@@ -41,6 +41,8 @@ use crate::data::{self, Table};
 use crate::expr::{self, Node};
 use crate::store::{self, FileStore};
 use crate::trading_gpu::{self, Threshold, ThresholdSource, ValidMask};
+use crate::inference;
+use crate::wf_protocol::NullBook;
 use std::collections::HashMap;
 
 /// Default per-side cost in basis points (10 bp, as in the pilot).
@@ -49,6 +51,58 @@ pub const DEFAULT_COST_BPS: f64 = 10.0;
 pub const DEFAULT_QUANTILE: f64 = 0.70;
 /// Seconds in a (crypto) year, used to turn a time step into periods per year.
 pub const SECONDS_PER_YEAR: f64 = 365.0 * 86_400.0;
+
+/// Options of the long-only evaluation protocol. The defaults leave every
+/// existing report value unchanged: the new report sections only add fields,
+/// and the bootstrap and null sections stay off until a draw count is set.
+#[derive(Clone, Debug)]
+pub struct ProtocolOptions {
+    /// Seconds from the row stamp to the label's entry. Part of the required purge.
+    pub entry_offset: f64,
+    /// Seconds of execution delay. Part of the required purge.
+    pub delay: f64,
+    /// Validation start per window label, overriding `validation_frac`.
+    pub validation_starts: Vec<(String, f64)>,
+    /// Circular block bootstrap draws; 0 disables the bootstrap section.
+    pub bootstrap_draws: usize,
+    /// Block length in periods; `None` uses `max(horizon, hold, n^(1/3))`.
+    pub block_len: Option<usize>,
+    /// Draws of the block-permutation and matched-exposure nulls; 0 disables them.
+    pub null_draws: usize,
+    /// Total trials behind the candidates, for DSR; `None` uses the candidate count.
+    pub trials: Option<usize>,
+    /// Seed of every protocol draw.
+    pub seed: u32,
+    /// Even block count of the CSCV PBO.
+    pub pbo_blocks: usize,
+    /// Benjamini-Hochberg false discovery rate.
+    pub fdr_q: f64,
+}
+
+impl Default for ProtocolOptions {
+    fn default() -> Self {
+        ProtocolOptions {
+            entry_offset: 0.0,
+            delay: 0.0,
+            validation_starts: Vec::new(),
+            bootstrap_draws: 0,
+            block_len: None,
+            null_draws: 0,
+            trials: None,
+            seed: 20_260_101,
+            pbo_blocks: 16,
+            fdr_q: 0.10,
+        }
+    }
+}
+
+impl ProtocolOptions {
+    /// `entry_offset + horizon + delay`: the minimum distance from a training
+    /// row to a test row so that no training label reaches the test decision.
+    pub fn required_purge_seconds(&self, horizon: f64) -> f64 {
+        self.entry_offset + horizon + self.delay
+    }
+}
 
 /// One walk-forward window. Bounds are epoch seconds (or whatever numeric time
 /// unit the time column uses); all ranges are half-open.
@@ -285,6 +339,9 @@ pub struct WindowResult {
     pub hindsight_bound: Option<HindsightBound>,
     /// #308: banded finalist provenance when `--select-band` was used.
     pub band_selection: Option<crate::selection::BandSelection>,
+    /// Latest stamp of any row used for training or validation. Its label ends
+    /// at most `required_purge_seconds` later, which stays below `test_start`.
+    pub train_last_time: Option<f64>,
 }
 
 /// #306: the band/cooldown book and its associative carry.
@@ -423,6 +480,12 @@ pub struct Report {
     pub allow_lockbox: bool,
     /// #304: fused long-only reduction summary when `--device-pnl` was set.
     pub device_pnl: Option<DevicePnlSummary>,
+    /// `entry_offset + horizon + delay`.
+    pub required_purge_seconds: f64,
+    /// Smallest `test_start - train_end` over the windows.
+    pub min_purge_seconds: f64,
+    pub economics: crate::wf_protocol::Economics,
+    pub inference: Option<crate::wf_protocol::Inference>,
     dropped_rows: usize,
 }
 
@@ -447,23 +510,38 @@ pub struct SignTest {
 
 /// Evaluate `spec` against a `.rcsb` store or a CSV table.
 pub fn run_path(path: &str, spec: &EvalSpec) -> Result<Report, String> {
+    run_path_with(path, spec, &ProtocolOptions::default())
+}
+
+/// [`run_path`] with the protocol options.
+pub fn run_path_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Result<Report, String> {
     if store::is_store_path(path) {
-        run_store(path, spec)
+        run_store_with(path, spec, opts)
     } else {
         let table = data::read_table(path)?;
-        run_table(&table, spec, "csv-table")
+        run_table_with(&table, spec, "csv-table", opts)
     }
 }
 
 /// Evaluate a resident table. The CLI's CSV path and tests use this.
 pub fn run_table(table: &Table, spec: &EvalSpec, source: &str) -> Result<Report, String> {
+    run_table_with(table, spec, source, &ProtocolOptions::default())
+}
+
+/// [`run_table`] with the protocol options.
+pub fn run_table_with(
+    table: &Table,
+    spec: &EvalSpec,
+    source: &str,
+    opts: &ProtocolOptions,
+) -> Result<Report, String> {
     let layout = resolve_layout(spec, &table.names, &table.numeric)?;
     let trees = parse_expressions(spec, &layout)?;
-    validate_windows(spec)?;
+    validate_windows(spec, opts)?;
 
     let times = data::time_keys(table, layout.time);
     let group_ids = layout.group.map(|g| table_group_ids(table, g));
-    let mut acc = Accum::new(spec, trees.len())?;
+    let mut acc = Accum::new(spec, opts, trees.len())?;
     let mut features = Vec::with_capacity(layout.vars.len());
     for r in 0..table.len() {
         let t = times.value(r);
@@ -479,6 +557,7 @@ pub fn run_table(table: &Table, spec: &EvalSpec, source: &str) -> Result<Report,
     }
     acc.finish(
         spec,
+        opts,
         &layout,
         source,
         "O(test rows + one score per training row per window); CSV is resident",
@@ -488,15 +567,20 @@ pub fn run_table(table: &Table, spec: &EvalSpec, source: &str) -> Result<Report,
 
 /// Evaluate a `.rcsb` store directly, scanning it one row group at a time.
 pub fn run_store(path: &str, spec: &EvalSpec) -> Result<Report, String> {
+    run_store_with(path, spec, &ProtocolOptions::default())
+}
+
+/// [`run_store`] with the protocol options.
+pub fn run_store_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Result<Report, String> {
     let fs = FileStore::open(path)?;
     let names = fs.header().names();
     let numeric = fs.header().numeric();
     let mut layout = resolve_layout(spec, &names, &numeric)?;
     layout.time_i64 = fs.header().dtypes()[layout.time] == store::DType::I64;
     let trees = parse_expressions(spec, &layout)?;
-    validate_windows(spec)?;
+    validate_windows(spec, opts)?;
 
-    let mut acc = Accum::new(spec, trees.len())?;
+    let mut acc = Accum::new(spec, opts, trees.len())?;
     let header = fs.header();
     let mut buf = GroupBuf::new();
     let mut scratch = Vec::new();
@@ -554,7 +638,7 @@ pub fn run_store(path: &str, spec: &EvalSpec) -> Result<Report, String> {
          group by group, one {} -row group resident",
         fs.group_rows()
     );
-    acc.finish(spec, &layout, "store-stream", &bound, &trees)
+    acc.finish(spec, opts, &layout, "store-stream", &bound, &trees)
 }
 
 // ---------------------------------------------------------------------------
@@ -650,7 +734,7 @@ fn has_dataset_op(n: &Node) -> bool {
     n.op.is_agg() || n.op.is_meta() || n.kids.iter().any(has_dataset_op)
 }
 
-fn validate_windows(spec: &EvalSpec) -> Result<(), String> {
+fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), String> {
     if spec.windows.is_empty() {
         return Err("at least one --window is required".to_string());
     }
@@ -684,7 +768,23 @@ fn validate_windows(spec: &EvalSpec) -> Result<(), String> {
     if spec.candidates.iter().any(|e| e.trim().is_empty()) {
         return Err("candidate expressions must be non-empty".to_string());
     }
-    let embargo = spec.embargo_seconds();
+    let required = opts.required_purge_seconds(spec.horizon);
+    if !(opts.entry_offset.is_finite() && opts.entry_offset >= 0.0 && opts.delay.is_finite() && opts.delay >= 0.0) {
+        return Err("--entry-offset and --delay must be finite and non-negative".to_string());
+    }
+    if opts.bootstrap_draws > 0 && opts.bootstrap_draws < 100 {
+        return Err("--bootstrap needs at least 100 draws".to_string());
+    }
+    if opts.pbo_blocks < 2 || opts.pbo_blocks % 2 != 0 || opts.pbo_blocks > 24 {
+        return Err("--pbo-blocks must be even and in 2..=24".to_string());
+    }
+    if !(opts.fdr_q > 0.0 && opts.fdr_q < 1.0) {
+        return Err("--fdr-q must be in (0, 1)".to_string());
+    }
+    if !opts.validation_starts.is_empty() && spec.validation_frac > 0.0 {
+        return Err("explicit validation starts and --validation-frac are mutually exclusive".to_string());
+    }
+    let embargo = spec.embargo_seconds().max(required);
     for w in &spec.windows {
         if !(w.train_start < w.train_end) {
             return Err(format!(
@@ -714,8 +814,8 @@ fn validate_windows(spec: &EvalSpec) -> Result<(), String> {
         let gap = w.test_start - w.train_end;
         if gap + 1e-9 < embargo {
             return Err(format!(
-                "window '{}': purge gap is {} seconds but horizon/embargo needs {}; \
-                 move test_start later or lower --horizon/--embargo",
+                "window '{}': purge gap is {} seconds but entry offset + horizon + delay / embargo \
+                 needs {}; move test_start later or lower --horizon/--embargo/--entry-offset/--delay",
                 w.label, gap, embargo
             ));
         }
@@ -785,6 +885,8 @@ struct WindowData {
     /// control).
     train_target_sum: f64,
     train_target_n: u64,
+    /// Latest stamp of any row that entered training or validation.
+    train_max_time: f64,
     dropped: usize,
 }
 
@@ -795,7 +897,7 @@ struct Accum {
 }
 
 impl Accum {
-    fn new(spec: &EvalSpec, candidates: usize) -> Result<Self, String> {
+    fn new(spec: &EvalSpec, opts: &ProtocolOptions, candidates: usize) -> Result<Self, String> {
         // Report and pool in test-time order even if the windows were written
         // out of order on the command line. Validation already proved that the
         // test blocks do not overlap.
@@ -808,7 +910,15 @@ impl Accum {
         });
         let mut windows = Vec::with_capacity(ordered.len());
         for w in ordered {
-            let validation_start = if spec.validation_frac > 0.0 {
+            let validation_start = if let Some((_, s)) = opts.validation_starts.iter().find(|(l, _)| *l == w.label) {
+                if !(*s > w.train_start && *s < w.train_end) {
+                    return Err(format!(
+                        "window '{}': validation start must lie inside the training range",
+                        w.label
+                    ));
+                }
+                Some(*s)
+            } else if spec.validation_frac > 0.0 {
                 let span = w.train_end - w.train_start;
                 let start = w.train_end - span * spec.validation_frac;
                 if !(start > w.train_start) {
@@ -831,6 +941,7 @@ impl Accum {
                 test_scores: vec![Vec::new(); candidates],
                 train_target_sum: 0.0,
                 train_target_n: 0,
+                train_max_time: f64::NEG_INFINITY,
                 dropped: 0,
             });
         }
@@ -863,6 +974,7 @@ impl Accum {
     fn finish(
         self,
         spec: &EvalSpec,
+        opts: &ProtocolOptions,
         layout: &Layout,
         source: &str,
         memory_bound: &str,
@@ -880,6 +992,16 @@ impl Accum {
         let mut previous_end: Option<HashMap<u64, f64>> = None;
         let mut pooled_previous: HashMap<u64, f64> = HashMap::new();
         let expressions = candidate_expressions(spec);
+        let want_inference = opts.bootstrap_draws > 0 || opts.null_draws > 0;
+        let n_candidates = trees.len();
+        let mut pooled_times: Vec<f64> = Vec::new();
+        let mut fresh_all: Vec<f64> = Vec::new();
+        let mut market_all: Vec<f64> = Vec::new();
+        let mut bh_all: Vec<f64> = Vec::new();
+        let mut const_all: Vec<f64> = Vec::new();
+        let (mut bh_rows, mut bh_long, mut const_rows, mut const_long) = (0u64, 0u64, 0u64, 0u64);
+        let mut cand_cols: Vec<Vec<f64>> = vec![Vec::new(); n_candidates];
+        let mut books: Vec<crate::wf_protocol::NullBook> = Vec::new();
         for d in self.windows {
             let has_validation = d.validation_start.is_some();
             if has_validation && expressions.len() > 1
@@ -1014,6 +1136,7 @@ impl Accum {
                     },
                     check_device: spec.device_pnl,
                 }),
+                opts.null_draws > 0,
             );
             // Pooled path: carry each group's position across the seam unless
             // the caller asked for the historical flat reset.
@@ -1031,6 +1154,7 @@ impl Accum {
                     spec.gpu,
                     false,
                     None,
+                    false,
                 )
             } else {
                 evaluate_window(
@@ -1046,6 +1170,7 @@ impl Accum {
                     spec.gpu,
                     false,
                     None,
+                    false,
                 )
             };
             if !spec.pool_reset_flat {
@@ -1068,6 +1193,53 @@ impl Accum {
             pooled_gross.extend_from_slice(&pev.gross_returns);
             pooled_stats.add_assign(&pev.stats);
             pooled_ppy.push(ppy);
+            pooled_times.extend_from_slice(&pev.times);
+            fresh_all.extend_from_slice(&ev.returns);
+            market_all.extend_from_slice(&ev.market);
+            if let Some(c) = &ev.controls {
+                bh_all.extend_from_slice(&c.series[1]);
+                const_all.extend_from_slice(&c.series[2]);
+                let bh = &c.get(crate::baselines::ControlKind::BuyAndHold).totals;
+                let cn = &c.get(crate::baselines::ControlKind::Constant).totals;
+                bh_rows += bh.rows;
+                bh_long += bh.long_rows;
+                const_rows += cn.rows;
+                const_long += cn.long_rows;
+            }
+            if opts.bootstrap_draws > 0 {
+                for c in 0..n_candidates {
+                    if c == candidate {
+                        cand_cols[c].extend_from_slice(&ev.returns);
+                        continue;
+                    }
+                    let other = evaluate_window(
+                        &d.test_rows,
+                        &d.test_scores[c],
+                        thresholds[c],
+                        cost_side,
+                        ppy,
+                        &mut HashMap::new(),
+                        spec.policy,
+                        spec.band_width,
+                        spec.min_hold,
+                        false,
+                        false,
+                        None,
+                        false,
+                    );
+                    for t in &ev.times {
+                        let v = match other.times.binary_search_by(|x| x.partial_cmp(t).unwrap()) {
+                            Ok(j) => other.returns[j],
+                            Err(_) => 0.0,
+                        };
+                        cand_cols[c].push(v);
+                    }
+                }
+            }
+            if let Some(b) = ev.book {
+                books.push(b);
+            }
+            let train_last_time = if d.train_max_time.is_finite() { Some(d.train_max_time) } else { None };
             windows.push(WindowResult {
                 window: d.window,
                 expression: expr::to_string(&trees[candidate], &layout.var_names),
@@ -1079,6 +1251,7 @@ impl Accum {
                 validation_rows: d.validation_scores[candidate].len(),
                 test_rows: ev.stats.rows,
                 dropped_rows: d.dropped,
+                train_last_time,
                 inferred_period_seconds: inferred_dt,
                 metrics: ev.metrics,
                 device_pnl: ev.device,
@@ -1094,6 +1267,84 @@ impl Accum {
             None => median(&mut pooled_ppy).unwrap_or(365.0),
         };
         let pooled = summarize(&pooled_returns, &pooled_gross, &pooled_stats, pooled_ppy);
+        let required_purge = opts.required_purge_seconds(spec.horizon);
+        let min_gap = windows
+            .iter()
+            .map(|w| w.window.test_start - w.window.train_end)
+            .fold(f64::INFINITY, f64::min);
+        let dt = {
+            let mut v: Vec<f64> = windows.iter().filter_map(|w| w.inferred_period_seconds).collect();
+            median(&mut v).unwrap_or(1.0)
+        };
+        let horizon_periods = if spec.horizon > 0.0 && dt > 0.0 {
+            (spec.horizon / dt).ceil() as usize
+        } else {
+            0
+        };
+        let hold_periods = if pooled.entries > 0 {
+            (pooled.active_rows as f64 / pooled.entries as f64).ceil() as usize
+        } else {
+            1
+        };
+        let floor_block = horizon_periods.max(hold_periods).max(1);
+        if let Some(l) = opts.block_len {
+            if l < floor_block {
+                return Err(format!(
+                    "--block-len {} is shorter than max(horizon, hold) = {} periods; \
+                     blocks must cover the label overlap and the holding period",
+                    l, floor_block
+                ));
+            }
+        }
+        let block_len = opts
+            .block_len
+            .unwrap_or_else(|| inference::auto_block_len(pooled_returns.len(), horizon_periods, hold_periods));
+        let economics = crate::wf_protocol::economics(&crate::wf_protocol::EconomicsInput {
+            net: &pooled_returns,
+            gross: &pooled_gross,
+            times: &pooled_times,
+            cost_bps: spec.cost_bps,
+            periods_per_year: pooled_ppy,
+            sortino: pooled.sortino,
+            cagr: pooled.cagr,
+            max_drawdown: pooled.max_drawdown,
+            exposure: pooled.exposure,
+            fresh: &fresh_all,
+            market: &market_all,
+            buy_and_hold: &bh_all,
+            constant: &const_all,
+            bh_exposure: if bh_rows == 0 { f64::NAN } else { bh_long as f64 / bh_rows as f64 },
+            constant_exposure: if const_rows == 0 { f64::NAN } else { const_long as f64 / const_rows as f64 },
+        });
+        let inference_report = if want_inference {
+            let zeros = vec![0.0; fresh_all.len()];
+            let baseline: &[f64] = match economics.best_baseline.as_str() {
+                "buy_and_hold" => &bh_all,
+                "constant_long_flat" => &const_all,
+                _ => &zeros,
+            };
+            let candidates: Vec<Vec<f64>> = if opts.bootstrap_draws > 0 { cand_cols } else { Vec::new() };
+            Some(crate::wf_protocol::infer(&crate::wf_protocol::InferenceInput {
+                draws: opts.bootstrap_draws,
+                null_draws: opts.null_draws,
+                block_len,
+                seed: opts.seed,
+                control_seed: spec.control_seed,
+                periods_per_year: pooled_ppy,
+                pooled: &pooled_returns,
+                fresh: &fresh_all,
+                candidates: &candidates,
+                trials: opts.trials.unwrap_or(0),
+                pbo_blocks: opts.pbo_blocks,
+                fdr_q: opts.fdr_q,
+                best_baseline: &economics.best_baseline,
+                baseline_series: baseline,
+                buy_and_hold: &bh_all,
+                books: &books,
+            })?)
+        } else {
+            None
+        };
         let annualization = if spec.periods_per_year.is_some() {
             "explicit --periods-per-year".to_string()
         } else {
@@ -1168,6 +1419,10 @@ impl Accum {
             memory_bound: memory_bound.to_string(),
             allow_lockbox: spec.allow_lockbox,
             device_pnl,
+            required_purge_seconds: required_purge,
+            min_purge_seconds: min_gap,
+            economics,
+            inference: inference_report,
             dropped_rows: dropped,
         })
     }
@@ -1184,6 +1439,9 @@ fn push_scores(
         let in_train = t >= d.window.train_start && t < d.window.train_end;
         let in_test = t >= d.window.test_start && t < d.window.test_end;
         if in_train {
+            if t > d.train_max_time {
+                d.train_max_time = t;
+            }
             if target.is_finite() {
                 d.train_target_sum += target;
                 d.train_target_n += 1;
@@ -1385,6 +1643,11 @@ struct WindowEval {
     metrics: Metrics,
     returns: Vec<f64>,
     gross_returns: Vec<f64>,
+    /// Period stamps of `returns`, ascending.
+    times: Vec<f64>,
+    /// Equal-weight mean target per period: the always-long universe, no cost.
+    market: Vec<f64>,
+    book: Option<NullBook>,
     stats: Stats,
     first_positions: HashMap<u64, f64>,
     end_positions: HashMap<u64, f64>,
@@ -1517,6 +1780,7 @@ fn evaluate_window(
     gpu: bool,
     device_pnl: bool,
     control_input: Option<ControlInput>,
+    keep_book: bool,
 ) -> WindowEval {
     assert_eq!(rows.len(), scores.len());
     // #305: one shared mask, score and target both finite. `position_for`
@@ -1856,11 +2120,49 @@ fn evaluate_window(
         .unwrap_or_else(|e| panic!("control ladder failed: {}", e))
     });
 
+    let times: Vec<f64> = cross.periods.iter().map(|p| p.time).collect();
+    let mut market_cross = CrossSection::default();
+    for &i in &time_order {
+        let row = &rows[valid[i]];
+        market_cross.add(row.time, row.target, row.target);
+    }
+    let market = market_cross.series().0;
+    let book = if keep_book {
+        let mut period_of = vec![0u32; n];
+        let mut current: i64 = -1;
+        let mut last_time = f64::NAN;
+        let mut period_count: Vec<u32> = Vec::new();
+        for &i in &time_order {
+            let t = rows[valid[i]].time;
+            if current < 0 || t != last_time {
+                current += 1;
+                last_time = t;
+                period_count.push(0);
+            }
+            period_of[i] = current as u32;
+            period_count[current as usize] += 1;
+        }
+        Some(NullBook {
+            positions: ord_positions.clone(),
+            returns: ord_returns.clone(),
+            groups: ord_groups.clone(),
+            period: group_order.iter().map(|&i| period_of[i]).collect(),
+            period_count,
+            period_cost: gross_returns.iter().zip(&returns).map(|(g, n)| g - n).collect(),
+            side: cost_side,
+        })
+    } else {
+        None
+    };
+
     let metrics = summarize(&returns, &gross_returns, &stats, ppy);
     WindowEval {
         metrics,
         returns,
         gross_returns,
+        times,
+        market,
+        book,
         stats,
         first_positions,
         end_positions,
@@ -2039,7 +2341,7 @@ fn infer_frequency(rows: &[RowBase]) -> (f64, Option<f64>) {
 // Reporting
 // ---------------------------------------------------------------------------
 
-fn jstr(s: &str) -> String {
+pub(crate) fn jstr(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
     for c in s.chars() {
@@ -2057,7 +2359,7 @@ fn jstr(s: &str) -> String {
     o
 }
 
-fn jnum(v: f64) -> String {
+pub(crate) fn jnum(v: f64) -> String {
     if v.is_finite() {
         format!("{}", v)
     } else {
@@ -2238,7 +2540,7 @@ impl WindowResult {
              \"threshold_source\":{},\"train_rows\":{},\"validation_rows\":{},\
              \"test_rows\":{},\"dropped_rows\":{},\"inferred_period_seconds\":{},\
              \"metrics\":{},\"device_pnl\":{},\"controls\":{},\"band\":{},\"hindsight_bound\":{},\
-             \"band_selection\":{}}}",
+             \"band_selection\":{},\"train_last_time\":{}}}",
             jstr(&self.window.label),
             jnum(self.window.train_start),
             jnum(self.window.train_end),
@@ -2270,15 +2572,42 @@ impl WindowResult {
                 .map_or("null".to_string(), hindsight_bound_json),
             self.band_selection
                 .as_ref()
-                .map_or("null".to_string(), |s| s.json())
+                .map_or("null".to_string(), |s| s.json()),
+            self.train_last_time.map_or("null".to_string(), jnum)
         )
     }
 }
 
 impl Report {
-    /// Machine-readable JSON: window definitions, cost model, position rule and
-    /// metrics, as required by issue #124.
+    /// Machine-readable JSON. The deterministic report; its SHA-256 is the
+    /// reproduction hash.
     pub fn json(&self) -> String {
+        let mut s = self.base_json();
+        s.pop();
+        s.push_str(&format!(
+            ",\"split\":{{\"required_purge_seconds\":{},\"purge_seconds\":{},\"horizon_seconds\":{},\
+             \"embargo_seconds\":{}}},\"economics\":{},\"inference\":{}}}",
+            jnum(self.required_purge_seconds),
+            jnum(self.min_purge_seconds),
+            jnum(self.horizon),
+            jnum(self.embargo),
+            self.economics.json(),
+            self.inference.as_ref().map_or("null".to_string(), |i| i.json())
+        ));
+        s
+    }
+
+    /// [`Report::json`] with a `protocol` object (lockbox and ledger facts).
+    pub fn json_with_protocol(&self, protocol: &str) -> String {
+        let mut s = self.json();
+        s.pop();
+        s.push_str(&format!(",\"protocol\":{}}}", protocol));
+        s
+    }
+
+    /// Window definitions, cost model, position rule and metrics, as required
+    /// by issue #124.
+    fn base_json(&self) -> String {
         let windows: Vec<String> = self.windows.iter().map(WindowResult::json).collect();
         let lb = crate::lockbox::Lockbox::crypto_2026h2();
         let overlap: Vec<String> = self
@@ -2647,6 +2976,12 @@ impl Report {
             ));
         }
         s.push_str(&format!("\nMemory: {}\n", self.memory_bound));
+        s.push('\n');
+        s.push_str(&self.economics.markdown());
+        if let Some(i) = &self.inference {
+            s.push('\n');
+            s.push_str(&i.markdown());
+        }
         s
     }
 

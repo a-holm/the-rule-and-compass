@@ -189,6 +189,8 @@ CPU scans, and names the reason when it falls back to the CPU. See [`docs/walkfo
 semantics and metric definitions, and [`docs/eval-benchmark.md`](docs/eval-benchmark.md) for
 the pinned 4M-row benchmark protocol and the measured wall time.
 
+The long-only evaluation protocol builds on it: the UTC windows table `protocol/windows.csv`, a purge of `--entry-offset + --horizon + --delay`, an economics block (Sortino, Calmar, CVaR, break-even cost, cost ladder, cash, buy-and-hold and equal-weight benchmarks with exposure and beta), a circular block bootstrap with a design effect (`--bootstrap`), block-permutation and matched-exposure nulls (`--null-draws`), DSR, PBO, SPA and BH-FDR, and a candidate ledger with a sealed list and a one-read locked test (`--ledger`, `--locked-test`, `rcsr protocol`). See the "Long-only evaluation protocol" section of [`docs/walkforward.md`](docs/walkforward.md).
+
 Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
 minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),
 comparisons (`x > 0`, `x <= y`, `x == 0`), the logical operators
@@ -580,7 +582,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--lags K | --lag-set k,..|default] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc] [--require-validation]
      [--equivalence-z z] [--noise-lag n|auto]
-     [--allow-lockbox] [--target-spec file] [--allow-target-structure]
+     [--allow-lockbox] [--lockbox START,END] [--ledger file] [--target-spec file] [--allow-target-structure]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
      [--smooth k] [--smooth-centred k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
@@ -741,6 +743,8 @@ run:
 | `--smooth-centred k` | the old **centred** window; reads future bars, is opt-in, and is reported as look-ahead |
 | `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
 | `--allow-lockbox` | permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only) |
+| `--lockbox START,END` | declared locked test reported in the run.json `lockbox` object (rows, date range, read count) |
+| `--ledger file` | candidate ledger whose locked reads run.json counts |
 | `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`; `long_only` is always true): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
 | `--allow-target-structure` | run a D13c target for a diagnostic replay (warns, records `check.status = overridden` and a proxy table) |
 | `--allow-overlap` (`rcsr enrich`, `rcsr prep`) | permit a `--label` stride below the horizon for horizons of 4 h and longer; without it such a label is refused. `--side short` and `--allow-short` are always refused: labels are long-only (action `{0,+1}`, long-side barriers, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge)) |

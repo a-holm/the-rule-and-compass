@@ -42,6 +42,7 @@ pub mod genome;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 pub mod gpu_stats;
+pub mod inference; // #264: block bootstrap, DSR, PBO, SPA, BH-FDR
 pub mod gui;
 pub mod implicit;
 pub mod leakage; // #129: differential leakage detectors
@@ -78,5 +79,7 @@ pub mod target; // #254: declared target spec
 pub mod trading_gpu; // #304/#305: fused long-only P&L, exact threshold and shared mask
 pub mod units;
 pub mod walkforward;
+pub mod wf_protocol; // #264: economics, block inference and nulls for the walk-forward report
+pub mod protocol; // #264: windows table, candidate ledger, sealed list, one-read lockbox
 pub mod window_stats;
 pub mod zip; // #123: minimal stored/deflate ZIP reader
