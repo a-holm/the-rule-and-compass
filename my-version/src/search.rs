@@ -184,6 +184,9 @@ pub struct Config {
     /// #26: print the one-line `# gpu: ...` note. The CLI clears this with
     /// `--quiet`, which promises an empty stderr for machine-readable output.
     pub gpu_notes: bool,
+    /// #293: `--gpu-memory`, an upper bound on the device memory the run may
+    /// plan on. Not a search setting: it is ignored by the checkpoint check.
+    pub gpu_memory: Option<u64>,
     /// #119: bounded producer/scorer overlap depth in batches (`0` disables).
     /// While the GPU scores a batch, the CPU keeps generating and fitting the
     /// next candidates. This is a scheduling choice only: the scored values,
@@ -345,6 +348,7 @@ impl Default for Config {
             // deliberate override and `--gpu` asserts that a device exists.
             gpu: cfg!(feature = "cuda"),
             gpu_notes: true,
+            gpu_memory: None,
             pipeline_depth: 2, // #119: only used when the GPU path is active
             variation: VariationMode::Auto,
         }
@@ -645,10 +649,41 @@ struct GpuSearch {
     device_eval_used: bool,
     /// #290: true once at least one fit batch actually ran on the device.
     device_fit_used: bool,
+    /// #293: the device memory plan this evaluator was built under.
+    memory_plan: Option<crate::memory::DevicePlan>,
+    /// #293: the tile stream of a tiled run, `None` when the rows are resident.
+    tile_stream: Option<TileStream>,
+}
+
+/// #293: what one scored batch streams to the device in a tiled run.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+struct TileStream {
+    tile_bytes: u64,
+    tiles: u64,
+    /// Candidates per wave.
+    wave: usize,
 }
 
 #[cfg(feature = "cuda")]
 impl GpuSearch {
+    /// #293: host-to-device bytes one batch of `candidates` streams in a tiled
+    /// run. Every wave sweeps all tiles, twice for the correlation family.
+    fn streamed_bytes(&self, candidates: usize) -> u64 {
+        let Some(t) = self.tile_stream else {
+            return 0;
+        };
+        let passes = match self.score {
+            Some(
+                crate::metrics::ScoreObjective::Correlation
+                | crate::metrics::ScoreObjective::CorrelationSigned,
+            ) => 2,
+            _ => 1,
+        };
+        let waves = candidates.div_ceil(t.wave).max(1) as u64;
+        waves * passes * t.tiles * t.tile_bytes
+    }
+
     fn new(
         train: &Sample,
         fit_data: bool,
@@ -662,7 +697,12 @@ impl GpuSearch {
         logistic_fit: bool,
         // #284: the run clock every device interval is placed on.
         run_start: std::time::Instant,
+        // #293: the device plan: its budget is the ceiling on the live device
+        // allocations, and a tiled plan streams the rows instead of holding them.
+        plan: Option<&crate::memory::DevicePlan>,
     ) -> Result<Self, String> {
+        let budget = plan.map(|p| p.budget);
+        let tiled = plan.filter(|p| p.mode == crate::memory::Residency::Tiled);
         // A test/diagnostic switch: `RCSR_GPU=0` makes a CUDA build behave as
         // if no device were present, so the fallback path can be exercised on
         // a machine that has one.
@@ -685,7 +725,24 @@ impl GpuSearch {
             }
         }
         let y: Vec<f32> = train.y.iter().map(|&v| v as f32).collect();
-        match crate::gpu::GpuEvaluator::new(&cols, n_rows, n_vars, &y) {
+        let created = match tiled {
+            Some(p) => {
+                if fit_data {
+                    return Err("device_memory: tiled residency has no device fit or exact statistic scorer".to_string());
+                }
+                crate::gpu::GpuEvaluator::new_tiled(
+                    cols,
+                    n_rows,
+                    n_vars,
+                    &y,
+                    p.tile_rows,
+                    budget,
+                    Some(p.partials_cap_bytes()),
+                )
+            }
+            None => crate::gpu::GpuEvaluator::with_budget(&cols, n_rows, n_vars, &y, budget),
+        };
+        match created {
             Some(mut ev) => {
                 // #284: one clock for evaluator and fit intervals.
                 ev.set_run_start(run_start);
@@ -701,7 +758,7 @@ impl GpuSearch {
                     let sign =
                         crate::fit::classification_signs_weighted(&train.y, &train.w);
                     if !ev.set_fit_sign(&sign) {
-                        return Err("the device refused the classification label sign".to_string());
+                        return Err(device_refusal("the classification label sign"));
                     }
                 }
                 // #169: the batched fit's final polish runs on the exact f64
@@ -715,13 +772,13 @@ impl GpuSearch {
                         }
                     }
                     if !ev.set_fit_data(&cols64, &train.y, &train.w) {
-                        return Err("the device refused the f64 fit rows".to_string());
+                        return Err(device_refusal("the f64 fit rows"));
                     }
                 } else if !train.w.is_empty() {
                     // #289: a weighted run whose fit stays on the CPU still
                     // needs the per-row weights for the native score.
                     if !ev.set_score_weights(&train.w) {
-                        return Err("the device refused the row weights".to_string());
+                        return Err(device_refusal("the row weights"));
                     }
                 }
                 Ok(GpuSearch {
@@ -747,12 +804,26 @@ impl GpuSearch {
                     score,
                     device_eval_used: false,
                     device_fit_used: false,
+                    memory_plan: None,
+                    tile_stream: tiled.map(|p| TileStream {
+                        tile_bytes: p.tile_rows as u64 * n_vars as u64 * 4,
+                        tiles: n_rows.div_ceil(p.tile_rows.max(1)) as u64,
+                        wave: p.wave_candidates.max(1),
+                    }),
                 })
             }
-            None => Err(format!(
-                "no usable CUDA device ({})",
-                crate::gpu::GpuEvaluator::device_name()
-            )),
+            None => Err(match crate::gpu::last_alloc_failure() {
+                Some(bytes) => format!(
+                    "device_memory: the device refused an allocation of {} bytes{} for the resident rows ({})",
+                    bytes,
+                    alloc_tag_note(),
+                    crate::memory::human(bytes)
+                ),
+                None => format!(
+                    "no usable CUDA device ({})",
+                    crate::gpu::GpuEvaluator::device_name()
+                ),
+            }),
         }
     }
 
@@ -1283,6 +1354,8 @@ impl GpuSearch {
             .map(|&(i, j)| islands[i][j].complexity.max(1.0))
             .fold(1.0f64, f64::max) as usize;
         let eval_workload = crate::dispatch::Workload::eval(pending.len(), train.len(), nodes);
+        let eval_workload = eval_workload
+            .with_bytes(eval_workload.bytes + self.streamed_bytes(pending.len()));
         // #290: a fit-only device run has no native scorer, so the evaluator is
         // CPU by contract and the plan says so. A native run lets the model
         // choose; a small batch keeps the CPU when launch dominates.
@@ -1515,6 +1588,8 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             fit_fallback_workers: self.fit_fallback_workers,
             fit_fallback_max: DEFAULT_FIT_FALLBACK_MAX,
             ledger,
+            memory_plan: self.memory_plan.clone(),
+            observed: Some(self.ev.alloc_report().observed()),
         }
     }
 
@@ -2412,6 +2487,145 @@ pub fn backend_blocker_reason(cfg: &Config, train: &Sample) -> Option<&'static s
     }
     let _ = (cfg, train);
     None
+}
+
+/// #230/#234/#288: which device shapes this run can use. One decision shared
+/// by the evaluator construction and the memory plan.
+#[cfg(feature = "cuda")]
+struct GpuPlanShape {
+    score_stat: Option<crate::metrics::ScoreStat>,
+    /// The exact order/rank scorer runs on the device.
+    score_admitted: bool,
+    /// The device moves constants only; the CPU scores.
+    fit_only: bool,
+    logistic_fit: bool,
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_plan_shape(cfg: &Config, train: &Sample) -> GpuPlanShape {
+    let order_stat_blocker = order_stat_fit_only_blocker(cfg, train);
+    // #227: `--metric maximum` uses the same fit-only shape with the batched
+    // exact maximum-error polish and its own measured cost-model gate.
+    let maximum_blocker = maximum_fit_only_blocker(cfg, train);
+    // `--no-fit` (or a non-gpu strategy) has nothing to fit on the device,
+    // so the fit-only evaluator must not be created for it.
+    let order_stat_fit = cfg.fit_strategy.defers_to_gpu()
+        && cfg.fit_iters > 0
+        && crate::fit::order_stat_fit_only(cfg.metric);
+    // #234: `log_loss` has a native *fit* objective (the batched LM
+    // kernel) and no native fitness, so it uses the same fit-only shape:
+    // the device moves constants, the exact CPU log-loss scores.
+    let logistic_fit = cfg.fit_strategy.defers_to_gpu()
+        && cfg.fit_iters > 0
+        && crate::fit::fit_only_loss(cfg.metric).is_some();
+    let maximum_fit = cfg.fit_strategy.defers_to_gpu()
+        && cfg.fit_iters > 0
+        && crate::fit::maximum_fit_only(cfg.metric);
+    // #288: an exact order-statistic/rank metric has a native *scoring*
+    // entry point named by the #287 dispatch table, so it is admitted
+    // through the same gate as the objective kernel and is not fit-only.
+    let score_stat = crate::metrics::ScoreStat::for_metric(cfg.metric);
+    let score_admitted = score_stat.is_some() && gpu_blocker(cfg, train).is_none();
+    // #287: maximum has a native objective, so it is never fit-only.
+    let maximum_fit_only = maximum_fit
+        && maximum_blocker.is_none()
+        && crate::metrics::native_score_objective(cfg.metric).is_none();
+    let fit_only = !score_admitted
+        && (rank_fit_only_arm(cfg, train).is_some()
+            || (order_stat_fit && order_stat_blocker.is_none())
+            || logistic_fit
+            || maximum_fit_only);
+    GpuPlanShape {
+        score_stat,
+        score_admitted,
+        fit_only,
+        logistic_fit,
+    }
+}
+
+/// #293: the device memory plan for this run, or `None` when the run does not
+/// build a device evaluator or the device cannot be queried.
+#[cfg(feature = "cuda")]
+pub fn device_plan_for(cfg: &Config, train: &Sample) -> Option<crate::memory::DevicePlan> {
+    if !cfg.gpu
+        || matches!(
+            std::env::var("RCSR_GPU").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    {
+        return None;
+    }
+    let shape = gpu_plan_shape(cfg, train);
+    if !(shape.score_admitted || shape.fit_only || gpu_blocker(cfg, train).is_none()) {
+        return None;
+    }
+    let n_vars = train.x.first().map(|r| r.len()).unwrap_or(0);
+    if train.is_empty() || n_vars == 0 {
+        return None;
+    }
+    let info = crate::gpu::device_info()?;
+    let device_fit = cfg.fit_strategy.defers_to_gpu() && cfg.fit_iters > 0;
+    let label_sign = (!shape.score_admitted && !shape.fit_only) || shape.logistic_fit;
+    let workload = crate::memory::DeviceWorkload {
+        rows: train.len(),
+        vars: n_vars,
+        candidates: cfg.pop.saturating_mul(cfg.islands.max(1)),
+        program_words: crate::genome::width_for(cfg.max_complexity),
+        device_fit,
+        stat: shape.score_admitted,
+        weights: !train.w.is_empty(),
+        label_sign,
+    };
+    let caps = crate::memory::DeviceCaps::from_env(cfg.gpu_memory);
+    Some(crate::memory::device_plan(&workload, &info, &caps))
+}
+
+/// #293: why a device plan cannot run, or `None` when it can. A stat scorer
+/// routed to the CPU leaves the run without a device scorer.
+#[cfg(feature = "cuda")]
+fn plan_blocker(plan: &crate::memory::DevicePlan) -> Option<String> {
+    if let Some(reason) = plan.refusal_reason() {
+        return Some(reason);
+    }
+    if plan.workload.stat && plan.stat_route != crate::memory::StageRoute::Device {
+        return Some(format!(
+            "device_memory: the exact {} scorer needs {} bytes of device memory, budget {} bytes{}",
+            "order/rank",
+            (plan.workload.rows as u64)
+                .saturating_mul(plan.workload.vars as u64 + 1)
+                .saturating_mul(4)
+                .saturating_add(plan.terms.side_vectors + plan.terms.buffers),
+            plan.budget,
+            if plan.mode == crate::memory::Residency::Tiled {
+                format!("; the rows stream in tiles of {}, so the scorer runs on the CPU", plan.tile_rows)
+            } else {
+                String::new()
+            }
+        ));
+    }
+    None
+}
+
+#[cfg(feature = "cuda")]
+fn device_refusal(what: &str) -> String {
+    match crate::gpu::last_alloc_failure() {
+        Some(bytes) => format!(
+            "device_memory: the device refused an allocation of {} bytes{} for {}",
+            bytes,
+            alloc_tag_note(),
+            what
+        ),
+        None => format!("the device refused {}", what),
+    }
+}
+
+/// ` (tag cols_f64)` for the most recent refused allocation, or nothing.
+#[cfg(feature = "cuda")]
+fn alloc_tag_note() -> String {
+    match crate::gpu::last_alloc_failure_tag() {
+        Some(tag) => format!(" (tag {})", tag),
+        None => String::new(),
+    }
 }
 
 pub fn eval_error(tree: &Node, s: &Sample, metric: Metric) -> f64 {
@@ -3759,6 +3973,10 @@ pub struct GpuRunStats {
     /// #284: run-scoped stage/device ledger. `Default` is an empty ledger, so
     /// every existing fixture that builds `GpuRunStats` still compiles.
     pub ledger: crate::gpu_stats::RunLedger,
+    /// #293: the device memory plan the run was built under.
+    pub memory_plan: Option<crate::memory::DevicePlan>,
+    /// #293: the device allocation ledger at the end of the run.
+    pub observed: Option<crate::memory::DeviceObserved>,
 }
 
 pub struct Outcome {
@@ -4995,40 +5213,12 @@ fn run_search(
         // same fit-only shape with the batched exact order-statistic polish.
         // Their measured cost-model gate can decline the arm for a small
         // sample; that refusal is recorded as the reason.
-        let order_stat_blocker = order_stat_fit_only_blocker(cfg, train);
-        // #227: `--metric maximum` uses the same fit-only shape with the batched
-        // exact maximum-error polish and its own measured cost-model gate.
-        let maximum_blocker = maximum_fit_only_blocker(cfg, train);
-        // `--no-fit` (or a non-gpu strategy) has nothing to fit on the device,
-        // so the fit-only evaluator must not be created for it.
-        let order_stat_fit = cfg.fit_strategy.defers_to_gpu()
-            && cfg.fit_iters > 0
-            && crate::fit::order_stat_fit_only(cfg.metric);
-        // #234: `log_loss` has a native *fit* objective (the batched LM
-        // kernel) and no native fitness, so it uses the same fit-only shape:
-        // the device moves constants, the exact CPU log-loss scores.
-        let logistic_fit = cfg.fit_strategy.defers_to_gpu()
-            && cfg.fit_iters > 0
-            && crate::fit::fit_only_loss(cfg.metric).is_some();
-        let maximum_fit = cfg.fit_strategy.defers_to_gpu()
-            && cfg.fit_iters > 0
-            && crate::fit::maximum_fit_only(cfg.metric);
-        // #288: an exact order-statistic/rank metric has a native *scoring*
-        // entry point named by the #287 dispatch table, so it is admitted
-        // through the same gate as the objective kernel and is not fit-only.
-        // `score_admitted` is the one decision the scorer, the gate and the
-        // status line share.
-        let score_stat = crate::metrics::ScoreStat::for_metric(cfg.metric);
-        let score_admitted = score_stat.is_some() && gpu_blocker(cfg, train).is_none();
-        // #287: maximum has a native objective, so it is never fit-only.
-        let maximum_fit_only = maximum_fit
-            && maximum_blocker.is_none()
-            && crate::metrics::native_score_objective(cfg.metric).is_none();
-        let fit_only = !score_admitted
-            && (rank_fit_only_arm(cfg, train).is_some()
-                || (order_stat_fit && order_stat_blocker.is_none())
-                || logistic_fit
-                || maximum_fit_only);
+        let GpuPlanShape {
+            score_stat,
+            score_admitted,
+            fit_only,
+            logistic_fit,
+        } = gpu_plan_shape(cfg, train);
         let plan: Option<(
             crate::fit::DeviceLoss,
             bool,
@@ -5087,17 +5277,25 @@ fn run_search(
                 } else {
                     None
                 };
-                match GpuSearch::new(
-                    train,
-                    cfg.fit_strategy.defers_to_gpu() || stat.is_some(),
-                    loss,
-                    native,
-                    stat,
-                    score,
-                    logistic_fit,
-                    t0,
-                ) {
-                    Ok(g) => {
+                // #293: the plan runs before the first allocation.
+                let memory_plan = device_plan_for(cfg, train);
+                let created = match memory_plan.as_ref().and_then(plan_blocker) {
+                    Some(reason) => Err(reason),
+                    None => GpuSearch::new(
+                        train,
+                        (cfg.fit_strategy.defers_to_gpu() && cfg.fit_iters > 0) || stat.is_some(),
+                        loss,
+                        native,
+                        stat,
+                        score,
+                        logistic_fit,
+                        t0,
+                        memory_plan.as_ref(),
+                    ),
+                };
+                match created {
+                    Ok(mut g) => {
+                        g.memory_plan = memory_plan;
                         let device = crate::gpu::GpuEvaluator::device_name();
                         if cfg.gpu_notes {
                             // #169: the GPU-fit arm runs at the generation
@@ -5180,6 +5378,19 @@ fn run_search(
                                 );
                             }
                         }
+                        if cfg.gpu_notes {
+                            if let Some(p) = g
+                                .memory_plan
+                                .as_ref()
+                                .filter(|p| p.mode == crate::memory::Residency::Tiled)
+                            {
+                                eprintln!(
+                                    "# gpu: tiled residency (tile {} rows, {} wave(s) of up to {} candidates; \
+                                     the rows stream from the host, fit and exact statistics stay on the CPU, device_memory)",
+                                    p.tile_rows, p.waves, p.wave_candidates
+                                );
+                            }
+                        }
                         if !native && stat.is_none() {
                             fit_only_device = true;
                         }
@@ -5253,12 +5464,20 @@ fn run_search(
     if !gpu_available {
         // No device: the two movable stages still answer for themselves with
         // the named cause, instead of looking like CPU-contract stages.
+        let cause = if backend_reason
+            .as_deref()
+            .map_or(false, |r| r.starts_with("device_memory"))
+        {
+            crate::dispatch::FallbackCause::DeviceMemory
+        } else {
+            crate::dispatch::FallbackCause::NoDevice
+        };
         let eval = crate::dispatch::Workload::eval(
             cfg.pop.saturating_mul(cfg.islands.max(1)),
             train.len(),
             cfg.max_complexity.max(1),
         )
-        .with_refusal(crate::dispatch::FallbackCause::NoDevice);
+        .with_refusal(cause);
         let decision = dispatcher.plan(crate::dispatch::Stage::Eval, &eval);
         dispatcher.record_plan(decision, eval.candidates, eval.bytes);
         let fit = crate::dispatch::Workload::fit(
@@ -5267,7 +5486,7 @@ fn run_search(
             4,
             cfg.fit_iters.max(1),
         )
-        .with_refusal(crate::dispatch::FallbackCause::NoDevice);
+        .with_refusal(cause);
         let decision = dispatcher.plan(crate::dispatch::Stage::Fit, &fit);
         dispatcher.record_plan(decision, fit.candidates, fit.bytes);
     }

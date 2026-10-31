@@ -707,6 +707,32 @@ The failure marker is part of the C API: `rc_eval` returns a negative time when
 `cudaGetLastError` reports a launch or execution failure, and `eval_batch`
 returns an empty result when the program upload fails.
 
+### Row ranges and the lane carry (#293)
+
+`score_kernel` gives lane `l` (thread `l` of the block, `L = blockDim.x`, 256 for production runs) the rows `r` with `r mod L = l`, in ascending order, and folds the lanes with one fixed tree. `rc_score_rows` scores an explicit partition `0 = b0 < b1 < ... < bk = n` with the same decomposition:
+
+- The lane of a row is `r mod L` in absolute rows. It does not depend on the partition, the chunk count or the grid.
+- Per candidate, the carry holds `L` lane states (two f64 each) and an `int` bad flag. Maximum keeps its key bits and row in the two slots. The region is zeroed at the start of a batch.
+- `score_rows_kernel<MODE, PASS>` applies one row range: lane `l` continues from its carried state over the rows of the range with `r mod L = l`. Correlation runs two passes with `score_mid_kernel` between them (mean prediction, lanes reset).
+- `score_finish_kernel<MODE>` runs the resident tree and epilogue: `+inf` and status 2 on a bad row, status 4 for all-zero classification weights, the AIC penalty on the host.
+
+The ranges form a left fold in row order, so every score kind returns the same bits as the resident kernel for any partition, including unaligned cuts and 1-row ranges. A lane index relative to the range start gives different bits on unaligned cuts. The production resident path keeps `score_kernel`.
+
+The carry is `P x (16 L + 16)` bytes (4,112 B per candidate), allocated once through the ledger with tag `carry` and grown only when the candidate count grows. Tests: `gpu::carry_tests`.
+
+`score_kernel` and `score_rows_kernel` fold rows through one `__device__` function (`score_step`), so the resident and the row-range paths cannot drift apart.
+
+### Tiled residency (#293)
+
+When the plan is `tiled`, `GpuEvaluator::new_tiled` (C: `rc_create_tiled`) keeps the column-major f32 feature columns on the host and allocates two device tile slots and two pinned staging slots of `tile_rows x vars x 4 B`. The target, label sign and weights stay resident by absolute row. Every score call runs the row-range kernels over the tiles:
+
+- Per wave of candidates, the tiles are swept in order (twice for the correlation family). A wave holds `partials cap / 4,112 B` candidates; one wave covers the whole population when it fits the cap.
+- For a tile, the host copies the `vars` column segments into the staging slot, the copy runs on a transfer stream behind the last kernel that read the device slot, and the kernel runs on the default stream behind the copy (events `ev_tile_copied`, `ev_tile_ready`, `ev_tile_used`). The next tile uploads while the current kernel runs.
+- The lane of a row is its absolute row modulo `L`, so scores are bit-identical to the resident kernels for every tile height and wave size.
+- The legacy evaluator, the batched fit, the exact rank and order-statistic scorers and the f64 twin are refused in a tiled context (the call returns a failure). The plan keeps them on the CPU.
+
+`ArenaReport` carries `tile_rows`, `tiles` (tile kernel launches), `tile_uploads`, `tile_overlapped_uploads`, `tile_pinned_bytes` and `waves`. A `# gpu: tiled residency (...)` note names the tile height and the waves. The eval stage of the route planner adds the streamed tile bytes to its transfer estimate. Tests: `tests/gpu_tiled.rs`.
+
 ### Overlapping generation with scoring (issue #119)
 
 Steps 1 and 2 above share no data except the candidate trees: variation,
@@ -2808,3 +2834,19 @@ the same planner with a zero-hysteresis compatibility calibration, preserving
 their measured crossovers.
 
 See [`dispatch.md`](dispatch.md) for the formulas, JSON shape and the tests.
+
+## Device memory plan (#293)
+
+The run plans its device memory before the first allocation. `--gpu-memory <size>` lowers the budget below `min(10.5 GiB, free - 1 GiB)`. A stage that does not fit is refused with its bytes and the smallest fix: `--gpu` exits 2, a plain run keeps the CPU with `backend_reason` starting `device_memory`, and an explicit `--fit-strategy gpu` whose f64 fit rows do not fit exits 2. `gpu.memory_plan` in `--json` records the plan. A failed device allocation is reported as `device_memory` with the byte count. The terms, the decision order and the refusal text are in [`memory-model.md`](memory-model.md).
+
+### Device allocation ledger
+
+Every device allocation of an evaluator goes through one tagged wrapper. It counts requests, keeps the largest request and its tag, tracks live and peak live bytes, and refuses a request that would push the live bytes over the context budget (the plan budget) with the tag and the byte count. `gpu.memory_plan.observed` in `--json` reports `requests`, `max_request_bytes`, `max_request_tag`, `live_bytes`, `peak_live_bytes`, `refused` and `refused_tag`. A refused allocation is reported as `device_memory: the device refused an allocation of N bytes (tag T) for ...`.
+
+No production request scales with `P x N`. The n-scaled requests are the dataset (`cols`, `y`), its f64 twin (`cols_f64`, `y_f64`, `w_f64`), the label sign (`tsign`, `tsign_f64`), the rank target (`rank_b`) and the fit and score region (`fit_region`). `GpuEvaluator::predictions`, which writes `P x N` values, exists only in test builds, and `rc_predict` refuses an output above 64 MiB.
+
+The rank and order-statistic score calls split their trials into sub-waves, so one call stays inside 512 MiB (64 bytes per row and segment) even when six trials of one candidate exceed it. The fit and score region caps its growth slack at 512 MiB when the batch itself fits.
+
+### Throughput at the wide-panel scale
+
+Resident scoring of 400 candidates over 4,775,757 x 20 f32 rows takes 0.139 s (median) and 4,096 candidates take 1.285 s, inside the 0.25 s and 2 s targets. Tiled scoring at 1,000,000 x 20 and P = 400 with 8,192-row tiles takes 0.95 times the resident time, because the next tile uploads while the current kernel runs. A 364-column store searched with 20 variables is `resident` and holds 0.88 GiB on the device; the numbers and the command are in [`memory-model.md`](memory-model.md).

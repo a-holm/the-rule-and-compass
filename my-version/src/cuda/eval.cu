@@ -133,7 +133,26 @@ typedef struct RcArenaReport {
     unsigned long long fs_batches;
     unsigned long long fs_dev_bytes;
     unsigned long long fs_pinned_bytes;
+    unsigned long long tile_rows;
+    unsigned long long tiles;
+    unsigned long long tile_uploads;
+    unsigned long long tile_overlapped_uploads;
+    unsigned long long tile_pinned_bytes;
+    unsigned long long waves;
 } RcArenaReport;
+
+#define RC_LEDGER_SLOTS 256
+/* #293: the device allocation ledger of one context. */
+typedef struct RcAllocReport {
+    unsigned long long requests, max_request_bytes, live_bytes, peak_live_bytes, refused;
+    char max_request_tag[32], refused_tag[32];
+} RcAllocReport;
+
+#define RC_PREDICT_CAP_BYTES (64ULL * 1024ULL * 1024ULL)
+/* #293 F1: the persistent fit/score region never asks for more than this in
+   one request when the batch itself fits, so its growth slack cannot push a
+   wave sized to the cap over it. */
+#define RC_FS_REQUEST_CAP (512ULL * 1024ULL * 1024ULL)
 
 struct RcCtx {
     float *d_cols;
@@ -165,6 +184,31 @@ struct RcCtx {
     double *d_score_out;
     int *d_score_status;
     int score_cap;
+    /* #293: the lane carry of the row-range scorer, `carry_cap` candidates wide.
+       `carry_warm` is set after its first batch so a later growth counts as a
+       steady allocation. */
+    char *d_carry;
+    int carry_cap;
+    int carry_warm;
+    /* #293: tiled residency. `d_cols` is null; the feature columns stream from
+       the host copy `h_cols` (column-major, caller-owned) through two device
+       slots of `tile_rows` rows. The target, label sign and weights stay
+       resident. */
+    int tiled;
+    const float *h_cols;
+    int tile_rows;
+    unsigned long long wave_cap_bytes;
+    float *d_tile[2];
+    float *h_stage[2];
+    size_t tile_bytes;
+    cudaEvent_t ev_tile_copied[2];
+    cudaEvent_t ev_tile_ready[2];
+    cudaEvent_t ev_tile_used[2];
+    unsigned long long tile_count;
+    unsigned long long tile_uploads;
+    unsigned long long tile_overlapped;
+    unsigned long long wave_count;
+    unsigned long long tile_seq;
     /* #287: cached target moments for the two-pass correlation scorer. They are
        computed once from the resident f32 target at rc_create time. */
     double ybar;
@@ -266,18 +310,108 @@ struct RcCtx {
     unsigned long long overlapped_uploads;
     unsigned long long arena_batches;
     char sync_reason[96];
+    /* #293: the device allocation ledger. Every device allocation of this
+       context goes through `rc_dev_alloc`, which tags it, enforces `budget`
+       (0 = none) against `live_bytes` and keeps the largest request. */
+    unsigned long long budget;
+    unsigned long long led_requests;
+    unsigned long long led_max_request;
+    unsigned long long led_live;
+    unsigned long long led_peak;
+    unsigned long long led_refused;
+    char led_max_tag[32];
+    char led_refused_tag[32];
+    int led_n;
+    struct {
+        void *p;
+        size_t bytes;
+    } led[RC_LEDGER_SLOTS];
 };
 
 /* #285: the pinned ring is capped at 64 MiB. Two upload slots plus two
    download slots must fit inside it, so each direction can use at most half. */
 #define RC_PIN_BUDGET_BYTES (64u * 1024u * 1024u)
 
+/* #293: the last refused allocation of any context, by size and tag. Context
+   creation fails before a report can be read, so the refusal is also kept
+   here. */
+static size_t g_alloc_fail_bytes = 0;
+static char g_alloc_fail_tag[32] = "";
+
+static void rc_ledger_tag(char *dst, const char *tag)
+{
+    snprintf(dst, 32, "%s", tag ? tag : "");
+}
+
+static int rc_ledger_refuse(RcCtx *c, const char *tag, size_t bytes)
+{
+    c->led_refused++;
+    rc_ledger_tag(c->led_refused_tag, tag);
+    g_alloc_fail_bytes = bytes;
+    rc_ledger_tag(g_alloc_fail_tag, tag);
+    return (int)cudaErrorMemoryAllocation;
+}
+
+/* One device allocation. A request that would push the live total over the
+   context budget, or that finds the table full, is refused with its tag and
+   bytes. `managed` selects cudaMallocManaged in the unified build. */
+static int rc_dev_alloc_kind(RcCtx *c, const char *tag, void **p, size_t bytes, int managed)
+{
+    c->led_requests++;
+    if (bytes > c->led_max_request) {
+        c->led_max_request = bytes;
+        rc_ledger_tag(c->led_max_tag, tag);
+    }
+    if (c->led_n >= RC_LEDGER_SLOTS) return rc_ledger_refuse(c, tag, bytes);
+    if (c->budget && c->led_live + (unsigned long long)bytes > c->budget) {
+        return rc_ledger_refuse(c, tag, bytes);
+    }
+    int rc;
+#ifdef RCSR_UNIFIED
+    rc = managed ? (int)cudaMallocManaged(p, bytes, cudaMemAttachGlobal) : (int)cudaMalloc(p, bytes);
+#else
+    (void)managed;
+    rc = (int)cudaMalloc(p, bytes);
+#endif
+    if (rc != 0) {
+        g_alloc_fail_bytes = bytes;
+        rc_ledger_tag(g_alloc_fail_tag, tag);
+        return rc;
+    }
+    c->led[c->led_n].p = *p;
+    c->led[c->led_n].bytes = bytes;
+    c->led_n++;
+    c->led_live += bytes;
+    if (c->led_live > c->led_peak) c->led_peak = c->led_live;
+    return 0;
+}
+
+static int rc_dev_alloc(RcCtx *c, const char *tag, void **p, size_t bytes)
+{
+    return rc_dev_alloc_kind(c, tag, p, bytes, 1);
+}
+
+static void rc_dev_free(RcCtx *c, void *p)
+{
+    if (!p) return;
+    for (int i = 0; i < c->led_n; ++i) {
+        if (c->led[i].p == p) {
+            c->led_live -= c->led[i].bytes;
+            c->led[i] = c->led[c->led_n - 1];
+            c->led_n--;
+            break;
+        }
+    }
+    cudaFree(p);
+}
+
+
 /* #285: an allocator call is part of the ledger. Before the first batch it is
    cold setup; afterwards it is a steady-state request and must stay zero on
    the hot path. */
-static int rc_arena_dev_alloc(RcCtx *c, void **p, size_t bytes)
+static int rc_arena_dev_alloc(RcCtx *c, const char *tag, void **p, size_t bytes)
 {
-    int rc = (int)cudaMalloc(p, bytes);
+    int rc = rc_dev_alloc_kind(c, tag, p, bytes, 0);
     if (rc == (int)cudaSuccess) {
         c->alloc_calls++;
         if (c->warm) c->steady_alloc_calls++;
@@ -288,7 +422,7 @@ static int rc_arena_dev_alloc(RcCtx *c, void **p, size_t bytes)
 static void rc_arena_dev_free(RcCtx *c, void *p)
 {
     if (!p) return;
-    cudaFree(p);
+    rc_dev_free(c, p);
     c->alloc_calls++;
     if (c->warm) c->steady_alloc_calls++;
 }
@@ -315,26 +449,26 @@ static int rc_arena_reserve(RcCtx *c, int nprog, size_t prog_words)
     unsigned int *p0 = 0, *p1 = 0, *o0 = 0, *o1 = 0;
     float *out = 0;
     int ok = 1;
-    if (rc_arena_dev_alloc(c, (void **)&p0, sizeof(unsigned int) * want_prog) != 0) ok = 0;
-    if (ok && rc_arena_dev_alloc(c, (void **)&p1, sizeof(unsigned int) * want_prog) != 0) ok = 0;
-    if (ok && rc_arena_dev_alloc(c, (void **)&o0, sizeof(unsigned int) * want_off) != 0) ok = 0;
-    if (ok && rc_arena_dev_alloc(c, (void **)&o1, sizeof(unsigned int) * want_off) != 0) ok = 0;
-    if (ok && rc_arena_dev_alloc(c, (void **)&out, sizeof(float) * want_out) != 0) ok = 0;
+    if (rc_arena_dev_alloc(c, "arena_prog", (void **)&p0, sizeof(unsigned int) * want_prog) != 0) ok = 0;
+    if (ok && rc_arena_dev_alloc(c, "arena_prog", (void **)&p1, sizeof(unsigned int) * want_prog) != 0) ok = 0;
+    if (ok && rc_arena_dev_alloc(c, "arena_off", (void **)&o0, sizeof(unsigned int) * want_off) != 0) ok = 0;
+    if (ok && rc_arena_dev_alloc(c, "arena_off", (void **)&o1, sizeof(unsigned int) * want_off) != 0) ok = 0;
+    if (ok && rc_arena_dev_alloc(c, "arena_out", (void **)&out, sizeof(float) * want_out) != 0) ok = 0;
     if (!ok) {
-        if (p0) cudaFree(p0);
-        if (p1) cudaFree(p1);
-        if (o0) cudaFree(o0);
-        if (o1) cudaFree(o1);
-        if (out) cudaFree(out);
+        if (p0) rc_dev_free(c, p0);
+        if (p1) rc_dev_free(c, p1);
+        if (o0) rc_dev_free(c, o0);
+        if (o1) rc_dev_free(c, o1);
+        if (out) rc_dev_free(c, out);
         snprintf(c->sync_reason, sizeof(c->sync_reason),
                  "device arena allocation failed");
         return -1;
     }
-    if (c->arena_prog[0]) cudaFree(c->arena_prog[0]);
-    if (c->arena_prog[1]) cudaFree(c->arena_prog[1]);
-    if (c->arena_off[0]) cudaFree(c->arena_off[0]);
-    if (c->arena_off[1]) cudaFree(c->arena_off[1]);
-    if (c->arena_out) cudaFree(c->arena_out);
+    if (c->arena_prog[0]) rc_dev_free(c, c->arena_prog[0]);
+    if (c->arena_prog[1]) rc_dev_free(c, c->arena_prog[1]);
+    if (c->arena_off[0]) rc_dev_free(c, c->arena_off[0]);
+    if (c->arena_off[1]) rc_dev_free(c, c->arena_off[1]);
+    if (c->arena_out) rc_dev_free(c, c->arena_out);
     c->arena_prog[0] = p0;
     c->arena_prog[1] = p1;
     c->arena_off[0] = o0;
@@ -827,6 +961,104 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) eval_pool_kernel(const floa
     if (threadIdx.x == 0) out[p] = sh[0];
 }
 
+/* One lane's fold over the rows `first, first + lanes, ...` below `r_end`,
+ * shared by `score_kernel` and `score_rows_kernel` so the resident and the
+ * row-range paths cannot drift apart. `wc` addresses columns by absolute row:
+ * column k, row i is `wc[k * ld + i]`. Classification keeps the weight sum in
+ * `b`; correlation pass 1 uses `a`, pass 2 uses `a` and `b`; maximum uses
+ * `best_key` and `best_row`. */
+template <int MODE, int PASS>
+__device__ __forceinline__ void score_step(
+    const unsigned int *code,
+    const float *wc,
+    int ld,
+    const float *__restrict__ y,
+    const float *__restrict__ tsign,
+    const double *__restrict__ w,
+    long long first,
+    long long r_end,
+    int lanes,
+    double pb,
+    double ybar,
+    double &a,
+    double &b,
+    unsigned long long &best_key,
+    int &best_row,
+    int &lbad)
+{
+    if (MODE >= RC_SCORE_LOG_LOSS && MODE <= RC_SCORE_HINGE_SQUARED) {
+        for (long long r = first; r < r_end; r += lanes) {
+            const int i = (int)r;
+            const double wi = w ? w[i] : 1.0;
+            if (!isfinite(wi) || wi < 0.0) {
+                lbad = 1;
+                continue;
+            }
+            if (wi == 0.0) continue;
+            const float t = tsign ? tsign[i] : CUDART_NAN_F;
+            const float pred = rc_exec_row(code, wc, ld, i);
+            if (!isfinite(t) || !isfinite(pred) || fabsf(pred) > 1e30f) {
+                lbad = 1;
+                continue;
+            }
+            a += wi * (double)rc_class_row_loss(pred, t, MODE);
+            b += wi;
+        }
+    } else if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
+        if (PASS == 0) {
+            for (long long r = first; r < r_end; r += lanes) {
+                const float pred = rc_exec_row(code, wc, ld, (int)r);
+                if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+                    lbad = 1;
+                } else {
+                    a += (double)pred;
+                }
+            }
+        } else {
+            for (long long r = first; r < r_end; r += lanes) {
+                const int i = (int)r;
+                const float pred = rc_exec_row(code, wc, ld, i);
+                if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+                    lbad = 1;
+                    continue;
+                }
+                const double dp = (double)pred - pb;
+                const double dy = (double)y[i] - ybar;
+                a += dp * dp;
+                b += dp * dy;
+            }
+        }
+    } else {
+        for (long long r = first; r < r_end; r += lanes) {
+            const int i = (int)r;
+            const float pred = rc_exec_row(code, wc, ld, i);
+            if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+                lbad = 1;
+                continue;
+            }
+            const double res = (double)pred - (double)y[i];
+            if (MODE == RC_SCORE_SQUARED || MODE == RC_SCORE_AIC ||
+                MODE == RC_SCORE_AICC || MODE == RC_SCORE_BIC) {
+                a += res * res;
+            } else if (MODE == RC_SCORE_ABSOLUTE) {
+                a += fabs(res);
+            } else if (MODE == RC_SCORE_LOG_SQUASHED) {
+                const double rr = res * res;
+                a += isfinite(rr) ? log1p(rr) : 2.0 * log(fabs(res));
+            } else if (MODE == RC_SCORE_SIGNED) {
+                a += res;
+            } else if (MODE == RC_SCORE_MAXIMUM) {
+                const double ar = fabs(res);
+                const unsigned long long key = (unsigned long long)__double_as_longlong(ar);
+                if (key > best_key) {
+                    best_key = key;
+                    best_row = i;
+                }
+            }
+        }
+    }
+}
+
 /* --- #287: native score-objective kernels -------------------------------
  *
  * One block per candidate, threads stride rows. The reduction tree is fixed
@@ -884,22 +1116,8 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
        `metrics::score_native_weighted`. */
     if (MODE >= RC_SCORE_LOG_LOSS && MODE <= RC_SCORE_HINGE_SQUARED) {
         double wn = 0.0;
-        for (int i = tid; i < n; i += blockDim.x) {
-            const double wi = w ? w[i] : 1.0;
-            if (!isfinite(wi) || wi < 0.0) {
-                bad = 1;
-                continue;
-            }
-            if (wi == 0.0) continue;
-            const float t = tsign ? tsign[i] : CUDART_NAN_F;
-            const float pred = rc_exec_row(code, cols, n, i);
-            if (!isfinite(t) || !isfinite(pred) || fabsf(pred) > 1e30f) {
-                bad = 1;
-                continue;
-            }
-            a += wi * (double)rc_class_row_loss(pred, t, MODE);
-            wn += wi;
-        }
+        score_step<MODE, 0>(code, cols, n, y, tsign, w, tid, n, blockDim.x, 0.0, ybar,
+                            a, wn, best_key, best_row, bad);
         if (tid == 0) sbad = 0;
         sh1[tid] = a;
         sh2[tid] = wn;
@@ -934,14 +1152,8 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
 
     if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
         /* Pass 1: mean prediction. */
-        for (int i = tid; i < n; i += blockDim.x) {
-            const float pred = rc_exec_row(code, cols, n, i);
-            if (!isfinite(pred) || fabsf(pred) > 1e30f) {
-                bad = 1;
-            } else {
-                a += (double)pred;
-            }
-        }
+        score_step<MODE, 0>(code, cols, n, y, tsign, w, tid, n, blockDim.x, 0.0, ybar,
+                            a, b, best_key, best_row, bad);
         if (tid == 0) sbad = 0;
         sh1[tid] = a;
         __syncthreads();
@@ -964,17 +1176,8 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
         bad = 0;
         a = 0.0;
         b = 0.0;
-        for (int i = tid; i < n; i += blockDim.x) {
-            const float pred = rc_exec_row(code, cols, n, i);
-            if (!isfinite(pred) || fabsf(pred) > 1e30f) {
-                bad = 1;
-                continue;
-            }
-            const double dp = (double)pred - pbar;
-            const double dy = (double)y[i] - ybar;
-            a += dp * dp;
-            b += dp * dy;
-        }
+        score_step<MODE, 1>(code, cols, n, y, tsign, w, tid, n, blockDim.x, pbar, ybar,
+                            a, b, best_key, best_row, bad);
         if (tid == 0) sbad = 0;
         sh1[tid] = a;
         sh2[tid] = b;
@@ -1012,32 +1215,8 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
 
     /* One-pass reductions. Modes 7/8/9 accumulate RSS; the host applies the
        AIC family's `k` penalty, which differs per candidate. */
-    for (int i = tid; i < n; i += blockDim.x) {
-        const float pred = rc_exec_row(code, cols, n, i);
-        if (!isfinite(pred) || fabsf(pred) > 1e30f) {
-            bad = 1;
-            continue;
-        }
-        const double r = (double)pred - (double)y[i];
-        if (MODE == RC_SCORE_SQUARED || MODE == RC_SCORE_AIC ||
-            MODE == RC_SCORE_AICC || MODE == RC_SCORE_BIC) {
-            a += r * r;
-        } else if (MODE == RC_SCORE_ABSOLUTE) {
-            a += fabs(r);
-        } else if (MODE == RC_SCORE_LOG_SQUASHED) {
-            const double rr = r * r;
-            a += isfinite(rr) ? log1p(rr) : 2.0 * log(fabs(r));
-        } else if (MODE == RC_SCORE_SIGNED) {
-            a += r;
-        } else if (MODE == RC_SCORE_MAXIMUM) {
-            const double ar = fabs(r);
-            const unsigned long long key = (unsigned long long)__double_as_longlong(ar);
-            if (key > best_key) {
-                best_key = key;
-                best_row = i;
-            }
-        }
-    }
+    score_step<MODE, 0>(code, cols, n, y, tsign, w, tid, n, blockDim.x, 0.0, ybar,
+                        a, b, best_key, best_row, bad);
     if (tid == 0) sbad = 0;
     sh1[tid] = a;
     shk[tid] = best_key;
@@ -1084,6 +1263,192 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
             }
             status[p] = 0;
         }
+    }
+}
+
+/* --- #293: row-range scoring with a lane carry ---------------------------
+ *
+ * The resident `score_kernel` gives lane `l` (a thread of the block) the rows
+ * `l, l + L, l + 2L, ...` in ascending order, with `L = blockDim.x`, and then
+ * folds the L lane states with one fixed shared-memory tree. A row range
+ * `[r_begin, r_end)` continues exactly that fold: lane `l` visits the rows
+ * `r = l (mod L)` of the range in ascending order, starting from the state it
+ * carried out of the previous range. The lane of a row is `r mod L` in
+ * absolute rows, never a tile-relative index, so any partition of `[0, n)`
+ * applied in order gives the same per-lane sums as the single pass, and the
+ * finish kernel runs the same tree. Both kernels fold rows
+ * through `score_step`.
+ *
+ * Lane state per candidate: `lane_a` and `lane_b` (f64). Maximum keeps the key
+ * bits in `lane_a` and the row in `lane_b`. `bad` is an int per candidate,
+ * combined with OR.
+ */
+template <int MODE, int PASS>
+__global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_rows_kernel(
+    const float *__restrict__ cols,
+    int ld,
+    long long row0,
+    const float *__restrict__ y,
+    const float *__restrict__ tsign,
+    const double *__restrict__ w,
+    long long r_begin,
+    long long r_end,
+    const unsigned int *__restrict__ prog,
+    const unsigned int *__restrict__ off,
+    int width,
+    int pooled,
+    double *__restrict__ lane_a,
+    double *__restrict__ lane_b,
+    int *__restrict__ bad,
+    const double *__restrict__ pbar,
+    double ybar)
+{
+    const int tid = threadIdx.x;
+    const int lanes = blockDim.x;
+    const int p = blockIdx.x;
+    const unsigned int *code = pooled
+        ? prog + (size_t)p * (size_t)width
+        : prog + off[p];
+    const float *wc = cols - row0;
+    const size_t slot = (size_t)p * (size_t)lanes + (size_t)tid;
+
+    long long d = (long long)tid - r_begin % lanes;
+    if (d < 0) d += lanes;
+    const long long first = r_begin + d;
+
+    int lbad = 0;
+    double a = lane_a[slot];
+    double b = lane_b[slot];
+
+    unsigned long long best_key = 0;
+    int best_row = 0;
+    if (MODE == RC_SCORE_MAXIMUM) {
+        best_key = ((unsigned long long *)lane_a)[slot];
+        best_row = ((int *)lane_b)[slot];
+    }
+    const double pb = (PASS == 1) ? pbar[p] : 0.0;
+    score_step<MODE, PASS>(code, wc, ld, y, tsign, w, first, r_end, lanes, pb, ybar,
+                           a, b, best_key, best_row, lbad);
+    if (MODE == RC_SCORE_MAXIMUM) {
+        ((unsigned long long *)lane_a)[slot] = best_key;
+        ((int *)lane_b)[slot] = best_row;
+    } else {
+        lane_a[slot] = a;
+        lane_b[slot] = b;
+    }
+    if (lbad) atomicOr(&bad[p], 1);
+}
+
+/* Correlation between its two passes: the mean prediction from the pass-one
+   lanes through the resident tree, then both lane arrays reset. */
+template <int MODE>
+__global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_mid_kernel(
+    double *__restrict__ lane_a,
+    double *__restrict__ lane_b,
+    double *__restrict__ pbar,
+    long long n)
+{
+    const int tid = threadIdx.x;
+    const int p = blockIdx.x;
+    const size_t slot = (size_t)p * (size_t)blockDim.x + (size_t)tid;
+    __shared__ double sh1[RC_MAX_THREADS];
+    sh1[tid] = lane_a[slot];
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if ((int)tid < st) sh1[tid] += sh1[tid + st];
+        __syncthreads();
+    }
+    if (tid == 0) pbar[p] = sh1[0] / (double)n;
+    lane_a[slot] = 0.0;
+    lane_b[slot] = 0.0;
+}
+
+/* The resident tree and epilogue over the carried lanes. */
+template <int MODE>
+__global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_finish_kernel(
+    const double *__restrict__ lane_a,
+    const double *__restrict__ lane_b,
+    const int *__restrict__ bad,
+    long long n,
+    double syy,
+    double *__restrict__ out,
+    int *__restrict__ status)
+{
+    const int tid = threadIdx.x;
+    const int p = blockIdx.x;
+    const size_t slot = (size_t)p * (size_t)blockDim.x + (size_t)tid;
+    __shared__ double sh1[RC_MAX_THREADS];
+    __shared__ double sh2[RC_MAX_THREADS];
+    __shared__ unsigned long long shk[RC_MAX_THREADS];
+    __shared__ int shi[RC_MAX_THREADS];
+
+    if (bad[p]) {
+        if (tid == 0) {
+            out[p] = INFINITY;
+            status[p] = RC_SCORE_NONFINITE;
+        }
+        return;
+    }
+    if (MODE == RC_SCORE_MAXIMUM) {
+        shk[tid] = ((const unsigned long long *)lane_a)[slot];
+        shi[tid] = ((const int *)lane_b)[slot];
+        __syncthreads();
+        for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+            if ((int)tid < st) {
+                const unsigned long long rk = shk[tid + st];
+                const int rr = shi[tid + st];
+                if (rk > shk[tid] || (rk == shk[tid] && rr < shi[tid])) {
+                    shk[tid] = rk;
+                    shi[tid] = rr;
+                }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            out[p] = __longlong_as_double((long long)shk[0]);
+            status[p] = 0;
+        }
+        return;
+    }
+    sh1[tid] = lane_a[slot];
+    sh2[tid] = lane_b[slot];
+    __syncthreads();
+    const int two = (MODE >= RC_SCORE_LOG_LOSS && MODE <= RC_SCORE_HINGE_SQUARED) ||
+                    MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED;
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if ((int)tid < st) {
+            sh1[tid] += sh1[tid + st];
+            if (two) sh2[tid] += sh2[tid + st];
+        }
+        __syncthreads();
+    }
+    if (tid != 0) return;
+    if (MODE >= RC_SCORE_LOG_LOSS && MODE <= RC_SCORE_HINGE_SQUARED) {
+        if (!(sh2[0] > 0.0)) {
+            out[p] = INFINITY;
+            status[p] = RC_SCORE_ALL_ZERO_WEIGHT;
+        } else {
+            out[p] = sh1[0] / sh2[0];
+            status[p] = 0;
+        }
+    } else if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
+        const double spp = sh1[0];
+        const double spy = sh2[0];
+        const double rho = (spp <= 0.0 || syy <= 0.0)
+            ? 0.0
+            : spy / (sqrt(spp) * sqrt(syy));
+        out[p] = (MODE == RC_SCORE_CORRELATION_SIGNED) ? 1.0 - rho : 1.0 - fabs(rho);
+        status[p] = 0;
+    } else {
+        const double sum = sh1[0];
+        if (MODE == RC_SCORE_AIC || MODE == RC_SCORE_AICC || MODE == RC_SCORE_BIC) {
+            out[p] = sum;
+        } else if (MODE == RC_SCORE_SIGNED) {
+            out[p] = fabs(sum) / (double)n;
+        } else {
+            out[p] = sum / (double)n;
+        }
+        status[p] = 0;
     }
 }
 
@@ -2692,10 +3057,6 @@ __global__ void hash_kernel(const unsigned int *__restrict__ prog,
  * is faster on a discrete GPU with its own VRAM (the RTX 3060 default).
  */
 #ifdef RCSR_UNIFIED
-static int rc_alloc(void **p, size_t bytes)
-{
-    return (int)cudaMallocManaged(p, bytes, cudaMemAttachGlobal);
-}
 static void rc_upload(void *dst, const void *src, size_t bytes)
 {
     memcpy(dst, src, bytes);
@@ -2705,10 +3066,6 @@ static void rc_download(void *dst, const void *src, size_t bytes)
     memcpy(dst, src, bytes);
 }
 #else
-static int rc_alloc(void **p, size_t bytes)
-{
-    return (int)cudaMalloc(p, bytes);
-}
 static void rc_upload(void *dst, const void *src, size_t bytes)
 {
     cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
@@ -2765,19 +3122,20 @@ static int rc_fs_reserve(RcCtx *c, int kind, size_t dev_bytes, size_t host_bytes
     if (host_bytes < 256) host_bytes = 256;
     if (dev_bytes > c->fs_dev_bytes) {
         if (c->fs_dev) {
-            cudaFree(c->fs_dev);
+            rc_dev_free(c, c->fs_dev);
             rc_fs_note(c, kind);
             c->fs_dev = 0;
             c->fs_dev_bytes = 0;
         }
         void *p = 0;
         size_t want = dev_bytes + dev_bytes / 4;
-        int rc = rc_alloc(&p, want);
+        if (want > RC_FS_REQUEST_CAP && dev_bytes <= RC_FS_REQUEST_CAP) want = RC_FS_REQUEST_CAP;
+        int rc = rc_dev_alloc(c, "fit_region", &p, want);
         if (rc != 0) {
             cudaGetLastError();
             want = dev_bytes;
             p = 0;
-            rc = rc_alloc(&p, want);
+            rc = rc_dev_alloc(c, "fit_region", &p, want);
         }
         if (rc != 0) {
             cudaGetLastError();
@@ -2862,7 +3220,7 @@ static int rc_fs_f64_twins(RcCtx *c)
 {
     if (c->d_cols64 && c->d_y64) return 0;
     if (!c->d_cols64) {
-        if (rc_alloc((void **)&c->d_cols64, sizeof(double) * (size_t)c->n * (size_t)c->v) != 0) {
+        if (rc_dev_alloc(c, "cols_f64", (void **)&c->d_cols64, sizeof(double) * (size_t)c->n * (size_t)c->v) != 0) {
             c->d_cols64 = 0;
             return -1;
         }
@@ -2873,7 +3231,7 @@ static int rc_fs_f64_twins(RcCtx *c)
         cast_f32_to_f64_kernel<<<(int)blocks, threads, 0, c->s_fit>>>(c->d_cols, c->d_cols64, total);
     }
     if (!c->d_y64) {
-        if (rc_alloc((void **)&c->d_y64, sizeof(double) * (size_t)c->n) != 0) {
+        if (rc_dev_alloc(c, "y_f64", (void **)&c->d_y64, sizeof(double) * (size_t)c->n) != 0) {
             c->d_y64 = 0;
             return -1;
         }
@@ -3133,9 +3491,30 @@ __global__ void k_rank_bb(const long long *__restrict__ b, int n,
     }
 }
 
-extern "C" {
+extern "C" void rc_destroy(void *ctx);
 
-void *rc_create(const float *cols, int n, int v, const float *y)
+/* Tile slots, staging and events of a tiled context. */
+static void rc_tiled_release(RcCtx *c)
+{
+    for (int i = 0; i < 2; ++i) {
+        if (c->d_tile[i]) rc_dev_free(c, c->d_tile[i]);
+        c->d_tile[i] = 0;
+        if (c->h_stage[i]) cudaFreeHost(c->h_stage[i]);
+        c->h_stage[i] = 0;
+        if (c->ev_tile_copied[i]) cudaEventDestroy(c->ev_tile_copied[i]);
+        if (c->ev_tile_ready[i]) cudaEventDestroy(c->ev_tile_ready[i]);
+        if (c->ev_tile_used[i]) cudaEventDestroy(c->ev_tile_used[i]);
+        c->ev_tile_copied[i] = c->ev_tile_ready[i] = c->ev_tile_used[i] = 0;
+    }
+    if (c->d_y) rc_dev_free(c, c->d_y);
+    c->d_y = 0;
+}
+
+/* `tile_rows > 0` builds a tiled context: `cols` stays on the host and
+   streams through two device tile slots. */
+static void *rc_create_impl(const float *cols, int n, int v, const float *y,
+                            unsigned long long budget, int tile_rows,
+                            unsigned long long wave_cap)
 {
     RcCtx *c = (RcCtx *)calloc(1, sizeof(RcCtx));
     if (!c) return 0;
@@ -3143,6 +3522,7 @@ void *rc_create(const float *cols, int n, int v, const float *y)
     c->v = v;
     c->nprog = 0;
     c->out_cap = 0;
+    c->budget = budget;
     c->async_copy = 1;
     c->sync_reason[0] = '\0';
 #ifdef RCSR_UNIFIED
@@ -3160,17 +3540,44 @@ void *rc_create(const float *cols, int n, int v, const float *y)
         snprintf(c->sync_reason, sizeof(c->sync_reason),
                  "RCSR_GPU_SYNC requests the synchronous copy path");
     }
+    g_alloc_fail_bytes = 0;
+    g_alloc_fail_tag[0] = 0;
     size_t col_bytes = sizeof(float) * (size_t)n * (size_t)v;
     size_t y_bytes = sizeof(float) * (size_t)n;
-    if (rc_alloc((void **)&c->d_cols, col_bytes) != 0 ||
-        rc_alloc((void **)&c->d_y, y_bytes) != 0) {
-        if (c->d_cols) cudaFree(c->d_cols);
-        if (c->d_y) cudaFree(c->d_y);
+    if (tile_rows > 0) {
+        c->tiled = 1;
+        c->h_cols = cols;
+        c->tile_rows = tile_rows;
+        c->wave_cap_bytes = wave_cap;
+        c->tile_bytes = sizeof(float) * (size_t)tile_rows * (size_t)v;
+        int ok = rc_dev_alloc(c, "y", (void **)&c->d_y, y_bytes) == 0;
+        for (int i = 0; ok && i < 2; ++i) {
+            ok = rc_dev_alloc_kind(c, "tile", (void **)&c->d_tile[i], c->tile_bytes, 0) == 0;
+        }
+        for (int i = 0; ok && i < 2; ++i) {
+            ok = cudaHostAlloc((void **)&c->h_stage[i], c->tile_bytes, cudaHostAllocDefault) == cudaSuccess;
+            if (!ok) {
+                cudaGetLastError();
+                c->h_stage[i] = 0;
+            }
+        }
+        if (!ok) {
+            rc_tiled_release(c);
+            free(c);
+            return 0;
+        }
+        rc_upload(c->d_y, y, y_bytes);
+    } else {
+    if (rc_dev_alloc(c, "cols", (void **)&c->d_cols, col_bytes) != 0 ||
+        rc_dev_alloc(c, "y", (void **)&c->d_y, y_bytes) != 0) {
+        if (c->d_cols) rc_dev_free(c, c->d_cols);
+        if (c->d_y) rc_dev_free(c, c->d_y);
         free(c);
         return 0;
     }
     rc_upload(c->d_cols, cols, col_bytes);
     rc_upload(c->d_y, y, y_bytes);
+    }
     /* #287: cache the target mean and centred sum of squares. The device
        correlator re-executes predictions for its second pass but never pays to
        recompute the target side. */
@@ -3216,30 +3623,66 @@ void *rc_create(const float *cols, int n, int v, const float *y)
         snprintf(c->sync_reason, sizeof(c->sync_reason),
                  "CUDA stream/event creation failed; synchronous copy path");
     }
+    if (c->tiled) {
+        int ok = streams_ok;
+        for (int i = 0; ok && i < 2; ++i) {
+            ok = cudaEventCreateWithFlags(&c->ev_tile_copied[i], cudaEventDisableTiming) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&c->ev_tile_ready[i], cudaEventDisableTiming) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&c->ev_tile_used[i], cudaEventDisableTiming) == cudaSuccess;
+        }
+        if (!ok) {
+            cudaGetLastError();
+            rc_destroy((void *)c);
+            return 0;
+        }
+    }
     return (void *)c;
+}
+
+extern "C" {
+
+/* `budget` is the byte ceiling on live device allocations, 0 for none. */
+void *rc_create(const float *cols, int n, int v, const float *y, unsigned long long budget)
+{
+    return rc_create_impl(cols, n, v, y, budget, 0, 0);
+}
+
+/* #293: tiled context. `cols` is column-major `cols[k * n + r]` and must
+   outlive the context. `wave_cap` bounds the lane carry in bytes (0 = none). */
+void *rc_create_tiled(const float *cols, int n, int v, const float *y,
+                      int tile_rows, unsigned long long budget,
+                      unsigned long long wave_cap)
+{
+    if (tile_rows <= 0) return 0;
+    return rc_create_impl(cols, n, v, y, budget, tile_rows, wave_cap);
 }
 
 void rc_destroy(void *ctx)
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c) return;
-    cudaFree(c->d_cols);
-    cudaFree(c->d_y);
-    if (c->d_cols64) cudaFree(c->d_cols64);
-    if (c->d_y64) cudaFree(c->d_y64);
-    if (c->d_w64) cudaFree(c->d_w64);
-    if (c->d_tsign) cudaFree(c->d_tsign);
-    if (c->d_tsign64) cudaFree(c->d_tsign64);
-    if (c->d_prog) cudaFree(c->d_prog);
-    if (c->d_off) cudaFree(c->d_off);
-    if (c->d_out) cudaFree(c->d_out);
-    if (c->d_score_out) cudaFree(c->d_score_out);
-    if (c->d_score_status) cudaFree(c->d_score_status);
-    if (c->d_pool[0]) cudaFree(c->d_pool[0]);
-    if (c->d_pool[1]) cudaFree(c->d_pool[1]);
-    if (c->d_hash) cudaFree(c->d_hash);
-    if (c->d_rank_b) cudaFree(c->d_rank_b);
-    if (c->fs_dev) cudaFree(c->fs_dev);
+    rc_dev_free(c, c->d_cols);
+    if (c->tiled) {
+        rc_tiled_release(c);
+    } else {
+        rc_dev_free(c, c->d_y);
+    }
+    if (c->d_cols64) rc_dev_free(c, c->d_cols64);
+    if (c->d_y64) rc_dev_free(c, c->d_y64);
+    if (c->d_w64) rc_dev_free(c, c->d_w64);
+    if (c->d_tsign) rc_dev_free(c, c->d_tsign);
+    if (c->d_tsign64) rc_dev_free(c, c->d_tsign64);
+    if (c->d_prog) rc_dev_free(c, c->d_prog);
+    if (c->d_off) rc_dev_free(c, c->d_off);
+    if (c->d_out) rc_dev_free(c, c->d_out);
+    if (c->d_score_out) rc_dev_free(c, c->d_score_out);
+    if (c->d_score_status) rc_dev_free(c, c->d_score_status);
+    if (c->d_carry) rc_dev_free(c, c->d_carry);
+    if (c->d_pool[0]) rc_dev_free(c, c->d_pool[0]);
+    if (c->d_pool[1]) rc_dev_free(c, c->d_pool[1]);
+    if (c->d_hash) rc_dev_free(c, c->d_hash);
+    if (c->d_rank_b) rc_dev_free(c, c->d_rank_b);
+    if (c->fs_dev) rc_dev_free(c, c->fs_dev);
     if (c->fs_host) cudaFreeHost(c->fs_host);
     if (c->s_fit) {
         cudaStreamDestroy(c->s_fit);
@@ -3248,8 +3691,8 @@ void rc_destroy(void *ctx)
     }
     /* #285: arena, staging rings, streams and events. */
     for (int i = 0; i < 2; ++i) {
-        if (c->arena_prog[i]) cudaFree(c->arena_prog[i]);
-        if (c->arena_off[i]) cudaFree(c->arena_off[i]);
+        if (c->arena_prog[i]) rc_dev_free(c, c->arena_prog[i]);
+        if (c->arena_off[i]) rc_dev_free(c, c->arena_off[i]);
         if (c->h_up[i]) cudaFreeHost(c->h_up[i]);
         if (c->h_down[i]) cudaFreeHost(c->h_down[i]);
         if (c->ev_upload[i]) cudaEventDestroy(c->ev_upload[i]);
@@ -3257,7 +3700,7 @@ void rc_destroy(void *ctx)
         if (c->ev_up_free[i]) cudaEventDestroy(c->ev_up_free[i]);
         if (c->ev_down_free[i]) cudaEventDestroy(c->ev_down_free[i]);
     }
-    if (c->arena_out) cudaFree(c->arena_out);
+    if (c->arena_out) rc_dev_free(c, c->arena_out);
     if (c->s_h2d) cudaStreamDestroy(c->s_h2d);
     if (c->s_d2h) cudaStreamDestroy(c->s_d2h);
     if (c->s_eval) cudaStreamDestroy(c->s_eval);
@@ -3345,7 +3788,7 @@ int rc_set_programs(void *ctx, const unsigned int *prog, const unsigned int *off
 int rc_eval_submit(void *ctx, int loss)
 {
     RcCtx *c = (RcCtx *)ctx;
-    if (!c || c->nprog <= 0 || c->pending.active) return -1;
+    if (!c || c->tiled || c->nprog <= 0 || c->pending.active) return -1;
     int slot = c->arena_slot;
     if (!c->arena_prog[slot] || !c->arena_off[slot] || !c->arena_out) return -1;
     RcStats *st = &c->stats;
@@ -3440,28 +3883,31 @@ int rc_predict(void *ctx, const unsigned int *prog, const unsigned int *off,
                int nprog, float *out)
 {
     RcCtx *c = (RcCtx *)ctx;
-    if (!c || nprog <= 0) return -1;
+    if (!c || c->tiled || nprog <= 0) return -1;
+    /* P x N output: no production path may scale with it, and C cannot see
+       the Rust cfg(test) gate on the caller. */
+    if ((unsigned long long)nprog * (unsigned long long)c->n * 4ULL > RC_PREDICT_CAP_BYTES) return -1;
     if (rc_set_programs(ctx, prog, off, nprog) != 0) return -1;
     int slot = c->arena_slot;
     /* #285: the upload may still be in flight on S_h2d. */
     if (c->arena_upload_async) cudaStreamWaitEvent(0, c->ev_upload[slot], 0);
     size_t total = (size_t)nprog * (size_t)c->n;
     float *d_pred = 0;
-    if (cudaMalloc((void **)&d_pred, sizeof(float) * total) != 0) return -1;
+    if (rc_dev_alloc(c, "predict", (void **)&d_pred, sizeof(float) * total) != 0) return -1;
     int threads = RC_MIN_THREADS;
     while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
     predict_kernel<<<nprog, threads>>>(c->d_cols, c->n, c->arena_prog[slot],
                                        c->arena_off[slot], d_pred);
     if (cudaGetLastError() != cudaSuccess) {
-        cudaFree(d_pred);
+        rc_dev_free(c, d_pred);
         return -1;
     }
     if (cudaMemcpy(out, d_pred, sizeof(float) * total, cudaMemcpyDeviceToHost)
         != cudaSuccess) {
-        cudaFree(d_pred);
+        rc_dev_free(c, d_pred);
         return -1;
     }
-    cudaFree(d_pred);
+    rc_dev_free(c, d_pred);
     return 0;
 }
 
@@ -3485,6 +3931,12 @@ int rc_arena_report(void *ctx, RcArenaReport *out)
     out->fs_batches = c->fs_batches;
     out->fs_dev_bytes = (unsigned long long)c->fs_dev_bytes;
     out->fs_pinned_bytes = (unsigned long long)c->fs_host_bytes;
+    out->tile_rows = c->tiled ? (unsigned long long)c->tile_rows : 0;
+    out->tiles = c->tile_count;
+    out->tile_uploads = c->tile_uploads;
+    out->tile_overlapped_uploads = c->tile_overlapped;
+    out->tile_pinned_bytes = c->tiled ? 2ULL * (unsigned long long)c->tile_bytes : 0;
+    out->waves = c->wave_count;
     return 0;
 }
 
@@ -3521,18 +3973,18 @@ int rc_pool_reserve(void *ctx, int nprog, int width)
         c->stats.alloc_ms += rc_now_ms() - t;
         return 0;
     }
-    if (c->d_pool[0]) { cudaFree(c->d_pool[0]); c->d_pool[0] = 0; }
-    if (c->d_pool[1]) { cudaFree(c->d_pool[1]); c->d_pool[1] = 0; }
+    if (c->d_pool[0]) { rc_dev_free(c, c->d_pool[0]); c->d_pool[0] = 0; }
+    if (c->d_pool[1]) { rc_dev_free(c, c->d_pool[1]); c->d_pool[1] = 0; }
     size_t bytes = sizeof(unsigned int) * (size_t)nprog * (size_t)width;
-    if (rc_alloc((void **)&c->d_pool[0], bytes) != 0 ||
-        rc_alloc((void **)&c->d_pool[1], bytes) != 0) {
+    if (rc_dev_alloc(c, "pool", (void **)&c->d_pool[0], bytes) != 0 ||
+        rc_dev_alloc(c, "pool", (void **)&c->d_pool[1], bytes) != 0) {
         c->stats.failed = 1;
         c->stats.alloc_ms += rc_now_ms() - t;
         return -1;
     }
     if (c->hash_cap < nprog) {
-        if (c->d_hash) { cudaFree(c->d_hash); c->d_hash = 0; }
-        if (rc_alloc((void **)&c->d_hash, sizeof(unsigned long long) * (size_t)nprog) != 0) {
+        if (c->d_hash) { rc_dev_free(c, c->d_hash); c->d_hash = 0; }
+        if (rc_dev_alloc(c, "hash", (void **)&c->d_hash, sizeof(unsigned long long) * (size_t)nprog) != 0) {
             c->d_hash = 0;
             c->hash_cap = 0;
             c->stats.failed = 1;
@@ -3566,12 +4018,12 @@ int rc_pool_upload(void *ctx, int which, const unsigned int *prog, int nprog)
 float rc_pool_eval(void *ctx, int which, int nprog, int width, float *out, int loss)
 {
     RcCtx *c = (RcCtx *)ctx;
-    if (!c || !c->d_pool[which & 1] || nprog <= 0) return -1.0f;
+    if (!c || c->tiled || !c->d_pool[which & 1] || nprog <= 0) return -1.0f;
     RcStats *st = &c->stats;
     double t = rc_now_ms();
     if (c->out_cap < nprog) {
-        if (c->d_out) cudaFree(c->d_out);
-        if (rc_alloc((void **)&c->d_out, sizeof(float) * (size_t)nprog) != 0) {
+        if (c->d_out) rc_dev_free(c, c->d_out);
+        if (rc_dev_alloc(c, "out", (void **)&c->d_out, sizeof(float) * (size_t)nprog) != 0) {
             c->d_out = 0;
             c->out_cap = 0;
             st->failed = 1;
@@ -3615,12 +4067,12 @@ float rc_pool_eval(void *ctx, int which, int nprog, int width, float *out, int l
 static int rc_score_reserve(RcCtx *c, int nprog)
 {
     if (c->score_cap >= nprog) return 0;
-    if (c->d_score_out) { cudaFree(c->d_score_out); c->d_score_out = 0; }
-    if (c->d_score_status) { cudaFree(c->d_score_status); c->d_score_status = 0; }
-    if (rc_alloc((void **)&c->d_score_out, sizeof(double) * (size_t)nprog) != 0 ||
-        rc_alloc((void **)&c->d_score_status, sizeof(int) * (size_t)nprog) != 0) {
-        if (c->d_score_out) { cudaFree(c->d_score_out); c->d_score_out = 0; }
-        if (c->d_score_status) { cudaFree(c->d_score_status); c->d_score_status = 0; }
+    if (c->d_score_out) { rc_dev_free(c, c->d_score_out); c->d_score_out = 0; }
+    if (c->d_score_status) { rc_dev_free(c, c->d_score_status); c->d_score_status = 0; }
+    if (rc_dev_alloc(c, "score_out", (void **)&c->d_score_out, sizeof(double) * (size_t)nprog) != 0 ||
+        rc_dev_alloc(c, "score_status", (void **)&c->d_score_status, sizeof(int) * (size_t)nprog) != 0) {
+        if (c->d_score_out) { rc_dev_free(c, c->d_score_out); c->d_score_out = 0; }
+        if (c->d_score_status) { rc_dev_free(c, c->d_score_status); c->d_score_status = 0; }
         c->score_cap = 0;
         return -1;
     }
@@ -3644,10 +4096,224 @@ static double rc_aic_value(int kind, double rss, int n, int k)
     return base + 2.0 * dk + 2.0 * dk * (dk + 1.0) / denom;
 }
 
+/* #293: lanes of the score launch, the block width of `score_kernel`. */
+static int rc_score_lanes(const RcCtx *c)
+{
+    int threads = RC_MIN_THREADS;
+    while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
+    return threads;
+}
+
+/* #293: the lane carry region for `ncand` candidates, ledger tag "carry".
+   Per candidate: two f64 lane arrays, the correlation mean and the bad flag.
+   Capacity only grows. */
+int rc_carry_reserve(void *ctx, int ncand)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || ncand <= 0) return -1;
+    if (c->carry_cap >= ncand) return 0;
+    if (c->d_carry) {
+        rc_dev_free(c, c->d_carry);
+        c->d_carry = 0;
+        c->carry_cap = 0;
+        c->alloc_calls++;
+        if (c->warm || c->carry_warm) c->steady_alloc_calls++;
+    }
+    const size_t bytes = (size_t)ncand * ((size_t)rc_score_lanes(c) * 16 + 16);
+    void *p = 0;
+    if (rc_dev_alloc_kind(c, "carry", &p, bytes, 0) != 0) return -1;
+    c->alloc_calls++;
+    if (c->warm || c->carry_warm) c->steady_alloc_calls++;
+    c->d_carry = (char *)p;
+    c->carry_cap = ncand;
+    return 0;
+}
+
+extern "C++" {
+template <int MODE, int PASS>
+static void rc_rows_pass(RcCtx *c, const unsigned int *prog, const unsigned int *off,
+                         int width, int pooled, int nprog, int lanes,
+                         const long long *bounds, int nbounds)
+{
+    double *lane_a = (double *)c->d_carry;
+    double *lane_b = lane_a + (size_t)nprog * (size_t)lanes;
+    double *pbar = lane_b + (size_t)nprog * (size_t)lanes;
+    int *bad = (int *)(pbar + nprog);
+    for (int k = 0; k + 1 < nbounds; ++k) {
+        score_rows_kernel<MODE, PASS><<<nprog, lanes>>>(
+            c->d_cols, c->n, 0, c->d_y, c->d_tsign, c->d_w64,
+            bounds[k], bounds[k + 1], prog, off, width, pooled,
+            lane_a, lane_b, bad, pbar, c->ybar);
+    }
+}
+
+template <int MODE>
+static void rc_rows_run(RcCtx *c, const unsigned int *prog, const unsigned int *off,
+                        int width, int pooled, int nprog, int lanes,
+                        const long long *bounds, int nbounds)
+{
+    double *lane_a = (double *)c->d_carry;
+    double *lane_b = lane_a + (size_t)nprog * (size_t)lanes;
+    double *pbar = lane_b + (size_t)nprog * (size_t)lanes;
+    int *bad = (int *)(pbar + nprog);
+    cudaMemsetAsync(c->d_carry, 0,
+                    (size_t)nprog * ((size_t)lanes * 16 + 16), 0);
+    rc_rows_pass<MODE, 0>(c, prog, off, width, pooled, nprog, lanes, bounds, nbounds);
+    if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
+        score_mid_kernel<MODE><<<nprog, lanes>>>(lane_a, lane_b, pbar, (long long)c->n);
+        rc_rows_pass<MODE, 1>(c, prog, off, width, pooled, nprog, lanes, bounds, nbounds);
+    }
+    score_finish_kernel<MODE><<<nprog, lanes>>>(
+        lane_a, lane_b, bad, (long long)c->n, c->syy, c->d_score_out, c->d_score_status);
+}
+
+static int rc_rows_dispatch(RcCtx *c, const unsigned int *prog, const unsigned int *off,
+                            int width, int pooled, int nprog, int kind, int lanes,
+                            const long long *bounds, int nbounds)
+{
+    switch (kind) {
+#define RC_ROWS_CASE(K) \
+        case K: rc_rows_run<K>(c, prog, off, width, pooled, nprog, lanes, bounds, nbounds); return 0;
+        RC_ROWS_CASE(RC_SCORE_SQUARED)
+        RC_ROWS_CASE(RC_SCORE_ABSOLUTE)
+        RC_ROWS_CASE(RC_SCORE_LOG_SQUASHED)
+        RC_ROWS_CASE(RC_SCORE_SIGNED)
+        RC_ROWS_CASE(RC_SCORE_MAXIMUM)
+        RC_ROWS_CASE(RC_SCORE_CORRELATION)
+        RC_ROWS_CASE(RC_SCORE_CORRELATION_SIGNED)
+        RC_ROWS_CASE(RC_SCORE_AIC)
+        RC_ROWS_CASE(RC_SCORE_AICC)
+        RC_ROWS_CASE(RC_SCORE_BIC)
+        RC_ROWS_CASE(RC_SCORE_LOG_LOSS)
+        RC_ROWS_CASE(RC_SCORE_BRIER)
+        RC_ROWS_CASE(RC_SCORE_HINGE_SIGMOID)
+        RC_ROWS_CASE(RC_SCORE_HINGE_ORDINARY)
+        RC_ROWS_CASE(RC_SCORE_HINGE_SQUARED)
+#undef RC_ROWS_CASE
+        default: return -1;
+    }
+}
+/* #293: candidates per wave in a tiled context, so the lane carry stays under
+   the partials cap. Resident launches use one wave. */
+static int rc_wave_width(const RcCtx *c, int nprog)
+{
+    if (!c->wave_cap_bytes) return nprog;
+    const unsigned long long per = (unsigned long long)rc_score_lanes(c) * 16ULL + 16ULL;
+    unsigned long long w = c->wave_cap_bytes / per;
+    if (w < 1) w = 1;
+    if (w > (unsigned long long)nprog) w = (unsigned long long)nprog;
+    return (int)w;
+}
+
+/* #293: stage tile rows `[r0, r0 + len)` into slot `slot` and run `launch`
+   on it. The copy runs on `s_h2d` behind the last kernel that read the slot;
+   the kernel runs on the default stream behind the copy. */
+template <typename Launch>
+static void rc_tile_step(RcCtx *c, int slot, long long r0, long long len, Launch launch)
+{
+    const long long n = c->n;
+    const long long T = c->tile_rows;
+    double t = rc_now_ms();
+    cudaEventSynchronize(c->ev_tile_copied[slot]);
+    for (int k = 0; k < c->v; ++k) {
+        memcpy(c->h_stage[slot] + (size_t)k * (size_t)T,
+               c->h_cols + (size_t)k * (size_t)n + (size_t)r0,
+               sizeof(float) * (size_t)len);
+    }
+    cudaStreamWaitEvent(c->s_h2d, c->ev_tile_used[slot], 0);
+    if (cudaEventQuery(c->ev_tile_used[slot ^ 1]) == cudaErrorNotReady) c->tile_overlapped++;
+    cudaMemcpyAsync(c->d_tile[slot], c->h_stage[slot], c->tile_bytes,
+                    cudaMemcpyHostToDevice, c->s_h2d);
+    cudaEventRecord(c->ev_tile_copied[slot], c->s_h2d);
+    cudaEventRecord(c->ev_tile_ready[slot], c->s_h2d);
+    c->tile_uploads++;
+    c->stats.h2d_ms += rc_now_ms() - t;
+    c->stats.h2d_bytes += (unsigned long long)c->tile_bytes;
+    cudaStreamWaitEvent(0, c->ev_tile_ready[slot], 0);
+    launch(c->d_tile[slot], (int)T, r0, r0 + len);
+    cudaEventRecord(c->ev_tile_used[slot], 0);
+}
+
+template <int MODE, int PASS>
+static void rc_tiles_pass(RcCtx *c, const unsigned int *prog, const unsigned int *off,
+                          int width, int pooled, int nw, int lanes)
+{
+    double *lane_a = (double *)c->d_carry;
+    double *lane_b = lane_a + (size_t)nw * (size_t)lanes;
+    double *pbar = lane_b + (size_t)nw * (size_t)lanes;
+    int *bad = (int *)(pbar + nw);
+    const long long n = c->n;
+    const long long T = c->tile_rows;
+    for (long long r0 = 0; r0 < n; r0 += T) {
+        const long long len = (n - r0 < T) ? (n - r0) : T;
+        const int slot = (int)(c->tile_seq++ & 1ULL);
+        rc_tile_step(c, slot, r0, len,
+            [&](const float *tile, int ld, long long b, long long e) {
+                score_rows_kernel<MODE, PASS><<<nw, lanes>>>(
+                    tile, ld, b, c->d_y, c->d_tsign, c->d_w64, b, e,
+                    prog, off, width, pooled, lane_a, lane_b, bad, pbar, c->ybar);
+            });
+        c->tile_count++;
+    }
+}
+
+template <int MODE>
+static void rc_tiles_run(RcCtx *c, const unsigned int *prog, const unsigned int *off,
+                         int width, int pooled, int nprog, int lanes, int wave)
+{
+    for (int w0 = 0; w0 < nprog; w0 += wave) {
+        const int nw = (nprog - w0 < wave) ? (nprog - w0) : wave;
+        const unsigned int *progw = pooled ? prog + (size_t)w0 * (size_t)width : prog;
+        const unsigned int *offw = pooled ? off : off + w0;
+        double *lane_a = (double *)c->d_carry;
+        double *lane_b = lane_a + (size_t)nw * (size_t)lanes;
+        double *pbar = lane_b + (size_t)nw * (size_t)lanes;
+        int *bad = (int *)(pbar + nw);
+        cudaMemsetAsync(c->d_carry, 0, (size_t)nw * ((size_t)lanes * 16 + 16), 0);
+        rc_tiles_pass<MODE, 0>(c, progw, offw, width, pooled, nw, lanes);
+        if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
+            score_mid_kernel<MODE><<<nw, lanes>>>(lane_a, lane_b, pbar, (long long)c->n);
+            rc_tiles_pass<MODE, 1>(c, progw, offw, width, pooled, nw, lanes);
+        }
+        score_finish_kernel<MODE><<<nw, lanes>>>(
+            lane_a, lane_b, bad, (long long)c->n, c->syy,
+            c->d_score_out + w0, c->d_score_status + w0);
+        c->wave_count++;
+    }
+}
+
+static int rc_tiles_dispatch(RcCtx *c, const unsigned int *prog, const unsigned int *off,
+                             int width, int pooled, int nprog, int kind, int lanes, int wave)
+{
+    switch (kind) {
+#define RC_TILES_CASE(K) \
+        case K: rc_tiles_run<K>(c, prog, off, width, pooled, nprog, lanes, wave); return 0;
+        RC_TILES_CASE(RC_SCORE_SQUARED)
+        RC_TILES_CASE(RC_SCORE_ABSOLUTE)
+        RC_TILES_CASE(RC_SCORE_LOG_SQUASHED)
+        RC_TILES_CASE(RC_SCORE_SIGNED)
+        RC_TILES_CASE(RC_SCORE_MAXIMUM)
+        RC_TILES_CASE(RC_SCORE_CORRELATION)
+        RC_TILES_CASE(RC_SCORE_CORRELATION_SIGNED)
+        RC_TILES_CASE(RC_SCORE_AIC)
+        RC_TILES_CASE(RC_SCORE_AICC)
+        RC_TILES_CASE(RC_SCORE_BIC)
+        RC_TILES_CASE(RC_SCORE_LOG_LOSS)
+        RC_TILES_CASE(RC_SCORE_BRIER)
+        RC_TILES_CASE(RC_SCORE_HINGE_SIGMOID)
+        RC_TILES_CASE(RC_SCORE_HINGE_ORDINARY)
+        RC_TILES_CASE(RC_SCORE_HINGE_SQUARED)
+#undef RC_TILES_CASE
+        default: return -1;
+    }
+}
+} /* extern "C++" */
+
 /* Shared launcher for the packed and fixed-slot pool entry points. */
 static float rc_score_launch(RcCtx *c, const unsigned int *prog,
                              const unsigned int *off, int width, int pooled,
                              int nprog, int kind, const int *pcount,
+                             const long long *bounds, int nbounds,
                              double *out, int *status)
 {
     RcStats *st = &c->stats;
@@ -3670,8 +4336,30 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
         return -1.0f;
     }
     t = rc_now_ms();
+    const int wave = c->tiled ? rc_wave_width(c, nprog) : nprog;
+    if ((bounds || c->tiled) && rc_carry_reserve(c, wave) != 0) {
+        st->failed = 1;
+        st->alloc_ms += rc_now_ms() - t;
+        st->wall_ms = rc_now_ms() - c->batch_start_ms;
+        return -1.0f;
+    }
+    st->alloc_ms += rc_now_ms() - t;
+    t = rc_now_ms();
     cudaEventRecord(c->t0, 0);
-    switch (kind) {
+    if (c->tiled) {
+        if (rc_tiles_dispatch(c, prog, off, width, pooled, nprog, kind, threads, wave) != 0) {
+            st->failed = 1;
+            st->wall_ms = rc_now_ms() - c->batch_start_ms;
+            return -1.0f;
+        }
+    } else if (bounds) {
+        if (rc_rows_dispatch(c, prog, off, width, pooled, nprog, kind, threads,
+                             bounds, nbounds) != 0) {
+            st->failed = 1;
+            st->wall_ms = rc_now_ms() - c->batch_start_ms;
+            return -1.0f;
+        }
+    } else switch (kind) {
         case RC_SCORE_SQUARED:
             score_kernel<RC_SCORE_SQUARED><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
@@ -3795,6 +4483,7 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     st->kernel_ms = (double)ms;
+    if (bounds || c->tiled) c->carry_warm = 1;
     st->batch = nprog;
     st->wall_ms = rc_now_ms() - c->batch_start_ms;
     return ms;
@@ -3817,7 +4506,30 @@ float rc_score_batch(void *ctx, const unsigned int *prog,
         cudaStreamWaitEvent(0, c->ev_upload[slot], 0);
     }
     return rc_score_launch(c, c->arena_prog[slot], c->arena_off[slot], 0, 0,
-                           nprog, kind, pcount, out, status);
+                           nprog, kind, pcount, 0, 0, out, status);
+}
+
+/* #293: score a packed batch over an explicit row partition `bounds`
+   (0 = b0 < ... < b_last = n), bit-identical to `rc_score_batch`. */
+float rc_score_rows(void *ctx, const unsigned int *prog, const unsigned int *off,
+                    int nprog, int kind, const int *pcount,
+                    const long long *bounds, int nbounds,
+                    double *out, int *status)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || c->tiled || nprog <= 0 || !out || !status || !bounds || nbounds < 2) return -1.0f;
+    if (bounds[0] != 0 || bounds[nbounds - 1] != (long long)c->n) return -1.0f;
+    for (int k = 0; k + 1 < nbounds; ++k) {
+        if (bounds[k + 1] <= bounds[k]) return -1.0f;
+    }
+    if (rc_set_programs(ctx, prog, off, nprog) != 0) return -1.0f;
+    const int slot = c->arena_slot;
+    if (!c->arena_prog[slot] || !c->arena_off[slot]) return -1.0f;
+    if (c->arena_upload_async) {
+        cudaStreamWaitEvent(0, c->ev_upload[slot], 0);
+    }
+    return rc_score_launch(c, c->arena_prog[slot], c->arena_off[slot], 0, 0,
+                           nprog, kind, pcount, bounds, nbounds, out, status);
 }
 
 /* #287: score the fixed-slot programs already uploaded to `which`. */
@@ -3828,7 +4540,7 @@ float rc_pool_score(void *ctx, int which, int nprog, int width, int kind,
     if (!c || !c->d_pool[which & 1] || nprog <= 0 || !out || !status)
         return -1.0f;
     return rc_score_launch(c, c->d_pool[which & 1], 0, width, 1, nprog, kind,
-                           pcount, out, status);
+                           pcount, 0, 0, out, status);
 }
 
 /* #118: start a fresh batch ledger. The Rust evaluator calls this once before
@@ -3882,31 +4594,33 @@ int rc_pool_hash(void *ctx, int which, int nprog, int width, unsigned long long 
    It is uploaded once here rather than per batch. */
 int rc_set_fit_data(void *ctx, const double *cols, const double *y, const double *w)
 {
+    g_alloc_fail_bytes = 0;
+    g_alloc_fail_tag[0] = 0;
     RcCtx *c = (RcCtx *)ctx;
-    if (!c || !cols || !y) return -1;
-    if (c->d_cols64) { cudaFree(c->d_cols64); c->d_cols64 = 0; }
-    if (c->d_y64) { cudaFree(c->d_y64); c->d_y64 = 0; }
-    if (c->d_w64) { cudaFree(c->d_w64); c->d_w64 = 0; }
+    if (!c || c->tiled || !cols || !y) return -1;
+    if (c->d_cols64) { rc_dev_free(c, c->d_cols64); c->d_cols64 = 0; }
+    if (c->d_y64) { rc_dev_free(c, c->d_y64); c->d_y64 = 0; }
+    if (c->d_w64) { rc_dev_free(c, c->d_w64); c->d_w64 = 0; }
     /* #288: the rank stage caches B from the previous target. Re-uploading
        exact rows invalidates it, or a scorer called after this would rank the
        new predictions against the old target. */
-    if (c->d_rank_b) { cudaFree(c->d_rank_b); c->d_rank_b = 0; }
+    if (c->d_rank_b) { rc_dev_free(c, c->d_rank_b); c->d_rank_b = 0; }
     c->rank_ready = 0;
     size_t cb = sizeof(double) * (size_t)c->n * (size_t)c->v;
     size_t yb = sizeof(double) * (size_t)c->n;
-    if (rc_alloc((void **)&c->d_cols64, cb) != 0) return -1;
-    if (rc_alloc((void **)&c->d_y64, yb) != 0) {
-        cudaFree(c->d_cols64);
+    if (rc_dev_alloc(c, "cols_f64", (void **)&c->d_cols64, cb) != 0) return -1;
+    if (rc_dev_alloc(c, "y_f64", (void **)&c->d_y64, yb) != 0) {
+        rc_dev_free(c, c->d_cols64);
         c->d_cols64 = 0;
         return -1;
     }
     rc_upload(c->d_cols64, cols, cb);
     rc_upload(c->d_y64, y, yb);
     if (w) {
-        if (rc_alloc((void **)&c->d_w64, yb) != 0) {
-            cudaFree(c->d_cols64);
+        if (rc_dev_alloc(c, "w_f64", (void **)&c->d_w64, yb) != 0) {
+            rc_dev_free(c, c->d_cols64);
             c->d_cols64 = 0;
-            cudaFree(c->d_y64);
+            rc_dev_free(c, c->d_y64);
             c->d_y64 = 0;
             return -1;
         }
@@ -3937,16 +4651,16 @@ int rc_set_score_weights(void *ctx, const double *w)
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c) return -1;
-    if (c->d_w64) { cudaFree(c->d_w64); c->d_w64 = 0; }
+    if (c->d_w64) { rc_dev_free(c, c->d_w64); c->d_w64 = 0; }
     if (!w) return 0;
     size_t yb = sizeof(double) * (size_t)c->n;
-    if (rc_alloc((void **)&c->d_w64, yb) != 0) {
+    if (rc_dev_alloc(c, "w_f64", (void **)&c->d_w64, yb) != 0) {
         c->d_w64 = 0;
         return -1;
     }
     rc_upload(c->d_w64, w, yb);
     if (cudaGetLastError() != cudaSuccess) {
-        cudaFree(c->d_w64);
+        rc_dev_free(c, c->d_w64);
         c->d_w64 = 0;
         return -1;
     }
@@ -3957,8 +4671,8 @@ int rc_set_fit_sign(void *ctx, const double *sign)
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c) return -1;
-    if (c->d_tsign) { cudaFree(c->d_tsign); c->d_tsign = 0; }
-    if (c->d_tsign64) { cudaFree(c->d_tsign64); c->d_tsign64 = 0; }
+    if (c->d_tsign) { rc_dev_free(c, c->d_tsign); c->d_tsign = 0; }
+    if (c->d_tsign64) { rc_dev_free(c, c->d_tsign64); c->d_tsign64 = 0; }
     c->has_tsign = 0;
     if (!sign) return 0;
     size_t yb = sizeof(double) * (size_t)c->n;
@@ -3967,8 +4681,8 @@ int rc_set_fit_sign(void *ctx, const double *sign)
     if (!host) return -1;
     for (int i = 0; i < c->n; ++i) host[i] = (float)sign[i];
     int ok = 1;
-    if (rc_alloc((void **)&c->d_tsign64, yb) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&c->d_tsign, yb32) != 0) ok = 0;
+    if (rc_dev_alloc(c, "tsign_f64", (void **)&c->d_tsign64, yb) != 0) ok = 0;
+    if (ok && rc_dev_alloc(c, "tsign", (void **)&c->d_tsign, yb32) != 0) ok = 0;
     if (ok) {
         rc_upload(c->d_tsign64, sign, yb);
         rc_upload(c->d_tsign, host, yb32);
@@ -3976,8 +4690,8 @@ int rc_set_fit_sign(void *ctx, const double *sign)
     }
     free(host);
     if (!ok) {
-        if (c->d_tsign) { cudaFree(c->d_tsign); c->d_tsign = 0; }
-        if (c->d_tsign64) { cudaFree(c->d_tsign64); c->d_tsign64 = 0; }
+        if (c->d_tsign) { rc_dev_free(c, c->d_tsign); c->d_tsign = 0; }
+        if (c->d_tsign64) { rc_dev_free(c, c->d_tsign64); c->d_tsign64 = 0; }
         return -1;
     }
     c->has_tsign = 1;
@@ -4014,7 +4728,7 @@ float rc_fit_batch(void *ctx,
                    int *outstatus)
 {
     RcCtx *c = (RcCtx *)ctx;
-    if (!c || nprog <= 0 || kmax <= 0) return -1.0f;
+    if (!c || c->tiled || nprog <= 0 || kmax <= 0) return -1.0f;
     /* #234: a log-loss batch without the uploaded label sign is refused here,
        so the arm can never run on another objective. */
     if (metric == RC_LOSS_LOGISTIC && !c->has_tsign) return -1.0f;
@@ -4197,7 +4911,7 @@ static int rc_rank_runs(RcCtx *c, RcRankWork *w, const long long *d_b, int n, lo
 static int rc_rank_prepare(void *ctx)
 {
     RcCtx *c = (RcCtx *)ctx;
-    if (!c) return -1;
+    if (!c || c->tiled) return -1;
     if (c->rank_ready) return 0;
     if (c->n <= 0) return -1;
     if (!c->s_fit) return -1;
@@ -4216,7 +4930,7 @@ static int rc_rank_prepare(void *ctx)
         rc_fs_drain(c);
         return -1;
     }
-    if (rc_alloc((void **)&c->d_rank_b, sizeof(long long) * (size_t)c->n) != 0) {
+    if (rc_dev_alloc(c, "rank_b", (void **)&c->d_rank_b, sizeof(long long) * (size_t)c->n) != 0) {
         c->d_rank_b = 0;
         return -1;
     }
@@ -4251,7 +4965,7 @@ static int rc_rank_prepare(void *ctx)
         rc_fs_drain(c);
     }
     if (!ok) {
-        cudaFree(c->d_rank_b);
+        rc_dev_free(c, c->d_rank_b);
         c->d_rank_b = 0;
         return -1;
     }
@@ -4281,7 +4995,7 @@ float rc_rank_score_batch(void *ctx,
                           unsigned long long *out_bb)
 {
     RcCtx *c = (RcCtx *)ctx;
-    if (!c || nsets <= 0 || ntrials <= 0 || kmax <= 0) return -1.0f;
+    if (!c || c->tiled || nsets <= 0 || ntrials <= 0 || kmax <= 0) return -1.0f;
     if (c->n <= 1) return -1.0f;
     if (rc_rank_prepare(ctx) != 0) return -1.0f;
     const int nsegs = nsets * ntrials;
@@ -4662,7 +5376,7 @@ float rc_max_scan_batch(void *ctx,
                         RcMaxOut *out)
 {
     RcCtx *c = (RcCtx *)ctx;
-    if (!c || nsets <= 0 || ntrials <= 0 || kmax <= 0 || kmax > FT_MAX_CONST_LARGE) return -1.0f;
+    if (!c || c->tiled || nsets <= 0 || ntrials <= 0 || kmax <= 0 || kmax > FT_MAX_CONST_LARGE) return -1.0f;
     if (c->n <= 0) return -1.0f;
     const int nsegs = nsets * ntrials;
     if ((long long)nsegs * (long long)c->n > 0x7FFFFFFFLL) return -1.0f;
@@ -4754,7 +5468,7 @@ float rc_order_stat_score_batch(void *ctx,
                                 int *out_status)
 {
     RcCtx *c = (RcCtx *)ctx;
-    if (!c || nsets <= 0 || ntrials <= 0 || kmax <= 0) return -1.0f;
+    if (!c || c->tiled || nsets <= 0 || ntrials <= 0 || kmax <= 0) return -1.0f;
     if (what != 0 && what != 1) return -1.0f;
     if (c->n <= 0) return -1.0f;
     const int nsegs = nsets * ntrials;
@@ -4889,6 +5603,45 @@ int rc_device_count(void)
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess) return -1;
     return n;
+}
+
+/* #293: free and total device memory and the L2 size, read once the context
+   exists so its own overhead is already subtracted from `free`. */
+int rc_device_memory(size_t *free_b, size_t *total_b, int *l2_bytes)
+{
+    if (cudaMemGetInfo(free_b, total_b) != cudaSuccess) return -1;
+    int l2 = 0;
+    if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, 0) != cudaSuccess) l2 = 0;
+    *l2_bytes = l2;
+    return 0;
+}
+
+/* #293: the device allocation ledger of one context. */
+int rc_alloc_report(void *ctx, RcAllocReport *out)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    out->requests = c->led_requests;
+    out->max_request_bytes = c->led_max_request;
+    out->live_bytes = c->led_live;
+    out->peak_live_bytes = c->led_peak;
+    out->refused = c->led_refused;
+    snprintf(out->max_request_tag, sizeof(out->max_request_tag), "%s", c->led_max_tag);
+    snprintf(out->refused_tag, sizeof(out->refused_tag), "%s", c->led_refused_tag);
+    return 0;
+}
+
+/* #293: tag of the most recent refused allocation, or an empty string. */
+const char *rc_last_alloc_failure_tag(void)
+{
+    return g_alloc_fail_tag;
+}
+
+/* #293: bytes of the most recent refused device allocation, or 0. */
+size_t rc_last_alloc_failure(void)
+{
+    return g_alloc_fail_bytes;
 }
 
 } /* extern "C" */

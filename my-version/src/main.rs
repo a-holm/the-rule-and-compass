@@ -580,6 +580,21 @@ SEARCH:
                              ring and copies on separate streams; set
                              RCSR_GPU_SYNC=1 to force the labelled blocking
                              fallback (#285)
+  --gpu-memory <size>        cap the device memory the run may plan on (bytes, or
+                             KiB/MiB/GiB/GB; default min(10.5 GiB, free - 1 GiB)).
+                             The plan runs before the first allocation. When
+                             the rows do not fit, --gpu exits 2 naming the
+                             stage, the bytes needed, the budget and the
+                             smallest fix (--vars, rows, --fit-strategy exact,
+                             --cpu); without --gpu the run keeps the CPU with
+                             backend_reason starting device_memory. An explicit
+                             --fit-strategy gpu whose f64 fit rows do not fit
+                             exits 2. When only the f32 rows do not fit, the
+                             rows stream from the host in tiles (scores are
+                             unchanged); the default fit and the exact rank and
+                             order scorers then run on the CPU and an explicit
+                             --fit-strategy gpu exits 2. JSON reports
+                             gpu.memory_plan
   --no-gpu                   force CPU evaluation (alias --cpu); also the
                              reproducibility escape hatch for a byte-identical
                              CPU trajectory
@@ -671,7 +686,7 @@ DISPATCH (#290):
   split with a machine reason; hysteresis (h=0.3) prevents oscillation at the
   crossover. A structural/arithmetic refusal (launch, unsupported_plan,
   too_few_rows, too_many_constants, ill_conditioned, non_finite,
-  metric_not_native, exactness) is never chosen by a timing test. Reported
+  metric_not_native, device_memory, exactness) is never chosen by a timing test. Reported
   numbers and finalists are still the exact CPU f64 rebuild.
 
 DEVELOPMENT LOG (#211) — on by default:
@@ -1035,7 +1050,7 @@ fn gpu_json(
         metric_is_squared,
     );
     format!(
-        "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"window_s\":{},\"host_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"residual_fraction\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"failed_batches\":{},\"programs\":{},\"evals\":{},\"row_evals\":{},\"evals_per_s\":{},\"row_evals_per_s\":{},\"batches_per_s\":{},\"eval_kernel_duty\":{},\"eval_window_s\":{},\"device_seconds_incl_fit\":{},\"device_fraction_of_run\":{},\"eval_fraction_of_run\":{},\"process_total_s\":{},\"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"sm_occupancy\":null,\"occupancy_source\":\"ncu (not run)\",\"quality_per_gpu_hour\":{},\"quality_scope\":\"evaluator_window_like_unit_ratio\",\"quality_per_gpu_hour_run\":{},\"ledger\":{},\"generations\":[{}],\"totals\":{}, {}}}",
+        "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"window_s\":{},\"host_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"residual_fraction\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"failed_batches\":{},\"programs\":{},\"evals\":{},\"row_evals\":{},\"evals_per_s\":{},\"row_evals_per_s\":{},\"batches_per_s\":{},\"eval_kernel_duty\":{},\"eval_window_s\":{},\"device_seconds_incl_fit\":{},\"device_fraction_of_run\":{},\"eval_fraction_of_run\":{},\"process_total_s\":{},\"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"sm_occupancy\":null,\"occupancy_source\":\"ncu (not run)\",\"quality_per_gpu_hour\":{},\"quality_scope\":\"evaluator_window_like_unit_ratio\",\"quality_per_gpu_hour_run\":{},\"ledger\":{},\"memory_plan\":{},\"generations\":[{}],\"totals\":{}, {}}}",
         jnum(a.kernel_s),
         jnum(a.launch_s),
         jnum(a.sync_s),
@@ -1079,6 +1094,10 @@ fn gpu_json(
             f64::NAN
         }),
         ledger,
+        g.memory_plan
+            .as_ref()
+            .map(|p| p.to_json_observed(g.observed.as_ref()))
+            .unwrap_or_else(|| "null".to_string()),
         gens.join(","),
         totals,
         fit
@@ -1845,6 +1864,8 @@ fn main() {
     // run follows the build/device default; `Some(true)` is `--gpu` and
     // `Some(false)` is `--no-gpu`/`--cpu`.
     let mut gpu_explicit: Option<bool> = None;
+    // #293: `--gpu-memory`, a device memory cap for the plan.
+    let mut gpu_memory: Option<u64> = None;
     let mut data_path: Option<String> = None;
     let mut target: Option<String> = None;
     let mut vars: Vec<String> = Vec::new();
@@ -2394,6 +2415,20 @@ fn main() {
             "--gpu" => {
                 cfg.gpu = true;
                 gpu_explicit = Some(true);
+            }
+            // #293: caps the device memory the plan may use.
+            "--gpu-memory" => {
+                let v = val!();
+                match parse_memory_bytes(&v) {
+                    Ok(n) if n > 0 => gpu_memory = Some(n),
+                    _ => {
+                        eprintln!(
+                            "error: --gpu-memory needs a positive size (bytes, KiB/MiB/GiB/GB), got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
             }
             "--no-gpu" | "--cpu" => {
                 cfg.gpu = false;
@@ -4502,6 +4537,21 @@ fn main() {
     // `--quiet` promises an empty stderr for machine-readable output, so it
     // suppresses the note and the one-line resource summary.
     cfg.gpu_notes = !quiet;
+    cfg.gpu_memory = gpu_memory;
+    // #293: the device memory plan runs before the search allocates anything.
+    // A refused fit stage, or a refused eval stage under an explicit `--gpu`,
+    // is a usage error naming the bytes and the smallest fix.
+    #[cfg(feature = "cuda")]
+    if cfg.gpu {
+        if let Some(plan) = search::device_plan_for(&cfg, &prepared.train) {
+            if let (Some(refusal), Some(text)) = (&plan.refusal, plan.refusal_text()) {
+                if refusal.stage == "fit" || gpu_explicit == Some(true) {
+                    eprintln!("error: {}", text);
+                    std::process::exit(EXIT_USAGE);
+                }
+            }
+        }
+    }
 
     // #141: one line stating the resources this run will use. `rows`/`cols`
     // are the training table (the search's hot loop); test rows are in the

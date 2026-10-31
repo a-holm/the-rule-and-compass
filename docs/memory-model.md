@@ -101,3 +101,103 @@ At 16.1M rows one `f64` column is 128 MiB, so the arena cannot hold even one
 full column; that case uses per-column staging and is reported as such. At the
 3.87M-row scale the arena holds two columns, and a 500k-row parity fixture holds
 eight. The pinned mirror is reused across blocks, never allocated per column.
+
+## Device memory plan (#293)
+
+Before the first device allocation the run computes a plan: a pure function in `src/memory.rs` (`device_plan`) of the workload, the free device memory and the caps. The device is queried once with `cudaMemGetInfo` after the CUDA context exists, so the context's own overhead is already subtracted from `free`.
+
+```text
+budget = min(cap 10.5 GiB, free - reserve 1 GiB, --gpu-memory)
+data_f32     = rows x (vars + 1) x 4 B                      scoring rows and target
+side_vectors = rows x 12 B (label sign) + rows x 8 B (weights), when present
+fit_twin     = rows x (vars + 1) x 8 B                      --fit-strategy gpu, or the exact rank/order scorer
+buffers      = 1 MiB + program slots, score, hash and fit regions, linear in the candidate count
+stat_wave    = max(512 MiB, 6 x (rows x 64 B + 1 MiB))      exact rank/order scorer only
+```
+
+Decision order:
+
+1. More than `i32::MAX` rows: refused at stage `eval`, because the kernels index rows with 32 bits.
+2. `data_f32 + side_vectors + buffers` within the budget: `resident`. An explicit device fit needs the twin as well, and the exact scorer needs the twin and the wave. A device fit that does not fit is refused at stage `fit`. A scorer that does not fit has `stat_route = cpu` and the run keeps the CPU.
+3. Otherwise `tiled` when two tiles of `tile_rows` rows, the side vectors, the buffers and at least one candidate's partials fit. `tile_rows` is the largest power of two with `2 x tile_rows x vars x 4 B` within L2, clamped to 512..8192. In this mode the feature columns stay on the host and stream through two device tiles. The target, label sign and weights stay resident. An explicit device fit is refused at stage `fit` ("tiled residency has no device fit"). The default fit and the exact rank and order-statistic scorers run on the CPU, and the plan routes name `device_memory`. The candidates are scored in waves of `partials / 4,112 B` so the lane carry stays under the partials cap (64 MiB).
+4. Otherwise refused at stage `eval`.
+
+A refusal names the stage, the bytes it needs, the budget and the smallest fixes, each computed by re-running the plan: `--vars K` (largest count that fits), the largest training row count, `--fit-strategy exact` (stage `fit`), raising `--gpu-memory` or freeing device memory held by other processes, `--cpu`.
+
+```text
+error: GPU memory plan refused the fit stage: the f64 fit twin does not fit beside the resident rows
+  need 19.50 GiB (20,933,704,236 bytes): rows f32 6.49 GiB + f64 fit twin 12.99 GiB + buffers 15.15 MiB (4,775,757 rows x 364 vars, P=10,000)
+  budget 10.09 GiB (10,830,741,504 bytes) = min(cap 10.50 GiB, free 11.09 GiB - reserve 1.00 GiB)
+  smallest fix: --vars 187; or at most 2457450 training rows (--sample-rows on store input, scaled by the train fraction); or --fit-strategy exact; or --cpu
+```
+
+Outcomes:
+
+* A refused `fit` stage exits 2, because a device fit is always explicit. A tiled run refuses `--fit-strategy gpu` the same way.
+* A refused `eval` stage exits 2 under `--gpu`. Without `--gpu` the run keeps the CPU, `backend` is `cpu`, `backend_reason` starts with `device_memory` and the route ledger names `device_memory`.
+* A device allocation that still fails is reported as `device_memory: the device refused an allocation of N bytes ...`, never as "no usable CUDA device".
+
+`--json` reports the plan as `gpu.memory_plan` (mode, budget and its source, free and total bytes, required bytes, every term, rows, vars, candidates, L2 bytes, tile rows, routes, the refusal with its fixes, and `observed`, the device allocation ledger of the run). The test hooks `RCSR_TEST_GPU_TILE_ROWS` and `RCSR_TEST_GPU_PARTIALS_CAP_BYTES` override the tile height and the partials cap.
+
+### Plan matrix
+
+Planned for the RTX 3060 with 11,353 MiB free (budget 10.09 GiB) and 4,775,757 rows. `P` is the candidate count; 10,000 is the largest case, and 1,000 changes only the buffer term. `memory::tests::device_plan_matrix` checks every cell.
+
+| vars | device fit | f32 rows | f64 twin | resident need | mode | fit route |
+|---:|---|---:|---:|---:|---|---|
+| 20 | off | 0.37 GiB | 0 | 0.44 GiB | resident | none |
+| 20 | on | 0.37 GiB | 0.75 GiB | 1.18 GiB | resident | device |
+| 56 | off | 1.01 GiB | 0 | 1.08 GiB | resident | none |
+| 56 | on | 1.01 GiB | 2.03 GiB | 3.11 GiB | resident | device |
+| 364 | off | 6.49 GiB | 0 | 6.56 GiB | resident | none |
+| 364 | on | 6.49 GiB | 12.99 GiB | 19.54 GiB | resident | refused: `--vars 187`, fewer rows, or `--fit-strategy exact` |
+
+When other processes hold the device, the budget shrinks. At a 1.0 GiB budget the 56-variable run without a device fit needs 1.05 GiB, so it runs `tiled` with 4,096-row tiles. The same budget refuses an explicit device fit at the fit stage. A 364-variable run needs about 48 GB of host memory when every column is used, so the host guard refuses it before the device plan matters.
+
+### Wide stores: 364 columns, 20 variables
+
+The projection (see above) reads only the columns a run uses, so the host and device footprint follow the 20 searched variables and not the 364-column header. The test `projection_gpu_search` builds a 364-column x 65,536-row store (ts, symbol, y, x0..x360), runs `--vars x0..x19 --time ts --group-by symbol --gpu --fit-strategy gpu --generations 3 --json --run-manifest --dev-log`, and asserts:
+
+* exit 0;
+* `projection.columns` in the run manifest has 23 names (ts, symbol, y, x0..x19);
+* `gpu.memory_plan.mode == "resident"`;
+* `peak_rss_bytes` of the development log under 8 GiB;
+* `gpu.memory_plan.observed.peak_live_bytes` under 10.5 GiB.
+
+It runs in about 7 seconds. The same builder writes the full-scale store with `cargo test --release --features cuda --test projection_gpu_search -- --ignored build_wide_364_store` (4,775,757 rows x 364 columns, 13.9 GB, one `write_store_appending` pass from the 23-column base and four shared filler column files; 135 s). The search is launched on that file with the `rcsr` binary:
+
+```sh
+rcsr --data 293-wide364.rcsb --target y --vars x0,...,x19 --time ts --group-by symbol \
+  --gpu --fit-strategy gpu --generations 3 --islands 4 --pop 128 --seed 7 \
+  --json --quiet --run-manifest m.json --dev-log dev.log
+```
+
+Measured on the RTX 3060 (12 GB), the machine otherwise in use at the lowest priority:
+
+| quantity | value | cap |
+|---|---:|---:|
+| exit status | 0 | |
+| projected columns | 23 | |
+| `memory_plan.mode` | resident | |
+| training rows | 3,581,818 | |
+| peak RSS (`peak_rss_bytes` of the dev log) | 4.77 GB (4.44 GiB) | 8 GiB |
+| peak RSS (`time -v`, maximum resident set) | 4.67 GB | 8 GiB |
+| observed device use (`peak_live_bytes`) | 945,905,560 B (0.88 GiB) | 10.5 GiB |
+| planned device need (`required_bytes`) | 947,408,336 B | 10.09 GiB |
+| prep wall (`timing.prep_seconds`) | 8.7 s | |
+| search wall (`timing.search_seconds`) | 1,705 s | |
+| baselines wall | 101 s | |
+| total wall (`timing.total_seconds`) | 1,820 s | |
+
+The search wall is dominated by host work: 47 candidates of generation 0 fall back to the CPU fit (132 s), and the process runs at the lowest CPU priority. The device kernels take 2.7 s of the run (`gpu_seconds`).
+
+### Resident scoring throughput
+
+Resident scoring of P candidates over 4,775,757 x 20 f32 rows (squared score, `score_pool`, median of 7 warm calls):
+
+| P | median | min | target |
+|---:|---:|---:|---:|
+| 400 | 0.139 s | 0.138 s | 0.25 s |
+| 4,096 | 1.285 s | 1.278 s | 2 s |
+
+The record is `resident_throughput_record` in `tests/projection_gpu_search.rs` (`--ignored --nocapture`). It is a measurement, not a gate.

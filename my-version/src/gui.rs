@@ -775,6 +775,7 @@ impl Default for RawOptions {
 const UNSUPPORTED: &[(&str, &str)] = &[
     ("--max-memory", "the server does not enforce the CLI memory guard"),
     ("--force", "the server does not enforce the CLI memory guard"),
+    ("--gpu-memory", "the server does not take a device memory cap"),
     ("--select-by", "the GUI uses the engine's default selection criterion"),
     ("--baseline-samples", "the GUI baseline uses the engine's default sample size"),
     ("--null-block", "the GUI null control only shuffles single rows"),

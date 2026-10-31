@@ -602,6 +602,58 @@ struct RawArenaReport {
     fs_batches: u64,
     fs_dev_bytes: u64,
     fs_pinned_bytes: u64,
+    tile_rows: u64,
+    tiles: u64,
+    tile_uploads: u64,
+    tile_overlapped_uploads: u64,
+    tile_pinned_bytes: u64,
+    waves: u64,
+}
+
+/// `RcAllocReport` in `src/cuda/eval.cu` field for field.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawAllocReport {
+    requests: u64,
+    max_request_bytes: u64,
+    live_bytes: u64,
+    peak_live_bytes: u64,
+    refused: u64,
+    max_request_tag: [u8; 32],
+    refused_tag: [u8; 32],
+}
+
+/// #293: the device allocation ledger of one evaluator. Every device
+/// allocation of the context is counted and tagged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocReport {
+    pub requests: u64,
+    pub max_request_bytes: u64,
+    pub max_request_tag: String,
+    pub live_bytes: u64,
+    pub peak_live_bytes: u64,
+    pub refused: u64,
+    pub refused_tag: String,
+}
+
+fn tag_text(raw: &[u8]) -> String {
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..end]).into_owned()
+}
+
+impl AllocReport {
+    /// The observed block of `gpu.memory_plan`.
+    pub fn observed(&self) -> crate::memory::DeviceObserved {
+        crate::memory::DeviceObserved {
+            requests: self.requests,
+            max_request_bytes: self.max_request_bytes,
+            max_request_tag: self.max_request_tag.clone(),
+            live_bytes: self.live_bytes,
+            peak_live_bytes: self.peak_live_bytes,
+            refused: self.refused,
+            refused_tag: self.refused_tag.clone(),
+        }
+    }
 }
 
 /// #285: what the batch arena is doing, for a test, benchmark or report.
@@ -637,6 +689,19 @@ pub struct ArenaReport {
     pub fit_device_bytes: u64,
     /// #334: current size of the pinned staging region in bytes.
     pub fit_pinned_bytes: u64,
+    /// #293: rows per tile, or `0` when the rows are resident.
+    pub tile_rows: u64,
+    /// #293: tile kernel launches, over all passes and waves.
+    pub tiles: u64,
+    /// #293: tile uploads issued.
+    pub tile_uploads: u64,
+    /// #293: uploads enqueued while the previous tile's kernel was still
+    /// outstanding.
+    pub tile_overlapped_uploads: u64,
+    /// #293: bytes of pinned host staging for the tile slots.
+    pub tile_pinned_bytes: u64,
+    /// #293: candidate waves launched.
+    pub waves: u64,
 }
 
 impl ArenaReport {
@@ -661,12 +726,29 @@ impl ArenaReport {
             fit_batches: raw.fs_batches,
             fit_device_bytes: raw.fs_dev_bytes,
             fit_pinned_bytes: raw.fs_pinned_bytes,
+            tile_rows: raw.tile_rows,
+            tiles: raw.tiles,
+            tile_uploads: raw.tile_uploads,
+            tile_overlapped_uploads: raw.tile_overlapped_uploads,
+            tile_pinned_bytes: raw.tile_pinned_bytes,
+            waves: raw.waves,
         }
     }
 }
 
 extern "C" {
-    fn rc_create(cols: *const f32, n: i32, v: i32, y: *const f32) -> *mut RawCtx;
+    fn rc_create(cols: *const f32, n: i32, v: i32, y: *const f32, budget: u64) -> *mut RawCtx;
+    fn rc_create_tiled(
+        cols: *const f32,
+        n: i32,
+        v: i32,
+        y: *const f32,
+        tile_rows: i32,
+        budget: u64,
+        wave_cap: u64,
+    ) -> *mut RawCtx;
+    fn rc_alloc_report(ctx: *mut RawCtx, out: *mut RawAllocReport) -> i32;
+    fn rc_last_alloc_failure_tag() -> *const std::os::raw::c_char;
     fn rc_destroy(ctx: *mut RawCtx);
     fn rc_set_programs(
         ctx: *mut RawCtx,
@@ -696,6 +778,19 @@ extern "C" {
         out: *mut f64,
         status: *mut i32,
     ) -> f32;
+    #[cfg(test)]
+    fn rc_score_rows(
+        ctx: *mut RawCtx,
+        prog: *const u32,
+        off: *const u32,
+        nprog: i32,
+        kind: i32,
+        pcount: *const i32,
+        bounds: *const i64,
+        nbounds: i32,
+        out: *mut f64,
+        status: *mut i32,
+    ) -> f32;
     fn rc_pool_score(
         ctx: *mut RawCtx,
         which: i32,
@@ -709,6 +804,7 @@ extern "C" {
     /* #118: start and read one batch's host-time ledger. */
     fn rc_stats_begin(ctx: *mut RawCtx);
     fn rc_last_stats(ctx: *mut RawCtx, out: *mut RawStats) -> i32;
+    #[cfg(test)]
     fn rc_predict(
         ctx: *mut RawCtx,
         prog: *const u32,
@@ -717,6 +813,8 @@ extern "C" {
         out: *mut f32,
     ) -> i32;
     fn rc_device_count() -> i32;
+    fn rc_device_memory(free_b: *mut usize, total_b: *mut usize, l2_bytes: *mut i32) -> i32;
+    fn rc_last_alloc_failure() -> usize;
     /* #122: persistent, fixed-capacity, double-buffered program arena. */
     fn rc_pool_reserve(ctx: *mut RawCtx, nprog: i32, width: i32) -> i32;
     fn rc_pool_upload(ctx: *mut RawCtx, which: i32, prog: *const u32, nprog: i32) -> i32;
@@ -857,6 +955,13 @@ struct RawMaxOut {
     status: i32,
 }
 
+/// #293: a half-open row range `[start, start + len)` of the resident rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowRange {
+    pub start: usize,
+    pub len: usize,
+}
+
 /// #287: one native scoring batch: `f64` values plus a per-candidate status.
 ///
 /// Unlike the legacy `Vec<f32>` SSE evaluator, a non-finite prediction is not
@@ -937,6 +1042,44 @@ pub fn probe() -> crate::backend::Probe {
         return crate::backend::Probe::cpu("CUDA device attributes unavailable");
     }
     crate::backend::Probe::gpu(name)
+}
+
+/// #293: free and total device memory and the L2 size. Call it after the
+/// context exists, so the context's own overhead is already subtracted.
+pub fn device_info() -> Option<crate::memory::DeviceInfo> {
+    let (mut free, mut total, mut l2) = (0usize, 0usize, 0i32);
+    let rc = unsafe { rc_device_memory(&mut free, &mut total, &mut l2) };
+    if rc != 0 || total == 0 {
+        return None;
+    }
+    Some(crate::memory::DeviceInfo {
+        free: free as u64,
+        total: total as u64,
+        l2_bytes: l2.max(0) as u64,
+    })
+}
+
+/// #293: bytes of the most recent allocation the device refused while a
+/// context or its fit rows were being created.
+pub fn last_alloc_failure() -> Option<u64> {
+    match unsafe { rc_last_alloc_failure() } {
+        0 => None,
+        bytes => Some(bytes as u64),
+    }
+}
+
+/// #293: the allocation tag of the most recent refused device allocation.
+pub fn last_alloc_failure_tag() -> Option<String> {
+    let raw = unsafe { rc_last_alloc_failure_tag() };
+    if raw.is_null() {
+        return None;
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 /// A compiled population: the postfix programs of many expressions laid out
@@ -1176,6 +1319,30 @@ fn auc_error_from_rank_sums(
     // the value bit-identical to the configured error.
     Some(1.0 - auc)
 }
+/// Device bytes a rank segment holds per row: the keys, the sorted copy, the
+/// run bookkeeping and the radix sort's own alternate buffers.
+pub(crate) const RANK_ROW_BYTES: u64 = 72;
+
+/// Device bytes an order-statistic segment holds per row: the keys, the sorted
+/// copy and the radix sort's alternate keys.
+pub(crate) const ORDER_ROW_BYTES: u64 = 64;
+
+
+/// #293 F1: how a rank or order-statistic score call is split so that one
+/// `n` rows and is charged `row_bytes` a row plus 1 MiB of fixed workspace.
+/// `n` rows and is charged 64 bytes a row plus 1 MiB of fixed workspace.
+/// Returns `(sets per wave, trials per call)`: whole trial lists while one list
+/// fits, otherwise one set at a time with the trial list cut into sub-waves. A
+/// single segment above the cap cannot be split further and still runs.
+pub(crate) fn wave_shape(n: usize, ntrials: usize, cap: u64, row_bytes: u64) -> (usize, usize) {
+    let per_seg = (n as u64).saturating_mul(row_bytes).saturating_add(1 << 20);
+    let segs = (cap / per_seg.max(1)).max(1) as usize;
+    if segs >= ntrials {
+        ((segs / ntrials).max(1), ntrials)
+    } else {
+        (1, segs)
+    }
+}
 
 /// A resident GPU evaluator: the dataset is uploaded once, then many batches of
 /// candidates can be scored without further host↔device traffic for the data.
@@ -1206,12 +1373,35 @@ pub struct GpuEvaluator {
     /// native AUC score is declined rather than computed from a wrong label
     /// mask. Unused by the order and rank-correlation statistics.
     target_classes: Option<(usize, usize)>,
+    /// #293: the host copy of the feature columns a tiled context streams
+    /// from. The device context holds a pointer into it.
+    host_cols: Option<Vec<f32>>,
 }
 
 impl GpuEvaluator {
     /// Upload a dataset. `cols` is column-major: `cols[var * n_rows + row]`.
     pub fn new(cols: &[f32], n_rows: usize, n_vars: usize, y: &[f32]) -> Option<Self> {
-        let ctx = unsafe { rc_create(cols.as_ptr(), n_rows as i32, n_vars as i32, y.as_ptr()) };
+        Self::with_budget(cols, n_rows, n_vars, y, None)
+    }
+
+    /// [`Self::new`] under a byte budget on the live device allocations of this
+    /// evaluator (#293). A request that would pass it is refused with its tag.
+    pub fn with_budget(
+        cols: &[f32],
+        n_rows: usize,
+        n_vars: usize,
+        y: &[f32],
+        budget: Option<u64>,
+    ) -> Option<Self> {
+        let ctx = unsafe {
+            rc_create(
+                cols.as_ptr(),
+                n_rows as i32,
+                n_vars as i32,
+                y.as_ptr(),
+                budget.unwrap_or(0),
+            )
+        };
         if ctx.is_null() {
             None
         } else {
@@ -1226,7 +1416,64 @@ impl GpuEvaluator {
                 ledger: crate::gpu_stats::RunLedger::new(),
                 loss: crate::fit::DeviceLoss::Squared,
                 target_classes: None,
+                host_cols: None,
             })
+        }
+    }
+
+    /// #293: an evaluator whose feature columns stay on the host and stream
+    /// through two device tiles of `tile_rows` rows. `cols` is column-major
+    /// like [`Self::new`]. Scores are bit-identical to the resident evaluator
+    /// for every tile size. `partials_cap` bounds the lane carry in bytes, so
+    /// a population is scored in waves when it would pass it. The fit, the
+    /// exact rank and order statistics and the f64 twin are refused.
+    pub fn new_tiled(
+        cols: Vec<f32>,
+        n_rows: usize,
+        n_vars: usize,
+        y: &[f32],
+        tile_rows: usize,
+        budget: Option<u64>,
+        partials_cap: Option<u64>,
+    ) -> Option<Self> {
+        if tile_rows == 0 || cols.len() != n_rows * n_vars || y.len() != n_rows {
+            return None;
+        }
+        let ctx = unsafe {
+            rc_create_tiled(
+                cols.as_ptr(),
+                n_rows as i32,
+                n_vars as i32,
+                y.as_ptr(),
+                tile_rows as i32,
+                budget.unwrap_or(0),
+                partials_cap.unwrap_or(0),
+            )
+        };
+        if ctx.is_null() {
+            return None;
+        }
+        Some(GpuEvaluator {
+            ctx,
+            n_rows: n_rows as u64,
+            pool_cap: 0,
+            pool_width: 0,
+            pool_last: 0,
+            stats: GpuStats::default(),
+            run_start: std::time::Instant::now(),
+            ledger: crate::gpu_stats::RunLedger::new(),
+            loss: crate::fit::DeviceLoss::Squared,
+            target_classes: None,
+            host_cols: Some(cols),
+        })
+    }
+
+    /// #293: how the feature columns live on the device.
+    pub fn residency(&self) -> crate::memory::Residency {
+        if self.host_cols.is_some() {
+            crate::memory::Residency::Tiled
+        } else {
+            crate::memory::Residency::Resident
         }
     }
 
@@ -1339,7 +1586,8 @@ impl GpuEvaluator {
     /// `NaN`, infinities and signed zeros exactly as the kernel produced them.
     ///
     /// Returns `None` on any CUDA failure.
-    pub fn predictions(&mut self, prog: &[u32], offsets: &[u32]) -> Option<Vec<f32>> {
+    #[cfg(test)]
+    pub(crate) fn predictions(&mut self, prog: &[u32], offsets: &[u32]) -> Option<Vec<f32>> {
         let nprog = offsets.len().saturating_sub(1);
         if nprog == 0 {
             return Some(Vec::new());
@@ -1392,6 +1640,29 @@ impl GpuEvaluator {
         result
     }
 
+    /// #293: the device allocation ledger of this evaluator.
+    pub fn alloc_report(&self) -> AllocReport {
+        let mut raw = RawAllocReport {
+            requests: 0,
+            max_request_bytes: 0,
+            live_bytes: 0,
+            peak_live_bytes: 0,
+            refused: 0,
+            max_request_tag: [0; 32],
+            refused_tag: [0; 32],
+        };
+        unsafe { rc_alloc_report(self.ctx, &mut raw) };
+        AllocReport {
+            requests: raw.requests,
+            max_request_bytes: raw.max_request_bytes,
+            max_request_tag: tag_text(&raw.max_request_tag),
+            live_bytes: raw.live_bytes,
+            peak_live_bytes: raw.peak_live_bytes,
+            refused: raw.refused,
+            refused_tag: tag_text(&raw.refused_tag),
+        }
+    }
+
     /// #285: the persistent arena's current state.
     ///
     /// `steady_alloc_calls` is the number of allocator calls made *after* the
@@ -1413,6 +1684,12 @@ impl GpuEvaluator {
             fs_batches: 0,
             fs_dev_bytes: 0,
             fs_pinned_bytes: 0,
+            tile_rows: 0,
+            tiles: 0,
+            tile_uploads: 0,
+            tile_overlapped_uploads: 0,
+            tile_pinned_bytes: 0,
+            waves: 0,
         };
         if unsafe { rc_arena_report(self.ctx, &mut raw) } != 0 {
             return ArenaReport::from_raw(&raw);
@@ -1560,6 +1837,68 @@ impl GpuEvaluator {
         })();
         self.record_batch(started.elapsed().as_secs_f64(), ok);
         let (values, status, ms) = result;
+        ScoreBatch { values, status, ms }
+    }
+
+    /// #293 seam: score an explicit row partition. `ranges` must tile
+    /// `[0, n)` in order without gaps; the result is bit-identical to
+    /// [`Self::score_batch`] for every partition. A malformed partition is a
+    /// failed launch (negative `ms`).
+    #[cfg(test)]
+    pub(crate) fn score_rows(
+        &mut self,
+        prog: &[u32],
+        offsets: &[u32],
+        objective: ScoreObjective,
+        pcount: &[i32],
+        ranges: &[RowRange],
+    ) -> ScoreBatch {
+        let nprog = offsets.len().saturating_sub(1);
+        let failed = || ScoreBatch {
+            values: Vec::new(),
+            status: Vec::new(),
+            ms: -1.0,
+        };
+        if nprog == 0 || pcount.len() != nprog || ranges.is_empty() {
+            return failed();
+        }
+        let mut bounds = Vec::with_capacity(ranges.len() + 1);
+        let mut next = 0usize;
+        bounds.push(0i64);
+        for r in ranges {
+            if r.start != next || r.len == 0 {
+                return failed();
+            }
+            next += r.len;
+            bounds.push(next as i64);
+        }
+        let mut values = vec![0.0f64; nprog];
+        let mut status = vec![0i32; nprog];
+        let ms = unsafe {
+            rc_stats_begin(self.ctx);
+            rc_score_rows(
+                self.ctx,
+                prog.as_ptr(),
+                offsets.as_ptr(),
+                nprog as i32,
+                objective.code(),
+                pcount.as_ptr(),
+                bounds.as_ptr(),
+                bounds.len() as i32,
+                values.as_mut_ptr(),
+                status.as_mut_ptr(),
+            )
+        };
+        let status = status
+            .into_iter()
+            .map(|code| {
+                if ms < 0.0 {
+                    ScoreStatus::DeviceError
+                } else {
+                    ScoreStatus::from_code(code)
+                }
+            })
+            .collect();
         ScoreBatch { values, status, ms }
     }
 
@@ -1988,6 +2327,17 @@ impl GpuEvaluator {
         plans: &[&crate::fit::GpuFitPlan],
         trials: &[Vec<Vec<f64>>],
     ) -> Option<Vec<Vec<Option<crate::metrics::RankSums>>>> {
+        self.rank_score_trials_capped(plans, trials, Self::RANK_WAVE_BYTES)
+    }
+
+    /// [`Self::rank_score_trials`] with an explicit wave size in bytes. The
+    /// sums are exact integers, so the split cannot change a score.
+    pub(crate) fn rank_score_trials_capped(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        trials: &[Vec<Vec<f64>>],
+        wave_bytes: u64,
+    ) -> Option<Vec<Vec<Option<crate::metrics::RankSums>>>> {
         use crate::metrics::RankSums;
         let nsets = plans.len();
         if nsets == 0 || trials.len() != nsets {
@@ -2002,10 +2352,7 @@ impl GpuEvaluator {
             return None;
         }
         let kmax = plans.iter().map(|p| p.nconst).max()?;
-        // One segment holds `n` rows; the stage keeps six 8- or 4-byte buffers
-        // per row plus fixed workspace, so charge 64 bytes a row.
-        let per_seg = (n as u64).saturating_mul(64).saturating_add(1 << 20);
-        let wave_sets = (Self::RANK_WAVE_BYTES / per_seg.max(1) / ntrials as u64).max(1) as usize;
+        let (wave_sets, chunk) = wave_shape(n, ntrials, wave_bytes, RANK_ROW_BYTES);
         let mut out: Vec<Vec<Option<RankSums>>> = vec![vec![None; ntrials]; nsets];
         let join = |hi: u64, lo: u64| -> i128 { (((hi as u128) << 64) | lo as u128) as i128 };
         let mut start = 0usize;
@@ -2021,53 +2368,59 @@ impl GpuEvaluator {
                 off.push(words.len() as u32);
                 pcount.push(plan.nconst as i32);
             }
-            let segs = (end - start) * ntrials;
-            let mut c0 = vec![0.0f64; segs * kmax];
-            for (k, list) in trials[start..end].iter().enumerate() {
-                for (t, c) in list.iter().enumerate() {
-                    let base = (k * ntrials + t) * kmax;
-                    if c.len() != wave[k].nconst || c.len() > kmax {
-                        return None;
+            let mut t0 = 0usize;
+            while t0 < ntrials {
+                let t1 = (t0 + chunk).min(ntrials);
+                let width = t1 - t0;
+                let segs = (end - start) * width;
+                let mut c0 = vec![0.0f64; segs * kmax];
+                for (k, list) in trials[start..end].iter().enumerate() {
+                    for (t, c) in list[t0..t1].iter().enumerate() {
+                        let base = (k * width + t) * kmax;
+                        if c.len() != wave[k].nconst || c.len() > kmax {
+                            return None;
+                        }
+                        c0[base..base + c.len()].copy_from_slice(c);
                     }
-                    c0[base..base + c.len()].copy_from_slice(c);
                 }
-            }
-            let mut raw = vec![0u64; segs * 4];
-            let mut status = vec![0i32; segs];
-            let mut bb = [0u64; 2];
-            let ms = unsafe {
-                rc_rank_score_batch(
-                    self.ctx,
-                    words.as_ptr(),
-                    off.as_ptr(),
-                    pcount.as_ptr(),
-                    (end - start) as i32,
-                    ntrials as i32,
-                    kmax as i32,
-                    c0.as_ptr(),
-                    raw.as_mut_ptr(),
-                    status.as_mut_ptr(),
-                    bb.as_mut_ptr(),
-                )
-            };
-            if ms < 0.0 {
-                return None;
-            }
-            let sum_bb = join(bb[0], bb[1]);
-            for seg in 0..segs {
-                let k = start + seg / ntrials;
-                let t = seg % ntrials;
-                // status != 0: a non-finite prediction in that segment, which
-                // the exact scorer maps to +inf exactly like the CPU.
-                out[k][t] = if status[seg] == 0 {
-                    Some(RankSums {
-                        ab: join(raw[seg * 4], raw[seg * 4 + 1]),
-                        aa: join(raw[seg * 4 + 2], raw[seg * 4 + 3]),
-                        bb: sum_bb,
-                    })
-                } else {
-                    None
+                let mut raw = vec![0u64; segs * 4];
+                let mut status = vec![0i32; segs];
+                let mut bb = [0u64; 2];
+                let ms = unsafe {
+                    rc_rank_score_batch(
+                        self.ctx,
+                        words.as_ptr(),
+                        off.as_ptr(),
+                        pcount.as_ptr(),
+                        (end - start) as i32,
+                        width as i32,
+                        kmax as i32,
+                        c0.as_ptr(),
+                        raw.as_mut_ptr(),
+                        status.as_mut_ptr(),
+                        bb.as_mut_ptr(),
+                    )
                 };
+                if ms < 0.0 {
+                    return None;
+                }
+                let sum_bb = join(bb[0], bb[1]);
+                for seg in 0..segs {
+                    let k = start + seg / width;
+                    let t = t0 + seg % width;
+                    // status != 0: a non-finite prediction in that segment, which
+                    // the exact scorer maps to +inf exactly like the CPU.
+                    out[k][t] = if status[seg] == 0 {
+                        Some(RankSums {
+                            ab: join(raw[seg * 4], raw[seg * 4 + 1]),
+                            aa: join(raw[seg * 4 + 2], raw[seg * 4 + 3]),
+                            bb: sum_bb,
+                        })
+                    } else {
+                        None
+                    };
+                }
+                t0 = t1;
             }
             start = end;
         }
@@ -2249,6 +2602,18 @@ impl GpuEvaluator {
         trials: &[Vec<Vec<f64>>],
         want: crate::fit::OrderStat,
     ) -> Option<Vec<Vec<Option<f64>>>> {
+        self.order_stat_score_trials_capped(plans, trials, want, Self::MEDIAN_WAVE_BYTES)
+    }
+
+    /// [`Self::order_stat_score_trials`] with an explicit wave size in bytes.
+    /// Every segment is sorted on its own, so the split cannot change a value.
+    pub(crate) fn order_stat_score_trials_capped(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        trials: &[Vec<Vec<f64>>],
+        want: crate::fit::OrderStat,
+        wave_bytes: u64,
+    ) -> Option<Vec<Vec<Option<f64>>>> {
         let nsets = plans.len();
         if nsets == 0 || trials.len() != nsets {
             return None;
@@ -2268,13 +2633,7 @@ impl GpuEvaluator {
             return None;
         }
         let kmax = plans.iter().map(|p| p.nconst).max()?;
-        // One set holds `ntrials` segments of `n` rows; 64 bytes a row and
-        // segment covers the keys, their sorted copy and CUB's temporary.
-        let per_set = (n as u64)
-            .saturating_mul(64)
-            .saturating_mul(ntrials as u64)
-            .saturating_add(1 << 20);
-        let wave_sets = (Self::MEDIAN_WAVE_BYTES / per_set.max(1)).max(1) as usize;
+        let (wave_sets, chunk) = wave_shape(n, ntrials, wave_bytes, ORDER_ROW_BYTES);
         let mut out: Vec<Vec<Option<f64>>> = vec![vec![None; ntrials]; nsets];
         let mut start = 0usize;
         while start < nsets {
@@ -2289,45 +2648,51 @@ impl GpuEvaluator {
                 off.push(words.len() as u32);
                 pcount.push(plan.nconst as i32);
             }
-            let nsegs = (end - start) * ntrials;
-            let mut c0 = vec![0.0f64; nsegs * kmax];
-            for (k, list) in trials[start..end].iter().enumerate() {
-                for (t, c) in list.iter().enumerate() {
-                    let base = (k * ntrials + t) * kmax;
-                    if c.len() != wave[k].nconst || c.len() > kmax {
-                        return None;
+            let mut t0 = 0usize;
+            while t0 < ntrials {
+                let t1 = (t0 + chunk).min(ntrials);
+                let width = t1 - t0;
+                let nsegs = (end - start) * width;
+                let mut c0 = vec![0.0f64; nsegs * kmax];
+                for (k, list) in trials[start..end].iter().enumerate() {
+                    for (t, c) in list[t0..t1].iter().enumerate() {
+                        let base = (k * width + t) * kmax;
+                        if c.len() != wave[k].nconst || c.len() > kmax {
+                            return None;
+                        }
+                        c0[base..base + c.len()].copy_from_slice(c);
                     }
-                    c0[base..base + c.len()].copy_from_slice(c);
                 }
-            }
-            let mut values = vec![f64::NAN; nsegs];
-            let mut status = vec![0i32; nsegs];
-            let ms = unsafe {
-                rc_order_stat_score_batch(
-                    self.ctx,
-                    words.as_ptr(),
-                    off.as_ptr(),
-                    pcount.as_ptr(),
-                    (end - start) as i32,
-                    ntrials as i32,
-                    kmax as i32,
-                    c0.as_ptr(),
-                    want.device_code(),
-                    values.as_mut_ptr(),
-                    status.as_mut_ptr(),
-                )
-            };
-            if ms < 0.0 {
-                return None;
-            }
-            for seg in 0..nsegs {
-                let k = start + seg / ntrials;
-                let t = seg % ntrials;
-                out[k][t] = if status[seg] == 0 && values[seg].is_finite() {
-                    Some(values[seg])
-                } else {
-                    None
+                let mut values = vec![f64::NAN; nsegs];
+                let mut status = vec![0i32; nsegs];
+                let ms = unsafe {
+                    rc_order_stat_score_batch(
+                        self.ctx,
+                        words.as_ptr(),
+                        off.as_ptr(),
+                        pcount.as_ptr(),
+                        (end - start) as i32,
+                        width as i32,
+                        kmax as i32,
+                        c0.as_ptr(),
+                        want.device_code(),
+                        values.as_mut_ptr(),
+                        status.as_mut_ptr(),
+                    )
                 };
+                if ms < 0.0 {
+                    return None;
+                }
+                for seg in 0..nsegs {
+                    let k = start + seg / width;
+                    let t = t0 + seg % width;
+                    out[k][t] = if status[seg] == 0 && values[seg].is_finite() {
+                        Some(values[seg])
+                    } else {
+                        None
+                    };
+                }
+                t0 = t1;
             }
             start = end;
         }
@@ -8476,5 +8841,642 @@ mod persistent_tests {
         let again = ev.arena_report();
         assert_eq!(again.fit_alloc_calls, grown.fit_alloc_calls, "{again:?}");
         assert_eq!(again.fit_growths, grown.fit_growths, "{again:?}");
+    }
+}
+
+/// #289 §6.2, moved from `tests/classification_gpu.rs` when `predictions`
+/// became test-only (#293).
+#[cfg(test)]
+mod classification_parity_tests {
+    use super::*;
+    use crate::data::Sample;
+    use crate::expr::{self, constant, input, node, Op};
+    use crate::metrics::{self, Metric, ScoreObjective};
+
+    fn binary_sample(n: usize, positives: f64, noise: f64, seed: u64) -> Sample {
+        let mut x = Vec::with_capacity(n);
+        let mut score = Vec::with_capacity(n);
+        let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        for i in 0..n {
+            let t0 = i as f64 / (n.max(2) - 1) as f64 * 6.0 - 3.0;
+            let t1 = next() * 2.0 - 1.0;
+            let eps = next() * 2.0 - 1.0;
+            x.push(vec![t0, t1]);
+            score.push(0.9 * t0 + 0.5 * t1 + noise * 6.0 * eps);
+        }
+        let k = ((n as f64 * positives).round() as usize).clamp(1, n.max(1));
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| score[b].partial_cmp(&score[a]).unwrap_or(std::cmp::Ordering::Equal));
+        let mut y = vec![0.0; n];
+        for &i in order.iter().take(k) {
+            y[i] = 1.0;
+        }
+        Sample {
+            x,
+            y,
+            w: Vec::new(),
+            ys: Vec::new(),
+        }
+    }
+
+    fn affine(a: f64, b: f64) -> Node {
+        node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(a), input(0)]), constant(b)],
+        )
+    }
+
+    fn cpu_score(tree: &Node, s: &Sample, m: Metric) -> f64 {
+        let pred: Vec<f64> = s.x.iter().map(|r| expr::eval(tree, r)).collect();
+        metrics::score_weighted(&pred, &s.y, &s.w, m, expr::count_constants(tree))
+    }
+
+    fn evaluator(s: &Sample) -> GpuEvaluator {
+        let n = s.len();
+        let v = s.x.first().map(|r| r.len()).unwrap_or(0);
+        let mut cols = vec![0.0f32; n * v];
+        for (r, row) in s.x.iter().enumerate() {
+            for (k, &x) in row.iter().enumerate().take(v) {
+                cols[k * n + r] = x as f32;
+            }
+        }
+        let y32: Vec<f32> = s.y.iter().map(|&y| y as f32).collect();
+        let mut ev = GpuEvaluator::new(&cols, n, v, &y32).expect("device evaluator");
+        assert!(ev.set_fit_sign(&crate::fit::classification_signs_weighted(&s.y, &s.w)));
+        if !s.w.is_empty() {
+            assert!(ev.set_score_weights(&s.w));
+        }
+        ev
+    }
+
+    /// #289 §6.2: device vs CPU parity on identical f32 rows for every
+    /// objective, with the search's weighted denominator.
+    #[test]
+    fn device_matches_cpu_for_every_classification_objective() {
+        if !probe().available() {
+            eprintln!("skipping GPU test: no usable CUDA device");
+            return;
+        }
+        let s = binary_sample(2_000, 0.35, 0.25, 21);
+        let trees = [
+            affine(0.7, -0.2),
+            affine(-1.3, 0.4),
+            affine(0.0, 0.0),
+            node(Op::Tanh, vec![affine(1.1, 0.2)]),
+        ];
+        for objective in [
+            ScoreObjective::LogLoss,
+            ScoreObjective::Brier,
+            ScoreObjective::HingeSigmoid,
+            ScoreObjective::HingeOrdinary,
+            ScoreObjective::HingeSquared,
+        ] {
+            let mut ev = evaluator(&s);
+            let pop = Population::from_trees(trees.iter());
+            assert_eq!(pop.len(), trees.len());
+            let batch = ev.score_population(&pop, objective, &vec![0i32; pop.len()]);
+            assert!(batch.ms >= 0.0, "kernel launch failed");
+            assert!(batch.all_ok(), "{:?}", batch.status);
+            let preds = ev
+                .predictions(pop.programs().0, pop.programs().1)
+                .expect("raw predictions");
+            for (i, tree) in trees.iter().enumerate() {
+                let got = batch.values[i];
+                let rows: Vec<f64> = preds[i * s.len()..(i + 1) * s.len()]
+                    .iter()
+                    .map(|&v| v as f64)
+                    .collect();
+                let want = metrics::score_weighted(&rows, &s.y, &s.w, objective.metric(), 0);
+                let err = (got - want).abs() / want.abs().max(1.0);
+                assert!(
+                    err <= 1e-6,
+                    "{} model {i}: device {got} vs CPU {want} (rel {err:.2e})",
+                    objective.name()
+                );
+                // f32 rows versus the f64 model: the wider bound.
+                let f64want = cpu_score(tree, &s, objective.metric());
+                let f32err = (got - f64want).abs() / f64want.abs().max(1.0);
+                assert!(
+                    f32err <= 1e-5,
+                    "{} model {i}: f32-row error {f32err:.2e} exceeds 1e-5",
+                    objective.name()
+                );
+            }
+        }
+    }
+}
+
+/// #293: the P x N guard, the allocation ledger and the F1 wave split.
+#[cfg(test)]
+mod alloc_ledger_tests {
+    use super::*;
+    use crate::expr::{constant, input, node};
+    use crate::fit::{gpu_fit_plan_reason, OrderStat};
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// One variable with distinct values, no ties, plus an exact `f64` copy.
+    fn data(n: usize) -> (Vec<f32>, Vec<f64>, Vec<f32>, Vec<f64>) {
+        let mut x = vec![0.0f64; n];
+        let mut y = vec![0.0f64; n];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for i in 0..n {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let noise = ((state >> 11) as f64) / ((1u64 << 53) as f64) - 0.5;
+            x[i] = -2.0 + 4.0 * i as f64 / (n - 1) as f64 + 1e-3 * noise;
+            y[i] = 0.7 * x[i] + 0.1 + 0.4 * noise;
+        }
+        let x32 = x.iter().map(|&v| v as f32).collect();
+        let y32 = y.iter().map(|&v| v as f32).collect();
+        (x32, x, y32, y)
+    }
+
+    fn evaluator(n: usize) -> Option<GpuEvaluator> {
+        let (x32, x, y32, y) = data(n);
+        let mut ev = GpuEvaluator::new(&x32, n, 1, &y32)?;
+        assert!(ev.set_fit_data(&x, &y, &[]), "f64 fit data upload");
+        Some(ev)
+    }
+
+    fn linear() -> Node {
+        node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(0.8), input(0)]), constant(0.15)],
+        )
+    }
+
+    fn trial_lists(nsets: usize, ntrials: usize) -> Vec<Vec<Vec<f64>>> {
+        (0..nsets)
+            .map(|k| {
+                (0..ntrials)
+                    .map(|t| vec![0.3 + 0.17 * t as f64 + 0.05 * k as f64, -0.2 + 0.11 * t as f64])
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wave_shape_keeps_every_call_inside_the_cap() {
+        let cap = 512 * MIB;
+        for row_bytes in [RANK_ROW_BYTES, ORDER_ROW_BYTES] {
+        for n in [1_000usize, 100_000, 1_398_102, 1_500_000, 3_580_000, 4_775_757, 8_000_000] {
+            for ntrials in [1usize, 2, 6, 7, 20] {
+                let (sets, chunk) = wave_shape(n, ntrials, cap, row_bytes);
+                assert!(sets >= 1 && chunk >= 1 && chunk <= ntrials);
+                let per_seg = n as u64 * row_bytes + MIB;
+                if per_seg <= cap {
+                    assert!(
+                        (sets * chunk) as u64 * per_seg <= cap,
+                        "n {n} trials {ntrials}: {sets} sets x {chunk} trials exceed the cap"
+                    );
+                } else {
+                    assert_eq!((sets, chunk), (1, 1), "a single segment cannot be split");
+                }
+                if chunk < ntrials {
+                    assert_eq!(sets, 1, "a cut trial list is run one set at a time");
+                }
+            }
+        }
+        }
+        // The minimum batch the issue names: 6 trials x 3.58M rows x 64 B.
+        assert!(6 * 3_580_000u64 * 64 > cap);
+        assert_eq!(wave_shape(3_580_000, 6, cap, ORDER_ROW_BYTES), (1, 2));
+        assert_eq!(wave_shape(3_580_000, 6, cap, RANK_ROW_BYTES), (1, 2));
+    }
+
+    #[test]
+    fn rank_trial_sub_waves_equal_the_unsplit_scores() {
+        let Some(mut ev) = evaluator(3_000) else {
+            eprintln!("skipping GPU test: no usable CUDA device");
+            return;
+        };
+        let t = linear();
+        let p = gpu_fit_plan_reason(&t).expect("an eligible plan");
+        let plans = [&p, &p];
+        let trials = trial_lists(2, 6);
+        let unsplit = ev
+            .rank_score_trials_capped(&plans, &trials, u64::MAX)
+            .expect("unsplit rank call");
+        let per_seg = 3_000u64 * RANK_ROW_BYTES + MIB;
+        for segs in [1u64, 2, 4, 5] {
+            let cap = per_seg * segs;
+            assert_eq!(wave_shape(3_000, 6, cap, RANK_ROW_BYTES).1, segs as usize);
+            let split = ev
+                .rank_score_trials_capped(&plans, &trials, cap)
+                .expect("split rank call");
+            assert_eq!(split, unsplit, "cap of {segs} segments changed a rank sum");
+        }
+    }
+
+    #[test]
+    fn median_trial_sub_waves_equal_the_unsplit_scores() {
+        let Some(mut ev) = evaluator(3_001) else {
+            eprintln!("skipping GPU test: no usable CUDA device");
+            return;
+        };
+        let t = linear();
+        let p = gpu_fit_plan_reason(&t).expect("an eligible plan");
+        let plans = [&p, &p];
+        let trials = trial_lists(2, 6);
+        let unsplit = ev
+            .order_stat_score_trials_capped(&plans, &trials, OrderStat::Median, u64::MAX)
+            .expect("unsplit median call");
+        let per_seg = 3_001u64 * ORDER_ROW_BYTES + MIB;
+        for segs in [1u64, 2, 4, 5] {
+            assert_eq!(wave_shape(3_001, 6, per_seg * segs, ORDER_ROW_BYTES).1, segs as usize);
+            let split = ev
+                .order_stat_score_trials_capped(&plans, &trials, OrderStat::Median, per_seg * segs)
+                .expect("split median call");
+            for (a, b) in split.iter().flatten().zip(unsplit.iter().flatten()) {
+                assert_eq!(
+                    a.map(f64::to_bits),
+                    b.map(f64::to_bits),
+                    "cap of {segs} segments changed a median"
+                );
+            }
+        }
+    }
+
+    /// Six trials of 1.5M rows need 6 x n x 64 B above the 512 MiB cap. The
+    /// call must run in sub-waves and no single device request may pass it.
+    #[test]
+    fn rank_and_median_batches_above_the_cap_run_in_sub_waves() {
+        let n = 1_500_000usize;
+        assert!(6 * n as u64 * 64 > 512 * MIB);
+        let Some(mut ev) = evaluator(n) else {
+            eprintln!("skipping GPU test: no usable CUDA device");
+            return;
+        };
+        let t = linear();
+        let p = gpu_fit_plan_reason(&t).expect("an eligible plan");
+        let trials = trial_lists(1, 6);
+        let before = ev.alloc_report();
+        let sums = ev.rank_score_trials(&[&p], &trials).expect("rank call");
+        assert_eq!(sums[0].len(), 6);
+        assert!(sums[0].iter().all(|s| s.is_some()));
+        let after_rank = ev.alloc_report();
+        let med = ev
+            .order_stat_score_trials(&[&p], &trials, OrderStat::Median)
+            .expect("median call");
+        assert!(med[0].iter().all(|v| v.is_some()));
+        let after = ev.alloc_report();
+        eprintln!(
+            "max request {} B ({}), before {} B, after rank {} B",
+            after.max_request_bytes, after.max_request_tag, before.max_request_bytes,
+            after_rank.max_request_bytes
+        );
+        assert!(
+            after_rank.max_request_bytes <= 512 * MIB,
+            "rank request of {} B ({}) is above the cap",
+            after_rank.max_request_bytes,
+            after_rank.max_request_tag
+        );
+        assert!(
+            after.max_request_bytes <= 512 * MIB,
+            "median request of {} B ({}) is above the cap",
+            after.max_request_bytes,
+            after.max_request_tag
+        );
+        assert_eq!(after.refused, 0);
+    }
+
+    /// `rc_predict` refuses a P x N output above 64 MiB: C cannot see the
+    /// `cfg(test)` gate on its caller.
+    #[test]
+    fn rc_predict_refuses_a_p_by_n_output_above_the_cap() {
+        let n = 200_000usize;
+        let (x32, _, y32, _) = data(n);
+        let Some(mut ev) = GpuEvaluator::new(&x32, n, 1, &y32) else {
+            eprintln!("skipping GPU test: no usable CUDA device");
+            return;
+        };
+        let trees: Vec<Node> = (0..100).map(|_| input(0)).collect();
+        let pop = Population::from_trees(trees.iter());
+        assert_eq!(pop.len(), 100);
+        // 100 x 200,000 x 4 B = 80 MB.
+        assert!(ev.predictions(pop.programs().0, pop.programs().1).is_none());
+        let small: Vec<Node> = (0..2).map(|_| input(0)).collect();
+        let pop = Population::from_trees(small.iter());
+        let rows = ev
+            .predictions(pop.programs().0, pop.programs().1)
+            .expect("a small P x N output is allowed");
+        assert_eq!(rows.len(), 2 * n);
+    }
+
+    /// `predictions` allocates P x N, so it exists only in test builds.
+    #[test]
+    fn predictions_is_compiled_only_for_tests() {
+        let src = include_str!("gpu.rs");
+        let at = src
+            .find("pub(crate) fn predictions(")
+            .expect("predictions is defined");
+        let attr = src[..at].lines().rev().find(|l| !l.trim().is_empty()).unwrap();
+        assert_eq!(attr.trim(), "#[cfg(test)]");
+        let public = ["pub fn", " predictions("].concat();
+        assert!(!src.contains(&public));
+    }
+
+    /// A budget of the resident bytes plus 1 MiB lets the context exist and
+    /// refuses the f64 twin, naming the allocation.
+    #[test]
+    fn a_budget_refuses_the_f64_twin_with_its_tag() {
+        let n = 200_000usize;
+        let (x32, x, y32, y) = data(n);
+        let resident = (n * 4 + n * 4) as u64;
+        let Some(mut ev) = GpuEvaluator::with_budget(&x32, n, 1, &y32, Some(resident + MIB)) else {
+            eprintln!("skipping GPU test: no usable CUDA device");
+            return;
+        };
+        assert!(!ev.set_fit_data(&x, &y, &[]));
+        let report = ev.alloc_report();
+        assert_eq!(report.refused_tag, "cols_f64");
+        assert_eq!(report.refused, 1);
+        assert_eq!(report.live_bytes, resident);
+        assert_eq!(last_alloc_failure(), Some((n * 8) as u64));
+        assert_eq!(last_alloc_failure_tag().as_deref(), Some("cols_f64"));
+    }
+}
+
+/// #293: row-range scoring with the lane carry.
+#[cfg(test)]
+mod carry_tests {
+    use super::*;
+    use crate::expr::{constant, input, node, Op};
+
+    const KINDS: [ScoreObjective; 15] = [
+        ScoreObjective::Squared,
+        ScoreObjective::Absolute,
+        ScoreObjective::LogSquashed,
+        ScoreObjective::Signed,
+        ScoreObjective::Maximum,
+        ScoreObjective::Correlation,
+        ScoreObjective::CorrelationSigned,
+        ScoreObjective::Aic,
+        ScoreObjective::Aicc,
+        ScoreObjective::Bic,
+        ScoreObjective::LogLoss,
+        ScoreObjective::Brier,
+        ScoreObjective::HingeSigmoid,
+        ScoreObjective::HingeOrdinary,
+        ScoreObjective::HingeSquared,
+    ];
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 11
+        }
+        fn unit(&mut self) -> f64 {
+            self.next() as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    struct Data {
+        n: usize,
+        cols: Vec<f32>,
+        y: Vec<f32>,
+        sign: Vec<f64>,
+    }
+
+    /// Rows 10, 12 and 266 (or the last row) carry `|y| = 7`: with the constant
+    /// zero candidate the maximum ties inside one lane and across lanes.
+    fn data(n: usize) -> Data {
+        let mut rng = Lcg(0x5eed_0293 ^ n as u64);
+        let mut cols = vec![0.0f32; 2 * n];
+        let mut y = vec![0.0f32; n];
+        for i in 0..n {
+            let a = rng.unit() * 4.0 - 2.0;
+            let b = rng.unit() * 2.0 - 1.0;
+            cols[i] = a as f32;
+            cols[n + i] = b as f32;
+            y[i] = (0.7 * a + 0.3 * (2.0 * b).sin() + 0.2 * (rng.unit() - 0.5)) as f32;
+        }
+        for (k, &row) in [10usize, 12, 266, n - 1].iter().enumerate() {
+            if row < n {
+                y[row] = if k % 2 == 0 { 7.0 } else { -7.0 };
+            }
+        }
+        let sign = y.iter().map(|&v| if v > 0.1 { 1.0 } else { -1.0 }).collect();
+        Data { n, cols, y, sign }
+    }
+
+    fn trees() -> Vec<Node> {
+        let affine = node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(0.8), input(0)]), constant(0.15)],
+        );
+        let sine = node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Sin,
+                    vec![node(Op::Add, vec![node(Op::Mul, vec![constant(1.1), input(0)]), constant(0.1)])],
+                ),
+                node(Op::Mul, vec![constant(0.2), input(1)]),
+            ],
+        );
+        vec![
+            affine,
+            sine,
+            constant(0.0),
+            constant(0.5),
+            constant(f64::NAN),
+            node(Op::Mul, vec![input(0), input(1)]),
+            node(Op::Tanh, vec![node(Op::Mul, vec![constant(2.0), input(1)])]),
+            node(Op::Sub, vec![node(Op::Square, vec![input(0)]), input(1)]),
+        ]
+    }
+
+    fn evaluator(d: &Data, weights: &[f64]) -> Option<GpuEvaluator> {
+        if !probe().available() {
+            eprintln!("skipping GPU test: no usable CUDA device");
+            return None;
+        }
+        let mut ev = GpuEvaluator::new(&d.cols, d.n, 2, &d.y)?;
+        assert!(ev.set_fit_sign(&d.sign));
+        if !weights.is_empty() {
+            assert!(ev.set_score_weights(weights));
+        }
+        Some(ev)
+    }
+
+    fn uniform(n: usize, step: usize) -> Vec<RowRange> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start < n {
+            let len = step.min(n - start);
+            out.push(RowRange { start, len });
+            start += len;
+        }
+        out
+    }
+
+    /// 30 seeded cuts, unaligned, with adjacent cuts so 1-row ranges occur.
+    fn seeded(n: usize, seed: u64) -> Vec<RowRange> {
+        let mut rng = Lcg(seed);
+        let mut cuts = vec![1usize, 2, n - 1];
+        while cuts.len() < 30 {
+            let c = 1 + (rng.next() as usize) % (n - 1);
+            cuts.push(c);
+            if cuts.len() < 30 {
+                cuts.push((c + 1).min(n - 1));
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut out = Vec::new();
+        let mut start = 0;
+        for c in cuts {
+            if c > start {
+                out.push(RowRange { start, len: c - start });
+                start = c;
+            }
+        }
+        out.push(RowRange { start, len: n - start });
+        out
+    }
+
+    fn partitions(n: usize) -> Vec<(String, Vec<RowRange>)> {
+        let mut parts = vec![("whole".to_string(), vec![RowRange { start: 0, len: n }])];
+        for step in [512usize, 1024, 8192] {
+            parts.push((format!("uniform {step}"), uniform(n, step)));
+        }
+        for seed in [11u64, 29] {
+            let p = seeded(n, seed);
+            assert!(p.iter().any(|r| r.len == 1), "the seeded cuts include a 1-row range");
+            parts.push((format!("seeded {seed}"), p));
+        }
+        parts
+    }
+
+    fn assert_same(label: &str, got: &ScoreBatch, want: &ScoreBatch) {
+        assert!(got.ms >= 0.0, "{label}: launch failed");
+        assert_eq!(got.values.len(), want.values.len(), "{label}");
+        for k in 0..want.values.len() {
+            assert_eq!(got.status[k], want.status[k], "{label} slot {k} status");
+            assert_eq!(
+                got.values[k].to_bits(),
+                want.values[k].to_bits(),
+                "{label} slot {k}: {} vs {}",
+                got.values[k],
+                want.values[k]
+            );
+        }
+    }
+
+    fn check_case(d: &Data, weights: &[f64], case: &str) {
+        let Some(mut ev) = evaluator(d, weights) else { return };
+        let trees = trees();
+        let pop = Population::from_trees(trees.iter());
+        assert_eq!(pop.len(), trees.len());
+        let (prog, offsets) = pop.programs();
+        let pcount = vec![2i32; pop.len()];
+        let parts = partitions(d.n);
+        for objective in KINDS {
+            let want = ev.score_batch(prog, offsets, objective, &pcount);
+            assert!(want.ms >= 0.0, "{case} {}: resident launch", objective.name());
+            assert_ne!(want.status[4], ScoreStatus::Ok, "{case} {}: the NaN candidate is unusable", objective.name());
+            assert_eq!(want.values[4], f64::INFINITY);
+            for (name, ranges) in &parts {
+                let got = ev.score_rows(prog, offsets, objective, &pcount, ranges);
+                assert_same(&format!("{case} n={} {} {name}", d.n, objective.name()), &got, &want);
+            }
+        }
+    }
+
+    #[test]
+    fn row_ranges_match_the_resident_kernel_bitwise() {
+        for n in [100usize, 70_001] {
+            let d = data(n);
+            check_case(&d, &[], "unweighted");
+            let zero: Vec<f64> = (0..n)
+                .map(|i| if i % 3 == 0 { 0.0 } else { 1.0 + (i % 4) as f64 * 0.25 })
+                .collect();
+            check_case(&d, &zero, "zero weights");
+            let mut negative = vec![1.0f64; n];
+            negative[5] = -1.0;
+            check_case(&d, &negative, "negative weight");
+            check_case(&d, &vec![0.0f64; n], "all-zero weights");
+        }
+    }
+
+    #[test]
+    fn waves_do_not_change_scores() {
+        let d = data(70_001);
+        let Some(mut ev) = evaluator(&d, &[]) else { return };
+        let base = trees();
+        let all: Vec<Node> = (0..30).map(|i| base[i % base.len()].clone()).collect();
+        let ranges = uniform(d.n, 8192);
+        for objective in [ScoreObjective::Squared, ScoreObjective::Correlation, ScoreObjective::Maximum] {
+            let score = |ev: &mut GpuEvaluator, trees: &[Node]| {
+                let pop = Population::from_trees(trees.iter());
+                let (prog, offsets) = pop.programs();
+                let pcount = vec![2i32; pop.len()];
+                ev.score_rows(prog, offsets, objective, &pcount, &ranges)
+            };
+            let whole = score(&mut ev, &all);
+            let (a, b) = all.split_at(11);
+            let mut parts = score(&mut ev, a);
+            let tail = score(&mut ev, b);
+            parts.values.extend(tail.values);
+            parts.status.extend(tail.status);
+            assert_same(objective.name(), &parts, &whole);
+            let pop = Population::from_trees(all.iter());
+            let (prog, offsets) = pop.programs();
+            let resident = ev.score_batch(prog, offsets, objective, &vec![2i32; all.len()]);
+            assert_same(objective.name(), &whole, &resident);
+        }
+    }
+
+    #[test]
+    fn carry_region_is_steady() {
+        let d = data(70_001);
+        let Some(mut ev) = evaluator(&d, &[]) else { return };
+        let base = trees();
+        let many: Vec<Node> = (0..512)
+            .map(|i| {
+                node(
+                    Op::Add,
+                    vec![
+                        node(Op::Mul, vec![constant(0.001 * (i + 1) as f64), input(i % 2)]),
+                        base[i % base.len()].clone(),
+                    ],
+                )
+            })
+            .collect();
+        let pop = Population::from_trees(many.iter());
+        let (prog, offsets) = pop.programs();
+        let pcount = vec![2i32; pop.len()];
+        let ranges = uniform(d.n, 8192);
+        let first = ev.score_rows(prog, offsets, ScoreObjective::Squared, &pcount, &ranges);
+        assert!(first.ms >= 0.0);
+        let cold = ev.alloc_report();
+        let cold_arena = ev.arena_report();
+        assert_eq!(cold.max_request_tag, "carry");
+        assert_eq!(cold.max_request_bytes, 512 * (16 * 256 + 16));
+        for _ in 0..100 {
+            let again = ev.score_rows(prog, offsets, ScoreObjective::Squared, &pcount, &ranges);
+            assert_same("steady", &again, &first);
+        }
+        let steady = ev.alloc_report();
+        let arena = ev.arena_report();
+        assert_eq!(arena.steady_alloc_calls, 0, "{arena:?}");
+        assert_eq!(arena.alloc_calls, cold_arena.alloc_calls, "{arena:?}");
+        assert_eq!(steady.requests, cold.requests, "{steady:?}");
+        assert_eq!(steady.live_bytes, cold.live_bytes);
+        assert_eq!(steady.refused, 0);
     }
 }

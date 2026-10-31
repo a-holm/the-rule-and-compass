@@ -27,7 +27,7 @@ Route  = Device | Cpu | Split
 Reason = cost_device | cost_cpu | hysteresis_device | split_cost |
          cpu_contract | no_device | unsupported_plan | too_few_rows |
          too_many_constants | launch | ill_conditioned | non_finite |
-         metric_not_native | exactness | no_calibration
+         metric_not_native | device_memory | exactness | no_calibration
 ```
 
 Every stage answers: `vary`, `eval`, `fit`, `select`, `archive`, `features`,
