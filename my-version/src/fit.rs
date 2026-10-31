@@ -4005,20 +4005,53 @@ pub fn partial(tree: &Node, x: &[f64], var: usize) -> f64 {
 /// occur in `tree` receives `0`; an input index outside `x` is ignored (the
 /// same row would evaluate to `NaN`).
 pub fn input_gradients(tree: &Node, x: &[f64]) -> Vec<f64> {
-    let f = flatten(tree);
-    let n = f.op.len();
-    let mut c = vec![0.0; f.nconst];
-    for i in 0..n {
-        if f.cslot[i] >= 0 {
-            c[f.cslot[i] as usize] = f.val[i];
+    InputGradients::new(tree).gradient(x).to_vec()
+}
+
+/// One tree prepared for repeated input-gradient sweeps: the flat form, the
+/// constant vector and the scratch buffers are built once and reused per row.
+pub(crate) struct InputGradients {
+    f: Flat,
+    c: Vec<f64>,
+    v: Vec<f64>,
+    adj: Vec<f64>,
+    grad: Vec<f64>,
+}
+
+impl InputGradients {
+    pub(crate) fn new(tree: &Node) -> Self {
+        let f = flatten(tree);
+        let n = f.op.len();
+        let mut c = vec![0.0; f.nconst];
+        for i in 0..n {
+            if f.cslot[i] >= 0 {
+                c[f.cslot[i] as usize] = f.val[i];
+            }
+        }
+        InputGradients {
+            f,
+            c,
+            v: vec![0.0; n],
+            adj: vec![0.0; n],
+            grad: Vec::new(),
         }
     }
-    let mut v = vec![0.0; n];
-    eval_row(&f, x, &c, &mut v);
-    let mut adj = vec![0.0; n];
-    let mut grad = vec![0.0; x.len()];
-    backward_impl(&f, &v, &mut adj, None, Some(&mut grad));
-    grad
+
+    /// Replace the tree's own constants, in pre-order, with `values`.
+    pub(crate) fn set_constants(&mut self, values: &[f64]) {
+        for (&slot, &val) in self.f.normal_order.iter().zip(values) {
+            self.c[slot] = val;
+        }
+    }
+
+    /// `∇f` at `x`; one forward and one backward sweep, no allocation.
+    pub(crate) fn gradient(&mut self, x: &[f64]) -> &[f64] {
+        self.grad.clear();
+        self.grad.resize(x.len(), 0.0);
+        eval_row(&self.f, x, &self.c, &mut self.v);
+        backward_impl(&self.f, &self.v, &mut self.adj, None, Some(&mut self.grad));
+        &self.grad
+    }
 }
 
 #[cfg(test)]

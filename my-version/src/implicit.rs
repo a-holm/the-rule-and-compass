@@ -66,13 +66,23 @@ fn finite_positive(v: f64) -> bool {
 /// which is what the least-squares fitter needs; the metric uses the absolute
 /// value.
 pub fn signed_distance(tree: &Node, row: &[f64]) -> Option<f64> {
+    signed_distance_with(tree, &mut fit::InputGradients::new(tree), row)
+}
+
+/// [`signed_distance`] on a prepared `grads` that was built from `tree` (with
+/// the same constants).
+fn signed_distance_with(
+    tree: &Node,
+    grads: &mut fit::InputGradients,
+    row: &[f64],
+) -> Option<f64> {
     let f = expr::eval(tree, row);
     if !f.is_finite() {
         return None;
     }
-    let grad = fit::input_gradients(tree, row);
+    let grad = grads.gradient(row);
     let mut norm_sq = 0.0;
-    for g in &grad {
+    for g in grad {
         if !g.is_finite() {
             return None;
         }
@@ -96,7 +106,11 @@ pub fn signed_distance(tree: &Node, row: &[f64]) -> Option<f64> {
 ///
 /// `+inf` when the candidate is undefined or the guard rejects the row.
 pub fn distance(tree: &Node, row: &[f64]) -> f64 {
-    match signed_distance(tree, row) {
+    distance_with(tree, &mut fit::InputGradients::new(tree), row)
+}
+
+fn distance_with(tree: &Node, grads: &mut fit::InputGradients, row: &[f64]) -> f64 {
+    match signed_distance_with(tree, grads, row) {
         Some(d) => d.abs(),
         None => f64::INFINITY,
     }
@@ -123,10 +137,19 @@ pub fn score(tree: &Node, s: &Sample, metric: Metric) -> f64 {
     if s.is_empty() {
         return f64::INFINITY;
     }
+    score_rows(tree, &s.x, &s.w, metric)
+}
+
+/// [`score`] on bare rows and weights (empty `w` means every row weighs 1).
+pub fn score_rows(tree: &Node, x: &[Vec<f64>], w: &[f64], metric: Metric) -> f64 {
+    if x.is_empty() {
+        return f64::INFINITY;
+    }
+    let mut grads = fit::InputGradients::new(tree);
     let mut total = 0.0;
     let mut sum = 0.0;
-    for (i, row) in s.x.iter().enumerate() {
-        let w = s.weight(i);
+    for (i, row) in x.iter().enumerate() {
+        let w = w.get(i).copied().unwrap_or(1.0);
         if !w.is_finite() || w < 0.0 {
             return f64::INFINITY;
         }
@@ -134,7 +157,7 @@ pub fn score(tree: &Node, s: &Sample, metric: Metric) -> f64 {
             continue;
         }
         let d = match metric {
-            Metric::ImplicitDerivative => distance(tree, row),
+            Metric::ImplicitDerivative => distance_with(tree, &mut grads, row),
             Metric::ImplicitResidual => residual(tree, row),
             _ => return f64::INFINITY,
         };
@@ -153,7 +176,12 @@ pub fn score(tree: &Node, s: &Sample, metric: Metric) -> f64 {
 
 /// The per-row signed residuals used by [`fit`]; a zero-weight row contributes
 /// `0` and never influences the constants.
-fn residuals(tree: &Node, x: &[Vec<f64>], w: &[f64]) -> Option<Vec<f64>> {
+fn residuals(
+    tree: &Node,
+    grads: &mut fit::InputGradients,
+    x: &[Vec<f64>],
+    w: &[f64],
+) -> Option<Vec<f64>> {
     if !w.is_empty() && w.len() != x.len() {
         return None;
     }
@@ -167,7 +195,7 @@ fn residuals(tree: &Node, x: &[Vec<f64>], w: &[f64]) -> Option<Vec<f64>> {
             out.push(0.0);
             continue;
         }
-        let d = signed_distance(tree, row)?;
+        let d = signed_distance_with(tree, grads, row)?;
         out.push(wi.sqrt() * d);
     }
     Some(out)
@@ -252,8 +280,30 @@ fn solve(a: &[Vec<f64>], b: &[f64], lambda: f64, k: usize) -> Option<Vec<f64>> {
     Some(d)
 }
 
+/// A tree prepared for repeated residual evaluation: one working copy whose
+/// constants are swapped in place, and one flat form built once.
+struct Level {
+    tree: Node,
+    grads: fit::InputGradients,
+}
+
+impl Level {
+    fn new(tree: &Node) -> Self {
+        Level {
+            grads: fit::InputGradients::new(tree),
+            tree: tree.clone(),
+        }
+    }
+
+    fn residuals(&mut self, c: &[f64], x: &[Vec<f64>], w: &[f64]) -> Option<Vec<f64>> {
+        set_constants(&mut self.tree, c);
+        self.grads.set_constants(c);
+        residuals(&self.tree, &mut self.grads, x, w)
+    }
+}
+
 fn rss_of(tree: &Node, x: &[Vec<f64>], w: &[f64]) -> f64 {
-    match residuals(tree, x, w) {
+    match residuals(tree, &mut fit::InputGradients::new(tree), x, w) {
         Some(r) => cost(&r),
         None => f64::INFINITY,
     }
@@ -288,19 +338,20 @@ pub fn fit(tree: &mut Node, x: &[Vec<f64>], w: &[f64], iters: usize) -> f64 {
     if iters == 0 {
         return rss_of(tree, x, w);
     }
-    let base = tree.clone();
-    let base_r = match residuals(&base, x, w) {
+    let mut level = Level::new(tree);
+    let base_r = match level.residuals(&initial, x, w) {
         Some(r) => r,
         None => return f64::INFINITY,
     };
     let mut best_c = initial;
-    let mut best_sse = cost(&base_r);
+    let initial_sse = cost(&base_r);
+    let mut best_sse = initial_sse;
     let mut c = best_c.clone();
     let mut lambda = 1e-3;
     let n = x.len();
 
     for _ in 0..iters.max(1) {
-        let r = match residuals(&base_with(&base, &c), x, w) {
+        let r = match level.residuals(&c, x, w) {
             Some(r) => r,
             None => break,
         };
@@ -316,8 +367,8 @@ pub fn fit(tree: &mut Node, x: &[Vec<f64>], w: &[f64], iters: usize) -> f64 {
             cp[j] += h;
             cm[j] -= h;
             match (
-                residuals(&base_with(&base, &cp), x, w),
-                residuals(&base_with(&base, &cm), x, w),
+                level.residuals(&cp, x, w),
+                level.residuals(&cm, x, w),
             ) {
                 (Some(rp), Some(rm)) => {
                     for i in 0..n {
@@ -375,7 +426,7 @@ pub fn fit(tree: &mut Node, x: &[Vec<f64>], w: &[f64], iters: usize) -> f64 {
             .zip(&step)
             .map(|(v, d)| (v + d).clamp(-1e6, 1e6))
             .collect();
-        match residuals(&base_with(&base, &trial), x, w) {
+        match level.residuals(&trial, x, w) {
             Some(rt) => {
                 let sse = cost(&rt);
                 if sse < best_sse {
@@ -402,16 +453,10 @@ pub fn fit(tree: &mut Node, x: &[Vec<f64>], w: &[f64], iters: usize) -> f64 {
         }
     }
 
-    if best_sse < rss_of(tree, x, w) {
+    if best_sse < initial_sse {
         set_constants(tree, &best_c);
     }
     best_sse
-}
-
-fn base_with(base: &Node, c: &[f64]) -> Node {
-    let mut t = base.clone();
-    set_constants(&mut t, c);
-    t
 }
 
 #[cfg(test)]
