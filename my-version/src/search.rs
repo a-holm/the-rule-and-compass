@@ -5411,14 +5411,7 @@ fn run_postfix_search(
         archive_refit: false,
         predictor_samples: 0,
         backend: crate::backend::Kind::Gpu,
-        backend_reason: if backend_reason.is_none()
-            && !gpu_used
-            && dispatcher.ledger().cost_model_kept_cpu()
-        {
-            Some("dispatch: cost model kept every stage on the cpu".to_string())
-        } else {
-            backend_reason
-        },
+        backend_reason,
         device,
         gpu: Some(stats),
         dispatch: dispatcher.snapshot(),
@@ -7021,7 +7014,11 @@ fn run_search(
         } else {
             crate::backend::Kind::Cpu
         },
-        backend_reason,
+        backend_reason: if backend_reason.is_none() && dispatcher.ledger().cost_model_kept_cpu() {
+            Some("dispatch: cost model kept every stage on the cpu".to_string())
+        } else {
+            backend_reason
+        },
         device: if gpu_used || fit_only_device {
             backend_device
         } else {
