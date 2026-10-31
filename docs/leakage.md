@@ -26,6 +26,8 @@ inputs that differ only where the answer must not change. The detectors live in
 | D13a-c target | a declared target (`--target-spec`): the future return or target as an input (a), a scale window that ends after the decision time (b), a structural term whose zero-return prediction depends on a column (c) | the label can be scored without forecasting a return; D13c has the override `--allow-target-structure` |
 | D12 fixtures | clean and leaky synthetic panels test the tests | the suite no longer catches the planted leak |
 
+The specs written by `rcsr::labels::LongLabelSpec::target_spec` list the forward return `fwd_<h>` as `return_column` and the scale `vol<W>` in `construction_columns`. D13a therefore refuses `fwd_<h>` and the target in `--vars`, and the spec carries `long_only: true` (`false` is refused). `tests/long_labels.rs::target_spec_links_to_the_construction_column_canary` links the label builder to the canary.
+
 `Report::assert_clean()` **panics** on a leak and prints the detector, column
 and row. `Report::result()` returns a `LeakageFailure` for callers that map it
 onto their own exit code. Neither path logs and continues.

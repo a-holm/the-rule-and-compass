@@ -275,6 +275,8 @@ after a gap rather than carrying state across an outage.
 by trailing volatility when requested, and drop labels whose window spans a gap.
 The builder reports warm-up, gap and stride row counts.
 
+`rcsr::labels` is the long-only label builder (`build(bars, spec, funding)`): `fwd`, `y`, `long_net`, action `{0,+1}`, the long-side triple barrier with `t1`, exit return, `m_net` and `m_barrier`, uniqueness weights and a report with the purge, `effective_n_hours` and a label hash. Its definitions are in [`time-series.md`](time-series.md#3b-long-only-labels-and-their-purge). The `fwd:` label above is the older single-column form: it subtracts the round trip before dividing by the trailing standard deviation, has no `sqrt(h)` factor, floor or clip, and has the GPU kernel (`gpu.label`); the long-only builder has no GPU kernel. `rcsr enrich` and `rcsr prep` refuse `side=short`, `--side short` and `--allow-short`, and refuse a `fwd:` stride below the horizon for horizons of 4 h and longer without `--allow-overlap`.
+
 ## Streaming over `.rcsb`
 
 `for_each_bar_from_store(path, f)` reads a column store one row group at a time
