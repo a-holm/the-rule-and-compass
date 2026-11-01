@@ -760,8 +760,11 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   (lower is better, all-flat is 1). Constants are still fitted with `--metric`. It needs a
   trading `--objective` and exits 2 with `--predictor-samples`, `--fit-samples`, `--implicit`,
   `--min-holding` above 1, `--max-position` other than 1, multiple targets or overlapping rows.
-  It runs on the CPU; resume needs the same cost, threshold and rows. `--json` adds
-  `search_fitness` and a `fitness` block per Pareto member. See
+  On the GPU the device scores the regret natively, fused with the program interpreter
+  (`search_fitness.scorer_backend` `cuda`); it equals the CPU book on the device's own `f32`
+  predictions bit for bit, and every reported value stays exact CPU `f64`. Resume needs the
+  same cost, threshold and rows. `--json` adds `search_fitness` and a `fitness` block per
+  Pareto member. See
   [`docs/walkforward.md`](docs/walkforward.md) and
   [`docs/optimisation.md`](docs/optimisation.md).
 * Time-ordered runs, runs with a target spec and runs with `--require-validation`

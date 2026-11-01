@@ -1595,7 +1595,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
             ? seg_start + RC_PNL_SEGMENT_ROWS
             : rows;
         unsigned int carry = 0u;
-        if (seg_start < 0) {
+        if (seg_start > 0) {
             const float q = rc_exec_row(code, cols, n, (int)(seg_start - 1));
             carry = rc_pnl_long(q, threshold) ? 1u : 0u;
         }

@@ -1962,7 +1962,7 @@ and `hinge_squared` are the separate SVM forms. A constant model has
 pin both optima.
 
 **Codes and dispatch.** The classification objectives occupy the score codes
-10–14, after the regression block 0–9 (#287), and slope is 15 (#236); the fit
+10–14, after the regression block 0–9 (#287), slope is 15 (#236) and the long/flat regret is 16 (#481); the fit
 `RC_LOSS_*` codes are 0–9. `metrics::score_dispatch` maps every classification metric to one of them,
 so `auc` stays a **named** refusal (`auc needs the exact rank scorer with
 labels (#288)`) rather than the old generic "classification metric" gate. The
@@ -2429,6 +2429,27 @@ to read GPU performance counters) on this host, so `sm_occupancy` stays `null`.
 `nsys profile -t cuda` traces the run, but its importer is missing here, so no
 CUPTI duty number is claimed. Kernel-time duty from the ledger is not a
 substitute for either.
+
+## Long/flat P&L regret on the device (issue #481)
+
+Under `--fitness pnl` the search ranks candidates by the long/flat regret `(B - net) / B` of `trading::FitnessBook` (`docs/optimisation.md`, `--fitness pnl`). On the GPU backend this is the native score objective `long_pnl_regret` (`ScoreObjective::LongPnl`, `RC_SCORE_LONG_PNL`, code 16), fused with the program interpreter: the device evaluates the program per row and reduces the book in the same pass, so predictions never leave the device. `--metric` only fits constants and keeps its device fit arm (the batched squared LM by default); it never stands in for the fitness.
+
+**Book.** `rc_set_pnl_book` uploads, once per run, the excess return per row (`f64`), the seam flags (`u8`: bit 1 first row of a group, bit 2 last row), the cost per side, the threshold, the hindsight bound and `--min-trades`. It is one allocation of 9 bytes per row (tag `pnl_book`, charged as a side vector in the device plan) and lives until `rc_destroy`. The rows are the resident training rows in canonical `(group, time)` order (#469). A refused allocation falls back to the CPU scorer with `backend_reason` `device_memory: the device refused an allocation of N bytes (tag pnl_book) for the long_pnl fitness book`; tiled residency is refused with `long_pnl fitness needs resident training rows (tiled residency: #293)`.
+
+**Kernel.** One block of 8 warps per candidate, whatever the row count. Segment `s` (8,192 rows) belongs to warp `s % 8`, which walks its segments in ascending order, 32 consecutive rows per step:
+
+* a row is long when its prediction is finite and `(double)pred > threshold`;
+* positions are `__ballot_sync` words; the position before row `k` of a step is bit `k - 1` of the ballot, the carried last bit of the previous step, or flat at a group start (`prev = ((m << 1) | carry) & ~first`);
+* flips are `popc((m ^ prev) & valid)`, exits `popc(m & last)`, long rows `popc(m)`, all integers;
+* a segment's carry is the position of the row before it, re-evaluated by the owning warp, so no warp waits for another and there is no per-segment state in shared memory. This costs one extra row evaluation per 8,192 rows;
+* `gross` is the only floating-point sum: lane `l` adds the excess of the long rows `segment_start + l + 32j` in ascending `j`, the lanes fold with `__shfl_down_sync` over 16, 8, 4, 2, 1, each warp adds its segment sums in ascending order, and thread 0 folds the 8 warp sums with 4, 2, 1. This is `FitnessBook::totals` term for term;
+* the regret is `__ddiv_rn(__dsub_rn(B, net), B)` with `net = __dsub_rn(gross, __dmul_rn(side, flips + exits))`, so no step can be contracted into an FMA.
+
+A non-finite prediction scores `+inf` with status 2; fewer flips than `--min-trades` scores `+inf` with status 0, the CPU value; an all-flat program scores exactly 1. There are no floating-point atomics, and the value depends only on `(program, rows)`, never on the batch, its size or the slot (`tests/pnl_fitness_gpu.rs::values_do_not_depend_on_the_batch`).
+
+**Exactness contract.** The device evaluates programs in `f32`, so a prediction within an `f32` rounding of the threshold can take the other position than the CPU `f64` evaluation. The contract is therefore stated on the device's own predictions: the device totals and regret equal `FitnessBook::totals` and `regret_of` applied to the `rc_predict` output of the same program, bit for bit (`device_totals_equal_the_cpu_tree_on_device_predictions`: 64 programs, 100,003 rows, 37 groups with starts on, before and after warp-step and segment boundaries, one-row groups and a group over three segments). Every value the GPU search writes to a candidate is this device score of the stored tree (`pipelined_search_archives_device_long_pnl_scores`, `pipelined_device_fit_archives_device_long_pnl_scores`). The reported archive, the per-member `fitness` block and the objective are the exact CPU `f64` rebuild; `--json` names `search_fitness.scorer_backend` `cuda` and `scorer_values` `screening_f32_predictions` next to `backend` `cpu_f64`.
+
+**Dispatch.** `search_score_objective` picks the objective of every device scoring path: `GpuSearch::score` (screening and the post-fit rescore), the overlap pipeline and the flat postfix arena. The CPU route of the #290 dispatcher and the unsupported-program fallback score with `FitnessBook::regret`.
 
 ## Long-only P&L reduction (issue #304)
 

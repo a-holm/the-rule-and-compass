@@ -2682,7 +2682,7 @@ fn score_pipeline_batch(
 #[cfg(feature = "cuda")]
 fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if !cfg.fitness.is_metric() {
-        return long_pnl_blocker(cfg, train).or(Some("long_pnl fitness has no device scorer yet")); // #481
+        return long_pnl_blocker(cfg, train); // #481
     }
     if train.is_multi() {
         return Some("multi-output objective");
