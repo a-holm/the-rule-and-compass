@@ -967,7 +967,7 @@ fn skip_existing_drops_equal_columns_and_appends_the_rest() {
     assert_eq!(report.skipped_existing, vec!["close".to_string(), "volume".to_string()]);
     assert_eq!(report.appended, vec!["r4".to_string()]);
     let out = FileStore::open(&path(&f.dir, "out.rcsb")).unwrap();
-    assert_eq!(out.header().n_cols(), FileStore::open(&f.panel).unwrap().header().n_cols() + 1);
+    assert_eq!(out.n_cols(), FileStore::open(&f.panel).unwrap().n_cols() + 1);
     assert!(leftovers(&f.dir).is_empty());
     let err = panel_append::append_family(&options(&f, &["close"], true, "out2.rcsb")).unwrap_err();
     assert!(err.contains("nothing to append"), "{err}");
