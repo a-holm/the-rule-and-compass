@@ -1300,16 +1300,6 @@ impl GpuSearch {
                 for ((i, j, plan), res) in jobs.iter().zip(out) {
                     let finite = res.c.iter().all(|v| v.is_finite());
                     let usable = crate::fit::fit_status_usable(res.status);
-                    if std::env::var_os("RCSR_DBG499").is_some() && finite && usable {
-                        let start = islands[*i][*j].tree.clone();
-                        let mut cpu = start.clone();
-                        let cpu_sse = crate::fit::fit_weighted(&mut cpu, &fit_train.x, &fit_train.y, &fit_train.w, cfg.fit_iters);
-                        let mut dev_t = start.clone();
-                        plan.apply(&mut dev_t, &res.c);
-                        let dev_sse = crate::fit::fit_weighted(&mut dev_t, &fit_train.x, &fit_train.y, &fit_train.w, 0);
-                        let st_sse = crate::fit::fit_weighted(&mut start.clone(), &fit_train.x, &fit_train.y, &fit_train.w, 0);
-                        eprintln!("DBG499 gen {generation} status {} start {st_sse:.9e} cpu {cpu_sse:.9e} dev {dev_sse:.9e} ratio {:.6} expr {}", res.status, dev_sse / cpu_sse, crate::expr::to_string(&start, &(0..8).map(|k| format!("x{k}")).collect::<Vec<_>>()));
-                    }
                     if gated && usable && finite {
                         let verdict = crate::fit::gate_device_proposal(
                             &mut islands[*i][*j].tree,
