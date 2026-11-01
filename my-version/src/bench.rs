@@ -395,6 +395,8 @@ pub struct Knobs {
     pub dispatch: Option<crate::dispatch::DispatchMode>,
     /// #470: `--linear-scaling`.
     pub linear_scaling: bool,
+    /// #496: arithmetic of the device fit polish.
+    pub fit_polish: Option<crate::fit::FitPolish>,
 }
 
 /// How to run the suite: noise levels, search budget, seed and criterion.
@@ -769,6 +771,9 @@ fn base_config(cfg: &SuiteConfig, seed: u32) -> Config {
         sc.dispatch = v;
     }
     sc.linear_scaling = k.linear_scaling; // #470
+    if let Some(v) = k.fit_polish {
+        sc.fit_polish = v;
+    }
     sc
 }
 
@@ -1453,7 +1458,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
     };
     let opt_u = |v: Option<usize>| json_opt(v);
     format!(
-        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"dispatch\":{},\"linear_scaling\":{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
+        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"dispatch\":{},\"fit_polish\":{},\"linear_scaling\":{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
         GENERATOR_VERSION,
         json_number(cfg.threshold),
         json_number(SIGNAL_THRESHOLD),
@@ -1472,6 +1477,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
         opt_u(k.restart_interval),
         k.variation.map_or("null".to_string(), |v| format!("\"{}\"", v.as_str())),
         k.dispatch.map_or("null".to_string(), |v| format!("\"{}\"", v.name())),
+        k.fit_polish.map_or("null".to_string(), |v| format!("\"{}\"", v.name())),
         k.linear_scaling,
         env!("CARGO_PKG_VERSION"),
         cfg!(feature = "cuda"),

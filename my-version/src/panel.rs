@@ -2045,6 +2045,11 @@ BUILD / AUDIT:
   --start <epoch|date>    build window start (default: panel first bar)
   --end <epoch|date>      build window end (default: panel last bar)
   --allow-lockbox         permit a window overlapping 2026H2 (declared final test only)
+  --locked-test <START,END>
+                          build (hourly v2): declare the protocol locked test (UTC,
+                          half-open) in <out>.manifest.json and <out>.schema.json;
+                          append and enrich copy it, and the search, walkforward,
+                          ladder and ablation score refuse it
   --resume <dir>          resumable build: one atomic binary part per symbol,
                           keyed by the store SHA-256, the membership decisions
                           and the settings; a fully warm re-run reads the parts
@@ -2076,6 +2081,13 @@ HOURLY V2 PANEL (#259):
   --require-full-bucket   base: drop an hour with fewer than four 15m bars (default)
   --keep-partial          base: keep it with cov15m 1-3 and the PARTIAL_BUCKET flag
   --interval <15m|1m>     base: archive interval; 1m only reaches the lockbox guard
+  --symbols <file>        snapshot, base: keep only the listed symbols (one per line; # comments
+                          and blank lines ignored; an empty list is a usage error). A listed
+                          symbol with no directory (missing) or an empty directory (empty)
+                          adds no rows and is not an error. The `universe` block of
+                          snapshot.json and <out>.manifest.json records the file SHA-256,
+                          listed, kept, dropped, missing and empty. A changed list rebuilds
+                          the base --resume parts
   --resume <dir>          base: per-symbol cache keyed by the archive SHA-256
   --relist SYMBOL@DATE    build: declare a listing break (repeatable, comma list)
   --listing-gap-days <n>  build: a longer gap between two bars starts a new listing (30)

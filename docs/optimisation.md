@@ -666,6 +666,91 @@ trend that matters is the AVX speed-up over the existing walk, which grows with
 the arithmetic share of the tree. Trees dominated by `sin`/`cos`/`exp` gain
 less because AVX alone cannot vectorise those functions.
 
+#### CPU benchmark fixture: `cpu_bench` modes (#472)
+
+`cpu_bench` is the named fixture for CPU before/after numbers. It runs in one
+process, reads no files and changes no engine code.
+
+```sh
+cargo run --release --bin cpu_bench -- --mode all --rows 20000 --tsv
+```
+
+| mode | what it measures | default rows |
+|---|---|---|
+| `eval` (default) | `expr::eval` walk, `eval_batch_scalar`, `eval_batch` (AVX) on the 5/9/15/25-node trees; output unchanged from the table above | 1000, 20000, 200000 |
+| `fit` | `fit_weighted(.., 0)` (one SSE pass) and `fit_weighted(.., 8)` on `arith15` and `trans13` | 20000, 150000, 1000000 |
+| `metric` | `fit_weighted_metric` on `arith15` for `squared`, `absolute`, `median`, `interquartile`, `rank_correlation`; `score_weighted` for `median` and `squared` | 20000, 150000 |
+| `scale` | T scoped threads share the data, each runs its own `fit_weighted(.., 8)` and `eval_batch` jobs | 20000, 150000, 1000000 |
+| `all` | the four above in turn | per mode |
+
+Flags: `--rows LIST` (overrides every mode's default; `0` or an empty list exits
+2), `--threads LIST` (`scale` only, default `1,2,4,8`, a value above
+`available_parallelism` is skipped with a note on stderr), `--min-seconds S`
+(per cell, default 0.3; `eval` keeps its 50 ms repetition batches unless set),
+`--fit-iters N` (metric fits, default 8), `--tsv`.
+
+Fixture. xorshift64 seeded with `0x9E3779B97F4A7C15`; 10 variables uniform in
+[-2, 2); `y = 1.5 sin(x0 x1) + 0.7 x2² - 0.3 exp(0.2 x3) + noise` with noise
+uniform in ±0.05. The `eval` mode keeps its own 5-variable generator so the
+published table stays reproducible. Fixed trees, parsed from strings:
+
+- `arith15`: `(1.1*x0 + 0.4*x1*x2) / (1.3 + x3*x3) - 0.2*x4` (4 constants)
+- `trans13`: `1.5*sin(x0*x1) + 0.7*x2*x2 - 0.3*exp(0.2*x3)` (4 constants)
+
+Timing. One warm-up, then the best of at least three runs, until
+`--min-seconds` has passed (the 8-iteration fit and metric fits skip the
+warm-up; the `scale` cells run once, as each cell is already many jobs).
+`pass_mrows` is rows per second of the one-pass `fit_weighted(.., 0)`.
+`scale` runs `max(8, 2_000_000 / rows)` fits and `max(8, 50_000_000 / rows)`
+evaluations split evenly over T threads; the speed-up is against T = 1.
+
+Hash. `hash` is FNV-1a 64 over the fitted constants' bits and the returned
+score's bits. A later fitter change that must stay bit-identical keeps every
+`fit` and `metric` hash. Two runs of the same binary print the same hashes. The
+`squared` metric hash equals the `arith15` `fit` hash for the same rows.
+
+##### Measured: full `--mode all --rows 20000`
+
+Host: Intel i7-3770K (4 cores, 8 threads, AVX without AVX2/FMA), date
+2026-11-01, load average 9.2 before and 9.1 after (shared host, other jobs
+running), suite lock held. Read ratios, not absolutes.
+
+| table | cell | value |
+|---|---|---|
+| eval | 5 nodes walk / SoA / AVX µs | 538.97 / 360.44 / 86.09 |
+| eval | 9 nodes walk / SoA / AVX µs | 1436.40 / 1126.17 / 763.43 |
+| eval | 15 nodes walk / SoA / AVX µs | 3142.44 / 2293.66 / 1633.46 |
+| eval | 25 nodes walk / SoA / AVX µs | 6441.61 / 4604.90 / 3424.26 |
+| fit | arith15: pass Mrow/s, 8-iteration fit s, hash | 11.13, 0.0976, `04a1faf819cb4481` |
+| fit | trans13: pass Mrow/s, 8-iteration fit s, hash | 7.40, 0.0647, `959fcb4d6eed6507` |
+| metric | squared fit s, hash | 0.0923, `04a1faf819cb4481` |
+| metric | absolute fit s, hash | 0.2698, `0fa1072137284ea7` |
+| metric | median fit s, hash | 0.2842, `afd265b8cf8152e2` |
+| metric | interquartile fit s, hash | 0.3025, `e9ac6b3998321ca4` |
+| metric | rank_correlation fit s, hash | 0.4801, `266b61b96788d729` |
+| score | median / squared ms | 0.5279 / 0.0379 |
+| scale | T = 1 / 2 / 4 / 8 fits/s | 10.27 / 19.46 / 29.46 / 37.40 |
+| scale | T = 1 / 2 / 4 / 8 eval Mrow/s | 13.6 / 26.8 / 43.9 / 56.5 |
+| scale | T = 8 speed-up, fits / eval | 3.64× / 4.16× |
+
+Larger row counts, each mode run on its own through the suite lock (load
+average 9 to 12):
+
+| rows | arith15 pass Mrow/s / fit s | trans13 pass Mrow/s / fit s | median / squared score ms |
+|---:|---|---|---|
+| 150 000 | 10.19 / 0.4798 | 4.74 / 0.9171 | 6.16 / 0.340 |
+| 1 000 000 | 7.99 / 5.7263 | 4.19 / 5.5664 | not run |
+
+| rows (150 000) | squared | absolute | median | interquartile | rank_correlation |
+|---|---:|---:|---:|---:|---:|
+| metric fit s | 0.6053 | 3.2224 | 4.8839 | 3.3800 | 7.2109 |
+
+| rows | T = 1 / 2 / 4 / 8 fits/s | T = 8 speed-up | T = 1 / 8 eval Mrow/s |
+|---:|---|---:|---|
+| 150 000 | 1.77 / 3.33 / 4.24 / 5.34 | 3.01× | 11.3 / 39.0 |
+
+`scale` at 1 000 000 rows was not run.
+
 #### Constants behind `sign` and `step`
 
 `sign` and `step` are piecewise constant: their derivative is zero almost
@@ -1245,10 +1330,11 @@ stages; fitting and all f64 reporting stay on the CPU.
 
 `--objective pnl|sharpe|log_growth` separates the loss the fitter minimises from the value that picks the finalist.
 
-* The fitter, the archive and every dominance test keep `--metric`. A surrogate error and a P&L value are never compared in one dominance test.
+* The fitter, the archive and every dominance test keep `--metric` unless `--fitness pnl` is given (below). A surrogate error and a P&L value are never compared in one dominance test.
 * After the exact finalist refit, each Pareto member's prediction vector on the validation slice is scored by the exact CPU `f64` long/flat book of [`docs/walkforward.md`](walkforward.md). The member with the lowest objective value is reported first. There is no complexity penalty term: ties keep the archive order, which is complexity first.
 * `--gpu` may speed up the fit. It does not change the finalist, which is always rebuilt on the CPU, and the device has no P&L metric arm.
-* A direct in-search P&L fitness is not implemented. The objective only chooses among archived members.
+* The book earns the full per-row return on every long row and charges one cost per position change. That is only right when the returns of one group do not overlap, so `rcsr` refuses (exit 2, `overlapping returns`) a validation or test slice whose rows of one group are closer than the target spec's `horizon_seconds`. Use a label stride of at least the horizon (`long:<h>,stride=<h>`) or a one-bar label. The JSON `objective.spec` carries `min_group_step_seconds` and `horizon_seconds`.
+* Without `--fitness pnl` the objective only chooses among archived members.
 
 ```sh
 rcsr --data bars.csv --target y --time t --split temporal --validation-frac 0.3 \
@@ -1256,6 +1342,41 @@ rcsr --data bars.csv --target y --time t --split temporal --validation-frac 0.3 
 ```
 
 The JSON `objective` block carries the fit error, the validation and test books, the cash and buy-and-hold comparisons, the number of candidates and usable candidates, and `backend_reason`.
+
+#### `--fitness pnl`: rank every candidate by the exact P&L regret
+
+`--fitness metric|pnl` (default `metric`, the behaviour above) chooses the value that ranks candidates in the search. `--fitness pnl` needs a trading `--objective` and all of its refusals (temporal split, forward-return target spec, cost, `--validation-frac`).
+
+```text
+e_i     = r_i - funding_i - cash_return               (excess return of row i, canonical (group, time) order)
+p_i     = 1 if isfinite(pred_i) and pred_i > threshold else 0
+flips   = sum_i [p_i != p_prev(i)]                    (p_prev = 0 at the first row of a group)
+exits   = sum_i p_i * [i is the last row of its group]
+net     = sum_i p_i * e_i - c_side * (flips + exits)
+B       = hindsight DP bound on e at the same c_side
+regret  = (B - net) / B                               lower is better; all-flat is exactly 1
+```
+
+* `regret` is non-negative and scale-free, so the archive, hypervolume, progress and patience logic work unchanged. It is never "solved": the solved stop is off.
+* A non-finite prediction on a row scores `+inf`. Fewer than `--min-trades` flips scores `+inf`.
+* Constants keep the `--metric` fit (squared LM by default). The P&L is piecewise constant in the constants, so it has no gradient to follow; the book only ranks. `--weight` weights that fit only. For a squared metric the fit's SSE is not reused as the score, so every fitted candidate costs one more evaluation pass plus the book.
+* The training rows are prepared in canonical `(group, time)` order (`SplitSpec.canonical_train_order`). `gross` is summed in fixed 8,192-row segments, 32 lanes per segment and 8 warp sums, each merged with a halving tree, so a device implementation can reproduce the totals bit for bit. The integer counts are order-free.
+* Exit 2 with a named reason for `--predictor-samples`, `--fit-samples`, multiple targets, `--implicit`, `--min-holding` above 1, `--max-position` other than 1, rows closer than the label horizon, and a training slice with no profitable long/flat path (`B <= 0`).
+* The search runs on the CPU. `backend_reason` is `long_pnl fitness has no device scorer yet`.
+* The checkpoint stores the kind and the book hash (rows, cost, threshold, `--min-trades`). Resuming with a different book exits 2, and so does resuming a `--fitness pnl` checkpoint without the flag.
+* `--json` carries `search_fitness` (`kind`, `rows`, `groups`, `cost_per_side`, `threshold`, `bound`, `min_trades`, `backend`, `book_hash`; `{"kind":"metric"}` without the flag). Each Pareto member gains `fitness: {train_regret, train_net, train_flips, train_exits, train_exposure}` in exact CPU `f64` (`train_net` is the excess net over cash), `train_error` stays the metric, and `objective.finalist.search_fitness` names `long_pnl_regret`.
+
+Why the constants keep the metric fit. A fixed linear structure (`[1, tanh z24, tanh z3, vol]`, `h = 4`, stride 4, 5 bp per side) fitted five ways and priced exactly (net train / validation / test):
+
+| fit of the constants | 5 bp | 10 bp |
+|---|---|---|
+| OLS on the vol-scaled label (`--metric squared`) | 25.52 / **2.87** / 7.17 | 20.83 / **1.89** / 6.16 |
+| `\|r\|`-weighted logistic on `1[r > 0]` | 28.47 / 1.96 / 6.91 | 23.80 / 0.96 / 5.90 |
+| `\|A\|`-weighted logistic on `1[A > 0]` (hindsight-DP advantage) | 26.19 / 2.03 / **7.25** | 18.43 / 0.26 / 6.16 |
+| exact coordinate search on train net | 28.65 / 1.83 / 6.89 | **24.80** / 0.52 / 5.91 |
+| smooth P&L (sigmoid positions) | **29.06** / 1.35 / 7.00 | 24.41 / 0.17 / 6.04 |
+
+The P&L-aligned fits raise train net but not validation net. Turnover is set by the structure, not by the constants, so the leverage is in ranking structures by exact P&L.
 
 ## 4. Hardware
 

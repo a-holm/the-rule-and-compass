@@ -1331,6 +1331,7 @@ impl RunPlan {
             exclude,
             time: time_spec,
             allow_lockbox: raw.allow_lockbox,
+            declared_lockbox: None,
             purge_seconds: None,
             scale_column: None,
             trading: None,
@@ -1811,6 +1812,7 @@ impl RunPlan {
             self.prepared.report.gap,
             self.cfg.seed,
             &self.dtypes,
+            None,
         )?;
         let mut fold_rows = Vec::new();
         for f in &folds {

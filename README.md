@@ -192,6 +192,7 @@ Every window also lists the long-only controls (cash, buy-and-hold, constant
 long/flat from the training mean, matched-exposure random long seeded by
 `--control-seed`) with exposure, turnover, beta and excess over cash; see
 `src/baselines.rs`.
+`--front run.json` takes the candidates from the Pareto front of a run, carries the run's threshold and per-side cost, defaults `--trials` to the offspring the search scored and refuses a window that tests rows the run trained or selected on (`docs/walkforward.md`).
 Pass `--batch-pnl` to score every candidate on every window in one batch (`src/wf_batch.rs`, kernel `src/cuda/wf_batch.cu`), per window and pooled, with the baseline ladder; finalist values stay exact CPU f64 and batch values are labelled `gpu_proxy`.
 `--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
 associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
@@ -202,6 +203,8 @@ semantics and metric definitions, and [`docs/eval-benchmark.md`](docs/eval-bench
 the pinned 4M-row benchmark protocol and the measured wall time.
 
 The long-only evaluation protocol builds on it: the UTC windows table `protocol/windows.csv`, a purge of `--entry-offset + --horizon + --delay`, an economics block (Sortino, Calmar, CVaR, break-even cost, cost ladder, cash, buy-and-hold and equal-weight benchmarks with exposure and beta), a circular block bootstrap with a design effect (`--bootstrap`), block-permutation and matched-exposure nulls (`--null-draws`), DSR, PBO, SPA and BH-FDR, and a candidate ledger with a sealed list and a one-read locked test (`--ledger`, `--locked-test`, `rcsr protocol`). See the "Long-only evaluation protocol" section of [`docs/walkforward.md`](docs/walkforward.md).
+
+The search objective, `walkforward`, `ablation score` and `ladder` price one book: the cost (`cost_bps / 2` per side), the return units (`log` is converted with `exp_m1`) and the label window come from the target spec, and `rcsr walkforward --from-run run.json` / `rcsr ablation score --from-run run.json` take the expression, the fixed threshold and the cost of the book the search selected. A `--cost-bps` that differs from the spec is refused; `--cost-override` prices another cost on purpose. Every report carries `cost: {per_side_bps, source, return_units}`, and `rcsr enrich --label long:<h>` needs an explicit `fee=`. See the "One book from search to evaluation" section of [`docs/walkforward.md`](docs/walkforward.md).
 
 Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
 minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),
@@ -229,9 +232,10 @@ reaches machine precision.
 ```sh
 rcsr ladder --data panel.rcsb --target y60 --return-col fwd60 --time ts --group symbol \
   --windows protocol/windows.csv --scheme expanding --target-spec panel.targets.json \
-  --vol-col vol96 --reversal-col ret_1 --signal-col trend96 --sr-score sr_score \
-  --sr-evals 1200000 --sr-wall 5400 --out ladder.json --markdown ladder.md
+  --vol-col vol96 --reversal-col ret_1 --signal-col trend96 --sr-run pilot/A2.run.json --out ladder.json --markdown ladder.md
 ```
+
+`--sr-run` scores the finalist of one search run on every fold; a fold that starts before the run's last seen row plus purge is refused (exit 3) unless `--allow-in-sample`, which labels it `oof:false` and drops it from every pooled statistic. `rcsr ablation score` applies the same check.
 
 `rcsr ablation` runs the add-one-family ablation under the decision rule committed in `protocol/ablation.json`: arms `A0` (B0) to `A5`, a fixed generation budget, 3 seeds per arm (5 with `--finalist`), one manifest per arm, a placebo arm and a circular-block-permuted arm. `rcsr --arm A1` writes the arm, the feature-list hash, the generation budget and the generations reached into run.json.
 
@@ -540,7 +544,9 @@ atomically instead of streaming it. See
   builds `panel_hourly_default.rcsb` in staged, cacheable steps. `snapshot` hashes
   every archive and lists the duplicate and invalid-OHLC bars. `base` keeps only
   full four-bar hours (`cov15m`), collapses identical duplicate instants, flags
-  differing ones and stores the unit of each source. `build` keeps point-in-time
+  differing ones and stores the unit of each source. `--symbols <file>` on
+  `snapshot` and `base` keeps only a pinned symbol universe (for example the
+  output of `rcsr-acquire universe`). `build` keeps point-in-time
   members, numbers listings, fails on an undeclared level jump and refuses the
   lockbox. `validate` runs V1-V12 and exits 3 on a failure. See
   [`docs/panel.md`](docs/panel.md#default-hourly-panel-v2-259).
@@ -616,10 +622,11 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--lags K | --lag-set k,..|default] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc] [--require-validation]
      [--objective mse|pnl|sharpe|log_growth] [--position long_only] [--threshold f]
-     [--cost-bps f] [--slippage-bps f] [--cash-return f] [--funding col]
+     [--cost-bps f | --cost-override f] [--slippage-bps f] [--cash-return f] [--funding col]
      [--max-position f] [--min-trades n] [--min-holding n] [--allow-short]
+     [--fitness metric|pnl]
      [--equivalence-z z] [--noise-lag n|auto]
-     [--allow-lockbox] [--lockbox START,END] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure]
+     [--allow-lockbox] [--lockbox START,END|none] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure] [--require-clean-inputs]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
      [--smooth k] [--smooth-centred k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
@@ -627,7 +634,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--null-runs N] [--null-block N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
-     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--no-fit]
+     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--fit-polish f64|f32|off] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--linear-scaling]
@@ -744,10 +751,17 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
 * `--objective pnl|sharpe|log_growth` chooses the finalist on the validation
   slice by an exact long/flat book (position 0 or 1, never short, cost per side
   on `|delta p|` including the exit, daily `sqrt(365)` Sharpe) instead of the
-  fit error. The fit and the archive keep `--metric`. It needs a temporal
+  fit error. The fit and, unless `--fitness pnl` is given, the archive keep `--metric`. It needs a temporal
   split, `--validation-frac`, a `forward_return` `--target-spec` and
-  `--cost-bps`. `--json` adds an `objective` block with the validation and test
-  books, cash and buy-and-hold comparisons and the break-even cost. See
+  `--cost-bps` (or a target spec `cost_bps`, which gives `cost_bps / 2` per side; a different flag is refused, `--cost-override` prices another cost on purpose). Rows of one group closer than the label horizon overlap, so the per-row return would be earned several times against one cost: such a book is refused (exit 2); use `long:<h>,stride=<h>` or `long:1`. `--json` adds an `objective` block with the validation and test
+  books, cash and buy-and-hold comparisons and the break-even cost.
+* `--fitness pnl` (default `metric`) ranks every candidate in the search by the exact long/flat net
+  regret `(B - net) / B` on the training rows, `B` the hindsight DP bound at the same cost
+  (lower is better, all-flat is 1). Constants are still fitted with `--metric`. It needs a
+  trading `--objective` and exits 2 with `--predictor-samples`, `--fit-samples`, `--implicit`,
+  `--min-holding` above 1, `--max-position` other than 1, multiple targets or overlapping rows.
+  It runs on the CPU; resume needs the same cost, threshold and rows. `--json` adds
+  `search_fitness` and a `fitness` block per Pareto member. See
   [`docs/walkforward.md`](docs/walkforward.md) and
   [`docs/optimisation.md`](docs/optimisation.md).
 * Time-ordered runs, runs with a target spec and runs with `--require-validation`
@@ -765,6 +779,15 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   The same central guard covers `rcsr run`, `rcsr walkforward`, an explicit
   `rcsr panel build` window and a labelled `rcsr prep`; see
   [`docs/panel.md`](docs/panel.md#the-2026h2-lockbox).
+* The protocol locked test (2025-07-01..2026-07-01, or the range declared with the data) guards every evaluator: search, `walkforward`, `ladder`, `ablation`, `enrich` and `audit`. Undeclared data gets the default. `--lockbox none` is the only opt-out and the report records `"source":"none"`. A flag that narrows a stored declaration, and conflicting declaration files, are refused. See [`docs/panel.md`](docs/panel.md#the-declared-locked-test).
+* The protocol locked test is declared once, with the data
+  (`rcsr panel base`, `prep` or `panel build --locked-test START,END`; `panel build`,
+  `panel append`, `enrich` and `ablation prepare` copy it, and a writer never drops or
+  changes it silently: exit 2 unless the flag repeats it or says `none`). The search, `walkforward`, `ladder` and
+  `ablation score` then refuse any split or window that touches it (exit 3).
+  Only `walkforward --locked-test` and `ladder --locked-test`, both with
+  `--ledger` and `--sealed`, read it, once each; see
+  [`docs/panel.md`](docs/panel.md#the-declared-locked-test).
 * `--train-select` / `--test-select` assign rows by expression (`> 0` is true)
   and override `--split`; `--exclude` drops rows and composes with any mode.
   A row matching both selections goes to training, one matching neither is
@@ -788,14 +811,15 @@ run:
 | `--smooth k` | `k`-wide **trailing** moving average per column (row `i` reads only itself and earlier rows); edges shrink |
 | `--smooth-centred k` | the old **centred** window; reads future bars, is opt-in, and is reported as look-ahead |
 | `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
-| `--allow-lockbox` | permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only) |
-| `--lockbox START,END` | declared locked test reported in the run.json `lockbox` object (rows, date range, read count) |
+| `--allow-lockbox` | permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only); never opens the declared locked test |
+| `--lockbox START,END` | declared locked test (UTC, half-open). Overrides the range declared with the data (`rcsr panel build --locked-test`). Train, validation and test rows inside it are refused (exit 3). The run.json `lockbox` object reports rows, date range, read count, `declared`, `source` (`store` or `flag`), `rows_in_scope` and `evaluated` |
 | `--ledger file` | candidate ledger whose locked reads run.json counts |
 | `--arm name` | ablation arm label; run.json gains an `ablation` object with the arm, the SHA-256 of the ordered variable list, the generation budget and the generations reached |
 | `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`; `long_only` is always true): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
 | `--allow-target-structure` | run a D13c target for a diagnostic replay (warns, records `check.status = overridden` and a proxy table) |
+| `--require-clean-inputs` | refuse (exit 5) a run whose inputs include a construction column of the target spec; default off, the column is only recorded in `check.construction_in_vars` |
 | `--allow-overlap` (`rcsr enrich`, `rcsr prep`) | permit a `--label` stride below the horizon for horizons of 4 h and longer; without it such a label is refused. `--side short` and `--allow-short` are always refused: labels are long-only (action `{0,+1}`, long-side barriers, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge)) |
-| `--label long:<horizon>,...` (`rcsr enrich`) | long-only label family `lbl_<name>_{fwd,y,long_net,action,t1,exit_ret,m_net,m_barrier,weight}`, the label report with hash and top 10 absolute moves in `<out>.labels.json`, the enrich report and `run.json` (`target_spec.label_report`); label columns are never `--vars` inputs, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge) |
+| `--label long:<horizon>,fee=<bp>,...` (`rcsr enrich`; `fee=` is required, `fee=0` for none) | long-only label family `lbl_<name>_{fwd,y,long_net,action,t1,exit_ret,m_net,m_barrier,weight}`, the label report with hash and top 10 absolute moves in `<out>.labels.json` (rows reaching the declared locked test, `--locked-test` or the input declaration, are left out of its statistics and counted), the enrich report and `run.json` (`target_spec.label_report`); label columns are never `--vars` inputs, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |
 | `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
 | `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |
@@ -1013,7 +1037,7 @@ re-runs the whole search on each fold's training rows (normalised on those rows
 alone) and reports the mean and spread of the held-out error, so a single lucky
 split cannot flatter the answer. Use `rolling` for time series (it never trains
 on the future) and `purged` to embargo `--gap` rows around each test block. It
-costs about `k` extra searches.
+costs about `k` extra searches. The folds are drawn from the rows left by `--exclude` and `--filter`. With a declared locked test (see `docs/time-series.md`) every such row is checked, also with `--allow-lockbox`.
 
 `--stability B` asks the question that matters most: **does the same law come
 back?** It bootstraps the training rows `B` times, re-runs the identical search
