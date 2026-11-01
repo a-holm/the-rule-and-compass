@@ -3375,7 +3375,7 @@ fn plan_fit_batch(
         return FitBatch { jobs: valid, decision: None, bytes: 0, refused };
     }
     let widest = valid.iter().map(|(_, _, p)| p.nconst).max().unwrap_or(1);
-    let workload = crate::dispatch::Workload::fit(1, rows, widest, sweeps)
+    let workload = crate::dispatch::Workload::fit(valid.len(), rows, widest, sweeps)
         .with_min_rows(32 * widest);
     let workload = match loss {
         Some(loss) => workload.with_objective(loss),
@@ -7110,7 +7110,7 @@ mod tests {
     /// #453: one candidate alone routes to the CPU, 64 together route to the
     /// device, and the admission sends all 64 to the device.
     #[test]
-    fn fit_admission_plans_the_batch_not_each_candidate() {
+    fn fit_batch_plans_the_batch_not_each_candidate() {
         let rows = 2_456_306;
         let alone = plan_fit_batch(&mut costly_launch(), rows, 8, None, affine_plans(1));
         assert!(alone.jobs.is_empty(), "a batch of one pays the whole launch");
