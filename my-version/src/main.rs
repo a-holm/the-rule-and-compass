@@ -984,6 +984,30 @@ fn parse_trade_number(flag: &str, text: &str) -> f64 {
 }
 
 /// #263: a usage error for the P&L objective, exit 2.
+/// #493: the book of one prediction vector. The context rows (removed only by a
+/// missing label) join the ranks of a top-tercile book; they earn nothing
+/// without a return.
+fn trading_book(
+    tree: &expr::Node,
+    x: &[Vec<f64>],
+    slice: &data::TradingSlice,
+    ctx: Option<&data::TradingContext>,
+    tspec: &rcsr::trading::TradingSpec,
+) -> Result<rcsr::trading::PathStats, String> {
+    let mut pred: Vec<f64> = x.iter().map(|row| expr::eval(tree, row)).collect();
+    let Some(c) = ctx else {
+        return rcsr::trading::evaluate(&pred, &slice.ret, &slice.rows, tspec);
+    };
+    pred.extend(c.x.iter().map(|row| expr::eval(tree, row)));
+    let mut ret = slice.ret.clone();
+    ret.extend_from_slice(&c.slice.ret);
+    let mut rows = slice.rows.clone();
+    rows.time.extend_from_slice(&c.slice.rows.time);
+    rows.group.extend_from_slice(&c.slice.rows.group);
+    rows.funding.extend_from_slice(&c.slice.rows.funding);
+    rcsr::trading::evaluate(&pred, &ret, &rows, tspec)
+}
+
 fn trading_usage(msg: &str) -> ! {
     eprintln!("error: {}", msg);
     std::process::exit(EXIT_USAGE);
@@ -4572,6 +4596,7 @@ fn main() {
             log_returns: ts.return_units == "log",
             funding_column: trade_funding.clone(),
             train: fitness_pnl, // #480
+            cross_section: top_tercile,
         });
         let tspec = rcsr::trading::TradingSpec {
             cost_bps: cost,
@@ -5887,8 +5912,8 @@ fn main() {
             };
             let objective_value = match (&trading_spec, &prepared.validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
                 (Some(tspec), Some(v), Some(slice)) => {
-                    let vpred: Vec<f64> = v.x.iter().map(|row| expr::eval(&s.tree, row)).collect();
-                    match rcsr::trading::evaluate(&vpred, &slice.ret, &slice.rows, tspec) {
+                    let ctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
+                    match trading_book(&s.tree, &v.x, slice, ctx, tspec) {
                         Ok(stats) => objective.score(&stats, tspec.min_trades),
                         Err(_) => f64::INFINITY,
                     }
@@ -6060,11 +6085,8 @@ fn main() {
     let objective_report: Option<rcsr::trading::FinalistReport> = match (&trading_spec, rows.first()) {
         (Some(tspec), Some(top)) => {
             let tree = &sorted[top.archive_rank - 1].tree;
-            let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>| match slice {
-                Some(slice) => {
-                    let pred: Vec<f64> = sample.x.iter().map(|row| expr::eval(tree, row)).collect();
-                    rcsr::trading::evaluate(&pred, &slice.ret, &slice.rows, tspec)
-                }
+            let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>, ctx: Option<&data::TradingContext>| match slice {
+                Some(slice) => trading_book(tree, &sample.x, slice, ctx, tspec),
                 None => Err("no trading rows".to_string()),
             };
             let split = prepared.trading.as_ref();
@@ -6090,10 +6112,10 @@ fn main() {
                 validation_value: top.objective_value,
                 search_fitness: fitness_book.as_ref().map(|_| "long_pnl_regret"),
                 validation: match &prepared.validation {
-                    Some(v) => book(v, split.and_then(|t| t.validation.as_ref())),
+                    Some(v) => book(v, split.and_then(|t| t.validation.as_ref()), split.and_then(|t| t.validation_context.as_ref())),
                     None => Err("no validation slice".to_string()),
                 },
-                test: book(&prepared.test, split.map(|t| &t.test)),
+                test: book(&prepared.test, split.map(|t| &t.test), split.and_then(|t| t.test_context.as_ref())),
             })
         }
         _ => None,

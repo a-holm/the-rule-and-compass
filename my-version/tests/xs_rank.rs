@@ -364,6 +364,11 @@ fn write_hand_csv(dir: &Path, name: &str) -> String {
 /// Columns `t,sym,x,r,lbl_h1_xs`; `lbl_h1_xs = x` so the search fits `x`.
 /// Rows: 14 training timestamps, the hand block as validation, the hand block as test.
 fn write_search_csv(dir: &Path, name: &str, rotate_test: Option<usize>) -> String {
+    write_search_csv_with(dir, name, rotate_test, false)
+}
+
+/// `delist`: symbol 5 has no label and no return at the 2nd and 3rd timestamp of each hand block.
+fn write_search_csv_with(dir: &Path, name: &str, rotate_test: Option<usize>, delist: bool) -> String {
     let mut rows: Vec<(i64, usize, f64, f64)> = Vec::new();
     for t in 0..14 {
         for k in 0..6 {
@@ -389,7 +394,13 @@ fn write_search_csv(dir: &Path, name: &str, rotate_test: Option<usize>) -> Strin
     }
     let mut text = String::from("t,sym,x,r,lbl_h1_xs\n");
     for (t, k, x, r) in rows {
-        text.push_str(&format!("{},S{},{},{},{}\n", t, k, x, r, x));
+        let step = ((t - T0) / STEP) as usize;
+        let gone = delist && k == 5 && step >= 14 && matches!((step - 14) % 3, 1 | 2);
+        if gone {
+            text.push_str(&format!("{},S{},{},NaN,NaN\n", t, k, x));
+        } else {
+            text.push_str(&format!("{},S{},{},{},{}\n", t, k, x, r, x));
+        }
     }
     let path = dir.join(name);
     std::fs::write(&path, text).unwrap();
@@ -558,4 +569,50 @@ fn walkforward_from_run_prices_the_top_tercile_book_of_the_search() {
     let ab = rcsr(&["ablation", "score", "--from-run", &run, "--data", &csv, "--time", "t", "--windows", &windows, "--purge-seconds", "3600"]);
     assert_eq!(code(&ab), 2, "{}", stderr(&ab));
     assert!(stderr(&ab).contains("top_tercile"), "{}", stderr(&ab));
+}
+
+#[test]
+fn search_and_walkforward_rank_the_same_cross_section() {
+    // Symbol 5 is delisted: no label and no return at the 2nd and 3rd timestamp of the
+    // validation block and of the test block. Its score still ranks in both paths, it
+    // earns nothing and pays nothing where the return is missing.
+    let dir = scratch();
+    let spec = write_xs_spec(&dir, "s.json");
+    let csv = write_search_csv_with(&dir, "d.csv", None, true);
+    let o = search(
+        &csv,
+        &spec,
+        &["--objective", "pnl", "--position", "top_tercile", "--validation-frac", "0.1765", "--fill", "drop"],
+    );
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let run = p(&dir, "run.json");
+    std::fs::write(&run, &o.stdout).unwrap();
+    let j = json(&o);
+
+    // Hand arithmetic at 10 bp per side. Longs: t0 sym0 + sym3; t1 sym5 (no return) + sym1;
+    // t2 sym2 + sym3. gross = 0.07 + 0.05 + 0.09 = 0.21, |delta p| with exits = 2 + 2 + 2 + 4 = 10,
+    // net = 0.21 - 0.010 = 0.200 on 16 usable rows, 5 of them long.
+    // Period means: (0.07 - 0.002) / 6, (0.05 - 0.003) / 5, (0.09 - 0.005) / 5.
+    let period_sum = 0.068 / 6.0 + 0.047 / 5.0 + 0.085 / 5.0;
+    for (book, start) in [("validation", 14), ("test", 17)] {
+        let b = at(&j, &["objective", book]);
+        assert_eq!(num(b, &["rows"]), 16.0, "{book}");
+        close(num(b, &["net_pnl"]), 0.2);
+        close(num(b, &["total_cost"]), 0.01);
+        close(num(b, &["exposure"]), 5.0 / 16.0);
+        assert_eq!(num(b, &["trades"]), 8.0, "{book}");
+
+        let w = format!("w,{},{},{},{}", T0, T0 + STEP * (start - 1), T0 + STEP * start, T0 + STEP * (start + 3));
+        let out = p(&dir, &format!("wf-{book}.json"));
+        let o = rcsr(&["walkforward", "--data", &csv, "--time", "t", "--group-by", "sym", "--from-run", &run, "--window", &w, "--out", &out]);
+        assert_eq!(code(&o), 0, "{book}: {}", stderr(&o));
+        let m = at(match at(&read_json(&out), &["windows"]) { Json::Arr(a) => &a[0], _ => panic!() }, &["metrics"]).clone();
+        assert_eq!(num(&m, &["rows"]), 16.0, "{book}");
+        assert_eq!(num(&m, &["active_rows"]), 5.0, "{book}");
+        close(num(&m, &["total_cost"]), num(b, &["total_cost"]));
+        close(num(&m, &["exposure"]), num(b, &["exposure"]));
+        assert_eq!(num(&m, &["trades"]), num(b, &["trades"]), "{book}");
+        assert_eq!(num(&m, &["entries"]), num(b, &["entries"]), "{book}");
+        close(num(&m, &["mean_return"]) * num(&m, &["periods"]), period_sum);
+    }
 }
