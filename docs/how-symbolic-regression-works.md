@@ -152,6 +152,8 @@ folding and only those identities that preserve every IEEE value, including
 `x+0 -> x` for a readable equation, and the tree is **denormalised** back to the
 original variable units.
 
+**Front prune (#466).** The sound simplifier must keep code that is neutral only on the training data: `x ^ (0 * f)` is 1 only for finite `f`, `if(c, a, b)` is `a` only where `c > 0`, `0 + n` differs from `n` at `-0`. With `--prune` (off by default), after the generation loop, and so also after the `solved` stop, each front member is pruned by measurement. For every internal node the prune tries each child and a constant (the mean of the subtree) in its place, refits the constants with the exact CPU fitter and keeps the smallest result whose training error is within `1e-6 * (1 + |e|)` of the original, the archive's epsilon-dominance tolerance. It repeats until nothing is accepted, offers every accepted tree to the front, and the front is rebuilt on all training rows in f64. The pass uses no RNG, so its result is a function of the tree and the data. `--prune` enables it, `--prune-rows` caps the rows it fits on and `--prune-budget` caps the fits. `expr::simplify_equal_branches` folds `if(c, a, a)` to `a`, which is exact for every condition including `NaN`; the prune uses it, the search does not, so a default run keeps the search trajectory.
+
 ## 8. Concurrency
 
 The search is embarrassingly parallel: islands, and candidate evaluations within

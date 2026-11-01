@@ -858,7 +858,7 @@ impl QdArchive {
 
 /// Normalized 2-D hypervolume of `(cost, error)` points. Both axes are mapped
 /// to `[0,1]` by the observed extremes; a single point contributes zero area.
-fn hypervolume(points: &[(f64, f64)]) -> f64 {
+pub(crate) fn hypervolume(points: &[(f64, f64)]) -> f64 {
     if points.len() < 2 {
         return 0.0;
     }

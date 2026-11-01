@@ -3223,3 +3223,70 @@ fn label_report_is_identical_for_stores_that_differ_only_inside_the_locked_range
     assert_ne!(without_label_hash(&a0), without_label_hash(&b0));
     assert!(!a0.contains("locked_test"));
 }
+
+/// Feature entries of the report with the whole-column hashes removed.
+fn feature_statistics(json: &str) -> String {
+    let start = json.find("\"features\":[").expect("features array");
+    let end = json[start..].find("],\n  \"long_labels\"").expect("end of features") + start;
+    let mut out = String::new();
+    let mut rest = &json[start..end];
+    while let Some(i) = rest.find("\"sha256\":\"") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 10..];
+        rest = &tail[tail.find('"').unwrap() + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn feature_report(tag: &str, poison: bool, locked: Option<&str>) -> String {
+    let dir = tmp_dir(tag);
+    let data = dir.join("in.rcsb");
+    let mut rows = lock_rows(false);
+    if poison {
+        for row in rows.iter_mut().filter(|r| r.0 >= LOCK_START && r.0 < LOCK_END) {
+            row.6 = -5.0;
+        }
+    }
+    write_store(data.to_str().unwrap(), &rows, 1000);
+    let out = dir.join("out.rcsb");
+    let mut o = opts(data.to_str().unwrap(), out.to_str().unwrap(), "r1,r5,vol20,vz96");
+    o.labels = vec![
+        "long:1h,name=h1,fee=10,vol=20".to_string(),
+        "long:4h,name=h4,fee=10,vol=20,stride=4".to_string(),
+    ];
+    o.locked_test = locked.map(|s| rcsr::lockbox::Lockbox::parse(s).unwrap());
+    let r = enrich::build(&o).unwrap();
+    r.json()
+}
+
+#[test]
+fn feature_report_is_identical_for_stores_that_differ_only_inside_the_locked_range() {
+    let range = "2024-06-01,2024-07-01";
+    let a = feature_report("feat-a", false, Some(range));
+    let b = feature_report("feat-b", true, Some(range));
+    assert_eq!(feature_statistics(&a), feature_statistics(&b));
+    assert!(a.contains("\"rows_left_out\":"));
+    assert!(!a.contains("\"rows_left_out\":0,"));
+    // Without a range the stores report different statistics, so the test has teeth.
+    let a0 = feature_report("feat-a0", false, None);
+    let b0 = feature_report("feat-b0", true, None);
+    assert_ne!(feature_statistics(&a0), feature_statistics(&b0));
+    assert!(!a0.contains("rows_left_out"));
+}
+
+#[test]
+fn feature_report_leaves_out_the_purge_window_of_label_columns_only() {
+    let range = "2024-06-01,2024-07-01";
+    let json = feature_report("feat-purge", false, Some(range));
+    let left = |name: &str| -> usize {
+        let at = json.find(&format!("{{\"name\":\"{}\"", name)).unwrap_or_else(|| panic!("{name}"));
+        let tail = &json[at..][..json[at..].find('}').unwrap()];
+        let k = tail.find("\"rows_left_out\":").unwrap() + 16;
+        tail[k..].split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap()
+    };
+    let locked_rows_per_symbol = ((LOCK_END - LOCK_START) / 3600) as usize;
+    assert_eq!(left("r1"), 3 * locked_rows_per_symbol);
+    assert_eq!(left("lbl_h1_fwd"), 3 * (locked_rows_per_symbol + 1));
+    assert_eq!(left("lbl_h4_fwd"), 3 * (locked_rows_per_symbol + 4));
+}
