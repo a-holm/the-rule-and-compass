@@ -234,6 +234,7 @@ library methods only to *seed* or *pre-process*.
 | **Structural hashing + de-duplication** | Never evaluate two identical candidates in a generation. |
 | **Lexicographic parsimony pressure** | No size-penalty coefficient to tune; bloat is controlled at selection time. |
 | **Parallel islands** | Islands are independent, so they evolve on separate threads. |
+| **Parallel fit and score** (`--threads`, #463) | Inside an island, variation draws every offspring serially from the island RNG. The constant fits and scores of the batch then run on a pool of `std::thread::scope` workers, and the results are committed in draw order. Neither the fit nor the score touches the RNG, so the archive, populations and RNG states are bit-identical for every thread count. |
 | **Convergence / time-budget stopping** | Stop when there is nothing left to gain, or when a caller's deadline arrives. |
 
 ### 3.0 Constants are fitted to the scoring loss
@@ -433,6 +434,14 @@ integer sums — no second kernel, no extra sort — and the proposal gate compa
 the **exact** oriented score, never SSE and never `|ρ|`. A proposal that is
 worse in SSE but better in signed ρ is accepted; a reflection is not. See
 [`gpu-backend.md`](gpu-backend.md#signed-rank-correlation-issue-231).
+
+### 3.0.2 Worker threads: `--threads` (#463)
+
+`--threads N` sets the worker budget (default: the CPU cores available to the process, which follows the affinity mask; `1` is the serial path). Islands share the budget: each gets `N / islands` workers, at least 1. The workers fit and score offspring, the generation 0 population, the screened refits and the final archive rescore.
+
+The loop is three phases. Phase A draws candidates with the island RNG until the batch is full (complexity and duplicate checks run here). Phase B fits, simplifies and scores the batch on the workers; work is handed out one candidate at a time, so uneven fit costs balance. Phase C commits the results in draw order and drops any candidate whose fitted tree exceeds `--max-complexity`; the island then returns to phase A for the missing slots. Phase C is rare (simplification after a fit folds constants); `--dev-log` reports the count as `variation.post_fit_drops` and the wall time of phase B as `phases.phase_b` (summed over islands). Batches of cheap fits (under 2048 training rows) use one worker per 16 candidates at most, because spawning workers costs more than the fits.
+
+`--threads` is not a saved search setting: a run checkpointed with `--threads 8` resumes with `--threads 1` to the same archive.
 
 ### 3.1 Measured results
 
