@@ -277,7 +277,7 @@ because that loop has neither.
 | `device_busy_s` basis | the union uses CUDA event timestamps when they are available; the stage seconds (including `io`), the placement basis (`events`, `host_envelope`, `mixed`) and the structural-zero stages (`features`, `pnl`) are in `--json` `gpu.ledger`, not in this event |
 | `stages.vary_s`, `stages.fit_s` (mixed arm) | with `--gpu --fit-strategy exact` the island threads fit on the CPU; each island-scope window is split into `fit_s` (summed island fit time divided by island threads, capped at the window) and `vary_s` (the rest). The split is apportioned, not a measured interval |
 | `fit_kernel_s`, `fit_fallback_s` | raw device fit-kernel seconds and measured exact-CPU fit-fallback seconds |
-| `fit_kernel_f32_s`, `fit_kernel_f64_s` | `fit_kernel_s` apportioned to the damped LM loop and to the polish phase by per-block cycle sums (`--fit-polish`) |
+| `fit_kernel_lm_s`, `fit_kernel_polish_s` | `fit_kernel_s` apportioned to the damped LM loop and to the polish phase by per-block cycle sums (`--fit-polish`) |
 | `fit_refit_s`, `fit_refits` | #495: wall seconds and count of the exact CPU finalist refits after the last generation (GPU runs; `null` on a CPU run). `rcsr dev-report` ranks the refit as its own window beside the generation phases and prints it in the run table |
 | `events`, `bytes`, `dropped` | log bookkeeping **before** this event; `dropped` counts events lost to the byte cap |
 | `end` | UTC end time |
