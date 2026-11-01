@@ -9334,6 +9334,9 @@ OPTIONS:
                              compare its report hash; records nothing
   --expect-report-sha256 <h> exit 1 unless the report JSON hashes to h
   --json                     print the full JSON report to stdout
+                             (it ends with a ledger object: the phase ledger of the
+                             command, io and pnl seconds on the run wall, outside the
+                             report hash)
   --out <file>               write the JSON report to a file
   --markdown <file|->        write the Markdown report ('-' = stdout)
   --allow-lockbox            permit a test window overlapping 2026H2
@@ -9932,10 +9935,7 @@ fn run_walkforward(args: &[String]) -> ! {
             windows_scheme.as_ref().map_or("null".to_string(), |s| format!("{:?}", s)),
         ));
     }
-    let report_json = || match &protocol_json {
-        Some(p) => report.json_with_protocol(p),
-        None => report.json(),
-    };
+    let report_json = || report.json_with_ledger(protocol_json.as_deref());
     for w in &report.windows {
         let reasons = [
             w.band.as_ref().and_then(|b| b.fallback_reason.as_deref()),
