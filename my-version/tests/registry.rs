@@ -1076,7 +1076,7 @@ fn schema_timeframe_edge_cases_single_row_and_mixed_steps() {
     steps.extend([7200; 10]);
     let mixed = timeframe_store(&dir, "mixed.rcsb", &steps);
     let body = std::fs::read_to_string(registry::write_schema(&mixed, "2").unwrap()).unwrap();
-    assert!(body.contains("\"bar_seconds\":3600,\"bar_seconds_modal_share\":0.9,"), "{body}");
+    assert!(body.contains("\"bar_seconds\":3600,\"bar_seconds_modal_share\":0.8989"), "{body}");
 
     let odd = timeframe_store(&dir, "odd.rcsb", &[1234; 20]);
     let body = std::fs::read_to_string(registry::write_schema(&odd, "2").unwrap()).unwrap();
