@@ -303,6 +303,9 @@ impl SrRun {
     pub fn load(path: &str) -> Result<SrRun, String> {
         let run = crate::run_json::RunFile::load(path)?;
         let book = run.book()?;
+        if book.position != crate::trading::PositionMap::Threshold {
+            return Err("the run priced the top_tercile book: the SR rung prices the threshold rule only".to_string());
+        }
         Ok(SrRun {
             expression: book.expression,
             variables: book.variables,
@@ -1038,6 +1041,7 @@ pub struct Report {
     pub periods_per_year: f64,
     pub block_len: usize,
     pub cost: crate::target::CostDecl,
+    pub min_group_step: Option<f64>,
     pub cost_bps: f64,
     pub n_trials: u64,
     pub benchmark: String,
@@ -1302,6 +1306,36 @@ fn return_space_mse(p: &Panel, pool: &Pool, opts: &Options, score: &[f64]) -> f6
     }
 }
 
+/// Refuse a fold whose test rows overlap: some group has two rows closer than
+/// `horizon_seconds`. Returns the smallest step over all folds.
+pub fn check_fold_spacing(p: &Panel, folds: &[Fold], horizon_seconds: f64) -> Result<Option<f64>, String> {
+    let mut min_step: Option<f64> = None;
+    for f in folds {
+        let book = crate::trading::TradingRows {
+            time: f.test.iter().map(|&i| p.time[i]).collect(),
+            group: f.test.iter().map(|&i| p.group[i]).collect(),
+            funding: Vec::new(),
+        };
+        let step = crate::trading::check_return_spacing(&book, horizon_seconds)
+            .map_err(|e| format!("window '{}': {}", f.label, e))?;
+        min_step = match (min_step, step) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
+    Ok(min_step)
+}
+
+/// Exit code for an error from the ladder or ablation scoring path: 2 for an
+/// overlap refusal (as in the search objective and walk-forward), else `other`.
+pub fn spacing_exit(message: &str, other: i32) -> i32 {
+    if message.contains("overlapping returns") {
+        2
+    } else {
+        other
+    }
+}
+
 /// Run the whole ladder.
 pub fn run_ladder(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report, String> {
     let started = Instant::now();
@@ -1321,6 +1355,7 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
     let mut rungs: Vec<Rung> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     let n = pool.len();
+    let min_group_step = check_fold_spacing(p, folds, opts.horizon_seconds)?;
 
     let mut cash = Rung::new("cash", "control");
     cash.pos = vec![0.0; n];
@@ -1650,7 +1685,7 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
         sr_zero = Some(z);
     }
     let rows = build_rows(p, &pool, opts, block, rungs, &market, sr_zero);
-    finish_report(p, &pool, opts, folds, rows, &market, block, &mut notes)
+    finish_report(p, &pool, opts, folds, rows, &market, block, &mut notes, min_group_step)
 }
 
 fn jarr_str(v: &[String]) -> String {
@@ -1666,6 +1701,7 @@ fn finish_report(
     market: &[f64],
     block: usize,
     notes: &mut Vec<String>,
+    min_group_step: Option<f64>,
 ) -> Result<Report, String> {
     let ran = |r: &Row| r.status == "ok";
     let mean_of = |name: &str, rows: &[Row]| rows.iter().find(|r| r.name == name && ran(r)).map(|r| r.mean_period_net);
@@ -1816,6 +1852,7 @@ fn finish_report(
             return_units: "simple".to_string(),
             spec_per_side_bps: None,
         }),
+        min_group_step,
         cost_bps: opts.cost_bps,
         n_trials,
         benchmark,
@@ -1938,7 +1975,7 @@ impl Report {
         };
         format!(
             "{{\"schema\":{},\"folds\":{},\"periods\":{},\"rows_scored\":{},\"periods_per_year\":{},\"block_len\":{},\
-\"cost_bps\":{},\"cost\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
+\"min_group_step_seconds\":{},\"cost_bps\":{},\"cost\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
 \"sr_candidate_evaluations\":{},\"sr_wall_seconds\":{},\"gbm_beats_sr\":{}}},\"multiple_testing\":{{\"draws\":{},\"seed\":{},\
 \"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"sr_run\":{},\"rungs\":[{}],\"ledger\":{}}}",
             jstr(SCHEMA),
@@ -1947,6 +1984,7 @@ impl Report {
             self.rows_scored,
             jnum(self.periods_per_year),
             self.block_len,
+            jopt(self.min_group_step),
             jnum(self.cost_bps),
             self.cost.json(),
             self.n_trials,
@@ -2200,7 +2238,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --windows <file>          protocol windows table (rcsr protocol windows)\n\
   --scheme <name>           expanding | rolling | locked (default expanding)\n\
   --purge-seconds <s>       gap between the fit range and the validation slice (default 219600)\n\
-  --horizon-seconds <s>     label horizon; floors the bootstrap block (default 0)\n\
+  --horizon-seconds <s>     label horizon; floors the bootstrap block; test rows of one group closer than it overlap and are refused (exit 2); the report carries min_group_step_seconds (default 0)\n\
   --cost-bps <x>            per-side cost of the headline book (default 12; with a --target-spec cost, the spec cost, and a different value is refused)\n\
   --cost-override <x>       per-side cost that differs from the --target-spec cost on purpose; reported as source flag with the spec cost beside it\n\
   --cost-grid <a,b,...>     per-side costs reported per rung (default 12,20,40; 1x, 2x and 3.33x the spec cost when a --target-spec declares one)\n\
@@ -2462,7 +2500,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         }
     }
     let io_s = t_io.elapsed().as_secs_f64();
-    let mut report = run_ladder(&panel, &folds, &opts).map_err(input_err)?;
+    let mut report = run_ladder(&panel, &folds, &opts).map_err(|e| (spacing_exit(&e, 3), e))?;
     let mut ledger = RunLedger::new();
     ledger.record_stage(Stage::Io, io_s);
     ledger.record_stage(Stage::Pnl, report.ledger.stage_s(Stage::Pnl));

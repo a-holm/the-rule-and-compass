@@ -69,6 +69,7 @@ OPTIONS:
   --migration-interval <N>  generations between island migrations
   --restart-interval <N>    generations between island restarts
   --variation <mode>        auto, node or postfix
+  --linear-scaling          wrap every candidate in a fitted affine output map (#470)
   --dispatch <mode>         auto or device (device skips the timing comparison)
   --fit-polish <mode>      f64 (default), f32 or off: arithmetic of the device fit
                             kernel polish (--fit-strategy gpu)
@@ -112,6 +113,7 @@ COMPARE OPTIONS:
   --json                    machine-readable output
   Runs are paired by (suite, problem, noise, seed). The command exits 2 when
   the two sides hold different runs or differ in anything but the search knobs.
+  Pairs whose criterion is null on a side are dropped, counted and listed.
 ",
         env!("CARGO_PKG_VERSION")
     )
@@ -295,6 +297,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
                 a.knobs.restart_interval =
                     Some(num(take(&mut i, "--restart-interval")?, "--restart-interval")?)
             }
+            "--linear-scaling" => a.knobs.linear_scaling = true,
             "--variation" => {
                 a.knobs.variation = Some(rcsr::search::VariationMode::parse(&take(&mut i, "--variation")?)?)
             }

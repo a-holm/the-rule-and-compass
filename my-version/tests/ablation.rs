@@ -442,6 +442,20 @@ fn a_real_run_is_scored_on_the_folds_without_the_test_block_in_selection() {
     assert!(r.return_mse.is_finite());
     assert!((r.net_by_fold_threshold[0][1] - r.net_period.iter().sum::<f64>()).abs() < 1e-12, "headline threshold is the series");
     assert!(r.net_period.iter().sum::<f64>() > 0.0, "the long book wins on a signal-driven return");
+    assert!(std::fs::read_to_string(&res).unwrap().contains("\"min_group_step_seconds\":900"), "the result carries the measured step");
+    let overlap = dir.join("spec2700.json");
+    std::fs::write(&overlap, std::fs::read_to_string(&spec).unwrap().replace("\"horizon_seconds\":900", "\"horizon_seconds\":2700")).unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "ablation", "score", "--run", run_json.to_str().unwrap(), "--data", &data, "--target", "y", "--return-col", "r", "--time", "t",
+            "--windows", windows.to_str().unwrap(), "--purge-seconds", "1800", "--target-spec", overlap.to_str().unwrap(),
+            "--out", dir.join("overlap.json").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(err.contains("overlapping returns") && err.contains("2700-second label horizon"), "{err}");
     assert_eq!(r.feature_list_sha256, ablation::feature_list_sha256(&r.features));
 
     let plain = dir.join("plain.run.json");

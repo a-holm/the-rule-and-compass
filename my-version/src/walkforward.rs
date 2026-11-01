@@ -200,6 +200,8 @@ pub enum Policy {
     Threshold,
     Band,
     Dp,
+    /// Per timestamp, the top `floor(n / 3)` finite scores are long (#493).
+    TopTercile,
 }
 
 impl Policy {
@@ -208,8 +210,9 @@ impl Policy {
             "threshold" => Ok(Policy::Threshold),
             "band" => Ok(Policy::Band),
             "dp" | "hindsight" => Ok(Policy::Dp),
+            "top-tercile" | "top_tercile" => Ok(Policy::TopTercile),
             other => Err(format!(
-                "unknown policy '{}'; expected threshold | band | dp",
+                "unknown policy '{}'; expected threshold | band | dp | top-tercile",
                 other
             )),
         }
@@ -220,6 +223,7 @@ impl Policy {
             Policy::Threshold => "threshold",
             Policy::Band => "band",
             Policy::Dp => "dp",
+            Policy::TopTercile => "top_tercile",
         }
     }
 }
@@ -893,6 +897,22 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
     if spec.min_hold == 0 {
         return Err("--min-hold must be at least 1".to_string());
     }
+    if spec.policy == Policy::TopTercile {
+        let refused = [
+            (spec.threshold_fixed.is_some(), "--threshold-fixed"),
+            (spec.band_width != 0.0, "--band"),
+            (spec.min_hold != 1, "--min-hold"),
+            (spec.band_select, "--select-band"),
+            (spec.device_pnl, "--device-pnl"),
+            (opts.batch_pnl, "--batch-pnl"),
+        ];
+        if let Some((_, flag)) = refused.iter().find(|(set, _)| *set) {
+            return Err(format!(
+                "{} is not supported with --policy top-tercile: the book has no threshold, band or device arm",
+                flag
+            ));
+        }
+    }
     if spec.candidates.len() > 1 && spec.validation_frac <= 0.0 {
         return Err(
             "multiple --expr candidates need --validation-frac > 0: select on a validation \
@@ -1248,7 +1268,9 @@ impl Accum {
                     ));
                 }
             }
-            let source_name = if spec.threshold_fixed.is_some() {
+            let source_name = if spec.policy == Policy::TopTercile {
+                ThresholdSource::None
+            } else if spec.threshold_fixed.is_some() {
                 ThresholdSource::Fixed
             } else if has_validation {
                 ThresholdSource::ValidationType7
@@ -2231,12 +2253,19 @@ fn evaluate_window(
         None
     };
 
+    // #493: the cross-section is every row of the timestamp with a finite
+    // score, before the target mask.
+    let tercile: Option<Vec<f64>> = (policy == Policy::TopTercile).then(|| {
+        let times: Vec<f64> = rows.iter().map(|r| r.time).collect();
+        crate::trading::top_tercile_positions(scores, &times)
+    });
     for (k, &i) in order.iter().enumerate() {
         let row = &rows[valid[i]];
-        let pos = match &band_scan {
-            Some((positions, ..)) => positions[k],
+        let pos = match (&band_scan, &tercile) {
+            (Some((positions, ..)), _) => positions[k],
+            (None, Some(top)) => top[valid[i]],
             // #305: strict `>` and a non-finite score is flat.
-            None => trading_gpu::long_position(scores[valid[i]], threshold) as f64,
+            (None, None) => trading_gpu::long_position(scores[valid[i]], threshold) as f64,
         };
         let prev = previous.get(&row.group).copied().unwrap_or(0.0);
         let delta = pos - prev;
@@ -3010,6 +3039,9 @@ impl Report {
                 "reported book is the threshold rule; the DP value is a hindsight_bound, \
                  not a strategy; never short; no leverage"
             }
+            Policy::TopTercile => {
+                "top-tercile long-only: per timestamp 1 for the top floor(n/3) finite scores (ties by row order), else 0; no threshold; never short; no leverage"
+            }
         };
         format!(
             "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"walkforward\",\
@@ -3168,8 +3200,13 @@ impl Report {
             Policy::Dp => {
                 "- Reported book: the plain threshold rule. The DP value is a **hindsight bound**, not a strategy; never short, no leverage.\n".to_string()
             }
+            Policy::TopTercile => {
+                "- Top-tercile long-only: per timestamp, `position = 1` for the top `floor(n/3)` finite scores (ties by row order), else `0`; fewer than 3 finite scores hold nothing; never short, no leverage.\n".to_string()
+            }
         };
-        let threshold_rule = if let Some(theta) = self.threshold_fixed {
+        let threshold_rule = if self.policy == Policy::TopTercile {
+            "none: the policy ranks the scores of each timestamp (source `none`)".to_string()
+        } else if let Some(theta) = self.threshold_fixed {
             format!(
                 "pre-registered fixed theta = {} (no data fitting; source `fixed`)",
                 theta
@@ -3466,7 +3503,7 @@ fn select_candidate(
                 } else {
                     scores
                 };
-                if source_scores.is_empty() && spec.threshold_fixed.is_none() {
+                if source_scores.is_empty() && spec.threshold_fixed.is_none() && spec.policy != Policy::TopTercile {
                     return Err(format!(
                         "window '{}': no finite {} scores for candidate {} to set the threshold",
                         d.window.label,
@@ -3479,7 +3516,9 @@ fn select_candidate(
                 } else {
                     0.0
                 };
-                let threshold = if let Some(theta) = spec.threshold_fixed {
+                let threshold = if spec.policy == Policy::TopTercile {
+                    f64::NAN
+                } else if let Some(theta) = spec.threshold_fixed {
                     Threshold::fixed(theta)?.value()
                 } else if has_validation {
                     Threshold::validation_type7(source_scores, spec.threshold_quantile).value()
