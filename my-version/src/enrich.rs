@@ -1531,6 +1531,8 @@ pub struct Options {
     pub write_bw: Option<f64>,
     pub allow_lockbox: bool,
     pub allow_overlap: bool,
+    /// Locked test left out of the label report; the input's declaration applies when unset.
+    pub locked_test: Option<crate::lockbox::Lockbox>,
     pub dry_run: bool,
     pub json: bool,
 }
@@ -1556,6 +1558,7 @@ impl Default for Options {
             write_bw: None,
             allow_lockbox: false,
             allow_overlap: false,
+            locked_test: None,
             dry_run: false,
             json: false,
         }
@@ -1741,6 +1744,15 @@ impl Report {
                 l.spec.name, l.target, r.rows, r.valid_rows, r.barrier_rows, r.clipped_share,
                 r.cost_to_move, r.effective_n, r.purge_seconds, r.label_hash
             ));
+            if let Some(lt) = &r.locked_test {
+                out.push(format!(
+                    "# enrich-label-locked: name={} locked_test={}..{} left_out_rows={}",
+                    l.spec.name,
+                    crate::lockbox::date(lt.range.start),
+                    crate::lockbox::date(lt.range.end),
+                    lt.rows_left_out
+                ));
+            }
             for m in &r.top_moves {
                 out.push(format!(
                     "# enrich-label-move: name={} symbol={} time={} iso={} fwd={:.6}",
@@ -6927,8 +6939,9 @@ fn enrich_inner(
             temp.insert(n.clone(), TempColumn::create(work_dir, &n, sp.column_warmup(kind), true)?);
         }
     }
+    let label_range = opts.locked_test.or_else(|| crate::lockbox::declared_for(&opts.data));
     let mut long_acc: Vec<crate::labels::LabelAccumulator> =
-        long_specs.iter().map(crate::labels::LabelAccumulator::new).collect();
+        long_specs.iter().map(|sp| crate::labels::LabelAccumulator::with_range(sp, label_range)).collect();
 
     // Cross-sectional source columns are computed even when the user did not
     // ask for them, then removed if they are not part of the output. The same
@@ -8263,6 +8276,7 @@ pub fn run(args: &[String]) -> ! {
         eprintln!("error: {}", e.message.replacen("--lockbox", "--locked-test", 2));
         std::process::exit(e.exit);
     });
+    opts.locked_test = resolved.sidecar_range();
     let report = match enrich(&opts) {
         Ok(r) => r,
         Err(e) => fail(&e),
@@ -8353,6 +8367,9 @@ INPUT / OUTPUT:
                           declared one is refused (exit 2); conflicting declarations of
                           --data are refused (exit 3); none writes no declaration and is
                           refused when --data declares one
+                          label rows whose window reaches the range (entry at or after
+                          START minus the purge, before END) are left out of every
+                          <out>.labels.json statistic, and counted
   --gpu [auto|on|off]     auto (default) dispatches a registered exact kernel
                           only when the cost model estimates it faster; on
                           forces every registered kernel above the 1M-row floor;

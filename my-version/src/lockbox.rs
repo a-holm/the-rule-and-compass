@@ -611,7 +611,7 @@ pub fn plausible_epoch_seconds(min: f64, max: f64) -> bool {
     min.is_finite() && max.is_finite() && min >= Y2000 && max <= Y2100
 }
 
-fn date(ts: i64) -> String {
+pub(crate) fn date(ts: i64) -> String {
     let (y, m, d) = crate::ohlcv::civil_from_days(ts.div_euclid(86_400));
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
