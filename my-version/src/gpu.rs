@@ -10348,3 +10348,7 @@ mod order_select_tests;
 #[cfg(test)]
 #[path = "gpu_hinge_fit_tests.rs"]
 mod hinge_fit_tests;
+
+#[cfg(test)]
+#[path = "gpu_if_fit_tests.rs"]
+mod if_fit_tests;
