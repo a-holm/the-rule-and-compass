@@ -1,19 +1,3 @@
-    fn keep_fn(&self) -> impl Fn(i64) -> bool {
-        let purge = self.spec.purge_seconds();
-        let ranges = [self.range, self.also];
-        let embargo = self.embargo;
-        move |t: i64| ranges.iter().flatten().all(|r| t + purge <= r.start || t >= r.end + embargo)
-    }
-
-    /// Builds the labels of one series with the weights normalised over the
-    /// development rows of the declared ranges.
-    pub fn build(&self, bars: &[Bar], funding: Option<&[f64]>) -> Result<LongLabels, String> {
-        build_keep(bars, &self.spec, funding, &self.keep_fn())
-    }
-
-    pub fn add(&mut self, symbol: &str, labels: &LongLabels) {
-        let symbol = (!symbol.is_empty()).then_some(symbol);
-        let keep = self.keep_fn();
 //! Long-only horizon, action and triple-barrier labels (exact CPU f64).
 //!
 //! For a row at bar `t`, horizon `h` bars and delay `d` bars:
@@ -322,6 +306,7 @@ pub fn build_keep(
     funding: Option<&[f64]>,
     keep: &dyn Fn(i64) -> bool,
 ) -> Result<LongLabels, String> {
+    let _ = keep;
     spec.validate()?;
     if let Some(f) = funding {
         if f.len() != bars.len() {
@@ -861,12 +846,22 @@ impl LabelAccumulator {
         self
     }
 
-    pub fn add(&mut self, symbol: &str, labels: &LongLabels) {
-        let symbol = (!symbol.is_empty()).then_some(symbol);
+    fn keep_fn(&self) -> impl Fn(i64) -> bool {
         let purge = self.spec.purge_seconds();
         let ranges = [self.range, self.also];
         let embargo = self.embargo;
-        let keep = move |t: i64| ranges.iter().flatten().all(|r| t + purge <= r.start || t >= r.end + embargo);
+        move |t: i64| ranges.iter().flatten().all(|r| t + purge <= r.start || t >= r.end + embargo)
+    }
+
+    /// Builds the labels of one series with the weights normalised over the
+    /// development rows of the declared ranges.
+    pub fn build(&self, bars: &[Bar], funding: Option<&[f64]>) -> Result<LongLabels, String> {
+        build_keep(bars, &self.spec, funding, &self.keep_fn())
+    }
+
+    pub fn add(&mut self, symbol: &str, labels: &LongLabels) {
+        let symbol = (!symbol.is_empty()).then_some(symbol);
+        let keep = self.keep_fn();
         self.tally.merge(labels.tally(symbol, &keep));
         self.chain.extend_from_slice(symbol.unwrap_or("").as_bytes());
         self.chain.push(0);

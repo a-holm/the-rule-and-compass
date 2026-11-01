@@ -540,7 +540,7 @@ fn label_family_columns_are_refused_as_inputs_by_the_d13a_canary() {
     assert!(view.map(|v| !v.columns.iter().any(|c| c.starts_with("lbl_"))).unwrap_or(true));
 }
 
-fn noisy(n: usize, seed: u64, locked: std::ops::Range<usize>) -> Vec<Bar> {
+fn noisy(n: usize, seed: u32, locked: std::ops::Range<usize>) -> Vec<Bar> {
     let mut rng = Mt::new(seed);
     let mut p = 100.0;
     (0..n)
@@ -567,7 +567,7 @@ fn uniqueness_weights_ignore_locked_prices() {
     for i in a..b {
         other[i] = alt[i];
     }
-    let range = labels::Lockbox { start: T0 + a as i64 * HOUR, end: T0 + b as i64 * HOUR };
+    let range = rcsr::lockbox::Lockbox { start: T0 + a as i64 * HOUR, end: T0 + b as i64 * HOUR };
     let embargo = 10 * HOUR;
     let acc = labels::LabelAccumulator::with_range(&s, Some(range)).with_embargo(embargo);
     let (x, y) = (acc.build(&base, None).unwrap(), acc.build(&other, None).unwrap());
@@ -610,7 +610,7 @@ fn uniqueness_weights_without_a_range_match_the_plain_build() {
 fn uniqueness_weights_are_nan_when_every_row_is_refused() {
     let bars = noisy(60, 4, 0..0);
     let s = spec("h3", 3);
-    let range = labels::Lockbox { start: T0, end: T0 + 100 * HOUR };
+    let range = rcsr::lockbox::Lockbox { start: T0, end: T0 + 100 * HOUR };
     let l = labels::LabelAccumulator::with_range(&s, Some(range)).build(&bars, None).unwrap();
     assert_eq!(l.weight_norm_rows, 0);
     assert!(l.weight.iter().all(|w| w.is_nan()));
