@@ -1166,11 +1166,29 @@ pub(crate) mod gpu_op {
     pub const ERF: u32 = 28;
     pub const ERFC: u32 = 29;
     pub const IF: u32 = 32;
+    pub const STEP: u32 = 19;
+    pub const FLOOR: u32 = 23;
+    pub const CEIL: u32 = 24;
+    pub const ROUND: u32 = 25;
+    pub const MOD: u32 = 26;
+    pub const ATAN2: u32 = 27;
+    pub const MIN: u32 = 30;
+    pub const MAX: u32 = 31;
+    pub const SIGN: u32 = 33;
+    pub const EQUAL: u32 = 34;
+    pub const LESS: u32 = 35;
+    pub const LESS_OR_EQUAL: u32 = 36;
+    pub const GREATER: u32 = 37;
+    pub const GREATER_OR_EQUAL: u32 = 38;
+    pub const AND: u32 = 39;
+    pub const OR: u32 = 40;
+    pub const XOR: u32 = 41;
+    pub const NOT: u32 = 42;
 }
 
 /// #169: map an operator to the fit kernel's opcode. Only operators with a
-/// well-defined analytic derivative in both the value and adjoint sweeps are
-/// eligible; everything else (piecewise-constant, logical, constraint, block,
+/// value and adjoint sweep (a zero or piecewise subgradient counts) are
+/// eligible; everything else (`asinh`, `acosh`, `atanh`, constraint, block,
 /// aggregate and meta operators) makes the candidate fall back to the CPU.
 fn gpu_fit_opcode(op: Op) -> Option<u32> {
     use gpu_op as g;
@@ -1197,6 +1215,24 @@ fn gpu_fit_opcode(op: Op) -> Option<u32> {
         Gauss => g::GAUSS,
         Pow => g::POW,
         If => g::IF,
+        Step => g::STEP,
+        Floor => g::FLOOR,
+        Ceil => g::CEIL,
+        Round => g::ROUND,
+        Mod => g::MOD,
+        Atan2 => g::ATAN2,
+        Min => g::MIN,
+        Max => g::MAX,
+        Sign => g::SIGN,
+        Equal => g::EQUAL,
+        Less => g::LESS,
+        LessOrEqual => g::LESS_OR_EQUAL,
+        Greater => g::GREATER,
+        GreaterOrEqual => g::GREATER_OR_EQUAL,
+        And => g::AND,
+        Or => g::OR,
+        Xor => g::XOR,
+        Not => g::NOT,
         Sinh => g::SINH,
         Cosh => g::COSH,
         Erf => g::ERF,
@@ -4857,10 +4893,26 @@ mod tests {
 
     #[test]
     fn op_coverage_needs_a_fit_opcode_for_every_operator() {
+        use Op::*;
         assert!(gpu_fit_op_coverage(&Op::default_set(), false));
-        assert!(!gpu_fit_op_coverage(&[Op::Add, Op::Min], false), "`min` has no fit opcode");
-        assert!(gpu_fit_op_coverage(&[Op::Add, Op::Mul, Op::Sin], false));
-        assert!(!gpu_fit_op_coverage(&[Op::Add, Op::Mul, Op::Sin], true));
+        assert!(gpu_fit_op_coverage(
+            &[
+                Add, Min, Max, Step, Sign, Floor, Ceil, Round, Mod, Atan2, Equal, Less,
+                LessOrEqual, Greater, GreaterOrEqual, And, Or, Xor, Not
+            ],
+            false
+        ));
+        assert!(gpu_fit_op_coverage(&[Add, Mul, Sin], false));
+        assert!(!gpu_fit_op_coverage(&[Add, Mul, Sin], true));
+        let no_fit_opcode = [
+            Asinh, Acosh, Atanh, Require, Between, Constrain, Complexity, Variables, Constants,
+            Contains, ContainsOp,
+        ];
+        for name in Op::names() {
+            let op = Op::from_name(name).expect("a listed operator parses");
+            let listed = no_fit_opcode.contains(&op) || matches!(op, Agg(_));
+            assert_eq!(gpu_fit_opcode(op).is_none(), listed, "`{name}`");
+        }
     }
 
     #[test]

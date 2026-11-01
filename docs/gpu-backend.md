@@ -1487,7 +1487,7 @@ gpu = (s * k + (1 - s) / W) * E * (1 + h)
 device iff gpu < cpu
 ```
 
-With `W = 8`: without full operator coverage (any operator without a fit opcode, such as `min`) the device is chosen up to 4 islands and `exact` from 5 (`dispatch_cost`); with full coverage the device is chosen up to 11 islands. There is no row floor. The per-candidate floor of `32p` rows in the fit stage is unchanged. This run-level rule is separate from the per-candidate stage model in `docs/dispatch.md`.
+With `W = 8`: without full operator coverage (any operator without a fit opcode, such as `asinh` or `require`) the device is chosen up to 4 islands and `exact` from 5 (`dispatch_cost`); with full coverage the device is chosen up to 11 islands. There is no row floor. The per-candidate floor of `32p` rows in the fit stage is unchanged. This run-level rule is separate from the per-candidate stage model in `docs/dispatch.md`.
 
 Evidence for the default is a paired comparison against `exact` on the GPU evaluator at equal generations (default operators, `--fit-iters 8`): admitting every candidate matched `exact` in test error and hypervolume and ran 1.5x to 5.1x faster; the screened fraction was faster still but lost on hypervolume. Fallbacks in these runs were `unsupported_plan` only, from `if`.
 
@@ -1897,6 +1897,24 @@ Paired search (`classes206k.csv`, 154,500 rows, `hinge_ordinary`, default operat
 Device fit is 3.2x faster than device score with the CPU fit and 3.7x faster than the CPU arm.
 
 **Tests** (`src/gpu_if_fit_tests.rs`): `if_plan_carries_the_third_child_in_the_slot_word`; `if_device_fit_matches_the_cpu_fit_including_the_switch_point` (device SSE within `1e-8` relative of the CPU fit, with rows at `x0 == 0` and `x0 == x1`, and a `NaN` in the untaken branch); `a_search_with_if_fits_on_the_device` (`dispatch: Device`, no `unsupported_plan` fallback).
+
+### Hard operators in the fit kernel (#499)
+
+The fit kernel takes the operators the scoring kernel has had since #131, with the scoring opcode values: `step` 19, `floor` 23, `ceil` 24, `round` 25, `mod` 26, `atan2` 27, `min` 30, `max` 31, `sign` 33, `equal` 34, `less` 35, `less_or_equal` 36, `greater` 37, `greater_or_equal` 38, `and` 39, `or` 40, `xor` 41, `not` 42. Fit opcode 32 is `if` (#403). The forward sweep (`ft_forward`, `ft_forward_d`) and the adjoint sweep (`ft_backward`, `ft_backward_d`) mirror `apply_op` and `adj_terms` in `src/fit.rs`, so the f32 LM phase and the `--fit-polish f64|f32` phases use one convention.
+
+| operator | value | adjoint |
+|---|---|---|
+| `min`, `max` | `NaN` if either argument is `NaN`, else the smaller or larger | all to the active argument, `0.5` each on a tie |
+| `atan2(y, x)` | `atan2(y, x)` | `x/(x²+y²)` to `y`, `-y/(x²+y²)` to `x`, none when `x²+y² = 0` |
+| `mod(a, b)` | `NaN` for a non-finite argument or `abs(b) < 1e-12`, else `a - b·floor(a/b)` | `1` to `a`, `-floor(a/b)` to `b`, none when `abs(b) < 1e-12` |
+| `step`, `sign`, `floor`, `ceil`, `round` | `step` is `[a > 0]`; `sign` is `NaN` for `NaN`; `round` is half away from zero | none |
+| `equal`, `less`, `less_or_equal`, `greater`, `greater_or_equal` | `0` or `1`, `NaN` if either argument is `NaN` | none |
+| `and`, `or`, `xor` | `0` or `1` on `[a > 0]`, `[b > 0]`, `NaN` if either argument is `NaN` | product-surrogate partials: `[b>0]`, `1-[b>0]`, `1-2[b>0]` for the first argument, symmetric for the second |
+| `not` | `1 - [a > 0]`, `NaN` for `NaN` | none |
+
+A constant reachable only through a value-only operator has a zero Jacobian column. The fit labels such a candidate `rank_deficient` or `no_improvement` and keeps the start; it is not a CPU fallback. Operators without a fit opcode stay `unsupported_plan` CPU fallbacks: `asinh`, `acosh`, `atanh`, `require`, `constrain`, `between`, aggregates, meta operators and block calls.
+
+**Tests** (`src/gpu_hard_op_fit_tests.rs`, device tests skip without CUDA): `hard_op_plan_words_carry_the_scoring_opcodes`; one device-versus-CPU parity test per family (`min_max_device_fit_matches_the_cpu_at_the_tie_rows`, `atan2_device_fit_matches_the_cpu_including_the_origin`, `mod_device_fit_matches_the_cpu_at_exact_multiples`, `piecewise_constant_device_fit_matches_the_cpu_at_the_jumps`, `comparisons_device_fit_matches_the_cpu_on_equal_rows`, `logic_device_fit_matches_the_cpu_on_the_product_surrogate`) with a device loss within `1e-5` relative of the CPU loss; `a_hard_operator_under_if_ignores_a_nan_in_the_untaken_branch`; `constants_only_under_a_value_only_operator_are_labelled_not_fallen_back`; `every_new_opcode_runs_on_nan_inf_and_kink_rows`; `a_search_with_hard_operators_fits_on_the_device` (`dispatch: Device`, no `unsupported_plan`). The unit test `op_coverage_needs_a_fit_opcode_for_every_operator` in `src/fit.rs` lists every operator without a fit opcode.
 
 ### Slope on the batched kernel (issue #236)
 

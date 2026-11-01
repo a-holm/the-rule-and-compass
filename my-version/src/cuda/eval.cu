@@ -1798,6 +1798,15 @@ struct FtSmem {
     double sdcarry[MAXC + 1];
 };
 
+/* Fit-kernel helpers for the piecewise operators. `ft_ind` is the 0/1 truth
+   indicator `[x > 0]`, `NaN` for `NaN`, as `ind` in fit.rs. `ft_mod_ok` is the
+   CPU validity test of `mod`. */
+template <typename T>
+__device__ __forceinline__ T ft_ind(T x)
+{
+    return isnan(x) ? (T)CUDART_NAN : (x > (T)0 ? (T)1 : (T)0);
+}
+
 __device__ __forceinline__ void ft_forward(const unsigned int *nd,
                                            int m,
                                            const float *__restrict__ cols,
@@ -1855,6 +1864,55 @@ __device__ __forceinline__ void ft_forward(const unsigned int *nd,
                 case OP_COSH: r = coshf(a); break;
                 case OP_ERF: r = (a == 0.0f) ? 0.0f : erff(a); break;
                 case OP_ERFC: r = erfcf(a); break;
+                case OP_STEP: r = (a > 0.0f) ? 1.0f : 0.0f; break;
+                case OP_FLOOR: r = floorf(a); break;
+                case OP_CEIL: r = ceilf(a); break;
+                case OP_ROUND: r = roundf(a); break;
+                case OP_SIGN:
+                    r = (a > 0.0f) ? 1.0f : (a < 0.0f) ? -1.0f : (a == 0.0f) ? 0.0f : CUDART_NAN_F;
+                    break;
+                case OP_NOT:
+                    r = isnan(a) ? CUDART_NAN_F : (a > 0.0f ? 0.0f : 1.0f);
+                    break;
+                case OP_MIN: {
+                    const float b = v[k1];
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN_F : fminf(a, b);
+                } break;
+                case OP_MAX: {
+                    const float b = v[k1];
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN_F : fmaxf(a, b);
+                } break;
+                case OP_ATAN2: r = atan2f(a, v[k1]); break;
+                case OP_MOD: {
+                    const float b = v[k1];
+                    r = (!isfinite(a) || !isfinite(b) || fabsf(b) < 1e-12f)
+                            ? CUDART_NAN_F
+                            : __fsub_rn(a, __fmul_rn(b, floorf(a / b)));
+                } break;
+                case OP_EQUAL:
+                case OP_LESS:
+                case OP_LESS_OR_EQUAL:
+                case OP_GREATER:
+                case OP_GREATER_OR_EQUAL: {
+                    const float b = v[k1];
+                    bool t = false;
+                    if (op == OP_EQUAL) t = a == b;
+                    else if (op == OP_LESS) t = a < b;
+                    else if (op == OP_LESS_OR_EQUAL) t = a <= b;
+                    else if (op == OP_GREATER) t = a > b;
+                    else t = a >= b;
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN_F : (t ? 1.0f : 0.0f);
+                } break;
+                case OP_AND:
+                case OP_OR:
+                case OP_XOR: {
+                    const float b = v[k1];
+                    bool t = false;
+                    if (op == OP_AND) t = (a > 0.0f) && (b > 0.0f);
+                    else if (op == OP_OR) t = (a > 0.0f) || (b > 0.0f);
+                    else t = (a > 0.0f) != (b > 0.0f);
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN_F : (t ? 1.0f : 0.0f);
+                } break;
                 default: r = CUDART_NAN_F; break;
             }
             v[i] = r;
@@ -1941,6 +1999,47 @@ __device__ __forceinline__ void ft_backward(const unsigned int *nd,
                     adj[k1] += a * powf(x, y) * logf(x);
                 }
                 break;
+            case OP_MOD:
+                if (fabsf(y) >= 1e-12f) {
+                    adj[k0] += a;
+                    adj[k1] += -a * floorf(x / y);
+                }
+                break;
+            case OP_MIN:
+                if (x < y) adj[k0] += a;
+                else if (y < x) adj[k1] += a;
+                else {
+                    adj[k0] += 0.5f * a;
+                    adj[k1] += 0.5f * a;
+                }
+                break;
+            case OP_MAX:
+                if (x > y) adj[k0] += a;
+                else if (y > x) adj[k1] += a;
+                else {
+                    adj[k0] += 0.5f * a;
+                    adj[k1] += 0.5f * a;
+                }
+                break;
+            case OP_ATAN2: {
+                const float d = x * x + y * y;
+                if (d > 0.0f) {
+                    adj[k0] += a * y / d;
+                    adj[k1] += -a * x / d;
+                }
+            } break;
+            case OP_AND:
+                adj[k0] += a * ft_ind(y);
+                adj[k1] += a * ft_ind(x);
+                break;
+            case OP_OR:
+                adj[k0] += a * (1.0f - ft_ind(y));
+                adj[k1] += a * (1.0f - ft_ind(x));
+                break;
+            case OP_XOR:
+                adj[k0] += a * (1.0f - 2.0f * ft_ind(y));
+                adj[k1] += a * (1.0f - 2.0f * ft_ind(x));
+                break;
             case OP_IF:
                 if (x > 0.0f) adj[k1] += a;
                 else adj[slot] += a;
@@ -2012,6 +2111,55 @@ __device__ __forceinline__ void ft_forward_d(const unsigned int *nd,
                 case OP_COSH: r = cosh(a); break;
                 case OP_ERF: r = (a == 0.0) ? 0.0 : erf(a); break;
                 case OP_ERFC: r = erfc(a); break;
+                case OP_STEP: r = (a > 0.0) ? 1.0 : 0.0; break;
+                case OP_FLOOR: r = floor(a); break;
+                case OP_CEIL: r = ceil(a); break;
+                case OP_ROUND: r = round(a); break;
+                case OP_SIGN:
+                    r = (a > 0.0) ? 1.0 : (a < 0.0) ? -1.0 : (a == 0.0) ? 0.0 : CUDART_NAN;
+                    break;
+                case OP_NOT:
+                    r = isnan(a) ? CUDART_NAN : (a > 0.0 ? 0.0 : 1.0);
+                    break;
+                case OP_MIN: {
+                    const double b = v[k1];
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN : fmin(a, b);
+                } break;
+                case OP_MAX: {
+                    const double b = v[k1];
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN : fmax(a, b);
+                } break;
+                case OP_ATAN2: r = atan2(a, v[k1]); break;
+                case OP_MOD: {
+                    const double b = v[k1];
+                    r = (!isfinite(a) || !isfinite(b) || fabs(b) < 1e-12)
+                            ? CUDART_NAN
+                            : __dsub_rn(a, __dmul_rn(b, floor(a / b)));
+                } break;
+                case OP_EQUAL:
+                case OP_LESS:
+                case OP_LESS_OR_EQUAL:
+                case OP_GREATER:
+                case OP_GREATER_OR_EQUAL: {
+                    const double b = v[k1];
+                    bool t = false;
+                    if (op == OP_EQUAL) t = a == b;
+                    else if (op == OP_LESS) t = a < b;
+                    else if (op == OP_LESS_OR_EQUAL) t = a <= b;
+                    else if (op == OP_GREATER) t = a > b;
+                    else t = a >= b;
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN : (t ? 1.0 : 0.0);
+                } break;
+                case OP_AND:
+                case OP_OR:
+                case OP_XOR: {
+                    const double b = v[k1];
+                    bool t = false;
+                    if (op == OP_AND) t = (a > 0.0) && (b > 0.0);
+                    else if (op == OP_OR) t = (a > 0.0) || (b > 0.0);
+                    else t = (a > 0.0) != (b > 0.0);
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN : (t ? 1.0 : 0.0);
+                } break;
                 default: r = CUDART_NAN; break;
             }
             v[i] = r;
@@ -2092,6 +2240,47 @@ __device__ __forceinline__ void ft_backward_d(const unsigned int *nd,
                     adj[k0] += a * y * pow(x, y - 1.0);
                     adj[k1] += a * pow(x, y) * log(x);
                 }
+                break;
+            case OP_MOD:
+                if (fabs(y) >= 1e-12) {
+                    adj[k0] += a;
+                    adj[k1] += -a * floor(x / y);
+                }
+                break;
+            case OP_MIN:
+                if (x < y) adj[k0] += a;
+                else if (y < x) adj[k1] += a;
+                else {
+                    adj[k0] += 0.5 * a;
+                    adj[k1] += 0.5 * a;
+                }
+                break;
+            case OP_MAX:
+                if (x > y) adj[k0] += a;
+                else if (y > x) adj[k1] += a;
+                else {
+                    adj[k0] += 0.5 * a;
+                    adj[k1] += 0.5 * a;
+                }
+                break;
+            case OP_ATAN2: {
+                const double d = x * x + y * y;
+                if (d > 0.0) {
+                    adj[k0] += a * y / d;
+                    adj[k1] += -a * x / d;
+                }
+            } break;
+            case OP_AND:
+                adj[k0] += a * ft_ind(y);
+                adj[k1] += a * ft_ind(x);
+                break;
+            case OP_OR:
+                adj[k0] += a * (1.0 - ft_ind(y));
+                adj[k1] += a * (1.0 - ft_ind(x));
+                break;
+            case OP_XOR:
+                adj[k0] += a * (1.0 - 2.0 * ft_ind(y));
+                adj[k1] += a * (1.0 - 2.0 * ft_ind(x));
                 break;
             case OP_IF:
                 if (x > 0.0) adj[k1] += a;
