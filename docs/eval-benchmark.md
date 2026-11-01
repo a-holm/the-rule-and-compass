@@ -66,3 +66,7 @@ Intel i7-3770K, 31 GiB, Linux, release binary, warm cache, median of two runs:
 
 Absolute seconds depend on the host and the page cache. Compare a new
 measurement against this row on the same host.
+
+## Batch scoring (`--batch-pnl`)
+
+`cargo test --release --features cuda --test wf_batch -- --ignored --nocapture bench_batch_vs_scalar` times the scalar walk-forward evaluator against the batch on a pinned synthetic fixture: 64 candidates, 8 windows, 40 groups, 385,527 rows, per-window seam. The scalar side runs `walkforward::reference_cell` for every cell; the batch side is one `wf_batch::run`. The test asserts the batch is at least 5x faster and that both nets agree to `1e-9` relative. The batch reports `candidates_per_s`, `row_evals_per_s`, `device_fraction`, `device_bytes` and `host_tile_bytes` in its `stats`. Compare a new measurement against the same fixture on the same host; see `walkforward.md` for the report fields.
