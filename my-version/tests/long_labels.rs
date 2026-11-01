@@ -466,8 +466,10 @@ fn spec_parses_and_refuses_what_it_cannot_label() {
     assert_eq!((s.name.as_str(), s.horizon_bars, s.delay_bars, s.sigma_window, s.stride), ("a_4h", 4, 1, 48, 2));
     assert_eq!((s.cost.fee_bps, s.cost.spread_bps, s.cost.slippage_bps), (5.0, 2.0, 1.0));
     assert_eq!((s.sigma_floor_bps, s.clip, s.barrier_up, s.barrier_down), (3.0, 2.0, 1.5, 0.5));
-    assert_eq!(LongLabelSpec::parse("long:6", HOUR).unwrap().name, "h6");
-    for bad in ["long:90m", "long:4,side=short", "long:4,vol=1", "long:4,fee=-1", "long:4,x=1", "name=a", "long:4,name=A"] {
+    assert_eq!(LongLabelSpec::parse("long:6,fee=0", HOUR).unwrap().name, "h6");
+    let missing = LongLabelSpec::parse("long:6", HOUR).unwrap_err();
+    assert!(missing.contains("fee=") && missing.contains("fee=0"), "{missing}");
+    for bad in ["long:90m,fee=0", "long:4,fee=0,side=short", "long:4,fee=0,vol=1", "long:4,fee=-1", "long:4,fee=0,x=1", "name=a,fee=0", "long:4,fee=0,name=A"] {
         assert!(LongLabelSpec::parse(bad, HOUR).is_err(), "{bad}");
     }
     assert_eq!(labels::parse_column("lbl_a_4h_m_net"), Some(("a_4h", "m_net")));

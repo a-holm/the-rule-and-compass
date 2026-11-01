@@ -396,7 +396,7 @@ One resolver (`rcsr::lockbox::resolve`) picks the range for search, `walkforward
 | `rcsr ablation score` | exit 3 for a fold touching the range |
 | `rcsr audit` | rows inside the range are left out of every detector; `locked_test.rows_left_out` in the JSON report and the `# audit: locked test ... rows left out=N` line count them |
 
-Rows are refused, never dropped silently, because a drop would change the split fractions without a record. A time column that is not epoch seconds skips the row check and the report says `lockbox.checked: false`.
+Rows are refused, never dropped silently, because a drop would change the split fractions without a record. With a declaration no check is skipped: `--time` is needed unless the data holds exactly one integer epoch-seconds column (the `i64` time column of a store); a time column that does not parse or is not epoch seconds, and any split row without a time stamp, is exit 3. Every run that exits 0 reports `lockbox.checked: true`. `--cv` checks every row left by `--exclude` and `--filter`, also with `--allow-lockbox`, and draws its folds from those rows only. Without a declaration, a time column that is not epoch seconds skips the row check and the report says `lockbox.checked: false`.
 
 ## Provenance manifest
 

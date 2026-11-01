@@ -38,6 +38,8 @@ use std::time::Instant;
 pub const SCHEMA: &str = "rcsr-ladder/1";
 pub const DEFAULT_COST_BPS: f64 = 12.0;
 pub const DEFAULT_COST_GRID: [f64; 3] = [12.0, 20.0, 40.0];
+/// Cost grid multiples of the declared per-side cost, used when a target spec is the cost source.
+pub const SPEC_COST_MULTIPLES: [f64; 3] = [1.0, 2.0, 3.33];
 pub const DEFAULT_QUANTILES: [f64; 5] = [0.5, 0.6, 0.7, 0.8, 0.9];
 pub const DEFAULT_PURGE_SECONDS: f64 = protocol::DEFAULT_PURGE_SECONDS;
 pub const DEFAULT_GBM_TREES: usize = 240;
@@ -287,6 +289,9 @@ pub fn make_folds(
 pub struct Options {
     pub cost_bps: f64,
     pub cost_grid: Vec<f64>,
+    /// #487: where the cost and the return units came from. `None` is the
+    /// historical reading: the flag or default cost.
+    pub cost: Option<crate::target::CostDecl>,
     pub quantiles: Vec<f64>,
     pub purge_seconds: f64,
     /// Label horizon in seconds; sets the bootstrap block floor.
@@ -314,6 +319,7 @@ impl Default for Options {
         Options {
             cost_bps: DEFAULT_COST_BPS,
             cost_grid: DEFAULT_COST_GRID.to_vec(),
+            cost: None,
             quantiles: DEFAULT_QUANTILES.to_vec(),
             purge_seconds: DEFAULT_PURGE_SECONDS,
             horizon_seconds: 0.0,
@@ -983,6 +989,7 @@ pub struct Report {
     pub rows_scored: usize,
     pub periods_per_year: f64,
     pub block_len: usize,
+    pub cost: crate::target::CostDecl,
     pub cost_bps: f64,
     pub n_trials: u64,
     pub benchmark: String,
@@ -1723,6 +1730,12 @@ fn finish_report(
         rows_scored: pool.len(),
         periods_per_year: pool.ppy,
         block_len: block,
+        cost: opts.cost.clone().unwrap_or(crate::target::CostDecl {
+            per_side_bps: opts.cost_bps,
+            source: crate::target::CostSource::Default,
+            return_units: "simple".to_string(),
+            spec_per_side_bps: None,
+        }),
         cost_bps: opts.cost_bps,
         n_trials,
         benchmark,
@@ -1844,7 +1857,7 @@ impl Report {
         };
         format!(
             "{{\"schema\":{},\"folds\":{},\"periods\":{},\"rows_scored\":{},\"periods_per_year\":{},\"block_len\":{},\
-\"cost_bps\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
+\"cost_bps\":{},\"cost\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
 \"sr_candidate_evaluations\":{},\"sr_wall_seconds\":{},\"gbm_beats_sr\":{}}},\"multiple_testing\":{{\"draws\":{},\"seed\":{},\
 \"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"rungs\":[{}],\"ledger\":{}}}",
             jstr(SCHEMA),
@@ -1854,6 +1867,7 @@ impl Report {
             jnum(self.periods_per_year),
             self.block_len,
             jnum(self.cost_bps),
+            self.cost.json(),
             self.n_trials,
             jstr(&self.benchmark),
             jstr(&self.best_long_flat_rule),
@@ -1990,7 +2004,20 @@ pub struct Input {
 
 /// Load the columns the ladder needs from a CSV or a `.rcsb` store.
 pub fn load_panel(inp: &Input, opts: &Options) -> Result<Panel, String> {
-    let ret_name = inp.ret.clone().unwrap_or_else(|| inp.target.clone());
+    let declared_ret = opts
+        .cost
+        .as_ref()
+        .and_then(|_| opts.spec.as_ref())
+        .and_then(|s| s.return_column.clone());
+    if let (Some(given), Some(declared)) = (&inp.ret, &declared_ret) {
+        if given != declared {
+            return Err(format!(
+                "--return-col {} differs from the target spec return column {}; remove the flag",
+                given, declared
+            ));
+        }
+    }
+    let ret_name = inp.ret.clone().or(declared_ret).unwrap_or_else(|| inp.target.clone());
     let mut want: Vec<String> = vec![inp.target.clone(), ret_name.clone(), inp.time.clone()];
     if let Some(g) = &inp.group {
         want.push(g.clone());
@@ -2019,7 +2046,13 @@ pub fn load_panel(inp: &Input, opts: &Options) -> Result<Panel, String> {
     } else {
         data::read_table(&inp.data)?
     };
-    panel_from_table(&table, inp, &ret_name, &extras)
+    let mut panel = panel_from_table(&table, inp, &ret_name, &extras)?;
+    if opts.cost.as_ref().is_some_and(|c| c.log_returns()) {
+        for r in &mut panel.ret {
+            *r = r.exp_m1();
+        }
+    }
+    Ok(panel)
 }
 
 pub fn panel_from_table(table: &Table, inp: &Input, ret_name: &str, extras: &[String]) -> Result<Panel, String> {
@@ -2076,13 +2109,14 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --scheme <name>           expanding | rolling | locked (default expanding)\n\
   --purge-seconds <s>       gap between the fit range and the validation slice (default 219600)\n\
   --horizon-seconds <s>     label horizon; floors the bootstrap block (default 0)\n\
-  --cost-bps <x>            per-side cost of the headline book (default 12)\n\
-  --cost-grid <a,b,...>     per-side costs reported per rung (default 12,20,40)\n\
+  --cost-bps <x>            per-side cost of the headline book (default 12; with a --target-spec cost, the spec cost, and a different value is refused)\n\
+  --cost-override <x>       per-side cost that differs from the --target-spec cost on purpose; reported as source flag with the spec cost beside it\n\
+  --cost-grid <a,b,...>     per-side costs reported per rung (default 12,20,40; 1x, 2x and 3.33x the spec cost when a --target-spec declares one)\n\
   --quantiles <a,b,...>     score-threshold grid chosen on validation (default 0.5,0.6,0.7,0.8,0.9)\n\
   --vol-col <col>           volatility column for the 20-bin E[y|sigma] rung\n\
   --reversal-col <col>      lagged return column for the naive reversal rung\n\
   --signal-col <col>        feature for the 1[f > tau] rung\n\
-  --target-spec <file>      target spec file for the zero-parameter rung (scale column must be in the panel)\n\
+  --target-spec <file>      target spec file: per-side cost (cost_bps / 2), return units (log is converted with exp_m1), return column and horizon; also the zero-parameter rung (scale column must be in the panel)\n\
   --sr-score <col>          out-of-fold symbolic-regression score column\n\
   --sr-evals <n>            candidate evaluations of the symbolic-regression run\n\
   --sr-wall <s>             wall seconds of the symbolic-regression run\n\
@@ -2144,6 +2178,10 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let mut ledger_path: Option<String> = None;
     let mut sealed_path: Option<String> = None;
     let mut spec_path: Option<String> = None;
+    let mut cost_flag: Option<f64> = None;
+    let mut cost_override: Option<f64> = None;
+    let mut grid_given = false;
+    let mut horizon_given = false;
     let mut out = None;
     let mut markdown = None;
     let mut print_json = false;
@@ -2165,9 +2203,16 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             "--windows" => windows = Some(val()?),
             "--scheme" => scheme = val()?,
             "--purge-seconds" => opts.purge_seconds = val()?.parse().map_err(|_| num_err(a))?,
-            "--horizon-seconds" => opts.horizon_seconds = val()?.parse().map_err(|_| num_err(a))?,
-            "--cost-bps" => opts.cost_bps = val()?.parse().map_err(|_| num_err(a))?,
-            "--cost-grid" => opts.cost_grid = parse_list(&val()?, a).map_err(usage_err)?,
+            "--horizon-seconds" => {
+                opts.horizon_seconds = val()?.parse().map_err(|_| num_err(a))?;
+                horizon_given = true;
+            }
+            "--cost-bps" => cost_flag = Some(val()?.parse().map_err(|_| num_err(a))?),
+            "--cost-override" => cost_override = Some(val()?.parse().map_err(|_| num_err(a))?),
+            "--cost-grid" => {
+                opts.cost_grid = parse_list(&val()?, a).map_err(usage_err)?;
+                grid_given = true;
+            }
             "--quantiles" => opts.quantiles = parse_list(&val()?, a).map_err(usage_err)?,
             "--vol-col" => opts.vol_col = Some(val()?),
             "--reversal-col" => opts.reversal_col = Some(val()?),
@@ -2199,9 +2244,6 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let target = need(target, "--target")?;
     let time = need(time, "--time")?;
     let windows = need(windows, "--windows")?;
-    if opts.cost_grid.is_empty() {
-        opts.cost_grid = vec![opts.cost_bps];
-    }
     if opts.pbo_blocks % 2 != 0 || opts.pbo_blocks < 2 {
         return Err(usage_err("--pbo-blocks must be an even number of at least 2".to_string()));
     }
@@ -2214,6 +2256,26 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         if opts.spec.is_none() {
             return Err(input_err(format!("{}: no entry for target '{}'", path, target)));
         }
+    }
+    let (cost, source) = crate::target::resolve_cost(opts.spec.as_ref(), cost_flag, cost_override, DEFAULT_COST_BPS).map_err(usage_err)?;
+    opts.cost_bps = cost;
+    if let Some(s) = &opts.spec {
+        if horizon_given && (opts.horizon_seconds - s.horizon_seconds).abs() > 1e-9 {
+            return Err(usage_err(format!(
+                "--horizon-seconds {} differs from the target spec ({}); remove the flag",
+                opts.horizon_seconds, s.horizon_seconds
+            )));
+        }
+        opts.horizon_seconds = s.horizon_seconds;
+    }
+    if opts.spec.is_some() || source == crate::target::CostSource::Flag {
+        opts.cost = Some(crate::target::CostDecl::new(opts.spec.as_ref(), cost, source));
+    }
+    if !grid_given && source == crate::target::CostSource::TargetSpec {
+        opts.cost_grid = SPEC_COST_MULTIPLES.iter().map(|m| m * cost).collect();
+    }
+    if opts.cost_grid.is_empty() {
+        opts.cost_grid = vec![opts.cost_bps];
     }
     let text = std::fs::read_to_string(&windows).map_err(|e| input_err(format!("{}: {}", windows, e)))?;
     let rows = protocol::parse_windows_csv(&text, Some(&scheme)).map_err(input_err)?;

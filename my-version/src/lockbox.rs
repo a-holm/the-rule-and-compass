@@ -236,6 +236,17 @@ pub struct Declared {
 }
 
 impl Declared {
+    /// A range from the store or a flag fails closed (no time column, not epoch
+    /// seconds). The protocol default only checks data that has epoch stamps.
+    pub fn strict(&self) -> bool {
+        self.source != "protocol_default"
+    }
+
+    /// `2024-06-01..2024-07-01 (store manifest)` for messages.
+    pub fn describe(&self) -> String {
+        format!("{}..{} ({})", date(self.lockbox.start), date(self.lockbox.end), self.origin())
+    }
+
     pub fn origin(&self) -> &'static str {
         match self.source {
             "store" => "store manifest",

@@ -172,14 +172,19 @@ INPUT:
                              side on |delta p| including the final exit; the
                              fit and the archive still use --metric. Needs a
                              temporal split with --validation-frac, a
-                             forward_return --target-spec, and --cost-bps.
+                             forward_return --target-spec, and a cost (--cost-bps
+                             or the spec cost_bps).
                              The test block is read once, for the winner only
   --position long_only       the only position map (default). short is refused
   --allow-short              refused: there is no short P&L, borrow or funding
   --threshold <f>            long when the prediction is strictly above <f>
                              (default 0)
-  --cost-bps <f>             cost per side in basis points (required with a
-                             P&L objective; 0 only when stated)
+  --cost-bps <f>             cost per side in basis points (required with a P&L
+                             objective unless the target spec declares cost_bps, which
+                             gives cost_bps / 2 per side; a different value is
+                             refused, exit 2; 0 only when stated)
+  --cost-override <f>        per-side cost that differs from the target spec cost on
+                             purpose; the objective block says cost.source = flag
   --slippage-bps <f>         extra cost per side in basis points (default 0)
   --cash-return <f>          return per row earned while flat (default 0)
   --funding <col>            per-row funding rate paid while long
@@ -233,6 +238,7 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              a look-ahead on time series; reported as centred
   --allow-interpolate        permit --fill interpolate on time-ordered data
   --allow-lockbox            permit train/validation/test rows in 2026H2 (declared final test only)
+                             It never opens the declared locked test (--lockbox).
   --lockbox <START,END|none>
                              locked test (UTC, half-open). Order: this flag, the range
                              declared with the data (<data>.manifest.json, .schema.json,
@@ -245,6 +251,11 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              reports rows, date range, read count, declared, source
                              (flag, store, protocol_default, none), declared_in,
                              rows_in_scope, evaluated
+                             With a declaration every split side is checked: without
+                             --time the data must hold one integer epoch-seconds
+                             column, else the run exits 3 asking for --time; a
+                             time column that is not epoch seconds, or a row without
+                             a time stamp, is exit 3 too
   --ledger <file>            candidate ledger whose locked reads run.json counts
   --arm <name>              ablation arm label; run.json gains an `ablation` object with the arm,
                              the SHA-256 of the ordered variable list, the generation budget and
@@ -358,6 +369,9 @@ OVERFITTING DIAGNOSTICS (always on):
                              rolling forward chaining (time-ordered data)
                              purged  k-fold with a --gap embargo either side of
                                      each test block
+                             Folds are drawn from the rows left by --exclude and
+                             --filter. With a declared locked test every such row
+                             is checked, also with --allow-lockbox.
   --cv-k <K>                 number of folds (default 5); --cv costs ~K searches
   --null-runs <n>            rerun the identical search on n shuffled targets
                              (y-randomisation control) and report the null error
@@ -2133,6 +2147,7 @@ fn main() {
     let mut allow_short = false;
     let mut trade_threshold = 0.0f64;
     let mut trade_cost_bps: Option<f64> = None;
+    let mut trade_cost_override: Option<f64> = None;
     let mut trade_slippage_bps = 0.0f64;
     let mut trade_cash_return = 0.0f64;
     let mut trade_funding: Option<String> = None;
@@ -2428,6 +2443,10 @@ fn main() {
             "--cost-bps" => {
                 trading_flags.push("--cost-bps");
                 trade_cost_bps = Some(parse_trade_number("--cost-bps", &val!()));
+            }
+            "--cost-override" => {
+                trading_flags.push("--cost-override");
+                trade_cost_override = Some(parse_trade_number("--cost-override", &val!()));
             }
             "--slippage-bps" => {
                 trading_flags.push("--slippage-bps");
@@ -4409,6 +4428,7 @@ fn main() {
     }
     let mut trading_spec: Option<rcsr::trading::TradingSpec> = None;
     let mut trading_cols: Option<data::TradingColumns> = None;
+    let mut trading_cost: Option<target::CostDecl> = None;
     if objective.is_trading() {
         let name = objective.name();
         if multi_output {
@@ -4441,13 +4461,21 @@ fn main() {
                 name, ts.kind
             ));
         }
-        let cost = match trade_cost_bps {
-            Some(c) => c,
-            None => trading_usage(&format!(
-                "--objective {} needs a cost assumption: --cost-bps <f> per side (0 only when stated)",
+        let spec_declares_cost = ts.per_side_cost_bps().is_some();
+        if trade_cost_bps.is_none() && trade_cost_override.is_none() && !spec_declares_cost {
+            trading_usage(&format!(
+                "--objective {} needs a cost assumption: a target spec with cost_bps, or --cost-bps <f> per side (0 only when stated)",
                 name
-            )),
-        };
+            ));
+        }
+        let (cost, cost_source) =
+            match target::resolve_cost(Some(ts), trade_cost_bps, trade_cost_override, 0.0) {
+                Ok(v) => v,
+                Err(e) => trading_usage(&e),
+            };
+        let mut decl = target::CostDecl::new(Some(ts), cost, cost_source);
+        decl.per_side_bps = cost + trade_slippage_bps;
+        trading_cost = Some(decl);
         if cost < 0.0 || trade_slippage_bps < 0.0 {
             trading_usage("--cost-bps and --slippage-bps must be non-negative");
         }
@@ -4584,6 +4612,27 @@ fn main() {
     };
     notes.extend(prepared.report.notes.iter().cloned());
     let prepared_s = run_start.elapsed().as_secs_f64();
+    // #145, #518: cross-validation draws its own folds, so the split guard
+    // cannot see them. Every row of the population (after --exclude and
+    // --filter) is a training or test row of some fold; refuse before the
+    // search. The declared locked test is checked even with --allow-lockbox.
+    let cv_keep: Option<Vec<bool>> = if cv_mode.is_some() {
+        let keep = match data::population_mask(&table, &spec, &prep) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        if let Err(e) = data::check_cv_lockbox(&table, &spec, &keep, allow_lockbox) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+        Some(keep)
+    } else {
+        None
+    };
+
     if cfg.metric == Metric::Slope {
         match prepared.require_slope_pairs() {
             Ok(pairs) => notes.push(format!(
@@ -5862,6 +5911,8 @@ fn main() {
             Some(rcsr::trading::FinalistReport {
                 objective,
                 spec: tspec.clone(),
+                cost: trading_cost.clone().unwrap_or_else(|| target::CostDecl::new(None, tspec.per_side_bps(), target::CostSource::Flag)),
+                constant: rcsr::trading::is_constant(tree),
                 candidates: rows.len(),
                 usable,
                 expression: top.expression.clone(),
@@ -5973,36 +6024,6 @@ fn main() {
         None
     };
 
-    // #145: cross-validation draws its own folds, so the split guard above
-    // cannot see them. If any row of the table is in 2026H2, some fold would
-    // train or score on the holdout; refuse before the first fold.
-    if cv_mode.is_some() && !allow_lockbox {
-        if let Some(name) = &time_name {
-            if let Ok(j) = table.index_of(name) {
-                let keys = data::time_keys_with(&table, j, &spec.time)
-                    .map(|(k, _)| k)
-                    .unwrap_or_default();
-                let times: Vec<i64> = keys
-                    .iter()
-                    .filter(|v| v.is_finite())
-                    .map(|v| v.floor() as i64)
-                    .collect();
-                if let Err(e) = rcsr::lockbox::Guard::default()
-                    .check_times("cross-validation rows", &times)
-                {
-                    eprintln!("error: {}", e);
-                    std::process::exit(EXIT_INPUT);
-                }
-                if let Some(d) = &spec.declared_lockbox {
-                    if let Err(e) = d.check_times("cross-validation rows", name, &times) {
-                        eprintln!("error: {}", e);
-                        std::process::exit(EXIT_INPUT);
-                    }
-                }
-            }
-        }
-    }
-
     // Cross-validation (issue #19): rebuild the split as `k` folds, re-run the
     // search on each fold's own training rows, and score the model it returns on
     // the held-out block. Each fold is normalised on its training rows alone.
@@ -6017,6 +6038,7 @@ fn main() {
             gap,
             cfg.seed,
             &dtypes,
+            cv_keep.as_deref(),
         ) {
             Ok(f) => f,
             Err(e) => {
@@ -6602,15 +6624,13 @@ fn main() {
                     Some(d) => d.lockbox,
                     None => rcsr::lockbox::Lockbox::crypto_2026h2(),
                 };
-                let times: Vec<i64> = match time_name.as_deref().and_then(|n| table.index_of(n).ok()) {
-                    Some(j) => data::time_keys_with(&table, j, &spec.time)
-                        .map(|(k, _)| k)
-                        .unwrap_or_default()
+                let times: Vec<i64> = match data::lockbox_stamps(&table, &spec) {
+                    Ok(Some((_, keys))) => keys
                         .iter()
                         .filter(|v| v.is_finite())
                         .map(|v| v.floor() as i64)
                         .collect(),
-                    None => Vec::new(),
+                    _ => Vec::new(),
                 };
                 let overlap = lockbox.overlap(times.iter().copied());
                 let reads = ledger_arg
@@ -9324,7 +9344,8 @@ USAGE:
 
 OPTIONS:
   --data <path>              .rcsb column store, or a CSV table as a fallback
-  --target <col>             forward-return column used for P&L
+  --target <col>             forward-return column used for P&L (optional with
+                             --target-spec or --from-run: the spec's return column)
   --expr <formula>           score expression, variables resolved by column name;
                              repeat to select among candidates on the validation slice
   --front <run.json>         candidates from the Pareto front of a run (one per
@@ -9363,7 +9384,20 @@ OPTIONS:
                              (default 0)
   --embargo <seconds>        extra gap between train_end and test_start
                              (default: the horizon)
-  --cost-bps <f>             cost per side in basis points (default {DEFAULT_COST_BPS})
+  --cost-bps <f>             cost per side in basis points (default {DEFAULT_COST_BPS}); a
+                             --target-spec or --from-run cost wins and a different
+                             value is refused (exit 2)
+  --cost-override <f>        price a different per-side cost on purpose; the report
+                             says cost.source = flag and keeps the spec cost
+  --target-spec <file>       target spec (rcsr-target-spec/1): --horizon, --entry-offset,
+                             --delay, the return column, return units (log is
+                             converted with exp_m1) and the cost come from the entry
+                             matching --target; a flag that disagrees is refused
+  --from-run <run.json>      the book a search with --objective selected: expression,
+                             variables, fixed threshold, per-side cost and target spec
+                             of the run. Refuses --expr, --threshold-quantile,
+                             --threshold-fixed and --target-spec, and a run without an
+                             objective block
   --threshold-quantile <q>   exact type-7 training/validation score quantile
                              (default {DEFAULT_QUANTILE}); selected by order-preserving
                              radix count, so theta is bit-identical to numpy
@@ -9489,9 +9523,14 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut group_col: Option<String> = None;
     let mut windows: Vec<walkforward::Window> = Vec::new();
     let mut windows_file: Option<String> = None;
-    let mut horizon = 0.0f64;
+    let mut horizon: Option<f64> = None;
     let mut embargo: Option<f64> = None;
-    let mut cost_bps = walkforward::DEFAULT_COST_BPS;
+    let mut cost_flag: Option<f64> = None;
+    let mut cost_override: Option<f64> = None;
+    let mut target_spec_path: Option<String> = None;
+    let mut from_run_path: Option<String> = None;
+    let mut entry_offset_flag: Option<f64> = None;
+    let mut delay_flag: Option<f64> = None;
     let mut quantile = walkforward::DEFAULT_QUANTILE;
     let mut quantile_set = false;
     let mut threshold_fixed: Option<f64> = None;
@@ -9520,7 +9559,6 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut expect_hash: Option<String> = None;
     let mut front_path: Option<String> = None;
     let mut allow_in_sample = false;
-    let mut cost_set = false;
 
     let need = |args: &[String], i: usize, flag: &str| -> String {
         match args.get(i) {
@@ -9583,7 +9621,7 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--horizon" => {
-                horizon = number(need(args, i + 1, "--horizon"), "--horizon");
+                horizon = Some(number(need(args, i + 1, "--horizon"), "--horizon"));
                 i += 1;
             }
             "--embargo" => {
@@ -9591,8 +9629,19 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--cost-bps" => {
-                cost_bps = number(need(args, i + 1, "--cost-bps"), "--cost-bps");
-                cost_set = true;
+                cost_flag = Some(number(need(args, i + 1, "--cost-bps"), "--cost-bps"));
+                i += 1;
+            }
+            "--cost-override" => {
+                cost_override = Some(number(need(args, i + 1, "--cost-override"), "--cost-override"));
+                i += 1;
+            }
+            "--target-spec" => {
+                target_spec_path = Some(need(args, i + 1, "--target-spec"));
+                i += 1;
+            }
+            "--from-run" => {
+                from_run_path = Some(need(args, i + 1, "--from-run"));
                 i += 1;
             }
             "--front" => {
@@ -9682,11 +9731,11 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--quiet" => quiet = true,
             "--entry-offset" => {
-                popts.entry_offset = number(need(args, i + 1, "--entry-offset"), "--entry-offset");
+                entry_offset_flag = Some(number(need(args, i + 1, "--entry-offset"), "--entry-offset"));
                 i += 1;
             }
             "--delay" => {
-                popts.delay = number(need(args, i + 1, "--delay"), "--delay");
+                delay_flag = Some(number(need(args, i + 1, "--delay"), "--delay"));
                 i += 1;
             }
             "--windows-scheme" => {
@@ -9788,8 +9837,43 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: walkforward needs --data\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
     });
+    let usage_fail = |msg: &str| -> ! {
+        eprintln!("error: {}", msg);
+        std::process::exit(EXIT_USAGE);
+    };
+    let input_fail = |msg: &str| -> ! {
+        eprintln!("error: {}", msg);
+        std::process::exit(EXIT_INPUT);
+    };
+    // #487: one declaration of the label window, the return units and the
+    // cost, read from a target spec or from the run that selected the book.
+    if from_run_path.is_some() && (target_spec_path.is_some() || front_path.is_some()) {
+        usage_fail("--from-run, --front and --target-spec are alternatives: a run carries its own target spec");
+    }
+    if front_path.is_some() && target_spec_path.is_some() {
+        usage_fail("--front and --target-spec are alternatives: the run carries its own target spec");
+    }
+    let mut cost_spec: Option<rcsr::target::TargetSpec> = None;
+    let mut run_cost: Option<(f64, rcsr::target::CostSource)> = None;
     let mut front_run: Option<rcsr::run_json::RunFile> = None;
-    if let Some(path) = &front_path {
+    if let Some(path) = &from_run_path {
+        if !expressions.is_empty() {
+            usage_fail("--from-run takes the expression from the run; do not pass --expr");
+        }
+        if quantile_set || threshold_fixed.is_some() {
+            usage_fail(
+                "--from-run takes the threshold rule from the run; do not pass \
+                 --threshold-quantile or --threshold-fixed",
+            );
+        }
+        let run = rcsr::run_json::RunFile::load(path).unwrap_or_else(|e| input_fail(&e));
+        let book = run.book().unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
+        expressions.push(book.expression.clone());
+        vars_src = Some(book.variables.join(","));
+        threshold_fixed = Some(book.threshold);
+        run_cost = Some((book.per_side_bps, book.source));
+        cost_spec = Some(book.spec);
+    } else if let Some(path) = &front_path {
         if !expressions.is_empty() {
             eprintln!(
                 "error: --front and --expr are alternatives; the candidates come from one source\n\n{}",
@@ -9837,18 +9921,83 @@ fn run_walkforward(args: &[String]) -> ! {
                 }
             });
         }
-        if threshold_fixed.is_none() && !quantile_set {
-            if let Some(theta) = run.threshold {
+        // The front is priced as the books the search compared: the run's
+        // fixed threshold, cost and target spec.
+        if let Some(theta) = run.threshold {
+            if threshold_fixed.is_none() && !quantile_set {
                 threshold_fixed = Some(theta);
             }
         }
-        if !cost_set {
-            if let Some(bps) = run.per_side_bps {
-                cost_bps = bps;
-            }
+        if let Some(bps) = run.per_side_bps {
+            run_cost = Some((bps, run.cost_source()));
+            cost_spec = run.target_spec();
         }
         front_run = Some(run);
+    } else if let Some(path) = &target_spec_path {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
+        let specs = rcsr::target::parse_file(&text).unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
+        let want = target.clone().unwrap_or_else(|| usage_fail("--target-spec needs --target to pick the spec entry"));
+        match rcsr::target::entry_for(&specs, &want) {
+            Some(s) => cost_spec = Some(s.clone()),
+            None => input_fail(&format!("{}: no entry for target '{}'", path, want)),
+        }
     }
+    let mut cost_bps = walkforward::DEFAULT_COST_BPS;
+    if let Some(s) = &cost_spec {
+        let effective = s.return_column.clone().unwrap_or_else(|| s.column.clone());
+        if let Some(t) = &target {
+            if *t != effective && *t != s.column && *t != s.name {
+                usage_fail(&format!(
+                    "--target {} is not the spec's return column '{}' or label column '{}'",
+                    t, effective, s.column
+                ));
+            }
+        }
+        let unit_scale = matches!(&s.scale, rcsr::target::Scale::Constant { value } if *value == 1.0);
+        if s.return_column.is_none() && (s.offset != 0.0 || s.clip.is_some() || !unit_scale) {
+            input_fail(
+                "the target is scaled, clipped or offset: declare a return_column in the \
+                 target spec so the P&L uses realised returns",
+            );
+        }
+        target = Some(effective);
+        let agree = |flag: &str, given: Option<f64>, declared: f64| -> f64 {
+            match given {
+                Some(g) if (g - declared).abs() > 1e-9 => usage_fail(&format!(
+                    "{} {} differs from the target spec ({}); remove the flag or edit the spec",
+                    flag, g, declared
+                )),
+                _ => declared,
+            }
+        };
+        horizon = Some(agree("--horizon", horizon, s.horizon_seconds));
+        popts.entry_offset = agree("--entry-offset", entry_offset_flag, s.entry_offset_seconds);
+        popts.delay = agree("--delay", delay_flag, s.delay_seconds);
+    } else {
+        popts.entry_offset = entry_offset_flag.unwrap_or(0.0);
+        popts.delay = delay_flag.unwrap_or(0.0);
+    }
+    let resolved = match run_cost {
+        Some((per_side, source)) => match (cost_flag, cost_override) {
+            (Some(_), Some(_)) => Err("--cost-bps and --cost-override are alternatives; pass one of them".to_string()),
+            (None, Some(o)) => Ok((o, rcsr::target::CostSource::Flag)),
+            (Some(f), None) if (f - per_side).abs() > 1e-12 => Err(format!(
+                "--cost-bps {} differs from the run ({} per side); \
+                 use --cost-override to price a different cost",
+                f, per_side
+            )),
+            _ => Ok((per_side, source)),
+        },
+        None => rcsr::target::resolve_cost(cost_spec.as_ref(), cost_flag, cost_override, cost_bps),
+    };
+    let (resolved_cost, cost_source) = resolved.unwrap_or_else(|e| usage_fail(&e));
+    cost_bps = resolved_cost;
+    if cost_spec.is_some() {
+        popts.cost = Some(rcsr::target::CostDecl::new(cost_spec.as_ref(), cost_bps, cost_source));
+    } else if cost_source == rcsr::target::CostSource::Flag {
+        popts.cost = Some(rcsr::target::CostDecl::new(None, cost_bps, cost_source));
+    }
+    let horizon = horizon.unwrap_or(0.0);
     let target = target.unwrap_or_else(|| {
         eprintln!("error: walkforward needs --target\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
@@ -10080,6 +10229,20 @@ fn run_walkforward(args: &[String]) -> ! {
             std::process::exit(EXIT_INPUT);
         }
     };
+    if spec.threshold_fixed.is_none() {
+        for c in &report.candidates {
+            let constant = expr::parse(c, &report.variables)
+                .map(|t| rcsr::trading::is_constant(&t))
+                .unwrap_or(false);
+            if constant {
+                eprintln!(
+                    "warning: score expression '{}' is constant: every quantile threshold makes \
+                     the book flat; pass --from-run or --threshold-fixed to price the book the search selected",
+                    c
+                );
+            }
+        }
+    }
     let report_sha = rcsr::manifest::sha256_hex(report.json().as_bytes());
     if let Some(want) = &expect_hash {
         if want != &report_sha {
