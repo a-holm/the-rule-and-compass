@@ -1600,12 +1600,17 @@ pub fn write_store_appending(
 ///
 /// Hashing happens while the blocks stream to disk, so the caller does not have
 /// to read a multi-gigabyte output a second time just to checksum it.
+///
+/// The bytes go to `<path>.tmp-<pid>` and are renamed to `path` on success, so
+/// a failed write leaves no file at `path` and no temporary file.
 pub fn write_store_appending_hashed(
     path: &str,
     source: &FileStore,
     extras: &[AppendColumn],
 ) -> Result<String, String> {
-    let mut file = File::create(path).map_err(|e| format!("{}: {}", path, e))?;
+    let tmp = format!("{}.tmp-{}", path, std::process::id());
+    let guard = TempGuard(tmp.clone());
+    let mut file = File::create(&tmp).map_err(|e| format!("{}: {}", tmp, e))?;
     let mut hasher = crate::manifest::Sha256Hasher::new();
     {
         let mut out = HashWriter {
@@ -1615,7 +1620,19 @@ pub fn write_store_appending_hashed(
         write_store_appending_to(&mut out, path, source, extras)?;
         out.flush().map_err(|e| format!("{}: {}", path, e))?;
     }
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {}", path, e))?;
+    std::mem::forget(guard);
     Ok(hasher.finalize())
+}
+
+/// Removes its file on drop; forgotten once the file has been renamed away.
+struct TempGuard(String);
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// `Write` adapter that feeds every byte to a SHA-256 state.
@@ -1692,7 +1709,7 @@ fn write_store_appending_to<W: Write>(
         if let Some(ci) = source.header.column_index(&e.name) {
             if !e.replace {
                 return Err(format!(
-                    "column '{}' already exists (use --replace to overwrite it)",
+                    "column '{}' already exists",
                     e.name
                 ));
             }
