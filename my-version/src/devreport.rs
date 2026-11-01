@@ -1232,4 +1232,22 @@ mod tests {
         assert!(u.contains("rcsr dev-report <log>"));
         assert!(u.contains("bottleneck"));
     }
+
+    /// #284: a device-fit run has only fallback seconds of island CPU time. It
+    /// must not read as a fit-bound run with severity 1.
+    #[test]
+    fn negligible_island_cpu_is_not_a_fit_bound_finding() {
+        let mut log = String::new();
+        for g in 1..=3 {
+            log.push_str(&line(g, 1.6e-7, 0.0, 1.0, 1, 10));
+            log.push('\n');
+        }
+        let (events, skipped) = parse_log(&log);
+        let a = analyse("x.ndjson", &events, skipped);
+        let text = render(&a);
+        assert!(!text.contains("fit-bound"), "{text}");
+        assert!(!text.contains("0.000 s of 0.000 s"), "{text}");
+        assert!(text.contains("no CPU fitting in the islands"), "{text}");
+        assert!(a.findings.iter().all(|f| f.severity < 1.0), "{:?}", a.findings);
+    }
 }

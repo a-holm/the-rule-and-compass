@@ -7151,7 +7151,7 @@ fn run_search(
             let mut dev_mark = cfg.dev_log.is_some().then(std::time::Instant::now);
             let mut stage_mark = std::time::Instant::now();
             let dev_counters = Some(GenCounters {
-                timed: cfg.dev_log.is_some(),
+                timed: cfg.dev_log.is_some() || cfg.gpu,
                 ..GenCounters::default()
             });
             // The island threads take `Option<&GenCounters>`, which is `Copy`;
@@ -7516,7 +7516,11 @@ fn run_search(
             // accumulated and partitioned with the nested fit window after the
             // loop, so fit is never counted twice.
             run_ledger.record_stage(crate::gpu_stats::Stage::HostOther, stage_prep);
-            run_ledger.record_stage(crate::gpu_stats::Stage::Vary, stage_search);
+            run_ledger.record_island_window(
+                stage_search,
+                GenCounters::seconds(dev_counters_ref, |c| &c.fit_ns),
+                islands.len().max(1) * island_workers,
+            );
             run_ledger.record_stage(crate::gpu_stats::Stage::Select, stage_select);
             run_ledger.record_stage(crate::gpu_stats::Stage::Archive, stage_archive);
             eval_stage_total += stage_eval;
