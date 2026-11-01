@@ -3522,10 +3522,11 @@ fn fitness_error_and_descriptor(
         return (f64::INFINITY, None);
     }
     let nvars = s.x.first().map(Vec::len).unwrap_or(0);
-    let pred = predictions(tree, data);
-    let error = book.regret(&pred);
-    let descriptor = want_descriptor.then(|| qd::descriptor_from_prediction(tree, &pred, nvars));
-    (error, descriptor)
+    with_predictions(tree, data, |pred| {
+        let error = book.regret(pred);
+        let descriptor = want_descriptor.then(|| qd::descriptor_from_prediction(tree, pred, nvars));
+        (error, descriptor)
+    })
 }
 
 /// #120: score a candidate and, when asked, accumulate its behaviour
@@ -3561,32 +3562,74 @@ fn eval_error_and_descriptor(
         let descriptor = want_descriptor.then(|| qd::descriptor(tree, s));
         return (error, descriptor);
     }
-    let pred = predictions(tree, data);
     // The parameter count lets the information criteria (AIC/AICc/BIC) work as
     // search metrics; it is ignored by every other metric. The weight vector is
     // empty for an unweighted sample, which takes the identical unweighted path.
-    let error = crate::metrics::score_sample(&pred, s, metric, expr::count_constants(tree));
-    let descriptor =
-        want_descriptor.then(|| qd::descriptor_from_prediction(tree, &pred, nvars));
-    (error, descriptor)
+    with_predictions(tree, data, |pred| {
+        let error = crate::metrics::score_sample(pred, s, metric, expr::count_constants(tree));
+        let descriptor = want_descriptor.then(|| qd::descriptor_from_prediction(tree, pred, nvars));
+        (error, descriptor)
+    })
 }
 
-/// #27: one candidate's prediction vector.
+/// #475: one candidate's prediction vector, owned.
 ///
-/// The fast path compiles the tree once and evaluates all rows in batches over
+/// The fast path compiles the tree once and evaluates all rows in tiles over
 /// the sample's cached SoA columns. An unsupported operator anywhere in the
 /// tree makes `compile` return `None`, and this call then takes the scalar
-/// walk — transparently, for that tree only.
+/// walk, transparently, for that tree only.
 fn predictions(tree: &Node, data: &EvalSample) -> Vec<f64> {
-    if let Some(cols) = &data.cols {
-        if let Some(program) = crate::eval_soa::compile(tree) {
-            let rows = data.sample.x.len();
-            let mut pred = vec![0.0; rows];
-            crate::eval_soa::eval_batch(&program, cols, rows, &mut pred);
-            return pred;
+    let mut buf = PredBuf::default();
+    buf.fill(tree, data);
+    buf.pred
+}
+
+/// #475: the prediction buffer and the evaluator scratch of one worker.
+#[derive(Default)]
+struct PredBuf {
+    pred: Vec<f64>,
+    scratch: crate::eval_soa::Scratch,
+}
+
+impl PredBuf {
+    fn fill(&mut self, tree: &Node, data: &EvalSample) {
+        let rows = data.sample.x.len();
+        #[cfg(test)]
+        if self.pred.capacity() < rows {
+            PRED_ALLOCS.with(|n| n.set(n.get() + 1));
         }
+        if let Some(cols) = &data.cols {
+            if let Some(program) = crate::eval_soa::compile(tree) {
+                self.pred.clear();
+                self.pred.resize(rows, 0.0);
+                crate::eval_soa::eval_batch_into(&program, cols, rows, &mut self.pred, &mut self.scratch);
+                return;
+            }
+        }
+        self.pred.clear();
+        self.pred.extend(data.sample.x.iter().map(|row| eval(tree, row)));
     }
-    data.sample.x.iter().map(|row| eval(tree, row)).collect()
+}
+
+thread_local! {
+    static PRED_BUF: std::cell::RefCell<PredBuf> = std::cell::RefCell::new(PredBuf::default());
+}
+
+#[cfg(test)]
+thread_local! {
+    static PRED_ALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// #475: run `f` on a candidate's predictions, held in this thread's reusable
+/// buffer. A nested call on the same thread gets its own buffer.
+fn with_predictions<R>(tree: &Node, data: &EvalSample, f: impl FnOnce(&[f64]) -> R) -> R {
+    PRED_BUF.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut buf) => {
+            buf.fill(tree, data);
+            f(&buf.pred)
+        }
+        Err(_) => f(&predictions(tree, data)),
+    })
 }
 
 /// #14, #117: fit a candidate's constants on the objective its metric actually
@@ -9201,6 +9244,47 @@ mod tests {
             "expected one full-train and one test transpose, got {}",
             transpose_count()
         );
+    }
+
+    /// #475: scoring many candidates on one thread reuses one prediction
+    /// buffer instead of allocating a vector per candidate.
+    #[test]
+    fn scoring_candidates_reuses_one_prediction_buffer() {
+        let s = sample();
+        let mut cfg = Config::default();
+        cfg.simd = true;
+        let view = EvalSample::new(&s, &cfg);
+        let trees = [
+            node(Op::Add, vec![input(0), constant(1.0)]),
+            node(Op::Mul, vec![input(0), input(0)]),
+            input(0),
+            constant(2.0),
+        ];
+        let expected: Vec<u64> = trees
+            .iter()
+            .map(|t| eval_error_on(t, &view, Metric::Squared).to_bits())
+            .collect();
+        PRED_ALLOCS.with(|n| n.set(0));
+        for _ in 0..25 {
+            for (t, want) in trees.iter().zip(&expected) {
+                assert_eq!(eval_error_on(t, &view, Metric::Squared).to_bits(), *want);
+            }
+        }
+        assert_eq!(PRED_ALLOCS.with(|n| n.get()), 0, "the buffer is already sized");
+        let fresh = std::thread::spawn({
+            let s = s.clone();
+            move || {
+                let cfg = Config::default();
+                let view = EvalSample::new(&s, &cfg);
+                for _ in 0..25 {
+                    let _ = eval_error_on(&input(0), &view, Metric::Squared);
+                }
+                PRED_ALLOCS.with(|n| n.get())
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(fresh, 1, "one buffer per worker thread");
     }
 
     // #76: two distinguishable front members.
