@@ -702,6 +702,63 @@ fn finish(ctx: &Ctx, positions: &[f64], spec: &TradingSpec) -> Result<PathStats,
     })
 }
 
+/// Smallest positive step between consecutive rows of one group, in seconds,
+/// and the rows that realise the first violation of `horizon_seconds`.
+/// Non-finite times and equal timestamps are skipped.
+fn group_steps(time: &[f64], group: &[u64], horizon_seconds: f64) -> (Option<f64>, Option<(u64, usize, usize, f64)>) {
+    let mut order: Vec<usize> = (0..time.len().min(group.len())).filter(|&i| time[i].is_finite()).collect();
+    order.sort_by(|&a, &b| {
+        group[a]
+            .cmp(&group[b])
+            .then_with(|| time[a].partial_cmp(&time[b]).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.cmp(&b))
+    });
+    let limit = horizon_seconds * (1.0 - 1e-9);
+    let mut min_step: Option<f64> = None;
+    let mut bad: Option<(u64, usize, usize, f64)> = None;
+    for w in order.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if group[a] != group[b] {
+            continue;
+        }
+        let step = time[b] - time[a];
+        if !(step > 0.0) {
+            continue;
+        }
+        if min_step.map_or(true, |m| step < m) {
+            min_step = Some(step);
+        }
+        if bad.is_none() && step < limit {
+            bad = Some((group[a], a, b, step));
+        }
+    }
+    (min_step, bad)
+}
+
+/// Smallest positive step between consecutive rows of one group, in seconds,
+/// in (group, time) order. `None` when no group has two rows.
+pub fn min_group_step(rows: &TradingRows) -> Option<f64> {
+    group_steps(&rows.time, &rows.group, 0.0).0
+}
+
+/// Refuse a book whose per-row returns overlap: some group has two rows
+/// closer than `horizon_seconds`. Returns the measured minimum step. A
+/// non-positive horizon skips the check.
+pub fn check_return_spacing(rows: &TradingRows, horizon_seconds: f64) -> Result<Option<f64>, String> {
+    let (min_step, bad) = group_steps(&rows.time, &rows.group, horizon_seconds);
+    if horizon_seconds > 0.0 {
+        if let Some((g, a, b, step)) = bad {
+            return Err(format!(
+                "overlapping returns: group {} has rows {} and {} {} seconds apart, below the {}-second \
+                 label horizon; use a label stride of at least the horizon (long:<h>,stride=<h>) or a \
+                 one-bar label",
+                g, a, b, step, horizon_seconds
+            ));
+        }
+    }
+    Ok(min_step)
+}
+
 fn check_lengths(n: usize, r: &[f64], rows: &TradingRows) -> Result<(), String> {
     if r.len() != n || rows.time.len() != n || rows.group.len() != n {
         return Err(format!(
@@ -793,11 +850,24 @@ pub fn evaluate_positions(
     finish(&ctx, &kept, spec)
 }
 
+/// True when the expression reads no variable.
+pub fn is_constant(tree: &crate::expr::Node) -> bool {
+    tree.op != crate::expr::Op::Input && tree.kids.iter().all(is_constant)
+}
+
 /// The finalist chosen by a trading objective, with both books.
 #[derive(Clone, Debug)]
 pub struct FinalistReport {
     pub objective: Objective,
     pub spec: TradingSpec,
+    /// Smallest positive step between consecutive rows of one group over the
+    /// validation and test slices.
+    pub min_group_step: Option<f64>,
+    pub horizon_seconds: f64,
+    pub cost: crate::target::CostDecl,
+    /// The finalist expression has no variable: every quantile or fixed
+    /// threshold makes it a flat or always-long book.
+    pub constant: bool,
     pub candidates: usize,
     pub usable: usize,
     pub expression: String,
@@ -813,6 +883,17 @@ pub struct FinalistReport {
 }
 
 impl FinalistReport {
+    fn spec_json(&self) -> String {
+        let mut s = self.spec.json();
+        s.pop();
+        s.push_str(&format!(
+            ",\"min_group_step_seconds\":{},\"horizon_seconds\":{}}}",
+            self.min_group_step.map_or_else(|| "null".to_string(), num),
+            num(self.horizon_seconds)
+        ));
+        s
+    }
+
     pub fn json(&self, backend: &str, backend_reason: Option<&str>) -> String {
         let block = |r: &Result<PathStats, String>| match r {
             Ok(s) => s.json(),
@@ -820,21 +901,23 @@ impl FinalistReport {
         };
         format!(
             "{{\"name\":\"{}\",\"position\":\"long_only\",\"selection\":\"validation_objective\",\
-             \"candidates\":{},\"usable_candidates\":{},\"exact\":\"cpu_f64\",\
+             \"cost\":{},\"candidates\":{},\"usable_candidates\":{},\"exact\":\"cpu_f64\",\
              \"backend\":{},\"backend_reason\":{},\"spec\":{},\
-             \"finalist\":{{\"expression\":{},\"archive_rank\":{},\"fit_metric\":{},\"fit_error\":{},\
+             \"finalist\":{{\"expression\":{},\"archive_rank\":{},\"constant\":{},\"fit_metric\":{},\"fit_error\":{},\
              \"validation_error\":{},\"test_error\":{},\"validation_objective\":{}}},\
              \"validation\":{},\"test\":{}}}",
             self.objective.name(),
+            self.cost.json(),
             self.candidates,
             self.usable,
             crate::devlog::text(backend),
             backend_reason
                 .map(crate::devlog::text)
                 .unwrap_or_else(|| "null".to_string()),
-            self.spec.json(),
+            self.spec_json(),
             crate::devlog::text(&self.expression),
             self.archive_rank,
+            self.constant,
             crate::devlog::text(&self.fit_metric),
             num(self.fit_error),
             num(self.validation_error),
@@ -870,6 +953,58 @@ impl FinalistReport {
             line("validation", &self.validation),
             line("test", &self.test)
         )
+    }
+}
+
+#[cfg(test)]
+mod spacing_tests {
+    use super::*;
+
+    fn rows(pairs: &[(u64, f64)]) -> TradingRows {
+        TradingRows {
+            time: pairs.iter().map(|p| p.1).collect(),
+            group: pairs.iter().map(|p| p.0).collect(),
+            funding: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn step_equal_to_horizon_passes() {
+        let r = rows(&[(1, 0.0), (1, 3600.0), (1, 7200.0)]);
+        assert_eq!(check_return_spacing(&r, 3600.0), Ok(Some(3600.0)));
+    }
+
+    #[test]
+    fn one_second_below_horizon_fails() {
+        let r = rows(&[(1, 0.0), (1, 3600.0), (1, 7199.0)]);
+        let e = check_return_spacing(&r, 3600.0).unwrap_err();
+        assert!(e.starts_with("overlapping returns: group 1 has rows 1 and 2 3599 seconds apart"), "{e}");
+    }
+
+    #[test]
+    fn single_row_groups_pass() {
+        let r = rows(&[(1, 0.0), (2, 10.0), (3, 20.0)]);
+        assert_eq!(check_return_spacing(&r, 3600.0), Ok(None));
+        assert_eq!(min_group_step(&r), None);
+    }
+
+    #[test]
+    fn groups_are_checked_separately() {
+        let r = rows(&[(1, 0.0), (2, 10.0), (1, 3600.0), (2, 3610.0)]);
+        assert_eq!(check_return_spacing(&r, 3600.0), Ok(Some(3600.0)));
+        assert_eq!(min_group_step(&r), Some(3600.0));
+    }
+
+    #[test]
+    fn equal_timestamps_and_nan_are_skipped() {
+        let r = rows(&[(1, 0.0), (1, 0.0), (1, f64::NAN), (1, 3600.0)]);
+        assert_eq!(check_return_spacing(&r, 3600.0), Ok(Some(3600.0)));
+    }
+
+    #[test]
+    fn nonpositive_horizon_skips() {
+        let r = rows(&[(1, 0.0), (1, 1.0)]);
+        assert_eq!(check_return_spacing(&r, 0.0), Ok(Some(1.0)));
     }
 }
 

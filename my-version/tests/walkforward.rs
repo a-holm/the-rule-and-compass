@@ -632,6 +632,48 @@ fn final_exit_is_charged_per_group_when_rows_are_dropped() {
     assert!((t.net - 0.096).abs() < 1e-15);
 }
 
+#[test]
+fn overlapping_test_rows_are_refused_and_the_spacing_is_reported() {
+    let rows: Vec<(f64, f64, f64)> = (0..8).map(|i| (3600.0 * i as f64, i as f64, 0.001)).collect();
+    let t = single(&rows);
+    let mut s = spec("x", vec![window("w", 0.0, 2.0 * 3600.0, 4.0 * 3600.0, 8.0 * 3600.0)]);
+    s.horizon = 7200.0;
+    let err = walkforward::run_table(&t, &s, "t").unwrap_err();
+    assert!(err.contains("overlapping returns"), "{err}");
+    s.horizon = 3600.0;
+    let r = walkforward::run_table(&t, &s, "t").unwrap();
+    assert_eq!(r.min_group_step, Some(3600.0));
+    assert!(r.json().contains("\"min_group_step_seconds\":3600"));
+}
+
+#[test]
+fn the_cli_exits_2_on_overlapping_returns() {
+    let dir = std::env::temp_dir().join(format!("rcsr-wf-overlap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("d.csv");
+    let mut csv = String::from("ts,x,target\n");
+    for i in 0..8 {
+        csv.push_str(&format!("{},{},0.001\n", 3600 * i, i));
+    }
+    std::fs::write(&data, csv).unwrap();
+    let run = |horizon: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+            .args([
+                "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x",
+                "--time", "ts", "--horizon", horizon, "--cost-bps", "5", "--periods-per-year", "365",
+                "--window", "w,0,7200,14400,28800", "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let bad = run("7200");
+    assert_eq!(bad.status.code(), Some(2), "{}", String::from_utf8_lossy(&bad.stderr));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("overlapping returns"));
+    let ok = run("3600");
+    assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 mod front {
     use rcsr::devlog::Json;
     use std::path::PathBuf;
@@ -679,7 +721,7 @@ mod front {
 
     fn wf(data: &str, source: &[&str], window: &str, extra: &[&str]) -> (i32, String, String) {
         let mut a = vec![
-            "walkforward", "--data", data, "--time", "ts", "--horizon", "5", "--periods-per-year", "365",
+            "walkforward", "--data", data, "--time", "ts", "--horizon", "1", "--periods-per-year", "365",
             "--validation-frac", "0.3", "--window", window, "--json",
         ];
         a.extend_from_slice(source);
@@ -782,7 +824,7 @@ mod front {
         assert_eq!(code, 0, "{err}");
         assert!(out.contains("\"per_side_bps\":5,"), "{out}");
         assert!(out.contains("\"threshold_source\":\"fixed\""), "{out}");
-        let (code, out, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--cost-bps", "12", "--threshold-quantile", "0.5"]);
+        let (code, out, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--cost-override", "12", "--threshold-quantile", "0.5"]);
         assert_eq!(code, 0, "{err}");
         assert!(out.contains("\"per_side_bps\":12,"), "{out}");
         assert!(!out.contains("\"threshold_source\":\"fixed\""), "{out}");

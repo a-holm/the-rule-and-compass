@@ -733,7 +733,7 @@ fn a_validation_slice_in_the_lockbox_is_refused_like_a_test_block() {
 
     let allowed = lockbox_run(
         &data,
-        &["--test-frac", "0.3", "--validation-frac", "0.2", "--allow-lockbox"],
+        &["--test-frac", "0.3", "--validation-frac", "0.2", "--allow-lockbox", "--lockbox", "none"],
     );
     assert_eq!(code(&allowed), 0, "{}", stderr(&allowed));
 

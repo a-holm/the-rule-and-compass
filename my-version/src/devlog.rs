@@ -779,6 +779,9 @@ pub struct RunEnd {
     pub unaccounted_s: Option<f64>,
     /// #284: fit kernel seconds from raw device events.
     pub fit_kernel_s: Option<f64>,
+    /// #496: `fit_kernel_s` apportioned to the LM phase and to the polish phase.
+    pub fit_kernel_f32_s: Option<f64>,
+    pub fit_kernel_f64_s: Option<f64>,
     /// #284: exact CPU fit-fallback seconds.
     pub fit_fallback_s: Option<f64>,
     /// Log bookkeeping: events written, bytes, events dropped by the cap.
@@ -796,7 +799,7 @@ pub fn run_end_json(r: &RunEnd) -> String {
          \"json\":{},\"peak_rss_bytes\":{},\"gpu_wall_s\":{},\"device_hours\":{},\
          \"device_seconds_incl_fit\":{},\"device_fraction_of_run\":{},\
          \"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"unaccounted_s\":{},\
-         \"fit_kernel_s\":{},\"fit_fallback_s\":{},\
+         \"fit_kernel_s\":{},\"fit_kernel_f32_s\":{},\"fit_kernel_f64_s\":{},\"fit_fallback_s\":{},\
          \"events\":{},\"bytes\":{},\"dropped\":{},\"end\":{}}}",
         SCHEMA,
         VERSION,
@@ -827,6 +830,8 @@ pub fn run_end_json(r: &RunEnd) -> String {
         opt_num(r.duty_run),
         opt_num(r.unaccounted_s),
         opt_num(r.fit_kernel_s),
+        opt_num(r.fit_kernel_f32_s),
+        opt_num(r.fit_kernel_f64_s),
         opt_num(r.fit_fallback_s),
         r.events,
         r.bytes,

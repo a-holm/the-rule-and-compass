@@ -164,7 +164,7 @@ The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA
   reported as the strategy's P&L. The report labels it `"label":
   "hindsight_bound"`, `"is_strategy": false`, and carries the threshold book's
   net, the gap and `rule_le_bound`.
-* `--cost-bps` is charged **per side** on `|position - previous position|`,
+* `--cost-bps` (default 10; a `--target-spec` cost wins, see "One book from search to evaluation") is charged **per side** on `|position - previous position|`,
   separately inside each `--group-by` series. Every series starts flat, so an
   entry costs one side and its exit (including the **final** exit of every
   group) costs the other: a round trip is `2 * cost_bps`. #145 changed the
@@ -180,11 +180,14 @@ The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA
   `"lockbox": {"permitted": true, ...}` in the JSON report. The same
   `rcsr::lockbox::Guard` is used by `rcsr run` (the default search),
   `rcsr panel build --start/--end` and a labelled `rcsr prep`.
-* A locked test declared with the data (`rcsr panel build --locked-test`, or
-  `--lockbox START,END`) is checked the same way on every run, with or without
-  `--ledger`: a window whose train or test range touches it exits 3. The JSON
-  `protocol.lockbox` object then carries `declared`, `source`, `rows_in_scope`
-  and `evaluated`. See [`panel.md`](panel.md#the-declared-locked-test).
+* The protocol locked test is checked on every run, with or without
+  `--ledger`: a window whose train or test range touches it exits 3. The range
+  is `--lockbox START,END`, else the one declared with the data
+  (`rcsr panel build --locked-test`), else the protocol default
+  2025-07-01..2026-07-01. `--lockbox none` is the only opt-out. The JSON
+  `protocol.lockbox` object always carries `declared`, `source` (`flag`,
+  `store`, `protocol_default`, `none`), `declared_in`, `rows_in_scope` and
+  `evaluated`. See [`panel.md`](panel.md#the-declared-locked-test).
 * Costs and positions are per group. Counting position changes on a flattened
   timestamp/symbol row order would count spurious changes at every symbol
   boundary; this implementation does not.
@@ -406,6 +409,19 @@ A `.rcsb` store read with `--vars` and `--time` is projected to the columns the 
 
 Finalist selection with `--objective` scores every Pareto member this way on the validation slice only. The winner has the lowest objective value (`-net P&L`, `-Sharpe` or `-log growth`; ties keep the archive order, so the smaller expression wins). Candidates below `--min-trades` or with a non-finite value are unusable. The test block is scored once, for the winner.
 
+## One book from search to evaluation (#487)
+
+The search objective, `rcsr walkforward`, `rcsr ablation score` and `rcsr ladder` price one long/flat book with one cost, one return unit and one position rule. The declarations live in the target spec (`<data>.targets.json`) that `rcsr enrich --label long:<h>,fee=<bp>` writes, and in the `run.json` of the search.
+
+* **Cost.** `rcsr enrich --label long:<h>` needs `fee=` (exit 2; `fee=0` is allowed). The spec carries `cost_bps` (round trip, `2 * fee + spread + slip`) and `cost_per_side_bps = cost_bps / 2`. Every evaluator charges `cost_bps / 2` per side. `--cost-bps` that differs from the spec is refused (exit 2); `--cost-override <bp>` prices a different cost on purpose. Without a spec cost the flag or the default applies (walk-forward 10 bp, ladder and ablation 12 bp per side; the search needs the flag). A spec whose label is already net of cost (`cost_in_label`) declares no per-side cost.
+* **Units.** A spec with `return_units: "log"` makes the walk-forward, the ladder and `ablation score` convert the return column with `exp_m1` before any P&L, as the objective does. Without a spec the column is read as a simple return.
+* **Position rule.** `rcsr walkforward --from-run run.json` and `rcsr ablation score --from-run run.json` take the expression, the fixed threshold `objective.spec.threshold`, the per-side cost `objective.spec.per_side_bps` and the target spec (return column, units, horizon, entry offset, delay) from the run. A run without an `objective` block is refused (exit 3). `--expr`, `--threshold-quantile`, `--threshold-fixed` and `--target-spec` with `--from-run` are usage errors (exit 2). The quantile rule of a plain `walkforward --expr` is a different book: for a constant finalist every quantile threshold is flat, and the command warns.
+* **Target spec in walk-forward.** `--target-spec <file>` fills `--horizon`, `--entry-offset`, `--delay`, the return column, the units and the cost from the entry whose `column`, `name` or `return_column` is `--target`. A flag that disagrees is refused like the cost.
+* **Ladder grid.** With a spec cost the default `--cost-grid` is 1x, 2x and 3.33x the per-side cost. With a flag or the default cost it stays `12,20,40`. An explicit `--cost-grid` is absolute.
+* **Reports.** The `objective` block of `run.json`, the walk-forward report, the ladder report and the ablation result carry `cost: {per_side_bps, source, return_units}` with `source` one of `target_spec`, `flag` or `default`. A `flag` source priced against a spec adds `spec_per_side_bps`. `objective.finalist.constant` is true when the finalist reads no variable.
+
+Verify: `tests/cost_contract.rs` (`one_cost_one_book_across_evaluators`, `walkforward_from_run_prices_the_selected_book`, `a_log_return_column_is_converted_with_exp_m1_in_every_evaluator`, `the_cost_flag_must_agree_with_the_target_spec`, `the_cost_source_is_reported`, `from_run_refuses_a_run_without_an_objective_and_competing_rules`, `a_long_label_needs_an_explicit_fee`) and the `resolve_cost_*` unit tests in `src/target.rs`.
+
 ## Metrics
 
 Per window and pooled:
@@ -460,7 +476,7 @@ The primary book is long or flat against cash. Short exposure, borrow and fundin
 
 ### Four tiers and the windows table
 
-Training fits, validation selects, development out-of-sample evaluates the procedure, and a locked test is read once per sealed candidate. [`protocol/windows.csv`](../protocol/windows.csv) holds the UTC boundaries (`rcsr protocol windows` regenerates it, and a test pins the file to the generator):
+Training fits, validation selects, development out-of-sample evaluates the procedure, and a locked test is read once per sealed candidate (once in total after a final seal). [`protocol/windows.csv`](../protocol/windows.csv) holds the UTC boundaries (`rcsr protocol windows` regenerates it, and a test pins the file to the generator):
 
 | range | UTC |
 |---|---|
@@ -472,6 +488,10 @@ Training fits, validation selects, development out-of-sample evaluates the proce
 | reserved | 2026H2 (the engine lockbox) |
 
 Each row has `train_end = test_start - purge_seconds` (219600 s: 1 h entry plus a 60 h label). A development test window ends at `min(quarter end, locked start - purge_seconds)`, so `expanding-2025Q2` and `rolling24-2025Q2` end at 2025-06-28T11:00:00: a label at a later stamp reads bars of the locked test. Outside `--locked-test`, `walkforward`, `ladder` and `ablation score` refuse (exit 3) a window that ends after `locked start - purge` (purge = entry offset + horizon + delay for `walkforward`, `--purge-seconds` for the others); in `--locked-test` mode the training range must end at or before `locked start - purge` and `validation_start` six calendar months before the test start. `--windows protocol/windows.csv --windows-scheme expanding` loads one scheme; the table's `validation_start` replaces `--validation-frac`. The validation slice sets the threshold and selects among `--expr` candidates. Select the procedure, not the lucky candidate: pool the development series of the chosen procedure.
+
+### Overlapping returns
+
+The book earns the per-row forward return on every long row and charges one cost per position change. With rows closer than `--horizon` in one group, a long run earns the same price move several times. `rcsr walkforward` therefore refuses (exit 2, `overlapping returns`) any window whose test rows have two rows of one group less than `--horizon` seconds apart; a step equal to the horizon passes, a gap passes, equal timestamps are skipped. `--horizon 0` skips the check. The report carries `split.min_group_step_seconds`, the smallest positive step.
 
 ### Purge
 
@@ -507,11 +527,23 @@ Candidates are evaluated on the test periods with their own validation threshold
 
 ### Candidate ledger and the locked test
 
-`--ledger FILE` makes a development run append a `candidate` line (content-addressed id over the procedure, the data SHA-256 and the build commit; `test_read:false`). Each line holds the SHA-256 of the previous line, so an edit breaks the chain. A development window that ends after the declared lockbox start minus the label purge (`--lockbox START,END`, default 2025-07-01 to 2026-07-01) is refused.
+`--ledger FILE` makes a development run append a `candidate` line (content-addressed id over the procedure, the data SHA-256 and the build commit; `test_read:false`). Each line holds the SHA-256 of the previous line, so an edit breaks the chain. A development window that ends after the locked test start minus the label purge (`--lockbox START,END`, else the range declared with the data, else 2025-07-01 to 2026-07-01; `--lockbox none` opts out) is refused.
 
 `rcsr protocol seal --ledger L --out locked_candidates.json` writes the sealed list and records its hash in the ledger. `--locked-test --sealed locked_candidates.json` then reads the locked test: the candidate must be in the sealed list, the data and build hashes must equal the sealed entry (otherwise the run is void), and the candidate must not have `test_read:true`. The read appends a `test_read` line with the report hash and the new `read_count`; a second read is refused. `--verify-read --expect-report-sha256 H` recomputes the read and compares hashes without recording anything. The report's `protocol` object holds the lockbox rows, date range and read count; `run.json` carries a `lockbox` object (`--lockbox`, `--ledger`) with the rows in the range, their first and last stamps and the read count.
 
 `rcsr ladder --scheme locked --locked-test --ledger L --sealed S` reads the locked test for the baseline ladder. The sealed list must be recorded in the ledger and the ledger must hold no `baseline_read`; the run appends `{"event":"baseline_read",...}` with the data and report hashes, and a second call is refused. Without `--locked-test`, `ladder` and `ablation score` refuse any fold that ends after the declared range start minus the purge.
+
+#### Final seal: one read, one candidate
+
+`rcsr protocol seal --final [--max-reads N] [--report-candidates] --ledger L --out locked_candidates.json` closes the ledger for the final result. It needs a ledger with no seal and no locked read, and it appends `{"event":"seal","final":true,"max_reads":N,...}` (N defaults to 1). Afterwards:
+
+* `walkforward --ledger` without `--locked-test` and both `protocol seal` forms are refused (`the ledger is final`; exit 3 and 1). All candidate selection happens on development data before the final seal.
+* At most N `test_read` lines (one `baseline_read` for `ladder`) are accepted. A read of a second sealed candidate after the Nth is refused with exit 3.
+* The first locked read writes `<data>.locked_reads.jsonl` beside the store: ledger path, the ledger head the read extends, event and report SHA-256. A read of the same store through another ledger (a fresh file, a copy, an edited chain) is refused: `<data> was already read through ledger <path>`. The marker lives with the store, so a fresh ledger cannot reset the count. Copying the store without its marker file is outside this check.
+* A read of a multi-candidate procedure reports the validation-selected candidate only. No other candidate is evaluated on the test block: `--bootstrap` has no candidate columns, `multiple_testing` has `candidates:1`, one p-value and `pbo_error` `final read reports the selected candidate`, and `--batch-pnl` is refused with exit 2. `--report-candidates` at seal time keeps the full report and records the choice in the seal line.
+* `rcsr protocol verify --ledger L --data D --expect-reads N [--sealed S]` exits 1 unless the ledger has N locked reads, exactly one seal line that is final, no more reads than the seal allows and a marker that matches the ledger line for line. With `--sealed` it also checks that the file is the final list and that every read id is in it. Before the read, `--expect-reads 1` exits 1 and `--expect-reads 0` exits 0.
+
+A crash after the marker line and before the ledger line leaves a marker the ledger does not record. The next call finds the same ledger head and reads once; `verify` flags the state until then. Deleting the marker makes `verify` report a ledger read without a marker line.
 
 ## Fold sign test
 

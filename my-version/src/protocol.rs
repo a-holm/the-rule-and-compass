@@ -281,10 +281,21 @@ fn field_num(line: &str, key: &str) -> Option<f64> {
     rest[..end].trim().parse().ok()
 }
 
+fn field_bool(line: &str, key: &str) -> bool {
+    line.contains(&format!("\"{}\":true", key))
+}
+
+/// Terms of a final seal: the locked test is read at most `max_reads` times.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinalSeal {
+    pub max_reads: u64,
+    pub report_candidates: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     Candidate(Candidate),
-    Seal { sealed_sha256: String },
+    Seal { sealed_sha256: String, final_seal: Option<FinalSeal> },
     TestRead { id: String, report_sha256: String, read_count: u64 },
     BaselineRead { data_sha256: String, report_sha256: String },
 }
@@ -355,7 +366,17 @@ impl Ledger {
                     report_sha256: get("report_sha256"),
                     expression: get("expression"),
                 }),
-                "seal" => Event::Seal { sealed_sha256: get("sealed_sha256") },
+                "seal" => Event::Seal {
+                    sealed_sha256: get("sealed_sha256"),
+                    final_seal: if field_bool(&line, "final") {
+                        Some(FinalSeal {
+                            max_reads: field_num(&line, "max_reads").unwrap_or(1.0) as u64,
+                            report_candidates: field_bool(&line, "report_candidates"),
+                        })
+                    } else {
+                        None
+                    },
+                },
                 "test_read" => Event::TestRead {
                     id: get("id"),
                     report_sha256: get("report_sha256"),
@@ -388,6 +409,7 @@ impl Ledger {
 
     /// Record a development candidate. Returns its id.
     pub fn add_candidate(&self, c: &Candidate) -> Result<String, String> {
+        self.refuse_if_final()?;
         self.append(&format!(
             "\"event\":\"candidate\",\"id\":\"{}\",\"spec_sha256\":\"{}\",\"data_sha256\":\"{}\",\
              \"build_commit\":\"{}\",\"report_sha256\":\"{}\",\"test_read\":false,\"expression\":{}",
@@ -433,6 +455,65 @@ impl Ledger {
     /// Write `locked_candidates.json` for `ids` (every unread candidate when
     /// empty), then record its hash in the ledger. Returns the hash.
     pub fn seal(&self, out: &std::path::Path, ids: &[String]) -> Result<String, String> {
+        self.refuse_if_final()?;
+        let hash = self.write_sealed(out, ids)?;
+        self.append(&format!("\"event\":\"seal\",\"sealed_sha256\":\"{}\",\"test_read\":false", hash))?;
+        Ok(hash)
+    }
+
+    /// Final seal: as [`Ledger::seal`], and the ledger takes no new candidate or
+    /// seal afterwards. The locked test is read at most `max_reads` times.
+    pub fn seal_final(
+        &self,
+        out: &std::path::Path,
+        ids: &[String],
+        max_reads: u64,
+        report_candidates: bool,
+    ) -> Result<String, String> {
+        if max_reads == 0 {
+            return Err("--max-reads must be at least 1".to_string());
+        }
+        self.verify_chain()?;
+        self.refuse_if_final()?;
+        let events = self.events()?;
+        if events.iter().any(|e| matches!(e, Event::Seal { .. })) {
+            return Err("the ledger already has a seal; a final seal needs a ledger with none".to_string());
+        }
+        if events.iter().any(|e| matches!(e, Event::TestRead { .. } | Event::BaselineRead { .. })) {
+            return Err("the ledger already has a locked read; a final seal needs a ledger with none".to_string());
+        }
+        let hash = self.write_sealed(out, ids)?;
+        self.append(&format!(
+            "\"event\":\"seal\",\"sealed_sha256\":\"{}\",\"final\":true,\"max_reads\":{},\
+             \"report_candidates\":{},\"test_read\":false",
+            hash, max_reads, report_candidates
+        ))?;
+        Ok(hash)
+    }
+
+    /// The final seal of the ledger: its sealed-list hash and terms.
+    pub fn final_seal(&self) -> Result<Option<(String, FinalSeal)>, String> {
+        Ok(self.events()?.into_iter().find_map(|e| match e {
+            Event::Seal { sealed_sha256, final_seal: Some(f) } => Some((sealed_sha256, f)),
+            _ => None,
+        }))
+    }
+
+    pub fn is_final(&self) -> Result<bool, String> {
+        Ok(self.final_seal()?.is_some())
+    }
+
+    pub fn refuse_if_final(&self) -> Result<(), String> {
+        match self.final_seal()? {
+            Some((hash, _)) => Err(format!(
+                "the ledger is final (sealed {}); development runs need a new protocol, not this ledger",
+                hash
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn write_sealed(&self, out: &std::path::Path, ids: &[String]) -> Result<String, String> {
         let unread = self.unread_candidates()?;
         let chosen: Vec<&Candidate> = if ids.is_empty() {
             unread.iter().collect()
@@ -476,9 +557,7 @@ impl Ledger {
             items.join(",")
         );
         std::fs::write(out, &text).map_err(|e| format!("{}: {}", out.display(), e))?;
-        let hash = sha256_hex(text.as_bytes());
-        self.append(&format!("\"event\":\"seal\",\"sealed_sha256\":\"{}\",\"test_read\":false", hash))?;
-        Ok(hash)
+        Ok(sha256_hex(text.as_bytes()))
     }
 
     /// Check that `id` is in a sealed list that the ledger recorded, and that the
@@ -496,7 +575,7 @@ impl Ledger {
         let events = self.events()?;
         let sealed_ok = events
             .iter()
-            .any(|e| matches!(e, Event::Seal { sealed_sha256 } if *sealed_sha256 == hash));
+            .any(|e| matches!(e, Event::Seal { sealed_sha256, .. } if *sealed_sha256 == hash));
         if !sealed_ok {
             return Err(format!(
                 "{} (sha256 {}) was not sealed in the ledger before this read",
@@ -546,6 +625,15 @@ impl Ledger {
                 id
             ));
         }
+        if let Some((_, f)) = self.final_seal()? {
+            let done = self.read_count()?;
+            if done >= f.max_reads {
+                return Err(format!(
+                    "the final seal allows {} locked read(s); {} done; the locked test is read once",
+                    f.max_reads, done
+                ));
+            }
+        }
         Ok(candidate)
     }
 
@@ -576,7 +664,7 @@ impl Ledger {
         let events = self.events()?;
         if !events
             .iter()
-            .any(|e| matches!(e, Event::Seal { sealed_sha256 } if *sealed_sha256 == hash))
+            .any(|e| matches!(e, Event::Seal { sealed_sha256, .. } if *sealed_sha256 == hash))
         {
             return Err(format!(
                 "{} (sha256 {}) was not sealed in the ledger before this read",
@@ -679,12 +767,25 @@ fn protocol_usage() -> &'static str {
   seal --ledger FILE --out locked_candidates.json [--id HEX ...]
       Write the sealed list (every unread candidate by default), then record its
       SHA-256 in the ledger. Prints the hash. Do this before any locked read.
+  seal --final [--max-reads N] [--report-candidates] --ledger FILE --out FILE [--id HEX ...]
+      Final seal for the single locked read. The ledger takes no new candidate
+      and no new seal afterwards, allows at most N (default 1) locked reads and
+      one baseline read, and a read of a multi-candidate procedure reports the
+      validation-selected candidate only (--report-candidates keeps the full
+      report and records the choice). Needs a ledger with no seal and no read.
+      The first locked read writes <data>.locked_reads.jsonl beside the store;
+      a read through any other ledger is refused.
   selectors --windows FILE --label LABEL --time-col COL [--scheme S]
       Print `--train-select` and `--test-select` for one window. The purge is in
       the train range (train_end = test_start - purge), in time and for every
       symbol; `--gap` does not apply to explicit selectors.
-  verify --ledger FILE
-      Check the ledger hash chain and print the line and read counts.
+  verify --ledger FILE [--data PATH] [--sealed FILE] [--expect-reads N]
+      Check the ledger hash chain and print the line and read counts. --data
+      also checks the read marker beside the store against the ledger.
+      --expect-reads N (needs --data) exits 1 unless the ledger has N locked
+      reads, exactly one seal line that is final, and a consistent marker;
+      with --sealed it also checks that the file is the final seal's list and
+      that every read id is in it.
   candidates --ledger FILE
       List the candidates without a locked read.
 "
@@ -708,6 +809,12 @@ pub fn run(args: &[String]) -> ! {
     let mut scheme: Option<String> = None;
     let mut label: Option<String> = None;
     let mut time_col: Option<String> = None;
+    let mut final_seal = false;
+    let mut report_candidates = false;
+    let mut max_reads: Option<u64> = None;
+    let mut expect_reads: Option<u64> = None;
+    let mut data: Option<String> = None;
+    let mut sealed: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         let value = |i: usize| -> String {
@@ -752,6 +859,34 @@ pub fn run(args: &[String]) -> ! {
                 time_col = Some(value(i));
                 i += 1;
             }
+            "--final" => final_seal = true,
+            "--report-candidates" => report_candidates = true,
+            "--max-reads" => {
+                max_reads = Some(
+                    value(i)
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|v| *v >= 1)
+                        .unwrap_or_else(|| fail("--max-reads needs an integer of at least 1".to_string(), 2)),
+                );
+                i += 1;
+            }
+            "--expect-reads" => {
+                expect_reads = Some(
+                    value(i)
+                        .parse::<u64>()
+                        .unwrap_or_else(|_| fail("--expect-reads needs a non-negative integer".to_string(), 2)),
+                );
+                i += 1;
+            }
+            "--data" => {
+                data = Some(value(i));
+                i += 1;
+            }
+            "--sealed" => {
+                sealed = Some(value(i));
+                i += 1;
+            }
             other => fail(format!("unknown protocol option '{}'\n\n{}", other, protocol_usage()), 2),
         }
         i += 1;
@@ -768,7 +903,15 @@ pub fn run(args: &[String]) -> ! {
         "seal" => {
             let l = need_ledger();
             let path = out.unwrap_or_else(|| fail("seal needs --out".to_string(), 2));
-            match l.seal(std::path::Path::new(&path), &ids) {
+            if !final_seal && (max_reads.is_some() || report_candidates) {
+                fail("--max-reads and --report-candidates need --final".to_string(), 2);
+            }
+            let sealed_result = if final_seal {
+                l.seal_final(std::path::Path::new(&path), &ids, max_reads.unwrap_or(1), report_candidates)
+            } else {
+                l.seal(std::path::Path::new(&path), &ids)
+            };
+            match sealed_result {
                 Ok(h) => println!("sealed_sha256 {}", h),
                 Err(e) => fail(e, 1),
             }
@@ -778,6 +921,20 @@ pub fn run(args: &[String]) -> ! {
             match (l.verify_chain(), l.read_count()) {
                 (Ok(n), Ok(r)) => println!("ledger ok: {} line(s), {} locked read(s)", n, r),
                 (Err(e), _) | (_, Err(e)) => fail(e, 1),
+            }
+            if expect_reads.is_some() && data.is_none() {
+                fail("--expect-reads needs --data, the store the marker lives with".to_string(), 2);
+            }
+            match (&data, expect_reads) {
+                (Some(d), Some(n)) => match l.verify_expected(n, d, sealed.as_deref().map(std::path::Path::new)) {
+                    Ok(lines) => lines.iter().for_each(|s| println!("{}", s)),
+                    Err(e) => fail(e, 1),
+                },
+                (Some(d), None) => match l.verify_read_marker(d) {
+                    Ok(s) => println!("{}", s),
+                    Err(e) => fail(e, 1),
+                },
+                _ => {}
             }
         }
         "selectors" => {
@@ -818,4 +975,209 @@ pub fn selector_exprs(row: &WindowRow, time_col: &str) -> (String, String) {
         format!("{} >= {} and {} < {}", time_col, w.train_start, time_col, w.train_end),
         format!("{} >= {} and {} < {}", time_col, w.test_start, time_col, w.test_end),
     )
+}
+
+/// One line of `<data>.locked_reads.jsonl`, the read marker kept with the store.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkerLine {
+    pub ledger: String,
+    pub ledger_head: String,
+    pub event: String,
+    pub report_sha256: String,
+}
+
+pub fn marker_path(data_path: &str) -> String {
+    format!("{}.locked_reads.jsonl", data_path)
+}
+
+fn marker_lines(data_path: &str) -> Result<Vec<MarkerLine>, String> {
+    let path = marker_path(data_path);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {}", path, e)),
+    };
+    let mut out = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let get = |k: &str| field_str(line, k).unwrap_or_default();
+        let m = MarkerLine {
+            ledger: get("ledger"),
+            ledger_head: get("ledger_head"),
+            event: get("event"),
+            report_sha256: get("report_sha256"),
+        };
+        if !matches!(m.event.as_str(), "test_read" | "baseline_read") || m.ledger.is_empty() {
+            return Err(format!("{}: malformed read marker line", path));
+        }
+        out.push(m);
+    }
+    Ok(out)
+}
+
+impl Ledger {
+    /// Hash of the last line, or 64 zeros for an empty ledger.
+    pub fn head(&self) -> Result<String, String> {
+        Ok(self.lines()?.last().map_or("0".repeat(64), |l| sha256_hex(l.as_bytes())))
+    }
+
+    fn absolute_path(&self) -> Result<String, String> {
+        let p = if self.path.exists() {
+            std::fs::canonicalize(&self.path)
+        } else {
+            std::path::absolute(&self.path)
+        };
+        p.map(|p| p.display().to_string())
+            .map_err(|e| format!("{}: {}", self.path.display(), e))
+    }
+
+    fn chain_heads(&self) -> Result<Vec<String>, String> {
+        let mut out = vec!["0".repeat(64)];
+        out.extend(self.lines()?.iter().map(|l| sha256_hex(l.as_bytes())));
+        Ok(out)
+    }
+
+    /// Refuse a locked read of the store at `data_path` through a ledger that is
+    /// not the one that made the first read: the marker names that ledger and a
+    /// head of its chain.
+    pub fn check_read_marker(&self, data_path: &str) -> Result<(), String> {
+        let lines = marker_lines(data_path)?;
+        let Some(first) = lines.first() else {
+            return Ok(());
+        };
+        let here = self.absolute_path()?;
+        if lines.iter().any(|m| m.ledger != first.ledger) {
+            return Err(format!("{}: the read marker names more than one ledger", marker_path(data_path)));
+        }
+        if first.ledger != here {
+            return Err(format!("{} was already read through ledger {}", data_path, first.ledger));
+        }
+        let heads = self.chain_heads()?;
+        if !heads.contains(&first.ledger_head) {
+            return Err(format!(
+                "{} was already read through ledger {}, and this ledger's chain does not contain the head {} of that read",
+                data_path, first.ledger, first.ledger_head
+            ));
+        }
+        Ok(())
+    }
+
+    /// Append the marker line of a locked read, before the ledger records it.
+    /// `ledger_head` is the ledger head the read extends. A retry after a crash
+    /// between marker and ledger finds the same head and writes nothing.
+    pub fn write_read_marker(&self, data_path: &str, event: &str, report_sha256: &str) -> Result<(), String> {
+        self.check_read_marker(data_path)?;
+        let head = self.head()?;
+        let lines = marker_lines(data_path)?;
+        if lines.last().map_or(false, |m| m.ledger_head == head && m.event == event) {
+            return Ok(());
+        }
+        let path = marker_path(data_path);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("{}: {}", path, e))?;
+        writeln!(
+            f,
+            "{{\"ledger\":{},\"ledger_head\":\"{}\",\"event\":\"{}\",\"report_sha256\":\"{}\"}}",
+            esc(&self.absolute_path()?),
+            head,
+            event,
+            report_sha256
+        )
+        .map_err(|e| format!("{}: {}", path, e))
+    }
+
+    /// Compare the marker with the ledger's reads. Returns one status line.
+    pub fn verify_read_marker(&self, data_path: &str) -> Result<String, String> {
+        self.check_read_marker(data_path)?;
+        let marker = marker_lines(data_path)?;
+        let mut want: Vec<(String, String)> = Vec::new();
+        for e in self.events()? {
+            match e {
+                Event::TestRead { report_sha256, .. } => want.push(("test_read".to_string(), report_sha256)),
+                Event::BaselineRead { report_sha256, .. } => want.push(("baseline_read".to_string(), report_sha256)),
+                _ => {}
+            }
+        }
+        let have: Vec<(String, String)> = marker.iter().map(|m| (m.event.clone(), m.report_sha256.clone())).collect();
+        for w in &want {
+            if !have.contains(w) {
+                return Err(format!(
+                    "the ledger records a {} (report {}) without a line in {}",
+                    w.0,
+                    w.1,
+                    marker_path(data_path)
+                ));
+            }
+        }
+        for h in &have {
+            if !want.contains(h) {
+                return Err(format!(
+                    "{} has a {} (report {}) that the ledger does not record",
+                    marker_path(data_path),
+                    h.0,
+                    h.1
+                ));
+            }
+        }
+        Ok(format!("marker {}: {} read line(s), consistent with the ledger", marker_path(data_path), marker.len()))
+    }
+}
+
+fn sealed_ids(text: &str) -> Vec<String> {
+    text.split("{\"id\":\"")
+        .skip(1)
+        .filter_map(|chunk| field_str(&format!("{{\"id\":\"{}", chunk), "id"))
+        .collect()
+}
+
+impl Ledger {
+    /// Gate for the single locked read: `expect` reads, one seal line that is
+    /// final, a marker that matches the ledger and, with `sealed`, a read id
+    /// set inside the final sealed list. Returns the status lines.
+    pub fn verify_expected(
+        &self,
+        expect: u64,
+        data_path: &str,
+        sealed: Option<&std::path::Path>,
+    ) -> Result<Vec<String>, String> {
+        self.verify_chain()?;
+        let mut out = Vec::new();
+        let events = self.events()?;
+        let reads = self.read_count()?;
+        if reads != expect {
+            return Err(format!("expected {} locked read(s), the ledger has {}", expect, reads));
+        }
+        let seals: Vec<&Event> = events.iter().filter(|e| matches!(e, Event::Seal { .. })).collect();
+        let Some((final_hash, terms)) = self.final_seal()? else {
+            return Err("the ledger has no final seal".to_string());
+        };
+        if seals.len() != 1 {
+            return Err(format!("expected exactly one seal line, the ledger has {}", seals.len()));
+        }
+        if reads > terms.max_reads {
+            return Err(format!("the ledger has {} locked read(s), the final seal allows {}", reads, terms.max_reads));
+        }
+        out.push(format!("final seal {} (max_reads {})", final_hash, terms.max_reads));
+        out.push(self.verify_read_marker(data_path)?);
+        if let Some(path) = sealed {
+            let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+            if sha256_hex(&bytes) != final_hash {
+                return Err(format!("{} is not the final sealed list", path.display()));
+            }
+            let ids = sealed_ids(&String::from_utf8_lossy(&bytes));
+            for e in &events {
+                if let Event::TestRead { id, .. } = e {
+                    if !ids.contains(id) {
+                        return Err(format!("read candidate {} is not in the final sealed list", id));
+                    }
+                }
+            }
+            out.push("every read candidate is in the final sealed list".to_string());
+        } else {
+            out.push("sealed list: not checked (pass --sealed)".to_string());
+        }
+        Ok(out)
+    }
 }
