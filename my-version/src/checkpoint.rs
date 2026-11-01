@@ -1329,6 +1329,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "fit_strategy",  // #116: missing means `exact`
         "fit_admission", // #223: missing means `screened`
         "fit_polish",    // #496: missing means `f64`
+        "fitness",       // #480: missing means `metric`
         "fit_rows",      // #116: missing means 0 (off)
         "fit_fallback_max", // #255: missing means the default bound
         "qd_bins",       // #120
@@ -1609,6 +1610,14 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             .parse::<usize>()
             .map_err(|_| format!("bad config value for 'fit_fallback_max': '{}'", raw))?,
     };
+    // #480: absent means the metric fitness.
+    let fitness = match fields.get("fitness").map(|s| s.as_str()) {
+        None | Some("metric") => crate::search::Fitness::Metric,
+        Some(raw) => match raw.strip_prefix("long_pnl:").and_then(|h| u64::from_str_radix(h, 16).ok()) {
+            Some(hash) => crate::search::Fitness::SavedLongPnl(hash),
+            None => return Err(format!("config 'fitness' must be metric or long_pnl:<hash>, got '{}'", raw)),
+        },
+    };
     // #122: absent means auto, matching checkpoints written before the flat
     // postfix engine existed.
     let variation = match fields.get("variation").map(|s| s.as_str()) {
@@ -1625,6 +1634,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         max_complexity: num_usize("max_complexity")?,
         complexity_model: model,
         metric,
+        fitness, // #480
         seed: num_u32("seed")?,
         ops,
         migration_interval: num_usize("migration_interval")?,
@@ -1712,6 +1722,9 @@ fn write_config(cfg: &Config, out: &mut String) {
     }
     if cfg.fit_polish != crate::fit::FitPolish::F64 {
         writeln!(out, "config fit_polish {}", cfg.fit_polish.name()).unwrap();
+    }
+    if !cfg.fitness.is_metric() {
+        writeln!(out, "config fitness {}", cfg.fitness.key()).unwrap(); // #480
     }
     writeln!(out, "config fit_rows {}", cfg.fit_rows).unwrap(); // #116
     writeln!(out, "config fit_fallback_max {}", cfg.fit_fallback_max).unwrap(); // #255

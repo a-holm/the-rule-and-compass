@@ -354,7 +354,7 @@ fn objective_csv(dir: &std::path::Path) -> String {
 fn write_target_spec(dir: &std::path::Path) -> String {
     let text = "{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{\"column\":\"y\",\"name\":\"raw_target\",\
 \"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"r\",\"return_units\":\"log\",\
-\"horizon_seconds\":3600,\"entry_offset_seconds\":900,\"delay_seconds\":0,\
+\"horizon_seconds\":900,\"entry_offset_seconds\":0,\"delay_seconds\":0,\
 \"entry_price\":\"next open\",\"exit_price\":\"close\",\"offset\":0.0,\
 \"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"log_return\",\
 \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}]}";
@@ -407,7 +407,7 @@ fn a_real_run_is_scored_on_the_folds_without_the_test_block_in_selection() {
             iso(0),
             iso(280),
             iso(200),
-            iso(290),
+            iso(300),
             iso(400)
         ),
     )
@@ -430,7 +430,7 @@ fn a_real_run_is_scored_on_the_folds_without_the_test_block_in_selection() {
     assert_eq!(r.thresholds, vec![0.6, 0.7, 0.8]);
     assert_eq!(r.net_by_fold_threshold.len(), 1);
     assert_eq!(r.net_by_fold_threshold[0].len(), 3);
-    assert_eq!(r.net_period.len(), 110);
+    assert_eq!(r.net_period.len(), 100);
     assert!(r.return_mse.is_finite());
     assert!((r.net_by_fold_threshold[0][1] - r.net_period.iter().sum::<f64>()).abs() < 1e-12, "headline threshold is the series");
     assert!(r.net_period.iter().sum::<f64>() > 0.0, "the long book wins on a signal-driven return");
@@ -755,7 +755,7 @@ fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
             iso(0),
             iso(280),
             iso(200),
-            iso(290),
+            iso(300),
             iso(400)
         ),
     )

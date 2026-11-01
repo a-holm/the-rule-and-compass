@@ -139,7 +139,7 @@ In-sample guard: `run.json` records `split.train_time` and `split.validation_tim
 error: window 'w1' tests rows the run trained or selected on (test_start 150 < last seen 179 + purge 5)
 ```
 
-`--allow-in-sample-windows` downgrades the refusal: the window is scored and its JSON carries `"in_sample":true`. Use it for diagnostics only.
+`--allow-in-sample-windows` downgrades the refusal: the window is scored and its JSON carries `"in_sample":true`. Use it for diagnostics only. `rcsr ladder --sr-run` and `rcsr ablation score` apply the same rule (`RunFile::in_sample`) to their folds: they exit 3 naming the in-sample fold, and `--allow-in-sample` labels it `oof:false` and leaves it out of every pooled statistic.
 
 The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA-256 of the file) and `candidate_labels`. `--select-band` and `--batch-pnl` work unchanged on the front's candidates.
 
@@ -408,6 +408,8 @@ net_t   = gross_t - cost_t                (the last row of a group also pays c_s
 A `.rcsb` store read with `--vars` and `--time` is projected to the columns the run names. With a trading objective the projection also keeps the target spec's `return_column` and the `--funding` column. A run without `--objective` keeps its projected column list. A `return_column` that is not in the store is an input error (exit 3) that names the target spec.
 
 Finalist selection with `--objective` scores every Pareto member this way on the validation slice only. The winner has the lowest objective value (`-net P&L`, `-Sharpe` or `-log growth`; ties keep the archive order, so the smaller expression wins). Candidates below `--min-trades` or with a non-finite value are unusable. The test block is scored once, for the winner.
+
+With `--fitness pnl` the search ranks every candidate by the regret `(B - net) / B` of this same book on the training rows, `B` being the hindsight DP bound (`trading_gpu::dp_bound`) at the same cost. `trading::FitnessBook` prices the plain threshold rule only (no `tau`, no band, `--min-holding 1`, `--max-position 1`): `net` is the excess net over cash, `sum p_i * (r_i - funding_i - cash) - c_side * (flips + exits)`, which equals `PathStats::net_pnl - cash * rows`. See section 3.5 of [`docs/optimisation.md`](optimisation.md).
 
 ## One book from search to evaluation (#487)
 
