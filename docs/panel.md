@@ -378,7 +378,7 @@ The protocol locked test (`protocol/windows.csv`, row `locked`) is declared with
 rcsr panel build --data base.rcsb --membership m.csv --out panel.rcsb --locked-test 2025-07-01,2026-07-01
 ```
 
-The build writes `"locked_test": {"start", "end", "start_date", "end_date", "source"}` to `panel.rcsb.manifest.json` and `panel.rcsb.schema.json`. `rcsr panel schema` keeps it, `rcsr panel append` copies it from the target panel, `rcsr enrich` copies it from `--data` (or takes `--locked-test`) into `<out>.enrich.json`, and `rcsr ablation prepare` writes `<csv>.lockbox.json`. A CSV can carry the same object in a `<csv>.lockbox.json` sidecar. `--allow-lockbox` does not open it: it keeps its 2026H2 meaning.
+The build writes `"locked_test": {"start", "end", "start_date", "end_date", "source"}` to `panel.rcsb.manifest.json` and `panel.rcsb.schema.json`. `rcsr panel schema` keeps it, `rcsr panel append` copies it from the target panel, `rcsr panel rank` takes it from the input panel (or the protocol default for an undeclared one), `rcsr enrich` copies it from `--data` (or takes `--locked-test`) into `<out>.enrich.json`, and `rcsr ablation prepare` writes `<csv>.lockbox.json`. A CSV can carry the same object in a `<csv>.lockbox.json` sidecar. `--allow-lockbox` does not open it: it keeps its 2026H2 meaning.
 
 One resolver (`rcsr::lockbox::resolve`) picks the range for search, `walkforward`, `ladder`, `ablation prepare` and `score`, `enrich` and `audit`:
 
