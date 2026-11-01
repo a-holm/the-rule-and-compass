@@ -439,7 +439,7 @@ fn one_range_without_purge_is_unchanged() {
     assert_eq!(sha, PINNED_ONE_RANGE_SHA256);
 }
 
-const PINNED_ONE_RANGE_SHA256: &str = "pending";
+const PINNED_ONE_RANGE_SHA256: &str = "bcd7b921418ae0fe5339195fa4b3aa4c158cf3c808547a9b7c17336cca96a023";
 
 fn prepare_cli(dir: &std::path::Path, data: &str, out: &str, extra: &[&str]) -> std::process::Output {
     let def = dir.join("def.json");
