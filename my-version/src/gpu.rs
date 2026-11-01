@@ -1493,6 +1493,11 @@ pub struct GpuEvaluator {
     /// #293: the host copy of the feature columns a tiled context streams
     /// from. The device context holds a pointer into it.
     host_cols: Option<Vec<f32>>,
+    /// #265: bytes of the f64 fit twin (columns, target and weights) resident
+    /// on the device, or `0` before [`Self::set_fit_data`].
+    fit_twin_bytes: u64,
+    /// #265: rows of that twin.
+    fit_twin_rows: u64,
 }
 
 impl GpuEvaluator {
@@ -1534,6 +1539,8 @@ impl GpuEvaluator {
                 loss: crate::fit::DeviceLoss::Squared,
                 target_classes: None,
                 host_cols: None,
+                fit_twin_bytes: 0,
+                fit_twin_rows: 0,
             })
         }
     }
@@ -1582,6 +1589,8 @@ impl GpuEvaluator {
             loss: crate::fit::DeviceLoss::Squared,
             target_classes: None,
             host_cols: Some(cols),
+            fit_twin_bytes: 0,
+            fit_twin_rows: 0,
         })
     }
 
@@ -1620,6 +1629,12 @@ impl GpuEvaluator {
     pub fn set_fit_data(&mut self, cols: &[f64], y: &[f64], w: &[f64]) -> bool {
         let wp = if w.is_empty() { std::ptr::null() } else { w.as_ptr() };
         let ok = unsafe { rc_set_fit_data(self.ctx, cols.as_ptr(), y.as_ptr(), wp) == 0 };
+        if ok {
+            let rows = y.len() as u64;
+            let cells = cols.len() as u64 + rows;
+            self.fit_twin_rows = rows;
+            self.fit_twin_bytes = (cells + w.len() as u64) * 8;
+        }
         if ok && y.len() as u64 == self.n_rows {
             // #288: cache the binary class sizes from the same exact `f64`
             // target the rank stage caches `B` from, so a native AUC uses one
@@ -1630,6 +1645,16 @@ impl GpuEvaluator {
             self.target_classes = None;
         }
         ok
+    }
+
+    /// Rows of the resident scoring dataset.
+    pub fn rows(&self) -> usize {
+        self.n_rows as usize
+    }
+
+    /// #265: rows and bytes of the f64 fit twin uploaded by [`Self::set_fit_data`].
+    pub fn fit_twin(&self) -> (u64, u64) {
+        (self.fit_twin_rows, self.fit_twin_bytes)
     }
 
     /// #288: the target class sizes a native AUC would use, or `None` when the
@@ -5328,6 +5353,49 @@ mod fit_tests {
             tree = node(Op::Add, vec![t, tree]);
         }
         tree
+    }
+
+    /// A fit subsample lives in its own context beside the full-row scorer: the
+    /// f64 twin holds only the subsample rows and the fit equals the CPU fit on
+    /// those rows.
+    #[test]
+    fn a_subsample_context_fits_its_own_rows_beside_the_full_row_scorer() {
+        let (p, n, step) = (3usize, 800usize, 4usize);
+        let (x, y, cols, y32, _target, start) = linear_fixture(p, n);
+        let Some(scorer) = GpuEvaluator::new(&cols, n, p, &y32) else {
+            eprintln!("skipping GPU test: no usable CUDA device");
+            return;
+        };
+        let rows: Vec<usize> = (0..n).step_by(step).collect();
+        let m = rows.len();
+        let sx: Vec<Vec<f64>> = rows.iter().map(|&r| x[r].clone()).collect();
+        let sy: Vec<f64> = rows.iter().map(|&r| y[r]).collect();
+        let mut sub32 = vec![0.0f32; m * p];
+        let mut cols64 = vec![0.0f64; m * p];
+        for (i, row) in sx.iter().enumerate() {
+            for k in 0..p {
+                sub32[k * m + i] = row[k] as f32;
+                cols64[k * m + i] = row[k];
+            }
+        }
+        let sy32: Vec<f32> = sy.iter().map(|&v| v as f32).collect();
+        let mut fit = GpuEvaluator::new(&sub32, m, p, &sy32).expect("fit context");
+        assert!(fit.set_fit_data(&cols64, &sy, &[]));
+        assert_eq!(fit.fit_twin(), (m as u64, ((m * p + m) * 8) as u64));
+        assert_eq!(scorer.rows(), n);
+        assert_eq!(scorer.fit_twin(), (0, 0));
+
+        let mut cpu_tree = linear_model(&start);
+        crate::fit::fit_weighted(&mut cpu_tree, &sx, &sy, &[], 8);
+        let cpu_c = constants(&cpu_tree);
+        let mut gpu_tree = linear_model(&start);
+        let plan = crate::fit::gpu_fit_plan(&gpu_tree).expect("plan");
+        let (out, ms) = fit.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Squared);
+        assert!(ms >= 0.0 && out.len() == 1 && out[0].status == 0);
+        plan.apply(&mut gpu_tree, &out[0].c);
+        for (g, c) in constants(&gpu_tree).iter().zip(&cpu_c) {
+            assert!((g - c).abs() <= 1e-5 * (1.0 + c.abs()), "{g} vs {c}");
+        }
     }
 
     #[test]
