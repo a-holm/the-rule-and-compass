@@ -3045,7 +3045,7 @@ fn fit_lm_loop(tree: &mut Node, f: &Flat, iters: usize, pass: &mut impl LmPass) 
     let mut normal: Option<NormalEquations> = None;
     // #569: consecutive tiny steps; `stop` is `None` outside the search's
     // candidate fit.
-    let stop: Option<LmStop> = None;
+    let stop = LM_STOP.with(|s| s.get());
     let trials = iters.max(1);
     let mut small = 0usize;
     LM_FITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
