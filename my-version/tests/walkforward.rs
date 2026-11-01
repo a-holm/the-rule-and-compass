@@ -647,6 +647,18 @@ fn overlapping_test_rows_are_refused_and_the_spacing_is_reported() {
 }
 
 #[test]
+fn rows_without_a_return_do_not_count_toward_the_spacing() {
+    let rows: Vec<(f64, f64, f64)> = (0..8)
+        .map(|i| (3600.0 * i as f64, i as f64, if i % 2 == 0 { 0.001 } else { f64::NAN }))
+        .collect();
+    let t = single(&rows);
+    let mut s = spec("x", vec![window("w", 0.0, 2.0 * 3600.0, 4.0 * 3600.0, 8.0 * 3600.0)]);
+    s.horizon = 7200.0;
+    let r = walkforward::run_table(&t, &s, "t").unwrap();
+    assert_eq!(r.min_group_step, Some(7200.0));
+}
+
+#[test]
 fn the_cli_exits_2_on_overlapping_returns() {
     let dir = std::env::temp_dir().join(format!("rcsr-wf-overlap-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
