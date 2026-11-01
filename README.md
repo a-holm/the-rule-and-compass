@@ -541,7 +541,9 @@ atomically instead of streaming it. See
   builds `panel_hourly_default.rcsb` in staged, cacheable steps. `snapshot` hashes
   every archive and lists the duplicate and invalid-OHLC bars. `base` keeps only
   full four-bar hours (`cov15m`), collapses identical duplicate instants, flags
-  differing ones and stores the unit of each source. `build` keeps point-in-time
+  differing ones and stores the unit of each source. `--symbols <file>` on
+  `snapshot` and `base` keeps only a pinned symbol universe (for example the
+  output of `rcsr-acquire universe`). `build` keeps point-in-time
   members, numbers listings, fails on an undeclared level jump and refuses the
   lockbox. `validate` runs V1-V12 and exits 3 on a failure. See
   [`docs/panel.md`](docs/panel.md#default-hourly-panel-v2-259).

@@ -312,6 +312,7 @@ pub fn json() -> String {
 {{\"name\":\"--input\",\"type\":\"path\",\"default\":\"none\",\"description\":\"CSV/TSV/ZIP file or a directory searched recursively\"}},\
 {{\"name\":\"--format\",\"type\":\"enum\",\"default\":\"auto\",\"description\":\"auto | binance | bitstamp | ohlcv (aliased header)\"}},\
 {{\"name\":\"--symbol\",\"type\":\"string\",\"default\":\"derived\",\"description\":\"symbol override for a single-file input\"}},\
+{{\"name\":\"--symbols\",\"type\":\"path\",\"default\":\"none\",\"description\":\"keep only the symbols listed in the file (one per line, # comments); the manifest universe block records the file SHA-256 and the kept, dropped, missing and empty symbols\"}},\
 {{\"name\":\"--tz\",\"type\":\"string\",\"default\":\"UTC\",\"description\":\"UTC, +HH:MM, America/New_York or Europe/London\"}},\
 {{\"name\":\"--calendar\",\"type\":\"enum\",\"default\":\"24x7\",\"description\":\"24x7 | nyse | lse\"}},\
 {{\"name\":\"--resample\",\"type\":\"enum\",\"default\":\"none\",\"description\":\"1m..1w, calendar-aware; OHLC exact, flows summed\"}},\
@@ -382,6 +383,7 @@ pub fn json() -> String {
 {{\"name\":\"--outage-share\",\"type\":\"float\",\"default\":\"0.5\",\"description\":\"build: share of the cross-section missing for a venue outage\"}},\
 {{\"name\":\"--replay\",\"type\":\"int\",\"default\":\"3\",\"description\":\"validate: prefix-causality cuts\"}},\
 {{\"name\":\"--snapshot\",\"type\":\"path\",\"default\":\"none\",\"description\":\"verified archive-snapshot JSON embedded in the panel manifest\"}},\
+{{\"name\":\"--symbols\",\"type\":\"path\",\"default\":\"none\",\"description\":\"snapshot, base: keep only the symbols listed in the file (one per line, # comments); snapshot.json and the base manifest carry a universe block with the file SHA-256, listed, kept, dropped, missing and empty; base --resume rebuilds when the list changes\"}},\
 {{\"name\":\"--family\",\"type\":\"path\",\"default\":\"none\",\"description\":\"append: symbol-major store that carries the family columns (computed by rcsr enrich)\"}},\
 {{\"name\":\"--columns\",\"type\":\"csv\",\"default\":\"none\",\"description\":\"append: registered columns to carry into the time-major panel by (symbol, ts) key; schema and append write <panel>.schema.json\"}},\
 {{\"name\":\"--verify\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"schema: re-hash the store and exit 3 when a column hash differs from <panel>.schema.json\"}},\

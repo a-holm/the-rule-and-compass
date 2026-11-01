@@ -814,6 +814,144 @@ fn a_cpu_pit_join_under_auto_is_labelled_in_the_panel_manifest() {
     );
 }
 
+// #485: pinned symbol universe.
+
+fn universe_raw(dir: &Path) -> PathBuf {
+    let raw = dir.join("raw");
+    for (s, b) in [("AAAUSDT", 10.0), ("BBBUSDT", 20.0), ("CCCUSDT", 30.0)] {
+        put_zip(&raw, s, "2021-01", &hours(b, 0, 48, &[], Unit::Ms));
+    }
+    std::fs::create_dir_all(raw.join("EMPTYUSDT")).unwrap();
+    raw
+}
+
+fn write_list(path: &Path, text: &str) -> rcsr::prep::SymbolList {
+    std::fs::write(path, text).unwrap();
+    rcsr::prep::read_symbol_list(path.to_str().unwrap()).unwrap()
+}
+
+fn universe_line(path: &str) -> String {
+    let text = std::fs::read_to_string(path).unwrap();
+    let lines: Vec<&str> = text.lines().filter(|l| l.trim_start().starts_with("\"universe\":")).collect();
+    assert_eq!(lines.len(), 1, "one universe block in {path}");
+    lines[0].trim().to_string()
+}
+
+#[test]
+fn universe_list_parsing_ignores_comments_blanks_and_duplicates_and_refuses_empty() {
+    let dir = scratch("universe-parse");
+    let l = write_list(&dir.join("l.txt"), "# header\n\nAAAUSDT\n  BBBUSDT  \nAAAUSDT\n#CCCUSDT\n币安人生USDT\n");
+    let got: Vec<&str> = l.symbols.iter().map(|s| s.as_str()).collect();
+    assert_eq!(got, vec!["AAAUSDT", "BBBUSDT", "币安人生USDT"]);
+    assert_eq!(l.sha256, manifest::sha256_hex("# header\n\nAAAUSDT\n  BBBUSDT  \nAAAUSDT\n#CCCUSDT\n币安人生USDT\n".as_bytes()));
+    std::fs::write(dir.join("e.txt"), "# only a comment\n\n").unwrap();
+    let err = rcsr::prep::read_symbol_list(dir.join("e.txt").to_str().unwrap()).unwrap_err();
+    assert!(err.contains("empty"), "{err}");
+    assert!(rcsr::prep::read_symbol_list(dir.join("none.txt").to_str().unwrap()).is_err());
+}
+
+#[test]
+fn universe_base_keeps_listed_intersect_archive_and_drops_the_rest_with_zero_rows() {
+    let dir = scratch("universe-base");
+    let raw = universe_raw(&dir);
+    let list = write_list(&dir.join("l.txt"), "AAAUSDT\nCCCUSDT\n");
+    let mut o = base_opts(&raw, &dir.join("b.rcsb"));
+    o.symbols = Some(list);
+    let s = panel_v2::build_base(&o).unwrap();
+    assert_eq!(s.symbols, 2);
+    let b = Cols::open(&dir.join("b.rcsb"));
+    assert!(!b.rows_of("AAAUSDT").is_empty());
+    assert!(!b.rows_of("CCCUSDT").is_empty());
+    assert_eq!(b.rows_of("BBBUSDT").len(), 0, "the dropped symbol has no rows");
+    assert_eq!(b.rows_of("EMPTYUSDT").len(), 0);
+}
+
+#[test]
+fn universe_blocks_in_snapshot_and_base_manifest_carry_all_fields() {
+    let dir = scratch("universe-block");
+    let raw = universe_raw(&dir);
+    let text = "# pinned\nAAAUSDT\nCCCUSDT\nEMPTYUSDT\nGONEUSDT\nAAAUSDT\n";
+    let list = write_list(&dir.join("l.txt"), text);
+    let sha = manifest::sha256_hex(text.as_bytes());
+    let file = dir.join("l.txt").to_str().unwrap().to_string();
+    let want = format!(
+        "\"universe\":{{\"file\":\"{file}\",\"sha256\":\"{sha}\",\"listed\":4,\"kept\":2,\"dropped\":[\"BBBUSDT\"],\"missing\":[\"GONEUSDT\"],\"empty\":[\"EMPTYUSDT\"]}},"
+    );
+    let snap = panel_v2::snapshot_text_with(raw.to_str().unwrap(), 2, Some(&list)).unwrap();
+    assert!(snap.lines().any(|l| l.trim() == want), "snapshot block missing:\n{snap}");
+    assert!(!snap.contains("BBBUSDT-15m"), "no dropped archive is scanned");
+    let mut o = base_opts(&raw, &dir.join("b.rcsb"));
+    o.symbols = Some(list);
+    panel_v2::build_base(&o).unwrap();
+    assert_eq!(universe_line(&format!("{}.manifest.json", dir.join("b.rcsb").display())), want);
+}
+
+#[test]
+fn universe_without_a_listed_archive_symbol_is_an_error_and_without_a_list_nothing_changes() {
+    let dir = scratch("universe-none");
+    let raw = universe_raw(&dir);
+    let list = write_list(&dir.join("l.txt"), "GONEUSDT\nEMPTYUSDT\n");
+    assert!(panel_v2::snapshot_text_with(raw.to_str().unwrap(), 1, Some(&list)).is_err());
+
+    let plain = dir.join("plain.rcsb");
+    panel_v2::build_base(&base_opts(&raw, &plain)).unwrap();
+    assert!(!std::fs::read_to_string(format!("{}.manifest.json", plain.display())).unwrap().contains("\"universe\":"));
+    assert!(!panel_v2::snapshot_text(raw.to_str().unwrap(), 1).unwrap().contains("\"universe\""));
+    let all = write_list(&dir.join("all.txt"), "AAAUSDT\nBBBUSDT\nCCCUSDT\n");
+    let mut o = base_opts(&raw, &dir.join("all.rcsb"));
+    o.symbols = Some(all);
+    panel_v2::build_base(&o).unwrap();
+    assert_eq!(
+        manifest::sha256_file(&plain).unwrap(),
+        manifest::sha256_file(&dir.join("all.rcsb")).unwrap(),
+        "a list that covers every symbol leaves the store bytes unchanged"
+    );
+}
+
+#[test]
+fn universe_resume_rebuilds_on_a_changed_list_and_reuses_on_the_same_list() {
+    let dir = scratch("universe-resume");
+    let raw = universe_raw(&dir);
+    let cache = dir.join("cache").to_str().unwrap().to_string();
+    let l1 = write_list(&dir.join("l1.txt"), "AAAUSDT\nBBBUSDT\n");
+    let l2 = write_list(&dir.join("l2.txt"), "AAAUSDT\nBBBUSDT\nGONEUSDT\n");
+    let run = |name: &str, l: &rcsr::prep::SymbolList| {
+        let mut o = base_opts(&raw, &dir.join(name));
+        o.resume = Some(cache.clone());
+        o.symbols = Some(l.clone());
+        panel_v2::build_base(&o).unwrap()
+    };
+    let cold = run("cold.rcsb", &l1);
+    assert_eq!(cold.reused, 0);
+    let warm = run("warm.rcsb", &l1);
+    assert_eq!(warm.reused, 2, "same list reuses every part");
+    assert_eq!(
+        manifest::sha256_file(&dir.join("cold.rcsb")).unwrap(),
+        manifest::sha256_file(&dir.join("warm.rcsb")).unwrap()
+    );
+    let changed = run("changed.rcsb", &l2);
+    assert_eq!(changed.reused, 0, "a different list rebuilds the parts");
+}
+
+#[test]
+fn universe_filters_the_legacy_prep_path_and_records_the_block() {
+    let dir = scratch("universe-prep");
+    let raw = universe_raw(&dir);
+    let list = write_list(&dir.join("l.txt"), "AAAUSDT\nCCCUSDT\n");
+    let mk = |symbols| rcsr::prep::Options {
+        inputs: vec![raw.to_str().unwrap().to_string()],
+        format: rcsr::prep::Layout::Binance,
+        symbols,
+        ..Default::default()
+    };
+    let all = rcsr::prep::build(&mk(None)).unwrap();
+    let kept = rcsr::prep::build(&mk(Some(list))).unwrap();
+    assert_eq!(kept.table.len() * 3, all.table.len() * 2, "two of three equal symbols");
+    assert!(kept.manifest.contains("\"universe\":{"));
+    assert!(kept.manifest.contains("\"dropped\":[\"BBBUSDT\",\"EMPTYUSDT\"]"), "{}", kept.manifest);
+    assert!(!all.manifest.contains("\"universe\""));
+}
+
 #[test]
 fn locked_test_declaration_travels_with_the_store() {
     use rcsr::lockbox::{self, Lockbox};
