@@ -900,9 +900,10 @@ impl GpuSearch {
         // device never fits a sign the sample does not support.
         // #289: the predicate is the *fit* objective, not the fit-only split:
         // `log_loss` now has a native scorer, but its device fit still needs
-        // both classes to have a finite optimum.
+        // both classes to have a finite optimum. The hinge codes read the same
+        // sign and are declined the same way.
         let single_class = crate::fit::fit_loss(cfg.metric)
-            == Some(crate::fit::DeviceLoss::Logistic)
+            .is_some_and(|loss| loss.needs_label_sign())
             && {
                 let (pos, neg) = crate::fit::class_counts_weighted(&train.y, &train.w);
                 pos == 0 || neg == 0
@@ -3915,6 +3916,8 @@ struct PipelineFit {
 /// already "every pending candidate with constants". That is exactly
 /// [`WIDE_ADMISSION_ROWS`], and only for the LM family (the rank/order/
 /// maximum/logistic arms have their own gated policies and stay synchronous).
+/// The label-sign codes stay synchronous too: the overlap batch has no
+/// single-class decline.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn pipeline_fit_safe(cfg: &Config, train_rows: usize, screened: bool) -> bool {
     !screened
@@ -3922,7 +3925,7 @@ fn pipeline_fit_safe(cfg: &Config, train_rows: usize, screened: bool) -> bool {
         && defers_fit_to_gpu(cfg, true)
         && (train_rows >= WIDE_ADMISSION_ROWS || cfg.fit_admission == crate::fit::FitAdmission::All)
         && cfg.fit_iters > 0
-        && crate::fit::fit_loss(cfg.metric).is_some()
+        && crate::fit::fit_loss(cfg.metric).is_some_and(|loss| !loss.needs_label_sign())
         && !crate::fit::device_fit_is_gated(cfg.metric)
 }
 

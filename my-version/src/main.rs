@@ -480,9 +480,11 @@ SEARCH:
                              metric and both fit strategies). Constants are
                              fitted to the configured --metric: squared/aic/
                              aicc/bic use exact least squares; absolute and
-                             log_squashed use IRLS; auc/log_loss/brier/hinge and
-                             the SVM hinge forms use logistic IRLS (a warm start
-                             judged by the configured metric); signed uses the
+                             log_squashed use IRLS; auc/log_loss/brier/hinge use
+                             logistic IRLS (a warm start judged by the configured
+                             metric); hinge_ordinary adds majorise-minimise
+                             rounds after the logistic rounds and hinge_squared
+                             uses Gauss-Newton on the active set; signed uses the
                              squared fit plus a
                              constrained least-squares projection onto the
                              zero-mean-residual manifold (exact to f64, two
@@ -528,7 +530,13 @@ SEARCH:
                              a softplus trial objective (#234; the device
                              proposes constants and the exact CPU f64 log-loss
                              judges and refits; since #289 the search also
-                             scores log_loss natively on the device), the exact correlation
+                             scores log_loss natively on the device), the three
+                             hinge forms on the same label sign (hinge_squared
+                             by Gauss-Newton on the active set, hinge_ordinary
+                             by logistic then majorise-minimise steps, hinge by
+                             the logistic step; every trial judged on the
+                             configured hinge, finalists refit exactly, a
+                             single-class sample labelled single_class), the exact correlation
                              objective 1-|rho| or 1-rho with a frozen affine
                              gauge (correlation_signed refines both gauge
                              orientations; a tree affine in every constant takes
@@ -559,8 +567,9 @@ SEARCH:
                              The device refuses any other metric instead of
                              substituting an objective: use
                              `--metric squared`, `--metric log_squashed`,
-                             `--metric absolute`, `--metric log_loss`, `--metric
-                             correlation`, `--metric correlation_signed`, a rank
+                             `--metric absolute`, `--metric log_loss`, a hinge
+                             form, `--metric correlation`, `--metric
+                             correlation_signed`, a rank
                              metric, `--metric median`, `--metric
                              interquartile`, `--metric maximum`, or a CPU
                              strategy. `--metric signed` fits on the device as

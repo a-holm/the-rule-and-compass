@@ -176,6 +176,9 @@ fn log_loss_has_a_native_fit_objective_and_a_native_score_objective() {
         fit::DeviceLoss::CorrelationSigned,
         fit::DeviceLoss::Absolute,
         fit::DeviceLoss::Logistic,
+        fit::DeviceLoss::HingeSquared,
+        fit::DeviceLoss::HingeOrdinary,
+        fit::DeviceLoss::HingeSigmoid,
     ]
     .iter()
     .map(|l| l.code())
@@ -184,9 +187,9 @@ fn log_loss_has_a_native_fit_objective_and_a_native_score_objective() {
     codes.sort_unstable();
     codes.dedup();
     assert_eq!(codes.len(), before, "every DeviceLoss needs its own code");
-    // The AUC/hinge neighbours keep the CPU: they have no native fit loss, so
+    // The AUC/Brier neighbours keep the CPU: they have no native fit loss, so
     // an explicit gpu stays a usage error rather than a surrogate fit.
-    for m in [Metric::Auc, Metric::Hinge] {
+    for m in [Metric::Auc, Metric::Brier] {
         assert_eq!(fit::fit_loss(m), None, "{m:?} has no native fit objective");
     }
     // And the usage gate now accepts log_loss.
