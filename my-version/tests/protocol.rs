@@ -30,11 +30,19 @@ fn windows_table_is_the_committed_file_and_obeys_the_protocol() {
         assert!(w.test_end <= LOCKBOX_START as f64, "{} reaches 2026H2", w.label);
         assert!(r.validation_start > w.train_start && r.validation_start < w.train_end);
         if r.scheme != "locked" {
-            assert!(w.test_end <= dev_end, "{} leaves development", w.label);
+            assert!(
+                w.test_end <= dev_end - protocol::DEFAULT_PURGE_SECONDS,
+                "{} has a label that reaches the locked test",
+                w.label
+            );
         } else {
             assert_eq!(w.test_start, dev_end);
             assert_eq!(w.test_end, rcsr::data::parse_time("2026-07-01").unwrap());
         }
+    }
+    for label in ["expanding-2025Q2", "rolling24-2025Q2"] {
+        let w = &rows.iter().find(|r| r.window.label == label).unwrap().window;
+        assert_eq!(protocol::iso(w.test_end), "2025-06-28T11:00:00", "{}", label);
     }
     // consecutive quarters inside each scheme
     for scheme in ["expanding", "rolling"] {
@@ -174,7 +182,7 @@ fn the_cli_runs_the_whole_protocol_and_refuses_a_second_read() {
     // training into the lockbox is refused even with the seal
     let (code, _, err) = base(&["--locked-test", "--sealed", &s, "--window", "locked,0,250,260,300"]);
     assert_eq!(code, 3, "{}", err);
-    assert!(err.contains("trains on the locked test"), "{}", err);
+    assert!(err.contains("trains within the label purge of the locked test"), "{}", err);
     // the locked read
     let (code, out, err) = base(&locked);
     assert_eq!(code, 0, "{}", err);

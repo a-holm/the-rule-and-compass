@@ -1673,6 +1673,11 @@ pub struct SplitReport {
     pub purged_validation_boundary_rows: usize,
     /// `target_spec` when a purge was derived from a spec, else `none`.
     pub purge_source: &'static str,
+    /// #519: seconds before a declared locked test whose rows are refused,
+    /// and where it came from (`target_spec` or `protocol_default`). Empty
+    /// without a declared range.
+    pub boundary_purge_seconds: f64,
+    pub boundary_purge_source: &'static str,
 }
 
 pub struct Prepared {
@@ -2823,6 +2828,12 @@ pub fn lockbox_stamps(t: &Table, spec: &SplitSpec) -> Result<Option<(usize, Vec<
     Ok(Some((tc, keys)))
 }
 
+/// Seconds before a declared locked test whose rows are refused: the target
+/// spec's required purge, else the protocol default.
+fn boundary_purge(spec: &SplitSpec) -> i64 {
+    spec.purge_seconds.unwrap_or(crate::protocol::DEFAULT_PURGE_SECONDS).ceil() as i64
+}
+
 /// Cross-validation guard: every kept row is a potential training or test row
 /// of some fold. The declared locked test is always checked, whatever
 /// `allow_lockbox` says; the 2026H2 box only without it.
@@ -2858,7 +2869,7 @@ pub fn check_cv_lockbox(
                 unstamped
             ));
         }
-        d.check_times("cross-validation rows", name, &times)?;
+        d.check_times("cross-validation rows", name, &times, boundary_purge(spec))?;
     }
     Ok(())
 }
@@ -4383,10 +4394,13 @@ fn check_split_lockbox(
     report.lockbox_validation = guard.check_times("validation split", &validation_times)?;
     report.lockbox_test = guard.check_times("test split", &test_times)?;
     if let Some(d) = &spec.declared_lockbox {
+        let boundary_purge = boundary_purge(spec);
+        report.boundary_purge_source = if spec.purge_seconds.is_some() { "target_spec" } else { "protocol_default" };
+        report.boundary_purge_seconds = boundary_purge as f64;
         let name = t.names.get(tc).map(String::as_str).unwrap_or("time");
-        d.check_times("training split", name, &train_times)?;
-        d.check_times("validation split", name, &validation_times)?;
-        d.check_times("test split", name, &test_times)?;
+        d.check_times("training split", name, &train_times, boundary_purge)?;
+        d.check_times("validation split", name, &validation_times, boundary_purge)?;
+        d.check_times("test split", name, &test_times, boundary_purge)?;
     }
     Ok(())
 }
