@@ -1001,3 +1001,104 @@ fn all_resolves_to_the_family_columns_the_panel_lacks() {
     }
     let _ = std::fs::remove_dir_all(&f.dir);
 }
+
+fn timeframe_store(dir: &std::path::Path, file: &str, steps: &[i64]) -> String {
+    let base = feature_names().into_iter().find(|n| registry::lookup(n).is_some_and(|r| r.timeframe == "15m")).unwrap();
+    let mtf = enrich::mtf_names().remove(0);
+    let mut text = format!("ts,symbol,{},{},gap\n", base, mtf);
+    let mut ts = 1_700_000_000i64;
+    for (r, step) in steps.iter().enumerate() {
+        ts += step;
+        text.push_str(&format!("{},AAA,{},{},{}\n", ts, r as f64, r as f64 * 0.5, r % 3));
+    }
+    let table = data::parse_table_with_time(&text, false, Some("ts")).unwrap();
+    let p = path(dir, file);
+    store::write_store_with_time(&p, &table, 50, Some(0)).unwrap();
+    p
+}
+
+fn column_timeframes(body: &str) -> Vec<(String, String)> {
+    body.lines()
+        .filter(|l| l.starts_with("{\"name\":"))
+        .map(|l| {
+            let name = l.split("\"name\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+            let tf = l.split("\"timeframe\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+            (name, tf)
+        })
+        .collect()
+}
+
+#[test]
+fn schema_timeframe_matches_hourly_store() {
+    let dir = tmp_dir("schema_tf_hourly");
+    let p = timeframe_store(&dir, "hourly.rcsb", &[3600; 120]);
+    let body = std::fs::read_to_string(registry::write_schema(&p, "2").unwrap()).unwrap();
+    assert!(body.contains("\"bar_seconds\":3600,"), "{body}");
+    let tfs = column_timeframes(&body);
+    let mtf = enrich::mtf_names().remove(0);
+    for (name, tf) in &tfs {
+        if *name == mtf {
+            assert_eq!(tf, mtf.split('_').nth(1).unwrap(), "{name}");
+        } else if name != "ts" && name != "symbol" {
+            assert_eq!(tf, "1h", "{name}");
+        }
+    }
+    assert!(!body.contains("\"timeframe\":\"15m\""), "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn schema_timeframe_of_a_15m_store_is_15m() {
+    let dir = tmp_dir("schema_tf_15m");
+    let p = timeframe_store(&dir, "m15.rcsb", &[900; 120]);
+    let body = std::fs::read_to_string(registry::write_schema(&p, "2").unwrap()).unwrap();
+    assert!(body.contains("\"bar_seconds\":900,"), "{body}");
+    let mtf = enrich::mtf_names().remove(0);
+    for (name, tf) in column_timeframes(&body) {
+        if name == "gap" {
+            assert_eq!(tf, "15m");
+        } else if name == mtf {
+            assert_ne!(tf, "15m");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn schema_timeframe_edge_cases_single_row_and_mixed_steps() {
+    let dir = tmp_dir("schema_tf_edge");
+    let one = timeframe_store(&dir, "one.rcsb", &[3600]);
+    let body = std::fs::read_to_string(registry::write_schema(&one, "2").unwrap()).unwrap();
+    assert!(body.contains("\"bar_seconds\":null,"), "{body}");
+    assert!(column_timeframes(&body).iter().any(|(n, tf)| n == "gap" && tf == "unknown"), "{body}");
+
+    let mut steps = vec![3600i64; 90];
+    steps.extend([7200; 10]);
+    let mixed = timeframe_store(&dir, "mixed.rcsb", &steps);
+    let body = std::fs::read_to_string(registry::write_schema(&mixed, "2").unwrap()).unwrap();
+    assert!(body.contains("\"bar_seconds\":3600,\"bar_seconds_modal_share\":0.9,"), "{body}");
+
+    let odd = timeframe_store(&dir, "odd.rcsb", &[1234; 20]);
+    let body = std::fs::read_to_string(registry::write_schema(&odd, "2").unwrap()).unwrap();
+    assert!(column_timeframes(&body).iter().any(|(n, tf)| n == "gap" && tf == "1234s"), "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rewriting_an_old_sidecar_keeps_hashes_and_verifies() {
+    let dir = tmp_dir("schema_tf_rewrite");
+    let p = timeframe_store(&dir, "hourly.rcsb", &[3600; 120]);
+    let schema = registry::write_schema(&p, "2").unwrap();
+    let new = std::fs::read_to_string(&schema).unwrap();
+    // The pre-change form: 15m labels, no bar_seconds in the header.
+    let old = new.replace("\"bar_seconds\":3600,", "").replace("\"timeframe\":\"1h\"", "\"timeframe\":\"15m\"");
+    assert_ne!(old, new);
+    std::fs::write(&schema, &old).unwrap();
+    assert!(registry::verify_schema(&p).unwrap().is_empty());
+    let before = registry::read_hashes(&schema).unwrap();
+    registry::write_schema(&p, "2").unwrap();
+    assert_eq!(registry::read_hashes(&schema).unwrap(), before);
+    assert_eq!(std::fs::read_to_string(&schema).unwrap(), new);
+    assert!(registry::verify_schema(&p).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
