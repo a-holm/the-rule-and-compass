@@ -498,8 +498,8 @@ pub struct PrepareInput<'a> {
 /// Segment of a time stamp relative to the locked test: 0 before, 1 inside, 2 after.
 pub fn segment_of(t: f64, locked: Option<&Lockbox>) -> u8 {
     match locked {
-        Some(l) if false && t >= l.end as f64 => 2,
-        Some(l) if false && t >= l.start as f64 => 1,
+        Some(l) if t >= l.end as f64 => 2,
+        Some(l) if t >= l.start as f64 => 1,
         _ => 0,
     }
 }
@@ -1590,7 +1590,8 @@ fn usage() -> &'static str {
             writes <arm>.arm.json (arm, feature list, SHA-256, generation budget, seeds), plan.json,\n\
             a copy of the definition and commands.sh\n\
   prepare   --definition <file> --data <csv|rcsb> --time <col> --group <col> --out <csv> [--lockbox START,END]\n\
-            writes <csv>.lockbox.json when the data (or --lockbox) declares a locked test\n\
+            writes <csv>.lockbox.json (with the row count of each segment) when the data (or --lockbox) declares a locked test;\n\
+            placebo and permuted columns are built separately before, inside and after the locked test\n\
             [--keep a,b] [--seed 0]\n\
             writes the projection CSV with placebo and circular-block-permuted columns\n\
   score     (--run <run.json> | --from-run <run.json>) --data <csv|rcsb> --target <col> --time <col> --windows <file> --out <file>\n\

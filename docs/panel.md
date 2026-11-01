@@ -380,6 +380,8 @@ rcsr panel build --data base.rcsb --membership m.csv --out panel.rcsb --locked-t
 
 The build writes `"locked_test": {"start", "end", "start_date", "end_date", "source"}` to `panel.rcsb.manifest.json` and `panel.rcsb.schema.json`. `rcsr panel schema` keeps it, `rcsr panel append` copies it from the target panel, `rcsr enrich` copies it from `--data` (or takes `--locked-test`) into `<out>.enrich.json`, and `rcsr ablation prepare` writes `<csv>.lockbox.json`. A CSV can carry the same object in a `<csv>.lockbox.json` sidecar. `--lockbox START,END` on a command overrides the stored range. `--allow-lockbox` does not open it: it keeps its 2026H2 meaning.
 
+`rcsr ablation prepare` builds the placebo and permuted columns separately on the rows before the declared start, inside the range and after it, per symbol. A development row never holds a locked value in `perm_*` or `placebo_*`. The sidecar adds `"segments":{"before":N,"locked":N,"after":N}` with the row count of each segment. Without a declaration there is one segment and the output is unchanged.
+
 | command | with a declaration |
 |---|---|
 | `rcsr --data ...` (search) | exit 3 when any fit, validation or test row is in the range; the message names the side, the first row's date and the `--exclude '<time> >= START'` fix. With the rows excluded, `run.json` has `lockbox.rows_in_scope: 0`, `evaluated: false`, `source` |
