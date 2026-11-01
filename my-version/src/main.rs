@@ -374,8 +374,9 @@ OVERFITTING DIAGNOSTICS (always on):
                               in the same metric as the search: a model must
                               beat them to earn its complexity
   --baseline-samples <N>      score at most N query rows for the k-NN baseline
-                              (default 512; 0 = every row; absolute/squared/
-                              log_squashed only). The reference set is always
+                              (any metric; default: every row up to 20000
+                              training rows, else a seeded sample of 512;
+                              0 = every row). The reference set is always
                               all training rows; sampled results report their
                               standard error with the finite-population
                               correction (#69). The exact every-row query is
@@ -2266,9 +2267,8 @@ fn main() {
     // row shuffle. `--null-block` without `--null-runs` runs 19 permutations.
     let mut null_block = 0usize;
     // #69: query-row cap for the k-NN null baseline; 0 = no caps at all.
-    // #132: bounded by default; `--baseline-samples 0` opts into every row.
-    let mut baseline_samples = diagnostics::DEFAULT_BASELINE_SAMPLES;
-    let mut baseline_samples_set = false;
+    // #497: unset = exact up to `KNN_EXACT_MAX_ROWS` training rows, sampled above.
+    let mut baseline_samples: Option<usize> = None;
     let mut bootstrap_resamples = 0usize;
     let mut eval_expr: Option<String> = None;
     let mut seed_exprs: Vec<String> = Vec::new();
@@ -2692,8 +2692,7 @@ fn main() {
             "--null-block" => null_block = val!().parse().unwrap_or(0),
             // #69: 0 = no caps; a positive N samples only the query rows.
             "--baseline-samples" => {
-                baseline_samples = val!().parse().unwrap_or(baseline_samples);
-                baseline_samples_set = true;
+                baseline_samples = val!().parse().ok().or(baseline_samples);
             }
             "--bootstrap-error" => bootstrap_resamples = val!().parse().unwrap_or(0),
             "--ops" => {
@@ -3240,24 +3239,6 @@ fn main() {
             eprintln!("error: {}", why);
             std::process::exit(EXIT_USAGE);
         }
-    }
-    // #69: query sampling is an unbiased estimate only for mean-loss metrics.
-    // Refuse the flag elsewhere rather than silently reporting a subsample of a
-    // median/correlation/AIC as if it were the full-sample value.
-    if !diagnostics::knn_sampling_supported(cfg.metric) {
-        if baseline_samples_set && baseline_samples > 0 {
-            eprintln!(
-                "error: --baseline-samples {} only supports mean-loss metrics \
-                 (absolute, squared, log_squashed), not {}",
-                baseline_samples,
-                cfg.metric.name()
-            );
-            std::process::exit(EXIT_USAGE);
-        }
-        // The bounded default does not apply: a subsample of a median or an
-        // information criterion is a different estimator, not an estimate of
-        // the same quantity.
-        baseline_samples = 0;
     }
     // A y-randomisation control shuffles the target. In implicit mode the target
     // is an input and the scored target is all zeros, so every null run would be
@@ -6215,6 +6196,8 @@ fn main() {
     // #69: the k-NN reference set is always all training rows; only the query
     // rows are optionally sampled by `--baseline-samples`.
     let baselines_start = std::time::Instant::now();
+    let baseline_samples =
+        diagnostics::resolve_baseline_samples(baseline_samples, prepared.train.len());
     let (baselines, linear_coef) = diagnostics::Baselines::fit_sampled_coef(
         &prepared.train,
         &fold_samples,
@@ -6741,12 +6724,14 @@ fn main() {
             // #69: state whether queries were sampled and the train/test SEMs.
             if baselines.knn_capped {
                 eprintln!(
-                    "# knn baseline: reference_rows={} train_query_rows={} train_sem={:.3e} test_query_rows={} test_sem={:.3e} sampled=true",
+                    "# knn baseline: reference_rows={} train_query_rows={} train_sem={:.3e} test_query_rows={} test_sem={:.3e} sampled=true sample_size={} sample_seed={}",
                     baselines.knn_reference_rows,
                     baselines.knn_train_query_rows,
                     baselines.knn_train_query_sem,
                     baselines.knn_test_query_rows,
-                    baselines.knn_test_query_sem
+                    baselines.knn_test_query_sem,
+                    baselines.knn_sample_size,
+                    baselines.knn_seed
                 );
             } else {
                 eprintln!(
