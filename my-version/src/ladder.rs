@@ -2234,6 +2234,8 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
                             appends a baseline_read to the ledger, a second read is refused\n\
   --ledger <file>           candidate ledger (with --locked-test)\n\
   --sealed <file>           sealed candidate list recorded in the ledger (with --locked-test)\n\
+  --allow-unbound-ledger    with --locked-test: accept a sealed list whose candidates recorded no\n\
+                            locked test range (old ledger); a different range is refused (exit 3)\n\
   --out <file>              write the JSON report (ends with a ledger object: io and\n\
                             pnl seconds on the run wall)\n\
   --markdown <file|->       write the Markdown table\n\
@@ -2274,6 +2276,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let mut scheme = "expanding".to_string();
     let mut lockbox_arg: Option<String> = None;
     let mut locked_test = false;
+    let mut allow_unbound = false;
     let mut ledger_path: Option<String> = None;
     let mut sealed_path: Option<String> = None;
     let mut spec_path: Option<String> = None;
@@ -2333,6 +2336,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             "--seed" => opts.seed = val()?.parse().map_err(|_| num_err(a))?,
             "--lockbox" => lockbox_arg = Some(val()?),
             "--locked-test" => locked_test = true,
+            "--allow-unbound-ledger" => allow_unbound = true,
             "--ledger" => ledger_path = Some(val()?),
             "--sealed" => sealed_path = Some(val()?),
             "--out" => out = Some(val()?),
@@ -2403,7 +2407,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     if !locked_test && (ledger_path.is_some() || sealed_path.is_some()) {
         return Err(usage_err("--ledger and --sealed apply to --locked-test only".to_string()));
     }
-    let mut read: Option<(protocol::Ledger, String)> = None;
+    let mut read: Option<(protocol::Ledger, String, protocol::LockedRange)> = None;
     if locked_test {
         let (Some(ledger), Some(sealed)) = (&ledger_path, &sealed_path) else {
             return Err(usage_err("--locked-test needs --ledger and --sealed".to_string()));
@@ -2425,9 +2429,11 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             }
         }
         let l = protocol::Ledger::new(ledger);
-        l.authorize_baseline_read(std::path::Path::new(sealed)).map_err(input_err)?;
+        let current = protocol::LockedRange::new(&d.lockbox, d.source);
+        let binding = protocol::RangeBinding { current: &current, allow_unbound };
+        l.authorize_baseline_read(std::path::Path::new(sealed), Some(binding)).map_err(input_err)?;
         l.check_read_marker(&data_path).map_err(input_err)?;
-        read = Some((l, crate::manifest::sha256_file(&data_path).map_err(input_err)?));
+        read = Some((l, crate::manifest::sha256_file(&data_path).map_err(input_err)?, current));
     }
     let guard = if locked_test {
         None
@@ -2471,10 +2477,10 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let mut json = report.json();
     let in_scope = if locked_test { folds.iter().map(|f| f.test.len()).sum() } else { 0 };
     json = resolved.splice_report(&json, in_scope, locked_test, true);
-    if let Some((ledger, data_sha)) = &read {
+    if let Some((ledger, data_sha, current)) = &read {
         let report_sha = crate::manifest::sha256_hex(json.as_bytes());
         ledger.write_read_marker(&data_path, "baseline_read", &report_sha).map_err(input_err)?;
-        ledger.record_baseline_read(data_sha, &report_sha).map_err(input_err)?;
+        ledger.record_baseline_read(data_sha, &report_sha, Some(current)).map_err(input_err)?;
     }
     if let Some(p) = &out {
         std::fs::write(p, &json).map_err(|e| input_err(format!("{}: {}", p, e)))?;

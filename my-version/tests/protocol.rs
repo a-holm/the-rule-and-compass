@@ -71,6 +71,7 @@ fn candidate(tag: &str) -> Candidate {
         build_commit: "build".to_string(),
         report_sha256: format!("report-{}", tag),
         expression: format!("x + \"{}\"", tag),
+        locked_test: None,
     }
 }
 
@@ -87,23 +88,23 @@ fn ledger_seals_before_the_read_and_allows_one_read_per_candidate() {
 
     // nothing sealed yet
     std::fs::write(&sealed, "{}").unwrap();
-    assert!(ledger.authorize_read(&sealed, &a.id, "data", "build").unwrap_err().contains("not sealed"));
+    assert!(ledger.authorize_read(&sealed, &a.id, "data", "build", None).unwrap_err().contains("not sealed"));
 
     let hash = ledger.seal(&sealed, &[a.id.clone(), b.id.clone()]).unwrap();
     assert_eq!(hash, rcsr::manifest::sha256_file(&sealed).unwrap());
     // c was not sealed
-    assert!(ledger.authorize_read(&sealed, &c.id, "data", "build").unwrap_err().contains("not in the sealed list"));
+    assert!(ledger.authorize_read(&sealed, &c.id, "data", "build", None).unwrap_err().contains("not in the sealed list"));
     // a different code or data hash voids the run
-    assert!(ledger.authorize_read(&sealed, &a.id, "data2", "build").unwrap_err().contains("void"));
-    assert!(ledger.authorize_read(&sealed, &a.id, "data", "build2").unwrap_err().contains("void"));
+    assert!(ledger.authorize_read(&sealed, &a.id, "data2", "build", None).unwrap_err().contains("void"));
+    assert!(ledger.authorize_read(&sealed, &a.id, "data", "build2", None).unwrap_err().contains("void"));
 
-    let entry = ledger.authorize_read(&sealed, &a.id, "data", "build").unwrap();
+    let entry = ledger.authorize_read(&sealed, &a.id, "data", "build", None).unwrap();
     assert_eq!(entry.expression, a.expression);
-    assert_eq!(ledger.record_read(&a.id, "locked-report-a").unwrap(), 1);
+    assert_eq!(ledger.record_read(&a.id, "locked-report-a", None).unwrap(), 1);
     // test_read:true cannot be read or selected again
-    assert!(ledger.authorize_read(&sealed, &a.id, "data", "build").unwrap_err().contains("test_read:true"));
+    assert!(ledger.authorize_read(&sealed, &a.id, "data", "build", None).unwrap_err().contains("test_read:true"));
     assert_eq!(ledger.read_report_sha(&a.id).as_deref(), Some("locked-report-a"));
-    assert_eq!(ledger.record_read(&b.id, "locked-report-b").unwrap(), 2);
+    assert_eq!(ledger.record_read(&b.id, "locked-report-b", None).unwrap(), 2);
     assert_eq!(ledger.read_count().unwrap(), 2);
     let unread: Vec<String> = ledger.unread_candidates().unwrap().into_iter().map(|c| c.id).collect();
     assert_eq!(unread, vec![c.id.clone()]);
@@ -111,7 +112,7 @@ fn ledger_seals_before_the_read_and_allows_one_read_per_candidate() {
     // a sealed file edited after the seal no longer matches the ledger
     let text = std::fs::read_to_string(&sealed).unwrap();
     std::fs::write(&sealed, text.replace("report-a", "report-z")).unwrap();
-    assert!(ledger.authorize_read(&sealed, &c.id, "data", "build").is_err());
+    assert!(ledger.authorize_read(&sealed, &c.id, "data", "build", None).is_err());
 }
 
 #[test]
@@ -287,9 +288,9 @@ fn final_seal_blocks_new_candidates_and_limits_reads() {
     assert!(ledger.seal(&sealed, &[]).unwrap_err().contains("the ledger is final"));
     assert!(ledger.seal_final(&sealed, &[], 1, false).unwrap_err().contains("the ledger is final"));
 
-    ledger.authorize_read(&sealed, &a.id, "data", "build").unwrap();
-    ledger.record_read(&a.id, "report-a").unwrap();
-    let second = ledger.authorize_read(&sealed, &b.id, "data", "build").unwrap_err();
+    ledger.authorize_read(&sealed, &a.id, "data", "build", None).unwrap();
+    ledger.record_read(&a.id, "report-a", None).unwrap();
+    let second = ledger.authorize_read(&sealed, &b.id, "data", "build", None).unwrap_err();
     assert!(second.contains("the final seal allows 1 locked read(s)"), "{}", second);
     ledger.verify_chain().unwrap();
 }
@@ -306,10 +307,10 @@ fn final_seal_with_more_reads_allows_exactly_that_many() {
     ledger.seal_final(&sealed, &[], 2, true).unwrap();
     assert!(ledger.final_seal().unwrap().unwrap().1.report_candidates);
     for x in [&a, &b] {
-        ledger.authorize_read(&sealed, &x.id, "data", "build").unwrap();
-        ledger.record_read(&x.id, "r").unwrap();
+        ledger.authorize_read(&sealed, &x.id, "data", "build", None).unwrap();
+        ledger.record_read(&x.id, "r", None).unwrap();
     }
-    assert!(ledger.authorize_read(&sealed, &c.id, "data", "build").is_err());
+    assert!(ledger.authorize_read(&sealed, &c.id, "data", "build", None).is_err());
 }
 
 #[test]
@@ -342,7 +343,7 @@ fn the_read_marker_binds_a_store_to_one_ledger_chain() {
     let marker = std::fs::read_to_string(protocol::marker_path(d)).unwrap();
     assert_eq!(marker.lines().count(), 1, "{}", marker);
     assert!(first.verify_read_marker(d).unwrap_err().contains("that the ledger does not record"));
-    first.record_read(&candidate("a").id, "r1").unwrap();
+    first.record_read(&candidate("a").id, "r1", None).unwrap();
     assert!(first.verify_read_marker(d).unwrap().contains("1 read line(s)"));
 
     let err = other.check_read_marker(d).unwrap_err();
@@ -361,4 +362,67 @@ fn the_read_marker_binds_a_store_to_one_ledger_chain() {
     rewritten.add_candidate(&candidate("zzz")).unwrap();
     std::fs::copy(dir.join("l3.jsonl"), &path).unwrap();
     assert!(first.check_read_marker(d).unwrap_err().contains("does not contain the head"));
+}
+
+#[test]
+fn a_ledger_binds_the_locked_range_and_a_read_refuses_another() {
+    use rcsr::protocol::{Event, LockedRange, RangeBinding};
+
+    let dir = scratch("bound-range");
+    let ledger = Ledger::new(dir.join("ledger.jsonl"));
+    let sealed = dir.join("locked_candidates.json");
+    let range = |start: i64, end: i64| LockedRange { start, end, source: "store".to_string() };
+    let developed = range(1_751_328_000, 1_782_864_000);
+    let (mut a, b) = (candidate("a"), candidate("b"));
+    a.locked_test = Some(developed.clone());
+    ledger.add_candidate(&a).unwrap();
+    ledger.add_candidate(&b).unwrap();
+    ledger.seal(&sealed, &[a.id.clone(), b.id.clone()]).unwrap();
+
+    // the range round trips through the ledger line and the sealed list
+    let events = ledger.events().unwrap();
+    assert!(events.iter().any(|e| matches!(e, Event::Candidate(c) if c.id == a.id && c.locked_test.as_ref() == Some(&developed))));
+    assert!(std::fs::read_to_string(&sealed).unwrap().contains("\"locked_test\":{\"start\":1751328000,\"end\":1782864000"));
+
+    fn bind(current: &LockedRange, allow_unbound: bool) -> Option<RangeBinding<'_>> {
+        Some(RangeBinding { current, allow_unbound })
+    }
+    let same = range(developed.start, developed.end);
+    ledger.authorize_read(&sealed, &a.id, "data", "build", bind(&same, false)).unwrap();
+    // the source name does not matter, the bounds do
+    let renamed = LockedRange { source: "flag".to_string(), ..same.clone() };
+    ledger.authorize_read(&sealed, &a.id, "data", "build", bind(&renamed, false)).unwrap();
+    for other in [range(developed.start, developed.end + 3600), range(developed.start - 3600, developed.end)] {
+        let err = ledger.authorize_read(&sealed, &a.id, "data", "build", bind(&other, false)).unwrap_err();
+        assert!(err.contains("was developed against the locked test 2025-07-01..2026-07-01 (store)"), "{err}");
+        assert!(err.contains("this read resolves"), "{err}");
+        let err = ledger.authorize_sealed(&sealed, &a.id, "data", "build", bind(&other, true)).unwrap_err();
+        assert!(err.contains("was developed against"), "{err}");
+    }
+
+    // an old candidate without a range needs the flag
+    let err = ledger.authorize_read(&sealed, &b.id, "data", "build", bind(&same, false)).unwrap_err();
+    assert!(err.contains("--allow-unbound-ledger"), "{err}");
+    let entry = ledger.authorize_read(&sealed, &b.id, "data", "build", bind(&same, true)).unwrap();
+    assert_eq!(entry.locked_test, None);
+    // the baseline read checks every sealed item
+    let err = ledger.authorize_baseline_read(&sealed, bind(&same, false)).unwrap_err();
+    assert!(err.contains("--allow-unbound-ledger"), "{err}");
+    ledger.authorize_baseline_read(&sealed, bind(&same, true)).unwrap();
+    let other = range(0, 1);
+    assert!(ledger.authorize_baseline_read(&sealed, bind(&other, true)).is_err());
+
+    // read lines carry the range
+    ledger.record_read(&a.id, "report-a", Some(&same)).unwrap();
+    ledger.record_baseline_read("data", "report-base", Some(&same)).unwrap();
+    let reads: Vec<Option<LockedRange>> = ledger
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::TestRead { locked_test, .. } | Event::BaselineRead { locked_test, .. } => Some(locked_test),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reads, vec![Some(same.clone()), Some(same)]);
 }
