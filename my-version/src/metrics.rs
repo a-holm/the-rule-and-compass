@@ -605,9 +605,9 @@ pub fn score_dispatch(m: Metric) -> ScoreDispatch {
         ImplicitDerivative => ScoreDispatch::Refused(
             "implicit needs an expression-tree gradient pass",
         ),
-        ImplicitResidual => ScoreDispatch::Refused(
-            "implicit_residual needs implicit samples on the device",
-        ),
+        // The target of an implicit sample is 0, so `sum w|f| / sum w` is the
+        // absolute metric bit for bit.
+        ImplicitResidual => ScoreDispatch::Native(O::Absolute),
         Auc => ScoreDispatch::Exact(ScoreStat::Auc),
     }
 }
@@ -2376,6 +2376,7 @@ mod tests {
                 "maximum",
                 "signed",
                 "log_squashed",
+                "implicit_residual",
                 "log_loss",
                 "brier",
                 "hinge",

@@ -331,7 +331,7 @@ fn the_panel_store_and_manifest_record_counts_delisted_and_checksums() {
     let m = build_membership(&s, &cfg(2)).unwrap();
     let p = build_panel(&s, &m).unwrap();
     let out = std::env::temp_dir().join(format!("rcsr-panel-test-{}.rcsb", std::process::id()));
-    let mut input = std::env::temp_dir().join(format!("rcsr-panel-in-{}.csv", std::process::id()));
+    let input = std::env::temp_dir().join(format!("rcsr-panel-in-{}.csv", std::process::id()));
     // Write a canonical daily CSV as the provenance input.
     let mut csv = String::from("ts,symbol,open,high,low,close,volume,quote_volume\n");
     for (sym, bs) in &s {

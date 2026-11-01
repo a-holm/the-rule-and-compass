@@ -239,7 +239,8 @@ mod tests {
 
     /// The batched driver commits exactly the constants the CPU
     /// `coordinate_polish` commits from the same start, and the score is the
-    /// same number: the ladder, not the GPU, is what is being tested.    #[test]
+    /// same number: the ladder, not the GPU, is what is being tested.
+    #[test]
     fn batched_polish_reproduces_the_cpu_ladder_from_the_same_start() {
         let (x, y) = fixture(96);
         let mut cpu = tree();

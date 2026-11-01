@@ -1373,7 +1373,9 @@ pub(crate) enum OrderCode {
     /// `metrics::interquartile_mean_abs`, bit for bit: the rank window added
     /// in ascending order, like the CPU's left-to-right sum.
     InterquartileExact = 2,
-    /// The largest `|r|`, bit for bit.
+    /// The largest `|r|`, bit for bit. Only the order-statistic kernel tests
+    /// drive this path; scoring uses the order-free scan.
+    #[cfg(test)]
     Maximum = 3,
 }
 
@@ -1394,7 +1396,9 @@ impl OrderCode {
     /// mean).
     pub(crate) fn select_min_rows(self) -> Option<usize> {
         match self {
-            OrderCode::Median | OrderCode::Maximum => Some(ORDER_SELECT_MIN_ROWS),
+            OrderCode::Median => Some(ORDER_SELECT_MIN_ROWS),
+            #[cfg(test)]
+            OrderCode::Maximum => Some(ORDER_SELECT_MIN_ROWS),
             OrderCode::InterquartileExact => Some(IQR_SELECT_MIN_ROWS),
             OrderCode::InterquartileTree => None,
         }
@@ -3814,6 +3818,65 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The device `Absolute` scorer, chosen by the dispatch table for
+    /// `implicit_residual`, equals the CPU `score_weighted(ImplicitResidual)` on an
+    /// implicit circle sample (target 0) at the absolute metric's tier.
+    #[test]
+    fn implicit_residual_device_score_matches_the_cpu_metric() {
+        use crate::metrics::{native_score_objective, score_weighted, Metric};
+
+        let n = 256;
+        let nv = 2;
+        let mut cols = vec![0.0f32; nv * n];
+        for i in 0..n {
+            let a = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
+            let r = 1.0 + 0.05 * ((i * 7 % 13) as f32 / 13.0 - 0.5);
+            cols[i] = r * a.cos();
+            cols[n + i] = r * a.sin();
+        }
+        let y = vec![0.0f32; n];
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let circle = |c: f64| {
+            node(
+                Op::Sub,
+                vec![
+                    node(
+                        Op::Add,
+                        vec![
+                            node(Op::Square, vec![input(0)]),
+                            node(Op::Square, vec![input(1)]),
+                        ],
+                    ),
+                    constant(c),
+                ],
+            )
+        };
+        let trees = vec![circle(1.0), circle(0.0), circle(2.5)];
+        let pop = Population::from_trees(trees.iter());
+        let (prog, offsets) = pop.programs();
+        let preds = ev.predictions(prog, offsets).expect("prediction readback");
+        let objective = native_score_objective(Metric::ImplicitResidual)
+            .expect("implicit_residual is natively scored");
+        assert_eq!(objective, ScoreObjective::Absolute);
+        let batch = ev.score_batch(prog, offsets, objective, &[1i32; 3]);
+        assert!(batch.is_consistent());
+        let zeros = vec![0.0f64; n];
+        for k in 0..trees.len() {
+            let pred: Vec<f64> = preds[k * n..(k + 1) * n].iter().map(|&v| v as f64).collect();
+            let want = score_weighted(&pred, &zeros, &[], Metric::ImplicitResidual, 1);
+            assert_eq!(batch.status[k], ScoreStatus::Ok, "slot {k}");
+            let tol = 1e-12 * (1.0 + want.abs());
+            assert!(
+                (batch.values[k] - want).abs() <= tol,
+                "slot {k}: GPU {} vs CPU {want}",
+                batch.values[k]
+            );
         }
     }
 
@@ -7503,12 +7566,36 @@ mod rank_tests {
     #[test]
     fn target_ranks_match_the_cpu() {
         let f = fixture(96);
-        let Some(mut ev) = evaluator(&f) else { return };
+        let Some(ev) = evaluator(&f) else { return };
         let target = RankTarget::new(&f.y).unwrap();
         let mut b = vec![0i64; f.n];
         let rc = unsafe { rc_rank_debug_b(ev.ctx, b.as_mut_ptr()) };
         assert_eq!(rc, 0, "the target stage ran");
         assert_eq!(b, target.ranks(), "device B differs from the CPU average ranks");
+    }
+
+    extern "C" {
+        fn rc_rank_test_force_cub_fail(on: i32);
+    }
+
+    /// #410: a refused CUB size query fails the rank call before any buffer is
+    /// sized, `rank_score_trials` reports `None` (the caller keeps the CPU
+    /// arm), and the next call on the same context works.
+    #[test]
+    fn refused_cub_query_fails_the_rank_call_then_recovers() {
+        let f = fixture(96);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let p = plan(&linear());
+        let ok = ev.rank_score_trials(&[&p], &[vec![p.c0.clone()]]);
+        assert!(ok.is_some(), "baseline rank call");
+        unsafe { rc_rank_test_force_cub_fail(1) };
+        let refused = ev.rank_score_trials(&[&p], &[vec![p.c0.clone()]]);
+        unsafe { rc_rank_test_force_cub_fail(0) };
+        assert!(refused.is_none(), "a refused CUB query must fail the rank call");
+        let again = ev
+            .rank_score_trials(&[&p], &[vec![p.c0.clone()]])
+            .expect("no error may stay pending");
+        assert_eq!(again[0][0].map(|s| (s.ab, s.aa)), ok.unwrap()[0][0].map(|s| (s.ab, s.aa)));
     }
 
     #[test]
@@ -8617,6 +8704,32 @@ mod order_stat_tests {
 
     fn constants_of(t: &Node) -> Vec<f64> {
         crate::fit::constants_slots(t)
+    }
+
+    extern "C" {
+        fn rc_os_test_force_cub_fail(on: i32);
+    }
+
+    /// #410: a refused CUB size query fails the order-statistic sort call,
+    /// `order_stat_score_trials` reports `None` (the caller keeps the CPU arm),
+    /// and the next call on the same context works.
+    #[test]
+    fn refused_cub_query_fails_the_order_stat_call_then_recovers() {
+        use crate::fit::OrderStat;
+        let f = fixture(96);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let p = plan(&affine());
+        let trials = [vec![p.c0.clone()]];
+        let ok = ev.order_stat_score_trials(&[&p], &trials, OrderStat::Median);
+        assert!(ok.is_some(), "baseline median call");
+        unsafe { rc_os_test_force_cub_fail(1) };
+        let refused = ev.order_stat_score_trials(&[&p], &trials, OrderStat::Median);
+        unsafe { rc_os_test_force_cub_fail(0) };
+        assert!(refused.is_none(), "a refused CUB query must fail the call");
+        let again = ev
+            .order_stat_score_trials(&[&p], &trials, OrderStat::Median)
+            .expect("no error may stay pending");
+        assert_eq!(again[0][0].map(f64::to_bits), ok.unwrap()[0][0].map(f64::to_bits));
     }
 
     /// The device median is the configured metric for odd and even row counts,

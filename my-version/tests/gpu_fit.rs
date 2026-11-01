@@ -5,6 +5,8 @@
 //! keep: the opt-in strategy, determinism, exact reporting and checkpoint
 //! round-trips. Device-dependent tests skip cleanly on a machine without CUDA.
 
+#![cfg_attr(not(feature = "cuda"), allow(dead_code, unused_imports))]
+
 use rcsr::checkpoint::{Backend, Checkpoint};
 use rcsr::data::Sample;
 use rcsr::expr;
@@ -60,7 +62,6 @@ fn metrics_without_an_admitted_scorer_never_use_the_gpu_evaluator() {
         Metric::Auc,
         Metric::Slope,
         Metric::ImplicitDerivative,
-        Metric::ImplicitResidual,
     ];
     for metric in metrics {
         let cfg = Config {
@@ -94,6 +95,7 @@ fn native_score_objectives_are_table_driven() {
     for metric in [
         Metric::Squared,
         Metric::Absolute,
+        Metric::ImplicitResidual,
         Metric::LogSquashed,
         Metric::Signed,
         Metric::Maximum,
@@ -1650,4 +1652,133 @@ fn an_affine_correlation_tree_takes_the_closed_form() {
         .copied()
         .unwrap_or(0);
     assert!(affine > 0, "no affine tree was routed: {:?}", g.fit_fallback_by_cause);
+}
+
+fn implicit_circle(n: usize) -> Sample {
+    let x: Vec<Vec<f64>> = (0..n)
+        .map(|i| {
+            let a = 2.0 * std::f64::consts::PI * i as f64 / n as f64;
+            let r = 1.0 + 0.04 * (((i * 37) % 11) as f64 / 11.0 - 0.5);
+            vec![r * a.cos(), r * a.sin()]
+        })
+        .collect();
+    Sample {
+        x,
+        y: vec![0.0; n],
+        w: Vec::new(),
+        ys: Vec::new(),
+        pairs: None,
+    }
+}
+
+/// `implicit_residual` is the absolute objective on the all-zero implicit
+/// target: the dispatch table, the fit objective and the weights gate follow
+/// `absolute`.
+#[test]
+fn implicit_residual_dispatch_is_absolute() {
+    use rcsr::fit::DeviceLoss;
+    use rcsr::metrics::ScoreObjective;
+    assert_eq!(
+        rcsr::metrics::native_score_objective(Metric::ImplicitResidual),
+        Some(ScoreObjective::Absolute)
+    );
+    assert_eq!(rcsr::fit::fit_loss(Metric::ImplicitResidual), Some(DeviceLoss::Absolute));
+    assert!(rcsr::fit::gpu_fit_metric_error(Metric::ImplicitResidual).is_none());
+    assert!(rcsr::metrics::score_refusal(Metric::ImplicitResidual).is_none());
+    assert!(rcsr::metrics::native_score_objective(Metric::ImplicitDerivative).is_none());
+}
+
+/// A GPU `implicit_residual` run on an implicit circle sample defers scoring and
+/// the constant fit to the device, repeats exactly, and reports the exact CPU
+/// metric for every archived tree.
+#[cfg(feature = "cuda")]
+#[test]
+fn implicit_residual_gpu_search_defers_and_reports_the_exact_metric() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = implicit_circle(4096);
+    let test = implicit_circle(512);
+    let cfg = Config {
+        generations: 4,
+        islands: 1,
+        pop: 64,
+        max_complexity: 12,
+        fit_iters: 6,
+        patience: 0,
+        seed: 3,
+        fit_strategy: FitStrategy::Gpu,
+        metric: Metric::ImplicitResidual,
+        ops: vec![expr::Op::Add, expr::Op::Sub, expr::Op::Mul, expr::Op::Square],
+        gpu: true,
+        ..Default::default()
+    };
+    let a = search::run(&cfg, &train, &test);
+    let b = search::run(&cfg, &train, &test);
+    assert_eq!(a.backend, rcsr::backend::Kind::Gpu, "{:?}", a.backend_reason);
+    let g = a.gpu.as_ref().expect("a GPU report");
+    assert!(g.fit_gpu > 0, "the fit kernel must have run: {:?}", g);
+    assert_eq!(describe(&a), describe(&b));
+    assert!(!a.archive.items.is_empty());
+    for s in &a.archive.items {
+        let cpu = search::eval_error(&s.tree, &train, Metric::ImplicitResidual);
+        assert_eq!(s.error.to_bits(), cpu.to_bits(), "{}", s.error);
+    }
+}
+
+/// `--metric signed` (the bias) with `--fit-strategy gpu` is accepted and
+/// defers: the device LM is the warm start, the exact `f64` gate projects every
+/// proposal, two runs are bit-identical, and every archive error is the exact
+/// CPU metric. `--fit-iters 0` runs no fit at all, so no constant moves.
+#[cfg(feature = "cuda")]
+#[test]
+fn signed_bias_gpu_fit_run_is_deterministic_and_exact() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    assert!(rcsr::fit::gpu_fit_metric_error(Metric::Signed).is_none());
+    let train = sample(240, 81);
+    let test = sample(60, 82);
+    let cfg = Config {
+        generations: 4,
+        metric: Metric::Signed,
+        ..gpu_config(83)
+    };
+    let a = search::run(&cfg, &train, &test);
+    let b = search::run(&cfg, &train, &test);
+    assert_eq!(describe(&a), describe(&b), "a fixed seed must be deterministic");
+    assert_eq!(a.test_errors, b.test_errors);
+    assert_eq!(a.backend, rcsr::backend::Kind::Gpu, "{:?}", a.backend_reason);
+    let g = a.gpu.as_ref().expect("a GPU report");
+    assert!(g.fit_gpu > 0, "the device warm start must run: {:?}", g);
+    // Wide admission fits candidates the screen did not select, so only the
+    // fit/fallback split is exact here.
+    assert_eq!(g.fit_attempts, g.fit_gpu + g.fit_fallback, "{:?}", g);
+    assert!(!a.archive.items.is_empty());
+    for s in &a.archive.items {
+        let cpu = search::eval_error(&s.tree, &train, Metric::Signed);
+        assert_eq!(
+            s.error.to_bits(),
+            cpu.to_bits(),
+            "archive row is not the exact CPU signed bias: {} vs {}",
+            s.error,
+            cpu
+        );
+    }
+
+    let off = Config {
+        fit_iters: 0,
+        ..cfg
+    };
+    let out = search::run(&off, &train, &test);
+    let g = out.gpu.as_ref().expect("a GPU report");
+    assert_eq!(g.fit_attempts, 0, "no fit may be attempted: {:?}", g);
+    assert_eq!(g.fit_gpu, 0);
+    assert_eq!(g.fit_screened, 0, "admission must not run without a fit: {:?}", g);
+    for s in &out.archive.items {
+        let cpu = search::eval_error(&s.tree, &train, Metric::Signed);
+        assert_eq!(s.error.to_bits(), cpu.to_bits());
+    }
 }
