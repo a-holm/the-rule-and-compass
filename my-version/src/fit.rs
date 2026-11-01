@@ -170,6 +170,48 @@ impl FitAdmission {
     }
 }
 
+/// #496: arithmetic of the undamped Gauss-Newton polish that ends the device
+/// fit kernel. Changing it changes the proposed constants, so it is a saved
+/// search setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FitPolish {
+    /// f64 re-baseline and f64 Gauss-Newton steps on the exact rows.
+    #[default]
+    F64,
+    /// The same steps on the f32 rows of the LM phase.
+    F32,
+    /// No re-baseline and no polish: the kernel returns after the LM phase.
+    Off,
+}
+
+impl FitPolish {
+    pub fn name(self) -> &'static str {
+        match self {
+            FitPolish::F64 => "f64",
+            FitPolish::F32 => "f32",
+            FitPolish::Off => "off",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "f64" => Some(FitPolish::F64),
+            "f32" => Some(FitPolish::F32),
+            "off" => Some(FitPolish::Off),
+            _ => None,
+        }
+    }
+
+    /// The kernel argument.
+    pub fn code(self) -> i32 {
+        match self {
+            FitPolish::F64 => 0,
+            FitPolish::F32 => 1,
+            FitPolish::Off => 2,
+        }
+    }
+}
+
 /// #223: what the person asked for when the engine resolves the fit arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FitRequest {

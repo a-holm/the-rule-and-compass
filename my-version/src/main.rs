@@ -609,6 +609,15 @@ SEARCH:
                              refits for --fit-strategy gpu (default 4096,
                              0 = unbounded). Fallbacks beyond the bound keep
                              their finite device constants and are counted
+  --fit-polish <f64|f32|off>  arithmetic of the device fit kernel's polish, the
+                             undamped Gauss-Newton steps after the damped LM
+                             (default f64). f64 re-baselines and steps on the
+                             exact f64 rows; f32 steps on the f32 rows of the LM
+                             phase; off returns after the LM phase. The search
+                             ranks on the f32 evaluator and the archive is
+                             refit exactly on the CPU in every mode. Only the
+                             device fit arm reads it; a resume refuses a
+                             different saved value
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
   --no-dedup                 disable structural de-duplication
   --no-front-parents         draw every parent from the island tournament;
@@ -1064,7 +1073,7 @@ fn ledger_json(
         rcsr::gpu_stats::Ratio::undefined(f64::NAN, f64::NAN, "decades_per_gpu_hour", "run")
     };
     format!(
-        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"fallback_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
+        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"fallback_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
         jnum(l.wall_s()),
         stages,
         jnum(l.stage_sum_s()),
@@ -1089,6 +1098,8 @@ fn ledger_json(
         ratio_json(Some(&l.fit_kernel_duty())),
         jnum(l.fit_host_s()),
         jnum(l.fit_kernel_s()),
+        jnum(l.fit_kernel_lm_s()),
+        jnum(l.fit_kernel_polish_s()),
         jnum(l.fit_fallback_s()),
         jnum(l.refit_s()),
         l.refits(),
@@ -1203,7 +1214,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1217,6 +1228,9 @@ fn gpu_json(
         ops_json(&g.fit_status_by_label),
         g.fit_refits,
         jnum(g.fit_ms / 1000.0),
+        jnum(g.ledger.fit_kernel_lm_s()),
+        jnum(g.ledger.fit_kernel_polish_s()),
+        jstr(g.fit_polish.name()),
         jnum(g.fit_host_ms / 1000.0),
         jnum(g.fit_fallback_ms / 1000.0),
         g.fit_fallback_bounded,
@@ -1711,6 +1725,8 @@ impl DevSink {
             duty_run: outcome.gpu.as_ref().map(|g| g.ledger.duty_run().value),
             unaccounted_s: outcome.gpu.as_ref().map(|g| g.ledger.unaccounted_s()),
             fit_kernel_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_s()),
+            fit_kernel_f32_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_lm_s()),
+            fit_kernel_f64_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_polish_s()),
             fit_fallback_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_fallback_s()),
             events,
             bytes,
@@ -2237,6 +2253,7 @@ fn main() {
     let mut fit_rows_set = false;
     // #255: explicit --fit-fallback-max for the resume settings check.
     let mut fit_fallback_max_set = false;
+    let mut fit_polish_set = false;
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
     let mut front_parents_set = false;
@@ -2617,6 +2634,20 @@ fn main() {
             "--fit-fallback-max" => {
                 cfg.fit_fallback_max = val!().parse().unwrap_or(cfg.fit_fallback_max);
                 fit_fallback_max_set = true;
+            }
+            // #496: arithmetic of the device fit polish.
+            "--fit-polish" => {
+                let v = val!();
+                match fit::FitPolish::parse(&v) {
+                    Some(s) => {
+                        cfg.fit_polish = s;
+                        fit_polish_set = true;
+                    }
+                    None => {
+                        eprintln!("error: --fit-polish needs f64, f32 or off, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
             }
             // #116: exact constant-fitting arm.
             "--fit-strategy" => {
@@ -3251,6 +3282,13 @@ fn main() {
         }
         // #255: the fallback bound is saved because reaching it changes which
         // candidates keep device constants.
+        if fit_polish_set && cfg.fit_polish != saved.fit_polish {
+            conflicts.push(format!(
+                "--fit-polish {} (saved {})",
+                cfg.fit_polish.name(),
+                saved.fit_polish.name()
+            ));
+        }
         if fit_fallback_max_set && cfg.fit_fallback_max != saved.fit_fallback_max {
             conflicts.push(format!(
                 "--fit-fallback-max {} (saved {})",
