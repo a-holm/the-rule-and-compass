@@ -183,6 +183,7 @@ Every window also lists the long-only controls (cash, buy-and-hold, constant
 long/flat from the training mean, matched-exposure random long seeded by
 `--control-seed`) with exposure, turnover, beta and excess over cash; see
 `src/baselines.rs`.
+Pass `--batch-pnl` to score every candidate on every window in one batch (`src/wf_batch.rs`, kernel `src/cuda/wf_batch.cu`), per window and pooled, with the baseline ladder; finalist values stay exact CPU f64 and batch values are labelled `gpu_proxy`.
 `--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
 associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
 adds the exact `O(2n)` hindsight DP as a labelled bound, never as the

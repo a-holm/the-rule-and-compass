@@ -9158,6 +9158,12 @@ OPTIONS:
                              matched-exposure random long, each with exposure,
                              turnover, beta and excess over cash. With
                              --device-pnl they are cross-checked on the device
+  --batch-pnl                score every candidate on every window in one batch
+                             (CUDA kernel when built with --features cuda, the
+                             identical host path otherwise), per window and
+                             pooled, with the baseline ladder. Reported
+                             finalist values stay exact CPU f64; batch values
+                             are labelled gpu_proxy and checked against them
   --entry-offset <seconds>   seconds from the row stamp to the label entry
                              (default 0). Required purge = entry-offset +
                              horizon + delay; a window with a shorter gap is
@@ -9387,6 +9393,7 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--pool-reset-flat" => pool_reset_flat = true,
             "--device-pnl" => device_pnl = true,
+            "--batch-pnl" => popts.batch_pnl = true,
             "--gpu" => gpu = true,
             "--control-seed" => {
                 let src = need(args, i + 1, "--control-seed");

@@ -271,6 +271,56 @@ The JSON gains a `device_pnl` object per window and a report-level summary with
 `max_abs_net_delta`. `backend` is `cuda` when the kernel ran and
 `cpu-canonical` on a non-CUDA build or when no device is available.
 
+## Batch scoring (`--batch-pnl`)
+
+`--batch-pnl` scores every candidate on every test window in one batch
+(`src/wf_batch.rs`, device kernel `src/cuda/wf_batch.cu` when built with
+`--features cuda`, otherwise the identical host loop). It consumes the windows,
+thresholds and scores the protocol already produced and does not redefine them.
+The reported finalist values stay the scalar evaluator's exact CPU `f64`. Every
+batch value carries a `value_label`:
+
+| label | meaning |
+|---|---|
+| `gpu_proxy` | computed by the device kernel |
+| `cpu_batch` | computed by the host mirror of the kernel |
+| `exact_cpu_f64` | computed by the scalar evaluator (finalist check, scalar fallback, ladder) |
+
+The rows of all windows are laid out once in chain order. A chain is a run of
+rows that share one position state, ascending in `(window, time)` and sorted by
+`(group, time)` inside a window whatever the input order, so a flattened
+`(time, group)` scan invents no trades.
+
+* `pooled`: one chain per group. The position carries across the window seam, so
+  a position held over the seam pays no second entry. Every window block still
+  pays its own final exit, like the scalar evaluator with a shared `previous`
+  map.
+* `per_window`: one chain per `(window, group)`. Every window starts flat.
+
+One device thread folds one `(candidate, chain)` in ascending row order, so a
+block's `f64` sums do not depend on the block size or the tile. Blocks merge
+into window cells in ascending block order. A cell equals the scalar evaluator
+to `1e-9` relative; the integer counters are equal.
+
+Candidates stream through a declared tile of at most 64 candidates (default
+byte budget 256 MiB, f64 scores). The population is never held as `P x N`. A
+candidate with a non-finite score on a finite-target row is computed by the
+scalar evaluator, because the evaluator drops such rows per candidate; its cells
+are labelled `exact_cpu_f64` and counted in `fallback_candidates`.
+
+The baseline ladder is scored in every batch. Per window, `cash`,
+`buy_and_hold` and `constant` are closed forms; `matched_exposure_random_long`
+is priced per candidate from the candidate's own positions. All start flat and
+are exact CPU `f64`.
+
+The `batch_pnl` JSON block holds `reported_values`, `batch_values`,
+`max_abs_net_delta` (selected candidate, scalar evaluator versus batch cell),
+`finalists`, and for each seam the `cells`, the `ladder` and `stats`:
+`candidates_per_s`, `row_evals_per_s`, `device_fraction`, `device_bytes`,
+`host_tile_bytes`, `device_tiles`, `host_tiles` and `fallback_candidates`.
+`backend` is `cuda` when the kernel ran and `cpu` otherwise, with a
+`fallback_reason` when a tile ran on the host.
+
 ## Long-only controls
 
 Every report lists four controls per window, in `controls` (JSON) and the
