@@ -427,6 +427,7 @@ pub fn json() -> String {
 {{\"name\":\"--demean\",\"type\":\"enum\",\"default\":\"cross-section\",\"description\":\"spread: cross-section | none; subtract the per-timestamp mean label first\"}},\
 {{\"name\":\"--block\",\"type\":\"int\",\"default\":\"auto\",\"description\":\"spread: circular block bootstrap length in timestamps; auto is the larger of the label horizon and ceil(T^(1/3))\"}},\
 {{\"name\":\"--draws\",\"type\":\"int\",\"default\":\"2000\",\"description\":\"spread: bootstrap draws\"}},\
+{{\"name\":\"--seed\",\"type\":\"int\",\"default\":\"1\",\"description\":\"spread: bootstrap seed\"}},\
 {{\"name\":\"--level\",\"type\":\"float\",\"default\":\"0.95\",\"description\":\"spread: percentile interval level\"}},\
 {{\"name\":\"--purge-seconds\",\"type\":\"int\",\"default\":\"spec\",\"description\":\"spread: label window length; default entry offset + delay + horizon of the --label target spec, required when no spec entry exists\"}},\
 {{\"name\":\"--target-spec\",\"type\":\"path\",\"default\":\"<data stem>.targets.json\",\"description\":\"rank: spec file with the forward_return entry of --column; the xs_rank entry (return_column --column) is written to <out stem>.targets.json\"}}]}},\n  \
