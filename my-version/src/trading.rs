@@ -1072,6 +1072,16 @@ impl FitnessBook {
         self.hash
     }
 
+    /// Excess return per row (return minus funding minus cash), the gross term.
+    pub fn excess(&self) -> &[f64] {
+        &self.excess
+    }
+
+    /// Seam flags per row: [`TradingRows::FIRST`] and [`TradingRows::LAST`].
+    pub fn flags(&self) -> &[u8] {
+        &self.flags
+    }
+
     /// Reduce one prediction vector. `gross` uses the fixed segment, lane and
     /// warp tree documented on [`FITNESS_SEGMENT_ROWS`]; integer counts are
     /// order-free.

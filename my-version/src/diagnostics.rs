@@ -114,6 +114,10 @@ pub struct Baselines {
     /// #132: wall time spent building the index and answering the k-NN
     /// queries (train plus test folds), in seconds.
     pub knn_seconds: f64,
+    /// #497: requested query sample size per set; `0` = every row.
+    pub knn_sample_size: usize,
+    /// #497: seed the query samples derive from.
+    pub knn_seed: u32,
 }
 
 /// #132: the CLI's default query-row cap for the k-NN baseline. Large panels
@@ -130,15 +134,20 @@ pub const DEFAULT_BASELINE_SAMPLES: usize = 512;
 /// "200 000 rows under a minute" claim is a `d <= 8` claim.
 pub const KNN_KD_MAX_DIM: usize = 8;
 
-/// #69: query sampling is only an unbiased estimate of the row-average loss
-/// for these metrics. The CLI refuses `--baseline-samples > 0` otherwise; the
-/// library falls back to exact queries rather than reporting a different
-/// estimator under the same name.
-pub fn knn_sampling_supported(metric: Metric) -> bool {
-    matches!(
-        metric,
-        Metric::Absolute | Metric::Squared | Metric::LogSquashed
-    )
+/// #497: training-row count up to which the default k-NN baseline answers every
+/// query row exactly. Above it the default is a seeded sample of
+/// [`DEFAULT_BASELINE_SAMPLES`] query rows for every metric.
+pub const KNN_EXACT_MAX_ROWS: usize = 20_000;
+
+/// #497: the query-row sample size for a run. An explicit `--baseline-samples`
+/// value wins (`0` = every row). Without one, the baseline is exact up to
+/// [`KNN_EXACT_MAX_ROWS`] training rows and sampled above it, for every metric.
+pub fn resolve_baseline_samples(requested: Option<usize>, train_rows: usize) -> usize {
+    match requested {
+        Some(n) => n,
+        None if train_rows <= KNN_EXACT_MAX_ROWS => 0,
+        None => DEFAULT_BASELINE_SAMPLES,
+    }
 }
 
 /// Number of neighbours used by the baseline k-NN learner.
@@ -169,10 +178,10 @@ impl Baselines {
     /// most that many deterministic query rows per set (training and each test
     /// fold), drawn from `seed`. The reference set stays exact in both cases.
     ///
-    /// Sampling is only offered for the mean-loss metrics accepted by
-    /// [`knn_sampling_supported`]; for every other metric this falls back to
-    /// exact queries, because a subsample of a median/correlation/AIC is a
-    /// different estimator, not an unbiased estimate of the full-sample value.
+    /// Every metric is sampled the same way. For the mean-loss metrics the sample
+    /// average is an unbiased estimate of the full value and carries a SEM; for
+    /// the other metrics it is a diagnostic estimate without a SEM. Classification
+    /// labels always come from the full query set (#497).
     pub fn fit_sampled(
         train: &Sample,
         test_folds: &[Sample],
@@ -216,11 +225,7 @@ impl Baselines {
         let knn_start = std::time::Instant::now();
         let k = knn_k(train.len());
         let mut index = KnnIndex::new(train);
-        let sample = if knn_sampling_supported(metric) {
-            baseline_samples
-        } else {
-            0
-        };
+        let sample = baseline_samples;
         let train_q = score_knn_queries(
             &mut index,
             train,
@@ -275,6 +280,8 @@ impl Baselines {
             knn_test_query_sem: test_sem,
             knn_capped: sampled,
             knn_seconds,
+            knn_sample_size: baseline_samples,
+            knn_seed: seed,
         };
         (baselines, coef)
     }
@@ -290,13 +297,15 @@ impl Baselines {
             }
         }
         format!(
-            "\"reference_rows\":{},\"train_query_rows\":{},\"train_query_sem\":{},\"test_query_rows\":{},\"test_query_sem\":{},\"capped\":{},\"seconds\":{}",
+            "\"reference_rows\":{},\"train_query_rows\":{},\"train_query_sem\":{},\"test_query_rows\":{},\"test_query_sem\":{},\"capped\":{},\"sample_size\":{},\"sample_seed\":{},\"seconds\":{}",
             self.knn_reference_rows,
             self.knn_train_query_rows,
             sem_json(self.knn_train_query_sem),
             self.knn_test_query_rows,
             sem_json(self.knn_test_query_sem),
             self.knn_capped,
+            self.knn_sample_size,
+            self.knn_seed,
             self.knn_seconds
         )
     }
@@ -333,14 +342,32 @@ fn score_knn_queries(
         sample.min(query.len())
     };
     let idx = sample_indices(query.len(), take, seed);
+    let full_labels = if metrics::ScoreObjective::for_metric(metric).is_some() {
+        metrics::binary_labels(&query.y)
+    } else {
+        Vec::new()
+    };
     let mut pred = Vec::with_capacity(take);
     for &i in &idx {
         pred.push(index.predict(&query.x[i], k));
     }
     let y: Vec<f64> = idx.iter().map(|&i| query.y[i]).collect();
-    let error = metrics::score(&pred, &y, metric);
+    // #497: the class labels of a sampled row come from the whole query set.
+    let objective = metrics::ScoreObjective::for_metric(metric);
+    let labels: Option<Vec<f64>> =
+        objective.map(|_| idx.iter().map(|&i| full_labels[i]).collect());
+    let error = match (objective, &labels) {
+        (Some(obj), Some(l)) if take < query.len() => {
+            let mut acc = 0.0;
+            for (&p, &t) in pred.iter().zip(l) {
+                acc += metrics::classification_row_loss(p, t, obj);
+            }
+            acc / take as f64
+        }
+        _ => metrics::score(&pred, &y, metric),
+    };
     let sem = if take < query.len() {
-        mean_sem(metric, &pred, &y, query.len())
+        mean_sem(metric, &pred, &y, labels.as_deref(), query.len())
     } else {
         f64::NAN
     };
@@ -358,20 +385,29 @@ fn score_knn_queries(
 /// `SE = (s / √q) · √((N − q) / (N − 1))`.
 ///
 /// `NaN` when every row was scored or the metric is not a plain mean.
-fn mean_sem(metric: Metric, pred: &[f64], y: &[f64], population: usize) -> f64 {
+fn mean_sem(
+    metric: Metric,
+    pred: &[f64],
+    y: &[f64],
+    labels: Option<&[f64]>,
+    population: usize,
+) -> f64 {
     let q = pred.len();
     let n = population;
     if q < 2 || q >= n || n < 2 {
         return f64::NAN;
     }
     let mut losses = Vec::with_capacity(q);
-    for (&p, &t) in pred.iter().zip(y) {
+    for (i, (&p, &t)) in pred.iter().zip(y).enumerate() {
         let e = p - t;
         let loss = match metric {
             Metric::Absolute => e.abs(),
             Metric::Squared => e * e,
             Metric::LogSquashed => (1.0 + e * e).ln(),
-            _ => return f64::NAN,
+            _ => match (metrics::ScoreObjective::for_metric(metric), labels) {
+                (Some(obj), Some(l)) => metrics::classification_row_loss(p, l[i], obj),
+                _ => return f64::NAN,
+            },
         };
         losses.push(loss);
     }
@@ -2415,15 +2451,118 @@ mod tests {
         // Losses 1 and 2 sampled from N = 5: s = sqrt(0.5), q = 2.
         let pred = vec![1.0, 2.0];
         let y = vec![0.0, 0.0];
-        let sem = mean_sem(Metric::Absolute, &pred, &y, 5);
+        let sem = mean_sem(Metric::Absolute, &pred, &y, None, 5);
         let expected = (0.5f64).sqrt() / (2.0f64).sqrt() * (3.0f64 / 4.0).sqrt();
         assert!((sem - expected).abs() < 1e-12, "{sem} vs {expected}");
         // No sampling error to report when every row was scored, and the
         // correction only exists for plain mean losses.
-        assert!(mean_sem(Metric::Absolute, &pred, &y, 2).is_nan());
-        assert!(mean_sem(Metric::Median, &pred, &y, 5).is_nan());
+        assert!(mean_sem(Metric::Absolute, &pred, &y, None, 2).is_nan());
+        assert!(mean_sem(Metric::Median, &pred, &y, None, 5).is_nan());
     }
 
+
+    const CLASS_LOSSES: [Metric; 5] = [
+        Metric::LogLoss,
+        Metric::Brier,
+        Metric::Hinge,
+        Metric::HingeOrdinary,
+        Metric::HingeSquared,
+    ];
+
+    /// Two inputs, a noisy linear boundary; `positive_rate` thins the positives.
+    fn class_sample(n: usize, positive_rate: f64, seed: u32) -> Sample {
+        let mut rng = Mt::new(seed);
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for _ in 0..n {
+            let a = rng.usize_below(10_000) as f64 / 5_000.0 - 1.0;
+            let b = rng.usize_below(10_000) as f64 / 5_000.0 - 1.0;
+            let u = rng.usize_below(10_000) as f64 / 10_000.0;
+            let label = if positive_rate < 1.0 {
+                u < positive_rate
+            } else {
+                a + b + 0.3 * (u - 0.5) > 0.0
+            };
+            x.push(vec![a, b]);
+            y.push(if label { 1.0 } else { 0.0 });
+        }
+        Sample::new(x, y)
+    }
+
+    #[test]
+    fn knn_sampling_covers_the_mean_classification_losses() {
+        let train = class_sample(2_000, 2.0, 5);
+        for m in CLASS_LOSSES {
+            let b = Baselines::fit_sampled(&train, &[], m, 100, 1);
+            assert!(b.knn_capped, "{m:?}");
+            assert_eq!(b.knn_train_query_rows, 100, "{m:?}");
+            assert!(b.knn_train_query_sem.is_finite(), "{m:?}");
+        }
+        let auc = Baselines::fit_sampled(&train, &[], Metric::Auc, 100, 1);
+        assert!(auc.knn_capped);
+        assert!(auc.knn_train_query_sem.is_nan());
+    }
+
+    #[test]
+    fn classification_query_path_equals_metrics_score_without_sampling() {
+        let train = class_sample(2_000, 2.0, 6);
+        let mut index = KnnIndex::new(&train);
+        let k = knn_k(train.len());
+        let pred: Vec<f64> = train.x.iter().map(|x| index.predict(x, k)).collect();
+        for m in CLASS_LOSSES {
+            let q = score_knn_queries(&mut index, &train, m, k, 0, 9);
+            let want = metrics::score(&pred, &train.y, m);
+            assert_eq!(q.error.to_bits(), want.to_bits(), "{m:?}");
+            assert_eq!(q.rows, train.len());
+        }
+    }
+
+    #[test]
+    fn single_class_sample_uses_the_labels_of_the_full_query_set() {
+        let train = class_sample(20_000, 0.9995, 7);
+        let negatives = train.y.iter().filter(|&&v| v < 0.5).count();
+        assert!(negatives >= 1, "fixture needs at least one negative");
+        let labels = metrics::binary_labels(&train.y);
+        let mut index = KnnIndex::new(&train);
+        let k = knn_k(train.len());
+        let obj = metrics::ScoreObjective::LogLoss;
+        let mut seed = 0u32;
+        while sample_indices(train.len(), 512, seed).iter().any(|&i| labels[i] == 0.0) {
+            seed += 1;
+        }
+        let idx = sample_indices(train.len(), 512, seed);
+        let pred: Vec<f64> = idx.iter().map(|&i| index.predict(&train.x[i], k)).collect();
+        let want = pred
+            .iter()
+            .map(|&p| metrics::classification_row_loss(p, 1.0, obj))
+            .sum::<f64>()
+            / 512.0;
+        let y: Vec<f64> = idx.iter().map(|&i| train.y[i]).collect();
+        let q = score_knn_queries(&mut index, &train, Metric::LogLoss, k, 512, seed);
+        assert_eq!(q.error.to_bits(), want.to_bits());
+        // The sample-only midpoint rule is degenerate on a single-class sample.
+        let old = metrics::score(&pred, &y, Metric::LogLoss);
+        assert_ne!(old.to_bits(), want.to_bits());
+    }
+
+    #[test]
+    fn sampled_classification_estimate_lies_within_three_sems_of_the_exact_value() {
+        let train = class_sample(20_000, 2.0, 8);
+        let mut index = KnnIndex::new(&train);
+        let k = knn_k(train.len());
+        for m in CLASS_LOSSES {
+            let exact = score_knn_queries(&mut index, &train, m, k, 0, 3);
+            let est = score_knn_queries(&mut index, &train, m, k, 512, 3);
+            assert!(est.sem.is_finite() && est.sem > 0.0, "{m:?}");
+            assert!(
+                (est.error - exact.error).abs() <= 3.0 * est.sem,
+                "{m:?}: exact {} sampled {} sem {}",
+                exact.error,
+                est.error,
+                est.sem
+            );
+        }
+    }
     #[test]
     fn sample_indices_are_distinct_deterministic_and_sorted() {
         let a = sample_indices(10_000, 500, 42);

@@ -122,7 +122,7 @@ fn score_objects_are_named_and_disjoint_from_fit_codes() {
     let mut codes = Vec::new();
     for (m, want) in expected {
         assert_eq!(ScoreObjective::for_metric(m), Some(want), "{}", m.name());
-        assert_eq!(want.metric(), m);
+        assert_eq!(want.metric(), Some(m));
         assert_eq!(want.name(), m.name());
         codes.push(want.code());
     }
@@ -519,7 +519,7 @@ mod device {
             let batch = ev.score_population(&pop, objective, &[0i32]);
             assert!(batch.ms >= 0.0);
             assert!(batch.all_ok(), "{:?}", batch.status);
-            let want = cpu_score(&tree, &s, objective.metric());
+            let want = cpu_score(&tree, &s, objective.metric().unwrap());
             assert!(want.is_finite(), "CPU reference must skip the masked row");
             let got = batch.values[0];
             let err = (got - want).abs() / want.abs().max(1.0);
