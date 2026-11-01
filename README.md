@@ -192,6 +192,7 @@ Every window also lists the long-only controls (cash, buy-and-hold, constant
 long/flat from the training mean, matched-exposure random long seeded by
 `--control-seed`) with exposure, turnover, beta and excess over cash; see
 `src/baselines.rs`.
+`--front run.json` takes the candidates from the Pareto front of a run, carries the run's threshold and per-side cost, defaults `--trials` to the offspring the search scored and refuses a window that tests rows the run trained or selected on (`docs/walkforward.md`).
 Pass `--batch-pnl` to score every candidate on every window in one batch (`src/wf_batch.rs`, kernel `src/cuda/wf_batch.cu`), per window and pooled, with the baseline ladder; finalist values stay exact CPU f64 and batch values are labelled `gpu_proxy`.
 `--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
 associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
@@ -765,6 +766,13 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   The same central guard covers `rcsr run`, `rcsr walkforward`, an explicit
   `rcsr panel build` window and a labelled `rcsr prep`; see
   [`docs/panel.md`](docs/panel.md#the-2026h2-lockbox).
+* The protocol locked test is declared once, with the data
+  (`rcsr panel build --locked-test START,END`; `panel append`, `enrich` and
+  `ablation prepare` copy it). The search, `walkforward`, `ladder` and
+  `ablation score` then refuse any split or window that touches it (exit 3).
+  Only `walkforward --locked-test` and `ladder --locked-test`, both with
+  `--ledger` and `--sealed`, read it, once each; see
+  [`docs/panel.md`](docs/panel.md#the-declared-locked-test).
 * `--train-select` / `--test-select` assign rows by expression (`> 0` is true)
   and override `--split`; `--exclude` drops rows and composes with any mode.
   A row matching both selections goes to training, one matching neither is
@@ -789,7 +797,7 @@ run:
 | `--smooth-centred k` | the old **centred** window; reads future bars, is opt-in, and is reported as look-ahead |
 | `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
 | `--allow-lockbox` | permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only) |
-| `--lockbox START,END` | declared locked test reported in the run.json `lockbox` object (rows, date range, read count) |
+| `--lockbox START,END` | declared locked test (UTC, half-open). Overrides the range declared with the data (`rcsr panel build --locked-test`). Train, validation and test rows inside it are refused (exit 3). The run.json `lockbox` object reports rows, date range, read count, `declared`, `source` (`store` or `flag`), `rows_in_scope` and `evaluated` |
 | `--ledger file` | candidate ledger whose locked reads run.json counts |
 | `--arm name` | ablation arm label; run.json gains an `ablation` object with the arm, the SHA-256 of the ordered variable list, the generation budget and the generations reached |
 | `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`; `long_only` is always true): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
@@ -1080,6 +1088,22 @@ complexity) in text or with `--json`, and a run is reproducible from `--seed`.
 See [`docs/benchmarks.md`](docs/benchmarks.md) for the criterion, the problem
 list and the recorded results.
 
+Two more suites make the bench able to rank a search change. `--suite hard` holds
+20 harder laws (Nguyen, Keijzer, Vladislavleva, Pagie, Korns, Feynman) and
+`--suite signal` holds 3 finance-like low-SNR tasks with Student-t noise,
+distractor columns and autocorrelated inputs. The oracle criterion
+(`oracle_recovered`) demands what the true structure can reach on the training
+rows, `hit_s` and `hit_evals` give the time to the first recovery, and
+`--seeds 1-10` repeats every run. `--ndjson` streams one JSON line per run, and
+`rcsr-bench compare` pairs two result sets by seed and gives Wilson intervals
+and an exact McNemar p-value:
+
+```sh
+cargo run --release --bin rcsr-bench -- --suite hard --noise 0 --seeds 1-3 --cpu --ndjson > base.ndjson
+cargo run --release --bin rcsr-bench -- --suite hard --noise 0 --seeds 1-3 --cpu --patience 20 --ndjson > treat.ndjson
+cargo run --release --bin rcsr-bench -- compare --base base.ndjson --treat treat.ndjson --criterion oracle_recovered
+```
+
 ## Features
 
 - expression trees over a broad primitive set (`+ - * / ^`, `exp ln sqrt abs
@@ -1364,20 +1388,23 @@ my-version/
     metrics.rs    error metrics
     pareto.rs     the error/complexity Pareto front
     data.rs       table loading, split modes, normalisation
-    bench.rs      known-truth benchmark suite: problems, generators, scoring
+    bench.rs      benchmark runner: known-truth problems, generators, scoring, reports
+    bench_suites.rs  the hard and signal suites
+    bench_stats.rs   Wilson, McNemar, front hypervolume, NDJSON reader, compare
     search.rs     island-model GP loop
     gpu.rs        bytecode compiler + FFI for the optional GPU evaluator
     cuda/eval.cu  the CUDA kernel
     main.rs       the `rcsr` CLI
     bin/
       gpu_bench.rs  GPU vs CPU evaluation benchmark (--features cuda)
-      rcsr_bench.rs the `rcsr-bench` known-truth benchmark harness
+      rcsr_bench.rs the `rcsr-bench` benchmark harness and `compare` command
   tests/
     recover.rs    end-to-end recovery tests + unit tests
     split.rs      split-mode tests (temporal, group, panel, folds)
     prep.rs       data-preparation tests (fill, outliers, smoothing, scaling, filters)
     weights.rs    row weights, weighted metrics and weighted least squares
     bench.rs      known-truth benchmark harness tests
+    bench_cli.rs  rcsr-bench NDJSON, multi-seed and compare tests
   examples/
     line.csv, sine.csv
 ```

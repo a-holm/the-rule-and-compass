@@ -6,6 +6,8 @@ pub mod atomic;
 pub mod attach; // #353: opt-in ptrace attach for hang diagnosis
 pub mod backend;
 pub mod bench;
+pub mod bench_stats;
+pub mod bench_suites;
 pub mod checkpoint;
 pub mod column;
 pub mod complexity;
@@ -71,6 +73,7 @@ pub mod qd; // #120: quality-diversity descriptor grid
 pub mod resample; // #92: index-based resampling with a BLB cap
 pub mod risk; // #307: exact risk monoids (Sharpe, Sortino, log-growth, drawdown, beta/alpha)
 pub mod rng;
+pub mod run_json; // #482: reader for the parts of run.json later commands use
 pub mod schema;
 pub mod search;
 pub mod selection; // #111: select on train/validation, never the test lockbox

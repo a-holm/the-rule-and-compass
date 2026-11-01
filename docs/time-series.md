@@ -100,12 +100,21 @@ time axis is global, so cross-symbol overlap on a panel and misaligned
 `purge_seconds` (the smallest stamp distance between retained training rows and
 test rows, also recorded without a spec), `validation_purge_seconds`,
 `purged_rows.test_boundary`, `purged_rows.validation_boundary` and
-`purge_source`. The text header prints the same facts on a `# purge:` line.
+`purge_source`. It also records `train_time` and `validation_time` as `[first, last]` raw time keys (`validation_time` is `null` without a validation slice; both are absent without `--time`) and `search.candidates_evaluated`, the offspring scored over the run. `rcsr walkforward --front` reads them. The text header prints the same facts on a `# purge:` line.
 
 The 2026H2 lockbox check covers the fit rows, the validation slice and the test
 blocks alike: a validation slice that overlaps the lockbox is refused with the
 message shape and exit code of a test block (`validation split: N row(s) ...
 overlap the lockbox`), unless `--allow-lockbox` declares a final test.
+
+The protocol locked test is a second, separate box: declare it with the data
+(`rcsr panel build --locked-test START,END`) and the search, `walkforward`,
+`ladder` and `ablation score` refuse every fit, validation or test row inside
+it (exit 3). `--allow-lockbox` does not open it. Only the sealed
+`--locked-test` path of `walkforward` and `ladder` reads it, once. A pilot
+split such as `--split temporal --validation-frac 0.20` on a panel that ends
+inside the locked range puts its test block there; the refusal tells you to
+`--exclude` the rows.
 
 **What fails.** Without the purge, the last training row and first test row
 share most of their label window. The test error is then a near-copy of the
@@ -461,6 +470,10 @@ say about a new one; a whole-group split exposes it immediately.
 * `tests/split.rs::group_split_never_puts_a_group_on_both_sides`.
 * `tests/dtypes.rs::categorical_expands_to_sorted_one_hot_indicators` (shows what
   the flag actually creates, so its use is deliberate).
+
+### Canonical training order
+
+A per-row P&L book needs each group's rows contiguous and time-ordered. `data::SplitSpec::canonical_train_order` sorts the training rows by (group id, time key, table row) after the centre and scale statistics are computed, so `means` and `stds` do not change. Every train-aligned output (`train`, `keys.train`, `target_scale.train`, `slope_pairs.train`, `trading.train`, `train_indices`) follows the sorted order. A temporal split returns training rows in time order, so a store of any layout needs the flag; a split that keeps table order on a symbol-major store is unchanged by it. `data::TradingColumns::train` builds `TradingSplit.train`; `TradingRows::is_canonical` checks the order and `TradingRows::seam_flags` marks the first and last row of each group. The flag is library-only: no CLI option sets it yet.
 
 ### Per-group reporting
 

@@ -284,6 +284,7 @@ pub enum Event {
     Candidate(Candidate),
     Seal { sealed_sha256: String },
     TestRead { id: String, report_sha256: String, read_count: u64 },
+    BaselineRead { data_sha256: String, report_sha256: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -357,6 +358,10 @@ impl Ledger {
                     id: get("id"),
                     report_sha256: get("report_sha256"),
                     read_count: field_num(&line, "read_count").unwrap_or(0.0) as u64,
+                },
+                "baseline_read" => Event::BaselineRead {
+                    data_sha256: get("data_sha256"),
+                    report_sha256: get("report_sha256"),
                 },
                 other => return Err(format!("unknown ledger event '{}'", other)),
             });
@@ -558,6 +563,37 @@ impl Ledger {
             id, report_sha256, count
         ))?;
         Ok(count)
+    }
+
+    /// Check that a baseline ladder may read the locked test: the sealed list
+    /// was recorded in the ledger and no baseline read exists yet.
+    pub fn authorize_baseline_read(&self, sealed: &std::path::Path) -> Result<(), String> {
+        self.verify_chain()?;
+        let bytes = std::fs::read(sealed).map_err(|e| format!("{}: {}", sealed.display(), e))?;
+        let hash = sha256_hex(&bytes);
+        let events = self.events()?;
+        if !events
+            .iter()
+            .any(|e| matches!(e, Event::Seal { sealed_sha256 } if *sealed_sha256 == hash))
+        {
+            return Err(format!(
+                "{} (sha256 {}) was not sealed in the ledger before this read",
+                sealed.display(),
+                hash
+            ));
+        }
+        if events.iter().any(|e| matches!(e, Event::BaselineRead { .. })) {
+            return Err("the ledger already has a baseline_read; the locked test is read once".to_string());
+        }
+        Ok(())
+    }
+
+    /// Append the `baseline_read` event of a ladder run on the locked test.
+    pub fn record_baseline_read(&self, data_sha256: &str, report_sha256: &str) -> Result<(), String> {
+        self.append(&format!(
+            "\"event\":\"baseline_read\",\"data_sha256\":\"{}\",\"report_sha256\":\"{}\",\"test_read\":true",
+            data_sha256, report_sha256
+        ))
     }
 }
 

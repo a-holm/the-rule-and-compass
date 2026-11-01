@@ -227,6 +227,154 @@ impl Guard {
     }
 }
 
+/// A locked test range and where it was declared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Declared {
+    pub lockbox: Lockbox,
+    /// `store` (read from the data's manifest, schema or sidecar) or `flag`.
+    pub source: &'static str,
+}
+
+impl Declared {
+    pub fn origin(&self) -> &'static str {
+        if self.source == "store" {
+            "store manifest"
+        } else {
+            "--lockbox"
+        }
+    }
+
+    /// Refuse a row set with any timestamp in the declared range. The error
+    /// names the first offending row, the split side and the fix.
+    pub fn check_times(&self, side: &str, time_name: &str, times: &[i64]) -> Result<Overlap, String> {
+        let overlap = self.lockbox.overlap(times.iter().copied());
+        if overlap.overlaps() {
+            return Err(format!(
+                "{} has {} row(s) in the declared locked test {}..{} ({}; first row {}). \
+                 Exclude them: --exclude '{} >= {}', or read the locked test only with \
+                 rcsr walkforward --locked-test or rcsr ladder --locked-test",
+                side,
+                group_digits(overlap.rows),
+                date(self.lockbox.start),
+                date(self.lockbox.end),
+                self.origin(),
+                date(overlap.first_ts),
+                time_name,
+                self.lockbox.start
+            ));
+        }
+        Ok(overlap)
+    }
+
+    /// The `lockbox` object fields of a report: declared range, source, rows
+    /// in scope and whether the range was read.
+    pub fn report_fields(&self, rows_in_scope: usize, evaluated: bool, checked: bool) -> String {
+        format!(
+            "\"declared\":{{\"start\":{},\"end\":{},\"start_date\":{},\"end_date\":{}}},\
+             \"source\":{},\"rows_in_scope\":{},\"evaluated\":{},\"checked\":{}",
+            self.lockbox.start,
+            self.lockbox.end,
+            jstr(&date(self.lockbox.start)),
+            jstr(&date(self.lockbox.end)),
+            jstr(self.source),
+            rows_in_scope,
+            evaluated,
+            checked
+        )
+    }
+
+    /// Append a `lockbox` object to a JSON report object.
+    pub fn splice_report(&self, json: &str, rows_in_scope: usize, evaluated: bool, checked: bool) -> String {
+        let body = json.trim_end();
+        let body = body.strip_suffix('}').unwrap_or(body);
+        format!(
+            "{},\"lockbox\":{{{}}}}}",
+            body,
+            self.report_fields(rows_in_scope, evaluated, checked)
+        )
+    }
+}
+
+fn group_digits(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+impl Lockbox {
+    /// The `locked_test` object stored with a panel, CSV or enrich output.
+    pub fn declaration_json(&self, source: &str) -> String {
+        format!(
+            "{{\"start\":{},\"end\":{},\"start_date\":{},\"end_date\":{},\"source\":{}}}",
+            self.start,
+            self.end,
+            jstr(&date(self.start)),
+            jstr(&date(self.end)),
+            jstr(source)
+        )
+    }
+
+    /// Read a `"locked_test":{...}` object from sidecar or manifest text.
+    pub fn from_declaration(text: &str) -> Option<Lockbox> {
+        let obj = crate::manifest::object(text, "locked_test")?;
+        let int = |key: &str| -> Option<i64> {
+            let needle = format!("\"{}\":", key);
+            let rest = &obj[obj.find(&needle)? + needle.len()..];
+            let end = rest
+                .char_indices()
+                .find(|(i, c)| !(c.is_ascii_digit() || (*i == 0 && *c == '-')))
+                .map(|(i, _)| i)
+                .unwrap_or(rest.len());
+            rest[..end].parse().ok()
+        };
+        let (start, end) = (int("start")?, int("end")?);
+        (end > start).then_some(Lockbox { start, end })
+    }
+}
+
+/// Sidecar that carries a declaration for a CSV (or any file without a
+/// manifest of its own).
+pub fn sidecar_path(data_path: &str) -> String {
+    format!("{}.lockbox.json", data_path)
+}
+
+/// The locked test declared with a store or CSV: the `.lockbox.json` sidecar,
+/// then the schema, the manifest and the enrich sidecar.
+pub fn declared_for(data_path: &str) -> Option<Lockbox> {
+    ["lockbox.json", "schema.json", "manifest.json", "enrich.json"]
+        .iter()
+        .find_map(|ext| {
+            let text = std::fs::read_to_string(format!("{}.{}", data_path, ext)).ok()?;
+            Lockbox::from_declaration(&text)
+        })
+}
+
+/// Resolve the locked test of a run: an explicit `--lockbox` wins over the
+/// declaration stored with the data.
+pub fn resolve_declared(flag: Option<&str>, data_path: &str) -> Result<Option<Declared>, String> {
+    match flag {
+        Some(s) => Ok(Some(Declared {
+            lockbox: Lockbox::parse(s)?,
+            source: "flag",
+        })),
+        None if data_path.is_empty() || data_path == "-" => Ok(None),
+        None => Ok(declared_for(data_path).map(|lockbox| Declared { lockbox, source: "store" })),
+    }
+}
+
+/// Write the CSV sidecar for a declaration.
+pub fn write_sidecar(data_path: &str, lockbox: &Lockbox, source: &str) -> Result<(), String> {
+    let p = sidecar_path(data_path);
+    std::fs::write(&p, format!("{{\"locked_test\":{}}}\n", lockbox.declaration_json(source)))
+        .map_err(|e| format!("{}: {}", p, e))
+}
+
 /// Parse epoch seconds or `YYYY-MM-DD` / `YYYY-MM-DDTHH:MM:SS` (UTC).
 pub fn parse_time(s: &str) -> Option<i64> {
     if let Ok(v) = s.parse::<i64>() {

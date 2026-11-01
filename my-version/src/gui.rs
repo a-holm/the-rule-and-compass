@@ -1331,9 +1331,11 @@ impl RunPlan {
             exclude,
             time: time_spec,
             allow_lockbox: raw.allow_lockbox,
+            declared_lockbox: None,
             purge_seconds: None,
             scale_column: None,
             trading: None,
+            canonical_train_order: false,
         };
         let cv_dtypes = dtypes.clone();
         let prep = data::PrepSpec {

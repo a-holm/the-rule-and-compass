@@ -22,6 +22,7 @@
 //! | `generations <n>` | generations completed |
 //! | `stopped_early <bool>` | the saved run had already stopped |
 //! | `best_prev <f64>` / `no_improve <n>` | patience bookkeeping |
+//! | `candidates_evaluated <n>` | #482: offspring scored so far |
 //! | `data train|test <rows> <hash>` | data fingerprint |
 //! | `archive <members> <cap>` | archive header |
 //! | `sol <complexity> <cost> <error> <tree>` | one archive member |
@@ -202,6 +203,9 @@ pub struct Checkpoint {
     /// #345: sha256 of the declared target spec the run used, or `None` for a
     /// run without one. A resume must present the same spec.
     pub target_spec: Option<String>,
+    /// #482: offspring scored up to this checkpoint, so a resumed run keeps
+    /// counting. `0` for a file written before the count existed.
+    pub candidates_evaluated: u64,
 }
 
 /// The operators in [`Op::index`] order. The array index is exactly
@@ -551,6 +555,7 @@ impl Checkpoint {
         if let Some(sha) = target_spec {
             writeln!(out, "target_spec {}", sha).unwrap();
         }
+        writeln!(out, "candidates_evaluated {}", self.candidates_evaluated).unwrap();
         writeln!(out, "archive_hash {:016x}", self.archive.hash()).unwrap();
         writeln!(out, "archive {} {}", self.archive.items.len(), self.archive.cap).unwrap();
         for sol in &self.archive.items {
@@ -654,6 +659,7 @@ impl Checkpoint {
         let mut stored_archive_hash: Option<u64> = None;
         let mut build_fields: BTreeMap<String, String> = BTreeMap::new();
         let mut target_spec: Option<String> = None;
+        let mut candidates_evaluated: Option<u64> = None;
         let mut final_header: Option<(usize, usize, u64)> = None;
         let mut final_sols: Vec<Sol> = Vec::new();
 
@@ -790,6 +796,14 @@ impl Checkpoint {
                     {
                         return Err(format!("line {}: duplicate build field '{}'", lineno, key));
                     }
+                }
+                "candidates_evaluated" => {
+                    set_once(
+                        &mut candidates_evaluated,
+                        parse_num::<u64>(&parts, 1, lineno, "candidates_evaluated")?,
+                        "candidates_evaluated",
+                        lineno,
+                    )?;
                 }
                 "target_spec" => {
                     let v = parts
@@ -1065,6 +1079,7 @@ impl Checkpoint {
         };
         Ok(Checkpoint {
             target_spec,
+            candidates_evaluated: candidates_evaluated.unwrap_or(0),
             config,
             backend,
             config_hash: computed_hash,
@@ -1639,6 +1654,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         qd_control,
         progress: None,
         dev_log: None, // #211: a reporting hook, never part of the saved state
+        front_observer: None, // #462
         // #27/#26: evaluator choices are not saved search state; a resumed run
         // picks the backend afresh from the current build/flags.
         simd: true,

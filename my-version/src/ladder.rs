@@ -26,6 +26,7 @@
 use crate::baselines;
 use crate::data::{self, Table};
 use crate::devlog::num;
+use crate::gpu_stats::{RunLedger, Stage};
 use crate::inference::{self, Bh, Dsr, Pbo, Spa};
 use crate::protocol::{self, WindowRow};
 use crate::risk::{risk_stats, BetaAlpha, DEFAULT_SORTINO_MAR};
@@ -211,10 +212,36 @@ pub struct Fold {
 /// Row ranges per fold. Rows need a finite time and return. The fit range ends
 /// `purge_seconds` before the validation start so a fit label never reads into
 /// the validation slice.
-pub fn make_folds(p: &Panel, windows: &[WindowRow], purge_seconds: f64) -> Result<Vec<Fold>, String> {
+/// A fold whose fit, validation or test range touches `locked` (a declared
+/// locked test, half-open seconds) is refused.
+pub fn make_folds(
+    p: &Panel,
+    windows: &[WindowRow],
+    purge_seconds: f64,
+    locked: Option<(f64, f64)>,
+) -> Result<Vec<Fold>, String> {
     let mut folds = Vec::with_capacity(windows.len());
     for w in windows {
         let win = &w.window;
+        if let Some((ls, le)) = locked {
+            let side = if win.train_start < le && win.train_end > ls {
+                Some("fit or validation")
+            } else if win.test_start < le && win.test_end > ls {
+                Some("test")
+            } else {
+                None
+            };
+            if let Some(side) = side {
+                return Err(format!(
+                    "fold {}: the {} range touches the declared locked test {}..{}; \
+                     read it only with --locked-test --ledger --sealed",
+                    win.label,
+                    side,
+                    protocol::iso(ls),
+                    protocol::iso(le)
+                ));
+            }
+        }
         let fit_end = w.validation_start - purge_seconds;
         let mut f = Fold {
             label: win.label.clone(),
@@ -974,6 +1001,8 @@ pub struct Report {
     pub sr_wall_seconds: Option<f64>,
     pub gbm_trees: usize,
     pub notes: Vec<String>,
+    /// #284: run-scoped phase ledger (`io`, `pnl`, `host_other`); empty until a run fills it.
+    pub ledger: RunLedger,
 }
 
 fn rank_vec(v: &[f64]) -> Vec<f64> {
@@ -1219,6 +1248,15 @@ fn return_space_mse(p: &Panel, pool: &Pool, opts: &Options, score: &[f64]) -> f6
 
 /// Run the whole ladder.
 pub fn run_ladder(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report, String> {
+    let started = Instant::now();
+    let mut report = run_ladder_rungs(p, folds, opts)?;
+    let wall = started.elapsed().as_secs_f64();
+    report.ledger.record_stage(Stage::Pnl, wall);
+    report.ledger.set_wall(wall);
+    Ok(report)
+}
+
+fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report, String> {
     if opts.quantiles.is_empty() {
         return Err("--quantiles needs at least one value".to_string());
     }
@@ -1703,6 +1741,7 @@ fn finish_report(
         sr_wall_seconds: opts.sr_wall_seconds,
         gbm_trees: opts.gbm_trees,
         notes: std::mem::take(notes),
+        ledger: RunLedger::new(),
     })
 }
 
@@ -1807,7 +1846,7 @@ impl Report {
             "{{\"schema\":{},\"folds\":{},\"periods\":{},\"rows_scored\":{},\"periods_per_year\":{},\"block_len\":{},\
 \"cost_bps\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
 \"sr_candidate_evaluations\":{},\"sr_wall_seconds\":{},\"gbm_beats_sr\":{}}},\"multiple_testing\":{{\"draws\":{},\"seed\":{},\
-\"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"rungs\":[{}]}}",
+\"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"rungs\":[{}],\"ledger\":{}}}",
             jstr(SCHEMA),
             jarr_str(&self.folds),
             self.periods,
@@ -1829,7 +1868,15 @@ impl Report {
             dsr,
             pbo,
             jarr_str(&self.notes),
-            rows.join(",")
+            rows.join(","),
+            if self.ledger.wall_s() > 0.0 {
+                self.ledger.phase_json(
+                    "ladder",
+                    &[Stage::Vary, Stage::Eval, Stage::Fit, Stage::Select, Stage::Archive, Stage::Features],
+                )
+            } else {
+                "null".to_string()
+            }
         )
     }
 
@@ -2046,7 +2093,14 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --fdr-q <q>               BH-FDR level (default 0.10)\n\
   --pbo-blocks <even n>     CSCV blocks (default 8)\n\
   --seed <n>                seed of every draw (default 0)\n\
-  --out <file>              write the JSON report\n\
+  --lockbox <START,END>     locked test to guard (default: the declaration stored with --data);\n\
+                            a fold touching it is refused (exit 3)\n\
+  --locked-test             read the locked test: needs --scheme locked, --ledger and --sealed;\n\
+                            appends a baseline_read to the ledger, a second read is refused\n\
+  --ledger <file>           candidate ledger (with --locked-test)\n\
+  --sealed <file>           sealed candidate list recorded in the ledger (with --locked-test)\n\
+  --out <file>              write the JSON report (ends with a ledger object: io and\n\
+                            pnl seconds on the run wall)\n\
   --markdown <file|->       write the Markdown table\n\
   --json                    print the JSON report\n"
 }
@@ -2068,6 +2122,7 @@ pub fn run(args: &[String]) -> ! {
 }
 
 fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
+    let t_run = Instant::now();
     let usage_err = |m: String| (2, m);
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{}", usage());
@@ -2082,6 +2137,10 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let mut features: Vec<String> = Vec::new();
     let mut windows = None;
     let mut scheme = "expanding".to_string();
+    let mut lockbox_arg: Option<String> = None;
+    let mut locked_test = false;
+    let mut ledger_path: Option<String> = None;
+    let mut sealed_path: Option<String> = None;
     let mut spec_path: Option<String> = None;
     let mut out = None;
     let mut markdown = None;
@@ -2122,6 +2181,10 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             "--fdr-q" => opts.fdr_q = val()?.parse().map_err(|_| num_err(a))?,
             "--pbo-blocks" => opts.pbo_blocks = val()?.parse().map_err(|_| num_err(a))?,
             "--seed" => opts.seed = val()?.parse().map_err(|_| num_err(a))?,
+            "--lockbox" => lockbox_arg = Some(val()?),
+            "--locked-test" => locked_test = true,
+            "--ledger" => ledger_path = Some(val()?),
+            "--sealed" => sealed_path = Some(val()?),
             "--out" => out = Some(val()?),
             "--markdown" => markdown = Some(val()?),
             "--json" => print_json = true,
@@ -2141,6 +2204,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         return Err(usage_err("--pbo-blocks must be an even number of at least 2".to_string()));
     }
     let input_err = |m: String| (3, m);
+    let t_io = Instant::now();
     if let Some(path) = &spec_path {
         let text = std::fs::read_to_string(path).map_err(|e| input_err(format!("{}: {}", path, e)))?;
         let specs = crate::target::parse_file(&text).map_err(|e| input_err(format!("{}: {}", path, e)))?;
@@ -2151,6 +2215,40 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     }
     let text = std::fs::read_to_string(&windows).map_err(|e| input_err(format!("{}: {}", windows, e)))?;
     let rows = protocol::parse_windows_csv(&text, Some(&scheme)).map_err(input_err)?;
+    let declared = crate::lockbox::resolve_declared(lockbox_arg.as_deref(), &data_path).map_err(|e| usage_err(format!("--lockbox: {}", e)))?;
+    if !locked_test && (ledger_path.is_some() || sealed_path.is_some()) {
+        return Err(usage_err("--ledger and --sealed apply to --locked-test only".to_string()));
+    }
+    let mut read: Option<(protocol::Ledger, String)> = None;
+    if locked_test {
+        let (Some(ledger), Some(sealed)) = (&ledger_path, &sealed_path) else {
+            return Err(usage_err("--locked-test needs --ledger and --sealed".to_string()));
+        };
+        if scheme != "locked" {
+            return Err(usage_err("--locked-test reads the locked scheme only: use --scheme locked".to_string()));
+        }
+        let Some(d) = &declared else {
+            return Err(usage_err("--locked-test needs a declared locked test: --lockbox or a store declaration".to_string()));
+        };
+        let (ls, le) = (d.lockbox.start as f64, d.lockbox.end as f64);
+        for r in &rows {
+            let w = &r.window;
+            if w.train_start < le && w.train_end > ls {
+                return Err(input_err(format!("window '{}' trains on the locked test", w.label)));
+            }
+            if !(w.test_start >= ls && w.test_end <= le) {
+                return Err(input_err(format!("window '{}' tests outside the locked test", w.label)));
+            }
+        }
+        let l = protocol::Ledger::new(ledger);
+        l.authorize_baseline_read(std::path::Path::new(sealed)).map_err(input_err)?;
+        read = Some((l, crate::manifest::sha256_file(&data_path).map_err(input_err)?));
+    }
+    let guard = if locked_test {
+        None
+    } else {
+        declared.as_ref().map(|d| (d.lockbox.start as f64, d.lockbox.end as f64))
+    };
     let inp = Input {
         data: data_path,
         target,
@@ -2160,9 +2258,25 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         features,
     };
     let panel = load_panel(&inp, &opts).map_err(input_err)?;
-    let folds = make_folds(&panel, &rows, opts.purge_seconds).map_err(input_err)?;
-    let report = run_ladder(&panel, &folds, &opts).map_err(input_err)?;
-    let json = report.json();
+    let folds = make_folds(&panel, &rows, opts.purge_seconds, guard).map_err(input_err)?;
+    let io_s = t_io.elapsed().as_secs_f64();
+    let mut report = run_ladder(&panel, &folds, &opts).map_err(input_err)?;
+    let mut ledger = RunLedger::new();
+    ledger.record_stage(Stage::Io, io_s);
+    ledger.record_stage(Stage::Pnl, report.ledger.stage_s(Stage::Pnl));
+    let wall = t_run.elapsed().as_secs_f64();
+    ledger.record_stage(Stage::HostOther, wall - ledger.stage_sum_s());
+    ledger.set_wall(wall);
+    report.ledger = ledger;
+    let mut json = report.json();
+    if let Some(d) = &declared {
+        let in_scope = if locked_test { folds.iter().map(|f| f.test.len()).sum() } else { 0 };
+        json = d.splice_report(&json, in_scope, locked_test, true);
+    }
+    if let Some((ledger, data_sha)) = &read {
+        let report_sha = crate::manifest::sha256_hex(json.as_bytes());
+        ledger.record_baseline_read(data_sha, &report_sha).map_err(input_err)?;
+    }
     if let Some(p) = &out {
         std::fs::write(p, &json).map_err(|e| input_err(format!("{}: {}", p, e)))?;
     }

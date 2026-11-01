@@ -3134,3 +3134,23 @@ fn long_label_dry_run_writes_no_sidecar_and_bad_specs_fail() {
     o.allow_overlap = true;
     assert!(enrich::build(&o).is_ok());
 }
+
+#[path = "common/ledger.rs"]
+mod ledger;
+
+#[test]
+fn json_carries_a_phase_ledger_with_features_and_io() {
+    let dir = tmp_dir("ledger");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let mut rows = bars("AAA", 120, 0, 3600);
+    rows.extend(bars("BBB", 120, 0, 3600));
+    write_store(&src, &rows, 32);
+    let mut o = opts(&src, &out, "r1,r5,ma20,vol20");
+    o.gpu = GpuMode::Off;
+    let r = enrich::build(&o).unwrap();
+    let l = ledger::check(&r.json(), "enrich", &["features", "io"]);
+    assert_eq!(l.busy, 0.0, "a CPU run has no device intervals");
+    assert!(l.wall <= r.total_seconds + 1e-6, "ledger wall {} vs total {}", l.wall, r.total_seconds);
+    let _ = std::fs::remove_dir_all(&dir);
+}

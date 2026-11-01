@@ -2045,6 +2045,11 @@ BUILD / AUDIT:
   --start <epoch|date>    build window start (default: panel first bar)
   --end <epoch|date>      build window end (default: panel last bar)
   --allow-lockbox         permit a window overlapping 2026H2 (declared final test only)
+  --locked-test <START,END>
+                          build (hourly v2): declare the protocol locked test (UTC,
+                          half-open) in <out>.manifest.json and <out>.schema.json;
+                          append and enrich copy it, and the search, walkforward,
+                          ladder and ablation score refuse it
   --resume <dir>          resumable build: one atomic binary part per symbol,
                           keyed by the store SHA-256, the membership decisions
                           and the settings; a fully warm re-run reads the parts

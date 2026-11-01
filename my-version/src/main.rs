@@ -232,8 +232,12 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              a look-ahead on time series; reported as centred
   --allow-interpolate        permit --fill interpolate on time-ordered data
   --allow-lockbox            permit train/validation/test rows in 2026H2 (declared final test only)
-  --lockbox <START,END>      declared locked test for the run.json `lockbox` object (UTC,
-                             half-open; default 2026-07-01,2027-01-01)
+  --lockbox <START,END>      declared locked test (UTC, half-open). Overrides the range
+                             declared with the data (<data>.manifest.json, .schema.json,
+                             .enrich.json or <csv>.lockbox.json). Train, validation and
+                             test rows inside it are refused (exit 3); run.json `lockbox`
+                             reports rows, date range, read count, declared, source,
+                             rows_in_scope, evaluated
   --ledger <file>            candidate ledger whose locked reads run.json counts
   --arm <name>              ablation arm label; run.json gains an `ablation` object with the arm,
                              the SHA-256 of the ordered variable list, the generation budget and
@@ -946,6 +950,29 @@ fn jnum(v: f64) -> String {
         format!("{}", v)
     } else {
         "null".to_string()
+    }
+}
+
+/// #482: `split.train_time` and `split.validation_time` as `[first, last]` raw
+/// time keys, with a leading comma. Empty without a time column.
+fn split_time_json(keys: Option<&data::RowKeys>) -> String {
+    let range = |v: &[f64]| -> Option<(f64, f64)> {
+        let finite = || v.iter().copied().filter(|t| t.is_finite());
+        let lo = finite().fold(f64::INFINITY, f64::min);
+        let hi = finite().fold(f64::NEG_INFINITY, f64::max);
+        (lo <= hi).then_some((lo, hi))
+    };
+    let show = |r: Option<(f64, f64)>| match r {
+        Some((a, b)) => format!("[{},{}]", jnum(a), jnum(b)),
+        None => "null".to_string(),
+    };
+    match keys {
+        Some(k) => format!(
+            ",\"train_time\":{},\"validation_time\":{}",
+            show(range(&k.train)),
+            show(k.validation.as_deref().and_then(range))
+        ),
+        None => String::new(),
     }
 }
 
@@ -4406,6 +4433,7 @@ fn main() {
             return_column: ts.return_column.clone(),
             log_returns: ts.return_units == "log",
             funding_column: trade_funding.clone(),
+            train: false,
         });
         let tspec = rcsr::trading::TradingSpec {
             cost_bps: cost,
@@ -4424,6 +4452,10 @@ fn main() {
         trading_spec = Some(tspec);
     }
 
+    let declared_lockbox = rcsr::lockbox::resolve_declared(lockbox_arg.as_deref(), &data_path).unwrap_or_else(|e| {
+        eprintln!("error: --lockbox: {}", e);
+        std::process::exit(EXIT_USAGE);
+    });
     let spec = data::SplitSpec {
         mode,
         time_col,
@@ -4441,8 +4473,10 @@ fn main() {
             tz,
         },
         allow_lockbox,
+        declared_lockbox,
         purge_seconds: target_resolved.as_ref().map(|r| r.spec.required_purge_seconds()),
         trading: trading_cols.clone(),
+        canonical_train_order: false,
         scale_column: target_resolved
             .as_ref()
             .and_then(|r| r.spec.scale_column())
@@ -5923,6 +5957,12 @@ fn main() {
                     eprintln!("error: {}", e);
                     std::process::exit(EXIT_INPUT);
                 }
+                if let Some(d) = &spec.declared_lockbox {
+                    if let Err(e) = d.check_times("cross-validation rows", name, &times) {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_INPUT);
+                    }
+                }
             }
         }
     }
@@ -6491,7 +6531,7 @@ fn main() {
                 String::new()
             };
             let split_json = format!(
-                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"lag_menu\":[{}],\"nvars_before\":{},\"nvars_after\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]{}}}",
+                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"lag_menu\":[{}],\"nvars_before\":{},\"nvars_after\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]{}{}}}",
                 jstr(prepared.report.mode),
                 prepared.report.rows_total,
                 prepared.train.len(),
@@ -6517,15 +6557,13 @@ fn main() {
                 lag_report.series,
                 lag_report.history_rows,
                 notes.iter().map(|n| jstr(n)).collect::<Vec<_>>().join(","),
-                target::split_purge_json(&prepared.report)
+                target::split_purge_json(&prepared.report),
+                split_time_json(prepared.keys.as_ref())
             );
             // #264: lockbox facts of the loaded table (rows, date range, read count).
             let lockbox_json = {
-                let lockbox = match lockbox_arg.as_deref() {
-                    Some(s) => rcsr::lockbox::Lockbox::parse(s).unwrap_or_else(|e| {
-                        eprintln!("error: --lockbox: {}", e);
-                        std::process::exit(EXIT_USAGE);
-                    }),
+                let lockbox = match &spec.declared_lockbox {
+                    Some(d) => d.lockbox,
                     None => rcsr::lockbox::Lockbox::crypto_2026h2(),
                 };
                 let times: Vec<i64> = match time_name.as_deref().and_then(|n| table.index_of(n).ok()) {
@@ -6543,9 +6581,15 @@ fn main() {
                     .as_ref()
                     .map(|p| rcsr::protocol::Ledger::new(p).read_count().unwrap_or(0))
                     .unwrap_or(0);
-                let mut j = lockbox.json(&overlap, allow_lockbox, false, allow_lockbox && overlap.rows > 0);
+                let evaluated = spec.declared_lockbox.is_none() && allow_lockbox && overlap.rows > 0;
+                let mut j = lockbox.json(&overlap, allow_lockbox, false, evaluated);
                 j.pop();
-                j.push_str(&format!(",\"read_count\":{}}}", reads));
+                j.push_str(&format!(",\"read_count\":{}", reads));
+                if let Some(d) = &spec.declared_lockbox {
+                    j.push(',');
+                    j.push_str(&d.report_fields(0, false, prepared.report.lockbox_checked));
+                }
+                j.push('}');
                 j
             };
             let seeds_json: Vec<String> = seed_rows
@@ -6849,7 +6893,7 @@ fn main() {
                 None => backend_json,
             };
             let result_json = format!(
-                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"lockbox\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"lockbox\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"search\":{{\"candidates_evaluated\":{}}},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
                 jstr(VERSION),
@@ -6870,6 +6914,7 @@ fn main() {
                 target_spec_json,
                 prepared.prep.json(),
                 outcome.generations,
+                outcome.candidates_evaluated,
                 outcome.converged_early,
                 jstr(outcome.stop_reason),
                 // #18: the four convergence numbers.
@@ -9239,6 +9284,20 @@ OPTIONS:
   --target <col>             forward-return column used for P&L
   --expr <formula>           score expression, variables resolved by column name;
                              repeat to select among candidates on the validation slice
+  --front <run.json>         candidates from the Pareto front of a run (one per
+                             member, labelled front_rank_<k>), instead of --expr.
+                             --vars, --target (the run's return column) and
+                             --trials (search.candidates_evaluated) default to
+                             the run. The run's position rule is carried: the
+                             objective threshold as a fixed threshold and its
+                             per-side cost; --threshold-fixed,
+                             --threshold-quantile and --cost-bps override.
+                             A window whose test_start is below the last train
+                             or validation time of the run plus its required
+                             purge exits 2
+  --allow-in-sample-windows  with --front: report such a window as
+                             in_sample:true instead of refusing it
+                             (diagnostics only)
   --select-band              #308: select among repeated --expr candidates with
                              the P&L band instead of validation MSE. The screen is
                              the fused long-only reduction on validation rows; the
@@ -9337,9 +9396,12 @@ OPTIONS:
   --ledger <file>            append-only JSONL candidate ledger. A development
                              run appends a candidate (test_read:false) and
                              refuses windows that touch the declared lockbox
-  --lockbox <START,END>      declared locked test, UTC half-open (default
-                             2025-07-01,2026-07-01); active with --ledger or
-                             --locked-test
+  --lockbox <START,END>      declared locked test, UTC half-open. Overrides the
+                             range declared with --data (store manifest, schema
+                             or sidecar). Default without a declaration:
+                             2025-07-01,2026-07-01, active with --ledger or
+                             --locked-test. A window touching it is refused
+                             (exit 3) unless --locked-test reads it
   --locked-test              read the locked test once for a sealed candidate.
                              Needs --ledger and --sealed. A second read, an
                              unsealed candidate or a code/data hash that differs
@@ -9349,6 +9411,9 @@ OPTIONS:
                              compare its report hash; records nothing
   --expect-report-sha256 <h> exit 1 unless the report JSON hashes to h
   --json                     print the full JSON report to stdout
+                             (it ends with a ledger object: the phase ledger of the
+                             command, io and pnl seconds on the run wall, outside the
+                             report hash)
   --out <file>               write the JSON report to a file
   --markdown <file|->        write the Markdown report ('-' = stdout)
   --allow-lockbox            permit a test window overlapping 2026H2
@@ -9407,6 +9472,9 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut verify_read = false;
     let mut lockbox_arg: Option<String> = None;
     let mut expect_hash: Option<String> = None;
+    let mut front_path: Option<String> = None;
+    let mut allow_in_sample = false;
+    let mut cost_set = false;
 
     let need = |args: &[String], i: usize, flag: &str| -> String {
         match args.get(i) {
@@ -9478,8 +9546,14 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--cost-bps" => {
                 cost_bps = number(need(args, i + 1, "--cost-bps"), "--cost-bps");
+                cost_set = true;
                 i += 1;
             }
+            "--front" => {
+                front_path = Some(need(args, i + 1, "--front"));
+                i += 1;
+            }
+            "--allow-in-sample-windows" => allow_in_sample = true,
             "--threshold-quantile" => {
                 quantile = number(
                     need(args, i + 1, "--threshold-quantile"),
@@ -9668,12 +9742,73 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: walkforward needs --data\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
     });
+    let mut front_run: Option<rcsr::run_json::RunFile> = None;
+    if let Some(path) = &front_path {
+        if !expressions.is_empty() {
+            eprintln!(
+                "error: --front and --expr are alternatives; the candidates come from one source\n\n{}",
+                walkforward_usage()
+            );
+            std::process::exit(EXIT_USAGE);
+        }
+        let run = rcsr::run_json::RunFile::load(path).unwrap_or_else(|e| {
+            eprintln!("error: --front {}", e);
+            std::process::exit(EXIT_INPUT);
+        });
+        if run.front.is_empty() {
+            eprintln!("error: --front {}: the Pareto front is empty", path);
+            std::process::exit(EXIT_INPUT);
+        }
+        if run.train_time.is_none() {
+            eprintln!(
+                "error: --front {}: the run has no split.train_time (no time column); \
+                 the walk-forward needs time",
+                path
+            );
+            std::process::exit(EXIT_INPUT);
+        }
+        expressions = run.front.iter().map(|m| m.expression.clone()).collect();
+        popts.front = Some(walkforward::FrontSource {
+            run: path.clone(),
+            run_sha256: run.sha256.clone(),
+            labels: run.front.iter().map(|m| format!("front_rank_{}", m.rank)).collect(),
+        });
+        if vars_src.is_none() && !run.variables.is_empty() {
+            vars_src = Some(run.variables.join(","));
+        }
+        if target.is_none() {
+            target = run.return_column.clone();
+        }
+        if popts.trials.is_none() {
+            popts.trials = Some(match run.candidates_evaluated {
+                Some(n) if n > 0 => n as usize,
+                _ => {
+                    eprintln!(
+                        "error: --front {}: the run has no search.candidates_evaluated; pass --trials",
+                        path
+                    );
+                    std::process::exit(EXIT_USAGE);
+                }
+            });
+        }
+        if threshold_fixed.is_none() && !quantile_set {
+            if let Some(theta) = run.threshold {
+                threshold_fixed = Some(theta);
+            }
+        }
+        if !cost_set {
+            if let Some(bps) = run.per_side_bps {
+                cost_bps = bps;
+            }
+        }
+        front_run = Some(run);
+    }
     let target = target.unwrap_or_else(|| {
         eprintln!("error: walkforward needs --target\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
     });
     if expressions.is_empty() {
-        eprintln!("error: walkforward needs --expr\n\n{}", walkforward_usage());
+        eprintln!("error: walkforward needs --expr or --front\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
     }
     if threshold_fixed.is_some() && quantile_set {
@@ -9768,6 +9903,22 @@ fn run_walkforward(args: &[String]) -> ! {
         );
         std::process::exit(EXIT_USAGE);
     }
+    if let Some((earliest, seen, purge)) = front_run.as_ref().and_then(|r| r.earliest_test_start()) {
+        for w in &windows {
+            if w.test_start < earliest {
+                if allow_in_sample {
+                    popts.in_sample_windows.push(w.label.clone());
+                    continue;
+                }
+                eprintln!(
+                    "error: window '{}' tests rows the run trained or selected on \
+                     (test_start {} < last seen {} + purge {})",
+                    w.label, w.test_start, seen, purge
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    }
     let vars: Vec<String> = vars_src
         .map(|s| {
             s.split(',')
@@ -9801,19 +9952,14 @@ fn run_walkforward(args: &[String]) -> ! {
         min_hold,
         gpu,
     };
-    let declared_lock: Option<(f64, f64)> = if ledger_path.is_some() || locked_test || lockbox_arg.is_some() {
-        match &lockbox_arg {
-            Some(s) => match rcsr::lockbox::Lockbox::parse(s) {
-                Ok(l) => Some((l.start as f64, l.end as f64)),
-                Err(e) => {
-                    eprintln!("error: --lockbox: {}", e);
-                    std::process::exit(EXIT_USAGE);
-                }
-            },
-            None => Some(rcsr::protocol::default_locked_range()),
-        }
-    } else {
-        None
+    let declared = rcsr::lockbox::resolve_declared(lockbox_arg.as_deref(), &data_path).unwrap_or_else(|e| {
+        eprintln!("error: --lockbox: {}", e);
+        std::process::exit(EXIT_USAGE);
+    });
+    let declared_lock: Option<(f64, f64)> = match &declared {
+        Some(d) => Some((d.lockbox.start as f64, d.lockbox.end as f64)),
+        None if ledger_path.is_some() || locked_test => Some(rcsr::protocol::default_locked_range()),
+        None => None,
     };
     if locked_test && (ledger_path.is_none() || sealed_path.is_none()) {
         eprintln!("error: --locked-test needs --ledger and --sealed");
@@ -9936,10 +10082,17 @@ fn run_walkforward(args: &[String]) -> ! {
             last_ts: if rows > 0 { Some(last) } else { None },
             read_count,
         };
+        let mut lockbox_facts = facts.json();
+        if let Some(d) = &declared {
+            lockbox_facts.pop();
+            lockbox_facts.push(',');
+            lockbox_facts.push_str(&d.report_fields(rows, locked_test, true));
+            lockbox_facts.push('}');
+        }
         protocol_json = Some(format!(
             "{{\"lockbox\":{},\"candidate_id\":{},\"report_sha256\":{},\"test_read\":{},\
              \"ledger\":{},\"windows_scheme\":{}}}",
-            facts.json(),
+            lockbox_facts,
             if ledger.is_some() { format!("\"{}\"", candidate_id) } else { "null".to_string() },
             format!("\"{}\"", report_sha),
             locked_test,
@@ -9947,10 +10100,7 @@ fn run_walkforward(args: &[String]) -> ! {
             windows_scheme.as_ref().map_or("null".to_string(), |s| format!("{:?}", s)),
         ));
     }
-    let report_json = || match &protocol_json {
-        Some(p) => report.json_with_protocol(p),
-        None => report.json(),
-    };
+    let report_json = || report.json_with_ledger(protocol_json.as_deref());
     for w in &report.windows {
         let reasons = [
             w.band.as_ref().and_then(|b| b.fallback_reason.as_deref()),

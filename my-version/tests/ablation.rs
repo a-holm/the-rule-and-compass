@@ -381,7 +381,7 @@ fn score_run_reads_the_expression_and_its_inputs() {
         window: Window { label: "w".into(), train_start: T0, train_end: T0 + 200.0 * 3600.0, test_start: T0 + 205.0 * 3600.0, test_end: T0 + 300.0 * 3600.0 },
         validation_start: T0 + 120.0 * 3600.0,
     }];
-    let folds: Vec<Fold> = ladder::make_folds(&panel, &rows, 3600.0).unwrap();
+    let folds: Vec<Fold> = ladder::make_folds(&panel, &rows, 3600.0, None).unwrap();
     let facts = ablation::RunFacts {
         arm: "A1".into(),
         feature_list_sha256: ablation::feature_list_sha256(&["s".into(), "n".into()]),
@@ -641,4 +641,85 @@ fn a_family_that_loses_only_on_pbo_is_dropped_with_reason_pbo() {
     assert_eq!(candle.verdict, "drop");
     assert_eq!(candle.failed.len(), 1, "{:?}", candle.failed);
     assert!(candle.failed[0].starts_with("pbo:"), "{:?}", candle.failed);
+}
+
+#[test]
+fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
+    use rcsr::lockbox::{self, Lockbox};
+
+    let dir = scratch("locked-test");
+    let data = objective_csv(&dir);
+    let spec = write_target_spec(&dir);
+    let run_json = dir.join("A0-s3.run.json");
+    let out = search(&data, &spec, &["--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--arm", "A0", "--json-out", run_json.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let iso = |i: i64| protocol::iso(T0 + 900.0 * i as f64);
+    let windows = dir.join("w.csv");
+    std::fs::write(
+        &windows,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,w0,{},{},{},{},{}\n",
+            iso(0),
+            iso(280),
+            iso(200),
+            iso(290),
+            iso(400)
+        ),
+    )
+    .unwrap();
+    let lb = Lockbox { start: T0 as i64 + 900 * 300, end: T0 as i64 + 900 * 400 };
+    lockbox::write_sidecar(&data, &lb, "test").unwrap();
+    let score = |res: &str| {
+        Command::new(env!("CARGO_BIN_EXE_rcsr"))
+            .args([
+                "ablation", "score", "--run", run_json.to_str().unwrap(), "--data", &data, "--target", "y", "--return-col", "r",
+                "--time", "t", "--windows", windows.to_str().unwrap(), "--purge-seconds", "1800", "--out", res,
+            ])
+            .output()
+            .unwrap()
+    };
+    let refused = score(dir.join("refused.json").to_str().unwrap());
+    assert_eq!(refused.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("declared locked test"), "{}", String::from_utf8_lossy(&refused.stderr));
+    assert!(!dir.join("refused.json").exists());
+
+    // prepare copies the declaration to a sidecar and a search on the CSV refuses the rows
+    let def = dir.join("def.json");
+    std::fs::write(
+        &def,
+        r#"{"schema":"rcsr-ablation/1","b0":["b"],"groups":{"fam":["f1","f2"],"pat":["p1"]},
+"placebo_template_group":"pat","generation_budget":10,
+"arms":[{"name":"A0","add":[]},{"name":"A1","add":["fam"]},{"name":"A5","add":[],"permute":["fam"]}],
+"rule":{"families":[{"name":"fam","treatment":"A1","controls":["A0"],"null_arm":"A5","null_control":"A0"}]}}"#,
+    )
+    .unwrap();
+    let mut csv = String::from("ts,sym,y,b,f1,f2,p1\n");
+    let mut rng = Mt::new(2);
+    for s in ["a", "b"] {
+        for k in 0..400i64 {
+            csv.push_str(&format!("{},{},{},{},{},{},{}\n", T0 as i64 + 900 * k, s, gauss(&mut rng), gauss(&mut rng), gauss(&mut rng), gauss(&mut rng), (k % 7 == 0) as i32));
+        }
+    }
+    let raw = dir.join("raw.csv");
+    std::fs::write(&raw, csv).unwrap();
+    lockbox::write_sidecar(raw.to_str().unwrap(), &lb, "test").unwrap();
+    let prepared = dir.join("prepared.csv");
+    let prep = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "ablation", "prepare", "--definition", def.to_str().unwrap(), "--data", raw.to_str().unwrap(), "--time", "ts", "--group", "sym",
+            "--keep", "y", "--out", prepared.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(prep.status.code(), Some(0), "{}", String::from_utf8_lossy(&prep.stderr));
+    assert_eq!(lockbox::declared_for(prepared.to_str().unwrap()), Some(lb));
+    let found = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "--data", prepared.to_str().unwrap(), "--target", "y", "--vars", "b,f1,f2", "--time", "ts", "--split", "temporal", "--cpu",
+            "--no-dev-log", "--seed", "3", "--generations", "3", "--pop", "16", "--quiet",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(found.status.code(), Some(3), "{}", String::from_utf8_lossy(&found.stderr));
+    assert!(String::from_utf8_lossy(&found.stderr).contains("declared locked test"));
 }

@@ -80,6 +80,20 @@ pub struct ProtocolOptions {
     /// #309: score every candidate on every window in one batch (device kernel
     /// when available) and report it beside the exact finalists.
     pub batch_pnl: bool,
+    /// #482: the run.json the candidates came from.
+    pub front: Option<FrontSource>,
+    /// #482: labels of windows that overlap the run's training or validation
+    /// rows and were allowed anyway.
+    pub in_sample_windows: Vec<String>,
+}
+
+/// #482: where a candidate list came from: a run's Pareto front.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrontSource {
+    pub run: String,
+    pub run_sha256: String,
+    /// Archive rank label of every candidate, in candidate order.
+    pub labels: Vec<String>,
 }
 
 impl Default for ProtocolOptions {
@@ -96,6 +110,8 @@ impl Default for ProtocolOptions {
             pbo_blocks: 16,
             fdr_q: 0.10,
             batch_pnl: false,
+            front: None,
+            in_sample_windows: Vec::new(),
         }
     }
 }
@@ -329,6 +345,8 @@ pub struct WindowResult {
     pub validation_rows: usize,
     pub test_rows: usize,
     pub dropped_rows: usize,
+    /// #482: the window overlaps rows the run trained or selected on.
+    pub in_sample: bool,
     /// Time step inferred from the test timestamps, when it was inferable.
     pub inferred_period_seconds: Option<f64>,
     pub metrics: Metrics,
@@ -465,6 +483,8 @@ pub struct Report {
     /// Which fibre selected the candidate(s). Always validation when more than
     /// one candidate is present; `test` is never a selection input.
     pub selected_on: String,
+    /// #482: the run whose Pareto front supplied the candidates.
+    pub front: Option<FrontSource>,
     /// #308: whether the band protocol selected the candidate.
     pub band_select: bool,
     /// True when no test row influenced candidate or threshold selection.
@@ -486,6 +506,8 @@ pub struct Report {
     pub device_pnl: Option<DevicePnlSummary>,
     /// #309: batch pass over all candidates and windows (`--batch-pnl`).
     pub batch_pnl: Option<crate::wf_batch::BatchSummary>,
+    /// #284: run-scoped phase ledger (`io`, `pnl`, `host_other`, device-busy intervals). Not part of `json()`, which is the reproduction hash.
+    pub ledger: crate::gpu_stats::RunLedger,
     /// `entry_offset) + horizon + delay`.
     pub required_purge_seconds: f64,
     /// Smallest `test_start - train_end` over the windows.
@@ -521,12 +543,28 @@ pub fn run_path(path: &str, spec: &EvalSpec) -> Result<Report, String> {
 
 /// [`run_path`] with the protocol options.
 pub fn run_path_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Result<Report, String> {
+    let clock = std::time::Instant::now();
     if store::is_store_path(path) {
-        run_store_with(path, spec, opts)
+        let mut report = run_store_clocked(path, spec, opts, clock)?;
+        close_ledger(&mut report.ledger, clock);
+        Ok(report)
     } else {
+        let t_read = std::time::Instant::now();
         let table = data::read_table(path)?;
-        run_table_with(&table, spec, "csv-table", opts)
+        let read_s = t_read.elapsed().as_secs_f64();
+        let mut report = run_table_clocked(&table, spec, "csv-table", opts, clock)?;
+        report.ledger.record_stage(crate::gpu_stats::Stage::Io, read_s);
+        close_ledger(&mut report.ledger, clock);
+        Ok(report)
     }
+}
+
+/// #284: the ledger clock covers the whole call. Stage windows are measured;
+/// `host_other` is the rest of the wall (layout, parsing, assembly).
+fn close_ledger(ledger: &mut crate::gpu_stats::RunLedger, clock: std::time::Instant) {
+    let wall = clock.elapsed().as_secs_f64();
+    ledger.record_stage(crate::gpu_stats::Stage::HostOther, wall - ledger.stage_sum_s());
+    ledger.set_wall(wall);
 }
 
 /// Evaluate a resident table. The CLI's CSV path and tests use this.
@@ -541,12 +579,26 @@ pub fn run_table_with(
     source: &str,
     opts: &ProtocolOptions,
 ) -> Result<Report, String> {
+    let clock = std::time::Instant::now();
+    let mut report = run_table_clocked(table, spec, source, opts, clock)?;
+    close_ledger(&mut report.ledger, clock);
+    Ok(report)
+}
+
+fn run_table_clocked(
+    table: &Table,
+    spec: &EvalSpec,
+    source: &str,
+    opts: &ProtocolOptions,
+    clock: std::time::Instant,
+) -> Result<Report, String> {
     let layout = resolve_layout(spec, &table.names, &table.numeric)?;
     let trees = parse_expressions(spec, &layout)?;
     validate_windows(spec, opts)?;
 
     let times = data::time_keys(table, layout.time);
     let group_ids = layout.group.map(|g| table_group_ids(table, g));
+    let t_pnl = std::time::Instant::now();
     let mut acc = Accum::new(spec, opts, trees.len())?;
     let mut features = Vec::with_capacity(layout.vars.len());
     for r in 0..table.len() {
@@ -561,14 +613,17 @@ pub fn run_table_with(
         let g = group_ids.as_ref().map_or(0, |ids| ids[r]);
         acc.add(t, g, &features, table.value(r, layout.target), &trees);
     }
-    acc.finish(
+    let mut report = acc.finish(
+        clock,
         spec,
         opts,
         &layout,
         source,
         "O(test rows + one score per training row per window); CSV is resident",
         &trees,
-    )
+    )?;
+    report.ledger.record_stage(crate::gpu_stats::Stage::Pnl, t_pnl.elapsed().as_secs_f64());
+    Ok(report)
 }
 
 /// Evaluate a `.rcsb` store directly, scanning it one row group at a time.
@@ -578,6 +633,18 @@ pub fn run_store(path: &str, spec: &EvalSpec) -> Result<Report, String> {
 
 /// [`run_store`] with the protocol options.
 pub fn run_store_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Result<Report, String> {
+    let clock = std::time::Instant::now();
+    let mut report = run_store_clocked(path, spec, opts, clock)?;
+    close_ledger(&mut report.ledger, clock);
+    Ok(report)
+}
+
+fn run_store_clocked(
+    path: &str,
+    spec: &EvalSpec,
+    opts: &ProtocolOptions,
+    clock: std::time::Instant,
+) -> Result<Report, String> {
     let fs = FileStore::open(path)?;
     let names = fs.header().names();
     let numeric = fs.header().numeric();
@@ -588,10 +655,13 @@ pub fn run_store_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Re
 
     let mut acc = Accum::new(spec, opts, trees.len())?;
     let header = fs.header();
+    let t_pnl = std::time::Instant::now();
+    let mut io_s = 0.0f64;
     let mut buf = GroupBuf::new();
     let mut scratch = Vec::new();
     let mut features = Vec::with_capacity(layout.vars.len());
     for group in 0..fs.n_groups() {
+        let t_io = std::time::Instant::now();
         let view = fs.load_group_with(group, &mut buf, &mut scratch)?;
         let len = view.len();
         let time_i64 = if layout.time_i64 {
@@ -608,6 +678,7 @@ pub fn run_store_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Re
             Some(c) if !numeric[c] => Some(fs.read_codes(group, c)?),
             _ => None,
         };
+        io_s += t_io.elapsed().as_secs_f64();
         let time_levels = header.levels(layout.time);
         for r in 0..len {
             let t = match (&time_i64, &time_codes) {
@@ -644,7 +715,10 @@ pub fn run_store_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Re
          group by group, one {} -row group resident",
         fs.group_rows()
     );
-    acc.finish(spec, opts, &layout, "store-stream", &bound, &trees)
+    let mut report = acc.finish(clock, spec, opts, &layout, "store-stream", &bound, &trees)?;
+    report.ledger.record_stage(crate::gpu_stats::Stage::Io, io_s);
+    report.ledger.record_stage(crate::gpu_stats::Stage::Pnl, t_pnl.elapsed().as_secs_f64() - io_s);
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +1053,7 @@ impl Accum {
 
     fn finish(
         self,
+        clock: std::time::Instant,
         spec: &EvalSpec,
         opts: &ProtocolOptions,
         layout: &Layout,
@@ -1266,6 +1341,7 @@ impl Accum {
                 });
             }
             let train_last_time = if d.train_max_time.is_finite() { Some(d.train_max_time) } else { None };
+            let in_sample = opts.in_sample_windows.contains(&d.window.label);
             windows.push(WindowResult {
                 window: d.window,
                 expression: expr::to_string(&trees[candidate], &layout.var_names),
@@ -1277,6 +1353,7 @@ impl Accum {
                 validation_rows: d.validation_scores[candidate].len(),
                 test_rows: ev.stats.rows,
                 dropped_rows: d.dropped,
+                in_sample,
                 train_last_time,
                 inferred_period_seconds: inferred_dt,
                 metrics: ev.metrics,
@@ -1377,6 +1454,7 @@ impl Accum {
             "inferred from the median test time step (365-day year)".to_string()
         };
         let sign_test = fold_sign_test(&windows);
+        let batch_started = clock.elapsed().as_secs_f64();
         let batch_pnl = if opts.batch_pnl {
             Some(crate::wf_batch::summarize(
                 &batch_in,
@@ -1387,6 +1465,15 @@ impl Accum {
         } else {
             None
         };
+        let mut ledger = crate::gpu_stats::RunLedger::new();
+        if let Some(b) = &batch_pnl {
+            let mut at = batch_started;
+            for r in std::iter::once(&b.per_window).chain(b.pooled.as_ref()) {
+                let s = &r.stats;
+                ledger.record_interval(crate::gpu_stats::Stage::Pnl, 0, at, at + s.device_s.min(s.wall_s));
+                at += s.wall_s;
+            }
+        }
         let device_pnl = if spec.device_pnl {
             let mut backend = String::new();
             let mut rows = 0u64;
@@ -1445,6 +1532,7 @@ impl Accum {
             annualization,
             candidates: expressions,
             selected_on,
+            front: opts.front.clone(),
             band_select: spec.band_select,
             test_used_for_selection: false,
             pool_reset_flat: spec.pool_reset_flat,
@@ -1456,6 +1544,7 @@ impl Accum {
             allow_lockbox: spec.allow_lockbox,
             device_pnl,
             batch_pnl,
+            ledger,
             required_purge_seconds: required_purge,
             min_purge_seconds: min_gap,
             economics,
@@ -2673,7 +2762,7 @@ impl Metrics {
 
 impl WindowResult {
     fn json(&self) -> String {
-        format!(
+        let mut s = format!(
             "{{\"label\":{},\"train_start\":{},\"train_end\":{},\"test_start\":{},\
              \"test_end\":{},\"purge_seconds\":{},\"expression\":{},\
              \"candidate\":{},\"validation_error\":{},\"threshold\":{},\
@@ -2714,11 +2803,30 @@ impl WindowResult {
                 .as_ref()
                 .map_or("null".to_string(), |s| s.json()),
             self.train_last_time.map_or("null".to_string(), jnum)
-        )
+        );
+        if self.in_sample {
+            s.pop();
+            s.push_str(",\"in_sample\":true}");
+        }
+        s
     }
 }
 
 impl Report {
+    /// #482: `source`, `run`, `run_sha256` and the candidate labels, with a
+    /// leading comma. Empty when the candidates came from `--expr`.
+    fn front_json(&self) -> String {
+        match &self.front {
+            Some(f) => format!(
+                ",\"source\":\"front\",\"run\":{},\"run_sha256\":{},\"candidate_labels\":[{}]",
+                jstr(&f.run),
+                jstr(&f.run_sha256),
+                f.labels.iter().map(|l| jstr(l)).collect::<Vec<_>>().join(",")
+            ),
+            None => String::new(),
+        }
+    }
+
     /// Machine-readable JSON. The deterministic report; its SHA-256 is the
     /// reproduction hash.
     pub fn json(&self) -> String {
@@ -2742,6 +2850,26 @@ impl Report {
         let mut s = self.json();
         s.pop();
         s.push_str(&format!(",\"protocol\":{}}}", protocol));
+        s
+    }
+
+    /// The printed report: [`Report::json_with_protocol`] (or [`Report::json`])
+    /// plus the #284 phase ledger. The ledger holds wall-clock seconds, so it
+    /// stays outside the reproduction hash.
+    pub fn json_with_ledger(&self, protocol: Option<&str>) -> String {
+        use crate::gpu_stats::Stage;
+        let mut s = match protocol {
+            Some(p) => self.json_with_protocol(p),
+            None => self.json(),
+        };
+        s.pop();
+        s.push_str(&format!(
+            ",\"ledger\":{}}}",
+            self.ledger.phase_json(
+                "walkforward",
+                &[Stage::Vary, Stage::Eval, Stage::Fit, Stage::Select, Stage::Archive, Stage::Features]
+            )
+        ));
         s
     }
 
@@ -2817,7 +2945,7 @@ impl Report {
              \"annualized_alpha_scale\":\"periods_per_year\"}}}},\
              \"candidates\":[{}],\"selection\":{{\"selected_on\":{},\
              \"band_select\":{},\"test_used_for_selection\":{},\
-             \"candidate_count\":{}}},\
+             \"candidate_count\":{}{}}},\
              \"pooled_seam\":{{\"reset_flat\":{},\"seam_cost\":{},\"seam_trades\":{}}},\
              \"sign_test\":{{\"positive\":{},\"total\":{},\"applicable\":{},\
              \"p_value\":{},\"method\":{}}},\
@@ -2865,6 +2993,7 @@ impl Report {
             self.band_select,
             self.test_used_for_selection,
             self.candidates.len(),
+            self.front_json(),
             self.pool_reset_flat,
             jnum(self.seam_cost),
             self.seam_trades,

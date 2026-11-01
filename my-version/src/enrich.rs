@@ -1646,6 +1646,8 @@ pub struct Report {
     pub xs_seconds: f64,
     pub write_seconds: f64,
     pub total_seconds: f64,
+    /// #284: run-scoped phase ledger: stage seconds (`features`, `io`, `host_other`) and device-busy intervals on one clock.
+    pub ledger: crate::gpu_stats::RunLedger,
     pub peak_rss_bytes: u64,
 }
 
@@ -1838,7 +1840,7 @@ impl Report {
              \"backend\":{},\"gpu_requested\":{},\"gpu_available\":{},\"gpu_device\":{},\n  \
              \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"write_s\":{:.6},\"transfer_bytes\":{},\"write_bw\":{:.0},\"fallback_columns\":[{}]}},\n  \
              \"projection\":{{\"hash\":{},\"columns\":[{}]}},\n  \
-             \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"feature_read_s\":{:.6},\"feature_context_s\":{:.6},\"feature_gpu_s\":{:.6},\"feature_cpu_s\":{:.6},\"feature_other_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"total_s\":{:.6}}},\n  \
+             \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"feature_read_s\":{:.6},\"feature_context_s\":{:.6},\"feature_gpu_s\":{:.6},\"feature_cpu_s\":{:.6},\"feature_other_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"total_s\":{:.6}}},\n  \"ledger\":{},\n  \
              \"peak_rss_bytes\":{},\n  \"features\":[{}],\n  \"long_labels\":[{}],\n  \"plan\":[{}]\n}}\n",
             jstr(&self.input),
             jstr(&self.output),
@@ -1895,12 +1897,79 @@ impl Report {
             self.xs_seconds,
             self.write_seconds,
             self.total_seconds,
+            self.ledger.phase_json("enrich", ENRICH_ZERO_STAGES),
             self.peak_rss_bytes,
             features.join(","),
             long_labels.join(","),
             plans.join(",")
         )
     }
+}
+
+/// Stages an enrichment run has no work for by design.
+const ENRICH_ZERO_STAGES: &[crate::gpu_stats::Stage] = &[
+    crate::gpu_stats::Stage::Vary,
+    crate::gpu_stats::Stage::Eval,
+    crate::gpu_stats::Stage::Fit,
+    crate::gpu_stats::Stage::Select,
+    crate::gpu_stats::Stage::Archive,
+    crate::gpu_stats::Stage::Pnl,
+];
+
+/// #284: device intervals of the run, placed from the host window of each
+/// device region (the labelled host-envelope basis).
+#[derive(Default)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct DeviceBook {
+    ledger: crate::gpu_stats::RunLedger,
+    booked_kernel_s: f64,
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+impl DeviceBook {
+    /// Book the kernel seconds added since the last call, inside the host
+    /// window that started at `window_start`. `kernel_total_s` is cumulative.
+    fn book(&mut self, started: Instant, window_start: Instant, kernel_total_s: f64) {
+        let delta = kernel_total_s - self.booked_kernel_s;
+        if !(delta.is_finite() && delta > 0.0) {
+            return;
+        }
+        self.booked_kernel_s = kernel_total_s;
+        let start = window_start.saturating_duration_since(started).as_secs_f64();
+        let window = window_start.elapsed().as_secs_f64();
+        self.ledger.record_interval(
+            crate::gpu_stats::Stage::Features,
+            0,
+            start,
+            start + delta.min(window),
+        );
+    }
+}
+
+/// #284: the enrichment ledger. `io` is every store read and write, `features`
+/// the producer work and the cross-section pass, `host_other` the rest of the
+/// run wall (hashing, planning, report assembly).
+#[allow(clippy::too_many_arguments)]
+fn phase_ledger(
+    mut ledger: crate::gpu_stats::RunLedger,
+    started: Instant,
+    read_s: f64,
+    feature_read_s: f64,
+    gpu_write_s: f64,
+    write_s: f64,
+    context_s: f64,
+    gpu_s: f64,
+    cpu_s: f64,
+    other_s: f64,
+    xs_s: f64,
+) -> crate::gpu_stats::RunLedger {
+    use crate::gpu_stats::Stage;
+    ledger.record_stage(Stage::Io, read_s + feature_read_s + gpu_write_s + write_s);
+    ledger.record_stage(Stage::Features, context_s + gpu_s + cpu_s + other_s + xs_s);
+    let wall = started.elapsed().as_secs_f64();
+    ledger.record_stage(Stage::HostOther, wall - ledger.stage_sum_s());
+    ledger.set_wall(wall);
+    ledger
 }
 
 /// Columns planned for the device that the CPU computed instead, with the
@@ -6930,6 +6999,8 @@ fn enrich_inner(
     // audited column list cannot drift from the bytes actually read.
     #[allow(unused_mut)]
     let mut device_projection: Option<(String, Vec<String>)> = None;
+    #[allow(unused_mut)]
+    let mut dev = DeviceBook::default();
     #[allow(unused_mut, unused_variables)]
     let mut side_kernel_seconds = 0.0;
     #[allow(unused_mut, unused_variables)]
@@ -6985,6 +7056,7 @@ fn enrich_inner(
                         }
                     }
                     side_kernel_seconds += stats.kernel_s;
+                    dev.book(started, tg, side_kernel_seconds);
                     side_transfer_bytes += stats.h2d_bytes + stats.d2h_bytes;
                     side_h2d_seconds += stats.h2d_s;
                     side_d2h_seconds += stats.d2h_s;
@@ -7050,6 +7122,7 @@ fn enrich_inner(
                         }
                     }
                     side_kernel_seconds += stats.kernel_s;
+                    dev.book(started, tg, side_kernel_seconds);
                     side_transfer_bytes += stats.h2d_bytes + stats.d2h_bytes;
                     side_h2d_seconds += stats.h2d_s;
                     side_d2h_seconds += stats.d2h_s;
@@ -7061,6 +7134,8 @@ fn enrich_inner(
             }
         }
     }
+    #[cfg(feature = "cuda")]
+    let t_dev_block = Instant::now();
     #[cfg(feature = "cuda")]
     if !gpu_names.is_empty() || gpu_labels {
         // Projected transport: only the raw columns the device needs, read
@@ -7436,6 +7511,7 @@ fn enrich_inner(
             t_gpu_block.elapsed().as_secs_f64() - (gpu_write_seconds - write_before_block);
         let stats = gpu.stats();
         gpu_kernel_seconds = stats.kernel_s + side_kernel_seconds;
+        dev.book(started, t_dev_block, gpu_kernel_seconds);
         gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes + side_transfer_bytes;
         gpu_h2d_seconds = stats.h2d_s + side_h2d_seconds;
         gpu_d2h_seconds = stats.d2h_s + side_d2h_seconds;
@@ -7776,6 +7852,8 @@ fn enrich_inner(
         }
     }
     let xs_seconds = t_xs.elapsed().as_secs_f64();
+    #[cfg(feature = "cuda")]
+    dev.book(started, t_xs, gpu_kernel_seconds);
 
     let long_outputs: Vec<LongLabelOutput> = long_specs
         .iter()
@@ -7902,6 +7980,7 @@ fn enrich_inner(
             feature_other_seconds,
             xs_seconds,
             write_seconds: 0.0,
+            ledger: phase_ledger(dev.ledger, started, read_seconds, feature_read_seconds, gpu_write_seconds, 0.0, feature_context_seconds, feature_gpu_seconds, feature_cpu_seconds, feature_other_seconds, xs_seconds),
             total_seconds: started.elapsed().as_secs_f64(),
             peak_rss_bytes: peak_rss_bytes(),
         };
@@ -7967,6 +8046,7 @@ fn enrich_inner(
         feature_other_seconds,
         xs_seconds,
         write_seconds,
+        ledger: phase_ledger(dev.ledger, started, read_seconds, feature_read_seconds, gpu_write_seconds, write_seconds, feature_context_seconds, feature_gpu_seconds, feature_cpu_seconds, feature_other_seconds, xs_seconds),
         total_seconds: started.elapsed().as_secs_f64(),
         peak_rss_bytes: peak_rss_bytes(),
     })
@@ -8072,6 +8152,7 @@ fn expected_columns_out(
 
 pub fn run(args: &[String]) -> ! {
     let mut opts = Options::default();
+    let mut locked_test: Option<crate::lockbox::Lockbox> = None;
     let mut i = 0usize;
     macro_rules! val {
         () => {{
@@ -8152,6 +8233,9 @@ pub fn run(args: &[String]) -> ! {
                 }
                 opts.write_bw = Some(mbps * 1_000_000.0);
             }
+            "--locked-test" => {
+                locked_test = Some(crate::lockbox::Lockbox::parse(&val!()).unwrap_or_else(|e| fail(&format!("--locked-test: {}", e))))
+            }
             "--allow-lockbox" => opts.allow_lockbox = true,
             "--dry-run" => opts.dry_run = true,
             "--json" => opts.json = true,
@@ -8175,7 +8259,15 @@ pub fn run(args: &[String]) -> ! {
     if !opts.dry_run {
         if let Some(out) = &opts.out {
             let sidecar = format!("{}.enrich.json", out);
-            if let Err(e) = crate::atomic::write_text_atomic(&sidecar, &report.json()) {
+            let mut text = report.json();
+            if let Some(lb) = locked_test.or_else(|| crate::lockbox::declared_for(&opts.data)) {
+                let at = text.find('{').map_or(0, |i| i + 1);
+                text.insert_str(
+                    at,
+                    &format!("\"locked_test\":{},", lb.declaration_json("rcsr enrich --locked-test")),
+                );
+            }
+            if let Err(e) = crate::atomic::write_text_atomic(&sidecar, &text) {
                 eprintln!("warning: could not write {}: {}", sidecar, e);
             }
         }
@@ -8242,6 +8334,9 @@ INPUT / OUTPUT:
                           4h and longer (labels overlap; use uniqueness weights)
   --side long             the only side; --side short and --allow-short are refused
   --allow-lockbox         permit labelled rows in 2026H2 (final test only)
+  --locked-test <START,END>
+                          declare the protocol locked test (UTC, half-open) in
+                          <out>.enrich.json; copied from --data when it declares one
   --gpu [auto|on|off]     auto (default) dispatches a registered exact kernel
                           only when the cost model estimates it faster; on
                           forces every registered kernel above the 1M-row floor;
@@ -8261,6 +8356,8 @@ INPUT / OUTPUT:
   --dry-run               print the report and write nothing
   --json                  print the JSON report on stdout; gpu.fallback_columns lists
                           each column the device left to the CPU, with the failing path
+                          and a ledger object (the phase ledger of the run: io, features,
+                          host_other and device-busy seconds on the run wall)
 
 FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
   returns    r1..r120, log close-to-close over exactly k contiguous bars
