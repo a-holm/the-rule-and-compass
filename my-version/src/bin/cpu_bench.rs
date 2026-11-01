@@ -48,7 +48,7 @@ fn binary(op: Op, a: Node, b: Node) -> Node {
 
 /// Four deterministic trees with 5, 9, 15 and 25 nodes, mixing arithmetic,
 /// transcendentals, division and the guarded operations.
-fn trees() -> Vec<Node> {
+fn trees() -> Vec<(&'static str, Node)> {
     // 5 nodes: 1.7*x0 + x1
     let five = binary(Op::Add, binary(Op::Mul, x(0), c(1.7)), x(1));
 
@@ -91,7 +91,14 @@ fn trees() -> Vec<Node> {
         ),
     );
 
-    vec![five, nine, fifteen, twenty_five]
+    vec![
+        ("lin5", five),
+        ("trig9", nine),
+        ("mix15", fifteen),
+        ("mix25", twenty_five),
+        ("arith15", named_tree(ARITH15)),
+        ("trans13", named_tree(TRANS13)),
+    ]
 }
 
 /// Build both layouts from the same values: SoA columns for the new evaluator
@@ -422,41 +429,48 @@ fn run_eval(o: &Opts, out: &mut Out) {
         .map(Duration::from_secs_f64)
         .unwrap_or(Duration::from_millis(50));
     let trees = trees();
-    let (mut d_scalar, mut d_avx, mut d_both) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut d_scalar, mut d_avx, mut d_tile) = (0.0f64, 0.0f64, 0.0f64);
+    let mut all_equal = true;
 
     if !o.tsv {
-        out.section("eval: scalar tree walk vs structure-of-arrays CPU evaluator");
+        out.section("eval: scalar tree walk vs structure-of-arrays CPU evaluators");
         println!(
-            "AVX kernel: {} (SIMD width {})",
+            "AVX kernels: {} (4-row width {}, tile {} rows)",
             if eval_soa::avx_available() {
                 "available"
             } else {
                 "not available, scalar SoA used"
             },
-            eval_soa::SIMD_WIDTH
+            eval_soa::SIMD_WIDTH,
+            eval_soa::TILE
         );
         println!();
         println!(
-            "{:>5} {:>8} {:>12} {:>12} {:>12} {:>8} {:>8}",
-            "nodes", "rows", "walk us", "soa us", "avx us", "soa x", "avx x"
+            "{:>8} {:>5} {:>8} {:>11} {:>11} {:>11} {:>11} {:>7} {:>7} {:>7} {:>8}",
+            "tree", "nodes", "rows", "walk us", "soa us", "avx4 us", "tile us", "soa x", "avx4 x", "tile x",
+            "tile/avx4"
         );
-        println!("{}", "-".repeat(72));
+        println!("{}", "-".repeat(109));
     } else {
         out.section("eval");
         out.header(&[
+            "tree",
             "tree_nodes",
             "rows",
             "walk_us",
             "soa_scalar_us",
             "soa_avx_us",
+            "tile_us",
             "walk_mrows",
             "soa_scalar_mrows",
             "soa_avx_mrows",
+            "tile_mrows",
+            "tile_over_avx",
             "bitwise_equal",
         ]);
     }
 
-    for tree in &trees {
+    for (name, tree) in &trees {
         let program = match eval_soa::compile(tree) {
             Some(p) => p,
             None => {
@@ -470,6 +484,8 @@ fn run_eval(o: &Opts, out: &mut Out) {
             let mut walk_out = vec![0.0; rows];
             let mut soa_out = vec![0.0; rows];
             let mut avx_out = vec![0.0; rows];
+            let mut tile_out = vec![0.0; rows];
+            let mut scratch = eval_soa::Scratch::new();
 
             let walk = measure(target, || {
                 for (r, row) in aos.iter().enumerate() {
@@ -482,45 +498,62 @@ fn run_eval(o: &Opts, out: &mut Out) {
                 black_box(&soa_out);
             });
             let avx = measure(target, || {
-                eval_soa::eval_batch(&program, &cols, rows, &mut avx_out);
+                eval_soa::eval_batch_rows4(&program, &cols, rows, &mut avx_out);
                 black_box(&avx_out);
+            });
+            let tile = measure(target, || {
+                eval_soa::eval_batch_into(&program, &cols, rows, &mut tile_out, &mut scratch);
+                black_box(&tile_out);
             });
 
             for (r, row) in aos.iter().enumerate() {
                 walk_out[r] = expr::eval(tree, row);
             }
             eval_soa::eval_batch_scalar(&program, &cols, rows, &mut soa_out);
-            eval_soa::eval_batch(&program, &cols, rows, &mut avx_out);
+            eval_soa::eval_batch_rows4(&program, &cols, rows, &mut avx_out);
+            eval_soa::eval_batch_into(&program, &cols, rows, &mut tile_out, &mut scratch);
             for r in 0..rows {
                 d_scalar = d_scalar.max(rel_diff(walk_out[r], soa_out[r]));
                 d_avx = d_avx.max(rel_diff(walk_out[r], avx_out[r]));
-                d_both = d_both.max(rel_diff(soa_out[r], avx_out[r]));
+                d_tile = d_tile.max(rel_diff(walk_out[r], tile_out[r]));
             }
+            let equal = bits_equal(&walk_out, &soa_out)
+                && bits_equal(&walk_out, &avx_out)
+                && bits_equal(&walk_out, &tile_out);
+            all_equal &= equal;
 
-            let (walk_us, soa_us, avx_us) = (us(walk), us(soa), us(avx));
+            let (walk_us, soa_us, avx_us, tile_us) = (us(walk), us(soa), us(avx), us(tile));
+            let tile_over_avx = avx_us / tile_us.max(f64::MIN_POSITIVE);
             if o.tsv {
-                let equal = bits_equal(&walk_out, &soa_out) && bits_equal(&walk_out, &avx_out);
                 out.line(&[
+                    name.to_string(),
                     nodes.to_string(),
                     rows.to_string(),
                     format!("{walk_us:.2}"),
                     format!("{soa_us:.2}"),
                     format!("{avx_us:.2}"),
+                    format!("{tile_us:.2}"),
                     format!("{:.2}", mrows(rows, walk.as_secs_f64())),
                     format!("{:.2}", mrows(rows, soa.as_secs_f64())),
                     format!("{:.2}", mrows(rows, avx.as_secs_f64())),
+                    format!("{:.2}", mrows(rows, tile.as_secs_f64())),
+                    format!("{tile_over_avx:.2}"),
                     equal.to_string(),
                 ]);
             } else {
                 println!(
-                    "{:>5} {:>8} {:>12.2} {:>12.2} {:>12.2} {:>8.2} {:>8.2}",
+                    "{:>8} {:>5} {:>8} {:>11.2} {:>11.2} {:>11.2} {:>11.2} {:>7.2} {:>7.2} {:>7.2} {:>8.2}",
+                    name,
                     nodes,
                     rows,
                     walk_us,
                     soa_us,
                     avx_us,
+                    tile_us,
                     walk_us / soa_us.max(f64::MIN_POSITIVE),
-                    walk_us / avx_us.max(f64::MIN_POSITIVE)
+                    walk_us / avx_us.max(f64::MIN_POSITIVE),
+                    walk_us / tile_us.max(f64::MIN_POSITIVE),
+                    tile_over_avx
                 );
             }
         }
@@ -530,8 +563,9 @@ fn run_eval(o: &Opts, out: &mut Out) {
         println!();
         println!("max relative difference vs the scalar walk:");
         println!("  SoA scalar : {d_scalar:.3e}");
-        println!("  SoA AVX    : {d_avx:.3e}");
-        println!("  AVX vs SoA : {d_both:.3e}");
+        println!("  SoA AVX 4  : {d_avx:.3e}");
+        println!("  SoA tile   : {d_tile:.3e}");
+        println!("all outputs bit-identical to the walk: {all_equal}");
         println!();
         println!("Times are one full evaluation of the dataset; lower is better.");
     }

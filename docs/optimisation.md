@@ -574,22 +574,23 @@ kernel; the search's single-output, non-implicit fitness path does.
 The API is deliberately small:
 
 ```rust
-use rcsr::eval_soa::{columns, compile, eval_batch, eval_batch_scalar, sse};
+use rcsr::eval_soa::{columns, compile, eval_batch, eval_batch_into, eval_batch_scalar, Scratch, sse};
 
 // cols[var][row], row-major inside each column.
 let cols = columns(&x);                            // x[row][var] -> cols[var][row]
 let program = compile(&tree).expect("supported tree"); // None => fall back
 let mut out = vec![0.0; rows];
-eval_batch(&program, &cols, rows, &mut out);        // AVX if available
+eval_batch(&program, &cols, rows, &mut out);        // column tiles, AVX if available
+let mut scratch = Scratch::new();
+eval_batch_into(&program, &cols, rows, &mut out, &mut scratch); // reuse the stack
 eval_batch_scalar(&program, &cols, rows, &mut out); // portable SoA loop
 let sum_sq = sse(&program, &cols, rows, &y);        // convenience
 ```
 
 `compile` computes the postfix stream and its peak operand-stack depth once;
-`eval_batch` allocates the value stack once per call, not per row. `rows` is
-clamped to `out.len()`, so zero rows and short buffers are safe. A trailing
-group shorter than the SIMD width is evaluated by the scalar loop, so any row
-count works.
+`eval_batch` allocates the tile stack once per call, not per row. `rows` is
+clamped to `out.len()`, so zero rows and short buffers are safe. A row count that
+is not a multiple of the tile size ends in a shorter tile, so any row count works.
 
 **Supported operators.** Unary: `neg`, `exp`, `ln`, `abs`, `sqrt`, `sin`,
 `cos`, `tan`, `sinh`, `cosh`, `tanh`, `logistic`, `step`, `gauss`, `square`,
@@ -610,61 +611,65 @@ propagate `NaN`, and `if` selects `cond > 0`. The tests compare every row of a
 deterministic generated corpus against `expr::eval`; the measured maximum
 relative difference is **0** (bit-identical) on the scalar and AVX paths.
 
-**What vectorises.** On `x86_64`, the kernel is compiled with
+**What vectorises.** The kernel is a column-tile interpreter. `compile` folds
+the postfix stream into steps whose destination slot and operand sources are
+fixed at compile time: an `Input` or `Const` leaf that feeds an operator is read
+in place (a column slice or an immediate) and emits no step, so the value stack
+is only `depth × TILE` doubles and `sp` is never tracked at run time. Each step
+runs over a tile of `TILE = 64` rows in one loop; the dispatch is paid once per
+tile, not once per four rows. On `x86_64` the loops are compiled under
 `#[target_feature(enable = "avx")]` and selected at runtime with
-`is_x86_feature_detected!("avx")`. The development CPU has AVX but no AVX2 and
-no FMA, so the kernel is four `f64` lanes and needs neither. Nothing requires
-nightly.
+`is_x86_feature_detected!("avx")`; the same source is the portable fallback. The
+development CPU has AVX but no AVX2 and no FMA, so nothing requires either.
+Nothing requires nightly.
 
-| operation | AVX kernel | portable fallback |
-|---|---|---|
-| `add`, `sub`, `mul`, `div`, `neg`, `abs`, `sqrt`, `square`, `cube`, `min`, `max` | vectorised (4 rows per instruction) | scalar per row |
-| `if` | vectorised as a lane mask + blend | per-row select |
-| `exp`, `ln`, `sin`, `cos`, `tan`, `sinh`, `cosh`, `tanh`, `logistic`, `step`, `gauss`, `floor`, `ceil`, `round`, `sign`, `pow` | one scalar `f64` call per lane (no AVX instruction for them) | scalar per row |
+Every per-row operation is `apply_unary`/`apply_binary`, the same `f64`
+operations and guards as the scalar path, so the output is bit-identical to
+`expr::eval` and to the previous four-row kernel, which stays as
+`eval_batch_rows4` for the benchmark and the tests. Arithmetic, `div`, `sqrt`
+and the `if` select auto-vectorise. The transcendental functions stay one libm
+call per row: a vectorised approximation would change bits. A program whose
+inputs are missing or shorter than `rows` takes the portable scalar loop, which
+supplies the `NaN` rule.
 
-Even where the transcendental itself is scalar, the tree walk and the
-per-row recursion are gone; those cases therefore still gain from the flat
-stream, just less than pure arithmetic.
+`eval_batch_into(&program, cols, rows, out, &mut Scratch)` takes a
+caller-owned `Scratch` (the tile stack); the search keeps one per worker thread
+together with the prediction buffer, so scoring a candidate allocates nothing
+once the buffers are sized. `eval_batch` allocates a scratch per call.
 
-#### Measured: scalar walk vs SoA
+#### Measured: four-row AVX kernel vs column tile
 
-`cargo run --release --bin cpu_bench` evaluates four deterministic trees (5, 9,
-15 and 25 nodes) over 1 000, 20 000 and 200 000 rows. The scalar column is the
-existing `expr::eval` tree walk on row vectors (what the search uses today);
-the SoA columns are `eval_batch_scalar` and the runtime-selected AVX path.
-Times are µs for one full pass, best of five runs, each sized to about 50 ms.
+`cpu_bench --mode eval --rows 20000,150000,1000000 --min-seconds 0.3`, one
+thread, i7-3770K (AVX, no AVX2/FMA), run through the suite lock on a shared
+host, so only ratios inside one run are evidence. `avx4` is
+`eval_batch_rows4` (the previous kernel), `tile` is `eval_batch`. Times are µs
+for one full pass. `tile/avx4` is `avx4 µs / tile µs`. The benchmark checks
+every output bit-identical to the `expr::eval` walk.
 
-| nodes | rows | walk µs | SoA scalar µs | SoA AVX µs | SoA speed-up | AVX speed-up |
-|---:|---:|---:|---:|---:|---:|---:|
-| 5 | 1 000 | 19.37 | 16.16 | 3.56 | 1.20× | **5.44×** |
-| 5 | 20 000 | 381.87 | 324.25 | 72.09 | 1.18× | **5.30×** |
-| 5 | 200 000 | 4 106.38 | 3 322.97 | 742.16 | 1.24× | **5.53×** |
-| 9 | 1 000 | 59.93 | 48.87 | 34.58 | 1.23× | **1.73×** |
-| 9 | 20 000 | 1 219.78 | 970.00 | 688.92 | 1.26× | **1.77×** |
-| 9 | 200 000 | 12 185.48 | 9 764.19 | 8 217.21 | 1.25× | **1.48×** |
-| 15 | 1 000 | 131.20 | 102.61 | 82.62 | 1.28× | **1.59×** |
-| 15 | 20 000 | 2 613.77 | 2 087.46 | 1 572.26 | 1.25× | **1.66×** |
-| 15 | 200 000 | 29 489.78 | 20 722.41 | 16 505.77 | 1.42× | **1.79×** |
-| 25 | 1 000 | 235.90 | 215.96 | 151.77 | 1.09× | **1.55×** |
-| 25 | 20 000 | 5 020.49 | 4 295.85 | 3 063.77 | 1.17× | **1.64×** |
-| 25 | 200 000 | 49 051.38 | 43 449.00 | 29 596.99 | 1.13× | **1.66×** |
+| tree | rows | avx4 µs | tile µs | tile/avx4 |
+|---|---:|---:|---:|---:|
+| lin5 | 20000 | 131 | 40 | 3.27× |
+| lin5 | 150000 | 992 | 411 | 2.41× |
+| lin5 | 1000000 | 6683 | 4219 | 1.58× |
+| trig9 | 20000 | 1453 | 1102 | 1.32× |
+| trig9 | 150000 | 11378 | 7373 | 1.54× |
+| trig9 | 1000000 | 75109 | 53999 | 1.39× |
+| mix15 | 20000 | 3886 | 2506 | 1.55× |
+| mix15 | 150000 | 21927 | 16918 | 1.30× |
+| mix15 | 1000000 | 126990 | 112679 | 1.13× |
+| mix25 | 20000 | 5037 | 3753 | 1.34× |
+| mix25 | 150000 | 40180 | 28850 | 1.39× |
+| mix25 | 1000000 | 247517 | 186271 | 1.33× |
+| arith15 | 20000 | 921 | 160 | 5.75× |
+| arith15 | 150000 | 8517 | 1762 | 4.83× |
+| arith15 | 1000000 | 56065 | 11515 | 4.87× |
+| trans13 | 20000 | 5649 | 2400 | 2.35× |
+| trans13 | 150000 | 28178 | 16403 | 1.72× |
+| trans13 | 1000000 | 252966 | 94811 | 2.67× |
 
-Measured on the development machine in §4.1 (AVX, no AVX2/FMA). The host is
-shared, so each cell is the minimum over eight alternating runs of
-`cpu_bench`; an individual run can be several percent slower. The 5-node tree
-is pure arithmetic and shows the ceiling of the approach. The 9-, 15- and
-25-node trees mix arithmetic with `sin`/`cos`/`exp`/`tanh`, which AVX alone
-cannot vectorise, so their 1.5–1.8× is the more realistic range for search
-candidates.
+Trees: `lin5` = `1.7*x0 + x1`; `trig9` = `sin(x0*x1 + 0.3) + cos(x2)`; `mix15` = `sin(x0*x1 + sqrt(abs(x2))) / (x1^2 + cos(x0))`; `mix25` = `mix15` plus `tanh(logistic(-x3)) * gauss(x4 + 0.7)`; `arith15` and `trans13` are the `cpu_bench` fit trees below. Trees with `sin`, `cos`, `exp` or `tanh` are bound by the libm calls, so they gain least.
 
-**Agreement:** maximum relative difference against the scalar tree walk is
-`0.0` for both SoA paths on all twelve tree/row combinations (same `f64`
-operations, same guards). The benchmark prints this check on every run.
-
-The 200 000-row cases are memory-bound and noisier than the smaller ones; the
-trend that matters is the AVX speed-up over the existing walk, which grows with
-the arithmetic share of the tree. Trees dominated by `sin`/`cos`/`exp` gain
-less because AVX alone cannot vectorise those functions.
+Tile size: 64 rows is kept. `arith15` tile/avx4 at 20 000 / 150 000 / 1 000 000 rows was 5.75 / 4.83 / 4.87 at 64 rows, 6.22 / 3.79 / 3.11 at 128 and 6.71 / 3.32 / 5.86 at 256; `trans13` was 2.35 / 1.72 / 2.67, 2.05 / 2.16 / 2.21 and 2.01 / 2.72 / 2.20. The host is shared and the runs differ by load, so the choice rests on the 150 000 and 1 000 000 row `arith15` cells.
 
 #### CPU benchmark fixture: `cpu_bench` modes (#472)
 
@@ -677,7 +682,7 @@ cargo run --release --bin cpu_bench -- --mode all --rows 20000 --tsv
 
 | mode | what it measures | default rows |
 |---|---|---|
-| `eval` (default) | `expr::eval` walk, `eval_batch_scalar`, `eval_batch` (AVX) on the 5/9/15/25-node trees; output unchanged from the table above | 1000, 20000, 200000 |
+| `eval` (default) | `expr::eval` walk, `eval_batch_scalar`, `eval_batch_rows4` (four-row AVX), `eval_batch` (column tile) on the 5/9/15/25-node trees plus `arith15` and `trans13`; one `tree` label column | 1000, 20000, 200000 |
 | `fit` | `fit_weighted(.., 0)` (one SSE pass) and `fit_weighted(.., 8)` on `arith15` and `trans13` | 20000, 150000, 1000000 |
 | `metric` | `fit_weighted_metric` on `arith15` for `squared`, `absolute`, `median`, `interquartile`, `rank_correlation`; `score_weighted` for `median` and `squared` | 20000, 150000 |
 | `scale` | T scoped threads share the data, each runs its own `fit_weighted(.., 8)` and `eval_batch` jobs | 20000, 150000, 1000000 |
