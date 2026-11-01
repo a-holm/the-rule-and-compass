@@ -9641,6 +9641,11 @@ OPTIONS:
   --sealed <file>            locked_candidates.json from `rcsr protocol seal`
   --verify-read              with --locked-test: recompute a recorded read and
                              compare its report hash; records nothing
+  --allow-unbound-ledger     with --locked-test: read a candidate whose ledger
+                             recorded no locked test range (old ledger); the read
+                             is reported as unbound. Without it that read is
+                             refused (exit 3), as is a range that differs from
+                             the one the candidate was developed against
   --expect-report-sha256 <h> exit 1 unless the report JSON hashes to h
   --json                     print the full JSON report to stdout
                              (it ends with a ledger object: the phase ledger of the
@@ -9707,6 +9712,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut sealed_path: Option<String> = None;
     let mut locked_test = false;
     let mut verify_read = false;
+    let mut allow_unbound = false;
     let mut lockbox_arg: Option<String> = None;
     let mut expect_hash: Option<String> = None;
     let mut front_path: Option<String> = None;
@@ -9936,6 +9942,7 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--locked-test" => locked_test = true,
             "--verify-read" => verify_read = true,
+            "--allow-unbound-ledger" => allow_unbound = true,
             "--allow-lockbox" => allow_lockbox = true,
             other if other.starts_with("--policy=") => {
                 let src = &other["--policy=".len()..];
@@ -10356,6 +10363,12 @@ fn run_walkforward(args: &[String]) -> ! {
     let spec_sha = rcsr::manifest::sha256_hex(rcsr::protocol::procedure_spec(&spec, &popts).as_bytes());
     let candidate_id = rcsr::protocol::Candidate::address(&spec_sha, &data_sha, &build_id);
     let ledger = ledger_path.as_ref().map(rcsr::protocol::Ledger::new);
+    let current_range = resolved
+        .range
+        .map(|l| rcsr::protocol::LockedRange::new(&l, resolved.source.as_str()));
+    let binding = current_range
+        .as_ref()
+        .map(|current| rcsr::protocol::RangeBinding { current, allow_unbound });
     let mut read_count = 0u64;
     if let (Some(l), true) = (&ledger, locked_test) {
         match l.final_seal() {
@@ -10381,10 +10394,13 @@ fn run_walkforward(args: &[String]) -> ! {
             l.verify_chain()?;
             if locked_test {
                 let sealed = std::path::Path::new(sealed_path.as_deref().unwrap_or(""));
-                if verify_read {
-                    l.authorize_sealed(sealed, &candidate_id, &data_sha, &build_id)?;
+                let entry = if verify_read {
+                    l.authorize_sealed(sealed, &candidate_id, &data_sha, &build_id, binding)?
                 } else {
-                    l.authorize_read(sealed, &candidate_id, &data_sha, &build_id)?;
+                    l.authorize_read(sealed, &candidate_id, &data_sha, &build_id, binding)?
+                };
+                if entry.locked_test.is_none() {
+                    eprintln!("warning: candidate {} has no recorded locked test; the read is unbound", candidate_id);
                 }
                 l.check_read_marker(&data_path)?;
             } else {
@@ -10442,7 +10458,7 @@ fn run_walkforward(args: &[String]) -> ! {
                 }
             } else if locked_test {
                 l.write_read_marker(&data_path, "test_read", &report_sha)
-                    .and_then(|_| l.record_read(&candidate_id, &report_sha))
+                    .and_then(|_| l.record_read(&candidate_id, &report_sha, current_range.as_ref()))
             } else {
                 l.add_candidate(&rcsr::protocol::Candidate {
                     id: candidate_id.clone(),
@@ -10451,6 +10467,7 @@ fn run_walkforward(args: &[String]) -> ! {
                     build_commit: build_id.clone(),
                     report_sha256: report_sha.clone(),
                     expression: report.candidates.join(" | "),
+                    locked_test: current_range.clone(),
                 })
                 .map(|_| read_count)
             };
@@ -10474,6 +10491,13 @@ fn run_walkforward(args: &[String]) -> ! {
         lockbox_facts.pop();
         lockbox_facts.push(',');
         lockbox_facts.push_str(&resolved.report_fields(rows, locked_test, true));
+        if locked_test {
+            lockbox_facts.push_str(&format!(
+                ",\"data_sha256\":{},\"read_marker\":{}",
+                jstr(&data_sha),
+                jstr(&rcsr::protocol::marker_path(&data_path))
+            ));
+        }
         lockbox_facts.push('}');
         protocol_json = Some(format!(
             "{{\"lockbox\":{},\"candidate_id\":{},\"report_sha256\":{},\"test_read\":{},\
@@ -10795,7 +10819,7 @@ fn run_audit(args: &[String]) -> ! {
     value_idx.dedup();
     let names: Vec<&str> = value_idx.iter().map(|&j| table.names[j].as_str()).collect();
 
-    let (times, mut time_audit, time_report) = match time_idx {
+    let (times, time_audit, time_report) = match time_idx {
         Some(j) => {
             let raw = data::time_keys(&table, j).to_f64();
             let (seconds, audit, report) = leakage::time_normalizer(&raw, unit);
@@ -10822,7 +10846,14 @@ fn run_audit(args: &[String]) -> ! {
         .filter(|&r| !ranges.iter().any(|l| times[r].is_finite() && l.contains(times[r].floor() as i64)))
         .collect();
     let rows_left_out = times.len() - keep.len();
-    let times: Vec<f64> = keep.iter().map(|&r| times[r]).collect();
+    let (times, mut time_audit, time_report) = if rows_left_out == 0 {
+        (times, time_audit, time_report)
+    } else {
+        // The time audit and its D1 findings describe the rows that stay.
+        let kept: Vec<f64> = keep.iter().map(|&r| times[r]).collect();
+        let (seconds, audit, report) = leakage::time_normalizer(&kept, data::TimeUnit::Seconds);
+        (seconds, Some(audit), report)
+    };
     let panel = match leakage::Panel::new(
         times,
         names
@@ -11127,7 +11158,7 @@ fn run_audit(args: &[String]) -> ! {
         if clean { EXIT_OK } else { EXIT_LEAKAGE },
         hash,
         jstr(leakage::TZDB_VERSION),
-        table.len(),
+        panel.len(),
         jstr(&target),
         jstr(&time_s),
         jstr(&unit_s),

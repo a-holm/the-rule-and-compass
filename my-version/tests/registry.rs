@@ -467,6 +467,7 @@ fn append(dir: &std::path::Path, target: &str, family: &str, cols: &[&str], out:
         out: out.to_string(),
         panel_version: "2".to_string(),
         scratch: Some(path(dir, "scratch")),
+        locked_test: rcsr::lockbox::Keep::Unset,
     })
     .unwrap()
 }
@@ -533,6 +534,7 @@ fn a_time_major_family_is_appended_without_changing_existing_columns() {
         out: path(&dir, "x.rcsb"),
         panel_version: "2".to_string(),
         scratch: Some(path(&dir, "scratch")),
+        locked_test: rcsr::lockbox::Keep::Unset,
     })
     .unwrap_err();
     assert!(err.contains("unknown column 'vol21'") && err.contains("family"), "{err}");
