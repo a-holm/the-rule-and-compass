@@ -22,6 +22,20 @@ pub struct RunBook {
     pub constant: bool,
 }
 
+/// `objective.cost.source`; a run without the block counts as a flag cost.
+pub(crate) fn cost_source_of(j: &Json) -> CostSource {
+    match j
+        .get("objective")
+        .and_then(|o| o.get("cost"))
+        .and_then(|c| c.get("source"))
+        .and_then(Json::as_str)
+    {
+        Some("target_spec") => CostSource::TargetSpec,
+        Some("default") => CostSource::Default,
+        _ => CostSource::Flag,
+    }
+}
+
 impl RunBook {
     pub fn parse(text: &str) -> Result<RunBook, String> {
         crate::run_json::RunFile::parse(text)?.book()
@@ -80,11 +94,7 @@ impl RunBook {
             .filter(|t| matches!(t, Json::Obj(_)))
             .ok_or_else(|| "run.json has no target_spec".to_string())?;
         let spec = target::parse_object(target_spec).map_err(|e| format!("run.json target_spec: {}", e))?;
-        let source = match obj.get("cost").and_then(|c| c.get("source")).and_then(Json::as_str) {
-            Some("target_spec") => CostSource::TargetSpec,
-            Some("default") => CostSource::Default,
-            _ => CostSource::Flag,
-        };
+        let source = cost_source_of(j);
         let constant = finalist
             .get("constant")
             .map(|c| matches!(c, Json::Bool(true)))

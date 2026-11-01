@@ -9840,13 +9840,14 @@ fn run_walkforward(args: &[String]) -> ! {
         }
         // The front is priced as the books the search compared: the run's
         // fixed threshold, cost and target spec.
-        if run.threshold.is_some() {
-            let book = run.book().unwrap_or_else(|e| input_fail(&format!("--front {}: {}", path, e)));
+        if let Some(theta) = run.threshold {
             if threshold_fixed.is_none() && !quantile_set {
-                threshold_fixed = Some(book.threshold);
+                threshold_fixed = Some(theta);
             }
-            run_cost = Some((book.per_side_bps, book.source));
-            cost_spec = Some(book.spec);
+        }
+        if let Some(bps) = run.per_side_bps {
+            run_cost = Some((bps, run.cost_source()));
+            cost_spec = run.target_spec();
         }
         front_run = Some(run);
     } else if let Some(path) = &target_spec_path {

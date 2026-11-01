@@ -102,6 +102,16 @@ impl RunFile {
         crate::run_book::RunBook::from_json(&self.doc)
     }
 
+    /// The declared target spec of the run, when it holds a full one.
+    pub fn target_spec(&self) -> Option<crate::target::TargetSpec> {
+        crate::target::parse_object(self.doc.get("target_spec")?).ok()
+    }
+
+    /// `objective.cost.source`; a run without the block counts as a flag cost.
+    pub fn cost_source(&self) -> crate::target::CostSource {
+        crate::run_book::cost_source_of(&self.doc)
+    }
+
     /// Last time key the search trained or selected on.
     pub fn last_seen(&self) -> Option<f64> {
         let train = self.train_time?.1;
