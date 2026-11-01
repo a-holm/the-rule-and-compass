@@ -38,6 +38,8 @@ use std::time::Instant;
 pub const SCHEMA: &str = "rcsr-ladder/1";
 pub const DEFAULT_COST_BPS: f64 = 12.0;
 pub const DEFAULT_COST_GRID: [f64; 3] = [12.0, 20.0, 40.0];
+/// Cost grid multiples of the declared per-side cost, used when a target spec is the cost source.
+pub const SPEC_COST_MULTIPLES: [f64; 3] = [1.0, 2.0, 3.33];
 pub const DEFAULT_QUANTILES: [f64; 5] = [0.5, 0.6, 0.7, 0.8, 0.9];
 pub const DEFAULT_PURGE_SECONDS: f64 = protocol::DEFAULT_PURGE_SECONDS;
 pub const DEFAULT_GBM_TREES: usize = 240;
@@ -204,6 +206,7 @@ fn group_column(t: &Table, name: Option<&str>) -> Result<Vec<u64>, String> {
 #[derive(Clone, Debug)]
 pub struct Fold {
     pub label: String,
+    pub test_start: f64,
     pub fit: Vec<usize>,
     pub valid: Vec<usize>,
     pub test: Vec<usize>,
@@ -212,13 +215,40 @@ pub struct Fold {
 /// Row ranges per fold. Rows need a finite time and return. The fit range ends
 /// `purge_seconds` before the validation start so a fit label never reads into
 /// the validation slice.
-pub fn make_folds(p: &Panel, windows: &[WindowRow], purge_seconds: f64) -> Result<Vec<Fold>, String> {
+/// A fold whose fit, validation or test range touches `locked` (a declared
+/// locked test, half-open seconds) is refused.
+pub fn make_folds(
+    p: &Panel,
+    windows: &[WindowRow],
+    purge_seconds: f64,
+    locked: Option<(f64, f64)>,
+) -> Result<Vec<Fold>, String> {
     let mut folds = Vec::with_capacity(windows.len());
     for w in windows {
         let win = &w.window;
+        if let Some((ls, le)) = locked {
+            let side = if win.train_start < le && win.train_end > ls {
+                Some("fit or validation")
+            } else if win.test_start < le && win.test_end > ls {
+                Some("test")
+            } else {
+                None
+            };
+            if let Some(side) = side {
+                return Err(format!(
+                    "fold {}: the {} range touches the declared locked test {}..{}; \
+                     read it only with --locked-test --ledger --sealed",
+                    win.label,
+                    side,
+                    protocol::iso(ls),
+                    protocol::iso(le)
+                ));
+            }
+        }
         let fit_end = w.validation_start - purge_seconds;
         let mut f = Fold {
             label: win.label.clone(),
+            test_start: win.test_start,
             fit: Vec::new(),
             valid: Vec::new(),
             test: Vec::new(),
@@ -257,10 +287,56 @@ pub fn make_folds(p: &Panel, windows: &[WindowRow], purge_seconds: f64) -> Resul
 // Options
 // ---------------------------------------------------------------------------
 
+/// One search run whose finalist is scored on every fold. The run's position
+/// rule is fixed: long iff the score exceeds `threshold`.
+#[derive(Clone, Debug)]
+pub struct SrRun {
+    pub run: crate::run_json::RunFile,
+    pub expression: String,
+    pub variables: Vec<String>,
+    pub threshold: f64,
+    /// `(fold label, out-of-fold)` for every window of the table.
+    pub fold_oof: Vec<(String, bool)>,
+}
+
+impl SrRun {
+    pub fn load(path: &str) -> Result<SrRun, String> {
+        let run = crate::run_json::RunFile::load(path)?;
+        let book = run.book()?;
+        Ok(SrRun {
+            expression: book.expression,
+            variables: book.variables,
+            threshold: book.threshold,
+            run,
+            fold_oof: Vec::new(),
+        })
+    }
+
+    fn json(&self) -> String {
+        let folds: Vec<String> = self
+            .fold_oof
+            .iter()
+            .map(|(l, ok)| format!("{{\"fold\":{},\"oof\":{}}}", jstr(l), ok))
+            .collect();
+        format!(
+            "{{\"run\":{},\"run_sha256\":{},\"expression\":{},\"expression_source\":\"objective.finalist\",\
+\"threshold\":{},\"threshold_source\":\"run\",\"folds\":[{}]}}",
+            jstr(&self.run.path),
+            jstr(&self.run.sha256),
+            jstr(&self.expression),
+            jnum(self.threshold),
+            folds.join(",")
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub cost_bps: f64,
     pub cost_grid: Vec<f64>,
+    /// #487: where the cost and the return units came from. `None` is the
+    /// historical reading: the flag or default cost.
+    pub cost: Option<crate::target::CostDecl>,
     pub quantiles: Vec<f64>,
     pub purge_seconds: f64,
     /// Label horizon in seconds; sets the bootstrap block floor.
@@ -272,6 +348,8 @@ pub struct Options {
     /// Candidate evaluations and wall seconds of the symbolic-regression run.
     pub sr_evals: Option<u64>,
     pub sr_wall_seconds: Option<f64>,
+    /// A single search run scored on every fold (#492); see [`SrRun`].
+    pub sr_run: Option<SrRun>,
     pub spec: Option<TargetSpec>,
     pub gbm_trees: usize,
     pub seed: u32,
@@ -288,6 +366,7 @@ impl Default for Options {
         Options {
             cost_bps: DEFAULT_COST_BPS,
             cost_grid: DEFAULT_COST_GRID.to_vec(),
+            cost: None,
             quantiles: DEFAULT_QUANTILES.to_vec(),
             purge_seconds: DEFAULT_PURGE_SECONDS,
             horizon_seconds: 0.0,
@@ -297,6 +376,7 @@ impl Default for Options {
             sr_score_col: None,
             sr_evals: None,
             sr_wall_seconds: None,
+            sr_run: None,
             spec: None,
             gbm_trees: DEFAULT_GBM_TREES,
             seed: 0,
@@ -957,6 +1037,7 @@ pub struct Report {
     pub rows_scored: usize,
     pub periods_per_year: f64,
     pub block_len: usize,
+    pub cost: crate::target::CostDecl,
     pub cost_bps: f64,
     pub n_trials: u64,
     pub benchmark: String,
@@ -971,6 +1052,7 @@ pub struct Report {
     pub seed: u32,
     pub fdr_q: f64,
     pub gbm_beats_sr: Option<bool>,
+    pub sr_run: Option<String>,
     pub sr_evals: Option<u64>,
     pub sr_wall_seconds: Option<f64>,
     pub gbm_trees: usize,
@@ -1473,19 +1555,50 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
         r
     };
 
-    // symbolic regression, scored by the caller's out-of-fold column
-    let sr = match opts.sr_score_col.as_deref().and_then(|c| p.col(c)) {
-        Some(col) => {
-            let all: Vec<f64> = col.to_vec();
-            let mut r = score_rung(p, folds, &pool, opts, Rung::new("symbolic_regression", "model"), &mut |f: &Fold| {
-                (rows_of(&all, &f.fit), rows_of(&all, &f.valid), rows_of(&all, &f.test))
-            });
-            r.fits = opts.sr_evals.unwrap_or(0);
-            r.wall = opts.sr_wall_seconds.unwrap_or(0.0);
-            r.predicts_target = true;
-            r
+    // symbolic regression: one search run scored on every fold, or the caller's column
+    let sr = if let Some(sr_run) = &opts.sr_run {
+        let tree = crate::expr::parse(&sr_run.expression, &sr_run.variables)
+            .map_err(|e| format!("cannot parse '{}': {}", sr_run.expression, e))?;
+        let cols: Vec<&[f64]> = sr_run
+            .variables
+            .iter()
+            .map(|v| p.col(v).ok_or_else(|| format!("variable '{}' is not in the data", v)))
+            .collect::<Result<_, _>>()?;
+        let mut row = vec![0.0f64; cols.len()];
+        let mut r = Rung::new("symbolic_regression", "model");
+        r.pos = vec![0.0; n];
+        r.score = vec![f64::NAN; n];
+        for (fi, f) in folds.iter().enumerate() {
+            let (s, _) = pool.ranges[fi];
+            for (k, &i) in f.test.iter().enumerate() {
+                for (c, col) in cols.iter().enumerate() {
+                    row[c] = col[i];
+                }
+                let sc = crate::expr::eval(&tree, &row);
+                r.score[s + k] = sc;
+                r.pos[s + k] = if sc > sr_run.threshold { 1.0 } else { 0.0 };
+            }
         }
-        None => Rung::not_run("symbolic_regression", "model", "needs --sr-score (runs in the pilot and campaign)"),
+        r.params = format!("fixed threshold {} from the run; expression {}", jnum(sr_run.threshold), sr_run.expression);
+        r.fits = opts.sr_evals.unwrap_or(0);
+        r.wall = opts.sr_wall_seconds.unwrap_or(0.0);
+        r.predicts_target = true;
+        r
+    } else {
+        match opts.sr_score_col.as_deref().and_then(|c| p.col(c)) {
+            Some(col) => {
+                let all: Vec<f64> = col.to_vec();
+                let mut r = score_rung(p, folds, &pool, opts, Rung::new("symbolic_regression", "model"), &mut |f: &Fold| {
+                    (rows_of(&all, &f.fit), rows_of(&all, &f.valid), rows_of(&all, &f.test))
+                });
+                r.fits = opts.sr_evals.unwrap_or(0);
+                r.wall = opts.sr_wall_seconds.unwrap_or(0.0);
+                r.predicts_target = true;
+                r.params = format!("{}; oof=caller", r.params);
+                r
+            }
+            None => Rung::not_run("symbolic_regression", "model", "needs --sr-run or --sr-score"),
+        }
     };
 
     // matched-exposure random long, matched to the strongest searched or linear book
@@ -1697,6 +1810,12 @@ fn finish_report(
         rows_scored: pool.len(),
         periods_per_year: pool.ppy,
         block_len: block,
+        cost: opts.cost.clone().unwrap_or(crate::target::CostDecl {
+            per_side_bps: opts.cost_bps,
+            source: crate::target::CostSource::Default,
+            return_units: "simple".to_string(),
+            spec_per_side_bps: None,
+        }),
         cost_bps: opts.cost_bps,
         n_trials,
         benchmark,
@@ -1711,6 +1830,7 @@ fn finish_report(
         seed: opts.seed,
         fdr_q: opts.fdr_q,
         gbm_beats_sr,
+        sr_run: opts.sr_run.as_ref().map(SrRun::json),
         sr_evals: opts.sr_evals,
         sr_wall_seconds: opts.sr_wall_seconds,
         gbm_trees: opts.gbm_trees,
@@ -1818,9 +1938,9 @@ impl Report {
         };
         format!(
             "{{\"schema\":{},\"folds\":{},\"periods\":{},\"rows_scored\":{},\"periods_per_year\":{},\"block_len\":{},\
-\"cost_bps\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
+\"cost_bps\":{},\"cost\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
 \"sr_candidate_evaluations\":{},\"sr_wall_seconds\":{},\"gbm_beats_sr\":{}}},\"multiple_testing\":{{\"draws\":{},\"seed\":{},\
-\"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"rungs\":[{}],\"ledger\":{}}}",
+\"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"sr_run\":{},\"rungs\":[{}],\"ledger\":{}}}",
             jstr(SCHEMA),
             jarr_str(&self.folds),
             self.periods,
@@ -1828,6 +1948,7 @@ impl Report {
             jnum(self.periods_per_year),
             self.block_len,
             jnum(self.cost_bps),
+            self.cost.json(),
             self.n_trials,
             jstr(&self.benchmark),
             jstr(&self.best_long_flat_rule),
@@ -1842,6 +1963,7 @@ impl Report {
             dsr,
             pbo,
             jarr_str(&self.notes),
+            self.sr_run.as_deref().unwrap_or("null"),
             rows.join(","),
             if self.ledger.wall_s() > 0.0 {
                 self.ledger.phase_json(
@@ -1964,7 +2086,20 @@ pub struct Input {
 
 /// Load the columns the ladder needs from a CSV or a `.rcsb` store.
 pub fn load_panel(inp: &Input, opts: &Options) -> Result<Panel, String> {
-    let ret_name = inp.ret.clone().unwrap_or_else(|| inp.target.clone());
+    let declared_ret = opts
+        .cost
+        .as_ref()
+        .and_then(|_| opts.spec.as_ref())
+        .and_then(|s| s.return_column.clone());
+    if let (Some(given), Some(declared)) = (&inp.ret, &declared_ret) {
+        if given != declared {
+            return Err(format!(
+                "--return-col {} differs from the target spec return column {}; remove the flag",
+                given, declared
+            ));
+        }
+    }
+    let ret_name = inp.ret.clone().or(declared_ret).unwrap_or_else(|| inp.target.clone());
     let mut want: Vec<String> = vec![inp.target.clone(), ret_name.clone(), inp.time.clone()];
     if let Some(g) = &inp.group {
         want.push(g.clone());
@@ -1981,8 +2116,18 @@ pub fn load_panel(inp: &Input, opts: &Options) -> Result<Panel, String> {
             extras.push(c.to_string());
         }
     }
+    if let Some(sr) = &opts.sr_run {
+        for v in &sr.variables {
+            if !inp.features.is_empty() && !inp.features.contains(v) {
+                extras.push(v.clone());
+            }
+        }
+    }
     want.extend(extras.iter().cloned());
     want.extend(inp.features.iter().cloned());
+    if let Some(sr) = &opts.sr_run {
+        want.extend(sr.variables.iter().cloned());
+    }
     want.sort();
     want.dedup();
     let table = if crate::store::is_store_path(&inp.data) {
@@ -1993,7 +2138,13 @@ pub fn load_panel(inp: &Input, opts: &Options) -> Result<Panel, String> {
     } else {
         data::read_table(&inp.data)?
     };
-    panel_from_table(&table, inp, &ret_name, &extras)
+    let mut panel = panel_from_table(&table, inp, &ret_name, &extras)?;
+    if opts.cost.as_ref().is_some_and(|c| c.log_returns()) {
+        for r in &mut panel.ret {
+            *r = r.exp_m1();
+        }
+    }
+    Ok(panel)
 }
 
 pub fn panel_from_table(table: &Table, inp: &Input, ret_name: &str, extras: &[String]) -> Result<Panel, String> {
@@ -2050,14 +2201,18 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --scheme <name>           expanding | rolling | locked (default expanding)\n\
   --purge-seconds <s>       gap between the fit range and the validation slice (default 219600)\n\
   --horizon-seconds <s>     label horizon; floors the bootstrap block (default 0)\n\
-  --cost-bps <x>            per-side cost of the headline book (default 12)\n\
-  --cost-grid <a,b,...>     per-side costs reported per rung (default 12,20,40)\n\
+  --cost-bps <x>            per-side cost of the headline book (default 12; with a --target-spec cost, the spec cost, and a different value is refused)\n\
+  --cost-override <x>       per-side cost that differs from the --target-spec cost on purpose; reported as source flag with the spec cost beside it\n\
+  --cost-grid <a,b,...>     per-side costs reported per rung (default 12,20,40; 1x, 2x and 3.33x the spec cost when a --target-spec declares one)\n\
   --quantiles <a,b,...>     score-threshold grid chosen on validation (default 0.5,0.6,0.7,0.8,0.9)\n\
   --vol-col <col>           volatility column for the 20-bin E[y|sigma] rung\n\
   --reversal-col <col>      lagged return column for the naive reversal rung\n\
   --signal-col <col>        feature for the 1[f > tau] rung\n\
-  --target-spec <file>      target spec file for the zero-parameter rung (scale column must be in the panel)\n\
-  --sr-score <col>          out-of-fold symbolic-regression score column\n\
+  --target-spec <file>      target spec file: per-side cost (cost_bps / 2), return units (log is converted with exp_m1), return column and horizon; also the zero-parameter rung (scale column must be in the panel)\n\
+  --sr-run <run.json>       one search run (rcsr --objective ... --json-out) scored on every fold with the run's fixed threshold;\n\
+                            a fold whose test starts before the run's last seen row + purge is refused (exit 3)\n\
+  --allow-in-sample         with --sr-run: drop in-sample folds from every rung and label them oof:false\n\
+  --sr-score <col>          out-of-fold symbolic-regression score column from the caller (labelled oof=caller)\n\
   --sr-evals <n>            candidate evaluations of the symbolic-regression run\n\
   --sr-wall <s>             wall seconds of the symbolic-regression run\n\
   --gbm-trees <n>           GBM tuning budget in trees per fold (default 240)\n\
@@ -2067,6 +2222,16 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --fdr-q <q>               BH-FDR level (default 0.10)\n\
   --pbo-blocks <even n>     CSCV blocks (default 8)\n\
   --seed <n>                seed of every draw (default 0)\n\
+  --lockbox <START,END|none> locked test to guard: this flag (it must cover a stored\n\
+                            declaration, else exit 2), the declaration stored with --data,\n\
+                            else 2025-07-01,2026-07-01; none opts out. A fold touching it\n\
+                            is refused (exit 3)\n\
+  --locked-test             read the locked test: needs --scheme locked, --ledger and --sealed;\n\
+                            appends a baseline_read to the ledger, a second read is refused\n\
+  --ledger <file>           candidate ledger (with --locked-test)\n\
+  --sealed <file>           sealed candidate list recorded in the ledger (with --locked-test)\n\
+  --allow-unbound-ledger    with --locked-test: accept a sealed list whose candidates recorded no\n\
+                            locked test range (old ledger); a different range is refused (exit 3)\n\
   --out <file>              write the JSON report (ends with a ledger object: io and\n\
                             pnl seconds on the run wall)\n\
   --markdown <file|->       write the Markdown table\n\
@@ -2105,7 +2270,18 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let mut features: Vec<String> = Vec::new();
     let mut windows = None;
     let mut scheme = "expanding".to_string();
+    let mut lockbox_arg: Option<String> = None;
+    let mut locked_test = false;
+    let mut allow_unbound = false;
+    let mut ledger_path: Option<String> = None;
+    let mut sealed_path: Option<String> = None;
     let mut spec_path: Option<String> = None;
+    let mut sr_run_path: Option<String> = None;
+    let mut allow_in_sample = false;
+    let mut cost_flag: Option<f64> = None;
+    let mut cost_override: Option<f64> = None;
+    let mut grid_given = false;
+    let mut horizon_given = false;
     let mut out = None;
     let mut markdown = None;
     let mut print_json = false;
@@ -2127,15 +2303,24 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             "--windows" => windows = Some(val()?),
             "--scheme" => scheme = val()?,
             "--purge-seconds" => opts.purge_seconds = val()?.parse().map_err(|_| num_err(a))?,
-            "--horizon-seconds" => opts.horizon_seconds = val()?.parse().map_err(|_| num_err(a))?,
-            "--cost-bps" => opts.cost_bps = val()?.parse().map_err(|_| num_err(a))?,
-            "--cost-grid" => opts.cost_grid = parse_list(&val()?, a).map_err(usage_err)?,
+            "--horizon-seconds" => {
+                opts.horizon_seconds = val()?.parse().map_err(|_| num_err(a))?;
+                horizon_given = true;
+            }
+            "--cost-bps" => cost_flag = Some(val()?.parse().map_err(|_| num_err(a))?),
+            "--cost-override" => cost_override = Some(val()?.parse().map_err(|_| num_err(a))?),
+            "--cost-grid" => {
+                opts.cost_grid = parse_list(&val()?, a).map_err(usage_err)?;
+                grid_given = true;
+            }
             "--quantiles" => opts.quantiles = parse_list(&val()?, a).map_err(usage_err)?,
             "--vol-col" => opts.vol_col = Some(val()?),
             "--reversal-col" => opts.reversal_col = Some(val()?),
             "--signal-col" => opts.signal_col = Some(val()?),
             "--target-spec" => spec_path = Some(val()?),
             "--sr-score" => opts.sr_score_col = Some(val()?),
+            "--sr-run" => sr_run_path = Some(val()?),
+            "--allow-in-sample" => allow_in_sample = true,
             "--sr-evals" => opts.sr_evals = Some(val()?.parse().map_err(|_| num_err(a))?),
             "--sr-wall" => opts.sr_wall_seconds = Some(val()?.parse().map_err(|_| num_err(a))?),
             "--gbm-trees" => opts.gbm_trees = val()?.parse().map_err(|_| num_err(a))?,
@@ -2145,6 +2330,11 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             "--fdr-q" => opts.fdr_q = val()?.parse().map_err(|_| num_err(a))?,
             "--pbo-blocks" => opts.pbo_blocks = val()?.parse().map_err(|_| num_err(a))?,
             "--seed" => opts.seed = val()?.parse().map_err(|_| num_err(a))?,
+            "--lockbox" => lockbox_arg = Some(val()?),
+            "--locked-test" => locked_test = true,
+            "--allow-unbound-ledger" => allow_unbound = true,
+            "--ledger" => ledger_path = Some(val()?),
+            "--sealed" => sealed_path = Some(val()?),
             "--out" => out = Some(val()?),
             "--markdown" => markdown = Some(val()?),
             "--json" => print_json = true,
@@ -2157,13 +2347,26 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let target = need(target, "--target")?;
     let time = need(time, "--time")?;
     let windows = need(windows, "--windows")?;
-    if opts.cost_grid.is_empty() {
-        opts.cost_grid = vec![opts.cost_bps];
-    }
     if opts.pbo_blocks % 2 != 0 || opts.pbo_blocks < 2 {
         return Err(usage_err("--pbo-blocks must be an even number of at least 2".to_string()));
     }
     let input_err = |m: String| (3, m);
+    if allow_in_sample && sr_run_path.is_none() {
+        return Err(usage_err("--allow-in-sample applies to --sr-run only".to_string()));
+    }
+    if let Some(path) = &sr_run_path {
+        if opts.sr_score_col.is_some() {
+            return Err(usage_err("--sr-run and --sr-score are alternatives".to_string()));
+        }
+        let sr = SrRun::load(path).map_err(|e| input_err(format!("--sr-run {}", e)))?;
+        if opts.sr_evals.is_none() {
+            opts.sr_evals = sr.run.candidates_evaluated;
+        }
+        if opts.sr_wall_seconds.is_none() {
+            opts.sr_wall_seconds = sr.run.elapsed_seconds;
+        }
+        opts.sr_run = Some(sr);
+    }
     let t_io = Instant::now();
     if let Some(path) = &spec_path {
         let text = std::fs::read_to_string(path).map_err(|e| input_err(format!("{}: {}", path, e)))?;
@@ -2173,10 +2376,68 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             return Err(input_err(format!("{}: no entry for target '{}'", path, target)));
         }
     }
+    let (cost, source) = crate::target::resolve_cost(opts.spec.as_ref(), cost_flag, cost_override, DEFAULT_COST_BPS).map_err(usage_err)?;
+    opts.cost_bps = cost;
+    if let Some(s) = &opts.spec {
+        if horizon_given && (opts.horizon_seconds - s.horizon_seconds).abs() > 1e-9 {
+            return Err(usage_err(format!(
+                "--horizon-seconds {} differs from the target spec ({}); remove the flag",
+                opts.horizon_seconds, s.horizon_seconds
+            )));
+        }
+        opts.horizon_seconds = s.horizon_seconds;
+    }
+    if opts.spec.is_some() || source == crate::target::CostSource::Flag {
+        opts.cost = Some(crate::target::CostDecl::new(opts.spec.as_ref(), cost, source));
+    }
+    if !grid_given && source == crate::target::CostSource::TargetSpec {
+        opts.cost_grid = SPEC_COST_MULTIPLES.iter().map(|m| m * cost).collect();
+    }
+    if opts.cost_grid.is_empty() {
+        opts.cost_grid = vec![opts.cost_bps];
+    }
     let text = std::fs::read_to_string(&windows).map_err(|e| input_err(format!("{}: {}", windows, e)))?;
     let rows = protocol::parse_windows_csv(&text, Some(&scheme)).map_err(input_err)?;
+    let resolved = crate::lockbox::resolve(lockbox_arg.as_deref(), &data_path).map_err(|e| (e.exit, e.message))?;
+    let declared = resolved.declared();
+    if !locked_test && (ledger_path.is_some() || sealed_path.is_some()) {
+        return Err(usage_err("--ledger and --sealed apply to --locked-test only".to_string()));
+    }
+    let mut read: Option<(protocol::Ledger, String, protocol::LockedRange)> = None;
+    if locked_test {
+        let (Some(ledger), Some(sealed)) = (&ledger_path, &sealed_path) else {
+            return Err(usage_err("--locked-test needs --ledger and --sealed".to_string()));
+        };
+        if scheme != "locked" {
+            return Err(usage_err("--locked-test reads the locked scheme only: use --scheme locked".to_string()));
+        }
+        let Some(d) = &declared else {
+            return Err(usage_err("--locked-test needs a locked test range: drop --lockbox none".to_string()));
+        };
+        let (ls, le) = (d.lockbox.start as f64, d.lockbox.end as f64);
+        for r in &rows {
+            let w = &r.window;
+            if w.train_start < le && w.train_end > ls {
+                return Err(input_err(format!("window '{}' trains on the locked test", w.label)));
+            }
+            if !(w.test_start >= ls && w.test_end <= le) {
+                return Err(input_err(format!("window '{}' tests outside the locked test", w.label)));
+            }
+        }
+        let l = protocol::Ledger::new(ledger);
+        let current = protocol::LockedRange::new(&d.lockbox, d.source);
+        let binding = protocol::RangeBinding { current: &current, allow_unbound };
+        l.authorize_baseline_read(std::path::Path::new(sealed), Some(binding)).map_err(input_err)?;
+        l.check_read_marker(&data_path).map_err(input_err)?;
+        read = Some((l, crate::manifest::sha256_file(&data_path).map_err(input_err)?, current));
+    }
+    let guard = if locked_test {
+        None
+    } else {
+        declared.as_ref().map(|d| (d.lockbox.start as f64, d.lockbox.end as f64))
+    };
     let inp = Input {
-        data: data_path,
+        data: data_path.clone(),
         target,
         ret,
         time,
@@ -2184,7 +2445,22 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         features,
     };
     let panel = load_panel(&inp, &opts).map_err(input_err)?;
-    let folds = make_folds(&panel, &rows, opts.purge_seconds).map_err(input_err)?;
+    let mut folds = make_folds(&panel, &rows, opts.purge_seconds, guard).map_err(input_err)?;
+    if !locked_test {
+        if let Some(extra) = resolved.also {
+            make_folds(&panel, &rows, opts.purge_seconds, Some((extra.start as f64, extra.end as f64))).map_err(input_err)?;
+        }
+    }
+    if let Some(sr) = &mut opts.sr_run {
+        let labelled: Vec<(String, f64)> = folds.iter().map(|f| (f.label.clone(), f.test_start)).collect();
+        let oof = sr.run.oof_flags(&labelled, allow_in_sample).map_err(|e| input_err(format!("--sr-run {}: {}", sr.run.path, e)))?;
+        sr.fold_oof = labelled.iter().map(|(l, _)| l.clone()).zip(oof.iter().copied()).collect();
+        let mut keep = oof.iter();
+        folds.retain(|_| *keep.next().unwrap());
+        if folds.is_empty() {
+            return Err(input_err("--sr-run: no out-of-fold folds".to_string()));
+        }
+    }
     let io_s = t_io.elapsed().as_secs_f64();
     let mut report = run_ladder(&panel, &folds, &opts).map_err(input_err)?;
     let mut ledger = RunLedger::new();
@@ -2194,7 +2470,14 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     ledger.record_stage(Stage::HostOther, wall - ledger.stage_sum_s());
     ledger.set_wall(wall);
     report.ledger = ledger;
-    let json = report.json();
+    let mut json = report.json();
+    let in_scope = if locked_test { folds.iter().map(|f| f.test.len()).sum() } else { 0 };
+    json = resolved.splice_report(&json, in_scope, locked_test, true);
+    if let Some((ledger, data_sha, current)) = &read {
+        let report_sha = crate::manifest::sha256_hex(json.as_bytes());
+        ledger.write_read_marker(&data_path, "baseline_read", &report_sha).map_err(input_err)?;
+        ledger.record_baseline_read(data_sha, &report_sha, Some(current)).map_err(input_err)?;
+    }
     if let Some(p) = &out {
         std::fs::write(p, &json).map_err(|e| input_err(format!("{}: {}", p, e)))?;
     }

@@ -28,6 +28,8 @@ inputs that differ only where the answer must not change. The detectors live in
 
 The specs written by `rcsr::labels::LongLabelSpec::target_spec` list the forward return `fwd_<h>` as `return_column` and the scale `vol<W>` in `construction_columns`. D13a therefore refuses `fwd_<h>` and the target in `--vars`, and the spec carries `long_only: true` (`false` is refused). `tests/long_labels.rs::target_spec_links_to_the_construction_column_canary` links the label builder to the canary. Every `lbl_<name>_<kind>` column the label family writes is also refused as an input (`label` registry family), whichever target is declared.
 
+`--project` never draws a construction column of the declared target spec; the run manifest lists it under `view.omitted` with the reason `construction column of <target>`. Explicit `--vars` may still name one and the run records it in `check.construction_in_vars`. `--require-clean-inputs` turns that record into a refusal with exit 5 that names the columns.
+
 `Report::assert_clean()` **panics** on a leak and prints the detector, column
 and row. `Report::result()` returns a `LeakageFailure` for callers that map it
 onto their own exit code. Neither path logs and continues.
@@ -53,6 +55,8 @@ The command runs the D0–D6/D11/D12 panel suite (the optional `--bars`,
 | 2 | usage error |
 | 3 | input error |
 | 5 | **leakage detected** |
+
+Rows inside the protocol locked test (`--lockbox START,END|none`, the range declared with the data, else 2025-07-01..2026-07-01) are left out of every detector. The report holds `locked_test` with `source`, `declared_in` and `rows_left_out`.
 
 `rcsr audit --target-spec FILE` adds D13a-c for the target against `--vars` (all
 numeric columns except the target and time when `--vars` is absent). The same

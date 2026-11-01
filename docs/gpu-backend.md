@@ -1172,6 +1172,26 @@ explicit `gpu` is always honoured:
    this arm is selected), so the returned constants are not limited by the f32
    evaluator copy or by f32 row arithmetic.
 
+   `--fit-polish` (#496) selects the arithmetic of this step. `f64` (default) is
+   the kernel described here, bit for bit. `f32` runs the same steps on the f32
+   rows and the f32 objective of the damped loop, without the f64 re-baseline.
+   `off` returns after the damped loop. The search ranks on the f32 evaluator
+   and the reported archive is rebuilt by the exact CPU f64 refit in every mode,
+   so the setting changes the proposed constants and the kernel time only.
+   Status `recovered_skipped` (8) is set only by the f64 assembly and cannot
+   occur under `f32` or `off`. The rank, order-statistic and maximum arms keep
+   their own kernels. A checkpoint stores a non-default value and a resume
+   refuses a different one.
+
+   Each block records `clock64()` cycle counts for the damped loop and for the
+   polish (re-baseline and steps). The host apportions the measured kernel
+   seconds of a batch by the summed cycle ratio and reports
+   `gpu.fit.kernel_f32_s` (damped loop) and `gpu.fit.kernel_f64_s` (polish) in
+   `--json`, in `gpu.ledger.fit` and in the `run_end` event of the development
+   log. The two sum to the fit kernel seconds. Under `f32` or `off` the second
+   value is the time of the polish phase in that arithmetic. A kernel launch
+   without recorded cycles counts as damped loop.
+
 **Two instantiations.** The kernel is compiled twice and dispatched on the
 batch's largest constant count. `p <= 16` keeps the 256-thread block and 256-row
 chunk it was measured with (now 43 744 B of shared memory: #229 added the f64

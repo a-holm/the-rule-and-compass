@@ -179,6 +179,10 @@ struct RcCtx {
     float *d_tsign;
     double *d_tsign64;
     int has_tsign;
+    /* #496: arithmetic of the fit polish (0 f64, 1 f32, 2 off) and the summed
+       per-block cycles of the LM and polish phases since the last read. */
+    int fit_polish;
+    unsigned long long fit_cyc[2];
     unsigned int *d_prog;
     unsigned int *d_off;
     float *d_out;
@@ -3267,10 +3271,14 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                            const int *__restrict__ gauge,
                            int iters,
                            int metric,
+                           int polish,
                            double *__restrict__ outc,
                            double *__restrict__ outsse,
-                           int *__restrict__ outstatus)
+                           int *__restrict__ outstatus,
+                           unsigned long long *__restrict__ outcyc)
 {
+    const unsigned long long t_begin = clock64();
+    unsigned long long t_lm_end = t_begin;
     const int cand = blockIdx.x;
     const int tid = threadIdx.x;
     const int p = pcount[cand];
@@ -3466,6 +3474,8 @@ __global__ void fit_kernel(const float *__restrict__ cols,
             for (int i = 0; i < p; ++i) outc[(size_t)cand * (size_t)kmax + (size_t)i] = S->sc[i];
             outsse[cand] = best;
             outstatus[cand] = status;
+            outcyc[2 * cand] = (unsigned long long)(clock64() - t_begin);
+            outcyc[2 * cand + 1] = 0;
         }
         return;
     }
@@ -3585,17 +3595,22 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                 __syncthreads();
             }
         }
+        t_lm_end = clock64();
         /* Re-baseline the acceptance objective in f64: `best` so far came from
            the f32 assembly, and comparing an f64 trial against it would reject
            every polish step on a systematic rounding difference alone. */
         if (metric == RC_LOSS_HINGE_ORDINARY) phase = 1;
-        if (status == 0) {
+        if (status == 0 && polish == 0) {
             const double exact = ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->sc, S->sred);
             if (isfinite(exact)) best = exact;
         }
         /* Undamped Gauss-Newton polish, exactly like the CPU path. */
-        for (int it = 0; it < 4 && status == 0 && best != 0.0 && !stalled; ++it) {
-            ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, p, metric, phase, S->sc, S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad, &S->sskip, S->sdcarry);
+        for (int it = 0; it < 4 && status == 0 && best != 0.0 && !stalled && polish != 2; ++it) {
+            if (polish == 0) {
+                ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, p, metric, phase, S->sc, S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad, &S->sskip, S->sdcarry);
+            } else {
+                ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad, S->scarry);
+            }
             assembled = 1;
             if (S->sbad) {
                 status = 2;
@@ -3613,14 +3628,18 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                 S->strial[tid] = fmin(1e6, fmax(-1e6, t));
             }
             __syncthreads();
-            double tsse = ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred);
+            double tsse = (polish == 0)
+                ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred)
+                : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->strial, S->sred);
             /* #222: one exact f64 backtrack for the non-smooth objective. */
             if (irls && !(tsse < best)) {
                 if (tid < p) {
                     S->strial[tid] = S->sc[tid] + 0.5 * (S->strial[tid] - S->sc[tid]);
                 }
                 __syncthreads();
-                tsse = ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred);
+                tsse = (polish == 0)
+                    ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred)
+                    : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->strial, S->sred);
             }
             if (tsse < best) {
                 if (tid < p) S->sc[tid] = S->strial[tid];
@@ -3633,15 +3652,18 @@ __global__ void fit_kernel(const float *__restrict__ cols,
         }
         /* #236: the CPU slope arm keeps the incoming constants unless the
            fitted ones are finite and strictly lower. Both are judged by the
-           same f64 pair sweep. */
+           same pair sweep, in the polish arithmetic. */
         if (metric == RC_LOSS_SLOPE && cbase) {
             const double fitted = (status == 0)
                 ? best
-                : ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->sc, S->sred);
+                : (polish == 0)
+                    ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->sc, S->sred)
+                    : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->sc, S->sred);
             if (tid < p) S->strial[tid] = cbase[(size_t)cand * (size_t)kmax + (size_t)tid];
             __syncthreads();
-            const double incoming =
-                ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred);
+            const double incoming = (polish == 0)
+                ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred)
+                : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->strial, S->sred);
             if (fitted < 1e30 && fitted < incoming) {
                 best = fitted;
             } else {
@@ -3678,6 +3700,8 @@ __global__ void fit_kernel(const float *__restrict__ cols,
         for (int i = 0; i < p; ++i) outc[(size_t)cand * (size_t)kmax + (size_t)i] = S->sc[i];
         outsse[cand] = best;
         outstatus[cand] = status;
+        outcyc[2 * cand] = (unsigned long long)(t_lm_end - t_begin);
+        outcyc[2 * cand + 1] = (unsigned long long)(clock64() - t_lm_end);
     }
 }
 
@@ -3776,9 +3800,11 @@ static int ft_launch(RcCtx *c,
                      const int *d_gauge,
                      int iters,
                      int metric,
+                     int polish,
                      double *d_c,
                      double *d_sse,
-                     int *d_status)
+                     int *d_status,
+                     unsigned long long *d_cyc)
 {
     const int bytes = (int)sizeof(FtSmem<MAXC, CHUNK, PCHUNK>);
     static int opted_in = 0;
@@ -3793,8 +3819,8 @@ static int ft_launch(RcCtx *c,
     }
     fit_kernel<MAXC, CHUNK, PCHUNK><<<nprog, CHUNK, bytes, c->s_fit>>>(
         c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->n,
-        c->v, d_prog, d_off, d_p, kmax, d_c0, d_cbase, d_gauge, iters, metric, d_c, d_sse,
-        d_status);
+        c->v, d_prog, d_off, d_p, kmax, d_c0, d_cbase, d_gauge, iters, metric, polish, d_c,
+        d_sse, d_status, d_cyc);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
@@ -5625,6 +5651,7 @@ static float rc_fit_launch(RcCtx *c,
     const size_t o_c = rc_fs_take(&cur, cbytes);
     const size_t o_sse = rc_fs_take(&cur, sizeof(double) * (size_t)nprog);
     const size_t o_status = rc_fs_take(&cur, sizeof(int) * (size_t)nprog);
+    const size_t o_cyc = rc_fs_take(&cur, sizeof(unsigned long long) * (size_t)nprog * 2);
     const size_t io_end = rc_fs_take(&cur, 0);
     if (rc_fs_reserve(c, RC_FS_FIT, io_end, io_end) != 0) return -1.0f;
     rc_fs_begin(c);
@@ -5649,13 +5676,15 @@ static float rc_fit_launch(RcCtx *c,
             c, nprog, kmax, (const unsigned int *)(base + o_prog),
             (const unsigned int *)(base + o_off), (const int *)(base + o_p),
             (const double *)(base + o_c0), d_cbase, (const int *)(base + o_gauge), iters, metric,
-            (double *)(base + o_c), (double *)(base + o_sse), (int *)(base + o_status));
+            c->fit_polish, (double *)(base + o_c), (double *)(base + o_sse),
+            (int *)(base + o_status), (unsigned long long *)(base + o_cyc));
     } else {
         launched = ft_launch<FT_MAX_CONST_LARGE, FT_CHUNK_LARGE, FT_PCHUNK>(
             c, nprog, kmax, (const unsigned int *)(base + o_prog),
             (const unsigned int *)(base + o_off), (const int *)(base + o_p),
             (const double *)(base + o_c0), d_cbase, (const int *)(base + o_gauge), iters, metric,
-            (double *)(base + o_c), (double *)(base + o_sse), (int *)(base + o_status));
+            c->fit_polish, (double *)(base + o_c), (double *)(base + o_sse),
+            (int *)(base + o_status), (unsigned long long *)(base + o_cyc));
     }
     cudaEventRecord(c->t1, c->s_fit);
     if (launched != 0) {
@@ -5667,6 +5696,13 @@ static float rc_fit_launch(RcCtx *c,
     memcpy(outc, host + o_c, cbytes);
     memcpy(outsse, host + o_sse, sizeof(double) * (size_t)nprog);
     memcpy(outstatus, host + o_status, sizeof(int) * (size_t)nprog);
+    {
+        const unsigned long long *cyc = (const unsigned long long *)(host + o_cyc);
+        for (int k = 0; k < nprog; ++k) {
+            c->fit_cyc[0] += cyc[2 * k];
+            c->fit_cyc[1] += cyc[2 * k + 1];
+        }
+    }
     rc_fs_ok(c, RC_FS_FIT);
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
@@ -5711,6 +5747,29 @@ float rc_fit_batch_from(void *ctx,
 {
     return rc_fit_launch((RcCtx *)ctx, prog, off, pcount, nprog, kmax, c0, cbase, gauge, iters,
                          metric, outc, outsse, outstatus);
+}
+
+/* #496: arithmetic of the fit kernel polish for later launches: 0 f64, 1 f32,
+ * 2 off. */
+int rc_set_fit_polish(void *ctx, int mode)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || mode < 0 || mode > 2) return -1;
+    c->fit_polish = mode;
+    return 0;
+}
+
+/* #496: per-block cycle sums of the LM phase and the polish phase of the fit
+ * launches since the last call; resets both. */
+int rc_take_fit_cycles(void *ctx, unsigned long long *out)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !out) return -1;
+    out[0] = c->fit_cyc[0];
+    out[1] = c->fit_cyc[1];
+    c->fit_cyc[0] = 0;
+    c->fit_cyc[1] = 0;
+    return 0;
 }
 
 /* Shape of the fit-kernel instantiation that would run a batch whose largest
