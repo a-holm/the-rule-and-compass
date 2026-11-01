@@ -1661,7 +1661,8 @@ mod block_tests {
 
     #[test]
     fn block_seams_split_runs_inside_a_group() {
-        let s = panel(&[8, 8]);
+        let mut s = panel(&[8, 8]);
+        s.ret.iter_mut().for_each(|r| *r = 0.01);
         let b = FitnessBook::with_blocks(&s, &spec(), 900.0, 2, 1.0).unwrap();
         let f = b.flags();
         let id = |i: usize| f[i] >> FITNESS_BLOCK_SHIFT;

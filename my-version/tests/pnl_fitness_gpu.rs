@@ -325,10 +325,125 @@ fn a_context_without_a_book_or_with_a_refused_book_is_refused() {
     assert!(ev.set_pnl_book(&short).unwrap_err().contains("rows"));
 }
 
+// ---- #484: time blocks ----
+
+fn book_blocks(f: &Fixture, min_trades: usize, blocks: usize, lambda: f64) -> FitnessBook {
+    FitnessBook::with_blocks(&f.slice, &spec(min_trades), 900.0, blocks, lambda).expect("a profitable blocked book")
+}
+
+/// The device value and per-block totals of every program against the CPU
+/// block tree applied to the device's own predictions.
+fn assert_exact_blocks(f: &Fixture, b: &FitnessBook, trees: &[Node]) -> usize {
+    let Some(mut ev) = evaluator(f, b) else {
+        return 0;
+    };
+    let pop = compiled(trees);
+    let (prog, off) = pop.programs();
+    let (batch, blocks) = ev
+        .long_pnl_block_totals_for_tests(prog, off, b.blocks())
+        .expect("the totals launch runs");
+    let scored = ev.score_batch(prog, off, ScoreObjective::LongPnl, &vec![0; trees.len()]);
+    assert!(scored.ms >= 0.0 && scored.values.len() == trees.len());
+    let mut finite = 0usize;
+    for k in 0..trees.len() {
+        let words = &prog[off[k] as usize..off[k + 1] as usize];
+        let pred: Vec<f64> = ev
+            .predict_one_for_tests(words)
+            .expect("the device predicts")
+            .iter()
+            .map(|&p| p as f64)
+            .collect();
+        let cpu = b.block_totals(&pred);
+        let want = b.fitness_of(&cpu);
+        assert_eq!(blocks[k].len(), cpu.len());
+        for (j, (d, c)) in blocks[k].iter().zip(&cpu).enumerate() {
+            assert_eq!(d.flips, c.flips, "program {k} block {j} flips");
+            assert_eq!(d.exits, c.exits, "program {k} block {j} exits");
+            assert_eq!(d.nonfinite, c.nonfinite, "program {k} block {j} non-finite");
+            assert_eq!(d.gross.to_bits(), c.gross.to_bits(), "program {k} block {j} gross {} vs {}", d.gross, c.gross);
+        }
+        assert_eq!(batch.values[k].to_bits(), want.to_bits(), "program {k} fitness {} vs {}", batch.values[k], want);
+        assert_eq!(scored.values[k].to_bits(), want.to_bits(), "program {k} score_batch");
+        assert_eq!(want.to_bits(), b.regret(&pred).to_bits());
+        let bad = cpu.iter().any(|t| t.nonfinite);
+        let status = if bad { ScoreStatus::NonFinite } else { ScoreStatus::Ok };
+        assert_eq!(batch.status[k], status, "program {k} status");
+        if want.is_finite() {
+            finite += 1;
+        }
+    }
+    finite
+}
+
+#[test]
+fn device_block_totals_equal_the_cpu_tree_on_a_small_book() {
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    for blocks in [2usize, 5, 8] {
+        let b = book_blocks(&f, 1, blocks, 1.5);
+        assert_eq!(b.blocks(), blocks);
+        let finite = assert_exact_blocks(&f, &b, &programs(24, 5));
+        assert!(finite == 0 || finite >= 8, "{finite} finite programs at {blocks} blocks");
+    }
+}
+
+/// Group 0 and group 1 each have 16384 rows, so with two blocks the cut falls
+/// on the 8192-row segment boundary inside both groups, and a one-row group
+/// follows.
+#[test]
+fn device_block_totals_equal_the_cpu_tree_when_a_cut_meets_a_segment_boundary() {
+    let f = fixture(&[0, 16_384, 32_768], 32_769, 19);
+    for (blocks, lambda) in [(2usize, 1.0), (4, 0.0), (3, 2.5)] {
+        let b = book_blocks(&f, 1, blocks, lambda);
+        let finite = assert_exact_blocks(&f, &b, &programs(24, 7));
+        assert!(finite == 0 || finite >= 8, "{finite} finite programs at {blocks} blocks");
+    }
+}
+
+#[test]
+fn device_block_totals_equal_the_cpu_tree_on_device_predictions() {
+    let f = fixture(&STARTS_100K, 100_003, 7);
+    for blocks in [2usize, 5, 8] {
+        let b = book_blocks(&f, 1, blocks, 1.0);
+        let finite = assert_exact_blocks(&f, &b, &programs(64, 9));
+        assert!(finite == 0 || finite >= 32, "{finite} finite programs at {blocks} blocks");
+    }
+}
+
+#[test]
+fn block_trade_floor_and_flat_programs_have_exact_values() {
+    let f = fixture(&STARTS_SMALL, 16_401, 3);
+    let trees = vec![constant(-1.0), constant(0.0), input(0), node(Op::Ln, vec![input(0)])];
+    let open = book_blocks(&f, 0, 4, 1.0);
+    let Some(mut ev) = evaluator(&f, &open) else {
+        return;
+    };
+    let pop = compiled(&trees);
+    let (prog, off) = pop.programs();
+    let b = ev.score_batch(prog, off, ScoreObjective::LongPnl, &vec![0; trees.len()]);
+    // Every block is flat: regret 1 each, sd 0, so the fitness is exactly 1.
+    for k in 0..2 {
+        assert_eq!(b.values[k].to_bits(), 1.0f64.to_bits(), "program {k}");
+    }
+    assert!(b.values[2].is_finite() && b.values[2] < 1.0);
+    assert_eq!(b.values[3], f64::INFINITY);
+    assert_eq!(b.status[3], ScoreStatus::NonFinite);
+
+    let floor = book_blocks(&f, 1_000_000, 4, 1.0);
+    ev.set_pnl_book(&floor).expect("a second book replaces the first");
+    let b = ev.score_batch(prog, off, ScoreObjective::LongPnl, &vec![0; trees.len()]);
+    for k in 0..3 {
+        assert_eq!(b.values[k], f64::INFINITY, "program {k} is under the trade floor");
+    }
+}
+
 // ---- search level ----
 
 /// Four groups of 600 rows. `x0` carries the return, `x1` is noise.
 fn search_fixture() -> (Sample, Arc<FitnessBook>) {
+    search_fixture_blocks(1)
+}
+
+fn search_fixture_blocks(blocks: usize) -> (Sample, Arc<FitnessBook>) {
     let f = fixture(&[0, 600, 1200, 1800], 2_400, 17);
     let x = (0..f.n)
         .map(|i| (0..2).map(|v| f.cols[v * f.n + i] as f64).collect())
@@ -340,7 +455,7 @@ fn search_fixture() -> (Sample, Arc<FitnessBook>) {
         ys: Vec::new(),
         pairs: None,
     };
-    let b = FitnessBook::new(&f.slice, &spec(1), 900.0).unwrap();
+    let b = FitnessBook::with_blocks(&f.slice, &spec(1), 900.0, blocks, 1.0).unwrap();
     (sample, Arc::new(b))
 }
 
@@ -527,6 +642,91 @@ fn tiled_residency_names_its_refusal() {
     let pop = compiled(&programs(2, 1));
     let (prog, off) = pop.programs();
     assert!(ev.score_batch(prog, off, ScoreObjective::LongPnl, &[0, 0]).ms < 0.0);
+}
+
+#[test]
+fn blocked_pipelined_search_archives_device_scores() {
+    let (sample, b) = search_fixture_blocks(3);
+    assert_eq!(b.blocks(), 3);
+    let seen: Archived = Arc::default();
+    let cfg = config(&b, &seen);
+    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let out = search::run(&cfg, &sample, &sample);
+    assert_device_scored(&out);
+    assert_archived_values_are_device_scores(&sample, &b, &seen);
+    for s in &out.archive.items {
+        let pred: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(&s.tree, r)).collect();
+        assert_eq!(s.error.to_bits(), b.regret(&pred).to_bits(), "{}", show(&s.tree));
+    }
+}
+
+#[test]
+fn blocked_synchronous_device_fit_archives_device_scores() {
+    let (sample, b) = search_fixture_blocks(4);
+    let seen: Archived = Arc::default();
+    let cfg = Config {
+        fit_strategy: rcsr::fit::FitStrategy::Gpu,
+        pipeline_depth: 0,
+        ..config(&b, &seen)
+    };
+    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let out = search::run(&cfg, &sample, &sample);
+    assert_device_scored(&out);
+    assert!(out.gpu.as_ref().unwrap().fit_gpu > 0, "the device fitted constants");
+    assert_archived_values_are_device_scores(&sample, &b, &seen);
+}
+
+/// Throughput of the blocked kernel against the unblocked one on the same
+/// 1,000,000 rows and programs.
+#[test]
+#[ignore]
+fn long_pnl_block_throughput_against_one_block() {
+    let n = 1_000_000usize;
+    let starts: Vec<usize> = (0..100).map(|g| g * 10_000).collect();
+    let f = fixture(&starts, n, 29);
+    let Some(mut ev) = evaluator(&f, &book(&f, 1)) else {
+        return;
+    };
+    let mut rng = Lcg(31);
+    let trees: Vec<Node> = (0..256)
+        .map(|k| {
+            let t = random_tree(&mut rng, 4);
+            if k % 2 == 0 {
+                node(Op::Tanh, vec![t])
+            } else {
+                node(Op::Logistic, vec![t])
+            }
+        })
+        .collect();
+    let pop = compiled(&trees);
+    let (prog, off) = pop.programs();
+    let zeros = vec![0; trees.len()];
+    let mut rates = Vec::new();
+    for blocks in [1usize, 2, 5, 8, 1] {
+        ev.set_pnl_book(&book_blocks(&f, 1, blocks, 1.0)).expect("the book uploads");
+        for _ in 0..2 {
+            assert!(ev.score_batch(prog, off, ScoreObjective::LongPnl, &zeros).ms >= 0.0);
+        }
+        let reps = 10;
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            assert!(ev.score_batch(prog, off, ScoreObjective::LongPnl, &zeros).ms >= 0.0);
+        }
+        let rate = (n * trees.len()) as f64 / (t.elapsed().as_secs_f64() / reps as f64);
+        println!("blocks {blocks} {rate:.3e} row-evals/s");
+        rates.push(rate);
+    }
+    let base = rates[0].max(rates[4]);
+    println!("ratios to one block: 2 {:.3} 5 {:.3} 8 {:.3}", rates[1] / base, rates[2] / base, rates[3] / base);
+    for (blocks, rate) in [(2, rates[1]), (5, rates[2]), (8, rates[3])] {
+        assert!(rate >= 0.6 * base, "{blocks} blocks {rate:.3e} vs one block {base:.3e}");
+    }
 }
 
 /// The 1,000,000-row, 256-program throughput of the long-P&L batch against

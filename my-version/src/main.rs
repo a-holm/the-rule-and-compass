@@ -194,6 +194,14 @@ INPUT:
                              residency keeps the CPU. Reported values stay
                              exact CPU f64. Resume needs the same cost,
                              threshold and rows
+  --pnl-blocks K          1 to 8 time blocks for --fitness pnl (default 1 =
+                             off, the plain regret). The training timestamps
+                             are cut into K equal runs, each block is its own
+                             long/flat book, and the fitness is the mean block
+                             regret plus --pnl-block-lambda times their
+                             standard deviation. Needs --fitness pnl
+  --pnl-block-lambda L      weight of the block spread (default 1.0, finite,
+                             >= 0; 0 is the plain mean). Needs --fitness pnl
   --position long_only|top_tercile
                              long_only (default): 1[pred > --threshold]. top_tercile: per
                              timestamp the top floor(n/3) finite predictions are long (p=1),
