@@ -487,8 +487,9 @@ fn slope_fit_keeps_incoming_constants_when_better() {
     assert_eq!(bits(&constants(&cpu)), bits(&[3.0, 7.0]), "the CPU arm kept them too");
 }
 
-/// D7 algorithm parity: from the same start, the device slope is at most the
-/// CPU arm's (squared fit then differenced IRLS) times `1 + 1e-5`.
+/// D7 algorithm parity: from the same start and with the iterations to
+/// converge, the device slope is at most the CPU arm's (squared fit then
+/// differenced IRLS) times `1 + 1e-5`.
 #[test]
 fn slope_device_fit_matches_cpu() {
     let s = series(4_000, 23);
@@ -498,18 +499,19 @@ fn slope_device_fit_matches_cpu() {
     let starts = [affine(0.0, 0.0), shaped(0.3, 0.1, 0.2), wave(1.0, 1.0, 0.0, 0.0)];
     let plans: Vec<fit::GpuFitPlan> = starts.iter().map(|t| fit::gpu_fit_plan(t).unwrap()).collect();
     let refs: Vec<&fit::GpuFitPlan> = plans.iter().collect();
-    let (out, ms) = ev.slope_fit_batch(&refs, 8);
+    let iters = 32;
+    let (out, ms) = ev.slope_fit_batch(&refs, iters);
     assert!(ms >= 0.0);
     for (k, start) in starts.iter().enumerate() {
         let mut dev = start.clone();
         plans[k].apply(&mut dev, &out[k].c);
         let dev_score = slope(&dev, &s);
         let mut cpu = start.clone();
-        fit::fit_weighted(&mut cpu, &s.x, &s.y, &[], 8);
-        fit::slope_irls(&mut cpu, &s.x, &s.y, &fit::consecutive_pairs(s.len()), 8);
+        fit::fit_weighted(&mut cpu, &s.x, &s.y, &[], iters);
+        fit::slope_irls(&mut cpu, &s.x, &s.y, &fit::consecutive_pairs(s.len()), iters);
         let cpu_score = slope(&cpu, &s);
         let mut full = start.clone();
-        let full_score = fit::fit_weighted_metric(&mut full, &s.x, &s.y, &[], 8, Metric::Slope);
+        let full_score = fit::fit_weighted_metric(&mut full, &s.x, &s.y, &[], iters, Metric::Slope);
         eprintln!(
             "slope tree {k}: start {:.9} device {dev_score:.9} cpu irls {cpu_score:.9} cpu arm {full_score:.9} status {}",
             slope(start, &s),
