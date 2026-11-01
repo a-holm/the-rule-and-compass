@@ -920,19 +920,19 @@ pub fn score_with_constants(pred: &[f64], y: &[f64], m: Metric, k: usize) -> f64
             return f64::INFINITY;
         }
     }
-    let resid: Vec<f64> = pred.iter().zip(y).map(|(p, t)| p - t).collect();
+    let mut resid: Vec<f64> = pred.iter().zip(y).map(|(p, t)| p - t).collect();
     match m {
         Metric::Absolute | Metric::ImplicitResidual => mean_abs(&resid),
         Metric::Squared => mean_sq(&resid),
         Metric::Correlation => 1.0 - correlation(pred, y).abs(),
         Metric::CorrelationSigned => 1.0 - correlation(pred, y),
-        Metric::Median => median_abs(&resid),
+        Metric::Median => median_abs_in_place(&mut resid),
         Metric::Maximum => resid.iter().fold(0.0f64, |a, e| a.max(e.abs())),
         Metric::Signed => mean(&resid).abs(),
         Metric::LogSquashed => resid.iter().map(|e| (1.0 + e * e).ln()).sum::<f64>() / n as f64,
         Metric::RankCorrelation => 1.0 - rank_correlation(pred, y).abs(),
         Metric::RankCorrelationSigned => 1.0 - rank_correlation(pred, y),
-        Metric::Interquartile => interquartile_mean_abs(&resid),
+        Metric::Interquartile => interquartile_mean_abs_in_place(&mut resid),
         Metric::Slope => {
             if n < 2 {
                 return f64::INFINITY;
@@ -1250,60 +1250,69 @@ fn rss(v: &[f64]) -> f64 {
     v.iter().map(|e| e * e).sum()
 }
 
-fn sorted(v: &[f64]) -> Vec<f64> {
-    let mut s = v.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    s
-}
-
 /// Median of the absolute errors. `+inf` is impossible here (inputs are finite
 /// and non-empty), so the empty case returns 0 by convention.
-fn median_abs(v: &[f64]) -> f64 {
-    if v.is_empty() {
+/// The buffer is owned by the caller: its values are replaced by their
+/// absolute values and reordered.
+fn median_abs_in_place(s: &mut [f64]) -> f64 {
+    if s.is_empty() {
         return 0.0;
     }
-    let s = sorted(&v.iter().map(|e| e.abs()).collect::<Vec<_>>());
+    for e in s.iter_mut() {
+        *e = e.abs();
+    }
     let n = s.len();
+    let (left, upper, _) = s.select_nth_unstable_by(n / 2, f64::total_cmp);
+    let upper = *upper;
     if n % 2 == 1 {
-        s[n / 2]
+        upper
     } else {
-        0.5 * (s[n / 2 - 1] + s[n / 2])
+        let lower = left.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        0.5 * (lower + upper)
     }
 }
 
 /// Mean of the absolute errors that fall between the 25th and 75th percentile —
 /// the "interquartile mean absolute error". Robust to extreme residuals without
 /// throwing most of the data away, as the median does.
-fn interquartile_mean_abs(v: &[f64]) -> f64 {
-    if v.is_empty() {
+/// The buffer is owned by the caller: its values are replaced by their absolute
+/// values and reordered.
+fn interquartile_mean_abs_in_place(s: &mut [f64]) -> f64 {
+    if s.is_empty() {
         return 0.0;
     }
-    let s = sorted(&v.iter().map(|e| e.abs()).collect::<Vec<_>>());
+    for e in s.iter_mut() {
+        *e = e.abs();
+    }
     let n = s.len();
     if n < 4 {
-        return mean(&s);
+        s.sort_unstable_by(f64::total_cmp);
+        return mean(s);
     }
     let lo = n / 4;
-    let hi = (3 * n) / 4;
-    let slice = &s[lo..hi.max(lo + 1)];
+    let end = ((3 * n) / 4).max(lo + 1);
+    let (_, _, right) = s.select_nth_unstable_by(lo, f64::total_cmp);
+    right.select_nth_unstable_by(end - lo - 1, f64::total_cmp);
+    let slice = &mut s[lo..end];
+    slice.sort_unstable_by(f64::total_cmp);
     mean(slice)
 }
 
 /// Average ranks (1-based), with ties sharing their mean rank.
 fn ranks(v: &[f64]) -> Vec<f64> {
     let n = v.len();
-    let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap_or(std::cmp::Ordering::Equal));
+    let mut order: Vec<(f64, usize)> = v.iter().copied().zip(0..n).collect();
+    order.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let mut r = vec![0.0; n];
     let mut i = 0;
     while i < n {
         let mut j = i + 1;
-        while j < n && v[idx[j]] == v[idx[i]] {
+        while j < n && order[j].0 == order[i].0 {
             j += 1;
         }
         // ranks i+1 .. j share the average
         let avg = 0.5 * ((i + 1) as f64 + j as f64);
-        for &k in &idx[i..j] {
+        for &(_, k) in &order[i..j] {
             r[k] = avg;
         }
         i = j;
@@ -1339,19 +1348,19 @@ pub fn centred_ranks_doubled(v: &[f64]) -> Option<Vec<i64>> {
     if v.iter().any(|x| !x.is_finite()) {
         return None;
     }
-    let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap_or(std::cmp::Ordering::Equal));
+    let mut order: Vec<(f64, usize)> = v.iter().copied().zip(0..n).collect();
+    order.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let mut a = vec![0i64; n];
     let mut i = 0usize;
     while i < n {
         let mut j = i + 1;
-        while j < n && v[idx[j]] == v[idx[i]] {
+        while j < n && order[j].0 == order[i].0 {
             j += 1;
         }
         // Run `[i, j)` holds sorted positions `i+1 ..= j`, whose average rank is
         // `(i + 1 + j)/2`; doubled and centred that is exactly `i + j - n`.
         let centred = (i + j) as i64 - n as i64;
-        for &k in &idx[i..j] {
+        for &(_, k) in &order[i..j] {
             a[k] = centred;
         }
         i = j;
@@ -1777,6 +1786,104 @@ pub fn hinge_squared(pred: &[f64], y: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sorted_reference(v: &[f64]) -> Vec<f64> {
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        s
+    }
+
+    fn median_reference(v: &[f64]) -> f64 {
+        if v.is_empty() {
+            return 0.0;
+        }
+        let s = sorted_reference(&v.iter().map(|e| e.abs()).collect::<Vec<_>>());
+        let n = s.len();
+        if n % 2 == 1 {
+            s[n / 2]
+        } else {
+            0.5 * (s[n / 2 - 1] + s[n / 2])
+        }
+    }
+
+    fn interquartile_reference(v: &[f64]) -> f64 {
+        if v.is_empty() {
+            return 0.0;
+        }
+        let s = sorted_reference(&v.iter().map(|e| e.abs()).collect::<Vec<_>>());
+        let n = s.len();
+        if n < 4 {
+            return mean(&s);
+        }
+        let lo = n / 4;
+        let hi = (3 * n) / 4;
+        mean(&s[lo..hi.max(lo + 1)])
+    }
+
+    /// Residual vectors with ties, both zeros and mixed signs.
+    fn selection_cases() -> Vec<Vec<f64>> {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u32
+        };
+        let mut cases = Vec::new();
+        for n in [1usize, 2, 3, 4, 5, 1000, 1001] {
+            let continuous: Vec<f64> = (0..n)
+                .map(|_| (f64::from(next() % 20_001) - 10_000.0) / 137.0)
+                .collect();
+            let tied: Vec<f64> = (0..n)
+                .map(|_| match next() % 6 {
+                    0 => 0.0,
+                    1 => -0.0,
+                    2 => 1.5,
+                    3 => -1.5,
+                    4 => 2.25,
+                    _ => -3.0,
+                })
+                .collect();
+            cases.push(continuous);
+            cases.push(tied);
+            cases.push(vec![0.5; n]);
+        }
+        cases
+    }
+
+    #[test]
+    fn median_by_selection_matches_sort() {
+        for v in selection_cases() {
+            assert_eq!(
+                median_abs_in_place(&mut v.clone()).to_bits(),
+                median_reference(&v).to_bits(),
+                "n = {}",
+                v.len()
+            );
+        }
+    }
+
+    #[test]
+    fn interquartile_by_selection_matches_sort() {
+        for v in selection_cases() {
+            assert_eq!(
+                interquartile_mean_abs_in_place(&mut v.clone()).to_bits(),
+                interquartile_reference(&v).to_bits(),
+                "n = {}",
+                v.len()
+            );
+        }
+    }
+
+    #[test]
+    fn ranks_with_ties_and_signed_zeros_share_the_mean_rank() {
+        let v = [3.0, 0.0, -0.0, 1.0, 3.0, 3.0, -2.0];
+        assert_eq!(ranks(&v), vec![6.0, 2.5, 2.5, 4.0, 6.0, 6.0, 1.0]);
+        assert_eq!(
+            centred_ranks_doubled(&v),
+            Some(vec![4, -3, -3, 0, 4, 4, -6])
+        );
+    }
 
     fn approx(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() <= tol
