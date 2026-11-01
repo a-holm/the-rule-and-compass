@@ -15,7 +15,7 @@ use super::{adj_terms, apply_op, Flat, NormalEquations};
 use crate::expr::Op;
 
 /// Rows per tile.
-const TILE: usize = 64;
+const TILE: usize = 256;
 
 const NO_KID: u32 = u32::MAX;
 
@@ -254,7 +254,7 @@ fn normal_impl(
     c: &[f64],
     s: &mut Scratch,
 ) -> Option<NormalEquations> {
-    let mut jtj = vec![vec![0.0; k]; k];
+    let mut jtj = vec![0.0; k * k];
     let mut jtr = vec![0.0; k];
     let mut gi = vec![0.0; k];
     let mut base = 0;
@@ -281,20 +281,24 @@ fn normal_impl(
                 gi[i] = v;
             }
             for i in 0..k {
-                jtr[i] += gi[i] * res;
-                for j in 0..=i {
-                    jtj[i][j] += gi[i] * gi[j];
+                let gii = gi[i];
+                jtr[i] += gii * res;
+                let row = &mut jtj[i * k..i * k + i + 1];
+                for (a, &gj) in row.iter_mut().zip(&gi[..=i]) {
+                    *a += gii * gj;
                 }
             }
         }
         base += n;
     }
+    let mut full = vec![vec![0.0; k]; k];
     for i in 0..k {
-        for j in 0..i {
-            jtj[j][i] = jtj[i][j];
+        for j in 0..=i {
+            full[i][j] = jtj[i * k + j];
+            full[j][i] = jtj[i * k + j];
         }
     }
-    Some(NormalEquations { jtj, jtr })
+    Some(NormalEquations { jtj: full, jtr })
 }
 
 /// Operators with their own monomorphised loop. Every other operator runs the
