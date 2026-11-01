@@ -441,6 +441,8 @@ pub struct GenCounters {
     /// #463: candidates dropped after the fit because they exceeded the
     /// complexity cap; each one re-enters variation.
     pub post_fit_drops: std::sync::atomic::AtomicU64,
+    /// #500: carried individuals re-scored at the start of a generation.
+    pub reevals: std::sync::atomic::AtomicU64,
     /// #477: offspring rejected before the fit because no input reaches the
     /// rows outside an aggregate or meta operator.
     pub constant: std::sync::atomic::AtomicU64,
@@ -928,6 +930,10 @@ impl Ind {
     fn reeval(&mut self, train: &EvalSample, cfg: &Config) {
         self.tree = expr::simplify(&self.tree);
         self.complexity = cfg.complexity_model.complexity(&self.tree);
+        self.score_in_place(train, cfg);
+    }
+
+    fn score_in_place(&mut self, train: &EvalSample, cfg: &Config) {
         // #25: re-evaluation must not resurrect a rejected candidate.
         let want_descriptor = cfg.qd_bins > 0 && !train.sample.is_multi();
         let (error, descriptor) = if cfg.accepts_dimensions(&self.tree) {
@@ -937,6 +943,23 @@ impl Ind {
         };
         self.error = error;
         self.descriptor = descriptor;
+    }
+
+    /// #500: `reeval` for an individual with a non-finite error. A `+inf` error
+    /// stays `+inf`, without a pass over every row, when the dimension filter
+    /// rejects the tree or a leading slice of the rows already holds a
+    /// non-finite prediction. Returns whether a full scoring pass ran.
+    fn reeval_probing(&mut self, train: &EvalSample, cfg: &Config) -> bool {
+        self.tree = expr::simplify(&self.tree);
+        self.complexity = cfg.complexity_model.complexity(&self.tree);
+        if self.error == f64::INFINITY
+            && (!cfg.accepts_dimensions(&self.tree) || prefix_is_non_finite(&self.tree, train, cfg))
+        {
+            self.descriptor = None;
+            return false;
+        }
+        self.score_in_place(train, cfg);
+        true
     }
 
     // #86: re-fit the constants on the current generation's fit rows *before*
@@ -3623,6 +3646,35 @@ fn eval_error_and_descriptor(
     })
 }
 
+/// #500: rows probed for a non-finite prediction before a full re-score.
+const INF_PROBE_ROWS: usize = 2048;
+
+/// #500: whether the first rows already hold a non-finite prediction, which
+/// makes the full score `+inf` for the plain metrics. Shapes whose score does
+/// not follow that rule (implicit, weighted, multi-output, descriptor, P&L
+/// book) report `false` and take the full pass.
+fn prefix_is_non_finite(tree: &Node, data: &EvalSample, cfg: &Config) -> bool {
+    let s = data.sample;
+    if s.is_empty()
+        || s.is_multi()
+        || !s.w.is_empty()
+        || cfg.metric.is_implicit()
+        || cfg.qd_bins > 0
+        || cfg.fitness.book().is_some()
+    {
+        return false;
+    }
+    let rows = s.x.len().min(INF_PROBE_ROWS);
+    if let Some(cols) = &data.cols {
+        if let Some(program) = crate::eval_soa::compile(tree) {
+            let mut pred = vec![0.0; rows];
+            crate::eval_soa::eval_batch(&program, cols, rows, &mut pred);
+            return pred.iter().any(|p| !p.is_finite());
+        }
+    }
+    s.x.iter().take(rows).any(|row| !eval(tree, row).is_finite())
+}
+
 /// #475: one candidate's prediction vector, owned.
 ///
 /// The fast path compiles the tree once and evaluates all rows in tiles over
@@ -5073,8 +5125,8 @@ fn evolve_island(
 ) {
     if !screened {
         for ind in isl.iter_mut() {
-            if !ind.error.is_finite() {
-                ind.reeval(train, cfg); // #25
+            if !ind.error.is_finite() && ind.reeval_probing(train, cfg) {
+                GenCounters::count(counters, |c| &c.reevals); // #25 #500
             }
         }
     }
@@ -6152,6 +6204,7 @@ fn dev_generation(
         eval_cpu_s: GenCounters::seconds(counters, |c| &c.eval_ns) + fallback_s,
         phase_b_s: GenCounters::seconds(counters, |c| &c.batch_ns),
         post_fit_drops: GenCounters::total(counters, |c| &c.post_fit_drops) as usize,
+        reevals: GenCounters::total(counters, |c| &c.reevals) as usize,
         constant_rejected: GenCounters::total(counters, |c| &c.constant) as usize,
         best_error,
         p05: q(0.05),
@@ -10659,6 +10712,101 @@ mod tests {
         let rebuilt = Ind::pending(input(0), &cfg);
         assert_eq!(rebuilt.age, 0);
         assert_eq!(Ind::evaluated(input(0), &data, &cfg).age, 0);
+    }
+
+    /// #500: trees whose predictions are non-finite on every row, one of them
+    /// with a subtree that `expr::simplify` rewrites, mixed with finite ones.
+    fn inf_population(data: &EvalSample, cfg: &Config) -> Vec<Ind> {
+        (0..40)
+            .map(|i| {
+                let tree = match i % 4 {
+                    0 => node(Op::Div, vec![input(0), constant(0.0)]),
+                    1 => node(
+                        Op::Add,
+                        vec![
+                            node(Op::Div, vec![input(0), constant(0.0)]),
+                            node(Op::Add, vec![constant(1.0), constant(2.0)]),
+                        ],
+                    ),
+                    _ => node(Op::Add, vec![input(0), constant(i as f64)]),
+                };
+                Ind::evaluated(tree, data, cfg)
+            })
+            .collect()
+    }
+
+    fn same_state(a: &Ind, b: &Ind) -> bool {
+        a.tree == b.tree
+            && a.error.to_bits() == b.error.to_bits()
+            && a.complexity.to_bits() == b.complexity.to_bits()
+            && a.descriptor == b.descriptor
+    }
+
+    /// #500: probing a `+inf` individual leaves exactly the state a full
+    /// re-score leaves, and runs no scoring pass for a tree that is non-finite
+    /// on the probed rows.
+    #[test]
+    fn skipping_inf_reeval_keeps_the_cpu_trajectory() {
+        let s = sample();
+        let cfg = Config::default();
+        let data = EvalSample::new(&s, &cfg);
+        let mut ran = 0;
+        for ind in inf_population(&data, &cfg) {
+            let mut full = ind.clone();
+            full.reeval(&data, &cfg);
+            let mut probed = ind.clone();
+            if probed.reeval_probing(&data, &cfg) {
+                ran += 1;
+            }
+            assert!(same_state(&full, &probed));
+        }
+        assert_eq!(ran, 20, "only the finite trees are scored again");
+    }
+
+    /// #500: a `+inf` error that the exact CPU score does not reproduce (a
+    /// device overflow) and a pending `NaN` are scored in full.
+    #[test]
+    fn inf_reeval_runs_when_the_prediction_is_finite() {
+        let s = sample();
+        let cfg = Config::default();
+        let data = EvalSample::new(&s, &cfg);
+        let mut spurious = Ind::evaluated(input(0), &data, &cfg);
+        spurious.error = f64::INFINITY;
+        assert!(spurious.reeval_probing(&data, &cfg));
+        assert!(spurious.error.is_finite());
+        let mut pending = Ind::evaluated(input(0), &data, &cfg);
+        pending.error = f64::NAN;
+        assert!(pending.reeval_probing(&data, &cfg));
+        assert!(pending.error.is_finite());
+    }
+
+    /// #500: shapes whose `+inf` rule differs from the plain metrics take the
+    /// full pass, and the island counts the passes it runs.
+    #[test]
+    fn inf_probe_is_limited_to_the_plain_metrics() {
+        let s = sample();
+        let mut weighted = sample();
+        weighted.w = vec![1.0; weighted.y.len()];
+        let cfg = Config::default();
+        let tree = node(Op::Div, vec![input(0), constant(0.0)]);
+        let data = EvalSample::new(&s, &cfg);
+        assert!(prefix_is_non_finite(&tree, &data, &cfg));
+        assert!(!prefix_is_non_finite(&tree, &EvalSample::new(&weighted, &cfg), &cfg));
+        let mut qd = Config::default();
+        qd.qd_bins = 4;
+        assert!(!prefix_is_non_finite(&tree, &EvalSample::new(&s, &qd), &qd));
+
+        let aggs = AggTable::from_sample(&s);
+        let mut cfg = Config::default();
+        cfg.pop = 40;
+        let data = EvalSample::new(&s, &cfg);
+        let mut isl = inf_population(&data, &cfg);
+        let counters = GenCounters::default();
+        evolve_island(
+            &mut isl, &mut Mt::new(5), &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None,
+            false, 0, None, Some(&counters), 1, &mut MixWindow::new(),
+        );
+        assert_eq!(GenCounters::total(Some(&counters), |c| &c.reevals), 0);
     }
 
     /// #465: migration replaces the member of the highest Pareto rank.
