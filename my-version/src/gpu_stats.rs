@@ -234,23 +234,6 @@ impl RunLedger {
         }
     }
 
-    /// #284: book one island-scope window as `vary` plus the apportioned CPU
-    /// fit. `fit_cpu_s` is the fit time summed over threads; dividing by the
-    /// thread count estimates its wall share. The split is an apportionment,
-    /// not a measured interval, and never exceeds the window.
-    pub fn record_island_window(&mut self, window_s: f64, fit_cpu_s: f64, threads: usize) {
-        if !window_s.is_finite() || window_s <= 0.0 {
-            return;
-        }
-        let fit_s = if fit_cpu_s.is_finite() && fit_cpu_s > 0.0 {
-            (fit_cpu_s / threads.max(1) as f64).min(window_s)
-        } else {
-            0.0
-        };
-        self.record_stage(Stage::Fit, fit_s);
-        self.record_stage(Stage::Vary, window_s - fit_s);
-    }
-
     /// #284: move a measured fit sub-window out of the enclosing eval window.
     /// Fit is nested inside eval (screening → fit → rescore), so it is
     /// reclassified rather than added: the stage sum must not grow.
