@@ -358,6 +358,8 @@ The protocol locked test (`protocol/windows.csv`, row `locked`) is declared with
 rcsr panel build --data base.rcsb --membership m.csv --out panel.rcsb --locked-test 2025-07-01,2026-07-01
 ```
 
+Evaluators refuse rows and windows from `2025-07-01` minus the label purge on, not only from `2025-07-01`: the label of a row at `2025-06-30T23:00` reads the first locked bars. A search excludes them with `--exclude 'ts >= 1751108400'` (default purge 219600 s; the refusal prints the exact value for the target spec in use). The split report carries `boundary_purge_seconds` and `boundary_purge_source` (`target_spec` or `protocol_default`).
+
 The build writes `"locked_test": {"start", "end", "start_date", "end_date", "source"}` to `panel.rcsb.manifest.json` and `panel.rcsb.schema.json`. `rcsr panel schema` keeps it, `rcsr panel append` copies it from the target panel, `rcsr enrich` copies it from `--data` (or takes `--locked-test`) into `<out>.enrich.json`, and `rcsr ablation prepare` writes `<csv>.lockbox.json`. A CSV can carry the same object in a `<csv>.lockbox.json` sidecar. `--lockbox START,END` on a command overrides the stored range. `--allow-lockbox` does not open it: it keeps its 2026H2 meaning.
 
 | command | with a declaration |

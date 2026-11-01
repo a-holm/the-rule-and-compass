@@ -235,7 +235,9 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   --lockbox <START,END>      declared locked test (UTC, half-open). Overrides the range
                              declared with the data (<data>.manifest.json, .schema.json,
                              .enrich.json or <csv>.lockbox.json). Train, validation and
-                             test rows inside it are refused (exit 3); run.json `lockbox`
+                             test rows inside it, or whose label reaches it (within the
+                             target spec's required purge before the range; default
+                             219600 s), are refused (exit 3); run.json `lockbox`
                              reports rows, date range, read count, declared, source,
                              rows_in_scope, evaluated
   --ledger <file>            candidate ledger whose locked reads run.json counts
@@ -5948,7 +5950,7 @@ fn main() {
                     std::process::exit(EXIT_INPUT);
                 }
                 if let Some(d) = &spec.declared_lockbox {
-                    if let Err(e) = d.check_times("cross-validation rows", name, &times) {
+                    if let Err(e) = d.check_times("cross-validation rows", name, &times, 0) {
                         eprintln!("error: {}", e);
                         std::process::exit(EXIT_INPUT);
                     }
@@ -9394,12 +9396,13 @@ OPTIONS:
   --fdr-q <q>                Benjamini-Hochberg rate (default 0.10)
   --ledger <file>            append-only JSONL candidate ledger. A development
                              run appends a candidate (test_read:false) and
-                             refuses windows that touch the declared lockbox
+                             refuses windows that reach the declared lockbox
   --lockbox <START,END>      declared locked test, UTC half-open. Overrides the
                              range declared with --data (store manifest, schema
                              or sidecar). Default without a declaration:
                              2025-07-01,2026-07-01, active with --ledger or
-                             --locked-test. A window touching it is refused
+                             --locked-test. A window ending after START minus the label
+                             purge (entry offset + horizon + delay) is refused
                              (exit 3) unless --locked-test reads it
   --locked-test              read the locked test once for a sealed candidate.
                              Needs --ledger and --sealed. A second read, an
@@ -9965,20 +9968,29 @@ fn run_walkforward(args: &[String]) -> ! {
         std::process::exit(EXIT_USAGE);
     }
     if let Some((ls, le)) = declared_lock {
+        let label_purge = popts.required_purge_seconds(spec.horizon).max(spec.embargo_seconds());
+        let boundary = ls - label_purge;
         for w in &spec.windows {
-            let train_hits = w.train_start < le && w.train_end > ls;
-            let test_hits = w.test_start < le && w.test_end > ls;
+            let train_hits = w.train_start < le && w.train_end > boundary;
+            let test_hits = w.test_start < le && w.test_end > boundary;
             let test_inside = w.test_start >= ls && w.test_end <= le;
             let problem = if locked_test {
                 if train_hits {
-                    Some("trains on the locked test")
+                    Some("trains within the label purge of the locked test".to_string())
                 } else if !test_inside {
-                    Some("tests outside the locked test")
+                    Some("tests outside the locked test".to_string())
                 } else {
                     None
                 }
             } else if train_hits || test_hits {
-                Some("touches the declared locked test; read it only with --locked-test and a sealed list")
+                Some(format!(
+                    "reaches the declared locked test {}..{} (label end = stamp + {} s); \
+                     end it at or before {}, or read the locked test only with --locked-test and a sealed list",
+                    rcsr::protocol::iso(ls),
+                    rcsr::protocol::iso(le),
+                    label_purge,
+                    rcsr::protocol::iso(boundary)
+                ))
             } else {
                 None
             };

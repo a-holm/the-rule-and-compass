@@ -212,8 +212,9 @@ pub struct Fold {
 /// Row ranges per fold. Rows need a finite time and return. The fit range ends
 /// `purge_seconds` before the validation start so a fit label never reads into
 /// the validation slice.
-/// A fold whose fit, validation or test range touches `locked` (a declared
-/// locked test, half-open seconds) is refused.
+/// A fold whose fit, validation or test range reaches `[locked start - purge_seconds,
+/// locked end)` (a declared locked test, half-open seconds) is refused: a label
+/// at the last development stamps reads bars inside the locked test.
 pub fn make_folds(
     p: &Panel,
     windows: &[WindowRow],
@@ -224,21 +225,24 @@ pub fn make_folds(
     for w in windows {
         let win = &w.window;
         if let Some((ls, le)) = locked {
-            let side = if win.train_start < le && win.train_end > ls {
+            let boundary = ls - purge_seconds;
+            let side = if win.train_start < le && win.train_end > boundary {
                 Some("fit or validation")
-            } else if win.test_start < le && win.test_end > ls {
+            } else if win.test_start < le && win.test_end > boundary {
                 Some("test")
             } else {
                 None
             };
             if let Some(side) = side {
                 return Err(format!(
-                    "fold {}: the {} range touches the declared locked test {}..{}; \
-                     read it only with --locked-test --ledger --sealed",
+                    "fold {}: the {} range reaches the declared locked test {}..{} (label end = stamp + {} s); \
+                     end it at or before {}, or read the locked test only with --locked-test --ledger --sealed",
                     win.label,
                     side,
                     protocol::iso(ls),
-                    protocol::iso(le)
+                    protocol::iso(le),
+                    purge_seconds,
+                    protocol::iso(boundary)
                 ));
             }
         }
@@ -2094,7 +2098,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --pbo-blocks <even n>     CSCV blocks (default 8)\n\
   --seed <n>                seed of every draw (default 0)\n\
   --lockbox <START,END>     locked test to guard (default: the declaration stored with --data);\n\
-                            a fold touching it is refused (exit 3)\n\
+                            a fold ending after START minus --purge-seconds is refused (exit 3)\n\
   --locked-test             read the locked test: needs --scheme locked, --ledger and --sealed;\n\
                             appends a baseline_read to the ledger, a second read is refused\n\
   --ledger <file>           candidate ledger (with --locked-test)\n\
@@ -2233,8 +2237,8 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         let (ls, le) = (d.lockbox.start as f64, d.lockbox.end as f64);
         for r in &rows {
             let w = &r.window;
-            if w.train_start < le && w.train_end > ls {
-                return Err(input_err(format!("window '{}' trains on the locked test", w.label)));
+            if w.train_start < le && w.train_end > ls - opts.purge_seconds {
+                return Err(input_err(format!("window '{}' trains within the label purge of the locked test", w.label)));
             }
             if !(w.test_start >= ls && w.test_end <= le) {
                 return Err(input_err(format!("window '{}' tests outside the locked test", w.label)));

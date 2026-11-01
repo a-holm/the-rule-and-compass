@@ -1520,7 +1520,7 @@ fn usage() -> &'static str {
             [--keep a,b] [--seed 0]\n\
             writes the projection CSV with placebo and circular-block-permuted columns\n\
   score     --run <run.json> --data <csv|rcsb> --target <col> --time <col> --windows <file> --out <file>\n\
-            [--lockbox START,END]  a fold touching the declared locked test is refused (exit 3)\n\
+            [--lockbox START,END]  a fold ending after START minus --purge-seconds is refused (exit 3)\n\
             [--group <col>] [--return-col <col>] [--scheme expanding] [--thresholds 0.6,0.7,0.8]\n\
             [--headline-threshold 0.7] [--cost-bps 12] [--purge-seconds 219600] [--target-spec <file>]\n\
             scores the run's finalist (objective.finalist.expression) on every fold\n\

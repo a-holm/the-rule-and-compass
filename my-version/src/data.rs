@@ -1664,6 +1664,11 @@ pub struct SplitReport {
     pub purged_validation_boundary_rows: usize,
     /// `target_spec` when a purge was derived from a spec, else `none`.
     pub purge_source: &'static str,
+    /// #519: seconds before a declared locked test whose rows are refused,
+    /// and where it came from (`target_spec` or `protocol_default`). Empty
+    /// without a declared range.
+    pub boundary_purge_seconds: f64,
+    pub boundary_purge_source: &'static str,
 }
 
 pub struct Prepared {
@@ -4170,10 +4175,21 @@ fn check_split_lockbox(
     report.lockbox_validation = guard.check_times("validation split", &validation_times)?;
     report.lockbox_test = guard.check_times("test split", &test_times)?;
     if let Some(d) = &spec.declared_lockbox {
+        let boundary_purge = match spec.purge_seconds {
+            Some(p) => {
+                report.boundary_purge_source = "target_spec";
+                p.ceil() as i64
+            }
+            None => {
+                report.boundary_purge_source = "protocol_default";
+                crate::protocol::DEFAULT_PURGE_SECONDS as i64
+            }
+        };
+        report.boundary_purge_seconds = boundary_purge as f64;
         let name = t.names.get(tc).map(String::as_str).unwrap_or("time");
-        d.check_times("training split", name, &train_times)?;
-        d.check_times("validation split", name, &validation_times)?;
-        d.check_times("test split", name, &test_times)?;
+        d.check_times("training split", name, &train_times, boundary_purge)?;
+        d.check_times("validation split", name, &validation_times, boundary_purge)?;
+        d.check_times("test split", name, &test_times, boundary_purge)?;
     }
     Ok(())
 }
