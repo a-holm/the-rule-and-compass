@@ -1556,6 +1556,9 @@ pub fn run(args: &[String]) -> ! {
     if matches!(cmd, "schema" | "append") {
         crate::panel_append::cli(cmd, &args[1..]);
     }
+    if cmd == "spread" {
+        crate::panel_spread::cli(&args[1..]);
+    }
     if cmd == "rank" {
         crate::panel_rank::cli(&args[1..]);
     }
@@ -2076,6 +2079,9 @@ HOURLY V2 PANEL (#259):
   rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b|@all --out out.rcsb [--skip-existing] [--scratch dir]
   rcsr panel rank --data panel.rcsb --column lbl_h1_fwd --name lbl_h1_xs --out out.rcsb [--min-members 20]
                   per-timestamp rank in [-1, 1] over the panel members; adds the xs_rank target spec (#493)
+  rcsr panel spread --data panel.rcsb --feature clv1 --label lbl_h1_fwd --range FROM..TO [--buckets 5] [--bucketing pooled|cross-section]
+                    [--demean cross-section|none] [--min-members 20] [--block N] [--draws 2000] [--seed 1] [--lockbox S,E|none]
+                  market-neutral bucket spread of a feature in bp with a block-bootstrap interval; refuses a range that reaches the locked test (#261)
   --input <dir>           archive directory (SYMBOL/SYMBOL-15m-YYYY-MM.zip); no network
   --jobs <n>              parallel symbols for snapshot and base (default 1)
   --gpu <auto|on|off>     base: run the 15m to 1h fold on the CUDA device (auto: from 1M decoded rows;
