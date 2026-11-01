@@ -56,6 +56,8 @@ The command runs the D0–D6/D11/D12 panel suite (the optional `--bars`,
 | 3 | input error |
 | 5 | **leakage detected** |
 
+Rows inside the protocol locked test (`--lockbox START,END|none`, the range declared with the data, else 2025-07-01..2026-07-01) are left out of every detector. The report holds `locked_test` with `source`, `declared_in` and `rows_left_out`.
+
 `rcsr audit --target-spec FILE` adds D13a-c for the target against `--vars` (all
 numeric columns except the target and time when `--vars` is absent). The same
 check runs before every search with a spec and exits 5 on a finding. See

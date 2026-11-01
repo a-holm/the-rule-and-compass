@@ -2093,8 +2093,10 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --fdr-q <q>               BH-FDR level (default 0.10)\n\
   --pbo-blocks <even n>     CSCV blocks (default 8)\n\
   --seed <n>                seed of every draw (default 0)\n\
-  --lockbox <START,END>     locked test to guard (default: the declaration stored with --data);\n\
-                            a fold touching it is refused (exit 3)\n\
+  --lockbox <START,END|none> locked test to guard: this flag (it must cover a stored\n\
+                            declaration, else exit 2), the declaration stored with --data,\n\
+                            else 2025-07-01,2026-07-01; none opts out. A fold touching it\n\
+                            is refused (exit 3)\n\
   --locked-test             read the locked test: needs --scheme locked, --ledger and --sealed;\n\
                             appends a baseline_read to the ledger, a second read is refused\n\
   --ledger <file>           candidate ledger (with --locked-test)\n\
@@ -2215,7 +2217,8 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     }
     let text = std::fs::read_to_string(&windows).map_err(|e| input_err(format!("{}: {}", windows, e)))?;
     let rows = protocol::parse_windows_csv(&text, Some(&scheme)).map_err(input_err)?;
-    let declared = crate::lockbox::resolve_declared(lockbox_arg.as_deref(), &data_path).map_err(|e| usage_err(format!("--lockbox: {}", e)))?;
+    let resolved = crate::lockbox::resolve(lockbox_arg.as_deref(), &data_path).map_err(|e| (e.exit, e.message))?;
+    let declared = resolved.declared();
     if !locked_test && (ledger_path.is_some() || sealed_path.is_some()) {
         return Err(usage_err("--ledger and --sealed apply to --locked-test only".to_string()));
     }
@@ -2228,7 +2231,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             return Err(usage_err("--locked-test reads the locked scheme only: use --scheme locked".to_string()));
         }
         let Some(d) = &declared else {
-            return Err(usage_err("--locked-test needs a declared locked test: --lockbox or a store declaration".to_string()));
+            return Err(usage_err("--locked-test needs a locked test range: drop --lockbox none".to_string()));
         };
         let (ls, le) = (d.lockbox.start as f64, d.lockbox.end as f64);
         for r in &rows {
@@ -2269,10 +2272,8 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     ledger.set_wall(wall);
     report.ledger = ledger;
     let mut json = report.json();
-    if let Some(d) = &declared {
-        let in_scope = if locked_test { folds.iter().map(|f| f.test.len()).sum() } else { 0 };
-        json = d.splice_report(&json, in_scope, locked_test, true);
-    }
+    let in_scope = if locked_test { folds.iter().map(|f| f.test.len()).sum() } else { 0 };
+    json = resolved.splice_report(&json, in_scope, locked_test, true);
     if let Some((ledger, data_sha)) = &read {
         let report_sha = crate::manifest::sha256_hex(json.as_bytes());
         ledger.record_baseline_read(data_sha, &report_sha).map_err(input_err)?;
