@@ -589,6 +589,208 @@ fn slope_no_fit_is_a_no_op() {
     }
 }
 
+/// The pairs of a panel laid out as consecutive groups of `sizes` rows: row `r`
+/// pairs with row `r - 1` unless `r` opens a group.
+fn panel_pairs(sizes: &[usize]) -> Vec<[u32; 2]> {
+    let mut pairs = Vec::new();
+    let mut start = 0usize;
+    for &size in sizes {
+        for r in start + 1..start + size {
+            pairs.push([(r - 1) as u32, r as u32]);
+        }
+        start += size;
+    }
+    pairs
+}
+
+/// The mask the search uploads for `pairs`, through the search's own builder.
+fn mask_of(s: &Sample) -> search::SlopePairMask {
+    search::slope_pair_mask(s).expect("a pair list the mask represents")
+}
+
+fn with_pairs(mut s: Sample, pairs: Vec<[u32; 2]>) -> Sample {
+    s.pairs = Some(pairs);
+    s
+}
+
+/// A panel of groups of 1, 2, 700, 1, 300 and 1 rows.
+const PANEL: [usize; 6] = [1, 2, 700, 1, 300, 1];
+
+/// The device slope under a pair mask equals the CPU slope over the same
+/// pairs: 1e-12 against the reducer on the f32 rows, 1e-6 against the exact
+/// `f64` metric. Pairs never cross a group, and a group of one row has none.
+#[test]
+fn slope_device_matches_the_cpu_on_a_grouped_panel() {
+    let n: usize = PANEL.iter().sum();
+    let pairs = panel_pairs(&PANEL);
+    assert_eq!(pairs.len(), n - PANEL.len());
+    let mut s = with_pairs(series(n, 41), pairs.clone());
+    // `hole()` is then non-finite on row 703 only, a group of one row.
+    s.x[n / 2][0] = 0.1;
+    s.x[703][0] = 0.0;
+    let Some(mut ev) = evaluator(&s) else {
+        return;
+    };
+    let mask = mask_of(&s);
+    assert!(ev.set_slope_pairs(&mask.bits, mask.pairs));
+    let trees = score_trees();
+    let pop = Population::from_trees(trees.iter());
+    let (prog, offsets) = pop.programs();
+    let pcount = vec![0i32; trees.len()];
+    let batch = ev.score_batch(prog, offsets, ScoreObjective::Slope, &pcount);
+    assert!(batch.ms >= 0.0, "launch");
+    let preds = ev.predictions(prog, offsets).expect("prediction readback");
+    let y32: Vec<f64> = s.y.iter().map(|&v| v as f32 as f64).collect();
+    for (k, tree) in trees.iter().enumerate() {
+        let pred: Vec<f64> = s.x.iter().map(|row| expr::eval(tree, row)).collect();
+        let exact = metrics::score_slope_pairs(&pred, &s.y, &pairs);
+        if k == trees.len() - 1 {
+            assert_eq!(batch.status[k], ScoreStatus::NonFinite, "tree {k}");
+            assert_eq!(batch.values[k], f64::INFINITY, "tree {k}");
+            assert_eq!(exact, f64::INFINITY, "tree {k}: the CPU agrees");
+            continue;
+        }
+        assert_eq!(batch.status[k], ScoreStatus::Ok, "tree {k}");
+        let p32: Vec<f64> = preds[k * n..(k + 1) * n].iter().map(|&v| v as f64).collect();
+        let reduced = metrics::score_slope_pairs(&p32, &y32, &pairs);
+        let got = batch.values[k];
+        assert!(
+            (got - reduced).abs() <= 1e-12 * reduced.abs().max(1e-300),
+            "tree {k}: device {got} vs reducer {reduced}"
+        );
+        let rel = (got - exact).abs() / exact.abs();
+        assert!(rel <= 1e-6, "tree {k}: device {got} vs exact {exact} ({rel:e})");
+        let unmasked = slope(tree, &s);
+        assert!((unmasked - exact).abs() > 1e-9, "tree {k}: the boundaries change the metric");
+    }
+}
+
+/// A pair list with no pair scores `+inf` with the non-finite status, as the
+/// CPU does; one pair is its single difference; a mask can be cleared.
+#[test]
+fn slope_pair_mask_edge_cases() {
+    let n = 70;
+    let s = series(n, 43);
+    let Some(mut ev) = evaluator(&s) else {
+        return;
+    };
+    let trees = vec![affine(0.5, 0.0), shaped(2.9, 0.2, 0.25)];
+    let pop = Population::from_trees(trees.iter());
+    let (prog, offsets) = pop.programs();
+    let pcount = vec![0i32; trees.len()];
+    let consecutive = ev.score_batch(prog, offsets, ScoreObjective::Slope, &pcount);
+
+    let none = with_pairs(s.clone(), Vec::new());
+    let mask = mask_of(&none);
+    assert_eq!((mask.pairs, mask.bits.len()), (0, 3));
+    assert!(ev.set_slope_pairs(&mask.bits, mask.pairs));
+    let got = ev.score_batch(prog, offsets, ScoreObjective::Slope, &pcount);
+    for k in 0..trees.len() {
+        assert_eq!(got.status[k], ScoreStatus::NonFinite, "no pair, tree {k}");
+        assert_eq!(got.values[k], f64::INFINITY, "no pair, tree {k}");
+    }
+
+    let one = with_pairs(s.clone(), vec![[40, 41]]);
+    let mask = mask_of(&one);
+    assert!(ev.set_slope_pairs(&mask.bits, mask.pairs));
+    let got = ev.score_batch(prog, offsets, ScoreObjective::Slope, &pcount);
+    for (k, tree) in trees.iter().enumerate() {
+        let want = metrics::score_slope_pairs(
+            &s.x.iter().map(|row| expr::eval(tree, row)).collect::<Vec<_>>(),
+            &s.y,
+            &[[40, 41]],
+        );
+        assert!((got.values[k] - want).abs() <= 1e-5, "one pair, tree {k}: {} vs {want}", got.values[k]);
+    }
+
+    assert!(ev.set_slope_pairs(&[], 0), "an empty mask clears");
+    let cleared = ev.score_batch(prog, offsets, ScoreObjective::Slope, &pcount);
+    for k in 0..trees.len() {
+        assert_eq!(cleared.values[k].to_bits(), consecutive.values[k].to_bits(), "cleared, tree {k}");
+    }
+    assert!(!ev.set_slope_pairs(&[0u32; 2], 0), "a mask of the wrong length is refused");
+}
+
+/// The device slope fit under a pair mask is at most the CPU fit over the same
+/// pairs (squared fit, differenced IRLS) times `1 + 1e-5`, and it reports the
+/// slope over the masked pair count.
+#[test]
+fn slope_device_fit_matches_the_cpu_on_a_grouped_panel() {
+    let n: usize = PANEL.iter().sum();
+    let pairs = panel_pairs(&PANEL);
+    let s = with_pairs(series(n, 45), pairs.clone());
+    let Some(mut ev) = evaluator(&s) else {
+        return;
+    };
+    let mask = mask_of(&s);
+    assert!(ev.set_slope_pairs(&mask.bits, mask.pairs));
+    let starts = [affine(0.0, 0.0), shaped(0.3, 0.1, 0.2), wave(1.0, 1.0, 0.0, 0.0)];
+    let plans: Vec<fit::GpuFitPlan> = starts.iter().map(|t| fit::gpu_fit_plan(t).unwrap()).collect();
+    let refs: Vec<&fit::GpuFitPlan> = plans.iter().collect();
+    let iters = 32;
+    let (out, ms) = ev.slope_fit_batch(&refs, iters);
+    assert!(ms >= 0.0);
+    let pair_slope = |t: &Node| {
+        let pred: Vec<f64> = s.x.iter().map(|row| expr::eval(t, row)).collect();
+        metrics::score_slope_pairs(&pred, &s.y, &pairs)
+    };
+    for (k, start) in starts.iter().enumerate() {
+        let mut dev = start.clone();
+        plans[k].apply(&mut dev, &out[k].c);
+        let dev_score = pair_slope(&dev);
+        let mut cpu = start.clone();
+        fit::fit_weighted(&mut cpu, &s.x, &s.y, &[], iters);
+        fit::slope_irls(&mut cpu, &s.x, &s.y, &pairs, iters);
+        let cpu_score = pair_slope(&cpu);
+        eprintln!(
+            "panel slope tree {k}: start {:.9} device {dev_score:.9} cpu irls {cpu_score:.9} status {}",
+            pair_slope(start),
+            out[k].status
+        );
+        assert!(fit::fit_status_usable(out[k].status), "tree {k}: status {}", out[k].status);
+        assert!(
+            dev_score <= cpu_score * (1.0 + 1e-5) + 1e-12,
+            "tree {k}: device {dev_score:.12e} vs cpu {cpu_score:.12e}"
+        );
+        assert!(dev_score <= pair_slope(start) + 1e-12, "tree {k}: never worse than the start");
+        assert!(
+            (out[k].sse - dev_score).abs() <= 1e-6 * dev_score,
+            "tree {k}: reported {} vs pair slope {dev_score}",
+            out[k].sse
+        );
+    }
+}
+
+/// A `--group-by` style panel run keeps the slope scorer and fit on the device:
+/// the fit ledger counts device fits and every archive error is the exact CPU
+/// slope over the panel's pairs.
+#[test]
+fn slope_panel_run_fits_slope_on_the_device() {
+    if !probe().available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let sizes = [1usize, 2, 900, 1, 700, 1, 395];
+    let n: usize = sizes.iter().sum();
+    let train = with_pairs(level_and_slope(n, 51), panel_pairs(&sizes));
+    let test = level_and_slope(600, 52);
+    let cfg = slope_config(6, 9);
+    let run = search::run(&cfg, &train, &test);
+    assert_eq!(run.backend, crate::backend::Kind::Gpu, "{:?}", run.backend_reason);
+    let eval = run.dispatch.ledger.entry(Stage::Eval).expect("an eval ledger entry");
+    assert_eq!(eval.route, Route::Device, "the slope scorer did not run on the device");
+    let g = run.gpu.as_ref().expect("a fit ledger");
+    assert!(g.fit_gpu > 0, "nothing was fitted on the device: {g:?}");
+    assert!(!run.archive.items.is_empty());
+    for item in &run.archive.items {
+        assert_eq!(
+            item.error.to_bits(),
+            search::eval_error(&item.tree, &train, Metric::Slope).to_bits(),
+            "an archive row is not the exact CPU slope over the panel pairs"
+        );
+    }
+}
+
 fn slope_config(fit_iters: usize, seed: u32) -> Config {
     Config {
         generations: 4,

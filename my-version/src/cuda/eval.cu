@@ -179,6 +179,10 @@ struct RcCtx {
     float *d_tsign;
     double *d_tsign64;
     int has_tsign;
+    /* #508: slope pair mask, `ceil(n/32)` words (bit r set: row r pairs with
+       row r - 1) followed by one word holding the pair count. Null means every
+       row r >= 1 pairs with row r - 1. */
+    unsigned int *d_pmask;
     /* #496: arithmetic of the fit polish (0 f64, 1 f32, 2 off) and the summed
        per-block cycles of the LM and polish phases since the last read. */
     int fit_polish;
@@ -1130,6 +1134,18 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) eval_pool_kernel(const floa
     if (threadIdx.x == 0) out[p] = sh[0];
 }
 
+/* #508: bit `r` of the slope pair mask, and the pair count the mask carries
+   in the word after its `ceil(n/32)` bit words. */
+__device__ __forceinline__ bool rc_pair_on(const unsigned int *pmask, long long r)
+{
+    return (pmask[r >> 5] >> (unsigned int)(r & 31)) & 1u;
+}
+
+__device__ __forceinline__ long long rc_pair_count(const unsigned int *pmask, long long n)
+{
+    return pmask ? (long long)pmask[(n + 31) >> 5] : n - 1;
+}
+
 /* One lane's fold over the rows `first, first + lanes, ...` below `r_end`,
  * shared by `score_kernel` and `score_rows_kernel` so the resident and the
  * row-range paths cannot drift apart. `wc` addresses columns by absolute row:
@@ -1144,6 +1160,7 @@ __device__ __forceinline__ void score_step(
     const float *__restrict__ y,
     const float *__restrict__ tsign,
     const double *__restrict__ w,
+    const unsigned int *__restrict__ pmask,
     long long first,
     long long r_end,
     int lanes,
@@ -1179,11 +1196,18 @@ __device__ __forceinline__ void score_step(
            carry holds on resident columns. Row 0 is checked as the
            predecessor of row 1. */
         for (long long r = first; r < r_end; r += lanes) {
-            if (r < 1) continue;
+            if (r < 1 && !pmask) continue;
             const int i = (int)r;
             const float pc = rc_exec_row(code, wc, ld, i);
+            if (!isfinite(pc)) {
+                lbad = 1;
+                continue;
+            }
+            /* #508: a row without a pair is still checked, as the CPU rejects
+               any non-finite prediction. */
+            if (r < 1 || (pmask && !rc_pair_on(pmask, r))) continue;
             const float pp = rc_exec_row(code, wc, ld, i - 1);
-            if (!isfinite(pc) || !isfinite(pp)) {
+            if (!isfinite(pp)) {
                 lbad = 1;
                 continue;
             }
@@ -1316,6 +1340,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
     int pooled,
     const float *__restrict__ tsign,
     const double *__restrict__ w,
+    const unsigned int *__restrict__ pmask,
     double *__restrict__ out,
     int *__restrict__ status,
     double ybar,
@@ -1345,7 +1370,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
        `metrics::score_native_weighted`. */
     if (MODE >= RC_SCORE_LOG_LOSS && MODE <= RC_SCORE_HINGE_SQUARED) {
         double wn = 0.0;
-        score_step<MODE, 0>(code, cols, n, y, tsign, w, tid, n, blockDim.x, 0.0, ybar,
+        score_step<MODE, 0>(code, cols, n, y, tsign, w, pmask, tid, n, blockDim.x, 0.0, ybar,
                             a, wn, best_key, best_row, bad);
         if (tid == 0) sbad = 0;
         sh1[tid] = a;
@@ -1381,7 +1406,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
 
     if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
         /* Pass 1: mean prediction. */
-        score_step<MODE, 0>(code, cols, n, y, tsign, w, tid, n, blockDim.x, 0.0, ybar,
+        score_step<MODE, 0>(code, cols, n, y, tsign, w, pmask, tid, n, blockDim.x, 0.0, ybar,
                             a, b, best_key, best_row, bad);
         if (tid == 0) sbad = 0;
         sh1[tid] = a;
@@ -1417,7 +1442,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
         bad = 0;
         a = 0.0;
         b = 0.0;
-        score_step<MODE, 1>(code, cols, n, y, tsign, w, tid, n, blockDim.x, pbar, ybar,
+        score_step<MODE, 1>(code, cols, n, y, tsign, w, pmask, tid, n, blockDim.x, pbar, ybar,
                             a, b, best_key, best_row, bad);
         if (tid == 0) sbad = 0;
         sh1[tid] = a;
@@ -1456,7 +1481,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
 
     /* One-pass reductions. Modes 7/8/9 accumulate RSS; the host applies the
        AIC family's `k` penalty, which differs per candidate. */
-    score_step<MODE, 0>(code, cols, n, y, tsign, w, tid, n, blockDim.x, 0.0, ybar,
+    score_step<MODE, 0>(code, cols, n, y, tsign, w, pmask, tid, n, blockDim.x, 0.0, ybar,
                         a, b, best_key, best_row, bad);
     if (tid == 0) sbad = 0;
     sh1[tid] = a;
@@ -1501,8 +1526,11 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
             const double sum = sh1[0];
             const double denom = w ? sh2[0] : (double)n;
             if (MODE == RC_SCORE_SLOPE) {
-                out[p] = n < 2 ? INFINITY : sum / (double)(n - 1);
-                status[p] = n < 2 ? RC_SCORE_NONFINITE : 0;
+                {
+                    const long long np = rc_pair_count(pmask, n);
+                    out[p] = np < 1 ? INFINITY : sum / (double)np;
+                    status[p] = np < 1 ? RC_SCORE_NONFINITE : 0;
+                }
             } else if (w && !(denom > 0.0)) {
                 out[p] = INFINITY;
                 status[p] = RC_SCORE_ALL_ZERO_WEIGHT;
@@ -1734,7 +1762,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_rows_kernel(
         best_row = ((int *)lane_b)[slot];
     }
     const double pb = (PASS == 1) ? pbar[p] : 0.0;
-    score_step<MODE, PASS>(code, wc, ld, y, tsign, w, first, r_end, lanes, pb, ybar,
+    score_step<MODE, PASS>(code, wc, ld, y, tsign, w, nullptr, first, r_end, lanes, pb, ybar,
                            a, b, best_key, best_row, lbad);
     if (MODE == RC_SCORE_MAXIMUM) {
         ((unsigned long long *)lane_a)[slot] = best_key;
@@ -2505,6 +2533,7 @@ __device__ void ft_assemble_slope(const unsigned int *nd,
                                   int m,
                                   const float *__restrict__ cols,
                                   const float *__restrict__ y,
+                                  const unsigned int *__restrict__ pmask,
                                   int n,
                                   int p,
                                   const double *c,
@@ -2553,7 +2582,7 @@ __device__ void ft_assemble_slope(const unsigned int *nd,
             if (!ok) *bad = 1;
         }
         __syncthreads();
-        const bool paired = row < n && row >= 1;
+        const bool paired = row < n && row >= 1 && (!pmask || rc_pair_on(pmask, row));
         float gp[MAXC];
         float pp = 0.0f;
         if (paired) {
@@ -2616,6 +2645,7 @@ __device__ void ft_assemble_slope_d(const unsigned int *nd,
                                     int m,
                                     const double *__restrict__ cols,
                                     const double *__restrict__ y,
+                                    const unsigned int *__restrict__ pmask,
                                     int n,
                                     int p,
                                     const double *c,
@@ -2665,7 +2695,7 @@ __device__ void ft_assemble_slope_d(const unsigned int *nd,
             if (!ok) *bad = 1;
         }
         __syncthreads();
-        const bool paired = mine && row >= 1;
+        const bool paired = mine && row >= 1 && (!pmask || rc_pair_on(pmask, row));
         double gp[MAXC];
         double pp = 0.0;
         if (paired) {
@@ -2726,6 +2756,7 @@ __device__ double ft_loss_slope(const unsigned int *nd,
                                 int m,
                                 const float *__restrict__ cols,
                                 const float *__restrict__ y,
+                                const unsigned int *__restrict__ pmask,
                                 int n,
                                 const double *c,
                                 double *red)
@@ -2733,13 +2764,18 @@ __device__ double ft_loss_slope(const unsigned int *nd,
     const int tid = threadIdx.x;
     double local = 0.0;
     for (int row = tid; row < n; row += CHUNK) {
-        if (row < 1) continue;
+        if (row < 1 && !pmask) continue;
         float vt[FT_MAX_NODES];
         ft_forward(nd, m, cols, n, row, c, vt);
         const float pc = vt[m - 1];
+        if (!isfinite(pc) || fabsf(pc) > 1e30f) {
+            local += 1e30;
+            continue;
+        }
+        if (row < 1 || (pmask && !rc_pair_on(pmask, row))) continue;
         ft_forward(nd, m, cols, n, row - 1, c, vt);
         const float pp = vt[m - 1];
-        if (!isfinite(pc) || fabsf(pc) > 1e30f || !isfinite(pp) || fabsf(pp) > 1e30f) {
+        if (!isfinite(pp) || fabsf(pp) > 1e30f) {
             local += 1e30;
             continue;
         }
@@ -2763,6 +2799,7 @@ __device__ double ft_loss_slope_d(const unsigned int *nd,
                                   int m,
                                   const double *__restrict__ cols,
                                   const double *__restrict__ y,
+                                  const unsigned int *__restrict__ pmask,
                                   int n,
                                   const double *c,
                                   double *red)
@@ -2771,14 +2808,19 @@ __device__ double ft_loss_slope_d(const unsigned int *nd,
     double local = 0.0;
     if (tid < PCHUNK) {
         for (int row = tid; row < n; row += PCHUNK) {
-            if (row < 1) continue;
+            if (row < 1 && !pmask) continue;
             double v[FT_MAX_NODES];
             ft_forward_d(nd, m, cols, n, row, c, v);
             const double pc = v[m - 1];
+            if (!isfinite(pc)) {
+                local += 1e30;
+                continue;
+            }
+            if (row < 1 || (pmask && !rc_pair_on(pmask, row))) continue;
             ft_forward_d(nd, m, cols, n, row - 1, c, v);
             const double pp = v[m - 1];
             const double g = (pc - pp) - (y[row] - y[row - 1]);
-            local += (isfinite(pc) && isfinite(pp) && isfinite(g)) ? fabs(g) : 1e30;
+            local += (isfinite(pp) && isfinite(g)) ? fabs(g) : 1e30;
         }
     }
     red[tid] = local;
@@ -2799,6 +2841,7 @@ __device__ void ft_assemble_d(const unsigned int *nd,
                               const double *__restrict__ y,
                               const double *__restrict__ tsign,
                               const double *__restrict__ w,
+                              const unsigned int *__restrict__ pmask,
                               int n,
                               int p,
                               int metric,
@@ -2815,7 +2858,7 @@ __device__ void ft_assemble_d(const unsigned int *nd,
                               double *dcarry)
 {
     if (metric == RC_LOSS_SLOPE) {
-        ft_assemble_slope_d<MAXC, PCHUNK>(nd, m, cols, y, n, p, c, dg, dr, dl, dcarry, jtj, jtr,
+        ft_assemble_slope_d<MAXC, PCHUNK>(nd, m, cols, y, pmask, n, p, c, dg, dr, dl, dcarry, jtj, jtr,
                                           ploss, bad);
         return;
     }
@@ -2953,12 +2996,13 @@ __device__ double ft_loss_d(const unsigned int *nd,
                             const double *__restrict__ y,
                             const double *__restrict__ tsign,
                             const double *__restrict__ w,
+                            const unsigned int *__restrict__ pmask,
                             int n,
                             int metric,
                             const double *c,
                             double *red)
 {
-    if (metric == RC_LOSS_SLOPE) return ft_loss_slope_d<PCHUNK>(nd, m, cols, y, n, c, red);
+    if (metric == RC_LOSS_SLOPE) return ft_loss_slope_d<PCHUNK>(nd, m, cols, y, pmask, n, c, red);
     const int tid = threadIdx.x;
     double local = 0.0;
     if (tid < PCHUNK) {
@@ -3017,6 +3061,7 @@ __device__ void ft_assemble(const unsigned int *nd,
                             const float *__restrict__ y,
                             const float *__restrict__ tsign,
                             const double *__restrict__ w,
+                            const unsigned int *__restrict__ pmask,
                             int n,
                             int p,
                             int metric,
@@ -3032,7 +3077,7 @@ __device__ void ft_assemble(const unsigned int *nd,
                             float *carry)
 {
     if (metric == RC_LOSS_SLOPE) {
-        ft_assemble_slope<MAXC, CHUNK>(nd, m, cols, y, n, p, c, sg, sr, sl, carry, jtj, jtr, ploss,
+        ft_assemble_slope<MAXC, CHUNK>(nd, m, cols, y, pmask, n, p, c, sg, sr, sl, carry, jtj, jtr, ploss,
                                        bad);
         return;
     }
@@ -3147,12 +3192,13 @@ __device__ double ft_loss(const unsigned int *nd,
                           const float *__restrict__ y,
                           const float *__restrict__ tsign,
                           const double *__restrict__ w,
+                          const unsigned int *__restrict__ pmask,
                           int n,
                           int metric,
                           const double *c,
                           double *red)
 {
-    if (metric == RC_LOSS_SLOPE) return ft_loss_slope<CHUNK>(nd, m, cols, y, n, c, red);
+    if (metric == RC_LOSS_SLOPE) return ft_loss_slope<CHUNK>(nd, m, cols, y, pmask, n, c, red);
     const int tid = threadIdx.x;
     double local = 0.0;
     for (int row = tid; row < n; row += CHUNK) {
@@ -3622,6 +3668,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                            const double *__restrict__ y64,
                            const double *__restrict__ tsign64,
                            const double *__restrict__ w64,
+                           const unsigned int *__restrict__ pmask,
                            int n,
                            int v,
                            const unsigned int *__restrict__ prog,
@@ -3873,7 +3920,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
 
     if (iters > 0) {
         /* First assembly also supplies the baseline objective. */
-        ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad, S->scarry);
+        ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, pmask, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad, S->scarry);
         assembled = 1;
         best = S->sbest;
         if (tid == 0) S->sstart = S->sbad ? 0 : 1;
@@ -3882,7 +3929,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
             if (irls && round > 0) assembled = 0; /* new weights, new Gram */
             for (int it = 0; it < inner && status == 0; ++it) {
                 if (!assembled) {
-                    ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad, S->scarry);
+                    ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, pmask, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad, S->scarry);
                     assembled = 1;
                     if (S->sbad) {
                         status = 2;
@@ -3913,7 +3960,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                     S->strial[tid] = fmin(1e6, fmax(-1e6, t));
                 }
                 __syncthreads();
-                double tsse = ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->strial, S->sred);
+                double tsse = ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, pmask, n, metric, S->strial, S->sred);
                 /* #222: true-metric Armijo. The weighted surrogate can point
                    uphill for `|r|`; halving the step twice costs two forward
                    passes and never accepts a trial that is worse in the
@@ -3926,7 +3973,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                         S->strial[tid] = S->sc[tid] + 0.5 * (S->strial[tid] - S->sc[tid]);
                     }
                     __syncthreads();
-                    tsse = ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->strial, S->sred);
+                    tsse = ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, pmask, n, metric, S->strial, S->sred);
                 }
                 if (tsse < best) {
                     if (tid < p) S->sc[tid] = S->strial[tid];
@@ -3963,15 +4010,15 @@ __global__ void fit_kernel(const float *__restrict__ cols,
            every polish step on a systematic rounding difference alone. */
         if (metric == RC_LOSS_HINGE_ORDINARY) phase = 1;
         if (status == 0 && polish == 0) {
-            const double exact = ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->sc, S->sred);
+            const double exact = ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, pmask, n, metric, S->sc, S->sred);
             if (isfinite(exact)) best = exact;
         }
         /* Undamped Gauss-Newton polish, exactly like the CPU path. */
         for (int it = 0; it < 4 && status == 0 && best != 0.0 && !stalled && polish != 2; ++it) {
             if (polish == 0) {
-                ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, p, metric, phase, S->sc, S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad, &S->sskip, S->sdcarry);
+                ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, pmask, n, p, metric, phase, S->sc, S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad, &S->sskip, S->sdcarry);
             } else {
-                ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad, S->scarry);
+                ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, pmask, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad, S->scarry);
             }
             assembled = 1;
             if (S->sbad) {
@@ -3991,8 +4038,8 @@ __global__ void fit_kernel(const float *__restrict__ cols,
             }
             __syncthreads();
             double tsse = (polish == 0)
-                ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred)
-                : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->strial, S->sred);
+                ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, pmask, n, metric, S->strial, S->sred)
+                : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, pmask, n, metric, S->strial, S->sred);
             /* #222: one exact f64 backtrack for the non-smooth objective. */
             if (irls && !(tsse < best)) {
                 if (tid < p) {
@@ -4000,8 +4047,8 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                 }
                 __syncthreads();
                 tsse = (polish == 0)
-                    ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred)
-                    : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->strial, S->sred);
+                    ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, pmask, n, metric, S->strial, S->sred)
+                    : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, pmask, n, metric, S->strial, S->sred);
             }
             if (tsse < best) {
                 if (tid < p) S->sc[tid] = S->strial[tid];
@@ -4019,13 +4066,13 @@ __global__ void fit_kernel(const float *__restrict__ cols,
             const double fitted = (status == 0)
                 ? best
                 : (polish == 0)
-                    ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->sc, S->sred)
-                    : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->sc, S->sred);
+                    ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, pmask, n, metric, S->sc, S->sred)
+                    : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, pmask, n, metric, S->sc, S->sred);
             if (tid < p) S->strial[tid] = cbase[(size_t)cand * (size_t)kmax + (size_t)tid];
             __syncthreads();
             const double incoming = (polish == 0)
-                ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred)
-                : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->strial, S->sred);
+                ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, pmask, n, metric, S->strial, S->sred)
+                : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, pmask, n, metric, S->strial, S->sred);
             if (fitted < 1e30 && fitted < incoming) {
                 best = fitted;
             } else {
@@ -4083,6 +4130,7 @@ __global__ void fit_probe_kernel(const float *__restrict__ cols,
                                  const double *__restrict__ y64,
                                  const double *__restrict__ tsign64,
                                  const double *__restrict__ w64,
+                                 const unsigned int *__restrict__ pmask,
                                  int n,
                                  const unsigned int *__restrict__ prog,
                                  const unsigned int *__restrict__ off,
@@ -4107,15 +4155,15 @@ __global__ void fit_probe_kernel(const float *__restrict__ cols,
         S->sskip = 0;
     }
     __syncthreads();
-    ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, phase, S->sc, S->sg, S->sr,
+    ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, pmask, n, p, metric, phase, S->sc, S->sg, S->sr,
                              S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad, S->scarry);
     const double a32 = S->sbest;
-    const double l32 = ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->sc, S->sred);
-    ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, p, metric, phase, S->sc,
+    const double l32 = ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, pmask, n, metric, S->sc, S->sred);
+    ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, pmask, n, p, metric, phase, S->sc,
                                 S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad,
                                 &S->sskip, S->sdcarry);
     const double a64 = S->sbest;
-    const double l64 = ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->sc, S->sred);
+    const double l64 = ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, pmask, n, metric, S->sc, S->sred);
     if (tid == 0) {
         double *o = out + (size_t)cand * (size_t)FT_PROBE_STRIDE(kmax);
         o[0] = a32;
@@ -4180,7 +4228,7 @@ static int ft_launch(RcCtx *c,
         opted_in = 1;
     }
     fit_kernel<MAXC, CHUNK, PCHUNK><<<nprog, CHUNK, bytes, c->s_fit>>>(
-        c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->n,
+        c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->d_pmask, c->n,
         c->v, d_prog, d_off, d_p, kmax, d_c0, d_cbase, d_gauge, iters, metric, polish, d_c,
         d_sse, d_status, d_cyc);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
@@ -4844,6 +4892,7 @@ void rc_destroy(void *ctx)
     if (c->d_w64) rc_dev_free(c, c->d_w64);
     if (c->d_tsign) rc_dev_free(c, c->d_tsign);
     if (c->d_tsign64) rc_dev_free(c, c->d_tsign64);
+    if (c->d_pmask) rc_dev_free(c, c->d_pmask);
     if (c->d_prog) rc_dev_free(c, c->d_prog);
     if (c->d_off) rc_dev_free(c, c->d_off);
     if (c->d_out) rc_dev_free(c, c->d_out);
@@ -5560,7 +5609,7 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
         return -1.0f;
     }
 
-    if (kind == RC_SCORE_SLOPE && (c->tiled || c->d_w64)) {
+    if (kind == RC_SCORE_SLOPE && (c->tiled || c->d_w64 || (c->d_pmask && bounds))) {
         st->failed = 1;
         st->wall_ms = rc_now_ms() - c->batch_start_ms;
         return -1.0f;
@@ -5601,97 +5650,97 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
         case RC_SCORE_SQUARED:
             score_kernel<RC_SCORE_SQUARED><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_ABSOLUTE:
             score_kernel<RC_SCORE_ABSOLUTE><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_LOG_SQUASHED:
             score_kernel<RC_SCORE_LOG_SQUASHED><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_SIGNED:
             score_kernel<RC_SCORE_SIGNED><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_MAXIMUM:
             score_kernel<RC_SCORE_MAXIMUM><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_CORRELATION:
             score_kernel<RC_SCORE_CORRELATION><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_CORRELATION_SIGNED:
             score_kernel<RC_SCORE_CORRELATION_SIGNED><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_AIC:
             score_kernel<RC_SCORE_AIC><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_AICC:
             score_kernel<RC_SCORE_AICC><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_BIC:
             score_kernel<RC_SCORE_BIC><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_LOG_LOSS:
             score_kernel<RC_SCORE_LOG_LOSS><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_BRIER:
             score_kernel<RC_SCORE_BRIER><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_HINGE_SIGMOID:
             score_kernel<RC_SCORE_HINGE_SIGMOID><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_HINGE_ORDINARY:
             score_kernel<RC_SCORE_HINGE_ORDINARY><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_HINGE_SQUARED:
             score_kernel<RC_SCORE_HINGE_SQUARED><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_SLOPE:
             score_kernel<RC_SCORE_SLOPE><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
-                c->d_tsign, c->d_w64,
+                c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_LONG_PNL:
@@ -6034,6 +6083,39 @@ int rc_set_fit_sign(void *ctx, const double *sign)
     return 0;
 }
 
+/* --- #508: the slope pair mask ---------------------------------------------
+ *
+ * `bits` holds `ceil(n / 32)` words, bit `r` set when row `r` pairs with row
+ * `r - 1` (bit 0 must be clear); `npairs` is the number of set bits. The device
+ * copy appends `npairs` as one more word, which the scorer reads as its divisor.
+ * `NULL` clears the mask, and every row `r >= 1` pairs with row `r - 1` again.
+ * A mask is read by the slope scorer and the slope fit arm only, and a
+ * row-range launch with a mask is refused.
+ */
+int rc_set_slope_pairs(void *ctx, const unsigned int *bits, long long npairs)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c) return -1;
+    if (c->d_pmask) { rc_dev_free(c, c->d_pmask); c->d_pmask = 0; }
+    if (!bits) return 0;
+    const size_t words = ((size_t)c->n + 31) / 32;
+    if (npairs < 0 || npairs >= (long long)c->n) return -1;
+    if ((bits[0] & 1u) != 0) return -1;
+    if (rc_dev_alloc(c, "slope_pairs", (void **)&c->d_pmask, sizeof(unsigned int) * (words + 1)) != 0) {
+        c->d_pmask = 0;
+        return -1;
+    }
+    rc_upload(c->d_pmask, bits, sizeof(unsigned int) * words);
+    unsigned int count = (unsigned int)npairs;
+    rc_upload(c->d_pmask + words, &count, sizeof(unsigned int));
+    if (cudaGetLastError() != cudaSuccess) {
+        rc_dev_free(c, c->d_pmask);
+        c->d_pmask = 0;
+        return -1;
+    }
+    return 0;
+}
+
 /* --- #169: batched LM fit entry point -------------------------------------
  *
  * `metric` is one of the `RC_LOSS_*` codes: 0 squared, 1 log-squashed,
@@ -6274,7 +6356,7 @@ int rc_fit_probe(void *ctx,
     rc_fs_h2d(c, base, host, in_end);
     fit_probe_kernel<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK>
         <<<nprog, FT_CHUNK_SMALL, bytes, c->s_fit>>>(
-            c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->n,
+            c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->d_pmask, c->n,
             (const unsigned int *)(base + o_prog), (const unsigned int *)(base + o_off),
             (const int *)(base + o_p), kmax, (const double *)(base + o_c0), metric, phase,
             (double *)(base + o_out));
