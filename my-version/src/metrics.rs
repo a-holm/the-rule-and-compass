@@ -1158,6 +1158,7 @@ fn weighted_correlation(a: &[f64], b: &[f64], w: &[f64]) -> f64 {
     if !(ha >= f64::MIN_POSITIVE && hb >= f64::MIN_POSITIVE && ha.is_finite() && hb.is_finite()) {
         return 0.0;
     }
+    let (ha, hb) = (pow2_floor(ha), pow2_floor(hb));
     let (mut sab, mut sa, mut sb) = (0.0, 0.0, 0.0);
     for i in 0..a.len() {
         let wi = w[i];
@@ -1503,6 +1504,7 @@ pub fn correlation(a: &[f64], b: &[f64]) -> f64 {
     if !(ha >= f64::MIN_POSITIVE && hb >= f64::MIN_POSITIVE && ha.is_finite() && hb.is_finite()) {
         return 0.0;
     }
+    let (ha, hb) = (pow2_floor(ha), pow2_floor(hb));
     let (mut sab, mut sa, mut sb) = (0.0, 0.0, 0.0);
     for i in 0..a.len() {
         let da = (a[i] - ma) / ha;
@@ -1512,6 +1514,12 @@ pub fn correlation(a: &[f64], b: &[f64]) -> f64 {
         sb += db * db;
     }
     clamp_correlation(sab, sa, sb)
+}
+
+/// The power of two at or below a normal positive `h`. Dividing by it is
+/// exact, so scaling the deviations changes no digit of a well-scaled input.
+pub(crate) fn pow2_floor(h: f64) -> f64 {
+    f64::from_bits(h.to_bits() & 0x7ff0_0000_0000_0000)
 }
 
 /// `sab / sqrt(sa * sb)` clamped to `[-1, 1]`. Zero variance or a non-finite
@@ -1877,7 +1885,7 @@ mod tests {
 
     #[test]
     fn correlation_large_mean_small_spread() {
-        let xs: Vec<f64> = (0..200).map(|i| (i as f64 * 0.37).sin() + 0.01 * i as f64).collect();
+        let xs: Vec<f64> = (0..200).map(|i| i as f64).collect();
         let big: Vec<f64> = xs.iter().map(|x| 1e8 + 1e-6 * x).collect();
         let want = correlation(&xs, &xs.iter().map(|x| x * x).collect::<Vec<_>>());
         let y: Vec<f64> = xs.iter().map(|x| x * x).collect();

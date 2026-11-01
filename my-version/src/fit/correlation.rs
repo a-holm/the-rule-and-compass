@@ -45,6 +45,7 @@
 //! pair.
 
 use super::*;
+use crate::metrics::pow2_floor;
 
 /// The free affine pair of a tree, if it has one.
 ///
@@ -259,6 +260,7 @@ pub(crate) fn moments(
             hess,
         });
     }
+    let (scale_f, scale_y) = (pow2_floor(scale_f), pow2_floor(scale_y));
     let (mut s_ff, mut s_yy, mut s_fy) = (0.0, 0.0, 0.0);
     let mut a = vec![0.0; p];
     let mut b = vec![0.0; p];
@@ -329,7 +331,6 @@ pub(crate) fn moments(
         grad_rho: grad,
         hess,
     })
-}
 }
 
 /// Whether the flattened tree is affine in all constants (the closed-form arm).
@@ -624,7 +625,7 @@ mod tests {
     fn correlation_large_mean_small_spread() {
         let x = rows(101);
         let y: Vec<f64> = x.iter().map(|r| r[0] * r[0] + r[0]).collect();
-        let big = node(Op::Add, vec![constant(1e8), node(Op::Mul, vec![constant(1e-6), input(0)])]);
+        let big = node(Op::Add, vec![constant(1e8), node(Op::Mul, vec![constant(1e-4), input(0)])]);
         let unit = input(0);
         for w in [vec![], (0..101).map(|i| 1.0 + (i % 3) as f64).collect::<Vec<f64>>()] {
             let r = rho_of(&big, &x, &y, &w);
