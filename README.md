@@ -195,6 +195,8 @@ long/flat from the training mean, matched-exposure random long seeded by
 `--front run.json` takes the candidates from the Pareto front of a run, carries the run's threshold and per-side cost, defaults `--trials` to the offspring the search scored and refuses a window that tests rows the run trained or selected on (`docs/walkforward.md`).
 Pass `--batch-pnl` to score every candidate on every window in one batch (`src/wf_batch.rs`, kernel `src/cuda/wf_batch.cu`), per window and pooled, with the baseline ladder; finalist values stay exact CPU f64 and batch values are labelled `gpu_proxy`.
 `--policy top-tercile` holds the top `floor(n/3)` finite scores of each timestamp long and the rest flat (no threshold); it prices the book of a search run with `--position top_tercile` on an `xs_rank` target made by `rcsr panel rank` (`docs/time-series.md`).
+
+`rcsr panel spread` prints the market-neutral bucket spread of a feature (for example `clv1` against `lbl_h1_fwd`) in bp with a block-bootstrap interval, on a `--range` that must not reach the declared locked test (`docs/time-series.md`).
 `--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
 associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
 adds the exact `O(2n)` hindsight DP as a labelled bound, never as the
@@ -639,10 +641,11 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--fit-polish f64|f32|off] [--refit-band F|inf] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
-     [--no-front-parents] [--linear-scaling] [--reject-constant-offspring]
+     [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--linear-scaling] [--reject-constant-offspring]
      [--selection lexicographic|afp]
+     [--mutation-mix classic|extended] [--tree-arity uniform|balanced] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
-     [--patience N]
+     [--patience N] [--patience-tol r] [--stop-on front[:W]]
      [--gpu] [--gpu-memory size] [--dispatch auto|device] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
      [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
@@ -829,7 +832,7 @@ run:
 | `--allow-target-structure` | run a D13c target for a diagnostic replay (warns, records `check.status = overridden` and a proxy table) |
 | `--require-clean-inputs` | refuse (exit 5) a run whose inputs include a construction column of the target spec; default off, the column is only recorded in `check.construction_in_vars` |
 | `--allow-overlap` (`rcsr enrich`, `rcsr prep`) | permit a `--label` stride below the horizon for horizons of 4 h and longer; without it such a label is refused. `--side short` and `--allow-short` are always refused: labels are long-only (action `{0,+1}`, long-side barriers, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge)) |
-| `--label long:<horizon>,fee=<bp>,...` (`rcsr enrich`; `fee=` is required, `fee=0` for none) | long-only label family `lbl_<name>_{fwd,y,long_net,action,t1,exit_ret,m_net,m_barrier,weight}`, the label report with hash and top 10 absolute moves in `<out>.labels.json` (rows reaching the declared locked test, `--locked-test` or the input declaration, are left out of its statistics and counted), the enrich report and `run.json` (`target_spec.label_report`); label columns are never `--vars` inputs, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge) |
+| `--label long:<horizon>,fee=<bp>,...` (`rcsr enrich`; `fee=` is required, `fee=0` for none) | long-only label family `lbl_<name>_{fwd,y,long_net,action,t1,exit_ret,m_net,m_barrier,weight}`, the label report with hash and top 10 absolute moves in `<out>.labels.json` (rows reaching the declared locked test, `--locked-test` or the input declaration, are left out of its statistics and counted; `<out>.enrich.json` leaves them out of every per-column statistic the same way and reports `rows_left_out`), the enrich report and `run.json` (`target_spec.label_report`); label columns are never `--vars` inputs, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |
 | `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
 | `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |

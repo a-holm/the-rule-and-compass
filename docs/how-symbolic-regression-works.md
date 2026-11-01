@@ -101,7 +101,7 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   non-dominated, so each member is the best shape found at some complexity, and
   this lets a building block found on another island or generations earlier
   re-enter the population. `--no-front-parents` disables the feedback.
-- **Constant models.** A tree with no input outside an aggregate or meta operator (`exp(1.3)`, `mean(x1) + 0.2`) predicts one value for every row, so after its constant fit it equals the training-mean model. With `--reject-constant-offspring` such a child is dropped after simplification and before de-duplication and the fit, and counted in `variation.constant_rejected`. The first constant tree of an island is kept, so the front keeps its complexity-1 baseline. Random fill and restart trees are drawn again (up to 8 times) when they are constant and the island already holds one. Seeds and migrants are not filtered. The flag is off by default.
+- **Constant models.** A tree with no input outside an aggregate or meta operator (`exp(1.3)`, `mean(x1) + 0.2`) predicts one value for every row, so after its constant fit it equals the training-mean model. With `--reject-constant-offspring` such a child is dropped after simplification and before de-duplication and the fit, and counted in `variation.constant_rejected`. The first constant tree of an island is kept, so the front keeps its complexity-1 baseline. Random fill, QD immigrant and restart trees are drawn again (up to 8 times) when they are constant and the island already holds one. Seeds and migrants are not filtered. The flag is off by default.
 - **Survivor selection** is generational by default: the island is replaced by
   its offspring and only the best individual is carried over. With
   `--selection afp` parents and offspring compete: the next population is the
@@ -115,7 +115,21 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
     constant/input perturb, 40 % subtree grow/shrink) and the site is chosen
     among nodes that the edit can actually change, so a mutation never returns
     the parent unchanged;
-  - *crossover* — swap subtrees between two parents.
+    `--mutation-mix extended` adds four structural edits: *insert* wraps a node
+    in a random operator, *delete* replaces a node by one of its children,
+    *swap* exchanges the operands of a non-commutative binary operator and
+    *rotate* turns `o1(a, o2(b, c))` into `o2(o1(a, b), c)`. Weights: point
+    0.20, terminal 0.30, subtree 0.20, insert 0.10, delete 0.10, swap 0.05,
+    rotate 0.05. `--adaptive-mix` lets each island reweight the seven kinds
+    from the success rate (a child beats its first parent) over the last 10
+    generations, `w = max(0.02, (s + 1) / (a + 2))`, normalised; it learns
+    from CPU-scored generations only;
+  - *crossover* — swap subtrees between two parents; `--crossover-internal P`
+    picks an internal node as the cut point with probability `P`;
+  - *random trees* — `--tree-arity balanced` draws the arity class of each
+    operator first (binary 0.5, unary 0.4, ternary 0.1) instead of choosing
+    uniformly among all operators, which favours the 15 unary operators of the
+    default set;
 - **Constant fitting** tunes the numeric constants of a candidate by local
   search. Without it, `y = a·sin(b·x) + c` would almost never be found, because
   random constants rarely land near the right values.
@@ -137,6 +151,8 @@ folding and only those identities that preserve every IEEE value, including
 (`expr::simplify_display`) additionally applies affine normalisation and
 `x+0 -> x` for a readable equation, and the tree is **denormalised** back to the
 original variable units.
+
+**Front prune (#466).** The sound simplifier must keep code that is neutral only on the training data: `x ^ (0 * f)` is 1 only for finite `f`, `if(c, a, b)` is `a` only where `c > 0`, `0 + n` differs from `n` at `-0`. With `--prune` (off by default), after the generation loop, and so also after the `solved` stop, each front member is pruned by measurement. For every internal node the prune tries each child and a constant (the mean of the subtree) in its place, refits the constants with the exact CPU fitter and keeps the smallest result whose training error is within `1e-6 * (1 + |e|)` of the original, the archive's epsilon-dominance tolerance. It repeats until nothing is accepted, offers every accepted tree to the front, and the front is rebuilt on all training rows in f64. The pass uses no RNG, so its result is a function of the tree and the data. `--prune` enables it, `--prune-rows` caps the rows it fits on and `--prune-budget` caps the fits. `expr::simplify_equal_branches` folds `if(c, a, a)` to `a`, which is exact for every condition including `NaN`; the prune uses it, the search does not, so a default run keeps the search trajectory.
 
 ## 8. Concurrency
 

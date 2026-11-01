@@ -58,6 +58,8 @@ OPTIONS:
                             (default: the available CPU cores; 1 = serial; the
                             results do not depend on it)
   --no-front-parents        disable the 15% Pareto-front parent feedback (#76)
+  --prune                   enable the front prune (#466; off by default)
+  --no-prune                keep the prune off (the default)
   --reject-constant-offspring  reject input-free offspring before the constant fit (#477)
   --cpu                     force the CPU evaluator (no environment variable)
   --gpu                     require the device evaluator; exit 2 without one
@@ -67,11 +69,17 @@ OPTIONS:
   --ops <a,b,..>            operator set
   --max-complexity <N>      maximum expression complexity
   --patience <N>            generations without improvement before stopping
+  --patience-tol <r>        scale-free patience tolerance (relative best-error drop)
+  --stop-on front[:W]       stop when the front is stable for W generations
   --migration-interval <N>  generations between island migrations
   --restart-interval <N>    generations between island restarts
   --variation <mode>        auto, node or postfix
   --selection <mode>        lexicographic (default) or afp (age-fitness Pareto)
   --linear-scaling          wrap every candidate in a fitted affine output map (#470)
+  --mutation-mix <mix>      classic (default) or extended: insert, delete, swap, rotate (#471)
+  --tree-arity <mode>       uniform (default) or balanced random-tree operator draw (#471)
+  --crossover-internal <P>  probability of an internal-node crossover cut (default 0) (#471)
+  --adaptive-mix            per-island edit weights from success rates (#471)
   --dispatch <mode>         auto or device (device skips the timing comparison)
   --fit-polish <mode>      f64 (default), f32 or off: arithmetic of the device fit
                             kernel polish (--fit-strategy gpu)
@@ -266,6 +274,8 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--json" => a.json = true,
             "--ndjson" => a.ndjson = true,
             "--no-front-parents" => a.front_parents = false,
+            "--prune" => a.knobs.prune = Some(true),
+            "--no-prune" => a.knobs.prune = Some(false),
             "--cpu" => a.cpu = true,
             "--gpu" => a.gpu = true,
             "--fit-strategy" => {
@@ -291,6 +301,21 @@ fn parse(args: &[String]) -> Result<Args, String> {
                 a.knobs.max_complexity = Some(num(take(&mut i, "--max-complexity")?, "--max-complexity")?)
             }
             "--patience" => a.knobs.patience = Some(num(take(&mut i, "--patience")?, "--patience")?),
+            "--patience-tol" => {
+                a.knobs.patience_tol = Some(num(take(&mut i, "--patience-tol")?, "--patience-tol")?)
+            }
+            "--stop-on" => {
+                let v = take(&mut i, "--stop-on")?;
+                a.knobs.stop_front = Some(match v.strip_prefix("front") {
+                    Some("") => 0,
+                    Some(rest) => rest
+                        .strip_prefix(':')
+                        .and_then(|w| w.parse::<usize>().ok())
+                        .filter(|w| *w >= 1)
+                        .ok_or_else(|| format!("--stop-on: bad window in '{}'", v))?,
+                    None => return Err(format!("--stop-on: expected front[:W], got '{}'", v)),
+                });
+            }
             "--migration-interval" => {
                 a.knobs.migration_interval =
                     Some(num(take(&mut i, "--migration-interval")?, "--migration-interval")?)
@@ -300,6 +325,17 @@ fn parse(args: &[String]) -> Result<Args, String> {
                     Some(num(take(&mut i, "--restart-interval")?, "--restart-interval")?)
             }
             "--linear-scaling" => a.knobs.linear_scaling = true,
+            "--mutation-mix" => {
+                a.knobs.mutation_mix = Some(rcsr::search::MutationMix::parse(&take(&mut i, "--mutation-mix")?)?)
+            }
+            "--tree-arity" => {
+                a.knobs.tree_arity = Some(rcsr::search::TreeArity::parse(&take(&mut i, "--tree-arity")?)?)
+            }
+            "--crossover-internal" => {
+                a.knobs.crossover_internal =
+                    Some(num(take(&mut i, "--crossover-internal")?, "--crossover-internal")?)
+            }
+            "--adaptive-mix" => a.knobs.adaptive_mix = true,
             "--variation" => {
                 a.knobs.variation = Some(rcsr::search::VariationMode::parse(&take(&mut i, "--variation")?)?)
             }

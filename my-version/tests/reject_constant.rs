@@ -100,3 +100,14 @@ fn the_setting_survives_a_checkpoint_round_trip() {
     let off = final_text(&config(false, 1));
     assert!(!off.contains("reject_constant_offspring"), "an off run writes the old checkpoint");
 }
+
+#[test]
+fn qd_immigrants_and_restarts_honour_the_flag() {
+    let qd = Config { qd_bins: 8, qd_policy: true, restart_interval: 3, generations: 40, ..config(true, 1) };
+    let counts = constants_per_generation(&qd);
+    assert!(counts.len() >= 40, "one checkpoint per generation, got {}", counts.len());
+    assert!(counts.iter().all(|&c| c <= 1), "constants per generation with QD: {counts:?}");
+    let off = Config { reject_constant_offspring: false, ..qd };
+    let counts = constants_per_generation(&off);
+    assert!(counts.iter().any(|&c| c > 1), "control without the flag: {counts:?}");
+}

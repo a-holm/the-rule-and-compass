@@ -755,7 +755,7 @@ pub fn run_start_json(r: &RunStart) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct RunEnd {
     pub generations: usize,
-    /// `solved`, `patience`, `time_budget` or `generations`.
+    /// `solved`, `patience`, `front_stable`, `time_budget` or `generations`.
     pub stop: String,
     /// Seconds since the CLI took the clock, including data preparation.
     pub wall_s: f64,
@@ -787,10 +787,14 @@ pub struct RunEnd {
     /// #284: fit kernel seconds from raw device events.
     pub fit_kernel_s: Option<f64>,
     /// #496: `fit_kernel_s` apportioned to the LM phase and to the polish phase.
-    pub fit_kernel_f32_s: Option<f64>,
-    pub fit_kernel_f64_s: Option<f64>,
+    pub fit_kernel_lm_s: Option<f64>,
+    pub fit_kernel_polish_s: Option<f64>,
     /// #284: exact CPU fit-fallback seconds.
     pub fit_fallback_s: Option<f64>,
+    /// #466: front prune counters.
+    pub prune_fits: usize,
+    pub prune_accepted: usize,
+    pub prune_s: f64,
     /// #495: exact finalist refit seconds.
     pub fit_refit_s: Option<f64>,
     /// #495: exact finalist refits performed.
@@ -810,7 +814,8 @@ pub fn run_end_json(r: &RunEnd) -> String {
          \"json\":{},\"peak_rss_bytes\":{},\"gpu_wall_s\":{},\"device_hours\":{},\
          \"device_seconds_incl_fit\":{},\"device_fraction_of_run\":{},\
          \"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"unaccounted_s\":{},\
-         \"fit_kernel_s\":{},\"fit_kernel_f32_s\":{},\"fit_kernel_f64_s\":{},\"fit_fallback_s\":{},\"fit_refit_s\":{},\"fit_refits\":{},\
+         \"fit_kernel_s\":{},\"fit_kernel_lm_s\":{},\"fit_kernel_polish_s\":{},\"fit_fallback_s\":{},\"fit_refit_s\":{},\"fit_refits\":{},\
+         \"prune\":{{\"fits\":{},\"accepted\":{},\"seconds\":{}}},\
          \"events\":{},\"bytes\":{},\"dropped\":{},\"end\":{}}}",
         SCHEMA,
         VERSION,
@@ -841,14 +846,17 @@ pub fn run_end_json(r: &RunEnd) -> String {
         opt_num(r.duty_run),
         opt_num(r.unaccounted_s),
         opt_num(r.fit_kernel_s),
-        opt_num(r.fit_kernel_f32_s),
-        opt_num(r.fit_kernel_f64_s),
+        opt_num(r.fit_kernel_lm_s),
+        opt_num(r.fit_kernel_polish_s),
         opt_num(r.fit_fallback_s),
         opt_num(r.fit_refit_s),
         match r.fit_refits {
             Some(n) => n.to_string(),
             None => "null".to_string(),
         },
+        r.prune_fits,
+        r.prune_accepted,
+        num(r.prune_s),
         r.events,
         r.bytes,
         r.dropped,

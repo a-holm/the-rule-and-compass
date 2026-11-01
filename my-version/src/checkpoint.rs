@@ -23,6 +23,7 @@
 //! | `stopped_early <bool>` | the saved run had already stopped |
 //! | `best_prev <f64>` / `no_improve <n>` | patience bookkeeping |
 //! | `candidates_evaluated <n>` | #482: offspring scored so far |
+//! | `front_stable <n>` | #464: front-stop counter; absent means 0 |
 //! | `data train|test <rows> <hash>` | data fingerprint |
 //! | `archive <members> <cap>` | archive header |
 //! | `sol <complexity> <cost> <error> <tree>` | one archive member |
@@ -32,6 +33,7 @@
 //! | `fsol <complexity> <cost> <error> <tree>` | #256: one post-refit member |
 //! | `build <field> <value>` | #256: version, commit, binary_sha256, device, driver, threads |
 //! | `island <i> <stagnant>` | per-island counter |
+//! | `mix <i> <numbers>` | #471: adaptive edit counts of island i, 14 numbers per generation |
 //! | `rng <i|main> <idx> <624 words>` | exact MT19937 state |
 //! | `ind <i> <error> <complexity> <tree>` | one population member |
 //!
@@ -81,6 +83,9 @@ pub struct Individual {
 pub struct IslandState {
     pub rng: Mt,
     pub population: Vec<Individual>,
+    /// #471: the adaptive edit counts of the last generations. Empty unless
+    /// `--adaptive-mix` is on.
+    pub mix: crate::mix::MixWindow,
 }
 
 /// A fingerprint of a sample: its row count and a hash of every stored value.
@@ -177,7 +182,7 @@ pub struct Checkpoint {
     pub config_hash: u64,
     /// Generations completed, i.e. the next generation to run.
     pub generations: usize,
-    /// True when the saved run declared itself finished (solved or patience).
+    /// True when the saved run declared itself finished (solved, patience or front_stable).
     /// Resuming such a checkpoint does not run more generations. A time-budget
     /// stop is never terminal (#256): the budget is a property of one process.
     pub stopped_early: bool,
@@ -185,6 +190,8 @@ pub struct Checkpoint {
     pub best_prev: f64,
     /// Consecutive generations without improvement.
     pub no_improve: usize,
+    /// #464: consecutive generations with a settled front (front stop).
+    pub front_stable: usize,
     pub train: Fingerprint,
     pub test: Fingerprint,
     pub archive: Archive,
@@ -544,6 +551,9 @@ impl Checkpoint {
         writeln!(out, "stopped_early {}", self.stopped_early).unwrap();
         writeln!(out, "best_prev {}", encode_f64(self.best_prev)).unwrap();
         writeln!(out, "no_improve {}", self.no_improve).unwrap();
+        if self.front_stable > 0 {
+            writeln!(out, "front_stable {}", self.front_stable).unwrap();
+        }
         writeln!(out, "data train {} {}", self.train.rows, self.train.hash).unwrap();
         writeln!(out, "data test {} {}", self.test.rows, self.test.hash).unwrap();
         writeln!(out, "error_kind {}", self.error_kind.as_str()).unwrap();
@@ -608,6 +618,10 @@ impl Checkpoint {
                 let _ = write!(line, "{}", w);
             }
             writeln!(out, "{}", line).unwrap();
+            if !isl.mix.is_empty() {
+                let numbers: Vec<String> = isl.mix.encode().iter().map(|v| v.to_string()).collect();
+                writeln!(out, "mix {} {}", i, numbers.join(" ")).unwrap();
+            }
             for ind in &isl.population {
                 writeln!(
                     out,
@@ -654,12 +668,14 @@ impl Checkpoint {
         let mut stopped_early: Option<bool> = None;
         let mut best_prev: Option<f64> = None;
         let mut no_improve: Option<usize> = None;
+        let mut front_stable: Option<usize> = None;
         let mut train: Option<Fingerprint> = None;
         let mut test: Option<Fingerprint> = None;
         let mut archive_header: Option<(usize, usize)> = None;
         let mut sols: Vec<Sol> = Vec::new();
         let mut island_stagnant: Vec<Option<usize>> = Vec::new();
         let mut island_rngs: Vec<Option<Mt>> = Vec::new();
+        let mut island_mix: Vec<Option<crate::mix::MixWindow>> = Vec::new();
         let mut island_pops: Vec<Option<Vec<Individual>>> = Vec::new();
         let mut island_ages: Vec<Option<Vec<u32>>> = Vec::new();
         let mut main_rng: Option<Mt> = None;
@@ -747,6 +763,14 @@ impl Checkpoint {
                         &mut no_improve,
                         parse_num::<usize>(&parts, 1, lineno, "no_improve")?,
                         "no_improve",
+                        lineno,
+                    )?;
+                }
+                "front_stable" => {
+                    set_once(
+                        &mut front_stable,
+                        parse_num::<usize>(&parts, 1, lineno, "front_stable")?,
+                        "front_stable",
                         lineno,
                     )?;
                 }
@@ -923,6 +947,16 @@ impl Checkpoint {
                         set_slot(&mut island_rngs, i, rng, "rng", lineno)?;
                     }
                 }
+                "mix" => {
+                    let i = parse_num::<usize>(&parts, 1, lineno, "mix island")?;
+                    let mut values = Vec::new();
+                    for k in 2..parts.len() {
+                        values.push(parse_num::<u64>(&parts, k, lineno, "mix count")?);
+                    }
+                    let window = crate::mix::MixWindow::decode(&values)
+                        .map_err(|e| format!("line {}: {}", lineno, e))?;
+                    set_slot(&mut island_mix, i, window, "mix", lineno)?;
+                }
                 "ind" => {
                     let i = parse_num::<usize>(&parts, 1, lineno, "ind island")?;
                     let error = parse_f64_at(&parts, 2, lineno, "ind error")?;
@@ -1050,7 +1084,8 @@ impl Checkpoint {
                 .get_mut(i)
                 .and_then(|s| s.take())
                 .ok_or_else(|| format!("checkpoint is incomplete: island {} has no counter", i))?;
-            islands.push(IslandState { rng, population });
+            let mix = island_mix.get_mut(i).and_then(|s| s.take()).unwrap_or_default();
+            islands.push(IslandState { rng, population, mix });
             stagnant.push(st);
         }
         if island_rngs.iter().skip(expected_islands).any(|s| s.is_some())
@@ -1128,6 +1163,7 @@ impl Checkpoint {
             stopped_early,
             best_prev,
             no_improve,
+            front_stable: front_stable.unwrap_or(0),
             train,
             test,
             archive,
@@ -1379,10 +1415,16 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "qd_cell_cap",   // #120
         "qd_cvt",        // #120
         "qd_policy",     // #120
+        "patience_tol",  // #464: missing means none
+        "stop_front",    // #464: missing means off
         "qd_control",    // #120
         "variation",     // #122: missing means auto
         "selection",     // #465: missing means lexicographic
         "linear_scaling", // #470: missing means false
+        "mutation_mix",       // #471: missing means classic
+        "tree_arity",         // #471: missing means uniform
+        "crossover_internal", // #471: missing means 0
+        "adaptive_mix",       // #471: missing means false
     ];
     for key in KEYS {
         required(fields, key)?;
@@ -1582,6 +1624,28 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             ))
         }
     };
+    let mutation_mix = match fields.get("mutation_mix") {
+        None => crate::search::MutationMix::Classic,
+        Some(s) => crate::search::MutationMix::parse(s).map_err(|e| format!("config 'mutation_mix': {}", e))?,
+    };
+    let tree_arity = match fields.get("tree_arity") {
+        None => crate::search::TreeArity::Uniform,
+        Some(s) => crate::search::TreeArity::parse(s).map_err(|e| format!("config 'tree_arity': {}", e))?,
+    };
+    let crossover_internal = match fields.get("crossover_internal") {
+        None => 0.0,
+        Some(s) => decode_f64(s).map_err(|e| format!("config 'crossover_internal': {}", e))?,
+    };
+    let adaptive_mix = match fields.get("adaptive_mix").map(|s| s.as_str()) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "config 'adaptive_mix' must be true or false, got '{}'",
+                other
+            ))
+        }
+    };
     let reject_constant_offspring = match fields.get("reject_constant_offspring").map(|s| s.as_str()) {
         None | Some("false") => false,
         Some("true") => true,
@@ -1614,6 +1678,16 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         Some(raw) => crate::fit::FitPolish::parse(raw).ok_or_else(|| {
             format!("config 'fit_polish' must be f64, f32 or off, got '{}'", raw)
         })?,
+    };
+    let patience_tol = match fields.get("patience_tol") {
+        None => None,
+        Some(raw) => Some(decode_f64(raw)?),
+    };
+    let stop_front = match fields.get("stop_front") {
+        None => None,
+        Some(raw) => Some(raw.parse::<usize>().map_err(|_| {
+            format!("config 'stop_front' must be a count, got '{}'", raw)
+        })?),
     };
     if require_dimensions && units.is_none() {
         return Err(
@@ -1728,6 +1802,8 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         dedup: bool_val("dedup")?,
         time_budget,
         patience: num_usize("patience")?,
+        patience_tol,
+        stop_front,
         predictor_samples,
         fit_samples, // #85
         fit_rows,     // #116
@@ -1747,6 +1823,9 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         progress: None,
         dev_log: None, // #211: a reporting hook, never part of the saved state
         front_observer: None, // #462
+        prune: false,         // #466: a post-loop pass, not saved state
+        prune_rows: crate::search::DEFAULT_PRUNE_ROWS,
+        prune_budget: crate::search::DEFAULT_PRUNE_BUDGET,
         // #27/#26: evaluator choices are not saved search state; a resumed run
         // picks the backend afresh from the current build/flags.
         simd: true,
@@ -1760,6 +1839,10 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         variation,
         selection,
         linear_scaling, // #470
+        mutation_mix,
+        tree_arity,
+        crossover_internal,
+        adaptive_mix,
     })
 }
 
@@ -1830,6 +1913,12 @@ fn write_config(cfg: &Config, out: &mut String) {
     )
     .unwrap();
     writeln!(out, "config patience {}", cfg.patience).unwrap();
+    if let Some(r) = cfg.patience_tol {
+        writeln!(out, "config patience_tol {}", encode_f64(r)).unwrap();
+    }
+    if let Some(w) = cfg.stop_front {
+        writeln!(out, "config stop_front {}", w).unwrap();
+    }
     writeln!(
         out,
         "config predictor_samples {}",
@@ -1852,6 +1941,19 @@ fn write_config(cfg: &Config, out: &mut String) {
     // #470: written only when on, so every other checkpoint keeps its bytes.
     if cfg.linear_scaling {
         writeln!(out, "config linear_scaling true").unwrap();
+    }
+    // #471: written only when set, so every other checkpoint keeps its bytes.
+    if cfg.mutation_mix != crate::search::MutationMix::Classic {
+        writeln!(out, "config mutation_mix {}", cfg.mutation_mix.as_str()).unwrap();
+    }
+    if cfg.tree_arity != crate::search::TreeArity::Uniform {
+        writeln!(out, "config tree_arity {}", cfg.tree_arity.as_str()).unwrap();
+    }
+    if cfg.crossover_internal != 0.0 {
+        writeln!(out, "config crossover_internal {}", encode_f64(cfg.crossover_internal)).unwrap();
+    }
+    if cfg.adaptive_mix {
+        writeln!(out, "config adaptive_mix true").unwrap();
     }
     // #76: only write the field when front feedback is off, so an on run's
     // checkpoint stays byte-identical to one written before the flag existed.

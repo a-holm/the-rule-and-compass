@@ -697,6 +697,20 @@ SEARCH:
                              and offset scores as right at once. Needs a
                              least-squares metric (squared, aic, aicc, bic) and
                              constant fitting; single target; off by default (#470)
+  --mutation-mix <M>         node-path edit weights: classic (point .25, terminal
+                             .35, subtree .40; default) or extended (adds insert,
+                             delete, swap and rotate). Not with --variation
+                             postfix (#471)
+  --tree-arity <A>           operator draw in random trees: uniform (default) or
+                             balanced (binary .5, unary .4, ternary .1). Not with
+                             --variation postfix (#471)
+  --crossover-internal <P>   probability that a crossover cut point is an
+                             internal node (default 0 = uniform cut). Not with
+                             --variation postfix (#471)
+  --adaptive-mix             per-island edit weights learned from the success
+                             rate of the last 10 generations (uses all seven edit
+                             kinds; learns from CPU-scored generations only).
+                             Off by default; not with --variation postfix (#471)
   --no-front-parents         draw every parent from the island tournament;
                              turns off the 15% Pareto-front feedback (#76)
   --reject-constant-offspring
@@ -705,6 +719,15 @@ SEARCH:
                              first constant of an island is kept (#477). Saved
                              search setting, off by default
                              and restores the pre-#76 trajectory exactly
+  --prune                    remove neutral code from the final front (off by
+                             default): replace subtrees with a child or a
+                             constant when the training error stays within
+                             1e-6 (1 + |e|) of the original (#466)
+  --no-prune                 keep the prune off (the default)
+  --prune-rows <N>           rows the prune fits on (default 20000, >= 2); a
+                             larger training sample is subsampled
+  --prune-budget <N>         cap on candidate fits per run (default 20000,
+                             0 = no prune)
   --no-simd                  force the scalar tree walk instead of the
                              SoA/AVX evaluator (same results, slower; an
                              escape hatch for debugging and A/B runs)
@@ -723,6 +746,15 @@ SEARCH:
                              selection and archiving. Independent of
                              --predictor-samples
   --patience <N>             stop after N generations without improvement (default 40)
+  --patience-tol <r>         count a generation as no improvement when the best
+                             error fell by at most r relative to itself (scale
+                             free). Default: the 1e-9 rule with a 1+|error|
+                             denominator
+  --stop-on front[:<W>]      stop after W generations (default: --patience) in
+                             which no front member beat the previous front by
+                             more than --patience-tol (default 1e-6) and the
+                             front hypervolume did not rise by that much;
+                             stop_reason front_stable. Off by default
   --time-budget <seconds>    wall-clock limit of this process (default: none).
                              The generation in progress finishes, its progress
                              event and checkpoint are written, and the result
@@ -1220,7 +1252,7 @@ fn ledger_json(
         rcsr::gpu_stats::Ratio::undefined(f64::NAN, f64::NAN, "decades_per_gpu_hour", "run")
     };
     format!(
-        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"fallback_s\":{},\"gate_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
+        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"fallback_s\":{},\"gate_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
         jnum(l.wall_s()),
         stages,
         jnum(l.stage_sum_s()),
@@ -1362,7 +1394,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"seconds\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1877,9 +1909,12 @@ impl DevSink {
             duty_run: outcome.gpu.as_ref().map(|g| g.ledger.duty_run().value),
             unaccounted_s: outcome.gpu.as_ref().map(|g| g.ledger.unaccounted_s()),
             fit_kernel_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_s()),
-            fit_kernel_f32_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_lm_s()),
-            fit_kernel_f64_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_polish_s()),
+            fit_kernel_lm_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_lm_s()),
+            fit_kernel_polish_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_polish_s()),
             fit_fallback_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_fallback_s()),
+            prune_fits: outcome.prune.fits,
+            prune_accepted: outcome.prune.accepted,
+            prune_s: outcome.prune.seconds,
             fit_refit_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_s()),
             fit_refits: outcome.gpu.as_ref().map(|g| g.fit_refits),
             events,
@@ -2406,6 +2441,8 @@ fn main() {
     let mut fit_strategy_set = false;
     let mut dedup_set = false;
     let mut patience_set = false;
+    let mut patience_tol_set = false;
+    let mut stop_front_set = false;
     let mut time_budget_set = false;
     let mut predictor_samples_set = false;
     // #85: remember an explicit --fit-samples so a resume can refuse a
@@ -2425,6 +2462,10 @@ fn main() {
     // #465: explicit --selection for the resume settings check.
     let mut selection_set = false;
     let mut linear_scaling_set = false; // #470
+    let mut mutation_mix_set = false; // #471
+    let mut tree_arity_set = false;
+    let mut crossover_internal_set = false;
+    let mut adaptive_mix_set = false;
     // #25: `--units` is resolved against the prepared input list later; the
     // expressions themselves are parsed here so a typo is a usage error.
     let mut unit_assignments: Vec<(String, Unit)> = Vec::new();
@@ -2809,6 +2850,29 @@ fn main() {
                 cfg.fit_fallback_max = val!().parse().unwrap_or(cfg.fit_fallback_max);
                 fit_fallback_max_set = true;
             }
+            // #466: front prune; a post-loop pass, not saved search state.
+            "--prune" => cfg.prune = true,
+            "--no-prune" => cfg.prune = false,
+            "--prune-rows" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n >= 2 => cfg.prune_rows = n,
+                    _ => {
+                        eprintln!("error: --prune-rows needs an integer >= 2, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--prune-budget" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) => cfg.prune_budget = n,
+                    _ => {
+                        eprintln!("error: --prune-budget needs a non-negative integer, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             // #495: relative band of the exact finalist refit.
             "--refit-band" => {
                 let v = val!();
@@ -2924,6 +2988,44 @@ fn main() {
             "--linear-scaling" => {
                 cfg.linear_scaling = true;
                 linear_scaling_set = true;
+            }
+            // #471: node-path variation settings, each off by default.
+            "--mutation-mix" => {
+                let v = val!();
+                match rcsr::search::MutationMix::parse(&v) {
+                    Ok(m) => cfg.mutation_mix = m,
+                    Err(e) => {
+                        eprintln!("error: --mutation-mix: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+                mutation_mix_set = true;
+            }
+            "--tree-arity" => {
+                let v = val!();
+                match rcsr::search::TreeArity::parse(&v) {
+                    Ok(m) => cfg.tree_arity = m,
+                    Err(e) => {
+                        eprintln!("error: --tree-arity: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+                tree_arity_set = true;
+            }
+            "--crossover-internal" => {
+                let v = val!();
+                match v.parse::<f64>() {
+                    Ok(p) if (0.0..=1.0).contains(&p) => cfg.crossover_internal = p,
+                    _ => {
+                        eprintln!("error: --crossover-internal needs a probability in [0, 1], got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+                crossover_internal_set = true;
+            }
+            "--adaptive-mix" => {
+                cfg.adaptive_mix = true;
+                adaptive_mix_set = true;
             }
             // #76: exactness escape hatch; the default is on.
             // #465: survivor and parent selection inside an island.
@@ -3071,6 +3173,36 @@ fn main() {
             "--patience" => {
                 cfg.patience = val!().parse().unwrap_or(cfg.patience);
                 patience_set = true;
+            }
+            "--patience-tol" => {
+                let v = val!();
+                match v.parse::<f64>() {
+                    Ok(r) if r.is_finite() && r >= 0.0 => cfg.patience_tol = Some(r),
+                    _ => {
+                        eprintln!("error: --patience-tol needs a number >= 0, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+                patience_tol_set = true;
+            }
+            "--stop-on" => {
+                let v = val!();
+                let window = match v.strip_prefix("front") {
+                    Some("") => Some(0),
+                    Some(rest) => rest
+                        .strip_prefix(':')
+                        .and_then(|w| w.parse::<usize>().ok())
+                        .filter(|w| *w >= 1),
+                    None => None,
+                };
+                match window {
+                    Some(w) => cfg.stop_front = Some(w),
+                    None => {
+                        eprintln!("error: --stop-on needs front or front:<W> with W >= 1, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+                stop_front_set = true;
             }
             "--time-budget" => {
                 cfg.time_budget = val!().parse().ok();
@@ -3462,6 +3594,18 @@ fn main() {
                 cfg.patience, saved.patience
             ));
         }
+        if patience_tol_set && cfg.patience_tol != saved.patience_tol {
+            conflicts.push(format!(
+                "--patience-tol {:?} (saved {:?})",
+                cfg.patience_tol, saved.patience_tol
+            ));
+        }
+        if stop_front_set && cfg.stop_front != saved.stop_front {
+            conflicts.push(format!(
+                "--stop-on front {:?} (saved {:?})",
+                cfg.stop_front, saved.stop_front
+            ));
+        }
         if predictor_samples_set && cfg.predictor_samples != saved.predictor_samples {
             conflicts.push(format!(
                 "--predictor-samples {:?} (saved {:?})",
@@ -3516,6 +3660,32 @@ fn main() {
         // #470: linear scaling is saved search state.
         if linear_scaling_set && !saved.linear_scaling {
             conflicts.push("--linear-scaling (saved linear_scaling is false)".to_string());
+        }
+        // #471: the node-path variation settings are saved search state.
+        {
+            if mutation_mix_set && cfg.mutation_mix != saved.mutation_mix {
+                conflicts.push(format!(
+                    "--mutation-mix {} (saved {})",
+                    cfg.mutation_mix.as_str(),
+                    saved.mutation_mix.as_str()
+                ));
+            }
+            if tree_arity_set && cfg.tree_arity != saved.tree_arity {
+                conflicts.push(format!(
+                    "--tree-arity {} (saved {})",
+                    cfg.tree_arity.as_str(),
+                    saved.tree_arity.as_str()
+                ));
+            }
+            if crossover_internal_set && cfg.crossover_internal != saved.crossover_internal {
+                conflicts.push(format!(
+                    "--crossover-internal {} (saved {})",
+                    cfg.crossover_internal, saved.crossover_internal
+                ));
+            }
+            if adaptive_mix_set && cfg.adaptive_mix != saved.adaptive_mix {
+                conflicts.push(format!("--adaptive-mix (saved adaptive_mix is {})", saved.adaptive_mix));
+            }
         }
         // #76: front feedback is saved search state.
         if front_parents_set && cfg.front_parents != saved.front_parents {
@@ -3782,6 +3952,16 @@ fn main() {
         };
         if let Some(reason) = refusal {
             eprintln!("error: --linear-scaling: {}", reason);
+            std::process::exit(EXIT_USAGE);
+        }
+    }
+
+    if let Some(flag) = cfg.node_variation_flag() {
+        if cfg.variation == rcsr::search::VariationMode::Postfix {
+            eprintln!(
+                "error: {}: the flat postfix engine has its own edits; use --variation node or auto",
+                flag
+            );
             std::process::exit(EXIT_USAGE);
         }
     }
@@ -7229,7 +7409,18 @@ fn main() {
             } else {
                 String::new()
             };
-            let search_meta_json = format!("{}{}", predictor_json, fit_json);
+            // #466: omitted unless --prune is given, which keeps the historical JSON.
+            let prune_json = if cfg.prune && cfg.prune_budget > 0 {
+                format!(
+                    "\"prune\":{{\"fits\":{},\"accepted\":{},\"seconds\":{}}},",
+                    outcome.prune.fits,
+                    outcome.prune.accepted,
+                    jnum(outcome.prune.seconds)
+                )
+            } else {
+                String::new()
+            };
+            let search_meta_json = format!("{}{}{}", predictor_json, fit_json, prune_json);
             let checkpoint_json = format!(
                 "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{}}}",
                 resume_path
@@ -11738,7 +11929,7 @@ mod tests {
         g.ledger.record_fit_gate(0.375);
         let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true, 10.0);
         assert!(
-            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"admitted_wide\":0,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"seconds\":0.25,\"kernel_f32_s\":0.5,\"kernel_f64_s\":0.25,\"polish\":\"f32\",\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"gate_s\":0.375,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096,\"fit_rows\":0,\"score_rows\":0,\"fit_twin_bytes\":0,\"subsample_hash\":null}"),
+            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"admitted_wide\":0,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"refit_candidates\":0,\"refit_s\":0,\"rescore_s\":0,\"seconds\":0.25,\"kernel_lm_s\":0.5,\"kernel_polish_s\":0.25,\"polish\":\"f32\",\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"gate_s\":0.375,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096,\"fit_rows\":0,\"score_rows\":0,\"fit_twin_bytes\":0,\"subsample_hash\":null}"),
             "{}",
             json
         );
