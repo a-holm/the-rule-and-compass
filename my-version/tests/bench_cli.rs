@@ -93,6 +93,28 @@ fn compare_exits_2_on_mismatched_key_sets() {
 }
 
 #[test]
+fn compare_lists_pairs_with_an_undefined_criterion() {
+    let run = |seed: u32, oracle: &str| {
+        format!("{{\"type\":\"run\",\"suite\":\"hard\",\"problem\":\"p\",\"noise\":0.1,\"seed\":{seed},\"recovered\":true,\"oracle_recovered\":{oracle},\"signal_recovered\":null,\"seconds\":1.0,\"config\":{{\"generator\":\"g\"}}}}")
+    };
+    let a = scratch("undef-a.ndjson");
+    let b = scratch("undef-b.ndjson");
+    std::fs::write(&a, [run(1, "true"), run(2, "null")].join("\n")).unwrap();
+    std::fs::write(&b, [run(1, "false"), run(2, "true")].join("\n")).unwrap();
+    let out = bin()
+        .args(["compare", "--criterion", "oracle_recovered", "--base"])
+        .arg(&a)
+        .arg("--treat")
+        .arg(&b)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("pairs=1"), "{text}");
+    assert!(text.contains("hard/p/noise 0.1/seed 2"), "{text}");
+}
+
+#[test]
 fn compare_exits_2_on_a_changed_data_generator() {
     let lines = small_run();
     let a = scratch("gen-a.ndjson");

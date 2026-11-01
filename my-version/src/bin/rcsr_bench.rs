@@ -112,6 +112,7 @@ COMPARE OPTIONS:
   --json                    machine-readable output
   Runs are paired by (suite, problem, noise, seed). The command exits 2 when
   the two sides hold different runs or differ in anything but the search knobs.
+  Pairs whose criterion is null on a side are dropped, counted and listed.
 ",
         env!("CARGO_PKG_VERSION")
     )
