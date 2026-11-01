@@ -274,12 +274,12 @@ fn null_columns_on_development_rows_ignore_the_locked_range() {
     let lb = rcsr::lockbox::Lockbox { start, end: start + 100 * 60 };
     let (a, seg_a) = prepare_rows(&two_stores_csv(false, 200), Some(lb));
     let (b, seg_b) = prepare_rows(&two_stores_csv(true, 200), Some(lb));
-    assert_eq!(seg_a, [400, 200, 0]);
-    assert_eq!(seg_a, seg_b);
     assert_eq!(a[0], b[0]);
     let dev = |rows: &[String]| rows[1..].iter().filter(|l| l.split(',').next().unwrap().parse::<i64>().unwrap() < start).cloned().collect::<Vec<_>>();
     assert_eq!(dev(&a).len(), 400);
     assert_eq!(dev(&a), dev(&b), "development rows, including placebo_* and perm_*, are byte-identical");
+    assert_eq!(seg_a, [400, 200, 0]);
+    assert_eq!(seg_a, seg_b);
     assert_ne!(a, b, "the locked rows differ");
 
     let (c, _) = prepare_rows(&two_stores_csv(false, 200), None);
