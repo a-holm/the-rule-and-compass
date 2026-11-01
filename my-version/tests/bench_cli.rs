@@ -16,13 +16,15 @@ fn scratch(name: &str) -> PathBuf {
     dir.join(name)
 }
 
-const SMALL: [&str; 10] = [
+const SMALL: [&str; 12] = [
     "--suite",
     "hard",
     "--problems",
     "nguyen9,korns1",
     "--seeds",
     "1-2",
+    "--noise",
+    "0",
     "--generations",
     "5",
     "--islands",
