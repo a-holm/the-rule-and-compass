@@ -443,3 +443,23 @@ fn a_ledger_without_a_recorded_range_needs_the_unbound_flag() {
     assert_eq!(code, 0, "{}", err);
     assert!(err.contains("unbound"), "{}", err);
 }
+
+#[test]
+fn a_sealed_batch_read_verifies() {
+    let dir = scratch("batch");
+    let data = store(&dir, "d.csv");
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+    let exprs = ["x", "0-x"];
+    let flags = ["--validation-frac", "0.3", "--batch-pnl"];
+    dev(&data, &l, &exprs, &flags);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--report-candidates", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, out, err) = read(&data, &l, &sealed, &exprs, &flags);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("\"batch_pnl\":{"), "{}", out);
+    let mut verify_flags = flags.to_vec();
+    verify_flags.push("--verify-read");
+    let (code, _, err) = read(&data, &l, &sealed, &exprs, &verify_flags);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("\"batch_timings\":{"), "{}", out);
+}
