@@ -350,6 +350,25 @@ routine runs. `rcsr walkforward` echoes it in its JSON as
 when a time column is absent or is not Unix seconds (a row index or a year
 fraction), so non-crypto data is not rejected by a crypto date.
 
+## The declared locked test
+
+The protocol locked test (`protocol/windows.csv`, row `locked`) is declared with the data, so no evaluator depends on the caller remembering a flag.
+
+```sh
+rcsr panel build --data base.rcsb --membership m.csv --out panel.rcsb --locked-test 2025-07-01,2026-07-01
+```
+
+The build writes `"locked_test": {"start", "end", "start_date", "end_date", "source"}` to `panel.rcsb.manifest.json` and `panel.rcsb.schema.json`. `rcsr panel schema` keeps it, `rcsr panel append` copies it from the target panel, `rcsr enrich` copies it from `--data` (or takes `--locked-test`) into `<out>.enrich.json`, and `rcsr ablation prepare` writes `<csv>.lockbox.json`. A CSV can carry the same object in a `<csv>.lockbox.json` sidecar. `--lockbox START,END` on a command overrides the stored range. `--allow-lockbox` does not open it: it keeps its 2026H2 meaning.
+
+| command | with a declaration |
+|---|---|
+| `rcsr --data ...` (search) | exit 3 when any fit, validation or test row is in the range; the message names the side, the first row's date and the `--exclude '<time> >= START'` fix. With the rows excluded, `run.json` has `lockbox.rows_in_scope: 0`, `evaluated: false`, `source` |
+| `rcsr walkforward` | exit 3 for a window touching the range, with or without `--ledger`; `--locked-test --ledger --sealed` reads it once |
+| `rcsr ladder` | exit 3 for a fold touching the range; `--scheme locked --locked-test --ledger --sealed` reads it once and appends a `baseline_read` ledger line; a second read is exit 3 |
+| `rcsr ablation score` | exit 3 for a fold touching the range |
+
+Rows are refused, never dropped silently, because a drop would change the split fractions without a record. A time column that is not epoch seconds skips the row check and the report says `lockbox.checked: false`.
+
 ## Provenance manifest
 
 `rcsr panel build` writes `<out>.manifest.json` with input paths, SHA-256 and

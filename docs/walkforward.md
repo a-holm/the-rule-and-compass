@@ -154,6 +154,11 @@ the winner.
   `"lockbox": {"permitted": true, ...}` in the JSON report. The same
   `rcsr::lockbox::Guard` is used by `rcsr run` (the default search),
   `rcsr panel build --start/--end` and a labelled `rcsr prep`.
+* A locked test declared with the data (`rcsr panel build --locked-test`, or
+  `--lockbox START,END`) is checked the same way on every run, with or without
+  `--ledger`: a window whose train or test range touches it exits 3. The JSON
+  `protocol.lockbox` object then carries `declared`, `source`, `rows_in_scope`
+  and `evaluated`. See [`panel.md`](panel.md#the-declared-locked-test).
 * Costs and positions are per group. Counting position changes on a flattened
   timestamp/symbol row order would count spurious changes at every symbol
   boundary; this implementation does not.
@@ -479,6 +484,8 @@ Candidates are evaluated on the test periods with their own validation threshold
 `--ledger FILE` makes a development run append a `candidate` line (content-addressed id over the procedure, the data SHA-256 and the build commit; `test_read:false`). Each line holds the SHA-256 of the previous line, so an edit breaks the chain. A development window that touches the declared lockbox (`--lockbox START,END`, default 2025-07-01 to 2026-07-01) is refused.
 
 `rcsr protocol seal --ledger L --out locked_candidates.json` writes the sealed list and records its hash in the ledger. `--locked-test --sealed locked_candidates.json` then reads the locked test: the candidate must be in the sealed list, the data and build hashes must equal the sealed entry (otherwise the run is void), and the candidate must not have `test_read:true`. The read appends a `test_read` line with the report hash and the new `read_count`; a second read is refused. `--verify-read --expect-report-sha256 H` recomputes the read and compares hashes without recording anything. The report's `protocol` object holds the lockbox rows, date range and read count; `run.json` carries a `lockbox` object (`--lockbox`, `--ledger`) with the rows in the range, their first and last stamps and the read count.
+
+`rcsr ladder --scheme locked --locked-test --ledger L --sealed S` reads the locked test for the baseline ladder. The sealed list must be recorded in the ledger and the ledger must hold no `baseline_read`; the run appends `{"event":"baseline_read",...}` with the data and report hashes, and a second call is refused. Without `--locked-test`, `ladder` and `ablation score` refuse any fold that touches the declared range.
 
 ## Fold sign test
 

@@ -765,6 +765,13 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   The same central guard covers `rcsr run`, `rcsr walkforward`, an explicit
   `rcsr panel build` window and a labelled `rcsr prep`; see
   [`docs/panel.md`](docs/panel.md#the-2026h2-lockbox).
+* The protocol locked test is declared once, with the data
+  (`rcsr panel build --locked-test START,END`; `panel append`, `enrich` and
+  `ablation prepare` copy it). The search, `walkforward`, `ladder` and
+  `ablation score` then refuse any split or window that touches it (exit 3).
+  Only `walkforward --locked-test` and `ladder --locked-test`, both with
+  `--ledger` and `--sealed`, read it, once each; see
+  [`docs/panel.md`](docs/panel.md#the-declared-locked-test).
 * `--train-select` / `--test-select` assign rows by expression (`> 0` is true)
   and override `--split`; `--exclude` drops rows and composes with any mode.
   A row matching both selections goes to training, one matching neither is
@@ -789,7 +796,7 @@ run:
 | `--smooth-centred k` | the old **centred** window; reads future bars, is opt-in, and is reported as look-ahead |
 | `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
 | `--allow-lockbox` | permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only) |
-| `--lockbox START,END` | declared locked test reported in the run.json `lockbox` object (rows, date range, read count) |
+| `--lockbox START,END` | declared locked test (UTC, half-open). Overrides the range declared with the data (`rcsr panel build --locked-test`). Train, validation and test rows inside it are refused (exit 3). The run.json `lockbox` object reports rows, date range, read count, `declared`, `source` (`store` or `flag`), `rows_in_scope` and `evaluated` |
 | `--ledger file` | candidate ledger whose locked reads run.json counts |
 | `--arm name` | ablation arm label; run.json gains an `ablation` object with the arm, the SHA-256 of the ordered variable list, the generation budget and the generations reached |
 | `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`; `long_only` is always true): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
