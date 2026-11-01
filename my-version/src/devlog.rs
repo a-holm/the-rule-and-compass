@@ -365,6 +365,9 @@ pub struct FitGen {
     pub host_seconds: f64,
     /// #256: wall seconds of the exact CPU fit-fallback inside `host_seconds`.
     pub fallback_seconds: f64,
+    /// #498: wall seconds of the exact host gate of device proposals inside
+    /// `host_seconds`.
+    pub gate_seconds: f64,
     /// #256: workers the fit-fallback batch used. This is the fit pool; the
     /// top-level `fallback.workers` is the evaluator's pool.
     pub fallback_workers: usize,
@@ -385,7 +388,7 @@ impl FitGen {
         let improved_total: usize = self.fallback_improved_by_cause.iter().map(|(_, v)| *v).sum();
         format!(
             "{{\"attempts\":{},\"gpu\":{},\"fallback\":{},\"refits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\
-             \"host_seconds\":{},\"fallback_seconds\":{},\"fallback_workers\":{}}}",
+             \"host_seconds\":{},\"fallback_seconds\":{},\"gate_seconds\":{},\"fallback_workers\":{}}}",
             self.attempts,
             self.gpu,
             self.fallback,
@@ -395,6 +398,7 @@ impl FitGen {
             improved.join(","),
             num(self.host_seconds),
             num(self.fallback_seconds),
+            num(self.gate_seconds),
             self.fallback_workers
         )
     }
@@ -1167,6 +1171,7 @@ mod tests {
                 fallback_improved_by_cause: vec![("ill_conditioned".to_string(), 1)],
                 host_seconds: 0.05,
                 fallback_seconds: 0.03,
+                gate_seconds: 0.02,
                 fallback_workers: 4,
             },
             fallback_s: 0.001,
@@ -1219,6 +1224,7 @@ mod tests {
         assert_eq!(improved[0].1.as_usize(), Some(1));
         assert_eq!(fit.get("host_seconds").and_then(|v| v.as_f64()), Some(0.05));
         assert_eq!(fit.get("fallback_seconds").and_then(|v| v.as_f64()), Some(0.03));
+        assert_eq!(fit.get("gate_seconds").and_then(|v| v.as_f64()), Some(0.02));
         assert_eq!(fit.get("fallback_workers").and_then(|v| v.as_usize()), Some(4));
         let eval_pool = parsed.get("fallback").unwrap();
         assert_eq!(

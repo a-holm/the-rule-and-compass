@@ -870,6 +870,7 @@ struct GpuSearch {
     /// #284/#255: exact CPU fallback seconds inside the fit stage, milliseconds.
     /// This is a subset of `fit_host_ms`, never added to it twice.
     fit_fallback_ms: f64,
+    fit_gate_ms: f64,
     /// #255: candidates left at their finite device constants because the
     /// per-generation fallback bound was reached.
     fit_fallback_bounded: usize,
@@ -1129,6 +1130,7 @@ impl GpuSearch {
                     fit_polish_ms: 0.0,
                     fit_host_ms: 0.0,
                     fit_fallback_ms: 0.0,
+                    fit_gate_ms: 0.0,
                     fit_fallback_bounded: 0,
                     fit_fallback_workers: 0,
                     ledger_origin: run_start,
@@ -1340,18 +1342,42 @@ impl GpuSearch {
                 // their historical trajectory (their proposal is the kernel's
                 // own optimum of the same objective).
                 let gated = crate::fit::device_fit_is_gated(cfg.metric);
-                for ((i, j, plan), res) in jobs.iter().zip(out) {
+                // #498: the exact judgements are independent, so they run on
+                // the worker pool; the verdicts are applied below in admission
+                // order.
+                let mut verdicts: Vec<Option<(crate::fit::Verdict, Node)>> = Vec::new();
+                if gated {
+                    let gate_start = std::time::Instant::now();
+                    let gate_jobs: Vec<(usize, Node, Vec<f64>)> = jobs
+                        .iter()
+                        .zip(&out)
+                        .enumerate()
+                        .filter(|(_, (_, res))| {
+                            crate::fit::fit_status_usable(res.status)
+                                && res.c.iter().all(|v| v.is_finite())
+                        })
+                        .map(|(k, ((i, j, _), res))| {
+                            (k, islands[*i][*j].tree.clone(), res.c.clone())
+                        })
+                        .collect();
+                    verdicts.resize_with(jobs.len(), || None);
+                    for (k, judged) in gate_proposals(gate_jobs, fit_train, cfg.metric, cfg.threads)
+                    {
+                        verdicts[k] = Some(judged);
+                    }
+                    let gate_seconds = gate_start.elapsed().as_secs_f64();
+                    self.fit_gate_ms += gate_seconds * 1000.0;
+                    self.stats.entry(generation).or_default().fit_gate_seconds += gate_seconds;
+                }
+                for (k, ((i, j, plan), res)) in jobs.iter().zip(out).enumerate() {
                     let finite = res.c.iter().all(|v| v.is_finite());
                     let usable = crate::fit::fit_status_usable(res.status);
                     if gated && usable && finite {
-                        let verdict = crate::fit::gate_device_proposal(
-                            &mut islands[*i][*j].tree,
-                            &res.c,
-                            &fit_train.x,
-                            &fit_train.y,
-                            &fit_train.w,
-                            cfg.metric,
-                        );
+                        let (verdict, judged) =
+                            verdicts[k].take().expect("every gated job has a verdict");
+                        if matches!(verdict, crate::fit::Verdict::Accepted(_)) {
+                            islands[*i][*j].tree = judged;
+                        }
                         let cause = match verdict {
                             crate::fit::Verdict::Accepted(_) => {
                                 self.fit_gpu += 1;
@@ -1953,6 +1979,7 @@ impl GpuSearch {
             self.fit_fallback_ms / 1000.0,
         );
         ledger.record_fit_polish_split(self.fit_polish_ms / 1000.0);
+        ledger.record_fit_gate(self.fit_gate_ms / 1000.0);
         ledger.record_fit_counters(
             self.fit_attempts as u64,
             self.fit_gpu as u64,
@@ -1983,6 +2010,7 @@ impl GpuSearch {
             fit_polish_ms: self.fit_polish_ms,
             fit_host_ms: self.fit_host_ms,
             fit_fallback_ms: self.fit_fallback_ms,
+            fit_gate_ms: self.fit_gate_ms,
 fit_fallback_bounded: self.fit_fallback_bounded,
             fit_fallback_workers: self.fit_fallback_workers,
             fit_fallback_max: DEFAULT_FIT_FALLBACK_MAX,
@@ -2019,6 +2047,7 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             fallbacks: batch.map(|b| b.fallbacks).unwrap_or(0),
             fit_host_s: self.fit_host_ms / 1000.0,
             fit_fallback_s: self.fit_fallback_ms / 1000.0,
+            fit_gate_s: self.fit_gate_ms / 1000.0,
             fit_fallback_workers: self.fit_fallback_workers,
         }
     }
@@ -2140,6 +2169,25 @@ fn fit_fallback_jobs(
         }
     });
     chunks
+}
+
+/// #498: judge device proposals with the exact gate on up to `workers`
+/// threads. Each job is `(position, tree, proposal)`; the result keeps the job
+/// order and carries the tree as the gate left it, so the outcome does not
+/// depend on `workers`.
+#[cfg(feature = "cuda")]
+fn gate_proposals(
+    jobs: Vec<(usize, Node, Vec<f64>)>,
+    sample: &Sample,
+    metric: Metric,
+    workers: usize,
+) -> Vec<(usize, (crate::fit::Verdict, Node))> {
+    par_map(workers.max(1), jobs, |(k, mut tree, proposal)| {
+        let verdict = crate::fit::gate_device_proposal(
+            &mut tree, &proposal, &sample.x, &sample.y, &sample.w, metric,
+        );
+        (k, (verdict, tree))
+    })
 }
 
 /// Score every still-pending (`error.is_nan()`) individual on the CPU.
@@ -4953,6 +5001,9 @@ pub struct GpuGenStats {
     /// #255: wall seconds this generation spent in the exact CPU fallback
     /// fits. A subset of the run's `fit.host_seconds`.
     pub fit_fallback_seconds: f64,
+    /// #498: wall seconds this generation spent in the exact host gate of
+    /// device proposals. A subset of the run's `fit.host_seconds`.
+    pub fit_gate_seconds: f64,
     /// #255: fallbacks held at their finite device constants because the
     /// per-generation bound was reached.
     pub fit_fallback_bounded: usize,
@@ -5002,6 +5053,9 @@ pub struct GpuRunStats {
 /// #284/#255: wall time spent in the exact CPU fallback fits, milliseconds.
     /// Already included in `fit_host_ms`; report it, never add it again.
     pub fit_fallback_ms: f64,
+    /// #498: wall time of the exact gate of device proposals, milliseconds.
+    /// Already included in `fit_host_ms`; report it, never add it again.
+    pub fit_gate_ms: f64,
     /// #255: fallbacks held at their finite device constants by the
     /// per-generation bound.
     pub fit_fallback_bounded: usize,
@@ -5501,6 +5555,8 @@ pub struct GpuSnapshot {
     pub fit_host_s: f64,
     /// #256: exact CPU fit-fallback wall, a subset of `fit_host_s`.
     pub fit_fallback_s: f64,
+    /// #498: exact host gate wall, a subset of `fit_host_s`.
+    pub fit_gate_s: f64,
     pub fit_fallback_workers: usize,
 }
 
@@ -5534,6 +5590,7 @@ impl GpuSnapshot {
             fallbacks: self.fallbacks,
             fit_host_s: (self.fit_host_s - earlier.fit_host_s).max(0.0),
             fit_fallback_s: (self.fit_fallback_s - earlier.fit_fallback_s).max(0.0),
+            fit_gate_s: (self.fit_gate_s - earlier.fit_gate_s).max(0.0),
             fit_fallback_workers: self.fit_fallback_workers.max(earlier.fit_fallback_workers),
         }
     }
@@ -5648,6 +5705,7 @@ fn dev_generation(
                     .collect(),
                 host_seconds: g.fit_host_s,
                 fallback_seconds: g.fit_fallback_s,
+                gate_seconds: g.fit_gate_s,
                 fallback_workers: g.fit_fallback_workers,
             },
             g.fallback_s,
@@ -5889,6 +5947,7 @@ fn run_postfix_search(
             fit_fallback_by_cause: Default::default(),
             fit_fallback_improved_by_cause: Default::default(),
             fit_fallback_seconds: 0.0,
+            fit_gate_seconds: 0.0,
             fit_fallback_bounded: 0,
             fit_fallback_workers: 0,
         });
@@ -9847,6 +9906,54 @@ mod tests {
                 expr::same(&job.tree, &serial),
                 "parallel fit differs from the serial arm at job {k}"
             );
+        }
+    }
+
+    /// #498: the exact host gate is a pure parallelisation. One worker and
+    /// eight workers return the same verdict list and the same trees, with a
+    /// mix of accepted, rejected and non-finite proposals.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gate_is_identical_for_one_and_many_workers() {
+        let mut s = sample();
+        for (i, y) in s.y.iter_mut().enumerate() {
+            *y = if i % 3 == 0 { 0.0 } else { 1.0 };
+        }
+        let jobs = |metric: Metric| -> Vec<(usize, Node, Vec<f64>)> {
+            (0..64usize)
+                .map(|k| {
+                    let start = 0.2 + (k % 7) as f64 / 10.0;
+                    let tree = node(
+                        Op::Add,
+                        vec![node(Op::Mul, vec![constant(start), input(0)]), constant(0.1)],
+                    );
+                    let proposal = match k % 4 {
+                        0 => vec![start + 1.0, 0.1],
+                        1 => vec![-3.0 * start, 0.1],
+                        2 => vec![f64::NAN, 0.1],
+                        _ => vec![start, 0.1 + (k as f64) / 50.0],
+                    };
+                    let _ = metric;
+                    (k, tree, proposal)
+                })
+                .collect()
+        };
+        for metric in [Metric::LogLoss, Metric::Correlation, Metric::Signed] {
+            let one = gate_proposals(jobs(metric), &s, metric, 1);
+            let many = gate_proposals(jobs(metric), &s, metric, 8);
+            assert_eq!(one.len(), 64);
+            assert_eq!(one.len(), many.len());
+            for ((ka, (va, ta)), (kb, (vb, tb))) in one.iter().zip(&many) {
+                assert_eq!(ka, kb);
+                assert_eq!(va, vb, "{:?} verdict differs at {}", metric, ka);
+                assert!(expr::same(ta, tb), "{:?} tree differs at {}", metric, ka);
+            }
+            let accepted = one
+                .iter()
+                .filter(|(_, (v, _))| matches!(v, crate::fit::Verdict::Accepted(_)))
+                .count();
+            assert!(accepted > 0 && accepted < 64, "{:?}: {} accepted", metric, accepted);
+            assert!(one.iter().any(|(_, (v, _))| *v == crate::fit::Verdict::NonFinite));
         }
     }
 
