@@ -128,7 +128,7 @@ fn converged_early_follows_the_stop_reason_and_percent_converged() {
     patience.patience = 2;
     for cfg in [budget, patience, config(4)] {
         let out = search::run_resumable(&cfg, &train, &test, None, 0, |_| {}).unwrap();
-        let engine_stop = matches!(out.stop_reason, "solved" | "patience" | "already_stopped");
+        let engine_stop = matches!(out.stop_reason, "solved" | "patience" | "front_stable" | "already_stopped");
         let expected = engine_stop && out.convergence.percent_converged >= 0.75;
         assert_eq!(
             out.converged_early, expected,

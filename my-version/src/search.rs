@@ -251,6 +251,14 @@ pub struct Config {
     pub time_budget: Option<f64>,
     /// Stop after this many generations with no improvement (0 disables).
     pub patience: usize,
+    /// #464: scale-free patience. `Some(r)` counts a generation as "no
+    /// improvement" when `(best_prev - best) / |best_prev| <= r`; `None` keeps
+    /// the `1 + |best_prev|` denominator and the 1e-9 threshold. Saved search state.
+    pub patience_tol: Option<f64>,
+    /// #464: `--stop-on front:<W>`. `Some(w)` stops after `w` consecutive
+    /// generations with a settled front; `Some(0)` takes the window from
+    /// `patience`. Saved search state.
+    pub stop_front: Option<usize>,
     /// Number of training rows used to score and fit candidates in a
     /// generation. `None` scores the full training sample. #86: a request at
     /// least the training size is an exact no-op, and a request above the
@@ -329,6 +337,15 @@ pub struct Config {
     /// and the archive. Reporting only: not search state, not saved in a
     /// checkpoint, ignored by [`search_setting_differences`](Self::search_setting_differences).
     pub front_observer: Option<FrontFn>,
+    /// #466: prune neutral code from the front members after the generation
+    /// loop. It runs after the loop, so it is not search state: it is not
+    /// saved in a checkpoint and is ignored by
+    /// [`search_setting_differences`](Self::search_setting_differences).
+    pub prune: bool,
+    /// #466: training rows the prune fits on; a larger sample is subsampled.
+    pub prune_rows: usize,
+    /// #466: cap on candidate fits per run (0 disables the prune).
+    pub prune_budget: usize,
     // #27: use the SoA/AVX evaluator for candidate predictions. This is a
     // path choice, not a search setting: both paths must produce the same
     // errors, so it is ignored by `search_setting_differences`.
@@ -424,6 +441,8 @@ pub struct GenCounters {
     /// #463: candidates dropped after the fit because they exceeded the
     /// complexity cap; each one re-enters variation.
     pub post_fit_drops: std::sync::atomic::AtomicU64,
+    /// #500: carried individuals re-scored at the start of a generation.
+    pub reevals: std::sync::atomic::AtomicU64,
     /// #477: offspring rejected before the fit because no input reaches the
     /// rows outside an aggregate or meta operator.
     pub constant: std::sync::atomic::AtomicU64,
@@ -593,6 +612,13 @@ fn fit_and_score(
 /// cell admitted at most 540 per generation.
 pub const DEFAULT_FIT_FALLBACK_MAX: usize = 4096;
 
+/// #466: default `--prune-rows`.
+pub const DEFAULT_PRUNE_ROWS: usize = 20_000;
+/// #466: default `--prune-budget`.
+pub const DEFAULT_PRUNE_BUDGET: usize = 20_000;
+
+mod prune;
+pub use prune::PruneReport;
 /// #495: default relative band of the finalist refit.
 pub const DEFAULT_REFIT_BAND: f64 = 0.001;
 
@@ -620,6 +646,8 @@ impl Default for Config {
             reject_constant_offspring: false,
             time_budget: None,
             patience: 40,
+            patience_tol: None,
+            stop_front: None,
             predictor_samples: None,
             fit_samples: 0, // #85: off by default
             fit_rows: 0,    // #116: off by default
@@ -637,6 +665,9 @@ impl Default for Config {
             progress: None,
             dev_log: None, // #211: off unless --dev-log is given
             front_observer: None, // #462
+            prune: false,         // #466: opt in with --prune
+            prune_rows: DEFAULT_PRUNE_ROWS,
+            prune_budget: DEFAULT_PRUNE_BUDGET,
             simd: true, // #27
             // #141: the GPU is the default backend when the binary is built
             // with CUDA and a device is available. The probe happens once at
@@ -661,6 +692,26 @@ impl Default for Config {
 }
 
 impl Config {
+    /// #464: relative tolerance of the front stop.
+    fn front_tol(&self) -> f64 {
+        self.patience_tol
+            .unwrap_or(crate::progress_stats::FRONT_STOP_TOL)
+    }
+
+    /// #464: consecutive stable generations that end a run; never reached when 0.
+    fn front_window(&self) -> usize {
+        let w = match self.stop_front {
+            Some(0) => self.patience,
+            Some(w) => w,
+            None => 0,
+        };
+        if w == 0 {
+            usize::MAX
+        } else {
+            w
+        }
+    }
+
     /// The names of search settings that differ between two configurations.
     ///
     /// `generations` is deliberately excluded: it is a **budget**, not a
@@ -704,6 +755,8 @@ impl Config {
         // #256: `time_budget` is a per-process limit, not search state; a resumed
         // run may set a new one.
         compare!(patience, "patience");
+        compare!(patience_tol, "patience_tol"); // #464
+        compare!(stop_front, "stop_front"); // #464
         compare!(predictor_samples, "predictor_samples");
         compare!(fit_samples, "fit_samples"); // #85
         compare!(fit_rows, "fit_rows"); // #116
@@ -877,6 +930,10 @@ impl Ind {
     fn reeval(&mut self, train: &EvalSample, cfg: &Config) {
         self.tree = expr::simplify(&self.tree);
         self.complexity = cfg.complexity_model.complexity(&self.tree);
+        self.score_in_place(train, cfg);
+    }
+
+    fn score_in_place(&mut self, train: &EvalSample, cfg: &Config) {
         // #25: re-evaluation must not resurrect a rejected candidate.
         let want_descriptor = cfg.qd_bins > 0 && !train.sample.is_multi();
         let (error, descriptor) = if cfg.accepts_dimensions(&self.tree) {
@@ -886,6 +943,23 @@ impl Ind {
         };
         self.error = error;
         self.descriptor = descriptor;
+    }
+
+    /// #500: `reeval` for an individual with a non-finite error. A `+inf` error
+    /// stays `+inf`, without a pass over every row, when the dimension filter
+    /// rejects the tree or a leading slice of the rows already holds a
+    /// non-finite prediction. Returns whether a full scoring pass ran.
+    fn reeval_probing(&mut self, train: &EvalSample, cfg: &Config) -> bool {
+        self.tree = expr::simplify(&self.tree);
+        self.complexity = cfg.complexity_model.complexity(&self.tree);
+        if self.error == f64::INFINITY
+            && (!cfg.accepts_dimensions(&self.tree) || prefix_is_non_finite(&self.tree, train, cfg))
+        {
+            self.descriptor = None;
+            return false;
+        }
+        self.score_in_place(train, cfg);
+        true
     }
 
     // #86: re-fit the constants on the current generation's fit rows *before*
@@ -3591,6 +3665,35 @@ fn eval_error_and_descriptor(
     })
 }
 
+/// #500: rows probed for a non-finite prediction before a full re-score.
+const INF_PROBE_ROWS: usize = 2048;
+
+/// #500: whether the first rows already hold a non-finite prediction, which
+/// makes the full score `+inf` for the plain metrics. Shapes whose score does
+/// not follow that rule (implicit, weighted, multi-output, descriptor, P&L
+/// book) report `false` and take the full pass.
+fn prefix_is_non_finite(tree: &Node, data: &EvalSample, cfg: &Config) -> bool {
+    let s = data.sample;
+    if s.is_empty()
+        || s.is_multi()
+        || !s.w.is_empty()
+        || cfg.metric.is_implicit()
+        || cfg.qd_bins > 0
+        || cfg.fitness.book().is_some()
+    {
+        return false;
+    }
+    let rows = s.x.len().min(INF_PROBE_ROWS);
+    if let Some(cols) = &data.cols {
+        if let Some(program) = crate::eval_soa::compile(tree) {
+            let mut pred = vec![0.0; rows];
+            crate::eval_soa::eval_batch(&program, cols, rows, &mut pred);
+            return pred.iter().any(|p| !p.is_finite());
+        }
+    }
+    s.x.iter().take(rows).any(|row| !eval(tree, row).is_finite())
+}
+
 /// #475: one candidate's prediction vector, owned.
 ///
 /// The fast path compiles the tree once and evaluates all rows in tiles over
@@ -5041,8 +5144,8 @@ fn evolve_island(
 ) {
     if !screened {
         for ind in isl.iter_mut() {
-            if !ind.error.is_finite() {
-                ind.reeval(train, cfg); // #25
+            if !ind.error.is_finite() && ind.reeval_probing(train, cfg) {
+                GenCounters::count(counters, |c| &c.reevals); // #25 #500
             }
         }
     }
@@ -5232,25 +5335,34 @@ fn evolve_island(
         if let Some(target) = qd.and_then(|q| q.least_occupied_descriptor()) {
             let immigrants = (pop / 10).max(1).min(pop);
             let mut trees: Vec<Node> = Vec::with_capacity(immigrants);
+            let mut have_const_imm = filter_constant
+                && next[..pop - immigrants].iter().any(|i| !expr::row_dependent(&i.tree)); // #477
             for _ in 0..immigrants {
-                let mut t =
-                    random_tree_opts(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced);
-                let mut best_score = {
-                    let d = qd::descriptor(&t, train.sample);
-                    (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2)
-                };
-                for _ in 0..3 {
-                    let cand = random_tree_opts(
+                let hc = have_const_imm;
+                let t = draw_row_dependent(cfg, nvars, &mut have_const_imm, || {
+                    let mut t = random_tree_opts(
                         rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced,
                     );
-                    let d = qd::descriptor(&cand, train.sample);
-                    let score = (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2);
-                    if score < best_score {
-                        t = cand;
-                        best_score = score;
+                    let mut best_score = if hc && !expr::row_dependent(&t) {
+                        f64::INFINITY
+                    } else {
+                        let d = qd::descriptor(&t, train.sample);
+                        (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2)
+                    };
+                    for _ in 0..3 {
+                        let cand = random_tree_opts(
+                            rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced,
+                        );
+                        let d = qd::descriptor(&cand, train.sample);
+                        let score = (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2);
+                        if score < best_score && !(hc && !expr::row_dependent(&cand)) {
+                            t = cand;
+                            best_score = score;
+                        }
                     }
-                }
-                trees.push(expr::simplify(&t));
+                    expr::simplify(&t)
+                });
+                trees.push(t);
             }
             // Immigrants are fitted even when the batch defers scoring.
             let fit_immigrants = cfg.fit_iters > 0 && !train.sample.is_multi();
@@ -5271,9 +5383,13 @@ fn evolve_island(
     // whose result slots cover the first `pop` candidates only.
     if afp {
         let k = afp_immigrants(pop);
+        let mut have_const_afp =
+            filter_constant && next.iter().any(|i| !expr::row_dependent(&i.tree)); // #477
         let trees: Vec<Node> = (0..k)
             .map(|_| {
-                expr::simplify(&random_tree_opts(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced))
+                draw_row_dependent(cfg, nvars, &mut have_const_afp, || {
+                    expr::simplify(&random_tree_opts(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced))
+                })
             })
             .collect();
         next.extend(fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters));
@@ -5472,10 +5588,13 @@ pub struct Outcome {
     pub qd: Option<QdReport>,
     /// #211: why the generation loop stopped: `solved` (an error at or below
     /// the solved floor), `patience` (no improvement for `--patience`
-    /// generations), `time_budget`, or `generations` (the budget ran out). Read
+    /// generations), `front_stable` (#464), `time_budget`, or `generations` (the
+    /// budget ran out). Read
     /// by the development log's `run_end` event; it is not printed, so the
     /// default output is unchanged.
     pub stop_reason: &'static str,
+    /// #466: what the front prune did; all zero unless `--prune` is given.
+    pub prune: PruneReport,
     /// #482: offspring scored over the run, summed over islands and
     /// generations, including generations before a resume.
     pub candidates_evaluated: u64,
@@ -5606,6 +5725,7 @@ fn snapshot(
     stopped_early: bool,
     best_prev: f64,
     no_improve: usize,
+    front_stable: usize,
     archive: &Archive,
     islands: &[Vec<Ind>],
     rngs: &[Mt],
@@ -5626,6 +5746,7 @@ fn snapshot(
         stopped_early,
         best_prev,
         no_improve,
+        front_stable,
         train: crate::checkpoint::fingerprint(train),
         test: crate::checkpoint::fingerprint(test),
         archive: Archive {
@@ -6102,6 +6223,7 @@ fn dev_generation(
         eval_cpu_s: GenCounters::seconds(counters, |c| &c.eval_ns) + fallback_s,
         phase_b_s: GenCounters::seconds(counters, |c| &c.batch_ns),
         post_fit_drops: GenCounters::total(counters, |c| &c.post_fit_drops) as usize,
+        reevals: GenCounters::total(counters, |c| &c.reevals) as usize,
         constant_rejected: GenCounters::total(counters, |c| &c.constant) as usize,
         best_error,
         p05: q(0.05),
@@ -6158,6 +6280,7 @@ fn run_postfix_search(
     mut converged_early: bool,
     mut best_prev: f64,
     mut no_improve: usize,
+    mut front_stable: usize,
     mut candidates: u64,
     save_every: usize,
     mut on_checkpoint: Option<CheckpointFn<'_>>,
@@ -6196,6 +6319,10 @@ fn run_postfix_search(
     } else {
         "generations"
     };
+
+    let mut front_stop = cfg
+        .stop_front
+        .map(|_| crate::progress_stats::FrontStop::new(&archive, front_stable));
 
     for gen in gens_done..cfg.generations {
         // A checkpoint saved after an early stop stays stopped even when the
@@ -6386,8 +6513,7 @@ fn run_postfix_search(
                 converged_early = true;
                 stop_reason = "solved"; // #211
             }
-            let rel = (best_prev - gen_best) / (1.0 + best_prev.abs());
-            if rel <= 1e-9 {
+            if crate::progress_stats::no_improvement(best_prev, gen_best, cfg.patience_tol) {
                 no_improve += 1;
             } else {
                 no_improve = 0;
@@ -6398,6 +6524,14 @@ fn run_postfix_search(
                 stop_reason = "patience"; // #211
             }
         }
+        if let Some(fs) = front_stop.as_mut() {
+            front_stable = fs.observe(&archive, cfg.front_tol());
+            if gen_best.is_finite() && !converged_early && front_stable >= cfg.front_window() {
+                converged_early = true;
+                stop_reason = "front_stable"; // #464
+            }
+        }
+
 
         if n_islands > 1 && cfg.migration_interval > 0 && (gen + 1) % cfg.migration_interval == 0
         {
@@ -6468,6 +6602,7 @@ fn run_postfix_search(
                 converged_early,
                 best_prev,
                 no_improve,
+                front_stable,
                 &archive,
                 &islands_now,
                 &rngs,
@@ -6540,6 +6675,7 @@ fn run_postfix_search(
             converged_early,
             best_prev,
             no_improve,
+            front_stable,
             &archive,
             &islands_now,
             &rngs,
@@ -6575,6 +6711,7 @@ fn run_postfix_search(
         });
     }
     final_archive.canonicalize();
+    let (final_archive, prune_report) = prune::prune_archive(final_archive, train, train_data, cfg);
     let sorted = final_archive.sorted();
     let test_data = EvalSample::new(test, cfg);
     let test_errors: Vec<f64> = sorted
@@ -6640,6 +6777,7 @@ fn run_postfix_search(
         dispatch: dispatcher.snapshot(),
         qd: None,
         stop_reason,
+        prune: prune_report,
         candidates_evaluated: candidates,
     })
 }
@@ -7033,6 +7171,7 @@ fn run_search(
     let mut converged_early: bool;
     let mut best_prev: f64;
     let mut no_improve: usize;
+    let mut front_stable: usize;
     let mut candidates: u64;
     // #85: did any generation fit on a screening subset? Only then may the
     // final archive be refit; a request at least as large as the sample, or
@@ -7066,6 +7205,7 @@ fn run_search(
             stopped_early,
             best_prev: saved_best,
             no_improve: saved_no_improve,
+            front_stable: saved_front_stable,
             archive: saved_archive,
             islands: saved_islands,
             stagnant: saved_stagnant,
@@ -7078,6 +7218,7 @@ fn run_search(
         converged_early = stopped_early;
         best_prev = saved_best;
         no_improve = saved_no_improve;
+        front_stable = saved_front_stable;
         archive = saved_archive;
         stagnant = saved_stagnant;
         rng = main_rng;
@@ -7189,6 +7330,7 @@ fn run_search(
         converged_early = false;
         best_prev = f64::INFINITY;
         no_improve = 0;
+        front_stable = 0;
         candidates = 0;
     }
 
@@ -7302,6 +7444,7 @@ fn run_search(
                         converged_early,
                         best_prev,
                         no_improve,
+                        front_stable,
                         candidates,
                         save_every,
                         on_checkpoint,
@@ -7385,6 +7528,10 @@ fn run_search(
     let mut last_save = std::time::Instant::now();
     let save_interval_s = checkpoint_interval_s();
     if !converged_early {
+        let mut front_stop = cfg
+            .stop_front
+            .map(|_| crate::progress_stats::FrontStop::new(&archive, front_stable));
+
         for gen in gens_done..cfg.generations {
             gens_done = gen + 1;
 
@@ -7854,8 +8001,7 @@ fn run_search(
                     stop_reason = "solved"; // #211
                     break;
                 }
-                let rel = (best_prev - gen_best) / (1.0 + best_prev.abs());
-                if rel <= 1e-9 {
+                if crate::progress_stats::no_improvement(best_prev, gen_best, cfg.patience_tol) {
                     no_improve += 1;
                 } else {
                     no_improve = 0;
@@ -7864,6 +8010,15 @@ fn run_search(
                 if cfg.patience > 0 && no_improve >= cfg.patience {
                     converged_early = true;
                     stop_reason = "patience"; // #211
+                    break;
+                }
+            }
+
+            if let Some(fs) = front_stop.as_mut() {
+                front_stable = fs.observe(&archive, cfg.front_tol());
+                if gen_best.is_finite() && front_stable >= cfg.front_window() {
+                    converged_early = true;
+                    stop_reason = "front_stable"; // #464
                     break;
                 }
             }
@@ -8001,42 +8156,47 @@ fn run_search(
                         };
                         let mut have_const = false; // #477
                         for ind in islands[ii].iter_mut() {
+                            let hc = have_const; // #477
                             let mut t = draw_row_dependent(cfg, nvars, &mut have_const, || {
-                                random_tree_opts(
+                                let mut t = random_tree_opts(
                                     &mut r,
                                     nvars,
                                     &cfg.ops,
                                     cfg.init_depth,
                                     Some(&aggs),
                                     cfg.tree_arity == TreeArity::Balanced,
-                                )
-                            });
-                            if let Some(target) = qd_target {
-                                let mut best = t.clone();
-                                let mut best_d = qd::descriptor(&t, gen_train);
-                                let mut best_score = (best_d.usage - target.usage).powi(2)
-                                    + (best_d.skew - target.skew).powi(2);
-                                for _ in 0..3 {
-                                    let cand = random_tree_opts(
-                                        &mut r,
-                                        nvars,
-                                        &cfg.ops,
-                                        cfg.init_depth,
-                                        Some(&aggs),
-                                        cfg.tree_arity == TreeArity::Balanced,
-                                    );
-                                    let d = qd::descriptor(&cand, gen_train);
-                                    let score = (d.usage - target.usage).powi(2)
-                                        + (d.skew - target.skew).powi(2);
-                                    if score < best_score {
-                                        best = cand;
-                                        best_d = d;
-                                        best_score = score;
+                                );
+                                if let Some(target) = qd_target {
+                                    let mut best = t.clone();
+                                    let mut best_d = qd::descriptor(&t, gen_train);
+                                    let mut best_score = if hc && !expr::row_dependent(&t) {
+                                        f64::INFINITY
+                                    } else {
+                                        (best_d.usage - target.usage).powi(2) + (best_d.skew - target.skew).powi(2)
+                                    };
+                                    for _ in 0..3 {
+                                        let cand = random_tree_opts(
+                                            &mut r,
+                                            nvars,
+                                            &cfg.ops,
+                                            cfg.init_depth,
+                                            Some(&aggs),
+                                            cfg.tree_arity == TreeArity::Balanced,
+                                        );
+                                        let d = qd::descriptor(&cand, gen_train);
+                                        let score = (d.usage - target.usage).powi(2)
+                                            + (d.skew - target.skew).powi(2);
+                                        if score < best_score && !(hc && !expr::row_dependent(&cand)) {
+                                            best = cand;
+                                            best_d = d;
+                                            best_score = score;
+                                        }
                                     }
+                                    let _ = best_d;
+                                    t = best;
                                 }
-                                let _ = best_d;
-                                t = best;
-                            }
+                                t
+                            });
                             if cfg.linear_scaling {
                                 t = crate::scale::ensure(t, 0.0, 1.0); // #470
                             }
@@ -8114,6 +8274,7 @@ fn run_search(
                     converged_early,
                     best_prev,
                     no_improve,
+                    front_stable,
                     &archive,
                     &islands,
                     &rngs,
@@ -8188,6 +8349,7 @@ fn run_search(
             converged_early,
             best_prev,
             no_improve,
+            front_stable,
             &archive,
             &islands,
             &rngs,
@@ -8230,6 +8392,7 @@ fn run_search(
             }
         }
     }
+    let (archive, prune_report) = prune::prune_archive(archive, train, &train_data, cfg);
     let sorted = archive.sorted();
     // #27: one transpose for the whole test sample, shared by every front
     // entry. Multi-output keeps its own scalar path.
@@ -8367,6 +8530,7 @@ fn run_search(
         // #120: coverage of the descriptor grid for this run.
         qd: qd_archive.as_ref().map(|q| q.report()),
         stop_reason, // #211
+        prune: prune_report,
         candidates_evaluated: candidates,
     })
 }
@@ -10573,6 +10737,101 @@ mod tests {
         let rebuilt = Ind::pending(input(0), &cfg);
         assert_eq!(rebuilt.age, 0);
         assert_eq!(Ind::evaluated(input(0), &data, &cfg).age, 0);
+    }
+
+    /// #500: trees whose predictions are non-finite on every row, one of them
+    /// with a subtree that `expr::simplify` rewrites, mixed with finite ones.
+    fn inf_population(data: &EvalSample, cfg: &Config) -> Vec<Ind> {
+        (0..40)
+            .map(|i| {
+                let tree = match i % 4 {
+                    0 => node(Op::Div, vec![input(0), constant(0.0)]),
+                    1 => node(
+                        Op::Add,
+                        vec![
+                            node(Op::Div, vec![input(0), constant(0.0)]),
+                            node(Op::Add, vec![constant(1.0), constant(2.0)]),
+                        ],
+                    ),
+                    _ => node(Op::Add, vec![input(0), constant(i as f64)]),
+                };
+                Ind::evaluated(tree, data, cfg)
+            })
+            .collect()
+    }
+
+    fn same_state(a: &Ind, b: &Ind) -> bool {
+        a.tree == b.tree
+            && a.error.to_bits() == b.error.to_bits()
+            && a.complexity.to_bits() == b.complexity.to_bits()
+            && a.descriptor == b.descriptor
+    }
+
+    /// #500: probing a `+inf` individual leaves exactly the state a full
+    /// re-score leaves, and runs no scoring pass for a tree that is non-finite
+    /// on the probed rows.
+    #[test]
+    fn skipping_inf_reeval_keeps_the_cpu_trajectory() {
+        let s = sample();
+        let cfg = Config::default();
+        let data = EvalSample::new(&s, &cfg);
+        let mut ran = 0;
+        for ind in inf_population(&data, &cfg) {
+            let mut full = ind.clone();
+            full.reeval(&data, &cfg);
+            let mut probed = ind.clone();
+            if probed.reeval_probing(&data, &cfg) {
+                ran += 1;
+            }
+            assert!(same_state(&full, &probed));
+        }
+        assert_eq!(ran, 20, "only the finite trees are scored again");
+    }
+
+    /// #500: a `+inf` error that the exact CPU score does not reproduce (a
+    /// device overflow) and a pending `NaN` are scored in full.
+    #[test]
+    fn inf_reeval_runs_when_the_prediction_is_finite() {
+        let s = sample();
+        let cfg = Config::default();
+        let data = EvalSample::new(&s, &cfg);
+        let mut spurious = Ind::evaluated(input(0), &data, &cfg);
+        spurious.error = f64::INFINITY;
+        assert!(spurious.reeval_probing(&data, &cfg));
+        assert!(spurious.error.is_finite());
+        let mut pending = Ind::evaluated(input(0), &data, &cfg);
+        pending.error = f64::NAN;
+        assert!(pending.reeval_probing(&data, &cfg));
+        assert!(pending.error.is_finite());
+    }
+
+    /// #500: shapes whose `+inf` rule differs from the plain metrics take the
+    /// full pass, and the island counts the passes it runs.
+    #[test]
+    fn inf_probe_is_limited_to_the_plain_metrics() {
+        let s = sample();
+        let mut weighted = sample();
+        weighted.w = vec![1.0; weighted.y.len()];
+        let cfg = Config::default();
+        let tree = node(Op::Div, vec![input(0), constant(0.0)]);
+        let data = EvalSample::new(&s, &cfg);
+        assert!(prefix_is_non_finite(&tree, &data, &cfg));
+        assert!(!prefix_is_non_finite(&tree, &EvalSample::new(&weighted, &cfg), &cfg));
+        let mut qd = Config::default();
+        qd.qd_bins = 4;
+        assert!(!prefix_is_non_finite(&tree, &EvalSample::new(&s, &qd), &qd));
+
+        let aggs = AggTable::from_sample(&s);
+        let mut cfg = Config::default();
+        cfg.pop = 40;
+        let data = EvalSample::new(&s, &cfg);
+        let mut isl = inf_population(&data, &cfg);
+        let counters = GenCounters::default();
+        evolve_island(
+            &mut isl, &mut Mt::new(5), &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None,
+            false, 0, None, Some(&counters), 1, &mut MixWindow::new(),
+        );
+        assert_eq!(GenCounters::total(Some(&counters), |c| &c.reevals), 0);
     }
 
     /// #465: migration replaces the member of the highest Pareto rank.

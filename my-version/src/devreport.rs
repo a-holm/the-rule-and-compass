@@ -1037,6 +1037,7 @@ mod tests {
             eval_cpu_s: eval_cpu,
             phase_b_s: 0.0,
             post_fit_drops: 0,
+            reevals: 0,
             constant_rejected: 0,
             best_error: 1.0 / gen as f64,
             median: 2.0,

@@ -195,6 +195,8 @@ long/flat from the training mean, matched-exposure random long seeded by
 `--front run.json` takes the candidates from the Pareto front of a run, carries the run's threshold and per-side cost, defaults `--trials` to the offspring the search scored and refuses a window that tests rows the run trained or selected on (`docs/walkforward.md`).
 Pass `--batch-pnl` to score every candidate on every window in one batch (`src/wf_batch.rs`, kernel `src/cuda/wf_batch.cu`), per window and pooled, with the baseline ladder; finalist values stay exact CPU f64 and batch values are labelled `gpu_proxy`.
 `--policy top-tercile` holds the top `floor(n/3)` finite scores of each timestamp long and the rest flat (no threshold); it prices the book of a search run with `--position top_tercile` on an `xs_rank` target made by `rcsr panel rank` (`docs/time-series.md`).
+
+`rcsr panel spread` prints the market-neutral bucket spread of a feature (for example `clv1` against `lbl_h1_fwd`) in bp with a block-bootstrap interval, on a `--range` that must not reach the declared locked test (`docs/time-series.md`).
 `--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
 associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
 adds the exact `O(2n)` hindsight DP as a labelled bound, never as the
@@ -238,7 +240,7 @@ rcsr ladder --data panel.rcsb --target y60 --return-col fwd60 --time ts --group 
 
 `--sr-run` scores the finalist of one search run on every fold; a fold that starts before the run's last seen row plus purge is refused (exit 3) unless `--allow-in-sample`, which labels it `oof:false` and drops it from every pooled statistic. `rcsr ablation score` applies the same check.
 
-`rcsr ablation` runs the add-one-family ablation under the decision rule committed in `protocol/ablation.json`: arms `A0` (B0) to `A5`, a fixed generation budget, 3 seeds per arm (5 with `--finalist`), one manifest per arm, a placebo arm and a circular-block-permuted arm. `rcsr --arm A1` writes the arm, the feature-list hash, the generation budget and the generations reached into run.json.
+`rcsr ablation` runs the add-one-family ablation under the decision rule committed in `protocol/ablation.json`: arms `A0` (B0) to `A5`, a fixed generation budget, 3 seeds per arm (5 with `--finalist`), one manifest per arm, a placebo arm and a circular-block-permuted arm. `rcsr ablation prepare` builds the null columns separately per segment of every guarded locked range and its purge band (`--purge-seconds`, `--target-spec`, default 219,600 s) and lists the segments in `<csv>.lockbox.json`. `rcsr --arm A1` writes the arm, the feature-list hash, the generation budget and the generations reached into run.json.
 
 ```sh
 rcsr ablation plan --definition protocol/ablation.json --data panel.rcsb --target y60 --time ts --group symbol \
@@ -638,11 +640,11 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--fit-polish f64|f32|off] [--refit-band F|inf] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
-     [--no-front-parents] [--linear-scaling] [--reject-constant-offspring]
+     [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--linear-scaling] [--reject-constant-offspring]
      [--selection lexicographic|afp]
      [--mutation-mix classic|extended] [--tree-arity uniform|balanced] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
-     [--patience N]
+     [--patience N] [--patience-tol r] [--stop-on front[:W]]
      [--gpu] [--gpu-memory size] [--dispatch auto|device] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
      [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]

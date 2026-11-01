@@ -520,6 +520,14 @@ The tests
 `a_partial_cross_section_is_nan_and_a_prefix_is_causal` and
 `btc_and_eth_joins_use_the_same_timestamp_and_a_shift_fails` pin these rules.
 
+### Market-neutral bucket spread
+
+`rcsr panel spread --data panel.rcsb --feature clv1 --label lbl_h1_fwd --range 2025-01-01..2025-06-28 [--buckets 5] [--bucketing pooled|cross-section] [--demean cross-section|none] [--min-members 20] [--block N] [--draws 2000] [--seed 1] [--lockbox S,E|none]` prints one JSON object with the spread of the lowest minus the highest feature bucket, in bp, and a circular block bootstrap interval over timestamps. The label is a return fraction (bp = x 1e4).
+
+The method: rows of the half-open `--range` with a finite feature and label are kept; timestamps with fewer than `--min-members` kept rows are dropped. Buckets are the quantiles of the feature pooled over the range (default) or of each timestamp (`--bucketing cross-section`); tied values share a bucket, and an empty lowest or highest bucket is an error. `--demean cross-section` (default) subtracts the per-timestamp mean label before the bucket means, which removes the market factor. The bootstrap resamples whole timestamps in blocks (default length: the larger of the label horizon in timestamps and `ceil(T^(1/3))`) and recomputes the ratio of pooled bucket sums, so the interval keeps the cross-sectional dependence of one timestamp.
+
+The command never reads the declared locked test. It refuses (exit 3) a `--range` that overlaps it, or whose label windows (`entry_offset + delay + horizon` of the `--label` target spec, or `--purge-seconds`) reach it, and any selected row inside that reach. `--lockbox none` is the only opt-out, and only for undeclared data. Run it on a development window; a calendar window that ends before the declared start minus the purge is enough.
+
 ### Cross-sectional rank target and the top-tercile book
 
 `rcsr panel rank --data panel.rcsb --column lbl_h1_fwd --name lbl_h1_xs --out ranked.rcsb [--min-members 20]` appends the per-timestamp rank of `--column` among the panel rows to a time-major panel. Every panel row is a PIT member at its `ts`, so the rank runs over the members, not over every live symbol of the symbol-major base (`rcsr enrich` cannot make this rank, it runs symbol-major).
@@ -597,7 +605,7 @@ it without `N_trials` is the multiple-testing error.
 
 ### Baselines and ablation folds
 
-`rcsr ladder` and `rcsr ablation score` take their folds from the protocol windows table. A fold fits on `[train_start, validation_start - purge)`, selects on `[validation_start, train_end)` and tests on `[test_start, test_end)`; `train_end` is already purged from the test start, and `--purge-seconds` purges the fit range from the validation slice. Every block starts flat and pays its final exit, so no position carries across a fold. A placebo column keeps the marginal distribution and the lag-1 autocorrelation of its template and nothing else; a permuted column is a per-symbol circular-block shuffle whose columns share one permutation. Both are generated with the seed in the arm's manifest, never from the test range. See [`overfitting.md`](overfitting.md#313-baseline-ladder-and-add-one-family-ablation-implemented).
+`rcsr ladder` and `rcsr ablation score` take their folds from the protocol windows table. A fold fits on `[train_start, validation_start - purge)`, selects on `[validation_start, train_end)` and tests on `[test_start, test_end)`; `train_end` is already purged from the test start, and `--purge-seconds` purges the fit range from the validation slice. Every block starts flat and pays its final exit, so no position carries across a fold. A placebo column keeps the marginal distribution and the lag-1 autocorrelation of its template and nothing else; a permuted column is a per-symbol circular-block shuffle whose columns share one permutation. Both are generated with the seed in the arm's manifest, never from the test range: `rcsr ablation prepare` builds them separately in every segment between the bounds of each guarded locked range and its purge band `[start - P, start)`, so no locked or purged value reaches a development row (`docs/panel.md`). See [`overfitting.md`](overfitting.md#313-baseline-ladder-and-add-one-family-ablation-implemented).
 
 ## 8. Costs and horizon: the break-even hit rate
 

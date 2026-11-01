@@ -434,14 +434,16 @@ impl Resolved {
         self.range.into_iter().chain(self.also).collect()
     }
 
-    /// The single range a derived sidecar declares: the union when the flag
-    /// and the protocol default overlap, else the protocol default.
+    /// The range a derived sidecar declares as `locked_test`: the union when
+    /// the two ranges overlap or touch. When they are disjoint, a flag on
+    /// undeclared data declares the protocol default first; a stored pair
+    /// keeps its roles.
     pub fn sidecar_range(&self) -> Option<Lockbox> {
         match (self.range, self.also) {
             (Some(f), Some(d)) if f.start <= d.end && f.end >= d.start => {
                 Some(Lockbox { start: f.start.min(d.start), end: f.end.max(d.end) })
             }
-            (Some(_), Some(d)) => Some(d),
+            (Some(_), Some(d)) if self.source == Source::FlagAndDefault => Some(d),
             (r, _) => r,
         }
     }
@@ -449,7 +451,13 @@ impl Resolved {
     /// The guarded range `sidecar_range` leaves out when the two are disjoint.
     pub fn sidecar_also(&self) -> Option<Lockbox> {
         match (self.range, self.also) {
-            (Some(f), Some(d)) if !(f.start <= d.end && f.end >= d.start) => Some(f),
+            (Some(f), Some(d)) if !(f.start <= d.end && f.end >= d.start) => {
+                if self.source == Source::FlagAndDefault {
+                    Some(f)
+                } else {
+                    Some(d)
+                }
+            }
             _ => None,
         }
     }
@@ -1016,6 +1024,19 @@ mod tests {
         assert_eq!(r.range, Some(stored()));
         assert_eq!(r.declared_in.len(), 1);
         assert!(r.declared_in[0].0.ends_with("a.rcsb.enrich.json"));
+    }
+
+    #[test]
+    fn a_stored_disjoint_pair_keeps_its_roles_in_a_derived_sidecar() {
+        let first = stored();
+        let second = Lockbox { start: lockbox_date(2024, 9, 1), end: lockbox_date(2024, 10, 1) };
+        let store = Resolved { range: Some(first), source: Source::Store, also: Some(second), declared_in: Vec::new() };
+        assert_eq!((store.sidecar_range(), store.sidecar_also()), (Some(first), Some(second)));
+        let flag = Resolved { range: Some(second), source: Source::FlagAndDefault, also: Some(first), declared_in: Vec::new() };
+        assert_eq!((flag.sidecar_range(), flag.sidecar_also()), (Some(first), Some(second)));
+        let touching = Resolved { range: Some(first), source: Source::Store, also: Some(Lockbox { start: first.end, end: second.end }), declared_in: Vec::new() };
+        assert_eq!(touching.sidecar_range(), Some(Lockbox { start: first.start, end: second.end }));
+        assert_eq!(touching.sidecar_also(), None);
     }
 
     #[test]

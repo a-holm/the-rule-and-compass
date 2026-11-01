@@ -464,6 +464,8 @@ pub struct GenRecord {
     pub phase_b_s: f64,
     /// #463: candidates dropped after the fit for exceeding the complexity cap.
     pub post_fit_drops: usize,
+    /// #500: carried individuals re-scored at the start of a generation.
+    pub reevals: usize,
     /// #477: offspring rejected before the fit for holding no row-dependent input.
     pub constant_rejected: usize,
     // Error distribution over this generation's population.
@@ -582,7 +584,7 @@ impl GenRecord {
              \"error\":{{\"best\":{},\"p05\":{},\"p25\":{},\"median\":{},\"p75\":{},\"p95\":{}}},\
              \"archive\":{{\"size\":{},\"hypervolume\":{},\"hash\":{},\"offers\":{},\"admissions\":{}}},\
              \"variation\":{{\"attempts\":{},\"duplicates\":{},\"too_complex\":{},\"offspring\":{},\
-             \"fitted\":{},\"refits\":{},\"dedup_rate\":{},\"post_fit_drops\":{},\"constant_rejected\":{}}},\
+             \"fitted\":{},\"refits\":{},\"dedup_rate\":{},\"post_fit_drops\":{},\"reevals\":{},\"constant_rejected\":{}}},\
              \"gpu\":{},\"fit\":{},\
              \"fallback\":{{\"scope\":\"evaluator_pool\",\"seconds\":{},\"workers\":{}}},\
              \"qd\":{},\
@@ -623,6 +625,7 @@ impl GenRecord {
             self.refits,
             num(self.dedup_rate()),
             self.post_fit_drops,
+            self.reevals,
             self.constant_rejected,
             self.gpu.as_ref().map(|g| g.json()).unwrap_or_else(|| "null".to_string()),
             self.fit.json(),
@@ -755,7 +758,7 @@ pub fn run_start_json(r: &RunStart) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct RunEnd {
     pub generations: usize,
-    /// `solved`, `patience`, `time_budget` or `generations`.
+    /// `solved`, `patience`, `front_stable`, `time_budget` or `generations`.
     pub stop: String,
     /// Seconds since the CLI took the clock, including data preparation.
     pub wall_s: f64,
@@ -791,6 +794,10 @@ pub struct RunEnd {
     pub fit_kernel_polish_s: Option<f64>,
     /// #284: exact CPU fit-fallback seconds.
     pub fit_fallback_s: Option<f64>,
+    /// #466: front prune counters.
+    pub prune_fits: usize,
+    pub prune_accepted: usize,
+    pub prune_s: f64,
     /// #495: exact finalist refit seconds.
     pub fit_refit_s: Option<f64>,
     /// #495: exact finalist refits performed.
@@ -811,6 +818,7 @@ pub fn run_end_json(r: &RunEnd) -> String {
          \"device_seconds_incl_fit\":{},\"device_fraction_of_run\":{},\
          \"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"unaccounted_s\":{},\
          \"fit_kernel_s\":{},\"fit_kernel_lm_s\":{},\"fit_kernel_polish_s\":{},\"fit_fallback_s\":{},\"fit_refit_s\":{},\"fit_refits\":{},\
+         \"prune\":{{\"fits\":{},\"accepted\":{},\"seconds\":{}}},\
          \"events\":{},\"bytes\":{},\"dropped\":{},\"end\":{}}}",
         SCHEMA,
         VERSION,
@@ -849,6 +857,9 @@ pub fn run_end_json(r: &RunEnd) -> String {
             Some(n) => n.to_string(),
             None => "null".to_string(),
         },
+        r.prune_fits,
+        r.prune_accepted,
+        num(r.prune_s),
         r.events,
         r.bytes,
         r.dropped,
@@ -1136,6 +1147,7 @@ mod tests {
             eval_cpu_s: 0.02,
             phase_b_s: 0.0,
             post_fit_drops: 0,
+            reevals: 0,
             constant_rejected: 0,
             best_error: 0.5,
             p05: 0.6,
