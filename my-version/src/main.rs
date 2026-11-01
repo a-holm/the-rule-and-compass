@@ -9997,7 +9997,7 @@ OPTIONS:
                              admitted set is rescored on the full validation rows in
                              exact CPU f64 and ranked by
                              (net, turnover, complexity, index). Requires
-                             --validation-frac > 0 and more than one --expr; the
+                             --validation-frac > 0 or a --windows table with validation_start, and more than one --expr; the
                              JSON carries surrogate_rank, exact_rank, band,
                              epsilon, finalists_considered, recall_band and
                              scored_by=cpu_f64
@@ -10701,14 +10701,6 @@ fn run_walkforward(args: &[String]) -> ! {
         );
         std::process::exit(EXIT_USAGE);
     }
-    if band_select && validation_frac <= 0.0 {
-        eprintln!(
-            "error: --select-band needs --validation-frac > 0; the test block \
-             may not choose the candidate\n\n{}",
-            walkforward_usage()
-        );
-        std::process::exit(EXIT_USAGE);
-    }
     let expression = expressions[0].clone();
     let candidates = if expressions.len() > 1 {
         expressions
@@ -10769,6 +10761,14 @@ fn run_walkforward(args: &[String]) -> ! {
                 std::process::exit(EXIT_INPUT);
             }
         }
+    }
+    if band_select && validation_frac <= 0.0 && popts.validation_starts.is_empty() {
+        eprintln!(
+            "error: --select-band needs --validation-frac > 0 or a windows table with validation_start; \
+             the test block may not choose the candidate\n\n{}",
+            walkforward_usage()
+        );
+        std::process::exit(EXIT_USAGE);
     }
     if windows.is_empty() {
         eprintln!(
