@@ -938,10 +938,7 @@ measurement claim stops here.
 
 `--fit-rows N` draws a fresh deterministic `N`-row subset each generation and
 fits constants there, while every candidate is scored on the generation's full
-sample. With the device fit arm (`--fit-strategy gpu` on a CUDA build) the
-subset is drawn once per run, uploaded to the device once, and the device
-evaluator scores every row (see `docs/gpu-backend.md`, "Fit subsample on the
-device"). The archive is refit on every training row before it is reported, so a
+sample. The archive is refit on every training row before it is reported, so a
 reported constant or error is never the subsample estimate. `N >= train rows`
 (and `N = 0`) is an exact no-op, and `--fit-rows` takes precedence over
 `--fit-samples` when both are set. It is a screening lever like

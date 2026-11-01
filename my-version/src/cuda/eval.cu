@@ -1784,8 +1784,6 @@ __device__ __forceinline__ void ft_forward(const unsigned int *nd,
             float b = v[k1];
             v[i] = (a < 0.0f && fabsf(b - roundf(b)) > 1e-9f) ? CUDART_NAN_F
                                                               : powf(a, b);
-        } else if (op == OP_IF) {
-            v[i] = (v[k0] > 0.0f) ? v[k1] : v[slot];
         } else {
             float a = v[k0];
             float r = a;
@@ -1896,10 +1894,6 @@ __device__ __forceinline__ void ft_backward(const unsigned int *nd,
                     adj[k1] += a * powf(x, y) * logf(x);
                 }
                 break;
-            case OP_IF:
-                if (x > 0.0f) adj[k1] += a;
-                else adj[slot] += a;
-                break;
             default: break;
         }
     }
@@ -1941,8 +1935,6 @@ __device__ __forceinline__ void ft_forward_d(const unsigned int *nd,
             double b = v[k1];
             v[i] = (a < 0.0 && fabs(b - round(b)) > 1e-9) ? CUDART_NAN
                                                            : pow(a, b);
-        } else if (op == OP_IF) {
-            v[i] = (v[k0] > 0.0) ? v[k1] : v[slot];
         } else {
             double a = v[k0];
             double r = a;
@@ -2047,10 +2039,6 @@ __device__ __forceinline__ void ft_backward_d(const unsigned int *nd,
                     adj[k0] += a * y * pow(x, y - 1.0);
                     adj[k1] += a * pow(x, y) * log(x);
                 }
-                break;
-            case OP_IF:
-                if (x > 0.0) adj[k1] += a;
-                else adj[slot] += a;
                 break;
             default: break;
         }

@@ -1143,11 +1143,7 @@ the default where admissible (see [Default fit arm](#default-fit-arm)); an
 explicit `gpu` is always honoured:
 
 1. The postorder tree is flattened into 4-word records `[op, kid0, kid1, slot]`.
-   Only operators with an analytic value and adjoint are eligible. `if` is
-   eligible (#403): it keeps its third child in the slot word, selects with
-   `cond > 0` (a row exactly at the switch point takes the else branch, like the
-   CPU), and the adjoint flows to the taken branch only. A `NaN` in the untaken
-   branch never reaches the result.
+   Only operators with an analytic value and adjoint are eligible.
 2. The block evaluates the value and the reverse-mode Jacobian for its `p`
    constants, and accumulates `JᵀJ`, `Jᵀr` and SSE. Each statistic is owned by
    one thread and summed in fixed chunk order, so the reduction is deterministic
@@ -1456,7 +1452,7 @@ gpu = (s * k + (1 - s) / W) * E * (1 + h)
 device iff gpu < cpu
 ```
 
-With `W = 8`: without full operator coverage (any operator without a fit opcode, such as `min`) the device is chosen up to 4 islands and `exact` from 5 (`dispatch_cost`); with full coverage the device is chosen up to 11 islands. There is no row floor. The per-candidate floor of `32p` rows in the fit stage is unchanged. This run-level rule is separate from the per-candidate stage model in `docs/dispatch.md`.
+With `W = 8`: without full operator coverage (the default operator set, because `if` has no fit opcode) the device is chosen up to 4 islands and `exact` from 5 (`dispatch_cost`); with full coverage the device is chosen up to 11 islands. There is no row floor. The per-candidate floor of `32p` rows in the fit stage is unchanged. This run-level rule is separate from the per-candidate stage model in `docs/dispatch.md`.
 
 Evidence for the default is a paired comparison against `exact` on the GPU evaluator at equal generations (default operators, `--fit-iters 8`): admitting every candidate matched `exact` in test error and hypervolume and ran 1.5x to 5.1x faster; the screened fraction was faster still but lost on hypervolume. Fallbacks in these runs were `unsupported_plan` only, from `if`.
 
@@ -1847,25 +1843,9 @@ Search, `--metric hinge_ordinary`, 206 000 rows (154 500 training), 4 islands of
 | same | 6 | 48.7 s | 153.6 s | 93.7 s | 0.258815 | 0.289527 |
 | default (includes `if`) | 5 | 64.1 s | 55.6 s | 73.4 s | 0.266926 | 0.291277 |
 
-With device-fit operators every admitted candidate fits on the device (234 of 234, no fallback); the kernel takes 2.4-2.7 s of the fit stage and the exact finalist refit by the CPU arm takes 29-41 s, which is most of the remaining wall. With the default operators 68 of 179 admitted candidates contained `if`; before #403 `if` had no device fit opcode, their CPU fallback (41.6 s) and the finalist refit (16.9 s) made that run slower than device scoring with the CPU fit, and `if` now fits on the device (see "The `if` fit opcode (#403)"). The CPU arms of one seed reach the same best value; the device arm follows a different trajectory and reached a lower hinge in all three cells. The dispatcher scales the calibrated fit rates by `(1, 1)` for the hinge codes, so no candidate in these runs was routed to the CPU by cost.
+With device-fit operators every admitted candidate fits on the device (234 of 234, no fallback); the kernel takes 2.4-2.7 s of the fit stage and the exact finalist refit by the CPU arm takes 29-41 s, which is most of the remaining wall. With the default operators 68 of 179 admitted candidates contain `if`, which has no device fit opcode; their CPU fallback (41.6 s) and the finalist refit (16.9 s) make that run slower than device scoring with the CPU fit. The CPU arms of one seed reach the same best value; the device arm follows a different trajectory and reached a lower hinge in all three cells. The dispatcher scales the calibrated fit rates by `(1, 1)` for the hinge codes, so no candidate in these runs was routed to the CPU by cost.
 
 **Tests** (`src/gpu_hinge_fit_tests.rs`, `src/fit/hinge.rs`): the kernel probe `rc_fit_probe` pins the four loss statistics (`f32` and `f64` assembly and trial) against `classification_row_loss` row for row and the `f64` `Jᵀr` against the analytic gradient of each triple, for both `hinge_ordinary` phases; refusal without a sign; device against CPU arm on overlap, separable, imbalanced and noisy cells (`device ≤ cpu·(1 + 1e-5)`); the constant-model optima `(n₊ − n₋)/n` and `sign(n₊ − n₋)`; a log-loss-only improvement rejected under `hinge`; separable data reaching loss 0; the single-class decline; zero-weight rows with a NaN target; determinism and batch independence; the zero-diagonal freeze; and search runs whose archive is the exact CPU metric, with `--fit-iters 0` a no-op and a labelled single-class run.
-
-### The `if` fit opcode (#403)
-
-`if(c, a, b)` is fittable on the device with fit opcode 32. The record keeps the condition in `kid0`, the then-branch in `kid1` and the else-branch in the slot word. The forward sweep selects `c > 0 ? a : b` in f32 and f64, so a row exactly at the switch point (`c == 0`) takes the else branch like `expr.rs`, and a `NaN` in the untaken branch does not reach the result. The adjoint adds the output adjoint to the taken branch only; the condition gets none (it is piecewise constant), as in the CPU adjoint. The default operator set now has full device fit coverage, so the run-level cost model uses `s = 1`.
-
-Paired search (`classes206k.csv`, 154,500 rows, `hinge_ordinary`, default operators, 5 generations, 4 islands, pop 16, seed 5, logs `/mnt/lager/tmp/eureqa-gates/issue403-e2e.log`):
-
-| arm | wall | fit stage | admitted / device / CPU fallback | hinge |
-|---|---|---|---|---|
-| device fit | 22.7 s | 19.0 s | 180 / 180 / 0 | 0.266926 |
-| device score, CPU fit | 71.8 s | | | 0.291277 |
-| CPU | 85.1 s | | | 0.291277 |
-
-Device fit is 3.2x faster than device score with the CPU fit and 3.7x faster than the CPU arm.
-
-**Tests** (`src/gpu_if_fit_tests.rs`): `if_plan_carries_the_third_child_in_the_slot_word`; `if_device_fit_matches_the_cpu_fit_including_the_switch_point` (device SSE within `1e-8` relative of the CPU fit, with rows at `x0 == 0` and `x0 == x1`, and a `NaN` in the untaken branch); `a_search_with_if_fits_on_the_device` (`dispatch: Device`, no `unsupported_plan` fallback).
 
 ### Classification fitness (#289)
 
@@ -2024,18 +2004,6 @@ The deferred device fit does per candidate what the CPU arm does.
 * **Refresh.** After the device write-back, after the CPU fallback batch and after the pipeline write-back, `refresh_after_fit` simplifies each fitted tree and recomputes its complexity, as `evolve_island` does after the CPU fit. Dead `1*` and `+ 0` nodes left by the kernel no longer reach tie-breaks or the in-search archive. A tree the dimensional filter rejects keeps an infinite error.
 * **Pipeline exclusion.** `pipeline_fit_safe` is false for every gated metric, because the pipeline write-back applies kernel constants without the gate.
 * **Wide admission.** `wide_admission` is true at 1 048 576 training rows or more, and for `correlation`, `correlation_signed` and `signed` at any size. With `wide`, `select_promoted` takes every candidate with constants and `GpuSearch::score` screens only the candidates without constants; the others are fitted and scored once. Other metrics keep `max(32, pop/4)` below the threshold.
-
-### Fit subsample on the device
-
-`--fit-rows N` (or `--fit-samples N`) with the device fit arm fits constants on a fixed `N`-row subsample and keeps scoring every training row on the device.
-
-* **Rows.** The subsample is drawn once per run: `N` ascending row indices from the training sample with the seed salted by the screening constant. `--run-manifest` records `fit_subsample.fit_rows`, the FNV-1a hash of those indices and `fixed` (true when the device fits the same rows for the whole run). The CPU screening arm draws a fresh subset each generation and does not run on a GPU search.
-* **Second context.** `GpuSearch` holds the subsample in its own device context: f32 rows, the f64 fit twin and the fit weights, uploaded once. The scoring context keeps the full f32 rows and, only for the exact order/rank scorer, a full twin. Weighted scoring keeps its weight vector in the scoring context. The log-loss label sign of the subsample is derived from the subsample target.
-* **What the subsample sees.** Every kernel batch of the fit stage (squared, absolute, log-squashed and log-loss LM, the correlation family, the rank, median, interquartile and maximum polishes), the cost-model rows, the exact gate for gated metrics and the CPU fallback fits use the subsample rows. After the write-back the survivors are scored on every row by the evaluator.
-* **Reporting.** `gpu.fit` carries `fit_rows` (rows of the twin), `score_rows`, `fit_twin_bytes` and `subsample_hash`. The reported archive is still rebuilt from an exact CPU refit of the finalists on all rows, so every reported error equals the CPU metric on all rows.
-* **Memory.** The plan charges the fit twin at `N` rows (`terms.fit_twin = N x (vars + 1) x 12 B` plus `N x 8 B` with weights: the f64 twin and the subsample's f32 rows) and a full-row twin only for the exact scorer. See `docs/memory-model.md`.
-* **Kept refusals.** A run without the device fit arm (`--fit-strategy exact`/`auto`/other CPU arm, `--no-fit`, a metric with no device fit objective) keeps the CPU evaluator with the reason `--fit-samples/--fit-rows scores on all rows only with the device fit arm (--fit-strategy gpu)`. Tiled residency still refuses the device fit. The overlapped fit pipeline (`pipeline_fit_safe`) is off for a subsample and the batches run synchronously. `--predictor-samples` still refuses the device.
-* **Cost model.** The planner decides per candidate on the subsample row count. At small `N` the model can route a fit to the CPU (`dispatch_cost`), which is labelled in `fit_fallback_by_cause`.
 
 ### Correlation arm
 

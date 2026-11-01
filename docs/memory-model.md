@@ -115,8 +115,6 @@ budget = min(cap 10.5 GiB, free - reserve 1 GiB, --gpu-memory)
 data_f32     = rows x (vars + 1) x 4 B                      scoring rows and target
 side_vectors = rows x 12 B (label sign) + rows x 8 B (weights), when present
 fit_twin     = rows x (vars + 1) x 8 B                      --fit-strategy gpu, or the exact rank/order scorer
-                (--fit-rows N < rows: N x (vars + 1) x 12 B + N x 8 B with weights, the subsample's f64 twin and f32 rows;
-                 the exact scorer adds a full-row twin)
 buffers      = 1 MiB + program slots, score, hash and fit regions, linear in the candidate count
 stat_wave    = max(512 MiB, 6 x (rows x 64 B + 1 MiB))      exact rank/order scorer only
 ```

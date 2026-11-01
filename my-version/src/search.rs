@@ -601,9 +601,6 @@ impl Ind {
 #[cfg(feature = "cuda")]
 struct GpuSearch {
     ev: crate::gpu::GpuEvaluator,
-    /// #265: the fixed fit subsample, its own device context (f32 rows, f64
-    /// twin, weights) and the row hash. `None` fits on the rows of `ev`.
-    fit_sub: Option<FitSubsample>,
     /// #122: the fixed-capacity, double-buffered postfix arena. It is allocated
     /// once (grown only if a later batch is larger) and reused every generation,
     /// so a generation never calls `cudaMalloc` for its programs.
@@ -683,71 +680,6 @@ struct TileStream {
     wave: usize,
 }
 
-/// Column-major `f64` copy of the feature rows, `cols[var * rows + row]`.
-#[cfg(feature = "cuda")]
-fn column_major(sample: &Sample, n_vars: usize) -> Vec<f64> {
-    let n = sample.len();
-    let mut cols = vec![0.0f64; n * n_vars];
-    for (r, row) in sample.x.iter().enumerate() {
-        for (v, &x) in row.iter().enumerate().take(n_vars) {
-            cols[v * n + r] = x;
-        }
-    }
-    cols
-}
-
-/// A fixed fit subsample resident on the device next to the full-row scorer.
-#[cfg(feature = "cuda")]
-struct FitSubsample {
-    /// The subsample rows, for the exact checks and CPU fallbacks that must
-    /// see the rows the device fitted.
-    sample: Sample,
-    /// Its own context: f32 rows, the f64 twin and the weights of these rows.
-    ev: crate::gpu::GpuEvaluator,
-    /// FNV-1a of the ascending row indices.
-    hash: u64,
-}
-
-#[cfg(feature = "cuda")]
-impl FitSubsample {
-    fn new(
-        train: &Sample,
-        rows: &[usize],
-        n_vars: usize,
-        loss: crate::fit::DeviceLoss,
-        logistic_fit: bool,
-        budget: Option<u64>,
-        run_start: std::time::Instant,
-    ) -> Result<Self, String> {
-        let sample = subset_sample(train, rows);
-        let n = sample.len();
-        let cols64 = column_major(&sample, n_vars);
-        let cols32: Vec<f32> = cols64.iter().map(|&v| v as f32).collect();
-        let y32: Vec<f32> = sample.y.iter().map(|&v| v as f32).collect();
-        let Some(mut ev) =
-            crate::gpu::GpuEvaluator::with_budget(&cols32, n, n_vars, &y32, budget)
-        else {
-            return Err(device_refusal("the fit subsample rows"));
-        };
-        ev.set_run_start(run_start);
-        ev.set_loss(loss);
-        if logistic_fit || loss == crate::fit::DeviceLoss::Logistic {
-            let sign = crate::fit::classification_signs_weighted(&sample.y, &sample.w);
-            if !ev.set_fit_sign(&sign) {
-                return Err(device_refusal("the fit subsample label sign"));
-            }
-        }
-        if !ev.set_fit_data(&cols64, &sample.y, &sample.w) {
-            return Err(device_refusal("the f64 fit subsample"));
-        }
-        Ok(FitSubsample {
-            sample,
-            ev,
-            hash: subsample_hash(rows),
-        })
-    }
-}
-
 #[cfg(feature = "cuda")]
 impl GpuSearch {
     /// #293: host-to-device bytes one batch of `candidates` streams in a tiled
@@ -782,9 +714,6 @@ impl GpuSearch {
         run_start: std::time::Instant,
         // #293: the device plan: its budget is the ceiling on the live device
         // allocations, and a tiled plan streams the rows instead of holding them.
-        // #265: the fixed rows the device fit runs on (ascending training row
-        // indices), or empty to fit on every row.
-        fit_rows: &[usize],
         plan: Option<&crate::memory::DevicePlan>,
     ) -> Result<Self, String> {
         let budget = plan.map(|p| p.budget);
@@ -850,13 +779,13 @@ impl GpuSearch {
                 // #169: the batched fit's final polish runs on the exact f64
                 // rows, so its constants are not limited by the f32 evaluator
                 // copy. Only the GPU-fit arm pays this second resident copy.
-                //
-                // With a fit subsample the twin lives in a second context that
-                // holds only those rows; this context keeps a full twin just
-                // for the exact order/rank scorer.
-                let sub = !fit_rows.is_empty() && fit_rows.len() < n_rows && fit_data;
-                if fit_data && (!sub || native_stat.is_some()) {
-                    let cols64 = column_major(train, n_vars);
+                if fit_data {
+                    let mut cols64 = vec![0.0f64; n_rows * n_vars];
+                    for (r, row) in train.x.iter().enumerate() {
+                        for (v, &x) in row.iter().enumerate().take(n_vars) {
+                            cols64[v * n_rows + r] = x;
+                        }
+                    }
                     if !ev.set_fit_data(&cols64, &train.y, &train.w) {
                         return Err(device_refusal("the f64 fit rows"));
                     }
@@ -867,16 +796,8 @@ impl GpuSearch {
                         return Err(device_refusal("the row weights"));
                     }
                 }
-                let fit_sub = if sub {
-                    Some(FitSubsample::new(
-                        train, fit_rows, n_vars, loss, logistic_fit, budget, run_start,
-                    )?)
-                } else {
-                    None
-                };
                 Ok(GpuSearch {
                     ev,
-                    fit_sub,
                     pool: None,
                     stats: BTreeMap::new(),
                     fallback: Some(FallbackPool::new(fallback_workers(), fallback_workers())),
@@ -959,14 +880,8 @@ impl GpuSearch {
         generation: usize,
         dispatcher: &mut crate::dispatch::Dispatcher,
     ) {
-        let (fit_sample, mut fit_ev, fit_hash) = match self.fit_sub.take() {
-            Some(FitSubsample { sample, ev, hash }) => (Some(sample), Some(ev), hash),
-            None => (None, None, 0),
-        };
-        // Everything that judges or refits a device proposal sees the rows the
-        // device fitted; the caller re-scores on every row afterwards.
-        let fit_train: &Sample = fit_sample.as_ref().unwrap_or(train);
-        let mut planned: Vec<(usize, usize, crate::fit::GpuFitPlan)> = Vec::new();
+        let mut jobs: Vec<(usize, usize, crate::fit::GpuFitPlan)> = Vec::new();
+        let mut job_decisions: Vec<crate::dispatch::Decision> = Vec::new();
         let mut fallbacks: Vec<(usize, usize, FitFallbackCause)> = Vec::new();
         // #229: the objective the batched kernel minimises. #230: the rank
         // family has no LM loss but has its own exact device polish, so it is
@@ -982,7 +897,7 @@ impl GpuSearch {
         // arm keeps its measured cost model: below the crossover the exact CPU
         // polish runs instead of paying a device launch.
         let maximum_arm = crate::fit::maximum_fit_only(cfg.metric)
-            && crate::fit::maximum_gpu_fit_worthwhile(fit_train.len(), 1, cfg.fit_iters);
+            && crate::fit::maximum_gpu_fit_worthwhile(train.len(), 1, cfg.fit_iters);
         // #234: a single-class fit sample has no finite log-loss optimum. The
         // counts come from the same midpoint rule the CPU arm uses, so the
         // device never fits a sign the sample does not support.
@@ -993,7 +908,7 @@ impl GpuSearch {
         let single_class = crate::fit::fit_loss(cfg.metric)
             .is_some_and(|loss| loss.needs_label_sign())
             && {
-                let (pos, neg) = crate::fit::class_counts_weighted(&fit_train.y, &fit_train.w);
+                let (pos, neg) = crate::fit::class_counts_weighted(&train.y, &train.w);
                 pos == 0 || neg == 0
             };
         for &(i, j) in admitted {
@@ -1015,17 +930,45 @@ impl GpuSearch {
                 {
                     fallbacks.push((i, j, FitFallbackCause::MetricNotNative))
                 }
-                Ok(plan) => planned.push((i, j, plan)),
+                Ok(plan) => {
+                    // #290: the per-stage cost model owns the row floor and the
+                    // crossover. Structural plan errors still carry their own
+                    // cause; only a valid plan reaches this timing comparison.
+                    let workload = crate::dispatch::Workload::fit(
+                        1,
+                        train.len(),
+                        plan.nconst,
+                        cfg.fit_iters,
+                    )
+                    .with_min_rows(32 * plan.nconst);
+                    let workload = match fit_loss {
+                        Some(loss) => workload.with_objective(loss),
+                        None => workload,
+                    };
+                    let decision = dispatcher.plan(crate::dispatch::Stage::Fit, &workload);
+                    if decision.route == crate::dispatch::Route::Device {
+                        jobs.push((i, j, plan));
+                        job_decisions.push(decision);
+                    } else {
+                        // A cost-model refusal is a policy route, not an
+                        // arithmetic fallback: label it `dispatch_cost`.
+                        let cause = match decision.reason {
+                            crate::dispatch::Reason::TooFewRows => FitFallbackCause::TooFewRows,
+                            crate::dispatch::Reason::TooManyConstants => {
+                                FitFallbackCause::TooManyConstants
+                            }
+                            crate::dispatch::Reason::UnsupportedPlan => {
+                                FitFallbackCause::UnsupportedPlan
+                            }
+                            _ => FitFallbackCause::DispatchCost,
+                        };
+                        fallbacks.push((i, j, cause));
+                        dispatcher.record(decision, 0.0, 1, workload.bytes);
+                    }
+                }
                 Err(reason) => fallbacks.push((i, j, plan_fallback_cause(reason))),
             }
         }
-        // #453: the device runs the admitted candidates as one batch, so the
-        // cost model plans the batch once, not each candidate alone.
-        let batch = plan_fit_batch(dispatcher, fit_train.len(), cfg.fit_iters, fit_loss, planned);
-        let batch_bytes = batch.bytes;
-        let batch_decision = batch.decision;
-        fallbacks.extend(batch.refused);
-        let jobs = batch.jobs;
         self.fit_attempts += admitted.len();
         let stats = self.stats.entry(generation).or_default();
         stats.generation = generation;
@@ -1047,28 +990,22 @@ impl GpuSearch {
             // #169/#229.
             let want = crate::fit::OrderStat::for_metric(cfg.metric);
             let fit_device_start = self.ledger_offset_s();
-            // The fit subsample has its own context; without one the fit runs
-            // on the scoring context's rows.
-            let dev = match fit_ev.as_mut() {
-                Some(ev) => ev,
-                None => &mut self.ev,
-            };
             let (out, ms) = if maximum_arm {
                 // #227: the exact maximum-error polish on the squared start.
-                dev.max_fit_batch(&plans, cfg.fit_iters)
+                self.ev.max_fit_batch(&plans, cfg.fit_iters)
             } else if let Some(want) = want {
-                dev.order_stat_fit_batch(&plans, cfg.fit_iters, want)
+                self.ev.order_stat_fit_batch(&plans, cfg.fit_iters, want)
             } else {
                 match crate::fit::rank_metric_signed(cfg.metric) {
-                    Some(signed) => {
-                        dev.rank_fit_batch(&plans, cfg.fit_iters, &fit_train.y, signed)
-                    }
+                    Some(signed) => self
+                        .ev
+                        .rank_fit_batch(&plans, cfg.fit_iters, &train.y, signed),
                     None => {
                         let loss = fit_loss.expect(
                             "jobs is only filled when a native, rank, order-statistic or \
                              maximum arm exists",
                         );
-                        dev.fit_batch(&plans, cfg.fit_iters, loss)
+                        self.ev.fit_batch(&plans, cfg.fit_iters, loss)
                     }
                 }
             };
@@ -1076,7 +1013,7 @@ impl GpuSearch {
                 self.fit_ms += ms as f64;
                 // #284: the fit kernel is one device interval on the run clock;
                 // its duration is the raw event time, not the host envelope.
-                match dev.take_span_start_s(crate::gpu::SPAN_FIT) {
+                match self.ev.take_span_start_s(crate::gpu::SPAN_FIT) {
                     Some(start_s) => self
                         .ledger
                         .record_fit_kernel_event(0, start_s, ms as f64 / 1000.0),
@@ -1102,9 +1039,9 @@ impl GpuSearch {
                         let verdict = crate::fit::gate_device_proposal(
                             &mut islands[*i][*j].tree,
                             &res.c,
-                            &fit_train.x,
-                            &fit_train.y,
-                            &fit_train.w,
+                            &train.x,
+                            &train.y,
+                            &train.w,
                             cfg.metric,
                         );
                         let cause = match verdict {
@@ -1164,14 +1101,16 @@ impl GpuSearch {
                     crate::fit::note_gpu_fit(false);
                 }
             }
-            // #290: attribute the measured batch time to the one planned batch
-            // decision (#453).
-            if let Some(decision) = batch_decision {
+            // #290: attribute the measured batch time to the planned device
+            // decisions. The actual is split evenly across the candidates: the
+            // kernel is one batch, so a per-candidate stopwatch would be noise.
+            let per = (ms.max(0.0) as f64 / 1000.0) / jobs.len() as f64;
+            for (decision, (_, _, plan)) in job_decisions.iter().zip(jobs.iter()) {
                 dispatcher.record(
-                    decision,
-                    ms.max(0.0) as f64 / 1000.0,
-                    jobs.len(),
-                    batch_bytes,
+                    *decision,
+                    per,
+                    1,
+                    crate::dispatch::estimate_fit_bytes(1, plan.nconst),
                 );
             }
         }
@@ -1198,9 +1137,9 @@ impl GpuSearch {
                 .collect();
             workers_used = fit_fallback_jobs(
                 &mut jobs,
-                &fit_train.x,
-                &fit_train.y,
-                &fit_train.w,
+                &train.x,
+                &train.y,
+                &train.w,
                 cfg.fit_iters,
                 cfg.metric,
                 fallback_workers(),
@@ -1222,13 +1161,6 @@ impl GpuSearch {
         let stats = self.stats.entry(generation).or_default();
         stats.fit_fallback_seconds += fallback_seconds;
         stats.fit_fallback_workers = stats.fit_fallback_workers.max(workers_used);
-        if let (Some(sample), Some(ev)) = (fit_sample, fit_ev) {
-            self.fit_sub = Some(FitSubsample {
-                sample,
-                ev,
-                hash: fit_hash,
-            });
-        }
         for &(i, j) in admitted {
             refresh_after_fit(&mut islands[i][j], cfg);
         }
@@ -1693,9 +1625,7 @@ impl GpuSearch {
         let mut ledger = self.ev.ledger().clone();
         ledger.set_eval_window(self.ev.stats().wall_s);
         ledger.absorb(&self.ledger);
-        // The fit kernels run in the subsample context when there is one.
-        let fit_ev = self.fit_sub.as_ref().map_or(&self.ev, |s| &s.ev);
-        let arena = fit_ev.arena_report();
+        let arena = self.ev.arena_report();
         ledger.set_fit_alloc(crate::gpu_stats::FitAlloc {
             alloc_calls: arena.fit_alloc_calls,
             growths: arena.fit_growths,
@@ -1736,10 +1666,6 @@ impl GpuSearch {
 fit_fallback_bounded: self.fit_fallback_bounded,
             fit_fallback_workers: self.fit_fallback_workers,
             fit_fallback_max: DEFAULT_FIT_FALLBACK_MAX,
-            fit_rows: fit_ev.fit_twin().0 as usize,
-            score_rows: self.ev.rows(),
-            fit_twin_bytes: fit_ev.fit_twin().1,
-            fit_subsample_hash: self.fit_sub.as_ref().map(|s| s.hash),
             fit_admission: crate::fit::FitAdmission::Screened,
             ledger,
             memory_plan: self.memory_plan.clone(),
@@ -2527,14 +2453,11 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if subsampling_active(cfg, train) {
         return Some("--predictor-samples changes the rows per generation");
     }
-    // #85/#116: the CPU screened path scores offspring on a per-generation
-    // subset, which the resident full-sample GPU evaluator cannot represent.
-    // The device fit arm instead fits on a fixed subsample and scores every
-    // row, so only a run without that arm is refused.
-    if effective_fit_rows(cfg, train) > 0 && !defers_fit_to_gpu(cfg, true) {
-        return Some(
-            "--fit-samples/--fit-rows scores on all rows only with the device fit arm (--fit-strategy gpu)",
-        );
+    // #85/#116: the screened path scores offspring on a per-generation subset,
+    // which the resident full-sample GPU evaluator cannot represent.
+    let fit_rows = effective_fit_rows(cfg, train);
+    if fit_rows > 0 && fit_rows < train.len() {
+        return Some("--fit-samples/--fit-rows scores offspring on a screening subset");
     }
     None
 }
@@ -2561,6 +2484,10 @@ fn rank_fit_only_arm(cfg: &Config, train: &Sample) -> Option<bool> {
         || cfg.metric.is_parameter_aware()
         || subsampling_active(cfg, train)
     {
+        return None;
+    }
+    let fit_rows = effective_fit_rows(cfg, train);
+    if fit_rows > 0 && fit_rows < train.len() {
         return None;
     }
     Some(signed)
@@ -2594,14 +2521,17 @@ fn order_stat_fit_only_blocker(cfg: &Config, train: &Sample) -> Option<&'static 
     if subsampling_active(cfg, train) {
         return Some("--predictor-samples changes the rows per generation");
     }
-    let fit_n = device_fit_rows(cfg, train);
+    let fit_rows = effective_fit_rows(cfg, train);
+    if fit_rows > 0 && fit_rows < train.len() {
+        return Some("--fit-samples/--fit-rows scores offspring on a screening subset");
+    }
     let (worthwhile, why) = match want {
         crate::fit::OrderStat::Median => (
-            crate::fit::median_gpu_fit_worthwhile(fit_n, 1, cfg.fit_iters),
+            crate::fit::median_gpu_fit_worthwhile(train.len(), 1, cfg.fit_iters),
             "median fit arm: the sample is too small for the device polish",
         ),
         crate::fit::OrderStat::Interquartile => (
-            crate::fit::interquartile_gpu_fit_worthwhile(fit_n, 1, cfg.fit_iters),
+            crate::fit::interquartile_gpu_fit_worthwhile(train.len(), 1, cfg.fit_iters),
             "interquartile fit arm: the sample is too small for the device polish",
         ),
     };
@@ -2639,7 +2569,11 @@ fn maximum_fit_only_blocker(cfg: &Config, train: &Sample) -> Option<&'static str
     if subsampling_active(cfg, train) {
         return Some("--predictor-samples changes the rows per generation");
     }
-    if !crate::fit::maximum_gpu_fit_worthwhile(device_fit_rows(cfg, train), 1, cfg.fit_iters) {
+    let fit_rows = effective_fit_rows(cfg, train);
+    if fit_rows > 0 && fit_rows < train.len() {
+        return Some("--fit-samples/--fit-rows scores offspring on a screening subset");
+    }
+    if !crate::fit::maximum_gpu_fit_worthwhile(train.len(), 1, cfg.fit_iters) {
         return Some("maximum fit arm: the sample is too small for the device polish");
     }
     None
@@ -2774,7 +2708,6 @@ pub fn device_plan_for(cfg: &Config, train: &Sample) -> Option<crate::memory::De
         candidates: cfg.pop.saturating_mul(cfg.islands.max(1)),
         program_words: crate::genome::width_for(cfg.max_complexity),
         device_fit,
-        fit_rows: if device_fit { effective_fit_rows(cfg, train) } else { 0 },
         stat: shape.score_admitted,
         weights: !train.w.is_empty(),
         label_sign,
@@ -2792,15 +2725,11 @@ pub fn resolve_fit_strategy(
     train: &Sample,
     request: crate::fit::FitRequest,
 ) -> crate::fit::FitResolution {
-    // The device arm is what the run would switch to, so a fit subsample is
-    // judged as the device arm fits it.
-    let mut probe = cfg.clone();
-    probe.fit_strategy = crate::fit::FitStrategy::Gpu;
-    let backend_ok = if effective_backend(&probe, train) == Backend::Gpu {
+    let backend_ok = if effective_backend(cfg, train) == Backend::Gpu {
         Ok(())
     } else if !cfg.gpu {
         Err("--cpu/--no-gpu".to_string())
-    } else if let Some(why) = backend_blocker_reason(&probe, train) {
+    } else if let Some(why) = backend_blocker_reason(cfg, train) {
         Err(why.to_string())
     } else if cfg!(feature = "cuda") {
         Err("no usable CUDA device".to_string())
@@ -3329,59 +3258,6 @@ fn effective_fit_rows(cfg: &Config, sample: &Sample) -> usize {
     }
 }
 
-/// Rows the device fit arm sees: the fixed fit subsample when one is requested,
-/// every training row otherwise. Scoring always uses every row.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn device_fit_rows(cfg: &Config, sample: &Sample) -> usize {
-    match effective_fit_rows(cfg, sample) {
-        0 => sample.len(),
-        n => n,
-    }
-}
-
-/// True when a requested fit subsample is fitted on the device (fixed rows,
-/// uploaded once) while the evaluator scores every row.
-fn fit_subsample_on_device(cfg: &Config, sample: &Sample) -> bool {
-    effective_fit_rows(cfg, sample) > 0 && defers_fit_to_gpu(cfg, true)
-}
-
-/// The fixed row indices of the device fit subsample, ascending.
-fn device_fit_indices(cfg: &Config, sample: &Sample) -> Vec<usize> {
-    generation_subset(
-        sample.len(),
-        effective_fit_rows(cfg, sample),
-        cfg.seed ^ FIT_SUBSET_SALT,
-        0,
-    )
-}
-
-/// FNV-1a over the little-endian `u64` row indices.
-fn subsample_hash(indices: &[usize]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &i in indices {
-        for b in (i as u64).to_le_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    h
-}
-
-/// The run's fit subsample as `(rows, hash, fixed)`, or `None` for a full fit.
-/// `fixed` is true when the device arm fits the same rows for the whole run.
-/// The CPU screened path draws a fresh subset each generation, so its hash is
-/// that of generation 0.
-pub fn fit_subsample_record(cfg: &Config, sample: &Sample) -> Option<(usize, u64, bool)> {
-    let rows = effective_fit_rows(cfg, sample);
-    if rows == 0 {
-        return None;
-    }
-    let fixed =
-        effective_backend(cfg, sample) == Backend::Gpu && fit_subsample_on_device(cfg, sample);
-    let draw = device_fit_indices(cfg, sample);
-    Some((rows, subsample_hash(&draw), fixed))
-}
-
 /// #169: why an admitted candidate still needed the exact CPU fit arm.
 ///
 /// The labels are stable: they appear in `gpu.fit.fallback_by_cause`, in each
@@ -3488,69 +3364,6 @@ impl FitFallbackCause {
             FitFallbackCause::AffineClosedForm => "affine_closed_form",
         }
     }
-}
-
-/// #453: the outcome of planning one fit batch.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-struct FitBatch {
-    /// Candidates the device will fit together.
-    jobs: Vec<(usize, usize, crate::fit::GpuFitPlan)>,
-    /// The batch decision; `None` when no candidate passed the row floor.
-    decision: Option<crate::dispatch::Decision>,
-    /// Workload bytes of the batch decision.
-    bytes: u64,
-    /// Candidates refused, with the cause each reports.
-    refused: Vec<(usize, usize, FitFallbackCause)>,
-}
-
-/// #453: plan the fit stage once for the whole batch.
-///
-/// Each candidate keeps its structural row floor (`32 * nconst` rows). The
-/// candidates that pass it form one workload of `W` fits with the largest
-/// constant count, because the device runs them as one launch with one
-/// transfer. The decision applies to every candidate in the batch.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn plan_fit_batch(
-    dispatcher: &mut crate::dispatch::Dispatcher,
-    rows: usize,
-    sweeps: usize,
-    loss: Option<crate::fit::DeviceLoss>,
-    plans: Vec<(usize, usize, crate::fit::GpuFitPlan)>,
-) -> FitBatch {
-    let mut refused = Vec::new();
-    let mut valid = Vec::with_capacity(plans.len());
-    for (i, j, plan) in plans {
-        if rows < 32 * plan.nconst {
-            refused.push((i, j, FitFallbackCause::TooFewRows));
-        } else {
-            valid.push((i, j, plan));
-        }
-    }
-    if valid.is_empty() {
-        return FitBatch { jobs: valid, decision: None, bytes: 0, refused };
-    }
-    let widest = valid.iter().map(|(_, _, p)| p.nconst).max().unwrap_or(1);
-    let workload = crate::dispatch::Workload::fit(valid.len(), rows, widest, sweeps)
-        .with_min_rows(32 * widest);
-    let workload = match loss {
-        Some(loss) => workload.with_objective(loss),
-        None => workload,
-    };
-    let decision = dispatcher.plan(crate::dispatch::Stage::Fit, &workload);
-    if decision.route == crate::dispatch::Route::Device {
-        return FitBatch { jobs: valid, decision: Some(decision), bytes: workload.bytes, refused };
-    }
-    // A cost-model refusal is a policy route, not an arithmetic fallback:
-    // label it `dispatch_cost`.
-    let cause = match decision.reason {
-        crate::dispatch::Reason::TooFewRows => FitFallbackCause::TooFewRows,
-        crate::dispatch::Reason::TooManyConstants => FitFallbackCause::TooManyConstants,
-        crate::dispatch::Reason::UnsupportedPlan => FitFallbackCause::UnsupportedPlan,
-        _ => FitFallbackCause::DispatchCost,
-    };
-    refused.extend(valid.iter().map(|(i, j, _)| (*i, *j, cause)));
-    dispatcher.record(decision, 0.0, valid.len(), workload.bytes);
-    FitBatch { jobs: Vec::new(), decision: Some(decision), bytes: workload.bytes, refused }
 }
 
 /// #169: map a structural fit-plan rejection to its reported cause.
@@ -3760,19 +3573,6 @@ fn defers_fit_to_gpu(cfg: &Config, defer_gpu: bool) -> bool {
             || crate::fit::rank_fit_only(cfg.metric).is_some()
             || crate::fit::order_stat_fit_only(cfg.metric)
             || crate::fit::maximum_fit_only(cfg.metric))
-}
-
-/// #451: why `--fit-strategy gpu` does not defer the fit to the device, or
-/// `None` when it does (or the strategy is not `gpu`).
-#[cfg(any(feature = "cuda", test))]
-fn gpu_fit_off_reason(cfg: &Config) -> Option<String> {
-    if !cfg.fit_strategy.defers_to_gpu() || defers_fit_to_gpu(cfg, true) {
-        return None;
-    }
-    if cfg.fit_iters == 0 {
-        return Some("--fit-iters 0: nothing to fit".to_string());
-    }
-    crate::fit::gpu_fit_metric_error(cfg.metric)
 }
 
 /// #85: true when constants are fitted on fewer rows than the generation's
@@ -4127,12 +3927,7 @@ struct PipelineFit {
 /// single-class decline.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn pipeline_fit_safe(cfg: &Config, train_rows: usize, screened: bool) -> bool {
-    // The overlap queue fits on the scoring context's rows; a fit subsample
-    // has its own context and takes the synchronous batches.
-    let request = if cfg.fit_rows >= 2 { cfg.fit_rows } else { cfg.fit_samples };
-    let fit_subsample = request >= 2 && request < train_rows;
     !screened
-        && !fit_subsample
         && cfg.pipeline_depth > 0
         && defers_fit_to_gpu(cfg, true)
         && (train_rows >= WIDE_ADMISSION_ROWS || cfg.fit_admission == crate::fit::FitAdmission::All)
@@ -4447,16 +4242,6 @@ pub struct GpuRunStats {
     pub fit_fallback_workers: usize,
     /// #255: configured per-generation fallback cap (`0` = unbounded).
     pub fit_fallback_max: usize,
-    /// Rows of the device fit twin: the fit subsample, else every row; `0`
-    /// without a device fit.
-    pub fit_rows: usize,
-    /// Rows the device evaluator scores.
-    pub score_rows: usize,
-    /// Bytes of the f64 fit twin resident on the device; `0` without a
-    /// device fit.
-    pub fit_twin_bytes: u64,
-    /// Hash of the fixed fit subsample rows, or `None` for a full fit.
-    pub fit_subsample_hash: Option<u64>,
     /// #223: the admission the deferred fit ran under.
     pub fit_admission: crate::fit::FitAdmission,
     /// #284: run-scoped stage/device ledger. `Default` is an empty ledger, so
@@ -5804,11 +5589,6 @@ fn run_search(
                 } else {
                     None
                 };
-                let fit_rows = if fit_subsample_on_device(cfg, train) {
-                    device_fit_indices(cfg, train)
-                } else {
-                    Vec::new()
-                };
                 // #293: the plan runs before the first allocation.
                 let memory_plan = device_plan_for(cfg, train);
                 let created = match memory_plan.as_ref().and_then(plan_blocker) {
@@ -5822,7 +5602,6 @@ fn run_search(
                         score,
                         logistic_fit,
                         t0,
-                        &fit_rows,
                         memory_plan.as_ref(),
                     ),
                 };
@@ -5954,10 +5733,14 @@ fn run_search(
         }
     }
     #[cfg(feature = "cuda")]
-    if cfg.gpu_notes {
-        if let Some(why) = gpu_fit_off_reason(cfg) {
-            eprintln!("# gpu-fit: off ({})", why);
-        }
+    if cfg.gpu_notes && cfg.fit_strategy.defers_to_gpu() && !defers_fit_to_gpu(cfg, true) {
+        eprintln!(
+            "# gpu-fit: off (the batched kernel minimises squared error, \
+             log-squashed, mean absolute error or the exact rank, median, \
+             interquartile and maximum objectives; --metric must be squared, \
+             log_squashed, absolute, aic, aicc, bic, rank_correlation, \
+             rank_correlation_signed, median, interquartile or maximum)"
+        );
     }
     // #226/#232: only a run that actually asked for the device fit arm can be
     // refused by it. `--no-fit` (or a CPU strategy) has nothing to fit, so it
@@ -6040,9 +5823,6 @@ fn run_search(
     // #85: did any generation fit on a screening subset? Only then may the
     // final archive be refit; a request at least as large as the sample, or
     // `--no-fit`, stays an exact no-op.
-    // The device fit arm fits a fixed subsample while the evaluator scores every
-    // row, so the CPU screening draw below stays off for it.
-    let device_fit_sub = defer_gpu && fit_subsample_on_device(cfg, train);
     let mut fit_screened = resumed && fit_sampling_active(cfg, train);
     // #27/#85: the full-data view is needed by the seeds, the screened
     // generation's promotion step and the final rebuild. Build it once.
@@ -6136,7 +5916,7 @@ fn run_search(
         };
         // #85: with screening on, the initial population is the first set of
         // full-data parents, so it must not start on a predictor subset.
-        let init_eval = if fit_sampling_active(cfg, train) && !device_fit_sub {
+        let init_eval = if fit_sampling_active(cfg, train) {
             &train_data
         } else {
             init_data
@@ -6397,13 +6177,7 @@ fn run_search(
             };
             // #85: a fresh screening subset for constant fitting, drawn from
             // this generation's sample. `None` keeps the whole sample.
-            let device_fit_sub = defer_gpu && fit_subsample_on_device(cfg, train);
-            let fit_sample = if device_fit_sub {
-                fit_screened = true;
-                None
-            } else {
-                fit_for_generation(cfg, gen_train, gen)
-            };
+            let fit_sample = fit_for_generation(cfg, gen_train, gen);
             let fit_train = fit_sample.as_ref().unwrap_or(gen_train);
             let screened = fit_sample.is_some();
             if screened {
@@ -7279,110 +7053,6 @@ fn run_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// #453: `n` eligible `c0 * x0 + c1` plans, one constant pair each.
-    fn affine_plans(n: usize) -> Vec<(usize, usize, crate::fit::GpuFitPlan)> {
-        use crate::expr::{constant, input, node, Op};
-        (0..n)
-            .map(|k| {
-                let tree = node(
-                    Op::Add,
-                    vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.5)],
-                );
-                (0, k, crate::fit::gpu_fit_plan_reason(&tree).expect("an eligible plan"))
-            })
-            .collect()
-    }
-
-    /// A launch so expensive that one fit cannot amortise it but 64 can.
-    fn costly_launch() -> crate::dispatch::Dispatcher {
-        let mut cal = crate::dispatch::Calibration::default();
-        cal.launch_s = 5.0;
-        crate::dispatch::Dispatcher::new(cal)
-    }
-
-    /// #453: one candidate alone routes to the CPU, 64 together route to the
-    /// device, and the admission sends all 64 to the device.
-    #[test]
-    fn fit_batch_plans_the_batch_not_each_candidate() {
-        let rows = 2_456_306;
-        let alone = plan_fit_batch(&mut costly_launch(), rows, 8, None, affine_plans(1));
-        assert!(alone.jobs.is_empty(), "a batch of one pays the whole launch");
-        assert_eq!(alone.refused.len(), 1);
-        assert_eq!(alone.refused[0].2, FitFallbackCause::DispatchCost);
-
-        let batch = plan_fit_batch(&mut costly_launch(), rows, 8, None, affine_plans(64));
-        assert_eq!(batch.jobs.len(), 64);
-        assert!(batch.refused.is_empty());
-        let decision = batch.decision.expect("a batch decision");
-        assert_eq!(decision.route, crate::dispatch::Route::Device);
-    }
-
-    /// #453: a CPU batch labels every candidate `dispatch_cost` and the ledger
-    /// holds one fit call carrying all of them.
-    #[test]
-    fn fit_batch_ledger_has_one_decision_with_all_candidates() {
-        let rows = 2_456_306;
-        let mut d = crate::dispatch::Dispatcher::new(crate::dispatch::Calibration {
-            launch_s: 1.0e9,
-            ..crate::dispatch::Calibration::default()
-        });
-        let cpu = plan_fit_batch(&mut d, rows, 8, None, affine_plans(64));
-        assert_eq!(cpu.refused.len(), 64);
-        assert!(cpu.refused.iter().all(|r| r.2 == FitFallbackCause::DispatchCost));
-        let entry = d.ledger().entry(crate::dispatch::Stage::Fit).expect("fit row");
-        assert_eq!((entry.calls, entry.candidates), (1, 64));
-
-        let mut d = costly_launch();
-        let batch = plan_fit_batch(&mut d, rows, 8, None, affine_plans(64));
-        d.record(batch.decision.unwrap(), 0.0, batch.jobs.len(), batch.bytes);
-        let entry = d.ledger().entry(crate::dispatch::Stage::Fit).expect("fit row");
-        assert_eq!((entry.calls, entry.candidates), (1, 64));
-    }
-
-    /// #453: a candidate below its own `32 * nconst` row floor keeps its
-    /// structural `too_few_rows` cause and does not join the batch.
-    #[test]
-    fn fit_batch_keeps_the_per_candidate_row_floor() {
-        let batch = plan_fit_batch(&mut costly_launch(), 40, 8, None, affine_plans(3));
-        assert!(batch.jobs.is_empty());
-        assert_eq!(batch.refused.len(), 3);
-        assert!(batch.refused.iter().all(|r| r.2 == FitFallbackCause::TooFewRows));
-        assert!(batch.decision.is_none());
-    }
-
-    #[test]
-    fn gpu_fit_off_reason_follows_the_fit_decision() {
-        use crate::fit::FitStrategy;
-        use crate::metrics::Metric;
-        for &metric in Metric::all() {
-            let cfg = Config {
-                metric,
-                fit_strategy: FitStrategy::Gpu,
-                fit_iters: 5,
-                ..Config::default()
-            };
-            let reason = gpu_fit_off_reason(&cfg);
-            assert_eq!(reason.is_none(), defers_fit_to_gpu(&cfg, true), "{}", metric.name());
-            if crate::fit::gpu_fit_metric_error(metric).is_none() {
-                assert_eq!(reason, None, "{}", metric.name());
-            } else {
-                assert_eq!(reason, crate::fit::gpu_fit_metric_error(metric));
-            }
-        }
-        let cfg = Config {
-            metric: Metric::Squared,
-            fit_strategy: FitStrategy::Gpu,
-            fit_iters: 0,
-            ..Config::default()
-        };
-        assert_eq!(
-            gpu_fit_off_reason(&cfg).as_deref(),
-            Some("--fit-iters 0: nothing to fit")
-        );
-        let cfg = Config { fit_strategy: FitStrategy::Exact, ..cfg };
-        assert_eq!(gpu_fit_off_reason(&cfg), None);
-    }
 
     /// #256: the fit stage leaves the eval window first, then prep, then
     /// search, and the phases keep their total.
