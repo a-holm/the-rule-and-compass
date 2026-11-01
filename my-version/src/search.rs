@@ -3607,6 +3607,19 @@ fn defers_fit_to_gpu(cfg: &Config, defer_gpu: bool) -> bool {
             || crate::fit::maximum_fit_only(cfg.metric))
 }
 
+/// #451: why `--fit-strategy gpu` does not defer the fit to the device, or
+/// `None` when it does (or the strategy is not `gpu`).
+#[cfg(any(feature = "cuda", test))]
+fn gpu_fit_off_reason(cfg: &Config) -> Option<String> {
+    if !cfg.fit_strategy.defers_to_gpu() || defers_fit_to_gpu(cfg, true) {
+        return None;
+    }
+    if cfg.fit_iters == 0 {
+        return Some("--fit-iters 0: nothing to fit".to_string());
+    }
+    crate::fit::gpu_fit_metric_error(cfg.metric)
+}
+
 /// #85: true when constants are fitted on fewer rows than the generation's
 /// scoring sample. A request at least as large as the sample is a no-op.
 fn fit_sampling_active(cfg: &Config, sample: &Sample) -> bool {
@@ -5765,14 +5778,10 @@ fn run_search(
         }
     }
     #[cfg(feature = "cuda")]
-    if cfg.gpu_notes && cfg.fit_strategy.defers_to_gpu() && !defers_fit_to_gpu(cfg, true) {
-        eprintln!(
-            "# gpu-fit: off (the batched kernel minimises squared error, \
-             log-squashed, mean absolute error or the exact rank, median, \
-             interquartile and maximum objectives; --metric must be squared, \
-             log_squashed, absolute, aic, aicc, bic, rank_correlation, \
-             rank_correlation_signed, median, interquartile or maximum)"
-        );
+    if cfg.gpu_notes {
+        if let Some(why) = gpu_fit_off_reason(cfg) {
+            eprintln!("# gpu-fit: off ({})", why);
+        }
     }
     // #226/#232: only a run that actually asked for the device fit arm can be
     // refused by it. `--no-fit` (or a CPU strategy) has nothing to fit, so it
@@ -7155,6 +7164,39 @@ mod tests {
         assert_eq!(batch.refused.len(), 3);
         assert!(batch.refused.iter().all(|r| r.2 == FitFallbackCause::TooFewRows));
         assert!(batch.decision.is_none());
+    }
+
+    #[test]
+    fn gpu_fit_off_reason_follows_the_fit_decision() {
+        use crate::fit::FitStrategy;
+        use crate::metrics::Metric;
+        for &metric in Metric::all() {
+            let cfg = Config {
+                metric,
+                fit_strategy: FitStrategy::Gpu,
+                fit_iters: 5,
+                ..Config::default()
+            };
+            let reason = gpu_fit_off_reason(&cfg);
+            assert_eq!(reason.is_none(), defers_fit_to_gpu(&cfg, true), "{}", metric.name());
+            if crate::fit::gpu_fit_metric_error(metric).is_none() {
+                assert_eq!(reason, None, "{}", metric.name());
+            } else {
+                assert_eq!(reason, crate::fit::gpu_fit_metric_error(metric));
+            }
+        }
+        let cfg = Config {
+            metric: Metric::Squared,
+            fit_strategy: FitStrategy::Gpu,
+            fit_iters: 0,
+            ..Config::default()
+        };
+        assert_eq!(
+            gpu_fit_off_reason(&cfg).as_deref(),
+            Some("--fit-iters 0: nothing to fit")
+        );
+        let cfg = Config { fit_strategy: FitStrategy::Exact, ..cfg };
+        assert_eq!(gpu_fit_off_reason(&cfg), None);
     }
 
     /// #256: the fit stage leaves the eval window first, then prep, then
