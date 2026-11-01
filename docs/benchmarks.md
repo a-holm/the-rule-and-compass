@@ -365,7 +365,7 @@ Each command ends its JSON report with a `ledger` object: the same keys as `gpu.
 | `walkforward` | `.rcsb` row-group reads or the CSV table load | `pnl_s`: scoring, windows, controls, `--batch-pnl` | the `--batch-pnl` device tile seconds per seam (`host_envelope`) |
 | `ladder` | panel, windows and fold load | `pnl_s`: the whole ladder | none |
 
-`host_other_s` is the rest of the wall. `walkforward` keeps the ledger outside the reproduction hash (`report_sha256` hashes the report without it). `--device-pnl` does not time its device reduction, so it adds no interval.
+`host_other_s` is the rest of the wall. `walkforward` keeps the ledger outside the reproduction hash (`report_sha256` hashes the report without it). `--device-pnl` books each CUDA reduction call as a `pnl` device interval on the `host_envelope` basis (host wall of the call); the canonical CPU backend adds none.
 
 `gpu.eval_kernel_duty` (formerly `gpu.duty_cycle`) is the evaluator-window kernel
 fraction (scope `evaluator_window`, window `gpu.eval_window_s`). It is not the run-level number; use

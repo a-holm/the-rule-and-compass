@@ -707,3 +707,20 @@ fn batch_pnl_books_the_pnl_stage_and_device_busy_inside_the_wall() {
         assert_eq!(l.busy, 0.0);
     }
 }
+
+#[test]
+fn device_pnl_books_a_device_interval_inside_the_wall() {
+    let table = report_table();
+    let spec = EvalSpec {
+        device_pnl: true,
+        ..report_spec()
+    };
+    let r = walkforward::run_table_with(&table, &spec, "test", &ProtocolOptions::default()).unwrap();
+    let l = ledger::check(&r.json_with_ledger(None), "walkforward", &[]);
+    let backend = r.device_pnl.as_ref().expect("a --device-pnl summary").backend.clone();
+    if backend == "cuda" {
+        assert!(l.busy > 0.0, "the device reduction ran but the ledger has no device interval");
+    } else {
+        assert_eq!(l.busy, 0.0, "no device ran on backend {backend}");
+    }
+}
