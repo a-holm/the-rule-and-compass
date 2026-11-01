@@ -355,6 +355,18 @@ with one wall clock and exclusive main-thread stages:
 | `eval_fallback.programs/seconds` | evaluator CPU-fallback work |
 | `quality_per_gpu_hour` | decades per run wall-hour, with like-unit errors and full provenance |
 
+### Phase ledger of `enrich`, `walkforward` and `ladder` (#284)
+
+Each command ends its JSON report with a `ledger` object: the same keys as `gpu.ledger` (`wall_s`, `stages.*_s`, `stage_sum_s`, `unaccounted_s`, `closure`, `device_busy_s`, `device_busy_sum_s`, `device_overlap_s`, `device_intervals`, `device_interval_basis`, `duty_run`) plus `command` and the command's own `structural_zero_stages`. The wall clock is the command's own run wall. Stages are exclusive and sum to no more than `wall_s`.
+
+| command | `io_s` | `features_s` / `pnl_s` | device intervals |
+|---|---|---|---|
+| `enrich` | input read, feature reads, GPU output staging writes, output write | `features_s`: context, GPU, CPU and cross-section producer work | the kernel seconds of each device region, placed in that region's host window (`host_envelope`) |
+| `walkforward` | `.rcsb` row-group reads or the CSV table load | `pnl_s`: scoring, windows, controls, `--batch-pnl` | the `--batch-pnl` device tile seconds per seam (`host_envelope`) |
+| `ladder` | panel, windows and fold load | `pnl_s`: the whole ladder | none |
+
+`host_other_s` is the rest of the wall. `walkforward` keeps the ledger outside the reproduction hash (`report_sha256` hashes the report without it). `--device-pnl` does not time its device reduction, so it adds no interval.
+
 `gpu.eval_kernel_duty` (formerly `gpu.duty_cycle`) is the evaluator-window kernel
 fraction (scope `evaluator_window`, window `gpu.eval_window_s`). It is not the run-level number; use
 `gpu.ledger.duty_run` for “how busy was the device during the run?”. A GPU run
