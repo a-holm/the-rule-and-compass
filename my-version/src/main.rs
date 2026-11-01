@@ -169,13 +169,26 @@ INPUT:
                              member's exact CPU f64 predictions as a long/flat
                              book (positions 0 or 1, never short) with cost per
                              side on |delta p| including the final exit; the
-                             fit and the archive still use --metric. Needs a
+                             fit and, unless --fitness pnl, the archive use --metric. Needs a
                              temporal split with --validation-frac, a
                              forward_return --target-spec, and a cost (--cost-bps
                              or the spec cost_bps).
                              Rows of one group closer than the label horizon overlap
                              and are refused (exit 2); use long:<h>,stride=<h>
                              The test block is read once, for the winner only
+  --fitness metric|pnl      what ranks candidates in the search (default metric:
+                             --metric on the label). pnl ranks every candidate
+                             by the exact long/flat net regret (B - net) / B on
+                             the training rows, B the hindsight bound at the
+                             same cost: lower is better, all-flat is 1.
+                             Constants are still fitted with --metric (--weight
+                             weights that fit only). Needs a trading --objective
+                             and its refusals. Exit 2 with --predictor-samples,
+                             --fit-samples, --implicit, --min-holding above 1,
+                             --max-position other than 1, multiple targets,
+                             overlapping rows, or no profitable path. Runs on
+                             the CPU (backend_reason names it); resume needs
+                             the same cost, threshold and rows
   --position long_only       the only position map (default). short is refused
   --allow-short              refused: there is no short P&L, borrow or funding
   --threshold <f>            long when the prediction is strictly above <f>
@@ -961,6 +974,20 @@ fn parse_trade_number(flag: &str, text: &str) -> f64 {
 fn trading_usage(msg: &str) -> ! {
     eprintln!("error: {}", msg);
     std::process::exit(EXIT_USAGE);
+}
+
+/// #480: the `"fitness"` member of a Pareto entry, in exact CPU `f64` on the
+/// training rows. `train_net` is the excess net over cash.
+fn fitness_member_json(book: &rcsr::trading::FitnessBook, pred: &[f64]) -> String {
+    let t = book.totals(pred);
+    format!(
+        ",\"fitness\":{{\"train_regret\":{},\"train_net\":{},\"train_flips\":{},\"train_exits\":{},\"train_exposure\":{}}}",
+        jnum(book.regret_of(&t)),
+        jnum(book.net_of(&t)),
+        t.flips,
+        t.exits,
+        jnum(t.long_rows as f64 / book.len().max(1) as f64)
+    )
 }
 
 /// JSON number, with non-finite values rendered as `null` (valid JSON).
@@ -2007,6 +2034,9 @@ struct Row {
     /// #257: gate members of the pareto JSON (leading comma); empty when the
     /// gates did not run.
     gate_json: String,
+    /// #480: the `"fitness"` member of the pareto JSON (leading comma); empty
+    /// without `--fitness pnl`.
+    fitness_json: String,
 }
 
 /// Cross-validation summary (issue #19).
@@ -2137,6 +2167,8 @@ fn main() {
     let mut select_by_arg: Option<String> = None;
     // #263: exact long/flat P&L objective for finalist selection.
     let mut objective_arg: Option<String> = None;
+    // #480: what ranks candidates in the search.
+    let mut fitness_arg: Option<String> = None;
     let mut trading_flags: Vec<&'static str> = Vec::new();
     let mut position_arg: Option<String> = None;
     let mut allow_short = false;
@@ -2423,6 +2455,7 @@ fn main() {
             "--validation-frac" => validation_frac = val!().parse().unwrap_or(validation_frac),
             "--select-by" => select_by_arg = Some(val!()),
             "--objective" => objective_arg = Some(val!()),
+            "--fitness" => fitness_arg = Some(val!()),
             "--position" => {
                 trading_flags.push("--position");
                 position_arg = Some(val!());
@@ -4421,6 +4454,11 @@ fn main() {
             trading_usage(&format!("{} needs --objective pnl, sharpe or log_growth", flag));
         }
     }
+    let fitness_pnl = match fitness_arg.as_deref() {
+        None | Some("metric") => false,
+        Some("pnl") => true,
+        Some(other) => trading_usage(&format!("--fitness must be metric or pnl, got '{}'", other)),
+    };
     let mut trading_spec: Option<rcsr::trading::TradingSpec> = None;
     let mut trading_cols: Option<data::TradingColumns> = None;
     let mut trading_cost: Option<target::CostDecl> = None;
@@ -4491,7 +4529,7 @@ fn main() {
             return_column: ts.return_column.clone(),
             log_returns: ts.return_units == "log",
             funding_column: trade_funding.clone(),
-            train: false,
+            train: fitness_pnl, // #480
         });
         let tspec = rcsr::trading::TradingSpec {
             cost_bps: cost,
@@ -4508,6 +4546,30 @@ fn main() {
             trading_usage(&e);
         }
         trading_spec = Some(tspec);
+    }
+    if fitness_pnl {
+        // #480: every refusal names its flag; scoring needs every training row, in order.
+        if !objective.is_trading() {
+            trading_usage("--fitness pnl needs --objective pnl, sharpe or log_growth");
+        }
+        if multi_output {
+            trading_usage("--fitness pnl is not supported with multiple targets (--target y1,y2)");
+        }
+        if cfg.predictor_samples.is_some() {
+            trading_usage("--fitness pnl is not supported with --predictor-samples: the long/flat book needs every training row in order");
+        }
+        if cfg.fit_samples > 0 {
+            trading_usage("--fitness pnl is not supported with --fit-samples: the long/flat book scores every training row (use --fit-rows to fit on fewer rows)");
+        }
+        if implicit_mode || cfg.metric.is_implicit() {
+            trading_usage("--fitness pnl is not supported with --implicit or an implicit metric");
+        }
+        if trade_min_holding > 1 {
+            trading_usage("--fitness pnl is not supported with --min-holding > 1: the fitness is the plain threshold rule");
+        }
+        if trade_max_position != 1.0 {
+            trading_usage("--fitness pnl needs --max-position 1: the fitness is the unit long/flat book");
+        }
     }
 
     let declared_lockbox = rcsr::lockbox::resolve_declared(lockbox_arg.as_deref(), &data_path).unwrap_or_else(|e| {
@@ -4534,7 +4596,7 @@ fn main() {
         declared_lockbox,
         purge_seconds: target_resolved.as_ref().map(|r| r.spec.required_purge_seconds()),
         trading: trading_cols.clone(),
-        canonical_train_order: false,
+        canonical_train_order: fitness_pnl, // #480
         scale_column: target_resolved
             .as_ref()
             .and_then(|r| r.spec.scale_column())
@@ -4657,6 +4719,43 @@ fn main() {
                 }
                 Err(e) => trading_usage(&e),
             }
+        }
+    }
+    // #480: the exact long/flat fitness book on the canonical training rows.
+    let fitness_book: Option<std::sync::Arc<rcsr::trading::FitnessBook>> = if fitness_pnl {
+        let slice = prepared.trading.as_ref().and_then(|t| t.train.as_ref());
+        let (Some(tspec), Some(slice)) = (trading_spec.as_ref(), slice) else {
+            trading_usage("--fitness pnl found no training trading rows");
+        };
+        match rcsr::trading::FitnessBook::new(slice, tspec, target_horizon) {
+            Ok(book) if book.len() == prepared.train.len() => Some(std::sync::Arc::new(book)),
+            Ok(book) => trading_usage(&format!(
+                "--fitness pnl: {} training trading rows for {} training rows",
+                book.len(),
+                prepared.train.len()
+            )),
+            Err(e) => trading_usage(&format!("--fitness pnl: {}", e)),
+        }
+    } else {
+        None
+    };
+    if let Some(book) = &fitness_book {
+        cfg.fitness = search::Fitness::LongPnl(book.clone());
+        if weight_name.is_some() && !quiet {
+            eprintln!("# note: --weight weights the constant fit (--metric) only; the long/flat regret counts every row once");
+        }
+    } else if !cfg.fitness.is_metric() {
+        trading_usage(
+            "the checkpoint was written with --fitness pnl: pass --fitness pnl and the same objective, cost and split flags",
+        );
+    }
+    if let Some(cp) = &resume_checkpoint {
+        if cp.config.fitness.key() != cfg.fitness.key() {
+            trading_usage(&format!(
+                "--resume conflicts with the saved search settings: fitness {} (saved {}); the book depends on the cost, threshold, min-trades and training rows",
+                cfg.fitness.key(),
+                cp.config.fitness.key()
+            ));
         }
     }
     // #254: the zero-parameter rung and, under the override, the proxy table.
@@ -5082,12 +5181,14 @@ fn main() {
     // Streaming progress: ndjson goes to stdout, other formats to stderr.
     if progress {
         let to_stdout = format == Format::Ndjson;
+        let pnl_kind = if fitness_book.is_some() { ",\"best_error_kind\":\"long_pnl_regret\"" } else { "" };
         cfg.progress = Some(std::sync::Arc::new(move |p: search::Progress| {
             let line = format!(
-                "{{\"event\":\"progress\",\"generation\":{},\"total\":{},\"best_error\":{},\"pareto_members\":{},\"convergence\":{}}}",
+                "{{\"event\":\"progress\",\"generation\":{},\"total\":{},\"best_error\":{}{},\"pareto_members\":{},\"convergence\":{}}}",
                 p.generation,
                 p.total_generations,
                 jnum(p.best_error),
+                pnl_kind,
                 p.pareto_members,
                 // #18: confidence, stability, maturity, percent_converged.
                 p.convergence.json()
@@ -5844,6 +5945,10 @@ fn main() {
                 stability: None,
                 expression: expr::to_string(&den, &vars),
                 gate_json: String::new(),
+                fitness_json: fitness_book
+                    .as_ref()
+                    .map(|b| fitness_member_json(b, &pred))
+                    .unwrap_or_default(),
             }
         })
         .collect();
@@ -5936,6 +6041,7 @@ fn main() {
                 validation_error: top.validation_error,
                 test_error: top.test_error,
                 validation_value: top.objective_value,
+                search_fitness: fitness_book.as_ref().map(|_| "long_pnl_regret"),
                 validation: match &prepared.validation {
                     Some(v) => book(v, split.and_then(|t| t.validation.as_ref())),
                     None => Err("no validation slice".to_string()),
@@ -6685,7 +6791,7 @@ fn main() {
                     } else {
                         String::new()
                     };
-                    let dimensions = format!("{}{}", dimensions, r.gate_json);
+                    let dimensions = format!("{}{}{}", dimensions, r.gate_json, r.fitness_json);
                     // Only a run that actually has a selection criterion gains
                     // the new fields; an ordinary run stays byte-identical.
                     let selection_json = if select_by.is_some() {
@@ -6943,6 +7049,23 @@ fn main() {
                     .unwrap_or_else(|| "null".to_string()),
                 cfg.threads, // #463
             );
+            let backend_json = format!(
+                "{}{}",
+                backend_json,
+                match &fitness_book {
+                    Some(b) => format!(
+                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\"}},",
+                        b.len(),
+                        b.groups(),
+                        jnum(b.side()),
+                        jnum(b.threshold()),
+                        jnum(b.bound()),
+                        b.min_trades(),
+                        b.hash()
+                    ),
+                    None => "\"search_fitness\":{\"kind\":\"metric\"},".to_string(),
+                }
+            );
             let backend_json = match &objective_report {
                 Some(rep) => format!(
                     "{}\"objective\":{},",
@@ -7064,7 +7187,7 @@ fn main() {
                 } else {
                     String::new()
                 };
-                let dimensions = format!("{}{}", dimensions, r.gate_json);
+                let dimensions = format!("{}{}{}", dimensions, r.gate_json, r.fitness_json);
                 let selection_json = if select_by.is_some() {
                     format!(
                         "\"archive_rank\":{},\"validation_error\":{},",

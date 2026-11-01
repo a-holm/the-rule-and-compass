@@ -406,6 +406,8 @@ A `.rcsb` store read with `--vars` and `--time` is projected to the columns the 
 
 Finalist selection with `--objective` scores every Pareto member this way on the validation slice only. The winner has the lowest objective value (`-net P&L`, `-Sharpe` or `-log growth`; ties keep the archive order, so the smaller expression wins). Candidates below `--min-trades` or with a non-finite value are unusable. The test block is scored once, for the winner.
 
+With `--fitness pnl` the search ranks every candidate by the regret `(B - net) / B` of this same book on the training rows, `B` being the hindsight DP bound (`trading_gpu::dp_bound`) at the same cost. `trading::FitnessBook` prices the plain threshold rule only (no `tau`, no band, `--min-holding 1`, `--max-position 1`): `net` is the excess net over cash, `sum p_i * (r_i - funding_i - cash) - c_side * (flips + exits)`, which equals `PathStats::net_pnl - cash * rows`. See section 3.5 of [`docs/optimisation.md`](optimisation.md).
+
 ## One book from search to evaluation (#487)
 
 The search objective, `rcsr walkforward`, `rcsr ablation score` and `rcsr ladder` price one long/flat book with one cost, one return unit and one position rule. The declarations live in the target spec (`<data>.targets.json`) that `rcsr enrich --label long:<h>,fee=<bp>` writes, and in the `run.json` of the search.
