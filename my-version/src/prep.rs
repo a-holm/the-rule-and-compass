@@ -2210,7 +2210,7 @@ pub fn run(args: &[String]) -> ! {
         Err(e) => fail(&e),
     };
     if let Some(lt) = &declared {
-        build.manifest = crate::lockbox::insert_declaration(&build.manifest, lt, "rcsr prep --locked-test");
+        build.manifest = crate::lockbox::insert_declaration(&build.manifest, lt, None, "rcsr prep --locked-test");
     }
     for line in build.audit.text_lines() {
         println!("{}", line);

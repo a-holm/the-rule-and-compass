@@ -112,14 +112,15 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
         }
     }
     let declared = crate::lockbox::output_declaration(&opts.out, Some(&opts.target), opts.locked_test).map_err(|e| e.message)?;
-    let family_declared = crate::lockbox::stored(&opts.family).map_err(|e| e.message)?;
-    if let Some((file, l)) = family_declared {
-        if declared != Some(l) {
+    let also = crate::lockbox::inherited_also(&opts.target, declared.as_ref())?;
+    // The target's declaration wins and is kept. A family store with no declaration is accepted.
+    if let Some(s) = crate::lockbox::stored_all(&opts.family).map_err(|e| e.message)? {
+        if declared != Some(s.range) || also != s.also {
             return Err(format!(
                 "family store {} declares the locked test {} ({}), the target {} declares {}",
                 opts.family,
-                crate::lockbox::span(&l),
-                file,
+                s.describe(),
+                s.file,
                 opts.target,
                 declared.as_ref().map_or("none".to_string(), crate::lockbox::span)
             ));
@@ -185,7 +186,7 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
         let _ = std::fs::remove_file(f);
     }
     let output_sha256 = result?;
-    let schema = registry::write_schema_declared(&opts.out, &opts.panel_version, declared.as_ref())?;
+    let schema = registry::write_schema_declared(&opts.out, &opts.panel_version, declared.as_ref(), also.as_ref())?;
     crate::lockbox::finish_output(&opts.out, declared.as_ref(), &["schema.json"]).map_err(|e| e.message)?;
     let after = manifest::sha256_file(&opts.target)?;
     Ok(AppendReport {

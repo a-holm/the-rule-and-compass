@@ -321,6 +321,13 @@ impl Lockbox {
         )
     }
 
+    /// Read a `"locked_test_also":{...}` object (a second guarded range).
+    pub fn also_from_declaration(text: &str) -> Option<Lockbox> {
+        let obj = crate::manifest::object(text, "locked_test_also")?;
+        let (start, end) = (int_field(obj, "start")?, int_field(obj, "end")?);
+        (end > start).then_some(Lockbox { start, end })
+    }
+
     /// Read a `"locked_test":{...}` object from sidecar or manifest text.
     pub fn from_declaration(text: &str) -> Option<Lockbox> {
         let obj = crate::manifest::object(text, "locked_test")?;
@@ -415,6 +422,14 @@ impl Resolved {
             }
             (Some(_), Some(d)) => Some(d),
             (r, _) => r,
+        }
+    }
+
+    /// The guarded range `sidecar_range` leaves out when the two are disjoint.
+    pub fn sidecar_also(&self) -> Option<Lockbox> {
+        match (self.range, self.also) {
+            (Some(f), Some(d)) if !(f.start <= d.end && f.end >= d.start) => Some(f),
+            _ => None,
         }
     }
 
@@ -537,23 +552,55 @@ pub fn declarations(data_path: &str) -> Result<Vec<(String, Lockbox)>, ResolveEr
     Ok(out)
 }
 
-/// The one range every declaration of `data_path` agrees on, with the first
-/// file that declares it. Two files that disagree are an input error.
-pub fn stored(data_path: &str) -> Result<Option<(String, Lockbox)>, ResolveError> {
+/// The ranges every declaration of `data_path` agrees on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stored {
+    /// The first file that declares them.
+    pub file: String,
+    pub range: Lockbox,
+    /// A second guarded range (`locked_test_also`).
+    pub also: Option<Lockbox>,
+}
+
+impl Stored {
+    pub fn describe(&self) -> String {
+        match &self.also {
+            Some(a) => format!("{} + {}", span(&self.range), span(a)),
+            None => span(&self.range),
+        }
+    }
+}
+
+/// The ranges every declaration of `data_path` agrees on. Two files that
+/// disagree are an input error.
+pub fn stored_all(data_path: &str) -> Result<Option<Stored>, ResolveError> {
     let declared_in = declarations(data_path)?;
-    if let Some((first_file, first)) = declared_in.first() {
-        if let Some((other_file, other)) = declared_in.iter().find(|(_, l)| l != first) {
+    let with_also: Vec<Stored> = declared_in
+        .into_iter()
+        .map(|(file, range)| {
+            let also = std::fs::read_to_string(&file).ok().and_then(|t| Lockbox::also_from_declaration(&t));
+            Stored { file, range, also }
+        })
+        .collect();
+    if let Some(first) = with_also.first() {
+        if let Some(other) = with_also.iter().find(|s| s.range != first.range || s.also != first.also) {
             return Err(input(format!(
                 "{}: conflicting locked-test declarations: {} {}, {} {}; remove the stale file",
                 data_path,
-                first_file,
-                span(first),
-                other_file,
-                span(other)
+                first.file,
+                first.describe(),
+                other.file,
+                other.describe()
             )));
         }
     }
-    Ok(declared_in.into_iter().next())
+    Ok(with_also.into_iter().next())
+}
+
+/// The primary range every declaration of `data_path` agrees on, with the first
+/// file that declares it.
+pub fn stored(data_path: &str) -> Result<Option<(String, Lockbox)>, ResolveError> {
+    Ok(stored_all(data_path)?.map(|s| (s.file, s.range)))
 }
 
 /// The protocol default locked test, 2025-07-01..2026-07-01.
@@ -576,20 +623,21 @@ pub fn resolve(flag: Option<&str>, data_path: &str) -> Result<Resolved, ResolveE
         Some(s) if s.trim().eq_ignore_ascii_case("none") => Some(None),
         Some(s) => Some(Some(Lockbox::parse(s).map_err(|e| usage(format!("--lockbox: {}", e)))?)),
     };
-    let stored = stored(data_path)?;
+    let stored = stored_all(data_path)?;
     let declared_in = declarations(data_path)?;
+    let covers = |f: &Lockbox, l: &Lockbox| f.start <= l.start && f.end >= l.end;
     match (explicit, stored) {
-        (Some(None), Some((file, l))) => Err(usage(format!(
+        (Some(None), Some(s)) => Err(usage(format!(
             "--lockbox none is refused: {} declares the locked test {}",
-            file,
-            span(&l)
+            s.file,
+            s.describe()
         ))),
         (Some(None), None) => Ok(Resolved { range: None, source: Source::None, also: None, declared_in }),
-        (Some(Some(f)), Some((file, l))) if !(f.start <= l.start && f.end >= l.end) => Err(usage(format!(
+        (Some(Some(f)), Some(s)) if !(covers(&f, &s.range) && s.also.map_or(true, |a| covers(&f, &a))) => Err(usage(format!(
             "--lockbox {} does not cover the declared locked test {} ({})",
             span(&f),
-            span(&l),
-            file
+            s.describe(),
+            s.file
         ))),
         (Some(Some(f)), Some(_)) => Ok(Resolved { range: Some(f), source: Source::Flag, also: None, declared_in }),
         (Some(Some(f)), None) => {
@@ -601,7 +649,7 @@ pub fn resolve(flag: Option<&str>, data_path: &str) -> Result<Resolved, ResolveE
             };
             Ok(Resolved { range: Some(f), source, also, declared_in })
         }
-        (None, Some((_, l))) => Ok(Resolved { range: Some(l), source: Source::Store, also: None, declared_in }),
+        (None, Some(s)) => Ok(Resolved { range: Some(s.range), source: Source::Store, also: s.also, declared_in }),
         (None, None) => Ok(Resolved {
             range: Some(protocol_default()),
             source: Source::ProtocolDefault,
@@ -614,6 +662,11 @@ pub fn resolve(flag: Option<&str>, data_path: &str) -> Result<Resolved, ResolveE
 /// Write the CSV sidecar for a declaration. It records the bytes and SHA-256 of
 /// `data_path`, so the declaration cannot outlive a rewrite of the file.
 pub fn write_sidecar(data_path: &str, lockbox: &Lockbox, source: &str) -> Result<(), String> {
+    write_sidecar_with(data_path, lockbox, source, "")
+}
+
+/// `write_sidecar` with extra top-level JSON members (each starting with a comma).
+pub fn write_sidecar_with(data_path: &str, lockbox: &Lockbox, source: &str, extra: &str) -> Result<(), String> {
     let p = sidecar_path(data_path);
     let binding = match std::fs::metadata(data_path) {
         Ok(meta) => {
@@ -628,7 +681,7 @@ pub fn write_sidecar(data_path: &str, lockbox: &Lockbox, source: &str) -> Result
     };
     crate::atomic::write_text_atomic(
         &p,
-        &format!("{{\"locked_test\":{}{}}}\n", lockbox.declaration_json(source), binding),
+        &format!("{{\"locked_test\":{}{}{}}}\n", lockbox.declaration_json(source), extra, binding),
     )
     .map_err(|e| format!("{}: {}", p, e))
 }
@@ -742,11 +795,24 @@ pub fn finish_output(out: &str, declared: Option<&Lockbox>, wrote: &[&str]) -> R
     Ok(())
 }
 
-/// Put a `"locked_test"` object first in a JSON object text.
-pub fn insert_declaration(text: &str, lockbox: &Lockbox, source: &str) -> String {
+/// The second range the input declares, when `declared` is the range it declares.
+pub fn inherited_also(input: &str, declared: Option<&Lockbox>) -> Result<Option<Lockbox>, String> {
+    Ok(stored_all(input)
+        .map_err(|e| e.message)?
+        .filter(|s| Some(&s.range) == declared)
+        .and_then(|s| s.also))
+}
+
+/// The `,"locked_test_also":{...}` member for a second guarded range, or nothing.
+pub fn also_json(also: Option<&Lockbox>, source: &str) -> String {
+    also.map(|a| format!(",\"locked_test_also\":{}", a.declaration_json(source))).unwrap_or_default()
+}
+
+/// Put a `"locked_test"` object (and a second range) first in a JSON object text.
+pub fn insert_declaration(text: &str, lockbox: &Lockbox, also: Option<&Lockbox>, source: &str) -> String {
     let at = text.find('{').map_or(0, |i| i + 1);
     let mut out = text.to_string();
-    out.insert_str(at, &format!("\"locked_test\":{},", lockbox.declaration_json(source)));
+    out.insert_str(at, &format!("\"locked_test\":{}{},", lockbox.declaration_json(source), also_json(also, source)));
     out
 }
 

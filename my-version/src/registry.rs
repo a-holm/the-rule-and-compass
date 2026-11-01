@@ -324,9 +324,16 @@ pub fn schema_json(
     rows: usize,
     panel_version: &str,
     locked_test: Option<&crate::lockbox::Lockbox>,
+    also: Option<&crate::lockbox::Lockbox>,
 ) -> String {
     let locked = locked_test
-        .map(|l| format!("\"locked_test\":{},", l.declaration_json("rcsr panel build --locked-test")))
+        .map(|l| {
+            format!(
+                "\"locked_test\":{}{},",
+                l.declaration_json("rcsr panel build --locked-test"),
+                crate::lockbox::also_json(also, "rcsr panel build --locked-test")
+            )
+        })
         .unwrap_or_default();
     let mut s = format!(
         "{{\"panel_version\":{},\"schema_version\":{},\"feature_registry_version\":{},\
@@ -371,8 +378,8 @@ pub fn schema_json(
 /// Hash every column of `store_path` and write `<store_path>.schema.json`,
 /// keeping the locked test the store already declares.
 pub fn write_schema(store_path: &str, panel_version: &str) -> Result<String, String> {
-    let kept = crate::lockbox::stored(store_path).map_err(|e| e.message)?;
-    write_schema_declared(store_path, panel_version, kept.as_ref().map(|(_, l)| l))
+    let kept = crate::lockbox::stored_all(store_path).map_err(|e| e.message)?;
+    write_schema_declared(store_path, panel_version, kept.as_ref().map(|s| &s.range), kept.as_ref().and_then(|s| s.also.as_ref()))
 }
 
 /// As [`write_schema`], with an explicit locked test declaration (or none).
@@ -380,10 +387,11 @@ pub fn write_schema_declared(
     store_path: &str,
     panel_version: &str,
     locked_test: Option<&crate::lockbox::Lockbox>,
+    also: Option<&crate::lockbox::Lockbox>,
 ) -> Result<String, String> {
     let store = FileStore::open(store_path)?;
     let columns = build_schema(&store)?;
-    let text = schema_json(&columns, store.n_rows(), panel_version, locked_test);
+    let text = schema_json(&columns, store.n_rows(), panel_version, locked_test, also);
     let out = schema_path(store_path);
     std::fs::write(&out, text).map_err(|e| format!("{}: {}", out, e))?;
     Ok(out)

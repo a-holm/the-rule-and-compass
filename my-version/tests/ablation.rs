@@ -226,7 +226,7 @@ fn prepare_writes_placebo_and_permuted_columns_next_to_the_real_ones() {
         }
     }
     let table = data::parse_table(&csv).unwrap();
-    let out = ablation::prepare_csv(&ablation::PrepareInput { table: &table, def: &d, time: "ts", group: "sym", keep: &["y".to_string()], seed: 3 }).unwrap();
+    let out = ablation::prepare_csv(&ablation::PrepareInput { table: &table, def: &d, time: "ts", group: "sym", keep: &["y".to_string()], seed: 3, locked: None }).unwrap();
     let prepared = data::parse_table(&out).unwrap();
     assert_eq!(prepared.names, vec!["ts", "sym", "y", "b", "f1", "f2", "p1", "placebo_1", "placebo_2", "perm_f1", "perm_f2"]);
     assert_eq!(prepared.len(), 600);
@@ -235,6 +235,99 @@ fn prepare_writes_placebo_and_permuted_columns_next_to_the_real_ones() {
     let p1 = prepared.col(prepared.index_of("placebo_1").unwrap());
     let pat = prepared.col(prepared.index_of("p1").unwrap());
     assert_eq!(p1.iter().sum::<f64>(), pat.iter().sum::<f64>(), "placebo_1 copies the prevalence of its template");
+}
+
+const NULL_DEF: &str = r#"{"schema":"rcsr-ablation/1","b0":["b"],"groups":{"fam":["f1","f2"],"pat":["p1"]},
+"placebo_template_group":"pat","generation_budget":10,
+"arms":[{"name":"A0","add":[]},{"name":"A1","add":["fam","pat"],"placebo":2},{"name":"A5","add":[],"permute":["fam"]}],
+"rule":{"families":[{"name":"fam","treatment":"A1","controls":["A0"],"null_arm":"A5","null_control":"A0"}]}}"#;
+
+/// Two symbols, 300 rows each; every value from row `flip_from` on is redrawn
+/// when `flipped`, so two stores differ only from that row on.
+fn two_stores_csv(flipped: bool, flip_from: i64) -> String {
+    let mut csv = String::from("ts,sym,y,b,f1,f2,p1\n");
+    for (si, s) in ["a", "b"].iter().enumerate() {
+        let mut rng = Mt::new(10 + si as u32);
+        let mut alt = Mt::new(900 + si as u32);
+        for k in 0..300i64 {
+            let v: Vec<f64> = (0..4).map(|_| gauss(&mut rng)).collect();
+            let w: Vec<f64> = (0..4).map(|_| gauss(&mut alt)).collect();
+            let use_alt = flipped && k >= flip_from;
+            let u = if use_alt { &w } else { &v };
+            let p = if use_alt { (k % 3 == 0) as i32 } else { (k % 7 == 0) as i32 };
+            csv.push_str(&format!("{},{},{},{},{},{},{}\n", 1_000_000 + k * 60, s, u[0], u[1], u[2], u[3], p));
+        }
+    }
+    csv
+}
+
+fn prepare_rows(csv: &str, locked: Option<rcsr::lockbox::Lockbox>) -> (Vec<String>, [usize; 3]) {
+    let d = ablation::parse_definition(NULL_DEF).unwrap();
+    let table = data::parse_table(csv).unwrap();
+    let (out, seg) = ablation::prepare_csv_segments(&ablation::PrepareInput { table: &table, def: &d, time: "ts", group: "sym", keep: &["y".to_string()], seed: 3, locked }).unwrap();
+    (out.lines().map(|l| l.to_string()).collect(), seg)
+}
+
+#[test]
+fn null_columns_on_development_rows_ignore_the_locked_range() {
+    let start = 1_000_000 + 200 * 60;
+    let lb = rcsr::lockbox::Lockbox { start, end: start + 100 * 60 };
+    let (a, seg_a) = prepare_rows(&two_stores_csv(false, 200), Some(lb));
+    let (b, seg_b) = prepare_rows(&two_stores_csv(true, 200), Some(lb));
+    assert_eq!(a[0], b[0]);
+    let dev = |rows: &[String]| rows[1..].iter().filter(|l| l.split(',').next().unwrap().parse::<i64>().unwrap() < start).cloned().collect::<Vec<_>>();
+    assert_eq!(dev(&a).len(), 400);
+    assert_eq!(dev(&a), dev(&b), "development rows, including placebo_* and perm_*, are byte-identical");
+    assert_eq!(seg_a, [400, 200, 0]);
+    assert_eq!(seg_a, seg_b);
+    assert_ne!(a, b, "the locked rows differ");
+
+    let (c, _) = prepare_rows(&two_stores_csv(false, 200), None);
+    let (d, _) = prepare_rows(&two_stores_csv(true, 200), None);
+    assert_ne!(dev(&c), dev(&d), "without a declaration locked values still reach development rows");
+}
+
+#[test]
+fn a_range_outside_the_data_changes_nothing() {
+    let csv = two_stores_csv(false, 200);
+    let (plain, seg) = prepare_rows(&csv, None);
+    assert_eq!(seg, [600, 0, 0]);
+    let far = rcsr::lockbox::Lockbox { start: 2_000_000_000, end: 2_100_000_000 };
+    let (outside, seg) = prepare_rows(&csv, Some(far));
+    assert_eq!(seg, [600, 0, 0]);
+    assert_eq!(plain, outside);
+}
+
+#[test]
+fn permutation_stays_inside_its_segment() {
+    let n = 300usize;
+    let groups: Vec<u64> = (0..n).map(|i| (i / 150) as u64).collect();
+    let segs: Vec<u8> = (0..n).map(|i| if i % 150 < 100 { 0 } else { 1 }).collect();
+    let x: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let keys = ablation::segment_keys(&groups, &segs);
+    let out = ablation::permute_columns(&[&x], &keys, 16, 5);
+    for i in 0..n {
+        let seg_of = |v: f64| (groups[v as usize], segs[v as usize]);
+        assert_eq!(seg_of(out[0][i]), (groups[i], segs[i]), "row {} holds a value from another symbol or segment", i);
+    }
+    assert_ne!(out[0], x);
+    assert_eq!(ablation::segment_keys(&groups, &vec![0u8; n]), groups, "segment 0 keeps the plain group id");
+}
+
+#[test]
+fn placebo_marginal_stays_inside_its_segment() {
+    let n = 400usize;
+    let groups = vec![0u64; n];
+    let segs: Vec<u8> = (0..n).map(|i| if i < 250 { 0 } else { 1 }).collect();
+    let template: Vec<f64> = (0..n).map(|i| if i < 250 { (i % 5) as f64 } else { 100.0 + (i % 3) as f64 }).collect();
+    let out = ablation::placebo_column_segmented(&template, &groups, &segs, 7, 1);
+    assert!(out[..250].iter().all(|v| *v < 5.0), "segment 0 holds only its own template values");
+    assert!(out[250..].iter().all(|v| *v >= 100.0));
+    let mut a = out[..250].to_vec();
+    let mut t = template[..250].to_vec();
+    a.sort_by(|p, q| p.total_cmp(q));
+    t.sort_by(|p, q| p.total_cmp(q));
+    assert_eq!(a, t, "each segment keeps its exact marginal");
 }
 
 // --- scoring a run --------------------------------------------------------------
@@ -261,7 +354,7 @@ fn objective_csv(dir: &std::path::Path) -> String {
 fn write_target_spec(dir: &std::path::Path) -> String {
     let text = "{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{\"column\":\"y\",\"name\":\"raw_target\",\
 \"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"r\",\"return_units\":\"log\",\
-\"horizon_seconds\":3600,\"entry_offset_seconds\":900,\"delay_seconds\":0,\
+\"horizon_seconds\":900,\"entry_offset_seconds\":0,\"delay_seconds\":0,\
 \"entry_price\":\"next open\",\"exit_price\":\"close\",\"offset\":0.0,\
 \"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"log_return\",\
 \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}]}";
@@ -322,7 +415,7 @@ fn a_real_run_is_scored_on_the_folds_without_the_test_block_in_selection() {
             iso(0),
             iso(280),
             iso(200),
-            iso(290),
+            iso(300),
             iso(400)
         ),
     )
@@ -345,7 +438,7 @@ fn a_real_run_is_scored_on_the_folds_without_the_test_block_in_selection() {
     assert_eq!(r.thresholds, vec![0.6, 0.7, 0.8]);
     assert_eq!(r.net_by_fold_threshold.len(), 1);
     assert_eq!(r.net_by_fold_threshold[0].len(), 3);
-    assert_eq!(r.net_period.len(), 110);
+    assert_eq!(r.net_period.len(), 100);
     assert!(r.return_mse.is_finite());
     assert!((r.net_by_fold_threshold[0][1] - r.net_period.iter().sum::<f64>()).abs() < 1e-12, "headline threshold is the series");
     assert!(r.net_period.iter().sum::<f64>() > 0.0, "the long book wins on a signal-driven return");
@@ -670,7 +763,7 @@ fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
             iso(0),
             iso(280),
             iso(200),
-            iso(290),
+            iso(300),
             iso(400)
         ),
     )
@@ -721,9 +814,38 @@ fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
         .unwrap();
     assert_eq!(prep.status.code(), Some(0), "{}", String::from_utf8_lossy(&prep.stderr));
     assert_eq!(lockbox::stored(prepared.to_str().unwrap()).unwrap().map(|(_, l)| l), Some(lb));
+    let side = std::fs::read_to_string(lockbox::sidecar_path(prepared.to_str().unwrap())).unwrap();
+    assert!(side.contains("\"segments\":{\"before\":600,\"locked\":200,\"after\":0}"), "{}", side);
     let found = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args([
             "--data", prepared.to_str().unwrap(), "--target", "y", "--vars", "b,f1,f2", "--time", "ts", "--split", "temporal", "--cpu",
+            "--no-dev-log", "--seed", "3", "--generations", "3", "--pop", "16", "--quiet",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(found.status.code(), Some(3), "{}", String::from_utf8_lossy(&found.stderr));
+    assert!(String::from_utf8_lossy(&found.stderr).contains("declared locked test"));
+
+    // undeclared data and a flag range disjoint from the protocol default: the output declares both
+    let raw2 = dir.join("raw2.csv");
+    std::fs::copy(&raw, &raw2).unwrap();
+    let prepared2 = dir.join("prepared2.csv");
+    let range = format!("{},{}", lb.start, lb.end);
+    let prep2 = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "ablation", "prepare", "--definition", def.to_str().unwrap(), "--data", raw2.to_str().unwrap(), "--time", "ts", "--group", "sym",
+            "--keep", "y", "--out", prepared2.to_str().unwrap(), "--lockbox", &range,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(prep2.status.code(), Some(0), "{}", String::from_utf8_lossy(&prep2.stderr));
+    let stored = lockbox::stored_all(prepared2.to_str().unwrap()).unwrap().unwrap();
+    assert_eq!((stored.range, stored.also), (lockbox::protocol_default(), Some(lb)));
+    let resolved = lockbox::resolve(None, prepared2.to_str().unwrap()).unwrap();
+    assert_eq!(resolved.ranges(), vec![lockbox::protocol_default(), lb]);
+    let found = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "--data", prepared2.to_str().unwrap(), "--target", "y", "--vars", "b,f1,f2", "--time", "ts", "--split", "temporal", "--cpu",
             "--no-dev-log", "--seed", "3", "--generations", "3", "--pop", "16", "--quiet",
         ])
         .output()

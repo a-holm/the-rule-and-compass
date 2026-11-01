@@ -1533,6 +1533,8 @@ pub struct Options {
     pub allow_overlap: bool,
     /// Locked test left out of the label report; the input's declaration applies when unset.
     pub locked_test: Option<crate::lockbox::Lockbox>,
+    /// A second guarded range next to `locked_test`.
+    pub locked_also: Option<crate::lockbox::Lockbox>,
     pub dry_run: bool,
     pub json: bool,
 }
@@ -1559,6 +1561,7 @@ impl Default for Options {
             allow_lockbox: false,
             allow_overlap: false,
             locked_test: None,
+            locked_also: None,
             dry_run: false,
             json: false,
         }
@@ -6939,12 +6942,17 @@ fn enrich_inner(
             temp.insert(n.clone(), TempColumn::create(work_dir, &n, sp.column_warmup(kind), true)?);
         }
     }
-    let label_range = match opts.locked_test {
-        Some(l) => Some(l),
-        None => crate::lockbox::stored(&opts.data).map_err(|e| e.message)?.map(|(_, l)| l),
+    let (label_range, label_also) = match opts.locked_test {
+        Some(l) => (Some(l), opts.locked_also),
+        None => match crate::lockbox::stored_all(&opts.data).map_err(|e| e.message)? {
+            Some(s) => (Some(s.range), s.also),
+            None => (None, None),
+        },
     };
-    let mut long_acc: Vec<crate::labels::LabelAccumulator> =
-        long_specs.iter().map(|sp| crate::labels::LabelAccumulator::with_range(sp, label_range)).collect();
+    let mut long_acc: Vec<crate::labels::LabelAccumulator> = long_specs
+        .iter()
+        .map(|sp| crate::labels::LabelAccumulator::with_range(sp, label_range).with_also(label_also))
+        .collect();
 
     // Cross-sectional source columns are computed even when the user did not
     // ask for them, then removed if they are not part of the output. The same
@@ -8280,6 +8288,7 @@ pub fn run(args: &[String]) -> ! {
         std::process::exit(e.exit);
     });
     opts.locked_test = resolved.sidecar_range();
+    opts.locked_also = resolved.sidecar_also();
     if let (Some(out), false) = (&opts.out, opts.dry_run) {
         let keep = opts.locked_test.map_or(crate::lockbox::Keep::Remove, crate::lockbox::Keep::Range);
         if let Err(e) = crate::lockbox::output_declaration(out, Some(&opts.data), keep) {
@@ -8297,9 +8306,10 @@ pub fn run(args: &[String]) -> ! {
             let mut text = report.json();
             if let Some(lb) = resolved.sidecar_range() {
                 let at = text.find('{').map_or(0, |i| i + 1);
+                let source = format!("rcsr enrich ({})", resolved.source.as_str());
                 text.insert_str(
                     at,
-                    &format!("\"locked_test\":{},", lb.declaration_json(&format!("rcsr enrich ({})", resolved.source.as_str()))),
+                    &format!("\"locked_test\":{}{},", lb.declaration_json(&source), crate::lockbox::also_json(resolved.sidecar_also().as_ref(), &source)),
                 );
             }
             let declared = resolved.sidecar_range();

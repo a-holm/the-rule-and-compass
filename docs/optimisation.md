@@ -1316,11 +1316,11 @@ stages; fitting and all f64 reporting stay on the CPU.
 
 `--objective pnl|sharpe|log_growth` separates the loss the fitter minimises from the value that picks the finalist.
 
-* The fitter, the archive and every dominance test keep `--metric`. A surrogate error and a P&L value are never compared in one dominance test.
+* The fitter, the archive and every dominance test keep `--metric` unless `--fitness pnl` is given (below). A surrogate error and a P&L value are never compared in one dominance test.
 * After the exact finalist refit, each Pareto member's prediction vector on the validation slice is scored by the exact CPU `f64` long/flat book of [`docs/walkforward.md`](walkforward.md). The member with the lowest objective value is reported first. There is no complexity penalty term: ties keep the archive order, which is complexity first.
 * `--gpu` may speed up the fit. It does not change the finalist, which is always rebuilt on the CPU, and the device has no P&L metric arm.
 * The book earns the full per-row return on every long row and charges one cost per position change. That is only right when the returns of one group do not overlap, so `rcsr` refuses (exit 2, `overlapping returns`) a validation or test slice whose rows of one group are closer than the target spec's `horizon_seconds`. Use a label stride of at least the horizon (`long:<h>,stride=<h>`) or a one-bar label. The JSON `objective.spec` carries `min_group_step_seconds` and `horizon_seconds`.
-* A direct in-search P&L fitness is not implemented. The objective only chooses among archived members.
+* Without `--fitness pnl` the objective only chooses among archived members.
 
 ```sh
 rcsr --data bars.csv --target y --time t --split temporal --validation-frac 0.3 \
@@ -1328,6 +1328,41 @@ rcsr --data bars.csv --target y --time t --split temporal --validation-frac 0.3 
 ```
 
 The JSON `objective` block carries the fit error, the validation and test books, the cash and buy-and-hold comparisons, the number of candidates and usable candidates, and `backend_reason`.
+
+#### `--fitness pnl`: rank every candidate by the exact P&L regret
+
+`--fitness metric|pnl` (default `metric`, the behaviour above) chooses the value that ranks candidates in the search. `--fitness pnl` needs a trading `--objective` and all of its refusals (temporal split, forward-return target spec, cost, `--validation-frac`).
+
+```text
+e_i     = r_i - funding_i - cash_return               (excess return of row i, canonical (group, time) order)
+p_i     = 1 if isfinite(pred_i) and pred_i > threshold else 0
+flips   = sum_i [p_i != p_prev(i)]                    (p_prev = 0 at the first row of a group)
+exits   = sum_i p_i * [i is the last row of its group]
+net     = sum_i p_i * e_i - c_side * (flips + exits)
+B       = hindsight DP bound on e at the same c_side
+regret  = (B - net) / B                               lower is better; all-flat is exactly 1
+```
+
+* `regret` is non-negative and scale-free, so the archive, hypervolume, progress and patience logic work unchanged. It is never "solved": the solved stop is off.
+* A non-finite prediction on a row scores `+inf`. Fewer than `--min-trades` flips scores `+inf`.
+* Constants keep the `--metric` fit (squared LM by default). The P&L is piecewise constant in the constants, so it has no gradient to follow; the book only ranks. `--weight` weights that fit only. For a squared metric the fit's SSE is not reused as the score, so every fitted candidate costs one more evaluation pass plus the book.
+* The training rows are prepared in canonical `(group, time)` order (`SplitSpec.canonical_train_order`). `gross` is summed in fixed 8,192-row segments, 32 lanes per segment and 8 warp sums, each merged with a halving tree, so a device implementation can reproduce the totals bit for bit. The integer counts are order-free.
+* Exit 2 with a named reason for `--predictor-samples`, `--fit-samples`, multiple targets, `--implicit`, `--min-holding` above 1, `--max-position` other than 1, rows closer than the label horizon, and a training slice with no profitable long/flat path (`B <= 0`).
+* The search runs on the CPU. `backend_reason` is `long_pnl fitness has no device scorer yet`.
+* The checkpoint stores the kind and the book hash (rows, cost, threshold, `--min-trades`). Resuming with a different book exits 2, and so does resuming a `--fitness pnl` checkpoint without the flag.
+* `--json` carries `search_fitness` (`kind`, `rows`, `groups`, `cost_per_side`, `threshold`, `bound`, `min_trades`, `backend`, `book_hash`; `{"kind":"metric"}` without the flag). Each Pareto member gains `fitness: {train_regret, train_net, train_flips, train_exits, train_exposure}` in exact CPU `f64` (`train_net` is the excess net over cash), `train_error` stays the metric, and `objective.finalist.search_fitness` names `long_pnl_regret`.
+
+Why the constants keep the metric fit. A fixed linear structure (`[1, tanh z24, tanh z3, vol]`, `h = 4`, stride 4, 5 bp per side) fitted five ways and priced exactly (net train / validation / test):
+
+| fit of the constants | 5 bp | 10 bp |
+|---|---|---|
+| OLS on the vol-scaled label (`--metric squared`) | 25.52 / **2.87** / 7.17 | 20.83 / **1.89** / 6.16 |
+| `\|r\|`-weighted logistic on `1[r > 0]` | 28.47 / 1.96 / 6.91 | 23.80 / 0.96 / 5.90 |
+| `\|A\|`-weighted logistic on `1[A > 0]` (hindsight-DP advantage) | 26.19 / 2.03 / **7.25** | 18.43 / 0.26 / 6.16 |
+| exact coordinate search on train net | 28.65 / 1.83 / 6.89 | **24.80** / 0.52 / 5.91 |
+| smooth P&L (sigmoid positions) | **29.06** / 1.35 / 7.00 | 24.41 / 0.17 / 6.04 |
+
+The P&L-aligned fits raise train net but not validation net. Turnover is set by the structure, not by the constants, so the leverage is in ranking structures by exact P&L.
 
 ## 4. Hardware
 

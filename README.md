@@ -232,9 +232,10 @@ reaches machine precision.
 ```sh
 rcsr ladder --data panel.rcsb --target y60 --return-col fwd60 --time ts --group symbol \
   --windows protocol/windows.csv --scheme expanding --target-spec panel.targets.json \
-  --vol-col vol96 --reversal-col ret_1 --signal-col trend96 --sr-score sr_score \
-  --sr-evals 1200000 --sr-wall 5400 --out ladder.json --markdown ladder.md
+  --vol-col vol96 --reversal-col ret_1 --signal-col trend96 --sr-run pilot/A2.run.json --out ladder.json --markdown ladder.md
 ```
+
+`--sr-run` scores the finalist of one search run on every fold; a fold that starts before the run's last seen row plus purge is refused (exit 3) unless `--allow-in-sample`, which labels it `oof:false` and drops it from every pooled statistic. `rcsr ablation score` applies the same check.
 
 `rcsr ablation` runs the add-one-family ablation under the decision rule committed in `protocol/ablation.json`: arms `A0` (B0) to `A5`, a fixed generation budget, 3 seeds per arm (5 with `--finalist`), one manifest per arm, a placebo arm and a circular-block-permuted arm. `rcsr --arm A1` writes the arm, the feature-list hash, the generation budget and the generations reached into run.json.
 
@@ -623,6 +624,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--objective mse|pnl|sharpe|log_growth] [--position long_only] [--threshold f]
      [--cost-bps f | --cost-override f] [--slippage-bps f] [--cash-return f] [--funding col]
      [--max-position f] [--min-trades n] [--min-holding n] [--allow-short]
+     [--fitness metric|pnl]
      [--equivalence-z z] [--noise-lag n|auto]
      [--allow-lockbox] [--lockbox START,END|none] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure] [--require-clean-inputs]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
@@ -749,10 +751,17 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
 * `--objective pnl|sharpe|log_growth` chooses the finalist on the validation
   slice by an exact long/flat book (position 0 or 1, never short, cost per side
   on `|delta p|` including the exit, daily `sqrt(365)` Sharpe) instead of the
-  fit error. The fit and the archive keep `--metric`. It needs a temporal
+  fit error. The fit and, unless `--fitness pnl` is given, the archive keep `--metric`. It needs a temporal
   split, `--validation-frac`, a `forward_return` `--target-spec` and
   `--cost-bps` (or a target spec `cost_bps`, which gives `cost_bps / 2` per side; a different flag is refused, `--cost-override` prices another cost on purpose). Rows of one group closer than the label horizon overlap, so the per-row return would be earned several times against one cost: such a book is refused (exit 2); use `long:<h>,stride=<h>` or `long:1`. `--json` adds an `objective` block with the validation and test
-  books, cash and buy-and-hold comparisons and the break-even cost. See
+  books, cash and buy-and-hold comparisons and the break-even cost.
+* `--fitness pnl` (default `metric`) ranks every candidate in the search by the exact long/flat net
+  regret `(B - net) / B` on the training rows, `B` the hindsight DP bound at the same cost
+  (lower is better, all-flat is 1). Constants are still fitted with `--metric`. It needs a
+  trading `--objective` and exits 2 with `--predictor-samples`, `--fit-samples`, `--implicit`,
+  `--min-holding` above 1, `--max-position` other than 1, multiple targets or overlapping rows.
+  It runs on the CPU; resume needs the same cost, threshold and rows. `--json` adds
+  `search_fitness` and a `fitness` block per Pareto member. See
   [`docs/walkforward.md`](docs/walkforward.md) and
   [`docs/optimisation.md`](docs/optimisation.md).
 * Time-ordered runs, runs with a target spec and runs with `--require-validation`

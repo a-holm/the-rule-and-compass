@@ -997,7 +997,12 @@ fn locked_test_declaration_travels_with_the_store() {
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let default = lockbox::protocol_default();
-    assert_eq!(lockbox::stored(fam.to_str().unwrap()).unwrap().map(|(_, l)| l), Some(default));
+    let fam_stored = lockbox::stored_all(fam.to_str().unwrap()).unwrap().unwrap();
+    assert_eq!((fam_stored.range, fam_stored.also), (default, Some(lb)));
+    let resolved = lockbox::resolve(None, fam.to_str().unwrap()).unwrap();
+    assert_eq!(resolved.ranges(), vec![default, lb], "a reader guards both ranges");
+    let enrich_json = std::fs::read_to_string(format!("{}.enrich.json", fam.to_str().unwrap())).unwrap();
+    assert_eq!(Lockbox::also_from_declaration(&enrich_json), Some(lb));
 
     // enrich copies the declaration of its input
     let fam2 = dir.join("fam2.rcsb");
@@ -1210,4 +1215,36 @@ fn enrich_fails_when_it_cannot_write_its_declaration() {
     let (code, err) = args(&["--locked-test", "none"]);
     assert_eq!(code, 0, "{err}");
     assert!(err.contains("warning: could not write"), "{err}");
+}
+
+#[test]
+fn append_keeps_the_target_declaration_when_the_family_store_declares_none() {
+    use rcsr::lockbox::{self, Keep, Lockbox};
+    use rcsr::panel_append::{self, AppendOptions};
+
+    let dir = scratch("locked-append-undeclared-family");
+    let (raw, m) = market(&dir, 24 * 40);
+    let base = dir.join("base.rcsb");
+    panel_v2::build_base(&base_opts(&raw, &base)).unwrap();
+    let lb = Lockbox { start: T0 + 250 * H, end: T0 + 300 * H };
+    let panel = dir.join("panel.rcsb");
+    let mut p = panel_opts(&base, &m, &panel);
+    p.locked_test = Keep::Range(lb);
+    panel_v2::build_panel(&p).unwrap();
+    let fam = dir.join("fam.rcsb");
+    let (code, err) = rcsr(&["enrich", "--data", base.to_str().unwrap(), "--out", fam.to_str().unwrap(), "--features", "r1", "--locked-test", "none"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lockbox::stored(fam.to_str().unwrap()).unwrap(), None);
+    let out = dir.join("out.rcsb");
+    panel_append::append_family(&AppendOptions {
+        target: panel.to_str().unwrap().to_string(),
+        family: fam.to_str().unwrap().to_string(),
+        columns: vec!["r1".to_string()],
+        out: out.to_str().unwrap().to_string(),
+        panel_version: "2".to_string(),
+        scratch: Some(dir.join("scratch").to_str().unwrap().to_string()),
+        locked_test: Keep::Unset,
+    })
+    .unwrap();
+    assert_eq!(lockbox::stored(out.to_str().unwrap()).unwrap().map(|(_, l)| l), Some(lb));
 }

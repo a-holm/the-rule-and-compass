@@ -660,3 +660,30 @@ fn audit_time_statistics_and_rows_ignore_the_locked_rows() {
     assert!(jb.contains(&format!("\"rows\":{kept_rows},")), "{jb}");
     assert!(jb.contains("\"rows_left_out\":"), "{jb}");
 }
+
+#[test]
+fn a_second_declared_range_is_guarded_by_every_reader() {
+    let dir = scratch("also");
+    let extra = Lockbox { start: T0 + 100 * H, end: T0 + 150 * H };
+    let default = lockbox::protocol_default();
+    for (name, t0) in [("flag.csv", T0), ("default.csv", T1)] {
+        let data = dir.join(name);
+        series_csv_at(&data, t0);
+        let d = s(&data);
+        let also = lockbox::also_json(Some(&extra), "test");
+        lockbox::write_sidecar_with(&d, &default, "test", &also).unwrap();
+        let resolved = lockbox::resolve(None, &d).unwrap();
+        assert_eq!(resolved.ranges(), vec![default, extra]);
+        let run = s(&dir.join("run.json"));
+        let (code, _, err) = search(&d, &run, &[]);
+        assert_eq!(code, 3, "{name}: {err}");
+        assert!(err.contains("declared locked test"), "{name}: {err}");
+        // a flag that covers only one of the two ranges is refused
+        let e = lockbox::resolve(Some(&format!("{},{}", default.start, default.end)), &d).unwrap_err();
+        assert_eq!(e.exit, 2, "{}", e.message);
+        // the audit leaves out the rows of both ranges
+        let (_, out, err) = rcsr(&["audit", "--data", &d, "--target", "y", "--time", "ts", "--json"]);
+        let inside = (0..400i64).filter(|i| [default, extra].iter().any(|r| r.contains(t0 + i * H))).count();
+        assert!(out.contains(&format!("\"rows_left_out\":{inside}")), "{name}: {out}{err}");
+    }
+}
