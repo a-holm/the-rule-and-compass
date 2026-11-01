@@ -100,12 +100,21 @@ time axis is global, so cross-symbol overlap on a panel and misaligned
 `purge_seconds` (the smallest stamp distance between retained training rows and
 test rows, also recorded without a spec), `validation_purge_seconds`,
 `purged_rows.test_boundary`, `purged_rows.validation_boundary` and
-`purge_source`. The text header prints the same facts on a `# purge:` line.
+`purge_source`. It also records `train_time` and `validation_time` as `[first, last]` raw time keys (`validation_time` is `null` without a validation slice; both are absent without `--time`) and `search.candidates_evaluated`, the offspring scored over the run. `rcsr walkforward --front` reads them. The text header prints the same facts on a `# purge:` line.
 
 The 2026H2 lockbox check covers the fit rows, the validation slice and the test
 blocks alike: a validation slice that overlaps the lockbox is refused with the
 message shape and exit code of a test block (`validation split: N row(s) ...
 overlap the lockbox`), unless `--allow-lockbox` declares a final test.
+
+The protocol locked test is a second, separate box: declare it with the data
+(`rcsr panel build --locked-test START,END`) and the search, `walkforward`,
+`ladder` and `ablation score` refuse every fit, validation or test row inside
+it (exit 3). `--allow-lockbox` does not open it. Only the sealed
+`--locked-test` path of `walkforward` and `ladder` reads it, once. A pilot
+split such as `--split temporal --validation-frac 0.20` on a panel that ends
+inside the locked range puts its test block there; the refusal tells you to
+`--exclude` the rows.
 
 **What fails.** Without the purge, the last training row and first test row
 share most of their label window. The test error is then a near-copy of the

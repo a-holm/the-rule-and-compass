@@ -652,6 +652,91 @@ trend that matters is the AVX speed-up over the existing walk, which grows with
 the arithmetic share of the tree. Trees dominated by `sin`/`cos`/`exp` gain
 less because AVX alone cannot vectorise those functions.
 
+#### CPU benchmark fixture: `cpu_bench` modes (#472)
+
+`cpu_bench` is the named fixture for CPU before/after numbers. It runs in one
+process, reads no files and changes no engine code.
+
+```sh
+cargo run --release --bin cpu_bench -- --mode all --rows 20000 --tsv
+```
+
+| mode | what it measures | default rows |
+|---|---|---|
+| `eval` (default) | `expr::eval` walk, `eval_batch_scalar`, `eval_batch` (AVX) on the 5/9/15/25-node trees; output unchanged from the table above | 1000, 20000, 200000 |
+| `fit` | `fit_weighted(.., 0)` (one SSE pass) and `fit_weighted(.., 8)` on `arith15` and `trans13` | 20000, 150000, 1000000 |
+| `metric` | `fit_weighted_metric` on `arith15` for `squared`, `absolute`, `median`, `interquartile`, `rank_correlation`; `score_weighted` for `median` and `squared` | 20000, 150000 |
+| `scale` | T scoped threads share the data, each runs its own `fit_weighted(.., 8)` and `eval_batch` jobs | 20000, 150000, 1000000 |
+| `all` | the four above in turn | per mode |
+
+Flags: `--rows LIST` (overrides every mode's default; `0` or an empty list exits
+2), `--threads LIST` (`scale` only, default `1,2,4,8`, a value above
+`available_parallelism` is skipped with a note on stderr), `--min-seconds S`
+(per cell, default 0.3; `eval` keeps its 50 ms repetition batches unless set),
+`--fit-iters N` (metric fits, default 8), `--tsv`.
+
+Fixture. xorshift64 seeded with `0x9E3779B97F4A7C15`; 10 variables uniform in
+[-2, 2); `y = 1.5 sin(x0 x1) + 0.7 x2² - 0.3 exp(0.2 x3) + noise` with noise
+uniform in ±0.05. The `eval` mode keeps its own 5-variable generator so the
+published table stays reproducible. Fixed trees, parsed from strings:
+
+- `arith15`: `(1.1*x0 + 0.4*x1*x2) / (1.3 + x3*x3) - 0.2*x4` (4 constants)
+- `trans13`: `1.5*sin(x0*x1) + 0.7*x2*x2 - 0.3*exp(0.2*x3)` (4 constants)
+
+Timing. One warm-up, then the best of at least three runs, until
+`--min-seconds` has passed (the 8-iteration fit and metric fits skip the
+warm-up; the `scale` cells run once, as each cell is already many jobs).
+`pass_mrows` is rows per second of the one-pass `fit_weighted(.., 0)`.
+`scale` runs `max(8, 2_000_000 / rows)` fits and `max(8, 50_000_000 / rows)`
+evaluations split evenly over T threads; the speed-up is against T = 1.
+
+Hash. `hash` is FNV-1a 64 over the fitted constants' bits and the returned
+score's bits. A later fitter change that must stay bit-identical keeps every
+`fit` and `metric` hash. Two runs of the same binary print the same hashes. The
+`squared` metric hash equals the `arith15` `fit` hash for the same rows.
+
+##### Measured: full `--mode all --rows 20000`
+
+Host: Intel i7-3770K (4 cores, 8 threads, AVX without AVX2/FMA), date
+2026-11-01, load average 9.2 before and 9.1 after (shared host, other jobs
+running), suite lock held. Read ratios, not absolutes.
+
+| table | cell | value |
+|---|---|---|
+| eval | 5 nodes walk / SoA / AVX µs | 538.97 / 360.44 / 86.09 |
+| eval | 9 nodes walk / SoA / AVX µs | 1436.40 / 1126.17 / 763.43 |
+| eval | 15 nodes walk / SoA / AVX µs | 3142.44 / 2293.66 / 1633.46 |
+| eval | 25 nodes walk / SoA / AVX µs | 6441.61 / 4604.90 / 3424.26 |
+| fit | arith15: pass Mrow/s, 8-iteration fit s, hash | 11.13, 0.0976, `04a1faf819cb4481` |
+| fit | trans13: pass Mrow/s, 8-iteration fit s, hash | 7.40, 0.0647, `959fcb4d6eed6507` |
+| metric | squared fit s, hash | 0.0923, `04a1faf819cb4481` |
+| metric | absolute fit s, hash | 0.2698, `0fa1072137284ea7` |
+| metric | median fit s, hash | 0.2842, `afd265b8cf8152e2` |
+| metric | interquartile fit s, hash | 0.3025, `e9ac6b3998321ca4` |
+| metric | rank_correlation fit s, hash | 0.4801, `266b61b96788d729` |
+| score | median / squared ms | 0.5279 / 0.0379 |
+| scale | T = 1 / 2 / 4 / 8 fits/s | 10.27 / 19.46 / 29.46 / 37.40 |
+| scale | T = 1 / 2 / 4 / 8 eval Mrow/s | 13.6 / 26.8 / 43.9 / 56.5 |
+| scale | T = 8 speed-up, fits / eval | 3.64× / 4.16× |
+
+Larger row counts, each mode run on its own through the suite lock (load
+average 9 to 12):
+
+| rows | arith15 pass Mrow/s / fit s | trans13 pass Mrow/s / fit s | median / squared score ms |
+|---:|---|---|---|
+| 150 000 | 10.19 / 0.4798 | 4.74 / 0.9171 | 6.16 / 0.340 |
+| 1 000 000 | 7.99 / 5.7263 | 4.19 / 5.5664 | not run |
+
+| rows (150 000) | squared | absolute | median | interquartile | rank_correlation |
+|---|---:|---:|---:|---:|---:|
+| metric fit s | 0.6053 | 3.2224 | 4.8839 | 3.3800 | 7.2109 |
+
+| rows | T = 1 / 2 / 4 / 8 fits/s | T = 8 speed-up | T = 1 / 8 eval Mrow/s |
+|---:|---|---:|---|
+| 150 000 | 1.77 / 3.33 / 4.24 / 5.34 | 3.01× | 11.3 / 39.0 |
+
+`scale` at 1 000 000 rows was not run.
+
 #### Constants behind `sign` and `step`
 
 `sign` and `step` are piecewise constant: their derivative is zero almost

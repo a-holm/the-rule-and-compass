@@ -8152,6 +8152,7 @@ fn expected_columns_out(
 
 pub fn run(args: &[String]) -> ! {
     let mut opts = Options::default();
+    let mut locked_test: Option<crate::lockbox::Lockbox> = None;
     let mut i = 0usize;
     macro_rules! val {
         () => {{
@@ -8232,6 +8233,9 @@ pub fn run(args: &[String]) -> ! {
                 }
                 opts.write_bw = Some(mbps * 1_000_000.0);
             }
+            "--locked-test" => {
+                locked_test = Some(crate::lockbox::Lockbox::parse(&val!()).unwrap_or_else(|e| fail(&format!("--locked-test: {}", e))))
+            }
             "--allow-lockbox" => opts.allow_lockbox = true,
             "--dry-run" => opts.dry_run = true,
             "--json" => opts.json = true,
@@ -8255,7 +8259,15 @@ pub fn run(args: &[String]) -> ! {
     if !opts.dry_run {
         if let Some(out) = &opts.out {
             let sidecar = format!("{}.enrich.json", out);
-            if let Err(e) = crate::atomic::write_text_atomic(&sidecar, &report.json()) {
+            let mut text = report.json();
+            if let Some(lb) = locked_test.or_else(|| crate::lockbox::declared_for(&opts.data)) {
+                let at = text.find('{').map_or(0, |i| i + 1);
+                text.insert_str(
+                    at,
+                    &format!("\"locked_test\":{},", lb.declaration_json("rcsr enrich --locked-test")),
+                );
+            }
+            if let Err(e) = crate::atomic::write_text_atomic(&sidecar, &text) {
                 eprintln!("warning: could not write {}: {}", sidecar, e);
             }
         }
@@ -8322,6 +8334,9 @@ INPUT / OUTPUT:
                           4h and longer (labels overlap; use uniqueness weights)
   --side long             the only side; --side short and --allow-short are refused
   --allow-lockbox         permit labelled rows in 2026H2 (final test only)
+  --locked-test <START,END>
+                          declare the protocol locked test (UTC, half-open) in
+                          <out>.enrich.json; copied from --data when it declares one
   --gpu [auto|on|off]     auto (default) dispatches a registered exact kernel
                           only when the cost model estimates it faster; on
                           forces every registered kernel above the 1M-row floor;

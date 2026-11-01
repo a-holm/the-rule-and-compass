@@ -117,6 +117,32 @@ finalist with exhaustive CPU selection. A wider band costs only exact CPU
 rescores; a narrower one fails the recall audit rather than silently dropping
 the winner.
 
+## Candidates from a run's front (`--front`)
+
+`rcsr walkforward --front run.json` takes every `pareto[k].expression` of a `run.json` as one candidate, labelled `front_rank_<k+1>` in archive order. It replaces `--expr` (passing both exits 2). With one member the walk-forward is the single-expression case. An empty front, a run without `split.train_time` (no time column) and an expression that uses a column missing from `--data` exit 3.
+
+Defaults taken from the run, each overridden by its explicit flag:
+
+| setting | run.json field | flag |
+|---|---|---|
+| variables | `variables` | `--vars` |
+| return column | `target_spec.return_column` | `--target` |
+| trials of the deflated Sharpe | `search.candidates_evaluated` (offspring scored over the run, summed over islands and generations, kept across `--resume`) | `--trials` (without either, exit 2) |
+| position rule | `objective.spec.threshold`, used as a fixed threshold | `--threshold-fixed`, `--threshold-quantile` |
+| per-side cost | `objective.spec.per_side_bps` | `--cost-bps` |
+
+A run with an `--objective` selects under `1[pred > threshold]`. Without the carried threshold the walk-forward would use its 0.70 training quantile and score the front under a different book than the one it was selected on.
+
+In-sample guard: `run.json` records `split.train_time` and `split.validation_time` as `[first, last]` raw time keys. With `seen = max(train_time[1], validation_time[1])` and `purge = split.required_purge_seconds` (else `split.purge_seconds`), a window with `test_start < seen + purge` exits 2:
+
+```
+error: window 'w1' tests rows the run trained or selected on (test_start 150 < last seen 179 + purge 5)
+```
+
+`--allow-in-sample-windows` downgrades the refusal: the window is scored and its JSON carries `"in_sample":true`. Use it for diagnostics only.
+
+The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA-256 of the file) and `candidate_labels`. `--select-band` and `--batch-pnl` work unchanged on the front's candidates.
+
 ## Position rule, costs and aggregation
 
 * `position = 1` if `score > threshold`, the score is finite and the shared
@@ -154,6 +180,11 @@ the winner.
   `"lockbox": {"permitted": true, ...}` in the JSON report. The same
   `rcsr::lockbox::Guard` is used by `rcsr run` (the default search),
   `rcsr panel build --start/--end` and a labelled `rcsr prep`.
+* A locked test declared with the data (`rcsr panel build --locked-test`, or
+  `--lockbox START,END`) is checked the same way on every run, with or without
+  `--ledger`: a window whose train or test range touches it exits 3. The JSON
+  `protocol.lockbox` object then carries `declared`, `source`, `rows_in_scope`
+  and `evaluated`. See [`panel.md`](panel.md#the-declared-locked-test).
 * Costs and positions are per group. Counting position changes on a flattened
   timestamp/symbol row order would count spurious changes at every symbol
   boundary; this implementation does not.
@@ -483,6 +514,8 @@ Candidates are evaluated on the test periods with their own validation threshold
 `--ledger FILE` makes a development run append a `candidate` line (content-addressed id over the procedure, the data SHA-256 and the build commit; `test_read:false`). Each line holds the SHA-256 of the previous line, so an edit breaks the chain. A development window that touches the declared lockbox (`--lockbox START,END`, default 2025-07-01 to 2026-07-01) is refused.
 
 `rcsr protocol seal --ledger L --out locked_candidates.json` writes the sealed list and records its hash in the ledger. `--locked-test --sealed locked_candidates.json` then reads the locked test: the candidate must be in the sealed list, the data and build hashes must equal the sealed entry (otherwise the run is void), and the candidate must not have `test_read:true`. The read appends a `test_read` line with the report hash and the new `read_count`; a second read is refused. `--verify-read --expect-report-sha256 H` recomputes the read and compares hashes without recording anything. The report's `protocol` object holds the lockbox rows, date range and read count; `run.json` carries a `lockbox` object (`--lockbox`, `--ledger`) with the rows in the range, their first and last stamps and the read count.
+
+`rcsr ladder --scheme locked --locked-test --ledger L --sealed S` reads the locked test for the baseline ladder. The sealed list must be recorded in the ledger and the ledger must hold no `baseline_read`; the run appends `{"event":"baseline_read",...}` with the data and report hashes, and a second call is refused. Without `--locked-test`, `ladder` and `ablation score` refuse any fold that touches the declared range.
 
 ## Fold sign test
 
