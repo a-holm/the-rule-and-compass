@@ -8638,8 +8638,6 @@ mod order_stat_tests {
         crate::fit::constants_slots(t)
     }
 
-    /// The device median is the configured metric for odd and even row counts,
-    /// with ties and with a constant prediction.
     extern "C" {
         fn rc_os_test_force_cub_fail(on: i32);
     }
