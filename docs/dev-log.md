@@ -1,3 +1,4 @@
+| `variation.constant_rejected` | full | offspring rejected before the fit because no input reaches the rows outside an aggregate (`--reject-constant-offspring`; 0 without the flag) |
 # The development log (`--dev-log`) and `rcsr dev-report`
 
 `rcsr` writes a **development log** while it searches. It is on by default: a

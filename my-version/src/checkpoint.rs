@@ -1326,6 +1326,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "require_dimensions",
         "fit_samples",
         "front_parents", // #76
+        "reject_constant_offspring", // #477: missing means false
         "fit_strategy",  // #116: missing means `exact`
         "fit_admission", // #223: missing means `screened`
         "fit_polish",    // #496: missing means `f64`
@@ -1527,6 +1528,16 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             ))
         }
     };
+    let reject_constant_offspring = match fields.get("reject_constant_offspring").map(|s| s.as_str()) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "config 'reject_constant_offspring' must be true or false, got '{}'",
+                other
+            ))
+        }
+    };
     // #116: missing means `exact`, byte-identical to a checkpoint written
     // before the solver portfolio existed.
     let fit_strategy = match fields.get("fit_strategy").map(|s| s.as_str()) {
@@ -1655,6 +1666,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         // #116: a disk row source is a path choice, not saved search state.
         fit_stream_source: None,
         front_parents, // #76
+        reject_constant_offspring, // #477
         units,
         require_dimensions,
         qd_bins,
@@ -1759,6 +1771,9 @@ fn write_config(cfg: &Config, out: &mut String) {
     // checkpoint stays byte-identical to one written before the flag existed.
     if !cfg.front_parents {
         writeln!(out, "config front_parents false").unwrap();
+    }
+    if cfg.reject_constant_offspring {
+        writeln!(out, "config reject_constant_offspring true").unwrap(); // #477
     }
     // #25: only write these when units are active, so a units-free checkpoint
     // is byte-identical to one written before this feature existed.

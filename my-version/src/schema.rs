@@ -115,6 +115,7 @@ pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--no-fit", "flag", "false", "disable constant fitting entirely (same as --fit-iters 0)"),
         ("--no-dedup", "flag", "false", "disable structural de-duplication"),
         ("--no-front-parents", "flag", "false", "draw every parent from the island tournament; disables the 15% Pareto-front feedback and restores the pre-#76 trajectory exactly"),
+        ("--reject-constant-offspring", "flag", "false", "#477: reject offspring and random fill or restart trees with no input outside an aggregate or meta operator before the constant fit. The first such constant tree of an island is kept, so the front keeps its constant baseline; later ones count as rejected attempts (development log variation.constant_rejected). Seeds and migrants are never filtered. A no-op without input variables. Saved search state: a resume refuses a different value; a checkpoint without it loads as off"),
         ("--no-simd", "flag", "false", "force the scalar tree walk instead of the SoA/AVX evaluator (same results; for debugging and A/B runs)"),
         ("--predictor-samples", "int", "none", "training rows per generation for fitness and constant fitting (>=2; all rows when >= train size)"),
         // #85: fit-only screening; survivors are refit on the full training sample.

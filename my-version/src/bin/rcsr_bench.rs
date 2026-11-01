@@ -58,6 +58,7 @@ OPTIONS:
                             (default: the available CPU cores; 1 = serial; the
                             results do not depend on it)
   --no-front-parents        disable the 15% Pareto-front parent feedback (#76)
+  --reject-constant-offspring  reject input-free offspring before the constant fit (#477)
   --cpu                     force the CPU evaluator (no environment variable)
   --gpu                     require the device evaluator; exit 2 without one
   --fit-strategy <name>     exact (bench default), auto, linear, varpro, stream,
@@ -299,6 +300,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--variation" => {
                 a.knobs.variation = Some(rcsr::search::VariationMode::parse(&take(&mut i, "--variation")?)?)
             }
+            "--reject-constant-offspring" => a.knobs.reject_constant_offspring = true,
             "--fit-polish" => {
                 let v = take(&mut i, "--fit-polish")?;
                 a.knobs.fit_polish = Some(
