@@ -31,6 +31,8 @@ pub struct RunFile {
     pub purge_seconds: Option<f64>,
     /// `search.candidates_evaluated`.
     pub candidates_evaluated: Option<u64>,
+    /// `elapsed_seconds`.
+    pub elapsed_seconds: Option<f64>,
     /// The parsed document, for views such as `RunFile::book`.
     doc: Json,
 }
@@ -93,6 +95,7 @@ impl RunFile {
                 .and_then(|s| s.get("candidates_evaluated"))
                 .and_then(Json::as_f64)
                 .map(|v| v as u64),
+            elapsed_seconds: j.get("elapsed_seconds").and_then(Json::as_f64),
             doc: j.clone(),
         })
     }
@@ -124,5 +127,43 @@ impl RunFile {
         let seen = self.last_seen()?;
         let purge = self.purge_seconds.unwrap_or(0.0);
         Some((seen + purge, seen, purge))
+    }
+}
+
+impl RunFile {
+    /// The #482 rule: a test window that starts before the last row the run saw
+    /// plus the purge overlaps what the run trained or selected on. A run without
+    /// a time range cannot prove otherwise and counts as in-sample.
+    pub fn in_sample(&self, test_start: f64) -> bool {
+        self.earliest_test_start().map_or(true, |(earliest, _, _)| test_start < earliest)
+    }
+
+    /// Out-of-fold flag per `(label, test_start)` fold. An in-sample fold is an
+    /// error naming it, unless `allow`.
+    pub fn oof_flags(&self, folds: &[(String, f64)], allow: bool) -> Result<Vec<bool>, String> {
+        let flags: Vec<bool> = folds.iter().map(|(_, t)| !self.in_sample(*t)).collect();
+        if !allow {
+            let bad: Vec<&str> = folds
+                .iter()
+                .zip(&flags)
+                .filter(|(_, ok)| !**ok)
+                .map(|((l, _), _)| l.as_str())
+                .collect();
+            if !bad.is_empty() {
+                let why = match self.earliest_test_start() {
+                    Some((earliest, seen, purge)) => {
+                        format!("test_start < last seen {} + purge {} = {}", seen, purge, earliest)
+                    }
+                    None => "the run has no split.train_time (no time column)".to_string(),
+                };
+                return Err(format!(
+                    "fold(s) {} test rows the run trained or selected on ({}); \
+                     use a run trained before the fold, or --allow-in-sample to label them oof:false",
+                    bad.join(", "),
+                    why
+                ));
+            }
+        }
+        Ok(flags)
     }
 }

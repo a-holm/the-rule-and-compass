@@ -697,7 +697,7 @@ fn declared_cv_ignores_allow_lockbox() {
         assert!(err.contains("cross-validation rows"), "{}", err);
         assert!(err.contains("declared locked test"), "{}", err);
     }
-    let exclude = format!("ts >= {}", locked().start);
+    let exclude = format!("ts >= {}", locked().start - DEFAULT_PURGE);
     let mut a = base.to_vec();
     a.extend_from_slice(&["--exclude", &exclude]);
     let (code, _, err) = plain(&a);
@@ -709,11 +709,20 @@ fn cv_folds_honour_exclude() {
     let dir = scratch("cvexclude");
     let (a, b) = (dir.join("a.csv"), dir.join("b.csv"));
     ab_csv(&a, &b);
-    let exclude = format!("ts >= {}", locked().start);
+    let exclude = format!("ts >= {}", locked().start - DEFAULT_PURGE);
+    let at_start = format!("ts >= {}", locked().start);
     let mut cv = Vec::new();
     for p in [&a, &b] {
         let d = s(p);
         lockbox::write_sidecar(&d, &locked(), "test").unwrap();
+        let (code, _, err) = plain(&[
+            "--data", &d, "--time", "ts", "--exclude", &at_start, "--cv", "k-fold", "--cv-k", "3", "--generations", "2",
+            "--pop", "8",
+        ]);
+        assert_eq!(code, 3, "{}", err);
+        assert!(err.contains("cross-validation rows has"), "{}", err);
+        assert!(err.contains("whose label window reaches the declared locked test"), "{}", err);
+        assert!(err.contains(&format!("--exclude '{}'", exclude)), "{}", err);
         let run = s(&dir.join(format!("{}.json", p.file_stem().unwrap().to_str().unwrap())));
         let train = format!("ts < {}", T0 + 100 * H);
         let test = format!("(ts >= {}) * (ts < {})", T0 + 100 * H, T0 + 150 * H);

@@ -858,3 +858,59 @@ fn cli_resume_errors_use_the_documented_exit_codes() {
     ]);
     assert_eq!(refused.status.code(), Some(3), "corrupt input is exit 3");
 }
+
+fn pnl_config(seed: u32, cost_bps: f64, train: &Sample) -> Config {
+    let slice = rcsr::data::TradingSlice {
+        rows: rcsr::trading::TradingRows {
+            time: (0..train.len()).map(|i| 900.0 * i as f64).collect(),
+            group: vec![0; train.len()],
+            funding: Vec::new(),
+        },
+        ret: train.x.iter().map(|r| 0.002 * r[0]).collect(),
+    };
+    let spec = rcsr::trading::TradingSpec {
+        cost_bps,
+        min_trades: 0,
+        ..Default::default()
+    };
+    let book = rcsr::trading::FitnessBook::new(&slice, &spec, 900.0).expect("book");
+    Config {
+        fitness: search::Fitness::LongPnl(std::sync::Arc::new(book)),
+        ..config(seed)
+    }
+}
+
+/// #480: the book hash is saved search state. The same book continues bit for
+/// bit; a different cost is refused.
+#[test]
+fn a_long_pnl_run_resumes_with_the_same_book_and_refuses_another() {
+    let train = sample(240);
+    let test = sample(80);
+    let full = Config {
+        generations: 30,
+        ..pnl_config(11, 5.0, &train)
+    };
+    let uninterrupted = search::run(&full, &train, &test);
+
+    let first = Config {
+        generations: 15,
+        ..pnl_config(11, 5.0, &train)
+    };
+    let text = checkpoint_text(&first, &train, &test);
+    assert!(text.contains("config fitness long_pnl:"), "the book hash is saved");
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    assert_eq!(saved.config.fitness.key(), first.fitness.key());
+    assert_ne!(config_hash(&first), config_hash(&Config { fitness: search::Fitness::Metric, ..first.clone() }));
+
+    let resumed = search::run_resumable(&full, &train, &test, Some(saved), 0, |_| {}).expect("resume");
+    assert_eq!(describe(&uninterrupted), describe(&resumed));
+    assert_eq!(uninterrupted.candidates_evaluated, resumed.candidates_evaluated);
+
+    let other = Config {
+        generations: 30,
+        ..pnl_config(11, 6.0, &train)
+    };
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    let err = expect_err(search::run_resumable(&other, &train, &test, Some(saved), 0, |_| {}), "other cost");
+    assert!(err.contains("fitness"), "{err}");
+}

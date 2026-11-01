@@ -597,8 +597,13 @@ pub fn resolve(flag: Option<&str>, data_path: &str) -> Result<Resolved, ResolveE
 
 /// Write the CSV sidecar for a declaration.
 pub fn write_sidecar(data_path: &str, lockbox: &Lockbox, source: &str) -> Result<(), String> {
+    write_sidecar_with(data_path, lockbox, source, "")
+}
+
+/// `write_sidecar` with extra top-level JSON members (each starting with a comma).
+pub fn write_sidecar_with(data_path: &str, lockbox: &Lockbox, source: &str, extra: &str) -> Result<(), String> {
     let p = sidecar_path(data_path);
-    std::fs::write(&p, format!("{{\"locked_test\":{}}}\n", lockbox.declaration_json(source)))
+    std::fs::write(&p, format!("{{\"locked_test\":{}{}}}\n", lockbox.declaration_json(source), extra))
         .map_err(|e| format!("{}: {}", p, e))
 }
 
