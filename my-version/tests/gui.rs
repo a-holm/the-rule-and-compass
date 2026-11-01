@@ -303,3 +303,124 @@ fn the_web_front_end_refuses_explicit_gpu_outside_the_native_objectives() {
     ])
     .is_ok());
 }
+
+const BOX_START: i64 = 1_717_200_000; // 2024-06-01
+const BOX_END: i64 = 1_719_792_000; // 2024-07-01
+
+fn stamped_table(first: i64, rows: i64) -> String {
+    let mut text = String::from("ts,x,y\n");
+    for i in 0..rows {
+        let x = (i % 37) as f64 - 18.0;
+        text.push_str(&format!("{},{},{}\n", first + i * 3600, x, 2.0 * x + 1.0));
+    }
+    text
+}
+
+fn lockbox_dir(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("rcsr-gui-lockbox-{}-{}", std::process::id(), name));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn declared_csv(name: &str) -> String {
+    let dir = lockbox_dir(name);
+    let path = dir.join("data.csv").to_string_lossy().to_string();
+    std::fs::write(&path, stamped_table(1_714_521_600, 1500)).unwrap();
+    rcsr::lockbox::write_sidecar(
+        &path,
+        &rcsr::lockbox::Lockbox { start: BOX_START, end: BOX_END },
+        "test",
+    )
+    .unwrap();
+    path
+}
+
+fn run_args(extra: &[&str]) -> String {
+    let mut args = vec![
+        "--target", "y", "--vars", "x", "--time", "ts", "--generations", "4", "--pop", "30",
+        "--islands", "1", "--max-complexity", "8", "--patience", "2", "--seed", "1",
+    ];
+    args.extend_from_slice(extra);
+    args.iter().map(|a| json_string(a)).collect::<Vec<_>>().join(",")
+}
+
+fn run_file(path: &str, extra: &[&str]) -> (u16, String) {
+    let server = gui::serve("127.0.0.1", 0).expect("start server");
+    let body = format!(
+        "{{\"args\":[\"--data\",{},{}]}}",
+        json_string(path),
+        run_args(extra)
+    );
+    post(server.addr(), "/api/run", &body)
+}
+
+fn run_upload(table: &str, extra: &[&str]) -> (u16, String) {
+    let server = gui::serve("127.0.0.1", 0).expect("start server");
+    let body = format!(
+        "{{\"args\":[\"--data\",\"-\",{}],\"table\":{}}}",
+        run_args(extra),
+        json_string(table)
+    );
+    post(server.addr(), "/api/run", &body)
+}
+
+#[test]
+fn gui_refuses_a_sidecar_declared_range_in_the_test_block() {
+    let path = declared_csv("split");
+    let (status, body) = run_file(&path, &["--split", "temporal"]);
+    assert_eq!(status, 400, "{}", body);
+    assert!(body.contains("2024-06-01"), "{}", body);
+    assert!(body.contains("locked test"), "{}", body);
+}
+
+#[test]
+fn gui_cv_needs_an_exclude_that_clears_the_declared_range() {
+    let path = declared_csv("cv");
+    let (status, body) = run_file(&path, &["--cv", "k-fold", "--cv-k", "3"]);
+    assert_eq!(status, 400, "{}", body);
+    assert!(body.contains("2024-06-01"), "{}", body);
+    let (status, body) = run_file(
+        &path,
+        &["--cv", "k-fold", "--cv-k", "3", "--exclude", "ts >= 1716980400"],
+    );
+    assert_eq!(status, 200, "{}", body);
+    assert!(body.contains("\"event\":\"done\""), "{}", body);
+    assert!(body.contains("\"source\":\"store\""), "{}", body);
+}
+
+#[test]
+fn gui_flag_range_guards_an_uploaded_table() {
+    let table = stamped_table(1_714_521_600, 1500);
+    let (status, body) = run_upload(&table, &["--split", "temporal", "--lockbox", "2024-06-01,2024-07-01"]);
+    assert_eq!(status, 400, "{}", body);
+    assert!(body.contains("2024-06-01"), "{}", body);
+    let (status, body) = run_upload(
+        &table,
+        &["--cv", "k-fold", "--cv-k", "3", "--lockbox", "2024-06-01,2024-07-01"],
+    );
+    assert_eq!(status, 400, "{}", body);
+    assert!(body.contains("2024-06-01"), "{}", body);
+}
+
+#[test]
+fn gui_applies_the_protocol_default_to_an_uploaded_table() {
+    // 2025-08-01 onward, inside the protocol default range.
+    let table = stamped_table(1_754_006_400, 1500);
+    let (status, body) = run_upload(&table, &["--split", "temporal"]);
+    assert_eq!(status, 400, "{}", body);
+    assert!(body.contains("2025-07-01"), "{}", body);
+}
+
+#[test]
+fn gui_reports_the_lockbox_object_and_lists_the_flag() {
+    let table = stamped_table(1_714_521_600, 600);
+    let (status, body) = run_upload(&table, &["--split", "temporal", "--lockbox", "none"]);
+    assert_eq!(status, 200, "{}", body);
+    let start = body.lines().find(|l| l.contains("\"event\":\"start\"")).unwrap();
+    assert!(start.contains("\"lockbox\":{"), "{}", start);
+    assert!(start.contains("\"source\":\"none\""), "{}", start);
+    assert!(gui::is_valid_json(start), "{}", start);
+    assert!(rcsr::schema::json().contains("\"--lockbox\""));
+    assert!(gui::parse_web_args_for_test(&["--lockbox".to_string(), "none".to_string()]).is_ok());
+}
