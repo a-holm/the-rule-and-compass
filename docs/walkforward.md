@@ -495,13 +495,13 @@ Training fits, validation selects, development out-of-sample evaluates the proce
 | range | UTC |
 |---|---|
 | warm-up (indicators only, never trained on) | 2021 |
-| development | 2022-01-01 to 2025-07-01 |
+| development | 2022-01-01 to 2025-06-28T11:00 (locked start minus `purge_seconds`) |
 | expanding folds | quarterly tests from 2023-01-01, train from 2022-01-01 |
 | rolling folds | quarterly tests from 2024-01-01, train on the previous 24 months |
 | locked test | 2025-07-01 to 2026-07-01 |
 | reserved | 2026H2 (the engine lockbox) |
 
-Each row has `train_end = test_start - purge_seconds` (219600 s: 1 h entry plus a 60 h label) and `validation_start` six calendar months before the test start. `--windows protocol/windows.csv --windows-scheme expanding` loads one scheme; the table's `validation_start` replaces `--validation-frac`. The validation slice sets the threshold and selects among `--expr` candidates. Select the procedure, not the lucky candidate: pool the development series of the chosen procedure.
+Each row has `train_end = test_start - purge_seconds` (219600 s: 1 h entry plus a 60 h label). A development test window ends at `min(quarter end, locked start - purge_seconds)`, so `expanding-2025Q2` and `rolling24-2025Q2` end at 2025-06-28T11:00:00: a label at a later stamp reads bars of the locked test. Outside `--locked-test`, `walkforward`, `ladder` and `ablation score` refuse (exit 3) a window that ends after `locked start - purge` (purge = entry offset + horizon + delay for `walkforward`, `--purge-seconds` for the others); in `--locked-test` mode the training range must end at or before `locked start - purge` and `validation_start` six calendar months before the test start. `--windows protocol/windows.csv --windows-scheme expanding` loads one scheme; the table's `validation_start` replaces `--validation-frac`. The validation slice sets the threshold and selects among `--expr` candidates. Select the procedure, not the lucky candidate: pool the development series of the chosen procedure.
 
 ### Overlapping returns
 
@@ -541,13 +541,17 @@ Candidates are evaluated on the test periods with their own validation threshold
 
 ### Candidate ledger and the locked test
 
-`--ledger FILE` makes a development run append a `candidate` line (content-addressed id over the procedure, the data SHA-256 and the build commit; `test_read:false`). Each line holds the SHA-256 of the previous line, so an edit breaks the chain. A development window that touches the locked test (`--lockbox START,END`, else the range declared with the data, else 2025-07-01 to 2026-07-01; `--lockbox none` opts out) is refused.
+`--ledger FILE` makes a development run append a `candidate` line (content-addressed id over the procedure, the data SHA-256 and the build commit; `test_read:false`). Each line holds the SHA-256 of the previous line, so an edit breaks the chain. A development window that ends after the locked test start minus the label purge (`--lockbox START,END`, else the range declared with the data, else 2025-07-01 to 2026-07-01; `--lockbox none` opts out) is refused.
 
 `rcsr protocol seal --ledger L --out locked_candidates.json` writes the sealed list and records its hash in the ledger. `--locked-test --sealed locked_candidates.json` then reads the locked test: the candidate must be in the sealed list, the data and build hashes must equal the sealed entry (otherwise the run is void), and the candidate must not have `test_read:true`. The read appends a `test_read` line with the report hash, the new `read_count` and the locked range it read (`"locked_test":{"start","end","source"}`); a second read is refused. A `candidate` line and the sealed list entry hold the range the candidate was developed against. A final read reports the store's `data_sha256` and the path of its read marker in `protocol.lockbox`, so a reviewer can check both. A copy of a store without its `<data>.locked_reads.jsonl` marker is not detected: the marker lives beside the store and nothing else records the read.
 
+<<<<<<< ours
+`rcsr ladder --scheme locked --locked-test --ledger L --sealed S` reads the locked test for the baseline ladder. The sealed list must be recorded in the ledger and the ledger must hold no `baseline_read`; the run appends `{"event":"baseline_read",...}` with the data and report hashes, and a second call is refused. Without `--locked-test`, `ladder` and `ablation score` refuse any fold that ends after the declared range start minus the purge.
+=======
 A read whose resolved range differs (another `--lockbox`, or a declaration that changed after development) is refused with exit 3: `candidate <id> was developed against the locked test A..B (<source>); this read resolves C..D`. A candidate of an old ledger without the member is refused unless `--allow-unbound-ledger` is given; the read is then reported as unbound. `--verify-read --expect-report-sha256 H` recomputes the read and compares hashes without recording anything. The report's `protocol` object holds the lockbox rows, date range and read count; `run.json` carries a `lockbox` object (`--lockbox`, `--ledger`) with the rows in the range, their first and last stamps and the read count.
 
-`rcsr ladder --scheme locked --locked-test --ledger L --sealed S` reads the locked test for the baseline ladder. The sealed list must be recorded in the ledger and the ledger must hold no `baseline_read`; the run appends `{"event":"baseline_read",...}` with the data and report hashes and the locked range, and a second call is refused. Every candidate of the sealed list must carry the range the ladder resolves (`--allow-unbound-ledger` accepts old entries without one). Without `--locked-test`, `ladder` and `ablation score` refuse any fold that touches the declared range.
+`rcsr ladder --scheme locked --locked-test --ledger L --sealed S` reads the locked test for the baseline ladder. The sealed list must be recorded in the ledger and the ledger must hold no `baseline_read`; the run appends `{"event":"baseline_read",...}` with the data and report hashes and the locked range, and a second call is refused. Every candidate of the sealed list must carry the range the ladder resolves (`--allow-unbound-ledger` accepts old entries without one). Without `--locked-test`, `ladder` and `ablation score` refuse any fold that ends after the declared range start minus the purge.
+>>>>>>> theirs
 
 #### Final seal: one read, one candidate
 
