@@ -215,8 +215,9 @@ pub struct Fold {
 /// Row ranges per fold. Rows need a finite time and return. The fit range ends
 /// `purge_seconds` before the validation start so a fit label never reads into
 /// the validation slice.
-/// A fold whose fit, validation or test range touches `locked` (a declared
-/// locked test, half-open seconds) is refused.
+/// A fold whose fit, validation or test range reaches `[locked start - purge_seconds,
+/// locked end)` (a declared locked test, half-open seconds) is refused: a label
+/// at the last development stamps reads bars inside the locked test.
 pub fn make_folds(
     p: &Panel,
     windows: &[WindowRow],
@@ -227,21 +228,24 @@ pub fn make_folds(
     for w in windows {
         let win = &w.window;
         if let Some((ls, le)) = locked {
-            let side = if win.train_start < le && win.train_end > ls {
+            let boundary = ls - purge_seconds;
+            let side = if win.train_start < le && win.train_end > boundary {
                 Some("fit or validation")
-            } else if win.test_start < le && win.test_end > ls {
+            } else if win.test_start < le && win.test_end > boundary {
                 Some("test")
             } else {
                 None
             };
             if let Some(side) = side {
                 return Err(format!(
-                    "fold {}: the {} range touches the declared locked test {}..{}; \
-                     read it only with --locked-test --ledger --sealed",
+                    "fold {}: the {} range reaches the declared locked test {}..{} (label end = stamp + {} s); \
+                     end it at or before {}, or read the locked test only with --locked-test --ledger --sealed",
                     win.label,
                     side,
                     protocol::iso(ls),
-                    protocol::iso(le)
+                    protocol::iso(le),
+                    purge_seconds,
+                    protocol::iso(boundary)
                 ));
             }
         }
@@ -303,6 +307,9 @@ impl SrRun {
     pub fn load(path: &str) -> Result<SrRun, String> {
         let run = crate::run_json::RunFile::load(path)?;
         let book = run.book()?;
+        if book.position != crate::trading::PositionMap::Threshold {
+            return Err("the run priced the top_tercile book: the SR rung prices the threshold rule only".to_string());
+        }
         Ok(SrRun {
             expression: book.expression,
             variables: book.variables,
@@ -1038,6 +1045,7 @@ pub struct Report {
     pub periods_per_year: f64,
     pub block_len: usize,
     pub cost: crate::target::CostDecl,
+    pub min_group_step: Option<f64>,
     pub cost_bps: f64,
     pub n_trials: u64,
     pub benchmark: String,
@@ -1302,6 +1310,36 @@ fn return_space_mse(p: &Panel, pool: &Pool, opts: &Options, score: &[f64]) -> f6
     }
 }
 
+/// Refuse a fold whose test rows overlap: some group has two rows closer than
+/// `horizon_seconds`. Returns the smallest step over all folds.
+pub fn check_fold_spacing(p: &Panel, folds: &[Fold], horizon_seconds: f64) -> Result<Option<f64>, String> {
+    let mut min_step: Option<f64> = None;
+    for f in folds {
+        let book = crate::trading::TradingRows {
+            time: f.test.iter().map(|&i| p.time[i]).collect(),
+            group: f.test.iter().map(|&i| p.group[i]).collect(),
+            funding: Vec::new(),
+        };
+        let step = crate::trading::check_return_spacing(&book, horizon_seconds)
+            .map_err(|e| format!("window '{}': {}", f.label, e))?;
+        min_step = match (min_step, step) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
+    Ok(min_step)
+}
+
+/// Exit code for an error from the ladder or ablation scoring path: 2 for an
+/// overlap refusal (as in the search objective and walk-forward), else `other`.
+pub fn spacing_exit(message: &str, other: i32) -> i32 {
+    if message.contains("overlapping returns") {
+        2
+    } else {
+        other
+    }
+}
+
 /// Run the whole ladder.
 pub fn run_ladder(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report, String> {
     let started = Instant::now();
@@ -1321,6 +1359,7 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
     let mut rungs: Vec<Rung> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     let n = pool.len();
+    let min_group_step = check_fold_spacing(p, folds, opts.horizon_seconds)?;
 
     let mut cash = Rung::new("cash", "control");
     cash.pos = vec![0.0; n];
@@ -1650,7 +1689,7 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
         sr_zero = Some(z);
     }
     let rows = build_rows(p, &pool, opts, block, rungs, &market, sr_zero);
-    finish_report(p, &pool, opts, folds, rows, &market, block, &mut notes)
+    finish_report(p, &pool, opts, folds, rows, &market, block, &mut notes, min_group_step)
 }
 
 fn jarr_str(v: &[String]) -> String {
@@ -1666,6 +1705,7 @@ fn finish_report(
     market: &[f64],
     block: usize,
     notes: &mut Vec<String>,
+    min_group_step: Option<f64>,
 ) -> Result<Report, String> {
     let ran = |r: &Row| r.status == "ok";
     let mean_of = |name: &str, rows: &[Row]| rows.iter().find(|r| r.name == name && ran(r)).map(|r| r.mean_period_net);
@@ -1816,6 +1856,7 @@ fn finish_report(
             return_units: "simple".to_string(),
             spec_per_side_bps: None,
         }),
+        min_group_step,
         cost_bps: opts.cost_bps,
         n_trials,
         benchmark,
@@ -1938,7 +1979,7 @@ impl Report {
         };
         format!(
             "{{\"schema\":{},\"folds\":{},\"periods\":{},\"rows_scored\":{},\"periods_per_year\":{},\"block_len\":{},\
-\"cost_bps\":{},\"cost\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
+\"min_group_step_seconds\":{},\"cost_bps\":{},\"cost\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
 \"sr_candidate_evaluations\":{},\"sr_wall_seconds\":{},\"gbm_beats_sr\":{}}},\"multiple_testing\":{{\"draws\":{},\"seed\":{},\
 \"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"sr_run\":{},\"rungs\":[{}],\"ledger\":{}}}",
             jstr(SCHEMA),
@@ -1947,6 +1988,7 @@ impl Report {
             self.rows_scored,
             jnum(self.periods_per_year),
             self.block_len,
+            jopt(self.min_group_step),
             jnum(self.cost_bps),
             self.cost.json(),
             self.n_trials,
@@ -2200,7 +2242,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --windows <file>          protocol windows table (rcsr protocol windows)\n\
   --scheme <name>           expanding | rolling | locked (default expanding)\n\
   --purge-seconds <s>       gap between the fit range and the validation slice (default 219600)\n\
-  --horizon-seconds <s>     label horizon; floors the bootstrap block (default 0)\n\
+  --horizon-seconds <s>     label horizon; floors the bootstrap block; test rows of one group closer than it overlap and are refused (exit 2); the report carries min_group_step_seconds (default 0)\n\
   --cost-bps <x>            per-side cost of the headline book (default 12; with a --target-spec cost, the spec cost, and a different value is refused)\n\
   --cost-override <x>       per-side cost that differs from the --target-spec cost on purpose; reported as source flag with the spec cost beside it\n\
   --cost-grid <a,b,...>     per-side costs reported per rung (default 12,20,40; 1x, 2x and 3.33x the spec cost when a --target-spec declares one)\n\
@@ -2224,12 +2266,14 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --seed <n>                seed of every draw (default 0)\n\
   --lockbox <START,END|none> locked test to guard: this flag (it must cover a stored\n\
                             declaration, else exit 2), the declaration stored with --data,\n\
-                            else 2025-07-01,2026-07-01; none opts out. A fold touching it\n\
-                            is refused (exit 3)\n\
+                            else 2025-07-01,2026-07-01; none opts out. A fold ending after START minus\n\
+                            --purge-seconds is refused (exit 3)\n\
   --locked-test             read the locked test: needs --scheme locked, --ledger and --sealed;\n\
                             appends a baseline_read to the ledger, a second read is refused\n\
   --ledger <file>           candidate ledger (with --locked-test)\n\
   --sealed <file>           sealed candidate list recorded in the ledger (with --locked-test)\n\
+  --allow-unbound-ledger    with --locked-test: accept a sealed list whose candidates recorded no\n\
+                            locked test range (old ledger); a different range is refused (exit 3)\n\
   --out <file>              write the JSON report (ends with a ledger object: io and\n\
                             pnl seconds on the run wall)\n\
   --markdown <file|->       write the Markdown table\n\
@@ -2270,6 +2314,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let mut scheme = "expanding".to_string();
     let mut lockbox_arg: Option<String> = None;
     let mut locked_test = false;
+    let mut allow_unbound = false;
     let mut ledger_path: Option<String> = None;
     let mut sealed_path: Option<String> = None;
     let mut spec_path: Option<String> = None;
@@ -2329,6 +2374,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             "--seed" => opts.seed = val()?.parse().map_err(|_| num_err(a))?,
             "--lockbox" => lockbox_arg = Some(val()?),
             "--locked-test" => locked_test = true,
+            "--allow-unbound-ledger" => allow_unbound = true,
             "--ledger" => ledger_path = Some(val()?),
             "--sealed" => sealed_path = Some(val()?),
             "--out" => out = Some(val()?),
@@ -2399,7 +2445,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     if !locked_test && (ledger_path.is_some() || sealed_path.is_some()) {
         return Err(usage_err("--ledger and --sealed apply to --locked-test only".to_string()));
     }
-    let mut read: Option<(protocol::Ledger, String)> = None;
+    let mut read: Option<(protocol::Ledger, String, protocol::LockedRange)> = None;
     if locked_test {
         let (Some(ledger), Some(sealed)) = (&ledger_path, &sealed_path) else {
             return Err(usage_err("--locked-test needs --ledger and --sealed".to_string()));
@@ -2413,17 +2459,19 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         let (ls, le) = (d.lockbox.start as f64, d.lockbox.end as f64);
         for r in &rows {
             let w = &r.window;
-            if w.train_start < le && w.train_end > ls {
-                return Err(input_err(format!("window '{}' trains on the locked test", w.label)));
+            if w.train_start < le && w.train_end > ls - opts.purge_seconds {
+                return Err(input_err(format!("window '{}' trains within the label purge of the locked test", w.label)));
             }
             if !(w.test_start >= ls && w.test_end <= le) {
                 return Err(input_err(format!("window '{}' tests outside the locked test", w.label)));
             }
         }
         let l = protocol::Ledger::new(ledger);
-        l.authorize_baseline_read(std::path::Path::new(sealed)).map_err(input_err)?;
+        let current = protocol::LockedRange::new(&d.lockbox, d.source);
+        let binding = protocol::RangeBinding { current: &current, allow_unbound };
+        l.authorize_baseline_read(std::path::Path::new(sealed), Some(binding)).map_err(input_err)?;
         l.check_read_marker(&data_path).map_err(input_err)?;
-        read = Some((l, crate::manifest::sha256_file(&data_path).map_err(input_err)?));
+        read = Some((l, crate::manifest::sha256_file(&data_path).map_err(input_err)?, current));
     }
     let guard = if locked_test {
         None
@@ -2456,7 +2504,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         }
     }
     let io_s = t_io.elapsed().as_secs_f64();
-    let mut report = run_ladder(&panel, &folds, &opts).map_err(input_err)?;
+    let mut report = run_ladder(&panel, &folds, &opts).map_err(|e| (spacing_exit(&e, 3), e))?;
     let mut ledger = RunLedger::new();
     ledger.record_stage(Stage::Io, io_s);
     ledger.record_stage(Stage::Pnl, report.ledger.stage_s(Stage::Pnl));
@@ -2467,10 +2515,10 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let mut json = report.json();
     let in_scope = if locked_test { folds.iter().map(|f| f.test.len()).sum() } else { 0 };
     json = resolved.splice_report(&json, in_scope, locked_test, true);
-    if let Some((ledger, data_sha)) = &read {
+    if let Some((ledger, data_sha, current)) = &read {
         let report_sha = crate::manifest::sha256_hex(json.as_bytes());
         ledger.write_read_marker(&data_path, "baseline_read", &report_sha).map_err(input_err)?;
-        ledger.record_baseline_read(data_sha, &report_sha).map_err(input_err)?;
+        ledger.record_baseline_read(data_sha, &report_sha, Some(current)).map_err(input_err)?;
     }
     if let Some(p) = &out {
         std::fs::write(p, &json).map_err(|e| input_err(format!("{}: {}", p, e)))?;

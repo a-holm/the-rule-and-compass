@@ -410,7 +410,7 @@ When the sidecar exists, a `--vars` name that it does not list exits 3 with the 
 
 `store::write_store_grouped` writes a store one group at a time from a producer closure, so peak memory is one group of every column and not the table. `write_store_with_time` is a producer over an in-memory table, so both paths write identical bytes (`tests/registry.rs`).
 
-`rcsr panel append --data panel.rcsb --family base_enriched.rcsb --columns a,b --out out.rcsb` appends registered columns computed on a symbol-major store to the time-major panel by `(symbol, ts)` key. Existing blocks are copied verbatim through `write_store_appending`, the input file is never opened for writing, a panel row without a family row is NaN and the output gets its own schema file.
+`rcsr panel append --data panel.rcsb --family base_enriched.rcsb --columns a,b --out out.rcsb` appends registered columns computed on a symbol-major store to the time-major panel by `(symbol, ts)` key. Existing blocks are copied verbatim through `write_store_appending`, the input file is never opened for writing, a panel row without a family row is NaN and the output gets its own schema file. `rcsr panel rank --data panel.rcsb --column lbl_h1_fwd --name lbl_h1_xs --out out.rcsb` appends the per-timestamp rank of a column in `[-1, 1]` the same way and adds an `xs_rank` entry to `<out stem>.targets.json` (`docs/time-series.md`).
 
 ## Measured
 

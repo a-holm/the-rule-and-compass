@@ -45,6 +45,7 @@ use crate::data::{self, Table};
 use crate::devlog::Json;
 use crate::inference::{self, Dsr, Pbo, Spa};
 use crate::ladder::{self, jnum, jstr, Fold, Input, Options, Panel};
+use crate::lockbox::Lockbox;
 use crate::manifest::sha256_hex;
 use crate::protocol;
 use crate::rng::Mt;
@@ -489,11 +490,55 @@ pub struct PrepareInput<'a> {
     /// Extra columns copied through (target, return, scale).
     pub keep: &'a [String],
     pub seed: u32,
+    /// Declared locked test: null columns are built per segment (before,
+    /// inside, after) so no locked value reaches a development row.
+    pub locked: Option<Lockbox>,
+}
+
+/// Segment of a time stamp relative to the locked test: 0 before, 1 inside, 2 after.
+pub fn segment_of(t: f64, locked: Option<&Lockbox>) -> u8 {
+    match locked {
+        Some(l) if t >= l.end as f64 => 2,
+        Some(l) if t >= l.start as f64 => 1,
+        _ => 0,
+    }
+}
+
+/// Group key per row for contiguous per-(group, segment) runs. Segment 0 keeps
+/// the plain group id.
+pub fn segment_keys(groups: &[u64], segs: &[u8]) -> Vec<u64> {
+    groups.iter().zip(segs).map(|(&g, &s)| g + ((s as u64) << 32)).collect()
+}
+
+/// `placebo_column` built independently inside each segment: the marginal and
+/// the lag-1 target of a segment come from that segment's template values only.
+pub fn placebo_column_segmented(template: &[f64], groups: &[u64], segs: &[u8], seed: u32, k: u64) -> Vec<f64> {
+    if segs.iter().all(|&s| s == segs[0]) {
+        return placebo_column(template, groups, seed, k);
+    }
+    let mut out = vec![f64::NAN; template.len()];
+    for s in 0..3u8 {
+        let idx: Vec<usize> = (0..template.len()).filter(|&i| segs[i] == s).collect();
+        if idx.is_empty() {
+            continue;
+        }
+        let tpl: Vec<f64> = idx.iter().map(|&i| template[i]).collect();
+        let g: Vec<u64> = idx.iter().map(|&i| groups[i]).collect();
+        for (&j, v) in idx.iter().zip(placebo_column(&tpl, &g, seed, k)) {
+            out[j] = v;
+        }
+    }
+    out
 }
 
 /// The projection CSV: key columns, kept columns, real columns, placebo and
 /// permuted columns, rows sorted by `(group, time)`.
 pub fn prepare_csv(inp: &PrepareInput) -> Result<String, String> {
+    prepare_csv_segments(inp).map(|(csv, _)| csv)
+}
+
+/// `prepare_csv` plus the row count of each segment (before, locked, after).
+pub fn prepare_csv_segments(inp: &PrepareInput) -> Result<(String, [usize; 3]), String> {
     let t = inp.table;
     let def = inp.def;
     let n = t.len();
@@ -523,6 +568,12 @@ pub fn prepare_csv(inp: &PrepareInput) -> Result<String, String> {
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| gid[a].cmp(&gid[b]).then_with(|| time[a].total_cmp(&time[b])).then_with(|| a.cmp(&b)));
     let groups: Vec<u64> = order.iter().map(|&i| gid[i]).collect();
+    let segs: Vec<u8> = order.iter().map(|&i| segment_of(time[i], inp.locked.as_ref())).collect();
+    let mut seg_rows = [0usize; 3];
+    for &s in &segs {
+        seg_rows[s as usize] += 1;
+    }
+    let seg_groups = segment_keys(&groups, &segs);
 
     let real = def.real_columns();
     let mut copied: Vec<String> = vec![inp.time.to_string(), inp.group.to_string()];
@@ -554,7 +605,7 @@ pub fn prepare_csv(inp: &PrepareInput) -> Result<String, String> {
     let mut new_cols: Vec<Vec<f64>> = Vec::new();
     for (k, name) in def.placebo_names(max_placebo).into_iter().enumerate() {
         let tpl = numeric_col(&templates[k % templates.len()])?;
-        new_cols.push(placebo_column(&tpl, &groups, inp.seed, k as u64 + 1));
+        new_cols.push(placebo_column_segmented(&tpl, &groups, &segs, inp.seed, k as u64 + 1));
         new_names.push(name);
     }
     let mut perm_groups: Vec<&String> = Vec::new();
@@ -569,7 +620,7 @@ pub fn prepare_csv(inp: &PrepareInput) -> Result<String, String> {
         let names = def.group(g);
         let cols: Vec<Vec<f64>> = names.iter().map(|c| numeric_col(c)).collect::<Result<_, _>>()?;
         let refs: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
-        let permuted = permute_columns(&refs, &groups, def.permute_block_len, inp.seed);
+        let permuted = permute_columns(&refs, &seg_groups, def.permute_block_len, inp.seed);
         for (c, v) in names.iter().zip(permuted) {
             new_names.push(def.permuted_name(c));
             new_cols.push(v);
@@ -599,7 +650,7 @@ pub fn prepare_csv(inp: &PrepareInput) -> Result<String, String> {
         out.push_str(&cells.join(","));
         out.push('\n');
     }
-    Ok(out)
+    Ok((out, seg_rows))
 }
 
 // ---------------------------------------------------------------------------
@@ -918,6 +969,7 @@ fn score_core(
         }
         crate::expr::eval(&tree, &row)
     };
+    ladder::check_fold_spacing(panel, folds, opts.horizon_seconds)?;
     let side = opts.cost_bps * 1e-4;
     let mut net_by_fold_threshold = Vec::new();
     let mut net_period: Vec<f64> = Vec::new();
@@ -1539,15 +1591,16 @@ fn usage() -> &'static str {
             writes <arm>.arm.json (arm, feature list, SHA-256, generation budget, seeds), plan.json,\n\
             a copy of the definition and commands.sh\n\
   prepare   --definition <file> --data <csv|rcsb> --time <col> --group <col> --out <csv> [--lockbox START,END]\n\
-            writes <csv>.lockbox.json when the data (or --lockbox) declares a locked test\n\
+            writes <csv>.lockbox.json (with the row count of each segment) when the data (or --lockbox) declares a locked test;\n\
+            placebo and permuted columns are built separately before, inside and after the locked test\n\
             [--keep a,b] [--seed 0]\n\
             writes the projection CSV with placebo and circular-block-permuted columns\n\
   score     (--run <run.json> | --from-run <run.json>) --data <csv|rcsb> --target <col> --time <col> --windows <file> --out <file>\n\
-            [--lockbox START,END|none]  a fold touching the locked test (same resolution) is refused (exit 3)\n\
+            [--lockbox START,END|none]  a fold ending after START minus --purge-seconds (same resolution) is refused (exit 3)\n\
             [--allow-in-sample]  a fold whose test starts before the run's last seen row + purge is refused (exit 3); with the flag it is labelled oof:false and left out of every pooled series\n\
             [--group <col>] [--return-col <col>] [--scheme expanding] [--thresholds 0.6,0.7,0.8]\n\
             [--headline-threshold 0.7] [--cost-bps 12 | --cost-override <bp>] [--purge-seconds 219600] [--target-spec <file>]\n\
-            scores the run's finalist (objective.finalist.expression) on every fold. --target-spec sets the per-side cost\n\
+            scores the run's finalist (objective.finalist.expression) on every fold. Test rows of one group closer than the target spec horizon overlap and are refused (exit 2); the result carries min_group_step_seconds. --target-spec sets the per-side cost\n\
             (cost_bps / 2), the return units (log is converted with exp_m1) and the return column; a --cost-bps that differs is refused.\n\
             --from-run prices the book the search selected: the run's target spec, per-side cost and fixed threshold\n\
             (objective.spec.threshold); it refuses --thresholds, --headline-threshold and --target-spec, and a run without an objective block\n
@@ -1673,20 +1726,33 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             };
             let seed: u32 = fl.opt("--seed").map_or(Ok(0), |s| s.parse().map_err(|_| (2, "--seed: invalid number".to_string())))?;
             let resolved = crate::lockbox::resolve(fl.opt("--lockbox"), data).map_err(|e| (e.exit, e.message))?;
-            let csv = prepare_csv(&PrepareInput {
+            let range = resolved.sidecar_range();
+            let (csv, segments) = prepare_csv_segments(&PrepareInput {
                 table: &table,
                 def: &def,
                 time: fl.need("--time")?,
                 group: fl.need("--group")?,
                 keep: &keep,
                 seed,
+                locked: range,
             })
             .map_err(|e| (3, e))?;
             let out = fl.need("--out")?;
             std::fs::write(out, csv).map_err(|e| io_err(out, e))?;
-            if let Some(lb) = &resolved.sidecar_range() {
-                crate::lockbox::write_sidecar(out, lb, &format!("rcsr ablation prepare ({})", resolved.source.as_str())).map_err(|e| (3, e))?;
+            match &range {
+                Some(lb) => {
+                    let seg = format!(",\"segments\":{{\"before\":{},\"locked\":{},\"after\":{}}}", segments[0], segments[1], segments[2]);
+                    let extra = format!("{}{}", crate::lockbox::also_json(resolved.sidecar_also().as_ref(), "rcsr ablation prepare"), seg);
+                    crate::lockbox::write_sidecar_with(out, lb, &format!("rcsr ablation prepare ({})", resolved.source.as_str()), &extra).map_err(|e| (3, e))?;
+                }
+                None => {
+                    let stale = crate::lockbox::sidecar_path(out);
+                    if Path::new(&stale).exists() {
+                        std::fs::remove_file(&stale).map_err(|e| io_err(&stale, e))?;
+                    }
+                }
             }
+            crate::lockbox::finish_output(out, range.as_ref(), &["lockbox.json"]).map_err(|e| (e.exit, e.message))?;
             println!("wrote {}", out);
             Ok(())
         }
@@ -1709,7 +1775,11 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                             return Err((2, format!("{} cannot be combined with --from-run: the run fixes the threshold rule and the target spec", flag)));
                         }
                     }
-                    Some(crate::run_book::RunBook::parse(&run_text).map_err(|e| (3, format!("{}: {}", run_path, e)))?)
+                    let book = crate::run_book::RunBook::parse(&run_text).map_err(|e| (3, format!("{}: {}", run_path, e)))?;
+                    if book.position != crate::trading::PositionMap::Threshold {
+                        return Err((2, format!("{}: the run priced the top_tercile book; the ablation prices the threshold rule only", run_path)));
+                    }
+                    Some(book)
                 }
                 None => None,
             };
@@ -1752,6 +1822,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 None => crate::target::resolve_cost(opts.spec.as_ref(), cost_flag, cost_override, ladder::DEFAULT_COST_BPS).map_err(|e| (2, e))?,
             };
             opts.cost_bps = cost;
+            opts.horizon_seconds = opts.spec.as_ref().map_or(0.0, |s| s.horizon_seconds);
             if opts.spec.is_some() || source == crate::target::CostSource::Flag {
                 opts.cost = Some(crate::target::CostDecl::new(opts.spec.as_ref(), cost, source));
             }
@@ -1792,7 +1863,8 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 Some(b) => score_run_fixed(&facts, &panel, &folds, b.threshold, &opts),
                 None => score_run(&facts, &panel, &folds, &thresholds, headline, &opts),
             }
-            .map_err(|e| (3, e))?;
+            .map_err(|e| (ladder::spacing_exit(&e, 3), e))?;
+            let min_group_step = ladder::check_fold_spacing(&panel, &folds, opts.horizon_seconds).map_err(|e| (3, e))?;
             let cost_decl = opts.cost.clone().unwrap_or(crate::target::CostDecl {
                 per_side_bps: cost,
                 source,
@@ -1814,8 +1886,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                     .join(",")
             );
             let mut json = format!(
-                "{},\"cost\":{},\"threshold_rule\":{},\"fold_oof\":{}}}",
+                "{},\"min_group_step_seconds\":{},\"cost\":{},\"threshold_rule\":{},\"fold_oof\":{}}}",
                 &json[..json.len() - 1],
+                min_group_step.map_or_else(|| "null".to_string(), jnum),
                 cost_decl.json(),
                 rule,
                 fold_oof

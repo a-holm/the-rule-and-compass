@@ -472,6 +472,13 @@ pub fn parse_column(name: &str) -> Option<(&str, &'static str)> {
     None
 }
 
+/// `lbl_<label>_xs`: the cross-sectional rank column written by `rcsr panel rank`.
+pub fn is_xs_column(name: &str) -> bool {
+    name.strip_prefix(COLUMN_PREFIX)
+        .and_then(|rest| rest.strip_suffix("_xs"))
+        .is_some_and(|label| !label.is_empty())
+}
+
 /// The refusal for a `long:` label without `fee=`.
 pub fn missing_fee_message(src: &str) -> String {
     format!(
@@ -794,6 +801,7 @@ impl LongLabels {
 pub struct LabelAccumulator {
     spec: LongLabelSpec,
     range: Option<Lockbox>,
+    also: Option<Lockbox>,
     tally: Tally,
     chain: Vec<u8>,
 }
@@ -807,14 +815,20 @@ impl LabelAccumulator {
     /// before its start, or inside it) are left out of every statistic. The
     /// label hash still covers every row.
     pub fn with_range(spec: &LongLabelSpec, range: Option<Lockbox>) -> Self {
-        LabelAccumulator { spec: spec.clone(), range, tally: Tally::default(), chain: spec.canonical().into_bytes() }
+        LabelAccumulator { spec: spec.clone(), range, also: None, tally: Tally::default(), chain: spec.canonical().into_bytes() }
+    }
+
+    /// A second range left out the same way.
+    pub fn with_also(mut self, also: Option<Lockbox>) -> Self {
+        self.also = also;
+        self
     }
 
     pub fn add(&mut self, symbol: &str, labels: &LongLabels) {
         let symbol = (!symbol.is_empty()).then_some(symbol);
         let purge = self.spec.purge_seconds();
-        let range = self.range;
-        let keep = move |t: i64| range.map_or(true, |r| t + purge <= r.start || t >= r.end);
+        let ranges = [self.range, self.also];
+        let keep = move |t: i64| ranges.iter().flatten().all(|r| t + purge <= r.start || t >= r.end);
         self.tally.merge(labels.tally(symbol, &keep));
         self.chain.extend_from_slice(symbol.unwrap_or("").as_bytes());
         self.chain.push(0);

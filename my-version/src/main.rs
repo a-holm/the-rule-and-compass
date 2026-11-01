@@ -194,7 +194,13 @@ INPUT:
                              residency keeps the CPU. Reported values stay
                              exact CPU f64. Resume needs the same cost,
                              threshold and rows
-  --position long_only       the only position map (default). short is refused
+  --position long_only|top_tercile
+                             long_only (default): 1[pred > --threshold]. top_tercile: per
+                             timestamp the top floor(n/3) finite predictions are long (p=1),
+                             ties by row order; fewer than 3 finite predictions hold nothing;
+                             no threshold. Needs a --split temporal (whole timestamps on one
+                             side), not --fitness pnl, --min-holding 1, --max-position 1.
+                             Use it with an xs_rank target (rcsr panel rank). short is refused
   --allow-short              refused: there is no short P&L, borrow or funding
   --threshold <f>            long when the prediction is strictly above <f>
                              (default 0)
@@ -266,7 +272,9 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              the declared range is refused (exit 2), as are conflicting
                              declarations (exit 3). `none` opts out and is refused when
                              the data declares a range. Train, validation and test rows
-                             inside the range are refused (exit 3); run.json `lockbox`
+                             inside the range, or whose label reaches it (within the target
+                             spec's required purge before the range; default 219600 s), are
+                             refused (exit 3); run.json `lockbox`
                              reports rows, date range, read count, declared, source
                              (flag, store, protocol_default, none), declared_in,
                              rows_in_scope, evaluated
@@ -658,8 +666,19 @@ SEARCH:
                              refit exactly on the CPU in every mode. Only the
                              device fit arm reads it; a resume refuses a
                              different saved value
+  --refit-band <F>           after a device-fit search, refit exactly (CPU f64)
+                             only the trees whose full-data error is within
+                             this relative band of the lowest error at no
+                             greater cost, then every reported front member
+                             still unrefit (default 0.001). inf refits every
+                             unique tree
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
   --no-dedup                 disable structural de-duplication
+  --linear-scaling           wrap every candidate shape f in a fitted affine output
+                             map a + b*f(x), so a shape that is right up to scale
+                             and offset scores as right at once. Needs a
+                             least-squares metric (squared, aic, aicc, bic) and
+                             constant fitting; single target; off by default (#470)
   --no-front-parents         draw every parent from the island tournament;
                              turns off the 15% Pareto-front feedback (#76)
                              and restores the pre-#76 trajectory exactly
@@ -985,6 +1004,30 @@ fn parse_trade_number(flag: &str, text: &str) -> f64 {
 }
 
 /// #263: a usage error for the P&L objective, exit 2.
+/// #493: the book of one prediction vector. The context rows (removed only by a
+/// missing label) join the ranks of a top-tercile book; they earn nothing
+/// without a return.
+fn trading_book(
+    tree: &expr::Node,
+    x: &[Vec<f64>],
+    slice: &data::TradingSlice,
+    ctx: Option<&data::TradingContext>,
+    tspec: &rcsr::trading::TradingSpec,
+) -> Result<rcsr::trading::PathStats, String> {
+    let mut pred: Vec<f64> = x.iter().map(|row| expr::eval(tree, row)).collect();
+    let Some(c) = ctx else {
+        return rcsr::trading::evaluate(&pred, &slice.ret, &slice.rows, tspec);
+    };
+    pred.extend(c.x.iter().map(|row| expr::eval(tree, row)));
+    let mut ret = slice.ret.clone();
+    ret.extend_from_slice(&c.slice.ret);
+    let mut rows = slice.rows.clone();
+    rows.time.extend_from_slice(&c.slice.rows.time);
+    rows.group.extend_from_slice(&c.slice.rows.group);
+    rows.funding.extend_from_slice(&c.slice.rows.funding);
+    rcsr::trading::evaluate(&pred, &ret, &rows, tspec)
+}
+
 fn trading_usage(msg: &str) -> ! {
     eprintln!("error: {}", msg);
     std::process::exit(EXIT_USAGE);
@@ -1271,7 +1314,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"seconds\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1284,6 +1327,9 @@ fn gpu_json(
         ops_json(&g.fit_fallback_improved_by_cause),
         ops_json(&g.fit_status_by_label),
         g.fit_refits,
+        g.fit_refit_candidates,
+        jnum(g.fit_refit_s),
+        jnum(g.fit_rescore_s),
         jnum(g.fit_ms / 1000.0),
         jnum(g.ledger.fit_kernel_lm_s()),
         jnum(g.ledger.fit_kernel_polish_s()),
@@ -1785,6 +1831,8 @@ impl DevSink {
             fit_kernel_f32_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_lm_s()),
             fit_kernel_f64_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_polish_s()),
             fit_fallback_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_fallback_s()),
+            fit_refit_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_s()),
+            fit_refits: outcome.gpu.as_ref().map(|g| g.fit_refits),
             events,
             bytes,
             dropped,
@@ -2316,10 +2364,13 @@ fn main() {
     let mut fit_rows_set = false;
     // #255: explicit --fit-fallback-max for the resume settings check.
     let mut fit_fallback_max_set = false;
+    // #495: explicit --refit-band for the resume settings check.
+    let mut refit_band_set = false;
     let mut fit_polish_set = false;
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
     let mut front_parents_set = false;
+    let mut linear_scaling_set = false; // #470
     // #25: `--units` is resolved against the prepared input list later; the
     // expressions themselves are parsed here so a typo is a usage error.
     let mut unit_assignments: Vec<(String, Unit)> = Vec::new();
@@ -2703,6 +2754,21 @@ fn main() {
                 cfg.fit_fallback_max = val!().parse().unwrap_or(cfg.fit_fallback_max);
                 fit_fallback_max_set = true;
             }
+            // #495: relative band of the exact finalist refit.
+            "--refit-band" => {
+                let v = val!();
+                cfg.refit_band = match v.as_str() {
+                    "inf" => f64::INFINITY,
+                    _ => match v.parse::<f64>() {
+                        Ok(b) if b.is_finite() && b >= 0.0 => b,
+                        _ => {
+                            eprintln!("error: --refit-band needs a number >= 0 or inf");
+                            std::process::exit(EXIT_USAGE);
+                        }
+                    },
+                };
+                refit_band_set = true;
+            }
             // #496: arithmetic of the device fit polish.
             "--fit-polish" => {
                 let v = val!();
@@ -2798,6 +2864,11 @@ fn main() {
                 if cfg.qd_bins == 0 {
                     cfg.qd_bins = 512;
                 }
+            }
+            // #470: opt-in affine output map around every candidate.
+            "--linear-scaling" => {
+                cfg.linear_scaling = true;
+                linear_scaling_set = true;
             }
             // #76: exactness escape hatch; the default is on.
             "--no-front-parents" => {
@@ -3363,6 +3434,17 @@ fn main() {
                 cfg.fit_fallback_max, saved.fit_fallback_max
             ));
         }
+        // #495: the band decides which finalists get the exact refit.
+        if refit_band_set && cfg.refit_band != saved.refit_band {
+            conflicts.push(format!(
+                "--refit-band {} (saved {})",
+                cfg.refit_band, saved.refit_band
+            ));
+        }
+        // #470: linear scaling is saved search state.
+        if linear_scaling_set && !saved.linear_scaling {
+            conflicts.push("--linear-scaling (saved linear_scaling is false)".to_string());
+        }
         // #76: front feedback is saved search state.
         if front_parents_set && cfg.front_parents != saved.front_parents {
             conflicts.push(format!(
@@ -3593,6 +3675,7 @@ fn main() {
             (null_block > 0, "--null-block"),
             (bootstrap_resamples > 0, "--bootstrap-error"),
             (cfg.metric == Metric::Slope, "--metric slope (its row pairs follow one target column)"),
+            (cfg.linear_scaling, "--linear-scaling"),
             (stability_runs > 0, "--stability"),
             (report.is_some(), "--report"),
             (run_manifest_path.is_some(), "--run-manifest"),
@@ -3606,6 +3689,22 @@ fn main() {
                 );
                 std::process::exit(EXIT_USAGE);
             }
+        }
+    }
+
+    if cfg.linear_scaling {
+        let refusal = if !cfg.metric.is_least_squares() {
+            Some("linear scaling needs a least-squares metric (squared, aic, aicc, bic)")
+        } else if cfg.fit_iters == 0 {
+            Some("linear scaling needs constant fitting (--fit-iters > 0, no --no-fit)")
+        } else if cfg.variation == rcsr::search::VariationMode::Postfix {
+            Some("linear scaling needs constant fitting, which --variation postfix does not do")
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            eprintln!("error: --linear-scaling: {}", reason);
+            std::process::exit(EXIT_USAGE);
         }
     }
 
@@ -4481,11 +4580,34 @@ fn main() {
         if multi_output {
             trading_usage("--objective is not supported with multiple targets (--target y1,y2)");
         }
-        if allow_short || position_arg.as_deref().is_some_and(|p| p != "long_only") {
+        let position_map = match position_arg.as_deref() {
+            None => rcsr::trading::PositionMap::Threshold,
+            Some("short") => trading_usage(
+                "--position short and --allow-short are refused: the book is long-only, \
+                 there is no short P&L, borrow or funding",
+            ),
+            Some(p) => match rcsr::trading::PositionMap::parse(p) {
+                Ok(m) => m,
+                Err(e) => trading_usage(&e),
+            },
+        };
+        if allow_short {
             trading_usage(
                 "--position short and --allow-short are refused: the book is long-only, \
                  there is no short P&L, borrow or funding",
             );
+        }
+        let top_tercile = position_map == rcsr::trading::PositionMap::TopTercile;
+        if top_tercile {
+            if !matches!(mode, data::SplitMode::Temporal) {
+                trading_usage(
+                    "--position top_tercile needs --split temporal: another split can put part of a \
+                     timestamp's cross-section on the other side of the split",
+                );
+            }
+            if trading_flags.contains(&"--threshold") {
+                trading_usage("--position top_tercile has no threshold: remove --threshold");
+            }
         }
         if !matches!(mode, data::SplitMode::Temporal | data::SplitMode::TemporalGroup)
             || time_col.is_none()
@@ -4502,10 +4624,16 @@ fn main() {
                 name
             )),
         };
-        if ts.kind != "forward_return" {
+        if ts.kind != "forward_return" && ts.kind != target::KIND_XS_RANK {
             trading_usage(&format!(
-                "--objective {} needs a forward_return target, the spec declares '{}'",
+                "--objective {} needs a forward_return or xs_rank target, the spec declares '{}'",
                 name, ts.kind
+            ));
+        }
+        if ts.kind == target::KIND_XS_RANK && !top_tercile {
+            trading_usage(&format!(
+                "--objective {} on an xs_rank target prices the top-tercile book: add --position top_tercile",
+                name
             ));
         }
         let spec_declares_cost = ts.per_side_cost_bps().is_some();
@@ -4544,6 +4672,7 @@ fn main() {
             log_returns: ts.return_units == "log",
             funding_column: trade_funding.clone(),
             train: fitness_pnl, // #480
+            cross_section: top_tercile,
         });
         let tspec = rcsr::trading::TradingSpec {
             cost_bps: cost,
@@ -4554,6 +4683,7 @@ fn main() {
             min_holding: trade_min_holding,
             threshold: trade_threshold,
             max_position: trade_max_position,
+            position: position_map,
             ..Default::default()
         };
         if let Err(e) = tspec.validate() {
@@ -4580,6 +4710,9 @@ fn main() {
         }
         if trade_min_holding > 1 {
             trading_usage("--fitness pnl is not supported with --min-holding > 1: the fitness is the plain threshold rule");
+        }
+        if trading_spec.as_ref().is_some_and(|s| s.position != rcsr::trading::PositionMap::Threshold) {
+            trading_usage("--fitness pnl is not supported with --position top_tercile: the fitness is the plain threshold rule");
         }
         if trade_max_position != 1.0 {
             trading_usage("--fitness pnl needs --max-position 1: the fitness is the unit long/flat book");
@@ -5749,7 +5882,7 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(" ");
             eprintln!(
-                "# fit: gpu-fit screened={} admitted_wide={} admitted={} gpu={} fallback={} [{}] labels=[{}] refits={} fallback_s={:.3} bounded={}/{} workers={}",
+                "# fit: gpu-fit screened={} admitted_wide={} admitted={} gpu={} fallback={} [{}] labels=[{}] refit_candidates={} refits={} refit_s={:.3} rescore_s={:.3} fallback_s={:.3} bounded={}/{} workers={}",
                 g.fit_screened,
                 g.fit_admitted_wide,
                 g.fit_attempts,
@@ -5757,7 +5890,10 @@ fn main() {
                 g.fit_fallback,
                 causes,
                 labels,
+                g.fit_refit_candidates,
                 g.fit_refits,
+                g.fit_refit_s,
+                g.fit_rescore_s,
                 g.fit_fallback_ms / 1000.0,
                 g.fit_fallback_bounded,
                 g.fit_fallback_max,
@@ -5855,8 +5991,8 @@ fn main() {
             };
             let objective_value = match (&trading_spec, &prepared.validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
                 (Some(tspec), Some(v), Some(slice)) => {
-                    let vpred: Vec<f64> = v.x.iter().map(|row| expr::eval(&s.tree, row)).collect();
-                    match rcsr::trading::evaluate(&vpred, &slice.ret, &slice.rows, tspec) {
+                    let ctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
+                    match trading_book(&s.tree, &v.x, slice, ctx, tspec) {
                         Ok(stats) => objective.score(&stats, tspec.min_trades),
                         Err(_) => f64::INFINITY,
                     }
@@ -6028,11 +6164,8 @@ fn main() {
     let objective_report: Option<rcsr::trading::FinalistReport> = match (&trading_spec, rows.first()) {
         (Some(tspec), Some(top)) => {
             let tree = &sorted[top.archive_rank - 1].tree;
-            let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>| match slice {
-                Some(slice) => {
-                    let pred: Vec<f64> = sample.x.iter().map(|row| expr::eval(tree, row)).collect();
-                    rcsr::trading::evaluate(&pred, &slice.ret, &slice.rows, tspec)
-                }
+            let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>, ctx: Option<&data::TradingContext>| match slice {
+                Some(slice) => trading_book(tree, &sample.x, slice, ctx, tspec),
                 None => Err("no trading rows".to_string()),
             };
             let split = prepared.trading.as_ref();
@@ -6058,10 +6191,10 @@ fn main() {
                 validation_value: top.objective_value,
                 search_fitness: fitness_book.as_ref().map(|_| "long_pnl_regret"),
                 validation: match &prepared.validation {
-                    Some(v) => book(v, split.and_then(|t| t.validation.as_ref())),
+                    Some(v) => book(v, split.and_then(|t| t.validation.as_ref()), split.and_then(|t| t.validation_context.as_ref())),
                     None => Err("no validation slice".to_string()),
                 },
-                test: book(&prepared.test, split.map(|t| &t.test)),
+                test: book(&prepared.test, split.map(|t| &t.test), split.and_then(|t| t.test_context.as_ref())),
             })
         }
         _ => None,
@@ -9562,7 +9695,11 @@ OPTIONS:
                              radix count, so theta is bit-identical to numpy
   --threshold-fixed <theta>  pre-registered fixed threshold instead of a quantile;
                              reported with threshold_source = fixed
-  --policy <p>               threshold | band | dp (default threshold). band is a
+  --policy <p>               threshold | band | dp | top-tercile (default threshold). top-tercile
+                             holds the top floor(n/3) finite scores of each timestamp long and
+                             the rest flat (no threshold; --threshold-quantile, --threshold-fixed,
+                             --band, --min-hold, --select-band, --device-pnl and --batch-pnl are
+                             refused). band is a
                              long-only no-trade band; dp keeps the threshold book
                              and reports the exact hindsight DP as a bound, never
                              as the strategy's P&L
@@ -9631,7 +9768,7 @@ OPTIONS:
   --fdr-q <q>                Benjamini-Hochberg rate (default 0.10)
   --ledger <file>            append-only JSONL candidate ledger. A development
                              run appends a candidate (test_read:false) and
-                             refuses windows that touch the declared lockbox
+                             refuses windows that reach the declared lockbox
   --lockbox <START,END|none>
                              locked test, UTC half-open. Order: this flag, the range
                              declared with --data (store manifest, schema or sidecar),
@@ -9640,8 +9777,9 @@ OPTIONS:
                              that does not cover the declared range is refused (exit
                              2), as are conflicting declarations (exit 3). `none` opts
                              out; it is refused when the data declares a range and
-                             with --ledger or --locked-test. A window touching the
-                             range is refused (exit 3) unless --locked-test reads it
+                             with --ledger or --locked-test. A window ending after START minus
+                             the label purge (entry offset + horizon + delay) is refused
+                             (exit 3) unless --locked-test reads it
   --locked-test              read the locked test once for a sealed candidate.
                              Needs --ledger and --sealed. A second read, an
                              unsealed candidate or a code/data hash that differs
@@ -9654,6 +9792,11 @@ OPTIONS:
   --sealed <file>            locked_candidates.json from `rcsr protocol seal`
   --verify-read              with --locked-test: recompute a recorded read and
                              compare its report hash; records nothing
+  --allow-unbound-ledger     with --locked-test: read a candidate whose ledger
+                             recorded no locked test range (old ledger); the read
+                             is reported as unbound. Without it that read is
+                             refused (exit 3), as is a range that differs from
+                             the one the candidate was developed against
   --expect-report-sha256 <h> exit 1 unless the report JSON hashes to h
   --json                     print the full JSON report to stdout
                              (it ends with a ledger object: the phase ledger of the
@@ -9720,6 +9863,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut sealed_path: Option<String> = None;
     let mut locked_test = false;
     let mut verify_read = false;
+    let mut allow_unbound = false;
     let mut lockbox_arg: Option<String> = None;
     let mut expect_hash: Option<String> = None;
     let mut front_path: Option<String> = None;
@@ -9949,6 +10093,7 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--locked-test" => locked_test = true,
             "--verify-read" => verify_read = true,
+            "--allow-unbound-ledger" => allow_unbound = true,
             "--allow-lockbox" => allow_lockbox = true,
             other if other.starts_with("--policy=") => {
                 let src = &other["--policy=".len()..];
@@ -10018,6 +10163,9 @@ fn run_walkforward(args: &[String]) -> ! {
     if front_path.is_some() && target_spec_path.is_some() {
         usage_fail("--front and --target-spec are alternatives: the run carries its own target spec");
     }
+    if policy == walkforward::Policy::TopTercile && (quantile_set || threshold_fixed.is_some()) {
+        usage_fail("--policy top-tercile has no threshold: do not pass --threshold-quantile or --threshold-fixed");
+    }
     let mut cost_spec: Option<rcsr::target::TargetSpec> = None;
     let mut run_cost: Option<(f64, rcsr::target::CostSource)> = None;
     let mut front_run: Option<rcsr::run_json::RunFile> = None;
@@ -10035,7 +10183,17 @@ fn run_walkforward(args: &[String]) -> ! {
         let book = run.book().unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
         expressions.push(book.expression.clone());
         vars_src = Some(book.variables.join(","));
-        threshold_fixed = Some(book.threshold);
+        if book.position == rcsr::trading::PositionMap::TopTercile {
+            if policy != walkforward::Policy::Threshold && policy != walkforward::Policy::TopTercile {
+                usage_fail("--policy conflicts with the run: it priced the top_tercile book");
+            }
+            policy = walkforward::Policy::TopTercile;
+        } else {
+            if policy == walkforward::Policy::TopTercile {
+                usage_fail("--policy top-tercile conflicts with the run: it priced the threshold book");
+            }
+            threshold_fixed = Some(book.threshold);
+        }
         run_cost = Some((book.per_side_bps, book.source));
         cost_spec = Some(book.spec);
     } else if let Some(path) = &front_path {
@@ -10088,7 +10246,15 @@ fn run_walkforward(args: &[String]) -> ! {
         }
         // The front is priced as the books the search compared: the run's
         // fixed threshold, cost and target spec.
-        if let Some(theta) = run.threshold {
+        if run.position == rcsr::trading::PositionMap::TopTercile {
+            if policy != walkforward::Policy::Threshold && policy != walkforward::Policy::TopTercile {
+                usage_fail("--policy conflicts with the run: it priced the top_tercile book");
+            }
+            policy = walkforward::Policy::TopTercile;
+        } else if let Some(theta) = run.threshold {
+            if policy == walkforward::Policy::TopTercile {
+                usage_fail("--policy top-tercile conflicts with the run: it priced the threshold book");
+            }
             if threshold_fixed.is_none() && !quantile_set {
                 threshold_fixed = Some(theta);
             }
@@ -10330,20 +10496,29 @@ fn run_walkforward(args: &[String]) -> ! {
             continue;
         }
         let (ls, le) = (rg.start as f64, rg.end as f64);
+        let label_purge = popts.required_purge_seconds(spec.horizon).max(spec.embargo_seconds());
+        let boundary = ls - label_purge;
         for w in &spec.windows {
-            let train_hits = w.train_start < le && w.train_end > ls;
-            let test_hits = w.test_start < le && w.test_end > ls;
+            let train_hits = w.train_start < le && w.train_end > boundary;
+            let test_hits = w.test_start < le && w.test_end > boundary;
             let test_inside = w.test_start >= ls && w.test_end <= le;
             let problem = if locked_test {
                 if train_hits {
-                    Some("trains on the locked test")
+                    Some("trains within the label purge of the locked test".to_string())
                 } else if !test_inside {
-                    Some("tests outside the locked test")
+                    Some("tests outside the locked test".to_string())
                 } else {
                     None
                 }
             } else if train_hits || test_hits {
-                Some("touches the declared locked test; read it only with --locked-test and a sealed list")
+                Some(format!(
+                    "reaches the declared locked test {}..{} (label end = stamp + {} s); \
+                     end it at or before {}, or read the locked test only with --locked-test and a sealed list",
+                    rcsr::protocol::iso(ls),
+                    rcsr::protocol::iso(le),
+                    label_purge,
+                    rcsr::protocol::iso(boundary)
+                ))
             } else {
                 None
             };
@@ -10369,6 +10544,12 @@ fn run_walkforward(args: &[String]) -> ! {
     let spec_sha = rcsr::manifest::sha256_hex(rcsr::protocol::procedure_spec(&spec, &popts).as_bytes());
     let candidate_id = rcsr::protocol::Candidate::address(&spec_sha, &data_sha, &build_id);
     let ledger = ledger_path.as_ref().map(rcsr::protocol::Ledger::new);
+    let current_range = resolved
+        .range
+        .map(|l| rcsr::protocol::LockedRange::new(&l, resolved.source.as_str()));
+    let binding = current_range
+        .as_ref()
+        .map(|current| rcsr::protocol::RangeBinding { current, allow_unbound });
     let mut read_count = 0u64;
     if let (Some(l), true) = (&ledger, locked_test) {
         match l.final_seal() {
@@ -10394,10 +10575,13 @@ fn run_walkforward(args: &[String]) -> ! {
             l.verify_chain()?;
             if locked_test {
                 let sealed = std::path::Path::new(sealed_path.as_deref().unwrap_or(""));
-                if verify_read {
-                    l.authorize_sealed(sealed, &candidate_id, &data_sha, &build_id)?;
+                let entry = if verify_read {
+                    l.authorize_sealed(sealed, &candidate_id, &data_sha, &build_id, binding)?
                 } else {
-                    l.authorize_read(sealed, &candidate_id, &data_sha, &build_id)?;
+                    l.authorize_read(sealed, &candidate_id, &data_sha, &build_id, binding)?
+                };
+                if entry.locked_test.is_none() {
+                    eprintln!("warning: candidate {} has no recorded locked test; the read is unbound", candidate_id);
                 }
                 l.check_read_marker(&data_path)?;
             } else {
@@ -10455,7 +10639,7 @@ fn run_walkforward(args: &[String]) -> ! {
                 }
             } else if locked_test {
                 l.write_read_marker(&data_path, "test_read", &report_sha)
-                    .and_then(|_| l.record_read(&candidate_id, &report_sha))
+                    .and_then(|_| l.record_read(&candidate_id, &report_sha, current_range.as_ref()))
             } else {
                 l.add_candidate(&rcsr::protocol::Candidate {
                     id: candidate_id.clone(),
@@ -10464,6 +10648,7 @@ fn run_walkforward(args: &[String]) -> ! {
                     build_commit: build_id.clone(),
                     report_sha256: report_sha.clone(),
                     expression: report.candidates.join(" | "),
+                    locked_test: current_range.clone(),
                 })
                 .map(|_| read_count)
             };
@@ -10487,6 +10672,13 @@ fn run_walkforward(args: &[String]) -> ! {
         lockbox_facts.pop();
         lockbox_facts.push(',');
         lockbox_facts.push_str(&resolved.report_fields(rows, locked_test, true));
+        if locked_test {
+            lockbox_facts.push_str(&format!(
+                ",\"data_sha256\":{},\"read_marker\":{}",
+                jstr(&data_sha),
+                jstr(&rcsr::protocol::marker_path(&data_path))
+            ));
+        }
         lockbox_facts.push('}');
         protocol_json = Some(format!(
             "{{\"lockbox\":{},\"candidate_id\":{},\"report_sha256\":{},\"test_read\":{},\
@@ -10808,7 +11000,7 @@ fn run_audit(args: &[String]) -> ! {
     value_idx.dedup();
     let names: Vec<&str> = value_idx.iter().map(|&j| table.names[j].as_str()).collect();
 
-    let (times, mut time_audit, time_report) = match time_idx {
+    let (times, time_audit, time_report) = match time_idx {
         Some(j) => {
             let raw = data::time_keys(&table, j).to_f64();
             let (seconds, audit, report) = leakage::time_normalizer(&raw, unit);
@@ -10835,7 +11027,14 @@ fn run_audit(args: &[String]) -> ! {
         .filter(|&r| !ranges.iter().any(|l| times[r].is_finite() && l.contains(times[r].floor() as i64)))
         .collect();
     let rows_left_out = times.len() - keep.len();
-    let times: Vec<f64> = keep.iter().map(|&r| times[r]).collect();
+    let (times, mut time_audit, time_report) = if rows_left_out == 0 {
+        (times, time_audit, time_report)
+    } else {
+        // The time audit and its D1 findings describe the rows that stay.
+        let kept: Vec<f64> = keep.iter().map(|&r| times[r]).collect();
+        let (seconds, audit, report) = leakage::time_normalizer(&kept, data::TimeUnit::Seconds);
+        (seconds, Some(audit), report)
+    };
     let panel = match leakage::Panel::new(
         times,
         names
@@ -11140,7 +11339,7 @@ fn run_audit(args: &[String]) -> ! {
         if clean { EXIT_OK } else { EXIT_LEAKAGE },
         hash,
         jstr(leakage::TZDB_VERSION),
-        table.len(),
+        panel.len(),
         jstr(&target),
         jstr(&time_s),
         jstr(&unit_s),
@@ -11416,9 +11615,12 @@ mod tests {
         g.fit_fallback_bounded = 0;
         g.fit_fallback_workers = 8;
         g.fit_fallback_max = 4096;
+        g.fit_polish = rcsr::fit::FitPolish::F32;
+        g.ledger.record_fit(0.5, 0.75, 0.125);
+        g.ledger.record_fit_polish_split(0.25);
         let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true, 10.0);
         assert!(
-            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"admitted_wide\":0,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"seconds\":0.25,\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096}"),
+            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"admitted_wide\":0,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"seconds\":0.25,\"kernel_f32_s\":0.5,\"kernel_f64_s\":0.25,\"polish\":\"f32\",\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096,\"fit_rows\":0,\"score_rows\":0,\"fit_twin_bytes\":0,\"subsample_hash\":null}"),
             "{}",
             json
         );

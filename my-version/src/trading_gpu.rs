@@ -114,11 +114,14 @@ pub enum ThresholdSource {
     ValidationType7,
     /// A pre-registered constant threshold, never fitted to the data.
     Fixed,
+    /// The top-tercile policy has no threshold (#493).
+    None,
 }
 
 impl ThresholdSource {
     pub fn as_str(self) -> &'static str {
         match self {
+            ThresholdSource::None => "none",
             ThresholdSource::TrainType7 => "train_type7",
             ThresholdSource::ValidationType7 => "validation_type7",
             ThresholdSource::Fixed => "fixed",

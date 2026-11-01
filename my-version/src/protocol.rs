@@ -79,6 +79,8 @@ pub const SCHEMES: [&str; 3] = ["expanding", "rolling", "locked"];
 
 pub fn default_windows(purge_seconds: f64) -> Vec<WindowRow> {
     let dev_start = month_start(2022, 1, 0);
+    let locked_start = month_start(2025, 7, 0);
+    let dev_end = locked_start - purge_seconds;
     let mut rows = Vec::new();
     let quarter = |scheme: &str, label: String, train_start: f64, test_start: f64, test_end: f64| WindowRow {
         scheme: scheme.to_string(),
@@ -97,7 +99,7 @@ pub fn default_windows(purge_seconds: f64) -> Vec<WindowRow> {
     for step in 0..10 {
         let months = 12 + step * MONTHS_PER_QUARTER;
         let test_start = month_start(2022, 1, months);
-        let test_end = month_start(2022, 1, months + MONTHS_PER_QUARTER);
+        let test_end = month_start(2022, 1, months + MONTHS_PER_QUARTER).min(dev_end);
         let (y, m) = civil_ym(test_start);
         rows.push(quarter(
             "expanding",
@@ -110,7 +112,7 @@ pub fn default_windows(purge_seconds: f64) -> Vec<WindowRow> {
     for step in 0..6 {
         let months = 24 + step * MONTHS_PER_QUARTER;
         let test_start = month_start(2022, 1, months);
-        let test_end = month_start(2022, 1, months + MONTHS_PER_QUARTER);
+        let test_end = month_start(2022, 1, months + MONTHS_PER_QUARTER).min(dev_end);
         let (y, m) = civil_ym(test_start);
         rows.push(quarter(
             "rolling",
@@ -124,7 +126,7 @@ pub fn default_windows(purge_seconds: f64) -> Vec<WindowRow> {
         "locked",
         "locked-test".to_string(),
         dev_start,
-        month_start(2025, 7, 0),
+        locked_start,
         month_start(2026, 7, 0),
     ));
     rows
@@ -290,12 +292,80 @@ pub struct FinalSeal {
     pub report_candidates: bool,
 }
 
+/// The locked test range a ledger line was made against: start and end in
+/// epoch seconds (half-open) and where the range came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LockedRange {
+    pub start: i64,
+    pub end: i64,
+    pub source: String,
+}
+
+impl LockedRange {
+    pub fn new(range: &crate::lockbox::Lockbox, source: &str) -> Self {
+        LockedRange { start: range.start, end: range.end, source: source.to_string() }
+    }
+
+    /// `"locked_test":{...}` as stored on ledger lines and sealed items.
+    pub fn json(&self) -> String {
+        format!(
+            "\"locked_test\":{{\"start\":{},\"end\":{},\"source\":{}}}",
+            self.start,
+            self.end,
+            esc(&self.source)
+        )
+    }
+
+    /// The `locked_test` object of a ledger line or sealed item, if it has one.
+    fn parse(text: &str) -> Option<LockedRange> {
+        let obj = crate::manifest::object(text, "locked_test")?;
+        Some(LockedRange {
+            start: crate::lockbox::int_field(obj, "start")?,
+            end: crate::lockbox::int_field(obj, "end")?,
+            source: field_str(obj, "source").unwrap_or_default(),
+        })
+    }
+
+    fn describe(&self) -> String {
+        format!("{}..{} ({})", crate::lockbox::date(self.start), crate::lockbox::date(self.end), self.source)
+    }
+}
+
+/// The range a locked read resolves now, checked against the range a sealed
+/// candidate was developed against.
+#[derive(Clone, Copy, Debug)]
+pub struct RangeBinding<'a> {
+    pub current: &'a LockedRange,
+    /// Read a candidate of an old ledger that recorded no range.
+    pub allow_unbound: bool,
+}
+
+impl RangeBinding<'_> {
+    fn check(&self, id: &str, developed: Option<&LockedRange>) -> Result<(), String> {
+        match developed {
+            Some(d) if (d.start, d.end) == (self.current.start, self.current.end) => Ok(()),
+            Some(d) => Err(format!(
+                "candidate {} was developed against the locked test {}; this read resolves {}",
+                id,
+                d.describe(),
+                self.current.describe()
+            )),
+            None if self.allow_unbound => Ok(()),
+            None => Err(format!(
+                "candidate {} has no recorded locked test (the ledger predates range binding); \
+                 pass --allow-unbound-ledger to read it unbound",
+                id
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     Candidate(Candidate),
     Seal { sealed_sha256: String, final_seal: Option<FinalSeal> },
-    TestRead { id: String, report_sha256: String, read_count: u64 },
-    BaselineRead { data_sha256: String, report_sha256: String },
+    TestRead { id: String, report_sha256: String, read_count: u64, locked_test: Option<LockedRange> },
+    BaselineRead { data_sha256: String, report_sha256: String, locked_test: Option<LockedRange> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -306,6 +376,8 @@ pub struct Candidate {
     pub build_commit: String,
     pub report_sha256: String,
     pub expression: String,
+    /// The locked test the candidate was developed against.
+    pub locked_test: Option<LockedRange>,
 }
 
 impl Candidate {
@@ -363,6 +435,7 @@ impl Ledger {
                     build_commit: get("build_commit"),
                     report_sha256: get("report_sha256"),
                     expression: get("expression"),
+                    locked_test: LockedRange::parse(&line),
                 }),
                 "seal" => Event::Seal {
                     sealed_sha256: get("sealed_sha256"),
@@ -379,10 +452,12 @@ impl Ledger {
                     id: get("id"),
                     report_sha256: get("report_sha256"),
                     read_count: field_num(&line, "read_count").unwrap_or(0.0) as u64,
+                    locked_test: LockedRange::parse(&line),
                 },
                 "baseline_read" => Event::BaselineRead {
                     data_sha256: get("data_sha256"),
                     report_sha256: get("report_sha256"),
+                    locked_test: LockedRange::parse(&line),
                 },
                 other => return Err(format!("unknown ledger event '{}'", other)),
             });
@@ -410,12 +485,13 @@ impl Ledger {
         self.refuse_if_final()?;
         self.append(&format!(
             "\"event\":\"candidate\",\"id\":\"{}\",\"spec_sha256\":\"{}\",\"data_sha256\":\"{}\",\
-             \"build_commit\":\"{}\",\"report_sha256\":\"{}\",\"test_read\":false,\"expression\":{}",
+             \"build_commit\":\"{}\",\"report_sha256\":\"{}\",\"test_read\":false,{}\"expression\":{}",
             c.id,
             c.spec_sha256,
             c.data_sha256,
             c.build_commit,
             c.report_sha256,
+            c.locked_test.as_ref().map(|l| format!("{},", l.json())).unwrap_or_default(),
             esc(&c.expression)
         ))?;
         Ok(c.id.clone())
@@ -539,12 +615,13 @@ impl Ledger {
             .map(|c| {
                 format!(
                     "{{\"id\":\"{}\",\"spec_sha256\":\"{}\",\"data_sha256\":\"{}\",\
-                     \"build_commit\":\"{}\",\"report_sha256\":\"{}\",\"expression\":{}}}",
+                     \"build_commit\":\"{}\",\"report_sha256\":\"{}\",{}\"expression\":{}}}",
                     c.id,
                     c.spec_sha256,
                     c.data_sha256,
                     c.build_commit,
                     c.report_sha256,
+                    c.locked_test.as_ref().map(|l| format!("{},", l.json())).unwrap_or_default(),
                     esc(&c.expression)
                 )
             })
@@ -566,6 +643,7 @@ impl Ledger {
         id: &str,
         data_sha256: &str,
         build_commit: &str,
+        bind: Option<RangeBinding>,
     ) -> Result<Candidate, String> {
         self.verify_chain()?;
         let bytes = std::fs::read(sealed).map_err(|e| format!("{}: {}", sealed.display(), e))?;
@@ -596,6 +674,7 @@ impl Ledger {
             build_commit: get("build_commit"),
             report_sha256: get("report_sha256"),
             expression: get("expression"),
+            locked_test: LockedRange::parse(&entry),
         };
         if candidate.data_sha256 != data_sha256 || candidate.build_commit != build_commit {
             return Err(format!(
@@ -603,6 +682,9 @@ impl Ledger {
                  (data {} vs {}, build {} vs {}); the run is void",
                 id, data_sha256, candidate.data_sha256, build_commit, candidate.build_commit
             ));
+        }
+        if let Some(b) = bind {
+            b.check(id, candidate.locked_test.as_ref())?;
         }
         Ok(candidate)
     }
@@ -615,8 +697,9 @@ impl Ledger {
         id: &str,
         data_sha256: &str,
         build_commit: &str,
+        bind: Option<RangeBinding>,
     ) -> Result<Candidate, String> {
-        let candidate = self.authorize_sealed(sealed, id, data_sha256, build_commit)?;
+        let candidate = self.authorize_sealed(sealed, id, data_sha256, build_commit, bind)?;
         if self.read_report_sha(id).is_some() {
             return Err(format!(
                 "candidate {} already has test_read:true; the locked test is read once",
@@ -644,18 +727,21 @@ impl Ledger {
     }
 
     /// Append `test_read:true` for `id`. Returns the new total read count.
-    pub fn record_read(&self, id: &str, report_sha256: &str) -> Result<u64, String> {
+    pub fn record_read(&self, id: &str, report_sha256: &str, range: Option<&LockedRange>) -> Result<u64, String> {
         let count = self.read_count()? + 1;
         self.append(&format!(
-            "\"event\":\"test_read\",\"id\":\"{}\",\"report_sha256\":\"{}\",\"read_count\":{},\"test_read\":true",
-            id, report_sha256, count
+            "\"event\":\"test_read\",\"id\":\"{}\",\"report_sha256\":\"{}\",\"read_count\":{},{}\"test_read\":true",
+            id,
+            report_sha256,
+            count,
+            range.map(|l| format!("{},", l.json())).unwrap_or_default()
         ))?;
         Ok(count)
     }
 
     /// Check that a baseline ladder may read the locked test: the sealed list
     /// was recorded in the ledger and no baseline read exists yet.
-    pub fn authorize_baseline_read(&self, sealed: &std::path::Path) -> Result<(), String> {
+    pub fn authorize_baseline_read(&self, sealed: &std::path::Path, bind: Option<RangeBinding>) -> Result<(), String> {
         self.verify_chain()?;
         let bytes = std::fs::read(sealed).map_err(|e| format!("{}: {}", sealed.display(), e))?;
         let hash = sha256_hex(&bytes);
@@ -673,14 +759,28 @@ impl Ledger {
         if events.iter().any(|e| matches!(e, Event::BaselineRead { .. })) {
             return Err("the ledger already has a baseline_read; the locked test is read once".to_string());
         }
+        if let Some(b) = bind {
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            for chunk in text.split("{\"id\":\"").skip(1) {
+                let id = chunk.split('"').next().unwrap_or_default();
+                b.check(id, LockedRange::parse(chunk).as_ref())?;
+            }
+        }
         Ok(())
     }
 
     /// Append the `baseline_read` event of a ladder run on the locked test.
-    pub fn record_baseline_read(&self, data_sha256: &str, report_sha256: &str) -> Result<(), String> {
+    pub fn record_baseline_read(
+        &self,
+        data_sha256: &str,
+        report_sha256: &str,
+        range: Option<&LockedRange>,
+    ) -> Result<(), String> {
         self.append(&format!(
-            "\"event\":\"baseline_read\",\"data_sha256\":\"{}\",\"report_sha256\":\"{}\",\"test_read\":true",
-            data_sha256, report_sha256
+            "\"event\":\"baseline_read\",\"data_sha256\":\"{}\",\"report_sha256\":\"{}\",{}\"test_read\":true",
+            data_sha256,
+            report_sha256,
+            range.map(|l| format!("{},", l.json())).unwrap_or_default()
         ))
     }
 }

@@ -1556,6 +1556,9 @@ pub fn run(args: &[String]) -> ! {
     if matches!(cmd, "schema" | "append") {
         crate::panel_append::cli(cmd, &args[1..]);
     }
+    if cmd == "rank" {
+        crate::panel_rank::cli(&args[1..]);
+    }
     let mut data = None;
     let mut membership_path = None;
     let mut out = None;
@@ -2071,6 +2074,8 @@ HOURLY V2 PANEL (#259):
   rcsr panel validate --data panel.rcsb [--base base_h1.rcsb] [--membership membership.csv]
   rcsr panel schema --data panel.rcsb [--panel-version V] [--verify]
   rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b --out out.rcsb [--scratch dir]
+  rcsr panel rank --data panel.rcsb --column lbl_h1_fwd --name lbl_h1_xs --out out.rcsb [--min-members 20]
+                  per-timestamp rank in [-1, 1] over the panel members; adds the xs_rank target spec (#493)
   --input <dir>           archive directory (SYMBOL/SYMBOL-15m-YYYY-MM.zip); no network
   --jobs <n>              parallel symbols for snapshot and base (default 1)
   --gpu <auto|on|off>     base: run the 15m to 1h fold on the CUDA device (auto: from 1M decoded rows;

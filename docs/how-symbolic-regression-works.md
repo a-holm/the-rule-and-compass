@@ -110,6 +110,12 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
 - **Constant fitting** tunes the numeric constants of a candidate by local
   search. Without it, `y = a·sin(b·x) + c` would almost never be found, because
   random constants rarely land near the right values.
+- **Linear scaling** (`--linear-scaling`, off by default) wraps every candidate
+  shape `f` in a free affine map `a + b·f(x)`. The two coefficients are ordinary
+  constants, fitted with the others (closed-form least-squares start on the
+  CPU), so a shape that is right up to scale and offset scores as right at
+  once. Variation edits the bare shape; the front holds the wrapped formula
+  with its full complexity. It needs a least-squares metric.
 - **Migration** periodically copies an island's best member into a neighbouring
   island; **stagnant islands are restarted** to avoid getting stuck.
 - Termination is by generation count or a time/effort budget.

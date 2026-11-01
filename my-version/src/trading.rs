@@ -12,6 +12,10 @@
 //!                                          c_side * p_end for the exit)
 //! ```
 //!
+//! `PositionMap::TopTercile` replaces the threshold: per timestamp the top
+//! `floor(n / 3)` finite predictions are long (`p = 1`), every other row is flat.
+//! The rank uses only the predictions of that timestamp.
+//!
 //! Rows are equal-weighted per timestamp (the walk-forward cross-section). The
 //! Sharpe is daily: sub-daily periods are compounded per calendar day and
 //! annualised with `sqrt(365)`, with the sample standard deviation (ddof = 1).
@@ -90,6 +94,36 @@ impl Objective {
     }
 }
 
+/// How a prediction becomes a position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PositionMap {
+    /// `1[pred > threshold]`, or the `tau` ramp.
+    #[default]
+    Threshold,
+    /// Per timestamp, the top `floor(n / 3)` finite predictions are long.
+    TopTercile,
+}
+
+impl PositionMap {
+    pub fn parse(s: &str) -> Result<PositionMap, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "long_only" | "threshold" => Ok(PositionMap::Threshold),
+            "top_tercile" | "top-tercile" => Ok(PositionMap::TopTercile),
+            other => Err(format!(
+                "unknown --position '{}' (expected long_only or top_tercile; short is refused: the book is long-only)",
+                other
+            )),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            PositionMap::Threshold => "long_only",
+            PositionMap::TopTercile => "top_tercile",
+        }
+    }
+}
+
 /// The book's assumptions. Costs are per side, in basis points of notional.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TradingSpec {
@@ -110,6 +144,7 @@ pub struct TradingSpec {
     /// Sizing scale; `None` is the `{0, 1}` indicator.
     pub tau: Option<f64>,
     pub max_position: f64,
+    pub position: PositionMap,
     /// Override of the annualisation. `None` compounds sub-daily periods per
     /// day and uses 365.
     pub periods_per_year: Option<f64>,
@@ -129,6 +164,7 @@ impl Default for TradingSpec {
             threshold: 0.0,
             tau: None,
             max_position: 1.0,
+            position: PositionMap::Threshold,
             periods_per_year: None,
         }
     }
@@ -174,6 +210,9 @@ impl TradingSpec {
         if self.min_holding == 0 {
             return Err("min_holding must be at least 1".to_string());
         }
+        if self.position == PositionMap::TopTercile && (self.tau.is_some() || self.min_holding > 1 || self.max_position != 1.0) {
+            return Err("the top_tercile book is the unit {0, 1} position: it needs no tau, min_holding 1 and max_position 1".to_string());
+        }
         if let Some(p) = self.periods_per_year {
             if !(p.is_finite() && p > 0.0) {
                 return Err(format!("periods_per_year must be positive, got {}", p));
@@ -184,10 +223,11 @@ impl TradingSpec {
 
     pub fn json(&self) -> String {
         format!(
-            "{{\"position\":\"long_only\",\"threshold\":{},\"tau\":{},\"max_position\":{},\
+            "{{\"position\":\"{}\",\"threshold\":{},\"tau\":{},\"max_position\":{},\
              \"cost_bps\":{},\"fee_bps\":{},\"half_spread_bps\":{},\"slippage_bps\":{},\
              \"per_side_bps\":{},\"funding_col\":{},\"cash_return\":{},\"min_trades\":{},\
              \"min_holding\":{}}}",
+            self.position.name(),
             num(self.threshold),
             self.tau.map(num).unwrap_or_else(|| "null".to_string()),
             num(self.max_position),
@@ -781,6 +821,30 @@ fn usable(i: usize, r: &[f64], rows: &TradingRows) -> bool {
         && (rows.funding.is_empty() || rows.funding[i].is_finite())
 }
 
+/// Top-tercile positions: per timestamp, the highest `floor(n / 3)` of the `n`
+/// finite predictions get `1.0`, ties by row order; every other row gets `0.0`.
+/// A timestamp with fewer than 3 finite predictions holds nothing. Only the
+/// predictions of one timestamp enter its ranks.
+pub fn top_tercile_positions(pred: &[f64], time: &[f64]) -> Vec<f64> {
+    let mut pos = vec![0.0f64; pred.len()];
+    let mut order: Vec<usize> = (0..pred.len().min(time.len()))
+        .filter(|&i| pred[i].is_finite() && time[i].is_finite())
+        .collect();
+    order.sort_by(|&a, &b| time[a].total_cmp(&time[b]).then_with(|| pred[b].total_cmp(&pred[a])).then_with(|| a.cmp(&b)));
+    let mut start = 0usize;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && time[order[end]] == time[order[start]] {
+            end += 1;
+        }
+        for &k in order[start..end].iter().take((end - start) / 3) {
+            pos[k] = 1.0;
+        }
+        start = end;
+    }
+    pos
+}
+
 /// Position of one prediction under the spec's map. `NaN` for a non-finite
 /// prediction, which the caller drops.
 pub fn position_of(pred: f64, spec: &TradingSpec) -> f64 {
@@ -810,7 +874,10 @@ pub fn evaluate(
         .collect();
     let ctx = Ctx::new(&keep, r, rows, spec.cash_return);
     let scores: Vec<f64> = keep.iter().map(|&i| pred[i]).collect();
-    let positions: Vec<f64> = if spec.min_holding > 1 {
+    let positions: Vec<f64> = if spec.position == PositionMap::TopTercile {
+        let all = top_tercile_positions(pred, &rows.time);
+        keep.iter().map(|&i| all[i]).collect()
+    } else if spec.min_holding > 1 {
         let mut positions = vec![0.0f64; keep.len()];
         let mut current: Option<u64> = None;
         let mut held = 0usize;
@@ -902,6 +969,9 @@ impl FitnessBook {
     /// closer than that are refused (#468). A non-positive horizon skips it.
     pub fn new(slice: &crate::data::TradingSlice, spec: &TradingSpec, horizon_seconds: f64) -> Result<Self, String> {
         spec.validate()?;
+        if spec.position != PositionMap::Threshold {
+            return Err("the fitness book prices the threshold rule only, not the top_tercile map".to_string());
+        }
         if spec.tau.is_some() || spec.min_holding > 1 || spec.max_position != 1.0 {
             return Err(
                 "the fitness book is the plain {0, 1} indicator: it needs min_holding 1, max_position 1 and no tau"
@@ -1151,13 +1221,14 @@ impl FinalistReport {
             Err(e) => format!("{{\"unusable\":{}}}", crate::devlog::text(e)),
         };
         format!(
-            "{{\"name\":\"{}\",\"position\":\"long_only\",\"selection\":\"validation_objective\",\
+            "{{\"name\":\"{}\",\"position\":\"{}\",\"selection\":\"validation_objective\",\
              \"cost\":{},\"candidates\":{},\"usable_candidates\":{},\"exact\":\"cpu_f64\",\
              \"backend\":{},\"backend_reason\":{},\"spec\":{},\
              \"finalist\":{{\"expression\":{},\"archive_rank\":{},\"constant\":{},\"fit_metric\":{},\"fit_error\":{},\
              \"validation_error\":{},\"test_error\":{},\"validation_objective\":{}{}}},\
              \"validation\":{},\"test\":{}}}",
             self.objective.name(),
+            self.spec.position.name(),
             self.cost.json(),
             self.candidates,
             self.usable,

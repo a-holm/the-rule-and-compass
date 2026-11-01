@@ -194,6 +194,7 @@ long/flat from the training mean, matched-exposure random long seeded by
 `src/baselines.rs`.
 `--front run.json` takes the candidates from the Pareto front of a run, carries the run's threshold and per-side cost, defaults `--trials` to the offspring the search scored and refuses a window that tests rows the run trained or selected on (`docs/walkforward.md`).
 Pass `--batch-pnl` to score every candidate on every window in one batch (`src/wf_batch.rs`, kernel `src/cuda/wf_batch.cu`), per window and pooled, with the baseline ladder; finalist values stay exact CPU f64 and batch values are labelled `gpu_proxy`.
+`--policy top-tercile` holds the top `floor(n/3)` finite scores of each timestamp long and the rest flat (no threshold); it prices the book of a search run with `--position top_tercile` on an `xs_rank` target made by `rcsr panel rank` (`docs/time-series.md`).
 `--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
 associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
 adds the exact `O(2n)` hindsight DP as a labelled bound, never as the
@@ -621,7 +622,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--group-by col] [--no-project] [--project n|auto] [--view k] [--gap N] [--folds K]
      [--lags K | --lag-set k,..|default] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc] [--require-validation]
-     [--objective mse|pnl|sharpe|log_growth] [--position long_only] [--threshold f]
+     [--objective mse|pnl|sharpe|log_growth] [--position long_only|top_tercile] [--threshold f]
      [--cost-bps f | --cost-override f] [--slippage-bps f] [--cash-return f] [--funding col]
      [--max-position f] [--min-trades n] [--min-holding n] [--allow-short]
      [--fitness metric|pnl]
@@ -634,10 +635,10 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--null-runs N] [--null-block N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
-     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--fit-polish f64|f32|off] [--no-fit]
+     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--fit-polish f64|f32|off] [--refit-band F|inf] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
-     [--no-front-parents]
+     [--no-front-parents] [--linear-scaling]
      [--fit-samples N]
      [--patience N]
      [--gpu] [--gpu-memory size] [--dispatch auto|device] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
@@ -784,8 +785,9 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   [`docs/panel.md`](docs/panel.md#the-2026h2-lockbox).
 * The protocol locked test (2025-07-01..2026-07-01, or the range declared with the data) guards every evaluator: search, `walkforward`, `ladder`, `ablation`, `enrich` and `audit`. Undeclared data gets the default. `--lockbox none` is the only opt-out and the report records `"source":"none"`. A flag that narrows a stored declaration, and conflicting declaration files, are refused. See [`docs/panel.md`](docs/panel.md#the-declared-locked-test).
 * The protocol locked test is declared once, with the data
-  (`rcsr panel build --locked-test START,END`; `panel append`, `enrich` and
-  `ablation prepare` copy it). The search, `walkforward`, `ladder` and
+  (`rcsr panel base`, `prep` or `panel build --locked-test START,END`; `panel build`,
+  `panel append`, `enrich` and `ablation prepare` copy it, and a writer never drops or
+  changes it silently: exit 2 unless the flag repeats it or says `none`). The search, `walkforward`, `ladder` and
   `ablation score` then refuse any split or window that touches it (exit 3).
   Only `walkforward --locked-test` and `ladder --locked-test`, both with
   `--ledger` and `--sealed`, read it, once each; see

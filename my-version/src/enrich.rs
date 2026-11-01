@@ -632,8 +632,13 @@ fn engine_device_tier(name: &str) -> &'static str {
 /// model input. Label names are chosen per run, so entries are derived from
 /// the column name instead of being listed in [`default_registry`].
 pub fn label_registry_entry(name: &str) -> Option<RegistryEntry> {
-    let (_, kind) = crate::labels::parse_column(name)?;
+    let kind = match crate::labels::parse_column(name) {
+        Some((_, kind)) => kind,
+        None if crate::labels::is_xs_column(name) => "xs",
+        None => return None,
+    };
     let formula = match kind {
+        "xs" => "rank of the forward return among the PIT members at ts, mapped to [-1, 1] (rcsr panel rank)",
         "fwd" => "ln(close[t+h+d] / open[t+1+d]), long gross log return",
         "y" => "clip(fwd / (max(s_W, floor) * sqrt(h)), -clip, +clip)",
         "long_net" => "fwd - long round-trip cost (- funding when supplied)",
@@ -1533,6 +1538,8 @@ pub struct Options {
     pub allow_overlap: bool,
     /// Locked test left out of the label report; the input's declaration applies when unset.
     pub locked_test: Option<crate::lockbox::Lockbox>,
+    /// A second guarded range next to `locked_test`.
+    pub locked_also: Option<crate::lockbox::Lockbox>,
     pub dry_run: bool,
     pub json: bool,
 }
@@ -1559,6 +1566,7 @@ impl Default for Options {
             allow_lockbox: false,
             allow_overlap: false,
             locked_test: None,
+            locked_also: None,
             dry_run: false,
             json: false,
         }
@@ -6939,9 +6947,17 @@ fn enrich_inner(
             temp.insert(n.clone(), TempColumn::create(work_dir, &n, sp.column_warmup(kind), true)?);
         }
     }
-    let label_range = opts.locked_test.or_else(|| crate::lockbox::declared_for(&opts.data));
-    let mut long_acc: Vec<crate::labels::LabelAccumulator> =
-        long_specs.iter().map(|sp| crate::labels::LabelAccumulator::with_range(sp, label_range)).collect();
+    let (label_range, label_also) = match opts.locked_test {
+        Some(l) => (Some(l), opts.locked_also),
+        None => match crate::lockbox::stored_all(&opts.data).map_err(|e| e.message)? {
+            Some(s) => (Some(s.range), s.also),
+            None => (None, None),
+        },
+    };
+    let mut long_acc: Vec<crate::labels::LabelAccumulator> = long_specs
+        .iter()
+        .map(|sp| crate::labels::LabelAccumulator::with_range(sp, label_range).with_also(label_also))
+        .collect();
 
     // Cross-sectional source columns are computed even when the user did not
     // ask for them, then removed if they are not part of the output. The same
@@ -8277,6 +8293,14 @@ pub fn run(args: &[String]) -> ! {
         std::process::exit(e.exit);
     });
     opts.locked_test = resolved.sidecar_range();
+    opts.locked_also = resolved.sidecar_also();
+    if let (Some(out), false) = (&opts.out, opts.dry_run) {
+        let keep = opts.locked_test.map_or(crate::lockbox::Keep::Remove, crate::lockbox::Keep::Range);
+        if let Err(e) = crate::lockbox::output_declaration(out, Some(&opts.data), keep) {
+            eprintln!("error: {}", e.message.replacen("--lockbox", "--locked-test", 2));
+            std::process::exit(e.exit);
+        }
+    }
     let report = match enrich(&opts) {
         Ok(r) => r,
         Err(e) => fail(&e),
@@ -8287,13 +8311,31 @@ pub fn run(args: &[String]) -> ! {
             let mut text = report.json();
             if let Some(lb) = resolved.sidecar_range() {
                 let at = text.find('{').map_or(0, |i| i + 1);
+                let source = format!("rcsr enrich ({})", resolved.source.as_str());
                 text.insert_str(
                     at,
-                    &format!("\"locked_test\":{},", lb.declaration_json(&format!("rcsr enrich ({})", resolved.source.as_str()))),
+                    &format!("\"locked_test\":{}{},", lb.declaration_json(&source), crate::lockbox::also_json(resolved.sidecar_also().as_ref(), &source)),
                 );
             }
+            let declared = resolved.sidecar_range();
             if let Err(e) = crate::atomic::write_text_atomic(&sidecar, &text) {
+                if declared.is_some() {
+                    if out != &opts.data {
+                        let _ = std::fs::remove_file(out);
+                    }
+                    eprintln!(
+                        "error: could not write {}: {}; the output does not carry its locked-test declaration{}",
+                        sidecar,
+                        e,
+                        if out != &opts.data { " and was removed" } else { "" }
+                    );
+                    std::process::exit(EXIT_INPUT);
+                }
                 eprintln!("warning: could not write {}: {}", sidecar, e);
+            }
+            if let Err(e) = crate::lockbox::finish_output(out, declared.as_ref(), &["enrich.json"]) {
+                eprintln!("error: {}", e.message);
+                std::process::exit(e.exit);
             }
         }
     }
