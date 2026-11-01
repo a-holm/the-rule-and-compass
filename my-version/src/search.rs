@@ -948,6 +948,8 @@ impl GpuSearch {
         // indices), or empty to fit on every row.
         fit_rows: &[usize],
         plan: Option<&crate::memory::DevicePlan>,
+        // #481: the long/flat book `ScoreObjective::LongPnl` reads.
+        pnl_book: Option<&crate::trading::FitnessBook>,
     ) -> Result<Self, String> {
         let budget = plan.map(|p| p.budget);
         let tiled = plan.filter(|p| p.mode == crate::memory::Residency::Tiled);
@@ -981,6 +983,9 @@ impl GpuSearch {
                 if score == Some(crate::metrics::ScoreObjective::Slope) {
                     return Err("device_memory: tiled residency refuses slope scoring: row r - 1 of a tile's first row is not resident".to_string());
                 }
+                if score == Some(crate::metrics::ScoreObjective::LongPnl) {
+                    return Err(crate::gpu::LONG_PNL_TILED.to_string());
+                }
                 crate::gpu::GpuEvaluator::new_tiled(
                     cols,
                     n_rows,
@@ -1001,11 +1006,20 @@ impl GpuSearch {
                 // run ranks on; `gpu_blocker` has already refused any metric
                 // without a native kernel objective.
                 ev.set_loss(loss);
+                // #481: the book is the first allocation after the rows, once
+                // per run.
+                let long_pnl = score == Some(crate::metrics::ScoreObjective::LongPnl);
+                if long_pnl {
+                    let Some(book) = pnl_book else {
+                        return Err("the long_pnl fitness book was not rebuilt".to_string());
+                    };
+                    ev.set_pnl_book(book)?;
+                }
                 // #289: a classification score uploads its label sign once per
                 // sample, whether or not the device also fits constants. The
                 // fit-only log-loss arm needs the same vector for the fit
                 // kernel, so it is uploaded once and shared.
-                if score.is_some() || logistic_fit {
+                if (score.is_some() && !long_pnl) || logistic_fit {
                     let sign =
                         crate::fit::classification_signs_weighted(&train.y, &train.w);
                     if !ev.set_fit_sign(&sign) {
@@ -1920,6 +1934,7 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             ledger,
             memory_plan: self.memory_plan.clone(),
             observed: Some(self.ev.alloc_report().observed()),
+            score_objective: self.score,
         }
     }
 
@@ -2667,7 +2682,7 @@ fn score_pipeline_batch(
 #[cfg(feature = "cuda")]
 fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if !cfg.fitness.is_metric() {
-        return Some("long_pnl fitness has no device scorer yet"); // #480
+        return long_pnl_blocker(cfg, train).or(Some("long_pnl fitness has no device scorer yet")); // #481
     }
     if train.is_multi() {
         return Some("multi-output objective");
@@ -2733,6 +2748,51 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
         return Some(
             "--fit-samples/--fit-rows scores on all rows only with the device fit arm (--fit-strategy gpu)",
         );
+    }
+    None
+}
+
+/// #481: the objective the device ranks candidates by: the long/flat regret
+/// under `--fitness pnl`, else the metric's native objective. Every device
+/// scoring path (`GpuSearch::score`, the overlap pipeline, the flat postfix
+/// arena) reads it through `GpuSearch::score`.
+#[cfg(feature = "cuda")]
+fn search_score_objective(cfg: &Config) -> Option<crate::metrics::ScoreObjective> {
+    match cfg.fitness {
+        Fitness::LongPnl(_) => Some(crate::metrics::ScoreObjective::LongPnl),
+        Fitness::SavedLongPnl(_) => None,
+        Fitness::Metric => crate::metrics::native_score_objective(cfg.metric),
+    }
+}
+
+/// #481: [`gpu_blocker`] under `--fitness pnl`. The device scores the
+/// long/flat regret itself and `--metric` only fits constants, so the metric's
+/// score refusals do not apply; what remains are the sample shapes the
+/// resident book cannot represent and the fit arm's own row contract.
+#[cfg(feature = "cuda")]
+fn long_pnl_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
+    let Some(book) = cfg.fitness.book() else {
+        return Some("the long_pnl fitness book was not rebuilt");
+    };
+    if train.is_multi() {
+        return Some("multi-output objective");
+    }
+    if book.len() != train.len() {
+        return Some("the long_pnl fitness book does not cover the training rows");
+    }
+    if subsampling_active(cfg, train) {
+        return Some("--predictor-samples changes the rows per generation");
+    }
+    if effective_fit_rows(cfg, train) > 0 && !defers_fit_to_gpu(cfg, true) {
+        return Some(
+            "--fit-samples/--fit-rows scores on all rows only with the device fit arm (--fit-strategy gpu)",
+        );
+    }
+    if cfg.metric == crate::metrics::Metric::Slope
+        && defers_fit_to_gpu(cfg, true)
+        && (!slope_pairs_are_consecutive(train) || effective_fit_rows(cfg, train) > 0)
+    {
+        return Some("slope pairs are not the consecutive rows of the device fit sample");
     }
     None
 }
@@ -2947,7 +3007,10 @@ fn gpu_plan_shape(cfg: &Config, train: &Sample) -> GpuPlanShape {
     // #288: an exact order-statistic/rank metric has a native *scoring*
     // entry point named by the #287 dispatch table, so it is admitted
     // through the same gate as the objective kernel and is not fit-only.
-    let score_stat = crate::metrics::ScoreStat::for_metric(cfg.metric);
+    // #481: under the long/flat fitness the metric only fits, so no exact
+    // statistic scores the run.
+    let score_stat = crate::metrics::ScoreStat::for_metric(cfg.metric)
+        .filter(|_| cfg.fitness.is_metric());
     let score_admitted = score_stat.is_some() && gpu_blocker(cfg, train).is_none();
     // #287: maximum has a native objective, so it is never fit-only.
     let maximum_fit_only = maximum_fit
@@ -2989,7 +3052,9 @@ pub fn device_plan_for(cfg: &Config, train: &Sample) -> Option<crate::memory::De
     }
     let info = crate::gpu::device_info()?;
     let device_fit = cfg.fit_strategy.defers_to_gpu() && cfg.fit_iters > 0;
-    let label_sign = (!shape.score_admitted && !shape.fit_only) || shape.logistic_fit;
+    // #481: the long/flat scorer reads its book, not the label sign.
+    let long_pnl = !cfg.fitness.is_metric();
+    let label_sign = (!long_pnl && !shape.score_admitted && !shape.fit_only) || shape.logistic_fit;
     let workload = crate::memory::DeviceWorkload {
         rows: train.len(),
         vars: n_vars,
@@ -3000,6 +3065,7 @@ pub fn device_plan_for(cfg: &Config, train: &Sample) -> Option<crate::memory::De
         stat: shape.score_admitted,
         weights: !train.w.is_empty(),
         label_sign,
+        pnl_book: long_pnl,
     };
     let caps = crate::memory::DeviceCaps::from_env(cfg.gpu_memory);
     Some(crate::memory::device_plan(&workload, &info, &caps))
@@ -4694,6 +4760,9 @@ pub struct GpuRunStats {
     pub memory_plan: Option<crate::memory::DevicePlan>,
     /// #293: the device allocation ledger at the end of the run.
     pub observed: Option<crate::memory::DeviceObserved>,
+    /// #481: the objective the device scored candidates by, `None` for a
+    /// fit-only or exact-statistic evaluator.
+    pub score_objective: Option<crate::metrics::ScoreObjective>,
 }
 
 pub struct Outcome {
@@ -5115,15 +5184,14 @@ fn postfix_variation_for(cfg: &Config, train: &Sample) -> Result<Variation, Stri
     // #287: the flat arena carries programs, not the per-candidate constant
     // count the AIC family's penalty needs. Keep that family on the owned-tree
     // path, where `count_constants(tree)` is available for every candidate.
-    if crate::metrics::native_score_objective(cfg.metric)
-        .is_some_and(|o| o.needs_constants())
-    {
+    if search_score_objective(cfg).is_some_and(|o| o.needs_constants()) {
         return Err("parameter-aware metric needs per-candidate constants".to_string());
     }
     // The pass-through path must never score a metric without a native
     // objective (the #236 defect). `gpu` is only built when this holds, but the
-    // gate is asserted here so a future caller cannot bypass it.
-    if crate::metrics::native_score_objective(cfg.metric).is_none() {
+    // gate is asserted here so a future caller cannot bypass it. #481: under
+    // `--fitness pnl` the objective is the long/flat regret.
+    if search_score_objective(cfg).is_none() {
         return Err("metric has no native score objective".to_string());
     }
     let width = crate::genome::width_for(cfg.max_complexity);
@@ -6029,7 +6097,7 @@ fn run_search(
                     // only seeds the legacy fit/eval field and is `Squared`
                     // when the metric has no device LM loss (correlation,
                     // signed, maximum, Brier, hinge).
-                    let _objective = crate::metrics::native_score_objective(cfg.metric)
+                    let _objective = search_score_objective(cfg)
                         .expect("gpu_blocker admits only native score objectives");
                     let loss = crate::fit::fit_loss(cfg.metric)
                         .unwrap_or(crate::fit::DeviceLoss::Squared);
@@ -6042,7 +6110,7 @@ fn run_search(
             Some((loss, native, stat)) => {
                 let score = if native {
                     Some(
-                        crate::metrics::native_score_objective(cfg.metric)
+                        search_score_objective(cfg)
                             .expect("native GPU plan owns a score objective"),
                     )
                 } else {
@@ -6068,6 +6136,7 @@ fn run_search(
                         t0,
                         &fit_rows,
                         memory_plan.as_ref(),
+                        cfg.fitness.book(),
                     ),
                 };
                 match created {
@@ -6105,7 +6174,9 @@ fn run_search(
                                 )
                             };
                             if native {
-                                let fitness = if cfg.metric == crate::metrics::Metric::Squared {
+                                let fitness = if !cfg.fitness.is_metric() {
+                                    "long_pnl regret of the f32 predictions, reported numbers stay f64"
+                                } else if cfg.metric == crate::metrics::Metric::Squared {
                                     "f32 fitness, reported numbers stay f64"
                                 } else {
                                     "native device loss, f32 fitness"
@@ -8946,11 +9017,31 @@ mod tests {
     #[test]
     fn long_pnl_fitness_names_why_the_device_is_off() {
         let s = sample();
+        // #481: the device scores the regret; the metric only fits, so a
+        // metric without a native scorer does not block it.
         let cfg = Config {
             fitness: Fitness::LongPnl(pnl_book(&s)),
+            metric: Metric::Median,
             ..Default::default()
         };
-        assert_eq!(gpu_blocker(&cfg, &s), Some("long_pnl fitness has no device scorer yet"));
+        assert_eq!(gpu_blocker(&cfg, &s), None);
+        assert_eq!(search_score_objective(&cfg), Some(crate::metrics::ScoreObjective::LongPnl));
+        let shape = gpu_plan_shape(&cfg, &s);
+        assert!(shape.score_stat.is_none() && !shape.score_admitted && !shape.fit_only);
+        let saved = Config {
+            fitness: Fitness::SavedLongPnl(7),
+            ..Default::default()
+        };
+        assert_eq!(gpu_blocker(&saved, &s), Some("the long_pnl fitness book was not rebuilt"));
+        assert_eq!(search_score_objective(&saved), None);
+        let other_rows = Config {
+            fitness: Fitness::LongPnl(pnl_book(&sample_rows(s.len() + 3))),
+            ..Default::default()
+        };
+        assert_eq!(
+            gpu_blocker(&other_rows, &s),
+            Some("the long_pnl fitness book does not cover the training rows")
+        );
     }
 
     #[test]

@@ -296,13 +296,18 @@ pub enum ScoreObjective {
     /// the resident sample, divided by `n − 1`. Admitted only when the
     /// sample's slope pairs are exactly the consecutive pairs.
     Slope,
+    /// #481: the long/flat net regret `(B - net) / B` of
+    /// [`crate::trading::FitnessBook`] on the resident rows. Not a metric: it
+    /// ranks candidates under `--fitness pnl` and reads the uploaded book.
+    LongPnl,
 }
 
 impl ScoreObjective {
     /// The `RC_SCORE_*` code the CUDA scoring entry points take.
     ///
     /// The regression block is 0–9 (#287); classification is 10–14 (#289);
-    /// slope is 15 (#236). A fit code (`DeviceLoss`) and a score code can never
+    /// slope is 15 (#236); the long/flat regret is 16 (#481). A fit code
+    /// (`DeviceLoss`) and a score code can never
     /// be confused, and every code in this enum has its own kernel branch.
     pub fn code(self) -> i32 {
         match self {
@@ -322,6 +327,7 @@ impl ScoreObjective {
             ScoreObjective::HingeOrdinary => 13,
             ScoreObjective::HingeSquared => 14,
             ScoreObjective::Slope => 15,
+            ScoreObjective::LongPnl => 16,
         }
     }
 
@@ -344,6 +350,7 @@ impl ScoreObjective {
             13 => ScoreObjective::HingeOrdinary,
             14 => ScoreObjective::HingeSquared,
             15 => ScoreObjective::Slope,
+            16 => ScoreObjective::LongPnl,
             _ => return None,
         })
     }
@@ -367,12 +374,14 @@ impl ScoreObjective {
             ScoreObjective::HingeOrdinary => "hinge_ordinary",
             ScoreObjective::HingeSquared => "hinge_squared",
             ScoreObjective::Slope => "slope",
+            ScoreObjective::LongPnl => "long_pnl_regret",
         }
     }
 
-    /// The metric this objective scores.
-    pub fn metric(self) -> Metric {
-        match self {
+    /// The metric this objective scores; `None` for the long/flat regret,
+    /// which is a fitness and not a metric.
+    pub fn metric(self) -> Option<Metric> {
+        Some(match self {
             ScoreObjective::Squared => Metric::Squared,
             ScoreObjective::Absolute => Metric::Absolute,
             ScoreObjective::LogSquashed => Metric::LogSquashed,
@@ -389,7 +398,8 @@ impl ScoreObjective {
             ScoreObjective::HingeOrdinary => Metric::HingeOrdinary,
             ScoreObjective::HingeSquared => Metric::HingeSquared,
             ScoreObjective::Slope => Metric::Slope,
-        }
+            ScoreObjective::LongPnl => return None,
+        })
     }
 
     /// The native scoring objective for a classification metric, or `None`.
@@ -732,7 +742,9 @@ pub fn score_native_weighted(
     k: usize,
 ) -> NativeScore {
     let n = pred.len();
-    if n == 0 || y.len() != n || (!w.is_empty() && w.len() != n) {
+    // #481: the long/flat regret reads its book, not `y`; its CPU reference is
+    // `trading::FitnessBook::regret`.
+    if n == 0 || y.len() != n || (!w.is_empty() && w.len() != n) || objective == ScoreObjective::LongPnl {
         return NativeScore::invalid(ScoreStatus::Invalid);
     }
     let weighted = !w.is_empty();
