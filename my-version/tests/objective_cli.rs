@@ -289,3 +289,106 @@ fn a_missing_return_column_names_the_target_spec() {
     assert_eq!(code(&out), 3, "{}", stderr(&out));
     assert!(stderr(&out).contains("declares return_column 'gone'"), "{}", stderr(&out));
 }
+
+fn write_csv_with_spare_columns(dir: &std::path::Path) -> String {
+    let base = std::fs::read_to_string(write_csv(dir, "base.csv", None)).unwrap();
+    let mut text = String::new();
+    for (i, line) in base.lines().enumerate() {
+        if i == 0 {
+            text.push_str(&format!("{},z1,z2,z3\n", line));
+        } else {
+            text.push_str(&format!("{},{},{},{}\n", line, i, 2 * i, 3 * i));
+        }
+    }
+    let path = dir.join("spare.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn store_projection_note(j: &Json) -> String {
+    at(j, &["preparation", "store_memory", "projection"]).as_str().unwrap().to_string()
+}
+
+fn projected_columns(j: &Json) -> f64 {
+    num(j, &["preparation", "store_memory", "projected_columns"])
+}
+
+fn row_expression_runs() -> Vec<Vec<String>> {
+    let cut = T0 + 900 * 300;
+    let early = T0 + 900 * 280;
+    vec![
+        vec!["--exclude".to_string(), format!("t >= {cut}")],
+        vec![
+            "--train-select".to_string(),
+            format!("t < {early}"),
+            "--test-select".to_string(),
+            format!("t >= {early}"),
+        ],
+        vec!["--filter".to_string(), "z1 > 5 and z2 > 0".to_string()],
+    ]
+}
+
+fn run_args(data: &str, spec: &str, expr: &[String], no_project: bool) -> Output {
+    let mut extra: Vec<&str> = PNL.to_vec();
+    extra.extend(expr.iter().map(String::as_str));
+    if no_project {
+        extra.push("--no-project");
+    }
+    run(data, spec, &extra)
+}
+
+#[test]
+fn row_expressions_keep_the_projection() {
+    let dir = scratch();
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let store = import_store(&dir, &write_csv_with_spare_columns(&dir));
+    for expr in row_expression_runs() {
+        let out = run_args(&store, &spec, &expr, false);
+        assert_eq!(code(&out), 0, "{expr:?}: {}", stderr(&out));
+        let j = json(&out);
+        let total = num(&j, &["preparation", "store_memory", "columns"]);
+        let used = projected_columns(&j);
+        assert!(used < total, "{expr:?}: projected {used} of {total}");
+        assert_eq!(store_projection_note(&j), "on", "{expr:?}");
+    }
+}
+
+#[test]
+fn the_projection_includes_the_columns_an_expression_reads() {
+    let dir = scratch();
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let store = import_store(&dir, &write_csv_with_spare_columns(&dir));
+    let expr = vec!["--filter".to_string(), "z1 > 5 and z2 > 0".to_string()];
+    let plain = projected_columns(&json(&run_args(&store, &spec, &[], false)));
+    let out = run_args(&store, &spec, &expr, false);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(projected_columns(&json(&out)), plain + 2.0);
+}
+
+#[test]
+fn projected_and_full_reads_agree_with_row_expressions() {
+    let dir = scratch();
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let store = import_store(&dir, &write_csv_with_spare_columns(&dir));
+    for expr in row_expression_runs() {
+        let on = run_args(&store, &spec, &expr, false);
+        let off = run_args(&store, &spec, &expr, true);
+        assert_eq!(code(&on), 0, "{expr:?}: {}", stderr(&on));
+        assert_eq!(code(&off), 0, "{expr:?}: {}", stderr(&off));
+        let (a, b) = (json(&on), json(&off));
+        assert_eq!(store_projection_note(&a), "on");
+        assert_eq!(store_projection_note(&b), "--no-project");
+        assert_eq!(at(&a, &["objective"]), at(&b, &["objective"]), "{expr:?}");
+        assert_eq!(at(&a, &["pareto"]), at(&b, &["pareto"]), "{expr:?}");
+    }
+}
+
+#[test]
+fn an_unknown_column_in_a_row_expression_fails_before_the_read() {
+    let dir = scratch();
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let store = import_store(&dir, &write_csv_with_spare_columns(&dir));
+    let out = run_args(&store, &spec, &["--exclude".to_string(), "nope > 1".to_string()], false);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(stderr(&out).contains("cannot parse --exclude"), "{}", stderr(&out));
+}

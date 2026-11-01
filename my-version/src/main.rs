@@ -292,7 +292,9 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
   --no-project               load every store column. The default projects the
                              read to --vars, targets, --weight, --time and
                              --group-by when a .rcsb store is read with --vars
-                             and --time; --no-project is the A/B escape hatch.
+                             and --time; the columns read by
+                             --filter, --exclude, --train-select and --test-select
+                             are added. --no-project is the A/B escape hatch.
   --gap <rows|time>          embargo: rows dropped between train and test to stop
                              autocorrelation leaking the future (default 0).
                              A suffixed value (90m, 1.5h, 30s, 2d) is wall time,
@@ -3562,6 +3564,7 @@ fn main() {
     // #294: the resolved read projection used by this run, recorded in the
     // manifest. `None` means the historical full-column load.
     let mut store_projection: Option<store::Projection> = None;
+    let mut projection_note: Option<String> = None;
     let mut view_record: Option<registry::View> = None;
     let lag_menu: Vec<usize> = match &lag_set_src {
         Some(s) => {
@@ -3712,16 +3715,23 @@ fn main() {
                         "symbol" | "ticker" | "asset" | "pair" | "group" | "code"
                     )
                 });
-                let may_project = !no_project
-                    && !vars.is_empty()
-                    && time_name.is_some()
-                    && !(group_name.is_none() && group_like_present)
-                    && dtype_src.is_none()
-                    && filter_src.is_none()
-                    && exclude_src.is_none()
-                    && train_select_src.is_none()
-                    && test_select_src.is_none()
-                    && sample_rows.is_none();
+                let projection_off_reason: Option<&str> = if no_project {
+                    Some("--no-project")
+                } else if vars.is_empty() {
+                    Some("no --vars")
+                } else if time_name.is_none() {
+                    Some("no --time")
+                } else if group_name.is_none() && group_like_present {
+                    Some("no --group-by")
+                } else if dtype_src.is_some() {
+                    Some("--dtype")
+                } else if sample_rows.is_some() {
+                    Some("--sample-rows")
+                } else {
+                    None
+                };
+                let may_project = projection_off_reason.is_none();
+                projection_note = Some(projection_off_reason.unwrap_or("on").to_string());
                 if may_project {
                     let mut pnames: Vec<String> = vars.clone();
                     pnames.extend(target_names.iter().cloned());
@@ -3736,6 +3746,29 @@ fn main() {
                     }
                     if let Some(c) = target_resolved.as_ref().and_then(|r| r.spec.scale_column()) {
                         pnames.push(c.to_string());
+                    }
+                    let numeric_names: Vec<String> = fs
+                        .header()
+                        .columns()
+                        .iter()
+                        .filter(|c| c.numeric)
+                        .map(|c| c.name.clone())
+                        .collect();
+                    for (flag, src) in [
+                        ("--filter", filter_src.as_deref()),
+                        ("--exclude", exclude_src.as_deref()),
+                        ("--train-select", train_select_src.as_deref()),
+                        ("--test-select", test_select_src.as_deref()),
+                    ] {
+                        let Some(src) = src else { continue };
+                        match data::row_expr_columns(src, &numeric_names) {
+                            Ok(cols) => pnames.extend(cols),
+                            Err(e) => {
+                                eprintln!("error: cannot parse {}: {}", flag, e);
+                                eprintln!("  expression: {}", src);
+                                std::process::exit(EXIT_USAGE);
+                            }
+                        }
                     }
                     let trading_requested = objective_arg
                         .as_deref()
@@ -3759,6 +3792,8 @@ fn main() {
                     pnames.dedup();
                     if let Ok(p) = store::Projection::resolve_owned(&fs, &pnames) {
                         store_projection = Some(p);
+                    } else {
+                        projection_note = Some("projection unresolved".to_string());
                     }
                 }
                 let mem_opts = memory::EstimateOptions {
@@ -4368,6 +4403,7 @@ fn main() {
             return_column: ts.return_column.clone(),
             log_returns: ts.return_units == "log",
             funding_column: trade_funding.clone(),
+            train: false,
         });
         let tspec = rcsr::trading::TradingSpec {
             cost_bps: cost,
@@ -4405,6 +4441,7 @@ fn main() {
         allow_lockbox,
         purge_seconds: target_resolved.as_ref().map(|r| r.spec.required_purge_seconds()),
         trading: trading_cols.clone(),
+        canonical_train_order: false,
         scale_column: target_resolved
             .as_ref()
             .and_then(|r| r.spec.scale_column())
@@ -4597,6 +4634,7 @@ fn main() {
         // #112: the store estimate used at the guard time is reported even on
         // a successful full load, so the decision has an observable basis.
         prepared.prep.store_estimate = Some(estimate);
+        prepared.prep.store_projection = projection_note.clone();
         prepared.prep.full_rows = store_full_rows;
         prepared.prep.sampled_rows = store_sample_rows;
     }
@@ -9313,6 +9351,9 @@ OPTIONS:
                              compare its report hash; records nothing
   --expect-report-sha256 <h> exit 1 unless the report JSON hashes to h
   --json                     print the full JSON report to stdout
+                             (it ends with a ledger object: the phase ledger of the
+                             command, io and pnl seconds on the run wall, outside the
+                             report hash)
   --out <file>               write the JSON report to a file
   --markdown <file|->        write the Markdown report ('-' = stdout)
   --allow-lockbox            permit a test window overlapping 2026H2
@@ -9911,10 +9952,7 @@ fn run_walkforward(args: &[String]) -> ! {
             windows_scheme.as_ref().map_or("null".to_string(), |s| format!("{:?}", s)),
         ));
     }
-    let report_json = || match &protocol_json {
-        Some(p) => report.json_with_protocol(p),
-        None => report.json(),
-    };
+    let report_json = || report.json_with_ledger(protocol_json.as_deref());
     for w in &report.windows {
         let reasons = [
             w.band.as_ref().and_then(|b| b.fallback_reason.as_deref()),

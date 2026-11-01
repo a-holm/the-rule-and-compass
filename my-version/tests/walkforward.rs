@@ -631,3 +631,22 @@ fn final_exit_is_charged_per_group_when_rows_are_dropped() {
     assert!((t.cost - 0.004).abs() < 1e-15);
     assert!((t.net - 0.096).abs() < 1e-15);
 }
+
+#[path = "common/ledger.rs"]
+mod ledger;
+
+#[test]
+fn the_printed_json_carries_a_phase_ledger_outside_the_reproduction_hash() {
+    let mut csv = String::from("ts,x,target\n");
+    for t in 0..64 {
+        csv.push_str(&format!("{},{},{}\n", t, (t % 7) as f64, ((t * 3) % 5) as f64 * 0.001 - 0.002));
+    }
+    let path = std::env::temp_dir().join(format!("rcsr-wf-ledger-{}.csv", std::process::id()));
+    std::fs::write(&path, csv).unwrap();
+    let s = spec("x", vec![window("w", 0.0, 32.0, 32.0, 64.0)]);
+    let r = walkforward::run_path_with(path.to_str().unwrap(), &s, &walkforward::ProtocolOptions::default()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(!r.json().contains("\"ledger\""), "the hashed report must stay deterministic");
+    let l = ledger::check(&r.json_with_ledger(None), "walkforward", &["io", "pnl"]);
+    assert_eq!(l.busy, 0.0, "the scalar evaluator has no device intervals");
+}
