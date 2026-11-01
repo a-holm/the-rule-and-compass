@@ -477,3 +477,71 @@ fn walkforward_front_of_a_real_run_guards_the_seen_rows() {
     assert_eq!(at(selection, &["source"]).as_str(), Some("front"));
     assert!(matches!(at(&report, &["candidates"]), Json::Arr(c) if !c.is_empty()));
 }
+
+fn walk_table(extra: &[&str]) -> Output {
+    let dir = scratch();
+    let data = write_csv(&dir, "a.csv", None);
+    let at_row = |i: usize| T0 + 900 * i as i64;
+    let table = format!(
+        "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,f1,{},{},{},{},{}\n",
+        at_row(0),
+        at_row(250),
+        at_row(180),
+        at_row(260),
+        at_row(399)
+    );
+    let table_path = dir.join("windows.csv");
+    std::fs::write(&table_path, table).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "walkforward", "--data", &data, "--time", "t", "--target", "r", "--vars", "x1,x2",
+            "--windows", &table_path.to_string_lossy(), "--windows-scheme", "expanding", "--horizon", "900",
+            "--periods-per-year", "365", "--json",
+        ])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn windows_table_validation_start_selects_among_repeated_expr() {
+    let out = walk_table(&["--expr", "x1", "--expr", "x2"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let j = json(&out);
+    assert_eq!(at(&j, &["selection", "selected_on"]).as_str(), Some("validation"));
+    let windows = match at(&j, &["windows"]) {
+        Json::Arr(a) => a,
+        _ => unreachable!(),
+    };
+    assert!(num(&windows[0], &["validation_rows"]) > 0.0);
+}
+
+#[test]
+fn windows_table_accepts_select_band() {
+    let out = walk_table(&["--expr", "x1", "--expr", "x2", "--select-band"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let windows = match at(&json(&out), &["windows"]) {
+        Json::Arr(a) => a.clone(),
+        _ => unreachable!(),
+    };
+    assert!(!matches!(at(&windows[0], &["band_selection"]), Json::Null));
+}
+
+#[test]
+fn windows_table_still_refuses_validation_frac_and_missing_slice() {
+    let both = walk_table(&["--expr", "x1", "--expr", "x2", "--validation-frac", "0.2"]);
+    assert_ne!(code(&both), 0);
+    assert!(stderr(&both).contains("mutually exclusive"), "{}", stderr(&both));
+    let dir = scratch();
+    let data = write_csv(&dir, "a.csv", None);
+    let none = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "walkforward", "--data", &data, "--time", "t", "--target", "r", "--vars", "x1,x2", "--expr", "x1",
+            "--expr", "x2", "--window", &format!("w,{},{},{},{}", T0, T0 + 900 * 250, T0 + 900 * 260, T0 + 900 * 399),
+            "--horizon", "900", "--periods-per-year", "365",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(code(&none), 3, "{}", stderr(&none));
+    assert!(stderr(&none).contains("need a validation slice"), "{}", stderr(&none));
+}
