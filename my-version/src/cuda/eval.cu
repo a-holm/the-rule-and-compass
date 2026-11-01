@@ -1614,13 +1614,22 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
     __shared__ unsigned int sh_longs[RC_PNL_WARPS];
     __shared__ int sh_bad[RC_PNL_WARPS];
 
-    unsigned int flips[NB], exits[NB], longs = 0;
-    double warp_gross[NB];
+    /* Per block: `sf`/`se` flips and exits, `wg` the warp's gross. The block of
+       the rows being walked, `bcur`, keeps its lane sum and counts in the
+       registers `acc`, `cfc` and `cec`; the others wait in `sg`, `sf` and `se`.
+       A warp step whose valid rows all belong to `bcur` (nearly every step:
+       blocks are runs of time) takes the register path. Any other step stores
+       the current block, adds each row to its own block's lane sum in ascending
+       row order, and continues with the block of the step's last row, so every
+       (block, lane) sum is added in the CPU's order. */
+    unsigned int sf[NB], se[NB], longs = 0;
+    double sg[NB], wg[NB];
 #pragma unroll
     for (int b = 0; b < NB; ++b) {
-        flips[b] = 0;
-        exits[b] = 0;
-        warp_gross[b] = 0.0;
+        sf[b] = 0;
+        se[b] = 0;
+        sg[b] = 0.0;
+        wg[b] = 0.0;
     }
     int bad = 0;
     const long long rows = (long long)n;
@@ -1635,9 +1644,12 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
             const float q = rc_exec_row(code, cols, n, (int)(seg_start - 1));
             carry = rc_pnl_long(q, threshold) ? 1u : 0u;
         }
-        double lane_gross[NB];
-#pragma unroll
-        for (int b = 0; b < NB; ++b) lane_gross[b] = 0.0;
+        int bcur = 0;
+        if (NB > 1) {
+            bcur = (int)min((flags[seg_start] >> RC_PNL_BLOCK_SHIFT) & (RC_PNL_MAX_BLOCKS - 1), (unsigned int)(NB - 1));
+        }
+        double acc = 0.0;
+        unsigned int cfc = 0, cec = 0;
         for (long long base = seg_start; base < seg_end; base += 32) {
             const long long row = base + lane;
             const int in = row < seg_end;
@@ -1657,33 +1669,59 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
             const unsigned int prev = ((m << 1) | carry) & ~fst;
             const unsigned int fl = (m ^ prev) & val;
             const unsigned int ex = m & lst;
-            const unsigned int bid = (f >> RC_PNL_BLOCK_SHIFT) & (RC_PNL_MAX_BLOCKS - 1);
-#pragma unroll
-            for (int b = 0; b < NB; ++b) {
-                const unsigned int bm = (NB == 1) ? val : __ballot_sync(0xffffffffu, in && bid == (unsigned int)b);
-                flips[b] += __popc(fl & bm);
-                exits[b] += __popc(ex & bm);
-                if (pos && (NB == 1 || bid == (unsigned int)b)) lane_gross[b] += excess[row];
-            }
             longs += __popc(m);
             carry = (m >> 31) & 1u;
+            if (NB == 1) {
+                cfc += __popc(fl);
+                cec += __popc(ex);
+                if (pos) acc += excess[row];
+                continue;
+            }
+            const unsigned int bid =
+                min((f >> RC_PNL_BLOCK_SHIFT) & (RC_PNL_MAX_BLOCKS - 1), (unsigned int)(NB - 1));
+            if (__all_sync(0xffffffffu, !in || (int)bid == bcur)) {
+                cfc += __popc(fl);
+                cec += __popc(ex);
+                if (pos) acc += excess[row];
+                continue;
+            }
+            sg[bcur] = acc;
+            sf[bcur] += cfc;
+            se[bcur] += cec;
+            cfc = 0;
+            cec = 0;
+            if (pos) sg[bid] += excess[row];
+#pragma unroll
+            for (int b = 0; b < NB; ++b) {
+                const unsigned int bm = __ballot_sync(0xffffffffu, in && bid == (unsigned int)b);
+                if (bm) {
+                    sf[b] += __popc(fl & bm);
+                    se[b] += __popc(ex & bm);
+                }
+            }
+            bcur = __shfl_sync(0xffffffffu, (int)bid, 31 - __clz(val));
+            acc = sg[bcur];
         }
+        if (NB > 1) sg[bcur] = acc;
+        sf[bcur] += cfc;
+        se[bcur] += cec;
 #pragma unroll
         for (int b = 0; b < NB; ++b) {
-            double g = lane_gross[b];
+            double g = (NB == 1) ? acc : sg[b];
             for (int half = 16; half >= 1; half >>= 1) {
                 g += __shfl_down_sync(0xffffffffu, g, half);
             }
-            warp_gross[b] += g;
+            wg[b] += g;
+            sg[b] = 0.0;
         }
     }
     bad = __any_sync(0xffffffffu, bad);
     if (lane == 0) {
 #pragma unroll
         for (int b = 0; b < NB; ++b) {
-            sh_gross[b][warp] = warp_gross[b];
-            sh_flips[b][warp] = flips[b];
-            sh_exits[b][warp] = exits[b];
+            sh_gross[b][warp] = wg[b];
+            sh_flips[b][warp] = sf[b];
+            sh_exits[b][warp] = se[b];
         }
         sh_longs[warp] = longs;
         sh_bad[warp] = bad;
