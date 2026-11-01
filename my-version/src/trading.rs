@@ -928,6 +928,38 @@ pub const FITNESS_SEGMENT_ROWS: usize = trading_gpu::DEFAULT_SEGMENT_ROWS;
 pub const FITNESS_LANES: usize = trading_gpu::PNL_LANES;
 /// Warp sums that the segments are spread over.
 pub const FITNESS_WARPS: usize = 8;
+/// Most time blocks of the consistency term (`--pnl-blocks`).
+pub const FITNESS_MAX_BLOCKS: usize = 8;
+/// The block id of a row sits in bits 2 to 4 of its [`FitnessBook::flags`] byte.
+pub const FITNESS_BLOCK_SHIFT: u8 = 2;
+
+/// Time block of every row: the sorted distinct timestamps are cut into
+/// `blocks` runs of equal count, the last run takes the remainder. Rows with
+/// equal timestamps share a block.
+pub fn block_ids(time: &[f64], blocks: usize) -> Result<Vec<u8>, String> {
+    let mut distinct: Vec<f64> = time.to_vec();
+    distinct.sort_by(|a, b| a.total_cmp(b));
+    distinct.dedup_by(|a, b| a == b);
+    if blocks == 0 || blocks > FITNESS_MAX_BLOCKS {
+        return Err(format!("the block count must be 1 to {}, got {}", FITNESS_MAX_BLOCKS, blocks));
+    }
+    if distinct.len() < blocks {
+        return Err(format!(
+            "{} time blocks need at least {} distinct training timestamps, found {}",
+            blocks,
+            blocks,
+            distinct.len()
+        ));
+    }
+    let per = distinct.len() / blocks;
+    Ok(time
+        .iter()
+        .map(|t| {
+            let at = distinct.partition_point(|d| d.total_cmp(t).is_lt());
+            (at / per).min(blocks - 1) as u8
+        })
+        .collect())
+}
 
 /// The long/flat book of one prediction vector, reduced to what the search
 /// ranks by (#480).
@@ -955,6 +987,8 @@ pub struct FitnessBook {
     bound: f64,
     min_trades: usize,
     hash: u64,
+    lambda: f64,
+    block_bounds: Vec<f64>,
 }
 
 fn fnv_u64(h: &mut u64, v: u64) {
@@ -968,6 +1002,27 @@ impl FitnessBook {
     /// `horizon_seconds` is the label horizon of the target; rows of one group
     /// closer than that are refused (#468). A non-positive horizon skips it.
     pub fn new(slice: &crate::data::TradingSlice, spec: &TradingSpec, horizon_seconds: f64) -> Result<Self, String> {
+        Self::with_blocks(slice, spec, horizon_seconds, 1, 1.0)
+    }
+
+    /// The book with the time-block consistency term (#484): the distinct
+    /// training timestamps are cut into `blocks` runs of equal count (the last
+    /// takes the remainder), every `(group, block)` run is its own book, and
+    /// the fitness is the mean block regret plus `lambda` times their sample
+    /// standard deviation. `blocks == 1` is [`FitnessBook::new`] exactly.
+    pub fn with_blocks(
+        slice: &crate::data::TradingSlice,
+        spec: &TradingSpec,
+        horizon_seconds: f64,
+        blocks: usize,
+        lambda: f64,
+    ) -> Result<Self, String> {
+        if blocks == 0 || blocks > FITNESS_MAX_BLOCKS {
+            return Err(format!("the block count must be 1 to {}, got {}", FITNESS_MAX_BLOCKS, blocks));
+        }
+        if !lambda.is_finite() || lambda < 0.0 {
+            return Err(format!("the block lambda must be finite and >= 0, got {}", lambda));
+        }
         spec.validate()?;
         if spec.position != PositionMap::Threshold {
             return Err("the fitness book prices the threshold rule only, not the top_tercile map".to_string());
@@ -1007,7 +1062,7 @@ impl FitnessBook {
             }
             excess.push(e);
         }
-        let flags = rows.seam_flags();
+        let mut flags = rows.seam_flags();
         let groups = flags.iter().filter(|&&f| f & TradingRows::FIRST != 0).count();
         let side = spec.per_side_bps() * BP;
         let bound = trading_gpu::dp_bound(&excess, &rows.group, side)?;
@@ -1017,6 +1072,39 @@ impl FitnessBook {
                 spec.per_side_bps(),
                 bound
             ));
+        }
+        let mut block_bounds = vec![bound];
+        if blocks > 1 {
+            let ids = block_ids(&rows.time, blocks)?;
+            block_bounds.clear();
+            for b in 0..blocks {
+                let mut e = Vec::new();
+                let mut g = Vec::new();
+                for i in 0..n {
+                    if ids[i] as usize == b {
+                        e.push(excess[i]);
+                        g.push(rows.group[i]);
+                    }
+                }
+                let bb = trading_gpu::dp_bound(&e, &g, side)?;
+                if !(bb > 0.0) {
+                    return Err(format!(
+                        "no profitable long/flat path exists in time block {} of {} at {} bp per side (hindsight bound {})",
+                        b + 1,
+                        blocks,
+                        spec.per_side_bps(),
+                        bb
+                    ));
+                }
+                block_bounds.push(bb);
+            }
+            for i in 0..n {
+                let first = flags[i] & TradingRows::FIRST != 0 || (i > 0 && ids[i] != ids[i - 1]);
+                let last = flags[i] & TradingRows::LAST != 0 || (i + 1 < n && ids[i] != ids[i + 1]);
+                flags[i] = (if first { TradingRows::FIRST } else { 0 })
+                    | (if last { TradingRows::LAST } else { 0 })
+                    | (ids[i] << FITNESS_BLOCK_SHIFT);
+            }
         }
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         for e in &excess {
@@ -1028,6 +1116,13 @@ impl FitnessBook {
         fnv_u64(&mut hash, side.to_bits());
         fnv_u64(&mut hash, spec.threshold.to_bits());
         fnv_u64(&mut hash, spec.min_trades as u64);
+        if blocks > 1 {
+            fnv_u64(&mut hash, blocks as u64);
+            fnv_u64(&mut hash, lambda.to_bits());
+            for b in &block_bounds {
+                fnv_u64(&mut hash, b.to_bits());
+            }
+        }
         Ok(FitnessBook {
             excess,
             flags,
@@ -1037,6 +1132,8 @@ impl FitnessBook {
             bound,
             min_trades: spec.min_trades,
             hash,
+            lambda,
+            block_bounds,
         })
     }
 
@@ -1077,12 +1174,15 @@ impl FitnessBook {
         &self.excess
     }
 
-    /// Seam flags per row: [`TradingRows::FIRST`] and [`TradingRows::LAST`].
+    /// Seam flags per row: [`TradingRows::FIRST`] and [`TradingRows::LAST`]. With
+    /// several blocks they mark the seams of every `(group, block)` run, and
+    /// bits 2 to 4 carry the block id ([`FITNESS_BLOCK_SHIFT`]).
     pub fn flags(&self) -> &[u8] {
         &self.flags
     }
 
-    /// Reduce one prediction vector. `gross` uses the fixed segment, lane and
+    /// Reduce one prediction vector as a single book (a multi-block book uses
+    /// [`FitnessBook::block_totals`]). `gross` uses the fixed segment, lane and
     /// warp tree documented on [`FITNESS_SEGMENT_ROWS`]; integer counts are
     /// order-free.
     pub fn totals(&self, pred: &[f64]) -> FitnessTotals {
@@ -1170,8 +1270,154 @@ impl FitnessBook {
     }
 
     pub fn regret(&self, pred: &[f64]) -> f64 {
-        self.regret_of(&self.totals(pred))
+        if self.blocks() == 1 {
+            self.regret_of(&self.totals(pred))
+        } else {
+            self.fitness_of(&self.block_totals(pred))
+        }
     }
+
+    /// Time blocks of the consistency term; 1 is the plain regret.
+    pub fn blocks(&self) -> usize {
+        self.block_bounds.len()
+    }
+
+    pub fn lambda(&self) -> f64 {
+        self.lambda
+    }
+
+    /// Hindsight bound of each block (one entry, [`FitnessBook::bound`], for a
+    /// single block).
+    pub fn block_bounds(&self) -> &[f64] {
+        &self.block_bounds
+    }
+
+    /// Reduce one prediction vector to one [`FitnessTotals`] per time block.
+    /// Each block keeps its own segment, lane and warp tree: block `b` adds
+    /// the long rows of block `b` into lane `(row - segment start) % 32`, folds
+    /// the lanes of every segment, and spreads the segment sums over the warps
+    /// exactly as [`FitnessBook::totals`] does for the whole book.
+    pub fn block_totals(&self, pred: &[f64]) -> Vec<FitnessTotals> {
+        debug_assert_eq!(pred.len(), self.excess.len());
+        let nb = self.blocks();
+        let n = self.excess.len().min(pred.len());
+        let mut warps = vec![[0.0f64; FITNESS_WARPS]; nb];
+        let mut out = vec![
+            FitnessTotals { gross: 0.0, flips: 0, exits: 0, long_rows: 0, nonfinite: false };
+            nb
+        ];
+        let mut prev = false;
+        let mut seg_start = 0usize;
+        let mut seg = 0usize;
+        while seg_start < n {
+            let seg_end = (seg_start + FITNESS_SEGMENT_ROWS).min(n);
+            let mut lanes = vec![[0.0f64; FITNESS_LANES]; nb];
+            for k in seg_start..seg_end {
+                let p = pred[k];
+                let flag = self.flags[k];
+                let b = (flag >> FITNESS_BLOCK_SHIFT) as usize & (FITNESS_MAX_BLOCKS - 1);
+                let long = if p.is_finite() {
+                    p > self.threshold
+                } else {
+                    out[b].nonfinite = true;
+                    false
+                };
+                if flag & TradingRows::FIRST != 0 {
+                    prev = false;
+                }
+                if long != prev {
+                    out[b].flips += 1;
+                }
+                if long {
+                    out[b].long_rows += 1;
+                    lanes[b][(k - seg_start) % FITNESS_LANES] += self.excess[k];
+                    if flag & TradingRows::LAST != 0 {
+                        out[b].exits += 1;
+                    }
+                }
+                prev = long;
+            }
+            for b in 0..nb {
+                let l = &mut lanes[b];
+                let mut half = FITNESS_LANES / 2;
+                while half >= 1 {
+                    for i in 0..half {
+                        l[i] += l[i + half];
+                    }
+                    half /= 2;
+                }
+                warps[b][seg % FITNESS_WARPS] += l[0];
+            }
+            seg += 1;
+            seg_start = seg_end;
+        }
+        for b in 0..nb {
+            let w = &mut warps[b];
+            let mut half = FITNESS_WARPS / 2;
+            while half >= 1 {
+                for i in 0..half {
+                    w[i] += w[i + half];
+                }
+                half /= 2;
+            }
+            out[b].gross = w[0];
+        }
+        out
+    }
+
+    /// Regret of block `b` from its totals; `+inf` when it is not finite.
+    pub fn block_regret_of(&self, b: usize, t: &FitnessTotals) -> f64 {
+        let bound = self.block_bounds[b];
+        let r = (bound - self.net_of(t)) / bound;
+        if r.is_finite() {
+            r
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    /// Regret of every block.
+    pub fn block_regrets(&self, totals: &[FitnessTotals]) -> Vec<f64> {
+        totals.iter().enumerate().map(|(b, t)| self.block_regret_of(b, t)).collect()
+    }
+
+    /// The search fitness from per-block totals: `mean + lambda * sd` of the
+    /// block regrets (sample standard deviation, ddof 1); with one block the
+    /// plain regret. `+inf` for a non-finite prediction, fewer than
+    /// `min_trades` flips over all blocks, or a non-finite block regret.
+    pub fn fitness_of(&self, totals: &[FitnessTotals]) -> f64 {
+        let nb = self.blocks();
+        debug_assert_eq!(totals.len(), nb);
+        if nb == 1 {
+            return self.regret_of(&totals[0]);
+        }
+        let flips: u64 = totals.iter().map(|t| t.flips).sum();
+        if totals.iter().any(|t| t.nonfinite) || (flips as usize) < self.min_trades {
+            return f64::INFINITY;
+        }
+        let r = self.block_regrets(totals);
+        if r.iter().any(|v| !v.is_finite()) {
+            return f64::INFINITY;
+        }
+        let mut sum = 0.0f64;
+        for v in &r {
+            sum += *v;
+        }
+        let mean = sum / nb as f64;
+        let mut ss = 0.0f64;
+        for v in &r {
+            let d = *v - mean;
+            ss += d * d;
+        }
+        let sd = (ss / (nb - 1) as f64).sqrt();
+        let f = mean + self.lambda * sd;
+        if f.is_finite() {
+            f
+        } else {
+            f64::INFINITY
+        }
+    }
+
 }
 
 /// The finalist chosen by a trading objective, with both books.
@@ -1356,5 +1602,140 @@ mod canonical_tests {
         assert_eq!(f, vec![1, 0, 2, 3, 1, 2]);
         assert_eq!(f.iter().filter(|&&x| x & TradingRows::FIRST != 0).count(), 3);
         assert_eq!(f.iter().filter(|&&x| x & TradingRows::LAST != 0).count(), 3);
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    #[test]
+    fn block_ids_cut_distinct_timestamps_into_equal_runs() {
+        let t = [0.0, 0.0, 1.0, 2.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        // 9 distinct stamps, 4 blocks of 2, the last takes 3.
+        assert_eq!(block_ids(&t, 4).unwrap(), vec![0, 0, 0, 1, 1, 1, 2, 2, 3, 3, 3]);
+        assert_eq!(block_ids(&t, 1).unwrap(), vec![0; 11]);
+        assert!(block_ids(&t[..3], 4).unwrap_err().contains("distinct training timestamps"));
+        assert!(block_ids(&t, 9).is_err());
+    }
+
+    fn panel(sizes: &[usize]) -> crate::data::TradingSlice {
+        let mut rows = TradingRows::default();
+        let mut ret = Vec::new();
+        let mut k = 0usize;
+        for (g, &n) in sizes.iter().enumerate() {
+            for i in 0..n {
+                rows.group.push(g as u64);
+                rows.time.push(900.0 * i as f64);
+                let x = k as f64 * 0.618_033_988_749_894_9;
+                ret.push(0.004 * (x - x.floor() - 0.45));
+                k += 1;
+            }
+        }
+        crate::data::TradingSlice { rows, ret }
+    }
+
+    fn spec() -> TradingSpec {
+        TradingSpec { cost_bps: 5.0, slippage_bps: 1.0, min_trades: 0, ..Default::default() }
+    }
+
+    fn pred(n: usize) -> Vec<f64> {
+        (0..n).map(|i| if (i * 7 + i / 5) % 3 == 0 { 1.0 } else { -1.0 }).collect()
+    }
+
+    #[test]
+    fn one_block_is_the_plain_book() {
+        let s = panel(&[60, 70, 1, 50]);
+        let plain = FitnessBook::new(&s, &spec(), 900.0).unwrap();
+        let one = FitnessBook::with_blocks(&s, &spec(), 900.0, 1, 3.0).unwrap();
+        assert_eq!(plain.hash(), one.hash());
+        assert_eq!(plain.flags(), one.flags());
+        let p = pred(s.ret.len());
+        assert_eq!(plain.regret(&p).to_bits(), one.regret(&p).to_bits());
+        let t = plain.totals(&p);
+        let b = one.block_totals(&p);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].gross.to_bits(), t.gross.to_bits());
+        assert_eq!((b[0].flips, b[0].exits, b[0].long_rows), (t.flips, t.exits, t.long_rows));
+    }
+
+    #[test]
+    fn block_seams_split_runs_inside_a_group() {
+        let s = panel(&[8, 8]);
+        let b = FitnessBook::with_blocks(&s, &spec(), 900.0, 2, 1.0).unwrap();
+        let f = b.flags();
+        let id = |i: usize| f[i] >> FITNESS_BLOCK_SHIFT;
+        let seam = |i: usize| f[i] & 3;
+        assert_eq!((0..16).map(id).collect::<Vec<_>>(), vec![0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1]);
+        assert_eq!(seam(0), 1);
+        assert_eq!(seam(3), 2);
+        assert_eq!(seam(4), 1);
+        assert_eq!(seam(7), 2);
+        assert_eq!(seam(8), 1);
+        assert_eq!(b.groups(), 2);
+    }
+
+    /// The block rows as their own training slice.
+    fn block_slice(s: &crate::data::TradingSlice, ids: &[u8], b: u8) -> crate::data::TradingSlice {
+        let mut rows = TradingRows::default();
+        let mut ret = Vec::new();
+        for i in 0..ids.len() {
+            if ids[i] == b {
+                rows.group.push(s.rows.group[i]);
+                rows.time.push(s.rows.time[i]);
+                ret.push(s.ret[i]);
+            }
+        }
+        crate::data::TradingSlice { rows, ret }
+    }
+
+    #[test]
+    fn block_regret_equals_separate_books_and_fitness_is_mean_plus_lambda_sd() {
+        let s = panel(&[9000, 4000, 1, 7000, 300]);
+        let k = 4usize;
+        let lambda = 1.5;
+        let book = FitnessBook::with_blocks(&s, &spec(), 900.0, k, lambda).unwrap();
+        let ids = block_ids(&s.rows.time, k).unwrap();
+        let p = pred(s.ret.len());
+        let totals = book.block_totals(&p);
+        let regrets = book.block_regrets(&totals);
+        let mut want = Vec::new();
+        for b in 0..k {
+            let sl = block_slice(&s, &ids, b as u8);
+            let bp: Vec<f64> = (0..ids.len()).filter(|&i| ids[i] as usize == b).map(|i| p[i]).collect();
+            let plain = FitnessBook::new(&sl, &spec(), 900.0).unwrap();
+            assert_eq!(plain.bound().to_bits(), book.block_bounds()[b].to_bits());
+            let r = plain.regret(&bp);
+            assert!((r - regrets[b]).abs() <= 1e-12, "block {b}: {r} vs {}", regrets[b]);
+            want.push(r);
+        }
+        let mean = want.iter().sum::<f64>() / k as f64;
+        let sd = (want.iter().map(|r| (r - mean) * (r - mean)).sum::<f64>() / (k - 1) as f64).sqrt();
+        let fit = book.regret(&p);
+        assert!((fit - (mean + lambda * sd)).abs() <= 1e-12, "{fit} vs {}", mean + lambda * sd);
+        let flat = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 0.0).unwrap();
+        assert!((flat.regret(&p) - mean).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn non_finite_and_min_trades_score_infinity() {
+        let s = panel(&[40, 40]);
+        let sp = TradingSpec { min_trades: 3, ..spec() };
+        let b = FitnessBook::with_blocks(&s, &sp, 900.0, 2, 1.0).unwrap();
+        assert_eq!(b.regret(&vec![-1.0; 80]), f64::INFINITY);
+        let mut p = pred(80);
+        assert!(b.regret(&p).is_finite());
+        p[50] = f64::NAN;
+        assert_eq!(b.regret(&p), f64::INFINITY);
+    }
+
+    #[test]
+    fn refusals_name_the_block_problem() {
+        let s = panel(&[40, 40]);
+        assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 0, 1.0).is_err());
+        assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 9, 1.0).is_err());
+        assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 2, -1.0).is_err());
+        assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 2, f64::NAN).is_err());
+        assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 41, 1.0).is_err());
     }
 }
