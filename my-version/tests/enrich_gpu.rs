@@ -955,8 +955,8 @@ fn refused_cub_sort_fails_cross_section_prepare_then_recovers() {
 
 /// #410: refusing the later real CUB calls of the cross-section prepare (the
 /// time pass, call 2, and the group scan, call 3) fails the prepare after the
-/// first sort already ran, no permutation survives, and the next prepare gives
-/// the same ranks as the baseline.
+/// first sort already ran, no permutation survives, and the next prepare on
+/// the same context gives the same ranks as an unrefused one.
 #[test]
 fn refused_later_cub_calls_fail_cross_section_prepare_then_recover() {
     use rcsr::enrich_gpu::EnrichGpu;
@@ -979,15 +979,19 @@ fn refused_later_cub_calls_fail_cross_section_prepare_then_recover() {
     let zeros = vec![0.0f64; n];
     let seg_start: Vec<u32> = (0..symbols).map(|k| (k * steps) as u32).collect();
     let seg_len = vec![steps as u32; symbols];
-    let mut gpu = EnrichGpu::new(
-        &times, &close, &close, &close, &close, &zeros, &zeros, &seg_start, &seg_len, 900,
-    )
-    .expect("CUDA context");
+    let make = || {
+        EnrichGpu::new(
+            &times, &close, &close, &close, &close, &zeros, &zeros, &seg_start, &seg_len, 900,
+        )
+        .expect("CUDA context")
+    };
     let src: Vec<f64> = (0..n).map(|i| (i % 29) as f64).collect();
 
-    assert!(gpu.prepare_cross_section(&sym, None), "baseline prepare");
-    let base = gpu.rank(&src).expect("baseline rank");
+    let mut reference = make();
+    assert!(reference.prepare_cross_section(&sym, None), "baseline prepare");
+    let base = reference.rank(&src).expect("baseline rank");
     for k in [2, 3] {
+        let mut gpu = make();
         unsafe { rc_enrich_test_force_cub_fail(k) };
         let refused = gpu.prepare_cross_section(&sym, None);
         unsafe { rc_enrich_test_force_cub_fail(0) };
