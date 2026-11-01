@@ -183,6 +183,7 @@ struct RcCtx {
        row r - 1) followed by one word holding the pair count. Null means every
        row r >= 1 pairs with row r - 1. */
     unsigned int *d_pmask;
+    int pmask_n;
     /* #496: arithmetic of the fit polish (0 f64, 1 f32, 2 off) and the summed
        per-block cycles of the LM and polish phases since the last read. */
     int fit_polish;
@@ -5609,7 +5610,7 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
         return -1.0f;
     }
 
-    if (kind == RC_SCORE_SLOPE && (c->tiled || c->d_w64 || (c->d_pmask && bounds))) {
+    if (kind == RC_SCORE_SLOPE && (c->tiled || c->d_w64 || (c->d_pmask && (bounds || c->pmask_n != c->n)))) {
         st->failed = 1;
         st->wall_ms = rc_now_ms() - c->batch_start_ms;
         return -1.0f;
@@ -5978,6 +5979,8 @@ int rc_set_fit_data(void *ctx, const double *cols, const double *y, const double
     if (c->d_cols64) { rc_dev_free(c, c->d_cols64); c->d_cols64 = 0; }
     if (c->d_y64) { rc_dev_free(c, c->d_y64); c->d_y64 = 0; }
     if (c->d_w64) { rc_dev_free(c, c->d_w64); c->d_w64 = 0; }
+    /* #508: the pair mask belongs to the rows it was built for. */
+    if (c->d_pmask) { rc_dev_free(c, c->d_pmask); c->d_pmask = 0; }
     rc_weighted_moments(c, 0);
     /* #288: the rank stage caches B from the previous target. Re-uploading
        exact rows invalidates it, or a scorer called after this would rank the
@@ -6089,8 +6092,9 @@ int rc_set_fit_sign(void *ctx, const double *sign)
  * `r - 1` (bit 0 must be clear); `npairs` is the number of set bits. The device
  * copy appends `npairs` as one more word, which the scorer reads as its divisor.
  * `NULL` clears the mask, and every row `r >= 1` pairs with row `r - 1` again.
- * A mask is read by the slope scorer and the slope fit arm only, and a
- * row-range launch with a mask is refused.
+ * A mask is read by the slope scorer and the slope fit arm only, a row-range
+ * launch with a mask is refused, and `rc_set_fit_data` drops it. A launch
+ * whose stored row count differs from the context's is refused.
  */
 int rc_set_slope_pairs(void *ctx, const unsigned int *bits, long long npairs)
 {
@@ -6108,6 +6112,7 @@ int rc_set_slope_pairs(void *ctx, const unsigned int *bits, long long npairs)
     rc_upload(c->d_pmask, bits, sizeof(unsigned int) * words);
     unsigned int count = (unsigned int)npairs;
     rc_upload(c->d_pmask + words, &count, sizeof(unsigned int));
+    c->pmask_n = c->n;
     if (cudaGetLastError() != cudaSuccess) {
         rc_dev_free(c, c->d_pmask);
         c->d_pmask = 0;
@@ -6156,7 +6161,7 @@ static float rc_fit_launch(RcCtx *c,
        refused here, so the arm can never run on another objective. */
     if (rc_fit_reads_sign(metric) && !c->has_tsign) return -1.0f;
     /* #236: slope has no weighted form. */
-    if (metric == RC_LOSS_SLOPE && c->d_w64) return -1.0f;
+    if (metric == RC_LOSS_SLOPE && (c->d_w64 || (c->d_pmask && c->pmask_n != c->n))) return -1.0f;
     if (kmax > FT_MAX_CONST_LARGE) return -1.0f;
     const size_t prog_words = (size_t)off[nprog];
     const size_t cbytes = sizeof(double) * (size_t)nprog * (size_t)kmax;
@@ -6320,7 +6325,7 @@ int rc_fit_probe(void *ctx,
     RcCtx *c = (RcCtx *)ctx;
     if (!c || c->tiled || nprog <= 0 || kmax <= 0 || kmax > FT_MAX_CONST_SMALL) return -1;
     if (rc_fit_reads_sign(metric) && !c->has_tsign) return -1;
-    if (metric == RC_LOSS_SLOPE && c->d_w64) return -1;
+    if (metric == RC_LOSS_SLOPE && (c->d_w64 || (c->d_pmask && c->pmask_n != c->n))) return -1;
     const size_t prog_words = (size_t)off[nprog];
     const size_t cbytes = sizeof(double) * (size_t)nprog * (size_t)kmax;
     const size_t obytes = sizeof(double) * (size_t)nprog * (size_t)FT_PROBE_STRIDE(kmax);

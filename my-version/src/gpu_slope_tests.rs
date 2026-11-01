@@ -761,6 +761,70 @@ fn slope_device_fit_matches_the_cpu_on_a_grouped_panel() {
     }
 }
 
+/// A pair mask follows the data: re-uploading the fit rows drops it, so the next
+/// scorer and fit launches difference the consecutive rows again, and a new
+/// mask for another grouping replaces it. A mask for another row count is
+/// refused.
+#[test]
+fn slope_pair_mask_is_cleared_by_a_fit_data_upload() {
+    let n: usize = PANEL.iter().sum();
+    let pairs = panel_pairs(&PANEL);
+    let s = with_pairs(series(n, 47), pairs.clone());
+    let Some(mut ev) = evaluator(&s) else {
+        return;
+    };
+    let mask = mask_of(&s);
+    assert!(ev.set_slope_pairs(&mask.bits, mask.pairs));
+    let trees = vec![affine(0.5, 0.0), shaped(2.9, 0.2, 0.25), wave(2.5, 1.1, 0.4, 0.3)];
+    let pop = Population::from_trees(trees.iter());
+    let (prog, offsets) = pop.programs();
+    let pcount = vec![0i32; trees.len()];
+    let pair_slope = |t: &Node, pairs: &[[u32; 2]]| {
+        let pred: Vec<f64> = s.x.iter().map(|row| expr::eval(t, row)).collect();
+        metrics::score_slope_pairs(&pred, &s.y, pairs)
+    };
+    let consecutive = fit::consecutive_pairs(n);
+
+    let n_cols = s.x[0].len();
+    let mut cols = vec![0.0f64; n * n_cols];
+    for (r, row) in s.x.iter().enumerate() {
+        for (k, &x) in row.iter().enumerate() {
+            cols[k * n + r] = x;
+        }
+    }
+    assert!(ev.set_fit_data(&cols, &s.y, &[]), "the rows are uploaded again");
+
+    let got = ev.score_batch(prog, offsets, ScoreObjective::Slope, &pcount);
+    for (k, tree) in trees.iter().enumerate() {
+        let want = pair_slope(tree, &consecutive);
+        let stale = pair_slope(tree, &pairs);
+        assert!((got.values[k] - want).abs() <= 1e-6 * want, "tree {k}: not the consecutive slope");
+        assert!((got.values[k] - stale).abs() > 1e-9, "tree {k}: the stale mask was used");
+    }
+    let plan = fit::gpu_fit_plan(&shaped(0.3, 0.1, 0.2)).unwrap();
+    let (out, ms) = ev.slope_fit_batch(&[&plan], 8);
+    assert!(ms >= 0.0);
+    let mut dev = shaped(0.3, 0.1, 0.2);
+    plan.apply(&mut dev, &out[0].c);
+    let fitted = pair_slope(&dev, &consecutive);
+    assert!(
+        (out[0].sse - fitted).abs() <= 1e-6 * fitted,
+        "fit reported {} vs consecutive slope {fitted}",
+        out[0].sse
+    );
+
+    let other = panel_pairs(&[500, 3, 400, 1, 100]);
+    let regrouped = with_pairs(s.clone(), other.clone());
+    let m2 = mask_of(&regrouped);
+    assert!(ev.set_slope_pairs(&m2.bits, m2.pairs));
+    let got = ev.score_batch(prog, offsets, ScoreObjective::Slope, &pcount);
+    for (k, tree) in trees.iter().enumerate() {
+        let want = pair_slope(tree, &other);
+        assert!((got.values[k] - want).abs() <= 1e-6 * want, "tree {k}: not the new grouping");
+    }
+    assert!(!ev.set_slope_pairs(&vec![0u32; n.div_ceil(32) + 1], 0), "another row count is refused");
+}
+
 /// A `--group-by` style panel run keeps the slope scorer and fit on the device:
 /// the fit ledger counts device fits and every archive error is the exact CPU
 /// slope over the panel's pairs.

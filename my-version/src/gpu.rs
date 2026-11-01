@@ -1694,6 +1694,8 @@ impl GpuEvaluator {
     /// same weights) it will verify the proposals on.
     pub fn set_fit_data(&mut self, cols: &[f64], y: &[f64], w: &[f64]) -> bool {
         let wp = if w.is_empty() { std::ptr::null() } else { w.as_ptr() };
+        // #508: the device drops the slope pair mask with the rows it described.
+        self.slope_pair_count = None;
         let ok = unsafe { rc_set_fit_data(self.ctx, cols.as_ptr(), y.as_ptr(), wp) == 0 };
         if ok {
             let rows = y.len() as u64;

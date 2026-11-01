@@ -1240,10 +1240,10 @@ impl GpuSearch {
                 }
                 // #508: a panel's slope pairs skip the group boundaries; the
                 // device reads them as a per-row mask.
-                if let Some(mask) = slope_pair_mask(train).filter(|m| !m.bits.is_empty()) {
-                    if !ev.set_slope_pairs(&mask.bits, mask.pairs) {
-                        return Err(device_refusal("the slope pair mask"));
-                    }
+                let mask = slope_pair_mask(train).map(|m| m.bits).unwrap_or_default();
+                let pairs = train.pairs.as_ref().map_or(0, Vec::len);
+                if !ev.set_slope_pairs(&mask, pairs) {
+                    return Err(device_refusal("the slope pair mask"));
                 }
                 let fit_sub = if sub {
                     Some(FitSubsample::new(
