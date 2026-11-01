@@ -172,7 +172,7 @@ fn sigma(signed: bool, rho: f64) -> f64 {
     }
 }
 
-/// One pass over the rows at `c`: weighted centred moments, `d rho`, `H`.
+/// Two passes over the rows at `c`: weighted centred moments, `d rho`, `H`.
 ///
 /// Returns `None` when a prediction or derivative is non-finite, so the caller
 /// can report `non_finite` and keep the incoming constants.
@@ -188,17 +188,14 @@ pub(crate) fn moments(
     g: &mut [f64],
 ) -> Option<CorrMoments> {
     let p = f.nconst;
-    let tri = p * (p + 1) / 2;
     let mut wsum = 0.0;
     let mut sf = 0.0;
     let mut sy = 0.0;
-    let mut sff = 0.0;
-    let mut syy = 0.0;
-    let mut sfy = 0.0;
     let mut sg = vec![0.0; p];
-    let mut sgf = vec![0.0; p];
-    let mut sgy = vec![0.0; p];
-    let mut cjk = vec![0.0; tri];
+    let mut rw: Vec<f64> = Vec::with_capacity(x.len());
+    let mut rf: Vec<f64> = Vec::with_capacity(x.len());
+    let mut rt: Vec<f64> = Vec::with_capacity(x.len());
+    let mut rg: Vec<f64> = Vec::with_capacity(x.len() * p);
     for (i, (row, &t)) in x.iter().zip(y).enumerate() {
         let sw = w.get(i).copied().unwrap_or(1.0);
         if sw == 0.0 {
@@ -216,65 +213,94 @@ pub(crate) fn moments(
         wsum += sw;
         sf += sw * pred;
         sy += sw * t;
-        sff += sw * pred * pred;
-        syy += sw * t * t;
-        sfy += sw * pred * t;
         for j in 0..p {
             let gj = g[j];
             if !gj.is_finite() {
                 return None;
             }
             sg[j] += sw * gj;
-            sgf[j] += sw * gj * pred;
-            sgy[j] += sw * gj * t;
         }
-        let mut k = 0;
-        for a in 0..p {
-            for b in 0..=a {
-                cjk[k] += sw * g[a] * g[b];
-                k += 1;
-            }
-        }
+        rw.push(sw);
+        rf.push(pred);
+        rt.push(t);
+        rg.extend_from_slice(&g[..p]);
     }
     if !(wsum > 0.0) || !wsum.is_finite() {
         return None;
     }
     let f_mean = sf / wsum;
     let y_mean = sy / wsum;
-    let s_ff = sff - wsum * f_mean * f_mean;
-    let s_yy = syy - wsum * y_mean * y_mean;
-    let s_fy = sfy - wsum * f_mean * y_mean;
+    let gbar: Vec<f64> = sg.iter().map(|s| s / wsum).collect();
+    // Centred two-pass sums in units of the largest deviation, so a prediction
+    // of tiny magnitude or a large mean with a small spread keeps its digits.
+    let mut scale_f = 0.0f64;
+    let mut scale_y = 0.0f64;
+    for (&pred, &t) in rf.iter().zip(&rt) {
+        scale_f = scale_f.max((pred - f_mean).abs());
+        scale_y = scale_y.max((t - y_mean).abs());
+    }
     let mut grad = vec![0.0; p];
     let mut hess = vec![vec![0.0; p]; p];
-    if !(s_ff.is_finite() && s_yy.is_finite() && s_fy.is_finite()) {
+    if !(scale_f.is_finite() && scale_y.is_finite()) {
         return None;
     }
     // Mirror `metrics::correlation`: a degenerate variance scores 0.0 there,
     // which is the metric's worst value `1.0`.
-    if s_ff <= 0.0 || s_yy <= 0.0 {
+    if scale_f < f64::MIN_POSITIVE || scale_y < f64::MIN_POSITIVE {
         return Some(CorrMoments {
             weight: wsum,
             f_mean,
             y_mean,
-            s_ff: s_ff.max(0.0),
-            s_yy: s_yy.max(0.0),
-            s_fy,
+            s_ff: 0.0,
+            s_yy: 0.0,
+            s_fy: 0.0,
             rho: 0.0,
             grad_rho: grad,
             hess,
         });
     }
-    let rho = s_fy / (s_ff * s_yy).sqrt();
+    let (mut s_ff, mut s_yy, mut s_fy) = (0.0, 0.0, 0.0);
     let mut a = vec![0.0; p];
     let mut b = vec![0.0; p];
-    let mut gbar = vec![0.0; p];
-    for j in 0..p {
-        gbar[j] = sg[j] / wsum;
-        a[j] = sgf[j] - wsum * gbar[j] * f_mean;
-        b[j] = sgy[j] - wsum * gbar[j] * y_mean;
+    let mut cjk = vec![0.0; p * (p + 1) / 2];
+    let mut dg = vec![0.0; p];
+    for (r, &sw) in rw.iter().enumerate() {
+        let df = (rf[r] - f_mean) / scale_f;
+        let dy = (rt[r] - y_mean) / scale_y;
+        s_ff += sw * df * df;
+        s_yy += sw * dy * dy;
+        s_fy += sw * df * dy;
+        for j in 0..p {
+            dg[j] = (rg[r * p + j] - gbar[j]) / scale_f;
+            a[j] += sw * dg[j] * df;
+            b[j] += sw * dg[j] * dy;
+        }
+        let mut k = 0;
+        for i in 0..p {
+            for j in 0..=i {
+                cjk[k] += sw * dg[i] * dg[j];
+                k += 1;
+            }
+        }
     }
-    let denom = s_ff * s_yy;
-    let root = denom.sqrt();
+    if !(s_ff.is_finite() && s_yy.is_finite() && s_fy.is_finite()) {
+        return None;
+    }
+    if s_ff <= 0.0 || s_yy <= 0.0 {
+        return Some(CorrMoments {
+            weight: wsum,
+            f_mean,
+            y_mean,
+            s_ff: 0.0,
+            s_yy: 0.0,
+            s_fy: 0.0,
+            rho: 0.0,
+            grad_rho: grad,
+            hess,
+        });
+    }
+    let rho = (s_fy / (s_ff.sqrt() * s_yy.sqrt())).clamp(-1.0, 1.0);
+    let root = s_ff.sqrt() * s_yy.sqrt();
     for j in 0..p {
         grad[j] = b[j] / root - rho * a[j] / s_ff;
         if !grad[j].is_finite() {
@@ -284,24 +310,26 @@ pub(crate) fn moments(
     let mut k = 0;
     for i in 0..p {
         for j in 0..=i {
-            // C_jk = Σw g_j g_k - W·ḡ_j·ḡ_k.
-            let centred = cjk[k] - wsum * gbar[i] * gbar[j];
-            hess[i][j] = (centred - a[i] * a[j] / s_ff) / s_ff;
+            hess[i][j] = (cjk[k] - a[i] * a[j] / s_ff) / s_ff;
             hess[j][i] = hess[i][j];
             k += 1;
         }
     }
+    // The sums above are in scaled units; report them in data units so the
+    // callers' relative-variance gate keeps its meaning. They may underflow to
+    // zero for a tiny-magnitude prediction, which the fit treats as degenerate.
     Some(CorrMoments {
         weight: wsum,
         f_mean,
         y_mean,
-        s_ff,
-        s_yy,
-        s_fy,
+        s_ff: s_ff * scale_f * scale_f,
+        s_yy: s_yy * scale_y * scale_y,
+        s_fy: s_fy * scale_f * scale_y,
         rho,
         grad_rho: grad,
         hess,
     })
+}
 }
 
 /// Whether the flattened tree is affine in all constants (the closed-form arm).
@@ -560,6 +588,48 @@ mod tests {
                 constant(0.1),
             ],
         )
+    }
+
+    fn rho_of(tree: &Node, x: &[Vec<f64>], y: &[f64], w: &[f64]) -> f64 {
+        let f = flatten(tree);
+        let mut c = vec![0.0; f.nconst];
+        for i in 0..f.op.len() {
+            if f.cslot[i] >= 0 {
+                c[f.cslot[i] as usize] = f.val[i];
+            }
+        }
+        let mut v = vec![0.0; f.op.len()];
+        let mut adj = vec![0.0; f.op.len()];
+        let mut g = vec![0.0; f.nconst];
+        moments(&f, x, y, w, &c, &mut v, &mut adj, &mut g).expect("finite moments").rho
+    }
+
+    fn tiny_target(x: &[Vec<f64>]) -> Vec<f64> {
+        x.iter().map(|r| (r[0] + 1.0).ln() + (r[0] * r[0] + 1.0).ln()).collect()
+    }
+
+    #[test]
+    fn correlation_tiny_magnitude() {
+        let x: Vec<Vec<f64>> = (0..200).map(|i| vec![2.0 * i as f64 / 199.0]).collect();
+        let y = tiny_target(&x);
+        let scaled = |k: f64| node(Op::Mul, vec![constant(k), node(Op::Exp, vec![input(0)])]);
+        for w in [vec![], (0..200).map(|i| 1.0 + (i % 3) as f64).collect::<Vec<f64>>()] {
+            let r = rho_of(&scaled(1e-162), &x, &y, &w);
+            assert!(r.abs() <= 1.0, "r={r}");
+            assert!((r - rho_of(&scaled(1.0), &x, &y, &w)).abs() < 1e-9, "r={r}");
+        }
+    }
+
+    #[test]
+    fn correlation_large_mean_small_spread() {
+        let x = rows(101);
+        let y: Vec<f64> = x.iter().map(|r| r[0] * r[0] + r[0]).collect();
+        let big = node(Op::Add, vec![constant(1e8), node(Op::Mul, vec![constant(1e-6), input(0)])]);
+        let unit = input(0);
+        for w in [vec![], (0..101).map(|i| 1.0 + (i % 3) as f64).collect::<Vec<f64>>()] {
+            let r = rho_of(&big, &x, &y, &w);
+            assert!((r - rho_of(&unit, &x, &y, &w)).abs() < 1e-6, "r={r}");
+        }
     }
 
     #[test]
