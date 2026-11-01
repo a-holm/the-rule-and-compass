@@ -6966,7 +6966,7 @@ fn enrich_inner(
                 std::sync::Arc::new(
                     times
                         .iter()
-                        .map(|&t| guarded.iter().all(|r| t + p <= r.start || t >= r.end))
+                        .map(|&t| guarded.iter().all(|r| t + p.max(1) <= r.start || t >= r.end))
                         .collect(),
                 )
             });
