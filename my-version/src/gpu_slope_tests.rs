@@ -608,17 +608,31 @@ fn slope_config(fit_iters: usize, seed: u32) -> Config {
     }
 }
 
+/// A slow level the inputs cannot explain plus a fast term they can: `3·x1`
+/// is the slope optimum, while a level statistic prefers models of the level.
+fn level_and_slope(n: usize, seed: u64) -> Sample {
+    let mut s = series(n, seed);
+    for (i, row) in s.x.iter_mut().enumerate() {
+        row[0] = i as f64 / n as f64;
+    }
+    for (i, y) in s.y.iter_mut().enumerate() {
+        *y = 10.0 * (std::f64::consts::TAU * i as f64 / n as f64).sin() + 3.0 * s.x[i][1];
+    }
+    s
+}
+
 /// A slope search ranks on slope on the device: the evaluator and the fit
 /// arm run there, every archived error is the exact CPU slope of its tree, and
-/// the best front member is as good as the `--no-gpu` run's.
+/// the best front member is as good as the `--no-gpu` run's on a cell where a
+/// level statistic would rank a different law first.
 #[test]
 fn slope_gpu_front_is_ranked_on_slope() {
     if !probe().available() {
         eprintln!("skipping GPU test: no usable CUDA device");
         return;
     }
-    let train = series(3_000, 31);
-    let test = series(600, 32);
+    let train = level_and_slope(3_000, 31);
+    let test = level_and_slope(600, 32);
     let cfg = slope_config(6, 9);
     let gpu = search::run(&cfg, &train, &test);
     assert_eq!(gpu.backend, crate::backend::Kind::Gpu, "{:?}", gpu.backend_reason);

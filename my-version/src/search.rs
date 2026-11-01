@@ -2277,7 +2277,13 @@ fn score_pipeline_batch(
     let mut fitted: Vec<(usize, Option<Vec<f64>>)> = Vec::new();
     if !plans.is_empty() {
         let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().map(|(_, p)| p).collect();
-        let (out, ms) = g.ev.fit_batch(&refs, fit.iters, fit.loss);
+        // #236: slope always starts from the squared warm start and keeps the
+        // incoming constants unless it improves on them.
+        let (out, ms) = if fit.loss == crate::fit::DeviceLoss::Slope {
+            g.ev.slope_fit_batch(&refs, fit.iters)
+        } else {
+            g.ev.fit_batch(&refs, fit.iters, fit.loss)
+        };
         if ms > 0.0 {
             g.fit_ms += ms as f64;
         }
@@ -2474,9 +2480,6 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
 /// `None` is the consecutive set by definition ([`crate::data::Sample::pairs`]).
 #[cfg(feature = "cuda")]
 pub(crate) fn slope_pairs_are_consecutive(train: &Sample) -> bool {
-    if train.len() > 0 {
-        return true;
-    }
     let Some(pairs) = &train.pairs else {
         return true;
     };

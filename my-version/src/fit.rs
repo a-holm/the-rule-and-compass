@@ -346,7 +346,7 @@ pub enum FitObjective {
     /// #236: `Σ |(pᵢ − pᵢ₋₁) − (yᵢ − yᵢ₋₁)|` over consecutive rows, minimised by
     /// IRLS on the differenced rows (row weight `1/max(|g|, 1e-6)`) with
     /// true-slope acceptance. Unweighted; the device runs it from the squared
-    /// warm start ([`crate::gpu::GpuEvaluator::slope_fit_batch`]).
+    /// warm start (`GpuEvaluator::slope_fit_batch`).
     Slope,
 }
 
