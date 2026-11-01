@@ -1544,6 +1544,7 @@ fn usage() -> &'static str {
             writes the projection CSV with placebo and circular-block-permuted columns\n\
   score     (--run <run.json> | --from-run <run.json>) --data <csv|rcsb> --target <col> --time <col> --windows <file> --out <file>\n\
             [--lockbox START,END|none]  a fold touching the locked test (same resolution) is refused (exit 3)\n\
+            [--allow-in-sample]  a fold whose test starts before the run's last seen row + purge is refused (exit 3); with the flag it is labelled oof:false and left out of every pooled series\n\
             [--group <col>] [--return-col <col>] [--scheme expanding] [--thresholds 0.6,0.7,0.8]\n\
             [--headline-threshold 0.7] [--cost-bps 12 | --cost-override <bp>] [--purge-seconds 219600] [--target-spec <file>]\n\
             scores the run's finalist (objective.finalist.expression) on every fold. --target-spec sets the per-side cost\n\
@@ -1690,7 +1691,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             Ok(())
         }
         "score" => {
-            let fl = parse_flags(rest, &[])?;
+            let fl = parse_flags(rest, &["--allow-in-sample"])?;
             let from_run = fl.opt("--from-run");
             if from_run.is_some() && fl.opt("--run").is_some() {
                 return Err((2, "--run and --from-run are alternatives; --from-run also takes the cost, units and fixed threshold from the run".to_string()));
@@ -1769,6 +1770,11 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             let windows_path = fl.need("--windows")?;
             let wtext = std::fs::read_to_string(windows_path).map_err(|e| io_err(windows_path, e))?;
             let rows = protocol::parse_windows_csv(&wtext, Some(fl.opt("--scheme").unwrap_or("expanding"))).map_err(|e| (3, e))?;
+            let run_file = crate::run_json::RunFile::parse(&run_text).map_err(|e| (3, format!("{}: {}", run_path, e)))?;
+            let labelled: Vec<(String, f64)> = rows.iter().map(|r| (r.window.label.clone(), r.window.test_start)).collect();
+            let oof = run_file
+                .oof_flags(&labelled, fl.has("--allow-in-sample"))
+                .map_err(|e| (3, format!("{}: {}", run_path, e)))?;
             let panel = ladder::load_panel(&inp, &opts).map_err(|e| (3, e))?;
             let resolved = crate::lockbox::resolve(fl.opt("--lockbox"), fl.need("--data")?).map_err(|e| (e.exit, e.message))?;
             let declared = resolved.declared();
@@ -1776,6 +1782,11 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             let folds = ladder::make_folds(&panel, &rows, opts.purge_seconds, guard).map_err(|e| (3, e))?;
             if let Some(extra) = resolved.also {
                 ladder::make_folds(&panel, &rows, opts.purge_seconds, Some((extra.start as f64, extra.end as f64))).map_err(|e| (3, e))?;
+            }
+            let all_labels: Vec<String> = folds.iter().map(|f| f.label.clone()).collect();
+            let folds: Vec<ladder::Fold> = folds.into_iter().zip(&oof).filter(|(_, ok)| **ok).map(|(f, _)| f).collect();
+            if folds.is_empty() {
+                return Err((3, "no out-of-fold folds: every fold overlaps the rows the run trained or selected on".to_string()));
             }
             let res = match &book {
                 Some(b) => score_run_fixed(&facts, &panel, &folds, b.threshold, &opts),
@@ -1793,7 +1804,22 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 None => "{\"kind\":\"quantile\"}".to_string(),
             };
             let json = res.json();
-            let mut json = format!("{},\"cost\":{},\"threshold_rule\":{}}}", &json[..json.len() - 1], cost_decl.json(), rule);
+            let fold_oof = format!(
+                "[{}]",
+                all_labels
+                    .iter()
+                    .zip(&oof)
+                    .map(|(l, ok)| format!("{{\"fold\":{},\"oof\":{}}}", jstr(l), ok))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let mut json = format!(
+                "{},\"cost\":{},\"threshold_rule\":{},\"fold_oof\":{}}}",
+                &json[..json.len() - 1],
+                cost_decl.json(),
+                rule,
+                fold_oof
+            );
             json = resolved.splice_report(&json, 0, false, true);
             let out = fl.need("--out")?;
             std::fs::write(out, json + "\n").map_err(|e| io_err(out, e))?;

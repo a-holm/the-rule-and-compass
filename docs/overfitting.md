@@ -566,8 +566,10 @@ A formula is only as good as the best opponent it beat. `rcsr ladder` runs every
 | `top_tercile_long` | long the top tercile of the OLS score per timestamp, cash for the rest |
 | `feature_threshold` | `1[f > tau]` on one declared feature (`--signal-col`) |
 | `gbm` | gradient-boosted trees (pure `std`), 6 depth and rate configurations, tree count chosen on validation MSE |
-| `symbolic_regression` | the caller's out-of-fold score column (`--sr-score`) |
+| `symbolic_regression` | one search `run.json` (`--sr-run`) scored on every fold with its fixed threshold `objective.spec.threshold`, or the caller's out-of-fold score column (`--sr-score`, labelled `oof=caller`) |
 | `matched_exposure_random_long` | the run lengths of the searched book (else the OLS book) shuffled per symbol |
+
+`--sr-run run.json` evaluates the run's finalist on `fit`, `validation` and `test` of every fold. Out-of-fold rule: a fold whose `test_start` is below `max(split.train_time[1], split.validation_time[1]) + purge` of the run is in-sample and exits 3 naming the fold; a run without `split.train_time` is in-sample too. `--allow-in-sample` labels such folds `oof:false` in the report's `sr_run.folds` and drops them from every rung and every pooled series (Sharpe, SPA, DSR, PBO). `candidate_evaluations` and `wall_seconds` of the rung come from the run (`search.candidates_evaluated`, `elapsed_seconds`) unless `--sr-evals` or `--sr-wall` is given. The out-of-fold SR score comes from one search per arm trained before the first scored fold, not from a search per fold.
 
 Per fold, a model fits on `[train_start, validation_start - purge)`, chooses its hyperparameters and its score-threshold quantile on `[validation_start, train_end)` and is scored once on the test range. A score rung is long iff `score > theta`, with `theta` a fit-score quantile from `--quantiles`. A rung whose input column is not given is `not_run` with the reason. The test range is never used for selection; the best long/flat rule and the SPA benchmark are reported from it for the reader only.
 
@@ -587,6 +589,8 @@ Reported per rung: exposure, beta on the equal-weight universe, net P&L at the c
 | `A5` | `B0` and circular-block-permuted copies of the `A2` family columns |
 
 Every arm runs a fixed generation count, 3 seeds for the screen and 5 for finalists. `rcsr ablation plan` writes one manifest per arm with the arm name, the ordered feature list, its SHA-256, the generation budget and the seeds. `rcsr --arm A1` writes `ablation.arm`, `ablation.feature_list_sha256`, `ablation.generation_budget` and `ablation.generations_run` into run.json, and `verdict` refuses a run whose hash or budget differs from the definition or the arm manifest. `rcsr ablation score` prices the run's validation-chosen finalist (`objective.finalist`) on every fold at a fixed threshold grid; no threshold is picked on the test range.
+
+`rcsr ablation score` refuses a fold whose test range starts before the run's last seen row plus purge (exit 3, the fold is named), because the finalist was trained or selected on those rows. `--allow-in-sample` scores only the out-of-fold folds, lists every fold with `oof` in the result's `fold_oof`, and leaves the others out of the pooled series. A scored arm needs a run trained before its first fold.
 
 A family is `ship` only if every check passes against every control arm:
 
