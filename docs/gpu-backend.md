@@ -515,7 +515,10 @@ remains for the fit and test APIs.
 `auc` are `ScoreDispatch::Exact` rows of the same table (#288): they are scored
 by `GpuEvaluator::score_stat_batch` over flattened plans on the exact `f64` forward
 pass, from the measured 4 096-row floor (see the #288 section below). `slope`
-and `implicit` remain CPU. `implicit_residual` is the `absolute` objective on the
+is a `ScoreDispatch::Native` row since #236, admitted only when the training
+pairs are the consecutive rows (see [Slope on the batched
+kernel](#slope-on-the-batched-kernel-issue-236)); `implicit` remains CPU.
+`implicit_residual` is the `absolute` objective on the
 all-zero implicit target: it shares the `absolute` native scorer and the L1 IRLS
 device fit arm, and a run with a non-zero target is refused by name. The named reason of a
 refused metric is printed and recorded in `backend_reason`, and so is the row floor for an `Exact` metric.
@@ -561,8 +564,8 @@ Fallback and the flags:
 * With neither flag, a CUDA build with a usable device selects the GPU when the
   #287 table names a native scorer for the metric (subject to the row floor and
   the binary-target rule for AUC). Every other metric is scored on the CPU and
-  prints the table's named reason (for example `# gpu: off (slope needs a
-  cross-row first-difference pass)`) once; the resource line and the `--json`
+  prints the table's named reason (for example `# gpu: off (implicit needs an
+  expression-tree gradient pass)`) once; the resource line and the `--json`
   `backend` both say `cpu` and `backend_reason` carries the same cause.
 * A build without the feature prints
   `# gpu: unavailable (built without --features cuda); using the CPU`; a CUDA
@@ -640,8 +643,11 @@ objective kernel at any size; `ScoreStat::Maximum` stays as the exact `f64`
 entry of `score_stat_batch` for direct callers and the parity tests. `gpu_blocker`
 names every refusal:
 
-* no scorer for the metric: the table's own reason (for example `slope needs a
-  cross-row first-difference pass`);
+* no scorer for the metric: the table's own reason (for example `implicit needs
+  an expression-tree gradient pass`);
+* slope whose training pairs are not the consecutive rows (a shuffled split, a
+  `--group-by` panel, a row missing from the side): `slope pairs are not the
+  consecutive rows of the training sample`;
 * sample below the measured floor: `order/rank scoring: the sample is below the
   4096-row device floor`;
 * AUC with a target that is not two-valued: `auc needs a two-valued target`;
@@ -830,7 +836,7 @@ returns an empty result when the program upload fails.
 - `score_rows_kernel<MODE, PASS>` applies one row range: lane `l` continues from its carried state over the rows of the range with `r mod L = l`. Correlation runs two passes with `score_mid_kernel` between them (mean prediction, lanes reset).
 - `score_finish_kernel<MODE>` runs the resident tree and epilogue: `+inf` and status 2 on a bad row, status 4 for all-zero weights, the AIC penalty on the host. A weighted launch carries `Σ w·term` in lane A and `Σ w` in lane B (weighted correlation: `Σ w·dp²` and `Σ w·dp·dy`, with the weighted mean prediction from the mid kernel); the weighted target moments are computed once when the weights are uploaded.
 
-The ranges form a left fold in row order, so every score kind returns the same bits as the resident kernel for any partition, including unaligned cuts and 1-row ranges. A lane index relative to the range start gives different bits on unaligned cuts. The production resident path keeps `score_kernel`.
+The ranges form a left fold in row order, so every score kind returns the same bits as the resident kernel for any partition, including unaligned cuts and 1-row ranges. Slope (#236) folds the pair `(r - 1, r)` into the lane of `r` and reads row `r - 1` from the resident columns, so a pair that straddles a cut needs no exchange between ranges. A lane index relative to the range start gives different bits on unaligned cuts. The production resident path keeps `score_kernel`.
 
 The carry is `P x (16 L + 16)` bytes (4,112 B per candidate), allocated once through the ledger with tag `carry` and grown only when the candidate count grows. Tests: `gpu::carry_tests`.
 
@@ -844,6 +850,7 @@ When the plan is `tiled`, `GpuEvaluator::new_tiled` (C: `rc_create_tiled`) keeps
 - For a tile, the host copies the `vars` column segments into the staging slot, the copy runs on a transfer stream behind the last kernel that read the device slot, and the kernel runs on the default stream behind the copy (events `ev_tile_copied`, `ev_tile_ready`, `ev_tile_used`). The next tile uploads while the current kernel runs.
 - The lane of a row is its absolute row modulo `L`, so scores are bit-identical to the resident kernels for every tile height and wave size.
 - The legacy evaluator, the batched fit, the exact rank and order-statistic scorers and the f64 twin are refused in a tiled context (the call returns a failure). The plan keeps them on the CPU.
+- The slope scorer (#236) is refused too: the predecessor of a tile's first row is not resident. A tiled slope run keeps the CPU scorer with `backend_reason` `device_memory: tiled residency refuses slope scoring: row r - 1 of a tile's first row is not resident`.
 
 `ArenaReport` carries `tile_rows`, `tiles` (tile kernel launches), `tile_uploads`, `tile_overlapped_uploads`, `tile_pinned_bytes` and `waves`. A `# gpu: tiled residency (...)` note names the tile height and the waves. The eval stage of the route planner adds the streamed tile bytes to its transfer estimate. Tests: `tests/gpu_tiled.rs`.
 
