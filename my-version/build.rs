@@ -214,7 +214,7 @@ fn main() {
     let mut cmd = Command::new(&nvcc);
     // `-fmad=false` keeps multiply-add association identical to the Rust f64
     // reference; the enrichment kernels must not silently contract `a*b+c`.
-    cmd.args(["-O3", "-fmad=false", "-std=c++14", arch_flag.as_str(), "-shared"]);
+    cmd.args(["-O3", "-fmad=false", "-std=c++17", arch_flag.as_str(), "-shared"]);
     cmd.args(["-Xcompiler", "-fPIC"]);
     if unified {
         cmd.arg("-DRCSR_UNIFIED=1");
