@@ -3154,3 +3154,72 @@ fn json_carries_a_phase_ledger_with_features_and_io() {
     assert!(l.wall <= r.total_seconds + 1e-6, "ledger wall {} vs total {}", l.wall, r.total_seconds);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+const LOCK_START: i64 = 1_717_200_000;
+const LOCK_END: i64 = 1_719_792_000;
+
+/// Hourly bars from 2024-03-01 to 2024-07-01. `flip` negates every one-bar
+/// return inside the locked range, so the two stores differ only there.
+fn lock_rows(flip: bool) -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
+    let start = 1_709_251_200_i64;
+    let n = ((1_719_792_000 - start) / 3600) as usize;
+    let mut out = Vec::new();
+    for (k, sym) in ["AAAUSDT", "BBBUSDT", "CCCUSDT"].iter().enumerate() {
+        let mut close = 100.0 + 10.0 * k as f64;
+        for i in 0..n {
+            let t = start + i as i64 * 3600;
+            let mut r = 0.004 * ((i as f64) * 0.7 + k as f64).sin() + 0.002 * ((i % 7) as f64 - 3.0) / 3.0;
+            if flip && t >= LOCK_START && t < LOCK_END {
+                r = -r - 0.003;
+            }
+            let open = close;
+            close = open * (r as f64).exp();
+            out.push((t, sym.to_string(), open, open.max(close) * 1.001, open.min(close) * 0.999, close, 10.0 + i as f64));
+        }
+    }
+    out
+}
+
+fn label_report(tag: &str, flip: bool, locked: Option<&str>) -> String {
+    let dir = tmp_dir(tag);
+    let data = dir.join("in.rcsb");
+    write_store(data.to_str().unwrap(), &lock_rows(flip), 1000);
+    let out = dir.join("out.rcsb");
+    let mut o = opts(data.to_str().unwrap(), out.to_str().unwrap(), "returns");
+    o.features.clear();
+    o.labels = vec![
+        "long:1h,name=h1,fee=10,vol=20".to_string(),
+        "long:4h,name=h4,fee=10,vol=20,stride=4".to_string(),
+    ];
+    o.locked_test = locked.map(|s| rcsr::lockbox::Lockbox::parse(s).unwrap());
+    enrich::build(&o).unwrap();
+    std::fs::read_to_string(out.with_extension("labels.json")).unwrap()
+}
+
+fn without_label_hash(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("\"label_hash\":\"") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 14..];
+        let end = tail.find('"').unwrap();
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn label_report_is_identical_for_stores_that_differ_only_inside_the_locked_range() {
+    let range = "2024-06-01,2024-07-01";
+    let a = label_report("lock-a", false, Some(range));
+    let b = label_report("lock-b", true, Some(range));
+    assert_eq!(without_label_hash(&a), without_label_hash(&b));
+    assert!(a.contains("\"locked_test\":{\"start_date\":\"2024-06-01\",\"end_date\":\"2024-07-01\""));
+    assert!(!a.contains("\"rows_left_out\":0"));
+    // Without a range the two stores report different statistics, so the test above has teeth.
+    let a0 = label_report("lock-a0", false, None);
+    let b0 = label_report("lock-b0", true, None);
+    assert_ne!(without_label_hash(&a0), without_label_hash(&b0));
+    assert!(!a0.contains("locked_test"));
+}

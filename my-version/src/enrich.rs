@@ -1531,6 +1531,8 @@ pub struct Options {
     pub write_bw: Option<f64>,
     pub allow_lockbox: bool,
     pub allow_overlap: bool,
+    /// Locked test left out of the label report; the input's declaration applies when unset.
+    pub locked_test: Option<crate::lockbox::Lockbox>,
     pub dry_run: bool,
     pub json: bool,
 }
@@ -1556,6 +1558,7 @@ impl Default for Options {
             write_bw: None,
             allow_lockbox: false,
             allow_overlap: false,
+            locked_test: None,
             dry_run: false,
             json: false,
         }
@@ -1741,6 +1744,15 @@ impl Report {
                 l.spec.name, l.target, r.rows, r.valid_rows, r.barrier_rows, r.clipped_share,
                 r.cost_to_move, r.effective_n, r.purge_seconds, r.label_hash
             ));
+            if let Some(lt) = &r.locked_test {
+                out.push(format!(
+                    "# enrich-label-locked: name={} locked_test={}..{} left_out_rows={}",
+                    l.spec.name,
+                    crate::lockbox::date(lt.range.start),
+                    crate::lockbox::date(lt.range.end),
+                    lt.rows_left_out
+                ));
+            }
             for m in &r.top_moves {
                 out.push(format!(
                     "# enrich-label-move: name={} symbol={} time={} iso={} fwd={:.6}",
@@ -6927,8 +6939,9 @@ fn enrich_inner(
             temp.insert(n.clone(), TempColumn::create(work_dir, &n, sp.column_warmup(kind), true)?);
         }
     }
+    let label_range = opts.locked_test.or_else(|| crate::lockbox::declared_for(&opts.data));
     let mut long_acc: Vec<crate::labels::LabelAccumulator> =
-        long_specs.iter().map(crate::labels::LabelAccumulator::new).collect();
+        long_specs.iter().map(|sp| crate::labels::LabelAccumulator::with_range(sp, label_range)).collect();
 
     // Cross-sectional source columns are computed even when the user did not
     // ask for them, then removed if they are not part of the output. The same
@@ -8152,7 +8165,6 @@ fn expected_columns_out(
 
 pub fn run(args: &[String]) -> ! {
     let mut opts = Options::default();
-    let mut locked_test: Option<crate::lockbox::Lockbox> = None;
     let mut i = 0usize;
     macro_rules! val {
         () => {{
@@ -8241,7 +8253,7 @@ pub fn run(args: &[String]) -> ! {
                 opts.write_bw = Some(mbps * 1_000_000.0);
             }
             "--locked-test" => {
-                locked_test = Some(crate::lockbox::Lockbox::parse(&val!()).unwrap_or_else(|e| fail(&format!("--locked-test: {}", e))))
+                opts.locked_test = Some(crate::lockbox::Lockbox::parse(&val!()).unwrap_or_else(|e| fail(&format!("--locked-test: {}", e))))
             }
             "--allow-lockbox" => opts.allow_lockbox = true,
             "--dry-run" => opts.dry_run = true,
@@ -8267,7 +8279,7 @@ pub fn run(args: &[String]) -> ! {
         if let Some(out) = &opts.out {
             let sidecar = format!("{}.enrich.json", out);
             let mut text = report.json();
-            if let Some(lb) = locked_test.or_else(|| crate::lockbox::declared_for(&opts.data)) {
+            if let Some(lb) = opts.locked_test.or_else(|| crate::lockbox::declared_for(&opts.data)) {
                 let at = text.find('{').map_or(0, |i| i + 1);
                 text.insert_str(
                     at,
@@ -8344,7 +8356,10 @@ INPUT / OUTPUT:
   --allow-lockbox         permit labelled rows in 2026H2 (final test only)
   --locked-test <START,END>
                           declare the protocol locked test (UTC, half-open) in
-                          <out>.enrich.json; copied from --data when it declares one
+                          <out>.enrich.json; copied from --data when it declares one;
+                          label rows whose window reaches it (entry at or after
+                          START minus the purge, before END) are left out of
+                          every <out>.labels.json statistic, and counted
   --gpu [auto|on|off]     auto (default) dispatches a registered exact kernel
                           only when the cost model estimates it faster; on
                           forces every registered kernel above the 1M-row floor;
