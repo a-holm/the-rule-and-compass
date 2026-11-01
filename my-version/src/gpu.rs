@@ -1388,7 +1388,9 @@ pub(crate) enum OrderCode {
     /// `metrics::interquartile_mean_abs`, bit for bit: the rank window added
     /// in ascending order, like the CPU's left-to-right sum.
     InterquartileExact = 2,
-    /// The largest `|r|`, bit for bit.
+    /// The largest `|r|`, bit for bit. Only the order-statistic kernel tests
+    /// drive this path; scoring uses the order-free scan.
+    #[cfg(test)]
     Maximum = 3,
 }
 
@@ -1409,7 +1411,9 @@ impl OrderCode {
     /// mean).
     pub(crate) fn select_min_rows(self) -> Option<usize> {
         match self {
-            OrderCode::Median | OrderCode::Maximum => Some(ORDER_SELECT_MIN_ROWS),
+            OrderCode::Median => Some(ORDER_SELECT_MIN_ROWS),
+            #[cfg(test)]
+            OrderCode::Maximum => Some(ORDER_SELECT_MIN_ROWS),
             OrderCode::InterquartileExact => Some(IQR_SELECT_MIN_ROWS),
             OrderCode::InterquartileTree => None,
         }
@@ -7568,7 +7572,7 @@ mod rank_tests {
     #[test]
     fn target_ranks_match_the_cpu() {
         let f = fixture(96);
-        let Some(mut ev) = evaluator(&f) else { return };
+        let Some(ev) = evaluator(&f) else { return };
         let target = RankTarget::new(&f.y).unwrap();
         let mut b = vec![0i64; f.n];
         let rc = unsafe { rc_rank_debug_b(ev.ctx, b.as_mut_ptr()) };
@@ -8708,8 +8712,6 @@ mod order_stat_tests {
         crate::fit::constants_slots(t)
     }
 
-    /// The device median is the configured metric for odd and even row counts,
-    /// with ties and with a constant prediction.
     extern "C" {
         fn rc_os_test_force_cub_fail(on: i32);
     }
@@ -8736,6 +8738,8 @@ mod order_stat_tests {
         assert_eq!(again[0][0].map(f64::to_bits), ok.unwrap()[0][0].map(f64::to_bits));
     }
 
+    /// The device median is the configured metric for odd and even row counts,
+    /// with ties and with a constant prediction.
     #[test]
     fn the_device_median_is_the_configured_metric() {
         for n in [5usize, 6, 31, 32, 97, 128] {

@@ -54,6 +54,7 @@ pub(crate) use median::{polish_median_batch, OrderStatTrialScorer};
 pub(crate) use interquartile::polish_interquartile_batch;
 // #227: the maximum-error (minimax) polish tail, likewise CUDA-only in
 // production and unit-tested from a CPU reference scorer in a plain build.
+#[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
 #[cfg(any(feature = "cuda", test))]
 pub(crate) use minimax::{
     polish_minimax_batch, LevelInterval, MaxStat, MinimaxTrialScorer,
@@ -61,12 +62,14 @@ pub(crate) use minimax::{
 // The exact-rank stage is only wired into the CUDA arm; a CPU-only build keeps
 // the module (its unit tests) without re-exporting anything.
 #[cfg(any(feature = "cuda", test))]
+#[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
 pub(crate) use rank::polish_rank_batch;
 #[cfg(any(feature = "cuda", test))]
 #[allow(unused_imports)]
 pub(crate) use rank::{exact_rank_score, RankTrialScorer};
 // #231: the exact, orientation-aware rank gate is shared by the CPU verifier,
 // the batched verifier and the device arm, so it exists in every build.
+#[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
 pub(crate) use rank::{choose_rank_fit, score_constants, RankFitChoice};
 pub use varpro::{cost_eligible as varpro_cost_eligible, VarProPartition};
 
@@ -1152,7 +1155,7 @@ fn gpu_fit_opcode(op: Op) -> Option<u32> {
 /// The program is a postorder array of `4`-word records `[op, kid0, kid1,
 /// slot]`; constants are kept in `c0` so the kernel can move them, and `flat`
 /// is retained so the fitted values can be written back into the tree exactly
-/// like the CPU LM path does.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
 pub(crate) struct GpuFitPlan {
     pub(crate) words: Vec<u32>,
@@ -1169,7 +1172,7 @@ pub(crate) struct GpuFitPlan {
     flat: Flat,
 }
 
-#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 impl GpuFitPlan {
     /// Write `c` back into `tree`'s constant slots.
     pub(crate) fn apply(&self, tree: &mut Node, c: &[f64]) {
@@ -1286,7 +1289,7 @@ pub(crate) fn gpu_fit_plan_reason(tree: &Node) -> Result<GpuFitPlan, GpuFitRejec
 /// #169: build the GPU fit plan for `tree`, or `None` when the candidate must
 /// stay on the CPU (non-affine block bodies, too many constants or nodes, or an
 /// operator without an analytic GPU derivative).
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn gpu_fit_plan(tree: &Node) -> Option<GpuFitPlan> {
     gpu_fit_plan_reason(tree).ok()
 }

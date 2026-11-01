@@ -584,6 +584,7 @@ fn device_market(dir: &Path) -> PathBuf {
     raw
 }
 
+#[cfg(feature = "cuda")]
 fn manifest_lines(base: &Path, keys: &[&str]) -> Vec<String> {
     let text = std::fs::read_to_string(format!("{}.manifest.json", base.display())).unwrap();
     text.lines()
