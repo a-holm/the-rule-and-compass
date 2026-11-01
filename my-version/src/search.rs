@@ -1312,6 +1312,12 @@ impl GpuSearch {
                         return Err(device_refusal("the row weights"));
                     }
                 }
+                // #508: a panel's slope pairs skip the group boundaries; the
+                // device reads them as a per-row mask.
+                let mask = slope_pair_mask(train).unwrap_or(SlopePairMask { bits: Vec::new(), pairs: 0 });
+                if !ev.set_slope_pairs(&mask.bits, mask.pairs) {
+                    return Err(device_refusal("the slope pair mask"));
+                }
                 let fit_sub = if sub {
                     Some(FitSubsample::new(
                         train, fit_rows, n_vars, loss, logistic_fit, budget, run_start,
@@ -3036,7 +3042,7 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     // #236: the device differences row r against row r - 1 of the resident
     // sample. A pair list with any other shape (a shuffled split, a group
     // boundary, a row missing from the side) keeps the exact CPU scorer.
-    if cfg.metric == crate::metrics::Metric::Slope && !slope_pairs_are_consecutive(train) {
+    if cfg.metric == crate::metrics::Metric::Slope && slope_pair_mask(train).is_none() {
         return Some("slope pairs are not the consecutive rows of the training sample");
     }
     // A fit subsample keeps only the pairs whose two rows it drew, and those
@@ -3113,34 +3119,46 @@ fn long_pnl_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     }
     if cfg.metric == crate::metrics::Metric::Slope
         && defers_fit_to_gpu(cfg, true)
-        && (!slope_pairs_are_consecutive(train) || effective_fit_rows(cfg, train) > 0)
+        && (slope_pair_mask(train).is_none() || effective_fit_rows(cfg, train) > 0)
     {
         return Some("slope pairs are not the consecutive rows of the device fit sample");
     }
     None
 }
 
-/// #236: true when the sample's slope pairs are exactly `[k - 1, k]` for every
-/// `k` in `1..n`, the only pair set the device slope scorer and fit compute.
-/// `None` is the consecutive set by definition ([`crate::data::Sample::pairs`]).
+/// #508: the slope pair mask of a training sample (see [`slope_pair_mask`]).
 #[cfg(feature = "cuda")]
-pub(crate) fn slope_pairs_are_consecutive(train: &Sample) -> bool {
+pub(crate) struct SlopePairMask {
+    /// `ceil(n / 32)` words, bit `r` set when row `r` pairs with row `r - 1`.
+    /// Empty when every row `r >= 1` pairs with its predecessor.
+    pub(crate) bits: Vec<u32>,
+    pub(crate) pairs: usize,
+}
+
+/// #236/#508: the device differences row `r` against row `r - 1` of the
+/// resident sample, so the sample's slope pairs must be a set of `[k - 1, k]`
+/// pairs with distinct `k` in `1..n`. A missing pair list is the full
+/// consecutive set (empty mask). A pair list of any other shape (a shuffled
+/// split, a repeated, backward or non-adjacent pair) is `None` and keeps the
+/// exact CPU scorer.
+#[cfg(feature = "cuda")]
+pub(crate) fn slope_pair_mask(train: &Sample) -> Option<SlopePairMask> {
     let Some(pairs) = &train.pairs else {
-        return true;
+        return Some(SlopePairMask { bits: Vec::new(), pairs: train.len().saturating_sub(1) });
     };
     let n = train.len();
-    if n < 2 || pairs.len() != n - 1 {
-        return false;
-    }
-    let mut seen = vec![false; n];
+    let mut bits = vec![0u32; n.div_ceil(32)];
     for &[a, b] in pairs {
         let (a, b) = (a as usize, b as usize);
-        if b == 0 || b >= n || a + 1 != b || seen[b] {
-            return false;
+        if b == 0 || b >= n || a + 1 != b || bits[b / 32] >> (b % 32) & 1 == 1 {
+            return None;
         }
-        seen[b] = true;
+        bits[b / 32] |= 1 << (b % 32);
     }
-    true
+    if n >= 2 && pairs.len() == n - 1 {
+        bits.clear();
+    }
+    Some(SlopePairMask { bits, pairs: pairs.len() })
 }
 
 /// #230: `Some(signed)` when the device may run this run's **fit stage only**,
@@ -9232,8 +9250,9 @@ mod tests {
         assert_eq!(gpu_status_label(7), Some("start_unusable"));
     }
 
-    /// #236: the device slope scorer differences row r against row r - 1, so a
-    /// pair list of any other shape keeps the CPU with a named reason.
+    /// #236/#508: the device slope scorer differences row r against row r - 1
+    /// under a per-row pair mask, so a pair list of any other shape keeps the
+    /// CPU with a named reason.
     #[cfg(feature = "cuda")]
     #[test]
     fn slope_device_admits_only_consecutive_pairs() {
@@ -9247,7 +9266,12 @@ mod tests {
         let mut boundary = crate::fit::consecutive_pairs(n);
         boundary.remove(9);
         s.pairs = Some(boundary);
-        assert_eq!(gpu_blocker(&cfg, &s), reason, "a group boundary drops a pair");
+        assert_eq!(gpu_blocker(&cfg, &s), None, "#508: a group boundary is a masked pair");
+        let mask = slope_pair_mask(&s).expect("a masked pair list");
+        assert_eq!(mask.pairs, n - 2);
+        assert_eq!(mask.bits[0] & (1 << 10), 0, "row 10 has no pair");
+        assert_eq!(mask.bits[0] & (1 << 9), 1 << 9);
+        assert_eq!(mask.bits[0] & 1, 0, "row 0 never pairs");
         let mut shuffled = crate::fit::consecutive_pairs(n);
         shuffled[3] = [2, 5];
         s.pairs = Some(shuffled);

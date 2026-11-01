@@ -61,8 +61,9 @@ the split you asked for.
 same group in the data order (`--time`, then `--group-by`). A gap in the time
 index is not detected: two rows on either side of a missing day are one pair,
 and their difference is a slope over the gap. The GPU scores and fits slope
-only when the training pairs are its consecutive rows: a single series under
-`--split temporal`. A panel with `--group-by` or a shuffled split keeps
+only when every training pair is a row and its predecessor: a single series
+under `--split temporal`, or a `--group-by` panel, whose group boundaries are
+masked per row (#508). A shuffled split keeps
 the CPU with the reason `slope pairs are not the consecutive rows of the
 training sample` (#236).
 
