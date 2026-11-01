@@ -288,3 +288,27 @@ fn fitting_runs_stay_on_the_owned_tree_path() {
     };
     assert!(err.contains("constant fitting"), "unexpected error: {}", err);
 }
+
+/// #462: the front observer sees every generation of the flat arena loop and
+/// does not change the archive.
+#[test]
+fn front_observer_does_not_change_the_postfix_archive() {
+    if !rcsr::backend::probe().available() {
+        return;
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let data = sample(160);
+    let plain = cfg(VariationMode::Postfix, 1, 4096, 3);
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let c2 = calls.clone();
+    let observed = Config {
+        front_observer: Some(std::sync::Arc::new(move |_, _, _| {
+            c2.fetch_add(1, Ordering::SeqCst);
+        })),
+        ..plain.clone()
+    };
+    let a = run(&plain, &data, &data);
+    let b = run(&observed, &data, &data);
+    assert_eq!(a.archive.hash(), b.archive.hash());
+    assert_eq!(calls.load(Ordering::SeqCst), b.generations);
+}
