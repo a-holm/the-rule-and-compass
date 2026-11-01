@@ -1,7 +1,4 @@
-//! Op        le        if rc != 0 {
-            return None;
-        }
-        let batch batch = ScoreBatch {ional GPU backend: batched fitness evaluation on an NVIDIA GPU.
+//! Optional GPU backend: batched fitness evaluation on an NVIDIA GPU.
 //!
 //! Enabled with `cargo build --features cuda`. The kernel lives in
 //! `src/cuda/eval.cu`; this module compiles expression trees to its postfix
