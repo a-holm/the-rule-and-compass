@@ -3674,6 +3674,24 @@ fn main() {
                     if let Some(c) = target_resolved.as_ref().and_then(|r| r.spec.scale_column()) {
                         pnames.push(c.to_string());
                     }
+                    let trading_requested = objective_arg
+                        .as_deref()
+                        .is_some_and(|o| rcsr::trading::Objective::parse(o).is_ok_and(|o| o.is_trading()));
+                    if trading_requested {
+                        if let Some(c) = target_resolved.as_ref().and_then(|r| r.spec.return_column.as_deref()) {
+                            if !fs.header().names().iter().any(|n| n == c) {
+                                eprintln!(
+                                    "error: target spec '{}' declares return_column '{}', which is not in {}",
+                                    target_names[0], c, data_path
+                                );
+                                std::process::exit(EXIT_INPUT);
+                            }
+                            pnames.push(c.to_string());
+                        }
+                        if let Some(f) = trade_funding.as_deref() {
+                            pnames.push(f.to_string());
+                        }
+                    }
                     pnames.sort();
                     pnames.dedup();
                     if let Ok(p) = store::Projection::resolve_owned(&fs, &pnames) {
