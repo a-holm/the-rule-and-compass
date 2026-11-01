@@ -1313,6 +1313,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "front_parents", // #76
         "fit_strategy",  // #116: missing means `exact`
         "fit_admission", // #223: missing means `screened`
+        "fit_polish",    // #496: missing means `f64`
         "fit_rows",      // #116: missing means 0 (off)
         "fit_fallback_max", // #255: missing means the default bound
         "qd_bins",       // #120
@@ -1527,6 +1528,12 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             format!("config 'fit_admission' must be screened or all, got '{}'", raw)
         })?,
     };
+    let fit_polish = match fields.get("fit_polish").map(|s| s.as_str()) {
+        None => crate::fit::FitPolish::F64,
+        Some(raw) => crate::fit::FitPolish::parse(raw).ok_or_else(|| {
+            format!("config 'fit_polish' must be f64, f32 or off, got '{}'", raw)
+        })?,
+    };
     if require_dimensions && units.is_none() {
         return Err(
             "config 'require_dimensions' is true but 'units' is none; \
@@ -1611,6 +1618,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         fit_iters: num_usize("fit_iters")?,
         fit_strategy, // #116
         fit_admission, // #223
+        fit_polish, // #496
         fit_report: false,
         dedup: bool_val("dedup")?,
         time_budget,
@@ -1685,6 +1693,9 @@ fn write_config(cfg: &Config, out: &mut String) {
     // checkpoint and config hash keeps its bytes.
     if cfg.fit_admission != crate::fit::FitAdmission::Screened {
         writeln!(out, "config fit_admission {}", cfg.fit_admission.name()).unwrap();
+    }
+    if cfg.fit_polish != crate::fit::FitPolish::F64 {
+        writeln!(out, "config fit_polish {}", cfg.fit_polish.name()).unwrap();
     }
     writeln!(out, "config fit_rows {}", cfg.fit_rows).unwrap(); // #116
     writeln!(out, "config fit_fallback_max {}", cfg.fit_fallback_max).unwrap(); // #255

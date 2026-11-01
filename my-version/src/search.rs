@@ -95,6 +95,8 @@ pub struct Config {
     /// affine in every constant and fall back to LM otherwise. Changing it
     /// changes the trajectory, so it is a saved search setting.
     pub fit_strategy: crate::fit::FitStrategy,
+    /// #496: arithmetic of the device fit kernel's polish. Saved search state.
+    pub fit_polish: crate::fit::FitPolish,
     /// #223: which offspring the deferred GPU fit admits. A resolved default
     /// or `auto` GPU arm admits every candidate with constants; an explicit
     /// `gpu` arm keeps the screened fraction. Saved search state.
@@ -429,6 +431,7 @@ impl Default for Config {
             init_depth: 3,
             fit_iters: 8,
             fit_strategy: crate::fit::FitStrategy::Exact, // #116
+            fit_polish: crate::fit::FitPolish::F64,
             fit_admission: crate::fit::FitAdmission::Screened,
             fit_report: false,
             dedup: true,
@@ -495,6 +498,7 @@ impl Config {
         compare!(init_depth, "init_depth");
         compare!(fit_iters, "fit_iters");
         compare!(fit_strategy, "fit_strategy"); // #116
+        compare!(fit_polish, "fit_polish");
         compare!(fit_admission, "fit_admission");
         compare!(dedup, "dedup");
         // #256: `time_budget` is a per-process limit, not search state; a resumed
@@ -731,6 +735,8 @@ struct GpuSearch {
     fit_status_by_label: BTreeMap<String, usize>,
     /// #169: wall time spent in the batched fit kernels, milliseconds.
     fit_ms: f64,
+    /// #496: the polish-phase part of `fit_ms`, apportioned by cycle ratio.
+    fit_polish_ms: f64,
     /// #169: wall time spent in the whole fit stage (kernel, launch, CPU
     /// fallback and write-back), milliseconds.
     fit_host_ms: f64,
@@ -993,6 +999,7 @@ impl GpuSearch {
                     fit_fallback_improved_by_cause: BTreeMap::new(),
                     fit_status_by_label: BTreeMap::new(),
                     fit_ms: 0.0,
+                    fit_polish_ms: 0.0,
                     fit_host_ms: 0.0,
                     fit_fallback_ms: 0.0,
                     fit_fallback_bounded: 0,
@@ -1157,6 +1164,7 @@ impl GpuSearch {
                 Some(ev) => ev,
                 None => &mut self.ev,
             };
+            dev.set_fit_polish(cfg.fit_polish);
             let (out, ms) = if maximum_arm {
                 // #227: the exact maximum-error polish on the squared start.
                 dev.max_fit_batch(&plans, cfg.fit_iters)
@@ -1183,6 +1191,7 @@ impl GpuSearch {
             };
             if ms > 0.0 {
                 self.fit_ms += ms as f64;
+                self.fit_polish_ms += dev.take_polish_ms(ms);
                 // #284: the fit kernel is one device interval on the run clock;
                 // its duration is the raw event time, not the host envelope.
                 match dev.take_span_start_s(crate::gpu::SPAN_FIT) {
@@ -1816,6 +1825,7 @@ impl GpuSearch {
             self.fit_ms / 1000.0,
             self.fit_fallback_ms / 1000.0,
         );
+        ledger.record_fit_polish_split(self.fit_polish_ms / 1000.0);
         ledger.record_fit_counters(
             self.fit_attempts as u64,
             self.fit_gpu as u64,
@@ -1840,6 +1850,7 @@ impl GpuSearch {
             fit_status_by_label: self.fit_status_by_label.clone(),
             fit_refits: 0,
             fit_ms: self.fit_ms,
+            fit_polish_ms: self.fit_polish_ms,
             fit_host_ms: self.fit_host_ms,
             fit_fallback_ms: self.fit_fallback_ms,
 fit_fallback_bounded: self.fit_fallback_bounded,
@@ -1849,6 +1860,7 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             score_rows: self.ev.rows(),
             fit_twin_bytes: fit_ev.fit_twin().1,
             fit_subsample_hash: self.fit_sub.as_ref().map(|s| s.hash),
+            fit_polish: crate::fit::FitPolish::F64,
             fit_admission: crate::fit::FitAdmission::Screened,
             ledger,
             memory_plan: self.memory_plan.clone(),
@@ -2461,6 +2473,7 @@ fn score_pipeline_batch(
         let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().map(|(_, p)| p).collect();
         // #236: slope always starts from the squared warm start and keeps the
         // incoming constants unless it improves on them.
+        g.ev.set_fit_polish(fit.polish);
         let (out, ms) = if fit.loss == crate::fit::DeviceLoss::Slope {
             g.ev.slope_fit_batch(&refs, fit.iters)
         } else {
@@ -2468,6 +2481,7 @@ fn score_pipeline_batch(
         };
         if ms > 0.0 {
             g.fit_ms += ms as f64;
+            g.fit_polish_ms += g.ev.take_polish_ms(ms);
         }
         if ms < 0.0 || out.len() != plans.len() {
             for (k, _) in &plans {
@@ -4260,6 +4274,7 @@ struct PipelineFit {
     loss: crate::fit::DeviceLoss,
     iters: usize,
     metric: Metric,
+    polish: crate::fit::FitPolish,
 }
 
 /// #286: overlap-with-fit is legal only where the serial admission set is
@@ -4561,6 +4576,10 @@ pub struct GpuRunStats {
     pub fit_refits: usize,
     /// #169: wall time spent in the batched fit kernels, milliseconds.
     pub fit_ms: f64,
+    /// #496: the polish-phase part of `fit_ms`, apportioned by per-block cycles.
+    pub fit_polish_ms: f64,
+    /// #496: arithmetic of the device fit polish.
+    pub fit_polish: crate::fit::FitPolish,
     /// #169: wall time spent in the whole fit stage, milliseconds.
     pub fit_host_ms: f64,
 /// #284/#255: wall time spent in the exact CPU fallback fits, milliseconds.
@@ -5758,6 +5777,7 @@ fn run_postfix_search(
     stats.ledger = ledger;
     stats.fit_fallback_max = cfg.fit_fallback_max;
     stats.fit_admission = cfg.fit_admission;
+    stats.fit_polish = cfg.fit_polish;
 
     Ok(Outcome {
         archive: final_archive,
@@ -6620,6 +6640,7 @@ fn run_search(
                     .expect("pipeline_fit_safe admits only LM objectives"),
                 iters: cfg.fit_iters,
                 metric: cfg.metric,
+                polish: cfg.fit_polish,
             });
             #[cfg(feature = "cuda")]
             let pipeline_active = !screened
@@ -7351,6 +7372,7 @@ fn run_search(
             let mut s = g.run_stats();
             s.fit_refits = gpu_fit_refits;
             s.fit_admission = cfg.fit_admission;
+            s.fit_polish = cfg.fit_polish;
 // #284: absorb the device intervals and fit leaves, then add the
             // exclusive main-thread stages. Fit is a sub-window of the measured
             // eval window, so it is partitioned out exactly once.
