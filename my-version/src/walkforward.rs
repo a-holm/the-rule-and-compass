@@ -2096,8 +2096,8 @@ fn evaluate_window(
     for (&g, _) in previous.iter() {
         if let Some((i, _)) = order
             .iter()
-            .filter(|&&i| rows[i].group == g)
-            .map(|&i| (i, rows[i].time))
+            .filter(|&&i| rows[valid[i]].group == g)
+            .map(|&i| (i, rows[valid[i]].time))
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         {
             last_of_group.insert(g, i);
