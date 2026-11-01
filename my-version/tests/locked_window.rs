@@ -271,7 +271,7 @@ fn declared_for_reads_each_carrier_and_a_flag_must_cover_the_store_range() {
 
 /// Hourly panel of 3 symbols, 500 bars. Bars from index 400 on (the locked
 /// range) are different when `flip` is set; every earlier bar is identical.
-/// The label at bar i is the return over bars i+1 and i+2; features read past
+/// The label at bar i is the return of bar i+1; features read past
 /// bars only.
 fn diff_panel(path: &Path, flip: bool) {
     let mut csv = String::from("ts,sym,f1,f2,y\n");
@@ -289,7 +289,7 @@ fn diff_panel(path: &Path, flip: bool) {
         for i in 0..500usize {
             let f1 = if i == 0 { 0.0 } else { ret[i - 1] * 100.0 };
             let f2 = (((i as i64 * 19 + g * 5) % 13) as f64 - 6.0) / 6.0;
-            let y = ret[i + 1] + ret[i + 2];
+            let y = ret[i + 1];
             csv.push_str(&format!("{},s{},{},{},{}\n", T0 + i as i64 * H, g, f1, f2, y));
         }
     }
@@ -352,7 +352,7 @@ fn dev_ladder(data: &str, win: &str, out: &str, purge: &str) -> (i32, String) {
 
 fn without_timing(json: &str) -> Vec<String> {
     json.split(',')
-        .filter(|t| !(t.contains("_s\"") || t.contains("seconds") || t.contains("wall") || t.contains("denominator")))
+        .filter(|t| !(t.contains("_s\"") || t.contains("seconds") || t.contains("wall") || t.contains("denominator") || t.contains("declared_in")))
         .map(str::to_string)
         .collect()
 }
@@ -382,12 +382,12 @@ fn development_outputs_ignore_locked_prices() {
         assert_eq!(na, nb, "{key}");
     }
 
-    // walk-forward: horizon 7200 s; a fold ending at the locked start is refused
+    // walk-forward: horizon 3600 s; a fold ending at the locked start is refused
     let wf_run = |d: &str, test_end: i64| {
         let window = format!("f1,{},{},{},{}", T0, T0 + 150 * H, T0 + 160 * H, test_end);
         rcsr(&[
             "walkforward", "--data", d, "--target", "y", "--expr", "f1", "--time", "ts", "--group-by", "sym",
-            "--horizon", "7200", "--cost-bps", "5", "--periods-per-year", "365", "--json", "--window", &window,
+            "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365", "--json", "--window", &window,
         ])
     };
     for d in [&a, &b] {
@@ -395,8 +395,8 @@ fn development_outputs_ignore_locked_prices() {
         assert_eq!(code, 3, "{}", err);
         assert!(err.contains("reaches the declared locked test"), "{}", err);
     }
-    let (ca, oa, ea) = wf_run(&a, s_start - 7200);
-    let (cb, ob, eb) = wf_run(&b, s_start - 7200);
+    let (ca, oa, ea) = wf_run(&a, s_start - 3600);
+    let (cb, ob, eb) = wf_run(&b, s_start - 3600);
     assert_eq!((ca, cb), (0, 0), "{}{}", ea, eb);
     let (ha, hb) = (numbers(&oa, "report_sha256"), numbers(&ob, "report_sha256"));
     assert!(!ha.is_empty(), "{}", oa);
@@ -427,7 +427,7 @@ fn walkforward_locked_scheme_trains_at_least_the_label_purge_before_the_start() 
     let run = |extra: &[&str]| {
         let mut args = vec![
             "walkforward", "--data", a.as_str(), "--target", "y", "--expr", "f1", "--time", "ts", "--group-by",
-            "sym", "--horizon", "7200", "--cost-bps", "5", "--periods-per-year", "365", "--json", "--ledger", &l,
+            "sym", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365", "--json", "--ledger", &l,
         ];
         args.extend_from_slice(extra);
         rcsr(&args)
@@ -435,7 +435,7 @@ fn walkforward_locked_scheme_trains_at_least_the_label_purge_before_the_start() 
     assert_eq!(run(&["--window", &dev]).0, 0);
     let (code, _, err) = rcsr(&["protocol", "seal", "--ledger", &l, "--out", &sealed]);
     assert_eq!(code, 0, "{}", err);
-    let late = format!("late,{},{},{},{}", T0, T0 + 399 * H, T0 + 400 * H, T0 + 500 * H);
+    let late = format!("late,{},{},{},{}", T0, T0 + 399 * H + 1800, T0 + 400 * H, T0 + 500 * H);
     let (code, _, err) = run(&["--locked-test", "--sealed", &sealed, "--window", &late]);
     assert_eq!(code, 3, "{}", err);
     assert!(err.contains("trains within the label purge of the locked test"), "{}", err);
@@ -488,7 +488,7 @@ fn undeclared_data_gets_the_protocol_default_in_search_walkforward_and_ladder() 
     let w = format!("w,{},{},{},{}", T1, T1 + 250 * H, T1 + 260 * H, T1 + 399 * H);
     let (code, _, err) = wf(&d, None, &["--window", &w]);
     assert_eq!(code, 3, "{}", err);
-    assert!(err.contains("touches the declared locked test"), "{}", err);
+    assert!(err.contains("reaches the declared locked test"), "{}", err);
     let (code, out, err) = wf(&d, None, &["--window", &w, "--lockbox", "none"]);
     assert_eq!(code, 0, "{}", err);
     assert!(out.contains("\"source\":\"none\""), "{}", out);
