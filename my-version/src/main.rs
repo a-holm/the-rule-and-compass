@@ -294,7 +294,9 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
   --no-project               load every store column. The default projects the
                              read to --vars, targets, --weight, --time and
                              --group-by when a .rcsb store is read with --vars
-                             and --time; --no-project is the A/B escape hatch.
+                             and --time; the columns read by
+                             --filter, --exclude, --train-select and --test-select
+                             are added. --no-project is the A/B escape hatch.
   --gap <rows|time>          embargo: rows dropped between train and test to stop
                              autocorrelation leaking the future (default 0).
                              A suffixed value (90m, 1.5h, 30s, 2d) is wall time,
@@ -3529,6 +3531,7 @@ fn main() {
     // #294: the resolved read projection used by this run, recorded in the
     // manifest. `None` means the historical full-column load.
     let mut store_projection: Option<store::Projection> = None;
+    let mut projection_note: Option<String> = None;
     let mut view_record: Option<registry::View> = None;
     let lag_menu: Vec<usize> = match &lag_set_src {
         Some(s) => {
@@ -3679,16 +3682,23 @@ fn main() {
                         "symbol" | "ticker" | "asset" | "pair" | "group" | "code"
                     )
                 });
-                let may_project = !no_project
-                    && !vars.is_empty()
-                    && time_name.is_some()
-                    && !(group_name.is_none() && group_like_present)
-                    && dtype_src.is_none()
-                    && filter_src.is_none()
-                    && exclude_src.is_none()
-                    && train_select_src.is_none()
-                    && test_select_src.is_none()
-                    && sample_rows.is_none();
+                let projection_off_reason: Option<&str> = if no_project {
+                    Some("--no-project")
+                } else if vars.is_empty() {
+                    Some("no --vars")
+                } else if time_name.is_none() {
+                    Some("no --time")
+                } else if group_name.is_none() && group_like_present {
+                    Some("no --group-by")
+                } else if dtype_src.is_some() {
+                    Some("--dtype")
+                } else if sample_rows.is_some() {
+                    Some("--sample-rows")
+                } else {
+                    None
+                };
+                let may_project = projection_off_reason.is_none();
+                projection_note = Some(projection_off_reason.unwrap_or("on").to_string());
                 if may_project {
                     let mut pnames: Vec<String> = vars.clone();
                     pnames.extend(target_names.iter().cloned());
@@ -3703,6 +3713,29 @@ fn main() {
                     }
                     if let Some(c) = target_resolved.as_ref().and_then(|r| r.spec.scale_column()) {
                         pnames.push(c.to_string());
+                    }
+                    let numeric_names: Vec<String> = fs
+                        .header()
+                        .columns()
+                        .iter()
+                        .filter(|c| c.numeric)
+                        .map(|c| c.name.clone())
+                        .collect();
+                    for (flag, src) in [
+                        ("--filter", filter_src.as_deref()),
+                        ("--exclude", exclude_src.as_deref()),
+                        ("--train-select", train_select_src.as_deref()),
+                        ("--test-select", test_select_src.as_deref()),
+                    ] {
+                        let Some(src) = src else { continue };
+                        match data::row_expr_columns(src, &numeric_names) {
+                            Ok(cols) => pnames.extend(cols),
+                            Err(e) => {
+                                eprintln!("error: cannot parse {}: {}", flag, e);
+                                eprintln!("  expression: {}", src);
+                                std::process::exit(EXIT_USAGE);
+                            }
+                        }
                     }
                     let trading_requested = objective_arg
                         .as_deref()
@@ -3726,6 +3759,8 @@ fn main() {
                     pnames.dedup();
                     if let Ok(p) = store::Projection::resolve_owned(&fs, &pnames) {
                         store_projection = Some(p);
+                    } else {
+                        projection_note = Some("projection unresolved".to_string());
                     }
                 }
                 let mem_opts = memory::EstimateOptions {
@@ -4582,6 +4617,7 @@ fn main() {
         // #112: the store estimate used at the guard time is reported even on
         // a successful full load, so the decision has an observable basis.
         prepared.prep.store_estimate = Some(estimate);
+        prepared.prep.store_projection = projection_note.clone();
         prepared.prep.full_rows = store_full_rows;
         prepared.prep.sampled_rows = store_sample_rows;
     }
