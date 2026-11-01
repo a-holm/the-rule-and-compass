@@ -6692,7 +6692,28 @@ mod tests {
             let (a, b, c) = (affine_arg(&mut s), affine_arg(&mut s), affine_arg(&mut s));
             trees.push(wrap(&mut s, node(op, vec![a, b, c])));
         }
-        while trees.len() < 85 {
+        // A zero adjoint must never meet an infinite or undefined local derivative.
+        let at_zero = |op: Op| node(op, vec![node(Op::Mul, vec![constant(1.3), input(0)])]);
+        trees.push(node(
+            Op::Add,
+            vec![
+                node(Op::Mul, vec![constant(0.0), at_zero(Op::Ln)]),
+                node(Op::Mul, vec![constant(0.7), input(1)]),
+            ],
+        ));
+        trees.push(node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(0.0), at_zero(Op::Sqrt)]), constant(0.3)],
+        ));
+        trees.push(node(
+            Op::If,
+            vec![
+                node(Op::Greater, vec![input(1), constant(5.0)]),
+                node(Op::Div, vec![constant(1.0), node(Op::Mul, vec![constant(0.4), input(0)])]),
+                node(Op::Mul, vec![constant(0.9), input(1)]),
+            ],
+        ));
+        while trees.len() < 88 {
             trees.push(random_tree(&mut s, 3));
         }
         let mut fits = 0;
