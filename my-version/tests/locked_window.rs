@@ -715,9 +715,11 @@ fn cv_folds_honour_exclude() {
     for p in [&a, &b] {
         let d = s(p);
         lockbox::write_sidecar(&d, &locked(), "test").unwrap();
+        let train0 = format!("ts < {}", T0 + 100 * H);
+        let test0 = format!("(ts >= {}) * (ts < {})", T0 + 100 * H, T0 + 150 * H);
         let (code, _, err) = plain(&[
-            "--data", &d, "--time", "ts", "--exclude", &at_start, "--cv", "k-fold", "--cv-k", "3", "--generations", "2",
-            "--pop", "8",
+            "--data", &d, "--time", "ts", "--train-select", &train0, "--test-select", &test0, "--exclude", &at_start,
+            "--cv", "k-fold", "--cv-k", "3", "--generations", "2", "--pop", "8",
         ]);
         assert_eq!(code, 3, "{}", err);
         assert!(err.contains("cross-validation rows has"), "{}", err);
