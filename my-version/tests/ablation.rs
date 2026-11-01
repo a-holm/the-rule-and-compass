@@ -226,7 +226,7 @@ fn prepare_writes_placebo_and_permuted_columns_next_to_the_real_ones() {
         }
     }
     let table = data::parse_table(&csv).unwrap();
-    let out = ablation::prepare_csv(&ablation::PrepareInput { table: &table, def: &d, time: "ts", group: "sym", keep: &["y".to_string()], seed: 3, locked: Vec::new(), purge_seconds: 0 }).unwrap();
+    let out = ablation::prepare_csv(&ablation::PrepareInput { table: &table, def: &d, time: "ts", group: "sym", keep: &["y".to_string()], seed: 3, locked: Vec::new(), purge_seconds: 0, embargo_seconds: 0 }).unwrap();
     let prepared = data::parse_table(&out).unwrap();
     assert_eq!(prepared.names, vec!["ts", "sym", "y", "b", "f1", "f2", "p1", "placebo_1", "placebo_2", "perm_f1", "perm_f2"]);
     assert_eq!(prepared.len(), 600);
@@ -273,6 +273,7 @@ fn prepare_segments(csv: &str, locked: &[rcsr::lockbox::Lockbox], purge_seconds:
         seed: 3,
         locked: locked.to_vec(),
         purge_seconds,
+        embargo_seconds: 0,
     })
     .unwrap();
     (out.lines().map(|l| l.to_string()).collect(), seg)
@@ -472,7 +473,7 @@ fn a_flag_range_disjoint_from_the_protocol_default_is_segmented() {
         let run = prepare_cli(&dir, src.to_str().unwrap(), out.to_str().unwrap(), &["--lockbox", &flag]);
         assert_eq!(run.status.code(), Some(0), "{}", String::from_utf8_lossy(&run.stderr));
     }
-    assert_eq!(sidecar_rows(oa.to_str().unwrap()), [7174, 122, 1440, 1824, 0, 0, 0]);
+    assert_eq!(sidecar_rows(oa.to_str().unwrap()), [7174, 122, 1440, 1824, 0, 0, 0, 0, 0]);
     let side = std::fs::read_to_string(rcsr::lockbox::sidecar_path(oa.to_str().unwrap())).unwrap();
     assert!(side.contains("\"purge_seconds\":219600,\"purge_source\":\"protocol_default\""), "{}", side);
     let (ta, tb) = (std::fs::read_to_string(&oa).unwrap(), std::fs::read_to_string(&ob).unwrap());
@@ -763,7 +764,7 @@ fn score_run_reads_the_expression_and_its_inputs() {
         window: Window { label: "w".into(), train_start: T0, train_end: T0 + 200.0 * 3600.0, test_start: T0 + 205.0 * 3600.0, test_end: T0 + 300.0 * 3600.0 },
         validation_start: T0 + 120.0 * 3600.0,
     }];
-    let folds: Vec<Fold> = ladder::make_folds(&panel, &rows, 3600.0, None).unwrap();
+    let folds: Vec<Fold> = ladder::make_folds(&panel, &rows, 3600.0, &[], 0.0).unwrap();
     let facts = ablation::RunFacts {
         arm: "A1".into(),
         feature_list_sha256: ablation::feature_list_sha256(&["s".into(), "n".into()]),
@@ -1096,7 +1097,7 @@ fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
     assert_eq!(prep.status.code(), Some(0), "{}", String::from_utf8_lossy(&prep.stderr));
     assert_eq!(lockbox::stored(prepared.to_str().unwrap()).unwrap().map(|(_, l)| l), Some(lb));
     let side = std::fs::read_to_string(lockbox::sidecar_path(prepared.to_str().unwrap())).unwrap();
-    assert_eq!(sidecar_rows(prepared.to_str().unwrap()), [112, 488, 200, 0], "{}", side);
+    assert_eq!(sidecar_rows(prepared.to_str().unwrap()), [112, 488, 200, 0, 0], "{}", side);
     assert!(side.contains("\"purge_source\":\"protocol_default\""), "{}", side);
     let found = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args([
