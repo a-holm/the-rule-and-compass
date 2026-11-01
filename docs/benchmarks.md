@@ -568,4 +568,4 @@ Pre-registered rule: recommend `--fitness pnl` if the seed-mean walk-forward net
 | gpu | 0.0680 | 0.3315 | 0.89 | `--fitness metric` |
 | cpu | 0.0159 | 0.3382 | 0.96 | `--fitness metric` |
 
-The finalist is `1.0275 * (0.0003 + r24)` (or a near variant) in every run, so the search-level test net is almost the same in both arms. The difference between the arms is the cost per generation: `--fitness pnl` needs 0.78x (GPU) and 0.54x (CPU) of the seconds per generation of `--fitness metric`, below the 1.2x target.
+9 of the 12 runs select a finalist with the same validation and test net (5.0768 and 6.1603); the other three, all in the pnl arm, have a test net of 6.300 to 6.308, so the search-level test net is almost the same in both arms. The difference between the arms is the cost per generation: `--fitness pnl` needs 0.78x (GPU) and 0.54x (CPU) of the seconds per generation of `--fitness metric`, below the 1.2x target.
