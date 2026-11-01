@@ -111,7 +111,7 @@ The protocol locked test is a second, separate box. Data that declares it
 (`rcsr panel build --locked-test START,END`) uses the declared range; undeclared
 data uses the protocol default 2025-07-01..2026-07-01. The search, `walkforward`,
 `ladder` and `ablation score` refuse every fit, validation or test row inside
-it (exit 3). `--lockbox none` is the only opt-out, and the report records
+it (exit 3), and every row whose label window reaches it: a row within the target's `required_purge_seconds` before the range (219600 s without a target spec) is refused too, and the refusal names the exact `--exclude 'ts >= START - purge'`. `walkforward`, `ladder` and `ablation score` refuse a window that ends after `START - purge`. `--lockbox none` is the only opt-out, and the report records
 `"source":"none"`. A `--lockbox` flag on undeclared data adds to the default and never replaces it. Ranges from the store or a flag also fail closed (no `--time`, a non-epoch time column and unstamped rows are refused); the protocol default only checks data with epoch-seconds stamps. `--allow-lockbox` does not open it. Only the sealed
 `--locked-test` path of `walkforward` and `ladder` reads it, once. A pilot
 split such as `--split temporal --validation-frac 0.20` on a panel that ends
