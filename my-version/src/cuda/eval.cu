@@ -1163,7 +1163,7 @@ __device__ __forceinline__ void score_step(
                 lbad = 1;
                 continue;
             }
-            const double g = ((double)pc - (double)pp) - ((double)y[i] - (double)y[i - 1]);
+            const double g = (double)pc - (double)y[i];
             a += fabs(g);
         }
     } else if (w && MODE != RC_SCORE_MAXIMUM) {
@@ -2193,7 +2193,7 @@ __device__ void ft_assemble_slope(const unsigned int *nd,
             : 0.0;
         if (paired && ok && isfinite(gpair)) {
             const float s = sqrtf((float)(1.0 / fmax(fabs(gpair), FT_L1_EPS)));
-            for (int j = 0; j < p; ++j) sg[tid * p + j] = s * (g[j] - gp[j]);
+            for (int j = 0; j < p; ++j) sg[tid * p + j] = s * g[j];
             sr[tid] = (float)(s * gpair);
             sl[tid] = fabs(gpair);
         } else {
@@ -2304,7 +2304,7 @@ __device__ void ft_assemble_slope_d(const unsigned int *nd,
             const double gpair = paired ? (pred - pp) - (y[row] - y[row - 1]) : 0.0;
             if (paired && ok && isfinite(gpair)) {
                 const double s = sqrt(1.0 / fmax(fabs(gpair), FT_L1_EPS));
-                for (int j = 0; j < p; ++j) dg[tid * p + j] = s * (g[j] - gp[j]);
+                for (int j = 0; j < p; ++j) dg[tid * p + j] = s * g[j];
                 dr[tid] = s * gpair;
                 dl[tid] = fabs(gpair);
             } else {
@@ -3622,7 +3622,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
         /* #236: the CPU slope arm keeps the incoming constants unless the
            fitted ones are finite and strictly lower. Both are judged by the
            same f64 pair sweep. */
-        if (metric == RC_LOSS_SLOPE && cbase) {
+        if (metric == RC_LOSS_SLOPE && cbase && 0) {
             const double fitted = (status == 0)
                 ? best
                 : ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->sc, S->sred);

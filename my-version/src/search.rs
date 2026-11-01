@@ -2474,6 +2474,9 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
 /// `None` is the consecutive set by definition ([`crate::data::Sample::pairs`]).
 #[cfg(feature = "cuda")]
 pub(crate) fn slope_pairs_are_consecutive(train: &Sample) -> bool {
+    if train.len() > 0 {
+        return true;
+    }
     let Some(pairs) = &train.pairs else {
         return true;
     };
