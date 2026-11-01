@@ -214,7 +214,9 @@ impl Metric {
     /// go negative on a good fit and the search sites hold only the criterion,
     /// not its residual sum of squares, so they are never solved.
     pub fn is_solved(self, best_error: f64) -> bool {
-        !self.is_parameter_aware() && best_error <= crate::progress_stats::SOLVED_ERROR
+        !self.is_parameter_aware()
+            && best_error >= 0.0
+            && best_error <= crate::progress_stats::SOLVED_ERROR
     }
 
     /// True for metrics that depend on the number of fitted constants.
@@ -1146,22 +1148,29 @@ fn weighted_correlation(a: &[f64], b: &[f64], w: &[f64]) -> f64 {
     }
     ma /= total;
     mb /= total;
+    let (mut ha, mut hb) = (0.0f64, 0.0f64);
+    for i in 0..a.len() {
+        if w[i] > 0.0 {
+            ha = ha.max((a[i] - ma).abs());
+            hb = hb.max((b[i] - mb).abs());
+        }
+    }
+    if !(ha >= f64::MIN_POSITIVE && hb >= f64::MIN_POSITIVE && ha.is_finite() && hb.is_finite()) {
+        return 0.0;
+    }
+    let (ha, hb) = (pow2_floor(ha), pow2_floor(hb));
     let (mut sab, mut sa, mut sb) = (0.0, 0.0, 0.0);
     for i in 0..a.len() {
         let wi = w[i];
         if wi > 0.0 {
-            let da = a[i] - ma;
-            let db = b[i] - mb;
+            let da = (a[i] - ma) / ha;
+            let db = (b[i] - mb) / hb;
             sab += wi * da * db;
             sa += wi * da * da;
             sb += wi * db * db;
         }
     }
-    if sa <= 0.0 || sb <= 0.0 {
-        0.0
-    } else {
-        sab / (sa.sqrt() * sb.sqrt())
-    }
+    clamp_correlation(sab, sa, sb)
 }
 
 /// Gaussian log-likelihood term `n·ln(RSS/n)`, guarding the perfect fit
@@ -1487,18 +1496,43 @@ pub fn correlation(a: &[f64], b: &[f64]) -> f64 {
     }
     let ma = a.iter().sum::<f64>() / n;
     let mb = b.iter().sum::<f64>() / n;
+    let (mut ha, mut hb) = (0.0f64, 0.0f64);
+    for i in 0..a.len() {
+        ha = ha.max((a[i] - ma).abs());
+        hb = hb.max((b[i] - mb).abs());
+    }
+    if !(ha >= f64::MIN_POSITIVE && hb >= f64::MIN_POSITIVE && ha.is_finite() && hb.is_finite()) {
+        return 0.0;
+    }
+    let (ha, hb) = (pow2_floor(ha), pow2_floor(hb));
     let (mut sab, mut sa, mut sb) = (0.0, 0.0, 0.0);
     for i in 0..a.len() {
-        let da = a[i] - ma;
-        let db = b[i] - mb;
+        let da = (a[i] - ma) / ha;
+        let db = (b[i] - mb) / hb;
         sab += da * db;
         sa += da * da;
         sb += db * db;
     }
-    if sa <= 0.0 || sb <= 0.0 {
-        0.0
+    clamp_correlation(sab, sa, sb)
+}
+
+/// The power of two at or below a normal positive `h`. Dividing by it is
+/// exact, so scaling the deviations changes no digit of a well-scaled input.
+pub(crate) fn pow2_floor(h: f64) -> f64 {
+    f64::from_bits(h.to_bits() & 0x7ff0_0000_0000_0000)
+}
+
+/// `sab / sqrt(sa * sb)` clamped to `[-1, 1]`. Zero variance or a non-finite
+/// result is `0.0`, the metric's worst value.
+fn clamp_correlation(sab: f64, sa: f64, sb: f64) -> f64 {
+    if !(sa > 0.0 && sb > 0.0) {
+        return 0.0;
+    }
+    let r = sab / (sa.sqrt() * sb.sqrt());
+    if r.is_finite() {
+        r.clamp(-1.0, 1.0)
     } else {
-        sab / (sa.sqrt() * sb.sqrt())
+        0.0
     }
 }
 
@@ -1826,6 +1860,48 @@ mod tests {
         assert!(approx(score(&p, &y, Metric::LogSquashed), logsq, 1e-12));
         // |e| sorted: 1,2,3,4 ; middle 50% is indices [1,3) = {2,3} -> 2.5
         assert!(approx(score(&p, &y, Metric::Interquartile), 2.5, 1e-12));
+    }
+
+    fn tiny_fixture() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let xs: Vec<f64> = (0..200).map(|i| 2.0 * i as f64 / 199.0).collect();
+        let b: Vec<f64> = xs.iter().map(|x| (x + 1.0).ln() + (x * x + 1.0).ln()).collect();
+        let tiny: Vec<f64> = xs.iter().map(|x| 1e-162 * x.exp()).collect();
+        let unit: Vec<f64> = xs.iter().map(|x| x.exp()).collect();
+        (tiny, unit, b)
+    }
+
+    #[test]
+    fn correlation_tiny_magnitude() {
+        let (tiny, unit, b) = tiny_fixture();
+        let r = correlation(&tiny, &b);
+        assert!(r.abs() <= 1.0, "r={r}");
+        assert!((r - correlation(&unit, &b)).abs() < 1e-9, "r={r}");
+        let w = vec![1.0; tiny.len()];
+        let rw = weighted_correlation(&tiny, &b, &w);
+        assert!(rw.abs() <= 1.0, "rw={rw}");
+        assert!((rw - correlation(&unit, &b)).abs() < 1e-9, "rw={rw}");
+        assert!(score(&tiny, &b, Metric::Correlation) >= 0.0);
+    }
+
+    #[test]
+    fn correlation_large_mean_small_spread() {
+        let xs: Vec<f64> = (0..200).map(|i| i as f64).collect();
+        let big: Vec<f64> = xs.iter().map(|x| 1e8 + 1e-6 * x).collect();
+        let want = correlation(&xs, &xs.iter().map(|x| x * x).collect::<Vec<_>>());
+        let y: Vec<f64> = xs.iter().map(|x| x * x).collect();
+        assert!((correlation(&big, &y) - want).abs() < 1e-6);
+        let w: Vec<f64> = (0..200).map(|i| 1.0 + (i % 3) as f64).collect();
+        let want_w = weighted_correlation(&xs, &y, &w);
+        assert!((weighted_correlation(&big, &y, &w) - want_w).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bounded_metric_never_solves_negative() {
+        for m in [Metric::Correlation, Metric::CorrelationSigned, Metric::Squared, Metric::RankCorrelation] {
+            assert!(!m.is_solved(-0.5), "{m:?}");
+            assert!(!m.is_solved(-1e-30), "{m:?}");
+            assert!(m.is_solved(0.0), "{m:?}");
+        }
     }
 
     #[test]
