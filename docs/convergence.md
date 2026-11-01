@@ -140,12 +140,12 @@ percent_converged >= 0.75
 
 Nothing in the search depends on this threshold — it changes no stopping rule —
 it is only a reading for the caller. Early stopping is still controlled by
-`--patience` and `--time-budget`.
+`--patience`, `--patience-tol`, `--stop-on front` and `--time-budget`.
 
-The result JSON carries `stop_reason` (`solved`, `patience`, `time_budget`,
+The result JSON carries `stop_reason` (`solved`, `patience`, `front_stable`, `time_budget`,
 `generations` or `already_stopped`) and `converged_early` (#256).
-`converged_early` is true only when the engine stopped on `solved` or
-`patience` **and** the final `percent_converged` is at least `0.75`. A
+`converged_early` is true only when the engine stopped on `solved`, `patience` or
+`front_stable` **and** the final `percent_converged` is at least `0.75`. A
 `time_budget` stop never sets it: the engine did not declare convergence. The
 terminating generation of a `time_budget` stop still emits its progress and
 development-log events.
@@ -209,3 +209,16 @@ statistics together with the held-out error, the baselines, the overfitting
 diagnostics and `--stability`; a high `percent_converged` is evidence about the
 optimiser, not about the data. In particular, do not use it as a substitute for
 `--cv`, `--null-runs` or a test split.
+
+## Scale-free patience and the front stop (#464)
+
+Both are off by default. The default patience test is unchanged: a generation is "no improvement" when `(best_prev - best) / (1 + |best_prev|) <= 1e-9`.
+
+`--patience-tol <r>` replaces that test with `(best_prev - best) / |best_prev| <= r`. The denominator has no `1 +`, so multiplying the error by a constant does not move the stopping generation. A non-finite `best_prev` is always an improvement. Negative errors (`aic`, `bic`) use `|best_prev|`.
+
+`--stop-on front[:W]` stops a run with `stop_reason front_stable` after `W` consecutive stable generations (`W` defaults to `--patience`; a window of 0 never stops). A generation is stable when both hold against the front at the end of the previous generation:
+
+1. no front member has an error more than `r` (relative) below the best previous error at its cost or lower; a member with no previous member at its cost or lower counts as a change;
+2. the front hypervolume (`qd::hypervolume`, a 64 x 64 grid normalised by the observed cost and error range) rose by less than `r` (relative).
+
+`r` is `--patience-tol`, or `1e-6` when the flag is not given. The test reads the archive the search already keeps (the f32 proxy on the GPU path), so both backends behave the same. Both settings and the stable-generation counter are saved in a checkpoint (`config patience_tol`, `config stop_front`, `front_stable`); a resumed run rebuilds the previous front from the saved archive and ends at the same generation as an uninterrupted run. A checkpoint of a run that uses neither setting has the same bytes as before.

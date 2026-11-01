@@ -395,6 +395,10 @@ pub struct Knobs {
     pub dispatch: Option<crate::dispatch::DispatchMode>,
     /// #496: arithmetic of the device fit polish.
     pub fit_polish: Option<crate::fit::FitPolish>,
+    /// #464: scale-free patience tolerance.
+    pub patience_tol: Option<f64>,
+    /// #464: `--stop-on front[:W]`; `Some(0)` takes W from the patience.
+    pub stop_front: Option<usize>,
 }
 
 /// How to run the suite: noise levels, search budget, seed and criterion.
@@ -756,6 +760,8 @@ fn base_config(cfg: &SuiteConfig, seed: u32) -> Config {
     if let Some(v) = k.patience {
         sc.patience = v;
     }
+    sc.patience_tol = k.patience_tol;
+    sc.stop_front = k.stop_front;
     if let Some(v) = k.migration_interval {
         sc.migration_interval = v;
     }
@@ -1455,7 +1461,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
     };
     let opt_u = |v: Option<usize>| json_opt(v);
     format!(
-        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"dispatch\":{},\"fit_polish\":{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
+        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"dispatch\":{},\"fit_polish\":{},\"patience_tol\":{},\"stop_front\":{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
         GENERATOR_VERSION,
         json_number(cfg.threshold),
         json_number(SIGNAL_THRESHOLD),
@@ -1475,6 +1481,8 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
         k.variation.map_or("null".to_string(), |v| format!("\"{}\"", v.as_str())),
         k.dispatch.map_or("null".to_string(), |v| format!("\"{}\"", v.name())),
         k.fit_polish.map_or("null".to_string(), |v| format!("\"{}\"", v.name())),
+        json_opt_f(k.patience_tol),
+        opt_u(k.stop_front),
         env!("CARGO_PKG_VERSION"),
         cfg!(feature = "cuda"),
         cfg.backend.name(),
