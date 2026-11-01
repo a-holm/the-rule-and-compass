@@ -69,6 +69,7 @@ OPTIONS:
   --migration-interval <N>  generations between island migrations
   --restart-interval <N>    generations between island restarts
   --variation <mode>        auto, node or postfix
+  --linear-scaling          wrap every candidate in a fitted affine output map (#470)
   --dispatch <mode>         auto or device (device skips the timing comparison)
   --jobs <N>                runs in flight at once on the CPU (default 1);
                             seconds and hit_s are then contended
@@ -293,6 +294,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
                 a.knobs.restart_interval =
                     Some(num(take(&mut i, "--restart-interval")?, "--restart-interval")?)
             }
+            "--linear-scaling" => a.knobs.linear_scaling = true,
             "--variation" => {
                 a.knobs.variation = Some(rcsr::search::VariationMode::parse(&take(&mut i, "--variation")?)?)
             }
