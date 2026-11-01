@@ -101,9 +101,9 @@ extern "C" void rc_enrich_set_test_budget(size_t bytes)
 /* Test-only fault injection. Allocation faults refuse the k-th allocation
    made through the guard after arming; launch faults make one launch site
    return failure before any kernel is queued. Both are off by default. */
-volatile int rc_fault_alloc_armed = 0;
-static std::atomic<unsigned long long> g_fault_alloc_count(0);
-static std::atomic<unsigned long long> g_fault_alloc_at(0);
+thread_local volatile int rc_fault_alloc_armed = 0;
+static thread_local unsigned long long g_fault_alloc_count = 0;
+static thread_local unsigned long long g_fault_alloc_at = 0;
 static volatile int g_fault_launch_site = 0;
 static std::atomic<unsigned long long> g_fault_launch_hits(0);
 
@@ -118,8 +118,8 @@ enum {
 
 extern "C" int rc_fault_alloc_hit(void)
 {
-    unsigned long long n = g_fault_alloc_count.fetch_add(1) + 1;
-    return n == g_fault_alloc_at.load();
+    unsigned long long n = ++g_fault_alloc_count;
+    return n == g_fault_alloc_at;
 }
 
 extern "C" void rc_enrich_set_test_alloc_fault(unsigned long long at)
@@ -131,7 +131,7 @@ extern "C" void rc_enrich_set_test_alloc_fault(unsigned long long at)
 
 extern "C" unsigned long long rc_enrich_test_alloc_count(void)
 {
-    return g_fault_alloc_count.load();
+    return g_fault_alloc_count;
 }
 
 extern "C" void rc_enrich_set_test_launch_fault(int site)

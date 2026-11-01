@@ -598,6 +598,40 @@ fn a_refused_device_allocation_falls_back_to_the_host_without_a_dangling_pointer
     expected_backend(&ok);
 }
 
+#[cfg(feature = "cuda")]
+#[test]
+fn an_armed_allocation_fault_never_reaches_another_thread() {
+    use std::sync::mpsc::channel;
+    let windows = fixture_windows(2, 6, 40);
+    let want = run_batch(&windows, 3, Seam::Pooled, Backend::Cpu, |_| {});
+    for _ in 0..5 {
+        let (armed_tx, armed_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<()>();
+        std::thread::scope(|s| {
+            let (windows, want) = (&windows, &want);
+            let armed = s.spawn(move || {
+                rcsr::enrich_gpu::set_alloc_fault_for_tests(1);
+                armed_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+                let r = run_batch(windows, 3, Seam::Pooled, Backend::Auto, |_| {});
+                rcsr::enrich_gpu::set_alloc_fault_for_tests(0);
+                assert_eq!(r.backend, "cpu", "the armed thread must get its refusal");
+                for (x, y) in r.cells.iter().zip(&want.cells) {
+                    assert_eq!(x.totals.bits(), y.totals.bits());
+                }
+            });
+            let other = s.spawn(move || {
+                armed_rx.recv().unwrap();
+                let r = run_batch(windows, 3, Seam::Pooled, Backend::Auto, |_| {});
+                done_tx.send(()).unwrap();
+                expected_backend(&r);
+            });
+            armed.join().unwrap();
+            other.join().unwrap();
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Measurement
 // ---------------------------------------------------------------------------
