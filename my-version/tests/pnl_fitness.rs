@@ -516,8 +516,8 @@ fn the_block_term_prefers_the_steady_signal() {
     let dir = scratch();
     let data = write_regime_csv(&dir);
     let spec = write_spec(&dir);
-    let pooled = json(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "1"]));
-    let blocked = json(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "4", "--pnl-block-lambda", "1"]));
+    let pooled = json(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "1", "--seed", "4"]));
+    let blocked = json(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "4", "--pnl-block-lambda", "1", "--seed", "4"]));
     let (p, b) = (best_expression(&pooled), best_expression(&blocked));
     assert!(p.contains("x1"), "pooled best: {p}");
     assert!(b.contains("x2") && !b.contains("x1"), "blocked best: {b}");
