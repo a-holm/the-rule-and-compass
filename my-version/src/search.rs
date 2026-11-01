@@ -3572,8 +3572,13 @@ fn defers_fit_to_gpu(cfg: &Config, defer_gpu: bool) -> bool {
 /// `None` when it does (or the strategy is not `gpu`).
 #[cfg(any(feature = "cuda", test))]
 fn gpu_fit_off_reason(cfg: &Config) -> Option<String> {
-    let _ = cfg;
-    None
+    if !cfg.fit_strategy.defers_to_gpu() || defers_fit_to_gpu(cfg, true) {
+        return None;
+    }
+    if cfg.fit_iters == 0 {
+        return Some("--fit-iters 0: nothing to fit".to_string());
+    }
+    crate::fit::gpu_fit_metric_error(cfg.metric)
 }
 
 /// #85: true when constants are fitted on fewer rows than the generation's
@@ -5727,14 +5732,10 @@ fn run_search(
         }
     }
     #[cfg(feature = "cuda")]
-    if cfg.gpu_notes && cfg.fit_strategy.defers_to_gpu() && !defers_fit_to_gpu(cfg, true) {
-        eprintln!(
-            "# gpu-fit: off (the batched kernel minimises squared error, \
-             log-squashed, mean absolute error or the exact rank, median, \
-             interquartile and maximum objectives; --metric must be squared, \
-             log_squashed, absolute, aic, aicc, bic, rank_correlation, \
-             rank_correlation_signed, median, interquartile or maximum)"
-        );
+    if cfg.gpu_notes {
+        if let Some(why) = gpu_fit_off_reason(cfg) {
+            eprintln!("# gpu-fit: off ({})", why);
+        }
     }
     // #226/#232: only a run that actually asked for the device fit arm can be
     // refused by it. `--no-fit` (or a CPU strategy) has nothing to fit, so it
