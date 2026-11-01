@@ -187,9 +187,13 @@ INPUT:
                              and its refusals. Exit 2 with --predictor-samples,
                              --fit-samples, --implicit, --min-holding above 1,
                              --max-position other than 1, multiple targets,
-                             overlapping rows, or no profitable path. Runs on
-                             the CPU (backend_reason names it); resume needs
-                             the same cost, threshold and rows
+                             overlapping rows, or no profitable path. On the
+                             GPU the device scores the regret of its own f32
+                             predictions, fused with the interpreter
+                             (search_fitness.scorer_backend cuda); tiled
+                             residency keeps the CPU. Reported values stay
+                             exact CPU f64. Resume needs the same cost,
+                             threshold and rows
   --position long_only|top_tercile
                              long_only (default): 1[pred > --threshold]. top_tercile: per
                              timestamp the top floor(n/3) finite predictions are long (p=1),
@@ -735,7 +739,10 @@ SEARCH:
                              for AUC); those statistics are bit-identical to
                              the CPU for the same prediction vector (median and
                              interquartile use a radix select from 4096 and
-                             65536 rows, rank and auc a sort). Every other
+                             65536 rows, rank and auc a sort). --fitness pnl
+                             is scored by the long/flat regret kernel (#481),
+                             bit-identical to the CPU book on the device's
+                             predictions; --metric then only fits. Every other
                              metric is *scored* on the CPU with its named
                              refusal, never with a proxy loss; with
                              --fit-strategy gpu its *constants* may still be
@@ -7239,14 +7246,20 @@ fn main() {
                 backend_json,
                 match &fitness_book {
                     Some(b) => format!(
-                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\"}},",
+                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}}},",
                         b.len(),
                         b.groups(),
                         jnum(b.side()),
                         jnum(b.threshold()),
                         jnum(b.bound()),
                         b.min_trades(),
-                        b.hash()
+                        b.hash(),
+                        // #481: what ranked the generations; `backend` above is
+                        // the reported values, always exact CPU f64.
+                        match outcome.backend {
+                            rcsr::backend::Kind::Gpu => "\"scorer\":\"long_pnl_regret\",\"scorer_backend\":\"cuda\",\"scorer_values\":\"screening_f32_predictions\"",
+                            rcsr::backend::Kind::Cpu => "\"scorer\":\"long_pnl_regret\",\"scorer_backend\":\"cpu\",\"scorer_values\":\"exact_f64\"",
+                        }
                     ),
                     None => "\"search_fitness\":{\"kind\":\"metric\"},".to_string(),
                 }
