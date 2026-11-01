@@ -799,6 +799,10 @@ pub struct RunEnd {
     pub fit_refit_s: Option<f64>,
     /// #495: exact finalist refits performed.
     pub fit_refits: Option<usize>,
+    /// #569: LM fits, row passes inside the LM loop and fits ended by the stop.
+    pub lm_fits: u64,
+    pub lm_passes: u64,
+    pub lm_stops: u64,
     /// Log bookkeeping: events written, bytes, events dropped by the cap.
     pub events: u64,
     pub bytes: u64,
@@ -816,6 +820,7 @@ pub fn run_end_json(r: &RunEnd) -> String {
          \"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"unaccounted_s\":{},\
          \"fit_kernel_s\":{},\"fit_kernel_lm_s\":{},\"fit_kernel_polish_s\":{},\"fit_fallback_s\":{},\"fit_refit_s\":{},\"fit_refits\":{},\
          \"prune\":{{\"fits\":{},\"accepted\":{},\"seconds\":{}}},\
+         \"fit_lm\":{{\"fits\":{},\"passes\":{},\"stops\":{}}},\
          \"events\":{},\"bytes\":{},\"dropped\":{},\"end\":{}}}",
         SCHEMA,
         VERSION,
@@ -857,6 +862,9 @@ pub fn run_end_json(r: &RunEnd) -> String {
         r.prune_fits,
         r.prune_accepted,
         num(r.prune_s),
+        r.lm_fits,
+        r.lm_passes,
+        r.lm_stops,
         r.events,
         r.bytes,
         r.dropped,

@@ -234,6 +234,10 @@ pub struct Config {
     pub fit_strategy: crate::fit::FitStrategy,
     /// #496: arithmetic of the device fit kernel's polish. Saved search state.
     pub fit_polish: crate::fit::FitPolish,
+    /// #569: relative-improvement stop of the CPU LM in the search's candidate
+    /// fit. `None` keeps every fit exact. Reported archives are refit exactly.
+    /// Saved search state.
+    pub fit_stop: Option<crate::fit::LmStop>,
     /// #223: which offspring the deferred GPU fit admits. A resolved default
     /// or `auto` GPU arm admits every candidate with constants; an explicit
     /// `gpu` arm keeps the screened fraction. Saved search state.
@@ -638,6 +642,7 @@ impl Default for Config {
             fit_iters: 8,
             fit_strategy: crate::fit::FitStrategy::Exact, // #116
             fit_polish: crate::fit::FitPolish::F64,
+            fit_stop: None,
             fit_admission: crate::fit::FitAdmission::Screened,
             fit_report: false,
             dedup: true,
@@ -743,6 +748,7 @@ impl Config {
         compare!(fit_iters, "fit_iters");
         compare!(fit_strategy, "fit_strategy"); // #116
         compare!(fit_polish, "fit_polish");
+        compare!(fit_stop, "fit_stop"); // #569
         compare!(fit_admission, "fit_admission");
         compare!(linear_scaling, "linear_scaling"); // #470
         compare!(mutation_mix, "mutation_mix"); // #471
@@ -3721,6 +3727,20 @@ fn fit_constants_with_iters(
     score: &Sample,
     iters: usize,
 ) -> Option<FitResult> {
+    // #569: the stop is scoped to this candidate fit; exact refits never set it.
+    match cfg.fit_stop {
+        None => fit_constants_body(tree, cfg, fit, score, iters),
+        stop => crate::fit::with_lm_stop(stop, || fit_constants_body(tree, cfg, fit, score, iters)),
+    }
+}
+
+fn fit_constants_body(
+    tree: &mut Node,
+    cfg: &Config,
+    fit: &Sample,
+    score: &Sample,
+    iters: usize,
+) -> Option<FitResult> {
     // #470: start the map of a wrapped tree at the closed-form least squares
     // on the fit rows; the configured fitter then refines every constant.
     if cfg.linear_scaling && cfg.metric.is_least_squares() {
@@ -5514,6 +5534,21 @@ pub struct Outcome {
     /// #482: offspring scored over the run, summed over islands and
     /// generations, including generations before a resume.
     pub candidates_evaluated: u64,
+    /// #569: LM work of this run (process-wide counters, so exact for one run at a time).
+    pub fit_work: FitWork,
+}
+
+/// #569: LM fit work inside one run and the exact finalist refits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FitWork {
+    /// Fits that ran the LM loop.
+    pub lm_fits: u64,
+    /// Row passes (normal-equation builds and SSE passes) inside the LM loop.
+    pub lm_passes: u64,
+    /// Fits that ended on the relative-improvement stop with trials left.
+    pub lm_stops: u64,
+    /// Exact refits of the final archive rebuild.
+    pub refits: usize,
 }
 
 /// #256: the reported `converged_early`. `stopped` is the loop-control flag
@@ -6694,6 +6729,7 @@ fn run_postfix_search(
         stop_reason,
         prune: prune_report,
         candidates_evaluated: candidates,
+        fit_work: FitWork::default(),
     })
 }
 
@@ -6706,6 +6742,7 @@ fn run_search(
     seeds: &[Node],
     mut on_checkpoint: Option<CheckpointFn<'_>>,
 ) -> Result<Outcome, String> {
+    let lm_before = crate::fit::fit_arm_counts_full();
     let nvars = train.x.first().map(|r| r.len()).unwrap_or(0);
     // #26: a checkpoint written during a GPU run stores the f32 proxy fitness,
     // so a resumed run must rebuild the reported front on the CPU even when it
@@ -8281,13 +8318,21 @@ fn run_search(
     // f64 LM before it is scored on all training rows.
     let gpu_fit_used =
         cfg.fit_strategy.defers_to_gpu() && (gpu_used || fit_only_device);
+    // #569: a stopped candidate fit is not a reported constant; refit exactly.
+    let refit_exact_fit = gpu_fit_used || cfg.fit_stop.is_some();
     let mut refit_report = RefitReport::default();
-    if subsampling_active(cfg, train) || gpu_used || fit_only_device || resumed || fit_screened {
+    if subsampling_active(cfg, train)
+        || gpu_used
+        || fit_only_device
+        || resumed
+        || fit_screened
+        || cfg.fit_stop.is_some()
+    {
         // Generation fitness was estimated on subsets, or on the GPU in f32, so
         // the front is rebuilt from the surviving trees and scored on every
         // training row with the CPU in f64. From here on the archive and every
         // number derived from it are full-data and match the CPU backend.
-        let rebuilt = full_data_archive(&archive, &islands, &train_data, cfg, gpu_fit_used);
+        let rebuilt = full_data_archive(&archive, &islands, &train_data, cfg, refit_exact_fit);
         archive = rebuilt.0;
         refit_report = rebuilt.1;
     } else {
@@ -8442,6 +8487,15 @@ fn run_search(
         stop_reason, // #211
         prune: prune_report,
         candidates_evaluated: candidates,
+        fit_work: {
+            let d = crate::fit::fit_arm_counts_full().since(lm_before);
+            FitWork {
+                lm_fits: d.lm_fits,
+                lm_passes: d.lm_passes,
+                lm_stops: d.lm_stops,
+                refits: refit_report.refits,
+            }
+        },
     })
 }
 

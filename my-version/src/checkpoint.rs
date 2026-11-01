@@ -1407,6 +1407,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "fit_strategy",  // #116: missing means `exact`
         "fit_admission", // #223: missing means `screened`
         "fit_polish",    // #496: missing means `f64`
+        "fit_stop",      // #569: missing means off
         "fitness",       // #480: missing means `metric`
         "fit_rows",      // #116: missing means 0 (off)
         "fit_fallback_max", // #255: missing means the default bound
@@ -1679,6 +1680,11 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             format!("config 'fit_polish' must be f64, f32 or off, got '{}'", raw)
         })?,
     };
+    let fit_stop = match fields.get("fit_stop") {
+        None => None,
+        Some(raw) => crate::fit::LmStop::parse(raw)
+            .map_err(|e| format!("config 'fit_stop': {}", e))?,
+    };
     let patience_tol = match fields.get("patience_tol") {
         None => None,
         Some(raw) => Some(decode_f64(raw)?),
@@ -1798,6 +1804,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         fit_strategy, // #116
         fit_admission, // #223
         fit_polish, // #496
+        fit_stop, // #569
         fit_report: false,
         dedup: bool_val("dedup")?,
         time_budget,
@@ -1889,6 +1896,9 @@ fn write_config(cfg: &Config, out: &mut String) {
     }
     if cfg.fit_polish != crate::fit::FitPolish::F64 {
         writeln!(out, "config fit_polish {}", cfg.fit_polish.name()).unwrap();
+    }
+    if cfg.fit_stop.is_some() {
+        writeln!(out, "config fit_stop {}", crate::fit::LmStop::name(cfg.fit_stop)).unwrap(); // #569
     }
     if !cfg.fitness.is_metric() {
         writeln!(out, "config fitness {}", cfg.fitness.key()).unwrap(); // #480

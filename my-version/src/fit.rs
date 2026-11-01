@@ -213,6 +213,76 @@ impl FitPolish {
     }
 }
 
+/// #569: relative-improvement stop of the damped LM phase. After `k`
+/// consecutive tiny steps (accepted steps with a relative SSE gain below `rel`,
+/// then rejections once a tiny step has been seen) the damped phase ends and
+/// the undamped polish runs as usual. Only the search's candidate fit sets it
+/// (see [`with_lm_stop`]); every other fit stays exact.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LmStop {
+    pub rel: f64,
+    pub k: usize,
+}
+
+impl LmStop {
+    /// The value of `--fit-stop on`.
+    pub const ON: LmStop = LmStop { rel: 1e-10, k: 2 };
+
+    /// `off` | `on` | `<tau>` | `<tau>,<k>`. `Ok(None)` is `off`.
+    pub fn parse(s: &str) -> Result<Option<LmStop>, String> {
+        match s {
+            "off" => return Ok(None),
+            "on" => return Ok(Some(LmStop::ON)),
+            _ => {}
+        }
+        let (tau, k) = match s.split_once(',') {
+            Some((t, k)) => (t, Some(k)),
+            None => (s, None),
+        };
+        let rel: f64 = tau
+            .parse()
+            .map_err(|_| format!("'{}' is not off, on, <tau> or <tau>,<k>", s))?;
+        if !(rel.is_finite() && rel > 0.0 && rel < 1.0) {
+            return Err(format!("tau must be finite and in (0, 1), got '{}'", tau));
+        }
+        let k = match k {
+            None => 2,
+            Some(k) => k
+                .parse::<usize>()
+                .ok()
+                .filter(|&k| k >= 1)
+                .ok_or_else(|| format!("k must be an integer >= 1, got '{}'", k))?,
+        };
+        Ok(Some(LmStop { rel, k }))
+    }
+
+    /// Canonical text, accepted again by [`LmStop::parse`].
+    pub fn name(stop: Option<LmStop>) -> String {
+        match stop {
+            None => "off".to_string(),
+            Some(s) => format!("{:e},{}", s.rel, s.k),
+        }
+    }
+}
+
+thread_local! {
+    /// #569: the stop the LM loop of this thread reads. `None` is exact.
+    static LM_STOP: std::cell::Cell<Option<LmStop>> = const { std::cell::Cell::new(None) };
+}
+
+/// #569: run `f` with the LM stop of this thread set to `stop`, then restore
+/// the previous value, also when `f` unwinds.
+pub fn with_lm_stop<R>(stop: Option<LmStop>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<LmStop>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LM_STOP.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(LM_STOP.with(|c| c.replace(stop)));
+    f()
+}
+
 /// #223: what the person asked for when the engine resolves the fit arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FitRequest {
@@ -1037,6 +1107,11 @@ static EXACT_FITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 static GPU_FITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GPU_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GPU_REFITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// #569: LM fits that ran the loop, row passes inside it, and fits that ended
+/// on the relative-improvement stop.
+static LM_FITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LM_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LM_STOPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// #116: all arm counts since process start. Kept as a struct so new arms do
 /// not change the meaning of older report fields.
@@ -1049,6 +1124,10 @@ pub struct FitArmCounts {
     pub gpu: u64,
     pub gpu_fallbacks: u64,
     pub gpu_refits: u64,
+    /// #569: see `LM_FITS`, `LM_PASSES`, `LM_STOPS`.
+    pub lm_fits: u64,
+    pub lm_passes: u64,
+    pub lm_stops: u64,
 }
 
 impl FitArmCounts {
@@ -1062,6 +1141,9 @@ impl FitArmCounts {
             gpu: self.gpu.saturating_sub(before.gpu),
             gpu_fallbacks: self.gpu_fallbacks.saturating_sub(before.gpu_fallbacks),
             gpu_refits: self.gpu_refits.saturating_sub(before.gpu_refits),
+            lm_fits: self.lm_fits.saturating_sub(before.lm_fits),
+            lm_passes: self.lm_passes.saturating_sub(before.lm_passes),
+            lm_stops: self.lm_stops.saturating_sub(before.lm_stops),
         }
     }
 
@@ -1091,6 +1173,9 @@ pub fn fit_arm_counts_full() -> FitArmCounts {
         gpu: GPU_FITS.load(Ordering::Relaxed),
         gpu_fallbacks: GPU_FALLBACKS.load(Ordering::Relaxed),
         gpu_refits: GPU_REFITS.load(Ordering::Relaxed),
+        lm_fits: LM_FITS.load(Ordering::Relaxed),
+        lm_passes: LM_PASSES.load(Ordering::Relaxed),
+        lm_stops: LM_STOPS.load(Ordering::Relaxed),
     }
 }
 
@@ -2897,8 +2982,39 @@ fn fit_lm(tree: &mut Node, x: &[Vec<f64>], y: &[f64], w: &[f64], iters: usize) -
     fit_lm_with(tree, &f, iters, &mut pass)
 }
 
+/// #569: a stop on the last trial skipped no work, so it is not counted.
+fn note_lm_stop(it: usize, trials: usize) {
+    if it + 1 < trials {
+        LM_STOPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// #569: counts the row passes of one LM fit.
+struct CountedPass<'a, P: LmPass> {
+    inner: &'a mut P,
+    passes: u64,
+}
+
+impl<P: LmPass> LmPass for CountedPass<'_, P> {
+    fn sse(&mut self, c: &[f64]) -> f64 {
+        self.passes += 1;
+        self.inner.sse(c)
+    }
+    fn normal(&mut self, c: &[f64]) -> Option<NormalEquations> {
+        self.passes += 1;
+        self.inner.normal(c)
+    }
+}
+
 /// The LM loop over an interchangeable pair of row passes.
 fn fit_lm_with(tree: &mut Node, f: &Flat, iters: usize, pass: &mut impl LmPass) -> f64 {
+    let mut counted = CountedPass { inner: pass, passes: 0 };
+    let sse = fit_lm_loop(tree, f, iters, &mut counted);
+    LM_PASSES.fetch_add(counted.passes, std::sync::atomic::Ordering::Relaxed);
+    sse
+}
+
+fn fit_lm_loop(tree: &mut Node, f: &Flat, iters: usize, pass: &mut impl LmPass) -> f64 {
     let k = f.nconst;
     let n = f.op.len();
     let mut c = vec![0.0; k];
@@ -2927,8 +3043,14 @@ fn fit_lm_with(tree: &mut Node, f: &Flat, iters: usize, pass: &mut impl LmPass) 
     // iteration and reuse the cached matrices for every damping retry; only a
     // change of `c` (an accepted step) invalidates them.
     let mut normal: Option<NormalEquations> = None;
+    // #569: consecutive tiny steps; `stop` is `None` outside the search's
+    // candidate fit.
+    let stop = LM_STOP.with(|s| s.get());
+    let trials = iters.max(1);
+    let mut small = 0usize;
+    LM_FITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    for _ in 0..iters.max(1) {
+    for it in 0..trials {
         if normal.is_none() {
             normal = pass.normal(&c);
         }
@@ -2936,6 +3058,7 @@ fn fit_lm_with(tree: &mut Node, f: &Flat, iters: usize, pass: &mut impl LmPass) 
         match gn_trial(pass, &c, lambda, k, n) {
             Some((trial, tsse)) => {
                 if tsse < best_sse {
+                    let prev = best_sse;
                     c = trial;
                     best_sse = tsse;
                     best_c = c.clone();
@@ -2944,7 +3067,23 @@ fn fit_lm_with(tree: &mut Node, f: &Flat, iters: usize, pass: &mut impl LmPass) 
                     if best_sse == 0.0 {
                         break;
                     }
+                    if let Some(s) = stop {
+                        small = if (prev - best_sse) / prev < s.rel { small + 1 } else { 0 };
+                        if small >= s.k {
+                            note_lm_stop(it, trials);
+                            break;
+                        }
+                    }
                 } else {
+                    if let Some(s) = stop {
+                        if small >= 1 {
+                            small += 1;
+                            if small >= s.k {
+                                note_lm_stop(it, trials);
+                                break;
+                            }
+                        }
+                    }
                     lambda *= 6.0;
                     if lambda > 1e9 {
                         break;
@@ -6845,5 +6984,142 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn stop_case() -> (Node, Vec<Vec<f64>>, Vec<f64>) {
+        let x: Vec<Vec<f64>> = (0..41).map(|i| vec![i as f64 / 10.0]).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .map(|r| 1.5 * (0.4 * r[0]).exp() + 0.7 + 0.01 * (7.0 * r[0]).sin())
+            .collect();
+        let tree = node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Mul,
+                    vec![constant(1.0), node(Op::Exp, vec![node(Op::Mul, vec![constant(0.9), input(0)])])],
+                ),
+                constant(0.0),
+            ],
+        );
+        (tree, x, y)
+    }
+
+    fn bits(tree: &Node) -> Vec<u64> {
+        fitted_constants(tree).iter().map(|v| v.to_bits()).collect()
+    }
+
+    #[test]
+    fn lm_stop_is_scoped() {
+        let (tree, x, y) = stop_case();
+        let mut plain = tree.clone();
+        FIT_STEPS.with(|n| n.set(0));
+        fit_weighted(&mut plain, &x, &y, &[], 8);
+        let full_steps = FIT_STEPS.with(|n| n.get());
+
+        let stop = LmStop { rel: 1e-3, k: 2 };
+        let mut stopped = tree.clone();
+        FIT_STEPS.with(|n| n.set(0));
+        with_lm_stop(Some(stop), || fit_weighted(&mut stopped, &x, &y, &[], 8));
+        let stopped_steps = FIT_STEPS.with(|n| n.get());
+        assert!(
+            stopped_steps < full_steps,
+            "stop took {stopped_steps} steps, full {full_steps}"
+        );
+
+        let mut after = tree.clone();
+        fit_weighted(&mut after, &x, &y, &[], 8);
+        assert_eq!(bits(&after), bits(&plain), "exact after the closure");
+
+        let panicked = std::panic::catch_unwind(|| {
+            with_lm_stop(Some(stop), || panic!("inside the scope"));
+        });
+        assert!(panicked.is_err());
+        let mut after_panic = tree.clone();
+        fit_weighted(&mut after_panic, &x, &y, &[], 8);
+        assert_eq!(bits(&after_panic), bits(&plain), "exact after a panic");
+
+        let mut nested = tree.clone();
+        with_lm_stop(Some(stop), || {
+            with_lm_stop(None, || fit_weighted(&mut nested, &x, &y, &[], 8));
+        });
+        assert_eq!(bits(&nested), bits(&plain), "None restores exact inside a scope");
+    }
+
+    #[test]
+    fn lm_stop_keeps_the_polish() {
+        let (tree, x, y) = stop_case();
+        let mut full = tree.clone();
+        let full_sse = fit_weighted(&mut full, &x, &y, &[], 8);
+        let mut stopped = tree.clone();
+        let stopped_sse =
+            with_lm_stop(Some(LmStop::ON), || fit_weighted(&mut stopped, &x, &y, &[], 8));
+        assert!(
+            (stopped_sse - full_sse).abs() <= 1e-12 * full_sse,
+            "stopped {stopped_sse:e} full {full_sse:e}"
+        );
+    }
+
+    /// Fixed SSE per call: call 0 is the start, then one value per trial and
+    /// polish step; past the script every call is non-improving.
+    struct ScriptPass {
+        sse: Vec<f64>,
+        next: usize,
+    }
+
+    impl LmPass for ScriptPass {
+        fn sse(&mut self, _c: &[f64]) -> f64 {
+            let v = self.sse.get(self.next).copied().unwrap_or(f64::INFINITY);
+            self.next += 1;
+            v
+        }
+        fn normal(&mut self, _c: &[f64]) -> Option<NormalEquations> {
+            Some(NormalEquations { jtj: vec![vec![1.0]], jtr: vec![1.0] })
+        }
+    }
+
+    /// Damped trials taken by the scripted fit (the single polish step is
+    /// subtracted).
+    fn scripted_trials(script: &[f64], iters: usize) -> usize {
+        let mut tree = constant(1.0);
+        let f = flatten(&tree);
+        let mut pass = ScriptPass { sse: script.to_vec(), next: 0 };
+        FIT_STEPS.with(|n| n.set(0));
+        with_lm_stop(Some(LmStop::ON), || fit_lm_with(&mut tree, &f, iters, &mut pass));
+        FIT_STEPS.with(|n| n.get()) - 1
+    }
+
+    #[test]
+    fn hybrid_stop_ignores_start_up_rejections() {
+        let tiny = |s: f64| s * (1.0 - 1e-12);
+        let rej = 10.0;
+        // Start-up rejections do not count: all four trials run.
+        assert_eq!(scripted_trials(&[1.0, rej, rej, rej, 0.5], 4), 4);
+        // Large accept, tiny accept, rejected: stops after the third trial.
+        let s = [1.0, 0.5, tiny(0.5), rej, rej, rej, rej, rej, rej];
+        assert_eq!(scripted_trials(&s, 8), 3);
+        // Tiny, large, tiny, rejected: stops after the fourth.
+        let s = [1.0, tiny(1.0), 0.5, tiny(0.5), rej, rej, rej, rej, rej, rej];
+        assert_eq!(scripted_trials(&s, 8), 4);
+        // Two tiny accepts in a row stop after the second.
+        let s = [1.0, tiny(1.0), tiny(tiny(1.0)), rej, rej, rej, rej, rej, rej];
+        assert_eq!(scripted_trials(&s, 8), 2);
+        // `iters <= k`: the stop can only fire on the last trial.
+        let s = [1.0, tiny(1.0), tiny(tiny(1.0)), rej];
+        assert_eq!(scripted_trials(&s, 2), 2);
+    }
+
+    #[test]
+    fn lm_stop_parse_grammar() {
+        assert_eq!(LmStop::parse("off"), Ok(None));
+        assert_eq!(LmStop::parse("on"), Ok(Some(LmStop::ON)));
+        assert_eq!(LmStop::parse("1e-8"), Ok(Some(LmStop { rel: 1e-8, k: 2 })));
+        assert_eq!(LmStop::parse("1e-8,3"), Ok(Some(LmStop { rel: 1e-8, k: 3 })));
+        for bad in ["0", "1", "-1e-8", "nan", "inf", "1e-8,0", "1e-8,x", "1e-8,-1", "", "yes"] {
+            assert!(LmStop::parse(bad).is_err(), "{bad}");
+        }
+        let s = Some(LmStop { rel: 1e-8, k: 3 });
+        assert_eq!(LmStop::parse(&LmStop::name(s)), Ok(s));
+        assert_eq!(LmStop::parse(&LmStop::name(None)), Ok(None));
     }
 }

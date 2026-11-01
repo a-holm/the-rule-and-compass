@@ -83,6 +83,8 @@ OPTIONS:
   --dispatch <mode>         auto or device (device skips the timing comparison)
   --fit-polish <mode>      f64 (default), f32 or off: arithmetic of the device fit
                             kernel polish (--fit-strategy gpu)
+  --fit-stop <off|on|TAU[,K]>  stop the CPU LM of the search fits after K tiny steps (#569);
+                            default off; reported archives stay exact refits
   --jobs <N>                runs in flight at once on the CPU (default 1);
                             seconds and hit_s are then contended
   --ndjson                  one JSON line per finished run, flushed at once,
@@ -349,6 +351,11 @@ fn parse(args: &[String]) -> Result<Args, String> {
                     rcsr::fit::FitPolish::parse(&v)
                         .ok_or_else(|| format!("--fit-polish needs f64, f32 or off, got '{}'", v))?,
                 );
+            }
+            "--fit-stop" => {
+                let v = take(&mut i, "--fit-stop")?;
+                a.knobs.fit_stop =
+                    rcsr::fit::LmStop::parse(&v).map_err(|e| format!("--fit-stop {}", e))?;
             }
             "--dispatch" => {
                 let v = take(&mut i, "--dispatch")?;

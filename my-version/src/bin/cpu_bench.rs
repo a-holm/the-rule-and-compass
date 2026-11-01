@@ -174,7 +174,7 @@ const HELP: &str = "cpu_bench — CPU evaluator, constant fitter, metric fit and
 
 USAGE:
   cpu_bench [--mode eval|fit|metric|scale|all] [--rows LIST] [--threads LIST]
-            [--min-seconds S] [--fit-iters N] [--tsv] [--help]
+            [--min-seconds S] [--fit-iters N] [--fit-stop SPEC] [--tsv] [--help]
 
 MODES:
   eval    scalar walk vs SoA scalar vs SoA AVX on the 5/9/15/25-node trees
@@ -195,6 +195,8 @@ OPTIONS:
   --min-seconds S    minimum time per cell (default 0.3 for fit, metric, scale;
                      eval keeps its 50 ms repetition batches unless set)
   --fit-iters N      iterations of the metric fits (default 8)
+  --fit-stop SPEC   fit mode: scope the LM relative-improvement stop (off, on or
+                     TAU[,K]) around the fits; default off
   --tsv              tab-separated cells with one header row per table
   --help             this text
 
@@ -216,6 +218,7 @@ struct Opts {
     threads: Vec<usize>,
     min_seconds: Option<f64>,
     fit_iters: usize,
+    fit_stop: Option<fit::LmStop>,
     tsv: bool,
 }
 
@@ -245,6 +248,7 @@ fn parse_args(args: &[String]) -> Opts {
         threads: DEFAULT_THREADS.to_vec(),
         min_seconds: None,
         fit_iters: DEFAULT_FIT_ITERS,
+        fit_stop: None,
         tsv: false,
     };
     let mut i = 0;
@@ -280,6 +284,12 @@ fn parse_args(args: &[String]) -> Opts {
                 o.fit_iters = match value().parse::<usize>() {
                     Ok(v) => v,
                     Err(_) => usage_error("--fit-iters needs a non-negative integer"),
+                }
+            }
+            "--fit-stop" => {
+                o.fit_stop = match fit::LmStop::parse(value()) {
+                    Ok(s) => s,
+                    Err(e) => usage_error(&format!("--fit-stop {e}")),
                 }
             }
             "--tsv" => o.tsv = true,
@@ -574,7 +584,14 @@ fn run_eval(o: &Opts, out: &mut Out) {
 fn run_fit(o: &Opts, out: &mut Out) {
     let rows_list = o.rows.clone().unwrap_or_else(|| NEW_ROWS.to_vec());
     let min_s = o.min_seconds.unwrap_or(DEFAULT_MIN_SECONDS);
-    out.section("fit: fit_weighted on the fixed trees (single thread)");
+    if o.fit_stop.is_some() {
+        out.section(&format!(
+            "fit: fit_weighted on the fixed trees (single thread), --fit-stop {}",
+            fit::LmStop::name(o.fit_stop)
+        ));
+    } else {
+        out.section("fit: fit_weighted on the fixed trees (single thread)");
+    }
     out.header(&[
         "tree",
         "rows",
@@ -599,12 +616,16 @@ fn run_fit(o: &Opts, out: &mut Out) {
                 true,
             );
             let mut hashed = tree.clone();
-            let score = fit::fit_weighted(&mut hashed, &d.x, &d.y, &[], DEFAULT_FIT_ITERS);
+            let score = fit::with_lm_stop(o.fit_stop, || {
+                fit::fit_weighted(&mut hashed, &d.x, &d.y, &[], DEFAULT_FIT_ITERS)
+            });
             let hash = fit_hash(&hashed, score);
             let wall = best_of(
                 || {
                     let mut t = tree.clone();
-                    black_box(fit::fit_weighted(&mut t, &d.x, &d.y, &[], DEFAULT_FIT_ITERS));
+                    black_box(fit::with_lm_stop(o.fit_stop, || {
+                        fit::fit_weighted(&mut t, &d.x, &d.y, &[], DEFAULT_FIT_ITERS)
+                    }));
                 },
                 min_s,
                 3,

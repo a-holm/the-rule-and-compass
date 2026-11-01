@@ -667,6 +667,15 @@ SEARCH:
                              refit exactly on the CPU in every mode. Only the
                              device fit arm reads it; a resume refuses a
                              different saved value
+  --fit-stop <off|on|TAU[,K]>  stop the CPU LM of the search's candidate fits after K
+                             (default 2) tiny steps in a row, each a relative
+                             SSE gain below TAU (on = 1e-10,2; default off).
+                             The undamped polish still runs. The reported
+                             archive is rebuilt with the exact full-budget
+                             refit (no stop); the finalist refit, the CPU
+                             fallback refits and the host gate stay exact.
+                             --fit-iters 0 ignores it. A resume refuses a
+                             different saved value
   --refit-band <F>           after a device-fit search, refit exactly (CPU f64)
                              only the trees whose full-data error is within
                              this relative band of the lowest error at no
@@ -1101,6 +1110,14 @@ fn jnum(v: f64) -> String {
         format!("{}", v)
     } else {
         "null".to_string()
+    }
+}
+
+/// #569: `search.fit_stop`, `null` or `{"rel":..,"k":..}`.
+fn fit_stop_json(stop: Option<fit::LmStop>) -> String {
+    match stop {
+        None => "null".to_string(),
+        Some(s) => format!("{{\"rel\":{},\"k\":{}}}", jnum(s.rel), s.k),
     }
 }
 
@@ -1886,6 +1903,9 @@ impl DevSink {
             prune_s: outcome.prune.seconds,
             fit_refit_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_s()),
             fit_refits: outcome.gpu.as_ref().map(|g| g.fit_refits),
+            lm_fits: outcome.fit_work.lm_fits,
+            lm_passes: outcome.fit_work.lm_passes,
+            lm_stops: outcome.fit_work.lm_stops,
             events,
             bytes,
             dropped,
@@ -2421,6 +2441,7 @@ fn main() {
     // #495: explicit --refit-band for the resume settings check.
     let mut refit_band_set = false;
     let mut fit_polish_set = false;
+    let mut fit_stop_set = false;
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
     let mut front_parents_set = false;
@@ -2862,6 +2883,20 @@ fn main() {
                     }
                     None => {
                         eprintln!("error: --fit-polish needs f64, f32 or off, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            // #569: relative-improvement stop of the CPU LM in the search fit.
+            "--fit-stop" => {
+                let v = val!();
+                match fit::LmStop::parse(&v) {
+                    Ok(s) => {
+                        cfg.fit_stop = s;
+                        fit_stop_set = true;
+                    }
+                    Err(e) => {
+                        eprintln!("error: --fit-stop {}", e);
                         std::process::exit(EXIT_USAGE);
                     }
                 }
@@ -3598,6 +3633,13 @@ fn main() {
                 "--fit-polish {} (saved {})",
                 cfg.fit_polish.name(),
                 saved.fit_polish.name()
+            ));
+        }
+        if fit_stop_set && cfg.fit_stop != saved.fit_stop {
+            conflicts.push(format!(
+                "--fit-stop {} (saved {})",
+                fit::LmStop::name(cfg.fit_stop),
+                fit::LmStop::name(saved.fit_stop)
             ));
         }
         if fit_fallback_max_set && cfg.fit_fallback_max != saved.fit_fallback_max {
@@ -6080,6 +6122,13 @@ fn main() {
             counts.gpu_refits
         );
         eprintln!("# fit: {}", fit::backend_description());
+        eprintln!(
+            "# fit: lm fits={} passes={} stops={} stop={}",
+            counts.lm_fits,
+            counts.lm_passes,
+            counts.lm_stops,
+            fit::LmStop::name(cfg.fit_stop)
+        );
         // #228: the signed-bias projection is the only non-squared metric with
         // an exact closed-form arm. Its labels say why a candidate left the arm.
         let signed: u64 = fit::signed_fit_counts().iter().map(|(_, n)| n).sum();
@@ -7387,6 +7436,16 @@ fn main() {
                 ),
                 _ => String::new(),
             };
+            // #569: omitted unless --fit-stop is on, which keeps the historical JSON.
+            let lm_json = if cfg.fit_stop.is_some() {
+                let w = &outcome.fit_work;
+                format!(
+                    ",\"lm_fits\":{},\"lm_passes\":{},\"lm_stops\":{},\"refits\":{}",
+                    w.lm_fits, w.lm_passes, w.lm_stops, w.refits
+                )
+            } else {
+                String::new()
+            };
             let fitting_json = if cfg.fit_strategy == fit::FitStrategy::Exact
                 && outcome.fit_rows == 0
                 && fit_provenance_json.is_empty()
@@ -7395,19 +7454,21 @@ fn main() {
                 // portfolio fields appear when a non-default arm or fit-row
                 // screen is in use.
                 format!(
-                    "{{\"loss\":{},\"value\":{}}}",
+                    "{{\"loss\":{},\"value\":{}{}}}",
                     jstr(cfg.metric.name()),
-                    jnum(best_fit_loss)
+                    jnum(best_fit_loss),
+                    lm_json
                 )
             } else {
                 format!(
-                    "{{\"loss\":{},\"value\":{},\"strategy\":{},\"fit_rows\":{},\"gpu_batches\":{}{}}}",
+                    "{{\"loss\":{},\"value\":{},\"strategy\":{},\"fit_rows\":{},\"gpu_batches\":{}{}{}}}",
                     jstr(cfg.metric.name()),
                     jnum(best_fit_loss),
                     jstr(cfg.fit_strategy.name()),
                     outcome.fit_rows,
                     fit::fit_arm_counts_full().since(fit_before).gpu,
-                    fit_provenance_json
+                    fit_provenance_json,
+                    lm_json
                 )
             };
             // #141: report the backend that actually guided the search, with
@@ -7475,7 +7536,7 @@ fn main() {
                 None => backend_json,
             };
             let result_json = format!(
-                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"lockbox\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"search\":{{\"candidates_evaluated\":{}}},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"lockbox\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"search\":{{\"candidates_evaluated\":{},\"fit_stop\":{}}},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
                 jstr(VERSION),
@@ -7497,6 +7558,7 @@ fn main() {
                 prepared.prep.json(),
                 outcome.generations,
                 outcome.candidates_evaluated,
+                fit_stop_json(cfg.fit_stop),
                 outcome.converged_early,
                 jstr(outcome.stop_reason),
                 // #18: the four convergence numbers.

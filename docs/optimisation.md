@@ -478,6 +478,18 @@ because the engine converges and stops early instead of burning all 400
 generations. Third, **parsimony**: recovered formulas print as `1 + 2·x` and
 `sin(x)` rather than as a hairball of nested divisions.
 
+#### Relative-improvement stop: `--fit-stop` (#569)
+
+The CPU Levenberg–Marquardt phase runs all `--fit-iters` trials unless the SSE reaches 0 or the system is singular. Most fits are done after one or two trials; the rest are rejections and tiny accepted steps. `--fit-stop off|on|<tau>[,<k>]` (default `off`; `on` is `1e-10,2`) ends the damped phase early:
+
+* After an accepted trial with relative gain `(prev - new) / prev < tau`, a counter grows; a larger gain resets it.
+* A rejected trial grows the counter only when a tiny accepted step came first, so the start-up rejections of a fit far from its optimum never count.
+* At `k` the damped phase ends and the undamped Gauss-Newton polish (up to 4 steps) runs as usual.
+
+The stop is scoped to the search's candidate fit (`search.rs` `fit_constants_with_iters`, through `fit::with_lm_stop`). It reaches every arm that solves through `fit_weighted` (squared, AIC/AICc/BIC, the inner and final IRLS solves, the squared warm starts). Every other fit stays exact: the finalist refit, the CPU fallback refits, the host gate, the walk-forward and evaluation refits, direct `fit::*` calls and the device fit kernel. With the stop on, the CPU search rebuilds the reported archive through the full-data archive with the exact band refit (`--refit-band`, #495), so every reported member is an exact full-budget refit from its carried constants. A stop on the last trial skips no work and is not counted.
+
+With `off` every constant, archive and checkpoint is bit-identical to a build without the flag. The setting is saved search state; a resume refuses a different value. `fitting.lm_fits`, `lm_passes`, `lm_stops` and `refits` appear in `--json` with the stop on; `--fit-report` prints the LM counts always; `rcsr-bench` run lines carry `lm_fits`, `lm_passes`, `lm_stops`; the dev log `run_end` carries `fit_lm`. The counters are process-wide, so a per-run value is exact only when one run is in flight (`rcsr-bench --jobs 1`). `cpu_bench --mode fit --fit-stop on` measures the fit wall with the stop.
+
 ### 3.2 What is left on the algorithm side
 
 Ordered by expected gain per unit effort **[planned]**:
