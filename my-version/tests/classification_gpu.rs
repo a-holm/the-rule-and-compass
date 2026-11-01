@@ -382,6 +382,7 @@ fn the_search_scores_brier_natively_and_reports_exact_cpu_values() {
     let test = binary_sample(60, 0.4, 0.2, 6);
     let cfg = Config {
         gpu: true,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
         generations: 3,
         islands: 1,
         pop: 16,
@@ -436,6 +437,7 @@ fn a_weighted_search_scores_the_weighted_mean() {
     let test = binary_sample(60, 0.4, 0.2, 9);
     let cfg = Config {
         gpu: true,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
         generations: 3,
         islands: 1,
         pop: 16,

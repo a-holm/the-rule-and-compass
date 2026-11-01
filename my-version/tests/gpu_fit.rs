@@ -622,6 +622,7 @@ fn admission_fits_only_the_promoted_fraction() {
         fit_strategy: FitStrategy::Gpu,
         metric: Metric::Squared,
         gpu: true,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
         ..Default::default()
     };
     let out = search::run(&cfg, &train, &test);
@@ -1732,6 +1733,7 @@ fn implicit_residual_gpu_search_defers_and_reports_the_exact_metric() {
         metric: Metric::ImplicitResidual,
         ops: vec![expr::Op::Add, expr::Op::Sub, expr::Op::Mul, expr::Op::Square],
         gpu: true,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
         ..Default::default()
     };
     let a = search::run(&cfg, &train, &test);
