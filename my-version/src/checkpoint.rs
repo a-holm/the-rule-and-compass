@@ -1315,6 +1315,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "fit_admission", // #223: missing means `screened`
         "fit_rows",      // #116: missing means 0 (off)
         "fit_fallback_max", // #255: missing means the default bound
+        "refit_band",       // #495: missing means the default band
         "qd_bins",       // #120
         "qd_cell_cap",   // #120
         "qd_cvt",        // #120
@@ -1587,6 +1588,14 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             .parse::<usize>()
             .map_err(|_| format!("bad config value for 'fit_fallback_max': '{}'", raw))?,
     };
+    // #495: absent means the default band.
+    let refit_band = match fields.get("refit_band") {
+        None => crate::search::DEFAULT_REFIT_BAND,
+        Some(raw) => decode_f64(raw)
+            .ok()
+            .filter(|v| *v >= 0.0)
+            .ok_or_else(|| format!("bad config value for 'refit_band': '{}'", raw))?,
+    };
     // #122: absent means auto, matching checkpoints written before the flat
     // postfix engine existed.
     let variation = match fields.get("variation").map(|s| s.as_str()) {
@@ -1619,6 +1628,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         fit_samples, // #85
         fit_rows,     // #116
         fit_fallback_max, // #255
+        refit_band, // #495
         // #116: a disk row source is a path choice, not saved search state.
         fit_stream_source: None,
         front_parents, // #76
@@ -1688,6 +1698,11 @@ fn write_config(cfg: &Config, out: &mut String) {
     }
     writeln!(out, "config fit_rows {}", cfg.fit_rows).unwrap(); // #116
     writeln!(out, "config fit_fallback_max {}", cfg.fit_fallback_max).unwrap(); // #255
+    // #495: written only when it differs from the default, so every other
+    // checkpoint and config hash keeps its bytes.
+    if cfg.refit_band != crate::search::DEFAULT_REFIT_BAND {
+        writeln!(out, "config refit_band {}", encode_f64(cfg.refit_band)).unwrap();
+    }
     // #122: absent means auto (the historical path for every old checkpoint).
     writeln!(out, "config variation {}", cfg.variation.as_str()).unwrap();
     writeln!(out, "config dedup {}", cfg.dedup).unwrap();
