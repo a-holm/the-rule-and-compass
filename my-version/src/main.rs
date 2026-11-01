@@ -9509,7 +9509,12 @@ OPTIONS:
   --locked-test              read the locked test once for a sealed candidate.
                              Needs --ledger and --sealed. A second read, an
                              unsealed candidate or a code/data hash that differs
-                             from the sealed entry is refused
+                             from the sealed entry is refused. After `protocol seal
+                             --final`: at most the sealed number of reads, a read
+                             through another ledger of the same store is refused
+                             (<data>.locked_reads.jsonl), --batch-pnl is refused
+                             (exit 2) and the report holds the selected candidate
+                             only (no per-candidate series, PBO or FDR)
   --sealed <file>            locked_candidates.json from `rcsr protocol seal`
   --verify-read              with --locked-test: recompute a recorded read and
                              compare its report hash; records nothing
@@ -10229,6 +10234,25 @@ fn run_walkforward(args: &[String]) -> ! {
     let candidate_id = rcsr::protocol::Candidate::address(&spec_sha, &data_sha, &build_id);
     let ledger = ledger_path.as_ref().map(rcsr::protocol::Ledger::new);
     let mut read_count = 0u64;
+    if let (Some(l), true) = (&ledger, locked_test) {
+        match l.final_seal() {
+            Ok(Some((_, terms))) if !terms.report_candidates => {
+                if popts.batch_pnl {
+                    eprintln!(
+                        "error: --batch-pnl scores every candidate on the locked test; the final seal reports \
+                         the selected candidate only (seal --final --report-candidates keeps the full report)"
+                    );
+                    std::process::exit(EXIT_USAGE);
+                }
+                popts.final_read = true;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    }
     if let Some(l) = &ledger {
         let r = (|| -> Result<u64, String> {
             l.verify_chain()?;
@@ -10239,6 +10263,9 @@ fn run_walkforward(args: &[String]) -> ! {
                 } else {
                     l.authorize_read(sealed, &candidate_id, &data_sha, &build_id)?;
                 }
+                l.check_read_marker(&data_path)?;
+            } else {
+                l.refuse_if_final()?;
             }
             l.read_count()
         })();
@@ -10291,7 +10318,8 @@ fn run_walkforward(args: &[String]) -> ! {
                     None => Err("no recorded read for this candidate".to_string()),
                 }
             } else if locked_test {
-                l.record_read(&candidate_id, &report_sha)
+                l.write_read_marker(&data_path, "test_read", &report_sha)
+                    .and_then(|_| l.record_read(&candidate_id, &report_sha))
             } else {
                 l.add_candidate(&rcsr::protocol::Candidate {
                     id: candidate_id.clone(),

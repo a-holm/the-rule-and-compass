@@ -88,6 +88,10 @@ pub struct ProtocolOptions {
     /// #482: labels of windows that overlap the run's training or validation
     /// rows and were allowed anyway.
     pub in_sample_windows: Vec<String>,
+    /// #523: the final locked read reports the selected candidate only: no
+    /// other candidate is evaluated on the test block, the inference has no
+    /// candidate columns and `batch_pnl` is refused.
+    pub final_read: bool,
 }
 
 /// #482: where a candidate list came from: a run's Pareto front.
@@ -116,6 +120,7 @@ impl Default for ProtocolOptions {
             cost: None,
             front: None,
             in_sample_windows: Vec::new(),
+            final_read: false,
         }
     }
 }
@@ -634,7 +639,14 @@ fn run_table_clocked(
     let group_ids = layout.group.map(|g| table_group_ids(table, g));
     let t_pnl = std::time::Instant::now();
     let mut acc = Accum::new(spec, opts, trees.len())?;
+    if opts.final_read {
+        acc.pass = Pass::TrainOnly;
+    }
     let mut features = Vec::with_capacity(layout.vars.len());
+    for pass in 0..(if opts.final_read { 2 } else { 1 }) {
+        if pass == 1 {
+            acc.begin_test_pass(spec, &trees)?;
+        }
     for r in 0..table.len() {
         let t = times.value(r);
         if !acc.wants(t) {
@@ -646,6 +658,7 @@ fn run_table_clocked(
         }
         let g = group_ids.as_ref().map_or(0, |ids| ids[r]);
         acc.add(t, g, &features, ret_in(opts, table.value(r, layout.target)), &trees);
+    }
     }
     let mut report = acc.finish(
         clock,
@@ -688,12 +701,19 @@ fn run_store_clocked(
     validate_windows(spec, opts)?;
 
     let mut acc = Accum::new(spec, opts, trees.len())?;
+    if opts.final_read {
+        acc.pass = Pass::TrainOnly;
+    }
     let header = fs.header();
     let t_pnl = std::time::Instant::now();
     let mut io_s = 0.0f64;
     let mut buf = GroupBuf::new();
     let mut scratch = Vec::new();
     let mut features = Vec::with_capacity(layout.vars.len());
+    for pass in 0..(if opts.final_read { 2 } else { 1 }) {
+        if pass == 1 {
+            acc.begin_test_pass(spec, &trees)?;
+        }
     for group in 0..fs.n_groups() {
         let t_io = std::time::Instant::now();
         let view = fs.load_group_with(group, &mut buf, &mut scratch)?;
@@ -743,6 +763,7 @@ fn run_store_clocked(
             let y = ret_in(opts, view.col(layout.target)[r]);
             acc.add(t, g, &features, y, &trees);
         }
+    }
     }
     let bound = format!(
         "O(test rows + one score per training row per window); the .rcsb store is scanned \
@@ -889,6 +910,13 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
     if opts.bootstrap_draws > 0 && opts.bootstrap_draws < 100 {
         return Err("--bootstrap needs at least 100 draws".to_string());
     }
+    if opts.final_read && opts.batch_pnl {
+        return Err(
+            "--batch-pnl scores every candidate on the locked test; a final read reports the selected \
+             candidate only"
+                .to_string(),
+        );
+    }
     if opts.pbo_blocks < 2 || opts.pbo_blocks % 2 != 0 || opts.pbo_blocks > 24 {
         return Err("--pbo-blocks must be even and in 2..=24".to_string());
     }
@@ -1004,10 +1032,26 @@ struct WindowData {
     dropped: usize,
 }
 
+/// Which rows an [`Accum`] scores. A final read scores in two passes: the
+/// training and validation rows of every candidate first, then, once the
+/// candidate of each window is fixed, the test rows of that candidate only.
+#[derive(Clone, Debug, PartialEq)]
+enum Pass {
+    All,
+    TrainOnly,
+    TestOnly,
+}
+
 struct Accum {
     windows: Vec<WindowData>,
     candidates: usize,
     scores: Vec<f64>,
+    pass: Pass,
+    /// Candidate of each window, fixed from training and validation rows
+    /// before any test row is scored (final read only).
+    forced: Option<Vec<usize>>,
+    /// Candidates scored on the test pass (final read only).
+    test_candidates: Vec<usize>,
 }
 
 impl Accum {
@@ -1063,6 +1107,9 @@ impl Accum {
             windows,
             candidates,
             scores: vec![0.0; candidates],
+            pass: Pass::All,
+            forced: None,
+            test_candidates: Vec::new(),
         })
     }
 
@@ -1071,18 +1118,60 @@ impl Accum {
             return false;
         }
         self.windows.iter().any(|d| {
-            (t >= d.window.train_start && t < d.window.train_end)
-                || (t >= d.window.test_start && t < d.window.test_end)
+            let train = t >= d.window.train_start && t < d.window.train_end;
+            let test = t >= d.window.test_start && t < d.window.test_end;
+            match self.pass {
+                Pass::All => train || test,
+                Pass::TrainOnly => train,
+                Pass::TestOnly => test,
+            }
         })
     }
 
     fn add(&mut self, t: f64, group: u64, features: &[f64], target: f64, trees: &[Node]) {
         debug_assert_eq!(trees.len(), self.candidates);
-        for (s, tree) in self.scores.iter_mut().zip(trees) {
-            *s = expr::eval(tree, features);
+        match self.pass {
+            Pass::All | Pass::TrainOnly => {
+                for (s, tree) in self.scores.iter_mut().zip(trees) {
+                    *s = expr::eval(tree, features);
+                }
+                push_scores(&mut self.windows, t, group, target, &self.scores, self.pass == Pass::All);
+            }
+            Pass::TestOnly => {
+                for &c in &self.test_candidates {
+                    self.scores[c] = expr::eval(&trees[c], features);
+                }
+                let forced = self.forced.as_deref().expect("the test pass follows the selection");
+                push_selected_test(&mut self.windows, forced, t, group, target, &self.scores);
+            }
         }
-        push_scores(&mut self.windows, t, group, target, &self.scores);
     }
+
+    /// Final read: end the training pass. Fix the candidate of every window
+    /// from its training and validation scores, then score the test rows of
+    /// those candidates only. No test row has been scored before this call.
+    fn begin_test_pass(&mut self, spec: &EvalSpec, trees: &[Node]) -> Result<(), String> {
+        debug_assert!(self.pass == Pass::TrainOnly);
+        let mut chosen = Vec::with_capacity(self.windows.len());
+        for d in &self.windows {
+            let has_validation = d.validation_start.is_some();
+            if has_validation && trees.len() > 1 && d.validation_rows.is_empty() {
+                return Err(format!(
+                    "window '{}': no validation rows for candidate selection",
+                    d.window.label
+                ));
+            }
+            chosen.push(select_candidate(d, spec, trees, has_validation)?.candidate);
+        }
+        let mut distinct = chosen.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        self.test_candidates = distinct;
+        self.forced = Some(chosen);
+        self.pass = Pass::TestOnly;
+        Ok(())
+    }
+
 
 
     fn finish(
@@ -1119,7 +1208,8 @@ impl Accum {
         let mut cand_cols: Vec<Vec<f64>> = vec![Vec::new(); n_candidates];
         let mut books: Vec<crate::wf_protocol::NullBook> = Vec::new();
         let mut batch_in: Vec<crate::wf_batch::WindowScores> = Vec::new();
-        for mut d in self.windows {
+        let forced = self.forced.as_deref();
+        for (window_index, mut d) in self.windows.into_iter().enumerate() {
             {
                 let book = crate::trading::TradingRows {
                     time: d.test_rows.iter().map(|r| r.time).collect(),
@@ -1148,91 +1238,16 @@ impl Accum {
                     d.window.label, d.window.test_start, d.window.test_end
                 ));
             }
-            // Score every candidate on the validation fibre, then freeze the
-            // choice before touching the test block.
-            let mut best: Option<(usize, f64, f64)> = None;
-            let mut thresholds = vec![f64::NAN; d.train_scores.len()];
-            for (c, scores) in d.train_scores.iter().enumerate() {
-                let source_scores = if has_validation {
-                    &d.validation_scores[c]
-                } else {
-                    scores
-                };
-                if source_scores.is_empty() && spec.threshold_fixed.is_none() {
+            let Selected { candidate, validation_error, threshold, band_selection, thresholds } =
+                select_candidate(&d, spec, trees, has_validation)?;
+            if let Some(fixed) = forced {
+                if fixed[window_index] != candidate {
                     return Err(format!(
-                        "window '{}': no finite {} scores for candidate {} to set the threshold",
-                        d.window.label,
-                        if has_validation { "validation" } else { "training" },
-                        c + 1
-                    ));
-                }
-                let err = if has_validation {
-                    validation_mse(&d.validation_rows, &d.validation_scores[c])
-                } else {
-                    0.0
-                };
-                let threshold = if let Some(theta) = spec.threshold_fixed {
-                    Threshold::fixed(theta)?.value()
-                } else if has_validation {
-                    Threshold::validation_type7(source_scores, spec.threshold_quantile).value()
-                } else {
-                    Threshold::train_type7(source_scores, spec.threshold_quantile).value()
-                };
-                thresholds[c] = threshold;
-                match best {
-                    Some((_, best_err, _)) if best_err <= err => {}
-                    _ => best = Some((c, err, threshold)),
-                }
-            }
-            let mut band_selection = None;
-            let (candidate, validation_error, threshold) = if spec.band_select {
-                if !has_validation {
-                    return Err(format!(
-                        "window '{}': --select-band needs --validation-frac > 0, \
-                         because the test block may not choose the candidate",
+                        "window '{}': the candidate chosen before the locked scoring differs from the one chosen after it",
                         d.window.label
                     ));
                 }
-                let targets: Vec<f64> = d.validation_rows.iter().map(|r| r.target).collect();
-                let groups: Vec<u64> = d.validation_rows.iter().map(|r| r.group).collect();
-                let times: Vec<f64> = d.validation_rows.iter().map(|r| r.time).collect();
-                let rows = crate::selection::BandRows {
-                    targets: &targets,
-                    groups: &groups,
-                    times: &times,
-                };
-                let options = crate::selection::BandOptions {
-                    cost_bps: spec.cost_bps,
-                    ..crate::selection::BandOptions::default()
-                };
-                let mut candidates: Vec<crate::selection::BandCandidate<'_>> =
-                    Vec::with_capacity(d.validation_scores.len());
-                for c in 0..d.validation_scores.len() {
-                    let surrogate = crate::selection::screening_net(
-                        &rows,
-                        &d.validation_scores[c],
-                        thresholds[c],
-                        &options,
-                    )?;
-                    candidates.push(crate::selection::BandCandidate {
-                        index: c,
-                        surrogate,
-                        complexity: expr::complexity(&trees[c]),
-                        scores: &d.validation_scores[c],
-                        threshold: thresholds[c],
-                    });
-                }
-                let selection = crate::selection::select_band(&rows, &candidates, &options)
-                    .map_err(|e| format!("window '{}': {}", d.window.label, e))?;
-                let chosen = selection.selected_index;
-                let err = validation_mse(&d.validation_rows, &d.validation_scores[chosen]);
-                band_selection = Some(selection);
-                (chosen, Some(err), thresholds[chosen])
-            } else {
-                let (c, err, theta) = best.expect("at least one candidate");
-                let err = if has_validation { Some(err) } else { None };
-                (c, err, theta)
-            };
+            }
             let source_name = if spec.threshold_fixed.is_some() {
                 ThresholdSource::Fixed
             } else if has_validation {
@@ -1336,7 +1351,7 @@ impl Accum {
                 const_rows += cn.rows;
                 const_long += cn.long_rows;
             }
-            if opts.bootstrap_draws > 0 {
+            if opts.bootstrap_draws > 0 && !opts.final_read {
                 for c in 0..n_candidates {
                     if c == candidate {
                         cand_cols[c].extend_from_slice(&ev.returns);
@@ -1474,8 +1489,8 @@ impl Accum {
                 "constant_long_flat" => &const_all,
                 _ => &zeros,
             };
-            let candidates: Vec<Vec<f64>> = if opts.bootstrap_draws > 0 { cand_cols } else { Vec::new() };
-            Some(crate::wf_protocol::infer(&crate::wf_protocol::InferenceInput {
+            let candidates: Vec<Vec<f64>> = if opts.bootstrap_draws > 0 && !opts.final_read { cand_cols } else { Vec::new() };
+            let mut inferred = crate::wf_protocol::infer(&crate::wf_protocol::InferenceInput {
                 draws: opts.bootstrap_draws,
                 null_draws: opts.null_draws,
                 block_len,
@@ -1492,7 +1507,14 @@ impl Accum {
                 baseline_series: baseline,
                 buy_and_hold: &bh_all,
                 books: &books,
-            })?)
+            })?;
+            if opts.final_read {
+                if let Some(m) = inferred.multiple.as_mut() {
+                    m.pbo = None;
+                    m.pbo_error = Some("final read reports the selected candidate".to_string());
+                }
+            }
+            Some(inferred)
         } else {
             None
         };
@@ -1610,6 +1632,7 @@ fn push_scores(
     group: u64,
     target: f64,
     scores: &[f64],
+    with_test: bool,
 ) {
     for d in windows {
         let in_train = t >= d.window.train_start && t < d.window.train_end;
@@ -1641,7 +1664,7 @@ fn push_scores(
                 }
             }
         }
-        if in_test {
+        if in_test && with_test {
             d.test_rows.push(RowBase {
                 time: t,
                 group,
@@ -1652,6 +1675,28 @@ fn push_scores(
                 dst.push(score);
             }
             if bad {
+                d.dropped += 1;
+            }
+        }
+    }
+}
+
+/// Final read: record a test row for every window that contains it, with the
+/// score of that window's fixed candidate only. The other candidates' test
+/// columns stay empty and are never evaluated.
+fn push_selected_test(
+    windows: &mut [WindowData],
+    chosen: &[usize],
+    t: f64,
+    group: u64,
+    target: f64,
+    scores: &[f64],
+) {
+    for (d, &c) in windows.iter_mut().zip(chosen) {
+        if t >= d.window.test_start && t < d.window.test_end {
+            d.test_rows.push(RowBase { time: t, group, target });
+            d.test_scores[c].push(scores[c]);
+            if !target.is_finite() || !scores[c].is_finite() {
                 d.dropped += 1;
             }
         }
@@ -3394,4 +3439,107 @@ impl Report {
         s.push('\n');
         s
     }
+}
+
+struct Selected {
+    candidate: usize,
+    validation_error: Option<f64>,
+    threshold: f64,
+    band_selection: Option<crate::selection::BandSelection>,
+    thresholds: Vec<f64>,
+}
+
+/// The candidate of one window. Reads the training and validation rows only,
+/// never `test_rows` or `test_scores`, so the choice cannot depend on a test
+/// value and can be made before the test block is scored.
+fn select_candidate(
+    d: &WindowData,
+    spec: &EvalSpec,
+    trees: &[Node],
+    has_validation: bool,
+) -> Result<Selected, String> {
+            let mut best: Option<(usize, f64, f64)> = None;
+            let mut thresholds = vec![f64::NAN; d.train_scores.len()];
+            for (c, scores) in d.train_scores.iter().enumerate() {
+                let source_scores = if has_validation {
+                    &d.validation_scores[c]
+                } else {
+                    scores
+                };
+                if source_scores.is_empty() && spec.threshold_fixed.is_none() {
+                    return Err(format!(
+                        "window '{}': no finite {} scores for candidate {} to set the threshold",
+                        d.window.label,
+                        if has_validation { "validation" } else { "training" },
+                        c + 1
+                    ));
+                }
+                let err = if has_validation {
+                    validation_mse(&d.validation_rows, &d.validation_scores[c])
+                } else {
+                    0.0
+                };
+                let threshold = if let Some(theta) = spec.threshold_fixed {
+                    Threshold::fixed(theta)?.value()
+                } else if has_validation {
+                    Threshold::validation_type7(source_scores, spec.threshold_quantile).value()
+                } else {
+                    Threshold::train_type7(source_scores, spec.threshold_quantile).value()
+                };
+                thresholds[c] = threshold;
+                match best {
+                    Some((_, best_err, _)) if best_err <= err => {}
+                    _ => best = Some((c, err, threshold)),
+                }
+            }
+            let mut band_selection = None;
+            let (candidate, validation_error, threshold) = if spec.band_select {
+                if !has_validation {
+                    return Err(format!(
+                        "window '{}': --select-band needs --validation-frac > 0, \
+                         because the test block may not choose the candidate",
+                        d.window.label
+                    ));
+                }
+                let targets: Vec<f64> = d.validation_rows.iter().map(|r| r.target).collect();
+                let groups: Vec<u64> = d.validation_rows.iter().map(|r| r.group).collect();
+                let times: Vec<f64> = d.validation_rows.iter().map(|r| r.time).collect();
+                let rows = crate::selection::BandRows {
+                    targets: &targets,
+                    groups: &groups,
+                    times: &times,
+                };
+                let options = crate::selection::BandOptions {
+                    cost_bps: spec.cost_bps,
+                    ..crate::selection::BandOptions::default()
+                };
+                let mut candidates: Vec<crate::selection::BandCandidate<'_>> =
+                    Vec::with_capacity(d.validation_scores.len());
+                for c in 0..d.validation_scores.len() {
+                    let surrogate = crate::selection::screening_net(
+                        &rows,
+                        &d.validation_scores[c],
+                        thresholds[c],
+                        &options,
+                    )?;
+                    candidates.push(crate::selection::BandCandidate {
+                        index: c,
+                        surrogate,
+                        complexity: expr::complexity(&trees[c]),
+                        scores: &d.validation_scores[c],
+                        threshold: thresholds[c],
+                    });
+                }
+                let selection = crate::selection::select_band(&rows, &candidates, &options)
+                    .map_err(|e| format!("window '{}': {}", d.window.label, e))?;
+                let chosen = selection.selected_index;
+                let err = validation_mse(&d.validation_rows, &d.validation_scores[chosen]);
+                band_selection = Some(selection);
+                (chosen, Some(err), thresholds[chosen])
+            } else {
+                let (c, err, theta) = best.expect("at least one candidate");
+                let err = if has_validation { Some(err) } else { None };
+                (c, err, theta)
+            };
+    Ok(Selected { candidate, validation_error, threshold, band_selection, thresholds })
 }

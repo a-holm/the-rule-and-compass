@@ -2307,6 +2307,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         }
         let l = protocol::Ledger::new(ledger);
         l.authorize_baseline_read(std::path::Path::new(sealed)).map_err(input_err)?;
+        l.check_read_marker(&data_path).map_err(input_err)?;
         read = Some((l, crate::manifest::sha256_file(&data_path).map_err(input_err)?));
     }
     let guard = if locked_test {
@@ -2315,7 +2316,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         declared.as_ref().map(|d| (d.lockbox.start as f64, d.lockbox.end as f64))
     };
     let inp = Input {
-        data: data_path,
+        data: data_path.clone(),
         target,
         ret,
         time,
@@ -2343,6 +2344,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     json = resolved.splice_report(&json, in_scope, locked_test, true);
     if let Some((ledger, data_sha)) = &read {
         let report_sha = crate::manifest::sha256_hex(json.as_bytes());
+        ledger.write_read_marker(&data_path, "baseline_read", &report_sha).map_err(input_err)?;
         ledger.record_baseline_read(data_sha, &report_sha).map_err(input_err)?;
     }
     if let Some(p) = &out {
