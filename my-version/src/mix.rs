@@ -106,3 +106,66 @@ impl MixWindow {
         Ok(w)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::CLASSIC_MIX;
+
+    fn gen(a: u64, s: u64) -> MixCounts {
+        [(a, s); EDIT_KINDS]
+    }
+
+    #[test]
+    fn an_empty_window_keeps_the_base_mix() {
+        assert_eq!(MixWindow::new().weights(&CLASSIC_MIX), CLASSIC_MIX);
+    }
+
+    #[test]
+    fn weights_follow_the_smoothed_success_rate_with_a_floor() {
+        let mut w = MixWindow::new();
+        let mut c = [(0, 0); EDIT_KINDS];
+        c[0] = (98, 48); // (48 + 1) / (98 + 2) = 0.49
+        c[1] = (98, 0); // 1 / 100 = 0.01, floored to 0.02
+        w.push(c);
+        let got = w.weights(&CLASSIC_MIX);
+        // Kinds with no attempt have (0 + 1) / (0 + 2) = 0.5.
+        let raw = [0.49, 0.02, 0.5, 0.5, 0.5, 0.5, 0.5];
+        let sum: f64 = raw.iter().sum();
+        for (g, r) in got.iter().zip(raw) {
+            assert!((g - r / sum).abs() < 1e-12, "{got:?}");
+        }
+        assert!((got.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn only_the_last_ten_generations_count() {
+        let mut w = MixWindow::new();
+        for _ in 0..WINDOW {
+            w.push(gen(10, 0));
+        }
+        for _ in 0..WINDOW {
+            w.push(gen(10, 10));
+        }
+        assert_eq!(w.len(), WINDOW);
+        let all_wins = w.weights(&CLASSIC_MIX);
+        let mut fresh = MixWindow::new();
+        for _ in 0..WINDOW {
+            fresh.push(gen(10, 10));
+        }
+        assert_eq!(all_wins, fresh.weights(&CLASSIC_MIX));
+    }
+
+    #[test]
+    fn encode_decode_round_trips_and_rejects_bad_input() {
+        let mut w = MixWindow::new();
+        w.push(gen(3, 1));
+        w.push(gen(5, 5));
+        assert_eq!(MixWindow::decode(&w.encode()).unwrap(), w);
+        assert!(MixWindow::decode(&[1, 2, 3]).is_err());
+        assert!(MixWindow::decode(&vec![0; 2 * EDIT_KINDS * (WINDOW + 1)]).is_err());
+        let mut bad = vec![0; 2 * EDIT_KINDS];
+        bad[1] = 1; // a success without an attempt
+        assert!(MixWindow::decode(&bad).is_err());
+    }
+}

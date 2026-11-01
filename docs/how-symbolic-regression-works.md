@@ -106,7 +106,21 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
     constant/input perturb, 40 % subtree grow/shrink) and the site is chosen
     among nodes that the edit can actually change, so a mutation never returns
     the parent unchanged;
-  - *crossover* — swap subtrees between two parents.
+    `--mutation-mix extended` adds four structural edits: *insert* wraps a node
+    in a random operator, *delete* replaces a node by one of its children,
+    *swap* exchanges the operands of a non-commutative binary operator and
+    *rotate* turns `o1(a, o2(b, c))` into `o2(o1(a, b), c)`. Weights: point
+    0.20, terminal 0.30, subtree 0.20, insert 0.10, delete 0.10, swap 0.05,
+    rotate 0.05. `--adaptive-mix` lets each island reweight the seven kinds
+    from the success rate (a child beats its first parent) over the last 10
+    generations, `w = max(0.02, (s + 1) / (a + 2))`, normalised; it learns
+    from CPU-scored generations only;
+  - *crossover* — swap subtrees between two parents; `--crossover-internal P`
+    picks an internal node as the cut point with probability `P`;
+  - *random trees* — `--tree-arity balanced` draws the arity class of each
+    operator first (binary 0.5, unary 0.4, ternary 0.1) instead of choosing
+    uniformly among all operators, which favours the 15 unary operators of the
+    default set;
 - **Constant fitting** tunes the numeric constants of a candidate by local
   search. Without it, `y = a·sin(b·x) + c` would almost never be found, because
   random constants rarely land near the right values.
