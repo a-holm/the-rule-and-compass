@@ -270,6 +270,14 @@ fn write_target_spec(dir: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// As [`write_target_spec`], with a horizon of one 900-second bar so that the rows do not overlap.
+fn write_target_spec_one_bar(dir: &std::path::Path) -> String {
+    let path = dir.join("spec900.json");
+    let text = std::fs::read_to_string(write_target_spec(dir)).unwrap();
+    std::fs::write(&path, text.replace("\"horizon_seconds\":3600", "\"horizon_seconds\":900")).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
 fn search(data: &str, spec: &str, extra: &[&str]) -> std::process::Output {
     let mut args = vec![
         "--data", data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal", "--target-spec", spec, "--cpu",
@@ -649,7 +657,7 @@ fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
 
     let dir = scratch("locked-test");
     let data = objective_csv(&dir);
-    let spec = write_target_spec(&dir);
+    let spec = write_target_spec_one_bar(&dir);
     let run_json = dir.join("A0-s3.run.json");
     let out = search(&data, &spec, &["--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--arm", "A0", "--json-out", run_json.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
@@ -730,9 +738,7 @@ fn stale_sidecar_is_refused() {
 
     let dir = scratch("stale-sidecar");
     let data = objective_csv(&dir);
-    let spec900 = dir.join("spec900.json");
-    std::fs::write(&spec900, std::fs::read_to_string(write_target_spec(&dir)).unwrap().replace("\"horizon_seconds\":3600", "\"horizon_seconds\":900")).unwrap();
-    let spec = spec900.to_str().unwrap().to_string();
+    let spec = write_target_spec_one_bar(&dir);
     let run_json = dir.join("A0.run.json");
     let out = search(&data, &spec, &["--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--arm", "A0", "--json-out", run_json.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
