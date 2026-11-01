@@ -1562,7 +1562,9 @@ pub struct SplitSpec {
     /// #145: permit a train or test row inside the 2026H2 lockbox. `false` is
     /// the safe default for every caller of [`prepare_full`].
     pub allow_lockbox: bool,
-    /// #486: the protocol locked test declared with the data or by `--lockbox`.
+    /// #486, #517: the locked test resolved by `lockbox::resolve`: `--lockbox`, the
+    /// declaration stored with the data or the protocol default; `None` only for
+    /// `--lockbox none` and for library callers.
     /// Train, validation and test rows inside it are refused; `allow_lockbox`
     /// does not open it.
     pub declared_lockbox: Option<crate::lockbox::Declared>,
