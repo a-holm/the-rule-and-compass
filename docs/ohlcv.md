@@ -297,7 +297,7 @@ rcsr enrich --data panel.csv --out panel.rcsb --features ta:core,returns
 The report (`<out>.enrich.json`, plus `--json` on stdout) records the input and
 output SHA-256, every per-column hash, each column's nominal warm-up, observed
 `NaN` count and first finite row, the inferred bar spacing, phase timings and
-peak RSS. The append writer hashes the output as it streams the blocks to disk,
+peak RSS. The per-column statistics (`nan_rows`, `prevalence`, first finite row) leave out the rows inside the declared locked test (and, for label columns, the rows whose label window reaches it); `rows_left_out` counts them and `sha256_scope` is `all_rows`: every hash covers the full stored column or file, locked rows included. Without a range neither key is written. The append writer hashes the output as it streams the blocks to disk,
 so a multi-gigabyte store is not read a second time just to checksum it.
 
 ### Catalogue

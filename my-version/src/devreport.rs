@@ -261,6 +261,9 @@ pub struct Analysis {
     pub points: Vec<GenPoint>,
 }
 
+/// Island CPU time below this is device-fit fallback noise, not a fit-versus-evaluation reading.
+const MIN_ISLAND_CPU_S: f64 = 1e-3;
+
 /// `0.75` is the convergence threshold documented in `docs/convergence.md`.
 const CONVERGED_THRESHOLD: f64 = 0.75;
 
@@ -487,7 +490,15 @@ pub fn analyse(path: &str, events: &[Json], skipped: usize) -> Analysis {
     // Cross-cutting findings, ranked by severity.
     let mut findings = Vec::new();
     let candidate_cpu = a.fit_cpu + a.eval_cpu;
-    if candidate_cpu > 0.0 {
+    if candidate_cpu < MIN_ISLAND_CPU_S {
+        findings.push(Finding {
+            severity: 0.0,
+            reading: format!(
+                "no CPU fitting in the islands (candidate CPU time {:.6} s)",
+                candidate_cpu
+            ),
+        });
+    } else {
         let fit_share = a.fit_cpu / candidate_cpu;
         findings.push(Finding {
             severity: fit_share,
@@ -777,7 +788,7 @@ pub fn render(a: &Analysis) -> String {
     out.push_str("## Fit vs evaluation\n\n| item | value |\n|---|---:|\n");
     out.push_str(&format!("| constant fitting (CPU, summed over islands) | {:.4} s |\n", a.fit_cpu));
     out.push_str(&format!("| candidate evaluation (CPU, summed over islands) | {:.4} s |\n", a.eval_cpu));
-    if candidate_cpu > 0.0 {
+    if candidate_cpu >= MIN_ISLAND_CPU_S {
         out.push_str(&format!(
             "| fit share of candidate CPU time | {:.1}% |\n",
             100.0 * a.fit_cpu / candidate_cpu
@@ -1027,6 +1038,7 @@ mod tests {
             phase_b_s: 0.0,
             post_fit_drops: 0,
             reevals: 0,
+            constant_rejected: 0,
             best_error: 1.0 / gen as f64,
             median: 2.0,
             p05: 0.0,
@@ -1231,5 +1243,23 @@ mod tests {
         let u = usage();
         assert!(u.contains("rcsr dev-report <log>"));
         assert!(u.contains("bottleneck"));
+    }
+
+    /// #284: a device-fit run has only fallback seconds of island CPU time. It
+    /// must not read as a fit-bound run with severity 1.
+    #[test]
+    fn negligible_island_cpu_is_not_a_fit_bound_finding() {
+        let mut log = String::new();
+        for g in 1..=3 {
+            log.push_str(&line(g, 1.6e-7, 0.0, 1.0, 1, 10));
+            log.push('\n');
+        }
+        let (events, skipped) = parse_log(&log);
+        let a = analyse("x.ndjson", &events, skipped);
+        let text = render(&a);
+        assert!(!text.contains("fit-bound"), "{text}");
+        assert!(!text.contains("0.000 s of 0.000 s"), "{text}");
+        assert!(text.contains("no CPU fitting in the islands"), "{text}");
+        assert!(a.findings.iter().all(|f| f.severity < 1.0), "{:?}", a.findings);
     }
 }

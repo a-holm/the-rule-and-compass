@@ -510,7 +510,7 @@ fn the_full_log_emits_the_documented_events_and_fields() {
     }
     let stop = end.get("stop").and_then(|v| v.as_str()).unwrap();
     assert!(
-        ["solved", "patience", "time_budget", "generations", "already_stopped"].contains(&stop),
+        ["solved", "patience", "front_stable", "time_budget", "generations", "already_stopped"].contains(&stop),
         "unknown stop reason '{}'",
         stop
     );

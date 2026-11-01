@@ -546,6 +546,12 @@ a default run. `--no-front-parents` restores the previous trajectory exactly
 (both pinned hashes hold with it), and a checkpoint records the setting and
 refuses to resume across a change of it.
 
+### 3.2.2 Front prune (#466)
+
+The sound simplifier keeps code that is neutral only on the data, so a run that stops at the first exact hit can report an exact law wrapped in introns (`q1 ^ tan(if(exp(r), -0, q1))`). The prune removes them by measurement, after the generation loop and the full-data rebuild, on the CPU in f64. For each front member, in ascending error order, it builds every one-step replacement of an internal node by one of its children or by a constant (the mean of the subtree on the fit rows), refits the constants with the exact arm at `--fit-iters`, simplifies, and accepts the lowest-cost result whose error is at most `e0 + 1e-6 * (1 + |e0|)`, with `e0` the error of the member being pruned. It repeats on the accepted tree. Ties break on lower error, then pre-order position. There is no RNG, so the result is a function of the tree and the data and does not depend on `--threads`. Every accepted tree is scored on all training rows and the front is rebuilt with the canonical epsilon-dominance, so a smaller exact tree removes the bloated one.
+
+The prune is off by default; `--prune` enables it. `--prune-rows N` (default 20000) fits on a deterministic subsample of a larger training set. `--prune-budget N` (default 20000) caps the candidate fits per run; `0` disables the pass. Without `--prune` the front is bit for bit the unpruned one. `--json` reports `prune.fits`, `prune.accepted` and `prune.seconds`; the development log `run_end` event and `--run-manifest` carry the same numbers and settings. The pass does not change the search trajectory or a checkpoint.
+
 ### 3.3 Structure-of-arrays CPU evaluator (stages 1–2, wired)
 
 **[implemented, wired into the search and measured]** — `src/eval_soa.rs`
@@ -574,22 +580,23 @@ kernel; the search's single-output, non-implicit fitness path does.
 The API is deliberately small:
 
 ```rust
-use rcsr::eval_soa::{columns, compile, eval_batch, eval_batch_scalar, sse};
+use rcsr::eval_soa::{columns, compile, eval_batch, eval_batch_into, eval_batch_scalar, Scratch, sse};
 
 // cols[var][row], row-major inside each column.
 let cols = columns(&x);                            // x[row][var] -> cols[var][row]
 let program = compile(&tree).expect("supported tree"); // None => fall back
 let mut out = vec![0.0; rows];
-eval_batch(&program, &cols, rows, &mut out);        // AVX if available
+eval_batch(&program, &cols, rows, &mut out);        // column tiles, AVX if available
+let mut scratch = Scratch::new();
+eval_batch_into(&program, &cols, rows, &mut out, &mut scratch); // reuse the stack
 eval_batch_scalar(&program, &cols, rows, &mut out); // portable SoA loop
 let sum_sq = sse(&program, &cols, rows, &y);        // convenience
 ```
 
 `compile` computes the postfix stream and its peak operand-stack depth once;
-`eval_batch` allocates the value stack once per call, not per row. `rows` is
-clamped to `out.len()`, so zero rows and short buffers are safe. A trailing
-group shorter than the SIMD width is evaluated by the scalar loop, so any row
-count works.
+`eval_batch` allocates the tile stack once per call, not per row. `rows` is
+clamped to `out.len()`, so zero rows and short buffers are safe. A row count that
+is not a multiple of the tile size ends in a shorter tile, so any row count works.
 
 **Supported operators.** Unary: `neg`, `exp`, `ln`, `abs`, `sqrt`, `sin`,
 `cos`, `tan`, `sinh`, `cosh`, `tanh`, `logistic`, `step`, `gauss`, `square`,
@@ -610,61 +617,65 @@ propagate `NaN`, and `if` selects `cond > 0`. The tests compare every row of a
 deterministic generated corpus against `expr::eval`; the measured maximum
 relative difference is **0** (bit-identical) on the scalar and AVX paths.
 
-**What vectorises.** On `x86_64`, the kernel is compiled with
+**What vectorises.** The kernel is a column-tile interpreter. `compile` folds
+the postfix stream into steps whose destination slot and operand sources are
+fixed at compile time: an `Input` or `Const` leaf that feeds an operator is read
+in place (a column slice or an immediate) and emits no step, so the value stack
+is only `depth × TILE` doubles and `sp` is never tracked at run time. Each step
+runs over a tile of `TILE = 64` rows in one loop; the dispatch is paid once per
+tile, not once per four rows. On `x86_64` the loops are compiled under
 `#[target_feature(enable = "avx")]` and selected at runtime with
-`is_x86_feature_detected!("avx")`. The development CPU has AVX but no AVX2 and
-no FMA, so the kernel is four `f64` lanes and needs neither. Nothing requires
-nightly.
+`is_x86_feature_detected!("avx")`; the same source is the portable fallback. The
+development CPU has AVX but no AVX2 and no FMA, so nothing requires either.
+Nothing requires nightly.
 
-| operation | AVX kernel | portable fallback |
-|---|---|---|
-| `add`, `sub`, `mul`, `div`, `neg`, `abs`, `sqrt`, `square`, `cube`, `min`, `max` | vectorised (4 rows per instruction) | scalar per row |
-| `if` | vectorised as a lane mask + blend | per-row select |
-| `exp`, `ln`, `sin`, `cos`, `tan`, `sinh`, `cosh`, `tanh`, `logistic`, `step`, `gauss`, `floor`, `ceil`, `round`, `sign`, `pow` | one scalar `f64` call per lane (no AVX instruction for them) | scalar per row |
+Every per-row operation is `apply_unary`/`apply_binary`, the same `f64`
+operations and guards as the scalar path, so the output is bit-identical to
+`expr::eval` and to the previous four-row kernel, which stays as
+`eval_batch_rows4` for the benchmark and the tests. Arithmetic, `div`, `sqrt`
+and the `if` select auto-vectorise. The transcendental functions stay one libm
+call per row: a vectorised approximation would change bits. A program whose
+inputs are missing or shorter than `rows` takes the portable scalar loop, which
+supplies the `NaN` rule.
 
-Even where the transcendental itself is scalar, the tree walk and the
-per-row recursion are gone; those cases therefore still gain from the flat
-stream, just less than pure arithmetic.
+`eval_batch_into(&program, cols, rows, out, &mut Scratch)` takes a
+caller-owned `Scratch` (the tile stack); the search keeps one per worker thread
+together with the prediction buffer, so scoring a candidate allocates nothing
+once the buffers are sized. `eval_batch` allocates a scratch per call.
 
-#### Measured: scalar walk vs SoA
+#### Measured: four-row AVX kernel vs column tile
 
-`cargo run --release --bin cpu_bench` evaluates four deterministic trees (5, 9,
-15 and 25 nodes) over 1 000, 20 000 and 200 000 rows. The scalar column is the
-existing `expr::eval` tree walk on row vectors (what the search uses today);
-the SoA columns are `eval_batch_scalar` and the runtime-selected AVX path.
-Times are µs for one full pass, best of five runs, each sized to about 50 ms.
+`cpu_bench --mode eval --rows 20000,150000,1000000 --min-seconds 0.3`, one
+thread, i7-3770K (AVX, no AVX2/FMA), run through the suite lock on a shared
+host, so only ratios inside one run are evidence. `avx4` is
+`eval_batch_rows4` (the previous kernel), `tile` is `eval_batch`. Times are µs
+for one full pass. `tile/avx4` is `avx4 µs / tile µs`. The benchmark checks
+every output bit-identical to the `expr::eval` walk.
 
-| nodes | rows | walk µs | SoA scalar µs | SoA AVX µs | SoA speed-up | AVX speed-up |
-|---:|---:|---:|---:|---:|---:|---:|
-| 5 | 1 000 | 19.37 | 16.16 | 3.56 | 1.20× | **5.44×** |
-| 5 | 20 000 | 381.87 | 324.25 | 72.09 | 1.18× | **5.30×** |
-| 5 | 200 000 | 4 106.38 | 3 322.97 | 742.16 | 1.24× | **5.53×** |
-| 9 | 1 000 | 59.93 | 48.87 | 34.58 | 1.23× | **1.73×** |
-| 9 | 20 000 | 1 219.78 | 970.00 | 688.92 | 1.26× | **1.77×** |
-| 9 | 200 000 | 12 185.48 | 9 764.19 | 8 217.21 | 1.25× | **1.48×** |
-| 15 | 1 000 | 131.20 | 102.61 | 82.62 | 1.28× | **1.59×** |
-| 15 | 20 000 | 2 613.77 | 2 087.46 | 1 572.26 | 1.25× | **1.66×** |
-| 15 | 200 000 | 29 489.78 | 20 722.41 | 16 505.77 | 1.42× | **1.79×** |
-| 25 | 1 000 | 235.90 | 215.96 | 151.77 | 1.09× | **1.55×** |
-| 25 | 20 000 | 5 020.49 | 4 295.85 | 3 063.77 | 1.17× | **1.64×** |
-| 25 | 200 000 | 49 051.38 | 43 449.00 | 29 596.99 | 1.13× | **1.66×** |
+| tree | rows | avx4 µs | tile µs | tile/avx4 |
+|---|---:|---:|---:|---:|
+| lin5 | 20000 | 131 | 40 | 3.27× |
+| lin5 | 150000 | 992 | 411 | 2.41× |
+| lin5 | 1000000 | 6683 | 4219 | 1.58× |
+| trig9 | 20000 | 1453 | 1102 | 1.32× |
+| trig9 | 150000 | 11378 | 7373 | 1.54× |
+| trig9 | 1000000 | 75109 | 53999 | 1.39× |
+| mix15 | 20000 | 3886 | 2506 | 1.55× |
+| mix15 | 150000 | 21927 | 16918 | 1.30× |
+| mix15 | 1000000 | 126990 | 112679 | 1.13× |
+| mix25 | 20000 | 5037 | 3753 | 1.34× |
+| mix25 | 150000 | 40180 | 28850 | 1.39× |
+| mix25 | 1000000 | 247517 | 186271 | 1.33× |
+| arith15 | 20000 | 921 | 160 | 5.75× |
+| arith15 | 150000 | 8517 | 1762 | 4.83× |
+| arith15 | 1000000 | 56065 | 11515 | 4.87× |
+| trans13 | 20000 | 5649 | 2400 | 2.35× |
+| trans13 | 150000 | 28178 | 16403 | 1.72× |
+| trans13 | 1000000 | 252966 | 94811 | 2.67× |
 
-Measured on the development machine in §4.1 (AVX, no AVX2/FMA). The host is
-shared, so each cell is the minimum over eight alternating runs of
-`cpu_bench`; an individual run can be several percent slower. The 5-node tree
-is pure arithmetic and shows the ceiling of the approach. The 9-, 15- and
-25-node trees mix arithmetic with `sin`/`cos`/`exp`/`tanh`, which AVX alone
-cannot vectorise, so their 1.5–1.8× is the more realistic range for search
-candidates.
+Trees: `lin5` = `1.7*x0 + x1`; `trig9` = `sin(x0*x1 + 0.3) + cos(x2)`; `mix15` = `sin(x0*x1 + sqrt(abs(x2))) / (x1^2 + cos(x0))`; `mix25` = `mix15` plus `tanh(logistic(-x3)) * gauss(x4 + 0.7)`; `arith15` and `trans13` are the `cpu_bench` fit trees below. Trees with `sin`, `cos`, `exp` or `tanh` are bound by the libm calls, so they gain least.
 
-**Agreement:** maximum relative difference against the scalar tree walk is
-`0.0` for both SoA paths on all twelve tree/row combinations (same `f64`
-operations, same guards). The benchmark prints this check on every run.
-
-The 200 000-row cases are memory-bound and noisier than the smaller ones; the
-trend that matters is the AVX speed-up over the existing walk, which grows with
-the arithmetic share of the tree. Trees dominated by `sin`/`cos`/`exp` gain
-less because AVX alone cannot vectorise those functions.
+Tile size: 64 rows is kept. `arith15` tile/avx4 at 20 000 / 150 000 / 1 000 000 rows was 5.75 / 4.83 / 4.87 at 64 rows, 6.22 / 3.79 / 3.11 at 128 and 6.71 / 3.32 / 5.86 at 256; `trans13` was 2.35 / 1.72 / 2.67, 2.05 / 2.16 / 2.21 and 2.01 / 2.72 / 2.20. The host is shared and the runs differ by load, so the choice rests on the 150 000 and 1 000 000 row `arith15` cells.
 
 #### CPU benchmark fixture: `cpu_bench` modes (#472)
 
@@ -677,7 +688,7 @@ cargo run --release --bin cpu_bench -- --mode all --rows 20000 --tsv
 
 | mode | what it measures | default rows |
 |---|---|---|
-| `eval` (default) | `expr::eval` walk, `eval_batch_scalar`, `eval_batch` (AVX) on the 5/9/15/25-node trees; output unchanged from the table above | 1000, 20000, 200000 |
+| `eval` (default) | `expr::eval` walk, `eval_batch_scalar`, `eval_batch_rows4` (four-row AVX), `eval_batch` (column tile) on the 5/9/15/25-node trees plus `arith15` and `trans13`; one `tree` label column | 1000, 20000, 200000 |
 | `fit` | `fit_weighted(.., 0)` (one SSE pass) and `fit_weighted(.., 8)` on `arith15` and `trans13` | 20000, 150000, 1000000 |
 | `metric` | `fit_weighted_metric` on `arith15` for `squared`, `absolute`, `median`, `interquartile`, `rank_correlation`; `score_weighted` for `median` and `squared` | 20000, 150000 |
 | `scale` | T scoped threads share the data, each runs its own `fit_weighted(.., 8)` and `eval_batch` jobs | 20000, 150000, 1000000 |
@@ -1332,7 +1343,7 @@ stages; fitting and all f64 reporting stay on the CPU.
 
 * The fitter, the archive and every dominance test keep `--metric` unless `--fitness pnl` is given (below). A surrogate error and a P&L value are never compared in one dominance test.
 * After the exact finalist refit, each Pareto member's prediction vector on the validation slice is scored by the exact CPU `f64` long/flat book of [`docs/walkforward.md`](walkforward.md). The member with the lowest objective value is reported first. There is no complexity penalty term: ties keep the archive order, which is complexity first.
-* `--gpu` may speed up the fit. It does not change the finalist, which is always rebuilt on the CPU, and the device has no P&L metric arm.
+* `--gpu` may speed up the fit. It does not change the finalist, which is always rebuilt on the CPU. Without `--fitness pnl` the device has no P&L arm.
 * The book earns the full per-row return on every long row and charges one cost per position change. That is only right when the returns of one group do not overlap, so `rcsr` refuses (exit 2, `overlapping returns`) a validation or test slice whose rows of one group are closer than the target spec's `horizon_seconds`. Use a label stride of at least the horizon (`long:<h>,stride=<h>`) or a one-bar label. The JSON `objective.spec` carries `min_group_step_seconds` and `horizon_seconds`.
 * Without `--fitness pnl` the objective only chooses among archived members.
 
@@ -1362,9 +1373,9 @@ regret  = (B - net) / B                               lower is better; all-flat 
 * Constants keep the `--metric` fit (squared LM by default). The P&L is piecewise constant in the constants, so it has no gradient to follow; the book only ranks. `--weight` weights that fit only. For a squared metric the fit's SSE is not reused as the score, so every fitted candidate costs one more evaluation pass plus the book.
 * The training rows are prepared in canonical `(group, time)` order (`SplitSpec.canonical_train_order`). `gross` is summed in fixed 8,192-row segments, 32 lanes per segment and 8 warp sums, each merged with a halving tree, so a device implementation can reproduce the totals bit for bit. The integer counts are order-free.
 * Exit 2 with a named reason for `--predictor-samples`, `--fit-samples`, multiple targets, `--implicit`, `--min-holding` above 1, `--max-position` other than 1, rows closer than the label horizon, and a training slice with no profitable long/flat path (`B <= 0`).
-* The search runs on the CPU. `backend_reason` is `long_pnl fitness has no device scorer yet`.
+* On the GPU backend the device scores every candidate with the score objective `long_pnl_regret` (#481, code 16): the regret kernel is fused with the program interpreter, takes positions from warp ballots, counts flips and exits as integers and sums `gross` in the tree above. Its value equals this book applied to the device's own `f32` predictions, bit for bit; a prediction within an `f32` rounding of the threshold can take the other position than the CPU `f64` evaluation, so the generations are ranked on the device predictions and every reported number (the archive, `fitness`, the objective) is the exact CPU `f64` rebuild. `--metric` keeps its device fit arm (the batched squared LM by default). Tiled residency keeps the CPU scorer with `backend_reason` `long_pnl fitness needs resident training rows (tiled residency: #293)`, and a refused book allocation falls back to the CPU with the refusal as `backend_reason`. See `gpu-backend.md`, section "Long/flat P&L regret on the device".
 * The checkpoint stores the kind and the book hash (rows, cost, threshold, `--min-trades`). Resuming with a different book exits 2, and so does resuming a `--fitness pnl` checkpoint without the flag.
-* `--json` carries `search_fitness` (`kind`, `rows`, `groups`, `cost_per_side`, `threshold`, `bound`, `min_trades`, `backend`, `book_hash`; `{"kind":"metric"}` without the flag). Each Pareto member gains `fitness: {train_regret, train_net, train_flips, train_exits, train_exposure}` in exact CPU `f64` (`train_net` is the excess net over cash), `train_error` stays the metric, and `objective.finalist.search_fitness` names `long_pnl_regret`.
+* `--json` carries `search_fitness` (`kind`, `rows`, `groups`, `cost_per_side`, `threshold`, `bound`, `min_trades`, `backend` (`cpu_f64`: the reported values), `book_hash`, `scorer` (`long_pnl_regret`), `scorer_backend` (`cuda` or `cpu`: what ranked the generations) and `scorer_values` (`screening_f32_predictions` or `exact_f64`); `{"kind":"metric"}` without the flag). Each Pareto member gains `fitness: {train_regret, train_net, train_flips, train_exits, train_exposure}` in exact CPU `f64` (`train_net` is the excess net over cash), `train_error` stays the metric, and `objective.finalist.search_fitness` names `long_pnl_regret`.
 
 Why the constants keep the metric fit. A fixed linear structure (`[1, tanh z24, tanh z3, vol]`, `h = 4`, stride 4, 5 bp per side) fitted five ways and priced exactly (net train / validation / test):
 

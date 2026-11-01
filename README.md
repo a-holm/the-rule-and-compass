@@ -638,10 +638,11 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--fit-polish f64|f32|off] [--refit-band F|inf] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
-     [--no-front-parents] [--linear-scaling]
+     [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--linear-scaling] [--reject-constant-offspring]
      [--selection lexicographic|afp]
+     [--mutation-mix classic|extended] [--tree-arity uniform|balanced] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
-     [--patience N]
+     [--patience N] [--patience-tol r] [--stop-on front[:W]]
      [--gpu] [--gpu-memory size] [--dispatch auto|device] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
      [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
@@ -762,8 +763,11 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   (lower is better, all-flat is 1). Constants are still fitted with `--metric`. It needs a
   trading `--objective` and exits 2 with `--predictor-samples`, `--fit-samples`, `--implicit`,
   `--min-holding` above 1, `--max-position` other than 1, multiple targets or overlapping rows.
-  It runs on the CPU; resume needs the same cost, threshold and rows. `--json` adds
-  `search_fitness` and a `fitness` block per Pareto member. See
+  On the GPU the device scores the regret natively, fused with the program interpreter
+  (`search_fitness.scorer_backend` `cuda`); it equals the CPU book on the device's own `f32`
+  predictions bit for bit, and every reported value stays exact CPU `f64`. Resume needs the
+  same cost, threshold and rows. `--json` adds `search_fitness` and a `fitness` block per
+  Pareto member. See
   [`docs/walkforward.md`](docs/walkforward.md) and
   [`docs/optimisation.md`](docs/optimisation.md).
 * Time-ordered runs, runs with a target spec and runs with `--require-validation`
@@ -821,7 +825,7 @@ run:
 | `--allow-target-structure` | run a D13c target for a diagnostic replay (warns, records `check.status = overridden` and a proxy table) |
 | `--require-clean-inputs` | refuse (exit 5) a run whose inputs include a construction column of the target spec; default off, the column is only recorded in `check.construction_in_vars` |
 | `--allow-overlap` (`rcsr enrich`, `rcsr prep`) | permit a `--label` stride below the horizon for horizons of 4 h and longer; without it such a label is refused. `--side short` and `--allow-short` are always refused: labels are long-only (action `{0,+1}`, long-side barriers, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge)) |
-| `--label long:<horizon>,fee=<bp>,...` (`rcsr enrich`; `fee=` is required, `fee=0` for none) | long-only label family `lbl_<name>_{fwd,y,long_net,action,t1,exit_ret,m_net,m_barrier,weight}`, the label report with hash and top 10 absolute moves in `<out>.labels.json` (rows reaching the declared locked test, `--locked-test` or the input declaration, are left out of its statistics and counted), the enrich report and `run.json` (`target_spec.label_report`); label columns are never `--vars` inputs, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge) |
+| `--label long:<horizon>,fee=<bp>,...` (`rcsr enrich`; `fee=` is required, `fee=0` for none) | long-only label family `lbl_<name>_{fwd,y,long_net,action,t1,exit_ret,m_net,m_barrier,weight}`, the label report with hash and top 10 absolute moves in `<out>.labels.json` (rows reaching the declared locked test, `--locked-test` or the input declaration, are left out of its statistics and counted; `<out>.enrich.json` leaves them out of every per-column statistic the same way and reports `rows_left_out`), the enrich report and `run.json` (`target_spec.label_report`); label columns are never `--vars` inputs, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |
 | `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
 | `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |
@@ -1013,10 +1017,11 @@ contain. The k-NN baseline's reference set is always all training rows; for up
 to eight inputs a k-d tree answers exact queries, and above that the exact
 brute-force path reuses one buffer (still `O(query_rows × reference_rows × d)`,
 so the 200k-under-a-minute result is a `d <= 8` claim). Only query rows can be
-sampled, with `--baseline-samples N` (default `512`; `0` = every row, and only
-for absolute/squared/log_squashed). The default cap keeps the exact
-`O(train²·d)` query bounded on large panels; the JSON reports reference/query
-rows, `capped`, SEMs and seconds. That is an unbiased estimate of the row-average
+sampled, with `--baseline-samples N` (any metric; default: every row up to
+20,000 training rows, a seeded sample of 512 above; `0` = every row). The
+default sample keeps the exact `O(train²·d)` query bounded on large panels; the
+JSON reports reference/query rows, `capped`, `sample_size`, `sample_seed`, SEMs
+and seconds. That is an unbiased estimate of the row-average
 loss, and `--json` reports train/test query rows and SEMs with the
 finite-population correction. The residual tests (Ljung–Box, Breusch–Pagan,
 skewness, excess kurtosis) are reported for the best solution; a small p-value

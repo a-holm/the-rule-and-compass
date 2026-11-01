@@ -1867,3 +1867,32 @@ fn a_search_with_min_and_max_fits_on_the_device() {
         g.fit_fallback_by_cause
     );
 }
+
+/// #284: with `--gpu --fit-strategy exact` the island threads fit on the CPU.
+/// That window is booked under `fit`, not `vary`, and the stages still close.
+#[cfg(feature = "cuda")]
+#[test]
+fn mixed_arm_books_the_island_cpu_fit_under_fit() {
+    use rcsr::gpu_stats::Stage;
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = sample(2000, 5);
+    let test = sample(60, 6);
+    let cfg = Config {
+        islands: 2,
+        pop: 48,
+        generations: 8,
+        fit_iters: 12,
+        fit_strategy: FitStrategy::Exact,
+        ..gpu_config(11)
+    };
+    let out = search::run(&cfg, &train, &test);
+    let g = out.gpu.as_ref().expect("a GPU report");
+    let l = &g.ledger;
+    assert_eq!(g.fit_attempts, 0, "the mixed arm fits on the CPU: {:?}", g);
+    assert!(l.stage_s(Stage::Fit) > 0.0, "island CPU fit must be booked as fit: {:?}", l);
+    assert!(l.stage_sum_s() <= l.wall_s() + 1e-9, "stages exceed wall: {:?}", l);
+    assert!(l.closure_residual().value.abs() < 0.01, "ledger does not close: {:?}", l);
+}
