@@ -114,6 +114,12 @@ CPU as cheaper for a valid plan. It is deliberately separate from
 `ill_conditioned`/`non_finite`, so a tuning route is never reported as an
 arithmetic defect.
 
+The fit arm plans the candidates that pass their own row floor (`32p` rows)
+once per batch, as `W` fits with the largest constant count `p`, because the
+device runs them as one launch and one transfer. The decision applies to every
+candidate of the batch, and the route ledger holds one `fit` call carrying
+`candidates = W`.
+
 ## Exactness
 
 Routing never changes the reported numbers. The device may guide the search with
