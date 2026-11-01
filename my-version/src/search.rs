@@ -966,8 +966,7 @@ impl GpuSearch {
         // Everything that judges or refits a device proposal sees the rows the
         // device fitted; the caller re-scores on every row afterwards.
         let fit_train: &Sample = fit_sample.as_ref().unwrap_or(train);
-        let mut jobs: Vec<(usize, usize, crate::fit::GpuFitPlan)> = Vec::new();
-        let mut job_decisions: Vec<crate::dispatch::Decision> = Vec::new();
+        let mut planned: Vec<(usize, usize, crate::fit::GpuFitPlan)> = Vec::new();
         let mut fallbacks: Vec<(usize, usize, FitFallbackCause)> = Vec::new();
         // #229: the objective the batched kernel minimises. #230: the rank
         // family has no LM loss but has its own exact device polish, so it is
@@ -1016,45 +1015,17 @@ impl GpuSearch {
                 {
                     fallbacks.push((i, j, FitFallbackCause::MetricNotNative))
                 }
-                Ok(plan) => {
-                    // #290: the per-stage cost model owns the row floor and the
-                    // crossover. Structural plan errors still carry their own
-                    // cause; only a valid plan reaches this timing comparison.
-                    let workload = crate::dispatch::Workload::fit(
-                        1,
-                        fit_train.len(),
-                        plan.nconst,
-                        cfg.fit_iters,
-                    )
-                    .with_min_rows(32 * plan.nconst);
-                    let workload = match fit_loss {
-                        Some(loss) => workload.with_objective(loss),
-                        None => workload,
-                    };
-                    let decision = dispatcher.plan(crate::dispatch::Stage::Fit, &workload);
-                    if decision.route == crate::dispatch::Route::Device {
-                        jobs.push((i, j, plan));
-                        job_decisions.push(decision);
-                    } else {
-                        // A cost-model refusal is a policy route, not an
-                        // arithmetic fallback: label it `dispatch_cost`.
-                        let cause = match decision.reason {
-                            crate::dispatch::Reason::TooFewRows => FitFallbackCause::TooFewRows,
-                            crate::dispatch::Reason::TooManyConstants => {
-                                FitFallbackCause::TooManyConstants
-                            }
-                            crate::dispatch::Reason::UnsupportedPlan => {
-                                FitFallbackCause::UnsupportedPlan
-                            }
-                            _ => FitFallbackCause::DispatchCost,
-                        };
-                        fallbacks.push((i, j, cause));
-                        dispatcher.record(decision, 0.0, 1, workload.bytes);
-                    }
-                }
+                Ok(plan) => planned.push((i, j, plan)),
                 Err(reason) => fallbacks.push((i, j, plan_fallback_cause(reason))),
             }
         }
+        // #453: the device runs the admitted candidates as one batch, so the
+        // cost model plans the batch once, not each candidate alone.
+        let batch = plan_fit_batch(dispatcher, fit_train.len(), cfg.fit_iters, fit_loss, planned);
+        let batch_bytes = batch.bytes;
+        let batch_decision = batch.decision;
+        fallbacks.extend(batch.refused);
+        let jobs = batch.jobs;
         self.fit_attempts += admitted.len();
         let stats = self.stats.entry(generation).or_default();
         stats.generation = generation;
@@ -1193,16 +1164,14 @@ impl GpuSearch {
                     crate::fit::note_gpu_fit(false);
                 }
             }
-            // #290: attribute the measured batch time to the planned device
-            // decisions. The actual is split evenly across the candidates: the
-            // kernel is one batch, so a per-candidate stopwatch would be noise.
-            let per = (ms.max(0.0) as f64 / 1000.0) / jobs.len() as f64;
-            for (decision, (_, _, plan)) in job_decisions.iter().zip(jobs.iter()) {
+            // #290: attribute the measured batch time to the one planned batch
+            // decision (#453).
+            if let Some(decision) = batch_decision {
                 dispatcher.record(
-                    *decision,
-                    per,
-                    1,
-                    crate::dispatch::estimate_fit_bytes(1, plan.nconst),
+                    decision,
+                    ms.max(0.0) as f64 / 1000.0,
+                    jobs.len(),
+                    batch_bytes,
                 );
             }
         }
@@ -3519,6 +3488,69 @@ impl FitFallbackCause {
             FitFallbackCause::AffineClosedForm => "affine_closed_form",
         }
     }
+}
+
+/// #453: the outcome of planning one fit batch.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct FitBatch {
+    /// Candidates the device will fit together.
+    jobs: Vec<(usize, usize, crate::fit::GpuFitPlan)>,
+    /// The batch decision; `None` when no candidate passed the row floor.
+    decision: Option<crate::dispatch::Decision>,
+    /// Workload bytes of the batch decision.
+    bytes: u64,
+    /// Candidates refused, with the cause each reports.
+    refused: Vec<(usize, usize, FitFallbackCause)>,
+}
+
+/// #453: plan the fit stage once for the whole batch.
+///
+/// Each candidate keeps its structural row floor (`32 * nconst` rows). The
+/// candidates that pass it form one workload of `W` fits with the largest
+/// constant count, because the device runs them as one launch with one
+/// transfer. The decision applies to every candidate in the batch.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn plan_fit_batch(
+    dispatcher: &mut crate::dispatch::Dispatcher,
+    rows: usize,
+    sweeps: usize,
+    loss: Option<crate::fit::DeviceLoss>,
+    plans: Vec<(usize, usize, crate::fit::GpuFitPlan)>,
+) -> FitBatch {
+    let mut refused = Vec::new();
+    let mut valid = Vec::with_capacity(plans.len());
+    for (i, j, plan) in plans {
+        if rows < 32 * plan.nconst {
+            refused.push((i, j, FitFallbackCause::TooFewRows));
+        } else {
+            valid.push((i, j, plan));
+        }
+    }
+    if valid.is_empty() {
+        return FitBatch { jobs: valid, decision: None, bytes: 0, refused };
+    }
+    let widest = valid.iter().map(|(_, _, p)| p.nconst).max().unwrap_or(1);
+    let workload = crate::dispatch::Workload::fit(valid.len(), rows, widest, sweeps)
+        .with_min_rows(32 * widest);
+    let workload = match loss {
+        Some(loss) => workload.with_objective(loss),
+        None => workload,
+    };
+    let decision = dispatcher.plan(crate::dispatch::Stage::Fit, &workload);
+    if decision.route == crate::dispatch::Route::Device {
+        return FitBatch { jobs: valid, decision: Some(decision), bytes: workload.bytes, refused };
+    }
+    // A cost-model refusal is a policy route, not an arithmetic fallback:
+    // label it `dispatch_cost`.
+    let cause = match decision.reason {
+        crate::dispatch::Reason::TooFewRows => FitFallbackCause::TooFewRows,
+        crate::dispatch::Reason::TooManyConstants => FitFallbackCause::TooManyConstants,
+        crate::dispatch::Reason::UnsupportedPlan => FitFallbackCause::UnsupportedPlan,
+        _ => FitFallbackCause::DispatchCost,
+    };
+    refused.extend(valid.iter().map(|(i, j, _)| (*i, *j, cause)));
+    dispatcher.record(decision, 0.0, valid.len(), workload.bytes);
+    FitBatch { jobs: Vec::new(), decision: Some(decision), bytes: workload.bytes, refused }
 }
 
 /// #169: map a structural fit-plan rejection to its reported cause.
@@ -7247,6 +7279,77 @@ fn run_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #453: `n` eligible `c0 * x0 + c1` plans, one constant pair each.
+    fn affine_plans(n: usize) -> Vec<(usize, usize, crate::fit::GpuFitPlan)> {
+        use crate::expr::{constant, input, node, Op};
+        (0..n)
+            .map(|k| {
+                let tree = node(
+                    Op::Add,
+                    vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.5)],
+                );
+                (0, k, crate::fit::gpu_fit_plan_reason(&tree).expect("an eligible plan"))
+            })
+            .collect()
+    }
+
+    /// A launch so expensive that one fit cannot amortise it but 64 can.
+    fn costly_launch() -> crate::dispatch::Dispatcher {
+        let mut cal = crate::dispatch::Calibration::default();
+        cal.launch_s = 5.0;
+        crate::dispatch::Dispatcher::new(cal)
+    }
+
+    /// #453: one candidate alone routes to the CPU, 64 together route to the
+    /// device, and the admission sends all 64 to the device.
+    #[test]
+    fn fit_batch_plans_the_batch_not_each_candidate() {
+        let rows = 2_456_306;
+        let alone = plan_fit_batch(&mut costly_launch(), rows, 8, None, affine_plans(1));
+        assert!(alone.jobs.is_empty(), "a batch of one pays the whole launch");
+        assert_eq!(alone.refused.len(), 1);
+        assert_eq!(alone.refused[0].2, FitFallbackCause::DispatchCost);
+
+        let batch = plan_fit_batch(&mut costly_launch(), rows, 8, None, affine_plans(64));
+        assert_eq!(batch.jobs.len(), 64);
+        assert!(batch.refused.is_empty());
+        let decision = batch.decision.expect("a batch decision");
+        assert_eq!(decision.route, crate::dispatch::Route::Device);
+    }
+
+    /// #453: a CPU batch labels every candidate `dispatch_cost` and the ledger
+    /// holds one fit call carrying all of them.
+    #[test]
+    fn fit_batch_ledger_has_one_decision_with_all_candidates() {
+        let rows = 2_456_306;
+        let mut d = crate::dispatch::Dispatcher::new(crate::dispatch::Calibration {
+            launch_s: 1.0e9,
+            ..crate::dispatch::Calibration::default()
+        });
+        let cpu = plan_fit_batch(&mut d, rows, 8, None, affine_plans(64));
+        assert_eq!(cpu.refused.len(), 64);
+        assert!(cpu.refused.iter().all(|r| r.2 == FitFallbackCause::DispatchCost));
+        let entry = d.ledger().entry(crate::dispatch::Stage::Fit).expect("fit row");
+        assert_eq!((entry.calls, entry.candidates), (1, 64));
+
+        let mut d = costly_launch();
+        let batch = plan_fit_batch(&mut d, rows, 8, None, affine_plans(64));
+        d.record(batch.decision.unwrap(), 0.0, batch.jobs.len(), batch.bytes);
+        let entry = d.ledger().entry(crate::dispatch::Stage::Fit).expect("fit row");
+        assert_eq!((entry.calls, entry.candidates), (1, 64));
+    }
+
+    /// #453: a candidate below its own `32 * nconst` row floor keeps its
+    /// structural `too_few_rows` cause and does not join the batch.
+    #[test]
+    fn fit_batch_keeps_the_per_candidate_row_floor() {
+        let batch = plan_fit_batch(&mut costly_launch(), 40, 8, None, affine_plans(3));
+        assert!(batch.jobs.is_empty());
+        assert_eq!(batch.refused.len(), 3);
+        assert!(batch.refused.iter().all(|r| r.2 == FitFallbackCause::TooFewRows));
+        assert!(batch.decision.is_none());
+    }
 
     #[test]
     fn gpu_fit_off_reason_follows_the_fit_decision() {
