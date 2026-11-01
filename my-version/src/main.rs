@@ -662,6 +662,11 @@ SEARCH:
                              different saved value
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
   --no-dedup                 disable structural de-duplication
+  --linear-scaling           wrap every candidate shape f in a fitted affine output
+                             map a + b*f(x), so a shape that is right up to scale
+                             and offset scores as right at once. Needs a
+                             least-squares metric (squared, aic, aicc, bic) and
+                             constant fitting; single target; off by default (#470)
   --no-front-parents         draw every parent from the island tournament;
                              turns off the 15% Pareto-front feedback (#76)
                              and restores the pre-#76 trajectory exactly
@@ -2343,6 +2348,7 @@ fn main() {
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
     let mut front_parents_set = false;
+    let mut linear_scaling_set = false; // #470
     // #25: `--units` is resolved against the prepared input list later; the
     // expressions themselves are parsed here so a typo is a usage error.
     let mut unit_assignments: Vec<(String, Unit)> = Vec::new();
@@ -2821,6 +2827,11 @@ fn main() {
                 if cfg.qd_bins == 0 {
                     cfg.qd_bins = 512;
                 }
+            }
+            // #470: opt-in affine output map around every candidate.
+            "--linear-scaling" => {
+                cfg.linear_scaling = true;
+                linear_scaling_set = true;
             }
             // #76: exactness escape hatch; the default is on.
             "--no-front-parents" => {
@@ -3386,6 +3397,10 @@ fn main() {
                 cfg.fit_fallback_max, saved.fit_fallback_max
             ));
         }
+        // #470: linear scaling is saved search state.
+        if linear_scaling_set && !saved.linear_scaling {
+            conflicts.push("--linear-scaling (saved linear_scaling is false)".to_string());
+        }
         // #76: front feedback is saved search state.
         if front_parents_set && cfg.front_parents != saved.front_parents {
             conflicts.push(format!(
@@ -3616,6 +3631,7 @@ fn main() {
             (null_block > 0, "--null-block"),
             (bootstrap_resamples > 0, "--bootstrap-error"),
             (cfg.metric == Metric::Slope, "--metric slope (its row pairs follow one target column)"),
+            (cfg.linear_scaling, "--linear-scaling"),
             (stability_runs > 0, "--stability"),
             (report.is_some(), "--report"),
             (run_manifest_path.is_some(), "--run-manifest"),
@@ -3629,6 +3645,22 @@ fn main() {
                 );
                 std::process::exit(EXIT_USAGE);
             }
+        }
+    }
+
+    if cfg.linear_scaling {
+        let refusal = if !cfg.metric.is_least_squares() {
+            Some("linear scaling needs a least-squares metric (squared, aic, aicc, bic)")
+        } else if cfg.fit_iters == 0 {
+            Some("linear scaling needs constant fitting (--fit-iters > 0, no --no-fit)")
+        } else if cfg.variation == rcsr::search::VariationMode::Postfix {
+            Some("linear scaling needs constant fitting, which --variation postfix does not do")
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            eprintln!("error: --linear-scaling: {}", reason);
+            std::process::exit(EXIT_USAGE);
         }
     }
 
