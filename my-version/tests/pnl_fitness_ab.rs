@@ -167,8 +167,8 @@ fn run_arm(dir: &Path, feat: &Path, spec: &Path, arm: &Arm, generations: usize, 
         front,
         search_s,
         sec_per_gen: search_s / generations as f64,
-        eval_s: phase("eval"),
-        fit_s: phase("fit"),
+        eval_s: phase("eval_cpu"),
+        fit_s: phase("fit_cpu"),
         device_frac: opt_num(end, &["device_fraction_of_run"]),
         wf_net: opt_num(&wf, &["pooled", "total_return"]),
         wf_min_window: window_returns.iter().cloned().fold(f64::INFINITY, f64::min),
@@ -206,7 +206,7 @@ fn pnl_fitness_against_metric_fitness() {
         .map(|k| format!("w{},{},{},{},{}", k + 1, t0, first + k * step - 5 * HOUR, first + k * step, first + (k + 1) * step - HOUR))
         .collect();
 
-    println!("backend fitness seed | val_net test_net test_sharpe test_trades test_exposure front | search_s s/gen eval_s fit_s dev_frac | wf_net wf_min_win wf_trades wf_exposure wf_sharpe wf_dsr wf_se");
+    println!("backend fitness seed | val_net test_net test_sharpe test_trades test_exposure front | search_s s/gen eval_cpu_s fit_cpu_s dev_frac | wf_net wf_min_win wf_trades wf_exposure wf_sharpe wf_dsr wf_se");
     let mut rows: Vec<(&str, &str, u64, ArmResult)> = Vec::new();
     for backend in &backends {
         let backend: &'static str = if backend == "gpu" { "gpu" } else { "cpu" };
