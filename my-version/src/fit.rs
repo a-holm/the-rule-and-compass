@@ -3256,11 +3256,12 @@ pub fn fit_weighted_metric(
         | Maximum
         | Interquartile
         | Slope => {
-            let start = metric_score(tree, x, y, w, metric);
+            let cols = FitCols::gather(tree, x);
+            let start = metric_score_cols(tree, x, &cols, y, w, metric);
             let mut trial = tree.clone();
             fit_weighted(&mut trial, x, y, w, iters);
-            coordinate_polish(&mut trial, x, y, w, metric, iters.max(1));
-            let score = metric_score(&trial, x, y, w, metric);
+            coordinate_polish_cols(&mut trial, x, &cols, y, w, metric, iters.max(1));
+            let score = metric_score_cols(&trial, x, &cols, y, w, metric);
             if improves(score, start) {
                 *tree = trial;
                 score
@@ -3282,14 +3283,15 @@ pub fn fit_weighted_metric(
         // manifold.
         Signed => {
             fit_weighted(tree, x, y, w, iters);
-            let before = metric_score(tree, x, y, w, metric);
+            let cols = FitCols::gather(tree, x);
+            let before = metric_score_cols(tree, x, &cols, y, w, metric);
             let outcome = signed_projection(tree, x, y, w, 2);
-            let after = metric_score(tree, x, y, w, metric);
+            let after = metric_score_cols(tree, x, &cols, y, w, metric);
             let moved = after.is_finite() && before.is_finite() && after < before;
             if !outcome.is_projected() && !moved {
-                coordinate_polish(tree, x, y, w, metric, iters.max(1));
+                coordinate_polish_cols(tree, x, &cols, y, w, metric, iters.max(1));
             }
-            metric_score(tree, x, y, w, metric)
+            metric_score_cols(tree, x, &cols, y, w, metric)
         }
     }
 }
@@ -3326,8 +3328,9 @@ pub fn fit_slope_pairs(
     pairs: &[[u32; 2]],
     iters: usize,
 ) -> f64 {
+    let cols = FitCols::gather(tree, x);
     let score_of = |t: &Node| {
-        metrics::score_slope_pairs(&predictions(t, x), y, pairs)
+        cols.with_predictions(t, x, |pred| metrics::score_slope_pairs(pred, y, pairs))
     };
     let start = score_of(tree);
     if iters == 0 {
@@ -3573,6 +3576,82 @@ fn metric_score(tree: &Node, x: &[Vec<f64>], y: &[f64], w: &[f64], metric: Metri
     metrics::score_weighted(&pred, y, w, metric, expr::count_constants(tree))
 }
 
+/// #473: the input columns a tree reads, gathered once per fit call so every
+/// probe scores through the compiled evaluator instead of the pointer walk.
+///
+/// `cols[var][row]`; a variable the tree does not read stays empty, and a row
+/// shorter than the variable index reads `NaN`, as in [`expr::eval`]. A tree
+/// that [`crate::eval_soa::compile`] rejects gathers nothing and every
+/// prediction takes the row walk.
+pub(crate) struct FitCols {
+    cols: Vec<Vec<f64>>,
+    rows: usize,
+    scratch: std::cell::RefCell<Vec<f64>>,
+}
+
+impl FitCols {
+    pub(crate) fn gather(tree: &Node, x: &[Vec<f64>]) -> FitCols {
+        fn used(n: &Node, out: &mut Vec<usize>) {
+            if n.op == Op::Input {
+                out.push(n.val as usize);
+            }
+            for k in &n.kids {
+                used(k, out);
+            }
+        }
+        let mut cols = Vec::new();
+        if crate::eval_soa::compile(tree).is_some() {
+            let mut vars = Vec::new();
+            used(tree, &mut vars);
+            vars.sort_unstable();
+            vars.dedup();
+            cols.resize_with(vars.last().map_or(0, |&v| v + 1), Vec::new);
+            for var in vars {
+                cols[var] = x
+                    .iter()
+                    .map(|row| row.get(var).copied().unwrap_or(f64::NAN))
+                    .collect();
+            }
+        }
+        FitCols {
+            cols,
+            rows: x.len(),
+            scratch: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Run `f` on the predictions of `tree`, held in a buffer that lives as long
+    /// as this view.
+    fn with_predictions<R>(&self, tree: &Node, x: &[Vec<f64>], f: impl FnOnce(&[f64]) -> R) -> R {
+        let mut out = self.scratch.borrow_mut();
+        out.clear();
+        match crate::eval_soa::compile(tree) {
+            Some(program) => {
+                out.resize(self.rows, 0.0);
+                crate::eval_soa::eval_batch(&program, &self.cols, self.rows, &mut out);
+            }
+            None => out.extend(x.iter().map(|row| expr::eval(tree, row))),
+        }
+        f(&out)
+    }
+}
+
+/// [`metric_score`] on the compiled evaluator.
+fn metric_score_cols(
+    tree: &Node,
+    x: &[Vec<f64>],
+    cols: &FitCols,
+    y: &[f64],
+    w: &[f64],
+    metric: Metric,
+) -> f64 {
+    if x.len() != y.len() || (!w.is_empty() && w.len() != x.len()) {
+        return f64::INFINITY;
+    }
+    let k = expr::count_constants(tree);
+    cols.with_predictions(tree, x, |pred| metrics::score_weighted(pred, y, w, metric, k))
+}
+
 /// The metric-monotone keep rule: a trial replaces the incumbent only when its
 /// score is finite and strictly lower. Two infinite scores never compare as an
 /// improvement.
@@ -3633,7 +3712,8 @@ where
     if x.len() != y.len() || (!w.is_empty() && w.len() != x.len()) {
         return f64::INFINITY;
     }
-    let mut best = metric_score(tree, x, y, w, metric);
+    let cols = FitCols::gather(tree, x);
+    let mut best = metric_score_cols(tree, x, &cols, y, w, metric);
     if !best.is_finite() {
         return best;
     }
@@ -3654,12 +3734,12 @@ where
         if best == 0.0 {
             return best;
         }
-        let Some((target, weights)) = pairs(&predictions(tree, x)) else {
+        let Some((target, weights)) = cols.with_predictions(tree, x, pairs) else {
             return best;
         };
         let mut trial = tree.clone();
         fit_weighted(&mut trial, x, &target, &weights, inner);
-        let score = metric_score(&trial, x, y, w, metric);
+        let score = metric_score_cols(&trial, x, &cols, y, w, metric);
         if improves(score, best) {
             best = score;
             *tree = trial;
@@ -3673,10 +3753,10 @@ where
     if best == 0.0 {
         return best;
     }
-    if let Some((target, weights)) = pairs(&predictions(tree, x)) {
+    if let Some((target, weights)) = cols.with_predictions(tree, x, pairs) {
         let mut trial = tree.clone();
         fit_weighted(&mut trial, x, &target, &weights, last);
-        let score = metric_score(&trial, x, y, w, metric);
+        let score = metric_score_cols(&trial, x, &cols, y, w, metric);
         if improves(score, best) {
             best = score;
             *tree = trial;
@@ -3874,9 +3954,24 @@ fn logistic_irls_counted(
 /// order-independent, which is what lets the CUDA rank stage reproduce this
 /// ladder constant for constant (see [`rank::polish_rank_batch`]). The target
 /// ranks are computed once per call instead of once per trial.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn coordinate_polish(
     tree: &mut Node,
     x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    metric: Metric,
+    sweeps: usize,
+) {
+    let cols = FitCols::gather(tree, x);
+    coordinate_polish_cols(tree, x, &cols, y, w, metric, sweeps);
+}
+
+/// [`coordinate_polish`] over columns gathered by the caller (#473).
+fn coordinate_polish_cols(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    cols: &FitCols,
     y: &[f64],
     w: &[f64],
     metric: Metric,
@@ -3890,11 +3985,8 @@ pub(crate) fn coordinate_polish(
         _ => None,
     };
     let score_of = |tree: &Node| match (&target, signed) {
-        (Some(t), Some(signed)) => {
-            let pred = predictions(tree, x);
-            t.score(&pred, signed)
-        }
-        _ => metric_score(tree, x, y, w, metric),
+        (Some(t), Some(signed)) => cols.with_predictions(tree, x, |pred| t.score(pred, signed)),
+        _ => metric_score_cols(tree, x, cols, y, w, metric),
     };
     coordinate_polish_by(tree, sweeps, &score_of);
 }
