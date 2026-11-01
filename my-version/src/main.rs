@@ -254,6 +254,9 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   --allow-target-structure   run a D13c target anyway for a diagnostic replay: warns,
                              records check.status=overridden and a proxy table.
                              D13a and D13b have no override
+  --require-clean-inputs   refuse (exit 5) a run whose inputs include a construction column of the
+                             target spec (for example the vol96 scale of lbl_*_y); without the flag
+                             the column is only recorded in check.construction_in_vars
                              (it reads the next bar; otherwise refused)
   --center <how>             subtract mean (default), median, min, max or none
   --scale <how>              divide by std (default), iqr, range or none
@@ -2177,6 +2180,7 @@ fn main() {
     // #254: declared target spec and the structural-term override.
     let mut target_spec_path: Option<String> = None;
     let mut allow_target_structure = false;
+    let mut require_clean_inputs = false;
     let mut require_validation = false;
     let mut equivalence_z = rcsr::gate_run::DEFAULT_Z;
     let mut noise_lag_arg: Option<String> = None;
@@ -2468,6 +2472,7 @@ fn main() {
             "--allow-lockbox" => allow_lockbox = true,
             "--target-spec" => target_spec_path = Some(val!()),
             "--allow-target-structure" => allow_target_structure = true,
+            "--require-clean-inputs" => require_clean_inputs = true,
             "--require-validation" => require_validation = true,
             "--equivalence-z" => {
                 let v = val!();
@@ -3523,9 +3528,13 @@ fn main() {
         eprintln!("error: --allow-target-structure needs a target spec (--target-spec or <data>.targets.json)");
         std::process::exit(EXIT_USAGE);
     }
+    if require_clean_inputs && target_resolved.is_none() {
+        eprintln!("error: --require-clean-inputs needs a target spec (--target-spec or <data>.targets.json)");
+        std::process::exit(EXIT_USAGE);
+    }
     let mut target_check: Option<target::Check> = None;
     if let (Some(r), false) = (&target_resolved, vars.is_empty()) {
-        target_check = Some(enforce_target_check(&r.spec, &vars, allow_target_structure));
+        target_check = Some(enforce_target_check(&r.spec, &vars, allow_target_structure, require_clean_inputs));
     }
 
     // #71/#112: the guard and the backing choice happen before any resident
@@ -3637,7 +3646,17 @@ fn main() {
                         .filter(|c| c.numeric && !excluded.contains(&c.name.as_str()))
                         .map(|c| c.name.clone())
                         .collect();
-                    match registry::select_view(&candidates, size, cfg.seed as u64, view_index) {
+                    let construction: Vec<(String, String)> = target_resolved
+                        .as_ref()
+                        .map(|r| {
+                            r.spec
+                                .construction_columns
+                                .iter()
+                                .map(|c| (c.clone(), format!("construction column of {}", r.spec.column)))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    match registry::select_view_excluding(&candidates, size, cfg.seed as u64, view_index, &construction) {
                         Ok(v) => {
                             eprintln!(
                                 "view {}: {} columns from {} families (seed {}, view {})",
@@ -3647,6 +3666,15 @@ fn main() {
                                 v.seed,
                                 v.view
                             );
+                            if v.delivered < v.size {
+                                eprintln!(
+                                    "view {}: requested {} columns, delivered {}: {} candidate famil(ies) at most two columns each",
+                                    v.id,
+                                    v.size,
+                                    v.delivered,
+                                    v.families.len()
+                                );
+                            }
                             vars = v.columns.clone();
                             view_record = Some(v);
                         }
@@ -4077,7 +4105,7 @@ fn main() {
         std::process::exit(EXIT_LEAKAGE);
     }
     if let (Some(r), None) = (&target_resolved, &target_check) {
-        target_check = Some(enforce_target_check(&r.spec, &vars, allow_target_structure));
+        target_check = Some(enforce_target_check(&r.spec, &vars, allow_target_structure, require_clean_inputs));
     }
 
     let known_vars: Vec<usize> = vars.iter().filter_map(|v| table.index_of(v).ok()).collect();
@@ -7596,8 +7624,17 @@ fn enforce_target_check(
     spec: &target::TargetSpec,
     vars: &[String],
     allow_structure: bool,
+    require_clean: bool,
 ) -> target::Check {
     match target::check(spec, vars, allow_structure) {
+        Ok(check) if require_clean && !check.construction_in_vars.is_empty() => {
+            eprintln!(
+                "error: --require-clean-inputs: construction column(s) of target '{}' are inputs: {}",
+                spec.column,
+                check.construction_in_vars.join(", ")
+            );
+            std::process::exit(EXIT_LEAKAGE);
+        }
         Ok(check) => check,
         Err(report) => {
             if let Err(failure) = report.result() {

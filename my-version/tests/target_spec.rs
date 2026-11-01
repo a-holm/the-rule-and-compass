@@ -900,3 +900,20 @@ fn label_columns_are_never_inputs_named_or_default() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn require_clean_inputs_refuses_a_construction_column_in_vars() {
+    let dir = scratch();
+    let rows = grid(900, 120, 1);
+    let data = write_csv(&dir, "d.csv", &rows, false);
+    let spec = Spec::gross("yg").write(&dir, "s.json");
+    let b = T0 + 900 * 90;
+    let sel = select(T0 + 900 * 80, b);
+    let out = run(&data, &spec, "yg", "sigma,x", &with_select(&sel, &["--require-clean-inputs"]));
+    assert_eq!(code(&out), 5, "{}", stderr(&out));
+    assert!(stderr(&out).contains("sigma"), "{}", stderr(&out));
+    let clean = run(&data, &spec, "yg", "x", &with_select(&sel, &["--require-clean-inputs"]));
+    assert_eq!(code(&clean), 0, "{}", stderr(&clean));
+    let off = run(&data, &spec, "yg", "sigma,x", &with_select(&sel, &[]));
+    assert_eq!(code(&off), 0, "{}", stderr(&off));
+}

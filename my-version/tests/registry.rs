@@ -797,3 +797,55 @@ fn a_view_records_every_omitted_column_and_the_registry_still_lists_it() {
     assert!(json.contains("\"omitted\":[{\"name\":"), "{json}");
     assert!(json.contains("\"reason\":"), "{json}");
 }
+
+fn construction(col: &str) -> Vec<(String, String)> {
+    vec![(col.to_string(), "construction column of lbl_h1_y".to_string())]
+}
+
+#[test]
+fn project_never_draws_construction_columns() {
+    let names = feature_names();
+    let scale = "vol96".to_string();
+    assert!(names.contains(&scale));
+    let excluded = construction(&scale);
+    let mut drawn_without = false;
+    for seed in 0..100u64 {
+        for view in 0..4usize {
+            let plain = registry::select_view(&names, 36, seed, view).unwrap();
+            drawn_without |= plain.columns.contains(&scale);
+            let v = registry::select_view_excluding(&names, 36, seed, view, &excluded).unwrap();
+            assert!(!v.columns.contains(&scale), "seed {seed} view {view}");
+            assert!(!v.families.iter().any(|(_, c)| c.contains(&scale)));
+            let row = v.omitted.iter().find(|(n, _, _)| *n == scale).expect("listed as omitted");
+            assert_eq!(row.2, "construction column of lbl_h1_y");
+            assert_eq!(row.1, "vol");
+        }
+    }
+    assert!(drawn_without, "the unfiltered sweep never draws the scale column");
+}
+
+#[test]
+fn view_records_requested_and_delivered_sizes() {
+    let names = feature_names();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut sixteen: Vec<String> = Vec::new();
+    for n in &names {
+        if let Some(r) = registry::lookup(n) {
+            if r.available && !r.input && r.causal_offset <= 0 {
+                if seen.contains(&r.family) || seen.len() < 16 {
+                    seen.insert(r.family);
+                    sixteen.push(n.clone());
+                }
+            }
+        }
+    }
+    assert_eq!(seen.len(), 16);
+    let v = registry::select_view(&sixteen, 36, 11, 0).unwrap();
+    assert_eq!(v.delivered, v.columns.len());
+    assert!(v.delivered < 36 && v.delivered <= 32, "{}", v.delivered);
+    let json = v.json();
+    assert!(json.contains("\"requested\":36"), "{json}");
+    assert!(json.contains(&format!("\"delivered\":{}", v.delivered)), "{json}");
+    let full = registry::select_view(&names, 36, 11, 0).unwrap();
+    assert_eq!(full.delivered, full.columns.len());
+}
