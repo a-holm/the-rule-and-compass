@@ -306,6 +306,8 @@ pub struct Options {
     pub allow_overlap: bool,
     /// #485: keep only the symbols of a pinned universe file.
     pub symbols: Option<SymbolList>,
+    /// `--locked-test START,END|none`, written to the manifest of the store.
+    pub locked_test: crate::lockbox::Keep,
 }
 
 impl Default for Options {
@@ -330,6 +332,7 @@ impl Default for Options {
             allow_lockbox: false,
             allow_overlap: false,
             symbols: None,
+            locked_test: crate::lockbox::Keep::Unset,
         }
     }
 }
@@ -2138,6 +2141,13 @@ pub fn run(args: &[String]) -> ! {
             "--resume" => opts.resume = Some(val!()),
             "--dry-run" => opts.dry_run = true,
             "--allow-lockbox" => opts.allow_lockbox = true,
+            "--locked-test" => match crate::lockbox::Keep::parse(&val!()) {
+                Ok(k) => opts.locked_test = k,
+                Err(e) => {
+                    eprintln!("error: --locked-test: {}", e);
+                    std::process::exit(EXIT_USAGE);
+                }
+            },
             "--allow-overlap" => opts.allow_overlap = true,
             "--symbols" => match read_symbol_list(&val!()) {
                 Ok(l) => opts.symbols = Some(l),
@@ -2187,10 +2197,21 @@ pub fn run(args: &[String]) -> ! {
             fail(&e);
         }
     }
-    let build = match build(&opts) {
+    let declared = match &opts.out {
+        Some(out) => crate::lockbox::output_declaration(out, None, opts.locked_test),
+        None => crate::lockbox::output_declaration("", None, opts.locked_test),
+    }
+    .unwrap_or_else(|e| {
+        eprintln!("error: {}", e.message);
+        std::process::exit(e.exit);
+    });
+    let mut build = match build(&opts) {
         Ok(b) => b,
         Err(e) => fail(&e),
     };
+    if let Some(lt) = &declared {
+        build.manifest = crate::lockbox::insert_declaration(&build.manifest, lt, None, "rcsr prep --locked-test");
+    }
     for line in build.audit.text_lines() {
         println!("{}", line);
     }
@@ -2217,6 +2238,9 @@ pub fn run(args: &[String]) -> ! {
     }
     if let Err(e) = std::fs::write(&manifest_path, text) {
         fail(&format!("{}: {}", manifest_path, e));
+    }
+    if let Err(e) = crate::lockbox::finish_output(&out, declared.as_ref(), &["manifest.json"]) {
+        fail(&e.message);
     }
     eprintln!(
         "prep: {} rows x {} cols -> {} ({} bytes, {:.1} MiB), manifest {}",
@@ -2271,6 +2295,9 @@ TRANSFORMS:
   --out, -o <store.rcsb>  output store (required unless --dry-run)
   --dry-run               print the audit and manifest, write nothing
   --allow-lockbox         permit labelled rows in 2026H2 (final test only)
+  --locked-test START,END|none
+                          protocol locked test written to <out>.manifest.json; a
+                          rebuild of a declared output must repeat it (exit 2)
 
 FEATURES (explicit names):
   ret1 ret5 ma20_ratio ma60_ratio bb20_z atr14 natr14 rsi14 adx14 di_plus

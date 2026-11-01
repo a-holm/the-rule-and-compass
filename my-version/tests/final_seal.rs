@@ -380,3 +380,66 @@ fn a_final_read_never_scores_the_locked_rows_of_the_other_candidates() {
     assert_eq!(fin.windows[0].test_rows, alone.windows[0].test_rows);
     assert_eq!(fin.windows[0].validation_error, full.windows[0].validation_error);
 }
+
+#[test]
+fn a_locked_read_refuses_a_range_other_than_the_one_developed_against() {
+    let dir = scratch("bound-range");
+    let data = store(&dir, "d.csv");
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+    dev(&data, &l, &["x"], &[]);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let ledger_text = std::fs::read_to_string(&l).unwrap();
+    let (start, end) = (T0 + 300 * H, T0 + 400 * H);
+    let bound = format!("\"locked_test\":{{\"start\":{},\"end\":{},\"source\":\"store\"}}", start, end);
+    assert!(ledger_text.contains(&bound), "{}", ledger_text);
+    assert!(std::fs::read_to_string(&sealed).unwrap().contains(&bound));
+
+    // the store declaration changes after development: same data bytes, other range
+    lockbox::write_sidecar(&data, &Lockbox { start, end: end + H }, "test").unwrap();
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &[]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("was developed against the locked test"), "{}", err);
+    // a flag that widens the range is refused the same way
+    lockbox::write_sidecar(&data, &Lockbox { start, end }, "test").unwrap();
+    let wide = format!("{},{}", start - H, end);
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--lockbox", &wide]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("was developed against the locked test"), "{}", err);
+    assert!(!Path::new(&format!("{}.locked_reads.jsonl", data)).exists(), "a refused read leaves no marker");
+
+    // the same range reads once, and the read line carries the range
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &[]);
+    assert_eq!(code, 0, "{}", err);
+    let last = std::fs::read_to_string(&l).unwrap().lines().last().unwrap().to_string();
+    assert!(last.contains("\"event\":\"test_read\"") && last.contains(&bound), "{}", last);
+}
+
+#[test]
+fn a_ledger_without_a_recorded_range_needs_the_unbound_flag() {
+    let dir = scratch("unbound");
+    let data = store(&dir, "d.csv");
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+    dev(&data, &l, &["x"], &[]);
+    // rewrite the ledger as an old one: no locked_test member, hash chain recomputed
+    let mut old: Vec<String> = Vec::new();
+    let mut prev = "0".repeat(64);
+    for line in std::fs::read_to_string(&l).unwrap().lines() {
+        let at = line.find("\"locked_test\":{").unwrap();
+        let close = line[at..].find("},").unwrap() + at + 2;
+        let stripped = format!("{}{}", &line[..at], &line[close..]);
+        let line = format!("{{\"prev\":\"{}\"{}", prev, &stripped[stripped.find(',').unwrap()..]);
+        prev = rcsr::manifest::sha256_hex(line.as_bytes());
+        old.push(line);
+    }
+    let l_old = s(&dir.join("old.jsonl"));
+    std::fs::write(&l_old, old.join("\n") + "\n").unwrap();
+    let (code, _, err) = rcsr(&["protocol", "seal", "--ledger", &l_old, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, _, err) = read(&data, &l_old, &sealed, &["x"], &[]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("--allow-unbound-ledger"), "{}", err);
+    let (code, _, err) = read(&data, &l_old, &sealed, &["x"], &["--allow-unbound-ledger"]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(err.contains("unbound"), "{}", err);
+}

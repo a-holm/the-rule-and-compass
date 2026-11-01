@@ -782,8 +782,9 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   [`docs/panel.md`](docs/panel.md#the-2026h2-lockbox).
 * The protocol locked test (2025-07-01..2026-07-01, or the range declared with the data) guards every evaluator: search, `walkforward`, `ladder`, `ablation`, `enrich` and `audit`. Undeclared data gets the default. `--lockbox none` is the only opt-out and the report records `"source":"none"`. A flag that narrows a stored declaration, and conflicting declaration files, are refused. See [`docs/panel.md`](docs/panel.md#the-declared-locked-test).
 * The protocol locked test is declared once, with the data
-  (`rcsr panel build --locked-test START,END`; `panel append`, `enrich` and
-  `ablation prepare` copy it). The search, `walkforward`, `ladder` and
+  (`rcsr panel base`, `prep` or `panel build --locked-test START,END`; `panel build`,
+  `panel append`, `enrich` and `ablation prepare` copy it, and a writer never drops or
+  changes it silently: exit 2 unless the flag repeats it or says `none`). The search, `walkforward`, `ladder` and
   `ablation score` then refuse any split or window that touches it (exit 3).
   Only `walkforward --locked-test` and `ladder --locked-test`, both with
   `--ledger` and `--sealed`, read it, once each; see

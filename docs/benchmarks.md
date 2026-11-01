@@ -471,6 +471,7 @@ rcsr-bench compare --base a.ndjson[,a2.ndjson] --treat b.ndjson[,b2.ndjson] \
 ```
 
 * Pairs runs by `(suite, problem, noise, seed)`. It exits 2 when the two sides do not hold the same set of keys, when a key repeats, or when the `config` objects differ in anything other than `knobs` and `build` (a different data generator or threshold cannot be compared by accident).
+* A pair whose criterion is undefined (`null`) on either side is left out of every statistic. The output gives the dropped count and lists the dropped keys (`dropped` with `count` and `keys` in `--json`). It exits 2 when the criterion is undefined for every pair.
 * Prints both rates with Wilson 95 % intervals, the discordant counts `b` (base only) and `c` (treat only) and the exact two-sided McNemar p-value `min(1, 2 P(X <= min(b, c)))`, `X ~ Binomial(b + c, 1/2)`.
 * Prints the median paired ratio `treat.hit_s / base.hit_s` and `hit_evals` over pairs where both hit, the median paired `front_hv` difference, the summed `seconds` of both sides and a per-problem table (base hits, treat hits, wins, losses).
 * `hit_evals` is exact and independent of machine load; `hit_s` is wall time. Compare time on an otherwise idle machine and prefer `hit_evals` when the load varies.

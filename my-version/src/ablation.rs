@@ -1738,10 +1738,20 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             .map_err(|e| (3, e))?;
             let out = fl.need("--out")?;
             std::fs::write(out, csv).map_err(|e| io_err(out, e))?;
-            if let Some(lb) = &range {
-                let seg = format!(",\"segments\":{{\"before\":{},\"locked\":{},\"after\":{}}}", segments[0], segments[1], segments[2]);
-                crate::lockbox::write_sidecar_with(out, lb, &format!("rcsr ablation prepare ({})", resolved.source.as_str()), &seg).map_err(|e| (3, e))?;
+            match &range {
+                Some(lb) => {
+                    let seg = format!(",\"segments\":{{\"before\":{},\"locked\":{},\"after\":{}}}", segments[0], segments[1], segments[2]);
+                    let extra = format!("{}{}", crate::lockbox::also_json(resolved.sidecar_also().as_ref(), "rcsr ablation prepare"), seg);
+                    crate::lockbox::write_sidecar_with(out, lb, &format!("rcsr ablation prepare ({})", resolved.source.as_str()), &extra).map_err(|e| (3, e))?;
+                }
+                None => {
+                    let stale = crate::lockbox::sidecar_path(out);
+                    if Path::new(&stale).exists() {
+                        std::fs::remove_file(&stale).map_err(|e| io_err(&stale, e))?;
+                    }
+                }
             }
+            crate::lockbox::finish_output(out, range.as_ref(), &["lockbox.json"]).map_err(|e| (e.exit, e.message))?;
             println!("wrote {}", out);
             Ok(())
         }
