@@ -79,6 +79,8 @@ pub const SCHEMES: [&str; 3] = ["expanding", "rolling", "locked"];
 
 pub fn default_windows(purge_seconds: f64) -> Vec<WindowRow> {
     let dev_start = month_start(2022, 1, 0);
+    let locked_start = month_start(2025, 7, 0);
+    let dev_end = locked_start - purge_seconds;
     let mut rows = Vec::new();
     let quarter = |scheme: &str, label: String, train_start: f64, test_start: f64, test_end: f64| WindowRow {
         scheme: scheme.to_string(),
@@ -97,7 +99,7 @@ pub fn default_windows(purge_seconds: f64) -> Vec<WindowRow> {
     for step in 0..10 {
         let months = 12 + step * MONTHS_PER_QUARTER;
         let test_start = month_start(2022, 1, months);
-        let test_end = month_start(2022, 1, months + MONTHS_PER_QUARTER);
+        let test_end = month_start(2022, 1, months + MONTHS_PER_QUARTER).min(dev_end);
         let (y, m) = civil_ym(test_start);
         rows.push(quarter(
             "expanding",
@@ -110,7 +112,7 @@ pub fn default_windows(purge_seconds: f64) -> Vec<WindowRow> {
     for step in 0..6 {
         let months = 24 + step * MONTHS_PER_QUARTER;
         let test_start = month_start(2022, 1, months);
-        let test_end = month_start(2022, 1, months + MONTHS_PER_QUARTER);
+        let test_end = month_start(2022, 1, months + MONTHS_PER_QUARTER).min(dev_end);
         let (y, m) = civil_ym(test_start);
         rows.push(quarter(
             "rolling",
@@ -124,7 +126,7 @@ pub fn default_windows(purge_seconds: f64) -> Vec<WindowRow> {
         "locked",
         "locked-test".to_string(),
         dev_start,
-        month_start(2025, 7, 0),
+        locked_start,
         month_start(2026, 7, 0),
     ));
     rows

@@ -974,13 +974,18 @@ pub fn purge_line(spec: &TargetSpec, report: &crate::data::SplitReport) -> Strin
 pub fn split_purge_json(r: &crate::data::SplitReport) -> String {
     let n = |v: Option<f64>| v.map(num).unwrap_or_else(|| "null".into());
     format!(
-        ",\"required_purge_seconds\":{},\"purge_seconds\":{},\"validation_purge_seconds\":{},\"purged_rows\":{{\"test_boundary\":{},\"validation_boundary\":{}}},\"purge_source\":{}",
+        ",\"required_purge_seconds\":{},\"purge_seconds\":{},\"validation_purge_seconds\":{},\"purged_rows\":{{\"test_boundary\":{},\"validation_boundary\":{}}},\"purge_source\":{}{}",
         n(r.required_purge_seconds),
         n(r.purge_seconds),
         n(r.validation_purge_seconds),
         r.purged_test_boundary_rows,
         r.purged_validation_boundary_rows,
-        if r.purge_source.is_empty() { "null".to_string() } else { text(r.purge_source) }
+        if r.purge_source.is_empty() { "null".to_string() } else { text(r.purge_source) },
+        if r.boundary_purge_source.is_empty() {
+            String::new()
+        } else {
+            format!(",\"boundary_purge_seconds\":{},\"boundary_purge_source\":{}", num(r.boundary_purge_seconds), text(r.boundary_purge_source))
+        }
     )
 }
 
