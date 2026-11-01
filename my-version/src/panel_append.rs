@@ -276,7 +276,15 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
     }
     let output_sha256 = result?;
     let finish = || -> Result<String, String> {
-        let schema = registry::write_schema_declared(&opts.out, &opts.panel_version, declared.as_ref(), also.as_ref())?;
+        let floor = [&opts.target, &opts.family]
+            .iter()
+            .map(|p| crate::lockbox::declared_embargo(p).map_err(|e| e.message))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .map(|(_, s)| s)
+            .max();
+        let schema = registry::write_schema_embargo(&opts.out, &opts.panel_version, declared.as_ref(), also.as_ref(), floor)?;
         crate::lockbox::finish_output(&opts.out, declared.as_ref(), &["schema.json"]).map_err(|e| e.message)?;
         Ok(schema)
     };

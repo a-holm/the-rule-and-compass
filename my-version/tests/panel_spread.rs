@@ -126,3 +126,26 @@ fn lockbox_none_is_the_only_opt_out() {
     let o = rcsr(&a);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
 }
+
+#[test]
+fn a_range_whose_features_read_the_declared_locked_test_is_refused_until_the_embargo_has_passed() {
+    let dir = scratch();
+    let panel = panel(&dir);
+    let lock = rcsr::lockbox::Lockbox { start: T0 + STEP * 2, end: T0 + STEP * 3 };
+    let embargo = rcsr::lockbox::embargo_json(2 * STEP, "clv1", "test", STEP);
+    rcsr::lockbox::write_sidecar_with(&panel, &lock, "test", &rcsr::lockbox::embargo_member(Some(&embargo))).unwrap();
+    let from_end = format!("{}..{}", T0 + STEP * 3, T0 + STEP * HOURS);
+    let o = rcsr(&base(&panel, &from_end));
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("features read the declared locked test"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("lookback embargo 7200 s"), "{}", stderr(&o));
+    let after = format!("{}..{}", T0 + STEP * 5, T0 + STEP * HOURS);
+    let o = rcsr(&base(&panel, &after));
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let json = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(json.contains("\"embargo_seconds\":7200,\"embargo_source\":\"store\""), "{json}");
+    let mut wider = base(&panel, &after);
+    wider.extend(["--lockbox-embargo", "7201"]);
+    let o = rcsr(&wider);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+}

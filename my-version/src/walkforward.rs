@@ -92,9 +92,13 @@ pub struct ProtocolOptions {
     /// other candidate is evaluated on the test block, the inference has no
     /// candidate columns and `batch_pnl` is refused.
     pub final_read: bool,
-    /// Half-open time ranges of the declared locked test. Rows inside them are
-    /// dropped at read time; the sealed read leaves this empty.
+    /// Half-open time ranges `[S, E)` that stay sealed in this run. A window that
+    /// reaches `[S - P, E + L)` is refused and rows inside it are dropped at read
+    /// time, with `P` the required purge and `L` `locked_embargo`. The sealed
+    /// read lists the other declared ranges only.
     pub locked_ranges: Vec<(i64, i64)>,
+    /// Seconds after the end of every locked range whose rows read it.
+    pub locked_embargo: i64,
 }
 
 /// #482: where a candidate list came from: a run's Pareto front.
@@ -125,6 +129,7 @@ impl Default for ProtocolOptions {
             in_sample_windows: Vec::new(),
             final_read: false,
             locked_ranges: Vec::new(),
+            locked_embargo: 0,
         }
     }
 }
@@ -150,6 +155,15 @@ impl ProtocolOptions {
     /// row to a test row so that no training label reaches the test decision.
     pub fn required_purge_seconds(&self, horizon: f64) -> f64 {
         self.entry_offset + horizon + self.delay
+    }
+
+    /// `[S - P, E + L)` of every sealed range with `P` the purge a training label needs.
+    pub fn locked_reach(&self, spec: &EvalSpec) -> Vec<(f64, f64, f64, f64)> {
+        let purge = self.required_purge_seconds(spec.horizon).max(spec.embargo_seconds());
+        self.locked_ranges
+            .iter()
+            .map(|&(s, e)| (s as f64, e as f64, s as f64 - purge, (e + self.locked_embargo.max(0)) as f64))
+            .collect()
     }
 }
 
@@ -986,6 +1000,30 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
             w.test_start.floor() as i64,
             w.test_end.ceil() as i64,
         )?;
+        for (ls, le, lo, hi) in opts.locked_reach(spec) {
+            let side = if w.train_start < hi && w.train_end > lo {
+                Some("training")
+            } else if w.test_start < hi && w.test_end > lo {
+                Some("test")
+            } else {
+                None
+            };
+            if let Some(side) = side {
+                return Err(format!(
+                    "window '{}': the {} range reaches the declared locked test {}..{} (label end = stamp + {} s, \
+                     lookback embargo {} s after the end); end it at or before {} or start it at or after {}, \
+                     or read the locked test only with --locked-test and a sealed list",
+                    w.label,
+                    side,
+                    crate::protocol::iso(ls),
+                    crate::protocol::iso(le),
+                    ls - lo,
+                    hi - le,
+                    crate::protocol::iso(lo),
+                    crate::protocol::iso(hi)
+                ));
+            }
+        }
         let gap = w.test_start - w.train_end;
         if gap + 1e-9 < embargo {
             return Err(format!(
@@ -1077,7 +1115,8 @@ enum Pass {
 }
 
 struct Accum {
-    locked_ranges: Vec<(i64, i64)>,
+    /// `[S - P, E + L)` of the sealed ranges: rows inside are never read.
+    locked_reach: Vec<(f64, f64)>,
     windows: Vec<WindowData>,
     candidates: usize,
     scores: Vec<f64>,
@@ -1139,7 +1178,7 @@ impl Accum {
             });
         }
         Ok(Accum {
-            locked_ranges: opts.locked_ranges.clone(),
+            locked_reach: opts.locked_reach(spec).iter().map(|r| (r.2, r.3)).collect(),
             windows,
             candidates,
             scores: vec![0.0; candidates],
@@ -1153,7 +1192,7 @@ impl Accum {
         if !t.is_finite() {
             return false;
         }
-        if self.locked_ranges.iter().any(|&(a, b)| t >= a as f64 && t < b as f64) {
+        if self.locked_reach.iter().any(|&(a, b)| t >= a && t < b) {
             return false;
         }
         self.windows.iter().any(|d| {
@@ -3611,4 +3650,49 @@ fn select_candidate(
                 (c, err, theta)
             };
     Ok(Selected { candidate, validation_error, threshold, band_selection, thresholds })
+}
+
+#[cfg(test)]
+mod locked_reach_tests {
+    use super::*;
+
+    fn spec(horizon: f64) -> EvalSpec {
+        EvalSpec {
+            expression: "x".to_string(),
+            vars: vec!["x".to_string()],
+            target: "target".to_string(),
+            time: "ts".to_string(),
+            group: None,
+            windows: vec![Window { label: "w".to_string(), train_start: 0.0, train_end: 20.0, test_start: 20.0, test_end: 40.0 }],
+            horizon,
+            embargo: None,
+            cost_bps: 10.0,
+            threshold_quantile: 0.5,
+            threshold_fixed: None,
+            validation_frac: 0.0,
+            periods_per_year: Some(4.0),
+            candidates: Vec::new(),
+            band_select: false,
+            pool_reset_flat: false,
+            allow_lockbox: false,
+            device_pnl: false,
+            control_seed: 0,
+            policy: Policy::Threshold,
+            band_width: 0.0,
+            min_hold: 1,
+            gpu: false,
+        }
+    }
+
+    #[test]
+    fn the_read_time_drop_spans_the_purge_before_and_the_embargo_after_a_sealed_range() {
+        let mut spec = spec(3.0);
+        spec.windows[0].test_end = 60.0;
+        let opts = ProtocolOptions { locked_ranges: vec![(30, 36)], locked_embargo: 5, ..ProtocolOptions::default() };
+        let acc = Accum::new(&spec, &opts, 1).unwrap();
+        assert_eq!(opts.locked_reach(&spec), vec![(30.0, 36.0, 27.0, 41.0)]);
+        for t in 0..60 {
+            assert_eq!(acc.wants(t as f64), t < 27 || t >= 41, "row {t}");
+        }
+    }
 }

@@ -216,36 +216,41 @@ pub struct Fold {
 /// `purge_seconds` before the validation start so a fit label never reads into
 /// the validation slice.
 /// A fold whose fit, validation or test range reaches `[locked start - purge_seconds,
-/// locked end)` (a declared locked test, half-open seconds) is refused: a label
-/// at the last development stamps reads bars inside the locked test.
+/// locked end + embargo_seconds)` of a guarded range (declared locked tests, half-open
+/// seconds) is refused: a label at the last development stamps reads bars inside
+/// the locked test, and a feature right after its end looks back into it.
 pub fn make_folds(
     p: &Panel,
     windows: &[WindowRow],
     purge_seconds: f64,
-    locked: Option<(f64, f64)>,
+    locked: &[(f64, f64)],
+    embargo_seconds: f64,
 ) -> Result<Vec<Fold>, String> {
     let mut folds = Vec::with_capacity(windows.len());
     for w in windows {
         let win = &w.window;
-        if let Some((ls, le)) = locked {
+        for &(ls, le) in locked {
             let boundary = ls - purge_seconds;
-            let side = if win.train_start < le && win.train_end > boundary {
+            let reach_end = le + embargo_seconds.max(0.0);
+            let side = if win.train_start < reach_end && win.train_end > boundary {
                 Some("fit or validation")
-            } else if win.test_start < le && win.test_end > boundary {
+            } else if win.test_start < reach_end && win.test_end > boundary {
                 Some("test")
             } else {
                 None
             };
             if let Some(side) = side {
                 return Err(format!(
-                    "fold {}: the {} range reaches the declared locked test {}..{} (label end = stamp + {} s); \
-                     end it at or before {}, or read the locked test only with --locked-test --ledger --sealed",
+                    "fold {}: the {} range reaches the declared locked test {}..{} (label end = stamp + {} s, lookback embargo {} s after the end); \
+                     end it at or before {} or start it at or after {}, or read the locked test only with --locked-test --ledger --sealed",
                     win.label,
                     side,
                     protocol::iso(ls),
                     protocol::iso(le),
                     purge_seconds,
-                    protocol::iso(boundary)
+                    embargo_seconds,
+                    protocol::iso(boundary),
+                    protocol::iso(reach_end)
                 ));
             }
         }
@@ -2264,6 +2269,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --fdr-q <q>               BH-FDR level (default 0.10)\n\
   --pbo-blocks <even n>     CSCV blocks (default 8)\n\
   --seed <n>                seed of every draw (default 0)\n\
+  --lockbox-embargo <s>     widen the lookback embargo after the end of the locked range (default: declared with --data, else 10972800); smaller is refused (exit 2); a fold reaching [START - purge, END + embargo) is refused\n\
   --lockbox <START,END|none> locked test to guard: this flag (it must cover a stored\n\
                             declaration, else exit 2), the declaration stored with --data,\n\
                             else 2025-07-01,2026-07-01; none opts out. A fold ending after START minus\n\
@@ -2313,6 +2319,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let mut windows = None;
     let mut scheme = "expanding".to_string();
     let mut lockbox_arg: Option<String> = None;
+    let mut lockbox_embargo_arg: Option<String> = None;
     let mut locked_test = false;
     let mut allow_unbound = false;
     let mut ledger_path: Option<String> = None;
@@ -2323,6 +2330,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let mut cost_flag: Option<f64> = None;
     let mut cost_override: Option<f64> = None;
     let mut grid_given = false;
+    let mut purge_given = false;
     let mut horizon_given = false;
     let mut out = None;
     let mut markdown = None;
@@ -2344,7 +2352,10 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             "--features" => features = val()?.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             "--windows" => windows = Some(val()?),
             "--scheme" => scheme = val()?,
-            "--purge-seconds" => opts.purge_seconds = val()?.parse().map_err(|_| num_err(a))?,
+            "--purge-seconds" => {
+                opts.purge_seconds = val()?.parse().map_err(|_| num_err(a))?;
+                purge_given = true;
+            }
             "--horizon-seconds" => {
                 opts.horizon_seconds = val()?.parse().map_err(|_| num_err(a))?;
                 horizon_given = true;
@@ -2373,6 +2384,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             "--pbo-blocks" => opts.pbo_blocks = val()?.parse().map_err(|_| num_err(a))?,
             "--seed" => opts.seed = val()?.parse().map_err(|_| num_err(a))?,
             "--lockbox" => lockbox_arg = Some(val()?),
+            "--lockbox-embargo" => lockbox_embargo_arg = Some(val()?),
             "--locked-test" => locked_test = true,
             "--allow-unbound-ledger" => allow_unbound = true,
             "--ledger" => ledger_path = Some(val()?),
@@ -2440,8 +2452,15 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     }
     let text = std::fs::read_to_string(&windows).map_err(|e| input_err(format!("{}: {}", windows, e)))?;
     let rows = protocol::parse_windows_csv(&text, Some(&scheme)).map_err(input_err)?;
-    let resolved = crate::lockbox::resolve(lockbox_arg.as_deref(), &data_path).map_err(|e| (e.exit, e.message))?;
+    let resolved = crate::lockbox::resolve_with(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path).map_err(|e| (e.exit, e.message))?;
     let declared = resolved.declared();
+    let mut purge_source = if purge_given { "flag" } else { "protocol_default" };
+    if let Some(s) = &opts.spec {
+        if s.required_purge_seconds() > opts.purge_seconds {
+            opts.purge_seconds = s.required_purge_seconds();
+            purge_source = "target_spec";
+        }
+    }
     if !locked_test && (ledger_path.is_some() || sealed_path.is_some()) {
         return Err(usage_err("--ledger and --sealed apply to --locked-test only".to_string()));
     }
@@ -2473,11 +2492,13 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         l.check_read_marker(&data_path).map_err(input_err)?;
         read = Some((l, crate::manifest::sha256_file(&data_path).map_err(input_err)?, current));
     }
-    let guard = if locked_test {
-        None
-    } else {
-        declared.as_ref().map(|d| (d.lockbox.start as f64, d.lockbox.end as f64))
-    };
+    // A sealed read opens the primary range; every other declared range stays sealed.
+    let guard: Vec<(f64, f64)> = resolved
+        .ranges()
+        .iter()
+        .skip(usize::from(locked_test))
+        .map(|r| (r.start as f64, r.end as f64))
+        .collect();
     let inp = Input {
         data: data_path.clone(),
         target,
@@ -2487,12 +2508,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         features,
     };
     let panel = load_panel(&inp, &opts).map_err(input_err)?;
-    let mut folds = make_folds(&panel, &rows, opts.purge_seconds, guard).map_err(input_err)?;
-    if !locked_test {
-        if let Some(extra) = resolved.also {
-            make_folds(&panel, &rows, opts.purge_seconds, Some((extra.start as f64, extra.end as f64))).map_err(input_err)?;
-        }
-    }
+    let mut folds = make_folds(&panel, &rows, opts.purge_seconds, &guard, resolved.embargo.seconds as f64).map_err(input_err)?;
     if let Some(sr) = &mut opts.sr_run {
         let labelled: Vec<(String, f64)> = folds.iter().map(|f| (f.label.clone(), f.test_start)).collect();
         let oof = sr.run.oof_flags(&labelled, allow_in_sample).map_err(|e| input_err(format!("--sr-run {}: {}", sr.run.path, e)))?;
@@ -2514,6 +2530,12 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     report.ledger = ledger;
     let mut json = report.json();
     let in_scope = if locked_test { folds.iter().map(|f| f.test.len()).sum() } else { 0 };
+    json = format!(
+        "{},\"purge_seconds\":{},\"purge_source\":\"{}\"}}",
+        json.trim_end().strip_suffix('}').unwrap_or(json.trim_end()),
+        opts.purge_seconds,
+        purge_source
+    );
     json = resolved.splice_report(&json, in_scope, locked_test, true);
     if let Some((ledger, data_sha, current)) = &read {
         let report_sha = crate::manifest::sha256_hex(json.as_bytes());

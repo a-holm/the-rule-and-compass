@@ -185,6 +185,7 @@ pub struct Args {
     pub target_spec: Option<String>,
     pub purge_seconds: Option<i64>,
     pub lockbox: Option<String>,
+    pub lockbox_embargo: Option<String>,
 }
 
 /// An error with its exit code: 2 usage, 3 input or lockbox refusal.
@@ -200,7 +201,7 @@ fn parse_range(s: &str) -> Result<(i64, i64), String> {
     Ok((from, to))
 }
 
-fn refuse_range(range: (i64, i64), locks: &[Lockbox], purge: i64) -> Result<(), String> {
+fn refuse_range(range: (i64, i64), locks: &[Lockbox], purge: i64, embargo: i64) -> Result<(), String> {
     for l in locks {
         let (from, to) = range;
         if from < l.end && to > l.start {
@@ -210,7 +211,7 @@ fn refuse_range(range: (i64, i64), locks: &[Lockbox], purge: i64) -> Result<(), 
                 lockbox::span(l)
             ));
         }
-        if to > l.start - purge && from < l.end {
+        if from < l.end && to > l.start - purge {
             return Err(format!(
                 "--range {} has rows whose label window ({} s) reaches the declared locked test {}; end the range at {} or earlier",
                 lockbox::span(&Lockbox { start: from, end: to }),
@@ -219,12 +220,21 @@ fn refuse_range(range: (i64, i64), locks: &[Lockbox], purge: i64) -> Result<(), 
                 crate::protocol::iso((l.start - purge) as f64)
             ));
         }
+        if from < l.end + embargo && to > l.end {
+            return Err(format!(
+                "--range {} has rows whose features read the declared locked test {} (lookback embargo {} s after the end); start the range at {} or later",
+                lockbox::span(&Lockbox { start: from, end: to }),
+                lockbox::span(l),
+                embargo,
+                crate::protocol::iso((l.end + embargo) as f64)
+            ));
+        }
     }
     Ok(())
 }
 
 pub fn run(a: &Args) -> Result<String, Refusal> {
-    let resolved = lockbox::resolve(a.lockbox.as_deref(), &a.data).map_err(|e| (e.exit, e.message))?;
+    let resolved = lockbox::resolve_with(a.lockbox.as_deref(), a.lockbox_embargo.as_deref(), &a.data).map_err(|e| (e.exit, e.message))?;
     let spec = match &a.target_spec {
         Some(p) => Some(p.clone()),
         None => target::sidecar_path(&a.data),
@@ -244,7 +254,7 @@ pub fn run(a: &Args) -> Result<String, Refusal> {
         }
     };
     let horizon = spec.as_ref().map_or(purge as f64, |s| s.horizon_seconds);
-    refuse_range(a.range, &resolved.ranges(), purge).map_err(|e| (3, e))?;
+    refuse_range(a.range, &resolved.ranges(), purge, resolved.embargo.seconds).map_err(|e| (3, e))?;
 
     let store = FileStore::open(&a.data).map_err(|e| (3, e))?;
     let ts = crate::panel_rank::read_ts(&store).map_err(|e| (3, e))?;
@@ -281,7 +291,7 @@ pub fn run(a: &Args) -> Result<String, Refusal> {
     Ok(format!(
         "{{\"schema\":\"rcsr-spread/1\",\"data\":{},\"feature\":{},\"label\":{},\"buckets\":{},\"bucketing\":{},\"demean\":{},\
 \"range\":{{\"start\":{},\"end\":{},\"start_iso\":{},\"end_iso\":{}}},\"purge_seconds\":{},\
-\"lockbox\":{{\"source\":{},\"ranges\":[{}],\"rows_in_range_overlap\":0}},\
+\"lockbox\":{{\"source\":{},\"ranges\":[{}],\"embargo_seconds\":{},\"embargo_source\":{},\"rows_in_range_overlap\":0}},\
 \"timestamps\":{},\"thin_timestamps\":{},\"rows\":{},\"block\":{},\"draws\":{},\"seed\":{},\"level\":{},\
 \"spread_bp\":{:.9},\"ci_lo_bp\":{:.9},\"ci_hi_bp\":{:.9},\"se_bp\":{:.9},\
 \"bucket_means_bp\":[{}],\"bucket_rows\":[{}],\"positive_timestamps\":{},\"finite_timestamps\":{}}}",
@@ -298,6 +308,8 @@ pub fn run(a: &Args) -> Result<String, Refusal> {
         purge,
         devlog::text(resolved.source.as_str()),
         locks,
+        resolved.embargo.seconds,
+        devlog::text(resolved.embargo.source.as_str()),
         r.timestamps,
         r.thin_timestamps,
         r.rows,
@@ -320,7 +332,7 @@ pub fn usage_text() -> &'static str {
     "rcsr panel spread --data panel.rcsb --feature clv1 --label lbl_h1_fwd --range FROM..TO [--buckets 5]
                    [--bucketing pooled|cross-section] [--demean cross-section|none] [--min-members 20]
                    [--block N] [--draws 2000] [--seed 1] [--level 0.95]
-                   [--target-spec FILE] [--purge-seconds S] [--lockbox S,E|none]
+                   [--target-spec FILE] [--purge-seconds S] [--lockbox S,E|none] [--lockbox-embargo S]
   Market-neutral bucket spread of a feature. Rows with ts in the half-open --range (epoch seconds or
   ISO dates) are put in --buckets quantile buckets of --feature: pooled over the range (default) or
   per timestamp. --demean cross-section (default) subtracts the per-timestamp mean of --label first.
@@ -364,7 +376,7 @@ pub fn cli(args: &[String]) -> ! {
         seed: 1,
         level: 0.95,
     };
-    let (mut target_spec, mut purge_seconds, mut lockbox) = (None, None, None);
+    let (mut target_spec, mut purge_seconds, mut lockbox, mut lockbox_embargo) = (None, None, None, None);
     let mut i = 0usize;
     while i < args.len() {
         let flag = args[i].clone();
@@ -396,6 +408,7 @@ pub fn cli(args: &[String]) -> ! {
             "--target-spec" => target_spec = Some(value(args, &mut i)),
             "--purge-seconds" => purge_seconds = Some(num(&flag, value(args, &mut i))),
             "--lockbox" => lockbox = Some(value(args, &mut i)),
+            "--lockbox-embargo" => lockbox_embargo = Some(value(args, &mut i)),
             "-h" | "--help" => {
                 print!("{}", usage_text());
                 std::process::exit(0);
@@ -417,6 +430,7 @@ pub fn cli(args: &[String]) -> ! {
         target_spec,
         purge_seconds,
         lockbox,
+        lockbox_embargo,
     };
     match run(&a) {
         Ok(json) => {
