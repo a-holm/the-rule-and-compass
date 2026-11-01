@@ -14,6 +14,7 @@
 //!   tie-break) so bloat is controlled without a hand-tuned penalty;
 //! * the loop stops early when it has converged, or when a time budget is hit.
 
+use crate::afp;
 use crate::checkpoint::{Backend, Checkpoint, Individual, IslandState};
 use crate::complexity::ComplexityModel;
 use crate::data::Sample;
@@ -67,6 +68,36 @@ impl VariationMode {
             "postfix" => Ok(VariationMode::Postfix),
             other => Err(format!(
                 "variation must be 'auto', 'node' or 'postfix', got '{}'",
+                other
+            )),
+        }
+    }
+}
+
+/// #465: how an island chooses its next population.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Selection {
+    /// Generational replacement with lexicographic parsimony tournaments.
+    #[default]
+    Lexicographic,
+    /// Age-fitness Pareto survivor selection over parents and offspring.
+    Afp,
+}
+
+impl Selection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Selection::Lexicographic => "lexicographic",
+            Selection::Afp => "afp",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "lexicographic" => Ok(Selection::Lexicographic),
+            "afp" => Ok(Selection::Afp),
+            other => Err(format!(
+                "selection must be 'lexicographic' or 'afp', got '{}'",
                 other
             )),
         }
@@ -174,6 +205,11 @@ pub struct Config {
     /// `0` disables the bound. The default is high enough not to fire on the
     /// recorded cell, so normal runs are bit-identical to the serial loop.
     pub fit_fallback_max: usize,
+    /// #495: finalist refit band. After a device-fit search only trees whose
+    /// full-data error is within this relative distance of the lowest error at
+    /// no greater cost, plus every reported front member, get the exact CPU
+    /// refit. `inf` refits every unique tree.
+    pub refit_band: f64,
     /// #116: disk-backed rows for the streaming fit arm. `Some` only when the
     /// CLI resolved a resident `.rcsb` store whose prepared training rows can be
     /// re-read exactly; it is read by `--fit-strategy stream` and never changes
@@ -253,6 +289,8 @@ pub struct Config {
     /// #122: which variation engine to use. `auto` selects the flat postfix
     /// engine only for a large, fit-free GPU run.
     pub variation: VariationMode,
+    /// #465: survivor and parent selection inside an island.
+    pub selection: Selection,
     /// #470: wrap every candidate shape in a fitted affine output map
     /// `a + b*f(x)`. Changes the trajectory, so it is a saved search setting.
     pub linear_scaling: bool,
@@ -471,6 +509,9 @@ fn fit_and_score(
 /// cell admitted at most 540 per generation.
 pub const DEFAULT_FIT_FALLBACK_MAX: usize = 4096;
 
+/// #495: default relative band of the finalist refit.
+pub const DEFAULT_REFIT_BAND: f64 = 0.001;
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -498,6 +539,7 @@ impl Default for Config {
             fit_samples: 0, // #85: off by default
             fit_rows: 0,    // #116: off by default
             fit_fallback_max: DEFAULT_FIT_FALLBACK_MAX, // #255
+            refit_band: DEFAULT_REFIT_BAND, // #495
             fit_stream_source: None,
             front_parents: true, // #76: measured on the known-truth suite
             units: None,
@@ -523,6 +565,7 @@ impl Default for Config {
             pipeline_depth: 2, // #119: only used when the GPU path is active
             threads: 1,
             variation: VariationMode::Auto,
+            selection: Selection::Lexicographic,
             linear_scaling: false,
         }
     }
@@ -571,7 +614,9 @@ impl Config {
         compare!(fit_samples, "fit_samples"); // #85
         compare!(fit_rows, "fit_rows"); // #116
         compare!(fit_fallback_max, "fit_fallback_max"); // #255
+        compare!(refit_band, "refit_band"); // #495
         compare!(front_parents, "front_parents"); // #76
+        compare!(selection, "selection"); // #465
         compare!(qd_bins, "qd_bins"); // #120
         compare!(qd_cell_cap, "qd_cell_cap"); // #120
         compare!(qd_cvt, "qd_cvt"); // #120
@@ -627,6 +672,8 @@ struct Ind {
     /// cross-checks a descriptor against the sample it was computed on before
     /// trusting it.
     descriptor: Option<qd::Descriptor>,
+    /// #465: generations since the lineage began; only `--selection afp` reads it.
+    age: u32,
 }
 
 impl Ind {
@@ -678,6 +725,7 @@ impl Ind {
             error,
             complexity,
             descriptor,
+            age: 0,
         }
     }
 
@@ -703,6 +751,7 @@ impl Ind {
             // A GPU batch returns the error, not the prediction vector, so the
             // descriptor is filled by the archive's fallback path.
             descriptor: None,
+            age: 0,
         }
     }
 
@@ -738,7 +787,9 @@ impl Ind {
         } else {
             None
         };
+        let age = self.age;
         *self = Ind::evaluated_fitted(tree, fitted, train, cfg); // #25 #87
+        self.age = age;
     }
 
     fn to_checkpoint(&self) -> Individual {
@@ -746,6 +797,7 @@ impl Ind {
             tree: self.tree.clone(),
             error: self.error,
             complexity: self.complexity,
+            age: self.age,
         }
     }
 
@@ -757,6 +809,7 @@ impl Ind {
             // A checkpoint stores the tree and score, not the descriptor; the
             // archive recomputes it on the resumed run like any other candidate.
             descriptor: None,
+            age: ind.age,
         }
     }
 }
@@ -1950,6 +2003,9 @@ impl GpuSearch {
             fit_fallback_improved_by_cause: self.fit_fallback_improved_by_cause.clone(),
             fit_status_by_label: self.fit_status_by_label.clone(),
             fit_refits: 0,
+            fit_refit_candidates: 0,
+            fit_refit_s: 0.0,
+            fit_rescore_s: 0.0,
             fit_ms: self.fit_ms,
             fit_polish_ms: self.fit_polish_ms,
             fit_host_ms: self.fit_host_ms,
@@ -4199,6 +4255,109 @@ fn canonical_front(cap: usize, mut scored: Vec<Sol>) -> Archive {
     out
 }
 
+/// #495: what the finalist rebuild did, for the ledger and `--json`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default)]
+struct RefitReport {
+    /// Unique trees of the archive and the final populations.
+    candidates: usize,
+    /// Exact CPU f64 refits performed.
+    refits: usize,
+    /// Wall seconds in the exact refit windows.
+    refit_s: f64,
+    /// Wall seconds in full-data scoring of the unique trees.
+    rescore_s: f64,
+}
+
+/// #495: indices of the trees worth an exact refit. `pre` are the pre-refit
+/// full-data errors and `costs` the complexity costs. A tree qualifies when its
+/// error is within `band` (relative) of the lowest finite error among trees of
+/// no greater cost. The set depends only on errors and costs.
+fn refit_band_selection(pre: &[f64], costs: &[f64], band: f64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..pre.len()).collect();
+    order.sort_by(|&a, &b| costs[a].total_cmp(&costs[b]).then(a.cmp(&b)));
+    let mut picked = Vec::new();
+    let mut env = f64::INFINITY;
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && costs[order[end]] == costs[order[start]] {
+            end += 1;
+        }
+        for &i in &order[start..end] {
+            if pre[i].is_finite() && pre[i] < env {
+                env = pre[i];
+            }
+        }
+        for &i in &order[start..end] {
+            if pre[i].is_finite() && pre[i] <= env + band * env.abs() {
+                picked.push(i);
+            }
+        }
+        start = end;
+    }
+    picked.sort_unstable();
+    picked
+}
+
+/// #169: exact CPU f64 refit of `trees` on all training rows, a warm start from
+/// the carried constants. Trees are independent, so the work is split across
+/// workers; the result order is unchanged.
+fn refit_exact(trees: &mut [Node], train: &EvalSample, cfg: &Config) {
+    let fit_one = |t: &mut Node| {
+        crate::fit::fit_weighted_metric(
+            t,
+            &train.sample.x,
+            &train.sample.y,
+            &train.sample.w,
+            cfg.fit_iters,
+            cfg.metric,
+        );
+        *t = expr::simplify(t);
+        crate::fit::note_gpu_refit();
+    };
+    let workers = cfg.threads.max(1).min(trees.len().max(1)); // #463
+    let blocks = expr::current_blocks();
+    if workers > 1 && trees.len() > 1 {
+        let per = trees.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            for chunk in trees.chunks_mut(per) {
+                let blocks = blocks.clone();
+                let fit_one = &fit_one;
+                scope.spawn(move || {
+                    expr::set_blocks(blocks);
+                    for t in chunk.iter_mut() {
+                        fit_one(t);
+                    }
+                });
+            }
+        });
+    } else {
+        for t in trees.iter_mut() {
+            fit_one(t);
+        }
+    }
+}
+
+/// #15/#25/#27: full-data error of one tree; a dimensionally rejected
+/// candidate must not sneak back in on the rebuild.
+fn full_data_error(tree: &Node, train: &EvalSample, cfg: &Config) -> f64 {
+    if cfg.accepts_dimensions(tree) {
+        score_tree(tree, train, cfg)
+    } else {
+        f64::INFINITY
+    }
+}
+
+fn full_data_sol(tree: Node, error: f64, cfg: &Config) -> Sol {
+    Sol {
+        complexity: expr::complexity(&tree),
+        cost: cfg.complexity_model.complexity(&tree),
+        tree,
+        error,
+    }
+}
+
 /// Rebuild an archive from its members and the final populations, scoring every
 /// expression on the **full** training sample. Used only when the generations
 /// ran on subsets, so the returned front and every error derived from it are
@@ -4208,10 +4367,10 @@ fn full_data_archive(
     islands: &[Vec<Ind>],
     train: &EvalSample, // #27 sample + cached SoA columns
     cfg: &Config,       // #15 refit per-output constants; #25 dimensional filter
-    // #169: refit every finalist with the exact CPU f64 arm because the search
+    // #169: refit the finalists with the exact CPU f64 arm because the search
     // used the batched GPU constants.
     refit_gpu_fit: bool,
-) -> (Archive, usize, f64) {
+) -> (Archive, RefitReport) {
     let trees: Vec<&Node> = archive
         .items
         .iter()
@@ -4225,77 +4384,100 @@ fn full_data_archive(
             unique.push(expr::simplify(tree));
         }
     }
-    let mut refits = 0usize;
-    let mut refit_s = 0.0;
-    let refit_start = std::time::Instant::now();
-    // #169: reported constants must come from the exact CPU f64 arm, not from
-    // the f32 row arithmetic of the batched kernel. This is a warm start from
-    // the GPU constants on the full training sample. Trees are independent, so
-    // the refit is split across workers; the result order is unchanged.
-    if refit_gpu_fit && cfg.fit_iters > 0 && !train.sample.is_multi() {
-        let workers = cfg.threads.max(1).min(unique.len().max(1)); // #463
-        let blocks = expr::current_blocks();
-        if workers > 1 && unique.len() > 1 {
-            let per = unique.len().div_ceil(workers);
-            std::thread::scope(|scope| {
-                for chunk in unique.chunks_mut(per) {
-                    let blocks = blocks.clone();
-                    scope.spawn(move || {
-                        expr::set_blocks(blocks);
-                        for t in chunk.iter_mut() {
-                            crate::fit::fit_weighted_metric(
-                                t,
-                                &train.sample.x,
-                                &train.sample.y,
-                                &train.sample.w,
-                                cfg.fit_iters,
-                                cfg.metric,
-                            );
-                            *t = expr::simplify(t);
-                        }
-                    });
-                }
-            });
-        } else {
-            for t in unique.iter_mut() {
-                crate::fit::fit_weighted_metric(
-                    t,
-                    &train.sample.x,
-                    &train.sample.y,
-                    &train.sample.w,
-                    cfg.fit_iters,
-                    cfg.metric,
-                );
-                *t = expr::simplify(t);
-            }
-        }
-        for _ in 0..unique.len() {
-            crate::fit::note_gpu_refit();
-        }
-        refits = unique.len();
-    }
-    // #284: only the exact CPU refit window, not the whole archive rebuild.
-    if refits > 0 {
-        refit_s = refit_start.elapsed().as_secs_f64();
-    }
+    let mut report = RefitReport {
+        candidates: unique.len(),
+        ..RefitReport::default()
+    };
+    let refit_on = refit_gpu_fit && cfg.fit_iters > 0 && !train.sample.is_multi();
+    let workers = |n: usize| batch_workers(cfg.threads, n, train.sample.len());
     // #463: scoring is independent per tree; results keep the order.
-    let scored: Vec<Sol> = par_map(batch_workers(cfg.threads, unique.len(), train.sample.len()), unique, |tree| {
-            // #15: combined error on a multi-output sample; #25: a rejected
-            // candidate must not sneak back in on the full-data rebuild.
-            let error = if cfg.accepts_dimensions(&tree) {
-                score_tree(&tree, train, cfg) // #27
-            } else {
-                f64::INFINITY
-            };
-            Sol {
-                complexity: expr::complexity(&tree),
-                cost: cfg.complexity_model.complexity(&tree),
-                tree,
-                error,
-            }
+    let score_all = |trees: Vec<Node>| -> Vec<Sol> {
+        par_map(workers(trees.len()), trees, |tree| {
+            let error = full_data_error(&tree, train, cfg);
+            full_data_sol(tree, error, cfg)
+        })
+    };
+
+    if !refit_on || cfg.refit_band.is_infinite() {
+        // #284: only the exact CPU refit window, not the whole archive rebuild.
+        if refit_on {
+            let start = std::time::Instant::now();
+            refit_exact(&mut unique, train, cfg);
+            report.refits = unique.len();
+            report.refit_s = start.elapsed().as_secs_f64();
+        }
+        let start = std::time::Instant::now();
+        let scored = score_all(unique);
+        report.rescore_s = start.elapsed().as_secs_f64();
+        return (canonical_front(archive.cap, scored), report);
+    }
+
+    // #495: score with the carried constants, refit only the band around the
+    // front, then refit every reported member that is still unrefit.
+    let start = std::time::Instant::now();
+    let scored = score_all(unique);
+    report.rescore_s += start.elapsed().as_secs_f64();
+    let costs: Vec<f64> = scored.iter().map(|s| s.cost).collect();
+    let pre: Vec<f64> = scored.iter().map(|s| s.error).collect();
+    let first = refit_band_selection(&pre, &costs, cfg.refit_band);
+    let (front, refits) = refit_to_fixpoint(archive.cap, scored, first, |batch: Vec<Node>| {
+        let start = std::time::Instant::now();
+        let mut batch = batch;
+        refit_exact(&mut batch, train, cfg);
+        report.refit_s += start.elapsed().as_secs_f64();
+        let start = std::time::Instant::now();
+        let rescored = score_all(batch);
+        report.rescore_s += start.elapsed().as_secs_f64();
+        rescored
     });
-    let out = canonical_front(archive.cap, scored);
-    (out, refits, refit_s)
+    report.refits = refits;
+    (front, report)
+}
+
+/// #495: refit the trees at `todo`, rebuild the front, and refit every front
+/// member that was not refit, until none is left. `refit` maps trees to their
+/// refit, scored solutions in the same order. Each round refits at least one
+/// new tree, so the loop ends. Returns the front and the number of refits.
+fn refit_to_fixpoint(
+    cap: usize,
+    mut scored: Vec<Sol>,
+    mut todo: Vec<usize>,
+    mut refit: impl FnMut(Vec<Node>) -> Vec<Sol>,
+) -> (Archive, usize) {
+    let mut done = vec![false; scored.len()];
+    let mut refits = 0;
+    loop {
+        if !todo.is_empty() {
+            let batch: Vec<Node> = todo.iter().map(|&i| scored[i].tree.clone()).collect();
+            refits += batch.len();
+            for (&i, sol) in todo.iter().zip(refit(batch)) {
+                scored[i] = sol;
+                done[i] = true;
+            }
+        }
+        let front = canonical_front(cap, scored.clone());
+        let refit_hashes: HashSet<u64> = scored
+            .iter()
+            .zip(&done)
+            .filter(|(_, &d)| d)
+            .map(|(s, _)| expr::structural_hash(&s.tree))
+            .collect();
+        todo = Vec::new();
+        for member in &front.items {
+            let h = expr::structural_hash(&member.tree);
+            if refit_hashes.contains(&h) {
+                continue;
+            }
+            if let Some(i) =
+                (0..scored.len()).find(|&i| !done[i] && expr::structural_hash(&scored[i].tree) == h)
+            {
+                todo.push(i);
+            }
+        }
+        if todo.is_empty() {
+            return (front, refits);
+        }
+    }
 }
 
 /// Lexicographic parsimony pressure: better error wins; if the errors are equal
@@ -4393,6 +4575,84 @@ fn pick_parent_policy(
         }
     }
     pick_parent(island, front, rng, front_p).clone()
+}
+
+// #465: age-fitness Pareto survivor selection (`--selection afp`).
+
+/// #465: random immigrants added to every island each generation.
+fn afp_immigrants(pop: usize) -> usize {
+    (pop / 20).max(1)
+}
+
+/// #465: the minimised objectives of a population. A non-finite error sorts
+/// last, so an all-infinite island falls back to `(complexity, age)`.
+fn afp_points(inds: &[Ind]) -> Vec<afp::Point> {
+    inds.iter()
+        .map(|i| {
+            let e = if i.error.is_nan() { f64::INFINITY } else { i.error };
+            [e, i.complexity, i.age as f64]
+        })
+        .collect()
+}
+
+/// #465: survivors of parents + offspring + immigrants (in that order, which
+/// is the tie-break order). Every survivor is one generation older.
+fn afp_select(candidates: Vec<Ind>, pop: usize) -> Vec<Ind> {
+    let keep = afp::survivors(&afp_points(&candidates), pop);
+    let mut wanted = vec![false; candidates.len()];
+    for i in keep {
+        wanted[i] = true;
+    }
+    candidates
+        .into_iter()
+        .zip(wanted)
+        .filter_map(|(mut ind, keep)| {
+            keep.then(|| {
+                ind.age += 1;
+                ind
+            })
+        })
+        .collect()
+}
+
+/// #465: the island member migration replaces: highest Pareto rank, then the
+/// smallest crowding distance, then the highest index.
+fn afp_worst(island: &[Ind]) -> Option<usize> {
+    let (rank, crowd) = afp::rank_and_crowd(&afp_points(island));
+    (0..island.len()).max_by(|&a, &b| {
+        rank[a]
+            .cmp(&rank[b])
+            .then(crowd[b].total_cmp(&crowd[a]))
+            .then(a.cmp(&b))
+    })
+}
+
+/// #465: one parent and its age. Without AFP this is [`pick_parent_policy`]
+/// with age 0, draw for draw. With AFP a front parent counts as age 0 and the
+/// island tournament runs on rank and crowding distance.
+#[allow(clippy::too_many_arguments)]
+fn pick_parent_aged(
+    island: &[Ind],
+    front: &[Sol],
+    qd: Option<&QdArchive>,
+    rng: &mut Mt,
+    front_p: f64,
+    qd_policy: bool,
+    qd_control: u8,
+    afp: bool,
+    rank: &[u32],
+    crowd: &[f64],
+) -> (Node, u32) {
+    if !afp || qd_policy {
+        return (pick_parent_policy(island, front, qd, rng, front_p, qd_policy, qd_control), 0);
+    }
+    match front_parent(front, rng, front_p) {
+        Some(tree) => (tree.clone(), 0),
+        None => {
+            let i = afp::tournament(rank, crowd, rng, 4);
+            (island[i].tree.clone(), island[i].age)
+        }
+    }
 }
 
 // #77: seed the per-generation duplicate set with the elite (`next`) and every
@@ -4511,13 +4771,20 @@ fn evolve_island(
         }
     }
 
+    let afp = cfg.selection == Selection::Afp;
+    // #465: Pareto rank and crowding of the parents drive the tournament.
+    let (par_rank, par_crowd) = if afp {
+        afp::rank_and_crowd(&afp_points(isl))
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let pop = cfg.pop;
     let mut next: Vec<Ind> = Vec::with_capacity(pop);
 
     // Elitism: carry the best individual over unchanged. In the screened phase
     // the full-data parents are kept by the caller and compete at selection, so
     // the offspring vector stays a full `pop`.
-    if !screened {
+    if !screened && !afp {
         if let Some(best) = isl
             .iter()
             .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal))
@@ -4542,13 +4809,16 @@ fn evolve_island(
     while next.len() < pop && attempts < max_attempts {
         let want = pop - next.len();
         let mut trees: Vec<Node> = Vec::with_capacity(want);
+        let mut ages: Vec<u32> = Vec::with_capacity(want);
         while trees.len() < want && attempts < max_attempts {
             attempts += 1;
             GenCounters::count(counters, |c| &c.attempts);
             // #120: with the policy on, a UCB/stratified cell elite supplies most
             // parents; 5% still come from the global Pareto front. With the policy
             // off this is exactly the #76 draw.
-            let p1 = pick_parent_policy(isl, front, qd, rng, front_p, qd_policy, qd_control);
+            let (p1, mut age) = pick_parent_aged(
+                isl, front, qd, rng, front_p, qd_policy, qd_control, afp, &par_rank, &par_crowd,
+            );
             // #470: variation edits the bare shape; the child inherits the first
             // parent's map as its warm start.
             let (scale_a, scale_b, p1) = if cfg.linear_scaling {
@@ -4558,7 +4828,10 @@ fn evolve_island(
             };
             let mut child = p1;
             if rng.bool(0.5) {
-                let parent2 = pick_parent_policy(isl, front, qd, rng, front_p, qd_policy, qd_control);
+                let (parent2, age2) = pick_parent_aged(
+                    isl, front, qd, rng, front_p, qd_policy, qd_control, afp, &par_rank, &par_crowd,
+                );
+                age = age.max(age2);
                 let parent2 = if cfg.linear_scaling {
                     crate::scale::split(&parent2).2
                 } else {
@@ -4584,8 +4857,11 @@ fn evolve_island(
                 continue;
             }
             trees.push(tree);
+            ages.push(age);
         }
-        for ind in fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters) {
+        let scored = fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters);
+        for (mut ind, age) in scored.into_iter().zip(ages) {
+            ind.age = age;
             if ind.complexity > cfg.complexity_cap() {
                 GenCounters::count(counters, |c| &c.post_fit_drops); // #463
                 continue;
@@ -4649,6 +4925,19 @@ fn evolve_island(
                 offer(&sink, slot, &next[slot]);
             }
         }
+    }
+
+    // #465: fresh lineages at age 0 compete with the older ones. They are scored
+    // with the rest of the generation but never offered to the overlap queue,
+    // whose result slots cover the first `pop` candidates only.
+    if afp {
+        let k = afp_immigrants(pop);
+        let trees: Vec<Node> = (0..k)
+            .map(|_| {
+                expr::simplify(&random_tree_with(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs)))
+            })
+            .collect();
+        next.extend(fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters));
     }
 
     *isl = next;
@@ -4747,6 +5036,12 @@ pub struct GpuRunStats {
     pub fit_status_by_label: BTreeMap<String, usize>,
     /// #169: exact CPU f64 refits of finalists before reporting.
     pub fit_refits: usize,
+    /// #495: unique trees considered for the finalist refit.
+    pub fit_refit_candidates: usize,
+    /// #495: wall seconds of the exact finalist refit windows.
+    pub fit_refit_s: f64,
+    /// #495: wall seconds of full-data scoring in the finalist rebuild.
+    pub fit_rescore_s: f64,
     /// #169: wall time spent in the batched fit kernels, milliseconds.
     pub fit_ms: f64,
     /// #496: the polish-phase part of `fit_ms`, apportioned by per-block cycles.
@@ -5171,6 +5466,9 @@ fn prepare_seeds(
 ///   keeps the historical loop, where it is already cheap.
 #[cfg(feature = "cuda")]
 fn postfix_variation_for(cfg: &Config, train: &Sample) -> Result<Variation, String> {
+    if cfg.selection == Selection::Afp {
+        return Err("--selection afp runs on the node path".to_string());
+    }
     if cfg.fit_iters != 0 {
         return Err("constant fitting is enabled".to_string());
     }
@@ -5810,6 +6108,7 @@ fn run_postfix_search(
                             complexity: next.cost[next.slot_index(i, j)] as f64,
                             tree,
                             descriptor: None,
+                            age: 0,
                         })
                         .collect()
                 })
@@ -5880,6 +6179,7 @@ fn run_postfix_search(
                         complexity: pool.cost[pool.slot_index(i, j)] as f64,
                         tree,
                         descriptor: None,
+                        age: 0,
                     })
                     .collect()
             })
@@ -6809,7 +7109,7 @@ fn run_search(
             }
 
             // #85: keep the full-data parents for the selection step.
-            let parents: Option<Vec<Vec<Ind>>> = if screened {
+            let parents: Option<Vec<Vec<Ind>>> = if screened || cfg.selection == Selection::Afp {
                 Some(islands.clone())
             } else {
                 None
@@ -7021,6 +7321,13 @@ fn run_search(
             if let Some(parents) = parents {
                 let promote = promoted_count(cfg.pop);
                 for (pop, parents) in islands.iter_mut().zip(parents) {
+                    if !screened {
+                        // #465: survivors of parents + offspring + immigrants.
+                        let mut combined = parents;
+                        combined.extend(std::mem::take(pop));
+                        *pop = afp_select(combined, cfg.pop);
+                        continue;
+                    }
                     let mut offspring = std::mem::take(pop);
                     offspring.sort_by(|a, b| {
                         a.error
@@ -7045,7 +7352,11 @@ fn run_search(
                     }
                     let mut combined = parents;
                     combined.extend(promoted);
-                    select_population(&mut combined, cfg.pop);
+                    if cfg.selection == Selection::Afp {
+                        combined = afp_select(combined, cfg.pop);
+                    } else {
+                        select_population(&mut combined, cfg.pop);
+                    }
                     *pop = combined;
                 }
             }
@@ -7204,6 +7515,18 @@ fn run_search(
                             .map(|i| i.tree.clone())
                     })
                     .collect();
+                let best_ages: Vec<u32> = islands
+                    .iter()
+                    .map(|pop| {
+                        pop.iter()
+                            .min_by(|a, b| {
+                                a.error
+                                    .partial_cmp(&b.error)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map_or(0, |i| i.age)
+                    })
+                    .collect();
                 for ii in 0..islands.len() {
                     let src = (ii + 1) % islands.len();
                     if let Some(t) = &bests[src] {
@@ -7252,6 +7575,9 @@ fn run_search(
                             None
                         };
                         let slot = victim.or_else(|| {
+                            if cfg.selection == Selection::Afp {
+                                return afp_worst(&islands[ii]);
+                            }
                             islands[ii]
                                 .iter()
                                 .enumerate()
@@ -7269,6 +7595,7 @@ fn run_search(
                             } else {
                                 Ind::evaluated(t.clone(), gen_data, cfg) // #25
                             };
+                            worst.age = best_ages[src];
                         }
                     }
                 }
@@ -7505,8 +7832,7 @@ fn run_search(
     // f64 LM before it is scored on all training rows.
     let gpu_fit_used =
         cfg.fit_strategy.defers_to_gpu() && (gpu_used || fit_only_device);
-    let mut gpu_fit_refits = 0usize;
-    let mut refit_tail_s = 0.0;
+    let mut refit_report = RefitReport::default();
     if subsampling_active(cfg, train) || gpu_used || fit_only_device || resumed || fit_screened {
         // Generation fitness was estimated on subsets, or on the GPU in f32, so
         // the front is rebuilt from the surviving trees and scored on every
@@ -7514,8 +7840,7 @@ fn run_search(
         // number derived from it are full-data and match the CPU backend.
         let rebuilt = full_data_archive(&archive, &islands, &train_data, cfg, gpu_fit_used);
         archive = rebuilt.0;
-        gpu_fit_refits = rebuilt.1;
-        refit_tail_s = rebuilt.2;
+        refit_report = rebuilt.1;
     } else {
         for pop in &islands {
             for ind in pop {
@@ -7573,6 +7898,8 @@ fn run_search(
 
     // #284: the exact finalist refit is a fit-stage leaf, and the remaining tail
     // (test scoring, report bookkeeping) is a measured host window.
+    let gpu_fit_refits = refit_report.refits;
+    let refit_tail_s = refit_report.refit_s;
     run_ledger.record_stage(crate::gpu_stats::Stage::Fit, refit_tail_s);
     run_ledger.record_refit(gpu_fit_refits as u64, refit_tail_s);
     let tail_total = (t0.elapsed().as_secs_f64() - pre_tail_elapsed).max(0.0);
@@ -7590,6 +7917,9 @@ fn run_search(
         gpu.as_ref().map(|g| {
             let mut s = g.run_stats();
             s.fit_refits = gpu_fit_refits;
+            s.fit_refit_candidates = refit_report.candidates;
+            s.fit_refit_s = refit_report.refit_s;
+            s.fit_rescore_s = refit_report.rescore_s;
             s.fit_admission = cfg.fit_admission;
             s.fit_polish = cfg.fit_polish;
 // #284: absorb the device intervals and fit leaves, then add the
@@ -7883,6 +8213,7 @@ mod tests {
             error,
             complexity,
             descriptor: None,
+            age: 0,
         }
     }
 
@@ -8085,6 +8416,7 @@ mod tests {
             error: f64::NAN,
             complexity: before,
             descriptor: None,
+            age: 0,
         };
         refresh_after_fit(&mut ind, &cfg);
         let want = expr::simplify(&tree);
@@ -8586,6 +8918,7 @@ mod tests {
             error: 1.0,
             complexity: 1.0,
             descriptor: None,
+            age: 0,
         }];
 
         let mut rng = Mt::new(11);
@@ -8839,6 +9172,7 @@ mod tests {
             error: f64::INFINITY,
             complexity: 0.0,
             descriptor: None,
+            age: 0,
         };
 
         ind.refit_and_reeval(&first_data, &first, &cfg);
@@ -9190,6 +9524,159 @@ mod tests {
         }
         assert!(inserted.len() > 1, "the triple must expose the order dependence");
         assert_eq!(rebuilt.unwrap().0.len(), 2);
+    }
+
+    /// #495: the envelope is the lowest finite error at no greater cost; a tree
+    /// is selected when it is within the relative band of it.
+    #[test]
+    fn refit_band_selection_uses_the_lower_envelope() {
+        let costs = [1.0, 2.0, 2.0, 3.0, 4.0, 5.0];
+        let pre = [10.0, 8.0, 8.02, 8.5, f64::NAN, f64::INFINITY];
+        assert_eq!(refit_band_selection(&pre, &costs, 0.001), vec![0, 1]);
+        assert_eq!(refit_band_selection(&pre, &costs, 0.01), vec![0, 1, 2]);
+        assert_eq!(refit_band_selection(&pre, &costs, 0.0), vec![0, 1]);
+        // A tree cheaper than the others sets the envelope for the dearer ones.
+        let costs = [2.0, 1.0];
+        assert_eq!(refit_band_selection(&[5.0, 1.0], &costs, 0.5), vec![1]);
+        // A negative error (aic) is its own envelope.
+        assert_eq!(refit_band_selection(&[-4.0, -3.0], &[1.0, 2.0], 0.001), vec![0]);
+    }
+
+    /// #495: a tree outside the band that enters the front after the band
+    /// refits is refit before it is reported.
+    #[test]
+    fn fixpoint_refits_every_reported_member() {
+        let scored = vec![
+            fake_sol(1.0, 1.0, 1.0),
+            fake_sol(2.0, 2.0, 2.0),
+            fake_sol(3.0, 2.5, 3.0),
+        ];
+        let costs: Vec<f64> = scored.iter().map(|s| s.cost).collect();
+        let pre: Vec<f64> = scored.iter().map(|s| s.error).collect();
+        let first = refit_band_selection(&pre, &costs, 0.001);
+        assert_eq!(first, vec![0], "only the cheapest tree is inside the band");
+        let mut seen: Vec<Vec<u64>> = Vec::new();
+        // The refit of the first tree worsens its error (a simplification that
+        // changes the value), which uncovers the second.
+        let (front, refits) = refit_to_fixpoint(10, scored, first, |batch| {
+            seen.push(batch.iter().map(expr::structural_hash).collect());
+            batch
+                .into_iter()
+                .map(|tree| {
+                    let k = tree.kids[1].val;
+                    let error = if k == 1.0 { 3.0 } else { 2.0 };
+                    let tree = node(Op::Add, vec![input(0), constant(k + 0.5)]);
+                    Sol { tree, error, complexity: 1, cost: k }
+                })
+                .collect()
+        });
+        assert_eq!(refits, 2);
+        assert_eq!(seen.len(), 2, "the second round refits the exposed member");
+        assert_eq!(front.items.len(), 2);
+        let refit_ks: Vec<f64> = front.items.iter().map(|s| s.tree.kids[1].val).collect();
+        assert_eq!(refit_ks, vec![1.5, 2.5], "every reported member is a refit");
+    }
+
+    fn refit_band_trees() -> Vec<Node> {
+        let lin = |c: f64, d: f64| {
+            node(Op::Add, vec![node(Op::Mul, vec![constant(c), input(0)]), constant(d)])
+        };
+        vec![
+            input(0),
+            node(Op::Mul, vec![constant(1.7), input(0)]),
+            lin(1.9, 0.4),
+            lin(2.0, 0.6),
+            lin(0.3, -1.0),
+            node(Op::Add, vec![input(0), constant(0.2)]),
+            node(Op::Mul, vec![constant(0.4), input(1)]),
+            node(Op::Sin, vec![node(Op::Mul, vec![constant(1.2), input(0)])]),
+            node(Op::Add, vec![lin(2.0, 0.5), node(Op::Mul, vec![constant(0.01), input(1)])]),
+            node(Op::Mul, vec![input(0), input(1)]),
+        ]
+    }
+
+    fn refit_band_sample() -> Sample {
+        let mut s = sample();
+        for (row, y) in s.x.iter().zip(s.y.iter_mut()) {
+            *y = 2.0 * row[0] + 0.5;
+        }
+        s
+    }
+
+    fn rebuild_with_band(band: f64) -> (Archive, RefitReport) {
+        let s = refit_band_sample();
+        let cfg = Config { refit_band: band, threads: 1, ..Config::default() };
+        let view = EvalSample::new(&s, &cfg);
+        let mut a = Archive::new(100);
+        for t in refit_band_trees() {
+            a.items.push(Sol {
+                complexity: expr::complexity(&t),
+                cost: cfg.complexity_model.complexity(&t),
+                error: 0.0,
+                tree: t,
+            });
+        }
+        full_data_archive(&a, &[], &view, &cfg, true)
+    }
+
+    /// #495: `inf` is the historical path: refit every unique tree, score,
+    /// take the canonical front.
+    #[test]
+    fn refit_band_inf_matches_the_full_refit() {
+        let s = refit_band_sample();
+        let cfg = Config { threads: 1, ..Config::default() };
+        let view = EvalSample::new(&s, &cfg);
+        let scored: Vec<Sol> = refit_band_trees()
+            .into_iter()
+            .map(|mut t| {
+                crate::fit::fit_weighted_metric(
+                    &mut t,
+                    &view.sample.x,
+                    &view.sample.y,
+                    &view.sample.w,
+                    cfg.fit_iters,
+                    cfg.metric,
+                );
+                let t = expr::simplify(&t);
+                let error = score_tree(&t, &view, &cfg);
+                Sol {
+                    complexity: expr::complexity(&t),
+                    cost: cfg.complexity_model.complexity(&t),
+                    error,
+                    tree: t,
+                }
+            })
+            .collect();
+        let want = canonical_front(100, scored);
+        let (got, report) = rebuild_with_band(f64::INFINITY);
+        assert_eq!(item_bits(&got), item_bits(&want));
+        assert_eq!(got.hash(), want.hash());
+        assert_eq!(report.refits, report.candidates);
+    }
+
+    /// #495: the default band reports the same front costs and errors as the
+    /// full refit with fewer refits, and every reported member is a refit.
+    #[test]
+    fn default_band_front_matches_the_full_refit() {
+        let (want, full) = rebuild_with_band(f64::INFINITY);
+        let (got, banded) = rebuild_with_band(DEFAULT_REFIT_BAND);
+        assert_eq!(got.items.len(), want.items.len());
+        for (g, w) in got.items.iter().zip(&want.items) {
+            assert_eq!(g.cost.to_bits(), w.cost.to_bits());
+            assert!((g.error - w.error).abs() <= 1e-9 * (1.0 + w.error.abs()), "{} vs {}", g.error, w.error);
+        }
+        assert_eq!(banded.candidates, full.candidates);
+        assert!(banded.refits < full.refits, "{} of {}", banded.refits, full.refits);
+        assert!(banded.refits >= got.items.len());
+    }
+
+    /// #495: the saved setting round-trips through the checkpoint config.
+    #[test]
+    fn refit_band_is_a_saved_search_setting() {
+        let a = Config::default();
+        let b = Config { refit_band: f64::INFINITY, ..Config::default() };
+        assert_eq!(a.search_setting_differences(&b), vec!["refit_band"]);
+        assert!(a.search_setting_differences(&a).is_empty());
     }
 
     /// #330: `full_data_archive` returns the same canonical archive hash for
@@ -9572,6 +10059,88 @@ mod tests {
             "QD scoring evaluated a tree a second time for its descriptor"
         );
     }
+
+    fn aged_ind(tree: Node, error: f64, complexity: f64, age: u32) -> Ind {
+        Ind { tree, error, complexity, descriptor: None, age }
+    }
+
+    /// #465: the lowest-error individual always survives, whatever its age or
+    /// size.
+    #[test]
+    fn afp_keeps_best_error() {
+        let mut all: Vec<Ind> = Vec::new();
+        for i in 0..8 {
+            // Parents: old and mid-sized, errors 1.0 .. 8.0.
+            all.push(aged_ind(input(0), 1.0 + i as f64, 3.0 + i as f64, 20));
+        }
+        for i in 0..8 {
+            // Offspring: young and small, errors 2.0 .. 9.0 except one best.
+            let error = if i == 5 { 0.25 } else { 2.0 + i as f64 };
+            let complexity = if i == 5 { 40.0 } else { 1.0 };
+            all.push(aged_ind(input(0), error, complexity, if i == 5 { 30 } else { 0 }));
+        }
+        let kept = afp_select(all, 8);
+        assert_eq!(kept.len(), 8);
+        let best = kept.iter().map(|i| i.error).fold(f64::INFINITY, f64::min);
+        assert_eq!(best, 0.25);
+    }
+
+    /// #465: survivors age by one; offspring inherit the older parent's age;
+    /// immigrants and rebuilt individuals start at 0.
+    #[test]
+    fn afp_age_rules() {
+        let kept = afp_select(
+            vec![aged_ind(input(0), 1.0, 1.0, 4), aged_ind(input(0), 2.0, 2.0, 0)],
+            2,
+        );
+        assert_eq!(kept.iter().map(|i| i.age).collect::<Vec<_>>(), vec![5, 1]);
+
+        let s = sample();
+        let aggs = AggTable::from_sample(&s);
+        let mut cfg = Config::default();
+        cfg.pop = 40;
+        cfg.fit_iters = 0;
+        cfg.selection = Selection::Afp;
+        let data = EvalSample::new(&s, &cfg);
+        let mut isl: Vec<Ind> = (0..40)
+            .map(|i| {
+                let mut ind = Ind::evaluated(
+                    node(Op::Add, vec![input(0), constant(i as f64)]),
+                    &data,
+                    &cfg,
+                );
+                ind.age = if i % 2 == 0 { 2 } else { 9 };
+                ind
+            })
+            .collect();
+        let mut rng = Mt::new(11);
+        evolve_island(
+            &mut isl, &mut rng, &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None, false,
+            0, None, None, 1,
+        );
+        let immigrants = afp_immigrants(cfg.pop);
+        assert_eq!(isl.len(), cfg.pop + immigrants);
+        let (offspring, fresh) = isl.split_at(cfg.pop);
+        assert!(fresh.iter().all(|i| i.age == 0), "immigrants start at age 0");
+        assert!(offspring.iter().all(|i| i.age == 2 || i.age == 9));
+        assert!(offspring.iter().any(|i| i.age == 9), "the older parent's age is inherited");
+
+        let rebuilt = Ind::pending(input(0), &cfg);
+        assert_eq!(rebuilt.age, 0);
+        assert_eq!(Ind::evaluated(input(0), &data, &cfg).age, 0);
+    }
+
+    /// #465: migration replaces the member of the highest Pareto rank.
+    #[test]
+    fn afp_worst_is_the_highest_rank() {
+        let island = vec![
+            aged_ind(input(0), 1.0, 1.0, 0),
+            aged_ind(input(0), 5.0, 9.0, 7),
+            aged_ind(input(0), 2.0, 2.0, 1),
+        ];
+        assert_eq!(afp_worst(&island), Some(1));
+    }
+
     fn affine_sample() -> Sample {
         let x: Vec<Vec<f64>> = (0..60).map(|i| vec![i as f64 * 0.1 - 3.0]).collect();
         let y: Vec<f64> = x.iter().map(|r| 2.0 * r[0] + 1.0).collect();
