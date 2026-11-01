@@ -74,6 +74,7 @@ impl BenchSeries {
         self.times.is_empty()
     }
 
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn consistent(&self) -> bool {
         self.planes.iter().all(|p| p.len() == self.times.len())
             && self.times.windows(2).all(|w| w[0] < w[1])

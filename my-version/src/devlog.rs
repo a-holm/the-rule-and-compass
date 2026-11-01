@@ -1372,10 +1372,9 @@ mod tests {
         let path = dir.join("cost.ndjson");
         let mut log = Log::create(&path, 0).unwrap();
         let record = rec();
-        let mut line = record.json();
         // Warm the formatter and the page cache.
         for _ in 0..100 {
-            line = record.json();
+            let line = record.json();
             log.append(&line, false);
         }
         let n = 2000;
@@ -1398,7 +1397,6 @@ mod tests {
             summary_bytes < full_bytes,
             "the summary record must be smaller than the full one"
         );
-        line = record.json();
         assert!(
             per_event_us < 5000.0,
             "one event took {:.0} us; the log would not be free",
