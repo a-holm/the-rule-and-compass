@@ -404,3 +404,24 @@ fn cv_folds_honour_exclude() {
     assert!(cv[0].contains("\"folds\":[{"), "{}", cv[0]);
     assert_eq!(cv[0], cv[1]);
 }
+
+#[test]
+fn a_refused_cv_run_exits_before_the_search() {
+    let started = std::time::Instant::now();
+    let dir = scratch("cvpreflight");
+    let data = dir.join("d.csv");
+    series_csv(&data);
+    let d = s(&data);
+    lockbox::write_sidecar(&d, &locked(), "test").unwrap();
+    let run = dir.join("run.json");
+    let train = format!("ts < {}", T0 + 100 * H);
+    let test = format!("(ts >= {}) * (ts < {})", T0 + 100 * H, T0 + 150 * H);
+    let (code, _, err) = plain(&[
+        "--data", &d, "--time", "ts", "--train-select", &train, "--test-select", &test, "--cv", "k-fold",
+        "--cv-k", "3", "--generations", "1000000", "--pop", "2000", "--json-out", &s(&run),
+    ]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("cross-validation rows"), "{}", err);
+    assert!(!run.exists(), "run.json written: the search ran");
+    assert!(started.elapsed().as_secs() < 30, "the search ran before the refusal");
+}

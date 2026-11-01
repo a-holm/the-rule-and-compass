@@ -4585,6 +4585,27 @@ fn main() {
     };
     notes.extend(prepared.report.notes.iter().cloned());
     let prepared_s = run_start.elapsed().as_secs_f64();
+    // #145, #518: cross-validation draws its own folds, so the split guard
+    // cannot see them. Every row of the population (after --exclude and
+    // --filter) is a training or test row of some fold; refuse before the
+    // search. The declared locked test is checked even with --allow-lockbox.
+    let cv_keep: Option<Vec<bool>> = if cv_mode.is_some() {
+        let keep = match data::population_mask(&table, &spec, &prep) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        if let Err(e) = data::check_cv_lockbox(&table, &spec, &keep, allow_lockbox) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+        Some(keep)
+    } else {
+        None
+    };
+
     if cfg.metric == Metric::Slope {
         match prepared.require_slope_pairs() {
             Ok(pairs) => notes.push(format!(
@@ -5970,27 +5991,6 @@ fn main() {
             r.stability = Some(st.frequency(&r.shape));
         }
         Some(st)
-    } else {
-        None
-    };
-
-    // #145, #518: cross-validation draws its own folds, so the split guard above
-    // cannot see them. Every row of the population (after --exclude and
-    // --filter) is a training or test row of some fold; refuse before the
-    // first fold. The declared locked test is checked even with --allow-lockbox.
-    let cv_keep: Option<Vec<bool>> = if cv_mode.is_some() {
-        let keep = match data::population_mask(&table, &spec, &prep) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("error: {}", e);
-                std::process::exit(EXIT_INPUT);
-            }
-        };
-        if let Err(e) = data::check_cv_lockbox(&table, &spec, &keep, allow_lockbox) {
-            eprintln!("error: {}", e);
-            std::process::exit(EXIT_INPUT);
-        }
-        Some(keep)
     } else {
         None
     };
