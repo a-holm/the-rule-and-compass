@@ -10656,3 +10656,7 @@ mod slope_tests;
 #[cfg(test)]
 #[path = "gpu_fit_polish_tests.rs"]
 mod fit_polish_tests;
+
+#[cfg(test)]
+#[path = "gpu_hard_op_fit_tests.rs"]
+mod hard_op_fit_tests;
