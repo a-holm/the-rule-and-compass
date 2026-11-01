@@ -333,6 +333,8 @@ pub struct SuiteConfig {
     pub time_budget: Option<f64>,
     /// #76: let the Pareto front supply 15 % of parents.
     pub front_parents: bool,
+    /// #463: worker threads for fitting and scoring inside an island.
+    pub threads: usize,
 }
 
 impl Default for SuiteConfig {
@@ -348,6 +350,7 @@ impl Default for SuiteConfig {
             threshold: DEFAULT_THRESHOLD,
             time_budget: None,
             front_parents: true, // #76
+            threads: 1,
         }
     }
 }
@@ -456,6 +459,7 @@ pub fn run_one(p: &Problem, noise: f64, cfg: &SuiteConfig) -> RunResult {
     sc.seed = cfg.seed;
     sc.time_budget = cfg.time_budget;
     sc.front_parents = cfg.front_parents; // #76
+    sc.threads = cfg.threads.max(1); // #463
 
     let t0 = Instant::now();
     let out = search::run(&sc, &train, &test);

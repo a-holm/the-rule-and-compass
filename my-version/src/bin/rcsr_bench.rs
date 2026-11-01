@@ -44,6 +44,9 @@ OPTIONS:
   --metric <name>           search metric (default squared)
   --threshold <r2>          test R^2 counted as recovered (default 0.99)
   --time-budget <seconds>   wall-clock limit per run (default: none)
+  --threads <N>             worker threads for fitting and scoring inside an island
+                            (default: the available CPU cores; 1 = serial; the
+                            results do not depend on it)
   --no-front-parents        disable the 15% Pareto-front parent feedback (#76)
   --json                    print one JSON object instead of the text table
   --list                    list the suite's problems and exit
@@ -73,6 +76,7 @@ struct Args {
     json: bool,
     list: bool,
     front_parents: bool,
+    threads: usize,
 }
 
 impl Default for Args {
@@ -91,6 +95,7 @@ impl Default for Args {
             json: false,
             list: false,
             front_parents: true, // #76
+            threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         }
     }
 }
@@ -172,6 +177,11 @@ fn parse(args: &[String]) -> Result<Args, String> {
             }
             "--json" => a.json = true,
             "--no-front-parents" => a.front_parents = false,
+            "--threads" => {
+                a.threads = take(&mut i, "--threads")?
+                    .parse()
+                    .map_err(|_| "--threads: not an integer".to_string())?
+            }
             "--list" => a.list = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown option '{}'", other)),
@@ -199,6 +209,7 @@ fn to_config(a: &Args) -> SuiteConfig {
         threshold: a.threshold,
         time_budget: a.time_budget,
         front_parents: a.front_parents,
+        threads: a.threads,
     }
 }
 
