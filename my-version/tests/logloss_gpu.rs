@@ -371,6 +371,7 @@ fn tiny_logloss_config(seed: u32) -> Config {
         patience: 0,
         seed,
         metric: Metric::LogLoss,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
         ops: vec![Op::Add, Op::Sub, Op::Mul, Op::Tanh, Op::Neg, Op::Square],
         ..Default::default()
     }
