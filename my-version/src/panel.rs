@@ -2073,7 +2073,7 @@ HOURLY V2 PANEL (#259):
   rcsr panel build --data base_h1.rcsb --membership membership.csv --out panel.rcsb [options]
   rcsr panel validate --data panel.rcsb [--base base_h1.rcsb] [--membership membership.csv]
   rcsr panel schema --data panel.rcsb [--panel-version V] [--verify]
-  rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b --out out.rcsb [--scratch dir]
+  rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b|@all --out out.rcsb [--skip-existing] [--scratch dir]
   rcsr panel rank --data panel.rcsb --column lbl_h1_fwd --name lbl_h1_xs --out out.rcsb [--min-members 20]
                   per-timestamp rank in [-1, 1] over the panel members; adds the xs_rank target spec (#493)
   --input <dir>           archive directory (SYMBOL/SYMBOL-15m-YYYY-MM.zip); no network

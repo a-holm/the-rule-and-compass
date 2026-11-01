@@ -396,6 +396,11 @@ pub struct Knobs {
     pub dispatch: Option<crate::dispatch::DispatchMode>,
     /// #470: `--linear-scaling`.
     pub linear_scaling: bool,
+    /// #471: node-path variation settings.
+    pub mutation_mix: Option<crate::search::MutationMix>,
+    pub tree_arity: Option<crate::search::TreeArity>,
+    pub crossover_internal: Option<f64>,
+    pub adaptive_mix: bool,
     /// #496: arithmetic of the device fit polish.
     pub fit_polish: Option<crate::fit::FitPolish>,
     /// #464: scale-free patience tolerance.
@@ -783,6 +788,16 @@ fn base_config(cfg: &SuiteConfig, seed: u32) -> Config {
         sc.dispatch = v;
     }
     sc.linear_scaling = k.linear_scaling; // #470
+    if let Some(v) = k.mutation_mix {
+        sc.mutation_mix = v; // #471
+    }
+    if let Some(v) = k.tree_arity {
+        sc.tree_arity = v;
+    }
+    if let Some(v) = k.crossover_internal {
+        sc.crossover_internal = v;
+    }
+    sc.adaptive_mix = k.adaptive_mix;
     if let Some(v) = k.fit_polish {
         sc.fit_polish = v;
     }
@@ -1471,7 +1486,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
     };
     let opt_u = |v: Option<usize>| json_opt(v);
     format!(
-        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"selection\":{},\"dispatch\":{},\"fit_polish\":{},\"linear_scaling\":{},\"reject_constant_offspring\":{},\"patience_tol\":{},\"stop_front\":{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
+        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"selection\":{},\"dispatch\":{},\"fit_polish\":{},\"linear_scaling\":{},\"reject_constant_offspring\":{},\"mutation_mix\":{},\"tree_arity\":{},\"crossover_internal\":{},\"adaptive_mix\":{},\"patience_tol\":{},\"stop_front\":{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
         GENERATOR_VERSION,
         json_number(cfg.threshold),
         json_number(SIGNAL_THRESHOLD),
@@ -1494,6 +1509,10 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
         k.fit_polish.map_or("null".to_string(), |v| format!("\"{}\"", v.name())),
         k.linear_scaling,
         k.reject_constant_offspring,
+        k.mutation_mix.map_or("null".to_string(), |v| format!("\"{}\"", v.as_str())),
+        k.tree_arity.map_or("null".to_string(), |v| format!("\"{}\"", v.as_str())),
+        k.crossover_internal.map_or("null".to_string(), json_number),
+        k.adaptive_mix,
         json_opt_f(k.patience_tol),
         opt_u(k.stop_front),
         env!("CARGO_PKG_VERSION"),

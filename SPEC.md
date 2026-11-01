@@ -317,7 +317,16 @@ Per generation, per island:
      the dominating individual, or a random one if they are incomparable;
    - **variation**: point-mutate an operator, replace/insert/delete a random
      subtree, perturb a constant, or **crossover** (swap random subtrees of two
-     parents);
+     parents). The node path also has opt-in edits: **insert** (wrap a node in a
+     random operator), **delete** (replace a node by one of its children),
+     **swap** (exchange the operands of a non-commutative binary operator) and
+     **rotate** (`o1(a, o2(b, c))` becomes `o2(o1(a, b), c)`), selected with
+     `--mutation-mix extended`; `--tree-arity balanced` draws the arity class of
+     a random operator first (binary 0.5, unary 0.4, ternary 0.1);
+     `--crossover-internal P` cuts at an internal node with probability `P`;
+     `--adaptive-mix` lets each island reweight the seven edit kinds from the
+     success rate of the last 10 generations. The flat postfix engine keeps its
+     own edits and refuses these flags;
    - **constant fitting**: for each `Const` leaf, try a small set of
      multiplicative/additive steps and keep any improvement against the
      training error, repeated for a few passes;
