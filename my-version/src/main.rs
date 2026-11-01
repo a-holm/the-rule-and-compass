@@ -254,6 +254,9 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   --allow-target-structure   run a D13c target anyway for a diagnostic replay: warns,
                              records check.status=overridden and a proxy table.
                              D13a and D13b have no override
+  --require-clean-inputs   refuse (exit 5) a run whose inputs include a construction column of the
+                             target spec (for example the vol96 scale of lbl_*_y); without the flag
+                             the column is only recorded in check.construction_in_vars
                              (it reads the next bar; otherwise refused)
   --center <how>             subtract mean (default), median, min, max or none
   --scale <how>              divide by std (default), iqr, range or none
@@ -606,6 +609,15 @@ SEARCH:
                              refits for --fit-strategy gpu (default 4096,
                              0 = unbounded). Fallbacks beyond the bound keep
                              their finite device constants and are counted
+  --fit-polish <f64|f32|off>  arithmetic of the device fit kernel's polish, the
+                             undamped Gauss-Newton steps after the damped LM
+                             (default f64). f64 re-baselines and steps on the
+                             exact f64 rows; f32 steps on the f32 rows of the LM
+                             phase; off returns after the LM phase. The search
+                             ranks on the f32 evaluator and the archive is
+                             refit exactly on the CPU in every mode. Only the
+                             device fit arm reads it; a resume refuses a
+                             different saved value
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
   --no-dedup                 disable structural de-duplication
   --no-front-parents         draw every parent from the island tournament;
@@ -944,6 +956,29 @@ fn jnum(v: f64) -> String {
     }
 }
 
+/// #482: `split.train_time` and `split.validation_time` as `[first, last]` raw
+/// time keys, with a leading comma. Empty without a time column.
+fn split_time_json(keys: Option<&data::RowKeys>) -> String {
+    let range = |v: &[f64]| -> Option<(f64, f64)> {
+        let finite = || v.iter().copied().filter(|t| t.is_finite());
+        let lo = finite().fold(f64::INFINITY, f64::min);
+        let hi = finite().fold(f64::NEG_INFINITY, f64::max);
+        (lo <= hi).then_some((lo, hi))
+    };
+    let show = |r: Option<(f64, f64)>| match r {
+        Some((a, b)) => format!("[{},{}]", jnum(a), jnum(b)),
+        None => "null".to_string(),
+    };
+    match keys {
+        Some(k) => format!(
+            ",\"train_time\":{},\"validation_time\":{}",
+            show(range(&k.train)),
+            show(k.validation.as_deref().and_then(range))
+        ),
+        None => String::new(),
+    }
+}
+
 /// #118: best reported error and constant-mean baseline error, the two inputs
 /// to quality-per-GPU-hour. Both are on the same full-data f64 scale as the
 /// archive. `inf`/`nan` yields `quality_per_gpu_hour = null` rather than a
@@ -1038,7 +1073,7 @@ fn ledger_json(
         rcsr::gpu_stats::Ratio::undefined(f64::NAN, f64::NAN, "decades_per_gpu_hour", "run")
     };
     format!(
-        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"fallback_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
+        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"fallback_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
         jnum(l.wall_s()),
         stages,
         jnum(l.stage_sum_s()),
@@ -1063,6 +1098,8 @@ fn ledger_json(
         ratio_json(Some(&l.fit_kernel_duty())),
         jnum(l.fit_host_s()),
         jnum(l.fit_kernel_s()),
+        jnum(l.fit_kernel_lm_s()),
+        jnum(l.fit_kernel_polish_s()),
         jnum(l.fit_fallback_s()),
         jnum(l.refit_s()),
         l.refits(),
@@ -1177,7 +1214,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1191,6 +1228,9 @@ fn gpu_json(
         ops_json(&g.fit_status_by_label),
         g.fit_refits,
         jnum(g.fit_ms / 1000.0),
+        jnum(g.ledger.fit_kernel_lm_s()),
+        jnum(g.ledger.fit_kernel_polish_s()),
+        jstr(g.fit_polish.name()),
         jnum(g.fit_host_ms / 1000.0),
         jnum(g.fit_fallback_ms / 1000.0),
         g.fit_fallback_bounded,
@@ -1685,6 +1725,8 @@ impl DevSink {
             duty_run: outcome.gpu.as_ref().map(|g| g.ledger.duty_run().value),
             unaccounted_s: outcome.gpu.as_ref().map(|g| g.ledger.unaccounted_s()),
             fit_kernel_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_s()),
+            fit_kernel_f32_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_lm_s()),
+            fit_kernel_f64_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_polish_s()),
             fit_fallback_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_fallback_s()),
             events,
             bytes,
@@ -2154,6 +2196,7 @@ fn main() {
     // #254: declared target spec and the structural-term override.
     let mut target_spec_path: Option<String> = None;
     let mut allow_target_structure = false;
+    let mut require_clean_inputs = false;
     let mut require_validation = false;
     let mut equivalence_z = rcsr::gate_run::DEFAULT_Z;
     let mut noise_lag_arg: Option<String> = None;
@@ -2210,6 +2253,7 @@ fn main() {
     let mut fit_rows_set = false;
     // #255: explicit --fit-fallback-max for the resume settings check.
     let mut fit_fallback_max_set = false;
+    let mut fit_polish_set = false;
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
     let mut front_parents_set = false;
@@ -2445,6 +2489,7 @@ fn main() {
             "--allow-lockbox" => allow_lockbox = true,
             "--target-spec" => target_spec_path = Some(val!()),
             "--allow-target-structure" => allow_target_structure = true,
+            "--require-clean-inputs" => require_clean_inputs = true,
             "--require-validation" => require_validation = true,
             "--equivalence-z" => {
                 let v = val!();
@@ -2589,6 +2634,20 @@ fn main() {
             "--fit-fallback-max" => {
                 cfg.fit_fallback_max = val!().parse().unwrap_or(cfg.fit_fallback_max);
                 fit_fallback_max_set = true;
+            }
+            // #496: arithmetic of the device fit polish.
+            "--fit-polish" => {
+                let v = val!();
+                match fit::FitPolish::parse(&v) {
+                    Some(s) => {
+                        cfg.fit_polish = s;
+                        fit_polish_set = true;
+                    }
+                    None => {
+                        eprintln!("error: --fit-polish needs f64, f32 or off, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
             }
             // #116: exact constant-fitting arm.
             "--fit-strategy" => {
@@ -3223,6 +3282,13 @@ fn main() {
         }
         // #255: the fallback bound is saved because reaching it changes which
         // candidates keep device constants.
+        if fit_polish_set && cfg.fit_polish != saved.fit_polish {
+            conflicts.push(format!(
+                "--fit-polish {} (saved {})",
+                cfg.fit_polish.name(),
+                saved.fit_polish.name()
+            ));
+        }
         if fit_fallback_max_set && cfg.fit_fallback_max != saved.fit_fallback_max {
             conflicts.push(format!(
                 "--fit-fallback-max {} (saved {})",
@@ -3500,9 +3566,13 @@ fn main() {
         eprintln!("error: --allow-target-structure needs a target spec (--target-spec or <data>.targets.json)");
         std::process::exit(EXIT_USAGE);
     }
+    if require_clean_inputs && target_resolved.is_none() {
+        eprintln!("error: --require-clean-inputs needs a target spec (--target-spec or <data>.targets.json)");
+        std::process::exit(EXIT_USAGE);
+    }
     let mut target_check: Option<target::Check> = None;
     if let (Some(r), false) = (&target_resolved, vars.is_empty()) {
-        target_check = Some(enforce_target_check(&r.spec, &vars, allow_target_structure));
+        target_check = Some(enforce_target_check(&r.spec, &vars, allow_target_structure, require_clean_inputs));
     }
 
     // #71/#112: the guard and the backing choice happen before any resident
@@ -3614,7 +3684,17 @@ fn main() {
                         .filter(|c| c.numeric && !excluded.contains(&c.name.as_str()))
                         .map(|c| c.name.clone())
                         .collect();
-                    match registry::select_view(&candidates, size, cfg.seed as u64, view_index) {
+                    let construction: Vec<(String, String)> = target_resolved
+                        .as_ref()
+                        .map(|r| {
+                            r.spec
+                                .construction_columns
+                                .iter()
+                                .map(|c| (c.clone(), format!("construction column of {}", r.spec.column)))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    match registry::select_view_excluding(&candidates, size, cfg.seed as u64, view_index, &construction) {
                         Ok(v) => {
                             eprintln!(
                                 "view {}: {} columns from {} families (seed {}, view {})",
@@ -3624,6 +3704,15 @@ fn main() {
                                 v.seed,
                                 v.view
                             );
+                            if v.delivered < v.size {
+                                eprintln!(
+                                    "view {}: requested {} columns, delivered {}: {} candidate famil(ies) at most two columns each",
+                                    v.id,
+                                    v.size,
+                                    v.delivered,
+                                    v.families.len()
+                                );
+                            }
                             vars = v.columns.clone();
                             view_record = Some(v);
                         }
@@ -4054,7 +4143,7 @@ fn main() {
         std::process::exit(EXIT_LEAKAGE);
     }
     if let (Some(r), None) = (&target_resolved, &target_check) {
-        target_check = Some(enforce_target_check(&r.spec, &vars, allow_target_structure));
+        target_check = Some(enforce_target_check(&r.spec, &vars, allow_target_structure, require_clean_inputs));
     }
 
     let known_vars: Vec<usize> = vars.iter().filter_map(|v| table.index_of(v).ok()).collect();
@@ -6470,7 +6559,7 @@ fn main() {
                 String::new()
             };
             let split_json = format!(
-                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"lag_menu\":[{}],\"nvars_before\":{},\"nvars_after\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]{}}}",
+                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"lag_menu\":[{}],\"nvars_before\":{},\"nvars_after\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]{}{}}}",
                 jstr(prepared.report.mode),
                 prepared.report.rows_total,
                 prepared.train.len(),
@@ -6496,7 +6585,8 @@ fn main() {
                 lag_report.series,
                 lag_report.history_rows,
                 notes.iter().map(|n| jstr(n)).collect::<Vec<_>>().join(","),
-                target::split_purge_json(&prepared.report)
+                target::split_purge_json(&prepared.report),
+                split_time_json(prepared.keys.as_ref())
             );
             // #264: lockbox facts of the loaded table (rows, date range, read count).
             let lockbox_json = {
@@ -6831,7 +6921,7 @@ fn main() {
                 None => backend_json,
             };
             let result_json = format!(
-                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"lockbox\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"lockbox\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"search\":{{\"candidates_evaluated\":{}}},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
                 jstr(VERSION),
@@ -6852,6 +6942,7 @@ fn main() {
                 target_spec_json,
                 prepared.prep.json(),
                 outcome.generations,
+                outcome.candidates_evaluated,
                 outcome.converged_early,
                 jstr(outcome.stop_reason),
                 // #18: the four convergence numbers.
@@ -7571,8 +7662,17 @@ fn enforce_target_check(
     spec: &target::TargetSpec,
     vars: &[String],
     allow_structure: bool,
+    require_clean: bool,
 ) -> target::Check {
     match target::check(spec, vars, allow_structure) {
+        Ok(check) if require_clean && !check.construction_in_vars.is_empty() => {
+            eprintln!(
+                "error: --require-clean-inputs: construction column(s) of target '{}' are inputs: {}",
+                spec.column,
+                check.construction_in_vars.join(", ")
+            );
+            std::process::exit(EXIT_LEAKAGE);
+        }
         Ok(check) => check,
         Err(report) => {
             if let Err(failure) = report.result() {
@@ -9221,6 +9321,20 @@ OPTIONS:
   --target <col>             forward-return column used for P&L
   --expr <formula>           score expression, variables resolved by column name;
                              repeat to select among candidates on the validation slice
+  --front <run.json>         candidates from the Pareto front of a run (one per
+                             member, labelled front_rank_<k>), instead of --expr.
+                             --vars, --target (the run's return column) and
+                             --trials (search.candidates_evaluated) default to
+                             the run. The run's position rule is carried: the
+                             objective threshold as a fixed threshold and its
+                             per-side cost; --threshold-fixed,
+                             --threshold-quantile and --cost-bps override.
+                             A window whose test_start is below the last train
+                             or validation time of the run plus its required
+                             purge exits 2
+  --allow-in-sample-windows  with --front: report such a window as
+                             in_sample:true instead of refusing it
+                             (diagnostics only)
   --select-band              #308: select among repeated --expr candidates with
                              the P&L band instead of validation MSE. The screen is
                              the fused long-only reduction on validation rows; the
@@ -9395,6 +9509,9 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut verify_read = false;
     let mut lockbox_arg: Option<String> = None;
     let mut expect_hash: Option<String> = None;
+    let mut front_path: Option<String> = None;
+    let mut allow_in_sample = false;
+    let mut cost_set = false;
 
     let need = |args: &[String], i: usize, flag: &str| -> String {
         match args.get(i) {
@@ -9466,8 +9583,14 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--cost-bps" => {
                 cost_bps = number(need(args, i + 1, "--cost-bps"), "--cost-bps");
+                cost_set = true;
                 i += 1;
             }
+            "--front" => {
+                front_path = Some(need(args, i + 1, "--front"));
+                i += 1;
+            }
+            "--allow-in-sample-windows" => allow_in_sample = true,
             "--threshold-quantile" => {
                 quantile = number(
                     need(args, i + 1, "--threshold-quantile"),
@@ -9656,12 +9779,73 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: walkforward needs --data\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
     });
+    let mut front_run: Option<rcsr::run_json::RunFile> = None;
+    if let Some(path) = &front_path {
+        if !expressions.is_empty() {
+            eprintln!(
+                "error: --front and --expr are alternatives; the candidates come from one source\n\n{}",
+                walkforward_usage()
+            );
+            std::process::exit(EXIT_USAGE);
+        }
+        let run = rcsr::run_json::RunFile::load(path).unwrap_or_else(|e| {
+            eprintln!("error: --front {}", e);
+            std::process::exit(EXIT_INPUT);
+        });
+        if run.front.is_empty() {
+            eprintln!("error: --front {}: the Pareto front is empty", path);
+            std::process::exit(EXIT_INPUT);
+        }
+        if run.train_time.is_none() {
+            eprintln!(
+                "error: --front {}: the run has no split.train_time (no time column); \
+                 the walk-forward needs time",
+                path
+            );
+            std::process::exit(EXIT_INPUT);
+        }
+        expressions = run.front.iter().map(|m| m.expression.clone()).collect();
+        popts.front = Some(walkforward::FrontSource {
+            run: path.clone(),
+            run_sha256: run.sha256.clone(),
+            labels: run.front.iter().map(|m| format!("front_rank_{}", m.rank)).collect(),
+        });
+        if vars_src.is_none() && !run.variables.is_empty() {
+            vars_src = Some(run.variables.join(","));
+        }
+        if target.is_none() {
+            target = run.return_column.clone();
+        }
+        if popts.trials.is_none() {
+            popts.trials = Some(match run.candidates_evaluated {
+                Some(n) if n > 0 => n as usize,
+                _ => {
+                    eprintln!(
+                        "error: --front {}: the run has no search.candidates_evaluated; pass --trials",
+                        path
+                    );
+                    std::process::exit(EXIT_USAGE);
+                }
+            });
+        }
+        if threshold_fixed.is_none() && !quantile_set {
+            if let Some(theta) = run.threshold {
+                threshold_fixed = Some(theta);
+            }
+        }
+        if !cost_set {
+            if let Some(bps) = run.per_side_bps {
+                cost_bps = bps;
+            }
+        }
+        front_run = Some(run);
+    }
     let target = target.unwrap_or_else(|| {
         eprintln!("error: walkforward needs --target\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
     });
     if expressions.is_empty() {
-        eprintln!("error: walkforward needs --expr\n\n{}", walkforward_usage());
+        eprintln!("error: walkforward needs --expr or --front\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
     }
     if threshold_fixed.is_some() && quantile_set {
@@ -9755,6 +9939,22 @@ fn run_walkforward(args: &[String]) -> ! {
             walkforward_usage()
         );
         std::process::exit(EXIT_USAGE);
+    }
+    if let Some((earliest, seen, purge)) = front_run.as_ref().and_then(|r| r.earliest_test_start()) {
+        for w in &windows {
+            if w.test_start < earliest {
+                if allow_in_sample {
+                    popts.in_sample_windows.push(w.label.clone());
+                    continue;
+                }
+                eprintln!(
+                    "error: window '{}' tests rows the run trained or selected on \
+                     (test_start {} < last seen {} + purge {})",
+                    w.label, w.test_start, seen, purge
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+        }
     }
     let vars: Vec<String> = vars_src
         .map(|s| {

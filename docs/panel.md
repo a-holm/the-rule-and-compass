@@ -254,6 +254,26 @@ Decodes the 15m archives and writes the symbol-major hourly base store `base_h1.
 
 Columns: `ts symbol open high low close volume quote_volume trades taker_buy_base taker_buy_quote cov15m gap flags traded dup_rows archive_unit`.
 
+### Pinned symbol universe (`--symbols`)
+
+`panel snapshot`, `panel base` and `prep` accept `--symbols <file>`: one symbol per line, `#` comments and blank lines ignored, duplicates collapsed, an empty list is a usage error (exit 2). Names compare byte-wise with the archive directory names (upper-cased ASCII). The filter runs on the file list before any archive is opened. A pinned list comes from `rcsr-acquire universe`.
+
+The `universe` block in `snapshot.json`, `<out>.manifest.json` (base) and the `prep` manifest records:
+
+```json
+"universe": {"file": "universe_all_usdt_pit.txt", "sha256": "...", "listed": 588, "kept": 576,
+             "dropped": ["AUDUSDT", "..."], "missing": ["AUSDT", "..."], "empty": ["HYPEUSDT", "..."]}
+```
+
+* `listed = kept + missing + empty`.
+* `kept`: listed symbols with at least one archive.
+* `dropped`: directories below `--input` (with or without archives) that are not listed. They contribute no rows.
+* `missing`: listed symbols with no directory. The list is the venue universe and the archive may lag, so this is not an error.
+* `empty`: listed symbols whose directory holds no archive (for example `HYPEUSDT`). They contribute no rows and are not an error.
+* If no archive symbol is listed, the command fails (exit 3).
+
+`base --resume` folds the list SHA-256 into the per-symbol cache key, so a changed list rebuilds the parts and the same list reuses them with a byte-identical store. Without `--symbols` the behaviour, the cache keys and the output bytes are unchanged and there is no `universe` block.
+
 ### P2 and P4 `membership`, `build`
 
 `membership` is unchanged. `build` keeps the rows that are members at `ts` (same rules as above: no fill across a gap, listing, delisting or membership exclusion) and writes the time-major store sorted by `(ts, symbol)`.

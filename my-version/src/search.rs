@@ -95,6 +95,8 @@ pub struct Config {
     /// affine in every constant and fall back to LM otherwise. Changing it
     /// changes the trajectory, so it is a saved search setting.
     pub fit_strategy: crate::fit::FitStrategy,
+    /// #496: arithmetic of the device fit kernel's polish. Saved search state.
+    pub fit_polish: crate::fit::FitPolish,
     /// #223: which offspring the deferred GPU fit admits. A resolved default
     /// or `auto` GPU arm admits every candidate with constants; an explicit
     /// `gpu` arm keeps the screened fraction. Saved search state.
@@ -262,6 +264,9 @@ pub struct GenCounters {
     /// #463: candidates dropped after the fit because they exceeded the
     /// complexity cap; each one re-enters variation.
     pub post_fit_drops: std::sync::atomic::AtomicU64,
+    /// Whether the fit, eval and batch timers read the clock. Off outside a
+    /// development log; the counts are kept either way.
+    pub timed: bool,
 }
 
 impl GenCounters {
@@ -306,7 +311,7 @@ fn fit_counted(
     fit: &Sample,
     score: &Sample,
 ) -> Option<FitResult> {
-    let t = counters.map(|_| std::time::Instant::now());
+    let t = counters.filter(|c| c.timed).map(|_| std::time::Instant::now());
     let out = fit_constants(tree, cfg, fit, score);
     if let (Some(c), Some(t)) = (counters, t) {
         GenCounters::add(&c.fitted, 1);
@@ -318,7 +323,7 @@ fn fit_counted(
 /// #211: an evaluated individual, timed only when a log is attached.
 #[inline]
 fn eval_counted(counters: Option<&GenCounters>, make: impl FnOnce() -> Ind) -> Ind {
-    let t = counters.map(|_| std::time::Instant::now());
+    let t = counters.filter(|c| c.timed).map(|_| std::time::Instant::now());
     let ind = make();
     if let (Some(c), Some(t)) = (counters, t) {
         GenCounters::add(&c.eval_ns, t.elapsed().as_nanos().min(u64::MAX as u128) as u64);
@@ -395,7 +400,7 @@ fn fit_and_score(
     defer_gpu: bool,
     counters: Option<&GenCounters>,
 ) -> Vec<Ind> {
-    let t = counters.map(|_| std::time::Instant::now());
+    let t = counters.filter(|c| c.timed).map(|_| std::time::Instant::now());
     let workers = batch_workers(workers, trees.len(), train.sample.len());
     let out = par_map(workers, trees, |mut tree| {
         let mut fitted = None;
@@ -438,6 +443,7 @@ impl Default for Config {
             init_depth: 3,
             fit_iters: 8,
             fit_strategy: crate::fit::FitStrategy::Exact, // #116
+            fit_polish: crate::fit::FitPolish::F64,
             fit_admission: crate::fit::FitAdmission::Screened,
             fit_report: false,
             dedup: true,
@@ -505,6 +511,7 @@ impl Config {
         compare!(init_depth, "init_depth");
         compare!(fit_iters, "fit_iters");
         compare!(fit_strategy, "fit_strategy"); // #116
+        compare!(fit_polish, "fit_polish");
         compare!(fit_admission, "fit_admission");
         compare!(dedup, "dedup");
         // #256: `time_budget` is a per-process limit, not search state; a resumed
@@ -741,6 +748,8 @@ struct GpuSearch {
     fit_status_by_label: BTreeMap<String, usize>,
     /// #169: wall time spent in the batched fit kernels, milliseconds.
     fit_ms: f64,
+    /// #496: the polish-phase part of `fit_ms`, apportioned by cycle ratio.
+    fit_polish_ms: f64,
     /// #169: wall time spent in the whole fit stage (kernel, launch, CPU
     /// fallback and write-back), milliseconds.
     fit_host_ms: f64,
@@ -1003,6 +1012,7 @@ impl GpuSearch {
                     fit_fallback_improved_by_cause: BTreeMap::new(),
                     fit_status_by_label: BTreeMap::new(),
                     fit_ms: 0.0,
+                    fit_polish_ms: 0.0,
                     fit_host_ms: 0.0,
                     fit_fallback_ms: 0.0,
                     fit_fallback_bounded: 0,
@@ -1167,6 +1177,7 @@ impl GpuSearch {
                 Some(ev) => ev,
                 None => &mut self.ev,
             };
+            dev.set_fit_polish(cfg.fit_polish);
             let (out, ms) = if maximum_arm {
                 // #227: the exact maximum-error polish on the squared start.
                 dev.max_fit_batch(&plans, cfg.fit_iters)
@@ -1193,6 +1204,7 @@ impl GpuSearch {
             };
             if ms > 0.0 {
                 self.fit_ms += ms as f64;
+                self.fit_polish_ms += dev.take_polish_ms(ms);
                 // #284: the fit kernel is one device interval on the run clock;
                 // its duration is the raw event time, not the host envelope.
                 match dev.take_span_start_s(crate::gpu::SPAN_FIT) {
@@ -1826,6 +1838,7 @@ impl GpuSearch {
             self.fit_ms / 1000.0,
             self.fit_fallback_ms / 1000.0,
         );
+        ledger.record_fit_polish_split(self.fit_polish_ms / 1000.0);
         ledger.record_fit_counters(
             self.fit_attempts as u64,
             self.fit_gpu as u64,
@@ -1850,6 +1863,7 @@ impl GpuSearch {
             fit_status_by_label: self.fit_status_by_label.clone(),
             fit_refits: 0,
             fit_ms: self.fit_ms,
+            fit_polish_ms: self.fit_polish_ms,
             fit_host_ms: self.fit_host_ms,
             fit_fallback_ms: self.fit_fallback_ms,
 fit_fallback_bounded: self.fit_fallback_bounded,
@@ -1859,6 +1873,7 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             score_rows: self.ev.rows(),
             fit_twin_bytes: fit_ev.fit_twin().1,
             fit_subsample_hash: self.fit_sub.as_ref().map(|s| s.hash),
+            fit_polish: crate::fit::FitPolish::F64,
             fit_admission: crate::fit::FitAdmission::Screened,
             ledger,
             memory_plan: self.memory_plan.clone(),
@@ -2471,6 +2486,7 @@ fn score_pipeline_batch(
         let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().map(|(_, p)| p).collect();
         // #236: slope always starts from the squared warm start and keeps the
         // incoming constants unless it improves on them.
+        g.ev.set_fit_polish(fit.polish);
         let (out, ms) = if fit.loss == crate::fit::DeviceLoss::Slope {
             g.ev.slope_fit_batch(&refs, fit.iters)
         } else {
@@ -2478,6 +2494,7 @@ fn score_pipeline_batch(
         };
         if ms > 0.0 {
             g.fit_ms += ms as f64;
+            g.fit_polish_ms += g.ev.take_polish_ms(ms);
         }
         if ms < 0.0 || out.len() != plans.len() {
             for (k, _) in &plans {
@@ -4270,6 +4287,7 @@ struct PipelineFit {
     loss: crate::fit::DeviceLoss,
     iters: usize,
     metric: Metric,
+    polish: crate::fit::FitPolish,
 }
 
 /// #286: overlap-with-fit is legal only where the serial admission set is
@@ -4571,6 +4589,10 @@ pub struct GpuRunStats {
     pub fit_refits: usize,
     /// #169: wall time spent in the batched fit kernels, milliseconds.
     pub fit_ms: f64,
+    /// #496: the polish-phase part of `fit_ms`, apportioned by per-block cycles.
+    pub fit_polish_ms: f64,
+    /// #496: arithmetic of the device fit polish.
+    pub fit_polish: crate::fit::FitPolish,
     /// #169: wall time spent in the whole fit stage, milliseconds.
     pub fit_host_ms: f64,
 /// #284/#255: wall time spent in the exact CPU fallback fits, milliseconds.
@@ -4654,6 +4676,9 @@ pub struct Outcome {
     /// by the development log's `run_end` event; it is not printed, so the
     /// default output is unchanged.
     pub stop_reason: &'static str,
+    /// #482: offspring scored over the run, summed over islands and
+    /// generations, including generations before a resume.
+    pub candidates_evaluated: u64,
 }
 
 /// #256: the reported `converged_early`. `stopped` is the loop-control flag
@@ -4789,6 +4814,7 @@ fn snapshot(
     train: &Sample,
     test: &Sample,
     final_archive: Option<&Archive>,
+    candidates_evaluated: u64,
 ) -> Checkpoint {
     let (words, idx) = main_rng.state();
     Checkpoint {
@@ -4829,6 +4855,7 @@ fn snapshot(
             backend == Backend::Gpu,
         )),
         target_spec: None,
+        candidates_evaluated,
     }
 }
 
@@ -5318,6 +5345,7 @@ fn run_postfix_search(
     mut converged_early: bool,
     mut best_prev: f64,
     mut no_improve: usize,
+    mut candidates: u64,
     save_every: usize,
     mut on_checkpoint: Option<CheckpointFn<'_>>,
     backend_reason: Option<String>,
@@ -5435,6 +5463,7 @@ fn run_postfix_search(
         run_ledger.record_stage(crate::gpu_stats::Stage::Vary, stage_generate);
         run_ledger.record_stage(crate::gpu_stats::Stage::Archive, stage_archive);
         eval_stage_total += stage_eval;
+        candidates += (n_islands * pop) as u64;
         gpu_stats.push(GpuGenStats {
             generation: gen,
             opcodes: Default::default(),
@@ -5632,6 +5661,7 @@ fn run_postfix_search(
                 train,
                 test,
                 None,
+                candidates,
             );
             emit(&mut on_checkpoint, &cp);
             io_stage_total += io_mark.elapsed().as_secs_f64();
@@ -5701,6 +5731,7 @@ fn run_postfix_search(
             train,
             test,
             None,
+            candidates,
         );
         Some(cp)
     } else {
@@ -5771,6 +5802,7 @@ fn run_postfix_search(
     stats.ledger = ledger;
     stats.fit_fallback_max = cfg.fit_fallback_max;
     stats.fit_admission = cfg.fit_admission;
+    stats.fit_polish = cfg.fit_polish;
 
     Ok(Outcome {
         archive: final_archive,
@@ -5790,6 +5822,7 @@ fn run_postfix_search(
         dispatch: dispatcher.snapshot(),
         qd: None,
         stop_reason,
+        candidates_evaluated: candidates,
     })
 }
 
@@ -6178,6 +6211,7 @@ fn run_search(
     let mut converged_early: bool;
     let mut best_prev: f64;
     let mut no_improve: usize;
+    let mut candidates: u64;
     // #85: did any generation fit on a screening subset? Only then may the
     // final archive be refit; a request at least as large as the sample, or
     // `--no-fit`, stays an exact no-op.
@@ -6213,10 +6247,12 @@ fn run_search(
             archive: saved_archive,
             islands: saved_islands,
             stagnant: saved_stagnant,
+            candidates_evaluated: saved_candidates,
             main_rng,
             ..
         } = cp;
         gens_done = generations;
+        candidates = saved_candidates;
         converged_early = stopped_early;
         best_prev = saved_best;
         no_improve = saved_no_improve;
@@ -6313,6 +6349,7 @@ fn run_search(
         converged_early = false;
         best_prev = f64::INFINITY;
         no_improve = 0;
+        candidates = 0;
     }
 
     // #26: a checkpoint from a GPU run carries the f32 proxy, and a run forced
@@ -6425,6 +6462,7 @@ fn run_search(
                         converged_early,
                         best_prev,
                         no_improve,
+                        candidates,
                         save_every,
                         on_checkpoint,
                         backend_reason,
@@ -6516,7 +6554,10 @@ fn run_search(
             // it always was.
             let mut dev_mark = cfg.dev_log.is_some().then(std::time::Instant::now);
             let mut stage_mark = std::time::Instant::now();
-            let dev_counters = cfg.dev_log.is_some().then(GenCounters::default);
+            let dev_counters = Some(GenCounters {
+                timed: cfg.dev_log.is_some(),
+                ..GenCounters::default()
+            });
             // The island threads take `Option<&GenCounters>`, which is `Copy`;
             // the owning `Option` stays here for the readout below.
             let dev_counters_ref = dev_counters.as_ref();
@@ -6633,6 +6674,7 @@ fn run_search(
                     .expect("pipeline_fit_safe admits only LM objectives"),
                 iters: cfg.fit_iters,
                 metric: cfg.metric,
+                polish: cfg.fit_polish,
             });
             #[cfg(feature = "cuda")]
             let pipeline_active = !screened
@@ -6733,6 +6775,7 @@ fn run_search(
                 }
             });
             let dev_search = dev_lap(&mut dev_mark); // #211: island scope
+            candidates += GenCounters::total(dev_counters_ref, |c| &c.offspring);
             let stage_search = stage_lap(&mut stage_mark); // #284: see note below
 
             #[cfg(feature = "cuda")]
@@ -7198,6 +7241,7 @@ fn run_search(
                     train,
                     test,
                     None,
+                    candidates,
                 );
                 emit(&mut on_checkpoint, &cp);
                 io_stage_total += io_mark.elapsed().as_secs_f64();
@@ -7270,6 +7314,7 @@ fn run_search(
             train,
             test,
             None,
+            candidates,
         );
         Some(cp)
     } else {
@@ -7367,6 +7412,7 @@ fn run_search(
             let mut s = g.run_stats();
             s.fit_refits = gpu_fit_refits;
             s.fit_admission = cfg.fit_admission;
+            s.fit_polish = cfg.fit_polish;
 // #284: absorb the device intervals and fit leaves, then add the
             // exclusive main-thread stages. Fit is a sub-window of the measured
             // eval window, so it is partitioned out exactly once.
@@ -7435,6 +7481,7 @@ fn run_search(
         // #120: coverage of the descriptor grid for this run.
         qd: qd_archive.as_ref().map(|q| q.report()),
         stop_reason, // #211
+        candidates_evaluated: candidates,
     })
 }
 

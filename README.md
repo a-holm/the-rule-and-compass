@@ -192,6 +192,7 @@ Every window also lists the long-only controls (cash, buy-and-hold, constant
 long/flat from the training mean, matched-exposure random long seeded by
 `--control-seed`) with exposure, turnover, beta and excess over cash; see
 `src/baselines.rs`.
+`--front run.json` takes the candidates from the Pareto front of a run, carries the run's threshold and per-side cost, defaults `--trials` to the offspring the search scored and refuses a window that tests rows the run trained or selected on (`docs/walkforward.md`).
 Pass `--batch-pnl` to score every candidate on every window in one batch (`src/wf_batch.rs`, kernel `src/cuda/wf_batch.cu`), per window and pooled, with the baseline ladder; finalist values stay exact CPU f64 and batch values are labelled `gpu_proxy`.
 `--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
 associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
@@ -540,7 +541,9 @@ atomically instead of streaming it. See
   builds `panel_hourly_default.rcsb` in staged, cacheable steps. `snapshot` hashes
   every archive and lists the duplicate and invalid-OHLC bars. `base` keeps only
   full four-bar hours (`cov15m`), collapses identical duplicate instants, flags
-  differing ones and stores the unit of each source. `build` keeps point-in-time
+  differing ones and stores the unit of each source. `--symbols <file>` on
+  `snapshot` and `base` keeps only a pinned symbol universe (for example the
+  output of `rcsr-acquire universe`). `build` keeps point-in-time
   members, numbers listings, fails on an undeclared level jump and refuses the
   lockbox. `validate` runs V1-V12 and exits 3 on a failure. See
   [`docs/panel.md`](docs/panel.md#default-hourly-panel-v2-259).
@@ -619,7 +622,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--cost-bps f] [--slippage-bps f] [--cash-return f] [--funding col]
      [--max-position f] [--min-trades n] [--min-holding n] [--allow-short]
      [--equivalence-z z] [--noise-lag n|auto]
-     [--allow-lockbox] [--lockbox START,END] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure]
+     [--allow-lockbox] [--lockbox START,END] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure] [--require-clean-inputs]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
      [--smooth k] [--smooth-centred k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
@@ -627,7 +630,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--null-runs N] [--null-block N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
-     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--no-fit]
+     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--fit-polish f64|f32|off] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents]
@@ -801,6 +804,7 @@ run:
 | `--arm name` | ablation arm label; run.json gains an `ablation` object with the arm, the SHA-256 of the ordered variable list, the generation budget and the generations reached |
 | `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`; `long_only` is always true): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
 | `--allow-target-structure` | run a D13c target for a diagnostic replay (warns, records `check.status = overridden` and a proxy table) |
+| `--require-clean-inputs` | refuse (exit 5) a run whose inputs include a construction column of the target spec; default off, the column is only recorded in `check.construction_in_vars` |
 | `--allow-overlap` (`rcsr enrich`, `rcsr prep`) | permit a `--label` stride below the horizon for horizons of 4 h and longer; without it such a label is refused. `--side short` and `--allow-short` are always refused: labels are long-only (action `{0,+1}`, long-side barriers, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge)) |
 | `--label long:<horizon>,...` (`rcsr enrich`) | long-only label family `lbl_<name>_{fwd,y,long_net,action,t1,exit_ret,m_net,m_barrier,weight}`, the label report with hash and top 10 absolute moves in `<out>.labels.json`, the enrich report and `run.json` (`target_spec.label_report`); label columns are never `--vars` inputs, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |

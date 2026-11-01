@@ -70,6 +70,8 @@ OPTIONS:
   --restart-interval <N>    generations between island restarts
   --variation <mode>        auto, node or postfix
   --dispatch <mode>         auto or device (device skips the timing comparison)
+  --fit-polish <mode>      f64 (default), f32 or off: arithmetic of the device fit
+                            kernel polish (--fit-strategy gpu)
   --jobs <N>                runs in flight at once on the CPU (default 1);
                             seconds and hit_s are then contended
   --ndjson                  one JSON line per finished run, flushed at once,
@@ -295,6 +297,13 @@ fn parse(args: &[String]) -> Result<Args, String> {
             }
             "--variation" => {
                 a.knobs.variation = Some(rcsr::search::VariationMode::parse(&take(&mut i, "--variation")?)?)
+            }
+            "--fit-polish" => {
+                let v = take(&mut i, "--fit-polish")?;
+                a.knobs.fit_polish = Some(
+                    rcsr::fit::FitPolish::parse(&v)
+                        .ok_or_else(|| format!("--fit-polish needs f64, f32 or off, got '{}'", v))?,
+                );
             }
             "--dispatch" => {
                 let v = take(&mut i, "--dispatch")?;

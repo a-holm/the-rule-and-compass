@@ -23,6 +23,7 @@ use crate::ohlcv::{self, Bar};
 use crate::panel::{self, Membership, Panel, PanelRow};
 use crate::panel_pit;
 use crate::panel_prep::{self, PrepBar, PrepSegment};
+use crate::prep::{SymbolList, Universe};
 use crate::{manifest, prep, store, zip};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -275,13 +276,21 @@ fn is_archive(p: &Path) -> bool {
 }
 
 /// Archives below `input`, sorted by symbol then path.
-fn discover(input: &str) -> Result<Vec<prep::Source>, String> {
+/// With a symbol list, only listed symbols are kept (before any archive is
+/// opened) and the universe report is returned.
+fn discover(input: &str, symbols: Option<&SymbolList>) -> Result<(Vec<prep::Source>, Option<Universe>), String> {
     let mut sources = prep::discover(&[input.to_string()], None)?;
     sources.retain(|s| is_archive(&s.path));
     if sources.is_empty() {
         return Err(format!("{}: no .zip or .csv archives found", input));
     }
-    Ok(sources)
+    match symbols {
+        Some(list) => {
+            let (kept, u) = prep::apply_universe(sources, &[input.to_string()], list)?;
+            Ok((kept, Some(u)))
+        }
+        None => Ok((sources, None)),
+    }
 }
 
 fn relative(root: &Path, p: &Path) -> String {
@@ -422,8 +431,14 @@ fn units_json(u: &[usize; 3]) -> String {
 /// Hash and scan every archive below `input`; the result is `snapshot.json`.
 /// The text is a pure function of the archives, their sizes and mtimes.
 pub fn snapshot_text(input: &str, jobs: usize) -> Result<String, String> {
+    snapshot_text_with(input, jobs, None)
+}
+
+/// `snapshot_text` restricted to a pinned symbol universe. The file hash and
+/// the kept, dropped, missing and empty symbols go into a `universe` block.
+pub fn snapshot_text_with(input: &str, jobs: usize, symbols: Option<&SymbolList>) -> Result<String, String> {
     let root = PathBuf::from(input);
-    let sources = discover(input)?;
+    let (sources, universe) = discover(input, symbols)?;
     let scans = parallel(sources, jobs, |s| scan_file(&root, &s))?;
     let lb = Lockbox::crypto_2026h2();
     let mut s = String::from("{\n");
@@ -450,6 +465,9 @@ pub fn snapshot_text(input: &str, jobs: usize) -> Result<String, String> {
         jstr(&date(last)),
         lock_files
     );
+    if let Some(u) = &universe {
+        let _ = writeln!(s, "  \"universe\":{},", u.json());
+    }
     let _ = writeln!(s, "  \"entries\":[");
     for (i, f) in scans.iter().enumerate() {
         let _ = writeln!(
@@ -592,6 +610,7 @@ pub struct BaseOptions {
     pub group_rows: usize,
     pub interval_seconds: i64,
     pub gpu: GpuMode,
+    pub symbols: Option<SymbolList>,
 }
 
 impl BaseOptions {
@@ -606,6 +625,7 @@ impl BaseOptions {
             group_rows: store::DEFAULT_GROUP_ROWS,
             interval_seconds: IN_STEP,
             gpu: GpuMode::Auto,
+            symbols: None,
         }
     }
 }
@@ -1170,7 +1190,7 @@ fn fold_wave(
 /// write the symbol-major hourly base store plus `<out>.manifest.json`.
 pub fn build_base(opts: &BaseOptions) -> Result<BaseSummary, String> {
     let root = PathBuf::from(&opts.input);
-    let sources = discover(&opts.input)?;
+    let (sources, universe) = discover(&opts.input, opts.symbols.as_ref())?;
     let guard = Guard::new(opts.allow_lockbox, None);
     guard_archive_names(&sources, &guard, "panel base")?;
     if opts.interval_seconds != IN_STEP {
@@ -1186,7 +1206,10 @@ pub fn build_base(opts: &BaseOptions) -> Result<BaseSummary, String> {
     if let Some(dir) = &opts.resume {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir, e))?;
     }
-    let settings = format!("interval={};keep_partial={}", IN_STEP, opts.keep_partial);
+    let mut settings = format!("interval={};keep_partial={}", IN_STEP, opts.keep_partial);
+    if let Some(u) = &universe {
+        let _ = write!(settings, ";universe={}", u.sha256);
+    }
     let mut groups: Vec<(String, Vec<prep::Source>)> = by_symbol.into_iter().collect();
     let reused = AtomicUsize::new(0);
     let mut route = DeviceRoute::new(opts.gpu);
@@ -1233,7 +1256,7 @@ pub fn build_base(opts: &BaseOptions) -> Result<BaseSummary, String> {
         return Err("panel base: no complete hourly bucket was produced".to_string());
     }
     store::write_store_with_time(&opts.out, &table, opts.group_rows, Some(0))?;
-    let text = base_manifest(opts, &syms, &inputs, &overlap, guard.allow, &route);
+    let text = base_manifest(opts, &syms, &inputs, &overlap, guard.allow, &route, universe.as_ref());
     let manifest_path = format!("{}.manifest.json", opts.out);
     std::fs::write(&manifest_path, text).map_err(|e| format!("{}: {}", manifest_path, e))?;
     Ok(BaseSummary {
@@ -1318,6 +1341,7 @@ fn base_manifest(
     overlap: &crate::lockbox::Overlap,
     allowed: bool,
     route: &DeviceRoute,
+    universe: Option<&Universe>,
 ) -> String {
     let mut input_rows = 0usize;
     let mut unique_rows = 0usize;
@@ -1368,6 +1392,9 @@ fn base_manifest(
     );
     if opts.gpu != GpuMode::Off {
         let _ = writeln!(s, "  \"backend\":{},", route.json());
+    }
+    if let Some(u) = universe {
+        let _ = writeln!(s, "  \"universe\":{},", u.json());
     }
     let _ = writeln!(s, "  \"columns\":[{}],", BASE_COLUMNS.iter().map(|c| jstr(c)).collect::<Vec<_>>().join(","));
     let _ = writeln!(s, "  \"inputs\":{{\"files\":{},\"archives\":[", inputs.len());
@@ -2399,6 +2426,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
     let mut jump_factor = 5.0f64;
     let mut outage_share = 0.5f64;
     let mut replay = 3usize;
+    let mut symbols: Option<SymbolList> = None;
     let mut gpu: Option<GpuMode> = None;
     let mut i = 0usize;
     while i < args.len() {
@@ -2413,6 +2441,9 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
             "--snapshot" => snapshot = Some(value(args, &mut i)),
             "--base" => base = Some(value(args, &mut i)),
             "--resume" => resume = Some(value(args, &mut i)),
+            "--symbols" => {
+                symbols = Some(prep::read_symbol_list(&value(args, &mut i)).unwrap_or_else(|e| cli_usage(&e)));
+            }
             "--interval" => interval = value(args, &mut i),
             "--jobs" => jobs = num(value(args, &mut i), "--jobs") as usize,
             "--group-rows" => group_rows = num(value(args, &mut i), "--group-rows") as usize,
@@ -2450,6 +2481,9 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
         }
         i += 1;
     }
+    if symbols.is_some() && cmd != "base" && cmd != "snapshot" {
+        cli_usage(&format!("--symbols applies to `rcsr panel snapshot` and `rcsr panel base`, not `{}`", cmd));
+    }
     if locked_test.is_some() && cmd != "build" {
         cli_usage(&format!("--locked-test applies to `rcsr panel build`, not `{}`", cmd));
     }
@@ -2473,7 +2507,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
         "snapshot" => {
             let input = input.unwrap_or_else(|| cli_usage("snapshot needs --input <archive dir>"));
             let out = out.unwrap_or_else(|| "snapshot.json".to_string());
-            let text = snapshot_text(&input, jobs).unwrap_or_else(|e| cli_fail(&e));
+            let text = snapshot_text_with(&input, jobs, symbols.as_ref()).unwrap_or_else(|e| cli_fail(&e));
             if let Err(e) = std::fs::write(&out, &text) {
                 cli_fail(&format!("{}: {}", out, e));
             }
@@ -2487,6 +2521,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
             o.jobs = jobs;
             o.allow_lockbox = allow_lockbox;
             o.resume = resume;
+            o.symbols = symbols;
             o.group_rows = group_rows;
             o.gpu = gpu.unwrap_or(GpuMode::Auto);
             o.interval_seconds = match interval.as_str() {
