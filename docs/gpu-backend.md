@@ -517,7 +517,10 @@ remains for the fit and test APIs.
 `auc` are `ScoreDispatch::Exact` rows of the same table (#288): they are scored
 by `GpuEvaluator::score_stat_batch` over flattened plans on the exact `f64` forward
 pass, from the measured 4 096-row floor (see the #288 section below). `slope`
-and `implicit` remain CPU. `implicit_residual` is the `absolute` objective on the
+is a `ScoreDispatch::Native` row since #236, admitted only when the training
+pairs are the consecutive rows (see [Slope on the batched
+kernel](#slope-on-the-batched-kernel-issue-236)); `implicit` remains CPU.
+`implicit_residual` is the `absolute` objective on the
 all-zero implicit target: it shares the `absolute` native scorer and the L1 IRLS
 device fit arm, and a run with a non-zero target is refused by name. The named reason of a
 refused metric is printed and recorded in `backend_reason`, and so is the row floor for an `Exact` metric.
@@ -563,8 +566,8 @@ Fallback and the flags:
 * With neither flag, a CUDA build with a usable device selects the GPU when the
   #287 table names a native scorer for the metric (subject to the row floor and
   the binary-target rule for AUC). Every other metric is scored on the CPU and
-  prints the table's named reason (for example `# gpu: off (slope needs a
-  cross-row first-difference pass)`) once; the resource line and the `--json`
+  prints the table's named reason (for example `# gpu: off (implicit needs an
+  expression-tree gradient pass)`) once; the resource line and the `--json`
   `backend` both say `cpu` and `backend_reason` carries the same cause.
 * A build without the feature prints
   `# gpu: unavailable (built without --features cuda); using the CPU`; a CUDA
@@ -642,8 +645,13 @@ objective kernel at any size; `ScoreStat::Maximum` stays as the exact `f64`
 entry of `score_stat_batch` for direct callers and the parity tests. `gpu_blocker`
 names every refusal:
 
-* no scorer for the metric: the table's own reason (for example `slope needs a
-  cross-row first-difference pass`);
+* no scorer for the metric: the table's own reason (for example `implicit needs
+  an expression-tree gradient pass`);
+* slope whose training pairs are not the consecutive rows (a shuffled split, a
+  `--group-by` panel, a row missing from the side): `slope pairs are not the
+  consecutive rows of the training sample`;
+* slope with a `--fit-rows`/`--fit-samples` subsample: `slope pairs are not the
+  consecutive rows of a --fit-rows/--fit-samples subsample`;
 * sample below the measured floor: `order/rank scoring: the sample is below the
   4096-row device floor`;
 * AUC with a target that is not two-valued: `auc needs a two-valued target`;
@@ -832,7 +840,7 @@ returns an empty result when the program upload fails.
 - `score_rows_kernel<MODE, PASS>` applies one row range: lane `l` continues from its carried state over the rows of the range with `r mod L = l`. Correlation runs two passes with `score_mid_kernel` between them (mean prediction, lanes reset).
 - `score_finish_kernel<MODE>` runs the resident tree and epilogue: `+inf` and status 2 on a bad row, status 4 for all-zero weights, the AIC penalty on the host. A weighted launch carries `Σ w·term` in lane A and `Σ w` in lane B (weighted correlation: `Σ w·dp²` and `Σ w·dp·dy`, with the weighted mean prediction from the mid kernel); the weighted target moments are computed once when the weights are uploaded.
 
-The ranges form a left fold in row order, so every score kind returns the same bits as the resident kernel for any partition, including unaligned cuts and 1-row ranges. A lane index relative to the range start gives different bits on unaligned cuts. The production resident path keeps `score_kernel`.
+The ranges form a left fold in row order, so every score kind returns the same bits as the resident kernel for any partition, including unaligned cuts and 1-row ranges. Slope (#236) folds the pair `(r - 1, r)` into the lane of `r` and reads row `r - 1` from the resident columns, so a pair that straddles a cut needs no exchange between ranges. A lane index relative to the range start gives different bits on unaligned cuts. The production resident path keeps `score_kernel`.
 
 The carry is `P x (16 L + 16)` bytes (4,112 B per candidate), allocated once through the ledger with tag `carry` and grown only when the candidate count grows. Tests: `gpu::carry_tests`.
 
@@ -846,6 +854,7 @@ When the plan is `tiled`, `GpuEvaluator::new_tiled` (C: `rc_create_tiled`) keeps
 - For a tile, the host copies the `vars` column segments into the staging slot, the copy runs on a transfer stream behind the last kernel that read the device slot, and the kernel runs on the default stream behind the copy (events `ev_tile_copied`, `ev_tile_ready`, `ev_tile_used`). The next tile uploads while the current kernel runs.
 - The lane of a row is its absolute row modulo `L`, so scores are bit-identical to the resident kernels for every tile height and wave size.
 - The legacy evaluator, the batched fit, the exact rank and order-statistic scorers and the f64 twin are refused in a tiled context (the call returns a failure). The plan keeps them on the CPU.
+- The slope scorer (#236) is refused too: the predecessor of a tile's first row is not resident. A tiled slope run keeps the CPU scorer with `backend_reason` `device_memory: tiled residency refuses slope scoring: row r - 1 of a tile's first row is not resident`.
 
 `ArenaReport` carries `tile_rows`, `tiles` (tile kernel launches), `tile_uploads`, `tile_overlapped_uploads`, `tile_pinned_bytes` and `waves`. A `# gpu: tiled residency (...)` note names the tile height and the waves. The eval stage of the route planner adds the streamed tile bytes to its transfer estimate. Tests: `tests/gpu_tiled.rs`.
 
@@ -1869,6 +1878,49 @@ Device fit is 3.2x faster than device score with the CPU fit and 3.7x faster tha
 
 **Tests** (`src/gpu_if_fit_tests.rs`): `if_plan_carries_the_third_child_in_the_slot_word`; `if_device_fit_matches_the_cpu_fit_including_the_switch_point` (device SSE within `1e-8` relative of the CPU fit, with rows at `x0 == 0` and `x0 == x1`, and a `NaN` in the untaken branch); `a_search_with_if_fits_on_the_device` (`dispatch: Device`, no `unsupported_plan` fallback).
 
+### Slope on the batched kernel (issue #236)
+
+`--metric slope` is scored and fitted on the device when the training sample's slope pairs are its consecutive rows: `[k − 1, k]` for every `k` in `1..n` (`search::slope_pairs_are_consecutive`). That is a single series under `--split temporal`. Any other pair list (a shuffled split, a `--group-by` panel, a row missing from the side) keeps the exact CPU scorer with the reason `slope pairs are not the consecutive rows of the training sample`, and a `--fit-rows`/`--fit-samples` subsample (#265) keeps it with its own reason, so the device never differences two rows the CPU would not. Weighted slope does not exist, and a tiled plan refuses the scorer by name (see [Tiled residency](#tiled-residency-293)).
+
+**Scorer** (`ScoreObjective::Slope`, score code 15). Lane `l` owns the pairs `(r − 1, r)` of its rows `r ≥ 1` and runs both rows itself, so no lane reads another lane's state and the #293 lane carry is unchanged. Each pair adds `|(p_r − p_{r−1}) − (y_r − y_{r−1})|` in `f64` from the `f32` predictions and target; the finish divides by `n − 1`. A non-finite prediction on any row is `+inf` with status 2, and `n < 2` is `+inf` with status 2, as on the CPU (`metrics::score_slope_pairs`).
+
+**Fit arm** (`DeviceLoss::Slope`, fit code 9), host-chained in `GpuEvaluator::slope_fit_batch`:
+
+1. `fit_batch(Squared)`: the CPU arm's warm start. It sets the level, which slope cannot see.
+2. `fit_batch_from(starts, keep_incoming)` with code 9: IRLS on `g_r = (p_r − p_{r−1}) − (y_r − y_{r−1})` with row weight `u = 1/max(|g|, 1e-6)`, Jacobian row `√u·(a_r − a_{r−1})` and response `√u·g`, the `absolute` arm's rounds and two Armijo halvings on the true slope sum, then the `f64` polish with one halving.
+3. The kernel judges the incoming constants and its answer by the same `f64` pair sweep and returns the incoming constants (status 6, `no_improvement`) unless its answer is finite and strictly lower.
+
+* **Pairs without a second buffer.** `ft_assemble` stages each chunk's raw adjoints and predictions in shared memory. One extra phase differences thread `k`'s row against row `k − 1` of the chunk, or for `k = 0` against the previous chunk's last row held in `scarry` (`p + 1` floats; `sdcarry` in the `f64` twin), and overwrites the staged row in place. Row 0 has no pair and stages zeros. The owner accumulation is unchanged, so every statistic keeps its fixed row order. The trial sweep `ft_loss_slope` runs both rows of each pair per thread and needs no synchronisation.
+* **The additive level.** A constant whose adjoint is the same on every row (an additive level) has a differenced column of exactly zero in `f32` and `f64`. Its diagonal is exactly 0, `ft_solve` freezes the slot (#399), and the level keeps the squared warm start's value. A step that is exactly zero in every slot (a lone level) ends the loop at once.
+* **No host gate.** `fit::device_fit_is_gated` is false for slope. The kernel's own guard is the CPU arm's metric-monotone rule; the device scorer ranks on slope, and `refit_finalists_exact` refits every finalist with the CPU arm, so every reported constant and error is exact CPU `f64`.
+* **CPU arm.** `fit_slope_pairs` runs the same IRLS (`fit::slope_irls`) between the squared fit and the coordinate polish, on the sample's own pair list. Device and CPU optimise slope by the same algorithm, so the parity test is algorithmic: from the same start and with 32 iterations, the device slope is at most the CPU IRLS result times `1 + 1e-5`. With 8 iterations neither arm has converged and the two trajectories differ; on the 4 000-row unit fixture the device ended 1.8e-3 relative above the CPU IRLS on one start.
+* **Precision.** Rows and adjoints are `f32`, sums and the polish `f64`. The device score differs from the CPU `f64` score only through the `f32` rounding of inputs, target and predictions. The fit's damped rounds run on `f32` rows, so a first difference of nearby inputs keeps fewer digits there than in the `f64` polish.
+* **Cost.** The dispatcher scales the calibrated fit rates by `(2.5, 6.3)` for slope: the device chain costs 2.54 squared LM batches and the CPU arm (squared fit, IRLS, coordinate polish) 6.34 squared LM fits, measured by `bench_slope_fit_stage` at 154 000 rows.
+
+**Measured** (RTX 3060, shared host, single CPU thread for the CPU arm). Fit stage, `bench_slope_fit_stage`: 154 000 rows, 32 candidates (`a·x0 + b`, `a·x0 + b + c·tanh(x1)` and `a·sin(b·x0) + c·x0 + d` starts), `--fit-iters 8`: the CPU arm 40.07 s (1 252 ms per candidate), the device batch 0.668 s (kernel 655 ms), **60.0×**. Every device answer is usable and no worse than the CPU arm's slope times `1 + 1e-5` (32/32, worst relative gap 1.3e-6).
+
+Scorer precision (D8), `bench_slope_score_precision_on_csv` on `panel_daily_100.csv` (154 674 rows in `ts` order, inputs `r1,r3,r7,ma7`, target `y1`), 64 candidates: maximum relative error of the device slope against the exact CPU `f64` slope 1.7e-8, no rank inversion. On the synthetic unit fixture (`[-3, 3]` inputs, 20 000 rows) it is 2.0e-7. Inputs of large magnitude with small first differences lose digits in `f32`: the same population on `x0` in `[-100, 100]` reached 4.3e-6.
+
+Search, `--metric slope`, `panel_daily_100.csv` before the 2026H2 lockbox (`--filter "1782864000 - ts"`, `--time ts --split temporal`, 109 866 training rows, 109 865 consecutive pairs), inputs `r1,r3,r7,ma7`, target `y1`, 4 islands of 32, 6 generations, `--fit-iters 8`, equal configuration per arm (`--gpu --fit-strategy gpu`, `--gpu --fit-strategy exact`, `--no-gpu`):
+
+| seed | device fit | device scoring, CPU fit | CPU | best train slope (device fit / device scoring / CPU) |
+|---:|---:|---:|---:|---|
+| 5 | 16.2 s | 60.3 s | 64.7 s | 0.2594649 / 0.2594051 / 0.2594292 |
+| 6 | 18.6 s | 67.8 s | 48.5 s | 0.2594650 / 0.2594014 / 0.2594014 |
+
+The device-fit run is 3.7× faster end to end than device scoring with the CPU fit in both seeds (2.6-4.0× against the CPU). Every admitted candidate fits on the device (546 and 550, no fallback); the fit kernel takes 3.8-3.9 s and the exact finalist refit 7.0-7.7 s. On this cell slope is nearly flat (the constant model scores 0.2597321), and the device-fit arm keeps a two-member front whose best member is 1.4e-4 to 2.5e-4 relative above the CPU-fit arms. The device arm admits candidates through the #223 screen (546 of 872 screened offspring in seed 5), while the CPU arms fit every offspring.
+
+The same three arms on a synthetic single series (`y = 3 sin x + 0.5 x + 0.3 tanh z` plus `U(−0.025, 0.025)`, 206 000 rows, `--time t --split temporal`, 154 500 training rows, inputs `x,z`, same configuration):
+
+| seed | device fit | device scoring, CPU fit | CPU | best train slope (device fit / device scoring / CPU) |
+|---:|---:|---:|---:|---|
+| 5 | 23.5 s | 55.2 s | 65.9 s | 0.0169713 / 0.0174055 / 0.0203705 |
+| 6 | 21.2 s | 74.1 s | 85.3 s | 0.0169762 / 0.0169673 / 0.0169678 |
+
+The device-fit run is 2.3-3.5× faster than device scoring with the CPU fit and 2.8-4.0× faster than the CPU; its best slope is the lowest of the three in seed 5 and 5e-4 relative above the CPU-fit arms in seed 6. The fit kernel takes 5.2-5.3 s and the finalist refit 12.3-14.7 s; 497 and 520 admitted candidates fit on the device with no fallback.
+
+**Tests** (`src/gpu_slope_tests.rs`, `search::tests::slope_device_admits_only_consecutive_pairs`): `slope_device_score_matches_cpu` (`n = 1, 2, 3, 300, 4 099`, the CPU reducer on the same `f32` rows to `1e-12`, the exact metric to `1e-6`, a single non-finite row is `+inf`, alone equals batch), `slope_score_is_partition_invariant` (row ranges with cuts at 1, 2, 255, 256, 257 and one-row ranges give the resident bits), `slope_scoring_is_refused_in_tiled_residency` (tiled and weighted launches refused, a tiled search keeps the CPU with the named reason), `slope_device_scores_rank_like_the_cpu` (D8 on 48 candidates), `slope_pair_assembly_matches_cpu_differenced_normal_equations` (`f64` `JᵀJ`, `Jᵀr` and loss against the CPU differenced normal equations to `1e-10`, across the chunk boundaries, the level column exactly zero), `slope_additive_constant_is_frozen_and_keeps_the_squared_level`, `slope_irls_never_worsens_the_metric`, `slope_fit_keeps_incoming_constants_when_better`, `slope_device_fit_matches_cpu` (32 iterations, `1 + 1e-5`), `slope_gpu_fit_is_deterministic_and_batch_independent`, `slope_no_fit_is_a_no_op` and `slope_gpu_front_is_ranked_on_slope` (a search with `dispatch: Device` scores and fits on the device, every archived error is the exact CPU slope, and the best member is within 5 % of the `--no-gpu` run's on a cell where a level statistic ranks a different law first). With the scorer changed to a level MAE, the search-level test fails (best 0.148 against the CPU's 0.0134), and with the adjoints left undifferenced, no incoming-constant guard and any pair list admitted, eight of the other tests fail.
+
 ### Classification fitness (#289)
 
 The #287 score table now has a label-aware block for long-only binary
@@ -1890,8 +1942,8 @@ and `hinge_squared` are the separate SVM forms. A constant model has
 pin both optima.
 
 **Codes and dispatch.** The classification objectives occupy the score codes
-10–14, after the regression block 0–9 (#287); the fit `RC_LOSS_*` codes are
-0–8. `metrics::score_dispatch` maps every classification metric to one of them,
+10–14, after the regression block 0–9 (#287), and slope is 15 (#236); the fit
+`RC_LOSS_*` codes are 0–9. `metrics::score_dispatch` maps every classification metric to one of them,
 so `auc` stays a **named** refusal (`auc needs the exact rank scorer with
 labels (#288)`) rather than the old generic "classification metric" gate. The
 CPU reference is `metrics::score_native_weighted`, which the kernel mirrors.

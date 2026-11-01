@@ -425,7 +425,11 @@ SEARCH:
                              data order and in the same group (--group-by, or
                              one group), whatever the split shuffles; fewer
                              than 32 such training pairs is a usage error that
-                             points at --split temporal.
+                             points at --split temporal. The GPU scores and
+                             fits slope only when those pairs are the
+                             consecutive training rows (a single series under
+                             --split temporal); otherwise the CPU scores it and
+                             backend_reason names the cause.
   --implicit                 fit an implicit relation f(inputs, target) = 0: the
                              target becomes one extra input (normalised with its
                              training mean/std) and the fit target is 0. Plain
@@ -536,7 +540,11 @@ SEARCH:
                              by logistic then majorise-minimise steps, hinge by
                              the logistic step; every trial judged on the
                              configured hinge, finalists refit exactly, a
-                             single-class sample labelled single_class), the exact correlation
+                             single-class sample labelled single_class), slope
+                             by IRLS on the first differences of consecutive
+                             rows from the squared warm start, keeping the
+                             incoming constants unless the slope improves and
+                             the additive level at the squared fit (#236), the exact correlation
                              objective 1-|rho| or 1-rho with a frozen affine
                              gauge (correlation_signed refines both gauge
                              orientations; a tree affine in every constant takes
@@ -629,9 +637,10 @@ SEARCH:
                              the GPU automatically when the #287 score table
                              names a native scorer: squared, absolute,
                              log_squashed, signed, maximum, correlation,
-                             correlation_signed, aic/aicc/bic and the
-                             classification family through the objective
-                             kernel, and median, interquartile,
+                             correlation_signed, aic/aicc/bic, the
+                             classification family and slope (when the training
+                             pairs are its consecutive rows, #236) through the
+                             objective kernel, and median, interquartile,
                              rank_correlation, rank_correlation_signed and auc
                              through the exact f64 order-statistic/rank batch
                              scorer (#288) from 4096 rows (a two-valued target

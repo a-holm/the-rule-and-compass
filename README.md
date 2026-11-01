@@ -39,6 +39,9 @@ logistic steps while they lower the hinge and then majorise-minimise steps,
 `hinge` by the logistic step judged on the sigmoid hinge; every trial is
 judged on the configured hinge, a single-class sample is labelled
 `single_class`, and finalists are refit by the same schedule in CPU `f64`),
+`slope` by the squared warm start and then IRLS on the first differences of
+consecutive rows, keeping the incoming constants unless the slope improves
+(#236; the additive level stays at the squared fit),
 and the exact correlation objective with
 a frozen affine gauge
 (#224) — and labels every larger or unsupported candidate for the exact CPU
@@ -1113,6 +1116,9 @@ logistic steps while they lower the hinge and then majorise-minimise steps,
 `hinge` by the logistic step judged on the sigmoid hinge; every trial is
 judged on the configured hinge, a single-class sample is labelled
 `single_class`, and finalists are refit by the same schedule in CPU `f64`),
+`slope` by the squared warm start and then IRLS on the first differences of
+consecutive rows, keeping the incoming constants unless the slope improves
+(#236; the additive level stays at the squared fit),
 and the exact correlation objective with
 a frozen affine gauge
 (#224) — and labels every larger or unsupported candidate for the exact CPU
@@ -1233,7 +1239,7 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
 See [`docs/optimisation.md`](docs/optimisation.md) for the measured before/after
 numbers and the hardware plan.
 
-## Backends: GPU by default when available
+## Backends: the GPU when the metric is scored on the device
 
 A binary built with `--features cuda` probes the device once at startup and uses
 the GPU to guide the search whenever one is available **and the run's metric is
@@ -1247,8 +1253,10 @@ with the backend, device, available threads and training rows/columns, and
 The kernel scores the configured metric natively through the #287
 `Metric -> ScoreDispatch` table. The objective kernel covers `squared`,
 `absolute`, `log_squashed`, `signed`, `maximum`, `correlation`,
-`correlation_signed`, `aic`/`aicc`/`bic` and the classification family
-(`log_loss`, `brier`, `hinge*`, #289). The exact `f64` order-statistic/rank
+`correlation_signed`, `aic`/`aicc`/`bic`, the classification family
+(`log_loss`, `brier`, `hinge*`, #289) and `slope` when the training sample's
+slope pairs are its consecutive rows (#236; a `--split temporal` single series,
+not a shuffled split or a `--group-by` panel). The exact `f64` order-statistic/rank
 batch entry point (#288) covers `median`, `interquartile`, `rank_correlation`,
 `rank_correlation_signed` and `auc` from 4 096 training rows (`auc` also needs a
 two-valued target). Every other metric, and the order/rank metrics below their

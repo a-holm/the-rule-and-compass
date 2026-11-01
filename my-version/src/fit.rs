@@ -343,6 +343,11 @@ pub enum FitObjective {
     /// `Σ w·(1 − t(2σ(p) − 1))`, the bounded sigmoid hinge: the logistic
     /// Fisher step, every trial judged on the sigmoid hinge.
     HingeSigmoid,
+    /// #236: `Σ |(pᵢ − pᵢ₋₁) − (yᵢ − yᵢ₋₁)|` over consecutive rows, minimised by
+    /// IRLS on the differenced rows (row weight `1/max(|g|, 1e-6)`) with
+    /// true-slope acceptance. Unweighted; the device runs it from the squared
+    /// warm start (`GpuEvaluator::slope_fit_batch`).
+    Slope,
 }
 
 /// Backwards-compatible name for the fit objective. New code should say
@@ -363,6 +368,7 @@ impl FitObjective {
             DeviceLoss::HingeSquared => 6,
             DeviceLoss::HingeOrdinary => 7,
             DeviceLoss::HingeSigmoid => 8,
+            DeviceLoss::Slope => 9,
         }
     }
 
@@ -391,7 +397,8 @@ impl FitObjective {
             | DeviceLoss::Logistic
             | DeviceLoss::HingeSquared
             | DeviceLoss::HingeOrdinary
-            | DeviceLoss::HingeSigmoid => false,
+            | DeviceLoss::HingeSigmoid
+            | DeviceLoss::Slope => false,
         }
     }
 
@@ -430,6 +437,8 @@ pub fn fit_loss(metric: Metric) -> Option<DeviceLoss> {
         Metric::HingeSquared => Some(DeviceLoss::HingeSquared),
         Metric::Correlation => Some(DeviceLoss::Correlation),
         Metric::CorrelationSigned => Some(DeviceLoss::CorrelationSigned),
+        // #236: the squared warm start, then the differenced IRLS.
+        Metric::Slope => Some(DeviceLoss::Slope),
         // Warm start only: the CPU arm runs `fit_weighted`, then `signed_projection`,
         // then the polish. The kernel replaces the first stage; the exact gate
         // projects every proposal.
@@ -502,13 +511,14 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
     Some(format!(
         "--fit-strategy gpu minimises squared error, log-squashed loss, mean \
          absolute error, the logistic log-loss, the three hinge forms, the \
+         first-difference slope, the \
          exact correlation objectives or the exact rank, median, interquartile \
          and maximum objectives, plus the squared warm start of the \
          signed-bias projection, but --metric {} has no device \
          fit objective, so the GPU arms cannot fit it. Use --metric squared \
          (aic, aicc and bic also fit by least squares), --metric log_squashed, \
          --metric absolute, --metric log_loss, --metric hinge, hinge_ordinary \
-         or hinge_squared, --metric correlation, \
+         or hinge_squared, --metric slope, --metric correlation, \
          --metric correlation_signed, --metric rank_correlation or \
          rank_correlation_signed, --metric median, --metric interquartile, \
          --metric maximum, --metric signed, or a CPU fit strategy: --fit-strategy exact, auto, \
@@ -3236,6 +3246,10 @@ pub fn fit_weighted_metric(
         // losses: start from the squared fit, then polish the actual objective.
         // The squared pre-fit runs on a clone, so a polish that finds no
         // improvement keeps the incoming constants (metric-monotone refit).
+        // #236: consecutive pairs, the squared fit, the differenced IRLS and
+        // the polish. Slope has no weighted form; a weighted call keeps the
+        // generic path below.
+        Slope if w.is_empty() => fit_slope_pairs(tree, x, y, &consecutive_pairs(x.len()), iters),
         RankCorrelation
         | RankCorrelationSigned
         | Median
@@ -3302,8 +3316,9 @@ pub fn fit_weighted_strategy_metric(
 }
 
 /// `slope` fit over explicit adjacent-row pairs: the squared fit, then the
-/// coordinate polish on the pair-based slope. Keeps the incumbent unless the
-/// trial improves it. Returns the slope at the kept constants.
+/// differenced IRLS ([`slope_irls`], #236), then the coordinate polish on the
+/// pair-based slope. Keeps the incumbent unless the trial improves it. Returns
+/// the slope at the kept constants.
 pub fn fit_slope_pairs(
     tree: &mut Node,
     x: &[Vec<f64>],
@@ -3315,8 +3330,12 @@ pub fn fit_slope_pairs(
         metrics::score_slope_pairs(&predictions(t, x), y, pairs)
     };
     let start = score_of(tree);
+    if iters == 0 {
+        return start;
+    }
     let mut trial = tree.clone();
     fit_weighted(&mut trial, x, y, &[], iters);
+    slope_irls(&mut trial, x, y, pairs, iters);
     coordinate_polish_by(&mut trial, iters.max(1), &score_of);
     let score = score_of(&trial);
     if improves(score, start) {
@@ -3325,6 +3344,208 @@ pub fn fit_slope_pairs(
     } else {
         start
     }
+}
+
+/// The consecutive pairs `[k − 1, k]` of an `n`-row sample: the pair set of a
+/// sample without [`crate::data::Sample::pairs`].
+pub fn consecutive_pairs(n: usize) -> Vec<[u32; 2]> {
+    (1..n).map(|k| [(k - 1) as u32, k as u32]).collect()
+}
+
+/// `Σ |(f_b − f_a) − (y_b − y_a)|` over `pairs` at constants `c`, `+inf` when
+/// any prediction is not finite (the rule of [`metrics::score_slope_pairs`]).
+fn slope_sum(f: &Flat, x: &[Vec<f64>], y: &[f64], pairs: &[[u32; 2]], c: &[f64], v: &mut [f64]) -> f64 {
+    let mut pred = Vec::with_capacity(x.len());
+    for row in x {
+        eval_row(f, row, c, v);
+        let p = v[f.root];
+        if !p.is_finite() {
+            return f64::INFINITY;
+        }
+        pred.push(p);
+    }
+    let mut acc = 0.0;
+    for &[a, b] in pairs {
+        let (a, b) = (a as usize, b as usize);
+        acc += ((pred[b] - pred[a]) - (y[b] - y[a])).abs();
+    }
+    acc
+}
+
+/// #236: the normal equations of one IRLS round on the first differences:
+/// the row of pair `[a, b]` is `√u·(∇f_b − ∇f_a)` with response `√u·g`,
+/// `g = (f_b − f_a) − (y_b − y_a)`, `u = 1/max(|g|, 1e-6)`. `None` when a
+/// prediction or a derivative is not finite.
+#[allow(clippy::too_many_arguments)]
+fn slope_normal_equations(
+    f: &Flat,
+    x: &[Vec<f64>],
+    y: &[f64],
+    pairs: &[[u32; 2]],
+    c: &[f64],
+    v: &mut [f64],
+    adj: &mut [f64],
+    grad: &mut [f64],
+) -> Option<(Vec<Vec<f64>>, Vec<f64>)> {
+    let k = f.nconst;
+    let mut pred = Vec::with_capacity(x.len());
+    let mut jac = Vec::with_capacity(x.len() * k);
+    for row in x {
+        eval_row(f, row, c, v);
+        let p = v[f.root];
+        backward(f, v, adj, grad);
+        if !p.is_finite() || grad.iter().any(|g| !g.is_finite()) {
+            return None;
+        }
+        pred.push(p);
+        jac.extend_from_slice(grad);
+    }
+    let mut jtj = vec![vec![0.0; k]; k];
+    let mut jtr = vec![0.0; k];
+    let mut d = vec![0.0; k];
+    for &[a, b] in pairs {
+        let (a, b) = (a as usize, b as usize);
+        let g = (pred[b] - pred[a]) - (y[b] - y[a]);
+        if !g.is_finite() {
+            return None;
+        }
+        let s = (1.0 / g.abs().max(1e-6)).sqrt();
+        for j in 0..k {
+            d[j] = s * (jac[b * k + j] - jac[a * k + j]);
+        }
+        for i in 0..k {
+            for j in 0..=i {
+                jtj[i][j] += d[i] * d[j];
+            }
+            jtr[i] += d[i] * s * g;
+        }
+    }
+    for i in 0..k {
+        for j in 0..i {
+            jtj[j][i] = jtj[i][j];
+        }
+    }
+    Some((jtj, jtr))
+}
+
+/// #236: IRLS on the first differences, the CPU twin of the device slope arm
+/// (`RC_LOSS_SLOPE` in `src/cuda/eval.cu`). `min(iters, 4)` rounds of damped
+/// LM sweeps re-weight from the current differences; every trial is judged on
+/// the true slope sum with two halvings, and up to four undamped steps with one
+/// halving follow. A constant whose differenced column is zero (an additive
+/// level) gets a zero step, so the level stays where the squared fit put it.
+/// The tree changes only when the slope sum strictly improves. Returns the
+/// slope sum at the kept constants.
+pub(crate) fn slope_irls(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    pairs: &[[u32; 2]],
+    iters: usize,
+) -> f64 {
+    let f = flatten(tree);
+    let k = f.nconst;
+    let mut v = vec![0.0; f.op.len().max(1)];
+    let mut c = vec![0.0; k];
+    for i in 0..f.op.len() {
+        if f.cslot[i] >= 0 {
+            c[f.cslot[i] as usize] = f.val[i];
+        }
+    }
+    let mut best = slope_sum(&f, x, y, pairs, &c, &mut v);
+    if k == 0 || iters == 0 || pairs.is_empty() || !best.is_finite() || x.len() != y.len() {
+        return best;
+    }
+    let mut adj = vec![0.0; f.op.len()];
+    let mut grad = vec![0.0; k];
+    let start = best;
+    let rounds = iters.clamp(1, 4);
+    let inner = (iters / rounds).max(1);
+    let mut lambda = 1e-3;
+    let mut normal: Option<(Vec<Vec<f64>>, Vec<f64>)> = None;
+    // A failed assembly or solve, or an exactly zero step, ends the fit
+    // without the undamped polish, as on the device.
+    let mut stop = false;
+    let step = |c: &[f64], delta: &[f64]| -> Vec<f64> {
+        (0..k).map(|i| (c[i] + delta[i]).clamp(-1e6, 1e6)).collect()
+    };
+    'rounds: for round in 0..rounds {
+        if best == 0.0 {
+            break;
+        }
+        if round > 0 {
+            normal = None;
+        }
+        for _ in 0..inner {
+            if normal.is_none() {
+                normal = slope_normal_equations(&f, x, y, pairs, &c, &mut v, &mut adj, &mut grad);
+            }
+            let Some((jtj, jtr)) = normal.as_ref() else {
+                stop = true;
+                break 'rounds;
+            };
+            let mut rhs: Vec<f64> = jtr.iter().map(|g| -g).collect();
+            let Some(delta) = solve(jtj, &mut rhs, lambda, k) else {
+                stop = true;
+                break 'rounds;
+            };
+            if delta.iter().all(|&d| d == 0.0) {
+                stop = true;
+                break 'rounds;
+            }
+            let mut trial = step(&c, &delta);
+            let mut t = slope_sum(&f, x, y, pairs, &trial, &mut v);
+            for _ in 0..2 {
+                if t < best {
+                    break;
+                }
+                trial = (0..k).map(|i| c[i] + 0.5 * (trial[i] - c[i])).collect();
+                t = slope_sum(&f, x, y, pairs, &trial, &mut v);
+            }
+            if t < best {
+                c = trial;
+                best = t;
+                lambda = (lambda / 8.0).max(1e-12);
+                normal = None;
+                if best == 0.0 {
+                    break 'rounds;
+                }
+            } else {
+                lambda *= 6.0;
+                if lambda > 1e9 {
+                    break 'rounds;
+                }
+            }
+        }
+    }
+    for _ in 0..4 {
+        if best == 0.0 || stop {
+            break;
+        }
+        let Some((jtj, jtr)) =
+            slope_normal_equations(&f, x, y, pairs, &c, &mut v, &mut adj, &mut grad)
+        else {
+            break;
+        };
+        let mut rhs: Vec<f64> = jtr.iter().map(|g| -g).collect();
+        let Some(delta) = solve(&jtj, &mut rhs, 0.0, k) else { break };
+        let mut trial = step(&c, &delta);
+        let mut t = slope_sum(&f, x, y, pairs, &trial, &mut v);
+        if !(t < best) {
+            trial = (0..k).map(|i| c[i] + 0.5 * (trial[i] - c[i])).collect();
+            t = slope_sum(&f, x, y, pairs, &trial, &mut v);
+        }
+        if t < best {
+            c = trial;
+            best = t;
+        } else {
+            break;
+        }
+    }
+    if best < start {
+        write_constants(tree, &f, &c);
+    }
+    best
 }
 
 /// Unweighted entry point for [`fit_weighted_metric`].
