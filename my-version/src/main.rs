@@ -940,6 +940,29 @@ fn jnum(v: f64) -> String {
     }
 }
 
+/// #482: `split.train_time` and `split.validation_time` as `[first, last]` raw
+/// time keys, with a leading comma. Empty without a time column.
+fn split_time_json(keys: Option<&data::RowKeys>) -> String {
+    let range = |v: &[f64]| -> Option<(f64, f64)> {
+        let finite = || v.iter().copied().filter(|t| t.is_finite());
+        let lo = finite().fold(f64::INFINITY, f64::min);
+        let hi = finite().fold(f64::NEG_INFINITY, f64::max);
+        (lo <= hi).then_some((lo, hi))
+    };
+    let show = |r: Option<(f64, f64)>| match r {
+        Some((a, b)) => format!("[{},{}]", jnum(a), jnum(b)),
+        None => "null".to_string(),
+    };
+    match keys {
+        Some(k) => format!(
+            ",\"train_time\":{},\"validation_time\":{}",
+            show(range(&k.train)),
+            show(k.validation.as_deref().and_then(range))
+        ),
+        None => String::new(),
+    }
+}
+
 /// #118: best reported error and constant-mean baseline error, the two inputs
 /// to quality-per-GPU-hour. Both are on the same full-data f64 scale as the
 /// archive. `inf`/`nan` yields `quality_per_gpu_hour = null` rather than a
@@ -6453,7 +6476,7 @@ fn main() {
                 String::new()
             };
             let split_json = format!(
-                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"lag_menu\":[{}],\"nvars_before\":{},\"nvars_after\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]{}}}",
+                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"lag_menu\":[{}],\"nvars_before\":{},\"nvars_after\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]{}{}}}",
                 jstr(prepared.report.mode),
                 prepared.report.rows_total,
                 prepared.train.len(),
@@ -6479,7 +6502,8 @@ fn main() {
                 lag_report.series,
                 lag_report.history_rows,
                 notes.iter().map(|n| jstr(n)).collect::<Vec<_>>().join(","),
-                target::split_purge_json(&prepared.report)
+                target::split_purge_json(&prepared.report),
+                split_time_json(prepared.keys.as_ref())
             );
             // #264: lockbox facts of the loaded table (rows, date range, read count).
             let lockbox_json = {
@@ -6811,7 +6835,7 @@ fn main() {
                 None => backend_json,
             };
             let result_json = format!(
-                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"lockbox\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"lockbox\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"search\":{{\"candidates_evaluated\":{}}},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
                 jstr(VERSION),
@@ -6832,6 +6856,7 @@ fn main() {
                 target_spec_json,
                 prepared.prep.json(),
                 outcome.generations,
+                outcome.candidates_evaluated,
                 outcome.converged_early,
                 jstr(outcome.stop_reason),
                 // #18: the four convergence numbers.
@@ -9201,6 +9226,20 @@ OPTIONS:
   --target <col>             forward-return column used for P&L
   --expr <formula>           score expression, variables resolved by column name;
                              repeat to select among candidates on the validation slice
+  --front <run.json>         candidates from the Pareto front of a run (one per
+                             member, labelled front_rank_<k>), instead of --expr.
+                             --vars, --target (the run's return column) and
+                             --trials (search.candidates_evaluated) default to
+                             the run. The run's position rule is carried: the
+                             objective threshold as a fixed threshold and its
+                             per-side cost; --threshold-fixed,
+                             --threshold-quantile and --cost-bps override.
+                             A window whose test_start is below the last train
+                             or validation time of the run plus its required
+                             purge exits 2
+  --allow-in-sample-windows  with --front: report such a window as
+                             in_sample:true instead of refusing it
+                             (diagnostics only)
   --select-band              #308: select among repeated --expr candidates with
                              the P&L band instead of validation MSE. The screen is
                              the fused long-only reduction on validation rows; the
@@ -9369,6 +9408,9 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut verify_read = false;
     let mut lockbox_arg: Option<String> = None;
     let mut expect_hash: Option<String> = None;
+    let mut front_path: Option<String> = None;
+    let mut allow_in_sample = false;
+    let mut cost_set = false;
 
     let need = |args: &[String], i: usize, flag: &str| -> String {
         match args.get(i) {
@@ -9440,8 +9482,14 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--cost-bps" => {
                 cost_bps = number(need(args, i + 1, "--cost-bps"), "--cost-bps");
+                cost_set = true;
                 i += 1;
             }
+            "--front" => {
+                front_path = Some(need(args, i + 1, "--front"));
+                i += 1;
+            }
+            "--allow-in-sample-windows" => allow_in_sample = true,
             "--threshold-quantile" => {
                 quantile = number(
                     need(args, i + 1, "--threshold-quantile"),
@@ -9630,12 +9678,73 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: walkforward needs --data\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
     });
+    let mut front_run: Option<rcsr::run_json::RunFile> = None;
+    if let Some(path) = &front_path {
+        if !expressions.is_empty() {
+            eprintln!(
+                "error: --front and --expr are alternatives; the candidates come from one source\n\n{}",
+                walkforward_usage()
+            );
+            std::process::exit(EXIT_USAGE);
+        }
+        let run = rcsr::run_json::RunFile::load(path).unwrap_or_else(|e| {
+            eprintln!("error: --front {}", e);
+            std::process::exit(EXIT_INPUT);
+        });
+        if run.front.is_empty() {
+            eprintln!("error: --front {}: the Pareto front is empty", path);
+            std::process::exit(EXIT_INPUT);
+        }
+        if run.train_time.is_none() {
+            eprintln!(
+                "error: --front {}: the run has no split.train_time (no time column); \
+                 the walk-forward needs time",
+                path
+            );
+            std::process::exit(EXIT_INPUT);
+        }
+        expressions = run.front.iter().map(|m| m.expression.clone()).collect();
+        popts.front = Some(walkforward::FrontSource {
+            run: path.clone(),
+            run_sha256: run.sha256.clone(),
+            labels: run.front.iter().map(|m| format!("front_rank_{}", m.rank)).collect(),
+        });
+        if vars_src.is_none() && !run.variables.is_empty() {
+            vars_src = Some(run.variables.join(","));
+        }
+        if target.is_none() {
+            target = run.return_column.clone();
+        }
+        if popts.trials.is_none() {
+            popts.trials = Some(match run.candidates_evaluated {
+                Some(n) if n > 0 => n as usize,
+                _ => {
+                    eprintln!(
+                        "error: --front {}: the run has no search.candidates_evaluated; pass --trials",
+                        path
+                    );
+                    std::process::exit(EXIT_USAGE);
+                }
+            });
+        }
+        if threshold_fixed.is_none() && !quantile_set {
+            if let Some(theta) = run.threshold {
+                threshold_fixed = Some(theta);
+            }
+        }
+        if !cost_set {
+            if let Some(bps) = run.per_side_bps {
+                cost_bps = bps;
+            }
+        }
+        front_run = Some(run);
+    }
     let target = target.unwrap_or_else(|| {
         eprintln!("error: walkforward needs --target\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
     });
     if expressions.is_empty() {
-        eprintln!("error: walkforward needs --expr\n\n{}", walkforward_usage());
+        eprintln!("error: walkforward needs --expr or --front\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
     }
     if threshold_fixed.is_some() && quantile_set {
@@ -9729,6 +9838,22 @@ fn run_walkforward(args: &[String]) -> ! {
             walkforward_usage()
         );
         std::process::exit(EXIT_USAGE);
+    }
+    if let Some((earliest, seen, purge)) = front_run.as_ref().and_then(|r| r.earliest_test_start()) {
+        for w in &windows {
+            if w.test_start < earliest {
+                if allow_in_sample {
+                    popts.in_sample_windows.push(w.label.clone());
+                    continue;
+                }
+                eprintln!(
+                    "error: window '{}' tests rows the run trained or selected on \
+                     (test_start {} < last seen {} + purge {})",
+                    w.label, w.test_start, seen, purge
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+        }
     }
     let vars: Vec<String> = vars_src
         .map(|s| {

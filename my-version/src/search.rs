@@ -253,6 +253,9 @@ pub struct GenCounters {
     /// #463: candidates dropped after the fit because they exceeded the
     /// complexity cap; each one re-enters variation.
     pub post_fit_drops: std::sync::atomic::AtomicU64,
+    /// Whether the fit, eval and batch timers read the clock. Off outside a
+    /// development log; the counts are kept either way.
+    pub timed: bool,
 }
 
 impl GenCounters {
@@ -297,7 +300,7 @@ fn fit_counted(
     fit: &Sample,
     score: &Sample,
 ) -> Option<FitResult> {
-    let t = counters.map(|_| std::time::Instant::now());
+    let t = counters.filter(|c| c.timed).map(|_| std::time::Instant::now());
     let out = fit_constants(tree, cfg, fit, score);
     if let (Some(c), Some(t)) = (counters, t) {
         GenCounters::add(&c.fitted, 1);
@@ -309,7 +312,7 @@ fn fit_counted(
 /// #211: an evaluated individual, timed only when a log is attached.
 #[inline]
 fn eval_counted(counters: Option<&GenCounters>, make: impl FnOnce() -> Ind) -> Ind {
-    let t = counters.map(|_| std::time::Instant::now());
+    let t = counters.filter(|c| c.timed).map(|_| std::time::Instant::now());
     let ind = make();
     if let (Some(c), Some(t)) = (counters, t) {
         GenCounters::add(&c.eval_ns, t.elapsed().as_nanos().min(u64::MAX as u128) as u64);
@@ -386,7 +389,7 @@ fn fit_and_score(
     defer_gpu: bool,
     counters: Option<&GenCounters>,
 ) -> Vec<Ind> {
-    let t = counters.map(|_| std::time::Instant::now());
+    let t = counters.filter(|c| c.timed).map(|_| std::time::Instant::now());
     let workers = batch_workers(workers, trees.len(), train.sample.len());
     let out = par_map(workers, trees, |mut tree| {
         let mut fitted = None;
@@ -4644,6 +4647,9 @@ pub struct Outcome {
     /// by the development log's `run_end` event; it is not printed, so the
     /// default output is unchanged.
     pub stop_reason: &'static str,
+    /// #482: offspring scored over the run, summed over islands and
+    /// generations, including generations before a resume.
+    pub candidates_evaluated: u64,
 }
 
 /// #256: the reported `converged_early`. `stopped` is the loop-control flag
@@ -4779,6 +4785,7 @@ fn snapshot(
     train: &Sample,
     test: &Sample,
     final_archive: Option<&Archive>,
+    candidates_evaluated: u64,
 ) -> Checkpoint {
     let (words, idx) = main_rng.state();
     Checkpoint {
@@ -4819,6 +4826,7 @@ fn snapshot(
             backend == Backend::Gpu,
         )),
         target_spec: None,
+        candidates_evaluated,
     }
 }
 
@@ -5308,6 +5316,7 @@ fn run_postfix_search(
     mut converged_early: bool,
     mut best_prev: f64,
     mut no_improve: usize,
+    mut candidates: u64,
     save_every: usize,
     mut on_checkpoint: Option<CheckpointFn<'_>>,
     backend_reason: Option<String>,
@@ -5425,6 +5434,7 @@ fn run_postfix_search(
         run_ledger.record_stage(crate::gpu_stats::Stage::Vary, stage_generate);
         run_ledger.record_stage(crate::gpu_stats::Stage::Archive, stage_archive);
         eval_stage_total += stage_eval;
+        candidates += (n_islands * pop) as u64;
         gpu_stats.push(GpuGenStats {
             generation: gen,
             opcodes: Default::default(),
@@ -5619,6 +5629,7 @@ fn run_postfix_search(
                 train,
                 test,
                 None,
+                candidates,
             );
             emit(&mut on_checkpoint, &cp);
             io_stage_total += io_mark.elapsed().as_secs_f64();
@@ -5688,6 +5699,7 @@ fn run_postfix_search(
             train,
             test,
             None,
+            candidates,
         );
         Some(cp)
     } else {
@@ -5777,6 +5789,7 @@ fn run_postfix_search(
         dispatch: dispatcher.snapshot(),
         qd: None,
         stop_reason,
+        candidates_evaluated: candidates,
     })
 }
 
@@ -6165,6 +6178,7 @@ fn run_search(
     let mut converged_early: bool;
     let mut best_prev: f64;
     let mut no_improve: usize;
+    let mut candidates: u64;
     // #85: did any generation fit on a screening subset? Only then may the
     // final archive be refit; a request at least as large as the sample, or
     // `--no-fit`, stays an exact no-op.
@@ -6200,10 +6214,12 @@ fn run_search(
             archive: saved_archive,
             islands: saved_islands,
             stagnant: saved_stagnant,
+            candidates_evaluated: saved_candidates,
             main_rng,
             ..
         } = cp;
         gens_done = generations;
+        candidates = saved_candidates;
         converged_early = stopped_early;
         best_prev = saved_best;
         no_improve = saved_no_improve;
@@ -6300,6 +6316,7 @@ fn run_search(
         converged_early = false;
         best_prev = f64::INFINITY;
         no_improve = 0;
+        candidates = 0;
     }
 
     // #26: a checkpoint from a GPU run carries the f32 proxy, and a run forced
@@ -6412,6 +6429,7 @@ fn run_search(
                         converged_early,
                         best_prev,
                         no_improve,
+                        candidates,
                         save_every,
                         on_checkpoint,
                         backend_reason,
@@ -6503,7 +6521,10 @@ fn run_search(
             // it always was.
             let mut dev_mark = cfg.dev_log.is_some().then(std::time::Instant::now);
             let mut stage_mark = std::time::Instant::now();
-            let dev_counters = cfg.dev_log.is_some().then(GenCounters::default);
+            let dev_counters = Some(GenCounters {
+                timed: cfg.dev_log.is_some(),
+                ..GenCounters::default()
+            });
             // The island threads take `Option<&GenCounters>`, which is `Copy`;
             // the owning `Option` stays here for the readout below.
             let dev_counters_ref = dev_counters.as_ref();
@@ -6720,6 +6741,7 @@ fn run_search(
                 }
             });
             let dev_search = dev_lap(&mut dev_mark); // #211: island scope
+            candidates += GenCounters::total(dev_counters_ref, |c| &c.offspring);
             let stage_search = stage_lap(&mut stage_mark); // #284: see note below
 
             #[cfg(feature = "cuda")]
@@ -7182,6 +7204,7 @@ fn run_search(
                     train,
                     test,
                     None,
+                    candidates,
                 );
                 emit(&mut on_checkpoint, &cp);
                 io_stage_total += io_mark.elapsed().as_secs_f64();
@@ -7254,6 +7277,7 @@ fn run_search(
             train,
             test,
             None,
+            candidates,
         );
         Some(cp)
     } else {
@@ -7419,6 +7443,7 @@ fn run_search(
         // #120: coverage of the descriptor grid for this run.
         qd: qd_archive.as_ref().map(|q| q.report()),
         stop_reason, // #211
+        candidates_evaluated: candidates,
     })
 }
 
