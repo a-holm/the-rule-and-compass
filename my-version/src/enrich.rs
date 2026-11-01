@@ -2947,7 +2947,6 @@ pub(crate) fn format_utc_seconds(ts: i64) -> String {
     )
 }
 
-#[cfg(feature = "cuda")]
 fn column_all(store: &FileStore, col: usize) -> Result<Vec<f64>, String> {
     let mut out = Vec::with_capacity(store.n_rows());
     for g in 0..store.n_groups() {
