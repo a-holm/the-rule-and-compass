@@ -392,3 +392,62 @@ fn an_unknown_column_in_a_row_expression_fails_before_the_read() {
     assert_eq!(code(&out), 2, "{}", stderr(&out));
     assert!(stderr(&out).contains("cannot parse --exclude"), "{}", stderr(&out));
 }
+
+#[test]
+fn run_json_carries_the_seen_time_ranges_and_the_candidate_count() {
+    let dir = scratch();
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let data = write_csv(&dir, "a.csv", None);
+    let out = run(&data, &spec, PNL);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let j = json(&out);
+    let pair = |path: &[&str]| match at(&j, path) {
+        Json::Arr(a) if a.len() == 2 => (a[0].as_f64().unwrap(), a[1].as_f64().unwrap()),
+        other => panic!("{path:?} is not a pair: {other:?}"),
+    };
+    let (t0, t1) = pair(&["split", "train_time"]);
+    let (v0, v1) = pair(&["split", "validation_time"]);
+    assert_eq!(t0, T0 as f64);
+    assert!(t1 < v0 && v0 < v1, "train {t1} validation {v0}..{v1}");
+    assert!(num(&j, &["search", "candidates_evaluated"]) > 0.0);
+    assert_eq!(at(&j, &["target_spec", "return_column"]).as_str(), Some("r"));
+}
+
+#[test]
+fn walkforward_front_of_a_real_run_guards_the_seen_rows() {
+    let dir = scratch();
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let data = write_csv(&dir, "a.csv", None);
+    let out = run(&data, &spec, PNL);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let j = json(&out);
+    let run_path = dir.join("run.json");
+    std::fs::write(&run_path, text.trim()).unwrap();
+    let run_path = run_path.to_string_lossy().into_owned();
+    let seen = match at(&j, &["split", "validation_time"]) {
+        Json::Arr(a) => a[1].as_f64().unwrap(),
+        _ => unreachable!(),
+    };
+    let purge = num(&j, &["split", "required_purge_seconds"]);
+    let end = (T0 + 900 * N as i64) as f64;
+    let walk = |test_start: f64| {
+        let window = format!("w,{},{},{},{}", T0, test_start - 3600.0, test_start, end);
+        Command::new(env!("CARGO_BIN_EXE_rcsr"))
+            .args([
+                "walkforward", "--data", &data, "--time", "t", "--front", &run_path, "--window", &window,
+                "--horizon", "3600", "--periods-per-year", "365", "--validation-frac", "0.3", "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let inside = walk(seen);
+    assert_eq!(code(&inside), 2, "{}", stderr(&inside));
+    assert!(stderr(&inside).contains("tests rows the run trained or selected on"), "{}", stderr(&inside));
+    let outside = walk(seen + purge);
+    assert_eq!(code(&outside), 0, "{}", stderr(&outside));
+    let report = json(&outside);
+    let selection = at(&report, &["selection"]);
+    assert_eq!(at(selection, &["source"]).as_str(), Some("front"));
+    assert!(matches!(at(&report, &["candidates"]), Json::Arr(c) if !c.is_empty()));
+}

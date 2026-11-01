@@ -1,4 +1,4 @@
-//! The book a search run selected (#487).
+//! The book a search run selected (#487), a view over [`crate::run_json::RunFile`].
 //!
 //! `rcsr --objective pnl|sharpe|log_growth --json` writes the finalist
 //! expression, the position rule (`objective.spec`) and the cost beside the
@@ -24,7 +24,10 @@ pub struct RunBook {
 
 impl RunBook {
     pub fn parse(text: &str) -> Result<RunBook, String> {
-        let j = Json::parse(text.trim()).ok_or_else(|| "run.json is not valid JSON".to_string())?;
+        crate::run_json::RunFile::parse(text)?.book()
+    }
+
+    pub(crate) fn from_json(j: &Json) -> Result<RunBook, String> {
         let obj = match j.get("objective") {
             Some(o @ Json::Obj(_)) => o,
             _ => {

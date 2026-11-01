@@ -100,7 +100,7 @@ time axis is global, so cross-symbol overlap on a panel and misaligned
 `purge_seconds` (the smallest stamp distance between retained training rows and
 test rows, also recorded without a spec), `validation_purge_seconds`,
 `purged_rows.test_boundary`, `purged_rows.validation_boundary` and
-`purge_source`. The text header prints the same facts on a `# purge:` line.
+`purge_source`. It also records `train_time` and `validation_time` as `[first, last]` raw time keys (`validation_time` is `null` without a validation slice; both are absent without `--time`) and `search.candidates_evaluated`, the offspring scored over the run. `rcsr walkforward --front` reads them. The text header prints the same facts on a `# purge:` line.
 
 The 2026H2 lockbox check covers the fit rows, the validation slice and the test
 blocks alike: a validation slice that overlaps the lockbox is refused with the

@@ -83,6 +83,20 @@ pub struct ProtocolOptions {
     /// #487: where the cost and the return units came from. `None` is the
     /// historical reading: the flag or default cost and simple returns.
     pub cost: Option<crate::target::CostDecl>,
+    /// #482: the run.json the candidates came from.
+    pub front: Option<FrontSource>,
+    /// #482: labels of windows that overlap the run's training or validation
+    /// rows and were allowed anyway.
+    pub in_sample_windows: Vec<String>,
+}
+
+/// #482: where a candidate list came from: a run's Pareto front.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrontSource {
+    pub run: String,
+    pub run_sha256: String,
+    /// Archive rank label of every candidate, in candidate order.
+    pub labels: Vec<String>,
 }
 
 impl Default for ProtocolOptions {
@@ -100,6 +114,8 @@ impl Default for ProtocolOptions {
             fdr_q: 0.10,
             batch_pnl: false,
             cost: None,
+            front: None,
+            in_sample_windows: Vec::new(),
         }
     }
 }
@@ -349,6 +365,8 @@ pub struct WindowResult {
     pub validation_rows: usize,
     pub test_rows: usize,
     pub dropped_rows: usize,
+    /// #482: the window overlaps rows the run trained or selected on.
+    pub in_sample: bool,
     /// Time step inferred from the test timestamps, when it was inferable.
     pub inferred_period_seconds: Option<f64>,
     pub metrics: Metrics,
@@ -487,6 +505,8 @@ pub struct Report {
     /// Which fibre selected the candidate(s). Always validation when more than
     /// one candidate is present; `test` is never a selection input.
     pub selected_on: String,
+    /// #482: the run whose Pareto front supplied the candidates.
+    pub front: Option<FrontSource>,
     /// #308: whether the band protocol selected the candidate.
     pub band_select: bool,
     /// True when no test row influenced candidate or threshold selection.
@@ -1353,6 +1373,7 @@ impl Accum {
                 });
             }
             let train_last_time = if d.train_max_time.is_finite() { Some(d.train_max_time) } else { None };
+            let in_sample = opts.in_sample_windows.contains(&d.window.label);
             windows.push(WindowResult {
                 window: d.window,
                 expression: expr::to_string(&trees[candidate], &layout.var_names),
@@ -1364,6 +1385,7 @@ impl Accum {
                 validation_rows: d.validation_scores[candidate].len(),
                 test_rows: ev.stats.rows,
                 dropped_rows: d.dropped,
+                in_sample,
                 train_last_time,
                 inferred_period_seconds: inferred_dt,
                 metrics: ev.metrics,
@@ -1543,6 +1565,7 @@ impl Accum {
             annualization,
             candidates: expressions,
             selected_on,
+            front: opts.front.clone(),
             band_select: spec.band_select,
             test_used_for_selection: false,
             pool_reset_flat: spec.pool_reset_flat,
@@ -2772,7 +2795,7 @@ impl Metrics {
 
 impl WindowResult {
     fn json(&self) -> String {
-        format!(
+        let mut s = format!(
             "{{\"label\":{},\"train_start\":{},\"train_end\":{},\"test_start\":{},\
              \"test_end\":{},\"purge_seconds\":{},\"expression\":{},\
              \"candidate\":{},\"validation_error\":{},\"threshold\":{},\
@@ -2813,11 +2836,30 @@ impl WindowResult {
                 .as_ref()
                 .map_or("null".to_string(), |s| s.json()),
             self.train_last_time.map_or("null".to_string(), jnum)
-        )
+        );
+        if self.in_sample {
+            s.pop();
+            s.push_str(",\"in_sample\":true}");
+        }
+        s
     }
 }
 
 impl Report {
+    /// #482: `source`, `run`, `run_sha256` and the candidate labels, with a
+    /// leading comma. Empty when the candidates came from `--expr`.
+    fn front_json(&self) -> String {
+        match &self.front {
+            Some(f) => format!(
+                ",\"source\":\"front\",\"run\":{},\"run_sha256\":{},\"candidate_labels\":[{}]",
+                jstr(&f.run),
+                jstr(&f.run_sha256),
+                f.labels.iter().map(|l| jstr(l)).collect::<Vec<_>>().join(",")
+            ),
+            None => String::new(),
+        }
+    }
+
     /// Machine-readable JSON. The deterministic report; its SHA-256 is the
     /// reproduction hash.
     pub fn json(&self) -> String {
@@ -2937,7 +2979,7 @@ impl Report {
              \"annualized_alpha_scale\":\"periods_per_year\"}}}},\
              \"candidates\":[{}],\"selection\":{{\"selected_on\":{},\
              \"band_select\":{},\"test_used_for_selection\":{},\
-             \"candidate_count\":{}}},\
+             \"candidate_count\":{}{}}},\
              \"pooled_seam\":{{\"reset_flat\":{},\"seam_cost\":{},\"seam_trades\":{}}},\
              \"sign_test\":{{\"positive\":{},\"total\":{},\"applicable\":{},\
              \"p_value\":{},\"method\":{}}},\
@@ -2986,6 +3028,7 @@ impl Report {
             self.band_select,
             self.test_used_for_selection,
             self.candidates.len(),
+            self.front_json(),
             self.pool_reset_flat,
             jnum(self.seam_cost),
             self.seam_trades,

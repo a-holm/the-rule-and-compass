@@ -420,7 +420,7 @@ fn from_run_refuses_a_run_without_an_objective_and_competing_rules() {
     let data = write_csv(&dir, "d.csv", |i| row(i).2);
     let w = window_arg();
     let plain = dir.join("plain.json");
-    std::fs::write(&plain, "{\"tool\":\"rcsr\",\"variables\":[\"x1\"],\"target_spec\":null}").unwrap();
+    std::fs::write(&plain, "{\"tool\":\"rcsr\",\"variables\":[\"x1\"],\"pareto\":[],\"target_spec\":null}").unwrap();
     let out = rcsr(&["walkforward", "--data", &data, "--time", "t", "--from-run", plain.to_str().unwrap(), "--window", &w]);
     assert_eq!(code(&out), 3);
     assert!(stderr(&out).contains("no objective block"), "{}", stderr(&out));
