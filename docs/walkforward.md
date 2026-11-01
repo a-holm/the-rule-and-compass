@@ -362,8 +362,12 @@ are exact CPU `f64`.
 The `batch_pnl` JSON block holds `reported_values`, `batch_values`,
 `max_abs_net_delta` (selected candidate, scalar evaluator versus batch cell),
 `finalists`, and for each seam the `cells`, the `ladder` and `stats`:
-`candidates_per_s`, `row_evals_per_s`, `device_fraction`, `device_bytes`,
-`host_tile_bytes`, `device_tiles`, `host_tiles` and `fallback_candidates`.
+`candidates`, `windows`, `cells`, `rows`, `row_evals`, `tile_candidates`,
+`device_bytes`, `host_tile_bytes`, `device_tiles`, `host_tiles` and
+`fallback_candidates`. The wall-clock fields (`wall_s`, `device_s`, `score_s`,
+`layout_s`, `reference_s`, `candidates_per_s`, `row_evals_per_s`,
+`device_fraction`) are in the printed `batch_timings` object, outside the
+report hash.
 `backend` is `cuda` when the kernel ran and `cpu` otherwise, with a
 `fallback_reason` when a tile ran on the host.
 
@@ -582,7 +586,7 @@ sign test, per-window metrics and pooled metrics. `--out file` writes the
 same JSON, `--markdown file` writes a Markdown report and `--markdown -` prints
 it to stdout. Without those flags a compact text table is printed.
 
-The printed and written JSON ends with a `ledger` object (#284): the phase ledger of the run with `io_s` (store row-group or CSV reads), `pnl_s` (scoring, windows, controls, `--batch-pnl`), `host_other_s`, `wall_s`, `unaccounted_s`, `closure` and `device_busy_s`, the union of the `--batch-pnl` device tile intervals and of the `--device-pnl` CUDA reduction calls (`host_envelope` basis; the canonical CPU backend adds none). The ledger holds wall-clock seconds, so `report_sha256` and `--expect-report-sha256` hash the report without it. See `docs/benchmarks.md`.
+The printed and written JSON ends with a `ledger` object (#284): the phase ledger of the run with `io_s` (store row-group or CSV reads), `pnl_s` (scoring, windows, controls, `--batch-pnl`), `host_other_s`, `wall_s`, `unaccounted_s`, `closure` and `device_busy_s`, the union of the `--batch-pnl` device tile intervals and of the `--device-pnl` CUDA reduction calls (`host_envelope` basis; the canonical CPU backend adds none). The ledger and the `batch_timings` object (`--batch-pnl`: per seam `wall_s`, `device_s`, `score_s`, `layout_s`, `reference_s`, `candidates_per_s`, `row_evals_per_s`, `device_fraction`) hold wall-clock seconds, so `report_sha256`, `--expect-report-sha256` and `--verify-read` hash the report without them. See `docs/benchmarks.md`.
 
 ## Store handling and memory
 

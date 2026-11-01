@@ -3047,8 +3047,8 @@ impl Report {
     }
 
     /// The printed report: [`Report::json_with_protocol`] (or [`Report::json`])
-    /// plus the #284 phase ledger. The ledger holds wall-clock seconds, so it
-    /// stays outside the reproduction hash.
+    /// plus the #284 phase ledger and the `--batch-pnl` timings. Both hold
+    /// wall-clock seconds, so they stay outside the reproduction hash.
     pub fn json_with_ledger(&self, protocol: Option<&str>) -> String {
         use crate::gpu_stats::Stage;
         let mut s = match protocol {
@@ -3056,6 +3056,9 @@ impl Report {
             None => self.json(),
         };
         s.pop();
+        if let Some(b) = &self.batch_pnl {
+            s.push_str(&format!(",\"batch_timings\":{}", b.timings_json()));
+        }
         s.push_str(&format!(
             ",\"ledger\":{}}}",
             self.ledger.phase_json(
