@@ -819,6 +819,7 @@ mod front {
         assert_eq!(code, 3, "{err}");
         assert!(err.contains("zz"), "{err}");
     }
+}
 
 #[path = "common/ledger.rs"]
 mod ledger;
