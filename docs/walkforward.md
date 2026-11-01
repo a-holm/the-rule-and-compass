@@ -180,11 +180,14 @@ The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA
   `"lockbox": {"permitted": true, ...}` in the JSON report. The same
   `rcsr::lockbox::Guard` is used by `rcsr run` (the default search),
   `rcsr panel build --start/--end` and a labelled `rcsr prep`.
-* A locked test declared with the data (`rcsr panel build --locked-test`, or
-  `--lockbox START,END`) is checked the same way on every run, with or without
-  `--ledger`: a window whose train or test range touches it exits 3. The JSON
-  `protocol.lockbox` object then carries `declared`, `source`, `rows_in_scope`
-  and `evaluated`. See [`panel.md`](panel.md#the-declared-locked-test).
+* The protocol locked test is checked on every run, with or without
+  `--ledger`: a window whose train or test range touches it exits 3. The range
+  is `--lockbox START,END`, else the one declared with the data
+  (`rcsr panel build --locked-test`), else the protocol default
+  2025-07-01..2026-07-01. `--lockbox none` is the only opt-out. The JSON
+  `protocol.lockbox` object always carries `declared`, `source` (`flag`,
+  `store`, `protocol_default`, `none`), `declared_in`, `rows_in_scope` and
+  `evaluated`. See [`panel.md`](panel.md#the-declared-locked-test).
 * Costs and positions are per group. Counting position changes on a flattened
   timestamp/symbol row order would count spurious changes at every symbol
   boundary; this implementation does not.
@@ -524,7 +527,7 @@ Candidates are evaluated on the test periods with their own validation threshold
 
 ### Candidate ledger and the locked test
 
-`--ledger FILE` makes a development run append a `candidate` line (content-addressed id over the procedure, the data SHA-256 and the build commit; `test_read:false`). Each line holds the SHA-256 of the previous line, so an edit breaks the chain. A development window that touches the declared lockbox (`--lockbox START,END`, default 2025-07-01 to 2026-07-01) is refused.
+`--ledger FILE` makes a development run append a `candidate` line (content-addressed id over the procedure, the data SHA-256 and the build commit; `test_read:false`). Each line holds the SHA-256 of the previous line, so an edit breaks the chain. A development window that touches the locked test (`--lockbox START,END`, else the range declared with the data, else 2025-07-01 to 2026-07-01; `--lockbox none` opts out) is refused.
 
 `rcsr protocol seal --ledger L --out locked_candidates.json` writes the sealed list and records its hash in the ledger. `--locked-test --sealed locked_candidates.json` then reads the locked test: the candidate must be in the sealed list, the data and build hashes must equal the sealed entry (otherwise the run is void), and the candidate must not have `test_read:true`. The read appends a `test_read` line with the report hash and the new `read_count`; a second read is refused. `--verify-read --expect-report-sha256 H` recomputes the read and compares hashes without recording anything. The report's `protocol` object holds the lockbox rows, date range and read count; `run.json` carries a `lockbox` object (`--lockbox`, `--ledger`) with the rows in the range, their first and last stamps and the read count.
 

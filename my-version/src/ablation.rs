@@ -1543,7 +1543,7 @@ fn usage() -> &'static str {
             [--keep a,b] [--seed 0]\n\
             writes the projection CSV with placebo and circular-block-permuted columns\n\
   score     (--run <run.json> | --from-run <run.json>) --data <csv|rcsb> --target <col> --time <col> --windows <file> --out <file>\n\
-            [--lockbox START,END]  a fold touching the declared locked test is refused (exit 3)\n\
+            [--lockbox START,END|none]  a fold touching the locked test (same resolution) is refused (exit 3)\n\
             [--allow-in-sample]  a fold whose test starts before the run's last seen row + purge is refused (exit 3); with the flag it is labelled oof:false and left out of every pooled series\n\
             [--group <col>] [--return-col <col>] [--scheme expanding] [--thresholds 0.6,0.7,0.8]\n\
             [--headline-threshold 0.7] [--cost-bps 12 | --cost-override <bp>] [--purge-seconds 219600] [--target-spec <file>]\n\
@@ -1672,6 +1672,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 data::read_table(data).map_err(|e| (3, e))?
             };
             let seed: u32 = fl.opt("--seed").map_or(Ok(0), |s| s.parse().map_err(|_| (2, "--seed: invalid number".to_string())))?;
+            let resolved = crate::lockbox::resolve(fl.opt("--lockbox"), data).map_err(|e| (e.exit, e.message))?;
             let csv = prepare_csv(&PrepareInput {
                 table: &table,
                 def: &def,
@@ -1683,8 +1684,8 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             .map_err(|e| (3, e))?;
             let out = fl.need("--out")?;
             std::fs::write(out, csv).map_err(|e| io_err(out, e))?;
-            if let Some(d) = crate::lockbox::resolve_declared(fl.opt("--lockbox"), data).map_err(|e| (2, format!("--lockbox: {}", e)))? {
-                crate::lockbox::write_sidecar(out, &d.lockbox, "rcsr ablation prepare").map_err(|e| (3, e))?;
+            if let Some(lb) = &resolved.sidecar_range() {
+                crate::lockbox::write_sidecar(out, lb, &format!("rcsr ablation prepare ({})", resolved.source.as_str())).map_err(|e| (3, e))?;
             }
             println!("wrote {}", out);
             Ok(())
@@ -1775,9 +1776,13 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 .oof_flags(&labelled, fl.has("--allow-in-sample"))
                 .map_err(|e| (3, format!("{}: {}", run_path, e)))?;
             let panel = ladder::load_panel(&inp, &opts).map_err(|e| (3, e))?;
-            let declared = crate::lockbox::resolve_declared(fl.opt("--lockbox"), fl.need("--data")?).map_err(|e| (2, format!("--lockbox: {}", e)))?;
+            let resolved = crate::lockbox::resolve(fl.opt("--lockbox"), fl.need("--data")?).map_err(|e| (e.exit, e.message))?;
+            let declared = resolved.declared();
             let guard = declared.as_ref().map(|d| (d.lockbox.start as f64, d.lockbox.end as f64));
             let folds = ladder::make_folds(&panel, &rows, opts.purge_seconds, guard).map_err(|e| (3, e))?;
+            if let Some(extra) = resolved.also {
+                ladder::make_folds(&panel, &rows, opts.purge_seconds, Some((extra.start as f64, extra.end as f64))).map_err(|e| (3, e))?;
+            }
             let all_labels: Vec<String> = folds.iter().map(|f| f.label.clone()).collect();
             let folds: Vec<ladder::Fold> = folds.into_iter().zip(&oof).filter(|(_, ok)| **ok).map(|(f, _)| f).collect();
             if folds.is_empty() {
@@ -1815,9 +1820,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 rule,
                 fold_oof
             );
-            if let Some(d) = &declared {
-                json = d.splice_report(&json, 0, false, true);
-            }
+            json = resolved.splice_report(&json, 0, false, true);
             let out = fl.need("--out")?;
             std::fs::write(out, json + "\n").map_err(|e| io_err(out, e))?;
             println!("wrote {}", out);
