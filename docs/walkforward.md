@@ -164,6 +164,15 @@ The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA
   reported as the strategy's P&L. The report labels it `"label":
   "hindsight_bound"`, `"is_strategy": false`, and carries the threshold book's
   net, the gap and `rule_le_bound`.
+* `--policy top-tercile` (#493) is the cross-sectional long-only book: per timestamp, `position = 1` for the top
+  `floor(n/3)` of the `n` rows with a finite score (ties by row order), else `0`. The ranks use the scores of
+  that timestamp only and run before the target mask, so a row with a NaN target stays in the cross-section.
+  A timestamp with fewer than 3 finite scores holds nothing. There is no threshold: `--threshold-quantile`,
+  `--threshold-fixed`, `--band`, `--min-hold`, `--select-band`, `--device-pnl` and `--batch-pnl` are refused,
+  the window `threshold` is `null` and `threshold_source` is `none`. Costs, the final exit and the equal-weight
+  period aggregation are the threshold rule's. `--from-run` of a search run with `--position top_tercile`
+  selects the policy; it conflicts with an explicit `--policy` of another kind. Pair it with an `xs_rank` target
+  (`--target lbl_h1_xs --target-spec ...` resolves to its `return_column`; `docs/time-series.md`).
 * `--cost-bps` (default 10; a `--target-spec` cost wins, see "One book from search to evaluation") is charged **per side** on `|position - previous position|`,
   separately inside each `--group-by` series. Every series starts flat, so an
   entry costs one side and its exit (including the **final** exit of every
@@ -263,6 +272,9 @@ rcsr walkforward ... --policy band --band 0.1 --min-hold 3
 
 # threshold strategy plus the exact hindsight bound (never a strategy)
 rcsr walkforward ... --policy dp
+
+# top-tercile long-only book per timestamp (no threshold)
+rcsr walkforward ... --policy top-tercile
 
 # the same scans on the device, bit-identical to the CPU
 rcsr walkforward ... --policy band --band 0.1 --gpu
@@ -483,17 +495,17 @@ Training fits, validation selects, development out-of-sample evaluates the proce
 | range | UTC |
 |---|---|
 | warm-up (indicators only, never trained on) | 2021 |
-| development | 2022-01-01 to 2025-07-01 |
+| development | 2022-01-01 to 2025-06-28T11:00 (locked start minus `purge_seconds`) |
 | expanding folds | quarterly tests from 2023-01-01, train from 2022-01-01 |
 | rolling folds | quarterly tests from 2024-01-01, train on the previous 24 months |
 | locked test | 2025-07-01 to 2026-07-01 |
 | reserved | 2026H2 (the engine lockbox) |
 
-Each row has `train_end = test_start - purge_seconds` (219600 s: 1 h entry plus a 60 h label) and `validation_start` six calendar months before the test start. `--windows protocol/windows.csv --windows-scheme expanding` loads one scheme; the table's `validation_start` replaces `--validation-frac`. The validation slice sets the threshold and selects among `--expr` candidates. Select the procedure, not the lucky candidate: pool the development series of the chosen procedure.
+Each row has `train_end = test_start - purge_seconds` (219600 s: 1 h entry plus a 60 h label). A development test window ends at `min(quarter end, locked start - purge_seconds)`, so `expanding-2025Q2` and `rolling24-2025Q2` end at 2025-06-28T11:00:00: a label at a later stamp reads bars of the locked test. Outside `--locked-test`, `walkforward`, `ladder` and `ablation score` refuse (exit 3) a window that ends after `locked start - purge` (purge = entry offset + horizon + delay for `walkforward`, `--purge-seconds` for the others); in `--locked-test` mode the training range must end at or before `locked start - purge` and `validation_start` six calendar months before the test start. `--windows protocol/windows.csv --windows-scheme expanding` loads one scheme; the table's `validation_start` replaces `--validation-frac`. The validation slice sets the threshold and selects among `--expr` candidates. Select the procedure, not the lucky candidate: pool the development series of the chosen procedure.
 
 ### Overlapping returns
 
-The book earns the per-row forward return on every long row and charges one cost per position change. With rows closer than `--horizon` in one group, a long run earns the same price move several times. `rcsr walkforward` therefore refuses (exit 2, `overlapping returns`) any window whose test rows have two rows of one group less than `--horizon` seconds apart; a step equal to the horizon passes, a gap passes, equal timestamps are skipped. `--horizon 0` skips the check. The report carries `split.min_group_step_seconds`, the smallest positive step.
+The book earns the per-row forward return on every long row and charges one cost per position change. With rows closer than `--horizon` in one group, a long run earns the same price move several times. `rcsr walkforward` therefore refuses (exit 2, `overlapping returns`) any window whose test rows have two rows of one group less than `--horizon` seconds apart; a step equal to the horizon passes, a gap passes, equal timestamps are skipped. `--horizon 0` skips the check. The report carries `split.min_group_step_seconds`, the smallest positive step. `rcsr ladder` and `rcsr ablation score` apply the same check to the test rows of every fold (horizon from the target spec, or `--horizon-seconds` for the ladder), refuse with exit 2 and the same message, and report `min_group_step_seconds`.
 
 ### Purge
 
@@ -529,13 +541,17 @@ Candidates are evaluated on the test periods with their own validation threshold
 
 ### Candidate ledger and the locked test
 
-`--ledger FILE` makes a development run append a `candidate` line (content-addressed id over the procedure, the data SHA-256 and the build commit; `test_read:false`). Each line holds the SHA-256 of the previous line, so an edit breaks the chain. A development window that touches the locked test (`--lockbox START,END`, else the range declared with the data, else 2025-07-01 to 2026-07-01; `--lockbox none` opts out) is refused.
+`--ledger FILE` makes a development run append a `candidate` line (content-addressed id over the procedure, the data SHA-256 and the build commit; `test_read:false`). Each line holds the SHA-256 of the previous line, so an edit breaks the chain. A development window that ends after the locked test start minus the label purge (`--lockbox START,END`, else the range declared with the data, else 2025-07-01 to 2026-07-01; `--lockbox none` opts out) is refused.
 
 `rcsr protocol seal --ledger L --out locked_candidates.json` writes the sealed list and records its hash in the ledger. `--locked-test --sealed locked_candidates.json` then reads the locked test: the candidate must be in the sealed list, the data and build hashes must equal the sealed entry (otherwise the run is void), and the candidate must not have `test_read:true`. The read appends a `test_read` line with the report hash, the new `read_count` and the locked range it read (`"locked_test":{"start","end","source"}`); a second read is refused. A `candidate` line and the sealed list entry hold the range the candidate was developed against. A final read reports the store's `data_sha256` and the path of its read marker in `protocol.lockbox`, so a reviewer can check both. A copy of a store without its `<data>.locked_reads.jsonl` marker is not detected: the marker lives beside the store and nothing else records the read.
 
+<<<<<<< ours
+`rcsr ladder --scheme locked --locked-test --ledger L --sealed S` reads the locked test for the baseline ladder. The sealed list must be recorded in the ledger and the ledger must hold no `baseline_read`; the run appends `{"event":"baseline_read",...}` with the data and report hashes, and a second call is refused. Without `--locked-test`, `ladder` and `ablation score` refuse any fold that ends after the declared range start minus the purge.
+=======
 A read whose resolved range differs (another `--lockbox`, or a declaration that changed after development) is refused with exit 3: `candidate <id> was developed against the locked test A..B (<source>); this read resolves C..D`. A candidate of an old ledger without the member is refused unless `--allow-unbound-ledger` is given; the read is then reported as unbound. `--verify-read --expect-report-sha256 H` recomputes the read and compares hashes without recording anything. The report's `protocol` object holds the lockbox rows, date range and read count; `run.json` carries a `lockbox` object (`--lockbox`, `--ledger`) with the rows in the range, their first and last stamps and the read count.
 
-`rcsr ladder --scheme locked --locked-test --ledger L --sealed S` reads the locked test for the baseline ladder. The sealed list must be recorded in the ledger and the ledger must hold no `baseline_read`; the run appends `{"event":"baseline_read",...}` with the data and report hashes and the locked range, and a second call is refused. Every candidate of the sealed list must carry the range the ladder resolves (`--allow-unbound-ledger` accepts old entries without one). Without `--locked-test`, `ladder` and `ablation score` refuse any fold that touches the declared range.
+`rcsr ladder --scheme locked --locked-test --ledger L --sealed S` reads the locked test for the baseline ladder. The sealed list must be recorded in the ledger and the ledger must hold no `baseline_read`; the run appends `{"event":"baseline_read",...}` with the data and report hashes and the locked range, and a second call is refused. Every candidate of the sealed list must carry the range the ladder resolves (`--allow-unbound-ledger` accepts old entries without one). Without `--locked-test`, `ladder` and `ablation score` refuse any fold that ends after the declared range start minus the purge.
+>>>>>>> theirs
 
 #### Final seal: one read, one candidate
 

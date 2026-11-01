@@ -61,15 +61,15 @@ fn write_spec(dir: &Path, name: &str, units: &str, round_trip: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// One expanding fold whose test block is rows 210..300, the search's validation slice.
+/// One expanding fold whose test block is rows 310..400, the search's test block (`--test-frac 0.225`), so the fold starts at the rows the run saw plus the purge.
 fn write_windows(dir: &Path) -> String {
     let text = format!(
         "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,f1,{},{},{},{},{}\n",
         T0,
         T0 + STEP * 150,
         T0 + STEP * 100,
-        T0 + STEP * 210,
-        T0 + STEP * 300
+        T0 + STEP * 310,
+        T0 + STEP * 400
     );
     let path = dir.join("windows.csv");
     std::fs::write(&path, text).unwrap();
@@ -121,7 +121,7 @@ fn search(dir: &Path, data: &str, spec: &str, extra: &[&str]) -> String {
         "--data", data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal",
         "--target-spec", spec, "--cpu", "--no-dev-log", "--seed", "3", "--generations", "15",
         "--pop", "32", "--metric", "squared", "--json", "--quiet", "--objective", "pnl",
-        "--validation-frac", "0.3", "--arm", "A0",
+        "--validation-frac", "0.3", "--test-frac", "0.225", "--arm", "A0",
     ];
     args.extend_from_slice(extra);
     let out = rcsr(&args);
@@ -132,7 +132,7 @@ fn search(dir: &Path, data: &str, spec: &str, extra: &[&str]) -> String {
 }
 
 fn window_arg() -> String {
-    format!("v,{},{},{},{}", T0, T0 + STEP * 209, T0 + STEP * 210, T0 + STEP * 300)
+    format!("v,{},{},{},{}", T0, T0 + STEP * 309, T0 + STEP * 310, T0 + STEP * 400)
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn one_cost_one_book_across_evaluators() {
     let run = search(&dir, &data, &spec, &[]);
     let run_json = read_json(&run);
 
-    let book = at(&run_json, &["objective", "validation"]);
+    let book = at(&run_json, &["objective", "test"]);
     assert_eq!(num(&run_json, &["objective", "cost", "per_side_bps"]), 10.0);
     assert_eq!(at(&run_json, &["objective", "cost", "source"]).as_str(), Some("target_spec"));
     assert_eq!(at(&run_json, &["objective", "cost", "return_units"]).as_str(), Some("log"));
@@ -233,8 +233,8 @@ fn walkforward_from_run_prices_the_selected_book() {
     let run_const = dir.join("const.json");
     std::fs::write(&run_const, &constant).unwrap();
 
-    // reference: the objective's own book function on the validation rows
-    let rows: Vec<usize> = (210..300).collect();
+    // reference: the objective's own book function on the test rows
+    let rows: Vec<usize> = (310..400).collect();
     let ret: Vec<f64> = rows.iter().map(|&i| row(i).2.exp_m1()).collect();
     let tr = rcsr::trading::TradingRows {
         time: rows.iter().map(|&i| (T0 + STEP * i as i64) as f64).collect(),
