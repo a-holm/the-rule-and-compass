@@ -41,6 +41,14 @@ const MONTHS_PER_QUARTER: i32 = 3;
 /// Default purge: 1 h entry offset plus a 60 h label on the hourly panel.
 pub const DEFAULT_PURGE_SECONDS: f64 = 219_600.0;
 
+/// Embargo after a locked range end when no writer declared one: the largest
+/// feature lookback of the default registry at a 3600 s base (127 days).
+pub const DEFAULT_LOCKBOX_EMBARGO_SECONDS: i64 = 10_972_800;
+
+/// A locked bar may keep this total weight in a recursive filter state once the
+/// embargo has passed.
+pub const LOOKBACK_RESIDUAL: f64 = 1e-4;
+
 /// Declared locked test, UTC half-open `[start, end)`.
 pub const LOCKED_TEST_START: &str = "2025-07-01";
 pub const LOCKED_TEST_END: &str = "2026-07-01";
