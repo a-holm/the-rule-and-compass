@@ -1314,7 +1314,7 @@ mod tests {
         let path = dir.join("cap.ndjson");
         // Room for the start event plus one full generation event (a
         // generation line is ~1 KiB with every optional section present).
-        let cap = run_start_json(&RunStart::default()).len() as u64 + 1200;
+        let cap = run_start_json(&RunStart::default()).len() as u64 + 1300;
         let mut log = Log::create(&path, cap).unwrap();
         assert!(log.append(&run_start_json(&RunStart::default()), true));
         let line = rec().json();
