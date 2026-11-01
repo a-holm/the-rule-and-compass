@@ -236,10 +236,11 @@ fn json_timing_phases_sum_to_the_measured_wall() {
     }
     }
 
-/// #132: the CLI's default baseline is capped, and explicitly passing 0 still
-/// asks for the exact every-row query. The JSON carries the sampling fields.
+/// #497: the CLI's default baseline is exact up to the row threshold, an
+/// explicit N samples for every metric, and 0 asks for every row. The JSON
+/// carries the sampling fields.
 #[test]
-fn cli_baseline_default_is_capped_and_zero_is_exact() {
+fn cli_baseline_default_is_exact_below_the_threshold_and_explicit_samples_any_metric() {
     let csv = TempCsv::new(&line_csv(2000));
     let base = [
         "--data", csv.as_str(), "--target", "y", "--vars", "x",
@@ -271,9 +272,20 @@ fn cli_baseline_default_is_capped_and_zero_is_exact() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let (reference, queries, capped, has_seconds) = parse(&out);
     assert_eq!(reference, 1500.0, "default test split leaves 1500 training rows");
-    assert_eq!(queries, 512.0, "the default must be the bounded cap");
-    assert!(capped);
+    assert_eq!(queries, 1500.0, "the default is exact below the threshold");
+    assert!(!capped);
     assert!(has_seconds, "JSON must report the baseline seconds");
+
+    for extra in [vec!["--baseline-samples", "512"], vec!["--baseline-samples", "64", "--metric", "median"]] {
+        let mut args = base.to_vec();
+        args.extend(extra.iter().copied());
+        let out = run(&args);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let (_, queries, capped, _) = parse(&out);
+        let want: f64 = extra[1].parse().unwrap();
+        assert_eq!(queries, want, "an explicit N must sample any metric");
+        assert!(capped);
+    }
 
     let mut args = base.to_vec();
     args.extend(["--baseline-samples", "0"]);
