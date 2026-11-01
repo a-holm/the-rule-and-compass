@@ -73,6 +73,42 @@ impl VariationMode {
     }
 }
 
+/// #480: what ranks a candidate. Constants are always fitted with the configured
+/// metric; this chooses only the value the archive and selection compare.
+#[derive(Clone, Default)]
+pub enum Fitness {
+    /// The configured `--metric` on the training sample.
+    #[default]
+    Metric,
+    /// The exact long/flat net regret on the canonical training rows.
+    LongPnl(std::sync::Arc<crate::trading::FitnessBook>),
+    /// Read from a checkpoint: only the book hash is known. The CLI replaces
+    /// it with the rebuilt book before the search starts.
+    SavedLongPnl(u64),
+}
+
+impl Fitness {
+    /// The comparison and checkpoint key: kind plus book hash.
+    pub fn key(&self) -> String {
+        match self {
+            Fitness::Metric => "metric".to_string(),
+            Fitness::LongPnl(book) => format!("long_pnl:{:016x}", book.hash()),
+            Fitness::SavedLongPnl(hash) => format!("long_pnl:{:016x}", hash),
+        }
+    }
+
+    pub fn is_metric(&self) -> bool {
+        matches!(self, Fitness::Metric)
+    }
+
+    fn book(&self) -> Option<&crate::trading::FitnessBook> {
+        match self {
+            Fitness::LongPnl(book) => Some(book),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub generations: usize,
@@ -83,6 +119,8 @@ pub struct Config {
     /// How a candidate's complexity is measured and ranked on the front.
     pub complexity_model: ComplexityModel,
     pub metric: Metric,
+    /// #480: the value candidates are ranked by. Saved search state.
+    pub fitness: Fitness,
     pub seed: u32,
     pub ops: Vec<Op>,
     pub migration_interval: usize,
@@ -436,6 +474,7 @@ impl Default for Config {
             max_complexity: 30,
             complexity_model: ComplexityModel::default(),
             metric: Metric::Absolute,
+            fitness: Fitness::Metric,
             seed: 0,
             ops: Op::default_set(),
             migration_interval: 25,
@@ -504,6 +543,9 @@ impl Config {
         compare!(max_complexity, "max_complexity");
         compare!(complexity_model, "complexity model");
         compare!(metric, "metric");
+        if self.fitness.key() != other.fitness.key() {
+            diff.push("fitness"); // #480
+        }
         compare!(seed, "seed");
         compare!(ops, "ops");
         compare!(migration_interval, "migration_interval");
@@ -607,7 +649,7 @@ impl Ind {
                     let d = want_descriptor.then(|| qd::descriptor(&tree, train.sample));
                     (fit.sse / train.sample.len() as f64, d)
                 }
-                _ => eval_error_and_descriptor(&tree, train, cfg.metric, want_descriptor), // #27
+                _ => fitness_error_and_descriptor(&tree, train, cfg, want_descriptor), // #27 #480
             }
         } else {
             (f64::INFINITY, None)
@@ -651,7 +693,7 @@ impl Ind {
         // #25: re-evaluation must not resurrect a rejected candidate.
         let want_descriptor = cfg.qd_bins > 0 && !train.sample.is_multi();
         let (error, descriptor) = if cfg.accepts_dimensions(&self.tree) {
-            eval_error_and_descriptor(&self.tree, train, cfg.metric, want_descriptor) // #27
+            fitness_error_and_descriptor(&self.tree, train, cfg, want_descriptor) // #27 #480
         } else {
             (f64::INFINITY, None)
         };
@@ -2624,6 +2666,9 @@ fn score_pipeline_batch(
 /// false`) whose every fitness value is scored by the CPU.
 #[cfg(feature = "cuda")]
 fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
+    if !cfg.fitness.is_metric() {
+        return Some("long_pnl fitness has no device scorer yet"); // #480
+    }
     if train.is_multi() {
         return Some("multi-output objective");
     }
@@ -2909,6 +2954,7 @@ fn gpu_plan_shape(cfg: &Config, train: &Sample) -> GpuPlanShape {
         && maximum_blocker.is_none()
         && crate::metrics::native_score_objective(cfg.metric).is_none();
     let fit_only = !score_admitted
+        && cfg.fitness.is_metric() // #480: the CPU scores the long_pnl fitness
         && (rank_fit_only_arm(cfg, train).is_some()
             || (order_stat_fit && order_stat_blocker.is_none())
             || logistic_fit
@@ -3151,6 +3197,29 @@ fn eval_error_on(tree: &Node, data: &EvalSample, metric: Metric) -> f64 {
     eval_error_and_descriptor(tree, data, metric, false).0
 }
 
+/// #480: [`eval_error_and_descriptor`] under the configured fitness. The long/flat
+/// regret reads the same prediction vector the descriptor does.
+fn fitness_error_and_descriptor(
+    tree: &Node,
+    data: &EvalSample,
+    cfg: &Config,
+    want_descriptor: bool,
+) -> (f64, Option<qd::Descriptor>) {
+    let Some(book) = cfg.fitness.book() else {
+        return eval_error_and_descriptor(tree, data, cfg.metric, want_descriptor);
+    };
+    let s = data.sample;
+    if s.is_empty() || s.len() != book.len() {
+        debug_assert!(false, "fitness book has {} rows, the sample {}", book.len(), s.len());
+        return (f64::INFINITY, None);
+    }
+    let nvars = s.x.first().map(Vec::len).unwrap_or(0);
+    let pred = predictions(tree, data);
+    let error = book.regret(&pred);
+    let descriptor = want_descriptor.then(|| qd::descriptor_from_prediction(tree, &pred, nvars));
+    (error, descriptor)
+}
+
 /// #120: score a candidate and, when asked, accumulate its behaviour
 /// descriptor from the *same* prediction vector.
 ///
@@ -3329,6 +3398,7 @@ struct FitResult {
 /// anything all keep the ordinary evaluation path.
 fn can_reuse_sse(cfg: &Config, train: &EvalSample, fit: &FitResult, hash: u64) -> bool {
     cfg.metric == Metric::Squared
+        && cfg.fitness.is_metric() // #480: the SSE is not the long/flat regret
         && fit.same_rows // #85
         && fit.hash == hash
         && fit.sse.is_finite()
@@ -3354,7 +3424,7 @@ fn score_tree(tree: &Node, data: &EvalSample, cfg: &Config) -> f64 {
     if data.sample.is_multi() {
         multi::combined_error(tree, data.sample, cfg.metric, cfg.fit_iters)
     } else {
-        eval_error_on(tree, data, cfg.metric)
+        fitness_error_and_descriptor(tree, data, cfg, false).0
     }
 }
 
@@ -5568,7 +5638,7 @@ fn run_postfix_search(
         }
 
         if gen_best.is_finite() {
-            if cfg.metric.is_solved(gen_best) {
+            if cfg.fitness.is_metric() && cfg.metric.is_solved(gen_best) {
                 converged_early = true;
                 stop_reason = "solved"; // #211
             }
@@ -6992,7 +7062,7 @@ fn run_search(
             }
 
             if gen_best.is_finite() {
-                if cfg.metric.is_solved(gen_best) {
+                if cfg.fitness.is_metric() && cfg.metric.is_solved(gen_best) {
                     converged_early = true;
                     stop_reason = "solved"; // #211
                     break;
@@ -8853,6 +8923,57 @@ mod tests {
             before,
             "a non-squared metric must never reuse the squared SSE"
         );
+    }
+
+    /// #480: under the long/flat fitness a squared fit must not hand its SSE
+    /// to the score, and the score is the regret of the same predictions.
+    fn pnl_book(s: &Sample) -> std::sync::Arc<crate::trading::FitnessBook> {
+        let rows = crate::trading::TradingRows {
+            time: (0..s.len()).map(|i| 900.0 * i as f64).collect(),
+            group: vec![0; s.len()],
+            funding: Vec::new(),
+        };
+        let slice = crate::data::TradingSlice { rows, ret: s.y.clone() };
+        let spec = crate::trading::TradingSpec {
+            cost_bps: 1.0,
+            min_trades: 0,
+            ..Default::default()
+        };
+        std::sync::Arc::new(crate::trading::FitnessBook::new(&slice, &spec, 900.0).unwrap())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn long_pnl_fitness_names_why_the_device_is_off() {
+        let s = sample();
+        let cfg = Config {
+            fitness: Fitness::LongPnl(pnl_book(&s)),
+            ..Default::default()
+        };
+        assert_eq!(gpu_blocker(&cfg, &s), Some("long_pnl fitness has no device scorer yet"));
+    }
+
+    #[test]
+    fn long_pnl_fitness_never_reuses_the_fit_sse() {
+        let s = sample(); // y = x0
+        let book = pnl_book(&s);
+        let cfg = Config {
+            metric: Metric::Squared,
+            fit_iters: 8,
+            fitness: Fitness::LongPnl(book.clone()),
+            ..Default::default()
+        };
+        let view = EvalSample::new(&s, &cfg);
+        let tree = node(
+            Op::Sin,
+            vec![node(Op::Mul, vec![constant(1.0), input(0)])],
+        );
+        let before = REFIT_SSE_REUSED.with(|n| n.get());
+        let sol = refit_survivor(&tree, &view, &cfg);
+        assert_eq!(REFIT_SSE_REUSED.with(|n| n.get()), before);
+        let pred = predictions(&sol.tree, &view);
+        assert_eq!(sol.error.to_bits(), book.regret(&pred).to_bits());
+        assert!(sol.error < 0.5, "x0 is the return, the fitted sign rule should be near the bound: {}", sol.error);
     }
 
     /// #87: guarded operators must not leave a finite fit SSE behind. The
