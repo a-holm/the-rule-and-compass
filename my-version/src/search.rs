@@ -286,6 +286,9 @@ pub struct Config {
     pub variation: VariationMode,
     /// #465: survivor and parent selection inside an island.
     pub selection: Selection,
+    /// #470: wrap every candidate shape in a fitted affine output map
+    /// `a + b*f(x)`. Changes the trajectory, so it is a saved search setting.
+    pub linear_scaling: bool,
 }
 
 /// A per-generation progress report.
@@ -474,6 +477,9 @@ fn fit_and_score(
     let t = counters.filter(|c| c.timed).map(|_| std::time::Instant::now());
     let workers = batch_workers(workers, trees.len(), train.sample.len());
     let out = par_map(workers, trees, |mut tree| {
+        if cfg.linear_scaling {
+            tree = crate::scale::ensure(tree, 0.0, 1.0); // #470
+        }
         let mut fitted = None;
         if fit {
             fitted = fit_counted(counters, &mut tree, cfg, fit_sample, train.sample); // #85 #87 #211
@@ -551,6 +557,7 @@ impl Default for Config {
             threads: 1,
             variation: VariationMode::Auto,
             selection: Selection::Lexicographic,
+            linear_scaling: false,
         }
     }
 }
@@ -589,6 +596,7 @@ impl Config {
         compare!(fit_strategy, "fit_strategy"); // #116
         compare!(fit_polish, "fit_polish");
         compare!(fit_admission, "fit_admission");
+        compare!(linear_scaling, "linear_scaling"); // #470
         compare!(dedup, "dedup");
         // #256: `time_budget` is a per-process limit, not search state; a resumed
         // run may set a new one.
@@ -627,6 +635,17 @@ impl Config {
             Some(units) if self.require_dimensions => units.accepts(tree),
             _ => true,
         }
+    }
+
+    /// #470: the complexity cap for a generated candidate. The affine wrapper is
+    /// free, so it extends the cap by exactly what it costs.
+    fn complexity_cap(&self) -> f64 {
+        let extra = if self.linear_scaling {
+            crate::scale::overhead(&self.complexity_model)
+        } else {
+            0.0
+        };
+        self.max_complexity as f64 + extra
     }
 }
 
@@ -3362,6 +3381,11 @@ fn fit_constants_with_iters(
     score: &Sample,
     iters: usize,
 ) -> Option<FitResult> {
+    // #470: start the map of a wrapped tree at the closed-form least squares
+    // on the fit rows; the configured fitter then refines every constant.
+    if cfg.linear_scaling && cfg.metric.is_least_squares() {
+        crate::scale::restart(tree, &fit.x, &fit.y, &fit.w);
+    }
     if cfg.metric.is_implicit_derivative() {
         crate::implicit::fit(tree, &fit.x, &fit.w, iters);
         None
@@ -4608,12 +4632,24 @@ fn evolve_island(
             let (p1, mut age) = pick_parent_aged(
                 isl, front, qd, rng, front_p, qd_policy, qd_control, afp, &par_rank, &par_crowd,
             );
+            // #470: variation edits the bare shape; the child inherits the first
+            // parent's map as its warm start.
+            let (scale_a, scale_b, p1) = if cfg.linear_scaling {
+                crate::scale::split(&p1)
+            } else {
+                (0.0, 1.0, p1)
+            };
             let mut child = p1;
             if rng.bool(0.5) {
                 let (parent2, age2) = pick_parent_aged(
                     isl, front, qd, rng, front_p, qd_policy, qd_control, afp, &par_rank, &par_crowd,
                 );
                 age = age.max(age2);
+                let parent2 = if cfg.linear_scaling {
+                    crate::scale::split(&parent2).2
+                } else {
+                    parent2
+                };
                 crossover_with(&mut child, &parent2, rng, Some(aggs));
             }
             mutate_with(&mut child, rng, nvars, &cfg.ops, Some(aggs));
@@ -4621,8 +4657,11 @@ fn evolve_island(
                 mutate_with(&mut child, rng, nvars, &cfg.ops, Some(aggs));
             }
 
-            let tree = expr::simplify(&child);
-            if cfg.complexity_model.complexity(&tree) > cfg.max_complexity as f64 {
+            let mut tree = expr::simplify(&child);
+            if cfg.linear_scaling {
+                tree = expr::simplify(&crate::scale::wrap(scale_a, scale_b, tree));
+            }
+            if cfg.complexity_model.complexity(&tree) > cfg.complexity_cap() {
                 GenCounters::count(counters, |c| &c.too_complex); // #211
                 continue;
             }
@@ -4636,7 +4675,7 @@ fn evolve_island(
         let scored = fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters);
         for (mut ind, age) in scored.into_iter().zip(ages) {
             ind.age = age;
-            if ind.complexity > cfg.max_complexity as f64 {
+            if ind.complexity > cfg.complexity_cap() {
                 GenCounters::count(counters, |c| &c.post_fit_drops); // #463
                 continue;
             }
@@ -6556,6 +6595,14 @@ fn run_search(
             batch_workers(cfg.threads, init_trees.len(), init_eval.sample.len()),
             init_trees,
             |tree| {
+                let tree = if !cfg.linear_scaling {
+                    tree
+                } else if defer_gpu {
+                    crate::scale::wrap(0.0, 1.0, tree) // #470
+                } else {
+                    let s = init_eval.sample;
+                    crate::scale::wrap_closed_form(tree, &s.x, &s.y, &s.w)
+                };
                 // #26: generation 0 is a whole generation too; defer it to the
                 // same batch as the first real generation.
                 if defer_gpu {
@@ -7410,6 +7457,9 @@ fn run_search(
                                 }
                                 let _ = best_d;
                                 t = best;
+                            }
+                            if cfg.linear_scaling {
+                                t = crate::scale::ensure(t, 0.0, 1.0); // #470
                             }
                             // #15: multi-output fits per output inside the evaluator.
                             let mut fitted = None;
@@ -9681,5 +9731,70 @@ mod tests {
             aged_ind(input(0), 2.0, 2.0, 1),
         ];
         assert_eq!(afp_worst(&island), Some(1));
+    }
+
+    fn affine_sample() -> Sample {
+        let x: Vec<Vec<f64>> = (0..60).map(|i| vec![i as f64 * 0.1 - 3.0]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 2.0 * r[0] + 1.0).collect();
+        Sample::new(x, y)
+    }
+
+    fn scaling_cfg(strategy: crate::fit::FitStrategy) -> Config {
+        let mut cfg = Config::default();
+        cfg.metric = Metric::Squared;
+        cfg.fit_iters = 8;
+        cfg.fit_strategy = strategy;
+        cfg.linear_scaling = true;
+        cfg
+    }
+
+    /// #470: a constant-free shape reaches the exact affine map in one fit call.
+    #[test]
+    fn linear_scaling_recovers_affine_exactly() {
+        let s = affine_sample();
+        for strategy in [crate::fit::FitStrategy::Exact, crate::fit::FitStrategy::Auto] {
+            let cfg = scaling_cfg(strategy);
+            let mut tree = crate::scale::wrap(0.0, 1.0, expr::input(0));
+            let fit = fit_constants(&mut tree, &cfg, &s, &s).expect("a fit result");
+            assert!(fit.sse <= 1e-20, "{:?}: sse {}", strategy, fit.sse);
+            let sse: f64 = s.x.iter().zip(&s.y).map(|(r, y)| (eval(&tree, r) - y).powi(2)).sum();
+            assert!(sse <= 1e-20, "{:?}: phenotype sse {}", strategy, sse);
+        }
+    }
+
+    /// #470: wrap, fit, split and re-wrap keep the constants bit for bit.
+    #[test]
+    fn linear_scaling_split_roundtrip() {
+        let s = affine_sample();
+        let cfg = scaling_cfg(crate::fit::FitStrategy::Exact);
+        let shape = expr::node(Op::Sin, vec![expr::input(0)]);
+        let mut tree = crate::scale::wrap(0.3, 0.7, shape);
+        fit_constants(&mut tree, &cfg, &s, &s);
+        let (a, b, f) = crate::scale::split(&tree);
+        let again = crate::scale::wrap(a, b, f);
+        let (a2, b2, _) = crate::scale::split(&again);
+        assert_eq!(a.to_bits(), a2.to_bits());
+        assert_eq!(b.to_bits(), b2.to_bits());
+        assert_eq!(again, tree);
+    }
+
+    /// #470: a short search with the map finds `2x + 1` and reports the wrapped
+    /// formula; the same search without it does not change.
+    #[test]
+    fn linear_scaling_search_reports_the_wrapped_formula() {
+        let s = affine_sample();
+        let mut cfg = scaling_cfg(crate::fit::FitStrategy::Exact);
+        cfg.generations = 6;
+        cfg.pop = 40;
+        cfg.seed = 3;
+        cfg.gpu = false;
+        let out = run(&cfg, &s, &s);
+        let best = out
+            .archive
+            .items
+            .iter()
+            .map(|m| m.error)
+            .fold(f64::INFINITY, f64::min);
+        assert!(best <= 1e-18, "best error {}", best);
     }
 }

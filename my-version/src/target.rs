@@ -6,6 +6,9 @@
 //! this from data, so the spec is a JSON contract (`rcsr-target-spec/1`) loaded
 //! from `--target-spec` or a `<data>.targets.json` sidecar.
 //!
+//! For `kind = "xs_rank"` the label is the per-timestamp rank of
+//! `return_column` over the panel members; the book is priced on `return_column`.
+//!
 //! For `kind = "forward_return"` the label is
 //! `T = clip((r - c) / (m * g), lo, hi)` with return `r`, offset `c`, scale
 //! multiplier `m` and scale value `g` (a column or a constant). The null
@@ -19,7 +22,11 @@ use crate::manifest::sha256_hex;
 pub const SCHEMA: &str = "rcsr-target-spec/1";
 
 /// The supported label kinds.
-pub const KINDS: &[&str] = &["forward_return"];
+pub const KINDS: &[&str] = &["forward_return", "xs_rank"];
+
+/// The label is the per-timestamp rank of `return_column` over the panel
+/// members, mapped to `[-1, 1]` by `rcsr panel rank`.
+pub const KIND_XS_RANK: &str = "xs_rank";
 
 /// Where an evaluator's per-side cost came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -516,6 +523,25 @@ fn validate(s: &TargetSpec, what: &str) -> Result<(), String> {
             what
         ));
     }
+    if s.kind == KIND_XS_RANK {
+        let unit_scale = matches!(&s.scale, Scale::Constant { value } if *value == 1.0);
+        if !unit_scale || s.clip.is_some() || s.offset != 0.0 || s.cost_in_label {
+            return Err(format!(
+                "{}: an xs_rank target has scale constant 1, no clip, offset 0 and cost_in_label false",
+                what
+            ));
+        }
+        match &s.return_column {
+            Some(r) if s.construction_columns.contains(r) => {}
+            Some(r) => {
+                return Err(format!(
+                    "{}: an xs_rank target lists its return_column '{}' in construction_columns",
+                    what, r
+                ))
+            }
+            None => return Err(format!("{}: an xs_rank target needs a return_column", what)),
+        }
+    }
     if !valid_name(&s.name) {
         return Err(format!("{}: name must match ^[a-z][a-z0-9_]*$", what));
     }
@@ -964,7 +990,7 @@ pub fn schema_json() -> String {
     let fields: &[(&str, &str, bool, &str)] = &[
         ("column", "string", true, "data column holding the label; unique in the file"),
         ("name", "string", true, "canonical name, ^[a-z][a-z0-9_]*$; unique in the file"),
-        ("kind", "enum", true, "forward_return"),
+        ("kind", "enum", true, "forward_return | xs_rank (per-timestamp rank of return_column over the panel members in [-1, 1], written by rcsr panel rank; needs return_column, scale constant 1, no clip, offset 0)"),
         ("deprecated", "bool", false, "the label is kept for replays only"),
         ("return_column", "string|null", false, "column holding the raw future return; refused as an input (D13a)"),
         ("return_units", "enum", true, "log | simple"),

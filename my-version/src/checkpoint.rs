@@ -1380,6 +1380,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "qd_control",    // #120
         "variation",     // #122: missing means auto
         "selection",     // #465: missing means lexicographic
+        "linear_scaling", // #470: missing means false
     ];
     for key in KEYS {
         required(fields, key)?;
@@ -1569,6 +1570,16 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             ))
         }
     };
+    let linear_scaling = match fields.get("linear_scaling").map(|s| s.as_str()) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "config 'linear_scaling' must be true or false, got '{}'",
+                other
+            ))
+        }
+    };
     // #116: missing means `exact`, byte-identical to a checkpoint written
     // before the solver portfolio existed.
     let fit_strategy = match fields.get("fit_strategy").map(|s| s.as_str()) {
@@ -1726,6 +1737,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         threads: 1,
         variation,
         selection,
+        linear_scaling, // #470
     })
 }
 
@@ -1809,6 +1821,10 @@ fn write_config(cfg: &Config, out: &mut String) {
     // keeps its bytes.
     if cfg.selection != crate::search::Selection::Lexicographic {
         writeln!(out, "config selection {}", cfg.selection.as_str()).unwrap();
+    }
+    // #470: written only when on, so every other checkpoint keeps its bytes.
+    if cfg.linear_scaling {
+        writeln!(out, "config linear_scaling true").unwrap();
     }
     // #76: only write the field when front feedback is off, so an on run's
     // checkpoint stays byte-identical to one written before the flag existed.
