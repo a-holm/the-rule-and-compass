@@ -5264,25 +5264,34 @@ fn evolve_island(
         if let Some(target) = qd.and_then(|q| q.least_occupied_descriptor()) {
             let immigrants = (pop / 10).max(1).min(pop);
             let mut trees: Vec<Node> = Vec::with_capacity(immigrants);
+            let mut have_const_imm = filter_constant
+                && next[..pop - immigrants].iter().any(|i| !expr::row_dependent(&i.tree)); // #477
             for _ in 0..immigrants {
-                let mut t =
-                    random_tree_opts(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced);
-                let mut best_score = {
-                    let d = qd::descriptor(&t, train.sample);
-                    (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2)
-                };
-                for _ in 0..3 {
-                    let cand = random_tree_opts(
+                let hc = have_const_imm;
+                let t = draw_row_dependent(cfg, nvars, &mut have_const_imm, || {
+                    let mut t = random_tree_opts(
                         rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced,
                     );
-                    let d = qd::descriptor(&cand, train.sample);
-                    let score = (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2);
-                    if score < best_score {
-                        t = cand;
-                        best_score = score;
+                    let mut best_score = if hc && !expr::row_dependent(&t) {
+                        f64::INFINITY
+                    } else {
+                        let d = qd::descriptor(&t, train.sample);
+                        (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2)
+                    };
+                    for _ in 0..3 {
+                        let cand = random_tree_opts(
+                            rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced,
+                        );
+                        let d = qd::descriptor(&cand, train.sample);
+                        let score = (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2);
+                        if score < best_score && !(hc && !expr::row_dependent(&cand)) {
+                            t = cand;
+                            best_score = score;
+                        }
                     }
-                }
-                trees.push(expr::simplify(&t));
+                    expr::simplify(&t)
+                });
+                trees.push(t);
             }
             // Immigrants are fitted even when the batch defers scoring.
             let fit_immigrants = cfg.fit_iters > 0 && !train.sample.is_multi();
@@ -5303,9 +5312,13 @@ fn evolve_island(
     // whose result slots cover the first `pop` candidates only.
     if afp {
         let k = afp_immigrants(pop);
+        let mut have_const_afp =
+            filter_constant && next.iter().any(|i| !expr::row_dependent(&i.tree)); // #477
         let trees: Vec<Node> = (0..k)
             .map(|_| {
-                expr::simplify(&random_tree_opts(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced))
+                draw_row_dependent(cfg, nvars, &mut have_const_afp, || {
+                    expr::simplify(&random_tree_opts(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced))
+                })
             })
             .collect();
         next.extend(fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters));
@@ -8071,42 +8084,47 @@ fn run_search(
                         };
                         let mut have_const = false; // #477
                         for ind in islands[ii].iter_mut() {
+                            let hc = have_const; // #477
                             let mut t = draw_row_dependent(cfg, nvars, &mut have_const, || {
-                                random_tree_opts(
+                                let mut t = random_tree_opts(
                                     &mut r,
                                     nvars,
                                     &cfg.ops,
                                     cfg.init_depth,
                                     Some(&aggs),
                                     cfg.tree_arity == TreeArity::Balanced,
-                                )
-                            });
-                            if let Some(target) = qd_target {
-                                let mut best = t.clone();
-                                let mut best_d = qd::descriptor(&t, gen_train);
-                                let mut best_score = (best_d.usage - target.usage).powi(2)
-                                    + (best_d.skew - target.skew).powi(2);
-                                for _ in 0..3 {
-                                    let cand = random_tree_opts(
-                                        &mut r,
-                                        nvars,
-                                        &cfg.ops,
-                                        cfg.init_depth,
-                                        Some(&aggs),
-                                        cfg.tree_arity == TreeArity::Balanced,
-                                    );
-                                    let d = qd::descriptor(&cand, gen_train);
-                                    let score = (d.usage - target.usage).powi(2)
-                                        + (d.skew - target.skew).powi(2);
-                                    if score < best_score {
-                                        best = cand;
-                                        best_d = d;
-                                        best_score = score;
+                                );
+                                if let Some(target) = qd_target {
+                                    let mut best = t.clone();
+                                    let mut best_d = qd::descriptor(&t, gen_train);
+                                    let mut best_score = if hc && !expr::row_dependent(&t) {
+                                        f64::INFINITY
+                                    } else {
+                                        (best_d.usage - target.usage).powi(2) + (best_d.skew - target.skew).powi(2)
+                                    };
+                                    for _ in 0..3 {
+                                        let cand = random_tree_opts(
+                                            &mut r,
+                                            nvars,
+                                            &cfg.ops,
+                                            cfg.init_depth,
+                                            Some(&aggs),
+                                            cfg.tree_arity == TreeArity::Balanced,
+                                        );
+                                        let d = qd::descriptor(&cand, gen_train);
+                                        let score = (d.usage - target.usage).powi(2)
+                                            + (d.skew - target.skew).powi(2);
+                                        if score < best_score && !(hc && !expr::row_dependent(&cand)) {
+                                            best = cand;
+                                            best_d = d;
+                                            best_score = score;
+                                        }
                                     }
+                                    let _ = best_d;
+                                    t = best;
                                 }
-                                let _ = best_d;
-                                t = best;
-                            }
+                                t
+                            });
                             if cfg.linear_scaling {
                                 t = crate::scale::ensure(t, 0.0, 1.0); // #470
                             }
