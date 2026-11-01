@@ -456,6 +456,9 @@ fn scan_with_backend<T>(
 /// #304: one test block's fused long-only reduction, plus the two benchmarks.
 #[derive(Clone, Debug)]
 pub struct DevicePnlCheck {
+    /// Host-side wall of the reduction call and its start; a host envelope, not CUDA events.
+    pub host_s: f64,
+    pub started: std::time::Instant,
     /// `cuda` when the device kernel ran, `cpu-canonical` when the identical
     /// CPU segment reduction ran (non-CUDA build or no device).
     pub backend: String,
@@ -1573,6 +1576,10 @@ impl Accum {
             let mut max_abs_net_delta = 0.0f64;
             for w in &windows {
                 if let Some(d) = &w.device_pnl {
+                    if d.backend == "cuda" {
+                        let at = d.started.saturating_duration_since(clock).as_secs_f64();
+                        ledger.record_interval(crate::gpu_stats::Stage::Pnl, 0, at, at + d.host_s);
+                    }
                     if backend.is_empty() {
                         backend = d.backend.clone();
                     }
@@ -2332,6 +2339,7 @@ fn evaluate_window(
     // group-contiguous order the reducer requires. The scalar evaluator above
     // stays the reported authority; this block is a device/canonical check.
     let device = if device_pnl {
+        let started = std::time::Instant::now();
         let params = crate::trading_gpu::PnlParams {
             threshold,
             per_side_bps: cost_side * 10_000.0,
@@ -2364,6 +2372,8 @@ fn evaluate_window(
         };
         let cpu_net = net.iter().sum::<f64>();
         Some(DevicePnlCheck {
+            host_s: started.elapsed().as_secs_f64(),
+            started,
             backend,
             segment_rows: crate::trading_gpu::DEFAULT_SEGMENT_ROWS,
             tile_candidates: crate::trading_gpu::MAX_TILE_CANDIDATES,
