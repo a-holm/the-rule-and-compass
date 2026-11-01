@@ -349,3 +349,40 @@ fn dedup_keys_are_canonical_and_value_preserving() {
         structural_hash(&expr::simplify(&constant(0.0)))
     );
 }
+/// #466: `if(c, a, a)` is `a` for every condition, including a NaN or
+/// infinite one, and for a branch that is itself NaN or infinite.
+#[test]
+fn simplify_if_equal_branches() {
+    let mut rng = Mt::new(0x0466_1F00);
+    let mut rows = edge_rows();
+    while rows.len() < 10_000 {
+        rows.push(vec![rng.range(-4.0, 4.0), rng.range(-4.0, 4.0)]);
+    }
+    let vars = ["x".to_string(), "y".to_string()];
+    let mut removed = 0usize;
+    for _ in 0..200 {
+        let cond = gen_tree(&mut rng, 3, 2);
+        let branch = gen_tree(&mut rng, 3, 2);
+        let tree = node(Op::If, vec![cond, branch.clone(), branch.clone()]);
+        let simple = expr::simplify_equal_branches(&tree);
+        assert_eq!(
+            structural_hash(&simple),
+            structural_hash(&expr::simplify(&branch)),
+            "{}",
+            expr::to_string(&tree, &vars)
+        );
+        removed += 1;
+        for row in &rows {
+            let (before, after) = (eval(&tree, row), eval(&simple, row));
+            assert!(
+                same_value(before, after),
+                "{} at {:?}: {} -> {}",
+                expr::to_string(&tree, &vars),
+                row,
+                before,
+                after
+            );
+        }
+    }
+    assert_eq!(removed, 200);
+}

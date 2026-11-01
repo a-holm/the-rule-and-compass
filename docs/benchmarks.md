@@ -434,6 +434,7 @@ The front member with the lowest error on the **validation** rows is selected, n
 | `oracle_hit_gen`, `oracle_hit_s`, `oracle_hit_evals` | the same for the oracle criterion |
 | `signal_r2`, `signal_recovered`, `selected_cx`, `distractors_used` | signal tasks only |
 | `fit_attempts`, `fit_gpu`, `fit_fallback` | device fit counters, `null` on a CPU run |
+| `prune_s` | seconds spent in the front prune (#466), `0` unless `--prune` is given |
 
 The time-to-hit fields come from a reporting-only hook, `search::Config::front_observer`, called once per generation after the archive update. It does not change the trajectory (test `front_observer_does_not_change_the_archive`, and `front_observer_does_not_change_the_postfix_archive` for the flat arena path). The bench scores each new front member once, so `seconds` and `hit_s` include that scoring. A run stopped by `--time-budget` still reports its hits.
 
@@ -453,6 +454,7 @@ rcsr-bench --suite all --problems nguyen9,sig_tanh --seeds 1,2 --generations 20 
 | `--seeds 1,2,3` or `--seeds 1-10` | engine seeds; `--seed S` stays a single seed |
 | `--cpu` | `Config::gpu = false`, no environment variable; `--gpu` needs a device and exits 2 without one |
 | `--fit-strategy exact\|auto\|linear\|varpro\|stream\|gpu\|default` | `exact` stays the bench default; `default` resolves the arm like the production CLI (`FitRequest::Unset`) |
+| `--prune` | enable the front prune (#466; off by default) |
 | `--fit-iters`, `--ops`, `--max-complexity`, `--patience`, `--migration-interval`, `--restart-interval`, `--variation`, `--selection`, `--dispatch` | copied into `search::Config` |
 | `--threads N` | worker threads for fitting and scoring inside an island (default: all cores; results do not depend on it) |
 | `--jobs N` | N CPU runs at once; each run keeps its seed, so results are identical, but `seconds` and `hit_s` are contended. Exits 2 with a device backend |

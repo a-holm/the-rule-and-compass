@@ -791,6 +791,10 @@ pub struct RunEnd {
     pub fit_kernel_polish_s: Option<f64>,
     /// #284: exact CPU fit-fallback seconds.
     pub fit_fallback_s: Option<f64>,
+    /// #466: front prune counters.
+    pub prune_fits: usize,
+    pub prune_accepted: usize,
+    pub prune_s: f64,
     /// #495: exact finalist refit seconds.
     pub fit_refit_s: Option<f64>,
     /// #495: exact finalist refits performed.
@@ -811,6 +815,7 @@ pub fn run_end_json(r: &RunEnd) -> String {
          \"device_seconds_incl_fit\":{},\"device_fraction_of_run\":{},\
          \"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"unaccounted_s\":{},\
          \"fit_kernel_s\":{},\"fit_kernel_lm_s\":{},\"fit_kernel_polish_s\":{},\"fit_fallback_s\":{},\"fit_refit_s\":{},\"fit_refits\":{},\
+         \"prune\":{{\"fits\":{},\"accepted\":{},\"seconds\":{}}},\
          \"events\":{},\"bytes\":{},\"dropped\":{},\"end\":{}}}",
         SCHEMA,
         VERSION,
@@ -849,6 +854,9 @@ pub fn run_end_json(r: &RunEnd) -> String {
             Some(n) => n.to_string(),
             None => "null".to_string(),
         },
+        r.prune_fits,
+        r.prune_accepted,
+        num(r.prune_s),
         r.events,
         r.bytes,
         r.dropped,
