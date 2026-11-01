@@ -9,6 +9,7 @@
 
 use crate::enrich::{self, RegistryEntry};
 use crate::manifest;
+use crate::ohlcv::Timeframe;
 use crate::store::{DType, FileStore};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -234,6 +235,57 @@ pub struct ColumnSchema {
 /// The store is read one group at a time, so memory is one group of one
 /// column plus the time column.
 pub fn build_schema(store: &FileStore) -> Result<Vec<ColumnSchema>, String> {
+    build_schema_with_bar(store).map(|(columns, _)| columns)
+}
+
+/// The base bar length of a store: the modal positive step of its time column.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BarStep {
+    pub seconds: Option<i64>,
+    pub modal_share: f64,
+}
+
+impl BarStep {
+    fn from_counts(counts: &BTreeMap<i64, u64>) -> BarStep {
+        let total: u64 = counts.values().sum();
+        let mut best: Option<(i64, u64)> = None;
+        for (&d, &n) in counts {
+            if best.is_none_or(|(_, bn)| n > bn) {
+                best = Some((d, n));
+            }
+        }
+        match best {
+            Some((d, n)) => BarStep { seconds: Some(d), modal_share: n as f64 / total as f64 },
+            None => BarStep { seconds: None, modal_share: 0.0 },
+        }
+    }
+
+    fn name(&self) -> String {
+        let Some(s) = self.seconds else {
+            return "unknown".to_string();
+        };
+        [
+            Timeframe::M1,
+            Timeframe::M3,
+            Timeframe::M5,
+            Timeframe::M15,
+            Timeframe::M30,
+            Timeframe::H1,
+            Timeframe::H2,
+            Timeframe::H4,
+            Timeframe::D1,
+            Timeframe::W1,
+        ]
+        .into_iter()
+        .find(|t| t.seconds() == s)
+        .map_or_else(|| format!("{}s", s), |t| t.name().to_string())
+    }
+}
+
+/// As [`build_schema`], with the store's base bar length. Columns whose registry
+/// label is the base default ("15m", and the quality columns) carry the bar
+/// name; multi-timeframe and label columns keep their registry label.
+pub fn build_schema_with_bar(store: &FileStore) -> Result<(Vec<ColumnSchema>, BarStep), String> {
     let header = store.header();
     let names = header.names();
     let dtypes = header.dtypes();
@@ -261,6 +313,8 @@ pub fn build_schema(store: &FileStore) -> Result<Vec<ColumnSchema>, String> {
     let mut first: Vec<Option<i64>> = vec![None; names.len()];
     let mut last: Vec<Option<i64>> = vec![None; names.len()];
     let mut bytes: Vec<u8> = Vec::new();
+    let mut step_counts: BTreeMap<i64, u64> = BTreeMap::new();
+    let mut prev_time: Option<i64> = None;
     for g in 0..header.n_groups() {
         let times: Vec<i64> = match time_col {
             Some(c) if dtypes[c] == DType::I64 => store.read_i64(g, c)?,
@@ -271,6 +325,14 @@ pub fn build_schema(store: &FileStore) -> Result<Vec<ColumnSchema>, String> {
                 .collect(),
             None => Vec::new(),
         };
+        for &t in &times {
+            if let Some(p) = prev_time {
+                if t > p {
+                    *step_counts.entry(t - p).or_insert(0) += 1;
+                }
+            }
+            prev_time = Some(t);
+        }
         for (c, dtype) in dtypes.iter().enumerate() {
             bytes.clear();
             match dtype {
@@ -300,8 +362,13 @@ pub fn build_schema(store: &FileStore) -> Result<Vec<ColumnSchema>, String> {
             hashers[c].update(&bytes);
         }
     }
+    let bar = BarStep::from_counts(&step_counts);
+    let bar_name = bar.name();
     let mut out = Vec::with_capacity(names.len());
-    for (c, (hasher, r)) in hashers.into_iter().zip(resolved).enumerate() {
+    for (c, (hasher, mut r)) in hashers.into_iter().zip(resolved).enumerate() {
+        if r.timeframe == "15m" || r.family == "quality" {
+            r.timeframe = bar_name.clone();
+        }
         out.push(ColumnSchema {
             name: names[c].clone(),
             resolved: r,
@@ -311,7 +378,7 @@ pub fn build_schema(store: &FileStore) -> Result<Vec<ColumnSchema>, String> {
             sha256: hasher.finalize(),
         });
     }
-    Ok(out)
+    Ok((out, bar))
 }
 
 fn opt_i64(v: Option<i64>) -> String {
@@ -321,6 +388,7 @@ fn opt_i64(v: Option<i64>) -> String {
 /// Serialise the schema: a header line, one line per column.
 pub fn schema_json(
     columns: &[ColumnSchema],
+    bar: &BarStep,
     rows: usize,
     panel_version: &str,
     locked_test: Option<&crate::lockbox::Lockbox>,
@@ -335,14 +403,22 @@ pub fn schema_json(
             )
         })
         .unwrap_or_default();
+    let bar_json = match bar.seconds {
+        None => "\"bar_seconds\":null,".to_string(),
+        Some(s) if bar.modal_share < 1.0 => {
+            format!("\"bar_seconds\":{},\"bar_seconds_modal_share\":{},", s, bar.modal_share)
+        }
+        Some(s) => format!("\"bar_seconds\":{},", s),
+    };
     let mut s = format!(
         "{{\"panel_version\":{},\"schema_version\":{},\"feature_registry_version\":{},\
-         \"compact_parity_owner\":\"#{}\",\"rows\":{},{}\"columns\":[\n",
+         \"compact_parity_owner\":\"#{}\",\"rows\":{},{}{}\"columns\":[\n",
         esc(panel_version),
         SCHEMA_VERSION,
         FEATURE_REGISTRY_VERSION,
         PARITY_OWNER_ISSUE,
         rows,
+        bar_json,
         locked
     );
     for (i, c) in columns.iter().enumerate() {
@@ -390,8 +466,8 @@ pub fn write_schema_declared(
     also: Option<&crate::lockbox::Lockbox>,
 ) -> Result<String, String> {
     let store = FileStore::open(store_path)?;
-    let columns = build_schema(&store)?;
-    let text = schema_json(&columns, store.n_rows(), panel_version, locked_test, also);
+    let (columns, bar) = build_schema_with_bar(&store)?;
+    let text = schema_json(&columns, &bar, store.n_rows(), panel_version, locked_test, also);
     let out = schema_path(store_path);
     std::fs::write(&out, text).map_err(|e| format!("{}: {}", out, e))?;
     Ok(out)
