@@ -1,17 +1,3 @@
-/// #500/#589: whether a non-finite prediction in the first rows decides the
-/// score. `Some(true)`: the first rows hold one, which makes the full score
-/// `+inf` for the plain metrics and for the P&L book. `Some(false)`: the prefix
-/// is finite and the full pass decides. `None`: the score does not follow the
-/// rule (implicit, weighted, multi-output), so the full pass always runs.
-fn nonfinite_prefix(tree: &Node, data: &EvalSample, cfg: &Config) -> Option<bool> {
-    let s = data.sample;
-    if s.is_empty()
-        || s.is_multi()
-        || !s.w.is_empty()
-        || (cfg.fitness.book().is_none() && cfg.metric.is_implicit())
-    {
-        return None;
-    }
 //! Island-model, multi-objective evolutionary search.
 //!
 //! A population of expression individuals evolves on separate islands, tracked

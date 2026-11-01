@@ -79,12 +79,12 @@ fn config(seed: u32, fitness: Fitness) -> Config {
 }
 
 fn cpu_error(tree: &Node, train: &Sample, cfg: &Config) -> f64 {
-    match cfg.fitness.book() {
-        Some(book) => {
+    match &cfg.fitness {
+        Fitness::LongPnl(book) => {
             let pred: Vec<f64> = train.x.iter().map(|r| expr::eval(tree, r)).collect();
             book.regret(&pred)
         }
-        None => search::eval_error(tree, train, cfg.metric),
+        _ => search::eval_error(tree, train, cfg.metric),
     }
 }
 
