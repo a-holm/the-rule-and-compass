@@ -615,6 +615,8 @@ struct GpuSearch {
     fit_fallback: usize,
     /// #169: pending offspring screened before the fit batch (admission).
     fit_screened: usize,
+    /// #448: candidates with constants admitted without a screening score (wide admission).
+    fit_admitted_wide: usize,
     /// #169: CPU fallback counts labelled by cause.
     fit_fallback_by_cause: BTreeMap<String, usize>,
     /// #265: fallbacks whose CPU refit lowered the exact error, by cause.
@@ -803,6 +805,7 @@ impl GpuSearch {
                     fit_gpu: 0,
                     fit_fallback: 0,
                     fit_screened: 0,
+                    fit_admitted_wide: 0,
                     fit_fallback_by_cause: BTreeMap::new(),
                     fit_fallback_improved_by_cause: BTreeMap::new(),
                     fit_status_by_label: BTreeMap::new(),
@@ -1245,6 +1248,9 @@ impl GpuSearch {
             };
             self.fit_screened += screened.len();
             self.stats.entry(generation).or_default().fit_screened += screened.len();
+            let unscreened = pending.len() - screened.len();
+            self.fit_admitted_wide += unscreened;
+            self.stats.entry(generation).or_default().fit_admitted_wide += unscreened;
             if !screened.is_empty() {
                 self.evaluate_the_batch(islands, &screened, train, cfg, generation, dispatcher)?;
             }
@@ -1649,6 +1655,7 @@ impl GpuSearch {
             fit_gpu: self.fit_gpu,
             fit_fallback: self.fit_fallback,
             fit_screened: self.fit_screened,
+            fit_admitted_wide: self.fit_admitted_wide,
             fit_fallback_by_cause: self.fit_fallback_by_cause.clone(),
             fit_fallback_improved_by_cause: self.fit_fallback_improved_by_cause.clone(),
             fit_status_by_label: self.fit_status_by_label.clone(),
@@ -4179,6 +4186,9 @@ pub struct GpuGenStats {
     pub fit_fallback: usize,
     /// #169: pending offspring screened before admission.
     pub fit_screened: usize,
+    /// #448: candidates with constants fitted without a screening score under
+    /// wide admission; `fit_screened + fit_admitted_wide >= fit_attempts`.
+    pub fit_admitted_wide: usize,
     /// #169: CPU fallback counts labelled by cause.
     pub fit_fallback_by_cause: BTreeMap<String, usize>,
     /// #265: fallbacks whose CPU refit lowered the exact error, by cause.
@@ -4207,6 +4217,9 @@ pub struct GpuRunStats {
     pub fit_fallback: usize,
     /// #169: pending offspring screened before admission.
     pub fit_screened: usize,
+    /// #448: candidates with constants fitted without a screening score under
+    /// wide admission; `fit_screened + fit_admitted_wide >= fit_attempts`.
+    pub fit_admitted_wide: usize,
     /// #169: CPU fallback counts labelled by cause.
     pub fit_fallback_by_cause: BTreeMap<String, usize>,
     /// #265: fallbacks whose CPU refit lowered the exact error, by cause.
@@ -5083,6 +5096,7 @@ fn run_postfix_search(
             fit_gpu: 0,
             fit_fallback: 0,
             fit_screened: 0,
+            fit_admitted_wide: 0,
             fit_fallback_by_cause: Default::default(),
             fit_fallback_improved_by_cause: Default::default(),
             fit_fallback_seconds: 0.0,
