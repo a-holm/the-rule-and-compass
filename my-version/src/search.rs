@@ -14,6 +14,7 @@
 //!   tie-break) so bloat is controlled without a hand-tuned penalty;
 //! * the loop stops early when it has converged, or when a time budget is hit.
 
+use crate::afp;
 use crate::checkpoint::{Backend, Checkpoint, Individual, IslandState};
 use crate::complexity::ComplexityModel;
 use crate::data::Sample;
@@ -67,6 +68,36 @@ impl VariationMode {
             "postfix" => Ok(VariationMode::Postfix),
             other => Err(format!(
                 "variation must be 'auto', 'node' or 'postfix', got '{}'",
+                other
+            )),
+        }
+    }
+}
+
+/// #465: how an island chooses its next population.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Selection {
+    /// Generational replacement with lexicographic parsimony tournaments.
+    #[default]
+    Lexicographic,
+    /// Age-fitness Pareto survivor selection over parents and offspring.
+    Afp,
+}
+
+impl Selection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Selection::Lexicographic => "lexicographic",
+            Selection::Afp => "afp",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "lexicographic" => Ok(Selection::Lexicographic),
+            "afp" => Ok(Selection::Afp),
+            other => Err(format!(
+                "selection must be 'lexicographic' or 'afp', got '{}'",
                 other
             )),
         }
@@ -258,6 +289,8 @@ pub struct Config {
     /// #122: which variation engine to use. `auto` selects the flat postfix
     /// engine only for a large, fit-free GPU run.
     pub variation: VariationMode,
+    /// #465: survivor and parent selection inside an island.
+    pub selection: Selection,
     /// #470: wrap every candidate shape in a fitted affine output map
     /// `a + b*f(x)`. Changes the trajectory, so it is a saved search setting.
     pub linear_scaling: bool,
@@ -532,6 +565,7 @@ impl Default for Config {
             pipeline_depth: 2, // #119: only used when the GPU path is active
             threads: 1,
             variation: VariationMode::Auto,
+            selection: Selection::Lexicographic,
             linear_scaling: false,
         }
     }
@@ -582,6 +616,7 @@ impl Config {
         compare!(fit_fallback_max, "fit_fallback_max"); // #255
         compare!(refit_band, "refit_band"); // #495
         compare!(front_parents, "front_parents"); // #76
+        compare!(selection, "selection"); // #465
         compare!(qd_bins, "qd_bins"); // #120
         compare!(qd_cell_cap, "qd_cell_cap"); // #120
         compare!(qd_cvt, "qd_cvt"); // #120
@@ -637,6 +672,8 @@ struct Ind {
     /// cross-checks a descriptor against the sample it was computed on before
     /// trusting it.
     descriptor: Option<qd::Descriptor>,
+    /// #465: generations since the lineage began; only `--selection afp` reads it.
+    age: u32,
 }
 
 impl Ind {
@@ -688,6 +725,7 @@ impl Ind {
             error,
             complexity,
             descriptor,
+            age: 0,
         }
     }
 
@@ -713,6 +751,7 @@ impl Ind {
             // A GPU batch returns the error, not the prediction vector, so the
             // descriptor is filled by the archive's fallback path.
             descriptor: None,
+            age: 0,
         }
     }
 
@@ -748,7 +787,9 @@ impl Ind {
         } else {
             None
         };
+        let age = self.age;
         *self = Ind::evaluated_fitted(tree, fitted, train, cfg); // #25 #87
+        self.age = age;
     }
 
     fn to_checkpoint(&self) -> Individual {
@@ -756,6 +797,7 @@ impl Ind {
             tree: self.tree.clone(),
             error: self.error,
             complexity: self.complexity,
+            age: self.age,
         }
     }
 
@@ -767,6 +809,7 @@ impl Ind {
             // A checkpoint stores the tree and score, not the descriptor; the
             // archive recomputes it on the resumed run like any other candidate.
             descriptor: None,
+            age: ind.age,
         }
     }
 }
@@ -4486,6 +4529,84 @@ fn pick_parent_policy(
     pick_parent(island, front, rng, front_p).clone()
 }
 
+// #465: age-fitness Pareto survivor selection (`--selection afp`).
+
+/// #465: random immigrants added to every island each generation.
+fn afp_immigrants(pop: usize) -> usize {
+    (pop / 20).max(1)
+}
+
+/// #465: the minimised objectives of a population. A non-finite error sorts
+/// last, so an all-infinite island falls back to `(complexity, age)`.
+fn afp_points(inds: &[Ind]) -> Vec<afp::Point> {
+    inds.iter()
+        .map(|i| {
+            let e = if i.error.is_nan() { f64::INFINITY } else { i.error };
+            [e, i.complexity, i.age as f64]
+        })
+        .collect()
+}
+
+/// #465: survivors of parents + offspring + immigrants (in that order, which
+/// is the tie-break order). Every survivor is one generation older.
+fn afp_select(candidates: Vec<Ind>, pop: usize) -> Vec<Ind> {
+    let keep = afp::survivors(&afp_points(&candidates), pop);
+    let mut wanted = vec![false; candidates.len()];
+    for i in keep {
+        wanted[i] = true;
+    }
+    candidates
+        .into_iter()
+        .zip(wanted)
+        .filter_map(|(mut ind, keep)| {
+            keep.then(|| {
+                ind.age += 1;
+                ind
+            })
+        })
+        .collect()
+}
+
+/// #465: the island member migration replaces: highest Pareto rank, then the
+/// smallest crowding distance, then the highest index.
+fn afp_worst(island: &[Ind]) -> Option<usize> {
+    let (rank, crowd) = afp::rank_and_crowd(&afp_points(island));
+    (0..island.len()).max_by(|&a, &b| {
+        rank[a]
+            .cmp(&rank[b])
+            .then(crowd[b].total_cmp(&crowd[a]))
+            .then(a.cmp(&b))
+    })
+}
+
+/// #465: one parent and its age. Without AFP this is [`pick_parent_policy`]
+/// with age 0, draw for draw. With AFP a front parent counts as age 0 and the
+/// island tournament runs on rank and crowding distance.
+#[allow(clippy::too_many_arguments)]
+fn pick_parent_aged(
+    island: &[Ind],
+    front: &[Sol],
+    qd: Option<&QdArchive>,
+    rng: &mut Mt,
+    front_p: f64,
+    qd_policy: bool,
+    qd_control: u8,
+    afp: bool,
+    rank: &[u32],
+    crowd: &[f64],
+) -> (Node, u32) {
+    if !afp || qd_policy {
+        return (pick_parent_policy(island, front, qd, rng, front_p, qd_policy, qd_control), 0);
+    }
+    match front_parent(front, rng, front_p) {
+        Some(tree) => (tree.clone(), 0),
+        None => {
+            let i = afp::tournament(rank, crowd, rng, 4);
+            (island[i].tree.clone(), island[i].age)
+        }
+    }
+}
+
 // #77: seed the per-generation duplicate set with the elite (`next`) and every
 // parent (`isl`), so a child that is an unchanged parent is rejected before the
 // expensive fit and score.
@@ -4602,13 +4723,20 @@ fn evolve_island(
         }
     }
 
+    let afp = cfg.selection == Selection::Afp;
+    // #465: Pareto rank and crowding of the parents drive the tournament.
+    let (par_rank, par_crowd) = if afp {
+        afp::rank_and_crowd(&afp_points(isl))
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let pop = cfg.pop;
     let mut next: Vec<Ind> = Vec::with_capacity(pop);
 
     // Elitism: carry the best individual over unchanged. In the screened phase
     // the full-data parents are kept by the caller and compete at selection, so
     // the offspring vector stays a full `pop`.
-    if !screened {
+    if !screened && !afp {
         if let Some(best) = isl
             .iter()
             .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal))
@@ -4633,13 +4761,16 @@ fn evolve_island(
     while next.len() < pop && attempts < max_attempts {
         let want = pop - next.len();
         let mut trees: Vec<Node> = Vec::with_capacity(want);
+        let mut ages: Vec<u32> = Vec::with_capacity(want);
         while trees.len() < want && attempts < max_attempts {
             attempts += 1;
             GenCounters::count(counters, |c| &c.attempts);
             // #120: with the policy on, a UCB/stratified cell elite supplies most
             // parents; 5% still come from the global Pareto front. With the policy
             // off this is exactly the #76 draw.
-            let p1 = pick_parent_policy(isl, front, qd, rng, front_p, qd_policy, qd_control);
+            let (p1, mut age) = pick_parent_aged(
+                isl, front, qd, rng, front_p, qd_policy, qd_control, afp, &par_rank, &par_crowd,
+            );
             // #470: variation edits the bare shape; the child inherits the first
             // parent's map as its warm start.
             let (scale_a, scale_b, p1) = if cfg.linear_scaling {
@@ -4649,7 +4780,10 @@ fn evolve_island(
             };
             let mut child = p1;
             if rng.bool(0.5) {
-                let parent2 = pick_parent_policy(isl, front, qd, rng, front_p, qd_policy, qd_control);
+                let (parent2, age2) = pick_parent_aged(
+                    isl, front, qd, rng, front_p, qd_policy, qd_control, afp, &par_rank, &par_crowd,
+                );
+                age = age.max(age2);
                 let parent2 = if cfg.linear_scaling {
                     crate::scale::split(&parent2).2
                 } else {
@@ -4675,8 +4809,11 @@ fn evolve_island(
                 continue;
             }
             trees.push(tree);
+            ages.push(age);
         }
-        for ind in fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters) {
+        let scored = fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters);
+        for (mut ind, age) in scored.into_iter().zip(ages) {
+            ind.age = age;
             if ind.complexity > cfg.complexity_cap() {
                 GenCounters::count(counters, |c| &c.post_fit_drops); // #463
                 continue;
@@ -4740,6 +4877,19 @@ fn evolve_island(
                 offer(&sink, slot, &next[slot]);
             }
         }
+    }
+
+    // #465: fresh lineages at age 0 compete with the older ones. They are scored
+    // with the rest of the generation but never offered to the overlap queue,
+    // whose result slots cover the first `pop` candidates only.
+    if afp {
+        let k = afp_immigrants(pop);
+        let trees: Vec<Node> = (0..k)
+            .map(|_| {
+                expr::simplify(&random_tree_with(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs)))
+            })
+            .collect();
+        next.extend(fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters));
     }
 
     *isl = next;
@@ -5262,6 +5412,9 @@ fn prepare_seeds(
 ///   keeps the historical loop, where it is already cheap.
 #[cfg(feature = "cuda")]
 fn postfix_variation_for(cfg: &Config, train: &Sample) -> Result<Variation, String> {
+    if cfg.selection == Selection::Afp {
+        return Err("--selection afp runs on the node path".to_string());
+    }
     if cfg.fit_iters != 0 {
         return Err("constant fitting is enabled".to_string());
     }
@@ -5896,6 +6049,7 @@ fn run_postfix_search(
                             complexity: next.cost[next.slot_index(i, j)] as f64,
                             tree,
                             descriptor: None,
+                            age: 0,
                         })
                         .collect()
                 })
@@ -5966,6 +6120,7 @@ fn run_postfix_search(
                         complexity: pool.cost[pool.slot_index(i, j)] as f64,
                         tree,
                         descriptor: None,
+                        age: 0,
                     })
                     .collect()
             })
@@ -6895,7 +7050,7 @@ fn run_search(
             }
 
             // #85: keep the full-data parents for the selection step.
-            let parents: Option<Vec<Vec<Ind>>> = if screened {
+            let parents: Option<Vec<Vec<Ind>>> = if screened || cfg.selection == Selection::Afp {
                 Some(islands.clone())
             } else {
                 None
@@ -7107,6 +7262,13 @@ fn run_search(
             if let Some(parents) = parents {
                 let promote = promoted_count(cfg.pop);
                 for (pop, parents) in islands.iter_mut().zip(parents) {
+                    if !screened {
+                        // #465: survivors of parents + offspring + immigrants.
+                        let mut combined = parents;
+                        combined.extend(std::mem::take(pop));
+                        *pop = afp_select(combined, cfg.pop);
+                        continue;
+                    }
                     let mut offspring = std::mem::take(pop);
                     offspring.sort_by(|a, b| {
                         a.error
@@ -7131,7 +7293,11 @@ fn run_search(
                     }
                     let mut combined = parents;
                     combined.extend(promoted);
-                    select_population(&mut combined, cfg.pop);
+                    if cfg.selection == Selection::Afp {
+                        combined = afp_select(combined, cfg.pop);
+                    } else {
+                        select_population(&mut combined, cfg.pop);
+                    }
                     *pop = combined;
                 }
             }
@@ -7290,6 +7456,18 @@ fn run_search(
                             .map(|i| i.tree.clone())
                     })
                     .collect();
+                let best_ages: Vec<u32> = islands
+                    .iter()
+                    .map(|pop| {
+                        pop.iter()
+                            .min_by(|a, b| {
+                                a.error
+                                    .partial_cmp(&b.error)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map_or(0, |i| i.age)
+                    })
+                    .collect();
                 for ii in 0..islands.len() {
                     let src = (ii + 1) % islands.len();
                     if let Some(t) = &bests[src] {
@@ -7338,6 +7516,9 @@ fn run_search(
                             None
                         };
                         let slot = victim.or_else(|| {
+                            if cfg.selection == Selection::Afp {
+                                return afp_worst(&islands[ii]);
+                            }
                             islands[ii]
                                 .iter()
                                 .enumerate()
@@ -7355,6 +7536,7 @@ fn run_search(
                             } else {
                                 Ind::evaluated(t.clone(), gen_data, cfg) // #25
                             };
+                            worst.age = best_ages[src];
                         }
                     }
                 }
@@ -7972,6 +8154,7 @@ mod tests {
             error,
             complexity,
             descriptor: None,
+            age: 0,
         }
     }
 
@@ -8174,6 +8357,7 @@ mod tests {
             error: f64::NAN,
             complexity: before,
             descriptor: None,
+            age: 0,
         };
         refresh_after_fit(&mut ind, &cfg);
         let want = expr::simplify(&tree);
@@ -8675,6 +8859,7 @@ mod tests {
             error: 1.0,
             complexity: 1.0,
             descriptor: None,
+            age: 0,
         }];
 
         let mut rng = Mt::new(11);
@@ -8928,6 +9113,7 @@ mod tests {
             error: f64::INFINITY,
             complexity: 0.0,
             descriptor: None,
+            age: 0,
         };
 
         ind.refit_and_reeval(&first_data, &first, &cfg);
@@ -9766,6 +9952,88 @@ mod tests {
             "QD scoring evaluated a tree a second time for its descriptor"
         );
     }
+
+    fn aged_ind(tree: Node, error: f64, complexity: f64, age: u32) -> Ind {
+        Ind { tree, error, complexity, descriptor: None, age }
+    }
+
+    /// #465: the lowest-error individual always survives, whatever its age or
+    /// size.
+    #[test]
+    fn afp_keeps_best_error() {
+        let mut all: Vec<Ind> = Vec::new();
+        for i in 0..8 {
+            // Parents: old and mid-sized, errors 1.0 .. 8.0.
+            all.push(aged_ind(input(0), 1.0 + i as f64, 3.0 + i as f64, 20));
+        }
+        for i in 0..8 {
+            // Offspring: young and small, errors 2.0 .. 9.0 except one best.
+            let error = if i == 5 { 0.25 } else { 2.0 + i as f64 };
+            let complexity = if i == 5 { 40.0 } else { 1.0 };
+            all.push(aged_ind(input(0), error, complexity, if i == 5 { 30 } else { 0 }));
+        }
+        let kept = afp_select(all, 8);
+        assert_eq!(kept.len(), 8);
+        let best = kept.iter().map(|i| i.error).fold(f64::INFINITY, f64::min);
+        assert_eq!(best, 0.25);
+    }
+
+    /// #465: survivors age by one; offspring inherit the older parent's age;
+    /// immigrants and rebuilt individuals start at 0.
+    #[test]
+    fn afp_age_rules() {
+        let kept = afp_select(
+            vec![aged_ind(input(0), 1.0, 1.0, 4), aged_ind(input(0), 2.0, 2.0, 0)],
+            2,
+        );
+        assert_eq!(kept.iter().map(|i| i.age).collect::<Vec<_>>(), vec![5, 1]);
+
+        let s = sample();
+        let aggs = AggTable::from_sample(&s);
+        let mut cfg = Config::default();
+        cfg.pop = 40;
+        cfg.fit_iters = 0;
+        cfg.selection = Selection::Afp;
+        let data = EvalSample::new(&s, &cfg);
+        let mut isl: Vec<Ind> = (0..40)
+            .map(|i| {
+                let mut ind = Ind::evaluated(
+                    node(Op::Add, vec![input(0), constant(i as f64)]),
+                    &data,
+                    &cfg,
+                );
+                ind.age = if i % 2 == 0 { 2 } else { 9 };
+                ind
+            })
+            .collect();
+        let mut rng = Mt::new(11);
+        evolve_island(
+            &mut isl, &mut rng, &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None, false,
+            0, None, None, 1,
+        );
+        let immigrants = afp_immigrants(cfg.pop);
+        assert_eq!(isl.len(), cfg.pop + immigrants);
+        let (offspring, fresh) = isl.split_at(cfg.pop);
+        assert!(fresh.iter().all(|i| i.age == 0), "immigrants start at age 0");
+        assert!(offspring.iter().all(|i| i.age == 2 || i.age == 9));
+        assert!(offspring.iter().any(|i| i.age == 9), "the older parent's age is inherited");
+
+        let rebuilt = Ind::pending(input(0), &cfg);
+        assert_eq!(rebuilt.age, 0);
+        assert_eq!(Ind::evaluated(input(0), &data, &cfg).age, 0);
+    }
+
+    /// #465: migration replaces the member of the highest Pareto rank.
+    #[test]
+    fn afp_worst_is_the_highest_rank() {
+        let island = vec![
+            aged_ind(input(0), 1.0, 1.0, 0),
+            aged_ind(input(0), 5.0, 9.0, 7),
+            aged_ind(input(0), 2.0, 2.0, 1),
+        ];
+        assert_eq!(afp_worst(&island), Some(1));
+    }
+
     fn affine_sample() -> Sample {
         let x: Vec<Vec<f64>> = (0..60).map(|i| vec![i as f64 * 0.1 - 3.0]).collect();
         let y: Vec<f64> = x.iter().map(|r| 2.0 * r[0] + 1.0).collect();

@@ -670,6 +670,15 @@ SEARCH:
                              unique tree
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
   --no-dedup                 disable structural de-duplication
+  --selection lexicographic|afp
+                             survivor and parent selection inside an island.
+                             lexicographic (default) replaces the island with
+                             its offspring and picks parents by error, then
+                             size. afp keeps the Pareto-best of parents and
+                             offspring on (error, complexity, age), adds a few
+                             random immigrants per generation and picks
+                             parents by Pareto rank and crowding distance.
+                             Node path only; refuses --variation postfix
   --linear-scaling           wrap every candidate shape f in a fitted affine output
                              map a + b*f(x), so a shape that is right up to scale
                              and offset scores as right at once. Needs a
@@ -2363,6 +2372,8 @@ fn main() {
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
     let mut front_parents_set = false;
+    // #465: explicit --selection for the resume settings check.
+    let mut selection_set = false;
     let mut linear_scaling_set = false; // #470
     // #25: `--units` is resolved against the prepared input list later; the
     // expressions themselves are parsed here so a typo is a usage error.
@@ -2864,6 +2875,20 @@ fn main() {
                 linear_scaling_set = true;
             }
             // #76: exactness escape hatch; the default is on.
+            // #465: survivor and parent selection inside an island.
+            "--selection" => {
+                let v = val!();
+                match crate::search::Selection::parse(&v) {
+                    Ok(s) => {
+                        cfg.selection = s;
+                        selection_set = true;
+                    }
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--no-front-parents" => {
                 cfg.front_parents = false;
                 front_parents_set = true;
@@ -3180,6 +3205,15 @@ fn main() {
         eprintln!("error: --save-every requires --save <file>");
         std::process::exit(EXIT_USAGE);
     }
+    if cfg.selection == crate::search::Selection::Afp
+        && cfg.variation == crate::search::VariationMode::Postfix
+    {
+        eprintln!(
+            "error: --selection afp runs on the node path only; \
+             use --variation auto or node"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
     if allow_backend_change && resume_path.is_none() {
         eprintln!("error: --allow-backend-change only applies to --resume");
         std::process::exit(EXIT_USAGE);
@@ -3425,6 +3459,14 @@ fn main() {
             conflicts.push(format!(
                 "--fit-fallback-max {} (saved {})",
                 cfg.fit_fallback_max, saved.fit_fallback_max
+            ));
+        }
+        // #465: the selection scheme is saved search state.
+        if selection_set && cfg.selection != saved.selection {
+            conflicts.push(format!(
+                "--selection {} (saved {})",
+                cfg.selection.as_str(),
+                saved.selection.as_str()
             ));
         }
         // #495: the band decides which finalists get the exact refit.

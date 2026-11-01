@@ -639,6 +639,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--linear-scaling]
+     [--selection lexicographic|afp]
      [--fit-samples N]
      [--patience N]
      [--gpu] [--gpu-memory size] [--dispatch auto|device] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
@@ -1207,6 +1208,11 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   and **72 → 74/75**, with `pythagoras` recovered in **7/9** cells instead of
   **0/9**, for about 5% more wall time. `--no-front-parents` disables it and
   restores the previous trajectory exactly;
+- **opt-in age-fitness Pareto survivor selection** (`--selection afp`): parents and
+  offspring compete on (error, complexity, age) by non-dominated sorting with
+  crowding distance, a few random immigrants join each generation, and parents
+  are drawn by Pareto rank. Small correct shapes and new lineages survive next
+  to large approximations. Node path only; the default stays `lexicographic`;
 - **opt-in quality-diversity search** (`--qd`, `--qd-cvt`, `--qd-policy`,
   `--qd-cells`, `--qd-cell-cap`): CVT-MAP-Elites over variable usage ×
   prediction skewness, with deterministic Halton initialisation, Lloyd
