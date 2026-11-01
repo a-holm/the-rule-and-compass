@@ -1319,6 +1319,7 @@ stages; fitting and all f64 reporting stay on the CPU.
 * The fitter, the archive and every dominance test keep `--metric`. A surrogate error and a P&L value are never compared in one dominance test.
 * After the exact finalist refit, each Pareto member's prediction vector on the validation slice is scored by the exact CPU `f64` long/flat book of [`docs/walkforward.md`](walkforward.md). The member with the lowest objective value is reported first. There is no complexity penalty term: ties keep the archive order, which is complexity first.
 * `--gpu` may speed up the fit. It does not change the finalist, which is always rebuilt on the CPU, and the device has no P&L metric arm.
+* The book earns the full per-row return on every long row and charges one cost per position change. That is only right when the returns of one group do not overlap, so `rcsr` refuses (exit 2, `overlapping returns`) a validation or test slice whose rows of one group are closer than the target spec's `horizon_seconds`. Use a label stride of at least the horizon (`long:<h>,stride=<h>`) or a one-bar label. The JSON `objective.spec` carries `min_group_step_seconds` and `horizon_seconds`.
 * A direct in-search P&L fitness is not implemented. The objective only chooses among archived members.
 
 ```sh

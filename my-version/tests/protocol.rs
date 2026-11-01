@@ -146,7 +146,7 @@ fn the_cli_runs_the_whole_protocol_and_refuses_a_second_read() {
     );
     let base = |extra: &[&str]| -> (i32, String, String) {
         let mut a = vec![
-            "walkforward", "--data", &d, "--target", "target", "--expr", "x", "--time", "ts", "--horizon", "5",
+            "walkforward", "--data", &d, "--target", "target", "--expr", "x", "--time", "ts", "--horizon", "1",
             "--cost-bps", "5", "--lockbox", "200,300", "--ledger", &l, "--periods-per-year", "365", "--json",
         ];
         a.extend_from_slice(extra);
