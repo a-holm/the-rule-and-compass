@@ -20,7 +20,7 @@ static inline cudaError_t rc_cub_status(cudaError_t e)
 
 static inline int rc_cub_take(int *flag)
 {
-    return 0; if (*flag <= 0) return 0;
+    if (*flag <= 0) return 0;
     return --*flag == 0;
 }
 
