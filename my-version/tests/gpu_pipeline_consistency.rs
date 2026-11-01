@@ -240,3 +240,51 @@ fn qd_immigrants_store_the_error_of_the_stored_tree() {
     }
     assert!(failures.is_empty(), "stored errors of a different tree: {failures:?}");
 }
+
+/// #600: the overlap drain books its device fit as fit, in the interval union
+/// and the fit stage, exactly as the synchronous path does.
+#[cfg(feature = "cuda")]
+#[test]
+fn pipeline_books_fit_interval() {
+    use rcsr::gpu_stats::Stage;
+    if !device_available() {
+        return;
+    }
+    let train = sample(4_096, 3);
+    let test = sample(256, 4);
+    for depth in [0usize, 2] {
+        let out = search::run(&config(depth, 7), &train, &test);
+        let g = out.gpu.expect("the device scored generations");
+        let l = &g.ledger;
+        let fit_intervals: f64 = l
+            .intervals()
+            .iter()
+            .filter(|i| i.stage == Stage::Fit)
+            .map(|i| i.end_s - i.start_s)
+            .sum();
+        let kernel = l.fit_kernel_s();
+        assert!(kernel > 0.0, "depth {depth}: no fit kernel ran");
+        assert!(
+            (fit_intervals - kernel).abs() <= 0.01 * kernel,
+            "depth {depth}: fit intervals {fit_intervals} vs fit kernel {kernel}"
+        );
+        let sum = l.eval_kernel_s() + kernel;
+        assert!(
+            l.device_busy_s() >= 0.9 * sum * (1.0 - l.device_overlap_s() / l.device_busy_sum_s()),
+            "depth {depth}: device_busy {} vs kernels {sum}",
+            l.device_busy_s()
+        );
+        assert!(
+            l.stage_s(Stage::Fit) >= kernel,
+            "depth {depth}: fit stage {} below fit kernel {kernel}",
+            l.stage_s(Stage::Fit)
+        );
+        assert!(
+            l.stage_s(Stage::Vary) + kernel <= l.wall_s() * 1.01,
+            "depth {depth}: vary {} still holds the fit kernel {kernel} of wall {}",
+            l.stage_s(Stage::Vary),
+            l.wall_s()
+        );
+        assert!(l.closure_residual().value.abs() < 0.005, "depth {depth}: closure");
+    }
+}
