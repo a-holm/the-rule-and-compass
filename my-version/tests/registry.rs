@@ -464,6 +464,7 @@ fn append(dir: &std::path::Path, target: &str, family: &str, cols: &[&str], out:
         target: target.to_string(),
         family: family.to_string(),
         columns: cols.iter().map(|s| s.to_string()).collect(),
+        skip_existing: false,
         out: out.to_string(),
         panel_version: "2".to_string(),
         scratch: Some(path(dir, "scratch")),
@@ -531,6 +532,7 @@ fn a_time_major_family_is_appended_without_changing_existing_columns() {
         target: target.clone(),
         family: family.clone(),
         columns: vec!["vol21".to_string()],
+        skip_existing: false,
         out: path(&dir, "x.rcsb"),
         panel_version: "2".to_string(),
         scratch: Some(path(&dir, "scratch")),
@@ -850,4 +852,152 @@ fn view_records_requested_and_delivered_sizes() {
     assert!(json.contains(&format!("\"delivered\":{}", v.delivered)), "{json}");
     let full = registry::select_view(&names, 36, 11, 0).unwrap();
     assert_eq!(full.delivered, full.columns.len());
+}
+
+struct AppendFixture {
+    dir: std::path::PathBuf,
+    panel: String,
+    family: String,
+}
+
+fn append_fixture(tag: &str, family_close_shift: Option<(usize, f64)>) -> AppendFixture {
+    let dir = tmp_dir(tag);
+    let symbols = ["AAA", "BBB"];
+    let sym_major = bar_rows(&symbols, 60);
+    let panel = path(&dir, "panel.rcsb");
+    write_rows(&panel, &time_major(&sym_major), 37);
+    registry::write_schema(&panel, "2").unwrap();
+    let mut fam_rows = sym_major.clone();
+    if let Some((row, d)) = family_close_shift {
+        fam_rows[row].5 += d;
+    }
+    let family = enrich_family(&dir, "fam", &fam_rows, "r1,r4,ma5,vol20");
+    AppendFixture { dir, panel, family }
+}
+
+fn options(f: &AppendFixture, cols: &[&str], skip_existing: bool, out: &str) -> AppendOptions {
+    AppendOptions {
+        target: f.panel.clone(),
+        family: f.family.clone(),
+        columns: cols.iter().map(|s| s.to_string()).collect(),
+        skip_existing,
+        out: path(&f.dir, out),
+        panel_version: "2".to_string(),
+        scratch: Some(path(&f.dir, "scratch")),
+        locked_test: rcsr::lockbox::Keep::Unset,
+    }
+}
+
+fn leftovers(dir: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if p.is_dir() {
+                stack.push(p);
+            } else if name.starts_with("rcsr-append-") || name.contains(".tmp-") {
+                found.push(name);
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn a_duplicate_name_fails_before_any_column_is_read() {
+    let f = append_fixture("append-dup", None);
+    let err = panel_append::append_family(&options(&f, &["close", "r4", "volume", "nope"], false, "out.rcsb")).unwrap_err();
+    assert!(err.contains("column 'close' already exists in the panel"), "{err}");
+    assert!(err.contains("column 'volume' already exists in the panel"), "{err}");
+    assert!(err.contains("unknown column 'nope'") && err.contains("column 'nope' is not in the family store"), "{err}");
+    assert!(!err.contains("--replace"), "{err}");
+    assert!(!std::path::Path::new(&path(&f.dir, "scratch")).exists(), "scratch dir created before the name check");
+    assert!(!std::path::Path::new(&path(&f.dir, "out.rcsb")).exists());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(["panel", "append", "--data", &f.panel, "--family", &f.family, "--columns", "close,r4,volume", "--out"])
+        .arg(path(&f.dir, "cli.rcsb"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("'close'") && text.contains("'volume'"), "{text}");
+    assert!(!std::path::Path::new(&path(&f.dir, "cli.rcsb")).exists());
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
+
+#[test]
+fn failed_append_leaves_no_output() {
+    let f = append_fixture("append-atomic", Some((7, 0.5)));
+    let out = path(&f.dir, "out.rcsb");
+    let err = panel_append::append_family(&options(&f, &["close", "r4"], true, "out.rcsb")).unwrap_err();
+    assert!(err.contains("another value at row") && err.contains("'close'"), "{err}");
+    assert!(!std::path::Path::new(&out).exists());
+    assert_eq!(leftovers(&f.dir), Vec::<String>::new());
+
+    // a failure inside the writer, after the scratch columns exist
+    let mut o = options(&f, &["r4"], false, "out.rcsb");
+    o.out = f.panel.clone();
+    let err = panel_append::append_family(&o).unwrap_err();
+    assert!(err.contains("in place"), "{err}");
+    assert_eq!(leftovers(&f.dir), Vec::<String>::new());
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
+
+#[test]
+fn the_store_appender_leaves_no_file_on_an_error() {
+    let f = append_fixture("append-store", None);
+    let source = FileStore::open(&f.panel).unwrap();
+    let bad = std::path::PathBuf::from(path(&f.dir, "short.f64"));
+    std::fs::write(&bad, [0u8; 8]).unwrap();
+    let out = path(&f.dir, "out.rcsb");
+    let extras = [store::AppendColumn { name: "x".to_string(), file: bad, replace: false }];
+    assert!(store::write_store_appending_hashed(&out, &source, &extras).is_err());
+    assert!(!std::path::Path::new(&out).exists());
+    assert_eq!(leftovers(&f.dir), Vec::<String>::new());
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
+
+#[test]
+fn skip_existing_drops_equal_columns_and_appends_the_rest() {
+    let f = append_fixture("append-skip", None);
+    let report = panel_append::append_family(&options(&f, &["close", "r4", "volume"], true, "out.rcsb")).unwrap();
+    assert_eq!(report.skipped_existing, vec!["close".to_string(), "volume".to_string()]);
+    assert_eq!(report.appended, vec!["r4".to_string()]);
+    let out = FileStore::open(&path(&f.dir, "out.rcsb")).unwrap();
+    assert_eq!(out.n_cols(), FileStore::open(&f.panel).unwrap().n_cols() + 1);
+    assert!(leftovers(&f.dir).is_empty());
+    let err = panel_append::append_family(&options(&f, &["close"], true, "out2.rcsb")).unwrap_err();
+    assert!(err.contains("nothing to append"), "{err}");
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
+
+#[test]
+fn all_resolves_to_the_family_columns_the_panel_lacks() {
+    let f = append_fixture("append-all", None);
+    let panel = FileStore::open(&f.panel).unwrap();
+    let family = FileStore::open(&f.family).unwrap();
+    let want: Vec<String> = family
+        .header()
+        .names()
+        .iter()
+        .filter(|n| panel.header().column_index(n).is_none())
+        .cloned()
+        .collect();
+    assert!(want.contains(&"r4".to_string()));
+    assert_eq!(panel_append::resolve_all(&panel, &family), want);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(["panel", "append", "--data", &f.panel, "--family", &f.family, "--columns", "@all", "--out"])
+        .arg(path(&f.dir, "all.rcsb"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let got = FileStore::open(&path(&f.dir, "all.rcsb")).unwrap();
+    for n in &want {
+        assert!(got.header().column_index(n).is_some(), "{n}");
+    }
+    let _ = std::fs::remove_dir_all(&f.dir);
 }

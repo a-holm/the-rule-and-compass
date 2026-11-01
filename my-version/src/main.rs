@@ -689,6 +689,20 @@ SEARCH:
                              and offset scores as right at once. Needs a
                              least-squares metric (squared, aic, aicc, bic) and
                              constant fitting; single target; off by default (#470)
+  --mutation-mix <M>         node-path edit weights: classic (point .25, terminal
+                             .35, subtree .40; default) or extended (adds insert,
+                             delete, swap and rotate). Not with --variation
+                             postfix (#471)
+  --tree-arity <A>           operator draw in random trees: uniform (default) or
+                             balanced (binary .5, unary .4, ternary .1). Not with
+                             --variation postfix (#471)
+  --crossover-internal <P>   probability that a crossover cut point is an
+                             internal node (default 0 = uniform cut). Not with
+                             --variation postfix (#471)
+  --adaptive-mix             per-island edit weights learned from the success
+                             rate of the last 10 generations (uses all seven edit
+                             kinds; learns from CPU-scored generations only).
+                             Off by default; not with --variation postfix (#471)
   --no-front-parents         draw every parent from the island tournament;
                              turns off the 15% Pareto-front feedback (#76)
   --reject-constant-offspring
@@ -2391,6 +2405,10 @@ fn main() {
     // #465: explicit --selection for the resume settings check.
     let mut selection_set = false;
     let mut linear_scaling_set = false; // #470
+    let mut mutation_mix_set = false; // #471
+    let mut tree_arity_set = false;
+    let mut crossover_internal_set = false;
+    let mut adaptive_mix_set = false;
     // #25: `--units` is resolved against the prepared input list later; the
     // expressions themselves are parsed here so a typo is a usage error.
     let mut unit_assignments: Vec<(String, Unit)> = Vec::new();
@@ -2888,6 +2906,44 @@ fn main() {
             "--linear-scaling" => {
                 cfg.linear_scaling = true;
                 linear_scaling_set = true;
+            }
+            // #471: node-path variation settings, each off by default.
+            "--mutation-mix" => {
+                let v = val!();
+                match rcsr::search::MutationMix::parse(&v) {
+                    Ok(m) => cfg.mutation_mix = m,
+                    Err(e) => {
+                        eprintln!("error: --mutation-mix: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+                mutation_mix_set = true;
+            }
+            "--tree-arity" => {
+                let v = val!();
+                match rcsr::search::TreeArity::parse(&v) {
+                    Ok(m) => cfg.tree_arity = m,
+                    Err(e) => {
+                        eprintln!("error: --tree-arity: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+                tree_arity_set = true;
+            }
+            "--crossover-internal" => {
+                let v = val!();
+                match v.parse::<f64>() {
+                    Ok(p) if (0.0..=1.0).contains(&p) => cfg.crossover_internal = p,
+                    _ => {
+                        eprintln!("error: --crossover-internal needs a probability in [0, 1], got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+                crossover_internal_set = true;
+            }
+            "--adaptive-mix" => {
+                cfg.adaptive_mix = true;
+                adaptive_mix_set = true;
             }
             // #76: exactness escape hatch; the default is on.
             // #465: survivor and parent selection inside an island.
@@ -3481,6 +3537,32 @@ fn main() {
         if linear_scaling_set && !saved.linear_scaling {
             conflicts.push("--linear-scaling (saved linear_scaling is false)".to_string());
         }
+        // #471: the node-path variation settings are saved search state.
+        {
+            if mutation_mix_set && cfg.mutation_mix != saved.mutation_mix {
+                conflicts.push(format!(
+                    "--mutation-mix {} (saved {})",
+                    cfg.mutation_mix.as_str(),
+                    saved.mutation_mix.as_str()
+                ));
+            }
+            if tree_arity_set && cfg.tree_arity != saved.tree_arity {
+                conflicts.push(format!(
+                    "--tree-arity {} (saved {})",
+                    cfg.tree_arity.as_str(),
+                    saved.tree_arity.as_str()
+                ));
+            }
+            if crossover_internal_set && cfg.crossover_internal != saved.crossover_internal {
+                conflicts.push(format!(
+                    "--crossover-internal {} (saved {})",
+                    cfg.crossover_internal, saved.crossover_internal
+                ));
+            }
+            if adaptive_mix_set && cfg.adaptive_mix != saved.adaptive_mix {
+                conflicts.push(format!("--adaptive-mix (saved adaptive_mix is {})", saved.adaptive_mix));
+            }
+        }
         // #76: front feedback is saved search state.
         if front_parents_set && cfg.front_parents != saved.front_parents {
             conflicts.push(format!(
@@ -3746,6 +3828,16 @@ fn main() {
         };
         if let Some(reason) = refusal {
             eprintln!("error: --linear-scaling: {}", reason);
+            std::process::exit(EXIT_USAGE);
+        }
+    }
+
+    if let Some(flag) = cfg.node_variation_flag() {
+        if cfg.variation == rcsr::search::VariationMode::Postfix {
+            eprintln!(
+                "error: {}: the flat postfix engine has its own edits; use --variation node or auto",
+                flag
+            );
             std::process::exit(EXIT_USAGE);
         }
     }

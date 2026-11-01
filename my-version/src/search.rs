@@ -16,10 +16,11 @@
 
 use crate::afp;
 use crate::checkpoint::{Backend, Checkpoint, Individual, IslandState};
+use crate::mix::{MixCounts, MixWindow};
 use crate::complexity::ComplexityModel;
 use crate::data::Sample;
 use crate::expr::{
-    self, crossover_with, eval, mutate_with, random_tree_with, AggTable, Node, Op,
+    self, crossover_with_opts, eval, mutate_with_opts, random_tree_opts, AggTable, Node, Op,
 };
 use crate::metrics::{score_weighted, Metric};
 // #15: multi-output combined error and per-output constant fitting.
@@ -98,6 +99,73 @@ impl Selection {
             "afp" => Ok(Selection::Afp),
             other => Err(format!(
                 "selection must be 'lexicographic' or 'afp', got '{}'",
+                other
+            )),
+        }
+    }
+}
+
+/// #471: which edit kinds the node-path mutation draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MutationMix {
+    /// Point 25 %, terminal 35 %, subtree 40 %.
+    #[default]
+    Classic,
+    /// Adds insert, delete, swap and rotate.
+    Extended,
+}
+
+impl MutationMix {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MutationMix::Classic => "classic",
+            MutationMix::Extended => "extended",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "classic" => Ok(MutationMix::Classic),
+            "extended" => Ok(MutationMix::Extended),
+            other => Err(format!(
+                "mutation mix must be 'classic' or 'extended', got '{}'",
+                other
+            )),
+        }
+    }
+
+    pub fn weights(self) -> expr::MixWeights {
+        match self {
+            MutationMix::Classic => expr::CLASSIC_MIX,
+            MutationMix::Extended => expr::EXTENDED_MIX,
+        }
+    }
+}
+
+/// #471: how random trees draw an operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TreeArity {
+    /// Uniform over `ops`.
+    #[default]
+    Uniform,
+    /// Arity class first (binary 0.5, unary 0.4, ternary 0.1), then uniform.
+    Balanced,
+}
+
+impl TreeArity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TreeArity::Uniform => "uniform",
+            TreeArity::Balanced => "balanced",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "uniform" => Ok(TreeArity::Uniform),
+            "balanced" => Ok(TreeArity::Balanced),
+            other => Err(format!(
+                "tree arity must be 'uniform' or 'balanced', got '{}'",
                 other
             )),
         }
@@ -298,6 +366,15 @@ pub struct Config {
     /// #470: wrap every candidate shape in a fitted affine output map
     /// `a + b*f(x)`. Changes the trajectory, so it is a saved search setting.
     pub linear_scaling: bool,
+    /// #471: the node-path edit weights. Changes the trajectory, so it is a
+    /// saved search setting.
+    pub mutation_mix: MutationMix,
+    /// #471: operator draw in random trees.
+    pub tree_arity: TreeArity,
+    /// #471: probability that a crossover cut point is an internal node.
+    pub crossover_internal: f64,
+    /// #471: per-island edit weights learned from success rates.
+    pub adaptive_mix: bool,
 }
 
 /// A per-generation progress report.
@@ -575,6 +652,10 @@ impl Default for Config {
             variation: VariationMode::Auto,
             selection: Selection::Lexicographic,
             linear_scaling: false,
+            mutation_mix: MutationMix::Classic,
+            tree_arity: TreeArity::Uniform,
+            crossover_internal: 0.0,
+            adaptive_mix: false,
         }
     }
 }
@@ -615,6 +696,10 @@ impl Config {
         compare!(fit_polish, "fit_polish");
         compare!(fit_admission, "fit_admission");
         compare!(linear_scaling, "linear_scaling"); // #470
+        compare!(mutation_mix, "mutation_mix"); // #471
+        compare!(tree_arity, "tree_arity"); // #471
+        compare!(crossover_internal, "crossover_internal"); // #471
+        compare!(adaptive_mix, "adaptive_mix"); // #471
         compare!(dedup, "dedup");
         // #256: `time_budget` is a per-process limit, not search state; a resumed
         // run may set a new one.
@@ -665,6 +750,31 @@ impl Config {
             0.0
         };
         self.max_complexity as f64 + extra
+    }
+
+    /// #471: the variation options of the node path.
+    pub fn variation_opts(&self) -> expr::VariationOpts {
+        expr::VariationOpts {
+            mix: self.mutation_mix.weights(),
+            balanced: self.tree_arity == TreeArity::Balanced,
+            crossover_internal: self.crossover_internal,
+        }
+    }
+
+    /// #471: the name of a node-path variation flag that is set. The postfix
+    /// engine has its own edits and refuses these.
+    pub fn node_variation_flag(&self) -> Option<&'static str> {
+        if self.mutation_mix != MutationMix::Classic {
+            Some("--mutation-mix")
+        } else if self.tree_arity != TreeArity::Uniform {
+            Some("--tree-arity")
+        } else if self.crossover_internal > 0.0 {
+            Some("--crossover-internal")
+        } else if self.adaptive_mix {
+            Some("--adaptive-mix")
+        } else {
+            None
+        }
     }
 }
 
@@ -4864,6 +4974,8 @@ fn evolve_island(
     counters: Option<&GenCounters>,
     // #463: worker threads for the fit-and-score phase of this island.
     workers: usize,
+    // #471: this island's window of edit success counts.
+    mix: &mut MixWindow,
 ) {
     if !screened {
         for ind in isl.iter_mut() {
@@ -4906,6 +5018,24 @@ fn evolve_island(
     let mut attempts = 0usize;
     let max_attempts = pop * 50 + 50;
 
+    // #471: edit weights and the adaptive window. Learning needs the child's
+    // error now, which a deferred GPU batch or a screening subset does not give.
+    let base_opts = cfg.variation_opts();
+    let mut opts = base_opts;
+    if cfg.adaptive_mix {
+        opts.mix = mix.weights(&base_opts.mix);
+    }
+    let learn = cfg.adaptive_mix && !screened && !defer_gpu;
+    let parent_errors: std::collections::HashMap<u64, f64> = if learn {
+        isl.iter()
+            .map(|i| (expr::structural_hash(&i.tree), i.error))
+            .chain(front.iter().map(|s| (expr::structural_hash(&s.tree), s.error)))
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+    let mut counts: MixCounts = [(0, 0); expr::EDIT_KINDS];
+
     let fit = cfg.fit_iters > 0 && !train.sample.is_multi() && !defers_fit_to_gpu(cfg, defer_gpu);
 
     // #463: variation is serial and owns the RNG (phase A); constant fitting
@@ -4915,6 +5045,7 @@ fn evolve_island(
     while next.len() < pop && attempts < max_attempts {
         let want = pop - next.len();
         let mut trees: Vec<Node> = Vec::with_capacity(want);
+        let mut meta: Vec<Option<(f64, u8)>> = Vec::with_capacity(want);
         let mut ages: Vec<u32> = Vec::with_capacity(want);
         while trees.len() < want && attempts < max_attempts {
             attempts += 1;
@@ -4925,6 +5056,12 @@ fn evolve_island(
             let (p1, mut age) = pick_parent_aged(
                 isl, front, qd, rng, front_p, qd_policy, qd_control, afp, &par_rank, &par_crowd,
             );
+            let parent_err = if learn {
+                parent_errors.get(&expr::structural_hash(&p1)).copied()
+            } else {
+                None
+            };
+            let mut used = 0u8; // #471: bit per edit kind applied to this child
             // #470: variation edits the bare shape; the child inherits the first
             // parent's map as its warm start.
             let (scale_a, scale_b, p1) = if cfg.linear_scaling {
@@ -4943,11 +5080,13 @@ fn evolve_island(
                 } else {
                     parent2
                 };
-                crossover_with(&mut child, &parent2, rng, Some(aggs));
+                crossover_with_opts(&mut child, &parent2, rng, Some(aggs), opts.crossover_internal);
             }
-            mutate_with(&mut child, rng, nvars, &cfg.ops, Some(aggs));
+            let edit = mutate_with_opts(&mut child, rng, nvars, &cfg.ops, Some(aggs), &opts);
+            used |= edit.map_or(0, |k| 1 << k.index());
             if rng.bool(0.5) {
-                mutate_with(&mut child, rng, nvars, &cfg.ops, Some(aggs));
+                let edit = mutate_with_opts(&mut child, rng, nvars, &cfg.ops, Some(aggs), &opts);
+                used |= edit.map_or(0, |k| 1 << k.index());
             }
 
             let mut tree = expr::simplify(&child);
@@ -4969,14 +5108,24 @@ fn evolve_island(
             }
             have_const |= is_const;
             trees.push(tree);
+            meta.push(parent_err.map(|e| (e, used)));
             ages.push(age);
         }
         let scored = fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters);
-        for (mut ind, age) in scored.into_iter().zip(ages) {
+        for (k, (mut ind, age)) in scored.into_iter().zip(ages).enumerate() {
             ind.age = age;
             if ind.complexity > cfg.complexity_cap() {
                 GenCounters::count(counters, |c| &c.post_fit_drops); // #463
                 continue;
+            }
+            if let Some((parent, used)) = meta[k] {
+                let won = ind.error.is_finite() && (!parent.is_finite() || ind.error < parent);
+                for kind in expr::EditKind::ALL {
+                    if used & (1 << kind.index()) != 0 {
+                        counts[kind.index()].0 += 1;
+                        counts[kind.index()].1 += won as u64;
+                    }
+                }
             }
             GenCounters::count(counters, |c| &c.offspring); // #211
             let slot = next.len();
@@ -4985,12 +5134,23 @@ fn evolve_island(
         }
     }
 
+    if learn {
+        mix.push(counts);
+    }
+
     // Fill any remainder with fresh random trees.
     if next.len() < pop {
         let trees: Vec<Node> = (next.len()..pop)
             .map(|_| {
                 draw_row_dependent(cfg, nvars, &mut have_const, || {
-                    expr::simplify(&random_tree_with(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs)))
+                    expr::simplify(&random_tree_opts(
+                        rng,
+                        nvars,
+                        &cfg.ops,
+                        cfg.init_depth,
+                        Some(aggs),
+                        base_opts.balanced,
+                    ))
                 })
             })
             .collect();
@@ -5011,13 +5171,16 @@ fn evolve_island(
             let immigrants = (pop / 10).max(1).min(pop);
             let mut trees: Vec<Node> = Vec::with_capacity(immigrants);
             for _ in 0..immigrants {
-                let mut t = random_tree_with(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs));
+                let mut t =
+                    random_tree_opts(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced);
                 let mut best_score = {
                     let d = qd::descriptor(&t, train.sample);
                     (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2)
                 };
                 for _ in 0..3 {
-                    let cand = random_tree_with(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs));
+                    let cand = random_tree_opts(
+                        rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced,
+                    );
                     let d = qd::descriptor(&cand, train.sample);
                     let score = (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2);
                     if score < best_score {
@@ -5048,7 +5211,7 @@ fn evolve_island(
         let k = afp_immigrants(pop);
         let trees: Vec<Node> = (0..k)
             .map(|_| {
-                expr::simplify(&random_tree_with(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs)))
+                expr::simplify(&random_tree_opts(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced))
             })
             .collect();
         next.extend(fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters));
@@ -5385,6 +5548,7 @@ fn snapshot(
     islands: &[Vec<Ind>],
     rngs: &[Mt],
     stagnant: &[usize],
+    mixes: &[MixWindow],
     main_rng: &Mt,
     train: &Sample,
     test: &Sample,
@@ -5409,10 +5573,12 @@ fn snapshot(
         islands: islands
             .iter()
             .zip(rngs.iter())
-            .map(|(pop, rng)| {
+            .enumerate()
+            .map(|(i, (pop, rng))| {
                 let (words, idx) = rng.state();
                 IslandState {
                     rng: Mt::from_state(*words, idx),
+                    mix: mixes.get(i).cloned().unwrap_or_default(),
                     population: pop.iter().map(Ind::to_checkpoint).collect(),
                 }
             })
@@ -5583,6 +5749,9 @@ fn prepare_seeds(
 ///   keeps the historical loop, where it is already cheap.
 #[cfg(feature = "cuda")]
 fn postfix_variation_for(cfg: &Config, train: &Sample) -> Result<Variation, String> {
+    if let Some(flag) = cfg.node_variation_flag() {
+        return Err(format!("{} is a node-path setting", flag));
+    }
     if cfg.selection == Selection::Afp {
         return Err("--selection afp runs on the node path".to_string());
     }
@@ -6241,6 +6410,7 @@ fn run_postfix_search(
                 &islands_now,
                 &rngs,
                 &stagnant,
+                &[],
                 &main_rng,
                 train,
                 test,
@@ -6312,6 +6482,7 @@ fn run_postfix_search(
             &islands_now,
             &rngs,
             &stagnant,
+            &[],
             &main_rng,
             train,
             test,
@@ -6795,6 +6966,7 @@ fn run_search(
     let mut rngs: Vec<Mt>;
     let mut islands: Vec<Vec<Ind>>;
     let mut stagnant: Vec<usize>;
+    let mut mixes: Vec<MixWindow>;
     let mut gens_done: usize;
     let mut converged_early: bool;
     let mut best_prev: f64;
@@ -6849,8 +7021,10 @@ fn run_search(
         rng = main_rng;
         rngs = Vec::with_capacity(saved_islands.len());
         islands = Vec::with_capacity(saved_islands.len());
+        mixes = Vec::with_capacity(saved_islands.len());
         for isl in saved_islands {
             rngs.push(isl.rng);
+            mixes.push(isl.mix);
             islands.push(
                 isl.population
                     .into_iter()
@@ -6886,6 +7060,7 @@ fn run_search(
 
         islands = Vec::with_capacity(cfg.islands.max(1));
         stagnant = vec![0; cfg.islands.max(1)];
+        mixes = vec![MixWindow::new(); cfg.islands.max(1)];
         // Generation 0's subset also scores the initial population, so nothing
         // is evaluated on the full table before the first generation.
         let init_sample = training_for_generation(cfg, train, 0);
@@ -6912,7 +7087,14 @@ fn run_search(
         for isl in 0..cfg.islands.max(1) {
             let depth = cfg.init_depth.min(1 + isl % 3);
             for _ in 0..cfg.pop {
-                init_trees.push(random_tree_with(&mut rng, nvars, &cfg.ops, depth, Some(&aggs)));
+                init_trees.push(random_tree_opts(
+                    &mut rng,
+                    nvars,
+                    &cfg.ops,
+                    depth,
+                    Some(&aggs),
+                    cfg.tree_arity == TreeArity::Balanced,
+                ));
             }
         }
         let mut init_inds = par_map(
@@ -7321,9 +7503,10 @@ fn run_search(
                 let handles: Vec<_> = islands
                     .iter_mut()
                     .zip(rngs.iter_mut())
+                    .zip(mixes.iter_mut())
                     .zip(senders.into_iter())
                     .enumerate()
-                    .map(|(i, ((isl, r), sender))| {
+                    .map(|(i, (((isl, r), mix), sender))| {
                         // #10: carry the block registry into the island thread.
                         let blocks = blocks.clone();
                         s.spawn(move || {
@@ -7346,6 +7529,7 @@ fn run_search(
                                 sender.as_ref().map(|t| (t, i)), // #119
                                 dev_counters_ref, // #211
                                 island_workers, // #463
+                                mix, // #471
                             ) // #85
                         })
                     })
@@ -7756,7 +7940,14 @@ fn run_search(
                         let mut have_const = false; // #477
                         for ind in islands[ii].iter_mut() {
                             let mut t = draw_row_dependent(cfg, nvars, &mut have_const, || {
-                                random_tree_with(&mut r, nvars, &cfg.ops, cfg.init_depth, Some(&aggs))
+                                random_tree_opts(
+                                    &mut r,
+                                    nvars,
+                                    &cfg.ops,
+                                    cfg.init_depth,
+                                    Some(&aggs),
+                                    cfg.tree_arity == TreeArity::Balanced,
+                                )
                             });
                             if let Some(target) = qd_target {
                                 let mut best = t.clone();
@@ -7764,12 +7955,13 @@ fn run_search(
                                 let mut best_score = (best_d.usage - target.usage).powi(2)
                                     + (best_d.skew - target.skew).powi(2);
                                 for _ in 0..3 {
-                                    let cand = random_tree_with(
+                                    let cand = random_tree_opts(
                                         &mut r,
                                         nvars,
                                         &cfg.ops,
                                         cfg.init_depth,
                                         Some(&aggs),
+                                        cfg.tree_arity == TreeArity::Balanced,
                                     );
                                     let d = qd::descriptor(&cand, gen_train);
                                     let score = (d.usage - target.usage).powi(2)
@@ -7864,6 +8056,7 @@ fn run_search(
                     &islands,
                     &rngs,
                     &stagnant,
+                    &mixes,
                     &rng,
                     train,
                     test,
@@ -7937,6 +8130,7 @@ fn run_search(
             &islands,
             &rngs,
             &stagnant,
+            &mixes,
             &rng,
             train,
             test,
@@ -9117,6 +9311,7 @@ mod tests {
                 None,  // #119: synchronous test path
                 None,  // #211: no development log in this test
                 1,     // #463
+                &mut MixWindow::new(), // #471
             );
             let trees: Vec<Node> = isl.iter().map(|i| i.tree.clone()).collect();
             let errors: Vec<u64> = isl.iter().map(|i| i.error.to_bits()).collect();
@@ -10257,7 +10452,7 @@ mod tests {
         let mut rng = Mt::new(11);
         evolve_island(
             &mut isl, &mut rng, &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None, false,
-            0, None, None, 1,
+            0, None, None, 1, &mut MixWindow::new(),
         );
         let immigrants = afp_immigrants(cfg.pop);
         assert_eq!(isl.len(), cfg.pop + immigrants);
