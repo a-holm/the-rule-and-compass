@@ -568,3 +568,40 @@ fn a_refused_cv_run_exits_before_the_search() {
     assert!(!run.exists(), "run.json written: the search ran");
     assert!(started.elapsed().as_secs() < 30, "the search ran before the refusal");
 }
+
+#[test]
+fn a_flag_on_undeclared_data_adds_to_the_protocol_default() {
+    let dir = scratch("flag-adds");
+    let (late, early) = (dir.join("late.csv"), dir.join("early.csv"));
+    series_csv_at(&late, T1);
+    series_csv(&early);
+    let (late, early, run) = (s(&late), s(&early), s(&dir.join("run.json")));
+
+    // a disjoint flag does not switch the default off
+    let (code, _, err) = search(&late, &run, &["--lockbox", "2030-01-01,2030-02-01"]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("2025-07-01..2026-07-01 (protocol default"), "{}", err);
+    // a flag narrower than the default does not either
+    let (code, _, err) = search(&late, &run, &["--lockbox", "2025-07-02,2025-07-03"]);
+    assert_eq!(code, 3, "{}", err);
+    let w = format!("w,{},{},{},{}", T1, T1 + 250 * H, T1 + 260 * H, T1 + 399 * H);
+    let (code, _, err) = wf(&late, None, &["--window", &w, "--lockbox", "2030-01-01,2030-02-01"]);
+    assert_eq!(code, 3, "{}", err);
+
+    // the flag range is guarded as well
+    let range = format!("{},{}", locked().start, locked().end);
+    let (code, _, err) = search(&early, &run, &["--lockbox", &range]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("(--lockbox;"), "{}", err);
+
+    // a stand-in window on data that never reaches 2025 still runs, and the report says both
+    let (code, _, err) = search(&early, &run, &["--lockbox", "2030-01-01,2030-02-01"]);
+    assert_eq!(code, 0, "{}", err);
+    let json = std::fs::read_to_string(&run).unwrap();
+    assert!(json.contains("\"source\":\"flag+protocol_default\""), "{}", json);
+    assert!(json.contains("\"also\":{"), "{}", json);
+
+    // only none removes the default
+    let (code, _, err) = search(&late, &run, &["--lockbox", "none"]);
+    assert_eq!(code, 0, "{}", err);
+}

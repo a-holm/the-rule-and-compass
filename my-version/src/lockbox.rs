@@ -233,6 +233,8 @@ pub struct Declared {
     pub lockbox: Lockbox,
     /// `store`, `flag` or `protocol_default`.
     pub source: &'static str,
+    /// The protocol default guarded next to a flag range on undeclared data.
+    pub also: Option<Lockbox>,
 }
 
 impl Declared {
@@ -251,6 +253,7 @@ impl Declared {
         match self.source {
             "store" => "store manifest",
             "protocol_default" => "protocol default, opt out with --lockbox none",
+            "flag+protocol_default" => "--lockbox; the protocol default is guarded too",
             _ => "--lockbox",
         }
     }
@@ -258,7 +261,22 @@ impl Declared {
     /// Refuse a row set with any timestamp in the declared range. The error
     /// names the first offending row, the split side and the fix.
     pub fn check_times(&self, side: &str, time_name: &str, times: &[i64]) -> Result<Overlap, String> {
-        let overlap = self.lockbox.overlap(times.iter().copied());
+        let overlap = self.check_range(&self.lockbox, self.origin(), side, time_name, times)?;
+        if let Some(also) = &self.also {
+            self.check_range(also, "protocol default, opt out with --lockbox none", side, time_name, times)?;
+        }
+        Ok(overlap)
+    }
+
+    fn check_range(
+        &self,
+        lockbox: &Lockbox,
+        origin: &str,
+        side: &str,
+        time_name: &str,
+        times: &[i64],
+    ) -> Result<Overlap, String> {
+        let overlap = lockbox.overlap(times.iter().copied());
         if overlap.overlaps() {
             return Err(format!(
                 "{} has {} row(s) in the declared locked test {}..{} ({}; first row {}). \
@@ -266,12 +284,12 @@ impl Declared {
                  rcsr walkforward --locked-test or rcsr ladder --locked-test",
                 side,
                 group_digits(overlap.rows),
-                date(self.lockbox.start),
-                date(self.lockbox.end),
-                self.origin(),
+                date(lockbox.start),
+                date(lockbox.end),
+                origin,
                 date(overlap.first_ts),
                 time_name,
-                self.lockbox.start
+                lockbox.start
             ));
         }
         Ok(overlap)
@@ -342,6 +360,7 @@ pub fn declared_for(data_path: &str) -> Option<Lockbox> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Flag,
+    FlagAndDefault,
     Store,
     ProtocolDefault,
     None,
@@ -351,6 +370,7 @@ impl Source {
     pub fn as_str(self) -> &'static str {
         match self {
             Source::Flag => "flag",
+            Source::FlagAndDefault => "flag+protocol_default",
             Source::Store => "store",
             Source::ProtocolDefault => "protocol_default",
             Source::None => "none",
@@ -379,19 +399,38 @@ pub struct Resolved {
     /// `None` only for an explicit `--lockbox none`.
     pub range: Option<Lockbox>,
     pub source: Source,
+    /// The protocol default guarded next to a flag range on undeclared data.
+    pub also: Option<Lockbox>,
     pub declared_in: Vec<(String, Lockbox)>,
 }
 
 impl Resolved {
     /// The active range as a [`Declared`], or `None` for `--lockbox none`.
     pub fn declared(&self) -> Option<Declared> {
-        self.range.map(|lockbox| Declared { lockbox, source: self.source.as_str() })
+        self.range.map(|lockbox| Declared { lockbox, source: self.source.as_str(), also: self.also })
+    }
+
+    /// Every guarded range: the primary one, then the protocol default added to a flag.
+    pub fn ranges(&self) -> Vec<Lockbox> {
+        self.range.into_iter().chain(self.also).collect()
+    }
+
+    /// The single range a derived sidecar declares: the union when the flag
+    /// and the protocol default overlap, else the protocol default.
+    pub fn sidecar_range(&self) -> Option<Lockbox> {
+        match (self.range, self.also) {
+            (Some(f), Some(d)) if f.start <= d.end && f.end >= d.start => {
+                Some(Lockbox { start: f.start.min(d.start), end: f.end.max(d.end) })
+            }
+            (Some(_), Some(d)) => Some(d),
+            (r, _) => r,
+        }
     }
 
     /// The `lockbox` object fields of a report: declared range, source, the
     /// files that declared it, rows in scope and whether the range was read.
     pub fn report_fields(&self, rows_in_scope: usize, evaluated: bool, checked: bool) -> String {
-        let declared = match &self.range {
+        let range_json = |r: &Option<Lockbox>| match r {
             Some(l) => format!(
                 "{{\"start\":{},\"end\":{},\"start_date\":{},\"end_date\":{}}}",
                 l.start,
@@ -401,6 +440,7 @@ impl Resolved {
             ),
             None => "null".to_string(),
         };
+        let (declared, also) = (range_json(&self.range), range_json(&self.also));
         let files: Vec<String> = self
             .declared_in
             .iter()
@@ -414,8 +454,9 @@ impl Resolved {
             })
             .collect();
         format!(
-            "\"declared\":{},\"source\":{},\"declared_in\":[{}],\"rows_in_scope\":{},\"evaluated\":{},\"checked\":{}",
+            "\"declared\":{},\"also\":{},\"source\":{},\"declared_in\":[{}],\"rows_in_scope\":{},\"evaluated\":{},\"checked\":{}",
             declared,
+            also,
             jstr(self.source.as_str()),
             files.join(","),
             rows_in_scope,
@@ -506,18 +547,28 @@ pub fn resolve(flag: Option<&str>, data_path: &str) -> Result<Resolved, ResolveE
             file,
             span(&l)
         ))),
-        (Some(None), None) => Ok(Resolved { range: None, source: Source::None, declared_in }),
+        (Some(None), None) => Ok(Resolved { range: None, source: Source::None, also: None, declared_in }),
         (Some(Some(f)), Some((file, l))) if !(f.start <= l.start && f.end >= l.end) => Err(usage(format!(
             "--lockbox {} does not cover the declared locked test {} ({})",
             span(&f),
             span(&l),
             file
         ))),
-        (Some(Some(f)), _) => Ok(Resolved { range: Some(f), source: Source::Flag, declared_in }),
-        (None, Some((_, l))) => Ok(Resolved { range: Some(l), source: Source::Store, declared_in }),
+        (Some(Some(f)), Some(_)) => Ok(Resolved { range: Some(f), source: Source::Flag, also: None, declared_in }),
+        (Some(Some(f)), None) => {
+            let d = protocol_default();
+            let (source, also) = if f.start <= d.start && f.end >= d.end {
+                (Source::Flag, None)
+            } else {
+                (Source::FlagAndDefault, Some(d))
+            };
+            Ok(Resolved { range: Some(f), source, also, declared_in })
+        }
+        (None, Some((_, l))) => Ok(Resolved { range: Some(l), source: Source::Store, also: None, declared_in }),
         (None, None) => Ok(Resolved {
             range: Some(protocol_default()),
             source: Source::ProtocolDefault,
+            also: None,
             declared_in,
         }),
     }
@@ -661,13 +712,22 @@ mod tests {
     }
 
     #[test]
-    fn resolve_flag_only_uses_the_flag() {
+    fn resolve_flag_on_undeclared_data_adds_to_the_protocol_default() {
         let d = resolve_dir("flag");
         let data = d.join("a.csv").to_str().unwrap().to_string();
         let r = resolve(Some("2030-01-01,2030-02-01"), &data).unwrap();
-        assert_eq!(r.source, Source::Flag);
+        assert_eq!(r.source, Source::FlagAndDefault);
+        assert_eq!(r.also, Some(protocol_default()));
+        assert_eq!(r.ranges().len(), 2);
+        let r = resolve(Some("2025-01-01,2027-01-01"), &data).unwrap();
+        assert_eq!((r.source, r.also), (Source::Flag, None));
+        let r = resolve(Some("2030-01-01,2030-02-01"), &data).unwrap();
         assert_eq!(r.range, Some(Lockbox::parse("2030-01-01,2030-02-01").unwrap()));
         assert!(r.declared_in.is_empty());
+        assert_eq!(r.sidecar_range(), r.also);
+        let r = resolve(Some("2025-01-01,2025-08-01"), &data).unwrap();
+        let u = r.sidecar_range().unwrap();
+        assert_eq!((u.start, u.end), (Lockbox::parse("2025-01-01,2025-08-01").unwrap().start, protocol_default().end));
         let e = resolve(Some("garbage"), &data).unwrap_err();
         assert_eq!(e.exit, 2);
         assert!(e.message.starts_with("--lockbox: "), "{}", e.message);

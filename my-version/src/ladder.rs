@@ -2324,6 +2324,11 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     };
     let panel = load_panel(&inp, &opts).map_err(input_err)?;
     let folds = make_folds(&panel, &rows, opts.purge_seconds, guard).map_err(input_err)?;
+    if !locked_test {
+        if let Some(extra) = resolved.also {
+            make_folds(&panel, &rows, opts.purge_seconds, Some((extra.start as f64, extra.end as f64))).map_err(input_err)?;
+        }
+    }
     let io_s = t_io.elapsed().as_secs_f64();
     let mut report = run_ladder(&panel, &folds, &opts).map_err(input_err)?;
     let mut ledger = RunLedger::new();

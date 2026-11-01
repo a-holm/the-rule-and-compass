@@ -1683,7 +1683,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             .map_err(|e| (3, e))?;
             let out = fl.need("--out")?;
             std::fs::write(out, csv).map_err(|e| io_err(out, e))?;
-            if let Some(lb) = &resolved.range {
+            if let Some(lb) = &resolved.sidecar_range() {
                 crate::lockbox::write_sidecar(out, lb, &format!("rcsr ablation prepare ({})", resolved.source.as_str())).map_err(|e| (3, e))?;
             }
             println!("wrote {}", out);
@@ -1774,6 +1774,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             let declared = resolved.declared();
             let guard = declared.as_ref().map(|d| (d.lockbox.start as f64, d.lockbox.end as f64));
             let folds = ladder::make_folds(&panel, &rows, opts.purge_seconds, guard).map_err(|e| (3, e))?;
+            if let Some(extra) = resolved.also {
+                ladder::make_folds(&panel, &rows, opts.purge_seconds, Some((extra.start as f64, extra.end as f64))).map_err(|e| (3, e))?;
+            }
             let res = match &book {
                 Some(b) => score_run_fixed(&facts, &panel, &folds, b.threshold, &opts),
                 None => score_run(&facts, &panel, &folds, &thresholds, headline, &opts),

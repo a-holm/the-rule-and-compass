@@ -8271,7 +8271,7 @@ pub fn run(args: &[String]) -> ! {
         if let Some(out) = &opts.out {
             let sidecar = format!("{}.enrich.json", out);
             let mut text = report.json();
-            if let Some(lb) = resolved.range {
+            if let Some(lb) = resolved.sidecar_range() {
                 let at = text.find('{').map_or(0, |i| i + 1);
                 text.insert_str(
                     at,

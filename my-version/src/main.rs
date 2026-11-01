@@ -243,7 +243,7 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              locked test (UTC, half-open). Order: this flag, the range
                              declared with the data (<data>.manifest.json, .schema.json,
                              .enrich.json or <csv>.lockbox.json), else the protocol
-                             default 2025-07-01,2026-07-01. A flag that does not cover
+                             default 2025-07-01,2026-07-01. On undeclared data the flag adds to the default. A flag that does not cover
                              the declared range is refused (exit 2), as are conflicting
                              declarations (exit 3). `none` opts out and is refused when
                              the data declares a range. Train, validation and test rows
@@ -9476,7 +9476,8 @@ OPTIONS:
   --lockbox <START,END|none>
                              locked test, UTC half-open. Order: this flag, the range
                              declared with --data (store manifest, schema or sidecar),
-                             else the protocol default 2025-07-01,2026-07-01. A flag
+                             else the protocol default 2025-07-01,2026-07-01. On undeclared
+                             data a flag adds to the default. A flag
                              that does not cover the declared range is refused (exit
                              2), as are conflicting declarations (exit 3). `none` opts
                              out; it is refused when the data declares a range and
@@ -10160,7 +10161,11 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: --locked-test needs --ledger and --sealed");
         std::process::exit(EXIT_USAGE);
     }
-    if let Some((ls, le)) = declared_lock {
+    for (ri, rg) in resolved.ranges().into_iter().enumerate() {
+        if locked_test && ri > 0 {
+            continue;
+        }
+        let (ls, le) = (rg.start as f64, rg.end as f64);
         for w in &spec.windows {
             let train_hits = w.train_start < le && w.train_end > ls;
             let test_hits = w.test_start < le && w.test_end > ls;
@@ -10634,9 +10639,13 @@ fn run_audit(args: &[String]) -> ! {
     });
     let finite_times = times.iter().copied().filter(|v| v.is_finite());
     let (t_lo, t_hi) = finite_times.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
-    let range = resolved.range.filter(|_| rcsr::lockbox::plausible_epoch_seconds(t_lo, t_hi));
+    let ranges: Vec<rcsr::lockbox::Lockbox> = if rcsr::lockbox::plausible_epoch_seconds(t_lo, t_hi) {
+        resolved.ranges()
+    } else {
+        Vec::new()
+    };
     let keep: Vec<usize> = (0..times.len())
-        .filter(|&r| !range.is_some_and(|l| times[r].is_finite() && l.contains(times[r].floor() as i64)))
+        .filter(|&r| !ranges.iter().any(|l| times[r].is_finite() && l.contains(times[r].floor() as i64)))
         .collect();
     let rows_left_out = times.len() - keep.len();
     let times: Vec<f64> = keep.iter().map(|&r| times[r]).collect();
@@ -10963,14 +10972,16 @@ fn run_audit(args: &[String]) -> ! {
             false,
             false
         ),
-        resolved.report_fields(0, false, range.is_some()),
+        resolved.report_fields(0, false, !ranges.is_empty()),
         rows_left_out,
         leaks_json.join(",")
     );
-    let locked_line = match &resolved.range {
-        Some(l) => format!(
+    let locked_line = match resolved.range {
+        Some(_) => format!(
             "# audit: locked test {} ({}) rows left out={}",
-            rcsr::lockbox::span(l), resolved.source.as_str(), rows_left_out
+            resolved.ranges().iter().map(rcsr::lockbox::span).collect::<Vec<_>>().join(" + "),
+            resolved.source.as_str(),
+            rows_left_out
         ),
         None => "# audit: locked test none (--lockbox none) rows left out=0".to_string(),
     };

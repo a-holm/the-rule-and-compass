@@ -382,7 +382,7 @@ The build writes `"locked_test": {"start", "end", "start_date", "end_date", "sou
 
 One resolver (`rcsr::lockbox::resolve`) picks the range for search, `walkforward`, `ladder`, `ablation prepare` and `score`, `enrich` and `audit`:
 
-1. `--lockbox START,END` (`--locked-test` for `enrich`). With a stored declaration it must cover it (`START <= stored start`, `END >= stored end`); otherwise exit 2.
+1. `--lockbox START,END` (`--locked-test` for `enrich`). With a stored declaration it must cover it (`START <= stored start`, `END >= stored end`); otherwise exit 2. On undeclared data the flag adds to the protocol default: both ranges are guarded and the report says `"source":"flag+protocol_default"` with the default in `lockbox.also`. A flag that already covers the default reports `flag`. A derived sidecar (`enrich`, `ablation prepare`) declares the union when the two overlap, else the default.
 2. The range declared with the data: `<data>.lockbox.json`, `.schema.json`, `.manifest.json` or `.enrich.json`. Two files with different ranges exit 3 and the message names both; equal ranges are fine. A `locked_test` object that does not parse exits 3.
 3. The protocol default `2025-07-01..2026-07-01` for undeclared data, stdin and CSV files without a sidecar. Rows whose time column is not epoch seconds are not checked, so non-crypto data behaves as before.
 
