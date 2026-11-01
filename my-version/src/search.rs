@@ -1,3 +1,17 @@
+/// #500/#589: whether a non-finite prediction in the first rows decides the
+/// score. `Some(true)`: the first rows hold one, which makes the full score
+/// `+inf` for the plain metrics and for the P&L book. `Some(false)`: the prefix
+/// is finite and the full pass decides. `None`: the score does not follow the
+/// rule (implicit, weighted, multi-output), so the full pass always runs.
+fn nonfinite_prefix(tree: &Node, data: &EvalSample, cfg: &Config) -> Option<bool> {
+    let s = data.sample;
+    if s.is_empty()
+        || s.is_multi()
+        || !s.w.is_empty()
+        || (cfg.fitness.book().is_none() && cfg.metric.is_implicit())
+    {
+        return None;
+    }
 //! Island-model, multi-objective evolutionary search.
 //!
 //! A population of expression individuals evolves on separate islands, tracked
@@ -2259,6 +2273,10 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             native: batch.map(|b| b.native).unwrap_or(0),
             lowered: batch.map(|b| b.lowered).unwrap_or(0),
             fallbacks: batch.map(|b| b.fallbacks).unwrap_or(0),
+            nonfinite: batch.map(|b| b.nonfinite).unwrap_or(0),
+            nonfinite_full: batch.map(|b| b.nonfinite_full).unwrap_or(0),
+            nonfinite_cpu_finite: batch.map(|b| b.nonfinite_cpu_finite).unwrap_or(0),
+            nonfinite_seconds: batch.map(|b| b.nonfinite_seconds).unwrap_or(0.0),
             fit_host_s: self.fit_host_ms / 1000.0,
             fit_fallback_s: self.fit_fallback_ms / 1000.0,
             fit_gate_s: self.fit_gate_ms / 1000.0,
@@ -3674,30 +3692,35 @@ fn eval_error_and_descriptor(
 /// #500: rows probed for a non-finite prediction before a full re-score.
 const INF_PROBE_ROWS: usize = 2048;
 
-/// #500: whether the first rows already hold a non-finite prediction, which
-/// makes the full score `+inf` for the plain metrics. Shapes whose score does
-/// not follow that rule (implicit, weighted, multi-output, descriptor, P&L
-/// book) report `false` and take the full pass.
-fn prefix_is_non_finite(tree: &Node, data: &EvalSample, cfg: &Config) -> bool {
+/// #500/#589: whether a non-finite prediction in the first rows decides the
+/// score. `Some(true)`: the first rows hold one, which makes the full score
+/// `+inf` for the plain metrics and the P&L book. `Some(false)`: the prefix is
+/// finite and the full pass decides. `None`: the score does not follow that
+/// rule (implicit, weighted, multi-output), so the full pass always runs.
+fn nonfinite_prefix(tree: &Node, data: &EvalSample, cfg: &Config) -> Option<bool> {
     let s = data.sample;
     if s.is_empty()
         || s.is_multi()
         || !s.w.is_empty()
-        || cfg.metric.is_implicit()
-        || cfg.qd_bins > 0
-        || cfg.fitness.book().is_some()
+        || (cfg.fitness.book().is_none() && cfg.metric.is_implicit())
     {
-        return false;
+        return None;
     }
     let rows = s.x.len().min(INF_PROBE_ROWS);
     if let Some(cols) = &data.cols {
         if let Some(program) = crate::eval_soa::compile(tree) {
             let mut pred = vec![0.0; rows];
             crate::eval_soa::eval_batch(&program, cols, rows, &mut pred);
-            return pred.iter().any(|p| !p.is_finite());
+            return Some(pred.iter().any(|p| !p.is_finite()));
         }
     }
-    s.x.iter().take(rows).any(|row| !eval(tree, row).is_finite())
+    Some(s.x.iter().take(rows).any(|row| !eval(tree, row).is_finite()))
+}
+
+/// #500: the prefix decides the score and the run keeps no descriptor
+/// (`--qd-bins`) that a full re-score would have to rebuild.
+fn prefix_is_non_finite(tree: &Node, data: &EvalSample, cfg: &Config) -> bool {
+    cfg.qd_bins == 0 && nonfinite_prefix(tree, data, cfg) == Some(true)
 }
 
 /// #475: one candidate's prediction vector, owned.
@@ -5473,6 +5496,15 @@ pub struct GpuGenStats {
     pub fit_fallback_bounded: usize,
     /// #255: workers the fallback batch used.
     pub fit_fallback_workers: usize,
+    /// #589: device results with status 2 (non-finite output) in this generation.
+    pub nonfinite: usize,
+    /// #589: of those, the ones the f64 prefix probe did not settle, so a full
+    /// CPU pass ran.
+    pub nonfinite_full: usize,
+    /// #589: of the full passes, the ones whose CPU score is finite.
+    pub nonfinite_cpu_finite: usize,
+    /// #589: wall seconds of the full CPU passes.
+    pub nonfinite_seconds: f64,
 }
 
 /// #131: aggregate GPU usage for a run.
@@ -6028,6 +6060,12 @@ pub struct GpuSnapshot {
     pub native: usize,
     pub lowered: usize,
     pub fallbacks: usize,
+    /// #589: device status-2 results, the full CPU passes among them, those
+    /// finite on the CPU, and the wall seconds of the passes.
+    pub nonfinite: usize,
+    pub nonfinite_full: usize,
+    pub nonfinite_cpu_finite: usize,
+    pub nonfinite_seconds: f64,
     /// #256: whole fit stage wall (device call, CPU fallback, write-back).
     pub fit_host_s: f64,
     /// #256: exact CPU fit-fallback wall, a subset of `fit_host_s`.
@@ -6065,6 +6103,10 @@ impl GpuSnapshot {
             native: self.native,
             lowered: self.lowered,
             fallbacks: self.fallbacks,
+            nonfinite: self.nonfinite,
+            nonfinite_full: self.nonfinite_full,
+            nonfinite_cpu_finite: self.nonfinite_cpu_finite,
+            nonfinite_seconds: self.nonfinite_seconds,
             fit_host_s: (self.fit_host_s - earlier.fit_host_s).max(0.0),
             fit_fallback_s: (self.fit_fallback_s - earlier.fit_fallback_s).max(0.0),
             fit_gate_s: (self.fit_gate_s - earlier.fit_gate_s).max(0.0),
@@ -6208,6 +6250,10 @@ fn dev_generation(
         fallbacks: g.fallbacks,
         fallback_s: g.fallback_s,
         fallback_workers: g.fallback_workers,
+        nonfinite: g.nonfinite,
+        nonfinite_full: g.nonfinite_full,
+        nonfinite_cpu_finite: g.nonfinite_cpu_finite,
+        nonfinite_seconds: g.nonfinite_seconds,
     });
     // #256: the GPU fit stage runs inside the evaluator window (and, with
     // screening, inside the carried-refit and island windows). It is its own
@@ -6434,6 +6480,10 @@ fn run_postfix_search(
             fit_gate_seconds: 0.0,
             fit_fallback_bounded: 0,
             fit_fallback_workers: 0,
+            nonfinite: 0,
+            nonfinite_full: 0,
+            nonfinite_cpu_finite: 0,
+            nonfinite_seconds: 0.0,
         });
 
         // #256: a time-budget stop is not convergence and not terminal. The
@@ -10923,5 +10973,105 @@ mod tests {
             .map(|m| m.error)
             .fold(f64::INFINITY, f64::min);
         assert!(best <= 1e-18, "best error {}", best);
+    }
+
+    /// #589: `n` rows with `x0` negative except three rows at 4.9, and `x1`
+    /// the row number.
+    fn overflow_sample(n: usize) -> Sample {
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = if i + 3 >= n { 4.9 } else { -5.5 + 5.4 * i as f64 / (n - 4) as f64 };
+            x.push(vec![a, i as f64]);
+            y.push(0.003 * (0.1 * i as f64).sin());
+        }
+        Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None }
+    }
+
+    /// `1 / (x1 - row)`: non-finite on exactly one row.
+    fn pole_at(row: usize) -> Node {
+        node(Op::Div, vec![constant(1.0), node(Op::Sub, vec![input(1), constant(row as f64)])])
+    }
+
+    /// #589: the prefix probe also decides the long/flat book, which scores
+    /// `+inf` on any non-finite prediction, and gives no answer for weights.
+    #[test]
+    fn nonfinite_prefix_covers_the_long_pnl_book() {
+        let s = overflow_sample(3_000);
+        let cfg = Config {
+            fitness: Fitness::LongPnl(pnl_book(&s)),
+            ..Config::default()
+        };
+        let data = EvalSample::new(&s, &cfg);
+        let early = pole_at(10);
+        let late = pole_at(2_500);
+        assert_eq!(nonfinite_prefix(&early, &data, &cfg), Some(true));
+        assert_eq!(nonfinite_prefix(&late, &data, &cfg), Some(false));
+        assert_eq!(score_tree(&early, &data, &cfg), f64::INFINITY);
+        assert_eq!(score_tree(&late, &data, &cfg), f64::INFINITY);
+        let mut weighted = overflow_sample(3_000);
+        weighted.w = vec![1.0; weighted.y.len()];
+        let wdata = EvalSample::new(&weighted, &cfg);
+        assert_eq!(nonfinite_prefix(&early, &wdata, &cfg), None);
+    }
+
+    /// #589: the device runs the program in f32. Every status-2 `+inf` is the
+    /// exact CPU score after `GpuSearch::score`, before promotion reads it.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_nonfinite_is_checked_before_promotion() {
+        if !crate::gpu::probe().available() {
+            eprintln!("skipping GPU test: no usable CUDA device");
+            return;
+        }
+        let s = overflow_sample(300);
+        let cfg = Config {
+            metric: Metric::Squared,
+            gpu: true,
+            dispatch: crate::dispatch::DispatchMode::Device,
+            ..Config::default()
+        };
+        let view = EvalSample::new(&s, &cfg);
+        let x0 = || input(0);
+        let trees = vec![
+            node(Op::Sinh, vec![node(Op::Exp, vec![x0()])]),
+            node(Op::Cos, vec![node(Op::Exp, vec![node(Op::Exp, vec![x0()])])]),
+            node(Op::Ln, vec![node(Op::Logistic, vec![node(Op::Cube, vec![x0()])])]),
+            node(Op::Ln, vec![x0()]),
+        ];
+        let mut island: Vec<Ind> = trees
+            .iter()
+            .map(|t| {
+                let mut ind = Ind::evaluated(t.clone(), &view, &cfg);
+                ind.error = f64::NAN;
+                ind
+            })
+            .collect();
+        let mut g = GpuSearch::new(
+            &s,
+            false,
+            crate::fit::DeviceLoss::Squared,
+            true,
+            None,
+            Some(crate::metrics::ScoreObjective::Squared),
+            false,
+            std::time::Instant::now(),
+            &[],
+            None,
+            None,
+        )
+        .expect("a device search");
+        let mut dispatcher = crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::default())
+            .with_mode(crate::dispatch::DispatchMode::Device);
+        let mut islands = vec![std::mem::take(&mut island)];
+        g.score(&mut islands, &s, &cfg, 0, &mut dispatcher).expect("device batch");
+        for (k, ind) in islands[0].iter().enumerate() {
+            let exact = score_tree(&ind.tree, &view, &cfg);
+            assert_eq!(ind.error.to_bits(), exact.to_bits(), "tree {k}");
+            assert_eq!(ind.error.is_finite(), k < 3, "tree {k}: {}", ind.error);
+        }
+        let stats = &g.stats[&0];
+        assert!(stats.nonfinite >= 3, "{:?}", stats);
+        assert!(stats.nonfinite_cpu_finite >= 3, "{:?}", stats);
     }
 }
