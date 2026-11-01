@@ -120,7 +120,7 @@ fn hard_op_plan_words_carry_the_scoring_opcodes() {
             _ => vec![input(0), constant(0.5)],
         };
         let t = scaled(1.0, 0.0, op, args);
-        let plan = fit::gpu_fit_plan(&t).unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
+        let plan = fit::gpu_fit_plan(&t).unwrap_or_else(|| panic!("{op:?} has no fit opcode"));
         assert!(plan.words.chunks(4).any(|r| r[0] == code), "{op:?} is opcode {code}");
         assert_eq!(code, crate::gpu::postfix_opcode(op).expect("a scoring opcode").0);
     }
