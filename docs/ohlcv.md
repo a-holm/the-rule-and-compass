@@ -961,7 +961,7 @@ partitioned into disjoint intervals on that thread:
 
 `gpu.kernel_s`, `gpu.h2d_s` and `gpu.d2h_s` are device-busy measures. They
 overlap the host timeline and are not summed into the partition. The text
-report prints the partition on the `# enrich: feature_parts` line.
+report prints the partition on the `# enrich: feature_parts` line. The JSON `ledger` object is the #284 phase ledger of the run (`io_s`, `features_s`, `host_other_s`, device-busy union); see `docs/benchmarks.md`.
 
 Paired A/B on the 3,874,994-row store, `--features returns --gpu auto
 --dry-run` (same input, same 118 dispatched columns, alternating order, two runs

@@ -56,8 +56,8 @@ impl Stage {
     ];
 
     /// Stages a search run has no work for by design. Enrichment and P&L are
-    /// separate commands; their ledger value inside a search run is zero by
-    /// construction, not by omission.
+    /// separate commands with their own ledger ([`RunLedger::phase_json`]); their
+    /// value inside a search run is zero by construction, not by omission.
     pub fn structurally_zero_in_search(self) -> bool {
         matches!(self, Stage::Features | Stage::Pnl)
     }
@@ -585,6 +585,62 @@ impl RunLedger {
             self.admitted as f64,
             "fraction",
             "admitted_fits",
+        )
+    }
+
+    /// #284: the ledger of a command that is not a search (`enrich`,
+    /// `walkforward`, `ladder`). Same keys as the search ledger's run-clock
+    /// block; `zero_stages` names the stages the command has no work for by
+    /// design.
+    pub fn phase_json(&self, command: &str, zero_stages: &[Stage]) -> String {
+        fn num(v: f64) -> String {
+            if v.is_finite() {
+                format!("{v}")
+            } else {
+                "null".to_string()
+            }
+        }
+        fn quote(s: &str) -> String {
+            format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+        }
+        let ratio = |r: Ratio| {
+            format!(
+                "{{\"value\":{},\"numerator\":{},\"denominator\":{},\"units\":{},\"scope\":{}}}",
+                num(r.value),
+                num(r.numerator),
+                num(r.denominator),
+                quote(r.units),
+                quote(r.scope)
+            )
+        };
+        let stages = Stage::ALL
+            .iter()
+            .map(|s| format!("{}:{}", quote(&format!("{}_s", s.label())), num(self.stage_s(*s))))
+            .collect::<Vec<_>>()
+            .join(",");
+        let zero = zero_stages
+            .iter()
+            .map(|s| quote(s.label()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let (by_event, by_host) = self.interval_counts();
+        format!(
+            "{{\"scope\":\"run\",\"command\":{},\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"duty_run\":{}}}",
+            quote(command),
+            num(self.wall_s()),
+            stages,
+            num(self.stage_sum_s()),
+            num(self.unaccounted_s()),
+            ratio(self.closure_residual()),
+            num(self.device_busy_s()),
+            num(self.device_busy_sum_s()),
+            num(self.device_overlap_s()),
+            self.intervals().len(),
+            quote(self.interval_basis()),
+            by_event,
+            by_host,
+            zero,
+            ratio(self.duty_run())
         )
     }
 
