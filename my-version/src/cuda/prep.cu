@@ -920,7 +920,7 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
         c->d_s_traded, c->d_s_chain, c->d_s_seg);
 
     rc_prep_run_flags<<<nb, threads>>>(c->d_s_time, c->d_s_seg, n, c->d_run_flags);
-    err = rc_cub_status(cub::DeviceScan::ExclusiveSum(
+    err = RC_CUB(g_force_cub_fail, cub::DeviceScan::ExclusiveSum(
         c->d_scan_tmp, c->scan_tmp_bytes, c->d_run_flags, c->d_run_of, n));
     if (err != cudaSuccess) {
         c->last.failed = 1;

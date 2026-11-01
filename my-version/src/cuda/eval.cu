@@ -5342,7 +5342,7 @@ typedef struct RcRankWork {
     size_t temp_bytes;
 } RcRankWork;
 
-/* Test hook: the next guarded CUB call of the rank sweep is refused before it
+/* Test hook: a counter of k refuses the k-th guarded CUB call of the rank sweep before it
  * reaches CUB and reports a failure. */
 static thread_local int g_force_rank_cub_fail = 0;
 
@@ -6283,7 +6283,7 @@ float rc_max_scan_batch(void *ctx,
     return ms;
 }
 
-/* Test hook: the next guarded CUB call of an order-statistic sort is refused
+/* Test hook: a counter of k refuses the k-th guarded CUB call of an order-statistic sort
  * before it reaches CUB and reports a failure. */
 static thread_local int g_force_os_cub_fail = 0;
 

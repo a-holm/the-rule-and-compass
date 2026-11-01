@@ -1972,7 +1972,7 @@ int rc_enrich_xs_prepare(void *v, const unsigned int *sym_key,
     /* Pass 2: stable by time. Equal times retain the symbol/row order. */
     k_keys_from_time<<<blocks, threads>>>(c->d_times, c->d_xs_order_tmp,
                                           c->d_xs_keys, c->n);
-    cub_err = rc_cub_status(cub::DeviceRadixSort::SortPairs(
+    cub_err = RC_CUB(g_force_cub_fail, cub::DeviceRadixSort::SortPairs(
         c->d_xs_temp, temp_bytes, c->d_xs_keys, c->d_xs_keys_out,
         c->d_xs_order_tmp, c->d_xs_order, c->n));
     if (cub_err != cudaSuccess) {
@@ -1987,7 +1987,7 @@ int rc_enrich_xs_prepare(void *v, const unsigned int *sym_key,
     /* Group boundaries, ids and starts from the time-ordered permutation. */
     k_group_boundary<<<blocks, threads>>>(c->d_times, c->d_xs_order,
                                           c->d_xs_rows_out, c->n);
-    cub_err = rc_cub_status(cub::DeviceScan::InclusiveSum(
+    cub_err = RC_CUB(g_force_cub_fail, cub::DeviceScan::InclusiveSum(
         c->d_xs_temp, temp_bytes, c->d_xs_rows_out, c->d_xs_gid, c->n));
     if (cub_err != cudaSuccess) {
         cudaEventDestroy(ev0);
