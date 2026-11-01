@@ -312,3 +312,47 @@ fn front_observer_does_not_change_the_postfix_archive() {
     assert_eq!(a.archive.hash(), b.archive.hash());
     assert_eq!(calls.load(Ordering::SeqCst), b.generations);
 }
+
+/// #466: the prune runs after the device loop on the CPU; the pruned front
+/// keeps every unpruned member's error at no more cost, and every reported
+/// error is the exact CPU metric of the stored tree.
+#[test]
+fn prune_keeps_the_device_front_dominated() {
+    if !rcsr::backend::probe().available() {
+        return;
+    }
+    let data = sample(160);
+    let off = Config {
+        prune: false,
+        ..cfg(VariationMode::Postfix, 1, 4096, 3)
+    };
+    let on = Config {
+        prune: true,
+        ..off.clone()
+    };
+    let base = run(&off, &data, &data);
+    let pruned = run(&on, &data, &data);
+    assert_eq!(base.prune, search::PruneReport::default());
+    assert!(pruned.prune.fits > 0);
+    for b in &base.archive.items {
+        let tol = 1e-6 * (1.0 + b.error.abs());
+        assert!(
+            pruned
+                .archive
+                .items
+                .iter()
+                .any(|p| p.cost <= b.cost && p.error <= b.error + tol),
+            "no pruned member covers cost {} error {}",
+            b.cost,
+            b.error
+        );
+    }
+    for p in &pruned.archive.items {
+        assert_eq!(
+            p.error.to_bits(),
+            search::eval_error(&p.tree, &data, on.metric).to_bits()
+        );
+    }
+    let again = run(&on, &data, &data);
+    assert_eq!(describe(&pruned), describe(&again));
+}
