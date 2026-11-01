@@ -497,6 +497,9 @@ fn tiny_config(metric: Metric, seed: u32) -> Config {
         seed,
         metric,
         ops: vec![Op::Add, Op::Sub, Op::Mul, Op::Tanh, Op::Neg, Op::Square],
+        // Under compute-sanitizer the cost model would keep every stage on the
+        // CPU and no kernel would run.
+        dispatch: crate::dispatch::DispatchMode::Device,
         ..Default::default()
     }
 }
