@@ -475,7 +475,7 @@ Recorded on the 8-thread i7-3770K with `--features cuda` for the GPU rows, with 
 | `hard`, noise 0, seeds 1-3, GPU, default fit arm | `rcsr-bench --suite hard --noise 0 --seeds 1-3 --gpu --fit-strategy default --ndjson` | 60 | 50/60 [0.720, 0.907] | 19/60 (31.7 %) [0.213, 0.442] | 0.14 s (n = 50) | 62.3 |
 | `signal`, seeds 1-2, CPU | `rcsr-bench --suite signal --seeds 1-2 --cpu --ndjson` | 6 | `signal_recovered` 6/6 | | 10.0 s (n = 6) | 406.7 |
 
-The `hard` baseline `oracle_recovered` rate at noise 0 is 38.3 %, inside the 20 % to 80 % target band, so the default budget (150 generations, 2 islands, 200 individuals) stays. Per problem, the number of seeds (of 3) whose front holds the oracle-grade member on CPU: `damped_freq`, `freq_sine`, `korns1`, `nguyen9`, `nguyen10` 3; `feynman_i12_11`, `keijzer15`, `korns4` 2; `nguyen6`, `nguyen12` 1; the other nine problems 0. The `signal` runs select models with `signal_r2` between 0.90 and 1.00 (cost 7 to 24); `distractors_used` is 0 in four of six runs, 1 in one and 3 in one, so it separates runs where `signal_recovered` does not.
+The `hard` baseline `oracle_recovered` rate at noise 0 is 38.3 %, inside the 20 % to 80 % target band, so the default budget (150 generations, 2 islands, 200 individuals) stays. Per problem, the number of seeds (of 3) whose front holds the oracle-grade member on CPU: `damped_freq`, `freq_sine`, `korns1`, `nguyen9`, `nguyen10` 3; `feynman_i12_11`, `keijzer15`, `korns4` 2; `nguyen6`, `nguyen12` 1; the other nine problems 0. The `signal` runs select models with `signal_r2` between 0.89 and 1.00 (cost 7 to 24); `distractors_used` is 0 in four of six runs, 1 in one and 3 in one, so it separates runs where `signal_recovered` does not.
 
 Paired comparison of the CPU baseline with the same seeds at `--generations 60` (a deliberately weaker treatment, to exercise the tool):
 
@@ -490,7 +490,7 @@ median paired hit_evals ratio treat/base = 1.0000 over 46 pairs
 
 The `hit_evals` ratio of exactly 1 shows that the shorter run follows the same trajectory as the first 60 generations of the longer one. Comparing the CPU baseline with the GPU default-arm run: `oracle_recovered` b = 6, c = 2, p = 0.289; `recovered` b = 3, c = 0, p = 0.25; median paired `hit_s` ratio 0.33.
 
-**Full baselines.** The recorded rows are small seed sets. The full baselines, one invocation per chunk so that each fits a 10-minute lock hold (measured: `hard` about 70 to 120 s per seed, `known-truth` about 240 to 450 s per seed, `signal` about 200 s per seed):
+**Full baselines.** The recorded rows are small seed sets. The full baselines, one invocation per chunk so that each fits a 10-minute lock hold (measured: `hard` about 70 to 90 s per seed, `known-truth` about 240 to 450 s per seed, `signal` about 200 s per seed):
 
 ```sh
 # known-truth, seeds 1-5, CPU: one seed per invocation
