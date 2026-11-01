@@ -613,3 +613,21 @@ fn candidates_are_selected_on_validation_never_on_test() {
     let e = walkforward::run_table(&t, &s, "test").unwrap_err();
     assert!(e.contains("validation"), "{}", e);
 }
+
+#[test]
+fn final_exit_is_charged_per_group_when_rows_are_dropped() {
+    // Group 1 has a NaN-target row first, group 2 is the single last row.
+    // Both groups end held, so both pay an entry and a final exit.
+    let time = [0.0, 1.0, 2.0, 3.0, 0.0];
+    let group = [1u64, 1, 1, 1, 2];
+    let target = [f64::NAN, 0.01, 0.02, 0.03, 0.04];
+    let scores = [1.0; 5];
+    let mut previous = std::collections::HashMap::new();
+    let t = walkforward::reference_cell(&time, &group, &target, &scores, 0.0, 0.001, &mut previous);
+    assert_eq!(t.rows, 4);
+    assert_eq!(t.final_exits, 2);
+    assert_eq!(t.entries, 2);
+    assert!((t.gross - 0.10).abs() < 1e-15);
+    assert!((t.cost - 0.004).abs() < 1e-15);
+    assert!((t.net - 0.096).abs() < 1e-15);
+}

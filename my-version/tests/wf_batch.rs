@@ -363,7 +363,7 @@ fn non_finite_score_cells_use_the_scalar_evaluator() {
 }
 
 #[test]
-fn dropped_target_rows_are_laid_out_once_and_priced_like_the_filtered_series() {
+fn dropped_target_rows_are_priced_like_the_evaluator() {
     let mut windows = fixture_windows(2, 6, 50);
     for w in windows.iter_mut() {
         for i in (0..w.target.len()).step_by(11) {
@@ -375,24 +375,19 @@ fn dropped_target_rows_are_laid_out_once_and_priced_like_the_filtered_series() {
     let thr = thresholds(3, 2);
     for c in 0..3 {
         for (w, win) in windows.iter().enumerate() {
-            let mut keep: Vec<usize> = (0..win.time.len()).filter(|&i| win.target[i].is_finite()).collect();
-            keep.sort_by(|&a, &b| {
-                win.group[a]
-                    .cmp(&win.group[b])
-                    .then(win.time[a].total_cmp(&win.time[b]))
-                    .then(a.cmp(&b))
-            });
-            let s: Vec<f64> = keep.iter().map(|&i| score(c, w, i)).collect();
-            let rt: Vec<f64> = keep.iter().map(|&i| win.target[i]).collect();
-            let g: Vec<u64> = keep.iter().map(|&i| win.group[i]).collect();
-            let params = PnlParams {
-                threshold: thr[c][w],
-                per_side_bps: COST_SIDE * 10_000.0,
-                ..PnlParams::default()
-            };
-            let want = trading_gpu::reduce(&s, &rt, &g, &params).unwrap().strategy;
+            let s: Vec<f64> = (0..win.time.len()).map(|i| score(c, w, i)).collect();
+            let want = walkforward::reference_cell(
+                &win.time,
+                &win.group,
+                &win.target,
+                &s,
+                thr[c][w],
+                COST_SIDE,
+                &mut HashMap::new(),
+            );
             assert_totals_close(&r.cell(c, w).totals, &want, &format!("c{c} w{w}"));
-            assert_eq!(r.cell(c, w).totals.rows, keep.len() as u64);
+            let kept = win.target.iter().filter(|t| t.is_finite()).count();
+            assert_eq!(r.cell(c, w).totals.rows, kept as u64);
         }
     }
 }

@@ -1224,10 +1224,10 @@ constants), `too_few_rows`, `too_many_constants` (`p > 20`),
 `rank_declined` (#230), `median_declined` (#226), `interquartile_declined`
 (#232) and `maximum_declined` (#227) causes (the device declined the call and
 the exact CPU arm took over). `--fit-report` and the `gpu.fit` JSON object count
-`screened`/`attempts`/`gpu`/`fallback`, the per-cause map, the
+`screened` (scored with seed constants before admission), `admitted_wide` (candidates with constants fitted without a screening score under wide admission), `attempts`/`gpu`/`fallback`, the per-cause map, the
 `status_by_label` map of finite device answers, `refits`, the kernel `seconds`
 and the whole fit stage's `host_seconds`; the run manifest records the same
-accepted/fallback/refit totals.
+accepted/fallback/refit totals. Ledger invariant: `screened + admitted_wide >= attempts`. Below the wide threshold `admitted_wide` is 0 and every attempt was screened; under wide admission only constant-free candidates are screened and every other pending candidate is counted in `admitted_wide`.
 
 **Parallel fallback batch and its bound (#255).** The exact CPU refits are
 independent per candidate and are therefore split across scoped workers with
