@@ -353,6 +353,7 @@ fn search_config(metric: Metric) -> Config {
         fit_strategy: FitStrategy::Exact,
         metric,
         gpu: true,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
         gpu_notes: false,
         ..Default::default()
     }

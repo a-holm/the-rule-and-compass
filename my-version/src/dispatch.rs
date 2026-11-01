@@ -181,6 +181,33 @@ impl Route {
     }
 }
 
+/// How the dispatcher resolves the timing comparison.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DispatchMode {
+    /// The cost model decides.
+    #[default]
+    Auto,
+    /// Every stage that is not refused or CPU by contract takes the device.
+    Device,
+}
+
+impl DispatchMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            DispatchMode::Auto => "auto",
+            DispatchMode::Device => "device",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<DispatchMode> {
+        match s {
+            "auto" => Some(DispatchMode::Auto),
+            "device" => Some(DispatchMode::Device),
+            _ => None,
+        }
+    }
+}
+
 /// Why a stage got its route. Labels are stable JSON/ledger keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
@@ -216,6 +243,8 @@ pub enum Reason {
     Exactness,
     /// The calibration is missing or degenerate.
     NoCalibration,
+    /// `--dispatch device` skipped the timing comparison.
+    Forced,
 }
 
 impl Reason {
@@ -237,6 +266,7 @@ impl Reason {
             Reason::DeviceMemory => "device_memory",
             Reason::Exactness => "exactness",
             Reason::NoCalibration => "no_calibration",
+            Reason::Forced => "forced",
         }
     }
 
@@ -838,6 +868,24 @@ pub struct Ledger {
 }
 
 impl Ledger {
+    /// True when the cost model, not a refusal, kept every movable stage on
+    /// the CPU: at least one stage lost the timing comparison (or had no
+    /// usable calibration) and none ran on the device.
+    pub fn cost_model_kept_cpu(&self) -> bool {
+        let movable = [Stage::Eval, Stage::Fit];
+        let on_device = movable.iter().any(|s| {
+            self.stages
+                .get(s)
+                .map_or(false, |e| e.route != Route::Cpu)
+        });
+        let by_cost = movable.iter().any(|s| {
+            self.stages.get(s).map_or(false, |e| {
+                matches!(e.reason, Reason::CostCpu | Reason::NoCalibration)
+            })
+        });
+        by_cost && !on_device
+    }
+
     pub fn entry(&self, stage: Stage) -> Option<&StageLedger> {
         self.stages.get(&stage)
     }
@@ -858,6 +906,7 @@ pub struct Dispatcher {
     calibration: Calibration,
     last: BTreeMap<Stage, Route>,
     ledger: Ledger,
+    mode: DispatchMode,
 }
 
 impl Dispatcher {
@@ -866,7 +915,13 @@ impl Dispatcher {
             calibration,
             last: BTreeMap::new(),
             ledger: Ledger::default(),
+            mode: DispatchMode::Auto,
         }
+    }
+
+    pub fn with_mode(mut self, mode: DispatchMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     pub fn calibration(&self) -> &Calibration {
@@ -887,7 +942,7 @@ impl Dispatcher {
             (Route::Cpu, Reason::TooFewRows)
         } else if stage.cpu_by_contract() {
             (Route::Cpu, Reason::CpuContract)
-        } else if !self.calibration.is_usable() {
+        } else if self.mode == DispatchMode::Auto && !self.calibration.is_usable() {
             (Route::Cpu, Reason::NoCalibration)
         } else if let Some(f) = workload.split_fraction {
             if f > 0.0 && f < 1.0 {
@@ -937,6 +992,9 @@ impl Dispatcher {
     }
 
     fn cost_route(&self, stage: Stage, cost: &Cost) -> (Route, Reason) {
+        if self.mode == DispatchMode::Device {
+            return (Route::Device, Reason::Forced);
+        }
         if !(cost.cpu_s.is_finite() && cost.cpu_s > 0.0) {
             return (Route::Cpu, Reason::NoCalibration);
         }
@@ -1477,6 +1535,56 @@ mod tests {
             }
         }
         assert!(device > 0 && device < total, "grid must contain both sides: {}/{}", device, total);
+    }
+
+    #[test]
+    fn forced_device_skips_timing_but_keeps_refusals() {
+        let slow_device = forced(1.0e-6, 1.0);
+        let mut auto = Dispatcher::new(cal());
+        assert_eq!(auto.plan(Stage::Eval, &slow_device).route, Route::Cpu);
+        let mut d = Dispatcher::new(cal()).with_mode(DispatchMode::Device);
+        for stage in [Stage::Eval, Stage::Fit] {
+            let decision = d.plan(stage, &slow_device);
+            assert_eq!(decision.route, Route::Device);
+            assert_eq!(decision.reason, Reason::Forced);
+        }
+        let unusable = Calibration {
+            r_eval: 0.0,
+            ..cal()
+        };
+        let mut d_unusable = Dispatcher::new(unusable).with_mode(DispatchMode::Device);
+        assert_eq!(d_unusable.plan(Stage::Eval, &slow_device).reason, Reason::Forced);
+        for cause in FallbackCause::ALL {
+            let decision = d.plan(Stage::Eval, &slow_device.with_refusal(cause));
+            assert_eq!(decision.route, Route::Cpu, "{:?}", cause);
+            assert_eq!(decision.reason, cause.reason());
+        }
+        let few = d.plan(Stage::Eval, &slow_device.with_min_rows(2));
+        assert_eq!((few.route, few.reason), (Route::Cpu, Reason::TooFewRows));
+        for stage in Stage::ALL.iter().copied().filter(|s| s.cpu_by_contract()) {
+            let decision = d.plan(stage, &Workload::contract());
+            assert_eq!((decision.route, decision.reason), (Route::Cpu, Reason::CpuContract));
+        }
+        let mut split = slow_device;
+        split.split_fraction = Some(0.5);
+        assert_eq!(d.plan(Stage::Eval, &split).route, Route::Split);
+        assert_eq!(Reason::Forced.name(), "forced");
+        assert!(!Reason::Forced.is_cause());
+    }
+
+    #[test]
+    fn cost_model_keeping_every_stage_on_the_cpu_is_reported() {
+        let mut d = Dispatcher::new(cal());
+        let eval = d.plan(Stage::Eval, &forced(1.0e-6, 1.0));
+        d.record_plan(eval, 1, 0);
+        assert!(d.snapshot().ledger.cost_model_kept_cpu());
+        let fit = d.plan(Stage::Fit, &forced(1.0, 1.0e-6));
+        d.record_plan(fit, 1, 0);
+        assert!(!d.snapshot().ledger.cost_model_kept_cpu());
+        let mut refused = Dispatcher::new(cal());
+        let eval = refused.plan(Stage::Eval, &forced(1.0, 1.0).with_refusal(FallbackCause::NoDevice));
+        refused.record_plan(eval, 1, 0);
+        assert!(!refused.snapshot().ledger.cost_model_kept_cpu());
     }
 }
 

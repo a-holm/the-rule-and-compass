@@ -1637,6 +1637,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         gpu: false,
         gpu_notes: true,
         gpu_memory: None,
+        dispatch: crate::dispatch::DispatchMode::Auto,
         // #119: scheduling only, not saved search state.
         pipeline_depth: 2,
         variation,

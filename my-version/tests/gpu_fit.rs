@@ -44,6 +44,7 @@ fn gpu_config(seed: u32) -> Config {
         fit_strategy: FitStrategy::Gpu,
         metric: Metric::Squared,
         gpu: true,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
         ..Default::default()
     }
 }
