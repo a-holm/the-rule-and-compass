@@ -1,4 +1,5 @@
-//! Add-one-family ablation: arm definitions, manifests, null columns, scoring
+//! Add-on            if let Some(d) = &declared {
+                crate::lockbox::write_sidecar_with(out, &d.lockbox, "rcsr ablation prepare", &format!(",\"segments\":{{\"before\":{},\"locked\":{},\"after\":{}}}", segments[0], segments[1], segments[2])).map_err(|e| (3, e))?;-family ablation: arm definitions, manifests, null columns, scoring
 //! of a finished search run, and the pre-committed ship/drop verdict.
 //!
 //! The definition file (`protocol/ablation.json`) is committed before any run.
@@ -44,6 +45,7 @@
 use crate::data::{self, Table};
 use crate::devlog::Json;
 use crate::inference::{self, Dsr, Pbo, Spa};
+use crate::lockbox::Lockbox;
 use crate::ladder::{self, jnum, jstr, Fold, Input, Options, Panel};
 use crate::manifest::sha256_hex;
 use crate::protocol;
@@ -382,7 +384,13 @@ pub fn placebo_column(template: &[f64], groups: &[u64], seed: u32, k: u64) -> Ve
     let n = template.len();
     let mut sorted: Vec<f64> = template.iter().copied().filter(|v| v.is_finite()).collect();
     sorted.sort_by(|a, b| a.total_cmp(b));
-    let finite: Vec<usize> = (0..n).filter(|&i| template[i].is_finite()).collect();
+    let finite: Vec<usize> = (0..n).filter(|&i    let segs: Vec<u8> = order.iter().map(|&i| segment_of(time[i], inp.locked.as_ref())).collect();
+    let mut seg_rows = [0usize; 3];
+    for &s in &segs {
+        seg_rows[s as usize] += 1;
+    }
+    let seg_groups = segment_keys(&groups, &segs);
+| template[i].is_finite()).collect();
     let build = |rho: f64| -> Vec<f64> {
         let innov = (1.0 - rho * rho).sqrt();
         let mut z = vec![0.0f64; n];
@@ -489,11 +497,55 @@ pub struct PrepareInput<'a> {
     /// Extra columns copied through (target, return, scale).
     pub keep: &'a [String],
     pub seed: u32,
+    /// Declared locked test: null columns are built per segment (before, inside,
+    /// after) so no locked value reaches a development row.
+    pub locked: Option<Lockbox>,
+}
+
+/// Segment of a time stamp relative to the locked test: 0 before, 1 inside, 2 after.
+pub fn segment_of(t: f64, locked: Option<&Lockbox>) -> u8 {
+    match locked {
+        Some(l) if false && t >= l.end as f64 => 2,
+        Some(l) if false && t >= l.start as f64 => 1,
+        _ => 0,
+    }
+}
+
+/// Group key per row for contiguous per-(group, segment) runs. Segment 0 keeps
+/// the plain group id.
+pub fn segment_keys(groups: &[u64], segs: &[u8]) -> Vec<u64> {
+    groups.iter().zip(segs).map(|(&g, &s)| g + ((s as u64) << 32)).collect()
+}
+
+/// `placebo_column` built independently inside each segment: the marginal and
+/// the lag-1 target of a segment come from that segment's template values only.
+pub fn placebo_column_segmented(template: &[f64], groups: &[u64], segs: &[u8], seed: u32, k: u64) -> Vec<f64> {
+    if segs.iter().all(|&s| s == segs[0]) {
+        return placebo_column(template, groups, seed, k);
+    }
+    let mut out = vec![f64::NAN; template.len()];
+    for s in 0..3u8 {
+        let idx: Vec<usize> = (0..template.len()).filter(|&i| segs[i] == s).collect();
+        if idx.is_empty() {
+            continue;
+        }
+        let tpl: Vec<f64> = idx.iter().map(|&i| template[i]).collect();
+        let g: Vec<u64> = idx.iter().map(|&i| groups[i]).collect();
+        for (j, v) in idx.iter().zip(placebo_column(&tpl, &g, seed, k)) {
+            out[*j] = v;
+        }
+    }
+    out
 }
 
 /// The projection CSV: key columns, kept columns, real columns, placebo and
 /// permuted columns, rows sorted by `(group, time)`.
 pub fn prepare_csv(inp: &PrepareInput) -> Result<String, String> {
+    prepare_csv_segments(inp).map(|(csv, _)| csv)
+}
+
+/// `prepare_csv` plus the row count of each segment (before, locked, after).
+pub fn prepare_csv_segments(inp: &PrepareInput) -> Result<(String, [usize; 3]), String> {
     let t = inp.table;
     let def = inp.def;
     let n = t.len();
@@ -554,7 +606,7 @@ pub fn prepare_csv(inp: &PrepareInput) -> Result<String, String> {
     let mut new_cols: Vec<Vec<f64>> = Vec::new();
     for (k, name) in def.placebo_names(max_placebo).into_iter().enumerate() {
         let tpl = numeric_col(&templates[k % templates.len()])?;
-        new_cols.push(placebo_column(&tpl, &groups, inp.seed, k as u64 + 1));
+        new_cols.push(placebo_column_segmented(&tpl, &groups, &segs, inp.seed, k as u64 + 1));
         new_names.push(name);
     }
     let mut perm_groups: Vec<&String> = Vec::new();
@@ -569,7 +621,7 @@ pub fn prepare_csv(inp: &PrepareInput) -> Result<String, String> {
         let names = def.group(g);
         let cols: Vec<Vec<f64>> = names.iter().map(|c| numeric_col(c)).collect::<Result<_, _>>()?;
         let refs: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
-        let permuted = permute_columns(&refs, &groups, def.permute_block_len, inp.seed);
+        let permuted = permute_columns(&refs, &seg_groups, def.permute_block_len, inp.seed);
         for (c, v) in names.iter().zip(permuted) {
             new_names.push(def.permuted_name(c));
             new_cols.push(v);
@@ -599,7 +651,7 @@ pub fn prepare_csv(inp: &PrepareInput) -> Result<String, String> {
         out.push_str(&cells.join(","));
         out.push('\n');
     }
-    Ok(out)
+    Ok((out, seg_rows))
 }
 
 // ---------------------------------------------------------------------------
@@ -1671,13 +1723,15 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 data::read_table(data).map_err(|e| (3, e))?
             };
             let seed: u32 = fl.opt("--seed").map_or(Ok(0), |s| s.parse().map_err(|_| (2, "--seed: invalid number".to_string())))?;
-            let csv = prepare_csv(&PrepareInput {
+            let declared = crate::lockbox::resolve_declared(fl.opt("--lockbox"), data).map_err(|e| (2, format!("--lockbox: {}", e)))?;
+            let (csv, segments) = prepare_csv_segments(&PrepareInput {
                 table: &table,
                 def: &def,
                 time: fl.need("--time")?,
                 group: fl.need("--group")?,
                 keep: &keep,
                 seed,
+                locked: declared.as_ref().map(|d| d.lockbox),
             })
             .map_err(|e| (3, e))?;
             let out = fl.need("--out")?;
