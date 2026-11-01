@@ -3227,7 +3227,7 @@ fn label_report_is_identical_for_stores_that_differ_only_inside_the_locked_range
 /// Feature entries of the report with the whole-column hashes removed.
 fn feature_statistics(json: &str) -> String {
     let start = json.find("\"features\":[").expect("features array");
-    let end = json[start..].find("],\"long_labels\"").expect("end of features") + start;
+    let end = json[start..].find("],\n  \"long_labels\"").expect("end of features") + start;
     let mut out = String::new();
     let mut rest = &json[start..end];
     while let Some(i) = rest.find("\"sha256\":\"") {
@@ -3281,7 +3281,7 @@ fn feature_report_leaves_out_the_purge_window_of_label_columns_only() {
     let json = feature_report("feat-purge", false, Some(range));
     let left = |name: &str| -> usize {
         let at = json.find(&format!("{{\"name\":\"{}\"", name)).unwrap_or_else(|| panic!("{name}"));
-        let tail = &json[at..];
+        let tail = &json[at..][..json[at..].find('}').unwrap()];
         let k = tail.find("\"rows_left_out\":").unwrap() + 16;
         tail[k..].split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap()
     };
