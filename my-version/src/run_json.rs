@@ -23,6 +23,8 @@ pub struct RunFile {
     pub threshold: Option<f64>,
     /// `objective.spec.per_side_bps`.
     pub per_side_bps: Option<f64>,
+    /// `objective.spec.position`: the position map the search priced.
+    pub position: crate::trading::PositionMap,
     /// `split.train_time`: `[first, last]` raw time keys.
     pub train_time: Option<(f64, f64)>,
     /// `split.validation_time`: `[first, last]`, absent without a validation slice.
@@ -41,6 +43,14 @@ fn pair(j: Option<&Json>) -> Option<(f64, f64)> {
     match j? {
         Json::Arr(a) if a.len() == 2 => Some((a[0].as_f64()?, a[1].as_f64()?)),
         _ => None,
+    }
+}
+
+/// `position` of an `objective.spec` object; a run without it priced the threshold rule.
+pub(crate) fn position_of(objective_spec: Option<&Json>) -> crate::trading::PositionMap {
+    match objective_spec.and_then(|s| s.get("position")).and_then(Json::as_str) {
+        Some("top_tercile") => crate::trading::PositionMap::TopTercile,
+        _ => crate::trading::PositionMap::Threshold,
     }
 }
 
@@ -87,6 +97,7 @@ impl RunFile {
                 .map(str::to_string),
             threshold: objective_spec.and_then(|s| s.get("threshold")).and_then(Json::as_f64),
             per_side_bps: objective_spec.and_then(|s| s.get("per_side_bps")).and_then(Json::as_f64),
+            position: position_of(objective_spec),
             train_time: pair(split.and_then(|s| s.get("train_time"))),
             validation_time: pair(split.and_then(|s| s.get("validation_time"))),
             purge_seconds: purge("required_purge_seconds").or_else(|| purge("purge_seconds")),
