@@ -526,3 +526,48 @@ Each chunk is one lock hold. They are not recorded here yet; the 10-seed `hard` 
 * `signal_recovered` (R² >= 0.8 against the noiseless signal) is saturated on the recorded runs. `distractors_used`, `selected_cx` and `signal_r2` still vary.
 * The oracle criterion is relative to the training rows. A front member can meet it with a different, equally good form; `exact_cx` and `excess_cx` show the cost.
 * Wall-clock fields depend on machine load. `hit_evals` does not.
+
+## 9. `--fitness pnl` against `--fitness metric` (#483)
+
+Synthetic panel only: 16 symbols x 20,000 hourly bars, `tests/common/synth_panel.rs` (shared market factor, GARCH-like variance, weak 24-bar momentum and 3-bar reversal drift), label `long:4,name=h4,fee=5,stride=4`, 5 bp per side. No claim holds beyond this panel.
+
+```sh
+# one lock hold per backend; the panel and the enriched store are cached in RCSR_AB_DIR
+RCSR_AB_BACKENDS=gpu RCSR_AB_DIR=/path/to/dir cargo test --release --features cuda --test pnl_fitness_ab -- --ignored --nocapture
+RCSR_AB_BACKENDS=cpu RCSR_AB_DIR=/path/to/dir cargo test --release --features cuda --test pnl_fitness_ab -- --ignored --nocapture
+```
+
+Both arms use `--objective pnl --metric squared --cost-bps 5 --validation-frac 0.2 --test-frac 0.2 --split temporal --pop 64 --islands 4 --generations 30 --patience 0`, seeds 11, 12, 13 (paired: the same seed in both arms), 16 variables. Each run's front goes to `rcsr walkforward --front --select-band --threshold-fixed 0 --validation-frac 0.2` on 4 windows after the run's validation slice. `wf_net` is the pooled compounded equal-weight return, `wf_sharpe` the pooled Sharpe at 8760 periods per year.
+
+| backend | arm | seed | front | test net | wf_net | wf trades | wf exposure | wf Sharpe | search s | s/gen |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| gpu | metric | 11 | 12 | 6.160 | 0.4030 | 3037 | 0.436 | 5.13 | 31.8 | 1.060 |
+| gpu | pnl | 11 | 2 | 6.160 | 0.4440 | 2693 | 0.475 | 5.27 | 22.3 | 0.743 |
+| gpu | metric | 12 | 9 | 6.160 | 0.4015 | 3208 | 0.440 | 5.11 | 30.3 | 1.008 |
+| gpu | pnl | 12 | 6 | 6.308 | 0.4576 | 2693 | 0.472 | 5.41 | 23.6 | 0.786 |
+| gpu | metric | 13 | 9 | 6.160 | 0.3508 | 2815 | 0.441 | 4.56 | 29.7 | 0.990 |
+| gpu | pnl | 13 | 2 | 6.308 | 0.4576 | 2693 | 0.472 | 5.41 | 25.5 | 0.848 |
+| cpu | metric | 11 | 10 | 6.160 | 0.4440 | 2693 | 0.475 | 5.27 | 76.6 | 2.553 |
+| cpu | pnl | 11 | 3 | 6.160 | 0.4451 | 2610 | 0.474 | 5.28 | 33.3 | 1.109 |
+| cpu | metric | 12 | 6 | 6.160 | 0.4440 | 2693 | 0.475 | 5.27 | 57.8 | 1.928 |
+| cpu | pnl | 12 | 1 | 6.160 | 0.4440 | 2693 | 0.475 | 5.27 | 28.7 | 0.956 |
+| cpu | metric | 13 | 9 | 6.160 | 0.4102 | 2943 | 0.467 | 4.95 | 82.0 | 2.733 |
+| cpu | pnl | 13 | 3 | 6.300 | 0.4569 | 2691 | 0.471 | 5.41 | 54.1 | 1.803 |
+
+Seed means:
+
+| backend | arm | wf_net | wf trades | s/gen | device fraction of run | CPU eval s | CPU fit s |
+|---|---|---:|---:|---:|---:|---:|---:|
+| gpu | metric | 0.3851 | 3020 | 1.019 | 0.731 | | |
+| gpu | pnl | 0.4531 | 2693 | 0.792 | 0.719 | | |
+| cpu | metric | 0.4327 | 2776 | 2.405 | | 8.0 | 417.6 |
+| cpu | pnl | 0.4487 | 2665 | 1.289 | | 24.1 | 182.5 |
+
+Pre-registered rule: recommend `--fitness pnl` if the seed-mean walk-forward net of the pnl arm beats the metric arm by more than one block-bootstrap standard error and its mean trades are at most 1.5x. The standard error is the root of the two arms' mean squared bootstrap errors of the pooled return (1000 draws, block 24).
+
+| backend | wf_net difference (pnl - metric) | standard error | trades ratio | recommendation |
+|---|---:|---:|---:|---|
+| gpu | 0.0680 | 0.3315 | 0.89 | `--fitness metric` |
+| cpu | 0.0159 | 0.3382 | 0.96 | `--fitness metric` |
+
+9 of the 12 runs select a finalist with the same validation and test net (5.0768 and 6.1603); the other three, all in the pnl arm, have a test net of 6.300 to 6.308, so the search-level test net is almost the same in both arms. The difference between the arms is the cost per generation: `--fitness pnl` needs 0.78x (GPU) and 0.54x (CPU) of the seconds per generation of `--fitness metric`, below the 1.2x target.
