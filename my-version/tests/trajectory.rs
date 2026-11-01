@@ -57,6 +57,7 @@ fn pinned_front(threads: Option<&str>) {
             // #76: this pin is the pre-front-feedback trajectory, so the
             // feature is explicitly off here.
             "--no-front-parents",
+            "--no-prune",
             // #141: the pin is a CPU f64 trajectory. A CUDA build now prefers
             // the GPU, whose f32 fitness is not bit-identical, so the
             // reproducibility escape hatch is explicit here.

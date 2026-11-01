@@ -607,6 +607,14 @@ SEARCH:
   --no-front-parents         draw every parent from the island tournament;
                              turns off the 15% Pareto-front feedback (#76)
                              and restores the pre-#76 trajectory exactly
+  --no-prune                 keep neutral code on the final front: skip the
+                             data-driven prune that replaces subtrees with a
+                             child or a constant when the training error stays
+                             within 1e-6 (1 + |e|) (#466)
+  --prune-rows <N>           rows the prune fits on (default 20000, >= 2); a
+                             larger training sample is subsampled
+  --prune-budget <N>         cap on candidate fits per run (default 20000,
+                             0 = no prune)
   --no-simd                  force the scalar tree walk instead of the
                              SoA/AVX evaluator (same results, slower; an
                              escape hatch for debugging and A/B runs)
@@ -1682,6 +1690,9 @@ impl DevSink {
             unaccounted_s: outcome.gpu.as_ref().map(|g| g.ledger.unaccounted_s()),
             fit_kernel_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_s()),
             fit_fallback_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_fallback_s()),
+            prune_fits: outcome.prune.fits,
+            prune_accepted: outcome.prune.accepted,
+            prune_s: outcome.prune.seconds,
             events,
             bytes,
             dropped,
@@ -2585,6 +2596,28 @@ fn main() {
             "--fit-fallback-max" => {
                 cfg.fit_fallback_max = val!().parse().unwrap_or(cfg.fit_fallback_max);
                 fit_fallback_max_set = true;
+            }
+            // #466: front prune; a post-loop pass, not saved search state.
+            "--no-prune" => cfg.prune = false,
+            "--prune-rows" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n >= 2 => cfg.prune_rows = n,
+                    _ => {
+                        eprintln!("error: --prune-rows needs an integer >= 2, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--prune-budget" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) => cfg.prune_budget = n,
+                    _ => {
+                        eprintln!("error: --prune-budget needs a non-negative integer, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
             }
             // #116: exact constant-fitting arm.
             "--fit-strategy" => {
@@ -6719,7 +6752,18 @@ fn main() {
             } else {
                 String::new()
             };
-            let search_meta_json = format!("{}{}", predictor_json, fit_json);
+            // #466: omitted with --no-prune, which keeps the historical JSON.
+            let prune_json = if cfg.prune && cfg.prune_budget > 0 {
+                format!(
+                    "\"prune\":{{\"fits\":{},\"accepted\":{},\"seconds\":{}}},",
+                    outcome.prune.fits,
+                    outcome.prune.accepted,
+                    jnum(outcome.prune.seconds)
+                )
+            } else {
+                String::new()
+            };
+            let search_meta_json = format!("{}{}{}", predictor_json, fit_json, prune_json);
             let checkpoint_json = format!(
                 "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{}}}",
                 resume_path

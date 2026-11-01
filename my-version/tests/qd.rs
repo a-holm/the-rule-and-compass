@@ -30,6 +30,7 @@ fn base(extra: &[&str]) -> Vec<String> {
         "--generations",
         "8",
         "--no-front-parents",
+        "--no-prune",
         "--quiet",
         "--json",
     ]

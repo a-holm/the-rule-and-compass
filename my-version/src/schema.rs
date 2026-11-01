@@ -111,6 +111,9 @@ pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--no-fit", "flag", "false", "disable constant fitting entirely (same as --fit-iters 0)"),
         ("--no-dedup", "flag", "false", "disable structural de-duplication"),
         ("--no-front-parents", "flag", "false", "draw every parent from the island tournament; disables the 15% Pareto-front feedback and restores the pre-#76 trajectory exactly"),
+        ("--no-prune", "flag", "false", "skip the final-front prune (#466): by default each front member is greedily rewritten by replacing subtrees with a child or a constant, refitting constants, and keeping a smaller tree when its training error is within 1e-6 (1 + abs(e)) of the original; pruned trees are scored on all training rows and offered to the front. Runs after the generation loop, on the CPU in f64, no RNG"),
+        ("--prune-rows", "int", "20000", "rows the prune fits on; a larger training sample is subsampled deterministically (>= 2)"),
+        ("--prune-budget", "int", "20000", "cap on candidate fits per run; members are pruned in ascending error order until it is spent (0 disables the prune). --json prune reports fits, accepted and seconds"),
         ("--no-simd", "flag", "false", "force the scalar tree walk instead of the SoA/AVX evaluator (same results; for debugging and A/B runs)"),
         ("--predictor-samples", "int", "none", "training rows per generation for fitness and constant fitting (>=2; all rows when >= train size)"),
         // #85: fit-only screening; survivors are refit on the full training sample.

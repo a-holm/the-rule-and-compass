@@ -58,6 +58,7 @@ OPTIONS:
                             (default: the available CPU cores; 1 = serial; the
                             results do not depend on it)
   --no-front-parents        disable the 15% Pareto-front parent feedback (#76)
+  --no-prune                skip the front prune (#466) to measure its effect
   --cpu                     force the CPU evaluator (no environment variable)
   --gpu                     require the device evaluator; exit 2 without one
   --fit-strategy <name>     exact (bench default), auto, linear, varpro, stream,
@@ -260,6 +261,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--json" => a.json = true,
             "--ndjson" => a.ndjson = true,
             "--no-front-parents" => a.front_parents = false,
+            "--no-prune" => a.knobs.prune = Some(false),
             "--cpu" => a.cpu = true,
             "--gpu" => a.gpu = true,
             "--fit-strategy" => {

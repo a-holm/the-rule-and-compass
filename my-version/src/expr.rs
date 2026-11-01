@@ -2545,6 +2545,46 @@ pub fn simplify_with_bounds(n: &Node, bounds: Option<&[(f64, f64)]>) -> Node {
     m
 }
 
+/// [`simplify`] plus the fold `if(c, a, a) -> a`.
+///
+/// `eval` returns the second or third child and both are `a`, so the fold
+/// preserves every value, including a `NaN` or infinite condition. It is a
+/// separate entry point because the search keys its trajectory on
+/// [`simplify`]; only the front prune (#466) uses this one.
+pub fn simplify_equal_branches(n: &Node) -> Node {
+    fn fold(n: &Node) -> (Node, bool) {
+        let mut changed = false;
+        let kids: Vec<Node> = n
+            .kids
+            .iter()
+            .map(|k| {
+                let (k, c) = fold(k);
+                changed |= c;
+                k
+            })
+            .collect();
+        if n.op == Op::If && same(&kids[1], &kids[2]) {
+            return (kids[1].clone(), true);
+        }
+        (
+            Node {
+                op: n.op,
+                val: n.val,
+                kids,
+                block: n.block.clone(),
+            },
+            changed,
+        )
+    }
+    let s = simplify(n);
+    let (f, changed) = fold(&s);
+    if changed {
+        simplify(&f)
+    } else {
+        s
+    }
+}
+
 /// `k * u`, pulled into canonical form by absorbing any constant factor that
 /// already sits at the top of `u`. Keeps `0.8447*(x)` rather than `x/1.1839`.
 fn mul_const(k: f64, u: Node) -> Node {
