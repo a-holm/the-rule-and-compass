@@ -306,7 +306,6 @@ pub fn build_keep(
     funding: Option<&[f64]>,
     keep: &dyn Fn(i64) -> bool,
 ) -> Result<LongLabels, String> {
-    let _ = keep;
     spec.validate()?;
     if let Some(f) = funding {
         if f.len() != bars.len() {
@@ -389,19 +388,21 @@ pub fn build_keep(
         out.m_net[t] = if out.exit_ret[t] > cost { 1.0 } else { 0.0 };
         out.m_barrier[t] = if exit.1 == EXIT_PROFIT { 1.0 } else { 0.0 };
     }
-    (out.uniqueness, out.weight) = uniqueness_weights(&out, d);
+    (out.uniqueness, out.weight, out.weight_norm_rows) = uniqueness_weights(&out, d, keep);
     Ok(out)
 }
 
 /// `u_i = mean over the label's bars of 1 / c_t`, `w_i = u_i * n / sum(u)`,
 /// with `c_t` the number of labels whose span covers bar `t`. A span runs from
-/// the entry bar to the exit bar.
-fn uniqueness_weights(l: &LongLabels, d: usize) -> (Vec<f64>, Vec<f64>) {
+/// the entry bar to the exit bar. `n` and `sum(u)` run over the valid rows whose
+/// stamp satisfies `keep`; every valid row gets `u * n / sum(u)`. The third
+/// value is that `n`.
+fn uniqueness_weights(l: &LongLabels, d: usize, keep: &dyn Fn(i64) -> bool) -> (Vec<f64>, Vec<f64>, usize) {
     let n = l.fwd.len();
     let rows: Vec<usize> = (0..n).filter(|&t| l.fwd[t].is_finite()).collect();
     let mut w = vec![f64::NAN; n];
     if rows.is_empty() {
-        return (w.clone(), w);
+        return (w.clone(), w, 0);
     }
     let mut conc = vec![0i64; n + 1];
     for &t in &rows {
@@ -416,15 +417,19 @@ fn uniqueness_weights(l: &LongLabels, d: usize) -> (Vec<f64>, Vec<f64>) {
     }
     let mut u = vec![f64::NAN; n];
     let mut total = 0.0;
+    let mut kept = 0usize;
     for &t in &rows {
         let (a, b) = (t + 1 + d, l.end_idx[t]);
         u[t] = (prefix[b + 1] - prefix[a]) / (b - a + 1) as f64;
-        total += u[t];
+        if keep(l.time[t]) {
+            total += u[t];
+            kept += 1;
+        }
     }
     for &t in &rows {
-        w[t] = u[t] * rows.len() as f64 / total;
+        w[t] = if kept == 0 { f64::NAN } else { u[t] * kept as f64 / total };
     }
-    (u, w)
+    (u, w, kept)
 }
 
 /// Meta-label: `1[long exit net > 0]` on rows where the primary rule is long,
@@ -634,6 +639,8 @@ pub struct LabelReport {
     pub average_uniqueness: f64,
     pub effective_n: f64,
     pub effective_n_hours: f64,
+    /// Valid rows the uniqueness weights are normalised over (development rows).
+    pub weight_norm_rows: usize,
     pub purge_seconds: i64,
     /// The declared locked test the statistics leave out, with the number of
     /// valid rows left out. `None` when no range applies.
@@ -679,6 +686,7 @@ struct Tally {
     uniqueness_sum: f64,
     top: Vec<TopMove>,
     left_out: usize,
+    weight_norm_rows: usize,
 }
 
 fn move_order(a: &TopMove, b: &TopMove) -> std::cmp::Ordering {
@@ -703,6 +711,7 @@ impl Tally {
         self.action_long += other.action_long;
         self.uniqueness_sum += other.uniqueness_sum;
         self.left_out += other.left_out;
+        self.weight_norm_rows += other.weight_norm_rows;
         self.top.extend(other.top);
         self.top.sort_by(move_order);
         self.top.truncate(TOP_MOVES);
@@ -738,6 +747,7 @@ impl Tally {
             average_uniqueness: if nv == 0 { f64::NAN } else { self.uniqueness_sum / nv as f64 },
             effective_n: self.uniqueness_sum,
             effective_n_hours: self.uniqueness_sum * hours,
+            weight_norm_rows: self.weight_norm_rows,
             purge_seconds: spec.purge_seconds(),
             locked_test: range.map(|range| LockedLeftOut { range, rows_left_out: self.left_out }),
             label_hash,
@@ -800,6 +810,7 @@ impl LongLabels {
             uniqueness_sum: valid.iter().map(|&t| self.uniqueness[t]).sum(),
             top,
             left_out: finite - valid.len(),
+            weight_norm_rows: self.weight_norm_rows,
         }
     }
 
@@ -910,7 +921,7 @@ impl LabelReport {
             })
             .unwrap_or_default();
         format!(
-            "{{\"version\":{},\"name\":{},\"long_only\":true,\"rows\":{},\"valid_rows\":{},\"barrier_rows\":{},\"stride_rows\":{},\"exits\":{{\"profit\":{},\"stop\":{},\"vertical\":{}}},\"action_long_share\":{},\"clipped_share\":{},\"sign_share\":{{\"positive\":{},\"negative\":{},\"zero\":{}}},\"fwd_mean\":{},\"fwd_quantiles\":{{{}}},\"cost_to_move\":{},\"top_abs_moves\":{{\"n\":{},\"moves\":[{}]}},\"average_uniqueness\":{},\"effective_n\":{},\"effective_n_hours\":{},\"purge_seconds\":{}{},\"label_hash\":{}}}",
+            "{{\"version\":{},\"name\":{},\"long_only\":true,\"rows\":{},\"valid_rows\":{},\"barrier_rows\":{},\"stride_rows\":{},\"exits\":{{\"profit\":{},\"stop\":{},\"vertical\":{}}},\"action_long_share\":{},\"clipped_share\":{},\"sign_share\":{{\"positive\":{},\"negative\":{},\"zero\":{}}},\"fwd_mean\":{},\"fwd_quantiles\":{{{}}},\"cost_to_move\":{},\"top_abs_moves\":{{\"n\":{},\"moves\":[{}]}},\"average_uniqueness\":{},\"effective_n\":{},\"effective_n_hours\":{},\"weight_norm_rows\":{},\"purge_seconds\":{}{},\"label_hash\":{}}}",
             text(VERSION),
             text(&self.name),
             self.rows,
@@ -933,6 +944,7 @@ impl LabelReport {
             num(self.average_uniqueness),
             num(self.effective_n),
             num(self.effective_n_hours),
+            self.weight_norm_rows,
             self.purge_seconds,
             locked,
             text(&self.label_hash)

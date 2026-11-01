@@ -3524,3 +3524,45 @@ fn enrich_reports_leave_out_the_embargo_rows_and_ignore_locked_prices_after_it()
     assert_eq!(r24.rows_left_out, Some(band));
 }
 
+
+// ---------------------------------------------------------------------------
+// #583: uniqueness weights normalise over the development rows.
+// ---------------------------------------------------------------------------
+
+fn weight_columns(tag: &str, perturbed: bool, declare: bool) -> (Vec<f64>, Vec<f64>) {
+    let (n, s, e) = (3000usize, 1500usize, 1800usize);
+    let dir = tmp_dir(tag);
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &embargo_rows(n, s, e, perturbed), 1024);
+    let mut o = opts(&src, &out, "returns");
+    o.features.clear();
+    o.labels = vec!["long:3h,name=h3,fee=10,vol=20".to_string()];
+    if declare {
+        o.locked_test = Some(rcsr::lockbox::Lockbox { start: EMB_T0 + EMB_H * s as i64, end: EMB_T0 + EMB_H * e as i64 });
+    }
+    o.allow_lockbox = true;
+    enrich::build(&o).unwrap();
+    (column(&out, "ts"), column(&out, "lbl_h3_weight"))
+}
+
+#[test]
+fn label_weights_ignore_locked_prices_in_a_declared_store() {
+    let (s, e) = ((EMB_T0 + EMB_H * 1500) as f64, (EMB_T0 + EMB_H * 1800) as f64);
+    let (purge, embargo) = (4.0 * EMB_H as f64, 24.0 * EMB_H as f64);
+    let (ts, a) = weight_columns("w-decl-a", false, true);
+    let (_, b) = weight_columns("w-decl-b", true, true);
+    let mut compared = 0;
+    for i in 0..ts.len() {
+        if (ts[i] < s - purge || ts[i] >= e + embargo) && a[i].is_finite() {
+            assert_eq!(a[i].to_bits(), b[i].to_bits(), "row {i}");
+            compared += 1;
+        }
+    }
+    assert!(compared > 6000, "{compared}");
+    // Without a declaration the weights depend on the locked prices, so the test has teeth.
+    let (_, a0) = weight_columns("w-undecl-a", false, false);
+    let (_, b0) = weight_columns("w-undecl-b", true, false);
+    let differ = (0..ts.len()).filter(|&i| ts[i] < s - purge && a0[i].is_finite() && a0[i].to_bits() != b0[i].to_bits()).count();
+    assert!(differ > 1000, "{differ}");
+}
