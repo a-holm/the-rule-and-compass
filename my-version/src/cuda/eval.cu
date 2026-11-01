@@ -205,7 +205,12 @@ struct RcCtx {
     unsigned char *d_pnl_book;
     double pnl_side;
     double pnl_threshold;
-    double pnl_bound;
+    /* #484: bound per time block (one entry, the whole-book bound, when
+       unblocked), the weight of the block spread and the block count (at most 8,
+       RC_PNL_MAX_BLOCKS). */
+    double pnl_bound[8];
+    double pnl_lambda;
+    int pnl_blocks;
     unsigned long long pnl_min_trades;
     void *d_pnl_totals;
     /* #293: tiled residency. `d_cols` is null; the feature columns stream from
@@ -864,6 +869,10 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
    tree. The block is exactly RC_PNL_WARPS warps whatever the row count. */
 #define RC_PNL_SEGMENT_ROWS 8192
 #define RC_PNL_WARPS 8
+/* #484: most time blocks, and the shift of the block id in the flags byte; keep
+   in step with `trading::FITNESS_MAX_BLOCKS` and `FITNESS_BLOCK_SHIFT`. */
+#define RC_PNL_MAX_BLOCKS 8
+#define RC_PNL_BLOCK_SHIFT 2
 
 /* #222: the L1 majoriser floor, the same `1e-6` the CPU `irls_fit` uses. It is
    deliberately not smaller: at |r| = 0 the exact weight is infinite, and a
@@ -1520,7 +1529,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
     }
 }
 
-/* --- #481: the long/flat regret fused with the interpreter ----------------
+/* --- #481, #484: the long/flat regret fused with the interpreter ----------
  *
  * One block of RC_PNL_WARPS warps per candidate. Segment `s` (RC_PNL_SEGMENT_ROWS
  * rows) belongs to warp `s % RC_PNL_WARPS`, which walks its segments in
@@ -1537,7 +1546,14 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
  * rows `seg_start + l + 32j` in ascending `j`, the lanes fold with the halving
  * tree 16, 8, 4, 2, 1, each warp adds its segment sums in ascending order, and
  * thread 0 folds the warp sums with 4, 2, 1: the CPU tree term for term. No
- * floating-point atomics; the value depends only on (program, rows). */
+ * floating-point atomics; the value depends only on (program, rows).
+ *
+ * #484: with NB > 1 time blocks the flags byte carries the block id in bits
+ * 2 to 4 and the seam bits mark every (group, block) run. Each block keeps its
+ * own lane sum, warp sum and integer counts (the ballots restricted to the
+ * rows of the block), the same trees per block, and thread 0 finishes with
+ * `mean + lambda * sd` of the block regrets in the CPU's order. NB == 1 is the
+ * unblocked kernel. */
 typedef struct RcPnlTotals {
     double gross;
     unsigned long long flips;
@@ -1545,8 +1561,21 @@ typedef struct RcPnlTotals {
     unsigned long long longs;
     int nonfinite;
     int pad;
+    double block_gross[RC_PNL_MAX_BLOCKS];
+    unsigned long long block_flips[RC_PNL_MAX_BLOCKS];
+    unsigned long long block_exits[RC_PNL_MAX_BLOCKS];
 } RcPnlTotals;
 
+/* The per-block bounds, the weight of the spread and the block count, passed
+   by value. */
+typedef struct RcPnlBlocks {
+    double bound[RC_PNL_MAX_BLOCKS];
+    double lambda;
+    int nb;
+    int pad;
+} RcPnlBlocks;
+
+static_assert(RC_PNL_MAX_BLOCKS == 8, "RcCtx::pnl_bound holds 8 block bounds");
 static_assert(RC_MAX_THREADS == 32 * RC_PNL_WARPS, "the long/flat block is RC_PNL_WARPS warps");
 static_assert(RC_PNL_SEGMENT_ROWS % 32 == 0, "a segment is whole warp steps");
 
@@ -1555,6 +1584,7 @@ __device__ __forceinline__ int rc_pnl_long(float pred, double threshold)
     return isfinite(pred) && (double)pred > threshold;
 }
 
+template <int NB>
 __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
     const float *__restrict__ cols,
     int n,
@@ -1566,7 +1596,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
     const unsigned char *__restrict__ flags,
     double side,
     double threshold,
-    double bound,
+    RcPnlBlocks blk,
     unsigned long long min_trades,
     double *__restrict__ out,
     int *__restrict__ status,
@@ -1578,15 +1608,30 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
         : prog + off[p];
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    __shared__ double sh_gross[RC_PNL_WARPS];
-    __shared__ unsigned int sh_flips[RC_PNL_WARPS];
-    __shared__ unsigned int sh_exits[RC_PNL_WARPS];
+    __shared__ double sh_gross[NB][RC_PNL_WARPS];
+    __shared__ unsigned int sh_flips[NB][RC_PNL_WARPS];
+    __shared__ unsigned int sh_exits[NB][RC_PNL_WARPS];
     __shared__ unsigned int sh_longs[RC_PNL_WARPS];
     __shared__ int sh_bad[RC_PNL_WARPS];
 
-    unsigned int flips = 0, exits = 0, longs = 0;
+    /* Per block: `sf`/`se` flips and exits, `wg` the warp's gross. The block of
+       the rows being walked, `bcur`, keeps its lane sum and counts in the
+       registers `acc`, `cfc` and `cec`; the others wait in `sg`, `sf` and `se`.
+       A warp step whose valid rows all belong to `bcur` (nearly every step:
+       blocks are runs of time) takes the register path. Any other step stores
+       the current block, adds each row to its own block's lane sum in ascending
+       row order, and continues with the block of the step's last row, so every
+       (block, lane) sum is added in the CPU's order. */
+    unsigned int sf[NB], se[NB], longs = 0;
+    double sg[NB], wg[NB];
+#pragma unroll
+    for (int b = 0; b < NB; ++b) {
+        sf[b] = 0;
+        se[b] = 0;
+        sg[b] = 0.0;
+        wg[b] = 0.0;
+    }
     int bad = 0;
-    double warp_gross = 0.0;
     const long long rows = (long long)n;
     const long long nseg = (rows + RC_PNL_SEGMENT_ROWS - 1) / RC_PNL_SEGMENT_ROWS;
     for (long long s = warp; s < nseg; s += RC_PNL_WARPS) {
@@ -1599,7 +1644,12 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
             const float q = rc_exec_row(code, cols, n, (int)(seg_start - 1));
             carry = rc_pnl_long(q, threshold) ? 1u : 0u;
         }
-        double lane_gross = 0.0;
+        int bcur = 0;
+        if (NB > 1) {
+            bcur = (int)min((flags[seg_start] >> RC_PNL_BLOCK_SHIFT) & (RC_PNL_MAX_BLOCKS - 1), (unsigned int)(NB - 1));
+        }
+        double acc = 0.0;
+        unsigned int cfc = 0, cec = 0;
         for (long long base = seg_start; base < seg_end; base += 32) {
             const long long row = base + lane;
             const int in = row < seg_end;
@@ -1617,60 +1667,172 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
             const unsigned int lst = __ballot_sync(0xffffffffu, (f & 2u) != 0u);
             const unsigned int val = __ballot_sync(0xffffffffu, in);
             const unsigned int prev = ((m << 1) | carry) & ~fst;
-            flips += __popc((m ^ prev) & val);
-            exits += __popc(m & lst);
+            const unsigned int fl = (m ^ prev) & val;
+            const unsigned int ex = m & lst;
             longs += __popc(m);
-            if (pos) lane_gross += excess[row];
             carry = (m >> 31) & 1u;
+            if (NB == 1) {
+                cfc += __popc(fl);
+                cec += __popc(ex);
+                if (pos) acc += excess[row];
+                continue;
+            }
+            const unsigned int bid =
+                min((f >> RC_PNL_BLOCK_SHIFT) & (RC_PNL_MAX_BLOCKS - 1), (unsigned int)(NB - 1));
+            if (__all_sync(0xffffffffu, !in || (int)bid == bcur)) {
+                cfc += __popc(fl);
+                cec += __popc(ex);
+                if (pos) acc += excess[row];
+                continue;
+            }
+            sg[bcur] = acc;
+            sf[bcur] += cfc;
+            se[bcur] += cec;
+            cfc = 0;
+            cec = 0;
+            if (pos) sg[bid] += excess[row];
+#pragma unroll
+            for (int b = 0; b < NB; ++b) {
+                const unsigned int bm = __ballot_sync(0xffffffffu, in && bid == (unsigned int)b);
+                if (bm) {
+                    sf[b] += __popc(fl & bm);
+                    se[b] += __popc(ex & bm);
+                }
+            }
+            bcur = __shfl_sync(0xffffffffu, (int)bid, 31 - __clz(val));
+            acc = sg[bcur];
         }
-        for (int half = 16; half >= 1; half >>= 1) {
-            lane_gross += __shfl_down_sync(0xffffffffu, lane_gross, half);
+        if (NB > 1) sg[bcur] = acc;
+        sf[bcur] += cfc;
+        se[bcur] += cec;
+#pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            double g = (NB == 1) ? acc : sg[b];
+            for (int half = 16; half >= 1; half >>= 1) {
+                g += __shfl_down_sync(0xffffffffu, g, half);
+            }
+            wg[b] += g;
+            sg[b] = 0.0;
         }
-        warp_gross += lane_gross;
     }
     bad = __any_sync(0xffffffffu, bad);
     if (lane == 0) {
-        sh_gross[warp] = warp_gross;
-        sh_flips[warp] = flips;
-        sh_exits[warp] = exits;
+#pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            sh_gross[b][warp] = wg[b];
+            sh_flips[b][warp] = sf[b];
+            sh_exits[b][warp] = se[b];
+        }
         sh_longs[warp] = longs;
         sh_bad[warp] = bad;
     }
     __syncthreads();
     if (threadIdx.x != 0) return;
-    double g[RC_PNL_WARPS];
+    double bg[NB];
+    unsigned long long bf[NB], be[NB];
     unsigned long long tf = 0, te = 0, tl = 0;
     int tb = 0;
+    for (int b = 0; b < NB; ++b) {
+        double g[RC_PNL_WARPS];
+        bf[b] = 0;
+        be[b] = 0;
+        for (int w = 0; w < RC_PNL_WARPS; ++w) {
+            g[w] = sh_gross[b][w];
+            bf[b] += sh_flips[b][w];
+            be[b] += sh_exits[b][w];
+        }
+        for (int half = RC_PNL_WARPS / 2; half >= 1; half >>= 1) {
+            for (int i = 0; i < half; ++i) g[i] = __dadd_rn(g[i], g[i + half]);
+        }
+        bg[b] = g[0];
+        tf += bf[b];
+        te += be[b];
+    }
     for (int w = 0; w < RC_PNL_WARPS; ++w) {
-        g[w] = sh_gross[w];
-        tf += sh_flips[w];
-        te += sh_exits[w];
         tl += sh_longs[w];
         tb |= sh_bad[w];
     }
-    for (int half = RC_PNL_WARPS / 2; half >= 1; half >>= 1) {
-        for (int i = 0; i < half; ++i) g[i] = __dadd_rn(g[i], g[i + half]);
-    }
-    const double gross = g[0];
-    const double net = __dsub_rn(gross, __dmul_rn(side, (double)(tf + te)));
     double r = INFINITY;
     int st = 0;
     if (tb) {
         st = RC_SCORE_NONFINITE;
     } else if (tf >= min_trades) {
-        r = __ddiv_rn(__dsub_rn(bound, net), bound);
-        if (!isfinite(r)) r = INFINITY;
+        double reg[NB];
+        int finite = 1;
+        for (int b = 0; b < NB; ++b) {
+            const double net = __dsub_rn(bg[b], __dmul_rn(side, (double)(bf[b] + be[b])));
+            reg[b] = __ddiv_rn(__dsub_rn(blk.bound[b], net), blk.bound[b]);
+            finite &= isfinite(reg[b]);
+        }
+        if (finite) {
+            if (NB == 1) {
+                r = reg[0];
+            } else {
+                double sum = 0.0;
+                for (int b = 0; b < NB; ++b) sum = __dadd_rn(sum, reg[b]);
+                const double mean = __ddiv_rn(sum, (double)NB);
+                double ss = 0.0;
+                for (int b = 0; b < NB; ++b) {
+                    const double d = __dsub_rn(reg[b], mean);
+                    ss = __dadd_rn(ss, __dmul_rn(d, d));
+                }
+                const double sd = __dsqrt_rn(__ddiv_rn(ss, (double)(NB - 1)));
+                r = __dadd_rn(mean, __dmul_rn(blk.lambda, sd));
+            }
+            if (!isfinite(r)) r = INFINITY;
+        }
     }
     out[p] = r;
     status[p] = st;
     if (totals) {
+        double gross = 0.0;
+        for (int b = 0; b < NB; ++b) gross = __dadd_rn(gross, bg[b]);
         totals[p].gross = gross;
         totals[p].flips = tf;
         totals[p].exits = te;
         totals[p].longs = tl;
         totals[p].nonfinite = tb;
         totals[p].pad = 0;
+        for (int b = 0; b < RC_PNL_MAX_BLOCKS; ++b) {
+            totals[p].block_gross[b] = b < NB ? bg[b] : 0.0;
+            totals[p].block_flips[b] = b < NB ? bf[b] : 0;
+            totals[p].block_exits[b] = b < NB ? be[b] : 0;
+        }
     }
+}
+
+/* #484: one instantiation per block count so the per-block accumulators stay
+   in registers. */
+static void rc_pnl_launch(RcCtx *c, const unsigned int *prog, const unsigned int *off,
+                          int width, int pooled, int nprog)
+{
+    RcPnlBlocks blk = {};
+    for (int b = 0; b < RC_PNL_MAX_BLOCKS; ++b) blk.bound[b] = c->pnl_bound[b];
+    blk.lambda = c->pnl_lambda;
+    blk.nb = c->pnl_blocks;
+    const double *excess = (const double *)c->d_pnl_book;
+    const unsigned char *flags = c->d_pnl_book + sizeof(double) * (size_t)c->n;
+    RcPnlTotals *totals = (RcPnlTotals *)c->d_pnl_totals;
+#define RC_PNL_CASE(K)                                                                   \
+    case K:                                                                              \
+        pnl_score_kernel<K><<<nprog, RC_MAX_THREADS>>>(                                  \
+            c->d_cols, c->n, prog, off, width, pooled, excess, flags, c->pnl_side,       \
+            c->pnl_threshold, blk, c->pnl_min_trades, c->d_score_out, c->d_score_status, \
+            totals);                                                                     \
+        break;
+    switch (c->pnl_blocks) {
+        RC_PNL_CASE(1)
+        RC_PNL_CASE(2)
+        RC_PNL_CASE(3)
+        RC_PNL_CASE(4)
+        RC_PNL_CASE(5)
+        RC_PNL_CASE(6)
+        RC_PNL_CASE(7)
+        RC_PNL_CASE(8)
+        default:
+            break;
+    }
+#undef RC_PNL_CASE
 }
 
 /* --- #293: row-range scoring with a lane carry ---------------------------
@@ -5695,12 +5857,7 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_LONG_PNL:
-            pnl_score_kernel<<<nprog, RC_MAX_THREADS>>>(
-                c->d_cols, c->n, prog, off, width, pooled,
-                (const double *)c->d_pnl_book,
-                c->d_pnl_book + sizeof(double) * (size_t)c->n,
-                c->pnl_side, c->pnl_threshold, c->pnl_bound, c->pnl_min_trades,
-                c->d_score_out, c->d_score_status, (RcPnlTotals *)c->d_pnl_totals);
+            rc_pnl_launch(c, prog, off, width, pooled, nprog);
             break;
         default:
             st->failed = 1;
@@ -5796,16 +5953,19 @@ float rc_pool_score(void *ctx, int which, int nprog, int width, int kind,
                            pcount, 0, 0, out, status);
 }
 
-/* #481: upload the long/flat fitness book of the resident rows: the excess
-   returns, the seam flags (bit 1 first row of a group, bit 2 last row), the
-   cost per side, the threshold, the hindsight bound and the trade floor. One
-   allocation of 9 bytes per row, tag "pnl_book", kept until rc_destroy or the
-   next call. Returns 0, or -1 when refused: a tiled context, a row count other
-   than the resident one, a non-positive bound or a refused allocation (the
-   previous book is released either way). */
+/* #481, #484: upload the long/flat fitness book of the resident rows: the
+   excess returns, the seam flags (value 1 first row of a run, value 2 last row,
+   bits 2 to 4 the time block id), the cost per side,
+   the threshold, the hindsight bound of each of `nblocks` time blocks (1 to 8;
+   one entry, the whole-book bound, when unblocked), the weight `lambda` of the
+   block spread and the trade floor. One allocation of 9 bytes per row, tag
+   "pnl_book", kept until rc_destroy or the next call. Returns 0, or -1 when
+   refused: a tiled context, a row count other than the resident one, a bad
+   block count, a non-positive bound or a refused allocation (the previous book
+   is released either way). */
 int rc_set_pnl_book(void *ctx, const double *excess, const unsigned char *flags,
-                    int n, double side, double threshold, double bound,
-                    unsigned long long min_trades)
+                    int n, double side, double threshold, const double *bounds,
+                    int nblocks, double lambda, unsigned long long min_trades)
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c) return -1;
@@ -5813,7 +5973,13 @@ int rc_set_pnl_book(void *ctx, const double *excess, const unsigned char *flags,
         rc_dev_free(c, c->d_pnl_book);
         c->d_pnl_book = 0;
     }
-    if (c->tiled || n <= 0 || n != c->n || !excess || !flags || !(bound > 0.0)) return -1;
+    if (c->tiled || n <= 0 || n != c->n || !excess || !flags || !bounds || nblocks < 1 ||
+        nblocks > RC_PNL_MAX_BLOCKS || !(lambda >= 0.0) || !isfinite(lambda)) {
+        return -1;
+    }
+    for (int b = 0; b < nblocks; ++b) {
+        if (!(bounds[b] > 0.0)) return -1;
+    }
     const size_t eb = sizeof(double) * (size_t)n;
     const size_t bytes = eb + (size_t)n;
     void *p = 0;
@@ -5828,7 +5994,9 @@ int rc_set_pnl_book(void *ctx, const double *excess, const unsigned char *flags,
     c->d_pnl_book = book;
     c->pnl_side = side;
     c->pnl_threshold = threshold;
-    c->pnl_bound = bound;
+    for (int b = 0; b < RC_PNL_MAX_BLOCKS; ++b) c->pnl_bound[b] = b < nblocks ? bounds[b] : 0.0;
+    c->pnl_blocks = nblocks;
+    c->pnl_lambda = lambda;
     c->pnl_min_trades = min_trades;
     return 0;
 }
