@@ -6333,4 +6333,79 @@ mod tests {
             assert!(((double.std_errors[i] - want) / want).abs() < 1e-12);
         }
     }
+
+    /// FNV-1a over the constants' bits then the score's bits.
+    fn fit_fingerprint(tree: &Node, score: f64) -> u64 {
+        fn walk(n: &Node, h: &mut u64) {
+            if n.op == Op::Const {
+                for b in n.val.to_bits().to_le_bytes() {
+                    *h = (*h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+                }
+            }
+            for k in &n.kids {
+                walk(k, h);
+            }
+        }
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        walk(tree, &mut h);
+        for b in score.to_bits().to_le_bytes() {
+            h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+        }
+        h
+    }
+
+    fn pinned_fixture() -> (Vec<Vec<f64>>, Vec<f64>) {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..2000 {
+            let row: Vec<f64> = (0..5).map(|_| 4.0 * next() - 2.0).collect();
+            let clean = (1.2 * row[0] + 0.5 * row[1] * row[2]) / (1.1 + row[3] * row[3]) - 0.3 * row[4];
+            let noise = 0.05 * (next() - 0.5);
+            let outlier = if i % 97 == 0 { 3.0 * (next() - 0.5) } else { 0.0 };
+            y.push(clean + noise + outlier);
+            x.push(row);
+        }
+        (x, y)
+    }
+
+    #[test]
+    fn metric_fits_are_bit_identical_after_the_evaluator_switch() {
+        let (x, y) = pinned_fixture();
+        let vars: Vec<String> = (0..5).map(|i| format!("x{i}")).collect();
+        let sources = [
+            "1.1*x0 + 0.4*x1*x2 + 0.2",
+            "(1.1*x0 + 0.4*x1*x2) / (1.3 + x3*x3) - 0.2*x4",
+            "atan2(1.1*x0, 1.3 + x3*x3) + 0.4*x1*x2 - 0.2*x4",
+        ];
+        let metrics = [
+            Metric::Absolute,
+            Metric::LogSquashed,
+            Metric::Median,
+            Metric::Maximum,
+            Metric::Interquartile,
+            Metric::RankCorrelation,
+            Metric::RankCorrelationSigned,
+            Metric::Slope,
+            Metric::Signed,
+        ];
+        let rejected = crate::parse::parse(sources[2], &vars).unwrap();
+        assert!(crate::eval_soa::compile(&rejected).is_none());
+        let mut got = Vec::new();
+        for src in sources {
+            for &m in &metrics {
+                let mut tree = crate::parse::parse(src, &vars).unwrap();
+                let score = fit_weighted_metric(&mut tree, &x, &y, &[], 8, m);
+                got.push(fit_fingerprint(&tree, score));
+            }
+        }
+        let pinned: [u64; 27] = [0x3c9276bf1c615d27, 0x9294d7602a3c3167, 0x15b8dd2bc7e89749, 0xafa0562facbfc842, 0x26ba0ddf4424a2e0, 0xa17c07db2474173c, 0xa17c07db2474173c, 0xcb94829dce1d26e3, 0x24434c6a996c9229, 0x23a970927fa60ca5, 0xe1c6b66d7f822d06, 0x451d1ef089f61505, 0x0374ecc179c28d13, 0xe6cad4afb716367e, 0xcbfa07bfbfbafb80, 0xcbfa07bfbfbafb80, 0x04f4b24b783f51c9, 0xd67f0e0db5df28f1, 0xf0baf5198f0be5ee, 0xdbfd0fea0481a991, 0x3d0b0848e99fccbc, 0xe3c3b66d8f3aca74, 0x5a6b313ff1818721, 0xc2f8defb6d1423d0, 0xc2f8defb6d1423d0, 0xf370ce07b2c3f2fb, 0xbd6156d48f9c3a62];
+        assert_eq!(got.as_slice(), pinned.as_slice());
+    }
 }
