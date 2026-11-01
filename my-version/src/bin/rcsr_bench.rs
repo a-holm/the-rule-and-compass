@@ -69,6 +69,7 @@ OPTIONS:
   --migration-interval <N>  generations between island migrations
   --restart-interval <N>    generations between island restarts
   --variation <mode>        auto, node or postfix
+  --selection <mode>        lexicographic (default) or afp (age-fitness Pareto)
   --dispatch <mode>         auto or device (device skips the timing comparison)
   --jobs <N>                runs in flight at once on the CPU (default 1);
                             seconds and hit_s are then contended
@@ -295,6 +296,9 @@ fn parse(args: &[String]) -> Result<Args, String> {
             }
             "--variation" => {
                 a.knobs.variation = Some(rcsr::search::VariationMode::parse(&take(&mut i, "--variation")?)?)
+            }
+            "--selection" => {
+                a.knobs.selection = Some(rcsr::search::Selection::parse(&take(&mut i, "--selection")?)?)
             }
             "--dispatch" => {
                 let v = take(&mut i, "--dispatch")?;
