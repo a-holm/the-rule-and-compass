@@ -31,6 +31,8 @@ pub struct RunFile {
     pub purge_seconds: Option<f64>,
     /// `search.candidates_evaluated`.
     pub candidates_evaluated: Option<u64>,
+    /// The parsed document, for views such as `RunFile::book`.
+    doc: Json,
 }
 
 fn pair(j: Option<&Json>) -> Option<(f64, f64)> {
@@ -91,7 +93,23 @@ impl RunFile {
                 .and_then(|s| s.get("candidates_evaluated"))
                 .and_then(Json::as_f64)
                 .map(|v| v as u64),
+            doc: j.clone(),
         })
+    }
+
+    /// The book the run selected (#487): finalist, fixed threshold, cost and target spec.
+    pub fn book(&self) -> Result<crate::run_book::RunBook, String> {
+        crate::run_book::RunBook::from_json(&self.doc)
+    }
+
+    /// The declared target spec of the run, when it holds a full one.
+    pub fn target_spec(&self) -> Option<crate::target::TargetSpec> {
+        crate::target::parse_object(self.doc.get("target_spec")?).ok()
+    }
+
+    /// `objective.cost.source`; a run without the block counts as a flag cost.
+    pub fn cost_source(&self) -> crate::target::CostSource {
+        crate::run_book::cost_source_of(&self.doc)
     }
 
     /// Last time key the search trained or selected on.

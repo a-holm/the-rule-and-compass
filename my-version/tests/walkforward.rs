@@ -782,7 +782,7 @@ mod front {
         assert_eq!(code, 0, "{err}");
         assert!(out.contains("\"per_side_bps\":5,"), "{out}");
         assert!(out.contains("\"threshold_source\":\"fixed\""), "{out}");
-        let (code, out, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--cost-bps", "12", "--threshold-quantile", "0.5"]);
+        let (code, out, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--cost-override", "12", "--threshold-quantile", "0.5"]);
         assert_eq!(code, 0, "{err}");
         assert!(out.contains("\"per_side_bps\":12,"), "{out}");
         assert!(!out.contains("\"threshold_source\":\"fixed\""), "{out}");
