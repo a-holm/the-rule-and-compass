@@ -1186,7 +1186,7 @@ explicit `gpu` is always honoured:
    Each block records `clock64()` cycle counts for the damped loop and for the
    polish (re-baseline and steps). The host apportions the measured kernel
    seconds of a batch by the summed cycle ratio and reports
-   `gpu.fit.kernel_f32_s` (damped loop) and `gpu.fit.kernel_f64_s` (polish) in
+   `gpu.fit.kernel_lm_s` (damped loop) and `gpu.fit.kernel_polish_s` (polish) in
    `--json`, in `gpu.ledger.fit` and in the `run_end` event of the development
    log. The two sum to the fit kernel seconds. Under `f32` or `off` the second
    value is the time of the polish phase in that arithmetic. A kernel launch

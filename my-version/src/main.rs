@@ -1176,7 +1176,7 @@ fn ledger_json(
         rcsr::gpu_stats::Ratio::undefined(f64::NAN, f64::NAN, "decades_per_gpu_hour", "run")
     };
     format!(
-        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"fallback_s\":{},\"gate_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
+        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"fallback_s\":{},\"gate_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
         jnum(l.wall_s()),
         stages,
         jnum(l.stage_sum_s()),
@@ -1318,7 +1318,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"seconds\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1833,8 +1833,8 @@ impl DevSink {
             duty_run: outcome.gpu.as_ref().map(|g| g.ledger.duty_run().value),
             unaccounted_s: outcome.gpu.as_ref().map(|g| g.ledger.unaccounted_s()),
             fit_kernel_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_s()),
-            fit_kernel_f32_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_lm_s()),
-            fit_kernel_f64_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_polish_s()),
+            fit_kernel_lm_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_lm_s()),
+            fit_kernel_polish_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_polish_s()),
             fit_fallback_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_fallback_s()),
             fit_refit_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_s()),
             fit_refits: outcome.gpu.as_ref().map(|g| g.fit_refits),
@@ -11653,7 +11653,7 @@ mod tests {
         g.ledger.record_fit_gate(0.375);
         let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true, 10.0);
         assert!(
-            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"admitted_wide\":0,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"seconds\":0.25,\"kernel_f32_s\":0.5,\"kernel_f64_s\":0.25,\"polish\":\"f32\",\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"gate_s\":0.375,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096,\"fit_rows\":0,\"score_rows\":0,\"fit_twin_bytes\":0,\"subsample_hash\":null}"),
+            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"admitted_wide\":0,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"refit_candidates\":0,\"refit_s\":0,\"rescore_s\":0,\"seconds\":0.25,\"kernel_lm_s\":0.5,\"kernel_polish_s\":0.25,\"polish\":\"f32\",\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"gate_s\":0.375,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096,\"fit_rows\":0,\"score_rows\":0,\"fit_twin_bytes\":0,\"subsample_hash\":null}"),
             "{}",
             json
         );
