@@ -237,12 +237,18 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              a look-ahead on time series; reported as centred
   --allow-interpolate        permit --fill interpolate on time-ordered data
   --allow-lockbox            permit train/validation/test rows in 2026H2 (declared final test only)
+                             It never opens the declared locked test (--lockbox).
   --lockbox <START,END>      declared locked test (UTC, half-open). Overrides the range
                              declared with the data (<data>.manifest.json, .schema.json,
                              .enrich.json or <csv>.lockbox.json). Train, validation and
                              test rows inside it are refused (exit 3); run.json `lockbox`
                              reports rows, date range, read count, declared, source,
                              rows_in_scope, evaluated
+                             With a declaration every split side is checked: without
+                             --time the data must hold one integer epoch-seconds
+                             column, else the run exits 3 asking for --time; a
+                             time column that is not epoch seconds, or a row without
+                             a time stamp, is exit 3 too
   --ledger <file>            candidate ledger whose locked reads run.json counts
   --arm <name>              ablation arm label; run.json gains an `ablation` object with the arm,
                              the SHA-256 of the ordered variable list, the generation budget and
@@ -356,6 +362,9 @@ OVERFITTING DIAGNOSTICS (always on):
                              rolling forward chaining (time-ordered data)
                              purged  k-fold with a --gap embargo either side of
                                      each test block
+                             Folds are drawn from the rows left by --exclude and
+                             --filter. With a declared locked test every such row
+                             is checked, also with --allow-lockbox.
   --cv-k <K>                 number of folds (default 5); --cv costs ~K searches
   --null-runs <n>            rerun the identical search on n shuffled targets
                              (y-randomisation control) and report the null error
@@ -4595,6 +4604,27 @@ fn main() {
     };
     notes.extend(prepared.report.notes.iter().cloned());
     let prepared_s = run_start.elapsed().as_secs_f64();
+    // #145, #518: cross-validation draws its own folds, so the split guard
+    // cannot see them. Every row of the population (after --exclude and
+    // --filter) is a training or test row of some fold; refuse before the
+    // search. The declared locked test is checked even with --allow-lockbox.
+    let cv_keep: Option<Vec<bool>> = if cv_mode.is_some() {
+        let keep = match data::population_mask(&table, &spec, &prep) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        if let Err(e) = data::check_cv_lockbox(&table, &spec, &keep, allow_lockbox) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+        Some(keep)
+    } else {
+        None
+    };
+
     if cfg.metric == Metric::Slope {
         match prepared.require_slope_pairs() {
             Ok(pairs) => notes.push(format!(
@@ -5986,36 +6016,6 @@ fn main() {
         None
     };
 
-    // #145: cross-validation draws its own folds, so the split guard above
-    // cannot see them. If any row of the table is in 2026H2, some fold would
-    // train or score on the holdout; refuse before the first fold.
-    if cv_mode.is_some() && !allow_lockbox {
-        if let Some(name) = &time_name {
-            if let Ok(j) = table.index_of(name) {
-                let keys = data::time_keys_with(&table, j, &spec.time)
-                    .map(|(k, _)| k)
-                    .unwrap_or_default();
-                let times: Vec<i64> = keys
-                    .iter()
-                    .filter(|v| v.is_finite())
-                    .map(|v| v.floor() as i64)
-                    .collect();
-                if let Err(e) = rcsr::lockbox::Guard::default()
-                    .check_times("cross-validation rows", &times)
-                {
-                    eprintln!("error: {}", e);
-                    std::process::exit(EXIT_INPUT);
-                }
-                if let Some(d) = &spec.declared_lockbox {
-                    if let Err(e) = d.check_times("cross-validation rows", name, &times) {
-                        eprintln!("error: {}", e);
-                        std::process::exit(EXIT_INPUT);
-                    }
-                }
-            }
-        }
-    }
-
     // Cross-validation (issue #19): rebuild the split as `k` folds, re-run the
     // search on each fold's own training rows, and score the model it returns on
     // the held-out block. Each fold is normalised on its training rows alone.
@@ -6030,6 +6030,7 @@ fn main() {
             gap,
             cfg.seed,
             &dtypes,
+            cv_keep.as_deref(),
         ) {
             Ok(f) => f,
             Err(e) => {
@@ -6615,15 +6616,13 @@ fn main() {
                     Some(d) => d.lockbox,
                     None => rcsr::lockbox::Lockbox::crypto_2026h2(),
                 };
-                let times: Vec<i64> = match time_name.as_deref().and_then(|n| table.index_of(n).ok()) {
-                    Some(j) => data::time_keys_with(&table, j, &spec.time)
-                        .map(|(k, _)| k)
-                        .unwrap_or_default()
+                let times: Vec<i64> = match data::lockbox_stamps(&table, &spec) {
+                    Ok(Some((_, keys))) => keys
                         .iter()
                         .filter(|v| v.is_finite())
                         .map(|v| v.floor() as i64)
                         .collect(),
-                    None => Vec::new(),
+                    _ => Vec::new(),
                 };
                 let overlap = lockbox.overlap(times.iter().copied());
                 let reads = ledger_arg

@@ -387,7 +387,7 @@ The build writes `"locked_test": {"start", "end", "start_date", "end_date", "sou
 | `rcsr ladder` | exit 3 for a fold touching the range; `--scheme locked --locked-test --ledger --sealed` reads it once and appends a `baseline_read` ledger line; a second read is exit 3 |
 | `rcsr ablation score` | exit 3 for a fold touching the range |
 
-Rows are refused, never dropped silently, because a drop would change the split fractions without a record. A time column that is not epoch seconds skips the row check and the report says `lockbox.checked: false`.
+Rows are refused, never dropped silently, because a drop would change the split fractions without a record. With a declaration no check is skipped: `--time` is needed unless the data holds exactly one integer epoch-seconds column (the `i64` time column of a store); a time column that does not parse or is not epoch seconds, and any split row without a time stamp, is exit 3. Every run that exits 0 reports `lockbox.checked: true`. `--cv` checks every row left by `--exclude` and `--filter`, also with `--allow-lockbox`, and draws its folds from those rows only. Without a declaration, a time column that is not epoch seconds skips the row check and the report says `lockbox.checked: false`.
 
 ## Provenance manifest
 

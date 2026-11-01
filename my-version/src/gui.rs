@@ -1812,6 +1812,7 @@ impl RunPlan {
             self.prepared.report.gap,
             self.cfg.seed,
             &self.dtypes,
+            None,
         )?;
         let mut fold_rows = Vec::new();
         for f in &folds {

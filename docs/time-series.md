@@ -116,6 +116,8 @@ split such as `--split temporal --validation-frac 0.20` on a panel that ends
 inside the locked range puts its test block there; the refusal tells you to
 `--exclude` the rows.
 
+The check needs the time stamps of every split side. Pass `--time <epoch-seconds column>`; without it the search uses the data's single integer epoch-seconds column, and exits 3 when there is none or several. Selectors without `--time` are checked the same way. `--cv` ignores `--allow-lockbox` for the declared range and draws its folds from the rows left by `--exclude` and `--filter`.
+
 **What fails.** Without the purge, the last training row and first test row
 share most of their label window. The test error is then a near-copy of the
 training error, and `--folds` blocks look suspiciously similar at the boundary.
@@ -380,7 +382,7 @@ rcsr --data d.csv --target y --vars x1,x2 --split temporal --time t \
 
 # Freeze the expression, then score it once on 2022+ with no search.
 rcsr --data d.csv --target y --vars x1,x2 --eval-expr 'the_chosen_expression' \
-     --train-select "year < 2022" --test-select "year >= 2022"
+     --time t --train-select "year < 2022" --test-select "year >= 2022"
 ```
 
 `--eval-expr` does not search; it parses the formula, scores it on the selected
@@ -670,7 +672,7 @@ rcsr ... --stability 50
 
 # 3. Freeze, then lockbox
 rcsr ... --eval-expr 'frozen_expression' \
-     --train-select "year < 2022" --test-select "year >= 2022"
+     --time t --train-select "year < 2022" --test-select "year >= 2022"
 
 # 4. Count trials and add costs
 echo $((islands * pop * generations * seeds * folds))

@@ -30,7 +30,7 @@ pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--max-levels", "int", "16", "maximum distinct values in a categorical column"),
         ("--skip-malformed", "flag", "false", "drop data rows whose field count differs from the header and report the count; default refuses the file with an input error naming the 1-based line"),
         ("--test-frac", "float", "0.25", "held-out fraction"),
-        ("--allow-lockbox", "flag", "false", "permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only)"),
+        ("--allow-lockbox", "flag", "false", "permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only); never opens the declared locked test"),
         ("--lockbox", "string", "declared with the data", "declared locked test START,END (UTC, half-open); overrides the range stored in the data's manifest, schema or sidecar. Train, validation and test rows inside it are refused (exit 3). The run.json lockbox object reports rows, date range, read count, declared, source, rows_in_scope, evaluated"),
         ("--ledger", "string", "none", "candidate ledger (JSONL) whose locked-test reads run.json reports as lockbox.read_count"),
         ("--arm", "string", "none", "ablation arm label (A0..A5). run.json gains an ablation object with arm, feature_list_sha256 (SHA-256 of the ordered variable list, one name per line), generation_budget (--generations) and generations_run, so an arm can be audited and its seeds compared. See rcsr ablation"),

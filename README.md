@@ -800,7 +800,7 @@ run:
 | `--smooth k` | `k`-wide **trailing** moving average per column (row `i` reads only itself and earlier rows); edges shrink |
 | `--smooth-centred k` | the old **centred** window; reads future bars, is opt-in, and is reported as look-ahead |
 | `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
-| `--allow-lockbox` | permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only) |
+| `--allow-lockbox` | permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only); never opens the declared locked test |
 | `--lockbox START,END` | declared locked test (UTC, half-open). Overrides the range declared with the data (`rcsr panel build --locked-test`). Train, validation and test rows inside it are refused (exit 3). The run.json `lockbox` object reports rows, date range, read count, `declared`, `source` (`store` or `flag`), `rows_in_scope` and `evaluated` |
 | `--ledger file` | candidate ledger whose locked reads run.json counts |
 | `--arm name` | ablation arm label; run.json gains an `ablation` object with the arm, the SHA-256 of the ordered variable list, the generation budget and the generations reached |
@@ -1026,7 +1026,7 @@ re-runs the whole search on each fold's training rows (normalised on those rows
 alone) and reports the mean and spread of the held-out error, so a single lucky
 split cannot flatter the answer. Use `rolling` for time series (it never trains
 on the future) and `purged` to embargo `--gap` rows around each test block. It
-costs about `k` extra searches.
+costs about `k` extra searches. The folds are drawn from the rows left by `--exclude` and `--filter`. With a declared locked test (see `docs/time-series.md`) every such row is checked, also with `--allow-lockbox`.
 
 `--stability B` asks the question that matters most: **does the same law come
 back?** It bootstraps the training rows `B` times, re-runs the identical search
