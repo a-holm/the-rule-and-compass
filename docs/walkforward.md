@@ -138,7 +138,7 @@ the winner.
   reported as the strategy's P&L. The report labels it `"label":
   "hindsight_bound"`, `"is_strategy": false`, and carries the threshold book's
   net, the gap and `rule_le_bound`.
-* `--cost-bps` is charged **per side** on `|position - previous position|`,
+* `--cost-bps` (default 10; a `--target-spec` cost wins, see "One book from search to evaluation") is charged **per side** on `|position - previous position|`,
   separately inside each `--group-by` series. Every series starts flat, so an
   entry costs one side and its exit (including the **final** exit of every
   group) costs the other: a round trip is `2 * cost_bps`. #145 changed the
@@ -374,6 +374,19 @@ net_t   = gross_t - cost_t                (the last row of a group also pays c_s
 A `.rcsb` store read with `--vars` and `--time` is projected to the columns the run names. With a trading objective the projection also keeps the target spec's `return_column` and the `--funding` column. A run without `--objective` keeps its projected column list. A `return_column` that is not in the store is an input error (exit 3) that names the target spec.
 
 Finalist selection with `--objective` scores every Pareto member this way on the validation slice only. The winner has the lowest objective value (`-net P&L`, `-Sharpe` or `-log growth`; ties keep the archive order, so the smaller expression wins). Candidates below `--min-trades` or with a non-finite value are unusable. The test block is scored once, for the winner.
+
+## One book from search to evaluation (#487)
+
+The search objective, `rcsr walkforward`, `rcsr ablation score` and `rcsr ladder` price one long/flat book with one cost, one return unit and one position rule. The declarations live in the target spec (`<data>.targets.json`) that `rcsr enrich --label long:<h>,fee=<bp>` writes, and in the `run.json` of the search.
+
+* **Cost.** `rcsr enrich --label long:<h>` needs `fee=` (exit 2; `fee=0` is allowed). The spec carries `cost_bps` (round trip, `2 * fee + spread + slip`) and `cost_per_side_bps = cost_bps / 2`. Every evaluator charges `cost_bps / 2` per side. `--cost-bps` that differs from the spec is refused (exit 2); `--cost-override <bp>` prices a different cost on purpose. Without a spec cost the flag or the default applies (walk-forward 10 bp, ladder and ablation 12 bp per side; the search needs the flag). A spec whose label is already net of cost (`cost_in_label`) declares no per-side cost.
+* **Units.** A spec with `return_units: "log"` makes the walk-forward, the ladder and `ablation score` convert the return column with `exp_m1` before any P&L, as the objective does. Without a spec the column is read as a simple return.
+* **Position rule.** `rcsr walkforward --from-run run.json` and `rcsr ablation score --from-run run.json` take the expression, the fixed threshold `objective.spec.threshold`, the per-side cost `objective.spec.per_side_bps` and the target spec (return column, units, horizon, entry offset, delay) from the run. A run without an `objective` block is refused (exit 3). `--expr`, `--threshold-quantile`, `--threshold-fixed` and `--target-spec` with `--from-run` are usage errors (exit 2). The quantile rule of a plain `walkforward --expr` is a different book: for a constant finalist every quantile threshold is flat, and the command warns.
+* **Target spec in walk-forward.** `--target-spec <file>` fills `--horizon`, `--entry-offset`, `--delay`, the return column, the units and the cost from the entry whose `column`, `name` or `return_column` is `--target`. A flag that disagrees is refused like the cost.
+* **Ladder grid.** With a spec cost the default `--cost-grid` is 1x, 2x and 3.33x the per-side cost. With a flag or the default cost it stays `12,20,40`. An explicit `--cost-grid` is absolute.
+* **Reports.** The `objective` block of `run.json`, the walk-forward report, the ladder report and the ablation result carry `cost: {per_side_bps, source, return_units}` with `source` one of `target_spec`, `flag` or `default`. A `flag` source priced against a spec adds `spec_per_side_bps`. `objective.finalist.constant` is true when the finalist reads no variable.
+
+Verify: `tests/cost_contract.rs` (`one_cost_one_book_across_evaluators`, `walkforward_from_run_prices_the_selected_book`, `a_log_return_column_is_converted_with_exp_m1_in_every_evaluator`, `the_cost_flag_must_agree_with_the_target_spec`, `the_cost_source_is_reported`, `from_run_refuses_a_run_without_an_objective_and_competing_rules`, `a_long_label_needs_an_explicit_fee`) and the `resolve_cost_*` unit tests in `src/target.rs`.
 
 ## Metrics
 

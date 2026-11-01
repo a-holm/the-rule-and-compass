@@ -80,6 +80,9 @@ pub struct ProtocolOptions {
     /// #309: score every candidate on every window in one batch (device kernel
     /// when available) and report it beside the exact finalists.
     pub batch_pnl: bool,
+    /// #487: where the cost and the return units came from. `None` is the
+    /// historical reading: the flag or default cost and simple returns.
+    pub cost: Option<crate::target::CostDecl>,
 }
 
 impl Default for ProtocolOptions {
@@ -96,7 +99,24 @@ impl Default for ProtocolOptions {
             pbo_blocks: 16,
             fdr_q: 0.10,
             batch_pnl: false,
+            cost: None,
         }
+    }
+}
+
+impl ProtocolOptions {
+    /// The cost block the report carries.
+    pub fn cost_decl(&self, per_side_bps: f64) -> crate::target::CostDecl {
+        self.cost.clone().unwrap_or(crate::target::CostDecl {
+            per_side_bps,
+            source: crate::target::CostSource::Default,
+            return_units: "simple".to_string(),
+            spec_per_side_bps: None,
+        })
+    }
+
+    fn log_returns(&self) -> bool {
+        self.cost.as_ref().is_some_and(|c| c.log_returns())
     }
 }
 
@@ -444,6 +464,8 @@ pub struct Report {
     pub group_by: Option<String>,
     pub windows: Vec<WindowResult>,
     pub pooled: Metrics,
+    /// #487: cost source and return units of the book.
+    pub cost: crate::target::CostDecl,
     pub cost_bps: f64,
     pub threshold_quantile: f64,
     /// The pre-registered fixed threshold, when one was supplied.
@@ -515,6 +537,16 @@ pub struct SignTest {
 // ---------------------------------------------------------------------------
 
 /// Evaluate `spec` against a `.rcsb` store or a CSV table.
+/// A target-column value in simple-return units: a `log` column is converted
+/// with `exp_m1`, the rule of the search objective.
+fn ret_in(opts: &ProtocolOptions, y: f64) -> f64 {
+    if opts.log_returns() {
+        y.exp_m1()
+    } else {
+        y
+    }
+}
+
 pub fn run_path(path: &str, spec: &EvalSpec) -> Result<Report, String> {
     run_path_with(path, spec, &ProtocolOptions::default())
 }
@@ -559,7 +591,7 @@ pub fn run_table_with(
             features.push(table.value(r, c));
         }
         let g = group_ids.as_ref().map_or(0, |ids| ids[r]);
-        acc.add(t, g, &features, table.value(r, layout.target), &trees);
+        acc.add(t, g, &features, ret_in(opts, table.value(r, layout.target)), &trees);
     }
     acc.finish(
         spec,
@@ -635,7 +667,7 @@ pub fn run_store_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Re
                 }
                 (Some(c), None) => group_key(view.col(c)[r]),
             };
-            let y = view.col(layout.target)[r];
+            let y = ret_in(opts, view.col(layout.target)[r]);
             acc.add(t, g, &features, y, &trees);
         }
     }
@@ -1431,6 +1463,7 @@ impl Accum {
             group_by: spec.group.clone(),
             windows,
             pooled,
+            cost: opts.cost_decl(spec.cost_bps),
             cost_bps: spec.cost_bps,
             threshold_quantile: spec.threshold_quantile,
             threshold_fixed: spec.threshold_fixed,
@@ -2795,6 +2828,7 @@ impl Report {
              \"purge\":{{\"horizon_seconds\":{},\"embargo_seconds\":{}}},\
              \"cost_model\":{{\"per_side_bps\":{},\"round_trip_bps\":{},\
              \"charged_on\":\"|position change| per group; per-window metrics start flat, pooled carries the boundary\"}},\
+             \"cost\":{},\
              \"position_rule\":{},\
              \"policy\":{{\"name\":{},\"hindsight_bound\":{},\"band_width\":{},\
              \"min_hold\":{},\"short\":false,\"gpu\":{}}},\
@@ -2839,6 +2873,7 @@ impl Report {
             jnum(self.embargo),
             jnum(self.cost_bps),
             jnum(self.cost_bps * 2.0),
+            self.cost.json(),
             jstr(position_rule),
             jstr(self.policy.as_str()),
             self.policy == Policy::Dp,

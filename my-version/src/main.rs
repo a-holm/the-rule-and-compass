@@ -171,14 +171,19 @@ INPUT:
                              side on |delta p| including the final exit; the
                              fit and the archive still use --metric. Needs a
                              temporal split with --validation-frac, a
-                             forward_return --target-spec, and --cost-bps.
+                             forward_return --target-spec, and a cost (--cost-bps
+                             or the spec cost_bps).
                              The test block is read once, for the winner only
   --position long_only       the only position map (default). short is refused
   --allow-short              refused: there is no short P&L, borrow or funding
   --threshold <f>            long when the prediction is strictly above <f>
                              (default 0)
-  --cost-bps <f>             cost per side in basis points (required with a
-                             P&L objective; 0 only when stated)
+  --cost-bps <f>             cost per side in basis points (required with a P&L
+                             objective unless the target spec declares cost_bps, which
+                             gives cost_bps / 2 per side; a different value is
+                             refused, exit 2; 0 only when stated)
+  --cost-override <f>        per-side cost that differs from the target spec cost on
+                             purpose; the objective block says cost.source = flag
   --slippage-bps <f>         extra cost per side in basis points (default 0)
   --cash-return <f>          return per row earned while flat (default 0)
   --funding <col>            per-row funding rate paid while long
@@ -2078,6 +2083,7 @@ fn main() {
     let mut allow_short = false;
     let mut trade_threshold = 0.0f64;
     let mut trade_cost_bps: Option<f64> = None;
+    let mut trade_cost_override: Option<f64> = None;
     let mut trade_slippage_bps = 0.0f64;
     let mut trade_cash_return = 0.0f64;
     let mut trade_funding: Option<String> = None;
@@ -2371,6 +2377,10 @@ fn main() {
             "--cost-bps" => {
                 trading_flags.push("--cost-bps");
                 trade_cost_bps = Some(parse_trade_number("--cost-bps", &val!()));
+            }
+            "--cost-override" => {
+                trading_flags.push("--cost-override");
+                trade_cost_override = Some(parse_trade_number("--cost-override", &val!()));
             }
             "--slippage-bps" => {
                 trading_flags.push("--slippage-bps");
@@ -4274,6 +4284,7 @@ fn main() {
     }
     let mut trading_spec: Option<rcsr::trading::TradingSpec> = None;
     let mut trading_cols: Option<data::TradingColumns> = None;
+    let mut trading_cost: Option<target::CostDecl> = None;
     if objective.is_trading() {
         let name = objective.name();
         if multi_output {
@@ -4306,13 +4317,21 @@ fn main() {
                 name, ts.kind
             ));
         }
-        let cost = match trade_cost_bps {
-            Some(c) => c,
-            None => trading_usage(&format!(
-                "--objective {} needs a cost assumption: --cost-bps <f> per side (0 only when stated)",
+        let spec_declares_cost = ts.per_side_cost_bps().is_some();
+        if trade_cost_bps.is_none() && trade_cost_override.is_none() && !spec_declares_cost {
+            trading_usage(&format!(
+                "--objective {} needs a cost assumption: a target spec with cost_bps, or --cost-bps <f> per side (0 only when stated)",
                 name
-            )),
-        };
+            ));
+        }
+        let (cost, cost_source) =
+            match target::resolve_cost(Some(ts), trade_cost_bps, trade_cost_override, 0.0) {
+                Ok(v) => v,
+                Err(e) => trading_usage(&e),
+            };
+        let mut decl = target::CostDecl::new(Some(ts), cost, cost_source);
+        decl.per_side_bps = cost + trade_slippage_bps;
+        trading_cost = Some(decl);
         if cost < 0.0 || trade_slippage_bps < 0.0 {
             trading_usage("--cost-bps and --slippage-bps must be non-negative");
         }
@@ -5718,6 +5737,8 @@ fn main() {
             Some(rcsr::trading::FinalistReport {
                 objective,
                 spec: tspec.clone(),
+                cost: trading_cost.clone().unwrap_or_else(|| target::CostDecl::new(None, tspec.per_side_bps(), target::CostSource::Flag)),
+                constant: rcsr::trading::is_constant(tree),
                 candidates: rows.len(),
                 usable,
                 expression: top.expression.clone(),
@@ -9162,7 +9183,8 @@ USAGE:
 
 OPTIONS:
   --data <path>              .rcsb column store, or a CSV table as a fallback
-  --target <col>             forward-return column used for P&L
+  --target <col>             forward-return column used for P&L (optional with
+                             --target-spec or --from-run: the spec's return column)
   --expr <formula>           score expression, variables resolved by column name;
                              repeat to select among candidates on the validation slice
   --select-band              #308: select among repeated --expr candidates with
@@ -9187,7 +9209,20 @@ OPTIONS:
                              (default 0)
   --embargo <seconds>        extra gap between train_end and test_start
                              (default: the horizon)
-  --cost-bps <f>             cost per side in basis points (default {DEFAULT_COST_BPS})
+  --cost-bps <f>             cost per side in basis points (default {DEFAULT_COST_BPS}); a
+                             --target-spec or --from-run cost wins and a different
+                             value is refused (exit 2)
+  --cost-override <f>        price a different per-side cost on purpose; the report
+                             says cost.source = flag and keeps the spec cost
+  --target-spec <file>       target spec (rcsr-target-spec/1): --horizon, --entry-offset,
+                             --delay, the return column, return units (log is
+                             converted with exp_m1) and the cost come from the entry
+                             matching --target; a flag that disagrees is refused
+  --from-run <run.json>      the book a search with --objective selected: expression,
+                             variables, fixed threshold, per-side cost and target spec
+                             of the run. Refuses --expr, --threshold-quantile,
+                             --threshold-fixed and --target-spec, and a run without an
+                             objective block
   --threshold-quantile <q>   exact type-7 training/validation score quantile
                              (default {DEFAULT_QUANTILE}); selected by order-preserving
                              radix count, so theta is bit-identical to numpy
@@ -9304,9 +9339,14 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut group_col: Option<String> = None;
     let mut windows: Vec<walkforward::Window> = Vec::new();
     let mut windows_file: Option<String> = None;
-    let mut horizon = 0.0f64;
+    let mut horizon: Option<f64> = None;
     let mut embargo: Option<f64> = None;
-    let mut cost_bps = walkforward::DEFAULT_COST_BPS;
+    let mut cost_flag: Option<f64> = None;
+    let mut cost_override: Option<f64> = None;
+    let mut target_spec_path: Option<String> = None;
+    let mut from_run_path: Option<String> = None;
+    let mut entry_offset_flag: Option<f64> = None;
+    let mut delay_flag: Option<f64> = None;
     let mut quantile = walkforward::DEFAULT_QUANTILE;
     let mut quantile_set = false;
     let mut threshold_fixed: Option<f64> = None;
@@ -9395,7 +9435,7 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--horizon" => {
-                horizon = number(need(args, i + 1, "--horizon"), "--horizon");
+                horizon = Some(number(need(args, i + 1, "--horizon"), "--horizon"));
                 i += 1;
             }
             "--embargo" => {
@@ -9403,7 +9443,19 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--cost-bps" => {
-                cost_bps = number(need(args, i + 1, "--cost-bps"), "--cost-bps");
+                cost_flag = Some(number(need(args, i + 1, "--cost-bps"), "--cost-bps"));
+                i += 1;
+            }
+            "--cost-override" => {
+                cost_override = Some(number(need(args, i + 1, "--cost-override"), "--cost-override"));
+                i += 1;
+            }
+            "--target-spec" => {
+                target_spec_path = Some(need(args, i + 1, "--target-spec"));
+                i += 1;
+            }
+            "--from-run" => {
+                from_run_path = Some(need(args, i + 1, "--from-run"));
                 i += 1;
             }
             "--threshold-quantile" => {
@@ -9488,11 +9540,11 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--quiet" => quiet = true,
             "--entry-offset" => {
-                popts.entry_offset = number(need(args, i + 1, "--entry-offset"), "--entry-offset");
+                entry_offset_flag = Some(number(need(args, i + 1, "--entry-offset"), "--entry-offset"));
                 i += 1;
             }
             "--delay" => {
-                popts.delay = number(need(args, i + 1, "--delay"), "--delay");
+                delay_flag = Some(number(need(args, i + 1, "--delay"), "--delay"));
                 i += 1;
             }
             "--windows-scheme" => {
@@ -9594,6 +9646,104 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: walkforward needs --data\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
     });
+    let usage_fail = |msg: &str| -> ! {
+        eprintln!("error: {}", msg);
+        std::process::exit(EXIT_USAGE);
+    };
+    let input_fail = |msg: &str| -> ! {
+        eprintln!("error: {}", msg);
+        std::process::exit(EXIT_INPUT);
+    };
+    // #487: one declaration of the label window, the return units and the
+    // cost, read from a target spec or from the run that selected the book.
+    if from_run_path.is_some() && target_spec_path.is_some() {
+        usage_fail("--from-run and --target-spec are alternatives: the run carries its own target spec");
+    }
+    let mut cost_spec: Option<rcsr::target::TargetSpec> = None;
+    let mut run_cost: Option<(f64, rcsr::target::CostSource)> = None;
+    if let Some(path) = &from_run_path {
+        if !expressions.is_empty() {
+            usage_fail("--from-run takes the expression from the run; do not pass --expr");
+        }
+        if quantile_set || threshold_fixed.is_some() {
+            usage_fail(
+                "--from-run takes the threshold rule from the run; do not pass \
+                 --threshold-quantile or --threshold-fixed",
+            );
+        }
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
+        let book = rcsr::run_book::RunBook::parse(&text)
+            .unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
+        expressions.push(book.expression.clone());
+        vars_src = Some(book.variables.join(","));
+        threshold_fixed = Some(book.threshold);
+        run_cost = Some((book.per_side_bps, book.source));
+        cost_spec = Some(book.spec);
+    } else if let Some(path) = &target_spec_path {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
+        let specs = rcsr::target::parse_file(&text).unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
+        let want = target.clone().unwrap_or_else(|| usage_fail("--target-spec needs --target to pick the spec entry"));
+        match rcsr::target::entry_for(&specs, &want) {
+            Some(s) => cost_spec = Some(s.clone()),
+            None => input_fail(&format!("{}: no entry for target '{}'", path, want)),
+        }
+    }
+    let mut cost_bps = walkforward::DEFAULT_COST_BPS;
+    if let Some(s) = &cost_spec {
+        let effective = s.return_column.clone().unwrap_or_else(|| s.column.clone());
+        if let Some(t) = &target {
+            if *t != effective && *t != s.column && *t != s.name {
+                usage_fail(&format!(
+                    "--target {} is not the spec's return column '{}' or label column '{}'",
+                    t, effective, s.column
+                ));
+            }
+        }
+        let unit_scale = matches!(&s.scale, rcsr::target::Scale::Constant { value } if *value == 1.0);
+        if s.return_column.is_none() && (s.offset != 0.0 || s.clip.is_some() || !unit_scale) {
+            input_fail(
+                "the target is scaled, clipped or offset: declare a return_column in the \
+                 target spec so the P&L uses realised returns",
+            );
+        }
+        target = Some(effective);
+        let agree = |flag: &str, given: Option<f64>, declared: f64| -> f64 {
+            match given {
+                Some(g) if (g - declared).abs() > 1e-9 => usage_fail(&format!(
+                    "{} {} differs from the target spec ({}); remove the flag or edit the spec",
+                    flag, g, declared
+                )),
+                _ => declared,
+            }
+        };
+        horizon = Some(agree("--horizon", horizon, s.horizon_seconds));
+        popts.entry_offset = agree("--entry-offset", entry_offset_flag, s.entry_offset_seconds);
+        popts.delay = agree("--delay", delay_flag, s.delay_seconds);
+    } else {
+        popts.entry_offset = entry_offset_flag.unwrap_or(0.0);
+        popts.delay = delay_flag.unwrap_or(0.0);
+    }
+    let resolved = match run_cost {
+        Some((per_side, source)) => match (cost_flag, cost_override) {
+            (Some(_), Some(_)) => Err("--cost-bps and --cost-override are alternatives; pass one of them".to_string()),
+            (None, Some(o)) => Ok((o, rcsr::target::CostSource::Flag)),
+            (Some(f), None) if (f - per_side).abs() > 1e-12 => Err(format!(
+                "--cost-bps {} differs from the run ({} per side); \
+                 use --cost-override to price a different cost",
+                f, per_side
+            )),
+            _ => Ok((per_side, source)),
+        },
+        None => rcsr::target::resolve_cost(cost_spec.as_ref(), cost_flag, cost_override, cost_bps),
+    };
+    let (resolved_cost, cost_source) = resolved.unwrap_or_else(|e| usage_fail(&e));
+    cost_bps = resolved_cost;
+    if cost_spec.is_some() {
+        popts.cost = Some(rcsr::target::CostDecl::new(cost_spec.as_ref(), cost_bps, cost_source));
+    } else if cost_source == rcsr::target::CostSource::Flag {
+        popts.cost = Some(rcsr::target::CostDecl::new(None, cost_bps, cost_source));
+    }
+    let horizon = horizon.unwrap_or(0.0);
     let target = target.unwrap_or_else(|| {
         eprintln!("error: walkforward needs --target\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
@@ -9814,6 +9964,20 @@ fn run_walkforward(args: &[String]) -> ! {
             std::process::exit(EXIT_INPUT);
         }
     };
+    if spec.threshold_fixed.is_none() {
+        for c in &report.candidates {
+            let constant = expr::parse(c, &report.variables)
+                .map(|t| rcsr::trading::is_constant(&t))
+                .unwrap_or(false);
+            if constant {
+                eprintln!(
+                    "warning: score expression '{}' is constant: every quantile threshold makes \
+                     the book flat; pass --from-run or --threshold-fixed to price the book the search selected",
+                    c
+                );
+            }
+        }
+    }
     let report_sha = rcsr::manifest::sha256_hex(report.json().as_bytes());
     if let Some(want) = &expect_hash {
         if want != &report_sha {

@@ -3103,7 +3103,7 @@ fn legacy_fwd_label_is_unchanged_next_to_a_long_label() {
     o.labels = vec!["fwd:2,cost=0".to_string()];
     enrich::build(&o).unwrap();
     o.out = Some(b.clone());
-    o.labels = vec!["fwd:2,cost=0".to_string(), "long:2".to_string()];
+    o.labels = vec!["fwd:2,cost=0".to_string(), "long:2,fee=0".to_string()];
     enrich::build(&o).unwrap();
     let (x, y) = (column(&a, "fwd2"), column(&b, "fwd2"));
     assert!(x.iter().zip(&y).all(|(p, q)| p.to_bits() == q.to_bits()));
@@ -3118,18 +3118,18 @@ fn long_label_dry_run_writes_no_sidecar_and_bad_specs_fail() {
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     write_store(&src, &two_symbol_rows(40), 30);
     let mut o = opts(&src, &out, "r1");
-    o.labels = vec!["long:2".to_string()];
+    o.labels = vec!["long:2,fee=0".to_string()];
     o.dry_run = true;
     let r = enrich::build(&o).unwrap();
     assert_eq!(r.columns_out, r.columns_in + 1 + 1 + 9);
     assert!(rcsr::target::label_sidecar_path(&out).map_or(true, |p| !std::path::Path::new(&p).exists()));
-    for bad in ["long:2,side=short", "long:2,mystery=1", "long:2,name=Bad", "long:0"] {
+    for bad in ["long:2,fee=0,side=short", "long:2,fee=0,mystery=1", "long:2,fee=0,name=Bad", "long:0,fee=0"] {
         o.labels = vec![bad.to_string()];
         assert!(enrich::build(&o).is_err(), "{bad}");
     }
-    o.labels = vec!["long:2".to_string(), "long:2".to_string()];
+    o.labels = vec!["long:2,fee=0".to_string(), "long:2,fee=0".to_string()];
     assert!(enrich::build(&o).unwrap_err().contains("used twice"));
-    o.labels = vec!["long:4".to_string()];
+    o.labels = vec!["long:4,fee=0".to_string()];
     assert!(enrich::build(&o).unwrap_err().contains("overlap"));
     o.allow_overlap = true;
     assert!(enrich::build(&o).is_ok());

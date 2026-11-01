@@ -8024,7 +8024,7 @@ fn write_label_sidecars(data: &str, out: &str, outputs: &[LongLabelOutput]) -> R
     let body = format!(
         "{{\"schema\":{},\"targets\":[{}]}}\n",
         jstr(crate::target::SCHEMA),
-        specs.iter().map(|s| format!("{{{}}}", s.fields_json())).collect::<Vec<_>>().join(",")
+        specs.iter().map(|s| format!("{{{}}}", s.file_json())).collect::<Vec<_>>().join(",")
     );
     crate::atomic::write_text_atomic(&targets_path, &body)
 }
@@ -8092,7 +8092,14 @@ pub fn run(args: &[String]) -> ! {
             "--data" | "-d" => opts.data = val!(),
             "--out" | "-o" => opts.out = Some(val!()),
             "--features" => opts.features.push(val!()),
-            "--label" => opts.labels.push(val!()),
+            "--label" => {
+                let v = val!();
+                if v.trim_start().starts_with("long:") && !crate::labels::LongLabelSpec::declares_fee(&v) {
+                    eprintln!("error: {}", crate::labels::missing_fee_message(&v));
+                    std::process::exit(EXIT_USAGE);
+                }
+                opts.labels.push(v);
+            }
             "--allow-overlap" => opts.allow_overlap = true,
             "--allow-short" => fail(&crate::labels::refuse_allow_short()),
             "--side" => {
@@ -8230,14 +8237,15 @@ INPUT / OUTPUT:
   --eth-data <store>      ETH benchmark store when --data does not contain it
   --label <spec>          fwd:<tf|bars>,cost=<bp>,volnorm=<bars>,stride=<n>
                           (repeatable; labels are targets, not features)
-  --label long:<tf|bars>[,name=<id>][,delay=<bars>][,fee=<bp>][,spread=<bp>]
+  --label long:<tf|bars>[,name=<id>][,delay=<bars>],fee=<bp>[,spread=<bp>]
                           [,slip=<bp>][,vol=<bars>][,floor=<bp>][,clip=<c>][,up=<u>]
                           [,down=<d>][,stride=<n>]
                           long-only label family (CPU f64): lbl_<name>_{fwd,y,
                           long_net,action,t1,exit_ret,m_net,m_barrier,weight};
                           writes <out>.labels.json (reports, label hash, top
-                          10 absolute moves) and a y target spec in
-                          <out>.targets.json; never a --vars input
+                          10 absolute moves) and a y target spec (cost_bps, cost_per_side_bps)
+                          in <out>.targets.json; fee= is required (fee=0 for none, exit 2
+                          otherwise); never a --vars input
   --allow-overlap         permit a label stride below the horizon for horizons of
                           4h and longer (labels overlap; use uniqueness weights)
   --side long             the only side; --side short and --allow-short are refused
