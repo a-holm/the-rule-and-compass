@@ -11,6 +11,8 @@ use std::process::Command;
 const T0: i64 = 1_704_067_200;
 const H: i64 = 3600;
 const DEFAULT_PURGE: i64 = 219_600;
+/// The embargo of a store whose writer declared none (`protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS`).
+const EXISTING_EMBARGO: i64 = 10_972_800;
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("rcsr-locked-window-{}-{}", std::process::id(), name));
@@ -74,7 +76,7 @@ fn the_search_refuses_the_declared_locked_test_unless_the_rows_are_excluded() {
     assert_eq!(code, 3, "{}", err);
     assert!(err.contains("split has"), "{}", err);
     assert!(err.contains("declared locked test 2024-01-13..2024-01-17 (store manifest"), "{}", err);
-    assert!(err.contains(&format!("--exclude 'ts >= {}'", locked().start - DEFAULT_PURGE)), "{}", err);
+    assert!(err.contains(&format!("--exclude 'ts >= {} and ts < {}'", locked().start - DEFAULT_PURGE, locked().end + EXISTING_EMBARGO)), "{}", err);
 
     let at_start = format!("ts >= {}", locked().start);
     let (code, _, err) = search(&d, &run, &["--exclude", &at_start]);
@@ -82,7 +84,7 @@ fn the_search_refuses_the_declared_locked_test_unless_the_rows_are_excluded() {
     assert!(err.contains("whose label window reaches the declared locked test"), "{}", err);
 
     let exclude = format!("ts >= {}", locked().start - DEFAULT_PURGE);
-    assert!(err.contains(&format!("--exclude '{}'", exclude)), "{}", err);
+    assert!(err.contains(&format!("--exclude '{} and ts < {}'", exclude, locked().end + EXISTING_EMBARGO)), "{}", err);
     let (code, _, err) = search(&d, &run, &["--exclude", &exclude]);
     assert_eq!(code, 0, "{}", err);
     let json = std::fs::read_to_string(&run).unwrap();
@@ -266,7 +268,7 @@ fn stored_reads_each_carrier_and_a_flag_must_cover_the_store_range() {
     let d = lockbox::resolve(None, &p).unwrap().declared().unwrap();
     let times = [lb.start - 1, lb.start, lb.end - 1, lb.end];
     let e = d.check_times("test split", "ts", &times, 0).unwrap_err();
-    assert!(e.contains("2 row(s)"), "{}", e);
+    assert!(e.contains("3 row(s)"), "{}", e);
     assert!(d.check_times("test split", "ts", &times[..1], 0).is_ok());
 }
 
@@ -370,7 +372,7 @@ fn development_outputs_ignore_locked_prices() {
     for d in [&a, &b] {
         let (code, err) = dev_search(d, &s(&dir.join("x.json")), &at_start);
         assert_eq!(code, 3, "{}", err);
-        assert!(err.contains(&format!("--exclude 'ts >= {}'", s_start - DEFAULT_PURGE)), "{}", err);
+        assert!(err.contains(&format!("--exclude 'ts >= {} and ts < {}'", s_start - DEFAULT_PURGE, s_start + 100 * H + EXISTING_EMBARGO)), "{}", err);
     }
     let at_purge = format!("ts >= {}", s_start - DEFAULT_PURGE);
     let (run_a, run_b) = (s(&dir.join("ra.json")), s(&dir.join("rb.json")));
@@ -569,7 +571,7 @@ fn audit_leaves_the_locked_rows_out_and_counts_them() {
     let data = dir.join("d.csv");
     series_csv_at(&data, T1);
     let d = s(&data);
-    let inside = (0..400i64).filter(|i| T1 + i * H >= DEFAULT_START).count();
+    let inside = (0..400i64).filter(|i| T1 + i * H >= DEFAULT_START - DEFAULT_PURGE).count();
     assert!(inside > 0 && inside < 400);
     let (_, out, err) = rcsr(&["audit", "--data", &d, "--target", "y", "--time", "ts", "--json"]);
     assert!(out.contains(&format!("\"rows_left_out\":{inside}")), "{}{}", out, err);
@@ -725,7 +727,7 @@ fn cv_folds_honour_exclude() {
         assert_eq!(code, 3, "{}", err);
         assert!(err.contains("cross-validation rows has"), "{}", err);
         assert!(err.contains("whose label window reaches the declared locked test"), "{}", err);
-        assert!(err.contains(&format!("--exclude '{}'", exclude)), "{}", err);
+        assert!(err.contains(&format!("--exclude '{} and ts < {}'", exclude, locked().end + EXISTING_EMBARGO)), "{}", err);
         let run = s(&dir.join(format!("{}.json", p.file_stem().unwrap().to_str().unwrap())));
         let train = format!("ts < {}", T0 + 100 * H);
         let test = format!("(ts >= {}) * (ts < {})", T0 + 100 * H, T0 + 150 * H);
@@ -826,7 +828,7 @@ fn audit_time_statistics_and_rows_ignore_the_locked_rows() {
     audit_series(&b, |i| DEFAULT_START + (i % 5) * 7 * H + (i % 3) * 86_400 + 400 * H * (i % 2));
     let mut text = String::from("ts,x,y\n");
     for line in std::fs::read_to_string(&a).unwrap().lines().skip(1) {
-        if line.split(',').next().unwrap().parse::<i64>().unwrap() < DEFAULT_START {
+        if line.split(',').next().unwrap().parse::<i64>().unwrap() < DEFAULT_START - DEFAULT_PURGE {
             text.push_str(line);
             text.push('\n');
         }
@@ -847,7 +849,7 @@ fn audit_time_statistics_and_rows_ignore_the_locked_rows() {
     assert_eq!(part(&ja), part(&jk), "{ja}{ea}{jk}{ek}");
     assert_eq!(part(&jb), part(&jk), "{jb}{eb}{jk}{ek}");
     assert!(json_part(&jb, "\"time_audit\":{", "}").contains("\"duplicate_instants\":0,\"non_monotonic_rows\":0"), "{jb}");
-    let kept_rows = 400 - (0..400i64).filter(|i| T1 + i * H >= DEFAULT_START).count();
+    let kept_rows = 400 - (0..400i64).filter(|i| T1 + i * H >= DEFAULT_START - DEFAULT_PURGE).count();
     assert!(jb.contains(&format!("\"rows\":{kept_rows},")), "{jb}");
     assert!(jb.contains("\"rows_left_out\":"), "{jb}");
 }
@@ -874,7 +876,417 @@ fn a_second_declared_range_is_guarded_by_every_reader() {
         assert_eq!(e.exit, 2, "{}", e.message);
         // the audit leaves out the rows of both ranges
         let (_, out, err) = rcsr(&["audit", "--data", &d, "--target", "y", "--time", "ts", "--json"]);
-        let inside = (0..400i64).filter(|i| [default, extra].iter().any(|r| r.contains(t0 + i * H))).count();
+        let inside = (0..400i64)
+            .filter(|i| [default, extra].iter().any(|r| (r.start - DEFAULT_PURGE..r.end + EXISTING_EMBARGO).contains(&(t0 + i * H))))
+            .count();
         assert!(out.contains(&format!("\"rows_left_out\":{inside}")), "{name}: {out}{err}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// #582: the lookback embargo after the end of a declared range.
+// ---------------------------------------------------------------------------
+
+const EMB_BARS: i64 = 420;
+const EMB_S: i64 = 200;
+const EMB_E: i64 = 260;
+/// 24 bars: the longest trailing window of the fixture features.
+const EMB_L: i64 = 86_400;
+
+fn emb_range() -> Lockbox {
+    Lockbox { start: T0 + EMB_S * H, end: T0 + EMB_E * H }
+}
+
+fn lcg(state: &mut u64) -> f64 {
+    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    ((*state >> 11) as f64) / ((1u64 << 53) as f64)
+}
+
+/// Three hourly series of independent price levels. `locked_variant` redraws
+/// the levels of `[S, E)` only. `f1` is a 24-bar trailing mean, `f2` a 12-bar
+/// one, `f3` a one-bar difference and `y` the next one-bar change, so rows from
+/// `E + 24 h` on read no bar of the range.
+fn emb_panel(path: &Path, locked_variant: bool) {
+    let mut csv = String::from("ts,sym,f1,f2,f3,y,ret,vol\n");
+    for g in 0..3u64 {
+        let mut st = 0x9E37_79B9 + g;
+        let mut alt = 0xC0FF_EE00 + g;
+        let mut p: Vec<f64> = Vec::new();
+        for i in 0..=EMB_BARS {
+            let base = 100.0 + 5.0 * lcg(&mut st);
+            let other = 100.0 + 5.0 * lcg(&mut alt);
+            let inside = (EMB_S..EMB_E).contains(&i);
+            p.push(if locked_variant && inside { other } else { base });
+        }
+        for i in 0..EMB_BARS as usize {
+            let mean = |w: usize| {
+                let lo = (i + 1).saturating_sub(w);
+                p[lo..=i].iter().sum::<f64>() / (i + 1 - lo) as f64
+            };
+            let f3 = if i == 0 { 0.0 } else { p[i] - p[i - 1] };
+            let y = p[i + 1] - p[i];
+            csv.push_str(&format!("{},s{},{},{},{},{},{},{}\n", T0 + i as i64 * H, g, mean(24), mean(12), f3, y, y, 1.0 + f3.abs()));
+        }
+    }
+    std::fs::write(path, csv).unwrap();
+}
+
+fn emb_declare(data: &str, seconds: i64) {
+    let embargo = lockbox::embargo_json(seconds, "f1", "test", H);
+    lockbox::write_sidecar_with(data, &emb_range(), "test", &lockbox::embargo_member(Some(&embargo))).unwrap();
+}
+
+fn emb_store(dir: &Path, name: &str, locked_variant: bool, seconds: i64) -> String {
+    let p = dir.join(format!("{name}.csv"));
+    emb_panel(&p, locked_variant);
+    let d = s(&p);
+    emb_declare(&d, seconds);
+    d
+}
+
+fn emb_search(data: &str, run: &str, exclude: &str, extra: &[&str]) -> (i32, String) {
+    let mut a = vec![
+        "--data", data, "--target", "y", "--vars", "f1,f2", "--time", "ts", "--group-by", "sym", "--split",
+        "temporal", "--validation-frac", "0.2", "--fill", "drop", "--exclude", exclude, "--seed", "3",
+        "--generations", "5", "--pop", "20", "--cpu", "--no-dev-log", "--quiet", "--json-out", run,
+    ];
+    a.extend_from_slice(extra);
+    let (code, _, err) = rcsr(&a);
+    (code, err)
+}
+
+fn emb_fold(path: &Path, label: &str, test_start: i64, test_end: i64) {
+    std::fs::write(
+        path,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\n\
+             expanding,{label},{},{},{},{},{}\n",
+            T0,
+            T0 + 100 * H,
+            T0 + 80 * H,
+            test_start,
+            test_end
+        ),
+    )
+    .unwrap();
+}
+
+fn emb_wf(data: &str, test_start: i64, test_end: i64, extra: &[&str]) -> (i32, String, String) {
+    let window = format!("f1,{},{},{},{}", T0, T0 + 100 * H, test_start, test_end);
+    let mut a = vec![
+        "walkforward", "--data", data, "--target", "y", "--expr", "f1", "--time", "ts", "--group-by", "sym",
+        "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365", "--threshold-fixed", "0", "--json",
+        "--window", &window,
+    ];
+    a.extend_from_slice(extra);
+    rcsr(&a)
+}
+
+fn emb_ladder(data: &str, win: &str, out: &str, extra: &[&str]) -> (i32, String) {
+    let mut a = vec![
+        "ladder", "--data", data, "--target", "y", "--return-col", "ret", "--time", "ts", "--group", "sym",
+        "--features", "f1,f2", "--windows", win, "--scheme", "expanding", "--horizon-seconds", "3600",
+        "--purge-seconds", "7200", "--gbm-trees", "10", "--draws", "50", "--max-fit-rows", "600", "--out", out,
+    ];
+    a.extend_from_slice(extra);
+    let (code, _, err) = rcsr(&a);
+    (code, err)
+}
+
+#[test]
+fn development_outputs_after_the_range_ignore_locked_prices() {
+    let dir = scratch("embargo-differential");
+    let a = emb_store(&dir, "a", false, EMB_L);
+    let b = emb_store(&dir, "b", true, EMB_L);
+    let (e, after) = (emb_range().end, emb_range().end + EMB_L);
+
+    // search: rows from E read locked bars through their trailing features
+    for d in [&a, &b] {
+        let (code, err) = emb_search(d, &s(&dir.join("x.json")), &format!("ts < {e}"), &[]);
+        assert_eq!(code, 3, "{}", err);
+        assert!(err.contains("whose features read the declared locked test"), "{}", err);
+        assert!(err.contains(&format!("ts < {after}")), "{}", err);
+    }
+    let (run_a, run_b) = (s(&dir.join("ra.json")), s(&dir.join("rb.json")));
+    let clean = format!("ts < {after}");
+    assert_eq!(emb_search(&a, &run_a, &clean, &[]).0, 0);
+    assert_eq!(emb_search(&b, &run_b, &clean, &[]).0, 0);
+    let (ja, jb) = (std::fs::read_to_string(&run_a).unwrap(), std::fs::read_to_string(&run_b).unwrap());
+    for key in ["train_error", "validation_error", "test_error"] {
+        let (na, nb) = (numbers(&ja, key), numbers(&jb, key));
+        assert!(!na.is_empty(), "{key}: {ja}");
+        assert_eq!(na, nb, "{key}");
+    }
+    assert!(ja.contains(&format!("\"lockbox_embargo_seconds\":{EMB_L},\"lockbox_embargo_source\":\"store\"")), "{ja}");
+
+    // walk-forward: a fold whose test starts at E is refused, one from E + L is not
+    for d in [&a, &b] {
+        let (code, _, err) = emb_wf(d, e, e + 40 * H, &[]);
+        assert_eq!(code, 3, "{}", err);
+        assert!(err.contains("reaches the declared locked test"), "{}", err);
+    }
+    let (ca, oa, ea) = emb_wf(&a, after, after + 40 * H, &[]);
+    let (cb, ob, eb) = emb_wf(&b, after, after + 40 * H, &[]);
+    assert_eq!((ca, cb), (0, 0), "{}{}", ea, eb);
+    let (ha, hb) = (numbers(&oa, "report_sha256"), numbers(&ob, "report_sha256"));
+    assert!(!ha.is_empty(), "{}", oa);
+    assert_eq!(ha, hb);
+
+    // ladder
+    let win = dir.join("w.csv");
+    emb_fold(&win, "leak", e, e + 40 * H);
+    for d in [&a, &b] {
+        let (code, err) = emb_ladder(d, &s(&win), &s(&dir.join("l.json")), &[]);
+        assert_eq!(code, 3, "{}", err);
+        assert!(err.contains("reaches the declared locked test"), "{}", err);
+    }
+    emb_fold(&win, "clean", after, after + 40 * H);
+    let (la, lb) = (s(&dir.join("la.json")), s(&dir.join("lb.json")));
+    assert_eq!(emb_ladder(&a, &s(&win), &la, &[]).0, 0);
+    assert_eq!(emb_ladder(&b, &s(&win), &lb, &[]).0, 0);
+    let (ja, jb) = (std::fs::read_to_string(&la).unwrap(), std::fs::read_to_string(&lb).unwrap());
+    assert_eq!(without_timing(&ja), without_timing(&jb));
+    assert!(ja.contains(&format!("\"embargo_seconds\":{EMB_L},\"embargo_source\":\"store\"")), "{ja}");
+}
+
+#[test]
+fn cross_validation_refuses_the_embargo_rows_and_ignores_the_locked_prices_after_it() {
+    let dir = scratch("embargo-cv");
+    let a = emb_store(&dir, "a", false, EMB_L);
+    let b = emb_store(&dir, "b", true, EMB_L);
+    let after = emb_range().end + EMB_L;
+    let cv = |d: &str, exclude: &str, out: &str| {
+        let (code, _, err) = plain(&[
+            "--data", d, "--time", "ts", "--vars", "f1,f2", "--cv", "k-fold", "--cv-k", "3", "--exclude", exclude,
+            "--generations", "3", "--pop", "16", "--json-out", out,
+        ]);
+        (code, err)
+    };
+    for d in [&a, &b] {
+        let (code, err) = cv(d, &format!("ts < {}", emb_range().end), &s(&dir.join("x.json")));
+        assert_eq!(code, 3, "{}", err);
+        assert!(err.contains("whose features read the declared locked test"), "{}", err);
+    }
+    let (ra, rb) = (s(&dir.join("ca.json")), s(&dir.join("cb.json")));
+    assert_eq!(cv(&a, &format!("ts < {after}"), &ra).0, 0);
+    assert_eq!(cv(&b, &format!("ts < {after}"), &rb).0, 0);
+    let (ja, jb) = (std::fs::read_to_string(&ra).unwrap(), std::fs::read_to_string(&rb).unwrap());
+    assert_eq!(cv_part(&ja), cv_part(&jb));
+}
+
+#[test]
+fn the_embargo_flag_widens_the_declared_value_and_never_narrows_it() {
+    let dir = scratch("embargo-flag");
+    let a = emb_store(&dir, "a", false, EMB_L);
+    let run = s(&dir.join("r.json"));
+    let after = emb_range().end + EMB_L;
+    let (code, err) = emb_search(&a, &run, &format!("ts < {after}"), &["--lockbox-embargo", "3600"]);
+    assert_eq!(code, 2, "{}", err);
+    assert!(err.contains("a flag may widen it, never narrow it"), "{}", err);
+    let wider = EMB_L + 24 * H;
+    let (code, err) = emb_search(&a, &run, &format!("ts < {after}"), &["--lockbox-embargo", &wider.to_string()]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains(&format!("lookback embargo {wider} s")), "{}", err);
+    let (code, err) = emb_search(&a, &run, &format!("ts < {}", emb_range().end + wider), &["--lockbox-embargo", &wider.to_string()]);
+    assert_eq!(code, 0, "{}", err);
+    let json = std::fs::read_to_string(&run).unwrap();
+    assert!(json.contains(&format!("\"embargo_seconds\":{wider},\"embargo_source\":\"flag\"")), "{json}");
+    assert!(json.contains(&format!("\"lockbox_embargo_seconds\":{wider},\"lockbox_embargo_source\":\"flag\"")), "{json}");
+}
+
+#[test]
+fn a_store_without_a_declared_embargo_uses_the_protocol_default() {
+    let dir = scratch("embargo-default");
+    let p = dir.join("a.csv");
+    emb_panel(&p, false);
+    let d = s(&p);
+    lockbox::write_sidecar(&d, &emb_range(), "test").unwrap();
+    let run = s(&dir.join("r.json"));
+    let (code, err) = emb_search(&d, &run, &format!("ts < {}", emb_range().end + EMB_L), &[]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("lookback embargo 10972800 s after the end (protocol default)"), "{}", err);
+}
+
+#[test]
+fn audit_leaves_out_the_purge_band_and_the_embargo_rows() {
+    let dir = scratch("embargo-audit");
+    let a = emb_store(&dir, "a", false, EMB_L);
+    let r = emb_range();
+    let (_, out, err) = rcsr(&["audit", "--data", &a, "--target", "y", "--time", "ts", "--json"]);
+    let band = (0..EMB_BARS)
+        .filter(|i| {
+            let t = T0 + i * H;
+            t >= r.start - DEFAULT_PURGE && t < r.end + EMB_L
+        })
+        .count()
+        * 3;
+    assert!(band > 3 * (EMB_E - EMB_S) as usize, "the band reaches past the range on both sides");
+    assert!(out.contains(&format!("\"rows_left_out\":{band}")), "{out}{err}");
+    assert!(out.contains(&format!("\"embargo_seconds\":{EMB_L}")), "{out}");
+}
+
+#[test]
+fn ablation_prepare_segments_the_embargo_and_its_null_columns_ignore_locked_prices() {
+    let dir = scratch("embargo-ablation");
+    let a = emb_store(&dir, "a", false, EMB_L);
+    let b = emb_store(&dir, "b", true, EMB_L);
+    let def = dir.join("def.json");
+    std::fs::write(
+        &def,
+        r#"{"schema":"rcsr-ablation/1","b0":["f1"],"groups":{"g":["f2","f3"]},"placebo_template_group":"g",
+"placebo_prefix":"placebo_","permute_prefix":"perm_","permute_block_len":24,"generation_budget":1,
+"screen_seeds":3,"finalist_seeds":3,"trials":{"windows":1,"horizons":1},
+"arms":[{"name":"A0","add":[]},{"name":"A1","add":["g"]},{"name":"A2","add":["g"],"placebo":1},{"name":"A3","add":[],"permute":["g"]}],
+"rule":{"min_seeds":3,"spa_alpha":0.05,"fdr_q":0.10,"min_dsr":0.5,"draws":200,"block_len":0,"seed":0,"pbo_blocks":8,"max_pbo":0.5,
+"families":[{"name":"g","treatment":"A1","controls":["A0"],"null_arm":"A3","null_control":"A0"}]}}"#,
+    )
+    .unwrap();
+    let mut outs = Vec::new();
+    for (tag, d) in [("a", &a), ("b", &b)] {
+        let out = s(&dir.join(format!("{tag}.prepared.csv")));
+        let (code, _, err) = rcsr(&[
+            "ablation", "prepare", "--definition", &s(&def), "--data", d, "--time", "ts", "--group", "sym", "--keep",
+            "y", "--seed", "1", "--out", &out,
+        ]);
+        assert_eq!(code, 0, "{}", err);
+        outs.push(out);
+    }
+    let r = emb_range();
+    let side = std::fs::read_to_string(lockbox::sidecar_path(&outs[0])).unwrap();
+    assert!(
+        side.contains(&format!("\"kind\":\"embargo\",\"start\":{},\"end\":{},", r.end, r.end + EMB_L)),
+        "{side}"
+    );
+    assert_eq!(lockbox::declared_embargo(&outs[0]).unwrap().map(|(_, s)| s), Some(EMB_L));
+    let rows = |p: &str| -> Vec<String> {
+        let text = std::fs::read_to_string(p).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].contains("placebo_1") && lines[0].contains("perm_"), "{}", lines[0]);
+        lines[1..]
+            .iter()
+            .filter(|l| l.split(',').next().unwrap().parse::<i64>().unwrap() >= r.end + EMB_L)
+            .map(|l| l.to_string())
+            .collect()
+    };
+    let (ra, rb) = (rows(&outs[0]), rows(&outs[1]));
+    assert!(ra.len() > 300, "{}", ra.len());
+    assert_eq!(ra, rb, "placebo and permuted columns from E + L do not read the range");
+    // a search on the prepared rows refuses the embargo band
+    let (code, _, err) = rcsr(&[
+        "--data", &outs[0], "--target", "y", "--vars", "f1", "--time", "ts", "--group-by", "sym", "--split", "temporal",
+        "--exclude", &format!("ts < {}", r.end), "--eval-expr", "f1", "--cpu", "--no-dev-log", "--quiet",
+    ]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("whose features read the declared locked test"), "{}", err);
+}
+
+const LONG_LABEL_SPEC: &str = "{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{\"column\":\"y\",\"name\":\"label\",\
+\"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"ret\",\"return_units\":\"log\",\
+\"horizon_seconds\":270000,\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\"exit_price\":\"close\",\
+\"offset\":0.002,\"scale\":{\"kind\":\"column\",\"column\":\"vol\",\"multiplier\":6.0,\"window_seconds\":3600,\"ends_at_offset_seconds\":0},\
+\"clip\":[-1.0,1.0],\"units\":\"log_return/(6*vol)\",\"cost_bps\":null,\"cost_in_label\":false,\
+\"construction_columns\":[\"vol\"],\"note\":null}]}";
+
+#[test]
+fn ladder_takes_the_target_spec_purge_before_the_range_start() {
+    let dir = scratch("embargo-spec-purge");
+    let a = emb_store(&dir, "a", false, EMB_L);
+    let spec = dir.join("spec.json");
+    std::fs::write(&spec, LONG_LABEL_SPEC).unwrap();
+    // a fold ending 68 h before S: clear of the 61 h default purge, inside the 75 h label of the spec
+    let win = dir.join("w.csv");
+    std::fs::write(
+        &win,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,f,{},{},{},{},{}\n",
+            T0,
+            T0 + 120 * H,
+            T0 + 100 * H,
+            T0 + 124 * H,
+            T0 + (EMB_S - 68) * H
+        ),
+    )
+    .unwrap();
+    let run = |extra: &[&str], out: &str| {
+        let win_s = s(&win);
+        let mut args = vec![
+            "ladder", "--data", a.as_str(), "--target", "y", "--return-col", "ret", "--time", "ts", "--group", "sym",
+            "--features", "f1,f2", "--windows", &win_s, "--scheme", "expanding", "--gbm-trees", "10", "--draws", "50",
+            "--max-fit-rows", "600", "--out", out,
+        ];
+        args.extend_from_slice(extra);
+        let args: Vec<String> = args.iter().map(|x| x.to_string()).collect();
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        rcsr(&refs)
+    };
+    let free = s(&dir.join("free.json"));
+    let (code, _, err) = run(&[], &free);
+    assert_eq!(code, 0, "{}", err);
+    assert!(std::fs::read_to_string(&free).unwrap().contains("\"purge_source\":\"protocol_default\""));
+    let (code, _, err) = run(&["--target-spec", &s(&spec)], &s(&dir.join("spec.out.json")));
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("reaches the declared locked test"), "{}", err);
+    assert!(err.contains("label end = stamp + 270000 s"), "{}", err);
+}
+
+#[test]
+fn a_sealed_read_keeps_every_other_declared_range_sealed() {
+    let dir = scratch("embargo-other-range");
+    let data = dir.join("d.csv");
+    emb_panel(&data, false);
+    let d = s(&data);
+    let primary = emb_range();
+    let other = Lockbox { start: T0 + 100 * H, end: T0 + 140 * H };
+    let also = lockbox::also_json(Some(&other), "test");
+    let embargo = lockbox::embargo_member(Some(&lockbox::embargo_json(EMB_L, "f1", "test", H)));
+    lockbox::write_sidecar_with(&d, &primary, "test", &format!("{also}{embargo}")).unwrap();
+    assert_eq!(lockbox::resolve(None, &d).unwrap().ranges(), vec![primary, other]);
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+
+    // the training range reaches the other range, not the primary one
+    let window = format!("w,{},{},{},{}", T0, T0 + 150 * H, primary.start, primary.end);
+    let (code, _, err) = rcsr(&[
+        "walkforward", "--data", &d, "--target", "y", "--expr", "f1", "--time", "ts", "--group-by", "sym",
+        "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365", "--json", "--locked-test", "--ledger", &l,
+        "--sealed", &sealed, "--window", &window,
+    ]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("reaches the declared locked test 2024-01-05"), "{}", err);
+
+    // the same for the ladder: the ledger and the seal are valid, the fold still reaches the other range
+    Ledger::new(dir.join("ledger.jsonl"))
+        .add_candidate(&Candidate {
+            id: "c1".into(),
+            spec_sha256: "a".repeat(64),
+            data_sha256: "b".repeat(64),
+            build_commit: "build".into(),
+            report_sha256: "c".repeat(64),
+            expression: "x".into(),
+            locked_test: Some(rcsr::protocol::LockedRange { start: primary.start, end: primary.end, source: "store".into() }),
+        })
+        .unwrap();
+    let (code, _, err) = rcsr(&["protocol", "seal", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let win = dir.join("w.csv");
+    std::fs::write(
+        &win,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nlocked,w,{},{},{},{},{}\n",
+            T0,
+            T0 + 150 * H,
+            T0 + 120 * H,
+            primary.start,
+            primary.end
+        ),
+    )
+    .unwrap();
+    let (code, _, err) = rcsr(&[
+        "ladder", "--data", &d, "--target", "y", "--return-col", "ret", "--time", "ts", "--group", "sym", "--features",
+        "f1,f2", "--windows", &s(&win), "--scheme", "locked", "--horizon-seconds", "3600", "--purge-seconds", "7200",
+        "--gbm-trees", "10", "--draws", "50", "--max-fit-rows", "600", "--out", &s(&dir.join("o.json")),
+        "--locked-test", "--ledger", &l, "--sealed", &sealed,
+    ]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("reaches the declared locked test"), "{}", err);
+    assert!(!std::fs::read_to_string(&l).unwrap().contains("baseline_read"), "no read is recorded");
 }

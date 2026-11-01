@@ -984,7 +984,13 @@ pub fn split_purge_json(r: &crate::data::SplitReport) -> String {
         if r.boundary_purge_source.is_empty() {
             String::new()
         } else {
-            format!(",\"boundary_purge_seconds\":{},\"boundary_purge_source\":{}", num(r.boundary_purge_seconds), text(r.boundary_purge_source))
+            format!(
+                ",\"boundary_purge_seconds\":{},\"boundary_purge_source\":{},\"lockbox_embargo_seconds\":{},\"lockbox_embargo_source\":{}",
+                num(r.boundary_purge_seconds),
+                text(r.boundary_purge_source),
+                r.lockbox_embargo_seconds,
+                text(r.lockbox_embargo_source)
+            )
         }
     )
 }

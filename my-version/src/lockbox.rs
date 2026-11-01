@@ -227,6 +227,50 @@ impl Guard {
     }
 }
 
+/// Where the lookback embargo of a run came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbargoSource {
+    /// Declared by the writer of the data (`lockbox_embargo` in a sidecar).
+    Store,
+    /// `--lockbox-embargo` widened the declared value.
+    Flag,
+    /// No declaration: `protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS`.
+    ProtocolDefault,
+}
+
+impl EmbargoSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EmbargoSource::Store => "store",
+            EmbargoSource::Flag => "flag",
+            EmbargoSource::ProtocolDefault => "protocol_default",
+        }
+    }
+}
+
+/// Seconds after the end of a locked range whose rows still read locked bars.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Embargo {
+    pub seconds: i64,
+    pub source: EmbargoSource,
+}
+
+impl Embargo {
+    pub const fn none() -> Self {
+        Embargo { seconds: 0, source: EmbargoSource::ProtocolDefault }
+    }
+
+    pub const fn protocol_default() -> Self {
+        Embargo { seconds: crate::protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS, source: EmbargoSource::ProtocolDefault }
+    }
+}
+
+impl Default for Embargo {
+    fn default() -> Self {
+        Embargo::protocol_default()
+    }
+}
+
 /// A locked test range and where it was declared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Declared {
@@ -235,6 +279,7 @@ pub struct Declared {
     pub source: &'static str,
     /// The protocol default guarded next to a flag range on undeclared data.
     pub also: Option<Lockbox>,
+    pub embargo: Embargo,
 }
 
 impl Declared {
@@ -258,9 +303,15 @@ impl Declared {
         }
     }
 
+    /// `[start - purge, end + embargo)` of one range.
+    pub fn reach(&self, l: &Lockbox, purge: i64) -> Lockbox {
+        Lockbox { start: l.start - purge.max(0), end: l.end + self.embargo.seconds.max(0) }
+    }
+
     /// Refuse a row set with a timestamp whose label window reaches the
-    /// declared range: any stamp in `[start - purge, end)`. The error names the
-    /// first offending row, the split side and the fix.
+    /// declared range or whose features read it: any stamp in
+    /// `[start - purge, end + embargo)`. The error names the first offending
+    /// row, the split side and the fix.
     pub fn check_times(&self, side: &str, time_name: &str, times: &[i64], purge: i64) -> Result<Overlap, String> {
         let overlap = self.check_range(&self.lockbox, self.origin(), side, time_name, times, purge)?;
         if let Some(also) = &self.also {
@@ -279,13 +330,13 @@ impl Declared {
         purge: i64,
     ) -> Result<Overlap, String> {
         let purge = purge.max(0);
-        let reach = Lockbox {
-            start: lockbox.start - purge,
-            end: lockbox.end,
-        };
+        let reach = self.reach(lockbox, purge);
         let overlap = reach.overlap(times.iter().copied());
         if overlap.overlaps() {
-            let subject = if purge == 0 {
+            let after = overlap.first_ts >= lockbox.end;
+            let subject = if after {
+                format!("{} row(s) whose features read the declared locked test", group_digits(overlap.rows))
+            } else if purge == 0 {
                 format!("{} row(s) in the declared locked test", group_digits(overlap.rows))
             } else {
                 format!(
@@ -293,24 +344,36 @@ impl Declared {
                     group_digits(overlap.rows)
                 )
             };
-            let label_end = if purge == 0 {
-                String::new()
-            } else {
-                format!("; label end = stamp + {} s", purge)
-            };
+            let mut notes = String::new();
+            if purge > 0 && !after {
+                notes.push_str(&format!("; label end = stamp + {} s", purge));
+            }
+            if self.embargo.seconds > 0 {
+                notes.push_str(&format!(
+                    "; lookback embargo {} s after the end ({})",
+                    self.embargo.seconds,
+                    match self.embargo.source {
+                        EmbargoSource::Store => "declared with the data",
+                        EmbargoSource::Flag => "--lockbox-embargo",
+                        EmbargoSource::ProtocolDefault => "protocol default",
+                    }
+                ));
+            }
             return Err(format!(
                 "{} has {} {}..{} ({}{}; first row {}). \
-                 Exclude them: --exclude '{} >= {}', or read the locked test only with \
+                 Exclude them: --exclude '{} >= {} and {} < {}', or read the locked test only with \
                  rcsr walkforward --locked-test or rcsr ladder --locked-test",
                 side,
                 subject,
                 date(lockbox.start),
                 date(lockbox.end),
                 origin,
-                label_end,
+                notes,
                 crate::protocol::iso(overlap.first_ts as f64),
                 time_name,
-                reach.start
+                reach.start,
+                time_name,
+                reach.end
             ));
         }
         Ok(overlap)
@@ -421,12 +484,14 @@ pub struct Resolved {
     /// The protocol default guarded next to a flag range on undeclared data.
     pub also: Option<Lockbox>,
     pub declared_in: Vec<(String, Lockbox)>,
+    /// Seconds after each range end whose rows still read the range.
+    pub embargo: Embargo,
 }
 
 impl Resolved {
     /// The active range as a [`Declared`], or `None` for `--lockbox none`.
     pub fn declared(&self) -> Option<Declared> {
-        self.range.map(|lockbox| Declared { lockbox, source: self.source.as_str(), also: self.also })
+        self.range.map(|lockbox| Declared { lockbox, source: self.source.as_str(), also: self.also, embargo: self.embargo })
     }
 
     /// Every guarded range: the primary one, then the protocol default added to a flag.
@@ -489,11 +554,13 @@ impl Resolved {
             })
             .collect();
         format!(
-            "\"declared\":{},\"also\":{},\"source\":{},\"declared_in\":[{}],\"rows_in_scope\":{},\"evaluated\":{},\"checked\":{}",
+            "\"declared\":{},\"also\":{},\"source\":{},\"declared_in\":[{}],\"embargo_seconds\":{},\"embargo_source\":{},\"rows_in_scope\":{},\"evaluated\":{},\"checked\":{}",
             declared,
             also,
             jstr(self.source.as_str()),
             files.join(","),
+            self.embargo.seconds,
+            jstr(self.embargo.source.as_str()),
             rows_in_scope,
             evaluated,
             checked
@@ -642,11 +709,97 @@ pub fn span(l: &Lockbox) -> String {
     format!("{}..{}", date(l.start), date(l.end))
 }
 
+/// One `lockbox_embargo` declaration: `seconds`, the column that sets it, the rule.
+pub fn embargo_json(seconds: i64, column: &str, rule: &str, bar_seconds: i64) -> String {
+    format!(
+        "{{\"seconds\":{},\"column\":{},\"rule\":{},\"bar_seconds\":{}}}",
+        seconds,
+        jstr(column),
+        jstr(rule),
+        bar_seconds
+    )
+}
+
+/// The `lockbox_embargo` seconds one carrier text declares.
+pub fn embargo_from_declaration(text: &str) -> Option<i64> {
+    let obj = crate::manifest::object(text, "lockbox_embargo")?;
+    int_field(obj, "seconds").filter(|s| *s >= 0)
+}
+
+/// The largest `lockbox_embargo.seconds` over the carriers of `data_path`, with
+/// the first file that declares it. Carriers may differ (a later writer knows
+/// more columns); the largest wins. A carrier whose member is unreadable is an
+/// input error.
+pub fn declared_embargo(data_path: &str) -> Result<Option<(String, i64)>, ResolveError> {
+    let mut best: Option<(String, i64)> = None;
+    if data_path.is_empty() || data_path == "-" {
+        return Ok(None);
+    }
+    for ext in CARRIERS {
+        let file = format!("{}.{}", data_path, ext);
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        if crate::manifest::object(&text, "lockbox_embargo").is_none() {
+            continue;
+        }
+        let Some(s) = embargo_from_declaration(&text) else {
+            return Err(input(format!("{}: unreadable lockbox_embargo declaration (needs integer seconds >= 0)", file)));
+        };
+        if best.as_ref().map_or(true, |(_, b)| s > *b) {
+            best = Some((file, s));
+        }
+    }
+    Ok(best)
+}
+
 /// Resolve the locked test of a run: flag, else store declaration, else the
 /// protocol default. `--lockbox none` is the only opt-out and is refused when
 /// the data declares a range. A flag may widen a store declaration, never
-/// narrow it. Conflicting store declarations are refused.
+/// narrow it. Conflicting store declarations are refused. The embargo is the
+/// declared one, else the protocol default.
 pub fn resolve(flag: Option<&str>, data_path: &str) -> Result<Resolved, ResolveError> {
+    resolve_with(flag, None, data_path)
+}
+
+/// [`resolve`] with `--lockbox-embargo SECONDS`: it widens the declared embargo
+/// and is refused when smaller.
+pub fn resolve_with(flag: Option<&str>, embargo_flag: Option<&str>, data_path: &str) -> Result<Resolved, ResolveError> {
+    let mut r = resolve_ranges(flag, data_path)?;
+    let requested = match embargo_flag {
+        None => None,
+        Some(s) => match s.trim().parse::<i64>() {
+            Ok(v) if v >= 0 => Some(v),
+            _ => return Err(usage(format!("--lockbox-embargo: '{}' is not a number of seconds >= 0", s))),
+        },
+    };
+    if r.range.is_none() {
+        r.embargo = Embargo::none();
+        return Ok(r);
+    }
+    let (base, file) = match declared_embargo(data_path)? {
+        Some((file, s)) => (Embargo { seconds: s, source: EmbargoSource::Store }, Some(file)),
+        None => (Embargo::protocol_default(), None),
+    };
+    r.embargo = match requested {
+        Some(v) if v < base.seconds => {
+            return Err(usage(format!(
+                "--lockbox-embargo {} is smaller than the embargo {} s{}; a flag may widen it, never narrow it",
+                v,
+                base.seconds,
+                match &file {
+                    Some(f) => format!(" declared by {}", f),
+                    None => " of the protocol default".to_string(),
+                }
+            )))
+        }
+        Some(v) if v > base.seconds => Embargo { seconds: v, source: EmbargoSource::Flag },
+        _ => base,
+    };
+    Ok(r)
+}
+
+fn resolve_ranges(flag: Option<&str>, data_path: &str) -> Result<Resolved, ResolveError> {
     let explicit = match flag {
         None => None,
         Some(s) if s.trim().eq_ignore_ascii_case("none") => Some(None),
@@ -661,14 +814,14 @@ pub fn resolve(flag: Option<&str>, data_path: &str) -> Result<Resolved, ResolveE
             s.file,
             s.describe()
         ))),
-        (Some(None), None) => Ok(Resolved { range: None, source: Source::None, also: None, declared_in }),
+        (Some(None), None) => Ok(Resolved { range: None, source: Source::None, also: None, declared_in, embargo: Embargo::none() }),
         (Some(Some(f)), Some(s)) if !(covers(&f, &s.range) && s.also.map_or(true, |a| covers(&f, &a))) => Err(usage(format!(
             "--lockbox {} does not cover the declared locked test {} ({})",
             span(&f),
             s.describe(),
             s.file
         ))),
-        (Some(Some(f)), Some(_)) => Ok(Resolved { range: Some(f), source: Source::Flag, also: None, declared_in }),
+        (Some(Some(f)), Some(_)) => Ok(Resolved { range: Some(f), source: Source::Flag, also: None, declared_in, embargo: Embargo::none() }),
         (Some(Some(f)), None) => {
             let d = protocol_default();
             let (source, also) = if f.start <= d.start && f.end >= d.end {
@@ -676,14 +829,15 @@ pub fn resolve(flag: Option<&str>, data_path: &str) -> Result<Resolved, ResolveE
             } else {
                 (Source::FlagAndDefault, Some(d))
             };
-            Ok(Resolved { range: Some(f), source, also, declared_in })
+            Ok(Resolved { range: Some(f), source, also, declared_in, embargo: Embargo::none() })
         }
-        (None, Some(s)) => Ok(Resolved { range: Some(s.range), source: Source::Store, also: s.also, declared_in }),
+        (None, Some(s)) => Ok(Resolved { range: Some(s.range), source: Source::Store, also: s.also, declared_in, embargo: Embargo::none() }),
         (None, None) => Ok(Resolved {
             range: Some(protocol_default()),
             source: Source::ProtocolDefault,
             also: None,
             declared_in,
+            embargo: Embargo::none(),
         }),
     }
 }
@@ -832,16 +986,32 @@ pub fn inherited_also(input: &str, declared: Option<&Lockbox>) -> Result<Option<
         .and_then(|s| s.also))
 }
 
+/// The `,"lockbox_embargo":{...}` member for an embargo object text, or nothing.
+pub fn embargo_member(embargo: Option<&str>) -> String {
+    embargo.map(|e| format!(",\"lockbox_embargo\":{}", e)).unwrap_or_default()
+}
+
 /// The `,"locked_test_also":{...}` member for a second guarded range, or nothing.
 pub fn also_json(also: Option<&Lockbox>, source: &str) -> String {
     also.map(|a| format!(",\"locked_test_also\":{}", a.declaration_json(source))).unwrap_or_default()
 }
 
 /// Put a `"locked_test"` object (and a second range) first in a JSON object text.
-pub fn insert_declaration(text: &str, lockbox: &Lockbox, also: Option<&Lockbox>, source: &str) -> String {
+pub fn insert_declaration(text: &str, lockbox: &Lockbox, also: Option<&Lockbox>, embargo: Option<&str>, source: &str) -> String {
     let at = text.find('{').map_or(0, |i| i + 1);
     let mut out = text.to_string();
-    out.insert_str(at, &format!("\"locked_test\":{}{},", lockbox.declaration_json(source), also_json(also, source)));
+    out.insert_str(
+        at,
+        &format!("\"locked_test\":{}{}{},", lockbox.declaration_json(source), also_json(also, source), embargo_member(embargo)),
+    );
+    out
+}
+
+/// Put a `"lockbox_embargo"` object first in a JSON object text.
+pub fn insert_embargo(text: &str, embargo: &str) -> String {
+    let at = text.find('{').map_or(0, |i| i + 1);
+    let mut out = text.to_string();
+    out.insert_str(at, &format!("\"lockbox_embargo\":{},", embargo));
     out
 }
 
@@ -942,15 +1112,81 @@ mod tests {
             lockbox: Lockbox { start: 1_000_000, end: 2_000_000 },
             source: "store",
             also: None,
+            embargo: Embargo::none(),
         };
         let purge = 7_200;
         let e = d.check_times("test split", "ts", &[1_000_000 - purge], purge).unwrap_err();
         assert!(e.contains("1 row(s) whose label window reaches the declared locked test"), "{}", e);
         assert!(e.contains("label end = stamp + 7200 s"), "{}", e);
-        assert!(e.contains("--exclude 'ts >= 992800'"), "{}", e);
+        assert!(e.contains("--exclude 'ts >= 992800 and ts < 2000000'"), "{}", e);
         assert!(d.check_times("test split", "ts", &[1_000_000 - purge - 1], purge).is_ok());
         assert!(d.check_times("test split", "ts", &[2_000_000], purge).is_ok());
         assert!(d.check_times("test split", "ts", &[1_000_000 - 1], 0).is_ok());
+    }
+
+    #[test]
+    fn declared_check_refuses_the_lookback_embargo_after_the_end() {
+        let d = Declared {
+            lockbox: Lockbox { start: 1_000_000, end: 2_000_000 },
+            source: "store",
+            also: None,
+            embargo: Embargo { seconds: 86_400, source: EmbargoSource::Store },
+        };
+        for t in [2_000_000, 2_000_000 + 86_399] {
+            let e = d.check_times("training split", "ts", &[t], 7_200).unwrap_err();
+            assert!(e.contains("1 row(s) whose features read the declared locked test"), "{}", e);
+            assert!(e.contains("lookback embargo 86400 s after the end (declared with the data)"), "{}", e);
+            assert!(e.contains("--exclude 'ts >= 992800 and ts < 2086400'"), "{}", e);
+        }
+        assert!(d.check_times("training split", "ts", &[2_000_000 + 86_400], 7_200).is_ok());
+        assert_eq!(d.reach(&d.lockbox, 7_200), Lockbox { start: 992_800, end: 2_086_400 });
+    }
+
+    #[test]
+    fn the_embargo_covers_the_second_range_too() {
+        let d = Declared {
+            lockbox: Lockbox { start: 1_000_000, end: 2_000_000 },
+            source: "store",
+            also: Some(Lockbox { start: 5_000_000, end: 6_000_000 }),
+            embargo: Embargo { seconds: 100, source: EmbargoSource::Flag },
+        };
+        assert!(d.check_times("training split", "ts", &[6_000_099], 0).is_err());
+        assert!(d.check_times("training split", "ts", &[6_000_100], 0).is_ok());
+    }
+
+    #[test]
+    fn the_default_embargo_is_the_registry_maximum() {
+        assert_eq!(crate::protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS, 10_972_800);
+    }
+
+    #[test]
+    fn the_embargo_is_the_largest_declared_value_and_a_flag_only_widens_it() {
+        let d = resolve_dir("embargo");
+        let data = d.join("a.rcsb").to_str().unwrap().to_string();
+        declare(&data, "enrich.json", &stored());
+        let r = resolve(None, &data).unwrap();
+        assert_eq!(r.embargo, Embargo::protocol_default());
+        std::fs::write(
+            format!("{}.enrich.json", data),
+            format!("{{\"locked_test\":{},\"lockbox_embargo\":{{\"seconds\":86400}}}}", stored().declaration_json("t")),
+        )
+        .unwrap();
+        std::fs::write(format!("{}.manifest.json", data), "{\"lockbox_embargo\":{\"seconds\":172800}}").unwrap();
+        let r = resolve(None, &data).unwrap();
+        assert_eq!(r.embargo, Embargo { seconds: 172_800, source: EmbargoSource::Store });
+        assert!(declared_embargo(&data).unwrap().unwrap().0.ends_with("a.rcsb.manifest.json"));
+        let e = resolve_with(None, Some("86400"), &data).unwrap_err();
+        assert_eq!(e.exit, 2);
+        assert!(e.message.contains("a flag may widen it, never narrow it"), "{}", e.message);
+        let r = resolve_with(None, Some("172800"), &data).unwrap();
+        assert_eq!(r.embargo.source, EmbargoSource::Store);
+        let r = resolve_with(None, Some("200000"), &data).unwrap();
+        assert_eq!(r.embargo, Embargo { seconds: 200_000, source: EmbargoSource::Flag });
+        let f = r.report_fields(0, false, true);
+        assert!(f.contains("\"embargo_seconds\":200000,\"embargo_source\":\"flag\""), "{}", f);
+        assert_eq!(resolve_with(None, Some("x"), &data).unwrap_err().exit, 2);
+        let r = resolve_with(Some("none"), Some("5"), &resolve_dir("embargo-none").join("b.csv").to_str().unwrap().to_string()).unwrap();
+        assert_eq!(r.embargo.seconds, 0);
     }
 
     #[test]
@@ -1030,11 +1266,11 @@ mod tests {
     fn a_stored_disjoint_pair_keeps_its_roles_in_a_derived_sidecar() {
         let first = stored();
         let second = Lockbox { start: lockbox_date(2024, 9, 1), end: lockbox_date(2024, 10, 1) };
-        let store = Resolved { range: Some(first), source: Source::Store, also: Some(second), declared_in: Vec::new() };
+        let store = Resolved { range: Some(first), source: Source::Store, also: Some(second), declared_in: Vec::new(), embargo: Embargo::none() };
         assert_eq!((store.sidecar_range(), store.sidecar_also()), (Some(first), Some(second)));
-        let flag = Resolved { range: Some(second), source: Source::FlagAndDefault, also: Some(first), declared_in: Vec::new() };
+        let flag = Resolved { range: Some(second), source: Source::FlagAndDefault, also: Some(first), declared_in: Vec::new(), embargo: Embargo::none() };
         assert_eq!((flag.sidecar_range(), flag.sidecar_also()), (Some(first), Some(second)));
-        let touching = Resolved { range: Some(first), source: Source::Store, also: Some(Lockbox { start: first.end, end: second.end }), declared_in: Vec::new() };
+        let touching = Resolved { range: Some(first), source: Source::Store, also: Some(Lockbox { start: first.end, end: second.end }), declared_in: Vec::new(), embargo: Embargo::none() };
         assert_eq!(touching.sidecar_range(), Some(Lockbox { start: first.start, end: second.end }));
         assert_eq!(touching.sidecar_also(), None);
     }

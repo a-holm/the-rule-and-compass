@@ -802,6 +802,7 @@ pub struct LabelAccumulator {
     spec: LongLabelSpec,
     range: Option<Lockbox>,
     also: Option<Lockbox>,
+    embargo: i64,
     tally: Tally,
     chain: Vec<u8>,
 }
@@ -815,7 +816,7 @@ impl LabelAccumulator {
     /// before its start, or inside it) are left out of every statistic. The
     /// label hash still covers every row.
     pub fn with_range(spec: &LongLabelSpec, range: Option<Lockbox>) -> Self {
-        LabelAccumulator { spec: spec.clone(), range, also: None, tally: Tally::default(), chain: spec.canonical().into_bytes() }
+        LabelAccumulator { spec: spec.clone(), range, also: None, embargo: 0, tally: Tally::default(), chain: spec.canonical().into_bytes() }
     }
 
     /// A second range left out the same way.
@@ -824,11 +825,18 @@ impl LabelAccumulator {
         self
     }
 
+    /// Rows within `seconds` after a range end read its bars through their features and are left out too.
+    pub fn with_embargo(mut self, seconds: i64) -> Self {
+        self.embargo = seconds.max(0);
+        self
+    }
+
     pub fn add(&mut self, symbol: &str, labels: &LongLabels) {
         let symbol = (!symbol.is_empty()).then_some(symbol);
         let purge = self.spec.purge_seconds();
         let ranges = [self.range, self.also];
-        let keep = move |t: i64| ranges.iter().flatten().all(|r| t + purge <= r.start || t >= r.end);
+        let embargo = self.embargo;
+        let keep = move |t: i64| ranges.iter().flatten().all(|r| t + purge <= r.start || t >= r.end + embargo);
         self.tally.merge(labels.tally(symbol, &keep));
         self.chain.extend_from_slice(symbol.unwrap_or("").as_bytes());
         self.chain.push(0);
