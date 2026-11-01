@@ -4770,7 +4770,7 @@ fn evolve_island(
 ) {
     if !screened {
         for ind in isl.iter_mut() {
-            if !ind.error.is_finite() || rows_changed && false {
+            if ind.error.is_nan() || (rows_changed && !ind.error.is_finite()) {
                 GenCounters::count(counters, |c| &c.reevals);
                 ind.reeval(train, cfg); // #25
             }
