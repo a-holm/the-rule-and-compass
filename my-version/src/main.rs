@@ -10791,6 +10791,9 @@ fn run_walkforward(args: &[String]) -> ! {
         std::process::exit(e.exit);
     });
     let declared_lock: Option<(f64, f64)> = resolved.range.map(|l| (l.start as f64, l.end as f64));
+    if !locked_test {
+        popts.locked_ranges = resolved.ranges().iter().map(|r| (r.start, r.end)).collect();
+    }
     if declared_lock.is_none() && (ledger_path.is_some() || locked_test) {
         eprintln!("error: --ledger and --locked-test need a locked test range: drop --lockbox none");
         std::process::exit(EXIT_USAGE);

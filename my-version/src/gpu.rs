@@ -879,6 +879,9 @@ extern "C" {
        null pointer clears it, and every log-loss launch is then refused.
        #289: the same resident vector is the classification scorer's label. */
     fn rc_set_fit_sign(ctx: *mut RawCtx, sign: *const f64) -> i32;
+    /* #508: the slope pair mask: `ceil(n/32)` words, bit r set when row r pairs
+       with row r - 1, and the number of set bits. A null pointer clears it. */
+    fn rc_set_slope_pairs(ctx: *mut RawCtx, bits: *const u32, npairs: i64) -> i32;
     /* #496: arithmetic of the fit kernel's polish (0 f64, 1 f32, 2 off). */
     fn rc_set_fit_polish(ctx: *mut RawCtx, mode: i32) -> i32;
     /* #496: summed per-block cycles of the LM phase and the polish phase of
@@ -1561,6 +1564,9 @@ pub struct GpuEvaluator {
     fit_twin_bytes: u64,
     /// #265: rows of that twin.
     fit_twin_rows: u64,
+    /// #508: pairs of the resident slope pair mask, or `None` when every row
+    /// pairs with its predecessor.
+    slope_pair_count: Option<u64>,
 }
 
 impl GpuEvaluator {
@@ -1604,6 +1610,7 @@ impl GpuEvaluator {
                 host_cols: None,
                 fit_twin_bytes: 0,
                 fit_twin_rows: 0,
+                slope_pair_count: None,
             })
         }
     }
@@ -1654,6 +1661,7 @@ impl GpuEvaluator {
             host_cols: Some(cols),
             fit_twin_bytes: 0,
             fit_twin_rows: 0,
+            slope_pair_count: None,
         })
     }
 
@@ -1691,6 +1699,8 @@ impl GpuEvaluator {
     /// same weights) it will verify the proposals on.
     pub fn set_fit_data(&mut self, cols: &[f64], y: &[f64], w: &[f64]) -> bool {
         let wp = if w.is_empty() { std::ptr::null() } else { w.as_ptr() };
+        // #508: the device drops the slope pair mask with the rows it described.
+        self.slope_pair_count = None;
         let ok = unsafe { rc_set_fit_data(self.ctx, cols.as_ptr(), y.as_ptr(), wp) == 0 };
         if ok {
             let rows = y.len() as u64;
@@ -1747,6 +1757,24 @@ impl GpuEvaluator {
             return false;
         }
         unsafe { rc_set_fit_sign(self.ctx, sign.as_ptr()) == 0 }
+    }
+
+    /// #508: upload the slope pair mask: bit `r` of `bits` is set when row `r`
+    /// pairs with row `r - 1`, `bits` holds `ceil(n / 32)` words and `npairs`
+    /// counts the set bits. The slope scorer and the slope fit arm skip rows
+    /// whose bit is clear and divide by `npairs`. An empty slice clears the
+    /// mask, which restores the consecutive pairs of every row.
+    pub fn set_slope_pairs(&mut self, bits: &[u32], npairs: usize) -> bool {
+        if bits.is_empty() {
+            self.slope_pair_count = None;
+            return unsafe { rc_set_slope_pairs(self.ctx, std::ptr::null(), 0) == 0 };
+        }
+        if bits.len() as u64 != self.n_rows.div_ceil(32) {
+            return false;
+        }
+        let ok = unsafe { rc_set_slope_pairs(self.ctx, bits.as_ptr(), npairs as i64) == 0 };
+        self.slope_pair_count = ok.then_some(npairs as u64);
+        ok
     }
 
     /// #496: select the arithmetic of the fit kernel's polish for later
@@ -2808,7 +2836,7 @@ impl GpuEvaluator {
         if ms < 0.0 || res.len() != sub.len() {
             return (Vec::new(), -1.0);
         }
-        let pairs = (self.n_rows as f64 - 1.0).max(1.0);
+        let pairs = self.slope_pair_count.map_or(self.n_rows as f64 - 1.0, |p| p as f64).max(1.0);
         for (j, &k) in idx.iter().enumerate() {
             out[k] = GpuFitOutput {
                 c: res[j].c.clone(),
