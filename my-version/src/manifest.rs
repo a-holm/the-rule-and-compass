@@ -69,6 +69,10 @@ pub struct Manifest {
     pub target_spec: Option<(String, String, String)>,
     /// #223: `(source, reason)` when the engine resolved the fit arm.
     pub fit_resolution: Option<(String, String)>,
+    /// `(rows, row hash, fixed)` of the `--fit-rows`/`--fit-samples` subsample,
+    /// or `None` for a full fit. `fixed` is true when the device fits the same
+    /// rows for the whole run.
+    pub fit_subsample: Option<(usize, u64, bool)>,
 }
 
 impl Manifest {
@@ -137,6 +141,12 @@ impl Manifest {
                 jstr(self.config.fit_strategy.name()),
                 jstr(source),
                 jstr(reason)
+            ));
+        }
+        if let Some((rows, hash, fixed)) = self.fit_subsample {
+            out.push_str(&format!(
+                "  \"fit_subsample\":{{\"fit_rows\":{},\"hash\":\"{:016x}\",\"fixed\":{},\"scored_rows\":{}}},\n",
+                rows, hash, fixed, self.train.rows
             ));
         }
         if let Some(dispatch) = &self.dispatch {
@@ -257,6 +267,7 @@ pub fn collect(
         view: None,
         target_spec: None,
         fit_resolution: None,
+        fit_subsample: None,
     }
 }
 

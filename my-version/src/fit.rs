@@ -1122,6 +1122,7 @@ pub(crate) mod gpu_op {
     pub const COSH: u32 = 22;
     pub const ERF: u32 = 28;
     pub const ERFC: u32 = 29;
+    pub const IF: u32 = 32;
 }
 
 /// #169: map an operator to the fit kernel's opcode. Only operators with a
@@ -1152,6 +1153,7 @@ fn gpu_fit_opcode(op: Op) -> Option<u32> {
         Neg => g::NEG,
         Gauss => g::GAUSS,
         Pow => g::POW,
+        If => g::IF,
         Sinh => g::SINH,
         Cosh => g::COSH,
         Erf => g::ERF,
@@ -1163,7 +1165,8 @@ fn gpu_fit_opcode(op: Op) -> Option<u32> {
 /// #169: a candidate flattened for the batched GPU fit kernel.
 ///
 /// The program is a postorder array of `4`-word records `[op, kid0, kid1,
-/// slot]`; constants are kept in `c0` so the kernel can move them, and `flat`
+/// slot]` (`if` keeps its third child in the slot word); constants are kept in
+/// `c0` so the kernel can move them, and `flat`
 /// is retained so the fitted values can be written back into the tree exactly
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
@@ -1246,7 +1249,9 @@ pub(crate) fn gpu_fit_plan_reason(tree: &Node) -> Result<GpuFitPlan, GpuFitRejec
         let kids = &f.kids[i];
         let k0 = kids.first().copied().unwrap_or(0) as u32;
         let k1 = kids.get(1).copied().unwrap_or(0) as u32;
-        let slot = if f.cslot[i] >= 0 {
+        let slot = if f.op[i] == Op::If {
+            kids.get(2).copied().unwrap_or(0) as u32
+        } else if f.cslot[i] >= 0 {
             f.cslot[i] as u32
         } else if f.op[i] == Op::Input {
             f.val[i] as u32
@@ -4692,7 +4697,8 @@ mod tests {
 
     #[test]
     fn op_coverage_needs_a_fit_opcode_for_every_operator() {
-        assert!(!gpu_fit_op_coverage(&Op::default_set(), false), "`if` has no fit opcode");
+        assert!(gpu_fit_op_coverage(&Op::default_set(), false));
+        assert!(!gpu_fit_op_coverage(&[Op::Add, Op::Min], false), "`min` has no fit opcode");
         assert!(gpu_fit_op_coverage(&[Op::Add, Op::Mul, Op::Sin], false));
         assert!(!gpu_fit_op_coverage(&[Op::Add, Op::Mul, Op::Sin], true));
     }

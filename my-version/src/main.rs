@@ -593,7 +593,9 @@ SEARCH:
                              and score/archive on all training rows (default 0
                              = off; N >= train rows is an exact full fit). The
                              archive and every reported error are refit on all
-                             rows
+                             rows. With the GPU evaluator and --fit-strategy gpu
+                             the subsample is fixed for the run and lives on the
+                             device; the device still scores every row
   --fit-fallback-max <N>     hard per-generation bound on exact CPU fallback
                              refits for --fit-strategy gpu (default 4096,
                              0 = unbounded). Fallbacks beyond the bound keep
@@ -1107,7 +1109,7 @@ fn gpu_json(
         .iter()
         .map(|s| {
             format!(
-                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_improved\":{},\"fit_fallback_improved_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"opcodes\":{{{}}}}}",
+                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_admitted_wide\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_improved\":{},\"fit_fallback_improved_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"opcodes\":{{{}}}}}",
                 s.generation,
                 s.programs,
                 s.native,
@@ -1118,6 +1120,7 @@ fn gpu_json(
                 jnum(s.fallback_seconds),
                 s.fallback_workers,
                 s.fit_screened,
+                s.fit_admitted_wide,
                 s.fit_attempts,
                 s.fit_gpu,
                 s.fit_fallback,
@@ -1162,10 +1165,11 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
+        g.fit_admitted_wide,
         g.fit_attempts,
         g.fit_gpu,
         g.fit_fallback,
@@ -1179,7 +1183,14 @@ fn gpu_json(
         jnum(g.fit_fallback_ms / 1000.0),
         g.fit_fallback_bounded,
         g.fit_fallback_workers,
-        g.fit_fallback_max
+        g.fit_fallback_max,
+        g.fit_rows,
+        g.score_rows,
+        g.fit_twin_bytes,
+        match g.fit_subsample_hash {
+            Some(h) => format!("\"{:016x}\"", h),
+            None => "null".to_string(),
+        }
     );
     let run_wall = if g.ledger.wall_s() > 0.0 {
         g.ledger.wall_s()
@@ -4870,6 +4881,7 @@ fn main() {
         let mut m = m;
         m.start_utc = run_start_utc.clone();
         m.fit_resolution = fit_provenance.clone();
+        m.fit_subsample = search::fit_subsample_record(&cfg, &prepared.train);
         if let Some(p) = &store_projection {
             m.projection = Some(manifest::ProjectionRecord {
                 hash: p.hash_hex(),
@@ -5378,8 +5390,9 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(" ");
             eprintln!(
-                "# fit: gpu-fit screened={} admitted={} gpu={} fallback={} [{}] labels=[{}] refits={} fallback_s={:.3} bounded={}/{} workers={}",
+                "# fit: gpu-fit screened={} admitted_wide={} admitted={} gpu={} fallback={} [{}] labels=[{}] refits={} fallback_s={:.3} bounded={}/{} workers={}",
                 g.fit_screened,
+                g.fit_admitted_wide,
                 g.fit_attempts,
                 g.fit_gpu,
                 g.fit_fallback,
@@ -10702,7 +10715,7 @@ mod tests {
         g.fit_fallback_max = 4096;
         let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true, 10.0);
         assert!(
-            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"seconds\":0.25,\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096}"),
+            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"admitted_wide\":0,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"seconds\":0.25,\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096}"),
             "{}",
             json
         );
