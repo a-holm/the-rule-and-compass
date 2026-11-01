@@ -5965,35 +5965,26 @@ fn main() {
         None
     };
 
-    // #145: cross-validation draws its own folds, so the split guard above
-    // cannot see them. If any row of the table is in 2026H2, some fold would
-    // train or score on the holdout; refuse before the first fold.
-    if cv_mode.is_some() && !allow_lockbox {
-        if let Some(name) = &time_name {
-            if let Ok(j) = table.index_of(name) {
-                let keys = data::time_keys_with(&table, j, &spec.time)
-                    .map(|(k, _)| k)
-                    .unwrap_or_default();
-                let times: Vec<i64> = keys
-                    .iter()
-                    .filter(|v| v.is_finite())
-                    .map(|v| v.floor() as i64)
-                    .collect();
-                if let Err(e) = rcsr::lockbox::Guard::default()
-                    .check_times("cross-validation rows", &times)
-                {
-                    eprintln!("error: {}", e);
-                    std::process::exit(EXIT_INPUT);
-                }
-                if let Some(d) = &spec.declared_lockbox {
-                    if let Err(e) = d.check_times("cross-validation rows", name, &times) {
-                        eprintln!("error: {}", e);
-                        std::process::exit(EXIT_INPUT);
-                    }
-                }
+    // #145, #518: cross-validation draws its own folds, so the split guard above
+    // cannot see them. Every row of the population (after --exclude and
+    // --filter) is a training or test row of some fold; refuse before the
+    // first fold. The declared locked test is checked even with --allow-lockbox.
+    let cv_keep: Option<Vec<bool>> = if cv_mode.is_some() {
+        let keep = match data::population_mask(&table, &spec, &prep) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
             }
+        };
+        if let Err(e) = data::check_cv_lockbox(&table, &spec, &keep, allow_lockbox) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
         }
-    }
+        Some(keep)
+    } else {
+        None
+    };
 
     // Cross-validation (issue #19): rebuild the split as `k` folds, re-run the
     // search on each fold's own training rows, and score the model it returns on
@@ -6009,6 +6000,7 @@ fn main() {
             gap,
             cfg.seed,
             &dtypes,
+            cv_keep.as_deref(),
         ) {
             Ok(f) => f,
             Err(e) => {
@@ -6594,15 +6586,13 @@ fn main() {
                     Some(d) => d.lockbox,
                     None => rcsr::lockbox::Lockbox::crypto_2026h2(),
                 };
-                let times: Vec<i64> = match time_name.as_deref().and_then(|n| table.index_of(n).ok()) {
-                    Some(j) => data::time_keys_with(&table, j, &spec.time)
-                        .map(|(k, _)| k)
-                        .unwrap_or_default()
+                let times: Vec<i64> = match data::lockbox_stamps(&table, &spec) {
+                    Ok(Some((_, keys))) => keys
                         .iter()
                         .filter(|v| v.is_finite())
                         .map(|v| v.floor() as i64)
                         .collect(),
-                    None => Vec::new(),
+                    _ => Vec::new(),
                 };
                 let overlap = lockbox.overlap(times.iter().copied());
                 let reads = ledger_arg

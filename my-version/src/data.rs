@@ -2653,6 +2653,192 @@ pub fn prepare_full_targets_weighted_with_indices(
     prepare_full_targets_weighted_inner(t, vars, targets, weight, spec, rng, prep, true)
 }
 
+/// The rows that survive `--exclude` and then `--filter`: the population every
+/// split and every cross-validation fold is drawn from.
+pub fn population_mask(t: &Table, spec: &SplitSpec, prep: &PrepSpec) -> Result<Vec<bool>, String> {
+    population_mask_counted(t, spec, prep).map(|(keep, _, _)| keep)
+}
+
+fn population_mask_counted(
+    t: &Table,
+    spec: &SplitSpec,
+    prep: &PrepSpec,
+) -> Result<(Vec<bool>, usize, usize), String> {
+    let mut excluded_count = 0usize;
+    let mut keep_row = vec![true; t.len()];
+    if let Some(x) = &spec.exclude {
+        let cols: Vec<usize> = x
+            .vars
+            .iter()
+            .map(|v| t.index_of(v))
+            .collect::<Result<_, _>>()?;
+        for r in 0..t.len() {
+            let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
+            if expr::eval(&x.tree, &vals) > 0.0 {
+                excluded_count += 1;
+                keep_row[r] = false;
+            }
+        }
+        if !keep_row.iter().any(|&b| b) {
+            return Err("--exclude removed every row".to_string());
+        }
+    }
+    let mut filtered_count = 0usize;
+    if let Some(f) = &prep.filter {
+        let cols: Vec<usize> = f
+            .vars
+            .iter()
+            .map(|v| t.index_of(v))
+            .collect::<Result<_, _>>()?;
+        for r in 0..t.len() {
+            if !keep_row[r] {
+                continue;
+            }
+            let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
+            let kept = expr::eval(&f.tree, &vals) > 0.0;
+            if !kept {
+                keep_row[r] = false;
+                filtered_count += 1;
+            }
+        }
+        if !keep_row.iter().any(|&b| b) {
+            return Err("--filter kept no rows".to_string());
+        }
+    }
+    Ok((keep_row, excluded_count, filtered_count))
+}
+
+/// Integer columns of the table whose finite values are plausible epoch seconds.
+fn epoch_int_columns(t: &Table) -> Vec<usize> {
+    (0..t.names.len())
+        .filter(|&c| {
+            let Some(v) = t.ints(c) else { return false };
+            let (lo, hi) = v
+                .iter()
+                .copied()
+                .filter(|&x| x != i64::MIN)
+                .fold((i64::MAX, i64::MIN), |(a, b), x| (a.min(x), b.max(x)));
+            lo <= hi && crate::lockbox::plausible_epoch_seconds(lo as f64, hi as f64)
+        })
+        .collect()
+}
+
+/// The single place that names the column holding the row time stamps for the
+/// declared locked test. Without a declaration it is the `--time` column.
+/// With a declaration and no `--time`, it is the one integer column of the
+/// table that holds epoch seconds; zero or several is a usage error.
+pub fn lockbox_time_column(t: &Table, spec: &SplitSpec) -> Result<Option<usize>, String> {
+    let Some(d) = &spec.declared_lockbox else {
+        return Ok(spec.time_col);
+    };
+    if spec.time_col.is_some() {
+        return Ok(spec.time_col);
+    }
+    let found = epoch_int_columns(t);
+    match found.as_slice() {
+        [c] => Ok(Some(*c)),
+        _ => Err(format!(
+            "the data declares a locked test {}; pass --time <epoch-seconds column> so every split side can be checked{}",
+            d.describe(),
+            if found.is_empty() {
+                " (no integer epoch-seconds column found)".to_string()
+            } else {
+                let names: Vec<&str> = found.iter().map(|&c| t.names[c].as_str()).collect();
+                format!(" (candidates: {})", names.join(", "))
+            }
+        )),
+    }
+}
+
+/// Row stamps for the declared-range checks, whole seconds, in table row
+/// order. `None` when no declaration applies or no time column exists.
+/// With a declaration the column must parse and hold epoch seconds.
+pub fn lockbox_stamps(t: &Table, spec: &SplitSpec) -> Result<Option<(usize, Vec<f64>)>, String> {
+    let Some(tc) = lockbox_time_column(t, spec)? else {
+        return Ok(None);
+    };
+    let name = t.names.get(tc).map(String::as_str).unwrap_or("time");
+    let keys = match time_keys_with(t, tc, &spec.time) {
+        Ok((keys, _)) => keys,
+        Err(e) => match &spec.declared_lockbox {
+            Some(d) => {
+                return Err(format!(
+                    "the data declares a locked test {}; time column '{}' cannot be read: {}",
+                    d.describe(),
+                    name,
+                    e
+                ))
+            }
+            None => return Ok(None),
+        },
+    };
+    if let Some(d) = &spec.declared_lockbox {
+        let (lo, hi) = keys
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
+        if !crate::lockbox::plausible_epoch_seconds(lo, hi) {
+            let others: Vec<&str> = epoch_int_columns(t)
+                .into_iter()
+                .filter(|&c| c != tc)
+                .map(|c| t.names[c].as_str())
+                .collect();
+            return Err(format!(
+                "the data declares a locked test {}; time column '{}' is not epoch seconds{}",
+                d.describe(),
+                name,
+                if others.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (the table has epoch-seconds column(s): {})", others.join(", "))
+                }
+            ));
+        }
+    }
+    Ok(Some((tc, keys)))
+}
+
+/// Cross-validation guard: every kept row is a potential training or test row
+/// of some fold. The declared locked test is always checked, whatever
+/// `allow_lockbox` says; the 2026H2 box only without it.
+pub fn check_cv_lockbox(
+    t: &Table,
+    spec: &SplitSpec,
+    keep: &[bool],
+    allow_lockbox: bool,
+) -> Result<(), String> {
+    let Some((tc, keys)) = lockbox_stamps(t, spec)? else {
+        return Ok(());
+    };
+    let name = t.names.get(tc).map(String::as_str).unwrap_or("time");
+    let mut times: Vec<i64> = Vec::new();
+    let mut unstamped = 0usize;
+    for (i, k) in keys.iter().enumerate() {
+        if !keep.get(i).copied().unwrap_or(true) {
+            continue;
+        }
+        if k.is_finite() {
+            times.push(k.floor() as i64);
+        } else {
+            unstamped += 1;
+        }
+    }
+    if !allow_lockbox {
+        crate::lockbox::Guard::default().check_times("cross-validation rows", &times)?;
+    }
+    if let Some(d) = &spec.declared_lockbox {
+        if unstamped > 0 {
+            return Err(format!(
+                "{} row(s) of the cross-validation rows have no time stamp; the declared locked test cannot be checked",
+                unstamped
+            ));
+        }
+        d.check_times("cross-validation rows", name, &times)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_full_targets_weighted_inner(
     t: &Table,
@@ -2709,50 +2895,7 @@ fn prepare_full_targets_weighted_inner(
     // run before the row filter, so `--exclude` can never be undone by it.
     // The population is a boolean view over the column-major table: no second
     // copy of the cells (and no text copy) is made while filtering.
-    let mut excluded_count = 0usize;
-    let mut keep_row = vec![true; t.len()];
-    if let Some(x) = &spec.exclude {
-        let cols: Vec<usize> = x
-            .vars
-            .iter()
-            .map(|v| t.index_of(v))
-            .collect::<Result<_, _>>()?;
-        for r in 0..t.len() {
-            let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
-            if expr::eval(&x.tree, &vals) > 0.0 {
-                excluded_count += 1;
-                keep_row[r] = false;
-            }
-        }
-        if !keep_row.iter().any(|&b| b) {
-            return Err("--exclude removed every row".to_string());
-        }
-    }
-
-    // 1. The row filter defines the population the split is drawn from.
-    let mut filtered_count = 0usize;
-    if let Some(f) = &prep.filter {
-        let cols: Vec<usize> = f
-            .vars
-            .iter()
-            .map(|v| t.index_of(v))
-            .collect::<Result<_, _>>()?;
-        for r in 0..t.len() {
-            if !keep_row[r] {
-                continue;
-            }
-            let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
-            if expr::eval(&f.tree, &vals) > 0.0 {
-                // kept
-            } else {
-                keep_row[r] = false;
-                filtered_count += 1;
-            }
-        }
-        if !keep_row.iter().any(|&b| b) {
-            return Err("--filter kept no rows".to_string());
-        }
-    }
+    let (keep_row, excluded_count, filtered_count) = population_mask_counted(t, spec, prep)?;
     // With no `--exclude`/`--filter` the population is the whole table: borrow
     // it rather than copy a second columnar image.
     let filtered_owned;
@@ -3671,13 +3814,13 @@ pub fn cv_folds_weighted(
     gap: usize,
     seed: u32,
 ) -> Result<Vec<CvFold>, String> {
-    cv_folds_typed(t, vars, target, weight, mode, k, gap, seed, &[])
+    cv_folds_typed(t, vars, target, weight, mode, k, gap, seed, &[], None)
 }
 
 /// Like [`cv_folds_weighted`], with the per-input datatypes produced by
 /// [`apply_dtypes`]. A `Boolean` input is never centred or scaled, exactly as in
 /// [`prepare_full_weighted_with`]; an empty slice means every input is
-/// continuous.
+/// continuous. `keep` limits the folds to the rows of [`population_mask`].
 #[allow(clippy::too_many_arguments)]
 pub fn cv_folds_typed(
     t: &Table,
@@ -3689,7 +3832,21 @@ pub fn cv_folds_typed(
     gap: usize,
     seed: u32,
     dtypes: &[DType],
+    keep: Option<&[bool]>,
 ) -> Result<Vec<CvFold>, String> {
+    if let Some(keep) = keep {
+        if keep.len() != t.len() {
+            return Err(format!(
+                "internal population mask has {} entries for {} rows",
+                keep.len(),
+                t.len()
+            ));
+        }
+        if !keep.iter().all(|&b| b) {
+            let kept = t.select(keep);
+            return cv_folds_typed(&kept, vars, target, weight, mode, k, gap, seed, dtypes, None);
+        }
+    }
     let (var_idx, tgt_idx) = resolve_columns(t, vars, target)?;
     let nv = var_idx.len();
     if !dtypes.is_empty() && dtypes.len() != nv {
@@ -4108,10 +4265,11 @@ fn build_split(
 
 /// #145: refuse a split whose training, validation or test rows fall inside the 2026H2
 /// lockbox. This is the guard behind `rcsr run` (the default search command),
-/// not only `walkforward`. A dataset without a time column cannot be checked;
-/// neither can a numeric time column that is not Unix seconds (a row index or a
-/// year fraction), so the check is skipped rather than rejecting valid
-/// non-crypto data.
+/// not only `walkforward`. Without a declared locked test, a dataset without a
+/// time column cannot be checked, and neither can a numeric time column that is
+/// not Unix seconds, so the check is skipped rather than rejecting valid
+/// non-crypto data. With a declared locked test (#486, #518) every split side
+/// is checked or the run is refused.
 fn check_split_lockbox(
     t: &Table,
     spec: &SplitSpec,
@@ -4120,12 +4278,14 @@ fn check_split_lockbox(
     folds: &[Vec<usize>],
     report: &mut SplitReport,
 ) -> Result<(), String> {
-    let Some(tc) = spec.time_col else {
+    let Some((tc, keys)) = lockbox_stamps(t, spec)? else {
         return Ok(());
     };
-    let keys = match time_keys_with(t, tc, &spec.time) {
-        Ok((keys, _)) => keys,
-        Err(_) => return Ok(()),
+    let declared = spec.declared_lockbox.is_some();
+    let unstamped = |idx: &[usize]| -> usize {
+        idx.iter()
+            .filter(|&&i| !keys.get(i).copied().unwrap_or(f64::NAN).is_finite())
+            .count()
     };
     let times = |idx: &[usize]| -> Vec<i64> {
         idx.iter()
@@ -4138,6 +4298,17 @@ fn check_split_lockbox(
     let validation_times = times(validation);
     let test_idx: Vec<usize> = folds.iter().flatten().copied().collect();
     let test_times = times(&test_idx);
+    if declared {
+        for (side, idx) in [("training", train), ("validation", validation), ("test", &test_idx[..])] {
+            let n = unstamped(idx);
+            if n > 0 {
+                return Err(format!(
+                    "{} row(s) of the {} split have no time stamp; the declared locked test cannot be checked",
+                    n, side
+                ));
+            }
+        }
+    }
     let extent = |v: &[i64]| -> Option<(f64, f64)> {
         v.iter()
             .copied()
@@ -4153,7 +4324,7 @@ fn check_split_lockbox(
         (f64::INFINITY, f64::NEG_INFINITY),
         |(lo, hi), (a, b)| (lo.min(a), hi.max(b)),
     );
-    if !crate::lockbox::plausible_epoch_seconds(span.0, span.1) {
+    if !declared && !crate::lockbox::plausible_epoch_seconds(span.0, span.1) {
         return Ok(());
     }
     report.lockbox_checked = true;

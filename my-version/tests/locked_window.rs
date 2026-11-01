@@ -255,3 +255,152 @@ fn declared_for_reads_each_carrier_and_an_explicit_flag_wins() {
     assert!(e.contains("2 row(s)"), "{}", e);
     assert!(d.check_times("test split", "ts", &times[..1]).is_ok());
 }
+
+/// Two series that are byte-identical outside the stand-in locked test and
+/// differ inside it (flipped target).
+fn ab_csv(a: &Path, b: &Path) {
+    let mut ca = String::from("ts,x,y\n");
+    let mut cb = ca.clone();
+    for i in 0..400i64 {
+        let x = ((i * 37) % 17) as f64 - 8.0;
+        let y = 0.0003 * x + (((i * 13) % 7) as f64 - 3.0) * 0.0004;
+        let ts = T0 + i * H;
+        let yb = if (locked().start..locked().end).contains(&ts) { -y - 0.001 } else { y };
+        ca.push_str(&format!("{},{},{}\n", ts, x, y));
+        cb.push_str(&format!("{},{},{}\n", ts, x, yb));
+    }
+    std::fs::write(a, ca).unwrap();
+    std::fs::write(b, cb).unwrap();
+}
+
+fn plain(args: &[&str]) -> (i32, String, String) {
+    let mut a = vec!["--target", "y", "--vars", "x", "--cpu", "--no-dev-log", "--seed", "3", "--quiet"];
+    a.extend_from_slice(args);
+    rcsr(&a)
+}
+
+fn cv_part(json: &str) -> String {
+    let a = json.find("\"cross_validation\":").expect("cross_validation in run.json");
+    let rest = &json[a..];
+    rest[..rest.find(",\"stability\"").unwrap()].to_string()
+}
+
+#[test]
+fn declared_split_without_time_is_refused() {
+    let dir = scratch("notime");
+    let data = dir.join("d.csv");
+    series_csv(&data);
+    let d = s(&data);
+    lockbox::write_sidecar(&d, &locked(), "test").unwrap();
+    let run = s(&dir.join("run.json"));
+
+    let (code, _, err) = plain(&["--data", &d, "--eval-expr", "0"]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("declared a locked test") || err.contains("declares a locked test"), "{}", err);
+    assert!(err.contains("2024-01-13..2024-01-17"), "{}", err);
+
+    // with --time the random split is checked too
+    let (code, _, err) = plain(&["--data", &d, "--time", "ts", "--eval-expr", "0"]);
+    assert_eq!(code, 3, "{}", err);
+
+    let exclude = format!("ts >= {}", locked().start);
+    let (code, _, err) = plain(&[
+        "--data", &d, "--time", "ts", "--split", "temporal", "--exclude", &exclude, "--generations", "3",
+        "--pop", "16", "--json-out", &run,
+    ]);
+    assert_eq!(code, 0, "{}", err);
+    let json = std::fs::read_to_string(&run).unwrap();
+    assert!(json.contains("\"checked\":true"), "{}", json);
+    assert!(json.contains("\"rows_in_scope\":0"), "{}", json);
+}
+
+#[test]
+fn declared_selectors_without_time_are_refused() {
+    let dir = scratch("selectors");
+    let data = dir.join("d.csv");
+    series_csv(&data);
+    let d = s(&data);
+    lockbox::write_sidecar(&d, &locked(), "test").unwrap();
+    let train = format!("ts < {}", T0 + 200 * H);
+    let test = format!("ts >= {}", locked().start + H);
+    let (code, _, err) = plain(&["--data", &d, "--train-select", &train, "--test-select", &test, "--eval-expr", "0"]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("2024-01-13..2024-01-17"), "{}", err);
+}
+
+#[test]
+fn declared_non_epoch_time_is_refused() {
+    let dir = scratch("nonepoch");
+    let data = dir.join("d.csv");
+    let mut csv = String::from("ts,x,y\n");
+    for i in 0..100i64 {
+        csv.push_str(&format!("{},{},{}\n", i, ((i * 37) % 17) as f64, ((i * 13) % 7) as f64));
+    }
+    std::fs::write(&data, csv).unwrap();
+    let d = s(&data);
+    lockbox::write_sidecar(&d, &locked(), "test").unwrap();
+    let (code, _, err) = plain(&["--data", &d, "--time", "ts", "--split", "temporal", "--eval-expr", "0"]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("not epoch seconds"), "{}", err);
+
+    // without a declaration the check is skipped as before
+    let free = dir.join("free.csv");
+    std::fs::copy(&data, &free).unwrap();
+    let (code, _, err) = plain(&["--data", &s(&free), "--time", "ts", "--split", "temporal", "--eval-expr", "0"]);
+    assert_eq!(code, 0, "{}", err);
+}
+
+#[test]
+fn declared_cv_ignores_allow_lockbox() {
+    let dir = scratch("cvallow");
+    let data = dir.join("d.csv");
+    series_csv(&data);
+    let d = s(&data);
+    lockbox::write_sidecar(&d, &locked(), "test").unwrap();
+    // the split sides avoid the locked rows; the cross-validation folds do not
+    let train = format!("ts < {}", T0 + 100 * H);
+    let test = format!("(ts >= {}) * (ts < {})", T0 + 100 * H, T0 + 150 * H);
+    let base = [
+        "--data", d.as_str(), "--time", "ts", "--train-select", train.as_str(), "--test-select", test.as_str(),
+        "--cv", "k-fold", "--cv-k", "3", "--generations", "2", "--pop", "8",
+    ];
+    for allow in [false, true] {
+        let mut a = base.to_vec();
+        if allow {
+            a.push("--allow-lockbox");
+        }
+        let (code, _, err) = plain(&a);
+        assert_eq!(code, 3, "allow={} {}", allow, err);
+        assert!(err.contains("cross-validation rows"), "{}", err);
+        assert!(err.contains("declared locked test"), "{}", err);
+    }
+    let exclude = format!("ts >= {}", locked().start);
+    let mut a = base.to_vec();
+    a.extend_from_slice(&["--exclude", &exclude]);
+    let (code, _, err) = plain(&a);
+    assert_eq!(code, 0, "{}", err);
+}
+
+#[test]
+fn cv_folds_honour_exclude() {
+    let dir = scratch("cvexclude");
+    let (a, b) = (dir.join("a.csv"), dir.join("b.csv"));
+    ab_csv(&a, &b);
+    let exclude = format!("ts >= {}", locked().start);
+    let mut cv = Vec::new();
+    for p in [&a, &b] {
+        let d = s(p);
+        lockbox::write_sidecar(&d, &locked(), "test").unwrap();
+        let run = s(&dir.join(format!("{}.json", p.file_stem().unwrap().to_str().unwrap())));
+        let train = format!("ts < {}", T0 + 100 * H);
+        let test = format!("(ts >= {}) * (ts < {})", T0 + 100 * H, T0 + 150 * H);
+        let (code, _, err) = plain(&[
+            "--data", &d, "--time", "ts", "--train-select", &train, "--test-select", &test, "--exclude", &exclude,
+            "--cv", "k-fold", "--cv-k", "3", "--generations", "3", "--pop", "16", "--json-out", &run,
+        ]);
+        assert_eq!(code, 0, "{}", err);
+        cv.push(cv_part(&std::fs::read_to_string(&run).unwrap()));
+    }
+    assert!(cv[0].contains("\"folds\":[{"), "{}", cv[0]);
+    assert_eq!(cv[0], cv[1]);
+}

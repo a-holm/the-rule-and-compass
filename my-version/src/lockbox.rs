@@ -236,6 +236,11 @@ pub struct Declared {
 }
 
 impl Declared {
+    /// `2024-06-01..2024-07-01 (store manifest)` for messages.
+    pub fn describe(&self) -> String {
+        format!("{}..{} ({})", date(self.lockbox.start), date(self.lockbox.end), self.origin())
+    }
+
     pub fn origin(&self) -> &'static str {
         if self.source == "store" {
             "store manifest"
