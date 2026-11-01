@@ -495,19 +495,14 @@ pub fn compare(
     let mut evals_ratios = Vec::new();
     let mut hv_diffs = Vec::new();
     let (mut base_seconds, mut treat_seconds) = (0.0, 0.0);
+    let mut dropped: Vec<String> = Vec::new();
     for (k, br) in &bm {
         let tr = &tm[k];
         let (bv, tv) = match (br.criterion(criterion), tr.criterion(criterion)) {
             (Some(x), Some(y)) => (x, y),
             _ => {
-                return Err(format!(
-                    "criterion {} is not defined for {}/{}/noise {}/seed {}",
-                    criterion.name(),
-                    k.0,
-                    k.1,
-                    k.2,
-                    k.3
-                ))
+                dropped.push(format!("{}/{}/noise {}/seed {}", k.0, k.1, k.2, k.3));
+                continue;
             }
         };
         let row = rows
@@ -554,7 +549,10 @@ pub fn compare(
         base_seconds += br.seconds;
         treat_seconds += tr.seconds;
     }
-    let pairs = bm.len();
+    let pairs = bm.len() - dropped.len();
+    if pairs == 0 {
+        return Err(format!("criterion {} is not defined for any pair", criterion.name()));
+    }
     Ok(CompareReport {
         criterion,
         pairs,
@@ -573,7 +571,7 @@ pub fn compare(
         base_seconds,
         treat_seconds,
         rows: rows.into_values().collect(),
-        dropped: Vec::new(),
+        dropped,
     })
 }
 
@@ -637,6 +635,13 @@ impl CompareReport {
             self.base_seconds, self.treat_seconds
         ));
         o.push_str(&format!(
+            "dropped pairs (criterion undefined on a side): {}\n",
+            self.dropped.len()
+        ));
+        for k in &self.dropped {
+            o.push_str(&format!("  {}\n", k));
+        }
+        o.push_str(&format!(
             "\n{:<8} {:<18} {:>5} {:>5} {:>5} {:>5} {:>6}\n",
             "suite", "problem", "pairs", "base", "treat", "wins", "losses"
         ));
@@ -687,6 +692,11 @@ impl CompareReport {
         o.push_str(&format!(
             "\"base_seconds\": {}, \"treat_seconds\": {},\n",
             self.base_seconds, self.treat_seconds
+        ));
+        o.push_str(&format!(
+            "\"dropped\": {{\"count\": {}, \"keys\": [{}]}},\n",
+            self.dropped.len(),
+            self.dropped.iter().map(|k| format!("\"{}\"", k)).collect::<Vec<_>>().join(", ")
         ));
         o.push_str("\"problems\": [\n");
         for (i, r) in self.rows.iter().enumerate() {
