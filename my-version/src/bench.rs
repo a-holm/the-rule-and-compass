@@ -394,6 +394,8 @@ pub struct Knobs {
     pub variation: Option<crate::search::VariationMode>,
     pub selection: Option<crate::search::Selection>,
     pub dispatch: Option<crate::dispatch::DispatchMode>,
+    /// #466: `Some(true)` turns the front prune on (`--prune`).
+    pub prune: Option<bool>,
     /// #470: `--linear-scaling`.
     pub linear_scaling: bool,
     /// #471: node-path variation settings.
@@ -532,6 +534,8 @@ pub struct RunResult {
     pub fit_attempts: Option<usize>,
     pub fit_gpu: Option<usize>,
     pub fit_fallback: Option<usize>,
+    /// #466: seconds the front prune took (0 unless `--prune`).
+    pub prune_s: f64,
 }
 
 /// Mean-adjusted summary of one `(suite, noise)` group.
@@ -801,6 +805,9 @@ fn base_config(cfg: &SuiteConfig, seed: u32) -> Config {
     if let Some(v) = k.fit_polish {
         sc.fit_polish = v;
     }
+    if let Some(v) = k.prune {
+        sc.prune = v;
+    }
     sc.reject_constant_offspring = k.reject_constant_offspring; // #477
     sc
 }
@@ -856,6 +863,7 @@ fn empty_result(suite: &str, problem: &str, noise: Option<f64>, seed: u32, truth
         fit_attempts: None,
         fit_gpu: None,
         fit_fallback: None,
+        prune_s: 0.0,
     }
 }
 
@@ -935,6 +943,7 @@ pub fn run_problem(p: &Problem, noise: f64, seed: u32, cfg: &SuiteConfig) -> Run
     r.stop_reason = out.stop_reason.to_string();
     r.backend = out.backend.name().to_string();
     (r.fit_attempts, r.fit_gpu, r.fit_fallback) = fit_counters(&out);
+    r.prune_s = out.prune.seconds;
     r.front_hv = front_hv(&points, max_cx);
     r.oracle_r2 = Some(oracle);
     if oracle_valid {
@@ -1011,6 +1020,7 @@ pub fn run_signal(task: &SignalTask, seed: u32, cfg: &SuiteConfig) -> RunResult 
     r.stop_reason = out.stop_reason.to_string();
     r.backend = out.backend.name().to_string();
     (r.fit_attempts, r.fit_gpu, r.fit_fallback) = fit_counters(&out);
+    r.prune_s = out.prune.seconds;
     r.front_hv = front_hv(&points, max_cx);
     install_hits(&mut r, &tracker.lock().unwrap());
     r
@@ -1486,7 +1496,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
     };
     let opt_u = |v: Option<usize>| json_opt(v);
     format!(
-        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"selection\":{},\"dispatch\":{},\"fit_polish\":{},\"linear_scaling\":{},\"reject_constant_offspring\":{},\"mutation_mix\":{},\"tree_arity\":{},\"crossover_internal\":{},\"adaptive_mix\":{},\"patience_tol\":{},\"stop_front\":{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
+        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"selection\":{},\"dispatch\":{},\"fit_polish\":{},\"linear_scaling\":{},\"reject_constant_offspring\":{},\"mutation_mix\":{},\"tree_arity\":{},\"crossover_internal\":{},\"adaptive_mix\":{},\"prune\":{},\"patience_tol\":{},\"stop_front\":{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
         GENERATOR_VERSION,
         json_number(cfg.threshold),
         json_number(SIGNAL_THRESHOLD),
@@ -1513,6 +1523,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
         k.tree_arity.map_or("null".to_string(), |v| format!("\"{}\"", v.as_str())),
         k.crossover_internal.map_or("null".to_string(), json_number),
         k.adaptive_mix,
+        k.prune.map_or("null".to_string(), |v| v.to_string()),
         json_opt_f(k.patience_tol),
         opt_u(k.stop_front),
         env!("CARGO_PKG_VERSION"),
@@ -1527,7 +1538,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
 /// The fields of one run, without braces.
 fn run_fields(r: &RunResult) -> String {
     format!(
-        "\"suite\": \"{}\", \"problem\": \"{}\", \"noise\": {}, \"seed\": {}, \"recovered\": {}, \"test_r2\": {}, \"complexity\": {}, \"train_error\": {}, \"test_rmse\": {}, \"seconds\": {}, \"expression\": \"{}\", \"truth_cx\": {}, \"generations_run\": {}, \"stop_reason\": \"{}\", \"backend\": \"{}\", \"oracle_r2\": {}, \"oracle_recovered\": {}, \"exact_cx\": {}, \"excess_cx\": {}, \"front_hv\": {}, \"hit_gen\": {}, \"hit_s\": {}, \"hit_evals\": {}, \"oracle_hit_gen\": {}, \"oracle_hit_s\": {}, \"oracle_hit_evals\": {}, \"signal_r2\": {}, \"signal_recovered\": {}, \"selected_cx\": {}, \"distractors_used\": {}, \"fit_attempts\": {}, \"fit_gpu\": {}, \"fit_fallback\": {}",
+        "\"suite\": \"{}\", \"problem\": \"{}\", \"noise\": {}, \"seed\": {}, \"recovered\": {}, \"test_r2\": {}, \"complexity\": {}, \"train_error\": {}, \"test_rmse\": {}, \"seconds\": {}, \"expression\": \"{}\", \"truth_cx\": {}, \"generations_run\": {}, \"stop_reason\": \"{}\", \"backend\": \"{}\", \"oracle_r2\": {}, \"oracle_recovered\": {}, \"exact_cx\": {}, \"excess_cx\": {}, \"front_hv\": {}, \"hit_gen\": {}, \"hit_s\": {}, \"hit_evals\": {}, \"oracle_hit_gen\": {}, \"oracle_hit_s\": {}, \"oracle_hit_evals\": {}, \"signal_r2\": {}, \"signal_recovered\": {}, \"selected_cx\": {}, \"distractors_used\": {}, \"fit_attempts\": {}, \"fit_gpu\": {}, \"fit_fallback\": {}, \"prune_s\": {}",
         json_escape(&r.suite),
         json_escape(&r.problem),
         json_opt_f(r.noise),
@@ -1561,6 +1572,7 @@ fn run_fields(r: &RunResult) -> String {
         json_opt(r.fit_attempts),
         json_opt(r.fit_gpu),
         json_opt(r.fit_fallback),
+        json_number(r.prune_s),
     )
 }
 

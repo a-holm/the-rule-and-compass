@@ -711,6 +711,15 @@ SEARCH:
                              first constant of an island is kept (#477). Saved
                              search setting, off by default
                              and restores the pre-#76 trajectory exactly
+  --prune                    remove neutral code from the final front (off by
+                             default): replace subtrees with a child or a
+                             constant when the training error stays within
+                             1e-6 (1 + |e|) of the original (#466)
+  --no-prune                 keep the prune off (the default)
+  --prune-rows <N>           rows the prune fits on (default 20000, >= 2); a
+                             larger training sample is subsampled
+  --prune-budget <N>         cap on candidate fits per run (default 20000,
+                             0 = no prune)
   --no-simd                  force the scalar tree walk instead of the
                              SoA/AVX evaluator (same results, slower; an
                              escape hatch for debugging and A/B runs)
@@ -1872,6 +1881,9 @@ impl DevSink {
             fit_kernel_lm_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_lm_s()),
             fit_kernel_polish_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_polish_s()),
             fit_fallback_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_fallback_s()),
+            prune_fits: outcome.prune.fits,
+            prune_accepted: outcome.prune.accepted,
+            prune_s: outcome.prune.seconds,
             fit_refit_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_s()),
             fit_refits: outcome.gpu.as_ref().map(|g| g.fit_refits),
             events,
@@ -2801,6 +2813,29 @@ fn main() {
             "--fit-fallback-max" => {
                 cfg.fit_fallback_max = val!().parse().unwrap_or(cfg.fit_fallback_max);
                 fit_fallback_max_set = true;
+            }
+            // #466: front prune; a post-loop pass, not saved search state.
+            "--prune" => cfg.prune = true,
+            "--no-prune" => cfg.prune = false,
+            "--prune-rows" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n >= 2 => cfg.prune_rows = n,
+                    _ => {
+                        eprintln!("error: --prune-rows needs an integer >= 2, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--prune-budget" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) => cfg.prune_budget = n,
+                    _ => {
+                        eprintln!("error: --prune-budget needs a non-negative integer, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
             }
             // #495: relative band of the exact finalist refit.
             "--refit-band" => {
@@ -7314,7 +7349,18 @@ fn main() {
             } else {
                 String::new()
             };
-            let search_meta_json = format!("{}{}", predictor_json, fit_json);
+            // #466: omitted unless --prune is given, which keeps the historical JSON.
+            let prune_json = if cfg.prune && cfg.prune_budget > 0 {
+                format!(
+                    "\"prune\":{{\"fits\":{},\"accepted\":{},\"seconds\":{}}},",
+                    outcome.prune.fits,
+                    outcome.prune.accepted,
+                    jnum(outcome.prune.seconds)
+                )
+            } else {
+                String::new()
+            };
+            let search_meta_json = format!("{}{}{}", predictor_json, fit_json, prune_json);
             let checkpoint_json = format!(
                 "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{}}}",
                 resume_path

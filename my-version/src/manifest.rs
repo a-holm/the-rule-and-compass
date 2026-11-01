@@ -154,6 +154,10 @@ impl Manifest {
             out.push_str(&format!("  \"dispatch\":{},\n", dispatch.manifest_json()));
         }
         out.push_str(&format!(
+            "  \"prune\":{{\"enabled\":{},\"rows\":{},\"budget\":{}}},\n",
+            self.config.prune, self.config.prune_rows, self.config.prune_budget
+        ));
+        out.push_str(&format!(
             "  \"resume\":{{\"from\":{},\"backend_change\":{}}},\n",
             self.resumed_from
                 .as_deref()
