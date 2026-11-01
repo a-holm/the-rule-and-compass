@@ -10117,9 +10117,9 @@ fn run_walkforward(args: &[String]) -> ! {
         );
         std::process::exit(EXIT_USAGE);
     }
-    if let Some((earliest, seen, purge)) = front_run.as_ref().and_then(|r| r.earliest_test_start()) {
+    if let Some((run, (_, seen, purge))) = front_run.as_ref().and_then(|r| Some((r, r.earliest_test_start()?))) {
         for w in &windows {
-            if w.test_start < earliest {
+            if run.in_sample(w.test_start) {
                 if allow_in_sample {
                     popts.in_sample_windows.push(w.label.clone());
                     continue;

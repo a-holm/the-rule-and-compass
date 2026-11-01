@@ -206,6 +206,7 @@ fn group_column(t: &Table, name: Option<&str>) -> Result<Vec<u64>, String> {
 #[derive(Clone, Debug)]
 pub struct Fold {
     pub label: String,
+    pub test_start: f64,
     pub fit: Vec<usize>,
     pub valid: Vec<usize>,
     pub test: Vec<usize>,
@@ -247,6 +248,7 @@ pub fn make_folds(
         let fit_end = w.validation_start - purge_seconds;
         let mut f = Fold {
             label: win.label.clone(),
+            test_start: win.test_start,
             fit: Vec::new(),
             valid: Vec::new(),
             test: Vec::new(),
@@ -285,6 +287,49 @@ pub fn make_folds(
 // Options
 // ---------------------------------------------------------------------------
 
+/// One search run whose finalist is scored on every fold. The run's position
+/// rule is fixed: long iff the score exceeds `threshold`.
+#[derive(Clone, Debug)]
+pub struct SrRun {
+    pub run: crate::run_json::RunFile,
+    pub expression: String,
+    pub variables: Vec<String>,
+    pub threshold: f64,
+    /// `(fold label, out-of-fold)` for every window of the table.
+    pub fold_oof: Vec<(String, bool)>,
+}
+
+impl SrRun {
+    pub fn load(path: &str) -> Result<SrRun, String> {
+        let run = crate::run_json::RunFile::load(path)?;
+        let book = run.book()?;
+        Ok(SrRun {
+            expression: book.expression,
+            variables: book.variables,
+            threshold: book.threshold,
+            run,
+            fold_oof: Vec::new(),
+        })
+    }
+
+    fn json(&self) -> String {
+        let folds: Vec<String> = self
+            .fold_oof
+            .iter()
+            .map(|(l, ok)| format!("{{\"fold\":{},\"oof\":{}}}", jstr(l), ok))
+            .collect();
+        format!(
+            "{{\"run\":{},\"run_sha256\":{},\"expression\":{},\"expression_source\":\"objective.finalist\",\
+\"threshold\":{},\"threshold_source\":\"run\",\"folds\":[{}]}}",
+            jstr(&self.run.path),
+            jstr(&self.run.sha256),
+            jstr(&self.expression),
+            jnum(self.threshold),
+            folds.join(",")
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub cost_bps: f64,
@@ -303,6 +348,8 @@ pub struct Options {
     /// Candidate evaluations and wall seconds of the symbolic-regression run.
     pub sr_evals: Option<u64>,
     pub sr_wall_seconds: Option<f64>,
+    /// A single search run scored on every fold (#492); see [`SrRun`].
+    pub sr_run: Option<SrRun>,
     pub spec: Option<TargetSpec>,
     pub gbm_trees: usize,
     pub seed: u32,
@@ -329,6 +376,7 @@ impl Default for Options {
             sr_score_col: None,
             sr_evals: None,
             sr_wall_seconds: None,
+            sr_run: None,
             spec: None,
             gbm_trees: DEFAULT_GBM_TREES,
             seed: 0,
@@ -1004,6 +1052,7 @@ pub struct Report {
     pub seed: u32,
     pub fdr_q: f64,
     pub gbm_beats_sr: Option<bool>,
+    pub sr_run: Option<String>,
     pub sr_evals: Option<u64>,
     pub sr_wall_seconds: Option<f64>,
     pub gbm_trees: usize,
@@ -1506,19 +1555,50 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
         r
     };
 
-    // symbolic regression, scored by the caller's out-of-fold column
-    let sr = match opts.sr_score_col.as_deref().and_then(|c| p.col(c)) {
-        Some(col) => {
-            let all: Vec<f64> = col.to_vec();
-            let mut r = score_rung(p, folds, &pool, opts, Rung::new("symbolic_regression", "model"), &mut |f: &Fold| {
-                (rows_of(&all, &f.fit), rows_of(&all, &f.valid), rows_of(&all, &f.test))
-            });
-            r.fits = opts.sr_evals.unwrap_or(0);
-            r.wall = opts.sr_wall_seconds.unwrap_or(0.0);
-            r.predicts_target = true;
-            r
+    // symbolic regression: one search run scored on every fold, or the caller's column
+    let sr = if let Some(sr_run) = &opts.sr_run {
+        let tree = crate::expr::parse(&sr_run.expression, &sr_run.variables)
+            .map_err(|e| format!("cannot parse '{}': {}", sr_run.expression, e))?;
+        let cols: Vec<&[f64]> = sr_run
+            .variables
+            .iter()
+            .map(|v| p.col(v).ok_or_else(|| format!("variable '{}' is not in the data", v)))
+            .collect::<Result<_, _>>()?;
+        let mut row = vec![0.0f64; cols.len()];
+        let mut r = Rung::new("symbolic_regression", "model");
+        r.pos = vec![0.0; n];
+        r.score = vec![f64::NAN; n];
+        for (fi, f) in folds.iter().enumerate() {
+            let (s, _) = pool.ranges[fi];
+            for (k, &i) in f.test.iter().enumerate() {
+                for (c, col) in cols.iter().enumerate() {
+                    row[c] = col[i];
+                }
+                let sc = crate::expr::eval(&tree, &row);
+                r.score[s + k] = sc;
+                r.pos[s + k] = if sc > sr_run.threshold { 1.0 } else { 0.0 };
+            }
         }
-        None => Rung::not_run("symbolic_regression", "model", "needs --sr-score (runs in the pilot and campaign)"),
+        r.params = format!("fixed threshold {} from the run; expression {}", jnum(sr_run.threshold), sr_run.expression);
+        r.fits = opts.sr_evals.unwrap_or(0);
+        r.wall = opts.sr_wall_seconds.unwrap_or(0.0);
+        r.predicts_target = true;
+        r
+    } else {
+        match opts.sr_score_col.as_deref().and_then(|c| p.col(c)) {
+            Some(col) => {
+                let all: Vec<f64> = col.to_vec();
+                let mut r = score_rung(p, folds, &pool, opts, Rung::new("symbolic_regression", "model"), &mut |f: &Fold| {
+                    (rows_of(&all, &f.fit), rows_of(&all, &f.valid), rows_of(&all, &f.test))
+                });
+                r.fits = opts.sr_evals.unwrap_or(0);
+                r.wall = opts.sr_wall_seconds.unwrap_or(0.0);
+                r.predicts_target = true;
+                r.params = format!("{}; oof=caller", r.params);
+                r
+            }
+            None => Rung::not_run("symbolic_regression", "model", "needs --sr-run or --sr-score"),
+        }
     };
 
     // matched-exposure random long, matched to the strongest searched or linear book
@@ -1750,6 +1830,7 @@ fn finish_report(
         seed: opts.seed,
         fdr_q: opts.fdr_q,
         gbm_beats_sr,
+        sr_run: opts.sr_run.as_ref().map(SrRun::json),
         sr_evals: opts.sr_evals,
         sr_wall_seconds: opts.sr_wall_seconds,
         gbm_trees: opts.gbm_trees,
@@ -1859,7 +1940,7 @@ impl Report {
             "{{\"schema\":{},\"folds\":{},\"periods\":{},\"rows_scored\":{},\"periods_per_year\":{},\"block_len\":{},\
 \"cost_bps\":{},\"cost\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
 \"sr_candidate_evaluations\":{},\"sr_wall_seconds\":{},\"gbm_beats_sr\":{}}},\"multiple_testing\":{{\"draws\":{},\"seed\":{},\
-\"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"rungs\":[{}],\"ledger\":{}}}",
+\"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"sr_run\":{},\"rungs\":[{}],\"ledger\":{}}}",
             jstr(SCHEMA),
             jarr_str(&self.folds),
             self.periods,
@@ -1882,6 +1963,7 @@ impl Report {
             dsr,
             pbo,
             jarr_str(&self.notes),
+            self.sr_run.as_deref().unwrap_or("null"),
             rows.join(","),
             if self.ledger.wall_s() > 0.0 {
                 self.ledger.phase_json(
@@ -2034,8 +2116,18 @@ pub fn load_panel(inp: &Input, opts: &Options) -> Result<Panel, String> {
             extras.push(c.to_string());
         }
     }
+    if let Some(sr) = &opts.sr_run {
+        for v in &sr.variables {
+            if !inp.features.is_empty() && !inp.features.contains(v) {
+                extras.push(v.clone());
+            }
+        }
+    }
     want.extend(extras.iter().cloned());
     want.extend(inp.features.iter().cloned());
+    if let Some(sr) = &opts.sr_run {
+        want.extend(sr.variables.iter().cloned());
+    }
     want.sort();
     want.dedup();
     let table = if crate::store::is_store_path(&inp.data) {
@@ -2117,7 +2209,10 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --reversal-col <col>      lagged return column for the naive reversal rung\n\
   --signal-col <col>        feature for the 1[f > tau] rung\n\
   --target-spec <file>      target spec file: per-side cost (cost_bps / 2), return units (log is converted with exp_m1), return column and horizon; also the zero-parameter rung (scale column must be in the panel)\n\
-  --sr-score <col>          out-of-fold symbolic-regression score column\n\
+  --sr-run <run.json>       one search run (rcsr --objective ... --json-out) scored on every fold with the run's fixed threshold;\n\
+                            a fold whose test starts before the run's last seen row + purge is refused (exit 3)\n\
+  --allow-in-sample         with --sr-run: drop in-sample folds from every rung and label them oof:false\n\
+  --sr-score <col>          out-of-fold symbolic-regression score column from the caller (labelled oof=caller)\n\
   --sr-evals <n>            candidate evaluations of the symbolic-regression run\n\
   --sr-wall <s>             wall seconds of the symbolic-regression run\n\
   --gbm-trees <n>           GBM tuning budget in trees per fold (default 240)\n\
@@ -2176,6 +2271,8 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let mut ledger_path: Option<String> = None;
     let mut sealed_path: Option<String> = None;
     let mut spec_path: Option<String> = None;
+    let mut sr_run_path: Option<String> = None;
+    let mut allow_in_sample = false;
     let mut cost_flag: Option<f64> = None;
     let mut cost_override: Option<f64> = None;
     let mut grid_given = false;
@@ -2217,6 +2314,8 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             "--signal-col" => opts.signal_col = Some(val()?),
             "--target-spec" => spec_path = Some(val()?),
             "--sr-score" => opts.sr_score_col = Some(val()?),
+            "--sr-run" => sr_run_path = Some(val()?),
+            "--allow-in-sample" => allow_in_sample = true,
             "--sr-evals" => opts.sr_evals = Some(val()?.parse().map_err(|_| num_err(a))?),
             "--sr-wall" => opts.sr_wall_seconds = Some(val()?.parse().map_err(|_| num_err(a))?),
             "--gbm-trees" => opts.gbm_trees = val()?.parse().map_err(|_| num_err(a))?,
@@ -2246,6 +2345,22 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         return Err(usage_err("--pbo-blocks must be an even number of at least 2".to_string()));
     }
     let input_err = |m: String| (3, m);
+    if allow_in_sample && sr_run_path.is_none() {
+        return Err(usage_err("--allow-in-sample applies to --sr-run only".to_string()));
+    }
+    if let Some(path) = &sr_run_path {
+        if opts.sr_score_col.is_some() {
+            return Err(usage_err("--sr-run and --sr-score are alternatives".to_string()));
+        }
+        let sr = SrRun::load(path).map_err(|e| input_err(format!("--sr-run {}", e)))?;
+        if opts.sr_evals.is_none() {
+            opts.sr_evals = sr.run.candidates_evaluated;
+        }
+        if opts.sr_wall_seconds.is_none() {
+            opts.sr_wall_seconds = sr.run.elapsed_seconds;
+        }
+        opts.sr_run = Some(sr);
+    }
     let t_io = Instant::now();
     if let Some(path) = &spec_path {
         let text = std::fs::read_to_string(path).map_err(|e| input_err(format!("{}: {}", path, e)))?;
@@ -2321,7 +2436,17 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         features,
     };
     let panel = load_panel(&inp, &opts).map_err(input_err)?;
-    let folds = make_folds(&panel, &rows, opts.purge_seconds, guard).map_err(input_err)?;
+    let mut folds = make_folds(&panel, &rows, opts.purge_seconds, guard).map_err(input_err)?;
+    if let Some(sr) = &mut opts.sr_run {
+        let labelled: Vec<(String, f64)> = folds.iter().map(|f| (f.label.clone(), f.test_start)).collect();
+        let oof = sr.run.oof_flags(&labelled, allow_in_sample).map_err(|e| input_err(format!("--sr-run {}: {}", sr.run.path, e)))?;
+        sr.fold_oof = labelled.iter().map(|(l, _)| l.clone()).zip(oof.iter().copied()).collect();
+        let mut keep = oof.iter();
+        folds.retain(|_| *keep.next().unwrap());
+        if folds.is_empty() {
+            return Err(input_err("--sr-run: no out-of-fold folds".to_string()));
+        }
+    }
     let io_s = t_io.elapsed().as_secs_f64();
     let mut report = run_ladder(&panel, &folds, &opts).map_err(input_err)?;
     let mut ledger = RunLedger::new();

@@ -139,7 +139,7 @@ In-sample guard: `run.json` records `split.train_time` and `split.validation_tim
 error: window 'w1' tests rows the run trained or selected on (test_start 150 < last seen 179 + purge 5)
 ```
 
-`--allow-in-sample-windows` downgrades the refusal: the window is scored and its JSON carries `"in_sample":true`. Use it for diagnostics only.
+`--allow-in-sample-windows` downgrades the refusal: the window is scored and its JSON carries `"in_sample":true`. Use it for diagnostics only. `rcsr ladder --sr-run` and `rcsr ablation score` apply the same rule (`RunFile::in_sample`) to their folds: they exit 3 naming the in-sample fold, and `--allow-in-sample` labels it `oof:false` and leaves it out of every pooled statistic.
 
 The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA-256 of the file) and `candidate_labels`. `--select-band` and `--batch-pnl` work unchanged on the front's candidates.
 

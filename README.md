@@ -232,9 +232,10 @@ reaches machine precision.
 ```sh
 rcsr ladder --data panel.rcsb --target y60 --return-col fwd60 --time ts --group symbol \
   --windows protocol/windows.csv --scheme expanding --target-spec panel.targets.json \
-  --vol-col vol96 --reversal-col ret_1 --signal-col trend96 --sr-score sr_score \
-  --sr-evals 1200000 --sr-wall 5400 --out ladder.json --markdown ladder.md
+  --vol-col vol96 --reversal-col ret_1 --signal-col trend96 --sr-run pilot/A2.run.json --out ladder.json --markdown ladder.md
 ```
+
+`--sr-run` scores the finalist of one search run on every fold; a fold that starts before the run's last seen row plus purge is refused (exit 3) unless `--allow-in-sample`, which labels it `oof:false` and drops it from every pooled statistic. `rcsr ablation score` applies the same check.
 
 `rcsr ablation` runs the add-one-family ablation under the decision rule committed in `protocol/ablation.json`: arms `A0` (B0) to `A5`, a fixed generation budget, 3 seeds per arm (5 with `--finalist`), one manifest per arm, a placebo arm and a circular-block-permuted arm. `rcsr --arm A1` writes the arm, the feature-list hash, the generation budget and the generations reached into run.json.
 
