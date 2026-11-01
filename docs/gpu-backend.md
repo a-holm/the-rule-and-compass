@@ -3099,6 +3099,15 @@ The existing median / interquartile / maximum row floors are expressed through
 the same planner with a zero-hysteresis compatibility calibration, preserving
 their measured crossovers.
 
+`--dispatch auto|device` (default `auto`, `Config.dispatch`) controls the timing
+comparison only. `device` routes every stage that is not refused and not CPU by
+contract to the device with reason `forced`; a `split_fraction` still splits.
+It needs `--gpu` (exit 2 otherwise). Under `compute-sanitizer` the device is
+many times slower, so `auto` routes every stage to the CPU and no kernel
+launches: sanitizer runs pass `--dispatch device`, and GPU test helpers set
+`DispatchMode::Device`. When `auto` keeps every stage on the CPU, the run
+reports `backend_reason` `dispatch: cost model kept every stage on the cpu`.
+
 See [`dispatch.md`](dispatch.md) for the formulas, JSON shape and the tests.
 
 ## Device memory plan (#293)

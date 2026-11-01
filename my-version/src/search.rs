@@ -191,6 +191,10 @@ pub struct Config {
     /// #293: `--gpu-memory`, an upper bound on the device memory the run may
     /// plan on. Not a search setting: it is ignored by the checkpoint check.
     pub gpu_memory: Option<u64>,
+    /// #438: `--dispatch`. `Device` skips the per-stage timing comparison only;
+    /// refusals and CPU-contract stages still route to the CPU. Not a search
+    /// setting.
+    pub dispatch: crate::dispatch::DispatchMode,
     /// #119: bounded producer/scorer overlap depth in batches (`0` disables).
     /// While the GPU scores a batch, the CPU keeps generating and fitting the
     /// next candidates. This is a scheduling choice only: the scored values,
@@ -354,6 +358,7 @@ impl Default for Config {
             gpu: cfg!(feature = "cuda"),
             gpu_notes: true,
             gpu_memory: None,
+            dispatch: crate::dispatch::DispatchMode::Auto,
             pipeline_depth: 2, // #119: only used when the GPU path is active
             variation: VariationMode::Auto,
         }
@@ -5456,7 +5461,8 @@ fn run_search(
             calibration = calibration.with_device_rates(rates);
         }
     }
-    let mut dispatcher = crate::dispatch::Dispatcher::new(calibration);
+    let mut dispatcher =
+        crate::dispatch::Dispatcher::new(calibration).with_mode(cfg.dispatch);
     for stage in [
         crate::dispatch::Stage::Vary,
         crate::dispatch::Stage::Select,
@@ -7008,7 +7014,11 @@ fn run_search(
         } else {
             crate::backend::Kind::Cpu
         },
-        backend_reason,
+        backend_reason: if backend_reason.is_none() && dispatcher.ledger().cost_model_kept_cpu() {
+            Some("dispatch: cost model kept every stage on the cpu".to_string())
+        } else {
+            backend_reason
+        },
         device: if gpu_used || fit_only_device {
             backend_device
         } else {
