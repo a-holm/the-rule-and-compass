@@ -369,12 +369,10 @@ pub fn schema_json(
 }
 
 /// Hash every column of `store_path` and write `<store_path>.schema.json`,
-/// keeping the locked test already declared in that schema.
+/// keeping the locked test the store already declares.
 pub fn write_schema(store_path: &str, panel_version: &str) -> Result<String, String> {
-    let kept = std::fs::read_to_string(schema_path(store_path))
-        .ok()
-        .and_then(|t| crate::lockbox::Lockbox::from_declaration(&t));
-    write_schema_declared(store_path, panel_version, kept.as_ref())
+    let kept = crate::lockbox::stored(store_path).map_err(|e| e.message)?;
+    write_schema_declared(store_path, panel_version, kept.as_ref().map(|(_, l)| l))
 }
 
 /// As [`write_schema`], with an explicit locked test declaration (or none).

@@ -611,6 +611,8 @@ pub struct BaseOptions {
     pub interval_seconds: i64,
     pub gpu: GpuMode,
     pub symbols: Option<SymbolList>,
+    /// `--locked-test START,END|none`, written to the manifest of the base store.
+    pub locked_test: crate::lockbox::Keep,
 }
 
 impl BaseOptions {
@@ -626,6 +628,7 @@ impl BaseOptions {
             interval_seconds: IN_STEP,
             gpu: GpuMode::Auto,
             symbols: None,
+            locked_test: crate::lockbox::Keep::Unset,
         }
     }
 }
@@ -1191,6 +1194,7 @@ fn fold_wave(
 pub fn build_base(opts: &BaseOptions) -> Result<BaseSummary, String> {
     let root = PathBuf::from(&opts.input);
     let (sources, universe) = discover(&opts.input, opts.symbols.as_ref())?;
+    let declared = crate::lockbox::output_declaration(&opts.out, None, opts.locked_test).map_err(|e| e.message)?;
     let guard = Guard::new(opts.allow_lockbox, None);
     guard_archive_names(&sources, &guard, "panel base")?;
     if opts.interval_seconds != IN_STEP {
@@ -1256,9 +1260,13 @@ pub fn build_base(opts: &BaseOptions) -> Result<BaseSummary, String> {
         return Err("panel base: no complete hourly bucket was produced".to_string());
     }
     store::write_store_with_time(&opts.out, &table, opts.group_rows, Some(0))?;
-    let text = base_manifest(opts, &syms, &inputs, &overlap, guard.allow, &route, universe.as_ref());
+    let mut text = base_manifest(opts, &syms, &inputs, &overlap, guard.allow, &route, universe.as_ref());
+    if let Some(lt) = &declared {
+        text = crate::lockbox::insert_declaration(&text, lt, "rcsr panel base --locked-test");
+    }
     let manifest_path = format!("{}.manifest.json", opts.out);
     std::fs::write(&manifest_path, text).map_err(|e| format!("{}: {}", manifest_path, e))?;
+    crate::lockbox::finish_output(&opts.out, declared.as_ref(), &["manifest.json"]).map_err(|e| e.message)?;
     Ok(BaseSummary {
         rows: table.len(),
         symbols: syms.len(),
@@ -1453,7 +1461,7 @@ pub struct PanelOptions {
     pub group_rows: usize,
     pub allow_lockbox: bool,
     /// Protocol locked test declared with the store (`--locked-test START,END`).
-    pub locked_test: Option<Lockbox>,
+    pub locked_test: crate::lockbox::Keep,
     pub snapshot: Option<String>,
     /// A gap longer than this many days between two base bars of one symbol
     /// starts a new listing.
@@ -1476,7 +1484,7 @@ impl PanelOptions {
             out: out.to_string(),
             group_rows: store::DEFAULT_GROUP_ROWS,
             allow_lockbox: false,
-            locked_test: None,
+            locked_test: crate::lockbox::Keep::Unset,
             snapshot: None,
             listing_gap_days: 30,
             relists: Vec::new(),
@@ -1911,6 +1919,8 @@ pub struct PanelSummary {
 
 /// P4/P5: assemble the time-major panel and write the store and manifest.
 pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
+    let declared =
+        crate::lockbox::output_declaration(&opts.out, Some(&opts.base), opts.locked_test).map_err(|e| e.message)?;
     let membership = panel::read_membership(&opts.membership)?;
     let series = read_base(&opts.base)?;
     let guard = Guard::new(opts.allow_lockbox, None);
@@ -1938,7 +1948,7 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
     crate::registry::write_schema_declared(
         &opts.out,
         crate::registry::DEFAULT_PANEL_VERSION,
-        opts.locked_test.as_ref(),
+        declared.as_ref(),
     )?;
     let ledger_misses = ledger_violations(&asm.rows, &membership);
     let snapshot_text = match &opts.snapshot {
@@ -1968,13 +1978,13 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
     let block = v2_block(opts, &asm, &q, invalid_ohlc, base_quality.as_deref(), ledger_misses);
     let marker = "  \"output\":";
     let at = text.rfind(marker).ok_or("manifest has no output block")?;
-    let locked = opts
-        .locked_test
+    let locked = declared
         .map(|lt| format!("  \"locked_test\":{},\n", lt.declaration_json("rcsr panel build --locked-test")))
         .unwrap_or_default();
     text.insert_str(at, &format!("{}  \"v2\":{},\n", locked, block));
     let manifest_path = format!("{}.manifest.json", opts.out);
     std::fs::write(&manifest_path, text).map_err(|e| format!("{}: {}", manifest_path, e))?;
+    crate::lockbox::finish_output(&opts.out, declared.as_ref(), &["schema.json", "manifest.json"]).map_err(|e| e.message)?;
     Ok(PanelSummary {
         rows: panel.rows.len(),
         symbols: panel.symbols.len(),
@@ -2416,7 +2426,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
     let mut base: Option<String> = None;
     let mut jobs = 1usize;
     let mut keep_partial = false;
-    let mut locked_test: Option<Lockbox> = None;
+    let mut locked_test = crate::lockbox::Keep::Unset;
     let mut allow_lockbox = false;
     let mut resume: Option<String> = None;
     let mut group_rows = store::DEFAULT_GROUP_ROWS;
@@ -2474,7 +2484,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
             "--keep-partial" => keep_partial = true,
             "--require-full-bucket" => keep_partial = false,
             "--locked-test" => {
-                locked_test = Some(Lockbox::parse(&value(args, &mut i)).unwrap_or_else(|e| cli_usage(&format!("--locked-test: {}", e))))
+                locked_test = crate::lockbox::Keep::parse(&value(args, &mut i)).unwrap_or_else(|e| cli_usage(&format!("--locked-test: {}", e)))
             }
             "--allow-lockbox" => allow_lockbox = true,
             other => cli_usage(&format!("unknown option '{}' for `rcsr panel {}` (hourly v2)", other, cmd)),
@@ -2484,8 +2494,8 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
     if symbols.is_some() && cmd != "base" && cmd != "snapshot" {
         cli_usage(&format!("--symbols applies to `rcsr panel snapshot` and `rcsr panel base`, not `{}`", cmd));
     }
-    if locked_test.is_some() && cmd != "build" {
-        cli_usage(&format!("--locked-test applies to `rcsr panel build`, not `{}`", cmd));
+    if locked_test != crate::lockbox::Keep::Unset && cmd != "build" && cmd != "base" {
+        cli_usage(&format!("--locked-test applies to `rcsr panel base` and `rcsr panel build`, not `{}`", cmd));
     }
     if gpu.is_some() && cmd != "base" && cmd != "build" {
         cli_usage(&format!("--gpu applies to `rcsr panel base` and `rcsr panel build`, not `{}`", cmd));
@@ -2516,12 +2526,17 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
         "base" => {
             let input = input.unwrap_or_else(|| cli_usage("base needs --input <archive dir>"));
             let out = out.unwrap_or_else(|| "base_h1.rcsb".to_string());
+            if let Err(e) = crate::lockbox::output_declaration(&out, None, locked_test) {
+                eprintln!("error: {}", e.message);
+                std::process::exit(e.exit);
+            }
             let mut o = BaseOptions::new(&input, &out);
             o.keep_partial = keep_partial;
             o.jobs = jobs;
             o.allow_lockbox = allow_lockbox;
             o.resume = resume;
             o.symbols = symbols;
+            o.locked_test = locked_test;
             o.group_rows = group_rows;
             o.gpu = gpu.unwrap_or(GpuMode::Auto);
             o.interval_seconds = match interval.as_str() {
@@ -2549,6 +2564,10 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
             let m = membership.unwrap_or_else(|| "membership.csv".to_string());
             let out = out.unwrap_or_else(|| "panel_hourly_default.rcsb".to_string());
             let p = po(&m, &out);
+            if let Err(e) = crate::lockbox::output_declaration(&out, Some(&p.base), locked_test) {
+                eprintln!("error: {}", e.message);
+                std::process::exit(e.exit);
+            }
             match build_panel(&p) {
                 Ok(s) => {
                     eprintln!(

@@ -712,7 +712,7 @@ fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
         .output()
         .unwrap();
     assert_eq!(prep.status.code(), Some(0), "{}", String::from_utf8_lossy(&prep.stderr));
-    assert_eq!(lockbox::declared_for(prepared.to_str().unwrap()), Some(lb));
+    assert_eq!(lockbox::stored(prepared.to_str().unwrap()).unwrap().map(|(_, l)| l), Some(lb));
     let found = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args([
             "--data", prepared.to_str().unwrap(), "--target", "y", "--vars", "b,f1,f2", "--time", "ts", "--split", "temporal", "--cpu",
@@ -722,4 +722,76 @@ fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
         .unwrap();
     assert_eq!(found.status.code(), Some(3), "{}", String::from_utf8_lossy(&found.stderr));
     assert!(String::from_utf8_lossy(&found.stderr).contains("declared locked test"));
+}
+
+#[test]
+fn stale_sidecar_is_refused() {
+    use rcsr::lockbox::{self, Lockbox};
+
+    let dir = scratch("stale-sidecar");
+    let data = objective_csv(&dir);
+    let spec900 = dir.join("spec900.json");
+    std::fs::write(&spec900, std::fs::read_to_string(write_target_spec(&dir)).unwrap().replace("\"horizon_seconds\":3600", "\"horizon_seconds\":900")).unwrap();
+    let spec = spec900.to_str().unwrap().to_string();
+    let run_json = dir.join("A0.run.json");
+    let out = search(&data, &spec, &["--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--arm", "A0", "--json-out", run_json.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let windows = dir.join("w.csv");
+    let iso = |i: i64| protocol::iso(T0 + 900.0 * i as f64);
+    std::fs::write(
+        &windows,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,w0,{},{},{},{},{}\n",
+            iso(0),
+            iso(280),
+            iso(200),
+            iso(290),
+            iso(400)
+        ),
+    )
+    .unwrap();
+    let score = || {
+        Command::new(env!("CARGO_BIN_EXE_rcsr"))
+            .args([
+                "ablation", "score", "--run", run_json.to_str().unwrap(), "--data", &data, "--target", "y", "--return-col", "r",
+                "--time", "t", "--windows", windows.to_str().unwrap(), "--purge-seconds", "1800", "--out", dir.join("o.json").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let lb = Lockbox { start: T0 as i64 + 900 * 300, end: T0 as i64 + 900 * 400 };
+    lockbox::write_sidecar(&data, &lb, "test").unwrap();
+    let text = std::fs::read_to_string(lockbox::sidecar_path(&data)).unwrap();
+    assert!(text.contains("\"data_bytes\":") && text.contains("\"data_sha256\":"), "{text}");
+    assert!(lockbox::resolve(None, &data).is_ok());
+
+    // same length, one digit changed: the SHA-256 differs
+    let original = std::fs::read(&data).unwrap();
+    let mut changed = original.clone();
+    let i = changed.iter().rposition(|c| c.is_ascii_digit()).unwrap();
+    changed[i] = if changed[i] == b'0' { b'1' } else { b'0' };
+    std::fs::write(&data, &changed).unwrap();
+    let e = lockbox::resolve(None, &data).unwrap_err();
+    assert_eq!(e.exit, 3, "{}", e.message);
+    assert!(e.message.contains("stale") && e.message.contains("sha256"), "{}", e.message);
+    let found = search(&data, &spec, &[]);
+    assert_eq!(found.status.code(), Some(3), "{}", String::from_utf8_lossy(&found.stderr));
+    assert!(String::from_utf8_lossy(&found.stderr).contains("stale"), "{}", String::from_utf8_lossy(&found.stderr));
+    let refused = score();
+    assert_eq!(refused.status.code(), Some(3), "{}", String::from_utf8_lossy(&refused.stderr));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("stale"), "{}", String::from_utf8_lossy(&refused.stderr));
+    assert!(!dir.join("o.json").exists());
+
+    // another length is refused by the byte count
+    let mut longer = original.clone();
+    longer.push(b'\n');
+    std::fs::write(&data, &longer).unwrap();
+    let e = lockbox::resolve(None, &data).unwrap_err();
+    assert_eq!(e.exit, 3, "{}", e.message);
+    assert!(e.message.contains("bytes"), "{}", e.message);
+
+    // the original bytes are accepted again
+    std::fs::write(&data, &original).unwrap();
+    assert!(lockbox::resolve(None, &data).is_ok());
 }

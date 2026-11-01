@@ -965,11 +965,11 @@ fn locked_test_declaration_travels_with_the_store() {
 
     let plain = dir.join("plain.rcsb");
     panel_v2::build_panel(&panel_opts(&base, &m, &plain)).unwrap();
-    assert_eq!(lockbox::declared_for(plain.to_str().unwrap()), None);
+    assert_eq!(lockbox::stored(plain.to_str().unwrap()).unwrap().map(|(_, l)| l), None);
 
     let panel = dir.join("panel.rcsb");
     let mut p = panel_opts(&base, &m, &panel);
-    p.locked_test = Some(lb);
+    p.locked_test = rcsr::lockbox::Keep::Range(lb);
     panel_v2::build_panel(&p).unwrap();
     let (panel_s, base_s) = (panel.to_str().unwrap(), base.to_str().unwrap());
     let manifest_text = std::fs::read_to_string(format!("{panel_s}.manifest.json")).unwrap();
@@ -986,9 +986,9 @@ fn locked_test_declaration_travels_with_the_store() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(lockbox::declared_for(panel_s), Some(lb));
+    assert_eq!(lockbox::stored(panel_s).unwrap().map(|(_, l)| l), Some(lb));
 
-    // enrich on the base carries a declared range into its sidecar
+    // enrich on an undeclared base declares the protocol default next to a flag range that does not overlap it
     let fam = dir.join("fam.rcsb");
     let range = format!("{},{}", lb.start, lb.end);
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
@@ -996,7 +996,8 @@ fn locked_test_declaration_travels_with_the_store() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(lockbox::declared_for(fam.to_str().unwrap()), Some(lb));
+    let default = lockbox::protocol_default();
+    assert_eq!(lockbox::stored(fam.to_str().unwrap()).unwrap().map(|(_, l)| l), Some(default));
 
     // enrich copies the declaration of its input
     let fam2 = dir.join("fam2.rcsb");
@@ -1006,23 +1007,207 @@ fn locked_test_declaration_travels_with_the_store() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(lockbox::declared_for(fam2.to_str().unwrap()), Some(lb));
+    assert_eq!(lockbox::stored(fam2.to_str().unwrap()).unwrap().map(|(_, l)| l), Some(lb));
 
     // append writes the target's declaration into the output schema
     let appended = dir.join("appended.rcsb");
     panel_append::append_family(&AppendOptions {
         target: panel_s.to_string(),
-        family: fam.to_str().unwrap().to_string(),
+        family: fam2.to_str().unwrap().to_string(),
         columns: vec!["r1".to_string()],
         out: appended.to_str().unwrap().to_string(),
         panel_version: "2".to_string(),
         scratch: Some(dir.join("scratch").to_str().unwrap().to_string()),
+        locked_test: rcsr::lockbox::Keep::Unset,
     })
     .unwrap();
-    assert_eq!(lockbox::declared_for(appended.to_str().unwrap()), Some(lb));
+    assert_eq!(lockbox::stored(appended.to_str().unwrap()).unwrap().map(|(_, l)| l), Some(lb));
     assert!(registry_verify(appended.to_str().unwrap()));
 }
 
 fn registry_verify(store: &str) -> bool {
     rcsr::registry::verify_schema(store).unwrap().is_empty()
+}
+
+fn rcsr(args: &[&str]) -> (i32, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().unwrap();
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).to_string())
+}
+
+#[test]
+fn locked_test_starts_at_the_base() {
+    use rcsr::lockbox::{self, Keep, Lockbox};
+
+    let dir = scratch("locked-base");
+    let (raw, m) = market(&dir, 24 * 40);
+    let lb = Lockbox { start: T0 + 250 * H, end: T0 + 300 * H };
+    let base = dir.join("base.rcsb");
+    let mut o = base_opts(&raw, &base);
+    o.locked_test = Keep::Range(lb);
+    panel_v2::build_base(&o).unwrap();
+    let (base_s, m_s) = (base.to_str().unwrap(), m.to_str().unwrap());
+    let manifest_text = std::fs::read_to_string(format!("{base_s}.manifest.json")).unwrap();
+    assert_eq!(Lockbox::from_declaration(&manifest_text), Some(lb));
+    assert!(manifest_text.contains("rcsr panel base --locked-test"), "{manifest_text}");
+
+    // enrich of the declared base carries the range to its sidecar
+    let enriched = dir.join("base_enriched.rcsb");
+    let (code, err) = rcsr(&["enrich", "--data", base_s, "--out", enriched.to_str().unwrap(), "--features", "r1"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lockbox::stored(enriched.to_str().unwrap()).unwrap().map(|(_, l)| l), Some(lb));
+
+    // build inherits the declaration of its base
+    let panel = dir.join("panel.rcsb");
+    panel_v2::build_panel(&panel_opts(&base, &m, &panel)).unwrap();
+    let panel_s = panel.to_str().unwrap();
+    assert_eq!(lockbox::stored(panel_s).unwrap().map(|(_, l)| l), Some(lb));
+    assert_eq!(Lockbox::from_declaration(&std::fs::read_to_string(format!("{panel_s}.schema.json")).unwrap()), Some(lb));
+    // a flag may not narrow the range of the base
+    let narrow = format!("{},{}", lb.start + H, lb.end);
+    let (code, err) = rcsr(&["panel", "build", "--data", base_s, "--membership", m_s, "--out", dir.join("n.rcsb").to_str().unwrap(), "--locked-test", &narrow]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("does not cover"), "{err}");
+    // `--locked-test none` is refused while the base declares
+    let (code, err) = rcsr(&["panel", "build", "--data", base_s, "--membership", m_s, "--out", dir.join("n.rcsb").to_str().unwrap(), "--locked-test", "none"]);
+    assert_eq!(code, 2, "{err}");
+
+    // rerunning base without the flag into the declared output is refused
+    let (code, err) = rcsr(&["panel", "base", "--input", raw.to_str().unwrap(), "--out", base_s]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("pass --locked-test"), "{err}");
+    let range = format!("{},{}", lb.start, lb.end);
+    let (code, err) = rcsr(&["panel", "base", "--input", raw.to_str().unwrap(), "--out", base_s, "--locked-test", &range]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lockbox::stored(base_s).unwrap().map(|(_, l)| l), Some(lb));
+}
+
+#[test]
+fn rebuild_without_locked_test_is_refused() {
+    use rcsr::lockbox::{self, Keep, Lockbox};
+
+    let dir = scratch("locked-rebuild");
+    let (raw, m) = market(&dir, 24 * 40);
+    let base = dir.join("base.rcsb");
+    panel_v2::build_base(&base_opts(&raw, &base)).unwrap();
+    let lb = Lockbox { start: T0 + 250 * H, end: T0 + 300 * H };
+    let panel = dir.join("panel.rcsb");
+    let mut p = panel_opts(&base, &m, &panel);
+    p.locked_test = Keep::Range(lb);
+    panel_v2::build_panel(&p).unwrap();
+    let (base_s, m_s, panel_s) = (base.to_str().unwrap(), m.to_str().unwrap(), panel.to_str().unwrap());
+
+    let before = std::fs::read(panel_s).unwrap();
+    let (code, err) = rcsr(&["panel", "build", "--data", base_s, "--membership", m_s, "--out", panel_s]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("declares the locked test"), "{err}");
+    assert!(err.contains("--locked-test"), "{err}");
+    assert_eq!(std::fs::read(panel_s).unwrap(), before, "a refused rebuild leaves the output alone");
+    // another range is a change, also refused
+    let other = format!("{},{}", lb.start, lb.end + H);
+    let (code, _) = rcsr(&["panel", "build", "--data", base_s, "--membership", m_s, "--out", panel_s, "--locked-test", &other]);
+    assert_eq!(code, 2);
+
+    let same = format!("{},{}", lb.start, lb.end);
+    let (code, err) = rcsr(&["panel", "build", "--data", base_s, "--membership", m_s, "--out", panel_s, "--locked-test", &same]);
+    assert_eq!(code, 0, "{err}");
+    let manifest_text = std::fs::read_to_string(format!("{panel_s}.manifest.json")).unwrap();
+    let schema_text = std::fs::read_to_string(format!("{panel_s}.schema.json")).unwrap();
+    for text in [&manifest_text, &schema_text] {
+        assert_eq!(Lockbox::from_declaration(text), Some(lb));
+    }
+
+    // `none` removes the declaration and the stale sidecar with it
+    std::fs::write(format!("{panel_s}.lockbox.json"), format!("{{\"locked_test\":{}}}", lb.declaration_json("t"))).unwrap();
+    let (code, err) = rcsr(&["panel", "build", "--data", base_s, "--membership", m_s, "--out", panel_s, "--locked-test", "none"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lockbox::stored(panel_s).unwrap(), None);
+    assert!(!Path::new(&format!("{panel_s}.lockbox.json")).exists());
+}
+
+#[test]
+fn append_refuses_a_family_store_with_another_declaration() {
+    use rcsr::lockbox::{Keep, Lockbox};
+    use rcsr::panel_append::{self, AppendOptions};
+
+    let dir = scratch("locked-append");
+    let (raw, m) = market(&dir, 24 * 40);
+    let base = dir.join("base.rcsb");
+    panel_v2::build_base(&base_opts(&raw, &base)).unwrap();
+    let panel = dir.join("panel.rcsb");
+    panel_v2::build_panel(&panel_opts(&base, &m, &panel)).unwrap();
+    let fam = dir.join("fam.rcsb");
+    let (code, err) = rcsr(&["enrich", "--data", base.to_str().unwrap(), "--out", fam.to_str().unwrap(), "--features", "r1"]);
+    assert_eq!(code, 0, "{err}");
+    let opts = |out: &str, lt: Keep| AppendOptions {
+        target: panel.to_str().unwrap().to_string(),
+        family: fam.to_str().unwrap().to_string(),
+        columns: vec!["r1".to_string()],
+        out: dir.join(out).to_str().unwrap().to_string(),
+        panel_version: "2".to_string(),
+        scratch: Some(dir.join("scratch").to_str().unwrap().to_string()),
+        locked_test: lt,
+    };
+    // enrich of undeclared data declares the protocol default; the target declares none
+    let err = panel_append::append_family(&opts("a.rcsb", Keep::Unset)).unwrap_err();
+    assert!(err.contains("family store"), "{err}");
+    // the target declares the same range: accepted
+    let d = rcsr::lockbox::protocol_default();
+    panel_append::append_family(&opts("b.rcsb", Keep::Range(Lockbox { start: d.start, end: d.end }))).unwrap();
+}
+
+#[test]
+fn prep_declares_the_locked_test_and_refuses_a_silent_drop() {
+    use rcsr::lockbox::{self, Lockbox};
+
+    let dir = scratch("locked-prep");
+    let raw = universe_raw(&dir);
+    let (raw_s, out) = (raw.to_str().unwrap(), dir.join("prep.rcsb"));
+    let out_s = out.to_str().unwrap();
+    let lb = Lockbox { start: T0 + 250 * H, end: T0 + 300 * H };
+    let range = format!("{},{}", lb.start, lb.end);
+    let run = |extra: &[&str]| {
+        let mut a = vec!["prep", "--input", raw_s, "--format", "binance", "--out", out_s];
+        a.extend_from_slice(extra);
+        rcsr(&a)
+    };
+    let (code, err) = run(&["--locked-test", &range]);
+    assert_eq!(code, 0, "{err}");
+    let manifest_text = std::fs::read_to_string(format!("{out_s}.manifest.json")).unwrap();
+    assert_eq!(Lockbox::from_declaration(&manifest_text), Some(lb));
+    assert!(manifest_text.contains("rcsr prep --locked-test"), "{manifest_text}");
+    assert_eq!(lockbox::stored(out_s).unwrap().map(|(_, l)| l), Some(lb));
+
+    let (code, err) = run(&[]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("pass --locked-test"), "{err}");
+    let (code, err) = run(&["--locked-test", &range]);
+    assert_eq!(code, 0, "{err}");
+    let (code, err) = run(&["--locked-test", "none"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lockbox::stored(out_s).unwrap(), None);
+}
+
+#[test]
+fn enrich_fails_when_it_cannot_write_its_declaration() {
+    let dir = scratch("enrich-sidecar");
+    let (raw, _) = market(&dir, 24 * 40);
+    let base = dir.join("base.rcsb");
+    panel_v2::build_base(&base_opts(&raw, &base)).unwrap();
+    let out = dir.join("e.rcsb");
+    let sidecar = format!("{}.enrich.json", out.to_str().unwrap());
+    std::fs::create_dir(&sidecar).unwrap();
+    let args = |extra: &[&str]| {
+        let mut a = vec!["enrich", "--data", base.to_str().unwrap(), "--out", out.to_str().unwrap(), "--features", "r1"];
+        a.extend_from_slice(extra);
+        rcsr(&a)
+    };
+    // the protocol default is declared, so the missing sidecar is fatal and the output goes
+    let (code, err) = args(&[]);
+    assert_eq!(code, 3, "{err}");
+    assert!(err.contains("could not write"), "{err}");
+    assert!(!out.exists(), "an output without its declaration is removed");
+    // without a declaration the sidecar stays a warning
+    let (code, err) = args(&["--locked-test", "none"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("warning: could not write"), "{err}");
 }

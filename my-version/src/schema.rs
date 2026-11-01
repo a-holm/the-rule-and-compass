@@ -286,6 +286,7 @@ pub fn json() -> String {
 {{\"name\":\"--locked-test\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"read the locked test once for a sealed candidate; needs --ledger and --sealed, refuses a second read and any code or data hash that differs from the sealed entry\"}},\
 {{\"name\":\"--sealed\",\"type\":\"string\",\"default\":\"none\",\"description\":\"locked_candidates.json written by `rcsr protocol seal`\"}},\
 {{\"name\":\"--verify-read\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"with --locked-test: re-run a recorded read and compare its report hash; records nothing\"}},\
+{{\"name\":\"--allow-unbound-ledger\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"with --locked-test: read a candidate of an old ledger that recorded no locked test range (reported as unbound); a range that differs from the candidate's is always refused (exit 3)\"}},\
 {{\"name\":\"--expect-report-sha256\",\"type\":\"string\",\"default\":\"none\",\"description\":\"exit 1 unless the SHA-256 of the report JSON equals this value\"}},\
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report; the ledger object is the #284 phase ledger (command walkforward): one wall clock, exclusive stage seconds (io = store row-group or CSV reads; pnl = scoring, windows, controls and the --batch-pnl pass; host_other = the rest), unaccounted_s, closure and device_busy_s, the union of the --batch-pnl device tile intervals (host_envelope basis). It is outside the reproduction hash: report_sha256 hashes the report without it\"}},\
 {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to a path\"}},\
@@ -335,6 +336,7 @@ pub fn json() -> String {
 {{\"name\":\"--resume\",\"type\":\"path\",\"default\":\"none\",\"description\":\"resumable per-symbol cache keyed by archive SHA-256: atomic spool + key per symbol, reused on a later build with the same settings\"}},\
 {{\"name\":\"--out\",\"type\":\"path\",\"default\":\"none\",\"description\":\"output .rcsb store\"}},\
 {{\"name\":\"--dry-run\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print audit + manifest and write nothing\"}},\
+{{\"name\":\"--locked-test\",\"type\":\"string\",\"default\":\"none\",\"description\":\"START,END of the protocol locked test, written to <out>.manifest.json; a rerun into a declared output must repeat it (exit 2), none removes it\"}},\
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit labelled rows in 2026H2 (unlabelled provenance is always allowed)\"}}]}},\n  \
          \"enrich\":{{\"command\":\"rcsr enrich\",\"summary\":\"append causal, gap-aware OHLCV features to an existing .rcsb store without rebuilding it\",\"doc\":\"docs/ohlcv.md\",\"options\":[\
 {{\"name\":\"--data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"existing .rcsb store or a CSV (loaded once into a temporary store)\"}},\
@@ -374,7 +376,7 @@ pub fn json() -> String {
 {{\"name\":\"--start\",\"type\":\"time\",\"default\":\"panelfirst\",\"description\":\"explicit evaluated range start; checked against the lockbox\"}},\
 {{\"name\":\"--end\",\"type\":\"time\",\"default\":\"panellast\",\"description\":\"explicit evaluated range end; checked against the lockbox\"}},\
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit an explicitly evaluated 2026H2 range\"}},\
-{{\"name\":\"--locked-test\",\"type\":\"string\",\"default\":\"none\",\"description\":\"build: START,END of the protocol locked test, written to the manifest and the schema; every evaluator then refuses it\"}},\
+{{\"name\":\"--locked-test\",\"type\":\"string\",\"default\":\"none\",\"description\":\"base, build and append: START,END of the protocol locked test, written to the manifest (and the schema); every evaluator then refuses it. build and append inherit the declaration of their input; a rerun into a declared output must repeat it (exit 2), none removes it\"}},\
 {{\"name\":\"--resume\",\"type\":\"path\",\"default\":\"none\",\"description\":\"resumable build cache: one atomic binary .part per symbol keyed by the store SHA-256 and the membership; a fully warm run reads the parts only\"}},\
 {{\"name\":\"--input\",\"type\":\"path\",\"default\":\"none\",\"description\":\"snapshot and base: archive directory of monthly 15m ZIPs\"}},\
 {{\"name\":\"--jobs\",\"type\":\"int\",\"default\":\"1\",\"description\":\"snapshot and base: parallel symbols\"}},\

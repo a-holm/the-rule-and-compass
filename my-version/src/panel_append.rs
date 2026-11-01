@@ -24,6 +24,8 @@ pub struct AppendOptions {
     pub panel_version: String,
     /// Directory for the temporary raw columns (default: next to `out`).
     pub scratch: Option<String>,
+    /// `--locked-test START,END|none`; the output inherits the declaration of `target`.
+    pub locked_test: crate::lockbox::Keep,
 }
 
 #[derive(Debug)]
@@ -109,6 +111,20 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
             }
         }
     }
+    let declared = crate::lockbox::output_declaration(&opts.out, Some(&opts.target), opts.locked_test).map_err(|e| e.message)?;
+    let family_declared = crate::lockbox::stored(&opts.family).map_err(|e| e.message)?;
+    if let Some((file, l)) = family_declared {
+        if declared != Some(l) {
+            return Err(format!(
+                "family store {} declares the locked test {} ({}), the target {} declares {}",
+                opts.family,
+                crate::lockbox::span(&l),
+                file,
+                opts.target,
+                declared.as_ref().map_or("none".to_string(), crate::lockbox::span)
+            ));
+        }
+    }
     let before = manifest::sha256_file(&opts.target)?;
     let target = FileStore::open(&opts.target)?;
     let family = FileStore::open(&opts.family)?;
@@ -169,8 +185,8 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
         let _ = std::fs::remove_file(f);
     }
     let output_sha256 = result?;
-    let declared = crate::lockbox::declared_for(&opts.target);
     let schema = registry::write_schema_declared(&opts.out, &opts.panel_version, declared.as_ref())?;
+    crate::lockbox::finish_output(&opts.out, declared.as_ref(), &["schema.json"]).map_err(|e| e.message)?;
     let after = manifest::sha256_file(&opts.target)?;
     Ok(AppendReport {
         input_sha256_before: before,
@@ -184,7 +200,7 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
 
 fn usage_text() -> &'static str {
     "rcsr panel schema --data panel.rcsb [--panel-version V] [--verify]
-rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b --out out.rcsb [--panel-version V] [--scratch dir]
+rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b --out out.rcsb [--panel-version V] [--scratch dir] [--locked-test START,END|none]
 "
 }
 
@@ -202,6 +218,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
     let mut panel_version = registry::DEFAULT_PANEL_VERSION.to_string();
     let mut scratch: Option<String> = None;
     let mut verify = false;
+    let mut locked_test = crate::lockbox::Keep::Unset;
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -217,6 +234,10 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
             "--out" => out = Some(value(args, &mut i)),
             "--panel-version" => panel_version = value(args, &mut i),
             "--scratch" => scratch = Some(value(args, &mut i)),
+            "--locked-test" => {
+                locked_test = crate::lockbox::Keep::parse(&value(args, &mut i))
+                    .unwrap_or_else(|e| fail(&format!("--locked-test: {}", e), 2))
+            }
             "--verify" => verify = true,
             "-h" | "--help" => {
                 print!("{}", usage_text());
@@ -250,7 +271,11 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
                 out: out.unwrap_or_else(|| fail("append needs --out", 2)),
                 panel_version,
                 scratch,
+                locked_test,
             };
+            if let Err(e) = crate::lockbox::output_declaration(&opts.out, Some(&opts.target), opts.locked_test) {
+                fail(&e.message, e.exit);
+            }
             match append_family(&opts) {
                 Ok(r) => {
                     eprintln!(

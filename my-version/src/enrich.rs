@@ -6939,7 +6939,10 @@ fn enrich_inner(
             temp.insert(n.clone(), TempColumn::create(work_dir, &n, sp.column_warmup(kind), true)?);
         }
     }
-    let label_range = opts.locked_test.or_else(|| crate::lockbox::declared_for(&opts.data));
+    let label_range = match opts.locked_test {
+        Some(l) => Some(l),
+        None => crate::lockbox::stored(&opts.data).map_err(|e| e.message)?.map(|(_, l)| l),
+    };
     let mut long_acc: Vec<crate::labels::LabelAccumulator> =
         long_specs.iter().map(|sp| crate::labels::LabelAccumulator::with_range(sp, label_range)).collect();
 
@@ -8277,6 +8280,13 @@ pub fn run(args: &[String]) -> ! {
         std::process::exit(e.exit);
     });
     opts.locked_test = resolved.sidecar_range();
+    if let (Some(out), false) = (&opts.out, opts.dry_run) {
+        let keep = opts.locked_test.map_or(crate::lockbox::Keep::Remove, crate::lockbox::Keep::Range);
+        if let Err(e) = crate::lockbox::output_declaration(out, Some(&opts.data), keep) {
+            eprintln!("error: {}", e.message.replacen("--lockbox", "--locked-test", 2));
+            std::process::exit(e.exit);
+        }
+    }
     let report = match enrich(&opts) {
         Ok(r) => r,
         Err(e) => fail(&e),
@@ -8292,8 +8302,25 @@ pub fn run(args: &[String]) -> ! {
                     &format!("\"locked_test\":{},", lb.declaration_json(&format!("rcsr enrich ({})", resolved.source.as_str()))),
                 );
             }
+            let declared = resolved.sidecar_range();
             if let Err(e) = crate::atomic::write_text_atomic(&sidecar, &text) {
+                if declared.is_some() {
+                    if out != &opts.data {
+                        let _ = std::fs::remove_file(out);
+                    }
+                    eprintln!(
+                        "error: could not write {}: {}; the output does not carry its locked-test declaration{}",
+                        sidecar,
+                        e,
+                        if out != &opts.data { " and was removed" } else { "" }
+                    );
+                    std::process::exit(EXIT_INPUT);
+                }
                 eprintln!("warning: could not write {}: {}", sidecar, e);
+            }
+            if let Err(e) = crate::lockbox::finish_output(out, declared.as_ref(), &["enrich.json"]) {
+                eprintln!("error: {}", e.message);
+                std::process::exit(e.exit);
             }
         }
     }

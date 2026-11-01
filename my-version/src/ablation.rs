@@ -1683,9 +1683,17 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             .map_err(|e| (3, e))?;
             let out = fl.need("--out")?;
             std::fs::write(out, csv).map_err(|e| io_err(out, e))?;
-            if let Some(lb) = &resolved.sidecar_range() {
-                crate::lockbox::write_sidecar(out, lb, &format!("rcsr ablation prepare ({})", resolved.source.as_str())).map_err(|e| (3, e))?;
+            match &resolved.sidecar_range() {
+                Some(lb) => crate::lockbox::write_sidecar(out, lb, &format!("rcsr ablation prepare ({})", resolved.source.as_str()))
+                    .map_err(|e| (3, e))?,
+                None => {
+                    let stale = crate::lockbox::sidecar_path(out);
+                    if Path::new(&stale).exists() {
+                        std::fs::remove_file(&stale).map_err(|e| io_err(&stale, e))?;
+                    }
+                }
             }
+            crate::lockbox::finish_output(out, resolved.sidecar_range().as_ref(), &["lockbox.json"]).map_err(|e| (e.exit, e.message))?;
             println!("wrote {}", out);
             Ok(())
         }

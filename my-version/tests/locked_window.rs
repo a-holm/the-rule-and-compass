@@ -68,7 +68,7 @@ fn the_search_refuses_the_declared_locked_test_unless_the_rows_are_excluded() {
     assert_eq!(code, 0, "{}", err);
 
     lockbox::write_sidecar(&d, &locked(), "test").unwrap();
-    assert_eq!(lockbox::declared_for(&d), Some(locked()));
+    assert_eq!(lockbox::stored(&d).unwrap().map(|(_, l)| l), Some(locked()));
     let (code, _, err) = search(&d, &run, &[]);
     assert_eq!(code, 3, "{}", err);
     assert!(err.contains("test split has"), "{}", err);
@@ -217,6 +217,7 @@ fn the_ladder_refuses_the_locked_scheme_and_reads_it_once_through_the_ledger() {
             build_commit: "build".into(),
             report_sha256: "c".repeat(64),
             expression: "x".into(),
+            locked_test: Some(rcsr::protocol::LockedRange { start: range.start, end: range.end, source: "store".into() }),
         })
         .unwrap();
     let (code, _, err) = rcsr(&["protocol", "seal", "--ledger", &l, "--out", &sealed]);
@@ -237,13 +238,13 @@ fn the_ladder_refuses_the_locked_scheme_and_reads_it_once_through_the_ledger() {
 }
 
 #[test]
-fn declared_for_reads_each_carrier_and_a_flag_must_cover_the_store_range() {
+fn stored_reads_each_carrier_and_a_flag_must_cover_the_store_range() {
     let dir = scratch("declared");
     let p = s(&dir.join("a.rcsb"));
-    assert_eq!(lockbox::declared_for(&p), None);
+    assert_eq!(lockbox::stored(&p).unwrap().map(|(_, l)| l), None);
     let lb = locked();
     std::fs::write(format!("{p}.manifest.json"), format!("{{\"locked_test\":{}}}", lb.declaration_json("t"))).unwrap();
-    assert_eq!(lockbox::declared_for(&p), Some(lb));
+    assert_eq!(lockbox::stored(&p).unwrap().map(|(_, l)| l), Some(lb));
     let narrow = format!("{},{}", T0, T0 + H);
     let e = lockbox::resolve(Some(&narrow), &p).unwrap_err();
     assert_eq!(e.exit, 2, "{}", e.message);
@@ -604,4 +605,58 @@ fn a_flag_on_undeclared_data_adds_to_the_protocol_default() {
     // only none removes the default
     let (code, _, err) = search(&late, &run, &["--lockbox", "none"]);
     assert_eq!(code, 0, "{}", err);
+}
+
+fn audit_series(path: &Path, locked_ts: impl Fn(i64) -> i64) {
+    let mut csv = String::from("ts,x,y\n");
+    for i in 0..400i64 {
+        let x = ((i * 37) % 17) as f64 - 8.0;
+        let y = 0.0003 * x + (((i * 13) % 7) as f64 - 3.0) * 0.0004;
+        let ts = T1 + i * H;
+        let ts = if ts >= DEFAULT_START { locked_ts(i) } else { ts };
+        csv.push_str(&format!("{},{},{}\n", ts, x, y));
+    }
+    std::fs::write(path, csv).unwrap();
+}
+
+fn json_part(json: &str, from: &str, to: &str) -> String {
+    let a = json.find(from).unwrap_or_else(|| panic!("{from} in {json}"));
+    let rest = &json[a..];
+    rest[..rest.find(to).unwrap()].to_string()
+}
+
+#[test]
+fn audit_time_statistics_and_rows_ignore_the_locked_rows() {
+    let dir = scratch("audit-time");
+    let (a, b, kept) = (dir.join("a.csv"), dir.join("b.csv"), dir.join("kept.csv"));
+    // A: regular hourly locked rows. B: locked rows with duplicates, jumps and
+    // backwards steps. Identical outside the default locked test.
+    audit_series(&a, |i| T1 + i * H);
+    audit_series(&b, |i| DEFAULT_START + (i % 5) * 7 * H + (i % 3) * 86_400 + 400 * H * (i % 2));
+    let mut text = String::from("ts,x,y\n");
+    for line in std::fs::read_to_string(&a).unwrap().lines().skip(1) {
+        if line.split(',').next().unwrap().parse::<i64>().unwrap() < DEFAULT_START {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    std::fs::write(&kept, text).unwrap();
+    let run = |p: &Path| rcsr(&["audit", "--data", &s(p), "--target", "y", "--time", "ts", "--json"]);
+    let (_, ja, ea) = run(&a);
+    let (_, jb, eb) = run(&b);
+    let (_, jk, ek) = run(&kept);
+    let part = |j: &str| {
+        format!(
+            "{}|{}|{}",
+            json_part(j, "\"rows\":", ","),
+            json_part(j, "\"time_audit\":{", "}"),
+            json_part(j, "\"leaks\":[", "]")
+        )
+    };
+    assert_eq!(part(&ja), part(&jk), "{ja}{ea}{jk}{ek}");
+    assert_eq!(part(&jb), part(&jk), "{jb}{eb}{jk}{ek}");
+    assert!(json_part(&jb, "\"time_audit\":{", "}").contains("\"duplicate_instants\":0,\"non_monotonic_rows\":0"), "{jb}");
+    let kept_rows = 400 - (0..400i64).filter(|i| T1 + i * H >= DEFAULT_START).count();
+    assert!(jb.contains(&format!("\"rows\":{kept_rows},")), "{jb}");
+    assert!(jb.contains("\"rows_left_out\":"), "{jb}");
 }
