@@ -238,15 +238,20 @@ fn describe(out: &Outcome) -> Vec<(u64, usize, String)> {
         .collect()
 }
 
+#[cfg(feature = "cuda")]
+fn fit_admission_violation(g: &rcsr::search::GpuRunStats) -> Option<String> {
+    (g.fit_screened + g.fit_admitted_wide < g.fit_attempts).then(|| {
+        format!("admission cannot fit more candidates than it screened or admitted wide: {:?}", g)
+    })
+}
+
+#[cfg(feature = "cuda")]
 /// #169: the admission ledger must be internally exact and use only the
 /// documented fallback labels.
-#[cfg(feature = "cuda")]
 fn assert_fit_ledger(g: &rcsr::search::GpuRunStats) {
-    assert!(
-        g.fit_screened >= g.fit_attempts,
-        "admission cannot fit more candidates than it screened: {:?}",
-        g
-    );
+    if let Some(msg) = fit_admission_violation(g) {
+        panic!("{msg}");
+    }
     assert_eq!(
         g.fit_attempts,
         g.fit_gpu + g.fit_fallback,
@@ -627,6 +632,20 @@ fn admission_fits_only_the_promoted_fraction() {
         g
     );
     assert_fit_ledger(g);
+}
+
+/// #448: attempts are bounded by screened plus wide-admitted candidates, so a
+/// double count still trips the ledger.
+#[cfg(feature = "cuda")]
+#[test]
+fn fit_admission_invariant_catches_a_double_count() {
+    let mut g = rcsr::search::GpuRunStats::default();
+    g.fit_screened = 10;
+    g.fit_admitted_wide = 5;
+    g.fit_attempts = 15;
+    assert!(fit_admission_violation(&g).is_none());
+    g.fit_attempts = 30;
+    assert!(fit_admission_violation(&g).is_some());
 }
 
 /// #229: rows with gross outliers, so `log_squashed` and `squared` disagree

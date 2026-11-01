@@ -170,11 +170,12 @@ struct RcCtx {
        per-row IRLS weight can be `sqrt(w_i * 2/(1 + r^2))`. */
     double *d_w64;
     /* #234: the per-row label sign `t = 2l - 1` (`l` from the target
-       midpoint), uploaded once by `rc_set_fit_sign` and read only by the
-       log-loss arm of the batched fit. Both precisions are resident because the
-       f32 assembly sweep and the f64 polish sweep read the same rows. Null
-       until uploaded, which makes a log-loss launch a refused launch rather
-       than a fit on another objective. */
+       midpoint), uploaded once by `rc_set_fit_sign` and read by the
+       label-sign fit codes (5-8) and the classification scorer. Both
+       precisions are resident because the f32 assembly sweep and the f64
+       polish sweep read the same rows. Null until uploaded, which makes a
+       label-sign launch a refused launch rather than a fit on another
+       objective. */
     float *d_tsign;
     double *d_tsign64;
     int has_tsign;
@@ -780,6 +781,17 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
    `rc_eval`/`rc_pool_eval`. The per-row weight is the Fisher weight `q(1-q)`
    and the response is `t/q`, which reproduce `logistic_irls`'s Newton step. */
 #define RC_LOSS_LOGISTIC 5
+/* SM-1: the hinge fit codes. Each reads the uploaded label sign and
+   accumulates a per-row (weight, response, loss) triple whose loss is the
+   configured hinge form of `metrics::classification_row_loss`, never log-loss
+   or SSE. Fit-only like code 5: never passed to `rc_eval`/`rc_pool_eval`.
+     6 hinge_squared   Gauss-Newton on the active set t·p < 1
+     7 hinge_ordinary  the logistic triple until the first rejected trial,
+                       then the majorise-minimise triple
+     8 hinge           the logistic triple, judged on the sigmoid hinge */
+#define RC_LOSS_HINGE_SQUARED 6
+#define RC_LOSS_HINGE_ORDINARY 7
+#define RC_LOSS_HINGE_SIGMOID 8
 
 /* #287: native score-objective codes (`ScoreObjective::code` in metrics.rs).
    These are deliberately separate from the fit `RC_LOSS_*` codes: fitting and
@@ -800,7 +812,7 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
  *
  * Label-aware row losses with `t = 2l - 1` and `p` the model output read as a
  * logit. They are disjoint from the regression score codes (0–9) and from the
- * fit `RC_LOSS_*` codes (0–5), so a fit launch and a score launch cannot be
+ * fit `RC_LOSS_*` codes (0–8), so a fit launch and a score launch cannot be
  * confused. The kernel accumulates `Σ wᵢ·lossᵢ` in f64, in fixed row order,
  * with no atomics; it divides by `Σw` (or the row count) in the same kernel,
  * exactly like `metrics::score_native_weighted`.
@@ -928,6 +940,83 @@ __device__ __forceinline__ double rc_class_row_loss(float p, float tsign, int lo
     /* A regression/fit code reaching the class kernel is a launch bug: NaN is
        visibly wrong instead of a silent substitution (#236). */
     return CUDART_NAN_F;
+}
+
+/* SM-1: the score code whose row loss a label-sign fit code minimises, or -1
+   for a fit code without label semantics. */
+__host__ __device__ __forceinline__ int rc_fit_class_code(int metric)
+{
+    if (metric == RC_LOSS_HINGE_SQUARED) return RC_SCORE_HINGE_SQUARED;
+    if (metric == RC_LOSS_HINGE_ORDINARY) return RC_SCORE_HINGE_ORDINARY;
+    if (metric == RC_LOSS_HINGE_SIGMOID) return RC_SCORE_HINGE_SIGMOID;
+    return -1;
+}
+
+/* SM-1: fit codes that read the uploaded label sign. */
+__host__ __device__ __forceinline__ int rc_fit_reads_sign(int metric)
+{
+    return metric == RC_LOSS_LOGISTIC || rc_fit_class_code(metric) >= 0;
+}
+
+__device__ __forceinline__ double rc_sigmoid_d(double x)
+{
+    if (x >= 0.0) return 1.0 / (1.0 + exp(-x));
+    const double e = exp(x);
+    return e / (1.0 + e);
+}
+
+/* SM-1: the f64 twin of `rc_class_row_loss` for the fit polish, term for term
+   `metrics::classification_row_loss`. */
+__device__ __forceinline__ double rc_class_row_loss_d(double p, double tsign, int loss)
+{
+    const double u = tsign * p;
+    if (loss == RC_SCORE_LOG_LOSS) return rc_softplus_neg(u);
+    if (loss == RC_SCORE_BRIER) {
+        const double d = rc_sigmoid_d(p) - 0.5 * (tsign + 1.0);
+        return d * d;
+    }
+    if (loss == RC_SCORE_HINGE_ORDINARY) return fmax(1.0 - u, 0.0);
+    if (loss == RC_SCORE_HINGE_SQUARED) {
+        const double h = fmax(1.0 - u, 0.0);
+        return h * h;
+    }
+    if (loss == RC_SCORE_HINGE_SIGMOID) {
+        const double s = 2.0 * rc_sigmoid_d(p) - 1.0;
+        return fmax(1.0 - tsign * s, 0.0);
+    }
+    return CUDART_NAN;
+}
+
+/* SM-1: Gauss-Newton weight `sw` and response `resp` of one hinge row, in
+   f64. `sw·resp` is the row's gradient factor and `sw` its curvature:
+     hinge_squared        sw = w·[u < 1]   resp = p − t
+     logistic (phase 0)   sw = w·q(1−q)    resp = −t/q
+     MM (phase 1)         sw = w/(2a)      resp = p − t(1 + a),  a = max(|1 − u|, eps)
+   with u = t·p. The MM pair is the curvature and gradient of
+   (p − t(1 + a))²/(4a), which majorises max(0, 1 − u) and touches it at the
+   current constants: an active row gives sw·resp = −w·t, an inactive row
+   resp = 0. */
+__device__ __forceinline__ void rc_hinge_triple(int metric,
+                                                int phase,
+                                                double wr,
+                                                double tt,
+                                                double pred,
+                                                double *sw,
+                                                double *resp)
+{
+    const double u = tt * pred;
+    if (metric == RC_LOSS_HINGE_SQUARED) {
+        *sw = (u < 1.0) ? wr : 0.0;
+        *resp = pred - tt;
+    } else if (metric == RC_LOSS_HINGE_ORDINARY && phase) {
+        const double a = fmax(fabs(1.0 - u), FT_L1_EPS);
+        *sw = wr / (2.0 * a);
+        *resp = pred - tt * (1.0 + a);
+    } else {
+        const double q = rc_logistic_q(u);
+        *sw = wr * q * (1.0 - q);
+        *resp = -tt / q;
+    }
 }
 
 /* #131 register contract: 6 blocks of RC_MAX_THREADS per SM. On sm_86 the
@@ -1993,6 +2082,7 @@ __device__ void ft_assemble_d(const unsigned int *nd,
                               int n,
                               int p,
                               int metric,
+                              int phase,
                               const double *c,
                               double *dg,
                               double *dr,
@@ -2068,6 +2158,11 @@ __device__ void ft_assemble_d(const unsigned int *nd,
                     sw = wr * q * (1.0 - q);
                     resp = -tt / q;
                     rho = rc_softplus_neg(u);
+                } else if (rc_fit_class_code(metric) >= 0) {
+                    const double tt = tsign ? tsign[row] : 0.0;
+                    if (!tsign || !isfinite(tt)) ok = false;
+                    rc_hinge_triple(metric, phase, wr, tt, pred, &sw, &resp);
+                    rho = rc_class_row_loss_d(pred, tt, rc_fit_class_code(metric));
                 } else {
                     sw = ft_row_weight(wr, r, metric);
                     /* The objective statistic is always the configured loss, in
@@ -2155,6 +2250,11 @@ __device__ double ft_loss_d(const unsigned int *nd,
             } else if (metric == RC_LOSS_LOGISTIC) {
                 const double tt = tsign ? tsign[row] : 0.0;
                 local += isfinite(tt) ? wr * rc_softplus_neg(tt * pred) : 1e30;
+            } else if (rc_fit_class_code(metric) >= 0) {
+                const double tt = tsign ? tsign[row] : 0.0;
+                local += isfinite(tt)
+                             ? wr * rc_class_row_loss_d(pred, tt, rc_fit_class_code(metric))
+                             : 1e30;
             } else if (metric == RC_LOSS_SQUARED) {
                 local += wr * r * r;
             } else if (metric == RC_LOSS_ABSOLUTE) {
@@ -2193,6 +2293,7 @@ __device__ void ft_assemble(const unsigned int *nd,
                             int n,
                             int p,
                             int metric,
+                            int phase,
                             const double *c,
                             float *sg,
                             float *sr,
@@ -2249,6 +2350,13 @@ __device__ void ft_assemble(const unsigned int *nd,
                 sw = wr * q * (1.0 - q);
                 resp = -tt / q;
                 rowloss = wr * rc_softplus_neg(u);
+            } else if (rc_fit_class_code(metric) >= 0) {
+                /* SM-1: the loss statistic is the f32 row loss the device
+                   scorer ranks on; the triple is formed in f64. */
+                const double tt = tsign ? (double)tsign[row] : 0.0;
+                if (!tsign || !isfinite(tt)) ok = false;
+                rc_hinge_triple(metric, phase, wr, tt, (double)pred, &sw, &resp);
+                rowloss = wr * (double)rc_class_row_loss(pred, (float)tt, rc_fit_class_code(metric));
             } else {
                 sw = ft_row_weight(wr, (double)r, metric);
                 rowloss = (double)wr * (double)rc_row_loss(r, metric);
@@ -2327,6 +2435,11 @@ __device__ double ft_loss(const unsigned int *nd,
                signed margin, never an SSE of the 0/1 target. */
             const double tt = tsign ? (double)tsign[row] : 0.0;
             local += isfinite(tt) ? wr * rc_softplus_neg(tt * (double)pred) : 1e30;
+        } else if (rc_fit_class_code(metric) >= 0) {
+            const double tt = tsign ? (double)tsign[row] : 0.0;
+            local += isfinite(tt)
+                         ? wr * (double)rc_class_row_loss(pred, (float)tt, rc_fit_class_code(metric))
+                         : 1e30;
         } else if (metric == RC_LOSS_SQUARED) {
             /* Keep the historical f64 square: the f32 product would round the
                trial score differently from the assembly's own statistic. */
@@ -2801,7 +2914,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
     /* #234: the logistic arm is row-weighted by `q(1-q) <= 0.25` and asks the
        same identification question, so it uses the scale-free gate too. */
     const int scale_free = (metric == RC_LOSS_LOG_SQUASHED || metric == RC_LOSS_ABSOLUTE ||
-                            metric == RC_LOSS_LOGISTIC);
+                            rc_fit_reads_sign(metric));
 
     extern __shared__ char ft_smem_raw[];
     FtSmem<MAXC, CHUNK, PCHUNK> *S =
@@ -2997,14 +3110,22 @@ __global__ void fit_kernel(const float *__restrict__ cols,
        sweeps mirror the CPU `irls_fit` split (four weight updates, `iters/4`
        sweeps each for the default of 8), and every trial is judged by `|r|`.
        The squared and log-squashed arms keep one round and their historical
-       step sequence bit for bit. */
-    const int irls = (metric == RC_LOSS_ABSOLUTE);
+       step sequence bit for bit.
+       SM-1: `hinge_ordinary` shares the rounds. `phase` 0 takes the logistic
+       triple with single-trial acceptance on the hinge (the CPU
+       `logistic_irls` rule); its first rejected trial switches to the MM
+       triple (phase 1) with the true-hinge Armijo halvings and leaves λ alone,
+       because the rejection judges the logistic direction, not the step
+       length. The polish always runs in phase 1. `phase` is derived from
+       block-uniform values only, so every thread holds the same value. */
+    const int irls = (metric == RC_LOSS_ABSOLUTE || metric == RC_LOSS_HINGE_ORDINARY);
     const int rounds = irls ? (iters < 1 ? 1 : (iters < 4 ? iters : 4)) : 1;
     const int inner = irls ? (iters / rounds < 1 ? 1 : iters / rounds) : iters;
+    int phase = 0;
 
     if (iters > 0) {
         /* First assembly also supplies the baseline objective. */
-        ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
+        ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
         assembled = 1;
         best = S->sbest;
         if (tid == 0) S->sstart = S->sbad ? 0 : 1;
@@ -3013,7 +3134,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
             if (irls && round > 0) assembled = 0; /* new weights, new Gram */
             for (int it = 0; it < inner && status == 0; ++it) {
                 if (!assembled) {
-                    ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
+                    ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
                     assembled = 1;
                     if (S->sbad) {
                         status = 2;
@@ -3041,7 +3162,9 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                    passes and never accepts a trial that is worse in the
                    configured loss. Every other objective keeps the historical
                    single-trial acceptance. */
-                for (int half = 0; half < (irls ? 2 : 0) && !(tsse < best); ++half) {
+                const int halves =
+                    (irls && !(metric == RC_LOSS_HINGE_ORDINARY && phase == 0)) ? 2 : 0;
+                for (int half = 0; half < halves && !(tsse < best); ++half) {
                     if (tid < p) {
                         S->strial[tid] = S->sc[tid] + 0.5 * (S->strial[tid] - S->sc[tid]);
                     }
@@ -3057,6 +3180,9 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                     }
                     assembled = 0;
                     if (best == 0.0) break;
+                } else if (metric == RC_LOSS_HINGE_ORDINARY && phase == 0) {
+                    phase = 1;
+                    assembled = 0;
                 } else {
                     if (tid == 0) S->slambda *= 6.0;
                     /* #234: `S->slambda` is written by thread 0 only, so the
@@ -3077,13 +3203,14 @@ __global__ void fit_kernel(const float *__restrict__ cols,
         /* Re-baseline the acceptance objective in f64: `best` so far came from
            the f32 assembly, and comparing an f64 trial against it would reject
            every polish step on a systematic rounding difference alone. */
+        if (metric == RC_LOSS_HINGE_ORDINARY) phase = 1;
         if (status == 0) {
             const double exact = ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->sc, S->sred);
             if (isfinite(exact)) best = exact;
         }
         /* Undamped Gauss-Newton polish, exactly like the CPU path. */
         for (int it = 0; it < 4 && status == 0 && best != 0.0; ++it) {
-            ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, p, metric, S->sc, S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad, &S->sskip);
+            ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, p, metric, phase, S->sc, S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad, &S->sskip);
             assembled = 1;
             if (S->sbad) {
                 status = 2;
@@ -3143,6 +3270,62 @@ __global__ void fit_kernel(const float *__restrict__ cols,
         for (int i = 0; i < p; ++i) outc[(size_t)cand * (size_t)kmax + (size_t)i] = S->sc[i];
         outsse[cand] = best;
         outstatus[cand] = status;
+    }
+}
+
+/* SM-1 probe: the statistics `fit_kernel` sees at each candidate's start
+ * constants, without a step. Per candidate `out[k * (4 + kmax) + ...]` holds
+ * the f32 assembly loss, the f32 trial loss, the f64 assembly loss, the f64
+ * trial loss and then the f64 assembly's J^T r (p entries). Test support for
+ * the fit codes; the search never launches it. */
+template <int MAXC, int CHUNK, int PCHUNK>
+__global__ void fit_probe_kernel(const float *__restrict__ cols,
+                                 const float *__restrict__ y,
+                                 const float *__restrict__ tsign,
+                                 const double *__restrict__ cols64,
+                                 const double *__restrict__ y64,
+                                 const double *__restrict__ tsign64,
+                                 const double *__restrict__ w64,
+                                 int n,
+                                 const unsigned int *__restrict__ prog,
+                                 const unsigned int *__restrict__ off,
+                                 const int *__restrict__ pcount,
+                                 int kmax,
+                                 const double *__restrict__ c0,
+                                 int metric,
+                                 int phase,
+                                 double *__restrict__ out)
+{
+    const int cand = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int p = pcount[cand];
+    const int m = (int)(off[cand + 1] - off[cand]) / 4;
+    const unsigned int *nd = prog + off[cand];
+    extern __shared__ char ft_smem_raw[];
+    FtSmem<MAXC, CHUNK, PCHUNK> *S =
+        reinterpret_cast<FtSmem<MAXC, CHUNK, PCHUNK> *>(ft_smem_raw);
+    if (tid < p) S->sc[tid] = c0[(size_t)cand * (size_t)kmax + (size_t)tid];
+    if (tid == 0) {
+        S->sbad = 0;
+        S->sskip = 0;
+    }
+    __syncthreads();
+    ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, phase, S->sc, S->sg, S->sr,
+                             S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
+    const double a32 = S->sbest;
+    const double l32 = ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->sc, S->sred);
+    ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, p, metric, phase, S->sc,
+                                S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad,
+                                &S->sskip);
+    const double a64 = S->sbest;
+    const double l64 = ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->sc, S->sred);
+    if (tid == 0) {
+        double *o = out + (size_t)cand * (size_t)(4 + kmax);
+        o[0] = a32;
+        o[1] = l32;
+        o[2] = a64;
+        o[3] = l64;
+        for (int i = 0; i < p; ++i) o[4 + i] = S->sjtr[i];
     }
 }
 
@@ -4962,9 +5145,9 @@ int rc_set_fit_sign(void *ctx, const double *sign)
 /* --- #169: batched LM fit entry point -------------------------------------
  *
  * `metric` is one of the `RC_LOSS_*` codes: 0 squared, 1 log-squashed,
- * 4 absolute, 5 the logistic cross-entropy (#234, which also needs the sign
- * uploaded by `rc_set_fit_sign`). 2 and 3 are the fit-only correlation codes,
- * which run their own kernel.
+ * 4 absolute, 5 the logistic cross-entropy (#234) and 6-8 the hinge forms
+ * (SM-1); 5-8 also need the sign uploaded by `rc_set_fit_sign`. 2 and 3 are
+ * the fit-only correlation codes, which run their own kernel.
  *
  * `prog` is the concatenated 4-word node records; `off` has nprog+1 word
  * offsets; `pcount` has one constant count per candidate; constants start at
@@ -4990,9 +5173,9 @@ float rc_fit_batch(void *ctx,
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c || c->tiled || nprog <= 0 || kmax <= 0) return -1.0f;
-    /* #234: a log-loss batch without the uploaded label sign is refused here,
-       so the arm can never run on another objective. */
-    if (metric == RC_LOSS_LOGISTIC && !c->has_tsign) return -1.0f;
+    /* #234/SM-1: a log-loss or hinge batch without the uploaded label sign is
+       refused here, so the arm can never run on another objective. */
+    if (rc_fit_reads_sign(metric) && !c->has_tsign) return -1.0f;
     if (kmax > FT_MAX_CONST_LARGE) return -1.0f;
     const size_t prog_words = (size_t)off[nprog];
     const size_t cbytes = sizeof(double) * (size_t)nprog * (size_t)kmax;
@@ -5062,6 +5245,72 @@ int rc_fit_kernel_info(int kmax, int *threads, int *smem_bytes, int *max_constan
 {
     if (!threads || !smem_bytes || !max_constants) return -1;
     return ft_kernel_shape(kmax, threads, smem_bytes, max_constants);
+}
+
+/* SM-1: run `fit_probe_kernel` over a batch laid out like `rc_fit_batch`.
+ * `out` holds `nprog * (4 + kmax)` doubles. Only the p <= 16 instantiation is
+ * probed. Returns 0, or -1 when the batch was refused or the launch failed. */
+int rc_fit_probe(void *ctx,
+                 const unsigned int *prog,
+                 const unsigned int *off,
+                 const int *pcount,
+                 int nprog,
+                 int kmax,
+                 const double *c0,
+                 int metric,
+                 int phase,
+                 double *out)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || c->tiled || nprog <= 0 || kmax <= 0 || kmax > FT_MAX_CONST_SMALL) return -1;
+    if (rc_fit_reads_sign(metric) && !c->has_tsign) return -1;
+    const size_t prog_words = (size_t)off[nprog];
+    const size_t cbytes = sizeof(double) * (size_t)nprog * (size_t)kmax;
+    const size_t obytes = sizeof(double) * (size_t)nprog * (size_t)(4 + kmax);
+    size_t cur = 0;
+    const size_t o_prog = rc_fs_take(&cur, sizeof(unsigned int) * prog_words);
+    const size_t o_off = rc_fs_take(&cur, sizeof(unsigned int) * (size_t)(nprog + 1));
+    const size_t o_p = rc_fs_take(&cur, sizeof(int) * (size_t)nprog);
+    const size_t o_c0 = rc_fs_take(&cur, cbytes);
+    const size_t in_end = rc_fs_take(&cur, 0);
+    const size_t o_out = rc_fs_take(&cur, obytes);
+    const size_t io_end = rc_fs_take(&cur, 0);
+    if (rc_fs_reserve(c, RC_FS_FIT, io_end, io_end) != 0) return -1;
+    rc_fs_begin(c);
+    if (rc_fs_f64_twins(c) != 0) {
+        rc_fs_drain(c);
+        return -1;
+    }
+    typedef FtSmem<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK> Smem;
+    const int bytes = (int)sizeof(Smem);
+    if (cudaFuncSetAttribute(
+            (const void *)fit_probe_kernel<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) {
+        cudaGetLastError();
+        rc_fs_drain(c);
+        return -1;
+    }
+    unsigned char *base = c->fs_dev;
+    unsigned char *host = c->fs_host;
+    memcpy(host + o_prog, prog, sizeof(unsigned int) * prog_words);
+    memcpy(host + o_off, off, sizeof(unsigned int) * (size_t)(nprog + 1));
+    memcpy(host + o_p, pcount, sizeof(int) * (size_t)nprog);
+    memcpy(host + o_c0, c0, cbytes);
+    rc_fs_h2d(c, base, host, in_end);
+    fit_probe_kernel<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK>
+        <<<nprog, FT_CHUNK_SMALL, bytes, c->s_fit>>>(
+            c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->n,
+            (const unsigned int *)(base + o_prog), (const unsigned int *)(base + o_off),
+            (const int *)(base + o_p), kmax, (const double *)(base + o_c0), metric, phase,
+            (double *)(base + o_out));
+    if (cudaGetLastError() != cudaSuccess) {
+        rc_fs_drain(c);
+        return -1;
+    }
+    rc_fs_d2h(c, host + o_out, base + o_out, obytes);
+    if (rc_fs_finish(c) != 0) return -1;
+    memcpy(out, host + o_out, obytes);
+    return 0;
 }
 
 

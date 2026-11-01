@@ -77,6 +77,9 @@ pub struct ProtocolOptions {
     pub pbo_blocks: usize,
     /// Benjamini-Hochberg false discovery rate.
     pub fdr_q: f64,
+    /// #309: score every candidate on every window in one batch (device kernel
+    /// when available) and report it beside the exact finalists.
+    pub batch_pnl: bool,
 }
 
 impl Default for ProtocolOptions {
@@ -92,6 +95,7 @@ impl Default for ProtocolOptions {
             seed: 20_260_101,
             pbo_blocks: 16,
             fdr_q: 0.10,
+            batch_pnl: false,
         }
     }
 }
@@ -480,7 +484,9 @@ pub struct Report {
     pub allow_lockbox: bool,
     /// #304: fused long-only reduction summary when `--device-pnl` was set.
     pub device_pnl: Option<DevicePnlSummary>,
-    /// `entry_offset + horizon + delay`.
+    /// #309: batch pass over all candidates and windows (`--batch-pnl`).
+    pub batch_pnl: Option<crate::wf_batch::BatchSummary>,
+    /// `entry_offset) + horizon + delay`.
     pub required_purge_seconds: f64,
     /// Smallest `test_start - train_end` over the windows.
     pub min_purge_seconds: f64,
@@ -1002,7 +1008,8 @@ impl Accum {
         let (mut bh_rows, mut bh_long, mut const_rows, mut const_long) = (0u64, 0u64, 0u64, 0u64);
         let mut cand_cols: Vec<Vec<f64>> = vec![Vec::new(); n_candidates];
         let mut books: Vec<crate::wf_protocol::NullBook> = Vec::new();
-        for d in self.windows {
+        let mut batch_in: Vec<crate::wf_batch::WindowScores> = Vec::new();
+        for mut d in self.windows {
             let has_validation = d.validation_start.is_some();
             if has_validation && expressions.len() > 1
                 && d.validation_rows.is_empty()
@@ -1239,6 +1246,25 @@ impl Accum {
             if let Some(b) = ev.book {
                 books.push(b);
             }
+            if opts.batch_pnl {
+                batch_in.push(crate::wf_batch::WindowScores {
+                    rows: crate::wf_batch::BatchWindow {
+                        label: d.window.label.clone(),
+                        time: d.test_rows.iter().map(|r| r.time).collect(),
+                        group: d.test_rows.iter().map(|r| r.group).collect(),
+                        target: d.test_rows.iter().map(|r| r.target).collect(),
+                        train_mean: if d.train_target_n == 0 {
+                            f64::NAN
+                        } else {
+                            d.train_target_sum / d.train_target_n as f64
+                        },
+                    },
+                    scores: std::mem::take(&mut d.test_scores),
+                    thresholds: thresholds.clone(),
+                    selected: candidate,
+                    exact_net: ev.stats.net_sum,
+                });
+            }
             let train_last_time = if d.train_max_time.is_finite() { Some(d.train_max_time) } else { None };
             windows.push(WindowResult {
                 window: d.window,
@@ -1351,6 +1377,16 @@ impl Accum {
             "inferred from the median test time step (365-day year)".to_string()
         };
         let sign_test = fold_sign_test(&windows);
+        let batch_pnl = if opts.batch_pnl {
+            Some(crate::wf_batch::summarize(
+                &batch_in,
+                cost_side,
+                !spec.pool_reset_flat,
+                spec.control_seed,
+            )?)
+        } else {
+            None
+        };
         let device_pnl = if spec.device_pnl {
             let mut backend = String::new();
             let mut rows = 0u64;
@@ -1419,6 +1455,7 @@ impl Accum {
             memory_bound: memory_bound.to_string(),
             allow_lockbox: spec.allow_lockbox,
             device_pnl,
+            batch_pnl,
             required_purge_seconds: required_purge,
             min_purge_seconds: min_gap,
             economics,
@@ -1620,6 +1657,11 @@ pub(crate) struct Stats {
     pub(crate) trades: usize,
     pub(crate) entries: usize,
     pub(crate) exits: usize,
+    /// #309: rule exits (position falls), excluding the final exit.
+    pub(crate) rule_exits: usize,
+    /// #309: row-order sums of `p * r` and of the net row terms.
+    pub(crate) gross_sum: f64,
+    pub(crate) net_sum: f64,
 }
 
 impl Stats {
@@ -1636,6 +1678,9 @@ impl Stats {
         self.trades += other.trades;
         self.entries += other.entries;
         self.exits += other.exits;
+        self.rule_exits += other.rule_exits;
+        self.gross_sum += other.gross_sum;
+        self.net_sum += other.net_sum;
     }
 }
 
@@ -1803,6 +1848,57 @@ pub fn reference_metrics(
     .metrics
 }
 
+/// #309: the scalar evaluator's row-level totals for one test block, the exact
+/// CPU reference of one `(candidate, window)` batch cell. `previous` carries
+/// each group's last position: pass a fresh map for a window that starts flat,
+/// the pooled map to carry the seam.
+pub fn reference_cell(
+    time: &[f64],
+    group: &[u64],
+    target: &[f64],
+    scores: &[f64],
+    threshold: f64,
+    cost_side: f64,
+    previous: &mut HashMap<u64, f64>,
+) -> trading_gpu::PnlTotals {
+    let rows: Vec<RowBase> = (0..time.len())
+        .map(|i| RowBase {
+            time: time[i],
+            group: group[i],
+            target: target[i],
+        })
+        .collect();
+    let ev = evaluate_window(
+        &rows,
+        scores,
+        threshold,
+        cost_side,
+        1.0,
+        previous,
+        Policy::Threshold,
+        0.0,
+        1,
+        false,
+        false,
+        None,
+        false,
+    );
+    let s = &ev.stats;
+    trading_gpu::PnlTotals {
+        rows: s.rows as u64,
+        long_rows: s.active as u64,
+        entries: s.entries as u64,
+        exits: (s.rule_exits + s.exits) as u64,
+        trades: s.trades as u64,
+        hits: s.hits as u64,
+        final_exits: s.exits as u64,
+        gross: s.gross_sum,
+        cost: s.total_cost,
+        turnover: s.total_abs_delta,
+        net: s.net_sum,
+    }
+}
+
 /// `previous` carries each group's last position. Pass a fresh map for a
 /// window that starts flat; pass the pooled map to carry the seam.
 fn evaluate_window(
@@ -1968,6 +2064,11 @@ fn evaluate_window(
         first_positions.entry(row.group).or_insert(pos);
 
         stats.total_abs_delta += delta.abs();
+        stats.gross_sum += pos * row.target;
+        stats.net_sum += net[i];
+        if delta < 0.0 {
+            stats.rule_exits += 1;
+        }
         stats.total_cost += cost;
         if delta != 0.0 {
             stats.trades += 1;
@@ -1995,8 +2096,8 @@ fn evaluate_window(
     for (&g, _) in previous.iter() {
         if let Some((i, _)) = order
             .iter()
-            .filter(|&&i| rows[i].group == g)
-            .map(|&i| (i, rows[i].time))
+            .filter(|&&i| rows[valid[i]].group == g)
+            .map(|&i| (i, rows[valid[i]].time))
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         {
             last_of_group.insert(g, i);
@@ -2008,6 +2109,7 @@ fn evaluate_window(
             let c = cost_side * p.abs();
             net[i] -= c;
             stats.total_cost += c;
+            stats.net_sum -= c;
             stats.exits += 1;
         }
     }
@@ -2406,7 +2508,7 @@ pub(crate) fn jnum(v: f64) -> String {
 }
 
 /// #304: one fused-reduction total as JSON.
-fn pnl_totals_json(t: &crate::trading_gpu::PnlTotals) -> String {
+pub(crate) fn pnl_totals_json(t: &crate::trading_gpu::PnlTotals) -> String {
     format!(
         "{{\"rows\":{},\"long_rows\":{},\"entries\":{},\"exits\":{},\
          \"trades\":{},\"hits\":{},\"final_exits\":{},\"gross\":{},\
@@ -2721,7 +2823,7 @@ impl Report {
              \"p_value\":{},\"method\":{}}},\
              \"lockbox\":{},\
              \"source\":{},\"memory_bound\":{},\"dropped_rows\":{},\
-             \"device_pnl\":{},\"windows\":[{}],\"pooled\":{}}}",
+             \"device_pnl\":{},\"batch_pnl\":{},\"windows\":[{}],\"pooled\":{}}}",
             jstr(env!("CARGO_PKG_VERSION")),
             jstr(&self.expression),
             jstr(&self.target),
@@ -2787,6 +2889,9 @@ impl Report {
                     jnum(d.max_abs_net_delta)
                 )
             }),
+            self.batch_pnl
+                .as_ref()
+                .map_or("null".to_string(), |b| b.json()),
             windows.join(","),
             self.pooled.json()
         )

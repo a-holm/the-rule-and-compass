@@ -615,6 +615,8 @@ struct GpuSearch {
     fit_fallback: usize,
     /// #169: pending offspring screened before the fit batch (admission).
     fit_screened: usize,
+    /// #448: candidates with constants admitted without a screening score (wide admission).
+    fit_admitted_wide: usize,
     /// #169: CPU fallback counts labelled by cause.
     fit_fallback_by_cause: BTreeMap<String, usize>,
     /// #265: fallbacks whose CPU refit lowered the exact error, by cause.
@@ -803,6 +805,7 @@ impl GpuSearch {
                     fit_gpu: 0,
                     fit_fallback: 0,
                     fit_screened: 0,
+                    fit_admitted_wide: 0,
                     fit_fallback_by_cause: BTreeMap::new(),
                     fit_fallback_improved_by_cause: BTreeMap::new(),
                     fit_status_by_label: BTreeMap::new(),
@@ -900,9 +903,10 @@ impl GpuSearch {
         // device never fits a sign the sample does not support.
         // #289: the predicate is the *fit* objective, not the fit-only split:
         // `log_loss` now has a native scorer, but its device fit still needs
-        // both classes to have a finite optimum.
+        // both classes to have a finite optimum. The hinge codes read the same
+        // sign and are declined the same way.
         let single_class = crate::fit::fit_loss(cfg.metric)
-            == Some(crate::fit::DeviceLoss::Logistic)
+            .is_some_and(|loss| loss.needs_label_sign())
             && {
                 let (pos, neg) = crate::fit::class_counts_weighted(&train.y, &train.w);
                 pos == 0 || neg == 0
@@ -1244,6 +1248,9 @@ impl GpuSearch {
             };
             self.fit_screened += screened.len();
             self.stats.entry(generation).or_default().fit_screened += screened.len();
+            let unscreened = pending.len() - screened.len();
+            self.fit_admitted_wide += unscreened;
+            self.stats.entry(generation).or_default().fit_admitted_wide += unscreened;
             if !screened.is_empty() {
                 self.evaluate_the_batch(islands, &screened, train, cfg, generation, dispatcher)?;
             }
@@ -1648,6 +1655,7 @@ impl GpuSearch {
             fit_gpu: self.fit_gpu,
             fit_fallback: self.fit_fallback,
             fit_screened: self.fit_screened,
+            fit_admitted_wide: self.fit_admitted_wide,
             fit_fallback_by_cause: self.fit_fallback_by_cause.clone(),
             fit_fallback_improved_by_cause: self.fit_fallback_improved_by_cause.clone(),
             fit_status_by_label: self.fit_status_by_label.clone(),
@@ -3567,6 +3575,19 @@ fn defers_fit_to_gpu(cfg: &Config, defer_gpu: bool) -> bool {
             || crate::fit::maximum_fit_only(cfg.metric))
 }
 
+/// #451: why `--fit-strategy gpu` does not defer the fit to the device, or
+/// `None` when it does (or the strategy is not `gpu`).
+#[cfg(any(feature = "cuda", test))]
+fn gpu_fit_off_reason(cfg: &Config) -> Option<String> {
+    if !cfg.fit_strategy.defers_to_gpu() || defers_fit_to_gpu(cfg, true) {
+        return None;
+    }
+    if cfg.fit_iters == 0 {
+        return Some("--fit-iters 0: nothing to fit".to_string());
+    }
+    crate::fit::gpu_fit_metric_error(cfg.metric)
+}
+
 /// #85: true when constants are fitted on fewer rows than the generation's
 /// scoring sample. A request at least as large as the sample is a no-op.
 fn fit_sampling_active(cfg: &Config, sample: &Sample) -> bool {
@@ -3915,6 +3936,8 @@ struct PipelineFit {
 /// already "every pending candidate with constants". That is exactly
 /// [`WIDE_ADMISSION_ROWS`], and only for the LM family (the rank/order/
 /// maximum/logistic arms have their own gated policies and stay synchronous).
+/// The label-sign codes stay synchronous too: the overlap batch has no
+/// single-class decline.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn pipeline_fit_safe(cfg: &Config, train_rows: usize, screened: bool) -> bool {
     !screened
@@ -3922,7 +3945,7 @@ fn pipeline_fit_safe(cfg: &Config, train_rows: usize, screened: bool) -> bool {
         && defers_fit_to_gpu(cfg, true)
         && (train_rows >= WIDE_ADMISSION_ROWS || cfg.fit_admission == crate::fit::FitAdmission::All)
         && cfg.fit_iters > 0
-        && crate::fit::fit_loss(cfg.metric).is_some()
+        && crate::fit::fit_loss(cfg.metric).is_some_and(|loss| !loss.needs_label_sign())
         && !crate::fit::device_fit_is_gated(cfg.metric)
 }
 
@@ -4176,6 +4199,9 @@ pub struct GpuGenStats {
     pub fit_fallback: usize,
     /// #169: pending offspring screened before admission.
     pub fit_screened: usize,
+    /// #448: candidates with constants fitted without a screening score under
+    /// wide admission; `fit_screened + fit_admitted_wide >= fit_attempts`.
+    pub fit_admitted_wide: usize,
     /// #169: CPU fallback counts labelled by cause.
     pub fit_fallback_by_cause: BTreeMap<String, usize>,
     /// #265: fallbacks whose CPU refit lowered the exact error, by cause.
@@ -4204,6 +4230,9 @@ pub struct GpuRunStats {
     pub fit_fallback: usize,
     /// #169: pending offspring screened before admission.
     pub fit_screened: usize,
+    /// #448: candidates with constants fitted without a screening score under
+    /// wide admission; `fit_screened + fit_admitted_wide >= fit_attempts`.
+    pub fit_admitted_wide: usize,
     /// #169: CPU fallback counts labelled by cause.
     pub fit_fallback_by_cause: BTreeMap<String, usize>,
     /// #265: fallbacks whose CPU refit lowered the exact error, by cause.
@@ -5080,6 +5109,7 @@ fn run_postfix_search(
             fit_gpu: 0,
             fit_fallback: 0,
             fit_screened: 0,
+            fit_admitted_wide: 0,
             fit_fallback_by_cause: Default::default(),
             fit_fallback_improved_by_cause: Default::default(),
             fit_fallback_seconds: 0.0,
@@ -5716,14 +5746,10 @@ fn run_search(
         }
     }
     #[cfg(feature = "cuda")]
-    if cfg.gpu_notes && cfg.fit_strategy.defers_to_gpu() && !defers_fit_to_gpu(cfg, true) {
-        eprintln!(
-            "# gpu-fit: off (the batched kernel minimises squared error, \
-             log-squashed, mean absolute error or the exact rank, median, \
-             interquartile and maximum objectives; --metric must be squared, \
-             log_squashed, absolute, aic, aicc, bic, rank_correlation, \
-             rank_correlation_signed, median, interquartile or maximum)"
-        );
+    if cfg.gpu_notes {
+        if let Some(why) = gpu_fit_off_reason(cfg) {
+            eprintln!("# gpu-fit: off ({})", why);
+        }
     }
     // #226/#232: only a run that actually asked for the device fit arm can be
     // refused by it. `--no-fit` (or a CPU strategy) has nothing to fit, so it
@@ -7036,6 +7062,39 @@ fn run_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_fit_off_reason_follows_the_fit_decision() {
+        use crate::fit::FitStrategy;
+        use crate::metrics::Metric;
+        for &metric in Metric::all() {
+            let cfg = Config {
+                metric,
+                fit_strategy: FitStrategy::Gpu,
+                fit_iters: 5,
+                ..Config::default()
+            };
+            let reason = gpu_fit_off_reason(&cfg);
+            assert_eq!(reason.is_none(), defers_fit_to_gpu(&cfg, true), "{}", metric.name());
+            if crate::fit::gpu_fit_metric_error(metric).is_none() {
+                assert_eq!(reason, None, "{}", metric.name());
+            } else {
+                assert_eq!(reason, crate::fit::gpu_fit_metric_error(metric));
+            }
+        }
+        let cfg = Config {
+            metric: Metric::Squared,
+            fit_strategy: FitStrategy::Gpu,
+            fit_iters: 0,
+            ..Config::default()
+        };
+        assert_eq!(
+            gpu_fit_off_reason(&cfg).as_deref(),
+            Some("--fit-iters 0: nothing to fit")
+        );
+        let cfg = Config { fit_strategy: FitStrategy::Exact, ..cfg };
+        assert_eq!(gpu_fit_off_reason(&cfg), None);
+    }
 
     /// #256: the fit stage leaves the eval window first, then prep, then
     /// search, and the phases keep their total.

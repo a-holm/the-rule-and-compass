@@ -122,6 +122,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/cuda/prep.cu");
     println!("cargo:rerun-if-changed=src/cuda/pnl.cu");
     println!("cargo:rerun-if-changed=src/cuda/pit.cu");
+    println!("cargo:rerun-if-changed=src/cuda/wf_batch.cu");
     println!("cargo:rerun-if-changed=src/cuda/alloc_guard.h");
     println!("cargo:rerun-if-changed=src/cuda/radix_select.h");
     println!("cargo:rerun-if-changed=src/cuda/arch.rs");
@@ -230,6 +231,7 @@ fn main() {
         "src/cuda/prep.cu",
         "src/cuda/pnl.cu",
         "src/cuda/pit.cu",
+        "src/cuda/wf_batch.cu",
         "-lcudart",
     ]);
 
