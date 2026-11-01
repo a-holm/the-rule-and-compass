@@ -7576,6 +7576,30 @@ mod rank_tests {
         assert_eq!(b, target.ranks(), "device B differs from the CPU average ranks");
     }
 
+    extern "C" {
+        fn rc_rank_test_force_cub_fail(on: i32);
+    }
+
+    /// #410: a refused CUB size query fails the rank call before any buffer is
+    /// sized, `rank_score_trials` reports `None` (the caller keeps the CPU
+    /// arm), and the next call on the same context works.
+    #[test]
+    fn refused_cub_query_fails_the_rank_call_then_recovers() {
+        let f = fixture(96);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let p = plan(&linear());
+        let ok = ev.rank_score_trials(&[&p], &[vec![p.c0.clone()]]);
+        assert!(ok.is_some(), "baseline rank call");
+        unsafe { rc_rank_test_force_cub_fail(1) };
+        let refused = ev.rank_score_trials(&[&p], &[vec![p.c0.clone()]]);
+        unsafe { rc_rank_test_force_cub_fail(0) };
+        assert!(refused.is_none(), "a refused CUB query must fail the rank call");
+        let again = ev
+            .rank_score_trials(&[&p], &[vec![p.c0.clone()]])
+            .expect("no error may stay pending");
+        assert_eq!(again[0][0].map(|s| (s.ab, s.aa)), ok.unwrap()[0][0].map(|s| (s.ab, s.aa)));
+    }
+
     #[test]
     fn rank_sums_are_bit_identical_to_the_cpu() {
         let f = fixture(96);
@@ -8686,6 +8710,32 @@ mod order_stat_tests {
 
     /// The device median is the configured metric for odd and even row counts,
     /// with ties and with a constant prediction.
+    extern "C" {
+        fn rc_os_test_force_cub_fail(on: i32);
+    }
+
+    /// #410: a refused CUB size query fails the order-statistic sort call,
+    /// `order_stat_score_trials` reports `None` (the caller keeps the CPU arm),
+    /// and the next call on the same context works.
+    #[test]
+    fn refused_cub_query_fails_the_order_stat_call_then_recovers() {
+        use crate::fit::OrderStat;
+        let f = fixture(96);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let p = plan(&affine());
+        let trials = [vec![p.c0.clone()]];
+        let ok = ev.order_stat_score_trials(&[&p], &trials, OrderStat::Median);
+        assert!(ok.is_some(), "baseline median call");
+        unsafe { rc_os_test_force_cub_fail(1) };
+        let refused = ev.order_stat_score_trials(&[&p], &trials, OrderStat::Median);
+        unsafe { rc_os_test_force_cub_fail(0) };
+        assert!(refused.is_none(), "a refused CUB query must fail the call");
+        let again = ev
+            .order_stat_score_trials(&[&p], &trials, OrderStat::Median)
+            .expect("no error may stay pending");
+        assert_eq!(again[0][0].map(f64::to_bits), ok.unwrap()[0][0].map(f64::to_bits));
+    }
+
     #[test]
     fn the_device_median_is_the_configured_metric() {
         for n in [5usize, 6, 31, 32, 97, 128] {

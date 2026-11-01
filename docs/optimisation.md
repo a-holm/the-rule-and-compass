@@ -378,12 +378,11 @@ because a projection onto the manifold *raises* SSE. A backend that answers a
 signed request with a squared proposal is declined by construction
 (`BatchedFitter::fit_batch_metric`), which is the difference between "the
 device cannot do this" and "the device quietly did something else".
-The search itself keeps `--metric signed` on the CPU evaluator: the CUDA
-evaluator has no native signed scorer yet (#236), and deferring only the *fit*
-to the device while offspring are ranked by MSE is precisely the silent
-substitution that gate prevents. On main this is already enforced up front:
-`--fit-strategy gpu --metric signed` is a usage error (`fit_loss(signed)` is
-`None`).
+The search defers the fit under `--fit-strategy gpu --metric signed`: the
+squared device LM is the warm start of the CPU arm (`fit_loss(signed)` is the
+squared objective), the exact `f64` gate projects every proposal, and a
+non-identifiable model goes to the CPU arm, which runs the polish. Scoring is
+the native signed objective, so the ranking is the configured bias.
 
 **Measured (#228).** `cargo test --release --test signed_gpu signed_cost_model
 -- --ignored --nocapture`, `n = 20 000` rows, `--fit-iters 8`, on a shared
