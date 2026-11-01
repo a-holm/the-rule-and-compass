@@ -2472,7 +2472,7 @@ A non-finite prediction scores `+inf` with status 2; fewer flips than `--min-tra
 
 **Dispatch.** `search_score_objective` picks the objective of every device scoring path: `GpuSearch::score` (screening and the post-fit rescore), the overlap pipeline and the flat postfix arena. The CPU route of the #290 dispatcher and the unsupported-program fallback score with `FitnessBook::regret`.
 
-**Throughput.** On the RTX 3060 at 1,000,000 rows (100 groups) and 256 programs (random depth-4 trees over 4 variables under `tanh` or `logistic`), the long-P&L score batch runs at 6.463e9 row-evaluations per second against 7.047e9 for the squared score batch on the same programs, 0.917x (kernel time alone: 6.492e9 against 7.079e9). Measured with the ignored test `long_pnl_throughput_against_squared` (`cargo test --release --features cuda --test pnl_fitness_gpu -- --ignored --exact long_pnl_throughput_against_squared --nocapture`).
+**Throughput.** On the RTX 3060 at 1,000,000 rows (100 groups) and 256 programs (random depth-4 trees over 4 variables under `tanh` or `logistic`), the long-P&L score batch runs at 6.425e9 row-evaluations per second against 7.079e9 for the squared score batch on the same programs, 0.908x (kernel time alone: 6.453e9 against 7.110e9). Measured with the ignored test `long_pnl_throughput_against_squared` (`cargo test --release --features cuda --test pnl_fitness_gpu -- --ignored --exact long_pnl_throughput_against_squared --nocapture`).
 
 ## Long-only P&L reduction (issue #304)
 
