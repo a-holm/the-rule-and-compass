@@ -450,6 +450,28 @@ fn pipelined_device_fit_archives_device_long_pnl_scores() {
     assert_archived_values_are_device_scores(&sample, &b, &seen);
 }
 
+/// The barrier path: screen, fit the admitted candidates on the device with
+/// the squared LM, rescore the fitted trees.
+#[test]
+fn synchronous_device_fit_archives_device_long_pnl_scores() {
+    let (sample, b) = search_fixture();
+    let seen: Archived = Arc::default();
+    let cfg = Config {
+        fit_strategy: rcsr::fit::FitStrategy::Gpu,
+        pipeline_depth: 0,
+        ..config(&b, &seen)
+    };
+    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let out = search::run(&cfg, &sample, &sample);
+    assert_device_scored(&out);
+    let gpu = out.gpu.as_ref().unwrap();
+    assert!(gpu.fit_gpu > 0 && gpu.fit_screened > 0, "screened and fitted on the device");
+    assert_archived_values_are_device_scores(&sample, &b, &seen);
+}
+
 #[test]
 fn a_refused_book_allocation_falls_back_to_the_cpu_scorer() {
     let (sample, b) = search_fixture();
@@ -598,13 +620,14 @@ fn write_cli_fixture() -> (String, String) {
     (data.to_string_lossy().into_owned(), spec_path.to_string_lossy().into_owned())
 }
 
-fn cli(data: &str, spec: &str, backend: &str) -> rcsr::devlog::Json {
+fn cli(data: &str, spec: &str, backend: &[&str]) -> rcsr::devlog::Json {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(backend)
         .args([
             "--data", data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal",
-            "--target-spec", spec, backend, "--no-dev-log", "--seed", "3", "--generations", "10",
+            "--target-spec", spec, "--no-dev-log", "--seed", "3", "--generations", "10",
             "--pop", "48", "--metric", "squared", "--json", "--quiet", "--objective", "pnl",
-            "--cost-bps", "5", "--validation-frac", "0.3", "--fitness", "pnl", "--dispatch", "device",
+            "--cost-bps", "5", "--validation-frac", "0.3", "--fitness", "pnl",
         ])
         .output()
         .expect("run rcsr");
@@ -620,7 +643,7 @@ fn cli_names_the_device_scorer_and_reports_exact_values() {
         return;
     }
     let (data, spec) = write_cli_fixture();
-    let gpu = cli(&data, &spec, "--gpu");
+    let gpu = cli(&data, &spec, &["--gpu", "--dispatch", "device"]);
     assert_eq!(gpu.get("backend").and_then(|j| j.as_str()), Some("gpu"));
     let f = gpu.get("search_fitness").expect("search_fitness");
     let field = |k: &str| f.get(k).and_then(|j| j.as_str()).map(str::to_string);
@@ -630,7 +653,7 @@ fn cli_names_the_device_scorer_and_reports_exact_values() {
     assert_eq!(field("scorer_backend").as_deref(), Some("cuda"));
     assert_eq!(field("scorer_values").as_deref(), Some("screening_f32_predictions"));
 
-    let cpu = cli(&data, &spec, "--cpu");
+    let cpu = cli(&data, &spec, &["--cpu"]);
     let f = cpu.get("search_fitness").expect("search_fitness");
     assert_eq!(f.get("scorer_backend").and_then(|j| j.as_str()), Some("cpu"));
     assert_eq!(f.get("scorer_values").and_then(|j| j.as_str()), Some("exact_f64"));
