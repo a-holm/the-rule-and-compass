@@ -442,6 +442,10 @@ Training fits, validation selects, development out-of-sample evaluates the proce
 
 Each row has `train_end = test_start - purge_seconds` (219600 s: 1 h entry plus a 60 h label) and `validation_start` six calendar months before the test start. `--windows protocol/windows.csv --windows-scheme expanding` loads one scheme; the table's `validation_start` replaces `--validation-frac`. The validation slice sets the threshold and selects among `--expr` candidates. Select the procedure, not the lucky candidate: pool the development series of the chosen procedure.
 
+### Overlapping returns
+
+The book earns the per-row forward return on every long row and charges one cost per position change. With rows closer than `--horizon` in one group, a long run earns the same price move several times. `rcsr walkforward` therefore refuses (exit 2, `overlapping returns`) any window whose test rows have two rows of one group less than `--horizon` seconds apart; a step equal to the horizon passes, a gap passes, equal timestamps are skipped. `--horizon 0` skips the check. The report carries `split.min_group_step_seconds`, the smallest positive step.
+
 ### Purge
 
 The required purge is `--entry-offset + --horizon + --delay` seconds. A window whose `test_start - train_end` is shorter is refused, and the report carries `split.required_purge_seconds`, `split.purge_seconds` (the smallest gap) and per window `train_last_time`: the stamp of the last training row, whose label ends at most `required_purge_seconds` later, before `test_start`. The purge is in time and applies to every symbol, so a late listing or a hole in one symbol cannot bring a training label into a test window.

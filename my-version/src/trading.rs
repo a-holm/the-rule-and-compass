@@ -820,6 +820,10 @@ pub fn evaluate_positions(
 pub struct FinalistReport {
     pub objective: Objective,
     pub spec: TradingSpec,
+    /// Smallest positive step between consecutive rows of one group over the
+    /// validation and test slices.
+    pub min_group_step: Option<f64>,
+    pub horizon_seconds: f64,
     pub candidates: usize,
     pub usable: usize,
     pub expression: String,
@@ -835,6 +839,17 @@ pub struct FinalistReport {
 }
 
 impl FinalistReport {
+    fn spec_json(&self) -> String {
+        let mut s = self.spec.json();
+        s.pop();
+        s.push_str(&format!(
+            ",\"min_group_step_seconds\":{},\"horizon_seconds\":{}}}",
+            self.min_group_step.map_or_else(|| "null".to_string(), num),
+            num(self.horizon_seconds)
+        ));
+        s
+    }
+
     pub fn json(&self, backend: &str, backend_reason: Option<&str>) -> String {
         let block = |r: &Result<PathStats, String>| match r {
             Ok(s) => s.json(),
@@ -854,7 +869,7 @@ impl FinalistReport {
             backend_reason
                 .map(crate::devlog::text)
                 .unwrap_or_else(|| "null".to_string()),
-            self.spec.json(),
+            self.spec_json(),
             crate::devlog::text(&self.expression),
             self.archive_rank,
             crate::devlog::text(&self.fit_metric),

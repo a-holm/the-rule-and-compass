@@ -172,6 +172,8 @@ INPUT:
                              fit and the archive still use --metric. Needs a
                              temporal split with --validation-frac, a
                              forward_return --target-spec, and --cost-bps.
+                             Rows of one group closer than the label horizon overlap
+                             and are refused (exit 2); use long:<h>,stride=<h>
                              The test block is read once, for the winner only
   --position long_only       the only position map (default). short is refused
   --allow-short              refused: there is no short P&L, borrow or funding
@@ -4455,6 +4457,24 @@ fn main() {
         }
     }
 
+    // #468: the long/flat book earns the full per-row return, so rows of one
+    // group must not be closer than the label horizon.
+    let target_horizon = target_resolved.as_ref().map_or(0.0, |r| r.spec.horizon_seconds);
+    let mut min_group_step: Option<f64> = None;
+    if let (Some(_), Some(split), Some(r)) = (&trading_spec, prepared.trading.as_ref(), target_resolved.as_ref()) {
+        let horizon = r.spec.horizon_seconds;
+        for slice in split.validation.iter().chain(std::iter::once(&split.test)) {
+            match rcsr::trading::check_return_spacing(&slice.rows, horizon) {
+                Ok(step) => {
+                    min_group_step = match (min_group_step, step) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    }
+                }
+                Err(e) => trading_usage(&e),
+            }
+        }
+    }
     // #254: the zero-parameter rung and, under the override, the proxy table.
     let target_active: Option<target::Active> = match (target_resolved.take(), target_check.take()) {
         (Some(r), Some(mut check)) => {
@@ -5718,6 +5738,8 @@ fn main() {
             Some(rcsr::trading::FinalistReport {
                 objective,
                 spec: tspec.clone(),
+                min_group_step,
+                horizon_seconds: target_horizon,
                 candidates: rows.len(),
                 usable,
                 expression: top.expression.clone(),
@@ -9183,7 +9205,8 @@ OPTIONS:
   --window <spec>            LABEL,TRAIN_START,TRAIN_END,TEST_START,TEST_END
                              (repeatable; the four-bound form is also accepted)
   --windows <file>           CSV file of window rows with the same columns
-  --horizon <seconds>        forward-label horizon; minimum purge/embargo
+  --horizon <seconds>        forward-label horizon; minimum purge/embargo. Test rows of one
+                             group closer than the horizon overlap and are refused (exit 2)
                              (default 0)
   --embargo <seconds>        extra gap between train_end and test_start
                              (default: the horizon)
@@ -9811,7 +9834,7 @@ fn run_walkforward(args: &[String]) -> ! {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(EXIT_INPUT);
+            std::process::exit(if e.contains("overlapping returns") { EXIT_USAGE } else { EXIT_INPUT });
         }
     };
     let report_sha = rcsr::manifest::sha256_hex(report.json().as_bytes());

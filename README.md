@@ -746,7 +746,9 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   on `|delta p|` including the exit, daily `sqrt(365)` Sharpe) instead of the
   fit error. The fit and the archive keep `--metric`. It needs a temporal
   split, `--validation-frac`, a `forward_return` `--target-spec` and
-  `--cost-bps`. `--json` adds an `objective` block with the validation and test
+  `--cost-bps`. Rows of one group closer than the label horizon overlap, so
+  the per-row return would be earned several times against one cost: such a
+  book is refused (exit 2); use `long:<h>,stride=<h>` or `long:1`. `--json` adds an `objective` block with the validation and test
   books, cash and buy-and-hold comparisons and the break-even cost. See
   [`docs/walkforward.md`](docs/walkforward.md) and
   [`docs/optimisation.md`](docs/optimisation.md).
