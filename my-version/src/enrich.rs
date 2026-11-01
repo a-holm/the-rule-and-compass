@@ -1,4 +1,4 @@
-//! `rcsr enrich` — append pre-computed OHLCV features to an existing store
+//! `rcsr enrich` — append pre-computed OHLCV features to an existing store,
 //! (issue #200).
 //!
 //! The store is read **column by column, one symbol at a time**. Every feature
@@ -1581,8 +1581,10 @@ pub struct FeatureReport {
     pub first_finite_row: Option<usize>,
     /// Epoch seconds of the first finite row, or `None`.
     pub first_finite_time: Option<i64>,
-    /// Finite rows divided by all rows (`NaN` rows are the complement).
+    /// Finite development rows divided by development rows.
     pub prevalence: f64,
+    /// Rows inside a guarded range (plus the label purge) that the statistics above leave out; `None` without a range.
+    pub rows_left_out: Option<usize>,
     pub hash: String,
     pub label: bool,
 }
@@ -1728,7 +1730,7 @@ impl Report {
         }
         for f in &self.features {
             out.push(format!(
-                "# enrich-feature: name={} warmup={} nan_rows={} prevalence={:.6} first_finite_row={} first_finite_time={} first_finite_iso={} label={}",
+                "# enrich-feature: name={} warmup={} nan_rows={} prevalence={:.6} first_finite_row={} first_finite_time={} first_finite_iso={} label={}{}",
                 f.name,
                 f.warmup,
                 f.nan_rows,
@@ -1742,7 +1744,8 @@ impl Report {
                 f.first_finite_time
                     .map(format_utc_seconds)
                     .unwrap_or_else(|| "none".to_string()),
-                f.label
+                f.label,
+                f.rows_left_out.map(|n| format!(" left_out_rows={}", n)).unwrap_or_default()
             ));
         }
         for l in &self.long_labels {
@@ -1801,7 +1804,7 @@ impl Report {
                 format!(
                     "{{\"name\":{},\"warmup\":{},\"nan_rows\":{},\"prevalence\":{:.12},\
                      \"first_finite_row\":{},\"first_finite_time\":{},\"first_finite_iso\":{},\
-                     \"label\":{},\"sha256\":{}}}",
+                     \"label\":{},\"sha256\":{}{}}}",
                     jstr(&f.name),
                     f.warmup,
                     f.nan_rows,
@@ -1816,7 +1819,10 @@ impl Report {
                         .map(|v| jstr(&format_utc_seconds(v)))
                         .unwrap_or_else(|| "null".to_string()),
                     f.label,
-                    jstr(&f.hash)
+                    jstr(&f.hash),
+                    f.rows_left_out
+                        .map(|n| format!(",\"rows_left_out\":{},\"sha256_scope\":\"all_rows\"", n))
+                        .unwrap_or_default()
                 )
             })
             .collect();
@@ -2941,7 +2947,6 @@ pub(crate) fn format_utc_seconds(ts: i64) -> String {
     )
 }
 
-#[cfg(feature = "cuda")]
 fn column_all(store: &FileStore, col: usize) -> Result<Vec<f64>, String> {
     let mut out = Vec::with_capacity(store.n_rows());
     for g in 0..store.n_groups() {
@@ -2950,7 +2955,6 @@ fn column_all(store: &FileStore, col: usize) -> Result<Vec<f64>, String> {
     Ok(out)
 }
 
-#[cfg(feature = "cuda")]
 fn i64_column_all(store: &FileStore, col: usize, dtype: DType) -> Result<Vec<i64>, String> {
     if dtype != DType::I64 {
         return Ok(column_all(store, col)?
@@ -5292,6 +5296,9 @@ struct TempColumn {
     first_finite: Option<usize>,
     label: bool,
     row_offset: usize,
+    /// Development rows by global row index; `None` keeps every row.
+    keep: Option<std::sync::Arc<Vec<bool>>>,
+    left_out: usize,
 }
 
 /// Staging size for [`TempColumn::write_values`]; a multiple of 8 and of the
@@ -5317,7 +5324,13 @@ impl TempColumn {
             first_finite: None,
             label,
             row_offset: 0,
+            keep: None,
+            left_out: 0,
         })
+    }
+    fn with_keep(mut self, keep: Option<std::sync::Arc<Vec<bool>>>) -> Self {
+        self.keep = keep;
+        self
     }
     /// Discard the current contents and start the column again. Used only when
     /// the canonical whole-panel pass replaces a legacy per-symbol preview
@@ -5333,6 +5346,7 @@ impl TempColumn {
         self.nan_rows = 0;
         self.first_finite = None;
         self.row_offset = 0;
+        self.left_out = 0;
         Ok(())
     }
 
@@ -5355,7 +5369,10 @@ impl TempColumn {
             return Err("temp column already closed".to_string());
         }
         for &v in values {
-            if !v.is_finite() {
+            let kept = self.keep.as_ref().map_or(true, |k| k.get(self.row_offset).copied().unwrap_or(true));
+            if !kept {
+                self.left_out += 1;
+            } else if !v.is_finite() {
                 self.nan_rows += 1;
             } else if self.first_finite.is_none() {
                 self.first_finite = Some(self.row_offset);
@@ -5390,6 +5407,7 @@ impl TempColumn {
             first_finite_row: self.first_finite,
             first_finite_time: None,
             prevalence: 0.0,
+            rows_left_out: self.keep.as_ref().map(|_| self.left_out),
             hash,
             label: self.label,
         })
@@ -6926,16 +6944,49 @@ fn enrich_inner(
         }
     }
 
+    let (label_range, label_also) = match opts.locked_test {
+        Some(l) => (Some(l), opts.locked_also),
+        None => match crate::lockbox::stored_all(&opts.data).map_err(|e| e.message)? {
+            Some(s) => (Some(s.range), s.also),
+            None => (None, None),
+        },
+    };
+    // Development rows by global row index, one mask per label purge. Feature
+    // statistics leave out rows inside a guarded range; label columns also
+    // leave out rows whose label window reaches it.
+    let guarded: Vec<crate::lockbox::Lockbox> = label_range.into_iter().chain(label_also).collect();
+    let mut keep_masks: BTreeMap<i64, std::sync::Arc<Vec<bool>>> = BTreeMap::new();
+    if !guarded.is_empty() {
+        let times = i64_column_all(&store, time_col, cols.time_dtype)?;
+        let mut purges: Vec<i64> = vec![0];
+        purges.extend(labels.iter().map(|(_, sp)| (sp.horizon as i64 + 1) * step));
+        purges.extend(long_specs.iter().map(|sp| sp.purge_seconds()));
+        for p in purges {
+            keep_masks.entry(p).or_insert_with(|| {
+                std::sync::Arc::new(
+                    times
+                        .iter()
+                        .map(|&t| guarded.iter().all(|r| t + p.max(1) <= r.start || t >= r.end))
+                        .collect(),
+                )
+            });
+        }
+    }
+    let keep_for = |purge: i64| keep_masks.get(&purge).cloned();
+
     // Create one temp column per requested feature and label.
     let mut temp: BTreeMap<String, TempColumn> = BTreeMap::new();
     for n in &requested {
         temp.insert(
             n.clone(),
-            TempColumn::create(work_dir, n, nominal_warmup(n), false)?,
+            TempColumn::create(work_dir, n, nominal_warmup(n), false)?.with_keep(keep_for(0)),
         );
     }
-    for (n, _) in &labels {
-        temp.insert(n.clone(), TempColumn::create(work_dir, n, 0, true)?);
+    for (n, sp) in &labels {
+        temp.insert(
+            n.clone(),
+            TempColumn::create(work_dir, n, 0, true)?.with_keep(keep_for((sp.horizon as i64 + 1) * step)),
+        );
     }
     let long_names: Vec<String> = long_specs
         .iter()
@@ -6944,16 +6995,13 @@ fn enrich_inner(
     for sp in &long_specs {
         for (kind, _) in crate::labels::COLUMN_KINDS {
             let n = sp.column(kind);
-            temp.insert(n.clone(), TempColumn::create(work_dir, &n, sp.column_warmup(kind), true)?);
+            temp.insert(
+                n.clone(),
+                TempColumn::create(work_dir, &n, sp.column_warmup(kind), true)?
+                    .with_keep(keep_for(sp.purge_seconds())),
+            );
         }
     }
-    let (label_range, label_also) = match opts.locked_test {
-        Some(l) => (Some(l), opts.locked_also),
-        None => match crate::lockbox::stored_all(&opts.data).map_err(|e| e.message)? {
-            Some(s) => (Some(s.range), s.also),
-            None => (None, None),
-        },
-    };
     let mut long_acc: Vec<crate::labels::LabelAccumulator> = long_specs
         .iter()
         .map(|sp| crate::labels::LabelAccumulator::with_range(sp, label_range).with_also(label_also))
@@ -6970,7 +7018,7 @@ fn enrich_inner(
             cross_sources.insert(src.to_string());
             if src != "volume" && !requested.contains(&src.to_string()) {
                 temp.entry(src.to_string())
-                    .or_insert(TempColumn::create(work_dir, src, nominal_warmup(src), false)?);
+                    .or_insert(TempColumn::create(work_dir, src, nominal_warmup(src), false)?.with_keep(keep_for(0)));
             }
         }
     }
@@ -7946,8 +7994,8 @@ fn enrich_inner(
     // Per-column prevalence and first finite timestamp. The timestamp is read
     // back by global row index, so the report names a date rather than only an
     // offset into the store.
-    let rows_total = store.n_rows();
     for r in &mut reports {
+        let rows_total = store.n_rows().saturating_sub(r.rows_left_out.unwrap_or(0));
         r.prevalence = if rows_total == 0 {
             0.0
         } else {
@@ -8412,6 +8460,10 @@ INPUT / OUTPUT:
                           label rows whose window reaches the range (entry at or after
                           START minus the purge, before END) are left out of every
                           <out>.labels.json statistic, and counted
+                          every per-column statistic of <out>.enrich.json (nan_rows,
+                          prevalence, first finite row) leaves out rows inside the range
+                          (label columns also the purge) and counts them as
+                          rows_left_out; sha256 covers all rows
   --gpu [auto|on|off]     auto (default) dispatches a registered exact kernel
                           only when the cost model estimates it faster; on
                           forces every registered kernel above the 1M-row floor;
