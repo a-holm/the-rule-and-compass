@@ -1,6 +1,4 @@
-//! Walk-forward over a `.rcsb` s        .filter(|t| {
-            !(t.contains("report_sha256")
-                || t.contains("_s\"")ore never depends on rows inside the declared
+//! Walk-forward over a `.rcsb` store never depends on rows inside the declared
 //! locked test. Two synthetic stores are identical outside the range and
 //! poisoned inside it; every report of a window that ends before the range
 //! must be byte-identical. Fixtures are synthetic; the range is a stand-in in
@@ -49,6 +47,14 @@ fn rcsr(args: &[&str]) -> (i32, String, String) {
 /// and duplicate rows inside the range, and appends rows far after its end.
 fn panel_csv(kind: Fixture) -> String {
     let mut csv = String::from("ts,sym,f1,f2,y\n");
+    if kind == Fixture::Poisoned {
+        // symbols that exist only inside the range, one sorting and appearing first, one last
+        for sym in ["a0", "zz"] {
+            for i in 400..450i64 {
+                csv.push_str(&format!("{},{sym},{},{},{}\n", T0 + i * H, i, -i, i));
+            }
+        }
+    }
     for g in 0..3i64 {
         for i in 0..500i64 {
             let ts = T0 + i * H;
@@ -143,7 +149,8 @@ fn stable(out: &str, data: &str) -> String {
     out.replace(data, "<data>")
         .split(',')
         .filter(|t| {
-            !(t.contains("_s\"")
+            !(t.contains("report_sha256")
+                || t.contains("_s\"")
                 || t.contains("seconds")
                 || t.contains("wall")
                 || t.contains("elapsed")
