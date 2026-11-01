@@ -238,7 +238,7 @@ rcsr ladder --data panel.rcsb --target y60 --return-col fwd60 --time ts --group 
 
 `--sr-run` scores the finalist of one search run on every fold; a fold that starts before the run's last seen row plus purge is refused (exit 3) unless `--allow-in-sample`, which labels it `oof:false` and drops it from every pooled statistic. `rcsr ablation score` applies the same check.
 
-`rcsr ablation` runs the add-one-family ablation under the decision rule committed in `protocol/ablation.json`: arms `A0` (B0) to `A5`, a fixed generation budget, 3 seeds per arm (5 with `--finalist`), one manifest per arm, a placebo arm and a circular-block-permuted arm. `rcsr --arm A1` writes the arm, the feature-list hash, the generation budget and the generations reached into run.json.
+`rcsr ablation` runs the add-one-family ablation under the decision rule committed in `protocol/ablation.json`: arms `A0` (B0) to `A5`, a fixed generation budget, 3 seeds per arm (5 with `--finalist`), one manifest per arm, a placebo arm and a circular-block-permuted arm. `rcsr ablation prepare` builds the null columns separately per segment of every guarded locked range and its purge band (`--purge-seconds`, `--target-spec`, default 219,600 s) and lists the segments in `<csv>.lockbox.json`. `rcsr --arm A1` writes the arm, the feature-list hash, the generation budget and the generations reached into run.json.
 
 ```sh
 rcsr ablation plan --definition protocol/ablation.json --data panel.rcsb --target y60 --time ts --group symbol \

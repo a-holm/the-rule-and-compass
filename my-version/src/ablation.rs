@@ -490,17 +490,95 @@ pub struct PrepareInput<'a> {
     /// Extra columns copied through (target, return, scale).
     pub keep: &'a [String],
     pub seed: u32,
-    /// Declared locked test: null columns are built per segment (before,
-    /// inside, after) so no locked value reaches a development row.
-    pub locked: Option<Lockbox>,
+    /// Every guarded locked range: null columns are built per elementary
+    /// segment between the range bounds and their purge bands, so no locked
+    /// value reaches a development row.
+    pub locked: Vec<Lockbox>,
+    /// Width of the purge band `[start - purge_seconds, start)` before each range.
+    pub purge_seconds: i64,
 }
 
-/// Segment of a time stamp relative to the locked test: 0 before, 1 inside, 2 after.
-pub fn segment_of(t: f64, locked: Option<&Lockbox>) -> u8 {
-    match locked {
-        Some(l) if t >= l.end as f64 => 2,
-        Some(l) if t >= l.start as f64 => 1,
-        _ => 0,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentKind {
+    Development,
+    Purge,
+    Locked,
+}
+
+impl SegmentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SegmentKind::Development => "development",
+            SegmentKind::Purge => "purge",
+            SegmentKind::Locked => "locked",
+        }
+    }
+}
+
+/// Row count of one segment, with its bounds (`None` = unbounded).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentRows {
+    pub kind: SegmentKind,
+    pub start: Option<i64>,
+    pub end: Option<i64>,
+    pub rows: usize,
+}
+
+impl SegmentRows {
+    pub fn json(&self) -> String {
+        let b = |v: Option<i64>| v.map_or("null".to_string(), |x| x.to_string());
+        format!("{{\"kind\":\"{}\",\"start\":{},\"end\":{},\"rows\":{}}}", self.kind.as_str(), b(self.start), b(self.end), self.rows)
+    }
+}
+
+/// The elementary intervals between the boundaries `{start - purge, start, end}`
+/// of every range. Ranges are never merged, so a value never crosses a boundary.
+pub struct Segments {
+    bounds: Vec<i64>,
+    ranges: Vec<Lockbox>,
+    purge: i64,
+}
+
+impl Segments {
+    pub fn new(ranges: &[Lockbox], purge: i64) -> Segments {
+        let purge = purge.max(0);
+        let mut bounds: Vec<i64> = ranges.iter().flat_map(|r| [r.start.saturating_sub(purge), r.start, r.end]).collect();
+        bounds.sort_unstable();
+        bounds.dedup();
+        Segments { bounds, ranges: ranges.to_vec(), purge }
+    }
+
+    /// Number of raw segments (one more than the boundaries).
+    pub fn len(&self) -> usize {
+        self.bounds.len() + 1
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Raw segment of a time stamp: the number of boundaries `<= t`.
+    pub fn raw(&self, t: f64) -> usize {
+        self.bounds.partition_point(|&b| (b as f64) <= t)
+    }
+
+    /// Bounds `[start, end)` of a raw segment.
+    pub fn span(&self, raw: usize) -> (Option<i64>, Option<i64>) {
+        (raw.checked_sub(1).map(|i| self.bounds[i]), self.bounds.get(raw).copied())
+    }
+
+    pub fn kind(&self, raw: usize) -> SegmentKind {
+        let (lo, hi) = self.span(raw);
+        let (Some(lo), Some(hi)) = (lo, hi) else {
+            return SegmentKind::Development;
+        };
+        if self.ranges.iter().any(|r| lo >= r.start && hi <= r.end) {
+            SegmentKind::Locked
+        } else if self.ranges.iter().any(|r| lo >= r.start.saturating_sub(self.purge) && hi <= r.start) {
+            SegmentKind::Purge
+        } else {
+            SegmentKind::Development
+        }
     }
 }
 
@@ -516,12 +594,12 @@ pub fn placebo_column_segmented(template: &[f64], groups: &[u64], segs: &[u8], s
     if segs.iter().all(|&s| s == segs[0]) {
         return placebo_column(template, groups, seed, k);
     }
+    let mut ids: Vec<u8> = segs.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
     let mut out = vec![f64::NAN; template.len()];
-    for s in 0..3u8 {
+    for s in ids {
         let idx: Vec<usize> = (0..template.len()).filter(|&i| segs[i] == s).collect();
-        if idx.is_empty() {
-            continue;
-        }
         let tpl: Vec<f64> = idx.iter().map(|&i| template[i]).collect();
         let g: Vec<u64> = idx.iter().map(|&i| groups[i]).collect();
         for (&j, v) in idx.iter().zip(placebo_column(&tpl, &g, seed, k)) {
@@ -537,8 +615,8 @@ pub fn prepare_csv(inp: &PrepareInput) -> Result<String, String> {
     prepare_csv_segments(inp).map(|(csv, _)| csv)
 }
 
-/// `prepare_csv` plus the row count of each segment (before, locked, after).
-pub fn prepare_csv_segments(inp: &PrepareInput) -> Result<(String, [usize; 3]), String> {
+/// `prepare_csv` plus every segment with its kind, bounds and row count.
+pub fn prepare_csv_segments(inp: &PrepareInput) -> Result<(String, Vec<SegmentRows>), String> {
     let t = inp.table;
     let def = inp.def;
     let n = t.len();
@@ -568,11 +646,27 @@ pub fn prepare_csv_segments(inp: &PrepareInput) -> Result<(String, [usize; 3]), 
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| gid[a].cmp(&gid[b]).then_with(|| time[a].total_cmp(&time[b])).then_with(|| a.cmp(&b)));
     let groups: Vec<u64> = order.iter().map(|&i| gid[i]).collect();
-    let segs: Vec<u8> = order.iter().map(|&i| segment_of(time[i], inp.locked.as_ref())).collect();
-    let mut seg_rows = [0usize; 3];
-    for &s in &segs {
-        seg_rows[s as usize] += 1;
+    let layout = Segments::new(&inp.locked, inp.purge_seconds);
+    let raws: Vec<usize> = order.iter().map(|&i| layout.raw(time[i])).collect();
+    let mut counts = vec![0usize; layout.len()];
+    for &r in &raws {
+        counts[r] += 1;
     }
+    let mut dense = vec![0usize; layout.len()];
+    let mut next = 0usize;
+    for (r, &c) in counts.iter().enumerate() {
+        if c > 0 {
+            dense[r] = next;
+            next += 1;
+        }
+    }
+    let segs: Vec<u8> = raws.iter().map(|&r| u8::try_from(dense[r]).map_err(|_| "more than 256 segments".to_string())).collect::<Result<_, _>>()?;
+    let seg_rows: Vec<SegmentRows> = (0..layout.len())
+        .map(|r| {
+            let (start, end) = layout.span(r);
+            SegmentRows { kind: layout.kind(r), start, end, rows: counts[r] }
+        })
+        .collect();
     let seg_groups = segment_keys(&groups, &segs);
 
     let real = def.real_columns();
@@ -1591,8 +1685,11 @@ fn usage() -> &'static str {
             writes <arm>.arm.json (arm, feature list, SHA-256, generation budget, seeds), plan.json,\n\
             a copy of the definition and commands.sh\n\
   prepare   --definition <file> --data <csv|rcsb> --time <col> --group <col> --out <csv> [--lockbox START,END]\n\
-            writes <csv>.lockbox.json (with the row count of each segment) when the data (or --lockbox) declares a locked test;\n\
-            placebo and permuted columns are built separately before, inside and after the locked test\n\
+            [--purge-seconds <s> | --target-spec <file>]\n\
+            writes <csv>.lockbox.json when the data (or --lockbox) declares a locked test: both ranges, purge_seconds, purge_source\n\
+            (flag, target_spec = the largest required purge of the file, or protocol_default 219600) and a segments list\n\
+            (kind development|purge|locked, start, end, rows). Placebo and permuted columns are built separately in every segment:\n\
+            before, inside and after every guarded range, and in the purge band [start - purge, start) before each range\n\
             [--keep a,b] [--seed 0]\n\
             writes the projection CSV with placebo and circular-block-permuted columns\n\
   score     (--run <run.json> | --from-run <run.json>) --data <csv|rcsb> --target <col> --time <col> --windows <file> --out <file>\n\
@@ -1726,7 +1823,26 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             };
             let seed: u32 = fl.opt("--seed").map_or(Ok(0), |s| s.parse().map_err(|_| (2, "--seed: invalid number".to_string())))?;
             let resolved = crate::lockbox::resolve(fl.opt("--lockbox"), data).map_err(|e| (e.exit, e.message))?;
-            let range = resolved.sidecar_range();
+            let (purge, purge_source) = match (fl.opt("--purge-seconds"), fl.opt("--target-spec")) {
+                (Some(c), _) => {
+                    let p: f64 = c.parse().map_err(|_| (2, "--purge-seconds: invalid number".to_string()))?;
+                    if !p.is_finite() || p < 0.0 {
+                        return Err((2, "--purge-seconds: must be a finite number >= 0".to_string()));
+                    }
+                    (p, "flag")
+                }
+                (None, Some(path)) => {
+                    let text = std::fs::read_to_string(path).map_err(|e| io_err(path, e))?;
+                    let specs = crate::target::parse_file(&text).map_err(|e| (3, format!("{}: {}", path, e)))?;
+                    match specs.iter().map(|s| s.required_purge_seconds()).reduce(f64::max) {
+                        Some(p) => (p, "target_spec"),
+                        None => (protocol::DEFAULT_PURGE_SECONDS, "protocol_default"),
+                    }
+                }
+                (None, None) => (protocol::DEFAULT_PURGE_SECONDS, "protocol_default"),
+            };
+            let purge = purge.ceil() as i64;
+            let ranges = resolved.ranges();
             let (csv, segments) = prepare_csv_segments(&PrepareInput {
                 table: &table,
                 def: &def,
@@ -1734,14 +1850,17 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 group: fl.need("--group")?,
                 keep: &keep,
                 seed,
-                locked: range,
+                locked: ranges,
+                purge_seconds: purge,
             })
             .map_err(|e| (3, e))?;
             let out = fl.need("--out")?;
             std::fs::write(out, csv).map_err(|e| io_err(out, e))?;
+            let range = resolved.sidecar_range();
             match &range {
                 Some(lb) => {
-                    let seg = format!(",\"segments\":{{\"before\":{},\"locked\":{},\"after\":{}}}", segments[0], segments[1], segments[2]);
+                    let list: Vec<String> = segments.iter().map(SegmentRows::json).collect();
+                    let seg = format!(",\"purge_seconds\":{},\"purge_source\":\"{}\",\"segments\":[{}]", purge, purge_source, list.join(","));
                     let extra = format!("{}{}", crate::lockbox::also_json(resolved.sidecar_also().as_ref(), "rcsr ablation prepare"), seg);
                     crate::lockbox::write_sidecar_with(out, lb, &format!("rcsr ablation prepare ({})", resolved.source.as_str()), &extra).map_err(|e| (3, e))?;
                 }
