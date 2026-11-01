@@ -445,6 +445,8 @@ pub struct GenCounters {
     /// #463: candidates dropped after the fit because they exceeded the
     /// complexity cap; each one re-enters variation.
     pub post_fit_drops: std::sync::atomic::AtomicU64,
+    /// #500: carried individuals re-scored at the start of a generation.
+    pub reevals: std::sync::atomic::AtomicU64,
     /// #477: offspring rejected before the fit because no input reaches the
     /// rows outside an aggregate or meta operator.
     pub constant: std::sync::atomic::AtomicU64,
@@ -934,6 +936,10 @@ impl Ind {
     fn reeval(&mut self, train: &EvalSample, cfg: &Config) {
         self.tree = expr::simplify(&self.tree);
         self.complexity = cfg.complexity_model.complexity(&self.tree);
+        self.score_in_place(train, cfg);
+    }
+
+    fn score_in_place(&mut self, train: &EvalSample, cfg: &Config) {
         // #25: re-evaluation must not resurrect a rejected candidate.
         let want_descriptor = cfg.qd_bins > 0 && !train.sample.is_multi();
         let (error, descriptor) = if cfg.accepts_dimensions(&self.tree) {
@@ -943,6 +949,23 @@ impl Ind {
         };
         self.error = error;
         self.descriptor = descriptor;
+    }
+
+    /// #500: `reeval` for an individual with a non-finite error. A `+inf` error
+    /// stays `+inf`, without a pass over every row, when the dimension filter
+    /// rejects the tree or a leading slice of the rows already holds a
+    /// non-finite prediction. Returns whether a full scoring pass ran.
+    fn reeval_probing(&mut self, train: &EvalSample, cfg: &Config) -> bool {
+        self.tree = expr::simplify(&self.tree);
+        self.complexity = cfg.complexity_model.complexity(&self.tree);
+        if self.error == f64::INFINITY
+            && (!cfg.accepts_dimensions(&self.tree) || prefix_is_non_finite(&self.tree, train, cfg))
+        {
+            self.descriptor = None;
+            return false;
+        }
+        self.score_in_place(train, cfg);
+        true
     }
 
     // #86: re-fit the constants on the current generation's fit rows *before*
@@ -2782,6 +2805,7 @@ fn score_pipeline_batch(
     let Some(g) = gpu.as_mut() else {
         return Err("pipeline scoring without a GPU evaluator".to_string());
     };
+    let offered_hash: Vec<u64> = jobs.iter().map(|(_, _, t)| expr::structural_hash(t)).collect();
     let (kept, errs) = eval_pipeline_jobs(g, &jobs, generation)?;
     if !kept.is_empty() {
         // #290: the overlap pipeline is a real device batch too; record it so
@@ -2792,7 +2816,8 @@ fn score_pipeline_batch(
         let (i, j) = (jobs[k].0, jobs[k].1);
         results[i][j] = Some(PipelineResult {
             error: e,
-            constants: None,
+            offered: offered_hash[k],
+            tree: None,
         });
     }
     let Some(fit) = fit else {
@@ -2833,11 +2858,12 @@ fn score_pipeline_batch(
         crate::fit::note_gpu_fit(false);
         results[i][j] = Some(PipelineResult {
             error: f64::NAN,
-            constants: None,
+            offered: offered_hash[k],
+            tree: None,
         });
     }
 
-    let mut fitted: Vec<(usize, Option<Vec<f64>>)> = Vec::new();
+    let mut fitted: Vec<usize> = Vec::new();
     if !plans.is_empty() {
         let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().map(|(_, p)| p).collect();
         // #236: slope always starts from the squared warm start and keeps the
@@ -2861,7 +2887,8 @@ fn score_pipeline_batch(
                 crate::fit::note_gpu_fit(false);
                 results[i][j] = Some(PipelineResult {
                     error: f64::NAN,
-                    constants: None,
+                    offered: offered_hash[*k],
+                    tree: None,
                 });
             }
         } else {
@@ -2875,7 +2902,7 @@ fn score_pipeline_batch(
                     g.fit_gpu += 1;
                     g.stats.entry(generation).or_default().fit_gpu += 1;
                     crate::fit::note_gpu_fit(true);
-                    fitted.push((*k, Some(res.c)));
+                    fitted.push(*k);
                 } else {
                     let (i, j) = (jobs[*k].0, jobs[*k].1);
                     let cause = if !finite {
@@ -2888,7 +2915,8 @@ fn score_pipeline_batch(
                     crate::fit::note_gpu_fit(false);
                     results[i][j] = Some(PipelineResult {
                         error: f64::NAN,
-                        constants: None,
+                        offered: offered_hash[*k],
+                        tree: None,
                     });
                     fallback_jobs.push(*k);
                 }
@@ -2935,25 +2963,27 @@ fn score_pipeline_batch(
             }
             job.tree = done.tree.clone();
             jobs[*k].2 = done.tree;
-            fitted.push((*k, None));
+            fitted.push(*k);
         }
     }
 
     if !fitted.is_empty() {
+        // #560: score the fitted tree after the post-fit simplify, as the
+        // synchronous path does, and hand that tree to the barrier.
         let refit: Vec<PipelineJob> = fitted
             .iter()
-            .map(|(k, _)| {
-                let (i, j, tree) = &jobs[*k];
-                (*i, *j, tree.clone())
+            .map(|&k| {
+                let (i, j, tree) = &jobs[k];
+                (*i, *j, expr::simplify(tree))
             })
             .collect();
         let (kept2, errs2) = eval_pipeline_jobs(g, &refit, generation)?;
-        for (pos, &err) in kept2.iter().zip(&errs2) {
-            let (k, constants) = &fitted[*pos];
-            let (i, j) = (jobs[*k].0, jobs[*k].1);
-            results[i][j] = Some(PipelineResult {
+        for (&pos, &err) in kept2.iter().zip(&errs2) {
+            let (i, j, tree) = &refit[pos];
+            results[*i][*j] = Some(PipelineResult {
                 error: err,
-                constants: constants.clone(),
+                offered: offered_hash[fitted[pos]],
+                tree: Some(tree.clone()),
             });
         }
     }
@@ -3627,6 +3657,35 @@ fn eval_error_and_descriptor(
         let descriptor = want_descriptor.then(|| qd::descriptor_from_prediction(tree, pred, nvars));
         (error, descriptor)
     })
+}
+
+/// #500: rows probed for a non-finite prediction before a full re-score.
+const INF_PROBE_ROWS: usize = 2048;
+
+/// #500: whether the first rows already hold a non-finite prediction, which
+/// makes the full score `+inf` for the plain metrics. Shapes whose score does
+/// not follow that rule (implicit, weighted, multi-output, descriptor, P&L
+/// book) report `false` and take the full pass.
+fn prefix_is_non_finite(tree: &Node, data: &EvalSample, cfg: &Config) -> bool {
+    let s = data.sample;
+    if s.is_empty()
+        || s.is_multi()
+        || !s.w.is_empty()
+        || cfg.metric.is_implicit()
+        || cfg.qd_bins > 0
+        || cfg.fitness.book().is_some()
+    {
+        return false;
+    }
+    let rows = s.x.len().min(INF_PROBE_ROWS);
+    if let Some(cols) = &data.cols {
+        if let Some(program) = crate::eval_soa::compile(tree) {
+            let mut pred = vec![0.0; rows];
+            crate::eval_soa::eval_batch(&program, cols, rows, &mut pred);
+            return pred.iter().any(|p| !p.is_finite());
+        }
+    }
+    s.x.iter().take(rows).any(|row| !eval(tree, row).is_finite())
 }
 
 /// #475: one candidate's prediction vector, owned.
@@ -4311,10 +4370,11 @@ fn maximum_status_fallback_cause(status: i32) -> FitFallbackCause {
 pub(crate) const WIDE_ADMISSION_ROWS: usize = 1 << 20;
 
 /// #393: the CPU path simplifies the tree and recomputes its complexity after a
-/// fit (`evolve_island`). The deferred path calls this for every candidate whose
-/// constants a device fit, a CPU fallback or the pipeline write-back replaced,
-/// so tie-breaks and the in-search archive see the fitted tree. A candidate the
-/// dimensional filter rejects keeps an infinite error, as in [`Ind::pending`].
+/// fit (`evolve_island`). `fit_pending` calls this for every candidate whose
+/// constants a device fit or a CPU fallback replaced, so tie-breaks and the
+/// in-search archive see the fitted tree; the overlap pipeline simplifies before
+/// it scores (`score_pipeline_batch`). A candidate the dimensional filter
+/// rejects keeps an infinite error, as in [`Ind::pending`].
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn refresh_after_fit(ind: &mut Ind, cfg: &Config) {
     ind.tree = expr::simplify(&ind.tree);
@@ -4967,15 +5027,17 @@ fn seed_seen(seen: &mut HashSet<u64>, next: &[Ind], parents: &[Ind]) {
 /// that island's `next` vector, and the tree to score.
 type PipelineJob = (usize, usize, Node);
 
-/// #286: one candidate's result from an overlap batch. `constants` are the
-/// fitted values to write back into the island's tree at the generation
-/// barrier; `None` means the candidate kept its screening constants (it had
-/// nothing to fit) and only `error` is meaningful.
+/// #286: one candidate's result from an overlap batch. #560: `error` belongs
+/// to `tree`, the fitted and simplified tree the barrier stores, or to the
+/// offered tree when `tree` is `None`. `offered` is the structural hash of the
+/// offered tree: a QD immigrant can replace an offered candidate in the same
+/// slot, and a result must never land on a tree it was not computed for.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[derive(Clone, Debug)]
 struct PipelineResult {
     error: f64,
-    constants: Option<Vec<f64>>,
+    offered: u64,
+    tree: Option<Node>,
 }
 
 /// #286: the device fit arm carried by the overlap queue when the admission
@@ -5093,8 +5155,8 @@ fn evolve_island(
 ) {
     if !screened {
         for ind in isl.iter_mut() {
-            if !ind.error.is_finite() {
-                ind.reeval(train, cfg); // #25
+            if !ind.error.is_finite() && ind.reeval_probing(train, cfg) {
+                GenCounters::count(counters, |c| &c.reevals); // #25 #500
             }
         }
     }
@@ -5284,25 +5346,34 @@ fn evolve_island(
         if let Some(target) = qd.and_then(|q| q.least_occupied_descriptor()) {
             let immigrants = (pop / 10).max(1).min(pop);
             let mut trees: Vec<Node> = Vec::with_capacity(immigrants);
+            let mut have_const_imm = filter_constant
+                && next[..pop - immigrants].iter().any(|i| !expr::row_dependent(&i.tree)); // #477
             for _ in 0..immigrants {
-                let mut t =
-                    random_tree_opts(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced);
-                let mut best_score = {
-                    let d = qd::descriptor(&t, train.sample);
-                    (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2)
-                };
-                for _ in 0..3 {
-                    let cand = random_tree_opts(
+                let hc = have_const_imm;
+                let t = draw_row_dependent(cfg, nvars, &mut have_const_imm, || {
+                    let mut t = random_tree_opts(
                         rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced,
                     );
-                    let d = qd::descriptor(&cand, train.sample);
-                    let score = (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2);
-                    if score < best_score {
-                        t = cand;
-                        best_score = score;
+                    let mut best_score = if hc && !expr::row_dependent(&t) {
+                        f64::INFINITY
+                    } else {
+                        let d = qd::descriptor(&t, train.sample);
+                        (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2)
+                    };
+                    for _ in 0..3 {
+                        let cand = random_tree_opts(
+                            rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced,
+                        );
+                        let d = qd::descriptor(&cand, train.sample);
+                        let score = (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2);
+                        if score < best_score && !(hc && !expr::row_dependent(&cand)) {
+                            t = cand;
+                            best_score = score;
+                        }
                     }
-                }
-                trees.push(expr::simplify(&t));
+                    expr::simplify(&t)
+                });
+                trees.push(t);
             }
             // Immigrants are fitted even when the batch defers scoring.
             let fit_immigrants = cfg.fit_iters > 0 && !train.sample.is_multi();
@@ -5323,9 +5394,13 @@ fn evolve_island(
     // whose result slots cover the first `pop` candidates only.
     if afp {
         let k = afp_immigrants(pop);
+        let mut have_const_afp =
+            filter_constant && next.iter().any(|i| !expr::row_dependent(&i.tree)); // #477
         let trees: Vec<Node> = (0..k)
             .map(|_| {
-                expr::simplify(&random_tree_opts(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced))
+                draw_row_dependent(cfg, nvars, &mut have_const_afp, || {
+                    expr::simplify(&random_tree_opts(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced))
+                })
             })
             .collect();
         next.extend(fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters));
@@ -6174,6 +6249,7 @@ fn dev_generation(
         eval_cpu_s: GenCounters::seconds(counters, |c| &c.eval_ns) + fallback_s,
         phase_b_s: GenCounters::seconds(counters, |c| &c.batch_ns),
         post_fit_drops: GenCounters::total(counters, |c| &c.post_fit_drops) as usize,
+        reevals: GenCounters::total(counters, |c| &c.reevals) as usize,
         constant_rejected: GenCounters::total(counters, |c| &c.constant) as usize,
         best_error,
         p05: q(0.05),
@@ -7724,19 +7800,25 @@ fn run_search(
                 if pipeline_active {
                     // Results are keyed by (island, slot), so the arrival order
                     // across concurrent island threads cannot change them.
-                    for (i, slots) in pipeline_results.iter().enumerate() {
-                        for (j, value) in slots.iter().enumerate() {
-                            if let Some(r) = value {
-                                if let Some(c) = &r.constants {
-                                    if let Ok(plan) =
-                                        crate::fit::gpu_fit_plan_reason(&islands[i][j].tree)
-                                    {
-                                        plan.apply(&mut islands[i][j].tree, c);
-                                        refresh_after_fit(&mut islands[i][j], cfg);
-                                    }
-                                }
-                                islands[i][j].error = r.error;
+                    // #560: a result for a replaced candidate is dropped, which
+                    // leaves the slot pending for `score_generation` below; a
+                    // rejected dimension keeps its infinite error.
+                    for (i, slots) in pipeline_results.iter_mut().enumerate() {
+                        for (j, value) in slots.iter_mut().enumerate() {
+                            let Some(r) = value.take() else { continue };
+                            let ind = &mut islands[i][j];
+                            if expr::structural_hash(&ind.tree) != r.offered {
+                                continue;
                             }
+                            if let Some(tree) = r.tree {
+                                ind.complexity = cfg.complexity_model.complexity(&tree);
+                                ind.tree = tree;
+                            }
+                            ind.error = if cfg.accepts_dimensions(&ind.tree) {
+                                r.error
+                            } else {
+                                f64::INFINITY
+                            };
                         }
                     }
                     if pipeline_error.is_none() {
@@ -8108,42 +8190,47 @@ fn run_search(
                         };
                         let mut have_const = false; // #477
                         for ind in islands[ii].iter_mut() {
+                            let hc = have_const; // #477
                             let mut t = draw_row_dependent(cfg, nvars, &mut have_const, || {
-                                random_tree_opts(
+                                let mut t = random_tree_opts(
                                     &mut r,
                                     nvars,
                                     &cfg.ops,
                                     cfg.init_depth,
                                     Some(&aggs),
                                     cfg.tree_arity == TreeArity::Balanced,
-                                )
-                            });
-                            if let Some(target) = qd_target {
-                                let mut best = t.clone();
-                                let mut best_d = qd::descriptor(&t, gen_train);
-                                let mut best_score = (best_d.usage - target.usage).powi(2)
-                                    + (best_d.skew - target.skew).powi(2);
-                                for _ in 0..3 {
-                                    let cand = random_tree_opts(
-                                        &mut r,
-                                        nvars,
-                                        &cfg.ops,
-                                        cfg.init_depth,
-                                        Some(&aggs),
-                                        cfg.tree_arity == TreeArity::Balanced,
-                                    );
-                                    let d = qd::descriptor(&cand, gen_train);
-                                    let score = (d.usage - target.usage).powi(2)
-                                        + (d.skew - target.skew).powi(2);
-                                    if score < best_score {
-                                        best = cand;
-                                        best_d = d;
-                                        best_score = score;
+                                );
+                                if let Some(target) = qd_target {
+                                    let mut best = t.clone();
+                                    let mut best_d = qd::descriptor(&t, gen_train);
+                                    let mut best_score = if hc && !expr::row_dependent(&t) {
+                                        f64::INFINITY
+                                    } else {
+                                        (best_d.usage - target.usage).powi(2) + (best_d.skew - target.skew).powi(2)
+                                    };
+                                    for _ in 0..3 {
+                                        let cand = random_tree_opts(
+                                            &mut r,
+                                            nvars,
+                                            &cfg.ops,
+                                            cfg.init_depth,
+                                            Some(&aggs),
+                                            cfg.tree_arity == TreeArity::Balanced,
+                                        );
+                                        let d = qd::descriptor(&cand, gen_train);
+                                        let score = (d.usage - target.usage).powi(2)
+                                            + (d.skew - target.skew).powi(2);
+                                        if score < best_score && !(hc && !expr::row_dependent(&cand)) {
+                                            best = cand;
+                                            best_d = d;
+                                            best_score = score;
+                                        }
                                     }
+                                    let _ = best_d;
+                                    t = best;
                                 }
-                                let _ = best_d;
-                                t = best;
-                            }
+                                t
+                            });
                             if cfg.linear_scaling {
                                 t = crate::scale::ensure(t, 0.0, 1.0); // #470
                             }
@@ -10695,6 +10782,101 @@ mod tests {
         let rebuilt = Ind::pending(input(0), &cfg);
         assert_eq!(rebuilt.age, 0);
         assert_eq!(Ind::evaluated(input(0), &data, &cfg).age, 0);
+    }
+
+    /// #500: trees whose predictions are non-finite on every row, one of them
+    /// with a subtree that `expr::simplify` rewrites, mixed with finite ones.
+    fn inf_population(data: &EvalSample, cfg: &Config) -> Vec<Ind> {
+        (0..40)
+            .map(|i| {
+                let tree = match i % 4 {
+                    0 => node(Op::Div, vec![input(0), constant(0.0)]),
+                    1 => node(
+                        Op::Add,
+                        vec![
+                            node(Op::Div, vec![input(0), constant(0.0)]),
+                            node(Op::Add, vec![constant(1.0), constant(2.0)]),
+                        ],
+                    ),
+                    _ => node(Op::Add, vec![input(0), constant(i as f64)]),
+                };
+                Ind::evaluated(tree, data, cfg)
+            })
+            .collect()
+    }
+
+    fn same_state(a: &Ind, b: &Ind) -> bool {
+        a.tree == b.tree
+            && a.error.to_bits() == b.error.to_bits()
+            && a.complexity.to_bits() == b.complexity.to_bits()
+            && a.descriptor == b.descriptor
+    }
+
+    /// #500: probing a `+inf` individual leaves exactly the state a full
+    /// re-score leaves, and runs no scoring pass for a tree that is non-finite
+    /// on the probed rows.
+    #[test]
+    fn skipping_inf_reeval_keeps_the_cpu_trajectory() {
+        let s = sample();
+        let cfg = Config::default();
+        let data = EvalSample::new(&s, &cfg);
+        let mut ran = 0;
+        for ind in inf_population(&data, &cfg) {
+            let mut full = ind.clone();
+            full.reeval(&data, &cfg);
+            let mut probed = ind.clone();
+            if probed.reeval_probing(&data, &cfg) {
+                ran += 1;
+            }
+            assert!(same_state(&full, &probed));
+        }
+        assert_eq!(ran, 20, "only the finite trees are scored again");
+    }
+
+    /// #500: a `+inf` error that the exact CPU score does not reproduce (a
+    /// device overflow) and a pending `NaN` are scored in full.
+    #[test]
+    fn inf_reeval_runs_when_the_prediction_is_finite() {
+        let s = sample();
+        let cfg = Config::default();
+        let data = EvalSample::new(&s, &cfg);
+        let mut spurious = Ind::evaluated(input(0), &data, &cfg);
+        spurious.error = f64::INFINITY;
+        assert!(spurious.reeval_probing(&data, &cfg));
+        assert!(spurious.error.is_finite());
+        let mut pending = Ind::evaluated(input(0), &data, &cfg);
+        pending.error = f64::NAN;
+        assert!(pending.reeval_probing(&data, &cfg));
+        assert!(pending.error.is_finite());
+    }
+
+    /// #500: shapes whose `+inf` rule differs from the plain metrics take the
+    /// full pass, and the island counts the passes it runs.
+    #[test]
+    fn inf_probe_is_limited_to_the_plain_metrics() {
+        let s = sample();
+        let mut weighted = sample();
+        weighted.w = vec![1.0; weighted.y.len()];
+        let cfg = Config::default();
+        let tree = node(Op::Div, vec![input(0), constant(0.0)]);
+        let data = EvalSample::new(&s, &cfg);
+        assert!(prefix_is_non_finite(&tree, &data, &cfg));
+        assert!(!prefix_is_non_finite(&tree, &EvalSample::new(&weighted, &cfg), &cfg));
+        let mut qd = Config::default();
+        qd.qd_bins = 4;
+        assert!(!prefix_is_non_finite(&tree, &EvalSample::new(&s, &qd), &qd));
+
+        let aggs = AggTable::from_sample(&s);
+        let mut cfg = Config::default();
+        cfg.pop = 40;
+        let data = EvalSample::new(&s, &cfg);
+        let mut isl = inf_population(&data, &cfg);
+        let counters = GenCounters::default();
+        evolve_island(
+            &mut isl, &mut Mt::new(5), &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None,
+            false, 0, None, Some(&counters), 1, &mut MixWindow::new(),
+        );
+        assert_eq!(GenCounters::total(Some(&counters), |c| &c.reevals), 0);
     }
 
     /// #465: migration replaces the member of the highest Pareto rank.

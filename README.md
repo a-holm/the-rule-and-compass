@@ -240,7 +240,7 @@ rcsr ladder --data panel.rcsb --target y60 --return-col fwd60 --time ts --group 
 
 `--sr-run` scores the finalist of one search run on every fold; a fold that starts before the run's last seen row plus purge is refused (exit 3) unless `--allow-in-sample`, which labels it `oof:false` and drops it from every pooled statistic. `rcsr ablation score` applies the same check.
 
-`rcsr ablation` runs the add-one-family ablation under the decision rule committed in `protocol/ablation.json`: arms `A0` (B0) to `A5`, a fixed generation budget, 3 seeds per arm (5 with `--finalist`), one manifest per arm, a placebo arm and a circular-block-permuted arm. `rcsr --arm A1` writes the arm, the feature-list hash, the generation budget and the generations reached into run.json.
+`rcsr ablation` runs the add-one-family ablation under the decision rule committed in `protocol/ablation.json`: arms `A0` (B0) to `A5`, a fixed generation budget, 3 seeds per arm (5 with `--finalist`), one manifest per arm, a placebo arm and a circular-block-permuted arm. `rcsr ablation prepare` builds the null columns separately per segment of every guarded locked range and its purge band (`--purge-seconds`, `--target-spec`, default 219,600 s) and lists the segments in `<csv>.lockbox.json`. `rcsr --arm A1` writes the arm, the feature-list hash, the generation budget and the generations reached into run.json.
 
 ```sh
 rcsr ablation plan --definition protocol/ablation.json --data panel.rcsb --target y60 --time ts --group symbol \
@@ -627,7 +627,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--objective mse|pnl|sharpe|log_growth] [--position long_only|top_tercile] [--threshold f]
      [--cost-bps f | --cost-override f] [--slippage-bps f] [--cash-return f] [--funding col]
      [--max-position f] [--min-trades n] [--min-holding n] [--allow-short]
-     [--fitness metric|pnl]
+     [--fitness metric|pnl] [--pnl-blocks K] [--pnl-block-lambda L]
+|pnl]
      [--equivalence-z z] [--noise-lag n|auto]
      [--allow-lockbox] [--lockbox START,END|none] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure] [--require-clean-inputs]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
@@ -768,8 +769,12 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   On the GPU the device scores the regret natively, fused with the program interpreter
   (`search_fitness.scorer_backend` `cuda`); it equals the CPU book on the device's own `f32`
   predictions bit for bit, and every reported value stays exact CPU `f64`. Resume needs the
-  same cost, threshold and rows. `--json` adds `search_fitness` and a `fitness` block per
-  Pareto member. See
+  same cost, threshold and rows. `--pnl-blocks K` (1 to 8, default 1 = off) cuts the training
+  timestamps into `K` blocks, scores each as its own long/flat book and ranks by the mean block
+  regret plus `--pnl-block-lambda` (default 1.0) times their standard deviation, so a formula
+  that earns in one regime only scores worse; the device computes it bit for bit like the CPU.
+  `--json` adds `search_fitness` and a `fitness` block per
+  Pareto member (`block_regret` with blocks). See
   [`docs/walkforward.md`](docs/walkforward.md) and
   [`docs/optimisation.md`](docs/optimisation.md).
 * Time-ordered runs, runs with a target spec and runs with `--require-validation`

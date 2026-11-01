@@ -426,3 +426,128 @@ fn resume_needs_the_same_book() {
     let no_flag = run(&data, &spec, &["--generations", "20", "--resume", &cp]);
     usage_error(&no_flag, "--fitness pnl");
 }
+
+// ---- #484: time-block consistency term ----
+
+/// Rows 0..REGIME_ROWS pay `+0.08 x1`, later rows pay `-0.008 x1`; `x2` pays
+/// `+0.006` in every row.
+const REGIME_ROWS: usize = 90;
+
+fn write_regime_csv(dir: &std::path::Path) -> String {
+    let mut text = String::from("t,x1,x2,r,y\n");
+    for i in 0..N {
+        let f = i as f64;
+        let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+        let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+        let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+        let c1 = if i < REGIME_ROWS { 0.08 } else { -0.008 };
+        let r = c1 * x1 + 0.006 * x2 + 0.0005 * noise;
+        text.push_str(&format!("{},{},{},{},{}\n", T0 + 900 * i as i64, x1, x2, r, r));
+    }
+    let path = dir.join("regime.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn members(j: &Json) -> Vec<(String, u64)> {
+    pareto(j)
+        .iter()
+        .map(|m| (at(m, &["expression"]).as_str().unwrap().to_string(), num(m, &["fitness", "train_regret"]).to_bits()))
+        .collect()
+}
+
+fn best_expression(j: &Json) -> String {
+    pareto(j)
+        .iter()
+        .min_by(|a, b| num(a, &["fitness", "train_regret"]).total_cmp(&num(b, &["fitness", "train_regret"])))
+        .map(|m| at(m, &["expression"]).as_str().unwrap().to_string())
+        .unwrap()
+}
+
+#[test]
+fn one_block_is_the_unblocked_fitness() {
+    let dir = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let plain = run(&data, &spec, &["--fitness", "pnl"]);
+    let one = run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "1", "--pnl-block-lambda", "4"]);
+    let (a, b) = (json(&plain), json(&one));
+    assert_eq!(members(&a), members(&b));
+    assert_eq!(at(&a, &["search_fitness"]).get("book_hash"), at(&b, &["search_fitness"]).get("book_hash"));
+    assert!(at(&b, &["search_fitness"]).get("blocks").is_none());
+    assert!(pareto(&b).iter().all(|m| at(m, &["fitness"]).get("block_regret").is_none()));
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout).replace(|c: char| c.is_ascii_digit() || c == '.', ""),
+        String::from_utf8_lossy(&one.stdout).replace(|c: char| c.is_ascii_digit() || c == '.', "")
+    );
+}
+
+#[test]
+fn blocks_report_per_block_regret_and_are_thread_invariant() {
+    let dir = scratch();
+    let data = write_regime_csv(&dir);
+    let spec = write_spec(&dir);
+    let args = ["--fitness", "pnl", "--pnl-blocks", "4", "--pnl-block-lambda", "1"];
+    let one = json(&run(&data, &spec, &[&args[..], &["--threads", "1"]].concat()));
+    let four = json(&run(&data, &spec, &[&args[..], &["--threads", "4"]].concat()));
+    assert_eq!(members(&one), members(&four));
+    let f = at(&one, &["search_fitness"]);
+    assert_eq!(num(f, &["blocks"]), 4.0);
+    assert_eq!(num(f, &["lambda"]), 1.0);
+    match at(f, &["block_bounds"]) {
+        Json::Arr(a) => assert!(a.len() == 4 && a.iter().all(|v| v.as_f64().unwrap() > 0.0)),
+        _ => panic!("block_bounds is not an array"),
+    }
+    for m in pareto(&one) {
+        let r: Vec<f64> = match at(m, &["fitness", "block_regret"]) {
+            Json::Arr(a) => a.iter().map(|v| v.as_f64().unwrap()).collect(),
+            _ => panic!("block_regret is not an array"),
+        };
+        assert_eq!(r.len(), 4);
+        let mean = r.iter().sum::<f64>() / 4.0;
+        let sd = (r.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / 3.0).sqrt();
+        let fit = num(m, &["fitness", "train_regret"]);
+        assert!((fit - (mean + sd)).abs() <= 1e-9, "{fit} vs {}", mean + sd);
+    }
+}
+
+#[test]
+fn the_block_term_prefers_the_steady_signal() {
+    let dir = scratch();
+    let data = write_regime_csv(&dir);
+    let spec = write_spec(&dir);
+    let pooled = json(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "1"]));
+    let blocked = json(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "4", "--pnl-block-lambda", "1"]));
+    let (p, b) = (best_expression(&pooled), best_expression(&blocked));
+    assert!(p.contains("x1"), "pooled best: {p}");
+    assert!(b.contains("x2") && !b.contains("x1"), "blocked best: {b}");
+}
+
+#[test]
+fn block_flags_name_their_reason() {
+    let dir = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    usage_error(&run(&data, &spec, &["--pnl-blocks", "4"]), "--pnl-blocks needs --fitness pnl");
+    usage_error(&run(&data, &spec, &["--pnl-block-lambda", "2"]), "--pnl-block-lambda needs --fitness pnl");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "9"]), "--pnl-blocks must be");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "0"]), "--pnl-blocks must be");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-block-lambda", "-1"]), "--pnl-block-lambda must be");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-block-lambda", "nan"]), "--pnl-block-lambda must be");
+}
+
+#[test]
+fn resume_needs_the_same_blocks() {
+    let dir = scratch();
+    let data = write_regime_csv(&dir);
+    let spec = write_spec(&dir);
+    let cp = dir.join("cp.rcsr").to_string_lossy().into_owned();
+    let blocked = ["--fitness", "pnl", "--pnl-blocks", "3"];
+    let first = run(&data, &spec, &[&blocked[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let straight = json(&run(&data, &spec, &[&blocked[..], &["--generations", "20"]].concat()));
+    let resumed = json(&run(&data, &spec, &[&blocked[..], &["--generations", "20", "--resume", &cp]].concat()));
+    assert_eq!(members(&straight), members(&resumed));
+    let other = run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "4", "--generations", "20", "--resume", &cp]);
+    usage_error(&other, "fitness");
+}

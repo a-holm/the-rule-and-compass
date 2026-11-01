@@ -226,7 +226,7 @@ fn prepare_writes_placebo_and_permuted_columns_next_to_the_real_ones() {
         }
     }
     let table = data::parse_table(&csv).unwrap();
-    let out = ablation::prepare_csv(&ablation::PrepareInput { table: &table, def: &d, time: "ts", group: "sym", keep: &["y".to_string()], seed: 3, locked: None }).unwrap();
+    let out = ablation::prepare_csv(&ablation::PrepareInput { table: &table, def: &d, time: "ts", group: "sym", keep: &["y".to_string()], seed: 3, locked: Vec::new(), purge_seconds: 0 }).unwrap();
     let prepared = data::parse_table(&out).unwrap();
     assert_eq!(prepared.names, vec!["ts", "sym", "y", "b", "f1", "f2", "p1", "placebo_1", "placebo_2", "perm_f1", "perm_f2"]);
     assert_eq!(prepared.len(), 600);
@@ -261,11 +261,26 @@ fn two_stores_csv(flipped: bool, flip_from: i64) -> String {
     csv
 }
 
-fn prepare_rows(csv: &str, locked: Option<rcsr::lockbox::Lockbox>) -> (Vec<String>, [usize; 3]) {
+fn prepare_segments(csv: &str, locked: &[rcsr::lockbox::Lockbox], purge_seconds: i64) -> (Vec<String>, Vec<ablation::SegmentRows>) {
     let d = ablation::parse_definition(NULL_DEF).unwrap();
     let table = data::parse_table(csv).unwrap();
-    let (out, seg) = ablation::prepare_csv_segments(&ablation::PrepareInput { table: &table, def: &d, time: "ts", group: "sym", keep: &["y".to_string()], seed: 3, locked }).unwrap();
+    let (out, seg) = ablation::prepare_csv_segments(&ablation::PrepareInput {
+        table: &table,
+        def: &d,
+        time: "ts",
+        group: "sym",
+        keep: &["y".to_string()],
+        seed: 3,
+        locked: locked.to_vec(),
+        purge_seconds,
+    })
+    .unwrap();
     (out.lines().map(|l| l.to_string()).collect(), seg)
+}
+
+fn prepare_rows(csv: &str, locked: Option<rcsr::lockbox::Lockbox>) -> (Vec<String>, Vec<usize>) {
+    let (rows, seg) = prepare_segments(csv, locked.as_slice(), 0);
+    (rows, seg.iter().map(|s| s.rows).collect())
 }
 
 #[test]
@@ -289,13 +304,265 @@ fn null_columns_on_development_rows_ignore_the_locked_range() {
 
 #[test]
 fn a_range_outside_the_data_changes_nothing() {
+    use rcsr::lockbox::Lockbox;
     let csv = two_stores_csv(false, 200);
     let (plain, seg) = prepare_rows(&csv, None);
-    assert_eq!(seg, [600, 0, 0]);
-    let far = rcsr::lockbox::Lockbox { start: 2_000_000_000, end: 2_100_000_000 };
-    let (outside, seg) = prepare_rows(&csv, Some(far));
-    assert_eq!(seg, [600, 0, 0]);
-    assert_eq!(plain, outside);
+    assert_eq!(seg, [600]);
+    let before = Lockbox { start: 100, end: 200 };
+    let after = Lockbox { start: 2_000_000_000, end: 2_100_000_000 };
+    for ranges in [vec![before], vec![after], vec![before, after]] {
+        for purge in [0, 219_600] {
+            let (outside, seg) = prepare_segments(&csv, &ranges, purge);
+            let counts: Vec<usize> = seg.iter().map(|s| s.rows).collect();
+            assert_eq!(counts.iter().sum::<usize>(), 600);
+            assert_eq!(counts.iter().filter(|&&c| c > 0).count(), 1, "one non-empty segment");
+            assert_eq!(plain, outside, "{:?} with purge {}", ranges, purge);
+        }
+    }
+}
+
+const HOUR: i64 = 3600;
+const H0: i64 = 1_704_067_200;
+const ROWS: i64 = 5280;
+const PURGE: i64 = 219_600;
+
+fn range_of(from: &str, to: &str) -> rcsr::lockbox::Lockbox {
+    rcsr::lockbox::Lockbox::parse(&format!("{},{}", from, to)).unwrap()
+}
+
+/// 2 symbols x 5,280 hourly rows from 2024-01-01. Rows inside any `redraw`
+/// interval hold other values, so two files differ only inside those intervals.
+fn hourly_csv(redraw: &[(i64, i64)]) -> String {
+    let mut csv = String::from("ts,sym,y,b,f1,f2,p1\n");
+    for (si, s) in ["a", "b"].iter().enumerate() {
+        let mut base = Mt::new(30 + si as u32);
+        let mut alt = Mt::new(700 + si as u32);
+        for k in 0..ROWS {
+            let t = H0 + k * HOUR;
+            let v: Vec<f64> = (0..4).map(|_| gauss(&mut base)).collect();
+            let w: Vec<f64> = (0..4).map(|_| gauss(&mut alt)).collect();
+            let use_alt = redraw.iter().any(|&(lo, hi)| t >= lo && t < hi);
+            let (u, p) = if use_alt { (&w, (k % 3 == 0) as i32) } else { (&v, (k % 7 == 0) as i32) };
+            csv.push_str(&format!("{},{},{},{},{},{},{}\n", t, s, u[0], u[1], u[2], u[3], p));
+        }
+    }
+    csv
+}
+
+fn row_time(line: &str) -> i64 {
+    line.split(',').next().unwrap().parse().unwrap()
+}
+
+fn rows_where(rows: &[String], keep: impl Fn(i64) -> bool) -> Vec<String> {
+    rows[1..].iter().filter(|l| keep(row_time(l))).cloned().collect()
+}
+
+#[test]
+fn null_columns_ignore_both_declared_ranges() {
+    let (r1, r2) = (range_of("2024-03-01", "2024-04-01"), range_of("2024-06-01", "2024-07-01"));
+    let base = hourly_csv(&[]);
+    for purge in [PURGE, 0] {
+        let (a, _) = prepare_segments(&base, &[r1, r2], purge);
+        for (inside, label) in [(r1, "R1"), (r2, "R2")] {
+            let (b, _) = prepare_segments(&hourly_csv(&[(inside.start, inside.end)]), &[r1, r2], purge);
+            assert_ne!(a, b, "{} rows differ", label);
+            let dev = |t: i64| t < r1.start - purge || (t >= r1.end && t < r2.start - purge) || t >= r2.end;
+            let (da, db) = (rows_where(&a, dev), rows_where(&b, dev));
+            assert!(da.len() > 7000, "development rows: {}", da.len());
+            assert_eq!(da, db, "purge {}: development rows ignore values inside {}", purge, label);
+        }
+    }
+}
+
+#[test]
+fn purge_band_is_its_own_segment() {
+    let s = range_of("2024-06-01", "2024-07-01");
+    let a = hourly_csv(&[]);
+    let b = hourly_csv(&[(s.start - PURGE, s.start)]);
+    let (ra, seg) = prepare_segments(&a, &[s], PURGE);
+    let (rb, _) = prepare_segments(&b, &[s], PURGE);
+    let kinds: Vec<_> = seg.iter().map(|x| x.kind).collect();
+    assert_eq!(kinds, [ablation::SegmentKind::Development, ablation::SegmentKind::Purge, ablation::SegmentKind::Locked, ablation::SegmentKind::Development]);
+    assert_eq!(rows_where(&ra, |t| t < s.start - PURGE), rows_where(&rb, |t| t < s.start - PURGE));
+    assert_eq!(rows_where(&ra, |t| t >= s.start), rows_where(&rb, |t| t >= s.start));
+    assert_ne!(rows_where(&ra, |t| t >= s.start - PURGE && t < s.start), rows_where(&rb, |t| t >= s.start - PURGE && t < s.start));
+}
+
+#[test]
+fn overlapping_and_adjacent_ranges_split_into_elementary_segments() {
+    use ablation::SegmentKind::{Development as D, Locked as L, Purge as P};
+    use rcsr::lockbox::Lockbox;
+    let lb = |start, end| Lockbox { start, end };
+    let layout = |ranges: &[Lockbox], purge| {
+        let s = ablation::Segments::new(ranges, purge);
+        (0..s.len()).map(|r| (s.kind(r), s.span(r))).collect::<Vec<_>>()
+    };
+    let span = |a, b| (Some(a), Some(b));
+
+    let overlap = layout(&[lb(100, 200), lb(150, 300)], 10);
+    assert_eq!(
+        overlap,
+        [(D, (None, Some(90))), (P, span(90, 100)), (L, span(100, 140)), (L, span(140, 150)), (L, span(150, 200)), (L, span(200, 300)), (D, (Some(300), None))]
+    );
+    let nested = layout(&[lb(100, 300), lb(150, 200)], 0);
+    assert_eq!(nested, [(D, (None, Some(100))), (L, span(100, 150)), (L, span(150, 200)), (L, span(200, 300)), (D, (Some(300), None))]);
+    let adjacent = layout(&[lb(100, 200), lb(200, 300)], 10);
+    assert_eq!(adjacent, [(D, (None, Some(90))), (P, span(90, 100)), (L, span(100, 190)), (L, span(190, 200)), (L, span(200, 300)), (D, (Some(300), None))]);
+    let touching = layout(&[lb(100, 200), lb(200, 300)], 0);
+    assert_eq!(touching, [(D, (None, Some(100))), (L, span(100, 200)), (L, span(200, 300)), (D, (Some(300), None))]);
+    let gap = layout(&[lb(100, 200), lb(400, 500)], 50);
+    assert_eq!(gap.iter().map(|x| x.0).collect::<Vec<_>>(), [D, P, L, D, P, L, D]);
+
+    let s = ablation::Segments::new(&[lb(100, 200)], 10);
+    assert_eq!((s.raw(89.9), s.raw(90.0), s.raw(99.0), s.raw(100.0), s.raw(199.0), s.raw(200.0)), (0, 1, 1, 2, 2, 3));
+}
+
+#[test]
+fn one_range_without_purge_is_unchanged() {
+    use rcsr::lockbox::{self, Lockbox};
+    let start = 1_000_000 + 200 * 60;
+    let lb = Lockbox { start, end: start + 100 * 60 };
+    let dir = scratch("one-range");
+    let raw = dir.join("raw.csv");
+    std::fs::write(&raw, two_stores_csv(false, 200)).unwrap();
+    lockbox::write_sidecar(raw.to_str().unwrap(), &lb, "test").unwrap();
+    let def = dir.join("def.json");
+    std::fs::write(&def, NULL_DEF).unwrap();
+    let out = dir.join("prepared.csv");
+    let run = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(["ablation", "prepare", "--definition", def.to_str().unwrap(), "--data", raw.to_str().unwrap(), "--time", "ts", "--group", "sym"])
+        .args(["--keep", "y", "--seed", "3", "--purge-seconds", "0", "--out", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(0), "{}", String::from_utf8_lossy(&run.stderr));
+    let sha = rcsr::manifest::sha256_hex(&std::fs::read(&out).unwrap());
+    assert_eq!(sha, PINNED_ONE_RANGE_SHA256);
+}
+
+const PINNED_ONE_RANGE_SHA256: &str = "bcd7b921418ae0fe5339195fa4b3aa4c158cf3c808547a9b7c17336cca96a023";
+
+fn prepare_cli(dir: &std::path::Path, data: &str, out: &str, extra: &[&str]) -> std::process::Output {
+    let def = dir.join("def.json");
+    std::fs::write(&def, NULL_DEF).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(["ablation", "prepare", "--definition", def.to_str().unwrap(), "--data", data, "--time", "ts", "--group", "sym"])
+        .args(["--keep", "y", "--seed", "3", "--out", out])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+fn sidecar_rows(out: &str) -> Vec<usize> {
+    let text = std::fs::read_to_string(rcsr::lockbox::sidecar_path(out)).unwrap();
+    let list = &text[text.find("\"segments\":[").expect("segments list") + 12..];
+    list[..list.find(']').unwrap()].split("\"rows\":").skip(1).map(|p| p.split('}').next().unwrap().parse().unwrap()).collect()
+}
+
+#[test]
+fn a_flag_range_disjoint_from_the_protocol_default_is_segmented() {
+    let dir = scratch("flag-range");
+    let (a, b) = (dir.join("A.csv"), dir.join("B.csv"));
+    let f = range_of("2024-06-01", "2024-07-01");
+    assert_eq!((f.start, f.end), (1_717_200_000, 1_719_792_000));
+    std::fs::write(&a, hourly_csv(&[])).unwrap();
+    std::fs::write(&b, hourly_csv(&[(f.start, f.end)])).unwrap();
+    let flag = format!("{},{}", f.start, f.end);
+    let (oa, ob) = (dir.join("oa.csv"), dir.join("ob.csv"));
+    for (src, out) in [(&a, &oa), (&b, &ob)] {
+        let run = prepare_cli(&dir, src.to_str().unwrap(), out.to_str().unwrap(), &["--lockbox", &flag]);
+        assert_eq!(run.status.code(), Some(0), "{}", String::from_utf8_lossy(&run.stderr));
+    }
+    assert_eq!(sidecar_rows(oa.to_str().unwrap()), [7174, 122, 1440, 1824, 0, 0, 0]);
+    let side = std::fs::read_to_string(rcsr::lockbox::sidecar_path(oa.to_str().unwrap())).unwrap();
+    assert!(side.contains("\"purge_seconds\":219600,\"purge_source\":\"protocol_default\""), "{}", side);
+    let (ta, tb) = (std::fs::read_to_string(&oa).unwrap(), std::fs::read_to_string(&ob).unwrap());
+    let rows = |t: &str| t.lines().map(str::to_string).collect::<Vec<_>>();
+    let (ra, rb) = (rows(&ta), rows(&tb));
+    let before = |t: i64| t < f.start - PURGE;
+    let after = |t: i64| t >= f.end;
+    assert_eq!(rows_where(&ra, before).len(), 7174);
+    assert_eq!(rows_where(&ra, before), rows_where(&rb, before));
+    assert_eq!(rows_where(&ra, after).len(), 1824);
+    assert_eq!(rows_where(&ra, after), rows_where(&rb, after));
+}
+
+#[test]
+fn a_second_prepare_keeps_the_range_roles() {
+    use rcsr::lockbox;
+    let dir = scratch("roles");
+    let a = dir.join("A.csv");
+    std::fs::write(&a, hourly_csv(&[])).unwrap();
+    let f = range_of("2024-06-01", "2024-07-01");
+    let flag = format!("{},{}", f.start, f.end);
+    let (o1, o2) = (dir.join("o1.csv"), dir.join("o2.csv"));
+    let run = prepare_cli(&dir, a.to_str().unwrap(), o1.to_str().unwrap(), &["--lockbox", &flag]);
+    assert_eq!(run.status.code(), Some(0), "{}", String::from_utf8_lossy(&run.stderr));
+    let run = prepare_cli(&dir, o1.to_str().unwrap(), o2.to_str().unwrap(), &[]);
+    assert_eq!(run.status.code(), Some(0), "{}", String::from_utf8_lossy(&run.stderr));
+    let roles = |p: &std::path::Path| lockbox::stored_all(p.to_str().unwrap()).unwrap().map(|s| (s.range, s.also));
+    assert_eq!(roles(&o1), Some((lockbox::protocol_default(), Some(f))));
+    assert_eq!(roles(&o2), roles(&o1));
+    assert_eq!(sidecar_rows(o2.to_str().unwrap()).iter().sum::<usize>(), 10560);
+}
+
+#[test]
+fn a_two_range_sidecar_segments_both_ranges_through_the_cli() {
+    use rcsr::lockbox;
+    let dir = scratch("two-range-sidecar");
+    let (r1, f) = (range_of("2024-03-01", "2024-04-01"), range_of("2024-06-01", "2024-07-01"));
+    let write = |name: &str, redraw: &[(i64, i64)]| {
+        let p = dir.join(name);
+        std::fs::write(&p, hourly_csv(redraw)).unwrap();
+        let text = format!("{{\"locked_test\":{},\"locked_test_also\":{}}}\n", r1.declaration_json("test"), f.declaration_json("test"));
+        std::fs::write(lockbox::sidecar_path(p.to_str().unwrap()), text).unwrap();
+        p
+    };
+    let (a, c) = (write("A.csv", &[]), write("C.csv", &[(r1.start, r1.end)]));
+    let (oa, oc) = (dir.join("oa.csv"), dir.join("oc.csv"));
+    for (src, out) in [(&a, &oa), (&c, &oc)] {
+        let run = prepare_cli(&dir, src.to_str().unwrap(), out.to_str().unwrap(), &[]);
+        assert_eq!(run.status.code(), Some(0), "{}", String::from_utf8_lossy(&run.stderr));
+    }
+    let rows = |p: &std::path::Path| std::fs::read_to_string(p).unwrap().lines().map(str::to_string).collect::<Vec<_>>();
+    let (ra, rc) = (rows(&oa), rows(&oc));
+    let dev = |t: i64| t < r1.start - PURGE || (t >= r1.end && t < f.start - PURGE) || t >= f.end;
+    assert_eq!(rows_where(&ra, dev), rows_where(&rc, dev), "values inside the first range stay out of development rows");
+    let kept = lockbox::stored_all(oa.to_str().unwrap()).unwrap().unwrap();
+    assert_eq!((kept.range, kept.also), (r1, Some(f)));
+}
+
+#[test]
+fn prepare_purge_source() {
+    let dir = scratch("purge-source");
+    let a = dir.join("A.csv");
+    std::fs::write(&a, hourly_csv(&[])).unwrap();
+    let f = range_of("2024-06-01", "2024-07-01");
+    let flag = format!("{},{}", f.start, f.end);
+    let one = std::fs::read_to_string(write_target_spec_one_bar(&dir)).unwrap();
+    let entry = &one[one.find("[{").unwrap() + 1..one.rfind("}]").unwrap() + 1];
+    let second = entry.replace("\"y\"", "\"y2\"").replace("raw_target", "second_target").replace("\"r\"", "\"r2\"").replace("\"horizon_seconds\":900", "\"horizon_seconds\":7200");
+    let spec2 = dir.join("two.json");
+    std::fs::write(&spec2, one.replace("}]", &format!("}},{}]", second))).unwrap();
+    let side = |name: &str, extra: &[&str]| {
+        let out = dir.join(name);
+        let mut args = vec!["--lockbox", flag.as_str()];
+        args.extend_from_slice(extra);
+        let run = prepare_cli(&dir, a.to_str().unwrap(), out.to_str().unwrap(), &args);
+        (run.status.code(), std::fs::read_to_string(rcsr::lockbox::sidecar_path(out.to_str().unwrap())).unwrap_or_default(), String::from_utf8_lossy(&run.stderr).into_owned())
+    };
+    let (code, text, err) = side("flag.csv", &["--purge-seconds", "3600"]);
+    assert_eq!(code, Some(0), "{}", err);
+    assert!(text.contains("\"purge_seconds\":3600,\"purge_source\":\"flag\""), "{}", text);
+    let (code, text, err) = side("spec.csv", &["--target-spec", spec2.to_str().unwrap()]);
+    assert_eq!(code, Some(0), "{}", err);
+    assert!(text.contains("\"purge_seconds\":7200,\"purge_source\":\"target_spec\""), "{}", text);
+    let (code, text, err) = side("default.csv", &[]);
+    assert_eq!(code, Some(0), "{}", err);
+    assert!(text.contains("\"purge_seconds\":219600,\"purge_source\":\"protocol_default\""), "{}", text);
+    for bad in ["-1", "NaN", "inf"] {
+        let (code, _, err) = side("bad.csv", &["--purge-seconds", bad]);
+        assert_eq!(code, Some(2), "{}: {}", bad, err);
+    }
 }
 
 #[test]
@@ -829,7 +1096,8 @@ fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
     assert_eq!(prep.status.code(), Some(0), "{}", String::from_utf8_lossy(&prep.stderr));
     assert_eq!(lockbox::stored(prepared.to_str().unwrap()).unwrap().map(|(_, l)| l), Some(lb));
     let side = std::fs::read_to_string(lockbox::sidecar_path(prepared.to_str().unwrap())).unwrap();
-    assert!(side.contains("\"segments\":{\"before\":600,\"locked\":200,\"after\":0}"), "{}", side);
+    assert_eq!(sidecar_rows(prepared.to_str().unwrap()), [112, 488, 200, 0], "{}", side);
+    assert!(side.contains("\"purge_source\":\"protocol_default\""), "{}", side);
     let found = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args([
             "--data", prepared.to_str().unwrap(), "--target", "y", "--vars", "b,f1,f2", "--time", "ts", "--split", "temporal", "--cpu",

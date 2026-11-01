@@ -1389,6 +1389,27 @@ regret  = (B - net) / B                               lower is better; all-flat 
 * The checkpoint stores the kind and the book hash (rows, cost, threshold, `--min-trades`). Resuming with a different book exits 2, and so does resuming a `--fitness pnl` checkpoint without the flag.
 * `--json` carries `search_fitness` (`kind`, `rows`, `groups`, `cost_per_side`, `threshold`, `bound`, `min_trades`, `backend` (`cpu_f64`: the reported values), `book_hash`, `scorer` (`long_pnl_regret`), `scorer_backend` (`cuda` or `cpu`: what ranked the generations) and `scorer_values` (`screening_f32_predictions` or `exact_f64`); `{"kind":"metric"}` without the flag). Each Pareto member gains `fitness: {train_regret, train_net, train_flips, train_exits, train_exposure}` in exact CPU `f64` (`train_net` is the excess net over cash), `train_error` stays the metric, and `objective.finalist.search_fitness` names `long_pnl_regret`.
 
+#### `--pnl-blocks K`: a time-block consistency term
+
+`--pnl-blocks K` (1 to 8, default 1 = off) and `--pnl-block-lambda L` (finite, `>= 0`, default 1.0) need `--fitness pnl` and exit 2 without it. With `K = 1` the fitness is the regret above bit for bit: the book, the archive and `run.json` do not change.
+
+With `K > 1` the sorted distinct training timestamps are cut into `K` runs of equal count (the last takes the remainder), so equal timestamps never straddle a cut. Every `(group, block)` run is its own long/flat book: the first row of a block inside a group starts flat, its last row pays the exit. Per block `k`:
+
+```text
+net_k     = gross_k - c_side * (flips_k + exits_k)
+B_k       = hindsight DP bound on the rows of block k (runs are (group, block))
+regret_k  = (B_k - net_k) / B_k
+fitness   = mean_k(regret_k) + L * sd_k(regret_k)       (sample sd, ddof 1)
+```
+
+* A formula that earns everything in one block and loses in the others scores worse than one that wins moderately everywhere. `L = 0` is the equal-weight mean of the block regrets.
+* A block with `B_k <= 0`, fewer distinct timestamps than blocks, or an invalid flag exits 2 with the reason. A group absent from a block adds nothing to it.
+* A non-finite prediction, a non-finite block regret, or fewer than `--min-trades` flips summed over the blocks scores `+inf`.
+* Each block keeps the fixed 8,192-row segment, 32-lane, 8-warp tree for its own `gross`. The device runs the same trees per block (counts from ballots restricted to the block's rows) and computes the fitness with `_rn` intrinsics in the order above, so it equals the CPU on the device's own `f32` predictions bit for bit. Results do not depend on `--threads`.
+* The block count, `L` and every `B_k` enter the book hash; resuming with other values exits 2.
+* `--json` `search_fitness` gains `blocks`, `lambda` and `block_bounds` (only when `K > 1`), and each Pareto member's `fitness` gains `block_regret` (the regret of each block; `train_regret` is the fitness, `train_net`, `train_flips` and `train_exits` sum the blocks).
+* The blocks are a ranking term inside one training period. They do not refit constants per block; the walk-forward of the front is the out-of-sample test.
+
 Why the constants keep the metric fit. A fixed linear structure (`[1, tanh z24, tanh z3, vol]`, `h = 4`, stride 4, 5 bp per side) fitted five ways and priced exactly (net train / validation / test):
 
 | fit of the constants | 5 bp | 10 bp |

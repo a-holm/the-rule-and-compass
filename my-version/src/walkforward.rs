@@ -92,6 +92,9 @@ pub struct ProtocolOptions {
     /// other candidate is evaluated on the test block, the inference has no
     /// candidate columns and `batch_pnl` is refused.
     pub final_read: bool,
+    /// Half-open time ranges of the declared locked test. Rows inside them are
+    /// dropped at read time; the sealed read leaves this empty.
+    pub locked_ranges: Vec<(i64, i64)>,
 }
 
 /// #482: where a candidate list came from: a run's Pareto front.
@@ -121,6 +124,7 @@ impl Default for ProtocolOptions {
             front: None,
             in_sample_windows: Vec::new(),
             final_read: false,
+            locked_ranges: Vec::new(),
         }
     }
 }
@@ -716,6 +720,10 @@ fn run_store_clocked(
     let mut io_s = 0.0f64;
     let mut buf = GroupBuf::new();
     let mut scratch = Vec::new();
+    let group_ids: Vec<u64> = match layout.group {
+        Some(c) if !numeric[c] => header.levels(c).map_or_else(Vec::new, |l| l.iter().map(|s| label_group_id(s)).collect()),
+        _ => Vec::new(),
+    };
     let mut features = Vec::with_capacity(layout.vars.len());
     for pass in 0..(if opts.final_read { 2 } else { 1 }) {
         if pass == 1 {
@@ -752,6 +760,7 @@ fn run_store_clocked(
                         .and_then(|s| data::parse_time(s))
                         .unwrap_or(f64::NAN)
                 }
+
             };
             if !acc.wants(t) {
                 continue;
@@ -763,7 +772,8 @@ fn run_store_clocked(
             let g = match (layout.group, &group_codes) {
                 (None, _) => 0,
                 (Some(_), Some(codes)) => {
-                    0x8000_0000_0000_0000 | codes.get(r).copied().unwrap_or(0) as u64
+                    let code = codes.get(r).copied().unwrap_or(0) as usize;
+                    group_ids.get(code).copied().unwrap_or(label_group_id(""))
                 }
                 (Some(c), None) => group_key(view.col(c)[r]),
             };
@@ -1007,21 +1017,22 @@ fn group_key(v: f64) -> u64 {
     }
 }
 
+/// Group id of a text label: it depends on the label alone, never on the other
+/// rows of the file, so a label that exists only elsewhere cannot move it.
+fn label_group_id(text: &str) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in text.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    0x8000_0000_0000_0000 | h
+}
+
 fn table_group_ids(table: &Table, col: usize) -> Vec<u64> {
     if let Some(dict) = table.dict(col) {
-        let mut ids: HashMap<&str, u64> = HashMap::new();
-        let mut next = 0u64;
-        dict.codes
-            .iter()
-            .map(|&code| {
-                let text = dict.levels.get(code as usize).map(|s| s.as_str()).unwrap_or("");
-                *ids.entry(text).or_insert_with(|| {
-                    let id = next;
-                    next += 1;
-                    id
-                })
-            })
-            .collect()
+        let ids: Vec<u64> = dict.levels.iter().map(|l| label_group_id(l)).collect();
+        let missing = label_group_id("");
+        dict.codes.iter().map(|&code| ids.get(code as usize).copied().unwrap_or(missing)).collect()
     } else {
         table.col(col).iter().map(|&v| group_key(v)).collect()
     }
@@ -1066,6 +1077,7 @@ enum Pass {
 }
 
 struct Accum {
+    locked_ranges: Vec<(i64, i64)>,
     windows: Vec<WindowData>,
     candidates: usize,
     scores: Vec<f64>,
@@ -1127,6 +1139,7 @@ impl Accum {
             });
         }
         Ok(Accum {
+            locked_ranges: opts.locked_ranges.clone(),
             windows,
             candidates,
             scores: vec![0.0; candidates],
@@ -1138,6 +1151,9 @@ impl Accum {
 
     fn wants(&self, t: f64) -> bool {
         if !t.is_finite() {
+            return false;
+        }
+        if self.locked_ranges.iter().any(|&(a, b)| t >= a as f64 && t < b as f64) {
             return false;
         }
         self.windows.iter().any(|d| {
@@ -1234,9 +1250,10 @@ impl Accum {
         let forced = self.forced.as_deref();
         for (window_index, mut d) in self.windows.into_iter().enumerate() {
             {
+                let labelled = d.test_rows.iter().filter(|r| r.target.is_finite());
                 let book = crate::trading::TradingRows {
-                    time: d.test_rows.iter().map(|r| r.time).collect(),
-                    group: d.test_rows.iter().map(|r| r.group).collect(),
+                    time: labelled.clone().map(|r| r.time).collect(),
+                    group: labelled.map(|r| r.group).collect(),
                     funding: Vec::new(),
                 };
                 let step = crate::trading::check_return_spacing(&book, spec.horizon)
