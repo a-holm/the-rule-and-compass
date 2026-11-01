@@ -368,6 +368,21 @@ fn one_command_reproduces_the_table() {
         assert!(json.contains(&format!("\"name\":\"{}\"", name)), "{name} missing");
     }
     assert!(std::fs::read_to_string(&md).unwrap().contains("| cash |"));
+    assert!(json.contains("\"min_group_step_seconds\":3600"), "the report carries the measured step");
+
+    let overlap = dir.join("spec_overlap.json");
+    std::fs::write(&overlap, spec_text.replace("\"horizon_seconds\":3600", "\"horizon_seconds\":10800")).unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "ladder", "--data", data.to_str().unwrap(), "--target", "y", "--return-col", "ret", "--time", "ts",
+            "--group", "sym", "--features", "signal,vol,n1,n2,lag", "--windows", windows.to_str().unwrap(),
+            "--purge-seconds", "7200", "--target-spec", overlap.to_str().unwrap(), "--draws", "100", "--gbm-trees", "30",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(err.contains("overlapping returns") && err.contains("10800-second label horizon"), "{err}");
 
     let missing = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(["ladder", "--data", "x.csv"]).output().unwrap();
     assert_eq!(missing.status.code(), Some(2));
@@ -382,4 +397,20 @@ fn the_json_carries_a_phase_ledger_with_the_pnl_stage() {
     let report = run(&f, &options(&f));
     let l = ledger::check(&report.json(), "ladder", &["pnl"]);
     assert_eq!(l.busy, 0.0, "the ladder has no device work");
+}
+
+#[test]
+fn fold_spacing_refuses_a_label_horizon_longer_than_the_row_step() {
+    let f = fixture(12);
+    assert_eq!(ladder::check_fold_spacing(&f.panel, &f.folds, 3600.0), Ok(Some(3600.0)));
+    assert_eq!(ladder::check_fold_spacing(&f.panel, &f.folds, 0.0), Ok(Some(3600.0)));
+    let e = ladder::check_fold_spacing(&f.panel, &f.folds, 3.0 * STEP).unwrap_err();
+    assert!(e.contains("overlapping returns") && e.contains("window 'f0'"), "{e}");
+    let mut o = options(&f);
+    o.horizon_seconds = 3.0 * STEP;
+    let e = ladder::run_ladder(&f.panel, &f.folds, &o).unwrap_err();
+    assert!(e.contains("overlapping returns"), "{e}");
+    assert_eq!(ladder::spacing_exit(&e, 3), 2);
+    o.horizon_seconds = STEP;
+    assert!(run(&f, &o).json().contains("\"min_group_step_seconds\":3600"));
 }

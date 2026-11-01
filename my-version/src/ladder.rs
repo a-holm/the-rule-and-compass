@@ -1682,7 +1682,7 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
         sr_zero = Some(z);
     }
     let rows = build_rows(p, &pool, opts, block, rungs, &market, sr_zero);
-    finish_report(p, &pool, opts, folds, rows, &market, block, &mut notes)
+    finish_report(p, &pool, opts, folds, rows, &market, block, &mut notes, min_group_step)
 }
 
 fn jarr_str(v: &[String]) -> String {
@@ -1698,6 +1698,7 @@ fn finish_report(
     market: &[f64],
     block: usize,
     notes: &mut Vec<String>,
+    min_group_step: Option<f64>,
 ) -> Result<Report, String> {
     let ran = |r: &Row| r.status == "ok";
     let mean_of = |name: &str, rows: &[Row]| rows.iter().find(|r| r.name == name && ran(r)).map(|r| r.mean_period_net);
