@@ -4368,6 +4368,7 @@ fn main() {
             return_column: ts.return_column.clone(),
             log_returns: ts.return_units == "log",
             funding_column: trade_funding.clone(),
+            train: false,
         });
         let tspec = rcsr::trading::TradingSpec {
             cost_bps: cost,
@@ -4405,6 +4406,7 @@ fn main() {
         allow_lockbox,
         purge_seconds: target_resolved.as_ref().map(|r| r.spec.required_purge_seconds()),
         trading: trading_cols.clone(),
+        canonical_train_order: false,
         scale_column: target_resolved
             .as_ref()
             .and_then(|r| r.spec.scale_column())
