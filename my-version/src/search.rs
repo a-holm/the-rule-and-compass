@@ -205,6 +205,11 @@ pub struct Config {
     /// `0` disables the bound. The default is high enough not to fire on the
     /// recorded cell, so normal runs are bit-identical to the serial loop.
     pub fit_fallback_max: usize,
+    /// #495: finalist refit band. After a device-fit search only trees whose
+    /// full-data error is within this relative distance of the lowest error at
+    /// no greater cost, plus every reported front member, get the exact CPU
+    /// refit. `inf` refits every unique tree.
+    pub refit_band: f64,
     /// #116: disk-backed rows for the streaming fit arm. `Some` only when the
     /// CLI resolved a resident `.rcsb` store whose prepared training rows can be
     /// re-read exactly; it is read by `--fit-strategy stream` and never changes
@@ -504,6 +509,9 @@ fn fit_and_score(
 /// cell admitted at most 540 per generation.
 pub const DEFAULT_FIT_FALLBACK_MAX: usize = 4096;
 
+/// #495: default relative band of the finalist refit.
+pub const DEFAULT_REFIT_BAND: f64 = 0.001;
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -531,6 +539,7 @@ impl Default for Config {
             fit_samples: 0, // #85: off by default
             fit_rows: 0,    // #116: off by default
             fit_fallback_max: DEFAULT_FIT_FALLBACK_MAX, // #255
+            refit_band: DEFAULT_REFIT_BAND, // #495
             fit_stream_source: None,
             front_parents: true, // #76: measured on the known-truth suite
             units: None,
@@ -605,6 +614,7 @@ impl Config {
         compare!(fit_samples, "fit_samples"); // #85
         compare!(fit_rows, "fit_rows"); // #116
         compare!(fit_fallback_max, "fit_fallback_max"); // #255
+        compare!(refit_band, "refit_band"); // #495
         compare!(front_parents, "front_parents"); // #76
         compare!(selection, "selection"); // #465
         compare!(qd_bins, "qd_bins"); // #120
@@ -1966,6 +1976,9 @@ impl GpuSearch {
             fit_fallback_improved_by_cause: self.fit_fallback_improved_by_cause.clone(),
             fit_status_by_label: self.fit_status_by_label.clone(),
             fit_refits: 0,
+            fit_refit_candidates: 0,
+            fit_refit_s: 0.0,
+            fit_rescore_s: 0.0,
             fit_ms: self.fit_ms,
             fit_polish_ms: self.fit_polish_ms,
             fit_host_ms: self.fit_host_ms,
@@ -4194,6 +4207,109 @@ fn canonical_front(cap: usize, mut scored: Vec<Sol>) -> Archive {
     out
 }
 
+/// #495: what the finalist rebuild did, for the ledger and `--json`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default)]
+struct RefitReport {
+    /// Unique trees of the archive and the final populations.
+    candidates: usize,
+    /// Exact CPU f64 refits performed.
+    refits: usize,
+    /// Wall seconds in the exact refit windows.
+    refit_s: f64,
+    /// Wall seconds in full-data scoring of the unique trees.
+    rescore_s: f64,
+}
+
+/// #495: indices of the trees worth an exact refit. `pre` are the pre-refit
+/// full-data errors and `costs` the complexity costs. A tree qualifies when its
+/// error is within `band` (relative) of the lowest finite error among trees of
+/// no greater cost. The set depends only on errors and costs.
+fn refit_band_selection(pre: &[f64], costs: &[f64], band: f64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..pre.len()).collect();
+    order.sort_by(|&a, &b| costs[a].total_cmp(&costs[b]).then(a.cmp(&b)));
+    let mut picked = Vec::new();
+    let mut env = f64::INFINITY;
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && costs[order[end]] == costs[order[start]] {
+            end += 1;
+        }
+        for &i in &order[start..end] {
+            if pre[i].is_finite() && pre[i] < env {
+                env = pre[i];
+            }
+        }
+        for &i in &order[start..end] {
+            if pre[i].is_finite() && pre[i] <= env + band * env.abs() {
+                picked.push(i);
+            }
+        }
+        start = end;
+    }
+    picked.sort_unstable();
+    picked
+}
+
+/// #169: exact CPU f64 refit of `trees` on all training rows, a warm start from
+/// the carried constants. Trees are independent, so the work is split across
+/// workers; the result order is unchanged.
+fn refit_exact(trees: &mut [Node], train: &EvalSample, cfg: &Config) {
+    let fit_one = |t: &mut Node| {
+        crate::fit::fit_weighted_metric(
+            t,
+            &train.sample.x,
+            &train.sample.y,
+            &train.sample.w,
+            cfg.fit_iters,
+            cfg.metric,
+        );
+        *t = expr::simplify(t);
+        crate::fit::note_gpu_refit();
+    };
+    let workers = cfg.threads.max(1).min(trees.len().max(1)); // #463
+    let blocks = expr::current_blocks();
+    if workers > 1 && trees.len() > 1 {
+        let per = trees.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            for chunk in trees.chunks_mut(per) {
+                let blocks = blocks.clone();
+                let fit_one = &fit_one;
+                scope.spawn(move || {
+                    expr::set_blocks(blocks);
+                    for t in chunk.iter_mut() {
+                        fit_one(t);
+                    }
+                });
+            }
+        });
+    } else {
+        for t in trees.iter_mut() {
+            fit_one(t);
+        }
+    }
+}
+
+/// #15/#25/#27: full-data error of one tree; a dimensionally rejected
+/// candidate must not sneak back in on the rebuild.
+fn full_data_error(tree: &Node, train: &EvalSample, cfg: &Config) -> f64 {
+    if cfg.accepts_dimensions(tree) {
+        score_tree(tree, train, cfg)
+    } else {
+        f64::INFINITY
+    }
+}
+
+fn full_data_sol(tree: Node, error: f64, cfg: &Config) -> Sol {
+    Sol {
+        complexity: expr::complexity(&tree),
+        cost: cfg.complexity_model.complexity(&tree),
+        tree,
+        error,
+    }
+}
+
 /// Rebuild an archive from its members and the final populations, scoring every
 /// expression on the **full** training sample. Used only when the generations
 /// ran on subsets, so the returned front and every error derived from it are
@@ -4203,10 +4319,10 @@ fn full_data_archive(
     islands: &[Vec<Ind>],
     train: &EvalSample, // #27 sample + cached SoA columns
     cfg: &Config,       // #15 refit per-output constants; #25 dimensional filter
-    // #169: refit every finalist with the exact CPU f64 arm because the search
+    // #169: refit the finalists with the exact CPU f64 arm because the search
     // used the batched GPU constants.
     refit_gpu_fit: bool,
-) -> (Archive, usize, f64) {
+) -> (Archive, RefitReport) {
     let trees: Vec<&Node> = archive
         .items
         .iter()
@@ -4220,77 +4336,100 @@ fn full_data_archive(
             unique.push(expr::simplify(tree));
         }
     }
-    let mut refits = 0usize;
-    let mut refit_s = 0.0;
-    let refit_start = std::time::Instant::now();
-    // #169: reported constants must come from the exact CPU f64 arm, not from
-    // the f32 row arithmetic of the batched kernel. This is a warm start from
-    // the GPU constants on the full training sample. Trees are independent, so
-    // the refit is split across workers; the result order is unchanged.
-    if refit_gpu_fit && cfg.fit_iters > 0 && !train.sample.is_multi() {
-        let workers = cfg.threads.max(1).min(unique.len().max(1)); // #463
-        let blocks = expr::current_blocks();
-        if workers > 1 && unique.len() > 1 {
-            let per = unique.len().div_ceil(workers);
-            std::thread::scope(|scope| {
-                for chunk in unique.chunks_mut(per) {
-                    let blocks = blocks.clone();
-                    scope.spawn(move || {
-                        expr::set_blocks(blocks);
-                        for t in chunk.iter_mut() {
-                            crate::fit::fit_weighted_metric(
-                                t,
-                                &train.sample.x,
-                                &train.sample.y,
-                                &train.sample.w,
-                                cfg.fit_iters,
-                                cfg.metric,
-                            );
-                            *t = expr::simplify(t);
-                        }
-                    });
-                }
-            });
-        } else {
-            for t in unique.iter_mut() {
-                crate::fit::fit_weighted_metric(
-                    t,
-                    &train.sample.x,
-                    &train.sample.y,
-                    &train.sample.w,
-                    cfg.fit_iters,
-                    cfg.metric,
-                );
-                *t = expr::simplify(t);
-            }
-        }
-        for _ in 0..unique.len() {
-            crate::fit::note_gpu_refit();
-        }
-        refits = unique.len();
-    }
-    // #284: only the exact CPU refit window, not the whole archive rebuild.
-    if refits > 0 {
-        refit_s = refit_start.elapsed().as_secs_f64();
-    }
+    let mut report = RefitReport {
+        candidates: unique.len(),
+        ..RefitReport::default()
+    };
+    let refit_on = refit_gpu_fit && cfg.fit_iters > 0 && !train.sample.is_multi();
+    let workers = |n: usize| batch_workers(cfg.threads, n, train.sample.len());
     // #463: scoring is independent per tree; results keep the order.
-    let scored: Vec<Sol> = par_map(batch_workers(cfg.threads, unique.len(), train.sample.len()), unique, |tree| {
-            // #15: combined error on a multi-output sample; #25: a rejected
-            // candidate must not sneak back in on the full-data rebuild.
-            let error = if cfg.accepts_dimensions(&tree) {
-                score_tree(&tree, train, cfg) // #27
-            } else {
-                f64::INFINITY
-            };
-            Sol {
-                complexity: expr::complexity(&tree),
-                cost: cfg.complexity_model.complexity(&tree),
-                tree,
-                error,
-            }
+    let score_all = |trees: Vec<Node>| -> Vec<Sol> {
+        par_map(workers(trees.len()), trees, |tree| {
+            let error = full_data_error(&tree, train, cfg);
+            full_data_sol(tree, error, cfg)
+        })
+    };
+
+    if !refit_on || cfg.refit_band.is_infinite() {
+        // #284: only the exact CPU refit window, not the whole archive rebuild.
+        if refit_on {
+            let start = std::time::Instant::now();
+            refit_exact(&mut unique, train, cfg);
+            report.refits = unique.len();
+            report.refit_s = start.elapsed().as_secs_f64();
+        }
+        let start = std::time::Instant::now();
+        let scored = score_all(unique);
+        report.rescore_s = start.elapsed().as_secs_f64();
+        return (canonical_front(archive.cap, scored), report);
+    }
+
+    // #495: score with the carried constants, refit only the band around the
+    // front, then refit every reported member that is still unrefit.
+    let start = std::time::Instant::now();
+    let scored = score_all(unique);
+    report.rescore_s += start.elapsed().as_secs_f64();
+    let costs: Vec<f64> = scored.iter().map(|s| s.cost).collect();
+    let pre: Vec<f64> = scored.iter().map(|s| s.error).collect();
+    let first = refit_band_selection(&pre, &costs, cfg.refit_band);
+    let (front, refits) = refit_to_fixpoint(archive.cap, scored, first, |batch: Vec<Node>| {
+        let start = std::time::Instant::now();
+        let mut batch = batch;
+        refit_exact(&mut batch, train, cfg);
+        report.refit_s += start.elapsed().as_secs_f64();
+        let start = std::time::Instant::now();
+        let rescored = score_all(batch);
+        report.rescore_s += start.elapsed().as_secs_f64();
+        rescored
     });
-    let out = canonical_front(archive.cap, scored);
-    (out, refits, refit_s)
+    report.refits = refits;
+    (front, report)
+}
+
+/// #495: refit the trees at `todo`, rebuild the front, and refit every front
+/// member that was not refit, until none is left. `refit` maps trees to their
+/// refit, scored solutions in the same order. Each round refits at least one
+/// new tree, so the loop ends. Returns the front and the number of refits.
+fn refit_to_fixpoint(
+    cap: usize,
+    mut scored: Vec<Sol>,
+    mut todo: Vec<usize>,
+    mut refit: impl FnMut(Vec<Node>) -> Vec<Sol>,
+) -> (Archive, usize) {
+    let mut done = vec![false; scored.len()];
+    let mut refits = 0;
+    loop {
+        if !todo.is_empty() {
+            let batch: Vec<Node> = todo.iter().map(|&i| scored[i].tree.clone()).collect();
+            refits += batch.len();
+            for (&i, sol) in todo.iter().zip(refit(batch)) {
+                scored[i] = sol;
+                done[i] = true;
+            }
+        }
+        let front = canonical_front(cap, scored.clone());
+        let refit_hashes: HashSet<u64> = scored
+            .iter()
+            .zip(&done)
+            .filter(|(_, &d)| d)
+            .map(|(s, _)| expr::structural_hash(&s.tree))
+            .collect();
+        todo = Vec::new();
+        for member in &front.items {
+            let h = expr::structural_hash(&member.tree);
+            if refit_hashes.contains(&h) {
+                continue;
+            }
+            if let Some(i) =
+                (0..scored.len()).find(|&i| !done[i] && expr::structural_hash(&scored[i].tree) == h)
+            {
+                todo.push(i);
+            }
+        }
+        if todo.is_empty() {
+            return (front, refits);
+        }
+    }
 }
 
 /// Lexicographic parsimony pressure: better error wins; if the errors are equal
@@ -4846,6 +4985,12 @@ pub struct GpuRunStats {
     pub fit_status_by_label: BTreeMap<String, usize>,
     /// #169: exact CPU f64 refits of finalists before reporting.
     pub fit_refits: usize,
+    /// #495: unique trees considered for the finalist refit.
+    pub fit_refit_candidates: usize,
+    /// #495: wall seconds of the exact finalist refit windows.
+    pub fit_refit_s: f64,
+    /// #495: wall seconds of full-data scoring in the finalist rebuild.
+    pub fit_rescore_s: f64,
     /// #169: wall time spent in the batched fit kernels, milliseconds.
     pub fit_ms: f64,
     /// #496: the polish-phase part of `fit_ms`, apportioned by per-block cycles.
@@ -7628,8 +7773,7 @@ fn run_search(
     // f64 LM before it is scored on all training rows.
     let gpu_fit_used =
         cfg.fit_strategy.defers_to_gpu() && (gpu_used || fit_only_device);
-    let mut gpu_fit_refits = 0usize;
-    let mut refit_tail_s = 0.0;
+    let mut refit_report = RefitReport::default();
     if subsampling_active(cfg, train) || gpu_used || fit_only_device || resumed || fit_screened {
         // Generation fitness was estimated on subsets, or on the GPU in f32, so
         // the front is rebuilt from the surviving trees and scored on every
@@ -7637,8 +7781,7 @@ fn run_search(
         // number derived from it are full-data and match the CPU backend.
         let rebuilt = full_data_archive(&archive, &islands, &train_data, cfg, gpu_fit_used);
         archive = rebuilt.0;
-        gpu_fit_refits = rebuilt.1;
-        refit_tail_s = rebuilt.2;
+        refit_report = rebuilt.1;
     } else {
         for pop in &islands {
             for ind in pop {
@@ -7696,6 +7839,8 @@ fn run_search(
 
     // #284: the exact finalist refit is a fit-stage leaf, and the remaining tail
     // (test scoring, report bookkeeping) is a measured host window.
+    let gpu_fit_refits = refit_report.refits;
+    let refit_tail_s = refit_report.refit_s;
     run_ledger.record_stage(crate::gpu_stats::Stage::Fit, refit_tail_s);
     run_ledger.record_refit(gpu_fit_refits as u64, refit_tail_s);
     let tail_total = (t0.elapsed().as_secs_f64() - pre_tail_elapsed).max(0.0);
@@ -7713,6 +7858,9 @@ fn run_search(
         gpu.as_ref().map(|g| {
             let mut s = g.run_stats();
             s.fit_refits = gpu_fit_refits;
+            s.fit_refit_candidates = refit_report.candidates;
+            s.fit_refit_s = refit_report.refit_s;
+            s.fit_rescore_s = refit_report.rescore_s;
             s.fit_admission = cfg.fit_admission;
             s.fit_polish = cfg.fit_polish;
 // #284: absorb the device intervals and fit leaves, then add the
@@ -9317,6 +9465,159 @@ mod tests {
         }
         assert!(inserted.len() > 1, "the triple must expose the order dependence");
         assert_eq!(rebuilt.unwrap().0.len(), 2);
+    }
+
+    /// #495: the envelope is the lowest finite error at no greater cost; a tree
+    /// is selected when it is within the relative band of it.
+    #[test]
+    fn refit_band_selection_uses_the_lower_envelope() {
+        let costs = [1.0, 2.0, 2.0, 3.0, 4.0, 5.0];
+        let pre = [10.0, 8.0, 8.02, 8.5, f64::NAN, f64::INFINITY];
+        assert_eq!(refit_band_selection(&pre, &costs, 0.001), vec![0, 1]);
+        assert_eq!(refit_band_selection(&pre, &costs, 0.01), vec![0, 1, 2]);
+        assert_eq!(refit_band_selection(&pre, &costs, 0.0), vec![0, 1]);
+        // A tree cheaper than the others sets the envelope for the dearer ones.
+        let costs = [2.0, 1.0];
+        assert_eq!(refit_band_selection(&[5.0, 1.0], &costs, 0.5), vec![1]);
+        // A negative error (aic) is its own envelope.
+        assert_eq!(refit_band_selection(&[-4.0, -3.0], &[1.0, 2.0], 0.001), vec![0]);
+    }
+
+    /// #495: a tree outside the band that enters the front after the band
+    /// refits is refit before it is reported.
+    #[test]
+    fn fixpoint_refits_every_reported_member() {
+        let scored = vec![
+            fake_sol(1.0, 1.0, 1.0),
+            fake_sol(2.0, 2.0, 2.0),
+            fake_sol(3.0, 2.5, 3.0),
+        ];
+        let costs: Vec<f64> = scored.iter().map(|s| s.cost).collect();
+        let pre: Vec<f64> = scored.iter().map(|s| s.error).collect();
+        let first = refit_band_selection(&pre, &costs, 0.001);
+        assert_eq!(first, vec![0], "only the cheapest tree is inside the band");
+        let mut seen: Vec<Vec<u64>> = Vec::new();
+        // The refit of the first tree worsens its error (a simplification that
+        // changes the value), which uncovers the second.
+        let (front, refits) = refit_to_fixpoint(10, scored, first, |batch| {
+            seen.push(batch.iter().map(expr::structural_hash).collect());
+            batch
+                .into_iter()
+                .map(|tree| {
+                    let k = tree.kids[1].val;
+                    let error = if k == 1.0 { 3.0 } else { 2.0 };
+                    let tree = node(Op::Add, vec![input(0), constant(k + 0.5)]);
+                    Sol { tree, error, complexity: 1, cost: k }
+                })
+                .collect()
+        });
+        assert_eq!(refits, 2);
+        assert_eq!(seen.len(), 2, "the second round refits the exposed member");
+        assert_eq!(front.items.len(), 2);
+        let refit_ks: Vec<f64> = front.items.iter().map(|s| s.tree.kids[1].val).collect();
+        assert_eq!(refit_ks, vec![1.5, 2.5], "every reported member is a refit");
+    }
+
+    fn refit_band_trees() -> Vec<Node> {
+        let lin = |c: f64, d: f64| {
+            node(Op::Add, vec![node(Op::Mul, vec![constant(c), input(0)]), constant(d)])
+        };
+        vec![
+            input(0),
+            node(Op::Mul, vec![constant(1.7), input(0)]),
+            lin(1.9, 0.4),
+            lin(2.0, 0.6),
+            lin(0.3, -1.0),
+            node(Op::Add, vec![input(0), constant(0.2)]),
+            node(Op::Mul, vec![constant(0.4), input(1)]),
+            node(Op::Sin, vec![node(Op::Mul, vec![constant(1.2), input(0)])]),
+            node(Op::Add, vec![lin(2.0, 0.5), node(Op::Mul, vec![constant(0.01), input(1)])]),
+            node(Op::Mul, vec![input(0), input(1)]),
+        ]
+    }
+
+    fn refit_band_sample() -> Sample {
+        let mut s = sample();
+        for (row, y) in s.x.iter().zip(s.y.iter_mut()) {
+            *y = 2.0 * row[0] + 0.5;
+        }
+        s
+    }
+
+    fn rebuild_with_band(band: f64) -> (Archive, RefitReport) {
+        let s = refit_band_sample();
+        let cfg = Config { refit_band: band, threads: 1, ..Config::default() };
+        let view = EvalSample::new(&s, &cfg);
+        let mut a = Archive::new(100);
+        for t in refit_band_trees() {
+            a.items.push(Sol {
+                complexity: expr::complexity(&t),
+                cost: cfg.complexity_model.complexity(&t),
+                error: 0.0,
+                tree: t,
+            });
+        }
+        full_data_archive(&a, &[], &view, &cfg, true)
+    }
+
+    /// #495: `inf` is the historical path: refit every unique tree, score,
+    /// take the canonical front.
+    #[test]
+    fn refit_band_inf_matches_the_full_refit() {
+        let s = refit_band_sample();
+        let cfg = Config { threads: 1, ..Config::default() };
+        let view = EvalSample::new(&s, &cfg);
+        let scored: Vec<Sol> = refit_band_trees()
+            .into_iter()
+            .map(|mut t| {
+                crate::fit::fit_weighted_metric(
+                    &mut t,
+                    &view.sample.x,
+                    &view.sample.y,
+                    &view.sample.w,
+                    cfg.fit_iters,
+                    cfg.metric,
+                );
+                let t = expr::simplify(&t);
+                let error = score_tree(&t, &view, &cfg);
+                Sol {
+                    complexity: expr::complexity(&t),
+                    cost: cfg.complexity_model.complexity(&t),
+                    error,
+                    tree: t,
+                }
+            })
+            .collect();
+        let want = canonical_front(100, scored);
+        let (got, report) = rebuild_with_band(f64::INFINITY);
+        assert_eq!(item_bits(&got), item_bits(&want));
+        assert_eq!(got.hash(), want.hash());
+        assert_eq!(report.refits, report.candidates);
+    }
+
+    /// #495: the default band reports the same front costs and errors as the
+    /// full refit with fewer refits, and every reported member is a refit.
+    #[test]
+    fn default_band_front_matches_the_full_refit() {
+        let (want, full) = rebuild_with_band(f64::INFINITY);
+        let (got, banded) = rebuild_with_band(DEFAULT_REFIT_BAND);
+        assert_eq!(got.items.len(), want.items.len());
+        for (g, w) in got.items.iter().zip(&want.items) {
+            assert_eq!(g.cost.to_bits(), w.cost.to_bits());
+            assert!((g.error - w.error).abs() <= 1e-9 * (1.0 + w.error.abs()), "{} vs {}", g.error, w.error);
+        }
+        assert_eq!(banded.candidates, full.candidates);
+        assert!(banded.refits < full.refits, "{} of {}", banded.refits, full.refits);
+        assert!(banded.refits >= got.items.len());
+    }
+
+    /// #495: the saved setting round-trips through the checkpoint config.
+    #[test]
+    fn refit_band_is_a_saved_search_setting() {
+        let a = Config::default();
+        let b = Config { refit_band: f64::INFINITY, ..Config::default() };
+        assert_eq!(a.search_setting_differences(&b), vec!["refit_band"]);
+        assert!(a.search_setting_differences(&a).is_empty());
     }
 
     /// #330: `full_data_archive` returns the same canonical archive hash for

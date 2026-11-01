@@ -662,6 +662,12 @@ SEARCH:
                              refit exactly on the CPU in every mode. Only the
                              device fit arm reads it; a resume refuses a
                              different saved value
+  --refit-band <F>           after a device-fit search, refit exactly (CPU f64)
+                             only the trees whose full-data error is within
+                             this relative band of the lowest error at no
+                             greater cost, then every reported front member
+                             still unrefit (default 0.001). inf refits every
+                             unique tree
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
   --no-dedup                 disable structural de-duplication
   --selection lexicographic|afp
@@ -1310,7 +1316,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"seconds\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1323,6 +1329,9 @@ fn gpu_json(
         ops_json(&g.fit_fallback_improved_by_cause),
         ops_json(&g.fit_status_by_label),
         g.fit_refits,
+        g.fit_refit_candidates,
+        jnum(g.fit_refit_s),
+        jnum(g.fit_rescore_s),
         jnum(g.fit_ms / 1000.0),
         jnum(g.ledger.fit_kernel_lm_s()),
         jnum(g.ledger.fit_kernel_polish_s()),
@@ -1824,6 +1833,8 @@ impl DevSink {
             fit_kernel_f32_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_lm_s()),
             fit_kernel_f64_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_polish_s()),
             fit_fallback_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_fallback_s()),
+            fit_refit_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_s()),
+            fit_refits: outcome.gpu.as_ref().map(|g| g.fit_refits),
             events,
             bytes,
             dropped,
@@ -2355,6 +2366,8 @@ fn main() {
     let mut fit_rows_set = false;
     // #255: explicit --fit-fallback-max for the resume settings check.
     let mut fit_fallback_max_set = false;
+    // #495: explicit --refit-band for the resume settings check.
+    let mut refit_band_set = false;
     let mut fit_polish_set = false;
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
@@ -2744,6 +2757,21 @@ fn main() {
             "--fit-fallback-max" => {
                 cfg.fit_fallback_max = val!().parse().unwrap_or(cfg.fit_fallback_max);
                 fit_fallback_max_set = true;
+            }
+            // #495: relative band of the exact finalist refit.
+            "--refit-band" => {
+                let v = val!();
+                cfg.refit_band = match v.as_str() {
+                    "inf" => f64::INFINITY,
+                    _ => match v.parse::<f64>() {
+                        Ok(b) if b.is_finite() && b >= 0.0 => b,
+                        _ => {
+                            eprintln!("error: --refit-band needs a number >= 0 or inf");
+                            std::process::exit(EXIT_USAGE);
+                        }
+                    },
+                };
+                refit_band_set = true;
             }
             // #496: arithmetic of the device fit polish.
             "--fit-polish" => {
@@ -3439,6 +3467,13 @@ fn main() {
                 "--selection {} (saved {})",
                 cfg.selection.as_str(),
                 saved.selection.as_str()
+            ));
+        }
+        // #495: the band decides which finalists get the exact refit.
+        if refit_band_set && cfg.refit_band != saved.refit_band {
+            conflicts.push(format!(
+                "--refit-band {} (saved {})",
+                cfg.refit_band, saved.refit_band
             ));
         }
         // #470: linear scaling is saved search state.
@@ -5882,7 +5917,7 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(" ");
             eprintln!(
-                "# fit: gpu-fit screened={} admitted_wide={} admitted={} gpu={} fallback={} [{}] labels=[{}] refits={} fallback_s={:.3} bounded={}/{} workers={}",
+                "# fit: gpu-fit screened={} admitted_wide={} admitted={} gpu={} fallback={} [{}] labels=[{}] refit_candidates={} refits={} refit_s={:.3} rescore_s={:.3} fallback_s={:.3} bounded={}/{} workers={}",
                 g.fit_screened,
                 g.fit_admitted_wide,
                 g.fit_attempts,
@@ -5890,7 +5925,10 @@ fn main() {
                 g.fit_fallback,
                 causes,
                 labels,
+                g.fit_refit_candidates,
                 g.fit_refits,
+                g.fit_refit_s,
+                g.fit_rescore_s,
                 g.fit_fallback_ms / 1000.0,
                 g.fit_fallback_bounded,
                 g.fit_fallback_max,
