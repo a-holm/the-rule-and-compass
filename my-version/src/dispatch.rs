@@ -351,10 +351,13 @@ impl FallbackCause {
 /// count cancels. The device kernel runs it once per gauge orientation: twice
 /// for `correlation_signed`. `correlation::fit` on the CPU runs one LM per
 /// orientation tried: three for `correlation_signed`. Unsigned correlation has
-/// one orientation on both sides.
+/// one orientation on both sides. Slope (#236) is the squared warm start plus
+/// the differenced IRLS on the device, and additionally the coordinate polish
+/// on the CPU (`bench_slope_fit_stage`, 154 000 rows).
 fn fit_pass_scale(objective: Option<crate::fit::DeviceLoss>) -> (f64, f64) {
     match objective {
         Some(crate::fit::DeviceLoss::CorrelationSigned) => (2.0, 3.0),
+        Some(crate::fit::DeviceLoss::Slope) => (2.5, 6.3),
         _ => (1.0, 1.0),
     }
 }

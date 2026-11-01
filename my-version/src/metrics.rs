@@ -214,7 +214,9 @@ impl Metric {
     /// go negative on a good fit and the search sites hold only the criterion,
     /// not its residual sum of squares, so they are never solved.
     pub fn is_solved(self, best_error: f64) -> bool {
-        !self.is_parameter_aware() && best_error <= crate::progress_stats::SOLVED_ERROR
+        !self.is_parameter_aware()
+            && best_error >= 0.0
+            && best_error <= crate::progress_stats::SOLVED_ERROR
     }
 
     /// True for metrics that depend on the number of fitted constants.
@@ -290,14 +292,18 @@ pub enum ScoreObjective {
     HingeOrdinary,
     /// #289: `max(0, 1 − u)²`.
     HingeSquared,
+    /// #236: mean `|(pᵢ − pᵢ₋₁) − (yᵢ − yᵢ₋₁)|` over the consecutive rows of
+    /// the resident sample, divided by `n − 1`. Admitted only when the
+    /// sample's slope pairs are exactly the consecutive pairs.
+    Slope,
 }
 
 impl ScoreObjective {
     /// The `RC_SCORE_*` code the CUDA scoring entry points take.
     ///
-    /// The regression block is 0–9 (#287); classification is 10–14 (#289) so a
-    /// fit code (0–5 in `DeviceLoss`) and a score code can never be confused,
-    /// and every code in this enum has its own kernel branch.
+    /// The regression block is 0–9 (#287); classification is 10–14 (#289);
+    /// slope is 15 (#236). A fit code (`DeviceLoss`) and a score code can never
+    /// be confused, and every code in this enum has its own kernel branch.
     pub fn code(self) -> i32 {
         match self {
             ScoreObjective::Squared => 0,
@@ -315,6 +321,7 @@ impl ScoreObjective {
             ScoreObjective::HingeSigmoid => 12,
             ScoreObjective::HingeOrdinary => 13,
             ScoreObjective::HingeSquared => 14,
+            ScoreObjective::Slope => 15,
         }
     }
 
@@ -336,6 +343,7 @@ impl ScoreObjective {
             12 => ScoreObjective::HingeSigmoid,
             13 => ScoreObjective::HingeOrdinary,
             14 => ScoreObjective::HingeSquared,
+            15 => ScoreObjective::Slope,
             _ => return None,
         })
     }
@@ -358,6 +366,7 @@ impl ScoreObjective {
             ScoreObjective::HingeSigmoid => "hinge",
             ScoreObjective::HingeOrdinary => "hinge_ordinary",
             ScoreObjective::HingeSquared => "hinge_squared",
+            ScoreObjective::Slope => "slope",
         }
     }
 
@@ -379,6 +388,7 @@ impl ScoreObjective {
             ScoreObjective::HingeSigmoid => Metric::Hinge,
             ScoreObjective::HingeOrdinary => Metric::HingeOrdinary,
             ScoreObjective::HingeSquared => Metric::HingeSquared,
+            ScoreObjective::Slope => Metric::Slope,
         }
     }
 
@@ -599,9 +609,9 @@ pub fn score_dispatch(m: Metric) -> ScoreDispatch {
         Interquartile => ScoreDispatch::Exact(ScoreStat::Interquartile),
         RankCorrelation => ScoreDispatch::Exact(ScoreStat::RankCorrelation),
         RankCorrelationSigned => ScoreDispatch::Exact(ScoreStat::RankCorrelationSigned),
-        Slope => ScoreDispatch::Refused(
-            "slope needs a cross-row first-difference pass",
-        ),
+        // #236: consecutive-row pairs; `search::gpu_blocker` refuses a sample
+        // whose pair list is anything else.
+        Slope => ScoreDispatch::Native(O::Slope),
         ImplicitDerivative => ScoreDispatch::Refused(
             "implicit needs an expression-tree gradient pass",
         ),
@@ -708,7 +718,7 @@ pub fn score_native(pred: &[f64], y: &[f64], objective: ScoreObjective, k: usize
 ///
 /// Zero-weight rows are masked **before** any prediction is read, exactly like
 /// [`score_weighted`]. A non-finite prediction in a masked row is therefore
-/// invisible. `maximum` has no weighted form and refuses weights.
+/// invisible. `maximum` and `slope` have no weighted form and refuse weights.
 ///
 /// #289: the classification objectives read `pred` as a **logit**, derive the
 /// label `l = [y > weighted midpoint]` and accumulate the configured row loss.
@@ -727,7 +737,7 @@ pub fn score_native_weighted(
     }
     let weighted = !w.is_empty();
     if weighted {
-        if objective == ScoreObjective::Maximum {
+        if objective == ScoreObjective::Maximum || objective == ScoreObjective::Slope {
             return NativeScore::invalid(ScoreStatus::Invalid);
         }
         let mut total = 0.0;
@@ -776,6 +786,16 @@ pub fn score_native_weighted(
     }
 
     match objective {
+        ScoreObjective::Slope => {
+            if n < 2 {
+                return NativeScore::invalid(ScoreStatus::NonFinite);
+            }
+            let mut sum = 0.0;
+            for i in 1..n {
+                sum += ((pred[i] - pred[i - 1]) - (y[i] - y[i - 1])).abs();
+            }
+            NativeScore::ok(sum / (n - 1) as f64)
+        }
         ScoreObjective::Maximum => {
             let mut best_bits = 0u64;
             let mut best_row = 0usize;
@@ -1146,22 +1166,29 @@ fn weighted_correlation(a: &[f64], b: &[f64], w: &[f64]) -> f64 {
     }
     ma /= total;
     mb /= total;
+    let (mut ha, mut hb) = (0.0f64, 0.0f64);
+    for i in 0..a.len() {
+        if w[i] > 0.0 {
+            ha = ha.max((a[i] - ma).abs());
+            hb = hb.max((b[i] - mb).abs());
+        }
+    }
+    if !(ha >= f64::MIN_POSITIVE && hb >= f64::MIN_POSITIVE && ha.is_finite() && hb.is_finite()) {
+        return 0.0;
+    }
+    let (ha, hb) = (pow2_floor(ha), pow2_floor(hb));
     let (mut sab, mut sa, mut sb) = (0.0, 0.0, 0.0);
     for i in 0..a.len() {
         let wi = w[i];
         if wi > 0.0 {
-            let da = a[i] - ma;
-            let db = b[i] - mb;
+            let da = (a[i] - ma) / ha;
+            let db = (b[i] - mb) / hb;
             sab += wi * da * db;
             sa += wi * da * da;
             sb += wi * db * db;
         }
     }
-    if sa <= 0.0 || sb <= 0.0 {
-        0.0
-    } else {
-        sab / (sa.sqrt() * sb.sqrt())
-    }
+    clamp_correlation(sab, sa, sb)
 }
 
 /// Gaussian log-likelihood term `n·ln(RSS/n)`, guarding the perfect fit
@@ -1487,18 +1514,43 @@ pub fn correlation(a: &[f64], b: &[f64]) -> f64 {
     }
     let ma = a.iter().sum::<f64>() / n;
     let mb = b.iter().sum::<f64>() / n;
+    let (mut ha, mut hb) = (0.0f64, 0.0f64);
+    for i in 0..a.len() {
+        ha = ha.max((a[i] - ma).abs());
+        hb = hb.max((b[i] - mb).abs());
+    }
+    if !(ha >= f64::MIN_POSITIVE && hb >= f64::MIN_POSITIVE && ha.is_finite() && hb.is_finite()) {
+        return 0.0;
+    }
+    let (ha, hb) = (pow2_floor(ha), pow2_floor(hb));
     let (mut sab, mut sa, mut sb) = (0.0, 0.0, 0.0);
     for i in 0..a.len() {
-        let da = a[i] - ma;
-        let db = b[i] - mb;
+        let da = (a[i] - ma) / ha;
+        let db = (b[i] - mb) / hb;
         sab += da * db;
         sa += da * da;
         sb += db * db;
     }
-    if sa <= 0.0 || sb <= 0.0 {
-        0.0
+    clamp_correlation(sab, sa, sb)
+}
+
+/// The power of two at or below a normal positive `h`. Dividing by it is
+/// exact, so scaling the deviations changes no digit of a well-scaled input.
+pub(crate) fn pow2_floor(h: f64) -> f64 {
+    f64::from_bits(h.to_bits() & 0x7ff0_0000_0000_0000)
+}
+
+/// `sab / sqrt(sa * sb)` clamped to `[-1, 1]`. Zero variance or a non-finite
+/// result is `0.0`, the metric's worst value.
+fn clamp_correlation(sab: f64, sa: f64, sb: f64) -> f64 {
+    if !(sa > 0.0 && sb > 0.0) {
+        return 0.0;
+    }
+    let r = sab / (sa.sqrt() * sb.sqrt());
+    if r.is_finite() {
+        r.clamp(-1.0, 1.0)
     } else {
-        sab / (sa.sqrt() * sb.sqrt())
+        0.0
     }
 }
 
@@ -1826,6 +1878,48 @@ mod tests {
         assert!(approx(score(&p, &y, Metric::LogSquashed), logsq, 1e-12));
         // |e| sorted: 1,2,3,4 ; middle 50% is indices [1,3) = {2,3} -> 2.5
         assert!(approx(score(&p, &y, Metric::Interquartile), 2.5, 1e-12));
+    }
+
+    fn tiny_fixture() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let xs: Vec<f64> = (0..200).map(|i| 2.0 * i as f64 / 199.0).collect();
+        let b: Vec<f64> = xs.iter().map(|x| (x + 1.0).ln() + (x * x + 1.0).ln()).collect();
+        let tiny: Vec<f64> = xs.iter().map(|x| 1e-162 * x.exp()).collect();
+        let unit: Vec<f64> = xs.iter().map(|x| x.exp()).collect();
+        (tiny, unit, b)
+    }
+
+    #[test]
+    fn correlation_tiny_magnitude() {
+        let (tiny, unit, b) = tiny_fixture();
+        let r = correlation(&tiny, &b);
+        assert!(r.abs() <= 1.0, "r={r}");
+        assert!((r - correlation(&unit, &b)).abs() < 1e-9, "r={r}");
+        let w = vec![1.0; tiny.len()];
+        let rw = weighted_correlation(&tiny, &b, &w);
+        assert!(rw.abs() <= 1.0, "rw={rw}");
+        assert!((rw - correlation(&unit, &b)).abs() < 1e-9, "rw={rw}");
+        assert!(score(&tiny, &b, Metric::Correlation) >= 0.0);
+    }
+
+    #[test]
+    fn correlation_large_mean_small_spread() {
+        let xs: Vec<f64> = (0..200).map(|i| i as f64).collect();
+        let big: Vec<f64> = xs.iter().map(|x| 1e8 + 1e-6 * x).collect();
+        let want = correlation(&xs, &xs.iter().map(|x| x * x).collect::<Vec<_>>());
+        let y: Vec<f64> = xs.iter().map(|x| x * x).collect();
+        assert!((correlation(&big, &y) - want).abs() < 1e-6);
+        let w: Vec<f64> = (0..200).map(|i| 1.0 + (i % 3) as f64).collect();
+        let want_w = weighted_correlation(&xs, &y, &w);
+        assert!((weighted_correlation(&big, &y, &w) - want_w).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bounded_metric_never_solves_negative() {
+        for m in [Metric::Correlation, Metric::CorrelationSigned, Metric::Squared, Metric::RankCorrelation] {
+            assert!(!m.is_solved(-0.5), "{m:?}");
+            assert!(!m.is_solved(-1e-30), "{m:?}");
+            assert!(m.is_solved(0.0), "{m:?}");
+        }
     }
 
     #[test]
@@ -2376,6 +2470,7 @@ mod tests {
                 "maximum",
                 "signed",
                 "log_squashed",
+                "slope",
                 "implicit_residual",
                 "log_loss",
                 "brier",
@@ -2398,9 +2493,10 @@ mod tests {
         );
         // An unhandled metric must be a hard failure, never an MSE fallback.
         assert_eq!(
-            score_refusal(Metric::Slope).unwrap(),
-            "slope needs a cross-row first-difference pass"
+            score_refusal(Metric::ImplicitDerivative).unwrap(),
+            "implicit needs an expression-tree gradient pass"
         );
+        assert_eq!(score_dispatch(Metric::Slope).objective(), Some(ScoreObjective::Slope));
         assert_eq!(score_dispatch(Metric::Auc).objective(), None);
         assert_eq!(score_dispatch(Metric::Maximum).stat(), None);
     }
@@ -2421,6 +2517,12 @@ mod tests {
                     continue;
                 };
                 let got = score_native(pred, y, o, 2);
+                if o == ScoreObjective::Slope && pred.len() < 2 {
+                    assert_eq!(got.status, ScoreStatus::NonFinite);
+                    assert_eq!(got.value, f64::INFINITY);
+                    assert_eq!(score_with_constants(pred, y, *m, 2), f64::INFINITY);
+                    continue;
+                }
                 assert_eq!(got.status, ScoreStatus::Ok, "{}", o.name());
                 let want = score_with_constants(pred, y, *m, 2);
                 if o == ScoreObjective::Maximum {

@@ -442,6 +442,7 @@ rcsr-bench --suite all --problems nguyen9,sig_tanh --seeds 1,2 --generations 20 
 | `--cpu` | `Config::gpu = false`, no environment variable; `--gpu` needs a device and exits 2 without one |
 | `--fit-strategy exact\|auto\|linear\|varpro\|stream\|gpu\|default` | `exact` stays the bench default; `default` resolves the arm like the production CLI (`FitRequest::Unset`) |
 | `--fit-iters`, `--ops`, `--max-complexity`, `--patience`, `--migration-interval`, `--restart-interval`, `--variation`, `--dispatch` | copied into `search::Config` |
+| `--threads N` | worker threads for fitting and scoring inside an island (default: all cores; results do not depend on it) |
 | `--jobs N` | N CPU runs at once; each run keeps its seed, so results are identical, but `seconds` and `hit_s` are contended. Exits 2 with a device backend |
 | `--ndjson` | one JSON line per finished run, flushed at once, then one summary line |
 | `--json` | one JSON object, as before |

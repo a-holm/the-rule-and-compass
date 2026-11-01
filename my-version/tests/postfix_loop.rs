@@ -41,6 +41,7 @@ fn cfg(mode: VariationMode, islands: usize, pop: usize, generations: usize) -> C
         seed: 11,
         metric: Metric::Squared,
         gpu: true,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
         variation: mode,
         pipeline_depth: 0,
         ..Default::default()

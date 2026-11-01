@@ -57,6 +57,15 @@ the split you asked for.
   `tests/split_warning.rs::the_random_warning_does_not_claim_a_split_it_did_not_use`.
 * `tests/split.rs::temporal_split_is_chronological_and_honours_the_gap`.
 
+**`--metric slope`.** Slope differences each row with the previous row of the
+same group in the data order (`--time`, then `--group-by`). A gap in the time
+index is not detected: two rows on either side of a missing day are one pair,
+and their difference is a slope over the gap. The GPU scores and fits slope
+only when the training pairs are its consecutive rows: a single series under
+`--split temporal`. A panel with `--group-by` or a shuffled split keeps
+the CPU with the reason `slope pairs are not the consecutive rows of the
+training sample` (#236).
+
 ---
 
 ## 2. Purge the label horizon and embargo the boundary

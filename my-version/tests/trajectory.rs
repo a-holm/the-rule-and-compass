@@ -22,6 +22,17 @@ const FRONT: &str = "rank\tcomplexity\ttrain_error\ttest_error\texpression\n\
 
 #[test]
 fn documented_baseline_front_is_pinned() {
+    pinned_front(None);
+}
+
+/// #463: the serial path and a many-worker run give the same front.
+#[test]
+fn documented_baseline_front_is_pinned_at_one_and_eight_threads() {
+    pinned_front(Some("1"));
+    pinned_front(Some("8"));
+}
+
+fn pinned_front(threads: Option<&str>) {
     let out = std::env::temp_dir().join(format!(
         "rcsr-trajectory-{}.tsv",
         std::process::id()
@@ -54,6 +65,7 @@ fn documented_baseline_front_is_pinned() {
             out.to_str().expect("utf-8 path"),
             "--quiet",
         ])
+        .args(threads.map(|t| vec!["--threads", t]).unwrap_or_default())
         .output()
         .expect("run rcsr");
     assert!(

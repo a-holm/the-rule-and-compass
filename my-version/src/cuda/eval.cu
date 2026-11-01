@@ -792,6 +792,12 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
 #define RC_LOSS_HINGE_SQUARED 6
 #define RC_LOSS_HINGE_ORDINARY 7
 #define RC_LOSS_HINGE_SIGMOID 8
+/* #236: first-difference MAE over consecutive rows. Fit-only: never passed to
+   `rc_eval`/`rc_pool_eval`; the scorer is RC_SCORE_SLOPE. Row r >= 1 pairs
+   with row r - 1: the IRLS row is `sqrt(u)·(a_r - a_{r-1})` with response `sqrt(u)·g`,
+   `g = (p_r - p_{r-1}) - (y_r - y_{r-1})`, `u = 1/max(|g|, FT_L1_EPS)`, and the
+   loss statistic is `Σ |g|`. A launch with row weights is refused. */
+#define RC_LOSS_SLOPE 9
 
 /* #287: native score-objective codes (`ScoreObjective::code` in metrics.rs).
    These are deliberately separate from the fit `RC_LOSS_*` codes: fitting and
@@ -812,7 +818,7 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
  *
  * Label-aware row losses with `t = 2l - 1` and `p` the model output read as a
  * logit. They are disjoint from the regression score codes (0–9) and from the
- * fit `RC_LOSS_*` codes (0–8), so a fit launch and a score launch cannot be
+ * fit `RC_LOSS_*` codes (0–9), so a fit launch and a score launch cannot be
  * confused. The kernel accumulates `Σ wᵢ·lossᵢ` in f64, in fixed row order,
  * with no atomics; it divides by `Σw` (or the row count) in the same kernel,
  * exactly like `metrics::score_native_weighted`.
@@ -828,6 +834,12 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
 #define RC_SCORE_HINGE_ORDINARY 13
 #define RC_SCORE_HINGE_SQUARED 14
 #define RC_SCORE_ALL_ZERO_WEIGHT 4
+
+/* #236: mean `|(p_r - p_{r-1}) - (y_r - y_{r-1})|` over the consecutive rows
+   of the resident sample, divided by `n - 1`. A launch with row weights or in
+   a tiled context is refused: slope has no weighted form, and row `r - 1` of a
+   tile's first row is not resident. */
+#define RC_SCORE_SLOPE 15
 
 /* #222: the L1 majoriser floor, the same `1e-6` the CPU `irls_fit` uses. It is
    deliberately not smaller: at |r| = 0 the exact weight is infinite, and a
@@ -1136,6 +1148,23 @@ __device__ __forceinline__ void score_step(
             }
             a += wi * rc_class_row_loss(pred, t, MODE);
             b += wi;
+        }
+    } else if (MODE == RC_SCORE_SLOPE) {
+        /* #236: lane `l` owns the pairs (r - 1, r) of its rows r >= 1 and runs
+           both rows itself, so no lane reads another lane's state and the #293
+           carry holds on resident columns. Row 0 is checked as the
+           predecessor of row 1. */
+        for (long long r = first; r < r_end; r += lanes) {
+            if (r < 1) continue;
+            const int i = (int)r;
+            const float pc = rc_exec_row(code, wc, ld, i);
+            const float pp = rc_exec_row(code, wc, ld, i - 1);
+            if (!isfinite(pc) || !isfinite(pp)) {
+                lbad = 1;
+                continue;
+            }
+            const double g = ((double)pc - (double)pp) - ((double)y[i] - (double)y[i - 1]);
+            a += fabs(g);
         }
     } else if (w && MODE != RC_SCORE_MAXIMUM) {
         /* Weighted regression: `a` carries `Σ wᵢ·termᵢ`, `b` the weight sum
@@ -1447,7 +1476,10 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
         if (tid == 0) {
             const double sum = sh1[0];
             const double denom = w ? sh2[0] : (double)n;
-            if (w && !(denom > 0.0)) {
+            if (MODE == RC_SCORE_SLOPE) {
+                out[p] = n < 2 ? INFINITY : sum / (double)(n - 1);
+                status[p] = n < 2 ? RC_SCORE_NONFINITE : 0;
+            } else if (w && !(denom > 0.0)) {
                 out[p] = INFINITY;
                 status[p] = RC_SCORE_ALL_ZERO_WEIGHT;
             } else if (MODE == RC_SCORE_AIC || MODE == RC_SCORE_AICC || MODE == RC_SCORE_BIC) {
@@ -1654,6 +1686,11 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_finish_kernel(
     } else {
         const double sum = sh1[0];
         const double denom = weighted ? sh2[0] : (double)n;
+        if (MODE == RC_SCORE_SLOPE) {
+            out[p] = n < 2 ? INFINITY : sum / (double)(n - 1);
+            status[p] = n < 2 ? RC_SCORE_NONFINITE : 0;
+            return;
+        }
         if (weighted && !(denom > 0.0)) {
             out[p] = INFINITY;
             status[p] = RC_SCORE_ALL_ZERO_WEIGHT;
@@ -1751,6 +1788,10 @@ struct FtSmem {
     int sstart;
     double slambda;
     double sbest;
+    /* #236: the previous chunk's last row for the slope pair of a chunk's
+       first row: raw adjoints, then the prediction. */
+    float scarry[MAXC + 1];
+    double sdcarry[MAXC + 1];
 };
 
 __device__ __forceinline__ void ft_forward(const unsigned int *nd,
@@ -2084,6 +2125,307 @@ __device__ __forceinline__ int ft_stat_kind(int s, int tri, int p, int *ei, int 
     return 2;
 }
 
+/* --- #236: the slope pair arm of the batched fit ---------------------------
+ *
+ * Row r >= 1 pairs with row r - 1 of the resident sample. Each chunk first
+ * stages the raw adjoint and prediction of its rows; thread k then differences
+ * its row against row k - 1 of the chunk, or, for k = 0, against the previous
+ * chunk's last row held in `carry`. The staged row is overwritten in place, so
+ * no second row buffer exists. Row 0 has no pair and stages zeros. The owner
+ * accumulation is the one of `ft_assemble`, so the statistics keep their fixed
+ * row order. A row whose prediction or adjoint is not finite sets `bad`. */
+template <int MAXC, int CHUNK>
+__device__ void ft_assemble_slope(const unsigned int *nd,
+                                  int m,
+                                  const float *__restrict__ cols,
+                                  const float *__restrict__ y,
+                                  int n,
+                                  int p,
+                                  const double *c,
+                                  float *sg,
+                                  float *sr,
+                                  double *sl,
+                                  float *carry,
+                                  double *jtj,
+                                  double *jtr,
+                                  double *ploss,
+                                  int *bad)
+{
+    const int tid = threadIdx.x;
+    const int tri = p * (p + 1) / 2;
+    const int total = tri + p + 1;
+    int own[FT_OWNED(MAXC, CHUNK)];
+    int own_kind[FT_OWNED(MAXC, CHUNK)];
+    int own_i[FT_OWNED(MAXC, CHUNK)];
+    int own_j[FT_OWNED(MAXC, CHUNK)];
+    double acc[FT_OWNED(MAXC, CHUNK)];
+    int nown = 0;
+    for (int s = tid; s < total; s += CHUNK) {
+        own[nown] = s;
+        own_kind[nown] = ft_stat_kind(s, tri, p, &own_i[nown], &own_j[nown]);
+        acc[nown] = 0.0;
+        ++nown;
+    }
+    for (int base = 0; base < n; base += CHUNK) {
+        const int rows = min(CHUNK, n - base);
+        const int row = base + tid;
+        float g[MAXC];
+        float pred = 0.0f;
+        bool ok = false;
+        if (row < n) {
+            float vt[FT_MAX_NODES];
+            float adj[FT_MAX_NODES];
+            ft_forward(nd, m, cols, n, row, c, vt);
+            pred = vt[m - 1];
+            ok = isfinite(pred) && fabsf(pred) <= 1e30f;
+            ft_backward<MAXC>(nd, m, vt, adj, g, p);
+            for (int j = 0; j < p; ++j) {
+                if (!isfinite(g[j])) ok = false;
+                sg[tid * p + j] = g[j];
+            }
+            sr[tid] = pred;
+            if (!ok) *bad = 1;
+        }
+        __syncthreads();
+        const bool paired = row < n && row >= 1;
+        float gp[MAXC];
+        float pp = 0.0f;
+        if (paired) {
+            const float *src = (tid == 0) ? carry : sg + (size_t)(tid - 1) * p;
+            for (int j = 0; j < p; ++j) gp[j] = src[j];
+            pp = (tid == 0) ? carry[p] : sr[tid - 1];
+        }
+        __syncthreads();
+        if (row < n && tid == rows - 1) {
+            for (int j = 0; j < p; ++j) carry[j] = g[j];
+            carry[p] = pred;
+        }
+        const double gpair = paired
+            ? ((double)pred - (double)pp) - ((double)y[row] - (double)y[row - 1])
+            : 0.0;
+        if (paired && ok && isfinite(gpair)) {
+            const float s = sqrtf((float)(1.0 / fmax(fabs(gpair), FT_L1_EPS)));
+            for (int j = 0; j < p; ++j) sg[tid * p + j] = s * (g[j] - gp[j]);
+            sr[tid] = (float)(s * gpair);
+            sl[tid] = fabs(gpair);
+        } else {
+            for (int j = 0; j < p; ++j) sg[tid * p + j] = 0.0f;
+            sr[tid] = 0.0f;
+            sl[tid] = 0.0;
+        }
+        __syncthreads();
+        for (int o = 0; o < nown; ++o) {
+            if (own_kind[o] == 0) {
+                const int ei = own_i[o];
+                const int ej = own_j[o];
+                for (int k = 0; k < rows; ++k) {
+                    acc[o] += (double)(sg[k * p + ei] * sg[k * p + ej]);
+                }
+            } else if (own_kind[o] == 1) {
+                const int which = own[o] - tri;
+                for (int k = 0; k < rows; ++k) {
+                    acc[o] += (double)(sg[k * p + which] * sr[k]);
+                }
+            } else {
+                for (int k = 0; k < rows; ++k) acc[o] += sl[k];
+            }
+        }
+        __syncthreads();
+    }
+    for (int o = 0; o < nown; ++o) {
+        if (own_kind[o] == 0) {
+            jtj[own[o]] = acc[o];
+        } else if (own_kind[o] == 1) {
+            jtr[own[o] - tri] = acc[o];
+        } else {
+            *ploss = acc[o];
+        }
+    }
+    __syncthreads();
+}
+
+/* The f64 twin of `ft_assemble_slope` for the polish, on the exact rows. */
+template <int MAXC, int PCHUNK>
+__device__ void ft_assemble_slope_d(const unsigned int *nd,
+                                    int m,
+                                    const double *__restrict__ cols,
+                                    const double *__restrict__ y,
+                                    int n,
+                                    int p,
+                                    const double *c,
+                                    double *dg,
+                                    double *dr,
+                                    double *dl,
+                                    double *carry,
+                                    double *jtj,
+                                    double *jtr,
+                                    double *ploss,
+                                    int *bad)
+{
+    const int tid = threadIdx.x;
+    const int tri = p * (p + 1) / 2;
+    const int total = tri + p + 1;
+    int own[FT_OWNED(MAXC, PCHUNK)];
+    int own_kind[FT_OWNED(MAXC, PCHUNK)];
+    int own_i[FT_OWNED(MAXC, PCHUNK)];
+    int own_j[FT_OWNED(MAXC, PCHUNK)];
+    double acc[FT_OWNED(MAXC, PCHUNK)];
+    int nown = 0;
+    for (int s = tid; s < total; s += PCHUNK) {
+        own[nown] = s;
+        own_kind[nown] = ft_stat_kind(s, tri, p, &own_i[nown], &own_j[nown]);
+        acc[nown] = 0.0;
+        ++nown;
+    }
+    for (int base = 0; base < n; base += PCHUNK) {
+        const int rows = min(PCHUNK, n - base);
+        const int row = base + tid;
+        const bool mine = tid < PCHUNK && row < n;
+        double g[MAXC];
+        double pred = 0.0;
+        bool ok = false;
+        if (mine) {
+            double v[FT_MAX_NODES];
+            double adj[FT_MAX_NODES];
+            ft_forward_d(nd, m, cols, n, row, c, v);
+            pred = v[m - 1];
+            ok = isfinite(pred);
+            ft_backward_d<MAXC>(nd, m, v, adj, g, p);
+            for (int j = 0; j < p; ++j) {
+                if (!isfinite(g[j])) ok = false;
+                dg[tid * p + j] = g[j];
+            }
+            dr[tid] = pred;
+            if (!ok) *bad = 1;
+        }
+        __syncthreads();
+        const bool paired = mine && row >= 1;
+        double gp[MAXC];
+        double pp = 0.0;
+        if (paired) {
+            const double *src = (tid == 0) ? carry : dg + (size_t)(tid - 1) * p;
+            for (int j = 0; j < p; ++j) gp[j] = src[j];
+            pp = (tid == 0) ? carry[p] : dr[tid - 1];
+        }
+        __syncthreads();
+        if (mine && tid == rows - 1) {
+            for (int j = 0; j < p; ++j) carry[j] = g[j];
+            carry[p] = pred;
+        }
+        if (tid < PCHUNK) {
+            const double gpair = paired ? (pred - pp) - (y[row] - y[row - 1]) : 0.0;
+            if (paired && ok && isfinite(gpair)) {
+                const double s = sqrt(1.0 / fmax(fabs(gpair), FT_L1_EPS));
+                for (int j = 0; j < p; ++j) dg[tid * p + j] = s * (g[j] - gp[j]);
+                dr[tid] = s * gpair;
+                dl[tid] = fabs(gpair);
+            } else {
+                for (int j = 0; j < p; ++j) dg[tid * p + j] = 0.0;
+                dr[tid] = 0.0;
+                dl[tid] = 0.0;
+            }
+        }
+        __syncthreads();
+        for (int o = 0; o < nown; ++o) {
+            if (own_kind[o] == 0) {
+                const int ei = own_i[o];
+                const int ej = own_j[o];
+                for (int k = 0; k < rows; ++k) acc[o] += dg[k * p + ei] * dg[k * p + ej];
+            } else if (own_kind[o] == 1) {
+                const int which = own[o] - tri;
+                for (int k = 0; k < rows; ++k) acc[o] += dg[k * p + which] * dr[k];
+            } else {
+                for (int k = 0; k < rows; ++k) acc[o] += dl[k];
+            }
+        }
+        __syncthreads();
+    }
+    for (int o = 0; o < nown; ++o) {
+        if (own_kind[o] == 0) {
+            jtj[own[o]] = acc[o];
+        } else if (own_kind[o] == 1) {
+            jtr[own[o] - tri] = acc[o];
+        } else {
+            *ploss = acc[o];
+        }
+    }
+    __syncthreads();
+}
+
+/* Trial objective `Σ |g|` over the pairs (r - 1, r): each thread runs both rows
+   of its pairs, so the sweep needs no synchronisation before the fixed-order
+   reduction. A non-finite or f32-overflowing prediction adds 1e30. */
+template <int CHUNK>
+__device__ double ft_loss_slope(const unsigned int *nd,
+                                int m,
+                                const float *__restrict__ cols,
+                                const float *__restrict__ y,
+                                int n,
+                                const double *c,
+                                double *red)
+{
+    const int tid = threadIdx.x;
+    double local = 0.0;
+    for (int row = tid; row < n; row += CHUNK) {
+        if (row < 1) continue;
+        float vt[FT_MAX_NODES];
+        ft_forward(nd, m, cols, n, row, c, vt);
+        const float pc = vt[m - 1];
+        ft_forward(nd, m, cols, n, row - 1, c, vt);
+        const float pp = vt[m - 1];
+        if (!isfinite(pc) || fabsf(pc) > 1e30f || !isfinite(pp) || fabsf(pp) > 1e30f) {
+            local += 1e30;
+            continue;
+        }
+        const double g = ((double)pc - (double)pp) - ((double)y[row] - (double)y[row - 1]);
+        local += isfinite(g) ? fabs(g) : 1e30;
+    }
+    red[tid] = local;
+    __syncthreads();
+    for (int st = CHUNK / 2; st > 0; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    const double total = red[0];
+    __syncthreads();
+    return total;
+}
+
+/* The f64 twin of `ft_loss_slope` on the exact rows. */
+template <int PCHUNK>
+__device__ double ft_loss_slope_d(const unsigned int *nd,
+                                  int m,
+                                  const double *__restrict__ cols,
+                                  const double *__restrict__ y,
+                                  int n,
+                                  const double *c,
+                                  double *red)
+{
+    const int tid = threadIdx.x;
+    double local = 0.0;
+    if (tid < PCHUNK) {
+        for (int row = tid; row < n; row += PCHUNK) {
+            if (row < 1) continue;
+            double v[FT_MAX_NODES];
+            ft_forward_d(nd, m, cols, n, row, c, v);
+            const double pc = v[m - 1];
+            ft_forward_d(nd, m, cols, n, row - 1, c, v);
+            const double pp = v[m - 1];
+            const double g = (pc - pp) - (y[row] - y[row - 1]);
+            local += (isfinite(pc) && isfinite(pp) && isfinite(g)) ? fabs(g) : 1e30;
+        }
+    }
+    red[tid] = local;
+    __syncthreads();
+    for (int st = PCHUNK / 2; st > 0; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    const double total = red[0];
+    __syncthreads();
+    return total;
+}
+
 template <int MAXC, int PCHUNK>
 __device__ void ft_assemble_d(const unsigned int *nd,
                               int m,
@@ -2103,8 +2445,14 @@ __device__ void ft_assemble_d(const unsigned int *nd,
                               double *jtr,
                               double *ploss,
                               int *bad,
-                              int *skipped)
+                              int *skipped,
+                              double *dcarry)
 {
+    if (metric == RC_LOSS_SLOPE) {
+        ft_assemble_slope_d<MAXC, PCHUNK>(nd, m, cols, y, n, p, c, dg, dr, dl, dcarry, jtj, jtr,
+                                          ploss, bad);
+        return;
+    }
     const int tid = threadIdx.x;
     const int tri = p * (p + 1) / 2;
     const int total = tri + p + 1;
@@ -2244,6 +2592,7 @@ __device__ double ft_loss_d(const unsigned int *nd,
                             const double *c,
                             double *red)
 {
+    if (metric == RC_LOSS_SLOPE) return ft_loss_slope_d<PCHUNK>(nd, m, cols, y, n, c, red);
     const int tid = threadIdx.x;
     double local = 0.0;
     if (tid < PCHUNK) {
@@ -2313,8 +2662,14 @@ __device__ void ft_assemble(const unsigned int *nd,
                             double *jtj,
                             double *jtr,
                             double *ploss,
-                            int *bad)
+                            int *bad,
+                            float *carry)
 {
+    if (metric == RC_LOSS_SLOPE) {
+        ft_assemble_slope<MAXC, CHUNK>(nd, m, cols, y, n, p, c, sg, sr, sl, carry, jtj, jtr, ploss,
+                                       bad);
+        return;
+    }
     const int tid = threadIdx.x;
     const int tri = p * (p + 1) / 2;
     const int total = tri + p + 1;
@@ -2431,6 +2786,7 @@ __device__ double ft_loss(const unsigned int *nd,
                           const double *c,
                           double *red)
 {
+    if (metric == RC_LOSS_SLOPE) return ft_loss_slope<CHUNK>(nd, m, cols, y, n, c, red);
     const int tid = threadIdx.x;
     double local = 0.0;
     for (int row = tid; row < n; row += CHUNK) {
@@ -2907,6 +3263,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                            const int *__restrict__ pcount,
                            int kmax,
                            const double *__restrict__ c0,
+                           const double *__restrict__ cbase,
                            const int *__restrict__ gauge,
                            int iters,
                            int metric,
@@ -2926,7 +3283,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
     /* #234: the logistic arm is row-weighted by `q(1-q) <= 0.25` and asks the
        same identification question, so it uses the scale-free gate too. */
     const int scale_free = (metric == RC_LOSS_LOG_SQUASHED || metric == RC_LOSS_ABSOLUTE ||
-                            rc_fit_reads_sign(metric));
+                            metric == RC_LOSS_SLOPE || rc_fit_reads_sign(metric));
 
     extern __shared__ char ft_smem_raw[];
     FtSmem<MAXC, CHUNK, PCHUNK> *S =
@@ -3130,23 +3487,30 @@ __global__ void fit_kernel(const float *__restrict__ cols,
        because the rejection judges the logistic direction, not the step
        length. The polish always runs in phase 1. `phase` is derived from
        block-uniform values only, so every thread holds the same value. */
-    const int irls = (metric == RC_LOSS_ABSOLUTE || metric == RC_LOSS_HINGE_ORDINARY);
+    const int irls = (metric == RC_LOSS_ABSOLUTE || metric == RC_LOSS_HINGE_ORDINARY ||
+                      metric == RC_LOSS_SLOPE);
     const int rounds = irls ? (iters < 1 ? 1 : (iters < 4 ? iters : 4)) : 1;
     const int inner = irls ? (iters / rounds < 1 ? 1 : iters / rounds) : iters;
     int phase = 0;
+    /* #236: a slope step that is exactly zero (every slot frozen, e.g. a lone
+       additive constant) can never improve, so the damped loop stops. */
+    int stalled = 0;
+    /* #236: 1 when the slope arm returned the incoming constants. */
+    int kept = 0;
+    double kept_loss = 0.0;
 
     if (iters > 0) {
         /* First assembly also supplies the baseline objective. */
-        ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
+        ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad, S->scarry);
         assembled = 1;
         best = S->sbest;
         if (tid == 0) S->sstart = S->sbad ? 0 : 1;
         if (S->sbad) status = 2;
-        for (int round = 0; round < rounds && status == 0 && best != 0.0; ++round) {
+        for (int round = 0; round < rounds && status == 0 && best != 0.0 && !stalled; ++round) {
             if (irls && round > 0) assembled = 0; /* new weights, new Gram */
             for (int it = 0; it < inner && status == 0; ++it) {
                 if (!assembled) {
-                    ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
+                    ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad, S->scarry);
                     assembled = 1;
                     if (S->sbad) {
                         status = 2;
@@ -3157,10 +3521,19 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                     const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, S->slambda, p, S->sdelta, S->sL, scale_free);
                     S->ssolved = (solve != 1);
                     if (solve == 4) S->srank = 1;
+                    if (S->ssolved && metric == RC_LOSS_SLOPE) {
+                        int moved = 0;
+                        for (int j = 0; j < p; ++j) moved |= (S->sdelta[j] != 0.0);
+                        if (!moved) S->ssolved = 2;
+                    }
                 }
                 __syncthreads();
                 if (!S->ssolved) {
                     status = 1;
+                    break;
+                }
+                if (S->ssolved == 2) {
+                    stalled = 1;
                     break;
                 }
                 if (tid < p) {
@@ -3221,8 +3594,8 @@ __global__ void fit_kernel(const float *__restrict__ cols,
             if (isfinite(exact)) best = exact;
         }
         /* Undamped Gauss-Newton polish, exactly like the CPU path. */
-        for (int it = 0; it < 4 && status == 0 && best != 0.0; ++it) {
-            ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, p, metric, phase, S->sc, S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad, &S->sskip);
+        for (int it = 0; it < 4 && status == 0 && best != 0.0 && !stalled; ++it) {
+            ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, p, metric, phase, S->sc, S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad, &S->sskip, S->sdcarry);
             assembled = 1;
             if (S->sbad) {
                 status = 2;
@@ -3258,6 +3631,27 @@ __global__ void fit_kernel(const float *__restrict__ cols,
             }
             __syncthreads();
         }
+        /* #236: the CPU slope arm keeps the incoming constants unless the
+           fitted ones are finite and strictly lower. Both are judged by the
+           same f64 pair sweep. */
+        if (metric == RC_LOSS_SLOPE && cbase) {
+            const double fitted = (status == 0)
+                ? best
+                : ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->sc, S->sred);
+            if (tid < p) S->strial[tid] = cbase[(size_t)cand * (size_t)kmax + (size_t)tid];
+            __syncthreads();
+            const double incoming =
+                ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred);
+            if (fitted < 1e30 && fitted < incoming) {
+                best = fitted;
+            } else {
+                if (tid < p) S->sc[tid] = S->strial[tid];
+                best = incoming;
+                kept = 1;
+                kept_loss = incoming;
+            }
+            __syncthreads();
+        }
     }
 
     /* #286: label a finite answer instead of discarding it.
@@ -3270,7 +3664,9 @@ __global__ void fit_kernel(const float *__restrict__ cols,
      * and only a non-finite start with no accepted iterate is status 7; neither
      * needs the CPU arm, which cannot move a non-finite start either. */
     if (tid == 0) {
-        if (status == 1 || status == 2) {
+        if (kept) {
+            status = kept_loss < 1e30 ? 6 : 7;
+        } else if (status == 1 || status == 2) {
             if (!S->sstart) status = 7;
             else if (S->simproved) status = 5;
             else status = 6;
@@ -3286,10 +3682,13 @@ __global__ void fit_kernel(const float *__restrict__ cols,
 }
 
 /* SM-1 probe: the statistics `fit_kernel` sees at each candidate's start
- * constants, without a step. Per candidate `out[k * (4 + kmax) + ...]` holds
- * the f32 assembly loss, the f32 trial loss, the f64 assembly loss, the f64
- * trial loss and then the f64 assembly's J^T r (p entries). Test support for
+ * constants, without a step. Per candidate `out[k * FT_PROBE_STRIDE(kmax) + ...]`
+ * holds the f32 assembly loss, the f32 trial loss, the f64 assembly loss, the
+ * f64 trial loss, the f64 assembly's J^T r (kmax slots) and its packed lower
+ * J^T J (#236). Test support for
  * the fit codes; the search never launches it. */
+#define FT_PROBE_STRIDE(K) (4 + (K) + (K) * ((K) + 1) / 2)
+
 template <int MAXC, int CHUNK, int PCHUNK>
 __global__ void fit_probe_kernel(const float *__restrict__ cols,
                                  const float *__restrict__ y,
@@ -3323,21 +3722,22 @@ __global__ void fit_probe_kernel(const float *__restrict__ cols,
     }
     __syncthreads();
     ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, phase, S->sc, S->sg, S->sr,
-                             S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
+                             S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad, S->scarry);
     const double a32 = S->sbest;
     const double l32 = ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->sc, S->sred);
     ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, p, metric, phase, S->sc,
                                 S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad,
-                                &S->sskip);
+                                &S->sskip, S->sdcarry);
     const double a64 = S->sbest;
     const double l64 = ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->sc, S->sred);
     if (tid == 0) {
-        double *o = out + (size_t)cand * (size_t)(4 + kmax);
+        double *o = out + (size_t)cand * (size_t)FT_PROBE_STRIDE(kmax);
         o[0] = a32;
         o[1] = l32;
         o[2] = a64;
         o[3] = l64;
         for (int i = 0; i < p; ++i) o[4 + i] = S->sjtr[i];
+        for (int s = 0; s < p * (p + 1) / 2; ++s) o[4 + kmax + s] = S->sjtj[s];
     }
 }
 
@@ -3372,6 +3772,7 @@ static int ft_launch(RcCtx *c,
                      const unsigned int *d_off,
                      const int *d_p,
                      const double *d_c0,
+                     const double *d_cbase,
                      const int *d_gauge,
                      int iters,
                      int metric,
@@ -3392,7 +3793,8 @@ static int ft_launch(RcCtx *c,
     }
     fit_kernel<MAXC, CHUNK, PCHUNK><<<nprog, CHUNK, bytes, c->s_fit>>>(
         c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->n,
-        c->v, d_prog, d_off, d_p, kmax, d_c0, d_gauge, iters, metric, d_c, d_sse, d_status);
+        c->v, d_prog, d_off, d_p, kmax, d_c0, d_cbase, d_gauge, iters, metric, d_c, d_sse,
+        d_status);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
@@ -4613,6 +5015,7 @@ static int rc_rows_dispatch(RcCtx *c, const unsigned int *prog, const unsigned i
         RC_ROWS_CASE(RC_SCORE_HINGE_SIGMOID)
         RC_ROWS_CASE(RC_SCORE_HINGE_ORDINARY)
         RC_ROWS_CASE(RC_SCORE_HINGE_SQUARED)
+        RC_ROWS_CASE(RC_SCORE_SLOPE)
 #undef RC_ROWS_CASE
         default: return -1;
     }
@@ -4767,6 +5170,12 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
         st->wall_ms = rc_now_ms() - c->batch_start_ms;
         return -1.0f;
     }
+
+    if (kind == RC_SCORE_SLOPE && (c->tiled || c->d_w64)) {
+        st->failed = 1;
+        st->wall_ms = rc_now_ms() - c->batch_start_ms;
+        return -1.0f;
+    }
     t = rc_now_ms();
     const int wave = c->tiled ? rc_wave_width(c, nprog) : nprog;
     if ((bounds || c->tiled) && rc_carry_reserve(c, wave) != 0) {
@@ -4878,6 +5287,12 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
             break;
         case RC_SCORE_HINGE_SQUARED:
             score_kernel<RC_SCORE_HINGE_SQUARED><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        case RC_SCORE_SLOPE:
+            score_kernel<RC_SCORE_SLOPE><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
@@ -5157,9 +5572,9 @@ int rc_set_fit_sign(void *ctx, const double *sign)
 /* --- #169: batched LM fit entry point -------------------------------------
  *
  * `metric` is one of the `RC_LOSS_*` codes: 0 squared, 1 log-squashed,
- * 4 absolute, 5 the logistic cross-entropy (#234) and 6-8 the hinge forms
- * (SM-1); 5-8 also need the sign uploaded by `rc_set_fit_sign`. 2 and 3 are
- * the fit-only correlation codes, which run their own kernel.
+ * 4 absolute, 5 the logistic cross-entropy (#234), 6-8 the hinge forms (SM-1)
+ * and 9 slope (#236); 5-8 also need the sign uploaded by `rc_set_fit_sign`. 2
+ * and 3 are the fit-only correlation codes, which run their own kernel.
  *
  * `prog` is the concatenated 4-word node records; `off` has nprog+1 word
  * offsets; `pcount` has one constant count per candidate; constants start at
@@ -5168,35 +5583,43 @@ int rc_set_fit_sign(void *ctx, const double *sign)
  * per-row IRLS weights `2/(1 + r^2)` (#229). Returns the kernel time in
  * milliseconds, or a negative value when the launch failed (the caller then
  * keeps the CPU arm).
+ *
+ * #236: `cbase`, when not NULL, holds each candidate's incoming constants in
+ * the `c0` layout. The slope arm starts from `c0` (the squared warm start) and
+ * returns `cbase` unless its own answer is finite and strictly lower on the
+ * f64 slope sum. Every other code ignores it.
  */
-float rc_fit_batch(void *ctx,
-                   const unsigned int *prog,
-                   const unsigned int *off,
-                   const int *pcount,
-                   int nprog,
-                   int kmax,
-                   const double *c0,
-                   const int *gauge,
-                   int iters,
-                   int metric,
-                   double *outc,
-                   double *outsse,
-                   int *outstatus)
+static float rc_fit_launch(RcCtx *c,
+                           const unsigned int *prog,
+                           const unsigned int *off,
+                           const int *pcount,
+                           int nprog,
+                           int kmax,
+                           const double *c0,
+                           const double *cbase,
+                           const int *gauge,
+                           int iters,
+                           int metric,
+                           double *outc,
+                           double *outsse,
+                           int *outstatus)
 {
-    RcCtx *c = (RcCtx *)ctx;
     if (!c || c->tiled || nprog <= 0 || kmax <= 0) return -1.0f;
     /* #234/SM-1: a log-loss or hinge batch without the uploaded label sign is
        refused here, so the arm can never run on another objective. */
     if (rc_fit_reads_sign(metric) && !c->has_tsign) return -1.0f;
+    /* #236: slope has no weighted form. */
+    if (metric == RC_LOSS_SLOPE && c->d_w64) return -1.0f;
     if (kmax > FT_MAX_CONST_LARGE) return -1.0f;
     const size_t prog_words = (size_t)off[nprog];
     const size_t cbytes = sizeof(double) * (size_t)nprog * (size_t)kmax;
-    /* #334: [ prog | off | pcount | c0 | gauge ] then [ c | sse | status ]. */
+    /* #334: [ prog | off | pcount | c0 | cbase | gauge ] then [ c | sse | status ]. */
     size_t cur = 0;
     const size_t o_prog = rc_fs_take(&cur, sizeof(unsigned int) * prog_words);
     const size_t o_off = rc_fs_take(&cur, sizeof(unsigned int) * (size_t)(nprog + 1));
     const size_t o_p = rc_fs_take(&cur, sizeof(int) * (size_t)nprog);
     const size_t o_c0 = rc_fs_take(&cur, cbytes);
+    const size_t o_cbase = rc_fs_take(&cur, cbase ? cbytes : 0);
     const size_t o_gauge = rc_fs_take(&cur, sizeof(int) * (size_t)nprog * 2);
     const size_t in_end = rc_fs_take(&cur, 0);
     const size_t o_c = rc_fs_take(&cur, cbytes);
@@ -5215,21 +5638,23 @@ float rc_fit_batch(void *ctx,
     memcpy(host + o_off, off, sizeof(unsigned int) * (size_t)(nprog + 1));
     memcpy(host + o_p, pcount, sizeof(int) * (size_t)nprog);
     memcpy(host + o_c0, c0, cbytes);
+    if (cbase) memcpy(host + o_cbase, cbase, cbytes);
     memcpy(host + o_gauge, gauge, sizeof(int) * (size_t)nprog * 2);
     rc_fs_h2d(c, base, host, in_end);
+    const double *d_cbase = cbase ? (const double *)(base + o_cbase) : (const double *)0;
     cudaEventRecord(c->t0, c->s_fit);
     int launched;
     if (kmax <= FT_MAX_CONST_SMALL) {
         launched = ft_launch<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK>(
             c, nprog, kmax, (const unsigned int *)(base + o_prog),
             (const unsigned int *)(base + o_off), (const int *)(base + o_p),
-            (const double *)(base + o_c0), (const int *)(base + o_gauge), iters, metric,
+            (const double *)(base + o_c0), d_cbase, (const int *)(base + o_gauge), iters, metric,
             (double *)(base + o_c), (double *)(base + o_sse), (int *)(base + o_status));
     } else {
         launched = ft_launch<FT_MAX_CONST_LARGE, FT_CHUNK_LARGE, FT_PCHUNK>(
             c, nprog, kmax, (const unsigned int *)(base + o_prog),
             (const unsigned int *)(base + o_off), (const int *)(base + o_p),
-            (const double *)(base + o_c0), (const int *)(base + o_gauge), iters, metric,
+            (const double *)(base + o_c0), d_cbase, (const int *)(base + o_gauge), iters, metric,
             (double *)(base + o_c), (double *)(base + o_sse), (int *)(base + o_status));
     }
     cudaEventRecord(c->t1, c->s_fit);
@@ -5249,6 +5674,45 @@ float rc_fit_batch(void *ctx,
     return ms;
 }
 
+float rc_fit_batch(void *ctx,
+                   const unsigned int *prog,
+                   const unsigned int *off,
+                   const int *pcount,
+                   int nprog,
+                   int kmax,
+                   const double *c0,
+                   const int *gauge,
+                   int iters,
+                   int metric,
+                   double *outc,
+                   double *outsse,
+                   int *outstatus)
+{
+    return rc_fit_launch((RcCtx *)ctx, prog, off, pcount, nprog, kmax, c0, 0, gauge, iters,
+                         metric, outc, outsse, outstatus);
+}
+
+/* #236: `rc_fit_batch` from explicit start constants `c0`, with the incoming
+   constants `cbase` the slope arm keeps unless it improves on them. */
+float rc_fit_batch_from(void *ctx,
+                        const unsigned int *prog,
+                        const unsigned int *off,
+                        const int *pcount,
+                        int nprog,
+                        int kmax,
+                        const double *c0,
+                        const double *cbase,
+                        const int *gauge,
+                        int iters,
+                        int metric,
+                        double *outc,
+                        double *outsse,
+                        int *outstatus)
+{
+    return rc_fit_launch((RcCtx *)ctx, prog, off, pcount, nprog, kmax, c0, cbase, gauge, iters,
+                         metric, outc, outsse, outstatus);
+}
+
 /* Shape of the fit-kernel instantiation that would run a batch whose largest
  * constant count is `kmax`: block width, dynamic shared bytes and the largest
  * constant count of that instantiation. Returns 0, or -1 when `kmax` is past
@@ -5260,7 +5724,7 @@ int rc_fit_kernel_info(int kmax, int *threads, int *smem_bytes, int *max_constan
 }
 
 /* SM-1: run `fit_probe_kernel` over a batch laid out like `rc_fit_batch`.
- * `out` holds `nprog * (4 + kmax)` doubles. Only the p <= 16 instantiation is
+ * `out` holds `nprog * FT_PROBE_STRIDE(kmax)` doubles. Only the p <= 16 instantiation is
  * probed. Returns 0, or -1 when the batch was refused or the launch failed. */
 int rc_fit_probe(void *ctx,
                  const unsigned int *prog,
@@ -5276,9 +5740,10 @@ int rc_fit_probe(void *ctx,
     RcCtx *c = (RcCtx *)ctx;
     if (!c || c->tiled || nprog <= 0 || kmax <= 0 || kmax > FT_MAX_CONST_SMALL) return -1;
     if (rc_fit_reads_sign(metric) && !c->has_tsign) return -1;
+    if (metric == RC_LOSS_SLOPE && c->d_w64) return -1;
     const size_t prog_words = (size_t)off[nprog];
     const size_t cbytes = sizeof(double) * (size_t)nprog * (size_t)kmax;
-    const size_t obytes = sizeof(double) * (size_t)nprog * (size_t)(4 + kmax);
+    const size_t obytes = sizeof(double) * (size_t)nprog * (size_t)FT_PROBE_STRIDE(kmax);
     size_t cur = 0;
     const size_t o_prog = rc_fs_take(&cur, sizeof(unsigned int) * prog_words);
     const size_t o_off = rc_fs_take(&cur, sizeof(unsigned int) * (size_t)(nprog + 1));
@@ -5342,7 +5807,7 @@ typedef struct RcRankWork {
     size_t temp_bytes;
 } RcRankWork;
 
-/* Test hook: the next guarded CUB call of the rank sweep is refused before it
+/* Test hook: a counter of k refuses the k-th guarded CUB call of the rank sweep before it
  * reaches CUB and reports a failure. */
 static thread_local int g_force_rank_cub_fail = 0;
 
@@ -6283,7 +6748,7 @@ float rc_max_scan_batch(void *ctx,
     return ms;
 }
 
-/* Test hook: the next guarded CUB call of an order-statistic sort is refused
+/* Test hook: a counter of k refuses the k-th guarded CUB call of an order-statistic sort
  * before it reaches CUB and reports a failure. */
 static thread_local int g_force_os_cub_fail = 0;
 

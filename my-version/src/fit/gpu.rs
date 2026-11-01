@@ -499,7 +499,13 @@ impl BatchedGpu<'_> {
             return out;
         }
         let plans: Vec<&GpuFitPlan> = slots.iter().map(|(_, p)| p).collect();
-        let (results, ms) = self.ev.borrow_mut().fit_batch(&plans, iters, loss);
+        // #236: slope runs from the squared warm start and keeps the incoming
+        // constants unless it improves on them.
+        let (results, ms) = if loss == DeviceLoss::Slope {
+            self.ev.borrow_mut().slope_fit_batch(&plans, iters)
+        } else {
+            self.ev.borrow_mut().fit_batch(&plans, iters, loss)
+        };
         if ms < 0.0 || results.len() != slots.len() {
             return out;
         }
@@ -594,6 +600,10 @@ impl BatchedFitter for BatchedGpu<'_> {
                 if !self.ev.borrow_mut().set_fit_sign(&sign) {
                     return vec![None; trees.len()];
                 }
+            }
+            // #236: slope has no weighted form; the exact CPU arm keeps it.
+            if loss == DeviceLoss::Slope && !w.is_empty() {
+                return vec![None; trees.len()];
             }
             return self.propose(trees, iters, loss);
         }

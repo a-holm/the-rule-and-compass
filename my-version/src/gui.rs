@@ -953,6 +953,7 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
                 cfg.qd_cell_cap = v;
             }
             "--pipeline-depth" => cfg.pipeline_depth = int(&take(&mut i)?, "--pipeline-depth", 0)?,
+            "--threads" => cfg.threads = int(&take(&mut i)?, "--threads", 1)?,
             "--gpu" => cfg.gpu = true,
             "--no-gpu" | "--cpu" => cfg.gpu = false,
             "--predictor-samples" => {

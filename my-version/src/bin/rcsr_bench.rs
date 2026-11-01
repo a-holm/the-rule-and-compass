@@ -54,6 +54,9 @@ OPTIONS:
   --metric <name>           search metric (default squared)
   --threshold <r2>          test R^2 counted as recovered (default 0.99)
   --time-budget <seconds>   wall-clock limit per run (default: none)
+  --threads <N>             worker threads for fitting and scoring inside an island
+                            (default: the available CPU cores; 1 = serial; the
+                            results do not depend on it)
   --no-front-parents        disable the 15% Pareto-front parent feedback (#76)
   --cpu                     force the CPU evaluator (no environment variable)
   --gpu                     require the device evaluator; exit 2 without one
@@ -133,6 +136,7 @@ struct Args {
     gpu: bool,
     jobs: usize,
     knobs: bench::Knobs,
+    threads: usize,
 }
 
 impl Default for Args {
@@ -158,6 +162,7 @@ impl Default for Args {
             gpu: false,
             jobs: 1,
             knobs: bench::Knobs::default(),
+            threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         }
     }
 }
@@ -304,6 +309,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
                     return Err("--jobs: must be at least 1".to_string());
                 }
             }
+            "--threads" => a.threads = num(take(&mut i, "--threads")?, "--threads")?,
             "--list" => a.list = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown option '{}'", other)),
@@ -347,6 +353,7 @@ fn to_config(a: &Args) -> SuiteConfig {
         backend: backend_of(a),
         knobs: a.knobs.clone(),
         jobs: a.jobs,
+        threads: a.threads,
     }
 }
 

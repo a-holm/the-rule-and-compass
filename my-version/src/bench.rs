@@ -423,6 +423,8 @@ pub struct SuiteConfig {
     pub knobs: Knobs,
     /// Runs in flight at once (CPU only).
     pub jobs: usize,
+    /// #463: worker threads for fitting and scoring inside an island.
+    pub threads: usize,
 }
 
 impl Default for SuiteConfig {
@@ -444,6 +446,7 @@ impl Default for SuiteConfig {
             backend: BackendChoice::Auto,
             knobs: Knobs::default(),
             jobs: 1,
+            threads: 1,
         }
     }
 }
@@ -727,6 +730,7 @@ fn base_config(cfg: &SuiteConfig, seed: u32) -> Config {
     sc.seed = seed;
     sc.time_budget = cfg.time_budget;
     sc.front_parents = cfg.front_parents; // #76
+    sc.threads = cfg.threads.max(1); // #463
     match cfg.backend {
         BackendChoice::Auto => {}
         BackendChoice::Cpu => sc.gpu = false,
@@ -1446,7 +1450,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
     };
     let opt_u = |v: Option<usize>| json_opt(v);
     format!(
-        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"dispatch\":{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"git\":\"{}\"}}}}",
+        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"dispatch\":{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
         GENERATOR_VERSION,
         json_number(cfg.threshold),
         json_number(SIGNAL_THRESHOLD),
@@ -1469,6 +1473,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
         cfg!(feature = "cuda"),
         cfg.backend.name(),
         cfg.jobs,
+        cfg.threads,
         json_escape(&git_describe()),
     )
 }

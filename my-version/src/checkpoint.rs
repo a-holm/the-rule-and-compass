@@ -1641,6 +1641,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         dispatch: crate::dispatch::DispatchMode::Auto,
         // #119: scheduling only, not saved search state.
         pipeline_depth: 2,
+        threads: 1,
         variation,
     })
 }
