@@ -101,6 +101,15 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   non-dominated, so each member is the best shape found at some complexity, and
   this lets a building block found on another island or generations earlier
   re-enter the population. `--no-front-parents` disables the feedback.
+- **Constant models.** A tree with no input outside an aggregate or meta operator (`exp(1.3)`, `mean(x1) + 0.2`) predicts one value for every row, so after its constant fit it equals the training-mean model. With `--reject-constant-offspring` such a child is dropped after simplification and before de-duplication and the fit, and counted in `variation.constant_rejected`. The first constant tree of an island is kept, so the front keeps its complexity-1 baseline. Random fill and restart trees are drawn again (up to 8 times) when they are constant and the island already holds one. Seeds and migrants are not filtered. The flag is off by default.
+- **Survivor selection** is generational by default: the island is replaced by
+  its offspring and only the best individual is carried over. With
+  `--selection afp` parents and offspring compete: the next population is the
+  Pareto-best set on (error, complexity, age), plus a few random immigrants per
+  generation. Small correct shapes and new lineages survive next to large
+  approximations, and individuals that are no better than the mean model are
+  dropped by their rank. Parents are then drawn by Pareto rank and crowding
+  distance.
 - **Variation** has two parts:
   - *mutation* — the edit kind is drawn first (25 % point change, 35 %
     constant/input perturb, 40 % subtree grow/shrink) and the site is chosen

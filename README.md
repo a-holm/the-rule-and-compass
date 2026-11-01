@@ -638,7 +638,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--fit-polish f64|f32|off] [--refit-band F|inf] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
-     [--no-front-parents] [--linear-scaling]
+     [--no-front-parents] [--linear-scaling] [--reject-constant-offspring]
+     [--selection lexicographic|afp]
      [--fit-samples N]
      [--patience N] [--patience-tol r] [--stop-on front[:W]]
      [--gpu] [--gpu-memory size] [--dispatch auto|device] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
@@ -761,8 +762,11 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   (lower is better, all-flat is 1). Constants are still fitted with `--metric`. It needs a
   trading `--objective` and exits 2 with `--predictor-samples`, `--fit-samples`, `--implicit`,
   `--min-holding` above 1, `--max-position` other than 1, multiple targets or overlapping rows.
-  It runs on the CPU; resume needs the same cost, threshold and rows. `--json` adds
-  `search_fitness` and a `fitness` block per Pareto member. See
+  On the GPU the device scores the regret natively, fused with the program interpreter
+  (`search_fitness.scorer_backend` `cuda`); it equals the CPU book on the device's own `f32`
+  predictions bit for bit, and every reported value stays exact CPU `f64`. Resume needs the
+  same cost, threshold and rows. `--json` adds `search_fitness` and a `fitness` block per
+  Pareto member. See
   [`docs/walkforward.md`](docs/walkforward.md) and
   [`docs/optimisation.md`](docs/optimisation.md).
 * Time-ordered runs, runs with a target spec and runs with `--require-validation`
@@ -1012,10 +1016,11 @@ contain. The k-NN baseline's reference set is always all training rows; for up
 to eight inputs a k-d tree answers exact queries, and above that the exact
 brute-force path reuses one buffer (still `O(query_rows × reference_rows × d)`,
 so the 200k-under-a-minute result is a `d <= 8` claim). Only query rows can be
-sampled, with `--baseline-samples N` (default `512`; `0` = every row, and only
-for absolute/squared/log_squashed). The default cap keeps the exact
-`O(train²·d)` query bounded on large panels; the JSON reports reference/query
-rows, `capped`, SEMs and seconds. That is an unbiased estimate of the row-average
+sampled, with `--baseline-samples N` (any metric; default: every row up to
+20,000 training rows, a seeded sample of 512 above; `0` = every row). The
+default sample keeps the exact `O(train²·d)` query bounded on large panels; the
+JSON reports reference/query rows, `capped`, `sample_size`, `sample_seed`, SEMs
+and seconds. That is an unbiased estimate of the row-average
 loss, and `--json` reports train/test query rows and SEMs with the
 finite-population correction. The residual tests (Ljung–Box, Breusch–Pagan,
 skewness, excess kurtosis) are reported for the best solution; a small p-value
@@ -1207,6 +1212,11 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   and **72 → 74/75**, with `pythagoras` recovered in **7/9** cells instead of
   **0/9**, for about 5% more wall time. `--no-front-parents` disables it and
   restores the previous trajectory exactly;
+- **opt-in age-fitness Pareto survivor selection** (`--selection afp`): parents and
+  offspring compete on (error, complexity, age) by non-dominated sorting with
+  crowding distance, a few random immigrants join each generation, and parents
+  are drawn by Pareto rank. Small correct shapes and new lineages survive next
+  to large approximations. Node path only; the default stays `lexicographic`;
 - **opt-in quality-diversity search** (`--qd`, `--qd-cvt`, `--qd-policy`,
   `--qd-cells`, `--qd-cell-cap`): CVT-MAP-Elites over variable usage ×
   prediction skewness, with deterministic Halton initialisation, Lloyd

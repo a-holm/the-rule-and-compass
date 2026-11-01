@@ -392,6 +392,7 @@ pub struct Knobs {
     pub migration_interval: Option<usize>,
     pub restart_interval: Option<usize>,
     pub variation: Option<crate::search::VariationMode>,
+    pub selection: Option<crate::search::Selection>,
     pub dispatch: Option<crate::dispatch::DispatchMode>,
     /// #470: `--linear-scaling`.
     pub linear_scaling: bool,
@@ -401,6 +402,8 @@ pub struct Knobs {
     pub patience_tol: Option<f64>,
     /// #464: `--stop-on front[:W]`; `Some(0)` takes W from the patience.
     pub stop_front: Option<usize>,
+    /// #477: reject input-free offspring before the constant fit.
+    pub reject_constant_offspring: bool,
 }
 
 /// How to run the suite: noise levels, search budget, seed and criterion.
@@ -773,6 +776,9 @@ fn base_config(cfg: &SuiteConfig, seed: u32) -> Config {
     if let Some(v) = k.variation {
         sc.variation = v;
     }
+    if let Some(v) = k.selection {
+        sc.selection = v;
+    }
     if let Some(v) = k.dispatch {
         sc.dispatch = v;
     }
@@ -780,6 +786,7 @@ fn base_config(cfg: &SuiteConfig, seed: u32) -> Config {
     if let Some(v) = k.fit_polish {
         sc.fit_polish = v;
     }
+    sc.reject_constant_offspring = k.reject_constant_offspring; // #477
     sc
 }
 
@@ -1464,7 +1471,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
     };
     let opt_u = |v: Option<usize>| json_opt(v);
     format!(
-        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"dispatch\":{},\"fit_polish\":{},\"linear_scaling\":{},\"patience_tol\":{},\"stop_front\":{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
+        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"selection\":{},\"dispatch\":{},\"fit_polish\":{},\"linear_scaling\":{},\"reject_constant_offspring\":{},\"patience_tol\":{},\"stop_front\":{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
         GENERATOR_VERSION,
         json_number(cfg.threshold),
         json_number(SIGNAL_THRESHOLD),
@@ -1482,9 +1489,11 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
         opt_u(k.migration_interval),
         opt_u(k.restart_interval),
         k.variation.map_or("null".to_string(), |v| format!("\"{}\"", v.as_str())),
+        k.selection.map_or("null".to_string(), |v| format!("\"{}\"", v.as_str())),
         k.dispatch.map_or("null".to_string(), |v| format!("\"{}\"", v.name())),
         k.fit_polish.map_or("null".to_string(), |v| format!("\"{}\"", v.name())),
         k.linear_scaling,
+        k.reject_constant_offspring,
         json_opt_f(k.patience_tol),
         opt_u(k.stop_front),
         env!("CARGO_PKG_VERSION"),

@@ -365,6 +365,9 @@ pub struct FitGen {
     pub host_seconds: f64,
     /// #256: wall seconds of the exact CPU fit-fallback inside `host_seconds`.
     pub fallback_seconds: f64,
+    /// #498: wall seconds of the exact host gate of device proposals inside
+    /// `host_seconds`.
+    pub gate_seconds: f64,
     /// #256: workers the fit-fallback batch used. This is the fit pool; the
     /// top-level `fallback.workers` is the evaluator's pool.
     pub fallback_workers: usize,
@@ -385,7 +388,7 @@ impl FitGen {
         let improved_total: usize = self.fallback_improved_by_cause.iter().map(|(_, v)| *v).sum();
         format!(
             "{{\"attempts\":{},\"gpu\":{},\"fallback\":{},\"refits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\
-             \"host_seconds\":{},\"fallback_seconds\":{},\"fallback_workers\":{}}}",
+             \"host_seconds\":{},\"fallback_seconds\":{},\"gate_seconds\":{},\"fallback_workers\":{}}}",
             self.attempts,
             self.gpu,
             self.fallback,
@@ -395,6 +398,7 @@ impl FitGen {
             improved.join(","),
             num(self.host_seconds),
             num(self.fallback_seconds),
+            num(self.gate_seconds),
             self.fallback_workers
         )
     }
@@ -460,6 +464,8 @@ pub struct GenRecord {
     pub phase_b_s: f64,
     /// #463: candidates dropped after the fit for exceeding the complexity cap.
     pub post_fit_drops: usize,
+    /// #477: offspring rejected before the fit for holding no row-dependent input.
+    pub constant_rejected: usize,
     // Error distribution over this generation's population.
     pub best_error: f64,
     pub p05: f64,
@@ -576,7 +582,7 @@ impl GenRecord {
              \"error\":{{\"best\":{},\"p05\":{},\"p25\":{},\"median\":{},\"p75\":{},\"p95\":{}}},\
              \"archive\":{{\"size\":{},\"hypervolume\":{},\"hash\":{},\"offers\":{},\"admissions\":{}}},\
              \"variation\":{{\"attempts\":{},\"duplicates\":{},\"too_complex\":{},\"offspring\":{},\
-             \"fitted\":{},\"refits\":{},\"dedup_rate\":{},\"post_fit_drops\":{}}},\
+             \"fitted\":{},\"refits\":{},\"dedup_rate\":{},\"post_fit_drops\":{},\"constant_rejected\":{}}},\
              \"gpu\":{},\"fit\":{},\
              \"fallback\":{{\"scope\":\"evaluator_pool\",\"seconds\":{},\"workers\":{}}},\
              \"qd\":{},\
@@ -617,6 +623,7 @@ impl GenRecord {
             self.refits,
             num(self.dedup_rate()),
             self.post_fit_drops,
+            self.constant_rejected,
             self.gpu.as_ref().map(|g| g.json()).unwrap_or_else(|| "null".to_string()),
             self.fit.json(),
             num(self.fallback_s),
@@ -1129,6 +1136,7 @@ mod tests {
             eval_cpu_s: 0.02,
             phase_b_s: 0.0,
             post_fit_drops: 0,
+            constant_rejected: 0,
             best_error: 0.5,
             p05: 0.6,
             p25: 0.7,
@@ -1167,6 +1175,7 @@ mod tests {
                 fallback_improved_by_cause: vec![("ill_conditioned".to_string(), 1)],
                 host_seconds: 0.05,
                 fallback_seconds: 0.03,
+                gate_seconds: 0.02,
                 fallback_workers: 4,
             },
             fallback_s: 0.001,
@@ -1219,6 +1228,7 @@ mod tests {
         assert_eq!(improved[0].1.as_usize(), Some(1));
         assert_eq!(fit.get("host_seconds").and_then(|v| v.as_f64()), Some(0.05));
         assert_eq!(fit.get("fallback_seconds").and_then(|v| v.as_f64()), Some(0.03));
+        assert_eq!(fit.get("gate_seconds").and_then(|v| v.as_f64()), Some(0.02));
         assert_eq!(fit.get("fallback_workers").and_then(|v| v.as_usize()), Some(4));
         let eval_pool = parsed.get("fallback").unwrap();
         assert_eq!(

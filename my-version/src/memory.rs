@@ -673,6 +673,8 @@ pub struct DeviceWorkload {
     pub stat: bool,
     pub weights: bool,
     pub label_sign: bool,
+    /// #481: the long/flat fitness book (f64 excess and a flag byte per row).
+    pub pnl_book: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -793,6 +795,9 @@ fn plan_core(w: &DeviceWorkload, d: &DeviceInfo, caps: &DeviceCaps) -> DevicePla
     }
     if w.weights {
         side += n * 8;
+    }
+    if w.pnl_book {
+        side += n * 9;
     }
     let side_vectors = clamp_u64(side, &mut sat);
     let fit_n = if w.device_fit && w.fit_rows > 0 && w.fit_rows < w.rows {
@@ -1293,6 +1298,7 @@ mod tests {
             stat: false,
             weights: false,
             label_sign: false,
+            pnl_book: false,
         }
     }
 
@@ -1461,6 +1467,18 @@ mod tests {
         assert_eq!(w.terms.fit_twin, 100_000 * 57 * 12 + 100_000 * 8);
         let no_fit = DeviceWorkload { device_fit: false, ..sub };
         assert_eq!(device_plan(&no_fit, &d, &caps).terms.fit_twin, 0);
+    }
+
+    /// #481: the long/flat book is an f64 excess and a flag byte per row.
+    #[test]
+    fn device_plan_charges_the_pnl_book_per_row() {
+        let d = rtx3060(11_353);
+        let caps = DeviceCaps::new(None);
+        let w = workload(20, 1_000, false);
+        let plain = device_plan(&w, &d, &caps);
+        let book = device_plan(&DeviceWorkload { pnl_book: true, ..w }, &d, &caps);
+        assert_eq!(book.terms.side_vectors - plain.terms.side_vectors, 4_775_757 * 9);
+        assert_eq!(book.required - plain.required, 4_775_757 * 9);
     }
 
     #[test]

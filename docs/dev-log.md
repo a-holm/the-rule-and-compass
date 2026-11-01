@@ -1,3 +1,4 @@
+| `variation.constant_rejected` | full | offspring rejected before the fit because no input reaches the rows outside an aggregate (`--reject-constant-offspring`; 0 without the flag) |
 # The development log (`--dev-log`) and `rcsr dev-report`
 
 `rcsr` writes a **development log** while it searches. It is on by default: a
@@ -219,6 +220,7 @@ Emitted at the same boundary as `--progress`, once per completed generation
 | `fit.fallback` | both | candidates refit by the exact CPU arm |
 | `fit.refits` | full | exact CPU refits recorded for this generation |
 | `fit.host_seconds`, `fit.fallback_seconds`, `fit.fallback_workers` | full | #256: wall of the whole fit stage in this generation, the exact CPU fit-fallback inside it, and the width of the **fit** fallback pool |
+| `fit.gate_seconds` | full | #498: wall of the exact host gate of device proposals inside `fit.host_seconds` (log_loss, correlation, correlation_signed, signed; 0 otherwise) |
 | `fit.fallback_by_cause` | full | CPU fallback counts labelled by cause (`unsupported_plan`, `too_few_rows`, `too_many_constants`, `ill_conditioned`, `non_finite`, `launch`, …) |
 | `fit.fallback_improved`, `fit.fallback_improved_by_cause` | full | fallbacks whose exact CPU refit lowered the exact error against the device (or incoming) constants, in total and by cause |
 | `gpu` | both | `null` without a GPU batch: `batches`, `programs`, `kernel_s`, `wall_s`, `duty`, `native`, `lowered`, `fallbacks`, `fallback_s`, `fallback_workers` |

@@ -3,7 +3,7 @@
 
 use rcsr::data::Sample;
 use rcsr::diagnostics::{
-    knn_predict, knn_sampling_supported, Baselines, DEFAULT_BASELINE_SAMPLES, KNN_KD_MAX_DIM,
+    knn_predict, Baselines, DEFAULT_BASELINE_SAMPLES, KNN_KD_MAX_DIM,
 };
 use rcsr::metrics::{self, Metric};
 
@@ -180,28 +180,48 @@ fn json_reports_split_query_rows_and_sems() {
     assert!(exact_json.contains("\"capped\":false"), "{exact_json}");
 }
 
+/// #497: above the threshold every metric samples its queries and reports the
+/// sample size and seed; the default is exact up to the threshold.
 #[test]
-fn sampling_is_only_offered_for_mean_loss_metrics() {
-    for m in [Metric::Absolute, Metric::Squared, Metric::LogSquashed] {
-        assert!(knn_sampling_supported(m), "{m:?}");
-    }
-    for m in [
-        Metric::Correlation,
-        Metric::Median,
-        Metric::Maximum,
-        Metric::Interquartile,
-        Metric::RankCorrelation,
-        Metric::Auc,
-        Metric::Aic,
-        Metric::Aicc,
-        Metric::Bic,
-    ] {
-        assert!(!knn_sampling_supported(m), "{m:?}");
-    }
-
-    // The library falls back to exact queries for unsupported metrics.
+fn every_metric_samples_queries_with_a_reported_size_and_seed() {
     let train = sample(1000, 3, 31);
-    let b = Baselines::fit_sampled(&train, &[], Metric::Median, 100, 3);
-    assert!(!b.knn_capped);
-    assert_eq!(b.knn_train_query_rows, train.len());
+    for m in [
+        Metric::Absolute,
+        Metric::Squared,
+        Metric::LogSquashed,
+        Metric::LogLoss,
+        Metric::Brier,
+        Metric::Hinge,
+        Metric::HingeOrdinary,
+        Metric::HingeSquared,
+        Metric::Auc,
+        Metric::Median,
+        Metric::Correlation,
+        Metric::Aic,
+    ] {
+        let b = Baselines::fit_sampled(&train, &[], m, 100, 3);
+        assert!(b.knn_capped, "{m:?}");
+        assert_eq!(b.knn_train_query_rows, 100, "{m:?}");
+        assert_eq!(b.knn_sample_size, 100, "{m:?}");
+        assert_eq!(b.knn_seed, 3, "{m:?}");
+        let json = b.knn_json_extra();
+        assert!(json.contains("\"sample_size\":100"), "{json}");
+        assert!(json.contains("\"sample_seed\":3"), "{json}");
+    }
+    let exact = Baselines::fit_sampled(&train, &[], Metric::Median, 0, 3);
+    assert!(!exact.knn_capped);
+    assert_eq!(exact.knn_train_query_rows, train.len());
+    assert_eq!(exact.knn_sample_size, 0);
+}
+
+#[test]
+fn default_sample_is_exact_up_to_the_threshold_and_sampled_above() {
+    use rcsr::diagnostics::{resolve_baseline_samples, KNN_EXACT_MAX_ROWS};
+    assert_eq!(resolve_baseline_samples(None, KNN_EXACT_MAX_ROWS), 0);
+    assert_eq!(
+        resolve_baseline_samples(None, KNN_EXACT_MAX_ROWS + 1),
+        DEFAULT_BASELINE_SAMPLES
+    );
+    assert_eq!(resolve_baseline_samples(Some(64), 10), 64);
+    assert_eq!(resolve_baseline_samples(Some(0), KNN_EXACT_MAX_ROWS + 1), 0);
 }

@@ -1261,7 +1261,7 @@ constants), `too_few_rows`, `too_many_constants` (`p > 20`),
 the exact CPU arm took over). `--fit-report` and the `gpu.fit` JSON object count
 `screened` (scored with seed constants before admission), `admitted_wide` (candidates with constants fitted without a screening score under wide admission), `attempts`/`gpu`/`fallback`, the per-cause map, the
 `status_by_label` map of finite device answers, `refits`, the kernel `seconds`
-and the whole fit stage's `host_seconds`; the run manifest records the same
+and the whole fit stage's `host_seconds` (with the `gate_s` subset, #498); the run manifest records the same
 accepted/fallback/refit totals. Ledger invariant: `screened + admitted_wide >= attempts`. Below the wide threshold `admitted_wide` is 0 and every attempt was screened; under wide admission only constant-free candidates are screened and every other pending candidate is counted in `admitted_wide`.
 
 **Parallel fallback batch and its bound (#255).** The exact CPU refits are
@@ -1508,7 +1508,7 @@ gpu = (s * k + (1 - s) / W) * E * (1 + h)
 device iff gpu < cpu
 ```
 
-With `W = 8`: without full operator coverage (any operator without a fit opcode, such as `min`) the device is chosen up to 4 islands and `exact` from 5 (`dispatch_cost`); with full coverage the device is chosen up to 11 islands. There is no row floor. The per-candidate floor of `32p` rows in the fit stage is unchanged. This run-level rule is separate from the per-candidate stage model in `docs/dispatch.md`.
+With `W = 8`: without full operator coverage (any operator without a fit opcode, such as `asinh` or `require`) the device is chosen up to 4 islands and `exact` from 5 (`dispatch_cost`); with full coverage the device is chosen up to 11 islands. There is no row floor. The per-candidate floor of `32p` rows in the fit stage is unchanged. This run-level rule is separate from the per-candidate stage model in `docs/dispatch.md`.
 
 Evidence for the default is a paired comparison against `exact` on the GPU evaluator at equal generations (default operators, `--fit-iters 8`): admitting every candidate matched `exact` in test error and hypervolume and ran 1.5x to 5.1x faster; the screened fraction was faster still but lost on hypervolume. Fallbacks in these runs were `unsupported_plan` only, from `if`.
 
@@ -1919,6 +1919,24 @@ Device fit is 3.2x faster than device score with the CPU fit and 3.7x faster tha
 
 **Tests** (`src/gpu_if_fit_tests.rs`): `if_plan_carries_the_third_child_in_the_slot_word`; `if_device_fit_matches_the_cpu_fit_including_the_switch_point` (device SSE within `1e-8` relative of the CPU fit, with rows at `x0 == 0` and `x0 == x1`, and a `NaN` in the untaken branch); `a_search_with_if_fits_on_the_device` (`dispatch: Device`, no `unsupported_plan` fallback).
 
+### Hard operators in the fit kernel (#499)
+
+The fit kernel takes the operators the scoring kernel has had since #131, with the scoring opcode values: `step` 19, `floor` 23, `ceil` 24, `round` 25, `mod` 26, `atan2` 27, `min` 30, `max` 31, `sign` 33, `equal` 34, `less` 35, `less_or_equal` 36, `greater` 37, `greater_or_equal` 38, `and` 39, `or` 40, `xor` 41, `not` 42. Fit opcode 32 is `if` (#403). The forward sweep (`ft_forward`, `ft_forward_d`) and the adjoint sweep (`ft_backward`, `ft_backward_d`) mirror `apply_op` and `adj_terms` in `src/fit.rs`, so the f32 LM phase and the `--fit-polish f64|f32` phases use one convention.
+
+| operator | value | adjoint |
+|---|---|---|
+| `min`, `max` | `NaN` if either argument is `NaN`, else the smaller or larger | all to the active argument, `0.5` each on a tie |
+| `atan2(y, x)` | `atan2(y, x)` | `x/(x²+y²)` to `y`, `-y/(x²+y²)` to `x`, none when `x²+y² = 0` |
+| `mod(a, b)` | `NaN` for a non-finite argument or `abs(b) < 1e-12`, else `a - b·floor(a/b)` | `1` to `a`, `-floor(a/b)` to `b`, none when `abs(b) < 1e-12` |
+| `step`, `sign`, `floor`, `ceil`, `round` | `step` is `[a > 0]`; `sign` is `NaN` for `NaN`; `round` is half away from zero | none |
+| `equal`, `less`, `less_or_equal`, `greater`, `greater_or_equal` | `0` or `1`, `NaN` if either argument is `NaN` | none |
+| `and`, `or`, `xor` | `0` or `1` on `[a > 0]`, `[b > 0]`, `NaN` if either argument is `NaN` | product-surrogate partials: `[b>0]`, `1-[b>0]`, `1-2[b>0]` for the first argument, symmetric for the second |
+| `not` | `1 - [a > 0]`, `NaN` for `NaN` | none |
+
+A constant reachable only through a value-only operator has a zero Jacobian column. The fit labels such a candidate `rank_deficient` or `no_improvement` and keeps the start; it is not a CPU fallback. Operators without a fit opcode stay `unsupported_plan` CPU fallbacks: `asinh`, `acosh`, `atanh`, `require`, `constrain`, `between`, aggregates, meta operators and block calls.
+
+**Tests** (`src/gpu_hard_op_fit_tests.rs`, device tests skip without CUDA): `hard_op_plan_words_carry_the_scoring_opcodes`; one device-versus-CPU parity test per family (`min_max_device_fit_matches_the_cpu_at_the_tie_rows`, `atan2_device_fit_matches_the_cpu_including_the_origin`, `mod_device_fit_matches_the_cpu_at_exact_multiples`, `piecewise_constant_device_fit_matches_the_cpu_at_the_jumps`, `comparisons_device_fit_matches_the_cpu_on_equal_rows`, `logic_device_fit_matches_the_cpu_on_the_product_surrogate`) with a device loss within `1e-5` relative of the CPU loss; `a_hard_operator_under_if_ignores_a_nan_in_the_untaken_branch`; `constants_only_under_a_value_only_operator_are_labelled_not_fallen_back`; `every_new_opcode_runs_on_nan_inf_and_kink_rows`; `a_search_with_hard_operators_fits_on_the_device` (`dispatch: Device`, no `unsupported_plan`). The unit test `op_coverage_needs_a_fit_opcode_for_every_operator` in `src/fit.rs` lists every operator without a fit opcode.
+
 ### Slope on the batched kernel (issue #236)
 
 `--metric slope` is scored and fitted on the device when the training sample's slope pairs are its consecutive rows: `[k − 1, k]` for every `k` in `1..n` (`search::slope_pairs_are_consecutive`). That is a single series under `--split temporal`. Any other pair list (a shuffled split, a `--group-by` panel, a row missing from the side) keeps the exact CPU scorer with the reason `slope pairs are not the consecutive rows of the training sample`, and a `--fit-rows`/`--fit-samples` subsample (#265) keeps it with its own reason, so the device never differences two rows the CPU would not. Weighted slope does not exist, and a tiled plan refuses the scorer by name (see [Tiled residency](#tiled-residency-293)).
@@ -1983,7 +2001,7 @@ and `hinge_squared` are the separate SVM forms. A constant model has
 pin both optima.
 
 **Codes and dispatch.** The classification objectives occupy the score codes
-10–14, after the regression block 0–9 (#287), and slope is 15 (#236); the fit
+10–14, after the regression block 0–9 (#287), slope is 15 (#236) and the long/flat regret is 16 (#481); the fit
 `RC_LOSS_*` codes are 0–9. `metrics::score_dispatch` maps every classification metric to one of them,
 so `auc` stays a **named** refusal (`auc needs the exact rank scorer with
 labels (#288)`) rather than the old generic "classification metric" gate. The
@@ -2116,6 +2134,7 @@ already feasible (p=3, 4), and `4.37e-4 → 1.08e-8` (p=8, near-collinear basis,
 The deferred device fit does per candidate what the CPU arm does.
 
 * **One exact gate.** `fit::device_fit_is_gated` is true for `log_loss`, `correlation`, `correlation_signed` and `signed`. For these, `GpuSearch::fit_pending` passes every usable proposal through `fit::gate_device_proposal`, the same function `fit_batch_verified` uses: rank, signed projection, the configured metric in exact `f64`, or squared SSE. `Rejected` restores the incoming constants and sends the candidate to the exact CPU arm with the label `worse` (`log_loss_worse` for `log_loss`); `NonFinite` does the same with the label `non_finite`. `NotIdentifiable` (signed only) uses the label `not_identifiable`.
+* **Parallel exact gate (#498).** The judgements of one fit batch are independent, so they run on the `--threads` worker pool (`search::gate_proposals`, dynamic hand-out, tree clones per job). Verdicts are applied in admission order: an accepted proposal writes its constants and counts as a device fit, a rejected one is pushed to the CPU fallback with the same label as before. The objective, the start, the `>` rule and the labels are unchanged (the #234 exactness contract), and the trees, verdicts and counters do not depend on the thread count (`search::tests::gate_is_identical_for_one_and_many_workers`). `gpu.fit.gate_s`, `gpu.ledger.fit.gate_s` and `fit.gate_seconds` in the full dev log report the measured gate wall; it is a **subset** of `host_seconds`, never added to it.
 * **Refresh.** After the device write-back, after the CPU fallback batch and after the pipeline write-back, `refresh_after_fit` simplifies each fitted tree and recomputes its complexity, as `evolve_island` does after the CPU fit. Dead `1*` and `+ 0` nodes left by the kernel no longer reach tie-breaks or the in-search archive. A tree the dimensional filter rejects keeps an infinite error.
 * **Pipeline exclusion.** `pipeline_fit_safe` is false for every gated metric, because the pipeline write-back applies kernel constants without the gate.
 * **Wide admission.** `wide_admission` is true at 1 048 576 training rows or more, and for `correlation`, `correlation_signed` and `signed` at any size. With `wide`, `select_promoted` takes every candidate with constants and `GpuSearch::score` screens only the candidates without constants; the others are fitted and scored once. Other metrics keep `max(32, pop/4)` below the threshold.
@@ -2450,6 +2469,29 @@ to read GPU performance counters) on this host, so `sm_occupancy` stays `null`.
 `nsys profile -t cuda` traces the run, but its importer is missing here, so no
 CUPTI duty number is claimed. Kernel-time duty from the ledger is not a
 substitute for either.
+
+## Long/flat P&L regret on the device (issue #481)
+
+Under `--fitness pnl` the search ranks candidates by the long/flat regret `(B - net) / B` of `trading::FitnessBook` (`docs/optimisation.md`, `--fitness pnl`). On the GPU backend this is the native score objective `long_pnl_regret` (`ScoreObjective::LongPnl`, `RC_SCORE_LONG_PNL`, code 16), fused with the program interpreter: the device evaluates the program per row and reduces the book in the same pass, so predictions never leave the device. `--metric` only fits constants and keeps its device fit arm (the batched squared LM by default); it never stands in for the fitness.
+
+**Book.** `rc_set_pnl_book` uploads, once per run, the excess return per row (`f64`), the seam flags (`u8`: bit 1 first row of a group, bit 2 last row), the cost per side, the threshold, the hindsight bound and `--min-trades`. It is one allocation of 9 bytes per row (tag `pnl_book`, charged as a side vector in the device plan) and lives until `rc_destroy`. The rows are the resident training rows in canonical `(group, time)` order (#469). A refused allocation falls back to the CPU scorer with `backend_reason` `device_memory: the device refused an allocation of N bytes (tag pnl_book) for the long_pnl fitness book`; tiled residency is refused with `long_pnl fitness needs resident training rows (tiled residency: #293)`.
+
+**Kernel.** One block of 8 warps per candidate, whatever the row count. Segment `s` (8,192 rows) belongs to warp `s % 8`, which walks its segments in ascending order, 32 consecutive rows per step:
+
+* a row is long when its prediction is finite and `(double)pred > threshold`;
+* positions are `__ballot_sync` words; the position before row `k` of a step is bit `k - 1` of the ballot, the carried last bit of the previous step, or flat at a group start (`prev = ((m << 1) | carry) & ~first`);
+* flips are `popc((m ^ prev) & valid)`, exits `popc(m & last)`, long rows `popc(m)`, all integers;
+* a segment's carry is the position of the row before it, re-evaluated by the owning warp, so no warp waits for another and there is no per-segment state in shared memory. This costs one extra row evaluation per 8,192 rows;
+* `gross` is the only floating-point sum: lane `l` adds the excess of the long rows `segment_start + l + 32j` in ascending `j`, the lanes fold with `__shfl_down_sync` over 16, 8, 4, 2, 1, each warp adds its segment sums in ascending order, and thread 0 folds the 8 warp sums with 4, 2, 1. This is `FitnessBook::totals` term for term;
+* the regret is `__ddiv_rn(__dsub_rn(B, net), B)` with `net = __dsub_rn(gross, __dmul_rn(side, flips + exits))`, so no step can be contracted into an FMA.
+
+A non-finite prediction scores `+inf` with status 2; fewer flips than `--min-trades` scores `+inf` with status 0, the CPU value; an all-flat program scores exactly 1. There are no floating-point atomics, and the value depends only on `(program, rows)`, never on the batch, its size or the slot (`tests/pnl_fitness_gpu.rs::values_do_not_depend_on_the_batch`).
+
+**Exactness contract.** The device evaluates programs in `f32`, so a prediction within an `f32` rounding of the threshold can take the other position than the CPU `f64` evaluation. The contract is therefore stated on the device's own predictions: the device totals and regret equal `FitnessBook::totals` and `regret_of` applied to the `rc_predict` output of the same program, bit for bit (`device_totals_equal_the_cpu_tree_on_device_predictions`: 64 programs, 100,003 rows, 37 groups with starts on, before and after warp-step and segment boundaries, one-row groups and a group over three segments). Every value the GPU search writes to a candidate is this device score of the stored tree (`pipelined_search_archives_device_long_pnl_scores`, `pipelined_device_fit_archives_device_long_pnl_scores`, `synchronous_device_fit_archives_device_long_pnl_scores`). The reported archive, the per-member `fitness` block and the objective are the exact CPU `f64` rebuild; `--json` names `search_fitness.scorer_backend` `cuda` and `scorer_values` `screening_f32_predictions` next to `backend` `cpu_f64`.
+
+**Dispatch.** `search_score_objective` picks the objective of every device scoring path: `GpuSearch::score` (screening and the post-fit rescore), the overlap pipeline and the flat postfix arena. The CPU route of the #290 dispatcher and the unsupported-program fallback score with `FitnessBook::regret`.
+
+**Throughput.** On the RTX 3060 at 1,000,000 rows (100 groups) and 256 programs (random depth-4 trees over 4 variables under `tanh` or `logistic`), the long-P&L score batch runs at 6.425e9 row-evaluations per second against 7.079e9 for the squared score batch on the same programs, 0.908x (kernel time alone: 6.453e9 against 7.110e9). Measured with the ignored test `long_pnl_throughput_against_squared` (`cargo test --release --features cuda --test pnl_fitness_gpu -- --ignored --exact long_pnl_throughput_against_squared --nocapture`).
 
 ## Long-only P&L reduction (issue #304)
 
