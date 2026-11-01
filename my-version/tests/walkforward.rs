@@ -632,6 +632,195 @@ fn final_exit_is_charged_per_group_when_rows_are_dropped() {
     assert!((t.net - 0.096).abs() < 1e-15);
 }
 
+mod front {
+    use rcsr::devlog::Json;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rcsr-front-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const MEMBERS: &str = r#"[{"expression":"x"},{"expression":"x * 2 + 0.1"},{"expression":"0.5 - x"}]"#;
+    const RUN: &str = r#"{"tool":"rcsr","variables":["x"],"target_spec":{"return_column":"target"},
+        "split":{"train_time":[0,119],"validation_time":[120,179],"required_purge_seconds":5,"purge_seconds":9},
+        "search":{"candidates_evaluated":4321},
+        "objective":{"spec":{"threshold":0,"per_side_bps":5}},
+        "pareto":[{"expression":"x"},{"expression":"x * 2 + 0.1"},{"expression":"0.5 - x"}]}"#;
+
+    fn write_data(dir: &std::path::Path) -> String {
+        let mut csv = String::from("ts,x,target\n");
+        for i in 0..400 {
+            let x = ((i * 37) % 17) as f64 - 8.0;
+            let y = 0.0003 * x + (((i * 13) % 7) as f64 - 3.0) * 0.0004;
+            csv.push_str(&format!("{},{},{}\n", i, x, y));
+        }
+        let path = dir.join("d.csv");
+        std::fs::write(&path, csv).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn write_run(dir: &std::path::Path, text: &str) -> String {
+        let path = dir.join("run.json");
+        std::fs::write(&path, text).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn rcsr(args: &[&str]) -> (i32, String, String) {
+        let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    fn wf(data: &str, source: &[&str], window: &str, extra: &[&str]) -> (i32, String, String) {
+        let mut a = vec![
+            "walkforward", "--data", data, "--time", "ts", "--horizon", "5", "--periods-per-year", "365",
+            "--validation-frac", "0.3", "--window", window, "--json",
+        ];
+        a.extend_from_slice(source);
+        a.extend_from_slice(extra);
+        rcsr(&a)
+    }
+
+    /// last seen 179 + required purge 5
+    const OK_WINDOW: &str = "late,0,150,184,300";
+
+    #[test]
+    fn front_scores_every_member_and_matches_explicit_expr_flags_bit_for_bit() {
+        let dir = scratch("equal");
+        let data = write_data(&dir);
+        let run = write_run(&dir, RUN);
+        let (code, a, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--batch-pnl"]);
+        assert_eq!(code, 0, "{err}");
+        let flags = [
+            "--expr", "x", "--expr", "x * 2 + 0.1", "--expr", "0.5 - x", "--batch-pnl", "--threshold-fixed", "0",
+            "--cost-bps", "5", "--target", "target", "--vars", "x", "--trials", "4321",
+        ];
+        let (code, b, err) = wf(&data, &[], OK_WINDOW, &flags);
+        assert_eq!(code, 0, "{err}");
+        let (ja, jb) = (Json::parse(a.trim()).unwrap(), Json::parse(b.trim()).unwrap());
+        let field = |j: &Json, k: &str| format!("{:?}", j.get(k).unwrap_or_else(|| panic!("missing {k}")));
+        for k in ["candidates", "windows", "pooled"] {
+            assert_eq!(field(&ja, k), field(&jb, k), "{k}");
+        }
+        let (pa, pb) = (ja.get("batch_pnl").unwrap(), jb.get("batch_pnl").unwrap());
+        for (k, sub) in [("finalists", None), ("per_window", Some("cells")), ("pooled", Some("cells"))] {
+            let pick = |p: &Json| {
+                let v = p.get(k).unwrap_or_else(|| panic!("missing {k}"));
+                format!("{:?}", sub.map_or(v, |s| v.get(s).unwrap_or_else(|| panic!("missing {k}.{s}"))))
+            };
+            assert_eq!(pick(pa), pick(pb), "{k}");
+        }
+        assert!(matches!(ja.get("batch_pnl"), Some(Json::Obj(_))));
+        assert!(matches!(ja.get("candidates"), Some(Json::Arr(c)) if c.len() == 3));
+        let sel = ja.get("selection").unwrap();
+        assert_eq!(sel.get("source").and_then(Json::as_str), Some("front"));
+        assert_eq!(sel.get("run").and_then(Json::as_str), Some(run.as_str()));
+        assert_eq!(sel.get("run_sha256").and_then(Json::as_str).map(str::len), Some(64));
+        assert!(matches!(sel.get("candidate_labels"), Some(Json::Arr(l)) if l.len() == 3));
+    }
+
+    #[test]
+    fn front_trials_default_to_candidates_evaluated_and_can_be_overridden() {
+        let dir = scratch("trials");
+        let data = write_data(&dir);
+        let run = write_run(&dir, RUN);
+        let (code, a, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--bootstrap", "100"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(a.contains("\"trials\":4321"), "{a}");
+        let (code, b, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--trials", "77", "--bootstrap", "100"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(b.contains("\"trials\":77"), "{b}");
+    }
+
+    #[test]
+    fn a_window_inside_the_validation_slice_is_refused() {
+        let dir = scratch("inside");
+        let data = write_data(&dir);
+        let run = write_run(&dir, RUN);
+        let (code, _, err) = wf(&data, &["--front", &run], "bad,0,100,150,300", &[]);
+        assert_eq!(code, 2, "{err}");
+        assert!(
+            err.contains("window 'bad' tests rows the run trained or selected on (test_start 150 < last seen 179 + purge 5)"),
+            "{err}"
+        );
+        let (code, _, err) = wf(&data, &["--front", &run], "bad,0,100,183,300", &[]);
+        assert_eq!(code, 2, "{err}");
+    }
+
+    #[test]
+    fn a_window_starting_at_seen_plus_purge_passes() {
+        let dir = scratch("edge");
+        let data = write_data(&dir);
+        let run = write_run(&dir, RUN);
+        let (code, out, err) = wf(&data, &["--front", &run], OK_WINDOW, &[]);
+        assert_eq!(code, 0, "{err}");
+        assert!(!out.contains("in_sample"), "{out}");
+    }
+
+    #[test]
+    fn the_override_reports_the_window_as_in_sample() {
+        let dir = scratch("override");
+        let data = write_data(&dir);
+        let run = write_run(&dir, RUN);
+        let (code, out, err) = wf(&data, &["--front", &run], "bad,0,100,150,300", &["--allow-in-sample-windows"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("\"in_sample\":true"), "{out}");
+    }
+
+    #[test]
+    fn the_run_position_rule_is_carried_and_explicit_flags_win() {
+        let dir = scratch("rule");
+        let data = write_data(&dir);
+        let run = write_run(&dir, RUN);
+        let (code, out, err) = wf(&data, &["--front", &run], OK_WINDOW, &[]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("\"per_side_bps\":5,"), "{out}");
+        assert!(out.contains("\"threshold_source\":\"fixed\""), "{out}");
+        let (code, out, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--cost-bps", "12", "--threshold-quantile", "0.5"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("\"per_side_bps\":12,"), "{out}");
+        assert!(!out.contains("\"threshold_source\":\"fixed\""), "{out}");
+    }
+
+    #[test]
+    fn refusals() {
+        let dir = scratch("refuse");
+        let data = write_data(&dir);
+        let run = write_run(&dir, RUN);
+        let (code, _, err) = wf(&data, &["--front", &run, "--expr", "x"], OK_WINDOW, &[]);
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains("alternatives"), "{err}");
+
+        let empty = write_run(&dir, &RUN.replace(MEMBERS, "[]"));
+        let (code, _, err) = wf(&data, &["--front", &empty], OK_WINDOW, &[]);
+        assert_eq!(code, 3, "{err}");
+        assert!(err.contains("front is empty"), "{err}");
+
+        let no_time = write_run(&dir, &RUN.replace(r#""train_time":[0,119],"validation_time":[120,179],"#, ""));
+        let (code, _, err) = wf(&data, &["--front", &no_time], OK_WINDOW, &[]);
+        assert_eq!(code, 3, "{err}");
+        assert!(err.contains("no time column"), "{err}");
+
+        let no_count = write_run(&dir, &RUN.replace(r#""search":{"candidates_evaluated":4321},"#, ""));
+        let (code, _, err) = wf(&data, &["--front", &no_count], OK_WINDOW, &[]);
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains("--trials"), "{err}");
+        let (code, _, err) = wf(&data, &["--front", &no_count], OK_WINDOW, &["--trials", "10"]);
+        assert_eq!(code, 0, "{err}");
+
+        let missing_var = write_run(&dir, &RUN.replace(r#"{"expression":"x"}"#, r#"{"expression":"zz"}"#));
+        let (code, _, err) = wf(&data, &["--front", &missing_var], OK_WINDOW, &[]);
+        assert_eq!(code, 3, "{err}");
+        assert!(err.contains("zz"), "{err}");
+    }
+}
+
 #[path = "common/ledger.rs"]
 mod ledger;
 
