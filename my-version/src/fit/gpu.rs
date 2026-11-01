@@ -462,8 +462,9 @@ pub fn maximum_finalist(tree: &mut Node, x: &[Vec<f64>], y: &[f64], w: &[f64], i
 /// #234: for `log_loss` the batch also uploads the label sign
 /// ([`super::classification_signs`]) derived from `y`, because the kernel
 /// cannot compute the target midpoint over the sample; the proposal is then the
-/// kernel's Fisher-scoring optimum of the configured log-loss. Without both
-/// classes the batch is declined.
+/// kernel's Fisher-scoring optimum of the configured log-loss. The hinge forms
+/// upload the same sign and return the kernel's optimum of the configured
+/// hinge. Without both classes the batch is declined.
 #[cfg(feature = "cuda")]
 pub struct BatchedGpu<'a> {
     ev: std::cell::RefCell<&'a mut crate::gpu::GpuEvaluator>,
@@ -577,12 +578,12 @@ impl BatchedFitter for BatchedGpu<'_> {
         metric: Metric,
     ) -> Vec<Option<Vec<f64>>> {
         if let Some(loss) = fit_loss(metric) {
-            // #234: the log-loss arm reads the label sign from the device, so
-            // the caller's `y` is uploaded once per batch. A single-class
-            // target has no finite log-loss optimum and is declined rather
-            // than fitted against a sign the data does not support; the caller
-            // labels it and the exact CPU arm keeps the candidate.
-            if loss == DeviceLoss::Logistic {
+            // #234: the log-loss and hinge arms read the label sign from the
+            // device, so the caller's `y` is uploaded once per batch. A
+            // single-class target is declined rather than fitted against a
+            // sign the data does not support; the caller labels it and the
+            // exact CPU arm keeps the candidate.
+            if loss.needs_label_sign() {
                 let (pos, neg) = class_counts_weighted(y, w);
                 if pos == 0 || neg == 0 {
                     return vec![None; trees.len()];

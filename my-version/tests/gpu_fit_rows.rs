@@ -49,6 +49,7 @@ fn config(seed: u32, fit_rows: usize) -> Config {
         metric: Metric::Squared,
         gpu: true,
         fit_rows,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
         ..Default::default()
     }
 }

@@ -250,8 +250,11 @@ is mathematically well posed:
 | `implicit_residual` (#396) | on an `--implicit` sample the target is 0, so `Σ w|f| / Σ w` is the `absolute` objective: the same L1 IRLS arm, scored by the finite residual (`score_with_constants` and `score_weighted` share the `absolute` branch). The level-set metric `implicit` keeps its own fit, `implicit::fit` |
 | `implicit` (#398) | `implicit::fit`: Levenberg–Marquardt on the signed geometric residual `f/||∇f||`, CPU `f64` only (no device arm; the measured cost is allocation, not arithmetic). `fit_weighted_metric` routes it there for every caller. The tree is flattened once per fit and per score, the constants are swapped in place per probe, and the Jacobian costs three sweeps per row (a directional difference of the constant adjoint along the unit normal, `ε = 1e-6·(1 + ||p||∞)`) instead of `1 + 2p` |
 | `log_squashed` | IRLS with weights `1 / (1 + r²)`, the derivative of `ln(1 + r²)` |
-| `auc`, `log_loss`, `brier`, `hinge`, `hinge_ordinary`, `hinge_squared` | logistic IRLS on the two-class label, with the model output as a logit; `auc`/Brier/hinge use the smooth logistic surrogate and the configured metric accepts or rejects each step. For `log_loss` the surrogate **is** the metric: Newton/Fisher scoring on `Σ ln(1 + exp(-t·p))` with `q(1-q)` row weights. Brier's probability optimum is the same logit `ln(n₊/n₋)` and the exact Brier value is the gate |
+| `auc`, `log_loss`, `brier`, `hinge` | logistic IRLS on the two-class label, with the model output as a logit; `auc`/Brier/`hinge` use the smooth logistic surrogate and the configured metric accepts or rejects each step. For `log_loss` the surrogate **is** the metric: Newton/Fisher scoring on `Σ ln(1 + exp(-t·p))` with `q(1-q)` row weights. Brier's probability optimum is the same logit `ln(n₊/n₋)` and the exact Brier value is the gate |
+| `hinge_ordinary` | the logistic IRLS rounds while they lower the hinge, then majorise-minimise (MM) rounds for the rest of the round budget `clamp(iters, 1, 16)` and one final MM solve. With `z = 1 − t·p` and `a = max(|z|, 1e-6)` at the current constants, `max(0, z) ≤ (z + a)²/(4a)`, tight at the current point: an MM round is weighted least squares to the target `t(1 + a)` with weight `1/(2a)`. Every round is kept only on a strictly lower hinge, so the arm is never worse than the logistic rounds alone |
+| `hinge_squared` | generalized Gauss-Newton: `max(0, 1 − t·p)² = (p − t)²` on the active rows `t·p < 1`, so a round is weighted least squares to the target `t` with weight `[t·p < 1]`, re-derived every round; the same round budget and final solve, every round kept only on a strictly lower squared hinge |
 | `log_loss` with `--fit-strategy gpu` (#234) | the same Fisher scoring in the batched kernel (uploaded label sign, `q(1-q)` weights, `t/q` pseudo-response, `softplus` trial objective, `ln det Ã` gate). The exact CPU `f64` log-loss judges every proposal and refits every finalist; since #289 the **fitness** is native too (log_loss/Brier/hinge), so the search no longer pays a CPU rescoring pass |
+| `hinge`, `hinge_ordinary`, `hinge_squared` with `--fit-strategy gpu` | the same schedules in the batched kernel on the uploaded label sign (fit codes 6-8): `hinge_squared` Gauss-Newton steps with the active set re-derived at every assembly; `hinge_ordinary` logistic Fisher steps until the first rejected trial, then MM steps with two true-hinge Armijo halvings and an MM `f64` polish; `hinge` the logistic Fisher step. The kernel's loss statistic and every trial are the configured hinge form, the device scorer ranks on it, there is no per-candidate host gate, and finalists are refit by the CPU arm above. A single-class sample is labelled `single_class` and never fitted. See `gpu-backend.md`, section "Hinge on the batched kernel" |
 | `signed` | squared fit, then a **constrained least-squares projection** onto the zero-mean-residual manifold in exact `f64` (see §3.0.1); the coordinate polish runs only when the projection is declined |
 | `correlation`, `correlation_signed` | exact analytic gradient and Gauss–Newton curvature of `ρ` with weighted centred moments; an affine-in-constants tree uses the closed-form weighted least-squares/rank-one GEVP optimum, and an outer `a·T+b` gauge is frozen and renormalised. Degenerate variance scores exactly `1.0` |
 | `rank_correlation`, `median`, `maximum`, `interquartile`, `slope` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
@@ -995,10 +998,13 @@ full admission preserves both exact-arm coverage and a large speed-up. Every CPU
 applies to metrics with a native device objective: the squared/AIC family,
 `log_squashed` (#229) with per-row IRLS weights `2/(1 + r²)` and an f64 loss
 accumulator, `absolute` (#222) with per-row Lawson weights
-`1/max(|r|, 1e-6)`, true-`|r|` acceptance and Armijo half-steps, and
+`1/max(|r|, 1e-6)`, true-`|r|` acceptance and Armijo half-steps,
 `log_loss` (#234) with per-row Fisher weights `q(1-q)`, the uploaded label sign
 `t = 2[y > (min+max)/2] - 1`, the pseudo-response offset `t/q` and a
-`softplus(-t·p)` trial objective. The robust arms and `log_loss` are gated by a
+`softplus(-t·p)` trial objective, and the three hinge forms on the same sign
+(Gauss-Newton for `hinge_squared`, logistic then majorise-minimise steps for
+`hinge_ordinary`, the logistic step for `hinge`, every trial judged on the
+configured hinge). The robust, logistic and hinge arms are gated by a
 scale-free `ln det Ã` test instead of the squared arm's Cholesky-diagonal ratio.
 The rank, median, interquartile and maximum families remain fit-only (#230,
 #226, #232, #227): the device moves the constants, while the exact CPU objective
@@ -1013,7 +1019,7 @@ the #234 arm attacked the dominant cost where the #233 AUC arm could not
 maximum arm at least 512 rows, the measured floor of the bisection on the error
 level; below either bound the exact CPU arm runs with a labelled reason. An explicit `gpu` with any other
 metric is a usage error (exit 2) naming `--metric squared`,
-`--metric log_squashed`, `--metric absolute`, `--metric log_loss`, a rank
+`--metric log_squashed`, `--metric absolute`, `--metric log_loss`, a hinge form, a rank
 metric, `--metric median`, `--metric interquartile`, `--metric maximum` or a
 CPU strategy (exact,
 auto, linear, varpro, stream), never a silent CPU fit of a different objective

@@ -130,6 +130,7 @@ git ls-files '*.py'                                                             
 ```sh
 $L bash -c "cd $W/my-version && CARGO_BUILD_JOBS=2 RCSR_CUDA_ARCH=sm_86 timeout 580 cargo test --release --features cuda --no-run" > "$G/issue$N-build.log" 2>&1
 $L bash -c "cd $W/my-version && timeout 580 /usr/local/cuda-13.0/bin/compute-sanitizer --tool memcheck --leak-check no --error-exitcode 99 target/release/deps/<test>-<hash> <filter> --nocapture" > "$G/issue$N-memcheck.log" 2>&1   # exit 0 before any plain GPU run
+# search-level tests: the config helper must set dispatch: DispatchMode::Device (CLI: --dispatch device), else the sanitized run stays on the CPU
 journalctl -k --since "<start>" | grep -i xid   # must print nothing
 ```
 

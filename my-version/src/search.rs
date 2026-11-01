@@ -191,6 +191,10 @@ pub struct Config {
     /// #293: `--gpu-memory`, an upper bound on the device memory the run may
     /// plan on. Not a search setting: it is ignored by the checkpoint check.
     pub gpu_memory: Option<u64>,
+    /// #438: `--dispatch`. `Device` skips the per-stage timing comparison only;
+    /// refusals and CPU-contract stages still route to the CPU. Not a search
+    /// setting.
+    pub dispatch: crate::dispatch::DispatchMode,
     /// #119: bounded producer/scorer overlap depth in batches (`0` disables).
     /// While the GPU scores a batch, the CPU keeps generating and fitting the
     /// next candidates. This is a scheduling choice only: the scored values,
@@ -354,6 +358,7 @@ impl Default for Config {
             gpu: cfg!(feature = "cuda"),
             gpu_notes: true,
             gpu_memory: None,
+            dispatch: crate::dispatch::DispatchMode::Auto,
             pipeline_depth: 2, // #119: only used when the GPU path is active
             variation: VariationMode::Auto,
         }
@@ -981,9 +986,10 @@ impl GpuSearch {
         // device never fits a sign the sample does not support.
         // #289: the predicate is the *fit* objective, not the fit-only split:
         // `log_loss` now has a native scorer, but its device fit still needs
-        // both classes to have a finite optimum.
+        // both classes to have a finite optimum. The hinge codes read the same
+        // sign and are declined the same way.
         let single_class = crate::fit::fit_loss(cfg.metric)
-            == Some(crate::fit::DeviceLoss::Logistic)
+            .is_some_and(|loss| loss.needs_label_sign())
             && {
                 let (pos, neg) = crate::fit::class_counts_weighted(&fit_train.y, &fit_train.w);
                 pos == 0 || neg == 0
@@ -4065,6 +4071,8 @@ struct PipelineFit {
 /// already "every pending candidate with constants". That is exactly
 /// [`WIDE_ADMISSION_ROWS`], and only for the LM family (the rank/order/
 /// maximum/logistic arms have their own gated policies and stay synchronous).
+/// The label-sign codes stay synchronous too: the overlap batch has no
+/// single-class decline.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn pipeline_fit_safe(cfg: &Config, train_rows: usize, screened: bool) -> bool {
     // The overlap queue fits on the scoring context's rows; a fit subsample
@@ -4077,7 +4085,7 @@ fn pipeline_fit_safe(cfg: &Config, train_rows: usize, screened: bool) -> bool {
         && defers_fit_to_gpu(cfg, true)
         && (train_rows >= WIDE_ADMISSION_ROWS || cfg.fit_admission == crate::fit::FitAdmission::All)
         && cfg.fit_iters > 0
-        && crate::fit::fit_loss(cfg.metric).is_some()
+        && crate::fit::fit_loss(cfg.metric).is_some_and(|loss| !loss.needs_label_sign())
         && !crate::fit::device_fit_is_gated(cfg.metric)
 }
 
@@ -5626,7 +5634,8 @@ fn run_search(
             calibration = calibration.with_device_rates(rates);
         }
     }
-    let mut dispatcher = crate::dispatch::Dispatcher::new(calibration);
+    let mut dispatcher =
+        crate::dispatch::Dispatcher::new(calibration).with_mode(cfg.dispatch);
     for stage in [
         crate::dispatch::Stage::Vary,
         crate::dispatch::Stage::Select,
@@ -7193,7 +7202,11 @@ fn run_search(
         } else {
             crate::backend::Kind::Cpu
         },
-        backend_reason,
+        backend_reason: if backend_reason.is_none() && dispatcher.ledger().cost_model_kept_cpu() {
+            Some("dispatch: cost model kept every stage on the cpu".to_string())
+        } else {
+            backend_reason
+        },
         device: if gpu_used || fit_only_device {
             backend_device
         } else {

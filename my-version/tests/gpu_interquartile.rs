@@ -59,6 +59,7 @@ fn iqr_config(seed: u32) -> Config {
         fit_strategy: FitStrategy::Gpu,
         metric: Metric::Interquartile,
         gpu: true,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
         gpu_notes: false,
         ..Default::default()
     }

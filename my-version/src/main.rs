@@ -480,9 +480,11 @@ SEARCH:
                              metric and both fit strategies). Constants are
                              fitted to the configured --metric: squared/aic/
                              aicc/bic use exact least squares; absolute and
-                             log_squashed use IRLS; auc/log_loss/brier/hinge and
-                             the SVM hinge forms use logistic IRLS (a warm start
-                             judged by the configured metric); signed uses the
+                             log_squashed use IRLS; auc/log_loss/brier/hinge use
+                             logistic IRLS (a warm start judged by the configured
+                             metric); hinge_ordinary adds majorise-minimise
+                             rounds after the logistic rounds and hinge_squared
+                             uses Gauss-Newton on the active set; signed uses the
                              squared fit plus a
                              constrained least-squares projection onto the
                              zero-mean-residual manifold (exact to f64, two
@@ -528,7 +530,13 @@ SEARCH:
                              a softplus trial objective (#234; the device
                              proposes constants and the exact CPU f64 log-loss
                              judges and refits; since #289 the search also
-                             scores log_loss natively on the device), the exact correlation
+                             scores log_loss natively on the device), the three
+                             hinge forms on the same label sign (hinge_squared
+                             by Gauss-Newton on the active set, hinge_ordinary
+                             by logistic then majorise-minimise steps, hinge by
+                             the logistic step; every trial judged on the
+                             configured hinge, finalists refit exactly, a
+                             single-class sample labelled single_class), the exact correlation
                              objective 1-|rho| or 1-rho with a frozen affine
                              gauge (correlation_signed refines both gauge
                              orientations; a tree affine in every constant takes
@@ -559,8 +567,9 @@ SEARCH:
                              The device refuses any other metric instead of
                              substituting an objective: use
                              `--metric squared`, `--metric log_squashed`,
-                             `--metric absolute`, `--metric log_loss`, `--metric
-                             correlation`, `--metric correlation_signed`, a rank
+                             `--metric absolute`, `--metric log_loss`, a hinge
+                             form, `--metric correlation`, `--metric
+                             correlation_signed`, a rank
                              metric, `--metric median`, `--metric
                              interquartile`, `--metric maximum`, or a CPU
                              strategy. `--metric signed` fits on the device as
@@ -672,6 +681,21 @@ SEARCH:
                              order scorers then run on the CPU and an explicit
                              --fit-strategy gpu exits 2. JSON reports
                              gpu.memory_plan
+  --dispatch <auto|device>   how the per-stage cost model (#290) routes the movable
+                             stages (default auto). device skips the timing
+                             comparison only and sends every stage that is not
+                             refused (launch, unsupported_plan, too_few_rows,
+                             too_many_constants, ill_conditioned, non_finite,
+                             metric_not_native, device_memory, no_device,
+                             exactness) and not CPU by contract to the device;
+                             the route ledger records reason forced. Needs
+                             --gpu (exit 2 otherwise). Required for
+                             compute-sanitizer runs: the sanitized device is
+                             slow, so auto keeps every stage on the CPU and no
+                             kernel launches. With auto, a CPU run whose stages
+                             all lost the timing comparison reports
+                             backend_reason `dispatch: cost model kept
+                             every stage on the cpu`
   --no-gpu                   force CPU evaluation (alias --cpu); also the
                              reproducibility escape hatch for a byte-identical
                              CPU trajectory
@@ -2015,6 +2039,8 @@ fn main() {
     let mut gpu_explicit: Option<bool> = None;
     // #293: `--gpu-memory`, a device memory cap for the plan.
     let mut gpu_memory: Option<u64> = None;
+    // #438: `--dispatch auto|device`.
+    let mut dispatch_mode = rcsr::dispatch::DispatchMode::Auto;
     let mut data_path: Option<String> = None;
     let mut target: Option<String> = None;
     let mut vars: Vec<String> = Vec::new();
@@ -2647,6 +2673,17 @@ fn main() {
                     }
                 }
             }
+            // #438: `device` skips the timing comparison; refusals still win.
+            "--dispatch" => {
+                let v = val!();
+                match rcsr::dispatch::DispatchMode::parse(&v) {
+                    Some(mode) => dispatch_mode = mode,
+                    None => {
+                        eprintln!("error: --dispatch needs auto or device, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--no-gpu" | "--cpu" => {
                 cfg.gpu = false;
                 gpu_explicit = Some(false);
@@ -3216,6 +3253,7 @@ fn main() {
         // continued on the CPU.
         let requested_gpu = cfg.gpu;
         let requested_simd = cfg.simd;
+        let requested_dispatch = cfg.dispatch;
         let mut effective = saved;
         if generations_set {
             effective.generations = cfg.generations;
@@ -3228,6 +3266,7 @@ fn main() {
         }
         effective.gpu = requested_gpu;
         effective.simd = requested_simd;
+        effective.dispatch = requested_dispatch;
         fit_request = None;
         cfg = effective;
         resumed_generation = Some(cp.generations);
@@ -3237,6 +3276,12 @@ fn main() {
     // #141: probe the device once, before the dataset is loaded. The probe
     // allocates nothing; the search opens its own resident context later. This
     // is the single runtime decision behind the startup summary and JSON.
+    if dispatch_mode == rcsr::dispatch::DispatchMode::Device && gpu_explicit != Some(true) {
+        eprintln!("error: --dispatch device needs --gpu (and a build with --features cuda)");
+        std::process::exit(EXIT_USAGE);
+    }
+    cfg.dispatch = dispatch_mode;
+
     let gpu_probe = backend::probe();
     match gpu_explicit {
         Some(true) => {
@@ -9132,6 +9177,12 @@ OPTIONS:
                              matched-exposure random long, each with exposure,
                              turnover, beta and excess over cash. With
                              --device-pnl they are cross-checked on the device
+  --batch-pnl                score every candidate on every window in one batch
+                             (CUDA kernel when built with --features cuda, the
+                             identical host path otherwise), per window and
+                             pooled, with the baseline ladder. Reported
+                             finalist values stay exact CPU f64; batch values
+                             are labelled gpu_proxy and checked against them
   --entry-offset <seconds>   seconds from the row stamp to the label entry
                              (default 0). Required purge = entry-offset +
                              horizon + delay; a window with a shorter gap is
@@ -9361,6 +9412,7 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--pool-reset-flat" => pool_reset_flat = true,
             "--device-pnl" => device_pnl = true,
+            "--batch-pnl" => popts.batch_pnl = true,
             "--gpu" => gpu = true,
             "--control-seed" => {
                 let src = need(args, i + 1, "--control-seed");

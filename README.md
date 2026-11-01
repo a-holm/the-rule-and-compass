@@ -33,7 +33,13 @@ on the binary label for `log_loss` (#234; the device proposes the constants
 and the exact CPU `f64` log-loss judges the proposal and refits every finalist,
 and since #289 the search also scores log-loss, Brier and the three hinge forms
 with a native label-aware kernel — `hinge` is explicitly the bounded sigmoid
-surrogate, not the SVM hinge), and the exact correlation objective with
+surrogate, not the SVM hinge), the three hinge forms on the same label sign
+(`hinge_squared` by Gauss-Newton on the active set, `hinge_ordinary` by
+logistic steps while they lower the hinge and then majorise-minimise steps,
+`hinge` by the logistic step judged on the sigmoid hinge; every trial is
+judged on the configured hinge, a single-class sample is labelled
+`single_class`, and finalists are refit by the same schedule in CPU `f64`),
+and the exact correlation objective with
 a frozen affine gauge
 (#224) — and labels every larger or unsupported candidate for the exact CPU
 arm; the correlation *scorer* is native on the device since #287;
@@ -65,7 +71,9 @@ interquartile`, `--metric maximum` or a CPU strategy.
 Dispatch is planned per stage, not per run: a calibrated cost model returns
 `device`, `cpu` or `split` plus a machine reason, with hysteresis at the
 crossover and a route ledger in `--json`/`--run-manifest`. Structural and
-arithmetic refusals are a cause set, never a timing test. See
+arithmetic refusals are a cause set, never a timing test. `--dispatch device` skips the timing comparison
+only (reason `forced`); a compute-sanitizer run needs it, or the slow sanitized
+device loses every stage and no kernel launches. See
 [`docs/dispatch.md`](docs/dispatch.md).
 Every arm falls back to the default LM path when it cannot prove a safe result,
 and the default remains the historical LM path bit for bit. `--metric signed`
@@ -181,6 +189,7 @@ Every window also lists the long-only controls (cash, buy-and-hold, constant
 long/flat from the training mean, matched-exposure random long seeded by
 `--control-seed`) with exposure, turnover, beta and excess over cash; see
 `src/baselines.rs`.
+Pass `--batch-pnl` to score every candidate on every window in one batch (`src/wf_batch.rs`, kernel `src/cuda/wf_batch.cu`), per window and pooled, with the baseline ladder; finalist values stay exact CPU f64 and batch values are labelled `gpu_proxy`.
 `--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
 associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
 adds the exact `O(2n)` hindsight DP as a labelled bound, never as the
@@ -621,7 +630,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--no-front-parents]
      [--fit-samples N]
      [--patience N]
-     [--gpu] [--gpu-memory size] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
+     [--gpu] [--gpu-memory size] [--dispatch auto|device] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
      [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
      [--allow-backend-change] [--allow-build-change] [--run-manifest file] [--json-out file]
@@ -1098,7 +1107,13 @@ on the binary label for `log_loss` (#234; the device proposes the constants
 and the exact CPU `f64` log-loss judges the proposal and refits every finalist,
 and since #289 the search also scores log-loss, Brier and the three hinge forms
 with a native label-aware kernel — `hinge` is explicitly the bounded sigmoid
-surrogate, not the SVM hinge), and the exact correlation objective with
+surrogate, not the SVM hinge), the three hinge forms on the same label sign
+(`hinge_squared` by Gauss-Newton on the active set, `hinge_ordinary` by
+logistic steps while they lower the hinge and then majorise-minimise steps,
+`hinge` by the logistic step judged on the sigmoid hinge; every trial is
+judged on the configured hinge, a single-class sample is labelled
+`single_class`, and finalists are refit by the same schedule in CPU `f64`),
+and the exact correlation objective with
 a frozen affine gauge
 (#224) — and labels every larger or unsupported candidate for the exact CPU
 arm; the correlation *scorer* is native on the device since #287;
@@ -1225,7 +1240,7 @@ the GPU to guide the search whenever one is available **and the run's metric is
 scored on the device**; a build without the feature, or a machine with no usable
 device, falls back to the CPU and records the reason. `--gpu` asserts that a
 device must exist (exit 2 otherwise), `--no-gpu`/`--cpu` forces the CPU, and
-`RCSR_GPU=0` simulates a missing device. Non-quiet runs print one resource line
+`RCSR_GPU=0` simulates a missing device. `--dispatch device` (needs `--gpu`) forces the device route past the cost model; refusals still win. Non-quiet runs print one resource line
 with the backend, device, available threads and training rows/columns, and
 `--json` records `backend`, `backend_reason` and `device`.
 
