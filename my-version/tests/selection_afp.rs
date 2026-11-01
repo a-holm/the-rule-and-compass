@@ -139,3 +139,39 @@ fn afp_off_is_bit_identical() {
 5\t5\t0.00000045\t0.00000067\t(2.7389 + (2 * (0.1305 + x)))\n";
     assert_eq!(got, want);
 }
+
+/// Device scoring and the batched device fit under afp: immigrant slots, the
+/// overlap pipeline (depth 0 and 2) and the thread count must not change the
+/// archive. Skipped without a device.
+#[cfg(feature = "cuda")]
+#[test]
+fn afp_is_deterministic_on_the_device() {
+    use rcsr::dispatch::DispatchMode;
+    use rcsr::fit::FitStrategy;
+    use rcsr::metrics::Metric;
+    let train = sample(96);
+    let test = sample(96);
+    for depth in [0, 2] {
+        let run = |threads| {
+            let cfg = Config {
+                metric: Metric::Squared,
+                gpu: true,
+                dispatch: DispatchMode::Device,
+                fit_strategy: FitStrategy::Gpu,
+                pipeline_depth: depth,
+                pop: 48,
+                ..config(Selection::Afp, 4, threads)
+            };
+            search::run(&cfg, &train, &test)
+        };
+        let a = run(1);
+        if a.backend != rcsr::backend::Kind::Gpu {
+            eprintln!("skipped: no usable device ({:?})", a.backend_reason);
+            return;
+        }
+        let b = run(1);
+        let c = run(4);
+        assert_eq!(a.archive.hash(), b.archive.hash(), "depth {depth}: same seed, same archive");
+        assert_eq!(a.archive.hash(), c.archive.hash(), "depth {depth}: threads 4 changed the archive");
+    }
+}
