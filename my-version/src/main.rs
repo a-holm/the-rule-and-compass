@@ -4391,6 +4391,7 @@ fn main() {
             return_column: ts.return_column.clone(),
             log_returns: ts.return_units == "log",
             funding_column: trade_funding.clone(),
+            train: false,
         });
         let tspec = rcsr::trading::TradingSpec {
             cost_bps: cost,
@@ -4428,6 +4429,7 @@ fn main() {
         allow_lockbox,
         purge_seconds: target_resolved.as_ref().map(|r| r.spec.required_purge_seconds()),
         trading: trading_cols.clone(),
+        canonical_train_order: false,
         scale_column: target_resolved
             .as_ref()
             .and_then(|r| r.spec.scale_column())
@@ -9350,6 +9352,9 @@ OPTIONS:
                              compare its report hash; records nothing
   --expect-report-sha256 <h> exit 1 unless the report JSON hashes to h
   --json                     print the full JSON report to stdout
+                             (it ends with a ledger object: the phase ledger of the
+                             command, io and pnl seconds on the run wall, outside the
+                             report hash)
   --out <file>               write the JSON report to a file
   --markdown <file|->        write the Markdown report ('-' = stdout)
   --allow-lockbox            permit a test window overlapping 2026H2
@@ -10034,10 +10039,7 @@ fn run_walkforward(args: &[String]) -> ! {
             windows_scheme.as_ref().map_or("null".to_string(), |s| format!("{:?}", s)),
         ));
     }
-    let report_json = || match &protocol_json {
-        Some(p) => report.json_with_protocol(p),
-        None => report.json(),
-    };
+    let report_json = || report.json_with_ledger(protocol_json.as_deref());
     for w in &report.windows {
         let reasons = [
             w.band.as_ref().and_then(|b| b.fallback_reason.as_deref()),

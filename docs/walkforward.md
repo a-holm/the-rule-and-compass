@@ -525,6 +525,8 @@ sign test, per-window metrics and pooled metrics. `--out file` writes the
 same JSON, `--markdown file` writes a Markdown report and `--markdown -` prints
 it to stdout. Without those flags a compact text table is printed.
 
+The printed and written JSON ends with a `ledger` object (#284): the phase ledger of the run with `io_s` (store row-group or CSV reads), `pnl_s` (scoring, windows, controls, `--batch-pnl`), `host_other_s`, `wall_s`, `unaccounted_s`, `closure` and `device_busy_s`, the union of the `--batch-pnl` device tile intervals (`host_envelope` basis; `--device-pnl` is not timed). The ledger holds wall-clock seconds, so `report_sha256` and `--expect-report-sha256` hash the report without it. See `docs/benchmarks.md`.
+
 ## Store handling and memory
 
 A `.rcsb` path is opened with `store::FileStore` and scanned one row group at a

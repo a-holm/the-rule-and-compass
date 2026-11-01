@@ -355,9 +355,171 @@ with one wall clock and exclusive main-thread stages:
 | `eval_fallback.programs/seconds` | evaluator CPU-fallback work |
 | `quality_per_gpu_hour` | decades per run wall-hour, with like-unit errors and full provenance |
 
+### Phase ledger of `enrich`, `walkforward` and `ladder` (#284)
+
+Each command ends its JSON report with a `ledger` object: the same keys as `gpu.ledger` (`wall_s`, `stages.*_s`, `stage_sum_s`, `unaccounted_s`, `closure`, `device_busy_s`, `device_busy_sum_s`, `device_overlap_s`, `device_intervals`, `device_interval_basis`, `duty_run`) plus `command` and the command's own `structural_zero_stages`. The wall clock is the command's own run wall. Stages are exclusive and sum to no more than `wall_s`.
+
+| command | `io_s` | `features_s` / `pnl_s` | device intervals |
+|---|---|---|---|
+| `enrich` | input read, feature reads, GPU output staging writes, output write | `features_s`: context, GPU, CPU and cross-section producer work | the kernel seconds of each device region, placed in that region's host window (`host_envelope`) |
+| `walkforward` | `.rcsb` row-group reads or the CSV table load | `pnl_s`: scoring, windows, controls, `--batch-pnl` | the `--batch-pnl` device tile seconds per seam (`host_envelope`) |
+| `ladder` | panel, windows and fold load | `pnl_s`: the whole ladder | none |
+
+`host_other_s` is the rest of the wall. `walkforward` keeps the ledger outside the reproduction hash (`report_sha256` hashes the report without it). `--device-pnl` does not time its device reduction, so it adds no interval.
+
 `gpu.eval_kernel_duty` (formerly `gpu.duty_cycle`) is the evaluator-window kernel
 fraction (scope `evaluator_window`, window `gpu.eval_window_s`). It is not the run-level number; use
 `gpu.ledger.duty_run` for “how busy was the device during the run?”. A GPU run
 answers `Σ stage_s + unaccounted_s = wall_s` within 1 %; a CPU run still reports
 `"gpu": null`.
 
+
+## 8. Hard and signal suites, multi-seed runs and paired comparison
+
+`known-truth` is saturated at its criterion: at the default budget the front holds a member above R² 0.99 in 75 of 75 runs, and the seed-to-seed spread at a small budget is as large as the effect of a search change. The `hard` and `signal` suites, the oracle criterion, the time-to-hit fields, many seeds and `rcsr-bench compare` exist to rank a search change with a known error bar. `known-truth` is unchanged: `rcsr-bench --suite known-truth --seed 1 --cpu --json` gives the same `recovered`, `test_r2`, `complexity`, `train_error`, `test_rmse` and `expression` for all 75 runs as the harness before this section.
+
+The suites live in `my-version/src/bench_suites.rs`, the statistics and the comparison in `my-version/src/bench_stats.rs`.
+
+### 8.1 The `hard` suite
+
+20 problems, 100 training rows, 500 fresh noiseless test rows, uniform inputs, the same noise model as `known-truth`. `truth_cx` is the node count of the truth tree under the default complexity model (`x^2` is one `square` node, `x^4` is `square(square(x))`); a unit test checks it against the tree. `rcsr-bench --list --suite hard` prints the table from the code.
+
+| problem | truth | ranges | `truth_cx` |
+|---|---|---|---:|
+| `nguyen5` | `sin(x²)·cos(x) − 1` | x ∈ [−1, 1] | 8 |
+| `nguyen6` | `sin(x) + sin(x + x²)` | x ∈ [−1, 1] | 8 |
+| `nguyen7` | `ln(x + 1) + ln(x² + 1)` | x ∈ [0, 2] | 10 |
+| `nguyen9` | `sin(x1) + sin(x2²)` | both ∈ [−1, 1] | 6 |
+| `nguyen10` | `2·sin(x1)·cos(x2)` | both ∈ [−1, 1] | 7 |
+| `nguyen12` | `x1⁴ − x1³ + 0.5·x2² − x2` | both ∈ [−1, 1] | 13 |
+| `keijzer11` | `x1·x2 + sin((x1 − 1)(x2 − 1))` | both ∈ [−3, 3] | 12 |
+| `keijzer14` | `8 / (2 + x1² + x2²)` | both ∈ [−3, 3] | 9 |
+| `keijzer15` | `0.2·x1³ + 0.5·x2³ − x2 − x1` | both ∈ [−3, 3] | 13 |
+| `vladislavleva1` | `exp(−(x1 − 1)²) / (1.2 + (x2 − 2.5)²)` | both ∈ [0.3, 4] | 13 |
+| `pagie1` | `x1⁴/(1 + x1⁴) + x2⁴/(1 + x2⁴)` | both ∈ [−5, 5] | 19 |
+| `korns1` | `1.57 + 24.3·x4` (inputs x1..x5) | all ∈ [−50, 50] | 5 |
+| `korns4` | `−2.3 + 0.13·sin(x3)` (inputs x1..x5) | all ∈ [−50, 50] | 6 |
+| `feynman_i6_2` | `exp(−0.5 (t/s)²) / (2.5066283·s)` | t, s ∈ [1, 3] | 11 |
+| `feynman_i12_11` | `q·(E + B·v·sin(th))` | all ∈ [1, 5] | 10 |
+| `feynman_i15_3x` | `(x − u·t) / sqrt(1 − u²/c²)` | x [5, 10], u [1, 2], t [2, 5], c [3, 10] | 14 |
+| `feynman_i29_16` | `sqrt(x1² + x2² − 2·x1·x2·cos(th1 − th2))` | all ∈ [1, 5] | 17 |
+| `freq_sine` | `1.5·sin(2.7·x + 0.4)` | x ∈ [−3, 3] | 8 |
+| `rational_r1` | `(x + 1)³ / (x² − x + 1)` | x ∈ [−1, 1] | 11 |
+| `damped_freq` | `exp(−0.4·x)·cos(3·x)` | x ∈ [0, 6] | 9 |
+
+`korns1` and `korns4` carry four unused input columns; a problem lists them in `distractors`.
+
+### 8.2 The `signal` suite
+
+Three low-SNR regression tasks that mimic a long-only signal on crypto data. Each has 2000 training, 1000 validation and 2000 test rows. The target is `y = s + e` with the noiseless signal `s` and Student-t noise `e` with 4 degrees of freedom (`N(0,1) / sqrt(chi2_4 / 4)`). The noise scale is solved on the training rows so that the realised `var(s) / var(y)` equals the task's oracle R² (unit test `bench_signal_oracle_r2`). Three distractor columns `d1..d3 ~ N(0, 1)` are appended to every task. The suite has no noise sweep: `--noise` is ignored and the run line reports `"noise": null`.
+
+| task | inputs | signal `s` | oracle R² | rows |
+|---|---|---|---:|---|
+| `sig_tanh` | r1 ~ N(0,1), vol = exp(0.5·N(0,1)), z ~ N(0,1) | `0.3·tanh(2·r1) − 0.2·z·vol` | 0.20 | i.i.d. |
+| `sig_regime` | r1, vol | `if(1.2 − vol, 0.25·r1, −0.1·r1)` | 0.10 | i.i.d. |
+| `sig_ar` | xf, xs AR(1) with phi 0.5 and 0.95 (unit marginal sd), vol | `0.15·(xf − xs) / vol` | 0.05 | time-ordered; train, validation and test are consecutive blocks |
+
+The front member with the lowest error on the **validation** rows is selected, never one chosen on the test rows. `signal_r2` is its R² against the noiseless test signal, `signal_recovered` is `signal_r2 >= 0.8`, `selected_cx` its complexity and `distractors_used` the number of distractor columns in the expression. For these runs `test_r2`, `complexity` and `expression` describe the selected member and `recovered` applies `--threshold` to `signal_r2`.
+
+### 8.3 Criteria and per-run fields
+
+| field | meaning |
+|---|---|
+| `seed`, `suite`, `truth_cx`, `generations_run`, `stop_reason`, `backend` | run identity and how it ended; `backend` is what ran (`cpu` or `gpu`) |
+| `oracle_r2` | test R² of `c0 + c1·truth` refit on the training rows with every truth constant free (50 LM iterations from the true constants) |
+| `oracle_recovered` | some front member has `1 − R² <= 2 (1 − oracle_r2) + 1e-9`. At noise 0 this demands the law; with noise it demands what the true structure reaches on these rows. `null` for signal tasks |
+| `exact_cx`, `excess_cx` | complexity of the simplest front member that meets the oracle criterion, and its difference to `truth_cx` |
+| `front_hv` | hypervolume of the final front in the plane `(min(1, max(0, 1 − R²)), cost / max_complexity)` with reference point `(1, 1)`; higher is better, 1 means the exact law at near-zero cost |
+| `hit_gen`, `hit_s`, `hit_evals` | first generation (1-based), elapsed search seconds and evaluated candidates (`generation · islands · pop`) at which the front held a member with test R² >= `--threshold`; for signal tasks the validation-selected member must reach `signal_r2 >= 0.8` |
+| `oracle_hit_gen`, `oracle_hit_s`, `oracle_hit_evals` | the same for the oracle criterion |
+| `signal_r2`, `signal_recovered`, `selected_cx`, `distractors_used` | signal tasks only |
+| `fit_attempts`, `fit_gpu`, `fit_fallback` | device fit counters, `null` on a CPU run |
+
+The time-to-hit fields come from a reporting-only hook, `search::Config::front_observer`, called once per generation after the archive update. It does not change the trajectory (test `front_observer_does_not_change_the_archive`, and `front_observer_does_not_change_the_postfix_archive` for the flat arena path). The bench scores each new front member once, so `seconds` and `hit_s` include that scoring. A run stopped by `--time-budget` still reports its hits.
+
+### 8.4 Running
+
+```sh
+cd my-version
+rcsr-bench --suite hard --noise 0 --seeds 1-3 --cpu --ndjson > hard.ndjson
+rcsr-bench --suite signal --seeds 1 --cpu --ndjson > signal.ndjson
+rcsr-bench --suite all --problems nguyen9,sig_tanh --seeds 1,2 --generations 20 --json
+```
+
+| flag | effect |
+|---|---|
+| `--suite known-truth\|hard\|signal\|all` | suites to run; a comma list runs several |
+| `--problems a,b` | run only these names; an unknown name exits 2 |
+| `--seeds 1,2,3` or `--seeds 1-10` | engine seeds; `--seed S` stays a single seed |
+| `--cpu` | `Config::gpu = false`, no environment variable; `--gpu` needs a device and exits 2 without one |
+| `--fit-strategy exact\|auto\|linear\|varpro\|stream\|gpu\|default` | `exact` stays the bench default; `default` resolves the arm like the production CLI (`FitRequest::Unset`) |
+| `--fit-iters`, `--ops`, `--max-complexity`, `--patience`, `--migration-interval`, `--restart-interval`, `--variation`, `--dispatch` | copied into `search::Config` |
+| `--threads N` | worker threads for fitting and scoring inside an island (default: all cores; results do not depend on it) |
+| `--jobs N` | N CPU runs at once; each run keeps its seed, so results are identical, but `seconds` and `hit_s` are contended. Exits 2 with a device backend |
+| `--ndjson` | one JSON line per finished run, flushed at once, then one summary line |
+| `--json` | one JSON object, as before |
+
+Every NDJSON line carries a `config` object: `generator` (the data generator and criteria version), the thresholds, `knobs` (every search setting) and `build` (version, CUDA feature, backend request, jobs, `git describe`).
+
+**Chunks.** A run killed by a lock-hold timeout keeps every line it flushed. Run seeds as separate invocations, each under `timeout 580`, and merge the files in `compare` with a comma list. Seeds are independent, so the merged result equals one long invocation.
+
+### 8.5 `rcsr-bench compare`
+
+```sh
+rcsr-bench compare --base a.ndjson[,a2.ndjson] --treat b.ndjson[,b2.ndjson] \
+    [--criterion recovered|oracle_recovered|signal_recovered] [--json]
+```
+
+* Pairs runs by `(suite, problem, noise, seed)`. It exits 2 when the two sides do not hold the same set of keys, when a key repeats, or when the `config` objects differ in anything other than `knobs` and `build` (a different data generator or threshold cannot be compared by accident).
+* Prints both rates with Wilson 95 % intervals, the discordant counts `b` (base only) and `c` (treat only) and the exact two-sided McNemar p-value `min(1, 2 P(X <= min(b, c)))`, `X ~ Binomial(b + c, 1/2)`.
+* Prints the median paired ratio `treat.hit_s / base.hit_s` and `hit_evals` over pairs where both hit, the median paired `front_hv` difference, the summed `seconds` of both sides and a per-problem table (base hits, treat hits, wins, losses).
+* `hit_evals` is exact and independent of machine load; `hit_s` is wall time. Compare time on an otherwise idle machine and prefer `hit_evals` when the load varies.
+
+Unit tests pin the statistics: Wilson 7/10 is [0.397, 0.892], McNemar (0, 6) is 0.03125 and (3, 3) is 1.
+
+### 8.6 Recorded baselines
+
+Recorded on the 8-thread i7-3770K with `--features cuda` for the GPU rows, with other jobs running on the machine, so absolute seconds are inflated and noisy. CPU data recorded at `b1f6390`, GPU data at `e6431cc` (the commits differ only in the `--dispatch` knob). Raw NDJSON is not committed; each row lists its command.
+
+| row | command (after `cd my-version`) | runs | recovered | oracle_recovered | median `hit_s` | summed seconds |
+|---|---|---:|---|---|---:|---:|
+| `known-truth`, seed 1, 3 noise levels, CPU | `rcsr-bench --suite known-truth --seed 1 --cpu --json` | 75 | 75/75 | | | 445.0 |
+| `hard`, noise 0, seeds 1-3, CPU | `rcsr-bench --suite hard --noise 0 --seeds 1 --cpu --ndjson` and `--seeds 2-3` | 60 | 53/60 [0.778, 0.942] | 23/60 (38.3 %) [0.271, 0.510] | 0.33 s (n = 53) | 242.4 |
+| `hard`, noise 0, seeds 1-3, GPU, default fit arm | `rcsr-bench --suite hard --noise 0 --seeds 1-3 --gpu --fit-strategy default --ndjson` | 60 | 50/60 [0.720, 0.907] | 19/60 (31.7 %) [0.213, 0.442] | 0.14 s (n = 50) | 62.3 |
+| `signal`, seeds 1-2, CPU | `rcsr-bench --suite signal --seeds 1-2 --cpu --ndjson` | 6 | `signal_recovered` 6/6 | | 10.0 s (n = 6) | 406.7 |
+
+The `hard` baseline `oracle_recovered` rate at noise 0 is 38.3 %, inside the 20 % to 80 % target band, so the default budget (150 generations, 2 islands, 200 individuals) stays. Per problem, the number of seeds (of 3) whose front holds the oracle-grade member on CPU: `damped_freq`, `freq_sine`, `korns1`, `nguyen9`, `nguyen10` 3; `feynman_i12_11`, `keijzer15`, `korns4` 2; `nguyen6`, `nguyen12` 1; the other nine problems 0. The `signal` runs select models with `signal_r2` between 0.89 and 1.00 (cost 7 to 24); `distractors_used` is 0 in four of six runs, 1 in one and 3 in one, so it separates runs where `signal_recovered` does not.
+
+Paired comparison of the CPU baseline with the same seeds at `--generations 60` (a deliberately weaker treatment, to exercise the tool):
+
+```
+rcsr-bench compare --base hard-s1.ndjson,hard-s2-3.ndjson --treat hard-g60.ndjson --criterion oracle_recovered
+base   23/60 (38.3%)  Wilson 95% [0.271, 0.510]
+treat  17/60 (28.3%)  Wilson 95% [0.185, 0.408]
+discordant: b (base only) = 6, c (treat only) = 0
+McNemar exact two-sided p = 0.03125
+median paired hit_evals ratio treat/base = 1.0000 over 46 pairs
+```
+
+The `hit_evals` ratio of exactly 1 shows that the shorter run follows the same trajectory as the first 60 generations of the longer one. Comparing the CPU baseline with the GPU default-arm run: `oracle_recovered` b = 6, c = 2, p = 0.289; `recovered` b = 3, c = 0, p = 0.25; median paired `hit_s` ratio 0.33.
+
+**Full baselines.** The recorded rows are small seed sets. The full baselines, one invocation per chunk so that each fits a 10-minute lock hold (measured: `hard` about 70 to 90 s per seed, `known-truth` about 240 to 450 s per seed, `signal` about 200 s per seed):
+
+```sh
+# known-truth, seeds 1-5, CPU: one seed per invocation
+for s in 1 2 3 4 5; do timeout 580 rcsr-bench --suite known-truth --seed $s --cpu --ndjson > kt-s$s.ndjson; done
+# hard, seeds 1-10, CPU, noise 0: three seeds per invocation
+for r in 1-3 4-6 7-9 10; do timeout 580 rcsr-bench --suite hard --noise 0 --seeds $r --cpu --ndjson > hard-$r.ndjson; done
+# signal, seeds 1-10, CPU: two seeds per invocation
+for r in 1-2 3-4 5-6 7-8 9-10; do timeout 580 rcsr-bench --suite signal --seeds $r --cpu --ndjson > signal-$r.ndjson; done
+# hard, seeds 1-3, GPU, production fit arm
+timeout 580 rcsr-bench --suite hard --noise 0 --seeds 1-3 --gpu --fit-strategy default --ndjson > hard-gpu.ndjson
+```
+
+Each chunk is one lock hold. They are not recorded here yet; the 10-seed `hard` rate decides whether the budget band holds.
+
+### 8.7 Limits
+
+* `signal_recovered` (R² >= 0.8 against the noiseless signal) is saturated on the recorded runs. `distractors_used`, `selected_cx` and `signal_r2` still vary.
+* The oracle criterion is relative to the training rows. A front member can meet it with a different, equally good form; `exact_cx` and `excess_cx` show the cost.
+* Wall-clock fields depend on machine load. `hit_evals` does not.

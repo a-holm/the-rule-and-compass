@@ -1334,6 +1334,7 @@ impl RunPlan {
             purge_seconds: None,
             scale_column: None,
             trading: None,
+            canonical_train_order: false,
         };
         let cv_dtypes = dtypes.clone();
         let prep = data::PrepSpec {

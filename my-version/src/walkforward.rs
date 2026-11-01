@@ -506,6 +506,8 @@ pub struct Report {
     pub device_pnl: Option<DevicePnlSummary>,
     /// #309: batch pass over all candidates and windows (`--batch-pnl`).
     pub batch_pnl: Option<crate::wf_batch::BatchSummary>,
+    /// #284: run-scoped phase ledger (`io`, `pnl`, `host_other`, device-busy intervals). Not part of `json()`, which is the reproduction hash.
+    pub ledger: crate::gpu_stats::RunLedger,
     /// `entry_offset) + horizon + delay`.
     pub required_purge_seconds: f64,
     /// Smallest `test_start - train_end` over the windows.
@@ -541,12 +543,28 @@ pub fn run_path(path: &str, spec: &EvalSpec) -> Result<Report, String> {
 
 /// [`run_path`] with the protocol options.
 pub fn run_path_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Result<Report, String> {
+    let clock = std::time::Instant::now();
     if store::is_store_path(path) {
-        run_store_with(path, spec, opts)
+        let mut report = run_store_clocked(path, spec, opts, clock)?;
+        close_ledger(&mut report.ledger, clock);
+        Ok(report)
     } else {
+        let t_read = std::time::Instant::now();
         let table = data::read_table(path)?;
-        run_table_with(&table, spec, "csv-table", opts)
+        let read_s = t_read.elapsed().as_secs_f64();
+        let mut report = run_table_clocked(&table, spec, "csv-table", opts, clock)?;
+        report.ledger.record_stage(crate::gpu_stats::Stage::Io, read_s);
+        close_ledger(&mut report.ledger, clock);
+        Ok(report)
     }
+}
+
+/// #284: the ledger clock covers the whole call. Stage windows are measured;
+/// `host_other` is the rest of the wall (layout, parsing, assembly).
+fn close_ledger(ledger: &mut crate::gpu_stats::RunLedger, clock: std::time::Instant) {
+    let wall = clock.elapsed().as_secs_f64();
+    ledger.record_stage(crate::gpu_stats::Stage::HostOther, wall - ledger.stage_sum_s());
+    ledger.set_wall(wall);
 }
 
 /// Evaluate a resident table. The CLI's CSV path and tests use this.
@@ -561,12 +579,26 @@ pub fn run_table_with(
     source: &str,
     opts: &ProtocolOptions,
 ) -> Result<Report, String> {
+    let clock = std::time::Instant::now();
+    let mut report = run_table_clocked(table, spec, source, opts, clock)?;
+    close_ledger(&mut report.ledger, clock);
+    Ok(report)
+}
+
+fn run_table_clocked(
+    table: &Table,
+    spec: &EvalSpec,
+    source: &str,
+    opts: &ProtocolOptions,
+    clock: std::time::Instant,
+) -> Result<Report, String> {
     let layout = resolve_layout(spec, &table.names, &table.numeric)?;
     let trees = parse_expressions(spec, &layout)?;
     validate_windows(spec, opts)?;
 
     let times = data::time_keys(table, layout.time);
     let group_ids = layout.group.map(|g| table_group_ids(table, g));
+    let t_pnl = std::time::Instant::now();
     let mut acc = Accum::new(spec, opts, trees.len())?;
     let mut features = Vec::with_capacity(layout.vars.len());
     for r in 0..table.len() {
@@ -581,14 +613,17 @@ pub fn run_table_with(
         let g = group_ids.as_ref().map_or(0, |ids| ids[r]);
         acc.add(t, g, &features, table.value(r, layout.target), &trees);
     }
-    acc.finish(
+    let mut report = acc.finish(
+        clock,
         spec,
         opts,
         &layout,
         source,
         "O(test rows + one score per training row per window); CSV is resident",
         &trees,
-    )
+    )?;
+    report.ledger.record_stage(crate::gpu_stats::Stage::Pnl, t_pnl.elapsed().as_secs_f64());
+    Ok(report)
 }
 
 /// Evaluate a `.rcsb` store directly, scanning it one row group at a time.
@@ -598,6 +633,18 @@ pub fn run_store(path: &str, spec: &EvalSpec) -> Result<Report, String> {
 
 /// [`run_store`] with the protocol options.
 pub fn run_store_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Result<Report, String> {
+    let clock = std::time::Instant::now();
+    let mut report = run_store_clocked(path, spec, opts, clock)?;
+    close_ledger(&mut report.ledger, clock);
+    Ok(report)
+}
+
+fn run_store_clocked(
+    path: &str,
+    spec: &EvalSpec,
+    opts: &ProtocolOptions,
+    clock: std::time::Instant,
+) -> Result<Report, String> {
     let fs = FileStore::open(path)?;
     let names = fs.header().names();
     let numeric = fs.header().numeric();
@@ -608,10 +655,13 @@ pub fn run_store_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Re
 
     let mut acc = Accum::new(spec, opts, trees.len())?;
     let header = fs.header();
+    let t_pnl = std::time::Instant::now();
+    let mut io_s = 0.0f64;
     let mut buf = GroupBuf::new();
     let mut scratch = Vec::new();
     let mut features = Vec::with_capacity(layout.vars.len());
     for group in 0..fs.n_groups() {
+        let t_io = std::time::Instant::now();
         let view = fs.load_group_with(group, &mut buf, &mut scratch)?;
         let len = view.len();
         let time_i64 = if layout.time_i64 {
@@ -628,6 +678,7 @@ pub fn run_store_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Re
             Some(c) if !numeric[c] => Some(fs.read_codes(group, c)?),
             _ => None,
         };
+        io_s += t_io.elapsed().as_secs_f64();
         let time_levels = header.levels(layout.time);
         for r in 0..len {
             let t = match (&time_i64, &time_codes) {
@@ -664,7 +715,10 @@ pub fn run_store_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Re
          group by group, one {} -row group resident",
         fs.group_rows()
     );
-    acc.finish(spec, opts, &layout, "store-stream", &bound, &trees)
+    let mut report = acc.finish(clock, spec, opts, &layout, "store-stream", &bound, &trees)?;
+    report.ledger.record_stage(crate::gpu_stats::Stage::Io, io_s);
+    report.ledger.record_stage(crate::gpu_stats::Stage::Pnl, t_pnl.elapsed().as_secs_f64() - io_s);
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -999,6 +1053,7 @@ impl Accum {
 
     fn finish(
         self,
+        clock: std::time::Instant,
         spec: &EvalSpec,
         opts: &ProtocolOptions,
         layout: &Layout,
@@ -1399,6 +1454,7 @@ impl Accum {
             "inferred from the median test time step (365-day year)".to_string()
         };
         let sign_test = fold_sign_test(&windows);
+        let batch_started = clock.elapsed().as_secs_f64();
         let batch_pnl = if opts.batch_pnl {
             Some(crate::wf_batch::summarize(
                 &batch_in,
@@ -1409,6 +1465,15 @@ impl Accum {
         } else {
             None
         };
+        let mut ledger = crate::gpu_stats::RunLedger::new();
+        if let Some(b) = &batch_pnl {
+            let mut at = batch_started;
+            for r in std::iter::once(&b.per_window).chain(b.pooled.as_ref()) {
+                let s = &r.stats;
+                ledger.record_interval(crate::gpu_stats::Stage::Pnl, 0, at, at + s.device_s.min(s.wall_s));
+                at += s.wall_s;
+            }
+        }
         let device_pnl = if spec.device_pnl {
             let mut backend = String::new();
             let mut rows = 0u64;
@@ -1479,6 +1544,7 @@ impl Accum {
             allow_lockbox: spec.allow_lockbox,
             device_pnl,
             batch_pnl,
+            ledger,
             required_purge_seconds: required_purge,
             min_purge_seconds: min_gap,
             economics,
@@ -2784,6 +2850,26 @@ impl Report {
         let mut s = self.json();
         s.pop();
         s.push_str(&format!(",\"protocol\":{}}}", protocol));
+        s
+    }
+
+    /// The printed report: [`Report::json_with_protocol`] (or [`Report::json`])
+    /// plus the #284 phase ledger. The ledger holds wall-clock seconds, so it
+    /// stays outside the reproduction hash.
+    pub fn json_with_ledger(&self, protocol: Option<&str>) -> String {
+        use crate::gpu_stats::Stage;
+        let mut s = match protocol {
+            Some(p) => self.json_with_protocol(p),
+            None => self.json(),
+        };
+        s.pop();
+        s.push_str(&format!(
+            ",\"ledger\":{}}}",
+            self.ledger.phase_json(
+                "walkforward",
+                &[Stage::Vary, Stage::Eval, Stage::Fit, Stage::Select, Stage::Archive, Stage::Features]
+            )
+        ));
         s
     }
 

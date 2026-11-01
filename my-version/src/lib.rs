@@ -6,6 +6,8 @@ pub mod atomic;
 pub mod attach; // #353: opt-in ptrace attach for hang diagnosis
 pub mod backend;
 pub mod bench;
+pub mod bench_stats;
+pub mod bench_suites;
 pub mod checkpoint;
 pub mod column;
 pub mod complexity;

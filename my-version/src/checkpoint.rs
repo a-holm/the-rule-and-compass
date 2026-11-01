@@ -1646,6 +1646,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         qd_control,
         progress: None,
         dev_log: None, // #211: a reporting hook, never part of the saved state
+        front_observer: None, // #462
         // #27/#26: evaluator choices are not saved search state; a resumed run
         // picks the backend afresh from the current build/flags.
         simd: true,
