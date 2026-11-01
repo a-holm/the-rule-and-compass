@@ -10786,7 +10786,7 @@ mod tests {
         let counters = GenCounters::default();
         evolve_island(
             &mut isl, &mut Mt::new(5), &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None,
-            false, 0, None, Some(&counters), 1,
+            false, 0, None, Some(&counters), 1, &mut MixWindow::new(),
         );
         assert_eq!(GenCounters::total(Some(&counters), |c| &c.reevals), 0);
     }
