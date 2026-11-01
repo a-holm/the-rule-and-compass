@@ -431,6 +431,8 @@ pub struct CompareReport {
     pub base_seconds: f64,
     pub treat_seconds: f64,
     pub rows: Vec<ProblemRow>,
+    /// Keys of pairs left out because the criterion is undefined on a side.
+    pub dropped: Vec<String>,
 }
 
 /// Pair the runs of two sides and compare them. Every error is a usage error.
@@ -571,6 +573,7 @@ pub fn compare(
         base_seconds,
         treat_seconds,
         rows: rows.into_values().collect(),
+        dropped: Vec::new(),
     })
 }
 
@@ -787,6 +790,30 @@ mod tests {
         let treat = side(&[line("a", 1, true, "g2")]);
         let e = compare(&base, &treat, Criterion::Recovered).unwrap_err();
         assert!(e.contains("different data configuration"), "{e}");
+    }
+
+    fn line_oracle(problem: &str, seed: u64, oracle: &str) -> String {
+        line(problem, seed, true, "g").replace("\"oracle_recovered\":true", &format!("\"oracle_recovered\":{}", oracle))
+    }
+
+    #[test]
+    fn compare_drops_pairs_with_undefined_criterion() {
+        let base = side(&[line_oracle("a", 1, "true"), line_oracle("a", 2, "null"), line_oracle("b", 1, "false")]);
+        let treat = side(&[line_oracle("a", 1, "false"), line_oracle("a", 2, "true"), line_oracle("b", 1, "true")]);
+        let r = compare(&base, &treat, Criterion::OracleRecovered).unwrap();
+        assert_eq!(r.pairs, 2);
+        assert_eq!((r.b, r.c), (1, 1));
+        assert_eq!(r.dropped, vec!["hard/a/noise 0/seed 2".to_string()]);
+        assert!(r.to_text().contains("dropped pairs (criterion undefined on a side): 1"));
+        assert!(r.to_text().contains("hard/a/noise 0/seed 2"));
+        assert!(r.to_json().contains("\"dropped\": {\"count\": 1"));
+    }
+
+    #[test]
+    fn compare_rejects_a_criterion_undefined_for_every_pair() {
+        let s = side(&[line_oracle("a", 1, "null"), line_oracle("a", 2, "null")]);
+        let e = compare(&s, &s, Criterion::OracleRecovered).unwrap_err();
+        assert!(e.contains("not defined for any pair"), "{e}");
     }
 
     #[test]
