@@ -303,6 +303,9 @@ impl SrRun {
     pub fn load(path: &str) -> Result<SrRun, String> {
         let run = crate::run_json::RunFile::load(path)?;
         let book = run.book()?;
+        if book.position != crate::trading::PositionMap::Threshold {
+            return Err("the run priced the top_tercile book: the SR rung prices the threshold rule only".to_string());
+        }
         Ok(SrRun {
             expression: book.expression,
             variables: book.variables,

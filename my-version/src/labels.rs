@@ -472,6 +472,13 @@ pub fn parse_column(name: &str) -> Option<(&str, &'static str)> {
     None
 }
 
+/// `lbl_<label>_xs`: the cross-sectional rank column written by `rcsr panel rank`.
+pub fn is_xs_column(name: &str) -> bool {
+    name.strip_prefix(COLUMN_PREFIX)
+        .and_then(|rest| rest.strip_suffix("_xs"))
+        .is_some_and(|label| !label.is_empty())
+}
+
 /// The refusal for a `long:` label without `fee=`.
 pub fn missing_fee_message(src: &str) -> String {
     format!(

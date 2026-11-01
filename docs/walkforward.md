@@ -164,6 +164,15 @@ The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA
   reported as the strategy's P&L. The report labels it `"label":
   "hindsight_bound"`, `"is_strategy": false`, and carries the threshold book's
   net, the gap and `rule_le_bound`.
+* `--policy top-tercile` (#493) is the cross-sectional long-only book: per timestamp, `position = 1` for the top
+  `floor(n/3)` of the `n` rows with a finite score (ties by row order), else `0`. The ranks use the scores of
+  that timestamp only and run before the target mask, so a row with a NaN target stays in the cross-section.
+  A timestamp with fewer than 3 finite scores holds nothing. There is no threshold: `--threshold-quantile`,
+  `--threshold-fixed`, `--band`, `--min-hold`, `--select-band`, `--device-pnl` and `--batch-pnl` are refused,
+  the window `threshold` is `null` and `threshold_source` is `none`. Costs, the final exit and the equal-weight
+  period aggregation are the threshold rule's. `--from-run` of a search run with `--position top_tercile`
+  selects the policy; it conflicts with an explicit `--policy` of another kind. Pair it with an `xs_rank` target
+  (`--target lbl_h1_xs --target-spec ...` resolves to its `return_column`; `docs/time-series.md`).
 * `--cost-bps` (default 10; a `--target-spec` cost wins, see "One book from search to evaluation") is charged **per side** on `|position - previous position|`,
   separately inside each `--group-by` series. Every series starts flat, so an
   entry costs one side and its exit (including the **final** exit of every
@@ -263,6 +272,9 @@ rcsr walkforward ... --policy band --band 0.1 --min-hold 3
 
 # threshold strategy plus the exact hindsight bound (never a strategy)
 rcsr walkforward ... --policy dp
+
+# top-tercile long-only book per timestamp (no threshold)
+rcsr walkforward ... --policy top-tercile
 
 # the same scans on the device, bit-identical to the CPU
 rcsr walkforward ... --policy band --band 0.1 --gpu

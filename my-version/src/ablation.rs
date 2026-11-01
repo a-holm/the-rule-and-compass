@@ -1775,7 +1775,11 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                             return Err((2, format!("{} cannot be combined with --from-run: the run fixes the threshold rule and the target spec", flag)));
                         }
                     }
-                    Some(crate::run_book::RunBook::parse(&run_text).map_err(|e| (3, format!("{}: {}", run_path, e)))?)
+                    let book = crate::run_book::RunBook::parse(&run_text).map_err(|e| (3, format!("{}: {}", run_path, e)))?;
+                    if book.position != crate::trading::PositionMap::Threshold {
+                        return Err((2, format!("{}: the run priced the top_tercile book; the ablation prices the threshold rule only", run_path)));
+                    }
+                    Some(book)
                 }
                 None => None,
             };
