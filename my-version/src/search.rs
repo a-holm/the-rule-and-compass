@@ -10448,7 +10448,7 @@ mod tests {
         let mut rng = Mt::new(11);
         evolve_island(
             &mut isl, &mut rng, &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None, false,
-            0, None, None, 1,
+            0, None, None, 1, &mut MixWindow::new(),
         );
         let immigrants = afp_immigrants(cfg.pop);
         assert_eq!(isl.len(), cfg.pop + immigrants);
