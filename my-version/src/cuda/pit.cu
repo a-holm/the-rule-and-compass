@@ -544,7 +544,7 @@ int rc_pit_run(RcPit *c, long long step, int threads, int chunk_rows)
     k_rebase<<<nb, threads>>>(d_first, c->d_chain_ord, c->n, c->d_chain_loc);
     k_keep_int<<<nb, threads>>>(c->d_keep, c->n, c->d_start);
     tmp = c->scan_tmp_bytes;
-    err = rc_cub_status(cub::DeviceScan::ExclusiveSum(
+    err = RC_CUB(g_force_cub_fail, cub::DeviceScan::ExclusiveSum(
         c->d_scan_tmp, tmp, c->d_start, c->d_dest, c->n));
     if (err != cudaSuccess) {
         c->last.failed = 1;

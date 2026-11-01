@@ -7672,6 +7672,35 @@ mod rank_tests {
         assert_eq!(again[0][0].map(|s| (s.ab, s.aa)), ok.unwrap()[0][0].map(|s| (s.ab, s.aa)));
     }
 
+
+    /// #410: refusing each real CUB call of the rank sweep (SortPairs,
+    /// InclusiveSum, ExclusiveSum: calls 4 to 6, after the three size queries
+    /// and with the temporary storage in use) fails the rank call, and the next
+    /// call on the same context is bit-identical to the baseline. Call 7 does
+    /// not exist, so it proves there are exactly three real calls.
+    #[test]
+    fn refused_real_cub_call_fails_the_rank_call_then_recovers() {
+        let f = fixture(96);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let p = plan(&linear());
+        let trials = [vec![p.c0.clone()]];
+        let ok = ev.rank_score_trials(&[&p], &trials).expect("baseline rank call");
+        let base = ok[0][0].map(|s| (s.ab, s.aa, s.bb));
+        for k in 4..=6 {
+            unsafe { rc_rank_test_force_cub_fail(k) };
+            let refused = ev.rank_score_trials(&[&p], &trials);
+            unsafe { rc_rank_test_force_cub_fail(0) };
+            assert!(refused.is_none(), "refusing real call {k} must fail the rank call");
+            let again = ev
+                .rank_score_trials(&[&p], &trials)
+                .expect("no error may stay pending");
+            assert_eq!(again[0][0].map(|s| (s.ab, s.aa, s.bb)), base, "call after refusing {k}");
+        }
+        unsafe { rc_rank_test_force_cub_fail(7) };
+        let past = ev.rank_score_trials(&[&p], &trials);
+        unsafe { rc_rank_test_force_cub_fail(0) };
+        assert!(past.is_some(), "the rank call has exactly six guarded CUB calls");
+    }
     #[test]
     fn rank_sums_are_bit_identical_to_the_cpu() {
         let f = fixture(96);
@@ -8806,6 +8835,38 @@ mod order_stat_tests {
         assert_eq!(again[0][0].map(f64::to_bits), ok.unwrap()[0][0].map(f64::to_bits));
     }
 
+    /// #410: refusing the real CUB call (call 2, after the size query) of the
+    /// sort path and of the select path's interquartile sort fails the call
+    /// with `None`, and the next call on the same context is bit-identical to
+    /// the baseline. Call 3 does not exist, so it proves there are exactly two.
+    #[test]
+    fn refused_real_cub_call_fails_the_order_stat_call_then_recovers() {
+        let f = fixture(96);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let p = plan(&affine());
+        let trials = [vec![p.c0.clone()]];
+        let wave = 512 * 1024 * 1024;
+        for (code, path) in [
+            (OrderCode::Median, OrderPath::Sort),
+            (OrderCode::InterquartileExact, OrderPath::Select),
+        ] {
+            let base = ev
+                .order_code_trials(&[&p], &trials, code, path, wave, 0)
+                .expect("baseline call");
+            unsafe { rc_os_test_force_cub_fail(2) };
+            let refused = ev.order_code_trials(&[&p], &trials, code, path, wave, 0);
+            unsafe { rc_os_test_force_cub_fail(0) };
+            assert!(refused.is_none(), "{path:?}: a refused real CUB call must fail the call");
+            let again = ev
+                .order_code_trials(&[&p], &trials, code, path, wave, 0)
+                .expect("no error may stay pending");
+            assert_eq!(again[0][0].map(f64::to_bits), base[0][0].map(f64::to_bits), "{path:?}");
+            unsafe { rc_os_test_force_cub_fail(3) };
+            let past = ev.order_code_trials(&[&p], &trials, code, path, wave, 0);
+            unsafe { rc_os_test_force_cub_fail(0) };
+            assert!(past.is_some(), "{path:?}: exactly two guarded CUB calls");
+        }
+    }
     /// The device median is the configured metric for odd and even row counts,
     /// with ties and with a constant prediction.
     #[test]
