@@ -69,6 +69,8 @@ OPTIONS:
   --ops <a,b,..>            operator set
   --max-complexity <N>      maximum expression complexity
   --patience <N>            generations without improvement before stopping
+  --patience-tol <r>        scale-free patience tolerance (relative best-error drop)
+  --stop-on front[:W]       stop when the front is stable for W generations
   --migration-interval <N>  generations between island migrations
   --restart-interval <N>    generations between island restarts
   --variation <mode>        auto, node or postfix
@@ -299,6 +301,21 @@ fn parse(args: &[String]) -> Result<Args, String> {
                 a.knobs.max_complexity = Some(num(take(&mut i, "--max-complexity")?, "--max-complexity")?)
             }
             "--patience" => a.knobs.patience = Some(num(take(&mut i, "--patience")?, "--patience")?),
+            "--patience-tol" => {
+                a.knobs.patience_tol = Some(num(take(&mut i, "--patience-tol")?, "--patience-tol")?)
+            }
+            "--stop-on" => {
+                let v = take(&mut i, "--stop-on")?;
+                a.knobs.stop_front = Some(match v.strip_prefix("front") {
+                    Some("") => 0,
+                    Some(rest) => rest
+                        .strip_prefix(':')
+                        .and_then(|w| w.parse::<usize>().ok())
+                        .filter(|w| *w >= 1)
+                        .ok_or_else(|| format!("--stop-on: bad window in '{}'", v))?,
+                    None => return Err(format!("--stop-on: expected front[:W], got '{}'", v)),
+                });
+            }
             "--migration-interval" => {
                 a.knobs.migration_interval =
                     Some(num(take(&mut i, "--migration-interval")?, "--migration-interval")?)

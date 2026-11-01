@@ -288,3 +288,183 @@ fn num(v: f64) -> String {
         "null".to_string()
     }
 }
+
+/// Default relative tolerance of the front stop when `--patience-tol` is not given.
+pub const FRONT_STOP_TOL: f64 = 1e-6;
+
+/// True when a generation counts as "no improvement" for the patience test.
+///
+/// Without `tol` the denominator is `1 + |best_prev|` and the threshold 1e-9.
+/// With `tol` the improvement is relative to `|best_prev|` alone, so the test
+/// does not depend on the units of the error. A non-finite `best_prev` is
+/// always an improvement.
+pub fn no_improvement(best_prev: f64, gen_best: f64, tol: Option<f64>) -> bool {
+    match tol {
+        None => (best_prev - gen_best) / (1.0 + best_prev.abs()) <= 1e-9,
+        Some(_) if !best_prev.is_finite() => false,
+        Some(r) => (best_prev - gen_best) / best_prev.abs().max(f64::MIN_POSITIVE) <= r,
+    }
+}
+
+/// Counts consecutive generations in which the Pareto front did not change.
+///
+/// A generation is stable when no front member has an error more than `tol`
+/// (relative) below the best error of the previous front at its cost or lower,
+/// and the front hypervolume rose by less than `tol` (relative). The previous
+/// front is the archive at the end of the previous generation, so a tracker
+/// rebuilt from a checkpoint's archive and its saved count continues exactly.
+pub struct FrontStop {
+    prev: Vec<(f64, f64)>,
+    prev_hv: f64,
+    stable: usize,
+}
+
+fn front_points(archive: &Archive) -> Vec<(f64, f64)> {
+    let mut pts: Vec<(f64, f64)> = archive.items.iter().map(|s| (s.cost, s.error)).collect();
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    pts
+}
+
+impl FrontStop {
+    pub fn new(archive: &Archive, stable: usize) -> Self {
+        let prev = front_points(archive);
+        let prev_hv = crate::qd::hypervolume(&prev);
+        FrontStop {
+            prev,
+            prev_hv,
+            stable,
+        }
+    }
+
+    /// Consecutive stable generations so far.
+    pub fn stable(&self) -> usize {
+        self.stable
+    }
+
+    /// Compare `archive` with the previous generation's front and update the count.
+    pub fn observe(&mut self, archive: &Archive, tol: f64) -> usize {
+        let cur = front_points(archive);
+        let hv = crate::qd::hypervolume(&cur);
+        let mut moved = false;
+        for &(c, e) in &cur {
+            let prev_best = self
+                .prev
+                .iter()
+                .take_while(|p| p.0 <= c)
+                .map(|p| p.1)
+                .fold(f64::INFINITY, f64::min);
+            let better = if prev_best.is_finite() {
+                (prev_best - e) / prev_best.abs().max(f64::MIN_POSITIVE) > tol
+            } else {
+                true
+            };
+            if better {
+                moved = true;
+                break;
+            }
+        }
+        let hv_rose = (hv - self.prev_hv) / self.prev_hv.abs().max(f64::MIN_POSITIVE) >= tol;
+        if moved || hv_rose {
+            self.stable = 0;
+        } else {
+            self.stable += 1;
+        }
+        self.prev = cur;
+        self.prev_hv = hv;
+        self.stable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pareto::Sol;
+
+    fn sol(cost: f64, error: f64) -> Sol {
+        Sol {
+            tree: crate::expr::input(0),
+            error,
+            complexity: cost as usize,
+            cost,
+        }
+    }
+
+    fn archive(points: &[(f64, f64)]) -> Archive {
+        let mut a = Archive::new(64);
+        a.items = points.iter().map(|&(c, e)| sol(c, e)).collect();
+        a
+    }
+
+    /// Scripted front: grows until generation 12, then never changes.
+    fn scripted(gen: usize) -> Archive {
+        let g = gen.min(12);
+        let pts: Vec<(f64, f64)> = (0..=g.min(6))
+            .map(|k| (1.0 + 2.0 * k as f64, 1.0 / (1.0 + (g * (k + 1)) as f64)))
+            .collect();
+        archive(&pts)
+    }
+
+    #[test]
+    fn front_stable_stops() {
+        let w = 5;
+        let mut fs = FrontStop::new(&scripted(0), 0);
+        let mut stopped = None;
+        for gen in 1..=40 {
+            if fs.observe(&scripted(gen), 1e-6) >= w {
+                stopped = Some(gen);
+                break;
+            }
+        }
+        assert_eq!(stopped, Some(12 + w));
+    }
+
+    #[test]
+    fn front_stop_resumes_from_archive_and_count() {
+        let mut fs = FrontStop::new(&scripted(0), 0);
+        for gen in 1..=14 {
+            fs.observe(&scripted(gen), 1e-6);
+        }
+        let mut resumed = FrontStop::new(&scripted(14), fs.stable());
+        for gen in 15..=40 {
+            let a = fs.observe(&scripted(gen), 1e-6);
+            let b = resumed.observe(&scripted(gen), 1e-6);
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn patience_tol_is_scale_free() {
+        let trace: Vec<f64> = (0..60)
+            .map(|g| 1.0 + 3.0 / (1.0 + g as f64).powi(3))
+            .collect();
+        let stop_at = |scale: f64| {
+            let (mut best_prev, mut run) = (f64::INFINITY, 0usize);
+            for (g, e) in trace.iter().enumerate() {
+                let e = e * scale;
+                run = if no_improvement(best_prev, e, Some(1e-3)) {
+                    run + 1
+                } else {
+                    0
+                };
+                best_prev = best_prev.min(e);
+                if run >= 5 {
+                    return Some(g);
+                }
+            }
+            None
+        };
+        let base = stop_at(1.0);
+        assert!(base.is_some());
+        assert_eq!(stop_at(1e-4), base);
+        assert_eq!(stop_at(1e4), base);
+    }
+
+    #[test]
+    fn default_patience_keeps_the_old_rule() {
+        assert!(no_improvement(1.0, 1.0, None));
+        assert!(!no_improvement(f64::INFINITY, 3.0, None));
+        assert!(no_improvement(1e-6, 1e-6 - 1e-12, None));
+        assert!(!no_improvement(1e-6, 1e-6 - 1e-12, Some(1e-9)));
+        assert!(!no_improvement(f64::INFINITY, 3.0, Some(1e-3)));
+    }
+}

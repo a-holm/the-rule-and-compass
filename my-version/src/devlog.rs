@@ -755,7 +755,7 @@ pub fn run_start_json(r: &RunStart) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct RunEnd {
     pub generations: usize,
-    /// `solved`, `patience`, `time_budget` or `generations`.
+    /// `solved`, `patience`, `front_stable`, `time_budget` or `generations`.
     pub stop: String,
     /// Seconds since the CLI took the clock, including data preparation.
     pub wall_s: f64,
