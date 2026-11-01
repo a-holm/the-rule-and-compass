@@ -6272,7 +6272,7 @@ mod tests {
             Op::Add,
             vec![
                 node(Op::Mul, vec![constant(1.0), node(Op::Sin, vec![node(Op::Mul, vec![constant(1.0), input(0)])])]),
-                constant(0.0),
+                constant(0.65),
             ],
         );
         assert!(!is_affine_correlation_tree(&shaped));
@@ -6997,9 +6997,9 @@ mod tests {
             vec![
                 node(
                     Op::Mul,
-                    vec![constant(1.0), node(Op::Exp, vec![node(Op::Mul, vec![constant(0.9), input(0)])])],
+                    vec![constant(1.45), node(Op::Exp, vec![node(Op::Mul, vec![constant(0.42), input(0)])])],
                 ),
-                constant(0.0),
+                constant(0.65),
             ],
         );
         (tree, x, y)
