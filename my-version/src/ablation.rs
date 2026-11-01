@@ -969,6 +969,7 @@ fn score_core(
         }
         crate::expr::eval(&tree, &row)
     };
+    ladder::check_fold_spacing(panel, folds, opts.horizon_seconds)?;
     let side = opts.cost_bps * 1e-4;
     let mut net_by_fold_threshold = Vec::new();
     let mut net_period: Vec<f64> = Vec::new();
@@ -1595,11 +1596,11 @@ fn usage() -> &'static str {
             [--keep a,b] [--seed 0]\n\
             writes the projection CSV with placebo and circular-block-permuted columns\n\
   score     (--run <run.json> | --from-run <run.json>) --data <csv|rcsb> --target <col> --time <col> --windows <file> --out <file>\n\
-            [--lockbox START,END|none]  a fold touching the locked test (same resolution) is refused (exit 3)\n\
+            [--lockbox START,END|none]  a fold ending after START minus --purge-seconds (same resolution) is refused (exit 3)\n\
             [--allow-in-sample]  a fold whose test starts before the run's last seen row + purge is refused (exit 3); with the flag it is labelled oof:false and left out of every pooled series\n\
             [--group <col>] [--return-col <col>] [--scheme expanding] [--thresholds 0.6,0.7,0.8]\n\
             [--headline-threshold 0.7] [--cost-bps 12 | --cost-override <bp>] [--purge-seconds 219600] [--target-spec <file>]\n\
-            scores the run's finalist (objective.finalist.expression) on every fold. --target-spec sets the per-side cost\n\
+            scores the run's finalist (objective.finalist.expression) on every fold. Test rows of one group closer than the target spec horizon overlap and are refused (exit 2); the result carries min_group_step_seconds. --target-spec sets the per-side cost\n\
             (cost_bps / 2), the return units (log is converted with exp_m1) and the return column; a --cost-bps that differs is refused.\n\
             --from-run prices the book the search selected: the run's target spec, per-side cost and fixed threshold\n\
             (objective.spec.threshold); it refuses --thresholds, --headline-threshold and --target-spec, and a run without an objective block\n
@@ -1774,7 +1775,11 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                             return Err((2, format!("{} cannot be combined with --from-run: the run fixes the threshold rule and the target spec", flag)));
                         }
                     }
-                    Some(crate::run_book::RunBook::parse(&run_text).map_err(|e| (3, format!("{}: {}", run_path, e)))?)
+                    let book = crate::run_book::RunBook::parse(&run_text).map_err(|e| (3, format!("{}: {}", run_path, e)))?;
+                    if book.position != crate::trading::PositionMap::Threshold {
+                        return Err((2, format!("{}: the run priced the top_tercile book; the ablation prices the threshold rule only", run_path)));
+                    }
+                    Some(book)
                 }
                 None => None,
             };
@@ -1817,6 +1822,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 None => crate::target::resolve_cost(opts.spec.as_ref(), cost_flag, cost_override, ladder::DEFAULT_COST_BPS).map_err(|e| (2, e))?,
             };
             opts.cost_bps = cost;
+            opts.horizon_seconds = opts.spec.as_ref().map_or(0.0, |s| s.horizon_seconds);
             if opts.spec.is_some() || source == crate::target::CostSource::Flag {
                 opts.cost = Some(crate::target::CostDecl::new(opts.spec.as_ref(), cost, source));
             }
@@ -1857,7 +1863,8 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 Some(b) => score_run_fixed(&facts, &panel, &folds, b.threshold, &opts),
                 None => score_run(&facts, &panel, &folds, &thresholds, headline, &opts),
             }
-            .map_err(|e| (3, e))?;
+            .map_err(|e| (ladder::spacing_exit(&e, 3), e))?;
+            let min_group_step = ladder::check_fold_spacing(&panel, &folds, opts.horizon_seconds).map_err(|e| (3, e))?;
             let cost_decl = opts.cost.clone().unwrap_or(crate::target::CostDecl {
                 per_side_bps: cost,
                 source,
@@ -1879,8 +1886,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                     .join(",")
             );
             let mut json = format!(
-                "{},\"cost\":{},\"threshold_rule\":{},\"fold_oof\":{}}}",
+                "{},\"min_group_step_seconds\":{},\"cost\":{},\"threshold_rule\":{},\"fold_oof\":{}}}",
                 &json[..json.len() - 1],
+                min_group_step.map_or_else(|| "null".to_string(), jnum),
                 cost_decl.json(),
                 rule,
                 fold_oof

@@ -1348,6 +1348,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "fitness",       // #480: missing means `metric`
         "fit_rows",      // #116: missing means 0 (off)
         "fit_fallback_max", // #255: missing means the default bound
+        "refit_band",       // #495: missing means the default band
         "qd_bins",       // #120
         "qd_cell_cap",   // #120
         "qd_cvt",        // #120
@@ -1356,6 +1357,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "stop_front",    // #464: missing means off
         "qd_control",    // #120
         "variation",     // #122: missing means auto
+        "linear_scaling", // #470: missing means false
     ];
     for key in KEYS {
         required(fields, key)?;
@@ -1545,6 +1547,16 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             ))
         }
     };
+    let linear_scaling = match fields.get("linear_scaling").map(|s| s.as_str()) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "config 'linear_scaling' must be true or false, got '{}'",
+                other
+            ))
+        }
+    };
     // #116: missing means `exact`, byte-identical to a checkpoint written
     // before the solver portfolio existed.
     let fit_strategy = match fields.get("fit_strategy").map(|s| s.as_str()) {
@@ -1638,6 +1650,14 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             .parse::<usize>()
             .map_err(|_| format!("bad config value for 'fit_fallback_max': '{}'", raw))?,
     };
+    // #495: absent means the default band.
+    let refit_band = match fields.get("refit_band") {
+        None => crate::search::DEFAULT_REFIT_BAND,
+        Some(raw) => decode_f64(raw)
+            .ok()
+            .filter(|v| *v >= 0.0)
+            .ok_or_else(|| format!("bad config value for 'refit_band': '{}'", raw))?,
+    };
     // #480: absent means the metric fitness.
     let fitness = match fields.get("fitness").map(|s| s.as_str()) {
         None | Some("metric") => crate::search::Fitness::Metric,
@@ -1682,6 +1702,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         fit_samples, // #85
         fit_rows,     // #116
         fit_fallback_max, // #255
+        refit_band, // #495
         // #116: a disk row source is a path choice, not saved search state.
         fit_stream_source: None,
         front_parents, // #76
@@ -1706,6 +1727,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         pipeline_depth: 2,
         threads: 1,
         variation,
+        linear_scaling, // #470
     })
 }
 
@@ -1758,6 +1780,11 @@ fn write_config(cfg: &Config, out: &mut String) {
     }
     writeln!(out, "config fit_rows {}", cfg.fit_rows).unwrap(); // #116
     writeln!(out, "config fit_fallback_max {}", cfg.fit_fallback_max).unwrap(); // #255
+    // #495: written only when it differs from the default, so every other
+    // checkpoint and config hash keeps its bytes.
+    if cfg.refit_band != crate::search::DEFAULT_REFIT_BAND {
+        writeln!(out, "config refit_band {}", encode_f64(cfg.refit_band)).unwrap();
+    }
     // #122: absent means auto (the historical path for every old checkpoint).
     writeln!(out, "config variation {}", cfg.variation.as_str()).unwrap();
     writeln!(out, "config dedup {}", cfg.dedup).unwrap();
@@ -1790,6 +1817,10 @@ fn write_config(cfg: &Config, out: &mut String) {
     // checkpoint stays byte-identical to one written before the flag existed.
     if cfg.fit_samples > 0 {
         writeln!(out, "config fit_samples {}", cfg.fit_samples).unwrap();
+    }
+    // #470: written only when on, so every other checkpoint keeps its bytes.
+    if cfg.linear_scaling {
+        writeln!(out, "config linear_scaling true").unwrap();
     }
     // #76: only write the field when front feedback is off, so an on run's
     // checkpoint stays byte-identical to one written before the flag existed.

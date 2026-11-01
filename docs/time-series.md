@@ -111,7 +111,7 @@ The protocol locked test is a second, separate box. Data that declares it
 (`rcsr panel build --locked-test START,END`) uses the declared range; undeclared
 data uses the protocol default 2025-07-01..2026-07-01. The search, `walkforward`,
 `ladder` and `ablation score` refuse every fit, validation or test row inside
-it (exit 3). `--lockbox none` is the only opt-out, and the report records
+it (exit 3), and every row whose label window reaches it: a row within the target's `required_purge_seconds` before the range (219600 s without a target spec) is refused too, and the refusal names the exact `--exclude 'ts >= START - purge'`. `walkforward`, `ladder` and `ablation score` refuse a window that ends after `START - purge`. `--lockbox none` is the only opt-out, and the report records
 `"source":"none"`. A `--lockbox` flag on undeclared data adds to the default and never replaces it. Ranges from the store or a flag also fail closed (no `--time`, a non-epoch time column and unstamped rows are refused); the protocol default only checks data with epoch-seconds stamps. `--allow-lockbox` does not open it. Only the sealed
 `--locked-test` path of `walkforward` and `ladder` reads it, once. A pilot
 split such as `--split temporal --validation-frac 0.20` on a panel that ends
@@ -518,6 +518,21 @@ The tests
 `tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit`,
 `a_partial_cross_section_is_nan_and_a_prefix_is_causal` and
 `btc_and_eth_joins_use_the_same_timestamp_and_a_shift_fails` pin these rules.
+
+### Cross-sectional rank target and the top-tercile book
+
+`rcsr panel rank --data panel.rcsb --column lbl_h1_fwd --name lbl_h1_xs --out ranked.rcsb [--min-members 20]` appends the per-timestamp rank of `--column` among the panel rows to a time-major panel. Every panel row is a PIT member at its `ts`, so the rank runs over the members, not over every live symbol of the symbol-major base (`rcsr enrich` cannot make this rank, it runs symbol-major).
+
+```text
+r = 2 * (rank - 1) / (n - 1) - 1      rank 1 = lowest value, ties take the average rank
+                                      n finite values at ts; NaN when n < --min-members (default 20, at least 2)
+```
+
+A rank reads the values of one timestamp only. The existing blocks are copied unchanged (column SHA-256 in `<out>.schema.json` stays), the input is never written, and the output carries the locked-test declaration of the input (`lockbox::resolve`, protocol default for an undeclared panel). `--name` must be `lbl_<label>_xs`: the registry knows it as a label-family lead column (`causal_offset 1`), so it is refused in `--vars` (D13a, exit 5) and never drawn by `--project`.
+
+The command adds an `xs_rank` entry to `<out stem>.targets.json` (the entries of the input sidecar carry over). `horizon_seconds`, `entry_offset_seconds`, `delay_seconds`, `return_units` and `cost_bps` come from the `forward_return` entry whose `return_column` (or column) is `--column`, found in `--target-spec` or `<data stem>.targets.json`; `return_column` is `--column`, the scale is constant 1, `clip` is null, the offset is 0 and `construction_columns` is `[--column]`. The purge is the `forward_return` rule: `entry_offset + delay + horizon`.
+
+`--objective pnl|sharpe|log_growth` accepts a `forward_return` or `xs_rank` target; the book is always priced on `return_column` with its `return_units` and the one cost rule of the spec. An `xs_rank` target needs `--position top_tercile`: per timestamp, `p = 1` for the top `floor(n / 3)` finite predictions (ties by row order, as `ladder::top_tercile`), `p = 0` otherwise. A timestamp with fewer than 3 finite predictions holds nothing, a NaN prediction is never long, and the final exit is charged. Rows of one timestamp are averaged (equal weight), exposure is the share of long rows (about 1/3). The map needs `--split temporal` (whole timestamps on each side of the split; `temporal-group` cuts every symbol at its own row quantile), `--min-holding 1`, `--max-position 1`, no `--threshold` and no `--fitness pnl`. The search and `rcsr walkforward --policy top-tercile` rank the same cross-section: every row of the timestamp with a finite score, whether or not its label or return exists (rows that `--fill drop` removes for a missing label stay in the ranks of the validation and test books). A row without a return earns and pays nothing (`tests/xs_rank.rs::search_and_walkforward_rank_the_same_cross_section`).
 
 ---
 
