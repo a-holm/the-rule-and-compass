@@ -8755,6 +8755,60 @@ mod tests {
         }
     }
 
+    /// #587: a finite error beats a non-finite one whatever the complexity.
+    #[test]
+    fn better_prefers_finite_over_non_finite() {
+        let finite = pending_ind(5.0, 40.0);
+        for bad in [f64::INFINITY, f64::NAN] {
+            let simple_bad = pending_ind(bad, 1.0);
+            assert!(better(&finite, &simple_bad), "finite vs {bad}");
+            assert!(!better(&simple_bad, &finite), "{bad} vs finite");
+        }
+    }
+
+    /// #587: two non-finite trees still compare by complexity.
+    #[test]
+    fn better_orders_two_non_finite_by_complexity() {
+        let small = pending_ind(f64::INFINITY, 2.0);
+        let large = pending_ind(f64::INFINITY, 9.0);
+        assert!(better(&small, &large));
+        assert!(!better(&large, &small));
+        assert!(!better(&small, &small));
+    }
+
+    /// #587: finite pairs keep the relative-tolerance parsimony rule.
+    #[test]
+    fn better_finite_pairs_keep_the_tolerance_band() {
+        assert!(better(&pending_ind(1.0, 9.0), &pending_ind(2.0, 3.0)), "clear error win");
+        assert!(!better(&pending_ind(2.0, 3.0), &pending_ind(1.0, 9.0)));
+        let tol = 1e-9 * (1.0 + 2.0);
+        let inside = pending_ind(2.0 - 0.5 * tol, 9.0);
+        assert!(better(&pending_ind(2.0, 3.0), &inside), "inside the band the smaller wins");
+        assert!(!better(&inside, &pending_ind(2.0, 3.0)));
+        let outside = pending_ind(2.0 - 2.0 * tol, 9.0);
+        assert!(better(&outside, &pending_ind(2.0, 3.0)), "outside the band the error wins");
+    }
+
+    /// #587: simple non-finite trees no longer win tournaments against complex
+    /// finite ones.
+    #[test]
+    fn tournament_winners_are_not_non_finite() {
+        let island: Vec<Ind> = (0..64)
+            .map(|i| {
+                if i % 2 == 0 {
+                    pending_ind(f64::INFINITY, 1.0)
+                } else {
+                    pending_ind(1.0 + i as f64, 30.0)
+                }
+            })
+            .collect();
+        let mut rng = Mt::new(7);
+        let wins = (0..2000)
+            .filter(|_| !island[tournament(&island, &mut rng, 3)].error.is_finite())
+            .count();
+        assert_eq!(wins, 0, "non-finite winners: {wins} of 2000");
+    }
+
     /// #169: the admission fraction is a pure function of the population size
     /// and the training row count, and widens to every candidate at large `N`.
     #[test]
