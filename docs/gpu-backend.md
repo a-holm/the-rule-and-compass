@@ -2522,6 +2522,8 @@ order, so device/CPU parity is bit-identical on the fixtures (and within
 `1e-9` relative, the acceptance gate, even if a future input exposes a rounding
 difference).
 
+**Throughput bench (issue #265).** The ignored test `device::bench_pnl_vs_cpu` in `tests/pnl_gpu.rs` times the canonical CPU `reduce` (single-threaded, one individual at a time) against `DevicePnl::eval` in tiles of 8 candidates. Knobs: `RCSR_PNL_BENCH_ROWS` (default 1,000,000) and `RCSR_PNL_BENCH_POP` (default 256). Scores are generated per tile and are not timed, so host memory holds one tile. The test asserts the CPU and device net agree within `1e-9` relative for every individual and `>= 5x` speed-up. On the RTX 3060 at 2,456,306 rows and 256 individuals: CPU 26.478 s, device 4.126 s (includes packing and the H2D transfer), 6.42x, 62.0 candidates/s, 1.524e8 row-evaluations/s, `cpu_net` and `gpu_net` both 1536791.766500; peak host RSS 376,108 kB, wall 37.7 s. Run: `RCSR_PNL_BENCH_ROWS=2456306 cargo test --release --features cuda --test pnl_gpu -- --ignored --exact device::bench_pnl_vs_cpu --nocapture`. A memcheck run at 10,000 rows and 8 individuals reports 0 errors.
+
 ## Band, cooldown and hindsight DP scan (issue #306)
 
 `rc_band_scan` and `rc_dp_scan` in `src/cuda/pnl.cu` run the no-trade band, its
