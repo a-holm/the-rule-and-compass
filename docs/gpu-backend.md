@@ -1891,12 +1891,34 @@ Device fit is 3.2x faster than device score with the CPU fit and 3.7x faster tha
 * **Pairs without a second buffer.** `ft_assemble` stages each chunk's raw adjoints and predictions in shared memory. One extra phase differences thread `k`'s row against row `k − 1` of the chunk, or for `k = 0` against the previous chunk's last row held in `scarry` (`p + 1` floats; `sdcarry` in the `f64` twin), and overwrites the staged row in place. Row 0 has no pair and stages zeros. The owner accumulation is unchanged, so every statistic keeps its fixed row order. The trial sweep `ft_loss_slope` runs both rows of each pair per thread and needs no synchronisation.
 * **The additive level.** A constant whose adjoint is the same on every row (an additive level) has a differenced column of exactly zero in `f32` and `f64`. Its diagonal is exactly 0, `ft_solve` freezes the slot (#399), and the level keeps the squared warm start's value. A step that is exactly zero in every slot (a lone level) ends the loop at once.
 * **No host gate.** `fit::device_fit_is_gated` is false for slope. The kernel's own guard is the CPU arm's metric-monotone rule; the device scorer ranks on slope, and `refit_finalists_exact` refits every finalist with the CPU arm, so every reported constant and error is exact CPU `f64`.
-* **CPU arm.** `fit_slope_pairs` runs the same IRLS (`fit::slope_irls`) between the squared fit and the coordinate polish, on the sample's own pair list. Device and CPU optimise slope by the same algorithm, so the parity test is algorithmic: the device slope is at most the CPU IRLS result times `1 + 1e-5` from the same start.
-* **Precision.** Rows and adjoints are `f32`, sums and the polish `f64`. The device score differs from the CPU `f64` score only through the `f32` rounding of inputs, target and predictions.
+* **CPU arm.** `fit_slope_pairs` runs the same IRLS (`fit::slope_irls`) between the squared fit and the coordinate polish, on the sample's own pair list. Device and CPU optimise slope by the same algorithm, so the parity test is algorithmic: from the same start and with 32 iterations, the device slope is at most the CPU IRLS result times `1 + 1e-5`. With 8 iterations neither arm has converged and the two trajectories differ; on the 4 000-row unit fixture the device ended 1.8e-3 relative above the CPU IRLS on one start.
+* **Precision.** Rows and adjoints are `f32`, sums and the polish `f64`. The device score differs from the CPU `f64` score only through the `f32` rounding of inputs, target and predictions. The fit's damped rounds run on `f32` rows, so a first difference of nearby inputs keeps fewer digits there than in the `f64` polish.
+* **Cost.** The dispatcher scales the calibrated fit rates by `(2.5, 6.3)` for slope: the device chain costs 2.54 squared LM batches and the CPU arm (squared fit, IRLS, coordinate polish) 6.34 squared LM fits, measured by `bench_slope_fit_stage` at 154 000 rows.
 
-MEASURED
+**Measured** (RTX 3060, shared host, single CPU thread for the CPU arm). Fit stage, `bench_slope_fit_stage`: 154 000 rows, 32 candidates (`a·x0 + b`, `a·x0 + b + c·tanh(x1)` and `a·sin(b·x0) + c·x0 + d` starts), `--fit-iters 8`: the CPU arm 40.07 s (1 252 ms per candidate), the device batch 0.668 s (kernel 655 ms), **60.0×**. Every device answer is usable and no worse than the CPU arm's slope times `1 + 1e-5` (32/32, worst relative gap 1.3e-6).
 
-**Tests** (`src/gpu_slope_tests.rs`, `search::tests::slope_device_admits_only_consecutive_pairs`): `slope_device_score_matches_cpu` (`n = 1, 2, 3, 300, 4 099`, the CPU reducer on the same `f32` rows to `1e-12`, the exact metric to `1e-6`, a single non-finite row is `+inf`, alone equals batch), `slope_score_is_partition_invariant` (row ranges with cuts at 1, 2, 255, 256, 257 and one-row ranges give the resident bits), `slope_scoring_is_refused_in_tiled_residency` (tiled and weighted launches refused, a tiled search keeps the CPU with the named reason), `slope_device_scores_rank_like_the_cpu` (D8 on 48 candidates), `slope_pair_assembly_matches_cpu_differenced_normal_equations` (`f64` `JᵀJ`, `Jᵀr` and loss against the CPU differenced normal equations to `1e-10`, across the chunk boundaries, the level column exactly zero), `slope_additive_constant_is_frozen_and_keeps_the_squared_level`, `slope_irls_never_worsens_the_metric`, `slope_fit_keeps_incoming_constants_when_better`, `slope_device_fit_matches_cpu`, `slope_gpu_fit_is_deterministic_and_batch_independent`, `slope_no_fit_is_a_no_op` and `slope_gpu_front_is_ranked_on_slope` (a search with `dispatch: Device` scores and fits on the device, every archived error is the exact CPU slope, and the best member is within 5 % of the `--no-gpu` run's).
+Scorer precision (D8), `bench_slope_score_precision_on_csv` on `panel_daily_100.csv` (154 674 rows in `ts` order, inputs `r1,r3,r7,ma7`, target `y1`), 64 candidates: maximum relative error of the device slope against the exact CPU `f64` slope 1.7e-8, no rank inversion. On the synthetic unit fixture (`[-3, 3]` inputs, 20 000 rows) it is 2.0e-7. Inputs of large magnitude with small first differences lose digits in `f32`: the same population on `x0` in `[-100, 100]` reached 4.3e-6.
+
+Search, `--metric slope`, `panel_daily_100.csv` before the 2026H2 lockbox (`--filter "1782864000 - ts"`, `--time ts --split temporal`, 109 866 training rows, 109 865 consecutive pairs), inputs `r1,r3,r7,ma7`, target `y1`, 4 islands of 32, 6 generations, `--fit-iters 8`, equal configuration per arm (`--gpu --fit-strategy gpu`, `--gpu --fit-strategy exact`, `--no-gpu`):
+
+| seed | device fit | device scoring, CPU fit | CPU | best train slope (device fit / device scoring / CPU) |
+|---:|---:|---:|---:|---|
+| 5 | 16.2 s | 60.3 s | 64.7 s | 0.2594649 / 0.2594051 / 0.2594292 |
+| 6 | 18.6 s | 67.8 s | 48.5 s | 0.2594650 / 0.2594014 / 0.2594014 |
+
+The device-fit run is 3.7× faster end to end than device scoring with the CPU fit in both seeds (2.6-4.0× against the CPU). Every admitted candidate fits on the device (546 and 550, no fallback); the fit kernel takes 3.8-3.9 s and the exact finalist refit 7.0-7.7 s. On this cell slope is nearly flat (the constant model scores 0.2597321), and the device-fit arm keeps a two-member front whose best member is 1.4e-4 to 2.5e-4 relative above the CPU-fit arms. The device arm admits candidates through the #223 screen (546 of 872 screened offspring in seed 5), while the CPU arms fit every offspring.
+
+The same three arms on a synthetic single series (`y = 3 sin x + 0.5 x + 0.3 tanh z` plus `U(−0.025, 0.025)`, 206 000 rows, `--time t --split temporal`, 154 500 training rows, inputs `x,z`, same configuration):
+
+| seed | device fit | device scoring, CPU fit | CPU | best train slope (device fit / device scoring / CPU) |
+|---:|---:|---:|---:|---|
+| 5 | 23.5 s | 55.2 s | 65.9 s | 0.0169713 / 0.0174055 / 0.0203705 |
+| 6 | 21.2 s | 74.1 s | 85.3 s | 0.0169762 / 0.0169673 / 0.0169678 |
+
+The device-fit run is 2.3-3.5× faster than device scoring with the CPU fit and 2.8-4.0× faster than the CPU; its best slope is the lowest of the three in seed 5 and 5e-4 relative above the CPU-fit arms in seed 6. The fit kernel takes 5.2-5.3 s and the finalist refit 12.3-14.7 s; 497 and 520 admitted candidates fit on the device with no fallback.
+
+**Tests** (`src/gpu_slope_tests.rs`, `search::tests::slope_device_admits_only_consecutive_pairs`): `slope_device_score_matches_cpu` (`n = 1, 2, 3, 300, 4 099`, the CPU reducer on the same `f32` rows to `1e-12`, the exact metric to `1e-6`, a single non-finite row is `+inf`, alone equals batch), `slope_score_is_partition_invariant` (row ranges with cuts at 1, 2, 255, 256, 257 and one-row ranges give the resident bits), `slope_scoring_is_refused_in_tiled_residency` (tiled and weighted launches refused, a tiled search keeps the CPU with the named reason), `slope_device_scores_rank_like_the_cpu` (D8 on 48 candidates), `slope_pair_assembly_matches_cpu_differenced_normal_equations` (`f64` `JᵀJ`, `Jᵀr` and loss against the CPU differenced normal equations to `1e-10`, across the chunk boundaries, the level column exactly zero), `slope_additive_constant_is_frozen_and_keeps_the_squared_level`, `slope_irls_never_worsens_the_metric`, `slope_fit_keeps_incoming_constants_when_better`, `slope_device_fit_matches_cpu` (32 iterations, `1 + 1e-5`), `slope_gpu_fit_is_deterministic_and_batch_independent`, `slope_no_fit_is_a_no_op` and `slope_gpu_front_is_ranked_on_slope` (a search with `dispatch: Device` scores and fits on the device, every archived error is the exact CPU slope, and the best member is within 5 % of the `--no-gpu` run's on a cell where a level statistic ranks a different law first). With the scorer changed to a level MAE, the search-level test fails (best 0.148 against the CPU's 0.0134), and with the adjoints left undifferenced, no incoming-constant guard and any pair list admitted, eight of the other tests fail.
+
 ### Classification fitness (#289)
 
 The #287 score table now has a label-aware block for long-only binary
@@ -1918,8 +1940,8 @@ and `hinge_squared` are the separate SVM forms. A constant model has
 pin both optima.
 
 **Codes and dispatch.** The classification objectives occupy the score codes
-10–14, after the regression block 0–9 (#287); the fit `RC_LOSS_*` codes are
-0–8. `metrics::score_dispatch` maps every classification metric to one of them,
+10–14, after the regression block 0–9 (#287), and slope is 15 (#236); the fit
+`RC_LOSS_*` codes are 0–9. `metrics::score_dispatch` maps every classification metric to one of them,
 so `auc` stays a **named** refusal (`auc needs the exact rank scorer with
 labels (#288)`) rather than the old generic "classification metric" gate. The
 CPU reference is `metrics::score_native_weighted`, which the kernel mirrors.
