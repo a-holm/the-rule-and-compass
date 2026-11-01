@@ -1594,8 +1594,8 @@ from the CPU on heavy tails — is asserted only per fixture
 (`gpu ≤ cpu × (1+1e-6)`), not measured over a corpus; graduated non-convexity
 for finalists is the follow-up.
 
-`--metric signed` now has a native one-pass score objective (#287); its exact
-fit arm remains the host-side projection of #228 (the fit section below).
+`--metric signed` has a native one-pass score objective; its exact
+fit arm is the squared device warm start plus the host-side projection (the fit section below).
 
 ### Absolute (MAE) on the batched kernel (issue #222)
 
@@ -1919,13 +1919,19 @@ describes. That is deliberate — the projection is two passes on `p` constants
 and must be exact `f64`, so putting it on the device could only add rounding,
 not speed on the row sweep the kernel has already paid for.
 
-**The search still keeps `--metric signed` off the device.** An explicit
-`--fit-strategy gpu --metric signed` is a usage error (`gpu_fit_metric_error`),
-because `fit::fit_loss` is `None` for it: the fit could be warmed up on the
-device, but the per-generation ranking would fall back to MSE, which is exactly
-what #236's gate forbids. `tests/gpu_fit.rs::signed_arm_projects_the_device_proposal_exactly`
-exercises the device-warm-start arm directly against the real kernel; the search
-path opens when a native signed loss lands.
+**The search defers the fit under `--fit-strategy gpu --metric signed`.**
+`fit::fit_loss(signed)` is the squared objective: the kernel is the warm start
+of the CPU arm, which runs `fit_weighted`, then the projection, then the polish
+when the projection is declined. Scoring is native (#287), so the ranking is the
+configured bias, not MSE. Every proposal passes `gate_device_proposal`, whose
+`signed` branch projects the proposal in exact `f64` before it compares; a
+worse or non-finite proposal restores the incoming constants and goes to the
+exact CPU arm, and `not_identifiable` goes to the CPU arm, which runs the
+polish. The deferred arm admits every candidate with constants. Every reported
+bias is the exact CPU metric. `--fit-iters 0` runs no fit.
+`tests/gpu_fit.rs::signed_gpu_fit_run_is_deterministic_and_exact` pins the
+search path and `signed_arm_projects_the_device_proposal_exactly` the proposal
+gate against the real kernel.
 
 **Cost model.** With `n` rows and `p` constants a signed CPU fit costs `iters`
 LM assemblies plus `min(iters,12)·p·6` polish evaluations (each a full row

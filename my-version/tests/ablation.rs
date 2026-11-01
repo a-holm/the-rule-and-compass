@@ -622,3 +622,23 @@ fn the_cli_plan_writes_manifests_to_a_directory() {
     assert_eq!(missing.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&missing.stderr).contains("missing columns"));
 }
+
+#[test]
+fn a_family_that_loses_only_on_pbo_is_dropped_with_reason_pbo() {
+    let sc = base_scenario();
+    let d = definition();
+    let rs = results(&d, &sc, 3);
+    let ok = ablation::verdict(&d, &rs, &BTreeMap::new()).unwrap();
+    let pbo = ok.pbo.as_ref().expect("pbo computed").pbo;
+    assert!(pbo < d.rule.max_pbo, "pbo {pbo}");
+    assert_eq!(d.rule.max_pbo, 0.5);
+    assert_eq!(family(&ok, "candle").verdict, "ship");
+
+    let mut strict = d.clone();
+    strict.rule.max_pbo = pbo / 2.0;
+    let v = ablation::verdict(&strict, &rs, &BTreeMap::new()).unwrap();
+    let candle = family(&v, "candle");
+    assert_eq!(candle.verdict, "drop");
+    assert_eq!(candle.failed.len(), 1, "{:?}", candle.failed);
+    assert!(candle.failed[0].starts_with("pbo:"), "{:?}", candle.failed);
+}

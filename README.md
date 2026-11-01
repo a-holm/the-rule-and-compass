@@ -72,7 +72,7 @@ and the default remains the historical LM path bit for bit. `--metric signed`
 (the absolute mean residual) is the one non-squared metric with an exact closed
 form: its constants are projected in f64 onto the zero-mean-residual manifold by
 a constrained least-squares step (two passes, no optimiser), and when no
-constant can move the mean the arm says so instead of fabricating a fit — see
+constant can move the mean the arm says so instead of fabricating a fit. With `--fit-strategy gpu` the squared device LM is the warm start and the exact f64 gate projects each proposal. See
 [`docs/optimisation.md`](docs/optimisation.md) §3.0.1.
 
 See [`docs/how-symbolic-regression-works.md`](docs/how-symbolic-regression-works.md)
@@ -1128,7 +1128,7 @@ and the default remains the historical LM path bit for bit. `--metric signed`
 (the absolute mean residual) is the one non-squared metric with an exact closed
 form: its constants are projected in f64 onto the zero-mean-residual manifold by
 a constrained least-squares step (two passes, no optimiser), and when no
-constant can move the mean the arm says so instead of fabricating a fit — see
+constant can move the mean the arm says so instead of fabricating a fit. With `--fit-strategy gpu` the squared device LM is the warm start and the exact f64 gate projects each proposal. See
 [`docs/optimisation.md`](docs/optimisation.md) §3.0.1.
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,
   `atan2`, `asinh`/`acosh`/`atanh`, and documented subgradients for

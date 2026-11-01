@@ -492,7 +492,9 @@ fn moments_sharpe(m: Moments) -> f64 {
 /// Probability of backtest overfitting. `cols[k]` is candidate `k`'s aligned
 /// series; `s` (even) contiguous blocks are formed from the first
 /// `s * floor(T / s)` periods and every choice of `s / 2` blocks is the
-/// in-sample half. The performance measure is the per-period Sharpe.
+/// in-sample half. The performance measure is the per-period Sharpe of the raw
+/// series; nothing is demeaned. Ties: `rank = #{oos <= oos[best]}`, so a
+/// candidate tied with the winner counts as not worse than it.
 pub fn pbo_cscv(cols: &[Vec<f64>], s: usize) -> Result<Pbo, String> {
     let k = cols.len();
     if k < 2 {
@@ -506,13 +508,11 @@ pub fn pbo_cscv(cols: &[Vec<f64>], s: usize) -> Result<Pbo, String> {
     if rows < 2 {
         return Err(format!("PBO needs at least {} periods for {} blocks", 2 * s, s));
     }
-    let centres: Vec<f64> = cols.iter().map(|c| mean(&c[..rows * s])).collect();
     let mut block = vec![vec![Moments::default(); s]; k];
     for (c, col) in cols.iter().enumerate() {
         for b in 0..s {
             let mut m = Moments::default();
-            for &v in &col[b * rows..(b + 1) * rows] {
-                let y = v - centres[c];
+            for &y in &col[b * rows..(b + 1) * rows] {
                 m.n += 1.0;
                 m.sum += y;
                 m.sumsq += y * y;

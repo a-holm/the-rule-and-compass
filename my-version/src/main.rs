@@ -563,9 +563,11 @@ SEARCH:
                              correlation`, `--metric correlation_signed`, a rank
                              metric, `--metric median`, `--metric
                              interquartile`, `--metric maximum`, or a CPU
-                             strategy. `--metric signed` keeps the exact CPU
-                             fit projection (#228), but its score is native on
-                             the device since #287
+                             strategy. `--metric signed` fits on the device as
+                             the squared warm start of the exact f64 bias
+                             projection; every proposal passes the
+                             exact f64 gate and its score is native on the
+                             device
   --fit-report               print the constant-fitting arm counts (linear,
                              varpro, stream, exact, GPU fallback/refit, signed
                              projection labels) at the end of the run
@@ -10842,8 +10844,6 @@ mod tests {
         }
     }
 
-    /// Every report flag and type must stay documented in `--help` and `schema`.
-    #[test]
     /// #211: the development log is a documented surface: every flag, the
     /// schema id, the four event names and the analyzer are in `--help` and in
     /// `rcsr schema`.
@@ -10891,6 +10891,8 @@ mod tests {
         assert!(report_usage.contains("<log>"));
     }
 
+    /// Every report flag and type must stay documented in `--help` and `schema`.
+    #[test]
     fn help_and_schema_document_reports() {
         for flag in ["--report", "--report-out", "--report-repeats"] {
             assert!(usage().contains(flag), "usage() is missing {flag}");

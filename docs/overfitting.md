@@ -539,12 +539,12 @@ A walk-forward report on many candidates is a selection problem. The report quan
 | block bootstrap CI and design effect | is the mean or Sharpe distinguishable from zero once labels overlap and returns are serially dependent | CI excludes 0 |
 | `N_eff` (participation ratio) | how many independent trials the candidate set is worth | reported |
 | DSR at `N_eff` and `10 N_eff` | probability the true Sharpe is positive after deflating for the trials, skew and kurtosis | reported with its inputs |
-| PBO (CSCV) | how often the in-sample winner ranks in the lower half out of sample | at most 0.20 |
+| PBO (CSCV) | how often the in-sample winner ranks in the lower half out of sample | at most 0.20 (ablation ship gate: below 0.5) |
 | SPA vs the best long/flat baseline | does any candidate beat cash, buy-and-hold or the constant book after data snooping | p at most 0.05 |
 | BH-FDR | which candidates survive a false discovery rate | q = 0.10 |
 | block-permutation and matched-exposure nulls | does the score time returns better than chance | `p = (1+count)/(B+1)` |
 
-Choices that the formulas leave open: block length `max(h, hold, ceil(n^(1/3)))`; 10000 draws is the recommended `--bootstrap`; the SPA uses the circular block bootstrap with Hansen's consistent, lower and upper recentering; PBO uses the per-period Sharpe over 16 blocks. A locked test is read once per sealed candidate (see `docs/walkforward.md`); a small tweak after a failed read is a new trial that inflates `N`.
+Choices that the formulas leave open: block length `max(h, hold, ceil(n^(1/3)))`; 10000 draws is the recommended `--bootstrap`; the SPA uses the circular block bootstrap with Hansen's consistent, lower and upper recentering; PBO uses the per-period Sharpe of the raw series (no demeaning) over 16 blocks, and ranks ties with `rank = #{oos <= oos[best]}`, so a candidate tied with the winner counts as not worse. A locked test is read once per sealed candidate (see `docs/walkforward.md`); a small tweak after a failed read is a new trial that inflates `N`.
 
 Verify: `tests/inference.rs` (hand-computed CVaR, break-even, BH, PSR and PBO fixtures, the AR(1) and overlapping-label design effects, SPA on signal and noise) and `tests/eval_protocol.rs`.
 
@@ -597,7 +597,7 @@ A family is `ship` only if every check passes against every control arm:
 * BH-FDR at q = 0.10 over the families keeps it;
 * the DSR, deflated by `N_trials = families x columns x windows x seeds x folds x horizons`, is at least 0.5.
 
-The PBO of the arms' series is reported with the verdict; it centres every series, so it records rank stability and does not gate.
+The PBO of the arms' seed-mean series is a ship gate: a family ships only when the PBO is below `rule.max_pbo` (0.5 in `protocol/ablation.json`). It is a property of the arm set, so a failure is listed as `pbo` on every family.
 
 `A3` is compared with the placebo arm `A4` and with `A2`, so it must beat both. Otherwise the family is `drop`, with every failed check listed. No family enters the default set on a single-cell t-test. The ablation is a selection on training data repeated inside every fold, and a family that only wins by making the search bigger has not won.
 

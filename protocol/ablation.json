@@ -32,6 +32,7 @@
     "block_len": 0,
     "seed": 0,
     "pbo_blocks": 8,
+    "max_pbo": 0.5,
     "families": [
       {"name": "candle", "treatment": "A1", "controls": ["A0"], "null_arm": "A5", "null_control": "A0"},
       {"name": "multi_bar", "treatment": "A2", "controls": ["A1"], "null_arm": "A5", "null_control": "A0"},
