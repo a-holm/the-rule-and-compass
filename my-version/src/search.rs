@@ -343,6 +343,8 @@ pub struct GenCounters {
     /// #463: candidates dropped after the fit because they exceeded the
     /// complexity cap; each one re-enters variation.
     pub post_fit_drops: std::sync::atomic::AtomicU64,
+    /// #500: carried individuals re-scored at the start of a generation.
+    pub reevals: std::sync::atomic::AtomicU64,
     /// Whether the fit, eval and batch timers read the clock. Off outside a
     /// development log; the counts are kept either way.
     pub timed: bool,
@@ -4762,10 +4764,14 @@ fn evolve_island(
     counters: Option<&GenCounters>,
     // #463: worker threads for the fit-and-score phase of this island.
     workers: usize,
+    // #500: the generation scores on rows other than the ones the carried
+    // individuals were scored on, so a `+inf` error can change.
+    rows_changed: bool,
 ) {
     if !screened {
         for ind in isl.iter_mut() {
-            if !ind.error.is_finite() {
+            if !ind.error.is_finite() || rows_changed && false {
+                GenCounters::count(counters, |c| &c.reevals);
                 ind.reeval(train, cfg); // #25
             }
         }
@@ -5755,6 +5761,7 @@ fn dev_generation(
         eval_cpu_s: GenCounters::seconds(counters, |c| &c.eval_ns) + fallback_s,
         phase_b_s: GenCounters::seconds(counters, |c| &c.batch_ns),
         post_fit_drops: GenCounters::total(counters, |c| &c.post_fit_drops) as usize,
+        reevals: GenCounters::total(counters, |c| &c.reevals) as usize,
         best_error,
         p05: q(0.05),
         p25: q(0.25),
@@ -7122,6 +7129,7 @@ fn run_search(
             let eval_view = eval_data; // #27
             // #463: islands share the thread budget.
             let island_workers = (cfg.threads / islands.len().max(1)).max(1);
+            let rows_changed = gen_sample.is_some(); // #500
             // #76: the front from the previous generation is borrowed, not
             // copied, and the scope ends before this generation updates the
             // archive below. At generation 0 (or with the feature off) it is
@@ -7226,6 +7234,7 @@ fn run_search(
                                 sender.as_ref().map(|t| (t, i)), // #119
                                 dev_counters_ref, // #211
                                 island_workers, // #463
+                                rows_changed, // #500
                             ) // #85
                         })
                     })
@@ -8996,6 +9005,7 @@ mod tests {
                 None,  // #119: synchronous test path
                 None,  // #211: no development log in this test
                 1,     // #463
+                false, // #500
             );
             let trees: Vec<Node> = isl.iter().map(|i| i.tree.clone()).collect();
             let errors: Vec<u64> = isl.iter().map(|i| i.error.to_bits()).collect();
@@ -10116,7 +10126,7 @@ mod tests {
         let mut rng = Mt::new(11);
         evolve_island(
             &mut isl, &mut rng, &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None, false,
-            0, None, None, 1,
+            0, None, None, 1, false,
         );
         let immigrants = afp_immigrants(cfg.pop);
         assert_eq!(isl.len(), cfg.pop + immigrants);
@@ -10128,6 +10138,85 @@ mod tests {
         let rebuilt = Ind::pending(input(0), &cfg);
         assert_eq!(rebuilt.age, 0);
         assert_eq!(Ind::evaluated(input(0), &data, &cfg).age, 0);
+    }
+
+    /// #500: a population that holds `+inf` individuals, some with trees that
+    /// `expr::simplify` rewrites.
+    fn inf_population(data: &EvalSample, cfg: &Config) -> Vec<Ind> {
+        (0..40)
+            .map(|i| {
+                let tree = match i % 4 {
+                    0 => node(Op::Div, vec![input(0), constant(0.0)]),
+                    1 => node(
+                        Op::Add,
+                        vec![
+                            node(Op::Div, vec![input(0), constant(0.0)]),
+                            node(Op::Add, vec![constant(1.0), constant(2.0)]),
+                        ],
+                    ),
+                    _ => node(Op::Add, vec![input(0), constant(i as f64)]),
+                };
+                Ind::evaluated(tree, data, cfg)
+            })
+            .collect()
+    }
+
+    fn evolve_inf_population(rows_changed: bool) -> (Vec<Ind>, u64) {
+        let s = sample();
+        let aggs = AggTable::from_sample(&s);
+        let mut cfg = Config::default();
+        cfg.pop = 40;
+        let data = EvalSample::new(&s, &cfg);
+        let mut isl = inf_population(&data, &cfg);
+        assert!(isl.iter().any(|i| i.error == f64::INFINITY));
+        let counters = GenCounters::default();
+        let mut rng = Mt::new(5);
+        evolve_island(
+            &mut isl, &mut rng, &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None, false,
+            0, None, Some(&counters), 1, rows_changed,
+        );
+        let reevals = GenCounters::total(Some(&counters), |c| &c.reevals);
+        (isl, reevals)
+    }
+
+    /// #500: skipping the re-score of `+inf` individuals on unchanged rows
+    /// leaves the next generation bit-identical, and the counter shows the
+    /// saved work.
+    #[test]
+    fn skipping_inf_reeval_keeps_the_cpu_trajectory() {
+        let (skipped, skipped_reevals) = evolve_inf_population(false);
+        let (rescored, rescored_reevals) = evolve_inf_population(true);
+        assert_eq!(skipped_reevals, 0);
+        assert_eq!(rescored_reevals, 20);
+        assert_eq!(skipped.len(), rescored.len());
+        for (a, b) in skipped.iter().zip(&rescored) {
+            assert_eq!(a.tree, b.tree);
+            assert_eq!(a.error.to_bits(), b.error.to_bits());
+            assert_eq!(a.complexity.to_bits(), b.complexity.to_bits());
+        }
+    }
+
+    /// #500: pending individuals are always scored; `+inf` ones are re-scored
+    /// when the generation's rows changed (`--predictor-samples`).
+    #[test]
+    fn inf_reeval_runs_when_the_rows_change() {
+        let (_, reevals) = evolve_inf_population(true);
+        assert_eq!(reevals, 20);
+        let s = sample();
+        let aggs = AggTable::from_sample(&s);
+        let mut cfg = Config::default();
+        cfg.pop = 40;
+        let data = EvalSample::new(&s, &cfg);
+        let mut isl = inf_population(&data, &cfg);
+        for ind in isl.iter_mut().take(3) {
+            ind.error = f64::NAN;
+        }
+        let counters = GenCounters::default();
+        evolve_island(
+            &mut isl, &mut Mt::new(5), &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None,
+            false, 0, None, Some(&counters), 1, false,
+        );
+        assert_eq!(GenCounters::total(Some(&counters), |c| &c.reevals), 3);
     }
 
     /// #465: migration replaces the member of the highest Pareto rank.

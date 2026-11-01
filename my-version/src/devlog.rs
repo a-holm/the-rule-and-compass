@@ -464,6 +464,8 @@ pub struct GenRecord {
     pub phase_b_s: f64,
     /// #463: candidates dropped after the fit for exceeding the complexity cap.
     pub post_fit_drops: usize,
+    /// #500: carried individuals re-scored at the start of a generation.
+    pub reevals: usize,
     // Error distribution over this generation's population.
     pub best_error: f64,
     pub p05: f64,
@@ -580,7 +582,7 @@ impl GenRecord {
              \"error\":{{\"best\":{},\"p05\":{},\"p25\":{},\"median\":{},\"p75\":{},\"p95\":{}}},\
              \"archive\":{{\"size\":{},\"hypervolume\":{},\"hash\":{},\"offers\":{},\"admissions\":{}}},\
              \"variation\":{{\"attempts\":{},\"duplicates\":{},\"too_complex\":{},\"offspring\":{},\
-             \"fitted\":{},\"refits\":{},\"dedup_rate\":{},\"post_fit_drops\":{}}},\
+             \"fitted\":{},\"refits\":{},\"dedup_rate\":{},\"post_fit_drops\":{},\"reevals\":{}}},\
              \"gpu\":{},\"fit\":{},\
              \"fallback\":{{\"scope\":\"evaluator_pool\",\"seconds\":{},\"workers\":{}}},\
              \"qd\":{},\
@@ -621,6 +623,7 @@ impl GenRecord {
             self.refits,
             num(self.dedup_rate()),
             self.post_fit_drops,
+            self.reevals,
             self.gpu.as_ref().map(|g| g.json()).unwrap_or_else(|| "null".to_string()),
             self.fit.json(),
             num(self.fallback_s),
@@ -1133,6 +1136,7 @@ mod tests {
             eval_cpu_s: 0.02,
             phase_b_s: 0.0,
             post_fit_drops: 0,
+            reevals: 0,
             best_error: 0.5,
             p05: 0.6,
             p25: 0.7,

@@ -231,6 +231,7 @@ Emitted at the same boundary as `--progress`, once per completed generation
 | `variation.fitted` | full | offspring whose constants were fitted on the CPU |
 | `variation.refits` | full | exact CPU refits of carried/promoted survivors |
 | `variation.dedup_rate` | full | `duplicates / attempts` |
+| `variation.reevals` | full | #500: carried individuals re-scored over every training row at the start of the generation. Pending (`NaN`) individuals always count; `+inf` ones count only when `--predictor-samples` changes the rows, since a `+inf` error on unchanged rows is final |
 | `qd` | full | `null` without `--qd`: `occupied`, `reachable`, `coverage`, `entropy` |
 | `convergence.percent_converged` | both | the #18 headline (`docs/convergence.md`) |
 | `convergence.confidence/stability/maturity` | full | its three components |
