@@ -1,4 +1,7 @@
-//! Optional GPU backend: batched fitness evaluation on an NVIDIA GPU.
+//! Op        le        if rc != 0 {
+            return None;
+        }
+        let batch batch = ScoreBatch {ional GPU backend: batched fitness evaluation on an NVIDIA GPU.
 //!
 //! Enabled with `cargo build --features cuda`. The kernel lives in
 //! `src/cuda/eval.cu`; this module compiles expression trees to its postfix
@@ -601,6 +604,9 @@ struct RawPnlTotals {
     longs: u64,
     nonfinite: i32,
     pad: i32,
+    block_gross: [f64; 8],
+    block_flips: [u64; 8],
+    block_exits: [u64; 8],
 }
 
 /// #285: host-visible state of the persistent batch arena. Mirrors
@@ -828,7 +834,9 @@ extern "C" {
         n: i32,
         side: f64,
         threshold: f64,
-        bound: f64,
+        bounds: *const f64,
+        nblocks: i32,
+        lambda: f64,
         min_trades: u64,
     ) -> i32;
     fn rc_pnl_totals(
@@ -1807,7 +1815,9 @@ impl GpuEvaluator {
                 book.len() as i32,
                 book.side(),
                 book.threshold(),
-                book.bound(),
+                book.block_bounds().as_ptr(),
+                book.blocks() as i32,
+                book.lambda(),
                 book.min_trades() as u64,
             )
         };
@@ -1842,6 +1852,53 @@ impl GpuEvaluator {
         prog: &[u32],
         offsets: &[u32],
     ) -> Option<(ScoreBatch, Vec<crate::trading::FitnessTotals>)> {
+        let (batch, raw) = self.long_pnl_raw_for_tests(prog, offsets)?;
+        let totals = raw
+            .iter()
+            .map(|t| crate::trading::FitnessTotals {
+                gross: t.gross,
+                flips: t.flips,
+                exits: t.exits,
+                long_rows: t.longs,
+                nonfinite: t.nonfinite != 0,
+            })
+            .collect();
+        Some((batch, totals))
+    }
+
+    /// #484 test hook: like [`GpuEvaluator::long_pnl_totals_for_tests`], with
+    /// one [`crate::trading::FitnessTotals`] per time block of the uploaded
+    /// book. The device counts long rows for the whole book only, so
+    /// `long_rows` is 0 per block and `nonfinite` is the whole-candidate flag.
+    pub fn long_pnl_block_totals_for_tests(
+        &mut self,
+        prog: &[u32],
+        offsets: &[u32],
+        blocks: usize,
+    ) -> Option<(ScoreBatch, Vec<Vec<crate::trading::FitnessTotals>>)> {
+        let (batch, raw) = self.long_pnl_raw_for_tests(prog, offsets)?;
+        let totals = raw
+            .iter()
+            .map(|t| {
+                (0..blocks.min(8))
+                    .map(|b| crate::trading::FitnessTotals {
+                        gross: t.block_gross[b],
+                        flips: t.block_flips[b],
+                        exits: t.block_exits[b],
+                        long_rows: 0,
+                        nonfinite: t.nonfinite != 0,
+                    })
+                    .collect()
+            })
+            .collect();
+        Some((batch, totals))
+    }
+
+    fn long_pnl_raw_for_tests(
+        &mut self,
+        prog: &[u32],
+        offsets: &[u32],
+    ) -> Option<(ScoreBatch, Vec<RawPnlTotals>)> {
         let nprog = offsets.len().saturating_sub(1);
         if nprog == 0 {
             return None;
@@ -1864,22 +1921,12 @@ impl GpuEvaluator {
         if rc != 0 {
             return None;
         }
-        let totals = raw
-            .iter()
-            .map(|t| crate::trading::FitnessTotals {
-                gross: t.gross,
-                flips: t.flips,
-                exits: t.exits,
-                long_rows: t.longs,
-                nonfinite: t.nonfinite != 0,
-            })
-            .collect();
         let batch = ScoreBatch {
             values,
             status: status.into_iter().map(ScoreStatus::from_code).collect(),
             ms: 0.0,
         };
-        Some((batch, totals))
+        Some((batch, raw))
     }
 
     pub fn device_name() -> String {
