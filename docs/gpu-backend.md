@@ -2025,6 +2025,18 @@ The deferred device fit does per candidate what the CPU arm does.
 * **Pipeline exclusion.** `pipeline_fit_safe` is false for every gated metric, because the pipeline write-back applies kernel constants without the gate.
 * **Wide admission.** `wide_admission` is true at 1 048 576 training rows or more, and for `correlation`, `correlation_signed` and `signed` at any size. With `wide`, `select_promoted` takes every candidate with constants and `GpuSearch::score` screens only the candidates without constants; the others are fitted and scored once. Other metrics keep `max(32, pop/4)` below the threshold.
 
+### Fit subsample on the device
+
+`--fit-rows N` (or `--fit-samples N`) with the device fit arm fits constants on a fixed `N`-row subsample and keeps scoring every training row on the device.
+
+* **Rows.** The subsample is drawn once per run: `N` ascending row indices from the training sample with the seed salted by the screening constant. `--run-manifest` records `fit_subsample.fit_rows`, the FNV-1a hash of those indices and `fixed` (true when the device fits the same rows for the whole run). The CPU screening arm draws a fresh subset each generation and does not run on a GPU search.
+* **Second context.** `GpuSearch` holds the subsample in its own device context: f32 rows, the f64 fit twin and the fit weights, uploaded once. The scoring context keeps the full f32 rows and, only for the exact order/rank scorer, a full twin. Weighted scoring keeps its weight vector in the scoring context. The log-loss label sign of the subsample is derived from the subsample target.
+* **What the subsample sees.** Every kernel batch of the fit stage (squared, absolute, log-squashed and log-loss LM, the correlation family, the rank, median, interquartile and maximum polishes), the cost-model rows, the exact gate for gated metrics and the CPU fallback fits use the subsample rows. After the write-back the survivors are scored on every row by the evaluator.
+* **Reporting.** `gpu.fit` carries `fit_rows` (rows of the twin), `score_rows`, `fit_twin_bytes` and `subsample_hash`. The reported archive is still rebuilt from an exact CPU refit of the finalists on all rows, so every reported error equals the CPU metric on all rows.
+* **Memory.** The plan charges the fit twin at `N` rows (`terms.fit_twin = N x (vars + 1) x 12 B` plus `N x 8 B` with weights: the f64 twin and the subsample's f32 rows) and a full-row twin only for the exact scorer. See `docs/memory-model.md`.
+* **Kept refusals.** A run without the device fit arm (`--fit-strategy exact`/`auto`/other CPU arm, `--no-fit`, a metric with no device fit objective) keeps the CPU evaluator with the reason `--fit-samples/--fit-rows scores on all rows only with the device fit arm (--fit-strategy gpu)`. Tiled residency still refuses the device fit. The overlapped fit pipeline (`pipeline_fit_safe`) is off for a subsample and the batches run synchronously. `--predictor-samples` still refuses the device.
+* **Cost model.** The planner decides per candidate on the subsample row count. At small `N` the model can route a fit to the CPU (`dispatch_cost`), which is labelled in `fit_fallback_by_cause`.
+
 ### Correlation arm
 
 `--metric correlation` (`1 − |ρ|`) and `--metric correlation_signed` (`1 − ρ`) fit on the device through `fit::fit_loss`. The kernel minimises exactly the configured objective with an analytic gradient and curvature in `f64`. The affine gauge pair `(a, b)` of an outer `a*T + b` is renormalised to `(sign a, 0)` and frozen, so its step is exactly zero.

@@ -666,6 +666,9 @@ pub struct DeviceWorkload {
     pub program_words: usize,
     /// An explicit `--fit-strategy gpu` with `fit_iters > 0`.
     pub device_fit: bool,
+    /// Rows the device fit runs on when it uses a subsample of `rows`; `0`
+    /// fits on every row. The subsample has its own f32 rows and f64 twin.
+    pub fit_rows: usize,
     /// The exact rank or order-statistic scorer.
     pub stat: bool,
     pub weights: bool,
@@ -792,7 +795,22 @@ fn plan_core(w: &DeviceWorkload, d: &DeviceInfo, caps: &DeviceCaps) -> DevicePla
         side += n * 8;
     }
     let side_vectors = clamp_u64(side, &mut sat);
-    let twin_all = clamp_u64(n * (v + 1) * 8, &mut sat);
+    let fit_n = if w.device_fit && w.fit_rows > 0 && w.fit_rows < w.rows {
+        Some(w.fit_rows as u128)
+    } else {
+        None
+    };
+    let twin_all = match fit_n {
+        None => clamp_u64(n * (v + 1) * 8, &mut sat),
+        // The fit context holds the subsample as f32 rows, the f64 twin and
+        // the weights. The scoring context keeps a full twin only for the
+        // exact order/rank scorer.
+        Some(m) => {
+            let scorer = if w.stat { n * (v + 1) * 8 } else { 0 };
+            let weights = if w.weights { m * 8 } else { 0 };
+            clamp_u64(scorer + m * (v + 1) * 12 + weights, &mut sat)
+        }
+    };
     let buffers = clamp_u64(device_buffer_bytes(w), &mut sat);
     let stat_wave = if w.stat {
         let min_wave = DEVICE_STAT_WAVE_TRIALS * (n * DEVICE_STAT_ROW_BYTES + (1 << 20));
@@ -1271,6 +1289,7 @@ mod tests {
             candidates,
             program_words: crate::genome::width_for(30),
             device_fit,
+            fit_rows: 0,
             stat: false,
             weights: false,
             label_sign: false,
@@ -1423,6 +1442,25 @@ mod tests {
         let narrow = device_plan(&w, &rtx3060(2_048), &DeviceCaps::new(None));
         assert_eq!(narrow.mode, Residency::Resident);
         assert_eq!(narrow.stat_route, StageRoute::Cpu("device_memory"));
+    }
+
+    #[test]
+    fn device_plan_charges_the_fit_twin_at_the_subsample_rows() {
+        let d = rtx3060(11_353);
+        let caps = DeviceCaps::new(None);
+        let full = device_plan(&workload(56, 1_000, true), &d, &caps);
+        let sub = DeviceWorkload { fit_rows: 100_000, ..workload(56, 1_000, true) };
+        let planned = device_plan(&sub, &d, &caps);
+        assert_eq!(full.terms.fit_twin, 4_775_757 * 57 * 8);
+        assert_eq!(planned.terms.fit_twin, 100_000 * 57 * 12);
+        assert!(planned.terms.fit_twin < full.terms.fit_twin / 4);
+        assert_eq!(planned.terms.data_f32, full.terms.data_f32);
+        assert_eq!(planned.fit_route, StageRoute::Device);
+        let weighted = DeviceWorkload { weights: true, ..sub };
+        let w = device_plan(&weighted, &d, &caps);
+        assert_eq!(w.terms.fit_twin, 100_000 * 57 * 12 + 100_000 * 8);
+        let no_fit = DeviceWorkload { device_fit: false, ..sub };
+        assert_eq!(device_plan(&no_fit, &d, &caps).terms.fit_twin, 0);
     }
 
     #[test]
