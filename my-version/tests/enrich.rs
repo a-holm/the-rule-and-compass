@@ -3537,13 +3537,12 @@ fn weight_columns(tag: &str, perturbed: bool, declare: bool) -> (Vec<f64>, Vec<f
     write_store(&src, &embargo_rows(n, s, e, perturbed), 1024);
     let mut o = opts(&src, &out, "returns");
     o.features.clear();
-    o.labels = vec!["long:3h,name=h3,fee=10,vol=20".to_string()];
+    o.labels = vec!["long:2h,name=h2,fee=10,vol=20".to_string()];
     if declare {
         o.locked_test = Some(rcsr::lockbox::Lockbox { start: EMB_T0 + EMB_H * s as i64, end: EMB_T0 + EMB_H * e as i64 });
     }
-    o.allow_lockbox = true;
     enrich::build(&o).unwrap();
-    (column(&out, "ts"), column(&out, "lbl_h3_weight"))
+    (column(&out, "ts"), column(&out, "lbl_h2_weight"))
 }
 
 #[test]
