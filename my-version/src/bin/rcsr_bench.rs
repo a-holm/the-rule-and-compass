@@ -66,6 +66,7 @@ OPTIONS:
   --migration-interval <N>  generations between island migrations
   --restart-interval <N>    generations between island restarts
   --variation <mode>        auto, node or postfix
+  --dispatch <mode>         auto or device (device skips the timing comparison)
   --jobs <N>                runs in flight at once on the CPU (default 1);
                             seconds and hit_s are then contended
   --ndjson                  one JSON line per finished run, flushed at once,
@@ -289,6 +290,13 @@ fn parse(args: &[String]) -> Result<Args, String> {
             }
             "--variation" => {
                 a.knobs.variation = Some(rcsr::search::VariationMode::parse(&take(&mut i, "--variation")?)?)
+            }
+            "--dispatch" => {
+                let v = take(&mut i, "--dispatch")?;
+                a.knobs.dispatch = Some(
+                    rcsr::dispatch::DispatchMode::parse(&v)
+                        .ok_or_else(|| format!("--dispatch needs auto or device, got '{}'", v))?,
+                );
             }
             "--jobs" => {
                 a.jobs = num(take(&mut i, "--jobs")?, "--jobs")?;

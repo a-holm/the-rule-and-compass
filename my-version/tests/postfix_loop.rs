@@ -297,7 +297,7 @@ fn front_observer_does_not_change_the_postfix_archive() {
     }
     use std::sync::atomic::{AtomicUsize, Ordering};
     let data = sample(160);
-    let plain = cfg(VariationMode::Postfix, 1, 1024, 3);
+    let plain = cfg(VariationMode::Postfix, 1, 4096, 3);
     let calls = std::sync::Arc::new(AtomicUsize::new(0));
     let c2 = calls.clone();
     let observed = Config {
