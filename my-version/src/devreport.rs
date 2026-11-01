@@ -1001,6 +1001,8 @@ mod tests {
             fit_s: 0.001,
             fit_cpu_s: fit_cpu,
             eval_cpu_s: eval_cpu,
+            phase_b_s: 0.0,
+            post_fit_drops: 0,
             best_error: 1.0 / gen as f64,
             median: 2.0,
             p05: 0.0,

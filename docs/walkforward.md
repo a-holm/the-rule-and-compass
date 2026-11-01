@@ -371,6 +371,8 @@ net_t   = gross_t - cost_t                (the last row of a group also pays c_s
 * The book reports gross and net P&L, total return, log growth (`sum ln(1 + R)`), Sharpe, Sortino, maximum drawdown, Calmar, turnover, trades, entries, exits, trades per year, exposure (time in market), hit rate on long rows and the break-even cost per side. The break-even cost is `gross P&L / sum |delta p|` including exits; at that cost the net P&L is zero.
 * Every book also carries a cash book (flat the whole time, earning `cash_return`), a buy-and-hold book (long from the first row to the end, paying the entry and the exit) and a cost ladder that re-prices the same positions at 0, 5, 10, 20 and 50 bp per side.
 
+A `.rcsb` store read with `--vars` and `--time` is projected to the columns the run names. With a trading objective the projection also keeps the target spec's `return_column` and the `--funding` column. A run without `--objective` keeps its projected column list. A `return_column` that is not in the store is an input error (exit 3) that names the target spec.
+
 Finalist selection with `--objective` scores every Pareto member this way on the validation slice only. The winner has the lowest objective value (`-net P&L`, `-Sharpe` or `-log growth`; ties keep the archive order, so the smaller expression wins). Candidates below `--min-trades` or with a non-finite value are unusable. The test block is scored once, for the winner.
 
 ## Metrics

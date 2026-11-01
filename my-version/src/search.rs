@@ -201,6 +201,10 @@ pub struct Config {
     /// candidate order and archive are identical to the synchronous path, so it
     /// is not saved in a checkpoint.
     pub pipeline_depth: usize,
+    /// #463: worker threads for fitting and scoring offspring. Scheduling
+    /// only: results are bit-identical for every value, so it is not saved in
+    /// a checkpoint. `1` runs every phase serially on the island thread.
+    pub threads: usize,
     /// #122: which variation engine to use. `auto` selects the flat postfix
     /// engine only for a large, fit-free GPU run.
     pub variation: VariationMode,
@@ -243,6 +247,12 @@ pub struct GenCounters {
     pub fit_ns: std::sync::atomic::AtomicU64,
     /// Candidate-evaluation CPU time, nanoseconds, summed over threads.
     pub eval_ns: std::sync::atomic::AtomicU64,
+    /// #463: wall time of the parallel fit-and-score phase, nanoseconds,
+    /// summed over islands.
+    pub batch_ns: std::sync::atomic::AtomicU64,
+    /// #463: candidates dropped after the fit because they exceeded the
+    /// complexity cap; each one re-enters variation.
+    pub post_fit_drops: std::sync::atomic::AtomicU64,
 }
 
 impl GenCounters {
@@ -307,6 +317,96 @@ fn eval_counted(counters: Option<&GenCounters>, make: impl FnOnce() -> Ind) -> I
     ind
 }
 
+/// #463: candidates per worker below which a batch of cheap fits runs
+/// serially, because spawning the workers costs more than the fits.
+const MIN_BATCH_PER_WORKER: usize = 16;
+
+/// #463: training rows from which one fit is expensive enough that a worker
+/// pays off for a single candidate.
+const HEAVY_FIT_ROWS: usize = 2048;
+
+/// #463: workers worth spawning for `n` candidates of `rows` rows.
+fn batch_workers(workers: usize, n: usize, rows: usize) -> usize {
+    let per = if rows >= HEAVY_FIT_ROWS { 1 } else { MIN_BATCH_PER_WORKER };
+    workers.min(n / per).max(1)
+}
+
+/// #463: map `f` over `items` on up to `workers` threads and return the
+/// results in input order. Work is handed out one item at a time, so uneven
+/// fit costs balance. `f` must not touch shared mutable state that changes
+/// the result, so the output is independent of `workers`.
+fn par_map<T: Send, R: Send>(workers: usize, items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let n = items.len();
+    let workers = workers.min(n);
+    if workers <= 1 {
+        return items.into_iter().map(f).collect();
+    }
+    let slots: Vec<Mutex<Option<T>>> = items.into_iter().map(|t| Mutex::new(Some(t))).collect();
+    let out: Vec<Mutex<Option<R>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let blocks = expr::current_blocks();
+    let run = || loop {
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        if i >= n {
+            break;
+        }
+        let item = slots[i].lock().unwrap().take().expect("each slot is taken once");
+        let r = f(item);
+        *out[i].lock().unwrap() = Some(r);
+    };
+    std::thread::scope(|s| {
+        for _ in 1..workers {
+            let blocks = blocks.clone();
+            let run = &run;
+            s.spawn(move || {
+                expr::set_blocks(blocks);
+                run();
+            });
+        }
+        run();
+    });
+    out.into_iter()
+        .map(|m| m.into_inner().unwrap().expect("every slot is filled"))
+        .collect()
+}
+
+/// #463: phase B of an island generation. Fit (when `fit`), simplify and score
+/// `trees` on `workers` threads; results keep the input order. Neither the fit
+/// nor the score draws from the RNG, so the output does not depend on
+/// `workers`.
+fn fit_and_score(
+    trees: Vec<Node>,
+    workers: usize,
+    cfg: &Config,
+    train: &EvalSample,
+    fit_sample: &Sample,
+    fit: bool,
+    defer_gpu: bool,
+    counters: Option<&GenCounters>,
+) -> Vec<Ind> {
+    let t = counters.map(|_| std::time::Instant::now());
+    let workers = batch_workers(workers, trees.len(), train.sample.len());
+    let out = par_map(workers, trees, |mut tree| {
+        let mut fitted = None;
+        if fit {
+            fitted = fit_counted(counters, &mut tree, cfg, fit_sample, train.sample); // #85 #87 #211
+            tree = expr::simplify(&tree);
+        }
+        // #26: with the GPU batch active the fitness is filled in later.
+        if defer_gpu {
+            Ind::pending(tree, cfg)
+        } else {
+            eval_counted(counters, || Ind::evaluated_fitted(tree, fitted, train, cfg)) // #25 #87 #211
+        }
+    });
+    if let (Some(c), Some(t)) = (counters, t) {
+        GenCounters::add(&c.batch_ns, t.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+    }
+    out
+}
+
 /// #255: default per-generation cap on exact CPU fallback refits. It is a
 /// safety bound, not a tuning knob: a generation would have to send more than
 /// this many candidates to the CPU before it changes any result. The recorded
@@ -360,6 +460,7 @@ impl Default for Config {
             gpu_memory: None,
             dispatch: crate::dispatch::DispatchMode::Auto,
             pipeline_depth: 2, // #119: only used when the GPU path is active
+            threads: 1,
             variation: VariationMode::Auto,
         }
     }
@@ -816,6 +917,9 @@ impl GpuSearch {
                 if fit_data {
                     return Err("device_memory: tiled residency has no device fit or exact statistic scorer".to_string());
                 }
+                if score == Some(crate::metrics::ScoreObjective::Slope) {
+                    return Err("device_memory: tiled residency refuses slope scoring: row r - 1 of a tile's first row is not resident".to_string());
+                }
                 crate::gpu::GpuEvaluator::new_tiled(
                     cols,
                     n_rows,
@@ -1062,6 +1166,11 @@ impl GpuSearch {
                 match crate::fit::rank_metric_signed(cfg.metric) {
                     Some(signed) => {
                         dev.rank_fit_batch(&plans, cfg.fit_iters, &fit_train.y, signed)
+                    }
+                    // #236: the squared warm start, then the differenced IRLS,
+                    // keeping the incoming constants unless it improves on them.
+                    None if fit_loss == Some(crate::fit::DeviceLoss::Slope) => {
+                        dev.slope_fit_batch(&plans, cfg.fit_iters)
                     }
                     None => {
                         let loss = fit_loss.expect(
@@ -2350,7 +2459,13 @@ fn score_pipeline_batch(
     let mut fitted: Vec<(usize, Option<Vec<f64>>)> = Vec::new();
     if !plans.is_empty() {
         let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().map(|(_, p)| p).collect();
-        let (out, ms) = g.ev.fit_batch(&refs, fit.iters, fit.loss);
+        // #236: slope always starts from the squared warm start and keeps the
+        // incoming constants unless it improves on them.
+        let (out, ms) = if fit.loss == crate::fit::DeviceLoss::Slope {
+            g.ev.slope_fit_batch(&refs, fit.iters)
+        } else {
+            g.ev.fit_batch(&refs, fit.iters, fit.loss)
+        };
         if ms > 0.0 {
             g.fit_ms += ms as f64;
         }
@@ -2508,6 +2623,17 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     {
         return Some("implicit_residual needs an all-zero training target");
     }
+    // #236: the device differences row r against row r - 1 of the resident
+    // sample. A pair list with any other shape (a shuffled split, a group
+    // boundary, a row missing from the side) keeps the exact CPU scorer.
+    if cfg.metric == crate::metrics::Metric::Slope && !slope_pairs_are_consecutive(train) {
+        return Some("slope pairs are not the consecutive rows of the training sample");
+    }
+    // A fit subsample keeps only the pairs whose two rows it drew, and those
+    // are not its consecutive rows.
+    if cfg.metric == crate::metrics::Metric::Slope && effective_fit_rows(cfg, train) > 0 {
+        return Some("slope pairs are not the consecutive rows of a --fit-rows/--fit-samples subsample");
+    }
     // #288: AUC needs exactly two distinct target values; the label rule is
     // the CPU midpoint rule, so any other target is refused, never collapsed.
     if cfg.metric == crate::metrics::Metric::Auc
@@ -2537,6 +2663,29 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
         );
     }
     None
+}
+
+/// #236: true when the sample's slope pairs are exactly `[k - 1, k]` for every
+/// `k` in `1..n`, the only pair set the device slope scorer and fit compute.
+/// `None` is the consecutive set by definition ([`crate::data::Sample::pairs`]).
+#[cfg(feature = "cuda")]
+pub(crate) fn slope_pairs_are_consecutive(train: &Sample) -> bool {
+    let Some(pairs) = &train.pairs else {
+        return true;
+    };
+    let n = train.len();
+    if n < 2 || pairs.len() != n - 1 {
+        return false;
+    }
+    let mut seen = vec![false; n];
+    for &[a, b] in pairs {
+        let (a, b) = (a as usize, b as usize);
+        if b == 0 || b >= n || a + 1 != b || seen[b] {
+            return false;
+        }
+        seen[b] = true;
+    }
+    true
 }
 
 /// #230: `Some(signed)` when the device may run this run's **fit stage only**,
@@ -3915,11 +4064,7 @@ fn full_data_archive(
     // the GPU constants on the full training sample. Trees are independent, so
     // the refit is split across workers; the result order is unchanged.
     if refit_gpu_fit && cfg.fit_iters > 0 && !train.sample.is_multi() {
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(8)
-            .min(unique.len().max(1));
+        let workers = cfg.threads.max(1).min(unique.len().max(1)); // #463
         let blocks = expr::current_blocks();
         if workers > 1 && unique.len() > 1 {
             let per = unique.len().div_ceil(workers);
@@ -3964,9 +4109,8 @@ fn full_data_archive(
     if refits > 0 {
         refit_s = refit_start.elapsed().as_secs_f64();
     }
-    let scored: Vec<Sol> = unique
-        .into_iter()
-        .map(|tree| {
+    // #463: scoring is independent per tree; results keep the order.
+    let scored: Vec<Sol> = par_map(batch_workers(cfg.threads, unique.len(), train.sample.len()), unique, |tree| {
             // #15: combined error on a multi-output sample; #25: a rejected
             // candidate must not sneak back in on the full-data rebuild.
             let error = if cfg.accepts_dimensions(&tree) {
@@ -3980,8 +4124,7 @@ fn full_data_archive(
                 tree,
                 error,
             }
-        })
-        .collect();
+    });
     let out = canonical_front(archive.cap, scored);
     (out, refits, refit_s)
 }
@@ -4187,6 +4330,8 @@ fn evolve_island(
     // #211: per-generation development-log counters. `None` (the default) makes
     // every count and timer below a single branch with no effect.
     counters: Option<&GenCounters>,
+    // #463: worker threads for the fit-and-score phase of this island.
+    workers: usize,
 ) {
     if !screened {
         for ind in isl.iter_mut() {
@@ -4218,86 +4363,68 @@ fn evolve_island(
     let mut attempts = 0usize;
     let max_attempts = pop * 50 + 50;
 
+    let fit = cfg.fit_iters > 0 && !train.sample.is_multi() && !defers_fit_to_gpu(cfg, defer_gpu);
+
+    // #463: variation is serial and owns the RNG (phase A); constant fitting
+    // and scoring never draw from it, so they run on the worker pool in draw
+    // order (phase B); the results are committed in draw order (phase C). The
+    // trajectory is the serial loop's, whatever `workers` is.
     while next.len() < pop && attempts < max_attempts {
-        attempts += 1;
-        GenCounters::count(counters, |c| &c.attempts);
-        // #120: with the policy on, a UCB/stratified cell elite supplies most
-        // parents; 5% still come from the global Pareto front. With the policy
-        // off this is exactly the #76 draw.
-        let p1 = pick_parent_policy(isl, front, qd, rng, front_p, qd_policy, qd_control);
-        let mut child = p1;
-        if rng.bool(0.5) {
-            let parent2 = pick_parent_policy(isl, front, qd, rng, front_p, qd_policy, qd_control);
-            crossover_with(&mut child, &parent2, rng, Some(aggs));
-        }
-        mutate_with(&mut child, rng, nvars, &cfg.ops, Some(aggs));
-        if rng.bool(0.5) {
+        let want = pop - next.len();
+        let mut trees: Vec<Node> = Vec::with_capacity(want);
+        while trees.len() < want && attempts < max_attempts {
+            attempts += 1;
+            GenCounters::count(counters, |c| &c.attempts);
+            // #120: with the policy on, a UCB/stratified cell elite supplies most
+            // parents; 5% still come from the global Pareto front. With the policy
+            // off this is exactly the #76 draw.
+            let p1 = pick_parent_policy(isl, front, qd, rng, front_p, qd_policy, qd_control);
+            let mut child = p1;
+            if rng.bool(0.5) {
+                let parent2 = pick_parent_policy(isl, front, qd, rng, front_p, qd_policy, qd_control);
+                crossover_with(&mut child, &parent2, rng, Some(aggs));
+            }
             mutate_with(&mut child, rng, nvars, &cfg.ops, Some(aggs));
-        }
+            if rng.bool(0.5) {
+                mutate_with(&mut child, rng, nvars, &cfg.ops, Some(aggs));
+            }
 
-        let mut tree = expr::simplify(&child);
-        if cfg.complexity_model.complexity(&tree) > cfg.max_complexity as f64 {
-            GenCounters::count(counters, |c| &c.too_complex); // #211
-            continue;
+            let tree = expr::simplify(&child);
+            if cfg.complexity_model.complexity(&tree) > cfg.max_complexity as f64 {
+                GenCounters::count(counters, |c| &c.too_complex); // #211
+                continue;
+            }
+            if cfg.dedup && !seen.insert(expr::structural_hash(&tree)) {
+                GenCounters::count(counters, |c| &c.duplicates); // #211
+                continue;
+            }
+            trees.push(tree);
         }
-        if cfg.dedup && !seen.insert(expr::structural_hash(&tree)) {
-            GenCounters::count(counters, |c| &c.duplicates); // #211
-            continue;
+        for ind in fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters) {
+            if ind.complexity > cfg.max_complexity as f64 {
+                GenCounters::count(counters, |c| &c.post_fit_drops); // #463
+                continue;
+            }
+            GenCounters::count(counters, |c| &c.offspring); // #211
+            let slot = next.len();
+            next.push(ind);
+            offer(&sink, slot, &next[slot]); // #119
         }
-
-        // #15: a multi-output shape keeps the constant slots that only some
-        // outputs need; it is fitted per output inside the evaluator.
-        // #14: otherwise fit on the objective the metric actually scores.
-        let mut fitted = None;
-        // #169: with the GPU-fit arm active the constants are moved by the
-        // batched kernel before scoring; fitting them here would hide the
-        // offload behind a CPU LM pass.
-        if cfg.fit_iters > 0 && !train.sample.is_multi() && !defers_fit_to_gpu(cfg, defer_gpu) {
-            fitted = fit_counted(counters, &mut tree, cfg, fit_sample, train.sample); // #85 #87 #211
-            tree = expr::simplify(&tree);
-        }
-        // #26: with the GPU batch active the fitness is filled in after every
-        // island has been generated; the CPU still owns simplification,
-        // fitting, de-duplication and the complexity/dimension checks.
-        let ind = if defer_gpu {
-            Ind::pending(tree, cfg)
-        } else {
-            eval_counted(counters, || Ind::evaluated_fitted(tree, fitted, train, cfg)) // #25 #87 #211
-        };
-        if ind.complexity > cfg.max_complexity as f64 {
-            continue;
-        }
-        GenCounters::count(counters, |c| &c.offspring); // #211
-        let slot = next.len();
-        next.push(ind);
-        offer(&sink, slot, &next[slot]); // #119
     }
 
     // Fill any remainder with fresh random trees.
-    while next.len() < pop {
-        let mut tree = expr::simplify(&random_tree_with(
-            rng,
-            nvars,
-            &cfg.ops,
-            cfg.init_depth,
-            Some(aggs),
-        ));
-        // #15: multi-output fits per output inside the evaluator.
-        // #14: otherwise fit on the objective the metric actually scores.
-        let mut fitted = None;
-        if cfg.fit_iters > 0 && !train.sample.is_multi() && !defers_fit_to_gpu(cfg, defer_gpu) {
-            fitted = fit_counted(counters, &mut tree, cfg, fit_sample, train.sample); // #85 #87 #211
-            tree = expr::simplify(&tree);
+    if next.len() < pop {
+        let trees: Vec<Node> = (next.len()..pop)
+            .map(|_| {
+                expr::simplify(&random_tree_with(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs)))
+            })
+            .collect();
+        for ind in fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters) {
+            let slot = next.len();
+            GenCounters::count(counters, |c| &c.offspring); // #211
+            next.push(ind);
+            offer(&sink, slot, &next[slot]); // #119
         }
-        // #26: same deferral for the random fill.
-        let slot = next.len();
-        GenCounters::count(counters, |c| &c.offspring); // #211
-        next.push(if defer_gpu {
-            Ind::pending(tree, cfg)
-        } else {
-            eval_counted(counters, || Ind::evaluated_fitted(tree, fitted, train, cfg)) // #25 #87 #211
-        });
-        offer(&sink, slot, &next[slot]); // #119
     }
 
     // #120: a small niche-immigrant stream. Without it mutation keeps the
@@ -4307,7 +4434,8 @@ fn evolve_island(
     if qd_policy {
         if let Some(target) = qd.and_then(|q| q.least_occupied_descriptor()) {
             let immigrants = (pop / 10).max(1).min(pop);
-            for k in 0..immigrants {
+            let mut trees: Vec<Node> = Vec::with_capacity(immigrants);
+            for _ in 0..immigrants {
                 let mut t = random_tree_with(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs));
                 let mut best_score = {
                     let d = qd::descriptor(&t, train.sample);
@@ -4322,19 +4450,17 @@ fn evolve_island(
                         best_score = score;
                     }
                 }
-                let mut tree = expr::simplify(&t);
-                let mut fitted = None;
-                if cfg.fit_iters > 0 && !train.sample.is_multi() {
-                    fitted = fit_counted(counters, &mut tree, cfg, fit_sample, train.sample); // #211
-                    tree = expr::simplify(&tree);
-                }
+                trees.push(expr::simplify(&t));
+            }
+            // Immigrants are fitted even when the batch defers scoring.
+            let fit_immigrants = cfg.fit_iters > 0 && !train.sample.is_multi();
+            let inds = fit_and_score(
+                trees, workers, cfg, train, fit_sample, fit_immigrants, defer_gpu, counters,
+            );
+            for (k, ind) in inds.into_iter().enumerate() {
                 let slot = pop - immigrants + k;
                 GenCounters::count(counters, |c| &c.offspring); // #211
-                next[slot] = if defer_gpu {
-                    Ind::pending(tree, cfg)
-                } else {
-                    eval_counted(counters, || Ind::evaluated_fitted(tree, fitted, train, cfg)) // #211
-                };
+                next[slot] = ind;
                 offer(&sink, slot, &next[slot]);
             }
         }
@@ -5125,6 +5251,8 @@ fn dev_generation(
         fit_cpu_s: GenCounters::seconds(counters, |c| &c.fit_ns) + fit.fallback_seconds,
         // Candidate scoring plus the evaluator's CPU fallback pool (wall).
         eval_cpu_s: GenCounters::seconds(counters, |c| &c.eval_ns) + fallback_s,
+        phase_b_s: GenCounters::seconds(counters, |c| &c.batch_ns),
+        post_fit_drops: GenCounters::total(counters, |c| &c.post_fit_drops) as usize,
         best_error,
         p05: q(0.05),
         p25: q(0.25),
@@ -6141,21 +6269,31 @@ fn run_search(
         } else {
             init_data
         };
+        // #463: the trees are drawn serially (the RNG order is fixed); scoring
+        // them does not touch the RNG and runs on the worker pool.
+        let mut init_trees: Vec<Node> = Vec::new();
         for isl in 0..cfg.islands.max(1) {
             let depth = cfg.init_depth.min(1 + isl % 3);
-            let mut pop = Vec::with_capacity(cfg.pop);
             for _ in 0..cfg.pop {
-                let tree =
-                    random_tree_with(&mut rng, nvars, &cfg.ops, depth, Some(&aggs));
+                init_trees.push(random_tree_with(&mut rng, nvars, &cfg.ops, depth, Some(&aggs)));
+            }
+        }
+        let mut init_inds = par_map(
+            batch_workers(cfg.threads, init_trees.len(), init_eval.sample.len()),
+            init_trees,
+            |tree| {
                 // #26: generation 0 is a whole generation too; defer it to the
                 // same batch as the first real generation.
-                pop.push(if defer_gpu {
+                if defer_gpu {
                     Ind::pending(tree, cfg)
                 } else {
                     Ind::evaluated(tree, init_eval, cfg) // #25 #85
-                });
-            }
-            islands.push(pop);
+                }
+            },
+        )
+        .into_iter();
+        for _ in 0..cfg.islands.max(1) {
+            islands.push(init_inds.by_ref().take(cfg.pop).collect());
         }
 
         gens_done = 0;
@@ -6452,6 +6590,8 @@ fn run_search(
             // ---- parallel generation across islands ---------------------
             let aggs_ref = &aggs;
             let eval_view = eval_data; // #27
+            // #463: islands share the thread budget.
+            let island_workers = (cfg.threads / islands.len().max(1)).max(1);
             // #76: the front from the previous generation is borrowed, not
             // copied, and the scope ends before this generation updates the
             // archive below. At generation 0 (or with the feature off) it is
@@ -6554,6 +6694,7 @@ fn run_search(
                                 cfg.qd_control, // #120 control
                                 sender.as_ref().map(|t| (t, i)), // #119
                                 dev_counters_ref, // #211
+                                island_workers, // #463
                             ) // #85
                         })
                     })
@@ -6654,16 +6795,21 @@ fn run_search(
                             .partial_cmp(&b.error)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     });
-                    let mut promoted: Vec<Ind> = Vec::with_capacity(promote);
-                    for mut ind in offspring.into_iter().take(promote) {
-                        let sol = refit_survivor(&ind.tree, &train_data, cfg);
-                        ind.tree = sol.tree;
-                        ind.error = sol.error;
-                        ind.complexity = sol.cost;
-                        promoted.push(ind);
-                        if dev_mark.is_some() {
-                            dev_refits += 1; // #211
-                        }
+                    let top: Vec<Ind> = offspring.into_iter().take(promote).collect();
+                    // #463: the refits are independent; results keep the order.
+                    let promoted: Vec<Ind> = par_map(
+                        batch_workers(cfg.threads, top.len(), train_data.sample.len()),
+                        top,
+                        |mut ind| {
+                            let sol = refit_survivor(&ind.tree, &train_data, cfg);
+                            ind.tree = sol.tree;
+                            ind.error = sol.error;
+                            ind.complexity = sol.cost;
+                            ind
+                        },
+                    );
+                    if dev_mark.is_some() {
+                        dev_refits += promoted.len(); // #211
                     }
                     let mut combined = parents;
                     combined.extend(promoted);
@@ -7459,10 +7605,10 @@ mod tests {
         s.y[1] = -2.0;
         assert_eq!(gpu_blocker(&cfg, &s), Some("auc needs a two-valued target"));
         // A metric outside the table keeps its named refusal, never MSE.
-        let cfg = Config { metric: Metric::Slope, ..Config::default() };
+        let cfg = Config { metric: Metric::ImplicitDerivative, ..Config::default() };
         assert_eq!(
             gpu_blocker(&cfg, &s),
-            crate::metrics::score_refusal(Metric::Slope)
+            crate::metrics::score_refusal(Metric::ImplicitDerivative)
         );
         assert!(gpu_blocker(&cfg, &s).is_some());
     }
@@ -7974,6 +8120,49 @@ mod tests {
         assert_eq!(gpu_status_label(7), Some("start_unusable"));
     }
 
+    /// #236: the device slope scorer differences row r against row r - 1, so a
+    /// pair list of any other shape keeps the CPU with a named reason.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn slope_device_admits_only_consecutive_pairs() {
+        let mut s = sample();
+        let n = s.len();
+        let cfg = Config { metric: Metric::Slope, ..Config::default() };
+        assert_eq!(gpu_blocker(&cfg, &s), None, "no pair list is the consecutive set");
+        s.pairs = Some(crate::fit::consecutive_pairs(n));
+        assert_eq!(gpu_blocker(&cfg, &s), None);
+        let reason = Some("slope pairs are not the consecutive rows of the training sample");
+        let mut boundary = crate::fit::consecutive_pairs(n);
+        boundary.remove(9);
+        s.pairs = Some(boundary);
+        assert_eq!(gpu_blocker(&cfg, &s), reason, "a group boundary drops a pair");
+        let mut shuffled = crate::fit::consecutive_pairs(n);
+        shuffled[3] = [2, 5];
+        s.pairs = Some(shuffled);
+        assert_eq!(gpu_blocker(&cfg, &s), reason, "a non-adjacent pair");
+        let mut doubled = crate::fit::consecutive_pairs(n);
+        doubled[4] = doubled[5];
+        s.pairs = Some(doubled);
+        assert_eq!(gpu_blocker(&cfg, &s), reason, "a repeated pair");
+        let mut reversed = crate::fit::consecutive_pairs(n);
+        reversed[0] = [1, 0];
+        s.pairs = Some(reversed);
+        assert_eq!(gpu_blocker(&cfg, &s), reason, "a backward pair");
+        s.pairs = Some(crate::fit::consecutive_pairs(n));
+        let subsample = Config {
+            fit_rows: 10,
+            fit_strategy: crate::fit::FitStrategy::Gpu,
+            fit_iters: 4,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            gpu_blocker(&subsample, &s),
+            Some("slope pairs are not the consecutive rows of a --fit-rows/--fit-samples subsample")
+        );
+        s.w = vec![1.0; n];
+        assert!(gpu_blocker(&cfg, &s).is_some(), "slope has no weighted form");
+    }
+
     /// #229: a metric without a native device objective is labelled
     /// `metric_not_native`, and the gate keeps such a run off the fit path in
     /// the first place. `log_squashed` passes because the kernel fits it.
@@ -8000,16 +8189,26 @@ mod tests {
             };
             assert!(defers_fit_to_gpu(&cfg, true), "{metric:?} fits by least squares");
         }
-        for metric in [Metric::Slope, Metric::Correlation] {
-            let cfg = Config {
-                metric,
-                ..gpu_fit.clone()
-            };
-            assert!(
-                !defers_fit_to_gpu(&cfg, true),
-                "{metric:?} has no native device loss"
-            );
-        }
+        // #236: slope fits on the device from the squared warm start.
+        let slope = Config {
+            metric: Metric::Slope,
+            ..gpu_fit.clone()
+        };
+        assert!(defers_fit_to_gpu(&slope, true), "#236: slope is native");
+        // #430: the correlation family defers its fit to the device.
+        let correlation = Config {
+            metric: Metric::Correlation,
+            ..gpu_fit.clone()
+        };
+        assert!(defers_fit_to_gpu(&correlation, true), "#430: correlation is native");
+        let implicit = Config {
+            metric: Metric::ImplicitDerivative,
+            ..gpu_fit.clone()
+        };
+        assert!(
+            !defers_fit_to_gpu(&implicit, true),
+            "implicit has no native device loss"
+        );
         // #226: the median arm has its own exact device polish, so the fit is
         // deferred exactly like the rank family's.
         let median = Config {
@@ -8221,6 +8420,7 @@ mod tests {
                 0,     // #120 control
                 None,  // #119: synchronous test path
                 None,  // #211: no development log in this test
+                1,     // #463
             );
             let trees: Vec<Node> = isl.iter().map(|i| i.tree.clone()).collect();
             let errors: Vec<u64> = isl.iter().map(|i| i.error.to_bits()).collect();

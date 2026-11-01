@@ -54,6 +54,7 @@ fn config(depth: usize, seed: u32) -> Config {
         fit_strategy: FitStrategy::Gpu,
         metric: Metric::Squared,
         gpu: true,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
         pipeline_depth: depth,
         ..Default::default()
     }

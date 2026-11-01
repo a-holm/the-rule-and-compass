@@ -234,6 +234,7 @@ library methods only to *seed* or *pre-process*.
 | **Structural hashing + de-duplication** | Never evaluate two identical candidates in a generation. |
 | **Lexicographic parsimony pressure** | No size-penalty coefficient to tune; bloat is controlled at selection time. |
 | **Parallel islands** | Islands are independent, so they evolve on separate threads. |
+| **Parallel fit and score** (`--threads`, #463) | Inside an island, variation draws every offspring serially from the island RNG. The constant fits and scores of the batch then run on a pool of `std::thread::scope` workers, and the results are committed in draw order. Neither the fit nor the score touches the RNG, so the archive, populations and RNG states are bit-identical for every thread count. |
 | **Convergence / time-budget stopping** | Stop when there is nothing left to gain, or when a caller's deadline arrives. |
 
 ### 3.0 Constants are fitted to the scoring loss
@@ -257,7 +258,9 @@ is mathematically well posed:
 | `hinge`, `hinge_ordinary`, `hinge_squared` with `--fit-strategy gpu` | the same schedules in the batched kernel on the uploaded label sign (fit codes 6-8): `hinge_squared` Gauss-Newton steps with the active set re-derived at every assembly; `hinge_ordinary` logistic Fisher steps until the first rejected trial, then MM steps with two true-hinge Armijo halvings and an MM `f64` polish; `hinge` the logistic Fisher step. The kernel's loss statistic and every trial are the configured hinge form, the device scorer ranks on it, there is no per-candidate host gate, and finalists are refit by the CPU arm above. A single-class sample is labelled `single_class` and never fitted. See `gpu-backend.md`, section "Hinge on the batched kernel" |
 | `signed` | squared fit, then a **constrained least-squares projection** onto the zero-mean-residual manifold in exact `f64` (see §3.0.1); the coordinate polish runs only when the projection is declined |
 | `correlation`, `correlation_signed` | exact analytic gradient and Gauss–Newton curvature of `ρ` with weighted centred moments; an affine-in-constants tree uses the closed-form weighted least-squares/rank-one GEVP optimum, and an outer `a·T+b` gauge is frozen and renormalised. Degenerate variance scores exactly `1.0` |
-| `rank_correlation`, `median`, `maximum`, `interquartile`, `slope` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
+| `rank_correlation`, `median`, `maximum`, `interquartile` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
+| `slope` (#236) | squared fit, then IRLS on the first differences of the sample's slope pairs, then the coordinate polish on the pair slope. A pair `[a, b]` gives the row `√u·(∇f_b − ∇f_a)` with response `√u·g`, `g = (f_b − f_a) − (y_b − y_a)` and `u = 1/max(|g|, 1e-6)`; `min(iters, 4)` rounds of damped LM sweeps take two halvings judged on the true slope sum, and four undamped steps with one halving follow (`fit::slope_irls`). The squared fit sets the **level**: a constant that only shifts every prediction has a differenced column of exactly zero, so its step is zero and it keeps the squared-fit value. Kept only on a strictly lower slope |
+| `slope` with `--fit-strategy gpu` (#236) | the same squared start and the same IRLS in the batched kernel (fit code 9) on the consecutive rows of the resident sample, `f32` rounds and an `f64` polish; the kernel returns the incoming constants unless its answer is strictly lower on the `f64` slope sum. The device scorer ranks on slope, and finalists are refit by the CPU arm above. Only a sample whose slope pairs are its consecutive rows is admitted. See `gpu-backend.md`, section "Slope on the batched kernel" |
 | `rank_correlation`, `rank_correlation_signed` with `--fit-strategy gpu` (#230, signed: #231) | the same squared start and the same polish on the device: segmented radix sort, exact integer rank sums, first-improver ladder; `rank_correlation_signed` scores `1 − ρ` and can never accept a reflected model or an SSE/`|ρ|` proxy (#231); the fitness and the finalist refit stay on the CPU |
 | `median` with `--fit-strategy gpu` (#226) | the same squared start and the same ladder on the device: a segmented radix sort of the `|r|` bit patterns selects the exact `f64` median, two middle values averaged for even `n`; every trial is scored on that median, never on SSE. Fit-only: the fitness and the finalist refit stay on the CPU. Needs `n >= 4096` rows (the measured cost-model crossover) |
 | `interquartile` with `--fit-strategy gpu` (#232) | the same squared start and the same ladder on the same sort, averaging ranks `[⌊n/4⌋, ⌊3n/4⌋)` of `|r|` (all rows below `n = 4`) — the window is by rank, so a repeated boundary value cannot change it. Every trial is scored on that window mean, never on SSE. Fit-only, `n >= 4096` rows, and the score agrees with the CPU to `1e-12` relative (a fixed tree reduction, not bit-identical like the median) |
@@ -431,6 +434,14 @@ integer sums — no second kernel, no extra sort — and the proposal gate compa
 the **exact** oriented score, never SSE and never `|ρ|`. A proposal that is
 worse in SSE but better in signed ρ is accepted; a reflection is not. See
 [`gpu-backend.md`](gpu-backend.md#signed-rank-correlation-issue-231).
+
+### 3.0.2 Worker threads: `--threads` (#463)
+
+`--threads N` sets the worker budget (default: the CPU cores available to the process, which follows the affinity mask; `1` is the serial path). Islands share the budget: each gets `N / islands` workers, at least 1. The workers fit and score offspring, the generation 0 population, the screened refits and the final archive rescore.
+
+The loop is three phases. Phase A draws candidates with the island RNG until the batch is full (complexity and duplicate checks run here). Phase B fits, simplifies and scores the batch on the workers; work is handed out one candidate at a time, so uneven fit costs balance. Phase C commits the results in draw order and drops any candidate whose fitted tree exceeds `--max-complexity`; the island then returns to phase A for the missing slots. Phase C is rare (simplification after a fit folds constants); `--dev-log` reports the count as `variation.post_fit_drops` and the wall time of phase B as `phases.phase_b` (summed over islands). Batches of cheap fits (under 2048 training rows) use one worker per 16 candidates at most, because spawning workers costs more than the fits.
+
+`--threads` is not a saved search setting: a run checkpointed with `--threads 8` resumes with `--threads 1` to the same archive.
 
 ### 3.1 Measured results
 

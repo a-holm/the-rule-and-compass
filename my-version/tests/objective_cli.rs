@@ -205,3 +205,87 @@ fn the_default_run_has_no_objective_block() {
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(json(&out).get("objective").is_none());
 }
+
+/// Imports `csv` to a `.rcsb` store; `extra` columns are not added, so callers
+/// write the CSV they want.
+fn import_store(dir: &std::path::Path, csv: &str) -> String {
+    let store = dir.join("d.rcsb").to_string_lossy().into_owned();
+    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(["import", "--data", csv, "--out", &store, "--time", "t", "--quiet"])
+        .output()
+        .expect("run rcsr import");
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    store
+}
+
+fn write_csv_with_funding(dir: &std::path::Path) -> String {
+    let base = std::fs::read_to_string(write_csv(dir, "base.csv", None)).unwrap();
+    let mut text = String::new();
+    for (i, line) in base.lines().enumerate() {
+        if i == 0 {
+            text.push_str(&format!("{},f\n", line));
+        } else {
+            text.push_str(&format!("{},0.0001\n", line));
+        }
+    }
+    let path = dir.join("fund.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn projection_columns(dir: &std::path::Path, data: &str, spec: &str, extra: &[&str]) -> (Output, Vec<String>) {
+    let path = dir.join("manifest.json");
+    let mut args = extra.to_vec();
+    args.extend_from_slice(&["--run-manifest", path.to_str().unwrap()]);
+    let o = run(data, spec, &args);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let j = Json::parse(std::fs::read_to_string(&path).unwrap().trim()).expect("manifest parses");
+    let cols = at(&j, &["projection", "columns"]);
+    let Json::Arr(items) = cols else { panic!("projection.columns is not an array") };
+    let names = items.iter().map(|c| c.as_str().unwrap().to_string()).collect();
+    (o, names)
+}
+
+#[test]
+fn a_projected_store_read_keeps_the_return_column() {
+    let dir = scratch();
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let store = import_store(&dir, &write_csv(&dir, "d.csv", None));
+    let (out, cols) = projection_columns(&dir, &store, &spec, PNL);
+    assert!(json(&out).get("objective").is_some());
+    assert!(cols.contains(&"r".to_string()), "{cols:?}");
+}
+
+#[test]
+fn a_projected_store_read_keeps_the_funding_column() {
+    let dir = scratch();
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let store = import_store(&dir, &write_csv_with_funding(&dir));
+    let mut extra = PNL.to_vec();
+    extra.extend_from_slice(&["--funding", "f"]);
+    let (out, cols) = projection_columns(&dir, &store, &spec, &extra);
+    let paid = num(&json(&out), &["objective", "validation", "funding_paid"]);
+    assert!(paid.is_finite(), "{paid}");
+    assert!(cols.contains(&"f".to_string()), "{cols:?}");
+}
+
+#[test]
+fn the_projection_without_an_objective_is_unchanged() {
+    let dir = scratch();
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let store = import_store(&dir, &write_csv(&dir, "d.csv", None));
+    let (_, cols) = projection_columns(&dir, &store, &spec, &["--validation-frac", "0.3"]);
+    assert_eq!(cols, vec!["t", "x1", "x2", "y"]);
+}
+
+#[test]
+fn a_missing_return_column_names_the_target_spec() {
+    let dir = scratch();
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let text = std::fs::read_to_string(&spec).unwrap().replace("\"return_column\":\"r\"", "\"return_column\":\"gone\"");
+    std::fs::write(&spec, text).unwrap();
+    let store = import_store(&dir, &write_csv(&dir, "d.csv", None));
+    let out = run(&store, &spec, PNL);
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    assert!(stderr(&out).contains("declares return_column 'gone'"), "{}", stderr(&out));
+}

@@ -425,7 +425,11 @@ SEARCH:
                              data order and in the same group (--group-by, or
                              one group), whatever the split shuffles; fewer
                              than 32 such training pairs is a usage error that
-                             points at --split temporal.
+                             points at --split temporal. The GPU scores and
+                             fits slope only when those pairs are the
+                             consecutive training rows (a single series under
+                             --split temporal); otherwise the CPU scores it and
+                             backend_reason names the cause.
   --implicit                 fit an implicit relation f(inputs, target) = 0: the
                              target becomes one extra input (normalised with its
                              training mean/std) and the fit target is 0. Plain
@@ -536,7 +540,11 @@ SEARCH:
                              by logistic then majorise-minimise steps, hinge by
                              the logistic step; every trial judged on the
                              configured hinge, finalists refit exactly, a
-                             single-class sample labelled single_class), the exact correlation
+                             single-class sample labelled single_class), slope
+                             by IRLS on the first differences of consecutive
+                             rows from the squared warm start, keeping the
+                             incoming constants unless the slope improves and
+                             the additive level at the squared fit (#236), the exact correlation
                              objective 1-|rho| or 1-rho with a frozen affine
                              gauge (correlation_signed refines both gauge
                              orientations; a tree affine in every constant takes
@@ -629,9 +637,10 @@ SEARCH:
                              the GPU automatically when the #287 score table
                              names a native scorer: squared, absolute,
                              log_squashed, signed, maximum, correlation,
-                             correlation_signed, aic/aicc/bic and the
-                             classification family through the objective
-                             kernel, and median, interquartile,
+                             correlation_signed, aic/aicc/bic, the
+                             classification family and slope (when the training
+                             pairs are its consecutive rows, #236) through the
+                             objective kernel, and median, interquartile,
                              rank_correlation, rank_correlation_signed and auc
                              through the exact f64 order-statistic/rank batch
                              scorer (#288) from 4096 rows (a two-valued target
@@ -717,6 +726,12 @@ SEARCH:
                              uniformly instead of the UCB1 mix
   --qd-random                control: hash descriptors to random cells, so the
                              partition carries no behaviour information
+  --threads <N>              worker threads for constant fitting and scoring of
+                             offspring, inside each island (default: the CPU
+                             cores available to the process; 1 = serial). The
+                             islands share the budget: N / islands per island.
+                             Results, archive and checkpoints are identical for
+                             every value
   --pipeline-depth <N>       overlap CPU generation with GPU scoring using a
                              bounded pending queue of N batches (default 2; 0 =
                              synchronous). Results and archive are identical;
@@ -1725,9 +1740,7 @@ fn dev_run_start(
         seed: cfg.seed,
         backend: backend.to_string(),
         device,
-        threads: std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
+        threads: cfg.threads,
         host: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         start_utc: manifest::utc_now(),
@@ -2041,6 +2054,10 @@ fn main() {
     let mut gpu_explicit: Option<bool> = None;
     // #293: `--gpu-memory`, a device memory cap for the plan.
     let mut gpu_memory: Option<u64> = None;
+    // #463: `--threads`, worker threads for fitting and scoring offspring.
+    let mut threads: usize = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     // #438: `--dispatch auto|device`.
     let mut dispatch_mode = rcsr::dispatch::DispatchMode::Auto;
     let mut data_path: Option<String> = None;
@@ -2660,6 +2677,17 @@ fn main() {
             "--gpu" => {
                 cfg.gpu = true;
                 gpu_explicit = Some(true);
+            }
+            // #463: scheduling only; results are identical for every value.
+            "--threads" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if (1..=1024).contains(&n) => threads = n,
+                    _ => {
+                        eprintln!("error: --threads needs an integer from 1 to 1024, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
             }
             // #293: caps the device memory the plan may use.
             "--gpu-memory" => {
@@ -3673,6 +3701,24 @@ fn main() {
                     }
                     if let Some(c) = target_resolved.as_ref().and_then(|r| r.spec.scale_column()) {
                         pnames.push(c.to_string());
+                    }
+                    let trading_requested = objective_arg
+                        .as_deref()
+                        .is_some_and(|o| rcsr::trading::Objective::parse(o).is_ok_and(|o| o.is_trading()));
+                    if trading_requested {
+                        if let Some(c) = target_resolved.as_ref().and_then(|r| r.spec.return_column.as_deref()) {
+                            if !fs.header().names().iter().any(|n| n == c) {
+                                eprintln!(
+                                    "error: target spec '{}' declares return_column '{}', which is not in {}",
+                                    target_names[0], c, data_path
+                                );
+                                std::process::exit(EXIT_INPUT);
+                            }
+                            pnames.push(c.to_string());
+                        }
+                        if let Some(f) = trade_funding.as_deref() {
+                            pnames.push(f.to_string());
+                        }
                     }
                     pnames.sort();
                     pnames.dedup();
@@ -5072,6 +5118,7 @@ fn main() {
     // suppresses the note and the one-line resource summary.
     cfg.gpu_notes = !quiet;
     cfg.gpu_memory = gpu_memory;
+    cfg.threads = threads; // #463
     // #293: the device memory plan runs before the search allocates anything.
     // A refused fit stage, or a refused eval stage under an explicit `--gpu`,
     // is a usage error naming the bytes and the smallest fix.
@@ -6698,14 +6745,15 @@ fn main() {
                     .or_else(|| gpu_probe.reason.clone())
             };
             let backend_json = format!(
-                "\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},",
+                "\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"threads\":{},",
                 outcome.backend.name(),
                 backend_reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
                 outcome
                     .device
                     .as_deref()
                     .map(jstr)
-                    .unwrap_or_else(|| "null".to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+                cfg.threads, // #463
             );
             let backend_json = match &objective_report {
                 Some(rep) => format!(

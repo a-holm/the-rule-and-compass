@@ -358,14 +358,18 @@ fn non_squared_metric_on_gpu_prints_the_reason_and_matches_the_cpu() {
         "the configured objective is still slope, json: {stdout}"
     );
     assert!(stdout.contains("\"backend\":\"cpu\""), "json: {stdout}");
+    // #236: the default random split leaves shuffled slope pairs, which the
+    // device scorer cannot difference.
     assert!(
         stdout.contains(
-            "\"backend_reason\":\"slope needs a cross-row first-difference pass\""
+            "\"backend_reason\":\"slope pairs are not the consecutive rows of the training sample\""
         ),
         "the fallback must carry its named cause, json: {stdout}"
     );
     assert!(
-        stderr.contains("# gpu: off (slope needs a cross-row first-difference pass)"),
+        stderr.contains(
+            "# gpu: off (slope pairs are not the consecutive rows of the training sample)"
+        ),
         "the reason must be printed once, got: {stderr}"
     );
     assert!(
