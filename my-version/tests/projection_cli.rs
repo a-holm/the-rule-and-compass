@@ -316,3 +316,16 @@ mod serde_lite {
         }
     }
 }
+
+#[test]
+fn row_expr_columns_lists_the_columns_an_expression_reads() {
+    let names: Vec<String> = ["ts", "a", "b", "c"].iter().map(|s| s.to_string()).collect();
+    let cols = |src: &str| data::row_expr_columns(src, &names);
+    assert_eq!(cols("ts >= 5").unwrap(), vec!["ts"]);
+    assert_eq!(
+        cols("(c > 1 and ts < 9) or (a > b and ts > 2)").unwrap(),
+        vec!["c", "ts", "a", "b"]
+    );
+    assert!(cols("nope > 1").is_err());
+    assert!(cols("a >").is_err());
+}
