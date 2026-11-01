@@ -22,7 +22,7 @@ const WINDOWS: usize = 4;
 const HOUR: i64 = 3600;
 
 fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+    std::env::var(key).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.to_string())
 }
 
 fn rcsr(args: &[String]) -> (i32, String, String) {
@@ -95,6 +95,7 @@ struct ArmResult {
     front: usize,
     search_s: f64,
     sec_per_gen: f64,
+    eval_s: f64,
     fit_s: f64,
     device_frac: f64,
     wf_net: f64,
@@ -118,7 +119,7 @@ fn run_arm(dir: &Path, feat: &Path, spec: &Path, arm: &Arm, generations: usize, 
     a.extend(s(&["--patience", "0", "--fitness", arm.fitness, "--seed", &arm.seed.to_string()]));
     a.extend(s(&["--generations", &generations.to_string()]));
     a.extend(s(&[if arm.backend == "gpu" { "--gpu" } else { "--cpu" }]));
-    a.extend(s(&["--json-out", run.to_str().unwrap(), "--dev-log", dev.to_str().unwrap(), "--json"]));
+    a.extend(s(&["--json-out", run.to_str().unwrap(), "--dev-log", dev.to_str().unwrap(), "--dev-log-every", "1", "--json"]));
     must(&a);
 
     let r = Json::parse(&std::fs::read_to_string(&run).unwrap()).unwrap();
@@ -126,17 +127,26 @@ fn run_arm(dir: &Path, feat: &Path, spec: &Path, arm: &Arm, generations: usize, 
         Some(Json::Arr(v)) => v.len(),
         _ => 0,
     };
-    let end = std::fs::read_to_string(&dev)
-        .unwrap()
-        .lines()
-        .filter_map(Json::parse)
+    let events: Vec<Json> = std::fs::read_to_string(&dev).unwrap().lines().filter_map(Json::parse).collect();
+    let end = events
+        .iter()
         .find(|e| e.get("event").and_then(Json::as_str) == Some("run_end"))
         .expect("dev log has no run_end");
-    let search_s = num(&end, &["search"]);
+    let phase = |name: &str| -> f64 {
+        events
+            .iter()
+            .filter(|e| e.get("event").and_then(Json::as_str) == Some("generation"))
+            .map(|e| opt_num(e, &["phases", name]))
+            .sum()
+    };
+    let search_s = num(end, &["search"]);
 
     let mut w = s(&["walkforward", "--data", feat.to_str().unwrap(), "--front", run.to_str().unwrap()]);
     w.extend(s(&["--time", "ts", "--group-by", "symbol"]));
     w.extend(s(&["--threshold-fixed", "0", "--validation-frac", "0.2", "--bootstrap", "1000", "--block-len", "24"]));
+    if front > 1 {
+        w.push("--select-band".to_string());
+    }
     w.extend(s(&["--json", "--out", wf_out.to_str().unwrap()]));
     for win in windows {
         w.extend(s(&["--window", win]));
@@ -157,14 +167,15 @@ fn run_arm(dir: &Path, feat: &Path, spec: &Path, arm: &Arm, generations: usize, 
         front,
         search_s,
         sec_per_gen: search_s / generations as f64,
-        fit_s: opt_num(&end, &["fit_kernel_s"]),
-        device_frac: opt_num(&end, &["device_fraction_of_run"]),
+        eval_s: phase("eval"),
+        fit_s: phase("fit"),
+        device_frac: opt_num(end, &["device_fraction_of_run"]),
         wf_net: opt_num(&wf, &["pooled", "total_return"]),
         wf_min_window: window_returns.iter().cloned().fold(f64::INFINITY, f64::min),
         wf_trades: opt_num(&wf, &["pooled", "trades"]),
         wf_exposure: opt_num(&wf, &["pooled", "exposure"]),
         wf_sharpe: opt_num(&wf, &["pooled", "sharpe"]),
-        wf_dsr: opt_num(&wf, &["inference", "dsr_at_n_eff", "dsr"]),
+        wf_dsr: opt_num(&wf, &["inference", "multiple_testing", "dsr_at_n_eff", "dsr"]),
         wf_se: opt_num(&wf, &["inference", "bootstrap", "mean_ci", "se"]) * opt_num(&wf, &["pooled", "periods"]),
     }
 }
@@ -195,7 +206,7 @@ fn pnl_fitness_against_metric_fitness() {
         .map(|k| format!("w{},{},{},{},{}", k + 1, t0, first + k * step - 5 * HOUR, first + k * step, first + (k + 1) * step - HOUR))
         .collect();
 
-    println!("backend fitness seed | val_net test_net test_sharpe test_trades test_exposure front | search_s s/gen fit_s dev_frac | wf_net wf_min_win wf_trades wf_exposure wf_sharpe wf_dsr wf_se");
+    println!("backend fitness seed | val_net test_net test_sharpe test_trades test_exposure front | search_s s/gen eval_s fit_s dev_frac | wf_net wf_min_win wf_trades wf_exposure wf_sharpe wf_dsr wf_se");
     let mut rows: Vec<(&str, &str, u64, ArmResult)> = Vec::new();
     for backend in &backends {
         let backend: &'static str = if backend == "gpu" { "gpu" } else { "cpu" };
@@ -203,9 +214,9 @@ fn pnl_fitness_against_metric_fitness() {
             for fitness in ["metric", "pnl"] {
                 let r = run_arm(&dir, &feat, &spec, &Arm { backend, fitness, seed }, generations, &windows);
                 println!(
-                    "{backend} {fitness} {seed} | {:.4} {:.4} {:.3} {} {:.3} {} | {:.1} {:.3} {:.1} {:.3} | {:.4} {:.4} {} {:.3} {:.3} {:.3} {:.4}",
+                    "{backend} {fitness} {seed} | {:.4} {:.4} {:.3} {} {:.3} {} | {:.1} {:.3} {:.1} {:.1} {:.3} | {:.4} {:.4} {} {:.3} {:.3} {:.3} {:.4}",
                     r.val_net, r.test_net, r.test_sharpe, r.flips, r.exposure, r.front, r.search_s, r.sec_per_gen,
-                    r.fit_s, r.device_frac, r.wf_net, r.wf_min_window, r.wf_trades, r.wf_exposure, r.wf_sharpe, r.wf_dsr, r.wf_se
+                    r.eval_s, r.fit_s, r.device_frac, r.wf_net, r.wf_min_window, r.wf_trades, r.wf_exposure, r.wf_sharpe, r.wf_dsr, r.wf_se
                 );
                 rows.push((backend, fitness, seed, r));
             }
