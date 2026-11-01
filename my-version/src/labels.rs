@@ -1,3 +1,19 @@
+    fn keep_fn(&self) -> impl Fn(i64) -> bool {
+        let purge = self.spec.purge_seconds();
+        let ranges = [self.range, self.also];
+        let embargo = self.embargo;
+        move |t: i64| ranges.iter().flatten().all(|r| t + purge <= r.start || t >= r.end + embargo)
+    }
+
+    /// Builds the labels of one series with the weights normalised over the
+    /// development rows of the declared ranges.
+    pub fn build(&self, bars: &[Bar], funding: Option<&[f64]>) -> Result<LongLabels, String> {
+        build_keep(bars, &self.spec, funding, &self.keep_fn())
+    }
+
+    pub fn add(&mut self, symbol: &str, labels: &LongLabels) {
+        let symbol = (!symbol.is_empty()).then_some(symbol);
+        let keep = self.keep_fn();
 //! Long-only horizon, action and triple-barrier labels (exact CPU f64).
 //!
 //! For a row at bar `t`, horizon `h` bars and delay `d` bars:
@@ -258,6 +274,8 @@ pub struct LongLabels {
     pub weight: Vec<f64>,
     /// Average uniqueness of each valid row.
     pub uniqueness: Vec<f64>,
+    /// Valid rows the weights are normalised over.
+    pub weight_norm_rows: usize,
     cost_total: Vec<f64>,
     end_idx: Vec<usize>,
 }
@@ -293,6 +311,17 @@ fn sigma_at(bars: &[Bar], t: usize, w: usize, step: i64) -> Option<f64> {
 /// of a long perp position in log-return units; pass `None` without a verified
 /// funding column.
 pub fn build(bars: &[Bar], spec: &LongLabelSpec, funding: Option<&[f64]>) -> Result<LongLabels, String> {
+    build_keep(bars, spec, funding, &|_| true)
+}
+
+/// [`build`] with the uniqueness weights normalised over the rows whose stamp
+/// satisfies `keep` (the development rows).
+pub fn build_keep(
+    bars: &[Bar],
+    spec: &LongLabelSpec,
+    funding: Option<&[f64]>,
+    keep: &dyn Fn(i64) -> bool,
+) -> Result<LongLabels, String> {
     spec.validate()?;
     if let Some(f) = funding {
         if f.len() != bars.len() {
@@ -318,6 +347,7 @@ pub fn build(bars: &[Bar], spec: &LongLabelSpec, funding: Option<&[f64]>) -> Res
         exit_kind: vec![EXIT_NONE; n],
         weight: nan.clone(),
         uniqueness: nan.clone(),
+        weight_norm_rows: 0,
         cost_total: nan,
         end_idx: vec![0; n],
     };

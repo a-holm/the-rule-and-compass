@@ -539,3 +539,79 @@ fn label_family_columns_are_refused_as_inputs_by_the_d13a_canary() {
     );
     assert!(view.map(|v| !v.columns.iter().any(|c| c.starts_with("lbl_"))).unwrap_or(true));
 }
+
+fn noisy(n: usize, seed: u64, locked: std::ops::Range<usize>) -> Vec<Bar> {
+    let mut rng = Mt::new(seed);
+    let mut p = 100.0;
+    (0..n)
+        .map(|i| {
+            let amp = if locked.contains(&i) { 0.02 } else { 0.004 };
+            let o = p;
+            p *= 1.0 + amp * (rng.next_f64() - 0.5);
+            let c = p;
+            bar(i, o, o.max(c) * (1.0 + 0.5 * amp * rng.next_f64()), o.min(c) * (1.0 - 0.5 * amp * rng.next_f64()), c)
+        })
+        .collect()
+}
+
+#[test]
+fn uniqueness_weights_ignore_locked_prices() {
+    let n = 300;
+    let (a, b) = (150usize, 200usize);
+    let mut s = spec("h3", 3);
+    s.stride = 1;
+    // Two series that agree on every bar outside the locked range.
+    let base = noisy(n, 1, a..b);
+    let mut other = base.clone();
+    let alt = noisy(n, 2, a..b);
+    for i in a..b {
+        other[i] = alt[i];
+    }
+    let range = labels::Lockbox { start: T0 + a as i64 * HOUR, end: T0 + b as i64 * HOUR };
+    let embargo = 10 * HOUR;
+    let acc = labels::LabelAccumulator::with_range(&s, Some(range)).with_embargo(embargo);
+    let (x, y) = (acc.build(&base, None).unwrap(), acc.build(&other, None).unwrap());
+    let (px, py) = (build(&base, &s, None).unwrap(), build(&other, &s, None).unwrap());
+    let purge = s.purge_seconds();
+    let (mut outside, mut plain_differs) = (0, 0);
+    for t in 0..n {
+        let time = T0 + t as i64 * HOUR;
+        let outside_span = time + purge <= range.start || time >= range.end + embargo;
+        if outside_span && x.weight[t].is_finite() {
+            outside += 1;
+            assert_eq!(x.weight[t].to_bits(), y.weight[t].to_bits(), "row {t}");
+            plain_differs += (px.weight[t].to_bits() != py.weight[t].to_bits()) as usize;
+        }
+    }
+    assert!(outside > 200, "{outside}");
+    assert!(plain_differs > 100, "plain weights must depend on locked prices: {plain_differs}");
+    let norm = x.weight_norm_rows;
+    assert_eq!(norm, outside);
+    let mean: f64 = (0..n)
+        .filter(|&t| x.weight[t].is_finite() && (T0 + t as i64 * HOUR + purge <= range.start || T0 + t as i64 * HOUR >= range.end + embargo))
+        .map(|t| x.weight[t])
+        .sum::<f64>()
+        / norm as f64;
+    assert!((mean - 1.0).abs() < 1e-12, "{mean}");
+}
+
+#[test]
+fn uniqueness_weights_without_a_range_match_the_plain_build() {
+    let bars = noisy(120, 3, 0..0);
+    let s = spec("h3", 3);
+    let plain = build(&bars, &s, None).unwrap();
+    let acc = labels::LabelAccumulator::new(&s).with_embargo(10 * HOUR);
+    let kept = acc.build(&bars, None).unwrap();
+    assert_eq!(plain.label_hash(), kept.label_hash());
+    assert_eq!(plain.weight_norm_rows, plain.report().valid_rows);
+}
+
+#[test]
+fn uniqueness_weights_are_nan_when_every_row_is_refused() {
+    let bars = noisy(60, 4, 0..0);
+    let s = spec("h3", 3);
+    let range = labels::Lockbox { start: T0, end: T0 + 100 * HOUR };
+    let l = labels::LabelAccumulator::with_range(&s, Some(range)).build(&bars, None).unwrap();
+    assert_eq!(l.weight_norm_rows, 0);
+    assert!(l.weight.iter().all(|w| w.is_nan()));
+}
