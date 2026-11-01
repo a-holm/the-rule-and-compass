@@ -321,3 +321,62 @@ fn ladder_on_a_final_ledger_reads_once() {
     assert_eq!(code, 3, "{}", err);
     assert!(err.contains("baseline_read"), "{}", err);
 }
+
+#[test]
+fn a_final_read_never_scores_the_locked_rows_of_the_other_candidates() {
+    use rcsr::walkforward::{self, EvalSpec, Policy, ProtocolOptions, Window};
+    let mut csv = String::from("ts,x,z,target\n");
+    for i in 0..200i64 {
+        let x = ((i * 37) % 17) as f64 - 8.0;
+        let y = 0.0003 * x + (((i * 13) % 7) as f64 - 3.0) * 0.0004;
+        // z * z is finite on development rows and overflows on the locked rows
+        let z = if i >= 150 { 1e200 } else { 1000.0 };
+        csv.push_str(&format!("{},{},{},{}\n", i, x, z, y));
+    }
+    let table = rcsr::data::parse_table(&csv).unwrap();
+    let spec = |exprs: &[&str]| EvalSpec {
+        expression: exprs[0].to_string(),
+        vars: vec!["x".to_string(), "z".to_string()],
+        target: "target".to_string(),
+        time: "ts".to_string(),
+        group: None,
+        windows: vec![Window {
+            label: "locked".to_string(),
+            train_start: 0.0,
+            train_end: 120.0,
+            test_start: 150.0,
+            test_end: 200.0,
+        }],
+        horizon: 0.0,
+        embargo: None,
+        cost_bps: 10.0,
+        threshold_quantile: 0.70,
+        threshold_fixed: None,
+        validation_frac: 0.3,
+        periods_per_year: Some(365.0),
+        candidates: if exprs.len() > 1 { exprs.iter().map(|e| e.to_string()).collect() } else { Vec::new() },
+        band_select: false,
+        pool_reset_flat: false,
+        allow_lockbox: false,
+        device_pnl: false,
+        control_seed: 0,
+        policy: Policy::Threshold,
+        band_width: 0.0,
+        min_hold: 1,
+        gpu: false,
+    };
+    let both = spec(&["x", "z*z"]);
+    let full = walkforward::run_table_with(&table, &both, "t", &ProtocolOptions::default()).unwrap();
+    assert_eq!(full.windows[0].candidate, 0);
+    assert!(full.windows[0].dropped_rows > 0, "the non-final run scores z*z on the locked rows");
+
+    let opts = ProtocolOptions { final_read: true, ..ProtocolOptions::default() };
+    let fin = walkforward::run_table_with(&table, &both, "t", &opts).unwrap();
+    assert_eq!(fin.windows[0].candidate, 0);
+    assert_eq!(fin.windows[0].dropped_rows, 0, "z*z was not evaluated on a locked row");
+    // the result equals the run of the selected candidate alone
+    let alone = walkforward::run_table_with(&table, &spec(&["x"]), "t", &ProtocolOptions::default()).unwrap();
+    assert_eq!(format!("{:?}", fin.windows[0].metrics), format!("{:?}", alone.windows[0].metrics));
+    assert_eq!(fin.windows[0].test_rows, alone.windows[0].test_rows);
+    assert_eq!(fin.windows[0].validation_error, full.windows[0].validation_error);
+}
