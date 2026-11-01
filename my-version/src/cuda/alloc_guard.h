@@ -7,7 +7,8 @@
  *
  * Test hook: when rc_fault_alloc_armed is set, the helpers ask
  * rc_fault_alloc_hit() whether to refuse this allocation before cudaMalloc is
- * called. The state lives in enrich.cu. */
+ * called. The state lives in enrich.cu and is thread_local, so a refusal armed
+ * by one test never reaches another thread. */
 #ifndef RCSR_ALLOC_GUARD_H
 #define RCSR_ALLOC_GUARD_H
 
@@ -17,7 +18,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-extern volatile int rc_fault_alloc_armed;
+extern thread_local volatile int rc_fault_alloc_armed;
 int rc_fault_alloc_hit(void);
 #ifdef __cplusplus
 }

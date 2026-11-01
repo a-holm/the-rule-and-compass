@@ -155,7 +155,7 @@ fn compiles_eval_cu_for_sm_121_without_a_gpu() {
     let compiled = run(Command::new(&nvcc)
         .args([
             "-O3",
-            "-std=c++14",
+            "-std=c++17",
             "-arch=sm_121",
             "-DRCSR_UNIFIED=1",
             "-cubin",
