@@ -1262,7 +1262,7 @@ pub fn build_base(opts: &BaseOptions) -> Result<BaseSummary, String> {
     store::write_store_with_time(&opts.out, &table, opts.group_rows, Some(0))?;
     let mut text = base_manifest(opts, &syms, &inputs, &overlap, guard.allow, &route, universe.as_ref());
     if let Some(lt) = &declared {
-        text = crate::lockbox::insert_declaration(&text, lt, None, "rcsr panel base --locked-test");
+        text = crate::lockbox::insert_declaration(&text, lt, None, None, "rcsr panel base --locked-test");
     }
     let manifest_path = format!("{}.manifest.json", opts.out);
     std::fs::write(&manifest_path, text).map_err(|e| format!("{}: {}", manifest_path, e))?;
@@ -1946,11 +1946,16 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
     debug_assert!(panel.rows.iter().zip(&asm.rows).all(|(a, b)| a == &b.row));
     let table = v2_table(&asm.rows);
     store::write_store_with_time(&opts.out, &table, opts.group_rows, Some(0))?;
-    crate::registry::write_schema_declared(
+    let embargo_floor = crate::lockbox::declared_embargo(&opts.base)
+        .map_err(|e| e.message)?
+        .map_or(0, |(_, s)| s)
+        .max(panel::membership_embargo_seconds(&opts.membership));
+    crate::registry::write_schema_embargo(
         &opts.out,
         crate::registry::DEFAULT_PANEL_VERSION,
         declared.as_ref(),
         also.as_ref(),
+        Some(embargo_floor),
     )?;
     let ledger_misses = ledger_violations(&asm.rows, &membership);
     let snapshot_text = match &opts.snapshot {
@@ -1989,6 +1994,11 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
             )
         })
         .unwrap_or_default();
+    let locked = format!(
+        "{}  \"lockbox_embargo\":{},\n",
+        locked,
+        crate::lockbox::embargo_json(embargo_floor, "membership", crate::enrich::EMBARGO_RULE, 3600)
+    );
     text.insert_str(at, &format!("{}  \"v2\":{},\n", locked, block));
     let manifest_path = format!("{}.manifest.json", opts.out);
     std::fs::write(&manifest_path, text).map_err(|e| format!("{}: {}", manifest_path, e))?;
