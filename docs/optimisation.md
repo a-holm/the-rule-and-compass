@@ -482,9 +482,8 @@ generations. Third, **parsimony**: recovered formulas print as `1 + 2·x` and
 
 Ordered by expected gain per unit effort **[planned]**:
 
-1. **Linear scaling** around the fitness function (`y = a·f(x) + b` in closed
-   form). Cheap, and it makes the *ranking* of unscaled candidates much more
-   informative during early generations.
+1. **Linear scaling** is implemented as the opt-in `--linear-scaling` and
+   measured in §3.2.2.
 2. **Column-oriented (SoA) evaluation with cached sub-terms.** Move the data
    matrix to one contiguous array per variable and evaluate node-by-node over
    whole columns, caching each node's column. Re-evaluation after a local
@@ -501,6 +500,21 @@ Ordered by expected gain per unit effort **[planned]**:
    it, so later runs begin with the best shapes found so far, rather than
    rediscovering them. (Pareto-front parent feedback *within* a run is
    implemented and measured in §3.2.1.)
+
+### 3.2.2 Linear scaling (#470)
+
+`--linear-scaling` wraps every candidate shape `f` in `add(a, mul(b, f))`. The two coefficients are ordinary constants, so every fitter, evaluator and device path sees a plain tree. Variation edits the bare shape: a parent is peeled (either child order), the child inherits the parent map as its warm start and is wrapped again. The CPU fit first replaces the map with the closed-form weighted least squares of the shape on the fit rows (centred moments, rescaled by the largest deviation), then runs the configured fitter on all constants. A constant-free shape gives a tree affine in its constants, which `--fit-strategy auto` solves in closed form. On the device the map is two constants of the batched LM; a new offspring starts from the first parent map, or `(0, 1)` for a random tree. The complexity cap grows by the cost of the wrapper, and the front reports the wrapped formula with its full complexity. The flag needs a least-squares metric, constant fitting and a single target; it is not available with `--variation postfix`, which is fit-free.
+
+Measured on the #462 bench, CPU, `hard` suite, noise 0, seeds 1-10 (200 paired runs), `rcsr-bench compare` against the same build without the flag:
+
+| criterion | base | `--linear-scaling` | discordant (base only, treat only) | McNemar p |
+|---|---|---|---|---|
+| `oracle_recovered` | 70/200 (35.0 %) | 62/200 (31.0 %) | 23, 15 | 0.256 |
+| `recovered` | 171/200 (85.5 %) | 176/200 (88.0 %) | 5, 10 | 0.302 |
+
+Median paired `hit_evals` ratio 0.594 over 166 pairs; median paired `hit_s` ratio 1.04; summed `seconds` 700.0 and 860.7 (+23 %). Per problem, `oracle_recovered` rises on `korns4` (5 to 10 of 10), `feynman_i6_2`, `keijzer11`, `keijzer14`, and falls on `nguyen9` (9 to 1), `feynman_i12_11` (7 to 2), `keijzer15` (8 to 6), `nguyen6`. `signal` suite, CPU, seeds 1-2 (6 paired runs, the other 8 seeds not run): `signal_recovered` 6/6 against 4/6 with the flag (discordant 2, 0; p = 0.50); `distractors_used` per run 0, 1, 0, 0, 0, 3 against 0, 2, 0, 0, 0, 0; summed `seconds` 279.2 and 420.3. Device arm, `hard`, noise 0, seeds 1-3, `--gpu --fit-strategy default`: all 120 runs report `backend: gpu`; `oracle_recovered` 19/60 against 20/60 (discordant 3, 4; p = 1.0); summed `seconds` 113.5 and 166.6. `known-truth` was not run.
+
+The planned gain (at least 5 percentage points of `oracle_recovered` at p < 0.05) is not reached, so the flag stays off by default.
 
 ### 3.2.1 Pareto-front parent feedback (#76)
 
