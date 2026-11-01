@@ -123,11 +123,12 @@ impl Manifest {
             jstr(&config_canonical(&self.config))
         ));
         out.push_str(&format!(
-            "  \"backend\":{},\"device\":{{\"name\":{},\"driver\":{},\"cuda\":{}}},\n",
+            "  \"backend\":{},\"device\":{{\"name\":{},\"driver\":{},\"cuda\":{}}},\"threads\":{},\n",
             jstr(&self.backend),
             jstr(&self.device),
             jstr(&self.driver),
-            jstr(&self.cuda_version)
+            jstr(&self.cuda_version),
+            self.config.threads
         ));
         if let Some((gpu, fallback, refits)) = self.fit {
             out.push_str(&format!(

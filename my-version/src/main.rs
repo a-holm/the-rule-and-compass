@@ -717,6 +717,12 @@ SEARCH:
                              uniformly instead of the UCB1 mix
   --qd-random                control: hash descriptors to random cells, so the
                              partition carries no behaviour information
+  --threads <N>              worker threads for constant fitting and scoring of
+                             offspring, inside each island (default: the CPU
+                             cores available to the process; 1 = serial). The
+                             islands share the budget: N / islands per island.
+                             Results, archive and checkpoints are identical for
+                             every value
   --pipeline-depth <N>       overlap CPU generation with GPU scoring using a
                              bounded pending queue of N batches (default 2; 0 =
                              synchronous). Results and archive are identical;
@@ -1725,9 +1731,7 @@ fn dev_run_start(
         seed: cfg.seed,
         backend: backend.to_string(),
         device,
-        threads: std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
+        threads: cfg.threads,
         host: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         start_utc: manifest::utc_now(),
@@ -2041,6 +2045,10 @@ fn main() {
     let mut gpu_explicit: Option<bool> = None;
     // #293: `--gpu-memory`, a device memory cap for the plan.
     let mut gpu_memory: Option<u64> = None;
+    // #463: `--threads`, worker threads for fitting and scoring offspring.
+    let mut threads: usize = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     // #438: `--dispatch auto|device`.
     let mut dispatch_mode = rcsr::dispatch::DispatchMode::Auto;
     let mut data_path: Option<String> = None;
@@ -2660,6 +2668,17 @@ fn main() {
             "--gpu" => {
                 cfg.gpu = true;
                 gpu_explicit = Some(true);
+            }
+            // #463: scheduling only; results are identical for every value.
+            "--threads" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if (1..=1024).contains(&n) => threads = n,
+                    _ => {
+                        eprintln!("error: --threads needs an integer from 1 to 1024, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
             }
             // #293: caps the device memory the plan may use.
             "--gpu-memory" => {
@@ -5072,6 +5091,7 @@ fn main() {
     // suppresses the note and the one-line resource summary.
     cfg.gpu_notes = !quiet;
     cfg.gpu_memory = gpu_memory;
+    cfg.threads = threads; // #463
     // #293: the device memory plan runs before the search allocates anything.
     // A refused fit stage, or a refused eval stage under an explicit `--gpu`,
     // is a usage error naming the bytes and the smallest fix.
@@ -6698,14 +6718,15 @@ fn main() {
                     .or_else(|| gpu_probe.reason.clone())
             };
             let backend_json = format!(
-                "\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},",
+                "\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"threads\":{},",
                 outcome.backend.name(),
                 backend_reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
                 outcome
                     .device
                     .as_deref()
                     .map(jstr)
-                    .unwrap_or_else(|| "null".to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+                cfg.threads, // #463
             );
             let backend_json = match &objective_report {
                 Some(rep) => format!(

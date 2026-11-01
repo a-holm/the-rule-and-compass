@@ -455,6 +455,11 @@ pub struct GenRecord {
     /// Candidate-evaluation CPU time: the island threads plus the evaluator's
     /// CPU fallback pool (wall seconds).
     pub eval_cpu_s: f64,
+    /// #463: wall seconds of the parallel fit-and-score phase, summed over
+    /// islands.
+    pub phase_b_s: f64,
+    /// #463: candidates dropped after the fit for exceeding the complexity cap.
+    pub post_fit_drops: usize,
     // Error distribution over this generation's population.
     pub best_error: f64,
     pub p05: f64,
@@ -525,7 +530,7 @@ impl GenRecord {
             "{{\"schema\":\"{}\",\"v\":{},\"event\":\"generation\",\"level\":\"summary\",\
              \"generation\":{},\"total\":{},\"t\":{},\"wall\":{},\
              \"phases\":{{\"prep\":{},\"search\":{},\"eval\":{},\"select\":{},\"archive\":{},\"fit\":{},\
-             \"fit_cpu\":{},\"eval_cpu\":{}}},\
+             \"fit_cpu\":{},\"eval_cpu\":{},\"phase_b\":{}}},\
              \"error\":{{\"best\":{},\"median\":{}}},\
              \"archive\":{{\"size\":{}}},\
              \"fit\":{{\"attempts\":{},\"gpu\":{},\"fallback\":{}}},\
@@ -545,6 +550,7 @@ impl GenRecord {
             num(self.fit_s),
             num(self.fit_cpu_s),
             num(self.eval_cpu_s),
+            num(self.phase_b_s),
             num(self.best_error),
             num(self.median),
             self.pareto_size,
@@ -566,11 +572,11 @@ impl GenRecord {
              \"generation\":{},\"total\":{},\
              \"t\":{},\"wall\":{},\
              \"phases\":{{\"prep\":{},\"search\":{},\"eval\":{},\"select\":{},\"archive\":{},\"fit\":{},\
-             \"fit_cpu\":{},\"eval_cpu\":{}}},\
+             \"fit_cpu\":{},\"eval_cpu\":{},\"phase_b\":{}}},\
              \"error\":{{\"best\":{},\"p05\":{},\"p25\":{},\"median\":{},\"p75\":{},\"p95\":{}}},\
              \"archive\":{{\"size\":{},\"hypervolume\":{},\"hash\":{},\"offers\":{},\"admissions\":{}}},\
              \"variation\":{{\"attempts\":{},\"duplicates\":{},\"too_complex\":{},\"offspring\":{},\
-             \"fitted\":{},\"refits\":{},\"dedup_rate\":{}}},\
+             \"fitted\":{},\"refits\":{},\"dedup_rate\":{},\"post_fit_drops\":{}}},\
              \"gpu\":{},\"fit\":{},\
              \"fallback\":{{\"scope\":\"evaluator_pool\",\"seconds\":{},\"workers\":{}}},\
              \"qd\":{},\
@@ -591,6 +597,7 @@ impl GenRecord {
             num(self.fit_s),
             num(self.fit_cpu_s),
             num(self.eval_cpu_s),
+            num(self.phase_b_s),
             num(self.best_error),
             num(self.p05),
             num(self.p25),
@@ -609,6 +616,7 @@ impl GenRecord {
             self.fitted,
             self.refits,
             num(self.dedup_rate()),
+            self.post_fit_drops,
             self.gpu.as_ref().map(|g| g.json()).unwrap_or_else(|| "null".to_string()),
             self.fit.json(),
             num(self.fallback_s),
@@ -1105,6 +1113,8 @@ mod tests {
             fit_s: 0.05,
             fit_cpu_s: 0.18,
             eval_cpu_s: 0.02,
+            phase_b_s: 0.0,
+            post_fit_drops: 0,
             best_error: 0.5,
             p05: 0.6,
             p25: 0.7,
