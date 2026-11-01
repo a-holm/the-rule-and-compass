@@ -254,6 +254,26 @@ Decodes the 15m archives and writes the symbol-major hourly base store `base_h1.
 
 Columns: `ts symbol open high low close volume quote_volume trades taker_buy_base taker_buy_quote cov15m gap flags traded dup_rows archive_unit`.
 
+### Pinned symbol universe (`--symbols`)
+
+`panel snapshot`, `panel base` and `prep` accept `--symbols <file>`: one symbol per line, `#` comments and blank lines ignored, duplicates collapsed, an empty list is a usage error (exit 2). Names compare byte-wise with the archive directory names (upper-cased ASCII). The filter runs on the file list before any archive is opened. A pinned list comes from `rcsr-acquire universe`.
+
+The `universe` block in `snapshot.json`, `<out>.manifest.json` (base) and the `prep` manifest records:
+
+```json
+"universe": {"file": "universe_all_usdt_pit.txt", "sha256": "...", "listed": 588, "kept": 576,
+             "dropped": ["AUDUSDT", "..."], "missing": ["AUSDT", "..."], "empty": ["HYPEUSDT", "..."]}
+```
+
+* `listed = kept + missing + empty`.
+* `kept`: listed symbols with at least one archive.
+* `dropped`: directories below `--input` (with or without archives) that are not listed. They contribute no rows.
+* `missing`: listed symbols with no directory. The list is the venue universe and the archive may lag, so this is not an error.
+* `empty`: listed symbols whose directory holds no archive (for example `HYPEUSDT`). They contribute no rows and are not an error.
+* If no archive symbol is listed, the command fails (exit 3).
+
+`base --resume` folds the list SHA-256 into the per-symbol cache key, so a changed list rebuilds the parts and the same list reuses them with a byte-identical store. Without `--symbols` the behaviour, the cache keys and the output bytes are unchanged and there is no `universe` block.
+
 ### P2 and P4 `membership`, `build`
 
 `membership` is unchanged. `build` keeps the rows that are members at `ts` (same rules as above: no fill across a gap, listing, delisting or membership exclusion) and writes the time-major store sorted by `(ts, symbol)`.
@@ -367,7 +387,7 @@ The build writes `"locked_test": {"start", "end", "start_date", "end_date", "sou
 | `rcsr ladder` | exit 3 for a fold touching the range; `--scheme locked --locked-test --ledger --sealed` reads it once and appends a `baseline_read` ledger line; a second read is exit 3 |
 | `rcsr ablation score` | exit 3 for a fold touching the range |
 
-Rows are refused, never dropped silently, because a drop would change the split fractions without a record. A time column that is not epoch seconds skips the row check and the report says `lockbox.checked: false`.
+Rows are refused, never dropped silently, because a drop would change the split fractions without a record. With a declaration no check is skipped: `--time` is needed unless the data holds exactly one integer epoch-seconds column (the `i64` time column of a store); a time column that does not parse or is not epoch seconds, and any split row without a time stamp, is exit 3. Every run that exits 0 reports `lockbox.checked: true`. `--cv` checks every row left by `--exclude` and `--filter`, also with `--allow-lockbox`, and draws its folds from those rows only. Without a declaration, a time column that is not epoch seconds skips the row check and the report says `lockbox.checked: false`.
 
 ## Provenance manifest
 

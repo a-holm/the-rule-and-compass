@@ -458,7 +458,7 @@ fn walkforward_front_of_a_real_run_guards_the_seen_rows() {
     let purge = num(&j, &["split", "required_purge_seconds"]);
     let end = (T0 + 900 * N as i64) as f64;
     let walk = |test_start: f64| {
-        let window = format!("w,{},{},{},{}", T0, test_start - 3600.0, test_start, end);
+        let window = format!("w,{},{},{},{}", T0, test_start - purge, test_start, end);
         Command::new(env!("CARGO_BIN_EXE_rcsr"))
             .args([
                 "walkforward", "--data", &data, "--time", "t", "--front", &run_path, "--window", &window,

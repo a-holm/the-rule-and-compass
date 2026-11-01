@@ -850,6 +850,11 @@ pub fn evaluate_positions(
     finish(&ctx, &kept, spec)
 }
 
+/// True when the expression reads no variable.
+pub fn is_constant(tree: &crate::expr::Node) -> bool {
+    tree.op != crate::expr::Op::Input && tree.kids.iter().all(is_constant)
+}
+
 /// The finalist chosen by a trading objective, with both books.
 #[derive(Clone, Debug)]
 pub struct FinalistReport {
@@ -859,6 +864,10 @@ pub struct FinalistReport {
     /// validation and test slices.
     pub min_group_step: Option<f64>,
     pub horizon_seconds: f64,
+    pub cost: crate::target::CostDecl,
+    /// The finalist expression has no variable: every quantile or fixed
+    /// threshold makes it a flat or always-long book.
+    pub constant: bool,
     pub candidates: usize,
     pub usable: usize,
     pub expression: String,
@@ -892,12 +901,13 @@ impl FinalistReport {
         };
         format!(
             "{{\"name\":\"{}\",\"position\":\"long_only\",\"selection\":\"validation_objective\",\
-             \"candidates\":{},\"usable_candidates\":{},\"exact\":\"cpu_f64\",\
+             \"cost\":{},\"candidates\":{},\"usable_candidates\":{},\"exact\":\"cpu_f64\",\
              \"backend\":{},\"backend_reason\":{},\"spec\":{},\
-             \"finalist\":{{\"expression\":{},\"archive_rank\":{},\"fit_metric\":{},\"fit_error\":{},\
+             \"finalist\":{{\"expression\":{},\"archive_rank\":{},\"constant\":{},\"fit_metric\":{},\"fit_error\":{},\
              \"validation_error\":{},\"test_error\":{},\"validation_objective\":{}}},\
              \"validation\":{},\"test\":{}}}",
             self.objective.name(),
+            self.cost.json(),
             self.candidates,
             self.usable,
             crate::devlog::text(backend),
@@ -907,6 +917,7 @@ impl FinalistReport {
             self.spec_json(),
             crate::devlog::text(&self.expression),
             self.archive_rank,
+            self.constant,
             crate::devlog::text(&self.fit_metric),
             num(self.fit_error),
             num(self.validation_error),

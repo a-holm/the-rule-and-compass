@@ -881,6 +881,29 @@ pub fn score_run(
     headline: usize,
     opts: &Options,
 ) -> Result<SeedResult, String> {
+    score_core(facts, panel, folds, thresholds, headline, None, opts)
+}
+
+/// [`score_run`] under the book the search selected: one fixed threshold, no quantile.
+pub fn score_run_fixed(
+    facts: &RunFacts,
+    panel: &Panel,
+    folds: &[Fold],
+    theta: f64,
+    opts: &Options,
+) -> Result<SeedResult, String> {
+    score_core(facts, panel, folds, &[theta], 0, Some(theta), opts)
+}
+
+fn score_core(
+    facts: &RunFacts,
+    panel: &Panel,
+    folds: &[Fold],
+    thresholds: &[f64],
+    headline: usize,
+    fixed: Option<f64>,
+    opts: &Options,
+) -> Result<SeedResult, String> {
     let tree = crate::expr::parse(&facts.expression, &facts.variables)
         .map_err(|e| format!("cannot parse '{}': {}", facts.expression, e))?;
     let cols: Vec<&[f64]> = facts
@@ -905,7 +928,7 @@ pub fn score_run(
         let test_s: Vec<f64> = f.test.iter().map(|&i| score(i)).collect();
         let mut per_thr = Vec::new();
         for (ti, &q) in thresholds.iter().enumerate() {
-            let theta = crate::walkforward::quantile(&fit_s, q);
+            let theta = fixed.unwrap_or_else(|| crate::walkforward::quantile(&fit_s, q));
             let pos: Vec<f64> = test_s.iter().map(|&s| if s > theta { 1.0 } else { 0.0 }).collect();
             let series = ladder::period_net(panel, &f.test, &pos, side);
             per_thr.push(series.iter().sum::<f64>());
@@ -1519,11 +1542,14 @@ fn usage() -> &'static str {
             writes <csv>.lockbox.json when the data (or --lockbox) declares a locked test\n\
             [--keep a,b] [--seed 0]\n\
             writes the projection CSV with placebo and circular-block-permuted columns\n\
-  score     --run <run.json> --data <csv|rcsb> --target <col> --time <col> --windows <file> --out <file>\n\
+  score     (--run <run.json> | --from-run <run.json>) --data <csv|rcsb> --target <col> --time <col> --windows <file> --out <file>\n\
             [--lockbox START,END]  a fold touching the declared locked test is refused (exit 3)\n\
             [--group <col>] [--return-col <col>] [--scheme expanding] [--thresholds 0.6,0.7,0.8]\n\
-            [--headline-threshold 0.7] [--cost-bps 12] [--purge-seconds 219600] [--target-spec <file>]\n\
-            scores the run's finalist (objective.finalist.expression) on every fold\n\
+            [--headline-threshold 0.7] [--cost-bps 12 | --cost-override <bp>] [--purge-seconds 219600] [--target-spec <file>]\n\
+            scores the run's finalist (objective.finalist.expression) on every fold. --target-spec sets the per-side cost\n\
+            (cost_bps / 2), the return units (log is converted with exp_m1) and the return column; a --cost-bps that differs is refused.\n\
+            --from-run prices the book the search selected: the run's target spec, per-side cost and fixed threshold\n\
+            (objective.spec.threshold); it refuses --thresholds, --headline-threshold and --target-spec, and a run without an objective block\n
   verdict   --definition <file> --results <dir> [--plan <dir>] [--out <file>] [--markdown <file|->]\n\
             ship or drop per family under the committed decision rule\n"
 }
@@ -1664,12 +1690,32 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         }
         "score" => {
             let fl = parse_flags(rest, &[])?;
-            let run_path = fl.need("--run")?;
-            let facts = parse_run(&std::fs::read_to_string(run_path).map_err(|e| io_err(run_path, e))?).map_err(|e| (3, format!("{}: {}", run_path, e)))?;
-            let mut opts = Options::default();
-            if let Some(c) = fl.opt("--cost-bps") {
-                opts.cost_bps = c.parse().map_err(|_| (2, "--cost-bps: invalid number".to_string()))?;
+            let from_run = fl.opt("--from-run");
+            if from_run.is_some() && fl.opt("--run").is_some() {
+                return Err((2, "--run and --from-run are alternatives; --from-run also takes the cost, units and fixed threshold from the run".to_string()));
             }
+            let run_path = match from_run {
+                Some(p) => p,
+                None => fl.need("--run")?,
+            };
+            let run_text = std::fs::read_to_string(run_path).map_err(|e| io_err(run_path, e))?;
+            let facts = parse_run(&run_text).map_err(|e| (3, format!("{}: {}", run_path, e)))?;
+            let book = match from_run {
+                Some(_) => {
+                    for flag in ["--thresholds", "--headline-threshold", "--target-spec"] {
+                        if fl.opt(flag).is_some() {
+                            return Err((2, format!("{} cannot be combined with --from-run: the run fixes the threshold rule and the target spec", flag)));
+                        }
+                    }
+                    Some(crate::run_book::RunBook::parse(&run_text).map_err(|e| (3, format!("{}: {}", run_path, e)))?)
+                }
+                None => None,
+            };
+            let mut opts = Options::default();
+            let num_flag = |name: &str| -> Result<Option<f64>, (i32, String)> {
+                fl.opt(name).map(|c| c.parse().map_err(|_| (2, format!("{}: invalid number", name)))).transpose()
+            };
+            let (cost_flag, cost_override) = (num_flag("--cost-bps")?, num_flag("--cost-override")?);
             if let Some(c) = fl.opt("--purge-seconds") {
                 opts.purge_seconds = c.parse().map_err(|_| (2, "--purge-seconds: invalid number".to_string()))?;
             }
@@ -1684,15 +1730,36 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 .iter()
                 .position(|q| (*q - headline_q).abs() < 1e-12)
                 .ok_or_else(|| (2, "--headline-threshold must be one of --thresholds".to_string()))?;
-            if let Some(path) = fl.opt("--target-spec") {
+            if let Some(b) = &book {
+                opts.spec = Some(b.spec.clone());
+            } else if let Some(path) = fl.opt("--target-spec") {
                 let text = std::fs::read_to_string(path).map_err(|e| io_err(path, e))?;
                 let specs = crate::target::parse_file(&text).map_err(|e| (3, format!("{}: {}", path, e)))?;
                 let target = fl.need("--target")?;
-                opts.spec = specs.into_iter().find(|s| s.column == target || s.name == target);
+                opts.spec = crate::target::entry_for(&specs, target).cloned();
             }
+            let (cost, source) = match &book {
+                Some(b) => match (cost_flag, cost_override) {
+                    (Some(_), Some(_)) => return Err((2, "--cost-bps and --cost-override are alternatives; pass one of them".to_string())),
+                    (None, Some(o)) => (o, crate::target::CostSource::Flag),
+                    (Some(f), None) if (f - b.per_side_bps).abs() > 1e-12 => {
+                        return Err((2, format!("--cost-bps {} differs from the run ({} per side); use --cost-override to price a different cost", f, b.per_side_bps)))
+                    }
+                    _ => (b.per_side_bps, b.source),
+                },
+                None => crate::target::resolve_cost(opts.spec.as_ref(), cost_flag, cost_override, ladder::DEFAULT_COST_BPS).map_err(|e| (2, e))?,
+            };
+            opts.cost_bps = cost;
+            if opts.spec.is_some() || source == crate::target::CostSource::Flag {
+                opts.cost = Some(crate::target::CostDecl::new(opts.spec.as_ref(), cost, source));
+            }
+            let target = match (&book, fl.opt("--target")) {
+                (Some(b), None) => b.spec.return_column.clone().unwrap_or_else(|| b.spec.column.clone()),
+                _ => fl.need("--target")?.to_string(),
+            };
             let inp = Input {
                 data: fl.need("--data")?.to_string(),
-                target: fl.need("--target")?.to_string(),
+                target,
                 ret: fl.opt("--return-col").map(str::to_string),
                 time: fl.need("--time")?.to_string(),
                 group: fl.opt("--group").map(str::to_string),
@@ -1705,8 +1772,23 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             let declared = crate::lockbox::resolve_declared(fl.opt("--lockbox"), fl.need("--data")?).map_err(|e| (2, format!("--lockbox: {}", e)))?;
             let guard = declared.as_ref().map(|d| (d.lockbox.start as f64, d.lockbox.end as f64));
             let folds = ladder::make_folds(&panel, &rows, opts.purge_seconds, guard).map_err(|e| (3, e))?;
-            let res = score_run(&facts, &panel, &folds, &thresholds, headline, &opts).map_err(|e| (3, e))?;
-            let mut json = res.json();
+            let res = match &book {
+                Some(b) => score_run_fixed(&facts, &panel, &folds, b.threshold, &opts),
+                None => score_run(&facts, &panel, &folds, &thresholds, headline, &opts),
+            }
+            .map_err(|e| (3, e))?;
+            let cost_decl = opts.cost.clone().unwrap_or(crate::target::CostDecl {
+                per_side_bps: cost,
+                source,
+                return_units: "simple".to_string(),
+                spec_per_side_bps: None,
+            });
+            let rule = match &book {
+                Some(b) => format!("{{\"kind\":\"fixed\",\"threshold\":{}}}", jnum(b.threshold)),
+                None => "{\"kind\":\"quantile\"}".to_string(),
+            };
+            let json = res.json();
+            let mut json = format!("{},\"cost\":{},\"threshold_rule\":{}}}", &json[..json.len() - 1], cost_decl.json(), rule);
             if let Some(d) = &declared {
                 json = d.splice_report(&json, 0, false, true);
             }

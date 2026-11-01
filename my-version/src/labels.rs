@@ -471,6 +471,14 @@ pub fn parse_column(name: &str) -> Option<(&str, &'static str)> {
     None
 }
 
+/// The refusal for a `long:` label without `fee=`.
+pub fn missing_fee_message(src: &str) -> String {
+    format!(
+        "label '{}': 'fee=' is required: state the per-side fee in basis points (fee=0 for none)",
+        src
+    )
+}
+
 impl LongLabelSpec {
     /// Parse `long:<horizon>[,name=ID][,delay=BARS][,fee=BP][,spread=BP]
     /// [,slip=BP][,vol=BARS][,floor=BP][,clip=C][,up=U][,down=D][,stride=N]`.
@@ -479,6 +487,7 @@ impl LongLabelSpec {
     pub fn parse(src: &str, bar_seconds: i64) -> Result<Self, String> {
         let bad = |part: &str| format!("label '{}': bad option '{}'", src, part);
         let mut spec = LongLabelSpec::new("", bar_seconds, 0);
+        let mut fee_set = false;
         let mut named = false;
         for part in src.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             if let Some(h) = part.strip_prefix("long:") {
@@ -512,7 +521,10 @@ impl LongLabelSpec {
                     named = true;
                 }
                 "delay" => spec.delay_bars = count()?,
-                "fee" => spec.cost.fee_bps = float()?,
+                "fee" => {
+                    spec.cost.fee_bps = float()?;
+                    fee_set = true;
+                }
                 "spread" => spec.cost.spread_bps = float()?,
                 "slip" => spec.cost.slippage_bps = float()?,
                 "vol" => spec.sigma_window = count()?,
@@ -528,11 +540,19 @@ impl LongLabelSpec {
         if spec.horizon_bars == 0 {
             return Err(format!("label '{}': needs 'long:<horizon>' with at least one bar", src));
         }
+        if !fee_set {
+            return Err(missing_fee_message(src));
+        }
         if !named {
             spec.name = format!("h{}", spec.horizon_bars);
         }
         spec.validate()?;
         Ok(spec)
+    }
+
+    /// Whether a `long:` label spec states `fee=`.
+    pub fn declares_fee(src: &str) -> bool {
+        src.split(',').any(|p| p.trim().split_once('=').is_some_and(|(k, _)| k.trim() == "fee"))
     }
 
     /// Volatility window of a `long:` label spec, read without resolving the horizon.
