@@ -1,4 +1,3 @@
-| `variation.constant_rejected` | full | offspring rejected before the fit because no input reaches the rows outside an aggregate (`--reject-constant-offspring`; 0 without the flag) |
 # The development log (`--dev-log`) and `rcsr dev-report`
 
 `rcsr` writes a **development log** while it searches. It is on by default: a
@@ -233,6 +232,7 @@ Emitted at the same boundary as `--progress`, once per completed generation
 | `variation.refits` | full | exact CPU refits of carried/promoted survivors |
 | `variation.dedup_rate` | full | `duplicates / attempts` |
 | `variation.reevals` | full | #500: carried individuals scored again over every training row at the start of the generation: pending (`NaN`) ones, and `+inf` ones whose first 2048 rows are all finite. A `+inf` individual with a non-finite prediction in those rows, or one the dimension filter rejects, stays `+inf` without the pass. The probe covers the plain unweighted metrics; every other shape takes the full pass |
+| `variation.constant_rejected` | full | offspring rejected before the fit because no input reaches the rows outside an aggregate (`--reject-constant-offspring`; 0 without the flag) |
 | `qd` | full | `null` without `--qd`: `occupied`, `reachable`, `coverage`, `entropy` |
 | `convergence.percent_converged` | both | the #18 headline (`docs/convergence.md`) |
 | `convergence.confidence/stability/maturity` | full | its three components |
