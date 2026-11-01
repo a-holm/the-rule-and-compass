@@ -222,7 +222,7 @@ pub fn rank_panel(opts: &RankOptions) -> Result<RankReport, String> {
     let _ = std::fs::remove_file(&file);
     let output_sha256 = result?;
 
-    let schema = registry::write_schema_declared(&opts.out, &opts.panel_version, resolved.sidecar_range().as_ref())?;
+    let schema = registry::write_schema_declared(&opts.out, &opts.panel_version, resolved.range.as_ref(), resolved.also.as_ref())?;
     let body = format!(
         "{{\"schema\":{},\"targets\":[{}]}}\n",
         crate::devlog::text(target::SCHEMA),
