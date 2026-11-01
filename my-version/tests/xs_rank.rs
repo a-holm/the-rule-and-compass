@@ -281,13 +281,13 @@ fn top_tercile_book_matches_hand_fixture() {
     close(s.turnover, 10.0 * 365.0 / 3.0);
     close(s.period.mean_return, NET / 18.0);
 
-    // NaN predictions are never long and leave the ranks of the others unchanged.
+    // A NaN prediction is never long and leaves the cross-section to the finite rows.
     let mut with_nan = pred.clone();
     with_nan[0] = f64::NAN;
     let pos_nan = trading::top_tercile_positions(&with_nan, &time);
     assert_eq!(pos_nan[0], 0.0);
     assert_eq!(pos_nan[3], 1.0);
-    assert_eq!(pos_nan[2], 1.0, "sym2 enters the top two once sym0 is not finite");
+    assert_eq!(pos_nan[2], 0.0, "five finite predictions hold floor(5/3) = 1 row");
     // Fewer than 3 finite predictions at a timestamp hold nothing.
     let thin = [0.5, 0.1, f64::NAN];
     assert_eq!(trading::top_tercile_positions(&thin, &[1.0, 1.0, 1.0]), vec![0.0, 0.0, 0.0]);
@@ -510,7 +510,7 @@ fn walkforward_from_run_prices_the_top_tercile_book_of_the_search() {
     let dir = scratch();
     let spec = write_xs_spec(&dir, "s.json");
     let csv = write_search_csv(&dir, "d.csv", None);
-    let o = search(&csv, &spec, &["--objective", "pnl", "--position", "top_tercile", "--validation-frac", "0.1765"]);
+    let o = search(&csv, &spec, &["--objective", "pnl", "--position", "top_tercile", "--validation-frac", "0.1765", "--arm", "A0"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let run = p(&dir, "run.json");
     std::fs::write(&run, &o.stdout).unwrap();

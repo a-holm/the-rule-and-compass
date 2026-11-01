@@ -837,7 +837,7 @@ pub fn top_tercile_positions(pred: &[f64], time: &[f64]) -> Vec<f64> {
         while end < order.len() && time[order[end]] == time[order[start]] {
             end += 1;
         }
-        for &k in order[start..end].iter().take((end - start) / 3) {
+        for &k in order[start..end].iter().take((end - start) / 2) {
             pos[k] = 1.0;
         }
         start = end;

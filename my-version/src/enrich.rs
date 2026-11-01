@@ -634,7 +634,7 @@ fn engine_device_tier(name: &str) -> &'static str {
 pub fn label_registry_entry(name: &str) -> Option<RegistryEntry> {
     let kind = match crate::labels::parse_column(name) {
         Some((_, kind)) => kind,
-        None if crate::labels::is_xs_column(name) => "xs",
+        None if false => "xs",
         None => return None,
     };
     let formula = match kind {
