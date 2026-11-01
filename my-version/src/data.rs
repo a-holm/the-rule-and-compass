@@ -1951,6 +1951,23 @@ pub struct Filter {
     pub expression: String,
 }
 
+/// Store columns a row expression reads, in order of first use. `Err` carries
+/// the parse error when the expression does not parse against `names`.
+pub fn row_expr_columns(src: &str, names: &[String]) -> Result<Vec<String>, String> {
+    fn walk(node: &Node, out: &mut Vec<usize>) {
+        if node.op == crate::expr::Op::Input && !out.contains(&(node.val as usize)) {
+            out.push(node.val as usize);
+        }
+        for k in &node.kids {
+            walk(k, out);
+        }
+    }
+    let tree = crate::expr::parse(src, names).map_err(|e| e.to_string())?;
+    let mut idx = Vec::new();
+    walk(&tree, &mut idx);
+    Ok(idx.into_iter().map(|i| names[i].clone()).collect())
+}
+
 /// Opt-in data preparation. Every default reproduces the behaviour before
 /// issue #2: no filling, no outlier removal, no smoothing, mean/std
 /// normalisation and no row filter.
@@ -2026,6 +2043,8 @@ pub struct PrepReport {
     pub memory_estimate: Option<CsvEstimate>,
     /// #112: the header-derived store estimate. `None` for a CSV source.
     pub store_estimate: Option<crate::memory::MemoryEstimate>,
+    /// #490: `on` when the store read was projected, else the reason it was not.
+    pub store_projection: Option<String>,
     /// #112: `Some(true)` when the full store/CSV rows were used, `Some(false)`
     /// for an explicit `--sample-rows` sample, `None` when not a store.
     pub full_rows: Option<bool>,
@@ -2053,6 +2072,7 @@ impl Default for PrepReport {
             time_converted: 0,
             memory_estimate: None,
             store_estimate: None,
+            store_projection: None,
             full_rows: None,
             sampled_rows: None,
         }
@@ -2220,6 +2240,7 @@ impl PrepReport {
                  \"directory_bytes\":{},\"group_buffer_bytes\":{},\"search_bytes\":{},\
                  \"fit_copy_bytes\":{},\"ring_bytes\":{},\"device_tile_bytes\":{},\
                  \"fixed_bytes\":{},\"slack_bytes\":{},\"saturated\":{},\
+                 \"projection\":\"{}\",\
                  \"basis\":\"store header: dtypes + row groups + projection\"}}",
                 m.total_bytes,
                 m.rows,
@@ -2236,7 +2257,8 @@ impl PrepReport {
                 m.device_tile_bytes,
                 m.fixed_bytes,
                 m.slack_bytes,
-                m.saturated
+                m.saturated,
+                self.store_projection.as_deref().unwrap_or("none")
             ),
             None => "null".to_string(),
         };
@@ -3399,6 +3421,7 @@ fn prepare_full_targets_weighted_inner(
             time_converted: hazards.converted,
             memory_estimate: None,
             store_estimate: None,
+            store_projection: None,
             full_rows: None,
             sampled_rows: None,
         },
