@@ -1730,6 +1730,9 @@ pub struct TradingColumns {
     pub funding_column: Option<String>,
     /// #469: also build the training slice.
     pub train: bool,
+    /// #493: also build the cross-section context of the validation and test
+    /// blocks: rows that only a missing label or return removed.
+    pub cross_section: bool,
 }
 
 /// One slice of the trading rows, aligned with the sample rows.
@@ -1766,6 +1769,18 @@ pub struct TradingSplit {
     pub train: Option<TradingSlice>,
     pub validation: Option<TradingSlice>,
     pub test: TradingSlice,
+    /// #493: rows of the validation and test blocks that only a missing label
+    /// removed, kept so a top-tercile book ranks the same cross-section as the
+    /// walk-forward.
+    pub validation_context: Option<TradingContext>,
+    pub test_context: Option<TradingContext>,
+}
+
+/// Feature rows (as in [`Sample::x`]) and trading rows of a cross-section context.
+#[derive(Clone, Debug, Default)]
+pub struct TradingContext {
+    pub x: Vec<Vec<f64>>,
+    pub slice: TradingSlice,
 }
 
 /// The pair lists of [`Prepared`]'s samples, in the order of each sample.
@@ -3089,6 +3104,9 @@ fn prepare_full_targets_weighted_inner(
     let mut keep = vec![true; n];
     let mut row_filled = vec![false; n];
     let mut rows_dropped_missing = 0usize;
+    // #493: rows that `--fill drop` removed only for a missing label; they
+    // stay in the cross-section of a top-tercile book.
+    let mut label_only_drop = vec![false; n];
 
     // #110: interpolation reads the next bar in each side. On a time-ordered
     // table that is look-ahead, so it needs an explicit opt-in.
@@ -3141,6 +3159,7 @@ fn prepare_full_targets_weighted_inner(
                 if (0..nc).any(|k| cell(&cells, r, k).is_nan()) {
                     keep[r] = false;
                     rows_dropped_missing += 1;
+                    label_only_drop[r] = (0..nv).all(|k| cell(&cells, r, k).is_finite());
                 }
             }
         }
@@ -3356,6 +3375,16 @@ fn prepare_full_targets_weighted_inner(
         }
     }
 
+    let want_context = spec.trading.as_ref().is_some_and(|c| c.cross_section);
+    let context_of = |idx: &[usize]| -> Vec<usize> {
+        if want_context {
+            idx.iter().copied().filter(|&i| !keep[i] && label_only_drop[i]).collect()
+        } else {
+            Vec::new()
+        }
+    };
+    let validation_context_idx = context_of(&validation_idx);
+    let test_context_idx = context_of(&fold_idx.iter().flatten().copied().collect::<Vec<_>>());
     // Rows dropped by preparation leave both the training and test sets.
     train_idx.retain(|&i| keep[i]);
     validation_idx.retain(|&i| keep[i]);
@@ -3523,6 +3552,8 @@ fn prepare_full_targets_weighted_inner(
     // `test`; with several folds the per-fold samples are still materialised.
     let test_idx: Vec<usize> = fold_idx.iter().flatten().copied().collect();
     let test = make(&test_idx);
+    let validation_context = (!validation_context_idx.is_empty()).then(|| make(&validation_context_idx));
+    let test_context = (!test_context_idx.is_empty()).then(|| make(&test_context_idx));
     let fold_samples: Vec<Sample> = if fold_idx.len() > 1 {
         fold_idx.iter().map(|f| make(f)).collect()
     } else {
@@ -3576,6 +3607,8 @@ fn prepare_full_targets_weighted_inner(
             &train,
             validation.as_ref(),
             &test,
+            (&validation_context_idx, validation_context.as_ref()),
+            (&test_context_idx, test_context.as_ref()),
         )?),
         None => None,
     };
@@ -4575,6 +4608,8 @@ fn build_trading(
     train: &Sample,
     validation: Option<&Sample>,
     test: &Sample,
+    validation_context: (&[usize], Option<&Sample>),
+    test_context: (&[usize], Option<&Sample>),
 ) -> Result<TradingSplit, String> {
     let tc = spec
         .time_col
@@ -4627,6 +4662,8 @@ fn build_trading(
         train: cols.train.then(|| slice(train_idx, train)),
         validation: validation.map(|v| slice(validation_idx, v)),
         test: slice(test_idx, test),
+        validation_context: validation_context.1.map(|s| TradingContext { x: s.x.clone(), slice: slice(validation_context.0, s) }),
+        test_context: test_context.1.map(|s| TradingContext { x: s.x.clone(), slice: slice(test_context.0, s) }),
     })
 }
 
@@ -5867,6 +5904,7 @@ mod tests {
                 log_returns: true,
                 funding_column: None,
                 train,
+                cross_section: false,
             }),
             canonical_train_order: canonical,
             ..Default::default()

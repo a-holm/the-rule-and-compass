@@ -190,7 +190,13 @@ INPUT:
                              overlapping rows, or no profitable path. Runs on
                              the CPU (backend_reason names it); resume needs
                              the same cost, threshold and rows
-  --position long_only       the only position map (default). short is refused
+  --position long_only|top_tercile
+                             long_only (default): 1[pred > --threshold]. top_tercile: per
+                             timestamp the top floor(n/3) finite predictions are long (p=1),
+                             ties by row order; fewer than 3 finite predictions hold nothing;
+                             no threshold. Needs a --split temporal (whole timestamps on one
+                             side), not --fitness pnl, --min-holding 1, --max-position 1.
+                             Use it with an xs_rank target (rcsr panel rank). short is refused
   --allow-short              refused: there is no short P&L, borrow or funding
   --threshold <f>            long when the prediction is strictly above <f>
                              (default 0)
@@ -980,6 +986,30 @@ fn parse_trade_number(flag: &str, text: &str) -> f64 {
 }
 
 /// #263: a usage error for the P&L objective, exit 2.
+/// #493: the book of one prediction vector. The context rows (removed only by a
+/// missing label) join the ranks of a top-tercile book; they earn nothing
+/// without a return.
+fn trading_book(
+    tree: &expr::Node,
+    x: &[Vec<f64>],
+    slice: &data::TradingSlice,
+    ctx: Option<&data::TradingContext>,
+    tspec: &rcsr::trading::TradingSpec,
+) -> Result<rcsr::trading::PathStats, String> {
+    let mut pred: Vec<f64> = x.iter().map(|row| expr::eval(tree, row)).collect();
+    let Some(c) = ctx else {
+        return rcsr::trading::evaluate(&pred, &slice.ret, &slice.rows, tspec);
+    };
+    pred.extend(c.x.iter().map(|row| expr::eval(tree, row)));
+    let mut ret = slice.ret.clone();
+    ret.extend_from_slice(&c.slice.ret);
+    let mut rows = slice.rows.clone();
+    rows.time.extend_from_slice(&c.slice.rows.time);
+    rows.group.extend_from_slice(&c.slice.rows.group);
+    rows.funding.extend_from_slice(&c.slice.rows.funding);
+    rcsr::trading::evaluate(&pred, &ret, &rows, tspec)
+}
+
 fn trading_usage(msg: &str) -> ! {
     eprintln!("error: {}", msg);
     std::process::exit(EXIT_USAGE);
@@ -4476,11 +4506,34 @@ fn main() {
         if multi_output {
             trading_usage("--objective is not supported with multiple targets (--target y1,y2)");
         }
-        if allow_short || position_arg.as_deref().is_some_and(|p| p != "long_only") {
+        let position_map = match position_arg.as_deref() {
+            None => rcsr::trading::PositionMap::Threshold,
+            Some("short") => trading_usage(
+                "--position short and --allow-short are refused: the book is long-only, \
+                 there is no short P&L, borrow or funding",
+            ),
+            Some(p) => match rcsr::trading::PositionMap::parse(p) {
+                Ok(m) => m,
+                Err(e) => trading_usage(&e),
+            },
+        };
+        if allow_short {
             trading_usage(
                 "--position short and --allow-short are refused: the book is long-only, \
                  there is no short P&L, borrow or funding",
             );
+        }
+        let top_tercile = position_map == rcsr::trading::PositionMap::TopTercile;
+        if top_tercile {
+            if !matches!(mode, data::SplitMode::Temporal) {
+                trading_usage(
+                    "--position top_tercile needs --split temporal: another split can put part of a \
+                     timestamp's cross-section on the other side of the split",
+                );
+            }
+            if trading_flags.contains(&"--threshold") {
+                trading_usage("--position top_tercile has no threshold: remove --threshold");
+            }
         }
         if !matches!(mode, data::SplitMode::Temporal | data::SplitMode::TemporalGroup)
             || time_col.is_none()
@@ -4497,10 +4550,16 @@ fn main() {
                 name
             )),
         };
-        if ts.kind != "forward_return" {
+        if ts.kind != "forward_return" && ts.kind != target::KIND_XS_RANK {
             trading_usage(&format!(
-                "--objective {} needs a forward_return target, the spec declares '{}'",
+                "--objective {} needs a forward_return or xs_rank target, the spec declares '{}'",
                 name, ts.kind
+            ));
+        }
+        if ts.kind == target::KIND_XS_RANK && !top_tercile {
+            trading_usage(&format!(
+                "--objective {} on an xs_rank target prices the top-tercile book: add --position top_tercile",
+                name
             ));
         }
         let spec_declares_cost = ts.per_side_cost_bps().is_some();
@@ -4539,6 +4598,7 @@ fn main() {
             log_returns: ts.return_units == "log",
             funding_column: trade_funding.clone(),
             train: fitness_pnl, // #480
+            cross_section: top_tercile,
         });
         let tspec = rcsr::trading::TradingSpec {
             cost_bps: cost,
@@ -4549,6 +4609,7 @@ fn main() {
             min_holding: trade_min_holding,
             threshold: trade_threshold,
             max_position: trade_max_position,
+            position: position_map,
             ..Default::default()
         };
         if let Err(e) = tspec.validate() {
@@ -4575,6 +4636,9 @@ fn main() {
         }
         if trade_min_holding > 1 {
             trading_usage("--fitness pnl is not supported with --min-holding > 1: the fitness is the plain threshold rule");
+        }
+        if trading_spec.as_ref().is_some_and(|s| s.position != rcsr::trading::PositionMap::Threshold) {
+            trading_usage("--fitness pnl is not supported with --position top_tercile: the fitness is the plain threshold rule");
         }
         if trade_max_position != 1.0 {
             trading_usage("--fitness pnl needs --max-position 1: the fitness is the unit long/flat book");
@@ -5850,8 +5914,8 @@ fn main() {
             };
             let objective_value = match (&trading_spec, &prepared.validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
                 (Some(tspec), Some(v), Some(slice)) => {
-                    let vpred: Vec<f64> = v.x.iter().map(|row| expr::eval(&s.tree, row)).collect();
-                    match rcsr::trading::evaluate(&vpred, &slice.ret, &slice.rows, tspec) {
+                    let ctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
+                    match trading_book(&s.tree, &v.x, slice, ctx, tspec) {
                         Ok(stats) => objective.score(&stats, tspec.min_trades),
                         Err(_) => f64::INFINITY,
                     }
@@ -6023,11 +6087,8 @@ fn main() {
     let objective_report: Option<rcsr::trading::FinalistReport> = match (&trading_spec, rows.first()) {
         (Some(tspec), Some(top)) => {
             let tree = &sorted[top.archive_rank - 1].tree;
-            let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>| match slice {
-                Some(slice) => {
-                    let pred: Vec<f64> = sample.x.iter().map(|row| expr::eval(tree, row)).collect();
-                    rcsr::trading::evaluate(&pred, &slice.ret, &slice.rows, tspec)
-                }
+            let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>, ctx: Option<&data::TradingContext>| match slice {
+                Some(slice) => trading_book(tree, &sample.x, slice, ctx, tspec),
                 None => Err("no trading rows".to_string()),
             };
             let split = prepared.trading.as_ref();
@@ -6053,10 +6114,10 @@ fn main() {
                 validation_value: top.objective_value,
                 search_fitness: fitness_book.as_ref().map(|_| "long_pnl_regret"),
                 validation: match &prepared.validation {
-                    Some(v) => book(v, split.and_then(|t| t.validation.as_ref())),
+                    Some(v) => book(v, split.and_then(|t| t.validation.as_ref()), split.and_then(|t| t.validation_context.as_ref())),
                     None => Err("no validation slice".to_string()),
                 },
-                test: book(&prepared.test, split.map(|t| &t.test)),
+                test: book(&prepared.test, split.map(|t| &t.test), split.and_then(|t| t.test_context.as_ref())),
             })
         }
         _ => None,
@@ -9551,7 +9612,11 @@ OPTIONS:
                              radix count, so theta is bit-identical to numpy
   --threshold-fixed <theta>  pre-registered fixed threshold instead of a quantile;
                              reported with threshold_source = fixed
-  --policy <p>               threshold | band | dp (default threshold). band is a
+  --policy <p>               threshold | band | dp | top-tercile (default threshold). top-tercile
+                             holds the top floor(n/3) finite scores of each timestamp long and
+                             the rest flat (no threshold; --threshold-quantile, --threshold-fixed,
+                             --band, --min-hold, --select-band, --device-pnl and --batch-pnl are
+                             refused). band is a
                              long-only no-trade band; dp keeps the threshold book
                              and reports the exact hindsight DP as a bound, never
                              as the strategy's P&L
@@ -10015,6 +10080,9 @@ fn run_walkforward(args: &[String]) -> ! {
     if front_path.is_some() && target_spec_path.is_some() {
         usage_fail("--front and --target-spec are alternatives: the run carries its own target spec");
     }
+    if policy == walkforward::Policy::TopTercile && (quantile_set || threshold_fixed.is_some()) {
+        usage_fail("--policy top-tercile has no threshold: do not pass --threshold-quantile or --threshold-fixed");
+    }
     let mut cost_spec: Option<rcsr::target::TargetSpec> = None;
     let mut run_cost: Option<(f64, rcsr::target::CostSource)> = None;
     let mut front_run: Option<rcsr::run_json::RunFile> = None;
@@ -10032,7 +10100,17 @@ fn run_walkforward(args: &[String]) -> ! {
         let book = run.book().unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
         expressions.push(book.expression.clone());
         vars_src = Some(book.variables.join(","));
-        threshold_fixed = Some(book.threshold);
+        if book.position == rcsr::trading::PositionMap::TopTercile {
+            if policy != walkforward::Policy::Threshold && policy != walkforward::Policy::TopTercile {
+                usage_fail("--policy conflicts with the run: it priced the top_tercile book");
+            }
+            policy = walkforward::Policy::TopTercile;
+        } else {
+            if policy == walkforward::Policy::TopTercile {
+                usage_fail("--policy top-tercile conflicts with the run: it priced the threshold book");
+            }
+            threshold_fixed = Some(book.threshold);
+        }
         run_cost = Some((book.per_side_bps, book.source));
         cost_spec = Some(book.spec);
     } else if let Some(path) = &front_path {
@@ -10085,7 +10163,15 @@ fn run_walkforward(args: &[String]) -> ! {
         }
         // The front is priced as the books the search compared: the run's
         // fixed threshold, cost and target spec.
-        if let Some(theta) = run.threshold {
+        if run.position == rcsr::trading::PositionMap::TopTercile {
+            if policy != walkforward::Policy::Threshold && policy != walkforward::Policy::TopTercile {
+                usage_fail("--policy conflicts with the run: it priced the top_tercile book");
+            }
+            policy = walkforward::Policy::TopTercile;
+        } else if let Some(theta) = run.threshold {
+            if policy == walkforward::Policy::TopTercile {
+                usage_fail("--policy top-tercile conflicts with the run: it priced the threshold book");
+            }
             if threshold_fixed.is_none() && !quantile_set {
                 threshold_fixed = Some(theta);
             }

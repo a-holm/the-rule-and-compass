@@ -14,6 +14,8 @@ pub struct RunBook {
     pub variables: Vec<String>,
     /// Fixed threshold: the position is `1[score > threshold]`.
     pub threshold: f64,
+    /// `objective.spec.position`; only the walk-forward prices the top-tercile map.
+    pub position: crate::trading::PositionMap,
     /// Total charge per side (cost, fee, half spread and slippage).
     pub per_side_bps: f64,
     pub source: CostSource,
@@ -103,6 +105,7 @@ impl RunBook {
             expression,
             variables,
             threshold: num("threshold")?,
+            position: crate::run_json::position_of(Some(spec_json)),
             per_side_bps: num("per_side_bps")?,
             source,
             spec,

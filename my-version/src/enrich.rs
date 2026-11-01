@@ -632,8 +632,13 @@ fn engine_device_tier(name: &str) -> &'static str {
 /// model input. Label names are chosen per run, so entries are derived from
 /// the column name instead of being listed in [`default_registry`].
 pub fn label_registry_entry(name: &str) -> Option<RegistryEntry> {
-    let (_, kind) = crate::labels::parse_column(name)?;
+    let kind = match crate::labels::parse_column(name) {
+        Some((_, kind)) => kind,
+        None if crate::labels::is_xs_column(name) => "xs",
+        None => return None,
+    };
     let formula = match kind {
+        "xs" => "rank of the forward return among the PIT members at ts, mapped to [-1, 1] (rcsr panel rank)",
         "fwd" => "ln(close[t+h+d] / open[t+1+d]), long gross log return",
         "y" => "clip(fwd / (max(s_W, floor) * sqrt(h)), -clip, +clip)",
         "long_net" => "fwd - long round-trip cost (- funding when supplied)",
