@@ -3568,6 +3568,14 @@ fn defers_fit_to_gpu(cfg: &Config, defer_gpu: bool) -> bool {
             || crate::fit::maximum_fit_only(cfg.metric))
 }
 
+/// #451: why `--fit-strategy gpu` does not defer the fit to the device, or
+/// `None` when it does (or the strategy is not `gpu`).
+#[cfg(any(feature = "cuda", test))]
+fn gpu_fit_off_reason(cfg: &Config) -> Option<String> {
+    let _ = cfg;
+    None
+}
+
 /// #85: true when constants are fitted on fewer rows than the generation's
 /// scoring sample. A request at least as large as the sample is a no-op.
 fn fit_sampling_active(cfg: &Config, sample: &Sample) -> bool {
@@ -7039,6 +7047,39 @@ fn run_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_fit_off_reason_follows_the_fit_decision() {
+        use crate::fit::FitStrategy;
+        use crate::metrics::Metric;
+        for &metric in Metric::all() {
+            let cfg = Config {
+                metric,
+                fit_strategy: FitStrategy::Gpu,
+                fit_iters: 5,
+                ..Config::default()
+            };
+            let reason = gpu_fit_off_reason(&cfg);
+            assert_eq!(reason.is_none(), defers_fit_to_gpu(&cfg, true), "{}", metric.name());
+            if crate::fit::gpu_fit_metric_error(metric).is_none() {
+                assert_eq!(reason, None, "{}", metric.name());
+            } else {
+                assert_eq!(reason, crate::fit::gpu_fit_metric_error(metric));
+            }
+        }
+        let cfg = Config {
+            metric: Metric::Squared,
+            fit_strategy: FitStrategy::Gpu,
+            fit_iters: 0,
+            ..Config::default()
+        };
+        assert_eq!(
+            gpu_fit_off_reason(&cfg).as_deref(),
+            Some("--fit-iters 0: nothing to fit")
+        );
+        let cfg = Config { fit_strategy: FitStrategy::Exact, ..cfg };
+        assert_eq!(gpu_fit_off_reason(&cfg), None);
+    }
 
     /// #256: the fit stage leaves the eval window first, then prep, then
     /// search, and the phases keep their total.
