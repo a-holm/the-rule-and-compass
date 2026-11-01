@@ -240,3 +240,159 @@ fn qd_immigrants_store_the_error_of_the_stored_tree() {
     }
     assert!(failures.is_empty(), "stored errors of a different tree: {failures:?}");
 }
+
+/// #578: what the pipeline depth must not change.
+#[cfg(feature = "cuda")]
+struct Trace {
+    archive: Vec<(u64, usize, u64)>,
+    /// Island errors (bit patterns) of every generation snapshot.
+    errors: Vec<Vec<u64>>,
+    stats: search::GpuRunStats,
+}
+
+#[cfg(feature = "cuda")]
+fn trace(cfg: &Config, train: &Sample, test: &Sample) -> Trace {
+    let mut errors: Vec<Vec<u64>> = Vec::new();
+    let out = search::run_resumable(cfg, train, test, None, 1, |cp: &Checkpoint| {
+        errors.push(
+            cp.islands
+                .iter()
+                .flat_map(|isl| isl.population.iter().map(|ind| ind.error.to_bits()))
+                .collect(),
+        );
+    })
+    .expect("search runs");
+    Trace {
+        archive: out
+            .archive
+            .items
+            .iter()
+            .map(|s| (rcsr::expr::structural_hash(&s.tree), s.complexity, s.error.to_bits()))
+            .collect(),
+        errors,
+        stats: out.gpu.expect("device run"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn assert_same_trajectory(label: &str, a: &Trace, b: &Trace) {
+    assert_eq!(a.errors.len(), b.errors.len(), "{label}: snapshot count");
+    for (g, (x, y)) in a.errors.iter().zip(&b.errors).enumerate() {
+        assert_eq!(x, y, "{label}: island errors differ in snapshot {g}");
+    }
+    assert_eq!(a.archive, b.archive, "{label}: archive differs");
+}
+
+#[cfg(feature = "cuda")]
+fn cause_total(t: &Trace, causes: &[&str]) -> usize {
+    causes
+        .iter()
+        .map(|c| t.stats.fit_fallback_by_cause.get(*c).copied().unwrap_or(0))
+        .sum()
+}
+
+/// `x1` repeats `x0`, so `c0 * x0 + c1 * x1` has a singular normal matrix and
+/// the device fit reports a non-usable status for it.
+#[cfg(feature = "cuda")]
+fn collinear_sample(n: usize) -> Sample {
+    let mut s = sample(n, 3);
+    for row in &mut s.x {
+        row[1] = row[0];
+    }
+    for (row, y) in s.x.iter().zip(&mut s.y) {
+        *y = 1.5 * row[0] + 0.7 * row[1] - 0.3;
+    }
+    s
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn pipeline_fallback_matches_sync_trajectory() {
+    if !device_available() {
+        return;
+    }
+    let train = collinear_sample(4_096);
+    let test = collinear_sample(256);
+    let mut runs = Vec::new();
+    for depth in [0usize, 2] {
+        let t = trace(&config(depth, 7), &train, &test);
+        let status = cause_total(&t, &["ill_conditioned", "non_finite", "rank_declined"]);
+        eprintln!("depth {depth}: status fallbacks {status}, causes {:?}", t.stats.fit_fallback_by_cause);
+        assert!(status > 0, "depth {depth}: no device status 1/2/3 fallback, the case is not exercised");
+        runs.push(t);
+    }
+    assert_same_trajectory("status fallbacks, depth 0 vs 2", &runs[0], &runs[1]);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn pipeline_fit_fallback_max_matches_sync() {
+    if !device_available() {
+        return;
+    }
+    const CAP: usize = 2;
+    let train = sample(4_096, 3);
+    let test = sample(256, 4);
+    let mut runs = Vec::new();
+    for depth in [0usize, 2] {
+        let cfg = Config {
+            fit_fallback_max: CAP,
+            ..config(depth, 7)
+        };
+        let t = trace(&cfg, &train, &test);
+        for g in &t.stats.generations {
+            assert!(
+                g.fit_fallback - g.fit_fallback_bounded <= CAP,
+                "depth {depth} generation {}: {} fallbacks, {} bounded",
+                g.generation,
+                g.fit_fallback,
+                g.fit_fallback_bounded
+            );
+        }
+        runs.push(t);
+    }
+    let bounded = |t: &Trace| -> Vec<(usize, usize, usize)> {
+        t.stats
+            .generations
+            .iter()
+            .map(|g| (g.generation, g.fit_fallback, g.fit_fallback_bounded))
+            .collect()
+    };
+    assert!(
+        bounded(&runs[0]).iter().any(|&(_, _, b)| b > 0),
+        "the cap never bound, the case is not exercised"
+    );
+    assert_eq!(bounded(&runs[0]), bounded(&runs[1]), "per-generation fallback and bound counts");
+    assert_same_trajectory("fit-fallback-max, depth 0 vs 2", &runs[0], &runs[1]);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn pipeline_does_not_launch_dimension_rejected() {
+    if !device_available() {
+        return;
+    }
+    let train = sample(4_096, 3);
+    let test = sample(256, 4);
+    let metre = Unit::parse("m").expect("unit");
+    let second = Unit::parse("s").expect("unit");
+    let units = Units::new(vec![metre.clone(), second], metre);
+    let mut runs = Vec::new();
+    for depth in [0usize, 2] {
+        let cfg = Config {
+            units: Some(units.clone()),
+            require_dimensions: true,
+            ..config(depth, 7)
+        };
+        runs.push(trace(&cfg, &train, &test));
+    }
+    eprintln!(
+        "fit attempts: depth 0 {}, depth 2 {}",
+        runs[0].stats.fit_attempts, runs[1].stats.fit_attempts
+    );
+    assert_eq!(
+        runs[0].stats.fit_attempts, runs[1].stats.fit_attempts,
+        "the pipeline fitted candidates the synchronous path never admits"
+    );
+    assert_same_trajectory("require-dimensions, depth 0 vs 2", &runs[0], &runs[1]);
+}
