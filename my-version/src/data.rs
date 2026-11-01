@@ -1562,7 +1562,9 @@ pub struct SplitSpec {
     /// #145: permit a train or test row inside the 2026H2 lockbox. `false` is
     /// the safe default for every caller of [`prepare_full`].
     pub allow_lockbox: bool,
-    /// #486: the protocol locked test declared with the data or by `--lockbox`.
+    /// #486, #517: the locked test resolved by `lockbox::resolve`: `--lockbox`, the
+    /// declaration stored with the data or the protocol default; `None` only for
+    /// `--lockbox none` and for library callers.
     /// Train, validation and test rows inside it are refused; `allow_lockbox`
     /// does not open it.
     pub declared_lockbox: Option<crate::lockbox::Declared>,
@@ -1579,6 +1581,13 @@ pub struct SplitSpec {
     /// scale statistics are computed, so every train-aligned output is in
     /// canonical order.
     pub canonical_train_order: bool,
+}
+
+impl SplitSpec {
+    /// The declared locked test when it must fail closed: see [`crate::lockbox::Declared::strict`].
+    pub fn strict_lockbox(&self) -> Option<&crate::lockbox::Declared> {
+        self.declared_lockbox.as_ref().filter(|d| d.strict())
+    }
 }
 
 impl Default for SplitSpec {
@@ -2728,7 +2737,7 @@ fn epoch_int_columns(t: &Table) -> Vec<usize> {
 /// With a declaration and no `--time`, it is the one integer column of the
 /// table that holds epoch seconds; zero or several is a usage error.
 pub fn lockbox_time_column(t: &Table, spec: &SplitSpec) -> Result<Option<usize>, String> {
-    let Some(d) = &spec.declared_lockbox else {
+    let Some(d) = spec.strict_lockbox() else {
         return Ok(spec.time_col);
     };
     if spec.time_col.is_some() {
@@ -2760,7 +2769,7 @@ pub fn lockbox_stamps(t: &Table, spec: &SplitSpec) -> Result<Option<(usize, Vec<
     let name = t.names.get(tc).map(String::as_str).unwrap_or("time");
     let keys = match time_keys_with(t, tc, &spec.time) {
         Ok((keys, _)) => keys,
-        Err(e) => match &spec.declared_lockbox {
+        Err(e) => match spec.strict_lockbox() {
             Some(d) => {
                 return Err(format!(
                     "the data declares a locked test {}; time column '{}' cannot be read: {}",
@@ -2772,7 +2781,7 @@ pub fn lockbox_stamps(t: &Table, spec: &SplitSpec) -> Result<Option<(usize, Vec<
             None => return Ok(None),
         },
     };
-    if let Some(d) = &spec.declared_lockbox {
+    if let Some(d) = spec.strict_lockbox() {
         let (lo, hi) = keys
             .iter()
             .copied()
@@ -2828,7 +2837,7 @@ pub fn check_cv_lockbox(
         crate::lockbox::Guard::default().check_times("cross-validation rows", &times)?;
     }
     if let Some(d) = &spec.declared_lockbox {
-        if unstamped > 0 {
+        if unstamped > 0 && spec.strict_lockbox().is_some() {
             return Err(format!(
                 "{} row(s) of the cross-validation rows have no time stamp; the declared locked test cannot be checked",
                 unstamped
@@ -4281,7 +4290,7 @@ fn check_split_lockbox(
     let Some((tc, keys)) = lockbox_stamps(t, spec)? else {
         return Ok(());
     };
-    let declared = spec.declared_lockbox.is_some();
+    let declared = spec.strict_lockbox().is_some();
     let unstamped = |idx: &[usize]| -> usize {
         idx.iter()
             .filter(|&&i| !keys.get(i).copied().unwrap_or(f64::NAN).is_finite())

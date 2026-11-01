@@ -180,11 +180,14 @@ The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA
   `"lockbox": {"permitted": true, ...}` in the JSON report. The same
   `rcsr::lockbox::Guard` is used by `rcsr run` (the default search),
   `rcsr panel build --start/--end` and a labelled `rcsr prep`.
-* A locked test declared with the data (`rcsr panel build --locked-test`, or
-  `--lockbox START,END`) is checked the same way on every run, with or without
-  `--ledger`: a window whose train or test range touches it exits 3. The JSON
-  `protocol.lockbox` object then carries `declared`, `source`, `rows_in_scope`
-  and `evaluated`. See [`panel.md`](panel.md#the-declared-locked-test).
+* The protocol locked test is checked on every run, with or without
+  `--ledger`: a window whose train or test range touches it exits 3. The range
+  is `--lockbox START,END`, else the one declared with the data
+  (`rcsr panel build --locked-test`), else the protocol default
+  2025-07-01..2026-07-01. `--lockbox none` is the only opt-out. The JSON
+  `protocol.lockbox` object always carries `declared`, `source` (`flag`,
+  `store`, `protocol_default`, `none`), `declared_in`, `rows_in_scope` and
+  `evaluated`. See [`panel.md`](panel.md#the-declared-locked-test).
 * Costs and positions are per group. Counting position changes on a flattened
   timestamp/symbol row order would count spurious changes at every symbol
   boundary; this implementation does not.
@@ -473,7 +476,7 @@ The primary book is long or flat against cash. Short exposure, borrow and fundin
 
 ### Four tiers and the windows table
 
-Training fits, validation selects, development out-of-sample evaluates the procedure, and a locked test is read once per sealed candidate. [`protocol/windows.csv`](../protocol/windows.csv) holds the UTC boundaries (`rcsr protocol windows` regenerates it, and a test pins the file to the generator):
+Training fits, validation selects, development out-of-sample evaluates the procedure, and a locked test is read once per sealed candidate (once in total after a final seal). [`protocol/windows.csv`](../protocol/windows.csv) holds the UTC boundaries (`rcsr protocol windows` regenerates it, and a test pins the file to the generator):
 
 | range | UTC |
 |---|---|
@@ -524,11 +527,23 @@ Candidates are evaluated on the test periods with their own validation threshold
 
 ### Candidate ledger and the locked test
 
-`--ledger FILE` makes a development run append a `candidate` line (content-addressed id over the procedure, the data SHA-256 and the build commit; `test_read:false`). Each line holds the SHA-256 of the previous line, so an edit breaks the chain. A development window that touches the declared lockbox (`--lockbox START,END`, default 2025-07-01 to 2026-07-01) is refused.
+`--ledger FILE` makes a development run append a `candidate` line (content-addressed id over the procedure, the data SHA-256 and the build commit; `test_read:false`). Each line holds the SHA-256 of the previous line, so an edit breaks the chain. A development window that touches the locked test (`--lockbox START,END`, else the range declared with the data, else 2025-07-01 to 2026-07-01; `--lockbox none` opts out) is refused.
 
 `rcsr protocol seal --ledger L --out locked_candidates.json` writes the sealed list and records its hash in the ledger. `--locked-test --sealed locked_candidates.json` then reads the locked test: the candidate must be in the sealed list, the data and build hashes must equal the sealed entry (otherwise the run is void), and the candidate must not have `test_read:true`. The read appends a `test_read` line with the report hash and the new `read_count`; a second read is refused. `--verify-read --expect-report-sha256 H` recomputes the read and compares hashes without recording anything. The report's `protocol` object holds the lockbox rows, date range and read count; `run.json` carries a `lockbox` object (`--lockbox`, `--ledger`) with the rows in the range, their first and last stamps and the read count.
 
 `rcsr ladder --scheme locked --locked-test --ledger L --sealed S` reads the locked test for the baseline ladder. The sealed list must be recorded in the ledger and the ledger must hold no `baseline_read`; the run appends `{"event":"baseline_read",...}` with the data and report hashes, and a second call is refused. Without `--locked-test`, `ladder` and `ablation score` refuse any fold that touches the declared range.
+
+#### Final seal: one read, one candidate
+
+`rcsr protocol seal --final [--max-reads N] [--report-candidates] --ledger L --out locked_candidates.json` closes the ledger for the final result. It needs a ledger with no seal and no locked read, and it appends `{"event":"seal","final":true,"max_reads":N,...}` (N defaults to 1). Afterwards:
+
+* `walkforward --ledger` without `--locked-test` and both `protocol seal` forms are refused (`the ledger is final`; exit 3 and 1). All candidate selection happens on development data before the final seal.
+* At most N `test_read` lines (one `baseline_read` for `ladder`) are accepted. A read of a second sealed candidate after the Nth is refused with exit 3.
+* The first locked read writes `<data>.locked_reads.jsonl` beside the store: ledger path, the ledger head the read extends, event and report SHA-256. A read of the same store through another ledger (a fresh file, a copy, an edited chain) is refused: `<data> was already read through ledger <path>`. The marker lives with the store, so a fresh ledger cannot reset the count. Copying the store without its marker file is outside this check.
+* A read of a multi-candidate procedure reports the validation-selected candidate only. No other candidate is evaluated on the test block: `--bootstrap` has no candidate columns, `multiple_testing` has `candidates:1`, one p-value and `pbo_error` `final read reports the selected candidate`, and `--batch-pnl` is refused with exit 2. `--report-candidates` at seal time keeps the full report and records the choice in the seal line.
+* `rcsr protocol verify --ledger L --data D --expect-reads N [--sealed S]` exits 1 unless the ledger has N locked reads, exactly one seal line that is final, no more reads than the seal allows and a marker that matches the ledger line for line. With `--sealed` it also checks that the file is the final list and that every read id is in it. Before the read, `--expect-reads 1` exits 1 and `--expect-reads 0` exits 0.
+
+A crash after the marker line and before the ledger line leaves a marker the ledger does not record. The next call finds the same ledger head and reads once; `verify` flags the state until then. Deleting the marker makes `verify` report a ledger read without a marker line.
 
 ## Fold sign test
 

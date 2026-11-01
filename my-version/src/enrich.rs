@@ -8165,6 +8165,7 @@ fn expected_columns_out(
 
 pub fn run(args: &[String]) -> ! {
     let mut opts = Options::default();
+    let mut locked_test: Option<String> = None;
     let mut i = 0usize;
     macro_rules! val {
         () => {{
@@ -8253,7 +8254,7 @@ pub fn run(args: &[String]) -> ! {
                 opts.write_bw = Some(mbps * 1_000_000.0);
             }
             "--locked-test" => {
-                opts.locked_test = Some(crate::lockbox::Lockbox::parse(&val!()).unwrap_or_else(|e| fail(&format!("--locked-test: {}", e))))
+                locked_test = Some(val!())
             }
             "--allow-lockbox" => opts.allow_lockbox = true,
             "--dry-run" => opts.dry_run = true,
@@ -8271,6 +8272,11 @@ pub fn run(args: &[String]) -> ! {
     if opts.features.is_empty() && opts.labels.is_empty() {
         fail("enrich needs --features and/or --label");
     }
+    let resolved = crate::lockbox::resolve(locked_test.as_deref(), &opts.data).unwrap_or_else(|e| {
+        eprintln!("error: {}", e.message.replacen("--lockbox", "--locked-test", 2));
+        std::process::exit(e.exit);
+    });
+    opts.locked_test = resolved.sidecar_range();
     let report = match enrich(&opts) {
         Ok(r) => r,
         Err(e) => fail(&e),
@@ -8279,11 +8285,11 @@ pub fn run(args: &[String]) -> ! {
         if let Some(out) = &opts.out {
             let sidecar = format!("{}.enrich.json", out);
             let mut text = report.json();
-            if let Some(lb) = opts.locked_test.or_else(|| crate::lockbox::declared_for(&opts.data)) {
+            if let Some(lb) = resolved.sidecar_range() {
                 let at = text.find('{').map_or(0, |i| i + 1);
                 text.insert_str(
                     at,
-                    &format!("\"locked_test\":{},", lb.declaration_json("rcsr enrich --locked-test")),
+                    &format!("\"locked_test\":{},", lb.declaration_json(&format!("rcsr enrich ({})", resolved.source.as_str()))),
                 );
             }
             if let Err(e) = crate::atomic::write_text_atomic(&sidecar, &text) {
@@ -8354,12 +8360,16 @@ INPUT / OUTPUT:
                           4h and longer (labels overlap; use uniqueness weights)
   --side long             the only side; --side short and --allow-short are refused
   --allow-lockbox         permit labelled rows in 2026H2 (final test only)
-  --locked-test <START,END>
-                          declare the protocol locked test (UTC, half-open) in
-                          <out>.enrich.json; copied from --data when it declares one;
-                          label rows whose window reaches it (entry at or after
-                          START minus the purge, before END) are left out of
-                          every <out>.labels.json statistic, and counted
+  --locked-test <START,END|none>
+                          declare the locked test (UTC, half-open) in <out>.enrich.json.
+                          Without the flag: the range --data declares, else the protocol
+                          default 2025-07-01,2026-07-01. A range that does not cover the
+                          declared one is refused (exit 2); conflicting declarations of
+                          --data are refused (exit 3); none writes no declaration and is
+                          refused when --data declares one
+                          label rows whose window reaches the range (entry at or after
+                          START minus the purge, before END) are left out of every
+                          <out>.labels.json statistic, and counted
   --gpu [auto|on|off]     auto (default) dispatches a registered exact kernel
                           only when the cost model estimates it faster; on
                           forces every registered kernel above the 1M-row floor;

@@ -107,10 +107,12 @@ blocks alike: a validation slice that overlaps the lockbox is refused with the
 message shape and exit code of a test block (`validation split: N row(s) ...
 overlap the lockbox`), unless `--allow-lockbox` declares a final test.
 
-The protocol locked test is a second, separate box: declare it with the data
-(`rcsr panel build --locked-test START,END`) and the search, `walkforward`,
+The protocol locked test is a second, separate box. Data that declares it
+(`rcsr panel build --locked-test START,END`) uses the declared range; undeclared
+data uses the protocol default 2025-07-01..2026-07-01. The search, `walkforward`,
 `ladder` and `ablation score` refuse every fit, validation or test row inside
-it (exit 3). `--allow-lockbox` does not open it. Only the sealed
+it (exit 3). `--lockbox none` is the only opt-out, and the report records
+`"source":"none"`. A `--lockbox` flag on undeclared data adds to the default and never replaces it. Ranges from the store or a flag also fail closed (no `--time`, a non-epoch time column and unstamped rows are refused); the protocol default only checks data with epoch-seconds stamps. `--allow-lockbox` does not open it. Only the sealed
 `--locked-test` path of `walkforward` and `ladder` reads it, once. A pilot
 split such as `--split temporal --validation-frac 0.20` on a panel that ends
 inside the locked range puts its test block there; the refusal tells you to
