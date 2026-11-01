@@ -414,6 +414,43 @@ fn reported_finalists_are_refit_exactly_on_the_cpu() {
     }
 }
 
+/// #470: wrapped trees fit on the device, the finalists are the exact CPU f64
+/// score of the stored tree, and the wrapper adds no fallback cause.
+#[cfg(feature = "cuda")]
+#[test]
+fn linear_scaling_wrapped_trees_fit_on_the_device() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = sample(240, 7);
+    let test = sample(60, 8);
+    let plain = search::run(&gpu_config(13), &train, &test);
+    let mut cfg = gpu_config(13);
+    cfg.linear_scaling = true;
+    let out = search::run(&cfg, &train, &test);
+    assert_eq!(out.backend, rcsr::backend::Kind::Gpu);
+    let g = out.gpu.as_ref().expect("a GPU report");
+    assert!(g.fit_gpu > 0, "batched GPU fit ran: {:?}", g);
+    assert!(g.fit_refits > 0, "finalists were refit: {:?}", g);
+    assert_fit_ledger(g);
+    let base = plain.gpu.as_ref().expect("a GPU report");
+    for cause in g.fit_fallback_by_cause.keys() {
+        assert!(
+            base.fit_fallback_by_cause.contains_key(cause),
+            "new fallback cause {cause:?}: {:?} vs {:?}",
+            g.fit_fallback_by_cause,
+            base.fit_fallback_by_cause
+        );
+    }
+    for s in &out.archive.items {
+        let cpu = search::eval_error(&s.tree, &train, Metric::Squared);
+        assert_eq!(s.error.to_bits(), cpu.to_bits(), "{} vs {}", s.error, cpu);
+    }
+    let best = out.archive.items.iter().map(|s| s.error).fold(f64::INFINITY, f64::min);
+    assert!(best < 0.5, "scaled run reached error {best}");
+}
+
 /// #287 AC6: for every metric the device scores natively, the reported score of
 /// each finalist after the exact refit is the CPU `score_weighted` of the stored
 /// tree on the same data, bit for bit. Metrics the device refuses are not run.
@@ -1803,4 +1840,30 @@ fn signed_bias_gpu_fit_run_is_deterministic_and_exact() {
         let cpu = search::eval_error(&s.tree, &train, Metric::Signed);
         assert_eq!(s.error.to_bits(), cpu.to_bits());
     }
+}
+
+/// #499: an operator set with `min` and `max` fits on the device and names no
+/// `unsupported_plan` fallback.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_search_with_min_and_max_fits_on_the_device() {
+    use rcsr::expr::Op;
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let s = sample(640, 3);
+    let cfg = Config {
+        ops: vec![Op::Add, Op::Sub, Op::Mul, Op::Min, Op::Max],
+        ..gpu_config(5)
+    };
+    let out = search::run(&cfg, &s, &s);
+    let g = out.gpu.as_ref().expect("a GPU report");
+    assert!(g.fit_gpu > 0, "nothing was fitted on the device: {g:?}");
+    assert_eq!(
+        g.fit_fallback_by_cause.get("unsupported_plan").copied().unwrap_or(0),
+        0,
+        "{:?}",
+        g.fit_fallback_by_cause
+    );
 }

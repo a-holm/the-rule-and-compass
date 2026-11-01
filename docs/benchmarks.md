@@ -454,8 +454,8 @@ rcsr-bench --suite all --problems nguyen9,sig_tanh --seeds 1,2 --generations 20 
 | `--seeds 1,2,3` or `--seeds 1-10` | engine seeds; `--seed S` stays a single seed |
 | `--cpu` | `Config::gpu = false`, no environment variable; `--gpu` needs a device and exits 2 without one |
 | `--fit-strategy exact\|auto\|linear\|varpro\|stream\|gpu\|default` | `exact` stays the bench default; `default` resolves the arm like the production CLI (`FitRequest::Unset`) |
-| `--fit-iters`, `--ops`, `--max-complexity`, `--patience`, `--migration-interval`, `--restart-interval`, `--variation`, `--dispatch` | copied into `search::Config` |
 | `--no-prune` | skip the front prune (#466) to measure its effect |
+| `--fit-iters`, `--ops`, `--max-complexity`, `--patience`, `--migration-interval`, `--restart-interval`, `--variation`, `--selection`, `--dispatch` | copied into `search::Config` |
 | `--threads N` | worker threads for fitting and scoring inside an island (default: all cores; results do not depend on it) |
 | `--jobs N` | N CPU runs at once; each run keeps its seed, so results are identical, but `seconds` and `hit_s` are contended. Exits 2 with a device backend |
 | `--ndjson` | one JSON line per finished run, flushed at once, then one summary line |
@@ -473,6 +473,7 @@ rcsr-bench compare --base a.ndjson[,a2.ndjson] --treat b.ndjson[,b2.ndjson] \
 ```
 
 * Pairs runs by `(suite, problem, noise, seed)`. It exits 2 when the two sides do not hold the same set of keys, when a key repeats, or when the `config` objects differ in anything other than `knobs` and `build` (a different data generator or threshold cannot be compared by accident).
+* A pair whose criterion is undefined (`null`) on either side is left out of every statistic. The output gives the dropped count and lists the dropped keys (`dropped` with `count` and `keys` in `--json`). It exits 2 when the criterion is undefined for every pair.
 * Prints both rates with Wilson 95 % intervals, the discordant counts `b` (base only) and `c` (treat only) and the exact two-sided McNemar p-value `min(1, 2 P(X <= min(b, c)))`, `X ~ Binomial(b + c, 1/2)`.
 * Prints the median paired ratio `treat.hit_s / base.hit_s` and `hit_evals` over pairs where both hit, the median paired `front_hv` difference, the summed `seconds` of both sides and a per-problem table (base hits, treat hits, wins, losses).
 * `hit_evals` is exact and independent of machine load; `hit_s` is wall time. Compare time on an otherwise idle machine and prefer `hit_evals` when the load varies.

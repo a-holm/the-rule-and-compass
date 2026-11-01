@@ -1172,6 +1172,26 @@ explicit `gpu` is always honoured:
    this arm is selected), so the returned constants are not limited by the f32
    evaluator copy or by f32 row arithmetic.
 
+   `--fit-polish` (#496) selects the arithmetic of this step. `f64` (default) is
+   the kernel described here, bit for bit. `f32` runs the same steps on the f32
+   rows and the f32 objective of the damped loop, without the f64 re-baseline.
+   `off` returns after the damped loop. The search ranks on the f32 evaluator
+   and the reported archive is rebuilt by the exact CPU f64 refit in every mode,
+   so the setting changes the proposed constants and the kernel time only.
+   Status `recovered_skipped` (8) is set only by the f64 assembly and cannot
+   occur under `f32` or `off`. The rank, order-statistic and maximum arms keep
+   their own kernels. A checkpoint stores a non-default value and a resume
+   refuses a different one.
+
+   Each block records `clock64()` cycle counts for the damped loop and for the
+   polish (re-baseline and steps). The host apportions the measured kernel
+   seconds of a batch by the summed cycle ratio and reports
+   `gpu.fit.kernel_f32_s` (damped loop) and `gpu.fit.kernel_f64_s` (polish) in
+   `--json`, in `gpu.ledger.fit` and in the `run_end` event of the development
+   log. The two sum to the fit kernel seconds. Under `f32` or `off` the second
+   value is the time of the polish phase in that arithmetic. A kernel launch
+   without recorded cycles counts as damped loop.
+
 **Two instantiations.** The kernel is compiled twice and dispatched on the
 batch's largest constant count. `p <= 16` keeps the 256-thread block and 256-row
 chunk it was measured with (now 43 744 B of shared memory: #229 added the f64
@@ -1241,7 +1261,7 @@ constants), `too_few_rows`, `too_many_constants` (`p > 20`),
 the exact CPU arm took over). `--fit-report` and the `gpu.fit` JSON object count
 `screened` (scored with seed constants before admission), `admitted_wide` (candidates with constants fitted without a screening score under wide admission), `attempts`/`gpu`/`fallback`, the per-cause map, the
 `status_by_label` map of finite device answers, `refits`, the kernel `seconds`
-and the whole fit stage's `host_seconds`; the run manifest records the same
+and the whole fit stage's `host_seconds` (with the `gate_s` subset, #498); the run manifest records the same
 accepted/fallback/refit totals. Ledger invariant: `screened + admitted_wide >= attempts`. Below the wide threshold `admitted_wide` is 0 and every attempt was screened; under wide admission only constant-free candidates are screened and every other pending candidate is counted in `admitted_wide`.
 
 **Parallel fallback batch and its bound (#255).** The exact CPU refits are
@@ -1290,8 +1310,29 @@ refits), so at this measured ratio its fallback residue projects from 36 362 s
 to about 8 400 s; that projection is not a run on that cell and is labelled as
 such.
 
+**Finalist refit band (#495).** `full_data_archive` scores every unique tree of
+the archive and the final populations on all training rows with the carried
+constants, then refits exactly (`fit::fit_weighted_metric`, `--fit-iters`, all
+rows) only the trees that can reach the front. The envelope `env(c)` is the
+lowest finite pre-refit error among trees of cost `<= c`; tree `t` is refit when
+`pre(t) <= env(cost(t)) + band * |env(cost(t))|`. The refit is metric-monotone,
+so errors only fall. The front is then rebuilt from refit errors (refit trees)
+and pre-refit errors (the rest), and every front member that was not refit is
+refit, repeating until none is left, so every reported member is an exact CPU
+f64 refit. The refit set depends only on errors, costs and structural hashes,
+never on timing. `--refit-band F` sets the relative band (default `0.001`);
+`--refit-band inf` refits every unique tree and reproduces the archive hash of
+the full refit. The band is a saved search setting, written to a checkpoint only
+when it differs from the default; a resume refuses a different explicit value.
+`gpu.fit.refit_candidates` (unique trees), `refits`, `refit_s` (refit window
+wall) and `rescore_s` (full-data scoring wall) report the work; the development
+log `run_end` carries `fit_refit_s` and `fit_refits`. With a CPU fit strategy, a
+multi-output sample or `--fit-iters 0` nothing is refit and the tree set is only
+re-scored.
+
 **Exactness.** Search fitness is still f32 and only guides selection. Every
-finalist is refit by the exact CPU f64 LM on all training rows before the final
+reported finalist is refit by the exact CPU f64 LM on all training rows (see the
+band above) before the final
 archive is rebuilt, and the archive is then scored by the CPU in f64. Reported
 constants and metrics therefore never come from f32. The unit tests upload the
 same f64 rows the CPU arm uses; the kernel's final constants then match the CPU
@@ -1467,7 +1508,7 @@ gpu = (s * k + (1 - s) / W) * E * (1 + h)
 device iff gpu < cpu
 ```
 
-With `W = 8`: without full operator coverage (any operator without a fit opcode, such as `min`) the device is chosen up to 4 islands and `exact` from 5 (`dispatch_cost`); with full coverage the device is chosen up to 11 islands. There is no row floor. The per-candidate floor of `32p` rows in the fit stage is unchanged. This run-level rule is separate from the per-candidate stage model in `docs/dispatch.md`.
+With `W = 8`: without full operator coverage (any operator without a fit opcode, such as `asinh` or `require`) the device is chosen up to 4 islands and `exact` from 5 (`dispatch_cost`); with full coverage the device is chosen up to 11 islands. There is no row floor. The per-candidate floor of `32p` rows in the fit stage is unchanged. This run-level rule is separate from the per-candidate stage model in `docs/dispatch.md`.
 
 Evidence for the default is a paired comparison against `exact` on the GPU evaluator at equal generations (default operators, `--fit-iters 8`): admitting every candidate matched `exact` in test error and hypervolume and ran 1.5x to 5.1x faster; the screened fraction was faster still but lost on hypervolume. Fallbacks in these runs were `unsupported_plan` only, from `if`.
 
@@ -1878,6 +1919,24 @@ Device fit is 3.2x faster than device score with the CPU fit and 3.7x faster tha
 
 **Tests** (`src/gpu_if_fit_tests.rs`): `if_plan_carries_the_third_child_in_the_slot_word`; `if_device_fit_matches_the_cpu_fit_including_the_switch_point` (device SSE within `1e-8` relative of the CPU fit, with rows at `x0 == 0` and `x0 == x1`, and a `NaN` in the untaken branch); `a_search_with_if_fits_on_the_device` (`dispatch: Device`, no `unsupported_plan` fallback).
 
+### Hard operators in the fit kernel (#499)
+
+The fit kernel takes the operators the scoring kernel has had since #131, with the scoring opcode values: `step` 19, `floor` 23, `ceil` 24, `round` 25, `mod` 26, `atan2` 27, `min` 30, `max` 31, `sign` 33, `equal` 34, `less` 35, `less_or_equal` 36, `greater` 37, `greater_or_equal` 38, `and` 39, `or` 40, `xor` 41, `not` 42. Fit opcode 32 is `if` (#403). The forward sweep (`ft_forward`, `ft_forward_d`) and the adjoint sweep (`ft_backward`, `ft_backward_d`) mirror `apply_op` and `adj_terms` in `src/fit.rs`, so the f32 LM phase and the `--fit-polish f64|f32` phases use one convention.
+
+| operator | value | adjoint |
+|---|---|---|
+| `min`, `max` | `NaN` if either argument is `NaN`, else the smaller or larger | all to the active argument, `0.5` each on a tie |
+| `atan2(y, x)` | `atan2(y, x)` | `x/(x²+y²)` to `y`, `-y/(x²+y²)` to `x`, none when `x²+y² = 0` |
+| `mod(a, b)` | `NaN` for a non-finite argument or `abs(b) < 1e-12`, else `a - b·floor(a/b)` | `1` to `a`, `-floor(a/b)` to `b`, none when `abs(b) < 1e-12` |
+| `step`, `sign`, `floor`, `ceil`, `round` | `step` is `[a > 0]`; `sign` is `NaN` for `NaN`; `round` is half away from zero | none |
+| `equal`, `less`, `less_or_equal`, `greater`, `greater_or_equal` | `0` or `1`, `NaN` if either argument is `NaN` | none |
+| `and`, `or`, `xor` | `0` or `1` on `[a > 0]`, `[b > 0]`, `NaN` if either argument is `NaN` | product-surrogate partials: `[b>0]`, `1-[b>0]`, `1-2[b>0]` for the first argument, symmetric for the second |
+| `not` | `1 - [a > 0]`, `NaN` for `NaN` | none |
+
+A constant reachable only through a value-only operator has a zero Jacobian column. The fit labels such a candidate `rank_deficient` or `no_improvement` and keeps the start; it is not a CPU fallback. Operators without a fit opcode stay `unsupported_plan` CPU fallbacks: `asinh`, `acosh`, `atanh`, `require`, `constrain`, `between`, aggregates, meta operators and block calls.
+
+**Tests** (`src/gpu_hard_op_fit_tests.rs`, device tests skip without CUDA): `hard_op_plan_words_carry_the_scoring_opcodes`; one device-versus-CPU parity test per family (`min_max_device_fit_matches_the_cpu_at_the_tie_rows`, `atan2_device_fit_matches_the_cpu_including_the_origin`, `mod_device_fit_matches_the_cpu_at_exact_multiples`, `piecewise_constant_device_fit_matches_the_cpu_at_the_jumps`, `comparisons_device_fit_matches_the_cpu_on_equal_rows`, `logic_device_fit_matches_the_cpu_on_the_product_surrogate`) with a device loss within `1e-5` relative of the CPU loss; `a_hard_operator_under_if_ignores_a_nan_in_the_untaken_branch`; `constants_only_under_a_value_only_operator_are_labelled_not_fallen_back`; `every_new_opcode_runs_on_nan_inf_and_kink_rows`; `a_search_with_hard_operators_fits_on_the_device` (`dispatch: Device`, no `unsupported_plan`). The unit test `op_coverage_needs_a_fit_opcode_for_every_operator` in `src/fit.rs` lists every operator without a fit opcode.
+
 ### Slope on the batched kernel (issue #236)
 
 `--metric slope` is scored and fitted on the device when the training sample's slope pairs are its consecutive rows: `[k − 1, k]` for every `k` in `1..n` (`search::slope_pairs_are_consecutive`). That is a single series under `--split temporal`. Any other pair list (a shuffled split, a `--group-by` panel, a row missing from the side) keeps the exact CPU scorer with the reason `slope pairs are not the consecutive rows of the training sample`, and a `--fit-rows`/`--fit-samples` subsample (#265) keeps it with its own reason, so the device never differences two rows the CPU would not. Weighted slope does not exist, and a tiled plan refuses the scorer by name (see [Tiled residency](#tiled-residency-293)).
@@ -2075,6 +2134,7 @@ already feasible (p=3, 4), and `4.37e-4 → 1.08e-8` (p=8, near-collinear basis,
 The deferred device fit does per candidate what the CPU arm does.
 
 * **One exact gate.** `fit::device_fit_is_gated` is true for `log_loss`, `correlation`, `correlation_signed` and `signed`. For these, `GpuSearch::fit_pending` passes every usable proposal through `fit::gate_device_proposal`, the same function `fit_batch_verified` uses: rank, signed projection, the configured metric in exact `f64`, or squared SSE. `Rejected` restores the incoming constants and sends the candidate to the exact CPU arm with the label `worse` (`log_loss_worse` for `log_loss`); `NonFinite` does the same with the label `non_finite`. `NotIdentifiable` (signed only) uses the label `not_identifiable`.
+* **Parallel exact gate (#498).** The judgements of one fit batch are independent, so they run on the `--threads` worker pool (`search::gate_proposals`, dynamic hand-out, tree clones per job). Verdicts are applied in admission order: an accepted proposal writes its constants and counts as a device fit, a rejected one is pushed to the CPU fallback with the same label as before. The objective, the start, the `>` rule and the labels are unchanged (the #234 exactness contract), and the trees, verdicts and counters do not depend on the thread count (`search::tests::gate_is_identical_for_one_and_many_workers`). `gpu.fit.gate_s`, `gpu.ledger.fit.gate_s` and `fit.gate_seconds` in the full dev log report the measured gate wall; it is a **subset** of `host_seconds`, never added to it.
 * **Refresh.** After the device write-back, after the CPU fallback batch and after the pipeline write-back, `refresh_after_fit` simplifies each fitted tree and recomputes its complexity, as `evolve_island` does after the CPU fit. Dead `1*` and `+ 0` nodes left by the kernel no longer reach tie-breaks or the in-search archive. A tree the dimensional filter rejects keeps an infinite error.
 * **Pipeline exclusion.** `pipeline_fit_safe` is false for every gated metric, because the pipeline write-back applies kernel constants without the gate.
 * **Wide admission.** `wide_admission` is true at 1 048 576 training rows or more, and for `correlation`, `correlation_signed` and `signed` at any size. With `wide`, `select_promoted` takes every candidate with constants and `GpuSearch::score` screens only the candidates without constants; the others are fitted and scored once. Other metrics keep `max(32, pop/4)` below the threshold.

@@ -840,6 +840,11 @@ extern "C" {
        null pointer clears it, and every log-loss launch is then refused.
        #289: the same resident vector is the classification scorer's label. */
     fn rc_set_fit_sign(ctx: *mut RawCtx, sign: *const f64) -> i32;
+    /* #496: arithmetic of the fit kernel's polish (0 f64, 1 f32, 2 off). */
+    fn rc_set_fit_polish(ctx: *mut RawCtx, mode: i32) -> i32;
+    /* #496: summed per-block cycles of the LM phase and the polish phase of
+       the fit launches since the last call; resets both. */
+    fn rc_take_fit_cycles(ctx: *mut RawCtx, out: *mut u64) -> i32;
     /* #289: the per-row score weight vector, uploaded once per sample. A null
        pointer clears it (every row weighs 1). */
     fn rc_set_score_weights(ctx: *mut RawCtx, w: *const f64) -> i32;
@@ -1703,6 +1708,30 @@ impl GpuEvaluator {
             return false;
         }
         unsafe { rc_set_fit_sign(self.ctx, sign.as_ptr()) == 0 }
+    }
+
+    /// #496: select the arithmetic of the fit kernel's polish for later
+    /// launches.
+    pub fn set_fit_polish(&mut self, mode: crate::fit::FitPolish) {
+        unsafe {
+            rc_set_fit_polish(self.ctx, mode.code());
+        }
+    }
+
+    /// #496: the polish-phase part of `ms` kernel milliseconds, apportioned by
+    /// the per-block cycle sums of the launches since the last call. A launch
+    /// without recorded cycles counts as LM phase.
+    pub fn take_polish_ms(&mut self, ms: f32) -> f64 {
+        let mut cyc = [0u64; 2];
+        unsafe {
+            rc_take_fit_cycles(self.ctx, cyc.as_mut_ptr());
+        }
+        let total = cyc[0] as f64 + cyc[1] as f64;
+        if total > 0.0 && ms > 0.0 {
+            ms as f64 * cyc[1] as f64 / total
+        } else {
+            0.0
+        }
     }
 
     /// #289: upload the per-row weights the classification scorer reads.
@@ -10623,3 +10652,11 @@ mod if_fit_tests;
 #[cfg(test)]
 #[path = "gpu_slope_tests.rs"]
 mod slope_tests;
+
+#[cfg(test)]
+#[path = "gpu_fit_polish_tests.rs"]
+mod fit_polish_tests;
+
+#[cfg(test)]
+#[path = "gpu_hard_op_fit_tests.rs"]
+mod hard_op_fit_tests;

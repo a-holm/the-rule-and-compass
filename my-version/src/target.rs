@@ -6,6 +6,9 @@
 //! this from data, so the spec is a JSON contract (`rcsr-target-spec/1`) loaded
 //! from `--target-spec` or a `<data>.targets.json` sidecar.
 //!
+//! For `kind = "xs_rank"` the label is the per-timestamp rank of
+//! `return_column` over the panel members; the book is priced on `return_column`.
+//!
 //! For `kind = "forward_return"` the label is
 //! `T = clip((r - c) / (m * g), lo, hi)` with return `r`, offset `c`, scale
 //! multiplier `m` and scale value `g` (a column or a constant). The null
@@ -19,7 +22,105 @@ use crate::manifest::sha256_hex;
 pub const SCHEMA: &str = "rcsr-target-spec/1";
 
 /// The supported label kinds.
-pub const KINDS: &[&str] = &["forward_return"];
+pub const KINDS: &[&str] = &["forward_return", "xs_rank"];
+
+/// The label is the per-timestamp rank of `return_column` over the panel
+/// members, mapped to `[-1, 1]` by `rcsr panel rank`.
+pub const KIND_XS_RANK: &str = "xs_rank";
+
+/// Where an evaluator's per-side cost came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CostSource {
+    TargetSpec,
+    Flag,
+    Default,
+}
+
+impl CostSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CostSource::TargetSpec => "target_spec",
+            CostSource::Flag => "flag",
+            CostSource::Default => "default",
+        }
+    }
+}
+
+/// The one cost rule of every evaluator. A target spec that declares a cost
+/// wins; a `--cost-bps` flag that disagrees is refused; `--cost-override`
+/// prices a different cost on purpose and is recorded as `flag`.
+pub fn resolve_cost(
+    spec: Option<&TargetSpec>,
+    flag: Option<f64>,
+    cost_override: Option<f64>,
+    default: f64,
+) -> Result<(f64, CostSource), String> {
+    if flag.is_some() && cost_override.is_some() {
+        return Err("--cost-bps and --cost-override are alternatives; pass one of them".to_string());
+    }
+    if let Some(o) = cost_override {
+        return Ok((o, CostSource::Flag));
+    }
+    match (spec.and_then(TargetSpec::per_side_cost_bps), flag) {
+        (Some(s), Some(f)) if (s - f).abs() > 1e-12 => Err(format!(
+            "--cost-bps {} differs from the target spec ({} per side); \
+             use --cost-override to price a different cost",
+            num(f),
+            num(s)
+        )),
+        (Some(s), _) => Ok((s, CostSource::TargetSpec)),
+        (None, Some(f)) => Ok((f, CostSource::Flag)),
+        (None, None) => Ok((default, CostSource::Default)),
+    }
+}
+
+/// The `cost` block of every report.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CostDecl {
+    pub per_side_bps: f64,
+    pub source: CostSource,
+    /// `log` or `simple`: the units of the return column as declared.
+    pub return_units: String,
+    /// The spec's own per-side cost when it differs from the one charged.
+    pub spec_per_side_bps: Option<f64>,
+}
+
+impl CostDecl {
+    pub fn new(spec: Option<&TargetSpec>, per_side_bps: f64, source: CostSource) -> CostDecl {
+        let spec_cost = spec.and_then(TargetSpec::per_side_cost_bps);
+        CostDecl {
+            per_side_bps,
+            source,
+            return_units: spec.map_or("simple", |s| s.return_units.as_str()).to_string(),
+            spec_per_side_bps: spec_cost.filter(|s| (s - per_side_bps).abs() > 1e-12),
+        }
+    }
+
+    pub fn log_returns(&self) -> bool {
+        self.return_units == "log"
+    }
+
+    pub fn json(&self) -> String {
+        let spec_cost = self
+            .spec_per_side_bps
+            .map(|s| format!(",\"spec_per_side_bps\":{}", num(s)))
+            .unwrap_or_default();
+        format!(
+            "{{\"per_side_bps\":{},\"source\":{},\"return_units\":{}{}}}",
+            num(self.per_side_bps),
+            text(self.source.as_str()),
+            text(&self.return_units),
+            spec_cost
+        )
+    }
+}
+
+/// The spec entry whose label column, name or return column is `target`.
+pub fn entry_for<'a>(specs: &'a [TargetSpec], target: &str) -> Option<&'a TargetSpec> {
+    specs
+        .iter()
+        .find(|s| s.column == target || s.name == target || s.return_column.as_deref() == Some(target))
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Scale {
@@ -69,6 +170,25 @@ impl TargetSpec {
     pub fn window_seconds(&self) -> (f64, f64) {
         let a = self.entry_offset_seconds + self.delay_seconds;
         (a, a + self.horizon_seconds)
+    }
+
+    /// Per-side cost in basis points: half the round-trip `cost_bps`. `None`
+    /// when the spec declares no cost or the cost is already inside the label
+    /// (an evaluator then charges nothing on top).
+    pub fn per_side_cost_bps(&self) -> Option<f64> {
+        if self.cost_in_label {
+            return None;
+        }
+        self.cost_bps.map(|c| c / 2.0)
+    }
+
+    /// The spec members as written to a spec file: the hashed members plus the
+    /// derived `cost_per_side_bps`.
+    pub fn file_json(&self) -> String {
+        match self.cost_bps {
+            Some(c) => format!("{},\"cost_per_side_bps\":{}", self.fields_json(), num(c / 2.0)),
+            None => self.fields_json(),
+        }
     }
 
     /// Minimum stamp distance between a training row and a test row so that
@@ -310,6 +430,11 @@ fn parse_scale(o: &Json, what: &str) -> Result<Scale, String> {
     }
 }
 
+/// Parse one spec object, such as the `target_spec` object of a `run.json`.
+pub fn parse_object(o: &Json) -> Result<TargetSpec, String> {
+    parse_one(o, 0)
+}
+
 fn parse_one(o: &Json, index: usize) -> Result<TargetSpec, String> {
     let what = match o.get("name") {
         Some(Json::Str(s)) => format!("target '{}'", s),
@@ -331,6 +456,21 @@ fn parse_one(o: &Json, index: usize) -> Result<TargetSpec, String> {
         Some(Json::Num(v)) if v.is_finite() => Some(*v),
         _ => return Err(format!("{}: field 'cost_bps' must be a number or null", what)),
     };
+    match o.get("cost_per_side_bps") {
+        None | Some(Json::Null) => {}
+        Some(Json::Num(v)) => match cost_bps {
+            Some(c) if (*v - c / 2.0).abs() <= 1e-12 => {}
+            _ => {
+                return Err(format!(
+                    "{}: cost_per_side_bps {} must equal cost_bps / 2 (cost_bps {:?})",
+                    what,
+                    num(*v),
+                    cost_bps
+                ))
+            }
+        },
+        _ => return Err(format!("{}: field 'cost_per_side_bps' must be a number or null", what)),
+    }
     let construction_columns = match field(o, "construction_columns", &what)? {
         Json::Arr(a) => a
             .iter()
@@ -382,6 +522,25 @@ fn validate(s: &TargetSpec, what: &str) -> Result<(), String> {
             "{}: long_only must be true; the engine has no short label or barrier",
             what
         ));
+    }
+    if s.kind == KIND_XS_RANK {
+        let unit_scale = matches!(&s.scale, Scale::Constant { value } if *value == 1.0);
+        if !unit_scale || s.clip.is_some() || s.offset != 0.0 || s.cost_in_label {
+            return Err(format!(
+                "{}: an xs_rank target has scale constant 1, no clip, offset 0 and cost_in_label false",
+                what
+            ));
+        }
+        match &s.return_column {
+            Some(r) if s.construction_columns.contains(r) => {}
+            Some(r) => {
+                return Err(format!(
+                    "{}: an xs_rank target lists its return_column '{}' in construction_columns",
+                    what, r
+                ))
+            }
+            None => return Err(format!("{}: an xs_rank target needs a return_column", what)),
+        }
     }
     if !valid_name(&s.name) {
         return Err(format!("{}: name must match ^[a-z][a-z0-9_]*$", what));
@@ -815,13 +974,18 @@ pub fn purge_line(spec: &TargetSpec, report: &crate::data::SplitReport) -> Strin
 pub fn split_purge_json(r: &crate::data::SplitReport) -> String {
     let n = |v: Option<f64>| v.map(num).unwrap_or_else(|| "null".into());
     format!(
-        ",\"required_purge_seconds\":{},\"purge_seconds\":{},\"validation_purge_seconds\":{},\"purged_rows\":{{\"test_boundary\":{},\"validation_boundary\":{}}},\"purge_source\":{}",
+        ",\"required_purge_seconds\":{},\"purge_seconds\":{},\"validation_purge_seconds\":{},\"purged_rows\":{{\"test_boundary\":{},\"validation_boundary\":{}}},\"purge_source\":{}{}",
         n(r.required_purge_seconds),
         n(r.purge_seconds),
         n(r.validation_purge_seconds),
         r.purged_test_boundary_rows,
         r.purged_validation_boundary_rows,
-        if r.purge_source.is_empty() { "null".to_string() } else { text(r.purge_source) }
+        if r.purge_source.is_empty() { "null".to_string() } else { text(r.purge_source) },
+        if r.boundary_purge_source.is_empty() {
+            String::new()
+        } else {
+            format!(",\"boundary_purge_seconds\":{},\"boundary_purge_source\":{}", num(r.boundary_purge_seconds), text(r.boundary_purge_source))
+        }
     )
 }
 
@@ -831,7 +995,7 @@ pub fn schema_json() -> String {
     let fields: &[(&str, &str, bool, &str)] = &[
         ("column", "string", true, "data column holding the label; unique in the file"),
         ("name", "string", true, "canonical name, ^[a-z][a-z0-9_]*$; unique in the file"),
-        ("kind", "enum", true, "forward_return"),
+        ("kind", "enum", true, "forward_return | xs_rank (per-timestamp rank of return_column over the panel members in [-1, 1], written by rcsr panel rank; needs return_column, scale constant 1, no clip, offset 0)"),
         ("deprecated", "bool", false, "the label is kept for replays only"),
         ("return_column", "string|null", false, "column holding the raw future return; refused as an input (D13a)"),
         ("return_units", "enum", true, "log | simple"),
@@ -844,7 +1008,8 @@ pub fn schema_json() -> String {
         ("scale", "object", true, "{kind: constant, value} or {kind: column, column, multiplier, window_seconds, ends_at_offset_seconds}; the scale column must be listed in construction_columns"),
         ("clip", "[lo, hi]|null", false, "lo < hi"),
         ("units", "string", true, "label units, e.g. log_return/(6*vol96)"),
-        ("cost_bps", "number|null", false, "round-trip cost assumption in basis points"),
+        ("cost_bps", "number|null", false, "round-trip cost assumption in basis points; every evaluator reads cost_bps / 2 as the per-side cost"),
+        ("cost_per_side_bps", "number|null", false, "written by rcsr enrich; must equal cost_bps / 2 when present; not part of the spec hash"),
         ("cost_in_label", "bool", true, "true requires offset == cost_bps * 1e-4"),
         ("construction_columns", "string[]", true, "columns used to build the label"),
         ("note", "string|null", false, "free text"),
@@ -1060,5 +1225,72 @@ mod tests {
             Err(ResolveError::Input(_))
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn with_cost(round_trip: Option<f64>, in_label: bool) -> TargetSpec {
+        let mut s = y60m();
+        s.cost_bps = round_trip;
+        s.cost_in_label = in_label;
+        s
+    }
+
+    #[test]
+    fn resolve_cost_spec_only() {
+        let s = with_cost(Some(20.0), false);
+        assert_eq!(resolve_cost(Some(&s), None, None, 12.0), Ok((10.0, CostSource::TargetSpec)));
+    }
+
+    #[test]
+    fn resolve_cost_flag_only() {
+        assert_eq!(resolve_cost(None, Some(7.0), None, 12.0), Ok((7.0, CostSource::Flag)));
+        let no_cost = with_cost(None, false);
+        assert_eq!(resolve_cost(Some(&no_cost), Some(7.0), None, 12.0), Ok((7.0, CostSource::Flag)));
+    }
+
+    #[test]
+    fn resolve_cost_both_equal_and_zero() {
+        let s = with_cost(Some(20.0), false);
+        assert_eq!(resolve_cost(Some(&s), Some(10.0), None, 12.0), Ok((10.0, CostSource::TargetSpec)));
+        let z = with_cost(Some(0.0), false);
+        assert_eq!(resolve_cost(Some(&z), Some(0.0), None, 12.0), Ok((0.0, CostSource::TargetSpec)));
+    }
+
+    #[test]
+    fn resolve_cost_both_different_is_refused() {
+        let s = with_cost(Some(20.0), false);
+        let e = resolve_cost(Some(&s), Some(12.0), None, 12.0).unwrap_err();
+        assert_eq!(
+            e,
+            "--cost-bps 12 differs from the target spec (10 per side); use --cost-override to price a different cost"
+        );
+    }
+
+    #[test]
+    fn resolve_cost_override_is_recorded_as_flag() {
+        let s = with_cost(Some(20.0), false);
+        let (c, src) = resolve_cost(Some(&s), None, Some(30.0), 12.0).unwrap();
+        assert_eq!((c, src), (30.0, CostSource::Flag));
+        let d = CostDecl::new(Some(&s), c, src);
+        assert_eq!(d.spec_per_side_bps, Some(10.0));
+        assert!(d.json().contains("\"source\":\"flag\"") && d.json().contains("\"spec_per_side_bps\":10"));
+        assert!(resolve_cost(Some(&s), Some(10.0), Some(30.0), 12.0).is_err());
+    }
+
+    #[test]
+    fn resolve_cost_neither_uses_the_default() {
+        assert_eq!(resolve_cost(None, None, None, 12.0), Ok((12.0, CostSource::Default)));
+        let in_label = with_cost(Some(20.0), true);
+        assert_eq!(resolve_cost(Some(&in_label), None, None, 12.0), Ok((12.0, CostSource::Default)));
+    }
+
+    #[test]
+    fn cost_per_side_field_must_match_the_round_trip() {
+        let s = with_cost(Some(20.0), false);
+        let body = format!("{{\"schema\":{},\"targets\":[{{{}}}]}}", text(SCHEMA), s.file_json());
+        assert_eq!(parse_file(&body).unwrap()[0], s);
+        assert!(parse_file(&body.replace("\"cost_per_side_bps\":10", "\"cost_per_side_bps\":9"))
+            .unwrap_err()
+            .contains("cost_per_side_bps"));
+        assert_eq!(s.sha256(), with_cost(Some(20.0), false).sha256());
     }
 }

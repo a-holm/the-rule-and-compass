@@ -733,7 +733,7 @@ fn a_validation_slice_in_the_lockbox_is_refused_like_a_test_block() {
 
     let allowed = lockbox_run(
         &data,
-        &["--test-frac", "0.3", "--validation-frac", "0.2", "--allow-lockbox"],
+        &["--test-frac", "0.3", "--validation-frac", "0.2", "--allow-lockbox", "--lockbox", "none"],
     );
     assert_eq!(code(&allowed), 0, "{}", stderr(&allowed));
 
@@ -899,4 +899,21 @@ fn label_columns_are_never_inputs_named_or_default() {
         Json::Arr(a) => assert!(a.iter().all(|v| !v.as_str().unwrap().starts_with("lbl_")), "{a:?}"),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn require_clean_inputs_refuses_a_construction_column_in_vars() {
+    let dir = scratch();
+    let rows = grid(900, 120, 1);
+    let data = write_csv(&dir, "d.csv", &rows, false);
+    let spec = Spec::gross("yg").write(&dir, "s.json");
+    let b = T0 + 900 * 90;
+    let sel = select(T0 + 900 * 80, b);
+    let out = run(&data, &spec, "yg", "sigma,x", &with_select(&sel, &["--require-clean-inputs"]));
+    assert_eq!(code(&out), 5, "{}", stderr(&out));
+    assert!(stderr(&out).contains("sigma"), "{}", stderr(&out));
+    let clean = run(&data, &spec, "yg", "x", &with_select(&sel, &["--require-clean-inputs"]));
+    assert_eq!(code(&clean), 0, "{}", stderr(&clean));
+    let off = run(&data, &spec, "yg", "sigma,x", &with_select(&sel, &[]));
+    assert_eq!(code(&off), 0, "{}", stderr(&off));
 }

@@ -1556,6 +1556,9 @@ pub fn run(args: &[String]) -> ! {
     if matches!(cmd, "schema" | "append") {
         crate::panel_append::cli(cmd, &args[1..]);
     }
+    if cmd == "rank" {
+        crate::panel_rank::cli(&args[1..]);
+    }
     let mut data = None;
     let mut membership_path = None;
     let mut out = None;
@@ -2045,6 +2048,11 @@ BUILD / AUDIT:
   --start <epoch|date>    build window start (default: panel first bar)
   --end <epoch|date>      build window end (default: panel last bar)
   --allow-lockbox         permit a window overlapping 2026H2 (declared final test only)
+  --locked-test <START,END>
+                          build (hourly v2): declare the protocol locked test (UTC,
+                          half-open) in <out>.manifest.json and <out>.schema.json;
+                          append and enrich copy it, and the search, walkforward,
+                          ladder and ablation score refuse it
   --resume <dir>          resumable build: one atomic binary part per symbol,
                           keyed by the store SHA-256, the membership decisions
                           and the settings; a fully warm re-run reads the parts
@@ -2066,6 +2074,8 @@ HOURLY V2 PANEL (#259):
   rcsr panel validate --data panel.rcsb [--base base_h1.rcsb] [--membership membership.csv]
   rcsr panel schema --data panel.rcsb [--panel-version V] [--verify]
   rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b --out out.rcsb [--scratch dir]
+  rcsr panel rank --data panel.rcsb --column lbl_h1_fwd --name lbl_h1_xs --out out.rcsb [--min-members 20]
+                  per-timestamp rank in [-1, 1] over the panel members; adds the xs_rank target spec (#493)
   --input <dir>           archive directory (SYMBOL/SYMBOL-15m-YYYY-MM.zip); no network
   --jobs <n>              parallel symbols for snapshot and base (default 1)
   --gpu <auto|on|off>     base: run the 15m to 1h fold on the CUDA device (auto: from 1M decoded rows;
@@ -2076,6 +2086,13 @@ HOURLY V2 PANEL (#259):
   --require-full-bucket   base: drop an hour with fewer than four 15m bars (default)
   --keep-partial          base: keep it with cov15m 1-3 and the PARTIAL_BUCKET flag
   --interval <15m|1m>     base: archive interval; 1m only reaches the lockbox guard
+  --symbols <file>        snapshot, base: keep only the listed symbols (one per line; # comments
+                          and blank lines ignored; an empty list is a usage error). A listed
+                          symbol with no directory (missing) or an empty directory (empty)
+                          adds no rows and is not an error. The `universe` block of
+                          snapshot.json and <out>.manifest.json records the file SHA-256,
+                          listed, kept, dropped, missing and empty. A changed list rebuilds
+                          the base --resume parts
   --resume <dir>          base: per-symbol cache keyed by the archive SHA-256
   --relist SYMBOL@DATE    build: declare a listing break (repeatable, comma list)
   --listing-gap-days <n>  build: a longer gap between two bars starts a new listing (30)

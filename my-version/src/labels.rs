@@ -23,6 +23,7 @@
 //! There is no short label, barrier or borrow/funding term.
 
 use crate::devlog::{num, text};
+use crate::lockbox::Lockbox;
 use crate::manifest::sha256_hex;
 use crate::ohlcv::{Bar, Timeframe};
 use crate::target::{Scale, TargetSpec};
@@ -471,6 +472,21 @@ pub fn parse_column(name: &str) -> Option<(&str, &'static str)> {
     None
 }
 
+/// `lbl_<label>_xs`: the cross-sectional rank column written by `rcsr panel rank`.
+pub fn is_xs_column(name: &str) -> bool {
+    name.strip_prefix(COLUMN_PREFIX)
+        .and_then(|rest| rest.strip_suffix("_xs"))
+        .is_some_and(|label| !label.is_empty())
+}
+
+/// The refusal for a `long:` label without `fee=`.
+pub fn missing_fee_message(src: &str) -> String {
+    format!(
+        "label '{}': 'fee=' is required: state the per-side fee in basis points (fee=0 for none)",
+        src
+    )
+}
+
 impl LongLabelSpec {
     /// Parse `long:<horizon>[,name=ID][,delay=BARS][,fee=BP][,spread=BP]
     /// [,slip=BP][,vol=BARS][,floor=BP][,clip=C][,up=U][,down=D][,stride=N]`.
@@ -479,6 +495,7 @@ impl LongLabelSpec {
     pub fn parse(src: &str, bar_seconds: i64) -> Result<Self, String> {
         let bad = |part: &str| format!("label '{}': bad option '{}'", src, part);
         let mut spec = LongLabelSpec::new("", bar_seconds, 0);
+        let mut fee_set = false;
         let mut named = false;
         for part in src.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             if let Some(h) = part.strip_prefix("long:") {
@@ -512,7 +529,10 @@ impl LongLabelSpec {
                     named = true;
                 }
                 "delay" => spec.delay_bars = count()?,
-                "fee" => spec.cost.fee_bps = float()?,
+                "fee" => {
+                    spec.cost.fee_bps = float()?;
+                    fee_set = true;
+                }
                 "spread" => spec.cost.spread_bps = float()?,
                 "slip" => spec.cost.slippage_bps = float()?,
                 "vol" => spec.sigma_window = count()?,
@@ -528,11 +548,19 @@ impl LongLabelSpec {
         if spec.horizon_bars == 0 {
             return Err(format!("label '{}': needs 'long:<horizon>' with at least one bar", src));
         }
+        if !fee_set {
+            return Err(missing_fee_message(src));
+        }
         if !named {
             spec.name = format!("h{}", spec.horizon_bars);
         }
         spec.validate()?;
         Ok(spec)
+    }
+
+    /// Whether a `long:` label spec states `fee=`.
+    pub fn declares_fee(src: &str) -> bool {
+        src.split(',').any(|p| p.trim().split_once('=').is_some_and(|(k, _)| k.trim() == "fee"))
     }
 
     /// Volatility window of a `long:` label spec, read without resolving the horizon.
@@ -592,7 +620,16 @@ pub struct LabelReport {
     pub effective_n: f64,
     pub effective_n_hours: f64,
     pub purge_seconds: i64,
+    /// The declared locked test the statistics leave out, with the number of
+    /// valid rows left out. `None` when no range applies.
+    pub locked_test: Option<LockedLeftOut>,
     pub label_hash: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LockedLeftOut {
+    pub range: Lockbox,
+    pub rows_left_out: usize,
 }
 
 const QUANTILES: [f64; 7] = [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99];
@@ -626,6 +663,7 @@ struct Tally {
     action_long: usize,
     uniqueness_sum: f64,
     top: Vec<TopMove>,
+    left_out: usize,
 }
 
 fn move_order(a: &TopMove, b: &TopMove) -> std::cmp::Ordering {
@@ -649,12 +687,13 @@ impl Tally {
         }
         self.action_long += other.action_long;
         self.uniqueness_sum += other.uniqueness_sum;
+        self.left_out += other.left_out;
         self.top.extend(other.top);
         self.top.sort_by(move_order);
         self.top.truncate(TOP_MOVES);
     }
 
-    fn into_report(mut self, spec: &LongLabelSpec, label_hash: String) -> LabelReport {
+    fn into_report(mut self, spec: &LongLabelSpec, range: Option<Lockbox>, label_hash: String) -> LabelReport {
         let nv = self.fwd.len();
         self.fwd.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mean_abs = if nv == 0 { f64::NAN } else { self.fwd.iter().map(|v| v.abs()).sum::<f64>() / nv as f64 };
@@ -685,6 +724,7 @@ impl Tally {
             effective_n: self.uniqueness_sum,
             effective_n_hours: self.uniqueness_sum * hours,
             purge_seconds: spec.purge_seconds(),
+            locked_test: range.map(|range| LockedLeftOut { range, rows_left_out: self.left_out }),
             label_hash,
         }
     }
@@ -722,9 +762,10 @@ impl LongLabels {
         })
     }
 
-    fn tally(&self, symbol: Option<&str>) -> Tally {
+    fn tally(&self, symbol: Option<&str>, keep: &dyn Fn(i64) -> bool) -> Tally {
         let rows = self.fwd.len();
-        let valid: Vec<usize> = (0..rows).filter(|&t| self.fwd[t].is_finite()).collect();
+        let finite = (0..rows).filter(|&t| self.fwd[t].is_finite()).count();
+        let valid: Vec<usize> = (0..rows).filter(|&t| self.fwd[t].is_finite() && keep(self.time[t])).collect();
         let with_y: Vec<usize> = valid.iter().copied().filter(|&t| self.y[t].is_finite()).collect();
         let kind = |k: u8| valid.iter().filter(|&&t| self.exit_kind[t] == k).count();
         let mut top: Vec<TopMove> = valid
@@ -743,12 +784,13 @@ impl LongLabels {
             action_long: valid.iter().filter(|&&t| self.action[t] == 1.0).count(),
             uniqueness_sum: valid.iter().map(|&t| self.uniqueness[t]).sum(),
             top,
+            left_out: finite - valid.len(),
         }
     }
 
     /// Report of this one series. Top moves carry no symbol.
     pub fn report(&self) -> LabelReport {
-        self.tally(None).into_report(&self.spec, self.label_hash())
+        self.tally(None, &|_| true).into_report(&self.spec, None, self.label_hash())
     }
 }
 
@@ -758,18 +800,36 @@ impl LongLabels {
 #[derive(Clone, Debug)]
 pub struct LabelAccumulator {
     spec: LongLabelSpec,
+    range: Option<Lockbox>,
+    also: Option<Lockbox>,
     tally: Tally,
     chain: Vec<u8>,
 }
 
 impl LabelAccumulator {
     pub fn new(spec: &LongLabelSpec) -> Self {
-        LabelAccumulator { spec: spec.clone(), tally: Tally::default(), chain: spec.canonical().into_bytes() }
+        Self::with_range(spec, None)
+    }
+
+    /// Rows whose label window reaches `range` (entry within `purge_seconds`
+    /// before its start, or inside it) are left out of every statistic. The
+    /// label hash still covers every row.
+    pub fn with_range(spec: &LongLabelSpec, range: Option<Lockbox>) -> Self {
+        LabelAccumulator { spec: spec.clone(), range, also: None, tally: Tally::default(), chain: spec.canonical().into_bytes() }
+    }
+
+    /// A second range left out the same way.
+    pub fn with_also(mut self, also: Option<Lockbox>) -> Self {
+        self.also = also;
+        self
     }
 
     pub fn add(&mut self, symbol: &str, labels: &LongLabels) {
         let symbol = (!symbol.is_empty()).then_some(symbol);
-        self.tally.merge(labels.tally(symbol));
+        let purge = self.spec.purge_seconds();
+        let ranges = [self.range, self.also];
+        let keep = move |t: i64| ranges.iter().flatten().all(|r| t + purge <= r.start || t >= r.end);
+        self.tally.merge(labels.tally(symbol, &keep));
         self.chain.extend_from_slice(symbol.unwrap_or("").as_bytes());
         self.chain.push(0);
         self.chain.extend_from_slice(labels.label_hash().as_bytes());
@@ -777,7 +837,7 @@ impl LabelAccumulator {
 
     pub fn finish(self) -> LabelReport {
         let hash = sha256_hex(&self.chain);
-        self.tally.into_report(&self.spec, hash)
+        self.tally.into_report(&self.spec, self.range, hash)
     }
 }
 
@@ -804,8 +864,20 @@ impl LabelReport {
             })
             .collect::<Vec<_>>()
             .join(",");
+        let locked = self
+            .locked_test
+            .map(|l| {
+                format!(
+                    ",\"locked_test\":{{\"start_date\":{},\"end_date\":{},\"purge_seconds\":{},\"rows_left_out\":{}}}",
+                    text(&crate::lockbox::date(l.range.start)),
+                    text(&crate::lockbox::date(l.range.end)),
+                    self.purge_seconds,
+                    l.rows_left_out
+                )
+            })
+            .unwrap_or_default();
         format!(
-            "{{\"version\":{},\"name\":{},\"long_only\":true,\"rows\":{},\"valid_rows\":{},\"barrier_rows\":{},\"stride_rows\":{},\"exits\":{{\"profit\":{},\"stop\":{},\"vertical\":{}}},\"action_long_share\":{},\"clipped_share\":{},\"sign_share\":{{\"positive\":{},\"negative\":{},\"zero\":{}}},\"fwd_mean\":{},\"fwd_quantiles\":{{{}}},\"cost_to_move\":{},\"top_abs_moves\":{{\"n\":{},\"moves\":[{}]}},\"average_uniqueness\":{},\"effective_n\":{},\"effective_n_hours\":{},\"purge_seconds\":{},\"label_hash\":{}}}",
+            "{{\"version\":{},\"name\":{},\"long_only\":true,\"rows\":{},\"valid_rows\":{},\"barrier_rows\":{},\"stride_rows\":{},\"exits\":{{\"profit\":{},\"stop\":{},\"vertical\":{}}},\"action_long_share\":{},\"clipped_share\":{},\"sign_share\":{{\"positive\":{},\"negative\":{},\"zero\":{}}},\"fwd_mean\":{},\"fwd_quantiles\":{{{}}},\"cost_to_move\":{},\"top_abs_moves\":{{\"n\":{},\"moves\":[{}]}},\"average_uniqueness\":{},\"effective_n\":{},\"effective_n_hours\":{},\"purge_seconds\":{}{},\"label_hash\":{}}}",
             text(VERSION),
             text(&self.name),
             self.rows,
@@ -829,6 +901,7 @@ impl LabelReport {
             num(self.effective_n),
             num(self.effective_n_hours),
             self.purge_seconds,
+            locked,
             text(&self.label_hash)
         )
     }
@@ -850,4 +923,84 @@ pub fn check_side(side: &str) -> Result<(), String> {
 /// `--allow-short` is refused with the same message as `--side short`.
 pub fn refuse_allow_short() -> String {
     check_side("short").unwrap_err().replace("--side short", "--allow-short")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const T0: i64 = 1_700_000_000 - 1_700_000_000 % 3600;
+    const N: usize = 400;
+    const RANGE: Lockbox = Lockbox { start: T0 + 200 * 3600, end: T0 + 300 * 3600 };
+
+    fn series() -> Vec<Bar> {
+        (0..N)
+            .map(|i| {
+                let x = i as f64;
+                let mut o = 100.0 + 3.0 * (x * 0.37).sin();
+                let mut c = 100.0 + 3.0 * (x * 0.37 + 0.4).sin();
+                if i == 250 {
+                    c = o * 1.5;
+                }
+                if i == 251 {
+                    o = 150.0;
+                    c = 150.0;
+                }
+                Bar::new(T0 + i as i64 * 3600, o, o.max(c) + 0.3, o.min(c) - 0.3, c, 1.0)
+            })
+            .collect()
+    }
+
+    fn spec(name: &str, h: usize, stride: usize) -> LongLabelSpec {
+        let mut s = LongLabelSpec::new(name, 3600, h);
+        s.sigma_window = 5;
+        s.stride = stride;
+        s
+    }
+
+    fn leaves_out(h: usize, stride: usize) {
+        let s = spec("x", h, stride);
+        let l = build(&series(), &s, None).unwrap();
+        let purge = s.purge_seconds();
+        let kept = |t: i64| t + purge <= RANGE.start || t >= RANGE.end;
+        let mut acc = LabelAccumulator::with_range(&s, Some(RANGE));
+        acc.add("A", &l);
+        let r = acc.finish();
+
+        let valid: Vec<usize> = (0..N).filter(|&t| l.fwd[t].is_finite()).collect();
+        let kept_fwd: Vec<f64> = valid.iter().filter(|&&t| kept(l.time[t])).map(|&t| l.fwd[t]).collect();
+        let out = valid.iter().filter(|&&t| l.time[t] + purge > RANGE.start && l.time[t] < RANGE.end).count();
+        assert!(out > 0);
+        assert_eq!(r.rows, N);
+        assert_eq!(r.valid_rows, kept_fwd.len());
+        assert_eq!(r.locked_test.unwrap().rows_left_out, out);
+        assert_eq!(r.valid_rows + out, valid.len());
+        let mean = kept_fwd.iter().sum::<f64>() / kept_fwd.len() as f64;
+        assert!((r.fwd_mean - mean).abs() < 1e-12);
+        for m in &r.top_moves {
+            assert!(kept(m.time), "top move at {} reaches the locked range", m.time);
+        }
+        if h == 1 {
+            assert!(l.fwd.iter().any(|v| v.abs() > 0.4), "the fixture holds the large move");
+            assert!(r.top_moves.iter().all(|m| m.fwd.abs() < 0.4));
+        }
+        assert!(r.json().contains(&format!("\"rows_left_out\":{}", out)));
+
+        let mut plain = LabelAccumulator::new(&s);
+        plain.add("A", &l);
+        let p = plain.finish();
+        assert_eq!(p.valid_rows, valid.len());
+        assert_eq!(p.label_hash, r.label_hash);
+        assert!(!p.json().contains("locked_test"));
+    }
+
+    #[test]
+    fn report_leaves_out_the_locked_range() {
+        leaves_out(1, 1);
+    }
+
+    #[test]
+    fn report_counts_left_out_rows_for_h4_stride_4() {
+        leaves_out(4, 4);
+    }
 }

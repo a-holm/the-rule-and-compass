@@ -101,6 +101,14 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   non-dominated, so each member is the best shape found at some complexity, and
   this lets a building block found on another island or generations earlier
   re-enter the population. `--no-front-parents` disables the feedback.
+- **Survivor selection** is generational by default: the island is replaced by
+  its offspring and only the best individual is carried over. With
+  `--selection afp` parents and offspring compete: the next population is the
+  Pareto-best set on (error, complexity, age), plus a few random immigrants per
+  generation. Small correct shapes and new lineages survive next to large
+  approximations, and individuals that are no better than the mean model are
+  dropped by their rank. Parents are then drawn by Pareto rank and crowding
+  distance.
 - **Variation** has two parts:
   - *mutation* — the edit kind is drawn first (25 % point change, 35 %
     constant/input perturb, 40 % subtree grow/shrink) and the site is chosen
@@ -110,6 +118,12 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
 - **Constant fitting** tunes the numeric constants of a candidate by local
   search. Without it, `y = a·sin(b·x) + c` would almost never be found, because
   random constants rarely land near the right values.
+- **Linear scaling** (`--linear-scaling`, off by default) wraps every candidate
+  shape `f` in a free affine map `a + b·f(x)`. The two coefficients are ordinary
+  constants, fitted with the others (closed-form least-squares start on the
+  CPU), so a shape that is right up to scale and offset scores as right at
+  once. Variation edits the bare shape; the front holds the wrapped formula
+  with its full complexity. It needs a least-squares metric.
 - **Migration** periodically copies an island's best member into a neighbouring
   island; **stagnant islands are restarted** to avoid getting stuck.
 - Termination is by generation count or a time/effort budget.

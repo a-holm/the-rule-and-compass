@@ -100,12 +100,25 @@ time axis is global, so cross-symbol overlap on a panel and misaligned
 `purge_seconds` (the smallest stamp distance between retained training rows and
 test rows, also recorded without a spec), `validation_purge_seconds`,
 `purged_rows.test_boundary`, `purged_rows.validation_boundary` and
-`purge_source`. The text header prints the same facts on a `# purge:` line.
+`purge_source`. It also records `train_time` and `validation_time` as `[first, last]` raw time keys (`validation_time` is `null` without a validation slice; both are absent without `--time`) and `search.candidates_evaluated`, the offspring scored over the run. `rcsr walkforward --front` reads them. The text header prints the same facts on a `# purge:` line.
 
 The 2026H2 lockbox check covers the fit rows, the validation slice and the test
 blocks alike: a validation slice that overlaps the lockbox is refused with the
 message shape and exit code of a test block (`validation split: N row(s) ...
 overlap the lockbox`), unless `--allow-lockbox` declares a final test.
+
+The protocol locked test is a second, separate box. Data that declares it
+(`rcsr panel build --locked-test START,END`) uses the declared range; undeclared
+data uses the protocol default 2025-07-01..2026-07-01. The search, `walkforward`,
+`ladder` and `ablation score` refuse every fit, validation or test row inside
+it (exit 3), and every row whose label window reaches it: a row within the target's `required_purge_seconds` before the range (219600 s without a target spec) is refused too, and the refusal names the exact `--exclude 'ts >= START - purge'`. `walkforward`, `ladder` and `ablation score` refuse a window that ends after `START - purge`. `--lockbox none` is the only opt-out, and the report records
+`"source":"none"`. A `--lockbox` flag on undeclared data adds to the default and never replaces it. Ranges from the store or a flag also fail closed (no `--time`, a non-epoch time column and unstamped rows are refused); the protocol default only checks data with epoch-seconds stamps. `--allow-lockbox` does not open it. Only the sealed
+`--locked-test` path of `walkforward` and `ladder` reads it, once. A pilot
+split such as `--split temporal --validation-frac 0.20` on a panel that ends
+inside the locked range puts its test block there; the refusal tells you to
+`--exclude` the rows.
+
+The check needs the time stamps of every split side. Pass `--time <epoch-seconds column>`; without it the search uses the data's single integer epoch-seconds column, and exits 3 when there is none or several. Selectors without `--time` are checked the same way. `--cv` ignores `--allow-lockbox` for the declared range and draws its folds from the rows left by `--exclude` and `--filter`.
 
 **What fails.** Without the purge, the last training row and first test row
 share most of their label window. The test error is then a near-copy of the
@@ -255,7 +268,7 @@ A row is `NaN` when any bar from `t` to `t+h+d` is missing, partial or has a non
 
 **Report.** The label report lists the share of rows clipped at the bound, the sign shares of `fwd`, its mean and the 1, 5, 25, 50, 75, 95 and 99 % quantiles, the cost-to-move ratio (round trip over mean absolute `fwd`), the exit counts, the purge and the label hash (SHA-256 of the definition version, spec and every column). It also lists the 10 largest absolute forward moves with symbol, decision timestamp and value, the replacement for the retired jumps audit. A panel report merges all symbols; its label hash is the SHA-256 of the spec and each symbol's series hash in store order.
 
-**Columns.** `rcsr enrich --label long:<tf|bars>[,name=<id>][,fee=<bp>][,spread=<bp>][,slip=<bp>][,vol=<bars>][,floor=<bp>][,clip=<c>][,up=<u>][,down=<d>][,delay=<bars>][,stride=<n>]` appends the scale column `vol<W>` when the store lacks it, and `lbl_<name>_fwd`, `_y`, `_long_net`, `_action`, `_t1`, `_exit_ret`, `_m_net`, `_m_barrier` and `_weight` (default name `h<bars>`). They are registered in family `label`: the barrier-scaled kinds (`_y`, `_exit_ret`, `_m_net`, `_m_barrier`) are `NaN` for the first `W` bars of a symbol, the PIT rule is "reads bars t+1 through t+h+d". Next to the store it writes `<out>.labels.json` (the report per target column) and a `y` entry in `<out>.targets.json`, so a run on `lbl_<name>_y` loads the spec and echoes the report in `run.json` as `target_spec.label_report`. A label-family column is refused in `--vars` (D13a, exit 5) and is left out of the default variable list. `rcsr prep` keeps the legacy `fwd:` label only.
+**Columns.** `rcsr enrich --label long:<tf|bars>[,name=<id>],fee=<bp>[,spread=<bp>][,slip=<bp>][,vol=<bars>][,floor=<bp>][,clip=<c>][,up=<u>][,down=<d>][,delay=<bars>][,stride=<n>]` appends the scale column `vol<W>` when the store lacks it, and `lbl_<name>_fwd`, `_y`, `_long_net`, `_action`, `_t1`, `_exit_ret`, `_m_net`, `_m_barrier` and `_weight` (default name `h<bars>`). They are registered in family `label`: the barrier-scaled kinds (`_y`, `_exit_ret`, `_m_net`, `_m_barrier`) are `NaN` for the first `W` bars of a symbol, the PIT rule is "reads bars t+1 through t+h+d". Next to the store it writes `<out>.labels.json` (the report per target column) and a `y` entry in `<out>.targets.json`, so a run on `lbl_<name>_y` loads the spec and echoes the report in `run.json` as `target_spec.label_report`. A label-family column is refused in `--vars` (D13a, exit 5) and is left out of the default variable list. `rcsr prep` keeps the legacy `fwd:` label only.
 
 **Verify.** `tests/long_labels.rs`: `horizon_windows_enter_next_open_and_exit_at_close_exactly`, `action_is_zero_or_plus_one_and_follows_the_cost`, `barrier_hits_profit_stop_and_vertical_in_the_expected_order`, `both_barriers_inside_one_bar_assume_the_stop`, `missing_partial_and_gap_crossing_windows_are_nan`, `purge_is_derived_from_the_spec_not_from_a_name`, `t1_and_the_derived_spec_drive_the_split_purge`, `overlap_is_guarded_and_uniqueness_weights_are_stored`, `spec_parses_and_refuses_what_it_cannot_label`, `top_moves_are_the_largest_absolute_forward_moves_with_stamps`, `accumulator_merges_symbols_and_hash_follows_every_series`, `label_family_columns_are_refused_as_inputs_by_the_d13a_canary`; `tests/enrich.rs`: `long_label_family_is_stored_registered_and_reported`, `legacy_fwd_label_is_unchanged_next_to_a_long_label`, `long_label_dry_run_writes_no_sidecar_and_bad_specs_fail`.
 
@@ -371,7 +384,7 @@ rcsr --data d.csv --target y --vars x1,x2 --split temporal --time t \
 
 # Freeze the expression, then score it once on 2022+ with no search.
 rcsr --data d.csv --target y --vars x1,x2 --eval-expr 'the_chosen_expression' \
-     --train-select "year < 2022" --test-select "year >= 2022"
+     --time t --train-select "year < 2022" --test-select "year >= 2022"
 ```
 
 `--eval-expr` does not search; it parses the formula, scores it on the selected
@@ -462,6 +475,10 @@ say about a new one; a whole-group split exposes it immediately.
 * `tests/dtypes.rs::categorical_expands_to_sorted_one_hot_indicators` (shows what
   the flag actually creates, so its use is deliberate).
 
+### Canonical training order
+
+A per-row P&L book needs each group's rows contiguous and time-ordered. `data::SplitSpec::canonical_train_order` sorts the training rows by (group id, time key, table row) after the centre and scale statistics are computed, so `means` and `stds` do not change. Every train-aligned output (`train`, `keys.train`, `target_scale.train`, `slope_pairs.train`, `trading.train`, `train_indices`) follows the sorted order. A temporal split returns training rows in time order, so a store of any layout needs the flag; a split that keeps table order on a symbol-major store is unchanged by it. `data::TradingColumns::train` builds `TradingSplit.train`; `TradingRows::is_canonical` checks the order and `TradingRows::seam_flags` marks the first and last row of each group. The flag is library-only: no CLI option sets it yet.
+
 ### Per-group reporting
 
 The engine reports global test error and the number of groups in train/test, not
@@ -501,6 +518,21 @@ The tests
 `tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit`,
 `a_partial_cross_section_is_nan_and_a_prefix_is_causal` and
 `btc_and_eth_joins_use_the_same_timestamp_and_a_shift_fails` pin these rules.
+
+### Cross-sectional rank target and the top-tercile book
+
+`rcsr panel rank --data panel.rcsb --column lbl_h1_fwd --name lbl_h1_xs --out ranked.rcsb [--min-members 20]` appends the per-timestamp rank of `--column` among the panel rows to a time-major panel. Every panel row is a PIT member at its `ts`, so the rank runs over the members, not over every live symbol of the symbol-major base (`rcsr enrich` cannot make this rank, it runs symbol-major).
+
+```text
+r = 2 * (rank - 1) / (n - 1) - 1      rank 1 = lowest value, ties take the average rank
+                                      n finite values at ts; NaN when n < --min-members (default 20, at least 2)
+```
+
+A rank reads the values of one timestamp only. The existing blocks are copied unchanged (column SHA-256 in `<out>.schema.json` stays), the input is never written, and the output carries the locked-test declaration of the input (`lockbox::resolve`, protocol default for an undeclared panel). `--name` must be `lbl_<label>_xs`: the registry knows it as a label-family lead column (`causal_offset 1`), so it is refused in `--vars` (D13a, exit 5) and never drawn by `--project`.
+
+The command adds an `xs_rank` entry to `<out stem>.targets.json` (the entries of the input sidecar carry over). `horizon_seconds`, `entry_offset_seconds`, `delay_seconds`, `return_units` and `cost_bps` come from the `forward_return` entry whose `return_column` (or column) is `--column`, found in `--target-spec` or `<data stem>.targets.json`; `return_column` is `--column`, the scale is constant 1, `clip` is null, the offset is 0 and `construction_columns` is `[--column]`. The purge is the `forward_return` rule: `entry_offset + delay + horizon`.
+
+`--objective pnl|sharpe|log_growth` accepts a `forward_return` or `xs_rank` target; the book is always priced on `return_column` with its `return_units` and the one cost rule of the spec. An `xs_rank` target needs `--position top_tercile`: per timestamp, `p = 1` for the top `floor(n / 3)` finite predictions (ties by row order, as `ladder::top_tercile`), `p = 0` otherwise. A timestamp with fewer than 3 finite predictions holds nothing, a NaN prediction is never long, and the final exit is charged. Rows of one timestamp are averaged (equal weight), exposure is the share of long rows (about 1/3). The map needs `--split temporal` (whole timestamps on each side of the split; `temporal-group` cuts every symbol at its own row quantile), `--min-holding 1`, `--max-position 1`, no `--threshold` and no `--fitness pnl`. The search and `rcsr walkforward --policy top-tercile` rank the same cross-section: every row of the timestamp with a finite score, whether or not its label or return exists (rows that `--fill drop` removes for a missing label stay in the ranks of the validation and test books). A row without a return earns and pays nothing (`tests/xs_rank.rs::search_and_walkforward_rank_the_same_cross_section`).
 
 ---
 
@@ -657,7 +689,7 @@ rcsr ... --stability 50
 
 # 3. Freeze, then lockbox
 rcsr ... --eval-expr 'frozen_expression' \
-     --train-select "year < 2022" --test-select "year >= 2022"
+     --time t --train-select "year < 2022" --test-select "year >= 2022"
 
 # 4. Count trials and add costs
 echo $((islands * pop * generations * seeds * folds))
@@ -677,5 +709,6 @@ For the hourly panel the windows, purge, locked test and uncertainty are fixed i
 * **Purge in time.** `purge_seconds >= entry_offset + h + delay` for every symbol; a late listing or a gap in one symbol never puts a training label inside a test window. Verify: `tests/eval_protocol.rs::no_training_label_reaches_a_test_window_on_a_ragged_panel` and `tests/protocol.rs::generated_selectors_leave_the_required_purge_on_a_ragged_panel`.
 * **Row counts are not sample sizes.** 4.78 M rows hide at most about 78 k hourly time points and about 1300 non-overlapping 60 h labels. Report `effective_n` from the block bootstrap design effect, in hours.
 * **Block, not row, uncertainty.** A circular block bootstrap with `L >= max(h, holding period)`. Verify: `tests/inference.rs::iid_over_rejects_on_ar1_and_the_block_does_not`.
+* **One book.** The cost, the return units and the position rule come from the target spec and the search `run.json` (`walkforward --from-run`, `ablation score --from-run`, `ladder --target-spec`), never from flags typed again. `rcsr enrich --label long:<h>` needs an explicit `fee=`. See `docs/walkforward.md` (One book from search to evaluation); verify `tests/cost_contract.rs::one_cost_one_book_across_evaluators`.
 * **Benchmarks beside the book.** Cash, buy-and-hold, equal-weight universe and the best long/flat baseline, with exposure and beta, so market drift is visible.
 * **One read of the locked test**, after `locked_candidates.json` is sealed. A tweak and rerun is a new trial.

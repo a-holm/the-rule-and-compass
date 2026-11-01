@@ -319,15 +319,31 @@ fn opt_i64(v: Option<i64>) -> String {
 }
 
 /// Serialise the schema: a header line, one line per column.
-pub fn schema_json(columns: &[ColumnSchema], rows: usize, panel_version: &str) -> String {
+pub fn schema_json(
+    columns: &[ColumnSchema],
+    rows: usize,
+    panel_version: &str,
+    locked_test: Option<&crate::lockbox::Lockbox>,
+    also: Option<&crate::lockbox::Lockbox>,
+) -> String {
+    let locked = locked_test
+        .map(|l| {
+            format!(
+                "\"locked_test\":{}{},",
+                l.declaration_json("rcsr panel build --locked-test"),
+                crate::lockbox::also_json(also, "rcsr panel build --locked-test")
+            )
+        })
+        .unwrap_or_default();
     let mut s = format!(
         "{{\"panel_version\":{},\"schema_version\":{},\"feature_registry_version\":{},\
-         \"compact_parity_owner\":\"#{}\",\"rows\":{},\"columns\":[\n",
+         \"compact_parity_owner\":\"#{}\",\"rows\":{},{}\"columns\":[\n",
         esc(panel_version),
         SCHEMA_VERSION,
         FEATURE_REGISTRY_VERSION,
         PARITY_OWNER_ISSUE,
-        rows
+        rows,
+        locked
     );
     for (i, c) in columns.iter().enumerate() {
         let r = &c.resolved;
@@ -359,11 +375,23 @@ pub fn schema_json(columns: &[ColumnSchema], rows: usize, panel_version: &str) -
     s
 }
 
-/// Hash every column of `store_path` and write `<store_path>.schema.json`.
+/// Hash every column of `store_path` and write `<store_path>.schema.json`,
+/// keeping the locked test the store already declares.
 pub fn write_schema(store_path: &str, panel_version: &str) -> Result<String, String> {
+    let kept = crate::lockbox::stored_all(store_path).map_err(|e| e.message)?;
+    write_schema_declared(store_path, panel_version, kept.as_ref().map(|s| &s.range), kept.as_ref().and_then(|s| s.also.as_ref()))
+}
+
+/// As [`write_schema`], with an explicit locked test declaration (or none).
+pub fn write_schema_declared(
+    store_path: &str,
+    panel_version: &str,
+    locked_test: Option<&crate::lockbox::Lockbox>,
+    also: Option<&crate::lockbox::Lockbox>,
+) -> Result<String, String> {
     let store = FileStore::open(store_path)?;
     let columns = build_schema(&store)?;
-    let text = schema_json(&columns, store.n_rows(), panel_version);
+    let text = schema_json(&columns, store.n_rows(), panel_version, locked_test, also);
     let out = schema_path(store_path);
     std::fs::write(&out, text).map_err(|e| format!("{}: {}", out, e))?;
     Ok(out)
@@ -467,6 +495,9 @@ pub struct View {
     pub seed: u64,
     pub view: usize,
     pub size: usize,
+    /// Columns the view holds; below `size` when the store has too few
+    /// candidate families for the two-per-family rule.
+    pub delivered: usize,
     pub columns: Vec<String>,
     pub families: Vec<(String, Vec<String>)>,
     /// Every candidate column the view leaves out: name, registry family
@@ -494,12 +525,14 @@ impl View {
             })
             .collect();
         format!(
-            "{{\"view_id\":{},\"seed\":{},\"view\":{},\"size\":{},\"feature_registry_version\":{},\
+            "{{\"view_id\":{},\"seed\":{},\"view\":{},\"size\":{},\"requested\":{},\"delivered\":{},\"feature_registry_version\":{},\
              \"columns\":[{}],\"families\":{{{}}},\"omitted\":[{}]}}",
             esc(&self.id),
             self.seed,
             self.view,
             self.size,
+            self.size,
+            self.delivered,
             FEATURE_REGISTRY_VERSION,
             cols.join(","),
             fams.join(","),
@@ -535,9 +568,24 @@ pub fn check_view_size(size: usize) -> Result<(), String> {
 /// different names. The result depends only on the column names, the registry
 /// and the arguments, never on row data.
 pub fn select_view(columns: &[String], size: usize, seed: u64, view: usize) -> Result<View, String> {
+    select_view_excluding(columns, size, seed, view, &[])
+}
+
+/// `select_view` with columns that must never be drawn: `(name, reason)` pairs,
+/// listed as omitted with that reason.
+pub fn select_view_excluding(
+    columns: &[String],
+    size: usize,
+    seed: u64,
+    view: usize,
+    excluded: &[(String, String)],
+) -> Result<View, String> {
     check_view_size(size)?;
     let mut fams: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for c in columns {
+        if excluded.iter().any(|(n, _)| n == c) {
+            continue;
+        }
         if let Some(r) = lookup(c) {
             if r.available && !r.input && r.causal_offset <= 0 {
                 fams.entry(r.family).or_default().push(c.clone());
@@ -584,6 +632,10 @@ pub fn select_view(columns: &[String], size: usize, seed: u64, view: usize) -> R
         .filter(|c| !chosen.contains(c))
         .map(|c| {
             let (family, reason) = match lookup(c) {
+                _ if excluded.iter().any(|(n, _)| n == c) => {
+                    let why = excluded.iter().find(|(n, _)| n == c).map(|(_, w)| w.clone()).unwrap_or_default();
+                    (lookup(c).map_or_else(|| "unregistered".to_string(), |r| r.family), why)
+                }
                 None => ("unregistered".to_string(), "not in the feature registry".to_string()),
                 Some(r) if !r.available => (r.family, "registered but unavailable".to_string()),
                 Some(r) if r.input => (r.family, "raw input column, not a view candidate".to_string()),
@@ -604,6 +656,7 @@ pub fn select_view(columns: &[String], size: usize, seed: u64, view: usize) -> R
         seed,
         view,
         size,
+        delivered: cols.len(),
         columns: cols,
         families,
         omitted,

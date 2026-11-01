@@ -7,6 +7,7 @@ pub mod attach; // #353: opt-in ptrace attach for hang diagnosis
 pub mod backend;
 pub mod bench;
 pub mod bench_stats;
+pub mod afp; // #465: age-fitness Pareto survivor selection
 pub mod bench_suites;
 pub mod checkpoint;
 pub mod column;
@@ -31,6 +32,7 @@ pub mod panel_pit_gpu; // #302: device PIT as-of merge joins
 pub mod panel_prep; // #301: exact CPU reference for the panel prep policy
 pub mod panel_v2; // #259: default hourly point-in-time panel (snapshot, base, build, validate)
 pub mod panel_append; // #260: schema sidecar and time-major family append
+pub mod panel_rank; // #493: per-timestamp rank target of a time-major panel
 pub mod registry; // #260: versioned feature registry, schema sidecar, views
 pub mod derivatives; // reserved, gated funding/OI/basis family
 pub mod devlog; // #211: optional development log
@@ -73,6 +75,8 @@ pub mod qd; // #120: quality-diversity descriptor grid
 pub mod resample; // #92: index-based resampling with a BLB cap
 pub mod risk; // #307: exact risk monoids (Sharpe, Sortino, log-growth, drawdown, beta/alpha)
 pub mod rng;
+pub mod scale; // #470: linear scaling wrapper
+pub mod run_json; // #482: reader for the parts of run.json later commands use
 pub mod schema;
 pub mod search;
 pub mod selection; // #111: select on train/validation, never the test lockbox
@@ -82,6 +86,7 @@ pub mod baselines; // #310: long-only baseline ladder (cash, buy-and-hold, const
 pub mod ablation; // #266: add-one-family ablation arms, manifests, null columns and verdict
 pub mod ladder; // #266: long-only baseline ladder on one panel and one set of folds
 pub mod target; // #254: declared target spec
+pub mod run_book; // #487: the book a search run selected, read back by the evaluators
 pub mod trading; // #263: exact long/flat P&L, Sharpe and log-growth objective
 pub mod trading_gpu; // #304/#305: fused long-only P&L, exact threshold and shared mask
 pub mod units;

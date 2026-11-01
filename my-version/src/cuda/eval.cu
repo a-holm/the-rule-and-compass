@@ -179,6 +179,10 @@ struct RcCtx {
     float *d_tsign;
     double *d_tsign64;
     int has_tsign;
+    /* #496: arithmetic of the fit polish (0 f64, 1 f32, 2 off) and the summed
+       per-block cycles of the LM and polish phases since the last read. */
+    int fit_polish;
+    unsigned long long fit_cyc[2];
     unsigned int *d_prog;
     unsigned int *d_off;
     float *d_out;
@@ -1794,6 +1798,15 @@ struct FtSmem {
     double sdcarry[MAXC + 1];
 };
 
+/* Fit-kernel helpers for the piecewise operators. `ft_ind` is the 0/1 truth
+   indicator `[x > 0]`, `NaN` for `NaN`, as `ind` in fit.rs. `ft_mod_ok` is the
+   CPU validity test of `mod`. */
+template <typename T>
+__device__ __forceinline__ T ft_ind(T x)
+{
+    return isnan(x) ? (T)CUDART_NAN : (x > (T)0 ? (T)1 : (T)0);
+}
+
 __device__ __forceinline__ void ft_forward(const unsigned int *nd,
                                            int m,
                                            const float *__restrict__ cols,
@@ -1851,6 +1864,55 @@ __device__ __forceinline__ void ft_forward(const unsigned int *nd,
                 case OP_COSH: r = coshf(a); break;
                 case OP_ERF: r = (a == 0.0f) ? 0.0f : erff(a); break;
                 case OP_ERFC: r = erfcf(a); break;
+                case OP_STEP: r = (a > 0.0f) ? 1.0f : 0.0f; break;
+                case OP_FLOOR: r = floorf(a); break;
+                case OP_CEIL: r = ceilf(a); break;
+                case OP_ROUND: r = roundf(a); break;
+                case OP_SIGN:
+                    r = (a > 0.0f) ? 1.0f : (a < 0.0f) ? -1.0f : (a == 0.0f) ? 0.0f : CUDART_NAN_F;
+                    break;
+                case OP_NOT:
+                    r = isnan(a) ? CUDART_NAN_F : (a > 0.0f ? 0.0f : 1.0f);
+                    break;
+                case OP_MIN: {
+                    const float b = v[k1];
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN_F : fminf(a, b);
+                } break;
+                case OP_MAX: {
+                    const float b = v[k1];
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN_F : fmaxf(a, b);
+                } break;
+                case OP_ATAN2: r = atan2f(a, v[k1]); break;
+                case OP_MOD: {
+                    const float b = v[k1];
+                    r = (!isfinite(a) || !isfinite(b) || fabsf(b) < 1e-12f)
+                            ? CUDART_NAN_F
+                            : __fsub_rn(a, __fmul_rn(b, floorf(a / b)));
+                } break;
+                case OP_EQUAL:
+                case OP_LESS:
+                case OP_LESS_OR_EQUAL:
+                case OP_GREATER:
+                case OP_GREATER_OR_EQUAL: {
+                    const float b = v[k1];
+                    bool t = false;
+                    if (op == OP_EQUAL) t = a == b;
+                    else if (op == OP_LESS) t = a < b;
+                    else if (op == OP_LESS_OR_EQUAL) t = a <= b;
+                    else if (op == OP_GREATER) t = a > b;
+                    else t = a >= b;
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN_F : (t ? 1.0f : 0.0f);
+                } break;
+                case OP_AND:
+                case OP_OR:
+                case OP_XOR: {
+                    const float b = v[k1];
+                    bool t = false;
+                    if (op == OP_AND) t = (a > 0.0f) && (b > 0.0f);
+                    else if (op == OP_OR) t = (a > 0.0f) || (b > 0.0f);
+                    else t = (a > 0.0f) != (b > 0.0f);
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN_F : (t ? 1.0f : 0.0f);
+                } break;
                 default: r = CUDART_NAN_F; break;
             }
             v[i] = r;
@@ -1937,6 +1999,47 @@ __device__ __forceinline__ void ft_backward(const unsigned int *nd,
                     adj[k1] += a * powf(x, y) * logf(x);
                 }
                 break;
+            case OP_MOD:
+                if (fabsf(y) >= 1e-12f) {
+                    adj[k0] += a;
+                    adj[k1] += -a * floorf(x / y);
+                }
+                break;
+            case OP_MIN:
+                if (x < y) adj[k0] += a;
+                else if (y < x) adj[k1] += a;
+                else {
+                    adj[k0] += 0.5f * a;
+                    adj[k1] += 0.5f * a;
+                }
+                break;
+            case OP_MAX:
+                if (x > y) adj[k0] += a;
+                else if (y > x) adj[k1] += a;
+                else {
+                    adj[k0] += 0.5f * a;
+                    adj[k1] += 0.5f * a;
+                }
+                break;
+            case OP_ATAN2: {
+                const float d = x * x + y * y;
+                if (d > 0.0f) {
+                    adj[k0] += a * y / d;
+                    adj[k1] += -a * x / d;
+                }
+            } break;
+            case OP_AND:
+                adj[k0] += a * ft_ind(y);
+                adj[k1] += a * ft_ind(x);
+                break;
+            case OP_OR:
+                adj[k0] += a * (1.0f - ft_ind(y));
+                adj[k1] += a * (1.0f - ft_ind(x));
+                break;
+            case OP_XOR:
+                adj[k0] += a * (1.0f - 2.0f * ft_ind(y));
+                adj[k1] += a * (1.0f - 2.0f * ft_ind(x));
+                break;
             case OP_IF:
                 if (x > 0.0f) adj[k1] += a;
                 else adj[slot] += a;
@@ -2008,6 +2111,55 @@ __device__ __forceinline__ void ft_forward_d(const unsigned int *nd,
                 case OP_COSH: r = cosh(a); break;
                 case OP_ERF: r = (a == 0.0) ? 0.0 : erf(a); break;
                 case OP_ERFC: r = erfc(a); break;
+                case OP_STEP: r = (a > 0.0) ? 1.0 : 0.0; break;
+                case OP_FLOOR: r = floor(a); break;
+                case OP_CEIL: r = ceil(a); break;
+                case OP_ROUND: r = round(a); break;
+                case OP_SIGN:
+                    r = (a > 0.0) ? 1.0 : (a < 0.0) ? -1.0 : (a == 0.0) ? 0.0 : CUDART_NAN;
+                    break;
+                case OP_NOT:
+                    r = isnan(a) ? CUDART_NAN : (a > 0.0 ? 0.0 : 1.0);
+                    break;
+                case OP_MIN: {
+                    const double b = v[k1];
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN : fmin(a, b);
+                } break;
+                case OP_MAX: {
+                    const double b = v[k1];
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN : fmax(a, b);
+                } break;
+                case OP_ATAN2: r = atan2(a, v[k1]); break;
+                case OP_MOD: {
+                    const double b = v[k1];
+                    r = (!isfinite(a) || !isfinite(b) || fabs(b) < 1e-12)
+                            ? CUDART_NAN
+                            : __dsub_rn(a, __dmul_rn(b, floor(a / b)));
+                } break;
+                case OP_EQUAL:
+                case OP_LESS:
+                case OP_LESS_OR_EQUAL:
+                case OP_GREATER:
+                case OP_GREATER_OR_EQUAL: {
+                    const double b = v[k1];
+                    bool t = false;
+                    if (op == OP_EQUAL) t = a == b;
+                    else if (op == OP_LESS) t = a < b;
+                    else if (op == OP_LESS_OR_EQUAL) t = a <= b;
+                    else if (op == OP_GREATER) t = a > b;
+                    else t = a >= b;
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN : (t ? 1.0 : 0.0);
+                } break;
+                case OP_AND:
+                case OP_OR:
+                case OP_XOR: {
+                    const double b = v[k1];
+                    bool t = false;
+                    if (op == OP_AND) t = (a > 0.0) && (b > 0.0);
+                    else if (op == OP_OR) t = (a > 0.0) || (b > 0.0);
+                    else t = (a > 0.0) != (b > 0.0);
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN : (t ? 1.0 : 0.0);
+                } break;
                 default: r = CUDART_NAN; break;
             }
             v[i] = r;
@@ -2088,6 +2240,47 @@ __device__ __forceinline__ void ft_backward_d(const unsigned int *nd,
                     adj[k0] += a * y * pow(x, y - 1.0);
                     adj[k1] += a * pow(x, y) * log(x);
                 }
+                break;
+            case OP_MOD:
+                if (fabs(y) >= 1e-12) {
+                    adj[k0] += a;
+                    adj[k1] += -a * floor(x / y);
+                }
+                break;
+            case OP_MIN:
+                if (x < y) adj[k0] += a;
+                else if (y < x) adj[k1] += a;
+                else {
+                    adj[k0] += 0.5 * a;
+                    adj[k1] += 0.5 * a;
+                }
+                break;
+            case OP_MAX:
+                if (x > y) adj[k0] += a;
+                else if (y > x) adj[k1] += a;
+                else {
+                    adj[k0] += 0.5 * a;
+                    adj[k1] += 0.5 * a;
+                }
+                break;
+            case OP_ATAN2: {
+                const double d = x * x + y * y;
+                if (d > 0.0) {
+                    adj[k0] += a * y / d;
+                    adj[k1] += -a * x / d;
+                }
+            } break;
+            case OP_AND:
+                adj[k0] += a * ft_ind(y);
+                adj[k1] += a * ft_ind(x);
+                break;
+            case OP_OR:
+                adj[k0] += a * (1.0 - ft_ind(y));
+                adj[k1] += a * (1.0 - ft_ind(x));
+                break;
+            case OP_XOR:
+                adj[k0] += a * (1.0 - 2.0 * ft_ind(y));
+                adj[k1] += a * (1.0 - 2.0 * ft_ind(x));
                 break;
             case OP_IF:
                 if (x > 0.0) adj[k1] += a;
@@ -3267,10 +3460,14 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                            const int *__restrict__ gauge,
                            int iters,
                            int metric,
+                           int polish,
                            double *__restrict__ outc,
                            double *__restrict__ outsse,
-                           int *__restrict__ outstatus)
+                           int *__restrict__ outstatus,
+                           unsigned long long *__restrict__ outcyc)
 {
+    const unsigned long long t_begin = clock64();
+    unsigned long long t_lm_end = t_begin;
     const int cand = blockIdx.x;
     const int tid = threadIdx.x;
     const int p = pcount[cand];
@@ -3466,6 +3663,8 @@ __global__ void fit_kernel(const float *__restrict__ cols,
             for (int i = 0; i < p; ++i) outc[(size_t)cand * (size_t)kmax + (size_t)i] = S->sc[i];
             outsse[cand] = best;
             outstatus[cand] = status;
+            outcyc[2 * cand] = (unsigned long long)(clock64() - t_begin);
+            outcyc[2 * cand + 1] = 0;
         }
         return;
     }
@@ -3585,17 +3784,22 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                 __syncthreads();
             }
         }
+        t_lm_end = clock64();
         /* Re-baseline the acceptance objective in f64: `best` so far came from
            the f32 assembly, and comparing an f64 trial against it would reject
            every polish step on a systematic rounding difference alone. */
         if (metric == RC_LOSS_HINGE_ORDINARY) phase = 1;
-        if (status == 0) {
+        if (status == 0 && polish == 0) {
             const double exact = ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->sc, S->sred);
             if (isfinite(exact)) best = exact;
         }
         /* Undamped Gauss-Newton polish, exactly like the CPU path. */
-        for (int it = 0; it < 4 && status == 0 && best != 0.0 && !stalled; ++it) {
-            ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, p, metric, phase, S->sc, S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad, &S->sskip, S->sdcarry);
+        for (int it = 0; it < 4 && status == 0 && best != 0.0 && !stalled && polish != 2; ++it) {
+            if (polish == 0) {
+                ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, p, metric, phase, S->sc, S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad, &S->sskip, S->sdcarry);
+            } else {
+                ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad, S->scarry);
+            }
             assembled = 1;
             if (S->sbad) {
                 status = 2;
@@ -3613,14 +3817,18 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                 S->strial[tid] = fmin(1e6, fmax(-1e6, t));
             }
             __syncthreads();
-            double tsse = ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred);
+            double tsse = (polish == 0)
+                ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred)
+                : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->strial, S->sred);
             /* #222: one exact f64 backtrack for the non-smooth objective. */
             if (irls && !(tsse < best)) {
                 if (tid < p) {
                     S->strial[tid] = S->sc[tid] + 0.5 * (S->strial[tid] - S->sc[tid]);
                 }
                 __syncthreads();
-                tsse = ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred);
+                tsse = (polish == 0)
+                    ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred)
+                    : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->strial, S->sred);
             }
             if (tsse < best) {
                 if (tid < p) S->sc[tid] = S->strial[tid];
@@ -3633,15 +3841,18 @@ __global__ void fit_kernel(const float *__restrict__ cols,
         }
         /* #236: the CPU slope arm keeps the incoming constants unless the
            fitted ones are finite and strictly lower. Both are judged by the
-           same f64 pair sweep. */
+           same pair sweep, in the polish arithmetic. */
         if (metric == RC_LOSS_SLOPE && cbase) {
             const double fitted = (status == 0)
                 ? best
-                : ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->sc, S->sred);
+                : (polish == 0)
+                    ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->sc, S->sred)
+                    : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->sc, S->sred);
             if (tid < p) S->strial[tid] = cbase[(size_t)cand * (size_t)kmax + (size_t)tid];
             __syncthreads();
-            const double incoming =
-                ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred);
+            const double incoming = (polish == 0)
+                ? ft_loss_d<PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, metric, S->strial, S->sred)
+                : ft_loss<CHUNK>(nd, m, cols, y, tsign, w64, n, metric, S->strial, S->sred);
             if (fitted < 1e30 && fitted < incoming) {
                 best = fitted;
             } else {
@@ -3678,6 +3889,8 @@ __global__ void fit_kernel(const float *__restrict__ cols,
         for (int i = 0; i < p; ++i) outc[(size_t)cand * (size_t)kmax + (size_t)i] = S->sc[i];
         outsse[cand] = best;
         outstatus[cand] = status;
+        outcyc[2 * cand] = (unsigned long long)(t_lm_end - t_begin);
+        outcyc[2 * cand + 1] = (unsigned long long)(clock64() - t_lm_end);
     }
 }
 
@@ -3776,9 +3989,11 @@ static int ft_launch(RcCtx *c,
                      const int *d_gauge,
                      int iters,
                      int metric,
+                     int polish,
                      double *d_c,
                      double *d_sse,
-                     int *d_status)
+                     int *d_status,
+                     unsigned long long *d_cyc)
 {
     const int bytes = (int)sizeof(FtSmem<MAXC, CHUNK, PCHUNK>);
     static int opted_in = 0;
@@ -3793,8 +4008,8 @@ static int ft_launch(RcCtx *c,
     }
     fit_kernel<MAXC, CHUNK, PCHUNK><<<nprog, CHUNK, bytes, c->s_fit>>>(
         c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->n,
-        c->v, d_prog, d_off, d_p, kmax, d_c0, d_cbase, d_gauge, iters, metric, d_c, d_sse,
-        d_status);
+        c->v, d_prog, d_off, d_p, kmax, d_c0, d_cbase, d_gauge, iters, metric, polish, d_c,
+        d_sse, d_status, d_cyc);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
@@ -5625,6 +5840,7 @@ static float rc_fit_launch(RcCtx *c,
     const size_t o_c = rc_fs_take(&cur, cbytes);
     const size_t o_sse = rc_fs_take(&cur, sizeof(double) * (size_t)nprog);
     const size_t o_status = rc_fs_take(&cur, sizeof(int) * (size_t)nprog);
+    const size_t o_cyc = rc_fs_take(&cur, sizeof(unsigned long long) * (size_t)nprog * 2);
     const size_t io_end = rc_fs_take(&cur, 0);
     if (rc_fs_reserve(c, RC_FS_FIT, io_end, io_end) != 0) return -1.0f;
     rc_fs_begin(c);
@@ -5649,13 +5865,15 @@ static float rc_fit_launch(RcCtx *c,
             c, nprog, kmax, (const unsigned int *)(base + o_prog),
             (const unsigned int *)(base + o_off), (const int *)(base + o_p),
             (const double *)(base + o_c0), d_cbase, (const int *)(base + o_gauge), iters, metric,
-            (double *)(base + o_c), (double *)(base + o_sse), (int *)(base + o_status));
+            c->fit_polish, (double *)(base + o_c), (double *)(base + o_sse),
+            (int *)(base + o_status), (unsigned long long *)(base + o_cyc));
     } else {
         launched = ft_launch<FT_MAX_CONST_LARGE, FT_CHUNK_LARGE, FT_PCHUNK>(
             c, nprog, kmax, (const unsigned int *)(base + o_prog),
             (const unsigned int *)(base + o_off), (const int *)(base + o_p),
             (const double *)(base + o_c0), d_cbase, (const int *)(base + o_gauge), iters, metric,
-            (double *)(base + o_c), (double *)(base + o_sse), (int *)(base + o_status));
+            c->fit_polish, (double *)(base + o_c), (double *)(base + o_sse),
+            (int *)(base + o_status), (unsigned long long *)(base + o_cyc));
     }
     cudaEventRecord(c->t1, c->s_fit);
     if (launched != 0) {
@@ -5667,6 +5885,13 @@ static float rc_fit_launch(RcCtx *c,
     memcpy(outc, host + o_c, cbytes);
     memcpy(outsse, host + o_sse, sizeof(double) * (size_t)nprog);
     memcpy(outstatus, host + o_status, sizeof(int) * (size_t)nprog);
+    {
+        const unsigned long long *cyc = (const unsigned long long *)(host + o_cyc);
+        for (int k = 0; k < nprog; ++k) {
+            c->fit_cyc[0] += cyc[2 * k];
+            c->fit_cyc[1] += cyc[2 * k + 1];
+        }
+    }
     rc_fs_ok(c, RC_FS_FIT);
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
@@ -5711,6 +5936,29 @@ float rc_fit_batch_from(void *ctx,
 {
     return rc_fit_launch((RcCtx *)ctx, prog, off, pcount, nprog, kmax, c0, cbase, gauge, iters,
                          metric, outc, outsse, outstatus);
+}
+
+/* #496: arithmetic of the fit kernel polish for later launches: 0 f64, 1 f32,
+ * 2 off. */
+int rc_set_fit_polish(void *ctx, int mode)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || mode < 0 || mode > 2) return -1;
+    c->fit_polish = mode;
+    return 0;
+}
+
+/* #496: per-block cycle sums of the LM phase and the polish phase of the fit
+ * launches since the last call; resets both. */
+int rc_take_fit_cycles(void *ctx, unsigned long long *out)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !out) return -1;
+    out[0] = c->fit_cyc[0];
+    out[1] = c->fit_cyc[1];
+    c->fit_cyc[0] = 0;
+    c->fit_cyc[1] = 0;
+    return 0;
 }
 
 /* Shape of the fit-kernel instantiation that would run a batch whose largest

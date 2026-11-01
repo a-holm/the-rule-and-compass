@@ -226,7 +226,7 @@ fn prepare_writes_placebo_and_permuted_columns_next_to_the_real_ones() {
         }
     }
     let table = data::parse_table(&csv).unwrap();
-    let out = ablation::prepare_csv(&ablation::PrepareInput { table: &table, def: &d, time: "ts", group: "sym", keep: &["y".to_string()], seed: 3 }).unwrap();
+    let out = ablation::prepare_csv(&ablation::PrepareInput { table: &table, def: &d, time: "ts", group: "sym", keep: &["y".to_string()], seed: 3, locked: None }).unwrap();
     let prepared = data::parse_table(&out).unwrap();
     assert_eq!(prepared.names, vec!["ts", "sym", "y", "b", "f1", "f2", "p1", "placebo_1", "placebo_2", "perm_f1", "perm_f2"]);
     assert_eq!(prepared.len(), 600);
@@ -235,6 +235,99 @@ fn prepare_writes_placebo_and_permuted_columns_next_to_the_real_ones() {
     let p1 = prepared.col(prepared.index_of("placebo_1").unwrap());
     let pat = prepared.col(prepared.index_of("p1").unwrap());
     assert_eq!(p1.iter().sum::<f64>(), pat.iter().sum::<f64>(), "placebo_1 copies the prevalence of its template");
+}
+
+const NULL_DEF: &str = r#"{"schema":"rcsr-ablation/1","b0":["b"],"groups":{"fam":["f1","f2"],"pat":["p1"]},
+"placebo_template_group":"pat","generation_budget":10,
+"arms":[{"name":"A0","add":[]},{"name":"A1","add":["fam","pat"],"placebo":2},{"name":"A5","add":[],"permute":["fam"]}],
+"rule":{"families":[{"name":"fam","treatment":"A1","controls":["A0"],"null_arm":"A5","null_control":"A0"}]}}"#;
+
+/// Two symbols, 300 rows each; every value from row `flip_from` on is redrawn
+/// when `flipped`, so two stores differ only from that row on.
+fn two_stores_csv(flipped: bool, flip_from: i64) -> String {
+    let mut csv = String::from("ts,sym,y,b,f1,f2,p1\n");
+    for (si, s) in ["a", "b"].iter().enumerate() {
+        let mut rng = Mt::new(10 + si as u32);
+        let mut alt = Mt::new(900 + si as u32);
+        for k in 0..300i64 {
+            let v: Vec<f64> = (0..4).map(|_| gauss(&mut rng)).collect();
+            let w: Vec<f64> = (0..4).map(|_| gauss(&mut alt)).collect();
+            let use_alt = flipped && k >= flip_from;
+            let u = if use_alt { &w } else { &v };
+            let p = if use_alt { (k % 3 == 0) as i32 } else { (k % 7 == 0) as i32 };
+            csv.push_str(&format!("{},{},{},{},{},{},{}\n", 1_000_000 + k * 60, s, u[0], u[1], u[2], u[3], p));
+        }
+    }
+    csv
+}
+
+fn prepare_rows(csv: &str, locked: Option<rcsr::lockbox::Lockbox>) -> (Vec<String>, [usize; 3]) {
+    let d = ablation::parse_definition(NULL_DEF).unwrap();
+    let table = data::parse_table(csv).unwrap();
+    let (out, seg) = ablation::prepare_csv_segments(&ablation::PrepareInput { table: &table, def: &d, time: "ts", group: "sym", keep: &["y".to_string()], seed: 3, locked }).unwrap();
+    (out.lines().map(|l| l.to_string()).collect(), seg)
+}
+
+#[test]
+fn null_columns_on_development_rows_ignore_the_locked_range() {
+    let start = 1_000_000 + 200 * 60;
+    let lb = rcsr::lockbox::Lockbox { start, end: start + 100 * 60 };
+    let (a, seg_a) = prepare_rows(&two_stores_csv(false, 200), Some(lb));
+    let (b, seg_b) = prepare_rows(&two_stores_csv(true, 200), Some(lb));
+    assert_eq!(a[0], b[0]);
+    let dev = |rows: &[String]| rows[1..].iter().filter(|l| l.split(',').next().unwrap().parse::<i64>().unwrap() < start).cloned().collect::<Vec<_>>();
+    assert_eq!(dev(&a).len(), 400);
+    assert_eq!(dev(&a), dev(&b), "development rows, including placebo_* and perm_*, are byte-identical");
+    assert_eq!(seg_a, [400, 200, 0]);
+    assert_eq!(seg_a, seg_b);
+    assert_ne!(a, b, "the locked rows differ");
+
+    let (c, _) = prepare_rows(&two_stores_csv(false, 200), None);
+    let (d, _) = prepare_rows(&two_stores_csv(true, 200), None);
+    assert_ne!(dev(&c), dev(&d), "without a declaration locked values still reach development rows");
+}
+
+#[test]
+fn a_range_outside_the_data_changes_nothing() {
+    let csv = two_stores_csv(false, 200);
+    let (plain, seg) = prepare_rows(&csv, None);
+    assert_eq!(seg, [600, 0, 0]);
+    let far = rcsr::lockbox::Lockbox { start: 2_000_000_000, end: 2_100_000_000 };
+    let (outside, seg) = prepare_rows(&csv, Some(far));
+    assert_eq!(seg, [600, 0, 0]);
+    assert_eq!(plain, outside);
+}
+
+#[test]
+fn permutation_stays_inside_its_segment() {
+    let n = 300usize;
+    let groups: Vec<u64> = (0..n).map(|i| (i / 150) as u64).collect();
+    let segs: Vec<u8> = (0..n).map(|i| if i % 150 < 100 { 0 } else { 1 }).collect();
+    let x: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let keys = ablation::segment_keys(&groups, &segs);
+    let out = ablation::permute_columns(&[&x], &keys, 16, 5);
+    for i in 0..n {
+        let seg_of = |v: f64| (groups[v as usize], segs[v as usize]);
+        assert_eq!(seg_of(out[0][i]), (groups[i], segs[i]), "row {} holds a value from another symbol or segment", i);
+    }
+    assert_ne!(out[0], x);
+    assert_eq!(ablation::segment_keys(&groups, &vec![0u8; n]), groups, "segment 0 keeps the plain group id");
+}
+
+#[test]
+fn placebo_marginal_stays_inside_its_segment() {
+    let n = 400usize;
+    let groups = vec![0u64; n];
+    let segs: Vec<u8> = (0..n).map(|i| if i < 250 { 0 } else { 1 }).collect();
+    let template: Vec<f64> = (0..n).map(|i| if i < 250 { (i % 5) as f64 } else { 100.0 + (i % 3) as f64 }).collect();
+    let out = ablation::placebo_column_segmented(&template, &groups, &segs, 7, 1);
+    assert!(out[..250].iter().all(|v| *v < 5.0), "segment 0 holds only its own template values");
+    assert!(out[250..].iter().all(|v| *v >= 100.0));
+    let mut a = out[..250].to_vec();
+    let mut t = template[..250].to_vec();
+    a.sort_by(|p, q| p.total_cmp(q));
+    t.sort_by(|p, q| p.total_cmp(q));
+    assert_eq!(a, t, "each segment keeps its exact marginal");
 }
 
 // --- scoring a run --------------------------------------------------------------
@@ -261,13 +354,21 @@ fn objective_csv(dir: &std::path::Path) -> String {
 fn write_target_spec(dir: &std::path::Path) -> String {
     let text = "{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{\"column\":\"y\",\"name\":\"raw_target\",\
 \"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"r\",\"return_units\":\"log\",\
-\"horizon_seconds\":3600,\"entry_offset_seconds\":900,\"delay_seconds\":0,\
+\"horizon_seconds\":900,\"entry_offset_seconds\":0,\"delay_seconds\":0,\
 \"entry_price\":\"next open\",\"exit_price\":\"close\",\"offset\":0.0,\
 \"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"log_return\",\
 \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}]}";
     let path = dir.join("spec.json");
     std::fs::write(&path, text).unwrap();
     path.to_string_lossy().into_owned()
+}
+
+/// As [`write_target_spec`], with a horizon of one 900-second bar so that the rows do not overlap.
+fn write_target_spec_one_bar(dir: &std::path::Path) -> String {
+    let path = dir.join("spec900.json");
+    let text = std::fs::read_to_string(write_target_spec(dir)).unwrap();
+    std::fs::write(&path, text.replace("\"horizon_seconds\":3600", "\"horizon_seconds\":900")).unwrap();
+    path.to_str().unwrap().to_string()
 }
 
 fn search(data: &str, spec: &str, extra: &[&str]) -> std::process::Output {
@@ -314,7 +415,7 @@ fn a_real_run_is_scored_on_the_folds_without_the_test_block_in_selection() {
             iso(0),
             iso(280),
             iso(200),
-            iso(290),
+            iso(300),
             iso(400)
         ),
     )
@@ -337,10 +438,24 @@ fn a_real_run_is_scored_on_the_folds_without_the_test_block_in_selection() {
     assert_eq!(r.thresholds, vec![0.6, 0.7, 0.8]);
     assert_eq!(r.net_by_fold_threshold.len(), 1);
     assert_eq!(r.net_by_fold_threshold[0].len(), 3);
-    assert_eq!(r.net_period.len(), 110);
+    assert_eq!(r.net_period.len(), 100);
     assert!(r.return_mse.is_finite());
     assert!((r.net_by_fold_threshold[0][1] - r.net_period.iter().sum::<f64>()).abs() < 1e-12, "headline threshold is the series");
     assert!(r.net_period.iter().sum::<f64>() > 0.0, "the long book wins on a signal-driven return");
+    assert!(std::fs::read_to_string(&res).unwrap().contains("\"min_group_step_seconds\":900"), "the result carries the measured step");
+    let overlap = dir.join("spec2700.json");
+    std::fs::write(&overlap, std::fs::read_to_string(&spec).unwrap().replace("\"horizon_seconds\":900", "\"horizon_seconds\":2700")).unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "ablation", "score", "--run", run_json.to_str().unwrap(), "--data", &data, "--target", "y", "--return-col", "r", "--time", "t",
+            "--windows", windows.to_str().unwrap(), "--purge-seconds", "1800", "--target-spec", overlap.to_str().unwrap(),
+            "--out", dir.join("overlap.json").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(err.contains("overlapping returns") && err.contains("2700-second label horizon"), "{err}");
     assert_eq!(r.feature_list_sha256, ablation::feature_list_sha256(&r.features));
 
     let plain = dir.join("plain.run.json");
@@ -381,7 +496,7 @@ fn score_run_reads_the_expression_and_its_inputs() {
         window: Window { label: "w".into(), train_start: T0, train_end: T0 + 200.0 * 3600.0, test_start: T0 + 205.0 * 3600.0, test_end: T0 + 300.0 * 3600.0 },
         validation_start: T0 + 120.0 * 3600.0,
     }];
-    let folds: Vec<Fold> = ladder::make_folds(&panel, &rows, 3600.0).unwrap();
+    let folds: Vec<Fold> = ladder::make_folds(&panel, &rows, 3600.0, None).unwrap();
     let facts = ablation::RunFacts {
         arm: "A1".into(),
         feature_list_sha256: ablation::feature_list_sha256(&["s".into(), "n".into()]),
@@ -641,4 +756,184 @@ fn a_family_that_loses_only_on_pbo_is_dropped_with_reason_pbo() {
     assert_eq!(candle.verdict, "drop");
     assert_eq!(candle.failed.len(), 1, "{:?}", candle.failed);
     assert!(candle.failed[0].starts_with("pbo:"), "{:?}", candle.failed);
+}
+
+#[test]
+fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
+    use rcsr::lockbox::{self, Lockbox};
+
+    let dir = scratch("locked-test");
+    let data = objective_csv(&dir);
+    let spec = write_target_spec_one_bar(&dir);
+    let run_json = dir.join("A0-s3.run.json");
+    let out = search(&data, &spec, &["--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--arm", "A0", "--json-out", run_json.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let iso = |i: i64| protocol::iso(T0 + 900.0 * i as f64);
+    let windows = dir.join("w.csv");
+    std::fs::write(
+        &windows,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,w0,{},{},{},{},{}\n",
+            iso(0),
+            iso(280),
+            iso(200),
+            iso(300),
+            iso(400)
+        ),
+    )
+    .unwrap();
+    let lb = Lockbox { start: T0 as i64 + 900 * 300, end: T0 as i64 + 900 * 400 };
+    lockbox::write_sidecar(&data, &lb, "test").unwrap();
+    let score = |res: &str| {
+        Command::new(env!("CARGO_BIN_EXE_rcsr"))
+            .args([
+                "ablation", "score", "--run", run_json.to_str().unwrap(), "--data", &data, "--target", "y", "--return-col", "r",
+                "--time", "t", "--windows", windows.to_str().unwrap(), "--purge-seconds", "1800", "--out", res,
+            ])
+            .output()
+            .unwrap()
+    };
+    let refused = score(dir.join("refused.json").to_str().unwrap());
+    assert_eq!(refused.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("declared locked test"), "{}", String::from_utf8_lossy(&refused.stderr));
+    assert!(!dir.join("refused.json").exists());
+
+    // prepare copies the declaration to a sidecar and a search on the CSV refuses the rows
+    let def = dir.join("def.json");
+    std::fs::write(
+        &def,
+        r#"{"schema":"rcsr-ablation/1","b0":["b"],"groups":{"fam":["f1","f2"],"pat":["p1"]},
+"placebo_template_group":"pat","generation_budget":10,
+"arms":[{"name":"A0","add":[]},{"name":"A1","add":["fam"]},{"name":"A5","add":[],"permute":["fam"]}],
+"rule":{"families":[{"name":"fam","treatment":"A1","controls":["A0"],"null_arm":"A5","null_control":"A0"}]}}"#,
+    )
+    .unwrap();
+    let mut csv = String::from("ts,sym,y,b,f1,f2,p1\n");
+    let mut rng = Mt::new(2);
+    for s in ["a", "b"] {
+        for k in 0..400i64 {
+            csv.push_str(&format!("{},{},{},{},{},{},{}\n", T0 as i64 + 900 * k, s, gauss(&mut rng), gauss(&mut rng), gauss(&mut rng), gauss(&mut rng), (k % 7 == 0) as i32));
+        }
+    }
+    let raw = dir.join("raw.csv");
+    std::fs::write(&raw, csv).unwrap();
+    lockbox::write_sidecar(raw.to_str().unwrap(), &lb, "test").unwrap();
+    let prepared = dir.join("prepared.csv");
+    let prep = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "ablation", "prepare", "--definition", def.to_str().unwrap(), "--data", raw.to_str().unwrap(), "--time", "ts", "--group", "sym",
+            "--keep", "y", "--out", prepared.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(prep.status.code(), Some(0), "{}", String::from_utf8_lossy(&prep.stderr));
+    assert_eq!(lockbox::stored(prepared.to_str().unwrap()).unwrap().map(|(_, l)| l), Some(lb));
+    let side = std::fs::read_to_string(lockbox::sidecar_path(prepared.to_str().unwrap())).unwrap();
+    assert!(side.contains("\"segments\":{\"before\":600,\"locked\":200,\"after\":0}"), "{}", side);
+    let found = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "--data", prepared.to_str().unwrap(), "--target", "y", "--vars", "b,f1,f2", "--time", "ts", "--split", "temporal", "--cpu",
+            "--no-dev-log", "--seed", "3", "--generations", "3", "--pop", "16", "--quiet",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(found.status.code(), Some(3), "{}", String::from_utf8_lossy(&found.stderr));
+    assert!(String::from_utf8_lossy(&found.stderr).contains("declared locked test"));
+
+    // undeclared data and a flag range disjoint from the protocol default: the output declares both
+    let raw2 = dir.join("raw2.csv");
+    std::fs::copy(&raw, &raw2).unwrap();
+    let prepared2 = dir.join("prepared2.csv");
+    let range = format!("{},{}", lb.start, lb.end);
+    let prep2 = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "ablation", "prepare", "--definition", def.to_str().unwrap(), "--data", raw2.to_str().unwrap(), "--time", "ts", "--group", "sym",
+            "--keep", "y", "--out", prepared2.to_str().unwrap(), "--lockbox", &range,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(prep2.status.code(), Some(0), "{}", String::from_utf8_lossy(&prep2.stderr));
+    let stored = lockbox::stored_all(prepared2.to_str().unwrap()).unwrap().unwrap();
+    assert_eq!((stored.range, stored.also), (lockbox::protocol_default(), Some(lb)));
+    let resolved = lockbox::resolve(None, prepared2.to_str().unwrap()).unwrap();
+    assert_eq!(resolved.ranges(), vec![lockbox::protocol_default(), lb]);
+    let found = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "--data", prepared2.to_str().unwrap(), "--target", "y", "--vars", "b,f1,f2", "--time", "ts", "--split", "temporal", "--cpu",
+            "--no-dev-log", "--seed", "3", "--generations", "3", "--pop", "16", "--quiet",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(found.status.code(), Some(3), "{}", String::from_utf8_lossy(&found.stderr));
+    assert!(String::from_utf8_lossy(&found.stderr).contains("declared locked test"));
+}
+
+#[test]
+fn stale_sidecar_is_refused() {
+    use rcsr::lockbox::{self, Lockbox};
+
+    let dir = scratch("stale-sidecar");
+    let data = objective_csv(&dir);
+    let spec = write_target_spec_one_bar(&dir);
+    let run_json = dir.join("A0.run.json");
+    let out = search(&data, &spec, &["--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--arm", "A0", "--json-out", run_json.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let windows = dir.join("w.csv");
+    let iso = |i: i64| protocol::iso(T0 + 900.0 * i as f64);
+    std::fs::write(
+        &windows,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,w0,{},{},{},{},{}\n",
+            iso(0),
+            iso(280),
+            iso(200),
+            iso(290),
+            iso(400)
+        ),
+    )
+    .unwrap();
+    let score = || {
+        Command::new(env!("CARGO_BIN_EXE_rcsr"))
+            .args([
+                "ablation", "score", "--run", run_json.to_str().unwrap(), "--data", &data, "--target", "y", "--return-col", "r",
+                "--time", "t", "--windows", windows.to_str().unwrap(), "--purge-seconds", "1800", "--out", dir.join("o.json").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let lb = Lockbox { start: T0 as i64 + 900 * 300, end: T0 as i64 + 900 * 400 };
+    lockbox::write_sidecar(&data, &lb, "test").unwrap();
+    let text = std::fs::read_to_string(lockbox::sidecar_path(&data)).unwrap();
+    assert!(text.contains("\"data_bytes\":") && text.contains("\"data_sha256\":"), "{text}");
+    assert!(lockbox::resolve(None, &data).is_ok());
+
+    // same length, one digit changed: the SHA-256 differs
+    let original = std::fs::read(&data).unwrap();
+    let mut changed = original.clone();
+    let i = changed.iter().rposition(|c| c.is_ascii_digit()).unwrap();
+    changed[i] = if changed[i] == b'0' { b'1' } else { b'0' };
+    std::fs::write(&data, &changed).unwrap();
+    let e = lockbox::resolve(None, &data).unwrap_err();
+    assert_eq!(e.exit, 3, "{}", e.message);
+    assert!(e.message.contains("stale") && e.message.contains("sha256"), "{}", e.message);
+    let found = search(&data, &spec, &[]);
+    assert_eq!(found.status.code(), Some(3), "{}", String::from_utf8_lossy(&found.stderr));
+    assert!(String::from_utf8_lossy(&found.stderr).contains("stale"), "{}", String::from_utf8_lossy(&found.stderr));
+    let refused = score();
+    assert_eq!(refused.status.code(), Some(3), "{}", String::from_utf8_lossy(&refused.stderr));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("stale"), "{}", String::from_utf8_lossy(&refused.stderr));
+    assert!(!dir.join("o.json").exists());
+
+    // another length is refused by the byte count
+    let mut longer = original.clone();
+    longer.push(b'\n');
+    std::fs::write(&data, &longer).unwrap();
+    let e = lockbox::resolve(None, &data).unwrap_err();
+    assert_eq!(e.exit, 3, "{}", e.message);
+    assert!(e.message.contains("bytes"), "{}", e.message);
+
+    // the original bytes are accepted again
+    std::fs::write(&data, &original).unwrap();
+    assert!(lockbox::resolve(None, &data).is_ok());
 }

@@ -1562,6 +1562,12 @@ pub struct SplitSpec {
     /// #145: permit a train or test row inside the 2026H2 lockbox. `false` is
     /// the safe default for every caller of [`prepare_full`].
     pub allow_lockbox: bool,
+    /// #486, #517: the locked test resolved by `lockbox::resolve`: `--lockbox`, the
+    /// declaration stored with the data or the protocol default; `None` only for
+    /// `--lockbox none` and for library callers.
+    /// Train, validation and test rows inside it are refused; `allow_lockbox`
+    /// does not open it.
+    pub declared_lockbox: Option<crate::lockbox::Declared>,
     /// #254: label end offset of the declared target, seconds. Training rows
     /// within this many seconds of a validation or test row are dropped.
     pub purge_seconds: Option<f64>,
@@ -1571,6 +1577,17 @@ pub struct SplitSpec {
     /// #263: the columns a long/flat P&L objective reads. `None` builds no
     /// trading rows.
     pub trading: Option<TradingColumns>,
+    /// #469: sort the training rows by (group, time, row) after the centre and
+    /// scale statistics are computed, so every train-aligned output is in
+    /// canonical order.
+    pub canonical_train_order: bool,
+}
+
+impl SplitSpec {
+    /// The declared locked test when it must fail closed: see [`crate::lockbox::Declared::strict`].
+    pub fn strict_lockbox(&self) -> Option<&crate::lockbox::Declared> {
+        self.declared_lockbox.as_ref().filter(|d| d.strict())
+    }
 }
 
 impl Default for SplitSpec {
@@ -1588,9 +1605,11 @@ impl Default for SplitSpec {
             exclude: None,
             time: TimeSpec::default(),
             allow_lockbox: false,
+            declared_lockbox: None,
             purge_seconds: None,
             scale_column: None,
             trading: None,
+            canonical_train_order: false,
         }
     }
 }
@@ -1654,6 +1673,11 @@ pub struct SplitReport {
     pub purged_validation_boundary_rows: usize,
     /// `target_spec` when a purge was derived from a spec, else `none`.
     pub purge_source: &'static str,
+    /// #519: seconds before a declared locked test whose rows are refused,
+    /// and where it came from (`target_spec` or `protocol_default`). Empty
+    /// without a declared range.
+    pub boundary_purge_seconds: f64,
+    pub boundary_purge_source: &'static str,
 }
 
 pub struct Prepared {
@@ -1704,6 +1728,11 @@ pub struct TradingColumns {
     /// returns (`exp_m1`).
     pub log_returns: bool,
     pub funding_column: Option<String>,
+    /// #469: also build the training slice.
+    pub train: bool,
+    /// #493: also build the cross-section context of the validation and test
+    /// blocks: rows that only a missing label or return removed.
+    pub cross_section: bool,
 }
 
 /// One slice of the trading rows, aligned with the sample rows.
@@ -1713,11 +1742,45 @@ pub struct TradingSlice {
     pub ret: Vec<f64>,
 }
 
+impl TradingSlice {
+    /// Refuses rows whose return is non-finite while the target is finite.
+    pub fn check_finite_returns(&self, target: &[f64]) -> Result<(), String> {
+        let bad = self
+            .ret
+            .iter()
+            .zip(target)
+            .filter(|(r, y)| !r.is_finite() && y.is_finite())
+            .count();
+        if bad > 0 {
+            return Err(format!(
+                "{} training rows have a non-finite return but a finite target",
+                bad
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Trading rows of the validation slice and the pooled test block (#263).
 #[derive(Clone, Debug, Default)]
 pub struct TradingSplit {
+    /// Training rows, aligned with `Prepared::train`. `Some` exactly when
+    /// `TradingColumns::train` is set.
+    pub train: Option<TradingSlice>,
     pub validation: Option<TradingSlice>,
     pub test: TradingSlice,
+    /// #493: rows of the validation and test blocks that only a missing label
+    /// removed, kept so a top-tercile book ranks the same cross-section as the
+    /// walk-forward.
+    pub validation_context: Option<TradingContext>,
+    pub test_context: Option<TradingContext>,
+}
+
+/// Feature rows (as in [`Sample::x`]) and trading rows of a cross-section context.
+#[derive(Clone, Debug, Default)]
+pub struct TradingContext {
+    pub x: Vec<Vec<f64>>,
+    pub slice: TradingSlice,
 }
 
 /// The pair lists of [`Prepared`]'s samples, in the order of each sample.
@@ -2619,6 +2682,198 @@ pub fn prepare_full_targets_weighted_with_indices(
     prepare_full_targets_weighted_inner(t, vars, targets, weight, spec, rng, prep, true)
 }
 
+/// The rows that survive `--exclude` and then `--filter`: the population every
+/// split and every cross-validation fold is drawn from.
+pub fn population_mask(t: &Table, spec: &SplitSpec, prep: &PrepSpec) -> Result<Vec<bool>, String> {
+    population_mask_counted(t, spec, prep).map(|(keep, _, _)| keep)
+}
+
+fn population_mask_counted(
+    t: &Table,
+    spec: &SplitSpec,
+    prep: &PrepSpec,
+) -> Result<(Vec<bool>, usize, usize), String> {
+    let mut excluded_count = 0usize;
+    let mut keep_row = vec![true; t.len()];
+    if let Some(x) = &spec.exclude {
+        let cols: Vec<usize> = x
+            .vars
+            .iter()
+            .map(|v| t.index_of(v))
+            .collect::<Result<_, _>>()?;
+        for r in 0..t.len() {
+            let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
+            if expr::eval(&x.tree, &vals) > 0.0 {
+                excluded_count += 1;
+                keep_row[r] = false;
+            }
+        }
+        if !keep_row.iter().any(|&b| b) {
+            return Err("--exclude removed every row".to_string());
+        }
+    }
+    let mut filtered_count = 0usize;
+    if let Some(f) = &prep.filter {
+        let cols: Vec<usize> = f
+            .vars
+            .iter()
+            .map(|v| t.index_of(v))
+            .collect::<Result<_, _>>()?;
+        for r in 0..t.len() {
+            if !keep_row[r] {
+                continue;
+            }
+            let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
+            let kept = expr::eval(&f.tree, &vals) > 0.0;
+            if !kept {
+                keep_row[r] = false;
+                filtered_count += 1;
+            }
+        }
+        if !keep_row.iter().any(|&b| b) {
+            return Err("--filter kept no rows".to_string());
+        }
+    }
+    Ok((keep_row, excluded_count, filtered_count))
+}
+
+/// Integer columns of the table whose finite values are plausible epoch seconds.
+fn epoch_int_columns(t: &Table) -> Vec<usize> {
+    (0..t.names.len())
+        .filter(|&c| {
+            let Some(v) = t.ints(c) else { return false };
+            let (lo, hi) = v
+                .iter()
+                .copied()
+                .filter(|&x| x != i64::MIN)
+                .fold((i64::MAX, i64::MIN), |(a, b), x| (a.min(x), b.max(x)));
+            lo <= hi && crate::lockbox::plausible_epoch_seconds(lo as f64, hi as f64)
+        })
+        .collect()
+}
+
+/// The single place that names the column holding the row time stamps for the
+/// declared locked test. Without a declaration it is the `--time` column.
+/// With a declaration and no `--time`, it is the one integer column of the
+/// table that holds epoch seconds; zero or several is a usage error.
+pub fn lockbox_time_column(t: &Table, spec: &SplitSpec) -> Result<Option<usize>, String> {
+    let Some(d) = spec.strict_lockbox() else {
+        return Ok(spec.time_col);
+    };
+    if spec.time_col.is_some() {
+        return Ok(spec.time_col);
+    }
+    let found = epoch_int_columns(t);
+    match found.as_slice() {
+        [c] => Ok(Some(*c)),
+        _ => Err(format!(
+            "the data declares a locked test {}; pass --time <epoch-seconds column> so every split side can be checked{}",
+            d.describe(),
+            if found.is_empty() {
+                " (no integer epoch-seconds column found)".to_string()
+            } else {
+                let names: Vec<&str> = found.iter().map(|&c| t.names[c].as_str()).collect();
+                format!(" (candidates: {})", names.join(", "))
+            }
+        )),
+    }
+}
+
+/// Row stamps for the declared-range checks, whole seconds, in table row
+/// order. `None` when no declaration applies or no time column exists.
+/// With a declaration the column must parse and hold epoch seconds.
+pub fn lockbox_stamps(t: &Table, spec: &SplitSpec) -> Result<Option<(usize, Vec<f64>)>, String> {
+    let Some(tc) = lockbox_time_column(t, spec)? else {
+        return Ok(None);
+    };
+    let name = t.names.get(tc).map(String::as_str).unwrap_or("time");
+    let keys = match time_keys_with(t, tc, &spec.time) {
+        Ok((keys, _)) => keys,
+        Err(e) => match spec.strict_lockbox() {
+            Some(d) => {
+                return Err(format!(
+                    "the data declares a locked test {}; time column '{}' cannot be read: {}",
+                    d.describe(),
+                    name,
+                    e
+                ))
+            }
+            None => return Ok(None),
+        },
+    };
+    if let Some(d) = spec.strict_lockbox() {
+        let (lo, hi) = keys
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
+        if !crate::lockbox::plausible_epoch_seconds(lo, hi) {
+            let others: Vec<&str> = epoch_int_columns(t)
+                .into_iter()
+                .filter(|&c| c != tc)
+                .map(|c| t.names[c].as_str())
+                .collect();
+            return Err(format!(
+                "the data declares a locked test {}; time column '{}' is not epoch seconds{}",
+                d.describe(),
+                name,
+                if others.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (the table has epoch-seconds column(s): {})", others.join(", "))
+                }
+            ));
+        }
+    }
+    Ok(Some((tc, keys)))
+}
+
+/// Seconds before a declared locked test whose rows are refused: the target
+/// spec's required purge, else the protocol default.
+fn boundary_purge(spec: &SplitSpec) -> i64 {
+    spec.purge_seconds.unwrap_or(crate::protocol::DEFAULT_PURGE_SECONDS).ceil() as i64
+}
+
+/// Cross-validation guard: every kept row is a potential training or test row
+/// of some fold. The declared locked test is always checked, whatever
+/// `allow_lockbox` says; the 2026H2 box only without it.
+pub fn check_cv_lockbox(
+    t: &Table,
+    spec: &SplitSpec,
+    keep: &[bool],
+    allow_lockbox: bool,
+) -> Result<(), String> {
+    let Some((tc, keys)) = lockbox_stamps(t, spec)? else {
+        return Ok(());
+    };
+    let name = t.names.get(tc).map(String::as_str).unwrap_or("time");
+    let mut times: Vec<i64> = Vec::new();
+    let mut unstamped = 0usize;
+    for (i, k) in keys.iter().enumerate() {
+        if !keep.get(i).copied().unwrap_or(true) {
+            continue;
+        }
+        if k.is_finite() {
+            times.push(k.floor() as i64);
+        } else {
+            unstamped += 1;
+        }
+    }
+    if !allow_lockbox {
+        crate::lockbox::Guard::default().check_times("cross-validation rows", &times)?;
+    }
+    if let Some(d) = &spec.declared_lockbox {
+        if unstamped > 0 && spec.strict_lockbox().is_some() {
+            return Err(format!(
+                "{} row(s) of the cross-validation rows have no time stamp; the declared locked test cannot be checked",
+                unstamped
+            ));
+        }
+        d.check_times("cross-validation rows", name, &times, boundary_purge(spec))?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_full_targets_weighted_inner(
     t: &Table,
@@ -2675,50 +2930,7 @@ fn prepare_full_targets_weighted_inner(
     // run before the row filter, so `--exclude` can never be undone by it.
     // The population is a boolean view over the column-major table: no second
     // copy of the cells (and no text copy) is made while filtering.
-    let mut excluded_count = 0usize;
-    let mut keep_row = vec![true; t.len()];
-    if let Some(x) = &spec.exclude {
-        let cols: Vec<usize> = x
-            .vars
-            .iter()
-            .map(|v| t.index_of(v))
-            .collect::<Result<_, _>>()?;
-        for r in 0..t.len() {
-            let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
-            if expr::eval(&x.tree, &vals) > 0.0 {
-                excluded_count += 1;
-                keep_row[r] = false;
-            }
-        }
-        if !keep_row.iter().any(|&b| b) {
-            return Err("--exclude removed every row".to_string());
-        }
-    }
-
-    // 1. The row filter defines the population the split is drawn from.
-    let mut filtered_count = 0usize;
-    if let Some(f) = &prep.filter {
-        let cols: Vec<usize> = f
-            .vars
-            .iter()
-            .map(|v| t.index_of(v))
-            .collect::<Result<_, _>>()?;
-        for r in 0..t.len() {
-            if !keep_row[r] {
-                continue;
-            }
-            let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
-            if expr::eval(&f.tree, &vals) > 0.0 {
-                // kept
-            } else {
-                keep_row[r] = false;
-                filtered_count += 1;
-            }
-        }
-        if !keep_row.iter().any(|&b| b) {
-            return Err("--filter kept no rows".to_string());
-        }
-    }
+    let (keep_row, excluded_count, filtered_count) = population_mask_counted(t, spec, prep)?;
     // With no `--exclude`/`--filter` the population is the whole table: borrow
     // it rather than copy a second columnar image.
     let filtered_owned;
@@ -2892,6 +3104,9 @@ fn prepare_full_targets_weighted_inner(
     let mut keep = vec![true; n];
     let mut row_filled = vec![false; n];
     let mut rows_dropped_missing = 0usize;
+    // #493: rows that `--fill drop` removed only for a missing label; they
+    // stay in the cross-section of a top-tercile book.
+    let mut label_only_drop = vec![false; n];
 
     // #110: interpolation reads the next bar in each side. On a time-ordered
     // table that is look-ahead, so it needs an explicit opt-in.
@@ -2944,6 +3159,7 @@ fn prepare_full_targets_weighted_inner(
                 if (0..nc).any(|k| cell(&cells, r, k).is_nan()) {
                     keep[r] = false;
                     rows_dropped_missing += 1;
+                    label_only_drop[r] = (0..nv).all(|k| cell(&cells, r, k).is_finite());
                 }
             }
         }
@@ -3159,6 +3375,16 @@ fn prepare_full_targets_weighted_inner(
         }
     }
 
+    let want_context = spec.trading.as_ref().is_some_and(|c| c.cross_section);
+    let context_of = |idx: &[usize]| -> Vec<usize> {
+        if want_context {
+            idx.iter().copied().filter(|&i| !keep[i] && label_only_drop[i]).collect()
+        } else {
+            Vec::new()
+        }
+    };
+    let validation_context_idx = context_of(&validation_idx);
+    let test_context_idx = context_of(&fold_idx.iter().flatten().copied().collect::<Vec<_>>());
     // Rows dropped by preparation leave both the training and test sets.
     train_idx.retain(|&i| keep[i]);
     validation_idx.retain(|&i| keep[i]);
@@ -3293,6 +3519,17 @@ fn prepare_full_targets_weighted_inner(
         s
     };
 
+    if spec.canonical_train_order {
+        let gid: Option<Vec<usize>> = spec.group_col.map(|gc| group_ids(filtered, gc).0);
+        let tkeys = spec.time_col.map(|tc| time_keys(filtered, tc));
+        train_idx.sort_by(|&a, &b| {
+            let ga = gid.as_ref().map_or(0, |g| g[a]);
+            let gb = gid.as_ref().map_or(0, |g| g[b]);
+            ga.cmp(&gb)
+                .then_with(|| tkeys.as_ref().map_or(std::cmp::Ordering::Equal, |k| k.cmp(a, b)))
+                .then(a.cmp(&b))
+        });
+    }
     let train = make(&train_idx);
     let validation = if validation_idx.is_empty() {
         None
@@ -3315,6 +3552,8 @@ fn prepare_full_targets_weighted_inner(
     // `test`; with several folds the per-fold samples are still materialised.
     let test_idx: Vec<usize> = fold_idx.iter().flatten().copied().collect();
     let test = make(&test_idx);
+    let validation_context = (!validation_context_idx.is_empty()).then(|| make(&validation_context_idx));
+    let test_context = (!test_context_idx.is_empty()).then(|| make(&test_context_idx));
     let fold_samples: Vec<Sample> = if fold_idx.len() > 1 {
         fold_idx.iter().map(|f| make(f)).collect()
     } else {
@@ -3362,10 +3601,14 @@ fn prepare_full_targets_weighted_inner(
             cols,
             spec,
             filtered,
+            &train_idx,
             &validation_idx,
             &test_idx,
+            &train,
             validation.as_ref(),
             &test,
+            (&validation_context_idx, validation_context.as_ref()),
+            (&test_context_idx, test_context.as_ref()),
         )?),
         None => None,
     };
@@ -3624,13 +3867,13 @@ pub fn cv_folds_weighted(
     gap: usize,
     seed: u32,
 ) -> Result<Vec<CvFold>, String> {
-    cv_folds_typed(t, vars, target, weight, mode, k, gap, seed, &[])
+    cv_folds_typed(t, vars, target, weight, mode, k, gap, seed, &[], None)
 }
 
 /// Like [`cv_folds_weighted`], with the per-input datatypes produced by
 /// [`apply_dtypes`]. A `Boolean` input is never centred or scaled, exactly as in
 /// [`prepare_full_weighted_with`]; an empty slice means every input is
-/// continuous.
+/// continuous. `keep` limits the folds to the rows of [`population_mask`].
 #[allow(clippy::too_many_arguments)]
 pub fn cv_folds_typed(
     t: &Table,
@@ -3642,7 +3885,21 @@ pub fn cv_folds_typed(
     gap: usize,
     seed: u32,
     dtypes: &[DType],
+    keep: Option<&[bool]>,
 ) -> Result<Vec<CvFold>, String> {
+    if let Some(keep) = keep {
+        if keep.len() != t.len() {
+            return Err(format!(
+                "internal population mask has {} entries for {} rows",
+                keep.len(),
+                t.len()
+            ));
+        }
+        if !keep.iter().all(|&b| b) {
+            let kept = t.select(keep);
+            return cv_folds_typed(&kept, vars, target, weight, mode, k, gap, seed, dtypes, None);
+        }
+    }
     let (var_idx, tgt_idx) = resolve_columns(t, vars, target)?;
     let nv = var_idx.len();
     if !dtypes.is_empty() && dtypes.len() != nv {
@@ -4061,10 +4318,11 @@ fn build_split(
 
 /// #145: refuse a split whose training, validation or test rows fall inside the 2026H2
 /// lockbox. This is the guard behind `rcsr run` (the default search command),
-/// not only `walkforward`. A dataset without a time column cannot be checked;
-/// neither can a numeric time column that is not Unix seconds (a row index or a
-/// year fraction), so the check is skipped rather than rejecting valid
-/// non-crypto data.
+/// not only `walkforward`. Without a declared locked test, a dataset without a
+/// time column cannot be checked, and neither can a numeric time column that is
+/// not Unix seconds, so the check is skipped rather than rejecting valid
+/// non-crypto data. With a declared locked test (#486, #518) every split side
+/// is checked or the run is refused.
 fn check_split_lockbox(
     t: &Table,
     spec: &SplitSpec,
@@ -4073,12 +4331,14 @@ fn check_split_lockbox(
     folds: &[Vec<usize>],
     report: &mut SplitReport,
 ) -> Result<(), String> {
-    let Some(tc) = spec.time_col else {
+    let Some((tc, keys)) = lockbox_stamps(t, spec)? else {
         return Ok(());
     };
-    let keys = match time_keys_with(t, tc, &spec.time) {
-        Ok((keys, _)) => keys,
-        Err(_) => return Ok(()),
+    let declared = spec.strict_lockbox().is_some();
+    let unstamped = |idx: &[usize]| -> usize {
+        idx.iter()
+            .filter(|&&i| !keys.get(i).copied().unwrap_or(f64::NAN).is_finite())
+            .count()
     };
     let times = |idx: &[usize]| -> Vec<i64> {
         idx.iter()
@@ -4091,6 +4351,17 @@ fn check_split_lockbox(
     let validation_times = times(validation);
     let test_idx: Vec<usize> = folds.iter().flatten().copied().collect();
     let test_times = times(&test_idx);
+    if declared {
+        for (side, idx) in [("training", train), ("validation", validation), ("test", &test_idx[..])] {
+            let n = unstamped(idx);
+            if n > 0 {
+                return Err(format!(
+                    "{} row(s) of the {} split have no time stamp; the declared locked test cannot be checked",
+                    n, side
+                ));
+            }
+        }
+    }
     let extent = |v: &[i64]| -> Option<(f64, f64)> {
         v.iter()
             .copied()
@@ -4106,7 +4377,7 @@ fn check_split_lockbox(
         (f64::INFINITY, f64::NEG_INFINITY),
         |(lo, hi), (a, b)| (lo.min(a), hi.max(b)),
     );
-    if !crate::lockbox::plausible_epoch_seconds(span.0, span.1) {
+    if !declared && !crate::lockbox::plausible_epoch_seconds(span.0, span.1) {
         return Ok(());
     }
     report.lockbox_checked = true;
@@ -4122,6 +4393,15 @@ fn check_split_lockbox(
     report.lockbox_train = guard.check_times("training split", &train_times)?;
     report.lockbox_validation = guard.check_times("validation split", &validation_times)?;
     report.lockbox_test = guard.check_times("test split", &test_times)?;
+    if let Some(d) = &spec.declared_lockbox {
+        let boundary_purge = boundary_purge(spec);
+        report.boundary_purge_source = if spec.purge_seconds.is_some() { "target_spec" } else { "protocol_default" };
+        report.boundary_purge_seconds = boundary_purge as f64;
+        let name = t.names.get(tc).map(String::as_str).unwrap_or("time");
+        d.check_times("training split", name, &train_times, boundary_purge)?;
+        d.check_times("validation split", name, &validation_times, boundary_purge)?;
+        d.check_times("test split", name, &test_times, boundary_purge)?;
+    }
     Ok(())
 }
 
@@ -4322,10 +4602,14 @@ fn build_trading(
     cols: &TradingColumns,
     spec: &SplitSpec,
     filtered: &Table,
+    train_idx: &[usize],
     validation_idx: &[usize],
     test_idx: &[usize],
+    train: &Sample,
     validation: Option<&Sample>,
     test: &Sample,
+    validation_context: (&[usize], Option<&Sample>),
+    test_context: (&[usize], Option<&Sample>),
 ) -> Result<TradingSplit, String> {
     let tc = spec
         .time_col
@@ -4375,8 +4659,11 @@ fn build_trading(
         }
     };
     Ok(TradingSplit {
+        train: cols.train.then(|| slice(train_idx, train)),
         validation: validation.map(|v| slice(validation_idx, v)),
         test: slice(test_idx, test),
+        validation_context: validation_context.1.map(|s| TradingContext { x: s.x.clone(), slice: slice(validation_context.0, s) }),
+        test_context: test_context.1.map(|s| TradingContext { x: s.x.clone(), slice: slice(test_context.0, s) }),
     })
 }
 
@@ -5569,5 +5856,162 @@ mod tests {
             1,
             "a mutating fill needs one mutable copy"
         );
+    }
+
+    /// Rows `t,g,x,r,s,y` with `x` = row id. Time-major interleaves the three
+    /// groups; symbol-major lists each group's rows together.
+    fn trading_fixture(time_major: bool) -> Table {
+        let (groups, steps) = (3usize, 50usize);
+        let mut s = String::from("t,g,x,r,s,y\n");
+        let mut id = 0;
+        let mut push = |s: &mut String, g: usize, step: usize| {
+            s.push_str(&format!(
+                "{},g{},{},{},{},{}\n",
+                step,
+                g,
+                id,
+                0.001 * ((id * 7) % 11) as f64 - 0.004,
+                1 + id % 5,
+                (id as f64).sin()
+            ));
+            id += 1;
+        };
+        if time_major {
+            for step in 0..steps {
+                for g in 0..groups {
+                    push(&mut s, g, step);
+                }
+            }
+        } else {
+            for g in 0..groups {
+                for step in 0..steps {
+                    push(&mut s, g, step);
+                }
+            }
+        }
+        table(&s)
+    }
+
+    fn trading_spec(canonical: bool, train: bool, t: &Table) -> SplitSpec {
+        SplitSpec {
+            mode: SplitMode::Temporal,
+            time_col: Some(t.index_of("t").unwrap()),
+            group_col: Some(t.index_of("g").unwrap()),
+            test_frac: 0.2,
+            scale_column: Some("s".into()),
+            trading: Some(TradingColumns {
+                return_column: Some("r".into()),
+                log_returns: true,
+                funding_column: None,
+                train,
+                cross_section: false,
+            }),
+            canonical_train_order: canonical,
+            ..Default::default()
+        }
+    }
+
+    fn prepare_trading(t: &Table, spec: &SplitSpec) -> Prepared {
+        let vars = vec!["x".to_string()];
+        prepare_full_targets_weighted_with_indices(
+            t,
+            &vars,
+            &["y"],
+            None,
+            spec,
+            &mut Mt::new(3),
+            &PrepSpec::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn train_trading_slice_exists_only_when_requested_and_aligns() {
+        let t = trading_fixture(true);
+        let off = prepare_trading(&t, &trading_spec(false, false, &t));
+        assert!(off.trading.unwrap().train.is_none());
+        let p = prepare_trading(&t, &trading_spec(false, true, &t));
+        let slice = p.trading.as_ref().unwrap().train.as_ref().unwrap();
+        let n = p.train.y.len();
+        assert_eq!(slice.ret.len(), n);
+        assert_eq!(slice.rows.time.len(), n);
+        assert_eq!(slice.rows.group.len(), n);
+        let r = t.col(t.index_of("r").unwrap()).to_vec();
+        let tt = t.col(t.index_of("t").unwrap()).to_vec();
+        for (k, &row) in p.train_indices.iter().enumerate() {
+            let id = (p.train.x[k][0] * p.stds[0] + p.means[0]).round() as usize;
+            assert_eq!(id, row);
+            assert_eq!(slice.ret[k], r[row].exp_m1());
+            assert_eq!(slice.rows.time[k], tt[row]);
+            assert_eq!(slice.rows.group[k], (row % 3) as u64);
+        }
+    }
+
+    #[test]
+    fn canonical_order_permutes_every_train_output_together() {
+        let t = trading_fixture(true);
+        let plain = prepare_trading(&t, &trading_spec(false, true, &t));
+        assert!(!plain.trading.as_ref().unwrap().train.as_ref().unwrap().rows.is_canonical());
+        let p = prepare_trading(&t, &trading_spec(true, true, &t));
+        let slice = p.trading.as_ref().unwrap().train.as_ref().unwrap();
+        assert!(slice.rows.is_canonical());
+        assert_eq!(p.train_indices.len(), plain.train_indices.len());
+        let mut a = p.train_indices.clone();
+        let mut b = plain.train_indices.clone();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+
+        let col = |n: &str| t.col(t.index_of(n).unwrap()).to_vec();
+        let (tt, s, r) = (col("t"), col("s"), col("r"));
+        let idx = &p.train_indices;
+        for (k, &row) in idx.iter().enumerate() {
+            let id = (p.train.x[k][0] * p.stds[0] + p.means[0]).round() as usize;
+            assert_eq!(id, row);
+            assert_eq!(p.train.y[k], (row as f64).sin());
+            assert_eq!(p.target_scale.as_ref().unwrap().train[k], s[row]);
+            assert_eq!(p.keys.as_ref().unwrap().train[k], tt[row]);
+            assert_eq!(slice.ret[k], r[row].exp_m1());
+        }
+        let gids = group_ids(&t, t.index_of("g").unwrap()).0;
+        let mut order: Vec<usize> = (0..t.len()).collect();
+        order.sort_by(|&a, &b| tt[a].partial_cmp(&tt[b]).unwrap().then(a.cmp(&b)));
+        let prev = row_predecessors(t.len(), Some(&order), Some(&gids));
+        assert_eq!(p.slope_pairs.train, adjacent_pairs(idx, &prev));
+    }
+
+    #[test]
+    fn canonical_order_keeps_statistics_bit_identical() {
+        let t = trading_fixture(true);
+        let plain = prepare_trading(&t, &trading_spec(false, true, &t));
+        let p = prepare_trading(&t, &trading_spec(true, true, &t));
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&p.means), bits(&plain.means));
+        assert_eq!(bits(&p.stds), bits(&plain.stds));
+    }
+
+    #[test]
+    fn canonical_order_is_a_no_op_on_a_symbol_major_store() {
+        let t = trading_fixture(false);
+        let group_split = |canonical| SplitSpec {
+            mode: SplitMode::Group,
+            test_frac: 0.2,
+            ..trading_spec(canonical, true, &t)
+        };
+        let plain = prepare_trading(&t, &group_split(false));
+        let p = prepare_trading(&t, &group_split(true));
+        assert!(plain.train_indices.len() > 50);
+        assert_eq!(p.train_indices, plain.train_indices);
+        assert!(p.trading.unwrap().train.unwrap().rows.is_canonical());
+    }
+
+    #[test]
+    fn check_finite_returns_names_the_count() {
+        let slice = TradingSlice {
+            rows: Default::default(),
+            ret: vec![0.1, f64::NAN, f64::NAN, 0.2],
+        };
+        assert!(slice.check_finite_returns(&[1.0, f64::NAN, 1.0, 1.0]).unwrap_err().starts_with("1 "));
+        assert!(slice.check_finite_returns(&[1.0, f64::NAN, f64::NAN, 1.0]).is_ok());
     }
 }

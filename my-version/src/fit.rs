@@ -30,6 +30,7 @@ mod median;
 mod minimax;
 mod rank;
 mod stream;
+mod tile;
 mod varpro;
 
 pub use gpu::{
@@ -166,6 +167,48 @@ impl FitAdmission {
             "screened" => Some(FitAdmission::Screened),
             "all" => Some(FitAdmission::All),
             _ => None,
+        }
+    }
+}
+
+/// #496: arithmetic of the undamped Gauss-Newton polish that ends the device
+/// fit kernel. Changing it changes the proposed constants, so it is a saved
+/// search setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FitPolish {
+    /// f64 re-baseline and f64 Gauss-Newton steps on the exact rows.
+    #[default]
+    F64,
+    /// The same steps on the f32 rows of the LM phase.
+    F32,
+    /// No re-baseline and no polish: the kernel returns after the LM phase.
+    Off,
+}
+
+impl FitPolish {
+    pub fn name(self) -> &'static str {
+        match self {
+            FitPolish::F64 => "f64",
+            FitPolish::F32 => "f32",
+            FitPolish::Off => "off",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "f64" => Some(FitPolish::F64),
+            "f32" => Some(FitPolish::F32),
+            "off" => Some(FitPolish::Off),
+            _ => None,
+        }
+    }
+
+    /// The kernel argument.
+    pub fn code(self) -> i32 {
+        match self {
+            FitPolish::F64 => 0,
+            FitPolish::F32 => 1,
+            FitPolish::Off => 2,
         }
     }
 }
@@ -1123,11 +1166,29 @@ pub(crate) mod gpu_op {
     pub const ERF: u32 = 28;
     pub const ERFC: u32 = 29;
     pub const IF: u32 = 32;
+    pub const STEP: u32 = 19;
+    pub const FLOOR: u32 = 23;
+    pub const CEIL: u32 = 24;
+    pub const ROUND: u32 = 25;
+    pub const MOD: u32 = 26;
+    pub const ATAN2: u32 = 27;
+    pub const MIN: u32 = 30;
+    pub const MAX: u32 = 31;
+    pub const SIGN: u32 = 33;
+    pub const EQUAL: u32 = 34;
+    pub const LESS: u32 = 35;
+    pub const LESS_OR_EQUAL: u32 = 36;
+    pub const GREATER: u32 = 37;
+    pub const GREATER_OR_EQUAL: u32 = 38;
+    pub const AND: u32 = 39;
+    pub const OR: u32 = 40;
+    pub const XOR: u32 = 41;
+    pub const NOT: u32 = 42;
 }
 
 /// #169: map an operator to the fit kernel's opcode. Only operators with a
-/// well-defined analytic derivative in both the value and adjoint sweeps are
-/// eligible; everything else (piecewise-constant, logical, constraint, block,
+/// value and adjoint sweep (a zero or piecewise subgradient counts) are
+/// eligible; everything else (`asinh`, `acosh`, `atanh`, constraint, block,
 /// aggregate and meta operators) makes the candidate fall back to the CPU.
 fn gpu_fit_opcode(op: Op) -> Option<u32> {
     use gpu_op as g;
@@ -1154,6 +1215,24 @@ fn gpu_fit_opcode(op: Op) -> Option<u32> {
         Gauss => g::GAUSS,
         Pow => g::POW,
         If => g::IF,
+        Step => g::STEP,
+        Floor => g::FLOOR,
+        Ceil => g::CEIL,
+        Round => g::ROUND,
+        Mod => g::MOD,
+        Atan2 => g::ATAN2,
+        Min => g::MIN,
+        Max => g::MAX,
+        Sign => g::SIGN,
+        Equal => g::EQUAL,
+        Less => g::LESS,
+        LessOrEqual => g::LESS_OR_EQUAL,
+        Greater => g::GREATER,
+        GreaterOrEqual => g::GREATER_OR_EQUAL,
+        And => g::AND,
+        Or => g::OR,
+        Xor => g::XOR,
+        Not => g::NOT,
         Sinh => g::SINH,
         Cosh => g::COSH,
         Erf => g::ERF,
@@ -1455,8 +1534,16 @@ fn const_positions(n: &Node, out: &mut Vec<usize>, counter: &mut usize) {
 
 #[inline]
 fn value_of(op: Op, kids: &[usize], v: &[f64], node_val: f64) -> f64 {
+    let x = |j: usize| kids.get(j).map_or(f64::NAN, |&k| v[k]);
+    apply_op(op, x(0), x(1), x(2), node_val)
+}
+
+/// One operator on its operand values `a0..a2`. Shared by the row evaluator and
+/// the column-tile forward pass.
+#[inline(always)]
+fn apply_op(op: Op, a0: f64, a1: f64, a2: f64, node_val: f64) -> f64 {
     use Op::*;
-    let a = |j: usize| v[kids[j]];
+    let a = |j: usize| [a0, a1, a2][j];
     match op {
         Const => node_val,
         Input => node_val, // unused: inputs are folded in below
@@ -1744,176 +1831,193 @@ fn backward_impl(
         if ks.is_empty() {
             continue;
         }
-        let get = |j: usize| v[ks[j]];
-        use Op::*;
-        match f.op[i] {
-            Neg => adj[ks[0]] += -a,
-            Exp => adj[ks[0]] += a * get(0).exp(),
-            Ln => adj[ks[0]] += a / get(0),
-            Abs => adj[ks[0]] += a * if get(0) >= 0.0 { 1.0 } else { -1.0 },
-            Sqrt => adj[ks[0]] += a / (2.0 * get(0).sqrt()),
-            Sin => adj[ks[0]] += a * get(0).cos(),
-            Cos => adj[ks[0]] += -a * get(0).sin(),
-            Tan => {
-                let t = get(0).cos();
-                adj[ks[0]] += a / (t * t);
+        let x = |j: usize| ks.get(j).map_or(f64::NAN, |&k| v[k]);
+        let (terms, mask) = adj_terms(f.op[i], a, x(0), x(1), x(2), v[i]);
+        for (j, &k) in ks.iter().enumerate().take(3) {
+            if mask >> j & 1 == 1 {
+                adj[k] += terms[j];
             }
-            Sinh => adj[ks[0]] += a * get(0).cosh(),
-            Cosh => adj[ks[0]] += a * get(0).sinh(),
-            Tanh => {
-                let t = get(0).tanh();
-                adj[ks[0]] += a * (1.0 - t * t);
-            }
-            Logistic => {
-                let s = 1.0 / (1.0 + (-get(0)).exp());
-                adj[ks[0]] += a * s * (1.0 - s);
-            }
-            Step => {}
-            Gauss => adj[ks[0]] += a * (-2.0 * get(0)) * (-get(0) * get(0)).exp(),
-            Square => adj[ks[0]] += a * 2.0 * get(0),
-            Cube => adj[ks[0]] += a * 3.0 * get(0) * get(0),
-            // floor/ceil/round/sign are piecewise constant, derivative 0 a.e.
-            Floor | Ceil | Round | Sign => {}
-            Erf => adj[ks[0]] += a * 2.0 * INV_SQRT_PI * (-get(0) * get(0)).exp(),
-            Erfc => adj[ks[0]] += -a * 2.0 * INV_SQRT_PI * (-get(0) * get(0)).exp(),
-            Asinh => adj[ks[0]] += a / (get(0) * get(0) + 1.0).sqrt(),
-            Acosh => {
-                let x = get(0);
-                if x > 1.0 {
-                    adj[ks[0]] += a / (x * x - 1.0).sqrt();
-                }
-            }
-            Atanh => {
-                let x = get(0);
-                if x.abs() < 1.0 {
-                    adj[ks[0]] += a / (1.0 - x * x);
-                }
-            }
-            Add => {
-                adj[ks[0]] += a;
-                adj[ks[1]] += a;
-            }
-            Sub => {
-                adj[ks[0]] += a;
-                adj[ks[1]] += -a;
-            }
-            Mul => {
-                adj[ks[0]] += a * get(1);
-                adj[ks[1]] += a * get(0);
-            }
-            Div => {
-                let d = get(1);
-                adj[ks[0]] += a / d;
-                adj[ks[1]] += -a * get(0) / (d * d);
-            }
-            Pow => {
-                let (b, e) = (get(0), get(1));
-                if b > 0.0 {
-                    adj[ks[0]] += a * e * b.powf(e - 1.0);
-                    adj[ks[1]] += a * b.powf(e) * b.ln();
-                }
-            }
-            // `mod(a,b) = a - b*floor(a/b)`; subgradient 1 for `a`, `-floor(a/b)`
-            // for `b`, undefined (0) where `b = 0`.
-            Mod => {
-                let b = get(1);
-                if b.abs() >= 1e-12 {
-                    adj[ks[0]] += a;
-                    adj[ks[1]] += -a * (get(0) / b).floor();
-                }
-            }
-            // `min`/`max` subgradient: all flow to the active argument, split
-            // evenly on a tie (a documented, symmetric choice).
-            Min => {
-                let (x, y) = (get(0), get(1));
-                if x < y {
-                    adj[ks[0]] += a;
-                } else if y < x {
-                    adj[ks[1]] += a;
-                } else {
-                    adj[ks[0]] += 0.5 * a;
-                    adj[ks[1]] += 0.5 * a;
-                }
-            }
-            Max => {
-                let (x, y) = (get(0), get(1));
-                if x > y {
-                    adj[ks[0]] += a;
-                } else if y > x {
-                    adj[ks[1]] += a;
-                } else {
-                    adj[ks[0]] += 0.5 * a;
-                    adj[ks[1]] += 0.5 * a;
-                }
-            }
-            Atan2 => {
-                let (y, x) = (get(0), get(1));
-                let d = x * x + y * y;
-                if d > 0.0 {
-                    adj[ks[0]] += a * x / d;
-                    adj[ks[1]] += -a * y / d;
-                }
-            }
-            If => {
-                // derivative flows only to the taken branch; condition is
-                // piecewise-constant.
-                if get(0) > 0.0 {
-                    adj[ks[1]] += a;
-                } else {
-                    adj[ks[2]] += a;
-                }
-            }
-            // Comparisons are piecewise constant (0/1), so flat a.e.: the
-            // subgradient is 0, like `step`. Same for `not`.
-            Equal | Less | LessOrEqual | Greater | GreaterOrEqual | Not => {}
-            // `and`/`or`/`xor` are flat a.e. too. Their documented subgradients
-            // are the partials of the product surrogate over the truth values
-            // `[a>0]`, `[b>0]`:
-            //   and: [a>0][b>0]            -> d/da = [b>0], d/db = [a>0]
-            //   or:  [a>0]+[b>0]-[a>0][b>0] -> d/da = 1-[b>0], d/db = 1-[a>0]
-            //   xor: [a>0]+[b>0]-2[a>0][b>0] -> d/da = 1-2[b>0], d/db = 1-2[a>0]
-            // These are bounded (|g| <= 2) and symmetric in the two arguments,
-            // matching the min/max convention above.
-            And => {
-                adj[ks[0]] += a * ind(get(1));
-                adj[ks[1]] += a * ind(get(0));
-            }
-            Or => {
-                adj[ks[0]] += a * (1.0 - ind(get(1)));
-                adj[ks[1]] += a * (1.0 - ind(get(0)));
-            }
-            Xor => {
-                adj[ks[0]] += a * (1.0 - 2.0 * ind(get(1)));
-                adj[ks[1]] += a * (1.0 - 2.0 * ind(get(0)));
-            }
-            // A constraint returns its argument while feasible, so the gradient
-            // passes through with weight 1; once violated it is `NaN` and the
-            // row is already rejected, so nothing is added.
-            Require | Constrain => {
-                if get(0) > 0.0 {
-                    adj[ks[0]] += a;
-                }
-            }
-            // `between(v, lo, hi)` returns `v` when `lo <= v <= hi`; the bounds
-            // are not part of the returned value, so they get no gradient.
-            Between => {
-                let (v, lo, hi) = (get(0), get(1), get(2));
-                if lo <= v && v <= hi {
-                    adj[ks[0]] += a;
-                }
-            }
-            // Meta operators are structural constants: the fitter must not
-            // move them, so their gradient is zero (like `floor`/`step`).
-            // Nothing flows into the argument either.
-            Complexity | Variables | Constants | Contains | ContainsOp => {}
-            // An aggregate is a dataset fact, not a fitted parameter: zero
-            // gradient, and nothing flows into its column child.
-            Agg(_) => {}
-            // Block calls are inlined by `build`, so this is unreachable.
-            Custom0 | Custom1 | Custom2 | Custom3 => {}
-            Const | Input => {}
         }
     }
+}
+
+/// The adjoint contributions of one node: `a` is the node's adjoint, `x0..x2`
+/// its operands' forward values and `vi` its own forward value. Returns the
+/// term to add to each operand's adjoint and a bitmask of the operands that
+/// receive one. Shared by the row sweep and the column-tile sweep.
+#[inline(always)]
+fn adj_terms(op: Op, a: f64, x0: f64, x1: f64, x2: f64, vi: f64) -> ([f64; 3], u8) {
+    use Op::*;
+    let get = |j: usize| [x0, x1, x2][j];
+    let mut terms = [0.0; 3];
+    let mut mask = 0u8;
+    let mut put = |j: usize, d: f64| {
+        terms[j] = d;
+        mask |= 1 << j;
+    };
+    match op {
+        Neg => put(0, -a),
+        // `vi` is `exp(x)` unless the forward pass saturated at x > 700.
+        Exp => put(0, a * if get(0) > 700.0 { get(0).exp() } else { vi }),
+        Ln => put(0, a / get(0)),
+        Abs => put(0, a * if get(0) >= 0.0 { 1.0 } else { -1.0 }),
+        Sqrt => put(0, a / (2.0 * vi)),
+        Sin => put(0, a * get(0).cos()),
+        Cos => put(0, -a * get(0).sin()),
+        Tan => {
+            let t = get(0).cos();
+            put(0, a / (t * t));
+        }
+        Sinh => put(0, a * get(0).cosh()),
+        Cosh => put(0, a * get(0).sinh()),
+        Tanh => put(0, a * (1.0 - vi * vi)),
+        Logistic => put(0, a * vi * (1.0 - vi)),
+        Step => {}
+        Gauss => put(0, a * (-2.0 * get(0)) * vi),
+        Square => put(0, a * 2.0 * get(0)),
+        Cube => put(0, a * 3.0 * get(0) * get(0)),
+        // floor/ceil/round/sign are piecewise constant, derivative 0 a.e.
+        Floor | Ceil | Round | Sign => {}
+        Erf => put(0, a * 2.0 * INV_SQRT_PI * (-get(0) * get(0)).exp()),
+        Erfc => put(0, -a * 2.0 * INV_SQRT_PI * (-get(0) * get(0)).exp()),
+        Asinh => put(0, a / (get(0) * get(0) + 1.0).sqrt()),
+        Acosh => {
+            let x = get(0);
+            if x > 1.0 {
+                put(0, a / (x * x - 1.0).sqrt());
+            }
+        }
+        Atanh => {
+            let x = get(0);
+            if x.abs() < 1.0 {
+                put(0, a / (1.0 - x * x));
+            }
+        }
+        Add => {
+            put(0, a);
+            put(1, a);
+        }
+        Sub => {
+            put(0, a);
+            put(1, -a);
+        }
+        Mul => {
+            put(0, a * get(1));
+            put(1, a * get(0));
+        }
+        Div => {
+            let d = get(1);
+            put(0, a / d);
+            put(1, -a * get(0) / (d * d));
+        }
+        Pow => {
+            let (b, e) = (get(0), get(1));
+            if b > 0.0 {
+                put(0, a * e * b.powf(e - 1.0));
+                put(1, a * b.powf(e) * b.ln());
+            }
+        }
+        // `mod(a,b) = a - b*floor(a/b)`; subgradient 1 for `a`, `-floor(a/b)`
+        // for `b`, undefined (0) where `b = 0`.
+        Mod => {
+            let b = get(1);
+            if b.abs() >= 1e-12 {
+                put(0, a);
+                put(1, -a * (get(0) / b).floor());
+            }
+        }
+        // `min`/`max` subgradient: all flow to the active argument, split
+        // evenly on a tie (a documented, symmetric choice).
+        Min => {
+            let (x, y) = (get(0), get(1));
+            if x < y {
+                put(0, a);
+            } else if y < x {
+                put(1, a);
+            } else {
+                put(0, 0.5 * a);
+                put(1, 0.5 * a);
+            }
+        }
+        Max => {
+            let (x, y) = (get(0), get(1));
+            if x > y {
+                put(0, a);
+            } else if y > x {
+                put(1, a);
+            } else {
+                put(0, 0.5 * a);
+                put(1, 0.5 * a);
+            }
+        }
+        Atan2 => {
+            let (y, x) = (get(0), get(1));
+            let d = x * x + y * y;
+            if d > 0.0 {
+                put(0, a * x / d);
+                put(1, -a * y / d);
+            }
+        }
+        If => {
+            // derivative flows only to the taken branch; condition is
+            // piecewise-constant.
+            if get(0) > 0.0 {
+                put(1, a);
+            } else {
+                put(2, a);
+            }
+        }
+        // Comparisons are piecewise constant (0/1), so flat a.e.: the
+        // subgradient is 0, like `step`. Same for `not`.
+        Equal | Less | LessOrEqual | Greater | GreaterOrEqual | Not => {}
+        // `and`/`or`/`xor` are flat a.e. too. Their documented subgradients
+        // are the partials of the product surrogate over the truth values
+        // `[a>0]`, `[b>0]`:
+        //   and: [a>0][b>0]            -> d/da = [b>0], d/db = [a>0]
+        //   or:  [a>0]+[b>0]-[a>0][b>0] -> d/da = 1-[b>0], d/db = 1-[a>0]
+        //   xor: [a>0]+[b>0]-2[a>0][b>0] -> d/da = 1-2[b>0], d/db = 1-2[a>0]
+        // These are bounded (|g| <= 2) and symmetric in the two arguments,
+        // matching the min/max convention above.
+        And => {
+            put(0, a * ind(get(1)));
+            put(1, a * ind(get(0)));
+        }
+        Or => {
+            put(0, a * (1.0 - ind(get(1))));
+            put(1, a * (1.0 - ind(get(0))));
+        }
+        Xor => {
+            put(0, a * (1.0 - 2.0 * ind(get(1))));
+            put(1, a * (1.0 - 2.0 * ind(get(0))));
+        }
+        // A constraint returns its argument while feasible, so the gradient
+        // passes through with weight 1; once violated it is `NaN` and the
+        // row is already rejected, so nothing is added.
+        Require | Constrain => {
+            if get(0) > 0.0 {
+                put(0, a);
+            }
+        }
+        // `between(v, lo, hi)` returns `v` when `lo <= v <= hi`; the bounds
+        // are not part of the returned value, so they get no gradient.
+        Between => {
+            let (v, lo, hi) = (get(0), get(1), get(2));
+            if lo <= v && v <= hi {
+                put(0, a);
+            }
+        }
+        // Meta operators are structural constants: the fitter must not
+        // move them, so their gradient is zero (like `floor`/`step`).
+        // Nothing flows into the argument either.
+        Complexity | Variables | Constants | Contains | ContainsOp => {}
+        // An aggregate is a dataset fact, not a fitted parameter: zero
+        // gradient, and nothing flows into its column child.
+        Agg(_) => {}
+        // Block calls are inlined by `build`, so this is unreachable.
+        Custom0 | Custom1 | Custom2 | Custom3 => {}
+        Const | Input => {}
+    }
+    (terms, mask)
 }
 
 /// Indicator `[x > 0]` as 0/1, `NaN` when `x` is `NaN` (a rejected row).
@@ -2015,7 +2119,9 @@ struct NormalEquations {
     jtr: Vec<f64>,
 }
 
-/// Build `JᵀWJ` and `JᵀWr` at `c`, one row sweep with the adjoint pass.
+/// Build `JᵀWJ` and `JᵀWr` at `c`, one row sweep with the adjoint pass. The
+/// row-at-a-time reference for the column-tile pass in `tile.rs`.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn normal_equations(
     f: &Flat,
@@ -2558,19 +2664,30 @@ thread_local! {
     static FIT_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// The two row passes of the exact LM fit: the SSE and the normal equations at
+/// a set of constants. `tile::TileFit` is the production implementation.
+trait LmPass {
+    fn sse(&mut self, c: &[f64]) -> f64;
+    fn normal(&mut self, c: &[f64]) -> Option<NormalEquations>;
+}
+
+impl LmPass for tile::TileFit<'_> {
+    fn sse(&mut self, c: &[f64]) -> f64 {
+        tile::TileFit::sse(self, c)
+    }
+    fn normal(&mut self, c: &[f64]) -> Option<NormalEquations> {
+        tile::TileFit::normal(self, c)
+    }
+}
+
 /// Solve the cached normal equations for one damping value and score the trial
 /// constants. This is the old `gn_step` without the row sweep.
-#[allow(clippy::too_many_arguments)]
 fn gn_trial(
-    f: &Flat,
-    x: &[Vec<f64>],
-    y: &[f64],
-    w: &[f64],
+    pass: &mut impl LmPass,
     c: &[f64],
     lambda: f64,
     k: usize,
     n: &NormalEquations,
-    v: &mut [f64],
 ) -> Option<(Vec<f64>, f64)> {
     #[cfg(test)]
     FIT_STEPS.with(|n| n.set(n.get() + 1));
@@ -2579,27 +2696,20 @@ fn gn_trial(
     let trial: Vec<f64> = (0..k)
         .map(|i| (c[i] + step[i]).clamp(-1e6, 1e6))
         .collect();
-    let s = sse(f, x, y, w, &trial, v);
+    let s = pass.sse(&trial);
     Some((trial, s))
 }
 
 /// One Gauss–Newton/Levenberg–Marquardt step. Returns the trial constants and
 /// their sum of squared errors, or `None` if the normal equations are singular.
-#[allow(clippy::too_many_arguments)]
 fn gn_step(
-    f: &Flat,
-    x: &[Vec<f64>],
-    y: &[f64],
-    w: &[f64],
+    pass: &mut impl LmPass,
     c: &[f64],
     lambda: f64,
     k: usize,
-    v: &mut [f64],
-    adj: &mut [f64],
-    grad: &mut [f64],
 ) -> Option<(Vec<f64>, f64)> {
-    let n = normal_equations(f, x, y, w, c, k, v, adj, grad)?;
-    gn_trial(f, x, y, w, c, lambda, k, &n, v)
+    let n = pass.normal(c)?;
+    gn_trial(pass, c, lambda, k, &n)
 }
 
 /// Fit all constants of `tree` to minimise squared error on `x`/`y`.
@@ -2779,11 +2889,17 @@ pub fn separable_partition(tree: &Node) -> Option<VarProPartition> {
 /// The historical Levenberg–Marquardt fitter (see [`fit_weighted`]).
 fn fit_lm(tree: &mut Node, x: &[Vec<f64>], y: &[f64], w: &[f64], iters: usize) -> f64 {
     let f = flatten(tree);
-    let k = f.nconst;
-    if k == 0 || x.is_empty() {
+    if x.is_empty() {
         let mut v = vec![0.0; f.op.len().max(1)];
         return sse(&f, x, y, w, &[], &mut v);
     }
+    let mut pass = tile::TileFit::new(&f, x, y, w);
+    fit_lm_with(tree, &f, iters, &mut pass)
+}
+
+/// The LM loop over an interchangeable pair of row passes.
+fn fit_lm_with(tree: &mut Node, f: &Flat, iters: usize, pass: &mut impl LmPass) -> f64 {
+    let k = f.nconst;
     let n = f.op.len();
     let mut c = vec![0.0; k];
     for i in 0..n {
@@ -2791,21 +2907,21 @@ fn fit_lm(tree: &mut Node, x: &[Vec<f64>], y: &[f64], w: &[f64], iters: usize) -
             c[f.cslot[i] as usize] = f.val[i];
         }
     }
-    let mut v = vec![0.0; n];
-    let mut adj = vec![0.0; n];
-    let mut grad = vec![0.0; k];
+    if k == 0 {
+        return pass.sse(&[]);
+    }
     let mut best_c = c.clone();
     // #135: `--no-fit` / `--fit-iters 0` must not fit at all. The LM loop
     // below runs `iters.max(1)` and a four-step polish, so without this early
     // return a "no fit" search still performs five LM iterations per candidate.
     if iters == 0 {
-        return sse(&f, x, y, w, &c, &mut v);
+        return pass.sse(&c);
     }
     // #87: this standalone SSE is intentionally kept. The first `gn_step`
     // forms the same residuals, but using them as the acceptance baseline
     // changed the LM trajectory on guard-free trees; exactness beats the one
     // saved sweep. Only the *final* SSE is reused (and only for `squared`).
-    let mut best_sse = sse(&f, x, y, w, &c, &mut v);
+    let mut best_sse = pass.sse(&c);
     let mut lambda = 1e-3;
     // #95: `JᵀJ`/`Jᵀr` depend on `c`, not on `λ`. Build them once per outer
     // iteration and reuse the cached matrices for every damping retry; only a
@@ -2814,11 +2930,10 @@ fn fit_lm(tree: &mut Node, x: &[Vec<f64>], y: &[f64], w: &[f64], iters: usize) -
 
     for _ in 0..iters.max(1) {
         if normal.is_none() {
-            normal =
-                normal_equations(&f, x, y, w, &c, k, &mut v, &mut adj, &mut grad);
+            normal = pass.normal(&c);
         }
         let Some(n) = normal.as_ref() else { break };
-        match gn_trial(&f, x, y, w, &c, lambda, k, n, &mut v) {
+        match gn_trial(pass, &c, lambda, k, n) {
             Some((trial, tsse)) => {
                 if tsse < best_sse {
                     c = trial;
@@ -2845,18 +2960,7 @@ fn fit_lm(tree: &mut Node, x: &[Vec<f64>], y: &[f64], w: &[f64], iters: usize) -
         if best_sse == 0.0 {
             break;
         }
-        match gn_step(
-            &f,
-            x,
-            y,
-            w,
-            &best_c,
-            0.0,
-            k,
-            &mut v,
-            &mut adj,
-            &mut grad,
-        ) {
+        match gn_step(pass, &best_c, 0.0, k) {
             Some((trial, tsse)) if tsse < best_sse => {
                 best_c = trial;
                 best_sse = tsse;
@@ -2865,7 +2969,7 @@ fn fit_lm(tree: &mut Node, x: &[Vec<f64>], y: &[f64], w: &[f64], iters: usize) -
         }
     }
 
-    write_constants(tree, &f, &best_c);
+    write_constants(tree, f, &best_c);
     best_sse
 }
 
@@ -3256,11 +3360,12 @@ pub fn fit_weighted_metric(
         | Maximum
         | Interquartile
         | Slope => {
-            let start = metric_score(tree, x, y, w, metric);
+            let cols = FitCols::gather(tree, x);
+            let start = metric_score_cols(tree, x, &cols, y, w, metric);
             let mut trial = tree.clone();
             fit_weighted(&mut trial, x, y, w, iters);
-            coordinate_polish(&mut trial, x, y, w, metric, iters.max(1));
-            let score = metric_score(&trial, x, y, w, metric);
+            coordinate_polish_cols(&mut trial, x, &cols, y, w, metric, iters.max(1));
+            let score = metric_score_cols(&trial, x, &cols, y, w, metric);
             if improves(score, start) {
                 *tree = trial;
                 score
@@ -3282,14 +3387,15 @@ pub fn fit_weighted_metric(
         // manifold.
         Signed => {
             fit_weighted(tree, x, y, w, iters);
-            let before = metric_score(tree, x, y, w, metric);
+            let cols = FitCols::gather(tree, x);
+            let before = metric_score_cols(tree, x, &cols, y, w, metric);
             let outcome = signed_projection(tree, x, y, w, 2);
-            let after = metric_score(tree, x, y, w, metric);
+            let after = metric_score_cols(tree, x, &cols, y, w, metric);
             let moved = after.is_finite() && before.is_finite() && after < before;
             if !outcome.is_projected() && !moved {
-                coordinate_polish(tree, x, y, w, metric, iters.max(1));
+                coordinate_polish_cols(tree, x, &cols, y, w, metric, iters.max(1));
             }
-            metric_score(tree, x, y, w, metric)
+            metric_score_cols(tree, x, &cols, y, w, metric)
         }
     }
 }
@@ -3326,8 +3432,9 @@ pub fn fit_slope_pairs(
     pairs: &[[u32; 2]],
     iters: usize,
 ) -> f64 {
+    let cols = FitCols::gather(tree, x);
     let score_of = |t: &Node| {
-        metrics::score_slope_pairs(&predictions(t, x), y, pairs)
+        cols.with_predictions(t, x, |pred| metrics::score_slope_pairs(pred, y, pairs))
     };
     let start = score_of(tree);
     if iters == 0 {
@@ -3573,6 +3680,82 @@ fn metric_score(tree: &Node, x: &[Vec<f64>], y: &[f64], w: &[f64], metric: Metri
     metrics::score_weighted(&pred, y, w, metric, expr::count_constants(tree))
 }
 
+/// #473: the input columns a tree reads, gathered once per fit call so every
+/// probe scores through the compiled evaluator instead of the pointer walk.
+///
+/// `cols[var][row]`; a variable the tree does not read stays empty, and a row
+/// shorter than the variable index reads `NaN`, as in [`expr::eval`]. A tree
+/// that [`crate::eval_soa::compile`] rejects gathers nothing and every
+/// prediction takes the row walk.
+pub(crate) struct FitCols {
+    cols: Vec<Vec<f64>>,
+    rows: usize,
+    scratch: std::cell::RefCell<Vec<f64>>,
+}
+
+impl FitCols {
+    pub(crate) fn gather(tree: &Node, x: &[Vec<f64>]) -> FitCols {
+        fn used(n: &Node, out: &mut Vec<usize>) {
+            if n.op == Op::Input {
+                out.push(n.val as usize);
+            }
+            for k in &n.kids {
+                used(k, out);
+            }
+        }
+        let mut cols = Vec::new();
+        if crate::eval_soa::compile(tree).is_some() {
+            let mut vars = Vec::new();
+            used(tree, &mut vars);
+            vars.sort_unstable();
+            vars.dedup();
+            cols.resize_with(vars.last().map_or(0, |&v| v + 1), Vec::new);
+            for var in vars {
+                cols[var] = x
+                    .iter()
+                    .map(|row| row.get(var).copied().unwrap_or(f64::NAN))
+                    .collect();
+            }
+        }
+        FitCols {
+            cols,
+            rows: x.len(),
+            scratch: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Run `f` on the predictions of `tree`, held in a buffer that lives as long
+    /// as this view.
+    fn with_predictions<R>(&self, tree: &Node, x: &[Vec<f64>], f: impl FnOnce(&[f64]) -> R) -> R {
+        let mut out = self.scratch.borrow_mut();
+        out.clear();
+        match crate::eval_soa::compile(tree) {
+            Some(program) => {
+                out.resize(self.rows, 0.0);
+                crate::eval_soa::eval_batch(&program, &self.cols, self.rows, &mut out);
+            }
+            None => out.extend(x.iter().map(|row| expr::eval(tree, row))),
+        }
+        f(&out)
+    }
+}
+
+/// [`metric_score`] on the compiled evaluator.
+fn metric_score_cols(
+    tree: &Node,
+    x: &[Vec<f64>],
+    cols: &FitCols,
+    y: &[f64],
+    w: &[f64],
+    metric: Metric,
+) -> f64 {
+    if x.len() != y.len() || (!w.is_empty() && w.len() != x.len()) {
+        return f64::INFINITY;
+    }
+    let k = expr::count_constants(tree);
+    cols.with_predictions(tree, x, |pred| metrics::score_weighted(pred, y, w, metric, k))
+}
+
 /// The metric-monotone keep rule: a trial replaces the incumbent only when its
 /// score is finite and strictly lower. Two infinite scores never compare as an
 /// improvement.
@@ -3633,7 +3816,8 @@ where
     if x.len() != y.len() || (!w.is_empty() && w.len() != x.len()) {
         return f64::INFINITY;
     }
-    let mut best = metric_score(tree, x, y, w, metric);
+    let cols = FitCols::gather(tree, x);
+    let mut best = metric_score_cols(tree, x, &cols, y, w, metric);
     if !best.is_finite() {
         return best;
     }
@@ -3654,12 +3838,12 @@ where
         if best == 0.0 {
             return best;
         }
-        let Some((target, weights)) = pairs(&predictions(tree, x)) else {
+        let Some((target, weights)) = cols.with_predictions(tree, x, pairs) else {
             return best;
         };
         let mut trial = tree.clone();
         fit_weighted(&mut trial, x, &target, &weights, inner);
-        let score = metric_score(&trial, x, y, w, metric);
+        let score = metric_score_cols(&trial, x, &cols, y, w, metric);
         if improves(score, best) {
             best = score;
             *tree = trial;
@@ -3673,10 +3857,10 @@ where
     if best == 0.0 {
         return best;
     }
-    if let Some((target, weights)) = pairs(&predictions(tree, x)) {
+    if let Some((target, weights)) = cols.with_predictions(tree, x, pairs) {
         let mut trial = tree.clone();
         fit_weighted(&mut trial, x, &target, &weights, last);
-        let score = metric_score(&trial, x, y, w, metric);
+        let score = metric_score_cols(&trial, x, &cols, y, w, metric);
         if improves(score, best) {
             best = score;
             *tree = trial;
@@ -3874,9 +4058,24 @@ fn logistic_irls_counted(
 /// order-independent, which is what lets the CUDA rank stage reproduce this
 /// ladder constant for constant (see [`rank::polish_rank_batch`]). The target
 /// ranks are computed once per call instead of once per trial.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn coordinate_polish(
     tree: &mut Node,
     x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    metric: Metric,
+    sweeps: usize,
+) {
+    let cols = FitCols::gather(tree, x);
+    coordinate_polish_cols(tree, x, &cols, y, w, metric, sweeps);
+}
+
+/// [`coordinate_polish`] over columns gathered by the caller (#473).
+fn coordinate_polish_cols(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    cols: &FitCols,
     y: &[f64],
     w: &[f64],
     metric: Metric,
@@ -3890,11 +4089,8 @@ pub(crate) fn coordinate_polish(
         _ => None,
     };
     let score_of = |tree: &Node| match (&target, signed) {
-        (Some(t), Some(signed)) => {
-            let pred = predictions(tree, x);
-            t.score(&pred, signed)
-        }
-        _ => metric_score(tree, x, y, w, metric),
+        (Some(t), Some(signed)) => cols.with_predictions(tree, x, |pred| t.score(pred, signed)),
+        _ => metric_score_cols(tree, x, cols, y, w, metric),
     };
     coordinate_polish_by(tree, sweeps, &score_of);
 }
@@ -4697,10 +4893,26 @@ mod tests {
 
     #[test]
     fn op_coverage_needs_a_fit_opcode_for_every_operator() {
+        use Op::*;
         assert!(gpu_fit_op_coverage(&Op::default_set(), false));
-        assert!(!gpu_fit_op_coverage(&[Op::Add, Op::Min], false), "`min` has no fit opcode");
-        assert!(gpu_fit_op_coverage(&[Op::Add, Op::Mul, Op::Sin], false));
-        assert!(!gpu_fit_op_coverage(&[Op::Add, Op::Mul, Op::Sin], true));
+        assert!(gpu_fit_op_coverage(
+            &[
+                Add, Min, Max, Step, Sign, Floor, Ceil, Round, Mod, Atan2, Equal, Less,
+                LessOrEqual, Greater, GreaterOrEqual, And, Or, Xor, Not
+            ],
+            false
+        ));
+        assert!(gpu_fit_op_coverage(&[Add, Mul, Sin], false));
+        assert!(!gpu_fit_op_coverage(&[Add, Mul, Sin], true));
+        let no_fit_opcode = [
+            Asinh, Acosh, Atanh, Require, Between, Constrain, Complexity, Variables, Constants,
+            Contains, ContainsOp,
+        ];
+        for name in Op::names() {
+            let op = Op::from_name(name).expect("a listed operator parses");
+            let listed = no_fit_opcode.contains(&op) || matches!(op, Agg(_));
+            assert_eq!(gpu_fit_opcode(op).is_none(), listed, "`{name}`");
+        }
     }
 
     #[test]
@@ -6331,6 +6543,307 @@ mod tests {
             let factor = (((n - 2) as f64) / ((2 * n - 2) as f64)).sqrt();
             let want = single.std_errors[i] * factor;
             assert!(((double.std_errors[i] - want) / want).abs() < 1e-12);
+        }
+    }
+
+    /// FNV-1a over the constants' bits then the score's bits.
+    fn fit_fingerprint(tree: &Node, score: f64) -> u64 {
+        fn walk(n: &Node, h: &mut u64) {
+            if n.op == Op::Const {
+                for b in n.val.to_bits().to_le_bytes() {
+                    *h = (*h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+                }
+            }
+            for k in &n.kids {
+                walk(k, h);
+            }
+        }
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        walk(tree, &mut h);
+        for b in score.to_bits().to_le_bytes() {
+            h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+        }
+        h
+    }
+
+    fn pinned_fixture() -> (Vec<Vec<f64>>, Vec<f64>) {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..2000 {
+            let row: Vec<f64> = (0..5).map(|_| 4.0 * next() - 2.0).collect();
+            let clean = (1.2 * row[0] + 0.5 * row[1] * row[2]) / (1.1 + row[3] * row[3]) - 0.3 * row[4];
+            let noise = 0.05 * (next() - 0.5);
+            let outlier = if i % 97 == 0 { 3.0 * (next() - 0.5) } else { 0.0 };
+            y.push(clean + noise + outlier);
+            x.push(row);
+        }
+        (x, y)
+    }
+
+    #[test]
+    fn metric_fits_are_bit_identical_after_the_evaluator_switch() {
+        let (x, y) = pinned_fixture();
+        let vars: Vec<String> = (0..5).map(|i| format!("x{i}")).collect();
+        let sources = [
+            "1.1*x0 + 0.4*x1*x2 + 0.2",
+            "(1.1*x0 + 0.4*x1*x2) / (1.3 + x3*x3) - 0.2*x4",
+            "atan2(1.1*x0, 1.3 + x3*x3) + 0.4*x1*x2 - 0.2*x4",
+        ];
+        let metrics = [
+            Metric::Absolute,
+            Metric::LogSquashed,
+            Metric::Median,
+            Metric::Maximum,
+            Metric::Interquartile,
+            Metric::RankCorrelation,
+            Metric::RankCorrelationSigned,
+            Metric::Slope,
+            Metric::Signed,
+        ];
+        let rejected = crate::parse::parse(sources[2], &vars).unwrap();
+        assert!(crate::eval_soa::compile(&rejected).is_none());
+        let mut got = Vec::new();
+        for src in sources {
+            for &m in &metrics {
+                let mut tree = crate::parse::parse(src, &vars).unwrap();
+                let score = fit_weighted_metric(&mut tree, &x, &y, &[], 8, m);
+                got.push(fit_fingerprint(&tree, score));
+            }
+        }
+        let pinned: [u64; 27] = [0x3c9276bf1c615d27, 0x9294d7602a3c3167, 0x15b8dd2bc7e89749, 0xafa0562facbfc842, 0x26ba0ddf4424a2e0, 0xa17c07db2474173c, 0xa17c07db2474173c, 0xcb94829dce1d26e3, 0x24434c6a996c9229, 0x23a970927fa60ca5, 0xe1c6b66d7f822d06, 0x451d1ef089f61505, 0x0374ecc179c28d13, 0xe6cad4afb716367e, 0xcbfa07bfbfbafb80, 0xcbfa07bfbfbafb80, 0x04f4b24b783f51c9, 0xd67f0e0db5df28f1, 0xf0baf5198f0be5ee, 0xdbfd0fea0481a991, 0x3d0b0848e99fccbc, 0xe3c3b66d8f3aca74, 0x5a6b313ff1818721, 0xc2f8defb6d1423d0, 0xc2f8defb6d1423d0, 0xf370ce07b2c3f2fb, 0xbd6156d48f9c3a62];
+        assert_eq!(got.as_slice(), pinned.as_slice());
+    }
+
+    /// The row-at-a-time passes, the reference for the column-tile passes.
+    struct RowPass<'a> {
+        f: &'a Flat,
+        x: &'a [Vec<f64>],
+        y: &'a [f64],
+        w: &'a [f64],
+        v: Vec<f64>,
+        adj: Vec<f64>,
+        grad: Vec<f64>,
+    }
+
+    impl LmPass for RowPass<'_> {
+        fn sse(&mut self, c: &[f64]) -> f64 {
+            sse(self.f, self.x, self.y, self.w, c, &mut self.v)
+        }
+        fn normal(&mut self, c: &[f64]) -> Option<NormalEquations> {
+            let k = self.f.nconst;
+            normal_equations(self.f, self.x, self.y, self.w, c, k, &mut self.v, &mut self.adj, &mut self.grad)
+        }
+    }
+
+    fn row_pass<'a>(f: &'a Flat, x: &'a [Vec<f64>], y: &'a [f64], w: &'a [f64]) -> RowPass<'a> {
+        RowPass {
+            f,
+            x,
+            y,
+            w,
+            v: vec![0.0; f.op.len().max(1)],
+            adj: vec![0.0; f.op.len()],
+            grad: vec![0.0; f.nconst],
+        }
+    }
+
+    fn fit_lm_rows(tree: &mut Node, x: &[Vec<f64>], y: &[f64], w: &[f64], iters: usize) -> f64 {
+        let f = flatten(tree);
+        let mut pass = row_pass(&f, x, y, w);
+        fit_lm_with(tree, &f, iters, &mut pass)
+    }
+
+    fn lcg(s: &mut u64) -> u64 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *s >> 33
+    }
+
+    fn unit(s: &mut u64) -> f64 {
+        (lcg(s) % 20000) as f64 / 10000.0 - 1.0
+    }
+
+    fn affine_arg(s: &mut u64) -> Node {
+        node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(unit(s) * 2.0), input((lcg(s) % 2) as usize)]), constant(unit(s))],
+        )
+    }
+
+    fn wrap(s: &mut u64, inner: Node) -> Node {
+        node(Op::Add, vec![node(Op::Mul, vec![constant(0.5 + unit(s).abs()), inner]), constant(unit(s))])
+    }
+
+    const UNARY_OPS: [Op; 28] = [
+        Op::Neg, Op::Exp, Op::Ln, Op::Abs, Op::Sqrt, Op::Sin, Op::Cos, Op::Tan, Op::Sinh, Op::Cosh,
+        Op::Tanh, Op::Logistic, Op::Step, Op::Gauss, Op::Square, Op::Cube, Op::Floor, Op::Ceil,
+        Op::Round, Op::Sign, Op::Erf, Op::Erfc, Op::Asinh, Op::Acosh, Op::Atanh, Op::Not,
+        Op::Require, Op::Constrain,
+    ];
+    const BINARY_OPS: [Op; 17] = [
+        Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Pow, Op::Mod, Op::Min, Op::Max, Op::Atan2,
+        Op::Equal, Op::Less, Op::LessOrEqual, Op::Greater, Op::GreaterOrEqual, Op::And, Op::Or,
+        Op::Xor,
+    ];
+
+    fn random_tree(s: &mut u64, depth: usize) -> Node {
+        if depth == 0 {
+            return affine_arg(s);
+        }
+        match lcg(s) % 6 {
+            0 => node(UNARY_OPS[lcg(s) as usize % UNARY_OPS.len()], vec![random_tree(s, depth - 1)]),
+            1 | 2 | 3 => node(
+                BINARY_OPS[lcg(s) as usize % BINARY_OPS.len()],
+                vec![random_tree(s, depth - 1), random_tree(s, depth - 1)],
+            ),
+            4 => node(
+                if lcg(s) % 2 == 0 { Op::If } else { Op::Between },
+                vec![random_tree(s, depth - 1), random_tree(s, depth - 1), random_tree(s, depth - 1)],
+            ),
+            _ => affine_arg(s),
+        }
+    }
+
+    fn tile_fixture(rows: usize, s: &mut u64) -> (Vec<Vec<f64>>, Vec<f64>) {
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..rows {
+            let a = if i % 7 == 3 { 0.0 } else { unit(s) * 3.0 };
+            let b = 0.1 + unit(s).abs() * 2.0;
+            y.push(a.sin() + 0.5 * b + 0.3);
+            x.push(vec![a, b]);
+        }
+        (x, y)
+    }
+
+    fn same_bits(a: &[f64], b: &[f64]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(p, q)| p.to_bits() == q.to_bits())
+    }
+
+    /// #474: the column-tile passes reproduce the row passes bit for bit, for
+    /// every operator `value_of` supports, with and without weights.
+    #[test]
+    fn tile_lm_is_bit_identical_to_row_lm() {
+        let mut s = 0x9e3779b97f4a7c15u64;
+        let mut trees = Vec::new();
+        for &op in UNARY_OPS.iter() {
+            let a = affine_arg(&mut s);
+            trees.push(wrap(&mut s, node(op, vec![a])));
+        }
+        for &op in BINARY_OPS.iter() {
+            let (a, b) = (affine_arg(&mut s), affine_arg(&mut s));
+            trees.push(wrap(&mut s, node(op, vec![a, b])));
+        }
+        for op in [Op::If, Op::Between] {
+            let (a, b, c) = (affine_arg(&mut s), affine_arg(&mut s), affine_arg(&mut s));
+            trees.push(wrap(&mut s, node(op, vec![a, b, c])));
+        }
+        // A zero adjoint must never meet an infinite or undefined local derivative.
+        let at_zero = |op: Op| node(op, vec![node(Op::Mul, vec![constant(1.3), input(0)])]);
+        trees.push(node(
+            Op::Add,
+            vec![
+                node(Op::Mul, vec![constant(0.0), at_zero(Op::Ln)]),
+                node(Op::Mul, vec![constant(0.7), input(1)]),
+            ],
+        ));
+        trees.push(node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(0.0), at_zero(Op::Sqrt)]), constant(0.3)],
+        ));
+        trees.push(node(
+            Op::If,
+            vec![
+                node(Op::Greater, vec![input(1), constant(5.0)]),
+                node(Op::Div, vec![constant(1.0), node(Op::Mul, vec![constant(0.4), input(0)])]),
+                node(Op::Mul, vec![constant(0.9), input(1)]),
+            ],
+        ));
+        while trees.len() < 88 {
+            trees.push(random_tree(&mut s, 3));
+        }
+        let mut fits = 0;
+        for rows in [1usize, 63, 64, 65, 255, 256, 257, 2000] {
+            let (x, y) = tile_fixture(rows, &mut s);
+            let weights: Vec<f64> = (0..rows)
+                .map(|i| if i % 5 == 2 { 0.0 } else { 0.5 + unit(&mut s).abs() })
+                .collect();
+            for (t, tree) in trees.iter().enumerate() {
+                for w in [&[][..], &weights[..]] {
+                    let f = flatten(tree);
+                    let k = f.nconst;
+                    let c0 = fitted_constants(tree);
+                    let mut rp = row_pass(&f, &x, &y, w);
+                    let mut tp = tile::TileFit::new(&f, &x, &y, w);
+                    let ctx = format!("tree {t} rows {rows} weighted {} {tree:?}", !w.is_empty());
+                    assert_eq!(rp.sse(&c0).to_bits(), tp.sse(&c0).to_bits(), "sse {ctx}");
+                    match (rp.normal(&c0), tp.normal(&c0)) {
+                        (None, None) => {}
+                        (Some(a), Some(b)) => {
+                            assert!(same_bits(&a.jtr, &b.jtr), "jtr {ctx}");
+                            for i in 0..k {
+                                assert!(same_bits(&a.jtj[i], &b.jtj[i]), "jtj row {i} {ctx}");
+                            }
+                        }
+                        _ => panic!("normal equations disagree on rejection: {ctx}"),
+                    }
+                    let (mut by_row, mut by_tile) = (tree.clone(), tree.clone());
+                    let sr = fit_lm_rows(&mut by_row, &x, &y, w, 8);
+                    let st = fit_lm(&mut by_tile, &x, &y, w, 8);
+                    assert_eq!(sr.to_bits(), st.to_bits(), "fit sse {ctx}");
+                    assert!(
+                        same_bits(&fitted_constants(&by_row), &fitted_constants(&by_tile)),
+                        "fit constants {ctx}"
+                    );
+                    fits += 1;
+                }
+            }
+        }
+        assert!(fits >= 1000, "{fits}");
+    }
+
+    /// #474: the adjoint reads the forward value instead of recomputing it
+    /// only where that is the same bits.
+    #[test]
+    fn adjoint_reuse_is_bit_identical() {
+        let xs = [
+            -800.0, -710.0, -3.5, -1.0, -1e-300, -0.0, 0.0, 1e-300, 0.25, 1.0, 2.0, 30.0, 699.5,
+            700.0, 700.0000000000001, 705.0, 709.7, 709.8, 710.0, 1e6, f64::INFINITY,
+            f64::NEG_INFINITY, f64::NAN,
+        ];
+        let adjs = [1.0, -2.5, 0.5, 1e-200, -0.0, 3e8];
+        for &x in &xs {
+            for &a in &adjs {
+                let reference = |op: Op| -> f64 {
+                    match op {
+                        Op::Exp => a * x.exp(),
+                        Op::Tanh => {
+                            let t = x.tanh();
+                            a * (1.0 - t * t)
+                        }
+                        Op::Logistic => {
+                            let s = 1.0 / (1.0 + (-x).exp());
+                            a * s * (1.0 - s)
+                        }
+                        Op::Gauss => a * (-2.0 * x) * (-x * x).exp(),
+                        Op::Sqrt => a / (2.0 * x.sqrt()),
+                        _ => unreachable!(),
+                    }
+                };
+                for op in [Op::Exp, Op::Tanh, Op::Logistic, Op::Gauss, Op::Sqrt] {
+                    let vi = apply_op(op, x, f64::NAN, f64::NAN, 0.0);
+                    let (t, mask) = adj_terms(op, a, x, f64::NAN, f64::NAN, vi);
+                    assert_eq!(mask, 1, "{op:?}");
+                    let want = reference(op);
+                    assert_eq!(t[0].to_bits(), want.to_bits(), "{op:?} x={x:e} a={a:e}: {} vs {want}", t[0]);
+                }
+            }
         }
     }
 }

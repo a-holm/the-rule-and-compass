@@ -254,6 +254,26 @@ Decodes the 15m archives and writes the symbol-major hourly base store `base_h1.
 
 Columns: `ts symbol open high low close volume quote_volume trades taker_buy_base taker_buy_quote cov15m gap flags traded dup_rows archive_unit`.
 
+### Pinned symbol universe (`--symbols`)
+
+`panel snapshot`, `panel base` and `prep` accept `--symbols <file>`: one symbol per line, `#` comments and blank lines ignored, duplicates collapsed, an empty list is a usage error (exit 2). Names compare byte-wise with the archive directory names (upper-cased ASCII). The filter runs on the file list before any archive is opened. A pinned list comes from `rcsr-acquire universe`.
+
+The `universe` block in `snapshot.json`, `<out>.manifest.json` (base) and the `prep` manifest records:
+
+```json
+"universe": {"file": "universe_all_usdt_pit.txt", "sha256": "...", "listed": 588, "kept": 576,
+             "dropped": ["AUDUSDT", "..."], "missing": ["AUSDT", "..."], "empty": ["HYPEUSDT", "..."]}
+```
+
+* `listed = kept + missing + empty`.
+* `kept`: listed symbols with at least one archive.
+* `dropped`: directories below `--input` (with or without archives) that are not listed. They contribute no rows.
+* `missing`: listed symbols with no directory. The list is the venue universe and the archive may lag, so this is not an error.
+* `empty`: listed symbols whose directory holds no archive (for example `HYPEUSDT`). They contribute no rows and are not an error.
+* If no archive symbol is listed, the command fails (exit 3).
+
+`base --resume` folds the list SHA-256 into the per-symbol cache key, so a changed list rebuilds the parts and the same list reuses them with a byte-identical store. Without `--symbols` the behaviour, the cache keys and the output bytes are unchanged and there is no `universe` block.
+
 ### P2 and P4 `membership`, `build`
 
 `membership` is unchanged. `build` keeps the rows that are members at `ts` (same rules as above: no fill across a gap, listing, delisting or membership exclusion) and writes the time-major store sorted by `(ts, symbol)`.
@@ -282,7 +302,7 @@ Prints a JSON report and exits 3 when a check fails.
 | V6 | `gap` matches the timestamp distance | |
 | V7 | prefix replay: rebuilding from the base truncated at a cut reproduces every earlier row (`--replay N`, default 3) | `--base`, `--membership` |
 | V8 | rank columns | not applicable |
-| V9 | no undeclared level jump inside a listing | |
+| V9 | no undeclared level jump inside a listing between adjacent bars of one chain (a membership exclusion starts a new chain and is not compared) | |
 | V10 | store SHA-256 equals the manifest | manifest |
 | V11 | zero lockbox rows | |
 | V12 | each row's `member_asof` is the decision in force with `member = 1`; per-year rows equal the manifest | `--membership` |
@@ -349,6 +369,42 @@ routine runs. `rcsr walkforward` echoes it in its JSON as
 `"lockbox": {"permitted": true, "evaluated": true, ...}`. The check is skipped
 when a time column is absent or is not Unix seconds (a row index or a year
 fraction), so non-crypto data is not rejected by a crypto date.
+
+## The declared locked test
+
+The protocol locked test (`protocol/windows.csv`, row `locked`) is declared with the data, so no evaluator depends on the caller remembering a flag.
+
+```sh
+rcsr panel build --data base.rcsb --membership m.csv --out panel.rcsb --locked-test 2025-07-01,2026-07-01
+```
+
+Evaluators refuse rows and windows from `2025-07-01` minus the label purge on, not only from `2025-07-01`: the label of a row at `2025-06-30T23:00` reads the first locked bars. A search excludes them with `--exclude 'ts >= 1751108400'` (default purge 219600 s; the refusal prints the exact value for the target spec in use). The split report carries `boundary_purge_seconds` and `boundary_purge_source` (`target_spec` or `protocol_default`).
+
+The build writes `"locked_test": {"start", "end", "start_date", "end_date", "source"}` to `panel.rcsb.manifest.json` and `panel.rcsb.schema.json`. `rcsr panel base` and `rcsr prep` take the same `--locked-test START,END` and write it to `<out>.manifest.json`, so the first store of a chain carries it. `rcsr panel build` and `rcsr panel append` inherit the declaration of their input (`--data`, the base or the target panel); `rcsr panel rank` takes the range from `lockbox::resolve` on its input (the protocol default for an undeclared panel). `rcsr panel schema` keeps it, `rcsr enrich` copies it from `--data` (or takes `--locked-test`) into `<out>.enrich.json`, and `rcsr ablation prepare` writes `<csv>.lockbox.json`. A CSV can carry the same object in a `<csv>.lockbox.json` sidecar. `--allow-lockbox` does not open it: it keeps its 2026H2 meaning.
+
+`rcsr ablation prepare` builds the placebo and permuted columns separately on the rows before the declared start, inside the range and after it, per symbol. A development row never holds a locked value in `perm_*` or `placebo_*`. The sidecar adds `"segments":{"before":N,"locked":N,"after":N}` with the row count of each segment. The range is the one the resolver picks, so undeclared crypto data uses the protocol default; data outside the range forms one segment and its output is unchanged.
+
+One resolver (`rcsr::lockbox::resolve`) picks the range for search, `walkforward`, `ladder`, `ablation prepare` and `score`, `enrich` and `audit`:
+
+1. `--lockbox START,END` (`--locked-test` for `enrich`). With a stored declaration it must cover it (`START <= stored start`, `END >= stored end`); otherwise exit 2. On undeclared data the flag adds to the protocol default: both ranges are guarded and the report says `"source":"flag+protocol_default"` with the default in `lockbox.also`. A flag that already covers the default reports `flag`. A derived sidecar (`enrich`, `ablation prepare`) declares the union when the two overlap. When they are disjoint it declares the default as `locked_test` and the flag range as `locked_test_also`; every reader guards both, a flag must cover both, and carriers must agree on both.
+2. The range declared with the data: `<data>.lockbox.json`, `.schema.json`, `.manifest.json` or `.enrich.json`. Two files with different ranges exit 3 and the message names both; equal ranges are fine. A `locked_test` object that does not parse exits 3.
+3. The protocol default `2025-07-01..2026-07-01` for undeclared data, stdin and CSV files without a sidecar. Rows whose time column is not epoch seconds are not checked, so non-crypto data behaves as before.
+
+A writer never drops or changes a declaration silently. When its output path already declares a range (any carrier file) and the run declares none or another one, it exits 2 before it writes: `<out> declares the locked test A..B (<file>); ...; pass --locked-test A,B to keep it or --locked-test none to remove it`. `--locked-test none` removes it and is refused while the input declares it; a flag may widen the range of the input, never narrow it. `panel append` also exits 3 for a family store that declares another range than the target. After a write, a `<out>.lockbox.json` of the old bytes is deleted, and another carrier left with a different range is exit 3. `rcsr enrich` exits 3 and removes its output when it cannot write `<out>.enrich.json` with a declaration (an in-place output stays and the error says so).
+
+A `<data>.lockbox.json` written by `rcsr ablation prepare` also records `data_bytes` and `data_sha256` of the file it declares. A sidecar whose file has other bytes (or another SHA-256, for files up to 2 GiB) exits 3 with `stale <file>: it declares <data> with sha256 X, the file has Y`, so a regenerated CSV cannot inherit an old declaration. A hand-written sidecar without these members is not checked.
+
+`--lockbox none` is the only opt-out. It exits 2 when the data declares a range, and `walkforward` refuses it together with `--ledger` or `--locked-test`. Every report `lockbox` object carries `source` (`flag`, `store`, `protocol_default` or `none`) and `declared_in` (the files that declared a range, each with `file`, `start_date`, `end_date`). `rcsr enrich` and `rcsr ablation prepare` write the resolved range, including the protocol default, to their sidecar, so data derived from undeclared data carries the range from then on.
+
+| command | with a declared or default range |
+|---|---|
+| `rcsr --data ...` (search) | exit 3 when any fit, validation or test row is in the range; the message names the side, the first row's date and the `--exclude '<time> >= START'` fix. With the rows excluded, `run.json` has `lockbox.rows_in_scope: 0`, `evaluated: false`, `source` |
+| `rcsr walkforward` | exit 3 for a window touching the range, with or without `--ledger`; `--locked-test --ledger --sealed` reads it once |
+| `rcsr ladder` | exit 3 for a fold touching the range; `--scheme locked --locked-test --ledger --sealed` reads it once and appends a `baseline_read` ledger line; a second read is exit 3 |
+| `rcsr ablation score` | exit 3 for a fold touching the range |
+| `rcsr audit` | rows inside the range are left out of every detector, of `rows` and of the `time_audit` block; `locked_test.rows_left_out` in the JSON report and the `# audit: locked test ... rows left out=N` line count them |
+
+Rows are refused, never dropped silently, because a drop would change the split fractions without a record. With a declaration no check is skipped: `--time` is needed unless the data holds exactly one integer epoch-seconds column (the `i64` time column of a store); a time column that does not parse or is not epoch seconds, and any split row without a time stamp, is exit 3. Every run that exits 0 reports `lockbox.checked: true`. `--cv` checks every row left by `--exclude` and `--filter`, also with `--allow-lockbox`, and draws its folds from those rows only. Without a declaration, a time column that is not epoch seconds skips the row check and the report says `lockbox.checked: false`.
 
 ## Provenance manifest
 
