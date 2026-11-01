@@ -1841,3 +1841,29 @@ fn signed_bias_gpu_fit_run_is_deterministic_and_exact() {
         assert_eq!(s.error.to_bits(), cpu.to_bits());
     }
 }
+
+/// #499: an operator set with `min` and `max` fits on the device and names no
+/// `unsupported_plan` fallback.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_search_with_min_and_max_fits_on_the_device() {
+    use rcsr::expr::Op;
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let s = sample(640, 3);
+    let cfg = Config {
+        ops: vec![Op::Add, Op::Sub, Op::Mul, Op::Min, Op::Max],
+        ..gpu_config(5)
+    };
+    let out = search::run(&cfg, &s, &s);
+    let g = out.gpu.as_ref().expect("a GPU report");
+    assert!(g.fit_gpu > 0, "nothing was fitted on the device: {g:?}");
+    assert_eq!(
+        g.fit_fallback_by_cause.get("unsupported_plan").copied().unwrap_or(0),
+        0,
+        "{:?}",
+        g.fit_fallback_by_cause
+    );
+}

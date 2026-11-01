@@ -1248,3 +1248,29 @@ fn append_keeps_the_target_declaration_when_the_family_store_declares_none() {
     .unwrap();
     assert_eq!(lockbox::stored(out.to_str().unwrap()).unwrap().map(|(_, l)| l), Some(lb));
 }
+
+#[test]
+fn validation_does_not_flag_a_price_change_across_a_membership_exclusion() {
+    let dir = scratch("reentry");
+    let raw = dir.join("raw");
+    let mut lines = hours(10.0, 0, 50, &[], Unit::Ms);
+    lines.extend(hours(20.0, 50, 50, &[], Unit::Ms));
+    lines.extend(hours(40.0, 100, 50, &[], Unit::Ms));
+    lines.extend(hours(80.0, 150, 50, &[], Unit::Ms));
+    put_zip(&raw, "XXXUSDT", "2021-01", &lines);
+    let m = dir.join("membership.csv");
+    membership(&m, &[(0, "XXXUSDT", 1), (50, "XXXUSDT", 0), (150, "XXXUSDT", 1)]);
+    let base = dir.join("base.rcsb");
+    panel_v2::build_base(&base_opts(&raw, &base)).unwrap();
+    let out = dir.join("panel.rcsb");
+    panel_v2::build_panel(&panel_opts(&base, &m, &out)).unwrap();
+    let rep = panel_v2::validate(&ValidateOptions {
+        panel: out.to_str().unwrap().to_string(),
+        base: Some(base.to_str().unwrap().to_string()),
+        membership: Some(m.to_str().unwrap().to_string()),
+        replay: 0,
+        panel_options: panel_opts(&base, &m, &out),
+    });
+    let failed: Vec<&str> = rep.checks.iter().filter(|c| c.status == "fail").map(|c| c.id).collect();
+    assert!(failed.is_empty(), "{failed:?}");
+}

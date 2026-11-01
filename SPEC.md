@@ -333,6 +333,15 @@ Per generation, per island:
    - respect `max_complexity`; retry a bounded number of times.
 4. Replace the island population with the offspring, keeping the island's best
    individual (elitism).
+   With `--selection afp` (issue #465) steps 3 and 4 change: `P` offspring plus
+   `max(1, P/20)` random immigrants (age 0) are scored, and the next population is
+   chosen from parents, offspring and immigrants by non-dominated sorting on the
+   minimised objectives (error, complexity, age), filling front by front and
+   splitting the last front by NSGA-II crowding distance (ties: lower index).
+   An offspring inherits the older parent's age; a front parent counts as age 0;
+   survivors age by 1. Parents are drawn by a size-4 tournament on Pareto rank,
+   then crowding distance, then index. Migration replaces the member of the
+   highest rank. The lowest-error individual always survives. Node path only.
 
 Every `migration_interval` generations, copy the best member of each island into
 the next island (ring topology). If an island stagnates for `restart_interval`

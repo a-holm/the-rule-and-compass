@@ -198,6 +198,16 @@ struct RcCtx {
     char *d_carry;
     int carry_cap;
     int carry_warm;
+    /* #481: the long/flat fitness book of the resident rows, one allocation:
+       `n` f64 excess returns followed by `n` seam-flag bytes. Null until
+       `rc_set_pnl_book`. `d_pnl_totals` is set only by the test-only totals
+       entry point. */
+    unsigned char *d_pnl_book;
+    double pnl_side;
+    double pnl_threshold;
+    double pnl_bound;
+    unsigned long long pnl_min_trades;
+    void *d_pnl_totals;
     /* #293: tiled residency. `d_cols` is null; the feature columns stream from
        the host copy `h_cols` (column-major, caller-owned) through two device
        slots of `tile_rows` rows. The target, label sign and weights stay
@@ -844,6 +854,16 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
    a tiled context is refused: slope has no weighted form, and row `r - 1` of a
    tile's first row is not resident. */
 #define RC_SCORE_SLOPE 15
+
+/* #481: the long/flat net regret `(B - net) / B` of `trading::FitnessBook` on
+   the resident rows in canonical (group, time) order, read from the uploaded
+   book. Refused in a tiled context, over a row partition and before
+   `rc_set_pnl_book`. */
+#define RC_SCORE_LONG_PNL 16
+/* `trading::FITNESS_SEGMENT_ROWS` and `FITNESS_WARPS`: the gross sum's fixed
+   tree. The block is exactly RC_PNL_WARPS warps whatever the row count. */
+#define RC_PNL_SEGMENT_ROWS 8192
+#define RC_PNL_WARPS 8
 
 /* #222: the L1 majoriser floor, the same `1e-6` the CPU `irls_fit` uses. It is
    deliberately not smaller: at |r| = 0 the exact weight is infinite, and a
@@ -1500,6 +1520,159 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
     }
 }
 
+/* --- #481: the long/flat regret fused with the interpreter ----------------
+ *
+ * One block of RC_PNL_WARPS warps per candidate. Segment `s` (RC_PNL_SEGMENT_ROWS
+ * rows) belongs to warp `s % RC_PNL_WARPS`, which walks its segments in
+ * ascending order, 32 consecutive rows per step. A row is long when its
+ * prediction is finite and `(double)pred > threshold`, exactly
+ * `FitnessBook::totals` on the same f32 prediction.
+ *
+ * Positions are warp ballots; flips, exits and long rows are popcounts. The
+ * position before a row is the previous bit of the ballot, the carried bit of
+ * the previous step, or flat at a group start. A segment's carry is seeded by
+ * re-evaluating the row before it, so no warp needs another warp's result.
+ *
+ * `gross` is the only floating-point sum. Lane `l` adds the excess of the long
+ * rows `seg_start + l + 32j` in ascending `j`, the lanes fold with the halving
+ * tree 16, 8, 4, 2, 1, each warp adds its segment sums in ascending order, and
+ * thread 0 folds the warp sums with 4, 2, 1: the CPU tree term for term. No
+ * floating-point atomics; the value depends only on (program, rows). */
+typedef struct RcPnlTotals {
+    double gross;
+    unsigned long long flips;
+    unsigned long long exits;
+    unsigned long long longs;
+    int nonfinite;
+    int pad;
+} RcPnlTotals;
+
+static_assert(RC_MAX_THREADS == 32 * RC_PNL_WARPS, "the long/flat block is RC_PNL_WARPS warps");
+static_assert(RC_PNL_SEGMENT_ROWS % 32 == 0, "a segment is whole warp steps");
+
+__device__ __forceinline__ int rc_pnl_long(float pred, double threshold)
+{
+    return isfinite(pred) && (double)pred > threshold;
+}
+
+__global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
+    const float *__restrict__ cols,
+    int n,
+    const unsigned int *__restrict__ prog,
+    const unsigned int *__restrict__ off,
+    int width,
+    int pooled,
+    const double *__restrict__ excess,
+    const unsigned char *__restrict__ flags,
+    double side,
+    double threshold,
+    double bound,
+    unsigned long long min_trades,
+    double *__restrict__ out,
+    int *__restrict__ status,
+    RcPnlTotals *__restrict__ totals)
+{
+    const int p = blockIdx.x;
+    const unsigned int *code = pooled
+        ? prog + (size_t)p * (size_t)width
+        : prog + off[p];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    __shared__ double sh_gross[RC_PNL_WARPS];
+    __shared__ unsigned int sh_flips[RC_PNL_WARPS];
+    __shared__ unsigned int sh_exits[RC_PNL_WARPS];
+    __shared__ unsigned int sh_longs[RC_PNL_WARPS];
+    __shared__ int sh_bad[RC_PNL_WARPS];
+
+    unsigned int flips = 0, exits = 0, longs = 0;
+    int bad = 0;
+    double warp_gross = 0.0;
+    const long long rows = (long long)n;
+    const long long nseg = (rows + RC_PNL_SEGMENT_ROWS - 1) / RC_PNL_SEGMENT_ROWS;
+    for (long long s = warp; s < nseg; s += RC_PNL_WARPS) {
+        const long long seg_start = s * RC_PNL_SEGMENT_ROWS;
+        const long long seg_end = (seg_start + RC_PNL_SEGMENT_ROWS < rows)
+            ? seg_start + RC_PNL_SEGMENT_ROWS
+            : rows;
+        unsigned int carry = 0u;
+        if (seg_start > 0) {
+            const float q = rc_exec_row(code, cols, n, (int)(seg_start - 1));
+            carry = rc_pnl_long(q, threshold) ? 1u : 0u;
+        }
+        double lane_gross = 0.0;
+        for (long long base = seg_start; base < seg_end; base += 32) {
+            const long long row = base + lane;
+            const int in = row < seg_end;
+            float pred = 0.0f;
+            unsigned int f = 0u;
+            if (in) {
+                pred = rc_exec_row(code, cols, n, (int)row);
+                f = flags[row];
+            }
+            const int fin = isfinite(pred);
+            const int pos = in && fin && (double)pred > threshold;
+            bad |= in && !fin;
+            const unsigned int m = __ballot_sync(0xffffffffu, pos);
+            const unsigned int fst = __ballot_sync(0xffffffffu, (f & 1u) != 0u);
+            const unsigned int lst = __ballot_sync(0xffffffffu, (f & 2u) != 0u);
+            const unsigned int val = __ballot_sync(0xffffffffu, in);
+            const unsigned int prev = ((m << 1) | carry) & ~fst;
+            flips += __popc((m ^ prev) & val);
+            exits += __popc(m & lst);
+            longs += __popc(m);
+            if (pos) lane_gross += excess[row];
+            carry = (m >> 31) & 1u;
+        }
+        for (int half = 16; half >= 1; half >>= 1) {
+            lane_gross += __shfl_down_sync(0xffffffffu, lane_gross, half);
+        }
+        warp_gross += lane_gross;
+    }
+    bad = __any_sync(0xffffffffu, bad);
+    if (lane == 0) {
+        sh_gross[warp] = warp_gross;
+        sh_flips[warp] = flips;
+        sh_exits[warp] = exits;
+        sh_longs[warp] = longs;
+        sh_bad[warp] = bad;
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    double g[RC_PNL_WARPS];
+    unsigned long long tf = 0, te = 0, tl = 0;
+    int tb = 0;
+    for (int w = 0; w < RC_PNL_WARPS; ++w) {
+        g[w] = sh_gross[w];
+        tf += sh_flips[w];
+        te += sh_exits[w];
+        tl += sh_longs[w];
+        tb |= sh_bad[w];
+    }
+    for (int half = RC_PNL_WARPS / 2; half >= 1; half >>= 1) {
+        for (int i = 0; i < half; ++i) g[i] = __dadd_rn(g[i], g[i + half]);
+    }
+    const double gross = g[0];
+    const double net = __dsub_rn(gross, __dmul_rn(side, (double)(tf + te)));
+    double r = INFINITY;
+    int st = 0;
+    if (tb) {
+        st = RC_SCORE_NONFINITE;
+    } else if (tf >= min_trades) {
+        r = __ddiv_rn(__dsub_rn(bound, net), bound);
+        if (!isfinite(r)) r = INFINITY;
+    }
+    out[p] = r;
+    status[p] = st;
+    if (totals) {
+        totals[p].gross = gross;
+        totals[p].flips = tf;
+        totals[p].exits = te;
+        totals[p].longs = tl;
+        totals[p].nonfinite = tb;
+        totals[p].pad = 0;
+    }
+}
+
 /* --- #293: row-range scoring with a lane carry ---------------------------
  *
  * The resident `score_kernel` gives lane `l` (a thread of the block) the rows
@@ -1798,6 +1971,15 @@ struct FtSmem {
     double sdcarry[MAXC + 1];
 };
 
+/* Fit-kernel helpers for the piecewise operators. `ft_ind` is the 0/1 truth
+   indicator `[x > 0]`, `NaN` for `NaN`, as `ind` in fit.rs. `ft_mod_ok` is the
+   CPU validity test of `mod`. */
+template <typename T>
+__device__ __forceinline__ T ft_ind(T x)
+{
+    return isnan(x) ? (T)CUDART_NAN : (x > (T)0 ? (T)1 : (T)0);
+}
+
 __device__ __forceinline__ void ft_forward(const unsigned int *nd,
                                            int m,
                                            const float *__restrict__ cols,
@@ -1855,6 +2037,55 @@ __device__ __forceinline__ void ft_forward(const unsigned int *nd,
                 case OP_COSH: r = coshf(a); break;
                 case OP_ERF: r = (a == 0.0f) ? 0.0f : erff(a); break;
                 case OP_ERFC: r = erfcf(a); break;
+                case OP_STEP: r = (a > 0.0f) ? 1.0f : 0.0f; break;
+                case OP_FLOOR: r = floorf(a); break;
+                case OP_CEIL: r = ceilf(a); break;
+                case OP_ROUND: r = roundf(a); break;
+                case OP_SIGN:
+                    r = (a > 0.0f) ? 1.0f : (a < 0.0f) ? -1.0f : (a == 0.0f) ? 0.0f : CUDART_NAN_F;
+                    break;
+                case OP_NOT:
+                    r = isnan(a) ? CUDART_NAN_F : (a > 0.0f ? 0.0f : 1.0f);
+                    break;
+                case OP_MIN: {
+                    const float b = v[k1];
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN_F : fminf(a, b);
+                } break;
+                case OP_MAX: {
+                    const float b = v[k1];
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN_F : fmaxf(a, b);
+                } break;
+                case OP_ATAN2: r = atan2f(a, v[k1]); break;
+                case OP_MOD: {
+                    const float b = v[k1];
+                    r = (!isfinite(a) || !isfinite(b) || fabsf(b) < 1e-12f)
+                            ? CUDART_NAN_F
+                            : __fsub_rn(a, __fmul_rn(b, floorf(a / b)));
+                } break;
+                case OP_EQUAL:
+                case OP_LESS:
+                case OP_LESS_OR_EQUAL:
+                case OP_GREATER:
+                case OP_GREATER_OR_EQUAL: {
+                    const float b = v[k1];
+                    bool t = false;
+                    if (op == OP_EQUAL) t = a == b;
+                    else if (op == OP_LESS) t = a < b;
+                    else if (op == OP_LESS_OR_EQUAL) t = a <= b;
+                    else if (op == OP_GREATER) t = a > b;
+                    else t = a >= b;
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN_F : (t ? 1.0f : 0.0f);
+                } break;
+                case OP_AND:
+                case OP_OR:
+                case OP_XOR: {
+                    const float b = v[k1];
+                    bool t = false;
+                    if (op == OP_AND) t = (a > 0.0f) && (b > 0.0f);
+                    else if (op == OP_OR) t = (a > 0.0f) || (b > 0.0f);
+                    else t = (a > 0.0f) != (b > 0.0f);
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN_F : (t ? 1.0f : 0.0f);
+                } break;
                 default: r = CUDART_NAN_F; break;
             }
             v[i] = r;
@@ -1941,6 +2172,47 @@ __device__ __forceinline__ void ft_backward(const unsigned int *nd,
                     adj[k1] += a * powf(x, y) * logf(x);
                 }
                 break;
+            case OP_MOD:
+                if (fabsf(y) >= 1e-12f) {
+                    adj[k0] += a;
+                    adj[k1] += -a * floorf(x / y);
+                }
+                break;
+            case OP_MIN:
+                if (x < y) adj[k0] += a;
+                else if (y < x) adj[k1] += a;
+                else {
+                    adj[k0] += 0.5f * a;
+                    adj[k1] += 0.5f * a;
+                }
+                break;
+            case OP_MAX:
+                if (x > y) adj[k0] += a;
+                else if (y > x) adj[k1] += a;
+                else {
+                    adj[k0] += 0.5f * a;
+                    adj[k1] += 0.5f * a;
+                }
+                break;
+            case OP_ATAN2: {
+                const float d = x * x + y * y;
+                if (d > 0.0f) {
+                    adj[k0] += a * y / d;
+                    adj[k1] += -a * x / d;
+                }
+            } break;
+            case OP_AND:
+                adj[k0] += a * ft_ind(y);
+                adj[k1] += a * ft_ind(x);
+                break;
+            case OP_OR:
+                adj[k0] += a * (1.0f - ft_ind(y));
+                adj[k1] += a * (1.0f - ft_ind(x));
+                break;
+            case OP_XOR:
+                adj[k0] += a * (1.0f - 2.0f * ft_ind(y));
+                adj[k1] += a * (1.0f - 2.0f * ft_ind(x));
+                break;
             case OP_IF:
                 if (x > 0.0f) adj[k1] += a;
                 else adj[slot] += a;
@@ -2012,6 +2284,55 @@ __device__ __forceinline__ void ft_forward_d(const unsigned int *nd,
                 case OP_COSH: r = cosh(a); break;
                 case OP_ERF: r = (a == 0.0) ? 0.0 : erf(a); break;
                 case OP_ERFC: r = erfc(a); break;
+                case OP_STEP: r = (a > 0.0) ? 1.0 : 0.0; break;
+                case OP_FLOOR: r = floor(a); break;
+                case OP_CEIL: r = ceil(a); break;
+                case OP_ROUND: r = round(a); break;
+                case OP_SIGN:
+                    r = (a > 0.0) ? 1.0 : (a < 0.0) ? -1.0 : (a == 0.0) ? 0.0 : CUDART_NAN;
+                    break;
+                case OP_NOT:
+                    r = isnan(a) ? CUDART_NAN : (a > 0.0 ? 0.0 : 1.0);
+                    break;
+                case OP_MIN: {
+                    const double b = v[k1];
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN : fmin(a, b);
+                } break;
+                case OP_MAX: {
+                    const double b = v[k1];
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN : fmax(a, b);
+                } break;
+                case OP_ATAN2: r = atan2(a, v[k1]); break;
+                case OP_MOD: {
+                    const double b = v[k1];
+                    r = (!isfinite(a) || !isfinite(b) || fabs(b) < 1e-12)
+                            ? CUDART_NAN
+                            : __dsub_rn(a, __dmul_rn(b, floor(a / b)));
+                } break;
+                case OP_EQUAL:
+                case OP_LESS:
+                case OP_LESS_OR_EQUAL:
+                case OP_GREATER:
+                case OP_GREATER_OR_EQUAL: {
+                    const double b = v[k1];
+                    bool t = false;
+                    if (op == OP_EQUAL) t = a == b;
+                    else if (op == OP_LESS) t = a < b;
+                    else if (op == OP_LESS_OR_EQUAL) t = a <= b;
+                    else if (op == OP_GREATER) t = a > b;
+                    else t = a >= b;
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN : (t ? 1.0 : 0.0);
+                } break;
+                case OP_AND:
+                case OP_OR:
+                case OP_XOR: {
+                    const double b = v[k1];
+                    bool t = false;
+                    if (op == OP_AND) t = (a > 0.0) && (b > 0.0);
+                    else if (op == OP_OR) t = (a > 0.0) || (b > 0.0);
+                    else t = (a > 0.0) != (b > 0.0);
+                    r = (isnan(a) || isnan(b)) ? CUDART_NAN : (t ? 1.0 : 0.0);
+                } break;
                 default: r = CUDART_NAN; break;
             }
             v[i] = r;
@@ -2092,6 +2413,47 @@ __device__ __forceinline__ void ft_backward_d(const unsigned int *nd,
                     adj[k0] += a * y * pow(x, y - 1.0);
                     adj[k1] += a * pow(x, y) * log(x);
                 }
+                break;
+            case OP_MOD:
+                if (fabs(y) >= 1e-12) {
+                    adj[k0] += a;
+                    adj[k1] += -a * floor(x / y);
+                }
+                break;
+            case OP_MIN:
+                if (x < y) adj[k0] += a;
+                else if (y < x) adj[k1] += a;
+                else {
+                    adj[k0] += 0.5 * a;
+                    adj[k1] += 0.5 * a;
+                }
+                break;
+            case OP_MAX:
+                if (x > y) adj[k0] += a;
+                else if (y > x) adj[k1] += a;
+                else {
+                    adj[k0] += 0.5 * a;
+                    adj[k1] += 0.5 * a;
+                }
+                break;
+            case OP_ATAN2: {
+                const double d = x * x + y * y;
+                if (d > 0.0) {
+                    adj[k0] += a * y / d;
+                    adj[k1] += -a * x / d;
+                }
+            } break;
+            case OP_AND:
+                adj[k0] += a * ft_ind(y);
+                adj[k1] += a * ft_ind(x);
+                break;
+            case OP_OR:
+                adj[k0] += a * (1.0 - ft_ind(y));
+                adj[k1] += a * (1.0 - ft_ind(x));
+                break;
+            case OP_XOR:
+                adj[k0] += a * (1.0 - 2.0 * ft_ind(y));
+                adj[k1] += a * (1.0 - 2.0 * ft_ind(x));
                 break;
             case OP_IF:
                 if (x > 0.0) adj[k1] += a;
@@ -4488,6 +4850,7 @@ void rc_destroy(void *ctx)
     if (c->d_score_out) rc_dev_free(c, c->d_score_out);
     if (c->d_score_status) rc_dev_free(c, c->d_score_status);
     if (c->d_carry) rc_dev_free(c, c->d_carry);
+    if (c->d_pnl_book) rc_dev_free(c, c->d_pnl_book);
     if (c->d_pool[0]) rc_dev_free(c, c->d_pool[0]);
     if (c->d_pool[1]) rc_dev_free(c, c->d_pool[1]);
     if (c->d_hash) rc_dev_free(c, c->d_hash);
@@ -5202,6 +5565,14 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
         st->wall_ms = rc_now_ms() - c->batch_start_ms;
         return -1.0f;
     }
+
+    /* #481: the book is resident and the segment tree spans every row, so a
+       tiled context, a row partition or a missing book is refused. */
+    if (kind == RC_SCORE_LONG_PNL && (c->tiled || bounds || !c->d_pnl_book)) {
+        st->failed = 1;
+        st->wall_ms = rc_now_ms() - c->batch_start_ms;
+        return -1.0f;
+    }
     t = rc_now_ms();
     const int wave = c->tiled ? rc_wave_width(c, nprog) : nprog;
     if ((bounds || c->tiled) && rc_carry_reserve(c, wave) != 0) {
@@ -5323,6 +5694,14 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
                 c->d_tsign, c->d_w64,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
+        case RC_SCORE_LONG_PNL:
+            pnl_score_kernel<<<nprog, RC_MAX_THREADS>>>(
+                c->d_cols, c->n, prog, off, width, pooled,
+                (const double *)c->d_pnl_book,
+                c->d_pnl_book + sizeof(double) * (size_t)c->n,
+                c->pnl_side, c->pnl_threshold, c->pnl_bound, c->pnl_min_trades,
+                c->d_score_out, c->d_score_status, (RcPnlTotals *)c->d_pnl_totals);
+            break;
         default:
             st->failed = 1;
             st->wall_ms = rc_now_ms() - c->batch_start_ms;
@@ -5415,6 +5794,66 @@ float rc_pool_score(void *ctx, int which, int nprog, int width, int kind,
         return -1.0f;
     return rc_score_launch(c, c->d_pool[which & 1], 0, width, 1, nprog, kind,
                            pcount, 0, 0, out, status);
+}
+
+/* #481: upload the long/flat fitness book of the resident rows: the excess
+   returns, the seam flags (bit 1 first row of a group, bit 2 last row), the
+   cost per side, the threshold, the hindsight bound and the trade floor. One
+   allocation of 9 bytes per row, tag "pnl_book", kept until rc_destroy or the
+   next call. Returns 0, or -1 when refused: a tiled context, a row count other
+   than the resident one, a non-positive bound or a refused allocation (the
+   previous book is released either way). */
+int rc_set_pnl_book(void *ctx, const double *excess, const unsigned char *flags,
+                    int n, double side, double threshold, double bound,
+                    unsigned long long min_trades)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c) return -1;
+    if (c->d_pnl_book) {
+        rc_dev_free(c, c->d_pnl_book);
+        c->d_pnl_book = 0;
+    }
+    if (c->tiled || n <= 0 || n != c->n || !excess || !flags || !(bound > 0.0)) return -1;
+    const size_t eb = sizeof(double) * (size_t)n;
+    const size_t bytes = eb + (size_t)n;
+    void *p = 0;
+    if (rc_dev_alloc(c, "pnl_book", &p, bytes) != 0) return -1;
+    unsigned char *book = (unsigned char *)p;
+    rc_upload(book, excess, eb);
+    rc_upload(book + eb, flags, (size_t)n);
+    if (cudaGetLastError() != cudaSuccess) {
+        rc_dev_free(c, book);
+        return -1;
+    }
+    c->d_pnl_book = book;
+    c->pnl_side = side;
+    c->pnl_threshold = threshold;
+    c->pnl_bound = bound;
+    c->pnl_min_trades = min_trades;
+    return 0;
+}
+
+/* #481, test-only: score a packed batch with RC_SCORE_LONG_PNL and also write
+   each candidate's totals (`RcPnlTotals`). The totals buffer is allocated and
+   released inside the call. Returns 0, or -1 on any failure. */
+int rc_pnl_totals(void *ctx, const unsigned int *prog, const unsigned int *off,
+                  int nprog, double *out, int *status, RcPnlTotals *totals)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || nprog <= 0 || !out || !status || !totals || c->d_pnl_totals) return -1;
+    const size_t bytes = sizeof(RcPnlTotals) * (size_t)nprog;
+    void *d = 0;
+    if (rc_dev_alloc(c, "pnl_totals", &d, bytes) != 0) return -1;
+    c->d_pnl_totals = d;
+    const float ms = rc_score_batch(ctx, prog, off, nprog, RC_SCORE_LONG_PNL, 0, out, status);
+    c->d_pnl_totals = 0;
+    int rc = ms < 0.0f ? -1 : 0;
+    if (rc == 0) {
+        rc_download(totals, d, bytes);
+        if (cudaGetLastError() != cudaSuccess) rc = -1;
+    }
+    rc_dev_free(c, d);
+    return rc;
 }
 
 /* #118: start a fresh batch ledger. The Rust evaluator calls this once before

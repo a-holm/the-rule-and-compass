@@ -73,6 +73,9 @@ pub struct Individual {
     pub error: f64,
     /// Configured complexity under the saved [`Config::complexity_model`].
     pub complexity: f64,
+    /// #465: generations since the lineage began. Written only by
+    /// `--selection afp` runs; every other checkpoint reads back 0.
+    pub age: u32,
 }
 
 /// One island: its RNG stream and its population, in order.
@@ -624,6 +627,10 @@ impl Checkpoint {
                 )
                 .unwrap();
             }
+            if self.config.selection == crate::search::Selection::Afp {
+                let ages: Vec<String> = isl.population.iter().map(|ind| ind.age.to_string()).collect();
+                writeln!(out, "ages {} {}", i, ages.join(" ")).unwrap();
+            }
         }
         out
     }
@@ -663,6 +670,7 @@ impl Checkpoint {
         let mut island_rngs: Vec<Option<Mt>> = Vec::new();
         let mut island_mix: Vec<Option<crate::mix::MixWindow>> = Vec::new();
         let mut island_pops: Vec<Option<Vec<Individual>>> = Vec::new();
+        let mut island_ages: Vec<Option<Vec<u32>>> = Vec::new();
         let mut main_rng: Option<Mt> = None;
         let mut error_kind: Option<ErrorKind> = None;
         let mut stored_archive_hash: Option<u64> = None;
@@ -955,7 +963,21 @@ impl Checkpoint {
                             tree,
                             error,
                             complexity,
+                            age: 0,
                         });
+                }
+                "ages" => {
+                    let i = parse_num::<usize>(&parts, 1, lineno, "ages island")?;
+                    let mut ages = Vec::with_capacity(parts.len().saturating_sub(2));
+                    for k in 2..parts.len() {
+                        ages.push(parse_num::<u32>(&parts, k, lineno, "ages value")?);
+                    }
+                    if island_ages.len() <= i {
+                        island_ages.resize_with(i + 1, || None);
+                    }
+                    if island_ages[i].replace(ages).is_some() {
+                        return Err(format!("line {}: duplicate ages record for island {}", lineno, i));
+                    }
                 }
                 other => {
                     return Err(format!(
@@ -1012,10 +1034,29 @@ impl Checkpoint {
                 .get_mut(i)
                 .and_then(|s| s.take())
                 .ok_or_else(|| format!("checkpoint is incomplete: island {} has no rng state", i))?;
-            let population = island_pops
+            let mut population = island_pops
                 .get_mut(i)
                 .and_then(|s| s.take())
                 .ok_or_else(|| format!("checkpoint is incomplete: island {} has no population", i))?;
+            match island_ages.get_mut(i).and_then(|s| s.take()) {
+                Some(ages) if ages.len() == population.len() => {
+                    for (ind, age) in population.iter_mut().zip(ages) {
+                        ind.age = age;
+                    }
+                }
+                Some(ages) => {
+                    return Err(format!(
+                        "checkpoint is inconsistent: island {} has {} age(s) for {} individual(s)",
+                        i,
+                        ages.len(),
+                        population.len()
+                    ));
+                }
+                None if config.selection == crate::search::Selection::Afp => {
+                    return Err(format!("checkpoint is incomplete: island {} has no ages", i));
+                }
+                None => {}
+            }
             if population.len() != config.pop {
                 return Err(format!(
                     "checkpoint is inconsistent: island {} has {} individual(s), saved pop is {}",
@@ -1346,6 +1387,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "require_dimensions",
         "fit_samples",
         "front_parents", // #76
+        "reject_constant_offspring", // #477: missing means false
         "fit_strategy",  // #116: missing means `exact`
         "fit_admission", // #223: missing means `screened`
         "fit_polish",    // #496: missing means `f64`
@@ -1359,6 +1401,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "qd_policy",     // #120
         "qd_control",    // #120
         "variation",     // #122: missing means auto
+        "selection",     // #465: missing means lexicographic
         "linear_scaling", // #470: missing means false
         "mutation_mix",       // #471: missing means classic
         "tree_arity",         // #471: missing means uniform
@@ -1585,6 +1628,16 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             ))
         }
     };
+    let reject_constant_offspring = match fields.get("reject_constant_offspring").map(|s| s.as_str()) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "config 'reject_constant_offspring' must be true or false, got '{}'",
+                other
+            ))
+        }
+    };
     // #116: missing means `exact`, byte-identical to a checkpoint written
     // before the solver portfolio existed.
     let fit_strategy = match fields.get("fit_strategy").map(|s| s.as_str()) {
@@ -1693,6 +1746,13 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         })?,
     };
 
+    // #465: absent means lexicographic, matching every earlier checkpoint.
+    let selection = match fields.get("selection").map(|s| s.as_str()) {
+        None => crate::search::Selection::Lexicographic,
+        Some(raw) => crate::search::Selection::parse(raw)
+            .map_err(|e| format!("config 'selection' is invalid: {}", e))?,
+    };
+
     Ok(Config {
         generations: num_usize("generations")?,
         islands: num_usize("islands")?,
@@ -1722,6 +1782,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         // #116: a disk row source is a path choice, not saved search state.
         fit_stream_source: None,
         front_parents, // #76
+        reject_constant_offspring, // #477
         units,
         require_dimensions,
         qd_bins,
@@ -1743,6 +1804,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         pipeline_depth: 2,
         threads: 1,
         variation,
+        selection,
         linear_scaling, // #470
         mutation_mix,
         tree_arity,
@@ -1832,6 +1894,11 @@ fn write_config(cfg: &Config, out: &mut String) {
     if cfg.fit_samples > 0 {
         writeln!(out, "config fit_samples {}", cfg.fit_samples).unwrap();
     }
+    // #465: written only when on, so every other checkpoint and config hash
+    // keeps its bytes.
+    if cfg.selection != crate::search::Selection::Lexicographic {
+        writeln!(out, "config selection {}", cfg.selection.as_str()).unwrap();
+    }
     // #470: written only when on, so every other checkpoint keeps its bytes.
     if cfg.linear_scaling {
         writeln!(out, "config linear_scaling true").unwrap();
@@ -1853,6 +1920,9 @@ fn write_config(cfg: &Config, out: &mut String) {
     // checkpoint stays byte-identical to one written before the flag existed.
     if !cfg.front_parents {
         writeln!(out, "config front_parents false").unwrap();
+    }
+    if cfg.reject_constant_offspring {
+        writeln!(out, "config reject_constant_offspring true").unwrap(); // #477
     }
     // #25: only write these when units are active, so a units-free checkpoint
     // is byte-identical to one written before this feature existed.

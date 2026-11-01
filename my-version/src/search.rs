@@ -14,6 +14,7 @@
 //!   tie-break) so bloat is controlled without a hand-tuned penalty;
 //! * the loop stops early when it has converged, or when a time budget is hit.
 
+use crate::afp;
 use crate::checkpoint::{Backend, Checkpoint, Individual, IslandState};
 use crate::mix::{MixCounts, MixWindow};
 use crate::complexity::ComplexityModel;
@@ -68,6 +69,36 @@ impl VariationMode {
             "postfix" => Ok(VariationMode::Postfix),
             other => Err(format!(
                 "variation must be 'auto', 'node' or 'postfix', got '{}'",
+                other
+            )),
+        }
+    }
+}
+
+/// #465: how an island chooses its next population.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Selection {
+    /// Generational replacement with lexicographic parsimony tournaments.
+    #[default]
+    Lexicographic,
+    /// Age-fitness Pareto survivor selection over parents and offspring.
+    Afp,
+}
+
+impl Selection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Selection::Lexicographic => "lexicographic",
+            Selection::Afp => "afp",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "lexicographic" => Ok(Selection::Lexicographic),
+            "afp" => Ok(Selection::Afp),
+            other => Err(format!(
+                "selection must be 'lexicographic' or 'afp', got '{}'",
                 other
             )),
         }
@@ -212,6 +243,10 @@ pub struct Config {
     pub fit_report: bool,
     /// Discard structurally duplicated offspring before evaluating them.
     pub dedup: bool,
+    /// #477: reject offspring and random trees with no row-dependent input
+    /// before the constant fit, except the first constant of an island.
+    /// Saved search state.
+    pub reject_constant_offspring: bool,
     /// Wall-clock budget in seconds; `None` means no limit.
     pub time_budget: Option<f64>,
     /// Stop after this many generations with no improvement (0 disables).
@@ -326,6 +361,8 @@ pub struct Config {
     /// #122: which variation engine to use. `auto` selects the flat postfix
     /// engine only for a large, fit-free GPU run.
     pub variation: VariationMode,
+    /// #465: survivor and parent selection inside an island.
+    pub selection: Selection,
     /// #470: wrap every candidate shape in a fitted affine output map
     /// `a + b*f(x)`. Changes the trajectory, so it is a saved search setting.
     pub linear_scaling: bool,
@@ -387,6 +424,9 @@ pub struct GenCounters {
     /// #463: candidates dropped after the fit because they exceeded the
     /// complexity cap; each one re-enters variation.
     pub post_fit_drops: std::sync::atomic::AtomicU64,
+    /// #477: offspring rejected before the fit because no input reaches the
+    /// rows outside an aggregate or meta operator.
+    pub constant: std::sync::atomic::AtomicU64,
     /// Whether the fit, eval and batch timers read the clock. Off outside a
     /// development log; the counts are kept either way.
     pub timed: bool,
@@ -577,6 +617,7 @@ impl Default for Config {
             fit_admission: crate::fit::FitAdmission::Screened,
             fit_report: false,
             dedup: true,
+            reject_constant_offspring: false,
             time_budget: None,
             patience: 40,
             predictor_samples: None,
@@ -609,6 +650,7 @@ impl Default for Config {
             pipeline_depth: 2, // #119: only used when the GPU path is active
             threads: 1,
             variation: VariationMode::Auto,
+            selection: Selection::Lexicographic,
             linear_scaling: false,
             mutation_mix: MutationMix::Classic,
             tree_arity: TreeArity::Uniform,
@@ -647,6 +689,7 @@ impl Config {
         compare!(ops, "ops");
         compare!(migration_interval, "migration_interval");
         compare!(restart_interval, "restart_interval");
+        compare!(reject_constant_offspring, "reject_constant_offspring"); // #477
         compare!(init_depth, "init_depth");
         compare!(fit_iters, "fit_iters");
         compare!(fit_strategy, "fit_strategy"); // #116
@@ -667,6 +710,7 @@ impl Config {
         compare!(fit_fallback_max, "fit_fallback_max"); // #255
         compare!(refit_band, "refit_band"); // #495
         compare!(front_parents, "front_parents"); // #76
+        compare!(selection, "selection"); // #465
         compare!(qd_bins, "qd_bins"); // #120
         compare!(qd_cell_cap, "qd_cell_cap"); // #120
         compare!(qd_cvt, "qd_cvt"); // #120
@@ -747,6 +791,8 @@ struct Ind {
     /// cross-checks a descriptor against the sample it was computed on before
     /// trusting it.
     descriptor: Option<qd::Descriptor>,
+    /// #465: generations since the lineage began; only `--selection afp` reads it.
+    age: u32,
 }
 
 impl Ind {
@@ -798,6 +844,7 @@ impl Ind {
             error,
             complexity,
             descriptor,
+            age: 0,
         }
     }
 
@@ -823,6 +870,7 @@ impl Ind {
             // A GPU batch returns the error, not the prediction vector, so the
             // descriptor is filled by the archive's fallback path.
             descriptor: None,
+            age: 0,
         }
     }
 
@@ -858,7 +906,9 @@ impl Ind {
         } else {
             None
         };
+        let age = self.age;
         *self = Ind::evaluated_fitted(tree, fitted, train, cfg); // #25 #87
+        self.age = age;
     }
 
     fn to_checkpoint(&self) -> Individual {
@@ -866,6 +916,7 @@ impl Ind {
             tree: self.tree.clone(),
             error: self.error,
             complexity: self.complexity,
+            age: self.age,
         }
     }
 
@@ -877,6 +928,7 @@ impl Ind {
             // A checkpoint stores the tree and score, not the descriptor; the
             // archive recomputes it on the resumed run like any other candidate.
             descriptor: None,
+            age: ind.age,
         }
     }
 }
@@ -937,6 +989,7 @@ struct GpuSearch {
     /// #284/#255: exact CPU fallback seconds inside the fit stage, milliseconds.
     /// This is a subset of `fit_host_ms`, never added to it twice.
     fit_fallback_ms: f64,
+    fit_gate_ms: f64,
     /// #255: candidates left at their finite device constants because the
     /// per-generation fallback bound was reached.
     fit_fallback_bounded: usize,
@@ -1087,6 +1140,8 @@ impl GpuSearch {
         // indices), or empty to fit on every row.
         fit_rows: &[usize],
         plan: Option<&crate::memory::DevicePlan>,
+        // #481: the long/flat book `ScoreObjective::LongPnl` reads.
+        pnl_book: Option<&crate::trading::FitnessBook>,
     ) -> Result<Self, String> {
         let budget = plan.map(|p| p.budget);
         let tiled = plan.filter(|p| p.mode == crate::memory::Residency::Tiled);
@@ -1120,6 +1175,9 @@ impl GpuSearch {
                 if score == Some(crate::metrics::ScoreObjective::Slope) {
                     return Err("device_memory: tiled residency refuses slope scoring: row r - 1 of a tile's first row is not resident".to_string());
                 }
+                if score == Some(crate::metrics::ScoreObjective::LongPnl) {
+                    return Err(crate::gpu::LONG_PNL_TILED.to_string());
+                }
                 crate::gpu::GpuEvaluator::new_tiled(
                     cols,
                     n_rows,
@@ -1140,11 +1198,20 @@ impl GpuSearch {
                 // run ranks on; `gpu_blocker` has already refused any metric
                 // without a native kernel objective.
                 ev.set_loss(loss);
+                // #481: the book is the first allocation after the rows, once
+                // per run.
+                let long_pnl = score == Some(crate::metrics::ScoreObjective::LongPnl);
+                if long_pnl {
+                    let Some(book) = pnl_book else {
+                        return Err("the long_pnl fitness book was not rebuilt".to_string());
+                    };
+                    ev.set_pnl_book(book)?;
+                }
                 // #289: a classification score uploads its label sign once per
                 // sample, whether or not the device also fits constants. The
                 // fit-only log-loss arm needs the same vector for the fit
                 // kernel, so it is uploaded once and shared.
-                if score.is_some() || logistic_fit {
+                if (score.is_some() && !long_pnl) || logistic_fit {
                     let sign =
                         crate::fit::classification_signs_weighted(&train.y, &train.w);
                     if !ev.set_fit_sign(&sign) {
@@ -1196,6 +1263,7 @@ impl GpuSearch {
                     fit_polish_ms: 0.0,
                     fit_host_ms: 0.0,
                     fit_fallback_ms: 0.0,
+                    fit_gate_ms: 0.0,
                     fit_fallback_bounded: 0,
                     fit_fallback_workers: 0,
                     ledger_origin: run_start,
@@ -1407,18 +1475,42 @@ impl GpuSearch {
                 // their historical trajectory (their proposal is the kernel's
                 // own optimum of the same objective).
                 let gated = crate::fit::device_fit_is_gated(cfg.metric);
-                for ((i, j, plan), res) in jobs.iter().zip(out) {
+                // #498: the exact judgements are independent, so they run on
+                // the worker pool; the verdicts are applied below in admission
+                // order.
+                let mut verdicts: Vec<Option<(crate::fit::Verdict, Node)>> = Vec::new();
+                if gated {
+                    let gate_start = std::time::Instant::now();
+                    let gate_jobs: Vec<(usize, Node, Vec<f64>)> = jobs
+                        .iter()
+                        .zip(&out)
+                        .enumerate()
+                        .filter(|(_, (_, res))| {
+                            crate::fit::fit_status_usable(res.status)
+                                && res.c.iter().all(|v| v.is_finite())
+                        })
+                        .map(|(k, ((i, j, _), res))| {
+                            (k, islands[*i][*j].tree.clone(), res.c.clone())
+                        })
+                        .collect();
+                    verdicts.resize_with(jobs.len(), || None);
+                    for (k, judged) in gate_proposals(gate_jobs, fit_train, cfg.metric, cfg.threads)
+                    {
+                        verdicts[k] = Some(judged);
+                    }
+                    let gate_seconds = gate_start.elapsed().as_secs_f64();
+                    self.fit_gate_ms += gate_seconds * 1000.0;
+                    self.stats.entry(generation).or_default().fit_gate_seconds += gate_seconds;
+                }
+                for (k, ((i, j, plan), res)) in jobs.iter().zip(out).enumerate() {
                     let finite = res.c.iter().all(|v| v.is_finite());
                     let usable = crate::fit::fit_status_usable(res.status);
                     if gated && usable && finite {
-                        let verdict = crate::fit::gate_device_proposal(
-                            &mut islands[*i][*j].tree,
-                            &res.c,
-                            &fit_train.x,
-                            &fit_train.y,
-                            &fit_train.w,
-                            cfg.metric,
-                        );
+                        let (verdict, judged) =
+                            verdicts[k].take().expect("every gated job has a verdict");
+                        if matches!(verdict, crate::fit::Verdict::Accepted(_)) {
+                            islands[*i][*j].tree = judged;
+                        }
                         let cause = match verdict {
                             crate::fit::Verdict::Accepted(_) => {
                                 self.fit_gpu += 1;
@@ -2020,6 +2112,7 @@ impl GpuSearch {
             self.fit_fallback_ms / 1000.0,
         );
         ledger.record_fit_polish_split(self.fit_polish_ms / 1000.0);
+        ledger.record_fit_gate(self.fit_gate_ms / 1000.0);
         ledger.record_fit_counters(
             self.fit_attempts as u64,
             self.fit_gpu as u64,
@@ -2050,6 +2143,7 @@ impl GpuSearch {
             fit_polish_ms: self.fit_polish_ms,
             fit_host_ms: self.fit_host_ms,
             fit_fallback_ms: self.fit_fallback_ms,
+            fit_gate_ms: self.fit_gate_ms,
 fit_fallback_bounded: self.fit_fallback_bounded,
             fit_fallback_workers: self.fit_fallback_workers,
             fit_fallback_max: DEFAULT_FIT_FALLBACK_MAX,
@@ -2062,6 +2156,7 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             ledger,
             memory_plan: self.memory_plan.clone(),
             observed: Some(self.ev.alloc_report().observed()),
+            score_objective: self.score,
         }
     }
 
@@ -2086,6 +2181,7 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             fallbacks: batch.map(|b| b.fallbacks).unwrap_or(0),
             fit_host_s: self.fit_host_ms / 1000.0,
             fit_fallback_s: self.fit_fallback_ms / 1000.0,
+            fit_gate_s: self.fit_gate_ms / 1000.0,
             fit_fallback_workers: self.fit_fallback_workers,
         }
     }
@@ -2207,6 +2303,25 @@ fn fit_fallback_jobs(
         }
     });
     chunks
+}
+
+/// #498: judge device proposals with the exact gate on up to `workers`
+/// threads. Each job is `(position, tree, proposal)`; the result keeps the job
+/// order and carries the tree as the gate left it, so the outcome does not
+/// depend on `workers`.
+#[cfg(feature = "cuda")]
+fn gate_proposals(
+    jobs: Vec<(usize, Node, Vec<f64>)>,
+    sample: &Sample,
+    metric: Metric,
+    workers: usize,
+) -> Vec<(usize, (crate::fit::Verdict, Node))> {
+    par_map(workers.max(1), jobs, |(k, mut tree, proposal)| {
+        let verdict = crate::fit::gate_device_proposal(
+            &mut tree, &proposal, &sample.x, &sample.y, &sample.w, metric,
+        );
+        (k, (verdict, tree))
+    })
 }
 
 /// Score every still-pending (`error.is_nan()`) individual on the CPU.
@@ -2809,7 +2924,7 @@ fn score_pipeline_batch(
 #[cfg(feature = "cuda")]
 fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if !cfg.fitness.is_metric() {
-        return Some("long_pnl fitness has no device scorer yet"); // #480
+        return long_pnl_blocker(cfg, train); // #481
     }
     if train.is_multi() {
         return Some("multi-output objective");
@@ -2875,6 +2990,51 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
         return Some(
             "--fit-samples/--fit-rows scores on all rows only with the device fit arm (--fit-strategy gpu)",
         );
+    }
+    None
+}
+
+/// #481: the objective the device ranks candidates by: the long/flat regret
+/// under `--fitness pnl`, else the metric's native objective. Every device
+/// scoring path (`GpuSearch::score`, the overlap pipeline, the flat postfix
+/// arena) reads it through `GpuSearch::score`.
+#[cfg(feature = "cuda")]
+fn search_score_objective(cfg: &Config) -> Option<crate::metrics::ScoreObjective> {
+    match cfg.fitness {
+        Fitness::LongPnl(_) => Some(crate::metrics::ScoreObjective::LongPnl),
+        Fitness::SavedLongPnl(_) => None,
+        Fitness::Metric => crate::metrics::native_score_objective(cfg.metric),
+    }
+}
+
+/// #481: [`gpu_blocker`] under `--fitness pnl`. The device scores the
+/// long/flat regret itself and `--metric` only fits constants, so the metric's
+/// score refusals do not apply; what remains are the sample shapes the
+/// resident book cannot represent and the fit arm's own row contract.
+#[cfg(feature = "cuda")]
+fn long_pnl_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
+    let Some(book) = cfg.fitness.book() else {
+        return Some("the long_pnl fitness book was not rebuilt");
+    };
+    if train.is_multi() {
+        return Some("multi-output objective");
+    }
+    if book.len() != train.len() {
+        return Some("the long_pnl fitness book does not cover the training rows");
+    }
+    if subsampling_active(cfg, train) {
+        return Some("--predictor-samples changes the rows per generation");
+    }
+    if effective_fit_rows(cfg, train) > 0 && !defers_fit_to_gpu(cfg, true) {
+        return Some(
+            "--fit-samples/--fit-rows scores on all rows only with the device fit arm (--fit-strategy gpu)",
+        );
+    }
+    if cfg.metric == crate::metrics::Metric::Slope
+        && defers_fit_to_gpu(cfg, true)
+        && (!slope_pairs_are_consecutive(train) || effective_fit_rows(cfg, train) > 0)
+    {
+        return Some("slope pairs are not the consecutive rows of the device fit sample");
     }
     None
 }
@@ -3089,7 +3249,10 @@ fn gpu_plan_shape(cfg: &Config, train: &Sample) -> GpuPlanShape {
     // #288: an exact order-statistic/rank metric has a native *scoring*
     // entry point named by the #287 dispatch table, so it is admitted
     // through the same gate as the objective kernel and is not fit-only.
-    let score_stat = crate::metrics::ScoreStat::for_metric(cfg.metric);
+    // #481: under the long/flat fitness the metric only fits, so no exact
+    // statistic scores the run.
+    let score_stat = crate::metrics::ScoreStat::for_metric(cfg.metric)
+        .filter(|_| cfg.fitness.is_metric());
     let score_admitted = score_stat.is_some() && gpu_blocker(cfg, train).is_none();
     // #287: maximum has a native objective, so it is never fit-only.
     let maximum_fit_only = maximum_fit
@@ -3131,7 +3294,9 @@ pub fn device_plan_for(cfg: &Config, train: &Sample) -> Option<crate::memory::De
     }
     let info = crate::gpu::device_info()?;
     let device_fit = cfg.fit_strategy.defers_to_gpu() && cfg.fit_iters > 0;
-    let label_sign = (!shape.score_admitted && !shape.fit_only) || shape.logistic_fit;
+    // #481: the long/flat scorer reads its book, not the label sign.
+    let long_pnl = !cfg.fitness.is_metric();
+    let label_sign = (!long_pnl && !shape.score_admitted && !shape.fit_only) || shape.logistic_fit;
     let workload = crate::memory::DeviceWorkload {
         rows: train.len(),
         vars: n_vars,
@@ -3142,6 +3307,7 @@ pub fn device_plan_for(cfg: &Config, train: &Sample) -> Option<crate::memory::De
         stat: shape.score_admitted,
         weights: !train.w.is_empty(),
         label_sign,
+        pnl_book: long_pnl,
     };
     let caps = crate::memory::DeviceCaps::from_env(cfg.gpu_memory);
     Some(crate::memory::device_plan(&workload, &info, &caps))
@@ -4596,6 +4762,84 @@ fn pick_parent_policy(
     pick_parent(island, front, rng, front_p).clone()
 }
 
+// #465: age-fitness Pareto survivor selection (`--selection afp`).
+
+/// #465: random immigrants added to every island each generation.
+fn afp_immigrants(pop: usize) -> usize {
+    (pop / 20).max(1)
+}
+
+/// #465: the minimised objectives of a population. A non-finite error sorts
+/// last, so an all-infinite island falls back to `(complexity, age)`.
+fn afp_points(inds: &[Ind]) -> Vec<afp::Point> {
+    inds.iter()
+        .map(|i| {
+            let e = if i.error.is_nan() { f64::INFINITY } else { i.error };
+            [e, i.complexity, i.age as f64]
+        })
+        .collect()
+}
+
+/// #465: survivors of parents + offspring + immigrants (in that order, which
+/// is the tie-break order). Every survivor is one generation older.
+fn afp_select(candidates: Vec<Ind>, pop: usize) -> Vec<Ind> {
+    let keep = afp::survivors(&afp_points(&candidates), pop);
+    let mut wanted = vec![false; candidates.len()];
+    for i in keep {
+        wanted[i] = true;
+    }
+    candidates
+        .into_iter()
+        .zip(wanted)
+        .filter_map(|(mut ind, keep)| {
+            keep.then(|| {
+                ind.age += 1;
+                ind
+            })
+        })
+        .collect()
+}
+
+/// #465: the island member migration replaces: highest Pareto rank, then the
+/// smallest crowding distance, then the highest index.
+fn afp_worst(island: &[Ind]) -> Option<usize> {
+    let (rank, crowd) = afp::rank_and_crowd(&afp_points(island));
+    (0..island.len()).max_by(|&a, &b| {
+        rank[a]
+            .cmp(&rank[b])
+            .then(crowd[b].total_cmp(&crowd[a]))
+            .then(a.cmp(&b))
+    })
+}
+
+/// #465: one parent and its age. Without AFP this is [`pick_parent_policy`]
+/// with age 0, draw for draw. With AFP a front parent counts as age 0 and the
+/// island tournament runs on rank and crowding distance.
+#[allow(clippy::too_many_arguments)]
+fn pick_parent_aged(
+    island: &[Ind],
+    front: &[Sol],
+    qd: Option<&QdArchive>,
+    rng: &mut Mt,
+    front_p: f64,
+    qd_policy: bool,
+    qd_control: u8,
+    afp: bool,
+    rank: &[u32],
+    crowd: &[f64],
+) -> (Node, u32) {
+    if !afp || qd_policy {
+        return (pick_parent_policy(island, front, qd, rng, front_p, qd_policy, qd_control), 0);
+    }
+    match front_parent(front, rng, front_p) {
+        Some(tree) => (tree.clone(), 0),
+        None => {
+            let i = afp::tournament(rank, crowd, rng, 4);
+            (island[i].tree.clone(), island[i].age)
+        }
+    }
+}
+
 // #77: seed the per-generation duplicate set with the elite (`next`) and every
 // parent (`isl`), so a child that is an unchanged parent is rejected before the
 // expensive fit and score.
@@ -4666,6 +4910,33 @@ fn offer(sink: &Option<(&std::sync::mpsc::SyncSender<PipelineJob>, usize)>, slot
     }
 }
 
+/// #477: draw `make()` again (up to 8 times) while it returns a tree with no
+/// row-dependent input and `have_const` says the island already holds one. The
+/// first constant tree is kept and sets `have_const`. Off, or with no input
+/// variable, it is a single draw.
+fn draw_row_dependent(
+    cfg: &Config,
+    nvars: usize,
+    have_const: &mut bool,
+    mut make: impl FnMut() -> Node,
+) -> Node {
+    let mut t = make();
+    if !cfg.reject_constant_offspring || nvars == 0 {
+        return t;
+    }
+    for _ in 0..8 {
+        if expr::row_dependent(&t) {
+            return t;
+        }
+        if !*have_const {
+            *have_const = true;
+            return t;
+        }
+        t = make();
+    }
+    t
+}
+
 /// Evolve one island by a single generation. Pure with respect to the rest of
 /// the world, so it can run on its own thread.
 #[allow(clippy::too_many_arguments)]
@@ -4714,13 +4985,20 @@ fn evolve_island(
         }
     }
 
+    let afp = cfg.selection == Selection::Afp;
+    // #465: Pareto rank and crowding of the parents drive the tournament.
+    let (par_rank, par_crowd) = if afp {
+        afp::rank_and_crowd(&afp_points(isl))
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let pop = cfg.pop;
     let mut next: Vec<Ind> = Vec::with_capacity(pop);
 
     // Elitism: carry the best individual over unchanged. In the screened phase
     // the full-data parents are kept by the caller and compete at selection, so
     // the offspring vector stays a full `pop`.
-    if !screened {
+    if !screened && !afp {
         if let Some(best) = isl
             .iter()
             .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal))
@@ -4729,6 +5007,10 @@ fn evolve_island(
         }
     }
 
+    // #477: whether `next` already holds a constant individual. Only the
+    // first constant of an island is kept when the filter is on.
+    let filter_constant = cfg.reject_constant_offspring && nvars > 0;
+    let mut have_const = filter_constant && next.iter().any(|i| !expr::row_dependent(&i.tree));
     let mut seen: HashSet<u64> = HashSet::with_capacity(pop * 2);
     // #77: parents are candidates too; seeding them here rejects an unchanged
     // child before it is fitted and scored.
@@ -4764,13 +5046,16 @@ fn evolve_island(
         let want = pop - next.len();
         let mut trees: Vec<Node> = Vec::with_capacity(want);
         let mut meta: Vec<Option<(f64, u8)>> = Vec::with_capacity(want);
+        let mut ages: Vec<u32> = Vec::with_capacity(want);
         while trees.len() < want && attempts < max_attempts {
             attempts += 1;
             GenCounters::count(counters, |c| &c.attempts);
             // #120: with the policy on, a UCB/stratified cell elite supplies most
             // parents; 5% still come from the global Pareto front. With the policy
             // off this is exactly the #76 draw.
-            let p1 = pick_parent_policy(isl, front, qd, rng, front_p, qd_policy, qd_control);
+            let (p1, mut age) = pick_parent_aged(
+                isl, front, qd, rng, front_p, qd_policy, qd_control, afp, &par_rank, &par_crowd,
+            );
             let parent_err = if learn {
                 parent_errors.get(&expr::structural_hash(&p1)).copied()
             } else {
@@ -4786,7 +5071,10 @@ fn evolve_island(
             };
             let mut child = p1;
             if rng.bool(0.5) {
-                let parent2 = pick_parent_policy(isl, front, qd, rng, front_p, qd_policy, qd_control);
+                let (parent2, age2) = pick_parent_aged(
+                    isl, front, qd, rng, front_p, qd_policy, qd_control, afp, &par_rank, &par_crowd,
+                );
+                age = age.max(age2);
                 let parent2 = if cfg.linear_scaling {
                     crate::scale::split(&parent2).2
                 } else {
@@ -4809,15 +5097,23 @@ fn evolve_island(
                 GenCounters::count(counters, |c| &c.too_complex); // #211
                 continue;
             }
+            let is_const = filter_constant && !expr::row_dependent(&tree); // #477
+            if is_const && have_const {
+                GenCounters::count(counters, |c| &c.constant);
+                continue;
+            }
             if cfg.dedup && !seen.insert(expr::structural_hash(&tree)) {
                 GenCounters::count(counters, |c| &c.duplicates); // #211
                 continue;
             }
+            have_const |= is_const;
             trees.push(tree);
             meta.push(parent_err.map(|e| (e, used)));
+            ages.push(age);
         }
         let scored = fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters);
-        for (k, ind) in scored.into_iter().enumerate() {
+        for (k, (mut ind, age)) in scored.into_iter().zip(ages).enumerate() {
+            ind.age = age;
             if ind.complexity > cfg.complexity_cap() {
                 GenCounters::count(counters, |c| &c.post_fit_drops); // #463
                 continue;
@@ -4846,7 +5142,16 @@ fn evolve_island(
     if next.len() < pop {
         let trees: Vec<Node> = (next.len()..pop)
             .map(|_| {
-                expr::simplify(&random_tree_opts(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced))
+                draw_row_dependent(cfg, nvars, &mut have_const, || {
+                    expr::simplify(&random_tree_opts(
+                        rng,
+                        nvars,
+                        &cfg.ops,
+                        cfg.init_depth,
+                        Some(aggs),
+                        base_opts.balanced,
+                    ))
+                })
             })
             .collect();
         for ind in fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters) {
@@ -4897,6 +5202,19 @@ fn evolve_island(
                 offer(&sink, slot, &next[slot]);
             }
         }
+    }
+
+    // #465: fresh lineages at age 0 compete with the older ones. They are scored
+    // with the rest of the generation but never offered to the overlap queue,
+    // whose result slots cover the first `pop` candidates only.
+    if afp {
+        let k = afp_immigrants(pop);
+        let trees: Vec<Node> = (0..k)
+            .map(|_| {
+                expr::simplify(&random_tree_opts(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced))
+            })
+            .collect();
+        next.extend(fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters));
     }
 
     *isl = next;
@@ -4960,6 +5278,9 @@ pub struct GpuGenStats {
     /// #255: wall seconds this generation spent in the exact CPU fallback
     /// fits. A subset of the run's `fit.host_seconds`.
     pub fit_fallback_seconds: f64,
+    /// #498: wall seconds this generation spent in the exact host gate of
+    /// device proposals. A subset of the run's `fit.host_seconds`.
+    pub fit_gate_seconds: f64,
     /// #255: fallbacks held at their finite device constants because the
     /// per-generation bound was reached.
     pub fit_fallback_bounded: usize,
@@ -5009,6 +5330,9 @@ pub struct GpuRunStats {
 /// #284/#255: wall time spent in the exact CPU fallback fits, milliseconds.
     /// Already included in `fit_host_ms`; report it, never add it again.
     pub fit_fallback_ms: f64,
+    /// #498: wall time of the exact gate of device proposals, milliseconds.
+    /// Already included in `fit_host_ms`; report it, never add it again.
+    pub fit_gate_ms: f64,
     /// #255: fallbacks held at their finite device constants by the
     /// per-generation bound.
     pub fit_fallback_bounded: usize,
@@ -5035,6 +5359,9 @@ pub struct GpuRunStats {
     pub memory_plan: Option<crate::memory::DevicePlan>,
     /// #293: the device allocation ledger at the end of the run.
     pub observed: Option<crate::memory::DeviceObserved>,
+    /// #481: the objective the device scored candidates by, `None` for a
+    /// fit-only or exact-statistic evaluator.
+    pub score_objective: Option<crate::metrics::ScoreObjective>,
 }
 
 pub struct Outcome {
@@ -5425,6 +5752,9 @@ fn postfix_variation_for(cfg: &Config, train: &Sample) -> Result<Variation, Stri
     if let Some(flag) = cfg.node_variation_flag() {
         return Err(format!("{} is a node-path setting", flag));
     }
+    if cfg.selection == Selection::Afp {
+        return Err("--selection afp runs on the node path".to_string());
+    }
     if cfg.fit_iters != 0 {
         return Err("constant fitting is enabled".to_string());
     }
@@ -5462,15 +5792,14 @@ fn postfix_variation_for(cfg: &Config, train: &Sample) -> Result<Variation, Stri
     // #287: the flat arena carries programs, not the per-candidate constant
     // count the AIC family's penalty needs. Keep that family on the owned-tree
     // path, where `count_constants(tree)` is available for every candidate.
-    if crate::metrics::native_score_objective(cfg.metric)
-        .is_some_and(|o| o.needs_constants())
-    {
+    if search_score_objective(cfg).is_some_and(|o| o.needs_constants()) {
         return Err("parameter-aware metric needs per-candidate constants".to_string());
     }
     // The pass-through path must never score a metric without a native
     // objective (the #236 defect). `gpu` is only built when this holds, but the
-    // gate is asserted here so a future caller cannot bypass it.
-    if crate::metrics::native_score_objective(cfg.metric).is_none() {
+    // gate is asserted here so a future caller cannot bypass it. #481: under
+    // `--fitness pnl` the objective is the long/flat regret.
+    if search_score_objective(cfg).is_none() {
         return Err("metric has no native score objective".to_string());
     }
     let width = crate::genome::width_for(cfg.max_complexity);
@@ -5511,6 +5840,8 @@ pub struct GpuSnapshot {
     pub fit_host_s: f64,
     /// #256: exact CPU fit-fallback wall, a subset of `fit_host_s`.
     pub fit_fallback_s: f64,
+    /// #498: exact host gate wall, a subset of `fit_host_s`.
+    pub fit_gate_s: f64,
     pub fit_fallback_workers: usize,
 }
 
@@ -5544,6 +5875,7 @@ impl GpuSnapshot {
             fallbacks: self.fallbacks,
             fit_host_s: (self.fit_host_s - earlier.fit_host_s).max(0.0),
             fit_fallback_s: (self.fit_fallback_s - earlier.fit_fallback_s).max(0.0),
+            fit_gate_s: (self.fit_gate_s - earlier.fit_gate_s).max(0.0),
             fit_fallback_workers: self.fit_fallback_workers.max(earlier.fit_fallback_workers),
         }
     }
@@ -5658,6 +5990,7 @@ fn dev_generation(
                     .collect(),
                 host_seconds: g.fit_host_s,
                 fallback_seconds: g.fit_fallback_s,
+                gate_seconds: g.fit_gate_s,
                 fallback_workers: g.fit_fallback_workers,
             },
             g.fallback_s,
@@ -5707,6 +6040,7 @@ fn dev_generation(
         eval_cpu_s: GenCounters::seconds(counters, |c| &c.eval_ns) + fallback_s,
         phase_b_s: GenCounters::seconds(counters, |c| &c.batch_ns),
         post_fit_drops: GenCounters::total(counters, |c| &c.post_fit_drops) as usize,
+        constant_rejected: GenCounters::total(counters, |c| &c.constant) as usize,
         best_error,
         p05: q(0.05),
         p25: q(0.25),
@@ -5899,6 +6233,7 @@ fn run_postfix_search(
             fit_fallback_by_cause: Default::default(),
             fit_fallback_improved_by_cause: Default::default(),
             fit_fallback_seconds: 0.0,
+            fit_gate_seconds: 0.0,
             fit_fallback_bounded: 0,
             fit_fallback_workers: 0,
         });
@@ -6059,6 +6394,7 @@ fn run_postfix_search(
                             complexity: next.cost[next.slot_index(i, j)] as f64,
                             tree,
                             descriptor: None,
+                            age: 0,
                         })
                         .collect()
                 })
@@ -6130,6 +6466,7 @@ fn run_postfix_search(
                         complexity: pool.cost[pool.slot_index(i, j)] as f64,
                         tree,
                         descriptor: None,
+                        age: 0,
                     })
                     .collect()
             })
@@ -6378,7 +6715,7 @@ fn run_search(
                     // only seeds the legacy fit/eval field and is `Squared`
                     // when the metric has no device LM loss (correlation,
                     // signed, maximum, Brier, hinge).
-                    let _objective = crate::metrics::native_score_objective(cfg.metric)
+                    let _objective = search_score_objective(cfg)
                         .expect("gpu_blocker admits only native score objectives");
                     let loss = crate::fit::fit_loss(cfg.metric)
                         .unwrap_or(crate::fit::DeviceLoss::Squared);
@@ -6391,7 +6728,7 @@ fn run_search(
             Some((loss, native, stat)) => {
                 let score = if native {
                     Some(
-                        crate::metrics::native_score_objective(cfg.metric)
+                        search_score_objective(cfg)
                             .expect("native GPU plan owns a score objective"),
                     )
                 } else {
@@ -6417,6 +6754,7 @@ fn run_search(
                         t0,
                         &fit_rows,
                         memory_plan.as_ref(),
+                        cfg.fitness.book(),
                     ),
                 };
                 match created {
@@ -6454,7 +6792,9 @@ fn run_search(
                                 )
                             };
                             if native {
-                                let fitness = if cfg.metric == crate::metrics::Metric::Squared {
+                                let fitness = if !cfg.fitness.is_metric() {
+                                    "long_pnl regret of the f32 predictions, reported numbers stay f64"
+                                } else if cfg.metric == crate::metrics::Metric::Squared {
                                     "f32 fitness, reported numbers stay f64"
                                 } else {
                                     "native device loss, f32 fitness"
@@ -7071,7 +7411,7 @@ fn run_search(
             }
 
             // #85: keep the full-data parents for the selection step.
-            let parents: Option<Vec<Vec<Ind>>> = if screened {
+            let parents: Option<Vec<Vec<Ind>>> = if screened || cfg.selection == Selection::Afp {
                 Some(islands.clone())
             } else {
                 None
@@ -7285,6 +7625,13 @@ fn run_search(
             if let Some(parents) = parents {
                 let promote = promoted_count(cfg.pop);
                 for (pop, parents) in islands.iter_mut().zip(parents) {
+                    if !screened {
+                        // #465: survivors of parents + offspring + immigrants.
+                        let mut combined = parents;
+                        combined.extend(std::mem::take(pop));
+                        *pop = afp_select(combined, cfg.pop);
+                        continue;
+                    }
                     let mut offspring = std::mem::take(pop);
                     offspring.sort_by(|a, b| {
                         a.error
@@ -7309,7 +7656,11 @@ fn run_search(
                     }
                     let mut combined = parents;
                     combined.extend(promoted);
-                    select_population(&mut combined, cfg.pop);
+                    if cfg.selection == Selection::Afp {
+                        combined = afp_select(combined, cfg.pop);
+                    } else {
+                        select_population(&mut combined, cfg.pop);
+                    }
                     *pop = combined;
                 }
             }
@@ -7468,6 +7819,18 @@ fn run_search(
                             .map(|i| i.tree.clone())
                     })
                     .collect();
+                let best_ages: Vec<u32> = islands
+                    .iter()
+                    .map(|pop| {
+                        pop.iter()
+                            .min_by(|a, b| {
+                                a.error
+                                    .partial_cmp(&b.error)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map_or(0, |i| i.age)
+                    })
+                    .collect();
                 for ii in 0..islands.len() {
                     let src = (ii + 1) % islands.len();
                     if let Some(t) = &bests[src] {
@@ -7516,6 +7879,9 @@ fn run_search(
                             None
                         };
                         let slot = victim.or_else(|| {
+                            if cfg.selection == Selection::Afp {
+                                return afp_worst(&islands[ii]);
+                            }
                             islands[ii]
                                 .iter()
                                 .enumerate()
@@ -7533,6 +7899,7 @@ fn run_search(
                             } else {
                                 Ind::evaluated(t.clone(), gen_data, cfg) // #25
                             };
+                            worst.age = best_ages[src];
                         }
                     }
                 }
@@ -7566,15 +7933,18 @@ fn run_search(
                         } else {
                             None
                         };
+                        let mut have_const = false; // #477
                         for ind in islands[ii].iter_mut() {
-                            let mut t = random_tree_opts(
-                                &mut r,
-                                nvars,
-                                &cfg.ops,
-                                cfg.init_depth,
-                                Some(&aggs),
-                                cfg.tree_arity == TreeArity::Balanced,
-                            );
+                            let mut t = draw_row_dependent(cfg, nvars, &mut have_const, || {
+                                random_tree_opts(
+                                    &mut r,
+                                    nvars,
+                                    &cfg.ops,
+                                    cfg.init_depth,
+                                    Some(&aggs),
+                                    cfg.tree_arity == TreeArity::Balanced,
+                                )
+                            });
                             if let Some(target) = qd_target {
                                 let mut best = t.clone();
                                 let mut best_d = qd::descriptor(&t, gen_train);
@@ -8154,6 +8524,7 @@ mod tests {
             error,
             complexity,
             descriptor: None,
+            age: 0,
         }
     }
 
@@ -8356,6 +8727,7 @@ mod tests {
             error: f64::NAN,
             complexity: before,
             descriptor: None,
+            age: 0,
         };
         refresh_after_fit(&mut ind, &cfg);
         let want = expr::simplify(&tree);
@@ -8857,6 +9229,7 @@ mod tests {
             error: 1.0,
             complexity: 1.0,
             descriptor: None,
+            age: 0,
         }];
 
         let mut rng = Mt::new(11);
@@ -9111,6 +9484,7 @@ mod tests {
             error: f64::INFINITY,
             complexity: 0.0,
             descriptor: None,
+            age: 0,
         };
 
         ind.refit_and_reeval(&first_data, &first, &cfg);
@@ -9327,11 +9701,31 @@ mod tests {
     #[test]
     fn long_pnl_fitness_names_why_the_device_is_off() {
         let s = sample();
+        // #481: the device scores the regret; the metric only fits, so a
+        // metric without a native scorer does not block it.
         let cfg = Config {
             fitness: Fitness::LongPnl(pnl_book(&s)),
+            metric: Metric::Median,
             ..Default::default()
         };
-        assert_eq!(gpu_blocker(&cfg, &s), Some("long_pnl fitness has no device scorer yet"));
+        assert_eq!(gpu_blocker(&cfg, &s), None);
+        assert_eq!(search_score_objective(&cfg), Some(crate::metrics::ScoreObjective::LongPnl));
+        let shape = gpu_plan_shape(&cfg, &s);
+        assert!(shape.score_stat.is_none() && !shape.score_admitted && !shape.fit_only);
+        let saved = Config {
+            fitness: Fitness::SavedLongPnl(7),
+            ..Default::default()
+        };
+        assert_eq!(gpu_blocker(&saved, &s), Some("the long_pnl fitness book was not rebuilt"));
+        assert_eq!(search_score_objective(&saved), None);
+        let other_rows = Config {
+            fitness: Fitness::LongPnl(pnl_book(&sample_rows(s.len() + 3))),
+            ..Default::default()
+        };
+        assert_eq!(
+            gpu_blocker(&other_rows, &s),
+            Some("the long_pnl fitness book does not cover the training rows")
+        );
     }
 
     #[test]
@@ -9847,6 +10241,54 @@ mod tests {
         }
     }
 
+    /// #498: the exact host gate is a pure parallelisation. One worker and
+    /// eight workers return the same verdict list and the same trees, with a
+    /// mix of accepted, rejected and non-finite proposals.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gate_is_identical_for_one_and_many_workers() {
+        let mut s = sample();
+        for (i, y) in s.y.iter_mut().enumerate() {
+            *y = if i % 3 == 0 { 0.0 } else { 1.0 };
+        }
+        let jobs = |metric: Metric| -> Vec<(usize, Node, Vec<f64>)> {
+            (0..64usize)
+                .map(|k| {
+                    let start = 0.2 + (k % 7) as f64 / 10.0;
+                    let tree = node(
+                        Op::Add,
+                        vec![node(Op::Mul, vec![constant(start), input(0)]), constant(0.1)],
+                    );
+                    let proposal = match k % 4 {
+                        0 => vec![start + 1.0, 0.1],
+                        1 => vec![-3.0 * start, 0.1],
+                        2 => vec![f64::NAN, 0.1],
+                        _ => vec![start, 0.1 + (k as f64) / 50.0],
+                    };
+                    let _ = metric;
+                    (k, tree, proposal)
+                })
+                .collect()
+        };
+        for metric in [Metric::LogLoss, Metric::Correlation, Metric::Signed] {
+            let one = gate_proposals(jobs(metric), &s, metric, 1);
+            let many = gate_proposals(jobs(metric), &s, metric, 8);
+            assert_eq!(one.len(), 64);
+            assert_eq!(one.len(), many.len());
+            for ((ka, (va, ta)), (kb, (vb, tb))) in one.iter().zip(&many) {
+                assert_eq!(ka, kb);
+                assert_eq!(va, vb, "{:?} verdict differs at {}", metric, ka);
+                assert!(expr::same(ta, tb), "{:?} tree differs at {}", metric, ka);
+            }
+            let accepted = one
+                .iter()
+                .filter(|(_, (v, _))| matches!(v, crate::fit::Verdict::Accepted(_)))
+                .count();
+            assert!(accepted > 0 && accepted < 64, "{:?}: {} accepted", metric, accepted);
+            assert!(one.iter().any(|(_, (v, _))| *v == crate::fit::Verdict::NonFinite));
+        }
+    }
+
     /// #121: the fallback queue is bounded by construction and the merge order
     /// does not depend on which worker finished first. Also checks that already
     /// scored individuals are skipped without shifting the pending results.
@@ -9949,6 +10391,88 @@ mod tests {
             "QD scoring evaluated a tree a second time for its descriptor"
         );
     }
+
+    fn aged_ind(tree: Node, error: f64, complexity: f64, age: u32) -> Ind {
+        Ind { tree, error, complexity, descriptor: None, age }
+    }
+
+    /// #465: the lowest-error individual always survives, whatever its age or
+    /// size.
+    #[test]
+    fn afp_keeps_best_error() {
+        let mut all: Vec<Ind> = Vec::new();
+        for i in 0..8 {
+            // Parents: old and mid-sized, errors 1.0 .. 8.0.
+            all.push(aged_ind(input(0), 1.0 + i as f64, 3.0 + i as f64, 20));
+        }
+        for i in 0..8 {
+            // Offspring: young and small, errors 2.0 .. 9.0 except one best.
+            let error = if i == 5 { 0.25 } else { 2.0 + i as f64 };
+            let complexity = if i == 5 { 40.0 } else { 1.0 };
+            all.push(aged_ind(input(0), error, complexity, if i == 5 { 30 } else { 0 }));
+        }
+        let kept = afp_select(all, 8);
+        assert_eq!(kept.len(), 8);
+        let best = kept.iter().map(|i| i.error).fold(f64::INFINITY, f64::min);
+        assert_eq!(best, 0.25);
+    }
+
+    /// #465: survivors age by one; offspring inherit the older parent's age;
+    /// immigrants and rebuilt individuals start at 0.
+    #[test]
+    fn afp_age_rules() {
+        let kept = afp_select(
+            vec![aged_ind(input(0), 1.0, 1.0, 4), aged_ind(input(0), 2.0, 2.0, 0)],
+            2,
+        );
+        assert_eq!(kept.iter().map(|i| i.age).collect::<Vec<_>>(), vec![5, 1]);
+
+        let s = sample();
+        let aggs = AggTable::from_sample(&s);
+        let mut cfg = Config::default();
+        cfg.pop = 40;
+        cfg.fit_iters = 0;
+        cfg.selection = Selection::Afp;
+        let data = EvalSample::new(&s, &cfg);
+        let mut isl: Vec<Ind> = (0..40)
+            .map(|i| {
+                let mut ind = Ind::evaluated(
+                    node(Op::Add, vec![input(0), constant(i as f64)]),
+                    &data,
+                    &cfg,
+                );
+                ind.age = if i % 2 == 0 { 2 } else { 9 };
+                ind
+            })
+            .collect();
+        let mut rng = Mt::new(11);
+        evolve_island(
+            &mut isl, &mut rng, &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None, false,
+            0, None, None, 1,
+        );
+        let immigrants = afp_immigrants(cfg.pop);
+        assert_eq!(isl.len(), cfg.pop + immigrants);
+        let (offspring, fresh) = isl.split_at(cfg.pop);
+        assert!(fresh.iter().all(|i| i.age == 0), "immigrants start at age 0");
+        assert!(offspring.iter().all(|i| i.age == 2 || i.age == 9));
+        assert!(offspring.iter().any(|i| i.age == 9), "the older parent's age is inherited");
+
+        let rebuilt = Ind::pending(input(0), &cfg);
+        assert_eq!(rebuilt.age, 0);
+        assert_eq!(Ind::evaluated(input(0), &data, &cfg).age, 0);
+    }
+
+    /// #465: migration replaces the member of the highest Pareto rank.
+    #[test]
+    fn afp_worst_is_the_highest_rank() {
+        let island = vec![
+            aged_ind(input(0), 1.0, 1.0, 0),
+            aged_ind(input(0), 5.0, 9.0, 7),
+            aged_ind(input(0), 2.0, 2.0, 1),
+        ];
+        assert_eq!(afp_worst(&island), Some(1));
+    }
+
     fn affine_sample() -> Sample {
         let x: Vec<Vec<f64>> = (0..60).map(|i| vec![i as f64 * 0.1 - 3.0]).collect();
         let y: Vec<f64> = x.iter().map(|r| 2.0 * r[0] + 1.0).collect();

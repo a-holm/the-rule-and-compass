@@ -2146,6 +2146,17 @@ pub fn same(a: &Node, b: &Node) -> bool {
         && a.block == b.block
 }
 
+/// #477: whether the tree can depend on the row: an `Input` occurs outside
+/// every aggregate and meta operator. Aggregates and meta operators evaluate to
+/// constants, and a user-defined block is assumed to read the row.
+pub fn row_dependent(n: &Node) -> bool {
+    match n.op {
+        Op::Input => true,
+        op if op.is_agg() || op.is_meta() => false,
+        _ => n.block.is_some() || n.kids.iter().any(row_dependent),
+    }
+}
+
 /// FNV-1a structural hash, for de-duplicating equivalent candidates before
 /// they are evaluated.
 pub fn structural_hash(n: &Node) -> u64 {
@@ -3040,6 +3051,20 @@ pub fn denormalize(n: &Node, means: &[f64], stds: &[f64]) -> Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_dependent_rules() {
+        let x1 = || input(0);
+        let x2 = || input(1);
+        let mean = || aggregate(AggKind::Mean, Some(0), 0.5);
+        assert!(row_dependent(&x1()));
+        assert!(!row_dependent(&node(Op::Exp, vec![constant(1.3)])));
+        let m = node(Op::Add, vec![mean(), constant(0.2)]);
+        assert!(!row_dependent(&m));
+        let m = node(Op::Mul, vec![mean(), x2()]);
+        assert!(row_dependent(&m));
+        assert!(!row_dependent(&meta(Op::Complexity, x1())));
+    }
 
     /// Bit-exact value equality except that all NaNs compare equal.
     fn same_value(a: f64, b: f64) -> bool {
