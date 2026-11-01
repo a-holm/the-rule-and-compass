@@ -261,6 +261,9 @@ pub struct Analysis {
     pub points: Vec<GenPoint>,
 }
 
+/// Island CPU time below this is device-fit fallback noise, not a fit-versus-evaluation reading.
+const MIN_ISLAND_CPU_S: f64 = 1e-3;
+
 /// `0.75` is the convergence threshold documented in `docs/convergence.md`.
 const CONVERGED_THRESHOLD: f64 = 0.75;
 
@@ -487,7 +490,15 @@ pub fn analyse(path: &str, events: &[Json], skipped: usize) -> Analysis {
     // Cross-cutting findings, ranked by severity.
     let mut findings = Vec::new();
     let candidate_cpu = a.fit_cpu + a.eval_cpu;
-    if candidate_cpu > 0.0 {
+    if candidate_cpu < MIN_ISLAND_CPU_S {
+        findings.push(Finding {
+            severity: 0.0,
+            reading: format!(
+                "no CPU fitting in the islands (candidate CPU time {:.6} s)",
+                candidate_cpu
+            ),
+        });
+    } else {
         let fit_share = a.fit_cpu / candidate_cpu;
         findings.push(Finding {
             severity: fit_share,
@@ -777,7 +788,7 @@ pub fn render(a: &Analysis) -> String {
     out.push_str("## Fit vs evaluation\n\n| item | value |\n|---|---:|\n");
     out.push_str(&format!("| constant fitting (CPU, summed over islands) | {:.4} s |\n", a.fit_cpu));
     out.push_str(&format!("| candidate evaluation (CPU, summed over islands) | {:.4} s |\n", a.eval_cpu));
-    if candidate_cpu > 0.0 {
+    if candidate_cpu >= MIN_ISLAND_CPU_S {
         out.push_str(&format!(
             "| fit share of candidate CPU time | {:.1}% |\n",
             100.0 * a.fit_cpu / candidate_cpu
