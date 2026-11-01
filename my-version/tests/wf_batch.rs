@@ -686,3 +686,24 @@ fn bench_batch_vs_scalar() {
     println!("{}", r.stats.json());
     assert!(speedup >= 5.0, "speedup {speedup:.2}x is below 5x");
 }
+
+#[path = "common/ledger.rs"]
+mod ledger;
+
+#[test]
+fn batch_pnl_books_the_pnl_stage_and_device_busy_inside_the_wall() {
+    let table = report_table();
+    let spec = report_spec();
+    let opts = ProtocolOptions {
+        batch_pnl: true,
+        ..ProtocolOptions::default()
+    };
+    let r = walkforward::run_table_with(&table, &spec, "test", &opts).unwrap();
+    let l = ledger::check(&r.json_with_ledger(None), "walkforward", &["pnl"]);
+    let device_tiles = r.batch_pnl.as_ref().unwrap().per_window.stats.device_tiles;
+    if device_tiles > 0 {
+        assert!(l.busy > 0.0, "device tiles ran but the ledger has no device-busy time");
+    } else {
+        assert_eq!(l.busy, 0.0);
+    }
+}
