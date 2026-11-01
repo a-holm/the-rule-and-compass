@@ -396,6 +396,8 @@ A `<data>.lockbox.json` written by `rcsr ablation prepare` also records `data_by
 
 `--lockbox none` is the only opt-out. It exits 2 when the data declares a range, and `walkforward` refuses it together with `--ledger` or `--locked-test`. Every report `lockbox` object carries `source` (`flag`, `store`, `protocol_default` or `none`) and `declared_in` (the files that declared a range, each with `file`, `start_date`, `end_date`). `rcsr enrich` and `rcsr ablation prepare` write the resolved range, including the protocol default, to their sidecar, so data derived from undeclared data carries the range from then on.
 
+Outside `--locked-test`, `walkforward` also drops every row whose time lies in a resolved range at read time, so a locked row never reaches scoring, thresholds or controls. The group id of a text group column is a hash of the label, not the store dictionary code, so a symbol that exists only inside the locked range cannot change the id of any other group (the matched-exposure random control is keyed by it).
+
 | command | with a declared or default range |
 |---|---|
 | `rcsr --data ...` (search) | exit 3 when any fit, validation or test row is in the range; the message names the side, the first row's date and the `--exclude '<time> >= START'` fix. With the rows excluded, `run.json` has `lockbox.rows_in_scope: 0`, `evaluated: false`, `source` |

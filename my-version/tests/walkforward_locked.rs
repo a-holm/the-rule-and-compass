@@ -200,8 +200,8 @@ fn the_poison_changes_the_report_when_the_range_is_not_declared() {
     // 2024 data is outside the protocol default range, so this window is legal here
     let w = window(LOCK_END - 10 * H);
     let (_, extra) = variants(&dir).remove(0);
-    let (ca, oa, ea) = wf(&clean, &w, &extra);
-    let (cb, ob, eb) = wf(&poisoned, &w, &extra);
+    let (ca, _, ea) = wf(&clean, &w, &extra);
+    let (cb, _, eb) = wf(&poisoned, &w, &extra);
     assert_eq!(ca, 0, "{ea}");
     assert_eq!(cb, 2, "{eb}");
     assert!(eb.contains("overlapping returns"), "{eb}");
