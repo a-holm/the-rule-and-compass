@@ -537,6 +537,8 @@ pub struct Report {
     pub ledger: crate::gpu_stats::RunLedger,
     /// `entry_offset) + horizon + delay`.
     pub required_purge_seconds: f64,
+    /// Smallest positive step between consecutive test rows of one group.
+    pub min_group_step: Option<f64>,
     /// Smallest `test_start - train_end` over the windows.
     pub min_purge_seconds: f64,
     pub economics: crate::wf_protocol::Economics,
@@ -1119,6 +1121,7 @@ impl Accum {
         let expressions = candidate_expressions(spec);
         let want_inference = opts.bootstrap_draws > 0 || opts.null_draws > 0;
         let n_candidates = trees.len();
+        let mut min_group_step: Option<f64> = None;
         let mut pooled_times: Vec<f64> = Vec::new();
         let mut fresh_all: Vec<f64> = Vec::new();
         let mut market_all: Vec<f64> = Vec::new();
@@ -1129,6 +1132,19 @@ impl Accum {
         let mut books: Vec<crate::wf_protocol::NullBook> = Vec::new();
         let mut batch_in: Vec<crate::wf_batch::WindowScores> = Vec::new();
         for mut d in self.windows {
+            {
+                let book = crate::trading::TradingRows {
+                    time: d.test_rows.iter().map(|r| r.time).collect(),
+                    group: d.test_rows.iter().map(|r| r.group).collect(),
+                    funding: Vec::new(),
+                };
+                let step = crate::trading::check_return_spacing(&book, spec.horizon)
+                    .map_err(|e| format!("window '{}': {}", d.window.label, e))?;
+                min_group_step = match (min_group_step, step) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+            }
             let has_validation = d.validation_start.is_some();
             if has_validation && expressions.len() > 1
                 && d.validation_rows.is_empty()
@@ -1598,6 +1614,7 @@ impl Accum {
             batch_pnl,
             ledger,
             required_purge_seconds: required_purge,
+            min_group_step,
             min_purge_seconds: min_gap,
             economics,
             inference: inference_report,
@@ -2886,11 +2903,12 @@ impl Report {
         s.pop();
         s.push_str(&format!(
             ",\"split\":{{\"required_purge_seconds\":{},\"purge_seconds\":{},\"horizon_seconds\":{},\
-             \"embargo_seconds\":{}}},\"economics\":{},\"inference\":{}}}",
+             \"embargo_seconds\":{},\"min_group_step_seconds\":{}}},\"economics\":{},\"inference\":{}}}",
             jnum(self.required_purge_seconds),
             jnum(self.min_purge_seconds),
             jnum(self.horizon),
             jnum(self.embargo),
+            self.min_group_step.map_or("null".to_string(), jnum),
             self.economics.json(),
             self.inference.as_ref().map_or("null".to_string(), |i| i.json())
         ));
