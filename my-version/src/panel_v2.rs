@@ -2335,10 +2335,11 @@ pub fn validate(opts: &ValidateOptions) -> Report {
 
     // V9
     let mut v9 = 0usize;
-    let mut prev: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
+    let mut prev: BTreeMap<&str, (f64, f64, i64)> = BTreeMap::new();
     for r in 0..n {
-        if let Some((l, c)) = prev.insert(sym[r].as_str(), (listing[r], close[r])) {
-            if l == listing[r] && c > 0.0 {
+        if let Some((l, c, p)) = prev.insert(sym[r].as_str(), (listing[r], close[r], ts[r])) {
+            let chain_break = gap[r] == 0.0 && ts[r] - p > OUT_STEP;
+            if l == listing[r] && c > 0.0 && !chain_break {
                 let ratio = open[r] / c;
                 if ratio > opts.panel_options.jump_factor || ratio < 1.0 / opts.panel_options.jump_factor {
                     v9 += 1;

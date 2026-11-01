@@ -187,9 +187,13 @@ INPUT:
                              and its refusals. Exit 2 with --predictor-samples,
                              --fit-samples, --implicit, --min-holding above 1,
                              --max-position other than 1, multiple targets,
-                             overlapping rows, or no profitable path. Runs on
-                             the CPU (backend_reason names it); resume needs
-                             the same cost, threshold and rows
+                             overlapping rows, or no profitable path. On the
+                             GPU the device scores the regret of its own f32
+                             predictions, fused with the interpreter
+                             (search_fitness.scorer_backend cuda); tiled
+                             residency keeps the CPU. Reported values stay
+                             exact CPU f64. Resume needs the same cost,
+                             threshold and rows
   --position long_only|top_tercile
                              long_only (default): 1[pred > --threshold]. top_tercile: per
                              timestamp the top floor(n/3) finite predictions are long (p=1),
@@ -374,8 +378,9 @@ OVERFITTING DIAGNOSTICS (always on):
                               in the same metric as the search: a model must
                               beat them to earn its complexity
   --baseline-samples <N>      score at most N query rows for the k-NN baseline
-                              (default 512; 0 = every row; absolute/squared/
-                              log_squashed only). The reference set is always
+                              (any metric; default: every row up to 20000
+                              training rows, else a seeded sample of 512;
+                              0 = every row). The reference set is always
                               all training rows; sampled results report their
                               standard error with the finite-population
                               correction (#69). The exact every-row query is
@@ -686,6 +691,11 @@ SEARCH:
                              constant fitting; single target; off by default (#470)
   --no-front-parents         draw every parent from the island tournament;
                              turns off the 15% Pareto-front feedback (#76)
+  --reject-constant-offspring
+                             reject offspring and random trees with no input
+                             outside an aggregate before the constant fit; the
+                             first constant of an island is kept (#477). Saved
+                             search setting, off by default
                              and restores the pre-#76 trajectory exactly
   --no-simd                  force the scalar tree walk instead of the
                              SoA/AVX evaluator (same results, slower; an
@@ -729,7 +739,10 @@ SEARCH:
                              for AUC); those statistics are bit-identical to
                              the CPU for the same prediction vector (median and
                              interquartile use a radix select from 4096 and
-                             65536 rows, rank and auc a sort). Every other
+                             65536 rows, rank and auc a sort). --fitness pnl
+                             is scored by the long/flat regret kernel (#481),
+                             bit-identical to the CPU book on the device's
+                             predictions; --metric then only fits. Every other
                              metric is *scored* on the CPU with its named
                              refusal, never with a proxy loss; with
                              --fit-strategy gpu its *constants* may still be
@@ -812,8 +825,9 @@ SEARCH:
                              offspring, inside each island (default: the CPU
                              cores available to the process; 1 = serial). The
                              islands share the budget: N / islands per island.
-                             Results, archive and checkpoints are identical for
-                             every value
+                             The exact gate of gated device fits (log_loss,
+                             correlation, signed) uses all N. Results, archive
+                             and checkpoints are identical for every value
   --pipeline-depth <N>       overlap CPU generation with GPU scoring using a
                              bounded pending queue of N batches (default 2; 0 =
                              synchronous). Results and archive are identical;
@@ -1175,7 +1189,7 @@ fn ledger_json(
         rcsr::gpu_stats::Ratio::undefined(f64::NAN, f64::NAN, "decades_per_gpu_hour", "run")
     };
     format!(
-        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"fallback_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
+        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"fallback_s\":{},\"gate_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
         jnum(l.wall_s()),
         stages,
         jnum(l.stage_sum_s()),
@@ -1203,6 +1217,7 @@ fn ledger_json(
         jnum(l.fit_kernel_lm_s()),
         jnum(l.fit_kernel_polish_s()),
         jnum(l.fit_fallback_s()),
+        jnum(l.fit_gate_s()),
         jnum(l.refit_s()),
         l.refits(),
         l.admitted(),
@@ -1316,7 +1331,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"seconds\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"seconds\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1338,6 +1353,7 @@ fn gpu_json(
         jstr(g.fit_polish.name()),
         jnum(g.fit_host_ms / 1000.0),
         jnum(g.fit_fallback_ms / 1000.0),
+        jnum(g.ledger.fit_gate_s()),
         g.fit_fallback_bounded,
         g.fit_fallback_workers,
         g.fit_fallback_max,
@@ -2275,9 +2291,8 @@ fn main() {
     // row shuffle. `--null-block` without `--null-runs` runs 19 permutations.
     let mut null_block = 0usize;
     // #69: query-row cap for the k-NN null baseline; 0 = no caps at all.
-    // #132: bounded by default; `--baseline-samples 0` opts into every row.
-    let mut baseline_samples = diagnostics::DEFAULT_BASELINE_SAMPLES;
-    let mut baseline_samples_set = false;
+    // #497: unset = exact up to `KNN_EXACT_MAX_ROWS` training rows, sampled above.
+    let mut baseline_samples: Option<usize> = None;
     let mut bootstrap_resamples = 0usize;
     let mut eval_expr: Option<String> = None;
     let mut seed_exprs: Vec<String> = Vec::new();
@@ -2372,6 +2387,7 @@ fn main() {
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
     let mut front_parents_set = false;
+    let mut reject_constant_set = false;
     // #465: explicit --selection for the resume settings check.
     let mut selection_set = false;
     let mut linear_scaling_set = false; // #470
@@ -2703,8 +2719,7 @@ fn main() {
             "--null-block" => null_block = val!().parse().unwrap_or(0),
             // #69: 0 = no caps; a positive N samples only the query rows.
             "--baseline-samples" => {
-                baseline_samples = val!().parse().unwrap_or(baseline_samples);
-                baseline_samples_set = true;
+                baseline_samples = val!().parse().ok().or(baseline_samples);
             }
             "--bootstrap-error" => bootstrap_resamples = val!().parse().unwrap_or(0),
             "--ops" => {
@@ -2892,6 +2907,10 @@ fn main() {
             "--no-front-parents" => {
                 cfg.front_parents = false;
                 front_parents_set = true;
+            }
+            "--reject-constant-offspring" => {
+                cfg.reject_constant_offspring = true;
+                reject_constant_set = true;
             }
             // #27: evaluator path only; deliberately not a saved search
             // setting, because both paths produce identical errors.
@@ -3275,24 +3294,6 @@ fn main() {
             std::process::exit(EXIT_USAGE);
         }
     }
-    // #69: query sampling is an unbiased estimate only for mean-loss metrics.
-    // Refuse the flag elsewhere rather than silently reporting a subsample of a
-    // median/correlation/AIC as if it were the full-sample value.
-    if !diagnostics::knn_sampling_supported(cfg.metric) {
-        if baseline_samples_set && baseline_samples > 0 {
-            eprintln!(
-                "error: --baseline-samples {} only supports mean-loss metrics \
-                 (absolute, squared, log_squashed), not {}",
-                baseline_samples,
-                cfg.metric.name()
-            );
-            std::process::exit(EXIT_USAGE);
-        }
-        // The bounded default does not apply: a subsample of a median or an
-        // information criterion is a different estimator, not an estimate of
-        // the same quantity.
-        baseline_samples = 0;
-    }
     // A y-randomisation control shuffles the target. In implicit mode the target
     // is an input and the scored target is all zeros, so every null run would be
     // the real run: refuse rather than report a meaningless p-value.
@@ -3485,6 +3486,12 @@ fn main() {
             conflicts.push(format!(
                 "--no-front-parents (saved front_parents is {})",
                 saved.front_parents
+            ));
+        }
+        if reject_constant_set && cfg.reject_constant_offspring != saved.reject_constant_offspring {
+            conflicts.push(format!(
+                "--reject-constant-offspring (saved reject_constant_offspring is {})",
+                saved.reject_constant_offspring
             ));
         }
         if let Some(spec) = &op_complexity_spec {
@@ -6257,6 +6264,8 @@ fn main() {
     // #69: the k-NN reference set is always all training rows; only the query
     // rows are optionally sampled by `--baseline-samples`.
     let baselines_start = std::time::Instant::now();
+    let baseline_samples =
+        diagnostics::resolve_baseline_samples(baseline_samples, prepared.train.len());
     let (baselines, linear_coef) = diagnostics::Baselines::fit_sampled_coef(
         &prepared.train,
         &fold_samples,
@@ -6783,12 +6792,14 @@ fn main() {
             // #69: state whether queries were sampled and the train/test SEMs.
             if baselines.knn_capped {
                 eprintln!(
-                    "# knn baseline: reference_rows={} train_query_rows={} train_sem={:.3e} test_query_rows={} test_sem={:.3e} sampled=true",
+                    "# knn baseline: reference_rows={} train_query_rows={} train_sem={:.3e} test_query_rows={} test_sem={:.3e} sampled=true sample_size={} sample_seed={}",
                     baselines.knn_reference_rows,
                     baselines.knn_train_query_rows,
                     baselines.knn_train_query_sem,
                     baselines.knn_test_query_rows,
-                    baselines.knn_test_query_sem
+                    baselines.knn_test_query_sem,
+                    baselines.knn_sample_size,
+                    baselines.knn_seed
                 );
             } else {
                 eprintln!(
@@ -7235,14 +7246,20 @@ fn main() {
                 backend_json,
                 match &fitness_book {
                     Some(b) => format!(
-                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\"}},",
+                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}}},",
                         b.len(),
                         b.groups(),
                         jnum(b.side()),
                         jnum(b.threshold()),
                         jnum(b.bound()),
                         b.min_trades(),
-                        b.hash()
+                        b.hash(),
+                        // #481: what ranked the generations; `backend` above is
+                        // the reported values, always exact CPU f64.
+                        match outcome.backend {
+                            rcsr::backend::Kind::Gpu => "\"scorer\":\"long_pnl_regret\",\"scorer_backend\":\"cuda\",\"scorer_values\":\"screening_f32_predictions\"",
+                            rcsr::backend::Kind::Cpu => "\"scorer\":\"long_pnl_regret\",\"scorer_backend\":\"cpu\",\"scorer_values\":\"exact_f64\"",
+                        }
                     ),
                     None => "\"search_fitness\":{\"kind\":\"metric\"},".to_string(),
                 }
@@ -11647,9 +11664,10 @@ mod tests {
         g.fit_polish = rcsr::fit::FitPolish::F32;
         g.ledger.record_fit(0.5, 0.75, 0.125);
         g.ledger.record_fit_polish_split(0.25);
+        g.ledger.record_fit_gate(0.375);
         let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true, 10.0);
         assert!(
-            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"admitted_wide\":0,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"seconds\":0.25,\"kernel_f32_s\":0.5,\"kernel_f64_s\":0.25,\"polish\":\"f32\",\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096,\"fit_rows\":0,\"score_rows\":0,\"fit_twin_bytes\":0,\"subsample_hash\":null}"),
+            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"admitted_wide\":0,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"seconds\":0.25,\"kernel_f32_s\":0.5,\"kernel_f64_s\":0.25,\"polish\":\"f32\",\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"gate_s\":0.375,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096,\"fit_rows\":0,\"score_rows\":0,\"fit_twin_bytes\":0,\"subsample_hash\":null}"),
             "{}",
             json
         );

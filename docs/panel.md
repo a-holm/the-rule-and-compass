@@ -302,7 +302,7 @@ Prints a JSON report and exits 3 when a check fails.
 | V6 | `gap` matches the timestamp distance | |
 | V7 | prefix replay: rebuilding from the base truncated at a cut reproduces every earlier row (`--replay N`, default 3) | `--base`, `--membership` |
 | V8 | rank columns | not applicable |
-| V9 | no undeclared level jump inside a listing | |
+| V9 | no undeclared level jump inside a listing between adjacent bars of one chain (a membership exclusion starts a new chain and is not compared) | |
 | V10 | store SHA-256 equals the manifest | manifest |
 | V11 | zero lockbox rows | |
 | V12 | each row's `member_asof` is the decision in force with `member = 1`; per-year rows equal the manifest | `--membership` |

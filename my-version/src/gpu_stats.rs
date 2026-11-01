@@ -192,6 +192,8 @@ pub struct RunLedger {
     fit_kernel_s: f64,
     /// #496: the part of `fit_kernel_s` apportioned to the polish phase.
     fit_kernel_polish_s: f64,
+    /// #498: exact host gate seconds of device proposals inside the fit stage.
+    fit_gate_s: f64,
     /// Exact CPU fallback seconds inside the fit stage.
     fit_fallback_s: f64,
     /// Exact CPU f64 finalist refit seconds (a subset of the fit stage).
@@ -309,6 +311,13 @@ impl RunLedger {
         }
     }
 
+    /// #498: record the wall seconds of the exact device-proposal gate.
+    pub fn record_fit_gate(&mut self, gate_s: f64) {
+        if gate_s.is_finite() && gate_s > 0.0 {
+            self.fit_gate_s += gate_s;
+        }
+    }
+
     /// #496: record the polish-phase share of the fit kernel seconds.
     pub fn record_fit_polish_split(&mut self, polish_s: f64) {
         if polish_s.is_finite() && polish_s > 0.0 {
@@ -405,6 +414,7 @@ impl RunLedger {
         self.fit_kernel_s += other.fit_kernel_s;
         self.fit_kernel_polish_s += other.fit_kernel_polish_s;
         self.fit_fallback_s += other.fit_fallback_s;
+        self.fit_gate_s += other.fit_gate_s;
         self.refit_s += other.refit_s;
         self.refits += other.refits;
         self.admitted += other.admitted;
@@ -504,6 +514,10 @@ impl RunLedger {
     /// `fit_kernel_s`.
     pub fn fit_kernel_lm_s(&self) -> f64 {
         self.fit_kernel_s - self.fit_kernel_polish_s()
+    }
+
+    pub fn fit_gate_s(&self) -> f64 {
+        self.fit_gate_s
     }
 
     pub fn fit_fallback_s(&self) -> f64 {

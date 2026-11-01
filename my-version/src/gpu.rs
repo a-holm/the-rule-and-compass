@@ -566,6 +566,9 @@ struct RawCtx {
 pub(crate) const SPAN_EVAL: i32 = 0;
 pub(crate) const SPAN_FIT: i32 = 1;
 
+/// #481: why a tiled context cannot score the long/flat fitness.
+pub const LONG_PNL_TILED: &str = "long_pnl fitness needs resident training rows (tiled residency: #293)";
+
 /// #118: the C-side ledger for one batch, in milliseconds. The host windows are
 /// disjoint: allocation, H2D copy, launch, event sync and D2H copy. `kernel_ms`
 /// is GPU-event time inside the wall and feeds the duty estimate, not the sum.
@@ -586,6 +589,18 @@ struct RawStats {
     d2h_bytes: u64,
     batch: i32,
     failed: i32,
+}
+
+/// #481: `RcPnlTotals` in `src/cuda/eval.cu`, field for field.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct RawPnlTotals {
+    gross: f64,
+    flips: u64,
+    exits: u64,
+    longs: u64,
+    nonfinite: i32,
+    pad: i32,
 }
 
 /// #285: host-visible state of the persistent batch arena. Mirrors
@@ -805,12 +820,31 @@ extern "C" {
         out: *mut f64,
         status: *mut i32,
     ) -> f32;
+    /* #481: the long/flat fitness book and its test-only totals download. */
+    fn rc_set_pnl_book(
+        ctx: *mut RawCtx,
+        excess: *const f64,
+        flags: *const u8,
+        n: i32,
+        side: f64,
+        threshold: f64,
+        bound: f64,
+        min_trades: u64,
+    ) -> i32;
+    fn rc_pnl_totals(
+        ctx: *mut RawCtx,
+        prog: *const u32,
+        off: *const u32,
+        nprog: i32,
+        out: *mut f64,
+        status: *mut i32,
+        totals: *mut RawPnlTotals,
+    ) -> i32;
     /* #118: start and read one batch's host-time ledger. */
     fn rc_stats_begin(ctx: *mut RawCtx);
     fn rc_last_stats(ctx: *mut RawCtx, out: *mut RawStats) -> i32;
     /* #284: last kernel span by event timestamps (0 evaluator, 1 fit). */
     fn rc_last_span(ctx: *mut RawCtx, which: i32, start_ms: *mut f64, now_ms: *mut f64) -> i32;
-    #[cfg(test)]
     fn rc_predict(
         ctx: *mut RawCtx,
         prog: *const u32,
@@ -1748,6 +1782,104 @@ impl GpuEvaluator {
             return false;
         }
         unsafe { rc_set_score_weights(self.ctx, w.as_ptr()) == 0 }
+    }
+
+    /// #481: upload the long/flat fitness book that
+    /// [`ScoreObjective::LongPnl`] reads. Its rows must be this evaluator's
+    /// rows in the same (canonical) order. Uploaded once per run; a tiled
+    /// context is refused, and a refused allocation names its bytes and tag.
+    pub fn set_pnl_book(&mut self, book: &crate::trading::FitnessBook) -> Result<(), String> {
+        if self.host_cols.is_some() {
+            return Err(LONG_PNL_TILED.to_string());
+        }
+        if book.len() as u64 != self.n_rows {
+            return Err(format!(
+                "the long_pnl fitness book has {} rows, the device sample {}",
+                book.len(),
+                self.n_rows
+            ));
+        }
+        let rc = unsafe {
+            rc_set_pnl_book(
+                self.ctx,
+                book.excess().as_ptr(),
+                book.flags().as_ptr(),
+                book.len() as i32,
+                book.side(),
+                book.threshold(),
+                book.bound(),
+                book.min_trades() as u64,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        Err(match (last_alloc_failure(), last_alloc_failure_tag()) {
+            (Some(bytes), Some(tag)) => format!(
+                "device_memory: the device refused an allocation of {} bytes (tag {}) for the long_pnl fitness book",
+                bytes, tag
+            ),
+            _ => "the device refused the long_pnl fitness book".to_string(),
+        })
+    }
+
+    /// #481 test hook: the raw `f32` predictions of one compiled program on
+    /// the resident rows, from the same interpreter the scorers run. One
+    /// program, so the output is `n` values, never `P × N`. `None` on any CUDA
+    /// failure or in a tiled context.
+    pub fn predict_one_for_tests(&mut self, words: &[u32]) -> Option<Vec<f32>> {
+        let n = usize::try_from(self.n_rows).ok()?;
+        let offsets = [0u32, u32::try_from(words.len()).ok()?];
+        let mut out = vec![0.0f32; n];
+        let rc = unsafe { rc_predict(self.ctx, words.as_ptr(), offsets.as_ptr(), 1, out.as_mut_ptr()) };
+        (rc == 0).then_some(out)
+    }
+
+    /// #481 test hook: score a packed batch with [`ScoreObjective::LongPnl`]
+    /// and download each candidate's device totals next to its value.
+    pub fn long_pnl_totals_for_tests(
+        &mut self,
+        prog: &[u32],
+        offsets: &[u32],
+    ) -> Option<(ScoreBatch, Vec<crate::trading::FitnessTotals>)> {
+        let nprog = offsets.len().saturating_sub(1);
+        if nprog == 0 {
+            return None;
+        }
+        let mut values = vec![0.0f64; nprog];
+        let mut status = vec![0i32; nprog];
+        let mut raw = vec![RawPnlTotals::default(); nprog];
+        let rc = unsafe {
+            rc_stats_begin(self.ctx);
+            rc_pnl_totals(
+                self.ctx,
+                prog.as_ptr(),
+                offsets.as_ptr(),
+                nprog as i32,
+                values.as_mut_ptr(),
+                status.as_mut_ptr(),
+                raw.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let totals = raw
+            .iter()
+            .map(|t| crate::trading::FitnessTotals {
+                gross: t.gross,
+                flips: t.flips,
+                exits: t.exits,
+                long_rows: t.longs,
+                nonfinite: t.nonfinite != 0,
+            })
+            .collect();
+        let batch = ScoreBatch {
+            values,
+            status: status.into_iter().map(ScoreStatus::from_code).collect(),
+            ms: 0.0,
+        };
+        Some((batch, totals))
     }
 
     pub fn device_name() -> String {
@@ -10049,7 +10181,7 @@ mod classification_parity_tests {
                     .iter()
                     .map(|&v| v as f64)
                     .collect();
-                let want = metrics::score_weighted(&rows, &s.y, &s.w, objective.metric(), 0);
+                let want = metrics::score_weighted(&rows, &s.y, &s.w, objective.metric().unwrap(), 0);
                 let err = (got - want).abs() / want.abs().max(1.0);
                 assert!(
                     err <= 1e-6,
@@ -10057,7 +10189,7 @@ mod classification_parity_tests {
                     objective.name()
                 );
                 // f32 rows versus the f64 model: the wider bound.
-                let f64want = cpu_score(tree, &s, objective.metric());
+                let f64want = cpu_score(tree, &s, objective.metric().unwrap());
                 let f32err = (got - f64want).abs() / f64want.abs().max(1.0);
                 assert!(
                     f32err <= 1e-5,
@@ -10106,7 +10238,7 @@ mod classification_parity_tests {
                     .iter()
                     .map(|&v| v as f64)
                     .collect();
-                let want = metrics::score_weighted(&rows, &s.y, &s.w, objective.metric(), 0);
+                let want = metrics::score_weighted(&rows, &s.y, &s.w, objective.metric().unwrap(), 0);
                 let got = batch.values[k];
                 let what = format!("{} model {k}", objective.name());
                 assert_eq!(got.to_bits(), again.values[k].to_bits(), "{what}: repeat");
@@ -10656,3 +10788,7 @@ mod slope_tests;
 #[cfg(test)]
 #[path = "gpu_fit_polish_tests.rs"]
 mod fit_polish_tests;
+
+#[cfg(test)]
+#[path = "gpu_hard_op_fit_tests.rs"]
+mod hard_op_fit_tests;
