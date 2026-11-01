@@ -79,6 +79,8 @@ Environment overrides for the build:
 | `RCSR_GPU_UNIFIED` | `1`/`true`/`yes`/`on` selects `cudaMallocManaged` for every buffer; `0`/`false`/anything else selects plain device memory | `1` for `sm_121`, `0` otherwise |
 | `RCSR_GPU_SYNC` | `1`/`true`/`yes`/`on` forces the blocking copy path for the batch arena (the labelled fallback, #285) | unset (pinned asynchronous path) |
 
+The build compiles the `.cu` files with `-std=c++17` on every toolkit. CUDA 13 needs it (its CUB headers require C++17); CUDA 12.0 accepts it. Both toolkits build the crate; set `RCSR_NVCC=/usr/local/cuda-13.0/bin/nvcc` to use CUDA 13.
+
 Minimum toolkit per target, as used by the build-script check:
 
 | Target | Minimum CUDA | Notes |
@@ -293,7 +295,7 @@ Measured with the build script's flags (`sm_86`, CUDA 12.0, `-O3`) on
 `main` at `ce3201c` (before) and on this branch (after):
 
 ```sh
-nvcc -O3 -std=c++14 -arch=sm_86 -cubin src/cuda/eval.cu \
+nvcc -O3 -std=c++17 -arch=sm_86 -cubin src/cuda/eval.cu \
      -o /tmp/eval.cubin -Xptxas -v,-warn-spills
 cuobjdump -res-usage /tmp/eval.cubin
 ```
