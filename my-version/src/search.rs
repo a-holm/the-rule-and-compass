@@ -176,6 +176,11 @@ pub struct Config {
     /// [`search_setting_differences`](Self::search_setting_differences), and
     /// `None` (the default) skips every measurement the log would need.
     pub dev_log: Option<DevFn>,
+    /// #462: optional front observer, invoked once per generation after the
+    /// archive update with the 1-based generation, the elapsed search seconds
+    /// and the archive. Reporting only: not search state, not saved in a
+    /// checkpoint, ignored by [`search_setting_differences`](Self::search_setting_differences).
+    pub front_observer: Option<FrontFn>,
     // #27: use the SoA/AVX evaluator for candidate predictions. This is a
     // path choice, not a search setting: both paths must produce the same
     // errors, so it is ignored by `search_setting_differences`.
@@ -225,6 +230,10 @@ pub type ProgressFn = std::sync::Arc<dyn Fn(Progress) + Send + Sync>;
 /// [`GenRecord`](crate::devlog::GenRecord); the CLI formats it as one NDJSON
 /// line. Not called at all when no log is attached.
 pub type DevFn = std::sync::Arc<dyn Fn(&crate::devlog::GenRecord) + Send + Sync>;
+
+/// #462: front observer callback type. Called once per generation with the
+/// 1-based generation, the elapsed search seconds and the archive.
+pub type FrontFn = std::sync::Arc<dyn Fn(usize, f64, &Archive) + Send + Sync>;
 
 /// #211: per-generation counters shared by the island threads.
 ///
@@ -349,6 +358,7 @@ impl Default for Config {
             qd_control: 0,
             progress: None,
             dev_log: None, // #211: off unless --dev-log is given
+            front_observer: None, // #462
             simd: true, // #27
             // #141: the GPU is the default backend when the binary is built
             // with CUDA and a device is available. The probe happens once at
@@ -5341,6 +5351,9 @@ fn run_postfix_search(
         // (programs that share a canonical postfix hash) instead of a rejected
         // attempt counter; `fit_*` stays zero because this path is fit-free by
         // construction.
+        if let Some(observe) = &cfg.front_observer {
+            observe(gens_done, t0.elapsed().as_secs_f64(), &archive);
+        }
         if let Some(report) = &cfg.dev_log {
             let mut dev_errors: Vec<f64> = Vec::with_capacity(n_islands * pop);
             let mut dev_island_best: Vec<f64> = Vec::with_capacity(n_islands);
@@ -6738,6 +6751,9 @@ fn run_search(
             // at the same boundary `--progress` reports. Everything here is a
             // reading of state the search already holds; nothing is drawn from
             // the RNG and nothing is written back.
+            if let Some(observe) = &cfg.front_observer {
+                observe(gens_done, t0.elapsed().as_secs_f64(), &archive);
+            }
             if let Some(report) = &cfg.dev_log {
                 #[cfg(feature = "cuda")]
                 let gpu_now = gpu.as_ref().map(|g| g.dev_snapshot(gen));
@@ -8283,6 +8299,46 @@ mod tests {
             ..Config::default()
         };
         run(&cfg, &train, &train.clone())
+    }
+
+    /// #462: the front observer sees every generation and cannot change the
+    /// trajectory.
+    #[test]
+    fn front_observer_does_not_change_the_archive() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        for i in 0..40 {
+            let a = -1.0 + 2.0 * i as f64 / 39.0;
+            x.push(vec![a]);
+            y.push((2.0 * a).sin() + a);
+        }
+        let train = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
+        let plain = Config {
+            generations: 8,
+            pop: 40,
+            islands: 2,
+            seed: 9,
+            patience: 0,
+            gpu: false,
+            ..Config::default()
+        };
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let last = std::sync::Arc::new(AtomicUsize::new(0));
+        let (c2, l2) = (calls.clone(), last.clone());
+        let observed = Config {
+            front_observer: Some(std::sync::Arc::new(move |g, secs, archive: &Archive| {
+                assert!(secs >= 0.0 && !archive.items.is_empty());
+                c2.fetch_add(1, Ordering::SeqCst);
+                l2.store(g, Ordering::SeqCst);
+            })),
+            ..plain.clone()
+        };
+        let a = run(&plain, &train, &train.clone());
+        let b = run(&observed, &train, &train.clone());
+        assert_eq!(a.archive.hash(), b.archive.hash());
+        assert_eq!(calls.load(Ordering::SeqCst), b.generations);
+        assert_eq!(last.load(Ordering::SeqCst), b.generations);
+        assert!(plain.search_setting_differences(&observed).is_empty());
     }
 
     /// #402: a negative information criterion is a good fit, not a solved run.
