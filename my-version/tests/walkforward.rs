@@ -721,7 +721,7 @@ mod front {
 
     fn wf(data: &str, source: &[&str], window: &str, extra: &[&str]) -> (i32, String, String) {
         let mut a = vec![
-            "walkforward", "--data", data, "--time", "ts", "--horizon", "5", "--periods-per-year", "365",
+            "walkforward", "--data", data, "--time", "ts", "--horizon", "1", "--periods-per-year", "365",
             "--validation-frac", "0.3", "--window", window, "--json",
         ];
         a.extend_from_slice(source);

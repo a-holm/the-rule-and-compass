@@ -462,7 +462,7 @@ fn walkforward_front_of_a_real_run_guards_the_seen_rows() {
         Command::new(env!("CARGO_BIN_EXE_rcsr"))
             .args([
                 "walkforward", "--data", &data, "--time", "t", "--front", &run_path, "--window", &window,
-                "--horizon", "3600", "--periods-per-year", "365", "--validation-frac", "0.3", "--json",
+                "--horizon", "900", "--periods-per-year", "365", "--validation-frac", "0.3", "--json",
             ])
             .output()
             .unwrap()
