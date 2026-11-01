@@ -4822,7 +4822,15 @@ fn refit_to_fixpoint(
 /// Lexicographic parsimony pressure: better error wins; if the errors are equal
 /// to within a relative tolerance, the smaller expression wins. This controls
 /// bloat without a tunable penalty coefficient (Luke & Panait 2006).
+/// A finite error always beats a non-finite one; two non-finite trees compare by
+/// complexity.
 fn better(a: &Ind, b: &Ind) -> bool {
+    match (a.error.is_finite(), b.error.is_finite()) {
+        (true, false) => return true,
+        (false, true) => return false,
+        (false, false) => return a.complexity < b.complexity,
+        (true, true) => {}
+    }
     let tol = 1e-9 * (1.0 + a.error.abs().max(b.error.abs()));
     if a.error < b.error - tol {
         return true;
@@ -8792,7 +8800,7 @@ mod tests {
     /// #587: simple non-finite trees no longer win tournaments against complex
     /// finite ones.
     #[test]
-    fn tournament_winners_are_not_non_finite() {
+    fn tournament_non_finite_winners_need_an_all_non_finite_draw() {
         let island: Vec<Ind> = (0..64)
             .map(|i| {
                 if i % 2 == 0 {
@@ -8806,7 +8814,9 @@ mod tests {
         let wins = (0..2000)
             .filter(|_| !island[tournament(&island, &mut rng, 3)].error.is_finite())
             .count();
-        assert_eq!(wins, 0, "non-finite winners: {wins} of 2000");
+        // A non-finite winner needs all 3 draws non-finite: about 1 in 8. The old
+        // comparator let any non-finite draw win.
+        assert!(wins < 2000 / 5, "non-finite winners: {wins} of 2000");
     }
 
     /// #169: the admission fraction is a pure function of the population size
