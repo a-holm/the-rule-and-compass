@@ -232,12 +232,18 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              a look-ahead on time series; reported as centred
   --allow-interpolate        permit --fill interpolate on time-ordered data
   --allow-lockbox            permit train/validation/test rows in 2026H2 (declared final test only)
+                             It never opens the declared locked test (--lockbox).
   --lockbox <START,END>      declared locked test (UTC, half-open). Overrides the range
                              declared with the data (<data>.manifest.json, .schema.json,
                              .enrich.json or <csv>.lockbox.json). Train, validation and
                              test rows inside it are refused (exit 3); run.json `lockbox`
                              reports rows, date range, read count, declared, source,
                              rows_in_scope, evaluated
+                             With a declaration every split side is checked: without
+                             --time the data must hold one integer epoch-seconds
+                             column, else the run exits 3 asking for --time; a
+                             time column that is not epoch seconds, or a row without
+                             a time stamp, is exit 3 too
   --ledger <file>            candidate ledger whose locked reads run.json counts
   --arm <name>              ablation arm label; run.json gains an `ablation` object with the arm,
                              the SHA-256 of the ordered variable list, the generation budget and
@@ -351,6 +357,9 @@ OVERFITTING DIAGNOSTICS (always on):
                              rolling forward chaining (time-ordered data)
                              purged  k-fold with a --gap embargo either side of
                                      each test block
+                             Folds are drawn from the rows left by --exclude and
+                             --filter. With a declared locked test every such row
+                             is checked, also with --allow-lockbox.
   --cv-k <K>                 number of folds (default 5); --cv costs ~K searches
   --null-runs <n>            rerun the identical search on n shuffled targets
                              (y-randomisation control) and report the null error
