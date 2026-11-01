@@ -8664,6 +8664,8 @@ mod order_stat_tests {
         assert_eq!(again[0][0].map(f64::to_bits), ok.unwrap()[0][0].map(f64::to_bits));
     }
 
+    /// The device median is the configured metric for odd and even row counts,
+    /// with ties and with a constant prediction.
     #[test]
     fn the_device_median_is_the_configured_metric() {
         for n in [5usize, 6, 31, 32, 97, 128] {
