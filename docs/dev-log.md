@@ -1,3 +1,4 @@
+| `variation.constant_rejected` | full | offspring rejected before the fit because no input reaches the rows outside an aggregate (`--reject-constant-offspring`; 0 without the flag) |
 # The development log (`--dev-log`) and `rcsr dev-report`
 
 `rcsr` writes a **development log** while it searches. It is on by default: a
@@ -242,6 +243,7 @@ the search's main thread and add up to `wall`. `fit_cpu` and `eval_cpu` overlap
 them: the islands run in parallel, so those are CPU-time sums, not wall time.
 That is why the analyzer reports the fit share of the island CPU budget as
 `fit_cpu / (search × islands)`.
+When `fit_cpu + eval_cpu` is under 1 ms (a device-fit run, where only fallback seconds remain) the analyzer prints "no CPU fitting in the islands" with severity 0 and omits the fit share rows.
 
 On the flat postfix path (`--variation postfix`, chosen automatically for a
 large, fit-free GPU run) there is no per-candidate fit, and the arena
@@ -273,8 +275,9 @@ because that loop has neither.
 | `run_wall_s`, `device_busy_s`, `duty_run` | #284 run ledger: run wall, **union** of device intervals, and their ratio |
 | `unaccounted_s` | `run_wall_s − Σ stage_s`; >1 % of wall is a telemetry defect |
 | `device_busy_s` basis | the union uses CUDA event timestamps when they are available; the stage seconds (including `io`), the placement basis (`events`, `host_envelope`, `mixed`) and the structural-zero stages (`features`, `pnl`) are in `--json` `gpu.ledger`, not in this event |
+| `stages.vary_s`, `stages.fit_s` (mixed arm) | with `--gpu --fit-strategy exact` the island threads fit on the CPU; each island-scope window is split into `fit_s` (summed island fit time divided by island threads, capped at the window) and `vary_s` (the rest). The split is apportioned, not a measured interval |
 | `fit_kernel_s`, `fit_fallback_s` | raw device fit-kernel seconds and measured exact-CPU fit-fallback seconds |
-| `fit_kernel_f32_s`, `fit_kernel_f64_s` | `fit_kernel_s` apportioned to the damped LM loop and to the polish phase by per-block cycle sums (`--fit-polish`) |
+| `fit_kernel_lm_s`, `fit_kernel_polish_s` | `fit_kernel_s` apportioned to the damped LM loop and to the polish phase by per-block cycle sums (`--fit-polish`) |
 | `fit_refit_s`, `fit_refits` | #495: wall seconds and count of the exact CPU finalist refits after the last generation (GPU runs; `null` on a CPU run). `rcsr dev-report` ranks the refit as its own window beside the generation phases and prints it in the run table |
 | `events`, `bytes`, `dropped` | log bookkeeping **before** this event; `dropped` counts events lost to the byte cap |
 | `end` | UTC end time |

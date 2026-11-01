@@ -464,6 +464,8 @@ pub struct GenRecord {
     pub phase_b_s: f64,
     /// #463: candidates dropped after the fit for exceeding the complexity cap.
     pub post_fit_drops: usize,
+    /// #477: offspring rejected before the fit for holding no row-dependent input.
+    pub constant_rejected: usize,
     // Error distribution over this generation's population.
     pub best_error: f64,
     pub p05: f64,
@@ -580,7 +582,7 @@ impl GenRecord {
              \"error\":{{\"best\":{},\"p05\":{},\"p25\":{},\"median\":{},\"p75\":{},\"p95\":{}}},\
              \"archive\":{{\"size\":{},\"hypervolume\":{},\"hash\":{},\"offers\":{},\"admissions\":{}}},\
              \"variation\":{{\"attempts\":{},\"duplicates\":{},\"too_complex\":{},\"offspring\":{},\
-             \"fitted\":{},\"refits\":{},\"dedup_rate\":{},\"post_fit_drops\":{}}},\
+             \"fitted\":{},\"refits\":{},\"dedup_rate\":{},\"post_fit_drops\":{},\"constant_rejected\":{}}},\
              \"gpu\":{},\"fit\":{},\
              \"fallback\":{{\"scope\":\"evaluator_pool\",\"seconds\":{},\"workers\":{}}},\
              \"qd\":{},\
@@ -621,6 +623,7 @@ impl GenRecord {
             self.refits,
             num(self.dedup_rate()),
             self.post_fit_drops,
+            self.constant_rejected,
             self.gpu.as_ref().map(|g| g.json()).unwrap_or_else(|| "null".to_string()),
             self.fit.json(),
             num(self.fallback_s),
@@ -784,8 +787,8 @@ pub struct RunEnd {
     /// #284: fit kernel seconds from raw device events.
     pub fit_kernel_s: Option<f64>,
     /// #496: `fit_kernel_s` apportioned to the LM phase and to the polish phase.
-    pub fit_kernel_f32_s: Option<f64>,
-    pub fit_kernel_f64_s: Option<f64>,
+    pub fit_kernel_lm_s: Option<f64>,
+    pub fit_kernel_polish_s: Option<f64>,
     /// #284: exact CPU fit-fallback seconds.
     pub fit_fallback_s: Option<f64>,
     /// #495: exact finalist refit seconds.
@@ -807,7 +810,7 @@ pub fn run_end_json(r: &RunEnd) -> String {
          \"json\":{},\"peak_rss_bytes\":{},\"gpu_wall_s\":{},\"device_hours\":{},\
          \"device_seconds_incl_fit\":{},\"device_fraction_of_run\":{},\
          \"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"unaccounted_s\":{},\
-         \"fit_kernel_s\":{},\"fit_kernel_f32_s\":{},\"fit_kernel_f64_s\":{},\"fit_fallback_s\":{},\"fit_refit_s\":{},\"fit_refits\":{},\
+         \"fit_kernel_s\":{},\"fit_kernel_lm_s\":{},\"fit_kernel_polish_s\":{},\"fit_fallback_s\":{},\"fit_refit_s\":{},\"fit_refits\":{},\
          \"events\":{},\"bytes\":{},\"dropped\":{},\"end\":{}}}",
         SCHEMA,
         VERSION,
@@ -838,8 +841,8 @@ pub fn run_end_json(r: &RunEnd) -> String {
         opt_num(r.duty_run),
         opt_num(r.unaccounted_s),
         opt_num(r.fit_kernel_s),
-        opt_num(r.fit_kernel_f32_s),
-        opt_num(r.fit_kernel_f64_s),
+        opt_num(r.fit_kernel_lm_s),
+        opt_num(r.fit_kernel_polish_s),
         opt_num(r.fit_fallback_s),
         opt_num(r.fit_refit_s),
         match r.fit_refits {
@@ -1133,6 +1136,7 @@ mod tests {
             eval_cpu_s: 0.02,
             phase_b_s: 0.0,
             post_fit_drops: 0,
+            constant_rejected: 0,
             best_error: 0.5,
             p05: 0.6,
             p25: 0.7,

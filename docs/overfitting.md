@@ -279,15 +279,17 @@ The cutoff is a practical choice, not a theorem: the literature puts k-d trees
 in their intended regime around `d <= 10` and worse than linear search beyond
 about 16.
 
-The **query rows** are bounded by default: `--baseline-samples N` scores at
+The **query rows** are bounded on large panels: `--baseline-samples N` scores at
 most `N` deterministic query rows per set (training and each test fold), seeded
-from `--seed`, and the default is **512**. On a small panel (at most 512 rows)
-that is every row, so the result is exact. This is offered only
-for the mean-loss metrics **absolute**, **squared** and **log_squashed**, where
-the sample average is an unbiased estimate of the full row-average loss. For
-median, maximum, correlation, rank correlation, interquartile, slope,
-classification and information-criterion metrics a subsample is a different
-estimator, so the CLI refuses the flag. When sampling happens the text line
+from `--seed`. Without the flag the baseline answers every row up to 20,000
+training rows and samples **512** query rows above that, for every metric (no
+per-metric exceptions). For the mean-loss metrics (absolute, squared,
+log_squashed, log_loss, brier, hinge, hinge_ordinary, hinge_squared) the sample
+average is an unbiased estimate of the full row-average loss, and the class
+labels of a sampled row come from the whole query set. For median, maximum,
+correlation, rank correlation, interquartile, slope, auc and information-criterion
+metrics the sampled value is a diagnostic estimate of a different statistic and
+carries no SEM. When sampling happens the text line
 says `sampled=true`, and `--json` carries `baselines.knn.train_query_rows`,
 `train_query_sem`, `test_query_rows` and `test_query_sem`. The SEMs use the
 finite-population correction for sampling without replacement,
@@ -295,7 +297,7 @@ finite-population correction for sampling without replacement,
 `--baseline-samples 0` explicitly means no caps at all: every query row is
 scored, which is `O(N_train²·d)` and should be opt-in on large panels.
 `baselines.knn.reference_rows`, `train_query_rows`, `test_query_rows`,
-`capped`, both SEMs and `seconds` are reported. The reference set is always the
+`capped`, `sample_size`, `sample_seed`, both SEMs and `seconds` are reported. The reference set is always the
 training size.
 
 At 20k rows (15k training) `--baseline-samples 4096` gives a 95% interval of

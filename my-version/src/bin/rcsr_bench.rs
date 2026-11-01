@@ -58,6 +58,7 @@ OPTIONS:
                             (default: the available CPU cores; 1 = serial; the
                             results do not depend on it)
   --no-front-parents        disable the 15% Pareto-front parent feedback (#76)
+  --reject-constant-offspring  reject input-free offspring before the constant fit (#477)
   --cpu                     force the CPU evaluator (no environment variable)
   --gpu                     require the device evaluator; exit 2 without one
   --fit-strategy <name>     exact (bench default), auto, linear, varpro, stream,
@@ -71,6 +72,10 @@ OPTIONS:
   --variation <mode>        auto, node or postfix
   --selection <mode>        lexicographic (default) or afp (age-fitness Pareto)
   --linear-scaling          wrap every candidate in a fitted affine output map (#470)
+  --mutation-mix <mix>      classic (default) or extended: insert, delete, swap, rotate (#471)
+  --tree-arity <mode>       uniform (default) or balanced random-tree operator draw (#471)
+  --crossover-internal <P>  probability of an internal-node crossover cut (default 0) (#471)
+  --adaptive-mix            per-island edit weights from success rates (#471)
   --dispatch <mode>         auto or device (device skips the timing comparison)
   --fit-polish <mode>      f64 (default), f32 or off: arithmetic of the device fit
                             kernel polish (--fit-strategy gpu)
@@ -299,9 +304,21 @@ fn parse(args: &[String]) -> Result<Args, String> {
                     Some(num(take(&mut i, "--restart-interval")?, "--restart-interval")?)
             }
             "--linear-scaling" => a.knobs.linear_scaling = true,
+            "--mutation-mix" => {
+                a.knobs.mutation_mix = Some(rcsr::search::MutationMix::parse(&take(&mut i, "--mutation-mix")?)?)
+            }
+            "--tree-arity" => {
+                a.knobs.tree_arity = Some(rcsr::search::TreeArity::parse(&take(&mut i, "--tree-arity")?)?)
+            }
+            "--crossover-internal" => {
+                a.knobs.crossover_internal =
+                    Some(num(take(&mut i, "--crossover-internal")?, "--crossover-internal")?)
+            }
+            "--adaptive-mix" => a.knobs.adaptive_mix = true,
             "--variation" => {
                 a.knobs.variation = Some(rcsr::search::VariationMode::parse(&take(&mut i, "--variation")?)?)
             }
+            "--reject-constant-offspring" => a.knobs.reject_constant_offspring = true,
             "--selection" => {
                 a.knobs.selection = Some(rcsr::search::Selection::parse(&take(&mut i, "--selection")?)?)
             }

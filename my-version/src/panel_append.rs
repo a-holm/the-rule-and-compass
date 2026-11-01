@@ -20,6 +20,8 @@ pub struct AppendOptions {
     /// Symbol-major store that carries the family columns.
     pub family: String,
     pub columns: Vec<String>,
+    /// Drop columns that already exist in the panel when the family values are bitwise equal.
+    pub skip_existing: bool,
     pub out: String,
     pub panel_version: String,
     /// Directory for the temporary raw columns (default: next to `out`).
@@ -34,6 +36,8 @@ pub struct AppendReport {
     pub input_sha256_after: String,
     pub output_sha256: String,
     pub appended: Vec<String>,
+    /// Columns dropped by `skip_existing` because the panel holds equal values.
+    pub skipped_existing: Vec<String>,
     /// Panel rows with no row in the family store; their values are NaN.
     pub unmatched_rows: usize,
     pub schema: String,
@@ -87,30 +91,89 @@ fn column_all(store: &FileStore, name: &str) -> Result<Vec<f64>, String> {
     Ok(out)
 }
 
-/// Append `opts.columns` from the family store to the panel.
-pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
-    if opts.columns.is_empty() {
+/// Check `names` against both stores and the registry before any column is read.
+/// Every problem is listed in one message.
+pub fn check_columns(
+    panel: &FileStore,
+    family: &FileStore,
+    names: &[String],
+    skip_existing: bool,
+) -> Result<(), String> {
+    if names.is_empty() {
         return Err("append needs at least one --columns name".to_string());
     }
-    for c in &opts.columns {
+    let mut problems: Vec<String> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for c in names {
+        if !seen.insert(c.as_str()) {
+            problems.push(format!("column '{}' is listed twice", c));
+            continue;
+        }
         match registry::lookup(c) {
             Some(r) if r.available => {}
-            Some(r) => {
-                return Err(format!(
-                    "column '{}' is registered in family '{}' but unavailable: {}",
-                    c,
-                    r.family,
-                    r.reason.unwrap_or_default()
-                ))
-            }
+            Some(r) => problems.push(format!(
+                "column '{}' is registered in family '{}' but unavailable: {}",
+                c,
+                r.family,
+                r.reason.unwrap_or_default()
+            )),
             None => {
                 let near = registry::nearest(c)
                     .map(|(n, f)| format!(" (nearest registry name '{}', family '{}')", n, f))
                     .unwrap_or_default();
-                return Err(format!("unknown column '{}': not in the feature registry{}", c, near));
+                problems.push(format!("unknown column '{}': not in the feature registry{}", c, near));
+            }
+        }
+        match family.header().column_index(c) {
+            None => problems.push(format!("column '{}' is not in the family store {}", c, family.path())),
+            Some(i) if family.header().dtypes()[i] != DType::F64 => {
+                problems.push(format!("column '{}' is not numeric f64 in the family store", c))
+            }
+            Some(_) => {}
+        }
+        if let Some(i) = panel.header().column_index(c) {
+            if !skip_existing {
+                problems.push(format!(
+                    "column '{}' already exists in the panel {} (--skip-existing drops it when the values are equal)",
+                    c,
+                    panel.path()
+                ));
+            } else if panel.header().dtypes()[i] != DType::F64 {
+                problems.push(format!("column '{}' already exists in the panel and is not numeric f64", c));
             }
         }
     }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("invalid --columns: {}", problems.join("; ")))
+    }
+}
+
+/// Every family column that is not in the panel, is numeric f64 and is an
+/// available registry feature or label column, in family order.
+pub fn resolve_all(panel: &FileStore, family: &FileStore) -> Vec<String> {
+    let dtypes = family.header().dtypes();
+    family
+        .header()
+        .names()
+        .iter()
+        .enumerate()
+        .filter(|(i, n)| {
+            dtypes[*i] == DType::F64
+                && panel.header().column_index(n).is_none()
+                && registry::lookup(n).is_some_and(|r| r.available)
+        })
+        .map(|(_, n)| n.clone())
+        .collect()
+}
+
+fn bits_equal(a: f64, b: f64) -> bool {
+    a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+}
+
+/// Append `opts.columns` from the family store to the panel.
+pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
     let declared = crate::lockbox::output_declaration(&opts.out, Some(&opts.target), opts.locked_test).map_err(|e| e.message)?;
     let also = crate::lockbox::inherited_also(&opts.target, declared.as_ref())?;
     // The target's declaration wins and is kept. A family store with no declaration is accepted.
@@ -126,9 +189,10 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
             ));
         }
     }
-    let before = manifest::sha256_file(&opts.target)?;
     let target = FileStore::open(&opts.target)?;
     let family = FileStore::open(&opts.family)?;
+    check_columns(&target, &family, &opts.columns, opts.skip_existing)?;
+    let before = manifest::sha256_file(&opts.target)?;
     let tk = read_keys(&target)?;
     let fk = read_keys(&family)?;
 
@@ -149,6 +213,31 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
         .collect();
     let unmatched_rows = rows.iter().filter(|r| r.is_none()).count();
 
+    let mut to_append: Vec<&String> = Vec::new();
+    let mut skipped_existing: Vec<String> = Vec::new();
+    for name in &opts.columns {
+        if target.header().column_index(name).is_none() {
+            to_append.push(name);
+            continue;
+        }
+        let have = column_all(&target, name)?;
+        let want = column_all(&family, name)?;
+        for (r, m) in rows.iter().enumerate() {
+            if let Some(i) = m {
+                if !bits_equal(have[r], want[*i as usize]) {
+                    return Err(format!(
+                        "column '{}' already exists in the panel with another value at row {} (symbol {}, ts {}): panel {}, family {}",
+                        name, r, tk.sym[r], tk.ts[r], have[r], want[*i as usize]
+                    ));
+                }
+            }
+        }
+        skipped_existing.push(name.clone());
+    }
+    if to_append.is_empty() {
+        return Err("every --columns name already exists in the panel with equal values; nothing to append".to_string());
+    }
+
     let scratch: PathBuf = match &opts.scratch {
         Some(s) => PathBuf::from(s),
         None => Path::new(&opts.out)
@@ -161,7 +250,7 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
     let mut extras: Vec<AppendColumn> = Vec::new();
     let mut files: Vec<PathBuf> = Vec::new();
     let result = (|| -> Result<String, String> {
-        for name in &opts.columns {
+        for name in &to_append {
             let values = column_all(&family, name)?;
             let file = scratch.join(format!("rcsr-append-{}-{}.f64", tag, name));
             let mut w = std::io::BufWriter::new(
@@ -175,7 +264,7 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
             }
             w.flush().map_err(|e| format!("{}: {}", file.display(), e))?;
             extras.push(AppendColumn {
-                name: name.clone(),
+                name: (*name).clone(),
                 file,
                 replace: false,
             });
@@ -186,14 +275,21 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
         let _ = std::fs::remove_file(f);
     }
     let output_sha256 = result?;
-    let schema = registry::write_schema_declared(&opts.out, &opts.panel_version, declared.as_ref(), also.as_ref())?;
-    crate::lockbox::finish_output(&opts.out, declared.as_ref(), &["schema.json"]).map_err(|e| e.message)?;
+    let finish = || -> Result<String, String> {
+        let schema = registry::write_schema_declared(&opts.out, &opts.panel_version, declared.as_ref(), also.as_ref())?;
+        crate::lockbox::finish_output(&opts.out, declared.as_ref(), &["schema.json"]).map_err(|e| e.message)?;
+        Ok(schema)
+    };
+    let schema = finish().inspect_err(|_| {
+        let _ = std::fs::remove_file(&opts.out);
+    })?;
     let after = manifest::sha256_file(&opts.target)?;
     Ok(AppendReport {
         input_sha256_before: before,
         input_sha256_after: after,
         output_sha256,
-        appended: opts.columns.clone(),
+        appended: to_append.into_iter().cloned().collect(),
+        skipped_existing,
         unmatched_rows,
         schema,
     })
@@ -201,7 +297,7 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
 
 fn usage_text() -> &'static str {
     "rcsr panel schema --data panel.rcsb [--panel-version V] [--verify]
-rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b --out out.rcsb [--panel-version V] [--scratch dir] [--locked-test START,END|none]
+rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b|@all --out out.rcsb [--skip-existing] [--panel-version V] [--scratch dir] [--locked-test START,END|none]
 "
 }
 
@@ -219,6 +315,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
     let mut panel_version = registry::DEFAULT_PANEL_VERSION.to_string();
     let mut scratch: Option<String> = None;
     let mut verify = false;
+    let mut skip_existing = false;
     let mut locked_test = crate::lockbox::Keep::Unset;
     let mut i = 0usize;
     while i < args.len() {
@@ -240,6 +337,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
                     .unwrap_or_else(|e| fail(&format!("--locked-test: {}", e), 2))
             }
             "--verify" => verify = true,
+            "--skip-existing" => skip_existing = true,
             "-h" | "--help" => {
                 print!("{}", usage_text());
                 std::process::exit(0);
@@ -265,10 +363,11 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
             }
         }
         "append" => {
-            let opts = AppendOptions {
+            let mut opts = AppendOptions {
                 target: data,
                 family: family.unwrap_or_else(|| fail("append needs --family", 2)),
                 columns,
+                skip_existing,
                 out: out.unwrap_or_else(|| fail("append needs --out", 2)),
                 panel_version,
                 scratch,
@@ -277,11 +376,25 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
             if let Err(e) = crate::lockbox::output_declaration(&opts.out, Some(&opts.target), opts.locked_test) {
                 fail(&e.message, e.exit);
             }
+            let stores = FileStore::open(&opts.target).and_then(|t| FileStore::open(&opts.family).map(|f| (t, f)));
+            let (panel_store, family_store) = stores.unwrap_or_else(|e| fail(&e, 3));
+            if opts.columns == ["@all"] {
+                opts.columns = resolve_all(&panel_store, &family_store);
+                if opts.columns.is_empty() {
+                    fail("--columns @all: the family store has no registry column that the panel lacks", 2);
+                }
+            }
+            if let Err(e) = check_columns(&panel_store, &family_store, &opts.columns, opts.skip_existing) {
+                fail(&e, 2);
+            }
+            drop((panel_store, family_store));
             match append_family(&opts) {
                 Ok(r) => {
                     eprintln!(
-                        "appended {} column(s); unmatched rows {}; input sha256 {} (unchanged: {}); output sha256 {}; schema {}",
+                        "appended {} column(s); skipped existing {} ({}); unmatched rows {}; input sha256 {} (unchanged: {}); output sha256 {}; schema {}",
                         r.appended.len(),
+                        r.skipped_existing.len(),
+                        r.skipped_existing.join(","),
                         r.unmatched_rows,
                         r.input_sha256_before,
                         r.input_sha256_before == r.input_sha256_after,

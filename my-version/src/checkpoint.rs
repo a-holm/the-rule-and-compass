@@ -32,6 +32,7 @@
 //! | `fsol <complexity> <cost> <error> <tree>` | #256: one post-refit member |
 //! | `build <field> <value>` | #256: version, commit, binary_sha256, device, driver, threads |
 //! | `island <i> <stagnant>` | per-island counter |
+//! | `mix <i> <numbers>` | #471: adaptive edit counts of island i, 14 numbers per generation |
 //! | `rng <i|main> <idx> <624 words>` | exact MT19937 state |
 //! | `ind <i> <error> <complexity> <tree>` | one population member |
 //!
@@ -81,6 +82,9 @@ pub struct Individual {
 pub struct IslandState {
     pub rng: Mt,
     pub population: Vec<Individual>,
+    /// #471: the adaptive edit counts of the last generations. Empty unless
+    /// `--adaptive-mix` is on.
+    pub mix: crate::mix::MixWindow,
 }
 
 /// A fingerprint of a sample: its row count and a hash of every stored value.
@@ -608,6 +612,10 @@ impl Checkpoint {
                 let _ = write!(line, "{}", w);
             }
             writeln!(out, "{}", line).unwrap();
+            if !isl.mix.is_empty() {
+                let numbers: Vec<String> = isl.mix.encode().iter().map(|v| v.to_string()).collect();
+                writeln!(out, "mix {} {}", i, numbers.join(" ")).unwrap();
+            }
             for ind in &isl.population {
                 writeln!(
                     out,
@@ -660,6 +668,7 @@ impl Checkpoint {
         let mut sols: Vec<Sol> = Vec::new();
         let mut island_stagnant: Vec<Option<usize>> = Vec::new();
         let mut island_rngs: Vec<Option<Mt>> = Vec::new();
+        let mut island_mix: Vec<Option<crate::mix::MixWindow>> = Vec::new();
         let mut island_pops: Vec<Option<Vec<Individual>>> = Vec::new();
         let mut island_ages: Vec<Option<Vec<u32>>> = Vec::new();
         let mut main_rng: Option<Mt> = None;
@@ -923,6 +932,16 @@ impl Checkpoint {
                         set_slot(&mut island_rngs, i, rng, "rng", lineno)?;
                     }
                 }
+                "mix" => {
+                    let i = parse_num::<usize>(&parts, 1, lineno, "mix island")?;
+                    let mut values = Vec::new();
+                    for k in 2..parts.len() {
+                        values.push(parse_num::<u64>(&parts, k, lineno, "mix count")?);
+                    }
+                    let window = crate::mix::MixWindow::decode(&values)
+                        .map_err(|e| format!("line {}: {}", lineno, e))?;
+                    set_slot(&mut island_mix, i, window, "mix", lineno)?;
+                }
                 "ind" => {
                     let i = parse_num::<usize>(&parts, 1, lineno, "ind island")?;
                     let error = parse_f64_at(&parts, 2, lineno, "ind error")?;
@@ -1050,7 +1069,8 @@ impl Checkpoint {
                 .get_mut(i)
                 .and_then(|s| s.take())
                 .ok_or_else(|| format!("checkpoint is incomplete: island {} has no counter", i))?;
-            islands.push(IslandState { rng, population });
+            let mix = island_mix.get_mut(i).and_then(|s| s.take()).unwrap_or_default();
+            islands.push(IslandState { rng, population, mix });
             stagnant.push(st);
         }
         if island_rngs.iter().skip(expected_islands).any(|s| s.is_some())
@@ -1367,6 +1387,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "require_dimensions",
         "fit_samples",
         "front_parents", // #76
+        "reject_constant_offspring", // #477: missing means false
         "fit_strategy",  // #116: missing means `exact`
         "fit_admission", // #223: missing means `screened`
         "fit_polish",    // #496: missing means `f64`
@@ -1382,6 +1403,10 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "variation",     // #122: missing means auto
         "selection",     // #465: missing means lexicographic
         "linear_scaling", // #470: missing means false
+        "mutation_mix",       // #471: missing means classic
+        "tree_arity",         // #471: missing means uniform
+        "crossover_internal", // #471: missing means 0
+        "adaptive_mix",       // #471: missing means false
     ];
     for key in KEYS {
         required(fields, key)?;
@@ -1581,6 +1606,38 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             ))
         }
     };
+    let mutation_mix = match fields.get("mutation_mix") {
+        None => crate::search::MutationMix::Classic,
+        Some(s) => crate::search::MutationMix::parse(s).map_err(|e| format!("config 'mutation_mix': {}", e))?,
+    };
+    let tree_arity = match fields.get("tree_arity") {
+        None => crate::search::TreeArity::Uniform,
+        Some(s) => crate::search::TreeArity::parse(s).map_err(|e| format!("config 'tree_arity': {}", e))?,
+    };
+    let crossover_internal = match fields.get("crossover_internal") {
+        None => 0.0,
+        Some(s) => decode_f64(s).map_err(|e| format!("config 'crossover_internal': {}", e))?,
+    };
+    let adaptive_mix = match fields.get("adaptive_mix").map(|s| s.as_str()) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "config 'adaptive_mix' must be true or false, got '{}'",
+                other
+            ))
+        }
+    };
+    let reject_constant_offspring = match fields.get("reject_constant_offspring").map(|s| s.as_str()) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "config 'reject_constant_offspring' must be true or false, got '{}'",
+                other
+            ))
+        }
+    };
     // #116: missing means `exact`, byte-identical to a checkpoint written
     // before the solver portfolio existed.
     let fit_strategy = match fields.get("fit_strategy").map(|s| s.as_str()) {
@@ -1725,6 +1782,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         // #116: a disk row source is a path choice, not saved search state.
         fit_stream_source: None,
         front_parents, // #76
+        reject_constant_offspring, // #477
         units,
         require_dimensions,
         qd_bins,
@@ -1748,6 +1806,10 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         variation,
         selection,
         linear_scaling, // #470
+        mutation_mix,
+        tree_arity,
+        crossover_internal,
+        adaptive_mix,
     })
 }
 
@@ -1841,10 +1903,26 @@ fn write_config(cfg: &Config, out: &mut String) {
     if cfg.linear_scaling {
         writeln!(out, "config linear_scaling true").unwrap();
     }
+    // #471: written only when set, so every other checkpoint keeps its bytes.
+    if cfg.mutation_mix != crate::search::MutationMix::Classic {
+        writeln!(out, "config mutation_mix {}", cfg.mutation_mix.as_str()).unwrap();
+    }
+    if cfg.tree_arity != crate::search::TreeArity::Uniform {
+        writeln!(out, "config tree_arity {}", cfg.tree_arity.as_str()).unwrap();
+    }
+    if cfg.crossover_internal != 0.0 {
+        writeln!(out, "config crossover_internal {}", encode_f64(cfg.crossover_internal)).unwrap();
+    }
+    if cfg.adaptive_mix {
+        writeln!(out, "config adaptive_mix true").unwrap();
+    }
     // #76: only write the field when front feedback is off, so an on run's
     // checkpoint stays byte-identical to one written before the flag existed.
     if !cfg.front_parents {
         writeln!(out, "config front_parents false").unwrap();
+    }
+    if cfg.reject_constant_offspring {
+        writeln!(out, "config reject_constant_offspring true").unwrap(); // #477
     }
     // #25: only write these when units are active, so a units-free checkpoint
     // is byte-identical to one written before this feature existed.

@@ -1428,16 +1428,30 @@ pub fn random_tree_with(
     depth: usize,
     aggs: Option<&AggTable>,
 ) -> Node {
+    random_tree_opts(rng, nvars, ops, depth, aggs, false)
+}
+
+/// [`random_tree_with`] with the operator draw of `--tree-arity`. `balanced`
+/// draws the arity class first (binary 0.5, unary 0.4, ternary 0.1, renormalised
+/// over the classes present in `ops`) and an operator uniformly inside it.
+pub fn random_tree_opts(
+    rng: &mut Mt,
+    nvars: usize,
+    ops: &[Op],
+    depth: usize,
+    aggs: Option<&AggTable>,
+    balanced: bool,
+) -> Node {
     if depth == 0 || rng.bool(0.15) {
         return random_terminal(rng, nvars);
     }
-    let op = *rng.pick(ops);
+    let op = if balanced { pick_balanced(rng, ops) } else { *rng.pick(ops) };
     if let Op::Agg(kind) = op {
         return random_aggregate(rng, nvars, kind, aggs);
     }
     let k = op.arity();
     let kids = (0..k)
-        .map(|_| random_tree_with(rng, nvars, ops, depth - 1, aggs))
+        .map(|_| random_tree_opts(rng, nvars, ops, depth - 1, aggs, balanced))
         .collect();
     node(op, kids)
 }
@@ -1495,11 +1509,169 @@ fn perturb_changed(rng: &mut Mt, v: f64) -> f64 {
     }
 }
 
-#[derive(Clone, Copy)]
-enum EditKind {
+/// One structural edit of the node-path mutation (#471).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditKind {
     Point,
     Terminal,
     Subtree,
+    Insert,
+    Delete,
+    Swap,
+    Rotate,
+}
+
+/// The number of edit kinds; the length of a [`MixWeights`] array.
+pub const EDIT_KINDS: usize = 7;
+
+/// Edit weights in [`EditKind::ALL`] order.
+pub type MixWeights = [f64; EDIT_KINDS];
+
+/// The historical draw: point 25 %, terminal 35 %, subtree 40 %.
+pub const CLASSIC_MIX: MixWeights = [0.25, 0.35, 0.40, 0.0, 0.0, 0.0, 0.0];
+
+/// `--mutation-mix extended`.
+pub const EXTENDED_MIX: MixWeights = [0.20, 0.30, 0.20, 0.10, 0.10, 0.05, 0.05];
+
+impl EditKind {
+    pub const ALL: [EditKind; EDIT_KINDS] = [
+        EditKind::Point,
+        EditKind::Terminal,
+        EditKind::Subtree,
+        EditKind::Insert,
+        EditKind::Delete,
+        EditKind::Swap,
+        EditKind::Rotate,
+    ];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            EditKind::Point => "point",
+            EditKind::Terminal => "terminal",
+            EditKind::Subtree => "subtree",
+            EditKind::Insert => "insert",
+            EditKind::Delete => "delete",
+            EditKind::Swap => "swap",
+            EditKind::Rotate => "rotate",
+        }
+    }
+}
+
+/// How the node path varies a tree: edit weights, the random-tree operator
+/// draw and the crossover cut-point bias. The default is the historical
+/// behaviour bit for bit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VariationOpts {
+    pub mix: MixWeights,
+    /// Arity-balanced operator draw in random trees (`--tree-arity balanced`).
+    pub balanced: bool,
+    /// Probability that a crossover cut point is an internal node
+    /// (`--crossover-internal`); `0` keeps the uniform choice.
+    pub crossover_internal: f64,
+}
+
+impl Default for VariationOpts {
+    fn default() -> Self {
+        VariationOpts {
+            mix: CLASSIC_MIX,
+            balanced: false,
+            crossover_internal: 0.0,
+        }
+    }
+}
+
+/// The kind a uniform draw `r` selects under `w`.
+fn draw_kind(r: f64, w: &MixWeights) -> EditKind {
+    let mut acc = 0.0;
+    let mut last = EditKind::Subtree;
+    for k in EditKind::ALL {
+        let wk = w[k.index()];
+        if wk <= 0.0 {
+            continue;
+        }
+        acc += wk;
+        last = k;
+        if r < acc {
+            return k;
+        }
+    }
+    last
+}
+
+/// Operators that are not commutative, so swapping the operands changes the value.
+fn noncommutative(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Sub
+            | Op::Div
+            | Op::Pow
+            | Op::Mod
+            | Op::Atan2
+            | Op::Less
+            | Op::LessOrEqual
+            | Op::Greater
+            | Op::GreaterOrEqual
+    )
+}
+
+/// A built-in binary operator that rotate and swap may rebuild.
+fn plain_binary(t: &Node) -> bool {
+    t.kids.len() == 2 && t.op.arity() == 2 && !t.op.is_custom() && !t.op.is_agg()
+}
+
+/// Whether `op` may wrap `site` in an insert edit.
+fn insertable(op: Op, site: &Node) -> bool {
+    op.arity() >= 1
+        && !op.is_agg()
+        && !op.is_meta()
+        && !(op == Op::Neg && site.op == Op::Neg)
+}
+
+/// Draw an operator from `ops` with the `--tree-arity balanced` class weights.
+fn pick_balanced(rng: &mut Mt, ops: &[Op]) -> Op {
+    const WEIGHT: [f64; 3] = [0.5, 0.4, 0.1];
+    fn class(op: Op) -> usize {
+        match op.arity() {
+            2 => 0,
+            a if a >= 3 => 2,
+            _ => 1,
+        }
+    }
+    let mut count = [0usize; 3];
+    for &o in ops {
+        count[class(o)] += 1;
+    }
+    let total: f64 = (0..3).filter(|&c| count[c] > 0).map(|c| WEIGHT[c]).sum();
+    if total <= 0.0 {
+        return *rng.pick(ops);
+    }
+    let r = rng.next_f64() * total;
+    let mut acc = 0.0;
+    let mut chosen = 0;
+    for c in 0..3 {
+        if count[c] == 0 {
+            continue;
+        }
+        acc += WEIGHT[c];
+        chosen = c;
+        if r < acc {
+            break;
+        }
+    }
+    let mut k = rng.usize_below(count[chosen]);
+    for &o in ops {
+        if class(o) == chosen {
+            if k == 0 {
+                return o;
+            }
+            k -= 1;
+        }
+    }
+    unreachable!("a counted class has members")
 }
 
 /// Whether a point change can actually change this node: it must be an
@@ -1523,6 +1695,7 @@ fn terminal_changeable(t: &Node, nvars: usize) -> bool {
 fn mutation_sites(n: &Node, kind: EditKind, nvars: usize, ops: &[Op]) -> Vec<usize> {
     fn walk(
         n: &Node,
+        under_agg: bool,
         kind: EditKind,
         nvars: usize,
         ops: &[Op],
@@ -1533,18 +1706,25 @@ fn mutation_sites(n: &Node, kind: EditKind, nvars: usize, ops: &[Op]) -> Vec<usi
             EditKind::Point => point_changeable(n, nvars, ops),
             EditKind::Terminal => terminal_changeable(n, nvars),
             EditKind::Subtree => true,
+            // An aggregate keeps its input-column child.
+            EditKind::Insert => !under_agg && ops.iter().any(|&o| insertable(o, n)),
+            EditKind::Delete => !n.kids.is_empty() && !n.op.is_agg(),
+            EditKind::Swap => {
+                plain_binary(n) && noncommutative(n.op) && n.kids[0] != n.kids[1]
+            }
+            EditKind::Rotate => plain_binary(n) && plain_binary(&n.kids[1]),
         };
         if editable {
             out.push(*i);
         }
         *i += 1;
         for k in &n.kids {
-            walk(k, kind, nvars, ops, i, out);
+            walk(k, n.op.is_agg(), kind, nvars, ops, i, out);
         }
     }
     let mut out = Vec::new();
     let mut i = 0;
-    walk(n, kind, nvars, ops, &mut i, &mut out);
+    walk(n, false, kind, nvars, ops, &mut i, &mut out);
     out
 }
 
@@ -1623,6 +1803,7 @@ fn replace_subtree(
     nvars: usize,
     ops: &[Op],
     aggs: Option<&AggTable>,
+    balanced: bool,
 ) {
     let old = structural_hash(t);
     let depth = if rng.next_f64() < 0.625 { 2 } else { 1 };
@@ -1630,7 +1811,7 @@ fn replace_subtree(
         let cand = if ops.is_empty() {
             different_leaf(t)
         } else {
-            random_tree_with(rng, nvars, ops, depth, aggs)
+            random_tree_opts(rng, nvars, ops, depth, aggs, balanced)
         };
         if structural_hash(&cand) != old {
             *t = cand;
@@ -1638,6 +1819,51 @@ fn replace_subtree(
         }
     }
     *t = different_leaf(t);
+}
+
+/// Wrap `t` in a random operator, `o(t, new...)`, the other operands being
+/// random terminals.
+fn insert_operator(t: &mut Node, rng: &mut Mt, nvars: usize, ops: &[Op]) {
+    let cands: Vec<Op> = ops.iter().copied().filter(|&o| insertable(o, t)).collect();
+    if cands.is_empty() {
+        return;
+    }
+    let op = cands[rng.usize_below(cands.len())];
+    let arity = op.arity();
+    let slot = rng.usize_below(arity);
+    let site = std::mem::replace(t, constant(0.0));
+    let mut site = Some(site);
+    let kids = (0..arity)
+        .map(|i| {
+            if i == slot {
+                site.take().expect("the site is placed once")
+            } else {
+                random_terminal(rng, nvars)
+            }
+        })
+        .collect();
+    *t = node(op, kids);
+}
+
+/// Replace `t` by one of its children, chosen uniformly.
+fn delete_operator(t: &mut Node, rng: &mut Mt) {
+    if t.kids.is_empty() {
+        return;
+    }
+    let i = rng.usize_below(t.kids.len());
+    let child = std::mem::replace(&mut t.kids[i], constant(0.0));
+    *t = child;
+}
+
+/// `o1(a, o2(b, c))` becomes `o2(o1(a, b), c)`.
+fn rotate_tree(t: &mut Node) {
+    let o1 = t.op;
+    let mut q = t.kids.pop().expect("a rotate site is binary");
+    let a = t.kids.pop().expect("a rotate site is binary");
+    let o2 = q.op;
+    let c = q.kids.pop().expect("a rotate child is binary");
+    let b = q.kids.pop().expect("a rotate child is binary");
+    *t = node(o2, vec![node(o1, vec![a, b]), c]);
 }
 
 /// In-place mutation: point-change an operator, perturb a constant, or replace a
@@ -1662,23 +1888,34 @@ pub fn mutate_with(
     ops: &[Op],
     aggs: Option<&AggTable>,
 ) {
+    mutate_with_opts(n, rng, nvars, ops, aggs, &VariationOpts::default());
+}
+
+/// [`mutate_with`] with the edit weights and tree draw of `opts`. Returns the
+/// kind that changed the tree, or `None` when only the last-resort leaf
+/// replacement (or nothing, for an empty tree) applied.
+pub fn mutate_with_opts(
+    n: &mut Node,
+    rng: &mut Mt,
+    nvars: usize,
+    ops: &[Op],
+    aggs: Option<&AggTable>,
+    opts: &VariationOpts,
+) -> Option<EditKind> {
     let total = complexity(n);
     if total == 0 {
-        return;
+        return None;
     }
     let before = structural_hash(n);
-    let r = rng.next_f64();
-    let drawn = if r < 0.25 {
-        EditKind::Point
-    } else if r < 0.6 {
-        EditKind::Terminal
-    } else {
-        EditKind::Subtree
-    };
+    let drawn = draw_kind(rng.next_f64(), &opts.mix);
     let order: &[EditKind] = match drawn {
         EditKind::Point => &[EditKind::Point, EditKind::Subtree],
         EditKind::Terminal => &[EditKind::Terminal, EditKind::Point, EditKind::Subtree],
         EditKind::Subtree => &[EditKind::Subtree, EditKind::Point, EditKind::Terminal],
+        EditKind::Insert => &[EditKind::Insert, EditKind::Subtree, EditKind::Point, EditKind::Terminal],
+        EditKind::Delete => &[EditKind::Delete, EditKind::Subtree, EditKind::Point, EditKind::Terminal],
+        EditKind::Swap => &[EditKind::Swap, EditKind::Subtree, EditKind::Point, EditKind::Terminal],
+        EditKind::Rotate => &[EditKind::Rotate, EditKind::Subtree, EditKind::Point, EditKind::Terminal],
     };
     for &kind in order {
         let sites = mutation_sites(n, kind, nvars, ops);
@@ -1690,7 +1927,11 @@ pub fn mutate_with(
             match kind {
                 EditKind::Point => change_operator(t, rng, nvars, ops, aggs),
                 EditKind::Terminal => change_terminal(t, rng, nvars),
-                EditKind::Subtree => replace_subtree(t, rng, nvars, ops, aggs),
+                EditKind::Subtree => replace_subtree(t, rng, nvars, ops, aggs, opts.balanced),
+                EditKind::Insert => insert_operator(t, rng, nvars, ops),
+                EditKind::Delete => delete_operator(t, rng),
+                EditKind::Swap => t.kids.swap(0, 1),
+                EditKind::Rotate => rotate_tree(t),
             }
         }
         // A structural edit anywhere below a meta node invalidates its cache.
@@ -1699,13 +1940,14 @@ pub fn mutate_with(
         // (or replaced the node with a malformed child).
         refresh_aggregates(n, aggs);
         if structural_hash(n) != before {
-            return;
+            return Some(kind);
         }
     }
     // Every kind fell through, or an aggregate repair undid the edit. Replacing
     // the root with a different constant cannot be a no-op.
     let leaf = different_leaf(n);
     *n = leaf;
+    None
 }
 
 /// Replace a random subtree of `a` with a random subtree of `b` (crossover). [I]
@@ -1715,13 +1957,55 @@ pub fn crossover(a: &mut Node, b: &Node, rng: &mut Mt) {
 
 /// [`crossover`] with the training-sample aggregate table.
 pub fn crossover_with(a: &mut Node, b: &Node, rng: &mut Mt, aggs: Option<&AggTable>) {
+    crossover_with_opts(a, b, rng, aggs, 0.0)
+}
+
+/// Pre-order positions of the internal nodes of `n`.
+fn internal_sites(n: &Node) -> Vec<usize> {
+    fn walk(n: &Node, i: &mut usize, out: &mut Vec<usize>) {
+        if !n.kids.is_empty() {
+            out.push(*i);
+        }
+        *i += 1;
+        for k in &n.kids {
+            walk(k, i, out);
+        }
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    walk(n, &mut i, &mut out);
+    out
+}
+
+/// A cut point: an internal node with probability `internal` when the tree has
+/// one, else uniform over all nodes. `internal == 0` draws exactly as the
+/// uniform crossover does.
+fn cut_point(n: &Node, total: usize, rng: &mut Mt, internal: f64) -> usize {
+    if internal > 0.0 && rng.bool(internal) {
+        let sites = internal_sites(n);
+        if !sites.is_empty() {
+            return sites[rng.usize_below(sites.len())];
+        }
+    }
+    rng.usize_below(total)
+}
+
+/// [`crossover_with`] with `--crossover-internal`: the probability that each
+/// cut point is an internal node.
+pub fn crossover_with_opts(
+    a: &mut Node,
+    b: &Node,
+    rng: &mut Mt,
+    aggs: Option<&AggTable>,
+    internal: f64,
+) {
     let ta = complexity(a);
     let tb = complexity(b);
     if ta == 0 || tb == 0 {
         return;
     }
-    let ia = rng.usize_below(ta);
-    let ib = rng.usize_below(tb);
+    let ia = cut_point(a, ta, rng, internal);
+    let ib = cut_point(b, tb, rng, internal);
     if let Some(sub) = nth(b, ib).cloned() {
         if let Some(t) = nth_mut(a, ia) {
             *t = sub;
@@ -1860,6 +2144,17 @@ pub fn same(a: &Node, b: &Node) -> bool {
         && a.kids.len() == b.kids.len()
         && a.kids.iter().zip(&b.kids).all(|(x, y)| same(x, y))
         && a.block == b.block
+}
+
+/// #477: whether the tree can depend on the row: an `Input` occurs outside
+/// every aggregate and meta operator. Aggregates and meta operators evaluate to
+/// constants, and a user-defined block is assumed to read the row.
+pub fn row_dependent(n: &Node) -> bool {
+    match n.op {
+        Op::Input => true,
+        op if op.is_agg() || op.is_meta() => false,
+        _ => n.block.is_some() || n.kids.iter().any(row_dependent),
+    }
 }
 
 /// FNV-1a structural hash, for de-duplicating equivalent candidates before
@@ -2756,6 +3051,20 @@ pub fn denormalize(n: &Node, means: &[f64], stds: &[f64]) -> Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_dependent_rules() {
+        let x1 = || input(0);
+        let x2 = || input(1);
+        let mean = || aggregate(AggKind::Mean, Some(0), 0.5);
+        assert!(row_dependent(&x1()));
+        assert!(!row_dependent(&node(Op::Exp, vec![constant(1.3)])));
+        let m = node(Op::Add, vec![mean(), constant(0.2)]);
+        assert!(!row_dependent(&m));
+        let m = node(Op::Mul, vec![mean(), x2()]);
+        assert!(row_dependent(&m));
+        assert!(!row_dependent(&meta(Op::Complexity, x1())));
+    }
 
     /// Bit-exact value equality except that all NaNs compare equal.
     fn same_value(a: f64, b: f64) -> bool {
