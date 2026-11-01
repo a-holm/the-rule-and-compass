@@ -53,7 +53,7 @@ pub fn xs_rank(values: &[f64], time: &[i64], min_members: usize) -> (Vec<f64>, u
     let mut out = vec![f64::NAN; values.len()];
     let mut order: Vec<usize> = (0..values.len().min(time.len())).filter(|&i| values[i].is_finite()).collect();
     order.sort_by(|&a, &b| time[a].cmp(&time[b]).then_with(|| values[a].total_cmp(&values[b])).then_with(|| a.cmp(&b)));
-    let need = 2;
+    let need = min_members.max(2);
     let mut thin = 0usize;
     let mut start = 0usize;
     while start < order.len() {
