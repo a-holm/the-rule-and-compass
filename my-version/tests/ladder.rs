@@ -280,6 +280,7 @@ fn the_report_is_deterministic() {
     let a = run(&f, &o).json();
     let mut b = run(&f, &o).json();
     let strip = |s: &str| {
+        let s = &s[..s.find(",\"ledger\":").unwrap()];
         let mut out = String::new();
         let mut rest = s;
         while let Some(i) = rest.find("\"wall_seconds\":") {
@@ -361,6 +362,7 @@ fn one_command_reproduces_the_table() {
     let first = run_cli();
     assert_eq!(first.status.code(), Some(0), "{}", String::from_utf8_lossy(&first.stderr));
     let json = std::fs::read_to_string(&out).unwrap();
+    ledger::check(&json, "ladder", &["io", "pnl"]);
     assert!(json.contains("\"schema\":\"rcsr-ladder/1\""));
     for name in ["cash", "buy_and_hold", "equal_weight_universe", "zero_param", "ols_ridge", "gbm", "top_tercile_long"] {
         assert!(json.contains(&format!("\"name\":\"{}\"", name)), "{name} missing");
@@ -369,4 +371,15 @@ fn one_command_reproduces_the_table() {
 
     let missing = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(["ladder", "--data", "x.csv"]).output().unwrap();
     assert_eq!(missing.status.code(), Some(2));
+}
+
+#[path = "common/ledger.rs"]
+mod ledger;
+
+#[test]
+fn the_json_carries_a_phase_ledger_with_the_pnl_stage() {
+    let f = fixture(11);
+    let report = run(&f, &options(&f));
+    let l = ledger::check(&report.json(), "ladder", &["pnl"]);
+    assert_eq!(l.busy, 0.0, "the ladder has no device work");
 }

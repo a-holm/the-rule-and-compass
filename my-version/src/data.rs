@@ -1575,6 +1575,10 @@ pub struct SplitSpec {
     /// #263: the columns a long/flat P&L objective reads. `None` builds no
     /// trading rows.
     pub trading: Option<TradingColumns>,
+    /// #469: sort the training rows by (group, time, row) after the centre and
+    /// scale statistics are computed, so every train-aligned output is in
+    /// canonical order.
+    pub canonical_train_order: bool,
 }
 
 impl Default for SplitSpec {
@@ -1596,6 +1600,7 @@ impl Default for SplitSpec {
             purge_seconds: None,
             scale_column: None,
             trading: None,
+            canonical_train_order: false,
         }
     }
 }
@@ -1709,6 +1714,8 @@ pub struct TradingColumns {
     /// returns (`exp_m1`).
     pub log_returns: bool,
     pub funding_column: Option<String>,
+    /// #469: also build the training slice.
+    pub train: bool,
 }
 
 /// One slice of the trading rows, aligned with the sample rows.
@@ -1718,9 +1725,31 @@ pub struct TradingSlice {
     pub ret: Vec<f64>,
 }
 
+impl TradingSlice {
+    /// Refuses rows whose return is non-finite while the target is finite.
+    pub fn check_finite_returns(&self, target: &[f64]) -> Result<(), String> {
+        let bad = self
+            .ret
+            .iter()
+            .zip(target)
+            .filter(|(r, y)| !r.is_finite() && y.is_finite())
+            .count();
+        if bad > 0 {
+            return Err(format!(
+                "{} training rows have a non-finite return but a finite target",
+                bad
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Trading rows of the validation slice and the pooled test block (#263).
 #[derive(Clone, Debug, Default)]
 pub struct TradingSplit {
+    /// Training rows, aligned with `Prepared::train`. `Some` exactly when
+    /// `TradingColumns::train` is set.
+    pub train: Option<TradingSlice>,
     pub validation: Option<TradingSlice>,
     pub test: TradingSlice,
 }
@@ -1956,6 +1985,23 @@ pub struct Filter {
     pub expression: String,
 }
 
+/// Store columns a row expression reads, in order of first use. `Err` carries
+/// the parse error when the expression does not parse against `names`.
+pub fn row_expr_columns(src: &str, names: &[String]) -> Result<Vec<String>, String> {
+    fn walk(node: &Node, out: &mut Vec<usize>) {
+        if node.op == crate::expr::Op::Input && !out.contains(&(node.val as usize)) {
+            out.push(node.val as usize);
+        }
+        for k in &node.kids {
+            walk(k, out);
+        }
+    }
+    let tree = crate::expr::parse(src, names).map_err(|e| e.to_string())?;
+    let mut idx = Vec::new();
+    walk(&tree, &mut idx);
+    Ok(idx.into_iter().map(|i| names[i].clone()).collect())
+}
+
 /// Opt-in data preparation. Every default reproduces the behaviour before
 /// issue #2: no filling, no outlier removal, no smoothing, mean/std
 /// normalisation and no row filter.
@@ -2031,6 +2077,8 @@ pub struct PrepReport {
     pub memory_estimate: Option<CsvEstimate>,
     /// #112: the header-derived store estimate. `None` for a CSV source.
     pub store_estimate: Option<crate::memory::MemoryEstimate>,
+    /// #490: `on` when the store read was projected, else the reason it was not.
+    pub store_projection: Option<String>,
     /// #112: `Some(true)` when the full store/CSV rows were used, `Some(false)`
     /// for an explicit `--sample-rows` sample, `None` when not a store.
     pub full_rows: Option<bool>,
@@ -2058,6 +2106,7 @@ impl Default for PrepReport {
             time_converted: 0,
             memory_estimate: None,
             store_estimate: None,
+            store_projection: None,
             full_rows: None,
             sampled_rows: None,
         }
@@ -2225,6 +2274,7 @@ impl PrepReport {
                  \"directory_bytes\":{},\"group_buffer_bytes\":{},\"search_bytes\":{},\
                  \"fit_copy_bytes\":{},\"ring_bytes\":{},\"device_tile_bytes\":{},\
                  \"fixed_bytes\":{},\"slack_bytes\":{},\"saturated\":{},\
+                 \"projection\":\"{}\",\
                  \"basis\":\"store header: dtypes + row groups + projection\"}}",
                 m.total_bytes,
                 m.rows,
@@ -2241,7 +2291,8 @@ impl PrepReport {
                 m.device_tile_bytes,
                 m.fixed_bytes,
                 m.slack_bytes,
-                m.saturated
+                m.saturated,
+                self.store_projection.as_deref().unwrap_or("none")
             ),
             None => "null".to_string(),
         };
@@ -3276,6 +3327,17 @@ fn prepare_full_targets_weighted_inner(
         s
     };
 
+    if spec.canonical_train_order {
+        let gid: Option<Vec<usize>> = spec.group_col.map(|gc| group_ids(filtered, gc).0);
+        let tkeys = spec.time_col.map(|tc| time_keys(filtered, tc));
+        train_idx.sort_by(|&a, &b| {
+            let ga = gid.as_ref().map_or(0, |g| g[a]);
+            let gb = gid.as_ref().map_or(0, |g| g[b]);
+            ga.cmp(&gb)
+                .then_with(|| tkeys.as_ref().map_or(std::cmp::Ordering::Equal, |k| k.cmp(a, b)))
+                .then(a.cmp(&b))
+        });
+    }
     let train = make(&train_idx);
     let validation = if validation_idx.is_empty() {
         None
@@ -3345,8 +3407,10 @@ fn prepare_full_targets_weighted_inner(
             cols,
             spec,
             filtered,
+            &train_idx,
             &validation_idx,
             &test_idx,
+            &train,
             validation.as_ref(),
             &test,
         )?),
@@ -3404,6 +3468,7 @@ fn prepare_full_targets_weighted_inner(
             time_converted: hazards.converted,
             memory_estimate: None,
             store_estimate: None,
+            store_projection: None,
             full_rows: None,
             sampled_rows: None,
         },
@@ -4310,8 +4375,10 @@ fn build_trading(
     cols: &TradingColumns,
     spec: &SplitSpec,
     filtered: &Table,
+    train_idx: &[usize],
     validation_idx: &[usize],
     test_idx: &[usize],
+    train: &Sample,
     validation: Option<&Sample>,
     test: &Sample,
 ) -> Result<TradingSplit, String> {
@@ -4363,6 +4430,7 @@ fn build_trading(
         }
     };
     Ok(TradingSplit {
+        train: cols.train.then(|| slice(train_idx, train)),
         validation: validation.map(|v| slice(validation_idx, v)),
         test: slice(test_idx, test),
     })
@@ -5557,5 +5625,161 @@ mod tests {
             1,
             "a mutating fill needs one mutable copy"
         );
+    }
+
+    /// Rows `t,g,x,r,s,y` with `x` = row id. Time-major interleaves the three
+    /// groups; symbol-major lists each group's rows together.
+    fn trading_fixture(time_major: bool) -> Table {
+        let (groups, steps) = (3usize, 50usize);
+        let mut s = String::from("t,g,x,r,s,y\n");
+        let mut id = 0;
+        let mut push = |s: &mut String, g: usize, step: usize| {
+            s.push_str(&format!(
+                "{},g{},{},{},{},{}\n",
+                step,
+                g,
+                id,
+                0.001 * ((id * 7) % 11) as f64 - 0.004,
+                1 + id % 5,
+                (id as f64).sin()
+            ));
+            id += 1;
+        };
+        if time_major {
+            for step in 0..steps {
+                for g in 0..groups {
+                    push(&mut s, g, step);
+                }
+            }
+        } else {
+            for g in 0..groups {
+                for step in 0..steps {
+                    push(&mut s, g, step);
+                }
+            }
+        }
+        table(&s)
+    }
+
+    fn trading_spec(canonical: bool, train: bool, t: &Table) -> SplitSpec {
+        SplitSpec {
+            mode: SplitMode::Temporal,
+            time_col: Some(t.index_of("t").unwrap()),
+            group_col: Some(t.index_of("g").unwrap()),
+            test_frac: 0.2,
+            scale_column: Some("s".into()),
+            trading: Some(TradingColumns {
+                return_column: Some("r".into()),
+                log_returns: true,
+                funding_column: None,
+                train,
+            }),
+            canonical_train_order: canonical,
+            ..Default::default()
+        }
+    }
+
+    fn prepare_trading(t: &Table, spec: &SplitSpec) -> Prepared {
+        let vars = vec!["x".to_string()];
+        prepare_full_targets_weighted_with_indices(
+            t,
+            &vars,
+            &["y"],
+            None,
+            spec,
+            &mut Mt::new(3),
+            &PrepSpec::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn train_trading_slice_exists_only_when_requested_and_aligns() {
+        let t = trading_fixture(true);
+        let off = prepare_trading(&t, &trading_spec(false, false, &t));
+        assert!(off.trading.unwrap().train.is_none());
+        let p = prepare_trading(&t, &trading_spec(false, true, &t));
+        let slice = p.trading.as_ref().unwrap().train.as_ref().unwrap();
+        let n = p.train.y.len();
+        assert_eq!(slice.ret.len(), n);
+        assert_eq!(slice.rows.time.len(), n);
+        assert_eq!(slice.rows.group.len(), n);
+        let r = t.col(t.index_of("r").unwrap()).to_vec();
+        let tt = t.col(t.index_of("t").unwrap()).to_vec();
+        for (k, &row) in p.train_indices.iter().enumerate() {
+            let id = (p.train.x[k][0] * p.stds[0] + p.means[0]).round() as usize;
+            assert_eq!(id, row);
+            assert_eq!(slice.ret[k], r[row].exp_m1());
+            assert_eq!(slice.rows.time[k], tt[row]);
+            assert_eq!(slice.rows.group[k], (row % 3) as u64);
+        }
+    }
+
+    #[test]
+    fn canonical_order_permutes_every_train_output_together() {
+        let t = trading_fixture(true);
+        let plain = prepare_trading(&t, &trading_spec(false, true, &t));
+        assert!(!plain.trading.as_ref().unwrap().train.as_ref().unwrap().rows.is_canonical());
+        let p = prepare_trading(&t, &trading_spec(true, true, &t));
+        let slice = p.trading.as_ref().unwrap().train.as_ref().unwrap();
+        assert!(slice.rows.is_canonical());
+        assert_eq!(p.train_indices.len(), plain.train_indices.len());
+        let mut a = p.train_indices.clone();
+        let mut b = plain.train_indices.clone();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+
+        let col = |n: &str| t.col(t.index_of(n).unwrap()).to_vec();
+        let (tt, s, r) = (col("t"), col("s"), col("r"));
+        let idx = &p.train_indices;
+        for (k, &row) in idx.iter().enumerate() {
+            let id = (p.train.x[k][0] * p.stds[0] + p.means[0]).round() as usize;
+            assert_eq!(id, row);
+            assert_eq!(p.train.y[k], (row as f64).sin());
+            assert_eq!(p.target_scale.as_ref().unwrap().train[k], s[row]);
+            assert_eq!(p.keys.as_ref().unwrap().train[k], tt[row]);
+            assert_eq!(slice.ret[k], r[row].exp_m1());
+        }
+        let gids = group_ids(&t, t.index_of("g").unwrap()).0;
+        let mut order: Vec<usize> = (0..t.len()).collect();
+        order.sort_by(|&a, &b| tt[a].partial_cmp(&tt[b]).unwrap().then(a.cmp(&b)));
+        let prev = row_predecessors(t.len(), Some(&order), Some(&gids));
+        assert_eq!(p.slope_pairs.train, adjacent_pairs(idx, &prev));
+    }
+
+    #[test]
+    fn canonical_order_keeps_statistics_bit_identical() {
+        let t = trading_fixture(true);
+        let plain = prepare_trading(&t, &trading_spec(false, true, &t));
+        let p = prepare_trading(&t, &trading_spec(true, true, &t));
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&p.means), bits(&plain.means));
+        assert_eq!(bits(&p.stds), bits(&plain.stds));
+    }
+
+    #[test]
+    fn canonical_order_is_a_no_op_on_a_symbol_major_store() {
+        let t = trading_fixture(false);
+        let group_split = |canonical| SplitSpec {
+            mode: SplitMode::Group,
+            test_frac: 0.2,
+            ..trading_spec(canonical, true, &t)
+        };
+        let plain = prepare_trading(&t, &group_split(false));
+        let p = prepare_trading(&t, &group_split(true));
+        assert!(plain.train_indices.len() > 50);
+        assert_eq!(p.train_indices, plain.train_indices);
+        assert!(p.trading.unwrap().train.unwrap().rows.is_canonical());
+    }
+
+    #[test]
+    fn check_finite_returns_names_the_count() {
+        let slice = TradingSlice {
+            rows: Default::default(),
+            ret: vec![0.1, f64::NAN, f64::NAN, 0.2],
+        };
+        assert!(slice.check_finite_returns(&[1.0, f64::NAN, 1.0, 1.0]).unwrap_err().starts_with("1 "));
+        assert!(slice.check_finite_returns(&[1.0, f64::NAN, f64::NAN, 1.0]).is_ok());
     }
 }

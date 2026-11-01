@@ -471,6 +471,10 @@ say about a new one; a whole-group split exposes it immediately.
 * `tests/dtypes.rs::categorical_expands_to_sorted_one_hot_indicators` (shows what
   the flag actually creates, so its use is deliberate).
 
+### Canonical training order
+
+A per-row P&L book needs each group's rows contiguous and time-ordered. `data::SplitSpec::canonical_train_order` sorts the training rows by (group id, time key, table row) after the centre and scale statistics are computed, so `means` and `stds` do not change. Every train-aligned output (`train`, `keys.train`, `target_scale.train`, `slope_pairs.train`, `trading.train`, `train_indices`) follows the sorted order. A temporal split returns training rows in time order, so a store of any layout needs the flag; a split that keeps table order on a symbol-major store is unchanged by it. `data::TradingColumns::train` builds `TradingSplit.train`; `TradingRows::is_canonical` checks the order and `TradingRows::seam_flags` marks the first and last row of each group. The flag is library-only: no CLI option sets it yet.
+
 ### Per-group reporting
 
 The engine reports global test error and the number of groups in train/test, not

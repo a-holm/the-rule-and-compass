@@ -42,7 +42,7 @@ fn tiny_suite_runs_end_to_end_and_reports_a_recovery_rate() {
         report
             .results
             .iter()
-            .any(|r| r.problem == "line" && r.noise == 0.0 && r.recovered),
+            .any(|r| r.problem == "line" && r.noise == Some(0.0) && r.recovered),
         "the line problem was not recovered on noiseless data"
     );
 

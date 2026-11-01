@@ -1087,6 +1087,22 @@ complexity) in text or with `--json`, and a run is reproducible from `--seed`.
 See [`docs/benchmarks.md`](docs/benchmarks.md) for the criterion, the problem
 list and the recorded results.
 
+Two more suites make the bench able to rank a search change. `--suite hard` holds
+20 harder laws (Nguyen, Keijzer, Vladislavleva, Pagie, Korns, Feynman) and
+`--suite signal` holds 3 finance-like low-SNR tasks with Student-t noise,
+distractor columns and autocorrelated inputs. The oracle criterion
+(`oracle_recovered`) demands what the true structure can reach on the training
+rows, `hit_s` and `hit_evals` give the time to the first recovery, and
+`--seeds 1-10` repeats every run. `--ndjson` streams one JSON line per run, and
+`rcsr-bench compare` pairs two result sets by seed and gives Wilson intervals
+and an exact McNemar p-value:
+
+```sh
+cargo run --release --bin rcsr-bench -- --suite hard --noise 0 --seeds 1-3 --cpu --ndjson > base.ndjson
+cargo run --release --bin rcsr-bench -- --suite hard --noise 0 --seeds 1-3 --cpu --patience 20 --ndjson > treat.ndjson
+cargo run --release --bin rcsr-bench -- compare --base base.ndjson --treat treat.ndjson --criterion oracle_recovered
+```
+
 ## Features
 
 - expression trees over a broad primitive set (`+ - * / ^`, `exp ln sqrt abs
@@ -1371,20 +1387,23 @@ my-version/
     metrics.rs    error metrics
     pareto.rs     the error/complexity Pareto front
     data.rs       table loading, split modes, normalisation
-    bench.rs      known-truth benchmark suite: problems, generators, scoring
+    bench.rs      benchmark runner: known-truth problems, generators, scoring, reports
+    bench_suites.rs  the hard and signal suites
+    bench_stats.rs   Wilson, McNemar, front hypervolume, NDJSON reader, compare
     search.rs     island-model GP loop
     gpu.rs        bytecode compiler + FFI for the optional GPU evaluator
     cuda/eval.cu  the CUDA kernel
     main.rs       the `rcsr` CLI
     bin/
       gpu_bench.rs  GPU vs CPU evaluation benchmark (--features cuda)
-      rcsr_bench.rs the `rcsr-bench` known-truth benchmark harness
+      rcsr_bench.rs the `rcsr-bench` benchmark harness and `compare` command
   tests/
     recover.rs    end-to-end recovery tests + unit tests
     split.rs      split-mode tests (temporal, group, panel, folds)
     prep.rs       data-preparation tests (fill, outliers, smoothing, scaling, filters)
     weights.rs    row weights, weighted metrics and weighted least squares
     bench.rs      known-truth benchmark harness tests
+    bench_cli.rs  rcsr-bench NDJSON, multi-seed and compare tests
   examples/
     line.csv, sine.csv
 ```
