@@ -1,5 +1,4 @@
-//! Add-on            if let Some(d) = &declared {
-                crate::lockbox::write_sidecar_with(out, &d.lockbox, "rcsr ablation prepare", &format!(",\"segments\":{{\"before\":{},\"locked\":{},\"after\":{}}}", segments[0], segments[1], segments[2])).map_err(|e| (3, e))?;-family ablation: arm definitions, manifests, null columns, scoring
+//! Add-one-family ablation: arm definitions, manifests, null columns, scoring
 //! of a finished search run, and the pre-committed ship/drop verdict.
 //!
 //! The definition file (`protocol/ablation.json`) is committed before any run.
@@ -45,8 +44,8 @@
 use crate::data::{self, Table};
 use crate::devlog::Json;
 use crate::inference::{self, Dsr, Pbo, Spa};
-use crate::lockbox::Lockbox;
 use crate::ladder::{self, jnum, jstr, Fold, Input, Options, Panel};
+use crate::lockbox::Lockbox;
 use crate::manifest::sha256_hex;
 use crate::protocol;
 use crate::rng::Mt;
@@ -384,13 +383,7 @@ pub fn placebo_column(template: &[f64], groups: &[u64], seed: u32, k: u64) -> Ve
     let n = template.len();
     let mut sorted: Vec<f64> = template.iter().copied().filter(|v| v.is_finite()).collect();
     sorted.sort_by(|a, b| a.total_cmp(b));
-    let finite: Vec<usize> = (0..n).filter(|&i    let segs: Vec<u8> = order.iter().map(|&i| segment_of(time[i], inp.locked.as_ref())).collect();
-    let mut seg_rows = [0usize; 3];
-    for &s in &segs {
-        seg_rows[s as usize] += 1;
-    }
-    let seg_groups = segment_keys(&groups, &segs);
-| template[i].is_finite()).collect();
+    let finite: Vec<usize> = (0..n).filter(|&i| template[i].is_finite()).collect();
     let build = |rho: f64| -> Vec<f64> {
         let innov = (1.0 - rho * rho).sqrt();
         let mut z = vec![0.0f64; n];
@@ -497,8 +490,8 @@ pub struct PrepareInput<'a> {
     /// Extra columns copied through (target, return, scale).
     pub keep: &'a [String],
     pub seed: u32,
-    /// Declared locked test: null columns are built per segment (before, inside,
-    /// after) so no locked value reaches a development row.
+    /// Declared locked test: null columns are built per segment (before,
+    /// inside, after) so no locked value reaches a development row.
     pub locked: Option<Lockbox>,
 }
 
@@ -531,8 +524,8 @@ pub fn placebo_column_segmented(template: &[f64], groups: &[u64], segs: &[u8], s
         }
         let tpl: Vec<f64> = idx.iter().map(|&i| template[i]).collect();
         let g: Vec<u64> = idx.iter().map(|&i| groups[i]).collect();
-        for (j, v) in idx.iter().zip(placebo_column(&tpl, &g, seed, k)) {
-            out[*j] = v;
+        for (&j, v) in idx.iter().zip(placebo_column(&tpl, &g, seed, k)) {
+            out[j] = v;
         }
     }
     out
@@ -575,6 +568,12 @@ pub fn prepare_csv_segments(inp: &PrepareInput) -> Result<(String, [usize; 3]), 
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| gid[a].cmp(&gid[b]).then_with(|| time[a].total_cmp(&time[b])).then_with(|| a.cmp(&b)));
     let groups: Vec<u64> = order.iter().map(|&i| gid[i]).collect();
+    let segs: Vec<u8> = order.iter().map(|&i| segment_of(time[i], inp.locked.as_ref())).collect();
+    let mut seg_rows = [0usize; 3];
+    for &s in &segs {
+        seg_rows[s as usize] += 1;
+    }
+    let seg_groups = segment_keys(&groups, &segs);
 
     let real = def.real_columns();
     let mut copied: Vec<String> = vec![inp.time.to_string(), inp.group.to_string()];
@@ -1736,8 +1735,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             .map_err(|e| (3, e))?;
             let out = fl.need("--out")?;
             std::fs::write(out, csv).map_err(|e| io_err(out, e))?;
-            if let Some(d) = crate::lockbox::resolve_declared(fl.opt("--lockbox"), data).map_err(|e| (2, format!("--lockbox: {}", e)))? {
-                crate::lockbox::write_sidecar(out, &d.lockbox, "rcsr ablation prepare").map_err(|e| (3, e))?;
+            if let Some(d) = &declared {
+                let seg = format!(",\"segments\":{{\"before\":{},\"locked\":{},\"after\":{}}}", segments[0], segments[1], segments[2]);
+                crate::lockbox::write_sidecar_with(out, &d.lockbox, "rcsr ablation prepare", &seg).map_err(|e| (3, e))?;
             }
             println!("wrote {}", out);
             Ok(())
