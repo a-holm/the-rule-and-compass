@@ -91,7 +91,7 @@ fn column_index(store: &FileStore, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("{}: no column '{}'", store.path(), name))
 }
 
-fn read_ts(store: &FileStore) -> Result<Vec<i64>, String> {
+pub(crate) fn read_ts(store: &FileStore) -> Result<Vec<i64>, String> {
     let t = column_index(store, "ts")?;
     let h = store.header();
     let mut ts = Vec::with_capacity(store.n_rows());
@@ -105,7 +105,7 @@ fn read_ts(store: &FileStore) -> Result<Vec<i64>, String> {
     Ok(ts)
 }
 
-fn read_column(store: &FileStore, name: &str) -> Result<Vec<f64>, String> {
+pub(crate) fn read_column(store: &FileStore, name: &str) -> Result<Vec<f64>, String> {
     let c = column_index(store, name)?;
     if store.header().dtypes()[c] != DType::F64 {
         return Err(format!("{}: column '{}' is not numeric f64", store.path(), name));

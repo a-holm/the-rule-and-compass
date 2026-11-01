@@ -29,8 +29,8 @@
 //!
 //! * [`compile`] returns `None` for an operator outside [`supports`], so the
 //!   caller can fall back to the scalar walk instead of getting wrong numbers.
-//! * [`eval_batch`] chooses AVX at runtime ([`avx_available`]) and otherwise
-//!   uses the portable scalar SoA loop.
+//! * [`eval_batch`] runs the column-tile kernel; the AVX build is chosen at
+//!   runtime ([`avx_available`]) and the same loops are the portable build.
 //! * [`eval_batch_scalar`] is the portable loop explicitly, for measurements.
 //! * [`sse`] is a small convenience for benchmarks.
 //!
@@ -51,25 +51,26 @@
 //! `ln(x <= 0) = NaN`, `div(|b| < 1e-12) = NaN`, `sqrt(x < 0) = NaN`,
 //! `pow(negative, non-integer) = NaN`), so supported trees agree numerically.
 //!
-//! # SIMD
+//! # Column tiles
 //!
-//! On `x86_64` the hot loop is written with AVX intrinsics (four `f64` lanes)
-//! behind `#[target_feature(enable = "avx")]`, selected at runtime with
-//! `is_x86_feature_detected!("avx")`. The machine this was developed on has AVX
-//! but no AVX2 and no FMA, so nothing here requires either. Arithmetic
-//! (`add`/`sub`/`mul`/`div`/`neg`/`abs`/`sqrt`/`square`/`cube`/`min`/`max`) and
-//! the `if` select vectorise; the transcendental functions cannot be vectorised
-//! with AVX alone, so they fall back to one scalar `f64` call per lane. The
-//! instruction stream still avoids the pointer walk in every case, and every
-//! value comes from the same `f64` operation as the scalar path.
+//! [`compile`] folds the stream into steps with fixed destination slots, and an
+//! `Input` or `Const` leaf feeding an operator becomes an operand read in
+//! place. [`eval_batch`] runs each step over [`TILE`] rows in one loop. On
+//! `x86_64` the loops are built under `#[target_feature(enable = "avx")]` and
+//! selected at runtime with `is_x86_feature_detected!("avx")`; the same source
+//! is the portable build. Nothing requires AVX2 or FMA. The transcendental
+//! functions stay one scalar `f64` call per row, so every value comes from the
+//! same operation as the scalar path.
 //!
-//! The value stack is allocated once per [`eval_batch`] call, never per row. A
-//! trailing group of fewer than four rows is evaluated by the scalar loop, so
-//! any row count is valid.
+//! [`eval_batch_rows4`] is the previous four-row AVX kernel, kept as the
+//! reference for tests and benchmarks.
+//!
+//! [`eval_batch_into`] takes a caller-owned [`Scratch`] for the tile stack.
+//! Inputs that are missing or shorter than `rows` take the scalar loop.
 
 use crate::expr::{Node, Op};
 
-/// Number of rows processed at once by the AVX kernel.
+/// Number of rows processed at once by the four-row AVX kernel.
 pub const SIMD_WIDTH: usize = 4;
 
 /// A flat postfix instruction. Every instruction pushes one value, after
@@ -133,6 +134,10 @@ pub struct Program {
     stack_depth: usize,
     /// One past the largest input index referenced by the program.
     n_inputs: usize,
+    /// The tile program: leaves folded into operands, destination slots fixed.
+    steps: Vec<Step>,
+    /// Sorted distinct input indices the program reads.
+    inputs: Vec<usize>,
 }
 
 impl Program {
@@ -155,6 +160,73 @@ impl Program {
     pub fn n_inputs(&self) -> usize {
         self.n_inputs
     }
+}
+
+/// Rows per tile of the column kernel.
+pub const TILE: usize = 64;
+
+/// Where a step reads an operand from.
+#[derive(Clone, Copy, Debug)]
+enum Src {
+    /// The stack slot at this operand position. For the first operand this is
+    /// always the destination slot itself.
+    Slot(usize),
+    /// An input column, read in place.
+    Col(usize),
+    /// A constant.
+    Imm(f64),
+}
+
+/// One tile instruction. `a`, `b`, `c` are the operands in postfix order; the
+/// result goes to slot `dst`.
+#[derive(Clone, Copy, Debug)]
+struct Step {
+    ins: Instr,
+    dst: usize,
+    a: Src,
+    b: Src,
+    c: Src,
+}
+
+/// Fold the postfix stream into tile steps. Every instruction writes the slot
+/// of its first operand, which is a compile-time fact, and `Input`/`Const`
+/// leaves become operands instead of steps. A program that is a single leaf
+/// keeps one copy step.
+fn plan(instrs: &[Instr]) -> Vec<Step> {
+    let mut stack: Vec<Src> = Vec::new();
+    let mut steps = Vec::new();
+    for &ins in instrs {
+        match ins {
+            Instr::Const(v) => stack.push(Src::Imm(v)),
+            Instr::Input(v) => stack.push(Src::Col(v)),
+            _ => {
+                let at = stack.len() - ins.arity();
+                let get = |k: usize| stack.get(at + k).copied().unwrap_or(Src::Imm(0.0));
+                let step = Step {
+                    ins,
+                    dst: at,
+                    a: get(0),
+                    b: get(1),
+                    c: get(2),
+                };
+                stack.truncate(at);
+                steps.push(step);
+                stack.push(Src::Slot(at));
+            }
+        }
+    }
+    if steps.is_empty() {
+        if let (Some(&ins), Some(&a)) = (instrs.first(), stack.first()) {
+            steps.push(Step {
+                ins,
+                dst: 0,
+                a,
+                b: Src::Imm(0.0),
+                c: Src::Imm(0.0),
+            });
+        }
+    }
+    steps
 }
 
 /// Map an operator to its instruction, or `None` when this evaluator does not
@@ -215,10 +287,22 @@ pub fn compile(tree: &Node) -> Option<Program> {
     let mut n_inputs = 0usize;
     emit(tree, &mut instrs, &mut depth, &mut max_depth, &mut n_inputs)?;
     debug_assert_eq!(depth, 1, "a complete expression leaves one value");
+    let steps = plan(&instrs);
+    let mut inputs: Vec<usize> = instrs
+        .iter()
+        .filter_map(|i| match i {
+            Instr::Input(v) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    inputs.sort_unstable();
+    inputs.dedup();
     Some(Program {
         instrs,
         stack_depth: max_depth,
         n_inputs,
+        steps,
+        inputs,
     })
 }
 
@@ -474,11 +558,91 @@ pub fn eval_batch_scalar(p: &Program, cols: &[Vec<f64>], rows: usize, out: &mut 
     eval_scalar_rows(p, cols, 0, rows, out);
 }
 
+/// The value stack of the tile kernel, owned by the caller so a worker reuses
+/// it across candidates. It grows on demand and never shrinks.
+#[derive(Debug, Default)]
+pub struct Scratch {
+    stack: Vec<f64>,
+}
+
+impl Scratch {
+    /// An empty scratch; the first evaluation sizes it.
+    pub fn new() -> Self {
+        Scratch::default()
+    }
+
+    /// Current capacity in `f64` values, for tests that count regrowth.
+    pub fn len(&self) -> usize {
+        self.stack.len()
+    }
+
+    /// Whether the scratch has not been sized yet.
+    pub fn is_empty(&self) -> bool {
+        self.stack.is_empty()
+    }
+}
+
 /// Evaluate `program` over `rows` rows, using AVX when the CPU supports it.
 ///
 /// `cols[var][row]` holds the inputs; `out[row]` receives the result. At most
-/// `out.len()` rows are written. Zero rows is a no-op.
+/// `out.len()` rows are written. Zero rows is a no-op. This allocates a fresh
+/// [`Scratch`]; use [`eval_batch_into`] to reuse one.
 pub fn eval_batch(p: &Program, cols: &[Vec<f64>], rows: usize, out: &mut [f64]) {
+    eval_batch_into(p, cols, rows, out, &mut Scratch::new());
+}
+
+/// [`eval_batch`] with a caller-owned [`Scratch`].
+///
+/// The column-tile kernel runs each instruction over [`TILE`] rows in one
+/// loop. Every value comes from the same `f64` operation, in the same order,
+/// as [`eval_batch_rows4`], [`eval_batch_scalar`] and [`crate::expr::eval`].
+/// When an input the program reads is missing or shorter than `rows`, the
+/// portable scalar loop supplies the `NaN` rule.
+pub fn eval_batch_into(
+    p: &Program,
+    cols: &[Vec<f64>],
+    rows: usize,
+    out: &mut [f64],
+    scratch: &mut Scratch,
+) {
+    let rows = rows.min(out.len());
+    if rows == 0 {
+        return;
+    }
+    if p.steps.is_empty() {
+        for v in &mut out[..rows] {
+            *v = f64::NAN;
+        }
+        return;
+    }
+    let covered = p
+        .inputs
+        .iter()
+        .all(|&v| cols.get(v).is_some_and(|c| c.len() >= rows));
+    if !covered {
+        eval_scalar_rows(p, cols, 0, rows, out);
+        return;
+    }
+    let need = p.stack_depth.max(1) * TILE;
+    if scratch.stack.len() < need {
+        scratch.stack.resize(need, 0.0);
+    }
+    let stack = &mut scratch.stack[..need];
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx") {
+            // SAFETY: the feature is detected above and the function is
+            // annotated `target_feature(enable = "avx")`.
+            unsafe { tile::eval_avx(p, cols, rows, out, stack) };
+            return;
+        }
+    }
+    tile::eval(p, cols, rows, out, stack);
+}
+
+/// The four-row AVX kernel: the whole program once per group of four rows.
+/// Kept as the reference [`eval_batch`] is measured and tested against.
+pub fn eval_batch_rows4(p: &Program, cols: &[Vec<f64>], rows: usize, out: &mut [f64]) {
     let rows = rows.min(out.len());
     if rows == 0 {
         return;
@@ -532,6 +696,187 @@ pub fn sse(p: &Program, cols: &[Vec<f64>], rows: usize, y: &[f64]) -> f64 {
         acc += r * r;
     }
     acc
+}
+
+/// The column-tile kernel. Selected by [`eval_batch_into`]; the AVX entry only
+/// changes the code generation of the same source.
+mod tile {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    enum A<'a> {
+        /// The destination itself, updated in place.
+        D,
+        S(&'a [f64]),
+        K(f64),
+    }
+
+    #[derive(Clone, Copy)]
+    enum B<'a> {
+        S(&'a [f64]),
+        K(f64),
+    }
+
+    #[inline(always)]
+    fn at(o: B, i: usize) -> f64 {
+        match o {
+            B::S(s) => s[i],
+            B::K(k) => k,
+        }
+    }
+
+    #[inline(always)]
+    fn un(d: &mut [f64], a: A, f: impl Fn(f64) -> f64) {
+        match a {
+            A::D => {
+                for v in d.iter_mut() {
+                    *v = f(*v);
+                }
+            }
+            A::S(x) => {
+                for (v, &xi) in d.iter_mut().zip(x) {
+                    *v = f(xi);
+                }
+            }
+            A::K(k) => d.fill(f(k)),
+        }
+    }
+
+    #[inline(always)]
+    fn bin(d: &mut [f64], a: A, b: B, f: impl Fn(f64, f64) -> f64) {
+        match (a, b) {
+            (A::D, B::S(y)) => {
+                for (v, &yi) in d.iter_mut().zip(y) {
+                    *v = f(*v, yi);
+                }
+            }
+            (A::D, B::K(k)) => {
+                for v in d.iter_mut() {
+                    *v = f(*v, k);
+                }
+            }
+            (A::S(x), B::S(y)) => {
+                for ((v, &xi), &yi) in d.iter_mut().zip(x).zip(y) {
+                    *v = f(xi, yi);
+                }
+            }
+            (A::S(x), B::K(k)) => {
+                for (v, &xi) in d.iter_mut().zip(x) {
+                    *v = f(xi, k);
+                }
+            }
+            (A::K(k), B::S(y)) => {
+                for (v, &yi) in d.iter_mut().zip(y) {
+                    *v = f(k, yi);
+                }
+            }
+            (A::K(k), B::K(m)) => d.fill(f(k, m)),
+        }
+    }
+
+    /// `if cond > 0 { then } else { else }` per row.
+    #[inline(always)]
+    fn select(d: &mut [f64], a: A, b: B, c: B) {
+        match a {
+            A::D => {
+                for i in 0..d.len() {
+                    d[i] = if d[i] > 0.0 { at(b, i) } else { at(c, i) };
+                }
+            }
+            A::S(x) => {
+                for i in 0..d.len() {
+                    d[i] = if x[i] > 0.0 { at(b, i) } else { at(c, i) };
+                }
+            }
+            A::K(k) => {
+                for i in 0..d.len() {
+                    d[i] = if k > 0.0 { at(b, i) } else { at(c, i) };
+                }
+            }
+        }
+    }
+
+    macro_rules! unary_arms {
+        ($ins:expr, $d:expr, $a:expr, $($op:ident),*) => {
+            match $ins {
+                $(Instr::$op => un($d, $a, |x| apply_unary(Instr::$op, x)),)*
+                _ => {}
+            }
+        };
+    }
+
+    macro_rules! binary_arms {
+        ($ins:expr, $d:expr, $a:expr, $b:expr, $($op:ident),*) => {
+            match $ins {
+                $(Instr::$op => bin($d, $a, $b, |x, y| apply_binary(Instr::$op, x, y)),)*
+                _ => {}
+            }
+        };
+    }
+
+    #[inline(always)]
+    fn run_tile(p: &Program, cols: &[Vec<f64>], base: usize, n: usize, s: &mut [f64]) {
+        for st in &p.steps {
+            let (lo, hi) = s.split_at_mut((st.dst + 1) * TILE);
+            let d = &mut lo[st.dst * TILE..st.dst * TILE + n];
+            let hi: &[f64] = hi;
+            let a = match st.a {
+                Src::Slot(_) => A::D,
+                Src::Col(v) => A::S(&cols[v][base..base + n]),
+                Src::Imm(k) => A::K(k),
+            };
+            let b_of = |src: Src| match src {
+                Src::Slot(j) => B::S(&hi[(j - st.dst - 1) * TILE..(j - st.dst - 1) * TILE + n]),
+                Src::Col(v) => B::S(&cols[v][base..base + n]),
+                Src::Imm(k) => B::K(k),
+            };
+            match st.ins {
+                Instr::Const(_) | Instr::Input(_) => un(d, a, |x| x),
+                Instr::If => select(d, a, b_of(st.b), b_of(st.c)),
+                Instr::Add
+                | Instr::Sub
+                | Instr::Mul
+                | Instr::Div
+                | Instr::Pow
+                | Instr::Min
+                | Instr::Max => {
+                    let b = b_of(st.b);
+                    binary_arms!(st.ins, d, a, b, Add, Sub, Mul, Div, Pow, Min, Max);
+                }
+                _ => unary_arms!(
+                    st.ins, d, a, Neg, Exp, Ln, Abs, Sqrt, Sin, Cos, Tan, Sinh, Cosh, Tanh,
+                    Logistic, Step, Gauss, Square, Cube, Floor, Ceil, Round, Sign
+                ),
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn run(p: &Program, cols: &[Vec<f64>], rows: usize, out: &mut [f64], s: &mut [f64]) {
+        let mut base = 0;
+        while base < rows {
+            let n = TILE.min(rows - base);
+            run_tile(p, cols, base, n, s);
+            out[base..base + n].copy_from_slice(&s[..n]);
+            base += n;
+        }
+    }
+
+    pub(super) fn eval(p: &Program, cols: &[Vec<f64>], rows: usize, out: &mut [f64], s: &mut [f64]) {
+        run(p, cols, rows, out, s);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx")]
+    pub(super) unsafe fn eval_avx(
+        p: &Program,
+        cols: &[Vec<f64>],
+        rows: usize,
+        out: &mut [f64],
+        s: &mut [f64],
+    ) {
+        run(p, cols, rows, out, s);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

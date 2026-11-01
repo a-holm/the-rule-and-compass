@@ -711,6 +711,15 @@ SEARCH:
                              first constant of an island is kept (#477). Saved
                              search setting, off by default
                              and restores the pre-#76 trajectory exactly
+  --prune                    remove neutral code from the final front (off by
+                             default): replace subtrees with a child or a
+                             constant when the training error stays within
+                             1e-6 (1 + |e|) of the original (#466)
+  --no-prune                 keep the prune off (the default)
+  --prune-rows <N>           rows the prune fits on (default 20000, >= 2); a
+                             larger training sample is subsampled
+  --prune-budget <N>         cap on candidate fits per run (default 20000,
+                             0 = no prune)
   --no-simd                  force the scalar tree walk instead of the
                              SoA/AVX evaluator (same results, slower; an
                              escape hatch for debugging and A/B runs)
@@ -729,6 +738,15 @@ SEARCH:
                              selection and archiving. Independent of
                              --predictor-samples
   --patience <N>             stop after N generations without improvement (default 40)
+  --patience-tol <r>         count a generation as no improvement when the best
+                             error fell by at most r relative to itself (scale
+                             free). Default: the 1e-9 rule with a 1+|error|
+                             denominator
+  --stop-on front[:<W>]      stop after W generations (default: --patience) in
+                             which no front member beat the previous front by
+                             more than --patience-tol (default 1e-6) and the
+                             front hypervolume did not rise by that much;
+                             stop_reason front_stable. Off by default
   --time-budget <seconds>    wall-clock limit of this process (default: none).
                              The generation in progress finishes, its progress
                              event and checkpoint are written, and the result
@@ -1863,6 +1881,9 @@ impl DevSink {
             fit_kernel_lm_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_lm_s()),
             fit_kernel_polish_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_polish_s()),
             fit_fallback_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_fallback_s()),
+            prune_fits: outcome.prune.fits,
+            prune_accepted: outcome.prune.accepted,
+            prune_s: outcome.prune.seconds,
             fit_refit_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_s()),
             fit_refits: outcome.gpu.as_ref().map(|g| g.fit_refits),
             events,
@@ -2386,6 +2407,8 @@ fn main() {
     let mut fit_strategy_set = false;
     let mut dedup_set = false;
     let mut patience_set = false;
+    let mut patience_tol_set = false;
+    let mut stop_front_set = false;
     let mut time_budget_set = false;
     let mut predictor_samples_set = false;
     // #85: remember an explicit --fit-samples so a resume can refuse a
@@ -2791,6 +2814,29 @@ fn main() {
                 cfg.fit_fallback_max = val!().parse().unwrap_or(cfg.fit_fallback_max);
                 fit_fallback_max_set = true;
             }
+            // #466: front prune; a post-loop pass, not saved search state.
+            "--prune" => cfg.prune = true,
+            "--no-prune" => cfg.prune = false,
+            "--prune-rows" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n >= 2 => cfg.prune_rows = n,
+                    _ => {
+                        eprintln!("error: --prune-rows needs an integer >= 2, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--prune-budget" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) => cfg.prune_budget = n,
+                    _ => {
+                        eprintln!("error: --prune-budget needs a non-negative integer, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             // #495: relative band of the exact finalist refit.
             "--refit-band" => {
                 let v = val!();
@@ -3091,6 +3137,36 @@ fn main() {
             "--patience" => {
                 cfg.patience = val!().parse().unwrap_or(cfg.patience);
                 patience_set = true;
+            }
+            "--patience-tol" => {
+                let v = val!();
+                match v.parse::<f64>() {
+                    Ok(r) if r.is_finite() && r >= 0.0 => cfg.patience_tol = Some(r),
+                    _ => {
+                        eprintln!("error: --patience-tol needs a number >= 0, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+                patience_tol_set = true;
+            }
+            "--stop-on" => {
+                let v = val!();
+                let window = match v.strip_prefix("front") {
+                    Some("") => Some(0),
+                    Some(rest) => rest
+                        .strip_prefix(':')
+                        .and_then(|w| w.parse::<usize>().ok())
+                        .filter(|w| *w >= 1),
+                    None => None,
+                };
+                match window {
+                    Some(w) => cfg.stop_front = Some(w),
+                    None => {
+                        eprintln!("error: --stop-on needs front or front:<W> with W >= 1, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+                stop_front_set = true;
             }
             "--time-budget" => {
                 cfg.time_budget = val!().parse().ok();
@@ -3480,6 +3556,18 @@ fn main() {
             conflicts.push(format!(
                 "--patience {} (saved {})",
                 cfg.patience, saved.patience
+            ));
+        }
+        if patience_tol_set && cfg.patience_tol != saved.patience_tol {
+            conflicts.push(format!(
+                "--patience-tol {:?} (saved {:?})",
+                cfg.patience_tol, saved.patience_tol
+            ));
+        }
+        if stop_front_set && cfg.stop_front != saved.stop_front {
+            conflicts.push(format!(
+                "--stop-on front {:?} (saved {:?})",
+                cfg.stop_front, saved.stop_front
             ));
         }
         if predictor_samples_set && cfg.predictor_samples != saved.predictor_samples {
@@ -7261,7 +7349,18 @@ fn main() {
             } else {
                 String::new()
             };
-            let search_meta_json = format!("{}{}", predictor_json, fit_json);
+            // #466: omitted unless --prune is given, which keeps the historical JSON.
+            let prune_json = if cfg.prune && cfg.prune_budget > 0 {
+                format!(
+                    "\"prune\":{{\"fits\":{},\"accepted\":{},\"seconds\":{}}},",
+                    outcome.prune.fits,
+                    outcome.prune.accepted,
+                    jnum(outcome.prune.seconds)
+                )
+            } else {
+                String::new()
+            };
+            let search_meta_json = format!("{}{}{}", predictor_json, fit_json, prune_json);
             let checkpoint_json = format!(
                 "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{}}}",
                 resume_path

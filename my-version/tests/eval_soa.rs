@@ -404,3 +404,176 @@ fn sse_matches_a_manual_sum() {
     let got = eval_soa::sse(&compile(&tree).unwrap(), &cols, 97, &y);
     assert!(close(manual, got), "manual {manual:?} vs sse {got:?}");
 }
+
+fn same_bits(a: f64, b: f64) -> bool {
+    a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+}
+
+/// Columns that hit every guard: signed zeros, NaN, infinities, the `div`
+/// and `exp` thresholds, negatives, and non-integer exponents.
+fn special_cols(rows: usize, nvars: usize) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    const POOL: [f64; 16] = [
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        0.5,
+        2.0,
+        -2.5,
+        1e-13,
+        -1e-13,
+        700.5,
+        -700.5,
+        3.0,
+        1e300,
+    ];
+    let mut cols = vec![vec![0.0; rows]; nvars];
+    for (v, col) in cols.iter_mut().enumerate() {
+        for (r, cell) in col.iter_mut().enumerate() {
+            *cell = POOL[(r * (v + 3) + v * 5 + r / 7) % POOL.len()];
+        }
+    }
+    let mut aos = vec![vec![0.0; nvars]; rows];
+    for (r, row) in aos.iter_mut().enumerate() {
+        for (v, cell) in row.iter_mut().enumerate() {
+            *cell = cols[v][r];
+        }
+    }
+    (cols, aos)
+}
+
+/// Every operand shape the tile kernel fuses: a column, a constant and a
+/// computed slot.
+fn operand_variants(i: usize) -> Vec<Node> {
+    vec![
+        expr::input(i),
+        expr::constant([1.5, -0.0, 2.0][i % 3]),
+        expr::node(Op::Add, vec![expr::input(i), expr::input((i + 1) % 3)]),
+    ]
+}
+
+fn operator_trees() -> Vec<(String, Node)> {
+    let mut trees = Vec::new();
+    for op in supported_ops() {
+        let arity = op.arity();
+        let combos = 3usize.pow(arity as u32);
+        for code in 0..combos {
+            let kids: Vec<Node> = (0..arity)
+                .map(|k| operand_variants(k)[(code / 3usize.pow(k as u32)) % 3].clone())
+                .collect();
+            trees.push((format!("{op:?}#{code}"), expr::node(op, kids)));
+        }
+    }
+    trees
+}
+
+#[test]
+fn tile_boundaries_are_bit_identical() {
+    let tile = eval_soa::TILE;
+    let mut counts = vec![0usize, 1, 255, 256, 257, 1000];
+    counts.extend([tile - 1, tile, tile + 1, 2 * tile - 1, 2 * tile, 2 * tile + 1]);
+    let (cols, aos) = special_cols(1000, 3);
+    for (name, tree) in operator_trees() {
+        let program = compile(&tree).expect("supported operator must compile");
+        for &rows in &counts {
+            let mut tiled = vec![f64::MAX; rows];
+            let mut rows4 = vec![f64::MAX; rows];
+            let mut scalar = vec![f64::MAX; rows];
+            eval_soa::eval_batch(&program, &cols, rows, &mut tiled);
+            eval_soa::eval_batch_rows4(&program, &cols, rows, &mut rows4);
+            eval_soa::eval_batch_scalar(&program, &cols, rows, &mut scalar);
+            for r in 0..rows {
+                let want = expr::eval(&tree, &aos[r]);
+                assert!(
+                    same_bits(want, tiled[r]),
+                    "{name} rows {rows} row {r}: expr::eval {want:?} vs tile {:?}",
+                    tiled[r]
+                );
+                assert!(
+                    same_bits(rows4[r], tiled[r]),
+                    "{name} rows {rows} row {r}: rows4 {:?} vs tile {:?}",
+                    rows4[r],
+                    tiled[r]
+                );
+                assert!(same_bits(scalar[r], tiled[r]), "{name} rows {rows} row {r}: scalar");
+            }
+        }
+    }
+}
+
+#[test]
+fn tile_random_trees_match_across_tile_boundaries() {
+    let ops = supported_ops();
+    let mut rng = Mt::new(475);
+    let (cols, aos) = special_cols(300, 4);
+    for _ in 0..60 {
+        let tree = expr::random_tree(&mut rng, 4, &ops, 5);
+        let program = compile(&tree).expect("supported tree");
+        let mut scratch = eval_soa::Scratch::new();
+        for rows in [1usize, 63, 64, 65, 300] {
+            let mut tiled = vec![0.0; rows];
+            let mut rows4 = vec![0.0; rows];
+            eval_soa::eval_batch_into(&program, &cols, rows, &mut tiled, &mut scratch);
+            eval_soa::eval_batch_rows4(&program, &cols, rows, &mut rows4);
+            for r in 0..rows {
+                assert!(same_bits(expr::eval(&tree, &aos[r]), tiled[r]), "row {r} of {rows}");
+                assert!(same_bits(rows4[r], tiled[r]), "rows4 row {r} of {rows}");
+            }
+        }
+    }
+}
+
+#[test]
+fn min_max_signed_zero_matches_expr_eval() {
+    let pairs = [
+        (-0.0, 0.0),
+        (0.0, -0.0),
+        (-0.0, -0.0),
+        (0.0, 0.0),
+        (f64::NAN, 0.0),
+        (0.0, f64::NAN),
+        (f64::NAN, f64::NAN),
+        (-0.0, f64::NAN),
+        (f64::NAN, -0.0),
+    ];
+    let cols = vec![
+        pairs.iter().map(|p| p.0).collect::<Vec<_>>(),
+        pairs.iter().map(|p| p.1).collect::<Vec<_>>(),
+    ];
+    let rows = pairs.len();
+    for op in [Op::Min, Op::Max] {
+        let tree = expr::node(op, vec![expr::input(0), expr::input(1)]);
+        let constant_rhs = expr::node(op, vec![expr::input(0), expr::constant(0.0)]);
+        let constant_lhs = expr::node(op, vec![expr::constant(-0.0), expr::input(1)]);
+        for t in [&tree, &constant_rhs, &constant_lhs] {
+            let out = soa(t, &cols, rows);
+            for r in 0..rows {
+                let want = expr::eval(t, &[pairs[r].0, pairs[r].1]);
+                assert!(
+                    same_bits(want, out[r]) && (want.is_nan() || want.to_bits() == out[r].to_bits()),
+                    "{op:?} {:?}: expr::eval {want:?} vs tile {:?}",
+                    pairs[r],
+                    out[r]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn missing_and_short_columns_read_nan_in_tile_kernel() {
+    let tree = expr::node(Op::Add, vec![expr::input(0), expr::input(2)]);
+    let program = compile(&tree).unwrap();
+    let rows = 130;
+    let cols = vec![vec![1.0; rows], vec![2.0; rows]];
+    let mut out = vec![0.0; rows];
+    eval_soa::eval_batch(&program, &cols, rows, &mut out);
+    assert!(out.iter().all(|v| v.is_nan()));
+    let cols = vec![vec![1.0; rows], vec![], vec![2.0; 70]];
+    eval_soa::eval_batch(&program, &cols, rows, &mut out);
+    assert!(out[..70].iter().all(|&v| v == 3.0));
+    assert!(out[70..].iter().all(|v| v.is_nan()));
+}
