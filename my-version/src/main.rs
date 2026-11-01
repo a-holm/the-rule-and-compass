@@ -194,6 +194,14 @@ INPUT:
                              residency keeps the CPU. Reported values stay
                              exact CPU f64. Resume needs the same cost,
                              threshold and rows
+  --pnl-blocks K          1 to 8 time blocks for --fitness pnl (default 1 =
+                             off, the plain regret). The training timestamps
+                             are cut into K equal runs, each block is its own
+                             long/flat book, and the fitness is the mean block
+                             regret plus --pnl-block-lambda times their
+                             standard deviation. Needs --fitness pnl
+  --pnl-block-lambda L      weight of the block spread (default 1.0, finite,
+                             >= 0; 0 is the plain mean). Needs --fitness pnl
   --position long_only|top_tercile
                              long_only (default): 1[pred > --threshold]. top_tercile: per
                              timestamp the top floor(n/3) finite predictions are long (p=1),
@@ -1084,6 +1092,29 @@ fn trading_usage(msg: &str) -> ! {
 /// #480: the `"fitness"` member of a Pareto entry, in exact CPU `f64` on the
 /// training rows. `train_net` is the excess net over cash.
 fn fitness_member_json(book: &rcsr::trading::FitnessBook, pred: &[f64]) -> String {
+    if book.blocks() > 1 {
+        // #484: `train_regret` is the search fitness (mean + lambda * sd of the
+        // block regrets); net, flips and exits sum the blocks.
+        let blocks = book.block_totals(pred);
+        let mut net = 0.0;
+        let (mut flips, mut exits, mut longs) = (0u64, 0u64, 0u64);
+        for t in &blocks {
+            net += book.net_of(t);
+            flips += t.flips;
+            exits += t.exits;
+            longs += t.long_rows;
+        }
+        let regrets: Vec<String> = book.block_regrets(&blocks).into_iter().map(jnum).collect();
+        return format!(
+            ",\"fitness\":{{\"train_regret\":{},\"train_net\":{},\"train_flips\":{},\"train_exits\":{},\"train_exposure\":{},\"block_regret\":[{}]}}",
+            jnum(book.fitness_of(&blocks)),
+            jnum(net),
+            flips,
+            exits,
+            jnum(longs as f64 / book.len().max(1) as f64),
+            regrets.join(",")
+        );
+    }
     let t = book.totals(pred);
     format!(
         ",\"fitness\":{{\"train_regret\":{},\"train_net\":{},\"train_flips\":{},\"train_exits\":{},\"train_exposure\":{}}}",
@@ -2284,6 +2315,9 @@ fn main() {
     let mut objective_arg: Option<String> = None;
     // #480: what ranks candidates in the search.
     let mut fitness_arg: Option<String> = None;
+    // #484: the time-block consistency term of the P&L fitness.
+    let mut pnl_blocks_arg: Option<String> = None;
+    let mut pnl_lambda_arg: Option<String> = None;
     let mut trading_flags: Vec<&'static str> = Vec::new();
     let mut position_arg: Option<String> = None;
     let mut allow_short = false;
@@ -2582,6 +2616,8 @@ fn main() {
             "--select-by" => select_by_arg = Some(val!()),
             "--objective" => objective_arg = Some(val!()),
             "--fitness" => fitness_arg = Some(val!()),
+            "--pnl-blocks" => pnl_blocks_arg = Some(val!()),
+            "--pnl-block-lambda" => pnl_lambda_arg = Some(val!()),
             "--position" => {
                 trading_flags.push("--position");
                 position_arg = Some(val!());
@@ -4794,6 +4830,30 @@ fn main() {
         Some("pnl") => true,
         Some(other) => trading_usage(&format!("--fitness must be metric or pnl, got '{}'", other)),
     };
+    let pnl_blocks: usize = match pnl_blocks_arg.as_deref() {
+        None => 1,
+        Some(t) => match t.trim().parse::<usize>() {
+            Ok(k) if (1..=rcsr::trading::FITNESS_MAX_BLOCKS).contains(&k) => k,
+            _ => trading_usage(&format!(
+                "--pnl-blocks must be an integer from 1 to {}, got '{}'",
+                rcsr::trading::FITNESS_MAX_BLOCKS, t
+            )),
+        },
+    };
+    let pnl_lambda: f64 = match pnl_lambda_arg.as_deref() {
+        None => 1.0,
+        Some(t) => match t.trim().parse::<f64>() {
+            Ok(l) if l.is_finite() && l >= 0.0 => l,
+            _ => trading_usage(&format!("--pnl-block-lambda must be a finite number >= 0, got '{}'", t)),
+        },
+    };
+    if !fitness_pnl {
+        for (flag, given) in [("--pnl-blocks", pnl_blocks_arg.is_some()), ("--pnl-block-lambda", pnl_lambda_arg.is_some())] {
+            if given {
+                trading_usage(&format!("{} needs --fitness pnl", flag));
+            }
+        }
+    }
     let mut trading_spec: Option<rcsr::trading::TradingSpec> = None;
     let mut trading_cols: Option<data::TradingColumns> = None;
     let mut trading_cost: Option<target::CostDecl> = None;
@@ -5097,7 +5157,7 @@ fn main() {
         let (Some(tspec), Some(slice)) = (trading_spec.as_ref(), slice) else {
             trading_usage("--fitness pnl found no training trading rows");
         };
-        match rcsr::trading::FitnessBook::new(slice, tspec, target_horizon) {
+        match rcsr::trading::FitnessBook::with_blocks(slice, tspec, target_horizon, pnl_blocks, pnl_lambda) {
             Ok(book) if book.len() == prepared.train.len() => Some(std::sync::Arc::new(book)),
             Ok(book) => trading_usage(&format!(
                 "--fitness pnl: {} training trading rows for {} training rows",
@@ -7437,7 +7497,7 @@ fn main() {
                 backend_json,
                 match &fitness_book {
                     Some(b) => format!(
-                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}}},",
+                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}{}}},",
                         b.len(),
                         b.groups(),
                         jnum(b.side()),
@@ -7445,6 +7505,17 @@ fn main() {
                         jnum(b.bound()),
                         b.min_trades(),
                         b.hash(),
+                        // #484: omitted for one block, so the default report is unchanged.
+                        if b.blocks() > 1 {
+                            format!(
+                                "\"blocks\":{},\"lambda\":{},\"block_bounds\":[{}],",
+                                b.blocks(),
+                                jnum(b.lambda()),
+                                b.block_bounds().iter().map(|v| jnum(*v)).collect::<Vec<_>>().join(",")
+                            )
+                        } else {
+                            String::new()
+                        },
                         // #481: what ranked the generations; `backend` above is
                         // the reported values, always exact CPU f64.
                         match outcome.backend {

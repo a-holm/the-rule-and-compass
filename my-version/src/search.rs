@@ -2805,6 +2805,7 @@ fn score_pipeline_batch(
     let Some(g) = gpu.as_mut() else {
         return Err("pipeline scoring without a GPU evaluator".to_string());
     };
+    let offered_hash: Vec<u64> = jobs.iter().map(|(_, _, t)| expr::structural_hash(t)).collect();
     let (kept, errs) = eval_pipeline_jobs(g, &jobs, generation)?;
     if !kept.is_empty() {
         // #290: the overlap pipeline is a real device batch too; record it so
@@ -2815,7 +2816,8 @@ fn score_pipeline_batch(
         let (i, j) = (jobs[k].0, jobs[k].1);
         results[i][j] = Some(PipelineResult {
             error: e,
-            constants: None,
+            offered: offered_hash[k],
+            tree: None,
         });
     }
     let Some(fit) = fit else {
@@ -2856,11 +2858,12 @@ fn score_pipeline_batch(
         crate::fit::note_gpu_fit(false);
         results[i][j] = Some(PipelineResult {
             error: f64::NAN,
-            constants: None,
+            offered: offered_hash[k],
+            tree: None,
         });
     }
 
-    let mut fitted: Vec<(usize, Option<Vec<f64>>)> = Vec::new();
+    let mut fitted: Vec<usize> = Vec::new();
     if !plans.is_empty() {
         let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().map(|(_, p)| p).collect();
         // #236: slope always starts from the squared warm start and keeps the
@@ -2884,7 +2887,8 @@ fn score_pipeline_batch(
                 crate::fit::note_gpu_fit(false);
                 results[i][j] = Some(PipelineResult {
                     error: f64::NAN,
-                    constants: None,
+                    offered: offered_hash[*k],
+                    tree: None,
                 });
             }
         } else {
@@ -2898,7 +2902,7 @@ fn score_pipeline_batch(
                     g.fit_gpu += 1;
                     g.stats.entry(generation).or_default().fit_gpu += 1;
                     crate::fit::note_gpu_fit(true);
-                    fitted.push((*k, Some(res.c)));
+                    fitted.push(*k);
                 } else {
                     let (i, j) = (jobs[*k].0, jobs[*k].1);
                     let cause = if !finite {
@@ -2911,7 +2915,8 @@ fn score_pipeline_batch(
                     crate::fit::note_gpu_fit(false);
                     results[i][j] = Some(PipelineResult {
                         error: f64::NAN,
-                        constants: None,
+                        offered: offered_hash[*k],
+                        tree: None,
                     });
                     fallback_jobs.push(*k);
                 }
@@ -2958,25 +2963,27 @@ fn score_pipeline_batch(
             }
             job.tree = done.tree.clone();
             jobs[*k].2 = done.tree;
-            fitted.push((*k, None));
+            fitted.push(*k);
         }
     }
 
     if !fitted.is_empty() {
+        // #560: score the fitted tree after the post-fit simplify, as the
+        // synchronous path does, and hand that tree to the barrier.
         let refit: Vec<PipelineJob> = fitted
             .iter()
-            .map(|(k, _)| {
-                let (i, j, tree) = &jobs[*k];
-                (*i, *j, tree.clone())
+            .map(|&k| {
+                let (i, j, tree) = &jobs[k];
+                (*i, *j, expr::simplify(tree))
             })
             .collect();
         let (kept2, errs2) = eval_pipeline_jobs(g, &refit, generation)?;
-        for (pos, &err) in kept2.iter().zip(&errs2) {
-            let (k, constants) = &fitted[*pos];
-            let (i, j) = (jobs[*k].0, jobs[*k].1);
-            results[i][j] = Some(PipelineResult {
+        for (&pos, &err) in kept2.iter().zip(&errs2) {
+            let (i, j, tree) = &refit[pos];
+            results[*i][*j] = Some(PipelineResult {
                 error: err,
-                constants: constants.clone(),
+                offered: offered_hash[fitted[pos]],
+                tree: Some(tree.clone()),
             });
         }
     }
@@ -4361,10 +4368,11 @@ fn maximum_status_fallback_cause(status: i32) -> FitFallbackCause {
 pub(crate) const WIDE_ADMISSION_ROWS: usize = 1 << 20;
 
 /// #393: the CPU path simplifies the tree and recomputes its complexity after a
-/// fit (`evolve_island`). The deferred path calls this for every candidate whose
-/// constants a device fit, a CPU fallback or the pipeline write-back replaced,
-/// so tie-breaks and the in-search archive see the fitted tree. A candidate the
-/// dimensional filter rejects keeps an infinite error, as in [`Ind::pending`].
+/// fit (`evolve_island`). `fit_pending` calls this for every candidate whose
+/// constants a device fit or a CPU fallback replaced, so tie-breaks and the
+/// in-search archive see the fitted tree; the overlap pipeline simplifies before
+/// it scores (`score_pipeline_batch`). A candidate the dimensional filter
+/// rejects keeps an infinite error, as in [`Ind::pending`].
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn refresh_after_fit(ind: &mut Ind, cfg: &Config) {
     ind.tree = expr::simplify(&ind.tree);
@@ -5017,15 +5025,17 @@ fn seed_seen(seen: &mut HashSet<u64>, next: &[Ind], parents: &[Ind]) {
 /// that island's `next` vector, and the tree to score.
 type PipelineJob = (usize, usize, Node);
 
-/// #286: one candidate's result from an overlap batch. `constants` are the
-/// fitted values to write back into the island's tree at the generation
-/// barrier; `None` means the candidate kept its screening constants (it had
-/// nothing to fit) and only `error` is meaningful.
+/// #286: one candidate's result from an overlap batch. #560: `error` belongs
+/// to `tree`, the fitted and simplified tree the barrier stores, or to the
+/// offered tree when `tree` is `None`. `offered` is the structural hash of the
+/// offered tree: a QD immigrant can replace an offered candidate in the same
+/// slot, and a result must never land on a tree it was not computed for.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[derive(Clone, Debug)]
 struct PipelineResult {
     error: f64,
-    constants: Option<Vec<f64>>,
+    offered: u64,
+    tree: Option<Node>,
 }
 
 /// #286: the device fit arm carried by the overlap queue when the admission
@@ -7771,19 +7781,25 @@ fn run_search(
                 if pipeline_active {
                     // Results are keyed by (island, slot), so the arrival order
                     // across concurrent island threads cannot change them.
-                    for (i, slots) in pipeline_results.iter().enumerate() {
-                        for (j, value) in slots.iter().enumerate() {
-                            if let Some(r) = value {
-                                if let Some(c) = &r.constants {
-                                    if let Ok(plan) =
-                                        crate::fit::gpu_fit_plan_reason(&islands[i][j].tree)
-                                    {
-                                        plan.apply(&mut islands[i][j].tree, c);
-                                        refresh_after_fit(&mut islands[i][j], cfg);
-                                    }
-                                }
-                                islands[i][j].error = r.error;
+                    // #560: a result for a replaced candidate is dropped, which
+                    // leaves the slot pending for `score_generation` below; a
+                    // rejected dimension keeps its infinite error.
+                    for (i, slots) in pipeline_results.iter_mut().enumerate() {
+                        for (j, value) in slots.iter_mut().enumerate() {
+                            let Some(r) = value.take() else { continue };
+                            let ind = &mut islands[i][j];
+                            if expr::structural_hash(&ind.tree) != r.offered {
+                                continue;
                             }
+                            if let Some(tree) = r.tree {
+                                ind.complexity = cfg.complexity_model.complexity(&tree);
+                                ind.tree = tree;
+                            }
+                            ind.error = if cfg.accepts_dimensions(&ind.tree) {
+                                r.error
+                            } else {
+                                f64::INFINITY
+                            };
                         }
                     }
                     if pipeline_error.is_none() {
