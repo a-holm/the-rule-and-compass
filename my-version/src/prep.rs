@@ -25,7 +25,7 @@ use crate::ohlcv::{
     Migration, Timeframe,
 };
 use crate::{manifest, store, zip};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -304,6 +304,8 @@ pub struct Options {
     pub allow_lockbox: bool,
     /// #262: permit a label stride below the horizon for horizons of 4h and longer.
     pub allow_overlap: bool,
+    /// #485: keep only the symbols of a pinned universe file.
+    pub symbols: Option<SymbolList>,
 }
 
 impl Default for Options {
@@ -327,6 +329,7 @@ impl Default for Options {
             resume: None,
             allow_lockbox: false,
             allow_overlap: false,
+            symbols: None,
         }
     }
 }
@@ -343,6 +346,114 @@ pub struct Build {
 pub struct Source {
     pub path: PathBuf,
     pub symbol: String,
+}
+
+/// A pinned symbol universe: one symbol per line, `#` comments and blank
+/// lines ignored, duplicates collapsed.
+#[derive(Clone, Debug)]
+pub struct SymbolList {
+    pub file: String,
+    pub sha256: String,
+    pub symbols: BTreeSet<String>,
+}
+
+pub fn read_symbol_list(path: &str) -> Result<SymbolList, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
+    let symbols: BTreeSet<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    if symbols.is_empty() {
+        return Err(format!("{}: the symbol list is empty", path));
+    }
+    Ok(SymbolList { file: path.to_string(), sha256: manifest::sha256_hex(text.as_bytes()), symbols })
+}
+
+/// What a universe filter did. `listed = kept + missing + empty`.
+/// `dropped` names input directories (with or without archives) that are not
+/// listed; `missing` names listed symbols with no directory; `empty` names
+/// listed symbols whose directory holds no archive. Missing and empty symbols
+/// contribute no rows and are not an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Universe {
+    pub file: String,
+    pub sha256: String,
+    pub listed: usize,
+    pub kept: usize,
+    pub dropped: Vec<String>,
+    pub missing: Vec<String>,
+    pub empty: Vec<String>,
+}
+
+impl Universe {
+    pub fn json(&self) -> String {
+        let names = |v: &[String]| v.iter().map(|s| jstr(s)).collect::<Vec<_>>().join(",");
+        format!(
+            "{{\"file\":{},\"sha256\":{},\"listed\":{},\"kept\":{},\"dropped\":[{}],\"missing\":[{}],\"empty\":[{}]}}",
+            jstr(&self.file),
+            jstr(&self.sha256),
+            self.listed,
+            self.kept,
+            names(&self.dropped),
+            names(&self.missing),
+            names(&self.empty)
+        )
+    }
+}
+
+/// Keep the sources whose symbol is listed. The filter runs on the file list,
+/// before any archive is opened.
+pub fn apply_universe(
+    sources: Vec<Source>,
+    inputs: &[String],
+    list: &SymbolList,
+) -> Result<(Vec<Source>, Universe), String> {
+    let mut present: BTreeSet<String> = sources.iter().map(|s| s.symbol.clone()).collect();
+    for input in inputs {
+        let Ok(rd) = std::fs::read_dir(input) else { continue };
+        for e in rd.filter_map(|e| e.ok()) {
+            if e.path().is_dir() {
+                if let Some(n) = e.file_name().to_str() {
+                    present.insert(n.to_ascii_uppercase());
+                }
+            }
+        }
+    }
+    let with_data: BTreeSet<&str> = sources
+        .iter()
+        .map(|s| s.symbol.as_str())
+        .filter(|s| list.symbols.contains(*s))
+        .collect();
+    let dropped: Vec<String> = present.iter().filter(|s| !list.symbols.contains(*s)).cloned().collect();
+    let mut missing = Vec::new();
+    let mut empty = Vec::new();
+    for s in &list.symbols {
+        if with_data.contains(s.as_str()) {
+            continue;
+        }
+        if present.contains(s) {
+            empty.push(s.clone());
+        } else {
+            missing.push(s.clone());
+        }
+    }
+    let kept = with_data.len();
+    let universe = Universe {
+        file: list.file.clone(),
+        sha256: list.sha256.clone(),
+        listed: list.symbols.len(),
+        kept,
+        dropped,
+        missing,
+        empty,
+    };
+    let kept_sources: Vec<Source> = sources.into_iter().filter(|s| list.symbols.contains(&s.symbol)).collect();
+    if kept_sources.is_empty() {
+        return Err(format!("{}: no archive symbol is listed in the universe file", list.file));
+    }
+    Ok((kept_sources, universe))
 }
 
 /// Expand files and directories into a deterministic symbol-sorted source
@@ -1218,6 +1329,13 @@ fn log_rss(tag: &str) {
 /// Build the table, audit and manifest without writing anything.
 pub fn build(opts: &Options) -> Result<Build, String> {
     let sources = discover(&opts.inputs, opts.symbol.as_deref())?;
+    let (sources, universe) = match &opts.symbols {
+        Some(list) => {
+            let (kept, u) = apply_universe(sources, &opts.inputs, list)?;
+            (kept, Some(u))
+        }
+        None => (sources, None),
+    };
     let mut audit = Audit {
         layout: opts.format.name().to_string(),
         files: sources.len(),
@@ -1750,6 +1868,9 @@ pub fn build(opts: &Options) -> Result<Build, String> {
         .collect();
     let mut manifest_text = String::from("{\n");
     let _ = writeln!(manifest_text, "  \"tool\":\"rcsr prep\",");
+    if let Some(u) = &universe {
+        let _ = writeln!(manifest_text, "  \"universe\":{},", u.json());
+    }
     let _ = writeln!(manifest_text, "  \"format\":{},", jstr(opts.format.name()));
     let _ = writeln!(
         manifest_text,
@@ -2018,6 +2139,13 @@ pub fn run(args: &[String]) -> ! {
             "--dry-run" => opts.dry_run = true,
             "--allow-lockbox" => opts.allow_lockbox = true,
             "--allow-overlap" => opts.allow_overlap = true,
+            "--symbols" => match read_symbol_list(&val!()) {
+                Ok(l) => opts.symbols = Some(l),
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_USAGE);
+                }
+            },
             "--allow-short" => fail(&crate::labels::refuse_allow_short()),
             "--side" => {
                 let v = val!();
@@ -2118,6 +2246,9 @@ INPUT:
                           (Binance Vision monthly ZIPs and Bitstamp CSVs)
   --format <kind>         auto (default), binance, bitstamp or ohlcv
   --symbol <name>         override the symbol for a single-file input
+  --symbols <file>        keep only the symbols listed in the file (one per line,
+                          # comments and blank lines ignored); the manifest records
+                          the file SHA-256 and the kept, dropped and missing symbols
   --tz <zone>             UTC (default), +HH:MM, America/New_York, Europe/London
   --calendar <name>       24x7 (default), nyse or lse
   --migrations <table>    OLD->NEW:k[:tol],... with a measured splice ratio

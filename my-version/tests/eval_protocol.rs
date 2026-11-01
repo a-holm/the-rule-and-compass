@@ -99,7 +99,7 @@ fn no_training_label_reaches_a_test_window_on_a_ragged_panel() {
     let t = table(&rows);
     let mut s = spec("x", vec![window("w", 0.0, 12.0, 15.0, 30.0)]);
     s.group = Some("sym".to_string());
-    s.horizon = 3.0;
+    s.horizon = 1.0;
     let r = walkforward::run_table(&t, &s, "t").unwrap();
     let w = &r.windows[0];
     // train rows: A 0..12 (12) + C 0..12 without 4..8 (8); B has none
@@ -108,7 +108,7 @@ fn no_training_label_reaches_a_test_window_on_a_ragged_panel() {
     assert_eq!(last, 11.0);
     assert!(last + r.required_purge_seconds <= w.window.test_start);
     // a window that would let the label of the last training row reach the test is refused
-    s.windows = vec![window("late", 0.0, 13.0, 15.0, 30.0)];
+    s.windows = vec![window("late", 0.0, 14.5, 15.0, 30.0)];
     assert!(walkforward::run_table(&t, &s, "t").unwrap_err().contains("purge gap"));
 }
 
@@ -226,7 +226,11 @@ fn panel(hours: usize, seed: u32) -> data::Table {
     let mut rows: Vec<(f64, String, f64, f64)> = Vec::new();
     for h in 0..hours {
         let ts = 1_700_000_000.0 + h as f64 * 3600.0;
-        for s in ["A", "B", "C"] {
+        // One row per symbol every fifth hour: the 5 h label horizon never overlaps within a symbol.
+        for (k, s) in ["A", "B", "C"].into_iter().enumerate() {
+            if h % 5 != k {
+                continue;
+            }
             let x = rng.next_f64() - 0.5;
             let y = 0.0004 * x + (rng.next_f64() - 0.5) * 0.004;
             rows.push((ts, s.to_string(), x, y));

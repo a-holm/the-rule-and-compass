@@ -1531,6 +1531,8 @@ pub struct Options {
     pub write_bw: Option<f64>,
     pub allow_lockbox: bool,
     pub allow_overlap: bool,
+    /// Locked test left out of the label report; the input's declaration applies when unset.
+    pub locked_test: Option<crate::lockbox::Lockbox>,
     pub dry_run: bool,
     pub json: bool,
 }
@@ -1556,6 +1558,7 @@ impl Default for Options {
             write_bw: None,
             allow_lockbox: false,
             allow_overlap: false,
+            locked_test: None,
             dry_run: false,
             json: false,
         }
@@ -1741,6 +1744,15 @@ impl Report {
                 l.spec.name, l.target, r.rows, r.valid_rows, r.barrier_rows, r.clipped_share,
                 r.cost_to_move, r.effective_n, r.purge_seconds, r.label_hash
             ));
+            if let Some(lt) = &r.locked_test {
+                out.push(format!(
+                    "# enrich-label-locked: name={} locked_test={}..{} left_out_rows={}",
+                    l.spec.name,
+                    crate::lockbox::date(lt.range.start),
+                    crate::lockbox::date(lt.range.end),
+                    lt.rows_left_out
+                ));
+            }
             for m in &r.top_moves {
                 out.push(format!(
                     "# enrich-label-move: name={} symbol={} time={} iso={} fwd={:.6}",
@@ -6927,8 +6939,9 @@ fn enrich_inner(
             temp.insert(n.clone(), TempColumn::create(work_dir, &n, sp.column_warmup(kind), true)?);
         }
     }
+    let label_range = opts.locked_test.or_else(|| crate::lockbox::declared_for(&opts.data));
     let mut long_acc: Vec<crate::labels::LabelAccumulator> =
-        long_specs.iter().map(crate::labels::LabelAccumulator::new).collect();
+        long_specs.iter().map(|sp| crate::labels::LabelAccumulator::with_range(sp, label_range)).collect();
 
     // Cross-sectional source columns are computed even when the user did not
     // ask for them, then removed if they are not part of the output. The same
@@ -8104,7 +8117,7 @@ fn write_label_sidecars(data: &str, out: &str, outputs: &[LongLabelOutput]) -> R
     let body = format!(
         "{{\"schema\":{},\"targets\":[{}]}}\n",
         jstr(crate::target::SCHEMA),
-        specs.iter().map(|s| format!("{{{}}}", s.fields_json())).collect::<Vec<_>>().join(",")
+        specs.iter().map(|s| format!("{{{}}}", s.file_json())).collect::<Vec<_>>().join(",")
     );
     crate::atomic::write_text_atomic(&targets_path, &body)
 }
@@ -8152,7 +8165,7 @@ fn expected_columns_out(
 
 pub fn run(args: &[String]) -> ! {
     let mut opts = Options::default();
-    let mut locked_test: Option<crate::lockbox::Lockbox> = None;
+    let mut locked_test: Option<String> = None;
     let mut i = 0usize;
     macro_rules! val {
         () => {{
@@ -8173,7 +8186,14 @@ pub fn run(args: &[String]) -> ! {
             "--data" | "-d" => opts.data = val!(),
             "--out" | "-o" => opts.out = Some(val!()),
             "--features" => opts.features.push(val!()),
-            "--label" => opts.labels.push(val!()),
+            "--label" => {
+                let v = val!();
+                if v.trim_start().starts_with("long:") && !crate::labels::LongLabelSpec::declares_fee(&v) {
+                    eprintln!("error: {}", crate::labels::missing_fee_message(&v));
+                    std::process::exit(EXIT_USAGE);
+                }
+                opts.labels.push(v);
+            }
             "--allow-overlap" => opts.allow_overlap = true,
             "--allow-short" => fail(&crate::labels::refuse_allow_short()),
             "--side" => {
@@ -8234,7 +8254,7 @@ pub fn run(args: &[String]) -> ! {
                 opts.write_bw = Some(mbps * 1_000_000.0);
             }
             "--locked-test" => {
-                locked_test = Some(crate::lockbox::Lockbox::parse(&val!()).unwrap_or_else(|e| fail(&format!("--locked-test: {}", e))))
+                locked_test = Some(val!())
             }
             "--allow-lockbox" => opts.allow_lockbox = true,
             "--dry-run" => opts.dry_run = true,
@@ -8252,6 +8272,11 @@ pub fn run(args: &[String]) -> ! {
     if opts.features.is_empty() && opts.labels.is_empty() {
         fail("enrich needs --features and/or --label");
     }
+    let resolved = crate::lockbox::resolve(locked_test.as_deref(), &opts.data).unwrap_or_else(|e| {
+        eprintln!("error: {}", e.message.replacen("--lockbox", "--locked-test", 2));
+        std::process::exit(e.exit);
+    });
+    opts.locked_test = resolved.sidecar_range();
     let report = match enrich(&opts) {
         Ok(r) => r,
         Err(e) => fail(&e),
@@ -8260,11 +8285,11 @@ pub fn run(args: &[String]) -> ! {
         if let Some(out) = &opts.out {
             let sidecar = format!("{}.enrich.json", out);
             let mut text = report.json();
-            if let Some(lb) = locked_test.or_else(|| crate::lockbox::declared_for(&opts.data)) {
+            if let Some(lb) = resolved.sidecar_range() {
                 let at = text.find('{').map_or(0, |i| i + 1);
                 text.insert_str(
                     at,
-                    &format!("\"locked_test\":{},", lb.declaration_json("rcsr enrich --locked-test")),
+                    &format!("\"locked_test\":{},", lb.declaration_json(&format!("rcsr enrich ({})", resolved.source.as_str()))),
                 );
             }
             if let Err(e) = crate::atomic::write_text_atomic(&sidecar, &text) {
@@ -8322,21 +8347,29 @@ INPUT / OUTPUT:
   --eth-data <store>      ETH benchmark store when --data does not contain it
   --label <spec>          fwd:<tf|bars>,cost=<bp>,volnorm=<bars>,stride=<n>
                           (repeatable; labels are targets, not features)
-  --label long:<tf|bars>[,name=<id>][,delay=<bars>][,fee=<bp>][,spread=<bp>]
+  --label long:<tf|bars>[,name=<id>][,delay=<bars>],fee=<bp>[,spread=<bp>]
                           [,slip=<bp>][,vol=<bars>][,floor=<bp>][,clip=<c>][,up=<u>]
                           [,down=<d>][,stride=<n>]
                           long-only label family (CPU f64): lbl_<name>_{fwd,y,
                           long_net,action,t1,exit_ret,m_net,m_barrier,weight};
                           writes <out>.labels.json (reports, label hash, top
-                          10 absolute moves) and a y target spec in
-                          <out>.targets.json; never a --vars input
+                          10 absolute moves) and a y target spec (cost_bps, cost_per_side_bps)
+                          in <out>.targets.json; fee= is required (fee=0 for none, exit 2
+                          otherwise); never a --vars input
   --allow-overlap         permit a label stride below the horizon for horizons of
                           4h and longer (labels overlap; use uniqueness weights)
   --side long             the only side; --side short and --allow-short are refused
   --allow-lockbox         permit labelled rows in 2026H2 (final test only)
-  --locked-test <START,END>
-                          declare the protocol locked test (UTC, half-open) in
-                          <out>.enrich.json; copied from --data when it declares one
+  --locked-test <START,END|none>
+                          declare the locked test (UTC, half-open) in <out>.enrich.json.
+                          Without the flag: the range --data declares, else the protocol
+                          default 2025-07-01,2026-07-01. A range that does not cover the
+                          declared one is refused (exit 2); conflicting declarations of
+                          --data are refused (exit 3); none writes no declaration and is
+                          refused when --data declares one
+                          label rows whose window reaches the range (entry at or after
+                          START minus the purge, before END) are left out of every
+                          <out>.labels.json statistic, and counted
   --gpu [auto|on|off]     auto (default) dispatches a registered exact kernel
                           only when the cost model estimates it faster; on
                           forces every registered kernel above the 1M-row floor;

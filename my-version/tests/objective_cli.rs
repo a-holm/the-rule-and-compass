@@ -51,10 +51,21 @@ fn write_csv(dir: &std::path::Path, name: &str, rotate_from: Option<usize>) -> S
 }
 
 fn write_spec(dir: &std::path::Path, name: &str, offset: f64, cost: &str, in_label: bool) -> String {
+    write_spec_horizon(dir, name, offset, cost, in_label, 900)
+}
+
+fn write_spec_horizon(
+    dir: &std::path::Path,
+    name: &str,
+    offset: f64,
+    cost: &str,
+    in_label: bool,
+    horizon: u32,
+) -> String {
     let text = format!(
         "{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{{\"column\":\"y\",\"name\":\"raw_target\",\
          \"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"r\",\"return_units\":\"log\",\
-         \"horizon_seconds\":3600,\"entry_offset_seconds\":900,\"delay_seconds\":0,\
+         \"horizon_seconds\":{horizon},\"entry_offset_seconds\":900,\"delay_seconds\":0,\
          \"entry_price\":\"next open\",\"exit_price\":\"close\",\"offset\":{offset:?},\
          \"scale\":{{\"kind\":\"constant\",\"value\":1.0}},\"clip\":null,\"units\":\"log_return\",\
          \"cost_bps\":{cost},\"cost_in_label\":{in_label},\"construction_columns\":[],\"note\":null}}]}}"
@@ -290,6 +301,21 @@ fn a_missing_return_column_names_the_target_spec() {
     assert!(stderr(&out).contains("declares return_column 'gone'"), "{}", stderr(&out));
 }
 
+#[test]
+fn overlapping_rows_are_refused_and_the_spacing_is_reported() {
+    let dir = scratch();
+    let data = write_csv(&dir, "d.csv", None);
+    let overlapping = write_spec_horizon(&dir, "o.json", 0.0, "null", false, 3600);
+    usage_error(&run(&data, &overlapping, PNL), "overlapping returns");
+
+    let spaced = write_spec_horizon(&dir, "p.json", 0.0, "null", false, 900);
+    let o = run(&data, &spaced, PNL);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let j = json(&o);
+    assert_eq!(num(&j, &["objective", "spec", "min_group_step_seconds"]), 900.0);
+    assert_eq!(num(&j, &["objective", "spec", "horizon_seconds"]), 900.0);
+}
+
 fn write_csv_with_spare_columns(dir: &std::path::Path) -> String {
     let base = std::fs::read_to_string(write_csv(dir, "base.csv", None)).unwrap();
     let mut text = String::new();
@@ -432,11 +458,11 @@ fn walkforward_front_of_a_real_run_guards_the_seen_rows() {
     let purge = num(&j, &["split", "required_purge_seconds"]);
     let end = (T0 + 900 * N as i64) as f64;
     let walk = |test_start: f64| {
-        let window = format!("w,{},{},{},{}", T0, test_start - 3600.0, test_start, end);
+        let window = format!("w,{},{},{},{}", T0, test_start - purge, test_start, end);
         Command::new(env!("CARGO_BIN_EXE_rcsr"))
             .args([
                 "walkforward", "--data", &data, "--time", "t", "--front", &run_path, "--window", &window,
-                "--horizon", "3600", "--periods-per-year", "365", "--validation-frac", "0.3", "--json",
+                "--horizon", "900", "--periods-per-year", "365", "--validation-frac", "0.3", "--json",
             ])
             .output()
             .unwrap()

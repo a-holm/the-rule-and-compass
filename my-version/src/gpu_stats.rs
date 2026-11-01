@@ -190,6 +190,8 @@ pub struct RunLedger {
     fit_host_s: f64,
     /// Fit kernel seconds only, summed from the device's raw events.
     fit_kernel_s: f64,
+    /// #496: the part of `fit_kernel_s` apportioned to the polish phase.
+    fit_kernel_polish_s: f64,
     /// Exact CPU fallback seconds inside the fit stage.
     fit_fallback_s: f64,
     /// Exact CPU f64 finalist refit seconds (a subset of the fit stage).
@@ -307,6 +309,13 @@ impl RunLedger {
         }
     }
 
+    /// #496: record the polish-phase share of the fit kernel seconds.
+    pub fn record_fit_polish_split(&mut self, polish_s: f64) {
+        if polish_s.is_finite() && polish_s > 0.0 {
+            self.fit_kernel_polish_s += polish_s;
+        }
+    }
+
     /// Record one fit device kernel interval on the run clock.
     pub fn record_fit_kernel_interval(&mut self, stream: u32, start_s: f64, kernel_s: f64) {
         if kernel_s.is_finite() && kernel_s > 0.0 {
@@ -394,6 +403,7 @@ impl RunLedger {
         self.eval_window_s += other.eval_window_s;
         self.fit_host_s += other.fit_host_s;
         self.fit_kernel_s += other.fit_kernel_s;
+        self.fit_kernel_polish_s += other.fit_kernel_polish_s;
         self.fit_fallback_s += other.fit_fallback_s;
         self.refit_s += other.refit_s;
         self.refits += other.refits;
@@ -482,6 +492,18 @@ impl RunLedger {
 
     pub fn fit_kernel_s(&self) -> f64 {
         self.fit_kernel_s
+    }
+
+    /// #496: kernel seconds apportioned to the polish phase (re-baseline and
+    /// Gauss-Newton steps) by the per-block cycle ratio.
+    pub fn fit_kernel_polish_s(&self) -> f64 {
+        self.fit_kernel_polish_s.min(self.fit_kernel_s)
+    }
+
+    /// #496: kernel seconds apportioned to the LM phase; the two parts sum to
+    /// `fit_kernel_s`.
+    pub fn fit_kernel_lm_s(&self) -> f64 {
+        self.fit_kernel_s - self.fit_kernel_polish_s()
     }
 
     pub fn fit_fallback_s(&self) -> f64 {

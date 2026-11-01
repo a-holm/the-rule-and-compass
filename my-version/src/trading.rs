@@ -702,6 +702,63 @@ fn finish(ctx: &Ctx, positions: &[f64], spec: &TradingSpec) -> Result<PathStats,
     })
 }
 
+/// Smallest positive step between consecutive rows of one group, in seconds,
+/// and the rows that realise the first violation of `horizon_seconds`.
+/// Non-finite times and equal timestamps are skipped.
+fn group_steps(time: &[f64], group: &[u64], horizon_seconds: f64) -> (Option<f64>, Option<(u64, usize, usize, f64)>) {
+    let mut order: Vec<usize> = (0..time.len().min(group.len())).filter(|&i| time[i].is_finite()).collect();
+    order.sort_by(|&a, &b| {
+        group[a]
+            .cmp(&group[b])
+            .then_with(|| time[a].partial_cmp(&time[b]).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.cmp(&b))
+    });
+    let limit = horizon_seconds * (1.0 - 1e-9);
+    let mut min_step: Option<f64> = None;
+    let mut bad: Option<(u64, usize, usize, f64)> = None;
+    for w in order.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if group[a] != group[b] {
+            continue;
+        }
+        let step = time[b] - time[a];
+        if !(step > 0.0) {
+            continue;
+        }
+        if min_step.map_or(true, |m| step < m) {
+            min_step = Some(step);
+        }
+        if bad.is_none() && step < limit {
+            bad = Some((group[a], a, b, step));
+        }
+    }
+    (min_step, bad)
+}
+
+/// Smallest positive step between consecutive rows of one group, in seconds,
+/// in (group, time) order. `None` when no group has two rows.
+pub fn min_group_step(rows: &TradingRows) -> Option<f64> {
+    group_steps(&rows.time, &rows.group, 0.0).0
+}
+
+/// Refuse a book whose per-row returns overlap: some group has two rows
+/// closer than `horizon_seconds`. Returns the measured minimum step. A
+/// non-positive horizon skips the check.
+pub fn check_return_spacing(rows: &TradingRows, horizon_seconds: f64) -> Result<Option<f64>, String> {
+    let (min_step, bad) = group_steps(&rows.time, &rows.group, horizon_seconds);
+    if horizon_seconds > 0.0 {
+        if let Some((g, a, b, step)) = bad {
+            return Err(format!(
+                "overlapping returns: group {} has rows {} and {} {} seconds apart, below the {}-second \
+                 label horizon; use a label stride of at least the horizon (long:<h>,stride=<h>) or a \
+                 one-bar label",
+                g, a, b, step, horizon_seconds
+            ));
+        }
+    }
+    Ok(min_step)
+}
+
 fn check_lengths(n: usize, r: &[f64], rows: &TradingRows) -> Result<(), String> {
     if r.len() != n || rows.time.len() != n || rows.group.len() != n {
         return Err(format!(
@@ -793,11 +850,263 @@ pub fn evaluate_positions(
     finish(&ctx, &kept, spec)
 }
 
+/// True when the expression reads no variable.
+pub fn is_constant(tree: &crate::expr::Node) -> bool {
+    tree.op != crate::expr::Op::Input && tree.kids.iter().all(is_constant)
+}
+
+/// Rows per canonical summation segment of the fitness gross sum.
+pub const FITNESS_SEGMENT_ROWS: usize = trading_gpu::DEFAULT_SEGMENT_ROWS;
+/// Lanes inside one segment.
+pub const FITNESS_LANES: usize = trading_gpu::PNL_LANES;
+/// Warp sums that the segments are spread over.
+pub const FITNESS_WARPS: usize = 8;
+
+/// The long/flat book of one prediction vector, reduced to what the search
+/// ranks by (#480).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FitnessTotals {
+    pub gross: f64,
+    pub flips: u64,
+    pub exits: u64,
+    pub long_rows: u64,
+    /// Some prediction was not finite.
+    pub nonfinite: bool,
+}
+
+/// Exact CPU `f64` long/flat net regret on the canonical training rows.
+///
+/// `regret = (B - net) / B`, with `net` the excess net over cash and `B` the
+/// hindsight DP bound on the same rows. Lower is better; all-flat is exactly 1.
+#[derive(Clone, Debug)]
+pub struct FitnessBook {
+    excess: Vec<f64>,
+    flags: Vec<u8>,
+    groups: usize,
+    side: f64,
+    threshold: f64,
+    bound: f64,
+    min_trades: usize,
+    hash: u64,
+}
+
+fn fnv_u64(h: &mut u64, v: u64) {
+    for b in v.to_le_bytes() {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+impl FitnessBook {
+    /// `horizon_seconds` is the label horizon of the target; rows of one group
+    /// closer than that are refused (#468). A non-positive horizon skips it.
+    pub fn new(slice: &crate::data::TradingSlice, spec: &TradingSpec, horizon_seconds: f64) -> Result<Self, String> {
+        spec.validate()?;
+        if spec.tau.is_some() || spec.min_holding > 1 || spec.max_position != 1.0 {
+            return Err(
+                "the fitness book is the plain {0, 1} indicator: it needs min_holding 1, max_position 1 and no tau"
+                    .to_string(),
+            );
+        }
+        let n = slice.ret.len();
+        if n == 0 {
+            return Err("no training rows".to_string());
+        }
+        let rows = &slice.rows;
+        if rows.time.len() != n || rows.group.len() != n || (!rows.funding.is_empty() && rows.funding.len() != n) {
+            return Err(format!(
+                "length mismatch: {} returns, {} times, {} groups, {} funding values",
+                n,
+                rows.time.len(),
+                rows.group.len(),
+                rows.funding.len()
+            ));
+        }
+        if !rows.is_canonical() {
+            return Err(
+                "training rows are not in canonical (group, time) order; set canonical_train_order".to_string(),
+            );
+        }
+        check_return_spacing(rows, horizon_seconds)?;
+        let mut excess = Vec::with_capacity(n);
+        for i in 0..n {
+            let f = if rows.funding.is_empty() { 0.0 } else { rows.funding[i] };
+            let e = slice.ret[i] - f - spec.cash_return;
+            if !e.is_finite() || !rows.time[i].is_finite() {
+                return Err(format!("training row {} has a non-finite return, funding or time", i));
+            }
+            excess.push(e);
+        }
+        let flags = rows.seam_flags();
+        let groups = flags.iter().filter(|&&f| f & TradingRows::FIRST != 0).count();
+        let side = spec.per_side_bps() * BP;
+        let bound = trading_gpu::dp_bound(&excess, &rows.group, side)?;
+        if !(bound > 0.0) {
+            return Err(format!(
+                "no profitable long/flat path exists on the training rows at {} bp per side (hindsight bound {})",
+                spec.per_side_bps(),
+                bound
+            ));
+        }
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for e in &excess {
+            fnv_u64(&mut hash, e.to_bits());
+        }
+        for f in &flags {
+            fnv_u64(&mut hash, *f as u64);
+        }
+        fnv_u64(&mut hash, side.to_bits());
+        fnv_u64(&mut hash, spec.threshold.to_bits());
+        fnv_u64(&mut hash, spec.min_trades as u64);
+        Ok(FitnessBook {
+            excess,
+            flags,
+            groups,
+            side,
+            threshold: spec.threshold,
+            bound,
+            min_trades: spec.min_trades,
+            hash,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.excess.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.excess.is_empty()
+    }
+
+    pub fn groups(&self) -> usize {
+        self.groups
+    }
+
+    pub fn side(&self) -> f64 {
+        self.side
+    }
+
+    pub fn threshold(&self) -> f64 {
+        self.threshold
+    }
+
+    pub fn bound(&self) -> f64 {
+        self.bound
+    }
+
+    pub fn min_trades(&self) -> usize {
+        self.min_trades
+    }
+
+    pub fn hash(&self) -> u64 {
+        self.hash
+    }
+
+    /// Reduce one prediction vector. `gross` uses the fixed segment, lane and
+    /// warp tree documented on [`FITNESS_SEGMENT_ROWS`]; integer counts are
+    /// order-free.
+    pub fn totals(&self, pred: &[f64]) -> FitnessTotals {
+        debug_assert_eq!(pred.len(), self.excess.len());
+        let n = self.excess.len().min(pred.len());
+        let mut warps = [0.0f64; FITNESS_WARPS];
+        let mut flips = 0u64;
+        let mut exits = 0u64;
+        let mut long_rows = 0u64;
+        let mut nonfinite = false;
+        let mut prev = false;
+        let mut seg_start = 0usize;
+        let mut seg = 0usize;
+        while seg_start < n {
+            let seg_end = (seg_start + FITNESS_SEGMENT_ROWS).min(n);
+            let mut lanes = [0.0f64; FITNESS_LANES];
+            for k in seg_start..seg_end {
+                let p = pred[k];
+                let long = if p.is_finite() {
+                    p > self.threshold
+                } else {
+                    nonfinite = true;
+                    false
+                };
+                let flag = self.flags[k];
+                if flag & TradingRows::FIRST != 0 {
+                    prev = false;
+                }
+                if long != prev {
+                    flips += 1;
+                }
+                if long {
+                    long_rows += 1;
+                    lanes[(k - seg_start) % FITNESS_LANES] += self.excess[k];
+                    if flag & TradingRows::LAST != 0 {
+                        exits += 1;
+                    }
+                }
+                prev = long;
+            }
+            let mut half = FITNESS_LANES / 2;
+            while half >= 1 {
+                for i in 0..half {
+                    lanes[i] += lanes[i + half];
+                }
+                half /= 2;
+            }
+            warps[seg % FITNESS_WARPS] += lanes[0];
+            seg += 1;
+            seg_start = seg_end;
+        }
+        let mut half = FITNESS_WARPS / 2;
+        while half >= 1 {
+            for i in 0..half {
+                warps[i] += warps[i + half];
+            }
+            half /= 2;
+        }
+        FitnessTotals {
+            gross: warps[0],
+            flips,
+            exits,
+            long_rows,
+            nonfinite,
+        }
+    }
+
+    /// Excess net over cash: `gross - side * (flips + exits)`.
+    pub fn net_of(&self, t: &FitnessTotals) -> f64 {
+        t.gross - self.side * (t.flips + t.exits) as f64
+    }
+
+    /// `(B - net) / B`; `+inf` for a non-finite prediction or fewer than
+    /// `min_trades` flips.
+    pub fn regret_of(&self, t: &FitnessTotals) -> f64 {
+        if t.nonfinite || (t.flips as usize) < self.min_trades {
+            return f64::INFINITY;
+        }
+        let r = (self.bound - self.net_of(t)) / self.bound;
+        if r.is_finite() {
+            r
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    pub fn regret(&self, pred: &[f64]) -> f64 {
+        self.regret_of(&self.totals(pred))
+    }
+}
+
 /// The finalist chosen by a trading objective, with both books.
 #[derive(Clone, Debug)]
 pub struct FinalistReport {
     pub objective: Objective,
     pub spec: TradingSpec,
+    /// Smallest positive step between consecutive rows of one group over the
+    /// validation and test slices.
+    pub min_group_step: Option<f64>,
+    pub horizon_seconds: f64,
+    pub cost: crate::target::CostDecl,
+    /// The finalist expression has no variable: every quantile or fixed
+    /// threshold makes it a flat or always-long book.
+    pub constant: bool,
     pub candidates: usize,
     pub usable: usize,
     pub expression: String,
@@ -809,10 +1118,23 @@ pub struct FinalistReport {
     /// The objective on the validation slice (lower is better).
     pub validation_value: f64,
     pub validation: Result<PathStats, String>,
+    /// #480: the value the search ranked candidates by, when it was not the metric.
+    pub search_fitness: Option<&'static str>,
     pub test: Result<PathStats, String>,
 }
 
 impl FinalistReport {
+    fn spec_json(&self) -> String {
+        let mut s = self.spec.json();
+        s.pop();
+        s.push_str(&format!(
+            ",\"min_group_step_seconds\":{},\"horizon_seconds\":{}}}",
+            self.min_group_step.map_or_else(|| "null".to_string(), num),
+            num(self.horizon_seconds)
+        ));
+        s
+    }
+
     pub fn json(&self, backend: &str, backend_reason: Option<&str>) -> String {
         let block = |r: &Result<PathStats, String>| match r {
             Ok(s) => s.json(),
@@ -820,26 +1142,31 @@ impl FinalistReport {
         };
         format!(
             "{{\"name\":\"{}\",\"position\":\"long_only\",\"selection\":\"validation_objective\",\
-             \"candidates\":{},\"usable_candidates\":{},\"exact\":\"cpu_f64\",\
+             \"cost\":{},\"candidates\":{},\"usable_candidates\":{},\"exact\":\"cpu_f64\",\
              \"backend\":{},\"backend_reason\":{},\"spec\":{},\
-             \"finalist\":{{\"expression\":{},\"archive_rank\":{},\"fit_metric\":{},\"fit_error\":{},\
-             \"validation_error\":{},\"test_error\":{},\"validation_objective\":{}}},\
+             \"finalist\":{{\"expression\":{},\"archive_rank\":{},\"constant\":{},\"fit_metric\":{},\"fit_error\":{},\
+             \"validation_error\":{},\"test_error\":{},\"validation_objective\":{}{}}},\
              \"validation\":{},\"test\":{}}}",
             self.objective.name(),
+            self.cost.json(),
             self.candidates,
             self.usable,
             crate::devlog::text(backend),
             backend_reason
                 .map(crate::devlog::text)
                 .unwrap_or_else(|| "null".to_string()),
-            self.spec.json(),
+            self.spec_json(),
             crate::devlog::text(&self.expression),
             self.archive_rank,
+            self.constant,
             crate::devlog::text(&self.fit_metric),
             num(self.fit_error),
             num(self.validation_error),
             num(self.test_error),
             num(self.validation_value),
+            self.search_fitness
+                .map(|k| format!(",\"search_fitness\":\"{}\"", k))
+                .unwrap_or_default(),
             block(&self.validation),
             block(&self.test)
         )
@@ -870,6 +1197,58 @@ impl FinalistReport {
             line("validation", &self.validation),
             line("test", &self.test)
         )
+    }
+}
+
+#[cfg(test)]
+mod spacing_tests {
+    use super::*;
+
+    fn rows(pairs: &[(u64, f64)]) -> TradingRows {
+        TradingRows {
+            time: pairs.iter().map(|p| p.1).collect(),
+            group: pairs.iter().map(|p| p.0).collect(),
+            funding: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn step_equal_to_horizon_passes() {
+        let r = rows(&[(1, 0.0), (1, 3600.0), (1, 7200.0)]);
+        assert_eq!(check_return_spacing(&r, 3600.0), Ok(Some(3600.0)));
+    }
+
+    #[test]
+    fn one_second_below_horizon_fails() {
+        let r = rows(&[(1, 0.0), (1, 3600.0), (1, 7199.0)]);
+        let e = check_return_spacing(&r, 3600.0).unwrap_err();
+        assert!(e.starts_with("overlapping returns: group 1 has rows 1 and 2 3599 seconds apart"), "{e}");
+    }
+
+    #[test]
+    fn single_row_groups_pass() {
+        let r = rows(&[(1, 0.0), (2, 10.0), (3, 20.0)]);
+        assert_eq!(check_return_spacing(&r, 3600.0), Ok(None));
+        assert_eq!(min_group_step(&r), None);
+    }
+
+    #[test]
+    fn groups_are_checked_separately() {
+        let r = rows(&[(1, 0.0), (2, 10.0), (1, 3600.0), (2, 3610.0)]);
+        assert_eq!(check_return_spacing(&r, 3600.0), Ok(Some(3600.0)));
+        assert_eq!(min_group_step(&r), Some(3600.0));
+    }
+
+    #[test]
+    fn equal_timestamps_and_nan_are_skipped() {
+        let r = rows(&[(1, 0.0), (1, 0.0), (1, f64::NAN), (1, 3600.0)]);
+        assert_eq!(check_return_spacing(&r, 3600.0), Ok(Some(3600.0)));
+    }
+
+    #[test]
+    fn nonpositive_horizon_skips() {
+        let r = rows(&[(1, 0.0), (1, 1.0)]);
+        assert_eq!(check_return_spacing(&r, 0.0), Ok(Some(1.0)));
     }
 }
 
