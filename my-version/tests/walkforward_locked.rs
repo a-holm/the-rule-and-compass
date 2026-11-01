@@ -233,3 +233,48 @@ fn a_window_that_reaches_the_range_is_refused_without_the_sealed_read() {
     let (code, _, err) = wf(&poisoned, &window(LOCK_START + 10 * H), &none);
     assert_ne!(code, 0, "{err}");
 }
+
+#[test]
+fn locked_ranges_are_dropped_at_read_time_on_the_store_and_the_table_path() {
+    use rcsr::walkforward::{self, EvalSpec, ProtocolOptions, Window};
+    let mut csv = String::from("ts,sym,x,target\n");
+    for i in 0..40 {
+        csv.push_str(&format!("{},{},{},{}\n", i, if i % 2 == 0 { "A" } else { "B" }, i, 0.001 * (i % 5) as f64));
+    }
+    let table = data::parse_table(&csv).unwrap();
+    let dir = scratch("library");
+    let path = s(&dir.join("t.rcsb"));
+    store::write_store_with_time(&path, &table, 7, Some(0)).unwrap();
+    let spec = EvalSpec {
+        expression: "x".to_string(),
+        vars: vec!["x".to_string()],
+        target: "target".to_string(),
+        time: "ts".to_string(),
+        group: Some("sym".to_string()),
+        windows: vec![Window { label: "w".to_string(), train_start: 0.0, train_end: 20.0, test_start: 20.0, test_end: 40.0 }],
+        horizon: 0.0,
+        embargo: None,
+        cost_bps: 10.0,
+        threshold_quantile: 0.5,
+        threshold_fixed: None,
+        validation_frac: 0.0,
+        periods_per_year: Some(4.0),
+        candidates: Vec::new(),
+        band_select: false,
+        pool_reset_flat: false,
+        allow_lockbox: false,
+        device_pnl: false,
+        control_seed: 0,
+        policy: walkforward::Policy::Threshold,
+        band_width: 0.0,
+        min_hold: 1,
+        gpu: false,
+    };
+    let open = ProtocolOptions::default();
+    let locked = ProtocolOptions { locked_ranges: vec![(30, 36)], ..ProtocolOptions::default() };
+    let rows = |r: &walkforward::Report| r.windows[0].test_rows;
+    assert_eq!(rows(&walkforward::run_path_with(&path, &spec, &open).unwrap()), 20);
+    assert_eq!(rows(&walkforward::run_path_with(&path, &spec, &locked).unwrap()), 14);
+    assert_eq!(rows(&walkforward::run_table_with(&table, &spec, "t", &open).unwrap()), 20);
+    assert_eq!(rows(&walkforward::run_table_with(&table, &spec, "t", &locked).unwrap()), 14);
+}
