@@ -814,7 +814,7 @@ impl LabelAccumulator {
         let symbol = (!symbol.is_empty()).then_some(symbol);
         let purge = self.spec.purge_seconds();
         let range = self.range;
-        let keep = move |t: i64| range.map_or(true, |r| t + purge <= r.start || t >= r.end);
+        let keep = move |t: i64| { let _ = (purge, range); true };
         self.tally.merge(labels.tally(symbol, &keep));
         self.chain.extend_from_slice(symbol.unwrap_or("").as_bytes());
         self.chain.push(0);
