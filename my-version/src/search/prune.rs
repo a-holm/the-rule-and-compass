@@ -300,6 +300,7 @@ mod tests {
     fn cfg() -> Config {
         Config {
             metric: Metric::Squared,
+            prune: true,
             ..Config::default()
         }
     }

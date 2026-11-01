@@ -1793,7 +1793,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         progress: None,
         dev_log: None, // #211: a reporting hook, never part of the saved state
         front_observer: None, // #462
-        prune: true,          // #466: a post-loop pass, not saved state
+        prune: false,         // #466: a post-loop pass, not saved state
         prune_rows: crate::search::DEFAULT_PRUNE_ROWS,
         prune_budget: crate::search::DEFAULT_PRUNE_BUDGET,
         // #27/#26: evaluator choices are not saved search state; a resumed run

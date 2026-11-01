@@ -711,10 +711,11 @@ SEARCH:
                              first constant of an island is kept (#477). Saved
                              search setting, off by default
                              and restores the pre-#76 trajectory exactly
-  --no-prune                 keep neutral code on the final front: skip the
-                             data-driven prune that replaces subtrees with a
-                             child or a constant when the training error stays
-                             within 1e-6 (1 + |e|) (#466)
+  --prune                    remove neutral code from the final front (off by
+                             default): replace subtrees with a child or a
+                             constant when the training error stays within
+                             1e-6 (1 + |e|) of the original (#466)
+  --no-prune                 keep the prune off (the default)
   --prune-rows <N>           rows the prune fits on (default 20000, >= 2); a
                              larger training sample is subsampled
   --prune-budget <N>         cap on candidate fits per run (default 20000,
@@ -2803,6 +2804,7 @@ fn main() {
                 fit_fallback_max_set = true;
             }
             // #466: front prune; a post-loop pass, not saved search state.
+            "--prune" => cfg.prune = true,
             "--no-prune" => cfg.prune = false,
             "--prune-rows" => {
                 let v = val!();
@@ -7294,7 +7296,7 @@ fn main() {
             } else {
                 String::new()
             };
-            // #466: omitted with --no-prune, which keeps the historical JSON.
+            // #466: omitted unless --prune is given, which keeps the historical JSON.
             let prune_json = if cfg.prune && cfg.prune_budget > 0 {
                 format!(
                     "\"prune\":{{\"fits\":{},\"accepted\":{},\"seconds\":{}}},",

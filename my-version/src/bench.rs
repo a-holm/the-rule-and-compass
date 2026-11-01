@@ -394,7 +394,7 @@ pub struct Knobs {
     pub variation: Option<crate::search::VariationMode>,
     pub selection: Option<crate::search::Selection>,
     pub dispatch: Option<crate::dispatch::DispatchMode>,
-    /// #466: `Some(false)` turns the front prune off (`--no-prune`).
+    /// #466: `Some(true)` turns the front prune on (`--prune`).
     pub prune: Option<bool>,
     /// #470: `--linear-scaling`.
     pub linear_scaling: bool,
@@ -530,7 +530,7 @@ pub struct RunResult {
     pub fit_attempts: Option<usize>,
     pub fit_gpu: Option<usize>,
     pub fit_fallback: Option<usize>,
-    /// #466: seconds the front prune took (0 with `--no-prune`).
+    /// #466: seconds the front prune took (0 unless `--prune`).
     pub prune_s: f64,
 }
 

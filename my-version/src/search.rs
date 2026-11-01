@@ -653,7 +653,7 @@ impl Default for Config {
             progress: None,
             dev_log: None, // #211: off unless --dev-log is given
             front_observer: None, // #462
-            prune: true,          // #466
+            prune: false,         // #466: opt in with --prune
             prune_rows: DEFAULT_PRUNE_ROWS,
             prune_budget: DEFAULT_PRUNE_BUDGET,
             simd: true, // #27
@@ -5433,7 +5433,7 @@ pub struct Outcome {
     /// by the development log's `run_end` event; it is not printed, so the
     /// default output is unchanged.
     pub stop_reason: &'static str,
-    /// #466: what the front prune did; all zero with `--no-prune`.
+    /// #466: what the front prune did; all zero unless `--prune` is given.
     pub prune: PruneReport,
     /// #482: offspring scored over the run, summed over islands and
     /// generations, including generations before a resume.

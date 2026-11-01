@@ -309,15 +309,15 @@ fn logging_on_or_off_leaves_the_archive_results_and_config_hash_identical() {
         let manifest = std::fs::read_to_string(dir.join(format!("{}.manifest", name))).unwrap();
         outputs.push((name.to_string(), tsv, json, manifest));
     }
-    // `elapsed_seconds`, every `*_seconds` in `timing` and `prune.seconds` are
-    // wall clock; the rest of the JSON document must be identical.
+    // `elapsed_seconds` and every `*_seconds` in `timing` are wall clock; the
+    // rest of the JSON document must be identical.
     let strip = |text: &str| -> Vec<String> {
         let v = Json::parse(text).expect("the JSON result parses");
         let mut fields = match v {
             Json::Obj(f) => f,
             _ => panic!("the JSON result is an object"),
         };
-        fields.retain(|(k, _)| k != "elapsed_seconds" && k != "timing" && k != "baselines" && k != "prune");
+        fields.retain(|(k, _)| k != "elapsed_seconds" && k != "timing" && k != "baselines");
         fields
             .into_iter()
             .map(|(k, v)| format!("{:?}", (k, v)))
