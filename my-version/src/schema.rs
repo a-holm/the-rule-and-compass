@@ -240,8 +240,6 @@ pub fn json() -> String {
 {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"none\",\"description\":\"column store (.rcsb) or CSV table\"}},\
 {{\"name\":\"--target\",\"type\":\"string\",\"default\":\"none\",\"description\":\"forward-return column used for P&L\"}},\
 {{\"name\":\"--expr\",\"type\":\"string\",\"default\":\"none\",\"description\":\"score expression; variables resolve by column name; repeat to select candidates on validation\"}},\
-{{\"name\":\"--front\",\"type\":\"string\",\"default\":\"none\",\"description\":\"#482 take the candidates from the Pareto front of a run.json (one candidate per member, labelled front_rank_<k>); --vars, --target (the run target_spec.return_column), --trials (search.candidates_evaluated) and the position rule (objective.spec.threshold as a fixed threshold, objective.spec.per_side_bps as the cost) default to the run, explicit flags win; refused with --expr; refuses a window whose test_start is below the last train or validation time of the run plus its required purge (exit 2); the selection block carries source, run, run_sha256 and candidate_labels\"}},\
-{{\"name\":\"--allow-in-sample-windows\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"#482 with --front: report a window that overlaps the run training or validation rows as in_sample:true instead of refusing it; diagnostics only\"}},\
 {{\"name\":\"--select-band\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"#308 banded finalist selection: screen repeated candidates with the fused long-only validation P&L, admit K=max(8,P/16) plus an epsilon band, rescore admitted candidates on full validation rows in exact CPU f64 and rank by (net, turnover, complexity, index); JSON carries surrogate_rank, exact_rank, band, epsilon, finalists_considered, recall_band and scored_by=cpu_f64; needs --validation-frac > 0\"}},\
 {{\"name\":\"--vars\",\"type\":\"csv\",\"default\":\"all numeric except target/time/group\",\"description\":\"feature columns\"}},\
 {{\"name\":\"--time\",\"type\":\"string\",\"default\":\"none\",\"description\":\"time/ordering column\"}},\
@@ -311,6 +309,7 @@ pub fn json() -> String {
 {{\"name\":\"--input\",\"type\":\"path\",\"default\":\"none\",\"description\":\"CSV/TSV/ZIP file or a directory searched recursively\"}},\
 {{\"name\":\"--format\",\"type\":\"enum\",\"default\":\"auto\",\"description\":\"auto | binance | bitstamp | ohlcv (aliased header)\"}},\
 {{\"name\":\"--symbol\",\"type\":\"string\",\"default\":\"derived\",\"description\":\"symbol override for a single-file input\"}},\
+{{\"name\":\"--symbols\",\"type\":\"path\",\"default\":\"none\",\"description\":\"keep only the symbols listed in the file (one per line, # comments); the manifest universe block records the file SHA-256 and the kept, dropped, missing and empty symbols\"}},\
 {{\"name\":\"--tz\",\"type\":\"string\",\"default\":\"UTC\",\"description\":\"UTC, +HH:MM, America/New_York or Europe/London\"}},\
 {{\"name\":\"--calendar\",\"type\":\"enum\",\"default\":\"24x7\",\"description\":\"24x7 | nyse | lse\"}},\
 {{\"name\":\"--resample\",\"type\":\"enum\",\"default\":\"none\",\"description\":\"1m..1w, calendar-aware; OHLC exact, flows summed\"}},\
@@ -381,6 +380,7 @@ pub fn json() -> String {
 {{\"name\":\"--outage-share\",\"type\":\"float\",\"default\":\"0.5\",\"description\":\"build: share of the cross-section missing for a venue outage\"}},\
 {{\"name\":\"--replay\",\"type\":\"int\",\"default\":\"3\",\"description\":\"validate: prefix-causality cuts\"}},\
 {{\"name\":\"--snapshot\",\"type\":\"path\",\"default\":\"none\",\"description\":\"verified archive-snapshot JSON embedded in the panel manifest\"}},\
+{{\"name\":\"--symbols\",\"type\":\"path\",\"default\":\"none\",\"description\":\"snapshot, base: keep only the symbols listed in the file (one per line, # comments); snapshot.json and the base manifest carry a universe block with the file SHA-256, listed, kept, dropped, missing and empty; base --resume rebuilds when the list changes\"}},\
 {{\"name\":\"--family\",\"type\":\"path\",\"default\":\"none\",\"description\":\"append: symbol-major store that carries the family columns (computed by rcsr enrich)\"}},\
 {{\"name\":\"--columns\",\"type\":\"csv\",\"default\":\"none\",\"description\":\"append: registered columns to carry into the time-major panel by (symbol, ts) key; schema and append write <panel>.schema.json\"}},\
 {{\"name\":\"--verify\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"schema: re-hash the store and exit 3 when a column hash differs from <panel>.schema.json\"}},\

@@ -192,7 +192,6 @@ Every window also lists the long-only controls (cash, buy-and-hold, constant
 long/flat from the training mean, matched-exposure random long seeded by
 `--control-seed`) with exposure, turnover, beta and excess over cash; see
 `src/baselines.rs`.
-`--front run.json` takes the candidates from the Pareto front of a run, carries the run's threshold and per-side cost, defaults `--trials` to the offspring the search scored and refuses a window that tests rows the run trained or selected on (`docs/walkforward.md`).
 Pass `--batch-pnl` to score every candidate on every window in one batch (`src/wf_batch.rs`, kernel `src/cuda/wf_batch.cu`), per window and pooled, with the baseline ladder; finalist values stay exact CPU f64 and batch values are labelled `gpu_proxy`.
 `--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
 associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
@@ -541,7 +540,9 @@ atomically instead of streaming it. See
   builds `panel_hourly_default.rcsb` in staged, cacheable steps. `snapshot` hashes
   every archive and lists the duplicate and invalid-OHLC bars. `base` keeps only
   full four-bar hours (`cov15m`), collapses identical duplicate instants, flags
-  differing ones and stores the unit of each source. `build` keeps point-in-time
+  differing ones and stores the unit of each source. `--symbols <file>` on
+  `snapshot` and `base` keeps only a pinned symbol universe (for example the
+  output of `rcsr-acquire universe`). `build` keeps point-in-time
   members, numbers listings, fails on an undeclared level jump and refuses the
   lockbox. `validate` runs V1-V12 and exits 3 on a failure. See
   [`docs/panel.md`](docs/panel.md#default-hourly-panel-v2-259).

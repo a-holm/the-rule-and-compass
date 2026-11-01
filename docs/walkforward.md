@@ -117,32 +117,6 @@ finalist with exhaustive CPU selection. A wider band costs only exact CPU
 rescores; a narrower one fails the recall audit rather than silently dropping
 the winner.
 
-## Candidates from a run's front (`--front`)
-
-`rcsr walkforward --front run.json` takes every `pareto[k].expression` of a `run.json` as one candidate, labelled `front_rank_<k+1>` in archive order. It replaces `--expr` (passing both exits 2). With one member the walk-forward is the single-expression case. An empty front, a run without `split.train_time` (no time column) and an expression that uses a column missing from `--data` exit 3.
-
-Defaults taken from the run, each overridden by its explicit flag:
-
-| setting | run.json field | flag |
-|---|---|---|
-| variables | `variables` | `--vars` |
-| return column | `target_spec.return_column` | `--target` |
-| trials of the deflated Sharpe | `search.candidates_evaluated` (offspring scored over the run, summed over islands and generations, kept across `--resume`) | `--trials` (without either, exit 2) |
-| position rule | `objective.spec.threshold`, used as a fixed threshold | `--threshold-fixed`, `--threshold-quantile` |
-| per-side cost | `objective.spec.per_side_bps` | `--cost-bps` |
-
-A run with an `--objective` selects under `1[pred > threshold]`. Without the carried threshold the walk-forward would use its 0.70 training quantile and score the front under a different book than the one it was selected on.
-
-In-sample guard: `run.json` records `split.train_time` and `split.validation_time` as `[first, last]` raw time keys. With `seen = max(train_time[1], validation_time[1])` and `purge = split.required_purge_seconds` (else `split.purge_seconds`), a window with `test_start < seen + purge` exits 2:
-
-```
-error: window 'w1' tests rows the run trained or selected on (test_start 150 < last seen 179 + purge 5)
-```
-
-`--allow-in-sample-windows` downgrades the refusal: the window is scored and its JSON carries `"in_sample":true`. Use it for diagnostics only.
-
-The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA-256 of the file) and `candidate_labels`. `--select-band` and `--batch-pnl` work unchanged on the front's candidates.
-
 ## Position rule, costs and aggregation
 
 * `position = 1` if `score > threshold`, the score is finite and the shared
