@@ -216,6 +216,41 @@ pub struct TradingRows {
     pub funding: Vec<f64>,
 }
 
+impl TradingRows {
+    /// First row of its group.
+    pub const FIRST: u8 = 1;
+    /// Last row of its group.
+    pub const LAST: u8 = 2;
+
+    /// Each group is one contiguous run and time is non-decreasing inside a run.
+    pub fn is_canonical(&self) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..self.group.len() {
+            if i > 0 && self.group[i] == self.group[i - 1] {
+                if self.time[i] < self.time[i - 1] {
+                    return false;
+                }
+            } else if !seen.insert(self.group[i]) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Bit `FIRST` on the first row of each group, bit `LAST` on the last.
+    /// Valid only on canonical rows.
+    pub fn seam_flags(&self) -> Vec<u8> {
+        let n = self.group.len();
+        (0..n)
+            .map(|i| {
+                let first = i == 0 || self.group[i] != self.group[i - 1];
+                let last = i + 1 == n || self.group[i] != self.group[i + 1];
+                (if first { Self::FIRST } else { 0 }) | (if last { Self::LAST } else { 0 })
+            })
+            .collect()
+    }
+}
+
 /// Net P&L, growth and drawdown of one comparison book.
 #[derive(Clone, Copy, Debug)]
 pub struct Headline {
@@ -846,5 +881,31 @@ impl FinalistReport {
             line("validation", &self.validation),
             line("test", &self.test)
         )
+    }
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    fn rows(group: &[u64], time: &[f64]) -> TradingRows {
+        TradingRows { time: time.to_vec(), group: group.to_vec(), funding: Vec::new() }
+    }
+
+    #[test]
+    fn is_canonical_needs_contiguous_groups_and_ordered_time() {
+        assert!(rows(&[0, 0, 1, 1, 1, 2], &[0.0, 1.0, 0.0, 0.0, 5.0, 3.0]).is_canonical());
+        assert!(!rows(&[0, 1, 0, 1], &[0.0, 0.0, 1.0, 1.0]).is_canonical());
+        assert!(!rows(&[0, 0, 1], &[1.0, 0.0, 0.0]).is_canonical());
+        assert!(rows(&[], &[]).is_canonical());
+    }
+
+    #[test]
+    fn seam_flags_mark_one_first_and_one_last_per_group() {
+        let r = rows(&[0, 0, 0, 1, 2, 2], &[0.0; 6]);
+        let f = r.seam_flags();
+        assert_eq!(f, vec![1, 0, 2, 3, 1, 2]);
+        assert_eq!(f.iter().filter(|&&x| x & TradingRows::FIRST != 0).count(), 3);
+        assert_eq!(f.iter().filter(|&&x| x & TradingRows::LAST != 0).count(), 3);
     }
 }

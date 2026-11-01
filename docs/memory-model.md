@@ -51,6 +51,8 @@ time from a 364-column store, the resident storage term falls from about
 `device_tile_bytes` but is not host RSS. `store_memory` in `--json` exposes all
 of these terms.
 
+Row expressions (`--filter`, `--exclude`, `--train-select`, `--test-select`) keep the projection on: the numeric store columns each expression reads join the projected names, and an expression that names an unknown column exits 2 before any column is read. `store_memory.projection` in `--json` is `on` or the reason the read is not projected (`--no-project`, `no --vars`, `no --time`, `no --group-by`, `--dtype`, `--sample-rows`, `projection unresolved`).
+
 The GPU transport pins **3 slots × one projected group**, capped at **64 MB**.
 At `group_rows = 65 536` and 21 `f64`/`i64` columns that is 11 MB per slot,
 33 MB for the ring. The pin is constant for the life of the run; groups stream

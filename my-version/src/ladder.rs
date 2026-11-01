@@ -26,6 +26,7 @@
 use crate::baselines;
 use crate::data::{self, Table};
 use crate::devlog::num;
+use crate::gpu_stats::{RunLedger, Stage};
 use crate::inference::{self, Bh, Dsr, Pbo, Spa};
 use crate::protocol::{self, WindowRow};
 use crate::risk::{risk_stats, BetaAlpha, DEFAULT_SORTINO_MAR};
@@ -981,6 +982,8 @@ pub struct Report {
     pub sr_wall_seconds: Option<f64>,
     pub gbm_trees: usize,
     pub notes: Vec<String>,
+    /// #284: run-scoped phase ledger (`io`, `pnl`, `host_other`); empty until a run fills it.
+    pub ledger: RunLedger,
 }
 
 fn rank_vec(v: &[f64]) -> Vec<f64> {
@@ -1226,6 +1229,15 @@ fn return_space_mse(p: &Panel, pool: &Pool, opts: &Options, score: &[f64]) -> f6
 
 /// Run the whole ladder.
 pub fn run_ladder(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report, String> {
+    let started = Instant::now();
+    let mut report = run_ladder_rungs(p, folds, opts)?;
+    let wall = started.elapsed().as_secs_f64();
+    report.ledger.record_stage(Stage::Pnl, wall);
+    report.ledger.set_wall(wall);
+    Ok(report)
+}
+
+fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report, String> {
     if opts.quantiles.is_empty() {
         return Err("--quantiles needs at least one value".to_string());
     }
@@ -1716,6 +1728,7 @@ fn finish_report(
         sr_wall_seconds: opts.sr_wall_seconds,
         gbm_trees: opts.gbm_trees,
         notes: std::mem::take(notes),
+        ledger: RunLedger::new(),
     })
 }
 
@@ -1820,7 +1833,7 @@ impl Report {
             "{{\"schema\":{},\"folds\":{},\"periods\":{},\"rows_scored\":{},\"periods_per_year\":{},\"block_len\":{},\
 \"cost_bps\":{},\"cost\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
 \"sr_candidate_evaluations\":{},\"sr_wall_seconds\":{},\"gbm_beats_sr\":{}}},\"multiple_testing\":{{\"draws\":{},\"seed\":{},\
-\"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"rungs\":[{}]}}",
+\"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"rungs\":[{}],\"ledger\":{}}}",
             jstr(SCHEMA),
             jarr_str(&self.folds),
             self.periods,
@@ -1843,7 +1856,15 @@ impl Report {
             dsr,
             pbo,
             jarr_str(&self.notes),
-            rows.join(",")
+            rows.join(","),
+            if self.ledger.wall_s() > 0.0 {
+                self.ledger.phase_json(
+                    "ladder",
+                    &[Stage::Vary, Stage::Eval, Stage::Fit, Stage::Select, Stage::Archive, Stage::Features],
+                )
+            } else {
+                "null".to_string()
+            }
         )
     }
 
@@ -2080,7 +2101,8 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --fdr-q <q>               BH-FDR level (default 0.10)\n\
   --pbo-blocks <even n>     CSCV blocks (default 8)\n\
   --seed <n>                seed of every draw (default 0)\n\
-  --out <file>              write the JSON report\n\
+  --out <file>              write the JSON report (ends with a ledger object: io and\n\
+                            pnl seconds on the run wall)\n\
   --markdown <file|->       write the Markdown table\n\
   --json                    print the JSON report\n"
 }
@@ -2102,6 +2124,7 @@ pub fn run(args: &[String]) -> ! {
 }
 
 fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
+    let t_run = Instant::now();
     let usage_err = |m: String| (2, m);
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{}", usage());
@@ -2183,6 +2206,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         return Err(usage_err("--pbo-blocks must be an even number of at least 2".to_string()));
     }
     let input_err = |m: String| (3, m);
+    let t_io = Instant::now();
     if let Some(path) = &spec_path {
         let text = std::fs::read_to_string(path).map_err(|e| input_err(format!("{}: {}", path, e)))?;
         let specs = crate::target::parse_file(&text).map_err(|e| input_err(format!("{}: {}", path, e)))?;
@@ -2223,7 +2247,15 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     };
     let panel = load_panel(&inp, &opts).map_err(input_err)?;
     let folds = make_folds(&panel, &rows, opts.purge_seconds).map_err(input_err)?;
-    let report = run_ladder(&panel, &folds, &opts).map_err(input_err)?;
+    let io_s = t_io.elapsed().as_secs_f64();
+    let mut report = run_ladder(&panel, &folds, &opts).map_err(input_err)?;
+    let mut ledger = RunLedger::new();
+    ledger.record_stage(Stage::Io, io_s);
+    ledger.record_stage(Stage::Pnl, report.ledger.stage_s(Stage::Pnl));
+    let wall = t_run.elapsed().as_secs_f64();
+    ledger.record_stage(Stage::HostOther, wall - ledger.stage_sum_s());
+    ledger.set_wall(wall);
+    report.ledger = ledger;
     let json = report.json();
     if let Some(p) = &out {
         std::fs::write(p, &json).map_err(|e| input_err(format!("{}: {}", p, e)))?;
