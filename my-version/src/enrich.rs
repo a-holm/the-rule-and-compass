@@ -1,5 +1,4 @@
 //! `rcsr enrich` — append pre-computed OHLCV features to an existing store,
-                f.rows_left_out.map(|n| format!(" left_out_rows={}", n)).unwrap_or_default()
 //! (issue #200).
 //!
 //! The store is read **column by column, one symbol at a time**. Every feature
@@ -1745,7 +1744,8 @@ impl Report {
                 f.first_finite_time
                     .map(format_utc_seconds)
                     .unwrap_or_else(|| "none".to_string()),
-                f.label
+                f.label,
+                f.rows_left_out.map(|n| format!(" left_out_rows={}", n)).unwrap_or_default()
             ));
         }
         for l in &self.long_labels {
