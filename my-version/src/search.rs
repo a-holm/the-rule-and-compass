@@ -175,6 +175,10 @@ pub struct Config {
     pub fit_report: bool,
     /// Discard structurally duplicated offspring before evaluating them.
     pub dedup: bool,
+    /// #477: reject offspring and random trees with no row-dependent input
+    /// before the constant fit, except the first constant of an island.
+    /// Saved search state.
+    pub reject_constant_offspring: bool,
     /// Wall-clock budget in seconds; `None` means no limit.
     pub time_budget: Option<f64>,
     /// Stop after this many generations with no improvement (0 disables).
@@ -343,6 +347,9 @@ pub struct GenCounters {
     /// #463: candidates dropped after the fit because they exceeded the
     /// complexity cap; each one re-enters variation.
     pub post_fit_drops: std::sync::atomic::AtomicU64,
+    /// #477: offspring rejected before the fit because no input reaches the
+    /// rows outside an aggregate or meta operator.
+    pub constant: std::sync::atomic::AtomicU64,
     /// Whether the fit, eval and batch timers read the clock. Off outside a
     /// development log; the counts are kept either way.
     pub timed: bool,
@@ -533,6 +540,7 @@ impl Default for Config {
             fit_admission: crate::fit::FitAdmission::Screened,
             fit_report: false,
             dedup: true,
+            reject_constant_offspring: false,
             time_budget: None,
             patience: 40,
             predictor_samples: None,
@@ -600,6 +608,7 @@ impl Config {
         compare!(ops, "ops");
         compare!(migration_interval, "migration_interval");
         compare!(restart_interval, "restart_interval");
+        compare!(reject_constant_offspring, "reject_constant_offspring"); // #477
         compare!(init_depth, "init_depth");
         compare!(fit_iters, "fit_iters");
         compare!(fit_strategy, "fit_strategy"); // #116
@@ -4725,6 +4734,33 @@ fn offer(sink: &Option<(&std::sync::mpsc::SyncSender<PipelineJob>, usize)>, slot
     }
 }
 
+/// #477: draw `make()` again (up to 8 times) while it returns a tree with no
+/// row-dependent input and `have_const` says the island already holds one. The
+/// first constant tree is kept and sets `have_const`. Off, or with no input
+/// variable, it is a single draw.
+fn draw_row_dependent(
+    cfg: &Config,
+    nvars: usize,
+    have_const: &mut bool,
+    mut make: impl FnMut() -> Node,
+) -> Node {
+    let mut t = make();
+    if !cfg.reject_constant_offspring || nvars == 0 {
+        return t;
+    }
+    for _ in 0..8 {
+        if expr::row_dependent(&t) {
+            return t;
+        }
+        if !*have_const {
+            *have_const = true;
+            return t;
+        }
+        t = make();
+    }
+    t
+}
+
 /// Evolve one island by a single generation. Pure with respect to the rest of
 /// the world, so it can run on its own thread.
 #[allow(clippy::too_many_arguments)]
@@ -4793,6 +4829,10 @@ fn evolve_island(
         }
     }
 
+    // #477: whether `next` already holds a constant individual. Only the
+    // first constant of an island is kept when the filter is on.
+    let filter_constant = cfg.reject_constant_offspring && nvars > 0;
+    let mut have_const = filter_constant && next.iter().any(|i| !expr::row_dependent(&i.tree));
     let mut seen: HashSet<u64> = HashSet::with_capacity(pop * 2);
     // #77: parents are candidates too; seeding them here rejects an unchanged
     // child before it is fitted and scored.
@@ -4852,10 +4892,16 @@ fn evolve_island(
                 GenCounters::count(counters, |c| &c.too_complex); // #211
                 continue;
             }
+            let is_const = filter_constant && !expr::row_dependent(&tree); // #477
+            if is_const && have_const {
+                GenCounters::count(counters, |c| &c.constant);
+                continue;
+            }
             if cfg.dedup && !seen.insert(expr::structural_hash(&tree)) {
                 GenCounters::count(counters, |c| &c.duplicates); // #211
                 continue;
             }
+            have_const |= is_const;
             trees.push(tree);
             ages.push(age);
         }
@@ -4877,7 +4923,9 @@ fn evolve_island(
     if next.len() < pop {
         let trees: Vec<Node> = (next.len()..pop)
             .map(|_| {
-                expr::simplify(&random_tree_with(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs)))
+                draw_row_dependent(cfg, nvars, &mut have_const, || {
+                    expr::simplify(&random_tree_with(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs)))
+                })
             })
             .collect();
         for ind in fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters) {
@@ -5755,6 +5803,7 @@ fn dev_generation(
         eval_cpu_s: GenCounters::seconds(counters, |c| &c.eval_ns) + fallback_s,
         phase_b_s: GenCounters::seconds(counters, |c| &c.batch_ns),
         post_fit_drops: GenCounters::total(counters, |c| &c.post_fit_drops) as usize,
+        constant_rejected: GenCounters::total(counters, |c| &c.constant) as usize,
         best_error,
         p05: q(0.05),
         p25: q(0.25),
@@ -7629,14 +7678,11 @@ fn run_search(
                         } else {
                             None
                         };
+                        let mut have_const = false; // #477
                         for ind in islands[ii].iter_mut() {
-                            let mut t = random_tree_with(
-                                &mut r,
-                                nvars,
-                                &cfg.ops,
-                                cfg.init_depth,
-                                Some(&aggs),
-                            );
+                            let mut t = draw_row_dependent(cfg, nvars, &mut have_const, || {
+                                random_tree_with(&mut r, nvars, &cfg.ops, cfg.init_depth, Some(&aggs))
+                            });
                             if let Some(target) = qd_target {
                                 let mut best = t.clone();
                                 let mut best_d = qd::descriptor(&t, gen_train);

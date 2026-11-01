@@ -687,6 +687,11 @@ SEARCH:
                              constant fitting; single target; off by default (#470)
   --no-front-parents         draw every parent from the island tournament;
                              turns off the 15% Pareto-front feedback (#76)
+  --reject-constant-offspring
+                             reject offspring and random trees with no input
+                             outside an aggregate before the constant fit; the
+                             first constant of an island is kept (#477). Saved
+                             search setting, off by default
                              and restores the pre-#76 trajectory exactly
   --no-simd                  force the scalar tree walk instead of the
                              SoA/AVX evaluator (same results, slower; an
@@ -2375,6 +2380,7 @@ fn main() {
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
     let mut front_parents_set = false;
+    let mut reject_constant_set = false;
     // #465: explicit --selection for the resume settings check.
     let mut selection_set = false;
     let mut linear_scaling_set = false; // #470
@@ -2894,6 +2900,10 @@ fn main() {
             "--no-front-parents" => {
                 cfg.front_parents = false;
                 front_parents_set = true;
+            }
+            "--reject-constant-offspring" => {
+                cfg.reject_constant_offspring = true;
+                reject_constant_set = true;
             }
             // #27: evaluator path only; deliberately not a saved search
             // setting, because both paths produce identical errors.
@@ -3469,6 +3479,12 @@ fn main() {
             conflicts.push(format!(
                 "--no-front-parents (saved front_parents is {})",
                 saved.front_parents
+            ));
+        }
+        if reject_constant_set && cfg.reject_constant_offspring != saved.reject_constant_offspring {
+            conflicts.push(format!(
+                "--reject-constant-offspring (saved reject_constant_offspring is {})",
+                saved.reject_constant_offspring
             ));
         }
         if let Some(spec) = &op_complexity_spec {
