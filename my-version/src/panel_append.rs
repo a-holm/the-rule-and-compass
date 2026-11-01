@@ -169,7 +169,8 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
         let _ = std::fs::remove_file(f);
     }
     let output_sha256 = result?;
-    let schema = registry::write_schema(&opts.out, &opts.panel_version)?;
+    let declared = crate::lockbox::declared_for(&opts.target);
+    let schema = registry::write_schema_declared(&opts.out, &opts.panel_version, declared.as_ref())?;
     let after = manifest::sha256_file(&opts.target)?;
     Ok(AppendReport {
         input_sha256_before: before,

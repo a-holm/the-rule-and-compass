@@ -1562,6 +1562,10 @@ pub struct SplitSpec {
     /// #145: permit a train or test row inside the 2026H2 lockbox. `false` is
     /// the safe default for every caller of [`prepare_full`].
     pub allow_lockbox: bool,
+    /// #486: the protocol locked test declared with the data or by `--lockbox`.
+    /// Train, validation and test rows inside it are refused; `allow_lockbox`
+    /// does not open it.
+    pub declared_lockbox: Option<crate::lockbox::Declared>,
     /// #254: label end offset of the declared target, seconds. Training rows
     /// within this many seconds of a validation or test row are dropped.
     pub purge_seconds: Option<f64>,
@@ -1592,6 +1596,7 @@ impl Default for SplitSpec {
             exclude: None,
             time: TimeSpec::default(),
             allow_lockbox: false,
+            declared_lockbox: None,
             purge_seconds: None,
             scale_column: None,
             trading: None,
@@ -4164,6 +4169,12 @@ fn check_split_lockbox(
     report.lockbox_train = guard.check_times("training split", &train_times)?;
     report.lockbox_validation = guard.check_times("validation split", &validation_times)?;
     report.lockbox_test = guard.check_times("test split", &test_times)?;
+    if let Some(d) = &spec.declared_lockbox {
+        let name = t.names.get(tc).map(String::as_str).unwrap_or("time");
+        d.check_times("training split", name, &train_times)?;
+        d.check_times("validation split", name, &validation_times)?;
+        d.check_times("test split", name, &test_times)?;
+    }
     Ok(())
 }
 

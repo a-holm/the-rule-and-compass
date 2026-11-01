@@ -237,8 +237,12 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              a look-ahead on time series; reported as centred
   --allow-interpolate        permit --fill interpolate on time-ordered data
   --allow-lockbox            permit train/validation/test rows in 2026H2 (declared final test only)
-  --lockbox <START,END>      declared locked test for the run.json `lockbox` object (UTC,
-                             half-open; default 2026-07-01,2027-01-01)
+  --lockbox <START,END>      declared locked test (UTC, half-open). Overrides the range
+                             declared with the data (<data>.manifest.json, .schema.json,
+                             .enrich.json or <csv>.lockbox.json). Train, validation and
+                             test rows inside it are refused (exit 3); run.json `lockbox`
+                             reports rows, date range, read count, declared, source,
+                             rows_in_scope, evaluated
   --ledger <file>            candidate ledger whose locked reads run.json counts
   --arm <name>              ablation arm label; run.json gains an `ablation` object with the arm,
                              the SHA-256 of the ordered variable list, the generation budget and
@@ -4406,6 +4410,10 @@ fn main() {
         trading_spec = Some(tspec);
     }
 
+    let declared_lockbox = rcsr::lockbox::resolve_declared(lockbox_arg.as_deref(), &data_path).unwrap_or_else(|e| {
+        eprintln!("error: --lockbox: {}", e);
+        std::process::exit(EXIT_USAGE);
+    });
     let spec = data::SplitSpec {
         mode,
         time_col,
@@ -4423,6 +4431,7 @@ fn main() {
             tz,
         },
         allow_lockbox,
+        declared_lockbox,
         purge_seconds: target_resolved.as_ref().map(|r| r.spec.required_purge_seconds()),
         trading: trading_cols.clone(),
         canonical_train_order: false,
@@ -5908,6 +5917,12 @@ fn main() {
                     eprintln!("error: {}", e);
                     std::process::exit(EXIT_INPUT);
                 }
+                if let Some(d) = &spec.declared_lockbox {
+                    if let Err(e) = d.check_times("cross-validation rows", name, &times) {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_INPUT);
+                    }
+                }
             }
         }
     }
@@ -6506,11 +6521,8 @@ fn main() {
             );
             // #264: lockbox facts of the loaded table (rows, date range, read count).
             let lockbox_json = {
-                let lockbox = match lockbox_arg.as_deref() {
-                    Some(s) => rcsr::lockbox::Lockbox::parse(s).unwrap_or_else(|e| {
-                        eprintln!("error: --lockbox: {}", e);
-                        std::process::exit(EXIT_USAGE);
-                    }),
+                let lockbox = match &spec.declared_lockbox {
+                    Some(d) => d.lockbox,
                     None => rcsr::lockbox::Lockbox::crypto_2026h2(),
                 };
                 let times: Vec<i64> = match time_name.as_deref().and_then(|n| table.index_of(n).ok()) {
@@ -6528,9 +6540,15 @@ fn main() {
                     .as_ref()
                     .map(|p| rcsr::protocol::Ledger::new(p).read_count().unwrap_or(0))
                     .unwrap_or(0);
-                let mut j = lockbox.json(&overlap, allow_lockbox, false, allow_lockbox && overlap.rows > 0);
+                let evaluated = spec.declared_lockbox.is_none() && allow_lockbox && overlap.rows > 0;
+                let mut j = lockbox.json(&overlap, allow_lockbox, false, evaluated);
                 j.pop();
-                j.push_str(&format!(",\"read_count\":{}}}", reads));
+                j.push_str(&format!(",\"read_count\":{}", reads));
+                if let Some(d) = &spec.declared_lockbox {
+                    j.push(',');
+                    j.push_str(&d.report_fields(0, false, prepared.report.lockbox_checked));
+                }
+                j.push('}');
                 j
             };
             let seeds_json: Vec<String> = seed_rows
@@ -9336,9 +9354,12 @@ OPTIONS:
   --ledger <file>            append-only JSONL candidate ledger. A development
                              run appends a candidate (test_read:false) and
                              refuses windows that touch the declared lockbox
-  --lockbox <START,END>      declared locked test, UTC half-open (default
-                             2025-07-01,2026-07-01); active with --ledger or
-                             --locked-test
+  --lockbox <START,END>      declared locked test, UTC half-open. Overrides the
+                             range declared with --data (store manifest, schema
+                             or sidecar). Default without a declaration:
+                             2025-07-01,2026-07-01, active with --ledger or
+                             --locked-test. A window touching it is refused
+                             (exit 3) unless --locked-test reads it
   --locked-test              read the locked test once for a sealed candidate.
                              Needs --ledger and --sealed. A second read, an
                              unsealed candidate or a code/data hash that differs
@@ -9918,19 +9939,14 @@ fn run_walkforward(args: &[String]) -> ! {
         min_hold,
         gpu,
     };
-    let declared_lock: Option<(f64, f64)> = if ledger_path.is_some() || locked_test || lockbox_arg.is_some() {
-        match &lockbox_arg {
-            Some(s) => match rcsr::lockbox::Lockbox::parse(s) {
-                Ok(l) => Some((l.start as f64, l.end as f64)),
-                Err(e) => {
-                    eprintln!("error: --lockbox: {}", e);
-                    std::process::exit(EXIT_USAGE);
-                }
-            },
-            None => Some(rcsr::protocol::default_locked_range()),
-        }
-    } else {
-        None
+    let declared = rcsr::lockbox::resolve_declared(lockbox_arg.as_deref(), &data_path).unwrap_or_else(|e| {
+        eprintln!("error: --lockbox: {}", e);
+        std::process::exit(EXIT_USAGE);
+    });
+    let declared_lock: Option<(f64, f64)> = match &declared {
+        Some(d) => Some((d.lockbox.start as f64, d.lockbox.end as f64)),
+        None if ledger_path.is_some() || locked_test => Some(rcsr::protocol::default_locked_range()),
+        None => None,
     };
     if locked_test && (ledger_path.is_none() || sealed_path.is_none()) {
         eprintln!("error: --locked-test needs --ledger and --sealed");
@@ -10067,10 +10083,17 @@ fn run_walkforward(args: &[String]) -> ! {
             last_ts: if rows > 0 { Some(last) } else { None },
             read_count,
         };
+        let mut lockbox_facts = facts.json();
+        if let Some(d) = &declared {
+            lockbox_facts.pop();
+            lockbox_facts.push(',');
+            lockbox_facts.push_str(&d.report_fields(rows, locked_test, true));
+            lockbox_facts.push('}');
+        }
         protocol_json = Some(format!(
             "{{\"lockbox\":{},\"candidate_id\":{},\"report_sha256\":{},\"test_read\":{},\
              \"ledger\":{},\"windows_scheme\":{}}}",
-            facts.json(),
+            lockbox_facts,
             if ledger.is_some() { format!("\"{}\"", candidate_id) } else { "null".to_string() },
             format!("\"{}\"", report_sha),
             locked_test,

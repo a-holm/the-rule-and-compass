@@ -1538,10 +1538,12 @@ fn usage() -> &'static str {
             [--search-args \"...\"] [--score-args \"...\"] [--verdict-args \"...\"]\n\
             writes <arm>.arm.json (arm, feature list, SHA-256, generation budget, seeds), plan.json,\n\
             a copy of the definition and commands.sh\n\
-  prepare   --definition <file> --data <csv|rcsb> --time <col> --group <col> --out <csv>\n\
+  prepare   --definition <file> --data <csv|rcsb> --time <col> --group <col> --out <csv> [--lockbox START,END]\n\
+            writes <csv>.lockbox.json when the data (or --lockbox) declares a locked test\n\
             [--keep a,b] [--seed 0]\n\
             writes the projection CSV with placebo and circular-block-permuted columns\n\
   score     (--run <run.json> | --from-run <run.json>) --data <csv|rcsb> --target <col> --time <col> --windows <file> --out <file>\n\
+            [--lockbox START,END]  a fold touching the declared locked test is refused (exit 3)\n\
             [--group <col>] [--return-col <col>] [--scheme expanding] [--thresholds 0.6,0.7,0.8]\n\
             [--headline-threshold 0.7] [--cost-bps 12 | --cost-override <bp>] [--purge-seconds 219600] [--target-spec <file>]\n\
             scores the run's finalist (objective.finalist.expression) on every fold. --target-spec sets the per-side cost\n\
@@ -1680,6 +1682,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             .map_err(|e| (3, e))?;
             let out = fl.need("--out")?;
             std::fs::write(out, csv).map_err(|e| io_err(out, e))?;
+            if let Some(d) = crate::lockbox::resolve_declared(fl.opt("--lockbox"), data).map_err(|e| (2, format!("--lockbox: {}", e)))? {
+                crate::lockbox::write_sidecar(out, &d.lockbox, "rcsr ablation prepare").map_err(|e| (3, e))?;
+            }
             println!("wrote {}", out);
             Ok(())
         }
@@ -1764,7 +1769,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             let wtext = std::fs::read_to_string(windows_path).map_err(|e| io_err(windows_path, e))?;
             let rows = protocol::parse_windows_csv(&wtext, Some(fl.opt("--scheme").unwrap_or("expanding"))).map_err(|e| (3, e))?;
             let panel = ladder::load_panel(&inp, &opts).map_err(|e| (3, e))?;
-            let folds = ladder::make_folds(&panel, &rows, opts.purge_seconds).map_err(|e| (3, e))?;
+            let declared = crate::lockbox::resolve_declared(fl.opt("--lockbox"), fl.need("--data")?).map_err(|e| (2, format!("--lockbox: {}", e)))?;
+            let guard = declared.as_ref().map(|d| (d.lockbox.start as f64, d.lockbox.end as f64));
+            let folds = ladder::make_folds(&panel, &rows, opts.purge_seconds, guard).map_err(|e| (3, e))?;
             let res = match &book {
                 Some(b) => score_run_fixed(&facts, &panel, &folds, b.threshold, &opts),
                 None => score_run(&facts, &panel, &folds, &thresholds, headline, &opts),
@@ -1781,7 +1788,10 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 None => "{\"kind\":\"quantile\"}".to_string(),
             };
             let json = res.json();
-            let json = format!("{},\"cost\":{},\"threshold_rule\":{}}}", &json[..json.len() - 1], cost_decl.json(), rule);
+            let mut json = format!("{},\"cost\":{},\"threshold_rule\":{}}}", &json[..json.len() - 1], cost_decl.json(), rule);
+            if let Some(d) = &declared {
+                json = d.splice_report(&json, 0, false, true);
+            }
             let out = fl.need("--out")?;
             std::fs::write(out, json + "\n").map_err(|e| io_err(out, e))?;
             println!("wrote {}", out);

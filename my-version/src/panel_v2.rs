@@ -1425,6 +1425,8 @@ pub struct PanelOptions {
     pub out: String,
     pub group_rows: usize,
     pub allow_lockbox: bool,
+    /// Protocol locked test declared with the store (`--locked-test START,END`).
+    pub locked_test: Option<Lockbox>,
     pub snapshot: Option<String>,
     /// A gap longer than this many days between two base bars of one symbol
     /// starts a new listing.
@@ -1447,6 +1449,7 @@ impl PanelOptions {
             out: out.to_string(),
             group_rows: store::DEFAULT_GROUP_ROWS,
             allow_lockbox: false,
+            locked_test: None,
             snapshot: None,
             listing_gap_days: 30,
             relists: Vec::new(),
@@ -1905,7 +1908,11 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
     debug_assert!(panel.rows.iter().zip(&asm.rows).all(|(a, b)| a == &b.row));
     let table = v2_table(&asm.rows);
     store::write_store_with_time(&opts.out, &table, opts.group_rows, Some(0))?;
-    crate::registry::write_schema(&opts.out, crate::registry::DEFAULT_PANEL_VERSION)?;
+    crate::registry::write_schema_declared(
+        &opts.out,
+        crate::registry::DEFAULT_PANEL_VERSION,
+        opts.locked_test.as_ref(),
+    )?;
     let ledger_misses = ledger_violations(&asm.rows, &membership);
     let snapshot_text = match &opts.snapshot {
         Some(p) => {
@@ -1934,7 +1941,11 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
     let block = v2_block(opts, &asm, &q, invalid_ohlc, base_quality.as_deref(), ledger_misses);
     let marker = "  \"output\":";
     let at = text.rfind(marker).ok_or("manifest has no output block")?;
-    text.insert_str(at, &format!("  \"v2\":{},\n", block));
+    let locked = opts
+        .locked_test
+        .map(|lt| format!("  \"locked_test\":{},\n", lt.declaration_json("rcsr panel build --locked-test")))
+        .unwrap_or_default();
+    text.insert_str(at, &format!("{}  \"v2\":{},\n", locked, block));
     let manifest_path = format!("{}.manifest.json", opts.out);
     std::fs::write(&manifest_path, text).map_err(|e| format!("{}: {}", manifest_path, e))?;
     Ok(PanelSummary {
@@ -2378,6 +2389,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
     let mut base: Option<String> = None;
     let mut jobs = 1usize;
     let mut keep_partial = false;
+    let mut locked_test: Option<Lockbox> = None;
     let mut allow_lockbox = false;
     let mut resume: Option<String> = None;
     let mut group_rows = store::DEFAULT_GROUP_ROWS;
@@ -2430,10 +2442,16 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
             "--no-gpu" | "--cpu" => gpu = Some(GpuMode::Off),
             "--keep-partial" => keep_partial = true,
             "--require-full-bucket" => keep_partial = false,
+            "--locked-test" => {
+                locked_test = Some(Lockbox::parse(&value(args, &mut i)).unwrap_or_else(|e| cli_usage(&format!("--locked-test: {}", e))))
+            }
             "--allow-lockbox" => allow_lockbox = true,
             other => cli_usage(&format!("unknown option '{}' for `rcsr panel {}` (hourly v2)", other, cmd)),
         }
         i += 1;
+    }
+    if locked_test.is_some() && cmd != "build" {
+        cli_usage(&format!("--locked-test applies to `rcsr panel build`, not `{}`", cmd));
     }
     if gpu.is_some() && cmd != "base" && cmd != "build" {
         cli_usage(&format!("--gpu applies to `rcsr panel base` and `rcsr panel build`, not `{}`", cmd));
@@ -2442,6 +2460,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
         let mut p = PanelOptions::new(data.as_deref().unwrap_or(""), membership, out);
         p.group_rows = group_rows;
         p.allow_lockbox = allow_lockbox;
+        p.locked_test = locked_test;
         p.snapshot = snapshot.clone();
         p.listing_gap_days = listing_gap_days;
         p.relists = std::mem::take(&mut relists);

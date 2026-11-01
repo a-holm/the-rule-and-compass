@@ -319,15 +319,24 @@ fn opt_i64(v: Option<i64>) -> String {
 }
 
 /// Serialise the schema: a header line, one line per column.
-pub fn schema_json(columns: &[ColumnSchema], rows: usize, panel_version: &str) -> String {
+pub fn schema_json(
+    columns: &[ColumnSchema],
+    rows: usize,
+    panel_version: &str,
+    locked_test: Option<&crate::lockbox::Lockbox>,
+) -> String {
+    let locked = locked_test
+        .map(|l| format!("\"locked_test\":{},", l.declaration_json("rcsr panel build --locked-test")))
+        .unwrap_or_default();
     let mut s = format!(
         "{{\"panel_version\":{},\"schema_version\":{},\"feature_registry_version\":{},\
-         \"compact_parity_owner\":\"#{}\",\"rows\":{},\"columns\":[\n",
+         \"compact_parity_owner\":\"#{}\",\"rows\":{},{}\"columns\":[\n",
         esc(panel_version),
         SCHEMA_VERSION,
         FEATURE_REGISTRY_VERSION,
         PARITY_OWNER_ISSUE,
-        rows
+        rows,
+        locked
     );
     for (i, c) in columns.iter().enumerate() {
         let r = &c.resolved;
@@ -359,11 +368,24 @@ pub fn schema_json(columns: &[ColumnSchema], rows: usize, panel_version: &str) -
     s
 }
 
-/// Hash every column of `store_path` and write `<store_path>.schema.json`.
+/// Hash every column of `store_path` and write `<store_path>.schema.json`,
+/// keeping the locked test already declared in that schema.
 pub fn write_schema(store_path: &str, panel_version: &str) -> Result<String, String> {
+    let kept = std::fs::read_to_string(schema_path(store_path))
+        .ok()
+        .and_then(|t| crate::lockbox::Lockbox::from_declaration(&t));
+    write_schema_declared(store_path, panel_version, kept.as_ref())
+}
+
+/// As [`write_schema`], with an explicit locked test declaration (or none).
+pub fn write_schema_declared(
+    store_path: &str,
+    panel_version: &str,
+    locked_test: Option<&crate::lockbox::Lockbox>,
+) -> Result<String, String> {
     let store = FileStore::open(store_path)?;
     let columns = build_schema(&store)?;
-    let text = schema_json(&columns, store.n_rows(), panel_version);
+    let text = schema_json(&columns, store.n_rows(), panel_version, locked_test);
     let out = schema_path(store_path);
     std::fs::write(&out, text).map_err(|e| format!("{}: {}", out, e))?;
     Ok(out)

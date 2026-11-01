@@ -31,7 +31,7 @@ pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--skip-malformed", "flag", "false", "drop data rows whose field count differs from the header and report the count; default refuses the file with an input error naming the 1-based line"),
         ("--test-frac", "float", "0.25", "held-out fraction"),
         ("--allow-lockbox", "flag", "false", "permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only)"),
-        ("--lockbox", "string", "2026-07-01,2027-01-01", "declared locked test START,END (UTC, half-open) reported in the run.json lockbox object: rows, date range, read count"),
+        ("--lockbox", "string", "declared with the data", "declared locked test START,END (UTC, half-open); overrides the range stored in the data's manifest, schema or sidecar. Train, validation and test rows inside it are refused (exit 3). The run.json lockbox object reports rows, date range, read count, declared, source, rows_in_scope, evaluated"),
         ("--ledger", "string", "none", "candidate ledger (JSONL) whose locked-test reads run.json reports as lockbox.read_count"),
         ("--arm", "string", "none", "ablation arm label (A0..A5). run.json gains an ablation object with arm, feature_list_sha256 (SHA-256 of the ordered variable list, one name per line), generation_budget (--generations) and generations_run, so an arm can be audited and its seeds compared. See rcsr ablation"),
         ("--target-spec", "string", "<data stem>.targets.json when present", "declared target spec (rcsr-target-spec/1): D13 structure refusal, purge derived from the label window, zero-parameter rung baselines.target_structure; see \"target_spec\""),
@@ -277,7 +277,7 @@ pub fn json() -> String {
 {{\"name\":\"--pbo-blocks\",\"type\":\"int\",\"default\":\"16\",\"description\":\"even block count S of the CSCV PBO\"}},\
 {{\"name\":\"--fdr-q\",\"type\":\"float\",\"default\":\"0.10\",\"description\":\"Benjamini-Hochberg false discovery rate\"}},\
 {{\"name\":\"--ledger\",\"type\":\"string\",\"default\":\"none\",\"description\":\"append-only JSONL candidate ledger; a development run appends a candidate with test_read:false and refuses windows that touch the declared lockbox\"}},\
-{{\"name\":\"--lockbox\",\"type\":\"string\",\"default\":\"2025-07-01,2026-07-01\",\"description\":\"START,END of the declared locked test (UTC, half-open); active with --ledger or --locked-test\"}},\
+{{\"name\":\"--lockbox\",\"type\":\"string\",\"default\":\"declared with the data, else 2025-07-01,2026-07-01\",\"description\":\"START,END of the declared locked test (UTC, half-open); overrides the range stored with --data; a window touching it is refused unless --locked-test reads it\"}},\
 {{\"name\":\"--locked-test\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"read the locked test once for a sealed candidate; needs --ledger and --sealed, refuses a second read and any code or data hash that differs from the sealed entry\"}},\
 {{\"name\":\"--sealed\",\"type\":\"string\",\"default\":\"none\",\"description\":\"locked_candidates.json written by `rcsr protocol seal`\"}},\
 {{\"name\":\"--verify-read\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"with --locked-test: re-run a recorded read and compare its report hash; records nothing\"}},\
@@ -368,6 +368,7 @@ pub fn json() -> String {
 {{\"name\":\"--start\",\"type\":\"time\",\"default\":\"panelfirst\",\"description\":\"explicit evaluated range start; checked against the lockbox\"}},\
 {{\"name\":\"--end\",\"type\":\"time\",\"default\":\"panellast\",\"description\":\"explicit evaluated range end; checked against the lockbox\"}},\
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit an explicitly evaluated 2026H2 range\"}},\
+{{\"name\":\"--locked-test\",\"type\":\"string\",\"default\":\"none\",\"description\":\"build: START,END of the protocol locked test, written to the manifest and the schema; every evaluator then refuses it\"}},\
 {{\"name\":\"--resume\",\"type\":\"path\",\"default\":\"none\",\"description\":\"resumable build cache: one atomic binary .part per symbol keyed by the store SHA-256 and the membership; a fully warm run reads the parts only\"}},\
 {{\"name\":\"--input\",\"type\":\"path\",\"default\":\"none\",\"description\":\"snapshot and base: archive directory of monthly 15m ZIPs\"}},\
 {{\"name\":\"--jobs\",\"type\":\"int\",\"default\":\"1\",\"description\":\"snapshot and base: parallel symbols\"}},\

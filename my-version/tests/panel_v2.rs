@@ -813,3 +813,78 @@ fn a_cpu_pit_join_under_auto_is_labelled_in_the_panel_manifest() {
         manifest::sha256_file(&dir.join("auto.rcsb")).unwrap()
     );
 }
+
+#[test]
+fn locked_test_declaration_travels_with_the_store() {
+    use rcsr::lockbox::{self, Lockbox};
+    use rcsr::panel_append::{self, AppendOptions};
+
+    let dir = scratch("locked-test");
+    let (raw, m) = market(&dir, 24 * 40);
+    let base = dir.join("base.rcsb");
+    panel_v2::build_base(&base_opts(&raw, &base)).unwrap();
+    let lb = Lockbox { start: T0 + 250 * H, end: T0 + 300 * H };
+
+    let plain = dir.join("plain.rcsb");
+    panel_v2::build_panel(&panel_opts(&base, &m, &plain)).unwrap();
+    assert_eq!(lockbox::declared_for(plain.to_str().unwrap()), None);
+
+    let panel = dir.join("panel.rcsb");
+    let mut p = panel_opts(&base, &m, &panel);
+    p.locked_test = Some(lb);
+    panel_v2::build_panel(&p).unwrap();
+    let (panel_s, base_s) = (panel.to_str().unwrap(), base.to_str().unwrap());
+    let manifest_text = std::fs::read_to_string(format!("{panel_s}.manifest.json")).unwrap();
+    let schema_text = std::fs::read_to_string(format!("{panel_s}.schema.json")).unwrap();
+    for text in [&manifest_text, &schema_text] {
+        assert_eq!(Lockbox::from_declaration(text), Some(lb));
+        assert!(text.contains("\"start_date\":\"2021-01-11\""), "{text}");
+    }
+    assert!(registry_verify(panel_s));
+
+    // `rcsr panel schema` regenerates the schema and keeps the declaration
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(["panel", "schema", "--data", panel_s])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(lockbox::declared_for(panel_s), Some(lb));
+
+    // enrich on the base carries a declared range into its sidecar
+    let fam = dir.join("fam.rcsb");
+    let range = format!("{},{}", lb.start, lb.end);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(["enrich", "--data", base_s, "--out", fam.to_str().unwrap(), "--features", "r1", "--locked-test", &range])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(lockbox::declared_for(fam.to_str().unwrap()), Some(lb));
+
+    // enrich copies the declaration of its input
+    let fam2 = dir.join("fam2.rcsb");
+    std::fs::write(format!("{base_s}.lockbox.json"), format!("{{\"locked_test\":{}}}", lb.declaration_json("t"))).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(["enrich", "--data", base_s, "--out", fam2.to_str().unwrap(), "--features", "r1"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(lockbox::declared_for(fam2.to_str().unwrap()), Some(lb));
+
+    // append writes the target's declaration into the output schema
+    let appended = dir.join("appended.rcsb");
+    panel_append::append_family(&AppendOptions {
+        target: panel_s.to_string(),
+        family: fam.to_str().unwrap().to_string(),
+        columns: vec!["r1".to_string()],
+        out: appended.to_str().unwrap().to_string(),
+        panel_version: "2".to_string(),
+        scratch: Some(dir.join("scratch").to_str().unwrap().to_string()),
+    })
+    .unwrap();
+    assert_eq!(lockbox::declared_for(appended.to_str().unwrap()), Some(lb));
+    assert!(registry_verify(appended.to_str().unwrap()));
+}
+
+fn registry_verify(store: &str) -> bool {
+    rcsr::registry::verify_schema(store).unwrap().is_empty()
+}
