@@ -1231,9 +1231,10 @@ impl Accum {
         let forced = self.forced.as_deref();
         for (window_index, mut d) in self.windows.into_iter().enumerate() {
             {
+                let labelled = d.test_rows.iter().filter(|r| r.target.is_finite());
                 let book = crate::trading::TradingRows {
-                    time: d.test_rows.iter().map(|r| r.time).collect(),
-                    group: d.test_rows.iter().map(|r| r.group).collect(),
+                    time: labelled.clone().map(|r| r.time).collect(),
+                    group: labelled.map(|r| r.group).collect(),
                     funding: Vec::new(),
                 };
                 let step = crate::trading::check_return_spacing(&book, spec.horizon)
