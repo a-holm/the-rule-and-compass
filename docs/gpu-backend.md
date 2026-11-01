@@ -1290,8 +1290,29 @@ refits), so at this measured ratio its fallback residue projects from 36 362 s
 to about 8 400 s; that projection is not a run on that cell and is labelled as
 such.
 
+**Finalist refit band (#495).** `full_data_archive` scores every unique tree of
+the archive and the final populations on all training rows with the carried
+constants, then refits exactly (`fit::fit_weighted_metric`, `--fit-iters`, all
+rows) only the trees that can reach the front. The envelope `env(c)` is the
+lowest finite pre-refit error among trees of cost `<= c`; tree `t` is refit when
+`pre(t) <= env(cost(t)) + band * |env(cost(t))|`. The refit is metric-monotone,
+so errors only fall. The front is then rebuilt from refit errors (refit trees)
+and pre-refit errors (the rest), and every front member that was not refit is
+refit, repeating until none is left, so every reported member is an exact CPU
+f64 refit. The refit set depends only on errors, costs and structural hashes,
+never on timing. `--refit-band F` sets the relative band (default `0.001`);
+`--refit-band inf` refits every unique tree and reproduces the archive hash of
+the full refit. The band is a saved search setting, written to a checkpoint only
+when it differs from the default; a resume refuses a different explicit value.
+`gpu.fit.refit_candidates` (unique trees), `refits`, `refit_s` (refit window
+wall) and `rescore_s` (full-data scoring wall) report the work; the development
+log `run_end` carries `fit_refit_s` and `fit_refits`. With a CPU fit strategy, a
+multi-output sample or `--fit-iters 0` nothing is refit and the tree set is only
+re-scored.
+
 **Exactness.** Search fitness is still f32 and only guides selection. Every
-finalist is refit by the exact CPU f64 LM on all training rows before the final
+reported finalist is refit by the exact CPU f64 LM on all training rows (see the
+band above) before the final
 archive is rebuilt, and the archive is then scored by the CPU in f64. Reported
 constants and metrics therefore never come from f32. The unit tests upload the
 same f64 rows the CPU arm uses; the kernel's final constants then match the CPU
