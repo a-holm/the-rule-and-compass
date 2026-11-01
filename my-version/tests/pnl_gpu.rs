@@ -671,20 +671,13 @@ mod device {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1_000_000);
-        let population = 256usize;
+        let population: usize = std::env::var("RCSR_PNL_BENCH_POP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&p| p > 0)
+            .unwrap_or(256);
         let params = PnlParams::default();
 
-        // Score generation is identical for both arms and excluded from the
-        // timed section, so the comparison is position/cost/count work plus the
-        // device H2D transfer of the declared tile.
-        let mut score_sets: Vec<Vec<f64>> = Vec::with_capacity(population);
-        for p in 0..population {
-            let mut s = Vec::with_capacity(n);
-            for i in 0..n {
-                s.push((((i * 37 + p * 17) % 1009) as f64 / 500.0) - 1.0);
-            }
-            score_sets.push(s);
-        }
         let mut returns = Vec::with_capacity(n);
         let mut groups = Vec::with_capacity(n);
         for i in 0..n {
@@ -692,32 +685,55 @@ mod device {
             groups.push((i / 20_000) as u64);
         }
 
-        let cpu_start = std::time::Instant::now();
-        let mut cpu_net = 0.0f64;
-        for s in &score_sets {
-            let r = reduce(s, &returns, &groups, &params).unwrap();
-            cpu_net += r.strategy.net;
-        }
-        let cpu_s = cpu_start.elapsed().as_secs_f64();
-
+        // Scores are generated per tile and excluded from the timed sections,
+        // so host memory holds one tile, never the population. The CPU arm
+        // reads the f32-cast scores the device receives. Timed work is the
+        // position/cost/count reduction plus, for the device, packing and the
+        // H2D transfer of the declared tile.
         let tile = MAX_TILE_CANDIDATES;
         let mut dev = rcsr::trading_gpu::DevicePnl::new(&returns, &groups, 8_192)
             .expect("device P&L context");
         let thresholds = vec![0.0f64; tile];
-        let gpu_start = std::time::Instant::now();
+        let mut cpu_s = 0.0f64;
+        let mut gpu_s = 0.0f64;
+        let mut cpu_net = 0.0f64;
         let mut gpu_net = 0.0f64;
         for base in (0..population).step_by(tile) {
             let count = tile.min(population - base);
+            let mut score_sets: Vec<Vec<f64>> = Vec::with_capacity(count);
+            for p in base..base + count {
+                let mut s = Vec::with_capacity(n);
+                for i in 0..n {
+                    let v = (((i * 37 + p * 17) % 1009) as f64 / 500.0) - 1.0;
+                    s.push(v as f32 as f64);
+                }
+                score_sets.push(s);
+            }
+
+            let cpu_start = std::time::Instant::now();
+            let mut cpu_tile = Vec::with_capacity(count);
+            for s in &score_sets {
+                cpu_tile.push(reduce(s, &returns, &groups, &params).unwrap().strategy.net);
+            }
+            cpu_s += cpu_start.elapsed().as_secs_f64();
+
+            let gpu_start = std::time::Instant::now();
             let mut packed: Vec<f32> = Vec::with_capacity(count * n);
-            for s in &score_sets[base..base + count] {
+            for s in &score_sets {
                 packed.extend(s.iter().map(|&v| v as f32));
             }
             let totals = dev
                 .eval(&packed, &thresholds[..count], params.per_side_bps, 256, 65_536)
                 .expect("device P&L");
+            gpu_s += gpu_start.elapsed().as_secs_f64();
+
+            for (k, t) in totals.iter().enumerate() {
+                let rel = (t.net - cpu_tile[k]).abs() / cpu_tile[k].abs().max(1e-30);
+                assert!(rel <= 1e-9, "individual {}: relative net error {}", base + k, rel);
+            }
+            cpu_net += cpu_tile.iter().sum::<f64>();
             gpu_net += totals.iter().map(|t| t.net).sum::<f64>();
         }
-        let gpu_s = gpu_start.elapsed().as_secs_f64();
         let row_evals = (population * n) as f64;
         let speedup = cpu_s / gpu_s;
         println!(
