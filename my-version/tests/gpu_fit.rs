@@ -61,7 +61,6 @@ fn metrics_without_an_admitted_scorer_never_use_the_gpu_evaluator() {
         Metric::RankCorrelationSigned,
         Metric::Interquartile,
         Metric::Auc,
-        Metric::Slope,
         Metric::ImplicitDerivative,
     ];
     for metric in metrics {
@@ -110,6 +109,7 @@ fn native_score_objectives_are_table_driven() {
         Metric::Hinge,
         Metric::HingeOrdinary,
         Metric::HingeSquared,
+        Metric::Slope,
     ] {
         assert!(
             rcsr::metrics::native_score_objective(metric).is_some(),

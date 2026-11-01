@@ -863,8 +863,27 @@ extern "C" {
         outsse: *mut f64,
         outstatus: *mut i32,
     ) -> f32;
-    /* SM-1: the fit kernel's loss statistics and f64 J^T r at the start
-       constants, `4 + kmax` doubles per candidate. Test support. */
+    /* #236: `rc_fit_batch` from the start constants `c0`; the slope arm keeps
+       the incoming constants `cbase` unless it improves on them. */
+    fn rc_fit_batch_from(
+        ctx: *mut RawCtx,
+        prog: *const u32,
+        off: *const u32,
+        pcount: *const i32,
+        nprog: i32,
+        kmax: i32,
+        c0: *const f64,
+        cbase: *const f64,
+        gauge: *const i32,
+        iters: i32,
+        metric: i32,
+        outc: *mut f64,
+        outsse: *mut f64,
+        outstatus: *mut i32,
+    ) -> f32;
+    /* SM-1: the fit kernel's loss statistics, f64 J^T r and (#236) the packed
+       f64 J^T J at the start constants, `4 + kmax + kmax(kmax+1)/2` doubles
+       per candidate. Test support. */
     #[cfg(test)]
     fn rc_fit_probe(
         ctx: *mut RawCtx,
@@ -2402,6 +2421,37 @@ impl GpuEvaluator {
         iters: usize,
         loss: crate::fit::DeviceLoss,
     ) -> (Vec<GpuFitOutput>, f32) {
+        self.fit_launch(plans, None, false, iters, loss)
+    }
+
+    /// #236: [`Self::fit_batch`] from explicit start constants, one vector per
+    /// plan in slot order. With `keep_incoming` the slope arm returns a plan's
+    /// own constants (`plan.c0`) unless its answer is finite and strictly lower
+    /// on the f64 slope sum.
+    pub(crate) fn fit_batch_from(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        starts: &[Vec<f64>],
+        keep_incoming: bool,
+        iters: usize,
+        loss: crate::fit::DeviceLoss,
+    ) -> (Vec<GpuFitOutput>, f32) {
+        if starts.len() != plans.len()
+            || starts.iter().zip(plans).any(|(c, p)| c.len() != p.nconst)
+        {
+            return (Vec::new(), -1.0);
+        }
+        self.fit_launch(plans, Some(starts), keep_incoming, iters, loss)
+    }
+
+    fn fit_launch(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        starts: Option<&[Vec<f64>]>,
+        keep_incoming: bool,
+        iters: usize,
+        loss: crate::fit::DeviceLoss,
+    ) -> (Vec<GpuFitOutput>, f32) {
         let nprog = plans.len();
         if nprog == 0 {
             return (Vec::new(), 0.0);
@@ -2414,34 +2464,58 @@ impl GpuEvaluator {
         let mut off: Vec<u32> = Vec::with_capacity(nprog + 1);
         let mut pcount: Vec<i32> = Vec::with_capacity(nprog);
         let mut c0 = vec![0.0f64; nprog * kmax];
+        let mut cbase = if keep_incoming { vec![0.0f64; nprog * kmax] } else { Vec::new() };
         let mut gauge = vec![-1i32; nprog * 2];
         off.push(0);
         for (k, plan) in plans.iter().enumerate() {
             words.extend_from_slice(&plan.words);
             off.push(words.len() as u32);
             pcount.push(plan.nconst as i32);
-            c0[k * kmax..k * kmax + plan.nconst].copy_from_slice(&plan.c0);
+            let start = starts.map_or(&plan.c0, |s| &s[k]);
+            c0[k * kmax..k * kmax + plan.nconst].copy_from_slice(start);
+            if keep_incoming {
+                cbase[k * kmax..k * kmax + plan.nconst].copy_from_slice(&plan.c0);
+            }
             gauge[k * 2..k * 2 + 2].copy_from_slice(&plan.gauge);
         }
         let mut outc = vec![0.0f64; nprog * kmax];
         let mut outsse = vec![0.0f64; nprog];
         let mut outstatus = vec![0i32; nprog];
         let ms = unsafe {
-            rc_fit_batch(
-                self.ctx,
-                words.as_ptr(),
-                off.as_ptr(),
-                pcount.as_ptr(),
-                nprog as i32,
-                kmax as i32,
-                c0.as_ptr(),
-                gauge.as_ptr(),
-                iters as i32,
-                loss.code(),
-                outc.as_mut_ptr(),
-                outsse.as_mut_ptr(),
-                outstatus.as_mut_ptr(),
-            )
+            if starts.is_none() && !keep_incoming {
+                rc_fit_batch(
+                    self.ctx,
+                    words.as_ptr(),
+                    off.as_ptr(),
+                    pcount.as_ptr(),
+                    nprog as i32,
+                    kmax as i32,
+                    c0.as_ptr(),
+                    gauge.as_ptr(),
+                    iters as i32,
+                    loss.code(),
+                    outc.as_mut_ptr(),
+                    outsse.as_mut_ptr(),
+                    outstatus.as_mut_ptr(),
+                )
+            } else {
+                rc_fit_batch_from(
+                    self.ctx,
+                    words.as_ptr(),
+                    off.as_ptr(),
+                    pcount.as_ptr(),
+                    nprog as i32,
+                    kmax as i32,
+                    c0.as_ptr(),
+                    if keep_incoming { cbase.as_ptr() } else { std::ptr::null() },
+                    gauge.as_ptr(),
+                    iters as i32,
+                    loss.code(),
+                    outc.as_mut_ptr(),
+                    outsse.as_mut_ptr(),
+                    outstatus.as_mut_ptr(),
+                )
+            }
         };
         if ms < 0.0 {
             return (Vec::new(), ms);
@@ -2458,18 +2532,77 @@ impl GpuEvaluator {
         (out, ms)
     }
 
+    /// #236: the device slope arm, host-chained like
+    /// [`Self::order_stat_fit_batch`].
+    ///
+    /// The squared fit is the CPU arm's own warm start and sets the level that
+    /// slope cannot see. The slope IRLS then runs from it on the consecutive-row
+    /// pairs of the resident sample, and the kernel returns each plan's incoming
+    /// constants unless its answer is finite and strictly lower on the f64
+    /// slope, so the arm obeys the CPU's metric-monotone rule. `sse` is the
+    /// slope itself (the f64 pair sum over `n − 1`). A plan whose squared start
+    /// is unusable keeps that start's status, and the caller labels its CPU
+    /// fallback. `iters == 0` returns the incoming constants without a launch.
+    pub(crate) fn slope_fit_batch(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        iters: usize,
+    ) -> (Vec<GpuFitOutput>, f32) {
+        if iters == 0 {
+            let out = plans
+                .iter()
+                .map(|p| GpuFitOutput {
+                    c: p.c0.clone(),
+                    sse: f64::NAN,
+                    status: 0,
+                })
+                .collect();
+            return (out, 0.0);
+        }
+        let (mut out, lm_ms) = self.fit_batch(plans, iters, crate::fit::DeviceLoss::Squared);
+        if out.len() != plans.len() {
+            return (Vec::new(), -1.0);
+        }
+        let idx: Vec<usize> = (0..out.len())
+            .filter(|&k| {
+                crate::fit::fit_status_usable(out[k].status) && out[k].c.iter().all(|v| v.is_finite())
+            })
+            .collect();
+        if idx.is_empty() {
+            return (out, lm_ms);
+        }
+        let sub: Vec<&crate::fit::GpuFitPlan> = idx.iter().map(|&k| plans[k]).collect();
+        let starts: Vec<Vec<f64>> = idx.iter().map(|&k| out[k].c.clone()).collect();
+        let (res, ms) =
+            self.fit_batch_from(&sub, &starts, true, iters, crate::fit::DeviceLoss::Slope);
+        if ms < 0.0 || res.len() != sub.len() {
+            return (Vec::new(), -1.0);
+        }
+        let pairs = (self.n_rows as f64 - 1.0).max(1.0);
+        for (j, &k) in idx.iter().enumerate() {
+            out[k] = GpuFitOutput {
+                c: res[j].c.clone(),
+                sse: res[j].sse / pairs,
+                status: res[j].status,
+            };
+        }
+        (out, lm_ms + ms)
+    }
+
     /// SM-1: the loss statistics `fit_kernel` sees at each plan's start
     /// constants, without a step: `[f32 assembly, f32 trial, f64 assembly,
-    /// f64 trial]` and the f64 assembly's `Jᵀr`. `phase` selects the
-    /// `hinge_ordinary` triple (0 logistic, 1 majorise-minimise). `None` when
-    /// the device refused the batch.
+    /// f64 trial]`, the f64 assembly's `Jᵀr` and (#236) its packed lower
+    /// `JᵀJ` (`[i(i+1)/2 + j]`). `phase` selects the `hinge_ordinary` triple
+    /// (0 logistic, 1 majorise-minimise). `None` when the device refused the
+    /// batch.
     #[cfg(test)]
+    #[allow(clippy::type_complexity)]
     pub(crate) fn fit_probe(
         &mut self,
         plans: &[&crate::fit::GpuFitPlan],
         loss: crate::fit::DeviceLoss,
         phase: i32,
-    ) -> Option<Vec<([f64; 4], Vec<f64>)>> {
+    ) -> Option<Vec<([f64; 4], Vec<f64>, Vec<f64>)>> {
         let nprog = plans.len();
         let kmax = plans.iter().map(|p| p.nconst).max().unwrap_or(0);
         if nprog == 0 || kmax == 0 {
@@ -2486,7 +2619,7 @@ impl GpuEvaluator {
             pcount.push(plan.nconst as i32);
             c0[k * kmax..k * kmax + plan.nconst].copy_from_slice(&plan.c0);
         }
-        let stride = 4 + kmax;
+        let stride = 4 + kmax + kmax * (kmax + 1) / 2;
         let mut out = vec![0.0f64; nprog * stride];
         let rc = unsafe {
             rc_fit_probe(
@@ -2511,7 +2644,12 @@ impl GpuEvaluator {
                 .enumerate()
                 .map(|(k, plan)| {
                     let o = &out[k * stride..(k + 1) * stride];
-                    ([o[0], o[1], o[2], o[3]], o[4..4 + plan.nconst].to_vec())
+                    let p = plan.nconst;
+                    (
+                        [o[0], o[1], o[2], o[3]],
+                        o[4..4 + p].to_vec(),
+                        o[4 + kmax..4 + kmax + p * (p + 1) / 2].to_vec(),
+                    )
                 })
                 .collect(),
         )
@@ -10348,3 +10486,7 @@ mod order_select_tests;
 #[cfg(test)]
 #[path = "gpu_hinge_fit_tests.rs"]
 mod hinge_fit_tests;
+
+#[cfg(test)]
+#[path = "gpu_slope_tests.rs"]
+mod slope_tests;

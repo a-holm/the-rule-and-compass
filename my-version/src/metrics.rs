@@ -290,14 +290,18 @@ pub enum ScoreObjective {
     HingeOrdinary,
     /// #289: `max(0, 1 − u)²`.
     HingeSquared,
+    /// #236: mean `|(pᵢ − pᵢ₋₁) − (yᵢ − yᵢ₋₁)|` over the consecutive rows of
+    /// the resident sample, divided by `n − 1`. Admitted only when the
+    /// sample's slope pairs are exactly the consecutive pairs.
+    Slope,
 }
 
 impl ScoreObjective {
     /// The `RC_SCORE_*` code the CUDA scoring entry points take.
     ///
-    /// The regression block is 0–9 (#287); classification is 10–14 (#289) so a
-    /// fit code (0–5 in `DeviceLoss`) and a score code can never be confused,
-    /// and every code in this enum has its own kernel branch.
+    /// The regression block is 0–9 (#287); classification is 10–14 (#289);
+    /// slope is 15 (#236). A fit code (`DeviceLoss`) and a score code can never
+    /// be confused, and every code in this enum has its own kernel branch.
     pub fn code(self) -> i32 {
         match self {
             ScoreObjective::Squared => 0,
@@ -315,6 +319,7 @@ impl ScoreObjective {
             ScoreObjective::HingeSigmoid => 12,
             ScoreObjective::HingeOrdinary => 13,
             ScoreObjective::HingeSquared => 14,
+            ScoreObjective::Slope => 15,
         }
     }
 
@@ -336,6 +341,7 @@ impl ScoreObjective {
             12 => ScoreObjective::HingeSigmoid,
             13 => ScoreObjective::HingeOrdinary,
             14 => ScoreObjective::HingeSquared,
+            15 => ScoreObjective::Slope,
             _ => return None,
         })
     }
@@ -358,6 +364,7 @@ impl ScoreObjective {
             ScoreObjective::HingeSigmoid => "hinge",
             ScoreObjective::HingeOrdinary => "hinge_ordinary",
             ScoreObjective::HingeSquared => "hinge_squared",
+            ScoreObjective::Slope => "slope",
         }
     }
 
@@ -379,6 +386,7 @@ impl ScoreObjective {
             ScoreObjective::HingeSigmoid => Metric::Hinge,
             ScoreObjective::HingeOrdinary => Metric::HingeOrdinary,
             ScoreObjective::HingeSquared => Metric::HingeSquared,
+            ScoreObjective::Slope => Metric::Slope,
         }
     }
 
@@ -599,9 +607,9 @@ pub fn score_dispatch(m: Metric) -> ScoreDispatch {
         Interquartile => ScoreDispatch::Exact(ScoreStat::Interquartile),
         RankCorrelation => ScoreDispatch::Exact(ScoreStat::RankCorrelation),
         RankCorrelationSigned => ScoreDispatch::Exact(ScoreStat::RankCorrelationSigned),
-        Slope => ScoreDispatch::Refused(
-            "slope needs a cross-row first-difference pass",
-        ),
+        // #236: consecutive-row pairs; `search::gpu_blocker` refuses a sample
+        // whose pair list is anything else.
+        Slope => ScoreDispatch::Native(O::Slope),
         ImplicitDerivative => ScoreDispatch::Refused(
             "implicit needs an expression-tree gradient pass",
         ),
@@ -708,7 +716,7 @@ pub fn score_native(pred: &[f64], y: &[f64], objective: ScoreObjective, k: usize
 ///
 /// Zero-weight rows are masked **before** any prediction is read, exactly like
 /// [`score_weighted`]. A non-finite prediction in a masked row is therefore
-/// invisible. `maximum` has no weighted form and refuses weights.
+/// invisible. `maximum` and `slope` have no weighted form and refuse weights.
 ///
 /// #289: the classification objectives read `pred` as a **logit**, derive the
 /// label `l = [y > weighted midpoint]` and accumulate the configured row loss.
@@ -727,7 +735,7 @@ pub fn score_native_weighted(
     }
     let weighted = !w.is_empty();
     if weighted {
-        if objective == ScoreObjective::Maximum {
+        if objective == ScoreObjective::Maximum || objective == ScoreObjective::Slope {
             return NativeScore::invalid(ScoreStatus::Invalid);
         }
         let mut total = 0.0;
@@ -776,6 +784,16 @@ pub fn score_native_weighted(
     }
 
     match objective {
+        ScoreObjective::Slope => {
+            if n < 2 {
+                return NativeScore::invalid(ScoreStatus::NonFinite);
+            }
+            let mut sum = 0.0;
+            for i in 1..n {
+                sum += ((pred[i] - pred[i - 1]) - (y[i] - y[i - 1])).abs();
+            }
+            NativeScore::ok(sum / (n - 1) as f64)
+        }
         ScoreObjective::Maximum => {
             let mut best_bits = 0u64;
             let mut best_row = 0usize;
@@ -2376,6 +2394,7 @@ mod tests {
                 "maximum",
                 "signed",
                 "log_squashed",
+                "slope",
                 "implicit_residual",
                 "log_loss",
                 "brier",
@@ -2398,9 +2417,10 @@ mod tests {
         );
         // An unhandled metric must be a hard failure, never an MSE fallback.
         assert_eq!(
-            score_refusal(Metric::Slope).unwrap(),
-            "slope needs a cross-row first-difference pass"
+            score_refusal(Metric::ImplicitDerivative).unwrap(),
+            "implicit needs an expression-tree gradient pass"
         );
+        assert_eq!(score_dispatch(Metric::Slope).objective(), Some(ScoreObjective::Slope));
         assert_eq!(score_dispatch(Metric::Auc).objective(), None);
         assert_eq!(score_dispatch(Metric::Maximum).stat(), None);
     }
@@ -2421,6 +2441,12 @@ mod tests {
                     continue;
                 };
                 let got = score_native(pred, y, o, 2);
+                if o == ScoreObjective::Slope && pred.len() < 2 {
+                    assert_eq!(got.status, ScoreStatus::NonFinite);
+                    assert_eq!(got.value, f64::INFINITY);
+                    assert_eq!(score_with_constants(pred, y, *m, 2), f64::INFINITY);
+                    continue;
+                }
                 assert_eq!(got.status, ScoreStatus::Ok, "{}", o.name());
                 let want = score_with_constants(pred, y, *m, 2);
                 if o == ScoreObjective::Maximum {

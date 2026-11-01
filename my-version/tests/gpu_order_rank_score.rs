@@ -161,17 +161,17 @@ fn a_metric_outside_the_table_keeps_its_named_refusal() {
     let s = sample(96, 3, false);
     let cfg = Config {
         gpu: true,
-        metric: Metric::Slope,
+        metric: Metric::ImplicitDerivative,
         ..Default::default()
     };
     assert_eq!(search::effective_backend(&cfg, &s), Backend::Cpu);
     #[cfg(feature = "cuda")]
     assert_eq!(
         search::backend_blocker_reason(&cfg, &s),
-        rcsr::metrics::score_refusal(Metric::Slope)
+        rcsr::metrics::score_refusal(Metric::ImplicitDerivative)
     );
     assert_eq!(
-        rcsr::metrics::score_refusal(Metric::Slope),
-        Some("slope needs a cross-row first-difference pass")
+        rcsr::metrics::score_refusal(Metric::ImplicitDerivative),
+        Some("implicit needs an expression-tree gradient pass")
     );
 }

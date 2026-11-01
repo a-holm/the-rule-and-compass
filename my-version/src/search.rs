@@ -743,6 +743,9 @@ impl GpuSearch {
                 if fit_data {
                     return Err("device_memory: tiled residency has no device fit or exact statistic scorer".to_string());
                 }
+                if score == Some(crate::metrics::ScoreObjective::Slope) {
+                    return Err("device_memory: tiled residency refuses slope scoring: row r - 1 of a tile's first row is not resident".to_string());
+                }
                 crate::gpu::GpuEvaluator::new_tiled(
                     cols,
                     n_rows,
@@ -997,6 +1000,11 @@ impl GpuSearch {
                     Some(signed) => self
                         .ev
                         .rank_fit_batch(&plans, cfg.fit_iters, &train.y, signed),
+                    // #236: the squared warm start, then the differenced IRLS,
+                    // keeping the incoming constants unless it improves on them.
+                    None if fit_loss == Some(crate::fit::DeviceLoss::Slope) => {
+                        self.ev.slope_fit_batch(&plans, cfg.fit_iters)
+                    }
                     None => {
                         let loss = fit_loss.expect(
                             "jobs is only filled when a native, rank, order-statistic or \
@@ -2427,6 +2435,12 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     {
         return Some("implicit_residual needs an all-zero training target");
     }
+    // #236: the device differences row r against row r - 1 of the resident
+    // sample. A pair list with any other shape (a shuffled split, a group
+    // boundary, a row missing from the side) keeps the exact CPU scorer.
+    if cfg.metric == crate::metrics::Metric::Slope && !slope_pairs_are_consecutive(train) {
+        return Some("slope pairs are not the consecutive rows of the training sample");
+    }
     // #288: AUC needs exactly two distinct target values; the label rule is
     // the CPU midpoint rule, so any other target is refused, never collapsed.
     if cfg.metric == crate::metrics::Metric::Auc
@@ -2453,6 +2467,29 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
         return Some("--fit-samples/--fit-rows scores offspring on a screening subset");
     }
     None
+}
+
+/// #236: true when the sample's slope pairs are exactly `[k - 1, k]` for every
+/// `k` in `1..n`, the only pair set the device slope scorer and fit compute.
+/// `None` is the consecutive set by definition ([`crate::data::Sample::pairs`]).
+#[cfg(feature = "cuda")]
+pub(crate) fn slope_pairs_are_consecutive(train: &Sample) -> bool {
+    let Some(pairs) = &train.pairs else {
+        return true;
+    };
+    let n = train.len();
+    if n < 2 || pairs.len() != n - 1 {
+        return false;
+    }
+    let mut seen = vec![false; n];
+    for &[a, b] in pairs {
+        let (a, b) = (a as usize, b as usize);
+        if b == 0 || b >= n || a + 1 != b || seen[b] {
+            return false;
+        }
+        seen[b] = true;
+    }
+    true
 }
 
 /// #230: `Some(signed)` when the device may run this run's **fit stage only**,
@@ -5722,9 +5759,10 @@ fn run_search(
     if cfg.gpu_notes && cfg.fit_strategy.defers_to_gpu() && !defers_fit_to_gpu(cfg, true) {
         eprintln!(
             "# gpu-fit: off (the batched kernel minimises squared error, \
-             log-squashed, mean absolute error or the exact rank, median, \
-             interquartile and maximum objectives; --metric must be squared, \
-             log_squashed, absolute, aic, aicc, bic, rank_correlation, \
+             log-squashed, mean absolute error, the first-difference slope or \
+             the exact rank, median, interquartile and maximum objectives; \
+             --metric must be squared, log_squashed, absolute, slope, aic, aicc, \
+             bic, rank_correlation, \
              rank_correlation_signed, median, interquartile or maximum)"
         );
     }
@@ -7115,10 +7153,10 @@ mod tests {
         s.y[1] = -2.0;
         assert_eq!(gpu_blocker(&cfg, &s), Some("auc needs a two-valued target"));
         // A metric outside the table keeps its named refusal, never MSE.
-        let cfg = Config { metric: Metric::Slope, ..Config::default() };
+        let cfg = Config { metric: Metric::ImplicitDerivative, ..Config::default() };
         assert_eq!(
             gpu_blocker(&cfg, &s),
-            crate::metrics::score_refusal(Metric::Slope)
+            crate::metrics::score_refusal(Metric::ImplicitDerivative)
         );
         assert!(gpu_blocker(&cfg, &s).is_some());
     }
@@ -7630,6 +7668,39 @@ mod tests {
         assert_eq!(gpu_status_label(7), Some("start_unusable"));
     }
 
+    /// #236: the device slope scorer differences row r against row r - 1, so a
+    /// pair list of any other shape keeps the CPU with a named reason.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn slope_device_admits_only_consecutive_pairs() {
+        let mut s = sample();
+        let n = s.len();
+        let cfg = Config { metric: Metric::Slope, ..Config::default() };
+        assert_eq!(gpu_blocker(&cfg, &s), None, "no pair list is the consecutive set");
+        s.pairs = Some(crate::fit::consecutive_pairs(n));
+        assert_eq!(gpu_blocker(&cfg, &s), None);
+        let reason = Some("slope pairs are not the consecutive rows of the training sample");
+        let mut boundary = crate::fit::consecutive_pairs(n);
+        boundary.remove(9);
+        s.pairs = Some(boundary);
+        assert_eq!(gpu_blocker(&cfg, &s), reason, "a group boundary drops a pair");
+        let mut shuffled = crate::fit::consecutive_pairs(n);
+        shuffled[3] = [2, 5];
+        s.pairs = Some(shuffled);
+        assert_eq!(gpu_blocker(&cfg, &s), reason, "a non-adjacent pair");
+        let mut doubled = crate::fit::consecutive_pairs(n);
+        doubled[4] = doubled[5];
+        s.pairs = Some(doubled);
+        assert_eq!(gpu_blocker(&cfg, &s), reason, "a repeated pair");
+        let mut reversed = crate::fit::consecutive_pairs(n);
+        reversed[0] = [1, 0];
+        s.pairs = Some(reversed);
+        assert_eq!(gpu_blocker(&cfg, &s), reason, "a backward pair");
+        s.pairs = Some(crate::fit::consecutive_pairs(n));
+        s.w = vec![1.0; n];
+        assert!(gpu_blocker(&cfg, &s).is_some(), "slope has no weighted form");
+    }
+
     /// #229: a metric without a native device objective is labelled
     /// `metric_not_native`, and the gate keeps such a run off the fit path in
     /// the first place. `log_squashed` passes because the kernel fits it.
@@ -7656,7 +7727,13 @@ mod tests {
             };
             assert!(defers_fit_to_gpu(&cfg, true), "{metric:?} fits by least squares");
         }
-        for metric in [Metric::Slope, Metric::Correlation] {
+        // #236: slope fits on the device from the squared warm start.
+        let slope = Config {
+            metric: Metric::Slope,
+            ..gpu_fit.clone()
+        };
+        assert!(defers_fit_to_gpu(&slope, true), "#236: slope is native");
+        for metric in [Metric::ImplicitDerivative, Metric::Correlation] {
             let cfg = Config {
                 metric,
                 ..gpu_fit.clone()
