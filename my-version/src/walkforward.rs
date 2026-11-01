@@ -88,6 +88,10 @@ pub struct ProtocolOptions {
     /// #482: labels of windows that overlap the run's training or validation
     /// rows and were allowed anyway.
     pub in_sample_windows: Vec<String>,
+    /// #523: the final locked read reports the selected candidate only: no
+    /// other candidate is evaluated on the test block, the inference has no
+    /// candidate columns and `batch_pnl` is refused.
+    pub final_read: bool,
 }
 
 /// #482: where a candidate list came from: a run's Pareto front.
@@ -116,6 +120,7 @@ impl Default for ProtocolOptions {
             cost: None,
             front: None,
             in_sample_windows: Vec::new(),
+            final_read: false,
         }
     }
 }
@@ -887,6 +892,13 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
     if opts.bootstrap_draws > 0 && opts.bootstrap_draws < 100 {
         return Err("--bootstrap needs at least 100 draws".to_string());
     }
+    if opts.final_read && opts.batch_pnl {
+        return Err(
+            "--batch-pnl scores every candidate on the locked test; a final read reports the selected \
+             candidate only"
+                .to_string(),
+        );
+    }
     if opts.pbo_blocks < 2 || opts.pbo_blocks % 2 != 0 || opts.pbo_blocks > 24 {
         return Err("--pbo-blocks must be even and in 2..=24".to_string());
     }
@@ -1320,7 +1332,7 @@ impl Accum {
                 const_rows += cn.rows;
                 const_long += cn.long_rows;
             }
-            if opts.bootstrap_draws > 0 {
+            if opts.bootstrap_draws > 0 && !opts.final_read {
                 for c in 0..n_candidates {
                     if c == candidate {
                         cand_cols[c].extend_from_slice(&ev.returns);
@@ -1458,8 +1470,8 @@ impl Accum {
                 "constant_long_flat" => &const_all,
                 _ => &zeros,
             };
-            let candidates: Vec<Vec<f64>> = if opts.bootstrap_draws > 0 { cand_cols } else { Vec::new() };
-            Some(crate::wf_protocol::infer(&crate::wf_protocol::InferenceInput {
+            let candidates: Vec<Vec<f64>> = if opts.bootstrap_draws > 0 && !opts.final_read { cand_cols } else { Vec::new() };
+            let mut inferred = crate::wf_protocol::infer(&crate::wf_protocol::InferenceInput {
                 draws: opts.bootstrap_draws,
                 null_draws: opts.null_draws,
                 block_len,
@@ -1476,7 +1488,14 @@ impl Accum {
                 baseline_series: baseline,
                 buy_and_hold: &bh_all,
                 books: &books,
-            })?)
+            })?;
+            if opts.final_read {
+                if let Some(m) = inferred.multiple.as_mut() {
+                    m.pbo = None;
+                    m.pbo_error = Some("final read reports the selected candidate".to_string());
+                }
+            }
+            Some(inferred)
         } else {
             None
         };

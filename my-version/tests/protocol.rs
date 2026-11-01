@@ -257,3 +257,100 @@ fn generated_selectors_leave_the_required_purge_on_a_ragged_panel() {
     assert_eq!(lb.get("read_count").unwrap().as_f64(), Some(0.0));
     assert!(lb.get("start_date").is_some() && lb.get("end_date").is_some());
 }
+
+#[test]
+fn final_seal_blocks_new_candidates_and_limits_reads() {
+    let dir = scratch("final");
+    let ledger = Ledger::new(dir.join("ledger.jsonl"));
+    let sealed = dir.join("locked_candidates.json");
+    let (a, b) = (candidate("a"), candidate("b"));
+    ledger.add_candidate(&a).unwrap();
+    ledger.add_candidate(&b).unwrap();
+    assert!(!ledger.is_final().unwrap());
+    assert!(ledger.seal_final(&sealed, &[], 0, false).is_err());
+    let hash = ledger.seal_final(&sealed, &[], 1, false).unwrap();
+    assert_eq!(hash, rcsr::manifest::sha256_file(&sealed).unwrap());
+    let (seal_hash, terms) = ledger.final_seal().unwrap().unwrap();
+    assert_eq!(seal_hash, hash);
+    assert_eq!((terms.max_reads, terms.report_candidates), (1, false));
+
+    let refused = ledger.add_candidate(&candidate("c")).unwrap_err();
+    assert!(refused.contains("the ledger is final"), "{}", refused);
+    assert!(ledger.seal(&sealed, &[]).unwrap_err().contains("the ledger is final"));
+    assert!(ledger.seal_final(&sealed, &[], 1, false).unwrap_err().contains("the ledger is final"));
+
+    ledger.authorize_read(&sealed, &a.id, "data", "build").unwrap();
+    ledger.record_read(&a.id, "report-a").unwrap();
+    let second = ledger.authorize_read(&sealed, &b.id, "data", "build").unwrap_err();
+    assert!(second.contains("the final seal allows 1 locked read(s)"), "{}", second);
+    ledger.verify_chain().unwrap();
+}
+
+#[test]
+fn final_seal_with_more_reads_allows_exactly_that_many() {
+    let dir = scratch("final2");
+    let ledger = Ledger::new(dir.join("ledger.jsonl"));
+    let sealed = dir.join("locked_candidates.json");
+    let (a, b, c) = (candidate("a"), candidate("b"), candidate("c"));
+    for x in [&a, &b, &c] {
+        ledger.add_candidate(x).unwrap();
+    }
+    ledger.seal_final(&sealed, &[], 2, true).unwrap();
+    assert!(ledger.final_seal().unwrap().unwrap().1.report_candidates);
+    for x in [&a, &b] {
+        ledger.authorize_read(&sealed, &x.id, "data", "build").unwrap();
+        ledger.record_read(&x.id, "r").unwrap();
+    }
+    assert!(ledger.authorize_read(&sealed, &c.id, "data", "build").is_err());
+}
+
+#[test]
+fn final_seal_refuses_a_ledger_that_has_a_seal_or_a_read() {
+    let dir = scratch("final3");
+    let ledger = Ledger::new(dir.join("ledger.jsonl"));
+    let sealed = dir.join("locked_candidates.json");
+    let a = candidate("a");
+    ledger.add_candidate(&a).unwrap();
+    ledger.seal(&sealed, &[]).unwrap();
+    assert!(ledger.seal_final(&sealed, &[], 1, false).unwrap_err().contains("already has a seal"));
+}
+
+#[test]
+fn the_read_marker_binds_a_store_to_one_ledger_chain() {
+    let dir = scratch("marker");
+    let data = dir.join("d.csv");
+    std::fs::write(&data, "ts,x\n").unwrap();
+    let d = data.to_str().unwrap();
+    let first = Ledger::new(dir.join("l1.jsonl"));
+    first.add_candidate(&candidate("a")).unwrap();
+    let other = Ledger::new(dir.join("l2.jsonl"));
+    other.add_candidate(&candidate("a")).unwrap();
+
+    first.check_read_marker(d).unwrap();
+    other.check_read_marker(d).unwrap();
+    first.write_read_marker(d, "test_read", "r1").unwrap();
+    // a retry on the same head writes no second line
+    first.write_read_marker(d, "test_read", "r1").unwrap();
+    let marker = std::fs::read_to_string(protocol::marker_path(d)).unwrap();
+    assert_eq!(marker.lines().count(), 1, "{}", marker);
+    assert!(first.verify_read_marker(d).unwrap_err().contains("that the ledger does not record"));
+    first.record_read(&candidate("a").id, "r1").unwrap();
+    assert!(first.verify_read_marker(d).unwrap().contains("1 read line(s)"));
+
+    let err = other.check_read_marker(d).unwrap_err();
+    assert!(err.contains("was already read through ledger"), "{}", err);
+    assert!(other.write_read_marker(d, "test_read", "r2").is_err());
+    assert_eq!(std::fs::read_to_string(protocol::marker_path(d)).unwrap(), marker);
+
+    // the same path with a different chain is refused
+    let path = dir.join("l1.jsonl");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.truncate(1);
+    std::fs::write(&path, format!("{}\n", lines[0])).unwrap();
+    assert!(first.check_read_marker(d).is_ok(), "the head of the first line is still in the chain");
+    let rewritten = Ledger::new(dir.join("l3.jsonl"));
+    rewritten.add_candidate(&candidate("zzz")).unwrap();
+    std::fs::copy(dir.join("l3.jsonl"), &path).unwrap();
+    assert!(first.check_read_marker(d).unwrap_err().contains("does not contain the head"));
+}
