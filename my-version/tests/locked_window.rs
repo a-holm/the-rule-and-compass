@@ -296,7 +296,7 @@ fn declared_split_without_time_is_refused() {
 
     let (code, _, err) = plain(&["--data", &d, "--eval-expr", "0"]);
     assert_eq!(code, 3, "{}", err);
-    assert!(err.contains("declared a locked test") || err.contains("declares a locked test"), "{}", err);
+    assert!(err.contains("declared locked test"), "{}", err);
     assert!(err.contains("2024-01-13..2024-01-17"), "{}", err);
 
     // with --time the random split is checked too
