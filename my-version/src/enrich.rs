@@ -6999,6 +6999,7 @@ fn enrich_inner(
     // audited column list cannot drift from the bytes actually read.
     #[allow(unused_mut)]
     let mut device_projection: Option<(String, Vec<String>)> = None;
+    #[allow(unused_mut)]
     let mut dev = DeviceBook::default();
     #[allow(unused_mut, unused_variables)]
     let mut side_kernel_seconds = 0.0;
