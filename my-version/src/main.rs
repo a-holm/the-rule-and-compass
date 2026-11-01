@@ -101,6 +101,7 @@ USAGE:
   rcsr enrich --data <store.rcsb|CSV> --out <store.rcsb> --features <list> [options]
   rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
+             [--lockbox <START,END|none>]
              [--target-spec <file>]
   rcsr verify-manifest <manifest.json> [--data <file>] [--binary <file>]
   rcsr dev-report <log.ndjson>
@@ -240,11 +241,17 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   --allow-interpolate        permit --fill interpolate on time-ordered data
   --allow-lockbox            permit train/validation/test rows in 2026H2 (declared final test only)
                              It never opens the declared locked test (--lockbox).
-  --lockbox <START,END>      declared locked test (UTC, half-open). Overrides the range
+  --lockbox <START,END|none>
+                             locked test (UTC, half-open). Order: this flag, the range
                              declared with the data (<data>.manifest.json, .schema.json,
-                             .enrich.json or <csv>.lockbox.json). Train, validation and
-                             test rows inside it are refused (exit 3); run.json `lockbox`
-                             reports rows, date range, read count, declared, source,
+                             .enrich.json or <csv>.lockbox.json), else the protocol
+                             default 2025-07-01,2026-07-01. On undeclared data the flag adds to the default. A flag that does not cover
+                             the declared range is refused (exit 2), as are conflicting
+                             declarations (exit 3). `none` opts out and is refused when
+                             the data declares a range. Train, validation and test rows
+                             inside the range are refused (exit 3); run.json `lockbox`
+                             reports rows, date range, read count, declared, source
+                             (flag, store, protocol_default, none), declared_in,
                              rows_in_scope, evaluated
                              With a declaration every split side is checked: without
                              --time the data must hold one integer epoch-seconds
@@ -4510,10 +4517,11 @@ fn main() {
         trading_spec = Some(tspec);
     }
 
-    let declared_lockbox = rcsr::lockbox::resolve_declared(lockbox_arg.as_deref(), &data_path).unwrap_or_else(|e| {
-        eprintln!("error: --lockbox: {}", e);
-        std::process::exit(EXIT_USAGE);
+    let resolved_lockbox = rcsr::lockbox::resolve(lockbox_arg.as_deref(), &data_path).unwrap_or_else(|e| {
+        eprintln!("error: {}", e.message);
+        std::process::exit(e.exit);
     });
+    let declared_lockbox = resolved_lockbox.declared();
     let spec = data::SplitSpec {
         mode,
         time_col,
@@ -6655,10 +6663,8 @@ fn main() {
                 let mut j = lockbox.json(&overlap, allow_lockbox, false, evaluated);
                 j.pop();
                 j.push_str(&format!(",\"read_count\":{}", reads));
-                if let Some(d) = &spec.declared_lockbox {
-                    j.push(',');
-                    j.push_str(&d.report_fields(0, false, prepared.report.lockbox_checked));
-                }
+                j.push(',');
+                j.push_str(&resolved_lockbox.report_fields(0, false, prepared.report.lockbox_checked));
                 j.push('}');
                 j
             };
@@ -9490,12 +9496,16 @@ OPTIONS:
   --ledger <file>            append-only JSONL candidate ledger. A development
                              run appends a candidate (test_read:false) and
                              refuses windows that touch the declared lockbox
-  --lockbox <START,END>      declared locked test, UTC half-open. Overrides the
-                             range declared with --data (store manifest, schema
-                             or sidecar). Default without a declaration:
-                             2025-07-01,2026-07-01, active with --ledger or
-                             --locked-test. A window touching it is refused
-                             (exit 3) unless --locked-test reads it
+  --lockbox <START,END|none>
+                             locked test, UTC half-open. Order: this flag, the range
+                             declared with --data (store manifest, schema or sidecar),
+                             else the protocol default 2025-07-01,2026-07-01. On undeclared
+                             data a flag adds to the default. A flag
+                             that does not cover the declared range is refused (exit
+                             2), as are conflicting declarations (exit 3). `none` opts
+                             out; it is refused when the data declares a range and
+                             with --ledger or --locked-test. A window touching the
+                             range is refused (exit 3) unless --locked-test reads it
   --locked-test              read the locked test once for a sealed candidate.
                              Needs --ledger and --sealed. A second read, an
                              unsealed candidate or a code/data hash that differs
@@ -10166,20 +10176,24 @@ fn run_walkforward(args: &[String]) -> ! {
         min_hold,
         gpu,
     };
-    let declared = rcsr::lockbox::resolve_declared(lockbox_arg.as_deref(), &data_path).unwrap_or_else(|e| {
-        eprintln!("error: --lockbox: {}", e);
-        std::process::exit(EXIT_USAGE);
+    let resolved = rcsr::lockbox::resolve(lockbox_arg.as_deref(), &data_path).unwrap_or_else(|e| {
+        eprintln!("error: {}", e.message);
+        std::process::exit(e.exit);
     });
-    let declared_lock: Option<(f64, f64)> = match &declared {
-        Some(d) => Some((d.lockbox.start as f64, d.lockbox.end as f64)),
-        None if ledger_path.is_some() || locked_test => Some(rcsr::protocol::default_locked_range()),
-        None => None,
-    };
+    let declared_lock: Option<(f64, f64)> = resolved.range.map(|l| (l.start as f64, l.end as f64));
+    if declared_lock.is_none() && (ledger_path.is_some() || locked_test) {
+        eprintln!("error: --ledger and --locked-test need a locked test range: drop --lockbox none");
+        std::process::exit(EXIT_USAGE);
+    }
     if locked_test && (ledger_path.is_none() || sealed_path.is_none()) {
         eprintln!("error: --locked-test needs --ledger and --sealed");
         std::process::exit(EXIT_USAGE);
     }
-    if let Some((ls, le)) = declared_lock {
+    for (ri, rg) in resolved.ranges().into_iter().enumerate() {
+        if locked_test && ri > 0 {
+            continue;
+        }
+        let (ls, le) = (rg.start as f64, rg.end as f64);
         for w in &spec.windows {
             let train_hits = w.train_start < le && w.train_end > ls;
             let test_hits = w.test_start < le && w.test_end > ls;
@@ -10291,7 +10305,7 @@ fn run_walkforward(args: &[String]) -> ! {
             std::process::exit(EXIT_INPUT);
         }
     }
-    let mut protocol_json: Option<String> = None;
+    let protocol_json: Option<String>;
     if let Some((ls, le)) = declared_lock {
         let rows: usize = if locked_test { report.windows.iter().map(|w| w.test_rows).sum() } else { 0 };
         let first = report.windows.iter().map(|w| w.window.test_start).fold(f64::INFINITY, f64::min);
@@ -10334,12 +10348,10 @@ fn run_walkforward(args: &[String]) -> ! {
             read_count,
         };
         let mut lockbox_facts = facts.json();
-        if let Some(d) = &declared {
-            lockbox_facts.pop();
-            lockbox_facts.push(',');
-            lockbox_facts.push_str(&d.report_fields(rows, locked_test, true));
-            lockbox_facts.push('}');
-        }
+        lockbox_facts.pop();
+        lockbox_facts.push(',');
+        lockbox_facts.push_str(&resolved.report_fields(rows, locked_test, true));
+        lockbox_facts.push('}');
         protocol_json = Some(format!(
             "{{\"lockbox\":{},\"candidate_id\":{},\"report_sha256\":{},\"test_read\":{},\
              \"ledger\":{},\"windows_scheme\":{}}}",
@@ -10348,6 +10360,14 @@ fn run_walkforward(args: &[String]) -> ! {
             format!("\"{}\"", report_sha),
             locked_test,
             ledger_path.as_ref().map_or("null".to_string(), |p| format!("{:?}", p)),
+            windows_scheme.as_ref().map_or("null".to_string(), |s| format!("{:?}", s)),
+        ));
+    } else {
+        protocol_json = Some(format!(
+            "{{\"lockbox\":{{{}}},\"candidate_id\":null,\"report_sha256\":\"{}\",\"test_read\":false,\
+             \"ledger\":null,\"windows_scheme\":{}}}",
+            resolved.report_fields(0, false, false),
+            report_sha,
             windows_scheme.as_ref().map_or("null".to_string(), |s| format!("{:?}", s)),
         ));
     }
@@ -10519,6 +10539,7 @@ fn run_audit(args: &[String]) -> ! {
     let mut resample_small = 15usize;
     let mut resample_large = 60usize;
     let mut session_gap: Option<f64> = None;
+    let mut lockbox_arg: Option<String> = None;
     let mut target_spec: Option<String> = None;
     let mut i = 0usize;
     while i < args.len() {
@@ -10557,6 +10578,7 @@ fn run_audit(args: &[String]) -> ! {
                 }
             }
             "--report" => report_path = Some(take(&mut i)),
+            "--lockbox" => lockbox_arg = Some(take(&mut i)),
             "--target-spec" => target_spec = Some(take(&mut i)),
             "--join-on" => join_on = Some(take(&mut i)),
             "--bars" => bars_path = Some(take(&mut i)),
@@ -10662,13 +10684,30 @@ fn run_audit(args: &[String]) -> ! {
             (seconds, Some(audit), report)
         }
     };
+    let resolved = rcsr::lockbox::resolve(lockbox_arg.as_deref(), &path).unwrap_or_else(|e| {
+        eprintln!("error: {}", e.message);
+        std::process::exit(e.exit);
+    });
+    let finite_times = times.iter().copied().filter(|v| v.is_finite());
+    let (t_lo, t_hi) = finite_times.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
+    let ranges: Vec<rcsr::lockbox::Lockbox> = if rcsr::lockbox::plausible_epoch_seconds(t_lo, t_hi) {
+        resolved.ranges()
+    } else {
+        Vec::new()
+    };
+    let keep: Vec<usize> = (0..times.len())
+        .filter(|&r| !ranges.iter().any(|l| times[r].is_finite() && l.contains(times[r].floor() as i64)))
+        .collect();
+    let rows_left_out = times.len() - keep.len();
+    let times: Vec<f64> = keep.iter().map(|&r| times[r]).collect();
     let panel = match leakage::Panel::new(
         times,
         names
             .iter()
             .map(|name| {
                 let j = table.index_of(name).expect("column was resolved above");
-                (name.to_string(), table.col(j).to_vec())
+                let col = table.col(j);
+                (name.to_string(), keep.iter().map(|&r| col[r]).collect())
             })
             .collect(),
     ) {
@@ -10721,7 +10760,7 @@ fn run_audit(args: &[String]) -> ! {
     if let Some(col) = &join_on {
         match table.index_of(col) {
             Ok(j) => {
-                let keys: Vec<u64> = table.col(j).iter().map(|v| v.to_bits()).collect();
+                let keys: Vec<u64> = keep.iter().map(|&r| table.col(j)[r].to_bits()).collect();
                 let (_matched, join_report) = leakage::audit_join_cardinality(&keys, &keys);
                 report.merge(join_report);
             }
@@ -10829,7 +10868,7 @@ fn run_audit(args: &[String]) -> ! {
         let rows: Vec<leakage::UniverseRow> = (0..panel.len())
             .map(|r| leakage::UniverseRow {
                 time: panel.time[r],
-                symbol: table.cell_text(r, sym_idx),
+                symbol: table.cell_text(keep[r], sym_idx),
             })
             .collect();
         report.merge(leakage::audit_universe(&rows, &events));
@@ -10886,12 +10925,12 @@ fn run_audit(args: &[String]) -> ! {
                 kind,
             });
         }
-        let prices = table.col(pj);
+        let prices: Vec<f64> = keep.iter().map(|&r| table.col(pj)[r]).collect();
         let cuts = leakage::cut_points(&panel, 10);
         for symbol in symbols {
             report.merge(leakage::corporate_action_replay(
                 &panel.time,
-                prices,
+                &prices,
                 &actions,
                 &symbol,
                 &cuts,
@@ -10957,6 +10996,7 @@ fn run_audit(args: &[String]) -> ! {
          \"time_audit\":{{\"rows\":{},\"median_dt\":{},\"min_dt\":{},\"max_dt\":{},\
          \"duplicate_instants\":{},\"non_monotonic_rows\":{}}},\
          \"lockbox\":{},\
+         \"locked_test\":{{{},\"rows_left_out\":{}}},\
          \"leaks\":[{}]}}",
         jstr(VERSION),
         clean,
@@ -10983,8 +11023,19 @@ fn run_audit(args: &[String]) -> ! {
             false,
             false
         ),
+        resolved.report_fields(0, false, !ranges.is_empty()),
+        rows_left_out,
         leaks_json.join(",")
     );
+    let locked_line = match resolved.range {
+        Some(_) => format!(
+            "# audit: locked test {} ({}) rows left out={}",
+            resolved.ranges().iter().map(rcsr::lockbox::span).collect::<Vec<_>>().join(" + "),
+            resolved.source.as_str(),
+            rows_left_out
+        ),
+        None => "# audit: locked test none (--lockbox none) rows left out=0".to_string(),
+    };
     if let Some(path) = report_path {
         if let Err(e) = std::fs::write(&path, format!("{out}\n")) {
             eprintln!("error: cannot write audit report '{}': {}", path, e);
@@ -10994,6 +11045,7 @@ fn run_audit(args: &[String]) -> ! {
     if json_out {
         println!("{}", out);
     } else if clean {
+        println!("{}", locked_line);
         println!(
             "# audit: lockbox rows={} windows={} (read-only, not evaluated)",
             lockbox_coverage.rows,
@@ -11008,6 +11060,7 @@ fn run_audit(args: &[String]) -> ! {
         );
     } else {
         eprintln!("audit failed ({} finding(s)):", report.leaks.len());
+        eprintln!("{}", locked_line);
         for leak in &report.leaks {
             eprintln!(
                 "  [{}]{}{}: {}",
