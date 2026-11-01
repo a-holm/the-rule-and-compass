@@ -648,6 +648,8 @@ names every refusal:
 * slope whose training pairs are not the consecutive rows (a shuffled split, a
   `--group-by` panel, a row missing from the side): `slope pairs are not the
   consecutive rows of the training sample`;
+* slope with a `--fit-rows`/`--fit-samples` subsample: `slope pairs are not the
+  consecutive rows of a --fit-rows/--fit-samples subsample`;
 * sample below the measured floor: `order/rank scoring: the sample is below the
   4096-row device floor`;
 * AUC with a target that is not two-valued: `auc needs a two-valued target`;
@@ -1874,6 +1876,27 @@ Device fit is 3.2x faster than device score with the CPU fit and 3.7x faster tha
 
 **Tests** (`src/gpu_if_fit_tests.rs`): `if_plan_carries_the_third_child_in_the_slot_word`; `if_device_fit_matches_the_cpu_fit_including_the_switch_point` (device SSE within `1e-8` relative of the CPU fit, with rows at `x0 == 0` and `x0 == x1`, and a `NaN` in the untaken branch); `a_search_with_if_fits_on_the_device` (`dispatch: Device`, no `unsupported_plan` fallback).
 
+### Slope on the batched kernel (issue #236)
+
+`--metric slope` is scored and fitted on the device when the training sample's slope pairs are its consecutive rows: `[k − 1, k]` for every `k` in `1..n` (`search::slope_pairs_are_consecutive`). That is a single series under `--split temporal`. Any other pair list (a shuffled split, a `--group-by` panel, a row missing from the side) keeps the exact CPU scorer with the reason `slope pairs are not the consecutive rows of the training sample`, and a `--fit-rows`/`--fit-samples` subsample (#265) keeps it with its own reason, so the device never differences two rows the CPU would not. Weighted slope does not exist, and a tiled plan refuses the scorer by name (see [Tiled residency](#tiled-residency-293)).
+
+**Scorer** (`ScoreObjective::Slope`, score code 15). Lane `l` owns the pairs `(r − 1, r)` of its rows `r ≥ 1` and runs both rows itself, so no lane reads another lane's state and the #293 lane carry is unchanged. Each pair adds `|(p_r − p_{r−1}) − (y_r − y_{r−1})|` in `f64` from the `f32` predictions and target; the finish divides by `n − 1`. A non-finite prediction on any row is `+inf` with status 2, and `n < 2` is `+inf` with status 2, as on the CPU (`metrics::score_slope_pairs`).
+
+**Fit arm** (`DeviceLoss::Slope`, fit code 9), host-chained in `GpuEvaluator::slope_fit_batch`:
+
+1. `fit_batch(Squared)`: the CPU arm's warm start. It sets the level, which slope cannot see.
+2. `fit_batch_from(starts, keep_incoming)` with code 9: IRLS on `g_r = (p_r − p_{r−1}) − (y_r − y_{r−1})` with row weight `u = 1/max(|g|, 1e-6)`, Jacobian row `√u·(a_r − a_{r−1})` and response `√u·g`, the `absolute` arm's rounds and two Armijo halvings on the true slope sum, then the `f64` polish with one halving.
+3. The kernel judges the incoming constants and its answer by the same `f64` pair sweep and returns the incoming constants (status 6, `no_improvement`) unless its answer is finite and strictly lower.
+
+* **Pairs without a second buffer.** `ft_assemble` stages each chunk's raw adjoints and predictions in shared memory. One extra phase differences thread `k`'s row against row `k − 1` of the chunk, or for `k = 0` against the previous chunk's last row held in `scarry` (`p + 1` floats; `sdcarry` in the `f64` twin), and overwrites the staged row in place. Row 0 has no pair and stages zeros. The owner accumulation is unchanged, so every statistic keeps its fixed row order. The trial sweep `ft_loss_slope` runs both rows of each pair per thread and needs no synchronisation.
+* **The additive level.** A constant whose adjoint is the same on every row (an additive level) has a differenced column of exactly zero in `f32` and `f64`. Its diagonal is exactly 0, `ft_solve` freezes the slot (#399), and the level keeps the squared warm start's value. A step that is exactly zero in every slot (a lone level) ends the loop at once.
+* **No host gate.** `fit::device_fit_is_gated` is false for slope. The kernel's own guard is the CPU arm's metric-monotone rule; the device scorer ranks on slope, and `refit_finalists_exact` refits every finalist with the CPU arm, so every reported constant and error is exact CPU `f64`.
+* **CPU arm.** `fit_slope_pairs` runs the same IRLS (`fit::slope_irls`) between the squared fit and the coordinate polish, on the sample's own pair list. Device and CPU optimise slope by the same algorithm, so the parity test is algorithmic: the device slope is at most the CPU IRLS result times `1 + 1e-5` from the same start.
+* **Precision.** Rows and adjoints are `f32`, sums and the polish `f64`. The device score differs from the CPU `f64` score only through the `f32` rounding of inputs, target and predictions.
+
+MEASURED
+
+**Tests** (`src/gpu_slope_tests.rs`, `search::tests::slope_device_admits_only_consecutive_pairs`): `slope_device_score_matches_cpu` (`n = 1, 2, 3, 300, 4 099`, the CPU reducer on the same `f32` rows to `1e-12`, the exact metric to `1e-6`, a single non-finite row is `+inf`, alone equals batch), `slope_score_is_partition_invariant` (row ranges with cuts at 1, 2, 255, 256, 257 and one-row ranges give the resident bits), `slope_scoring_is_refused_in_tiled_residency` (tiled and weighted launches refused, a tiled search keeps the CPU with the named reason), `slope_device_scores_rank_like_the_cpu` (D8 on 48 candidates), `slope_pair_assembly_matches_cpu_differenced_normal_equations` (`f64` `JᵀJ`, `Jᵀr` and loss against the CPU differenced normal equations to `1e-10`, across the chunk boundaries, the level column exactly zero), `slope_additive_constant_is_frozen_and_keeps_the_squared_level`, `slope_irls_never_worsens_the_metric`, `slope_fit_keeps_incoming_constants_when_better`, `slope_device_fit_matches_cpu`, `slope_gpu_fit_is_deterministic_and_batch_independent`, `slope_no_fit_is_a_no_op` and `slope_gpu_front_is_ranked_on_slope` (a search with `dispatch: Device` scores and fits on the device, every archived error is the exact CPU slope, and the best member is within 5 % of the `--no-gpu` run's).
 ### Classification fitness (#289)
 
 The #287 score table now has a label-aware block for long-only binary

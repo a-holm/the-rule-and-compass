@@ -7994,16 +7994,20 @@ mod tests {
             ..gpu_fit.clone()
         };
         assert!(defers_fit_to_gpu(&slope, true), "#236: slope is native");
-        for metric in [Metric::ImplicitDerivative, Metric::Correlation] {
-            let cfg = Config {
-                metric,
-                ..gpu_fit.clone()
-            };
-            assert!(
-                !defers_fit_to_gpu(&cfg, true),
-                "{metric:?} has no native device loss"
-            );
-        }
+        // #430: the correlation family defers its fit to the device.
+        let correlation = Config {
+            metric: Metric::Correlation,
+            ..gpu_fit.clone()
+        };
+        assert!(defers_fit_to_gpu(&correlation, true), "#430: correlation is native");
+        let implicit = Config {
+            metric: Metric::ImplicitDerivative,
+            ..gpu_fit.clone()
+        };
+        assert!(
+            !defers_fit_to_gpu(&implicit, true),
+            "implicit has no native device loss"
+        );
         // #226: the median arm has its own exact device polish, so the fit is
         // deferred exactly like the rank family's.
         let median = Config {
