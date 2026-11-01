@@ -382,7 +382,7 @@ fn gui_cv_needs_an_exclude_that_clears_the_declared_range() {
     assert!(body.contains("2024-06-01"), "{}", body);
     let (status, body) = run_file(
         &path,
-        &["--cv", "k-fold", "--cv-k", "3", "--exclude", "ts >= 1717200000"],
+        &["--cv", "k-fold", "--cv-k", "3", "--exclude", "ts >= 1716980400"],
     );
     assert_eq!(status, 200, "{}", body);
     assert!(body.contains("\"event\":\"done\""), "{}", body);
