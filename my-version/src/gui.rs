@@ -675,6 +675,8 @@ struct RunPlan {
     weight: Option<String>,
     null_runs: usize,
     bootstrap_resamples: usize,
+    cv_keep: Option<Vec<bool>>,
+    lockbox_json: String,
     cv_mode: Option<data::CvMode>,
     cv_k: usize,
     stability_runs: usize,
@@ -696,6 +698,7 @@ struct RawOptions {
     smooth_centred: bool,
     allow_interpolate: bool,
     allow_lockbox: bool,
+    lockbox: Option<String>,
     validation_frac: f64,
     date_only: DateOnlyPolicy,
     time_unit: Option<TimeUnit>,
@@ -740,6 +743,7 @@ impl Default for RawOptions {
             smooth_centred: false,
             allow_interpolate: false,
             allow_lockbox: false,
+            lockbox: None,
             validation_frac: 0.0,
             date_only: DateOnlyPolicy::Error,
             time_unit: None,
@@ -879,6 +883,7 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
             }
             "--allow-interpolate" => raw.allow_interpolate = true,
             "--allow-lockbox" => raw.allow_lockbox = true,
+            "--lockbox" => raw.lockbox = Some(take(&mut i)?),
             "--center" => raw.center = Center::parse(&take(&mut i)?)?,
             "--scale" => raw.scale = Scale::parse(&take(&mut i)?)?,
             "--filter" => raw.filter = Some(take(&mut i)?),
@@ -1319,6 +1324,7 @@ impl RunPlan {
             }
         }
 
+        let resolved_lockbox = crate::lockbox::resolve(raw.lockbox.as_deref(), &data_path).map_err(|e| e.message)?;
         let spec = data::SplitSpec {
             mode,
             time_col,
@@ -1332,7 +1338,7 @@ impl RunPlan {
             exclude,
             time: time_spec,
             allow_lockbox: raw.allow_lockbox,
-            declared_lockbox: None,
+            declared_lockbox: resolved_lockbox.declared(),
             purge_seconds: None,
             scale_column: None,
             trading: None,
@@ -1375,6 +1381,15 @@ impl RunPlan {
             None => None,
         };
 
+        let cv_keep = if cv_mode.is_some() {
+            let keep = data::population_mask(&table, &spec, &prep)?;
+            data::check_cv_lockbox(&table, &spec, &keep, raw.allow_lockbox)?;
+            Some(keep)
+        } else {
+            None
+        };
+        let lockbox_json = format!("{{{}}}", resolved_lockbox.report_fields(0, false, prepared.report.lockbox_checked));
+
         if let Some(src) = &raw.eval_expr {
             expr::parse(src, &vars).map_err(|e| format!("cannot parse --eval-expr: {}", e))?;
         }
@@ -1406,6 +1421,8 @@ impl RunPlan {
             weight: raw.weight,
             null_runs: raw.null_runs,
             bootstrap_resamples: raw.bootstrap_resamples,
+            cv_keep,
+            lockbox_json,
             cv_mode,
             cv_k: raw.cv_k.max(2),
             stability_runs: raw.stability_runs,
@@ -1425,7 +1442,7 @@ impl RunPlan {
         emit(
             writer,
             &format!(
-                "{{\"event\":\"start\",\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{{\"mode\":{},\"gap\":{},\"folds\":[{}]}}}}",
+                "{{\"event\":\"start\",\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{{\"mode\":{},\"gap\":{},\"folds\":[{}]}},\"lockbox\":{}}}",
                 jstr(VERSION),
                 self.cfg.seed,
                 jstr(self.cfg.metric.name()),
@@ -1436,7 +1453,8 @@ impl RunPlan {
                 prepared.test.len(),
                 jstr(prepared.report.mode),
                 prepared.report.gap,
-                folds_json.join(",")
+                folds_json.join(","),
+                self.lockbox_json
             ),
         );
         if prepared.prep.active() {
@@ -1813,7 +1831,7 @@ impl RunPlan {
             self.prepared.report.gap,
             self.cfg.seed,
             &self.dtypes,
-            None,
+            self.cv_keep.as_deref(),
         )?;
         let mut fold_rows = Vec::new();
         for f in &folds {

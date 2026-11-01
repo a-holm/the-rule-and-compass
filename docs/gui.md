@@ -78,6 +78,10 @@ the server refuses anything but the address it was bound to.
 request or the arguments return HTTP 400 with a JSON `{"error": …}` object;
 failures after the stream starts arrive as `{"event":"error","code":3,"message":…}`.
 
+### Locked test
+
+The server resolves the locked test with the same resolver and the same split and cross-validation checks as the CLI: `--lockbox START,END|none`, else the range declared next to a `--data <path>` file (`.lockbox.json`, schema or manifest), else the protocol default 2025-07-01,2026-07-01 (always the case for an uploaded table, where a flag adds to the default). A train, validation, test or cross-validation row inside the range is refused with HTTP 400 and the CLI message. With a declared range and no `--time`, the one epoch-seconds integer column is used. The `start` event carries the `lockbox` object (declared range, source, declared_in, rows_in_scope, evaluated, checked).
+
 The stream uses the `--ndjson` event names and payloads: `start`, `progress`,
 `solution`, `note`, `preparation`, `null_control`, `baselines`,
 `cross_validation`, `residual_tests`, `stability`, `done` (and `eval` for
@@ -133,6 +137,7 @@ a socket and exercises the real endpoints:
 5. `GET /` contains the app title and the page's JS reads the schema.
 6. The three embedded assets contain no `http://` or `https://` string.
 7. Dropping the server handle stops the listener.
+8. A sidecar-declared range, a `--lockbox` flag range and the protocol default refuse an overlapping split or cross-validation request with 400; `--exclude` clearing the range lets cross-validation run; the `start` event carries the `lockbox` object.
 
 There is **no screenshot test**: no browser or display was used in this build.
 The visual layer is documented and checked by these headless contract tests, not

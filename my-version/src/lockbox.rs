@@ -258,12 +258,13 @@ impl Declared {
         }
     }
 
-    /// Refuse a row set with any timestamp in the declared range. The error
-    /// names the first offending row, the split side and the fix.
-    pub fn check_times(&self, side: &str, time_name: &str, times: &[i64]) -> Result<Overlap, String> {
-        let overlap = self.check_range(&self.lockbox, self.origin(), side, time_name, times)?;
+    /// Refuse a row set with a timestamp whose label window reaches the
+    /// declared range: any stamp in `[start - purge, end)`. The error names the
+    /// first offending row, the split side and the fix.
+    pub fn check_times(&self, side: &str, time_name: &str, times: &[i64], purge: i64) -> Result<Overlap, String> {
+        let overlap = self.check_range(&self.lockbox, self.origin(), side, time_name, times, purge)?;
         if let Some(also) = &self.also {
-            self.check_range(also, "protocol default, opt out with --lockbox none", side, time_name, times)?;
+            self.check_range(also, "protocol default, opt out with --lockbox none", side, time_name, times, purge)?;
         }
         Ok(overlap)
     }
@@ -275,21 +276,41 @@ impl Declared {
         side: &str,
         time_name: &str,
         times: &[i64],
+        purge: i64,
     ) -> Result<Overlap, String> {
-        let overlap = lockbox.overlap(times.iter().copied());
+        let purge = purge.max(0);
+        let reach = Lockbox {
+            start: lockbox.start - purge,
+            end: lockbox.end,
+        };
+        let overlap = reach.overlap(times.iter().copied());
         if overlap.overlaps() {
+            let subject = if purge == 0 {
+                format!("{} row(s) in the declared locked test", group_digits(overlap.rows))
+            } else {
+                format!(
+                    "{} row(s) whose label window reaches the declared locked test",
+                    group_digits(overlap.rows)
+                )
+            };
+            let label_end = if purge == 0 {
+                String::new()
+            } else {
+                format!("; label end = stamp + {} s", purge)
+            };
             return Err(format!(
-                "{} has {} row(s) in the declared locked test {}..{} ({}; first row {}). \
+                "{} has {} {}..{} ({}{}; first row {}). \
                  Exclude them: --exclude '{} >= {}', or read the locked test only with \
                  rcsr walkforward --locked-test or rcsr ladder --locked-test",
                 side,
-                group_digits(overlap.rows),
+                subject,
                 date(lockbox.start),
                 date(lockbox.end),
                 origin,
-                date(overlap.first_ts),
+                label_end,
+                crate::protocol::iso(overlap.first_ts as f64),
                 time_name,
-                lockbox.start
+                reach.start
             ));
         }
         Ok(overlap)
@@ -905,6 +926,23 @@ mod tests {
         assert_eq!(o.windows[1].rows, 1);
         assert_eq!(o.first_ts, july);
         assert_eq!(o.last_ts, august);
+    }
+
+    #[test]
+    fn declared_check_with_a_purge_refuses_the_label_window_that_reaches_the_range() {
+        let d = Declared {
+            lockbox: Lockbox { start: 1_000_000, end: 2_000_000 },
+            source: "store",
+            also: None,
+        };
+        let purge = 7_200;
+        let e = d.check_times("test split", "ts", &[1_000_000 - purge], purge).unwrap_err();
+        assert!(e.contains("1 row(s) whose label window reaches the declared locked test"), "{}", e);
+        assert!(e.contains("label end = stamp + 7200 s"), "{}", e);
+        assert!(e.contains("--exclude 'ts >= 992800'"), "{}", e);
+        assert!(d.check_times("test split", "ts", &[1_000_000 - purge - 1], purge).is_ok());
+        assert!(d.check_times("test split", "ts", &[2_000_000], purge).is_ok());
+        assert!(d.check_times("test split", "ts", &[1_000_000 - 1], 0).is_ok());
     }
 
     #[test]

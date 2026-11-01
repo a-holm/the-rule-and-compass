@@ -787,6 +787,10 @@ pub struct RunEnd {
     pub fit_kernel_f64_s: Option<f64>,
     /// #284: exact CPU fit-fallback seconds.
     pub fit_fallback_s: Option<f64>,
+    /// #495: exact finalist refit seconds.
+    pub fit_refit_s: Option<f64>,
+    /// #495: exact finalist refits performed.
+    pub fit_refits: Option<usize>,
     /// Log bookkeeping: events written, bytes, events dropped by the cap.
     pub events: u64,
     pub bytes: u64,
@@ -802,7 +806,7 @@ pub fn run_end_json(r: &RunEnd) -> String {
          \"json\":{},\"peak_rss_bytes\":{},\"gpu_wall_s\":{},\"device_hours\":{},\
          \"device_seconds_incl_fit\":{},\"device_fraction_of_run\":{},\
          \"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"unaccounted_s\":{},\
-         \"fit_kernel_s\":{},\"fit_kernel_f32_s\":{},\"fit_kernel_f64_s\":{},\"fit_fallback_s\":{},\
+         \"fit_kernel_s\":{},\"fit_kernel_f32_s\":{},\"fit_kernel_f64_s\":{},\"fit_fallback_s\":{},\"fit_refit_s\":{},\"fit_refits\":{},\
          \"events\":{},\"bytes\":{},\"dropped\":{},\"end\":{}}}",
         SCHEMA,
         VERSION,
@@ -836,6 +840,11 @@ pub fn run_end_json(r: &RunEnd) -> String {
         opt_num(r.fit_kernel_f32_s),
         opt_num(r.fit_kernel_f64_s),
         opt_num(r.fit_fallback_s),
+        opt_num(r.fit_refit_s),
+        match r.fit_refits {
+            Some(n) => n.to_string(),
+            None => "null".to_string(),
+        },
         r.events,
         r.bytes,
         r.dropped,

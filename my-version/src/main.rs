@@ -268,7 +268,9 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              the declared range is refused (exit 2), as are conflicting
                              declarations (exit 3). `none` opts out and is refused when
                              the data declares a range. Train, validation and test rows
-                             inside the range are refused (exit 3); run.json `lockbox`
+                             inside the range, or whose label reaches it (within the target
+                             spec's required purge before the range; default 219600 s), are
+                             refused (exit 3); run.json `lockbox`
                              reports rows, date range, read count, declared, source
                              (flag, store, protocol_default, none), declared_in,
                              rows_in_scope, evaluated
@@ -660,8 +662,19 @@ SEARCH:
                              refit exactly on the CPU in every mode. Only the
                              device fit arm reads it; a resume refuses a
                              different saved value
+  --refit-band <F>           after a device-fit search, refit exactly (CPU f64)
+                             only the trees whose full-data error is within
+                             this relative band of the lowest error at no
+                             greater cost, then every reported front member
+                             still unrefit (default 0.001). inf refits every
+                             unique tree
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
   --no-dedup                 disable structural de-duplication
+  --linear-scaling           wrap every candidate shape f in a fitted affine output
+                             map a + b*f(x), so a shape that is right up to scale
+                             and offset scores as right at once. Needs a
+                             least-squares metric (squared, aic, aicc, bic) and
+                             constant fitting; single target; off by default (#470)
   --no-front-parents         draw every parent from the island tournament;
                              turns off the 15% Pareto-front feedback (#76)
   --reject-constant-offspring
@@ -1299,7 +1312,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"seconds\":{},\"kernel_f32_s\":{},\"kernel_f64_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1312,6 +1325,9 @@ fn gpu_json(
         ops_json(&g.fit_fallback_improved_by_cause),
         ops_json(&g.fit_status_by_label),
         g.fit_refits,
+        g.fit_refit_candidates,
+        jnum(g.fit_refit_s),
+        jnum(g.fit_rescore_s),
         jnum(g.fit_ms / 1000.0),
         jnum(g.ledger.fit_kernel_lm_s()),
         jnum(g.ledger.fit_kernel_polish_s()),
@@ -1813,6 +1829,8 @@ impl DevSink {
             fit_kernel_f32_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_lm_s()),
             fit_kernel_f64_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_polish_s()),
             fit_fallback_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_fallback_s()),
+            fit_refit_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_s()),
+            fit_refits: outcome.gpu.as_ref().map(|g| g.fit_refits),
             events,
             bytes,
             dropped,
@@ -2344,11 +2362,14 @@ fn main() {
     let mut fit_rows_set = false;
     // #255: explicit --fit-fallback-max for the resume settings check.
     let mut fit_fallback_max_set = false;
+    // #495: explicit --refit-band for the resume settings check.
+    let mut refit_band_set = false;
     let mut fit_polish_set = false;
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
     let mut front_parents_set = false;
     let mut reject_constant_set = false;
+    let mut linear_scaling_set = false; // #470
     // #25: `--units` is resolved against the prepared input list later; the
     // expressions themselves are parsed here so a typo is a usage error.
     let mut unit_assignments: Vec<(String, Unit)> = Vec::new();
@@ -2732,6 +2753,21 @@ fn main() {
                 cfg.fit_fallback_max = val!().parse().unwrap_or(cfg.fit_fallback_max);
                 fit_fallback_max_set = true;
             }
+            // #495: relative band of the exact finalist refit.
+            "--refit-band" => {
+                let v = val!();
+                cfg.refit_band = match v.as_str() {
+                    "inf" => f64::INFINITY,
+                    _ => match v.parse::<f64>() {
+                        Ok(b) if b.is_finite() && b >= 0.0 => b,
+                        _ => {
+                            eprintln!("error: --refit-band needs a number >= 0 or inf");
+                            std::process::exit(EXIT_USAGE);
+                        }
+                    },
+                };
+                refit_band_set = true;
+            }
             // #496: arithmetic of the device fit polish.
             "--fit-polish" => {
                 let v = val!();
@@ -2827,6 +2863,11 @@ fn main() {
                 if cfg.qd_bins == 0 {
                     cfg.qd_bins = 512;
                 }
+            }
+            // #470: opt-in affine output map around every candidate.
+            "--linear-scaling" => {
+                cfg.linear_scaling = true;
+                linear_scaling_set = true;
             }
             // #76: exactness escape hatch; the default is on.
             "--no-front-parents" => {
@@ -3396,6 +3437,17 @@ fn main() {
                 cfg.fit_fallback_max, saved.fit_fallback_max
             ));
         }
+        // #495: the band decides which finalists get the exact refit.
+        if refit_band_set && cfg.refit_band != saved.refit_band {
+            conflicts.push(format!(
+                "--refit-band {} (saved {})",
+                cfg.refit_band, saved.refit_band
+            ));
+        }
+        // #470: linear scaling is saved search state.
+        if linear_scaling_set && !saved.linear_scaling {
+            conflicts.push("--linear-scaling (saved linear_scaling is false)".to_string());
+        }
         // #76: front feedback is saved search state.
         if front_parents_set && cfg.front_parents != saved.front_parents {
             conflicts.push(format!(
@@ -3632,6 +3684,7 @@ fn main() {
             (null_block > 0, "--null-block"),
             (bootstrap_resamples > 0, "--bootstrap-error"),
             (cfg.metric == Metric::Slope, "--metric slope (its row pairs follow one target column)"),
+            (cfg.linear_scaling, "--linear-scaling"),
             (stability_runs > 0, "--stability"),
             (report.is_some(), "--report"),
             (run_manifest_path.is_some(), "--run-manifest"),
@@ -3645,6 +3698,22 @@ fn main() {
                 );
                 std::process::exit(EXIT_USAGE);
             }
+        }
+    }
+
+    if cfg.linear_scaling {
+        let refusal = if !cfg.metric.is_least_squares() {
+            Some("linear scaling needs a least-squares metric (squared, aic, aicc, bic)")
+        } else if cfg.fit_iters == 0 {
+            Some("linear scaling needs constant fitting (--fit-iters > 0, no --no-fit)")
+        } else if cfg.variation == rcsr::search::VariationMode::Postfix {
+            Some("linear scaling needs constant fitting, which --variation postfix does not do")
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            eprintln!("error: --linear-scaling: {}", reason);
+            std::process::exit(EXIT_USAGE);
         }
     }
 
@@ -5822,7 +5891,7 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(" ");
             eprintln!(
-                "# fit: gpu-fit screened={} admitted_wide={} admitted={} gpu={} fallback={} [{}] labels=[{}] refits={} fallback_s={:.3} bounded={}/{} workers={}",
+                "# fit: gpu-fit screened={} admitted_wide={} admitted={} gpu={} fallback={} [{}] labels=[{}] refit_candidates={} refits={} refit_s={:.3} rescore_s={:.3} fallback_s={:.3} bounded={}/{} workers={}",
                 g.fit_screened,
                 g.fit_admitted_wide,
                 g.fit_attempts,
@@ -5830,7 +5899,10 @@ fn main() {
                 g.fit_fallback,
                 causes,
                 labels,
+                g.fit_refit_candidates,
                 g.fit_refits,
+                g.fit_refit_s,
+                g.fit_rescore_s,
                 g.fit_fallback_ms / 1000.0,
                 g.fit_fallback_bounded,
                 g.fit_fallback_max,
@@ -9699,7 +9771,7 @@ OPTIONS:
   --fdr-q <q>                Benjamini-Hochberg rate (default 0.10)
   --ledger <file>            append-only JSONL candidate ledger. A development
                              run appends a candidate (test_read:false) and
-                             refuses windows that touch the declared lockbox
+                             refuses windows that reach the declared lockbox
   --lockbox <START,END|none>
                              locked test, UTC half-open. Order: this flag, the range
                              declared with --data (store manifest, schema or sidecar),
@@ -9708,8 +9780,9 @@ OPTIONS:
                              that does not cover the declared range is refused (exit
                              2), as are conflicting declarations (exit 3). `none` opts
                              out; it is refused when the data declares a range and
-                             with --ledger or --locked-test. A window touching the
-                             range is refused (exit 3) unless --locked-test reads it
+                             with --ledger or --locked-test. A window ending after START minus
+                             the label purge (entry offset + horizon + delay) is refused
+                             (exit 3) unless --locked-test reads it
   --locked-test              read the locked test once for a sealed candidate.
                              Needs --ledger and --sealed. A second read, an
                              unsealed candidate or a code/data hash that differs
@@ -10426,20 +10499,29 @@ fn run_walkforward(args: &[String]) -> ! {
             continue;
         }
         let (ls, le) = (rg.start as f64, rg.end as f64);
+        let label_purge = popts.required_purge_seconds(spec.horizon).max(spec.embargo_seconds());
+        let boundary = ls - label_purge;
         for w in &spec.windows {
-            let train_hits = w.train_start < le && w.train_end > ls;
-            let test_hits = w.test_start < le && w.test_end > ls;
+            let train_hits = w.train_start < le && w.train_end > boundary;
+            let test_hits = w.test_start < le && w.test_end > boundary;
             let test_inside = w.test_start >= ls && w.test_end <= le;
             let problem = if locked_test {
                 if train_hits {
-                    Some("trains on the locked test")
+                    Some("trains within the label purge of the locked test".to_string())
                 } else if !test_inside {
-                    Some("tests outside the locked test")
+                    Some("tests outside the locked test".to_string())
                 } else {
                     None
                 }
             } else if train_hits || test_hits {
-                Some("touches the declared locked test; read it only with --locked-test and a sealed list")
+                Some(format!(
+                    "reaches the declared locked test {}..{} (label end = stamp + {} s); \
+                     end it at or before {}, or read the locked test only with --locked-test and a sealed list",
+                    rcsr::protocol::iso(ls),
+                    rcsr::protocol::iso(le),
+                    label_purge,
+                    rcsr::protocol::iso(boundary)
+                ))
             } else {
                 None
             };

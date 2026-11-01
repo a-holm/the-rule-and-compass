@@ -209,6 +209,8 @@ pub struct Analysis {
     pub unaccounted_s: Option<f64>,
     pub fit_kernel_s: Option<f64>,
     pub fit_fallback_s: Option<f64>,
+    pub fit_refit_s: Option<f64>,
+    pub fit_refits: Option<usize>,
     pub start_utc: String,
     pub end_utc: String,
     pub final_hash: String,
@@ -344,6 +346,8 @@ pub fn analyse(path: &str, events: &[Json], skipped: usize) -> Analysis {
         a.unaccounted_s = opt_f(e.get("unaccounted_s"));
         a.fit_kernel_s = opt_f(e.get("fit_kernel_s"));
         a.fit_fallback_s = opt_f(e.get("fit_fallback_s"));
+        a.fit_refit_s = opt_f(e.get("fit_refit_s"));
+        a.fit_refits = opt_f(e.get("fit_refits")).map(|v| v as usize);
         a.end_utc = string_field(e, "end");
         a.log_events = opt_f(e.get("events")).map(|v| v as u64).unwrap_or(0);
         a.log_bytes = opt_f(e.get("bytes")).map(|v| v as u64).unwrap_or(0);
@@ -457,8 +461,19 @@ pub fn analyse(path: &str, events: &[Json], skipped: usize) -> Analysis {
         ("archive", archive, "Pareto insertions and the best/quantile bookkeeping"),
         ("fit", fit, "constant fitting: the GPU fit call, the exact CPU fallback and write-back"),
     ];
+    // #495: the exact finalist refit runs after the last generation, so it is
+    // its own window beside the generation phases.
+    let refit_s = a.fit_refit_s.filter(|v| v.is_finite()).map(|v| v.max(0.0));
+    if let Some(r) = refit_s {
+        ranked.push((
+            "refit",
+            r,
+            "post-loop exact CPU f64 refit of the finalists (outside the generation wall)",
+        ));
+    }
     ranked.sort_by(|x, y| y.1.total_cmp(&x.1));
-    let wall = if a.gen_wall > 0.0 { a.gen_wall } else { 1.0 };
+    let total = a.gen_wall + refit_s.unwrap_or(0.0);
+    let wall = if total > 0.0 { total } else { 1.0 };
     a.bottlenecks = ranked
         .into_iter()
         .map(|(name, seconds, reading)| Bottleneck {
@@ -700,6 +715,13 @@ pub fn render(a: &Analysis) -> String {
     if let Some(f) = a.fit_fallback_s {
         out.push_str(&format!("| fit CPU fallback | {:.3} s |\n", f));
     }
+    if let Some(r) = a.fit_refit_s {
+        out.push_str(&format!(
+            "| exact finalist refit | {:.3} s, {} refit(s) |\n",
+            r,
+            a.fit_refits.unwrap_or(0)
+        ));
+    }
     out.push_str(&format!("| started / ended | {} / {} |\n", a.start_utc, a.end_utc));
     out.push_str(&format!(
         "| log | {} event(s), {}, {} dropped by the cap |\n\n",
@@ -883,11 +905,12 @@ pub fn render(a: &Analysis) -> String {
     out.push_str("## Bottleneck ranking\n\n");
     for (i, b) in a.bottlenecks.iter().enumerate() {
         out.push_str(&format!(
-            "{}. **{}** — {:.3} s ({:.1}% of generation wall): {}\n",
+            "{}. **{}** — {:.3} s ({:.1}% of {}): {}\n",
             i + 1,
             b.name,
             b.seconds,
             100.0 * b.share,
+            if a.fit_refit_s.is_some() { "generation wall plus refit" } else { "generation wall" },
             b.reading
         ));
     }
@@ -1101,6 +1124,39 @@ mod tests {
         assert!(text.contains("first generation at or above 0.75 converged | 2"));
         assert!(text.contains("## Archive growth"));
         assert!(text.contains("0x0000000000000003"));
+    }
+
+    /// #495: `run_end` carries the exact finalist refit; the report ranks it
+    /// beside the generation phases and without it the ranking is unchanged.
+    #[test]
+    fn report_ranks_the_post_loop_refit() {
+        let log = sample_log();
+        let end_line = log.lines().last().unwrap().to_string();
+        let with_refit = run_end_json(&RunEnd {
+            generations: 3,
+            stop: "patience".into(),
+            wall_s: 1.0,
+            search_s: 0.9,
+            archive_hash: 3,
+            fit_refit_s: Some(2.5),
+            fit_refits: Some(16),
+            ..RunEnd::default()
+        });
+        let log = log.replace(&end_line, &with_refit);
+        let (events, skipped) = parse_log(&log);
+        let a = analyse("x.ndjson", &events, skipped);
+        assert_eq!(a.fit_refit_s, Some(2.5));
+        assert_eq!(a.fit_refits, Some(16));
+        let names: Vec<&str> = a.bottlenecks.iter().map(|b| b.name).collect();
+        assert_eq!(names[0], "search");
+        assert_eq!(names[1], "refit");
+        let text = render(&a);
+        assert!(text.contains("2. **refit** — 2.500 s (42.9% of generation wall plus refit)"), "{text}");
+        assert!(text.contains("| exact finalist refit | 2.500 s, 16 refit(s) |"));
+        let (events, _) = parse_log(&sample_log());
+        let plain = analyse("x.ndjson", &events, 0);
+        assert!(plain.bottlenecks.iter().all(|b| b.name != "refit"));
+        assert!(!render(&plain).contains("exact finalist refit"));
     }
 
     /// A `summary` log renders the monitoring sections, says what the level
