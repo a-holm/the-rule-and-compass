@@ -168,6 +168,12 @@ fn assert_same(label: &str, got: &ScoreBatch, want: &ScoreBatch) {
     }
 }
 
+/// Maximum has no weighted form: a weighted launch is refused on both paths.
+fn assert_refused(label: &str, got: &ScoreBatch, want: &ScoreBatch) {
+    assert!(got.ms < 0.0, "{label}: a weighted maximum launch is refused");
+    assert!(want.ms < 0.0, "{label}: a weighted resident maximum launch is refused");
+}
+
 fn pool_of(trees: &[Node]) -> GenomePool {
     let programs: Vec<_> = trees
         .iter()
@@ -188,6 +194,7 @@ fn score_both(
     til: &mut GpuEvaluator,
     trees: &[Node],
     kinds: &[ScoreObjective],
+    weighted: bool,
 ) {
     let pop = Population::from_trees(trees.iter());
     let (prog, offsets) = pop.programs();
@@ -195,6 +202,15 @@ fn score_both(
     let pool = pool_of(trees);
     let pcount = vec![2i32; trees.len()];
     for &kind in kinds {
+        if weighted && kind == ScoreObjective::Maximum {
+            let got = til.score_population(&pop, kind, &pcount);
+            let want = res.score_population(&pop, kind, &pcount);
+            assert_refused(&format!("{label} population maximum"), &got, &want);
+            let got = til.score_pool(&pool, kind, &pcount);
+            let want = res.score_pool(&pool, kind, &pcount);
+            assert_refused(&format!("{label} pool maximum"), &got, &want);
+            continue;
+        }
         let want = res.score_population(&pop, kind, &pcount);
         let got = til.score_population(&pop, kind, &pcount);
         assert_same(&format!("{label} population {}", kind.name()), &got, &want);
@@ -220,7 +236,14 @@ fn tile_rows_do_not_change_scores() {
         let mut res = resident(&d, &weights);
         for tile_rows in [512usize, 1_024, 8_192] {
             let mut til = tiled(&d, &weights, tile_rows, None);
-            score_both(&format!("{case} T={tile_rows}"), &mut res, &mut til, &trees, &KINDS);
+            score_both(
+                &format!("{case} T={tile_rows}"),
+                &mut res,
+                &mut til,
+                &trees,
+                &KINDS,
+                !weights.is_empty(),
+            );
             let report = til.arena_report();
             assert_eq!(report.tile_rows, tile_rows as u64);
             assert!(report.tiles >= (n / tile_rows) as u64);
@@ -228,6 +251,29 @@ fn tile_rows_do_not_change_scores() {
     }
     let nan = score_nan_candidate(&d);
     assert!(nan, "the NaN candidate is unusable on both paths");
+}
+
+/// #449: a weighted maximum is refused on the tiled and the resident path, and
+/// the refusal leaves both evaluators usable: the next weighted objectives and
+/// the unweighted maximum after the weights are cleared score identically.
+#[test]
+fn weighted_maximum_refusal_leaves_the_tiled_context_usable() {
+    if !has_device() {
+        return;
+    }
+    let n = 4_097;
+    let d = data(n);
+    let zero: Vec<f64> = (0..n)
+        .map(|i| if i % 3 == 0 { 0.0 } else { 1.0 + (i % 4) as f64 * 0.25 })
+        .collect();
+    let trees = trees();
+    let mut res = resident(&d, &zero);
+    let mut til = tiled(&d, &zero, 512, None);
+    let after = [ScoreObjective::Maximum, ScoreObjective::Squared, ScoreObjective::Correlation];
+    score_both("zero weights T=512", &mut res, &mut til, &trees, &after, true);
+    assert!(res.set_score_weights(&[]));
+    assert!(til.set_score_weights(&[]));
+    score_both("cleared T=512", &mut res, &mut til, &trees, &[ScoreObjective::Maximum], false);
 }
 
 fn score_nan_candidate(d: &Data) -> bool {
@@ -258,7 +304,7 @@ fn waves_do_not_change_scores_tiled() {
         ScoreObjective::Maximum,
         ScoreObjective::LogLoss,
     ];
-    score_both("W=64", &mut res, &mut til, &candidates, &kinds);
+    score_both("W=64", &mut res, &mut til, &candidates, &kinds, false);
     let report = til.arena_report();
     let per_batch = report.waves / (2 * kinds.len() as u64);
     assert_eq!(per_batch, 16, "1,000 candidates in waves of 64: {report:?}");
