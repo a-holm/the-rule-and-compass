@@ -530,15 +530,6 @@ impl Resolved {
     /// The `lockbox` object fields of a report: declared range, source, the
     /// files that declared it, rows in scope and whether the range was read.
     pub fn report_fields(&self, rows_in_scope: usize, evaluated: bool, checked: bool) -> String {
-        self.fields(rows_in_scope, evaluated, checked, true)
-    }
-
-    /// Hashed form of `report_fields`: each declaring file is named by its carrier, not its path.
-    pub fn hashed_report_fields(&self, rows_in_scope: usize, evaluated: bool, checked: bool) -> String {
-        self.fields(rows_in_scope, evaluated, checked, false)
-    }
-
-    fn fields(&self, rows_in_scope: usize, evaluated: bool, checked: bool, paths: bool) -> String {
         let range_json = |r: &Option<Lockbox>| match r {
             Some(l) => format!(
                 "{{\"start\":{},\"end\":{},\"start_date\":{},\"end_date\":{}}}",
@@ -555,9 +546,8 @@ impl Resolved {
             .iter()
             .map(|(f, l)| {
                 format!(
-                    "{{\"{}\":{},\"start_date\":{},\"end_date\":{}}}",
-                    if paths { "file" } else { "carrier" },
-                    jstr(if paths { f } else { carrier(f) }),
+                    "{{\"file\":{},\"start_date\":{},\"end_date\":{}}}",
+                    jstr(f),
                     jstr(&date(l.start)),
                     jstr(&date(l.end))
                 )
@@ -587,28 +577,9 @@ impl Resolved {
             self.report_fields(rows_in_scope, evaluated, checked)
         )
     }
-
-    /// `splice_report` with the hashed form of the fields.
-    pub fn splice_hashed_report(&self, json: &str, rows_in_scope: usize, evaluated: bool, checked: bool) -> String {
-        let body = json.trim_end();
-        let body = body.strip_suffix('}').unwrap_or(body);
-        format!(
-            "{},\"lockbox\":{{{}}}}}",
-            body,
-            self.hashed_report_fields(rows_in_scope, evaluated, checked)
-        )
-    }
 }
 
 const CARRIERS: [&str; 4] = ["lockbox.json", "schema.json", "manifest.json", "enrich.json"];
-
-fn carrier(file: &str) -> &str {
-    CARRIERS
-        .iter()
-        .find(|e| file.ends_with(&format!(".{}", e)))
-        .copied()
-        .unwrap_or("")
-}
 
 /// Largest file a sidecar hashes; bigger files are bound by their byte count only.
 const SIDECAR_HASH_LIMIT: u64 = 2 << 30;

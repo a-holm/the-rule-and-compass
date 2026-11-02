@@ -11130,7 +11130,7 @@ fn run_walkforward(args: &[String]) -> ! {
             }
         }
     }
-    let report_sha = rcsr::manifest::sha256_hex(report.hashed_json().as_bytes());
+    let report_sha = rcsr::manifest::sha256_hex(report.json().as_bytes());
     if let Some(want) = &expect_hash {
         if want != &report_sha {
             eprintln!("error: report sha256 {} differs from the expected {}", report_sha, want);
