@@ -25,7 +25,8 @@ impl Lcg {
 
 const ROWS: usize = 2_400;
 
-/// `x0` carries the return signal, `x1` is wide enough for `exp(cube(x1))` to
+/// No trade floor: a status-0 `+inf` of the floor follows the f32 contract and is
+/// not a range failure. `x0` carries the return signal, `x1` is wide enough for `exp(cube(x1))` to
 /// overflow f32 while f64 stays finite.
 fn fixture() -> (Sample, Sample, Arc<FitnessBook>) {
     let mut rng = Lcg(17);
@@ -42,7 +43,7 @@ fn fixture() -> (Sample, Sample, Arc<FitnessBook>) {
         ret.push(0.004 * signal + 0.003 * (rng.unit() - 0.5));
     }
     let slice = TradingSlice { rows, ret: ret.clone() };
-    let spec = TradingSpec { cost_bps: 2.0, min_trades: 1, ..Default::default() };
+    let spec = TradingSpec { cost_bps: 2.0, min_trades: 0, ..Default::default() };
     let book = FitnessBook::new(&slice, &spec, 900.0).expect("a profitable fixture book");
     let y_sq = x.iter().map(|r| 0.5 * r[0] + 0.1 * r[1].tanh()).collect();
     let squared = Sample { x: x.clone(), y: y_sq, w: Vec::new(), ys: Vec::new(), pairs: None };
