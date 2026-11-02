@@ -530,7 +530,7 @@ fn walkforward_from_run_prices_the_top_tercile_book_of_the_search() {
     // The validation slice is the 3 timestamps after 14 training timestamps.
     let w = format!("v,{},{},{},{}", T0, T0 + STEP * 13, T0 + STEP * 14, T0 + STEP * 17);
     let out = p(&dir, "wf.json");
-    let o = rcsr(&["walkforward", "--data", &csv, "--time", "t", "--group-by", "sym", "--from-run", &run, "--window", &w, "--out", &out]);
+    let o = rcsr(&["walkforward", "--data", &csv, "--time", "t", "--group-by", "sym", "--from-run", &run, "--window", &w, "--out", &out, "--allow-in-sample-windows"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let j = read_json(&out);
     assert_eq!(at(&j, &["policy", "name"]).as_str(), Some("top_tercile"));
@@ -604,7 +604,7 @@ fn search_and_walkforward_rank_the_same_cross_section() {
 
         let w = format!("w,{},{},{},{}", T0, T0 + STEP * (start - 1), T0 + STEP * start, T0 + STEP * (start + 3));
         let out = p(&dir, &format!("wf-{book}.json"));
-        let o = rcsr(&["walkforward", "--data", &csv, "--time", "t", "--group-by", "sym", "--from-run", &run, "--window", &w, "--out", &out]);
+        let o = rcsr(&["walkforward", "--data", &csv, "--time", "t", "--group-by", "sym", "--from-run", &run, "--window", &w, "--out", &out, "--allow-in-sample-windows"]);
         assert_eq!(code(&o), 0, "{book}: {}", stderr(&o));
         let m = at(match at(&read_json(&out), &["windows"]) { Json::Arr(a) => &a[0], _ => panic!() }, &["metrics"]).clone();
         assert_eq!(num(&m, &["rows"]), 16.0, "{book}");
