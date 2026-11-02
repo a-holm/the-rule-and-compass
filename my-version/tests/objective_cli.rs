@@ -678,7 +678,7 @@ fn run_second_search_fault(extra: &[&str], keep_dev_log: bool) -> Output {
     let mut args = vec![
         "--data", data.as_str(), "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal",
         "--target-spec", spec.as_str(), "--seed", "3", "--generations", "6", "--pop", "32",
-        "--metric", "squared", "--json", "--quiet", "--fitness", "pnl", "--gpu", "--dispatch", "device",
+        "--metric", "squared", "--json", "--quiet", "--gpu", "--dispatch", "device",
     ];
     if !keep_dev_log {
         args.push("--no-dev-log");
@@ -698,6 +698,16 @@ fn assert_exits_6_with_message(o: &Output) {
     assert_eq!(code(o), 6, "{}", stderr(o));
     assert!(stderr(o).contains("--gpu was requested but the device search failed"), "{}", stderr(o));
     assert!(!stderr(o).contains("panicked"), "{}", stderr(o));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cross_validation_with_an_injected_fault_exits_6() {
+    let o = run_second_search_fault(&["--cv", "k-fold", "--cv-k", "3"], false);
+    if !has_device(&o) {
+        return;
+    }
+    assert_exits_6_with_message(&o);
 }
 
 #[cfg(feature = "cuda")]

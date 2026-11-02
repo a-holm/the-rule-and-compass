@@ -206,6 +206,7 @@ INPUT:
                              and its refusals. Exit 2 with --predictor-samples,
                              --fit-samples, --implicit, --min-holding above 1,
                              --max-position other than 1, multiple targets,
+                             --cv, --stability, --null-runs or --null-block,
                              overlapping rows, or no profitable path. On the
                              GPU the device scores the regret of its own f32
                              predictions, fused with the interpreter
@@ -2285,7 +2286,7 @@ impl CvReport {
     fn std_test(&self) -> f64 {
         let n = self.folds.len();
         if n == 0 {
-            return 0.0;
+            return f64::NAN;
         }
         let m = self.mean_test();
         (self.folds.iter().map(|r| (r.test_error - m).powi(2)).sum::<f64>() / n as f64).sqrt()
@@ -2295,7 +2296,7 @@ impl CvReport {
 fn mean_of(it: impl Iterator<Item = f64>) -> f64 {
     let v: Vec<f64> = it.collect();
     if v.is_empty() {
-        0.0
+        f64::NAN
     } else {
         v.iter().sum::<f64>() / v.len() as f64
     }
@@ -5115,6 +5116,15 @@ fn main() {
         if trade_max_position != 1.0 {
             trading_usage("--fitness pnl needs --max-position 1: the fitness is the unit long/flat book");
         }
+        if cv_mode.is_some() {
+            trading_usage("--fitness pnl is not supported with --cv: a fold trains on other rows than the long/flat book prices (use walkforward for out-of-sample P&L)");
+        }
+        if stability_runs > 0 {
+            trading_usage("--fitness pnl is not supported with --stability: a bootstrap resample reorders the rows the long/flat book prices");
+        }
+        if null_runs > 0 {
+            trading_usage("--fitness pnl is not supported with --null-runs/--null-block: the null shuffles the target, but the regret reads the book's returns, so every null run is the real run");
+        }
     }
 
     let resolved_lockbox = rcsr::lockbox::resolve_with(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path).unwrap_or_else(|e| {
@@ -7194,7 +7204,9 @@ fn main() {
                     baselines.knn_test_query_rows
                 );
             }
-            if let Some(cv) = &cv {
+            if let Some(cv) = cv.as_ref().filter(|c| c.folds.is_empty()) {
+                eprintln!("# cross-validation ({}, k={}): no fold produced a model", cv.mode, cv.k);
+            } else if let Some(cv) = &cv {
                 eprintln!(
                     "# cross-validation ({}, k={}): mean test={:.6} +/- {:.6} | mean train={:.6}",
                     cv.mode,
@@ -12102,6 +12114,13 @@ fn finish_import(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_empty_cv_report_has_no_means() {
+        let c = CvReport { mode: "k-fold", k: 3, folds: Vec::new() };
+        assert!(c.mean_test().is_nan() && c.mean_train().is_nan() && c.std_test().is_nan());
+        assert_eq!(jnum(c.mean_test()), "null");
+    }
+
     /// #91: a default run must be CPU regardless of build features, so the
     /// same command yields the same archive in a CUDA and a non-CUDA build.
     #[test]
