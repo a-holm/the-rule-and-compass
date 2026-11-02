@@ -509,7 +509,9 @@ fn assert_archived_values_are_device_scores(sample: &Sample, b: &FitnessBook, se
             if s.status[0].is_ok() {
                 s.values[0]
             } else {
-                f64::INFINITY
+                // #589: a status-2 +inf is replaced by the exact CPU score.
+                let pred: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(tree, r)).collect();
+                b.regret(&pred)
             }
         } else {
             let pred: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(tree, r)).collect();

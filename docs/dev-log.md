@@ -222,7 +222,7 @@ Emitted at the same boundary as `--progress`, once per completed generation
 | `fit.gate_seconds` | full | #498: wall of the exact host gate of device proposals inside `fit.host_seconds` (log_loss, correlation, correlation_signed, signed; 0 otherwise) |
 | `fit.fallback_by_cause` | full | CPU fallback counts labelled by cause (`unsupported_plan`, `too_few_rows`, `too_many_constants`, `ill_conditioned`, `non_finite`, `launch`, …) |
 | `fit.fallback_improved`, `fit.fallback_improved_by_cause` | full | fallbacks whose exact CPU refit lowered the exact error against the device (or incoming) constants, in total and by cause |
-| `gpu` | both | `null` without a GPU batch: `batches`, `programs`, `kernel_s`, `wall_s`, `duty`, `native`, `lowered`, `fallbacks`, `fallback_s`, `fallback_workers` |
+| `gpu` | both | `null` without a GPU batch: `batches`, `programs`, `kernel_s`, `wall_s`, `duty`, `native`, `lowered`, `fallbacks`, `fallback_s`, `fallback_workers`, and the #589 device `+inf` check: `nonfinite` (status-2 results), `nonfinite_full` (of those, full CPU passes after the f64 prefix probe), `nonfinite_cpu_finite` (of the full passes, finite on the CPU), `nonfinite_seconds` (wall of the full passes) |
 | `fallback.seconds`, `fallback.workers`, `fallback.scope` | both | the **evaluator** fallback pool (`scope` is `evaluator_pool`): what it cost and how wide it was. The fit fallback is `fit.fallback_*`. |
 | `variation.attempts` | full | candidate generation attempts |
 | `variation.duplicates` | full | attempts rejected as structural duplicates (`--no-dedup` makes this 0) |

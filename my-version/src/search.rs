@@ -1840,6 +1840,56 @@ impl GpuSearch {
         }
     }
 
+    /// #589: replace every device `+inf` of `slots` (status 2: the f32 program
+    /// left the f32 range) by the exact CPU score, before promotion, the
+    /// archive or migration read it. The f64 prefix probe settles a candidate
+    /// that is non-finite there; the others get a full pass on the fallback
+    /// pool.
+    fn check_device_nonfinite(
+        &mut self,
+        islands: &mut [Vec<Ind>],
+        slots: &[(usize, usize)],
+        train: &Sample,
+        cfg: &Config,
+        generation: usize,
+    ) {
+        if slots.is_empty() {
+            return;
+        }
+        let rows = EvalSample { sample: train, cols: None };
+        let full: Vec<(usize, usize)> = slots
+            .iter()
+            .copied()
+            .filter(|&(i, j)| {
+                let tree = &islands[i][j].tree;
+                cfg.accepts_dimensions(tree) && nonfinite_prefix(tree, &rows, cfg) != Some(true)
+            })
+            .collect();
+        let stats = self.stats.entry(generation).or_default();
+        stats.nonfinite += slots.len();
+        stats.nonfinite_full += full.len();
+        if full.is_empty() {
+            return;
+        }
+        let view = EvalSample::new(train, cfg);
+        let jobs: Vec<(usize, Node)> = full
+            .iter()
+            .map(|&(i, j)| (0, islands[i][j].tree.clone()))
+            .collect();
+        let (errors, seconds) = self
+            .fallback
+            .as_ref()
+            .expect("a GPU search owns its fallback pool")
+            .score(jobs, &view, cfg);
+        let stats = self.stats.entry(generation).or_default();
+        for (&(i, j), e) in full.iter().zip(errors) {
+            stats.nonfinite_cpu_finite += e.is_finite() as usize;
+            islands[i][j].error = e;
+        }
+        stats.nonfinite_seconds += seconds;
+        self.ledger.record_eval_fallback(full.len() as u64, seconds);
+    }
+
     /// #288: score one explicit set of pending candidates through the exact
     /// order-statistic/rank batch entry point.
     ///
@@ -1912,6 +1962,7 @@ impl GpuSearch {
                 .submit(jobs, view, cfg)
         });
 
+        let mut nonfinite: Vec<(usize, usize)> = Vec::new();
         let mut gpu_error: Option<String> = None;
         if !plans.is_empty() {
             let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
@@ -1919,6 +1970,9 @@ impl GpuSearch {
             match self.ev.score_stat_batch(&refs, &constants, stat) {
                 Some(values) if values.len() == refs.len() => {
                     for (&(i, j), value) in slots.iter().zip(values) {
+                        if value.is_none() {
+                            nonfinite.push((i, j));
+                        }
                         islands[i][j].error = value.unwrap_or(f64::INFINITY);
                     }
                     self.device_eval_used = true;
@@ -1956,6 +2010,7 @@ impl GpuSearch {
         if let Some(e) = gpu_error {
             return Err(e);
         }
+        self.check_device_nonfinite(islands, &nonfinite, train, cfg, generation);
         Ok(())
     }
 
@@ -2093,6 +2148,7 @@ impl GpuSearch {
                 .submit(jobs, view, cfg)
         });
 
+        let mut nonfinite: Vec<(usize, usize)> = Vec::new();
         let mut gpu_error: Option<String> = None;
         if !pool.is_empty() {
             let objective = self
@@ -2115,6 +2171,7 @@ impl GpuSearch {
                     islands[i][j].error = if status.is_ok() {
                         value
                     } else {
+                        nonfinite.push((i, j));
                         f64::INFINITY
                     };
                 }
@@ -2165,6 +2222,7 @@ impl GpuSearch {
             pending.len(),
             eval_workload.bytes,
         );
+        self.check_device_nonfinite(islands, &nonfinite, train, cfg, generation);
         Ok(())
     }
 
@@ -2749,7 +2807,7 @@ fn eval_pipeline_jobs(
     g: &mut GpuSearch,
     jobs: &[PipelineJob],
     generation: usize,
-) -> Result<(Vec<usize>, Vec<f64>), String> {
+) -> Result<(Vec<usize>, Vec<(f64, bool)>), String> {
     let mut pop = crate::gpu::Population::new();
     let mut kept: Vec<usize> = Vec::with_capacity(jobs.len());
     let mut pcount: Vec<i32> = Vec::with_capacity(jobs.len());
@@ -2788,9 +2846,9 @@ fn eval_pipeline_jobs(
         .zip(batch.status.iter())
         .map(|(&value, &status)| {
             if status.is_ok() {
-                value
+                (value, false)
             } else {
-                f64::INFINITY
+                (f64::INFINITY, true)
             }
         })
         .collect();
@@ -2816,10 +2874,11 @@ fn score_pipeline_batch(
         // the route ledger and the backend claim come from what ran.
         g.device_eval_used = true;
     }
-    for (&k, &e) in kept.iter().zip(&errs) {
+    for (&k, &(e, bad)) in kept.iter().zip(&errs) {
         let (i, j) = (jobs[k].0, jobs[k].1);
         results[i][j] = Some(PipelineResult {
             error: e,
+            nonfinite: bad,
             offered: offered_hash[k],
             tree: None,
         });
@@ -2862,6 +2921,7 @@ fn score_pipeline_batch(
         crate::fit::note_gpu_fit(false);
         results[i][j] = Some(PipelineResult {
             error: f64::NAN,
+            nonfinite: false,
             offered: offered_hash[k],
             tree: None,
         });
@@ -2891,6 +2951,7 @@ fn score_pipeline_batch(
                 crate::fit::note_gpu_fit(false);
                 results[i][j] = Some(PipelineResult {
                     error: f64::NAN,
+                    nonfinite: false,
                     offered: offered_hash[*k],
                     tree: None,
                 });
@@ -2919,6 +2980,7 @@ fn score_pipeline_batch(
                     crate::fit::note_gpu_fit(false);
                     results[i][j] = Some(PipelineResult {
                         error: f64::NAN,
+                        nonfinite: false,
                         offered: offered_hash[*k],
                         tree: None,
                     });
@@ -2982,10 +3044,11 @@ fn score_pipeline_batch(
             })
             .collect();
         let (kept2, errs2) = eval_pipeline_jobs(g, &refit, generation)?;
-        for (&pos, &err) in kept2.iter().zip(&errs2) {
+        for (&pos, &(err, bad)) in kept2.iter().zip(&errs2) {
             let (i, j, tree) = &refit[pos];
             results[*i][*j] = Some(PipelineResult {
                 error: err,
+                nonfinite: bad,
                 offered: offered_hash[fitted[pos]],
                 tree: Some(tree.clone()),
             });
@@ -5043,6 +5106,8 @@ type PipelineJob = (usize, usize, Node);
 #[derive(Clone, Debug)]
 struct PipelineResult {
     error: f64,
+    /// #589: the error is a device `+inf` with status 2, to be checked on the CPU.
+    nonfinite: bool,
     offered: u64,
     tree: Option<Node>,
 }
@@ -7820,6 +7885,7 @@ fn run_search(
                     // #560: a result for a replaced candidate is dropped, which
                     // leaves the slot pending for `score_generation` below; a
                     // rejected dimension keeps its infinite error.
+                    let mut nonfinite_slots: Vec<(usize, usize)> = Vec::new();
                     for (i, slots) in pipeline_results.iter_mut().enumerate() {
                         for (j, value) in slots.iter_mut().enumerate() {
                             let Some(r) = value.take() else { continue };
@@ -7836,7 +7902,13 @@ fn run_search(
                             } else {
                                 f64::INFINITY
                             };
+                            if r.nonfinite {
+                                nonfinite_slots.push((i, j));
+                            }
                         }
+                    }
+                    if let Some(g) = gpu.as_mut() {
+                        g.check_device_nonfinite(&mut islands, &nonfinite_slots, gen_train, cfg, gen);
                     }
                     if pipeline_error.is_none() {
                         if pipeline_scored {
