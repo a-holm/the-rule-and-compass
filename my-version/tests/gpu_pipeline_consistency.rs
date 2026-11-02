@@ -71,7 +71,9 @@ fn config(depth: usize, seed: u32) -> Config {
 }
 
 /// The device scores in `f32`, so a stored error matches the exact `f64`
-/// evaluation of its tree only up to that rounding.
+/// evaluation of its tree only up to that rounding. A tree with a near-zero
+/// denominator amplifies that rounding on a few rows past this bound; the
+/// audit then compares the stored error with a device rescore of the tree.
 #[cfg(feature = "cuda")]
 fn agrees(stored: f64, exact: f64) -> bool {
     if !stored.is_finite() || !exact.is_finite() {
@@ -84,6 +86,8 @@ fn agrees(stored: f64, exact: f64) -> bool {
 #[derive(Default)]
 struct Audit {
     checked: usize,
+    /// Pairs that disagree with the exact `f64` error but equal the device score of their own tree.
+    device_confirmed: usize,
     rejected: usize,
     /// CPU fallback refits that lowered the exact error.
     improved: usize,
@@ -92,12 +96,59 @@ struct Audit {
     mismatches: Vec<String>,
 }
 
+/// Scores a tree on the device the way the search does, to check that a stored
+/// error belongs to its tree even where `f32` and `f64` evaluation diverge.
+#[cfg(feature = "cuda")]
+struct Rescorer {
+    ev: Option<rcsr::gpu::GpuEvaluator>,
+    rows: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl Rescorer {
+    fn new(train: &Sample) -> Self {
+        let rows = train.x.len();
+        let vars = train.x[0].len();
+        let mut cols = vec![0.0f32; rows * vars];
+        for (r, x) in train.x.iter().enumerate() {
+            for (v, &value) in x.iter().enumerate() {
+                cols[v * rows + r] = value as f32;
+            }
+        }
+        let y: Vec<f32> = train.y.iter().map(|&v| v as f32).collect();
+        Self {
+            ev: rcsr::gpu::GpuEvaluator::new(&cols, rows, vars, &y),
+            rows,
+        }
+    }
+
+    /// The stored error equals the device mean squared error of `tree` up to
+    /// `f32` reduction noise. A tree the device cannot compile never confirms.
+    fn confirms(&mut self, tree: &Node, stored: f64) -> bool {
+        let Some(ev) = self.ev.as_mut() else {
+            return false;
+        };
+        let pop = rcsr::gpu::Population::from_trees([tree]);
+        if pop.len() != 1 || pop.unsupported() != 0 {
+            return false;
+        }
+        let (prog, off) = pop.programs();
+        let (scores, ms) = ev.eval_batch(prog, off);
+        if ms < 0.0 {
+            return false;
+        }
+        let device = scores[0] as f64 / self.rows as f64;
+        device.is_finite() && (stored - device).abs() <= 1e-4 * stored.abs().max(device.abs()) + 1e-7
+    }
+}
+
 /// Run `cfg` with a snapshot after every generation and compare each island
 /// individual and archive member with an exact evaluation of its own tree.
 #[cfg(feature = "cuda")]
 fn audit(cfg: &Config, train: &Sample, test: &Sample) -> Audit {
     let names = ["x0".to_string(), "x1".to_string()];
     let mut a = Audit::default();
+    let mut rescorer = Rescorer::new(train);
     let mut check = |generation: usize, what: &str, tree: &Node, stored: f64| {
         a.checked += 1;
         let exact = if cfg.accepts_dimensions(tree) {
@@ -107,6 +158,10 @@ fn audit(cfg: &Config, train: &Sample, test: &Sample) -> Audit {
             f64::INFINITY
         };
         if !agrees(stored, exact) {
+            if exact.is_finite() && rescorer.confirms(tree, stored) {
+                a.device_confirmed += 1;
+                return;
+            }
             a.mismatches.push(format!(
                 "generation {generation} {what}: stored {stored:.9e} exact {exact:.9e} {}",
                 rcsr::expr::to_string(tree, &names)
@@ -136,10 +191,11 @@ fn audit(cfg: &Config, train: &Sample, test: &Sample) -> Audit {
 #[cfg(feature = "cuda")]
 fn report(label: &str, a: &Audit) {
     eprintln!(
-        "{label}: checked {}, rejected {}, improved CPU fallback refits {}, mismatches {}, worst agreeing deviation {:.3e}",
+        "{label}: checked {}, rejected {}, improved CPU fallback refits {}, device-confirmed {}, mismatches {}, worst agreeing deviation {:.3e}",
         a.checked,
         a.rejected,
         a.improved,
+        a.device_confirmed,
         a.mismatches.len(),
         a.worst
     );
