@@ -682,7 +682,8 @@ SEARCH:
                              (diagnostics only)
   --fit-rows <N>             fit constants on a deterministic N-row subsample
                              and score/archive on all training rows (default 0
-                             = off; N >= train rows is an exact full fit). The
+                             = off, else >= 2; anything else exits 2; N >= train
+                             rows is an exact full fit). The
                              archive and every reported error are refit on all
                              rows. With the GPU evaluator and --fit-strategy gpu
                              the subsample is fixed for the run and lives on the
@@ -2881,12 +2882,14 @@ fn main() {
             "--fit-report" => cfg.fit_report = true,
             // #116: fit on a deterministic subsample, score and archive on all rows.
             "--fit-rows" => {
-                let n: usize = val!().parse().unwrap_or(0);
-                if n == 1 {
-                    eprintln!("error: --fit-rows needs 0 (off) or an integer >= 2");
-                    std::process::exit(EXIT_USAGE);
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n != 1 => cfg.fit_rows = n,
+                    _ => {
+                        eprintln!("error: --fit-rows needs 0 (off) or an integer >= 2, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
                 }
-                cfg.fit_rows = if n >= 2 { n } else { 0 };
                 fit_rows_set = true;
             }
             // #255: hard bound on one generation's exact CPU fallback refits.
