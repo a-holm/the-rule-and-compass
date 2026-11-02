@@ -541,25 +541,51 @@ pub const INJECTED_REFUSAL: &str = "injected fault: the device refused ";
 
 /// #604: test hook. `RCSR_FAULT` is a comma list of sites (`pnl_book`, `batch`,
 /// `pipeline`) at which a device call fails before it reaches the driver.
-/// Unset in normal use.
+/// `site@N` fires only in the N-th search of the process (1-based). Unset in
+/// normal use. The variable is read once per process.
 pub fn injected_fault(site: &str) -> bool {
-    let mut sites = FAULT_SITES.lock().unwrap_or_else(|e| e.into_inner());
-    sites
-        .get_or_insert_with(|| {
-            std::env::var("RCSR_FAULT")
-                .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
-                .unwrap_or_default()
-        })
-        .iter()
-        .any(|s| s == site)
+    if FAULT_OVERRIDE_SET.load(std::sync::atomic::Ordering::Relaxed) {
+        let over = FAULT_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner());
+        return fault_listed(&over, site);
+    }
+    let env = FAULTS_FROM_ENV.get_or_init(|| {
+        parse_faults(&std::env::var("RCSR_FAULT").unwrap_or_default())
+    });
+    fault_listed(env, site)
 }
 
-static FAULT_SITES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+type FaultList = Vec<(String, Option<u64>)>;
+
+static FAULTS_FROM_ENV: std::sync::OnceLock<FaultList> = std::sync::OnceLock::new();
+static FAULT_OVERRIDE: std::sync::Mutex<FaultList> = std::sync::Mutex::new(Vec::new());
+static FAULT_OVERRIDE_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SEARCH_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn parse_faults(text: &str) -> FaultList {
+    text.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| match s.split_once('@') {
+            Some((site, n)) => (site.to_string(), n.parse().ok()),
+            None => (s.to_string(), None),
+        })
+        .collect()
+}
+
+fn fault_listed(list: &FaultList, site: &str) -> bool {
+    let run = SEARCH_RUNS.load(std::sync::atomic::Ordering::Relaxed);
+    list.iter().any(|(s, n)| s == site && n.map_or(true, |n| n == run))
+}
+
+/// #619: count one search of this process, for `site@N` faults.
+pub fn note_search_start() {
+    SEARCH_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// #604: replace the injected sites in-process (empty string clears them).
 pub fn set_injected_faults_for_tests(sites: &str) {
-    let list = sites.split(',').filter(|s| !s.is_empty()).map(|s| s.trim().to_string()).collect();
-    *FAULT_SITES.lock().unwrap_or_else(|e| e.into_inner()) = Some(list);
+    *FAULT_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = parse_faults(sites);
+    FAULT_OVERRIDE_SET.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// #118: the C-side ledger for one batch, in milliseconds. The host windows are
@@ -10582,6 +10608,26 @@ mod alloc_ledger_tests {
         assert_eq!(report.live_bytes, resident);
         assert_eq!(last_alloc_failure(), Some((n * 8) as u64));
         assert_eq!(last_alloc_failure_tag().as_deref(), Some("cols_f64"));
+    }
+
+    /// #619: a refusal that is not an allocation failure must not report the
+    /// bytes of an earlier refusal in the same process.
+    #[test]
+    fn a_second_refusal_does_not_quote_the_first_allocation() {
+        let n = 200_000usize;
+        let (x32, x, y32, y) = data(n);
+        let resident = (n * 4 + n * 4) as u64;
+        let Some(mut ev) = GpuEvaluator::with_budget(&x32, n, 1, &y32, Some(resident + MIB)) else {
+            eprintln!("skipping GPU test: no usable CUDA device");
+            return;
+        };
+        assert!(!ev.set_fit_data(&x, &y, &[]));
+        assert_eq!(last_alloc_failure(), Some((n * 8) as u64));
+        let mut bits = vec![0u32; n.div_ceil(32)];
+        bits[0] = 1;
+        assert!(!ev.set_slope_pairs(&bits, 1));
+        assert_eq!(last_alloc_failure(), None);
+        assert_eq!(last_alloc_failure_tag(), None);
     }
 }
 

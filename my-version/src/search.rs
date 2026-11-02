@@ -7111,6 +7111,8 @@ fn run_search(
     seeds: &[Node],
     mut on_checkpoint: Option<CheckpointFn<'_>>,
 ) -> Result<Outcome, String> {
+    #[cfg(feature = "cuda")]
+    crate::gpu::note_search_start();
     let nvars = train.x.first().map(|r| r.len()).unwrap_or(0);
     // #26: a checkpoint written during a GPU run stores the f32 proxy fitness,
     // so a resumed run must rebuild the reported front on the CPU even when it
