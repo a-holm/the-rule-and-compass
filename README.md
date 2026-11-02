@@ -630,7 +630,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--fitness metric|pnl] [--pnl-blocks K] [--pnl-block-lambda L]
 |pnl]
      [--equivalence-z z] [--noise-lag n|auto]
-     [--allow-lockbox] [--lockbox START,END|none] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure] [--require-clean-inputs]
+     [--allow-lockbox] [--lockbox START,END|none] [--lockbox-embargo SECONDS] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure] [--require-clean-inputs]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
      [--smooth k] [--smooth-centred k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
@@ -826,6 +826,7 @@ run:
 | `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
 | `--allow-lockbox` | permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only); never opens the declared locked test |
 | `--lockbox START,END` | declared locked test (UTC, half-open). Overrides the range declared with the data (`rcsr panel build --locked-test`). Train, validation and test rows inside it are refused (exit 3). The run.json `lockbox` object reports rows, date range, read count, `declared`, `source` (`store` or `flag`), `rows_in_scope` and `evaluated` |
+| `--lockbox-embargo SECONDS` | widen the lookback embargo after the end of every locked range (default: `lockbox_embargo` declared with the data, else 10972800). Rows in `[start - purge, end + embargo)` are refused; a smaller value is refused (exit 2). The `lockbox` object reports `embargo_seconds` and `embargo_source` (`store`, `flag` or `protocol_default`) |
 | `--ledger file` | candidate ledger whose locked reads run.json counts |
 | `--arm name` | ablation arm label; run.json gains an `ablation` object with the arm, the SHA-256 of the ordered variable list, the generation budget and the generations reached |
 | `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`; `long_only` is always true): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
