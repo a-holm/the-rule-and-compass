@@ -780,6 +780,32 @@ mod front {
     }
 
     #[test]
+    fn batch_pnl_report_hash_is_reproducible_and_timings_stay_outside_it() {
+        let dir = scratch("batchhash");
+        let data = write_data(&dir);
+        let run = write_run(&dir, RUN);
+        let sha = |o: &str| o.split("\"report_sha256\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        let (code, a, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--batch-pnl"]);
+        assert_eq!(code, 0, "{err}");
+        let (code, b, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--batch-pnl"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(sha(&a), sha(&b));
+        let ja = Json::parse(a.trim()).unwrap();
+        let timings = ja.get("batch_timings").expect("batch_timings object");
+        for seam in ["per_window", "pooled"] {
+            let t = timings.get(seam).unwrap_or_else(|| panic!("missing {seam}"));
+            let stats = ja.get("batch_pnl").unwrap().get(seam).unwrap().get("stats").unwrap();
+            for k in [
+                "wall_s", "device_s", "score_s", "layout_s", "reference_s", "candidates_per_s", "row_evals_per_s",
+                "device_fraction",
+            ] {
+                assert!(t.get(k).is_some(), "{seam}.{k}");
+                assert!(stats.get(k).is_none(), "{seam}.stats.{k} is hashed");
+            }
+        }
+    }
+
+    #[test]
     fn front_trials_default_to_candidates_evaluated_and_can_be_overridden() {
         let dir = scratch("trials");
         let data = write_data(&dir);

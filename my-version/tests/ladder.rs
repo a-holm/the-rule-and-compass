@@ -95,7 +95,7 @@ fn fixture(seed: u32) -> Fixture {
     )
     .unwrap();
     let rows = windows();
-    let folds = ladder::make_folds(&panel, &rows, 2.0 * STEP, None).unwrap();
+    let folds = ladder::make_folds(&panel, &rows, 2.0 * STEP, &[], 0.0).unwrap();
     Fixture { panel, folds, rows, spec }
 }
 

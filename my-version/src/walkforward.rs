@@ -92,6 +92,13 @@ pub struct ProtocolOptions {
     /// other candidate is evaluated on the test block, the inference has no
     /// candidate columns and `batch_pnl` is refused.
     pub final_read: bool,
+    /// Half-open time ranges `[S, E)` that stay sealed in this run. A window that
+    /// reaches `[S - P, E + L)` is refused and rows inside it are dropped at read
+    /// time, with `P` the required purge and `L` `locked_embargo`. The sealed
+    /// read lists the other declared ranges only.
+    pub locked_ranges: Vec<(i64, i64)>,
+    /// Seconds after the end of every locked range whose rows read it.
+    pub locked_embargo: i64,
 }
 
 /// #482: where a candidate list came from: a run's Pareto front.
@@ -121,6 +128,8 @@ impl Default for ProtocolOptions {
             front: None,
             in_sample_windows: Vec::new(),
             final_read: false,
+            locked_ranges: Vec::new(),
+            locked_embargo: 0,
         }
     }
 }
@@ -146,6 +155,15 @@ impl ProtocolOptions {
     /// row to a test row so that no training label reaches the test decision.
     pub fn required_purge_seconds(&self, horizon: f64) -> f64 {
         self.entry_offset + horizon + self.delay
+    }
+
+    /// `[S - P, E + L)` of every sealed range with `P` the purge a training label needs.
+    pub fn locked_reach(&self, spec: &EvalSpec) -> Vec<(f64, f64, f64, f64)> {
+        let purge = self.required_purge_seconds(spec.horizon).max(spec.embargo_seconds());
+        self.locked_ranges
+            .iter()
+            .map(|&(s, e)| (s as f64, e as f64, s as f64 - purge, (e + self.locked_embargo.max(0)) as f64))
+            .collect()
     }
 }
 
@@ -716,6 +734,10 @@ fn run_store_clocked(
     let mut io_s = 0.0f64;
     let mut buf = GroupBuf::new();
     let mut scratch = Vec::new();
+    let group_ids: Vec<u64> = match layout.group {
+        Some(c) if !numeric[c] => header.levels(c).map_or_else(Vec::new, |l| l.iter().map(|s| label_group_id(s)).collect()),
+        _ => Vec::new(),
+    };
     let mut features = Vec::with_capacity(layout.vars.len());
     for pass in 0..(if opts.final_read { 2 } else { 1 }) {
         if pass == 1 {
@@ -752,6 +774,7 @@ fn run_store_clocked(
                         .and_then(|s| data::parse_time(s))
                         .unwrap_or(f64::NAN)
                 }
+
             };
             if !acc.wants(t) {
                 continue;
@@ -763,7 +786,8 @@ fn run_store_clocked(
             let g = match (layout.group, &group_codes) {
                 (None, _) => 0,
                 (Some(_), Some(codes)) => {
-                    0x8000_0000_0000_0000 | codes.get(r).copied().unwrap_or(0) as u64
+                    let code = codes.get(r).copied().unwrap_or(0) as usize;
+                    group_ids.get(code).copied().unwrap_or(label_group_id(""))
                 }
                 (Some(c), None) => group_key(view.col(c)[r]),
             };
@@ -916,10 +940,12 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
             ));
         }
     }
-    if spec.candidates.len() > 1 && spec.validation_frac <= 0.0 {
+    let table_validation = !opts.validation_starts.is_empty()
+        && spec.windows.iter().all(|w| opts.validation_starts.iter().any(|(l, _)| *l == w.label));
+    if spec.candidates.len() > 1 && spec.validation_frac <= 0.0 && !table_validation {
         return Err(
-            "multiple --expr candidates need --validation-frac > 0: select on a validation \
-             slice, never on the test block"
+            "multiple --expr candidates need a validation slice (--validation-frac > 0 or a windows \
+             table with validation_start): select on a validation slice, never on the test block"
                 .to_string(),
         );
     }
@@ -976,6 +1002,30 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
             w.test_start.floor() as i64,
             w.test_end.ceil() as i64,
         )?;
+        for (ls, le, lo, hi) in opts.locked_reach(spec) {
+            let side = if w.train_start < hi && w.train_end > lo {
+                Some("training")
+            } else if w.test_start < hi && w.test_end > lo {
+                Some("test")
+            } else {
+                None
+            };
+            if let Some(side) = side {
+                return Err(format!(
+                    "window '{}': the {} range reaches the declared locked test {}..{} (label end = stamp + {} s, \
+                     lookback embargo {} s after the end); end it at or before {} or start it at or after {}, \
+                     or read the locked test only with --locked-test and a sealed list",
+                    w.label,
+                    side,
+                    crate::protocol::iso(ls),
+                    crate::protocol::iso(le),
+                    ls - lo,
+                    hi - le,
+                    crate::protocol::iso(lo),
+                    crate::protocol::iso(hi)
+                ));
+            }
+        }
         let gap = w.test_start - w.train_end;
         if gap + 1e-9 < embargo {
             return Err(format!(
@@ -1007,21 +1057,22 @@ fn group_key(v: f64) -> u64 {
     }
 }
 
+/// Group id of a text label: it depends on the label alone, never on the other
+/// rows of the file, so a label that exists only elsewhere cannot move it.
+fn label_group_id(text: &str) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in text.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    0x8000_0000_0000_0000 | h
+}
+
 fn table_group_ids(table: &Table, col: usize) -> Vec<u64> {
     if let Some(dict) = table.dict(col) {
-        let mut ids: HashMap<&str, u64> = HashMap::new();
-        let mut next = 0u64;
-        dict.codes
-            .iter()
-            .map(|&code| {
-                let text = dict.levels.get(code as usize).map(|s| s.as_str()).unwrap_or("");
-                *ids.entry(text).or_insert_with(|| {
-                    let id = next;
-                    next += 1;
-                    id
-                })
-            })
-            .collect()
+        let ids: Vec<u64> = dict.levels.iter().map(|l| label_group_id(l)).collect();
+        let missing = label_group_id("");
+        dict.codes.iter().map(|&code| ids.get(code as usize).copied().unwrap_or(missing)).collect()
     } else {
         table.col(col).iter().map(|&v| group_key(v)).collect()
     }
@@ -1066,6 +1117,8 @@ enum Pass {
 }
 
 struct Accum {
+    /// `[S - P, E + L)` of the sealed ranges: rows inside are never read.
+    locked_reach: Vec<(f64, f64)>,
     windows: Vec<WindowData>,
     candidates: usize,
     scores: Vec<f64>,
@@ -1127,6 +1180,7 @@ impl Accum {
             });
         }
         Ok(Accum {
+            locked_reach: opts.locked_reach(spec).iter().map(|r| (r.2, r.3)).collect(),
             windows,
             candidates,
             scores: vec![0.0; candidates],
@@ -1138,6 +1192,9 @@ impl Accum {
 
     fn wants(&self, t: f64) -> bool {
         if !t.is_finite() {
+            return false;
+        }
+        if self.locked_reach.iter().any(|&(a, b)| t >= a && t < b) {
             return false;
         }
         self.windows.iter().any(|d| {
@@ -2990,8 +3047,8 @@ impl Report {
     }
 
     /// The printed report: [`Report::json_with_protocol`] (or [`Report::json`])
-    /// plus the #284 phase ledger. The ledger holds wall-clock seconds, so it
-    /// stays outside the reproduction hash.
+    /// plus the #284 phase ledger and the `--batch-pnl` timings. Both hold
+    /// wall-clock seconds, so they stay outside the reproduction hash.
     pub fn json_with_ledger(&self, protocol: Option<&str>) -> String {
         use crate::gpu_stats::Stage;
         let mut s = match protocol {
@@ -2999,6 +3056,9 @@ impl Report {
             None => self.json(),
         };
         s.pop();
+        if let Some(b) = &self.batch_pnl {
+            s.push_str(&format!(",\"batch_timings\":{}", b.timings_json()));
+        }
         s.push_str(&format!(
             ",\"ledger\":{}}}",
             self.ledger.phase_json(
@@ -3546,8 +3606,8 @@ fn select_candidate(
             let (candidate, validation_error, threshold) = if spec.band_select {
                 if !has_validation {
                     return Err(format!(
-                        "window '{}': --select-band needs --validation-frac > 0, \
-                         because the test block may not choose the candidate",
+                        "window '{}': --select-band needs a validation slice (--validation-frac > 0 or a windows \
+                         table with validation_start), because the test block may not choose the candidate",
                         d.window.label
                     ));
                 }
@@ -3592,4 +3652,49 @@ fn select_candidate(
                 (c, err, theta)
             };
     Ok(Selected { candidate, validation_error, threshold, band_selection, thresholds })
+}
+
+#[cfg(test)]
+mod locked_reach_tests {
+    use super::*;
+
+    fn spec(horizon: f64) -> EvalSpec {
+        EvalSpec {
+            expression: "x".to_string(),
+            vars: vec!["x".to_string()],
+            target: "target".to_string(),
+            time: "ts".to_string(),
+            group: None,
+            windows: vec![Window { label: "w".to_string(), train_start: 0.0, train_end: 20.0, test_start: 20.0, test_end: 40.0 }],
+            horizon,
+            embargo: None,
+            cost_bps: 10.0,
+            threshold_quantile: 0.5,
+            threshold_fixed: None,
+            validation_frac: 0.0,
+            periods_per_year: Some(4.0),
+            candidates: Vec::new(),
+            band_select: false,
+            pool_reset_flat: false,
+            allow_lockbox: false,
+            device_pnl: false,
+            control_seed: 0,
+            policy: Policy::Threshold,
+            band_width: 0.0,
+            min_hold: 1,
+            gpu: false,
+        }
+    }
+
+    #[test]
+    fn the_read_time_drop_spans_the_purge_before_and_the_embargo_after_a_sealed_range() {
+        let mut spec = spec(3.0);
+        spec.windows[0].test_end = 60.0;
+        let opts = ProtocolOptions { locked_ranges: vec![(30, 36)], locked_embargo: 5, ..ProtocolOptions::default() };
+        let acc = Accum::new(&spec, &opts, 1).unwrap();
+        assert_eq!(opts.locked_reach(&spec), vec![(30.0, 36.0, 27.0, 41.0)]);
+        for t in 0..60 {
+            assert_eq!(acc.wants(t as f64), t < 27 || t >= 41, "row {t}");
+        }
+    }
 }

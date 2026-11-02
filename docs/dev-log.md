@@ -176,7 +176,7 @@ both levels; the fields marked **full** only exist in a `full` log.
 | `command` | the command line, verbatim |
 | `version`, `commit`, `dirty` | binary version and the commit recorded when the binary was built (`manifest::build_info`; #256) |
 | `binary_sha256` | SHA-256 of the running executable |
-| `data.path`, `data.sha256` | the input path and its SHA-256 (`null` for stdin) |
+| `data.path`, `data.sha256` | the input path and its SHA-256 (`null` for stdin). The digest is cached in `<data>.sha256.json` (size, mtime, inode); a changed file is hashed again. A read-only directory skips the cache. |
 | `data.full_rows`, `data.sampled_rows` | #112: `true`/`null` full load, `false`/`N` explicit sample, `null` for a CSV |
 | `data.estimate_bytes` | #112: the memory estimate behind the load decision (`null` for a CSV) |
 | `data.train`, `data.test` | `rows` and the checkpoint `fingerprint` of each sample |
@@ -277,6 +277,7 @@ because that loop has neither.
 | `unaccounted_s` | `run_wall_s − Σ stage_s`; >1 % of wall is a telemetry defect |
 | `device_busy_s` basis | the union uses CUDA event timestamps when they are available; the stage seconds (including `io`), the placement basis (`events`, `host_envelope`, `mixed`) and the structural-zero stages (`features`, `pnl`) are in `--json` `gpu.ledger`, not in this event |
 | `stages.vary_s`, `stages.fit_s` (mixed arm) | with `--gpu --fit-strategy exact` the island threads fit on the CPU; each island-scope window is split into `fit_s` (summed island fit time divided by island threads, capped at the window) and `vary_s` (the rest). The split is apportioned, not a measured interval |
+| `stages.eval_s`, `stages.fit_s`, `drain_wall_s` (overlap pipeline) | with `--pipeline-depth > 0` the main thread scores and fits queued batches inside the island-scope window (#600). Those call times are booked as `eval_s` and `fit_s` (capped by the window, eval first) and counted in `ledger.drain_wall_s`; `vary_s` is the rest of the window. The fit kernel is a `fit` device interval in `device_busy_s`, as at depth 0. The split is apportioned, because the drain runs concurrently with island work |
 | `fit_kernel_s`, `fit_fallback_s` | raw device fit-kernel seconds and measured exact-CPU fit-fallback seconds |
 | `fit_kernel_lm_s`, `fit_kernel_polish_s` | `fit_kernel_s` apportioned to the damped LM loop and to the polish phase by per-block cycle sums (`--fit-polish`) |
 | `fit_refit_s`, `fit_refits` | #495: wall seconds and count of the exact CPU finalist refits after the last generation (GPU runs; `null` on a CPU run). `rcsr dev-report` ranks the refit as its own window beside the generation phases and prints it in the run table |

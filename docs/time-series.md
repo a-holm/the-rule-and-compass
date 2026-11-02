@@ -61,8 +61,9 @@ the split you asked for.
 same group in the data order (`--time`, then `--group-by`). A gap in the time
 index is not detected: two rows on either side of a missing day are one pair,
 and their difference is a slope over the gap. The GPU scores and fits slope
-only when the training pairs are its consecutive rows: a single series under
-`--split temporal`. A panel with `--group-by` or a shuffled split keeps
+only when every training pair is a row and its predecessor: a single series
+under `--split temporal`, or a `--group-by` panel, whose group boundaries are
+masked per row (#508). A shuffled split keeps
 the CPU with the reason `slope pairs are not the consecutive rows of the
 training sample` (#236).
 
@@ -111,12 +112,18 @@ The protocol locked test is a second, separate box. Data that declares it
 (`rcsr panel build --locked-test START,END`) uses the declared range; undeclared
 data uses the protocol default 2025-07-01..2026-07-01. The search, `walkforward`,
 `ladder` and `ablation score` refuse every fit, validation or test row inside
-it (exit 3), and every row whose label window reaches it: a row within the target's `required_purge_seconds` before the range (219600 s without a target spec) is refused too, and the refusal names the exact `--exclude 'ts >= START - purge'`. `walkforward`, `ladder` and `ablation score` refuse a window that ends after `START - purge`. `--lockbox none` is the only opt-out, and the report records
+it (exit 3), and every row whose label window reaches it: a row within the target's `required_purge_seconds` before the range (219600 s without a target spec) is refused too, and the refusal names the exact `--exclude 'ts >= START - purge and ts < END + embargo'`. `walkforward`, `ladder` and `ablation score` refuse a window that reaches `[START - purge, END + embargo)`. `--lockbox none` is the only opt-out, and the report records
 `"source":"none"`. A `--lockbox` flag on undeclared data adds to the default and never replaces it. Ranges from the store or a flag also fail closed (no `--time`, a non-epoch time column and unstamped rows are refused); the protocol default only checks data with epoch-seconds stamps. `--allow-lockbox` does not open it. Only the sealed
 `--locked-test` path of `walkforward` and `ladder` reads it, once. A pilot
 split such as `--split temporal --validation-frac 0.20` on a panel that ends
 inside the locked range puts its test block there; the refusal tells you to
 `--exclude` the rows.
+
+**Lookback embargo after the end.** Features look back: a development row at `t >= END` is computed from locked bars while `t - lookback < END`, so a model fitted, validated or selected on it sees locked prices. This is the embargo of AFML 7.4.2. Every guard refuses the span `[START - purge, END + embargo)` of each declared range, both ranges of a pair included. `embargo` is one number per data file: the largest lookback of its columns, declared by the writer as `lockbox_embargo` (`seconds`, `column`, `rule`, `bar_seconds`) in the sidecar next to `locked_test` and read as the largest value over the carriers. `rcsr enrich` computes it from `enrich::lookback_seconds`, the rule `rcsr-lookback/1`: finite windows count their bars, a recursive filter (EMA, Wilder RSI, ATR, ADX, MACD) counts the lags that hold all but `protocol::LOOKBACK_RESIDUAL` (1e-4) of the weight of each stage, an MTF leaf counts `(K + 2)` higher bars, a cross-section column takes its source, a label column takes the volatility window. `rcsr panel build` takes at least `lookback_days + rebalance_days` of the membership sidecar (`<membership>.json`). A store with no declaration gets `protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS` (10972800 s, 127 days, the longest lookback of the default feature set on hourly bars). `--lockbox-embargo SECONDS` on the search, `walkforward`, `ladder`, `ablation prepare`, `ablation score`, `panel spread` and `audit` widens it and is refused (exit 2) when smaller. The reports record `embargo_seconds` and `embargo_source` (`store`, `flag` or `protocol_default`) in the `lockbox` object, and `split.lockbox_embargo_seconds` in `run.json`. A range at the end of the data has no row in the embargo, so its outputs do not change. The audit leaves out `[START - purge, END + embargo)` as well, and the enrich feature and label reports leave out the same span. `rcsr ablation prepare` builds its null columns in a separate segment for `[END, END + embargo)`.
+
+A locked read of one range keeps every other declared range sealed: `walkforward --locked-test` and `ladder --locked-test` refuse a window or fold that reaches the span of the other range.
+
+`ladder` and `ablation score` take the purge as the larger of `--purge-seconds` and the `required_purge_seconds` of the `--target-spec` entry (`purge_source` in the report). A search with several targets uses the largest `required_purge_seconds` of the targets that have a spec entry. `rcsr audit` uses the spec purge too.
 
 The check needs the time stamps of every split side. Pass `--time <epoch-seconds column>`; without it the search uses the data's single integer epoch-seconds column, and exits 3 when there is none or several. Selectors without `--time` are checked the same way. `--cv` ignores `--allow-lockbox` for the declared range and draws its folds from the rows left by `--exclude` and `--filter`.
 
@@ -264,7 +271,7 @@ A row is `NaN` when any bar from `t` to `t+h+d` is missing, partial or has a non
 
 **Purge.** `purge_seconds = entry_offset + h + delay`, derived from the spec and never from a name: a 60 minute label on 15 minute bars purges 4500 s, a 60 hour label on hourly bars 219600 s. `LongLabelSpec::target_spec` writes the matching `rcsr-target-spec/1` entry (`long_only: true`, `return_column`, scale column `vol<W>`), so the split purges `required_purge_seconds` around every validation and test row. `--gap` stays row based and is ignored with explicit `--train-select`/`--test-select`; `rcsr protocol selectors` prints selectors that carry the purge, and `rcsr walkforward` refuses a window whose gap is shorter than `--entry-offset + --horizon + --delay`.
 
-**Overlap.** Uniqueness weights `u_i = mean over the label's bars of 1/c_t` and `w_i = u_i*n/sum(u)` are stored with the labels (`c_t` is the number of labels covering bar `t`). The report records `effective_n = sum(u)` and `effective_n_hours = effective_n * horizon hours`. A stride below the horizon is refused for horizons of 4 h and longer unless `--allow-overlap` is given (`rcsr enrich`, `rcsr prep`); stride at `h` is the primary fix.
+**Overlap.** Uniqueness weights `u_i = mean over the label's bars of 1/c_t` and `w_i = u_i*n/sum(u)` are stored with the labels (`c_t` is the number of labels covering bar `t`). The report records `effective_n = sum(u)` and `effective_n_hours = effective_n * horizon hours`. A stride below the horizon is refused for horizons of 4 h and longer unless `--allow-overlap` is given (`rcsr enrich`, `rcsr prep`); stride at `h` is the primary fix. With a declared locked range the weights are normalised over the development rows only: `n` and `sum(u)` run over the valid rows whose stamp is outside every refused span `[S - purge, E + L)` (`L` is the lock-box lookback embargo), so no weight depends on a locked price. Rows inside a span keep a finite weight that no evaluator reads. The report records `weight_norm_rows` (rows in the normalisation), and `weight_norm_rows: 0` makes the weight column `NaN`. Without a range the column is unchanged.
 
 **Report.** The label report lists the share of rows clipped at the bound, the sign shares of `fwd`, its mean and the 1, 5, 25, 50, 75, 95 and 99 % quantiles, the cost-to-move ratio (round trip over mean absolute `fwd`), the exit counts, the purge and the label hash (SHA-256 of the definition version, spec and every column). It also lists the 10 largest absolute forward moves with symbol, decision timestamp and value, the replacement for the retired jumps audit. A panel report merges all symbols; its label hash is the SHA-256 of the spec and each symbol's series hash in store order.
 

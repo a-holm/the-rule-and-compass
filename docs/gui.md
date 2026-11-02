@@ -623,7 +623,7 @@ This is what the Run pane consumes; it is also what makes the Pareto chart grow
 live.
 
 **Exit codes** — `0` success, `2` usage error, `3` input/data error,
-`4` no finite solution. The GUI maps each to a message and, for `2` and `3`,
+`4` no finite solution, `6` device failure under an explicit `--gpu`. The GUI maps each to a message and, for `2` and `3`,
 highlights the offending form field where it can and otherwise shows the log.
 
 ### 6.2 Driving the stream

@@ -9,6 +9,7 @@
 
 use crate::enrich::{self, RegistryEntry};
 use crate::manifest;
+use crate::ohlcv::Timeframe;
 use crate::store::{DType, FileStore};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -234,6 +235,57 @@ pub struct ColumnSchema {
 /// The store is read one group at a time, so memory is one group of one
 /// column plus the time column.
 pub fn build_schema(store: &FileStore) -> Result<Vec<ColumnSchema>, String> {
+    build_schema_with_bar(store).map(|(columns, _)| columns)
+}
+
+/// The base bar length of a store: the modal positive step of its time column.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BarStep {
+    pub seconds: Option<i64>,
+    pub modal_share: f64,
+}
+
+impl BarStep {
+    fn from_counts(counts: &BTreeMap<i64, u64>) -> BarStep {
+        let total: u64 = counts.values().sum();
+        let mut best: Option<(i64, u64)> = None;
+        for (&d, &n) in counts {
+            if best.is_none_or(|(_, bn)| n > bn) {
+                best = Some((d, n));
+            }
+        }
+        match best {
+            Some((d, n)) => BarStep { seconds: Some(d), modal_share: n as f64 / total as f64 },
+            None => BarStep { seconds: None, modal_share: 0.0 },
+        }
+    }
+
+    fn name(&self) -> String {
+        let Some(s) = self.seconds else {
+            return "unknown".to_string();
+        };
+        [
+            Timeframe::M1,
+            Timeframe::M3,
+            Timeframe::M5,
+            Timeframe::M15,
+            Timeframe::M30,
+            Timeframe::H1,
+            Timeframe::H2,
+            Timeframe::H4,
+            Timeframe::D1,
+            Timeframe::W1,
+        ]
+        .into_iter()
+        .find(|t| t.seconds() == s)
+        .map_or_else(|| format!("{}s", s), |t| t.name().to_string())
+    }
+}
+
+/// As [`build_schema`], with the store's base bar length. Columns whose registry
+/// label is the base default ("15m", and the quality columns) carry the bar
+/// name; multi-timeframe and label columns keep their registry label.
+pub fn build_schema_with_bar(store: &FileStore) -> Result<(Vec<ColumnSchema>, BarStep), String> {
     let header = store.header();
     let names = header.names();
     let dtypes = header.dtypes();
@@ -261,6 +313,8 @@ pub fn build_schema(store: &FileStore) -> Result<Vec<ColumnSchema>, String> {
     let mut first: Vec<Option<i64>> = vec![None; names.len()];
     let mut last: Vec<Option<i64>> = vec![None; names.len()];
     let mut bytes: Vec<u8> = Vec::new();
+    let mut step_counts: BTreeMap<i64, u64> = BTreeMap::new();
+    let mut prev_time: Option<i64> = None;
     for g in 0..header.n_groups() {
         let times: Vec<i64> = match time_col {
             Some(c) if dtypes[c] == DType::I64 => store.read_i64(g, c)?,
@@ -271,6 +325,14 @@ pub fn build_schema(store: &FileStore) -> Result<Vec<ColumnSchema>, String> {
                 .collect(),
             None => Vec::new(),
         };
+        for &t in &times {
+            if let Some(p) = prev_time {
+                if t > p {
+                    *step_counts.entry(t - p).or_insert(0) += 1;
+                }
+            }
+            prev_time = Some(t);
+        }
         for (c, dtype) in dtypes.iter().enumerate() {
             bytes.clear();
             match dtype {
@@ -300,8 +362,13 @@ pub fn build_schema(store: &FileStore) -> Result<Vec<ColumnSchema>, String> {
             hashers[c].update(&bytes);
         }
     }
+    let bar = BarStep::from_counts(&step_counts);
+    let bar_name = bar.name();
     let mut out = Vec::with_capacity(names.len());
-    for (c, (hasher, r)) in hashers.into_iter().zip(resolved).enumerate() {
+    for (c, (hasher, mut r)) in hashers.into_iter().zip(resolved).enumerate() {
+        if r.timeframe == "15m" || r.family == "quality" {
+            r.timeframe = bar_name.clone();
+        }
         out.push(ColumnSchema {
             name: names[c].clone(),
             resolved: r,
@@ -311,7 +378,7 @@ pub fn build_schema(store: &FileStore) -> Result<Vec<ColumnSchema>, String> {
             sha256: hasher.finalize(),
         });
     }
-    Ok(out)
+    Ok((out, bar))
 }
 
 fn opt_i64(v: Option<i64>) -> String {
@@ -321,11 +388,22 @@ fn opt_i64(v: Option<i64>) -> String {
 /// Serialise the schema: a header line, one line per column.
 pub fn schema_json(
     columns: &[ColumnSchema],
+    bar: &BarStep,
     rows: usize,
     panel_version: &str,
     locked_test: Option<&crate::lockbox::Lockbox>,
     also: Option<&crate::lockbox::Lockbox>,
+    embargo_floor: Option<i64>,
 ) -> String {
+    let base_bar = bar.seconds.unwrap_or(3600);
+    let (embargo_seconds, embargo_column) = {
+        let (l, c) = crate::enrich::max_lookback_seconds(columns.iter().map(|c| c.name.as_str()), base_bar);
+        match embargo_floor {
+            Some(f) if f > l => (f, "(inherited or membership)".to_string()),
+            _ => (l, c),
+        }
+    };
+    let embargo = crate::lockbox::embargo_json(embargo_seconds, &embargo_column, crate::enrich::EMBARGO_RULE, base_bar);
     let locked = locked_test
         .map(|l| {
             format!(
@@ -335,22 +413,31 @@ pub fn schema_json(
             )
         })
         .unwrap_or_default();
+    let bar_json = match bar.seconds {
+        None => "\"bar_seconds\":null,".to_string(),
+        Some(s) if bar.modal_share < 1.0 => {
+            format!("\"bar_seconds\":{},\"bar_seconds_modal_share\":{},", s, bar.modal_share)
+        }
+        Some(s) => format!("\"bar_seconds\":{},", s),
+    };
     let mut s = format!(
         "{{\"panel_version\":{},\"schema_version\":{},\"feature_registry_version\":{},\
-         \"compact_parity_owner\":\"#{}\",\"rows\":{},{}\"columns\":[\n",
+         \"compact_parity_owner\":\"#{}\",\"rows\":{},{}{}\"lockbox_embargo\":{},\"columns\":[\n",
         esc(panel_version),
         SCHEMA_VERSION,
         FEATURE_REGISTRY_VERSION,
         PARITY_OWNER_ISSUE,
         rows,
-        locked
+        bar_json,
+        locked,
+        embargo
     );
     for (i, c) in columns.iter().enumerate() {
         let r = &c.resolved;
         let sources: Vec<String> = r.sources.iter().map(|x| esc(x)).collect();
         s.push_str(&format!(
             "{{\"name\":{},\"family\":{},\"timeframe\":{},\"sources\":[{}],\"transform\":{},\
-             \"causal_offset\":{},\"warmup_bars\":{},\"dtype\":{},\"unit\":{},\
+             \"causal_offset\":{},\"warmup_bars\":{},\"lookback_seconds\":{},\"dtype\":{},\"unit\":{},\
              \"availability_start\":{},\"availability_end\":{},\"pit_rule\":{},\
              \"semantic_cost\":{},\"status\":{},\"sha256\":{}}}{}\n",
             esc(&c.name),
@@ -360,6 +447,7 @@ pub fn schema_json(
             esc(&r.transform),
             r.causal_offset,
             r.warmup,
+            opt_i64(crate::enrich::lookback_seconds(&c.name, base_bar)),
             esc(c.dtype.name()),
             esc(&r.unit),
             opt_i64(c.availability_start),
@@ -389,9 +477,21 @@ pub fn write_schema_declared(
     locked_test: Option<&crate::lockbox::Lockbox>,
     also: Option<&crate::lockbox::Lockbox>,
 ) -> Result<String, String> {
+    let floor = crate::lockbox::declared_embargo(store_path).map_err(|e| e.message)?.map(|(_, s)| s);
+    write_schema_embargo(store_path, panel_version, locked_test, also, floor)
+}
+
+/// As [`write_schema_declared`], with the embargo the schema declares at least `embargo_floor` seconds.
+pub fn write_schema_embargo(
+    store_path: &str,
+    panel_version: &str,
+    locked_test: Option<&crate::lockbox::Lockbox>,
+    also: Option<&crate::lockbox::Lockbox>,
+    embargo_floor: Option<i64>,
+) -> Result<String, String> {
     let store = FileStore::open(store_path)?;
-    let columns = build_schema(&store)?;
-    let text = schema_json(&columns, store.n_rows(), panel_version, locked_test, also);
+    let (columns, bar) = build_schema_with_bar(&store)?;
+    let text = schema_json(&columns, &bar, store.n_rows(), panel_version, locked_test, also, embargo_floor);
     let out = schema_path(store_path);
     std::fs::write(&out, text).map_err(|e| format!("{}: {}", out, e))?;
     Ok(out)
@@ -495,8 +595,8 @@ pub struct View {
     pub seed: u64,
     pub view: usize,
     pub size: usize,
-    /// Columns the view holds; below `size` when the store has too few
-    /// candidate families for the two-per-family rule.
+    /// Columns the view holds; equals `size` because a store with fewer
+    /// candidate columns is refused.
     pub delivered: usize,
     pub columns: Vec<String>,
     pub families: Vec<(String, Vec<String>)>,
@@ -560,14 +660,35 @@ pub fn check_view_size(size: usize) -> Result<(), String> {
     }
 }
 
+/// Why a view could not be selected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewError {
+    /// The store has fewer candidate columns than the requested size.
+    Shortfall { requested: usize, available: usize },
+    Invalid(String),
+}
+
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ViewError::Shortfall { requested, available } => write!(
+                f,
+                "--project {}: the store has {} candidate columns, fewer than the {} requested",
+                requested, available, requested
+            ),
+            ViewError::Invalid(m) => f.write_str(m),
+        }
+    }
+}
+
 /// Select a view from `columns` (stored column names in header order).
 ///
 /// Candidates are the available, derived (non-input) registry columns. Each
-/// family contributes one column, or two when `size` allows, and the choice
+/// family contributes one column per round until `size` columns are drawn, and the choice
 /// rotates with `(seed, view)`: consecutive views walk different families and
 /// different names. The result depends only on the column names, the registry
 /// and the arguments, never on row data.
-pub fn select_view(columns: &[String], size: usize, seed: u64, view: usize) -> Result<View, String> {
+pub fn select_view(columns: &[String], size: usize, seed: u64, view: usize) -> Result<View, ViewError> {
     select_view_excluding(columns, size, seed, view, &[])
 }
 
@@ -579,8 +700,8 @@ pub fn select_view_excluding(
     seed: u64,
     view: usize,
     excluded: &[(String, String)],
-) -> Result<View, String> {
-    check_view_size(size)?;
+) -> Result<View, ViewError> {
+    check_view_size(size).map_err(ViewError::Invalid)?;
     let mut fams: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for c in columns {
         if excluded.iter().any(|(n, _)| n == c) {
@@ -593,7 +714,11 @@ pub fn select_view_excluding(
         }
     }
     if fams.is_empty() {
-        return Err("--project: the store has no registered feature columns".to_string());
+        return Err(ViewError::Invalid("--project: the store has no registered feature columns".to_string()));
+    }
+    let available: usize = fams.values().map(|n| n.len()).sum();
+    if available < size {
+        return Err(ViewError::Shortfall { requested: size, available });
     }
     for names in fams.values_mut() {
         names.sort();
@@ -605,9 +730,8 @@ pub fn select_view_excluding(
     let order: Vec<&String> = (0..nf).map(|i| &family_names[(start + i) % nf]).collect();
     let mut picked: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut count = 0usize;
-    let rounds = if size <= VIEW_SIZE_MAX { 2 } else { usize::MAX };
     let per = size.div_ceil(nf).max(1);
-    for round in 0..rounds {
+    for round in 0.. {
         if count >= size || round > fams.values().map(|n| n.len()).max().unwrap_or(0) {
             break;
         }

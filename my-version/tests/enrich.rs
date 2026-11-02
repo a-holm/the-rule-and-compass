@@ -3290,3 +3290,278 @@ fn feature_report_leaves_out_the_purge_window_of_label_columns_only() {
     assert_eq!(left("lbl_h1_fwd"), 3 * (locked_rows_per_symbol + 1));
     assert_eq!(left("lbl_h4_fwd"), 3 * (locked_rows_per_symbol + 4));
 }
+
+// ---------------------------------------------------------------------------
+// #582: the lookback of every column and the embargo the writers declare.
+// ---------------------------------------------------------------------------
+
+const EMB_T0: i64 = 1_704_067_200;
+const EMB_H: i64 = 3600;
+
+struct Lcg(u64);
+
+impl Lcg {
+    fn unif(&mut self) -> f64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((self.0 >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    }
+
+    fn norm(&mut self) -> f64 {
+        let (u, v) = (self.unif(), self.unif());
+        (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+    }
+}
+
+/// Three hourly symbols. With `perturbed`, the one-bar log returns of bars
+/// `[s, e)` are replayed in reverse order and the last locked close is pinned,
+/// so every bar before `s` and from `e` on is identical in both variants.
+fn embargo_rows(n: usize, s: usize, e: usize, perturbed: bool) -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
+    let mut out = Vec::new();
+    for (k, sym) in ["AAA", "BBB", "BTCUSDT"].iter().enumerate() {
+        let mut rng = Lcg(0x9E37_79B9_7F4A_7C15 ^ ((k as u64 + 1) * 0x2545_F491_4F6C_DD1D));
+        let (mut r, mut uh, mut ul, mut vol) = (vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+        for t in 0..n {
+            r[t] = 0.00005 + 0.006 * rng.norm();
+            uh[t] = rng.unif();
+            ul[t] = rng.unif();
+            vol[t] = 1000.0 + (rng.unif() * 500.0).floor();
+        }
+        let p0 = 100.0 * (k as f64 + 1.0);
+        let mut ca = vec![0.0; n];
+        let mut prev = p0;
+        for t in 0..n {
+            ca[t] = prev * r[t].exp();
+            prev = ca[t];
+        }
+        let mut c = ca.clone();
+        if perturbed {
+            let mut prev = if s > 0 { ca[s - 1] } else { p0 };
+            for t in s..e {
+                c[t] = prev * r[s + e - 1 - t].exp();
+                prev = c[t];
+            }
+            c[e - 1] = ca[e - 1];
+        }
+        for t in 0..n {
+            let open = if t == 0 { p0 } else { c[t - 1] };
+            let close = c[t];
+            out.push((
+                EMB_T0 + EMB_H * t as i64,
+                sym.to_string(),
+                open,
+                open.max(close) * (1.0 + 0.002 * uh[t]),
+                open.min(close) * (1.0 - 0.002 * ul[t]),
+                close,
+                vol[t],
+            ));
+        }
+    }
+    out
+}
+
+fn is_recursive_column(name: &str) -> bool {
+    name.starts_with("ema")
+        || name.starts_with("macd")
+        || name.starts_with("rsi")
+        || name.starts_with("atr")
+        || matches!(name, "mfi14" | "rng_atr" | "inside_s" | "outside_s" | "engulf_s" | "harami_s" | "natr14" | "adx14" | "di_plus" | "di_minus" | "di_diff14" | "batr" | "gapatr" | "volrat")
+        || (name.starts_with("mtf_") && (name.ends_with("_rsi") || name.ends_with("_atr_pct")))
+}
+
+#[test]
+fn every_catalogue_column_forgets_a_perturbed_prefix_after_its_lookback() {
+    let (n, s, e) = (7000usize, 2900usize, 3300usize);
+    let dir = tmp_dir("lookback-property");
+    let mut outs = Vec::new();
+    for (tag, perturbed) in [("a", false), ("b", true)] {
+        let src = dir.join(format!("{tag}.rcsb")).to_string_lossy().into_owned();
+        let out = dir.join(format!("{tag}_out.rcsb")).to_string_lossy().into_owned();
+        write_store_with_flow(&src, &embargo_rows(n, s, e, perturbed), 4096);
+        let mut o = Options { data: src.clone(), out: Some(out.clone()), gpu: GpuMode::Off, ..Default::default() };
+        for g in ["all", "py15m", "compact", "flow", "price_action", "mtf", "cross:btc"] {
+            o.features.push(g.to_string());
+        }
+        enrich::build(&o).unwrap();
+        outs.push(out);
+    }
+    let names = FileStore::open(&outs[0]).unwrap().header().names();
+    let ts = column(&outs[0], "ts");
+    let e_ts = (EMB_T0 + EMB_H * e as i64) as f64;
+    let mut checked = 0;
+    let mut failures: Vec<String> = Vec::new();
+    for name in names.iter().skip(8) {
+        let lookback = enrich::lookback_seconds(name, EMB_H).unwrap_or_else(|| panic!("{name} has no lookback rule"));
+        let (a, b) = (column(&outs[0], name), column(&outs[1], name));
+        let from_e: Vec<usize> = (0..ts.len()).filter(|&i| ts[i] >= e_ts).collect();
+        let max_abs = from_e.iter().filter(|&&i| a[i].is_finite()).fold(0.0f64, |m, &i| m.max(a[i].abs()));
+        let max_diff = from_e.iter().filter(|&&i| a[i].is_finite() && b[i].is_finite()).fold(0.0f64, |m, &i| m.max((a[i] - b[i]).abs()));
+        let tol = if is_recursive_column(name) { 1e-3 * max_diff } else { 1e-12 * max_abs };
+        for i in (0..ts.len()).filter(|&i| ts[i] >= e_ts + lookback as f64) {
+            if a[i].is_nan() != b[i].is_nan() {
+                failures.push(format!("{name}: NaN pattern differs at row {i} after its lookback {lookback} s"));
+                break;
+            }
+            if a[i].is_finite() {
+                if (a[i] - b[i]).abs() > tol {
+                    let last_bad = (0..ts.len()).filter(|&j| ts[j] >= e_ts && a[j].is_finite() && b[j].is_finite() && (a[j] - b[j]).abs() > tol).map(|j| ((ts[j] - e_ts) / EMB_H as f64) as i64).max().unwrap_or(0);
+                    failures.push(format!("{name} at row {i}: {} vs {} (tolerance {tol}, lookback {lookback} s, last differing hour after E {last_bad})", a[i], b[i]));
+                    break;
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{} columns read the range after their lookback:\n{}", failures.len(), failures.join("\n"));
+    assert!(checked > 100_000, "{checked} compared values");
+}
+
+#[test]
+fn the_lookback_rule_matches_the_measured_decay() {
+    let h = EMB_H;
+    assert_eq!(enrich::lookback_seconds("mtf_1d_rsi", h), Some(10_972_800));
+    assert_eq!(enrich::lookback_seconds("mtf_1d_atr_pct", h), Some(10_972_800));
+    assert_eq!(enrich::lookback_seconds("vol_z2880", h), Some(10_710_000));
+    assert_eq!(enrich::lookback_seconds("cusum_abs_z", h), Some(691_200));
+    assert_eq!(enrich::lookback_seconds("ema200", h), Some(921 * h));
+    assert_eq!(enrich::lookback_seconds("rsi14", h), Some(125 * h));
+    assert_eq!(enrich::lookback_seconds("macd_hist", h), Some(160 * h));
+    assert_eq!(enrich::lookback_seconds("volrat", h), Some(880 * h));
+    assert_eq!(enrich::lookback_seconds("ma_slope672", h), Some(1343 * h));
+    assert_eq!(enrich::lookback_seconds("mtf_1h_vol", h), Some(22 * h));
+    assert_eq!(enrich::lookback_seconds("mtf_4h_vol", h), Some(88 * h));
+    assert_eq!(enrich::lookback_seconds("mtf_1d_ret24", h), Some(624 * h));
+    assert_eq!(enrich::lookback_seconds("mtf_1d_trend_slope", h), Some(984 * h));
+    assert_eq!(enrich::lookback_seconds("lbl_h1_y", h), Some(96 * h));
+    assert_eq!(enrich::lookback_seconds("lbl_h1_fwd", h), Some(0));
+    assert_eq!(enrich::lookback_seconds("ts", h), Some(0));
+    assert_eq!(enrich::lookback_seconds("not_a_column", h), None);
+}
+
+#[test]
+fn the_default_lockbox_embargo_is_the_largest_registry_lookback_at_one_hour() {
+    let longest = enrich::default_registry()
+        .iter()
+        .filter_map(|e| enrich::lookback_seconds(&e.name, EMB_H))
+        .max()
+        .unwrap();
+    assert_eq!(longest, rcsr::protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS);
+    assert_eq!(rcsr::protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS, 10_972_800);
+}
+
+#[test]
+fn the_lookback_of_a_column_is_at_least_its_warmup_for_every_registry_entry() {
+    for e in enrich::default_registry() {
+        if let Some(l) = enrich::lookback_seconds(&e.name, EMB_H) {
+            assert!(l >= e.warmup as i64 * EMB_H || e.family == "mtf", "{}: lookback {} s, warmup {}", e.name, l, e.warmup);
+        }
+    }
+}
+
+#[test]
+fn enrich_writes_the_lockbox_embargo_and_the_lookback_of_every_feature() {
+    let dir = tmp_dir("embargo-sidecar");
+    let src = dir.join("a.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("a_out.rcsb").to_string_lossy().into_owned();
+    write_store_with_flow(&src, &embargo_rows(400, 100, 160, false), 256);
+    let (s, e) = (EMB_T0 + 100 * EMB_H, EMB_T0 + 160 * EMB_H);
+    let range = format!("{s},{e}");
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "enrich", "--data", &src, "--out", &out, "--cpu", "--features", "r24,vol_z2880,cusum_abs_z,mtf_1d_rsi",
+            "--label", "long:1h,name=h1,fee=10,vol=20", "--locked-test", &range,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(0), "{}", String::from_utf8_lossy(&run.stderr));
+    let text = std::fs::read_to_string(format!("{out}.enrich.json")).unwrap();
+    let embargo = rcsr::manifest::object(&text, "lockbox_embargo").unwrap();
+    assert!(embargo.contains("\"seconds\":10972800"), "{embargo}");
+    assert!(embargo.contains("\"column\":\"mtf_1d_rsi\""), "{embargo}");
+    assert!(embargo.contains("\"rule\":\"rcsr-lookback/1 residual 1e-4\"") && embargo.contains("\"bar_seconds\":3600"), "{embargo}");
+    for (name, secs) in [("mtf_1d_rsi", 10_972_800), ("vol_z2880", 10_710_000), ("cusum_abs_z", 691_200)] {
+        let at = text.find(&format!("\"name\":\"{name}\"")).unwrap();
+        assert!(text[at..].contains(&format!("\"lookback_seconds\":{secs}")), "{name}: {}", &text[at..at + 300]);
+    }
+    assert_eq!(rcsr::lockbox::declared_embargo(&out).unwrap().map(|(_, s)| s), Some(10_972_800));
+}
+
+#[test]
+fn enrich_reports_leave_out_the_embargo_rows_and_ignore_locked_prices_after_it() {
+    let (n, s, e) = (700usize, 200usize, 260usize);
+    let dir = tmp_dir("embargo-reports");
+    let range = rcsr::lockbox::Lockbox { start: EMB_T0 + EMB_H * s as i64, end: EMB_T0 + EMB_H * e as i64 };
+    let mut reports = Vec::new();
+    for (tag, perturbed) in [("a", false), ("b", true)] {
+        let src = dir.join(format!("{tag}.rcsb")).to_string_lossy().into_owned();
+        let out = dir.join(format!("{tag}_out.rcsb")).to_string_lossy().into_owned();
+        write_store_with_flow(&src, &embargo_rows(n, s, e, perturbed), 256);
+        let mut o = opts(&src, &out, "r24");
+        o.gpu = GpuMode::Off;
+        o.labels = vec!["long:1h,name=h1,fee=10,vol=20".to_string()];
+        o.locked_test = Some(range);
+        let r = enrich::build(&o).unwrap();
+        assert_eq!(r.lockbox_embargo.0, 24 * EMB_H);
+        reports.push(r);
+    }
+    let strip = |json: String| json.split(",\"label_hash\"").next().unwrap().to_string();
+    let label = |r: &enrich::Report| strip(r.long_labels[0].report.json());
+    assert_eq!(label(&reports[0]), label(&reports[1]), "the label report reads rows from E + L only");
+    let facts = |r: &enrich::Report| {
+        r.features
+            .iter()
+            .map(|f| (f.name.clone(), f.nan_rows, f.first_finite_row, f.rows_left_out, format!("{:.12}", f.prevalence)))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(facts(&reports[0]), facts(&reports[1]));
+    let r24 = reports[0].features.iter().find(|f| f.name == "r24").unwrap();
+    let band = (0..n as i64)
+        .filter(|i| {
+            let t = EMB_T0 + i * EMB_H;
+            t >= range.start && t < range.end + 24 * EMB_H
+        })
+        .count()
+        * 3;
+    assert_eq!(r24.rows_left_out, Some(band));
+}
+
+
+// ---------------------------------------------------------------------------
+// #583: uniqueness weights normalise over the development rows.
+// ---------------------------------------------------------------------------
+
+fn weight_columns(tag: &str, perturbed: bool, declare: bool) -> (Vec<f64>, Vec<f64>) {
+    let (n, s, e) = (3000usize, 1500usize, 1800usize);
+    let dir = tmp_dir(tag);
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &embargo_rows(n, s, e, perturbed), 1024);
+    let mut o = opts(&src, &out, "returns");
+    o.features.clear();
+    o.labels = vec!["long:2h,name=h2,fee=10,vol=20".to_string()];
+    if declare {
+        o.locked_test = Some(rcsr::lockbox::Lockbox { start: EMB_T0 + EMB_H * s as i64, end: EMB_T0 + EMB_H * e as i64 });
+    }
+    enrich::build(&o).unwrap();
+    (column(&out, "ts"), column(&out, "lbl_h2_weight"))
+}
+
+#[test]
+fn label_weights_ignore_locked_prices_in_a_declared_store() {
+    let (s, e) = ((EMB_T0 + EMB_H * 1500) as f64, (EMB_T0 + EMB_H * 1800) as f64);
+    let (purge, embargo) = (4.0 * EMB_H as f64, 24.0 * EMB_H as f64);
+    let (ts, a) = weight_columns("w-decl-a", false, true);
+    let (_, b) = weight_columns("w-decl-b", true, true);
+    let mut compared = 0;
+    for i in 0..ts.len() {
+        if (ts[i] < s - purge || ts[i] >= e + embargo) && a[i].is_finite() {
+            assert_eq!(a[i].to_bits(), b[i].to_bits(), "row {i}");
+            compared += 1;
+        }
+    }
+    assert!(compared > 6000, "{compared}");
+    // Without a declaration the weights depend on the locked prices, so the test has teeth.
+    let (_, a0) = weight_columns("w-undecl-a", false, false);
+    let (_, b0) = weight_columns("w-undecl-b", true, false);
+    let differ = (0..ts.len()).filter(|&i| ts[i] < s - purge && a0[i].is_finite() && a0[i].to_bits() != b0[i].to_bits()).count();
+    assert!(differ > 1000, "{differ}");
+}

@@ -2209,9 +2209,13 @@ pub fn run(args: &[String]) -> ! {
         Ok(b) => b,
         Err(e) => fail(&e),
     };
-    if let Some(lt) = &declared {
-        build.manifest = crate::lockbox::insert_declaration(&build.manifest, lt, None, "rcsr prep --locked-test");
-    }
+    let bar = opts.resample.unwrap_or(Timeframe::M1).seconds();
+    let (embargo_s, embargo_col) = crate::enrich::max_lookback_seconds(build.table.names.iter().map(String::as_str), bar);
+    let embargo = crate::lockbox::embargo_json(embargo_s, &embargo_col, crate::enrich::EMBARGO_RULE, bar);
+    build.manifest = match &declared {
+        Some(lt) => crate::lockbox::insert_declaration(&build.manifest, lt, None, Some(&embargo), "rcsr prep --locked-test"),
+        None => crate::lockbox::insert_embargo(&build.manifest, &embargo),
+    };
     for line in build.audit.text_lines() {
         println!("{}", line);
     }
