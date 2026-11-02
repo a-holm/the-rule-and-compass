@@ -286,5 +286,12 @@ fn pipeline_books_fit_interval() {
             l.wall_s()
         );
         assert!(l.closure_residual().value.abs() < 0.005, "depth {depth}: closure");
+        let per_gen: f64 = g.generations.iter().map(|s| s.fit_fallback_seconds).sum();
+        let run = g.fit_fallback_ms / 1000.0;
+        assert!(run > 0.0, "depth {depth}: the fixture produced no CPU fallback");
+        assert!(
+            (per_gen - run).abs() <= 1e-9 + 1e-6 * run,
+            "depth {depth}: per-generation fallback {per_gen} vs run {run}"
+        );
     }
 }

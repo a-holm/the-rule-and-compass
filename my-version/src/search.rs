@@ -2973,7 +2973,9 @@ fn score_pipeline_batch(
             fit.metric,
             fallback_workers(),
         );
-        g.fit_fallback_ms += fallback_start.elapsed().as_secs_f64() * 1000.0;
+        let fallback_seconds = fallback_start.elapsed().as_secs_f64();
+        g.fit_fallback_ms += fallback_seconds * 1000.0;
+        g.stats.entry(generation).or_default().fit_fallback_seconds += fallback_seconds;
         for ((k, job), done) in fb.iter_mut().zip(owned) {
             if done.improved {
                 let cause = fallback_cause
