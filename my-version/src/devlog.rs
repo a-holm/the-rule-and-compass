@@ -320,8 +320,6 @@ pub struct GpuGen {
     pub duty: f64,
     /// Programs the kernel accepted verbatim.
     pub native: usize,
-    /// Programs that needed the exact lowering pass.
-    pub lowered: usize,
     /// Programs scored by the CPU fallback pool.
     pub fallbacks: usize,
     /// Wall the CPU fallback pool spent.
@@ -342,14 +340,13 @@ impl GpuGen {
     fn json(&self) -> String {
         format!(
             "{{\"batches\":{},\"programs\":{},\"kernel_s\":{},\"wall_s\":{},\"duty\":{},\
-             \"native\":{},\"lowered\":{},\"fallbacks\":{},\"fallback_s\":{},\"fallback_workers\":{},\"nonfinite\":{},\"nonfinite_full\":{},\"nonfinite_cpu_finite\":{},\"nonfinite_seconds\":{}}}",
+             \"native\":{},\"fallbacks\":{},\"fallback_s\":{},\"fallback_workers\":{},\"nonfinite\":{},\"nonfinite_full\":{},\"nonfinite_cpu_finite\":{},\"nonfinite_seconds\":{}}}",
             self.batches,
             self.programs,
             num(self.kernel_s),
             num(self.wall_s),
             num(self.duty),
             self.native,
-            self.lowered,
             self.fallbacks,
             num(self.fallback_s),
             self.fallback_workers,
@@ -1196,7 +1193,6 @@ mod tests {
                 wall_s: 0.02,
                 duty: 0.2,
                 native: 18,
-                lowered: 2,
                 fallbacks: 1,
                 fallback_s: 0.001,
                 fallback_workers: 1,
