@@ -1062,6 +1062,10 @@ struct GpuSearch {
     fit_ms: f64,
     /// #496: the polish-phase part of `fit_ms`, apportioned by cycle ratio.
     fit_polish_ms: f64,
+    /// #601: device fit launches, candidates they carried, longest launch (ms).
+    fit_calls: usize,
+    fit_call_candidates: usize,
+    fit_call_ms_max: f64,
     /// #169: wall time spent in the whole fit stage (kernel, launch, CPU
     /// fallback and write-back), milliseconds.
     fit_host_ms: f64,
@@ -1350,6 +1354,9 @@ impl GpuSearch {
                     fit_status_by_label: BTreeMap::new(),
                     fit_ms: 0.0,
                     fit_polish_ms: 0.0,
+                    fit_calls: 0,
+                    fit_call_candidates: 0,
+                    fit_call_ms_max: 0.0,
                     fit_host_ms: 0.0,
                     fit_fallback_ms: 0.0,
                     fit_gate_ms: 0.0,
@@ -1545,6 +1552,9 @@ impl GpuSearch {
             if ms > 0.0 {
                 self.fit_ms += ms as f64;
                 self.fit_polish_ms += dev.take_polish_ms(ms);
+                self.fit_calls += 1;
+                self.fit_call_candidates += plans.len();
+                self.fit_call_ms_max = self.fit_call_ms_max.max(ms as f64);
                 // #284: the fit kernel is one device interval on the run clock;
                 // its duration is the raw event time, not the host envelope.
                 match dev.take_span_start_s(crate::gpu::SPAN_FIT) {
@@ -2288,6 +2298,9 @@ impl GpuSearch {
             fit_rescore_s: 0.0,
             fit_ms: self.fit_ms,
             fit_polish_ms: self.fit_polish_ms,
+            fit_calls: self.fit_calls,
+            fit_call_candidates: self.fit_call_candidates,
+            fit_call_ms_max: self.fit_call_ms_max,
             fit_host_ms: self.fit_host_ms,
             fit_fallback_ms: self.fit_fallback_ms,
             fit_gate_ms: self.fit_gate_ms,
@@ -2887,12 +2900,13 @@ fn eval_pipeline_jobs(
 
 #[cfg(feature = "cuda")]
 fn score_pipeline_batch(
-    mut jobs: Vec<PipelineJob>,
+    jobs: Vec<PipelineJob>,
     gpu: &mut Option<GpuSearch>,
     results: &mut [Vec<Option<PipelineResult>>],
     train: &Sample,
     generation: usize,
     fit: Option<PipelineFit>,
+    pending: &mut PipelineFitQueue,
 ) -> Result<(), String> {
     let Some(g) = gpu.as_mut() else {
         return Err("pipeline scoring without a GPU evaluator".to_string());
@@ -2919,16 +2933,42 @@ fn score_pipeline_batch(
         return Ok(());
     };
 
-    // #286: fit the candidates of this batch while the island threads keep
-    // producing the next ones. Every candidate with a plan is fitted (the wide
-    // admission set), exactly as the synchronous `fit_pending` loop would.
+    // #601: the candidates with constants wait in the queue until a device
+    // call is big enough to fill the GPU (`FIT_BATCH_MIN`).
+    for (k, job) in jobs.into_iter().enumerate() {
+        match crate::fit::gpu_fit_plan_reason(&job.2) {
+            Err(crate::fit::GpuFitReject::NoConstants) => {}
+            plan => pending.push(job, offered_hash[k], plan),
+        }
+    }
+    if pending.planned() >= FIT_BATCH_MIN {
+        fit_pipeline_queue(pending, gpu, results, train, generation, fit)?;
+    }
+    Ok(())
+}
+
+/// #601: fit everything the queue holds in one device call, then score the
+/// fitted trees. Called when the queue reaches `FIT_BATCH_MIN` planned
+/// candidates and once more when the generation's queue closes.
+#[cfg(feature = "cuda")]
+fn fit_pipeline_queue(
+    pending: &mut PipelineFitQueue,
+    gpu: &mut Option<GpuSearch>,
+    results: &mut [Vec<Option<PipelineResult>>],
+    train: &Sample,
+    generation: usize,
+    fit: PipelineFit,
+) -> Result<(), String> {
+    let Some(g) = gpu.as_mut() else {
+        return Err("pipeline scoring without a GPU evaluator".to_string());
+    };
+    let (mut jobs, offered_hash, entries) = pending.take();
     let mut plans: Vec<(usize, crate::fit::GpuFitPlan)> = Vec::new();
     let mut fallback_jobs: Vec<usize> = Vec::new();
     let mut fallback_cause: BTreeMap<usize, FitFallbackCause> = BTreeMap::new();
-    for (k, (_, _, tree)) in jobs.iter().enumerate() {
-        match crate::fit::gpu_fit_plan_reason(tree) {
+    for (k, entry) in entries.into_iter().enumerate() {
+        match entry {
             Ok(plan) => plans.push((k, plan)),
-            Err(crate::fit::GpuFitReject::NoConstants) => {}
             Err(_) => fallback_jobs.push(k),
         }
     }
@@ -2975,6 +3015,9 @@ fn score_pipeline_batch(
         if ms > 0.0 {
             g.fit_ms += ms as f64;
             g.fit_polish_ms += g.ev.take_polish_ms(ms);
+            g.fit_calls += 1;
+            g.fit_call_candidates += plans.len();
+            g.fit_call_ms_max = g.fit_call_ms_max.max(ms as f64);
             // #600: the fit kernel is one device interval on the run clock.
             match g.ev.take_span_start_s(crate::gpu::SPAN_FIT) {
                 Some(start_s) => g.ledger.record_fit_kernel_event(0, start_s, ms as f64 / 1000.0),
@@ -4964,7 +5007,15 @@ fn refit_to_fixpoint(
 /// Lexicographic parsimony pressure: better error wins; if the errors are equal
 /// to within a relative tolerance, the smaller expression wins. This controls
 /// bloat without a tunable penalty coefficient (Luke & Panait 2006).
+/// A finite error always beats a non-finite one; two non-finite trees compare by
+/// complexity.
 fn better(a: &Ind, b: &Ind) -> bool {
+    match (a.error.is_finite(), b.error.is_finite()) {
+        (true, false) => return true,
+        (false, true) => return false,
+        (false, false) => return a.complexity < b.complexity,
+        (true, true) => {}
+    }
     let tol = 1e-9 * (1.0 + a.error.abs().max(b.error.abs()));
     if a.error < b.error - tol {
         return true;
@@ -5162,6 +5213,60 @@ struct PipelineResult {
     nonfinite: bool,
     offered: u64,
     tree: Option<Node>,
+}
+
+/// #601: the fewest planned candidates one overlap fit call carries. A fit
+/// block owns a candidate for the whole pass over the rows, so a call with
+/// fewer blocks than the device holds takes as long as a full one.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const FIT_BATCH_MIN: usize = 128;
+
+/// #601: candidates of the overlap queue that wait for a device fit call.
+/// Each entry is the offered job, its structural hash and the fit plan or the
+/// reason it has none.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Default)]
+struct PipelineFitQueue {
+    jobs: Vec<PipelineJob>,
+    offered: Vec<u64>,
+    entries: Vec<Result<crate::fit::GpuFitPlan, crate::fit::GpuFitReject>>,
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+impl PipelineFitQueue {
+    fn push(
+        &mut self,
+        job: PipelineJob,
+        offered: u64,
+        plan: Result<crate::fit::GpuFitPlan, crate::fit::GpuFitReject>,
+    ) {
+        self.jobs.push(job);
+        self.offered.push(offered);
+        self.entries.push(plan);
+    }
+
+    fn planned(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_ok()).count()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn take(
+        &mut self,
+    ) -> (
+        Vec<PipelineJob>,
+        Vec<u64>,
+        Vec<Result<crate::fit::GpuFitPlan, crate::fit::GpuFitReject>>,
+    ) {
+        (
+            std::mem::take(&mut self.jobs),
+            std::mem::take(&mut self.offered),
+            std::mem::take(&mut self.entries),
+        )
+    }
 }
 
 /// #286: the device fit arm carried by the overlap queue when the admission
@@ -5643,6 +5748,10 @@ pub struct GpuRunStats {
     pub fit_ms: f64,
     /// #496: the polish-phase part of `fit_ms`, apportioned by per-block cycles.
     pub fit_polish_ms: f64,
+    /// #601: device fit launches, the candidates they carried, longest launch (ms).
+    pub fit_calls: usize,
+    pub fit_call_candidates: usize,
+    pub fit_call_ms_max: f64,
     /// #496: arithmetic of the device fit polish.
     pub fit_polish: crate::fit::FitPolish,
     /// #169: wall time spent in the whole fit stage, milliseconds.
@@ -7858,6 +7967,8 @@ fn run_search(
                 .map_or((0.0, 0.0), |g| (g.drain_eval_ms, g.drain_fit_ms));
             #[cfg(feature = "cuda")]
             let mut pipeline_scored = false;
+            #[cfg(feature = "cuda")]
+            let mut fit_queue = PipelineFitQueue::default();
             std::thread::scope(|s| {
                 // The queue lives in the scope: producers take a clone of the
                 // sender, and `drain` consumes the original so it can end.
@@ -7922,8 +8033,22 @@ fn run_search(
                             gen_train,
                             gen,
                             pipeline_fit,
+                            &mut fit_queue,
                         )
                     });
+                    if pipeline_error.is_none() {
+                        if let (Some(fit), false) = (pipeline_fit, fit_queue.is_empty()) {
+                            pipeline_error = fit_pipeline_queue(
+                                &mut fit_queue,
+                                &mut gpu,
+                                &mut pipeline_results,
+                                gen_train,
+                                gen,
+                                fit,
+                            )
+                            .err();
+                        }
+                    }
                 }
 
                 for h in handles {
@@ -8742,6 +8867,28 @@ mod tests {
             .collect()
     }
 
+    /// #601: only candidates with a plan count toward the flush threshold, and
+    /// `take` empties the queue.
+    #[test]
+    fn fit_queue_counts_planned_candidates_and_empties_on_take() {
+        let mut q = PipelineFitQueue::default();
+        assert!(q.is_empty());
+        for (i, j, plan) in affine_plans(3) {
+            q.push((i, j, crate::expr::input(0)), j as u64, Ok(plan));
+        }
+        q.push(
+            (0, 9, crate::expr::input(0)),
+            9,
+            Err(crate::fit::GpuFitReject::UnsupportedOp),
+        );
+        assert_eq!(q.planned(), 3);
+        assert!(!q.is_empty());
+        let (jobs, offered, entries) = q.take();
+        assert_eq!((jobs.len(), offered.len(), entries.len()), (4, 4, 4));
+        assert!(q.is_empty());
+        assert_eq!(q.planned(), 0);
+    }
+
     /// A launch so expensive that one fit cannot amortise it but 64 can.
     fn costly_launch() -> crate::dispatch::Dispatcher {
         let mut cal = crate::dispatch::Calibration::default();
@@ -8945,6 +9092,62 @@ mod tests {
             descriptor: None,
             age: 0,
         }
+    }
+
+    /// #587: a finite error beats a non-finite one whatever the complexity.
+    #[test]
+    fn better_prefers_finite_over_non_finite() {
+        let finite = pending_ind(5.0, 40.0);
+        for bad in [f64::INFINITY, f64::NAN] {
+            let simple_bad = pending_ind(bad, 1.0);
+            assert!(better(&finite, &simple_bad), "finite vs {bad}");
+            assert!(!better(&simple_bad, &finite), "{bad} vs finite");
+        }
+    }
+
+    /// #587: two non-finite trees still compare by complexity.
+    #[test]
+    fn better_orders_two_non_finite_by_complexity() {
+        let small = pending_ind(f64::INFINITY, 2.0);
+        let large = pending_ind(f64::INFINITY, 9.0);
+        assert!(better(&small, &large));
+        assert!(!better(&large, &small));
+        assert!(!better(&small, &small));
+    }
+
+    /// #587: finite pairs keep the relative-tolerance parsimony rule.
+    #[test]
+    fn better_finite_pairs_keep_the_tolerance_band() {
+        assert!(better(&pending_ind(1.0, 9.0), &pending_ind(2.0, 3.0)), "clear error win");
+        assert!(!better(&pending_ind(2.0, 3.0), &pending_ind(1.0, 9.0)));
+        let tol = 1e-9 * (1.0 + 2.0);
+        let inside = pending_ind(2.0 - 0.5 * tol, 9.0);
+        assert!(better(&pending_ind(2.0, 3.0), &inside), "inside the band the smaller wins");
+        assert!(!better(&inside, &pending_ind(2.0, 3.0)));
+        let outside = pending_ind(2.0 - 2.0 * tol, 9.0);
+        assert!(better(&outside, &pending_ind(2.0, 3.0)), "outside the band the error wins");
+    }
+
+    /// #587: simple non-finite trees no longer win tournaments against complex
+    /// finite ones.
+    #[test]
+    fn tournament_non_finite_winners_need_an_all_non_finite_draw() {
+        let island: Vec<Ind> = (0..64)
+            .map(|i| {
+                if i % 2 == 0 {
+                    pending_ind(f64::INFINITY, 1.0)
+                } else {
+                    pending_ind(1.0 + i as f64, 30.0)
+                }
+            })
+            .collect();
+        let mut rng = Mt::new(7);
+        let wins = (0..2000)
+            .filter(|_| !island[tournament(&island, &mut rng, 3)].error.is_finite())
+            .count();
+        // A non-finite winner needs all 3 draws non-finite: about 1 in 8. The old
+        // comparator let any non-finite draw win.
+        assert!(wins < 2000 / 5, "non-finite winners: {wins} of 2000");
     }
 
     /// #169: the admission fraction is a pure function of the population size
