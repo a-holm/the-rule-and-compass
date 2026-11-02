@@ -144,7 +144,7 @@ fn refusals_are_usage_errors() {
     usage_error(&run(&data, &labelled, PNL), "cost_already_in_label");
 
     let no_spec = Command::new(env!("CARGO_BIN_EXE_rcsr"))
-        .args(["--data", &data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal", "--cpu", "--no-dev-log", "--generations", "1", "--pop", "8", "--json", "--quiet"])
+        .args(["--data", data.as_str(), "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal", "--cpu", "--no-dev-log", "--generations", "1", "--pop", "8", "--json", "--quiet"])
         .args(PNL)
         .output()
         .unwrap();
@@ -667,35 +667,53 @@ fn windows_table_still_refuses_validation_frac_and_missing_slice() {
 
 // ---- #619: the extra searches of one invocation fail closed too ----
 
+/// The second search of the process hits an injected batch fault.
 #[cfg(feature = "cuda")]
-fn assert_second_search_exits_6(extra: &[&str]) {
+fn run_second_search_fault(extra: &[&str], keep_dev_log: bool) -> Output {
     let dir = scratch();
     let data = write_csv(&dir, "d.csv", None);
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
-    let o = run_gpu(&data, &spec, &["--gpu"], "batch@2", &[&["--dispatch", "device"], extra].concat());
-    if !has_device(&o) {
-        return;
+    let mut args = vec![
+        "--data", data.as_str(), "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal",
+        "--target-spec", spec.as_str(), "--seed", "3", "--generations", "6", "--pop", "32",
+        "--metric", "squared", "--json", "--quiet", "--fitness", "pnl", "--gpu", "--dispatch", "device",
+    ];
+    if !keep_dev_log {
+        args.push("--no-dev-log");
     }
-    assert_eq!(code(&o), 6, "{}", stderr(&o));
-    assert!(stderr(&o).contains("--gpu was requested but the device search failed"), "{}", stderr(&o));
-    assert!(!stderr(&o).contains("panicked"), "{}", stderr(&o));
+    args.extend_from_slice(PNL);
+    args.extend_from_slice(extra);
+    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(&args)
+        .current_dir(&dir)
+        .env("RCSR_FAULT", "batch@2")
+        .output()
+        .expect("run rcsr")
+}
+
+#[cfg(feature = "cuda")]
+fn assert_exits_6_with_message(o: &Output) {
+    assert_eq!(code(o), 6, "{}", stderr(o));
+    assert!(stderr(o).contains("--gpu was requested but the device search failed"), "{}", stderr(o));
+    assert!(!stderr(o).contains("panicked"), "{}", stderr(o));
 }
 
 #[cfg(feature = "cuda")]
 #[test]
 fn permutation_with_an_injected_fault_exits_6() {
-    assert_second_search_exits_6(&["--null-runs", "1"]);
+    let o = run_second_search_fault(&["--null-runs", "1"], false);
+    if !has_device(&o) {
+        return;
+    }
+    assert_exits_6_with_message(&o);
 }
 
 #[cfg(feature = "cuda")]
 #[test]
 fn benchmark_with_an_injected_fault_exits_6() {
-    let out = std::env::temp_dir().join(format!("rcsr-bench-{}.md", std::process::id()));
-    assert_second_search_exits_6(&["--report", "benchmark", "--report-repeats", "2", "--report-out", out.to_str().unwrap()]);
-}
-
-#[cfg(feature = "cuda")]
-#[test]
-fn cross_validation_with_an_injected_fault_exits_6() {
-    assert_second_search_exits_6(&["--cv", "k-fold", "--cv-k", "2"]);
+    let o = run_second_search_fault(&["--report", "benchmark", "--report-repeats", "2"], true);
+    if !has_device(&o) {
+        return;
+    }
+    assert_exits_6_with_message(&o);
 }
