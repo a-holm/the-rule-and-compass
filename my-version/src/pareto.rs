@@ -322,4 +322,15 @@ mod tests {
         assert!(!a.admits(f64::NAN, 0.1));
         assert!(a.admits(0.4, 2.0));
     }
+
+    /// #622: sorting a front that holds a NaN error does not panic and puts it last.
+    #[test]
+    fn sorted_places_nan_last_without_panic() {
+        let mut a = Archive::new(100);
+        a.items = vec![sol(2.0, f64::NAN, 1.0), sol(2.0, 0.5, 2.0), sol(1.0, 0.9, 3.0)];
+        let s = a.sorted();
+        let errors: Vec<f64> = s.iter().map(|x| x.error).collect();
+        assert_eq!(&errors[..2], &[0.9, 0.5]);
+        assert!(errors[2].is_nan());
+    }
 }

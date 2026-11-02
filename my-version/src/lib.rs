@@ -63,6 +63,7 @@ pub mod gates; // #257: noise-scaled supported front and verdict
 pub mod gate_run; // #257: gates glue for the CLI report
 pub mod target_structure; // #257: affine, binned and OLS rungs on the declared structure
 pub mod ohlcv;
+pub mod error_order; // #622: finite, then +inf, then NaN
 pub mod pareto;
 #[cfg(feature = "cuda")]
 pub mod postfix;

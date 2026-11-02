@@ -9003,6 +9003,55 @@ mod tests {
         assert!(better(&outside, &pending_ind(2.0, 3.0)), "outside the band the error wins");
     }
 
+    /// #622: the sequence of (error class bits, complexity) after a sort.
+    fn error_key(inds: &[Ind]) -> Vec<(u64, u64)> {
+        inds.iter()
+            .map(|i| {
+                let e = if i.error.is_nan() { u64::MAX } else { i.error.to_bits() };
+                (e, i.complexity.to_bits())
+            })
+            .collect()
+    }
+
+    /// #622: a NaN error gives the same population order for every input order.
+    #[test]
+    fn select_population_orders_nan_independent_of_input_order() {
+        let base = vec![
+            pending_ind(f64::NAN, 4.0),
+            pending_ind(3.0, 5.0),
+            pending_ind(f64::INFINITY, 7.0),
+            pending_ind(1.0, 9.0),
+            pending_ind(f64::INFINITY, 2.0),
+            pending_ind(-f64::NAN, 3.0),
+            pending_ind(2.0, 3.0),
+        ];
+        let mut reference: Option<Vec<(u64, u64)>> = None;
+        for shift in 0..base.len() {
+            for reversed in [false, true] {
+                let mut v = base.clone();
+                v.rotate_left(shift);
+                if reversed {
+                    v.reverse();
+                }
+                select_population(&mut v, 7);
+                let key = error_key(&v);
+                match &reference {
+                    None => reference = Some(key),
+                    Some(r) => assert_eq!(&key, r, "shift {shift} reversed {reversed}"),
+                }
+            }
+        }
+        let errors: Vec<f64> = {
+            let mut v = base.clone();
+            select_population(&mut v, 7);
+            v.iter().map(|i| i.error).collect()
+        };
+        assert_eq!(&errors[..3], &[1.0, 2.0, 3.0]);
+        assert_eq!(&errors[3..5], &[f64::INFINITY, f64::INFINITY]);
+        assert!(errors[5].is_nan() && errors[6].is_nan());
+    }
+
+
     /// #587: simple non-finite trees no longer win tournaments against complex
     /// finite ones.
     #[test]

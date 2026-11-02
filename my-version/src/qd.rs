@@ -1350,4 +1350,22 @@ mod tests {
         assert_eq!(fixed_reference_hypervolume(&front[..1], 1.0), 0.0);
         assert!(fixed_reference_hypervolume(&front, 10.0) > hv);
     }
+
+    /// #622: the best entry of a cell does not depend on where a NaN sits.
+    #[test]
+    fn cell_best_ignores_nan_in_any_position() {
+        let entry = |error: f64, v: f64| QdEntry {
+            tree: node(Op::Add, vec![input(0), constant(v)]),
+            error,
+            cost: 3.0,
+            descriptor: Descriptor { usage: 0.5, skew: 0.5 },
+        };
+        let base = vec![entry(f64::NAN, 1.0), entry(2.0, 2.0), entry(1.5, 3.0)];
+        for shift in 0..base.len() {
+            let mut cell = QdCell::default();
+            cell.entries = base.clone();
+            cell.entries.rotate_left(shift);
+            assert_eq!(cell.best().map(|e| e.error), Some(1.5), "shift {shift}");
+        }
+    }
 }
