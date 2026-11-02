@@ -4579,8 +4579,7 @@ fn select_promoted(
             })
             .collect();
         ranked.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            crate::error_order::cmp_error(a.1, b.1)
                 .then(
                     a.2.partial_cmp(&b.2)
                         .unwrap_or(std::cmp::Ordering::Equal),
@@ -4712,9 +4711,7 @@ fn promoted_count(pop: usize) -> usize {
 /// duplicates are removed by the archive, not here.
 fn select_population(candidates: &mut Vec<Ind>, pop: usize) {
     candidates.sort_by(|a, b| {
-        a.error
-            .partial_cmp(&b.error)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        crate::error_order::cmp_error(a.error, b.error)
             .then(
                 a.complexity
                     .partial_cmp(&b.complexity)
@@ -4732,7 +4729,7 @@ fn canonical_front(cap: usize, mut scored: Vec<Sol>) -> Archive {
     scored.sort_by(|a, b| {
         a.cost
             .total_cmp(&b.cost)
-            .then(a.error.total_cmp(&b.error))
+            .then(crate::error_order::cmp_error(a.error, b.error))
             .then(expr::structural_hash(&a.tree).cmp(&expr::structural_hash(&b.tree)))
     });
     let mut out = Archive::new(cap);
@@ -5316,7 +5313,7 @@ fn evolve_island(
     if !screened && !afp {
         if let Some(best) = isl
             .iter()
-            .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal))
+            .min_by(|a, b| crate::error_order::cmp_error(a.error, b.error))
         {
             next.push(best.clone());
         }
@@ -8043,9 +8040,7 @@ fn run_search(
                     }
                     let mut offspring = std::mem::take(pop);
                     offspring.sort_by(|a, b| {
-                        a.error
-                            .partial_cmp(&b.error)
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                        crate::error_order::cmp_error(a.error, b.error)
                     });
                     let top: Vec<Ind> = offspring.into_iter().take(promote).collect();
                     // #463: the refits are independent; results keep the order.
@@ -8244,9 +8239,7 @@ fn run_search(
                     .map(|pop| {
                         pop.iter()
                             .min_by(|a, b| {
-                                a.error
-                                    .partial_cmp(&b.error)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                crate::error_order::cmp_error(a.error, b.error)
                             })
                             .map(|i| i.tree.clone())
                     })
@@ -8256,9 +8249,7 @@ fn run_search(
                     .map(|pop| {
                         pop.iter()
                             .min_by(|a, b| {
-                                a.error
-                                    .partial_cmp(&b.error)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                crate::error_order::cmp_error(a.error, b.error)
                             })
                             .map_or(0, |i| i.age)
                     })
@@ -8318,9 +8309,7 @@ fn run_search(
                                 .iter()
                                 .enumerate()
                                 .max_by(|(_, a), (_, b)| {
-                                    a.error
-                                        .partial_cmp(&b.error)
-                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                    crate::error_order::cmp_error(a.error, b.error)
                                 })
                                 .map(|(i, _)| i)
                         });

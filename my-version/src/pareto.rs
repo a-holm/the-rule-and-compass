@@ -100,7 +100,7 @@ impl Archive {
         self.items.sort_by(|a, b| {
             a.cost
                 .total_cmp(&b.cost)
-                .then(a.error.partial_cmp(&b.error).unwrap())
+                .then(crate::error_order::cmp_error(a.error, b.error))
         });
         self.items.dedup_by(|a, b| a.cost == b.cost);
         while self.items.len() > self.cap {
@@ -135,7 +135,7 @@ impl Archive {
         self.items.sort_by(|a, b| {
             a.cost
                 .total_cmp(&b.cost)
-                .then(a.error.total_cmp(&b.error))
+                .then(crate::error_order::cmp_error(a.error, b.error))
                 .then(
                     crate::expr::structural_hash(&a.tree)
                         .cmp(&crate::expr::structural_hash(&b.tree)),
@@ -199,7 +199,7 @@ impl Archive {
         order.sort_by(|a, b| {
             a.cost
                 .total_cmp(&b.cost)
-                .then(a.error.total_cmp(&b.error))
+                .then(crate::error_order::cmp_error(a.error, b.error))
                 .then(
                     crate::expr::structural_hash(&a.tree)
                         .cmp(&crate::expr::structural_hash(&b.tree)),
@@ -223,7 +223,7 @@ impl Archive {
         v.sort_by(|a, b| {
             a.cost
                 .total_cmp(&b.cost)
-                .then(a.error.partial_cmp(&b.error).unwrap())
+                .then(crate::error_order::cmp_error(a.error, b.error))
         });
         v
     }

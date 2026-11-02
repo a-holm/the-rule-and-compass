@@ -99,7 +99,7 @@ impl QdCell {
             self.entries.sort_by(|a, b| {
                 a.cost
                     .total_cmp(&b.cost)
-                    .then(a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal))
+                    .then(crate::error_order::cmp_error(a.error, b.error))
                     .then(expr::structural_hash(&a.tree).cmp(&expr::structural_hash(&b.tree)))
             });
             while self.entries.len() > cap.max(1) {
@@ -111,9 +111,7 @@ impl QdCell {
 
     pub fn best(&self) -> Option<&QdEntry> {
         self.entries.iter().min_by(|a, b| {
-            a.error
-                .partial_cmp(&b.error)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            crate::error_order::cmp_error(a.error, b.error)
                 .then(a.cost.total_cmp(&b.cost))
         })
     }
@@ -534,7 +532,7 @@ impl QdArchive {
                 cell.entries.sort_by(|a, b| {
                     a.cost
                         .total_cmp(&b.cost)
-                        .then(a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal))
+                        .then(crate::error_order::cmp_error(a.error, b.error))
                 });
                 while cell.entries.len() > self.cell_cap {
                     cell.entries.remove(cell.entries.len() / 2);
