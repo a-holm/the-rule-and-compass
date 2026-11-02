@@ -9,7 +9,11 @@ design maps onto an NVIDIA DGX Spark.
 The backend is **preferred automatically**: a binary built with
 `--features cuda` probes the device once at startup and uses the GPU when one is
 available; a build without the feature, or a machine with no usable device,
-falls back to the CPU with a recorded reason. The default build remains pure
+falls back to the CPU with a recorded reason. An explicit `--gpu` never
+falls back: a device failure after the probe (a refused `long_pnl` fitness book,
+a failed batch, a pipeline error) exits 2 for `device_memory` reasons and 6
+otherwise, and the run writes no result. A failure that stops the run at a
+generation boundary leaves the last checkpoint, so `--resume --gpu` continues. The default build remains pure
 `std` with no dependencies and no CUDA requirement.
 
 ## Backend identity and resumes
@@ -508,6 +512,7 @@ remains for the fit and test APIs.
 
 * A prediction that is not finite on a row with positive weight scores `+inf` (status 2, `None` on the order-statistic paths). Nothing else does.
 * A finite prediction of any magnitude is scored. The f32 score kernels (`score_kernel`, `score_step`, the row-range and classification kernels) widen the f32 prediction to `f64` before the residual, so a residual cannot overflow there. A prediction that overflows the f32 range is `inf` in the kernel and is therefore `+inf`, because the f32 program cannot represent it. The CPU gives the same `+inf` when it scores those f32 rows.
+* The device program runs in f32, so a candidate whose f32 output (or an intermediate) leaves the f32 range scores `+inf` with status 2 where the f64 program is finite. Every status-2 `+inf` (and every `None` of the order-statistic paths) is checked on the CPU right after its batch, before promotion, the archive, migration or `--selection afp` read it: the f64 prefix probe (the first 2048 rows, scalar view) settles a candidate that is non-finite there, and the others get a full f64 pass on the CPU fallback pool. The corrected error replaces the device value. A `+inf` with status 0 (the `--min-trades` floor of the long/flat book) comes from finite predictions and is not checked. The counters `nonfinite`, `nonfinite_full`, `nonfinite_cpu_finite` and `nonfinite_seconds` are in `--json` `gpu.generations[]` and the development log `gpu` block.
 * The exact `f64` order-statistic paths (`median`, `maximum`, `interquartile`, sort and select) form `pred - y` in `f64`. A residual that overflows keys as `+inf`, the largest finite-or-infinite key, so the maximum is `+inf`, the median ignores it unless it is the middle key, and the interquartile mean is `+inf` only when the window holds it. A NaN residual (a NaN target) marks the segment non-finite.
 * The legacy f32 SSE evaluator (`eval_batch`, `eval_pool`, `cpu_sse`) keeps its 1e30 hard-failure limit. It serves the fit and test APIs, not scoring.
 

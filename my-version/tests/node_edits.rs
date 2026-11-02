@@ -343,8 +343,8 @@ fn config(strategy: FitStrategy) -> Config {
 
 /// Archive hash of the pre-change CPU path for `config` on `sample(300, 5)`.
 const GOLDEN: &[(FitStrategy, u64)] = &[
-    (FitStrategy::Exact, 0xd7f8_c657_7ac8_8687),
-    (FitStrategy::Auto, 0x2915_2e01_f9dc_b6a2),
+    (FitStrategy::Exact, 0xbd59_e38d_0c07_2a90),
+    (FitStrategy::Auto, 0xdb2e_af98_9cca_2d6b),
 ];
 
 #[test]

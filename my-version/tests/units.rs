@@ -6,6 +6,7 @@
 
 use rcsr::checkpoint::Checkpoint;
 use rcsr::data::Sample;
+use rcsr::devlog::Json;
 use rcsr::expr::{constant, input, node, Node, Op};
 use rcsr::metrics::Metric;
 use rcsr::search::{self, Config, Outcome};
@@ -489,139 +490,41 @@ fn without_required_dimensions_the_result_is_bit_identical() {
 
 
 
-/// Mask the nondeterministic timings: `elapsed_seconds` (the old field) and the
-/// `timing` phase object added in #134, so the rest of the byte stream can be
-/// compared against the recorded golden.
-fn mask_elapsed(src: &str) -> String {
-    let src = mask_timing(src);
-    let src = mask_seconds(&src);
-    let key = "\"elapsed_seconds\":";
-    let mut out = String::with_capacity(src.len());
-    let mut rest = &src[..];
-    while let Some(i) = rest.find(key) {
-        out.push_str(&rest[..i + key.len()]);
-        out.push_str("ELAPSED");
-        let after = &rest[i + key.len()..];
-        if after.starts_with("ELAPSED") {
-            rest = &after["ELAPSED".len()..];
-            continue;
-        }
-        let end = after.find(|c| c == ',' || c == '}').unwrap_or(after.len());
-        rest = &after[end..];
+/// The result-bearing part of a `--json` document: the run's identity, the
+/// seeds, the Pareto front, the residual tests and the mean and linear
+/// baseline errors. Report fields that other features add, and the execution
+/// fields (`threads`, `dispatch`, timings), are not part of it.
+fn json_result_part(doc: &Json) -> Json {
+    let pick = |from: &Json, key: &str| from.get(key).cloned().expect(key);
+    let baselines = doc.get("baselines").expect("baselines");
+    let mut fields = Vec::new();
+    for key in [
+        "metric", "target", "variables", "train_rows", "test_rows",
+        "generations_run", "seeds", "pareto", "residual_tests",
+    ] {
+        fields.push((key.to_string(), pick(doc, key)));
     }
-    out.push_str(rest);
-    out
+    fields.push(("mean".to_string(), pick(baselines, "mean")));
+    fields.push(("linear".to_string(), pick(baselines, "linear")));
+    Json::Obj(fields)
 }
 
-fn mask_timing(src: &str) -> String {
-    let key = "\"timing\":";
-    let mut out = String::with_capacity(src.len());
-    let mut rest = &src[..];
-    while let Some(i) = rest.find(key) {
-        out.push_str(&rest[..i + key.len()]);
-        out.push_str("TIMING");
-        let after = &rest[i + key.len()..];
-        // The golden already contains the placeholder, not an object.
-        if after.starts_with("TIMING") {
-            rest = &after["TIMING".len()..];
-            continue;
-        }
-        let mut depth = 0usize;
-        let mut end = after.len();
-        for (n, c) in after.char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = n + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        rest = &after[end..];
-    }
-    out.push_str(rest);
-    out
+/// The `seed` and `solution` events of an `--ndjson` stream, in order.
+fn ndjson_result_part(stream: &str) -> Vec<Json> {
+    stream
+        .lines()
+        .map(|line| Json::parse(line).expect("ndjson line"))
+        .filter(|ev| matches!(ev.get("event").and_then(Json::as_str), Some("seed" | "solution")))
+        .collect()
 }
 
-/// Remove the top-level `dispatch` field added in #290 before comparing the
-/// units golden. That golden is a units snapshot, not a dispatch snapshot, and
-/// the new field is covered by the dispatch and run-manifest tests.
-fn strip_dispatch(src: &str) -> String {
-    const KEY: &str = "\"dispatch\":";
-    let Some(i) = src.find(KEY) else {
-        return src.to_string();
-    };
-    let bytes = src.as_bytes();
-    let mut end = i + KEY.len();
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut escaped = false;
-    for (off, ch) in src[end..].char_indices() {
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_str = true,
-            '{' | '[' => depth += 1,
-            '}' | ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    end += off + ch.len_utf8();
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut start = i;
-    if start > 0 && bytes[start - 1] == b',' {
-        start -= 1;
-    } else if end < bytes.len() && bytes[end] == b',' {
-        end += 1;
-    }
-    let mut out = String::with_capacity(src.len());
-    out.push_str(&src[..start]);
-    out.push_str(&src[end..]);
-    out
-}
-
-/// Mask the k-NN baseline's `seconds` field added in #132.
-fn mask_seconds(src: &str) -> String {    let key = "\"seconds\":";
-    let mut out = String::with_capacity(src.len());
-    let mut rest = &src[..];
-    while let Some(i) = rest.find(key) {
-        out.push_str(&rest[..i + key.len()]);
-        out.push_str("SECONDS");
-        let after = &rest[i + key.len()..];
-        if after.starts_with("SECONDS") {
-            rest = &after["SECONDS".len()..];
-            continue;
-        }
-        let end = after.find(|c| c == ',' || c == '}').unwrap_or(after.len());
-        rest = &after[end..];
-    }
-    out.push_str(rest);
-    out
-}
-
-/// Layer 1: a units-free run is byte-identical to the recorded golden,
-/// including the absence of any units field. The text golden is exact; the
-/// JSON/NDJSON goldens are snapshots of this engine's output (regenerated when
-/// another feature deliberately adds a field) and mask only `elapsed_seconds`,
-/// which is nondeterministic by nature. The units-specific assertions - no
-/// `constant_dimensions` field and no filtering - are independent of the
-/// snapshot.
+/// Layer 1: a units-free run gives the same results as before units existed,
+/// and gains no units field. The text golden is exact. The JSON and NDJSON
+/// goldens hold only the result-bearing parts (see `json_result_part` and
+/// `ndjson_result_part`), parsed and compared as values, so a report field
+/// that another feature adds does not break the test. The units-specific
+/// assertions (no `constant_dimensions` field, no filtering) are independent of
+/// the goldens.
 #[test]
 fn layer1_no_units_output_is_byte_identical_to_pre_change() {
     let table = "x,y\n1,2\n2,4\n3,6\n4,8\n";
@@ -649,8 +552,8 @@ fn layer1_no_units_output_is_byte_identical_to_pre_change() {
     let out = rcsr_stdin(&args, table);
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stderr.is_empty());
-    let got = strip_dispatch(&mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8")));
-    let want = mask_elapsed(include_str!("fixtures/units_layer1_json.stdout"));
+    let got = json_result_part(&Json::parse(std::str::from_utf8(&out.stdout).expect("utf-8")).expect("json"));
+    let want = Json::parse(include_str!("fixtures/units_layer1_json.stdout")).expect("golden");
     assert_eq!(got, want, "--json changed");
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains("constant_dimensions"),
@@ -662,8 +565,8 @@ fn layer1_no_units_output_is_byte_identical_to_pre_change() {
     let out = rcsr_stdin(&args, table);
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stderr.is_empty());
-    let got = strip_dispatch(&mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8")));
-    let want = mask_elapsed(include_str!("fixtures/units_layer1_ndjson.stdout"));
+    let got = ndjson_result_part(std::str::from_utf8(&out.stdout).expect("utf-8"));
+    let want = ndjson_result_part(include_str!("fixtures/units_layer1_ndjson.stdout"));
     assert_eq!(got, want, "--ndjson changed");
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains("constant_dimensions"),

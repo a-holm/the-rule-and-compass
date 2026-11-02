@@ -1830,6 +1830,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         // picks the backend afresh from the current build/flags.
         simd: true,
         gpu: false,
+        gpu_required: false,
         gpu_notes: true,
         gpu_memory: None,
         dispatch: crate::dispatch::DispatchMode::Auto,

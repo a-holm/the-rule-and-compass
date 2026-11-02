@@ -328,13 +328,21 @@ pub struct GpuGen {
     pub fallback_s: f64,
     /// Worker threads in the fallback pool.
     pub fallback_workers: usize,
+    /// #589: device results with status 2 (non-finite output).
+    pub nonfinite: usize,
+    /// #589: of those, the ones that needed a full CPU pass.
+    pub nonfinite_full: usize,
+    /// #589: of the full passes, the ones finite on the CPU.
+    pub nonfinite_cpu_finite: usize,
+    /// #589: wall seconds of the full CPU passes.
+    pub nonfinite_seconds: f64,
 }
 
 impl GpuGen {
     fn json(&self) -> String {
         format!(
             "{{\"batches\":{},\"programs\":{},\"kernel_s\":{},\"wall_s\":{},\"duty\":{},\
-             \"native\":{},\"lowered\":{},\"fallbacks\":{},\"fallback_s\":{},\"fallback_workers\":{}}}",
+             \"native\":{},\"lowered\":{},\"fallbacks\":{},\"fallback_s\":{},\"fallback_workers\":{},\"nonfinite\":{},\"nonfinite_full\":{},\"nonfinite_cpu_finite\":{},\"nonfinite_seconds\":{}}}",
             self.batches,
             self.programs,
             num(self.kernel_s),
@@ -344,7 +352,11 @@ impl GpuGen {
             self.lowered,
             self.fallbacks,
             num(self.fallback_s),
-            self.fallback_workers
+            self.fallback_workers,
+            self.nonfinite,
+            self.nonfinite_full,
+            self.nonfinite_cpu_finite,
+            num(self.nonfinite_seconds)
         )
     }
 }
@@ -1188,6 +1200,10 @@ mod tests {
                 fallbacks: 1,
                 fallback_s: 0.001,
                 fallback_workers: 1,
+                nonfinite: 5,
+                nonfinite_full: 2,
+                nonfinite_cpu_finite: 1,
+                nonfinite_seconds: 0.002,
             }),
             fit: FitGen {
                 attempts: 20,
@@ -1238,6 +1254,8 @@ mod tests {
         );
         let gpu = parsed.get("gpu").unwrap();
         assert_eq!(gpu.get("native").and_then(|v| v.as_usize()), Some(18));
+        assert_eq!(gpu.get("nonfinite_full").and_then(|v| v.as_usize()), Some(2));
+        assert_eq!(gpu.get("nonfinite_seconds").and_then(|v| v.as_f64()), Some(0.002));
         let fit = parsed.get("fit").unwrap();
         let causes = fit.get("fallback_by_cause").and_then(|v| v.as_obj()).unwrap();
         assert_eq!(causes[0].0, "ill_conditioned");
@@ -1360,8 +1378,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cap.ndjson");
         // Room for the start event plus one full generation event (a
-        // generation line is ~1 KiB with every optional section present).
-        let cap = run_start_json(&RunStart::default()).len() as u64 + 1300;
+        // generation line is ~1.2 KiB with every optional section present).
+        let cap = run_start_json(&RunStart::default()).len() as u64 + 1500;
         let mut log = Log::create(&path, cap).unwrap();
         assert!(log.append(&run_start_json(&RunStart::default()), true));
         let line = rec().json();
