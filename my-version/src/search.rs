@@ -4087,6 +4087,33 @@ fn effective_fit_rows(cfg: &Config, sample: &Sample) -> usize {
     }
 }
 
+/// #602: fit subsample size used when the training rows exceed
+/// [`DEFAULT_FIT_ROWS_ABOVE`] and the user gave no `--fit-rows`.
+pub const DEFAULT_FIT_ROWS: usize = 65_536;
+/// #602: the default applies when the training rows exceed this count.
+pub const DEFAULT_FIT_ROWS_ABOVE: usize = 4 * DEFAULT_FIT_ROWS;
+
+/// #602: the pure threshold rule of the default fit subsample.
+pub fn default_fit_rows_for(train_rows: usize, device_fit: bool) -> Option<usize> {
+    (device_fit && train_rows > DEFAULT_FIT_ROWS_ABOVE).then_some(DEFAULT_FIT_ROWS)
+}
+
+/// #602: the fit subsample a run takes when `--fit-rows` is absent: the device
+/// fit arm on a large training set. `None` keeps the full-row fit. The run
+/// must stay on the GPU with the subsample set, exactly as for an explicit flag.
+pub fn default_fit_rows(cfg: &Config, train: &Sample) -> Option<usize> {
+    if cfg.fit_rows != 0 || cfg.fit_samples != 0 || cfg.fit_iters == 0 {
+        return None;
+    }
+    let rows = default_fit_rows_for(train.len(), defers_fit_to_gpu(cfg, true))?;
+    if effective_backend(cfg, train) != Backend::Gpu {
+        return None;
+    }
+    let mut with_rows = cfg.clone();
+    with_rows.fit_rows = rows;
+    (effective_backend(&with_rows, train) == Backend::Gpu).then_some(rows)
+}
+
 /// Rows the device fit arm sees: the fixed fit subsample when one is requested,
 /// every training row otherwise. Scoring always uses every row.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -10966,5 +10993,14 @@ mod tests {
             .map(|m| m.error)
             .fold(f64::INFINITY, f64::min);
         assert!(best <= 1e-18, "best error {}", best);
+    }
+
+    #[test]
+    fn fit_rows_default_applies_above_threshold() {
+        let above = DEFAULT_FIT_ROWS_ABOVE + 1;
+        assert_eq!(default_fit_rows_for(above, true), Some(DEFAULT_FIT_ROWS));
+        assert_eq!(default_fit_rows_for(DEFAULT_FIT_ROWS_ABOVE, true), None);
+        assert_eq!(default_fit_rows_for(10 * above, false), None);
+        assert_eq!(default_fit_rows_for(1_000, true), None);
     }
 }

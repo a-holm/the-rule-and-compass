@@ -73,6 +73,8 @@ pub struct Manifest {
     /// or `None` for a full fit. `fixed` is true when the device fits the same
     /// rows for the whole run.
     pub fit_subsample: Option<(usize, u64, bool)>,
+    /// #602: the subsample size came from the row-count default, not `--fit-rows`.
+    pub fit_rows_default: bool,
 }
 
 impl Manifest {
@@ -146,8 +148,12 @@ impl Manifest {
         }
         if let Some((rows, hash, fixed)) = self.fit_subsample {
             out.push_str(&format!(
-                "  \"fit_subsample\":{{\"fit_rows\":{},\"hash\":\"{:016x}\",\"fixed\":{},\"scored_rows\":{}}},\n",
-                rows, hash, fixed, self.train.rows
+                "  \"fit_subsample\":{{\"fit_rows\":{},\"hash\":\"{:016x}\",\"fixed\":{},\"scored_rows\":{},\"source\":\"{}\"}},\n",
+                rows,
+                hash,
+                fixed,
+                self.train.rows,
+                if self.fit_rows_default { "default" } else { "flag" }
             ));
         }
         if let Some(dispatch) = &self.dispatch {
@@ -273,6 +279,7 @@ pub fn collect(
         target_spec: None,
         fit_resolution: None,
         fit_subsample: None,
+        fit_rows_default: false,
     }
 }
 

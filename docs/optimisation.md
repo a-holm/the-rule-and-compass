@@ -1074,9 +1074,18 @@ archive was the same shape class and was refit on all rows. The subsample fit
 can change the *ranking* during the generation, so the final constants are the
 full-row refit, not the screen's numbers.
 
-The issue's cost model goes beyond this deterministic structural dispatch:
-timing-calibrated path selection and automatic subsampling were not adopted,
-because a wall-clock-dependent choice would make a seed non-reproducible. The
+Row-count default (#602): a GPU run with the device fit arm and more than 262144
+training rows uses `--fit-rows 65536` when the flag is absent. The rule reads
+only the training row count, so a seed stays reproducible. `--fit-rows 0` or
+`--fit-rows none` fits every row. A run that cannot keep the GPU with the
+subsample (for example `--metric slope`), a CPU run and a resumed run keep
+their full-row fit or the saved value. The startup line `# fit-rows:` names the
+default and `--run-manifest` records `fit_subsample.source` (`default` or
+`flag`).
+
+The issue cost model goes beyond this deterministic structural dispatch:
+timing-calibrated path selection was not adopted, because a
+wall-clock-dependent choice would make a seed non-reproducible. The
 measured cells below justify keeping the dispatcher structural.
 
 

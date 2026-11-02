@@ -661,9 +661,12 @@ SEARCH:
                              varpro, stream, exact, GPU fallback/refit, signed
                              projection labels) at the end of the run
                              (diagnostics only)
-  --fit-rows <N>             fit constants on a deterministic N-row subsample
-                             and score/archive on all training rows (default 0
-                             = off; N >= train rows is an exact full fit). The
+  --fit-rows <N|none>        fit constants on a deterministic N-row subsample
+                             and score/archive on all training rows (0 or none
+                             = every row; N >= train rows is an exact full fit).
+                             Default: 65536 when the GPU device-fit run has more
+                             than 262144 training rows, else every row; a given
+                             value, including 0, replaces the default. The
                              archive and every reported error are refit on all
                              rows. With the GPU evaluator and --fit-strategy gpu
                              the subsample is fixed for the run and lives on the
@@ -2846,7 +2849,8 @@ fn main() {
             "--fit-report" => cfg.fit_report = true,
             // #116: fit on a deterministic subsample, score and archive on all rows.
             "--fit-rows" => {
-                let n: usize = val!().parse().unwrap_or(0);
+                let raw = val!();
+                let n: usize = if raw == "none" { 0 } else { raw.parse().unwrap_or(0) };
                 if n == 1 {
                     eprintln!("error: --fit-rows needs 0 (off) or an integer >= 2");
                     std::process::exit(EXIT_USAGE);
@@ -5576,6 +5580,25 @@ fn main() {
         .as_ref()
         .map(|r| (r.source.to_string(), r.reason.clone()));
 
+    // #602: a large training set fits constants on a fixed subsample unless
+    // `--fit-rows` is given (`--fit-rows 0` or `none` keeps every row). A
+    // resumed run keeps the saved value.
+    let mut fit_rows_default = false;
+    if !fit_rows_set && resume_checkpoint.is_none() {
+        if let Some(rows) = search::default_fit_rows(&cfg, &prepared.train) {
+            cfg.fit_rows = rows;
+            fit_rows_default = true;
+            if !quiet {
+                eprintln!(
+                    "# fit-rows: {} (default above {} training rows, this run has {}; --fit-rows 0 fits every row)",
+                    rows,
+                    search::DEFAULT_FIT_ROWS_ABOVE,
+                    prepared.train.len()
+                );
+            }
+        }
+    }
+
     // Seed expressions are written in original units, like `--eval-expr`, and
     // rewritten into the search's normalised-input space before they enter the
     // population. A syntax error is a usage error and keeps the parser's
@@ -5679,6 +5702,7 @@ fn main() {
         m.start_utc = run_start_utc.clone();
         m.fit_resolution = fit_provenance.clone();
         m.fit_subsample = search::fit_subsample_record(&cfg, &prepared.train);
+        m.fit_rows_default = fit_rows_default;
         if let Some(p) = &store_projection {
             m.projection = Some(manifest::ProjectionRecord {
                 hash: p.hash_hex(),

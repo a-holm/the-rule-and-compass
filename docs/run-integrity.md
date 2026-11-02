@@ -40,7 +40,7 @@ timings. It contains:
 | `config.hash`, `config.seed`, `config.canonical` | the canonical configuration text, its FNV-1a hash and the search seed |
 | `backend`, `device` | `cpu`/`gpu`, device name, driver version and CUDA version |
 | `dispatch` | #290: the calibrated `r_eval`/`r_fit`/`bw`/`launch` values, probe wall time, source and band, plus the per-stage route ledger (`route`, `reason`, `calls`, `candidates`, `predicted_s`, `actual_s`, `bytes`, `switches`) |
-| `fit_subsample.fit_rows`, `fit_subsample.hash`, `fit_subsample.fixed`, `fit_subsample.scored_rows` | present with `--fit-rows`/`--fit-samples` below the training rows: the subsample size, the FNV-1a hash of its ascending row indices (generation 0 for the CPU screening arm), whether the device fits the same rows for the whole run, and the rows every candidate is scored on |
+| `fit_subsample.fit_rows`, `fit_subsample.hash`, `fit_subsample.fixed`, `fit_subsample.scored_rows` | present with `--fit-rows`/`--fit-samples` below the training rows: the subsample size, the FNV-1a hash of its ascending row indices (generation 0 for the CPU screening arm), whether the device fits the same rows for the whole run, and the rows every candidate is scored on; `fit_subsample.source` is `default` when the row-count default chose the size (#602) and `flag` when `--fit-rows`/`--fit-samples` did |
 | `resume.from`, `resume.backend_change` | checkpoint path and an allowed backend change, if any |
 | `phases_seconds` | `data_prepare`, `search`, `baselines`, `diagnostics`, `report`, `total`. `total` is exactly `timing.total_seconds` of the result JSON: the one runtime of the process (#256). `search` is `elapsed_seconds`. |
 
