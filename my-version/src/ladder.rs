@@ -50,7 +50,7 @@ const GBM_CHECK_EVERY: usize = 5;
 const GBM_MIN_LEAF: usize = 20;
 const MAX_FIT_ROWS: usize = 200_000;
 
-pub(crate) fn jstr(s: &str) -> String {
+pub(crate) fn jstr(s: &str) -> Stringlet finish = |json: String, hashed: bool| {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
     for c in s.chars() {
@@ -325,15 +325,21 @@ impl SrRun {
     }
 
     fn json(&self) -> String {
+        self.json_with(true)
+    }
+
+    /// The report object; `path: false` is the form the read hash covers.
+    pub fn json_with(&self, path: bool) -> String {
+        let run_path = if path { format!("\"run\":{},", jstr(&self.run.path)) } else { String::new() };
         let folds: Vec<String> = self
             .fold_oof
             .iter()
             .map(|(l, ok)| format!("{{\"fold\":{},\"oof\":{}}}", jstr(l), ok))
             .collect();
         format!(
-            "{{\"run\":{},\"run_sha256\":{},\"expression\":{},\"expression_source\":\"objective.finalist\",\
+            "{{{}\"run_sha256\":{},\"expression\":{},\"expression_source\":\"objective.finalist\",\
 \"threshold\":{},\"threshold_source\":\"run\",\"folds\":[{}]}}",
-            jstr(&self.run.path),
+            run_path,
             jstr(&self.run.sha256),
             jstr(&self.expression),
             jnum(self.threshold),
@@ -1066,6 +1072,7 @@ pub struct Report {
     pub fdr_q: f64,
     pub gbm_beats_sr: Option<bool>,
     pub sr_run: Option<String>,
+    pub sr_run_hashed: Option<String>,
     pub sr_evals: Option<u64>,
     pub sr_wall_seconds: Option<f64>,
     pub gbm_trees: usize,
@@ -1877,6 +1884,7 @@ fn finish_report(
         fdr_q: opts.fdr_q,
         gbm_beats_sr,
         sr_run: opts.sr_run.as_ref().map(SrRun::json),
+        sr_run_hashed: opts.sr_run.as_ref().map(|s| s.json_with(false)),
         sr_evals: opts.sr_evals,
         sr_wall_seconds: opts.sr_wall_seconds,
         gbm_trees: opts.gbm_trees,
@@ -2019,7 +2027,7 @@ impl Report {
             dsr,
             pbo,
             jarr_str(&self.notes),
-            self.sr_run.as_deref().unwrap_or("null"),
+            if timed { self.sr_run.as_deref() } else { self.sr_run_hashed.as_deref() }.unwrap_or("null"),
             rows.join(","),
             if !timed {
                 String::new()
@@ -2550,11 +2558,15 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             opts.purge_seconds,
             purge_source
         );
-        resolved.splice_report(&json, in_scope, locked_test, true)
+        if hashed {
+            resolved.splice_hashed_report(&json, in_scope, locked_test, true)
+        } else {
+            resolved.splice_report(&json, in_scope, locked_test, true)
+        }
     };
-    let json = finish(report.json());
+    let json = finish(report.json(), false);
     if let Some((ledger, data_sha, current)) = &read {
-        let report_sha = crate::manifest::sha256_hex(finish(report.hashed_json()).as_bytes());
+        let report_sha = crate::manifest::sha256_hex(finish(report.hashed_json(), true).as_bytes());
         ledger.write_read_marker(&data_path, "baseline_read", &report_sha).map_err(input_err)?;
         ledger.record_baseline_read(data_sha, &report_sha, Some(current)).map_err(input_err)?;
     }

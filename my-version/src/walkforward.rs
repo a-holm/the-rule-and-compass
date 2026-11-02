@@ -3007,11 +3007,11 @@ impl WindowResult {
 impl Report {
     /// #482: `source`, `run`, `run_sha256` and the candidate labels, with a
     /// leading comma. Empty when the candidates came from `--expr`.
-    fn front_json(&self) -> String {
+    fn front_json(&self, paths: bool) -> String {
         match &self.front {
             Some(f) => format!(
-                ",\"source\":\"front\",\"run\":{},\"run_sha256\":{},\"candidate_labels\":[{}]",
-                jstr(&f.run),
+                ",\"source\":\"front\"{},\"run_sha256\":{},\"candidate_labels\":[{}]",
+                if paths { format!(",\"run\":{}", jstr(&f.run)) } else { String::new() },
                 jstr(&f.run_sha256),
                 f.labels.iter().map(|l| jstr(l)).collect::<Vec<_>>().join(",")
             ),
@@ -3019,10 +3019,18 @@ impl Report {
         }
     }
 
-    /// Machine-readable JSON. The deterministic report; its SHA-256 is the
-    /// reproduction hash.
+    /// Machine-readable JSON. The deterministic report, with the `--front` path.
     pub fn json(&self) -> String {
-        let mut s = self.base_json();
+        self.json_with(true)
+    }
+
+    /// [`Report::json`] without file paths: its SHA-256 is the reproduction hash.
+    pub fn hashed_json(&self) -> String {
+        self.json_with(false)
+    }
+
+    fn json_with(&self, paths: bool) -> String {
+        let mut s = self.base_json(paths);
         s.pop();
         s.push_str(&format!(
             ",\"split\":{{\"required_purge_seconds\":{},\"purge_seconds\":{},\"horizon_seconds\":{},\
@@ -3071,7 +3079,7 @@ impl Report {
 
     /// Window definitions, cost model, position rule and metrics, as required
     /// by issue #124.
-    fn base_json(&self) -> String {
+    fn base_json(&self, paths: bool) -> String {
         let windows: Vec<String> = self.windows.iter().map(WindowResult::json).collect();
         let lb = crate::lockbox::Lockbox::crypto_2026h2();
         let overlap: Vec<String> = self
@@ -3194,7 +3202,7 @@ impl Report {
             self.band_select,
             self.test_used_for_selection,
             self.candidates.len(),
-            self.front_json(),
+            self.front_json(paths),
             self.pool_reset_flat,
             jnum(self.seam_cost),
             self.seam_trades,
