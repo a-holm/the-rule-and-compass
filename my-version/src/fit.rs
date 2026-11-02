@@ -2893,29 +2893,46 @@ fn fit_lm(tree: &mut Node, x: &[Vec<f64>], y: &[f64], w: &[f64], iters: usize) -
         let mut v = vec![0.0; f.op.len().max(1)];
         return sse(&f, x, y, w, &[], &mut v);
     }
-    let mut pass = tile::TileFit::new(&f, x, y, w);
+    let mut core = tile::TileCore::new(&f, x);
+    let mut pass = tile::TileFit::new(&mut core, y, w);
     fit_lm_with(tree, &f, iters, &mut pass)
 }
 
-/// The LM loop over an interchangeable pair of row passes.
-fn fit_lm_with(tree: &mut Node, f: &Flat, iters: usize, pass: &mut impl LmPass) -> f64 {
-    let k = f.nconst;
-    let n = f.op.len();
-    let mut c = vec![0.0; k];
-    for i in 0..n {
+/// The constants of a flat program, one per slot.
+fn flat_constants(f: &Flat) -> Vec<f64> {
+    let mut c = vec![0.0; f.nconst];
+    for i in 0..f.op.len() {
         if f.cslot[i] >= 0 {
             c[f.cslot[i] as usize] = f.val[i];
         }
     }
+    c
+}
+
+/// The LM loop over an interchangeable pair of row passes.
+fn fit_lm_with(tree: &mut Node, f: &Flat, iters: usize, pass: &mut impl LmPass) -> f64 {
+    let c = flat_constants(f);
+    if c.is_empty() || iters == 0 {
+        return lm_core(pass, &c, f.nconst, iters).1;
+    }
+    let (best_c, best_sse) = lm_core(pass, &c, f.nconst, iters);
+    write_constants(tree, f, &best_c);
+    best_sse
+}
+
+/// The LM loop from the constants `c`: the fitted constants and their SSE.
+fn lm_core(pass: &mut impl LmPass, c: &[f64], k: usize, iters: usize) -> (Vec<f64>, f64) {
+    let mut c = c.to_vec();
     if k == 0 {
-        return pass.sse(&[]);
+        return (c, pass.sse(&[]));
     }
     let mut best_c = c.clone();
     // #135: `--no-fit` / `--fit-iters 0` must not fit at all. The LM loop
     // below runs `iters.max(1)` and a four-step polish, so without this early
     // return a "no fit" search still performs five LM iterations per candidate.
     if iters == 0 {
-        return pass.sse(&c);
+        let s = pass.sse(&c);
+        return (c, s);
     }
     // #87: this standalone SSE is intentionally kept. The first `gn_step`
     // forms the same residuals, but using them as the acceptance baseline
@@ -2955,12 +2972,19 @@ fn fit_lm_with(tree: &mut Node, f: &Flat, iters: usize, pass: &mut impl LmPass) 
         }
     }
 
-    // Undamped Gauss–Newton polish: quadratic convergence to the optimum.
+    // Undamped Gauss–Newton polish: quadratic convergence to the optimum. When
+    // the last damped trial was rejected, `normal` still holds the system at
+    // `best_c`, which is the system the first polish step would build.
+    let mut held = normal.take();
     for _ in 0..4 {
         if best_sse == 0.0 {
             break;
         }
-        match gn_step(pass, &best_c, 0.0, k) {
+        let step = match held.take() {
+            Some(n) => gn_trial(pass, &best_c, 0.0, k, &n),
+            None => gn_step(pass, &best_c, 0.0, k),
+        };
+        match step {
             Some((trial, tsse)) if tsse < best_sse => {
                 best_c = trial;
                 best_sse = tsse;
@@ -2969,8 +2993,7 @@ fn fit_lm_with(tree: &mut Node, f: &Flat, iters: usize, pass: &mut impl LmPass) 
         }
     }
 
-    write_constants(tree, f, &best_c);
-    best_sse
+    (best_c, best_sse)
 }
 
 /// Write fitted constant values back into the tree, including constants shared
@@ -3724,18 +3747,23 @@ impl FitCols {
         }
     }
 
-    /// Run `f` on the predictions of `tree`, held in a buffer that lives as long
-    /// as this view.
-    fn with_predictions<R>(&self, tree: &Node, x: &[Vec<f64>], f: impl FnOnce(&[f64]) -> R) -> R {
-        let mut out = self.scratch.borrow_mut();
+    /// Fill `out` with the predictions of `tree`.
+    fn predictions_into(&self, tree: &Node, x: &[Vec<f64>], out: &mut Vec<f64>) {
         out.clear();
         match crate::eval_soa::compile(tree) {
             Some(program) => {
                 out.resize(self.rows, 0.0);
-                crate::eval_soa::eval_batch(&program, &self.cols, self.rows, &mut out);
+                crate::eval_soa::eval_batch(&program, &self.cols, self.rows, out);
             }
             None => out.extend(x.iter().map(|row| expr::eval(tree, row))),
         }
+    }
+
+    /// Run `f` on the predictions of `tree`, held in a buffer that lives as long
+    /// as this view.
+    fn with_predictions<R>(&self, tree: &Node, x: &[Vec<f64>], f: impl FnOnce(&[f64]) -> R) -> R {
+        let mut out = self.scratch.borrow_mut();
+        self.predictions_into(tree, x, &mut out);
         f(&out)
     }
 }
@@ -3790,6 +3818,43 @@ where
     })
 }
 
+/// The flat program and tile core one IRLS call reuses for every weighted
+/// solve, with the constants of the incumbent tree.
+struct IrlsSolver {
+    flat: Flat,
+    core: tile::TileCore,
+    c: Vec<f64>,
+}
+
+impl IrlsSolver {
+    fn new(tree: &Node, x: &[Vec<f64>]) -> IrlsSolver {
+        let flat = flatten(tree);
+        let core = tile::TileCore::new(&flat, x);
+        let c = flat_constants(&flat);
+        IrlsSolver { flat, core, c }
+    }
+
+    /// One weighted solve from the incumbent constants: the fitted copy of
+    /// `tree` and its constants. The incumbent is not changed.
+    fn solve(
+        &mut self,
+        tree: &Node,
+        target: &[f64],
+        weights: &[f64],
+        iters: usize,
+    ) -> (Node, Vec<f64>) {
+        EXACT_FITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let k = self.flat.nconst;
+        let mut pass = tile::TileFit::new(&mut self.core, target, weights);
+        let (fitted, _) = lm_core(&mut pass, &self.c, k, iters);
+        let mut trial = tree.clone();
+        if k > 0 && iters > 0 {
+            write_constants(&mut trial, &self.flat, &fitted);
+        }
+        (trial, fitted)
+    }
+}
+
 /// IRLS with a per-row `(weight, target)` pair derived from the prediction at
 /// the current constants.
 ///
@@ -3798,6 +3863,10 @@ where
 /// improves; the first round that does not ends the loop. `row` returning
 /// `None` ends the fit at the incumbent. The base `w` multiplies the weight,
 /// and a zero-weight row gets weight 0.
+///
+/// One flat program and one tile core serve every solve of the call, and the
+/// predictions that scored an accepted trial are the next round's weight
+/// source.
 #[allow(clippy::too_many_arguments)]
 fn irls_rounds<F>(
     tree: &mut Node,
@@ -3817,36 +3886,54 @@ where
         return f64::INFINITY;
     }
     let cols = FitCols::gather(tree, x);
-    let mut best = metric_score_cols(tree, x, &cols, y, w, metric);
+    let nconst = expr::count_constants(tree);
+    let mut pred = Vec::new();
+    cols.predictions_into(tree, x, &mut pred);
+    let mut best = metrics::score_weighted(&pred, y, w, metric, nconst);
     if !best.is_finite() {
         return best;
     }
-    let pairs = |pred: &[f64]| -> Option<(Vec<f64>, Vec<f64>)> {
-        let mut target = Vec::with_capacity(pred.len());
-        let mut weights = Vec::with_capacity(pred.len());
+    if x.is_empty() {
+        // No rows: a solve changes nothing, the first round is rejected.
+        if best != 0.0 {
+            let solves = u64::from(rounds > 0) + 1;
+            EXACT_FITS.fetch_add(solves, std::sync::atomic::Ordering::Relaxed);
+        }
+        return best;
+    }
+    let mut target = vec![0.0; x.len()];
+    let mut weights = vec![0.0; x.len()];
+    let fill = |pred: &[f64], target: &mut [f64], weights: &mut [f64]| -> bool {
         for (i, &p) in pred.iter().enumerate() {
-            let (factor, t) = row(p, i)?;
+            let Some((factor, t)) = row(p, i) else {
+                return false;
+            };
             let base = if w.is_empty() { 1.0 } else { w[i] };
             // A zero-weight row must stay invisible to the fit, exactly as in
             // `fit_weighted`.
-            weights.push(if base > 0.0 { base * factor.max(0.0) } else { 0.0 });
-            target.push(t);
+            weights[i] = if base > 0.0 { base * factor.max(0.0) } else { 0.0 };
+            target[i] = t;
         }
-        Some((target, weights))
+        true
     };
+    let mut solver: Option<IrlsSolver> = None;
+    let mut trial_pred = Vec::new();
     for _ in 0..rounds {
         if best == 0.0 {
             return best;
         }
-        let Some((target, weights)) = cols.with_predictions(tree, x, pairs) else {
+        if !fill(&pred, &mut target, &mut weights) {
             return best;
-        };
-        let mut trial = tree.clone();
-        fit_weighted(&mut trial, x, &target, &weights, inner);
-        let score = metric_score_cols(&trial, x, &cols, y, w, metric);
+        }
+        let s = solver.get_or_insert_with(|| IrlsSolver::new(tree, x));
+        let (trial, fitted) = s.solve(tree, &target, &weights, inner);
+        cols.predictions_into(&trial, x, &mut trial_pred);
+        let score = metrics::score_weighted(&trial_pred, y, w, metric, nconst);
         if improves(score, best) {
             best = score;
             *tree = trial;
+            s.c = fitted;
+            std::mem::swap(&mut pred, &mut trial_pred);
         } else {
             break; // the majoriser no longer moves the objective
         }
@@ -3857,10 +3944,11 @@ where
     if best == 0.0 {
         return best;
     }
-    if let Some((target, weights)) = cols.with_predictions(tree, x, pairs) {
-        let mut trial = tree.clone();
-        fit_weighted(&mut trial, x, &target, &weights, last);
-        let score = metric_score_cols(&trial, x, &cols, y, w, metric);
+    if fill(&pred, &mut target, &mut weights) {
+        let s = solver.get_or_insert_with(|| IrlsSolver::new(tree, x));
+        let (trial, _) = s.solve(tree, &target, &weights, last);
+        cols.predictions_into(&trial, x, &mut trial_pred);
+        let score = metrics::score_weighted(&trial_pred, y, w, metric, nconst);
         if improves(score, best) {
             best = score;
             *tree = trial;
@@ -6660,6 +6748,206 @@ mod tests {
         fit_lm_with(tree, &f, iters, &mut pass)
     }
 
+    struct CountingPass<'a> {
+        inner: RowPass<'a>,
+        normals: usize,
+    }
+
+    impl LmPass for CountingPass<'_> {
+        fn sse(&mut self, c: &[f64]) -> f64 {
+            self.inner.sse(c)
+        }
+        fn normal(&mut self, c: &[f64]) -> Option<NormalEquations> {
+            self.normals += 1;
+            self.inner.normal(c)
+        }
+    }
+
+    /// The LM loop with the polish rebuilding its first system.
+    fn lm_core_rebuilding_the_polish(
+        pass: &mut impl LmPass,
+        c: &[f64],
+        k: usize,
+        iters: usize,
+    ) -> (Vec<f64>, f64) {
+        let mut c = c.to_vec();
+        let mut best_c = c.clone();
+        let mut best_sse = pass.sse(&c);
+        let mut lambda = 1e-3;
+        let mut normal: Option<NormalEquations> = None;
+        for _ in 0..iters.max(1) {
+            if normal.is_none() {
+                normal = pass.normal(&c);
+            }
+            let Some(n) = normal.as_ref() else { break };
+            match gn_trial(pass, &c, lambda, k, n) {
+                Some((trial, tsse)) => {
+                    if tsse < best_sse {
+                        c = trial;
+                        best_sse = tsse;
+                        best_c = c.clone();
+                        lambda = (lambda / 8.0).max(1e-12);
+                        normal = None;
+                        if best_sse == 0.0 {
+                            break;
+                        }
+                    } else {
+                        lambda *= 6.0;
+                        if lambda > 1e9 {
+                            break;
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+        for _ in 0..4 {
+            if best_sse == 0.0 {
+                break;
+            }
+            match gn_step(pass, &best_c, 0.0, k) {
+                Some((trial, tsse)) if tsse < best_sse => {
+                    best_c = trial;
+                    best_sse = tsse;
+                }
+                _ => break,
+            }
+        }
+        (best_c, best_sse)
+    }
+
+    #[test]
+    fn polish_reuses_the_held_system() {
+        let mut s = 0x2f6e_2b1c_9d3a_4e55u64;
+        let (x, y) = tile_fixture(300, &mut s);
+        let mut saved = 0;
+        for t in 0..40 {
+            let tree = random_tree(&mut s, 2);
+            let f = flatten(&tree);
+            if f.nconst == 0 {
+                continue;
+            }
+            let c0 = fitted_constants(&tree);
+            let mut held = CountingPass { inner: row_pass(&f, &x, &y, &[]), normals: 0 };
+            let mut rebuilt = CountingPass { inner: row_pass(&f, &x, &y, &[]), normals: 0 };
+            let (hc, hs) = lm_core(&mut held, &c0, f.nconst, 8);
+            let (rc, rs) = lm_core_rebuilding_the_polish(&mut rebuilt, &c0, f.nconst, 8);
+            assert!(same_bits(&hc, &rc), "constants of tree {t}");
+            assert_eq!(hs.to_bits(), rs.to_bits(), "sse of tree {t}");
+            assert!(held.normals <= rebuilt.normals, "tree {t}");
+            assert!(rebuilt.normals - held.normals <= 1, "tree {t}");
+            saved += rebuilt.normals - held.normals;
+        }
+        assert!(saved > 0, "no fixture ended its damped phase on a rejected trial");
+    }
+
+    /// `irls_rounds` as it was before the call shared one tile core.
+    pub(super) fn irls_rounds_per_round_solves<F>(
+        tree: &mut Node,
+        x: &[Vec<f64>],
+        y: &[f64],
+        w: &[f64],
+        metric: Metric,
+        rounds: usize,
+        inner: usize,
+        last: usize,
+        row: F,
+    ) -> f64
+    where
+        F: Fn(f64, usize) -> Option<(f64, f64)>,
+    {
+        let cols = FitCols::gather(tree, x);
+        let mut best = metric_score_cols(tree, x, &cols, y, w, metric);
+        if !best.is_finite() {
+            return best;
+        }
+        let pairs = |pred: &[f64]| -> Option<(Vec<f64>, Vec<f64>)> {
+            let mut target = Vec::with_capacity(pred.len());
+            let mut weights = Vec::with_capacity(pred.len());
+            for (i, &p) in pred.iter().enumerate() {
+                let (factor, t) = row(p, i)?;
+                let base = if w.is_empty() { 1.0 } else { w[i] };
+                weights.push(if base > 0.0 { base * factor.max(0.0) } else { 0.0 });
+                target.push(t);
+            }
+            Some((target, weights))
+        };
+        for _ in 0..rounds {
+            if best == 0.0 {
+                return best;
+            }
+            let Some((target, weights)) = cols.with_predictions(tree, x, pairs) else {
+                return best;
+            };
+            let mut trial = tree.clone();
+            fit_weighted(&mut trial, x, &target, &weights, inner);
+            let score = metric_score_cols(&trial, x, &cols, y, w, metric);
+            if improves(score, best) {
+                best = score;
+                *tree = trial;
+            } else {
+                break;
+            }
+        }
+        if best == 0.0 {
+            return best;
+        }
+        if let Some((target, weights)) = cols.with_predictions(tree, x, pairs) {
+            let mut trial = tree.clone();
+            fit_weighted(&mut trial, x, &target, &weights, last);
+            let score = metric_score_cols(&trial, x, &cols, y, w, metric);
+            if improves(score, best) {
+                best = score;
+                *tree = trial;
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn irls_reuse_is_bit_identical() {
+        let (x, y) = pinned_fixture();
+        let vars: Vec<String> = (0..5).map(|i| format!("x{i}")).collect();
+        let sources = [
+            "1.1*x0 + 0.4*x1*x2 + 0.2",
+            "(1.1*x0 + 0.4*x1*x2) / (1.3 + x3*x3) - 0.2*x4",
+            "atan2(1.1*x0, 1.3 + x3*x3) + 0.4*x1*x2 - 0.2*x4",
+        ];
+        let weights: Vec<f64> = (0..y.len())
+            .map(|i| if i % 11 == 4 { 0.0 } else { 0.5 + (i % 7) as f64 * 0.25 })
+            .collect();
+        let mut cases = 0;
+        for src in sources {
+            for w in [&[][..], &weights[..]] {
+                for iters in [1usize, 2, 8, 16] {
+                    for metric in [Metric::Absolute, Metric::LogSquashed, Metric::ImplicitResidual] {
+                        let rounds = iters.clamp(1, 4);
+                        let inner = (iters / rounds).max(1);
+                        let weight_of = |r: f64| match metric {
+                            Metric::LogSquashed => 1.0 / (1.0 + r * r),
+                            _ => 1.0 / r.abs().max(1e-6),
+                        };
+                        let row = |p: f64, i: usize| {
+                            let r = p - y[i];
+                            r.is_finite().then(|| (weight_of(r), y[i]))
+                        };
+                        let mut old = crate::parse::parse(src, &vars).unwrap();
+                        let mut new = old.clone();
+                        let so = irls_rounds_per_round_solves(
+                            &mut old, &x, &y, w, metric, rounds, inner, iters.max(4), row,
+                        );
+                        let sn = irls_rounds(&mut new, &x, &y, w, metric, rounds, inner, iters.max(4), row);
+                        let ctx = format!("{src} {metric:?} iters {iters} weighted {}", !w.is_empty());
+                        assert_eq!(so.to_bits(), sn.to_bits(), "score {ctx}");
+                        assert_eq!(fit_fingerprint(&old, so), fit_fingerprint(&new, sn), "constants {ctx}");
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 72);
+    }
+
     fn lcg(s: &mut u64) -> u64 {
         *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         *s >> 33
@@ -6780,7 +7068,8 @@ mod tests {
                     let k = f.nconst;
                     let c0 = fitted_constants(tree);
                     let mut rp = row_pass(&f, &x, &y, w);
-                    let mut tp = tile::TileFit::new(&f, &x, &y, w);
+                    let mut core = tile::TileCore::new(&f, &x);
+                    let mut tp = tile::TileFit::new(&mut core, &y, w);
                     let ctx = format!("tree {t} rows {rows} weighted {} {tree:?}", !w.is_empty());
                     assert_eq!(rp.sse(&c0).to_bits(), tp.sse(&c0).to_bits(), "sse {ctx}");
                     match (rp.normal(&c0), tp.normal(&c0)) {
