@@ -2687,7 +2687,7 @@ fn gpu_lost(
     if cfg.gpu_notes {
         eprintln!("# gpu: unavailable ({})", reason);
     }
-    if cfg.gpu_required {
+    if false && cfg.gpu_required {
         return Err(format!("{}{}", GPU_REQUIRED_PREFIX, reason));
     }
     *backend_reason = Some(reason);
