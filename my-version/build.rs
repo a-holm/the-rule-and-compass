@@ -2,8 +2,9 @@
 //!
 //! The CUDA backend is **opt-in** (`cargo build --features cuda`). Without the
 //! feature this script does nothing, so the crate stays dependency-free and
-//! builds anywhere. With the feature it compiles `src/cuda/eval.cu` into a
-//! shared object and links it.
+//! builds anywhere. With the feature it compiles `src/cuda/*.cu` into a
+//! static archive and links it with the static CUDA runtime, so the binaries
+//! have no run-time dependency on the build tree (only `libcuda.so.1`).
 //!
 //! Overridable via environment:
 //!   RCSR_CUDA_ARCH    target architecture (default `sm_86`, i.e. Ampere)
@@ -90,10 +91,10 @@ fn record_build_commit() {
     }
 }
 
-/// True when `so` is newer than every CUDA source and was built with the same
+/// True when `lib` is newer than every CUDA source and was built with the same
 /// compiler settings (`stamp`), so a commit-only rebuild does not run nvcc.
-fn cuda_library_fresh(so: &str, stamp_path: &str, stamp: &str) -> bool {
-    let Ok(built) = std::fs::metadata(so).and_then(|m| m.modified()) else {
+fn cuda_library_fresh(lib: &str, stamp_path: &str, stamp: &str) -> bool {
+    let Ok(built) = std::fs::metadata(lib).and_then(|m| m.modified()) else {
         return false;
     };
     if std::fs::read_to_string(stamp_path).ok().as_deref() != Some(stamp) {
@@ -108,6 +109,46 @@ fn cuda_library_fresh(so: &str, stamp_path: &str, stamp: &str) -> bool {
             .map(|t| t <= built)
             .unwrap_or(false)
     })
+}
+
+/// Library directories of the toolkit that `nvcc` belongs to, where `libcudart_static.a`
+/// lives: `<root>/lib64`, `<root>/targets/*/lib` and the distro multiarch directories.
+fn cuda_lib_dirs(nvcc: &str) -> Vec<std::path::PathBuf> {
+    let path = std::path::Path::new(nvcc);
+    let resolved = if path.components().count() > 1 {
+        Some(path.to_path_buf())
+    } else {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|d| d.join(nvcc))
+                .find(|p| p.is_file())
+        })
+    };
+    let Some(root) = resolved
+        .and_then(|p| p.canonicalize().ok())
+        .and_then(|p| p.parent().and_then(|b| b.parent()).map(|r| r.to_path_buf()))
+    else {
+        return Vec::new();
+    };
+    let mut dirs = vec![root.join("lib64")];
+    dirs.extend(["x86_64", "aarch64"].map(|a| std::path::PathBuf::from(format!("/usr/lib/{}-linux-gnu", a))));
+    if let Ok(entries) = std::fs::read_dir(root.join("targets")) {
+        dirs.extend(entries.flatten().map(|e| e.path().join("lib")));
+    }
+    dirs.into_iter().filter(|d| d.join("libcudart_static.a").is_file()).collect()
+}
+
+/// Link the CUDA code statically: no shared object, no run-time search path.
+fn emit_link(out: &str, nvcc: &str) {
+    println!("cargo:rustc-link-search=native={}", out);
+    for dir in cuda_lib_dirs(nvcc) {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+    }
+    println!("cargo:rustc-link-lib=static=rcsrcuda");
+    println!("cargo:rustc-link-lib=static=cudart_static");
+    for lib in ["dl", "rt", "pthread", "stdc++"] {
+        println!("cargo:rustc-link-lib=dylib={}", lib);
+    }
 }
 
 fn main() {
@@ -137,7 +178,7 @@ fn main() {
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
     let nvcc = std::env::var("RCSR_NVCC").unwrap_or_else(|_| "nvcc".to_string());
     let arch_text = std::env::var("RCSR_CUDA_ARCH").unwrap_or_else(|_| "sm_86".to_string());
-    let so = format!("{}/librcsrcuda.so", out);
+    let lib = format!("{}/librcsrcuda.a", out);
 
     let arch = match parse_arch(&arch_text) {
         Ok(a) => a,
@@ -203,10 +244,8 @@ fn main() {
 
     let stamp_path = format!("{}/nvcc.stamp", out);
     let stamp = format!("{} {} {} {}", nvcc, arch.name(), unified, detected_text);
-    if cuda_library_fresh(&so, &stamp_path, &stamp) {
-        println!("cargo:rustc-link-search=native={}", out);
-        println!("cargo:rustc-link-lib=dylib=rcsrcuda");
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", out);
+    if cuda_library_fresh(&lib, &stamp_path, &stamp) {
+        emit_link(&out, &nvcc);
         return;
     }
 
@@ -214,14 +253,14 @@ fn main() {
     let mut cmd = Command::new(&nvcc);
     // `-fmad=false` keeps multiply-add association identical to the Rust f64
     // reference; the enrichment kernels must not silently contract `a*b+c`.
-    cmd.args(["-O3", "-fmad=false", "-std=c++17", arch_flag.as_str(), "-shared"]);
+    cmd.args(["-O3", "-fmad=false", "-std=c++17", arch_flag.as_str(), "-lib"]);
     cmd.args(["-Xcompiler", "-fPIC"]);
     if unified {
         cmd.arg("-DRCSR_UNIFIED=1");
     }
     cmd.args([
         "-o",
-        so.as_str(),
+        lib.as_str(),
         "src/cuda/eval.cu",
         "src/cuda/enrich.cu",
         "src/cuda/tail.cu",
@@ -232,7 +271,6 @@ fn main() {
         "src/cuda/pnl.cu",
         "src/cuda/pit.cu",
         "src/cuda/wf_batch.cu",
-        "-lcudart",
     ]);
 
     let result = cmd.output().unwrap_or_else(|e| {
@@ -269,7 +307,5 @@ fn main() {
     }
 
     let _ = std::fs::write(&stamp_path, &stamp);
-    println!("cargo:rustc-link-search=native={}", out);
-    println!("cargo:rustc-link-lib=dylib=rcsrcuda");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", out);
+    emit_link(&out, &nvcc);
 }

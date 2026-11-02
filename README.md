@@ -1418,7 +1418,7 @@ docs/gui.md                   design for a GUI over the JSON/NDJSON contract
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan
 my-version/
   Cargo.toml
-  build.rs      compiles the CUDA backend when --features cuda is used
+  build.rs      compiles the CUDA backend (static archive, no RUNPATH) when --features cuda is used
   src/
     rng.rs        MT19937 RNG for reproducible runs
     expr.rs       expression trees, primitives, evaluator, mutation, simplification
