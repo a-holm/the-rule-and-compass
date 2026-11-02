@@ -431,3 +431,43 @@ fn pipeline_books_fit_interval() {
         );
     }
 }
+
+/// #601: the overlap fit queue groups candidates into device calls of at least
+/// `FIT_BATCH_MIN`. A candidate's constants depend on its own plan only, so the
+/// archive and the fit counters equal the synchronous run's, with far fewer
+/// fit calls than scoring batches.
+#[cfg(feature = "cuda")]
+#[test]
+fn pipeline_fit_constants_match_sync() {
+    if !device_available() {
+        return;
+    }
+    let train = sample(4_096, 5);
+    let test = sample(256, 6);
+    let run = |depth: usize| {
+        let mut cfg = config(depth, 11);
+        cfg.ops.retain(|&op| op != Op::Asinh);
+        cfg.pop = 256;
+        cfg.generations = 3;
+        search::run(&cfg, &train, &test)
+    };
+    let sync = run(0);
+    let overlap = run(4);
+    let key = |o: &search::Outcome| {
+        o.archive
+            .items
+            .iter()
+            .map(|s| format!("{:?}|{:e}", s.tree, s.error))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(key(&sync), key(&overlap), "archive differs between depth 0 and 4");
+    let (gs, go) = (sync.gpu.expect("sync gpu"), overlap.gpu.expect("overlap gpu"));
+    assert!(gs.fit_calls > 0 && go.fit_calls > 0);
+    assert_eq!(gs.fit_call_candidates, go.fit_call_candidates);
+    let gens = 3 + 1;
+    assert!(
+        go.fit_calls <= 2 * gens,
+        "overlap fit calls {} for {gens} generations",
+        go.fit_calls
+    );
+}

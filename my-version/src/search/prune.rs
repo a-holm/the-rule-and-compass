@@ -169,7 +169,7 @@ fn prune_tree(
                 None => true,
                 Some(b) => {
                     let (_, bc, be) = &scored[b];
-                    cost.total_cmp(bc).then(err.total_cmp(be)).is_lt()
+                    cost.total_cmp(bc).then(crate::error_order::cmp_error(*err, *be)).is_lt()
                 }
             };
             if better {
@@ -218,7 +218,7 @@ pub(super) fn prune_archive(
         (train, train_data)
     };
     let mut order: Vec<&Sol> = archive.items.iter().collect();
-    order.sort_by(|a, b| a.error.total_cmp(&b.error).then(a.cost.total_cmp(&b.cost)));
+    order.sort_by(|a, b| crate::error_order::cmp_error(a.error, b.error).then(a.cost.total_cmp(&b.cost)));
     let mut budget = cfg.prune_budget;
     let mut pruned: Vec<Node> = Vec::new();
     for sol in order {

@@ -1361,7 +1361,7 @@ fn gpu_json(
         .iter()
         .map(|s| {
             format!(
-                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_admitted_wide\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_improved\":{},\"fit_fallback_improved_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"opcodes\":{{{}}}}}",
+                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_admitted_wide\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_improved\":{},\"fit_fallback_improved_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"nonfinite\":{},\"nonfinite_full\":{},\"nonfinite_cpu_finite\":{},\"nonfinite_seconds\":{},\"opcodes\":{{{}}}}}",
                 s.generation,
                 s.programs,
                 s.native,
@@ -1382,6 +1382,10 @@ fn gpu_json(
                 jnum(s.fit_fallback_seconds),
                 s.fit_fallback_bounded,
                 s.fit_fallback_workers,
+                s.nonfinite,
+                s.nonfinite_full,
+                s.nonfinite_cpu_finite,
+                jnum(s.nonfinite_seconds),
                 ops_json(&s.opcodes)
             )
         })
@@ -1417,7 +1421,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{},\"calls\":{},\"candidates\":{},\"call_s_max\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1449,7 +1453,10 @@ fn gpu_json(
         match g.fit_subsample_hash {
             Some(h) => format!("\"{:016x}\"", h),
             None => "null".to_string(),
-        }
+        },
+        g.fit_calls,
+        g.fit_call_candidates,
+        jnum(g.fit_call_ms_max / 1000.0)
     );
     let run_wall = if g.ledger.wall_s() > 0.0 {
         g.ledger.wall_s()
@@ -1940,6 +1947,9 @@ impl DevSink {
             prune_s: outcome.prune.seconds,
             fit_refit_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_s()),
             fit_refits: outcome.gpu.as_ref().map(|g| g.fit_refits),
+            fit_calls: outcome.gpu.as_ref().map(|g| g.fit_calls),
+            fit_candidates: outcome.gpu.as_ref().map(|g| g.fit_call_candidates),
+            fit_call_s_max: outcome.gpu.as_ref().map(|g| g.fit_call_ms_max / 1000.0),
             events,
             bytes,
             dropped,
@@ -6534,9 +6544,7 @@ fn main() {
     let best_resid = rows
         .iter()
         .min_by(|a, b| {
-            a.train_error
-                .partial_cmp(&b.train_error)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            rcsr::error_order::cmp_error(a.train_error, b.train_error)
         })
         .map(|r| r.resid_tests);
 
@@ -6649,7 +6657,7 @@ fn main() {
                 .archive
                 .sorted()
                 .into_iter()
-                .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal));
+                .min_by(|a, b| rcsr::error_order::cmp_error(a.error, b.error));
             if let Some(s) = best {
                 let test_error = search::eval_error(&s.tree, &f.test, cfg.metric);
                 let train_error = search::eval_error(&s.tree, &f.train, cfg.metric);
@@ -6783,9 +6791,7 @@ fn main() {
                 full_rows.first()
             } else {
                 full_rows.iter().min_by(|a, b| {
-                    a.train_error
-                        .partial_cmp(&b.train_error)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    rcsr::error_order::cmp_error(a.train_error, b.train_error)
                 })
             };
             let sorted = outcome.archive.sorted();
@@ -6928,9 +6934,7 @@ fn main() {
                 rows.first()
             } else {
                 rows.iter().min_by(|a, b| {
-                    a.train_error
-                        .partial_cmp(&b.train_error)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    rcsr::error_order::cmp_error(a.train_error, b.train_error)
                 })
             };
             if let Some(r) = selected_row {
@@ -8117,9 +8121,7 @@ fn run_multi_output(
                 }
             }
             if let Some(r) = rows.iter().min_by(|a, b| {
-                a.train_error
-                    .partial_cmp(&b.train_error)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                rcsr::error_order::cmp_error(a.train_error, b.train_error)
             }) {
                 eprintln!("# diagnostics: n={} k={} constants (total across outputs)", prepared.train.len(), r.k_constants);
             }
@@ -8581,9 +8583,7 @@ fn summary_markdown(
         rows.first()
     } else {
         rows.iter().min_by(|a, b| {
-            a.train_error
-                .partial_cmp(&b.train_error)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            rcsr::error_order::cmp_error(a.train_error, b.train_error)
         })
     };
 

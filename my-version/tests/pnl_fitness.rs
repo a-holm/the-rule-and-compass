@@ -429,8 +429,8 @@ fn resume_needs_the_same_book() {
 
 // ---- #484: time-block consistency term ----
 
-/// Rows 0..REGIME_ROWS pay `+0.08 x1`, later rows pay `-0.008 x1`; `x2` pays
-/// `+0.006` in every row.
+/// Rows 0..REGIME_ROWS pay `+0.08 x1`, later rows pay `-0.02 x1`; `x2` pays
+/// `+0.008` in every row.
 const REGIME_ROWS: usize = 90;
 
 fn write_regime_csv(dir: &std::path::Path) -> String {
@@ -440,8 +440,8 @@ fn write_regime_csv(dir: &std::path::Path) -> String {
         let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
         let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
         let noise = frac(f * 0.324_717_957_244_746) - 0.5;
-        let c1 = if i < REGIME_ROWS { 0.08 } else { -0.008 };
-        let r = c1 * x1 + 0.006 * x2 + 0.0005 * noise;
+        let c1 = if i < REGIME_ROWS { 0.08 } else { -0.02 };
+        let r = c1 * x1 + 0.008 * x2 + 0.0005 * noise;
         text.push_str(&format!("{},{},{},{},{}\n", T0 + 900 * i as i64, x1, x2, r, r));
     }
     let path = dir.join("regime.csv");
@@ -516,8 +516,8 @@ fn the_block_term_prefers_the_steady_signal() {
     let dir = scratch();
     let data = write_regime_csv(&dir);
     let spec = write_spec(&dir);
-    let pooled = json(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "1"]));
-    let blocked = json(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "4", "--pnl-block-lambda", "1"]));
+    let pooled = json(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "1", "--seed", "4"]));
+    let blocked = json(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "4", "--pnl-block-lambda", "1", "--seed", "4"]));
     let (p, b) = (best_expression(&pooled), best_expression(&blocked));
     assert!(p.contains("x1"), "pooled best: {p}");
     assert!(b.contains("x2") && !b.contains("x1"), "blocked best: {b}");

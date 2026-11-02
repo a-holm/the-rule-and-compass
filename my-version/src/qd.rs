@@ -99,7 +99,7 @@ impl QdCell {
             self.entries.sort_by(|a, b| {
                 a.cost
                     .total_cmp(&b.cost)
-                    .then(a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal))
+                    .then(crate::error_order::cmp_error(a.error, b.error))
                     .then(expr::structural_hash(&a.tree).cmp(&expr::structural_hash(&b.tree)))
             });
             while self.entries.len() > cap.max(1) {
@@ -111,9 +111,7 @@ impl QdCell {
 
     pub fn best(&self) -> Option<&QdEntry> {
         self.entries.iter().min_by(|a, b| {
-            a.error
-                .partial_cmp(&b.error)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            crate::error_order::cmp_error(a.error, b.error)
                 .then(a.cost.total_cmp(&b.cost))
         })
     }
@@ -534,7 +532,7 @@ impl QdArchive {
                 cell.entries.sort_by(|a, b| {
                     a.cost
                         .total_cmp(&b.cost)
-                        .then(a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal))
+                        .then(crate::error_order::cmp_error(a.error, b.error))
                 });
                 while cell.entries.len() > self.cell_cap {
                     cell.entries.remove(cell.entries.len() / 2);
@@ -1349,5 +1347,23 @@ mod tests {
         // One point has no area; a larger reference error scores a larger area.
         assert_eq!(fixed_reference_hypervolume(&front[..1], 1.0), 0.0);
         assert!(fixed_reference_hypervolume(&front, 10.0) > hv);
+    }
+
+    /// #622: the best entry of a cell does not depend on where a NaN sits.
+    #[test]
+    fn cell_best_ignores_nan_in_any_position() {
+        let entry = |error: f64, v: f64| QdEntry {
+            tree: node(Op::Add, vec![input(0), constant(v)]),
+            error,
+            cost: 3.0,
+            descriptor: Descriptor { usage: 0.5, skew: 0.5 },
+        };
+        let base = vec![entry(f64::NAN, 1.0), entry(2.0, 2.0), entry(1.5, 3.0)];
+        for shift in 0..base.len() {
+            let mut cell = QdCell::default();
+            cell.entries = base.clone();
+            cell.entries.rotate_left(shift);
+            assert_eq!(cell.best().map(|e| e.error), Some(1.5), "shift {shift}");
+        }
     }
 }

@@ -359,4 +359,32 @@ mod tests {
         assert_eq!(bits(&a), bits(&b));
         assert_eq!(sa.to_bits(), sb.to_bits());
     }
+
+    #[test]
+    fn irls_reuse_is_bit_identical_for_the_hinge_rounds() {
+        let (x, y) = cell(60, 60, 1.0, 0.8, 7, 3);
+        let weights: Vec<f64> = (0..y.len()).map(|i| if i % 9 == 2 { 0.0 } else { 1.0 + (i % 3) as f64 }).collect();
+        for w in [&[][..], &weights[..]] {
+            for iters in [1usize, 2, 8, 16] {
+                let signs = classification_signs_weighted(&y, w);
+                for (metric, squared) in [(Metric::HingeOrdinary, false), (Metric::HingeSquared, true)] {
+                    let row = |p: f64, i: usize| {
+                        if squared {
+                            ggn_row(p, signs[i], live(w, i))
+                        } else {
+                            mm_row(p, signs[i], live(w, i))
+                        }
+                    };
+                    let mut old = affine(0.7, 0.1);
+                    let mut new = old.clone();
+                    let so = super::super::tests::irls_rounds_per_round_solves(
+                        &mut old, &x, &y, w, metric, round_budget(iters), INNER, iters.max(4), row,
+                    );
+                    let sn = irls_rounds(&mut new, &x, &y, w, metric, round_budget(iters), INNER, iters.max(4), row);
+                    assert_eq!(so.to_bits(), sn.to_bits(), "score {metric:?} iters {iters}");
+                    assert_eq!(bits(&old), bits(&new), "constants {metric:?} iters {iters}");
+                }
+            }
+        }
+    }
 }
