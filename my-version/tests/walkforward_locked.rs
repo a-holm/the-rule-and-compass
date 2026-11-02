@@ -291,3 +291,33 @@ fn locked_ranges_are_dropped_at_read_time_on_the_store_and_the_table_path() {
     assert_eq!(rows(&walkforward::run_path_with(&path, &after, &locked).unwrap()), 2);
     assert_eq!(rows(&walkforward::run_table_with(&table, &after, "t", &locked).unwrap()), 2);
 }
+
+#[test]
+fn front_read_verifies_with_another_path_spelling() {
+    let dir = scratch("front-spelling");
+    let data = write_data(&dir, "p", Fixture::Clean, false);
+    std::fs::write(dir.join("run.json"), RUN).unwrap();
+    let w = window(T0 + 300 * H);
+    let front = |spelling: &str, extra: &[&str]| {
+        let mut a: Vec<&str> = vec![
+            "walkforward", "--data", &data, "--target", "y", "--time", "ts", "--group-by", "sym", "--horizon", "3600",
+            "--cost-bps", "5", "--periods-per-year", "365", "--json", "--window", &w, "--front", spelling,
+            "--validation-frac", "0.2",
+        ];
+        a.extend_from_slice(extra);
+        let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).current_dir(&dir).args(&a).output().unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let abs = s(&dir.join("run.json"));
+    let (code, out, err) = front(&abs, &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(&format!("\"run\":\"{abs}\"")), "the printed report keeps the --front path");
+    let hash = out.split("\"report_sha256\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let (code, out, err) = front("run.json", &["--expect-report-sha256", &hash]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("\"run\":\"run.json\""), "the printed report keeps the --front path");
+}

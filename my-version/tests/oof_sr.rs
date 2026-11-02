@@ -218,3 +218,19 @@ fn ablation_score_refuses_an_in_sample_fold_and_drops_it_with_the_flag() {
     assert_eq!(oof, vec![false, true]);
     let _ = &f.spec;
 }
+
+#[test]
+fn ladder_sr_run_hash_ignores_the_run_path() {
+    let f = fixture("hash-path");
+    let copy = f.dir.join("elsewhere");
+    std::fs::create_dir_all(&copy).unwrap();
+    let copied = copy.join("same.run.json");
+    std::fs::copy(&f.run, &copied).unwrap();
+    let a = rcsr::ladder::SrRun::load(p(&f.run)).unwrap();
+    let b = rcsr::ladder::SrRun::load(p(&copied)).unwrap();
+    assert_eq!(a.json_with(false), b.json_with(false));
+    assert!(!a.json_with(false).contains("\"run\":"));
+    assert!(a.json_with(false).contains("\"run_sha256\":"));
+    assert!(a.json_with(true).contains(&format!("\"run\":\"{}\"", p(&f.run))));
+    assert!(b.json_with(true).contains(&format!("\"run\":\"{}\"", p(&copied))));
+}

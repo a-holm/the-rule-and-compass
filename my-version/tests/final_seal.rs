@@ -524,3 +524,13 @@ fn a_sealed_ladder_read_hash_is_reproducible_and_verifies() {
     let (b, _, _) = sealed_ladder_read("lad");
     assert_eq!(baseline_read_sha(&a), baseline_read_sha(&b));
 }
+
+#[test]
+fn ladder_read_hash_ignores_the_store_directory() {
+    let (a, da, _) = sealed_ladder_read("lad-dir-a");
+    let (b, db, _) = sealed_ladder_read("lad-dir-b");
+    assert_ne!(da, db);
+    assert_eq!(baseline_read_sha(&a), baseline_read_sha(&b));
+    let printed = std::fs::read_to_string(Path::new(&da).with_file_name("ladder.json")).unwrap();
+    assert!(printed.contains(&format!("\"file\":\"{}.lockbox.json\"", da)), "{printed}");
+}
