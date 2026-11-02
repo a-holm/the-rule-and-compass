@@ -1891,6 +1891,15 @@ impl Report {
     }
 
     pub fn json(&self) -> String {
+        self.json_with(true)
+    }
+
+    /// The report bytes the read hash covers: no wall-clock seconds, no phase ledger.
+    pub fn hashed_json(&self) -> String {
+        self.json_with(false)
+    }
+
+    fn json_with(&self, timed: bool) -> String {
         let rows: Vec<String> = self
             .rows
             .iter()
@@ -1902,7 +1911,7 @@ impl Report {
                     .collect();
                 format!(
                     "{{\"name\":{},\"kind\":{},\"status\":{},\"role\":{},\"note\":{},\"params\":{},\
-\"candidate_evaluations\":{},\"trials\":{},\"wall_seconds\":{},\"exposure\":{},\"beta\":{},\
+\"candidate_evaluations\":{},\"trials\":{},{}\"exposure\":{},\"beta\":{},\
 \"net_by_cost\":[{}],\"mean_period_net\":{},\"mean_ci\":[{},{}],\"sharpe\":{},\"p_mean_positive\":{},\
 \"bh_rejected\":{},\"bh_adjusted\":{},\"turnover_per_row\":{},\"entries\":{},\"break_even_bps\":{},\
 \"hit_rate\":{},\"return_space_mse\":{},\"rank_ic\":{},\"rank_ic_ci\":[{},{}],\
@@ -1915,7 +1924,7 @@ impl Report {
                     jstr(&r.params),
                     r.fits,
                     r.trials,
-                    jnum(r.wall_seconds),
+                    if timed { format!("\"wall_seconds\":{},", jnum(r.wall_seconds)) } else { String::new() },
                     jnum(r.exposure),
                     jnum(r.beta),
                     nets.join(","),
@@ -1986,7 +1995,7 @@ impl Report {
             "{{\"schema\":{},\"folds\":{},\"periods\":{},\"rows_scored\":{},\"periods_per_year\":{},\"block_len\":{},\
 \"min_group_step_seconds\":{},\"cost_bps\":{},\"cost\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
 \"sr_candidate_evaluations\":{},\"sr_wall_seconds\":{},\"gbm_beats_sr\":{}}},\"multiple_testing\":{{\"draws\":{},\"seed\":{},\
-\"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"sr_run\":{},\"rungs\":[{}],\"ledger\":{}}}",
+\"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"sr_run\":{},\"rungs\":[{}]{}}}",
             jstr(SCHEMA),
             jarr_str(&self.folds),
             self.periods,
@@ -2012,13 +2021,18 @@ impl Report {
             jarr_str(&self.notes),
             self.sr_run.as_deref().unwrap_or("null"),
             rows.join(","),
-            if self.ledger.wall_s() > 0.0 {
-                self.ledger.phase_json(
-                    "ladder",
-                    &[Stage::Vary, Stage::Eval, Stage::Fit, Stage::Select, Stage::Archive, Stage::Features],
+            if !timed {
+                String::new()
+            } else if self.ledger.wall_s() > 0.0 {
+                format!(
+                    ",\"ledger\":{}",
+                    self.ledger.phase_json(
+                        "ladder",
+                        &[Stage::Vary, Stage::Eval, Stage::Fit, Stage::Select, Stage::Archive, Stage::Features],
+                    )
                 )
             } else {
-                "null".to_string()
+                ",\"ledger\":null".to_string()
             }
         )
     }
@@ -2528,17 +2542,19 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     ledger.record_stage(Stage::HostOther, wall - ledger.stage_sum_s());
     ledger.set_wall(wall);
     report.ledger = ledger;
-    let mut json = report.json();
     let in_scope = if locked_test { folds.iter().map(|f| f.test.len()).sum() } else { 0 };
-    json = format!(
-        "{},\"purge_seconds\":{},\"purge_source\":\"{}\"}}",
-        json.trim_end().strip_suffix('}').unwrap_or(json.trim_end()),
-        opts.purge_seconds,
-        purge_source
-    );
-    json = resolved.splice_report(&json, in_scope, locked_test, true);
+    let finish = |json: String| {
+        let json = format!(
+            "{},\"purge_seconds\":{},\"purge_source\":\"{}\"}}",
+            json.trim_end().strip_suffix('}').unwrap_or(json.trim_end()),
+            opts.purge_seconds,
+            purge_source
+        );
+        resolved.splice_report(&json, in_scope, locked_test, true)
+    };
+    let json = finish(report.json());
     if let Some((ledger, data_sha, current)) = &read {
-        let report_sha = crate::manifest::sha256_hex(json.as_bytes());
+        let report_sha = crate::manifest::sha256_hex(finish(report.hashed_json()).as_bytes());
         ledger.write_read_marker(&data_path, "baseline_read", &report_sha).map_err(input_err)?;
         ledger.record_baseline_read(data_sha, &report_sha, Some(current)).map_err(input_err)?;
     }

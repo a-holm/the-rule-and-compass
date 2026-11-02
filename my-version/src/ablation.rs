@@ -773,6 +773,10 @@ pub struct PlanInput<'a> {
     pub time: &'a str,
     pub group: Option<&'a str>,
     pub return_col: Option<&'a str>,
+    /// Columns the target spec needs besides the target: its return column and construction columns.
+    pub spec_columns: &'a [String],
+    /// Spec file every search line passes as `--target-spec`; the prepared CSV has no sidecar.
+    pub target_spec: Option<&'a str>,
     pub windows: &'a str,
     pub scheme: &'a str,
     pub out_dir: &'a str,
@@ -803,6 +807,12 @@ pub fn plan_files(inp: &PlanInput) -> Vec<(String, String)> {
     let mut script = String::new();
     script.push_str("#!/usr/bin/env bash\nset -euo pipefail\n");
     let dir = inp.out_dir;
+    let mut keep: Vec<String> = vec![inp.target.to_string()];
+    for c in inp.return_col.into_iter().chain(inp.spec_columns.iter().map(|s| s.as_str())) {
+        if !keep.iter().any(|k| k == c) {
+            keep.push(c.to_string());
+        }
+    }
     script.push_str(&format!(
         "# prepare: placebo and permuted columns (projection CSV; import it with `rcsr import` for a column store)\n\
 rcsr ablation prepare --definition {} --data {} --time {} --group {} --keep {} --out {}/prepared.csv\n",
@@ -810,10 +820,13 @@ rcsr ablation prepare --definition {} --data {} --time {} --group {} --keep {} -
         shell_quote(inp.data),
         shell_quote(inp.time),
         shell_quote(inp.group.unwrap_or("")),
-        shell_quote(&inp.target.to_string()),
+        shell_quote(&keep.join(",")),
         dir
     ));
     let prepared = format!("{}/prepared.csv", dir);
+    let spec_arg = inp
+        .target_spec
+        .map_or(String::new(), |p| format!(" --target-spec {}", shell_quote(p)));
     let mut arms_json = Vec::new();
     for arm in &def.arms {
         let feats = def.features(arm);
@@ -823,7 +836,7 @@ rcsr ablation prepare --definition {} --data {} --time {} --group {} --keep {} -
             let run = format!("{}/{}-s{}.run.json", dir, arm.name, s);
             let res = format!("{}/{}-s{}.result.json", dir, arm.name, s);
             let search = format!(
-                "rcsr --data {} --target {} --vars {} --generations {} --seed {} --arm {} --json-out {} --run-manifest {}/{}-s{}.run-manifest.json {}",
+                "rcsr --data {} --target {} --vars {} --generations {} --seed {} --arm {} --json-out {} --run-manifest {}/{}-s{}.run-manifest.json{} {}",
                 shell_quote(&prepared),
                 shell_quote(inp.target),
                 shell_quote(&feats.join(",")),
@@ -834,6 +847,7 @@ rcsr ablation prepare --definition {} --data {} --time {} --group {} --keep {} -
                 dir,
                 arm.name,
                 s,
+                spec_arg,
                 inp.search_args
             );
             let score = format!(
@@ -1695,10 +1709,12 @@ fn usage() -> &'static str {
     "usage: rcsr ablation <plan|prepare|score|verdict> [options]\n\
 \n\
   plan      --definition <file> --data <path> --target <col> --time <col> --windows <file> --out <dir>\n\
-            [--group <col>] [--return-col <col>] [--scheme expanding] [--finalist]\n\
+            [--group <col>] [--return-col <col>] [--target-spec <file>] [--scheme expanding] [--finalist]\n\
             [--search-args \"...\"] [--score-args \"...\"] [--verdict-args \"...\"]\n\
             writes <arm>.arm.json (arm, feature list, SHA-256, generation budget, seeds), plan.json,\n\
             a copy of the definition and commands.sh\n\
+            the prepare line keeps the target, --return-col and the return and construction columns of the target spec entry\n\
+            (--target-spec, else <data stem>.targets.json); every search line passes that spec file\n\
   prepare   --definition <file> --data <csv|rcsb> --time <col> --group <col> --out <csv> [--lockbox START,END]\n\
             [--purge-seconds <s> | --target-spec <file>]\n\
             writes <csv>.lockbox.json when the data (or --lockbox) declares a locked test: both ranges, purge_seconds, purge_source\n\
@@ -1772,6 +1788,29 @@ impl Flags {
     }
 }
 
+/// The target spec entry of `target` (`--target-spec`, else the sidecar of `data`) and the columns
+/// it needs beside the target: its return column and construction columns.
+fn plan_target_spec(data: &str, flag: Option<&str>, target: &str) -> Result<(Option<String>, Vec<String>), (i32, String)> {
+    let path = match flag {
+        Some(p) => p.to_string(),
+        None => match crate::target::sidecar_path(data) {
+            Some(p) if Path::new(&p).is_file() => p,
+            _ => return Ok((None, Vec::new())),
+        },
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| io_err(&path, e))?;
+    let specs = crate::target::parse_file(&text).map_err(|e| (3, format!("{}: {}", path, e)))?;
+    match crate::target::entry_for(&specs, target) {
+        Some(s) => {
+            let mut cols: Vec<String> = s.return_column.iter().cloned().collect();
+            cols.extend(s.construction_columns.iter().cloned());
+            Ok((Some(path), cols))
+        }
+        None if flag.is_some() => Err((2, format!("--target-spec {}: no entry for target '{}'", path, target))),
+        None => Ok((None, Vec::new())),
+    }
+}
+
 fn load_definition(path: &str) -> Result<Definition, (i32, String)> {
     let text = std::fs::read_to_string(path).map_err(|e| io_err(path, e))?;
     parse_definition(&text).map_err(|e| (3, format!("{}: {}", path, e)))
@@ -1791,13 +1830,17 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             std::fs::create_dir_all(out).map_err(|e| io_err(out, e))?;
             let data = fl.need("--data")?;
             check_columns(&def, data)?;
+            let target = fl.need("--target")?;
+            let (spec_path, spec_columns) = plan_target_spec(data, fl.opt("--target-spec"), target)?;
             let files = plan_files(&PlanInput {
                 def: &def,
                 data,
-                target: fl.need("--target")?,
+                target,
                 time: fl.need("--time")?,
                 group: fl.opt("--group"),
                 return_col: fl.opt("--return-col"),
+                spec_columns: &spec_columns,
+                target_spec: spec_path.as_deref(),
                 windows: fl.need("--windows")?,
                 scheme: fl.opt("--scheme").unwrap_or("expanding"),
                 out_dir: out,
