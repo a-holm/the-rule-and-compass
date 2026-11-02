@@ -400,6 +400,10 @@ fn fitness_pnl_refusals_name_their_reason() {
         &run(&data, &spec, &["--fitness", "pnl", "--fit-samples", "50"]),
         "--fit-samples",
     );
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--cv", "k-fold"]), "--fitness pnl is not supported with --cv");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--stability", "1"]), "--fitness pnl is not supported with --stability");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--null-runs", "1"]), "--fitness pnl is not supported with --null-runs");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--null-block", "4"]), "--fitness pnl is not supported with --null-runs");
     usage_error(&run(&data, &spec, &["--fitness", "other"]), "--fitness must be");
 
     let overlapping = write_csv(&dir, 300);

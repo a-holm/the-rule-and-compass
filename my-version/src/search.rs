@@ -7219,6 +7219,15 @@ fn run_search(
     seeds: &[Node],
     mut on_checkpoint: Option<CheckpointFn<'_>>,
 ) -> Result<Outcome, String> {
+    if let Some(book) = cfg.fitness.book() {
+        if book.len() != train.len() {
+            return Err(format!(
+                "the long_pnl fitness book has {} rows, the training sample {}",
+                book.len(),
+                train.len()
+            ));
+        }
+    }
     #[cfg(feature = "cuda")]
     crate::gpu::note_search_start();
     let nvars = train.x.first().map(|r| r.len()).unwrap_or(0);
@@ -10642,6 +10651,20 @@ mod tests {
             ..Default::default()
         };
         std::sync::Arc::new(crate::trading::FitnessBook::new(&slice, &spec, 900.0).unwrap())
+    }
+
+    #[test]
+    fn a_fitness_book_of_another_length_is_an_error_not_a_silent_run() {
+        let s = sample();
+        let mut longer = s.clone();
+        longer.x.push(longer.x[0].clone());
+        longer.y.push(longer.y[0]);
+        let cfg = Config {
+            fitness: Fitness::LongPnl(pnl_book(&s)),
+            ..Default::default()
+        };
+        let err = run_seeded_checked(&cfg, &longer, &longer, &[]).err().expect("a length mismatch is refused");
+        assert!(err.contains("fitness book has"), "{err}");
     }
 
     #[cfg(feature = "cuda")]
