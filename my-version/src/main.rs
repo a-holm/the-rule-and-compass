@@ -350,8 +350,9 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
                              inside each group). Text columns are allowed.
   --project <n|auto>         choose the variables as a deterministic family-stratified
                              view of n registered feature columns (24-48, research
-                             cell 96-128; auto = 36), one or two per family, rotated
-                             by --seed and --view. Needs a .rcsb store; not with --vars.
+                             cell 96-128; auto = 36), exactly n columns, one per family per
+                             round, rotated by --seed and --view; a store with fewer than n
+                             candidate columns exits 2. Needs a .rcsb store; not with --vars.
                              The view id and columns go to --run-manifest
   --view <k>                 view index for --project (default 0)
   --no-project               load every store column. The default projects the
@@ -4136,21 +4137,13 @@ fn main() {
                                 v.seed,
                                 v.view
                             );
-                            if v.delivered < v.size {
-                                eprintln!(
-                                    "view {}: requested {} columns, delivered {}: {} candidate famil(ies) at most two columns each",
-                                    v.id,
-                                    v.size,
-                                    v.delivered,
-                                    v.families.len()
-                                );
-                            }
                             vars = v.columns.clone();
                             view_record = Some(v);
                         }
                         Err(e) => {
                             eprintln!("error: {}", e);
-                            std::process::exit(EXIT_INPUT);
+                            let shortfall = matches!(e, registry::ViewError::Shortfall { .. });
+                            std::process::exit(if shortfall { EXIT_USAGE } else { EXIT_INPUT });
                         }
                     }
                 }

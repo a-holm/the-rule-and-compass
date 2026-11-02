@@ -974,7 +974,7 @@ rcsr --data lag.csv --target y --vars x --split temporal --time t --lags 1
 
 `--lag-set 1,4,24,96` (or `default`, the same menu) replaces the blanket `--lags K`: it adds `x_lag<k>` only for the listed bar counts, which keeps the variable count and the mutation dilution down on a wide store. The two flags are alternatives. Stderr and the split report give `nvars` before and after (`nvars 2 -> 10` for two variables and four lags). The first `max(k)` rows of each series are history, as with `--lags`; no normalisation or centred window is involved.
 
-`--project n|auto` (with `--view k`) selects `--vars` from the feature registry instead: a deterministic family-stratified view of 24-48 columns (research cell 96-128), rotated by `--seed` and `--view`, recorded in `--run-manifest`.
+`--project n|auto` (with `--view k`) selects `--vars` from the feature registry instead: a deterministic family-stratified view of 24-48 columns (research cell 96-128), rotated by `--seed` and `--view`, of exactly `n` columns (a store with fewer than `n` candidate columns exits 2), recorded in `--run-manifest`.
 
 `--history-frac f` keeps the first share of every series as *history*: those
 rows provide the past for later rows but are not scored, so a delay near the
