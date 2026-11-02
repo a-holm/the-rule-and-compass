@@ -212,8 +212,13 @@ pub(super) fn prune_archive(
     let (fit, data): (&Sample, &EvalSample) = if cfg.prune_rows >= 2 && train.len() > cfg.prune_rows {
         let idx = generation_subset(train.len(), cfg.prune_rows, cfg.seed ^ PRUNE_SUBSET_SALT, 0);
         sub = subset_sample(train, &idx);
-        sub_data = EvalSample::new(&sub, cfg);
-        (&sub, &sub_data)
+        // The P&L book is bound to the training rows; a row subsample cannot carry it.
+        if cfg.fitness.book().is_some() {
+            (&sub, train_data)
+        } else {
+            sub_data = EvalSample::new(&sub, cfg);
+            (&sub, &sub_data)
+        }
     } else {
         (train, train_data)
     };

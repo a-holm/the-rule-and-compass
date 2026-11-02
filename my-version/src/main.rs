@@ -764,6 +764,8 @@ SEARCH:
   --no-prune                 keep the prune off (the default)
   --prune-rows <N>           rows the prune fits on (default 20000, >= 2); a
                              larger training sample is subsampled
+                             (constant refits only under --fitness pnl; scores
+                             use all rows)
   --prune-budget <N>         cap on candidate fits per run (default 20000,
                              0 = no prune)
   --no-simd                  force the scalar tree walk instead of the
