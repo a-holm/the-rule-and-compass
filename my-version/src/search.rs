@@ -2792,9 +2792,9 @@ fn score_pipeline_batch(
     mut jobs: Vec<PipelineJob>,
     gpu: &mut Option<GpuSearch>,
     results: &mut [Vec<Option<PipelineResult>>],
-    train: &Sample,
     generation: usize,
     fit: Option<PipelineFit>,
+    fallbacks: &mut Vec<PipelineFallback>,
 ) -> Result<(), String> {
     let Some(g) = gpu.as_mut() else {
         return Err("pipeline scoring without a GPU evaluator".to_string());
@@ -2823,7 +2823,6 @@ fn score_pipeline_batch(
     // admission set), exactly as the synchronous `fit_pending` loop would.
     let mut plans: Vec<(usize, crate::fit::GpuFitPlan)> = Vec::new();
     let mut fallback_jobs: Vec<usize> = Vec::new();
-    let mut fallback_cause: BTreeMap<usize, FitFallbackCause> = BTreeMap::new();
     for (k, (_, _, tree)) in jobs.iter().enumerate() {
         match crate::fit::gpu_fit_plan_reason(tree) {
             Ok(plan) => plans.push((k, plan)),
@@ -2847,14 +2846,9 @@ fn score_pipeline_batch(
             Err(crate::fit::GpuFitReject::TooManyConstants) => FitFallbackCause::TooManyConstants,
             _ => FitFallbackCause::UnsupportedPlan,
         };
-        fallback_cause.insert(k, cause);
         g.note_fit_fallback(generation, cause);
         crate::fit::note_gpu_fit(false);
-        results[i][j] = Some(PipelineResult {
-            error: f64::NAN,
-            offered: offered_hash[k],
-            tree: None,
-        });
+        fallbacks.push(PipelineFallback::new(0, i, j, cause, offered_hash[k], jobs[k].2.clone()));
     }
 
     let mut fitted: Vec<usize> = Vec::new();
@@ -2874,22 +2868,16 @@ fn score_pipeline_batch(
         }
         if ms < 0.0 || out.len() != plans.len() {
             for (k, _) in &plans {
-                fallback_jobs.push(*k);
                 let (i, j) = (jobs[*k].0, jobs[*k].1);
-                fallback_cause.insert(*k, FitFallbackCause::Launch);
                 g.note_fit_fallback(generation, FitFallbackCause::Launch);
                 crate::fit::note_gpu_fit(false);
-                results[i][j] = Some(PipelineResult {
-                    error: f64::NAN,
-                    offered: offered_hash[*k],
-                    tree: None,
-                });
+                let kept = jobs[*k].2.clone();
+                fallbacks.push(PipelineFallback::new(1, i, j, FitFallbackCause::Launch, offered_hash[*k], kept));
             }
         } else {
             for ((k, plan), res) in plans.iter().zip(out) {
-                let finite = res.c.iter().all(|v| v.is_finite());
-                if crate::fit::fit_status_usable(res.status) && finite {
-                    plan.apply(&mut jobs[*k].2, &res.c);
+                let verdict = apply_device_fit(plan, &mut jobs[*k].2, &res);
+                if verdict.is_none() {
                     if let Some(label) = gpu_status_label(res.status) {
                         *g.fit_status_by_label.entry(label.to_string()).or_default() += 1;
                     }
@@ -2897,67 +2885,14 @@ fn score_pipeline_batch(
                     g.stats.entry(generation).or_default().fit_gpu += 1;
                     crate::fit::note_gpu_fit(true);
                     fitted.push(*k);
-                } else {
+                } else if let Some(cause) = verdict {
                     let (i, j) = (jobs[*k].0, jobs[*k].1);
-                    let cause = if !finite {
-                        FitFallbackCause::NonFinite
-                    } else {
-                        status_fallback_cause(res.status)
-                    };
-                    fallback_cause.insert(*k, cause);
                     g.note_fit_fallback(generation, cause);
                     crate::fit::note_gpu_fit(false);
-                    results[i][j] = Some(PipelineResult {
-                        error: f64::NAN,
-                        offered: offered_hash[*k],
-                        tree: None,
-                    });
-                    fallback_jobs.push(*k);
+                    let kept = jobs[*k].2.clone();
+                    fallbacks.push(PipelineFallback::new(1, i, j, cause, offered_hash[*k], kept));
                 }
             }
-        }
-    }
-
-    // The exact CPU arm keeps the same constants a synchronous run would have
-    // produced. These are the structural/rare arithmetic residuals only; the
-    // device answers above are never refit.
-    let mut fb: Vec<(usize, FallbackFitJob)> = fallback_jobs
-        .iter()
-        .filter_map(|&k| {
-            let (i, j) = (jobs[k].0, jobs[k].1);
-            results[i][j]
-                .as_ref()
-                .is_some_and(|r| r.error.is_nan())
-                .then(|| {
-                    (k, FallbackFitJob::new(i, j, jobs[k].2.clone()))
-                })
-        })
-        .collect();
-    if !fb.is_empty() {
-        let mut owned: Vec<FallbackFitJob> = fb
-            .iter()
-            .map(|(_, job)| FallbackFitJob::new(job.island, job.slot, job.tree.clone()))
-            .collect();
-        fit_fallback_jobs(
-            &mut owned,
-            &train.x,
-            &train.y,
-            &train.w,
-            fit.iters,
-            fit.metric,
-            fallback_workers(),
-        );
-        for ((k, job), done) in fb.iter_mut().zip(owned) {
-            if done.improved {
-                let cause = fallback_cause
-                    .get(k)
-                    .copied()
-                    .unwrap_or(FitFallbackCause::UnsupportedPlan);
-                g.note_fit_fallback_improved(generation, cause);
-            }
-            job.tree = done.tree.clone();
-            jobs[*k].2 = done.tree;
-            fitted.push(*k);
         }
     }
 
@@ -2980,6 +2915,119 @@ fn score_pipeline_batch(
                 tree: Some(tree.clone()),
             });
         }
+    }
+    Ok(())
+}
+
+/// #578: write the device constants into `tree` whenever they are finite, as
+/// the synchronous `fit_pending` does, so a CPU fallback starts from them. The
+/// result is the fallback cause, or `None` for a usable device fit.
+#[cfg(feature = "cuda")]
+fn apply_device_fit(
+    plan: &crate::fit::GpuFitPlan,
+    tree: &mut Node,
+    res: &crate::gpu::GpuFitOutput,
+) -> Option<FitFallbackCause> {
+    let finite = res.c.iter().all(|v| v.is_finite());
+    if finite {
+        plan.apply(tree, &res.c);
+    }
+    if !finite {
+        Some(FitFallbackCause::NonFinite)
+    } else if crate::fit::fit_status_usable(res.status) {
+        None
+    } else {
+        Some(status_fallback_cause(res.status))
+    }
+}
+
+/// #578: a candidate that needs the exact CPU fit. The refit happens at the
+/// generation barrier, in the synchronous admission order, so
+/// `--fit-fallback-max` picks the same candidates as on the synchronous path.
+/// `tree` carries the finite device constants when the device produced any.
+#[cfg(feature = "cuda")]
+struct PipelineFallback {
+    /// 0: structural plan reject, 1: device status or launch failure; the order
+    /// of the synchronous `fallbacks` vector.
+    group: u8,
+    island: usize,
+    slot: usize,
+    cause: FitFallbackCause,
+    offered: u64,
+    tree: Node,
+}
+
+#[cfg(feature = "cuda")]
+impl PipelineFallback {
+    fn new(group: u8, island: usize, slot: usize, cause: FitFallbackCause, offered: u64, tree: Node) -> Self {
+        Self { group, island, slot, cause, offered, tree }
+    }
+}
+
+/// #578: refit the first `fit_fallback_max` fallbacks of the generation on the
+/// CPU, hold the rest at their device constants, then simplify and score every
+/// fallback tree on the device, as `fit_pending` and its re-score do.
+#[cfg(feature = "cuda")]
+fn finish_pipeline_fallbacks(
+    g: &mut GpuSearch,
+    mut fallbacks: Vec<PipelineFallback>,
+    results: &mut [Vec<Option<PipelineResult>>],
+    train: &Sample,
+    fit: PipelineFit,
+    cap: usize,
+    generation: usize,
+) -> Result<(), String> {
+    if fallbacks.is_empty() {
+        return Ok(());
+    }
+    fallbacks.sort_by_key(|f| (f.group, f.island, f.slot));
+    let (refit, bounded) = fallback_batch_split(fallbacks.len(), cap);
+    if bounded > 0 {
+        g.fit_fallback_bounded += bounded;
+        g.stats.entry(generation).or_default().fit_fallback_bounded += bounded;
+    }
+    let start = std::time::Instant::now();
+    let mut workers_used = 0usize;
+    if refit > 0 {
+        let mut jobs: Vec<FallbackFitJob> = fallbacks[..refit]
+            .iter()
+            .map(|f| FallbackFitJob::new(f.island, f.slot, f.tree.clone()))
+            .collect();
+        workers_used = fit_fallback_jobs(
+            &mut jobs,
+            &train.x,
+            &train.y,
+            &train.w,
+            fit.iters,
+            fit.metric,
+            fallback_workers(),
+        );
+        for (f, job) in fallbacks[..refit].iter_mut().zip(jobs) {
+            if job.improved {
+                g.note_fit_fallback_improved(generation, f.cause);
+            }
+            f.tree = job.tree;
+        }
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    g.fit_fallback_ms += seconds * 1000.0;
+    g.fit_fallback_workers = g.fit_fallback_workers.max(workers_used);
+    let stats = g.stats.entry(generation).or_default();
+    stats.fit_fallback_seconds += seconds;
+    stats.fit_fallback_workers = stats.fit_fallback_workers.max(workers_used);
+
+    let scored: Vec<PipelineJob> = fallbacks
+        .iter()
+        .map(|f| (f.island, f.slot, expr::simplify(&f.tree)))
+        .collect();
+    let (kept, errs) = eval_pipeline_jobs(g, &scored, generation)?;
+    for (&pos, &err) in kept.iter().zip(&errs) {
+        let (i, j, tree) = &scored[pos];
+        results[*i][*j] = Some(PipelineResult {
+            error: err,
+            offered: fallbacks[pos].offered,
+            tree: Some(tree.clone()),
+        });
     }
     Ok(())
 }
@@ -5061,6 +5109,11 @@ fn pipeline_fit_safe(cfg: &Config, train_rows: usize, screened: bool) -> bool {
 /// does while producers run). The candidate itself stays in the producer's
 /// `next`, so a dropped job is simply scored at the barrier.
 fn offer(sink: &Option<(&std::sync::mpsc::SyncSender<PipelineJob>, usize)>, slot: usize, ind: &Ind) {
+    // A dimension-rejected candidate keeps its infinite error; the synchronous
+    // path never scores it.
+    if !ind.error.is_nan() {
+        return;
+    }
     if let Some((tx, island)) = sink {
         let _ = tx.send((*island, slot, ind.tree.clone()));
     }
@@ -7682,6 +7735,8 @@ fn run_search(
             let mut pipeline_error: Option<String> = None;
             #[cfg(feature = "cuda")]
             let mut pipeline_scored = false;
+            #[cfg(feature = "cuda")]
+            let mut pipeline_fallbacks: Vec<PipelineFallback> = Vec::new();
             std::thread::scope(|s| {
                 // The queue lives in the scope: producers take a clone of the
                 // sender, and `drain` consumes the original so it can end.
@@ -7743,9 +7798,9 @@ fn run_search(
                             jobs,
                             &mut gpu,
                             &mut pipeline_results,
-                            gen_train,
                             gen,
                             pipeline_fit,
+                            &mut pipeline_fallbacks,
                         )
                     });
                 }
@@ -7761,6 +7816,20 @@ fn run_search(
             #[cfg(feature = "cuda")]
             {
                 if pipeline_active {
+                    if pipeline_error.is_none() {
+                        if let (Some(g), Some(fit)) = (gpu.as_mut(), pipeline_fit) {
+                            pipeline_error = finish_pipeline_fallbacks(
+                                g,
+                                std::mem::take(&mut pipeline_fallbacks),
+                                &mut pipeline_results,
+                                gen_train,
+                                fit,
+                                cfg.fit_fallback_max,
+                                gen,
+                            )
+                            .err();
+                        }
+                    }
                     // Results are keyed by (island, slot), so the arrival order
                     // across concurrent island threads cannot change them.
                     // #560: a result for a replaced candidate is dropped, which
@@ -8535,6 +8604,41 @@ fn run_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #578: a device result with a non-usable status but finite constants
+    /// still moves the tree, so the CPU fallback starts from them.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_non_usable_device_status_still_applies_finite_constants() {
+        use crate::expr::{constant, input, node, Op};
+        let tree = node(Op::Add, vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.5)]);
+        let plan = crate::fit::gpu_fit_plan_reason(&tree).expect("an eligible plan");
+        let out = |status: i32, c: Vec<f64>| crate::gpu::GpuFitOutput {
+            c,
+            sse: 0.0,
+            status,
+        };
+        for (status, cause) in [
+            (1, FitFallbackCause::IllConditioned),
+            (2, FitFallbackCause::NonFinite),
+            (3, FitFallbackCause::RankDeclined),
+        ] {
+            let mut t = tree.clone();
+            assert_eq!(apply_device_fit(&plan, &mut t, &out(status, vec![2.0, 3.0])), Some(cause));
+            let mut want = tree.clone();
+            plan.apply(&mut want, &[2.0, 3.0]);
+            assert_eq!(t, want, "status {status}");
+            assert_ne!(t, tree);
+        }
+        let mut t = tree.clone();
+        assert_eq!(apply_device_fit(&plan, &mut t, &out(0, vec![2.0, 3.0])), None);
+        let mut t = tree.clone();
+        assert_eq!(
+            apply_device_fit(&plan, &mut t, &out(0, vec![f64::NAN, 3.0])),
+            Some(FitFallbackCause::NonFinite)
+        );
+        assert_eq!(t, tree, "non-finite constants are never applied");
+    }
 
     /// #453: `n` eligible `c0 * x0 + c1` plans, one constant pair each.
     fn affine_plans(n: usize) -> Vec<(usize, usize, crate::fit::GpuFitPlan)> {
