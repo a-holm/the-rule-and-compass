@@ -6541,9 +6541,7 @@ fn main() {
     let best_resid = rows
         .iter()
         .min_by(|a, b| {
-            a.train_error
-                .partial_cmp(&b.train_error)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            rcsr::error_order::cmp_error(a.train_error, b.train_error)
         })
         .map(|r| r.resid_tests);
 
@@ -6656,7 +6654,7 @@ fn main() {
                 .archive
                 .sorted()
                 .into_iter()
-                .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal));
+                .min_by(|a, b| rcsr::error_order::cmp_error(a.error, b.error));
             if let Some(s) = best {
                 let test_error = search::eval_error(&s.tree, &f.test, cfg.metric);
                 let train_error = search::eval_error(&s.tree, &f.train, cfg.metric);
@@ -6790,9 +6788,7 @@ fn main() {
                 full_rows.first()
             } else {
                 full_rows.iter().min_by(|a, b| {
-                    a.train_error
-                        .partial_cmp(&b.train_error)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    rcsr::error_order::cmp_error(a.train_error, b.train_error)
                 })
             };
             let sorted = outcome.archive.sorted();
@@ -6935,9 +6931,7 @@ fn main() {
                 rows.first()
             } else {
                 rows.iter().min_by(|a, b| {
-                    a.train_error
-                        .partial_cmp(&b.train_error)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    rcsr::error_order::cmp_error(a.train_error, b.train_error)
                 })
             };
             if let Some(r) = selected_row {
@@ -8124,9 +8118,7 @@ fn run_multi_output(
                 }
             }
             if let Some(r) = rows.iter().min_by(|a, b| {
-                a.train_error
-                    .partial_cmp(&b.train_error)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                rcsr::error_order::cmp_error(a.train_error, b.train_error)
             }) {
                 eprintln!("# diagnostics: n={} k={} constants (total across outputs)", prepared.train.len(), r.k_constants);
             }
@@ -8588,9 +8580,7 @@ fn summary_markdown(
         rows.first()
     } else {
         rows.iter().min_by(|a, b| {
-            a.train_error
-                .partial_cmp(&b.train_error)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            rcsr::error_order::cmp_error(a.train_error, b.train_error)
         })
     };
 
