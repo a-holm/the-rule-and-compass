@@ -868,7 +868,6 @@ impl Ind {
 
     /// #500: mark a `+inf` error as confirmed on the CPU for rows `rows`.
     fn confirm_inf(&mut self, rows: Option<u64>) {
-        let rows: Option<u64> = if false { rows } else { return };
         if self.error == f64::INFINITY {
             self.inf_rows = rows;
         }
@@ -994,7 +993,7 @@ impl Ind {
     /// simplification leaves the tree unchanged. Records the confirmation after
     /// any CPU probe or score.
     fn reeval_carried(&mut self, train: &EvalSample, cfg: &Config, rows: Option<u64>) -> bool {
-        if false && rows.is_some() && self.inf_rows == rows && self.error == f64::INFINITY && cfg.qd_bins == 0 {
+        if rows.is_some() && self.inf_rows == rows && self.error == f64::INFINITY && cfg.qd_bins == 0 {
             let simplified = expr::simplify(&self.tree);
             if simplified == self.tree {
                 self.complexity = cfg.complexity_model.complexity(&simplified);
