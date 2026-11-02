@@ -5113,7 +5113,7 @@ struct PipelineResult {
 /// block owns a candidate for the whole pass over the rows, so a call with
 /// fewer blocks than the device holds takes as long as a full one.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-const FIT_BATCH_MIN: usize = 128;
+const FIT_BATCH_MIN: usize = 1;
 
 /// #601: candidates of the overlap queue that wait for a device fit call.
 /// Each entry is the offered job, its structural hash and the fit plan or the
@@ -8726,6 +8726,28 @@ mod tests {
                 (0, k, crate::fit::gpu_fit_plan_reason(&tree).expect("an eligible plan"))
             })
             .collect()
+    }
+
+    /// #601: only candidates with a plan count toward the flush threshold, and
+    /// `take` empties the queue.
+    #[test]
+    fn fit_queue_counts_planned_candidates_and_empties_on_take() {
+        let mut q = PipelineFitQueue::default();
+        assert!(q.is_empty());
+        for (i, j, plan) in affine_plans(3) {
+            q.push((i, j, crate::expr::input(0)), j as u64, Ok(plan));
+        }
+        q.push(
+            (0, 9, crate::expr::input(0)),
+            9,
+            Err(crate::fit::GpuFitReject::UnsupportedOp),
+        );
+        assert_eq!(q.planned(), 3);
+        assert!(!q.is_empty());
+        let (jobs, offered, entries) = q.take();
+        assert_eq!((jobs.len(), offered.len(), entries.len()), (4, 4, 4));
+        assert!(q.is_empty());
+        assert_eq!(q.planned(), 0);
     }
 
     /// A launch so expensive that one fit cannot amortise it but 64 can.
