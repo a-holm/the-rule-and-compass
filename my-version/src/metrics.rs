@@ -1684,9 +1684,12 @@ pub fn classification_row_loss(p: f64, l: f64, objective: ScoreObjective) -> f64
             let h = (1.0 - u).max(0.0);
             h * h
         }
-        // Only the five classification objectives reach this function; a
-        // regression objective here is a dispatch bug, not a number.
-        _ => f64::NAN,
+        // Only the five classification objectives reach this function. The
+        // invalid-score convention is +inf, never NaN.
+        _ => {
+            debug_assert!(false, "classification_row_loss: non-classification objective {objective:?}");
+            f64::INFINITY
+        }
     }
 }
 
