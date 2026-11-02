@@ -6626,7 +6626,11 @@ fn main() {
     // variable is selected. A form that wins most resamples is what the data
     // supports; one that wins once is a coincidence.
     let stab: Option<stability::Stability> = if stability_runs > 0 {
-        let st = stability::run(&cfg, &prepared.train, &prepared.test, stability_runs, &vars);
+        let st = stability::run_checked(&cfg, &prepared.train, &prepared.test, stability_runs, &vars)
+            .unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                std::process::exit(gpu_required_exit(&e).unwrap_or(EXIT_INPUT));
+            });
         for r in rows.iter_mut() {
             r.stability = Some(st.frequency(&r.shape));
         }

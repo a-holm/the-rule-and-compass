@@ -719,3 +719,13 @@ fn benchmark_with_an_injected_fault_exits_6() {
     }
     assert_exits_6_with_message(&o);
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn stability_with_an_injected_fault_exits_6() {
+    let o = run_second_search_fault(&["--stability", "1"], false);
+    if !has_device(&o) {
+        return;
+    }
+    assert_exits_6_with_message(&o);
+}
