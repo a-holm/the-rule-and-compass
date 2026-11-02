@@ -7166,13 +7166,14 @@ fn run_postfix_search(
 
     // #284: the remaining tail is one measured host window (final f64 rebuild,
     // test scoring and archive canonicalisation).
-    let tail_total = (t0.elapsed().as_secs_f64() - pre_tail_elapsed).max(0.0);
+    let end_s = t0.elapsed().as_secs_f64();
+    let tail_total = (end_s - pre_tail_elapsed).max(0.0);
     run_ledger.record_stage(crate::gpu_stats::Stage::Io, io_final_s);
     run_ledger.record_stage(
         crate::gpu_stats::Stage::HostOther,
         (tail_total - io_final_s).max(0.0),
     );
-    run_ledger.set_wall(t0.elapsed().as_secs_f64());
+    run_ledger.set_wall(end_s);
 
     let mut stats = gpu.run_stats();
     let mut ledger = run_ledger;
@@ -7180,7 +7181,7 @@ fn run_postfix_search(
     // The flat path is fit-free (no per-candidate constants), but keep the
     // same reclassification rule for a future fit arm.
     ledger.reclassify_eval_to_fit(stats.fit_host_ms / 1000.0);
-    ledger.set_wall(t0.elapsed().as_secs_f64());
+    ledger.close_at(end_s, t0.elapsed().as_secs_f64());
     stats.ledger = ledger;
     stats.fit_fallback_max = cfg.fit_fallback_max;
     stats.fit_admission = cfg.fit_admission;
@@ -8943,13 +8944,14 @@ fn run_search(
     let refit_tail_s = refit_report.refit_s;
     run_ledger.record_stage(crate::gpu_stats::Stage::Fit, refit_tail_s);
     run_ledger.record_refit(gpu_fit_refits as u64, refit_tail_s);
-    let tail_total = (t0.elapsed().as_secs_f64() - pre_tail_elapsed).max(0.0);
+    let end_s = t0.elapsed().as_secs_f64();
+    let tail_total = (end_s - pre_tail_elapsed).max(0.0);
     run_ledger.record_stage(crate::gpu_stats::Stage::Io, io_final_s);
     run_ledger.record_stage(
         crate::gpu_stats::Stage::HostOther,
         (tail_total - refit_tail_s - io_final_s).max(0.0),
     );
-    run_ledger.set_wall(t0.elapsed().as_secs_f64());
+    run_ledger.set_wall(end_s);
 
     // #131: the GPU report is emitted only for a run that actually used the
     // device, so a CPU run's JSON is byte-identical to before.
@@ -8973,7 +8975,7 @@ fn run_search(
             // share is reclassified, so the stage sum never grows.
             let fit_loop_s = ((s.fit_host_ms - g.drain_fit_ms) / 1000.0 - setup_fit_s).max(0.0);
             ledger.reclassify_eval_to_fit(fit_loop_s);
-            ledger.set_wall(t0.elapsed().as_secs_f64());
+            ledger.close_at(end_s, t0.elapsed().as_secs_f64());
             s.ledger = ledger;
             s.fit_fallback_max = cfg.fit_fallback_max;
             s

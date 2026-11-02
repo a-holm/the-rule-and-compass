@@ -523,6 +523,14 @@ impl RunLedger {
         }
     }
 
+    /// Book `now_s - booked_until_s` as host time and end the run at `now_s`.
+    /// The caller passes the clock read that ended the last booked stage and
+    /// one fresh read, so stage sum and wall share their reads.
+    pub fn close_at(&mut self, booked_until_s: f64, now_s: f64) {
+        self.record_stage(Stage::HostOther, now_s - booked_until_s);
+        self.set_wall(now_s);
+    }
+
     pub fn wall_s(&self) -> f64 {
         self.wall_s
     }
@@ -988,6 +996,19 @@ impl GpuStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_at_books_the_gap_as_host_other() {
+        let mut l = RunLedger::new();
+        l.record_stage(Stage::Eval, 0.6);
+        l.record_stage(Stage::HostOther, 0.4);
+        l.set_wall(1.0);
+        let before = l.stage_s(Stage::HostOther);
+        l.close_at(1.0, 1.002);
+        assert!((l.stage_s(Stage::HostOther) - before - 0.002).abs() < 1e-12);
+        assert_eq!(l.wall_s(), 1.002);
+        assert!(l.closure_residual().value.abs() < 1e-12);
+    }
 
     /// #600: the drain is eval and fit, never vary; the window still closes.
     #[test]
