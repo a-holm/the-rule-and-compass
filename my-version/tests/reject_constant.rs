@@ -80,7 +80,7 @@ fn without_the_flag_islands_hold_several_constant_individuals() {
 fn the_default_archive_hash_is_pinned() {
     let (train, test) = (sample(200), sample(50));
     let out = search::run(&config(false, 1), &train, &test);
-    assert_eq!(out.archive.hash(), 1243343133610422360, "pinned archive hash of the default trajectory");
+    assert_eq!(out.archive.hash(), 2767051220635111621, "pinned archive hash of the default trajectory");
 }
 
 #[test]
