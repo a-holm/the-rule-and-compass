@@ -1998,7 +1998,6 @@ impl GpuSearch {
         let force_cpu = eval_decision.route == crate::dispatch::Route::Cpu;
         let mut slots: Vec<(usize, usize)> = Vec::with_capacity(pending.len());
         let mut on_cpu: Vec<(usize, usize)> = Vec::new();
-        let mut lowered = 0usize;
         // #131: record what the batch actually emitted. Several calls can belong
         // to one generation (initial screening, refit, restarts); merge them.
         // The counts come from `compile_program`, i.e. from the words that were
@@ -2037,9 +2036,6 @@ impl GpuSearch {
                 .map_or(false, |c| c.words().len() <= width && pool.push(c.words(), meta));
             match compiled {
                 Some(c) if pushed => {
-                    if c.lowered() {
-                        lowered += 1;
-                    }
                     for (name, n) in c.opcodes() {
                         *stats.opcodes.entry(name.clone()).or_default() += *n;
                     }
@@ -2051,8 +2047,7 @@ impl GpuSearch {
         }
 
         stats.programs += pool.len();
-        stats.native += pool.len() - lowered;
-        stats.lowered += lowered;
+        stats.native += pool.len();
         stats.fallbacks += on_cpu.len();
         stats.unsupported_programs += on_cpu.len();
         stats.fallback_workers = self
@@ -2257,7 +2252,6 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             fallback_workers: batch.map(|b| b.fallback_workers).unwrap_or(0),
             programs: batch.map(|b| b.programs).unwrap_or(0),
             native: batch.map(|b| b.native).unwrap_or(0),
-            lowered: batch.map(|b| b.lowered).unwrap_or(0),
             fallbacks: batch.map(|b| b.fallbacks).unwrap_or(0),
             fit_host_s: self.fit_host_ms / 1000.0,
             fit_fallback_s: self.fit_fallback_ms / 1000.0,
@@ -2758,14 +2752,13 @@ fn eval_pipeline_jobs(
     if pop.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    // #121: the overlap path uses the same lowering and reports the same
-    // supported/lowered/unsupported split as the synchronous path.
+    // #121: the overlap path reports the same native/unsupported split as the
+    // synchronous path.
     // #131: it also reports the opcodes of the programs actually uploaded.
     let stats = g.stats.entry(generation).or_default();
     stats.generation = generation;
     stats.programs += pop.len();
     stats.native += pop.native();
-    stats.lowered += pop.lowered();
     stats.fallbacks += pop.unsupported();
     stats.unsupported_programs += pop.unsupported();
     for (name, n) in pop.opcode_usage() {
@@ -5434,8 +5427,6 @@ pub struct GpuGenStats {
     pub programs: usize,
     /// #121: compiled programs the kernel accepted verbatim.
     pub native: usize,
-    /// #121: compiled programs that needed the exact lowering pass.
-    pub lowered: usize,
     /// Candidates sent to the CPU fallback in the same batch.
     pub fallbacks: usize,
     /// #121: alias of `fallbacks`, matching the issue's JSON name.
@@ -6010,7 +6001,7 @@ fn postfix_variation_for(cfg: &Config, train: &Sample) -> Result<Variation, Stri
 ///
 /// The run-level counters are monotone, so subtracting a snapshot from the one
 /// taken at the next generation boundary gives that generation's share without
-/// adding a second accounting path. `programs`/`native`/`lowered`/`fallbacks`
+/// adding a second accounting path. `programs`/`native`/`fallbacks`
 /// come from the batch stats keyed by generation and are therefore not
 /// subtracted.
 #[derive(Clone, Debug, Default)]
@@ -6026,7 +6017,6 @@ pub struct GpuSnapshot {
     pub fallback_workers: usize,
     pub programs: usize,
     pub native: usize,
-    pub lowered: usize,
     pub fallbacks: usize,
     /// #256: whole fit stage wall (device call, CPU fallback, write-back).
     pub fit_host_s: f64,
@@ -6063,7 +6053,6 @@ impl GpuSnapshot {
             fallback_workers: self.fallback_workers.max(earlier.fallback_workers),
             programs: self.programs,
             native: self.native,
-            lowered: self.lowered,
             fallbacks: self.fallbacks,
             fit_host_s: (self.fit_host_s - earlier.fit_host_s).max(0.0),
             fit_fallback_s: (self.fit_fallback_s - earlier.fit_fallback_s).max(0.0),
@@ -6204,7 +6193,6 @@ fn dev_generation(
         wall_s: g.accounting.wall_s,
         duty: g.accounting.duty_cycle(),
         native: g.native,
-        lowered: g.lowered,
         fallbacks: g.fallbacks,
         fallback_s: g.fallback_s,
         fallback_workers: g.fallback_workers,
@@ -6418,7 +6406,6 @@ fn run_postfix_search(
             opcodes: Default::default(),
             programs: n_islands * pop,
             native: n_islands * pop,
-            lowered: 0,
             fallbacks: 0,
             unsupported_programs: 0,
             fallback_seconds: 0.0,
@@ -6511,7 +6498,6 @@ fn run_postfix_search(
             // entry, not the (empty) node-path one, describes this batch.
             if let (Some(g), Some(gs)) = (rec.gpu.as_mut(), gpu_stats.last()) {
                 g.native = gs.native;
-                g.lowered = gs.lowered;
                 g.fallbacks = gs.fallbacks;
             }
             report(&rec);

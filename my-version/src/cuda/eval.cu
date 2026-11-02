@@ -82,6 +82,9 @@ enum {
     OP_OR = 40,
     OP_XOR = 41,
     OP_NOT = 42,
+    OP_ASINH = 43,
+    OP_ACOSH = 44,
+    OP_ATANH = 45,
     OP_HALT = 255
 };
 
@@ -768,6 +771,9 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
                 case OP_NOT:
                     r = isnan(a) ? CUDART_NAN_F : (a > 0.0f ? 0.0f : 1.0f);
                     break;
+                case OP_ASINH: r = asinhf(a); break;
+                case OP_ACOSH: r = (a >= 1.0f) ? acoshf(a) : CUDART_NAN_F; break;
+                case OP_ATANH: r = (fabsf(a) < 1.0f) ? atanhf(a) : CUDART_NAN_F; break;
                 default: r = CUDART_NAN_F; break;
             }
             s[sp - 1] = r;

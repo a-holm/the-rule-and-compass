@@ -16,7 +16,7 @@
 //! * FP32 throughout, because on both the RTX 3060 and the GB10 in the DGX Spark
 //!   FP64 runs at 1/64 of FP32.
 
-use crate::expr::{constant, node, Node, Op};
+use crate::expr::{Node, Op};
 use crate::gpu_stats::GpuStats;
 use crate::metrics::{ScoreObjective, ScoreStatus};
 
@@ -70,6 +70,9 @@ pub const OP_AND: u32 = 39;
 pub const OP_OR: u32 = 40;
 pub const OP_XOR: u32 = 41;
 pub const OP_NOT: u32 = 42;
+pub const OP_ASINH: u32 = 43;
+pub const OP_ACOSH: u32 = 44;
+pub const OP_ATANH: u32 = 45;
 pub const OP_HALT: u32 = 255;
 
 /// `(name, opcode)` for the enum-consistency test and for the per-generation
@@ -118,6 +121,9 @@ const OPCODE_TABLE: &[(&str, u32)] = &[
     ("OP_OR", OP_OR),
     ("OP_XOR", OP_XOR),
     ("OP_NOT", OP_NOT),
+    ("OP_ASINH", OP_ASINH),
+    ("OP_ACOSH", OP_ACOSH),
+    ("OP_ATANH", OP_ATANH),
     ("OP_HALT", OP_HALT),
 ];
 
@@ -127,10 +133,9 @@ const OPCODE_TABLE: &[(&str, u32)] = &[
 /// device through the normal path.
 pub const RC_MAX_STACK: usize = 64;
 
-/// #121: host gate for emitted programs. Lowering can expand a tree, so the
-/// static peak stack is checked after [`lower`] and before a single word is
-/// appended. The 8-slot margin leaves room for an opcode that pushes an
-/// intermediate the pass did not model.
+/// #121: host gate for emitted programs. The static peak stack is checked before
+/// a single word is appended. The 8-slot margin leaves room for an opcode that
+/// pushes an intermediate the peak model does not count.
 pub const HOST_MAX_STACK: usize = 56;
 
 /// The kernel's operand stack (`RC_MAX_STACK` in `eval.cu`), less the headroom
@@ -141,10 +146,10 @@ const MAX_PROGRAM_STACK: usize = HOST_MAX_STACK;
 /// Why a tree cannot run on the kernel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompileError {
-    /// The operator has no kernel opcode even after [`lower`]: `asinh`,
-    /// `acosh`, `atanh`, constraints, aggregates and custom blocks.
+    /// The operator has no kernel opcode: constraints, aggregates and custom
+    /// blocks.
     Unsupported(&'static str),
-    /// The lowered postfix program would use more operand-stack slots than the
+    /// The postfix program would use more operand-stack slots than the
     /// kernel has (`RC_MAX_STACK`).
     StackOverflow { peak: usize, limit: usize },
 }
@@ -168,7 +173,6 @@ impl std::fmt::Display for CompileError {
 pub struct CompiledProgram {
     words: Vec<u32>,
     opcodes: Vec<(String, usize)>,
-    lowered: bool,
 }
 
 impl CompiledProgram {
@@ -182,22 +186,16 @@ impl CompiledProgram {
     pub fn opcodes(&self) -> &[(String, usize)] {
         &self.opcodes
     }
-
-    /// Whether [`lower`] had to rewrite the tree before emission (#121).
-    pub fn lowered(&self) -> bool {
-        self.lowered
-    }
 }
 
 /// Compile one expression through the one guarded entry point every caller must
-/// use: [`lower`] first, then the operand-stack guard, then emission.
+/// use: the operand-stack guard, then emission.
 ///
 /// `compile_program` is what both the search's pool batch and
 /// [`Population::add`] call, so the two paths cannot disagree about which
 /// operators are native or how deep a program may be.
 pub fn compile_program(tree: &Node) -> Result<CompiledProgram, CompileError> {
-    let lowered = lower(tree);
-    let peak = peak_stack(&lowered);
+    let peak = peak_stack(tree);
     if peak > MAX_PROGRAM_STACK {
         return Err(CompileError::StackOverflow {
             peak,
@@ -205,36 +203,25 @@ pub fn compile_program(tree: &Node) -> Result<CompiledProgram, CompileError> {
         });
     }
     let mut words = Vec::new();
-    if !emit(&lowered, &mut words) {
-        let op = first_unsupported(&lowered).unwrap_or("operator");
+    if !emit(tree, &mut words) {
+        let op = first_unsupported(tree).unwrap_or("operator");
         return Err(CompileError::Unsupported(op));
     }
     words.push(OP_HALT);
     let opcodes = count_opcodes(&words);
-    Ok(CompiledProgram {
-        words,
-        opcodes,
-        lowered: lowered != *tree,
-    })
-}
-
-/// #121 compatibility wrapper over [`compile_program`]: emit into `out` and
-/// report whether [`lower`] rewrote the tree. `None` means the tree is
-/// unsupported or over-deep and must go to the CPU fallback.
-pub fn compile_with_report(n: &Node, out: &mut Vec<u32>) -> Option<bool> {
-    match compile_program(n) {
-        Ok(c) => {
-            out.extend_from_slice(c.words());
-            Some(c.lowered)
-        }
-        Err(_) => None,
-    }
+    Ok(CompiledProgram { words, opcodes })
 }
 
 /// Compile one expression to postfix bytecode. Returns `false` if the tree uses
-/// an operator the kernel does not implement even after [`lower`].
+/// an operator the kernel does not implement or is over-deep.
 pub fn compile(n: &Node, out: &mut Vec<u32>) -> bool {
-    compile_with_report(n, out).is_some()
+    match compile_program(n) {
+        Ok(c) => {
+            out.extend_from_slice(c.words());
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// The first operator (in tree order) that [`emit`] does not handle.
@@ -267,6 +254,9 @@ fn first_unsupported(n: &Node) -> Option<&'static str> {
             | Erf
             | Erfc
             | Not
+            | Asinh
+            | Acosh
+            | Atanh
             | Add
             | Sub
             | Mul
@@ -313,37 +303,6 @@ fn count_opcodes(words: &[u32]) -> Vec<(String, usize)> {
         .collect()
 }
 
-/// #121: rewrite operators the kernel lacks into exact equivalents over the
-/// supported instruction set. The identities below are exact for finite values
-/// (NaN semantics differ for a few, so search results are always verified by
-/// the f64 CPU scorer before they are reported).
-fn lower(n: &Node) -> Node {
-    use Op::*;
-    if matches!(n.op, Const | Input) {
-        return n.clone();
-    }
-    let k: Vec<Node> = n.kids.iter().map(lower).collect();
-    match n.op {
-        Asinh => {
-            // odd form: the naive ln(x + sqrt(x^2+1)) is wrong for negative x
-            let x = k[0].clone();
-            let sgn = node(Sub, vec![node(Step, vec![x.clone()]), node(Step, vec![node(Neg, vec![x.clone()])])]);
-            let mag = node(Ln, vec![node(Add, vec![node(Abs, vec![x.clone()]), node(Sqrt, vec![node(Add, vec![node(Mul, vec![x.clone(), x]), constant(1.0)])])])]);
-            node(Mul, vec![sgn, mag])
-        }
-        Acosh => {
-            // factored (x-1)(x+1) survives x -> 1 in f32
-            let x = k[0].clone();
-            node(Ln, vec![node(Add, vec![x.clone(), node(Sqrt, vec![node(Mul, vec![node(Sub, vec![x.clone(), constant(1.0)]), node(Add, vec![x, constant(1.0)])])])])])
-        }
-        Atanh => {
-            let x = k[0].clone();
-            node(Mul, vec![constant(0.5), node(Ln, vec![node(Div, vec![node(Add, vec![constant(1.0), x.clone()]), node(Sub, vec![constant(1.0), x])])])])
-        }
-        _ => node(n.op, k),
-    }
-}
-
 /// Emit the opcodes for a subtree. The `HALT` terminator is added only by
 /// [`compile`], once, at the end of the whole program.
 fn emit(n: &Node, out: &mut Vec<u32>) -> bool {
@@ -364,7 +323,7 @@ fn emit(n: &Node, out: &mut Vec<u32>) -> bool {
             true
         },
         Exp | Ln | Abs | Sqrt | Sin | Cos | Tan | Sinh | Cosh | Tanh | Logistic | Step | Gauss
-        | Square | Cube | Floor | Ceil | Round | Sign | Erf | Erfc | Not => {
+        | Square | Cube | Floor | Ceil | Round | Sign | Erf | Erfc | Not | Asinh | Acosh | Atanh => {
             let op = match n.op {
                 Exp => OP_EXP,
                 Ln => OP_LOG,
@@ -388,6 +347,9 @@ fn emit(n: &Node, out: &mut Vec<u32>) -> bool {
                 Erf => OP_ERF,
                 Erfc => OP_ERFC,
                 Not => OP_NOT,
+                Asinh => OP_ASINH,
+                Acosh => OP_ACOSH,
+                Atanh => OP_ATANH,
                 _ => unreachable!(),
             };
             emit(&n.kids[0], out) && {
@@ -439,8 +401,7 @@ fn emit(n: &Node, out: &mut Vec<u32>) -> bool {
 
 /// #122: the kernel opcode and arity of an operator that is emitted directly.
 ///
-/// `Const`/`Input` are terminals, not operators; `Asinh`/`Acosh`/`Atanh` are
-/// lowered to exact equivalents by [`compile`], and aggregates, meta nodes,
+/// `Const`/`Input` are terminals, not operators; aggregates, meta nodes,
 /// constraints and custom blocks have no kernel opcode. This function returns
 /// `None` for all of those so a caller can reject a configuration instead of
 /// silently producing a program the kernel cannot evaluate.
@@ -470,6 +431,9 @@ pub fn postfix_opcode(op: Op) -> Option<(u32, usize)> {
         Erf => (OP_ERF, 1),
         Erfc => (OP_ERFC, 1),
         Not => (OP_NOT, 1),
+        Asinh => (OP_ASINH, 1),
+        Acosh => (OP_ACOSH, 1),
+        Atanh => (OP_ATANH, 1),
         Add => (OP_ADD, 2),
         Sub => (OP_SUB, 2),
         Mul => (OP_MUL, 2),
@@ -499,7 +463,7 @@ pub fn opcode_arity(code: u32) -> Option<usize> {
     Some(match code {
         OP_NEG | OP_EXP | OP_LOG | OP_ABS | OP_SQRT | OP_SIN | OP_COS | OP_TAN | OP_SINH
         | OP_COSH | OP_TANH | OP_SIG | OP_STEP | OP_GAUSS | OP_SQUARE | OP_CUBE | OP_FLOOR
-        | OP_CEIL | OP_ROUND | OP_SIGN | OP_ERF | OP_ERFC | OP_NOT => 1,
+        | OP_CEIL | OP_ROUND | OP_SIGN | OP_ERF | OP_ERFC | OP_NOT | OP_ASINH | OP_ACOSH | OP_ATANH => 1,
         OP_ADD | OP_SUB | OP_MUL | OP_DIV | OP_POW | OP_MOD | OP_ATAN2 | OP_MIN | OP_MAX
         | OP_EQUAL | OP_LESS | OP_LESS_OR_EQUAL | OP_GREATER | OP_GREATER_OR_EQUAL | OP_AND
         | OP_OR | OP_XOR => 2,
@@ -535,6 +499,9 @@ pub fn opcode_op(code: u32) -> Option<Op> {
         OP_ERF => Erf,
         OP_ERFC => Erfc,
         OP_NOT => Not,
+        OP_ASINH => Asinh,
+        OP_ACOSH => Acosh,
+        OP_ATANH => Atanh,
         OP_ADD => Add,
         OP_SUB => Sub,
         OP_MUL => Mul,
@@ -1221,9 +1188,6 @@ pub struct Population {
     prog: Vec<u32>,
     offsets: Vec<u32>,
     unsupported: usize,
-    /// #121: programs that needed the exact lowering pass. The rest were
-    /// accepted verbatim, so `native + lowered + unsupported == added`.
-    lowered: usize,
     /// #131: operator occurrences, used for the per-generation `--json` report.
     ops: std::collections::BTreeMap<String, usize>,
 }
@@ -1235,7 +1199,6 @@ impl Population {
             prog: Vec::new(),
             offsets: vec![0],
             unsupported: 0,
-            lowered: 0,
             ops: std::collections::BTreeMap::new(),
         }
     }
@@ -1251,9 +1214,6 @@ impl Population {
                 return false;
             }
         };
-        if compiled.lowered {
-            self.lowered += 1;
-        }
         for (name, n) in compiled.opcodes {
             *self.ops.entry(name).or_default() += n;
         }
@@ -1289,14 +1249,9 @@ impl Population {
         self.unsupported
     }
 
-    /// #121: compiled programs that needed the exact lowering pass.
-    pub fn lowered(&self) -> usize {
-        self.lowered
-    }
-
     /// #121: compiled programs the kernel accepted verbatim.
     pub fn native(&self) -> usize {
-        self.len() - self.lowered
+        self.len()
     }
 
     /// The raw `(program bytes, offsets)` pair, e.g. for [`GpuEvaluator::eval_batch`].
@@ -4045,31 +4000,30 @@ mod tests {
     }
 
     /// #121: a mixed population keeps its order and reports the
-    /// native/lowered/unsupported split. The two GPU programs must score in
+    /// native/unsupported split. The two GPU programs must score in
     /// insertion order, exactly where the caller will merge them.
     #[test]
-    fn mixed_population_keeps_order_and_counts_lowered() {
+    fn mixed_population_keeps_order_and_counts_native() {
         let (cols, n, nv, y, trees) = fixture();
         let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
             Some(ev) => ev,
             None => return,
         };
         let native = node(Op::If, vec![input(0), constant(1.0), constant(2.0)]);
-        let lowered = node(Op::Asinh, vec![input(0)]);
+        let asinh = node(Op::Asinh, vec![input(0)]);
         let unsupported = node(Op::Require, vec![trees[0].clone()]);
         let mut pop = Population::new();
         assert!(pop.add(&trees[0]));
         assert!(!pop.add(&unsupported));
         assert!(pop.add(&native));
-        assert!(pop.add(&lowered));
+        assert!(pop.add(&asinh));
         assert_eq!(pop.len(), 3);
-        assert_eq!(pop.native(), 2, "the fixture tree and `if` are accepted verbatim");
-        assert_eq!(pop.lowered(), 1, "asinh needs the lowering pass");
+        assert_eq!(pop.native(), 3, "the fixture tree, `if` and `asinh` have native opcodes");
         assert_eq!(pop.unsupported(), 1);
         let (sse, ms) = ev.eval_population(&pop);
         assert!(ms >= 0.0);
         assert_eq!(sse.len(), 3);
-        for (slot, tree) in [&trees[0], &native, &lowered].iter().enumerate() {
+        for (slot, tree) in [&trees[0], &native, &asinh].iter().enumerate() {
             let cpu = cpu_sse(tree, &cols, n, nv, &y);
             let rel = (sse[slot] as f64 - cpu).abs() / (1.0 + cpu.abs());
             assert!(
@@ -4702,33 +4656,19 @@ mod tests {
         );
     }
 
-    /// #121: a deep tree that needs lowering is still rejected statically
-    /// before any word is emitted (the lowering pass can add nodes).
+    /// #121: a deep tree is rejected statically before any word is emitted.
     #[test]
-    fn deep_lowered_tree_is_rejected_before_emission() {
-        // asinh expands into ~10 nodes; wrapping it 8 times raises the peak
-        // stack past the host gate.
-        let mut t = input(0);
-        for _ in 0..8 {
-            t = node(Op::Asinh, vec![t]);
+    fn deep_tree_is_rejected_before_emission() {
+        // A right-deep add chain grows one stack slot per level.
+        let mut deep = input(0);
+        for _ in 0..HOST_MAX_STACK {
+            deep = node(Op::Add, vec![input(1), deep]);
         }
-        if peak_stack(&lower(&t)) <= HOST_MAX_STACK {
-            // 8 nested expansions are not deep enough on this build; use a
-            // right-deep add chain, which grows one stack slot per level.
-            let mut deep = input(0);
-            for _ in 0..HOST_MAX_STACK {
-                deep = node(Op::Add, vec![input(1), deep]);
-            }
-            assert!(peak_stack(&deep) > HOST_MAX_STACK);
-            let mut pop = Population::new();
-            assert!(!pop.add(&deep));
-            assert_eq!(pop.unsupported(), 1);
-            return;
-        }
+        assert!(peak_stack(&deep) > HOST_MAX_STACK);
         let mut pop = Population::new();
-        assert!(!pop.add(&t), "an over-deep lowered tree must not be emitted");
+        assert!(!pop.add(&deep), "an over-deep tree must not be emitted");
         assert_eq!(pop.unsupported(), 1);
-        assert_eq!(pop.lowered(), 0, "nothing may be counted as emitted");
+        assert_eq!(pop.len(), 0, "nothing may be counted as emitted");
     }
 
     /// #121: the host stack constant must match `RC_MAX_STACK` in the kernel.
@@ -5073,10 +5013,8 @@ mod tests {
             compile_program(&deep),
             Err(CompileError::StackOverflow { .. })
         ));
-        // `asinh` is lowered, not rejected, so both paths agree.
-        let lowered = compile_program(&node(Op::Asinh, vec![input(0)])).unwrap();
-        assert!(lowered.opcodes().iter().any(|(n, _)| n.as_str() == "OP_LOG"));
-        assert!(lowered.opcodes().iter().all(|(n, _)| n.as_str() != "OP_ASINH"));
+        let asinh = compile_program(&node(Op::Asinh, vec![input(0)])).unwrap();
+        assert_eq!(asinh.opcodes(), &[("OP_ASINH".to_string(), 1)]);
     }
 
     fn ulp_key(x: f32) -> i64 {
@@ -5271,6 +5209,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #590: `asinh`, `acosh` and `atanh` are native opcodes. Device values
+    /// match the f64 CPU evaluator within 4 f32 ULP where it is finite and are
+    /// non-finite exactly where it is.
+    #[test]
+    fn hyperbolic_inverses_are_native() {
+        let trees: Vec<Node> = [Op::Asinh, Op::Acosh, Op::Atanh]
+            .iter()
+            .map(|&op| node(op, vec![input(0)]))
+            .collect();
+        for (tree, want) in trees.iter().zip(["OP_ASINH", "OP_ACOSH", "OP_ATANH"]) {
+            let c = compile_program(tree).expect("a native operator compiles");
+            assert_eq!(c.opcodes(), &[(want.to_string(), 1)], "{want} is emitted as is");
+        }
+        let mut a: Vec<f32> = vec![0.0, -0.0, 1.0 + 1e-3, 10.0, 2e19, 1e30, 1.0, -1.0];
+        for m in [1e-30f32, 1e-8, 5e-8, 1e-4, 0.5, 0.999] {
+            a.push(m);
+            a.push(-m);
+        }
+        a.push(f32::from_bits(1.0f32.to_bits() + 1));
+        a.push(f32::from_bits(1.0f32.to_bits() - 1));
+        a.push(f32::from_bits(1));
+        a.push(f32::NAN);
+        a.push(f32::INFINITY);
+        a.push(f32::NEG_INFINITY);
+        let n = a.len();
+        let y = vec![0.0f32; n];
+        let Some(preds) = raw_predictions(&a, n, 1, &y, &trees) else {
+            return;
+        };
+        for (k, (tree, name)) in trees.iter().zip(["asinh", "acosh", "atanh"]).enumerate() {
+            for i in 0..n {
+                let got = preds[k * n + i];
+                let want64 = crate::expr::eval(tree, &[a[i] as f64]);
+                if !want64.is_finite() {
+                    assert!(
+                        !got.is_finite(),
+                        "{name}({:e}): CPU {want64}, device {got}",
+                        a[i]
+                    );
+                    if want64.is_infinite() {
+                        assert_eq!(got, want64 as f32, "{name}({:e}): infinity sign", a[i]);
+                    }
+                    continue;
+                }
+                let want = want64 as f32;
+                assert!(got.is_finite(), "{name}({:e}): CPU {want64}, device {got}", a[i]);
+                let d = ulp_diff(got, want);
+                assert!(
+                    d <= 4,
+                    "{name}({:e}): device {got:e} vs CPU {want:e}, {d} ULP",
+                    a[i]
+                );
+            }
+        }
+    }
+
+    /// #590: `ln(asinh(u))` for tiny `u` is finite on the device and scores
+    /// like the CPU. The old f32 lowering returned `asinh(u) = 0` below 6e-8
+    /// and so `ln(0)`.
+    #[test]
+    fn ln_of_small_asinh_is_finite() {
+        let cols: Vec<f32> = vec![1e-9, 1e-8, 5e-8];
+        let n = cols.len();
+        let y = vec![0.0f32; n];
+        let tree = node(Op::Ln, vec![node(Op::Asinh, vec![input(0)])]);
+        let mut ev = match evaluator_or_skip(&cols, n, 1, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let pop = Population::from_trees([&tree]);
+        let (sse, _) = ev.eval_population(&pop);
+        let cpu = cpu_sse(&tree, &cols, n, 1, &y);
+        assert!(cpu.is_finite() && cpu < 1e30, "CPU score {cpu}");
+        assert!(sse[0].is_finite() && sse[0] < 1e30, "device score {}", sse[0]);
+        let rel = (sse[0] as f64 - cpu).abs() / cpu;
+        assert!(rel < 1e-6, "device {} vs CPU {cpu} (relative {rel:.2e})", sse[0]);
     }
 
     /// #131 acceptance: the special-value cases named in the issue, asserted
@@ -5478,93 +5494,36 @@ mod tests {
     }
 }
 
-
-#[cfg(test)]
-mod lower_tests {
+mod native_operator_tests {
     use super::*;
-    use crate::expr::{eval, input};
-
-    fn close(a: f64, b: f64) {
-        if a.is_nan() && b.is_nan() { return; }
-        assert!((a - b).abs() <= 1e-9 * (1.0 + a.abs().max(b.abs())), "{a} vs {b}");
-    }
-
-    fn check(t: Node, rows: &[Vec<f64>]) {
-        let l = lower(&t);
-        let mut buf = Vec::new();
-        assert!(compile(&l, &mut buf), "lowered tree must compile");
-        for r in rows {
-            close(eval(&t, r), eval(&l, r));
-        }
-    }
+    use crate::expr::{constant, input, node, Op};
 
     #[test]
-    fn lowered_operators_match_the_cpu() {
-        let rows = [
-            vec![-2.0, -0.5], vec![-0.5, 0.0], vec![0.0, 0.0],
-            vec![0.25, 0.75], vec![1.5, 2.0], vec![3.0, -1.0],
-        ];
+    fn every_emitted_operator_compiles_without_a_rewrite() {
         let x = || input(0);
         let y = || input(1);
-        check(node(Op::Min, vec![x(), y()]), &rows);
-        check(node(Op::Max, vec![x(), y()]), &rows);
-        check(node(Op::If, vec![x(), y(), node(Op::Neg, vec![y()])]), &rows);
-        check(node(Op::Sign, vec![x()]), &rows);
-        check(node(Op::Less, vec![x(), y()]), &rows);
-        check(node(Op::LessOrEqual, vec![x(), y()]), &rows);
-        check(node(Op::Greater, vec![x(), y()]), &rows);
-        check(node(Op::GreaterOrEqual, vec![x(), y()]), &rows);
-        check(node(Op::Equal, vec![x(), y()]), &rows);
-        check(node(Op::And, vec![x(), y()]), &rows);
-        check(node(Op::Or, vec![x(), y()]), &rows);
-        check(node(Op::Xor, vec![x(), y()]), &rows);
-        check(node(Op::Not, vec![x()]), &rows);
-        check(node(Op::Asinh, vec![x()]), &rows);
-        check(node(Op::Atanh, vec![node(Op::Div, vec![x(), constant(4.0)])]), &rows);
-    }
-
-    #[test]
-    fn acosh_matches_on_its_domain() {
-        let t = node(Op::Acosh, vec![input(0)]);
-        let l = lower(&t);
-        for x in [1.0, 1.5, 2.0, 10.0] {
-            close(eval(&t, &[x]), eval(&l, &[x]));
+        let cases = [
+            (node(Op::Min, vec![x(), y()]), "OP_MIN"),
+            (node(Op::Max, vec![x(), y()]), "OP_MAX"),
+            (node(Op::If, vec![x(), y(), node(Op::Neg, vec![y()])]), "OP_IF"),
+            (node(Op::Sign, vec![x()]), "OP_SIGN"),
+            (node(Op::Less, vec![x(), y()]), "OP_LESS"),
+            (node(Op::LessOrEqual, vec![x(), y()]), "OP_LESS_OR_EQUAL"),
+            (node(Op::Greater, vec![x(), y()]), "OP_GREATER"),
+            (node(Op::GreaterOrEqual, vec![x(), y()]), "OP_GREATER_OR_EQUAL"),
+            (node(Op::Equal, vec![x(), y()]), "OP_EQUAL"),
+            (node(Op::And, vec![x(), y()]), "OP_AND"),
+            (node(Op::Or, vec![x(), y()]), "OP_OR"),
+            (node(Op::Xor, vec![x(), y()]), "OP_XOR"),
+            (node(Op::Not, vec![x()]), "OP_NOT"),
+            (node(Op::Asinh, vec![x()]), "OP_ASINH"),
+            (node(Op::Acosh, vec![x()]), "OP_ACOSH"),
+            (node(Op::Atanh, vec![node(Op::Div, vec![x(), constant(4.0)])]), "OP_ATANH"),
+        ];
+        for (t, name) in cases {
+            let c = compile_program(&t).expect("the operator compiles");
+            assert!(c.opcodes().iter().any(|(n, _)| n == name), "{name} is emitted");
         }
-    }
-}
-
-#[cfg(test)]
-mod lower_extreme_tests {
-    use super::*;
-    use crate::expr::{constant, eval, input, node, Op};
-
-    #[test]
-    fn min_max_do_not_add_operands() {
-        let cases = [(1e8, 1.0), (3e38, -3e38), (1.0, 1.0), (-0.0, 0.0)];
-        for (a, b) in cases {
-            let mn = node(Op::Min, vec![constant(a), constant(b)]);
-            let mx = node(Op::Max, vec![constant(a), constant(b)]);
-            assert_eq!(eval(&lower(&mn), &[]), a.min(b));
-            assert_eq!(eval(&lower(&mx), &[]), a.max(b));
-        }
-    }
-
-    #[test]
-    fn if_is_exact_for_extreme_arms() {
-        let t = node(Op::If, vec![input(0), constant(1.0), constant(1e8)]);
-        let l = lower(&t);
-        for (x, want) in [(1.0, 1.0), (-1.0, 1e8), (0.0, 1e8)] {
-            assert_eq!(eval(&l, &[x]), want);
-        }
-    }
-
-    #[test]
-    fn asinh_negative_uses_the_odd_form() {
-        let t = node(Op::Asinh, vec![input(0)]);
-        let l = lower(&t);
-        let a = eval(&t, &[-1e8]);
-        let b = eval(&l, &[-1e8]);
-        assert!((a - b).abs() < 1e-6, "{a} vs {b}");
     }
 
     #[test]

@@ -878,11 +878,11 @@ SEARCH:
                              synchronous). Results and archive are identical;
                              only effective with --gpu
                              Programs with no device opcode (constraints,
-                             aggregates, blocks the lowerer cannot rewrite) are
+                             aggregates, custom blocks) are
                              scored by a bounded CPU worker pool, never on the
                              scoring thread; RCSR_CPU_FALLBACK_THREADS sets its
                              size (default min(cores, 8)). --json reports each
-                             generation's native/lowered/unsupported counts and
+                             generation's native/unsupported counts and
                              fallback seconds
   --variation auto|node|postfix
                              variation engine. auto (default) uses the flat
@@ -1343,12 +1343,11 @@ fn gpu_json(
         .iter()
         .map(|s| {
             format!(
-                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_admitted_wide\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_improved\":{},\"fit_fallback_improved_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"opcodes\":{{{}}}}}",
+                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_admitted_wide\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_improved\":{},\"fit_fallback_improved_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"opcodes\":{{{}}}}}",
                 s.generation,
                 s.programs,
                 s.native,
-                s.native + s.lowered,
-                s.lowered,
+                s.native,
                 s.fallbacks,
                 s.unsupported_programs,
                 jnum(s.fallback_seconds),
@@ -1370,12 +1369,11 @@ fn gpu_json(
         .collect();
     // #121: `gpu.totals` aggregates the per-generation counters over the run.
     let mut total_ops = std::collections::BTreeMap::new();
-    let (mut t_programs, mut t_native, mut t_lowered, mut t_fallbacks) = (0usize, 0usize, 0usize, 0usize);
+    let (mut t_programs, mut t_native, mut t_fallbacks) = (0usize, 0usize, 0usize);
     let (mut t_unsupported, mut t_seconds, mut t_workers) = (0usize, 0.0f64, 0usize);
     for s in &g.generations {
         t_programs += s.programs;
         t_native += s.native;
-        t_lowered += s.lowered;
         t_fallbacks += s.fallbacks;
         t_unsupported += s.unsupported_programs;
         t_seconds += s.fallback_seconds;
@@ -1385,11 +1383,10 @@ fn gpu_json(
         }
     }
     let totals = format!(
-        "{{\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"opcodes\":{{{}}}}}",
+        "{{\"programs\":{},\"native\":{},\"supported\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"opcodes\":{{{}}}}}",
         t_programs,
         t_native,
-        t_native + t_lowered,
-        t_lowered,
+        t_native,
         t_fallbacks,
         t_unsupported,
         jnum(t_seconds),
