@@ -5494,6 +5494,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 mod native_operator_tests {
     use super::*;
     use crate::expr::{constant, input, node, Op};
