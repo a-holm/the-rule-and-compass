@@ -231,7 +231,7 @@ Emitted at the same boundary as `--progress`, once per completed generation
 | `variation.fitted` | full | offspring whose constants were fitted on the CPU |
 | `variation.refits` | full | exact CPU refits of carried/promoted survivors |
 | `variation.dedup_rate` | full | `duplicates / attempts` |
-| `variation.reevals` | full | #500: carried individuals scored again over every training row at the start of the generation: pending (`NaN`) ones, and `+inf` ones whose first 2048 rows are all finite. A `+inf` individual with a non-finite prediction in those rows, or one the dimension filter rejects, stays `+inf` without the pass. The probe covers the plain unweighted metrics; every other shape takes the full pass |
+| `variation.reevals` | full | #500: carried individuals scored again over every training row at the start of the generation: pending (`NaN`) ones, and `+inf` ones that the CPU has not confirmed on the current rows and whose first 2048 rows are all finite. A `+inf` individual stays `+inf` without the pass when the CPU confirmed it on the same rows (a CPU score, the CPU check of a device `+inf`, or a dimension rejection) and simplification leaves its tree unchanged, or when a non-finite prediction shows in those rows. Changed rows (`--predictor-samples` redraw, a resume) and `--qd-bins` runs take the full pass |
 | `variation.constant_rejected` | full | offspring rejected before the fit because no input reaches the rows outside an aggregate (`--reject-constant-offspring`; 0 without the flag) |
 | `qd` | full | `null` without `--qd`: `occupied`, `reachable`, `coverage`, `entropy` |
 | `convergence.percent_converged` | both | the #18 headline (`docs/convergence.md`) |

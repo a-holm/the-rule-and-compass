@@ -585,6 +585,7 @@ fn fit_and_score(
     fit: bool,
     defer_gpu: bool,
     counters: Option<&GenCounters>,
+    rows: Option<u64>, // #500: rows version of `train`, `None` for a subset
 ) -> Vec<Ind> {
     let t = counters.filter(|c| c.timed).map(|_| std::time::Instant::now());
     let workers = batch_workers(workers, trees.len(), train.sample.len());
@@ -598,11 +599,13 @@ fn fit_and_score(
             tree = expr::simplify(&tree);
         }
         // #26: with the GPU batch active the fitness is filled in later.
-        if defer_gpu {
+        let mut ind = if defer_gpu {
             Ind::pending(tree, cfg)
         } else {
             eval_counted(counters, || Ind::evaluated_fitted(tree, fitted, train, cfg)) // #25 #87 #211
-        }
+        };
+        ind.confirm_inf(rows);
+        ind
     });
     if let (Some(c), Some(t)) = (counters, t) {
         GenCounters::add(&c.batch_ns, t.elapsed().as_nanos().min(u64::MAX as u128) as u64);
@@ -851,9 +854,25 @@ struct Ind {
     descriptor: Option<qd::Descriptor>,
     /// #465: generations since the lineage began; only `--selection afp` reads it.
     age: u32,
+    /// #500: the rows version on which the CPU confirmed this individual's
+    /// `+inf` (a CPU score, a CPU check of a device `+inf`, or a dimension
+    /// rejection). `None` means unconfirmed. Any write of `error` clears it.
+    inf_rows: Option<u64>,
 }
 
 impl Ind {
+    fn set_error(&mut self, error: f64) {
+        self.error = error;
+        self.inf_rows = None;
+    }
+
+    /// #500: mark a `+inf` error as confirmed on the CPU for rows `rows`.
+    fn confirm_inf(&mut self, rows: Option<u64>) {
+        if self.error == f64::INFINITY {
+            self.inf_rows = rows;
+        }
+    }
+
     // #15: `fit_iters` lets a multi-output sample fit one constant vector per
     // output. #25: a dimensionally inconsistent candidate is rejected outright
     // when units are required (the predicate is a no-op otherwise).
@@ -903,6 +922,7 @@ impl Ind {
             complexity,
             descriptor,
             age: 0,
+            inf_rows: None,
         }
     }
 
@@ -929,6 +949,7 @@ impl Ind {
             // descriptor is filled by the archive's fallback path.
             descriptor: None,
             age: 0,
+            inf_rows: None,
         }
     }
 
@@ -946,7 +967,7 @@ impl Ind {
         } else {
             (f64::INFINITY, None)
         };
-        self.error = error;
+        self.set_error(error);
         self.descriptor = descriptor;
     }
 
@@ -965,6 +986,24 @@ impl Ind {
         }
         self.score_in_place(train, cfg);
         true
+    }
+
+    /// #500: `reeval_probing` for a carried individual whose `+inf` the CPU
+    /// already confirmed on these rows. The score is kept without a pass when
+    /// simplification leaves the tree unchanged. Records the confirmation after
+    /// any CPU probe or score.
+    fn reeval_carried(&mut self, train: &EvalSample, cfg: &Config, rows: Option<u64>) -> bool {
+        if rows.is_some() && self.inf_rows == rows && self.error == f64::INFINITY && cfg.qd_bins == 0 {
+            let simplified = expr::simplify(&self.tree);
+            if simplified == self.tree {
+                self.complexity = cfg.complexity_model.complexity(&simplified);
+                self.descriptor = None;
+                return false;
+            }
+        }
+        let scored = self.reeval_probing(train, cfg);
+        self.confirm_inf(rows);
+        scored
     }
 
     // #86: re-fit the constants on the current generation's fit rows *before*
@@ -1008,6 +1047,7 @@ impl Ind {
             // archive recomputes it on the resumed run like any other candidate.
             descriptor: None,
             age: ind.age,
+            inf_rows: None,
         }
     }
 }
@@ -1040,6 +1080,9 @@ struct GpuSearch {
     pool: Option<crate::genome::GenomePool>,
     /// #131: per-generation opcode/fallback counts.
     stats: BTreeMap<usize, GpuGenStats>,
+    /// #500: rows version of the sample the next `score` call scores on, set
+    /// by the caller; a CPU-confirmed `+inf` is recorded against it.
+    rows_version: u64,
     /// #121: persistent bounded CPU pool for unsupported programs.
     fallback: Option<FallbackPool>,
     /// #169: batched GPU-fit outcomes for this run.
@@ -1343,6 +1386,7 @@ impl GpuSearch {
                     fit_sub,
                     pool: None,
                     stats: BTreeMap::new(),
+                    rows_version: 0,
                     fallback: Some(FallbackPool::new(fallback_workers(), fallback_workers())),
                     fit_attempts: 0,
                     fit_gpu: 0,
@@ -1889,6 +1933,11 @@ impl GpuSearch {
                 cfg.accepts_dimensions(tree) && nonfinite_prefix(tree, &rows, cfg) != Some(true)
             })
             .collect();
+        // Every slot outside `full` is `+inf` on the CPU: rejected by the
+        // dimension filter or non-finite in the probed prefix.
+        for &(i, j) in slots {
+            islands[i][j].confirm_inf(Some(self.rows_version));
+        }
         let stats = self.stats.entry(generation).or_default();
         stats.nonfinite += slots.len();
         stats.nonfinite_full += full.len();
@@ -1908,7 +1957,8 @@ impl GpuSearch {
         let stats = self.stats.entry(generation).or_default();
         for (&(i, j), e) in full.iter().zip(errors) {
             stats.nonfinite_cpu_finite += e.is_finite() as usize;
-            islands[i][j].error = e;
+            islands[i][j].set_error(e);
+            islands[i][j].confirm_inf(Some(self.rows_version));
         }
         stats.nonfinite_seconds += seconds;
         self.ledger.record_eval_fallback(full.len() as u64, seconds);
@@ -1997,7 +2047,7 @@ impl GpuSearch {
                         if value.is_none() {
                             nonfinite.push((i, j));
                         }
-                        islands[i][j].error = value.unwrap_or(f64::INFINITY);
+                        islands[i][j].set_error(value.unwrap_or(f64::INFINITY));
                     }
                     self.device_eval_used = true;
                 }
@@ -2017,7 +2067,8 @@ impl GpuSearch {
                 .finish(ticket);
             if gpu_error.is_none() {
                 for (&(i, j), e) in on_cpu.iter().zip(errors.iter()) {
-                    islands[i][j].error = *e;
+                    islands[i][j].set_error(*e);
+                    islands[i][j].confirm_inf(Some(self.rows_version));
                 }
             }
             let stats = self.stats.entry(generation).or_default();
@@ -2187,12 +2238,13 @@ impl GpuSearch {
                     // Ok value is already the configured statistic (mean, RSS +
                     // penalty, max, 1-rho or a weighted classification mean),
                     // never an SSE to divide by n.
-                    islands[i][j].error = if status.is_ok() {
+                    let error = if status.is_ok() {
                         value
                     } else {
                         nonfinite.push((i, j));
                         f64::INFINITY
                     };
+                    islands[i][j].set_error(error);
                 }
                 // The generation is complete: the just-evaluated arena becomes
                 // the readable front, and the next generation writes into the
@@ -2214,7 +2266,8 @@ impl GpuSearch {
                 .finish(ticket);
             if gpu_error.is_none() {
                 for (&(i, j), &e) in on_cpu.iter().zip(errors.iter()) {
-                    islands[i][j].error = e;
+                    islands[i][j].set_error(e);
+                    islands[i][j].confirm_inf(Some(self.rows_version));
                 }
             }
             let stats = self.stats.entry(generation).or_default();
@@ -2522,7 +2575,7 @@ fn rescore_pending_cpu(
     for pop in islands.iter_mut() {
         for ind in pop.iter_mut() {
             if ind.error.is_nan() {
-                ind.error = errors[k];
+                ind.set_error(errors[k]);
                 k += 1;
             }
         }
@@ -2784,10 +2837,12 @@ fn score_generation(
     backend_reason: &mut Option<String>,
     generation: usize,
     dispatcher: &mut crate::dispatch::Dispatcher,
+    rows_version: u64, // #500
 ) -> Result<bool, String> {
     let Some(g) = gpu.as_mut() else {
         return Ok(false);
     };
+    g.rows_version = rows_version;
     match g.score(islands, train, cfg, generation, dispatcher) {
         Ok(()) => {
             // #230: a fit-only evaluator scores on the CPU, so it must not make
@@ -5426,10 +5481,13 @@ fn evolve_island(
     workers: usize,
     // #471: this island's window of edit success counts.
     mix: &mut MixWindow,
+    // #500: rows version of `train` for confirming a CPU-scored `+inf`; `None`
+    // when `train` is a screening subset.
+    rows: Option<u64>,
 ) {
     if !screened {
         for ind in isl.iter_mut() {
-            if !ind.error.is_finite() && ind.reeval_probing(train, cfg) {
+            if !ind.error.is_finite() && ind.reeval_carried(train, cfg, rows) {
                 GenCounters::count(counters, |c| &c.reevals); // #25 #500
             }
         }
@@ -5561,7 +5619,7 @@ fn evolve_island(
             meta.push(parent_err.map(|e| (e, used)));
             ages.push(age);
         }
-        let scored = fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters);
+        let scored = fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters, rows);
         for (k, (mut ind, age)) in scored.into_iter().zip(ages).enumerate() {
             ind.age = age;
             if ind.complexity > cfg.complexity_cap() {
@@ -5604,7 +5662,7 @@ fn evolve_island(
                 })
             })
             .collect();
-        for ind in fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters) {
+        for ind in fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters, rows) {
             let slot = next.len();
             GenCounters::count(counters, |c| &c.offspring); // #211
             next.push(ind);
@@ -5652,7 +5710,7 @@ fn evolve_island(
             // Immigrants are fitted even when the batch defers scoring.
             let fit_immigrants = cfg.fit_iters > 0 && !train.sample.is_multi();
             let inds = fit_and_score(
-                trees, workers, cfg, train, fit_sample, fit_immigrants, defer_gpu, counters,
+                trees, workers, cfg, train, fit_sample, fit_immigrants, defer_gpu, counters, rows,
             );
             for (k, ind) in inds.into_iter().enumerate() {
                 let slot = pop - immigrants + k;
@@ -5677,7 +5735,7 @@ fn evolve_island(
                 })
             })
             .collect();
-        next.extend(fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters));
+        next.extend(fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters, rows));
     }
 
     *isl = next;
@@ -6911,6 +6969,7 @@ fn run_postfix_search(
                             tree,
                             descriptor: None,
                             age: 0,
+                            inf_rows: None,
                         })
                         .collect()
                 })
@@ -6984,6 +7043,7 @@ fn run_postfix_search(
                         tree,
                         descriptor: None,
                         age: 0,
+                        inf_rows: None,
                     })
                     .collect()
             })
@@ -7603,6 +7663,8 @@ fn run_search(
         } else {
             init_data
         };
+        // #500: rows version 0 is the full training sample.
+        let init_rows = std::ptr::eq(init_eval, &train_data).then_some(0u64);
         // #463: the trees are drawn serially (the RNG order is fixed); scoring
         // them does not touch the RNG and runs on the worker pool.
         let mut init_trees: Vec<Node> = Vec::new();
@@ -7636,7 +7698,9 @@ fn run_search(
                 if defer_gpu {
                     Ind::pending(tree, cfg)
                 } else {
-                    Ind::evaluated(tree, init_eval, cfg) // #25 #85
+                    let mut ind = Ind::evaluated(tree, init_eval, cfg); // #25 #85
+                    ind.confirm_inf(init_rows);
+                    ind
                 }
             },
         )
@@ -7736,7 +7800,7 @@ fn run_search(
     // before the first selection step reads an error.
     #[cfg(feature = "cuda")]
     {
-        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg, &mut backend_reason, gens_done, &mut dispatcher)?;
+        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg, &mut backend_reason, gens_done, &mut dispatcher, 0)?;
     }
 
     // #122: the flat postfix generation loop. It is selected before the first
@@ -7883,6 +7947,9 @@ fn run_search(
             // `None` means the full training sample, exactly as before.
             let gen_sample = training_for_generation(cfg, train, gen);
             let gen_train = gen_sample.as_ref().unwrap_or(train);
+            // #500: rows version of this generation's scoring rows: 0 is the full
+            // training sample, a predictor subset gets a version of its own.
+            let rows_version: u64 = if gen_sample.is_some() { gen as u64 + 1 } else { 0 };
             // #133: transpose once per distinct sample, not once per use. With
             // no predictor subset the generation shares the full-data view.
             let gen_data_owned;
@@ -7904,6 +7971,7 @@ fn run_search(
             };
             let fit_train = fit_sample.as_ref().unwrap_or(gen_train);
             let screened = fit_sample.is_some();
+            let island_rows = if screened { None } else { Some(rows_version) };
             if screened {
                 fit_screened = true;
             }
@@ -8066,6 +8134,7 @@ fn run_search(
                                 dev_counters_ref, // #211
                                 island_workers, // #463
                                 mix, // #471
+                                island_rows, // #500
                             ) // #85
                         })
                     })
@@ -8142,17 +8211,18 @@ fn run_search(
                                 ind.complexity = cfg.complexity_model.complexity(&tree);
                                 ind.tree = tree;
                             }
-                            ind.error = if cfg.accepts_dimensions(&ind.tree) {
+                            ind.set_error(if cfg.accepts_dimensions(&ind.tree) {
                                 r.error
                             } else {
                                 f64::INFINITY
-                            };
+                            });
                             if r.nonfinite {
                                 nonfinite_slots.push((i, j));
                             }
                         }
                     }
                     if let Some(g) = gpu.as_mut() {
+                        g.rows_version = rows_version;
                         g.check_device_nonfinite(&mut islands, &nonfinite_slots, gen_train, cfg, gen);
                     }
                     if pipeline_error.is_none() {
@@ -8162,7 +8232,7 @@ fn run_search(
                         // Score anything the kernel could not compile (left
                         // pending) through the normal CPU fallback.
                         defer_gpu =
-                            score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher)?;
+                            score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
                     } else {
                         // Stop the GPU and re-score every still-pending
                         // candidate in f64 on the CPU; a failed batch must
@@ -8187,7 +8257,7 @@ fn run_search(
                     // #26: one batched call covers every candidate of the
                     // generation (the pre-#119 synchronous path).
                     defer_gpu =
-                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher)?;
+                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
                 }
             }
             let dev_eval = dev_lap(&mut dev_mark); // #211: evaluator batch
@@ -8219,7 +8289,7 @@ fn run_search(
                         |mut ind| {
                             let sol = refit_survivor(&ind.tree, &train_data, cfg);
                             ind.tree = sol.tree;
-                            ind.error = sol.error;
+                            ind.set_error(sol.error);
                             ind.complexity = sol.cost;
                             ind
                         },
@@ -8596,7 +8666,7 @@ fn run_search(
             #[cfg(feature = "cuda")]
             {
                 defer_gpu =
-                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher)?;
+                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
             }
 
             // #120: record this generation's evaluated behaviours. The order
@@ -9181,6 +9251,7 @@ mod tests {
             complexity,
             descriptor: None,
             age: 0,
+            inf_rows: None,
         }
     }
 
@@ -9489,6 +9560,7 @@ mod tests {
             complexity: before,
             descriptor: None,
             age: 0,
+            inf_rows: None,
         };
         refresh_after_fit(&mut ind, &cfg);
         let want = expr::simplify(&tree);
@@ -10038,6 +10110,7 @@ mod tests {
             complexity: 1.0,
             descriptor: None,
             age: 0,
+            inf_rows: None,
         }];
 
         let mut rng = Mt::new(11);
@@ -10116,6 +10189,7 @@ mod tests {
                 None,  // #211: no development log in this test
                 1,     // #463
                 &mut MixWindow::new(), // #471
+                None, // #500
             );
             let trees: Vec<Node> = isl.iter().map(|i| i.tree.clone()).collect();
             let errors: Vec<u64> = isl.iter().map(|i| i.error.to_bits()).collect();
@@ -10293,6 +10367,7 @@ mod tests {
             complexity: 0.0,
             descriptor: None,
             age: 0,
+            inf_rows: None,
         };
 
         ind.refit_and_reeval(&first_data, &first, &cfg);
@@ -11201,7 +11276,7 @@ mod tests {
     }
 
     fn aged_ind(tree: Node, error: f64, complexity: f64, age: u32) -> Ind {
-        Ind { tree, error, complexity, descriptor: None, age }
+        Ind { tree, error, complexity, descriptor: None, age, inf_rows: None }
     }
 
     /// #465: the lowest-error individual always survives, whatever its age or
@@ -11256,7 +11331,7 @@ mod tests {
         let mut rng = Mt::new(11);
         evolve_island(
             &mut isl, &mut rng, &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None, false,
-            0, None, None, 1, &mut MixWindow::new(),
+            0, None, None, 1, &mut MixWindow::new(), None,
         );
         let immigrants = afp_immigrants(cfg.pop);
         assert_eq!(isl.len(), cfg.pop + immigrants);
@@ -11360,9 +11435,86 @@ mod tests {
         let counters = GenCounters::default();
         evolve_island(
             &mut isl, &mut Mt::new(5), &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None,
-            false, 0, None, Some(&counters), 1, &mut MixWindow::new(),
+            false, 0, None, Some(&counters), 1, &mut MixWindow::new(), None,
         );
         assert_eq!(GenCounters::total(Some(&counters), |c| &c.reevals), 0);
+    }
+
+    /// #500: a `+inf` confirmed on the CPU for these rows is kept without a
+    /// score; unconfirmed, other rows, a descriptor run and an unsimplified
+    /// tree all take the full pass.
+    #[test]
+    fn confirmed_inf_is_kept_on_the_same_rows_only() {
+        let s = sample();
+        let cfg = Config::default();
+        let data = EvalSample::new(&s, &cfg);
+        let confirmed = |rows: Option<u64>| {
+            let mut ind = Ind::evaluated(input(0), &data, &cfg);
+            ind.error = f64::INFINITY;
+            ind.inf_rows = rows;
+            ind
+        };
+        let mut kept = confirmed(Some(0));
+        assert!(!kept.reeval_carried(&data, &cfg, Some(0)));
+        assert_eq!(kept.error, f64::INFINITY);
+        assert_eq!(kept.inf_rows, Some(0));
+
+        let mut changed = confirmed(Some(0));
+        assert!(changed.reeval_carried(&data, &cfg, Some(1)), "other rows are scored");
+        assert!(changed.error.is_finite());
+        assert_eq!(changed.inf_rows, None);
+
+        let mut unconfirmed = confirmed(None);
+        assert!(unconfirmed.reeval_carried(&data, &cfg, Some(0)));
+        assert!(unconfirmed.error.is_finite());
+
+        let mut qd = Config::default();
+        qd.qd_bins = 4;
+        let qd_data = EvalSample::new(&s, &qd);
+        let mut descriptor_run = confirmed(Some(0));
+        assert!(descriptor_run.reeval_carried(&qd_data, &qd, Some(0)));
+
+        for ind in inf_population(&data, &cfg) {
+            let mut full = ind.clone();
+            full.reeval(&data, &cfg);
+            let mut carried = ind.clone();
+            carried.inf_rows = ind.error.is_infinite().then_some(0);
+            carried.reeval_carried(&data, &cfg, Some(0));
+            assert!(same_state(&full, &carried));
+        }
+    }
+
+    /// #500: the island re-scores no confirmed `+inf` on unchanged rows and all
+    /// of them when the rows change (a `--predictor-samples` redraw).
+    #[test]
+    fn island_skips_confirmed_inf_unless_the_rows_change() {
+        let s = sample();
+        let aggs = AggTable::from_sample(&s);
+        let mut cfg = Config::default();
+        cfg.pop = 40;
+        let data = EvalSample::new(&s, &cfg);
+        let run = |rows: Option<u64>| {
+            let mut isl: Vec<Ind> = (0..40)
+                .map(|i| {
+                    let mut ind = Ind::evaluated(
+                        node(Op::Add, vec![input(0), constant(i as f64)]),
+                        &data,
+                        &cfg,
+                    );
+                    ind.error = f64::INFINITY;
+                    ind.inf_rows = Some(0);
+                    ind
+                })
+                .collect();
+            let counters = GenCounters::default();
+            evolve_island(
+                &mut isl, &mut Mt::new(5), &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None,
+                false, 0, None, Some(&counters), 1, &mut MixWindow::new(), rows,
+            );
+            GenCounters::total(Some(&counters), |c| &c.reevals)
+        };
+        assert_eq!(run(Some(0)), 0);
+        assert_eq!(run(Some(1)), 40);
     }
 
     /// #465: migration replaces the member of the highest Pareto rank.
@@ -11530,11 +11682,14 @@ mod tests {
         let mut dispatcher = crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::default())
             .with_mode(crate::dispatch::DispatchMode::Device);
         let mut islands = vec![std::mem::take(&mut island)];
+        g.rows_version = 7;
         g.score(&mut islands, &s, &cfg, 0, &mut dispatcher).expect("device batch");
         for (k, ind) in islands[0].iter().enumerate() {
             let exact = score_tree(&ind.tree, &view, &cfg);
             assert_eq!(ind.error.to_bits(), exact.to_bits(), "tree {k}");
             assert_eq!(ind.error.is_finite(), k < 3, "tree {k}: {}", ind.error);
+            // #500: the CPU check confirms the kept `+inf`, and only that one.
+            assert_eq!(ind.inf_rows, (k == 3).then_some(7), "tree {k}");
         }
         let stats = &g.stats[&0];
         assert!(stats.nonfinite >= 3, "{:?}", stats);
