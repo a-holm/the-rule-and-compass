@@ -595,8 +595,8 @@ pub struct View {
     pub seed: u64,
     pub view: usize,
     pub size: usize,
-    /// Columns the view holds; below `size` when the store has too few
-    /// candidate families for the two-per-family rule.
+    /// Columns the view holds; equals `size` because a store with fewer
+    /// candidate columns is refused.
     pub delivered: usize,
     pub columns: Vec<String>,
     pub families: Vec<(String, Vec<String>)>,
@@ -663,7 +663,7 @@ pub fn check_view_size(size: usize) -> Result<(), String> {
 /// Select a view from `columns` (stored column names in header order).
 ///
 /// Candidates are the available, derived (non-input) registry columns. Each
-/// family contributes one column, or two when `size` allows, and the choice
+/// family contributes one column per round until `size` columns are drawn, and the choice
 /// rotates with `(seed, view)`: consecutive views walk different families and
 /// different names. The result depends only on the column names, the registry
 /// and the arguments, never on row data.
@@ -695,6 +695,13 @@ pub fn select_view_excluding(
     if fams.is_empty() {
         return Err("--project: the store has no registered feature columns".to_string());
     }
+    let available: usize = fams.values().map(|n| n.len()).sum();
+    if available < size {
+        return Err(format!(
+            "--project {}: the store has {} candidate columns, fewer than the {} requested",
+            size, available, size
+        ));
+    }
     for names in fams.values_mut() {
         names.sort();
     }
@@ -705,9 +712,8 @@ pub fn select_view_excluding(
     let order: Vec<&String> = (0..nf).map(|i| &family_names[(start + i) % nf]).collect();
     let mut picked: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut count = 0usize;
-    let rounds = if size <= VIEW_SIZE_MAX { 2 } else { usize::MAX };
     let per = size.div_ceil(nf).max(1);
-    for round in 0..rounds {
+    for round in 0.. {
         if count >= size || round > fams.values().map(|n| n.len()).max().unwrap_or(0) {
             break;
         }
