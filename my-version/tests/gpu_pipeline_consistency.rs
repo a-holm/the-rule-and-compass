@@ -314,7 +314,7 @@ fn pipeline_fit_fallback_max_matches_sync() {
     if !device_available() {
         return;
     }
-    const CAP: usize = 2;
+    const CAP: usize = 1;
     let train = sample(4_096, 3);
     let test = sample(256, 4);
     let mut runs = Vec::new();
