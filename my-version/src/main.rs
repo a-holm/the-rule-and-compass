@@ -350,8 +350,9 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
                              inside each group). Text columns are allowed.
   --project <n|auto>         choose the variables as a deterministic family-stratified
                              view of n registered feature columns (24-48, research
-                             cell 96-128; auto = 36), one or two per family, rotated
-                             by --seed and --view. Needs a .rcsb store; not with --vars.
+                             cell 96-128; auto = 36), exactly n columns, one per family per
+                             round, rotated by --seed and --view; a store with fewer than n
+                             candidate columns exits 2. Needs a .rcsb store; not with --vars.
                              The view id and columns go to --run-manifest
   --view <k>                 view index for --project (default 0)
   --no-project               load every store column. The default projects the
@@ -4136,21 +4137,13 @@ fn main() {
                                 v.seed,
                                 v.view
                             );
-                            if v.delivered < v.size {
-                                eprintln!(
-                                    "view {}: requested {} columns, delivered {}: {} candidate famil(ies) at most two columns each",
-                                    v.id,
-                                    v.size,
-                                    v.delivered,
-                                    v.families.len()
-                                );
-                            }
                             vars = v.columns.clone();
                             view_record = Some(v);
                         }
                         Err(e) => {
                             eprintln!("error: {}", e);
-                            std::process::exit(EXIT_INPUT);
+                            let shortfall = matches!(e, registry::ViewError::Shortfall { .. });
+                            std::process::exit(if shortfall { EXIT_USAGE } else { EXIT_INPUT });
                         }
                     }
                 }
@@ -9997,7 +9990,7 @@ OPTIONS:
                              admitted set is rescored on the full validation rows in
                              exact CPU f64 and ranked by
                              (net, turnover, complexity, index). Requires
-                             --validation-frac > 0 and more than one --expr; the
+                             --validation-frac > 0 or a --windows table with validation_start, and more than one --expr; the
                              JSON carries surrogate_rank, exact_rank, band,
                              epsilon, finalists_considered, recall_band and
                              scored_by=cpu_f64
@@ -10702,14 +10695,6 @@ fn run_walkforward(args: &[String]) -> ! {
         );
         std::process::exit(EXIT_USAGE);
     }
-    if band_select && validation_frac <= 0.0 {
-        eprintln!(
-            "error: --select-band needs --validation-frac > 0; the test block \
-             may not choose the candidate\n\n{}",
-            walkforward_usage()
-        );
-        std::process::exit(EXIT_USAGE);
-    }
     let expression = expressions[0].clone();
     let candidates = if expressions.len() > 1 {
         expressions
@@ -10770,6 +10755,14 @@ fn run_walkforward(args: &[String]) -> ! {
                 std::process::exit(EXIT_INPUT);
             }
         }
+    }
+    if band_select && validation_frac <= 0.0 && popts.validation_starts.is_empty() {
+        eprintln!(
+            "error: --select-band needs --validation-frac > 0 or a windows table with validation_start; \
+             the test block may not choose the candidate\n\n{}",
+            walkforward_usage()
+        );
+        std::process::exit(EXIT_USAGE);
     }
     if windows.is_empty() {
         eprintln!(
