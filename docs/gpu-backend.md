@@ -99,6 +99,12 @@ The build-script check is deliberately about the **compiler**, not the device:
 `RCSR_CUDA_ARCH=sm_121` succeeds on any machine with CUDA ≥ 12.9 and needs no
 GB10 attached.
 
+### Deploying a CUDA build (#659)
+
+`build.rs` compiles `src/cuda/*.cu` to a static archive and links it with the static CUDA runtime (`libcudart_static.a`, found next to the `nvcc` toolkit, in `targets/*/lib` or in `/usr/lib/<arch>-linux-gnu`). Every binary and test binary is therefore one self-contained file: no `librcsrcuda.so`, no RUNPATH, no run-time dependency on `target/`. The only CUDA dependency left at run time is the driver library `libcuda.so.1`. Deploying is `cp target/release/rcsr <dir>`; the SHA-256 of that file identifies the code that runs.
+
+`scripts/tests/relocatable_bins.sh [target/release]` checks `readelf -d` (no RUNPATH into a build directory, no `librcsrcuda`), `ldd` (no library inside the target directory), a copied `rcsr --version` run and `--list` on each built test binary. It needs no GPU.
+
 ### `sm_121` compile-only validation (#28)
 
 [`tests/sm121_compile.rs`](../my-version/tests/sm121_compile.rs) compiles the
