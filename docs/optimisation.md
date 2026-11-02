@@ -247,7 +247,7 @@ is mathematically well posed:
 | metric | fitting strategy |
 |---|---|
 | `squared`, `aic`, `aicc`, `bic` | the exact historical Levenberg–Marquardt least-squares path, bit for bit |
-| `absolute` | IRLS with weights `1 / max(|r|, 1e-6)`, each weighted solve on the same LM/QR solver |
+| `absolute` | IRLS with weights `1 / max(|r|, 1e-6)`, each weighted solve on the same LM/QR solver; `--fit-irls` (#611) selects the nested rounds or the reweighted L1 schedule |
 | `implicit_residual` (#396) | on an `--implicit` sample the target is 0, so `Σ w|f| / Σ w` is the `absolute` objective: the same L1 IRLS arm, scored by the finite residual (`score_with_constants` and `score_weighted` share the `absolute` branch). The level-set metric `implicit` keeps its own fit, `implicit::fit` |
 | `implicit` (#398) | `implicit::fit`: Levenberg–Marquardt on the signed geometric residual `f/||∇f||`, CPU `f64` only (no device arm; the measured cost is allocation, not arithmetic). `fit_weighted_metric` routes it there for every caller. The tree is flattened once per fit and per score, the constants are swapped in place per probe, and the Jacobian costs three sweeps per row (a directional difference of the constant adjoint along the unit normal, `ε = 1e-6·(1 + ||p||∞)`) instead of `1 + 2p` |
 | `log_squashed` | IRLS with weights `1 / (1 + r²)`, the derivative of `ln(1 + r²)` |
@@ -286,6 +286,18 @@ SSE). The weighted normal equations now scale **both** the Jacobian and the
 residual by `sqrt(w)`; before this change the weighted fit mixed a weighted
 Jacobian with a half-weighted gradient, which is corrected as part of the same
 work.
+
+#### 3.0.0 The `absolute` schedule: `--fit-irls` (#611)
+
+`--fit-irls nested|reweighted|reweighted-final` (default `nested`) picks the schedule of the CPU constant fit for `absolute` and `implicit_residual` inside the search.
+
+| value | schedule |
+|---|---|
+| `nested` | today's IRLS (`irls_rounds`): up to 4 rounds, each a weighted LM at the round-start weights and kept only on a strictly lower MAE, then a final weighted solve with `max(--fit-iters, 4)` trials |
+| `reweighted` | one LM over the true L1 loss `Σ w|r|`, the CPU twin of the device kernel: weights `w / max(|r|, 1e-6)` rebuilt at every assembly, trials judged on the true loss with up to two halvings, damping carried across rounds, then up to 4 undamped steps with one halving. About half the row passes of `nested` |
+| `reweighted-final` | `reweighted`, then the final weighted solve of `nested` at the weights of the end point, kept only on a strictly lower MAE |
+
+Both non-default values change the fitted constants, so the setting is saved in the checkpoint and a resume refuses a different value. It is read only inside the search's candidate fit (`fit_constants_with_iters`): the CPU search then rebuilds the reported archive through the exact band refit (`--refit-band`) on `nested` IRLS, warm-started from the carried constants, so every reported member is a `nested` refit. The finalist refit, the CPU fallback refits, the host gate, the walk-forward refits and direct `fit::*` calls stay on `nested`. Other metrics ignore the flag (a note is printed); `--fit-iters 0` runs no fit. Both schedules are deterministic and independent of `--threads`. `--json` reports `search.fit_irls` and `fitting.irls_reweighted`, `--fit-report` prints the count, and `cpu_bench --mode metric --fit-irls` and `rcsr-bench --fit-irls` measure and A/B them.
 
 #### 3.0.1 Signed bias: a projection, not an optimiser (#228)
 

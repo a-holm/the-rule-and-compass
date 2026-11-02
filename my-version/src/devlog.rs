@@ -814,6 +814,8 @@ pub struct RunEnd {
     pub fit_refit_s: Option<f64>,
     /// #495: exact finalist refits performed.
     pub fit_refits: Option<usize>,
+    /// #611: fits that ran on a reweighted L1 schedule.
+    pub irls_reweighted: u64,
     /// Log bookkeeping: events written, bytes, events dropped by the cap.
     pub events: u64,
     pub bytes: u64,
@@ -830,6 +832,7 @@ pub fn run_end_json(r: &RunEnd) -> String {
          \"device_seconds_incl_fit\":{},\"device_fraction_of_run\":{},\
          \"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"unaccounted_s\":{},\
          \"fit_kernel_s\":{},\"fit_kernel_lm_s\":{},\"fit_kernel_polish_s\":{},\"fit_fallback_s\":{},\"fit_refit_s\":{},\"fit_refits\":{},\
+         \"irls_reweighted\":{},\
          \"prune\":{{\"fits\":{},\"accepted\":{},\"seconds\":{}}},\
          \"events\":{},\"bytes\":{},\"dropped\":{},\"end\":{}}}",
         SCHEMA,
@@ -869,6 +872,7 @@ pub fn run_end_json(r: &RunEnd) -> String {
             Some(n) => n.to_string(),
             None => "null".to_string(),
         },
+        r.irls_reweighted,
         r.prune_fits,
         r.prune_accepted,
         num(r.prune_s),

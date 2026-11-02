@@ -83,6 +83,8 @@ OPTIONS:
   --dispatch <mode>         auto or device (device skips the timing comparison)
   --fit-polish <mode>      f64 (default), f32 or off: arithmetic of the device fit
                             kernel polish (--fit-strategy gpu)
+  --fit-irls <mode>         nested (default), reweighted or reweighted-final: schedule
+                            of the CPU absolute / implicit_residual constant fit (#611)
   --jobs <N>                runs in flight at once on the CPU (default 1);
                             seconds and hit_s are then contended
   --ndjson                  one JSON line per finished run, flushed at once,
@@ -349,6 +351,12 @@ fn parse(args: &[String]) -> Result<Args, String> {
                     rcsr::fit::FitPolish::parse(&v)
                         .ok_or_else(|| format!("--fit-polish needs f64, f32 or off, got '{}'", v))?,
                 );
+            }
+            "--fit-irls" => {
+                let v = take(&mut i, "--fit-irls")?;
+                a.knobs.fit_irls = Some(rcsr::fit::FitIrls::parse(&v).ok_or_else(|| {
+                    format!("--fit-irls needs nested, reweighted or reweighted-final, got '{}'", v)
+                })?);
             }
             "--dispatch" => {
                 let v = take(&mut i, "--dispatch")?;

@@ -1703,6 +1703,8 @@ objective, `defers_fit_to_gpu` admits it, and `verify_proposal` +
 — the exact CPU L1 IRLS. A squared-only backend still declines `absolute`
 (the `BatchedFitter` default), so a device can never answer it with SSE.
 
+**CPU twin (`--fit-irls`, #611).** `--fit-irls reweighted` runs this schedule on the CPU for the search's candidate fit: `fit::reweighted` assembles the weights, `JᵀWJ`, `JᵀWr` and `Σ w|r|` in one column-tile pass (`TileFit::normal_l1`), judges each trial on the true loss with up to two halvings (`TileFit::loss_l1`), carries the damping across the rounds, and ends with up to four undamped steps with one halving. It differs from the kernel in the f64 assembly, in the plain Cholesky solve (no Jacobi scaling) and in the bad-gradient row policy (the CPU declines the assembly and keeps the incumbent). `--fit-irls reweighted-final` adds today's final weighted solve at the weights of the end point. The default `nested` keeps `irls_rounds`. The finalist refit, the CPU fallback refits and the host gate stay on `nested`, so every reported member is the same exact refit as before.
+
 **Degeneracy and fallback.** Zero residual rows are legitimate but make the
 majoriser unbounded; the `1e-6` floor and the `ln det Ã` test decide between an
 exact fit and a labelled `ill_conditioned` fallback. Non-finite rows are status

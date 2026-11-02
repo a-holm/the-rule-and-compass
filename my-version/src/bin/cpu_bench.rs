@@ -174,7 +174,7 @@ const HELP: &str = "cpu_bench — CPU evaluator, constant fitter, metric fit and
 
 USAGE:
   cpu_bench [--mode eval|fit|metric|scale|all] [--rows LIST] [--threads LIST]
-            [--min-seconds S] [--fit-iters N] [--tsv] [--help]
+            [--min-seconds S] [--fit-iters N] [--fit-irls MODE] [--tsv] [--help]
 
 MODES:
   eval    scalar walk vs SoA scalar vs SoA AVX on the 5/9/15/25-node trees
@@ -195,6 +195,8 @@ OPTIONS:
   --min-seconds S    minimum time per cell (default 0.3 for fit, metric, scale;
                      eval keeps its 50 ms repetition batches unless set)
   --fit-iters N      iterations of the metric fits (default 8)
+  --fit-irls MODE    schedule of the absolute fit in metric mode: nested (default),
+                     reweighted or reweighted-final (#611)
   --tsv              tab-separated cells with one header row per table
   --help             this text
 
@@ -216,6 +218,7 @@ struct Opts {
     threads: Vec<usize>,
     min_seconds: Option<f64>,
     fit_iters: usize,
+    fit_irls: fit::FitIrls,
     tsv: bool,
 }
 
@@ -245,6 +248,7 @@ fn parse_args(args: &[String]) -> Opts {
         threads: DEFAULT_THREADS.to_vec(),
         min_seconds: None,
         fit_iters: DEFAULT_FIT_ITERS,
+        fit_irls: fit::FitIrls::Nested,
         tsv: false,
     };
     let mut i = 0;
@@ -280,6 +284,12 @@ fn parse_args(args: &[String]) -> Opts {
                 o.fit_iters = match value().parse::<usize>() {
                     Ok(v) => v,
                     Err(_) => usage_error("--fit-iters needs a non-negative integer"),
+                }
+            }
+            "--fit-irls" => {
+                o.fit_irls = match fit::FitIrls::parse(value()) {
+                    Some(s) => s,
+                    None => usage_error("--fit-irls needs nested, reweighted or reweighted-final"),
                 }
             }
             "--tsv" => o.tsv = true,
@@ -641,12 +651,16 @@ fn run_metric(o: &Opts, out: &mut Out) {
         let d = fit_data(rows);
         for (name, m) in metrics_list {
             let mut hashed = tree.clone();
-            let score = fit::fit_weighted_metric(&mut hashed, &d.x, &d.y, &[], o.fit_iters, m);
+            let score = fit::with_fit_irls(o.fit_irls, || {
+                fit::fit_weighted_metric(&mut hashed, &d.x, &d.y, &[], o.fit_iters, m)
+            });
             let hash = fit_hash(&hashed, score);
             let wall = best_of(
                 || {
                     let mut t = tree.clone();
-                    black_box(fit::fit_weighted_metric(&mut t, &d.x, &d.y, &[], o.fit_iters, m));
+                    black_box(fit::with_fit_irls(o.fit_irls, || {
+                        fit::fit_weighted_metric(&mut t, &d.x, &d.y, &[], o.fit_iters, m)
+                    }));
                 },
                 min_s,
                 3,

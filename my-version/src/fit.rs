@@ -29,6 +29,7 @@ mod median;
 #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
 mod minimax;
 mod rank;
+mod reweighted;
 mod stream;
 mod tile;
 mod varpro;
@@ -73,6 +74,8 @@ pub(crate) use rank::{exact_rank_score, RankTrialScorer};
 #[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
 pub(crate) use rank::{choose_rank_fit, score_constants, RankFitChoice};
 pub use varpro::{cost_eligible as varpro_cost_eligible, VarProPartition};
+pub use reweighted::FitIrls;
+pub use reweighted::with_schedule as with_fit_irls;
 
 /// `1/sqrt(pi)`, the constant in the error-function derivative.
 const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
@@ -1049,6 +1052,8 @@ pub struct FitArmCounts {
     pub gpu: u64,
     pub gpu_fallbacks: u64,
     pub gpu_refits: u64,
+    /// #611: fits that ran on a reweighted L1 schedule.
+    pub irls_reweighted: u64,
 }
 
 impl FitArmCounts {
@@ -1062,6 +1067,7 @@ impl FitArmCounts {
             gpu: self.gpu.saturating_sub(before.gpu),
             gpu_fallbacks: self.gpu_fallbacks.saturating_sub(before.gpu_fallbacks),
             gpu_refits: self.gpu_refits.saturating_sub(before.gpu_refits),
+            irls_reweighted: self.irls_reweighted.saturating_sub(before.irls_reweighted),
         }
     }
 
@@ -1091,6 +1097,7 @@ pub fn fit_arm_counts_full() -> FitArmCounts {
         gpu: GPU_FITS.load(Ordering::Relaxed),
         gpu_fallbacks: GPU_FALLBACKS.load(Ordering::Relaxed),
         gpu_refits: GPU_REFITS.load(Ordering::Relaxed),
+        irls_reweighted: reweighted::fits(),
     }
 }
 
@@ -3350,9 +3357,12 @@ pub fn fit_weighted_metric(
             unreachable!("least-squares metrics are fitted by fit_weighted")
         }
         ImplicitDerivative => unreachable!("the level-set metric returned above"),
-        Absolute | ImplicitResidual => irls_fit(tree, x, y, w, iters, metric, |r, _| {
-            1.0 / r.abs().max(1e-6)
-        }),
+        Absolute | ImplicitResidual => match reweighted::current() {
+            FitIrls::Nested => irls_fit(tree, x, y, w, iters, metric, |r, _| {
+                1.0 / r.abs().max(1e-6)
+            }),
+            schedule => reweighted::l1_fit(tree, x, y, w, iters, metric, schedule),
+        },
         LogSquashed => irls_fit(tree, x, y, w, iters, metric, |r, _| {
             1.0 / (1.0 + r * r)
         }),
@@ -6707,6 +6717,129 @@ mod tests {
         }
         let pinned: [u64; 27] = [0x3c9276bf1c615d27, 0x9294d7602a3c3167, 0x15b8dd2bc7e89749, 0xafa0562facbfc842, 0x26ba0ddf4424a2e0, 0xa17c07db2474173c, 0xa17c07db2474173c, 0xcb94829dce1d26e3, 0x24434c6a996c9229, 0x23a970927fa60ca5, 0xe1c6b66d7f822d06, 0x451d1ef089f61505, 0x0374ecc179c28d13, 0xe6cad4afb716367e, 0xcbfa07bfbfbafb80, 0xcbfa07bfbfbafb80, 0x04f4b24b783f51c9, 0xd67f0e0db5df28f1, 0xf0baf5198f0be5ee, 0xdbfd0fea0481a991, 0x3d0b0848e99fccbc, 0xe3c3b66d8f3aca74, 0x5a6b313ff1818721, 0xc2f8defb6d1423d0, 0xc2f8defb6d1423d0, 0xf370ce07b2c3f2fb, 0xbd6156d48f9c3a62];
         assert_eq!(got.as_slice(), pinned.as_slice());
+    }
+
+    const REWEIGHTED: [FitIrls; 2] = [FitIrls::Reweighted, FitIrls::ReweightedFinal];
+
+    /// #611: the reweighted schedules keep the incumbent unless the loss
+    /// strictly drops, and report the metric of the tree they write back.
+    #[test]
+    fn l1_reweighted_never_worsens_the_start() {
+        let (x, y) = pinned_fixture();
+        let vars: Vec<String> = (0..5).map(|i| format!("x{i}")).collect();
+        let sources = [
+            "1.1*x0 + 0.4*x1*x2 + 0.2",
+            "0.5*x0 + 2.0*x1*x2 - 1.0",
+            "(1.1*x0 + 0.4*x1*x2) / (1.3 + x3*x3) - 0.2*x4",
+            "(3.0*x0 - 0.7*x1*x2) / (0.4 + x3*x3) + 0.9*x4",
+        ];
+        let weights: Vec<f64> = (0..x.len())
+            .map(|i| if i % 7 == 0 { 0.0 } else { 0.5 + (i % 5) as f64 * 0.25 })
+            .collect();
+        for w in [&[][..], &weights[..]] {
+            for src in sources {
+                for iters in [1usize, 2, 8, 16] {
+                    for schedule in REWEIGHTED {
+                        let mut tree = crate::parse::parse(src, &vars).unwrap();
+                        let start = metric_score(&tree, &x, &y, w, Metric::Absolute);
+                        let got = with_fit_irls(schedule, || {
+                            fit_weighted_metric(&mut tree, &x, &y, w, iters, Metric::Absolute)
+                        });
+                        let written = metric_score(&tree, &x, &y, w, Metric::Absolute);
+                        let ctx = format!("{src} iters={iters} {schedule:?} weighted={}", !w.is_empty());
+                        assert!(got <= start, "{ctx}: {got} > start {start}");
+                        assert!(
+                            (got - written).abs() <= 1e-12 * written.abs().max(1.0),
+                            "{ctx}: returned {got} vs written {written}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// #611: the oracle and gates of `l1_fit_matches_the_weighted_median_on_a_scale_model`.
+    #[test]
+    fn l1_reweighted_matches_the_weighted_median_on_a_scale_model() {
+        let ratios = [
+            2.0, 2.1, 1.9, 2.05, 1.95, 30.0, 2.02, 1.98, -12.0, 2.03, 1.97,
+        ];
+        let xs = [0.5, 0.7, 0.9, 1.1, 1.3, 1.5, 1.7, 1.9, 2.1, 2.3, 2.5];
+        let base = [1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 1.0, 1.0, 0.75, 1.0, 1.0];
+        let x: Vec<Vec<f64>> = xs.iter().map(|&v| vec![v]).collect();
+        let y: Vec<f64> = xs.iter().zip(&ratios).map(|(x, r)| x * r).collect();
+        let mut order: Vec<usize> = (0..xs.len()).collect();
+        order.sort_by(|&a, &b| ratios[a].partial_cmp(&ratios[b]).unwrap());
+        let total: f64 = order.iter().map(|&i| base[i] * xs[i]).sum();
+        let mut acc = 0.0;
+        let mut median = f64::NAN;
+        for &i in &order {
+            acc += base[i] * xs[i];
+            if acc >= 0.5 * total {
+                median = ratios[i];
+                break;
+            }
+        }
+        let pred_at = |c: f64| -> Vec<f64> { x.iter().map(|r| c * r[0]).collect() };
+        let at_median = metrics::score_weighted(&pred_at(median), &y, &base, Metric::Absolute, 1);
+        for schedule in REWEIGHTED {
+            let mut tree = node(Op::Mul, vec![constant(1.0), input(0)]);
+            let loss = with_fit_irls(schedule, || {
+                fit_weighted_metric(&mut tree, &x, &y, &base, 64, Metric::Absolute)
+            });
+            let a = fitted_constants(&tree)[0];
+            assert!(
+                (a - median).abs() <= 1e-2 * median.abs().max(1.0),
+                "{schedule:?}: {a} vs weighted median {median}"
+            );
+            assert!(
+                loss <= at_median * (1.0 + 1e-3),
+                "{schedule:?}: loss {loss} worse than the oracle {at_median}"
+            );
+        }
+    }
+
+    /// #611: the switch is a scope. A fit outside it, also after a panic
+    /// inside it, is bit-identical to one that never saw it.
+    #[test]
+    fn fit_irls_switch_is_scoped() {
+        let (x, y) = pinned_fixture();
+        let vars: Vec<String> = (0..5).map(|i| format!("x{i}")).collect();
+        let src = "1.1*x0 + 0.4*x1*x2 + 0.2";
+        let fit_once = || {
+            let mut tree = crate::parse::parse(src, &vars).unwrap();
+            let score = fit_weighted_metric(&mut tree, &x, &y, &[], 8, Metric::Absolute);
+            fit_fingerprint(&tree, score)
+        };
+        let before = reweighted::thread_fits();
+        let never = fit_once();
+        assert_eq!(reweighted::thread_fits(), before);
+        let inside = with_fit_irls(FitIrls::Reweighted, fit_once);
+        assert_eq!(reweighted::thread_fits(), before + 1);
+        assert_ne!(inside, never, "the reweighted schedule must differ from the nested one here");
+        assert_eq!(fit_once(), never);
+        assert_eq!(reweighted::thread_fits(), before + 1);
+        let caught = std::panic::catch_unwind(|| {
+            with_fit_irls(FitIrls::ReweightedFinal, || panic!("inside the scope"))
+        });
+        assert!(caught.is_err());
+        assert_eq!(reweighted::current(), FitIrls::Nested);
+        assert_eq!(fit_once(), never);
+        assert_eq!(reweighted::thread_fits(), before + 1);
+        // A non-L1 metric never reads the switch.
+        let squared = |scoped: bool| {
+            let mut tree = crate::parse::parse(src, &vars).unwrap();
+            let score = if scoped {
+                with_fit_irls(FitIrls::Reweighted, || {
+                    fit_weighted_metric(&mut tree, &x, &y, &[], 8, Metric::LogSquashed)
+                })
+            } else {
+                fit_weighted_metric(&mut tree, &x, &y, &[], 8, Metric::LogSquashed)
+            };
+            fit_fingerprint(&tree, score)
+        };
+        assert_eq!(squared(true), squared(false));
+        assert_eq!(reweighted::thread_fits(), before + 1);
     }
 
     /// The row-at-a-time passes, the reference for the column-tile passes.

@@ -691,6 +691,18 @@ SEARCH:
                              refit exactly on the CPU in every mode. Only the
                              device fit arm reads it; a resume refuses a
                              different saved value
+  --fit-irls <nested|reweighted|reweighted-final>
+                             schedule of the CPU constant fit for absolute and
+                             implicit_residual (default nested, today's IRLS).
+                             reweighted is the CPU twin of the device L1 kernel:
+                             one LM over the true L1 loss, weights rebuilt at
+                             every assembly, about half the row passes.
+                             reweighted-final adds today's final weighted solve.
+                             Both change the fitted constants; every reported
+                             front member is refit on nested IRLS. A saved
+                             search setting: a resume refuses a different
+                             value. No effect for other metrics or with
+                             --fit-iters 0
   --refit-band <F>           after a device-fit search, refit exactly (CPU f64)
                              only the trees whose full-data error is within
                              this relative band of the lowest error at no
@@ -1944,6 +1956,7 @@ impl DevSink {
             prune_s: outcome.prune.seconds,
             fit_refit_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_s()),
             fit_refits: outcome.gpu.as_ref().map(|g| g.fit_refits),
+            irls_reweighted: fit::fit_arm_counts_full().irls_reweighted,
             events,
             bytes,
             dropped,
@@ -2483,6 +2496,7 @@ fn main() {
     // #495: explicit --refit-band for the resume settings check.
     let mut refit_band_set = false;
     let mut fit_polish_set = false;
+    let mut fit_irls_set = false;
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
     let mut front_parents_set = false;
@@ -2916,6 +2930,23 @@ fn main() {
                     },
                 };
                 refit_band_set = true;
+            }
+            // #611: schedule of the CPU L1 constant fit.
+            "--fit-irls" => {
+                let v = val!();
+                match fit::FitIrls::parse(&v) {
+                    Some(s) => {
+                        cfg.fit_irls = s;
+                        fit_irls_set = true;
+                    }
+                    None => {
+                        eprintln!(
+                            "error: --fit-irls needs nested, reweighted or reweighted-final, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
             }
             // #496: arithmetic of the device fit polish.
             "--fit-polish" => {
@@ -3491,6 +3522,18 @@ fn main() {
             std::process::exit(EXIT_USAGE);
         }
     }
+    // #611: the schedule applies to the L1 metrics only.
+    if fit_irls_set
+        && cfg.fit_irls != fit::FitIrls::Nested
+        && cfg.fit_iters > 0
+        && !matches!(cfg.metric, Metric::Absolute | Metric::ImplicitResidual)
+    {
+        eprintln!(
+            "note: --fit-irls {} has no effect for --metric {} (absolute and implicit_residual only)",
+            cfg.fit_irls.name(),
+            cfg.metric.name()
+        );
+    }
     // A y-randomisation control shuffles the target. In implicit mode the target
     // is an input and the scored target is all zeros, so every null run would be
     // the real run: refuse rather than report a meaningless p-value.
@@ -3658,6 +3701,14 @@ fn main() {
         }
         // #255: the fallback bound is saved because reaching it changes which
         // candidates keep device constants.
+        // #611: the L1 fit schedule changes the fitted constants.
+        if fit_irls_set && cfg.fit_irls != saved.fit_irls {
+            conflicts.push(format!(
+                "--fit-irls {} (saved {})",
+                cfg.fit_irls.name(),
+                saved.fit_irls.name()
+            ));
+        }
         if fit_polish_set && cfg.fit_polish != saved.fit_polish {
             conflicts.push(format!(
                 "--fit-polish {} (saved {})",
@@ -6186,6 +6237,13 @@ fn main() {
             counts.gpu_refits
         );
         eprintln!("# fit: {}", fit::backend_description());
+        if cfg.fit_irls != fit::FitIrls::Nested {
+            eprintln!(
+                "# fit: irls={} reweighted={}",
+                cfg.fit_irls.name(),
+                counts.irls_reweighted
+            );
+        }
         // #228: the signed-bias projection is the only non-squared metric with
         // an exact closed-form arm. Its labels say why a candidate left the arm.
         let signed: u64 = fit::signed_fit_counts().iter().map(|(_, n)| n).sum();
@@ -7516,6 +7574,18 @@ fn main() {
                     fit_provenance_json
                 )
             };
+            // #611: the L1 schedule and the fits that ran it; absent for the default,
+            // so the historical object keeps its bytes.
+            let fitting_json = if cfg.fit_irls_active() {
+                format!(
+                    "{},\"fit_irls\":{},\"irls_reweighted\":{}}}",
+                    fitting_json.trim_end_matches('}'),
+                    jstr(cfg.fit_irls.name()),
+                    fit::fit_arm_counts_full().since(fit_before).irls_reweighted
+                )
+            } else {
+                fitting_json
+            };
             // #141: report the backend that actually guided the search, with
             // the device name and a reason when the CPU ran. This is derived
             // from the probe/outcome, never from the flags alone.
@@ -7592,7 +7662,7 @@ fn main() {
                 None => backend_json,
             };
             let result_json = format!(
-                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"lockbox\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"search\":{{\"candidates_evaluated\":{}}},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"lockbox\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"search\":{{\"candidates_evaluated\":{}{}}},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
                 jstr(VERSION),
@@ -7614,6 +7684,11 @@ fn main() {
                 prepared.prep.json(),
                 outcome.generations,
                 outcome.candidates_evaluated,
+                if cfg.fit_irls_active() {
+                    format!(",\"fit_irls\":{}", jstr(cfg.fit_irls.name()))
+                } else {
+                    String::new()
+                },
                 outcome.converged_early,
                 jstr(outcome.stop_reason),
                 // #18: the four convergence numbers.
