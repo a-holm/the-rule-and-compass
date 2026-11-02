@@ -761,6 +761,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   split, `--validation-frac`, a `forward_return` `--target-spec` and
   `--cost-bps` (or a target spec `cost_bps`, which gives `cost_bps / 2` per side; a different flag is refused, `--cost-override` prices another cost on purpose). Rows of one group closer than the label horizon overlap, so the per-row return would be earned several times against one cost: such a book is refused (exit 2); use `long:<h>,stride=<h>` or `long:1`. `--json` adds an `objective` block with the validation and test
   books, cash and buy-and-hold comparisons and the break-even cost.
+  With a trading objective every `pareto[i]` in `run.json` also carries `validation_book`: `objective` (the selection score, lower is better), `net_pnl`, `sharpe`, `trades`, `exposure` and `constant`, from the same exact CPU `f64` validation book that ranks the member; `null` when the member has no usable book. Without a trading objective the field is absent.
 * `--fitness pnl` (default `metric`) ranks every candidate in the search by the exact long/flat net
   regret `(B - net) / B` on the training rows, `B` the hindsight DP bound at the same cost
   (lower is better, all-flat is 1). Constants are still fitted with `--metric`. It needs a

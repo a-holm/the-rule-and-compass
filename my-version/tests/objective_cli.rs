@@ -729,3 +729,137 @@ fn stability_with_an_injected_fault_exits_6() {
     }
     assert_exits_6_with_message(&o);
 }
+
+// ---- #645: the validation book of every Pareto member ----
+
+fn pareto(j: &Json) -> &[Json] {
+    match at(j, &["pareto"]) {
+        Json::Arr(a) => a,
+        other => panic!("pareto is not an array: {other:?}"),
+    }
+}
+
+/// Exact re-score of one member: its printed expression on the raw rows with
+/// `t` in `[from, to]`, the simple return `exp_m1(r)`, `1[pred > 0]`, 5 bp per
+/// side.
+fn rescore(expression: &str, from: f64, to: f64) -> rcsr::trading::PathStats {
+    let vars = vec!["x1".to_string(), "x2".to_string()];
+    let tree = rcsr::parse::parse(expression, &vars).unwrap_or_else(|e| panic!("{expression}: {e:?}"));
+    let (mut pred, mut ret, mut time) = (Vec::new(), Vec::new(), Vec::new());
+    for i in 0..N {
+        let t = (T0 + 900 * i as i64) as f64;
+        if t < from || t > to {
+            continue;
+        }
+        let (x1, x2, r) = row(i);
+        pred.push(rcsr::expr::eval(&tree, &[x1, x2]));
+        ret.push(r.exp_m1());
+        time.push(t);
+    }
+    let rows = rcsr::trading::TradingRows { group: vec![0; time.len()], funding: Vec::new(), time };
+    let spec = rcsr::trading::TradingSpec { cost_bps: 5.0, ..Default::default() };
+    rcsr::trading::evaluate(&pred, &ret, &rows, &spec).unwrap()
+}
+
+fn validation_window(j: &Json) -> (f64, f64) {
+    match at(j, &["split", "validation_time"]) {
+        Json::Arr(a) if a.len() == 2 => (a[0].as_f64().unwrap(), a[1].as_f64().unwrap()),
+        other => panic!("validation_time: {other:?}"),
+    }
+}
+
+fn assert_members_match_rescore(j: &Json) -> usize {
+    let (from, to) = validation_window(j);
+    let mut scored = 0;
+    for m in pareto(j) {
+        let expression = at(m, &["expression"]).as_str().unwrap();
+        let book = at(m, &["validation_book"]);
+        if matches!(book, Json::Null) {
+            continue;
+        }
+        // A constant prints rounded, so only its flag is checked here; the
+        // finalist test covers an exact constant.
+        if at(book, &["constant"]) == &Json::Bool(true) {
+            continue;
+        }
+        let want = rescore(expression, from, to);
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * (1.0 + b.abs());
+        assert!(close(num(book, &["net_pnl"]), want.net_pnl), "{expression}: net {:?} vs {}", at(book, &["net_pnl"]), want.net_pnl);
+        match at(book, &["sharpe"]).as_f64() {
+            Some(s) => assert!(close(s, want.sharpe), "{expression}: sharpe"),
+            None => assert!(!want.sharpe.is_finite(), "{expression}: sharpe"),
+        }
+        assert!(close(num(book, &["exposure"]), want.exposure), "{expression}: exposure");
+        assert_eq!(num(book, &["trades"]), want.trades as f64, "{expression}: trades");
+        assert_eq!(at(book, &["constant"]), &Json::Bool(rcsr::trading::is_constant(
+            &rcsr::parse::parse(expression, &["x1".to_string(), "x2".to_string()]).unwrap()
+        )), "{expression}: constant");
+        scored += 1;
+    }
+    scored
+}
+
+#[test]
+fn every_pareto_member_reports_its_validation_book() {
+    let dir = scratch();
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let data = write_csv(&dir, "a.csv", None);
+    let mut extra = PNL.to_vec();
+    extra.extend(["--generations", "60", "--pop", "64"]);
+    let out = run(&data, &spec, &extra);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let j = json(&out);
+    assert!(pareto(&j).len() >= 2, "need a front of several members");
+    for m in pareto(&j) {
+        let book = at(m, &["validation_book"]);
+        if matches!(book, Json::Null) {
+            continue;
+        }
+        for key in ["objective", "net_pnl", "sharpe", "trades", "exposure", "constant"] {
+            assert!(book.get(key).is_some(), "missing {key}");
+        }
+    }
+    let finalist = pareto(&j).iter().find(|m| num(m, &["rank"]) == 1.0).unwrap();
+    let book = at(finalist, &["validation_book"]);
+    let o = at(&j, &["objective"]);
+    assert_eq!(num(book, &["objective"]), num(o, &["finalist", "validation_objective"]));
+    assert_eq!(num(book, &["net_pnl"]), num(o, &["validation", "net_pnl"]));
+    assert!(assert_members_match_rescore(&j) >= 1);
+}
+
+#[test]
+fn a_run_without_a_trading_objective_has_no_validation_book() {
+    let dir = scratch();
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let data = write_csv(&dir, "a.csv", None);
+    let out = run(&data, &spec, &["--validation-frac", "0.3"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("validation_book"));
+}
+
+#[test]
+fn a_declared_lockbox_is_never_part_of_a_member_book() {
+    let dir = scratch();
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let data = write_csv(&dir, "a.csv", None);
+    let lock_from = T0 + 900 * 340;
+    let lock_to = T0 + 900 * N as i64 + 900;
+    let range = format!("{lock_from},{lock_to}");
+    let mut extra = PNL.to_vec();
+    extra.extend(["--lockbox", &range, "--generations", "60", "--pop", "64"]);
+    let exclude = format!("t >= {}", lock_from - 1800);
+    let refused = run(&data, &spec, &extra);
+    assert_ne!(code(&refused), 0, "a test block that reaches the lockbox is refused");
+    extra.extend(["--exclude", &exclude]);
+    let out = run(&data, &spec, &extra);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let j = json(&out);
+    let (_, to) = validation_window(&j);
+    assert!(to < lock_from as f64, "validation ends at {to}, lockbox starts at {lock_from}");
+    // The re-score reads only rows before the lockbox and matches every member.
+    assert!(assert_members_match_rescore(&j) >= 1);
+    let validation_rows = num(&j, &["objective", "validation", "rows"]) as usize;
+    let first = at(&pareto(&j)[0], &["expression"]).as_str().unwrap().to_string();
+    let want = rescore(&first, validation_window(&j).0, to);
+    assert_eq!(validation_rows, want.rows);
+}

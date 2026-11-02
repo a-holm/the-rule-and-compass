@@ -1170,6 +1170,22 @@ fn fitness_member_json(book: &rcsr::trading::FitnessBook, pred: &[f64]) -> Strin
     )
 }
 
+const NO_VALIDATION_BOOK: &str = ",\"validation_book\":null";
+
+/// #645: the `"validation_book"` member of a Pareto entry, from the same book
+/// that scores the member for selection.
+fn validation_book_member_json(objective: f64, stats: &rcsr::trading::PathStats, constant: bool) -> String {
+    format!(
+        ",\"validation_book\":{{\"objective\":{},\"net_pnl\":{},\"sharpe\":{},\"trades\":{},\"exposure\":{},\"constant\":{}}}",
+        jnum(objective),
+        jnum(stats.net_pnl),
+        jnum(stats.sharpe),
+        stats.trades,
+        jnum(stats.exposure),
+        constant
+    )
+}
+
 /// JSON number, with non-finite values rendered as `null` (valid JSON).
 fn jnum(v: f64) -> String {
     if v.is_finite() {
@@ -2237,6 +2253,9 @@ struct Row {
     /// #480: the `"fitness"` member of the pareto JSON (leading comma); empty
     /// without `--fitness pnl`.
     fitness_json: String,
+    /// #645: the `"validation_book"` member of the pareto JSON (leading comma);
+    /// empty without a trading objective.
+    validation_book_json: String,
 }
 
 /// Cross-validation summary (issue #19).
@@ -6391,15 +6410,20 @@ fn main() {
                 Some(v) => search::eval_error(&s.tree, v, cfg.metric),
                 None => f64::NAN,
             };
-            let objective_value = match (&trading_spec, &prepared.validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
+            let (objective_value, validation_book_json) = match (&trading_spec, &prepared.validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
                 (Some(tspec), Some(v), Some(slice)) => {
                     let ctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
                     match trading_book(&s.tree, &v.x, slice, ctx, tspec) {
-                        Ok(stats) => objective.score(&stats, tspec.min_trades),
-                        Err(_) => f64::INFINITY,
+                        Ok(stats) => {
+                            let value = objective.score(&stats, tspec.min_trades);
+                            let book = validation_book_member_json(value, &stats, rcsr::trading::is_constant(&s.tree));
+                            (value, book)
+                        }
+                        Err(_) => (f64::INFINITY, NO_VALIDATION_BOOK.to_string()),
                     }
                 }
-                _ => f64::NAN,
+                (Some(_), _, _) => (f64::NAN, NO_VALIDATION_BOOK.to_string()),
+                _ => (f64::NAN, String::new()),
             };
             let pred: Vec<f64> = prepared
                 .train
@@ -6502,6 +6526,7 @@ fn main() {
                     .as_ref()
                     .map(|b| fitness_member_json(b, &pred))
                     .unwrap_or_default(),
+                validation_book_json,
             }
         })
         .collect();
@@ -7341,7 +7366,7 @@ fn main() {
                     } else {
                         String::new()
                     };
-                    let dimensions = format!("{}{}{}", dimensions, r.gate_json, r.fitness_json);
+                    let dimensions = format!("{}{}{}{}", dimensions, r.gate_json, r.fitness_json, r.validation_book_json);
                     // Only a run that actually has a selection criterion gains
                     // the new fields; an ordinary run stays byte-identical.
                     let selection_json = if select_by.is_some() {
@@ -7782,7 +7807,7 @@ fn main() {
                 } else {
                     String::new()
                 };
-                let dimensions = format!("{}{}{}", dimensions, r.gate_json, r.fitness_json);
+                let dimensions = format!("{}{}{}{}", dimensions, r.gate_json, r.fitness_json, r.validation_book_json);
                 let selection_json = if select_by.is_some() {
                     format!(
                         "\"archive_rank\":{},\"validation_error\":{},",
