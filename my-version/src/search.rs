@@ -1062,6 +1062,10 @@ struct GpuSearch {
     fit_ms: f64,
     /// #496: the polish-phase part of `fit_ms`, apportioned by cycle ratio.
     fit_polish_ms: f64,
+    /// #601: device fit launches, candidates they carried, longest launch (ms).
+    fit_calls: usize,
+    fit_call_candidates: usize,
+    fit_call_ms_max: f64,
     /// #169: wall time spent in the whole fit stage (kernel, launch, CPU
     /// fallback and write-back), milliseconds.
     fit_host_ms: f64,
@@ -1350,6 +1354,9 @@ impl GpuSearch {
                     fit_status_by_label: BTreeMap::new(),
                     fit_ms: 0.0,
                     fit_polish_ms: 0.0,
+                    fit_calls: 0,
+                    fit_call_candidates: 0,
+                    fit_call_ms_max: 0.0,
                     fit_host_ms: 0.0,
                     fit_fallback_ms: 0.0,
                     fit_gate_ms: 0.0,
@@ -1545,6 +1552,9 @@ impl GpuSearch {
             if ms > 0.0 {
                 self.fit_ms += ms as f64;
                 self.fit_polish_ms += dev.take_polish_ms(ms);
+                self.fit_calls += 1;
+                self.fit_call_candidates += plans.len();
+                self.fit_call_ms_max = self.fit_call_ms_max.max(ms as f64);
                 // #284: the fit kernel is one device interval on the run clock;
                 // its duration is the raw event time, not the host envelope.
                 match dev.take_span_start_s(crate::gpu::SPAN_FIT) {
@@ -1854,6 +1864,56 @@ impl GpuSearch {
         }
     }
 
+    /// #589: replace every device `+inf` of `slots` (status 2: the f32 program
+    /// left the f32 range) by the exact CPU score, before promotion, the
+    /// archive or migration read it. The f64 prefix probe settles a candidate
+    /// that is non-finite there; the others get a full pass on the fallback
+    /// pool.
+    fn check_device_nonfinite(
+        &mut self,
+        islands: &mut [Vec<Ind>],
+        slots: &[(usize, usize)],
+        train: &Sample,
+        cfg: &Config,
+        generation: usize,
+    ) {
+        if slots.is_empty() {
+            return;
+        }
+        let rows = EvalSample { sample: train, cols: None };
+        let full: Vec<(usize, usize)> = slots
+            .iter()
+            .copied()
+            .filter(|&(i, j)| {
+                let tree = &islands[i][j].tree;
+                cfg.accepts_dimensions(tree) && nonfinite_prefix(tree, &rows, cfg) != Some(true)
+            })
+            .collect();
+        let stats = self.stats.entry(generation).or_default();
+        stats.nonfinite += slots.len();
+        stats.nonfinite_full += full.len();
+        if full.is_empty() {
+            return;
+        }
+        let view = EvalSample::new(train, cfg);
+        let jobs: Vec<(usize, Node)> = full
+            .iter()
+            .map(|&(i, j)| (0, islands[i][j].tree.clone()))
+            .collect();
+        let (errors, seconds) = self
+            .fallback
+            .as_ref()
+            .expect("a GPU search owns its fallback pool")
+            .score(jobs, &view, cfg);
+        let stats = self.stats.entry(generation).or_default();
+        for (&(i, j), e) in full.iter().zip(errors) {
+            stats.nonfinite_cpu_finite += e.is_finite() as usize;
+            islands[i][j].error = e;
+        }
+        stats.nonfinite_seconds += seconds;
+        self.ledger.record_eval_fallback(full.len() as u64, seconds);
+    }
+
     /// #288: score one explicit set of pending candidates through the exact
     /// order-statistic/rank batch entry point.
     ///
@@ -1926,6 +1986,7 @@ impl GpuSearch {
                 .submit(jobs, view, cfg)
         });
 
+        let mut nonfinite: Vec<(usize, usize)> = Vec::new();
         let mut gpu_error: Option<String> = None;
         if !plans.is_empty() {
             let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
@@ -1933,6 +1994,9 @@ impl GpuSearch {
             match self.ev.score_stat_batch(&refs, &constants, stat) {
                 Some(values) if values.len() == refs.len() => {
                     for (&(i, j), value) in slots.iter().zip(values) {
+                        if value.is_none() {
+                            nonfinite.push((i, j));
+                        }
                         islands[i][j].error = value.unwrap_or(f64::INFINITY);
                     }
                     self.device_eval_used = true;
@@ -1970,6 +2034,7 @@ impl GpuSearch {
         if let Some(e) = gpu_error {
             return Err(e);
         }
+        self.check_device_nonfinite(islands, &nonfinite, train, cfg, generation);
         Ok(())
     }
 
@@ -2107,6 +2172,7 @@ impl GpuSearch {
                 .submit(jobs, view, cfg)
         });
 
+        let mut nonfinite: Vec<(usize, usize)> = Vec::new();
         let mut gpu_error: Option<String> = None;
         if !pool.is_empty() {
             let objective = self
@@ -2129,6 +2195,7 @@ impl GpuSearch {
                     islands[i][j].error = if status.is_ok() {
                         value
                     } else {
+                        nonfinite.push((i, j));
                         f64::INFINITY
                     };
                 }
@@ -2179,6 +2246,7 @@ impl GpuSearch {
             pending.len(),
             eval_workload.bytes,
         );
+        self.check_device_nonfinite(islands, &nonfinite, train, cfg, generation);
         Ok(())
     }
 
@@ -2235,6 +2303,9 @@ impl GpuSearch {
             fit_rescore_s: 0.0,
             fit_ms: self.fit_ms,
             fit_polish_ms: self.fit_polish_ms,
+            fit_calls: self.fit_calls,
+            fit_call_candidates: self.fit_call_candidates,
+            fit_call_ms_max: self.fit_call_ms_max,
             fit_host_ms: self.fit_host_ms,
             fit_fallback_ms: self.fit_fallback_ms,
             fit_gate_ms: self.fit_gate_ms,
@@ -2273,6 +2344,10 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             native: batch.map(|b| b.native).unwrap_or(0),
             lowered: batch.map(|b| b.lowered).unwrap_or(0),
             fallbacks: batch.map(|b| b.fallbacks).unwrap_or(0),
+            nonfinite: batch.map(|b| b.nonfinite).unwrap_or(0),
+            nonfinite_full: batch.map(|b| b.nonfinite_full).unwrap_or(0),
+            nonfinite_cpu_finite: batch.map(|b| b.nonfinite_cpu_finite).unwrap_or(0),
+            nonfinite_seconds: batch.map(|b| b.nonfinite_seconds).unwrap_or(0.0),
             fit_host_s: self.fit_host_ms / 1000.0,
             fit_fallback_s: self.fit_fallback_ms / 1000.0,
             fit_gate_s: self.fit_gate_ms / 1000.0,
@@ -2779,7 +2854,7 @@ fn eval_pipeline_jobs(
     g: &mut GpuSearch,
     jobs: &[PipelineJob],
     generation: usize,
-) -> Result<(Vec<usize>, Vec<f64>), String> {
+) -> Result<(Vec<usize>, Vec<(f64, bool)>), String> {
     if generation >= 2 && crate::gpu::injected_fault("pipeline") {
         return Err(format!("{}the pipeline batch", crate::gpu::INJECTED_REFUSAL));
     }
@@ -2821,9 +2896,9 @@ fn eval_pipeline_jobs(
         .zip(batch.status.iter())
         .map(|(&value, &status)| {
             if status.is_ok() {
-                value
+                (value, false)
             } else {
-                f64::INFINITY
+                (f64::INFINITY, true)
             }
         })
         .collect();
@@ -2832,12 +2907,13 @@ fn eval_pipeline_jobs(
 
 #[cfg(feature = "cuda")]
 fn score_pipeline_batch(
-    mut jobs: Vec<PipelineJob>,
+    jobs: Vec<PipelineJob>,
     gpu: &mut Option<GpuSearch>,
     results: &mut [Vec<Option<PipelineResult>>],
     train: &Sample,
     generation: usize,
     fit: Option<PipelineFit>,
+    pending: &mut PipelineFitQueue,
 ) -> Result<(), String> {
     let Some(g) = gpu.as_mut() else {
         return Err("pipeline scoring without a GPU evaluator".to_string());
@@ -2851,10 +2927,11 @@ fn score_pipeline_batch(
         // the route ledger and the backend claim come from what ran.
         g.device_eval_used = true;
     }
-    for (&k, &e) in kept.iter().zip(&errs) {
+    for (&k, &(e, bad)) in kept.iter().zip(&errs) {
         let (i, j) = (jobs[k].0, jobs[k].1);
         results[i][j] = Some(PipelineResult {
             error: e,
+            nonfinite: bad,
             offered: offered_hash[k],
             tree: None,
         });
@@ -2863,16 +2940,42 @@ fn score_pipeline_batch(
         return Ok(());
     };
 
-    // #286: fit the candidates of this batch while the island threads keep
-    // producing the next ones. Every candidate with a plan is fitted (the wide
-    // admission set), exactly as the synchronous `fit_pending` loop would.
+    // #601: the candidates with constants wait in the queue until a device
+    // call is big enough to fill the GPU (`FIT_BATCH_MIN`).
+    for (k, job) in jobs.into_iter().enumerate() {
+        match crate::fit::gpu_fit_plan_reason(&job.2) {
+            Err(crate::fit::GpuFitReject::NoConstants) => {}
+            plan => pending.push(job, offered_hash[k], plan),
+        }
+    }
+    if pending.planned() >= FIT_BATCH_MIN {
+        fit_pipeline_queue(pending, gpu, results, train, generation, fit)?;
+    }
+    Ok(())
+}
+
+/// #601: fit everything the queue holds in one device call, then score the
+/// fitted trees. Called when the queue reaches `FIT_BATCH_MIN` planned
+/// candidates and once more when the generation's queue closes.
+#[cfg(feature = "cuda")]
+fn fit_pipeline_queue(
+    pending: &mut PipelineFitQueue,
+    gpu: &mut Option<GpuSearch>,
+    results: &mut [Vec<Option<PipelineResult>>],
+    train: &Sample,
+    generation: usize,
+    fit: PipelineFit,
+) -> Result<(), String> {
+    let Some(g) = gpu.as_mut() else {
+        return Err("pipeline scoring without a GPU evaluator".to_string());
+    };
+    let (mut jobs, offered_hash, entries) = pending.take();
     let mut plans: Vec<(usize, crate::fit::GpuFitPlan)> = Vec::new();
     let mut fallback_jobs: Vec<usize> = Vec::new();
     let mut fallback_cause: BTreeMap<usize, FitFallbackCause> = BTreeMap::new();
-    for (k, (_, _, tree)) in jobs.iter().enumerate() {
-        match crate::fit::gpu_fit_plan_reason(tree) {
+    for (k, entry) in entries.into_iter().enumerate() {
+        match entry {
             Ok(plan) => plans.push((k, plan)),
-            Err(crate::fit::GpuFitReject::NoConstants) => {}
             Err(_) => fallback_jobs.push(k),
         }
     }
@@ -2898,6 +3001,7 @@ fn score_pipeline_batch(
         crate::fit::note_gpu_fit(false);
         results[i][j] = Some(PipelineResult {
             error: f64::NAN,
+            nonfinite: false,
             offered: offered_hash[k],
             tree: None,
         });
@@ -2918,6 +3022,9 @@ fn score_pipeline_batch(
         if ms > 0.0 {
             g.fit_ms += ms as f64;
             g.fit_polish_ms += g.ev.take_polish_ms(ms);
+            g.fit_calls += 1;
+            g.fit_call_candidates += plans.len();
+            g.fit_call_ms_max = g.fit_call_ms_max.max(ms as f64);
             // #600: the fit kernel is one device interval on the run clock.
             match g.ev.take_span_start_s(crate::gpu::SPAN_FIT) {
                 Some(start_s) => g.ledger.record_fit_kernel_event(0, start_s, ms as f64 / 1000.0),
@@ -2937,6 +3044,7 @@ fn score_pipeline_batch(
                 crate::fit::note_gpu_fit(false);
                 results[i][j] = Some(PipelineResult {
                     error: f64::NAN,
+                    nonfinite: false,
                     offered: offered_hash[*k],
                     tree: None,
                 });
@@ -2965,6 +3073,7 @@ fn score_pipeline_batch(
                     crate::fit::note_gpu_fit(false);
                     results[i][j] = Some(PipelineResult {
                         error: f64::NAN,
+                        nonfinite: false,
                         offered: offered_hash[*k],
                         tree: None,
                     });
@@ -3037,10 +3146,11 @@ fn score_pipeline_batch(
         let rescore_start = std::time::Instant::now();
         let (kept2, errs2) = eval_pipeline_jobs(g, &refit, generation)?;
         g.drain_eval_ms += rescore_start.elapsed().as_secs_f64() * 1000.0;
-        for (&pos, &err) in kept2.iter().zip(&errs2) {
+        for (&pos, &(err, bad)) in kept2.iter().zip(&errs2) {
             let (i, j, tree) = &refit[pos];
             results[*i][*j] = Some(PipelineResult {
                 error: err,
+                nonfinite: bad,
                 offered: offered_hash[fitted[pos]],
                 tree: Some(tree.clone()),
             });
@@ -3733,30 +3843,35 @@ fn eval_error_and_descriptor(
 /// #500: rows probed for a non-finite prediction before a full re-score.
 const INF_PROBE_ROWS: usize = 2048;
 
-/// #500: whether the first rows already hold a non-finite prediction, which
-/// makes the full score `+inf` for the plain metrics. Shapes whose score does
-/// not follow that rule (implicit, weighted, multi-output, descriptor, P&L
-/// book) report `false` and take the full pass.
-fn prefix_is_non_finite(tree: &Node, data: &EvalSample, cfg: &Config) -> bool {
+/// #500/#589: whether a non-finite prediction in the first rows decides the
+/// score. `Some(true)`: the first rows hold one, which makes the full score
+/// `+inf` for the plain metrics and the P&L book. `Some(false)`: the prefix is
+/// finite and the full pass decides. `None`: the score does not follow that
+/// rule (implicit, weighted, multi-output), so the full pass always runs.
+fn nonfinite_prefix(tree: &Node, data: &EvalSample, cfg: &Config) -> Option<bool> {
     let s = data.sample;
     if s.is_empty()
         || s.is_multi()
         || !s.w.is_empty()
-        || cfg.metric.is_implicit()
-        || cfg.qd_bins > 0
-        || cfg.fitness.book().is_some()
+        || (cfg.fitness.book().is_none() && cfg.metric.is_implicit())
     {
-        return false;
+        return None;
     }
     let rows = s.x.len().min(INF_PROBE_ROWS);
     if let Some(cols) = &data.cols {
         if let Some(program) = crate::eval_soa::compile(tree) {
             let mut pred = vec![0.0; rows];
             crate::eval_soa::eval_batch(&program, cols, rows, &mut pred);
-            return pred.iter().any(|p| !p.is_finite());
+            return Some(pred.iter().any(|p| !p.is_finite()));
         }
     }
-    s.x.iter().take(rows).any(|row| !eval(tree, row).is_finite())
+    Some(s.x.iter().take(rows).any(|row| !eval(tree, row).is_finite()))
+}
+
+/// #500: the prefix decides the score and the run keeps no descriptor
+/// (`--qd-bins`) that a full re-score would have to rebuild.
+fn prefix_is_non_finite(tree: &Node, data: &EvalSample, cfg: &Config) -> bool {
+    cfg.qd_bins == 0 && nonfinite_prefix(tree, data, cfg) == Some(true)
 }
 
 /// #475: one candidate's prediction vector, owned.
@@ -4507,8 +4622,7 @@ fn select_promoted(
             })
             .collect();
         ranked.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            crate::error_order::cmp_error(a.1, b.1)
                 .then(
                     a.2.partial_cmp(&b.2)
                         .unwrap_or(std::cmp::Ordering::Equal),
@@ -4640,9 +4754,7 @@ fn promoted_count(pop: usize) -> usize {
 /// duplicates are removed by the archive, not here.
 fn select_population(candidates: &mut Vec<Ind>, pop: usize) {
     candidates.sort_by(|a, b| {
-        a.error
-            .partial_cmp(&b.error)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        crate::error_order::cmp_error(a.error, b.error)
             .then(
                 a.complexity
                     .partial_cmp(&b.complexity)
@@ -4660,7 +4772,7 @@ fn canonical_front(cap: usize, mut scored: Vec<Sol>) -> Archive {
     scored.sort_by(|a, b| {
         a.cost
             .total_cmp(&b.cost)
-            .then(a.error.total_cmp(&b.error))
+            .then(crate::error_order::cmp_error(a.error, b.error))
             .then(expr::structural_hash(&a.tree).cmp(&expr::structural_hash(&b.tree)))
     });
     let mut out = Archive::new(cap);
@@ -4899,7 +5011,15 @@ fn refit_to_fixpoint(
 /// Lexicographic parsimony pressure: better error wins; if the errors are equal
 /// to within a relative tolerance, the smaller expression wins. This controls
 /// bloat without a tunable penalty coefficient (Luke & Panait 2006).
+/// A finite error always beats a non-finite one; two non-finite trees compare by
+/// complexity.
 fn better(a: &Ind, b: &Ind) -> bool {
+    match (a.error.is_finite(), b.error.is_finite()) {
+        (true, false) => return true,
+        (false, true) => return false,
+        (false, false) => return a.complexity < b.complexity,
+        (true, true) => {}
+    }
     let tol = 1e-9 * (1.0 + a.error.abs().max(b.error.abs()));
     if a.error < b.error - tol {
         return true;
@@ -5093,8 +5213,64 @@ type PipelineJob = (usize, usize, Node);
 #[derive(Clone, Debug)]
 struct PipelineResult {
     error: f64,
+    /// #589: the error is a device `+inf` with status 2, to be checked on the CPU.
+    nonfinite: bool,
     offered: u64,
     tree: Option<Node>,
+}
+
+/// #601: the fewest planned candidates one overlap fit call carries. A fit
+/// block owns a candidate for the whole pass over the rows, so a call with
+/// fewer blocks than the device holds takes as long as a full one.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const FIT_BATCH_MIN: usize = 128;
+
+/// #601: candidates of the overlap queue that wait for a device fit call.
+/// Each entry is the offered job, its structural hash and the fit plan or the
+/// reason it has none.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Default)]
+struct PipelineFitQueue {
+    jobs: Vec<PipelineJob>,
+    offered: Vec<u64>,
+    entries: Vec<Result<crate::fit::GpuFitPlan, crate::fit::GpuFitReject>>,
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+impl PipelineFitQueue {
+    fn push(
+        &mut self,
+        job: PipelineJob,
+        offered: u64,
+        plan: Result<crate::fit::GpuFitPlan, crate::fit::GpuFitReject>,
+    ) {
+        self.jobs.push(job);
+        self.offered.push(offered);
+        self.entries.push(plan);
+    }
+
+    fn planned(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_ok()).count()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn take(
+        &mut self,
+    ) -> (
+        Vec<PipelineJob>,
+        Vec<u64>,
+        Vec<Result<crate::fit::GpuFitPlan, crate::fit::GpuFitReject>>,
+    ) {
+        (
+            std::mem::take(&mut self.jobs),
+            std::mem::take(&mut self.offered),
+            std::mem::take(&mut self.entries),
+        )
+    }
 }
 
 /// #286: the device fit arm carried by the overlap queue when the admission
@@ -5234,7 +5410,7 @@ fn evolve_island(
     if !screened && !afp {
         if let Some(best) = isl
             .iter()
-            .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal))
+            .min_by(|a, b| crate::error_order::cmp_error(a.error, b.error))
         {
             next.push(best.clone());
         }
@@ -5532,6 +5708,15 @@ pub struct GpuGenStats {
     pub fit_fallback_bounded: usize,
     /// #255: workers the fallback batch used.
     pub fit_fallback_workers: usize,
+    /// #589: device results with status 2 (non-finite output) in this generation.
+    pub nonfinite: usize,
+    /// #589: of those, the ones the f64 prefix probe did not settle, so a full
+    /// CPU pass ran.
+    pub nonfinite_full: usize,
+    /// #589: of the full passes, the ones whose CPU score is finite.
+    pub nonfinite_cpu_finite: usize,
+    /// #589: wall seconds of the full CPU passes.
+    pub nonfinite_seconds: f64,
 }
 
 /// #131: aggregate GPU usage for a run.
@@ -5569,6 +5754,10 @@ pub struct GpuRunStats {
     pub fit_ms: f64,
     /// #496: the polish-phase part of `fit_ms`, apportioned by per-block cycles.
     pub fit_polish_ms: f64,
+    /// #601: device fit launches, the candidates they carried, longest launch (ms).
+    pub fit_calls: usize,
+    pub fit_call_candidates: usize,
+    pub fit_call_ms_max: f64,
     /// #496: arithmetic of the device fit polish.
     pub fit_polish: crate::fit::FitPolish,
     /// #169: wall time spent in the whole fit stage, milliseconds.
@@ -6098,6 +6287,12 @@ pub struct GpuSnapshot {
     pub native: usize,
     pub lowered: usize,
     pub fallbacks: usize,
+    /// #589: device status-2 results, the full CPU passes among them, those
+    /// finite on the CPU, and the wall seconds of the passes.
+    pub nonfinite: usize,
+    pub nonfinite_full: usize,
+    pub nonfinite_cpu_finite: usize,
+    pub nonfinite_seconds: f64,
     /// #256: whole fit stage wall (device call, CPU fallback, write-back).
     pub fit_host_s: f64,
     /// #256: exact CPU fit-fallback wall, a subset of `fit_host_s`.
@@ -6135,6 +6330,10 @@ impl GpuSnapshot {
             native: self.native,
             lowered: self.lowered,
             fallbacks: self.fallbacks,
+            nonfinite: self.nonfinite,
+            nonfinite_full: self.nonfinite_full,
+            nonfinite_cpu_finite: self.nonfinite_cpu_finite,
+            nonfinite_seconds: self.nonfinite_seconds,
             fit_host_s: (self.fit_host_s - earlier.fit_host_s).max(0.0),
             fit_fallback_s: (self.fit_fallback_s - earlier.fit_fallback_s).max(0.0),
             fit_gate_s: (self.fit_gate_s - earlier.fit_gate_s).max(0.0),
@@ -6278,6 +6477,10 @@ fn dev_generation(
         fallbacks: g.fallbacks,
         fallback_s: g.fallback_s,
         fallback_workers: g.fallback_workers,
+        nonfinite: g.nonfinite,
+        nonfinite_full: g.nonfinite_full,
+        nonfinite_cpu_finite: g.nonfinite_cpu_finite,
+        nonfinite_seconds: g.nonfinite_seconds,
     });
     // #256: the GPU fit stage runs inside the evaluator window (and, with
     // screening, inside the carried-refit and island windows). It is its own
@@ -6504,6 +6707,10 @@ fn run_postfix_search(
             fit_gate_seconds: 0.0,
             fit_fallback_bounded: 0,
             fit_fallback_workers: 0,
+            nonfinite: 0,
+            nonfinite_full: 0,
+            nonfinite_cpu_finite: 0,
+            nonfinite_seconds: 0.0,
         });
 
         // #256: a time-budget stop is not convergence and not terminal. The
@@ -7773,6 +7980,8 @@ fn run_search(
                 .map_or((0.0, 0.0), |g| (g.drain_eval_ms, g.drain_fit_ms));
             #[cfg(feature = "cuda")]
             let mut pipeline_scored = false;
+            #[cfg(feature = "cuda")]
+            let mut fit_queue = PipelineFitQueue::default();
             std::thread::scope(|s| {
                 // The queue lives in the scope: producers take a clone of the
                 // sender, and `drain` consumes the original so it can end.
@@ -7837,8 +8046,22 @@ fn run_search(
                             gen_train,
                             gen,
                             pipeline_fit,
+                            &mut fit_queue,
                         )
                     });
+                    if pipeline_error.is_none() {
+                        if let (Some(fit), false) = (pipeline_fit, fit_queue.is_empty()) {
+                            pipeline_error = fit_pipeline_queue(
+                                &mut fit_queue,
+                                &mut gpu,
+                                &mut pipeline_results,
+                                gen_train,
+                                gen,
+                                fit,
+                            )
+                            .err();
+                        }
+                    }
                 }
 
                 for h in handles {
@@ -7857,6 +8080,7 @@ fn run_search(
                     // #560: a result for a replaced candidate is dropped, which
                     // leaves the slot pending for `score_generation` below; a
                     // rejected dimension keeps its infinite error.
+                    let mut nonfinite_slots: Vec<(usize, usize)> = Vec::new();
                     for (i, slots) in pipeline_results.iter_mut().enumerate() {
                         for (j, value) in slots.iter_mut().enumerate() {
                             let Some(r) = value.take() else { continue };
@@ -7873,7 +8097,13 @@ fn run_search(
                             } else {
                                 f64::INFINITY
                             };
+                            if r.nonfinite {
+                                nonfinite_slots.push((i, j));
+                            }
                         }
+                    }
+                    if let Some(g) = gpu.as_mut() {
+                        g.check_device_nonfinite(&mut islands, &nonfinite_slots, gen_train, cfg, gen);
                     }
                     if pipeline_error.is_none() {
                         if pipeline_scored {
@@ -7929,9 +8159,7 @@ fn run_search(
                     }
                     let mut offspring = std::mem::take(pop);
                     offspring.sort_by(|a, b| {
-                        a.error
-                            .partial_cmp(&b.error)
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                        crate::error_order::cmp_error(a.error, b.error)
                     });
                     let top: Vec<Ind> = offspring.into_iter().take(promote).collect();
                     // #463: the refits are independent; results keep the order.
@@ -8130,9 +8358,7 @@ fn run_search(
                     .map(|pop| {
                         pop.iter()
                             .min_by(|a, b| {
-                                a.error
-                                    .partial_cmp(&b.error)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                crate::error_order::cmp_error(a.error, b.error)
                             })
                             .map(|i| i.tree.clone())
                     })
@@ -8142,9 +8368,7 @@ fn run_search(
                     .map(|pop| {
                         pop.iter()
                             .min_by(|a, b| {
-                                a.error
-                                    .partial_cmp(&b.error)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                crate::error_order::cmp_error(a.error, b.error)
                             })
                             .map_or(0, |i| i.age)
                     })
@@ -8204,9 +8428,7 @@ fn run_search(
                                 .iter()
                                 .enumerate()
                                 .max_by(|(_, a), (_, b)| {
-                                    a.error
-                                        .partial_cmp(&b.error)
-                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                    crate::error_order::cmp_error(a.error, b.error)
                                 })
                                 .map(|(i, _)| i)
                         });
@@ -8650,6 +8872,28 @@ mod tests {
             .collect()
     }
 
+    /// #601: only candidates with a plan count toward the flush threshold, and
+    /// `take` empties the queue.
+    #[test]
+    fn fit_queue_counts_planned_candidates_and_empties_on_take() {
+        let mut q = PipelineFitQueue::default();
+        assert!(q.is_empty());
+        for (i, j, plan) in affine_plans(3) {
+            q.push((i, j, crate::expr::input(0)), j as u64, Ok(plan));
+        }
+        q.push(
+            (0, 9, crate::expr::input(0)),
+            9,
+            Err(crate::fit::GpuFitReject::UnsupportedOp),
+        );
+        assert_eq!(q.planned(), 3);
+        assert!(!q.is_empty());
+        let (jobs, offered, entries) = q.take();
+        assert_eq!((jobs.len(), offered.len(), entries.len()), (4, 4, 4));
+        assert!(q.is_empty());
+        assert_eq!(q.planned(), 0);
+    }
+
     /// A launch so expensive that one fit cannot amortise it but 64 can.
     fn costly_launch() -> crate::dispatch::Dispatcher {
         let mut cal = crate::dispatch::Calibration::default();
@@ -8853,6 +9097,111 @@ mod tests {
             descriptor: None,
             age: 0,
         }
+    }
+
+    /// #587: a finite error beats a non-finite one whatever the complexity.
+    #[test]
+    fn better_prefers_finite_over_non_finite() {
+        let finite = pending_ind(5.0, 40.0);
+        for bad in [f64::INFINITY, f64::NAN] {
+            let simple_bad = pending_ind(bad, 1.0);
+            assert!(better(&finite, &simple_bad), "finite vs {bad}");
+            assert!(!better(&simple_bad, &finite), "{bad} vs finite");
+        }
+    }
+
+    /// #587: two non-finite trees still compare by complexity.
+    #[test]
+    fn better_orders_two_non_finite_by_complexity() {
+        let small = pending_ind(f64::INFINITY, 2.0);
+        let large = pending_ind(f64::INFINITY, 9.0);
+        assert!(better(&small, &large));
+        assert!(!better(&large, &small));
+        assert!(!better(&small, &small));
+    }
+
+    /// #587: finite pairs keep the relative-tolerance parsimony rule.
+    #[test]
+    fn better_finite_pairs_keep_the_tolerance_band() {
+        assert!(better(&pending_ind(1.0, 9.0), &pending_ind(2.0, 3.0)), "clear error win");
+        assert!(!better(&pending_ind(2.0, 3.0), &pending_ind(1.0, 9.0)));
+        let tol = 1e-9 * (1.0 + 2.0);
+        let inside = pending_ind(2.0 - 0.5 * tol, 9.0);
+        assert!(better(&pending_ind(2.0, 3.0), &inside), "inside the band the smaller wins");
+        assert!(!better(&inside, &pending_ind(2.0, 3.0)));
+        let outside = pending_ind(2.0 - 2.0 * tol, 9.0);
+        assert!(better(&outside, &pending_ind(2.0, 3.0)), "outside the band the error wins");
+    }
+
+    /// #622: the sequence of (error class bits, complexity) after a sort.
+    fn error_key(inds: &[Ind]) -> Vec<(u64, u64)> {
+        inds.iter()
+            .map(|i| {
+                let e = if i.error.is_nan() { u64::MAX } else { i.error.to_bits() };
+                (e, i.complexity.to_bits())
+            })
+            .collect()
+    }
+
+    /// #622: a NaN error gives the same population order for every input order.
+    #[test]
+    fn select_population_orders_nan_independent_of_input_order() {
+        let base = vec![
+            pending_ind(f64::NAN, 4.0),
+            pending_ind(3.0, 5.0),
+            pending_ind(f64::INFINITY, 7.0),
+            pending_ind(1.0, 9.0),
+            pending_ind(f64::INFINITY, 2.0),
+            pending_ind(-f64::NAN, 3.0),
+            pending_ind(2.0, 3.0),
+        ];
+        let mut reference: Option<Vec<(u64, u64)>> = None;
+        for shift in 0..base.len() {
+            for reversed in [false, true] {
+                let mut v = base.clone();
+                v.rotate_left(shift);
+                if reversed {
+                    v.reverse();
+                }
+                select_population(&mut v, 7);
+                let key = error_key(&v);
+                match &reference {
+                    None => reference = Some(key),
+                    Some(r) => assert_eq!(&key, r, "shift {shift} reversed {reversed}"),
+                }
+            }
+        }
+        let errors: Vec<f64> = {
+            let mut v = base.clone();
+            select_population(&mut v, 7);
+            v.iter().map(|i| i.error).collect()
+        };
+        assert_eq!(&errors[..3], &[1.0, 2.0, 3.0]);
+        assert_eq!(&errors[3..5], &[f64::INFINITY, f64::INFINITY]);
+        assert!(errors[5].is_nan() && errors[6].is_nan());
+    }
+
+
+    /// #587: simple non-finite trees no longer win tournaments against complex
+    /// finite ones.
+    #[test]
+    fn tournament_non_finite_winners_need_an_all_non_finite_draw() {
+        let island: Vec<Ind> = (0..64)
+            .map(|i| {
+                if i % 2 == 0 {
+                    pending_ind(f64::INFINITY, 1.0)
+                } else {
+                    pending_ind(1.0 + i as f64, 30.0)
+                }
+            })
+            .collect();
+        let mut rng = Mt::new(7);
+        let wins = (0..2000)
+            .filter(|_| !island[tournament(&island, &mut rng, 3)].error.is_finite())
+            .count();
+        // A non-finite winner needs all 3 draws non-finite: about 1 in 8. The old
+        // comparator let any non-finite draw win.
+        assert!(wins < 2000 / 5, "non-finite winners: {wins} of 2000");
     }
 
     /// #169: the admission fraction is a pure function of the population size
@@ -11005,5 +11354,105 @@ mod tests {
             .map(|m| m.error)
             .fold(f64::INFINITY, f64::min);
         assert!(best <= 1e-18, "best error {}", best);
+    }
+
+    /// #589: `n` rows with `x0` negative except three rows at 4.9, and `x1`
+    /// the row number.
+    fn overflow_sample(n: usize) -> Sample {
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = if i + 3 >= n { 4.9 } else { -5.5 + 5.4 * i as f64 / (n - 4) as f64 };
+            x.push(vec![a, i as f64]);
+            y.push(0.003 * (0.1 * i as f64).sin());
+        }
+        Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None }
+    }
+
+    /// `1 / (x1 - row)`: non-finite on exactly one row.
+    fn pole_at(row: usize) -> Node {
+        node(Op::Div, vec![constant(1.0), node(Op::Sub, vec![input(1), constant(row as f64)])])
+    }
+
+    /// #589: the prefix probe also decides the long/flat book, which scores
+    /// `+inf` on any non-finite prediction, and gives no answer for weights.
+    #[test]
+    fn nonfinite_prefix_covers_the_long_pnl_book() {
+        let s = overflow_sample(3_000);
+        let cfg = Config {
+            fitness: Fitness::LongPnl(pnl_book(&s)),
+            ..Config::default()
+        };
+        let data = EvalSample::new(&s, &cfg);
+        let early = pole_at(10);
+        let late = pole_at(2_500);
+        assert_eq!(nonfinite_prefix(&early, &data, &cfg), Some(true));
+        assert_eq!(nonfinite_prefix(&late, &data, &cfg), Some(false));
+        assert_eq!(score_tree(&early, &data, &cfg), f64::INFINITY);
+        assert_eq!(score_tree(&late, &data, &cfg), f64::INFINITY);
+        let mut weighted = overflow_sample(3_000);
+        weighted.w = vec![1.0; weighted.y.len()];
+        let wdata = EvalSample::new(&weighted, &cfg);
+        assert_eq!(nonfinite_prefix(&early, &wdata, &cfg), None);
+    }
+
+    /// #589: the device runs the program in f32. Every status-2 `+inf` is the
+    /// exact CPU score after `GpuSearch::score`, before promotion reads it.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_nonfinite_is_checked_before_promotion() {
+        if !crate::gpu::probe().available() {
+            eprintln!("skipping GPU test: no usable CUDA device");
+            return;
+        }
+        let s = overflow_sample(300);
+        let cfg = Config {
+            metric: Metric::Squared,
+            gpu: true,
+            dispatch: crate::dispatch::DispatchMode::Device,
+            ..Config::default()
+        };
+        let view = EvalSample::new(&s, &cfg);
+        let x0 = || input(0);
+        let trees = vec![
+            node(Op::Sinh, vec![node(Op::Exp, vec![x0()])]),
+            node(Op::Cos, vec![node(Op::Exp, vec![node(Op::Exp, vec![x0()])])]),
+            node(Op::Ln, vec![node(Op::Logistic, vec![node(Op::Cube, vec![x0()])])]),
+            node(Op::Ln, vec![x0()]),
+        ];
+        let mut island: Vec<Ind> = trees
+            .iter()
+            .map(|t| {
+                let mut ind = Ind::evaluated(t.clone(), &view, &cfg);
+                ind.error = f64::NAN;
+                ind
+            })
+            .collect();
+        let mut g = GpuSearch::new(
+            &s,
+            false,
+            crate::fit::DeviceLoss::Squared,
+            true,
+            None,
+            Some(crate::metrics::ScoreObjective::Squared),
+            false,
+            std::time::Instant::now(),
+            &[],
+            None,
+            None,
+        )
+        .expect("a device search");
+        let mut dispatcher = crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::default())
+            .with_mode(crate::dispatch::DispatchMode::Device);
+        let mut islands = vec![std::mem::take(&mut island)];
+        g.score(&mut islands, &s, &cfg, 0, &mut dispatcher).expect("device batch");
+        for (k, ind) in islands[0].iter().enumerate() {
+            let exact = score_tree(&ind.tree, &view, &cfg);
+            assert_eq!(ind.error.to_bits(), exact.to_bits(), "tree {k}");
+            assert_eq!(ind.error.is_finite(), k < 3, "tree {k}: {}", ind.error);
+        }
+        let stats = &g.stats[&0];
+        assert!(stats.nonfinite >= 3, "{:?}", stats);
+        assert!(stats.nonfinite_cpu_finite >= 3, "{:?}", stats);
     }
 }
