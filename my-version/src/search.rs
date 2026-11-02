@@ -10654,7 +10654,9 @@ mod tests {
     #[test]
     fn a_fitness_book_of_another_length_is_an_error_not_a_silent_run() {
         let s = sample();
-        let longer = sample_rows(s.len() + 1);
+        let mut longer = s.clone();
+        longer.x.push(longer.x[0].clone());
+        longer.y.push(longer.y[0]);
         let cfg = Config {
             fitness: Fitness::LongPnl(pnl_book(&s)),
             ..Default::default()
