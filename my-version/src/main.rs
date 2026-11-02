@@ -33,9 +33,19 @@ const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
 const EXIT_INPUT: i32 = 3;
 const EXIT_NO_SOLUTION: i32 = 4;
+/// #604: an explicit `--gpu` search lost the device after the start-up probe.
+const EXIT_DEVICE: i32 = 6;
 /// #129: a leakage audit failed. Stable so CI can distinguish a real leak from
 /// a usage (2) or input (3) error.
 const EXIT_LEAKAGE: i32 = leakage::AUDIT_EXIT_CODE;
+
+/// #604: exit code of a search error raised under an explicit `--gpu`: 2 for a
+/// device memory refusal (as the memory plan), 6 for any other device failure.
+/// `None` for every other error.
+fn gpu_required_exit(err: &str) -> Option<i32> {
+    let reason = err.strip_prefix(search::GPU_REQUIRED_PREFIX)?;
+    Some(if reason.starts_with("device_memory") { EXIT_USAGE } else { EXIT_DEVICE })
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Format {
@@ -769,7 +779,13 @@ SEARCH:
                              set a new --time-budget
   --gpu                      assert that the GPU must guide the search: an
                              error (exit 2) when the binary was not built with
-                             --features cuda or no device is present. Without
+                             --features cuda or no device is present. After
+                             the start-up probe a device failure (a refused
+                             fitness book, a failed batch or pipeline stage)
+                             also ends the run: exit 2 for device_memory,
+                             exit 6 otherwise, with no CPU fallback. Without
+                             --gpu the failure falls back to the CPU and is
+                             recorded as backend_reason. Without
                              --gpu/--cpu, a CUDA build with a usable device uses
                              the GPU automatically when the #287 score table
                              names a native scorer: squared, absolute,
@@ -3805,6 +3821,7 @@ fn main() {
                 std::process::exit(EXIT_USAGE);
             }
             cfg.gpu = true;
+            cfg.gpu_required = true;
         }
         Some(false) => cfg.gpu = false,
         None => {
@@ -6098,12 +6115,7 @@ fn main() {
     } else if resume_checkpoint.is_none() {
         // A fresh run with no save does not need any snapshot at all: keep the
         // historical path (and avoid hashing the data on exit).
-        Ok(search::run_seeded(
-            &cfg,
-            &prepared.train,
-            &prepared.test,
-            &seeds,
-        ))
+        search::run_seeded_checked(&cfg, &prepared.train, &prepared.test, &seeds)
     } else {
         let resumed = resume_checkpoint.take();
         search::run_resumable_seeded(
@@ -6120,7 +6132,7 @@ fn main() {
         Ok(outcome) => outcome,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(EXIT_INPUT);
+            std::process::exit(gpu_required_exit(&e).unwrap_or(EXIT_INPUT));
         }
     };
     if let Some(g) = outcome.gpu.as_mut() {
@@ -7943,7 +7955,11 @@ fn run_multi_output(
     // #211: the development log, if one is open.
     dev: Option<&DevSink>,
 ) {
-    let outcome = search::run(cfg, &prepared.train, &prepared.test);
+    let outcome = search::run_seeded_checked(cfg, &prepared.train, &prepared.test, &[])
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(gpu_required_exit(&e).unwrap_or(EXIT_INPUT));
+        });
     let search_seconds = start.elapsed().as_secs_f64();
     let elapsed = search_seconds;
     let report_start = std::time::Instant::now();

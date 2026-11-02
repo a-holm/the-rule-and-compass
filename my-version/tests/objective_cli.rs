@@ -477,3 +477,70 @@ fn walkforward_front_of_a_real_run_guards_the_seen_rows() {
     assert_eq!(at(selection, &["source"]).as_str(), Some("front"));
     assert!(matches!(at(&report, &["candidates"]), Json::Arr(c) if !c.is_empty()));
 }
+
+// ---- #604: an explicit --gpu never completes on the CPU ----
+
+fn run_gpu(data: &str, spec: &str, flag: &[&str], fault: &str, extra: &[&str]) -> Output {
+    let mut args = vec![
+        "--data", data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal",
+        "--target-spec", spec, "--no-dev-log", "--seed", "3", "--generations", "6", "--pop", "32",
+        "--metric", "squared", "--json", "--quiet", "--fitness", "pnl",
+    ];
+    args.extend_from_slice(PNL);
+    args.extend_from_slice(flag);
+    args.extend_from_slice(extra);
+    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(&args)
+        .env("RCSR_FAULT", fault)
+        .output()
+        .expect("run rcsr")
+}
+
+fn has_device(o: &Output) -> bool {
+    !(code(o) == 2 && stderr(o).contains("no GPU is available"))
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn an_explicit_gpu_run_exits_non_zero_when_the_book_is_refused() {
+    let dir = scratch();
+    let data = write_csv(&dir, "d.csv", None);
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let o = run_gpu(&data, &spec, &["--gpu"], "pnl_book", &[]);
+    if !has_device(&o) {
+        return;
+    }
+    assert_eq!(code(&o), 6, "{}", stderr(&o));
+    assert!(stderr(&o).contains("--gpu was requested but the device search failed"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("long_pnl fitness book"), "{}", stderr(&o));
+    assert!(o.stdout.is_empty(), "no result is written: {}", String::from_utf8_lossy(&o.stdout));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn the_auto_mode_labels_the_cpu_fallback_when_the_book_is_refused() {
+    let dir = scratch();
+    let data = write_csv(&dir, "d.csv", None);
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let o = run_gpu(&data, &spec, &[], "pnl_book", &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let j = json(&o);
+    assert_eq!(at(&j, &["backend"]).as_str(), Some("cpu"));
+    let why = at(&j, &["backend_reason"]).as_str().unwrap_or_default().to_string();
+    assert!(why.contains("long_pnl fitness book"), "{why}");
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn an_explicit_gpu_run_exits_non_zero_on_a_mid_run_batch_failure() {
+    let dir = scratch();
+    let data = write_csv(&dir, "d.csv", None);
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let o = run_gpu(&data, &spec, &["--gpu"], "batch", &["--dispatch", "device"]);
+    if !has_device(&o) {
+        return;
+    }
+    assert_eq!(code(&o), 6, "{}", stderr(&o));
+    assert!(stderr(&o).contains("generation batch"), "{}", stderr(&o));
+    assert!(o.stdout.is_empty(), "no result is written");
+}

@@ -355,6 +355,10 @@ pub struct Config {
     /// only: it is not part of the checkpoint settings, and the numbers the
     /// user reads are always re-scored on the CPU in `f64`.
     pub gpu: bool,
+    /// #604: an explicit `--gpu` (or `--dispatch device`). A device failure
+    /// after the start-up probe ends the run with an error instead of
+    /// continuing on the CPU. Not a search setting.
+    pub gpu_required: bool,
     /// #26: print the one-line `# gpu: ...` note. The CLI clears this with
     /// `--quiet`, which promises an empty stderr for machine-readable output.
     pub gpu_notes: bool,
@@ -675,6 +679,7 @@ impl Default for Config {
             // objective falls back to the CPU. `--no-gpu`/`--cpu` is the
             // deliberate override and `--gpu` asserts that a device exists.
             gpu: cfg!(feature = "cuda"),
+            gpu_required: false,
             gpu_notes: true,
             gpu_memory: None,
             dispatch: crate::dispatch::DispatchMode::Auto,
@@ -1756,6 +1761,9 @@ impl GpuSearch {
         generation: usize,
         dispatcher: &mut crate::dispatch::Dispatcher,
     ) -> Result<(), String> {
+        if generation >= 2 && crate::gpu::injected_fault("batch") {
+            return Err(format!("{}the generation batch", crate::gpu::INJECTED_REFUSAL));
+        }
         let pending: Vec<(usize, usize)> = islands
             .iter()
             .enumerate()
@@ -2663,6 +2671,29 @@ fn fallback_workers() -> usize {
         .min(MAX)
 }
 
+/// #604: the prefix of the error a run returns when `--gpu` was explicit and
+/// the device failed after the start-up probe. The CLI maps it to an exit code.
+pub const GPU_REQUIRED_PREFIX: &str = "--gpu was requested but the device search failed: ";
+
+/// #604: the one place a device failure after the probe is decided. Under an
+/// explicit `--gpu` the run fails; in auto mode the failure is noted and
+/// recorded as the backend reason, and the caller continues on the CPU.
+#[cfg(feature = "cuda")]
+fn gpu_lost(
+    cfg: &Config,
+    reason: String,
+    backend_reason: &mut Option<String>,
+) -> Result<(), String> {
+    if cfg.gpu_notes {
+        eprintln!("# gpu: unavailable ({})", reason);
+    }
+    if cfg.gpu_required {
+        return Err(format!("{}{}", GPU_REQUIRED_PREFIX, reason));
+    }
+    *backend_reason = Some(reason);
+    Ok(())
+}
+
 /// #26: score the pending individuals, falling back to the CPU on any error.
 ///
 /// Returns whether the GPU remains usable. On failure the whole pending batch
@@ -2678,9 +2709,9 @@ fn score_generation(
     backend_reason: &mut Option<String>,
     generation: usize,
     dispatcher: &mut crate::dispatch::Dispatcher,
-) -> bool {
+) -> Result<bool, String> {
     let Some(g) = gpu.as_mut() else {
-        return false;
+        return Ok(false);
     };
     match g.score(islands, train, cfg, generation, dispatcher) {
         Ok(()) => {
@@ -2693,15 +2724,12 @@ fn score_generation(
             // Preserve a `used` already set by the overlap pipeline: this call
             // only scores the leftovers and must not clear a prior device use.
             *used = *used || (g.claims_device() && (g.device_eval_used || g.device_fit_used));
-            true
+            Ok(true)
         }
         Err(e) => {
-            if cfg.gpu_notes {
-                eprintln!("# gpu: unavailable ({})", e);
-            }
             // #141: the backend report must record the runtime fallback, not
             // just the startup choice.
-            *backend_reason = Some(e);
+            gpu_lost(cfg, e, backend_reason)?;
             // #121: keep the fallback pool alive for the rescore below.
             let fallback = g.take_fallback();
             *gpu = None;
@@ -2730,7 +2758,7 @@ fn score_generation(
             let train_view = EvalSample::new(train, cfg);
             // #121: the same bounded worker pool as the per-batch fallback.
             rescore_pending_cpu(islands, &train_view, cfg, &fallback);
-            false
+            Ok(false)
         }
     }
 }
@@ -2746,6 +2774,9 @@ fn eval_pipeline_jobs(
     jobs: &[PipelineJob],
     generation: usize,
 ) -> Result<(Vec<usize>, Vec<f64>), String> {
+    if generation >= 2 && crate::gpu::injected_fault("pipeline") {
+        return Err(format!("{}the pipeline batch", crate::gpu::INJECTED_REFUSAL));
+    }
     let mut pop = crate::gpu::Population::new();
     let mut kept: Vec<usize> = Vec::with_capacity(jobs.len());
     let mut pcount: Vec<i32> = Vec::with_capacity(jobs.len());
@@ -5633,6 +5664,17 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
         .unwrap_or_else(|e| panic!("search failed: {}", e))
 }
 
+/// #604: [`run_seeded`] returning the error (a device failure under an explicit `--gpu`)
+/// instead of panicking.
+pub fn run_seeded_checked(
+    cfg: &Config,
+    train: &Sample,
+    test: &Sample,
+    seeds: &[Node],
+) -> Result<Outcome, String> {
+    run_search(cfg, train, test, None, 0, seeds, None)
+}
+
 /// Run a search from a fresh start with prior solutions injected.
 ///
 /// Every seed is simplified, its constants are fitted on the training sample
@@ -5644,7 +5686,7 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
 /// A seed is an elite: it is inserted even when its complexity exceeds
 /// `cfg.max_complexity`, which otherwise limits generated offspring only.
 pub fn run_seeded(cfg: &Config, train: &Sample, test: &Sample, seeds: &[Node]) -> Outcome {
-    run_search(cfg, train, test, None, 0, seeds, None)
+    run_seeded_checked(cfg, train, test, seeds)
         .unwrap_or_else(|e| panic!("search failed: {}", e))
 }
 
@@ -7073,10 +7115,7 @@ fn run_search(
                         Some(g)
                     }
                     Err(e) => {
-                        if cfg.gpu_notes {
-                            eprintln!("# gpu: unavailable ({})", e);
-                        }
-                        backend_reason = Some(e);
+                        gpu_lost(cfg, e, &mut backend_reason)?;
                         None
                     }
                 }
@@ -7426,7 +7465,7 @@ fn run_search(
     // before the first selection step reads an error.
     #[cfg(feature = "cuda")]
     {
-        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg, &mut backend_reason, gens_done, &mut dispatcher);
+        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg, &mut backend_reason, gens_done, &mut dispatcher)?;
     }
 
     // #122: the flat postfix generation loop. It is selected before the first
@@ -7809,15 +7848,13 @@ fn run_search(
                         // Score anything the kernel could not compile (left
                         // pending) through the normal CPU fallback.
                         defer_gpu =
-                            score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher);
+                            score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher)?;
                     } else {
                         // Stop the GPU and re-score every still-pending
                         // candidate in f64 on the CPU; a failed batch must
                         // never leave a wrong (or missing) number behind.
-                        if cfg.gpu_notes {
-                            if let Some(e) = &pipeline_error {
-                                eprintln!("# gpu: unavailable ({})", e);
-                            }
+                        if let Some(e) = pipeline_error.take() {
+                            gpu_lost(cfg, e, &mut backend_reason)?;
                         }
                         // #121: keep the pool for the rescore, then drop the
                         // evaluator; a failed batch also scores via the pool.
@@ -7836,7 +7873,7 @@ fn run_search(
                     // #26: one batched call covers every candidate of the
                     // generation (the pre-#119 synchronous path).
                     defer_gpu =
-                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher);
+                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher)?;
                 }
             }
             let dev_eval = dev_lap(&mut dev_mark); // #211: evaluator batch
@@ -8242,7 +8279,7 @@ fn run_search(
             #[cfg(feature = "cuda")]
             {
                 defer_gpu =
-                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher);
+                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher)?;
             }
 
             // #120: record this generation's evaluated behaviours. The order
