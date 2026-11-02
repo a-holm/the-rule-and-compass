@@ -392,6 +392,9 @@ pub fn build_keep(
     Ok(out)
 }
 
+/// Fixed-point unit of the exact window sums in [`uniqueness_weights`].
+const FIXED_ONE: u128 = 1 << 62;
+
 /// `u_i = mean over the label's bars of 1 / c_t`, `w_i = u_i * n / sum(u)`,
 /// with `c_t` the number of labels whose span covers bar `t`. A span runs from
 /// the entry bar to the exit bar. `n` and `sum(u)` run over the valid rows whose
@@ -409,18 +412,32 @@ fn uniqueness_weights(l: &LongLabels, d: usize, keep: &dyn Fn(i64) -> bool) -> (
         conc[t + 1 + d] += 1;
         conc[l.end_idx[t] + 1] -= 1;
     }
+    // With rows left out of the normalisation the window sums run in integers:
+    // a float prefix sum rounds with every earlier term, so it would carry the
+    // concurrency of the left-out region into rows far from it.
+    let exact = rows.iter().any(|&t| !keep(l.time[t]));
     let mut prefix = vec![0.0; n + 1];
+    let mut prefix_fixed = vec![0u128; n + 1];
     let mut c = 0i64;
     for k in 0..n {
         c += conc[k];
-        prefix[k + 1] = prefix[k] + if c > 0 { 1.0 / c as f64 } else { 0.0 };
+        if exact {
+            prefix_fixed[k + 1] = prefix_fixed[k] + if c > 0 { FIXED_ONE / c as u128 } else { 0 };
+        } else {
+            prefix[k + 1] = prefix[k] + if c > 0 { 1.0 / c as f64 } else { 0.0 };
+        }
     }
     let mut u = vec![f64::NAN; n];
     let mut total = 0.0;
     let mut kept = 0usize;
     for &t in &rows {
         let (a, b) = (t + 1 + d, l.end_idx[t]);
-        u[t] = (prefix[b + 1] - prefix[a]) / (b - a + 1) as f64;
+        let sum = if exact {
+            (prefix_fixed[b + 1] - prefix_fixed[a]) as f64 / FIXED_ONE as f64
+        } else {
+            prefix[b + 1] - prefix[a]
+        };
+        u[t] = sum / (b - a + 1) as f64;
         if keep(l.time[t]) {
             total += u[t];
             kept += 1;
