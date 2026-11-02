@@ -480,6 +480,7 @@ fn walkforward_front_of_a_real_run_guards_the_seen_rows() {
 
 // ---- #604: an explicit --gpu never completes on the CPU ----
 
+#[cfg(feature = "cuda")]
 fn run_gpu(data: &str, spec: &str, flag: &[&str], fault: &str, extra: &[&str]) -> Output {
     let mut args = vec![
         "--data", data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal",
@@ -496,6 +497,7 @@ fn run_gpu(data: &str, spec: &str, flag: &[&str], fault: &str, extra: &[&str]) -
         .expect("run rcsr")
 }
 
+#[cfg(feature = "cuda")]
 fn has_device(o: &Output) -> bool {
     !(code(o) == 2 && stderr(o).contains("no GPU is available"))
 }
