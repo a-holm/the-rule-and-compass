@@ -328,6 +328,8 @@ pub struct GpuGen {
     pub fallback_workers: usize,
     /// #589: device results with status 2 (non-finite output).
     pub nonfinite: usize,
+    /// #640: device results with status 0 and `+inf` from the trade floor.
+    pub nonfinite_trade_floor: usize,
     /// #589: of those, the ones that needed a full CPU pass.
     pub nonfinite_full: usize,
     /// #589: of the full passes, the ones finite on the CPU.
@@ -340,7 +342,7 @@ impl GpuGen {
     fn json(&self) -> String {
         format!(
             "{{\"batches\":{},\"programs\":{},\"kernel_s\":{},\"wall_s\":{},\"duty\":{},\
-             \"native\":{},\"fallbacks\":{},\"fallback_s\":{},\"fallback_workers\":{},\"nonfinite\":{},\"nonfinite_full\":{},\"nonfinite_cpu_finite\":{},\"nonfinite_seconds\":{}}}",
+             \"native\":{},\"fallbacks\":{},\"fallback_s\":{},\"fallback_workers\":{},\"nonfinite\":{},\"nonfinite_trade_floor\":{},\"nonfinite_full\":{},\"nonfinite_cpu_finite\":{},\"nonfinite_seconds\":{}}}",
             self.batches,
             self.programs,
             num(self.kernel_s),
@@ -351,6 +353,7 @@ impl GpuGen {
             num(self.fallback_s),
             self.fallback_workers,
             self.nonfinite,
+            self.nonfinite_trade_floor,
             self.nonfinite_full,
             self.nonfinite_cpu_finite,
             num(self.nonfinite_seconds)
@@ -1197,6 +1200,7 @@ mod tests {
                 fallback_s: 0.001,
                 fallback_workers: 1,
                 nonfinite: 5,
+                nonfinite_trade_floor: 3,
                 nonfinite_full: 2,
                 nonfinite_cpu_finite: 1,
                 nonfinite_seconds: 0.002,
@@ -1250,6 +1254,7 @@ mod tests {
         );
         let gpu = parsed.get("gpu").unwrap();
         assert_eq!(gpu.get("native").and_then(|v| v.as_usize()), Some(18));
+        assert_eq!(gpu.get("nonfinite_trade_floor").and_then(|v| v.as_usize()), Some(3));
         assert_eq!(gpu.get("nonfinite_full").and_then(|v| v.as_usize()), Some(2));
         assert_eq!(gpu.get("nonfinite_seconds").and_then(|v| v.as_f64()), Some(0.002));
         let fit = parsed.get("fit").unwrap();
