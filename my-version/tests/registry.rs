@@ -200,9 +200,7 @@ fn views_are_deterministic_stratified_and_traceable() {
         let r = registry::lookup(c).unwrap_or_else(|| panic!("{c} has no registry entry"));
         assert!(r.available && r.causal_offset <= 0);
     }
-    for (fam, picked) in &a.families {
-        assert!(picked.len() <= 2, "{fam}: {picked:?}");
-    }
+    assert_eq!(a.delivered, 36);
     let next = registry::select_view(&names, 36, 7, 1).unwrap();
     assert_ne!(a.id, next.id);
     assert_ne!(a.columns, next.columns);
@@ -846,7 +844,7 @@ fn view_records_requested_and_delivered_sizes() {
     assert_eq!(seen.len(), 16);
     let v = registry::select_view(&sixteen, 36, 11, 0).unwrap();
     assert_eq!(v.delivered, v.columns.len());
-    assert!(v.delivered < 36 && v.delivered <= 32, "{}", v.delivered);
+    assert_eq!(v.delivered, 36);
     let json = v.json();
     assert!(json.contains("\"requested\":36"), "{json}");
     assert!(json.contains(&format!("\"delivered\":{}", v.delivered)), "{json}");
@@ -1101,4 +1099,69 @@ fn rewriting_an_old_sidecar_keeps_hashes_and_verifies() {
     assert_eq!(std::fs::read_to_string(&schema).unwrap(), new);
     assert!(registry::verify_schema(&p).unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every available derived column of the first `n` registry families.
+fn family_columns(n: usize) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for name in feature_names() {
+        if let Some(r) = registry::lookup(&name) {
+            if r.available && !r.input && r.causal_offset <= 0 && (seen.contains(&r.family) || seen.len() < n) {
+                seen.insert(r.family);
+                out.push(name);
+            }
+        }
+    }
+    assert_eq!(seen.len(), n);
+    out
+}
+
+#[test]
+fn project_delivers_the_requested_size() {
+    let sixteen = family_columns(16);
+    assert!(sixteen.len() >= 60, "{}", sixteen.len());
+    for size in [33usize, 36, 40, 48] {
+        let v = registry::select_view(&sixteen, size, 11, 0).unwrap();
+        assert_eq!(v.delivered, size);
+        assert_eq!(v.columns.len(), size);
+        assert!(v.json().contains(&format!("\"requested\":{size},\"delivered\":{size}")));
+    }
+    let views: Vec<Vec<String>> = (0..4).map(|k| registry::select_view(&sixteen, 48, 11, k).unwrap().columns).collect();
+    for i in 0..4 {
+        for j in i + 1..4 {
+            assert_ne!(views[i], views[j], "views {i} and {j} are equal");
+        }
+    }
+}
+
+#[test]
+fn project_refuses_a_store_with_fewer_candidate_columns_than_requested() {
+    let all = family_columns(16);
+    let thirty: Vec<String> = all.into_iter().take(30).collect();
+    let err = registry::select_view(&thirty, 48, 11, 0).unwrap_err().to_string();
+    assert!(err.contains("30 candidate columns"), "{err}");
+    assert!(registry::select_view(&thirty, 30, 11, 0).is_ok());
+    let dir = tmp_dir("shortfall");
+    let (p, _) = registry_store(&dir, 30, 64, "short.rcsb");
+    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(["--data", &p, "--target", "y", "--project", "48", "--time", "ts", "--group-by", "symbol", "--cpu"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("30 candidate columns"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn view_ids_of_fully_delivered_sizes_are_pinned() {
+    let sixteen = family_columns(16);
+    let got: Vec<String> = [24usize, 28, 32]
+        .iter()
+        .flat_map(|&s| (0..2).map(move |k| (s, k)))
+        .map(|(s, k)| registry::select_view(&sixteen, s, 11, k).unwrap().id)
+        .collect();
+    let golden: [&str; 6] = ["2abdb5320a08", "c498b629e472", "41f0170017d4", "8ed29caee6cb", "a32035702727", "558b4954cb4b"];
+    assert_eq!(got, golden, "{got:?}");
 }

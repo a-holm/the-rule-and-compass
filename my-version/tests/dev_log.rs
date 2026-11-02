@@ -832,3 +832,36 @@ fn dev_log_flag_misuse_is_a_usage_error() {
     let out = run(&["dev-report".to_string(), "/nonexistent/log.ndjson".to_string()]);
     assert_eq!(out.status.code(), Some(3));
 }
+
+/// #599: the data digest in the run record equals the plain file hash, is
+/// cached beside the data file, and a changed file invalidates the cache.
+#[test]
+fn data_digest_is_cached_beside_the_file_and_follows_changes() {
+    let dir = scratch("digest");
+    let data = dir.join("data.csv");
+    std::fs::copy(fixture(), &data).expect("copy fixture");
+    let sidecar = dir.join("data.csv.sha256.json");
+    let args: Vec<String> = base_args(data.to_str().unwrap())
+        .into_iter()
+        .filter(|a| a != "--no-dev-log")
+        .collect();
+    let digest = |dir: &Path| -> String {
+        let _ = std::fs::remove_file(dir.join("rcsr.dev.ndjson"));
+        let out = run_in(dir, &args);
+        assert!(out.status.success(), "rcsr failed: {}", String::from_utf8_lossy(&out.stderr));
+        let events = parse_events(&dir.join("rcsr.dev.ndjson"));
+        field(events_of(&events, "run_start")[0].get("data").unwrap(), "sha256")
+    };
+
+    let first = digest(&dir);
+    assert_eq!(first, rcsr::manifest::sha256_file(&data).unwrap());
+    assert!(sidecar.exists(), "the first run must leave a digest cache");
+    assert_eq!(digest(&dir), first, "a cached digest must equal the computed one");
+
+    let mut bytes = std::fs::read(&data).unwrap();
+    bytes.extend_from_slice(b"9,9\n");
+    std::fs::write(&data, &bytes).unwrap();
+    let changed = digest(&dir);
+    assert_eq!(changed, rcsr::manifest::sha256_file(&data).unwrap());
+    assert_ne!(changed, first, "a changed file must not reuse the cache");
+}

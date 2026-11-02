@@ -6009,6 +6009,14 @@ float rc_pool_score(void *ctx, int which, int nprog, int width, int kind,
                            pcount, 0, 0, out, status);
 }
 
+static const char *g_pnl_book_err = "";
+
+static int rc_pnl_book_fail(const char *why)
+{
+    g_pnl_book_err = why;
+    return -1;
+}
+
 /* #481, #484: upload the long/flat fitness book of the resident rows: the
    excess returns, the seam flags (value 1 first row of a run, value 2 last row,
    bits 2 to 4 the time block id), the cost per side,
@@ -6024,17 +6032,21 @@ int rc_set_pnl_book(void *ctx, const double *excess, const unsigned char *flags,
                     int nblocks, double lambda, unsigned long long min_trades)
 {
     RcCtx *c = (RcCtx *)ctx;
-    if (!c) return -1;
+    g_pnl_book_err = "";
+    if (!c) return rc_pnl_book_fail("the context is null");
     if (c->d_pnl_book) {
         rc_dev_free(c, c->d_pnl_book);
         c->d_pnl_book = 0;
     }
-    if (c->tiled || n <= 0 || n != c->n || !excess || !flags || !bounds || nblocks < 1 ||
-        nblocks > RC_PNL_MAX_BLOCKS || !(lambda >= 0.0) || !isfinite(lambda)) {
-        return -1;
+    if (c->tiled) return rc_pnl_book_fail("the context is tiled");
+    if (n <= 0 || n != c->n) return rc_pnl_book_fail("the row count differs from the resident rows");
+    if (!excess || !flags || !bounds) return rc_pnl_book_fail("a book array is null");
+    if (nblocks < 1 || nblocks > RC_PNL_MAX_BLOCKS) return rc_pnl_book_fail("the block count is outside 1 to 8");
+    if (!(lambda >= 0.0) || !isfinite(lambda)) {
+        return rc_pnl_book_fail("the block spread weight is negative or not finite");
     }
     for (int b = 0; b < nblocks; ++b) {
-        if (!(bounds[b] > 0.0)) return -1;
+        if (!(bounds[b] > 0.0)) return rc_pnl_book_fail("a block hindsight bound is not positive");
     }
     const size_t eb = sizeof(double) * (size_t)n;
     const size_t bytes = eb + (size_t)n;
@@ -6045,7 +6057,7 @@ int rc_set_pnl_book(void *ctx, const double *excess, const unsigned char *flags,
     rc_upload(book + eb, flags, (size_t)n);
     if (cudaGetLastError() != cudaSuccess) {
         rc_dev_free(c, book);
-        return -1;
+        return rc_pnl_book_fail("a CUDA error was pending after the book upload");
     }
     c->d_pnl_book = book;
     c->pnl_side = side;
@@ -7954,6 +7966,13 @@ const char *rc_last_alloc_failure_tag(void)
 size_t rc_last_alloc_failure(void)
 {
     return g_alloc_fail_bytes;
+}
+
+/* #604: why the last rc_set_pnl_book refused; empty after a success or an
+   allocation refusal (which rc_last_alloc_failure describes). */
+const char *rc_last_pnl_book_error(void)
+{
+    return g_pnl_book_err;
 }
 
 } /* extern "C" */

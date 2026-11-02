@@ -5671,7 +5671,7 @@ fn compute_series(
             }
         }
         for (spec, acc) in ctx.long_labels.iter().zip(long_acc.iter_mut()) {
-            let built = crate::labels::build(&bars, spec, None)?;
+            let built = acc.build(&bars, None)?;
             for (kind, _) in crate::labels::COLUMN_KINDS {
                 if let (Some(t), Some(v)) = (cols.get_mut(&spec.column(kind)), built.column(kind)) {
                     t.write_values(v)?;

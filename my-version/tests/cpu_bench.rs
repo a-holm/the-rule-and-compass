@@ -25,14 +25,21 @@ fn every_mode_runs_on_a_tiny_fixture() {
     assert!(out.status.success(), "exit {:?}", out.status);
     let text = String::from_utf8_lossy(&out.stdout);
     let headers = [
-        "tree_nodes\trows\twalk_us\tsoa_scalar_us\tsoa_avx_us\twalk_mrows\tsoa_scalar_mrows\tsoa_avx_mrows\tbitwise_equal",
-        "tree\trows\tconsts\tpass_mrows\tfit_iters\tfit_s\tfits_per_s\thash",
-        "metric\trows\tfit_iters\tfit_s\thash",
-        "scorer\trows\tscore_ms",
-        "rows\tthreads\tfit_jobs\tfits_per_s\tfit_speedup\teval_jobs\teval_mrows\teval_speedup",
+        "tree_nodes rows walk_us soa_scalar_us soa_avx_us tile_us walk_mrows soa_scalar_mrows soa_avx_mrows tile_mrows tile_over_avx bitwise_equal",
+        "tree rows consts pass_mrows fit_iters fit_s fits_per_s hash",
+        "metric rows fit_iters fit_s hash",
+        "scorer rows score_ms",
+        "rows threads fit_jobs fits_per_s fit_speedup eval_jobs eval_mrows eval_speedup",
     ];
     for h in headers {
-        assert!(text.lines().any(|l| l == h), "missing header {h:?} in\n{text}");
+        let wanted: Vec<&str> = h.split(' ').collect();
+        assert!(
+            text.lines().any(|l| {
+                let cols: Vec<&str> = l.split('\t').collect();
+                wanted.iter().all(|w| cols.contains(w))
+            }),
+            "no header with columns {wanted:?} in\n{text}"
+        );
     }
     for name in ["arith15", "trans13", "squared", "absolute", "median", "interquartile", "rank_correlation"] {
         assert!(text.lines().any(|l| l.starts_with(name)), "no row for {name}");

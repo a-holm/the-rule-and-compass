@@ -33,9 +33,19 @@ const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
 const EXIT_INPUT: i32 = 3;
 const EXIT_NO_SOLUTION: i32 = 4;
+/// #604: an explicit `--gpu` search lost the device after the start-up probe.
+const EXIT_DEVICE: i32 = 6;
 /// #129: a leakage audit failed. Stable so CI can distinguish a real leak from
 /// a usage (2) or input (3) error.
 const EXIT_LEAKAGE: i32 = leakage::AUDIT_EXIT_CODE;
+
+/// #604: exit code of a search error raised under an explicit `--gpu`: 2 for a
+/// device memory refusal (as the memory plan), 6 for any other device failure.
+/// `None` for every other error.
+fn gpu_required_exit(err: &str) -> Option<i32> {
+    let reason = err.strip_prefix(search::GPU_REQUIRED_PREFIX)?;
+    Some(if reason.starts_with("device_memory") { EXIT_USAGE } else { EXIT_DEVICE })
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Format {
@@ -350,8 +360,9 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
                              inside each group). Text columns are allowed.
   --project <n|auto>         choose the variables as a deterministic family-stratified
                              view of n registered feature columns (24-48, research
-                             cell 96-128; auto = 36), one or two per family, rotated
-                             by --seed and --view. Needs a .rcsb store; not with --vars.
+                             cell 96-128; auto = 36), exactly n columns, one per family per
+                             round, rotated by --seed and --view; a store with fewer than n
+                             candidate columns exits 2. Needs a .rcsb store; not with --vars.
                              The view id and columns go to --run-manifest
   --view <k>                 view index for --project (default 0)
   --no-project               load every store column. The default projects the
@@ -769,7 +780,13 @@ SEARCH:
                              set a new --time-budget
   --gpu                      assert that the GPU must guide the search: an
                              error (exit 2) when the binary was not built with
-                             --features cuda or no device is present. Without
+                             --features cuda or no device is present. After
+                             the start-up probe a device failure (a refused
+                             fitness book, a failed batch or pipeline stage)
+                             also ends the run: exit 2 for device_memory,
+                             exit 6 otherwise, with no CPU fallback. Without
+                             --gpu the failure falls back to the CPU and is
+                             recorded as backend_reason. Without
                              --gpu/--cpu, a CUDA build with a usable device uses
                              the GPU automatically when the #287 score table
                              names a native scorer: squared, absolute,
@@ -1257,7 +1274,7 @@ fn ledger_json(
         rcsr::gpu_stats::Ratio::undefined(f64::NAN, f64::NAN, "decades_per_gpu_hour", "run")
     };
     format!(
-        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"fallback_s\":{},\"gate_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
+        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"drain_wall_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"fallback_s\":{},\"gate_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
         jnum(l.wall_s()),
         stages,
         jnum(l.stage_sum_s()),
@@ -1266,6 +1283,7 @@ fn ledger_json(
         jnum(l.device_busy_s()),
         jnum(l.device_busy_sum_s()),
         jnum(l.device_overlap_s()),
+        jnum(l.drain_wall_s()),
         l.intervals().len(),
         jstr(l.interval_basis()),
         by_event,
@@ -1343,7 +1361,7 @@ fn gpu_json(
         .iter()
         .map(|s| {
             format!(
-                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_admitted_wide\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_improved\":{},\"fit_fallback_improved_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"opcodes\":{{{}}}}}",
+                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_admitted_wide\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_improved\":{},\"fit_fallback_improved_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"nonfinite\":{},\"nonfinite_full\":{},\"nonfinite_cpu_finite\":{},\"nonfinite_seconds\":{},\"opcodes\":{{{}}}}}",
                 s.generation,
                 s.programs,
                 s.native,
@@ -1363,6 +1381,10 @@ fn gpu_json(
                 jnum(s.fit_fallback_seconds),
                 s.fit_fallback_bounded,
                 s.fit_fallback_workers,
+                s.nonfinite,
+                s.nonfinite_full,
+                s.nonfinite_cpu_finite,
+                jnum(s.nonfinite_seconds),
                 ops_json(&s.opcodes)
             )
         })
@@ -1965,7 +1987,7 @@ fn dev_run_start(
         data_sha256: if data_path == "-" || data_path.is_empty() {
             None
         } else {
-            manifest::sha256_file(std::path::Path::new(data_path)).ok()
+            manifest::sha256_file_cached(std::path::Path::new(data_path)).ok()
         },
         train_rows: train.rows,
         train_fingerprint: format!("{:016x}", train.hash),
@@ -3758,6 +3780,9 @@ fn main() {
         let requested_gpu = cfg.gpu;
         let requested_simd = cfg.simd;
         let requested_dispatch = cfg.dispatch;
+        let requested_pipeline_depth = cfg.pipeline_depth;
+        let requested_prune = (cfg.prune, cfg.prune_rows, cfg.prune_budget);
+        let requested_fit_report = cfg.fit_report;
         let mut effective = saved;
         if generations_set {
             effective.generations = cfg.generations;
@@ -3771,6 +3796,9 @@ fn main() {
         effective.gpu = requested_gpu;
         effective.simd = requested_simd;
         effective.dispatch = requested_dispatch;
+        effective.pipeline_depth = requested_pipeline_depth;
+        (effective.prune, effective.prune_rows, effective.prune_budget) = requested_prune;
+        effective.fit_report = requested_fit_report;
         fit_request = None;
         cfg = effective;
         resumed_generation = Some(cp.generations);
@@ -3802,6 +3830,7 @@ fn main() {
                 std::process::exit(EXIT_USAGE);
             }
             cfg.gpu = true;
+            cfg.gpu_required = true;
         }
         Some(false) => cfg.gpu = false,
         None => {
@@ -4133,21 +4162,13 @@ fn main() {
                                 v.seed,
                                 v.view
                             );
-                            if v.delivered < v.size {
-                                eprintln!(
-                                    "view {}: requested {} columns, delivered {}: {} candidate famil(ies) at most two columns each",
-                                    v.id,
-                                    v.size,
-                                    v.delivered,
-                                    v.families.len()
-                                );
-                            }
                             vars = v.columns.clone();
                             view_record = Some(v);
                         }
                         Err(e) => {
                             eprintln!("error: {}", e);
-                            std::process::exit(EXIT_INPUT);
+                            let shortfall = matches!(e, registry::ViewError::Shortfall { .. });
+                            std::process::exit(if shortfall { EXIT_USAGE } else { EXIT_INPUT });
                         }
                     }
                 }
@@ -6095,12 +6116,7 @@ fn main() {
     } else if resume_checkpoint.is_none() {
         // A fresh run with no save does not need any snapshot at all: keep the
         // historical path (and avoid hashing the data on exit).
-        Ok(search::run_seeded(
-            &cfg,
-            &prepared.train,
-            &prepared.test,
-            &seeds,
-        ))
+        search::run_seeded_checked(&cfg, &prepared.train, &prepared.test, &seeds)
     } else {
         let resumed = resume_checkpoint.take();
         search::run_resumable_seeded(
@@ -6117,7 +6133,7 @@ fn main() {
         Ok(outcome) => outcome,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(EXIT_INPUT);
+            std::process::exit(gpu_required_exit(&e).unwrap_or(EXIT_INPUT));
         }
     };
     if let Some(g) = outcome.gpu.as_mut() {
@@ -7940,7 +7956,11 @@ fn run_multi_output(
     // #211: the development log, if one is open.
     dev: Option<&DevSink>,
 ) {
-    let outcome = search::run(cfg, &prepared.train, &prepared.test);
+    let outcome = search::run_seeded_checked(cfg, &prepared.train, &prepared.test, &[])
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(gpu_required_exit(&e).unwrap_or(EXIT_INPUT));
+        });
     let search_seconds = start.elapsed().as_secs_f64();
     let elapsed = search_seconds;
     let report_start = std::time::Instant::now();
@@ -9985,7 +10005,7 @@ OPTIONS:
                              A window whose test_start is below the last train
                              or validation time of the run plus its required
                              purge exits 2
-  --allow-in-sample-windows  with --front: report such a window as
+  --allow-in-sample-windows  with --front or --from-run: report such a window as
                              in_sample:true instead of refusing it
                              (diagnostics only)
   --select-band              #308: select among repeated --expr candidates with
@@ -9994,7 +10014,7 @@ OPTIONS:
                              admitted set is rescored on the full validation rows in
                              exact CPU f64 and ranked by
                              (net, turnover, complexity, index). Requires
-                             --validation-frac > 0 and more than one --expr; the
+                             --validation-frac > 0 or a --windows table with validation_start, and more than one --expr; the
                              JSON carries surrogate_rank, exact_rank, band,
                              epsilon, finalists_considered, recall_band and
                              scored_by=cpu_f64
@@ -10541,6 +10561,7 @@ fn run_walkforward(args: &[String]) -> ! {
         }
         run_cost = Some((book.per_side_bps, book.source));
         cost_spec = Some(book.spec);
+        front_run = Some(run);
     } else if let Some(path) = &front_path {
         if !expressions.is_empty() {
             eprintln!(
@@ -10698,14 +10719,6 @@ fn run_walkforward(args: &[String]) -> ! {
         );
         std::process::exit(EXIT_USAGE);
     }
-    if band_select && validation_frac <= 0.0 {
-        eprintln!(
-            "error: --select-band needs --validation-frac > 0; the test block \
-             may not choose the candidate\n\n{}",
-            walkforward_usage()
-        );
-        std::process::exit(EXIT_USAGE);
-    }
     let expression = expressions[0].clone();
     let candidates = if expressions.len() > 1 {
         expressions
@@ -10767,6 +10780,14 @@ fn run_walkforward(args: &[String]) -> ! {
             }
         }
     }
+    if band_select && validation_frac <= 0.0 && popts.validation_starts.is_empty() {
+        eprintln!(
+            "error: --select-band needs --validation-frac > 0 or a windows table with validation_start; \
+             the test block may not choose the candidate\n\n{}",
+            walkforward_usage()
+        );
+        std::process::exit(EXIT_USAGE);
+    }
     if windows.is_empty() {
         eprintln!(
             "error: walkforward needs at least one --window or --windows file\n\n{}",
@@ -10774,18 +10795,25 @@ fn run_walkforward(args: &[String]) -> ! {
         );
         std::process::exit(EXIT_USAGE);
     }
-    if let Some((run, (_, seen, purge))) = front_run.as_ref().and_then(|r| Some((r, r.earliest_test_start()?))) {
+    if let Some(run) = front_run.as_ref() {
         for w in &windows {
             if run.in_sample(w.test_start) {
                 if allow_in_sample {
                     popts.in_sample_windows.push(w.label.clone());
                     continue;
                 }
-                eprintln!(
-                    "error: window '{}' tests rows the run trained or selected on \
-                     (test_start {} < last seen {} + purge {})",
-                    w.label, w.test_start, seen, purge
-                );
+                match run.earliest_test_start() {
+                    Some((_, seen, purge)) => eprintln!(
+                        "error: window '{}' tests rows the run trained or selected on \
+                         (test_start {} < last seen {} + purge {})",
+                        w.label, w.test_start, seen, purge
+                    ),
+                    None => eprintln!(
+                        "error: window '{}' tests rows the run trained or selected on \
+                         (the run has no split.train_time)",
+                        w.label
+                    ),
+                }
                 std::process::exit(EXIT_USAGE);
             }
         }
@@ -12019,6 +12047,7 @@ mod tests {
             "\"stages\":",
             "\"device_busy_s\":4",
             "\"device_busy_sum_s\":5",
+            "\"drain_wall_s\":0",
             "\"device_overlap_s\":1",
             "\"device_split\":{\"eval_kernel_s\":0,\"eval_launch_s\":0,\"eval_copy_s\":0,\"eval_alloc_s\":0,\"fit_kernel_s\":1.5,\"units\":\"seconds\"}",
             "\"duty_run\":{\"value\":0.4,\"numerator\":4,\"denominator\":10,\"units\":\"fraction\",\"scope\":\"run\"}",

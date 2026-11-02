@@ -940,10 +940,12 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
             ));
         }
     }
-    if spec.candidates.len() > 1 && spec.validation_frac <= 0.0 {
+    let table_validation = !opts.validation_starts.is_empty()
+        && spec.windows.iter().all(|w| opts.validation_starts.iter().any(|(l, _)| *l == w.label));
+    if spec.candidates.len() > 1 && spec.validation_frac <= 0.0 && !table_validation {
         return Err(
-            "multiple --expr candidates need --validation-frac > 0: select on a validation \
-             slice, never on the test block"
+            "multiple --expr candidates need a validation slice (--validation-frac > 0 or a windows \
+             table with validation_start): select on a validation slice, never on the test block"
                 .to_string(),
         );
     }
@@ -3604,8 +3606,8 @@ fn select_candidate(
             let (candidate, validation_error, threshold) = if spec.band_select {
                 if !has_validation {
                     return Err(format!(
-                        "window '{}': --select-band needs --validation-frac > 0, \
-                         because the test block may not choose the candidate",
+                        "window '{}': --select-band needs a validation slice (--validation-frac > 0 or a windows \
+                         table with validation_start), because the test block may not choose the candidate",
                         d.window.label
                     ));
                 }

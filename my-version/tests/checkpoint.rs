@@ -914,3 +914,92 @@ fn a_long_pnl_run_resumes_with_the_same_book_and_refuses_another() {
     let err = expect_err(search::run_resumable(&other, &train, &test, Some(saved), 0, |_| {}), "other cost");
     assert!(err.contains("fitness"), "{err}");
 }
+
+/// #598: the pipeline depth is an execution setting. A resume takes the one it
+/// is given, and the archive equals an uninterrupted run at that depth.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_resume_takes_the_requested_pipeline_depth() {
+    if !rcsr::backend::probe().available() {
+        eprintln!("no usable GPU; skipping the resume pipeline-depth test");
+        return;
+    }
+    let csv = TempPath::new("depth.csv");
+    std::fs::write(&csv.0, line_csv(200)).expect("write csv");
+    let checkpoint = TempPath::new("depth.rcsr");
+    let resumed_out = TempPath::new("depth-resumed.tsv");
+    let resumed_deep_out = TempPath::new("depth-resumed-deep.tsv");
+    let full_out = TempPath::new("depth-full.tsv");
+
+    let common = |extra: &[&'static str]| -> Vec<String> {
+        let mut args: Vec<String> = [
+            "--data",
+            csv.as_str(),
+            "--target",
+            "y",
+            "--vars",
+            "x",
+            "--seed",
+            "4",
+            "--pop",
+            "32",
+            "--max-complexity",
+            "8",
+            "--metric",
+            "squared",
+            "--gpu",
+            "--dispatch",
+            "device",
+            "--no-dev-log",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args
+    };
+    let run = |args: Vec<String>| -> Output {
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        rcsr(&refs)
+    };
+
+    let mut saved_args = common(&["--generations", "3", "--save"]);
+    saved_args.push(checkpoint.as_str().to_string());
+    let saved = run(saved_args);
+    assert!(saved.status.success(), "save run failed: {:?}", saved);
+
+    let resume = |depth: &'static str, generations: &'static str, out: &TempPath| -> Output {
+        let mut args = common(&["--generations", generations, "--pipeline-depth", depth]);
+        args.extend(["--resume", checkpoint.as_str(), "--out", out.as_str()].map(String::from));
+        run(args)
+    };
+
+    let sync = resume("0", "6", &resumed_out);
+    assert!(sync.status.success(), "resume failed: {:?}", sync);
+    let err = String::from_utf8_lossy(&sync.stderr);
+    assert!(
+        err.contains("synchronous") && !err.contains("overlap depth"),
+        "a resume with --pipeline-depth 0 must run synchronously: {}",
+        err
+    );
+
+    let deep = resume("3", "6", &resumed_deep_out);
+    assert!(deep.status.success(), "resume failed: {:?}", deep);
+    let err = String::from_utf8_lossy(&deep.stderr);
+    assert!(
+        err.contains("overlap depth 3"),
+        "a resume with --pipeline-depth 3 must overlap at depth 3: {}",
+        err
+    );
+
+    let mut full_args = common(&["--generations", "6", "--pipeline-depth", "0", "--out"]);
+    full_args.push(full_out.as_str().to_string());
+    let full = run(full_args);
+    assert!(full.status.success(), "uninterrupted run failed: {:?}", full);
+
+    let a = std::fs::read_to_string(&full_out.0).expect("full tsv");
+    let b = std::fs::read_to_string(&resumed_out.0).expect("resumed tsv");
+    let c = std::fs::read_to_string(&resumed_deep_out.0).expect("deep tsv");
+    assert_eq!(a, b, "the depth-0 resume must equal the uninterrupted depth-0 run");
+    assert_eq!(a, c, "the depth-3 resume must give the same archive");
+}

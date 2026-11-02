@@ -327,3 +327,55 @@ fn explicit_validation_starts_replace_the_fraction() {
     s.validation_frac = 0.2;
     assert!(walkforward::run_table_with(&t, &s, "t", &o).unwrap_err().contains("mutually exclusive"));
 }
+
+fn candidate_rows(n: usize) -> data::Table {
+    let rows: Vec<(f64, f64, f64)> = (0..n)
+        .map(|i| {
+            let x = (i % 17) as f64 - 8.0;
+            (i as f64, x, 0.01 * x + 0.002 * ((i * 7 % 5) as f64 - 2.0))
+        })
+        .collect();
+    single(&rows)
+}
+
+#[test]
+fn table_validation_starts_select_among_candidates() {
+    let t = candidate_rows(60);
+    let mut by_table = spec("x", vec![window("w", 0.0, 40.0, 40.0, 60.0)]);
+    by_table.candidates = vec!["-x".to_string(), "x".to_string()];
+    let mut o = ProtocolOptions::default();
+    o.validation_starts = vec![("w".to_string(), 30.0)];
+    let a = walkforward::run_table_with(&t, &by_table, "t", &o).unwrap();
+    assert_eq!(a.windows[0].validation_rows, 10);
+    assert_eq!(a.windows[0].candidate, 1);
+    assert_eq!(a.windows[0].threshold_source, "validation_type7");
+    assert_eq!(a.selected_on, "validation");
+
+    let mut by_frac = by_table.clone();
+    by_frac.validation_frac = 0.25;
+    let b = walkforward::run_table(&t, &by_frac, "t").unwrap();
+    assert_eq!(a.windows[0].validation_rows, b.windows[0].validation_rows);
+    assert_eq!(a.windows[0].candidate, b.windows[0].candidate);
+
+    let none = walkforward::run_table(&t, &by_table, "t").unwrap_err();
+    assert!(none.contains("need a validation slice"), "{none}");
+
+    by_table.windows.push(window("w2", 0.0, 40.0, 40.0, 60.0));
+    let partial = walkforward::run_table_with(&t, &by_table, "t", &o).unwrap_err();
+    assert!(partial.contains("need a validation slice"), "{partial}");
+}
+
+#[test]
+fn select_band_accepts_table_validation_starts() {
+    let t = candidate_rows(400);
+    let mut s = spec("x", vec![window("w", 0.0, 300.0, 300.0, 400.0)]);
+    s.candidates = vec!["-x".to_string(), "x".to_string()];
+    s.band_select = true;
+    let mut o = ProtocolOptions::default();
+    o.validation_starts = vec![("w".to_string(), 200.0)];
+    let r = walkforward::run_table_with(&t, &s, "t", &o).unwrap();
+    assert!(r.windows[0].band_selection.is_some());
+    assert_eq!(r.windows[0].validation_rows, 100);
+    let none = walkforward::run_table(&t, &s, "t").unwrap_err();
+    assert!(none.contains("validation"), "{none}");
+}

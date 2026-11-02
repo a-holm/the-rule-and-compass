@@ -536,6 +536,32 @@ pub(crate) const SPAN_FIT: i32 = 1;
 /// #481: why a tiled context cannot score the long/flat fitness.
 pub const LONG_PNL_TILED: &str = "long_pnl fitness needs resident training rows (tiled residency: #293)";
 
+/// #604: prefix of an injected device refusal (test hook, see [`injected_fault`]).
+pub const INJECTED_REFUSAL: &str = "injected fault: the device refused ";
+
+/// #604: test hook. `RCSR_FAULT` is a comma list of sites (`pnl_book`, `batch`,
+/// `pipeline`) at which a device call fails before it reaches the driver.
+/// Unset in normal use.
+pub fn injected_fault(site: &str) -> bool {
+    let mut sites = FAULT_SITES.lock().unwrap_or_else(|e| e.into_inner());
+    sites
+        .get_or_insert_with(|| {
+            std::env::var("RCSR_FAULT")
+                .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default()
+        })
+        .iter()
+        .any(|s| s == site)
+}
+
+static FAULT_SITES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+/// #604: replace the injected sites in-process (empty string clears them).
+pub fn set_injected_faults_for_tests(sites: &str) {
+    let list = sites.split(',').filter(|s| !s.is_empty()).map(|s| s.trim().to_string()).collect();
+    *FAULT_SITES.lock().unwrap_or_else(|e| e.into_inner()) = Some(list);
+}
+
 /// #118: the C-side ledger for one batch, in milliseconds. The host windows are
 /// disjoint: allocation, H2D copy, launch, event sync and D2H copy. `kernel_ms`
 /// is GPU-event time inside the wall and feeds the duty estimate, not the sum.
@@ -827,6 +853,7 @@ extern "C" {
     fn rc_device_count() -> i32;
     fn rc_device_memory(free_b: *mut usize, total_b: *mut usize, l2_bytes: *mut i32) -> i32;
     fn rc_last_alloc_failure() -> usize;
+    fn rc_last_pnl_book_error() -> *const std::os::raw::c_char;
     /* #122: persistent, fixed-capacity, double-buffered program arena. */
     fn rc_pool_reserve(ctx: *mut RawCtx, nprog: i32, width: i32) -> i32;
     fn rc_pool_upload(ctx: *mut RawCtx, which: i32, prog: *const u32, nprog: i32) -> i32;
@@ -1780,6 +1807,9 @@ impl GpuEvaluator {
         if self.host_cols.is_some() {
             return Err(LONG_PNL_TILED.to_string());
         }
+        if injected_fault("pnl_book") {
+            return Err(format!("{}the long_pnl fitness book", INJECTED_REFUSAL));
+        }
         if book.len() as u64 != self.n_rows {
             return Err(format!(
                 "the long_pnl fitness book has {} rows, the device sample {}",
@@ -1787,29 +1817,64 @@ impl GpuEvaluator {
                 self.n_rows
             ));
         }
+        self.upload_pnl_book(
+            book.excess(),
+            book.flags(),
+            book.side(),
+            book.threshold(),
+            book.block_bounds(),
+            book.lambda(),
+            book.min_trades() as u64,
+        )
+    }
+
+    /// #604: [`GpuEvaluator::set_pnl_book`] on raw book parts. The row count is
+    /// `excess.len()`; every refusal names its cause. Public so a test can
+    /// reach the device-side checks that a built `FitnessBook` never trips.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_pnl_book(
+        &mut self,
+        excess: &[f64],
+        flags: &[u8],
+        side: f64,
+        threshold: f64,
+        bounds: &[f64],
+        lambda: f64,
+        min_trades: u64,
+    ) -> Result<(), String> {
         let rc = unsafe {
             rc_set_pnl_book(
                 self.ctx,
-                book.excess().as_ptr(),
-                book.flags().as_ptr(),
-                book.len() as i32,
-                book.side(),
-                book.threshold(),
-                book.block_bounds().as_ptr(),
-                book.blocks() as i32,
-                book.lambda(),
-                book.min_trades() as u64,
+                if excess.is_empty() { std::ptr::null() } else { excess.as_ptr() },
+                if flags.is_empty() { std::ptr::null() } else { flags.as_ptr() },
+                excess.len() as i32,
+                side,
+                threshold,
+                if bounds.is_empty() { std::ptr::null() } else { bounds.as_ptr() },
+                bounds.len() as i32,
+                lambda,
+                min_trades,
             )
         };
         if rc == 0 {
             return Ok(());
+        }
+        let raw = unsafe { rc_last_pnl_book_error() };
+        let why = if raw.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(raw) }.to_string_lossy().into_owned()
+        };
+        if !why.is_empty() {
+            return Err(format!("the device refused the long_pnl fitness book: {}", why));
         }
         Err(match (last_alloc_failure(), last_alloc_failure_tag()) {
             (Some(bytes), Some(tag)) => format!(
                 "device_memory: the device refused an allocation of {} bytes (tag {}) for the long_pnl fitness book",
                 bytes, tag
             ),
-            _ => "the device refused the long_pnl fitness book".to_string(),
+            _ => "the device refused the long_pnl fitness book: no allocation failure and no reason were recorded".to_string(),
         })
     }
 
