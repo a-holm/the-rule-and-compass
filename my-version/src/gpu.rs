@@ -7500,6 +7500,42 @@ mod fit_tests {
         );
     }
 
+    /// #611: the CPU `reweighted` schedule is the device L1 schedule, so on
+    /// the robust fixture the two reach the same MAE.
+    #[test]
+    fn gpu_absolute_fit_matches_the_cpu_reweighted_schedule() {
+        let n = 400;
+        let (x, y, cols, y32) = robust_fixture(n);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let mut cols64 = vec![0.0f64; n];
+        for i in 0..n {
+            cols64[i] = x[i][0];
+        }
+        assert!(ev.set_fit_data(&cols64, &y, &[]), "f64 fit rows uploaded");
+
+        let start = model(&[0.2, 1.0]);
+        let mut cpu_tree = start.clone();
+        let cpu = crate::fit::with_fit_irls(crate::fit::FitIrls::Reweighted, || {
+            crate::fit::fit_weighted_metric(&mut cpu_tree, &x, &y, &[], 8, Metric::Absolute)
+        });
+        assert!(cpu.is_finite() && cpu < absolute_at(&start, &x, &y, &[]));
+
+        let plan = crate::fit::gpu_fit_plan(&start).expect("affine plan");
+        let (out, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Absolute);
+        assert_eq!(out[0].status, 0, "the outlier fixture is well conditioned");
+        let mut gpu_tree = start.clone();
+        plan.apply(&mut gpu_tree, &out[0].c);
+        let gpu = absolute_at(&gpu_tree, &x, &y, &[]);
+        let rel = (gpu - cpu).abs() / cpu.abs().max(1e-12);
+        assert!(rel <= 1e-4, "GPU/CPU reweighted MAE gap {:.3e} (gpu {:.12e}, cpu {:.12e})", rel, gpu, cpu);
+    }
+
     /// #222: the kernel's objective statistic is the configured risk too:
     /// `Σ|r|` (up to the trial baseline), not `Σr²`.
     #[test]

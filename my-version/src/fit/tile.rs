@@ -178,6 +178,38 @@ impl<'a> TileFit<'a> {
         }
         normal_impl(&k.plan, &k.cols, self.y, self.w, k.rows, k.k, c, &mut k.s)
     }
+
+    /// The reweighted L1 assembly at `c`: `JᵀWJ` and `JᵀWr` with the row
+    /// weight `base / max(|r|, 1e-6)` taken from the residual at `c`, and the
+    /// loss `Σ base·|r|`. `self.w` holds the base weights.
+    pub(super) fn normal_l1(&mut self, c: &[f64]) -> Option<(NormalEquations, f64)> {
+        if !self.contract_ok {
+            return None;
+        }
+        let k = &mut *self.core;
+        #[cfg(target_arch = "x86_64")]
+        if k.avx {
+            // SAFETY: AVX is detected at construction.
+            return unsafe {
+                normal_l1_avx(&k.plan, &k.cols, self.y, self.w, k.rows, k.k, c, &mut k.s)
+            };
+        }
+        normal_l1_impl(&k.plan, &k.cols, self.y, self.w, k.rows, k.k, c, &mut k.s)
+    }
+
+    /// `Σ base·|r|` at `c`; `+inf` on a non-finite residual.
+    pub(super) fn loss_l1(&mut self, c: &[f64]) -> f64 {
+        if !self.contract_ok {
+            return f64::INFINITY;
+        }
+        let k = &mut *self.core;
+        #[cfg(target_arch = "x86_64")]
+        if k.avx {
+            // SAFETY: AVX is detected at construction.
+            return unsafe { loss_l1_avx(&k.plan, &k.cols, self.y, self.w, k.rows, c, &mut k.s) };
+        }
+        loss_l1_impl(&k.plan, &k.cols, self.y, self.w, k.rows, c, &mut k.s)
+    }
 }
 
 fn avx_available() -> bool {
@@ -219,6 +251,131 @@ unsafe fn normal_avx(
     s: &mut Scratch,
 ) -> Option<NormalEquations> {
     normal_impl(p, cols, y, w, rows, k, c, s)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn loss_l1_avx(
+    p: &Plan,
+    cols: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    rows: usize,
+    c: &[f64],
+    s: &mut Scratch,
+) -> f64 {
+    loss_l1_impl(p, cols, y, w, rows, c, s)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn normal_l1_avx(
+    p: &Plan,
+    cols: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    rows: usize,
+    k: usize,
+    c: &[f64],
+    s: &mut Scratch,
+) -> Option<(NormalEquations, f64)> {
+    normal_l1_impl(p, cols, y, w, rows, k, c, s)
+}
+
+#[inline(always)]
+fn loss_l1_impl(
+    p: &Plan,
+    cols: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    rows: usize,
+    c: &[f64],
+    s: &mut Scratch,
+) -> f64 {
+    let mut sum = 0.0;
+    let mut base = 0;
+    while base < rows {
+        let n = TILE.min(rows - base);
+        forward(p, cols, c, base, n, &mut s.v, &s.nan);
+        let root = &s.v[p.root * TILE..p.root * TILE + n];
+        for r in 0..n {
+            let bw = w.get(base + r).copied().unwrap_or(1.0);
+            if bw == 0.0 {
+                continue;
+            }
+            let e = root[r] - y[base + r];
+            if !e.is_finite() {
+                return f64::INFINITY;
+            }
+            sum += bw * e.abs();
+        }
+        base += n;
+    }
+    sum
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn normal_l1_impl(
+    p: &Plan,
+    cols: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    rows: usize,
+    k: usize,
+    c: &[f64],
+    s: &mut Scratch,
+) -> Option<(NormalEquations, f64)> {
+    let mut jtj = vec![0.0; k * k];
+    let mut jtr = vec![0.0; k];
+    let mut gi = vec![0.0; k];
+    let mut loss = 0.0;
+    let mut base = 0;
+    while base < rows {
+        let n = TILE.min(rows - base);
+        forward(p, cols, c, base, n, &mut s.v, &s.nan);
+        adjoint(p, n, s);
+        let root = &s.v[p.root * TILE..p.root * TILE + n];
+        for r in 0..n {
+            let bw = w.get(base + r).copied().unwrap_or(1.0);
+            if bw == 0.0 {
+                continue;
+            }
+            let e = root[r] - y[base + r];
+            if !e.is_finite() {
+                return None;
+            }
+            loss += bw * e.abs();
+            let sw = bw / e.abs().max(1e-6);
+            let res = sw.sqrt() * e;
+            let jw = sw.sqrt();
+            for i in 0..k {
+                let v = jw * s.g[i * TILE + r];
+                if !v.is_finite() {
+                    return None;
+                }
+                gi[i] = v;
+            }
+            for i in 0..k {
+                let gii = gi[i];
+                jtr[i] += gii * res;
+                let row = &mut jtj[i * k..i * k + i + 1];
+                for (a, &gj) in row.iter_mut().zip(&gi[..=i]) {
+                    *a += gii * gj;
+                }
+            }
+        }
+        base += n;
+    }
+    let mut full = vec![vec![0.0; k]; k];
+    for i in 0..k {
+        for j in 0..=i {
+            full[i][j] = jtj[i * k + j];
+            full[j][i] = jtj[i * k + j];
+        }
+    }
+    Some((NormalEquations { jtj: full, jtr }, loss))
 }
 
 #[inline(always)]

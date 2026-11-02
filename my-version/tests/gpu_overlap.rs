@@ -120,3 +120,72 @@ fn wide_cell_overlap_matches_serial_and_reports_run_scope_duty() {
         "device-busy must be measurable and inside the run wall"
     );
 }
+
+/// #286: a small cell on the resolved default arm (`fit_admission == All`)
+/// takes the overlap fit queue and keeps the synchronous trajectory: one
+/// archive hash and one set of `f64` error bits at `pipeline_depth` 0 and 2.
+/// `asinh`, `acosh`, `atanh` and `tan` are left out: their `f32` device value
+/// differs between the two schedules.
+#[cfg(feature = "cuda")]
+#[test]
+fn small_default_cell_overlap_matches_serial() {
+    use rcsr::expr::Op;
+    use rcsr::fit::{FitAdmission, FitRequest};
+
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = wide_sample(5_000);
+    let test = wide_sample(256);
+    let ops: Vec<Op> = Op::default_set()
+        .into_iter()
+        .filter(|op| !matches!(op, Op::Tan | Op::Asinh | Op::Acosh | Op::Atanh))
+        .collect();
+    let base = Config {
+        generations: 4,
+        islands: 1,
+        pop: 96,
+        max_complexity: 10,
+        fit_iters: 4,
+        patience: 0,
+        seed: 11,
+        ops,
+        metric: Metric::Squared,
+        gpu: true,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
+        ..Default::default()
+    };
+    let resolved = search::resolve_fit_strategy(&base, &train, FitRequest::Unset);
+    assert_eq!(resolved.strategy, FitStrategy::Gpu, "{}", resolved.reason);
+    assert_eq!(resolved.admission, FitAdmission::All, "{}", resolved.reason);
+    let cfg = |depth: usize, seed: u32| Config {
+        fit_strategy: resolved.strategy,
+        fit_admission: resolved.admission,
+        pipeline_depth: depth,
+        seed,
+        ..base.clone()
+    };
+    let run = |depth: usize, seed: u32| search::run(&cfg(depth, seed), &train, &test);
+    let errors = |o: &search::Outcome| -> Vec<u64> {
+        o.archive.items.iter().map(|s| s.error.to_bits()).collect()
+    };
+
+    let serial = run(0, 11);
+    let overlap = run(2, 11);
+    let (gs, go) = (serial.gpu.as_ref().expect("serial ledger"), overlap.gpu.as_ref().expect("overlap ledger"));
+    assert!(gs.fit_calls > 0 && go.fit_calls > 0, "no device fit ran");
+    assert!(go.fit_admitted_wide > 0, "admission was not unconditional");
+    assert_eq!(serial.archive.hash(), overlap.archive.hash(), "archive hash");
+    assert_eq!(errors(&serial), errors(&overlap), "f64 errors");
+    assert_eq!(gs.fit_call_candidates, go.fit_call_candidates, "fitted candidates");
+    assert!(
+        go.accounting.batches > gs.accounting.batches,
+        "the overlap queue did not engage: {} scoring batches vs {} serial",
+        go.accounting.batches,
+        gs.accounting.batches
+    );
+
+    let other = run(0, 12);
+    assert_ne!(serial.archive.hash(), other.archive.hash(), "seed 12 must differ");
+}
