@@ -1552,9 +1552,7 @@ fn cli_csv() -> String {
     text
 }
 
-/// The `fitting` object and the Pareto array of one `--json` run: everything
-/// the fit arm can change, without the wall-clock fields.
-fn cli_fit_and_front(extra: &[&str]) -> (String, String) {
+fn cli_json(extra: &[&str]) -> String {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
@@ -1571,7 +1569,13 @@ fn cli_fit_and_front(extra: &[&str]) -> (String, String) {
     child.stdin.as_mut().unwrap().write_all(cli_csv().as_bytes()).unwrap();
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
-    let json = String::from_utf8(out.stdout).unwrap();
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// The `fitting` object and the Pareto array of one `--json` run: everything
+/// the fit arm can change, without the wall-clock fields.
+fn cli_fit_and_front(extra: &[&str]) -> (String, String) {
+    let json = cli_json(extra);
     let fitting = json.split("\"fitting\":").nth(1).unwrap().split('}').next().unwrap().to_string();
     let front = json.split("\"pareto\":").nth(1).unwrap().to_string();
     (fitting, front)
@@ -1895,4 +1899,40 @@ fn mixed_arm_books_the_island_cpu_fit_under_fit() {
     assert!(l.stage_s(Stage::Fit) > 0.0, "island CPU fit must be booked as fit: {:?}", l);
     assert!(l.stage_sum_s() <= l.wall_s() + 1e-9, "stages exceed wall: {:?}", l);
     assert!(l.closure_residual().value.abs() < 0.01, "ledger does not close: {:?}", l);
+}
+
+/// The `gpu.fit` object up to its first wall-clock field, plus the device fit
+/// launch counts: every counter of the fit ledger, no seconds.
+#[cfg(feature = "cuda")]
+fn gpu_fit_counters(json: &str) -> String {
+    let fit = json.split("\"fit\":{\"strategy\"").nth(1).expect("gpu.fit object");
+    let head = fit.split(",\"refit_s\"").next().unwrap();
+    let calls = fit.split("\"calls\":").nth(1).unwrap().split(",\"call_s_max\"").next().unwrap();
+    format!("{head}|calls:{calls}")
+}
+
+/// #223 / #286: two default-resolved runs with one seed agree on the Pareto
+/// front, the `fitting` object and every `gpu.fit` counter. Another seed does
+/// not, so the comparison can fail.
+#[cfg(feature = "cuda")]
+#[test]
+fn default_resolved_runs_with_one_seed_agree_on_front_and_fit_counters() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let args = ["--gpu", "--metric", "squared", "--dispatch", "device"];
+    let first = cli_json(&args);
+    let second = cli_json(&args);
+    let field = |json: &str, key: &str| json.split(key).nth(1).unwrap().to_string();
+    let fitting = |json: &str| field(json, "\"fitting\":").split('}').next().unwrap().to_string();
+    assert!(fitting(&first).contains("\"strategy_source\":\"default\""), "{}", fitting(&first));
+    assert_eq!(field(&first, "\"pareto\":"), field(&second, "\"pareto\":"), "front");
+    assert_eq!(fitting(&first), fitting(&second), "fitting object");
+    let counters = gpu_fit_counters(&first);
+    assert_eq!(counters, gpu_fit_counters(&second), "gpu.fit counters");
+    assert!(!counters.contains("\"attempts\":0,"), "no candidate was fitted: {counters}");
+
+    let other = cli_json(&["--gpu", "--metric", "squared", "--dispatch", "device", "--seed", "2"]);
+    assert_ne!(field(&first, "\"pareto\":"), field(&other, "\"pareto\":"), "seed 2 must differ");
 }
