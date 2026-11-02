@@ -56,7 +56,7 @@ The command runs the D0–D6/D11/D12 panel suite (the optional `--bars`,
 | 3 | input error |
 | 5 | **leakage detected** |
 
-Rows inside the protocol locked test (`--lockbox START,END|none`, the range declared with the data, else 2025-07-01..2026-07-01) are left out of every detector. The report holds `locked_test` with `source`, `declared_in` and `rows_left_out`.
+Rows in `[start - purge, end + embargo)` of the protocol locked test (`--lockbox START,END|none`, the range declared with the data, else 2025-07-01..2026-07-01) are left out of every detector: the purge is the `--target-spec` purge, else 219600 s, and the embargo is the lookback embargo of the store (`--lockbox-embargo` widens it). The features of a row after the range end read locked bars. The report holds `locked_test` with `source`, `declared_in` and `rows_left_out`.
 
 `rcsr audit --target-spec FILE` adds D13a-c for the target against `--vars` (all
 numeric columns except the target and time when `--vars` is absent). The same

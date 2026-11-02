@@ -810,11 +810,10 @@ fn random_control(
 // ---------------------------------------------------------------------------
 
 impl BatchStats {
+    /// Deterministic counters only: this block is inside the report hash.
     pub fn json(&self) -> String {
         format!(
             "{{\"candidates\":{},\"windows\":{},\"cells\":{},\"rows\":{},\"row_evals\":{},\
-             \"wall_s\":{},\"device_s\":{},\"score_s\":{},\"layout_s\":{},\"reference_s\":{},\
-             \"candidates_per_s\":{},\"row_evals_per_s\":{},\"device_fraction\":{},\
              \"tile_candidates\":{},\"device_bytes\":{},\"host_tile_bytes\":{},\
              \"device_tiles\":{},\"host_tiles\":{},\"fallback_candidates\":{}}}",
             self.candidates,
@@ -822,6 +821,20 @@ impl BatchStats {
             self.cells,
             self.rows,
             self.row_evals,
+            self.tile_candidates,
+            self.device_bytes,
+            self.host_tile_bytes,
+            self.device_tiles,
+            self.host_tiles,
+            self.fallback_candidates,
+        )
+    }
+
+    /// Wall-clock seconds and rates: printed outside the report hash.
+    pub fn timing_json(&self) -> String {
+        format!(
+            "{{\"wall_s\":{},\"device_s\":{},\"score_s\":{},\"layout_s\":{},\"reference_s\":{},\
+             \"candidates_per_s\":{},\"row_evals_per_s\":{},\"device_fraction\":{}}}",
             jnum(self.wall_s),
             jnum(self.device_s),
             jnum(self.score_s),
@@ -830,12 +843,6 @@ impl BatchStats {
             jnum(self.candidates_per_s),
             jnum(self.row_evals_per_s),
             jnum(self.device_fraction),
-            self.tile_candidates,
-            self.device_bytes,
-            self.host_tile_bytes,
-            self.device_tiles,
-            self.host_tiles,
-            self.fallback_candidates,
         )
     }
 }
@@ -913,6 +920,15 @@ pub struct FinalistCheck {
 }
 
 impl BatchSummary {
+    /// Timings of both seams, printed outside the report hash.
+    pub fn timings_json(&self) -> String {
+        format!(
+            "{{\"per_window\":{},\"pooled\":{}}}",
+            self.per_window.stats.timing_json(),
+            self.pooled.as_ref().map_or("null".to_string(), |p| p.stats.timing_json())
+        )
+    }
+
     pub fn max_abs_net_delta(&self) -> f64 {
         self.finalists.iter().fold(0.0, |m, f| m.max(f.delta.abs()))
     }

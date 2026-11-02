@@ -393,7 +393,17 @@ pub fn schema_json(
     panel_version: &str,
     locked_test: Option<&crate::lockbox::Lockbox>,
     also: Option<&crate::lockbox::Lockbox>,
+    embargo_floor: Option<i64>,
 ) -> String {
+    let base_bar = bar.seconds.unwrap_or(3600);
+    let (embargo_seconds, embargo_column) = {
+        let (l, c) = crate::enrich::max_lookback_seconds(columns.iter().map(|c| c.name.as_str()), base_bar);
+        match embargo_floor {
+            Some(f) if f > l => (f, "(inherited or membership)".to_string()),
+            _ => (l, c),
+        }
+    };
+    let embargo = crate::lockbox::embargo_json(embargo_seconds, &embargo_column, crate::enrich::EMBARGO_RULE, base_bar);
     let locked = locked_test
         .map(|l| {
             format!(
@@ -412,21 +422,22 @@ pub fn schema_json(
     };
     let mut s = format!(
         "{{\"panel_version\":{},\"schema_version\":{},\"feature_registry_version\":{},\
-         \"compact_parity_owner\":\"#{}\",\"rows\":{},{}{}\"columns\":[\n",
+         \"compact_parity_owner\":\"#{}\",\"rows\":{},{}{}\"lockbox_embargo\":{},\"columns\":[\n",
         esc(panel_version),
         SCHEMA_VERSION,
         FEATURE_REGISTRY_VERSION,
         PARITY_OWNER_ISSUE,
         rows,
         bar_json,
-        locked
+        locked,
+        embargo
     );
     for (i, c) in columns.iter().enumerate() {
         let r = &c.resolved;
         let sources: Vec<String> = r.sources.iter().map(|x| esc(x)).collect();
         s.push_str(&format!(
             "{{\"name\":{},\"family\":{},\"timeframe\":{},\"sources\":[{}],\"transform\":{},\
-             \"causal_offset\":{},\"warmup_bars\":{},\"dtype\":{},\"unit\":{},\
+             \"causal_offset\":{},\"warmup_bars\":{},\"lookback_seconds\":{},\"dtype\":{},\"unit\":{},\
              \"availability_start\":{},\"availability_end\":{},\"pit_rule\":{},\
              \"semantic_cost\":{},\"status\":{},\"sha256\":{}}}{}\n",
             esc(&c.name),
@@ -436,6 +447,7 @@ pub fn schema_json(
             esc(&r.transform),
             r.causal_offset,
             r.warmup,
+            opt_i64(crate::enrich::lookback_seconds(&c.name, base_bar)),
             esc(c.dtype.name()),
             esc(&r.unit),
             opt_i64(c.availability_start),
@@ -465,9 +477,21 @@ pub fn write_schema_declared(
     locked_test: Option<&crate::lockbox::Lockbox>,
     also: Option<&crate::lockbox::Lockbox>,
 ) -> Result<String, String> {
+    let floor = crate::lockbox::declared_embargo(store_path).map_err(|e| e.message)?.map(|(_, s)| s);
+    write_schema_embargo(store_path, panel_version, locked_test, also, floor)
+}
+
+/// As [`write_schema_declared`], with the embargo the schema declares at least `embargo_floor` seconds.
+pub fn write_schema_embargo(
+    store_path: &str,
+    panel_version: &str,
+    locked_test: Option<&crate::lockbox::Lockbox>,
+    also: Option<&crate::lockbox::Lockbox>,
+    embargo_floor: Option<i64>,
+) -> Result<String, String> {
     let store = FileStore::open(store_path)?;
     let (columns, bar) = build_schema_with_bar(&store)?;
-    let text = schema_json(&columns, &bar, store.n_rows(), panel_version, locked_test, also);
+    let text = schema_json(&columns, &bar, store.n_rows(), panel_version, locked_test, also, embargo_floor);
     let out = schema_path(store_path);
     std::fs::write(&out, text).map_err(|e| format!("{}: {}", out, e))?;
     Ok(out)
@@ -571,8 +595,8 @@ pub struct View {
     pub seed: u64,
     pub view: usize,
     pub size: usize,
-    /// Columns the view holds; below `size` when the store has too few
-    /// candidate families for the two-per-family rule.
+    /// Columns the view holds; equals `size` because a store with fewer
+    /// candidate columns is refused.
     pub delivered: usize,
     pub columns: Vec<String>,
     pub families: Vec<(String, Vec<String>)>,
@@ -636,14 +660,35 @@ pub fn check_view_size(size: usize) -> Result<(), String> {
     }
 }
 
+/// Why a view could not be selected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewError {
+    /// The store has fewer candidate columns than the requested size.
+    Shortfall { requested: usize, available: usize },
+    Invalid(String),
+}
+
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ViewError::Shortfall { requested, available } => write!(
+                f,
+                "--project {}: the store has {} candidate columns, fewer than the {} requested",
+                requested, available, requested
+            ),
+            ViewError::Invalid(m) => f.write_str(m),
+        }
+    }
+}
+
 /// Select a view from `columns` (stored column names in header order).
 ///
 /// Candidates are the available, derived (non-input) registry columns. Each
-/// family contributes one column, or two when `size` allows, and the choice
+/// family contributes one column per round until `size` columns are drawn, and the choice
 /// rotates with `(seed, view)`: consecutive views walk different families and
 /// different names. The result depends only on the column names, the registry
 /// and the arguments, never on row data.
-pub fn select_view(columns: &[String], size: usize, seed: u64, view: usize) -> Result<View, String> {
+pub fn select_view(columns: &[String], size: usize, seed: u64, view: usize) -> Result<View, ViewError> {
     select_view_excluding(columns, size, seed, view, &[])
 }
 
@@ -655,8 +700,8 @@ pub fn select_view_excluding(
     seed: u64,
     view: usize,
     excluded: &[(String, String)],
-) -> Result<View, String> {
-    check_view_size(size)?;
+) -> Result<View, ViewError> {
+    check_view_size(size).map_err(ViewError::Invalid)?;
     let mut fams: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for c in columns {
         if excluded.iter().any(|(n, _)| n == c) {
@@ -669,7 +714,11 @@ pub fn select_view_excluding(
         }
     }
     if fams.is_empty() {
-        return Err("--project: the store has no registered feature columns".to_string());
+        return Err(ViewError::Invalid("--project: the store has no registered feature columns".to_string()));
+    }
+    let available: usize = fams.values().map(|n| n.len()).sum();
+    if available < size {
+        return Err(ViewError::Shortfall { requested: size, available });
     }
     for names in fams.values_mut() {
         names.sort();
@@ -681,9 +730,8 @@ pub fn select_view_excluding(
     let order: Vec<&String> = (0..nf).map(|i| &family_names[(start + i) % nf]).collect();
     let mut picked: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut count = 0usize;
-    let rounds = if size <= VIEW_SIZE_MAX { 2 } else { usize::MAX };
     let per = size.div_ceil(nf).max(1);
-    for round in 0..rounds {
+    for round in 0.. {
         if count >= size || round > fams.values().map(|n| n.len()).max().unwrap_or(0) {
             break;
         }

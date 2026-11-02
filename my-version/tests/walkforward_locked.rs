@@ -271,10 +271,23 @@ fn locked_ranges_are_dropped_at_read_time_on_the_store_and_the_table_path() {
         gpu: false,
     };
     let open = ProtocolOptions::default();
-    let locked = ProtocolOptions { locked_ranges: vec![(30, 36)], ..ProtocolOptions::default() };
+    let locked = ProtocolOptions { locked_ranges: vec![(30, 36)], locked_embargo: 2, ..ProtocolOptions::default() };
     let rows = |r: &walkforward::Report| r.windows[0].test_rows;
     assert_eq!(rows(&walkforward::run_path_with(&path, &spec, &open).unwrap()), 20);
-    assert_eq!(rows(&walkforward::run_path_with(&path, &spec, &locked).unwrap()), 14);
     assert_eq!(rows(&walkforward::run_table_with(&table, &spec, "t", &open).unwrap()), 20);
-    assert_eq!(rows(&walkforward::run_table_with(&table, &spec, "t", &locked).unwrap()), 14);
+    // the library guard refuses a window that reaches [S - P, E + L) of a sealed range
+    let reaches = |w: &Window| EvalSpec { windows: vec![w.clone()], ..spec.clone() };
+    let window = |train_end: f64, test_start: f64, test_end: f64| Window { label: "w".to_string(), train_start: 0.0, train_end, test_start, test_end };
+    for refused in [window(20.0, 20.0, 40.0), window(20.0, 37.0, 40.0), window(20.0, 30.0, 33.0)] {
+        let spec = reaches(&refused);
+        for err in [
+            walkforward::run_path_with(&path, &spec, &locked).unwrap_err(),
+            walkforward::run_table_with(&table, &spec, "t", &locked).unwrap_err(),
+        ] {
+            assert!(err.contains("reaches the declared locked test"), "{err}");
+        }
+    }
+    let after = reaches(&window(20.0, 38.0, 40.0));
+    assert_eq!(rows(&walkforward::run_path_with(&path, &after, &locked).unwrap()), 2);
+    assert_eq!(rows(&walkforward::run_table_with(&table, &after, "t", &locked).unwrap()), 2);
 }

@@ -611,6 +611,28 @@ fn index_path(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Publish a small file atomically (`tmp` + rename).
+/// `<membership>.json`: the ranking windows that set the embargo of a panel built from it.
+pub fn membership_sidecar_path(membership: &str) -> String {
+    format!("{}.json", membership)
+}
+
+pub fn write_membership_sidecar(membership: &str, cfg: &MembershipConfig) -> Result<(), String> {
+    let p = membership_sidecar_path(membership);
+    publish_text(std::path::Path::new(&p), &format!("{{\"membership\":{{\"lookback_days\":{},\"rebalance_days\":{}}}}}\n", cfg.lookback_days, cfg.rebalance_days))
+}
+
+/// Seconds after which a panel row no longer depends on the ranking bars of a
+/// date: the lookback plus one rebalance step. The default window when the
+/// membership has no sidecar.
+pub fn membership_embargo_seconds(membership: &str) -> i64 {
+    let text = std::fs::read_to_string(membership_sidecar_path(membership)).unwrap_or_default();
+    let obj = crate::manifest::object(&text, "membership").unwrap_or("");
+    match (crate::lockbox::int_field(obj, "lookback_days"), crate::lockbox::int_field(obj, "rebalance_days")) {
+        (Some(l), Some(r)) if l > 0 && r > 0 => (l + r) * 86_400,
+        _ => crate::protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS,
+    }
+}
+
 pub(crate) fn publish_text(path: &std::path::Path, text: &str) -> Result<(), String> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
@@ -1733,6 +1755,7 @@ pub fn run(args: &[String]) -> ! {
                         .unwrap_or_else(|e| fail(&format!("{}: {}", csv.display(), e)));
                     publish_text(std::path::Path::new(&out), &text)
                         .unwrap_or_else(|e| fail(&e));
+                    write_membership_sidecar(&out, &cfg).unwrap_or_else(|e| fail(&e));
                     eprintln!(
                         "panel membership: cached (store sha256 {}), {} as-of dates -> {}",
                         &store_sha[..store_sha.len().min(12)],
@@ -1764,6 +1787,7 @@ pub fn run(args: &[String]) -> ! {
             if let Err(e) = std::fs::write(&out, &text) {
                 fail(&format!("{}: {}", out, e));
             }
+            write_membership_sidecar(&out, &cfg).unwrap_or_else(|e| fail(&e));
             if let Some(dir) = &membership_cache {
                 let dir = std::path::Path::new(dir);
                 publish_text(&dir.join("membership.csv"), &text).unwrap_or_else(|e| fail(&e));
