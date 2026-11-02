@@ -6758,6 +6758,35 @@ mod tests {
         }
     }
 
+    /// #611: the same property from wild starts on a curved model and an outlier
+    /// table, where a damped step can overshoot.
+    #[test]
+    fn l1_reweighted_never_worsens_a_wild_start() {
+        let (x, y) = outlier_fixture();
+        let wild = |a: f64, b: f64| {
+            node(
+                Op::Mul,
+                vec![constant(a), node(Op::Exp, vec![node(Op::Mul, vec![constant(b), input(0)])])],
+            )
+        };
+        let starts = [wild(0.5, 3.0), wild(40.0, -2.0), wild(0.01, 6.0), line(100.0, -50.0), line(-7.0, 9.0)];
+        for start_tree in &starts {
+            for iters in [1usize, 2, 4, 8, 16] {
+                for schedule in REWEIGHTED {
+                    let mut tree = start_tree.clone();
+                    let start = metric_score(&tree, &x, &y, &[], Metric::Absolute);
+                    let got = with_fit_irls(schedule, || {
+                        fit_weighted_metric(&mut tree, &x, &y, &[], iters, Metric::Absolute)
+                    });
+                    let written = metric_score(&tree, &x, &y, &[], Metric::Absolute);
+                    let ctx = format!("{:?} iters={iters} {schedule:?}", values(start_tree));
+                    assert!(!start.is_finite() || got <= start, "{ctx}: {got} > start {start}");
+                    assert!(got.to_bits() == written.to_bits() || (got - written).abs() <= 1e-12 * written.abs().max(1.0), "{ctx}: {got} vs {written}");
+                }
+            }
+        }
+    }
+
     /// #611: the oracle and gates of `l1_fit_matches_the_weighted_median_on_a_scale_model`.
     #[test]
     fn l1_reweighted_matches_the_weighted_median_on_a_scale_model() {
