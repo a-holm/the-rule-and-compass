@@ -147,6 +147,8 @@ fn a_fitted_step_warns_that_the_threshold_is_not_optimised() {
             "x",
             "--seed-expr",
             "step(2*x - 1)",
+            "--seed",
+            "1",
             "--cpu",
             "--generations",
             "1",
