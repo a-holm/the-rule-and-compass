@@ -4622,8 +4622,7 @@ fn select_promoted(
             })
             .collect();
         ranked.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            crate::error_order::cmp_error(a.1, b.1)
                 .then(
                     a.2.partial_cmp(&b.2)
                         .unwrap_or(std::cmp::Ordering::Equal),
@@ -4755,9 +4754,7 @@ fn promoted_count(pop: usize) -> usize {
 /// duplicates are removed by the archive, not here.
 fn select_population(candidates: &mut Vec<Ind>, pop: usize) {
     candidates.sort_by(|a, b| {
-        a.error
-            .partial_cmp(&b.error)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        crate::error_order::cmp_error(a.error, b.error)
             .then(
                 a.complexity
                     .partial_cmp(&b.complexity)
@@ -4775,7 +4772,7 @@ fn canonical_front(cap: usize, mut scored: Vec<Sol>) -> Archive {
     scored.sort_by(|a, b| {
         a.cost
             .total_cmp(&b.cost)
-            .then(a.error.total_cmp(&b.error))
+            .then(crate::error_order::cmp_error(a.error, b.error))
             .then(expr::structural_hash(&a.tree).cmp(&expr::structural_hash(&b.tree)))
     });
     let mut out = Archive::new(cap);
@@ -5413,7 +5410,7 @@ fn evolve_island(
     if !screened && !afp {
         if let Some(best) = isl
             .iter()
-            .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal))
+            .min_by(|a, b| crate::error_order::cmp_error(a.error, b.error))
         {
             next.push(best.clone());
         }
@@ -8160,9 +8157,7 @@ fn run_search(
                     }
                     let mut offspring = std::mem::take(pop);
                     offspring.sort_by(|a, b| {
-                        a.error
-                            .partial_cmp(&b.error)
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                        crate::error_order::cmp_error(a.error, b.error)
                     });
                     let top: Vec<Ind> = offspring.into_iter().take(promote).collect();
                     // #463: the refits are independent; results keep the order.
@@ -8361,9 +8356,7 @@ fn run_search(
                     .map(|pop| {
                         pop.iter()
                             .min_by(|a, b| {
-                                a.error
-                                    .partial_cmp(&b.error)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                crate::error_order::cmp_error(a.error, b.error)
                             })
                             .map(|i| i.tree.clone())
                     })
@@ -8373,9 +8366,7 @@ fn run_search(
                     .map(|pop| {
                         pop.iter()
                             .min_by(|a, b| {
-                                a.error
-                                    .partial_cmp(&b.error)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                crate::error_order::cmp_error(a.error, b.error)
                             })
                             .map_or(0, |i| i.age)
                     })
@@ -8435,9 +8426,7 @@ fn run_search(
                                 .iter()
                                 .enumerate()
                                 .max_by(|(_, a), (_, b)| {
-                                    a.error
-                                        .partial_cmp(&b.error)
-                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                    crate::error_order::cmp_error(a.error, b.error)
                                 })
                                 .map(|(i, _)| i)
                         });
@@ -9141,6 +9130,55 @@ mod tests {
         let outside = pending_ind(2.0 - 2.0 * tol, 9.0);
         assert!(better(&outside, &pending_ind(2.0, 3.0)), "outside the band the error wins");
     }
+
+    /// #622: the sequence of (error class bits, complexity) after a sort.
+    fn error_key(inds: &[Ind]) -> Vec<(u64, u64)> {
+        inds.iter()
+            .map(|i| {
+                let e = if i.error.is_nan() { u64::MAX } else { i.error.to_bits() };
+                (e, i.complexity.to_bits())
+            })
+            .collect()
+    }
+
+    /// #622: a NaN error gives the same population order for every input order.
+    #[test]
+    fn select_population_orders_nan_independent_of_input_order() {
+        let base = vec![
+            pending_ind(f64::NAN, 4.0),
+            pending_ind(3.0, 5.0),
+            pending_ind(f64::INFINITY, 7.0),
+            pending_ind(1.0, 9.0),
+            pending_ind(f64::INFINITY, 2.0),
+            pending_ind(-f64::NAN, 3.0),
+            pending_ind(2.0, 3.0),
+        ];
+        let mut reference: Option<Vec<(u64, u64)>> = None;
+        for shift in 0..base.len() {
+            for reversed in [false, true] {
+                let mut v = base.clone();
+                v.rotate_left(shift);
+                if reversed {
+                    v.reverse();
+                }
+                select_population(&mut v, 7);
+                let key = error_key(&v);
+                match &reference {
+                    None => reference = Some(key),
+                    Some(r) => assert_eq!(&key, r, "shift {shift} reversed {reversed}"),
+                }
+            }
+        }
+        let errors: Vec<f64> = {
+            let mut v = base.clone();
+            select_population(&mut v, 7);
+            v.iter().map(|i| i.error).collect()
+        };
+        assert_eq!(&errors[..3], &[1.0, 2.0, 3.0]);
+        assert_eq!(&errors[3..5], &[f64::INFINITY, f64::INFINITY]);
+        assert!(errors[5].is_nan() && errors[6].is_nan());
+    }
+
 
     /// #587: simple non-finite trees no longer win tournaments against complex
     /// finite ones.

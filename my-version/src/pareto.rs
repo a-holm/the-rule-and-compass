@@ -100,7 +100,7 @@ impl Archive {
         self.items.sort_by(|a, b| {
             a.cost
                 .total_cmp(&b.cost)
-                .then(a.error.partial_cmp(&b.error).unwrap())
+                .then(crate::error_order::cmp_error(a.error, b.error))
         });
         self.items.dedup_by(|a, b| a.cost == b.cost);
         while self.items.len() > self.cap {
@@ -135,7 +135,7 @@ impl Archive {
         self.items.sort_by(|a, b| {
             a.cost
                 .total_cmp(&b.cost)
-                .then(a.error.total_cmp(&b.error))
+                .then(crate::error_order::cmp_error(a.error, b.error))
                 .then(
                     crate::expr::structural_hash(&a.tree)
                         .cmp(&crate::expr::structural_hash(&b.tree)),
@@ -199,7 +199,7 @@ impl Archive {
         order.sort_by(|a, b| {
             a.cost
                 .total_cmp(&b.cost)
-                .then(a.error.total_cmp(&b.error))
+                .then(crate::error_order::cmp_error(a.error, b.error))
                 .then(
                     crate::expr::structural_hash(&a.tree)
                         .cmp(&crate::expr::structural_hash(&b.tree)),
@@ -223,7 +223,7 @@ impl Archive {
         v.sort_by(|a, b| {
             a.cost
                 .total_cmp(&b.cost)
-                .then(a.error.partial_cmp(&b.error).unwrap())
+                .then(crate::error_order::cmp_error(a.error, b.error))
         });
         v
     }
@@ -321,5 +321,16 @@ mod tests {
         assert!(!a.admits(0.6, 2.0), "dominated by (1, 0.5)");
         assert!(!a.admits(f64::NAN, 0.1));
         assert!(a.admits(0.4, 2.0));
+    }
+
+    /// #622: sorting a front that holds a NaN error does not panic and puts it last.
+    #[test]
+    fn sorted_places_nan_last_without_panic() {
+        let mut a = Archive::new(100);
+        a.items = vec![sol(2.0, f64::NAN, 1.0), sol(2.0, 0.5, 2.0), sol(1.0, 0.9, 3.0)];
+        let s = a.sorted();
+        let errors: Vec<f64> = s.iter().map(|x| x.error).collect();
+        assert_eq!(&errors[..2], &[0.9, 0.5]);
+        assert!(errors[2].is_nan());
     }
 }

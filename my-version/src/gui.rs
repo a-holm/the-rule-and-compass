@@ -1603,9 +1603,7 @@ impl RunPlan {
         let best_resid = rows
             .iter()
             .min_by(|a, b| {
-                a.train_error
-                    .partial_cmp(&b.train_error)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                crate::error_order::cmp_error(a.train_error, b.train_error)
             })
             .map(|r| r.resid_tests);
 
@@ -1841,9 +1839,7 @@ impl RunPlan {
         for f in &folds {
             let out = search::run(&self.cfg, &f.train, &f.test);
             let best = out.archive.sorted().into_iter().min_by(|a, b| {
-                a.error
-                    .partial_cmp(&b.error)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                crate::error_order::cmp_error(a.error, b.error)
             });
             if let Some(s) = best {
                 let test_error = search::eval_error(&s.tree, &f.test, self.cfg.metric);
