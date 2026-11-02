@@ -543,6 +543,7 @@ fn an_explicit_gpu_run_exits_non_zero_on_a_mid_run_batch_failure() {
     assert_eq!(code(&o), 6, "{}", stderr(&o));
     assert!(stderr(&o).contains("generation batch"), "{}", stderr(&o));
     assert!(o.stdout.is_empty(), "no result is written");
+}
 
 fn from_run_fixture() -> (String, String, f64, f64) {
     let dir = scratch();
