@@ -202,12 +202,12 @@ fn a_time_budget_stop_on_the_flat_path_is_resumable() {
 fn unsupported_operators_fall_back_and_postfix_refuses() {
     let data = sample(120);
     let mut auto = cfg(VariationMode::Auto, 1, 4096, 1);
-    auto.ops = vec![Op::Add, Op::Mul, Op::Asinh];
+    auto.ops = vec![Op::Add, Op::Mul, Op::Require];
     let out = run(&auto, &data, &data);
     assert!(!out.archive.items.is_empty());
 
     let mut forced = cfg(VariationMode::Postfix, 1, 4096, 1);
-    forced.ops = vec![Op::Add, Op::Mul, Op::Asinh];
+    forced.ops = vec![Op::Add, Op::Mul, Op::Require];
     let err = match search::run_resumable(&forced, &data, &data, None, 0, |_| {}) {
         Ok(_) => panic!("postfix must refuse an operator without a kernel opcode"),
         Err(e) => e,
