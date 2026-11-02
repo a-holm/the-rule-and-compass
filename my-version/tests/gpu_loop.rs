@@ -43,6 +43,9 @@ fn sample(n: usize) -> Sample {
     }
 }
 
+/// A search config. GPU configs force `Device`: the `Auto` cost model is timing
+/// based, so under compute-sanitizer it can route the synchronous path to the
+/// CPU while the overlap pipeline stays on the device.
 #[cfg(feature = "cuda")]
 fn config(seed: u32, gpu: bool) -> Config {
     Config {
@@ -56,6 +59,11 @@ fn config(seed: u32, gpu: bool) -> Config {
         metric: Metric::Squared,
         ops: vec![Op::Add, Op::Sub, Op::Mul, Op::Div],
         gpu,
+        dispatch: if gpu {
+            rcsr::dispatch::DispatchMode::Device
+        } else {
+            rcsr::dispatch::DispatchMode::Auto
+        },
         ..Default::default()
     }
 }
