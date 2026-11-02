@@ -1167,6 +1167,6 @@ fn view_ids_of_fully_delivered_sizes_are_pinned() {
         .flat_map(|&s| (0..2).map(move |k| (s, k)))
         .map(|(s, k)| registry::select_view(&sixteen, s, 11, k).unwrap().id)
         .collect();
-    let golden: [&str; 6] = ["", "", "", "", "", ""];
+    let golden: [&str; 6] = ["2abdb5320a08", "c498b629e472", "41f0170017d4", "8ed29caee6cb", "a32035702727", "558b4954cb4b"];
     assert_eq!(got, golden, "{got:?}");
 }
