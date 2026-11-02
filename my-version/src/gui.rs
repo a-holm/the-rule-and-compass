@@ -699,6 +699,7 @@ struct RawOptions {
     allow_interpolate: bool,
     allow_lockbox: bool,
     lockbox: Option<String>,
+    lockbox_embargo: Option<String>,
     validation_frac: f64,
     date_only: DateOnlyPolicy,
     time_unit: Option<TimeUnit>,
@@ -744,6 +745,7 @@ impl Default for RawOptions {
             allow_interpolate: false,
             allow_lockbox: false,
             lockbox: None,
+            lockbox_embargo: None,
             validation_frac: 0.0,
             date_only: DateOnlyPolicy::Error,
             time_unit: None,
@@ -884,6 +886,7 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
             "--allow-interpolate" => raw.allow_interpolate = true,
             "--allow-lockbox" => raw.allow_lockbox = true,
             "--lockbox" => raw.lockbox = Some(take(&mut i)?),
+            "--lockbox-embargo" => raw.lockbox_embargo = Some(take(&mut i)?),
             "--center" => raw.center = Center::parse(&take(&mut i)?)?,
             "--scale" => raw.scale = Scale::parse(&take(&mut i)?)?,
             "--filter" => raw.filter = Some(take(&mut i)?),
@@ -1324,7 +1327,7 @@ impl RunPlan {
             }
         }
 
-        let resolved_lockbox = crate::lockbox::resolve(raw.lockbox.as_deref(), &data_path).map_err(|e| e.message)?;
+        let resolved_lockbox = crate::lockbox::resolve_with(raw.lockbox.as_deref(), raw.lockbox_embargo.as_deref(), &data_path).map_err(|e| e.message)?;
         let spec = data::SplitSpec {
             mode,
             time_col,
@@ -1340,6 +1343,7 @@ impl RunPlan {
             allow_lockbox: raw.allow_lockbox,
             declared_lockbox: resolved_lockbox.declared(),
             purge_seconds: None,
+            boundary_purge_seconds: None,
             scale_column: None,
             trading: None,
             canonical_train_order: false,

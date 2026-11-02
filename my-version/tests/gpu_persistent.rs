@@ -129,6 +129,7 @@ fn fit_and_score_paths_use_the_fit_stream_and_no_blocking_copies() {
     let src = include_str!("../src/cuda/eval.cu");
     let entry_points = [
         "float rc_fit_batch(",
+        "float rc_fit_batch_from(",
         "float rc_rank_score_batch(",
         "float rc_order_stat_score_batch(",
         "float rc_max_scan_batch(",
@@ -138,7 +139,9 @@ fn fit_and_score_paths_use_the_fit_stream_and_no_blocking_copies() {
         "static int rc_rank_runs(",
         "static int rc_fs_f64_twins(",
         "static int ft_launch(",
+        "static float rc_fit_launch(",
     ];
+    let delegating = ["float rc_fit_batch(", "float rc_fit_batch_from("];
     for head in entry_points.iter().chain(helpers.iter()) {
         let text = body(src, head);
         let code: String = text
@@ -163,7 +166,16 @@ fn fit_and_score_paths_use_the_fit_stream_and_no_blocking_copies() {
         let code = body(src, head);
         assert!(!code.contains("cudaMalloc") && !code.contains("rc_alloc("), "{head}: allocates");
         assert!(!code.contains("cudaFree"), "{head}: frees");
-        assert!(code.contains("rc_fs_finish("), "{head}: no event synchronisation");
+        if delegating.contains(head) {
+            assert!(code.contains("rc_fit_launch("), "{head}: does not delegate to rc_fit_launch");
+        } else {
+            assert!(code.contains("rc_fs_finish("), "{head}: no event synchronisation");
+        }
         assert_eq!(code.matches("cudaEventSynchronize").count(), 0);
     }
+    let launch = body(src, "static float rc_fit_launch(");
+    assert!(!launch.contains("cudaMalloc") && !launch.contains("rc_alloc("), "rc_fit_launch: allocates");
+    assert!(!launch.contains("cudaFree"), "rc_fit_launch: frees");
+    assert!(launch.contains("rc_fs_finish("), "rc_fit_launch: no event synchronisation");
+    assert_eq!(launch.matches("cudaEventSynchronize").count(), 0);
 }

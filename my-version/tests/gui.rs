@@ -390,6 +390,19 @@ fn gui_cv_needs_an_exclude_that_clears_the_declared_range() {
 }
 
 #[test]
+fn gui_refuses_rows_after_the_range_end_whose_features_read_it() {
+    let path = declared_csv("embargo");
+    let exclude = format!("ts >= {} and ts < {}", BOX_START - 219_600, BOX_END);
+    let (status, body) = run_file(&path, &["--cv", "k-fold", "--cv-k", "3", "--exclude", &exclude]);
+    assert_eq!(status, 400, "{}", body);
+    assert!(body.contains("whose features read the declared locked test"), "{}", body);
+    assert!(body.contains("lookback embargo 10972800 s after the end (protocol default)"), "{}", body);
+    let (status, body) = run_file(&path, &["--split", "temporal", "--exclude", &exclude, "--lockbox-embargo", "20000000"]);
+    assert_eq!(status, 400, "{}", body);
+    assert!(body.contains("lookback embargo 20000000 s"), "{}", body);
+}
+
+#[test]
 fn gui_flag_range_guards_an_uploaded_table() {
     let table = stamped_table(1_714_521_600, 1500);
     let (status, body) = run_upload(&table, &["--split", "temporal", "--lockbox", "2024-06-01,2024-07-01"]);

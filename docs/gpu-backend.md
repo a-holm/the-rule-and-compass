@@ -647,9 +647,10 @@ names every refusal:
 
 * no scorer for the metric: the table's own reason (for example `implicit needs
   an expression-tree gradient pass`);
-* slope whose training pairs are not the consecutive rows (a shuffled split, a
-  `--group-by` panel, a row missing from the side): `slope pairs are not the
-  consecutive rows of the training sample`;
+* slope whose training pairs are not `[k - 1, k]` pairs of the sample (a
+  shuffled split, a row missing from the side): `slope pairs are not the
+  consecutive rows of the training sample`. A `--group-by` panel is admitted
+  through the pair mask (#508);
 * slope with a `--fit-rows`/`--fit-samples` subsample: `slope pairs are not the
   consecutive rows of a --fit-rows/--fit-samples subsample`;
 * sample below the measured floor: `order/rank scoring: the sample is below the
@@ -1939,7 +1940,7 @@ A constant reachable only through a value-only operator has a zero Jacobian colu
 
 ### Slope on the batched kernel (issue #236)
 
-`--metric slope` is scored and fitted on the device when the training sample's slope pairs are its consecutive rows: `[k − 1, k]` for every `k` in `1..n` (`search::slope_pairs_are_consecutive`). That is a single series under `--split temporal`. Any other pair list (a shuffled split, a `--group-by` panel, a row missing from the side) keeps the exact CPU scorer with the reason `slope pairs are not the consecutive rows of the training sample`, and a `--fit-rows`/`--fit-samples` subsample (#265) keeps it with its own reason, so the device never differences two rows the CPU would not. Weighted slope does not exist, and a tiled plan refuses the scorer by name (see [Tiled residency](#tiled-residency-293)).
+`--metric slope` is scored and fitted on the device when every training pair is `[k − 1, k]` with a distinct `k` in `1..n` (`search::slope_pair_mask`). A single series under `--split temporal` has all of them. A `--group-by` panel drops the pairs that open a group (#508): the host uploads a one-bit-per-row mask (`ceil(n/32)` words plus one word with the pair count, `rc_set_slope_pairs`), the scorer and the fit kernel skip rows whose bit is clear, and the scorer divides by the pair count. A row without a pair is still evaluated and must be finite, as on the CPU. A run without a mask reads no mask and is unchanged. A row-range launch with a mask is refused. Any other pair list (a shuffled split, a row missing from the side) keeps the exact CPU scorer with the reason `slope pairs are not the consecutive rows of the training sample`, and a `--fit-rows`/`--fit-samples` subsample (#265) keeps it with its own reason, so the device never differences two rows the CPU would not. Weighted slope does not exist, and a tiled plan refuses the scorer by name (see [Tiled residency](#tiled-residency-293)).
 
 **Scorer** (`ScoreObjective::Slope`, score code 15). Lane `l` owns the pairs `(r − 1, r)` of its rows `r ≥ 1` and runs both rows itself, so no lane reads another lane's state and the #293 lane carry is unchanged. Each pair adds `|(p_r − p_{r−1}) − (y_r − y_{r−1})|` in `f64` from the `f32` predictions and target; the finish divides by `n − 1`. A non-finite prediction on any row is `+inf` with status 2, and `n < 2` is `+inf` with status 2, as on the CPU (`metrics::score_slope_pairs`).
 
@@ -2392,6 +2393,7 @@ Definitions that matter:
   `{value,numerator,denominator,units,scope}`. `features`, `pnl` and `io` are
   present even when their stage did not run, so a reader never has to infer a
   missing key.
+* **overlap drain** (#600). With `--pipeline-depth > 0` the main thread scores and fits the queued batches inside the island-scope window. The time of those calls is booked as `eval` (device scoring, rescore) and `fit` (device fit, exact CPU fallback), capped by the window and eval first; the rest of the window stays `vary`. The split is measured per call but the window is an apportionment, because the drain runs concurrently with island work. `ledger.drain_wall_s` is the booked drain total. The drain records its fit kernel as one `fit` device interval, so `device_busy_s` includes it exactly as at `--pipeline-depth 0`. Tests: `pipeline_books_fit_interval` (`tests/gpu_pipeline_consistency.rs`), `pipeline_drain_not_vary` and `ledger_closure_with_overlap` (`src/gpu_stats.rs`).
 * **quality/GPU-hour** is decades of error reduction against the constant-mean
   baseline per measured run-wall GPU-hour:
   `-log10(best / baseline) / hours`. The two errors **must be the same unit and

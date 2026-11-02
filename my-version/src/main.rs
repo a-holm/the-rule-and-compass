@@ -272,6 +272,11 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   --allow-interpolate        permit --fill interpolate on time-ordered data
   --allow-lockbox            permit train/validation/test rows in 2026H2 (declared final test only)
                              It never opens the declared locked test (--lockbox).
+  --lockbox-embargo <SECONDS>
+                             widen the lookback embargo after the end of every locked range
+                             (default: lockbox_embargo declared with the data, else 10972800);
+                             a smaller value is refused (exit 2). Rows in
+                             [START - purge, END + embargo) are refused (exit 3)
   --lockbox <START,END|none>
                              locked test (UTC, half-open). Order: this flag, the range
                              declared with the data (<data>.manifest.json, .schema.json,
@@ -345,8 +350,9 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
                              inside each group). Text columns are allowed.
   --project <n|auto>         choose the variables as a deterministic family-stratified
                              view of n registered feature columns (24-48, research
-                             cell 96-128; auto = 36), one or two per family, rotated
-                             by --seed and --view. Needs a .rcsb store; not with --vars.
+                             cell 96-128; auto = 36), exactly n columns, one per family per
+                             round, rotated by --seed and --view; a store with fewer than n
+                             candidate columns exits 2. Needs a .rcsb store; not with --vars.
                              The view id and columns go to --run-manifest
   --view <k>                 view index for --project (default 0)
   --no-project               load every store column. The default projects the
@@ -1269,7 +1275,7 @@ fn ledger_json(
         rcsr::gpu_stats::Ratio::undefined(f64::NAN, f64::NAN, "decades_per_gpu_hour", "run")
     };
     format!(
-        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"fallback_s\":{},\"gate_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
+        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"drain_wall_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"fallback_s\":{},\"gate_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
         jnum(l.wall_s()),
         stages,
         jnum(l.stage_sum_s()),
@@ -1278,6 +1284,7 @@ fn ledger_json(
         jnum(l.device_busy_s()),
         jnum(l.device_busy_sum_s()),
         jnum(l.device_overlap_s()),
+        jnum(l.drain_wall_s()),
         l.intervals().len(),
         jstr(l.interval_basis()),
         by_event,
@@ -2407,6 +2414,7 @@ fn main() {
     let mut allow_lockbox = false;
     // #264: declared locked test and the ledger whose reads run.json counts.
     let mut lockbox_arg: Option<String> = None;
+    let mut lockbox_embargo_arg: Option<String> = None;
     let mut ledger_arg: Option<String> = None;
     // #266: ablation arm label recorded in the run report.
     let mut arm_arg: Option<String> = None;
@@ -2721,6 +2729,7 @@ fn main() {
             },
             "--allow-interpolate" => allow_interpolate = true,
             "--lockbox" => lockbox_arg = Some(val!()),
+            "--lockbox-embargo" => lockbox_embargo_arg = Some(val!()),
             "--ledger" => ledger_arg = Some(val!()),
             "--arm" => arm_arg = Some(val!()),
             "--allow-lockbox" => allow_lockbox = true,
@@ -4171,21 +4180,13 @@ fn main() {
                                 v.seed,
                                 v.view
                             );
-                            if v.delivered < v.size {
-                                eprintln!(
-                                    "view {}: requested {} columns, delivered {}: {} candidate famil(ies) at most two columns each",
-                                    v.id,
-                                    v.size,
-                                    v.delivered,
-                                    v.families.len()
-                                );
-                            }
                             vars = v.columns.clone();
                             view_record = Some(v);
                         }
                         Err(e) => {
                             eprintln!("error: {}", e);
-                            std::process::exit(EXIT_INPUT);
+                            let shortfall = matches!(e, registry::ViewError::Shortfall { .. });
+                            std::process::exit(if shortfall { EXIT_USAGE } else { EXIT_INPUT });
                         }
                     }
                 }
@@ -5043,11 +5044,33 @@ fn main() {
         }
     }
 
-    let resolved_lockbox = rcsr::lockbox::resolve(lockbox_arg.as_deref(), &data_path).unwrap_or_else(|e| {
+    let resolved_lockbox = rcsr::lockbox::resolve_with(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path).unwrap_or_else(|e| {
         eprintln!("error: {}", e.message);
         std::process::exit(e.exit);
     });
     let declared_lockbox = resolved_lockbox.declared();
+    // Several targets resolve no single spec: the boundary purge is the largest
+    // required purge of the targets that have a spec entry.
+    let multi_boundary_purge: Option<f64> = if multi_output {
+        let mut largest: Option<f64> = None;
+        for name in &target_names {
+            match target::resolve(&data_path, None, name) {
+                Ok(Some(r)) => largest = Some(largest.map_or(r.spec.required_purge_seconds(), |l| l.max(r.spec.required_purge_seconds()))),
+                Ok(None) => {}
+                Err(target::ResolveError::Usage(e)) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_USAGE);
+                }
+                Err(target::ResolveError::Input(e)) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
+            }
+        }
+        largest
+    } else {
+        None
+    };
     let spec = data::SplitSpec {
         mode,
         time_col,
@@ -5067,6 +5090,7 @@ fn main() {
         allow_lockbox,
         declared_lockbox,
         purge_seconds: target_resolved.as_ref().map(|r| r.spec.required_purge_seconds()),
+        boundary_purge_seconds: multi_boundary_purge,
         trading: trading_cols.clone(),
         canonical_train_order: fitness_pnl, // #480
         scale_column: target_resolved
@@ -10020,7 +10044,7 @@ OPTIONS:
                              A window whose test_start is below the last train
                              or validation time of the run plus its required
                              purge exits 2
-  --allow-in-sample-windows  with --front: report such a window as
+  --allow-in-sample-windows  with --front or --from-run: report such a window as
                              in_sample:true instead of refusing it
                              (diagnostics only)
   --select-band              #308: select among repeated --expr candidates with
@@ -10029,7 +10053,7 @@ OPTIONS:
                              admitted set is rescored on the full validation rows in
                              exact CPU f64 and ranked by
                              (net, turnover, complexity, index). Requires
-                             --validation-frac > 0 and more than one --expr; the
+                             --validation-frac > 0 or a --windows table with validation_start, and more than one --expr; the
                              JSON carries surrogate_rank, exact_rank, band,
                              epsilon, finalists_considered, recall_band and
                              scored_by=cpu_f64
@@ -10139,6 +10163,11 @@ OPTIONS:
   --ledger <file>            append-only JSONL candidate ledger. A development
                              run appends a candidate (test_read:false) and
                              refuses windows that reach the declared lockbox
+  --lockbox-embargo <SECONDS>
+                             widen the lookback embargo after the end of every locked range
+                             (default: lockbox_embargo declared with the data, else 10972800);
+                             a smaller value is refused (exit 2). Rows in
+                             [START - purge, END + embargo) are refused (exit 3)
   --lockbox <START,END|none>
                              locked test, UTC half-open. Order: this flag, the range
                              declared with --data (store manifest, schema or sidecar),
@@ -10235,6 +10264,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut verify_read = false;
     let mut allow_unbound = false;
     let mut lockbox_arg: Option<String> = None;
+    let mut lockbox_embargo_arg: Option<String> = None;
     let mut expect_hash: Option<String> = None;
     let mut front_path: Option<String> = None;
     let mut allow_in_sample = false;
@@ -10457,6 +10487,10 @@ fn run_walkforward(args: &[String]) -> ! {
                 lockbox_arg = Some(need(args, i + 1, "--lockbox"));
                 i += 1;
             }
+            "--lockbox-embargo" => {
+                lockbox_embargo_arg = Some(need(args, i + 1, "--lockbox-embargo"));
+                i += 1;
+            }
             "--expect-report-sha256" => {
                 expect_hash = Some(need(args, i + 1, "--expect-report-sha256"));
                 i += 1;
@@ -10566,6 +10600,7 @@ fn run_walkforward(args: &[String]) -> ! {
         }
         run_cost = Some((book.per_side_bps, book.source));
         cost_spec = Some(book.spec);
+        front_run = Some(run);
     } else if let Some(path) = &front_path {
         if !expressions.is_empty() {
             eprintln!(
@@ -10723,14 +10758,6 @@ fn run_walkforward(args: &[String]) -> ! {
         );
         std::process::exit(EXIT_USAGE);
     }
-    if band_select && validation_frac <= 0.0 {
-        eprintln!(
-            "error: --select-band needs --validation-frac > 0; the test block \
-             may not choose the candidate\n\n{}",
-            walkforward_usage()
-        );
-        std::process::exit(EXIT_USAGE);
-    }
     let expression = expressions[0].clone();
     let candidates = if expressions.len() > 1 {
         expressions
@@ -10792,6 +10819,14 @@ fn run_walkforward(args: &[String]) -> ! {
             }
         }
     }
+    if band_select && validation_frac <= 0.0 && popts.validation_starts.is_empty() {
+        eprintln!(
+            "error: --select-band needs --validation-frac > 0 or a windows table with validation_start; \
+             the test block may not choose the candidate\n\n{}",
+            walkforward_usage()
+        );
+        std::process::exit(EXIT_USAGE);
+    }
     if windows.is_empty() {
         eprintln!(
             "error: walkforward needs at least one --window or --windows file\n\n{}",
@@ -10799,18 +10834,25 @@ fn run_walkforward(args: &[String]) -> ! {
         );
         std::process::exit(EXIT_USAGE);
     }
-    if let Some((run, (_, seen, purge))) = front_run.as_ref().and_then(|r| Some((r, r.earliest_test_start()?))) {
+    if let Some(run) = front_run.as_ref() {
         for w in &windows {
             if run.in_sample(w.test_start) {
                 if allow_in_sample {
                     popts.in_sample_windows.push(w.label.clone());
                     continue;
                 }
-                eprintln!(
-                    "error: window '{}' tests rows the run trained or selected on \
-                     (test_start {} < last seen {} + purge {})",
-                    w.label, w.test_start, seen, purge
-                );
+                match run.earliest_test_start() {
+                    Some((_, seen, purge)) => eprintln!(
+                        "error: window '{}' tests rows the run trained or selected on \
+                         (test_start {} < last seen {} + purge {})",
+                        w.label, w.test_start, seen, purge
+                    ),
+                    None => eprintln!(
+                        "error: window '{}' tests rows the run trained or selected on \
+                         (the run has no split.train_time)",
+                        w.label
+                    ),
+                }
                 std::process::exit(EXIT_USAGE);
             }
         }
@@ -10848,14 +10890,15 @@ fn run_walkforward(args: &[String]) -> ! {
         min_hold,
         gpu,
     };
-    let resolved = rcsr::lockbox::resolve(lockbox_arg.as_deref(), &data_path).unwrap_or_else(|e| {
+    let resolved = rcsr::lockbox::resolve_with(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path).unwrap_or_else(|e| {
         eprintln!("error: {}", e.message);
         std::process::exit(e.exit);
     });
     let declared_lock: Option<(f64, f64)> = resolved.range.map(|l| (l.start as f64, l.end as f64));
-    if !locked_test {
-        popts.locked_ranges = resolved.ranges().iter().map(|r| (r.start, r.end)).collect();
-    }
+    // A sealed read opens the primary range only; every other declared range
+    // stays sealed until its own sealed read.
+    popts.locked_ranges = resolved.ranges().iter().skip(usize::from(locked_test)).map(|r| (r.start, r.end)).collect();
+    popts.locked_embargo = resolved.embargo.seconds;
     if declared_lock.is_none() && (ledger_path.is_some() || locked_test) {
         eprintln!("error: --ledger and --locked-test need a locked test range: drop --lockbox none");
         std::process::exit(EXIT_USAGE);
@@ -10865,17 +10908,16 @@ fn run_walkforward(args: &[String]) -> ! {
         std::process::exit(EXIT_USAGE);
     }
     for (ri, rg) in resolved.ranges().into_iter().enumerate() {
-        if locked_test && ri > 0 {
-            continue;
-        }
+        let sealed_read = locked_test && ri == 0;
         let (ls, le) = (rg.start as f64, rg.end as f64);
         let label_purge = popts.required_purge_seconds(spec.horizon).max(spec.embargo_seconds());
         let boundary = ls - label_purge;
+        let reach_end = if sealed_read { le } else { le + resolved.embargo.seconds as f64 };
         for w in &spec.windows {
-            let train_hits = w.train_start < le && w.train_end > boundary;
-            let test_hits = w.test_start < le && w.test_end > boundary;
+            let train_hits = w.train_start < reach_end && w.train_end > boundary;
+            let test_hits = w.test_start < reach_end && w.test_end > boundary;
             let test_inside = w.test_start >= ls && w.test_end <= le;
-            let problem = if locked_test {
+            let problem = if sealed_read {
                 if train_hits {
                     Some("trains within the label purge of the locked test".to_string())
                 } else if !test_inside {
@@ -10885,12 +10927,14 @@ fn run_walkforward(args: &[String]) -> ! {
                 }
             } else if train_hits || test_hits {
                 Some(format!(
-                    "reaches the declared locked test {}..{} (label end = stamp + {} s); \
-                     end it at or before {}, or read the locked test only with --locked-test and a sealed list",
+                    "reaches the declared locked test {}..{} (label end = stamp + {} s, lookback embargo {} s after the end); \
+                     end it at or before {} or start it at or after {}, or read the locked test only with --locked-test and a sealed list",
                     rcsr::protocol::iso(ls),
                     rcsr::protocol::iso(le),
                     label_purge,
-                    rcsr::protocol::iso(boundary)
+                    resolved.embargo.seconds,
+                    rcsr::protocol::iso(boundary),
+                    rcsr::protocol::iso(reach_end)
                 ))
             } else {
                 None
@@ -11241,6 +11285,7 @@ fn run_audit(args: &[String]) -> ! {
     let mut resample_large = 60usize;
     let mut session_gap: Option<f64> = None;
     let mut lockbox_arg: Option<String> = None;
+    let mut lockbox_embargo_arg: Option<String> = None;
     let mut target_spec: Option<String> = None;
     let mut i = 0usize;
     while i < args.len() {
@@ -11280,6 +11325,7 @@ fn run_audit(args: &[String]) -> ! {
             }
             "--report" => report_path = Some(take(&mut i)),
             "--lockbox" => lockbox_arg = Some(take(&mut i)),
+            "--lockbox-embargo" => lockbox_embargo_arg = Some(take(&mut i)),
             "--target-spec" => target_spec = Some(take(&mut i)),
             "--join-on" => join_on = Some(take(&mut i)),
             "--bars" => bars_path = Some(take(&mut i)),
@@ -11385,7 +11431,7 @@ fn run_audit(args: &[String]) -> ! {
             (seconds, Some(audit), report)
         }
     };
-    let resolved = rcsr::lockbox::resolve(lockbox_arg.as_deref(), &path).unwrap_or_else(|e| {
+    let resolved = rcsr::lockbox::resolve_with(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &path).unwrap_or_else(|e| {
         eprintln!("error: {}", e.message);
         std::process::exit(e.exit);
     });
@@ -11396,8 +11442,21 @@ fn run_audit(args: &[String]) -> ! {
     } else {
         Vec::new()
     };
+    // Rows whose label window reaches a range (the target spec purge, else the
+    // default) or whose features read it (the lookback embargo) are left out too.
+    let audit_purge: i64 = match target::resolve(&path, target_spec.as_deref(), &target) {
+        Ok(Some(r)) => r.spec.required_purge_seconds().ceil() as i64,
+        _ => rcsr::protocol::DEFAULT_PURGE_SECONDS as i64,
+    };
     let keep: Vec<usize> = (0..times.len())
-        .filter(|&r| !ranges.iter().any(|l| times[r].is_finite() && l.contains(times[r].floor() as i64)))
+        .filter(|&r| {
+            !ranges.iter().any(|l| {
+                times[r].is_finite() && {
+                    let t = times[r].floor() as i64;
+                    t >= l.start - audit_purge && t < l.end + resolved.embargo.seconds
+                }
+            })
+        })
         .collect();
     let rows_left_out = times.len() - keep.len();
     let (times, mut time_audit, time_report) = if rows_left_out == 0 {
@@ -12027,6 +12086,7 @@ mod tests {
             "\"stages\":",
             "\"device_busy_s\":4",
             "\"device_busy_sum_s\":5",
+            "\"drain_wall_s\":0",
             "\"device_overlap_s\":1",
             "\"device_split\":{\"eval_kernel_s\":0,\"eval_launch_s\":0,\"eval_copy_s\":0,\"eval_alloc_s\":0,\"fit_kernel_s\":1.5,\"units\":\"seconds\"}",
             "\"duty_run\":{\"value\":0.4,\"numerator\":4,\"denominator\":10,\"units\":\"fraction\",\"scope\":\"run\"}",

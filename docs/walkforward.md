@@ -139,7 +139,7 @@ In-sample guard: `run.json` records `split.train_time` and `split.validation_tim
 error: window 'w1' tests rows the run trained or selected on (test_start 150 < last seen 179 + purge 5)
 ```
 
-`--allow-in-sample-windows` downgrades the refusal: the window is scored and its JSON carries `"in_sample":true`. Use it for diagnostics only. `rcsr ladder --sr-run` and `rcsr ablation score` apply the same rule (`RunFile::in_sample`) to their folds: they exit 3 naming the in-sample fold, and `--allow-in-sample` labels it `oof:false` and leaves it out of every pooled statistic.
+`--from-run` applies the same rule: it reads the same `run.json`, so a window inside the rows the run trained or selected on exits 2, and a run without `split.train_time` refuses every window. `--allow-in-sample-windows` downgrades the refusal: the window is scored and its JSON carries `"in_sample":true`. Use it for diagnostics only. `rcsr ladder --sr-run` and `rcsr ablation score` apply the same rule (`RunFile::in_sample`) to their folds: they exit 3 naming the in-sample fold, and `--allow-in-sample` labels it `oof:false` and leaves it out of every pooled statistic.
 
 The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA-256 of the file) and `candidate_labels`. `--select-band` and `--batch-pnl` work unchanged on the front's candidates.
 
@@ -362,8 +362,12 @@ are exact CPU `f64`.
 The `batch_pnl` JSON block holds `reported_values`, `batch_values`,
 `max_abs_net_delta` (selected candidate, scalar evaluator versus batch cell),
 `finalists`, and for each seam the `cells`, the `ladder` and `stats`:
-`candidates_per_s`, `row_evals_per_s`, `device_fraction`, `device_bytes`,
-`host_tile_bytes`, `device_tiles`, `host_tiles` and `fallback_candidates`.
+`candidates`, `windows`, `cells`, `rows`, `row_evals`, `tile_candidates`,
+`device_bytes`, `host_tile_bytes`, `device_tiles`, `host_tiles` and
+`fallback_candidates`. The wall-clock fields (`wall_s`, `device_s`, `score_s`,
+`layout_s`, `reference_s`, `candidates_per_s`, `row_evals_per_s`,
+`device_fraction`) are in the printed `batch_timings` object, outside the
+report hash.
 `backend` is `cuda` when the kernel ran and `cpu` otherwise, with a
 `fallback_reason` when a tile ran on the host.
 
@@ -429,7 +433,7 @@ The search objective, `rcsr walkforward`, `rcsr ablation score` and `rcsr ladder
 
 * **Cost.** `rcsr enrich --label long:<h>` needs `fee=` (exit 2; `fee=0` is allowed). The spec carries `cost_bps` (round trip, `2 * fee + spread + slip`) and `cost_per_side_bps = cost_bps / 2`. Every evaluator charges `cost_bps / 2` per side. `--cost-bps` that differs from the spec is refused (exit 2); `--cost-override <bp>` prices a different cost on purpose. Without a spec cost the flag or the default applies (walk-forward 10 bp, ladder and ablation 12 bp per side; the search needs the flag). A spec whose label is already net of cost (`cost_in_label`) declares no per-side cost.
 * **Units.** A spec with `return_units: "log"` makes the walk-forward, the ladder and `ablation score` convert the return column with `exp_m1` before any P&L, as the objective does. Without a spec the column is read as a simple return.
-* **Position rule.** `rcsr walkforward --from-run run.json` and `rcsr ablation score --from-run run.json` take the expression, the fixed threshold `objective.spec.threshold`, the per-side cost `objective.spec.per_side_bps` and the target spec (return column, units, horizon, entry offset, delay) from the run. A run without an `objective` block is refused (exit 3). `--expr`, `--threshold-quantile`, `--threshold-fixed` and `--target-spec` with `--from-run` are usage errors (exit 2). The quantile rule of a plain `walkforward --expr` is a different book: for a constant finalist every quantile threshold is flat, and the command warns.
+* **Position rule.** `rcsr walkforward --from-run run.json` and `rcsr ablation score --from-run run.json` take the expression, the fixed threshold `objective.spec.threshold`, the per-side cost `objective.spec.per_side_bps` and the target spec (return column, units, horizon, entry offset, delay) from the run. A run without an `objective` block is refused (exit 3). `--expr`, `--threshold-quantile`, `--threshold-fixed` and `--target-spec` with `--from-run` are usage errors (exit 2). The quantile rule of a plain `walkforward --expr` is a different book: for a constant finalist every quantile threshold is flat, and the command warns. `walkforward --from-run` refuses a window inside the rows the run trained or selected on like `--front` does (exit 2); `--allow-in-sample-windows` labels it `in_sample:true`.
 * **Target spec in walk-forward.** `--target-spec <file>` fills `--horizon`, `--entry-offset`, `--delay`, the return column, the units and the cost from the entry whose `column`, `name` or `return_column` is `--target`. A flag that disagrees is refused like the cost.
 * **Ladder grid.** With a spec cost the default `--cost-grid` is 1x, 2x and 3.33x the per-side cost. With a flag or the default cost it stays `12,20,40`. An explicit `--cost-grid` is absolute.
 * **Reports.** The `objective` block of `run.json`, the walk-forward report, the ladder report and the ablation result carry `cost: {per_side_bps, source, return_units}` with `source` one of `target_spec`, `flag` or `default`. A `flag` source priced against a spec adds `spec_per_side_bps`. `objective.finalist.constant` is true when the finalist reads no variable.
@@ -501,7 +505,9 @@ Training fits, validation selects, development out-of-sample evaluates the proce
 | locked test | 2025-07-01 to 2026-07-01 |
 | reserved | 2026H2 (the engine lockbox) |
 
-Each row has `train_end = test_start - purge_seconds` (219600 s: 1 h entry plus a 60 h label). A development test window ends at `min(quarter end, locked start - purge_seconds)`, so `expanding-2025Q2` and `rolling24-2025Q2` end at 2025-06-28T11:00:00: a label at a later stamp reads bars of the locked test. Outside `--locked-test`, `walkforward`, `ladder` and `ablation score` refuse (exit 3) a window that ends after `locked start - purge` (purge = entry offset + horizon + delay for `walkforward`, `--purge-seconds` for the others); in `--locked-test` mode the training range must end at or before `locked start - purge` and `validation_start` six calendar months before the test start. `--windows protocol/windows.csv --windows-scheme expanding` loads one scheme; the table's `validation_start` replaces `--validation-frac`. The validation slice sets the threshold and selects among `--expr` candidates. Select the procedure, not the lucky candidate: pool the development series of the chosen procedure.
+Each row has `train_end = test_start - purge_seconds` (219600 s: 1 h entry plus a 60 h label). A development test window ends at `min(quarter end, locked start - purge_seconds)`, so `expanding-2025Q2` and `rolling24-2025Q2` end at 2025-06-28T11:00:00: a label at a later stamp reads bars of the locked test. Outside `--locked-test`, `walkforward`, `ladder` and `ablation score` refuse (exit 3) a window that reaches `[locked start - purge, locked end + embargo)` (purge = entry offset + horizon + delay for `walkforward`; the larger of `--purge-seconds` and the `--target-spec` purge for the others; embargo = the lookback embargo of the store, `--lockbox-embargo` widens it): the features of a row after the range end read locked bars. In `--locked-test` mode the other declared ranges stay sealed and every window or fold must clear their `[start - purge, end + embargo)` too; in `--locked-test` mode the training range must end at or before `locked start - purge` and `validation_start` six calendar months before the test start. `--windows protocol/windows.csv --windows-scheme expanding` loads one scheme; the table's `validation_start` replaces `--validation-frac`. The validation slice sets the threshold and selects among `--expr` candidates. Select the procedure, not the lucky candidate: pool the development series of the chosen procedure.
+
+The table's `validation_start` is the validation slice of every window: it sets the threshold and selects among repeated `--expr` candidates, `--front` members and `--select-band` (`selection.selected_on` is `validation`). `--validation-frac` together with the table exits 2 (`mutually exclusive`); repeated `--expr` with neither exits 3.
 
 ### Overlapping returns
 
@@ -547,7 +553,7 @@ Candidates are evaluated on the test periods with their own validation threshold
 
 A read whose resolved range differs (another `--lockbox`, or a declaration that changed after development) is refused with exit 3: `candidate <id> was developed against the locked test A..B (<source>); this read resolves C..D`. A candidate of an old ledger without the member is refused unless `--allow-unbound-ledger` is given; the read is then reported as unbound. `--verify-read --expect-report-sha256 H` recomputes the read and compares hashes without recording anything. The report's `protocol` object holds the lockbox rows, date range and read count; `run.json` carries a `lockbox` object (`--lockbox`, `--ledger`) with the rows in the range, their first and last stamps and the read count.
 
-`rcsr ladder --scheme locked --locked-test --ledger L --sealed S` reads the locked test for the baseline ladder. The sealed list must be recorded in the ledger and the ledger must hold no `baseline_read`; the run appends `{"event":"baseline_read",...}` with the data and report hashes and the locked range, and a second call is refused. Every candidate of the sealed list must carry the range the ladder resolves (`--allow-unbound-ledger` accepts old entries without one). Without `--locked-test`, `ladder` and `ablation score` refuse any fold that ends after the declared range start minus the purge.
+`rcsr ladder --scheme locked --locked-test --ledger L --sealed S` reads the locked test for the baseline ladder. The sealed list must be recorded in the ledger and the ledger must hold no `baseline_read`; the run appends `{"event":"baseline_read",...}` with the data and report hashes and the locked range (the report hash covers the printed report without the per-rung `wall_seconds` and the `ledger` object, so two identical reads hash equal), and a second call is refused. Every candidate of the sealed list must carry the range the ladder resolves (`--allow-unbound-ledger` accepts old entries without one). Without `--locked-test`, `ladder` and `ablation score` refuse any fold that reaches the declared range from `start - purge` to `end + embargo`.
 
 #### Final seal: one read, one candidate
 
@@ -580,7 +586,7 @@ sign test, per-window metrics and pooled metrics. `--out file` writes the
 same JSON, `--markdown file` writes a Markdown report and `--markdown -` prints
 it to stdout. Without those flags a compact text table is printed.
 
-The printed and written JSON ends with a `ledger` object (#284): the phase ledger of the run with `io_s` (store row-group or CSV reads), `pnl_s` (scoring, windows, controls, `--batch-pnl`), `host_other_s`, `wall_s`, `unaccounted_s`, `closure` and `device_busy_s`, the union of the `--batch-pnl` device tile intervals and of the `--device-pnl` CUDA reduction calls (`host_envelope` basis; the canonical CPU backend adds none). The ledger holds wall-clock seconds, so `report_sha256` and `--expect-report-sha256` hash the report without it. See `docs/benchmarks.md`.
+The printed and written JSON ends with a `ledger` object (#284): the phase ledger of the run with `io_s` (store row-group or CSV reads), `pnl_s` (scoring, windows, controls, `--batch-pnl`), `host_other_s`, `wall_s`, `unaccounted_s`, `closure` and `device_busy_s`, the union of the `--batch-pnl` device tile intervals and of the `--device-pnl` CUDA reduction calls (`host_envelope` basis; the canonical CPU backend adds none). The ledger and the `batch_timings` object (`--batch-pnl`: per seam `wall_s`, `device_s`, `score_s`, `layout_s`, `reference_s`, `candidates_per_s`, `row_evals_per_s`, `device_fraction`) hold wall-clock seconds, so `report_sha256`, `--expect-report-sha256` and `--verify-read` hash the report without them. See `docs/benchmarks.md`.
 
 ## Store handling and memory
 
