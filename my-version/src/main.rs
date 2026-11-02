@@ -9988,7 +9988,7 @@ OPTIONS:
                              A window whose test_start is below the last train
                              or validation time of the run plus its required
                              purge exits 2
-  --allow-in-sample-windows  with --front: report such a window as
+  --allow-in-sample-windows  with --front or --from-run: report such a window as
                              in_sample:true instead of refusing it
                              (diagnostics only)
   --select-band              #308: select among repeated --expr candidates with
@@ -10544,6 +10544,7 @@ fn run_walkforward(args: &[String]) -> ! {
         }
         run_cost = Some((book.per_side_bps, book.source));
         cost_spec = Some(book.spec);
+        front_run = Some(run);
     } else if let Some(path) = &front_path {
         if !expressions.is_empty() {
             eprintln!(
@@ -10777,18 +10778,25 @@ fn run_walkforward(args: &[String]) -> ! {
         );
         std::process::exit(EXIT_USAGE);
     }
-    if let Some((run, (_, seen, purge))) = front_run.as_ref().and_then(|r| Some((r, r.earliest_test_start()?))) {
+    if let Some(run) = front_run.as_ref() {
         for w in &windows {
             if run.in_sample(w.test_start) {
                 if allow_in_sample {
                     popts.in_sample_windows.push(w.label.clone());
                     continue;
                 }
-                eprintln!(
-                    "error: window '{}' tests rows the run trained or selected on \
-                     (test_start {} < last seen {} + purge {})",
-                    w.label, w.test_start, seen, purge
-                );
+                match run.earliest_test_start() {
+                    Some((_, seen, purge)) => eprintln!(
+                        "error: window '{}' tests rows the run trained or selected on \
+                         (test_start {} < last seen {} + purge {})",
+                        w.label, w.test_start, seen, purge
+                    ),
+                    None => eprintln!(
+                        "error: window '{}' tests rows the run trained or selected on \
+                         (the run has no split.train_time)",
+                        w.label
+                    ),
+                }
                 std::process::exit(EXIT_USAGE);
             }
         }
