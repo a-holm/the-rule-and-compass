@@ -1045,7 +1045,7 @@ REPORTS (Markdown, issue #29):
   -h, --help                 show this help
 
 EXIT CODES:
-  0 success   2 usage error   3 input/data error   4 no finite solution found"
+  0 success   2 usage error (also an unparsable numeric value)   3 input/data error   4 no finite solution found"
     )
 }
 
@@ -2601,19 +2601,19 @@ fn main() {
                 metric_set = true;
             }
             "--generations" => {
-                cfg.generations = val!().parse().unwrap_or(cfg.generations);
+                cfg.generations = parse_uint("--generations", &val!());
                 generations_set = true;
             }
             "--islands" => {
-                cfg.islands = val!().parse().unwrap_or(cfg.islands);
+                cfg.islands = parse_uint("--islands", &val!());
                 islands_set = true;
             }
             "--pop" => {
-                cfg.pop = val!().parse().unwrap_or(cfg.pop);
+                cfg.pop = parse_uint("--pop", &val!());
                 pop_set = true;
             }
             "--max-complexity" => {
-                cfg.max_complexity = val!().parse().unwrap_or(cfg.max_complexity);
+                cfg.max_complexity = parse_uint("--max-complexity", &val!());
                 max_complexity_set = true;
             }
             "--op-complexity" => {
@@ -2649,11 +2649,11 @@ fn main() {
                 }
             }
             "--seed" => {
-                cfg.seed = val!().parse().unwrap_or(cfg.seed);
+                cfg.seed = parse_flag("--seed", &val!(), "an integer from 0 to 4294967295", |_| true);
                 seed_set = true;
             }
-            "--test-frac" => test_frac = val!().parse().unwrap_or(test_frac),
-            "--validation-frac" => validation_frac = val!().parse().unwrap_or(validation_frac),
+            "--test-frac" => test_frac = parse_nonneg("--test-frac", &val!()),
+            "--validation-frac" => validation_frac = parse_nonneg("--validation-frac", &val!()),
             "--select-by" => select_by_arg = Some(val!()),
             "--objective" => objective_arg = Some(val!()),
             "--fitness" => fitness_arg = Some(val!()),
@@ -2796,13 +2796,13 @@ fn main() {
             "--time" => time_name = Some(val!()),
             "--group-by" => group_name = Some(val!()),
             "--gap" => gap_src = Some(val!()),
-            "--folds" => folds = val!().parse().unwrap_or(1).max(1),
-            "--lags" => lags = val!().parse().unwrap_or(0),
+            "--folds" => folds = parse_uint::<usize>("--folds", &val!()).max(1),
+            "--lags" => lags = parse_uint("--lags", &val!()),
             "--lag-set" => lag_set_src = Some(val!()),
             "--project" => project_src = Some(val!()),
-            "--view" => view_index = val!().parse().unwrap_or(0),
-            "--history-frac" => history_frac = val!().parse().unwrap_or(0.0),
-            "--gap-break" => gap_break = val!().parse().unwrap_or(0.0),
+            "--view" => view_index = parse_uint("--view", &val!()),
+            "--history-frac" => history_frac = parse_nonneg("--history-frac", &val!()),
+            "--gap-break" => gap_break = parse_nonneg("--gap-break", &val!()),
             // #130: strict time parsing. Every choice is reported.
             "--date-only" => {
                 let v = val!();
@@ -2834,13 +2834,13 @@ fn main() {
                     }
                 }
             }
-            "--null-runs" => null_runs = val!().parse().unwrap_or(0),
-            "--null-block" => null_block = val!().parse().unwrap_or(0),
+            "--null-runs" => null_runs = parse_uint("--null-runs", &val!()),
+            "--null-block" => null_block = parse_uint("--null-block", &val!()),
             // #69: 0 = no caps; a positive N samples only the query rows.
             "--baseline-samples" => {
-                baseline_samples = val!().parse().ok().or(baseline_samples);
+                baseline_samples = Some(parse_uint("--baseline-samples", &val!()));
             }
-            "--bootstrap-error" => bootstrap_resamples = val!().parse().unwrap_or(0),
+            "--bootstrap-error" => bootstrap_resamples = parse_uint("--bootstrap-error", &val!()),
             "--ops" => {
                 match Op::parse_list_checked(&val!()) {
                     Ok(ops) => cfg.ops = ops,
@@ -2855,7 +2855,7 @@ fn main() {
             "--function" => function_defs.push(val!()),
             "--seed-expr" => seed_exprs.push(val!()),
             "--seed-file" => seed_files.push(val!()),
-            "--stability" => stability_runs = val!().parse().unwrap_or(0),
+            "--stability" => stability_runs = parse_uint("--stability", &val!()),
             "--cv" => {
                 let v = val!();
                 match data::CvMode::parse(&v) {
@@ -2866,9 +2866,9 @@ fn main() {
                     }
                 }
             }
-            "--cv-k" => cv_k = val!().parse().unwrap_or(5).max(2),
+            "--cv-k" => cv_k = parse_uint::<usize>("--cv-k", &val!()).max(2),
             "--fit-iters" => {
-                cfg.fit_iters = val!().parse().unwrap_or(cfg.fit_iters);
+                cfg.fit_iters = parse_uint("--fit-iters", &val!());
                 fit_iters_set = true;
             }
             "--no-fit" => {
@@ -2891,7 +2891,7 @@ fn main() {
             }
             // #255: hard bound on one generation's exact CPU fallback refits.
             "--fit-fallback-max" => {
-                cfg.fit_fallback_max = val!().parse().unwrap_or(cfg.fit_fallback_max);
+                cfg.fit_fallback_max = parse_uint("--fit-fallback-max", &val!());
                 fit_fallback_max_set = true;
             }
             // #466: front prune; a post-loop pass, not saved search state.
@@ -3215,7 +3215,7 @@ fn main() {
             }
             "--require-dimensions" => require_dimensions = true,
             "--patience" => {
-                cfg.patience = val!().parse().unwrap_or(cfg.patience);
+                cfg.patience = parse_uint("--patience", &val!());
                 patience_set = true;
             }
             "--patience-tol" => {
@@ -3249,7 +3249,7 @@ fn main() {
                 stop_front_set = true;
             }
             "--time-budget" => {
-                cfg.time_budget = val!().parse().ok();
+                cfg.time_budget = Some(parse_nonneg("--time-budget", &val!()));
                 time_budget_set = true;
             }
             "--save" => save_path = Some(val!()),
@@ -3341,7 +3341,7 @@ fn main() {
             "--json" => format = Format::Json,
             "--ndjson" => format = Format::Ndjson,
             "--progress" => progress = true,
-            "--top" => top = val!().parse().unwrap_or(0),
+            "--top" => top = parse_uint("--top", &val!()),
             "--quiet" => quiet = true,
             "--out" => out_path = Some(val!()),
             "--report" => {
@@ -9700,6 +9700,25 @@ fn metric_names() -> String {
 // #71: memory guard and `import`
 // ---------------------------------------------------------------------------
 
+/// Parse a numeric flag value or exit 2: `error: <flag> needs <range>, got '<v>'`.
+fn parse_flag<T: std::str::FromStr>(name: &str, v: &str, range: &str, ok: impl Fn(&T) -> bool) -> T {
+    match v.parse::<T>() {
+        Ok(x) if ok(&x) => x,
+        _ => {
+            eprintln!("error: {} needs {}, got '{}'", name, range, v);
+            std::process::exit(EXIT_USAGE);
+        }
+    }
+}
+
+fn parse_uint<T: std::str::FromStr>(name: &str, v: &str) -> T {
+    parse_flag(name, v, "a non-negative integer", |_| true)
+}
+
+fn parse_nonneg(name: &str, v: &str) -> f64 {
+    parse_flag(name, v, "a finite number >= 0", |x: &f64| x.is_finite() && *x >= 0.0)
+}
+
 /// Parse `bytes`, `KB`/`KiB`, `MB`/`MiB`, `GB`/`GiB` (case-insensitive).
 /// Bare numbers are bytes. Decimal suffixes use 1000, binary suffixes 1024.
 fn parse_memory_bytes(src: &str) -> Result<u64, String> {
@@ -11284,7 +11303,7 @@ fn run_audit(args: &[String]) -> ! {
                     .collect()
             }
             "--horizon" | "--label-horizon" => {
-                horizon = take(&mut i).parse().unwrap_or(0);
+                horizon = parse_uint(a, &take(&mut i));
             }
             "--time-unit" => {
                 let v = take(&mut i);
@@ -11307,13 +11326,13 @@ fn run_audit(args: &[String]) -> ! {
             "--symbol" => symbol_col = Some(take(&mut i)),
             "--price" => price_col = Some(take(&mut i)),
             "--resample-small" => {
-                resample_small = take(&mut i).parse().unwrap_or(0);
+                resample_small = parse_uint("--resample-small", &take(&mut i));
             }
             "--resample-large" => {
-                resample_large = take(&mut i).parse().unwrap_or(0);
+                resample_large = parse_uint("--resample-large", &take(&mut i));
             }
             "--session-gap" => {
-                session_gap = take(&mut i).parse::<f64>().ok();
+                session_gap = Some(parse_nonneg("--session-gap", &take(&mut i)));
             }
             other => {
                 eprintln!("error: unknown audit option '{}'", other);

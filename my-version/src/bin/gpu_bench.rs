@@ -9,6 +9,18 @@ use rcsr::eval_soa;
 use rcsr::expr::{self, complexity, random_tree, Op};
 use rcsr::gpu::{cpu_sse, GpuEvaluator, Population};
 use rcsr::rng::Mt;
+/// Parse a numeric flag value or exit 2: `error: <flag> needs <range>, got '<v>'`.
+fn parse_uint<T: std::str::FromStr>(name: &str, v: Option<&String>) -> T {
+    let text = v.map(String::as_str).unwrap_or("");
+    match text.parse::<T>() {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln!("error: {} needs a non-negative integer, got '{}'", name, text);
+            std::process::exit(2);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut path = "examples/sine.csv".to_string();
@@ -45,19 +57,19 @@ fn main() {
             }
             "--batch" => {
                 i += 1;
-                batch = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(batch);
+                batch = parse_uint("--batch", args.get(i));
             }
             "--reps" => {
                 i += 1;
-                reps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(reps);
+                reps = parse_uint("--reps", args.get(i));
             }
             "--depth" => {
                 i += 1;
-                depth = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(depth);
+                depth = parse_uint("--depth", args.get(i));
             }
             "--seed" => {
                 i += 1;
-                seed = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(seed);
+                seed = parse_uint("--seed", args.get(i));
             }
             "-h" | "--help" => {
                 println!(
