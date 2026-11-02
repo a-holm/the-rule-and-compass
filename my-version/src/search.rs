@@ -1913,14 +1913,20 @@ impl GpuSearch {
     /// archive or migration read it. The f64 prefix probe settles a candidate
     /// that is non-finite there; the others get a full pass on the fallback
     /// pool.
+    ///
+    /// #640: `floor` lists the slots whose device `+inf` has status 0: the
+    /// long/flat book found fewer entries than `--min-trades` in f32 positions.
+    /// The CPU counts f64 positions, so the same check applies.
     fn check_device_nonfinite(
         &mut self,
         islands: &mut [Vec<Ind>],
         slots: &[(usize, usize)],
+        floor: &[(usize, usize)],
         train: &Sample,
         cfg: &Config,
         generation: usize,
     ) {
+        let (status2, slots) = (slots.len(), [slots, floor].concat());
         if slots.is_empty() {
             return;
         }
@@ -1935,11 +1941,12 @@ impl GpuSearch {
             .collect();
         // Every slot outside `full` is `+inf` on the CPU: rejected by the
         // dimension filter or non-finite in the probed prefix.
-        for &(i, j) in slots {
+        for &(i, j) in &slots {
             islands[i][j].confirm_inf(Some(self.rows_version));
         }
         let stats = self.stats.entry(generation).or_default();
-        stats.nonfinite += slots.len();
+        stats.nonfinite += status2;
+        stats.nonfinite_trade_floor += floor.len();
         stats.nonfinite_full += full.len();
         if full.is_empty() {
             return;
@@ -2085,7 +2092,7 @@ impl GpuSearch {
         if let Some(e) = gpu_error {
             return Err(e);
         }
-        self.check_device_nonfinite(islands, &nonfinite, train, cfg, generation);
+        self.check_device_nonfinite(islands, &nonfinite, &[], train, cfg, generation);
         Ok(())
     }
 
@@ -2219,6 +2226,7 @@ impl GpuSearch {
         });
 
         let mut nonfinite: Vec<(usize, usize)> = Vec::new();
+        let mut floor: Vec<(usize, usize)> = Vec::new();
         let mut gpu_error: Option<String> = None;
         if !pool.is_empty() {
             let objective = self
@@ -2239,6 +2247,9 @@ impl GpuSearch {
                     // penalty, max, 1-rho or a weighted classification mean),
                     // never an SSE to divide by n.
                     let error = if status.is_ok() {
+                        if value == f64::INFINITY && objective == crate::metrics::ScoreObjective::LongPnl {
+                            floor.push((i, j));
+                        }
                         value
                     } else {
                         nonfinite.push((i, j));
@@ -2294,7 +2305,7 @@ impl GpuSearch {
             pending.len(),
             eval_workload.bytes,
         );
-        self.check_device_nonfinite(islands, &nonfinite, train, cfg, generation);
+        self.check_device_nonfinite(islands, &nonfinite, &floor, train, cfg, generation);
         Ok(())
     }
 
@@ -2904,7 +2915,7 @@ fn eval_pipeline_jobs(
     g: &mut GpuSearch,
     jobs: &[PipelineJob],
     generation: usize,
-) -> Result<(Vec<usize>, Vec<(f64, bool)>), String> {
+) -> Result<(Vec<usize>, Vec<(f64, DeviceInf)>), String> {
     if generation >= 2 && crate::gpu::injected_fault("pipeline") {
         return Err(format!("{}the pipeline batch", crate::gpu::INJECTED_REFUSAL));
     }
@@ -2944,10 +2955,12 @@ fn eval_pipeline_jobs(
         .iter()
         .zip(batch.status.iter())
         .map(|(&value, &status)| {
-            if status.is_ok() {
-                (value, false)
+            if !status.is_ok() {
+                (f64::INFINITY, DeviceInf::Range)
+            } else if value == f64::INFINITY && objective == crate::metrics::ScoreObjective::LongPnl {
+                (value, DeviceInf::TradeFloor)
             } else {
-                (f64::INFINITY, true)
+                (value, DeviceInf::None)
             }
         })
         .collect();
@@ -5296,6 +5309,17 @@ fn seed_seen(seen: &mut HashSet<u64>, next: &[Ind], parents: &[Ind]) {
 /// that island's `next` vector, and the tree to score.
 type PipelineJob = (usize, usize, Node);
 
+/// #589, #640: which device `+inf` a pipeline result carries.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceInf {
+    None,
+    /// Status 2: the f32 program left the f32 range.
+    Range,
+    /// Status 0: the long/flat book found too few f32 entries.
+    TradeFloor,
+}
+
 /// #286: one candidate's result from an overlap batch. #560: `error` belongs
 /// to `tree`, the fitted and simplified tree the barrier stores, or to the
 /// offered tree when `tree` is `None`. `offered` is the structural hash of the
@@ -5305,8 +5329,8 @@ type PipelineJob = (usize, usize, Node);
 #[derive(Clone, Debug)]
 struct PipelineResult {
     error: f64,
-    /// #589: the error is a device `+inf` with status 2, to be checked on the CPU.
-    nonfinite: bool,
+    /// #589, #640: the error is a device `+inf` to be checked on the CPU.
+    nonfinite: DeviceInf,
     offered: u64,
     tree: Option<Node>,
 }
@@ -8208,6 +8232,7 @@ fn run_search(
                     // leaves the slot pending for `score_generation` below; a
                     // rejected dimension keeps its infinite error.
                     let mut nonfinite_slots: Vec<(usize, usize)> = Vec::new();
+                    let mut floor_slots: Vec<(usize, usize)> = Vec::new();
                     for (i, slots) in pipeline_results.iter_mut().enumerate() {
                         for (j, value) in slots.iter_mut().enumerate() {
                             let Some(r) = value.take() else { continue };
@@ -8224,14 +8249,16 @@ fn run_search(
                             } else {
                                 f64::INFINITY
                             });
-                            if r.nonfinite {
-                                nonfinite_slots.push((i, j));
+                            match r.nonfinite {
+                                DeviceInf::None => {}
+                                DeviceInf::Range => nonfinite_slots.push((i, j)),
+                                DeviceInf::TradeFloor => floor_slots.push((i, j)),
                             }
                         }
                     }
                     if let Some(g) = gpu.as_mut() {
                         g.rows_version = rows_version;
-                        g.check_device_nonfinite(&mut islands, &nonfinite_slots, gen_train, cfg, gen);
+                        g.check_device_nonfinite(&mut islands, &nonfinite_slots, &floor_slots, gen_train, cfg, gen);
                     }
                     if pipeline_error.is_none() {
                         if pipeline_scored {
