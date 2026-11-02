@@ -51,22 +51,29 @@ struct Scratch {
     nan: Vec<f64>,
 }
 
-/// The tile evaluator of one fit: the plan, the gathered input columns and the
-/// scratch that every pass reuses.
-pub(super) struct TileFit<'a> {
+/// The plan, the gathered input columns and the scratch that every pass of a
+/// fit reuses. It depends on the program and the rows, not on the target or
+/// the weights, so an IRLS call builds it once.
+pub(super) struct TileCore {
     plan: Plan,
     cols: Vec<Vec<f64>>,
-    y: &'a [f64],
-    w: &'a [f64],
     rows: usize,
     k: usize,
-    contract_ok: bool,
     avx: bool,
     s: Scratch,
 }
 
-impl<'a> TileFit<'a> {
-    pub(super) fn new(f: &Flat, x: &[Vec<f64>], y: &'a [f64], w: &'a [f64]) -> TileFit<'a> {
+/// The row passes of one fit: a core borrowed with one target and one weight
+/// vector.
+pub(super) struct TileFit<'a> {
+    core: &'a mut TileCore,
+    y: &'a [f64],
+    w: &'a [f64],
+    contract_ok: bool,
+}
+
+impl TileCore {
+    pub(super) fn new(f: &Flat, x: &[Vec<f64>]) -> TileCore {
         let n = f.op.len();
         let mut cols: Vec<Vec<f64>> = Vec::new();
         let mut col_of: Vec<(usize, Option<usize>)> = Vec::new();
@@ -113,7 +120,7 @@ impl<'a> TileFit<'a> {
             nk.push(f.kids[i].len().min(3) as u8);
         }
         let k = f.nconst;
-        TileFit {
+        TileCore {
             plan: Plan {
                 op: f.op.clone(),
                 src,
@@ -123,11 +130,8 @@ impl<'a> TileFit<'a> {
                 root: f.root,
             },
             cols,
-            y,
-            w,
             rows: x.len(),
             k,
-            contract_ok: x.len() == y.len() && (w.is_empty() || w.len() == x.len()),
             avx: avx_available(),
             s: Scratch {
                 v: vec![0.0; n * TILE],
@@ -139,18 +143,26 @@ impl<'a> TileFit<'a> {
             },
         }
     }
+}
+
+impl<'a> TileFit<'a> {
+    pub(super) fn new(core: &'a mut TileCore, y: &'a [f64], w: &'a [f64]) -> TileFit<'a> {
+        let contract_ok = core.rows == y.len() && (w.is_empty() || w.len() == core.rows);
+        TileFit { core, y, w, contract_ok }
+    }
 
     /// The weighted residual sum of squares at `c`, as `sse` in `fit.rs`.
     pub(super) fn sse(&mut self, c: &[f64]) -> f64 {
         if !self.contract_ok {
             return f64::INFINITY;
         }
+        let k = &mut *self.core;
         #[cfg(target_arch = "x86_64")]
-        if self.avx {
+        if k.avx {
             // SAFETY: AVX is detected at construction.
-            return unsafe { sse_avx(&self.plan, &self.cols, self.y, self.w, self.rows, c, &mut self.s) };
+            return unsafe { sse_avx(&k.plan, &k.cols, self.y, self.w, k.rows, c, &mut k.s) };
         }
-        sse_impl(&self.plan, &self.cols, self.y, self.w, self.rows, c, &mut self.s)
+        sse_impl(&k.plan, &k.cols, self.y, self.w, k.rows, c, &mut k.s)
     }
 
     /// `JᵀWJ` and `JᵀWr` at `c`, as `normal_equations` in `fit.rs`.
@@ -158,14 +170,13 @@ impl<'a> TileFit<'a> {
         if !self.contract_ok {
             return None;
         }
+        let k = &mut *self.core;
         #[cfg(target_arch = "x86_64")]
-        if self.avx {
+        if k.avx {
             // SAFETY: AVX is detected at construction.
-            return unsafe {
-                normal_avx(&self.plan, &self.cols, self.y, self.w, self.rows, self.k, c, &mut self.s)
-            };
+            return unsafe { normal_avx(&k.plan, &k.cols, self.y, self.w, k.rows, k.k, c, &mut k.s) };
         }
-        normal_impl(&self.plan, &self.cols, self.y, self.w, self.rows, self.k, c, &mut self.s)
+        normal_impl(&k.plan, &k.cols, self.y, self.w, k.rows, k.k, c, &mut k.s)
     }
 }
 
