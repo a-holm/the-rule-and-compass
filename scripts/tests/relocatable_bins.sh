@@ -1,3 +1,6 @@
+    d="$(readelf -d "$t")"
+    grep -E "RUNPATH|RPATH" <<<"$d" | grep -q "/build/" && fail "$(basename "$t"): RUNPATH points into a build dir"
+    grep -q librcsrcuda <<<"$d" && fail "$(basename "$t"): NEEDED librcsrcuda"
 #!/usr/bin/env bash
 # Relocation check for a built profile directory (issue #659).
 # Usage: scripts/tests/relocatable_bins.sh [target/release]
@@ -32,6 +35,9 @@ for src in "$ROOT"/my-version/tests/*.rs; do
   for t in "$REL"/deps/"$name"-*; do
     [[ -f "$t" && -x "$t" && "$t" != *.d ]] || continue
     ! cmp -s "$t" "$REL/$name" || continue
+    d="$(readelf -d "$t")"
+    grep -E 'RUNPATH|RPATH' <<<"$d" | grep -q '/build/' && fail "$(basename "$t"): RUNPATH points into a build dir"
+    grep -q librcsrcuda <<<"$d" && fail "$(basename "$t"): NEEDED librcsrcuda"
     "$t" --list >/dev/null 2>&1 || fail "$(basename "$t") --list failed"
     n=$((n + 1))
   done
