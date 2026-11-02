@@ -5113,7 +5113,7 @@ struct PipelineResult {
 /// block owns a candidate for the whole pass over the rows, so a call with
 /// fewer blocks than the device holds takes as long as a full one.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-const FIT_BATCH_MIN: usize = 1;
+const FIT_BATCH_MIN: usize = 128;
 
 /// #601: candidates of the overlap queue that wait for a device fit call.
 /// Each entry is the offered job, its structural hash and the fit plan or the
