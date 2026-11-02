@@ -7529,6 +7529,8 @@ fn run_search(
         } else {
             init_data
         };
+        // #500: rows version 0 is the full training sample.
+        let init_rows = std::ptr::eq(init_eval, &train_data).then_some(0u64);
         // #463: the trees are drawn serially (the RNG order is fixed); scoring
         // them does not touch the RNG and runs on the worker pool.
         let mut init_trees: Vec<Node> = Vec::new();
@@ -7562,7 +7564,9 @@ fn run_search(
                 if defer_gpu {
                     Ind::pending(tree, cfg)
                 } else {
-                    Ind::evaluated(tree, init_eval, cfg) // #25 #85
+                    let mut ind = Ind::evaluated(tree, init_eval, cfg); // #25 #85
+                    ind.confirm_inf(init_rows);
+                    ind
                 }
             },
         )
