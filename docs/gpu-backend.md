@@ -2393,6 +2393,7 @@ Definitions that matter:
   `{value,numerator,denominator,units,scope}`. `features`, `pnl` and `io` are
   present even when their stage did not run, so a reader never has to infer a
   missing key.
+* **overlap drain** (#600). With `--pipeline-depth > 0` the main thread scores and fits the queued batches inside the island-scope window. The time of those calls is booked as `eval` (device scoring, rescore) and `fit` (device fit, exact CPU fallback), capped by the window and eval first; the rest of the window stays `vary`. The split is measured per call but the window is an apportionment, because the drain runs concurrently with island work. `ledger.drain_wall_s` is the booked drain total. The drain records its fit kernel as one `fit` device interval, so `device_busy_s` includes it exactly as at `--pipeline-depth 0`. Tests: `pipeline_books_fit_interval` (`tests/gpu_pipeline_consistency.rs`), `pipeline_drain_not_vary` and `ledger_closure_with_overlap` (`src/gpu_stats.rs`).
 * **quality/GPU-hour** is decades of error reduction against the constant-mean
   baseline per measured run-wall GPU-hour:
   `-log10(best / baseline) / hours`. The two errors **must be the same unit and
