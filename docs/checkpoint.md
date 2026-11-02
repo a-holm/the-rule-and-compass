@@ -194,6 +194,8 @@ Non-search flags (input file, column names, output format, reports, `--top`, …
 are free to change, subject to the data fingerprint. `--save` may be combined
 with `--resume`; saving to the same path overwrites it at the next boundary.
 
+Execution settings are not saved. A resumed run takes them from its own command line: `--gpu`, `--cpu`, `--dispatch`, `--pipeline-depth` (default `2`, not the earlier chunk's value), `--threads`, `--gpu-memory`, and the post-loop options `--prune`, `--prune-rows`, `--prune-budget` and `--fit-report`. None of them changes the search trajectory. Settings that do change it, such as `--fit-polish` and `--fit-rows`, are saved and a mismatch is refused.
+
 ### Backend identity
 
 The saved `backend` is checked before the search starts. A GPU checkpoint
