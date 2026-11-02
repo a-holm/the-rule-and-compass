@@ -1684,9 +1684,12 @@ pub fn classification_row_loss(p: f64, l: f64, objective: ScoreObjective) -> f64
             let h = (1.0 - u).max(0.0);
             h * h
         }
-        // Only the five classification objectives reach this function; a
-        // regression objective here is a dispatch bug, not a number.
-        _ => f64::NAN,
+        // Only the five classification objectives reach this function. The
+        // invalid-score convention is +inf, never NaN.
+        _ => {
+            debug_assert!(false, "classification_row_loss: non-classification objective {objective:?}");
+            f64::INFINITY
+        }
     }
 }
 
@@ -2845,5 +2848,19 @@ mod tests {
         let p: Vec<f64> = y.iter().map(|v| v * 2.0 + 3.0).collect();
         let rho = 1.0 - score_native(&p, &y, ScoreObjective::Correlation, 0).value;
         assert!((rho - 1.0).abs() <= 1e-9, "rho = {rho}");
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn row_loss_non_classification_is_infinite() {
+        let v = classification_row_loss(0.3, 1.0, ScoreObjective::Squared);
+        assert_eq!(v, f64::INFINITY);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "non-classification objective")]
+    fn row_loss_non_classification_panics_in_debug() {
+        classification_row_loss(0.3, 1.0, ScoreObjective::Squared);
     }
 }
