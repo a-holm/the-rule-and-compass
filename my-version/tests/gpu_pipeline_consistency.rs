@@ -471,3 +471,34 @@ fn pipeline_fit_constants_match_sync() {
         go.fit_calls
     );
 }
+
+/// #642: `complexity` has no device opcode, so a QD immigrant that contains it
+/// gets no pipeline result. The result of the candidate it replaced must not
+/// land on its slot.
+#[cfg(feature = "cuda")]
+#[test]
+fn overwritten_slot_keeps_the_error_of_its_own_tree() {
+    if !device_available() {
+        return;
+    }
+    let train = sample(1_024, 3);
+    let test = sample(128, 4);
+    let mut failures = Vec::new();
+    for seed in [7u32, 8, 9] {
+        let cfg = Config {
+            pop: 20,
+            generations: 8,
+            fit_iters: 0,
+            ops: vec![Op::Add, Op::Sub, Op::Mul, Op::Sin, Op::Complexity],
+            qd_bins: 4,
+            qd_policy: true,
+            ..config(2, seed)
+        };
+        let a = audit(&cfg, &train, &test);
+        report(&format!("overwritten slot seed {seed}"), &a);
+        if !a.mismatches.is_empty() {
+            failures.push(format!("seed {seed}: {} of {}", a.mismatches.len(), a.checked));
+        }
+    }
+    assert!(failures.is_empty(), "overwritten slots store the offered tree's error: {failures:?}");
+}
