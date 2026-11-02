@@ -239,8 +239,12 @@ fn scratch() -> PathBuf {
 /// `r = 0.01 x1 + noise` is the realised return; `y = r + 0.05 x2` is the
 /// regression target, so the squared error prefers `x2` and the P&L `x1`.
 fn write_csv(dir: &std::path::Path, step: i64) -> String {
+    write_csv_rows(dir, step, N)
+}
+
+fn write_csv_rows(dir: &std::path::Path, step: i64, rows: usize) -> String {
     let mut text = String::from("t,x1,x2,r,y\n");
-    for i in 0..N {
+    for i in 0..rows {
         let f = i as f64;
         let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
         let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
@@ -550,4 +554,18 @@ fn resume_needs_the_same_blocks() {
     assert_eq!(members(&straight), members(&resumed));
     let other = run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "4", "--generations", "20", "--resume", &cp]);
     usage_error(&other, "fitness");
+}
+
+#[test]
+fn prune_fits_candidates_under_pnl_above_prune_rows() {
+    let dir = scratch();
+    let data = write_csv_rows(&dir, 900, 3000);
+    let spec = write_spec(&dir);
+    let j = json(&run(
+        &data,
+        &spec,
+        &["--fitness", "pnl", "--prune", "--prune-rows", "1000", "--generations", "8"],
+    ));
+    let fits = num(&j, &["prune", "fits"]);
+    assert!(fits > 0.0, "prune made {fits} fits");
 }
