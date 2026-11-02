@@ -205,3 +205,30 @@ fn the_manifest_records_fit_rows_and_the_subsample_hash() {
     m.fit_subsample = None;
     assert!(!m.json(None, &[]).contains("fit_subsample"));
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn fit_rows_default_resolves_on_the_gpu_fit_path_only() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let big = sample(search::DEFAULT_FIT_ROWS_ABOVE + 1, 5, false);
+    assert_eq!(
+        search::default_fit_rows(&config(3, 0), &big),
+        Some(search::DEFAULT_FIT_ROWS)
+    );
+    assert_eq!(search::DEFAULT_FIT_ROWS, 65_536);
+    let at_threshold = sample(search::DEFAULT_FIT_ROWS_ABOVE, 5, false);
+    assert_eq!(search::default_fit_rows(&config(3, 0), &at_threshold), None);
+    let cpu_fit = Config {
+        fit_strategy: FitStrategy::Exact,
+        ..config(3, 0)
+    };
+    assert_eq!(search::default_fit_rows(&cpu_fit, &big), None);
+    let cpu = Config {
+        gpu: false,
+        ..config(3, 0)
+    };
+    assert_eq!(search::default_fit_rows(&cpu, &big), None);
+}
