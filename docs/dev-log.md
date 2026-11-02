@@ -281,6 +281,7 @@ because that loop has neither.
 | `fit_kernel_s`, `fit_fallback_s` | raw device fit-kernel seconds and measured exact-CPU fit-fallback seconds |
 | `fit_kernel_lm_s`, `fit_kernel_polish_s` | `fit_kernel_s` apportioned to the damped LM loop and to the polish phase by per-block cycle sums (`--fit-polish`) |
 | `fit_refit_s`, `fit_refits` | #495: wall seconds and count of the exact CPU finalist refits after the last generation (GPU runs; `null` on a CPU run). `rcsr dev-report` ranks the refit as its own window beside the generation phases and prints it in the run table |
+| `irls_reweighted` | #611: constant fits of the search that ran on a reweighted L1 schedule (`--fit-irls reweighted` or `reweighted-final`); `0` with the default `nested` |
 | `events`, `bytes`, `dropped` | log bookkeeping **before** this event; `dropped` counts events lost to the byte cap |
 | `end` | UTC end time |
 

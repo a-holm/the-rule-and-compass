@@ -405,6 +405,8 @@ pub struct Knobs {
     pub adaptive_mix: bool,
     /// #496: arithmetic of the device fit polish.
     pub fit_polish: Option<crate::fit::FitPolish>,
+    /// #611: schedule of the CPU L1 constant fit.
+    pub fit_irls: Option<crate::fit::FitIrls>,
     /// #464: scale-free patience tolerance.
     pub patience_tol: Option<f64>,
     /// #464: `--stop-on front[:W]`; `Some(0)` takes W from the patience.
@@ -536,6 +538,9 @@ pub struct RunResult {
     pub fit_fallback: Option<usize>,
     /// #466: seconds the front prune took (0 unless `--prune`).
     pub prune_s: f64,
+    /// #611: fits that ran on a reweighted L1 schedule. A process-wide delta, so
+    /// exact only for a single running search (`--jobs 1`).
+    pub irls_reweighted: u64,
 }
 
 /// Mean-adjusted summary of one `(suite, noise)` group.
@@ -805,6 +810,9 @@ fn base_config(cfg: &SuiteConfig, seed: u32) -> Config {
     if let Some(v) = k.fit_polish {
         sc.fit_polish = v;
     }
+    if let Some(v) = k.fit_irls {
+        sc.fit_irls = v;
+    }
     if let Some(v) = k.prune {
         sc.prune = v;
     }
@@ -864,6 +872,7 @@ fn empty_result(suite: &str, problem: &str, noise: Option<f64>, seed: u32, truth
         fit_gpu: None,
         fit_fallback: None,
         prune_s: 0.0,
+        irls_reweighted: 0,
     }
 }
 
@@ -912,14 +921,17 @@ pub fn run_problem(p: &Problem, noise: f64, seed: u32, cfg: &SuiteConfig) -> Run
     }));
     let max_cx = sc.max_complexity as f64;
 
+    let irls_before = crate::fit::fit_arm_counts_full().irls_reweighted;
     let t0 = Instant::now();
     let out = search::run(&sc, &train, &test);
     let seconds = t0.elapsed().as_secs_f64();
+    let irls_reweighted = crate::fit::fit_arm_counts_full().irls_reweighted - irls_before;
 
     // Scan the Pareto front in complexity order and keep the member with the
     // highest test R²; ties therefore go to the simplest expression.
     let mut r = empty_result(p.suite, p.name, Some(noise), seed, p.truth_cx);
     r.seconds = seconds;
+    r.irls_reweighted = irls_reweighted;
     let mut points: Vec<(f64, f64)> = Vec::new();
     let mut have_best = false;
     for sol in out.archive.sorted() {
@@ -1496,7 +1508,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
     };
     let opt_u = |v: Option<usize>| json_opt(v);
     format!(
-        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"selection\":{},\"dispatch\":{},\"fit_polish\":{},\"linear_scaling\":{},\"reject_constant_offspring\":{},\"mutation_mix\":{},\"tree_arity\":{},\"crossover_internal\":{},\"adaptive_mix\":{},\"prune\":{},\"patience_tol\":{},\"stop_front\":{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
+        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"selection\":{},\"dispatch\":{},\"fit_polish\":{},\"linear_scaling\":{},\"reject_constant_offspring\":{},\"mutation_mix\":{},\"tree_arity\":{},\"crossover_internal\":{},\"adaptive_mix\":{},\"prune\":{},\"patience_tol\":{},\"stop_front\":{},\"fit_irls\":{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
         GENERATOR_VERSION,
         json_number(cfg.threshold),
         json_number(SIGNAL_THRESHOLD),
@@ -1526,6 +1538,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
         k.prune.map_or("null".to_string(), |v| v.to_string()),
         json_opt_f(k.patience_tol),
         opt_u(k.stop_front),
+        k.fit_irls.map_or("null".to_string(), |v| format!("\"{}\"", v.name())),
         env!("CARGO_PKG_VERSION"),
         cfg!(feature = "cuda"),
         cfg.backend.name(),
@@ -1538,7 +1551,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
 /// The fields of one run, without braces.
 fn run_fields(r: &RunResult) -> String {
     format!(
-        "\"suite\": \"{}\", \"problem\": \"{}\", \"noise\": {}, \"seed\": {}, \"recovered\": {}, \"test_r2\": {}, \"complexity\": {}, \"train_error\": {}, \"test_rmse\": {}, \"seconds\": {}, \"expression\": \"{}\", \"truth_cx\": {}, \"generations_run\": {}, \"stop_reason\": \"{}\", \"backend\": \"{}\", \"oracle_r2\": {}, \"oracle_recovered\": {}, \"exact_cx\": {}, \"excess_cx\": {}, \"front_hv\": {}, \"hit_gen\": {}, \"hit_s\": {}, \"hit_evals\": {}, \"oracle_hit_gen\": {}, \"oracle_hit_s\": {}, \"oracle_hit_evals\": {}, \"signal_r2\": {}, \"signal_recovered\": {}, \"selected_cx\": {}, \"distractors_used\": {}, \"fit_attempts\": {}, \"fit_gpu\": {}, \"fit_fallback\": {}, \"prune_s\": {}",
+        "\"suite\": \"{}\", \"problem\": \"{}\", \"noise\": {}, \"seed\": {}, \"recovered\": {}, \"test_r2\": {}, \"complexity\": {}, \"train_error\": {}, \"test_rmse\": {}, \"seconds\": {}, \"expression\": \"{}\", \"truth_cx\": {}, \"generations_run\": {}, \"stop_reason\": \"{}\", \"backend\": \"{}\", \"oracle_r2\": {}, \"oracle_recovered\": {}, \"exact_cx\": {}, \"excess_cx\": {}, \"front_hv\": {}, \"hit_gen\": {}, \"hit_s\": {}, \"hit_evals\": {}, \"oracle_hit_gen\": {}, \"oracle_hit_s\": {}, \"oracle_hit_evals\": {}, \"signal_r2\": {}, \"signal_recovered\": {}, \"selected_cx\": {}, \"distractors_used\": {}, \"fit_attempts\": {}, \"fit_gpu\": {}, \"fit_fallback\": {}, \"prune_s\": {}, \"irls_reweighted\": {}",
         json_escape(&r.suite),
         json_escape(&r.problem),
         json_opt_f(r.noise),
@@ -1573,6 +1586,7 @@ fn run_fields(r: &RunResult) -> String {
         json_opt(r.fit_gpu),
         json_opt(r.fit_fallback),
         json_number(r.prune_s),
+        r.irls_reweighted,
     )
 }
 

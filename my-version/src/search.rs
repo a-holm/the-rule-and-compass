@@ -232,6 +232,10 @@ pub struct Config {
     /// affine in every constant and fall back to LM otherwise. Changing it
     /// changes the trajectory, so it is a saved search setting.
     pub fit_strategy: crate::fit::FitStrategy,
+    /// #611: schedule of the CPU `absolute` and `implicit_residual` constant
+    /// fit inside the search. A non-`nested` value changes the fitted constants,
+    /// so it is a saved search setting; reported members are refit on `nested`.
+    pub fit_irls: crate::fit::FitIrls,
     /// #496: arithmetic of the device fit kernel's polish. Saved search state.
     pub fit_polish: crate::fit::FitPolish,
     /// #223: which offspring the deferred GPU fit admits. A resolved default
@@ -646,6 +650,7 @@ impl Default for Config {
             init_depth: 3,
             fit_iters: 8,
             fit_strategy: crate::fit::FitStrategy::Exact, // #116
+            fit_irls: crate::fit::FitIrls::Nested,
             fit_polish: crate::fit::FitPolish::F64,
             fit_admission: crate::fit::FitAdmission::Screened,
             fit_report: false,
@@ -700,6 +705,13 @@ impl Default for Config {
 }
 
 impl Config {
+    /// #611: whether the candidate fit runs a reweighted L1 schedule.
+    pub fn fit_irls_active(&self) -> bool {
+        self.fit_irls != crate::fit::FitIrls::Nested
+            && self.fit_iters > 0
+            && matches!(self.metric, Metric::Absolute | Metric::ImplicitResidual)
+    }
+
     /// #464: relative tolerance of the front stop.
     fn front_tol(&self) -> f64 {
         self.patience_tol
@@ -753,6 +765,7 @@ impl Config {
         compare!(fit_iters, "fit_iters");
         compare!(fit_strategy, "fit_strategy"); // #116
         compare!(fit_polish, "fit_polish");
+        compare!(fit_irls, "fit_irls"); // #611
         compare!(fit_admission, "fit_admission");
         compare!(linear_scaling, "linear_scaling"); // #470
         compare!(mutation_mix, "mutation_mix"); // #471
@@ -4109,15 +4122,17 @@ fn fit_constants_with_iters(
             });
         }
         // #116 + #117: strategy and metric together.
-        let sse = crate::fit::fit_weighted_strategy_metric(
-            tree,
-            &fit.x,
-            &fit.y,
-            &fit.w,
-            iters,
-            cfg.fit_strategy,
-            cfg.metric,
-        );
+        let sse = crate::fit::with_fit_irls(cfg.fit_irls, || {
+            crate::fit::fit_weighted_strategy_metric(
+                tree,
+                &fit.x,
+                &fit.y,
+                &fit.w,
+                iters,
+                cfg.fit_strategy,
+                cfg.metric,
+            )
+        });
         Some(FitResult {
             sse,
             hash: expr::structural_hash(tree),
@@ -8811,12 +8826,24 @@ fn run_search(
     let gpu_fit_used =
         cfg.fit_strategy.defers_to_gpu() && (gpu_used || fit_only_device);
     let mut refit_report = RefitReport::default();
-    if subsampling_active(cfg, train) || gpu_used || fit_only_device || resumed || fit_screened {
+    if subsampling_active(cfg, train)
+        || gpu_used
+        || fit_only_device
+        || resumed
+        || fit_screened
+        || cfg.fit_irls_active()
+    {
         // Generation fitness was estimated on subsets, or on the GPU in f32, so
         // the front is rebuilt from the surviving trees and scored on every
         // training row with the CPU in f64. From here on the archive and every
         // number derived from it are full-data and match the CPU backend.
-        let rebuilt = full_data_archive(&archive, &islands, &train_data, cfg, gpu_fit_used);
+        let rebuilt = full_data_archive(
+            &archive,
+            &islands,
+            &train_data,
+            cfg,
+            gpu_fit_used || cfg.fit_irls_active(),
+        );
         archive = rebuilt.0;
         refit_report = rebuilt.1;
     } else {
