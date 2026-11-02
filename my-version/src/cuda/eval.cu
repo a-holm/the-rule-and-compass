@@ -386,6 +386,12 @@ static void rc_ledger_tag(char *dst, const char *tag)
     snprintf(dst, 32, "%s", tag ? tag : "");
 }
 
+static void rc_alloc_fail_clear(void)
+{
+    g_alloc_fail_bytes = 0;
+    g_alloc_fail_tag[0] = 0;
+}
+
 /* #284: place the kernel span `t0..t1` on the rc_now_ms clock from the event
    distance to the anchor. `which` is 0 for the evaluator and 1 for the fit
    stage. Both events are complete when this runs (the elapsed-time query
@@ -4911,8 +4917,7 @@ static void *rc_create_impl(const float *cols, int n, int v, const float *y,
         snprintf(c->sync_reason, sizeof(c->sync_reason),
                  "RCSR_GPU_SYNC requests the synchronous copy path");
     }
-    g_alloc_fail_bytes = 0;
-    g_alloc_fail_tag[0] = 0;
+    rc_alloc_fail_clear();
     size_t col_bytes = sizeof(float) * (size_t)n * (size_t)v;
     size_t y_bytes = sizeof(float) * (size_t)n;
     if (tile_rows > 0) {
@@ -6026,6 +6031,7 @@ int rc_set_pnl_book(void *ctx, const double *excess, const unsigned char *flags,
                     int nblocks, double lambda, unsigned long long min_trades)
 {
     RcCtx *c = (RcCtx *)ctx;
+    rc_alloc_fail_clear();
     g_pnl_book_err = "";
     if (!c) return rc_pnl_book_fail("the context is null");
     if (c->d_pnl_book) {
@@ -6152,8 +6158,7 @@ int rc_pool_hash(void *ctx, int which, int nprog, int width, unsigned long long 
    It is uploaded once here rather than per batch. */
 int rc_set_fit_data(void *ctx, const double *cols, const double *y, const double *w)
 {
-    g_alloc_fail_bytes = 0;
-    g_alloc_fail_tag[0] = 0;
+    rc_alloc_fail_clear();
     RcCtx *c = (RcCtx *)ctx;
     if (!c || c->tiled || !cols || !y) return -1;
     if (c->d_cols64) { rc_dev_free(c, c->d_cols64); c->d_cols64 = 0; }
@@ -6211,6 +6216,7 @@ int rc_set_fit_data(void *ctx, const double *cols, const double *y, const double
  */
 int rc_set_score_weights(void *ctx, const double *w)
 {
+    rc_alloc_fail_clear();
     RcCtx *c = (RcCtx *)ctx;
     if (!c) return -1;
     if (c->d_w64) { rc_dev_free(c, c->d_w64); c->d_w64 = 0; }
@@ -6237,6 +6243,7 @@ int rc_set_score_weights(void *ctx, const double *w)
 
 int rc_set_fit_sign(void *ctx, const double *sign)
 {
+    rc_alloc_fail_clear();
     RcCtx *c = (RcCtx *)ctx;
     if (!c) return -1;
     if (c->d_tsign) { rc_dev_free(c, c->d_tsign); c->d_tsign = 0; }
@@ -6278,6 +6285,7 @@ int rc_set_fit_sign(void *ctx, const double *sign)
  */
 int rc_set_slope_pairs(void *ctx, const unsigned int *bits, long long npairs)
 {
+    rc_alloc_fail_clear();
     RcCtx *c = (RcCtx *)ctx;
     if (!c) return -1;
     if (c->d_pmask) { rc_dev_free(c, c->d_pmask); c->d_pmask = 0; }

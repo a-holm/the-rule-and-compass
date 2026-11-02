@@ -47,6 +47,15 @@ fn gpu_required_exit(err: &str) -> Option<i32> {
     Some(if reason.starts_with("device_memory") { EXIT_USAGE } else { EXIT_DEVICE })
 }
 
+/// #619: one more search of the invocation (fold, null control, benchmark repeat); a
+/// device failure under an explicit `--gpu` exits with its code instead of panicking.
+fn run_or_exit(cfg: &search::Config, train: &data::Sample, test: &data::Sample) -> search::Outcome {
+    search::run_seeded_checked(cfg, train, test, &[]).unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(gpu_required_exit(&e).unwrap_or(EXIT_INPUT));
+    })
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Format {
     Text,
@@ -6636,7 +6645,7 @@ fn main() {
         };
         let mut fold_rows = Vec::new();
         for f in &folds {
-            let out = search::run(&cfg, &f.train, &f.test);
+            let out = run_or_exit(&cfg, &f.train, &f.test);
             // Pick by the engine's own criterion (lowest training error), then
             // score on rows that fold's search never saw.
             let best = out
@@ -6704,7 +6713,7 @@ fn main() {
                 ys: Vec::new(),
                 pairs: None,
             };
-            let out = search::run(&cfg, &shuffled, &shuffled);
+            let out = run_or_exit(&cfg, &shuffled, &shuffled);
             let b = out
                 .archive
                 .items
@@ -9446,7 +9455,7 @@ fn benchmark_markdown(
             .seed
             .wrapping_add(0x9E37_79B9u32.wrapping_mul(r as u32));
         let start = std::time::Instant::now();
-        let outcome = search::run(&extra, &prepared.train, &prepared.test);
+        let outcome = run_or_exit(&extra, &prepared.train, &prepared.test);
         let seconds = start.elapsed().as_secs_f64();
         if !quiet {
             eprintln!(
