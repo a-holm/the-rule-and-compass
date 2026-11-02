@@ -341,3 +341,7 @@ Runs that are time-ordered, have a target spec or pass `--require-validation` ad
 * `timing.gates_seconds`.
 
 In every run `validation_hv` carries `complexity_min` and `complexity_max`, and a structurally unidentified member has `constant_errors.ill_conditioned: true` and `null` standard errors for its involved constants.
+
+## Validation book of every Pareto member in `run.json` (#645)
+
+With `--objective pnl|sharpe|log_growth`, each `pareto` member has `validation_book`: `objective` (the selection score on the validation slice, lower is better), `net_pnl`, `sharpe`, `trades`, `exposure` and `constant` (the expression reads no variable). The numbers come from the exact CPU `f64` book that ranks the member, on the validation rows only, with the cost, return unit and position rule of the `objective` block. The finalist's entry equals `objective.finalist.validation_objective` and `objective.validation.net_pnl`. A member without a usable book has `"validation_book": null`. Non-finite numbers (a NaN Sharpe) are `null`. Runs without a trading objective have no such field. The test block is scored for the finalist alone.
