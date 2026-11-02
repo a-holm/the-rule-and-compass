@@ -161,7 +161,7 @@ fn small_default_cell_overlap_matches_serial() {
     assert_eq!(resolved.admission, FitAdmission::All, "{}", resolved.reason);
     let cfg = |depth: usize, seed: u32| Config {
         fit_strategy: resolved.strategy,
-        fit_admission: resolved.admission,
+        fit_admission: if depth == 0 { resolved.admission } else { FitAdmission::Screened },
         pipeline_depth: depth,
         seed,
         ..base.clone()
