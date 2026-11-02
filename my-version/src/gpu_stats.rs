@@ -216,6 +216,9 @@ pub struct RunLedger {
     refits: u64,
     /// #334: allocator activity of the fit and score regions.
     fit_alloc: FitAlloc,
+    /// #600: main-thread seconds of the overlap drain (device scoring, device
+    /// fit and CPU fallback) booked as eval and fit instead of vary.
+    drain_wall_s: f64,
     /// Windows before the search clock starts (data load, preparation). They
     /// are not part of the run wall, so they never enter the closure.
     outside_s: [f64; 9],
@@ -249,6 +252,33 @@ impl RunLedger {
         };
         self.record_stage(Stage::Fit, fit_s);
         self.record_stage(Stage::Vary, window_s - fit_s);
+    }
+
+    /// #600: book one island-scope window whose main thread also ran the
+    /// overlap drain. The drain seconds are eval and fit (capped by the window,
+    /// eval first); the rest follows [`Self::record_island_window`].
+    pub fn record_island_window_overlap(
+        &mut self,
+        window_s: f64,
+        fit_cpu_s: f64,
+        threads: usize,
+        drain_eval_s: f64,
+        drain_fit_s: f64,
+    ) {
+        if !window_s.is_finite() || window_s <= 0.0 {
+            return;
+        }
+        let clamp = |v: f64| if v.is_finite() && v > 0.0 { v } else { 0.0 };
+        let eval_s = clamp(drain_eval_s).min(window_s);
+        let fit_s = clamp(drain_fit_s).min(window_s - eval_s);
+        self.record_stage(Stage::Eval, eval_s);
+        self.record_stage(Stage::Fit, fit_s);
+        self.drain_wall_s += eval_s + fit_s;
+        self.record_island_window(window_s - eval_s - fit_s, fit_cpu_s, threads);
+    }
+
+    pub fn drain_wall_s(&self) -> f64 {
+        self.drain_wall_s
     }
 
     /// #284: move a measured fit sub-window out of the enclosing eval window.
@@ -958,6 +988,31 @@ impl GpuStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #600: the drain is eval and fit, never vary; the window still closes.
+    #[test]
+    fn pipeline_drain_not_vary() {
+        let mut l = RunLedger::new();
+        l.record_island_window_overlap(10.0, 0.0, 4, 2.0, 5.0);
+        assert!((l.stage_s(Stage::Eval) - 2.0).abs() < 1e-12);
+        assert!((l.stage_s(Stage::Fit) - 5.0).abs() < 1e-12);
+        assert!((l.stage_s(Stage::Vary) - 3.0).abs() < 1e-12);
+        assert!((l.drain_wall_s() - 7.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ledger_closure_with_overlap() {
+        let mut l = RunLedger::new();
+        // A drain longer than the window is capped, eval first.
+        l.record_island_window_overlap(4.0, 8.0, 2, 3.0, 9.0);
+        l.record_island_window_overlap(6.0, 0.0, 2, 0.0, 1.5);
+        l.set_wall(10.0);
+        assert!((l.stage_sum_s() - 10.0).abs() < 1e-12);
+        assert!(l.closure_residual().value.abs() < 1e-12);
+        assert!((l.stage_s(Stage::Eval) - 3.0).abs() < 1e-12);
+        assert!((l.stage_s(Stage::Fit) - 2.5).abs() < 1e-12);
+        assert!((l.stage_s(Stage::Vary) - 4.5).abs() < 1e-12);
+    }
 
     /// #118: the host windows are disjoint and add up to wall; kernel time is
     /// overlapping and only feeds duty/idle, never the additive sum.

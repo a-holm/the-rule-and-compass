@@ -1068,6 +1068,10 @@ struct GpuSearch {
     /// This is a subset of `fit_host_ms`, never added to it twice.
     fit_fallback_ms: f64,
     fit_gate_ms: f64,
+    /// #600: main-thread milliseconds of the overlap drain spent in scoring and
+    /// in the fit stage. The fit part is a subset of `fit_host_ms`.
+    drain_eval_ms: f64,
+    drain_fit_ms: f64,
     /// #255: candidates left at their finite device constants because the
     /// per-generation fallback bound was reached.
     fit_fallback_bounded: usize,
@@ -1351,6 +1355,8 @@ impl GpuSearch {
                     fit_host_ms: 0.0,
                     fit_fallback_ms: 0.0,
                     fit_gate_ms: 0.0,
+                    drain_eval_ms: 0.0,
+                    drain_fit_ms: 0.0,
                     fit_fallback_bounded: 0,
                     fit_fallback_workers: 0,
                     ledger_origin: run_start,
@@ -2820,7 +2826,9 @@ fn score_pipeline_batch(
         return Err("pipeline scoring without a GPU evaluator".to_string());
     };
     let offered_hash: Vec<u64> = jobs.iter().map(|(_, _, t)| expr::structural_hash(t)).collect();
+    let eval_start = std::time::Instant::now();
     let (kept, errs) = eval_pipeline_jobs(g, &jobs, generation)?;
+    g.drain_eval_ms += eval_start.elapsed().as_secs_f64() * 1000.0;
     if !kept.is_empty() {
         // #290: the overlap pipeline is a real device batch too; record it so
         // the route ledger and the backend claim come from what ran.
@@ -2881,6 +2889,7 @@ fn fit_pipeline_queue(
     if offered == 0 {
         return Ok(());
     }
+    let fit_start = std::time::Instant::now();
     g.fit_attempts += offered;
     {
         let stats = g.stats.entry(generation).or_default();
@@ -2909,6 +2918,7 @@ fn fit_pipeline_queue(
         // #236: slope always starts from the squared warm start and keeps the
         // incoming constants unless it improves on them.
         g.ev.set_fit_polish(fit.polish);
+        let fit_device_start = g.ledger_offset_s();
         let (out, ms) = if fit.loss == crate::fit::DeviceLoss::Slope {
             g.ev.slope_fit_batch(&refs, fit.iters)
         } else {
@@ -2920,6 +2930,15 @@ fn fit_pipeline_queue(
             g.fit_calls += 1;
             g.fit_call_candidates += plans.len();
             g.fit_call_ms_max = g.fit_call_ms_max.max(ms as f64);
+            // #600: the fit kernel is one device interval on the run clock.
+            match g.ev.take_span_start_s(crate::gpu::SPAN_FIT) {
+                Some(start_s) => g.ledger.record_fit_kernel_event(0, start_s, ms as f64 / 1000.0),
+                None => g.ledger.record_fit_kernel_interval(
+                    0,
+                    fit_device_start,
+                    ms as f64 / 1000.0,
+                ),
+            }
         }
         if ms < 0.0 || out.len() != plans.len() {
             for (k, _) in &plans {
@@ -2987,6 +3006,7 @@ fn fit_pipeline_queue(
             .iter()
             .map(|(_, job)| FallbackFitJob::new(job.island, job.slot, job.tree.clone()))
             .collect();
+        let fallback_start = std::time::Instant::now();
         fit_fallback_jobs(
             &mut owned,
             &train.x,
@@ -2996,6 +3016,9 @@ fn fit_pipeline_queue(
             fit.metric,
             fallback_workers(),
         );
+        let fallback_seconds = fallback_start.elapsed().as_secs_f64();
+        g.fit_fallback_ms += fallback_seconds * 1000.0;
+        g.stats.entry(generation).or_default().fit_fallback_seconds += fallback_seconds;
         for ((k, job), done) in fb.iter_mut().zip(owned) {
             if done.improved {
                 let cause = fallback_cause
@@ -3010,6 +3033,9 @@ fn fit_pipeline_queue(
         }
     }
 
+    let fit_ms_elapsed = fit_start.elapsed().as_secs_f64() * 1000.0;
+    g.fit_host_ms += fit_ms_elapsed;
+    g.drain_fit_ms += fit_ms_elapsed;
     if !fitted.is_empty() {
         // #560: score the fitted tree after the post-fit simplify, as the
         // synchronous path does, and hand that tree to the barrier.
@@ -3020,7 +3046,9 @@ fn fit_pipeline_queue(
                 (*i, *j, expr::simplify(tree))
             })
             .collect();
+        let rescore_start = std::time::Instant::now();
         let (kept2, errs2) = eval_pipeline_jobs(g, &refit, generation)?;
+        g.drain_eval_ms += rescore_start.elapsed().as_secs_f64() * 1000.0;
         for (&pos, &err) in kept2.iter().zip(&errs2) {
             let (i, j, tree) = &refit[pos];
             results[*i][*j] = Some(PipelineResult {
@@ -7800,6 +7828,10 @@ fn run_search(
             #[cfg(feature = "cuda")]
             let mut pipeline_error: Option<String> = None;
             #[cfg(feature = "cuda")]
+            let drain_before = gpu
+                .as_ref()
+                .map_or((0.0, 0.0), |g| (g.drain_eval_ms, g.drain_fit_ms));
+            #[cfg(feature = "cuda")]
             let mut pipeline_scored = false;
             #[cfg(feature = "cuda")]
             let mut fit_queue = PipelineFitQueue::default();
@@ -8035,16 +8067,27 @@ fn run_search(
             let dev_archive = dev_lap(&mut dev_mark); // #211
             let stage_archive = stage_lap(&mut stage_mark); // #284
 
+            #[cfg(feature = "cuda")]
+            let (drain_eval_s, drain_fit_s) = gpu.as_ref().map_or((0.0, 0.0), |g| {
+                (
+                    (g.drain_eval_ms - drain_before.0) / 1000.0,
+                    (g.drain_fit_ms - drain_before.1) / 1000.0,
+                )
+            });
+            #[cfg(not(feature = "cuda"))]
+            let (drain_eval_s, drain_fit_s) = (0.0f64, 0.0f64);
             // #284: exclusive main-thread stages. `prep` is the generation
             // setup/carried refit window, which has no dedicated name in the
             // stage enum, so it is `host_other`. The evaluator window is
             // accumulated and partitioned with the nested fit window after the
             // loop, so fit is never counted twice.
             run_ledger.record_stage(crate::gpu_stats::Stage::HostOther, stage_prep);
-            run_ledger.record_island_window(
+            run_ledger.record_island_window_overlap(
                 stage_search,
                 GenCounters::seconds(dev_counters_ref, |c| &c.fit_ns),
                 islands.len().max(1) * island_workers,
+                drain_eval_s,
+                drain_fit_s,
             );
             run_ledger.record_stage(crate::gpu_stats::Stage::Select, stage_select);
             run_ledger.record_stage(crate::gpu_stats::Stage::Archive, stage_archive);
@@ -8602,7 +8645,7 @@ fn run_search(
             // Fit is a sub-window of the measured eval window. The part before
             // the loop (generation 0) is already booked as Fit; only the loop's
             // share is reclassified, so the stage sum never grows.
-            let fit_loop_s = (s.fit_host_ms / 1000.0 - setup_fit_s).max(0.0);
+            let fit_loop_s = ((s.fit_host_ms - g.drain_fit_ms) / 1000.0 - setup_fit_s).max(0.0);
             ledger.reclassify_eval_to_fit(fit_loop_s);
             ledger.set_wall(t0.elapsed().as_secs_f64());
             s.ledger = ledger;
