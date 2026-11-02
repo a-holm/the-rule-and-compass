@@ -3761,6 +3761,9 @@ fn main() {
         let requested_gpu = cfg.gpu;
         let requested_simd = cfg.simd;
         let requested_dispatch = cfg.dispatch;
+        let requested_pipeline_depth = cfg.pipeline_depth;
+        let requested_prune = (cfg.prune, cfg.prune_rows, cfg.prune_budget);
+        let requested_fit_report = cfg.fit_report;
         let mut effective = saved;
         if generations_set {
             effective.generations = cfg.generations;
@@ -3774,6 +3777,9 @@ fn main() {
         effective.gpu = requested_gpu;
         effective.simd = requested_simd;
         effective.dispatch = requested_dispatch;
+        effective.pipeline_depth = requested_pipeline_depth;
+        (effective.prune, effective.prune_rows, effective.prune_budget) = requested_prune;
+        effective.fit_report = requested_fit_report;
         fit_request = None;
         cfg = effective;
         resumed_generation = Some(cp.generations);
