@@ -1258,7 +1258,7 @@ fn ledger_json(
         rcsr::gpu_stats::Ratio::undefined(f64::NAN, f64::NAN, "decades_per_gpu_hour", "run")
     };
     format!(
-        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"fallback_s\":{},\"gate_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
+        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"drain_wall_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"fallback_s\":{},\"gate_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
         jnum(l.wall_s()),
         stages,
         jnum(l.stage_sum_s()),
@@ -1267,6 +1267,7 @@ fn ledger_json(
         jnum(l.device_busy_s()),
         jnum(l.device_busy_sum_s()),
         jnum(l.device_overlap_s()),
+        jnum(l.drain_wall_s()),
         l.intervals().len(),
         jstr(l.interval_basis()),
         by_event,
@@ -12027,6 +12028,7 @@ mod tests {
             "\"stages\":",
             "\"device_busy_s\":4",
             "\"device_busy_sum_s\":5",
+            "\"drain_wall_s\":0",
             "\"device_overlap_s\":1",
             "\"device_split\":{\"eval_kernel_s\":0,\"eval_launch_s\":0,\"eval_copy_s\":0,\"eval_alloc_s\":0,\"fit_kernel_s\":1.5,\"units\":\"seconds\"}",
             "\"duty_run\":{\"value\":0.4,\"numerator\":4,\"denominator\":10,\"units\":\"fraction\",\"scope\":\"run\"}",
