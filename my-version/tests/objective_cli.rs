@@ -477,3 +477,123 @@ fn walkforward_front_of_a_real_run_guards_the_seen_rows() {
     assert_eq!(at(selection, &["source"]).as_str(), Some("front"));
     assert!(matches!(at(&report, &["candidates"]), Json::Arr(c) if !c.is_empty()));
 }
+
+fn from_run_fixture() -> (String, String, f64, f64) {
+    let dir = scratch();
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let data = write_csv(&dir, "a.csv", None);
+    let out = run(&data, &spec, PNL);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let j = json(&out);
+    let run_path = dir.join("run.json");
+    std::fs::write(&run_path, String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    let seen = match at(&j, &["split", "validation_time"]) {
+        Json::Arr(a) => a[1].as_f64().unwrap(),
+        _ => unreachable!(),
+    };
+    let purge = num(&j, &["split", "required_purge_seconds"]);
+    (data, run_path.to_string_lossy().into_owned(), seen, purge)
+}
+
+fn walk_from_run(data: &str, run_path: &str, test_start: f64, purge: f64, extra: &[&str]) -> Output {
+    let end = (T0 + 900 * N as i64) as f64;
+    let window = format!("w,{},{},{},{}", T0, test_start - purge, test_start, end);
+    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "walkforward", "--data", data, "--time", "t", "--from-run", run_path, "--window", &window,
+            "--horizon", "900", "--periods-per-year", "365", "--json",
+        ])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn from_run_refuses_in_sample_windows() {
+    let (data, run_path, seen, purge) = from_run_fixture();
+    let inside = walk_from_run(&data, &run_path, seen, purge, &[]);
+    assert_eq!(code(&inside), 2, "{}", stderr(&inside));
+    assert!(stderr(&inside).contains("tests rows the run trained or selected on"), "{}", stderr(&inside));
+    let outside = walk_from_run(&data, &run_path, seen + purge, purge, &[]);
+    assert_eq!(code(&outside), 0, "{}", stderr(&outside));
+}
+
+#[test]
+fn from_run_labels_allowed_in_sample_windows() {
+    let (data, run_path, seen, purge) = from_run_fixture();
+    let inside = walk_from_run(&data, &run_path, seen, purge, &["--allow-in-sample-windows"]);
+    assert_eq!(code(&inside), 0, "{}", stderr(&inside));
+    let text = String::from_utf8_lossy(&inside.stdout).into_owned();
+    assert!(text.contains("\"in_sample\":true"), "{text}");
+    let outside = walk_from_run(&data, &run_path, seen + purge, purge, &["--allow-in-sample-windows"]);
+    assert_eq!(code(&outside), 0, "{}", stderr(&outside));
+    assert!(!String::from_utf8_lossy(&outside.stdout).contains("\"in_sample\":true"));
+}
+
+fn walk_table(extra: &[&str]) -> Output {
+    let dir = scratch();
+    let data = write_csv(&dir, "a.csv", None);
+    let at_row = |i: usize| T0 + 900 * i as i64;
+    let table = format!(
+        "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,f1,{},{},{},{},{}\n",
+        at_row(0),
+        at_row(250),
+        at_row(180),
+        at_row(260),
+        at_row(399)
+    );
+    let table_path = dir.join("windows.csv");
+    std::fs::write(&table_path, table).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "walkforward", "--data", &data, "--time", "t", "--target", "r", "--vars", "x1,x2",
+            "--windows", &table_path.to_string_lossy(), "--windows-scheme", "expanding", "--horizon", "900",
+            "--periods-per-year", "365", "--json",
+        ])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn windows_table_validation_start_selects_among_repeated_expr() {
+    let out = walk_table(&["--expr", "x1", "--expr", "x2"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let j = json(&out);
+    assert_eq!(at(&j, &["selection", "selected_on"]).as_str(), Some("validation"));
+    let windows = match at(&j, &["windows"]) {
+        Json::Arr(a) => a,
+        _ => unreachable!(),
+    };
+    assert!(num(&windows[0], &["validation_rows"]) > 0.0);
+}
+
+#[test]
+fn windows_table_accepts_select_band() {
+    let out = walk_table(&["--expr", "x1", "--expr", "x2", "--select-band"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let windows = match at(&json(&out), &["windows"]) {
+        Json::Arr(a) => a.clone(),
+        _ => unreachable!(),
+    };
+    assert!(!matches!(at(&windows[0], &["band_selection"]), Json::Null));
+}
+
+#[test]
+fn windows_table_still_refuses_validation_frac_and_missing_slice() {
+    let both = walk_table(&["--expr", "x1", "--expr", "x2", "--validation-frac", "0.2"]);
+    assert_ne!(code(&both), 0);
+    assert!(stderr(&both).contains("mutually exclusive"), "{}", stderr(&both));
+    let dir = scratch();
+    let data = write_csv(&dir, "a.csv", None);
+    let none = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "walkforward", "--data", &data, "--time", "t", "--target", "r", "--vars", "x1,x2", "--expr", "x1",
+            "--expr", "x2", "--window", &format!("w,{},{},{},{}", T0, T0 + 900 * 250, T0 + 900 * 260, T0 + 900 * 399),
+            "--horizon", "900", "--periods-per-year", "365",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(code(&none), 3, "{}", stderr(&none));
+    assert!(stderr(&none).contains("need a validation slice"), "{}", stderr(&none));
+}

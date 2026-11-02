@@ -258,6 +258,8 @@ pub struct LongLabels {
     pub weight: Vec<f64>,
     /// Average uniqueness of each valid row.
     pub uniqueness: Vec<f64>,
+    /// Valid rows the weights are normalised over.
+    pub weight_norm_rows: usize,
     cost_total: Vec<f64>,
     end_idx: Vec<usize>,
 }
@@ -293,6 +295,17 @@ fn sigma_at(bars: &[Bar], t: usize, w: usize, step: i64) -> Option<f64> {
 /// of a long perp position in log-return units; pass `None` without a verified
 /// funding column.
 pub fn build(bars: &[Bar], spec: &LongLabelSpec, funding: Option<&[f64]>) -> Result<LongLabels, String> {
+    build_keep(bars, spec, funding, &|_| true)
+}
+
+/// [`build`] with the uniqueness weights normalised over the rows whose stamp
+/// satisfies `keep` (the development rows).
+pub fn build_keep(
+    bars: &[Bar],
+    spec: &LongLabelSpec,
+    funding: Option<&[f64]>,
+    keep: &dyn Fn(i64) -> bool,
+) -> Result<LongLabels, String> {
     spec.validate()?;
     if let Some(f) = funding {
         if f.len() != bars.len() {
@@ -318,6 +331,7 @@ pub fn build(bars: &[Bar], spec: &LongLabelSpec, funding: Option<&[f64]>) -> Res
         exit_kind: vec![EXIT_NONE; n],
         weight: nan.clone(),
         uniqueness: nan.clone(),
+        weight_norm_rows: 0,
         cost_total: nan,
         end_idx: vec![0; n],
     };
@@ -374,42 +388,65 @@ pub fn build(bars: &[Bar], spec: &LongLabelSpec, funding: Option<&[f64]>) -> Res
         out.m_net[t] = if out.exit_ret[t] > cost { 1.0 } else { 0.0 };
         out.m_barrier[t] = if exit.1 == EXIT_PROFIT { 1.0 } else { 0.0 };
     }
-    (out.uniqueness, out.weight) = uniqueness_weights(&out, d);
+    (out.uniqueness, out.weight, out.weight_norm_rows) = uniqueness_weights(&out, d, keep);
     Ok(out)
 }
 
+/// Fixed-point unit of the exact window sums in [`uniqueness_weights`].
+const FIXED_ONE: u128 = 1 << 62;
+
 /// `u_i = mean over the label's bars of 1 / c_t`, `w_i = u_i * n / sum(u)`,
 /// with `c_t` the number of labels whose span covers bar `t`. A span runs from
-/// the entry bar to the exit bar.
-fn uniqueness_weights(l: &LongLabels, d: usize) -> (Vec<f64>, Vec<f64>) {
+/// the entry bar to the exit bar. `n` and `sum(u)` run over the valid rows whose
+/// stamp satisfies `keep`; every valid row gets `u * n / sum(u)`. The third
+/// value is that `n`.
+fn uniqueness_weights(l: &LongLabels, d: usize, keep: &dyn Fn(i64) -> bool) -> (Vec<f64>, Vec<f64>, usize) {
     let n = l.fwd.len();
     let rows: Vec<usize> = (0..n).filter(|&t| l.fwd[t].is_finite()).collect();
     let mut w = vec![f64::NAN; n];
     if rows.is_empty() {
-        return (w.clone(), w);
+        return (w.clone(), w, 0);
     }
     let mut conc = vec![0i64; n + 1];
     for &t in &rows {
         conc[t + 1 + d] += 1;
         conc[l.end_idx[t] + 1] -= 1;
     }
+    // With rows left out of the normalisation the window sums run in integers:
+    // a float prefix sum rounds with every earlier term, so it would carry the
+    // concurrency of the left-out region into rows far from it.
+    let exact = rows.iter().any(|&t| !keep(l.time[t]));
     let mut prefix = vec![0.0; n + 1];
+    let mut prefix_fixed = vec![0u128; n + 1];
     let mut c = 0i64;
     for k in 0..n {
         c += conc[k];
-        prefix[k + 1] = prefix[k] + if c > 0 { 1.0 / c as f64 } else { 0.0 };
+        if exact {
+            prefix_fixed[k + 1] = prefix_fixed[k] + if c > 0 { FIXED_ONE / c as u128 } else { 0 };
+        } else {
+            prefix[k + 1] = prefix[k] + if c > 0 { 1.0 / c as f64 } else { 0.0 };
+        }
     }
     let mut u = vec![f64::NAN; n];
     let mut total = 0.0;
+    let mut kept = 0usize;
     for &t in &rows {
         let (a, b) = (t + 1 + d, l.end_idx[t]);
-        u[t] = (prefix[b + 1] - prefix[a]) / (b - a + 1) as f64;
-        total += u[t];
+        let sum = if exact {
+            (prefix_fixed[b + 1] - prefix_fixed[a]) as f64 / FIXED_ONE as f64
+        } else {
+            prefix[b + 1] - prefix[a]
+        };
+        u[t] = sum / (b - a + 1) as f64;
+        if keep(l.time[t]) {
+            total += u[t];
+            kept += 1;
+        }
     }
     for &t in &rows {
-        w[t] = u[t] * rows.len() as f64 / total;
+        w[t] = if kept == 0 { f64::NAN } else { u[t] * kept as f64 / total };
     }
-    (u, w)
+    (u, w, kept)
 }
 
 /// Meta-label: `1[long exit net > 0]` on rows where the primary rule is long,
@@ -619,6 +656,8 @@ pub struct LabelReport {
     pub average_uniqueness: f64,
     pub effective_n: f64,
     pub effective_n_hours: f64,
+    /// Valid rows the uniqueness weights are normalised over (development rows).
+    pub weight_norm_rows: usize,
     pub purge_seconds: i64,
     /// The declared locked test the statistics leave out, with the number of
     /// valid rows left out. `None` when no range applies.
@@ -664,6 +703,7 @@ struct Tally {
     uniqueness_sum: f64,
     top: Vec<TopMove>,
     left_out: usize,
+    weight_norm_rows: usize,
 }
 
 fn move_order(a: &TopMove, b: &TopMove) -> std::cmp::Ordering {
@@ -688,6 +728,7 @@ impl Tally {
         self.action_long += other.action_long;
         self.uniqueness_sum += other.uniqueness_sum;
         self.left_out += other.left_out;
+        self.weight_norm_rows += other.weight_norm_rows;
         self.top.extend(other.top);
         self.top.sort_by(move_order);
         self.top.truncate(TOP_MOVES);
@@ -723,6 +764,7 @@ impl Tally {
             average_uniqueness: if nv == 0 { f64::NAN } else { self.uniqueness_sum / nv as f64 },
             effective_n: self.uniqueness_sum,
             effective_n_hours: self.uniqueness_sum * hours,
+            weight_norm_rows: self.weight_norm_rows,
             purge_seconds: spec.purge_seconds(),
             locked_test: range.map(|range| LockedLeftOut { range, rows_left_out: self.left_out }),
             label_hash,
@@ -785,6 +827,7 @@ impl LongLabels {
             uniqueness_sum: valid.iter().map(|&t| self.uniqueness[t]).sum(),
             top,
             left_out: finite - valid.len(),
+            weight_norm_rows: self.weight_norm_rows,
         }
     }
 
@@ -831,12 +874,22 @@ impl LabelAccumulator {
         self
     }
 
-    pub fn add(&mut self, symbol: &str, labels: &LongLabels) {
-        let symbol = (!symbol.is_empty()).then_some(symbol);
+    fn keep_fn(&self) -> impl Fn(i64) -> bool {
         let purge = self.spec.purge_seconds();
         let ranges = [self.range, self.also];
         let embargo = self.embargo;
-        let keep = move |t: i64| ranges.iter().flatten().all(|r| t + purge <= r.start || t >= r.end + embargo);
+        move |t: i64| ranges.iter().flatten().all(|r| t + purge <= r.start || t >= r.end + embargo)
+    }
+
+    /// Builds the labels of one series with the weights normalised over the
+    /// development rows of the declared ranges.
+    pub fn build(&self, bars: &[Bar], funding: Option<&[f64]>) -> Result<LongLabels, String> {
+        build_keep(bars, &self.spec, funding, &self.keep_fn())
+    }
+
+    pub fn add(&mut self, symbol: &str, labels: &LongLabels) {
+        let symbol = (!symbol.is_empty()).then_some(symbol);
+        let keep = self.keep_fn();
         self.tally.merge(labels.tally(symbol, &keep));
         self.chain.extend_from_slice(symbol.unwrap_or("").as_bytes());
         self.chain.push(0);
@@ -885,7 +938,7 @@ impl LabelReport {
             })
             .unwrap_or_default();
         format!(
-            "{{\"version\":{},\"name\":{},\"long_only\":true,\"rows\":{},\"valid_rows\":{},\"barrier_rows\":{},\"stride_rows\":{},\"exits\":{{\"profit\":{},\"stop\":{},\"vertical\":{}}},\"action_long_share\":{},\"clipped_share\":{},\"sign_share\":{{\"positive\":{},\"negative\":{},\"zero\":{}}},\"fwd_mean\":{},\"fwd_quantiles\":{{{}}},\"cost_to_move\":{},\"top_abs_moves\":{{\"n\":{},\"moves\":[{}]}},\"average_uniqueness\":{},\"effective_n\":{},\"effective_n_hours\":{},\"purge_seconds\":{}{},\"label_hash\":{}}}",
+            "{{\"version\":{},\"name\":{},\"long_only\":true,\"rows\":{},\"valid_rows\":{},\"barrier_rows\":{},\"stride_rows\":{},\"exits\":{{\"profit\":{},\"stop\":{},\"vertical\":{}}},\"action_long_share\":{},\"clipped_share\":{},\"sign_share\":{{\"positive\":{},\"negative\":{},\"zero\":{}}},\"fwd_mean\":{},\"fwd_quantiles\":{{{}}},\"cost_to_move\":{},\"top_abs_moves\":{{\"n\":{},\"moves\":[{}]}},\"average_uniqueness\":{},\"effective_n\":{},\"effective_n_hours\":{},\"weight_norm_rows\":{},\"purge_seconds\":{}{},\"label_hash\":{}}}",
             text(VERSION),
             text(&self.name),
             self.rows,
@@ -908,6 +961,7 @@ impl LabelReport {
             num(self.average_uniqueness),
             num(self.effective_n),
             num(self.effective_n_hours),
+            self.weight_norm_rows,
             self.purge_seconds,
             locked,
             text(&self.label_hash)
