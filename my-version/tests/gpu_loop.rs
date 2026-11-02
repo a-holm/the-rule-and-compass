@@ -441,7 +441,7 @@ fn recovered_law_and_reported_errors_agree_with_the_cpu_backend() {
     );
 }
 
-/// #121: a generation that mixes native, lowered (`asinh`) and unsupported
+/// #121: a generation that mixes native (`asinh` included) and unsupported
 /// (`require`) candidates is deterministic, and the JSON reports the split and
 /// the CPU fallback time/workers for every GPU generation.
 #[cfg(feature = "cuda")]
@@ -465,7 +465,7 @@ fn mixed_supported_and_unsupported_candidates_are_deterministic_and_reported() {
     assert!(!gpu.generations.is_empty());
     let mut saw_unsupported = false;
     for s in &gpu.generations {
-        assert_eq!(s.native + s.lowered, s.programs);
+        assert_eq!(s.native, s.programs);
         assert_eq!(s.fallbacks, s.unsupported_programs);
         saw_unsupported |= s.unsupported_programs > 0;
         if s.fallback_seconds > 0.0 {
@@ -491,7 +491,6 @@ fn mixed_supported_and_unsupported_candidates_are_deterministic_and_reported() {
     for key in [
         "\"native\":",
         "\"supported\":",
-        "\"lowered\":",
         "\"unsupported_programs\":",
         "\"fallback_seconds\":",
         "\"fallback_workers\":",
@@ -499,6 +498,7 @@ fn mixed_supported_and_unsupported_candidates_are_deterministic_and_reported() {
     ] {
         assert!(stdout.contains(key), "missing {key} in json: {stdout}");
     }
+    assert!(!stdout.contains("\"lowered\":"), "the lowering pass is gone: {stdout}");
 }
 
 /// #119: the overlap pipeline must not change a single scored value. The

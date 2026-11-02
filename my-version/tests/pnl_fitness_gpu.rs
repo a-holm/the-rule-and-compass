@@ -191,6 +191,7 @@ const STARTS_SMALL: [usize; 12] = [0, 1, 31, 32, 33, 4000, 9000, 16383, 16384, 1
 
 #[test]
 fn device_totals_equal_the_cpu_tree_on_a_small_book() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let f = fixture(&STARTS_SMALL, 16_401, 11);
     let b = book(&f, 1);
     let cpu = assert_exact(&f, &b, &programs(24, 5));
@@ -203,6 +204,7 @@ fn device_totals_equal_the_cpu_tree_on_a_small_book() {
 
 #[test]
 fn device_totals_equal_the_cpu_tree_on_device_predictions() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let f = fixture(&STARTS_100K, 100_003, 7);
     let b = book(&f, 1);
     assert_eq!(b.groups(), 37);
@@ -217,6 +219,7 @@ fn device_totals_equal_the_cpu_tree_on_device_predictions() {
 
 #[test]
 fn non_finite_trade_floor_and_flat_programs_have_exact_values() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let f = fixture(&STARTS_SMALL, 16_401, 3);
     let trees = vec![
         node(Op::Ln, vec![input(0)]),
@@ -255,6 +258,7 @@ fn non_finite_trade_floor_and_flat_programs_have_exact_values() {
 
 #[test]
 fn values_do_not_depend_on_the_batch() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let f = fixture(&STARTS_SMALL, 16_401, 21);
     let b = book(&f, 1);
     let Some(mut ev) = evaluator(&f, &b) else {
@@ -295,6 +299,7 @@ fn values_do_not_depend_on_the_batch() {
 
 #[test]
 fn a_context_without_a_book_or_with_a_refused_book_is_refused() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let f = fixture(&STARTS_SMALL, 16_401, 4);
     let b = book(&f, 1);
     let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
@@ -377,6 +382,7 @@ fn assert_exact_blocks(f: &Fixture, b: &FitnessBook, trees: &[Node]) -> usize {
 
 #[test]
 fn device_block_totals_equal_the_cpu_tree_on_a_small_book() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let f = fixture(&STARTS_SMALL, 16_401, 11);
     for blocks in [2usize, 5, 8] {
         let b = book_blocks(&f, 1, blocks, 1.5);
@@ -391,6 +397,7 @@ fn device_block_totals_equal_the_cpu_tree_on_a_small_book() {
 /// follows.
 #[test]
 fn device_block_totals_equal_the_cpu_tree_when_a_cut_meets_a_segment_boundary() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let f = fixture(&[0, 16_384, 32_768], 32_769, 19);
     for (blocks, lambda) in [(2usize, 1.0), (4, 0.0), (3, 2.5)] {
         let b = book_blocks(&f, 1, blocks, lambda);
@@ -401,6 +408,7 @@ fn device_block_totals_equal_the_cpu_tree_when_a_cut_meets_a_segment_boundary() 
 
 #[test]
 fn device_block_totals_equal_the_cpu_tree_on_device_predictions() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let f = fixture(&STARTS_100K, 100_003, 7);
     for blocks in [2usize, 5, 8] {
         let b = book_blocks(&f, 1, blocks, 1.0);
@@ -411,6 +419,7 @@ fn device_block_totals_equal_the_cpu_tree_on_device_predictions() {
 
 #[test]
 fn block_trade_floor_and_flat_programs_have_exact_values() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let f = fixture(&STARTS_SMALL, 16_401, 3);
     let trees = vec![constant(-1.0), constant(0.0), input(0), node(Op::Ln, vec![input(0)])];
     let open = book_blocks(&f, 0, 4, 1.0);
@@ -531,6 +540,7 @@ fn assert_device_scored(out: &search::Outcome) {
 
 #[test]
 fn pipelined_search_archives_device_long_pnl_scores() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let (sample, b) = search_fixture();
     let seen: Archived = Arc::default();
     let cfg = config(&b, &seen);
@@ -550,6 +560,7 @@ fn pipelined_search_archives_device_long_pnl_scores() {
 
 #[test]
 fn pipelined_device_fit_archives_device_long_pnl_scores() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let (sample, b) = search_fixture();
     let seen: Archived = Arc::default();
     let cfg = Config {
@@ -571,6 +582,7 @@ fn pipelined_device_fit_archives_device_long_pnl_scores() {
 /// the squared LM, rescore the fitted trees.
 #[test]
 fn synchronous_device_fit_archives_device_long_pnl_scores() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let (sample, b) = search_fixture();
     let seen: Archived = Arc::default();
     let cfg = Config {
@@ -591,6 +603,7 @@ fn synchronous_device_fit_archives_device_long_pnl_scores() {
 
 #[test]
 fn a_refused_book_allocation_falls_back_to_the_cpu_scorer() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let (sample, b) = search_fixture();
     let seen: Archived = Arc::default();
     let cols: Vec<f32> = (0..2)
@@ -630,6 +643,7 @@ fn a_refused_book_allocation_falls_back_to_the_cpu_scorer() {
 
 #[test]
 fn tiled_residency_names_its_refusal() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     assert_eq!(
         rcsr::gpu::LONG_PNL_TILED,
         "long_pnl fitness needs resident training rows (tiled residency: #293)"
@@ -648,6 +662,7 @@ fn tiled_residency_names_its_refusal() {
 
 #[test]
 fn blocked_pipelined_search_archives_device_scores() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let (sample, b) = search_fixture_blocks(3);
     assert_eq!(b.blocks(), 3);
     let seen: Archived = Arc::default();
@@ -667,6 +682,7 @@ fn blocked_pipelined_search_archives_device_scores() {
 
 #[test]
 fn blocked_synchronous_device_fit_archives_device_scores() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let (sample, b) = search_fixture_blocks(4);
     let seen: Archived = Arc::default();
     let cfg = Config {
@@ -689,6 +705,7 @@ fn blocked_synchronous_device_fit_archives_device_scores() {
 #[test]
 #[ignore]
 fn long_pnl_block_throughput_against_one_block() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let n = 1_000_000usize;
     let starts: Vec<usize> = (0..100).map(|g| g * 10_000).collect();
     let f = fixture(&starts, n, 29);
@@ -737,6 +754,7 @@ fn long_pnl_block_throughput_against_one_block() {
 #[test]
 #[ignore]
 fn long_pnl_throughput_against_squared() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let n = 1_000_000usize;
     let starts: Vec<usize> = (0..100).map(|g| g * 10_000).collect();
     let f = fixture(&starts, n, 29);
@@ -840,6 +858,7 @@ fn cli(data: &str, spec: &str, backend: &[&str]) -> rcsr::devlog::Json {
 
 #[test]
 fn cli_names_the_device_scorer_and_reports_exact_values() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
         eprintln!("skipping GPU test: no usable CUDA device");
         return;
@@ -863,13 +882,14 @@ fn cli_names_the_device_scorer_and_reports_exact_values() {
 
 // ---- #604: an explicit --gpu never completes on the CPU ----
 
-static FAULTS: Mutex<()> = Mutex::new(());
+/// Tests that run a device search hold the read side; a test that arms a fault holds the write side.
+static FAULTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
-struct Faults(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+struct Faults(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
 
 impl Faults {
     fn arm(sites: &str) -> Self {
-        let guard = FAULTS.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = FAULTS.write().unwrap_or_else(|e| e.into_inner());
         rcsr::gpu::set_injected_faults_for_tests(sites);
         Faults(guard)
     }

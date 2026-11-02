@@ -47,6 +47,15 @@ fn gpu_required_exit(err: &str) -> Option<i32> {
     Some(if reason.starts_with("device_memory") { EXIT_USAGE } else { EXIT_DEVICE })
 }
 
+/// #619: one more search of the invocation (fold, null control, benchmark repeat); a
+/// device failure under an explicit `--gpu` exits with its code instead of panicking.
+fn run_or_exit(cfg: &search::Config, train: &data::Sample, test: &data::Sample) -> search::Outcome {
+    search::run_seeded_checked(cfg, train, test, &[]).unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(gpu_required_exit(&e).unwrap_or(EXIT_INPUT));
+    })
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Format {
     Text,
@@ -673,7 +682,8 @@ SEARCH:
                              (diagnostics only)
   --fit-rows <N>             fit constants on a deterministic N-row subsample
                              and score/archive on all training rows (default 0
-                             = off; N >= train rows is an exact full fit). The
+                             = off, else >= 2; anything else exits 2; N >= train
+                             rows is an exact full fit). The
                              archive and every reported error are refit on all
                              rows. With the GPU evaluator and --fit-strategy gpu
                              the subsample is fixed for the run and lives on the
@@ -907,11 +917,11 @@ SEARCH:
                              synchronous). Results and archive are identical;
                              only effective with --gpu
                              Programs with no device opcode (constraints,
-                             aggregates, blocks the lowerer cannot rewrite) are
+                             aggregates, custom blocks) are
                              scored by a bounded CPU worker pool, never on the
                              scoring thread; RCSR_CPU_FALLBACK_THREADS sets its
                              size (default min(cores, 8)). --json reports each
-                             generation's native/lowered/unsupported counts and
+                             generation's native/unsupported counts and
                              fallback seconds
   --variation auto|node|postfix
                              variation engine. auto (default) uses the flat
@@ -1373,12 +1383,11 @@ fn gpu_json(
         .iter()
         .map(|s| {
             format!(
-                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_admitted_wide\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_improved\":{},\"fit_fallback_improved_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"nonfinite\":{},\"nonfinite_full\":{},\"nonfinite_cpu_finite\":{},\"nonfinite_seconds\":{},\"opcodes\":{{{}}}}}",
+                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_admitted_wide\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_improved\":{},\"fit_fallback_improved_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"nonfinite\":{},\"nonfinite_full\":{},\"nonfinite_cpu_finite\":{},\"nonfinite_seconds\":{},\"opcodes\":{{{}}}}}",
                 s.generation,
                 s.programs,
                 s.native,
-                s.native + s.lowered,
-                s.lowered,
+                s.native,
                 s.fallbacks,
                 s.unsupported_programs,
                 jnum(s.fallback_seconds),
@@ -1404,12 +1413,11 @@ fn gpu_json(
         .collect();
     // #121: `gpu.totals` aggregates the per-generation counters over the run.
     let mut total_ops = std::collections::BTreeMap::new();
-    let (mut t_programs, mut t_native, mut t_lowered, mut t_fallbacks) = (0usize, 0usize, 0usize, 0usize);
+    let (mut t_programs, mut t_native, mut t_fallbacks) = (0usize, 0usize, 0usize);
     let (mut t_unsupported, mut t_seconds, mut t_workers) = (0usize, 0.0f64, 0usize);
     for s in &g.generations {
         t_programs += s.programs;
         t_native += s.native;
-        t_lowered += s.lowered;
         t_fallbacks += s.fallbacks;
         t_unsupported += s.unsupported_programs;
         t_seconds += s.fallback_seconds;
@@ -1419,11 +1427,10 @@ fn gpu_json(
         }
     }
     let totals = format!(
-        "{{\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"opcodes\":{{{}}}}}",
+        "{{\"programs\":{},\"native\":{},\"supported\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"opcodes\":{{{}}}}}",
         t_programs,
         t_native,
-        t_native + t_lowered,
-        t_lowered,
+        t_native,
         t_fallbacks,
         t_unsupported,
         jnum(t_seconds),
@@ -1433,7 +1440,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{},\"calls\":{},\"candidates\":{},\"call_s_max\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1465,7 +1472,10 @@ fn gpu_json(
         match g.fit_subsample_hash {
             Some(h) => format!("\"{:016x}\"", h),
             None => "null".to_string(),
-        }
+        },
+        g.fit_calls,
+        g.fit_call_candidates,
+        jnum(g.fit_call_ms_max / 1000.0)
     );
     let run_wall = if g.ledger.wall_s() > 0.0 {
         g.ledger.wall_s()
@@ -1956,6 +1966,9 @@ impl DevSink {
             prune_s: outcome.prune.seconds,
             fit_refit_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_s()),
             fit_refits: outcome.gpu.as_ref().map(|g| g.fit_refits),
+            fit_calls: outcome.gpu.as_ref().map(|g| g.fit_calls),
+            fit_candidates: outcome.gpu.as_ref().map(|g| g.fit_call_candidates),
+            fit_call_s_max: outcome.gpu.as_ref().map(|g| g.fit_call_ms_max / 1000.0),
             irls_reweighted: fit::fit_arm_counts_full().irls_reweighted,
             events,
             bytes,
@@ -2880,12 +2893,14 @@ fn main() {
             "--fit-report" => cfg.fit_report = true,
             // #116: fit on a deterministic subsample, score and archive on all rows.
             "--fit-rows" => {
-                let n: usize = val!().parse().unwrap_or(0);
-                if n == 1 {
-                    eprintln!("error: --fit-rows needs 0 (off) or an integer >= 2");
-                    std::process::exit(EXIT_USAGE);
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n != 1 => cfg.fit_rows = n,
+                    _ => {
+                        eprintln!("error: --fit-rows needs 0 (off) or an integer >= 2, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
                 }
-                cfg.fit_rows = if n >= 2 { n } else { 0 };
                 fit_rows_set = true;
             }
             // #255: hard bound on one generation's exact CPU fallback refits.
@@ -6596,9 +6611,7 @@ fn main() {
     let best_resid = rows
         .iter()
         .min_by(|a, b| {
-            a.train_error
-                .partial_cmp(&b.train_error)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            rcsr::error_order::cmp_error(a.train_error, b.train_error)
         })
         .map(|r| r.resid_tests);
 
@@ -6671,7 +6684,11 @@ fn main() {
     // variable is selected. A form that wins most resamples is what the data
     // supports; one that wins once is a coincidence.
     let stab: Option<stability::Stability> = if stability_runs > 0 {
-        let st = stability::run(&cfg, &prepared.train, &prepared.test, stability_runs, &vars);
+        let st = stability::run_checked(&cfg, &prepared.train, &prepared.test, stability_runs, &vars)
+            .unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                std::process::exit(gpu_required_exit(&e).unwrap_or(EXIT_INPUT));
+            });
         for r in rows.iter_mut() {
             r.stability = Some(st.frequency(&r.shape));
         }
@@ -6704,14 +6721,14 @@ fn main() {
         };
         let mut fold_rows = Vec::new();
         for f in &folds {
-            let out = search::run(&cfg, &f.train, &f.test);
+            let out = run_or_exit(&cfg, &f.train, &f.test);
             // Pick by the engine's own criterion (lowest training error), then
             // score on rows that fold's search never saw.
             let best = out
                 .archive
                 .sorted()
                 .into_iter()
-                .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal));
+                .min_by(|a, b| rcsr::error_order::cmp_error(a.error, b.error));
             if let Some(s) = best {
                 let test_error = search::eval_error(&s.tree, &f.test, cfg.metric);
                 let train_error = search::eval_error(&s.tree, &f.train, cfg.metric);
@@ -6772,7 +6789,7 @@ fn main() {
                 ys: Vec::new(),
                 pairs: None,
             };
-            let out = search::run(&cfg, &shuffled, &shuffled);
+            let out = run_or_exit(&cfg, &shuffled, &shuffled);
             let b = out
                 .archive
                 .items
@@ -6845,9 +6862,7 @@ fn main() {
                 full_rows.first()
             } else {
                 full_rows.iter().min_by(|a, b| {
-                    a.train_error
-                        .partial_cmp(&b.train_error)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    rcsr::error_order::cmp_error(a.train_error, b.train_error)
                 })
             };
             let sorted = outcome.archive.sorted();
@@ -6990,9 +7005,7 @@ fn main() {
                 rows.first()
             } else {
                 rows.iter().min_by(|a, b| {
-                    a.train_error
-                        .partial_cmp(&b.train_error)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    rcsr::error_order::cmp_error(a.train_error, b.train_error)
                 })
             };
             if let Some(r) = selected_row {
@@ -8196,9 +8209,7 @@ fn run_multi_output(
                 }
             }
             if let Some(r) = rows.iter().min_by(|a, b| {
-                a.train_error
-                    .partial_cmp(&b.train_error)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                rcsr::error_order::cmp_error(a.train_error, b.train_error)
             }) {
                 eprintln!("# diagnostics: n={} k={} constants (total across outputs)", prepared.train.len(), r.k_constants);
             }
@@ -8660,9 +8671,7 @@ fn summary_markdown(
         rows.first()
     } else {
         rows.iter().min_by(|a, b| {
-            a.train_error
-                .partial_cmp(&b.train_error)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            rcsr::error_order::cmp_error(a.train_error, b.train_error)
         })
     };
 
@@ -9531,7 +9540,7 @@ fn benchmark_markdown(
             .seed
             .wrapping_add(0x9E37_79B9u32.wrapping_mul(r as u32));
         let start = std::time::Instant::now();
-        let outcome = search::run(&extra, &prepared.train, &prepared.test);
+        let outcome = run_or_exit(&extra, &prepared.train, &prepared.test);
         let seconds = start.elapsed().as_secs_f64();
         if !quiet {
             eprintln!(

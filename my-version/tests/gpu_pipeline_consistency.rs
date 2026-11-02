@@ -241,6 +241,142 @@ fn qd_immigrants_store_the_error_of_the_stored_tree() {
     assert!(failures.is_empty(), "stored errors of a different tree: {failures:?}");
 }
 
+/// #578: what the pipeline depth must not change.
+#[cfg(feature = "cuda")]
+struct Trace {
+    archive: Vec<(u64, usize, u64)>,
+    /// Every island individual of every generation snapshot.
+    islands: Vec<Vec<(Node, f64)>>,
+    stats: search::GpuRunStats,
+}
+
+#[cfg(feature = "cuda")]
+fn trace(cfg: &Config, train: &Sample, test: &Sample) -> Trace {
+    let mut islands: Vec<Vec<(Node, f64)>> = Vec::new();
+    let out = search::run_resumable(cfg, train, test, None, 1, |cp: &Checkpoint| {
+        islands.push(
+            cp.islands
+                .iter()
+                .flat_map(|isl| isl.population.iter().map(|ind| (ind.tree.clone(), ind.error)))
+                .collect(),
+        );
+    })
+    .expect("search runs");
+    Trace {
+        archive: out
+            .archive
+            .items
+            .iter()
+            .map(|s| (rcsr::expr::structural_hash(&s.tree), s.complexity, s.error.to_bits()))
+            .collect(),
+        islands,
+        stats: out.gpu.expect("device run"),
+    }
+}
+
+/// Same stored trees with their constants bit for bit; with `exact` also the
+/// same error bits, otherwise the same error up to `f32` scoring noise (a
+/// program longer than the genome slot is scored on the CPU by the synchronous
+/// path and on the device by the overlap path).
+#[cfg(feature = "cuda")]
+fn assert_same_trajectory(label: &str, a: &Trace, b: &Trace, exact: bool) {
+    assert_eq!(a.islands.len(), b.islands.len(), "{label}: snapshot count");
+    let names = ["x0".to_string(), "x1".to_string()];
+    for (g, (x, y)) in a.islands.iter().zip(&b.islands).enumerate() {
+        assert_eq!(x.len(), y.len(), "{label}: snapshot {g} size");
+        let diff: Vec<String> = x
+            .iter()
+            .zip(y)
+            .enumerate()
+            .filter(|(_, (p, q))| {
+                p.0 != q.0 || if exact { p.1.to_bits() != q.1.to_bits() } else { !agrees(p.1, q.1) }
+            })
+            .map(|(k, (p, q))| {
+                format!(
+                    "[{k}] {:e} {} | {:e} {}",
+                    p.1,
+                    rcsr::expr::to_string(&p.0, &names),
+                    q.1,
+                    rcsr::expr::to_string(&q.0, &names)
+                )
+            })
+            .collect();
+        assert!(diff.is_empty(), "{label}: snapshot {g} differs: {diff:#?}");
+    }
+    if exact {
+        assert_eq!(a.archive, b.archive, "{label}: archive differs");
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn pipeline_fit_fallback_max_matches_sync() {
+    if !device_available() {
+        return;
+    }
+    const CAP: usize = 1;
+    let train = sample(4_096, 3);
+    let test = sample(256, 4);
+    let mut runs = Vec::new();
+    for depth in [0usize, 2] {
+        let cfg = Config {
+            fit_fallback_max: CAP,
+            ..config(depth, 7)
+        };
+        let t = trace(&cfg, &train, &test);
+        for g in &t.stats.generations {
+            assert!(
+                g.fit_fallback - g.fit_fallback_bounded <= CAP,
+                "depth {depth} generation {}: {} fallbacks, {} bounded",
+                g.generation,
+                g.fit_fallback,
+                g.fit_fallback_bounded
+            );
+        }
+        runs.push(t);
+    }
+    let bounded = |t: &Trace| -> Vec<(usize, usize, usize)> {
+        t.stats
+            .generations
+            .iter()
+            .map(|g| (g.generation, g.fit_fallback, g.fit_fallback_bounded))
+            .collect()
+    };
+    assert!(
+        bounded(&runs[0]).iter().any(|&(_, _, b)| b > 0),
+        "the cap never bound, the case is not exercised"
+    );
+    assert_eq!(bounded(&runs[0]), bounded(&runs[1]), "per-generation fallback and bound counts");
+    assert_same_trajectory("fit-fallback-max, depth 0 vs 2", &runs[0], &runs[1], false);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn pipeline_does_not_launch_dimension_rejected() {
+    if !device_available() {
+        return;
+    }
+    let train = sample(4_096, 3);
+    let test = sample(256, 4);
+    let metre = Unit::parse("m").expect("unit");
+    let second = Unit::parse("s").expect("unit");
+    let units = Units::new(vec![metre.clone(), second], metre);
+    let mut runs = Vec::new();
+    for depth in [0usize, 2] {
+        let cfg = Config {
+            units: Some(units.clone()),
+            require_dimensions: true,
+            ..config(depth, 7)
+        };
+        runs.push(trace(&cfg, &train, &test));
+    }
+    assert_eq!(
+        runs[0].stats.fit_attempts, runs[1].stats.fit_attempts,
+        "the pipeline fitted candidates the synchronous path never admits"
+    );
+    assert_same_trajectory("require-dimensions, depth 0 vs 2", &runs[0], &runs[1], true);
+}
+
 /// #600: the overlap drain books its device fit as fit, in the interval union
 /// and the fit stage, exactly as the synchronous path does.
 #[cfg(feature = "cuda")]
@@ -294,4 +430,44 @@ fn pipeline_books_fit_interval() {
             "depth {depth}: per-generation fallback {per_gen} vs run {run}"
         );
     }
+}
+
+/// #601: the overlap fit queue groups candidates into device calls of at least
+/// `FIT_BATCH_MIN`. A candidate's constants depend on its own plan only, so the
+/// archive and the fit counters equal the synchronous run's, with far fewer
+/// fit calls than scoring batches.
+#[cfg(feature = "cuda")]
+#[test]
+fn pipeline_fit_constants_match_sync() {
+    if !device_available() {
+        return;
+    }
+    let train = sample(4_096, 5);
+    let test = sample(256, 6);
+    let run = |depth: usize| {
+        let mut cfg = config(depth, 11);
+        cfg.ops.retain(|&op| op != Op::Asinh);
+        cfg.pop = 256;
+        cfg.generations = 3;
+        search::run(&cfg, &train, &test)
+    };
+    let sync = run(0);
+    let overlap = run(4);
+    let key = |o: &search::Outcome| {
+        o.archive
+            .items
+            .iter()
+            .map(|s| format!("{:?}|{:e}", s.tree, s.error))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(key(&sync), key(&overlap), "archive differs between depth 0 and 4");
+    let (gs, go) = (sync.gpu.expect("sync gpu"), overlap.gpu.expect("overlap gpu"));
+    assert!(gs.fit_calls > 0 && go.fit_calls > 0);
+    assert_eq!(gs.fit_call_candidates, go.fit_call_candidates);
+    let gens = 3 + 1;
+    assert!(
+        go.fit_calls <= 2 * gens,
+        "overlap fit calls {} for {gens} generations",
+        go.fit_calls
+    );
 }

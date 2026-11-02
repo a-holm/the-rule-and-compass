@@ -225,6 +225,17 @@ impl Stability {
 /// result is a deterministic function of `cfg.seed`. Progress callbacks are
 /// cleared on the sub-searches so a stability run never pollutes a stream.
 pub fn run(cfg: &Config, train: &Sample, test: &Sample, runs: usize, vars: &[String]) -> Stability {
+    run_checked(cfg, train, test, runs, vars).unwrap_or_else(|e| panic!("search failed: {}", e))
+}
+
+/// #619: [`run`] returning a sub-search error (a device failure under an explicit `--gpu`).
+pub fn run_checked(
+    cfg: &Config,
+    train: &Sample,
+    test: &Sample,
+    runs: usize,
+    vars: &[String],
+) -> Result<Stability, String> {
     // #92: decide the resample size once; report it so a capped run is visible.
     let plan = crate::resample::plan(train.len());
     let mut rng = Mt::new(cfg.seed ^ 0x5741_4c49);
@@ -240,7 +251,7 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample, runs: usize, vars: &[Str
         let mut sub = cfg.clone();
         sub.seed = cfg.seed.wrapping_add(1).wrapping_add((b as u32).wrapping_mul(0x9E37_79B9));
         sub.progress = None;
-        let out = search::run(&sub, &rs, test);
+        let out = search::run_seeded_checked(&sub, &rs, test, &[])?;
         effective += 1;
         let front = out.archive.sorted();
         // `test_errors` is aligned with `front` (search::Outcome contract).
@@ -284,7 +295,7 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample, runs: usize, vars: &[Str
     }
     let mut vs: Vec<(usize, usize)> = var_counts.into_iter().enumerate().collect();
     vs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    Stability {
+    Ok(Stability {
         runs: effective,
         found,
         source_rows: plan.source_rows,
@@ -292,7 +303,7 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample, runs: usize, vars: &[Str
         capped: plan.capped,
         forms: counts,
         variables: vs,
-    }
+    })
 }
 
 #[cfg(test)]

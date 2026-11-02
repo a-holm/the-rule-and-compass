@@ -247,10 +247,10 @@ floored `a - b*floor(a/b)` with the `|b|<1e-12` and finite-quotient guards;
 match the host.
 
 Every tree reaches the device through `gpu::compile_program`, the one guarded
-entry point: it applies the #121 `lower()` rewrites, rejects a postfix program
+entry point: it rejects a postfix program
 that would need more than 56 operand-stack slots, and returns the opcodes that
 were actually emitted. `Population::add` (pipeline path) and the fixed-slot
-batch (synchronous path) both use it, so they agree on `asinh`/`acosh`/`atanh`
+batch (synchronous path) both use it, so they agree on the native operators
 and on the stack limit.
 
 **Exactness limits of the native opcodes (f32).** `floor`, `ceil`, `round`,
@@ -272,6 +272,7 @@ behaviour instead of a ULP bound. Below `2^25` (which covers the `8 388 608 /
 0.7` case) the correction makes `mod` match the f64 reference to 1 ULP. `mod`
 returns NaN for a non-finite operand, `|b| < 1e-12` or a non-finite f32
 quotient, as the host does, and `atan2` returns NaN if either operand is NaN.
+`asinh`, `acosh` and `atanh` use `asinhf`, `acoshf` and `atanhf` (asserted to 4 ULP by `hyperbolic_inverses_are_native`) with the CPU domain guards: `acosh` is NaN below 1 and `atanh` is NaN at `|x| >= 1`. Their constants are not fitted on the device (no fit opcode, `unsupported_plan` CPU fallback).
 Discontinuous
 operators (`floor`, `ceil`, `round`, `mod`, `sign`, comparisons, `if`) can jump
 by O(1) on a 1-ULP input change, so they are never approximated in the tree and
@@ -338,7 +339,7 @@ path. No kernel's stack frame increased. A CUDA-guided run reports the opcode
 and fallback counts for each generation under `gpu.generations` in `--json`,
 aggregated from the emitted programs of both the pipeline batches and the
 synchronous fallback batch; a CPU run's JSON is unchanged. Operators without an
-opcode (`asinh`, `acosh`, `atanh`, constraints, aggregates) still take the CPU
+opcode (constraints, aggregates) still take the CPU
 fallback, and the final f64 CPU rescore remains the exactness guarantee for
 reported results.
 
@@ -351,16 +352,15 @@ with their absolute candidate index and are merged in candidate order, so the
 fitness bits and the archive are identical to the serial walk for any worker
 count (`search::tests::cpu_fallback_is_identical_for_one_and_many_threads`, and
 the mixed supported/unsupported integration test). `gpu.generations[]` reports
-`programs`, `native`, `lowered`, `fallbacks`/`unsupported_programs`,
+`programs`, `native`, `fallbacks`/`unsupported_programs`,
 `fallback_seconds` and `fallback_workers`; `gpu.totals` aggregates the run.
 
-**Static and device stack guards (#121).** The lowering pass can expand a tree,
-so the host computes the postfix peak stack after lowering and rejects anything
+**Static and device stack guards (#121).** The host computes the postfix peak stack and rejects anything
 above 56 slots before a word is emitted; that tree goes to the CPU pool. The
 device is still guarded independently: every push checks `RC_MAX_STACK` (64) and
 every operator checks its operand depth, returning NaN (a hard failure) instead
 of writing past the local stack if a malformed or future program ever slips
-through. `gpu::deep_lowered_tree_is_rejected_before_emission` and
+through. `gpu::deep_tree_is_rejected_before_emission` and
 `gpu::device_stack_guard_rejects_an_over_deep_program` pin both halves.
 
 **FP32 throughout.** On the RTX 3060 (Ampere) and on the GB10 in the DGX Spark,
@@ -1488,7 +1488,11 @@ for the metric-specific gated arms (`log_loss`, rank, median, interquartile,
 maximum), the synchronous generation batch is still used. Selection and the
 archive still wait at the generation barrier, so all errors, the archive hash
 and the exact CPU finalist are unchanged; `--pipeline-depth 0` remains the
-synchronous schedule.
+synchronous schedule. The exact CPU fallback refits of a generation run at the
+barrier in the synchronous admission order, so `--fit-fallback-max` bounds them
+the same way on both paths, and a fallback after a non-usable device status
+starts from the finite device constants. A candidate rejected by
+`--require-dimensions` is not offered to the queue.
 
 **Zero diagonal (#399).** `ft_solve` freezes a slot whose normal-equation diagonal is exactly `0.0` on every arm. A constant with a zero adjoint on all active rows cannot move the prediction, so its row and column become the identity, its right-hand side is `0` and its step is `0`. The other constants are still fitted, as the CPU ridge solve (`fit.rs::solve`, ridge `1e-12`) does. A negative or non-finite diagonal is still status `1`. `tests/gpu_fit.rs::zero_adjoint_constant_is_frozen_and_the_rest_are_fitted` pins it.
 
@@ -2401,6 +2405,7 @@ Definitions that matter:
   present even when their stage did not run, so a reader never has to infer a
   missing key.
 * **overlap drain** (#600). With `--pipeline-depth > 0` the main thread scores and fits the queued batches inside the island-scope window. The time of those calls is booked as `eval` (device scoring, rescore) and `fit` (device fit, exact CPU fallback), capped by the window and eval first; the rest of the window stays `vary`. The split is measured per call but the window is an apportionment, because the drain runs concurrently with island work. `ledger.drain_wall_s` is the booked drain total. The drain records its fit kernel as one `fit` device interval, so `device_busy_s` includes it exactly as at `--pipeline-depth 0`. Tests: `pipeline_books_fit_interval` (`tests/gpu_pipeline_consistency.rs`), `pipeline_drain_not_vary` and `ledger_closure_with_overlap` (`src/gpu_stats.rs`).
+* **overlap fit calls** (#601). A fit block owns one candidate for a whole pass over the rows, so a device fit call takes about as long as its slowest block until it holds more blocks than the device runs at once. The overlap drain therefore queues candidates with constants and launches one fit call when 128 are planned (`FIT_BATCH_MIN`) and once more when the generation's queue closes; scoring batches keep their size. `gpu.fit.calls`, `gpu.fit.candidates` and `gpu.fit.call_s_max` count the launches, the candidates they carried and the longest launch, and `run_end` carries `fit_calls`, `fit_candidates` and `fit_call_s_max`. Test: `pipeline_fit_constants_match_sync` (`tests/gpu_pipeline_consistency.rs`).
 * **quality/GPU-hour** is decades of error reduction against the constant-mean
   baseline per measured run-wall GPU-hour:
   `-log10(best / baseline) / hours`. The two errors **must be the same unit and
