@@ -1571,6 +1571,10 @@ pub struct SplitSpec {
     /// #254: label end offset of the declared target, seconds. Training rows
     /// within this many seconds of a validation or test row are dropped.
     pub purge_seconds: Option<f64>,
+    /// Seconds before a declared locked test whose rows are refused, when no
+    /// single target spec sets `purge_seconds` (several targets: the largest
+    /// required purge of the targets that have a spec entry).
+    pub boundary_purge_seconds: Option<f64>,
     /// #254: the target spec's scale column. Its raw values for the prepared
     /// rows are returned in [`Prepared::target_scale`].
     pub scale_column: Option<String>,
@@ -1607,6 +1611,7 @@ impl Default for SplitSpec {
             allow_lockbox: false,
             declared_lockbox: None,
             purge_seconds: None,
+            boundary_purge_seconds: None,
             scale_column: None,
             trading: None,
             canonical_train_order: false,
@@ -1678,6 +1683,10 @@ pub struct SplitReport {
     /// without a declared range.
     pub boundary_purge_seconds: f64,
     pub boundary_purge_source: &'static str,
+    /// Seconds after the declared range end whose rows are refused, and where
+    /// the value came from (`store`, `flag` or `protocol_default`).
+    pub lockbox_embargo_seconds: i64,
+    pub lockbox_embargo_source: &'static str,
 }
 
 pub struct Prepared {
@@ -2831,7 +2840,10 @@ pub fn lockbox_stamps(t: &Table, spec: &SplitSpec) -> Result<Option<(usize, Vec<
 /// Seconds before a declared locked test whose rows are refused: the target
 /// spec's required purge, else the protocol default.
 fn boundary_purge(spec: &SplitSpec) -> i64 {
-    spec.purge_seconds.unwrap_or(crate::protocol::DEFAULT_PURGE_SECONDS).ceil() as i64
+    spec.purge_seconds
+        .or(spec.boundary_purge_seconds)
+        .unwrap_or(crate::protocol::DEFAULT_PURGE_SECONDS)
+        .ceil() as i64
 }
 
 /// Cross-validation guard: every kept row is a potential training or test row
@@ -4395,8 +4407,10 @@ fn check_split_lockbox(
     report.lockbox_test = guard.check_times("test split", &test_times)?;
     if let Some(d) = &spec.declared_lockbox {
         let boundary_purge = boundary_purge(spec);
-        report.boundary_purge_source = if spec.purge_seconds.is_some() { "target_spec" } else { "protocol_default" };
+        report.boundary_purge_source = if spec.purge_seconds.or(spec.boundary_purge_seconds).is_some() { "target_spec" } else { "protocol_default" };
         report.boundary_purge_seconds = boundary_purge as f64;
+        report.lockbox_embargo_seconds = d.embargo.seconds;
+        report.lockbox_embargo_source = d.embargo.source.as_str();
         let name = t.names.get(tc).map(String::as_str).unwrap_or("time");
         d.check_times("training split", name, &train_times, boundary_purge)?;
         d.check_times("validation split", name, &validation_times, boundary_purge)?;

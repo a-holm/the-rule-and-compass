@@ -79,6 +79,8 @@ fn the_plan_writes_one_manifest_per_arm_and_every_command() {
         time: "ts",
         group: Some("symbol"),
         return_col: Some("fwd60"),
+        spec_columns: &[],
+        target_spec: None,
         windows: "protocol/windows.csv",
         scheme: "expanding",
         out_dir: "out",
@@ -116,6 +118,8 @@ fn the_plan_writes_one_manifest_per_arm_and_every_command() {
         time: "ts",
         group: None,
         return_col: None,
+        spec_columns: &[],
+        target_spec: None,
         windows: "w.csv",
         scheme: "expanding",
         out_dir: "out",
@@ -226,7 +230,7 @@ fn prepare_writes_placebo_and_permuted_columns_next_to_the_real_ones() {
         }
     }
     let table = data::parse_table(&csv).unwrap();
-    let out = ablation::prepare_csv(&ablation::PrepareInput { table: &table, def: &d, time: "ts", group: "sym", keep: &["y".to_string()], seed: 3, locked: Vec::new(), purge_seconds: 0 }).unwrap();
+    let out = ablation::prepare_csv(&ablation::PrepareInput { table: &table, def: &d, time: "ts", group: "sym", keep: &["y".to_string()], seed: 3, locked: Vec::new(), purge_seconds: 0, embargo_seconds: 0 }).unwrap();
     let prepared = data::parse_table(&out).unwrap();
     assert_eq!(prepared.names, vec!["ts", "sym", "y", "b", "f1", "f2", "p1", "placebo_1", "placebo_2", "perm_f1", "perm_f2"]);
     assert_eq!(prepared.len(), 600);
@@ -273,6 +277,7 @@ fn prepare_segments(csv: &str, locked: &[rcsr::lockbox::Lockbox], purge_seconds:
         seed: 3,
         locked: locked.to_vec(),
         purge_seconds,
+        embargo_seconds: 0,
     })
     .unwrap();
     (out.lines().map(|l| l.to_string()).collect(), seg)
@@ -472,7 +477,7 @@ fn a_flag_range_disjoint_from_the_protocol_default_is_segmented() {
         let run = prepare_cli(&dir, src.to_str().unwrap(), out.to_str().unwrap(), &["--lockbox", &flag]);
         assert_eq!(run.status.code(), Some(0), "{}", String::from_utf8_lossy(&run.stderr));
     }
-    assert_eq!(sidecar_rows(oa.to_str().unwrap()), [7174, 122, 1440, 1824, 0, 0, 0]);
+    assert_eq!(sidecar_rows(oa.to_str().unwrap()), [7174, 122, 1440, 1824, 0, 0, 0, 0, 0]);
     let side = std::fs::read_to_string(rcsr::lockbox::sidecar_path(oa.to_str().unwrap())).unwrap();
     assert!(side.contains("\"purge_seconds\":219600,\"purge_source\":\"protocol_default\""), "{}", side);
     let (ta, tb) = (std::fs::read_to_string(&oa).unwrap(), std::fs::read_to_string(&ob).unwrap());
@@ -763,7 +768,7 @@ fn score_run_reads_the_expression_and_its_inputs() {
         window: Window { label: "w".into(), train_start: T0, train_end: T0 + 200.0 * 3600.0, test_start: T0 + 205.0 * 3600.0, test_end: T0 + 300.0 * 3600.0 },
         validation_start: T0 + 120.0 * 3600.0,
     }];
-    let folds: Vec<Fold> = ladder::make_folds(&panel, &rows, 3600.0, None).unwrap();
+    let folds: Vec<Fold> = ladder::make_folds(&panel, &rows, 3600.0, &[], 0.0).unwrap();
     let facts = ablation::RunFacts {
         arm: "A1".into(),
         feature_list_sha256: ablation::feature_list_sha256(&["s".into(), "n".into()]),
@@ -1096,7 +1101,7 @@ fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
     assert_eq!(prep.status.code(), Some(0), "{}", String::from_utf8_lossy(&prep.stderr));
     assert_eq!(lockbox::stored(prepared.to_str().unwrap()).unwrap().map(|(_, l)| l), Some(lb));
     let side = std::fs::read_to_string(lockbox::sidecar_path(prepared.to_str().unwrap())).unwrap();
-    assert_eq!(sidecar_rows(prepared.to_str().unwrap()), [112, 488, 200, 0], "{}", side);
+    assert_eq!(sidecar_rows(prepared.to_str().unwrap()), [112, 488, 200, 0, 0], "{}", side);
     assert!(side.contains("\"purge_source\":\"protocol_default\""), "{}", side);
     let found = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args([
@@ -1204,4 +1209,98 @@ fn stale_sidecar_is_refused() {
     // the original bytes are accepted again
     std::fs::write(&data, &original).unwrap();
     assert!(lockbox::resolve(None, &data).is_ok());
+}
+
+const PLAN_DEF: &str = r#"{"schema":"rcsr-ablation/1","b0":["b"],"groups":{"fam":["f1"],"pat":["p1"]},
+"placebo_template_group":"pat","generation_budget":6,
+"arms":[{"name":"A0","add":[]},{"name":"A1","add":["fam","pat"],"placebo":1},{"name":"A5","add":[],"permute":["fam"]}],
+"rule":{"families":[{"name":"fam","treatment":"A1","controls":["A0"],"null_arm":"A5","null_control":"A0"}]}}"#;
+
+fn plan_store(dir: &std::path::Path) -> String {
+    let n = 400usize;
+    let frac = |v: f64| v - v.floor();
+    let mut text = String::from("ts,sym,b,f1,p1,lbl_y,lbl_fwd,vol96\n");
+    for i in 0..n {
+        let f = i as f64;
+        let b = frac(f * 0.618_033_988_749_894_9) - 0.5;
+        let f1 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+        let r = 0.01 * b + 0.0005 * (frac(f * 0.324_717_957_244_746) - 0.5);
+        text.push_str(&format!("{},a,{},{},{},{},{},1\n", (T0 as i64) + 900 * i as i64, b, f1, (i % 5 == 0) as i32, r, r));
+    }
+    let path = dir.join("panel.csv");
+    std::fs::write(&path, text).unwrap();
+    let spec = std::fs::read_to_string(write_target_spec(dir)).unwrap();
+    let spec = spec
+        .replace("\"column\":\"y\"", "\"column\":\"lbl_y\"")
+        .replace("\"return_column\":\"r\"", "\"return_column\":\"lbl_fwd\"")
+        .replace("\"scale\":{\"kind\":\"constant\",\"value\":1.0}", "\"scale\":{\"kind\":\"column\",\"column\":\"vol96\",\"multiplier\":1,\"window_seconds\":900,\"ends_at_offset_seconds\":0}")
+        .replace("\"construction_columns\":[]", "\"construction_columns\":[\"lbl_fwd\",\"vol96\"]");
+    std::fs::write(dir.join("panel.targets.json"), spec).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn plan_cli(dir: &std::path::Path, data: &str, extra: &[&str]) -> String {
+    let def = dir.join("def.json");
+    std::fs::write(&def, PLAN_DEF).unwrap();
+    let iso = |i: i64| protocol::iso(T0 + 900.0 * i as f64);
+    let windows = dir.join("w.csv");
+    std::fs::write(
+        &windows,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,w0,{},{},{},{},{}\n",
+            iso(0),
+            iso(280),
+            iso(200),
+            iso(300),
+            iso(400)
+        ),
+    )
+    .unwrap();
+    let out = dir.join("plan");
+    let o = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(["ablation", "plan", "--definition", def.to_str().unwrap(), "--data", data, "--target", "lbl_y", "--time", "ts", "--group", "sym"])
+        .args(["--windows", windows.to_str().unwrap(), "--out", out.to_str().unwrap()])
+        .args(extra)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    std::fs::read_to_string(out.join("commands.sh")).unwrap()
+}
+
+fn keep_of(script: &str) -> String {
+    let prepare = script.lines().find(|l| l.starts_with("rcsr ablation prepare")).unwrap();
+    let words: Vec<&str> = prepare.split_whitespace().collect();
+    words[words.iter().position(|w| *w == "--keep").unwrap() + 1].to_string()
+}
+
+#[test]
+fn plan_keeps_the_return_and_construction_columns() {
+    let dir = scratch("plan-keep");
+    let data = plan_store(&dir);
+    let script = plan_cli(&dir, &data, &["--return-col", "lbl_fwd"]);
+    assert_eq!(keep_of(&script), "lbl_y,lbl_fwd,vol96");
+    assert!(script.lines().filter(|l| l.contains("--arm A")).all(|l| l.contains("--target-spec")), "{script}");
+
+    let no_spec = scratch("plan-keep-nospec");
+    let data = plan_store(&no_spec);
+    std::fs::remove_file(no_spec.join("panel.targets.json")).unwrap();
+    assert_eq!(keep_of(&plan_cli(&no_spec, &data, &[])), "lbl_y");
+}
+
+#[test]
+fn the_planned_lines_for_one_arm_and_seed_run_as_written() {
+    let dir = scratch("plan-run");
+    let data = plan_store(&dir);
+    let script = plan_cli(&dir, &data, &["--return-col", "lbl_fwd", "--search-args", "--objective pnl --cost-bps 5 --validation-frac 0.3 --split temporal --time ts --cpu --no-dev-log --pop 16 --quiet", "--score-args", "--purge-seconds 900"]);
+    let lines: Vec<&str> = script
+        .lines()
+        .filter(|l| l.starts_with("rcsr ablation prepare") || (l.contains("A0-s1.") && l.starts_with("rcsr")))
+        .collect();
+    assert_eq!(lines.len(), 3, "{script}");
+    for line in lines {
+        let mut words = line.split_whitespace();
+        assert_eq!(words.next(), Some("rcsr"));
+        let o = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(words).output().unwrap();
+        assert_eq!(o.status.code(), Some(0), "{line}\n{}", String::from_utf8_lossy(&o.stderr));
+    }
 }

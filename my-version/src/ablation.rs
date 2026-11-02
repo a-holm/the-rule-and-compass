@@ -496,6 +496,9 @@ pub struct PrepareInput<'a> {
     pub locked: Vec<Lockbox>,
     /// Width of the purge band `[start - purge_seconds, start)` before each range.
     pub purge_seconds: i64,
+    /// Width of the lookback band `[end, end + embargo_seconds)` after each range: its
+    /// rows read locked bars through their features.
+    pub embargo_seconds: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -503,6 +506,7 @@ pub enum SegmentKind {
     Development,
     Purge,
     Locked,
+    Embargo,
 }
 
 impl SegmentKind {
@@ -511,6 +515,7 @@ impl SegmentKind {
             SegmentKind::Development => "development",
             SegmentKind::Purge => "purge",
             SegmentKind::Locked => "locked",
+            SegmentKind::Embargo => "embargo",
         }
     }
 }
@@ -531,21 +536,29 @@ impl SegmentRows {
     }
 }
 
-/// The elementary intervals between the boundaries `{start - purge, start, end}`
+/// The elementary intervals between the boundaries `{start - purge, start, end, end + embargo}`
 /// of every range. Ranges are never merged, so a value never crosses a boundary.
 pub struct Segments {
     bounds: Vec<i64>,
     ranges: Vec<Lockbox>,
     purge: i64,
+    embargo: i64,
 }
 
 impl Segments {
     pub fn new(ranges: &[Lockbox], purge: i64) -> Segments {
-        let purge = purge.max(0);
-        let mut bounds: Vec<i64> = ranges.iter().flat_map(|r| [r.start.saturating_sub(purge), r.start, r.end]).collect();
+        Segments::with_embargo(ranges, purge, 0)
+    }
+
+    pub fn with_embargo(ranges: &[Lockbox], purge: i64, embargo: i64) -> Segments {
+        let (purge, embargo) = (purge.max(0), embargo.max(0));
+        let mut bounds: Vec<i64> = ranges
+            .iter()
+            .flat_map(|r| [r.start.saturating_sub(purge), r.start, r.end, r.end.saturating_add(embargo)])
+            .collect();
         bounds.sort_unstable();
         bounds.dedup();
-        Segments { bounds, ranges: ranges.to_vec(), purge }
+        Segments { bounds, ranges: ranges.to_vec(), purge, embargo }
     }
 
     /// Number of raw segments (one more than the boundaries).
@@ -576,6 +589,8 @@ impl Segments {
             SegmentKind::Locked
         } else if self.ranges.iter().any(|r| lo >= r.start.saturating_sub(self.purge) && hi <= r.start) {
             SegmentKind::Purge
+        } else if self.ranges.iter().any(|r| lo >= r.end && hi <= r.end.saturating_add(self.embargo)) {
+            SegmentKind::Embargo
         } else {
             SegmentKind::Development
         }
@@ -646,7 +661,7 @@ pub fn prepare_csv_segments(inp: &PrepareInput) -> Result<(String, Vec<SegmentRo
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| gid[a].cmp(&gid[b]).then_with(|| time[a].total_cmp(&time[b])).then_with(|| a.cmp(&b)));
     let groups: Vec<u64> = order.iter().map(|&i| gid[i]).collect();
-    let layout = Segments::new(&inp.locked, inp.purge_seconds);
+    let layout = Segments::with_embargo(&inp.locked, inp.purge_seconds, inp.embargo_seconds);
     let raws: Vec<usize> = order.iter().map(|&i| layout.raw(time[i])).collect();
     let mut counts = vec![0usize; layout.len()];
     for &r in &raws {
@@ -758,6 +773,10 @@ pub struct PlanInput<'a> {
     pub time: &'a str,
     pub group: Option<&'a str>,
     pub return_col: Option<&'a str>,
+    /// Columns the target spec needs besides the target: its return column and construction columns.
+    pub spec_columns: &'a [String],
+    /// Spec file every search line passes as `--target-spec`; the prepared CSV has no sidecar.
+    pub target_spec: Option<&'a str>,
     pub windows: &'a str,
     pub scheme: &'a str,
     pub out_dir: &'a str,
@@ -788,6 +807,12 @@ pub fn plan_files(inp: &PlanInput) -> Vec<(String, String)> {
     let mut script = String::new();
     script.push_str("#!/usr/bin/env bash\nset -euo pipefail\n");
     let dir = inp.out_dir;
+    let mut keep: Vec<String> = vec![inp.target.to_string()];
+    for c in inp.return_col.into_iter().chain(inp.spec_columns.iter().map(|s| s.as_str())) {
+        if !keep.iter().any(|k| k == c) {
+            keep.push(c.to_string());
+        }
+    }
     script.push_str(&format!(
         "# prepare: placebo and permuted columns (projection CSV; import it with `rcsr import` for a column store)\n\
 rcsr ablation prepare --definition {} --data {} --time {} --group {} --keep {} --out {}/prepared.csv\n",
@@ -795,10 +820,13 @@ rcsr ablation prepare --definition {} --data {} --time {} --group {} --keep {} -
         shell_quote(inp.data),
         shell_quote(inp.time),
         shell_quote(inp.group.unwrap_or("")),
-        shell_quote(&inp.target.to_string()),
+        shell_quote(&keep.join(",")),
         dir
     ));
     let prepared = format!("{}/prepared.csv", dir);
+    let spec_arg = inp
+        .target_spec
+        .map_or(String::new(), |p| format!(" --target-spec {}", shell_quote(p)));
     let mut arms_json = Vec::new();
     for arm in &def.arms {
         let feats = def.features(arm);
@@ -808,7 +836,7 @@ rcsr ablation prepare --definition {} --data {} --time {} --group {} --keep {} -
             let run = format!("{}/{}-s{}.run.json", dir, arm.name, s);
             let res = format!("{}/{}-s{}.result.json", dir, arm.name, s);
             let search = format!(
-                "rcsr --data {} --target {} --vars {} --generations {} --seed {} --arm {} --json-out {} --run-manifest {}/{}-s{}.run-manifest.json {}",
+                "rcsr --data {} --target {} --vars {} --generations {} --seed {} --arm {} --json-out {} --run-manifest {}/{}-s{}.run-manifest.json{} {}",
                 shell_quote(&prepared),
                 shell_quote(inp.target),
                 shell_quote(&feats.join(",")),
@@ -819,6 +847,7 @@ rcsr ablation prepare --definition {} --data {} --time {} --group {} --keep {} -
                 dir,
                 arm.name,
                 s,
+                spec_arg,
                 inp.search_args
             );
             let score = format!(
@@ -1680,10 +1709,12 @@ fn usage() -> &'static str {
     "usage: rcsr ablation <plan|prepare|score|verdict> [options]\n\
 \n\
   plan      --definition <file> --data <path> --target <col> --time <col> --windows <file> --out <dir>\n\
-            [--group <col>] [--return-col <col>] [--scheme expanding] [--finalist]\n\
+            [--group <col>] [--return-col <col>] [--target-spec <file>] [--scheme expanding] [--finalist]\n\
             [--search-args \"...\"] [--score-args \"...\"] [--verdict-args \"...\"]\n\
             writes <arm>.arm.json (arm, feature list, SHA-256, generation budget, seeds), plan.json,\n\
             a copy of the definition and commands.sh\n\
+            the prepare line keeps the target, --return-col and the return and construction columns of the target spec entry\n\
+            (--target-spec, else <data stem>.targets.json); every search line passes that spec file\n\
   prepare   --definition <file> --data <csv|rcsb> --time <col> --group <col> --out <csv> [--lockbox START,END]\n\
             [--purge-seconds <s> | --target-spec <file>]\n\
             writes <csv>.lockbox.json when the data (or --lockbox) declares a locked test: both ranges, purge_seconds, purge_source\n\
@@ -1694,6 +1725,7 @@ fn usage() -> &'static str {
             writes the projection CSV with placebo and circular-block-permuted columns\n\
   score     (--run <run.json> | --from-run <run.json>) --data <csv|rcsb> --target <col> --time <col> --windows <file> --out <file>\n\
             [--lockbox START,END|none]  a fold ending after START minus --purge-seconds (same resolution) is refused (exit 3)\n\
+            [--lockbox-embargo S]  widen the lookback embargo after the range end (prepare writes it as its own segment; score refuses a fold reaching it)\n\
             [--allow-in-sample]  a fold whose test starts before the run's last seen row + purge is refused (exit 3); with the flag it is labelled oof:false and left out of every pooled series\n\
             [--group <col>] [--return-col <col>] [--scheme expanding] [--thresholds 0.6,0.7,0.8]\n\
             [--headline-threshold 0.7] [--cost-bps 12 | --cost-override <bp>] [--purge-seconds 219600] [--target-spec <file>]\n\
@@ -1756,6 +1788,29 @@ impl Flags {
     }
 }
 
+/// The target spec entry of `target` (`--target-spec`, else the sidecar of `data`) and the columns
+/// it needs beside the target: its return column and construction columns.
+fn plan_target_spec(data: &str, flag: Option<&str>, target: &str) -> Result<(Option<String>, Vec<String>), (i32, String)> {
+    let path = match flag {
+        Some(p) => p.to_string(),
+        None => match crate::target::sidecar_path(data) {
+            Some(p) if Path::new(&p).is_file() => p,
+            _ => return Ok((None, Vec::new())),
+        },
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| io_err(&path, e))?;
+    let specs = crate::target::parse_file(&text).map_err(|e| (3, format!("{}: {}", path, e)))?;
+    match crate::target::entry_for(&specs, target) {
+        Some(s) => {
+            let mut cols: Vec<String> = s.return_column.iter().cloned().collect();
+            cols.extend(s.construction_columns.iter().cloned());
+            Ok((Some(path), cols))
+        }
+        None if flag.is_some() => Err((2, format!("--target-spec {}: no entry for target '{}'", path, target))),
+        None => Ok((None, Vec::new())),
+    }
+}
+
 fn load_definition(path: &str) -> Result<Definition, (i32, String)> {
     let text = std::fs::read_to_string(path).map_err(|e| io_err(path, e))?;
     parse_definition(&text).map_err(|e| (3, format!("{}: {}", path, e)))
@@ -1775,13 +1830,17 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             std::fs::create_dir_all(out).map_err(|e| io_err(out, e))?;
             let data = fl.need("--data")?;
             check_columns(&def, data)?;
+            let target = fl.need("--target")?;
+            let (spec_path, spec_columns) = plan_target_spec(data, fl.opt("--target-spec"), target)?;
             let files = plan_files(&PlanInput {
                 def: &def,
                 data,
-                target: fl.need("--target")?,
+                target,
                 time: fl.need("--time")?,
                 group: fl.opt("--group"),
                 return_col: fl.opt("--return-col"),
+                spec_columns: &spec_columns,
+                target_spec: spec_path.as_deref(),
                 windows: fl.need("--windows")?,
                 scheme: fl.opt("--scheme").unwrap_or("expanding"),
                 out_dir: out,
@@ -1822,7 +1881,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 data::read_table(data).map_err(|e| (3, e))?
             };
             let seed: u32 = fl.opt("--seed").map_or(Ok(0), |s| s.parse().map_err(|_| (2, "--seed: invalid number".to_string())))?;
-            let resolved = crate::lockbox::resolve(fl.opt("--lockbox"), data).map_err(|e| (e.exit, e.message))?;
+            let resolved = crate::lockbox::resolve_with(fl.opt("--lockbox"), fl.opt("--lockbox-embargo"), data).map_err(|e| (e.exit, e.message))?;
             let (purge, purge_source) = match (fl.opt("--purge-seconds"), fl.opt("--target-spec")) {
                 (Some(c), _) => {
                     let p: f64 = c.parse().map_err(|_| (2, "--purge-seconds: invalid number".to_string()))?;
@@ -1852,6 +1911,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 seed,
                 locked: ranges,
                 purge_seconds: purge,
+                embargo_seconds: resolved.embargo.seconds,
             })
             .map_err(|e| (3, e))?;
             let out = fl.need("--out")?;
@@ -1861,7 +1921,13 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 Some(lb) => {
                     let list: Vec<String> = segments.iter().map(SegmentRows::json).collect();
                     let seg = format!(",\"purge_seconds\":{},\"purge_source\":\"{}\",\"segments\":[{}]", purge, purge_source, list.join(","));
-                    let extra = format!("{}{}", crate::lockbox::also_json(resolved.sidecar_also().as_ref(), "rcsr ablation prepare"), seg);
+                    let embargo = crate::lockbox::embargo_json(resolved.embargo.seconds, "(input)", crate::enrich::EMBARGO_RULE, 0);
+                    let extra = format!(
+                        "{}{}{}",
+                        crate::lockbox::also_json(resolved.sidecar_also().as_ref(), "rcsr ablation prepare"),
+                        crate::lockbox::embargo_member(Some(&embargo)),
+                        seg
+                    );
                     crate::lockbox::write_sidecar_with(out, lb, &format!("rcsr ablation prepare ({})", resolved.source.as_str()), &extra).map_err(|e| (3, e))?;
                 }
                 None => {
@@ -1966,13 +2032,16 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 .oof_flags(&labelled, fl.has("--allow-in-sample"))
                 .map_err(|e| (3, format!("{}: {}", run_path, e)))?;
             let panel = ladder::load_panel(&inp, &opts).map_err(|e| (3, e))?;
-            let resolved = crate::lockbox::resolve(fl.opt("--lockbox"), fl.need("--data")?).map_err(|e| (e.exit, e.message))?;
-            let declared = resolved.declared();
-            let guard = declared.as_ref().map(|d| (d.lockbox.start as f64, d.lockbox.end as f64));
-            let folds = ladder::make_folds(&panel, &rows, opts.purge_seconds, guard).map_err(|e| (3, e))?;
-            if let Some(extra) = resolved.also {
-                ladder::make_folds(&panel, &rows, opts.purge_seconds, Some((extra.start as f64, extra.end as f64))).map_err(|e| (3, e))?;
+            let resolved = crate::lockbox::resolve_with(fl.opt("--lockbox"), fl.opt("--lockbox-embargo"), fl.need("--data")?).map_err(|e| (e.exit, e.message))?;
+            let mut purge_source = if fl.opt("--purge-seconds").is_some() { "flag" } else { "protocol_default" };
+            if let Some(s) = &opts.spec {
+                if s.required_purge_seconds() > opts.purge_seconds {
+                    opts.purge_seconds = s.required_purge_seconds();
+                    purge_source = "target_spec";
+                }
             }
+            let guard: Vec<(f64, f64)> = resolved.ranges().iter().map(|r| (r.start as f64, r.end as f64)).collect();
+            let folds = ladder::make_folds(&panel, &rows, opts.purge_seconds, &guard, resolved.embargo.seconds as f64).map_err(|e| (3, e))?;
             let all_labels: Vec<String> = folds.iter().map(|f| f.label.clone()).collect();
             let folds: Vec<ladder::Fold> = folds.into_iter().zip(&oof).filter(|(_, ok)| **ok).map(|(f, _)| f).collect();
             if folds.is_empty() {
@@ -2011,6 +2080,12 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 cost_decl.json(),
                 rule,
                 fold_oof
+            );
+            json = format!(
+                "{},\"purge_seconds\":{},\"purge_source\":\"{}\"}}",
+                json.trim_end().strip_suffix('}').unwrap_or(json.trim_end()),
+                jnum(opts.purge_seconds),
+                purge_source
             );
             json = resolved.splice_report(&json, 0, false, true);
             let out = fl.need("--out")?;

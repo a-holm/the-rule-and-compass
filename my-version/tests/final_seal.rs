@@ -443,3 +443,84 @@ fn a_ledger_without_a_recorded_range_needs_the_unbound_flag() {
     assert_eq!(code, 0, "{}", err);
     assert!(err.contains("unbound"), "{}", err);
 }
+
+#[test]
+fn a_sealed_batch_read_verifies() {
+    let dir = scratch("batch");
+    let data = store(&dir, "d.csv");
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+    let exprs = ["x", "0-x"];
+    let flags = ["--validation-frac", "0.3", "--batch-pnl"];
+    dev(&data, &l, &exprs, &flags);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--report-candidates", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, out, err) = read(&data, &l, &sealed, &exprs, &flags);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("\"batch_pnl\":{"), "{}", out);
+    let mut verify_flags = flags.to_vec();
+    verify_flags.push("--verify-read");
+    let (code, _, err) = read(&data, &l, &sealed, &exprs, &verify_flags);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("\"batch_timings\":{"), "{}", out);
+}
+
+/// One sealed ladder read on a fresh copy of the same synthetic panel. Returns
+/// the ledger text, the data path and the ledger path.
+fn sealed_ladder_read(name: &str) -> (String, String, String) {
+    let dir = scratch(name);
+    let (data, win) = (dir.join("p.csv"), dir.join("w.csv"));
+    let mut csv = String::from("ts,sym,f1,f2,y\n");
+    for g in 0..3i64 {
+        for i in 0..500i64 {
+            let f1 = (((i * 37 + g * 11) % 17) as f64 - 8.0) / 8.0;
+            let f2 = (((i * 19 + g * 5) % 13) as f64 - 6.0) / 6.0;
+            let y = 0.004 * f1 + (((i * 13 + g) % 7) as f64 - 3.0) * 0.001;
+            csv.push_str(&format!("{},s{},{},{},{}\n", T0 + i * H, g, f1, f2, y));
+        }
+    }
+    std::fs::write(&data, csv).unwrap();
+    std::fs::write(
+        &win,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nlocked,locked_0,{},{},{},{},{}\n",
+            T0,
+            T0 + 398 * H,
+            T0 + 250 * H,
+            T0 + 400 * H,
+            T0 + 500 * H
+        ),
+    )
+    .unwrap();
+    let (d, w, out) = (s(&data), s(&win), s(&dir.join("ladder.json")));
+    lockbox::write_sidecar(&d, &Lockbox { start: T0 + 400 * H, end: T0 + 500 * H }, "test").unwrap();
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+    let wfd = window("dev", 0, 150, 160, 250);
+    let (code, _, err) = rcsr(&[
+        "walkforward", "--data", &d, "--target", "y", "--expr", "f1", "--time", "ts", "--group-by", "sym", "--horizon", "5",
+        "--cost-bps", "5", "--periods-per-year", "365", "--json", "--ledger", &l, "--window", &wfd,
+    ]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, _, err) = rcsr(&[
+        "ladder", "--data", &d, "--target", "y", "--time", "ts", "--group", "sym", "--features", "f1,f2",
+        "--windows", &w, "--scheme", "locked", "--purge-seconds", "7200", "--gbm-trees", "10", "--draws", "50",
+        "--max-fit-rows", "600", "--out", &out, "--locked-test", "--ledger", &l, "--sealed", &sealed,
+    ]);
+    assert_eq!(code, 0, "{}", err);
+    (std::fs::read_to_string(&l).unwrap(), d, l)
+}
+
+fn baseline_read_sha(ledger: &str) -> String {
+    let line = ledger.lines().find(|l| l.contains("\"event\":\"baseline_read\"")).expect("baseline_read line");
+    line.split("\"report_sha256\":\"").nth(1).unwrap().split('"').next().unwrap().to_string()
+}
+
+#[test]
+fn a_sealed_ladder_read_hash_is_reproducible_and_verifies() {
+    let (a, da, la) = sealed_ladder_read("lad");
+    let (code, out, err) = rcsr(&["protocol", "verify", "--ledger", &la, "--data", &da]);
+    assert_eq!(code, 0, "{}{}", out, err);
+    let (b, _, _) = sealed_ladder_read("lad");
+    assert_eq!(baseline_read_sha(&a), baseline_read_sha(&b));
+}

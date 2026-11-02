@@ -193,7 +193,7 @@ long/flat from the training mean, matched-exposure random long seeded by
 `--control-seed`) with exposure, turnover, beta and excess over cash; see
 `src/baselines.rs`.
 `--front run.json` takes the candidates from the Pareto front of a run, carries the run's threshold and per-side cost, defaults `--trials` to the offspring the search scored and refuses a window that tests rows the run trained or selected on (`docs/walkforward.md`).
-Pass `--batch-pnl` to score every candidate on every window in one batch (`src/wf_batch.rs`, kernel `src/cuda/wf_batch.cu`), per window and pooled, with the baseline ladder; finalist values stay exact CPU f64 and batch values are labelled `gpu_proxy`.
+Pass `--batch-pnl` to score every candidate on every window in one batch (`src/wf_batch.rs`, kernel `src/cuda/wf_batch.cu`), per window and pooled, with the baseline ladder; finalist values stay exact CPU f64 and batch values are labelled `gpu_proxy`. Its timings are printed in a separate `batch_timings` object, outside `report_sha256`.
 `--policy top-tercile` holds the top `floor(n/3)` finite scores of each timestamp long and the rest flat (no threshold); it prices the book of a search run with `--position top_tercile` on an `xs_rank` target made by `rcsr panel rank` (`docs/time-series.md`).
 
 `rcsr panel spread` prints the market-neutral bucket spread of a feature (for example `clv1` against `lbl_h1_fwd`) in bp with a block-bootstrap interval, on a `--range` that must not reach the declared locked test (`docs/time-series.md`).
@@ -554,7 +554,7 @@ atomically instead of streaming it. See
   lockbox. `validate` runs V1-V12 and exits 3 on a failure. See
   [`docs/panel.md`](docs/panel.md#default-hourly-panel-v2-259).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
-  `4` no finite solution.
+  `4` no finite solution, `6` device failure under an explicit `--gpu` (#604).
 
 ```sh
 # machine-readable
@@ -630,7 +630,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--fitness metric|pnl] [--pnl-blocks K] [--pnl-block-lambda L]
 |pnl]
      [--equivalence-z z] [--noise-lag n|auto]
-     [--allow-lockbox] [--lockbox START,END|none] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure] [--require-clean-inputs]
+     [--allow-lockbox] [--lockbox START,END|none] [--lockbox-embargo SECONDS] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure] [--require-clean-inputs]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
      [--smooth k] [--smooth-centred k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
@@ -826,6 +826,7 @@ run:
 | `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
 | `--allow-lockbox` | permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only); never opens the declared locked test |
 | `--lockbox START,END` | declared locked test (UTC, half-open). Overrides the range declared with the data (`rcsr panel build --locked-test`). Train, validation and test rows inside it are refused (exit 3). The run.json `lockbox` object reports rows, date range, read count, `declared`, `source` (`store` or `flag`), `rows_in_scope` and `evaluated` |
+| `--lockbox-embargo SECONDS` | widen the lookback embargo after the end of every locked range (default: `lockbox_embargo` declared with the data, else 10972800). Rows in `[start - purge, end + embargo)` are refused; a smaller value is refused (exit 2). The `lockbox` object reports `embargo_seconds` and `embargo_source` (`store`, `flag` or `protocol_default`) |
 | `--ledger file` | candidate ledger whose locked reads run.json counts |
 | `--arm name` | ablation arm label; run.json gains an `ablation` object with the arm, the SHA-256 of the ordered variable list, the generation budget and the generations reached |
 | `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`; `long_only` is always true): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
@@ -973,7 +974,7 @@ rcsr --data lag.csv --target y --vars x --split temporal --time t --lags 1
 
 `--lag-set 1,4,24,96` (or `default`, the same menu) replaces the blanket `--lags K`: it adds `x_lag<k>` only for the listed bar counts, which keeps the variable count and the mutation dilution down on a wide store. The two flags are alternatives. Stderr and the split report give `nvars` before and after (`nvars 2 -> 10` for two variables and four lags). The first `max(k)` rows of each series are history, as with `--lags`; no normalisation or centred window is involved.
 
-`--project n|auto` (with `--view k`) selects `--vars` from the feature registry instead: a deterministic family-stratified view of 24-48 columns (research cell 96-128), rotated by `--seed` and `--view`, recorded in `--run-manifest`.
+`--project n|auto` (with `--view k`) selects `--vars` from the feature registry instead: a deterministic family-stratified view of 24-48 columns (research cell 96-128), rotated by `--seed` and `--view`, of exactly `n` columns (a store with fewer than `n` candidate columns exits 2), recorded in `--run-manifest`.
 
 `--history-frac f` keeps the first share of every series as *history*: those
 rows provide the past for later rows but are not scored, so a delay near the

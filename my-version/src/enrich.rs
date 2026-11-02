@@ -1493,6 +1493,135 @@ pub fn nominal_warmup(name: &str) -> usize {
     engine_warmup(name)
 }
 
+/// Name of the lookback rule recorded with every declared embargo.
+pub const EMBARGO_RULE: &str = "rcsr-lookback/1 residual 1e-4";
+
+/// Lags that hold all but [`crate::protocol::LOOKBACK_RESIDUAL`] of the weight
+/// of a recursive smoother with factor `a` per step.
+fn residual_lags(a: f64) -> i64 {
+    ((crate::protocol::LOOKBACK_RESIDUAL.ln() / (1.0 - a).ln()).ceil() as i64 - 1).max(0)
+}
+
+/// Exponential average of span `n`.
+fn ema_lags(n: usize) -> i64 {
+    residual_lags(2.0 / (n as f64 + 1.0))
+}
+
+/// Wilder smoother of period `n`.
+fn wilder_lags(n: usize) -> i64 {
+    residual_lags(1.0 / n as f64)
+}
+
+fn bars_of_suffix(name: &str, prefix: &str) -> Option<usize> {
+    name.strip_prefix(prefix)?.parse().ok()
+}
+
+/// Higher-timeframe bars of one MTF leaf, before the two bars of the as-of join.
+fn mtf_lookback_bars(leaf: &str) -> i64 {
+    match leaf {
+        "atr_pct" | "rsi" => wilder_lags(14) + 1,
+        other => mtf_warmup(other) as i64,
+    }
+}
+
+fn mtf_seconds(tf: &str) -> i64 {
+    match tf {
+        "1h" => 3600,
+        "4h" => 14_400,
+        _ => 86_400,
+    }
+}
+
+/// Base bars before `t` that the value of a non-MTF, non-label column depends
+/// on (see [`lookback_seconds`]).
+fn lookback_bars(name: &str) -> Option<i64> {
+    let recursive = match name {
+        "macd" => Some(ema_lags(26)),
+        "macd_sig" | "macd_hist" => Some(ema_lags(26) + ema_lags(9)),
+        "atr14" | "natr14" | "di_plus" | "di_minus" | "di_diff14" | "batr" | "gapatr" => Some(wilder_lags(14) + 1),
+        "atr50" => Some(wilder_lags(50) + 1),
+        "adx14" => Some(2 * wilder_lags(14) + 1),
+        "volrat" => Some(wilder_lags(96) + 1),
+        "obv_z96" => Some(96),
+        "avg_corr" => Some(97),
+        "skew96" | "kurt96" | "rskew96" | "cusum_abs_z" => Some(192),
+        "mfi14" => Some(wilder_lags(14) + 1),
+        "rng_atr" => Some(wilder_lags(14) + 1),
+        "inside_s" | "outside_s" | "engulf_s" | "harami_s" => Some(wilder_lags(14) + 2),
+        "stoch_d" => Some(15),
+        _ => None,
+    };
+    if recursive.is_some() {
+        return recursive;
+    }
+    if let Some(n) = bars_of_suffix(name, "ema") {
+        return Some(ema_lags(n));
+    }
+    if let Some(n) = bars_of_suffix(name, "rsi") {
+        return Some(wilder_lags(n) + 1);
+    }
+    if let Some(src) = cross_source(name) {
+        return if src == "volume" { Some(0) } else { lookback_bars(src) };
+    }
+    Some(nominal_warmup(name) as i64)
+}
+
+fn known_lookback_names() -> &'static BTreeSet<String> {
+    static NAMES: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names: BTreeSet<String> = default_registry()
+            .into_iter()
+            .filter(|e| e.family != "derivatives")
+            .map(|e| e.name)
+            .collect();
+        names.extend(engine_names());
+        names.extend(cross_names());
+        names
+    })
+}
+
+/// Seconds before a row after which the value of column `name` no longer
+/// depends on a bar (rule `rcsr-lookback/1`). `None` for a name the registry
+/// does not know. `bar_seconds` is the bar of the data.
+///
+/// Finite windows count `nominal_warmup` bars. A recursive filter with factor
+/// `a` per stage counts the lags that hold all but `LOOKBACK_RESIDUAL` of the
+/// weight, summed over its stages, plus one bar for a close difference or a
+/// true range. An MTF leaf counts `(K + 2)` higher bars (the current closed bar
+/// and the join lag). A cross-section column takes its source column. A label
+/// column takes the default volatility window for the kinds that use the scale.
+/// Calendar, identity and raw columns have none.
+pub fn lookback_seconds(name: &str, bar_seconds: i64) -> Option<i64> {
+    if let Some((tf, leaf)) = mtf_parts(name) {
+        return Some((mtf_lookback_bars(leaf) + 2) * mtf_seconds(tf));
+    }
+    if let Some((_, kind)) = crate::labels::parse_column(name) {
+        let scaled = crate::labels::COLUMN_KINDS.iter().any(|(k, s)| *k == kind && *s);
+        let w = if scaled { crate::labels::LongLabelSpec::new("", 1, 1).sigma_window as i64 } else { 0 };
+        return Some(w * bar_seconds);
+    }
+    if crate::labels::is_xs_column(name) {
+        return Some(0);
+    }
+    if !known_lookback_names().contains(name) {
+        return None;
+    }
+    lookback_bars(name).map(|k| k * bar_seconds)
+}
+
+/// The largest lookback of `names` and the column that sets it. A name without
+/// a rule counts as the protocol default and can be the maximum.
+pub fn max_lookback_seconds<'a, I: IntoIterator<Item = &'a str>>(names: I, bar_seconds: i64) -> (i64, String) {
+    let mut best = (0i64, String::new());
+    for n in names {
+        let l = lookback_seconds(n, bar_seconds).unwrap_or(crate::protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS);
+        if best.1.is_empty() || l > best.0 {
+            best = (l, n.to_string());
+        }
+    }
+    best
+}
+
 // ---------------------------------------------------------------------------
 // Options and report
 // ---------------------------------------------------------------------------
@@ -1587,6 +1716,8 @@ pub struct FeatureReport {
     pub rows_left_out: Option<usize>,
     pub hash: String,
     pub label: bool,
+    /// Seconds of bars before a row that the column reads (rule `rcsr-lookback/1`).
+    pub lookback_seconds: Option<i64>,
 }
 
 /// One long-only label family written to the store.
@@ -1615,6 +1746,8 @@ pub struct Report {
     pub group_rows: usize,
     pub chunk_rows: usize,
     pub bar_seconds: i64,
+    /// Store-wide lookback embargo and the column that sets it.
+    pub lockbox_embargo: (i64, String),
     pub features: Vec<FeatureReport>,
     pub plans: Vec<GroupPlan>,
     /// Long-only label families written by this run (#262).
@@ -1804,7 +1937,7 @@ impl Report {
                 format!(
                     "{{\"name\":{},\"warmup\":{},\"nan_rows\":{},\"prevalence\":{:.12},\
                      \"first_finite_row\":{},\"first_finite_time\":{},\"first_finite_iso\":{},\
-                     \"label\":{},\"sha256\":{}{}}}",
+                     \"label\":{},\"lookback_seconds\":{},\"sha256\":{}{}}}",
                     jstr(&f.name),
                     f.warmup,
                     f.nan_rows,
@@ -1819,6 +1952,7 @@ impl Report {
                         .map(|v| jstr(&format_utc_seconds(v)))
                         .unwrap_or_else(|| "null".to_string()),
                     f.label,
+                    f.lookback_seconds.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
                     jstr(&f.hash),
                     f.rows_left_out
                         .map(|n| format!(",\"rows_left_out\":{},\"sha256_scope\":\"all_rows\"", n))
@@ -1863,6 +1997,7 @@ impl Report {
              \"input_sha256\":{},\"output_sha256\":{},\"output_bytes\":{},\n  \
              \"rows\":{},\"columns_in\":{},\"columns_out\":{},\"groups\":{},\"symbols\":{},\n  \
              \"group_rows\":{},\"chunk_rows\":{},\"bar_seconds\":{},\n  \
+             \"lockbox_embargo\":{},\n  \
              \"backend\":{},\"gpu_requested\":{},\"gpu_available\":{},\"gpu_device\":{},\n  \
              \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"write_s\":{:.6},\"transfer_bytes\":{},\"write_bw\":{:.0},\"fallback_columns\":[{}]}},\n  \
              \"projection\":{{\"hash\":{},\"columns\":[{}]}},\n  \
@@ -1881,6 +2016,7 @@ impl Report {
             self.group_rows,
             self.chunk_rows,
             self.bar_seconds,
+            crate::lockbox::embargo_json(self.lockbox_embargo.0, &self.lockbox_embargo.1, EMBARGO_RULE, self.bar_seconds),
             jstr(&self.backend),
             jstr(&self.gpu_requested),
             self.gpu_available,
@@ -5410,6 +5546,7 @@ impl TempColumn {
             rows_left_out: self.keep.as_ref().map(|_| self.left_out),
             hash,
             label: self.label,
+            lookback_seconds: None,
         })
     }
 }
@@ -5534,7 +5671,7 @@ fn compute_series(
             }
         }
         for (spec, acc) in ctx.long_labels.iter().zip(long_acc.iter_mut()) {
-            let built = crate::labels::build(&bars, spec, None)?;
+            let built = acc.build(&bars, None)?;
             for (kind, _) in crate::labels::COLUMN_KINDS {
                 if let (Some(t), Some(v)) = (cols.get_mut(&spec.column(kind)), built.column(kind)) {
                     t.write_values(v)?;
@@ -6955,6 +7092,32 @@ fn enrich_inner(
     // statistics leave out rows inside a guarded range; label columns also
     // leave out rows whose label window reaches it.
     let guarded: Vec<crate::lockbox::Lockbox> = label_range.into_iter().chain(label_also).collect();
+    // Store-wide lookback embargo of the output: the input's declaration (else
+    // its own columns) and every column this run writes.
+    let mut column_lookback: BTreeMap<String, i64> = BTreeMap::new();
+    for n in &requested {
+        column_lookback.insert(n.clone(), lookback_seconds(n, step).unwrap_or(crate::protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS));
+    }
+    for sp in &long_specs {
+        for (kind, _) in crate::labels::COLUMN_KINDS {
+            column_lookback.insert(sp.column(kind), sp.column_warmup(kind) as i64 * step);
+        }
+    }
+    for (n, _) in &labels {
+        column_lookback.insert(n.clone(), 0);
+    }
+    let embargo_l: (i64, String) = {
+        let mut best = match crate::lockbox::declared_embargo(&opts.data).map_err(|e| e.message)? {
+            Some((_, s)) => (s, "(input)".to_string()),
+            None => max_lookback_seconds(names.iter().map(String::as_str), step),
+        };
+        for (n, l) in &column_lookback {
+            if *l > best.0 {
+                best = (*l, n.clone());
+            }
+        }
+        best
+    };
     let mut keep_masks: BTreeMap<i64, std::sync::Arc<Vec<bool>>> = BTreeMap::new();
     if !guarded.is_empty() {
         let times = i64_column_all(&store, time_col, cols.time_dtype)?;
@@ -6966,7 +7129,7 @@ fn enrich_inner(
                 std::sync::Arc::new(
                     times
                         .iter()
-                        .map(|&t| guarded.iter().all(|r| t + p.max(1) <= r.start || t >= r.end))
+                        .map(|&t| guarded.iter().all(|r| t + p.max(1) <= r.start || t >= r.end + embargo_l.0))
                         .collect(),
                 )
             });
@@ -7004,7 +7167,7 @@ fn enrich_inner(
     }
     let mut long_acc: Vec<crate::labels::LabelAccumulator> = long_specs
         .iter()
-        .map(|sp| crate::labels::LabelAccumulator::with_range(sp, label_range).with_also(label_also))
+        .map(|sp| crate::labels::LabelAccumulator::with_range(sp, label_range).with_also(label_also).with_embargo(embargo_l.0))
         .collect();
 
     // Cross-sectional source columns are computed even when the user did not
@@ -7995,6 +8158,7 @@ fn enrich_inner(
     // back by global row index, so the report names a date rather than only an
     // offset into the store.
     for r in &mut reports {
+        r.lookback_seconds = column_lookback.get(&r.name).copied();
         let rows_total = store.n_rows().saturating_sub(r.rows_left_out.unwrap_or(0));
         r.prevalence = if rows_total == 0 {
             0.0
@@ -8025,6 +8189,7 @@ fn enrich_inner(
             group_rows: store.group_rows(),
             chunk_rows: opts.chunk_rows,
             bar_seconds: step,
+            lockbox_embargo: embargo_l.clone(),
             features: reports,
             plans,
             long_labels: long_outputs,
@@ -8091,6 +8256,7 @@ fn enrich_inner(
         group_rows: store.group_rows(),
         chunk_rows: opts.chunk_rows,
         bar_seconds: step,
+        lockbox_embargo: embargo_l.clone(),
         features: reports,
         plans,
         long_labels: long_outputs,
