@@ -50,7 +50,7 @@ const GBM_CHECK_EVERY: usize = 5;
 const GBM_MIN_LEAF: usize = 20;
 const MAX_FIT_ROWS: usize = 200_000;
 
-pub(crate) fn jstr(s: &str) -> Stringlet finish = |json: String, hashed: bool| {
+pub(crate) fn jstr(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
     for c in s.chars() {
@@ -2551,7 +2551,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     ledger.set_wall(wall);
     report.ledger = ledger;
     let in_scope = if locked_test { folds.iter().map(|f| f.test.len()).sum() } else { 0 };
-    let finish = |json: String| {
+    let finish = |json: String, hashed: bool| {
         let json = format!(
             "{},\"purge_seconds\":{},\"purge_source\":\"{}\"}}",
             json.trim_end().strip_suffix('}').unwrap_or(json.trim_end()),
