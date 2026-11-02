@@ -126,6 +126,10 @@ pub const MAX_EVENT_BYTES: usize = 8 * 1024;
 
 /// A finite number as a JSON token; a non-finite one becomes `null` rather than
 /// the invalid `NaN`/`inf` that `format!("{}", f64)` would produce.
+fn opt_usize(v: Option<usize>) -> String {
+    v.map_or_else(|| "null".to_string(), |n| n.to_string())
+}
+
 fn opt_num(v: Option<f64>) -> String {
     match v {
         Some(v) if v.is_finite() => num(v),
@@ -316,8 +320,6 @@ pub struct GpuGen {
     pub duty: f64,
     /// Programs the kernel accepted verbatim.
     pub native: usize,
-    /// Programs that needed the exact lowering pass.
-    pub lowered: usize,
     /// Programs scored by the CPU fallback pool.
     pub fallbacks: usize,
     /// Wall the CPU fallback pool spent.
@@ -338,14 +340,13 @@ impl GpuGen {
     fn json(&self) -> String {
         format!(
             "{{\"batches\":{},\"programs\":{},\"kernel_s\":{},\"wall_s\":{},\"duty\":{},\
-             \"native\":{},\"lowered\":{},\"fallbacks\":{},\"fallback_s\":{},\"fallback_workers\":{},\"nonfinite\":{},\"nonfinite_full\":{},\"nonfinite_cpu_finite\":{},\"nonfinite_seconds\":{}}}",
+             \"native\":{},\"fallbacks\":{},\"fallback_s\":{},\"fallback_workers\":{},\"nonfinite\":{},\"nonfinite_full\":{},\"nonfinite_cpu_finite\":{},\"nonfinite_seconds\":{}}}",
             self.batches,
             self.programs,
             num(self.kernel_s),
             num(self.wall_s),
             num(self.duty),
             self.native,
-            self.lowered,
             self.fallbacks,
             num(self.fallback_s),
             self.fallback_workers,
@@ -814,6 +815,10 @@ pub struct RunEnd {
     pub fit_refit_s: Option<f64>,
     /// #495: exact finalist refits performed.
     pub fit_refits: Option<usize>,
+    /// #601: device fit launches, the candidates they carried, longest launch.
+    pub fit_calls: Option<usize>,
+    pub fit_candidates: Option<usize>,
+    pub fit_call_s_max: Option<f64>,
     /// Log bookkeeping: events written, bytes, events dropped by the cap.
     pub events: u64,
     pub bytes: u64,
@@ -829,7 +834,7 @@ pub fn run_end_json(r: &RunEnd) -> String {
          \"json\":{},\"peak_rss_bytes\":{},\"gpu_wall_s\":{},\"device_hours\":{},\
          \"device_seconds_incl_fit\":{},\"device_fraction_of_run\":{},\
          \"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"unaccounted_s\":{},\
-         \"fit_kernel_s\":{},\"fit_kernel_lm_s\":{},\"fit_kernel_polish_s\":{},\"fit_fallback_s\":{},\"fit_refit_s\":{},\"fit_refits\":{},\
+         \"fit_kernel_s\":{},\"fit_kernel_lm_s\":{},\"fit_kernel_polish_s\":{},\"fit_fallback_s\":{},\"fit_refit_s\":{},\"fit_refits\":{},\"fit_calls\":{},\"fit_candidates\":{},\"fit_call_s_max\":{},\
          \"prune\":{{\"fits\":{},\"accepted\":{},\"seconds\":{}}},\
          \"events\":{},\"bytes\":{},\"dropped\":{},\"end\":{}}}",
         SCHEMA,
@@ -869,6 +874,9 @@ pub fn run_end_json(r: &RunEnd) -> String {
             Some(n) => n.to_string(),
             None => "null".to_string(),
         },
+        opt_usize(r.fit_calls),
+        opt_usize(r.fit_candidates),
+        opt_num(r.fit_call_s_max),
         r.prune_fits,
         r.prune_accepted,
         num(r.prune_s),
@@ -1185,7 +1193,6 @@ mod tests {
                 wall_s: 0.02,
                 duty: 0.2,
                 native: 18,
-                lowered: 2,
                 fallbacks: 1,
                 fallback_s: 0.001,
                 fallback_workers: 1,
