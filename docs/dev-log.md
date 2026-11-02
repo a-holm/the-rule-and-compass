@@ -176,7 +176,7 @@ both levels; the fields marked **full** only exist in a `full` log.
 | `command` | the command line, verbatim |
 | `version`, `commit`, `dirty` | binary version and the commit recorded when the binary was built (`manifest::build_info`; #256) |
 | `binary_sha256` | SHA-256 of the running executable |
-| `data.path`, `data.sha256` | the input path and its SHA-256 (`null` for stdin) |
+| `data.path`, `data.sha256` | the input path and its SHA-256 (`null` for stdin). The digest is cached in `<data>.sha256.json` (size, mtime, inode); a changed file is hashed again. A read-only directory skips the cache. |
 | `data.full_rows`, `data.sampled_rows` | #112: `true`/`null` full load, `false`/`N` explicit sample, `null` for a CSV |
 | `data.estimate_bytes` | #112: the memory estimate behind the load decision (`null` for a CSV) |
 | `data.train`, `data.test` | `rows` and the checkpoint `fingerprint` of each sample |

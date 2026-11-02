@@ -1969,7 +1969,7 @@ fn dev_run_start(
         data_sha256: if data_path == "-" || data_path.is_empty() {
             None
         } else {
-            manifest::sha256_file(std::path::Path::new(data_path)).ok()
+            manifest::sha256_file_cached(std::path::Path::new(data_path)).ok()
         },
         train_rows: train.rows,
         train_fingerprint: format!("{:016x}", train.hash),
