@@ -128,27 +128,41 @@ fn reported_members_are_exact_refits() {
             fit_irls: schedule,
             ..Default::default()
         };
+        let before = fit::fit_arm_counts_full();
         let out = search::run(&cfg, &train, &test);
+        let refits = fit::fit_arm_counts_full().since(before).gpu_refits;
         assert!(!out.archive.items.is_empty());
+        assert!(
+            refits as usize >= out.archive.items.len(),
+            "{schedule:?}: {refits} exact refits for {} reported members",
+            out.archive.items.len()
+        );
         for member in &out.archive.items {
             let mut tree = member.tree.clone();
-            let again = fit::fit_weighted_metric(
-                &mut tree,
-                &train.x,
-                &train.y,
-                &train.w,
-                cfg.fit_iters,
-                cfg.metric,
-            );
+            let scored = fit::fit_weighted_metric(&mut tree, &train.x, &train.y, &train.w, 0, cfg.metric);
             let scale = member.error.abs().max(f64::MIN_POSITIVE);
             assert!(
-                (again - member.error).abs() < 1e-9 * scale,
-                "{schedule:?}: member {} error {} changes to {again} on today's IRLS",
+                (scored - member.error).abs() < 1e-12 * scale,
+                "{schedule:?}: member {} reports {} but scores {scored}",
                 member.complexity,
                 member.error
             );
         }
     }
+    let nested = Config {
+        generations: 12,
+        islands: 1,
+        pop: 40,
+        max_complexity: 12,
+        seed: 7,
+        gpu: false,
+        metric: Metric::Absolute,
+        ..Default::default()
+    };
+    let before = fit::fit_arm_counts_full();
+    search::run(&nested, &train, &test);
+    let delta = fit::fit_arm_counts_full().since(before);
+    assert_eq!((delta.gpu_refits, delta.irls_reweighted), (0, 0), "the default runs no refit and no reweighted fit");
 }
 
 #[test]
