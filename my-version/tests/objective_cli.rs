@@ -664,3 +664,38 @@ fn windows_table_still_refuses_validation_frac_and_missing_slice() {
     assert_eq!(code(&none), 3, "{}", stderr(&none));
     assert!(stderr(&none).contains("need a validation slice"), "{}", stderr(&none));
 }
+
+// ---- #619: the extra searches of one invocation fail closed too ----
+
+#[cfg(feature = "cuda")]
+fn assert_second_search_exits_6(extra: &[&str]) {
+    let dir = scratch();
+    let data = write_csv(&dir, "d.csv", None);
+    let spec = write_spec(&dir, "s.json", 0.0, "null", false);
+    let o = run_gpu(&data, &spec, &["--gpu"], "batch@2", &[&["--dispatch", "device"], extra].concat());
+    if !has_device(&o) {
+        return;
+    }
+    assert_eq!(code(&o), 6, "{}", stderr(&o));
+    assert!(stderr(&o).contains("--gpu was requested but the device search failed"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("panicked"), "{}", stderr(&o));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn permutation_with_an_injected_fault_exits_6() {
+    assert_second_search_exits_6(&["--null-runs", "1"]);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn benchmark_with_an_injected_fault_exits_6() {
+    let out = std::env::temp_dir().join(format!("rcsr-bench-{}.md", std::process::id()));
+    assert_second_search_exits_6(&["--report", "benchmark", "--report-repeats", "2", "--report-out", out.to_str().unwrap()]);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cross_validation_with_an_injected_fault_exits_6() {
+    assert_second_search_exits_6(&["--cv", "k-fold", "--cv-k", "2"]);
+}
