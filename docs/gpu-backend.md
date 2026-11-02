@@ -9,7 +9,11 @@ design maps onto an NVIDIA DGX Spark.
 The backend is **preferred automatically**: a binary built with
 `--features cuda` probes the device once at startup and uses the GPU when one is
 available; a build without the feature, or a machine with no usable device,
-falls back to the CPU with a recorded reason. The default build remains pure
+falls back to the CPU with a recorded reason. An explicit `--gpu` never
+falls back: a device failure after the probe (a refused `long_pnl` fitness book,
+a failed batch, a pipeline error) exits 2 for `device_memory` reasons and 6
+otherwise, and the run writes no result. A failure that stops the run at a
+generation boundary leaves the last checkpoint, so `--resume --gpu` continues. The default build remains pure
 `std` with no dependencies and no CUDA requirement.
 
 ## Backend identity and resumes

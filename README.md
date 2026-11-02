@@ -554,7 +554,7 @@ atomically instead of streaming it. See
   lockbox. `validate` runs V1-V12 and exits 3 on a failure. See
   [`docs/panel.md`](docs/panel.md#default-hourly-panel-v2-259).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
-  `4` no finite solution.
+  `4` no finite solution, `6` device failure under an explicit `--gpu` (#604).
 
 ```sh
 # machine-readable

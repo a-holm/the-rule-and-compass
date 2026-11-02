@@ -858,3 +858,148 @@ fn cli_names_the_device_scorer_and_reports_exact_values() {
     assert_eq!(f.get("scorer_backend").and_then(|j| j.as_str()), Some("cpu"));
     assert_eq!(f.get("scorer_values").and_then(|j| j.as_str()), Some("exact_f64"));
 }
+
+// ---- #604: an explicit --gpu never completes on the CPU ----
+
+static FAULTS: Mutex<()> = Mutex::new(());
+
+struct Faults(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl Faults {
+    fn arm(sites: &str) -> Self {
+        let guard = FAULTS.lock().unwrap_or_else(|e| e.into_inner());
+        rcsr::gpu::set_injected_faults_for_tests(sites);
+        Faults(guard)
+    }
+}
+
+impl Drop for Faults {
+    fn drop(&mut self) {
+        rcsr::gpu::set_injected_faults_for_tests("");
+    }
+}
+
+fn device_present() -> bool {
+    let present = GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_some();
+    if !present {
+        eprintln!("skipping GPU test: no usable CUDA device");
+    }
+    present
+}
+
+fn required_config(b: &Arc<FitnessBook>, required: bool) -> Config {
+    Config {
+        gpu_required: required,
+        dispatch: if required {
+            rcsr::dispatch::DispatchMode::Device
+        } else {
+            rcsr::dispatch::DispatchMode::Auto
+        },
+        ..config(b, &Archived::default())
+    }
+}
+
+fn assert_fails_closed(site: &str, needle: &str) {
+    if !device_present() {
+        return;
+    }
+    let (sample, b) = search_fixture();
+    let _faults = Faults::arm(site);
+    let err = search::run_seeded_checked(&required_config(&b, true), &sample, &sample, &[])
+        .err()
+        .unwrap_or_else(|| panic!("{site}: a required GPU run must fail"));
+    assert!(err.starts_with(search::GPU_REQUIRED_PREFIX), "{site}: {err}");
+    assert!(err.contains(needle), "{site}: {err}");
+}
+
+fn assert_auto_falls_back(site: &str, needle: &str, cpu_backend: bool) {
+    if !device_present() {
+        return;
+    }
+    let (sample, b) = search_fixture();
+    let _faults = Faults::arm(site);
+    let out = search::run_seeded_checked(&required_config(&b, false), &sample, &sample, &[])
+        .unwrap_or_else(|e| panic!("{site}: auto mode must fall back: {e}"));
+    if cpu_backend {
+        assert_eq!(out.backend, rcsr::backend::Kind::Cpu, "{site}");
+    }
+    let why = out.backend_reason.expect("the fallback is labelled");
+    assert!(why.contains(needle), "{site}: {why}");
+    assert!(!out.archive.items.is_empty(), "{site}: the CPU run finished");
+}
+
+#[test]
+fn a_refused_book_fails_a_required_gpu_run() {
+    assert_fails_closed("pnl_book", "long_pnl fitness book");
+}
+
+#[test]
+fn a_refused_book_falls_back_labelled_in_auto_mode() {
+    assert_auto_falls_back("pnl_book", "long_pnl fitness book", true);
+}
+
+#[test]
+fn a_failed_batch_fails_a_required_gpu_run() {
+    assert_fails_closed("batch", "generation batch");
+}
+
+#[test]
+fn a_failed_batch_falls_back_labelled_in_auto_mode() {
+    assert_auto_falls_back("batch", "generation batch", false);
+}
+
+#[test]
+fn a_failed_pipeline_stage_fails_a_required_gpu_run() {
+    assert_fails_closed("pipeline", "pipeline batch");
+}
+
+#[test]
+fn a_failed_pipeline_stage_falls_back_labelled_in_auto_mode() {
+    assert_auto_falls_back("pipeline", "pipeline batch", false);
+}
+
+#[test]
+fn every_device_side_book_refusal_names_its_cause() {
+    let f = fixture(&STARTS_SMALL, 16_401, 4);
+    let b = book(&f, 1);
+    let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    };
+    let _faults = Faults::arm("");
+    let bound = b.block_bounds()[0];
+    let nine = [bound; 9];
+    let zero = [0.0];
+    let cases: [(&str, Result<(), String>); 6] = [
+        (
+            "the row count differs",
+            ev.upload_pnl_book(&b.excess()[..100], &b.flags()[..100], b.side(), b.threshold(), &[bound], 1.0, 1),
+        ),
+        (
+            "a book array is null",
+            ev.upload_pnl_book(b.excess(), b.flags(), b.side(), b.threshold(), &[], 1.0, 1),
+        ),
+        (
+            "the block count is outside 1 to 8",
+            ev.upload_pnl_book(b.excess(), b.flags(), b.side(), b.threshold(), &nine, 1.0, 1),
+        ),
+        (
+            "the block spread weight",
+            ev.upload_pnl_book(b.excess(), b.flags(), b.side(), b.threshold(), &[bound], -1.0, 1),
+        ),
+        (
+            "the block spread weight",
+            ev.upload_pnl_book(b.excess(), b.flags(), b.side(), b.threshold(), &[bound], f64::NAN, 1),
+        ),
+        (
+            "a block hindsight bound is not positive",
+            ev.upload_pnl_book(b.excess(), b.flags(), b.side(), b.threshold(), &zero, 1.0, 1),
+        ),
+    ];
+    for (needle, result) in cases {
+        let why = result.expect_err(needle);
+        assert!(why.starts_with("the device refused the long_pnl fitness book: "), "{why}");
+        assert!(why.contains(needle), "want '{needle}' in: {why}");
+    }
+    ev.set_pnl_book(&b).expect("a valid book still uploads after the refusals");
+}

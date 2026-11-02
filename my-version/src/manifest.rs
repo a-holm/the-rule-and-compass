@@ -242,7 +242,7 @@ pub fn collect(
     let data_sha256 = if data_path == "-" || data_path.is_empty() {
         None
     } else {
-        sha256_file(Path::new(data_path)).ok()
+        sha256_file_cached(Path::new(data_path)).ok()
     };
     let (device, driver, cuda_version) = device_info(backend);
     Manifest {
@@ -609,6 +609,107 @@ pub fn sha256_file(path: impl AsRef<Path>) -> Result<String, String> {
     Ok(state.finalize())
 }
 
+
+/// Identity of a data file for digest reuse: size, modification time and (on
+/// Unix) inode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    size: u64,
+    mtime_ns: u128,
+    inode: u64,
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime_ns = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+    #[cfg(not(unix))]
+    let inode = 0;
+    Some(FileStamp { size: meta.len(), mtime_ns, inode })
+}
+
+/// Path of the digest cache that sits beside a data file.
+pub fn digest_sidecar_path(data_path: &Path) -> std::path::PathBuf {
+    let mut name = data_path.as_os_str().to_os_string();
+    name.push(".sha256.json");
+    std::path::PathBuf::from(name)
+}
+
+fn number_field(text: &str, key: &str) -> Option<u128> {
+    let rest = value_after(text, key)?;
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// The digest recorded in `sidecar` when it still describes the file.
+fn read_digest_sidecar(sidecar: &Path, stamp: FileStamp) -> Option<String> {
+    let text = std::fs::read_to_string(sidecar).ok()?;
+    let sha = string_field(&text, "sha256")?;
+    let valid = sha.len() == 64 && sha.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'));
+    let same = number_field(&text, "size")? == stamp.size as u128
+        && number_field(&text, "mtime_ns")? == stamp.mtime_ns
+        && number_field(&text, "inode")? == stamp.inode as u128;
+    (valid && same).then_some(sha)
+}
+
+fn write_digest_sidecar(sidecar: &Path, data_path: &Path, stamp: FileStamp, sha: &str) {
+    let text = format!(
+        "{{\"path\":{},\"size\":{},\"mtime_ns\":{},\"inode\":{},\"sha256\":{}}}\n",
+        jstr(&data_path.to_string_lossy()),
+        stamp.size,
+        stamp.mtime_ns,
+        stamp.inode,
+        jstr(sha)
+    );
+    let mut tmp = sidecar.as_os_str().to_os_string();
+    tmp.push(format!(".tmp{}", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    if std::fs::write(&tmp, text).is_err() || std::fs::rename(&tmp, sidecar).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+type DigestMemo = std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (FileStamp, String)>>;
+
+/// SHA-256 of the run's data file for the run record, hashing at most once per
+/// process and at most once per file version across processes.
+///
+/// A digest is reused only when size, modification time and inode match the
+/// ones recorded beside the file in `<data>.sha256.json`. A file that changes
+/// while it is hashed gets no sidecar. A directory that cannot be written
+/// skips the sidecar silently. Content-verifying callers (lockbox, ladder,
+/// panel append) keep using [`sha256_file`].
+pub fn sha256_file_cached(path: impl AsRef<Path>) -> Result<String, String> {
+    static MEMO: std::sync::OnceLock<DigestMemo> = std::sync::OnceLock::new();
+    let path = path.as_ref();
+    let Some(before) = file_stamp(path) else {
+        return sha256_file(path);
+    };
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some((stamp, sha)) = memo.lock().unwrap().get(path) {
+        if *stamp == before {
+            return Ok(sha.clone());
+        }
+    }
+    let sidecar = digest_sidecar_path(path);
+    if let Some(sha) = read_digest_sidecar(&sidecar, before) {
+        memo.lock().unwrap().insert(path.to_path_buf(), (before, sha.clone()));
+        return Ok(sha);
+    }
+    let sha = sha256_file(path)?;
+    if file_stamp(path) == Some(before) {
+        write_digest_sidecar(&sidecar, path, before, &sha);
+        memo.lock().unwrap().insert(path.to_path_buf(), (before, sha.clone()));
+    }
+    Ok(sha)
+}
+
 /// SHA-256, as lowercase hex.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut state = Sha256::new();
@@ -791,6 +892,25 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sidecar_rejects_changed_file() {
+        let dir = std::env::temp_dir().join(format!("rcsr-sha-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("d.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let abc = sha256_hex(b"abc");
+        assert_eq!(sha256_file_cached(&path).unwrap(), abc);
+        let sidecar = digest_sidecar_path(&path);
+        let stamp = file_stamp(&path).unwrap();
+        assert_eq!(read_digest_sidecar(&sidecar, stamp), Some(abc));
+        std::fs::write(&path, b"abcd").unwrap();
+        let changed = file_stamp(&path).unwrap();
+        assert_eq!(read_digest_sidecar(&sidecar, changed), None);
+        assert_eq!(sha256_file_cached(&path).unwrap(), sha256_hex(b"abcd"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
