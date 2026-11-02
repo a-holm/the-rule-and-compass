@@ -2975,7 +2975,7 @@ fn lm_core(pass: &mut impl LmPass, c: &[f64], k: usize, iters: usize) -> (Vec<f6
     // Undamped Gauss–Newton polish: quadratic convergence to the optimum. When
     // the last damped trial was rejected, `normal` still holds the system at
     // `best_c`, which is the system the first polish step would build.
-    let mut held: Option<NormalEquations> = normal.take().and(None);
+    let mut held = normal.take();
     for _ in 0..4 {
         if best_sse == 0.0 {
             break;
