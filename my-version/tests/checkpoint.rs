@@ -400,6 +400,7 @@ fn a_gpu_run_and_a_gpu_resume_match_exactly() {
         ..config(17)
     };
     full.gpu = true;
+    full.dispatch = rcsr::dispatch::DispatchMode::Device;
     let uninterrupted = search::run(&full, &train, &test);
     assert_eq!(uninterrupted.backend, rcsr::backend::Kind::Gpu);
 
