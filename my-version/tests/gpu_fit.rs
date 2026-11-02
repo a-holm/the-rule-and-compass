@@ -1921,9 +1921,9 @@ fn default_resolved_runs_with_one_seed_agree_on_front_and_fit_counters() {
         eprintln!("skipping GPU test: no usable CUDA device");
         return;
     }
-    let args = ["--metric", "squared", "--dispatch", "device"];
+    let args = ["--gpu", "--metric", "squared", "--dispatch", "device"];
     let first = cli_json(&args);
-    let second = cli_json(&["--metric", "squared", "--dispatch", "device", "--seed", "2"]);
+    let second = cli_json(&["--gpu", "--metric", "squared", "--dispatch", "device", "--seed", "2"]);
     let field = |json: &str, key: &str| json.split(key).nth(1).unwrap().to_string();
     let fitting = |json: &str| field(json, "\"fitting\":").split('}').next().unwrap().to_string();
     assert!(fitting(&first).contains("\"strategy_source\":\"default\""), "{}", fitting(&first));
@@ -1933,6 +1933,6 @@ fn default_resolved_runs_with_one_seed_agree_on_front_and_fit_counters() {
     assert_eq!(counters, gpu_fit_counters(&second), "gpu.fit counters");
     assert!(!counters.contains("\"attempts\":0,"), "no candidate was fitted: {counters}");
 
-    let other = cli_json(&["--metric", "squared", "--dispatch", "device", "--seed", "2"]);
+    let other = cli_json(&["--gpu", "--metric", "squared", "--dispatch", "device", "--seed", "2"]);
     assert_ne!(field(&first, "\"pareto\":"), field(&other, "\"pareto\":"), "seed 2 must differ");
 }
