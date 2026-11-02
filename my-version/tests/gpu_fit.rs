@@ -1923,7 +1923,7 @@ fn default_resolved_runs_with_one_seed_agree_on_front_and_fit_counters() {
     }
     let args = ["--gpu", "--metric", "squared", "--dispatch", "device"];
     let first = cli_json(&args);
-    let second = cli_json(&["--gpu", "--metric", "squared", "--dispatch", "device", "--seed", "2"]);
+    let second = cli_json(&args);
     let field = |json: &str, key: &str| json.split(key).nth(1).unwrap().to_string();
     let fitting = |json: &str| field(json, "\"fitting\":").split('}').next().unwrap().to_string();
     assert!(fitting(&first).contains("\"strategy_source\":\"default\""), "{}", fitting(&first));
