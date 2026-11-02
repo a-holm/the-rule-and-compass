@@ -4142,7 +4142,7 @@ fn main() {
                         }
                         Err(e) => {
                             eprintln!("error: {}", e);
-                            let shortfall = e.contains("candidate columns");
+                            let shortfall = matches!(e, registry::ViewError::Shortfall { .. });
                             std::process::exit(if shortfall { EXIT_USAGE } else { EXIT_INPUT });
                         }
                     }

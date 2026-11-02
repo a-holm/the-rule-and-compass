@@ -1139,7 +1139,7 @@ fn project_delivers_the_requested_size() {
 fn project_refuses_a_store_with_fewer_candidate_columns_than_requested() {
     let all = family_columns(16);
     let thirty: Vec<String> = all.into_iter().take(30).collect();
-    let err = registry::select_view(&thirty, 48, 11, 0).unwrap_err();
+    let err = registry::select_view(&thirty, 48, 11, 0).unwrap_err().to_string();
     assert!(err.contains("30 candidate columns"), "{err}");
     assert!(registry::select_view(&thirty, 30, 11, 0).is_ok());
     let dir = tmp_dir("shortfall");

@@ -660,6 +660,27 @@ pub fn check_view_size(size: usize) -> Result<(), String> {
     }
 }
 
+/// Why a view could not be selected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewError {
+    /// The store has fewer candidate columns than the requested size.
+    Shortfall { requested: usize, available: usize },
+    Invalid(String),
+}
+
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ViewError::Shortfall { requested, available } => write!(
+                f,
+                "--project {}: the store has {} candidate columns, fewer than the {} requested",
+                requested, available, requested
+            ),
+            ViewError::Invalid(m) => f.write_str(m),
+        }
+    }
+}
+
 /// Select a view from `columns` (stored column names in header order).
 ///
 /// Candidates are the available, derived (non-input) registry columns. Each
@@ -667,7 +688,7 @@ pub fn check_view_size(size: usize) -> Result<(), String> {
 /// rotates with `(seed, view)`: consecutive views walk different families and
 /// different names. The result depends only on the column names, the registry
 /// and the arguments, never on row data.
-pub fn select_view(columns: &[String], size: usize, seed: u64, view: usize) -> Result<View, String> {
+pub fn select_view(columns: &[String], size: usize, seed: u64, view: usize) -> Result<View, ViewError> {
     select_view_excluding(columns, size, seed, view, &[])
 }
 
@@ -679,8 +700,8 @@ pub fn select_view_excluding(
     seed: u64,
     view: usize,
     excluded: &[(String, String)],
-) -> Result<View, String> {
-    check_view_size(size)?;
+) -> Result<View, ViewError> {
+    check_view_size(size).map_err(ViewError::Invalid)?;
     let mut fams: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for c in columns {
         if excluded.iter().any(|(n, _)| n == c) {
@@ -693,14 +714,11 @@ pub fn select_view_excluding(
         }
     }
     if fams.is_empty() {
-        return Err("--project: the store has no registered feature columns".to_string());
+        return Err(ViewError::Invalid("--project: the store has no registered feature columns".to_string()));
     }
     let available: usize = fams.values().map(|n| n.len()).sum();
     if available < size {
-        return Err(format!(
-            "--project {}: the store has {} candidate columns, fewer than the {} requested",
-            size, available, size
-        ));
+        return Err(ViewError::Shortfall { requested: size, available });
     }
     for names in fams.values_mut() {
         names.sort();
