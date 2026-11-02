@@ -1936,3 +1936,25 @@ fn default_resolved_runs_with_one_seed_agree_on_front_and_fit_counters() {
     let other = cli_json(&["--gpu", "--metric", "squared", "--dispatch", "device", "--seed", "2"]);
     assert_ne!(field(&first, "\"pareto\":"), field(&other, "\"pareto\":"), "seed 2 must differ");
 }
+
+/// The run ledger closes to float rounding: the report window is booked, so no
+/// scheduler delay can leave unbooked wall.
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_run_ledger_closes_exactly() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = sample(600, 7);
+    let test = sample(100, 8);
+    let out = search::run(&gpu_config(13), &train, &test);
+    assert_eq!(out.backend, rcsr::backend::Kind::Gpu);
+    let g = out.gpu.as_ref().expect("a GPU report");
+    let residual = g.ledger.closure_residual().value;
+    assert!(
+        residual.abs() < 1e-9,
+        "ledger residual {residual:e}: {:?}",
+        g.ledger
+    );
+}

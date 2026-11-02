@@ -356,3 +356,21 @@ fn prune_keeps_the_device_front_dominated() {
     let again = run(&on, &data, &data);
     assert_eq!(describe(&pruned), describe(&again));
 }
+
+/// The postfix run ledger closes to float rounding: the report window is booked.
+#[test]
+fn postfix_run_ledger_closes_exactly() {
+    if !rcsr::backend::probe().available() {
+        return;
+    }
+    let data = sample(200);
+    let out = run(&cfg(VariationMode::Postfix, 1, 4096, 3), &data, &data);
+    assert_eq!(out.backend, rcsr::backend::Kind::Gpu);
+    let g = out.gpu.as_ref().expect("a GPU report");
+    let residual = g.ledger.closure_residual().value;
+    assert!(
+        residual.abs() < 1e-9,
+        "ledger residual {residual:e}: {:?}",
+        g.ledger
+    );
+}
