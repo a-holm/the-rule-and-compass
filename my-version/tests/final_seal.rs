@@ -518,9 +518,9 @@ fn baseline_read_sha(ledger: &str) -> String {
 
 #[test]
 fn a_sealed_ladder_read_hash_is_reproducible_and_verifies() {
-    let (a, da, la) = sealed_ladder_read("lad-a");
-    let (b, _, _) = sealed_ladder_read("lad-b");
-    assert_eq!(baseline_read_sha(&a), baseline_read_sha(&b));
+    let (a, da, la) = sealed_ladder_read("lad");
     let (code, out, err) = rcsr(&["protocol", "verify", "--ledger", &la, "--data", &da]);
     assert_eq!(code, 0, "{}{}", out, err);
+    let (b, _, _) = sealed_ladder_read("lad");
+    assert_eq!(baseline_read_sha(&a), baseline_read_sha(&b));
 }
