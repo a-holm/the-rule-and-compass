@@ -64,7 +64,7 @@ check WT "$(lib 'echo $WT' RCSR_ROOT="$side_top")" "$main_top/worktrees"
 # need_gates
 out=$(lib 'need_gates; echo reached' RCSR_GATES="$T/nogates" 2>&1); rc=$?
 check need_gates-rc "$rc" "1"
-check need_gates-msg "$out" "gates dir $T/nogates missing; #684 creates the symlink"
+check need_gates-msg "$out" "gates dir $T/nogates missing; link it to the log directory or set RCSR_GATES"
 check need_gates-creates-nothing "$([ -e "$T/nogates" ] && echo yes || echo no)" "no"
 mkdir "$T/gates"
 check need_gates-ok "$(lib 'need_gates; echo reached' RCSR_GATES="$T/gates")" "reached"

@@ -18,7 +18,7 @@ The workshop is the ICM workspace for the recurring agent workflows of this repo
 | `10_machine/` | lock -> pause -> measure -> priority -> resume |
 | `_shared/` | factory: commands, rules, agent brief, output format, failure modes |
 | `_templates/` | blank starters: a new run is a copy, not a blank page |
-| `_tools/` | `links.sh`, `check.sh`, `gate.sh`, `watch.sh` |
+| `_tools/` | every script with its usage and what it writes: `_index.md` |
 | `setup/` | one-time factory configuration |
 
 ## Route by what just happened
@@ -38,6 +38,10 @@ The workshop is the ICM workspace for the recurring agent workflows of this repo
 | the previous step is `pass` | the next numbered step | the step's `## Check` |
 | status of a run is asked | read `*/stages/*/output/` and `check.md` | report what exists |
 | a link or input path looks wrong | `verksted/_tools/links.sh` | exit 0 |
+| which script does what | `_index.md` | the usage line |
+| one status screen | `verksted/_tools/status.sh` | the report |
+| how the system works | `../docs/how-it-works.md` | the section you need |
+| dispatch an agent | `verksted/_tools/brief.sh`, then `03_orchestrate/CONTEXT.md` | the printed prompt |
 
 ## The one rule
 
