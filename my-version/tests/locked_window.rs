@@ -384,10 +384,10 @@ fn without_timing(json: &str) -> Json {
 
 #[test]
 fn without_timing_drops_timing_keys_and_keeps_data() {
-    let a = r#"{"label":"wall","train_error":1.5,"fit_s":0.1,"duty_run":{"numerator":3,"denominator":9},"stages":[{"io_s":1,"rows":7}],"declared_in":"x"}"#;
-    let b = r#"{"label":"wall","train_error":1.5,"fit_s":9.9,"duty_run":{"numerator":4,"denominator":2},"stages":[{"io_s":2,"rows":7}],"declared_in":"y"}"#;
-    let c = r#"{"label":"wall","train_error":1.6,"fit_s":0.1,"duty_run":{"numerator":3,"denominator":9},"stages":[{"io_s":1,"rows":7}],"declared_in":"x"}"#;
-    let d = r#"{"label":"walk","train_error":1.5,"fit_s":0.1,"duty_run":{"numerator":3,"denominator":9},"stages":[{"io_s":1,"rows":7}],"declared_in":"x"}"#;
+    let a = r#"{"label":"wall","train_error":1.5,"fit_s":0.1,"duty_run":{"numerator":3,"denominator":9},"closure":{"numerator":3,"rows":5},"stages":[{"io_s":1,"rows":7}],"declared_in":"x"}"#;
+    let b = r#"{"label":"wall","train_error":1.5,"fit_s":9.9,"duty_run":{"numerator":4,"denominator":2},"closure":{"numerator":8,"rows":5},"stages":[{"io_s":2,"rows":7}],"declared_in":"y"}"#;
+    let c = r#"{"label":"wall","train_error":1.6,"fit_s":0.1,"duty_run":{"numerator":3,"denominator":9},"closure":{"numerator":3,"rows":5},"stages":[{"io_s":1,"rows":7}],"declared_in":"x"}"#;
+    let d = r#"{"label":"walk","train_error":1.5,"fit_s":0.1,"duty_run":{"numerator":3,"denominator":9},"closure":{"numerator":3,"rows":5},"stages":[{"io_s":1,"rows":7}],"declared_in":"x"}"#;
     assert_eq!(without_timing(a), without_timing(b));
     assert_ne!(without_timing(a), without_timing(c));
     assert_ne!(without_timing(a), without_timing(d));

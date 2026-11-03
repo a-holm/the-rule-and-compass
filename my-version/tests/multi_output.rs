@@ -273,8 +273,9 @@ fn timing_phases_sum_to_wall_in_text_json_and_ndjson() {
         fields["total"] >= 0.0,
         "text total wall must not be negative: {line}"
     );
+    // Three values rounded to hundredths: the exact worst-case error is 3 * 0.005.
     assert!(
-        fields["prep"] + fields["search"] <= fields["total"] + 0.01,
+        fields["prep"] + fields["search"] <= fields["total"] + 0.015 + 1e-9,
         "text phases must not exceed the wall: {line}"
     );
 
