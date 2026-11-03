@@ -15,7 +15,7 @@ The rules most often broken, each with its source. Sources: `AGENTS.md` and `doc
 
 ## Language and tools
 
-9. No Python. No `.py` file, no `python3` call, no python shebang. Experiments, reference values, fixtures and helpers are Rust: crate tests, or single-file `rustc -O` programs outside the repo. Quick checks are shell. Scripted edits use the Edit tool, `perl` or `sed`. A Claude Code PreToolUse hook (`~/.claude/hooks/eureqa-no-python.sh`) blocks any Bash command that invokes `python` or `pip` in this repository. (source: `docs/issue-workflow.md` rule 10; `my-version/tests/no_python.rs`; user, 2026-10-31)
+9. No Python. No `.py` file, no `python3` call, no python shebang. Experiments, reference values, fixtures and helpers are Rust: crate tests, or single-file `rustc -O` programs outside the repo. Quick checks are shell. Scripted edits use the Edit tool, `perl` or `sed`. A Claude Code PreToolUse hook in the user settings blocks any Bash command that invokes `python` or `pip` in this repository. (source: `docs/issue-workflow.md` rule 10; `my-version/tests/no_python.rs`; user, 2026-10-31)
 10. Plain technical English, short sentences, no em-dashes. Docs describe the present only: no history, no provenance, no AI references. (source: global writing rules)
 11. Code comments state a constraint the code cannot show. No measured numbers in comments. (source: global commit and ticket rules)
 
