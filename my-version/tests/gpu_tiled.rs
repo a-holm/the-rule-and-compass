@@ -599,6 +599,7 @@ fn cli_tiled_rank_metric_runs_on_the_cpu_with_device_memory() {
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("--gpu was requested but the device search failed"), "{stderr}");
     assert!(stderr.contains("device_memory: the exact order/rank scorer"), "{stderr}");
+    assert!(!stderr.contains("scorer runs on the CPU"), "{stderr}");
     assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
 }
 
