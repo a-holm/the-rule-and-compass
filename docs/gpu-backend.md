@@ -1223,9 +1223,12 @@ explicit `gpu` is always honoured:
 
 **Two instantiations.** The kernel is compiled twice and dispatched on the
 batch's largest constant count. `p <= 16` keeps the 256-thread block and 256-row
-chunk it was measured with (now 43 744 B of shared memory: #229 added the f64
-per-row loss buffers); `17 <= p <= 20` uses a 128-thread block and a 128-row
-chunk (41 040 B). Both fit two blocks per SM on `sm_86`. The larger alternative — 20 constants with a 256-row chunk —
+chunk it was measured with (28 040 B of shared memory); `17 <= p <= 20` uses a
+128-thread block and a 128-row chunk (31 624 B). The f32 per-row gradients (`sg`)
+and the f64 polish gradients (`sdg`) share one union in the shared block: no
+phase reads both. On `sm_86` the `p <= 16` kernel runs two blocks per SM
+(registers bind) and the `17 <= p <= 20` kernel runs three (shared memory binds;
+the launch asks for the full shared carveout). The larger alternative — 20 constants with a 256-row chunk —
 needs about 50.8 KB, past the 48 KB static ceiling and only one block per SM, so
 the shared block is dynamic (`extern __shared__`) and the opt-in limit is raised
 once with `cudaFuncSetAttribute`; it is measured below. A block narrower than
@@ -1382,10 +1385,10 @@ second one. Their resources, from `cuobjdump -res-usage` on the built
 
 | constant cap | block | row chunk | dynamic shared | registers | stack (local frame) |
 |---:|---:|---:|---:|---:|---:|
-| 16 | 256 | 256 | 40 672 B | 89 | 1 792 B |
-| 20 | 128 | 128 | 38 992 B | 85 | 1 824 B |
+| 16 | 256 | 256 | 28 040 B | 127 (12.0), 128 (13.0) | 5 056 B (12.0), 4 288 B (13.0) |
+| 20 | 128 | 128 | 31 624 B | 106 (12.0), 96 (13.0) | 5 200 B (12.0), 4 480 B (13.0) |
 
-Both stay under the 48 KB static ceiling and fit two blocks per SM on `sm_86`.
+Resident blocks per SM on `sm_86`: 2 for the 256-thread instantiation, 3 for the 128-thread one (`gpu::toolchain_tests::fit_kernel_large_runs_three_blocks_per_sm`, from `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, on both toolkits).
 The 256-thread instantiation is launched as `fit_kernel_two_blocks` with `__launch_bounds__(256, 2)` (same device body as `fit_kernel`), so the register allocation keeps two resident blocks per SM on both CUDA 12.0 and CUDA 13.0. `gpu::toolchain_tests::fit_kernel_occupancy_report` prints the registers and the resident blocks from `cudaOccupancyMaxActiveBlocksPerMultiprocessor`.
 The rejected alternative — 20 constants with a 256-thread block and a 256-row
 chunk — is 50 768 B (one block per SM). At `N = 1e5`/`1e6`, `P = 256`, eight

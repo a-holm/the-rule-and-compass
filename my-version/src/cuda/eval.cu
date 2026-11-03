@@ -2139,10 +2139,14 @@ struct FtSmem {
     double strial[MAXC];
     double sdelta[MAXC];
     double sred[CHUNK];
-    float sg[CHUNK * MAXC];
+    /* One phase reads one of them: the f32 assemblies (LM, f32 polish,
+       correlation) use sg, the f64 polish assembly uses sdg. */
+    union {
+        float sg[CHUNK * MAXC];
+        double sdg[PCHUNK * MAXC];
+    };
     float sr[CHUNK];
     double sdl[CHUNK];
-    double sdg[PCHUNK * MAXC];
     double sdr[PCHUNK];
     double sdl64[PCHUNK];
     /* #224: correlation moments and conditioning probes. */
@@ -2165,6 +2169,9 @@ struct FtSmem {
     float scarry[MAXC + 1];
     double sdcarry[MAXC + 1];
 };
+
+static_assert(sizeof(FtSmem<16, 256, 128>) == 28040, "FtSmem<16,256,128> shared block");
+static_assert(sizeof(FtSmem<20, 128, 128>) == 31624, "FtSmem<20,128,128> shared block");
 
 /* Fit-kernel helpers for the piecewise operators. `ft_ind` is the 0/1 truth
    indicator `[x > 0]`, `NaN` for `NaN`, as `ind` in fit.rs. `ft_mod_ok` is the
@@ -4416,6 +4423,12 @@ static int ft_launch(RcCtx *c,
             cudaGetLastError();
             return -1;
         }
+        if constexpr (CHUNK == FT_CHUNK_LARGE) {
+            cudaFuncSetAttribute(fit_kernel_symbol<MAXC, CHUNK, PCHUNK>(),
+                                 cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+            cudaGetLastError();
+        }
         opted_in = 1;
     }
     if constexpr (CHUNK == 256) {
@@ -4432,19 +4445,41 @@ static int ft_launch(RcCtx *c,
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
+/* Occupancy of one fit kernel instantiation. */
+template <int MAXC, int CHUNK, int PCHUNK>
+static int ft_occupancy(int *blocks, int *regs, int *smem_bytes)
+{
+    const int bytes = (int)sizeof(FtSmem<MAXC, CHUNK, PCHUNK>);
+    const void *fn = fit_kernel_symbol<MAXC, CHUNK, PCHUNK>();
+    cudaFuncAttributes attr;
+    if (cudaFuncGetAttributes(&attr, fn) != cudaSuccess) return -1;
+    if (cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) return -1;
+    if constexpr (CHUNK == FT_CHUNK_LARGE) {
+        cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+        cudaGetLastError();
+    }
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(blocks, fn, CHUNK, (size_t)bytes) != cudaSuccess) return -1;
+    *regs = attr.numRegs;
+    *smem_bytes = bytes;
+    return 0;
+}
+
+/* Resident blocks per SM, registers per thread and dynamic shared bytes of the
+   fit kernel instantiation that owns a batch with `kmax` constants. Returns 0
+   on success. */
+extern "C" int rc_fit_occupancy_for(int kmax, int *blocks, int *regs, int *smem_bytes)
+{
+    if (kmax <= FT_MAX_CONST_SMALL) return ft_occupancy<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK>(blocks, regs, smem_bytes);
+    if (kmax <= FT_MAX_CONST_LARGE) return ft_occupancy<FT_MAX_CONST_LARGE, FT_CHUNK_LARGE, FT_PCHUNK>(blocks, regs, smem_bytes);
+    return -1;
+}
+
 /* Resident blocks per SM and registers per thread of the p <= 16 fit kernel
    instantiation. Returns 0 on success. */
 extern "C" int rc_fit_occupancy(int *blocks, int *regs)
 {
-    const int bytes = (int)sizeof(FtSmem<16, 256, 128>);
-    cudaFuncAttributes attr;
-    if (cudaFuncGetAttributes(&attr, fit_kernel_symbol<16, 256, 128>()) != cudaSuccess) return -1;
-    if (cudaFuncSetAttribute(fit_kernel_symbol<16, 256, 128>(),
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) return -1;
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(blocks, fit_kernel_symbol<16, 256, 128>(),
-                                                      256, (size_t)bytes) != cudaSuccess) return -1;
-    *regs = attr.numRegs;
-    return 0;
+    int smem;
+    return rc_fit_occupancy_for(FT_MAX_CONST_SMALL, blocks, regs, &smem);
 }
 
 /* #122: canonical postfix hash, FNV-1a over the words up to and including
