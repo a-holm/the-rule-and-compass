@@ -18,12 +18,19 @@ fn sample(n: usize, seed: u32) -> Sample {
 }
 
 #[test]
-fn dump_squared_archive() {
+fn dump_archives() {
     let train = sample(2_048, 5);
     let test = sample(256, 6);
-    for gens in [1usize, 2, 3, 4] {
+    for metric in [
+        Metric::Squared,
+        Metric::Absolute,
+        Metric::RankCorrelation,
+        Metric::Median,
+        Metric::Interquartile,
+        Metric::Maximum,
+    ] {
         let cfg = Config {
-            generations: gens,
+            generations: 4,
             islands: 1,
             pop: 20,
             max_complexity: 10,
@@ -31,21 +38,25 @@ fn dump_squared_archive() {
             patience: 0,
             seed: 11,
             fit_strategy: FitStrategy::Gpu,
-            metric: Metric::Squared,
+            metric,
             gpu: true,
             dispatch: rcsr::dispatch::DispatchMode::Device,
             gpu_notes: false,
             ..Default::default()
         };
         let out = search::run(&cfg, &train, &test);
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
         for s in &out.archive.items {
-            println!(
-                "gen{} c{} err {:016x} {}",
-                gens,
-                s.complexity,
-                s.error.to_bits(),
-                rcsr::expr::to_string(&s.tree, &["x0".to_string(), "x1".to_string()])
-            );
+            eat(&s.error.to_bits().to_le_bytes());
+            eat(&(s.complexity as u64).to_le_bytes());
+            eat(rcsr::expr::to_string(&s.tree, &["x0".to_string(), "x1".to_string()]).as_bytes());
         }
+        println!("ARCHIVE {:?} {:#018x} items {}", metric, h, out.archive.items.len());
     }
 }
