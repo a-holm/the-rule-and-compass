@@ -77,7 +77,6 @@ OPTIONS:
   --selection <mode>        lexicographic (default) or afp (age-fitness Pareto)
   --linear-scaling          wrap every candidate in a fitted affine output map (#470)
   --mutation-mix <mix>      classic (default) or extended: insert, delete, swap, rotate (#471)
-  --tree-arity <mode>       uniform (default) or balanced random-tree operator draw (#471)
   --crossover-internal <P>  probability of an internal-node crossover cut (default 0) (#471)
   --adaptive-mix            per-island edit weights from success rates (#471)
   --dispatch <mode>         auto or device (device skips the timing comparison)
@@ -331,7 +330,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
                 a.knobs.mutation_mix = Some(rcsr::search::MutationMix::parse(&take(&mut i, "--mutation-mix")?)?)
             }
             "--tree-arity" => {
-                a.knobs.tree_arity = Some(rcsr::search::TreeArity::parse(&take(&mut i, "--tree-arity")?)?)
+                return Err("--tree-arity was removed (#471): its only non-default value, balanced, lowered oracle_recovered in the default-decision A/B".to_string())
             }
             "--crossover-internal" => {
                 a.knobs.crossover_internal =

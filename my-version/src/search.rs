@@ -20,7 +20,7 @@ use crate::mix::{MixCounts, MixWindow};
 use crate::complexity::ComplexityModel;
 use crate::data::Sample;
 use crate::expr::{
-    self, crossover_with_opts, eval, mutate_with_opts, random_tree_opts, AggTable, Node, Op,
+    self, crossover_with_opts, eval, mutate_with_opts, random_tree_with, AggTable, Node, Op,
 };
 use crate::metrics::{score_weighted, Metric};
 // #15: multi-output combined error and per-output constant fitting.
@@ -138,36 +138,6 @@ impl MutationMix {
         match self {
             MutationMix::Classic => expr::CLASSIC_MIX,
             MutationMix::Extended => expr::EXTENDED_MIX,
-        }
-    }
-}
-
-/// #471: how random trees draw an operator.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum TreeArity {
-    /// Uniform over `ops`.
-    #[default]
-    Uniform,
-    /// Arity class first (binary 0.5, unary 0.4, ternary 0.1), then uniform.
-    Balanced,
-}
-
-impl TreeArity {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TreeArity::Uniform => "uniform",
-            TreeArity::Balanced => "balanced",
-        }
-    }
-
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "uniform" => Ok(TreeArity::Uniform),
-            "balanced" => Ok(TreeArity::Balanced),
-            other => Err(format!(
-                "tree arity must be 'uniform' or 'balanced', got '{}'",
-                other
-            )),
         }
     }
 }
@@ -394,8 +364,6 @@ pub struct Config {
     /// #471: the node-path edit weights. Changes the trajectory, so it is a
     /// saved search setting.
     pub mutation_mix: MutationMix,
-    /// #471: operator draw in random trees.
-    pub tree_arity: TreeArity,
     /// #471: probability that a crossover cut point is an internal node.
     pub crossover_internal: f64,
     /// #471: per-island edit weights learned from success rates.
@@ -697,7 +665,6 @@ impl Default for Config {
             selection: Selection::Lexicographic,
             linear_scaling: false,
             mutation_mix: MutationMix::Classic,
-            tree_arity: TreeArity::Uniform,
             crossover_internal: 0.0,
             adaptive_mix: false,
         }
@@ -769,7 +736,6 @@ impl Config {
         compare!(fit_admission, "fit_admission");
         compare!(linear_scaling, "linear_scaling"); // #470
         compare!(mutation_mix, "mutation_mix"); // #471
-        compare!(tree_arity, "tree_arity"); // #471
         compare!(crossover_internal, "crossover_internal"); // #471
         compare!(adaptive_mix, "adaptive_mix"); // #471
         compare!(dedup, "dedup");
@@ -830,7 +796,6 @@ impl Config {
     pub fn variation_opts(&self) -> expr::VariationOpts {
         expr::VariationOpts {
             mix: self.mutation_mix.weights(),
-            balanced: self.tree_arity == TreeArity::Balanced,
             crossover_internal: self.crossover_internal,
         }
     }
@@ -840,8 +805,6 @@ impl Config {
     pub fn node_variation_flag(&self) -> Option<&'static str> {
         if self.mutation_mix != MutationMix::Classic {
             Some("--mutation-mix")
-        } else if self.tree_arity != TreeArity::Uniform {
-            Some("--tree-arity")
         } else if self.crossover_internal > 0.0 {
             Some("--crossover-internal")
         } else if self.adaptive_mix {
@@ -5718,13 +5681,12 @@ fn evolve_island(
         let trees: Vec<Node> = (next.len()..pop)
             .map(|_| {
                 draw_row_dependent(cfg, nvars, &mut have_const, || {
-                    expr::simplify(&random_tree_opts(
+                    expr::simplify(&random_tree_with(
                         rng,
                         nvars,
                         &cfg.ops,
                         cfg.init_depth,
                         Some(aggs),
-                        base_opts.balanced,
                     ))
                 })
             })
@@ -5750,8 +5712,8 @@ fn evolve_island(
             for _ in 0..immigrants {
                 let hc = have_const_imm;
                 let t = draw_row_dependent(cfg, nvars, &mut have_const_imm, || {
-                    let mut t = random_tree_opts(
-                        rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced,
+                    let mut t = random_tree_with(
+                        rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs)
                     );
                     let mut best_score = if hc && !expr::row_dependent(&t) {
                         f64::INFINITY
@@ -5760,8 +5722,8 @@ fn evolve_island(
                         (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2)
                     };
                     for _ in 0..3 {
-                        let cand = random_tree_opts(
-                            rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced,
+                        let cand = random_tree_with(
+                            rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs)
                         );
                         let d = qd::descriptor(&cand, train.sample);
                         let score = (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2);
@@ -5798,7 +5760,7 @@ fn evolve_island(
         let trees: Vec<Node> = (0..k)
             .map(|_| {
                 draw_row_dependent(cfg, nvars, &mut have_const_afp, || {
-                    expr::simplify(&random_tree_opts(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced))
+                    expr::simplify(&random_tree_with(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs)))
                 })
             })
             .collect();
@@ -7755,13 +7717,12 @@ fn run_search(
         for isl in 0..cfg.islands.max(1) {
             let depth = cfg.init_depth.min(1 + isl % 3);
             for _ in 0..cfg.pop {
-                init_trees.push(random_tree_opts(
+                init_trees.push(random_tree_with(
                     &mut rng,
                     nvars,
                     &cfg.ops,
                     depth,
                     Some(&aggs),
-                    cfg.tree_arity == TreeArity::Balanced,
                 ));
             }
         }
@@ -8684,13 +8645,12 @@ fn run_search(
                         for ind in islands[ii].iter_mut() {
                             let hc = have_const; // #477
                             let mut t = draw_row_dependent(cfg, nvars, &mut have_const, || {
-                                let mut t = random_tree_opts(
+                                let mut t = random_tree_with(
                                     &mut r,
                                     nvars,
                                     &cfg.ops,
                                     cfg.init_depth,
                                     Some(&aggs),
-                                    cfg.tree_arity == TreeArity::Balanced,
                                 );
                                 if let Some(target) = qd_target {
                                     let mut best = t.clone();
@@ -8701,13 +8661,12 @@ fn run_search(
                                         (best_d.usage - target.usage).powi(2) + (best_d.skew - target.skew).powi(2)
                                     };
                                     for _ in 0..3 {
-                                        let cand = random_tree_opts(
+                                        let cand = random_tree_with(
                                             &mut r,
                                             nvars,
                                             &cfg.ops,
                                             cfg.init_depth,
                                             Some(&aggs),
-                                            cfg.tree_arity == TreeArity::Balanced,
                                         );
                                         let d = qd::descriptor(&cand, gen_train);
                                         let score = (d.usage - target.usage).powi(2)

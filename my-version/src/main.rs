@@ -743,9 +743,6 @@ SEARCH:
                              .35, subtree .40; default) or extended (adds insert,
                              delete, swap and rotate). Not with --variation
                              postfix (#471)
-  --tree-arity <A>           operator draw in random trees: uniform (default) or
-                             balanced (binary .5, unary .4, ternary .1). Not with
-                             --variation postfix (#471)
   --crossover-internal <P>   probability that a crossover cut point is an
                              internal node (default 0 = uniform cut). Not with
                              --variation postfix (#471)
@@ -2544,7 +2541,6 @@ fn main() {
     let mut selection_set = false;
     let mut linear_scaling_set = false; // #470
     let mut mutation_mix_set = false; // #471
-    let mut tree_arity_set = false;
     let mut crossover_internal_set = false;
     let mut adaptive_mix_set = false;
     // #25: `--units` is resolved against the prepared input list later; the
@@ -3103,15 +3099,10 @@ fn main() {
                 mutation_mix_set = true;
             }
             "--tree-arity" => {
-                let v = val!();
-                match rcsr::search::TreeArity::parse(&v) {
-                    Ok(m) => cfg.tree_arity = m,
-                    Err(e) => {
-                        eprintln!("error: --tree-arity: {}", e);
-                        std::process::exit(EXIT_USAGE);
-                    }
-                }
-                tree_arity_set = true;
+                eprintln!(
+                    "error: --tree-arity was removed (#471): its only non-default value, balanced, lowered oracle_recovered in the default-decision A/B"
+                );
+                std::process::exit(EXIT_USAGE);
             }
             "--crossover-internal" => {
                 let v = val!();
@@ -3789,13 +3780,6 @@ fn main() {
                     "--mutation-mix {} (saved {})",
                     cfg.mutation_mix.as_str(),
                     saved.mutation_mix.as_str()
-                ));
-            }
-            if tree_arity_set && cfg.tree_arity != saved.tree_arity {
-                conflicts.push(format!(
-                    "--tree-arity {} (saved {})",
-                    cfg.tree_arity.as_str(),
-                    saved.tree_arity.as_str()
                 ));
             }
             if crossover_internal_set && cfg.crossover_internal != saved.crossover_internal {
