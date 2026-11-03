@@ -225,14 +225,6 @@ pub struct Config {
     pub time_budget: Option<f64>,
     /// Stop after this many generations with no improvement (0 disables).
     pub patience: usize,
-    /// #464: scale-free patience. `Some(r)` counts a generation as "no
-    /// improvement" when `(best_prev - best) / |best_prev| <= r`; `None` keeps
-    /// the `1 + |best_prev|` denominator and the 1e-9 threshold. Saved search state.
-    pub patience_tol: Option<f64>,
-    /// #464: `--stop-on front:<W>`. `Some(w)` stops after `w` consecutive
-    /// generations with a settled front; `Some(0)` takes the window from
-    /// `patience`. Saved search state.
-    pub stop_front: Option<usize>,
     /// Number of training rows used to score and fit candidates in a
     /// generation. `None` scores the full training sample. #86: a request at
     /// least the training size is an exact no-op, and a request above the
@@ -620,8 +612,6 @@ impl Default for Config {
             reject_constant_offspring: false,
             time_budget: None,
             patience: 40,
-            patience_tol: None,
-            stop_front: None,
             predictor_samples: None,
             fit_samples: 0, // #85: off by default
             fit_rows: 0,    // #116: off by default
@@ -672,26 +662,6 @@ impl Config {
             && matches!(self.metric, Metric::Absolute | Metric::ImplicitResidual)
     }
 
-    /// #464: relative tolerance of the front stop.
-    fn front_tol(&self) -> f64 {
-        self.patience_tol
-            .unwrap_or(crate::progress_stats::FRONT_STOP_TOL)
-    }
-
-    /// #464: consecutive stable generations that end a run; never reached when 0.
-    fn front_window(&self) -> usize {
-        let w = match self.stop_front {
-            Some(0) => self.patience,
-            Some(w) => w,
-            None => 0,
-        };
-        if w == 0 {
-            usize::MAX
-        } else {
-            w
-        }
-    }
-
     /// The names of search settings that differ between two configurations.
     ///
     /// `generations` is deliberately excluded: it is a **budget**, not a
@@ -734,8 +704,6 @@ impl Config {
         // #256: `time_budget` is a per-process limit, not search state; a resumed
         // run may set a new one.
         compare!(patience, "patience");
-        compare!(patience_tol, "patience_tol"); // #464
-        compare!(stop_front, "stop_front"); // #464
         compare!(predictor_samples, "predictor_samples");
         compare!(fit_samples, "fit_samples"); // #85
         compare!(fit_rows, "fit_rows"); // #116
@@ -5935,7 +5903,7 @@ pub struct Outcome {
     pub qd: Option<QdReport>,
     /// #211: why the generation loop stopped: `solved` (an error at or below
     /// the solved floor), `patience` (no improvement for `--patience`
-    /// generations), `front_stable` (#464), `time_budget`, or `generations` (the
+    /// generations), `time_budget`, or `generations` (the
     /// budget ran out). Read
     /// by the development log's `run_end` event; it is not printed, so the
     /// default output is unchanged.
@@ -6083,7 +6051,6 @@ fn snapshot(
     stopped_early: bool,
     best_prev: f64,
     no_improve: usize,
-    front_stable: usize,
     archive: &Archive,
     islands: &[Vec<Ind>],
     rngs: &[Mt],
@@ -6105,7 +6072,6 @@ fn snapshot(
         stopped_early,
         best_prev,
         no_improve,
-        front_stable,
         train: crate::checkpoint::fingerprint(train),
         test: crate::checkpoint::fingerprint(test),
         archive: Archive {
@@ -6653,7 +6619,6 @@ fn run_postfix_search(
     mut converged_early: bool,
     mut best_prev: f64,
     mut no_improve: usize,
-    mut front_stable: usize,
     mut candidates: u64,
     save_every: usize,
     mut on_checkpoint: Option<CheckpointFn<'_>>,
@@ -6692,10 +6657,6 @@ fn run_postfix_search(
     } else {
         "generations"
     };
-
-    let mut front_stop = cfg
-        .stop_front
-        .map(|_| crate::progress_stats::FrontStop::new(&archive, front_stable));
 
     for gen in gens_done..cfg.generations {
         // A checkpoint saved after an early stop stays stopped even when the
@@ -6889,7 +6850,7 @@ fn run_postfix_search(
                 converged_early = true;
                 stop_reason = "solved"; // #211
             }
-            if crate::progress_stats::no_improvement(best_prev, gen_best, cfg.patience_tol) {
+            if crate::progress_stats::no_improvement(best_prev, gen_best) {
                 no_improve += 1;
             } else {
                 no_improve = 0;
@@ -6900,14 +6861,6 @@ fn run_postfix_search(
                 stop_reason = "patience"; // #211
             }
         }
-        if let Some(fs) = front_stop.as_mut() {
-            front_stable = fs.observe(&archive, cfg.front_tol());
-            if gen_best.is_finite() && !converged_early && front_stable >= cfg.front_window() {
-                converged_early = true;
-                stop_reason = "front_stable"; // #464
-            }
-        }
-
 
         if n_islands > 1 && cfg.migration_interval > 0 && (gen + 1) % cfg.migration_interval == 0
         {
@@ -6979,7 +6932,6 @@ fn run_postfix_search(
                 converged_early,
                 best_prev,
                 no_improve,
-                front_stable,
                 &archive,
                 &islands_now,
                 &rngs,
@@ -7053,7 +7005,6 @@ fn run_postfix_search(
             converged_early,
             best_prev,
             no_improve,
-            front_stable,
             &archive,
             &islands_now,
             &rngs,
@@ -7558,7 +7509,6 @@ fn run_search(
     let mut converged_early: bool;
     let mut best_prev: f64;
     let mut no_improve: usize;
-    let mut front_stable: usize;
     let mut candidates: u64;
     // #85: did any generation fit on a screening subset? Only then may the
     // final archive be refit; a request at least as large as the sample, or
@@ -7596,7 +7546,6 @@ fn run_search(
             stopped_early,
             best_prev: saved_best,
             no_improve: saved_no_improve,
-            front_stable: saved_front_stable,
             archive: saved_archive,
             islands: saved_islands,
             stagnant: saved_stagnant,
@@ -7609,7 +7558,6 @@ fn run_search(
         converged_early = stopped_early;
         best_prev = saved_best;
         no_improve = saved_no_improve;
-        front_stable = saved_front_stable;
         archive = saved_archive;
         stagnant = saved_stagnant;
         rng = main_rng;
@@ -7716,7 +7664,6 @@ fn run_search(
         converged_early = false;
         best_prev = f64::INFINITY;
         no_improve = 0;
-        front_stable = 0;
         candidates = 0;
     }
 
@@ -7830,7 +7777,6 @@ fn run_search(
                         converged_early,
                         best_prev,
                         no_improve,
-                        front_stable,
                         candidates,
                         save_every,
                         on_checkpoint,
@@ -7914,10 +7860,6 @@ fn run_search(
     let mut last_save = std::time::Instant::now();
     let save_interval_s = checkpoint_interval_s();
     if !converged_early {
-        let mut front_stop = cfg
-            .stop_front
-            .map(|_| crate::progress_stats::FrontStop::new(&archive, front_stable));
-
         for gen in gens_done..cfg.generations {
             gens_done = gen + 1;
 
@@ -8452,7 +8394,7 @@ fn run_search(
                     stop_reason = "solved"; // #211
                     break;
                 }
-                if crate::progress_stats::no_improvement(best_prev, gen_best, cfg.patience_tol) {
+                if crate::progress_stats::no_improvement(best_prev, gen_best) {
                     no_improve += 1;
                 } else {
                     no_improve = 0;
@@ -8461,15 +8403,6 @@ fn run_search(
                 if cfg.patience > 0 && no_improve >= cfg.patience {
                     converged_early = true;
                     stop_reason = "patience"; // #211
-                    break;
-                }
-            }
-
-            if let Some(fs) = front_stop.as_mut() {
-                front_stable = fs.observe(&archive, cfg.front_tol());
-                if gen_best.is_finite() && front_stable >= cfg.front_window() {
-                    converged_early = true;
-                    stop_reason = "front_stable"; // #464
                     break;
                 }
             }
@@ -8714,7 +8647,6 @@ fn run_search(
                     converged_early,
                     best_prev,
                     no_improve,
-                    front_stable,
                     &archive,
                     &islands,
                     &rngs,
@@ -8789,7 +8721,6 @@ fn run_search(
             converged_early,
             best_prev,
             no_improve,
-            front_stable,
             &archive,
             &islands,
             &rngs,
