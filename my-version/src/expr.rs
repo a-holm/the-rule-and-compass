@@ -1428,30 +1428,16 @@ pub fn random_tree_with(
     depth: usize,
     aggs: Option<&AggTable>,
 ) -> Node {
-    random_tree_opts(rng, nvars, ops, depth, aggs, false)
-}
-
-/// [`random_tree_with`] with the operator draw of `--tree-arity`. `balanced`
-/// draws the arity class first (binary 0.5, unary 0.4, ternary 0.1, renormalised
-/// over the classes present in `ops`) and an operator uniformly inside it.
-pub fn random_tree_opts(
-    rng: &mut Mt,
-    nvars: usize,
-    ops: &[Op],
-    depth: usize,
-    aggs: Option<&AggTable>,
-    balanced: bool,
-) -> Node {
     if depth == 0 || rng.bool(0.15) {
         return random_terminal(rng, nvars);
     }
-    let op = if balanced { pick_balanced(rng, ops) } else { *rng.pick(ops) };
+    let op = *rng.pick(ops);
     if let Op::Agg(kind) = op {
         return random_aggregate(rng, nvars, kind, aggs);
     }
     let k = op.arity();
     let kids = (0..k)
-        .map(|_| random_tree_opts(rng, nvars, ops, depth - 1, aggs, balanced))
+        .map(|_| random_tree_with(rng, nvars, ops, depth - 1, aggs))
         .collect();
     node(op, kids)
 }
@@ -1561,14 +1547,11 @@ impl EditKind {
     }
 }
 
-/// How the node path varies a tree: edit weights, the random-tree operator
-/// draw and the crossover cut-point bias. The default is the historical
-/// behaviour bit for bit.
+/// How the node path varies a tree: edit weights and the crossover cut-point
+/// bias. The default is the historical behaviour bit for bit.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VariationOpts {
     pub mix: MixWeights,
-    /// Arity-balanced operator draw in random trees (`--tree-arity balanced`).
-    pub balanced: bool,
     /// Probability that a crossover cut point is an internal node
     /// (`--crossover-internal`); `0` keeps the uniform choice.
     pub crossover_internal: f64,
@@ -1578,7 +1561,6 @@ impl Default for VariationOpts {
     fn default() -> Self {
         VariationOpts {
             mix: CLASSIC_MIX,
-            balanced: false,
             crossover_internal: 0.0,
         }
     }
@@ -1629,49 +1611,6 @@ fn insertable(op: Op, site: &Node) -> bool {
         && !op.is_agg()
         && !op.is_meta()
         && !(op == Op::Neg && site.op == Op::Neg)
-}
-
-/// Draw an operator from `ops` with the `--tree-arity balanced` class weights.
-fn pick_balanced(rng: &mut Mt, ops: &[Op]) -> Op {
-    const WEIGHT: [f64; 3] = [0.5, 0.4, 0.1];
-    fn class(op: Op) -> usize {
-        match op.arity() {
-            2 => 0,
-            a if a >= 3 => 2,
-            _ => 1,
-        }
-    }
-    let mut count = [0usize; 3];
-    for &o in ops {
-        count[class(o)] += 1;
-    }
-    let total: f64 = (0..3).filter(|&c| count[c] > 0).map(|c| WEIGHT[c]).sum();
-    if total <= 0.0 {
-        return *rng.pick(ops);
-    }
-    let r = rng.next_f64() * total;
-    let mut acc = 0.0;
-    let mut chosen = 0;
-    for c in 0..3 {
-        if count[c] == 0 {
-            continue;
-        }
-        acc += WEIGHT[c];
-        chosen = c;
-        if r < acc {
-            break;
-        }
-    }
-    let mut k = rng.usize_below(count[chosen]);
-    for &o in ops {
-        if class(o) == chosen {
-            if k == 0 {
-                return o;
-            }
-            k -= 1;
-        }
-    }
-    unreachable!("a counted class has members")
 }
 
 /// Whether a point change can actually change this node: it must be an
@@ -1803,7 +1742,6 @@ fn replace_subtree(
     nvars: usize,
     ops: &[Op],
     aggs: Option<&AggTable>,
-    balanced: bool,
 ) {
     let old = structural_hash(t);
     let depth = if rng.next_f64() < 0.625 { 2 } else { 1 };
@@ -1811,7 +1749,7 @@ fn replace_subtree(
         let cand = if ops.is_empty() {
             different_leaf(t)
         } else {
-            random_tree_opts(rng, nvars, ops, depth, aggs, balanced)
+            random_tree_with(rng, nvars, ops, depth, aggs)
         };
         if structural_hash(&cand) != old {
             *t = cand;
@@ -1927,7 +1865,7 @@ pub fn mutate_with_opts(
             match kind {
                 EditKind::Point => change_operator(t, rng, nvars, ops, aggs),
                 EditKind::Terminal => change_terminal(t, rng, nvars),
-                EditKind::Subtree => replace_subtree(t, rng, nvars, ops, aggs, opts.balanced),
+                EditKind::Subtree => replace_subtree(t, rng, nvars, ops, aggs),
                 EditKind::Insert => insert_operator(t, rng, nvars, ops),
                 EditKind::Delete => delete_operator(t, rng),
                 EditKind::Swap => t.kids.swap(0, 1),

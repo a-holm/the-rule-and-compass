@@ -1,16 +1,16 @@
-//! #471: structural edits, arity-balanced trees, internal crossover cuts and
+//! #471: structural edits, internal crossover cuts and
 //! the adaptive edit mix. Every new setting is opt-in; the default archive is
 //! the pre-change archive bit for bit.
 
 use rcsr::data::Sample;
 use rcsr::expr::{
-    self, complexity, constant, input, mutate_with_opts, node, random_tree_opts, EditKind, Node,
+    self, complexity, constant, input, mutate_with_opts, node, EditKind, Node,
     Op, VariationOpts, CLASSIC_MIX, EDIT_KINDS,
 };
 use rcsr::fit::FitStrategy;
 use rcsr::metrics::Metric;
 use rcsr::rng::Mt;
-use rcsr::search::{self, Config, MutationMix, Outcome, TreeArity};
+use rcsr::search::{self, Config, MutationMix, Outcome};
 
 fn only(kind: EditKind) -> VariationOpts {
     let mut mix = [0.0; EDIT_KINDS];
@@ -234,49 +234,6 @@ fn extended_mix_always_changes_the_tree() {
 }
 
 #[test]
-fn balanced_arity_frequencies() {
-    let ops = rcsr::search::Config::default().ops;
-    let mut rng = Mt::new(17);
-    let (mut binary, mut internal) = (0usize, 0usize);
-    fn count(n: &Node, binary: &mut usize, internal: &mut usize) {
-        if !n.kids.is_empty() {
-            *internal += 1;
-            if n.kids.len() == 2 {
-                *binary += 1;
-            }
-        }
-        for k in &n.kids {
-            count(k, binary, internal);
-        }
-    }
-    for _ in 0..100_000 {
-        let t = random_tree_opts(&mut rng, 3, &ops, 1, None, true);
-        count(&t, &mut binary, &mut internal);
-    }
-    let share = binary as f64 / internal as f64;
-    assert!((share - 0.50).abs() <= 0.01, "binary share {share} over {internal} internal nodes");
-
-    let mut rng = Mt::new(17);
-    let (mut b2, mut i2) = (0usize, 0usize);
-    for _ in 0..100_000 {
-        let t = random_tree_opts(&mut rng, 3, &ops, 1, None, false);
-        count(&t, &mut b2, &mut i2);
-    }
-    let uniform = b2 as f64 / i2 as f64;
-    assert!(uniform < 0.40, "the uniform draw is far from balanced: {uniform}");
-}
-
-#[test]
-fn balanced_without_unary_operators_still_builds() {
-    let ops = [Op::Add, Op::Mul];
-    let mut rng = Mt::new(3);
-    for _ in 0..200 {
-        let t = random_tree_opts(&mut rng, 2, &ops, 3, None, true);
-        assert!(valid(&t));
-    }
-}
-
-#[test]
 fn internal_crossover_cuts_internal_nodes() {
     let b = node(Op::Add, vec![input(0), node(Op::Sin, vec![input(1)])]);
     // p = 1: every cut point is internal, so the donor is never a bare leaf
@@ -355,7 +312,6 @@ fn classic_mix_is_bit_identical() {
     for (strategy, want) in GOLDEN {
         let cfg = config(*strategy);
         assert_eq!(cfg.mutation_mix, MutationMix::Classic);
-        assert_eq!(cfg.tree_arity, TreeArity::Uniform);
         assert_eq!(cfg.crossover_internal, 0.0);
         assert!(!cfg.adaptive_mix);
         let h = archive_hash(&search::run(&cfg, &train, &test));
@@ -366,7 +322,6 @@ fn classic_mix_is_bit_identical() {
 fn adaptive_config() -> Config {
     Config {
         mutation_mix: MutationMix::Extended,
-        tree_arity: TreeArity::Balanced,
         crossover_internal: 0.9,
         adaptive_mix: true,
         generations: 20,

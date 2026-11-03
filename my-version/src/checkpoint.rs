@@ -1424,9 +1424,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "qd_control",    // #120
         "variation",     // #122: missing means auto
         "selection",     // #465: missing means lexicographic
-        "linear_scaling", // #470: missing means false
         "mutation_mix",       // #471: missing means classic
-        "tree_arity",         // #471: missing means uniform
         "crossover_internal", // #471: missing means 0
         "adaptive_mix",       // #471: missing means false
     ];
@@ -1438,6 +1436,18 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         .map(|s| s.as_str())
         .filter(|k| !KEYS.contains(k) && !OPTIONAL_KEYS.contains(k))
         .collect();
+    if extras.contains(&"linear_scaling") {
+        return Err(
+            "checkpoint was written with --linear-scaling, which was removed (#470); it cannot be resumed"
+                .to_string(),
+        );
+    }
+    if extras.contains(&"tree_arity") {
+        return Err(
+            "checkpoint was written with --tree-arity balanced, which was removed (#471); it cannot be resumed"
+                .to_string(),
+        );
+    }
     if extras.contains(&"patience_tol") || extras.contains(&"stop_front") {
         return Err(
             "checkpoint was written with --patience-tol or --stop-on front, which were removed (#464); it cannot be resumed"
@@ -1624,23 +1634,9 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             ))
         }
     };
-    let linear_scaling = match fields.get("linear_scaling").map(|s| s.as_str()) {
-        None | Some("false") => false,
-        Some("true") => true,
-        Some(other) => {
-            return Err(format!(
-                "config 'linear_scaling' must be true or false, got '{}'",
-                other
-            ))
-        }
-    };
     let mutation_mix = match fields.get("mutation_mix") {
         None => crate::search::MutationMix::Classic,
         Some(s) => crate::search::MutationMix::parse(s).map_err(|e| format!("config 'mutation_mix': {}", e))?,
-    };
-    let tree_arity = match fields.get("tree_arity") {
-        None => crate::search::TreeArity::Uniform,
-        Some(s) => crate::search::TreeArity::parse(s).map_err(|e| format!("config 'tree_arity': {}", e))?,
     };
     let crossover_internal = match fields.get("crossover_internal") {
         None => 0.0,
@@ -1844,9 +1840,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         threads: 1,
         variation,
         selection,
-        linear_scaling, // #470
         mutation_mix,
-        tree_arity,
         crossover_internal,
         adaptive_mix,
     })
@@ -1937,16 +1931,9 @@ fn write_config(cfg: &Config, out: &mut String) {
     if cfg.selection != crate::search::Selection::Lexicographic {
         writeln!(out, "config selection {}", cfg.selection.as_str()).unwrap();
     }
-    // #470: written only when on, so every other checkpoint keeps its bytes.
-    if cfg.linear_scaling {
-        writeln!(out, "config linear_scaling true").unwrap();
-    }
     // #471: written only when set, so every other checkpoint keeps its bytes.
     if cfg.mutation_mix != crate::search::MutationMix::Classic {
         writeln!(out, "config mutation_mix {}", cfg.mutation_mix.as_str()).unwrap();
-    }
-    if cfg.tree_arity != crate::search::TreeArity::Uniform {
-        writeln!(out, "config tree_arity {}", cfg.tree_arity.as_str()).unwrap();
     }
     if cfg.crossover_internal != 0.0 {
         writeln!(out, "config crossover_internal {}", encode_f64(cfg.crossover_internal)).unwrap();

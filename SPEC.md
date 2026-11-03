@@ -321,9 +321,7 @@ Per generation, per island:
      random operator), **delete** (replace a node by one of its children),
      **swap** (exchange the operands of a non-commutative binary operator) and
      **rotate** (`o1(a, o2(b, c))` becomes `o2(o1(a, b), c)`), selected with
-     `--mutation-mix extended`; `--tree-arity balanced` draws the arity class of
-     a random operator first (binary 0.5, unary 0.4, ternary 0.1);
-     `--crossover-internal P` cuts at an internal node with probability `P`;
+     `--mutation-mix extended`; `--crossover-internal P` cuts at an internal node with probability `P`;
      `--adaptive-mix` lets each island reweight the seven edit kinds from the
      success rate of the last 10 generations. The flat postfix engine keeps its
      own edits and refuses these flags;

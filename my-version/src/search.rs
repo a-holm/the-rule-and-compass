@@ -20,7 +20,7 @@ use crate::mix::{MixCounts, MixWindow};
 use crate::complexity::ComplexityModel;
 use crate::data::Sample;
 use crate::expr::{
-    self, crossover_with_opts, eval, mutate_with_opts, random_tree_opts, AggTable, Node, Op,
+    self, crossover_with_opts, eval, mutate_with_opts, random_tree_with, AggTable, Node, Op,
 };
 use crate::metrics::{score_weighted, Metric};
 // #15: multi-output combined error and per-output constant fitting.
@@ -138,36 +138,6 @@ impl MutationMix {
         match self {
             MutationMix::Classic => expr::CLASSIC_MIX,
             MutationMix::Extended => expr::EXTENDED_MIX,
-        }
-    }
-}
-
-/// #471: how random trees draw an operator.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum TreeArity {
-    /// Uniform over `ops`.
-    #[default]
-    Uniform,
-    /// Arity class first (binary 0.5, unary 0.4, ternary 0.1), then uniform.
-    Balanced,
-}
-
-impl TreeArity {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TreeArity::Uniform => "uniform",
-            TreeArity::Balanced => "balanced",
-        }
-    }
-
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "uniform" => Ok(TreeArity::Uniform),
-            "balanced" => Ok(TreeArity::Balanced),
-            other => Err(format!(
-                "tree arity must be 'uniform' or 'balanced', got '{}'",
-                other
-            )),
         }
     }
 }
@@ -380,14 +350,9 @@ pub struct Config {
     pub variation: VariationMode,
     /// #465: survivor and parent selection inside an island.
     pub selection: Selection,
-    /// #470: wrap every candidate shape in a fitted affine output map
-    /// `a + b*f(x)`. Changes the trajectory, so it is a saved search setting.
-    pub linear_scaling: bool,
     /// #471: the node-path edit weights. Changes the trajectory, so it is a
     /// saved search setting.
     pub mutation_mix: MutationMix,
-    /// #471: operator draw in random trees.
-    pub tree_arity: TreeArity,
     /// #471: probability that a crossover cut point is an internal node.
     pub crossover_internal: f64,
     /// #471: per-island edit weights learned from success rates.
@@ -586,9 +551,6 @@ fn fit_and_score(
     let t = counters.filter(|c| c.timed).map(|_| std::time::Instant::now());
     let workers = batch_workers(workers, trees.len(), train.sample.len());
     let out = par_map(workers, trees, |mut tree| {
-        if cfg.linear_scaling {
-            tree = crate::scale::ensure(tree, 0.0, 1.0); // #470
-        }
         let mut fitted = None;
         if fit {
             fitted = fit_counted(counters, &mut tree, cfg, fit_sample, train.sample); // #85 #87 #211
@@ -685,9 +647,7 @@ impl Default for Config {
             threads: 1,
             variation: VariationMode::Auto,
             selection: Selection::Lexicographic,
-            linear_scaling: false,
             mutation_mix: MutationMix::Classic,
-            tree_arity: TreeArity::Uniform,
             crossover_internal: 0.0,
             adaptive_mix: false,
         }
@@ -737,9 +697,7 @@ impl Config {
         compare!(fit_polish, "fit_polish");
         compare!(fit_irls, "fit_irls"); // #611
         compare!(fit_admission, "fit_admission");
-        compare!(linear_scaling, "linear_scaling"); // #470
         compare!(mutation_mix, "mutation_mix"); // #471
-        compare!(tree_arity, "tree_arity"); // #471
         compare!(crossover_internal, "crossover_internal"); // #471
         compare!(adaptive_mix, "adaptive_mix"); // #471
         compare!(dedup, "dedup");
@@ -783,22 +741,10 @@ impl Config {
         }
     }
 
-    /// #470: the complexity cap for a generated candidate. The affine wrapper is
-    /// free, so it extends the cap by exactly what it costs.
-    fn complexity_cap(&self) -> f64 {
-        let extra = if self.linear_scaling {
-            crate::scale::overhead(&self.complexity_model)
-        } else {
-            0.0
-        };
-        self.max_complexity as f64 + extra
-    }
-
     /// #471: the variation options of the node path.
     pub fn variation_opts(&self) -> expr::VariationOpts {
         expr::VariationOpts {
             mix: self.mutation_mix.weights(),
-            balanced: self.tree_arity == TreeArity::Balanced,
             crossover_internal: self.crossover_internal,
         }
     }
@@ -808,8 +754,6 @@ impl Config {
     pub fn node_variation_flag(&self) -> Option<&'static str> {
         if self.mutation_mix != MutationMix::Classic {
             Some("--mutation-mix")
-        } else if self.tree_arity != TreeArity::Uniform {
-            Some("--tree-arity")
         } else if self.crossover_internal > 0.0 {
             Some("--crossover-internal")
         } else if self.adaptive_mix {
@@ -4058,11 +4002,6 @@ fn fit_constants_with_iters(
     score: &Sample,
     iters: usize,
 ) -> Option<FitResult> {
-    // #470: start the map of a wrapped tree at the closed-form least squares
-    // on the fit rows; the configured fitter then refines every constant.
-    if cfg.linear_scaling && cfg.metric.is_least_squares() {
-        crate::scale::restart(tree, &fit.x, &fit.y, &fit.w);
-    }
     if cfg.metric.is_implicit_derivative() {
         crate::implicit::fit(tree, &fit.x, &fit.w, iters);
         None
@@ -5605,24 +5544,12 @@ fn evolve_island(
                 None
             };
             let mut used = 0u8; // #471: bit per edit kind applied to this child
-            // #470: variation edits the bare shape; the child inherits the first
-            // parent's map as its warm start.
-            let (scale_a, scale_b, p1) = if cfg.linear_scaling {
-                crate::scale::split(&p1)
-            } else {
-                (0.0, 1.0, p1)
-            };
             let mut child = p1;
             if rng.bool(0.5) {
                 let (parent2, age2) = pick_parent_aged(
                     isl, front, qd, rng, front_p, qd_policy, qd_control, afp, &par_rank, &par_crowd,
                 );
                 age = age.max(age2);
-                let parent2 = if cfg.linear_scaling {
-                    crate::scale::split(&parent2).2
-                } else {
-                    parent2
-                };
                 crossover_with_opts(&mut child, &parent2, rng, Some(aggs), opts.crossover_internal);
             }
             let edit = mutate_with_opts(&mut child, rng, nvars, &cfg.ops, Some(aggs), &opts);
@@ -5632,11 +5559,8 @@ fn evolve_island(
                 used |= edit.map_or(0, |k| 1 << k.index());
             }
 
-            let mut tree = expr::simplify(&child);
-            if cfg.linear_scaling {
-                tree = expr::simplify(&crate::scale::wrap(scale_a, scale_b, tree));
-            }
-            if cfg.complexity_model.complexity(&tree) > cfg.complexity_cap() {
+            let tree = expr::simplify(&child);
+            if cfg.complexity_model.complexity(&tree) > cfg.max_complexity as f64 {
                 GenCounters::count(counters, |c| &c.too_complex); // #211
                 continue;
             }
@@ -5657,7 +5581,7 @@ fn evolve_island(
         let scored = fit_and_score(trees, workers, cfg, train, fit_sample, fit, defer_gpu, counters, rows);
         for (k, (mut ind, age)) in scored.into_iter().zip(ages).enumerate() {
             ind.age = age;
-            if ind.complexity > cfg.complexity_cap() {
+            if ind.complexity > cfg.max_complexity as f64 {
                 GenCounters::count(counters, |c| &c.post_fit_drops); // #463
                 continue;
             }
@@ -5686,13 +5610,12 @@ fn evolve_island(
         let trees: Vec<Node> = (next.len()..pop)
             .map(|_| {
                 draw_row_dependent(cfg, nvars, &mut have_const, || {
-                    expr::simplify(&random_tree_opts(
+                    expr::simplify(&random_tree_with(
                         rng,
                         nvars,
                         &cfg.ops,
                         cfg.init_depth,
                         Some(aggs),
-                        base_opts.balanced,
                     ))
                 })
             })
@@ -5718,8 +5641,8 @@ fn evolve_island(
             for _ in 0..immigrants {
                 let hc = have_const_imm;
                 let t = draw_row_dependent(cfg, nvars, &mut have_const_imm, || {
-                    let mut t = random_tree_opts(
-                        rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced,
+                    let mut t = random_tree_with(
+                        rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs)
                     );
                     let mut best_score = if hc && !expr::row_dependent(&t) {
                         f64::INFINITY
@@ -5728,8 +5651,8 @@ fn evolve_island(
                         (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2)
                     };
                     for _ in 0..3 {
-                        let cand = random_tree_opts(
-                            rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced,
+                        let cand = random_tree_with(
+                            rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs)
                         );
                         let d = qd::descriptor(&cand, train.sample);
                         let score = (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2);
@@ -5766,7 +5689,7 @@ fn evolve_island(
         let trees: Vec<Node> = (0..k)
             .map(|_| {
                 draw_row_dependent(cfg, nvars, &mut have_const_afp, || {
-                    expr::simplify(&random_tree_opts(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs), base_opts.balanced))
+                    expr::simplify(&random_tree_with(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs)))
                 })
             })
             .collect();
@@ -7708,13 +7631,12 @@ fn run_search(
         for isl in 0..cfg.islands.max(1) {
             let depth = cfg.init_depth.min(1 + isl % 3);
             for _ in 0..cfg.pop {
-                init_trees.push(random_tree_opts(
+                init_trees.push(random_tree_with(
                     &mut rng,
                     nvars,
                     &cfg.ops,
                     depth,
                     Some(&aggs),
-                    cfg.tree_arity == TreeArity::Balanced,
                 ));
             }
         }
@@ -7722,14 +7644,6 @@ fn run_search(
             batch_workers(cfg.threads, init_trees.len(), init_eval.sample.len()),
             init_trees,
             |tree| {
-                let tree = if !cfg.linear_scaling {
-                    tree
-                } else if defer_gpu {
-                    crate::scale::wrap(0.0, 1.0, tree) // #470
-                } else {
-                    let s = init_eval.sample;
-                    crate::scale::wrap_closed_form(tree, &s.x, &s.y, &s.w)
-                };
                 // #26: generation 0 is a whole generation too; defer it to the
                 // same batch as the first real generation.
                 if defer_gpu {
@@ -8622,13 +8536,12 @@ fn run_search(
                         for ind in islands[ii].iter_mut() {
                             let hc = have_const; // #477
                             let mut t = draw_row_dependent(cfg, nvars, &mut have_const, || {
-                                let mut t = random_tree_opts(
+                                let mut t = random_tree_with(
                                     &mut r,
                                     nvars,
                                     &cfg.ops,
                                     cfg.init_depth,
                                     Some(&aggs),
-                                    cfg.tree_arity == TreeArity::Balanced,
                                 );
                                 if let Some(target) = qd_target {
                                     let mut best = t.clone();
@@ -8639,13 +8552,12 @@ fn run_search(
                                         (best_d.usage - target.usage).powi(2) + (best_d.skew - target.skew).powi(2)
                                     };
                                     for _ in 0..3 {
-                                        let cand = random_tree_opts(
+                                        let cand = random_tree_with(
                                             &mut r,
                                             nvars,
                                             &cfg.ops,
                                             cfg.init_depth,
                                             Some(&aggs),
-                                            cfg.tree_arity == TreeArity::Balanced,
                                         );
                                         let d = qd::descriptor(&cand, gen_train);
                                         let score = (d.usage - target.usage).powi(2)
@@ -8661,9 +8573,6 @@ fn run_search(
                                 }
                                 t
                             });
-                            if cfg.linear_scaling {
-                                t = crate::scale::ensure(t, 0.0, 1.0); // #470
-                            }
                             // #15: multi-output fits per output inside the evaluator.
                             let mut fitted = None;
                             if cfg.fit_iters > 0
@@ -11576,71 +11485,6 @@ mod tests {
             aged_ind(input(0), 2.0, 2.0, 1),
         ];
         assert_eq!(afp_worst(&island), Some(1));
-    }
-
-    fn affine_sample() -> Sample {
-        let x: Vec<Vec<f64>> = (0..60).map(|i| vec![i as f64 * 0.1 - 3.0]).collect();
-        let y: Vec<f64> = x.iter().map(|r| 2.0 * r[0] + 1.0).collect();
-        Sample::new(x, y)
-    }
-
-    fn scaling_cfg(strategy: crate::fit::FitStrategy) -> Config {
-        let mut cfg = Config::default();
-        cfg.metric = Metric::Squared;
-        cfg.fit_iters = 8;
-        cfg.fit_strategy = strategy;
-        cfg.linear_scaling = true;
-        cfg
-    }
-
-    /// #470: a constant-free shape reaches the exact affine map in one fit call.
-    #[test]
-    fn linear_scaling_recovers_affine_exactly() {
-        let s = affine_sample();
-        for strategy in [crate::fit::FitStrategy::Exact, crate::fit::FitStrategy::Auto] {
-            let cfg = scaling_cfg(strategy);
-            let mut tree = crate::scale::wrap(0.0, 1.0, expr::input(0));
-            let fit = fit_constants(&mut tree, &cfg, &s, &s).expect("a fit result");
-            assert!(fit.sse <= 1e-20, "{:?}: sse {}", strategy, fit.sse);
-            let sse: f64 = s.x.iter().zip(&s.y).map(|(r, y)| (eval(&tree, r) - y).powi(2)).sum();
-            assert!(sse <= 1e-20, "{:?}: phenotype sse {}", strategy, sse);
-        }
-    }
-
-    /// #470: wrap, fit, split and re-wrap keep the constants bit for bit.
-    #[test]
-    fn linear_scaling_split_roundtrip() {
-        let s = affine_sample();
-        let cfg = scaling_cfg(crate::fit::FitStrategy::Exact);
-        let shape = expr::node(Op::Sin, vec![expr::input(0)]);
-        let mut tree = crate::scale::wrap(0.3, 0.7, shape);
-        fit_constants(&mut tree, &cfg, &s, &s);
-        let (a, b, f) = crate::scale::split(&tree);
-        let again = crate::scale::wrap(a, b, f);
-        let (a2, b2, _) = crate::scale::split(&again);
-        assert_eq!(a.to_bits(), a2.to_bits());
-        assert_eq!(b.to_bits(), b2.to_bits());
-        assert_eq!(again, tree);
-    }
-
-    /// #470: a short search with the map finds `2x + 1` and reports the wrapped
-    /// formula; the same search without it does not change.
-    #[test]
-    fn linear_scaling_search_reports_the_wrapped_formula() {
-        let s = affine_sample();
-        let mut cfg = scaling_cfg(crate::fit::FitStrategy::Exact);
-        cfg.generations = 6;
-        cfg.pop = 40;
-        cfg.seed = 3;
-        cfg.gpu = false;
-        let out = run(&cfg, &s, &s);
-        let best = out
-            .archive
-            .items
-            .iter()
-            .map(|m| m.error)
-            .fold(f64::INFINITY, f64::min);
-        assert!(best <= 1e-18, "best error {}", best);
     }
 
     /// #589: `n` rows with `x0` negative except three rows at 4.9, and `x1`
