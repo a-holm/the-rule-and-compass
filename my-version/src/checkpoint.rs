@@ -1437,7 +1437,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "variation",     // #122: missing means auto
         "selection",     // #465: missing means lexicographic
         "mutation_mix",       // #471: missing means classic
-        "tree_arity",         // #471: missing means uniform
         "crossover_internal", // #471: missing means 0
         "adaptive_mix",       // #471: missing means false
     ];
@@ -1452,6 +1451,12 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
     if extras.contains(&"linear_scaling") {
         return Err(
             "checkpoint was written with --linear-scaling, which was removed (#470); it cannot be resumed"
+                .to_string(),
+        );
+    }
+    if extras.contains(&"tree_arity") {
+        return Err(
+            "checkpoint was written with --tree-arity balanced, which was removed (#471); it cannot be resumed"
                 .to_string(),
         );
     }
@@ -1638,10 +1643,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
     let mutation_mix = match fields.get("mutation_mix") {
         None => crate::search::MutationMix::Classic,
         Some(s) => crate::search::MutationMix::parse(s).map_err(|e| format!("config 'mutation_mix': {}", e))?,
-    };
-    let tree_arity = match fields.get("tree_arity") {
-        None => crate::search::TreeArity::Uniform,
-        Some(s) => crate::search::TreeArity::parse(s).map_err(|e| format!("config 'tree_arity': {}", e))?,
     };
     let crossover_internal = match fields.get("crossover_internal") {
         None => 0.0,
@@ -1858,7 +1859,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         variation,
         selection,
         mutation_mix,
-        tree_arity,
         crossover_internal,
         adaptive_mix,
     })
@@ -1958,9 +1958,6 @@ fn write_config(cfg: &Config, out: &mut String) {
     // #471: written only when set, so every other checkpoint keeps its bytes.
     if cfg.mutation_mix != crate::search::MutationMix::Classic {
         writeln!(out, "config mutation_mix {}", cfg.mutation_mix.as_str()).unwrap();
-    }
-    if cfg.tree_arity != crate::search::TreeArity::Uniform {
-        writeln!(out, "config tree_arity {}", cfg.tree_arity.as_str()).unwrap();
     }
     if cfg.crossover_internal != 0.0 {
         writeln!(out, "config crossover_internal {}", encode_f64(cfg.crossover_internal)).unwrap();

@@ -126,10 +126,6 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
     from CPU-scored generations only;
   - *crossover* — swap subtrees between two parents; `--crossover-internal P`
     picks an internal node as the cut point with probability `P`;
-  - *random trees* — `--tree-arity balanced` draws the arity class of each
-    operator first (binary 0.5, unary 0.4, ternary 0.1) instead of choosing
-    uniformly among all operators, which favours the 15 unary operators of the
-    default set;
 - **Constant fitting** tunes the numeric constants of a candidate by local
   search. Without it, `y = a·sin(b·x) + c` would almost never be found, because
   random constants rarely land near the right values.
