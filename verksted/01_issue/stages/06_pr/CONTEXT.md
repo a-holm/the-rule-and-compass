@@ -19,9 +19,9 @@ Do NOT load: merge, gate, close.
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. `git push -u origin "issue/$N-$SLUG"`, then `gh pr create --base "$BASE" --body-file <filled pr.md>`. Do not merge.
-3. The PR body lists every acceptance criterion with its box ticked or open, commands with counts, deviations, and `Refs #N`.
-4. Write `report.md` per `output-format.md`: PR number, head sha, criteria with evidence, what was not verified.
+2. `git push -u origin "issue/$N-$SLUG"`, then `gh pr create --base "$BASE" --body-file <filled pr.md>`. The base is the integration branch `$BASE`. Do not merge.
+3. The PR body lists every acceptance criterion with its box ticked or open, commands with counts, deviations, and ends with `Refs #N, #EPIC` (the epic from the issue metadata).
+4. Write `report.md` per `output-format.md`: PR number, head sha, each criterion with its test name or log path, deviations with reasons, open items, findings outside the issue.
 
 ## Outputs
 

@@ -156,15 +156,7 @@ Generate a noisy circle, ordered along the arc so the moving average is
 meaningful (`t` is just the row order; the target is `y`):
 
 ```sh
-python3 - <<'PY'
-import math
-with open("circle.csv", "w") as f:
-    f.write("t,x,y\n")
-    for i in range(80):
-        a = 2 * math.pi * i / 80
-        r = 1 + 0.012 * math.sin(7 * a) + 0.005 * math.cos(3 * a)
-        f.write(f"{i},{r*math.cos(a):.8f},{r*math.sin(a):.8f}\n")
-PY
+awk 'BEGIN{pi=atan2(0,-1); print "t,x,y"; for(i=0;i<80;i++){a=2*pi*i/80; r=1+0.012*sin(7*a)+0.005*cos(3*a); printf "%d,%.8f,%.8f\n", i, r*cos(a), r*sin(a)}}' > circle.csv
 
 rcsr --data circle.csv --target y --vars x --time t \
      --implicit-derivative --smooth 5 \

@@ -9,7 +9,7 @@ One job: download spot files from the vendor archive and verify every checksum.
 
 **Reference (every run):**
 - `../../../_shared/rules.md`
-- `../../../../docs/python-pipeline-retirement.md`
+- `../../../../docs/data-pipeline.md`
 - `../../CONTEXT.md`
 
 Do NOT load: perpetual or futures data, any HTTP client inside the crate. Build the tool once: `cargo build --release --manifest-path tools/acquire/Cargo.toml` (through the lock).

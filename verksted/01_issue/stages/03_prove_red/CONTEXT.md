@@ -13,16 +13,19 @@ One job: show on unfixed code that each testable criterion fails.
 - `../../../_shared/commands.md`
 - `../../../_shared/failure-modes.md`
 - `../../CONTEXT.md`
+- `../../../_tools/rc-run.sh`
+- `../../../_tools/test-summary.sh`
 
 Do NOT load: the fix, docs, the PR.
 
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. Write the failing test or repro first (Rust only, no Python). Run it through the lock, narrow, with an outer `timeout`; log to `$G/issue$N-red.log`.
-3. The log must show `test result: FAILED` for the new test and no `error[E....]` or `could not compile` line. A compile error is not red. The `error: test failed` line cargo prints after a red test is expected.
-4. A documentation-only issue (`area:docs`, no behaviour) writes `n/a: <reason>` as the first line of `red.md` and names its own red proof, for example a deliberately broken link.
-5. Write `red.md`: command, log path, failing test names.
+2. Write the failing test or repro first (Rust only, no Python). When the fix already exists, show red on a temporary WIP commit that reverts the fix. Never use `git stash` (shared by all worktrees). Drop the WIP commit before the first push.
+3. Build: `verksted/_tools/rc-run.sh build "$W" "$N" red-build [--cuda] -- cargo test --release [--features cuda] --no-run --test <file>`. Run: `verksted/_tools/rc-run.sh test "$W" "$N" red [--cuda] -- cargo test --release [--features cuda] --test <file> <filter>`. The log is `$GATES/issue$N-red.log`.
+4. `verksted/_tools/test-summary.sh` on that log must print `tests: passed=<n> failed=<k>` with k at least 1 and `errors: 0`. A compile error is not red. The `error: test failed` line cargo prints after a red test is expected.
+5. A documentation-only issue (`area:docs`, no behaviour) writes `n/a: <reason>` as the first line of `red.md` and names its own red proof, for example a deliberately broken link.
+6. Write `red.md`: command, log path, failing test names.
 
 ## Outputs
 
@@ -32,7 +35,7 @@ Do NOT load: the fix, docs, the PR.
 ## Check
 
 ```sh
-grep -q 'test result: FAILED' "$G/issue$N-red.log" && ! grep -qE 'could not compile|^error\[E[0-9]+\]' "$G/issue$N-red.log" || head -1 "$V/01_issue/stages/03_prove_red/output/red.md" | grep -q '^n/a: '
+s=$(verksted/_tools/test-summary.sh "$GATES/issue$N-red.log"); { echo "$s" | grep -qE '^tests: passed=[0-9]+ failed=[1-9]' && echo "$s" | grep -qx 'errors: 0'; } || head -1 "$V/01_issue/stages/03_prove_red/output/red.md" | grep -q '^n/a: '
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.

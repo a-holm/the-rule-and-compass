@@ -1123,7 +1123,7 @@ fn pit_asof_joins_are_byte_identical_and_causal() {
 /// * `RCSR_PARITY_STORE`: the input store, default
 ///   `/mnt/lager/tmp/opencode/prep-measure/panel15m.rcsb` (16,113,108 rows,
 ///   109 symbols, 15-minute bars; not in git).
-/// * `RCSR_PARITY_WORK`: output directory (default `/mnt/lager/tmp/eureqa-gates/parity-large`).
+/// * `RCSR_PARITY_WORK`: output directory (default `/mnt/lager/tmp/rcsr-gates/parity-large`).
 /// * `RCSR_PARITY_ARM`: `cpu`, `gpu` (writes the store, then a second
 ///   `--dry-run` GPU run whose hashes must equal the first) or `compare`.
 ///
@@ -1138,7 +1138,7 @@ fn large_store_parity_at_the_declared_tiers() {
         return;
     }
     let work = std::path::PathBuf::from(
-        std::env::var("RCSR_PARITY_WORK").unwrap_or_else(|_| "/mnt/lager/tmp/eureqa-gates/parity-large".to_string()),
+        std::env::var("RCSR_PARITY_WORK").unwrap_or_else(|_| "/mnt/lager/tmp/rcsr-gates/parity-large".to_string()),
     );
     std::fs::create_dir_all(&work).unwrap();
     let arm = std::env::var("RCSR_PARITY_ARM").expect("RCSR_PARITY_ARM=cpu|gpu|compare");

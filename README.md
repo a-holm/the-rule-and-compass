@@ -473,7 +473,7 @@ atomically instead of streaming it. See
   blocks are copied byte for byte, dtypes and dictionaries survive, a duplicate
   name needs an explicit `--replace`, and every change is chunk-size stable.
   Windows are causal and gap-aware, warm-up is reported per column, and the
-  `py15m` group reproduces the 35 Python enrichment columns on a committed
+  `py15m` group reproduces the 35 legacy enrichment columns on a committed
   parity fixture, the `compact` group emits the exact 52-column smoke/parity
   subset at the 15 m base, the `flow` group materialises `vwap` plus the nine
   derived OHLCV/flow columns (taker ratios, trade intensity, average trade
@@ -660,9 +660,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
 
 Subcommands (`rcsr import`, `rcsr prep`, `rcsr enrich`, `rcsr panel`, `rcsr
 walkforward`, `rcsr verify-manifest`, `rcsr dev-report`) carry their own option
-lists in `rcsr schema`; the block above is the root search command. The former
-Python pipeline is classified and retired in
-[`docs/python-pipeline-retirement.md`](docs/python-pipeline-retirement.md):
+lists in `rcsr schema`; the block above is the root search command. The data
+pipeline is described in [`docs/data-pipeline.md`](docs/data-pipeline.md):
 the documented path is these Rust commands plus the acquisition tool
 [`rcsr-acquire`](#acquiring-the-binance-vision-archive). `rcsr dev-report` summarises the optional `--dev-log` NDJSON record.
 
@@ -1383,14 +1382,20 @@ coverage/entropy, per-island best, RNG key). The file is `rcsr.dev.ndjson` next
 to `--json-out`/`--save`, else in the working directory; `--no-dev-log` turns it
 off. It never changes the archive, the results or the configuration hash, each
 event is one atomic line, and the file is bounded by `--dev-log-max-bytes`.
-`rcsr dev-report <log>` (pure Rust, no Python) turns the file into a phase table,
+`rcsr dev-report <log>` turns the file into a phase table,
 a fit-versus-evaluation share, fallback causes, convergence and archive growth,
 and a ranked list of bottlenecks. See [`docs/dev-log.md`](docs/dev-log.md).
 
 ## Layout
 
+How the parts fit together: [`docs/how-it-works.md`](docs/how-it-works.md).
+
+The agent workshop: [`verksted/AGENTS.md`](verksted/AGENTS.md).
+
 ```
 SPEC.md                       behaviour specification
+docs/how-it-works.md          how the engine, GPU backend, data pipeline, protocol and agent workflow fit together
+verksted/AGENTS.md            the workshop: numbered pipelines for the recurring agent workflows
 docs/how-symbolic-regression-works.md   plain-language explainer
 docs/optimisation.md          theory, literature and measurements behind the search
 docs/data-splitting.md        train/test splitting for time series and panel data

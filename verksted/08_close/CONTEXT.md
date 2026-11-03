@@ -15,6 +15,8 @@ Evidence: GitHub closed issues through `Closes` in pushed commits; issues were c
 - `../_shared/output-format.md`
 - `../_templates/verification-comment.md`
 - `../../docs/issue-workflow.md`
+- `../_tools/wt-done.sh`
+- `../_tools/test-summary.sh`
 
 Do NOT load: the implementation pipelines' stages, earlier runs' `output/`, the rest of `../_shared/`.
 
