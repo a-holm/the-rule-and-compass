@@ -21,8 +21,8 @@ step() {
   local name=$1 cmd=$2
   "$L" bash -c "cd '$W/my-version' && CARGO_BUILD_JOBS=2 $cmd" > "$D/$T-$name.log" 2>&1
 }
-step cpu "timeout 5400 cargo test --release"; c=$?
-step cuda "RCSR_CUDA_ARCH=sm_86 timeout 5400 cargo test --release --features cuda"; g=$?
+step cpu "timeout 5400 cargo test --release --no-fail-fast"; c=$?
+step cuda "RCSR_CUDA_ARCH=sm_86 timeout 5400 cargo test --release --features cuda --no-fail-fast"; g=$?
 step bench "timeout 5400 cargo build --release && timeout 1800 ./target/release/rcsr-bench --tiny"; b=$?
 bad=0
 for k in cpu cuda; do

@@ -64,7 +64,7 @@ rm /mnt/lager/tmp/opencode/STREAMING
 verksted/_tools/gate.sh "$WT/integration-gpu-hardening" <tag>   # logs: $G/<tag>-{cpu,cuda,bench}.log
 ```
 
-Three lock holds: `cargo test --release`; `RCSR_CUDA_ARCH=sm_86 cargo test --release --features cuda`; `cargo build --release && ./target/release/rcsr-bench --tiny` (must print `recovered 27/27`). Start it as one background shell and wait for the notification.
+Three lock holds: `cargo test --release --no-fail-fast`; `RCSR_CUDA_ARCH=sm_86 cargo test --release --features cuda --no-fail-fast`; `cargo build --release && ./target/release/rcsr-bench --tiny` (must print `recovered 27/27`). Start it as one background shell and wait for the notification.
 
 ## Waiting
 

@@ -6349,9 +6349,16 @@ mod fit_tests {
         let (out, _) = ev.fit_batch(&[&plan], 4, crate::fit::DeviceLoss::Squared);
         assert_eq!(out[0].status, 7, "non-finite start must be labelled log-only");
 
-        // Unsupported (piecewise-constant) operators never reach the kernel.
+        // An operator without a fit opcode never reaches the kernel.
+        let asinh = node(Op::Asinh, vec![node(Op::Mul, vec![constant(0.5), input(0)])]);
+        assert!(crate::fit::gpu_fit_plan(&asinh).is_none());
+        assert_eq!(
+            crate::fit::gpu_fit_plan_reason(&asinh).err(),
+            Some(crate::fit::GpuFitReject::UnsupportedOp)
+        );
+        // Floor has a device opcode since #548.
         let floor = node(Op::Floor, vec![node(Op::Mul, vec![constant(0.5), input(0)])]);
-        assert!(crate::fit::gpu_fit_plan(&floor).is_none());
+        assert!(crate::fit::gpu_fit_plan(&floor).is_some());
     }
 
 
