@@ -159,3 +159,54 @@ fn fit_polish_cycle_split_is_recorded_and_resets() {
     assert!(share[2] < share[0], "off ({}) spends less of the kernel on polish than f64 ({})", share[2], share[0]);
     assert!(share[1] < share[0], "f32 polish ({}) is cheaper than f64 ({})", share[1], share[0]);
 }
+
+fn varied_model(p: usize, cand: usize) -> Node {
+    let mut terms: Vec<Node> = (0..p)
+        .map(|k| {
+            let c = 0.25 + 0.07 * k as f64 + 0.013 * ((cand * 7 + k * 3) % 11) as f64;
+            node(Op::Mul, vec![constant(c), input(k)])
+        })
+        .collect();
+    let mut tree = terms.pop().expect("one term");
+    while let Some(t) = terms.pop() {
+        tree = node(Op::Add, vec![t, tree]);
+    }
+    tree
+}
+
+/// Status, SSE bits and constant bits of 64 candidates per `p`, loss and polish
+/// mode. With `RCSR_UNION_BITS_OUT` set the lines are written to that file so
+/// two builds can be compared with `cmp`.
+#[test]
+fn fit_union_keeps_results_bitwise() {
+    let n = 600;
+    let mut lines = String::new();
+    for p in [4usize, 16, 20] {
+        let (x, y, _) = fixture(p, n);
+        let Some(mut ev) = evaluator(&x, &y) else {
+            return;
+        };
+        let plans: Vec<fit::GpuFitPlan> =
+            (0..64).map(|c| fit::gpu_fit_plan(&varied_model(p, c)).expect("plan")).collect();
+        let refs: Vec<&fit::GpuFitPlan> = plans.iter().collect();
+        for loss in [DeviceLoss::Squared, DeviceLoss::Absolute] {
+            for mode in [FitPolish::F64, FitPolish::F32] {
+                ev.set_fit_polish(mode);
+                let (out, ms) = ev.fit_batch(&refs, 8, loss);
+                assert!(ms >= 0.0 && out.len() == 64, "p={p} {loss:?} {mode:?}");
+                for (c, r) in out.iter().enumerate() {
+                    lines.push_str(&format!(
+                        "p={p} {loss:?} {mode:?} c={c} status={} sse={:016x} k={:x?}\n",
+                        r.status,
+                        r.sse.to_bits(),
+                        bits(&r.c)
+                    ));
+                }
+            }
+        }
+    }
+    if let Ok(path) = std::env::var("RCSR_UNION_BITS_OUT") {
+        std::fs::write(path, &lines).expect("write the bit record");
+    }
+    assert_eq!(lines.lines().count(), 3 * 2 * 2 * 64);
+}
