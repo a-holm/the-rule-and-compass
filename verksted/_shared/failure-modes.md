@@ -25,8 +25,23 @@ Mined from the Claude Code and opencode sessions of this repo (2026-10-18 to 202
 | F19 | Flaky test failed the gate (a timing comparison; a 3.5e-9 relative miss once in 22 runs) | #311, #359 | rule 17 |
 | F20 | Four tickets active against a cap of three | 2026-10-30 | rule 21; `../03_orchestrate/stages/01_wave_plan/CONTEXT.md` |
 | F21 | Dead agent left unreviewed work in its worktree | #295, #301 salvage | `../03_orchestrate/stages/03_dispatch/CONTEXT.md`: a new Sonnet agent treats it as a draft |
-| F22 | Shared `CARGO_TARGET_DIR` linked artefacts from another tree | opencode 2026-10-18, twice | rule 6 |
+| F22 | Shared `CARGO_TARGET_DIR` linked artefacts from another tree | opencode 2026-10-18, twice, and 2026-11-01 (#470: an A/B base tree built with the branch's target dir) | rule 6 |
 | F23 | DNS failure during fetch or merge; retry loops | 2026-10-30 | verify with `gh pr view --json state,mergeCommit` after a retry |
 | F24 | `rm -rf` with variables denied by a safety check | three agents | rule 7: `git worktree remove` with an explicit path |
 | F25 | Device out-of-bounds read after a refused allocation (Xid 31); nvidia_uvm NULL dereference; every CPU soft-locked; desktop frozen 07:33 to 13:07 | kernel log 2026-10-31, #381 | rule 31 |
 | F26 | Only one ticket worked while it blocked a merge; the cap was read as counting lock waiters | user 2026-10-31 | rule 21 |
+| F27 | A pinned binary's RUNPATH pointed into a removed build dir; a sealed run exited 127 | 2026-11-02; #659, PR #660 | rule 29; `../07_longrun/stages/01_preconditions/CONTEXT.md` |
+| F28 | The system `compute-sanitizer` (CUDA 12.0) has no injection library for driver 580 | 2026-11-02 | rule 31 |
+| F29 | A sanitized search-level test ran every stage on the CPU, so a clean memcheck proved nothing | #438 | rule 31 |
+| F30 | `git stash` used across worktrees | 14 shell calls | rule 32 |
+| F31 | Agent history rewrites reverted base files | 2026-11-01 | rule 33 |
+| F32 | A new refusal on a shared path broke other agents' tests | 2026-11-01 | rule 36 |
+| F33 | Results reported without a log | 2026-11-01 | rule 34 |
+| F34 | Merge comments with forward-looking lines and unverified agent numbers | user, 2026-11-01 | rule 35 |
+| F35 | Wall-time comparisons under SCHED_IDLE at load 13 to 19 were noise | 21 hand-backs | rule 38 |
+| F36 | Long A/B sweeps left in nohup loops held the lock after the report | 2026-11-01 | rule 37 |
+| F37 | `pkill -f` killed other agents' jobs | 24 shell calls, 2026-11-01 | rule 26 |
+| F38 | The same brief text pasted into every prompt | 45 of 76 prompts on 2026-10-31 | `../03_orchestrate/stages/02_brief/CONTEXT.md` |
+| F39 | Throw-away editor scripts and interpreter heredoc patches | about 60 `ed*.sh` files; 1,597 heredoc patches in opencode | rule 9 |
+| F40 | `pgrep -f` wait loops written after the rule existed | 2026-11-01T23:44 | rules 26 and 27 |
+| F41 | Placeholder ids passed literally to a message call, twice | opencode | `../03_orchestrate/stages/02_brief/CONTEXT.md` |
