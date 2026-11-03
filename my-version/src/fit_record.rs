@@ -299,18 +299,24 @@ impl Default for Fnv {
     }
 }
 
-/// Hash of one candidate's `(status, sse bits, c bits)`; `c` is its `kmax` row.
+/// Hash of one candidate's `(status, sse bits, c bits)`; `c` holds its used constants.
 pub fn candidate_hash(status: i32, sse: f64, c: &[f64]) -> u64 {
     let mut h = Fnv::new();
     h.candidate(status, sse, c);
     h.0
 }
 
+/// The constants the host reads: the first `pcount` of the candidate's `kmax` row. The
+/// kernel leaves the padding slots of a row unwritten, so they are never compared.
+pub fn used_constants<'a>(c: &'a [f64], kmax: usize, pcount: &[i32], k: usize) -> &'a [f64] {
+    &c[k * kmax..k * kmax + pcount[k] as usize]
+}
+
 /// Hash of a whole result, candidate by candidate in order.
-pub fn output_hash(status: &[i32], sse: &[f64], c: &[f64], kmax: usize) -> u64 {
+pub fn output_hash(status: &[i32], sse: &[f64], c: &[f64], kmax: usize, pcount: &[i32]) -> u64 {
     let mut h = Fnv::new();
     for (k, (&st, &s)) in status.iter().zip(sse).enumerate() {
-        h.candidate(st, s, &c[k * kmax..(k + 1) * kmax]);
+        h.candidate(st, s, used_constants(c, kmax, pcount, k));
     }
     h.0
 }

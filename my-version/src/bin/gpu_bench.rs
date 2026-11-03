@@ -97,7 +97,7 @@ fn run_replay(dir: &str, reps: usize) -> i32 {
         for _ in 0..reps {
             let r = ev.fit_replay_call(call);
             ms.push(r.ms);
-            let h = fit_record::output_hash(&r.status, &r.sse, &r.c, kmax);
+            let h = fit_record::output_hash(&r.status, &r.sse, &r.c, kmax, &call.pcount);
             match &first {
                 None => first = Some((h, r.status.clone(), r.sse.clone(), r.c.clone())),
                 Some((h0, ..)) => stable &= *h0 == h,
@@ -105,10 +105,13 @@ fn run_replay(dir: &str, reps: usize) -> i32 {
             cycles.push(r.cycles);
         }
         let (out_hash, status, sse, c) = first.unwrap();
-        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        let same = status == call.status && bits(&sse) == bits(&call.sse) && bits(&c) == bits(&call.c);
+        let used = |c: &[f64], i: usize| fit_record::used_constants(c, kmax, &call.pcount, i).to_vec();
+        let cand = |st: &[i32], s: &[f64], c: &[f64], i: usize| fit_record::candidate_hash(st[i], s[i], &used(c, i));
+        let same = fit_record::output_hash(&call.status, &call.sse, &call.c, kmax, &call.pcount) == out_hash;
         if !same || !stable {
             failed += 1;
+            let first_bad = (0..call.nprog as usize).find(|&i| cand(&status, &sse, &c, i) != cand(&call.status, &call.sse, &call.c, i));
+            eprintln!("call {}: first differing candidate {:?}, stable across reps: {}", k, first_bad, stable);
         }
         let nprog = call.nprog as usize;
         let mid = |lane: usize, i: usize| {
@@ -122,7 +125,7 @@ fn run_replay(dir: &str, reps: usize) -> i32 {
             ms_median: median(&mut ms.clone()),
             lm: (0..nprog).map(|i| mid(0, i)).collect(),
             polish: (0..nprog).map(|i| mid(1, i)).collect(),
-            cand_hash: (0..nprog).map(|i| fit_record::candidate_hash(status[i], sse[i], &c[i * kmax..(i + 1) * kmax])).collect(),
+            cand_hash: (0..nprog).map(|i| cand(&status, &sse, &c, i)).collect(),
         };
         println!("{}", line.json(&ms, &status, out_hash, same, stable));
         ncalls += 1;
