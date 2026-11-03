@@ -1115,7 +1115,7 @@ What the tests check: every column at its tier (`device_columns_match_the_cpu_at
 Large store (not in git): `/mnt/lager/tmp/opencode/prep-measure/panel15m.rcsb` (16,113,108 rows). Each arm is its own invocation so no lock hold covers both.
 
 ```sh
-export RCSR_PARITY_STORE=/mnt/lager/tmp/opencode/prep-measure/panel15m.rcsb RCSR_PARITY_WORK=/mnt/lager/tmp/eureqa-gates/parity-large
+export RCSR_PARITY_STORE=/mnt/lager/tmp/opencode/prep-measure/panel15m.rcsb RCSR_PARITY_WORK=/mnt/lager/tmp/rcsr-gates/parity-large
 for arm in cpu gpu compare; do
   RCSR_PARITY_ARM=$arm cargo test --release --features cuda --test gpu_parity large_store -- --ignored --nocapture
 done

@@ -1923,7 +1923,7 @@ With device-fit operators every admitted candidate fits on the device (234 of 23
 
 `if(c, a, b)` is fittable on the device with fit opcode 32. The record keeps the condition in `kid0`, the then-branch in `kid1` and the else-branch in the slot word. The forward sweep selects `c > 0 ? a : b` in f32 and f64, so a row exactly at the switch point (`c == 0`) takes the else branch like `expr.rs`, and a `NaN` in the untaken branch does not reach the result. The adjoint adds the output adjoint to the taken branch only; the condition gets none (it is piecewise constant), as in the CPU adjoint. The default operator set now has full device fit coverage, so the run-level cost model uses `s = 1`.
 
-Paired search (`classes206k.csv`, 154,500 rows, `hinge_ordinary`, default operators, 5 generations, 4 islands, pop 16, seed 5, logs `/mnt/lager/tmp/eureqa-gates/issue403-e2e.log`):
+Paired search (`classes206k.csv`, 154,500 rows, `hinge_ordinary`, default operators, 5 generations, 4 islands, pop 16, seed 5, logs `/mnt/lager/tmp/rcsr-gates/issue403-e2e.log`):
 
 | arm | wall | fit stage | admitted / device / CPU fallback | hinge |
 |---|---|---|---|---|
@@ -2595,7 +2595,7 @@ caller runs the CPU scan.
 Measured on the RTX 3060 (`sm_86`), 3,943,856 rows, `β = 0.1`, `K = 1`, one
 candidate, block size 256, one launch, device times including upload and
 download (`bench_band_dp_device_vs_cpu`, log
-`/mnt/lager/tmp/eureqa-gates/issue306-final.log`):
+`/mnt/lager/tmp/rcsr-gates/issue306-final.log`):
 
 | groups | band CPU | band device | DP CPU | DP device |
 |---:|---:|---:|---:|---:|
