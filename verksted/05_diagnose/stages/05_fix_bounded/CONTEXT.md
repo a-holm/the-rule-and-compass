@@ -12,6 +12,7 @@ One job: fix the cause and bound every wait so a future bug fails with a message
 - `../../../_shared/rules.md`
 - `../../../_shared/commands.md`
 - `../../CONTEXT.md`
+- `../../../_tools/rc-run.sh`
 
 Do NOT load: unrelated cleanups, weaker exactness guards.
 
@@ -19,7 +20,7 @@ Do NOT load: unrelated cleanups, weaker exactness guards.
 
 1. If an input is missing or empty, stop and say which.
 2. Fix the cycle found in stage 03. Replace each unbounded wait on the path with a bounded one that names what it waited for. Never weaken an exactness guard.
-3. Rerun the repro N times: write `fixed.md` with `hangs: 0/N` and the log path. Run the ring or area tests narrowly: `$G/issue$N-green.log` shows `test result: ok`.
+3. Rerun the repro N times with `verksted/_tools/rc-run.sh run <W> <id> <tag> --timeout S -- <command>` (S at most 600): write `fixed.md` with `hangs: 0/N` and the log path. Run the ring or area tests narrowly the same way: `$G/issue$N-green.log` shows `test result: ok`.
 
 ## Outputs
 

@@ -17,8 +17,12 @@ Evidence: #303 held the lock and 11 GB of GPU for over 90 minutes (I/O counter f
 - `../../docs/issue-workflow.md`
 - `../../scripts/stacks.sh`
 - `../../scripts/stall-watch.sh`
+- `../_tools/sanitize.sh`
+- `../_tools/rc-run.sh`
 
 Do NOT load: the data and long-run pipelines, earlier runs' `output/`, the rest of `../_shared/`.
+
+Sanitizer first: a GPU crash or a CPU/GPU delta in changed CUDA code runs `verksted/_tools/sanitize.sh` before any plain GPU run (rule 31). When memcheck cannot attach or does not scale, bisect with device `printf` on a small input, through the lock (a missing barrier in a log-loss kernel was found this way).
 
 ## Process
 

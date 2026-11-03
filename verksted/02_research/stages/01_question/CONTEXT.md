@@ -11,15 +11,18 @@ One job: state the question, the overlapping issues and the numbered premises to
 - `../../../_shared/rules.md`
 - `../../../_templates/research-question.md`
 - `../../CONTEXT.md`
+- `../../../_tools/wt-new.sh`
+- `../../../_tools/wt-done.sh`
 
 Do NOT load: code changes, other issues' research, the answer.
 
 ## Process
 
 1. If the issue cannot be read, stop and say so.
-2. Run on an Opus agent with tractatus thinking and context7: no code, no branch, no commit (`agent-model-policy`, `rules.md`).
-3. Copy `_templates/research-question.md` to `output/question.md` and fill it. Name overlapping issues by number and the evidence files by path.
-4. List the premises as `- P1: <claim that must be true>`. A premise is something a measurement can refute.
+2. Run on an Opus agent with tractatus_thinking and context7, no web search or web fetch. No code, no branch, no commit (rule 40).
+3. Make a read-only research worktree: `verksted/_tools/wt-new.sh --research <slug>`. It prints `W=` and `SCRATCH=`. Remove it at the end of the pipeline with `verksted/_tools/wt-done.sh --research <slug>`.
+4. Copy `_templates/research-question.md` to `output/question.md` and fill it. Name overlapping issues by number and the evidence files by path.
+5. List the premises as `- P1: <claim that must be true>`. A premise is something a measurement can refute.
 
 ## Outputs
 
