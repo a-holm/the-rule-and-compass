@@ -13,6 +13,11 @@
 
 use std::process::Command;
 
+#[path = "common/scratch.rs"]
+mod scratch;
+
+use scratch::Scratch;
+
 const FRONT: &str = "rank\tcomplexity\ttrain_error\ttest_error\texpression\n\
 1\t1\t2.97670764\t3.66924796\t(0.5726 * (0.1305 + x))\n\
 2\t2\t2.17852613\t2.42006255\texp((0.5726 * (0.1305 + x)))\n\
@@ -33,10 +38,8 @@ fn documented_baseline_front_is_pinned_at_one_and_eight_threads() {
 }
 
 fn pinned_front(threads: Option<&str>) {
-    let out = std::env::temp_dir().join(format!(
-        "rcsr-trajectory-{}.tsv",
-        std::process::id()
-    ));
+    let dir = Scratch::new("front");
+    let out = dir.join("front.tsv");
     let data = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/clean.csv");
     let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args([
@@ -74,7 +77,6 @@ fn pinned_front(threads: Option<&str>) {
         String::from_utf8_lossy(&output.stderr)
     );
     let got = std::fs::read_to_string(&out).expect("read the front");
-    let _ = std::fs::remove_file(&out);
 
     assert_eq!(
         got, FRONT,
