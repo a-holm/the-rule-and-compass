@@ -1352,9 +1352,9 @@ so errors only fall. The front is then rebuilt from refit errors (refit trees)
 and pre-refit errors (the rest), and every front member that was not refit is
 refit, repeating until none is left, so every reported member is an exact CPU
 f64 refit. The refit set depends only on errors, costs and structural hashes,
-never on timing. `--refit-band F` sets the relative band (default `0.001`);
-`--refit-band inf` refits every unique tree and reproduces the archive hash of
-the full refit. The band is a saved search setting, written to a checkpoint only
+never on timing. `--refit-band F` sets the relative band (default `inf`);
+`--refit-band inf` (the default) refits every unique tree and reproduces the archive hash of
+the full refit. The default band is `inf`: in the default-decision A/B round (#495), 6 of 26 paired runs reported a different front with `0.001` (REAL seeds 23 and 27; TAB squared 15k seeds 11 and 13, log_loss 15k seed 12, log_loss 112k seed 12), all from the final refit, so `0.001` is opt-in and cuts `gpu.fit.refit_s` at the cost of that difference. The band is a saved search setting, written to a checkpoint only
 when it differs from the default; a resume refuses a different explicit value.
 `gpu.fit.refit_candidates` (unique trees), `refits`, `refit_s` (refit window
 wall) and `rescore_s` (full-data scoring wall) report the work; the development
