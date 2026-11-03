@@ -1440,19 +1440,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #211: the cost of one generation event on its own — render the record,
-    /// format the JSON and append it to a file — so the overhead claim has a
-    /// measured per-event number next to the end-to-end A/B. The bound is
-    /// deliberately loose (5 ms); the printed figure is the datum quoted in
-    /// docs/dev-log.md and the issue.
+    /// #211: the log grows by exactly one line plus a newline per event, and
+    /// the summary record is smaller than the full one.
     #[test]
-    fn one_generation_event_costs_well_under_a_millisecond() {
+    fn dev_log_bytes_grow_by_exactly_the_event_lines() {
+        let dir = std::env::temp_dir().join(format!("rcsr-devlog-bytes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bytes.ndjson");
+        let mut log = Log::create(&path, 0).unwrap();
+        let record = rec();
+        let n = 50;
+        let mut grow = |level: Level| -> (u64, usize) {
+            let before = log.bytes();
+            let mut len = 0;
+            for _ in 0..n {
+                let out = record.json_at(level);
+                len = out.len();
+                assert!(log.append(&out, false));
+            }
+            (log.bytes() - before, len)
+        };
+        let (summary_grown, summary_len) = grow(Level::Summary);
+        assert_eq!(summary_grown, (n * (summary_len + 1)) as u64);
+        let (full_grown, full_len) = grow(Level::Full);
+        assert_eq!(full_grown, (n * (full_len + 1)) as u64);
+        assert!(summary_len < full_len, "the summary record must be smaller than the full one");
+        assert!(log.bytes() > 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), log.bytes());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #211: per-event cost of rendering and appending; run with `--ignored`.
+    #[test]
+    #[ignore = "timing measurement"]
+    fn measure_dev_log_event_cost() {
         let dir = std::env::temp_dir().join(format!("rcsr-devlog-cost-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cost.ndjson");
         let mut log = Log::create(&path, 0).unwrap();
         let record = rec();
-        // Warm the formatter and the page cache.
         for _ in 0..100 {
             let line = record.json();
             log.append(&line, false);
@@ -1473,16 +1499,6 @@ mod tests {
             "# dev-log cost: summary {:.2} us/event ({} bytes), full {:.2} us/event ({} bytes)",
             summary_us, summary_bytes, per_event_us, full_bytes
         );
-        assert!(
-            summary_bytes < full_bytes,
-            "the summary record must be smaller than the full one"
-        );
-        assert!(
-            per_event_us < 5000.0,
-            "one event took {:.0} us; the log would not be free",
-            per_event_us
-        );
-        assert!((log.bytes() as f64) > 0.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

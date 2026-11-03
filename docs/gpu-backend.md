@@ -3397,6 +3397,8 @@ launches: sanitizer runs pass `--dispatch device`, and GPU test helpers set
 `DispatchMode::Device`. When `auto` keeps every stage on the CPU, the run
 reports `backend_reason` `dispatch: cost model kept every stage on the cpu`.
 
+The memcheck pass is defined by `my-version/tests/sanitizer.plan` and run by `verksted/_tools/sanitize-all.sh`. Each line names a binary and a test (or `*`), a mode and a reason. `skip` runs nothing. `api-errors-no` runs that one test alone with `--report-api-errors no`, because it provokes a `cudaMalloc` out-of-memory on purpose and the default reports that call as an error. The runner exports `RCSR_UNDER_SANITIZER=memcheck`; a test reads it through `tests/common/sanitizer.rs` (`active()`, `pick(native, sanitized)`) to pick a smaller fixture that still crosses every chunk, tile and gap boundary. Every run is capped at 580 s; a run that hits the cap fails as `budget`. `tests/sanitizer_plan.rs` fails when the plan names a binary or test that does not exist.
+
 See [`dispatch.md`](dispatch.md) for the formulas, JSON shape and the tests.
 
 ## Device memory plan (#293)

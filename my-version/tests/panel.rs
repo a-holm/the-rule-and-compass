@@ -503,11 +503,11 @@ fn a_part_with_a_stale_series_end_is_rebuilt() {
     let dir_s = dir.to_string_lossy().to_string();
     let cold = build_panel_resumable(Some(&s), &m, DAY, &dir_s, "store-a", "").unwrap();
     let untouched = std::fs::metadata(dir.join("C.part")).unwrap().modified().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(20));
     // A part that records an older series end (as if the input had grown) must
     // not be trusted: the source-fed path rebuilds it. The checksum covers the
     // payload, so patching the header alone still parses.
     let a_part = dir.join("A.part");
+    let cold_bytes = std::fs::read(&a_part).unwrap();
     let mut bytes = std::fs::read(&a_part).unwrap();
     bytes[20..28].copy_from_slice(&0i64.to_le_bytes());
     std::fs::write(&a_part, &bytes).unwrap();
@@ -517,10 +517,8 @@ fn a_part_with_a_stale_series_end_is_rebuilt() {
     let rebuilt = build_panel_resumable(Some(&s), &m, DAY, &dir_s, "store-a", "").unwrap();
     assert_eq!(rebuilt.rows, cold.rows);
     assert_eq!(rebuilt.delisted, cold.delisted);
-    assert!(
-        std::fs::metadata(&a_part).unwrap().modified().unwrap() > untouched,
-        "the stale part is rewritten"
-    );
+    assert_ne!(bytes, cold_bytes, "the patch changed the header");
+    assert_eq!(std::fs::read(&a_part).unwrap(), cold_bytes, "the stale part is rewritten");
     assert_eq!(
         std::fs::metadata(dir.join("C.part")).unwrap().modified().unwrap(),
         untouched,

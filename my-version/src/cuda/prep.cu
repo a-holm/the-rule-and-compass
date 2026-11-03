@@ -168,6 +168,131 @@ typedef struct RcPrep {
     double batch_start_ms;
 } RcPrep;
 
+/* Device-side view of the prep context. Passed by value so device code never
+   dereferences the host RcPrep. */
+typedef struct RcPrepDev {
+    const int *d_bucket_lo;
+    const int *d_emit;
+    const int *d_out_at;
+    const int *d_run_lo;
+    const long long *d_s_chain;
+    const double *d_s_close;
+    const unsigned char *d_s_complete;
+    const double *d_s_high;
+    const int *d_s_index;
+    const double *d_s_low;
+    const double *d_s_open;
+    const double *d_s_quote_volume;
+    const int *d_s_seg;
+    const double *d_s_taker_buy_base;
+    const double *d_s_taker_buy_quote;
+    const long long *d_s_time;
+    const unsigned char *d_s_traded;
+    const double *d_s_trades;
+    const double *d_s_volume;
+    long long *d_o_chain;
+    double *d_o_close;
+    unsigned int *d_o_cov;
+    unsigned int *d_o_dup_rows;
+    unsigned int *d_o_flags;
+    unsigned int *d_o_gap;
+    double *d_o_high;
+    double *d_o_low;
+    double *d_o_open;
+    double *d_o_quote_volume;
+    int *d_o_seg;
+    double *d_o_taker_buy_base;
+    double *d_o_taker_buy_quote;
+    long long *d_o_time;
+    double *d_o_trades;
+    double *d_o_volume;
+    long long *d_u_chain;
+    double *d_u_close;
+    unsigned char *d_u_complete;
+    int *d_u_conflict;
+    int *d_u_dup_rows;
+    int *d_u_first_row;
+    double *d_u_high;
+    int *d_u_len;
+    double *d_u_low;
+    double *d_u_open;
+    double *d_u_quote_volume;
+    int *d_u_seg;
+    double *d_u_taker_buy_base;
+    double *d_u_taker_buy_quote;
+    long long *d_u_time;
+    unsigned char *d_u_traded;
+    double *d_u_trades;
+    double *d_u_volume;
+    int n;
+    int n_unique;
+    long long in_step;
+    long long out_step;
+} RcPrepDev;
+
+static RcPrepDev prep_dev(const RcPrep *c)
+{
+    RcPrepDev v;
+    v.d_bucket_lo = c->d_bucket_lo;
+    v.d_emit = c->d_emit;
+    v.d_o_chain = c->d_o_chain;
+    v.d_o_close = c->d_o_close;
+    v.d_o_cov = c->d_o_cov;
+    v.d_o_dup_rows = c->d_o_dup_rows;
+    v.d_o_flags = c->d_o_flags;
+    v.d_o_gap = c->d_o_gap;
+    v.d_o_high = c->d_o_high;
+    v.d_o_low = c->d_o_low;
+    v.d_o_open = c->d_o_open;
+    v.d_o_quote_volume = c->d_o_quote_volume;
+    v.d_o_seg = c->d_o_seg;
+    v.d_o_taker_buy_base = c->d_o_taker_buy_base;
+    v.d_o_taker_buy_quote = c->d_o_taker_buy_quote;
+    v.d_o_time = c->d_o_time;
+    v.d_o_trades = c->d_o_trades;
+    v.d_o_volume = c->d_o_volume;
+    v.d_out_at = c->d_out_at;
+    v.d_run_lo = c->d_run_lo;
+    v.d_s_chain = c->d_s_chain;
+    v.d_s_close = c->d_s_close;
+    v.d_s_complete = c->d_s_complete;
+    v.d_s_high = c->d_s_high;
+    v.d_s_index = c->d_s_index;
+    v.d_s_low = c->d_s_low;
+    v.d_s_open = c->d_s_open;
+    v.d_s_quote_volume = c->d_s_quote_volume;
+    v.d_s_seg = c->d_s_seg;
+    v.d_s_taker_buy_base = c->d_s_taker_buy_base;
+    v.d_s_taker_buy_quote = c->d_s_taker_buy_quote;
+    v.d_s_time = c->d_s_time;
+    v.d_s_traded = c->d_s_traded;
+    v.d_s_trades = c->d_s_trades;
+    v.d_s_volume = c->d_s_volume;
+    v.d_u_chain = c->d_u_chain;
+    v.d_u_close = c->d_u_close;
+    v.d_u_complete = c->d_u_complete;
+    v.d_u_conflict = c->d_u_conflict;
+    v.d_u_dup_rows = c->d_u_dup_rows;
+    v.d_u_first_row = c->d_u_first_row;
+    v.d_u_high = c->d_u_high;
+    v.d_u_len = c->d_u_len;
+    v.d_u_low = c->d_u_low;
+    v.d_u_open = c->d_u_open;
+    v.d_u_quote_volume = c->d_u_quote_volume;
+    v.d_u_seg = c->d_u_seg;
+    v.d_u_taker_buy_base = c->d_u_taker_buy_base;
+    v.d_u_taker_buy_quote = c->d_u_taker_buy_quote;
+    v.d_u_time = c->d_u_time;
+    v.d_u_traded = c->d_u_traded;
+    v.d_u_trades = c->d_u_trades;
+    v.d_u_volume = c->d_u_volume;
+    v.in_step = c->in_step;
+    v.n = c->n;
+    v.n_unique = c->n_unique;
+    v.out_step = c->out_step;
+    return v;
+}
+
 typedef struct RcPrepHostOut {
     long long *time;
     double *open;
@@ -268,19 +393,19 @@ __device__ __forceinline__ long long rc_prep_bucket(long long t, long long step)
 }
 
 /* Bitwise payload equality for one equal-time run. */
-__device__ __forceinline__ bool rc_same_payload(RcPrep *c, int a, int b)
+__device__ __forceinline__ bool rc_same_payload(const RcPrepDev &c, int a, int b)
 {
-    if (c->d_s_complete[a] != c->d_s_complete[b]) return false;
-    if (c->d_s_traded[a] != c->d_s_traded[b]) return false;
-    return __double_as_longlong(c->d_s_open[a]) == __double_as_longlong(c->d_s_open[b]) &&
-           __double_as_longlong(c->d_s_high[a]) == __double_as_longlong(c->d_s_high[b]) &&
-           __double_as_longlong(c->d_s_low[a]) == __double_as_longlong(c->d_s_low[b]) &&
-           __double_as_longlong(c->d_s_close[a]) == __double_as_longlong(c->d_s_close[b]) &&
-           __double_as_longlong(c->d_s_volume[a]) == __double_as_longlong(c->d_s_volume[b]) &&
-           __double_as_longlong(c->d_s_quote_volume[a]) == __double_as_longlong(c->d_s_quote_volume[b]) &&
-           __double_as_longlong(c->d_s_trades[a]) == __double_as_longlong(c->d_s_trades[b]) &&
-           __double_as_longlong(c->d_s_taker_buy_base[a]) == __double_as_longlong(c->d_s_taker_buy_base[b]) &&
-           __double_as_longlong(c->d_s_taker_buy_quote[a]) == __double_as_longlong(c->d_s_taker_buy_quote[b]);
+    if (c.d_s_complete[a] != c.d_s_complete[b]) return false;
+    if (c.d_s_traded[a] != c.d_s_traded[b]) return false;
+    return __double_as_longlong(c.d_s_open[a]) == __double_as_longlong(c.d_s_open[b]) &&
+           __double_as_longlong(c.d_s_high[a]) == __double_as_longlong(c.d_s_high[b]) &&
+           __double_as_longlong(c.d_s_low[a]) == __double_as_longlong(c.d_s_low[b]) &&
+           __double_as_longlong(c.d_s_close[a]) == __double_as_longlong(c.d_s_close[b]) &&
+           __double_as_longlong(c.d_s_volume[a]) == __double_as_longlong(c.d_s_volume[b]) &&
+           __double_as_longlong(c.d_s_quote_volume[a]) == __double_as_longlong(c.d_s_quote_volume[b]) &&
+           __double_as_longlong(c.d_s_trades[a]) == __double_as_longlong(c.d_s_trades[b]) &&
+           __double_as_longlong(c.d_s_taker_buy_base[a]) == __double_as_longlong(c.d_s_taker_buy_base[b]) &&
+           __double_as_longlong(c.d_s_taker_buy_quote[a]) == __double_as_longlong(c.d_s_taker_buy_quote[b]);
 }
 
 __device__ __forceinline__ bool rc_structural(const long long *time, int lo, int hi,
@@ -374,12 +499,12 @@ __global__ void rc_prep_run_lo(const int *__restrict__ run_of,
  * One thread per equal-time run. Identical copies are a pure copy; a conflict
  * folds every copy exactly once in stable-sorted (input) order.
  */
-__global__ void rc_prep_unique(RcPrep *c, int n_unique)
+__global__ void rc_prep_unique(RcPrepDev c, int n_unique)
 {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= n_unique) return;
-    int lo = c->d_run_lo[r];
-    int hi = (r + 1 < n_unique) ? c->d_run_lo[r + 1] : c->n;
+    int lo = c.d_run_lo[r];
+    int hi = (r + 1 < n_unique) ? c.d_run_lo[r + 1] : c.n;
     bool same = true;
     for (int j = lo + 1; j < hi; ++j) {
         if (!rc_same_payload(c, lo, j)) {
@@ -387,47 +512,47 @@ __global__ void rc_prep_unique(RcPrep *c, int n_unique)
             break;
         }
     }
-    c->d_u_time[r] = c->d_s_time[lo];
-    c->d_u_chain[r] = c->d_s_chain[lo];
-    c->d_u_seg[r] = c->d_s_seg[lo];
-    c->d_u_complete[r] = c->d_s_complete[lo];
-    c->d_u_traded[r] = c->d_s_traded[lo];
-    c->d_u_open[r] = c->d_s_open[lo];
-    c->d_u_high[r] = c->d_s_high[lo];
-    c->d_u_low[r] = c->d_s_low[lo];
-    c->d_u_close[r] = c->d_s_close[lo];
-    c->d_u_volume[r] = c->d_s_volume[lo];
-    c->d_u_quote_volume[r] = c->d_s_quote_volume[lo];
-    c->d_u_trades[r] = c->d_s_trades[lo];
-    c->d_u_taker_buy_base[r] = c->d_s_taker_buy_base[lo];
-    c->d_u_taker_buy_quote[r] = c->d_s_taker_buy_quote[lo];
-    c->d_u_dup_rows[r] = hi - lo;
-    c->d_u_first_row[r] = c->d_s_index[lo];
-    c->d_u_len[r] = hi - lo;
-    c->d_u_conflict[r] = same ? 0 : 1;
+    c.d_u_time[r] = c.d_s_time[lo];
+    c.d_u_chain[r] = c.d_s_chain[lo];
+    c.d_u_seg[r] = c.d_s_seg[lo];
+    c.d_u_complete[r] = c.d_s_complete[lo];
+    c.d_u_traded[r] = c.d_s_traded[lo];
+    c.d_u_open[r] = c.d_s_open[lo];
+    c.d_u_high[r] = c.d_s_high[lo];
+    c.d_u_low[r] = c.d_s_low[lo];
+    c.d_u_close[r] = c.d_s_close[lo];
+    c.d_u_volume[r] = c.d_s_volume[lo];
+    c.d_u_quote_volume[r] = c.d_s_quote_volume[lo];
+    c.d_u_trades[r] = c.d_s_trades[lo];
+    c.d_u_taker_buy_base[r] = c.d_s_taker_buy_base[lo];
+    c.d_u_taker_buy_quote[r] = c.d_s_taker_buy_quote[lo];
+    c.d_u_dup_rows[r] = hi - lo;
+    c.d_u_first_row[r] = c.d_s_index[lo];
+    c.d_u_len[r] = hi - lo;
+    c.d_u_conflict[r] = same ? 0 : 1;
     if (same) return;
 
     unsigned char complete = 1;
     unsigned char traded = 0;
-    c->d_u_volume[r] = 0.0;
-    c->d_u_quote_volume[r] = 0.0;
-    c->d_u_trades[r] = 0.0;
-    c->d_u_taker_buy_base[r] = 0.0;
-    c->d_u_taker_buy_quote[r] = 0.0;
+    c.d_u_volume[r] = 0.0;
+    c.d_u_quote_volume[r] = 0.0;
+    c.d_u_trades[r] = 0.0;
+    c.d_u_taker_buy_base[r] = 0.0;
+    c.d_u_taker_buy_quote[r] = 0.0;
     for (int j = lo; j < hi; ++j) {
-        if (c->d_s_high[j] > c->d_u_high[r]) c->d_u_high[r] = c->d_s_high[j];
-        if (c->d_s_low[j] < c->d_u_low[r]) c->d_u_low[r] = c->d_s_low[j];
-        c->d_u_volume[r] += c->d_s_volume[j];
-        c->d_u_quote_volume[r] += c->d_s_quote_volume[j];
-        c->d_u_trades[r] += c->d_s_trades[j];
-        c->d_u_taker_buy_base[r] += c->d_s_taker_buy_base[j];
-        c->d_u_taker_buy_quote[r] += c->d_s_taker_buy_quote[j];
-        complete &= c->d_s_complete[j];
-        traded |= c->d_s_traded[j];
+        if (c.d_s_high[j] > c.d_u_high[r]) c.d_u_high[r] = c.d_s_high[j];
+        if (c.d_s_low[j] < c.d_u_low[r]) c.d_u_low[r] = c.d_s_low[j];
+        c.d_u_volume[r] += c.d_s_volume[j];
+        c.d_u_quote_volume[r] += c.d_s_quote_volume[j];
+        c.d_u_trades[r] += c.d_s_trades[j];
+        c.d_u_taker_buy_base[r] += c.d_s_taker_buy_base[j];
+        c.d_u_taker_buy_quote[r] += c.d_s_taker_buy_quote[j];
+        complete &= c.d_s_complete[j];
+        traded |= c.d_s_traded[j];
     }
-    c->d_u_close[r] = c->d_s_close[hi - 1];
-    c->d_u_complete[r] = complete;
-    c->d_u_traded[r] = traded;
+    c.d_u_close[r] = c.d_s_close[hi - 1];
+    c.d_u_complete[r] = complete;
+    c.d_u_traded[r] = traded;
 }
 
 __global__ void rc_prep_conflict_scatter(const long long *__restrict__ time,
@@ -494,54 +619,54 @@ __global__ void rc_prep_emit_flags(const long long *__restrict__ time,
     emit[b] = (structural || keep_partial) ? 1 : 0;
 }
 
-__global__ void rc_prep_fold(RcPrep *c, int n_buckets)
+__global__ void rc_prep_fold(RcPrepDev c, int n_buckets)
 {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= n_buckets || !c->d_emit[b]) return;
-    int o = c->d_out_at[b];
-    int lo = c->d_bucket_lo[b];
-    int hi = (b + 1 < n_buckets) ? c->d_bucket_lo[b + 1] : c->n_unique;
-    long long start = rc_prep_bucket(c->d_u_time[lo], c->out_step);
-    bool structural = rc_structural(c->d_u_time, lo, hi, c->in_step, c->out_step);
+    if (b >= n_buckets || !c.d_emit[b]) return;
+    int o = c.d_out_at[b];
+    int lo = c.d_bucket_lo[b];
+    int hi = (b + 1 < n_buckets) ? c.d_bucket_lo[b + 1] : c.n_unique;
+    long long start = rc_prep_bucket(c.d_u_time[lo], c.out_step);
+    bool structural = rc_structural(c.d_u_time, lo, hi, c.in_step, c.out_step);
 
-    c->d_o_time[o] = start;
-    c->d_o_chain[o] = c->d_u_chain[lo];
-    c->d_o_seg[o] = c->d_u_seg[lo];
-    c->d_o_open[o] = c->d_u_open[lo];
-    c->d_o_high[o] = c->d_u_high[lo];
-    c->d_o_low[o] = c->d_u_low[lo];
-    c->d_o_close[o] = c->d_u_close[lo];
-    c->d_o_volume[o] = 0.0;
-    c->d_o_quote_volume[o] = 0.0;
-    c->d_o_trades[o] = 0.0;
-    c->d_o_taker_buy_base[o] = 0.0;
-    c->d_o_taker_buy_quote[o] = 0.0;
+    c.d_o_time[o] = start;
+    c.d_o_chain[o] = c.d_u_chain[lo];
+    c.d_o_seg[o] = c.d_u_seg[lo];
+    c.d_o_open[o] = c.d_u_open[lo];
+    c.d_o_high[o] = c.d_u_high[lo];
+    c.d_o_low[o] = c.d_u_low[lo];
+    c.d_o_close[o] = c.d_u_close[lo];
+    c.d_o_volume[o] = 0.0;
+    c.d_o_quote_volume[o] = 0.0;
+    c.d_o_trades[o] = 0.0;
+    c.d_o_taker_buy_base[o] = 0.0;
+    c.d_o_taker_buy_quote[o] = 0.0;
     unsigned int cov = (unsigned int)(hi - lo);
     unsigned int dup = 0;
     unsigned char complete = structural ? 1 : 0;
     unsigned char conflict = 0;
     for (int j = lo; j < hi; ++j) {
-        if (c->d_u_high[j] > c->d_o_high[o]) c->d_o_high[o] = c->d_u_high[j];
-        if (c->d_u_low[j] < c->d_o_low[o]) c->d_o_low[o] = c->d_u_low[j];
-        c->d_o_volume[o] += c->d_u_volume[j];
-        c->d_o_quote_volume[o] += c->d_u_quote_volume[j];
-        c->d_o_trades[o] += c->d_u_trades[j];
-        c->d_o_taker_buy_base[o] += c->d_u_taker_buy_base[j];
-        c->d_o_taker_buy_quote[o] += c->d_u_taker_buy_quote[j];
-        dup += (unsigned int)c->d_u_dup_rows[j];
-        complete &= c->d_u_complete[j];
-        conflict |= (unsigned char)c->d_u_conflict[j];
+        if (c.d_u_high[j] > c.d_o_high[o]) c.d_o_high[o] = c.d_u_high[j];
+        if (c.d_u_low[j] < c.d_o_low[o]) c.d_o_low[o] = c.d_u_low[j];
+        c.d_o_volume[o] += c.d_u_volume[j];
+        c.d_o_quote_volume[o] += c.d_u_quote_volume[j];
+        c.d_o_trades[o] += c.d_u_trades[j];
+        c.d_o_taker_buy_base[o] += c.d_u_taker_buy_base[j];
+        c.d_o_taker_buy_quote[o] += c.d_u_taker_buy_quote[j];
+        dup += (unsigned int)c.d_u_dup_rows[j];
+        complete &= c.d_u_complete[j];
+        conflict |= (unsigned char)c.d_u_conflict[j];
     }
-    c->d_o_close[o] = c->d_u_close[hi - 1];
-    c->d_o_cov[o] = cov;
-    c->d_o_dup_rows[o] = dup;
-    c->d_o_gap[o] = 0;
+    c.d_o_close[o] = c.d_u_close[hi - 1];
+    c.d_o_cov[o] = cov;
+    c.d_o_dup_rows[o] = dup;
+    c.d_o_gap[o] = 0;
     unsigned int flags = 0;
     if (complete) flags |= RC_PREP_COMPLETE;
-    if (c->d_o_volume[o] > 0.0 || c->d_o_trades[o] > 0.0) flags |= RC_PREP_TRADED;
+    if (c.d_o_volume[o] > 0.0 || c.d_o_trades[o] > 0.0) flags |= RC_PREP_TRADED;
     if (!structural) flags |= RC_PREP_PARTIAL;
     if (conflict) flags |= RC_PREP_CONFLICT;
-    c->d_o_flags[o] = flags;
+    c.d_o_flags[o] = flags;
 }
 
 /* Gap tags over the compacted output; segment or chain changes reset. */
@@ -940,7 +1065,7 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
 
     rc_prep_run_lo<<<nb, threads>>>(c->d_run_of, c->d_run_flags, n, c->d_run_lo);
     int ub = blocks_for(c->n_unique, threads);
-    rc_prep_unique<<<ub, threads>>>(c, c->n_unique);
+    rc_prep_unique<<<ub, threads>>>(prep_dev(c), c->n_unique);
 
     /* Deterministic conflict list: exclusive scan, then scatter. */
     err = rc_cub_status(cub::DeviceScan::ExclusiveSum(
@@ -1010,7 +1135,7 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
     }
 
     if (c->n_out > 0) {
-        rc_prep_fold<<<bb, threads>>>(c, n_buckets);
+        rc_prep_fold<<<bb, threads>>>(prep_dev(c), n_buckets);
         int ob = blocks_for(c->n_out, threads);
         rc_prep_gap<<<ob, threads>>>(c->d_o_time, c->d_o_chain, c->d_o_seg,
                                c->d_o_gap, c->d_o_flags, c->n_out, out_step);
