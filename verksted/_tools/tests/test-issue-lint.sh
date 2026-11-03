@@ -129,6 +129,13 @@ expect closes 1 "$T/closes.md" "FAIL: closing-keyword" --offline
 derive fixes-lower 's/^Why\./why fixes #12/'
 expect fixes-lower 1 "$T/fixes-lower.md" "FAIL: closing-keyword" --offline
 
+derive quoted-closes 's/^Why\./Why. The fixture has `Closes #12` in it./'
+expect quoted-inline 0 "$T/quoted-closes.md" OK --offline
+derive quoted-then-bare 's/^Why\./Why. `Closes #12` is quoted but Fixes #13 is bare./'
+expect quoted-then-bare 1 "$T/quoted-then-bare.md" "FAIL: closing-keyword" --offline
+derive fenced-closes 's/^Closes nothing here/Closes #12/'
+expect quoted-fenced 0 "$T/fenced-closes.md" OK --offline
+
 dash=$(printf '\xe2\x80\x94')
 derive dash "s/^Why\./Why $dash really./"
 expect em-dash 1 "$T/dash.md" "FAIL: em-dash" --offline

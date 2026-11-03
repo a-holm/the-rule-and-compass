@@ -224,7 +224,8 @@ fi
 
 # Forbidden text
 body=$(printf '%s\n' "${L[@]}")
-if grep -qiE '(closes|fixes|resolves)[[:space:]]+#' <<< "$body"; then
+prose=$(awk '/^[[:space:]]*(```|~~~)/ { f = !f; next } !f' <<< "$body" | sed 's/`[^`]*`//g')
+if grep -qiE '(closes|fixes|resolves)[[:space:]]+#' <<< "$prose"; then
   fail "closing-keyword: Closes, Fixes or Resolves followed by #N"
 fi
 if grep -qF "$(printf '\xe2\x80\x94')" <<< "$body"; then
