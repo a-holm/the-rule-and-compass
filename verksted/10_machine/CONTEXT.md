@@ -14,15 +14,17 @@ Evidence: the lock scripts (SCHED_IDLE, nice 19, ionice idle, autogroup 19, stre
 - `../_shared/rules.md`
 - `../_shared/failure-modes.md`
 - `../_shared/output-format.md`
+- `../_tools/status.sh`
+- `../_tools/machine-sync.sh`
 
 Do NOT load: the ticket pipelines' stages, earlier runs' `output/`.
 
 ## Process
 
-1. `stages/01_lock/`: all heavy work runs through the lock at the lowest priority.
+1. `stages/01_lock/`: builds in the build slot, tests and GPU runs behind the test lock, live scripts checked against the canonical copies.
 2. `stages/02_pause/`: create the `PAUSE` file so new runs wait.
 3. `stages/03_measure/`: measure load, GPU and top consumers.
-4. `stages/04_priority/`: act only on processes you started; ask before restarting the terminal.
+4. `stages/04_priority/`: the desktop has priority; screen blanking and lock stay off; act only on processes you started; ask before restarting the terminal.
 5. `stages/05_resume/`: remove the `PAUSE` file and report.
 
 ## Outputs
