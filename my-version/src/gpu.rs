@@ -908,6 +908,9 @@ extern "C" {
     /* #496: summed per-block cycles of the LM phase and the polish phase of
        the fit launches since the last call; resets both. */
     fn rc_take_fit_cycles(ctx: *mut RawCtx, out: *mut u64) -> i32;
+    /* #704: the per-candidate (LM, polish) cycle words of the last fit launch,
+       two per candidate; `n` is the candidate capacity of `out`. */
+    fn rc_fit_last_cycles(ctx: *mut RawCtx, out: *mut u64, n: i32) -> i32;
     /* #289: the per-row score weight vector, uploaded once per sample. A null
        pointer clears it (every row weighs 1). */
     fn rc_set_score_weights(ctx: *mut RawCtx, w: *const f64) -> i32;
@@ -1549,6 +1552,29 @@ pub(crate) fn wave_shape(n: usize, ntrials: usize, cap: u64, row_bytes: u64) -> 
     }
 }
 
+/// #704: the arrays one fit launch reads.
+struct FitInputs<'a> {
+    words: &'a [u32],
+    off: &'a [u32],
+    pcount: &'a [i32],
+    nprog: usize,
+    kmax: usize,
+    c0: &'a [f64],
+    cbase: Option<&'a [f64]>,
+    gauge: &'a [i32],
+    iters: usize,
+    loss: i32,
+}
+
+/// #704: what one replayed fit launch returned.
+pub struct ReplayResult {
+    pub ms: f32,
+    pub c: Vec<f64>,
+    pub sse: Vec<f64>,
+    pub status: Vec<i32>,
+    pub cycles: Vec<[u64; 2]>,
+}
+
 /// A resident GPU evaluator: the dataset is uploaded once, then many batches of
 /// candidates can be scored without further host↔device traffic for the data.
 pub struct GpuEvaluator {
@@ -1589,6 +1615,8 @@ pub struct GpuEvaluator {
     /// #508: pairs of the resident slope pair mask, or `None` when every row
     /// pairs with its predecessor.
     slope_pair_count: Option<u64>,
+    /// #704: the fit recorder, `None` unless `RCSR_FIT_RECORD` is set.
+    rec: Option<crate::fit_record::EvalRec>,
 }
 
 impl GpuEvaluator {
@@ -1633,6 +1661,7 @@ impl GpuEvaluator {
                 fit_twin_bytes: 0,
                 fit_twin_rows: 0,
                 slope_pair_count: None,
+                rec: crate::fit_record::EvalRec::open(cols, n_rows, n_vars, y),
             })
         }
     }
@@ -1684,6 +1713,7 @@ impl GpuEvaluator {
             fit_twin_bytes: 0,
             fit_twin_rows: 0,
             slope_pair_count: None,
+            rec: None,
         })
     }
 
@@ -1724,6 +1754,11 @@ impl GpuEvaluator {
         // #508: the device drops the slope pair mask with the rows it described.
         self.slope_pair_count = None;
         let ok = unsafe { rc_set_fit_data(self.ctx, cols.as_ptr(), y.as_ptr(), wp) == 0 };
+        if ok {
+            if let Some(r) = self.rec.as_mut() {
+                r.set_twin(cols, y, w);
+            }
+        }
         if ok {
             let rows = y.len() as u64;
             let cells = cols.len() as u64 + rows;
@@ -1772,13 +1807,15 @@ impl GpuEvaluator {
     /// the arm can never fall back to another objective. An empty slice clears
     /// the vector.
     pub fn set_fit_sign(&mut self, sign: &[f64]) -> bool {
-        if sign.is_empty() {
-            return unsafe { rc_set_fit_sign(self.ctx, std::ptr::null()) == 0 };
-        }
-        if sign.len() as u64 != self.n_rows {
+        if !sign.is_empty() && sign.len() as u64 != self.n_rows {
             return false;
         }
-        unsafe { rc_set_fit_sign(self.ctx, sign.as_ptr()) == 0 }
+        let p = if sign.is_empty() { std::ptr::null() } else { sign.as_ptr() };
+        let ok = unsafe { rc_set_fit_sign(self.ctx, p) == 0 };
+        if let (true, Some(r)) = (ok, self.rec.as_mut()) {
+            r.set_sign(sign);
+        }
+        ok
     }
 
     /// #508: upload the slope pair mask: bit `r` of `bits` is set when row `r`
@@ -1802,6 +1839,9 @@ impl GpuEvaluator {
     /// #496: select the arithmetic of the fit kernel's polish for later
     /// launches.
     pub fn set_fit_polish(&mut self, mode: crate::fit::FitPolish) {
+        if let Some(r) = self.rec.as_mut() {
+            r.polish = mode.code();
+        }
         unsafe {
             rc_set_fit_polish(self.ctx, mode.code());
         }
@@ -2772,6 +2812,153 @@ impl GpuEvaluator {
         self.fit_launch(plans, Some(starts), keep_incoming, iters, loss)
     }
 
+    /// The one place the fit entry points are called from raw arrays.
+    fn fit_raw(
+        &mut self,
+        a: &FitInputs,
+        from: bool,
+        outc: &mut [f64],
+        outsse: &mut [f64],
+        outstatus: &mut [i32],
+    ) -> f32 {
+        unsafe {
+            if !from {
+                rc_fit_batch(
+                    self.ctx,
+                    a.words.as_ptr(),
+                    a.off.as_ptr(),
+                    a.pcount.as_ptr(),
+                    a.nprog as i32,
+                    a.kmax as i32,
+                    a.c0.as_ptr(),
+                    a.gauge.as_ptr(),
+                    a.iters as i32,
+                    a.loss,
+                    outc.as_mut_ptr(),
+                    outsse.as_mut_ptr(),
+                    outstatus.as_mut_ptr(),
+                )
+            } else {
+                rc_fit_batch_from(
+                    self.ctx,
+                    a.words.as_ptr(),
+                    a.off.as_ptr(),
+                    a.pcount.as_ptr(),
+                    a.nprog as i32,
+                    a.kmax as i32,
+                    a.c0.as_ptr(),
+                    a.cbase.map_or(std::ptr::null(), |c| c.as_ptr()),
+                    a.gauge.as_ptr(),
+                    a.iters as i32,
+                    a.loss,
+                    outc.as_mut_ptr(),
+                    outsse.as_mut_ptr(),
+                    outstatus.as_mut_ptr(),
+                )
+            }
+        }
+    }
+
+    /// #704: write one launch to the recording directory.
+    #[allow(clippy::too_many_arguments)]
+    fn record_fit(
+        &mut self,
+        words: Vec<u32>,
+        off: Vec<u32>,
+        pcount: Vec<i32>,
+        c0: Vec<f64>,
+        cbase: Option<Vec<f64>>,
+        gauge: Vec<i32>,
+        iters: usize,
+        loss: i32,
+        ms: f32,
+        outc: &[f64],
+        outsse: &[f64],
+        outstatus: &[i32],
+    ) {
+        let kmax = c0.len() / pcount.len().max(1);
+        if kmax > 20 {
+            return;
+        }
+        let flags = if self.slope_pair_count.is_some() { crate::fit_record::CALL_PAIRS } else { 0 };
+        let nprog = pcount.len() as u32;
+        let Some(rec) = self.rec.as_mut() else { return };
+        rec.record(crate::fit_record::RecCall {
+            data: 0,
+            flags,
+            iters: iters as u32,
+            loss,
+            polish: rec.polish,
+            nprog,
+            kmax: kmax as u32,
+            words,
+            off,
+            pcount,
+            c0,
+            cbase,
+            gauge,
+            ms,
+            status: outstatus.to_vec(),
+            sse: outsse.to_vec(),
+            c: outc.to_vec(),
+        });
+    }
+
+    /// #704: an evaluator holding the rows of a recorded data file.
+    pub fn from_recorded(d: &crate::fit_record::RecData) -> Option<Self> {
+        let mut ev = Self::new(&d.cols, d.n, d.v, &d.y)?;
+        if let Some(t) = &d.twin {
+            if !ev.set_fit_data(&t.cols, &t.y, &t.w) {
+                return None;
+            }
+        }
+        if !d.tsign.is_empty() && !ev.set_fit_sign(&d.tsign) {
+            return None;
+        }
+        Some(ev)
+    }
+
+    /// #704: launch a recorded call again on the current rows. Returns the
+    /// kernel milliseconds (negative on a failed launch), the outputs and the
+    /// per-candidate `[LM, polish]` cycles. The caller must have built this
+    /// evaluator with [`Self::from_recorded`] for `call.data`.
+    pub fn fit_replay_call(&mut self, call: &crate::fit_record::RecCall) -> ReplayResult {
+        unsafe {
+            rc_set_fit_polish(self.ctx, call.polish);
+        }
+        let (nprog, kmax) = (call.nprog as usize, call.kmax as usize);
+        let mut outc = vec![0.0f64; nprog * kmax];
+        let mut outsse = vec![0.0f64; nprog];
+        let mut outstatus = vec![0i32; nprog];
+        let inp = FitInputs {
+            words: &call.words,
+            off: &call.off,
+            pcount: &call.pcount,
+            nprog,
+            kmax,
+            c0: &call.c0,
+            cbase: call.cbase.as_deref(),
+            gauge: &call.gauge,
+            iters: call.iters as usize,
+            loss: call.loss,
+        };
+        let ms = self.fit_raw(&inp, true, &mut outc, &mut outsse, &mut outstatus);
+        let cycles = if ms >= 0.0 { self.last_fit_cycles(nprog) } else { Vec::new() };
+        ReplayResult { ms, c: outc, sse: outsse, status: outstatus, cycles }
+    }
+
+    /// #704: the `[LM, polish]` cycle words of each candidate of the last fit
+    /// launch. Host-only: the kernel already writes them. Empty when `nprog`
+    /// does not match the last launch.
+    pub fn last_fit_cycles(&mut self, nprog: usize) -> Vec<[u64; 2]> {
+        let mut raw = vec![0u64; nprog * 2];
+        let got = unsafe { rc_fit_last_cycles(self.ctx, raw.as_mut_ptr(), nprog as i32) };
+        if got < 0 {
+            return Vec::new();
+        }
+        raw.chunks_exact(2).map(|w| [w[0], w[1]]).collect()
+    }
+
     fn fit_launch(
         &mut self,
         plans: &[&crate::fit::GpuFitPlan],
@@ -2809,42 +2996,25 @@ impl GpuEvaluator {
         let mut outc = vec![0.0f64; nprog * kmax];
         let mut outsse = vec![0.0f64; nprog];
         let mut outstatus = vec![0i32; nprog];
-        let ms = unsafe {
-            if starts.is_none() && !keep_incoming {
-                rc_fit_batch(
-                    self.ctx,
-                    words.as_ptr(),
-                    off.as_ptr(),
-                    pcount.as_ptr(),
-                    nprog as i32,
-                    kmax as i32,
-                    c0.as_ptr(),
-                    gauge.as_ptr(),
-                    iters as i32,
-                    loss.code(),
-                    outc.as_mut_ptr(),
-                    outsse.as_mut_ptr(),
-                    outstatus.as_mut_ptr(),
-                )
-            } else {
-                rc_fit_batch_from(
-                    self.ctx,
-                    words.as_ptr(),
-                    off.as_ptr(),
-                    pcount.as_ptr(),
-                    nprog as i32,
-                    kmax as i32,
-                    c0.as_ptr(),
-                    if keep_incoming { cbase.as_ptr() } else { std::ptr::null() },
-                    gauge.as_ptr(),
-                    iters as i32,
-                    loss.code(),
-                    outc.as_mut_ptr(),
-                    outsse.as_mut_ptr(),
-                    outstatus.as_mut_ptr(),
-                )
-            }
+        let from = starts.is_some() || keep_incoming;
+        let ms = {
+            let inp = FitInputs {
+                words: &words,
+                off: &off,
+                pcount: &pcount,
+                nprog,
+                kmax,
+                c0: &c0,
+                cbase: if keep_incoming { Some(&cbase) } else { None },
+                gauge: &gauge,
+                iters,
+                loss: loss.code(),
+            };
+            self.fit_raw(&inp, from, &mut outc, &mut outsse, &mut outstatus)
         };
+        if self.rec.is_some() {
+            self.record_fit(words, off, pcount, c0, keep_incoming.then_some(cbase), gauge, iters, loss.code(), ms, &outc, &outsse, &outstatus);
+        }
         if ms < 0.0 {
             return (Vec::new(), ms);
         }

@@ -2375,6 +2375,38 @@ holds the archive hashes of GPU-fit searches captured on the allocating path and
 a code inspection of the entry points (no legacy-stream launch, no synchronous
 copy, no allocator call).
 
+## Comparing toolkits and fit kernel variants (issue #704)
+
+Search-level `gpu.fit.fit_kernel_s` is not a kernel-speed metric. Two builds that differ in one libdevice function (CUDA 12.0 and 13.0 differ in f32 `powf`) take different LM and polish paths from the first generation that fits a `pow` program, so they fit different candidates. A change of `fit_kernel_s` between two builds mixes the speed of the kernel (K) with the work it was given (W). The replay measures the two apart.
+
+**Record.** `RCSR_FIT_RECORD=<dir>` makes every device fit launch (`GpuEvaluator::fit_launch`, which includes the #290 dispatch probe and the warm starts of the slope, rank, order-statistic and maximum arms) write its raw kernel inputs and its result:
+
+* `data-<j>.bin`: the f32 rows, the f64 twin and weights of `set_fit_data`, and the label sign. Written once before the first call that reads them.
+* `call-<k>.bin`: programs, offsets, constant counts, start constants, `cbase`, gauge, iteration count, loss code, polish mode, and the recorded `ms`, `status`, `sse` and constants.
+
+`<dir>` must not exist or must be empty. A non-empty directory prints one warning and records nothing; the recorder never overwrites. Unset, the recorder is one `Option` check per launch and one `None` field per evaluator: no file, no copy, no device work. Recording writes after the launch and never changes a result. Format and field order: the header of `src/fit_record.rs`. A call made while a slope pair mask is resident carries a flag and is skipped by the replay (the mask is not recorded).
+
+**Replay.**
+
+```sh
+RCSR_FIT_RECORD=$G/rec rcsr --gpu --dispatch device --fit-strategy gpu ... > run.json
+rcsr-gpu-bench --fit-replay $G/rec --reps 5 > replay.ndjson
+rcsr-gpu-bench --fit-replay-compare replay-a.ndjson replay-b.ndjson
+```
+
+The replay rebuilds one evaluator per `data-<j>.bin`, applies each call's polish mode and launches the recorded arrays with one warm-up rep and `--reps` timed reps (default 5). One NDJSON line per call holds the rep times and their median, the per-candidate LM and polish cycles (median over reps), `status`, a hash per candidate (`status`, `sse` bits, bits of the `pcount` constants the host reads; the kernel leaves the padding slots of a row unwritten), `out_hash` over all candidates, `same_as_recorded` (bitwise against the recording) and `stable` (same `out_hash` in every rep). The last line is the summary: summed `ms_median`, toolkit, device and `recording_hash`. The cycle words are the ones the kernel already writes; `rc_fit_last_cycles` copies them from the staging buffer and the kernel source is unchanged. A block's cycles include the time it shares its SM with the other resident block, so compare them only between replays of the same batch.
+
+`--fit-replay-compare a b` prints, per call, per instantiation (`16x256`, `20x128`) and in total: the time ratio b/a, the number of candidates whose hash is equal in both replays, and the cycle ratio b/a over those candidates (speed on identical paths) and over all. It exits 2 when the `recording_hash` values differ, or the device strings differ and `--allow-device-mismatch` is not given.
+
+**The 2x2.** Record `R12` with the 12.0 build and `R13` with the 13.0 build, replay each recording on each build, and let `T(b, R)` be the summed `ms_median`. Then
+
+```text
+K = sqrt( T(13,R12)/T(12,R12) * T(13,R13)/T(12,R13) )    kernel factor, same work
+W = sqrt( T(12,R13)/T(12,R12) * T(13,R13)/T(13,R12) )    workload factor, same kernel
+```
+
+and `K * W` is the search-level ratio of the two recording runs. Decide per instantiation: with `K <= 1.03` and a matching-candidate cycle ratio `<= 1.03`, no toolkit-specific kernel change is made. Tool 2 of the #663 speed check has no `20x128` calls; for that instantiation use the P = 256 cells of `bench_batched_fit_by_p`.
+
 ## Measuring the full GPU path (issue #118)
 
 The older benchmark placed an event pair immediately after the launch, so

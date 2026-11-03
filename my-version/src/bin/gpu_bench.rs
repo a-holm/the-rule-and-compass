@@ -5,6 +5,7 @@
 //! speed-up and the agreement between the two. Requires `--features cuda`.
 
 use rcsr::data;
+use rcsr::fit_record::{self, ReplayLine, ReplaySummary};
 use rcsr::eval_soa;
 use rcsr::expr::{self, complexity, random_tree, Op};
 use rcsr::gpu::{cpu_sse, GpuEvaluator, Population};
@@ -21,8 +22,137 @@ fn parse_uint<T: std::str::FromStr>(name: &str, v: Option<&String>) -> T {
     }
 }
 
+fn median(v: &mut [f32]) -> f64 {
+    v.sort_by(|a, b| a.total_cmp(b));
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2] as f64
+    } else {
+        (v[n / 2 - 1] as f64 + v[n / 2] as f64) / 2.0
+    }
+}
+
+fn run_compare(a: &str, b: &str, allow_device_mismatch: bool) -> i32 {
+    let read = |p: &str| {
+        std::fs::read_to_string(p).unwrap_or_else(|e| {
+            eprintln!("error: {}: {}", p, e);
+            std::process::exit(3);
+        })
+    };
+    match fit_record::compare_replays(&read(a), &read(b), allow_device_mismatch) {
+        Ok(report) => {
+            print!("{}", report);
+            0
+        }
+        Err((code, why)) => {
+            eprintln!("error: {}", why);
+            code
+        }
+    }
+}
+
+fn run_replay(dir: &str, reps: usize) -> i32 {
+    if reps == 0 {
+        eprintln!("error: --reps needs at least 1 for --fit-replay");
+        return 2;
+    }
+    let rec = match fit_record::load_recording(std::path::Path::new(dir)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 3;
+        }
+    };
+    let mut evs: std::collections::HashMap<u32, GpuEvaluator> = std::collections::HashMap::new();
+    let (mut ncalls, mut ncands, mut total) = (0usize, 0usize, 0.0f64);
+    let mut failed = 0usize;
+    for (k, call) in &rec.calls {
+        if call.flags & fit_record::CALL_PAIRS != 0 {
+            eprintln!("call {}: skipped, a slope pair mask was resident", k);
+            println!("{{\"call\":{},\"skipped\":\"pairs\"}}", k);
+            continue;
+        }
+        if !evs.contains_key(&call.data) {
+            let Some((_, d)) = rec.data.iter().find(|(j, _)| *j == call.data) else {
+                eprintln!("error: call {} names missing data-{}.bin", k, call.data);
+                return 3;
+            };
+            let Some(ev) = GpuEvaluator::from_recorded(d) else {
+                eprintln!("error: could not rebuild the rows of data-{}.bin on the device", call.data);
+                return 4;
+            };
+            evs.insert(call.data, ev);
+        }
+        let ev = evs.get_mut(&call.data).unwrap();
+        let kmax = call.kmax as usize;
+        let inst = match rcsr::gpu::fit_kernel_shape(kmax) {
+            Some((threads, _, maxc)) => format!("{}x{}", maxc, threads),
+            None => "none".to_string(),
+        };
+        let _warm = ev.fit_replay_call(call);
+        let mut ms: Vec<f32> = Vec::with_capacity(reps);
+        let mut first: Option<(u64, Vec<i32>, Vec<f64>, Vec<f64>)> = None;
+        let mut stable = true;
+        let mut cycles: Vec<Vec<[u64; 2]>> = Vec::new();
+        for _ in 0..reps {
+            let r = ev.fit_replay_call(call);
+            ms.push(r.ms);
+            let h = fit_record::output_hash(&r.status, &r.sse, &r.c, kmax, &call.pcount);
+            match &first {
+                None => first = Some((h, r.status.clone(), r.sse.clone(), r.c.clone())),
+                Some((h0, ..)) => stable &= *h0 == h,
+            }
+            cycles.push(r.cycles);
+        }
+        let (out_hash, status, sse, c) = first.unwrap();
+        let used = |c: &[f64], i: usize| fit_record::used_constants(c, kmax, &call.pcount, i).to_vec();
+        let cand = |st: &[i32], s: &[f64], c: &[f64], i: usize| fit_record::candidate_hash(st[i], s[i], &used(c, i));
+        let same = fit_record::output_hash(&call.status, &call.sse, &call.c, kmax, &call.pcount) == out_hash;
+        if !same || !stable {
+            failed += 1;
+            let first_bad = (0..call.nprog as usize).find(|&i| cand(&status, &sse, &c, i) != cand(&call.status, &call.sse, &call.c, i));
+            eprintln!("call {}: first differing candidate {:?}, stable across reps: {}", k, first_bad, stable);
+        }
+        let nprog = call.nprog as usize;
+        let mid = |lane: usize, i: usize| {
+            let mut v: Vec<u64> = cycles.iter().filter_map(|r| r.get(i).map(|w| w[lane])).collect();
+            v.sort_unstable();
+            v.get(v.len() / 2).copied().unwrap_or(0)
+        };
+        let line = ReplayLine {
+            call: *k,
+            inst,
+            ms_median: median(&mut ms.clone()),
+            lm: (0..nprog).map(|i| mid(0, i)).collect(),
+            polish: (0..nprog).map(|i| mid(1, i)).collect(),
+            cand_hash: (0..nprog).map(|i| cand(&status, &sse, &c, i)).collect(),
+        };
+        println!("{}", line.json(&ms, &status, out_hash, same, stable));
+        ncalls += 1;
+        ncands += nprog;
+        total += line.ms_median;
+    }
+    let summary = ReplaySummary {
+        calls: ncalls,
+        candidates: ncands,
+        ms_total: total,
+        toolkit: rcsr::provenance::CUDA_BUILD.map_or("none", |b| b.toolkit).to_string(),
+        device: GpuEvaluator::device_name().replace('"', "'"),
+        recording_hash: format!("{:016x}", rec.hash),
+    };
+    println!("{}", summary.json(reps));
+    if failed > 0 {
+        eprintln!("warning: {} call(s) differ from the recording or between reps", failed);
+    }
+    0
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut replay_dir: Option<String> = None;
+    let mut compare: Option<(String, String)> = None;
+    let mut allow_device_mismatch = false;
+    let mut reps_given = false;
     let mut path = "examples/sine.csv".to_string();
     let mut target = "y".to_string();
     let mut vars: Vec<String> = vec!["x".to_string()];
@@ -59,8 +189,24 @@ fn main() {
                 i += 1;
                 batch = parse_uint("--batch", args.get(i));
             }
+            "--fit-replay" => {
+                i += 1;
+                replay_dir = args.get(i).cloned();
+            }
+            "--fit-replay-compare" => {
+                compare = match (args.get(i + 1), args.get(i + 2)) {
+                    (Some(a), Some(b)) => Some((a.clone(), b.clone())),
+                    _ => {
+                        eprintln!("error: --fit-replay-compare needs <a.ndjson> <b.ndjson>");
+                        std::process::exit(2);
+                    }
+                };
+                i += 2;
+            }
+            "--allow-device-mismatch" => allow_device_mismatch = true,
             "--reps" => {
                 i += 1;
+                reps_given = true;
                 reps = parse_uint("--reps", args.get(i));
             }
             "--depth" => {
@@ -73,13 +219,20 @@ fn main() {
             }
             "-h" | "--help" => {
                 println!(
-                    "rcsr-gpu-bench [--data file] [--target y] [--vars a,b] [--batch N] [--depth D] [--seed S] [--reps R]"
+                    "rcsr-gpu-bench [--data file] [--target y] [--vars a,b] [--batch N] [--depth D] [--seed S] [--reps R]\n\nrcsr-gpu-bench --fit-replay <dir> [--reps N]\n    Replay the fit launches recorded with RCSR_FIT_RECORD=<dir> (rcsr run on a CUDA build).\n    One warm-up rep, then N timed reps (default 5). Prints one NDJSON line per call and a\n    summary line: per-candidate cycles, output hashes and same_as_recorded.\nrcsr-gpu-bench --fit-replay-compare <a.ndjson> <b.ndjson> [--allow-device-mismatch]\n    Per-call and total time ratio b/a, matching candidates and cycle ratios of two replays of\n    one recording. Exit 2 when the recordings or devices differ."
                 );
                 return;
             }
             _ => {}
         }
         i += 1;
+    }
+
+    if let Some((a, b)) = compare {
+        std::process::exit(run_compare(&a, &b, allow_device_mismatch));
+    }
+    if let Some(dir) = replay_dir {
+        std::process::exit(run_replay(&dir, if reps_given { reps } else { 5 }));
     }
 
     let table = match data::read_table(&path) {
