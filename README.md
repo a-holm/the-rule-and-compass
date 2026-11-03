@@ -412,7 +412,7 @@ unless `--allow-backend-change` is explicit. See
 determinism guarantee and its limits.
 
 `--run-manifest <path>` records the evidence needed to reproduce a long run:
-the commit recorded when the binary was built, the SHA-256 of the running binary, the data file
+the commit recorded when the binary was built, the SHA-256 of the running binary, the CUDA toolkit it was built with (`binary.cuda_build`, `null` in a CPU build), the data file
 checksum and sample fingerprints, the resolved configuration, seed, backend,
 device/driver/CUDA, process UTC start/end and phase timings; `total` equals
 `timing.total_seconds` in the result JSON. `rcsr verify-manifest` re-checks it

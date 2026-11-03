@@ -142,6 +142,75 @@ pub fn format_version(v: (u32, u32)) -> String {
     format!("{}.{}", v.0, v.1)
 }
 
+
+/// The CUDA major version the build prefers when it finds several toolkits.
+pub const PREFERRED_CUDA_MAJOR: u32 = 13;
+
+/// True when a toolkit of version `v` can compile for `a`. CUDA 13.0 removed
+/// offline compilation for Maxwell, Pascal and Volta (`sm_50` to `sm_72`).
+pub fn toolkit_supports(a: Arch, v: (u32, u32)) -> bool {
+    let new_enough = minimum_cuda(a).map_or(true, |m| version_at_least(v, m));
+    new_enough && !arch_dropped(a, v)
+}
+
+/// True when `a` is an architecture that toolkit `v` no longer compiles for.
+pub fn arch_dropped(a: Arch, v: (u32, u32)) -> bool {
+    let dropped = a.major < 7 || (a.major == 7 && a.minor < 5);
+    dropped && v.0 >= 13
+}
+
+/// Where the chosen `nvcc` came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NvccSource {
+    Override,
+    Preferred,
+    Path,
+}
+
+impl NvccSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            NvccSource::Override => "RCSR_NVCC",
+            NvccSource::Preferred => "cuda-13",
+            NvccSource::Path => "PATH",
+        }
+    }
+}
+
+/// The toolkit selection rule: a non-empty override wins; else the newest
+/// preferred-major toolkit that can target `arch`; else `nvcc` on `PATH`.
+/// `preferred` holds each discovered `/usr/local/cuda-<major>.<minor>/bin/nvcc`
+/// with the version its `--version` reported, so this function stays pure.
+pub fn choose_nvcc(
+    override_nvcc: Option<&str>,
+    preferred: &[(String, (u32, u32))],
+    arch: Arch,
+) -> (String, NvccSource) {
+    if let Some(p) = override_nvcc.map(str::trim).filter(|p| !p.is_empty()) {
+        return (p.to_string(), NvccSource::Override);
+    }
+    preferred
+        .iter()
+        .filter(|(_, v)| v.0 == PREFERRED_CUDA_MAJOR && toolkit_supports(arch, *v))
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        .map(|(p, _)| (p.clone(), NvccSource::Preferred))
+        .unwrap_or_else(|| ("nvcc".to_string(), NvccSource::Path))
+}
+
+/// The full toolkit version from the `V<major>.<minor>.<patch>` token of
+/// `nvcc --version`, for example `13.0.88`; falls back to `X.Y` from the
+/// release field.
+pub fn parse_nvcc_build_version(text: &str) -> Option<String> {
+    for token in text.split(|c: char| c.is_whitespace() || c == ',') {
+        let Some(v) = token.strip_prefix('V') else { continue };
+        let parts: Vec<&str> = v.split('.').collect();
+        if parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) {
+            return Some(v.to_string());
+        }
+    }
+    parse_nvcc_version(text).map(format_version)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +286,97 @@ mod tests {
         assert!(!version_at_least((12, 0), (12, 8)));
         assert!(!version_at_least((11, 9), (12, 0)));
         assert_eq!(format_version((12, 8)), "12.8");
+    }
+
+    fn tk(path: &str, major: u32, minor: u32) -> (String, (u32, u32)) {
+        (path.to_string(), (major, minor))
+    }
+
+    fn pick(over: Option<&str>, found: &[(String, (u32, u32))], arch: &str) -> (String, NvccSource) {
+        choose_nvcc(over, found, parse_arch(arch).unwrap())
+    }
+
+    #[test]
+    fn toolkit_supports_follows_minimum_and_dropped_architectures() {
+        let s = |a: &str, v: (u32, u32)| toolkit_supports(parse_arch(a).unwrap(), v);
+        for v in [(12, 0), (12, 9), (13, 0), (13, 4), (14, 0)] {
+            assert!(s("sm_86", v), "sm_86 on {:?}", v);
+            assert!(s("sm_75", v), "sm_75 on {:?}", v);
+        }
+        assert!(s("sm_70", (12, 0)) && s("sm_70", (12, 9)));
+        assert!(!s("sm_70", (13, 0)) && !s("sm_70", (13, 4)) && !s("sm_70", (14, 0)));
+        assert!(!s("sm_121", (12, 0)) && s("sm_121", (12, 9)) && s("sm_121", (13, 0)));
+        assert!(arch_dropped(parse_arch("sm_70").unwrap(), (13, 0)));
+        assert!(!arch_dropped(parse_arch("sm_70").unwrap(), (12, 9)));
+        assert!(!arch_dropped(parse_arch("sm_75").unwrap(), (13, 0)));
+    }
+
+    #[test]
+    fn choose_nvcc_empty_override_is_unset() {
+        let found = [tk("/usr/local/cuda-13.0/bin/nvcc", 13, 0)];
+        let (p, src) = pick(Some(""), &found, "sm_86");
+        assert_eq!((p.as_str(), src), ("/usr/local/cuda-13.0/bin/nvcc", NvccSource::Preferred));
+        let (p, src) = pick(Some("  "), &found, "sm_86");
+        assert_eq!((p.as_str(), src), ("/usr/local/cuda-13.0/bin/nvcc", NvccSource::Preferred));
+    }
+
+    #[test]
+    fn choose_nvcc_override_wins_over_a_present_13() {
+        let found = [tk("/usr/local/cuda-13.0/bin/nvcc", 13, 0)];
+        let (p, src) = pick(Some("/usr/bin/nvcc"), &found, "sm_86");
+        assert_eq!((p.as_str(), src), ("/usr/bin/nvcc", NvccSource::Override));
+    }
+
+    #[test]
+    fn choose_nvcc_falls_back_to_path() {
+        let (p, src) = pick(None, &[], "sm_86");
+        assert_eq!((p.as_str(), src), ("nvcc", NvccSource::Path));
+        let only14 = [tk("/usr/local/cuda-14.0/bin/nvcc", 14, 0)];
+        let (p, src) = pick(None, &only14, "sm_86");
+        assert_eq!((p.as_str(), src), ("nvcc", NvccSource::Path));
+        let only12 = [tk("/usr/local/cuda-12.6/bin/nvcc", 12, 6)];
+        let (p, src) = pick(None, &only12, "sm_86");
+        assert_eq!((p.as_str(), src), ("nvcc", NvccSource::Path));
+    }
+
+    #[test]
+    fn choose_nvcc_takes_the_newest_13() {
+        let found = [
+            tk("/usr/local/cuda-13.0/bin/nvcc", 13, 0),
+            tk("/usr/local/cuda-13.4/bin/nvcc", 13, 4),
+            tk("/usr/local/cuda-13.1/bin/nvcc", 13, 1),
+            tk("/usr/local/cuda-14.0/bin/nvcc", 14, 0),
+        ];
+        let (p, src) = pick(None, &found, "sm_86");
+        assert_eq!((p.as_str(), src), ("/usr/local/cuda-13.4/bin/nvcc", NvccSource::Preferred));
+        let (p, _) = pick(None, &[found[1].clone(), found[0].clone()], "sm_86");
+        assert_eq!(p, "/usr/local/cuda-13.4/bin/nvcc");
+    }
+
+    #[test]
+    fn choose_nvcc_skips_13_for_a_dropped_architecture() {
+        let found = [tk("/usr/local/cuda-13.0/bin/nvcc", 13, 0)];
+        let (p, src) = pick(None, &found, "sm_70");
+        assert_eq!((p.as_str(), src), ("nvcc", NvccSource::Path));
+    }
+
+    #[test]
+    fn choose_nvcc_prefers_13_for_sm121() {
+        let found = [tk("/usr/local/cuda-13.0/bin/nvcc", 13, 0)];
+        let (p, src) = pick(None, &found, "sm_121");
+        assert_eq!((p.as_str(), src), ("/usr/local/cuda-13.0/bin/nvcc", NvccSource::Preferred));
+    }
+
+    #[test]
+    fn parses_the_full_toolkit_version() {
+        let cuda12 = "Cuda compilation tools, release 12.0, V12.0.140\nBuild cuda_12.0.r12.0/compiler.32267302_0";
+        assert_eq!(parse_nvcc_build_version(cuda12).as_deref(), Some("12.0.140"));
+        let cuda13 = "Cuda compilation tools, release 13.0, V13.0.88\nBuild cuda_13.0.r13.0/compiler.36424714_0";
+        assert_eq!(parse_nvcc_build_version(cuda13).as_deref(), Some("13.0.88"));
+        assert_eq!(
+            parse_nvcc_build_version("Cuda compilation tools, release 13.0, odd").as_deref(),
+            Some("13.0")
+        );
+        assert_eq!(parse_nvcc_build_version("nothing"), None);
     }
 }

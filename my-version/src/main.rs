@@ -2356,7 +2356,7 @@ fn main() {
         std::process::exit(EXIT_OK);
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("rcsr {}", VERSION);
+        println!("{}", rcsr::provenance::version_text());
         std::process::exit(EXIT_OK);
     }
     if args.first().map(|s| s.as_str()) == Some("schema") {
@@ -10326,7 +10326,7 @@ fn run_walkforward(args: &[String]) -> ! {
         std::process::exit(EXIT_OK);
     }
     if args.iter().any(|a| a == "-V" || a == "--version") {
-        println!("rcsr {}", VERSION);
+        println!("{}", rcsr::provenance::version_text());
         std::process::exit(EXIT_OK);
     }
     let mut data_path: Option<String> = None;
@@ -11955,7 +11955,7 @@ fn run_import(args: &[String]) -> ! {
         std::process::exit(EXIT_OK);
     }
     if args.iter().any(|a| a == "-V" || a == "--version") {
-        println!("rcsr {}", VERSION);
+        println!("{}", rcsr::provenance::version_text());
         std::process::exit(EXIT_OK);
     }
     let mut input: Option<String> = None;

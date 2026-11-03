@@ -148,3 +148,44 @@ fn manifest_pass_then_each_check_fails_independently() {
         String::from_utf8_lossy(&failed.stderr)
     );
 }
+
+#[test]
+fn version_prints_a_cuda_line_only_in_a_cuda_build() {
+    let out = rcsr(&["--version"]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].starts_with("rcsr "), "{}", text);
+    if cfg!(feature = "cuda") {
+        assert_eq!(lines.len(), 2, "{}", text);
+        assert!(lines[1].starts_with("cuda: toolkit "), "{}", text);
+        assert!(lines[1].contains(", runtime ") && lines[1].contains(", arch sm_"), "{}", text);
+    } else {
+        assert_eq!(lines.len(), 1, "{}", text);
+    }
+}
+
+#[test]
+fn manifest_binary_records_the_cuda_build() {
+    let manifest_path = TempPath::new("cuda-build.json");
+    let json_path = TempPath::new("cuda-build-result.json");
+    let data_path = TempPath::new("cuda-build-data.csv");
+    std::fs::copy(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/clean.csv"),
+        &data_path.0,
+    )
+    .expect("copy data fixture");
+    let run = run_with_manifest(data_path.as_str(), manifest_path.as_str(), json_path.as_str());
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let text = std::fs::read_to_string(&manifest_path.0).expect("manifest");
+    let binary = manifest::object(&text, "binary").expect("binary object");
+    if cfg!(feature = "cuda") {
+        let build = manifest::object(binary, "cuda_build").expect("cuda_build object");
+        for key in ["toolkit", "nvcc", "source", "arch", "runtime"] {
+            let value = manifest::string_field(build, key).unwrap_or_default();
+            assert!(!value.is_empty(), "cuda_build.{} in {}", key, build);
+        }
+    } else {
+        assert!(binary.contains("\"cuda_build\":null"), "{}", binary);
+    }
+}

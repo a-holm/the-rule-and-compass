@@ -497,14 +497,6 @@ static int rc_arena_dev_alloc(RcCtx *c, const char *tag, void **p, size_t bytes)
     return rc;
 }
 
-static void rc_arena_dev_free(RcCtx *c, void *p)
-{
-    if (!p) return;
-    rc_dev_free(c, p);
-    c->alloc_calls++;
-    if (c->warm) c->steady_alloc_calls++;
-}
-
 /* Reserve the device arena at the requested high-water mark. Capacity only
    grows, and only when no batch is in flight: reallocating a slot that a
    pending kernel still reads would be a use-after-free. */
@@ -4409,6 +4401,21 @@ static int ft_launch(RcCtx *c,
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
+/* Resident blocks per SM and registers per thread of the p <= 16 fit kernel
+   instantiation. Returns 0 on success. */
+int rc_fit_occupancy(int *blocks, int *regs)
+{
+    const int bytes = (int)sizeof(FtSmem<16, 256, 128>);
+    cudaFuncAttributes attr;
+    if (cudaFuncGetAttributes(&attr, (const void *)fit_kernel<16, 256, 128>) != cudaSuccess) return -1;
+    if (cudaFuncSetAttribute((const void *)fit_kernel<16, 256, 128>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) return -1;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(blocks, (const void *)fit_kernel<16, 256, 128>,
+                                                      256, (size_t)bytes) != cudaSuccess) return -1;
+    *regs = attr.numRegs;
+    return 0;
+}
+
 /* #122: canonical postfix hash, FNV-1a over the words up to and including
    HALT. Mirrors `genome::postfix_hash` exactly. */
 __global__ void hash_kernel(const unsigned int *__restrict__ prog,
@@ -7905,6 +7912,15 @@ int rc_copy_probe(void *ctx, unsigned long long bytes, int reps, double *h2d_ms,
     return rc;
 }
 
+/* Version of the linked static runtime (13000 for 13.0), or -1. Since CUDA 12.0
+   this does not initialise the driver, so it works without a GPU. */
+int rc_runtime_version(void)
+{
+    int v = 0;
+    if (cudaRuntimeGetVersion(&v) != cudaSuccess) return -1;
+    return v;
+}
+
 /* 1 when the context uses managed (unified) memory, 0 for plain device memory.
    The benchmark prints this so a recorded run states which path it measured. */
 int rc_unified(void)
@@ -7918,7 +7934,7 @@ int rc_unified(void)
 
 const char *rc_device_name(void)
 {
-    static char name[256];
+    static char name[320];
     cudaDeviceProp p;
     if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) return "unknown";
     snprintf(name, sizeof(name), "%s (sm_%d%d, %d SMs, %d MB)",

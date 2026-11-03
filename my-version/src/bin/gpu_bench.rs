@@ -206,6 +206,7 @@ fn main() {
     let row_evals = (trees.len() * n) as f64;
     let evals = trees.len() as f64;
     println!("device           : {}", device);
+    println!("toolkit          : {}", rcsr::provenance::cuda_build_summary().unwrap_or_else(|| "none".to_string()));
     println!(
         "memory           : {}",
         if GpuEvaluator::unified_memory() {
