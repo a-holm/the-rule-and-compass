@@ -60,7 +60,13 @@ fn tools_tests_pass() {
         let name = test.file_name().and_then(|n| n.to_str()).unwrap_or("test").to_string();
         let log = log_dir.join(format!("{name}.log"));
         let file = fs::File::create(&log).expect("create log");
-        let mut child = Command::new("bash")
+        let mut cmd = Command::new("bash");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("RCSR_") {
+                cmd.env_remove(key);
+            }
+        }
+        let mut child = cmd
             .arg(test)
             .stdin(Stdio::null())
             .stdout(file.try_clone().expect("clone log handle"))
