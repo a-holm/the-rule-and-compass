@@ -11,6 +11,7 @@ One job: start the silence watcher over the agents' worktrees.
 **Reference (every run):**
 - `../../../_shared/rules.md`
 - `../../../_tools/watch.sh`
+- `../../../_tools/status.sh`
 - `../../CONTEXT.md`
 
 Do NOT load: agent transcripts (they buffer and prove nothing about liveness).
@@ -19,7 +20,7 @@ Do NOT load: agent transcripts (they buffer and prove nothing about liveness).
 
 1. If an input is missing or empty, stop and say which.
 2. Start `verksted/_tools/watch.sh` once in the background over every agent worktree and write its pid to `output/watch.pid`. It alerts after 45 minutes without a file change unless cargo, flock, nvcc or rcsr runs under that path.
-3. Wait for the background notification. Never write a `pgrep -f` loop or a `sleep` loop of your own.
+3. For a one-call look at every agent worktree (branch, dirty, minutes of silence) run `verksted/_tools/status.sh --section agents`. Wait for the background notification; never write a `pgrep -f` loop or a `sleep` loop of your own. Wait on a log line with `verksted/_tools/wait-for.sh`.
 4. An alert is a question to the agent (SendMessage), not a kill.
 
 ## Outputs

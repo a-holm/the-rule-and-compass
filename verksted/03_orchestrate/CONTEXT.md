@@ -14,7 +14,9 @@ Evidence: 39 agent briefs in one orchestrator session, 394 subagent dispatches i
 - `../_shared/rules.md`
 - `../_shared/brief.md`
 - `../_shared/output-format.md`
-- `../_templates/brief.md`
+- `../_templates/brief.md`, `../_templates/brief-research.md`, `../_templates/brief-clerk.md`
+- `../_tools/brief.sh`
+- `../_tools/status.sh`
 - `../_tools/watch.sh`
 
 Do NOT load: the ticket pipelines' stages, earlier runs' `output/`, the rest of `../_shared/`.
@@ -22,10 +24,10 @@ Do NOT load: the ticket pipelines' stages, earlier runs' `output/`, the rest of 
 ## Process
 
 1. `stages/01_wave_plan/`: pick file-disjoint tickets, at most 10 agents, at most 3 tickets using the machine (lock waiters do not count).
-2. `stages/02_brief/`: one brief per ticket from the template.
+2. `stages/02_brief/`: one brief per ticket, rendered by `brief.sh` from the templates.
 3. `stages/03_dispatch/`: dispatch with the model set explicitly, record agent ids.
 4. `stages/04_watchdog/`: one background watcher, alert after 45 minutes of silence.
-5. `stages/05_receive_and_verify/`: check every hand-back against PR state, git and logs.
+5. `stages/05_receive_and_verify/`: check every hand-back against PR state, git and logs; a merge clerk (`brief.sh clerk`) verifies the evidence.
 6. `stages/06_merge_cleanup/`: merge into `BASE` one at a time, clean up path by path.
 
 ## Outputs

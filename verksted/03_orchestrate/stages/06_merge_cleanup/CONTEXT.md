@@ -11,6 +11,8 @@ One job: merge verified PRs into the base and remove only finished tickets' left
 **Reference (every run):**
 - `../../../_shared/rules.md`
 - `../../../_shared/commands.md`
+- `../../../_templates/brief-clerk.md`
+- `../../../_tools/wt-done.sh`
 - `../../CONTEXT.md`
 
 Do NOT load: unfinished agents' worktrees, bulk deletion.
@@ -18,9 +20,10 @@ Do NOT load: unfinished agents' worktrees, bulk deletion.
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. Merge one PR at a time into `BASE` with `gh pr merge <pr> --squash` and a hand-written subject and body (section "Merge" of `commands.md`). No gate per merge. Do not use `--delete-branch` while the worktree exists.
-3. After each merge: `git fetch`, update the integration worktree with `--ff-only`, then clean that ticket only: `git worktree remove`, `git branch -D`, `git push origin --delete`, `git worktree prune`. Never `rm -rf`, never in bulk while agents live.
-4. Write `report.md`: tickets merged with merge shas, tickets still open, deviations.
+2. The merge clerk (`brief.sh clerk`) merges one PR at a time into `BASE` only, never `main` (rule 41): `gh pr merge <pr> --squash --delete-branch --subject "<type(area): subject> (#<pr>)" --body-file <file>` with a hand-written subject and body. No gate per merge.
+3. After each merge the clerk comments on the issue with the merge sha and the verified facts (rule 41). Then `git fetch` and update the integration worktree with `--ff-only`.
+4. Clean up that ticket only with `verksted/_tools/wt-done.sh <issue>`. It refuses unless the worktree is clean, no process runs inside it and the PR is merged; then it removes the worktree, the local branch and the remote branch. Never `rm -rf`, never in bulk while agents live.
+5. Write `report.md`: tickets merged with merge shas, tickets still open, deviations.
 
 ## Outputs
 
