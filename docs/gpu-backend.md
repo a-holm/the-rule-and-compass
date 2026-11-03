@@ -106,7 +106,7 @@ Minimum toolkit per target, as used by the build-script check:
 
 | Target | Minimum CUDA | Notes |
 |---|---|---|
-| `sm_86` | 11.1 | RTX 3060 / Ampere; verified here with CUDA 12.0 |
+| `sm_86` | 11.1 | RTX 3060 / Ampere; verified here with CUDA 12.0.140 and 13.0.88 |
 | `sm_90` / `sm_90a` | 11.8 / 12.0 | Hopper |
 | `sm_100` | 12.8 | datacentre Blackwell |
 | `sm_120` | 12.8 | consumer Blackwell |
@@ -2649,6 +2649,7 @@ the CPU run apart from the backend labels.
 | Architecture parser/validator (accept/reject, toolkit minimums) | unit tests, any machine | **verified** |
 | CUDA 12.0 rejects `sm_121` with the target, toolkit and minimum version named | RTX 3060 host, `nvcc` 12.0 | **verified** |
 | Plain device-memory path: build, tests, benchmark | RTX 3060, `sm_86`, CUDA 12.0 | **verified** |
+| Plain device-memory path on the CUDA 13.0.88 default toolchain: build with 0 warnings, memcheck on the lib, parity, P&L fitness, fit and loop tests, `rcsr-bench --tiny --gpu` 27/27 | RTX 3060, `sm_86`, CUDA 13.0.88 | **verified** |
 | Unified-memory path: build, tests, benchmark | RTX 3060, `sm_86`, `RCSR_GPU_UNIFIED=1` | **verified on a discrete GPU** |
 | Whole-population batch equals one-at-a-time SSEs | RTX 3060, `cargo test --features cuda` | **verified** |
 | GPU-vs-CPU agreement | RTX 3060, test + benchmark | **verified** (tables above) |
