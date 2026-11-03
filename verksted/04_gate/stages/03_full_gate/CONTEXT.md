@@ -11,6 +11,7 @@ One job: run the CPU suite, the CUDA suite and the tiny benchmark once on the ba
 **Reference (every run):**
 - `../../../_shared/rules.md`
 - `../../../_tools/gate.sh`
+- `../../../_tools/test-summary.sh`
 - `../../CONTEXT.md`
 
 Do NOT load: per-ticket reruns, anything but the three suites.
