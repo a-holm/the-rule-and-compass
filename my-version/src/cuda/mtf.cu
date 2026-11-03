@@ -101,6 +101,7 @@ typedef struct RcMtf {
     double *d_rs4;
     int *d_join_idx;
     double *d_age;
+    double *d_out;
 
     RcMtfStats last;
     double batch_start_ms;
@@ -625,6 +626,7 @@ RcMtf *rc_mtf_create(const long long *times, const double *open,
     ok &= rc_alloc((void **)&c->d_rs4, pref * sizeof(double)) == 0;
     ok &= rc_alloc((void **)&c->d_join_idx, rows * sizeof(int)) == 0;
     ok &= rc_alloc((void **)&c->d_age, rows * sizeof(double)) == 0;
+    ok &= rc_alloc((void **)&c->d_out, rows * sizeof(double)) == 0;
     if (!ok) {
         rc_mtf_destroy(c);
         return NULL;
@@ -705,6 +707,7 @@ void rc_mtf_destroy(RcMtf *c)
     cudaFree(c->d_rs4);
     cudaFree(c->d_join_idx);
     cudaFree(c->d_age);
+    cudaFree(c->d_out);
     free(c);
 }
 
@@ -815,10 +818,10 @@ int rc_mtf_gather(RcMtf *c, int leaf, double *out)
     const int threads = 256;
     int nb = blocks_for(c->n, threads);
     if (leaf == RC_MTF_BAR_AGE) {
-        k_copy_age<<<nb, threads>>>(c->d_age, c->n, out);
+        k_copy_age<<<nb, threads>>>(c->d_age, c->n, c->d_out);
     } else {
         const double *src = c->d_leaf + (size_t)leaf * c->max_buckets;
-        k_gather<<<nb, threads>>>(c->d_join_idx, src, c->n, out);
+        k_gather<<<nb, threads>>>(c->d_join_idx, src, c->n, c->d_out);
     }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -826,7 +829,16 @@ int rc_mtf_gather(RcMtf *c, int leaf, double *out)
         stats_end(c);
         return 3;
     }
-    cudaDeviceSynchronize();
+    err = cudaDeviceSynchronize();
+    if (err == cudaSuccess)
+        err = cudaMemcpy(out, c->d_out, (size_t)c->n * sizeof(double),
+                         cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        c->last.failed = 1;
+        stats_end(c);
+        return 4;
+    }
     c->last.d2h_bytes = (unsigned long long)c->n * sizeof(double);
     stats_end(c);
     return 0;
