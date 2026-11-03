@@ -2293,12 +2293,15 @@ allocator call in steady state.
   `alloc_s` stays at zero after warm-up and the pinned ring never grows. It also
   compares the asynchronous path against the forced synchronous path **bit for
   bit**, and uses `eval_batch_pipelined` to enqueue batch B's upload while batch
-  A's kernel is still outstanding; `overlapped_uploads` must increase and both
-  batches must equal the sequential result. Arithmetic is unchanged: the same
+  A is submitted and not collected; `pipelined_uploads` (host state, no device
+  query) must grow by exactly 1 and both batches must equal the sequential
+  result. `overlapped_uploads` is a measurement: it counts uploads for which
+  A's kernel was still running at that instant, depends on device speed, and is
+  printed by `rcsr-gpu-bench`. Arithmetic is unchanged: the same
   kernel, launch shape and accumulation order execute; only the stream and
   buffer lifetime differ.
 * **Telemetry.** `GpuEvaluator::arena_report()` exposes `async_copy`, `reason`,
-  `pinned_bytes`, `alloc_calls`, `steady_alloc_calls`, `overlapped_uploads` and
+  `pinned_bytes`, `alloc_calls`, `steady_alloc_calls`, `overlapped_uploads`, `pipelined_uploads` and
   `batches`. `alloc_calls` counts cold arena/staging setup; any increase in
   `steady_alloc_calls` after the first batch is a hot-path allocation bug.
   `rcsr-gpu-bench --reps N` prints the arena line next to the #118 ledger.

@@ -649,6 +649,7 @@ struct RawArenaReport {
     tile_overlapped_uploads: u64,
     tile_pinned_bytes: u64,
     waves: u64,
+    pipelined_uploads: u64,
 }
 
 /// `RcAllocReport` in `src/cuda/eval.cu` field for field.
@@ -710,8 +711,9 @@ pub struct ArenaReport {
     pub alloc_calls: u64,
     /// Allocator calls after the first successful batch: the hot-path count.
     pub steady_alloc_calls: u64,
-    /// Uploads that were enqueued while the previous kernel was still
-    /// outstanding — the event-ordering proof of overlap.
+    /// Uploads enqueued while the previous kernel was still running at that
+    /// instant. A timing observation that depends on device speed; use
+    /// `pipelined_uploads` for the ordering fact.
     pub overlapped_uploads: u64,
     /// Batches collected through the arena.
     pub batches: u64,
@@ -743,6 +745,9 @@ pub struct ArenaReport {
     pub tile_pinned_bytes: u64,
     /// #293: candidate waves launched.
     pub waves: u64,
+    /// Uploads staged while the previous batch was submitted and not yet
+    /// collected. Host state, deterministic: one per pipelined second batch.
+    pub pipelined_uploads: u64,
 }
 
 impl ArenaReport {
@@ -773,6 +778,7 @@ impl ArenaReport {
             tile_overlapped_uploads: raw.tile_overlapped_uploads,
             tile_pinned_bytes: raw.tile_pinned_bytes,
             waves: raw.waves,
+            pipelined_uploads: raw.pipelined_uploads,
         }
     }
 }
@@ -2210,6 +2216,7 @@ impl GpuEvaluator {
             tile_overlapped_uploads: 0,
             tile_pinned_bytes: 0,
             waves: 0,
+            pipelined_uploads: 0,
         };
         if unsafe { rc_arena_report(self.ctx, &mut raw) } != 0 {
             return ArenaReport::from_raw(&raw);
@@ -2231,8 +2238,9 @@ impl GpuEvaluator {
     ///
     /// This is the production double-buffer schedule made observable: batch A
     /// is uploaded and submitted on `S_eval`, batch B is then uploaded on
-    /// `S_h2d` (the `overlapped_uploads` counter records that A's kernel was
-    /// not yet complete when B's copy was enqueued), A is collected, and only
+    /// `S_h2d` (`pipelined_uploads` counts that A was submitted and not collected when B
+    /// was staged; `overlapped_uploads` observes that A's kernel was still
+    /// running), A is collected, and only
     /// then is B submitted. Arithmetic and launch shape are identical to two
     /// [`Self::eval_batch`] calls, so the errors are bit-for-bit equal.
     ///
