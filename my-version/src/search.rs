@@ -598,8 +598,8 @@ pub const DEFAULT_PRUNE_BUDGET: usize = 20_000;
 
 mod prune;
 pub use prune::PruneReport;
-/// #495: default relative band of the finalist refit.
-pub const DEFAULT_REFIT_BAND: f64 = 0.001;
+/// #495: default relative band of the finalist refit (`inf`: refit every unique tree).
+pub const DEFAULT_REFIT_BAND: f64 = f64::INFINITY;
 
 impl Default for Config {
     fn default() -> Self {
@@ -6139,6 +6139,7 @@ fn snapshot(
         config: cfg.clone(),
         backend,
         config_hash: crate::checkpoint::config_hash(cfg),
+        refit_band_unknown: false,
         generations: gens_done,
         stopped_early,
         best_prev,
@@ -7611,8 +7612,12 @@ fn run_search(
 
     if let Some(cp) = resume {
         cp.check_data(train, test)?;
-        if !cfg.same_search_settings(&cp.config) {
-            let diff = cfg.search_setting_differences(&cp.config);
+        let mut saved_settings = cp.config.clone();
+        if cp.refit_band_unknown {
+            saved_settings.refit_band = cfg.refit_band;
+        }
+        if !cfg.same_search_settings(&saved_settings) {
+            let diff = cfg.search_setting_differences(&saved_settings);
             return Err(format!(
                 "checkpoint search settings do not match ({})",
                 diff.join(", ")
@@ -10942,12 +10947,12 @@ mod tests {
         assert_eq!(report.refits, report.candidates);
     }
 
-    /// #495: the default band reports the same front costs and errors as the
+    /// #495: the 0.001 band reports the same front costs and errors as the
     /// full refit with fewer refits, and every reported member is a refit.
     #[test]
-    fn default_band_front_matches_the_full_refit() {
+    fn band_0_001_front_matches_the_full_refit() {
         let (want, full) = rebuild_with_band(f64::INFINITY);
-        let (got, banded) = rebuild_with_band(DEFAULT_REFIT_BAND);
+        let (got, banded) = rebuild_with_band(0.001);
         assert_eq!(got.items.len(), want.items.len());
         for (g, w) in got.items.iter().zip(&want.items) {
             assert_eq!(g.cost.to_bits(), w.cost.to_bits());
@@ -10962,7 +10967,7 @@ mod tests {
     #[test]
     fn refit_band_is_a_saved_search_setting() {
         let a = Config::default();
-        let b = Config { refit_band: f64::INFINITY, ..Config::default() };
+        let b = Config { refit_band: 0.001, ..Config::default() };
         assert_eq!(a.search_setting_differences(&b), vec!["refit_band"]);
         assert!(a.search_setting_differences(&a).is_empty());
     }
