@@ -573,7 +573,6 @@ fn cli_tiled_rank_metric_runs_on_the_cpu_with_device_memory() {
     let out = rcsr(
         &csv,
         &[
-            "--gpu",
             "--metric",
             "rank_correlation",
             "--json",
@@ -591,6 +590,16 @@ fn cli_tiled_rank_metric_runs_on_the_cpu_with_device_memory() {
         "{stdout}"
     );
     assert!(stdout.contains("tiles of"), "{stdout}");
+
+    let out = rcsr(
+        &csv,
+        &["--gpu", "--metric", "rank_correlation", "--quiet", "--gpu-memory", budget.as_str()],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--gpu was requested but the device search failed"), "{stderr}");
+    assert!(stderr.contains("device_memory: the exact order/rank scorer"), "{stderr}");
+    assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
 }
 
 /// Paired timing for the PR: 1,000,000 rows x 20 vars, 400 candidates,
