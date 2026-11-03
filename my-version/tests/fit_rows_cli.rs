@@ -50,7 +50,7 @@ fn fit_rows_accepts_zero_and_integers() {
 fn big_csv() -> PathBuf {
     let path = std::env::temp_dir().join(format!("rcsr-fit-rows-big-{}.csv", std::process::id()));
     let mut text = String::from("x,y\n");
-    for i in 0..270_000u32 {
+    for i in 0..360_000u32 {
         let x = (i % 1000) as f64 * 0.01;
         text.push_str(&format!("{x},{}\n", 2.0 * x + 1.0));
     }
