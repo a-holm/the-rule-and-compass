@@ -3681,7 +3681,7 @@ fn fit_cost_check(_cfg: &Config) -> bool {
 /// #293: why a device plan cannot run, or `None` when it can. A stat scorer
 /// routed to the CPU leaves the run without a device scorer.
 #[cfg(feature = "cuda")]
-fn plan_blocker(plan: &crate::memory::DevicePlan) -> Option<String> {
+fn plan_blocker(plan: &crate::memory::DevicePlan, gpu_required: bool) -> Option<String> {
     if let Some(reason) = plan.refusal_reason() {
         return Some(reason);
     }
@@ -3694,7 +3694,7 @@ fn plan_blocker(plan: &crate::memory::DevicePlan) -> Option<String> {
                 .saturating_mul(4)
                 .saturating_add(plan.terms.side_vectors + plan.terms.buffers),
             plan.budget,
-            if plan.mode == crate::memory::Residency::Tiled {
+            if plan.mode == crate::memory::Residency::Tiled && !gpu_required {
                 format!("; the rows stream in tiles of {}, so the scorer runs on the CPU", plan.tile_rows)
             } else {
                 String::new()
@@ -7282,7 +7282,7 @@ fn run_search(
                 };
                 // #293: the plan runs before the first allocation.
                 let memory_plan = device_plan_for(cfg, train);
-                let created = match memory_plan.as_ref().and_then(plan_blocker) {
+                let created = match memory_plan.as_ref().and_then(|p| plan_blocker(p, cfg.gpu_required)) {
                     Some(reason) => Err(reason),
                     None => GpuSearch::new(
                         train,
