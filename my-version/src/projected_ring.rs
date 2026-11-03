@@ -147,6 +147,39 @@ pub struct RingStats {
     pub failed: bool,
 }
 
+/// Test hook: holds a stalled reader, ignoring cancellation, until released.
+#[derive(Clone, Debug, Default)]
+pub struct StallGate(Arc<(Mutex<GateState>, Condvar)>);
+
+#[derive(Debug, Default)]
+struct GateState {
+    released: bool,
+    waiting: bool,
+}
+
+impl StallGate {
+    pub fn release(&self) {
+        let (m, c) = &*self.0;
+        m.lock().unwrap().released = true;
+        c.notify_all();
+    }
+
+    /// True while a reader is blocked on the gate.
+    pub fn is_waiting(&self) -> bool {
+        self.0 .0.lock().unwrap().waiting
+    }
+
+    fn wait(&self) {
+        let (m, c) = &*self.0;
+        let mut g = m.lock().unwrap();
+        g.waiting = true;
+        while !g.released {
+            g = c.wait(g).unwrap();
+        }
+        g.waiting = false;
+    }
+}
+
 /// Bounds and test hooks for the ring's blocking waits.
 #[derive(Clone, Debug, Default)]
 pub struct RingOptions {
@@ -156,8 +189,8 @@ pub struct RingOptions {
     /// Test hook: the reader takes a slot for this group and then stalls until
     /// it is cancelled, without delivering it.
     pub stall_before_group: Option<usize>,
-    /// Test hook: the stalled reader ignores cancellation for this long.
-    pub stall_ignores_cancel: Option<Duration>,
+    /// Test hook: the stalled reader ignores cancellation until the gate is released.
+    pub stall_gate: Option<StallGate>,
 }
 
 impl RingOptions {
@@ -175,7 +208,7 @@ impl RingOptions {
         RingOptions {
             wait,
             stall_before_group,
-            stall_ignores_cancel: None,
+            stall_gate: None,
         }
     }
 }
@@ -454,10 +487,10 @@ impl ProjectedRing {
                     if options.stall_before_group == Some(group) {
                         let mut st = shared.lock();
                         st.phase = Phase::Stalled;
-                        match options.stall_ignores_cancel {
-                            Some(d) => {
+                        match &options.stall_gate {
+                            Some(gate) => {
                                 drop(st);
-                                std::thread::sleep(d);
+                                gate.wait();
                             }
                             None => {
                                 while !st.cancelled {
