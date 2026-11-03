@@ -12,13 +12,14 @@ One job: prove the repository and the machine are in the recorded state.
 - `../../../_shared/rules.md`
 - `../../../_shared/commands.md`
 - `../../CONTEXT.md`
+- `../../../_tools/status.sh`
 
 Do NOT load: continuing work before all four checks pass.
 
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. Four checks: the branch sha equals the remote sha, the worktree is clean, no cargo or rustc process runs, no `PAUSE` file exists.
+2. Run `verksted/_tools/status.sh --no-fetch`. Four checks read from its lines: the `origin/<base>` tip equals the branch tip, the run worktree shows `dirty=n`, the `processes:` list is `none`, `flags:` shows `PAUSE=n`.
 3. Write `report.md`: each check with its command and result.
 
 ## Outputs
@@ -29,7 +30,7 @@ Do NOT load: continuing work before all four checks pass.
 ## Check
 
 ```sh
-test "$(git -C "$RUN" rev-parse HEAD)" = "$(git -C "$RUN" rev-parse '@{u}')" && test -z "$(git -C "$RUN" status --porcelain --untracked-files=no)" && test "$(ps -eo comm= | grep -cE '^(cargo|rustc|rcsr-bench)$')" = 0 && test ! -e /mnt/lager/tmp/opencode/PAUSE
+s=$("$V/_tools/status.sh" --no-fetch); test "$(printf "%s\n" "$s" | sed -n "s|^origin/$BASE: \([0-9a-f]*\) .*|\1|p")" = "$(git -C "$RUN" rev-parse --short HEAD)" && printf "%s\n" "$s" | grep -q "^$(basename "$RUN"): .* dirty=n" && test "$(printf "%s\n" "$s" | sed -n "/^processes:/,\$p" | tail -n +2)" = "  none" && printf "%s\n" "$s" | grep -q "^flags: PAUSE=n"
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.

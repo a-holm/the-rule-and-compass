@@ -11,13 +11,14 @@ One job: collect the state of PRs, branches, worktrees, gates and processes.
 - `../../../_shared/rules.md`
 - `../../../_shared/commands.md`
 - `../../CONTEXT.md`
+- `../../../_tools/status.sh`
 
 Do NOT load: opinions, estimates, agent self-reports.
 
 ## Process
 
-1. Run the source commands: `gh pr list`, `gh issue list`, `git log --oneline origin/main..<base>`, `git worktree list`, the gate logs in `$G`, `ps -eo pid,etime,args | grep -E 'cargo|rustc|rcsr'`.
-2. Write `state.md`: one bullet per fact, each ending in `(source: <command>)`. A fact without a source is not written.
+1. Run `verksted/_tools/status.sh`: it prints the clock, the base tip, open PRs, worktrees, locks, flags, GPU and processes. Add `gh pr list`, `gh issue list`, `git log --oneline origin/main..<base>` and the gate logs in `$GATES`.
+2. Write `state.md`: one bullet per fact, each ending in `(source: status.sh <section>)` or `(source: <command>)`. A fact without a source is not written. The integration branch never goes to `main` as a whole. The one approved exception is `verksted/` alone, copied to `main` as its own issue after epic #666 is done. Any other merge into `main` needs the project lead's written instruction (standing instruction, 2026-11-03).
 3. Where something cannot be checked, write `unknown: <what>` and do not guess.
 
 ## Outputs
