@@ -321,3 +321,12 @@ fn front_read_verifies_with_another_path_spelling() {
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("\"run\":\"run.json\""), "the printed report keeps the --front path");
 }
+
+#[test]
+fn the_report_filter_drops_timing_ledger_fields_and_keeps_data_fields() {
+    let a = r#"{"device_fraction":0.1,"duty_run":{"value":0.2,"numerator":0.3,"denominator":4,"units":"s/s","scope":"run"},"sharpe":1.5,"n_rows":10}"#;
+    let b = r#"{"device_fraction":0.9,"duty_run":{"value":0.8,"numerator":0.7,"denominator":5,"units":"s/s","scope":"run"},"sharpe":1.5,"n_rows":10}"#;
+    assert_eq!(stable(a, "d"), stable(b, "d"));
+    assert_ne!(stable(a, "d"), stable(&a.replace("1.5", "1.6"), "d"));
+    assert_ne!(stable(a, "d"), stable(&a.replace("10", "11"), "d"));
+}
