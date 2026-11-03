@@ -1253,6 +1253,11 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   a request above the measured break-even (3/5 of the rows) is widened to the
   full sample, because rebuilding the sample and refitting the carried
   population cost more than the rows saved;
+- **device fit subsample** (`--fit-rows N`, default 65536 on the GPU fit path
+  above 262144 training rows, #602): the device fits constants on a fixed
+  `N`-row subsample, scores every training row and refits the archive on all
+  rows. `--fit-rows 0` keeps every row; a CPU run is unchanged. The A/B
+  evidence is on #602;
 - **screened constant fitting** (`--fit-samples N`): within each generation,
   all offspring are fitted and scored on a fresh deterministic `N`-row subset,
   the top 1/16 are promoted to a full-data refit and re-score, and the next
