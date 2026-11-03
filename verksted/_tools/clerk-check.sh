@@ -7,7 +7,7 @@
 #   conflicts: on CONFLICTING, git merge-tree --write-tree --name-only origin/<base> <head>
 #   claims: one row per line `<label>|<log path>|<ERE>` of the claims file: found | no match | no log
 #   merge: the command to run, with a subject placeholder; never executed
-# Retries while mergeable is UNKNOWN, every 5 s for up to 60 s.
+# Retries while an OPEN PR has mergeable UNKNOWN, every 5 s for up to 60 s.
 # Writes: nothing (git fetch only).
 # Exit: 0 when state OPEN, base matches (default $BASE), MERGEABLE, every claim found and nothing out of scope; 1 otherwise; 2 usage.
 set -uo pipefail
@@ -40,7 +40,7 @@ while :; do
   json=$(cd "$ROOT" && gh pr view "$pr" --json state,baseRefName,headRefOid,mergeable,files) \
     || { echo "gh pr view $pr failed" >&2; exit 1; }
   mergeable=$(jq -r .mergeable <<<"$json")
-  [ "$mergeable" = UNKNOWN ] && [ "$tries" -lt 12 ] || break
+  [ "$mergeable" = UNKNOWN ] && [ "$(jq -r .state <<<"$json")" = OPEN ] && [ "$tries" -lt 12 ] || break
   tries=$((tries + 1))
   sleep "$sleep_s"
 done
