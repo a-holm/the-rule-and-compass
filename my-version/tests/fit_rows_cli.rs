@@ -2,9 +2,13 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static CSV_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 fn csv() -> PathBuf {
-    let path = std::env::temp_dir().join(format!("rcsr-fit-rows-{}.csv", std::process::id()));
+    let n = CSV_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("rcsr-fit-rows-{}-{}.csv", std::process::id(), n));
     let mut text = String::from("x,y\n");
     for i in 0..60 {
         let x = i as f64 * 0.1;
@@ -15,12 +19,15 @@ fn csv() -> PathBuf {
 }
 
 fn run(value: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let data = csv();
+    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args(["--data"])
-        .arg(csv())
+        .arg(&data)
         .args(["--target", "y", "--generations", "1", "--pop", "20", "--fit-rows", value])
         .output()
-        .expect("run rcsr")
+        .expect("run rcsr");
+    let _ = std::fs::remove_file(&data);
+    out
 }
 
 #[test]
