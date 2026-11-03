@@ -4,6 +4,7 @@
 # one-full-suite, rustc, nvcc or rcsr process runs under it. Prints `SILENT <n>min: <path>`
 # and exits 0 on the first alert. -1 does one pass and exits 0 (alert or not).
 # The build directory and .git are ignored: transcripts buffer and do not show liveness.
+# Writes: nothing.
 set -u
 minutes=45
 interval=300
