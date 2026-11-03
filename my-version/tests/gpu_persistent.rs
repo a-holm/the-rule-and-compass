@@ -78,7 +78,8 @@ const GOLDEN: &[(Metric, u64)] = &[
     (Metric::RankCorrelation, 0x0dbc_187c_7c8f_6de1),
     (Metric::Median, 0xdd06_72b6_d7be_afeb),
     (Metric::Interquartile, 0xbd8b_f909_d817_ba39),
-    (Metric::Maximum, 0x9a03_40a6_bdea_51f7),
+    // 2 048 rows is below the crossover of the maximum fit cost model, so the CPU polish fits.
+    (Metric::Maximum, 0x4cef_73c5_37d0_7645),
 ];
 
 #[cfg(feature = "cuda")]

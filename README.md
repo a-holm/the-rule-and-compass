@@ -650,7 +650,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--mutation-mix classic|extended] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
      [--patience N]
-     [--gpu] [--gpu-memory size] [--dispatch auto|device] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
+     [--gpu] [--gpu-memory size] [--dispatch auto|device] [--calibration anchors|probe|PATH] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
      [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
      [--allow-backend-change] [--allow-build-change] [--run-manifest file] [--json-out file]
@@ -1316,7 +1316,7 @@ the GPU to guide the search whenever one is available **and the run's metric is
 scored on the device**; a build without the feature, or a machine with no usable
 device, falls back to the CPU and records the reason. `--gpu` asserts that a
 device must exist (exit 2 otherwise), `--no-gpu`/`--cpu` forces the CPU, and
-`RCSR_GPU=0` simulates a missing device. `--dispatch device` (needs `--gpu`) forces the device route past the cost model; refusals still win. Non-quiet runs print one resource line
+`RCSR_GPU=0` simulates a missing device. `--dispatch device` (needs `--gpu`) forces the device route past the cost model; refusals still win. `--calibration anchors|probe|<path>` selects the rates Auto dispatch prices with (default: `$XDG_CACHE_HOME/rcsr/calibration.json` if it exists, else the fixed corpus anchors); `rcsr calibrate` writes that file and a search run never does. Non-quiet runs print one resource line
 with the backend, device, available threads and training rows/columns, and
 `--json` records `backend`, `backend_reason` and `device`.
 `RCSR_FIT_RECORD=<empty dir>` records every device fit launch for `rcsr-gpu-bench --fit-replay` (see `docs/gpu-backend.md`, "Comparing toolkits and fit kernel variants").

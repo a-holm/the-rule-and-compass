@@ -335,13 +335,13 @@ pub fn json() -> String {
  {{\"name\":\"--max-memory\",\"type\":\"size\",\"default\":\"auto\",\"description\":\"refuse when the header-derived store or rows x columns CSV estimate exceeds this\"}},\
  {{\"name\":\"--force\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"override --max-memory and load the full input\"}},\
  {{\"name\":\"--quiet\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"do not print the import summary\"}}]}},\n  \
+         \"verify-manifest\":{{\"command\":\"rcsr verify-manifest\",\"summary\":\"check a --run-manifest against the current binary, commit, data and canonical config\",\"doc\":\"docs/run-integrity.md\",\"options\":[\
+ {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"path stored in the manifest\",\"description\":\"data file to hash instead of the manifest's path\"}},\
+{{\"name\":\"--binary\",\"type\":\"path\",\"default\":\"the running rcsr\",\"description\":\"executable to hash instead of the running one, for the preserved binary of a finished run\"}}],\"exit_codes\":{{\"0\":\"all checks pass\",\"1\":\"mismatch\",\"2\":\"usage error\"}}}},\n  \
          \"calibrate\":{{\"command\":\"rcsr calibrate\",\"summary\":\"time this machine and write the calibration file --dispatch auto routes from (schema rcsr-calibration/1); written atomically, never written by a search run\",\"doc\":\"docs/dispatch.md\",\"options\":[\
 {{\"name\":\"--out\",\"type\":\"path\",\"default\":\"$XDG_CACHE_HOME/rcsr/calibration.json, else ~/.cache/rcsr/calibration.json\",\"description\":\"where to write the file\"}},\
 {{\"name\":\"--gpu\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"also time the device; exit 2 when none is usable. Without --gpu or --cpu the device is timed when one is usable\"}},\
 {{\"name\":\"--cpu\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"time the host only; the device terms stay the corpus anchors\"}}],\"exit_codes\":{{\"0\":\"file written\",\"2\":\"usage error, unusable probe or write failure\"}}}},\n  \
-         \"verify-manifest\":{{\"command\":\"rcsr verify-manifest\",\"summary\":\"check a --run-manifest against the current binary, commit, data and canonical config\",\"doc\":\"docs/run-integrity.md\",\"options\":[\
- {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"path stored in the manifest\",\"description\":\"data file to hash instead of the manifest's path\"}},\
-{{\"name\":\"--binary\",\"type\":\"path\",\"default\":\"the running rcsr\",\"description\":\"executable to hash instead of the running one, for the preserved binary of a finished run\"}}],\"exit_codes\":{{\"0\":\"all checks pass\",\"1\":\"mismatch\",\"2\":\"usage error\"}}}},\n  \
          \"prep\":{{\"command\":\"rcsr prep\",\"summary\":\"raw OHLCV CSV/ZIP archives to a .rcsb store with no intermediate CSV\",\"options\":[\
 {{\"name\":\"--input\",\"type\":\"path\",\"default\":\"none\",\"description\":\"CSV/TSV/ZIP file or a directory searched recursively\"}},\
 {{\"name\":\"--format\",\"type\":\"enum\",\"default\":\"auto\",\"description\":\"auto | binance | bitstamp | ohlcv (aliased header)\"}},\

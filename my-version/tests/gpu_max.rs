@@ -153,7 +153,8 @@ fn gpu_maximum_run_is_deterministic_and_reports_the_exact_objective() {
         eprintln!("skipping GPU test: no usable CUDA device");
         return;
     }
-    let n = rcsr::fit::MAXIMUM_GPU_MIN_ROWS + 64;
+    // Above the crossover of the maximum fit cost model, so the fit arm runs on the device.
+    let n = 5_000;
     let train = sample(n, 5);
     let test = sample(300, 6);
     let a = search::run(&maximum_config(11), &train, &test);
