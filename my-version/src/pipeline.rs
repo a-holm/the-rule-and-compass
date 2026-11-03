@@ -81,7 +81,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
 
     /// A fast producer and a deliberately slow consumer: every job is delivered
     /// in FIFO order, and the number of live jobs never exceeds capacity +
@@ -113,9 +112,13 @@ mod tests {
         let mut seen = Vec::new();
         let error = queue.drain(BATCH, |jobs| {
             assert!(jobs.len() <= BATCH, "batch of {} jobs", jobs.len());
-            // A slow scorer: this is what gives the producer a chance to run
-            // ahead, so the bound is exercised rather than incidental.
-            std::thread::sleep(Duration::from_micros(200));
+            // Hold the first batch until the producer has filled the queue and
+            // blocks in a `send` with one more job in hand.
+            if seen.is_empty() {
+                while live.load(Ordering::SeqCst) < CAPACITY + jobs.len() + 1 {
+                    std::thread::yield_now();
+                }
+            }
             for j in jobs {
                 seen.push(j);
                 live.fetch_sub(1, Ordering::SeqCst);
