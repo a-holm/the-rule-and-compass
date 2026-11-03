@@ -48,7 +48,23 @@ A run is set up once from `setup/questionnaire.md`. Its answers are already writ
 ## Check the structure itself
 
 ```sh
-verksted/_tools/links.sh
+verksted/_tools/links.sh [--strict]
 ```
 
-It runs the crate test `my-version/tests/verksted_links.rs` through the machine lock. The test checks that every relative link and every backticked input path under `verksted/` resolves, that every pipeline and stage holds the four contract headings in order, that `AGENTS.md` routes every pipeline, and that no `.py` file exists. Exit 0 means the tree is clean.
+It builds the crate `_tools/verksted-check/` in the build slot and runs `links` and `walk` on `verksted/`. `links` checks that every relative link and every backticked input path resolves. `walk` checks that every pipeline and stage holds the four contract headings in order, that `AGENTS.md` routes every pipeline, that no `.py` file exists, that `CLAUDE.md` is exactly `@AGENTS.md`, that every script header follows the convention below, and that every `_tools/<path>` mention in a markdown file exists. `--strict` adds three checks: `_index.md` matches the tree, every tool is mentioned in a file other than `_index.md`, and the repo `AGENTS.md` links `verksted/AGENTS.md`. The same rules run in `cargo test --release` in `my-version/` through `tests/verksted_links.rs`; `tests/verksted_tools.rs` runs `bash -n` on every script and every `_tools/tests/*.sh`. Exit 0 means the tree is clean.
+
+## Scripts
+
+Every top-level `_tools/*.sh` follows one convention:
+
+- Line 1 is `#!/usr/bin/env bash`. Line 2 starts with `# Usage:`, or with `# Sourced` for a file that is only sourced. A `# Writes:` line sits in the first 15 lines.
+- It starts with `set -uo pipefail` and `source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"`. `lib.sh` holds the paths, the `RCSR_*` overrides and the helpers; no script repeats a machine path.
+- `-h` prints the header (`usage`). A bad argument prints it to stderr and exits 2.
+- Exit codes: 0 ok, 1 failed or refused, 2 usage, 70 a GPU Xid error appeared, 75 the lock gave up, 124 timeout.
+- A script that runs a job prints `RC_DONE rc=<n> at=<time>` as its last line (`rc_done`).
+- A script never creates `$GATES`; it calls `need_gates` before it writes a log.
+- Each script has a hermetic test in `_tools/tests/test-<name>.sh`: no network, no GPU, no real lock, no real `gh`, temp dirs only, under 30 s. `tests/verksted_tools.rs` runs every file there.
+
+## Index
+
+`_index.md` lists the pipelines, stages, tools and templates. It is generated: never edit it by hand. After a change to a stage, a tool or a template, run `verksted-check index` (`_tools/links.sh` builds the binary). `links.sh --strict` fails when the file is stale.

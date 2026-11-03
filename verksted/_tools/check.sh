@@ -2,6 +2,7 @@
 # Usage: check.sh <output-dir> '<check command>'
 # Runs the command with bash -c and writes <output-dir>/check.md: line 1 is `pass` or
 # `fail: exit <code>: <last output line>`, then the command and the exit code.
+# Writes: <output-dir>/check.md
 set -u
 if [ $# -ne 2 ]; then
   echo "usage: check.sh <output-dir> '<check command>'" >&2

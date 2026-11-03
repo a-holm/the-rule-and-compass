@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Usage: gate.sh <worktree> <tag>
 # The full gate on an integration tip: CPU suite, CUDA suite, tiny benchmark (27/27).
-# Each step is its own lock hold with an outer timeout. Logs: $G/<tag>-{cpu,cuda,bench}.log.
+# Each step is its own lock hold with an outer timeout. Logs: $D/<tag>-{cpu,cuda,bench}.log.
 # Exit 0 only when every suite passes and the benchmark recovers 27/27.
+# Writes: $D/<tag>-{cpu,cuda,bench}.log
 set -u
 if [ $# -ne 2 ]; then
   echo "usage: gate.sh <worktree> <tag>" >&2
@@ -11,8 +12,11 @@ fi
 W=$1
 T=$2
 L=${RCSR_LOCK_SCRIPT:-/mnt/lager/tmp/opencode/one-full-suite.sh}
-D=${RCSR_GATE_DIR:-/mnt/lager/tmp/eureqa-gates}
-mkdir -p "$D"
+D=${RCSR_GATE_DIR:-${RCSR_GATES:-/mnt/lager/tmp/rcsr-gates}}
+if [ ! -d "$D" ]; then
+  echo "gate dir $D missing; #684 creates the symlink" >&2
+  exit 1
+fi
 step() {
   local name=$1 cmd=$2
   "$L" bash -c "cd '$W/my-version' && CARGO_BUILD_JOBS=2 $cmd" > "$D/$T-$name.log" 2>&1

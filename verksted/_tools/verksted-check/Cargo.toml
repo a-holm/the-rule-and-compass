@@ -1,0 +1,13 @@
+[package]
+name = "verksted-check"
+version = "0.1.0"
+edition = "2021"
+# Writes: `_index.md` with `index`
+description = "Link, contract, reference and index checks of the verksted workshop"
+publish = false
+
+[[bin]]
+name = "verksted-check"
+path = "src/main.rs"
+
+[dependencies]

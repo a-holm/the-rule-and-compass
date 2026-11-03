@@ -22,14 +22,19 @@ Provisional answer: yes. Each stage's `## Check` is a command. The gate is `../_
 
 Provisional answer, with the machine values the run variables take:
 
-| Name | Value |
+Each value is defined, with its `RCSR_*` override, in [`../_tools/lib.sh`](../_tools/lib.sh); the table names the variable and does not repeat the value.
+
+| Name | Defined in lib.sh as |
 |---|---|
-| `ROOT` | the first entry of `git worktree list` |
-| Lock script | `/mnt/lager/tmp/opencode/one-full-suite.sh` |
-| Pause file | `/mnt/lager/tmp/opencode/PAUSE` |
-| Gate logs | `/mnt/lager/tmp/eureqa-gates/` |
-| CUDA architecture | `RCSR_CUDA_ARCH=sm_86` |
-| Integration branch | `integration/gpu-hardening` |
+| Main checkout `ROOT` | `ROOT`, `WT` (worktrees) |
+| Repo checkout of this workshop | `RCSR_ROOT` |
+| Lock script | `L` (`RCSR_LOCK_SCRIPT`) |
+| Build slot script | `B` (`RCSR_SLOT_SCRIPT`), `SLOTDIR` |
+| Pause file | `PAUSE` |
+| Gate logs | `$GATES`, the neutral path `/mnt/lager/tmp/rcsr-gates` (a symlink) |
+| CUDA architecture | `CUDA_ARCH` |
+| CUDA 13.0 sanitizer | `SANITIZER` (`RCSR_SANITIZER`) |
+| Integration branch | `BASE` (`RCSR_BASE`) |
 | Memory file `MEM` | the integration state file under the agent's project memory directory |
 | Existing tools | `../../scripts/stacks.sh`, `../../scripts/stall-watch.sh`, `rcsr-launch`, `rcsr-rss` |
 
