@@ -3827,8 +3827,9 @@ __device__ void ft_corr_mask_gauge(double *jtj, double *jtr, int p, double rho, 
     }
 }
 
+/* Two resident 256-thread blocks per SM for the CHUNK = 256 instantiation. */
 template <int MAXC, int CHUNK, int PCHUNK>
-__global__ void fit_kernel(const float *__restrict__ cols,
+__global__ void __launch_bounds__(CHUNK, CHUNK == 256 ? 2 : 1) fit_kernel(const float *__restrict__ cols,
                            const float *__restrict__ y,
                            const float *__restrict__ tsign,
                            const double *__restrict__ cols64,
