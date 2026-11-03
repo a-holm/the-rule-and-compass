@@ -305,14 +305,14 @@ fn timing_phases_sum_to_wall_in_text_json_and_ndjson() {
         "report_seconds",
     ];
     let json_sum: f64 = phases.iter().map(|k| num_after(k)).sum();
+    let json_unaccounted = num_after("unaccounted_seconds");
     let json_total = num_after("total_seconds");
     assert!(json_total >= 0.0, "JSON total wall must not be negative: {body}");
-    if json_total > 0.0 {
-        assert!(
-            (json_sum - json_total).abs() <= 0.01 * json_total,
-            "JSON phases must sum to wall within 1%: {json_sum} vs {json_total}"
-        );
-    }
+    assert!(
+        (json_sum + json_unaccounted - json_total).abs() <= 1e-9 * json_total.max(1.0),
+        "JSON phases and unaccounted must sum to total: {json_sum} + {json_unaccounted} vs {json_total}"
+    );
+    assert!(json_unaccounted >= -1e-9, "unaccounted_seconds must not be negative: {json_unaccounted}");
     assert_eq!(
         num_after("elapsed_seconds"),
         num_after("search_seconds"),

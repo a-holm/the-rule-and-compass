@@ -8,7 +8,7 @@
 use rcsr::gui;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn get(addr: SocketAddr, path: &str) -> (u16, String) {
     request(addr, &format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", path))
@@ -219,14 +219,10 @@ fn server_stops_when_dropped() {
     let server = gui::serve("127.0.0.1", 0).expect("start server");
     let addr = server.addr();
     drop(server);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
-            Err(_) => break,
-            Ok(_) if Instant::now() >= deadline => panic!("server still accepting after drop"),
-            Ok(_) => std::thread::sleep(Duration::from_millis(20)),
-        }
-    }
+    assert!(
+        TcpStream::connect_timeout(&addr, Duration::from_secs(5)).is_err(),
+        "server still accepting after drop"
+    );
 }
 
 fn json_string(s: &str) -> String {

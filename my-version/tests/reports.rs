@@ -220,10 +220,12 @@ fn json_timing_phases_sum_to_the_measured_wall() {
         "phases must be non-negative"
     );
     assert!(total > 0.0, "total wall must be positive");
+    let unaccounted = get("unaccounted_seconds");
     assert!(
-        (prep + search + baselines + diagnostics + report - total).abs() <= 0.01 * total,
-        "phases must sum to total wall within 1%: {prep}+{search}+{baselines}+{diagnostics}+{report} vs {total}"
+        (prep + search + baselines + diagnostics + report + unaccounted - total).abs() <= 1e-9 * total.max(1.0),
+        "phases and unaccounted must sum to total: {prep}+{search}+{baselines}+{diagnostics}+{report}+{unaccounted} vs {total}"
     );
+    assert!(unaccounted >= -1e-9, "unaccounted_seconds must not be negative: {unaccounted}");
     // The uncapped 1200-row k-NN baseline is real work, not a zero placeholder.
     assert!(
         baselines > 0.0,

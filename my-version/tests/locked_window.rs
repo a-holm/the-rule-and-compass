@@ -2,6 +2,7 @@
 //! search split, walk-forward and the ladder, and read only through the sealed
 //! path. Fixtures are synthetic; the locked range is a stand-in in 2024.
 
+use rcsr::devlog::Json;
 use rcsr::lockbox::{self, Lockbox};
 use rcsr::protocol::{Candidate, Ledger};
 use std::path::{Path, PathBuf};
@@ -353,11 +354,43 @@ fn dev_ladder(data: &str, win: &str, out: &str, purge: &str) -> (i32, String) {
     (code, err)
 }
 
-fn without_timing(json: &str) -> Vec<String> {
-    json.split(',')
-        .filter(|t| !(t.contains("_s\"") || t.contains("seconds") || t.contains("wall") || t.contains("denominator") || t.contains("declared_in")))
-        .map(str::to_string)
-        .collect()
+fn is_timing_key(key: &str) -> bool {
+    key.ends_with("_s")
+        || key.ends_with("_ms")
+        || key.ends_with("_seconds")
+        || key.starts_with("wall")
+        || key.starts_with("elapsed")
+        || ["numerator", "denominator", "device_fraction", "duty_run", "declared_in", "bytes_per_s", "rows_per_s"]
+            .contains(&key)
+}
+
+fn drop_timing(value: Json) -> Json {
+    match value {
+        Json::Obj(items) => Json::Obj(
+            items
+                .into_iter()
+                .filter(|(key, _)| !is_timing_key(key))
+                .map(|(key, v)| (key, drop_timing(v)))
+                .collect(),
+        ),
+        Json::Arr(items) => Json::Arr(items.into_iter().map(drop_timing).collect()),
+        other => other,
+    }
+}
+
+fn without_timing(json: &str) -> Json {
+    drop_timing(Json::parse(json).unwrap_or_else(|| panic!("not one JSON document: {json}")))
+}
+
+#[test]
+fn without_timing_drops_timing_keys_and_keeps_data() {
+    let a = r#"{"label":"wall","train_error":1.5,"fit_s":0.1,"duty_run":{"numerator":3,"denominator":9},"stages":[{"io_s":1,"rows":7}],"declared_in":"x"}"#;
+    let b = r#"{"label":"wall","train_error":1.5,"fit_s":9.9,"duty_run":{"numerator":4,"denominator":2},"stages":[{"io_s":2,"rows":7}],"declared_in":"y"}"#;
+    let c = r#"{"label":"wall","train_error":1.6,"fit_s":0.1,"duty_run":{"numerator":3,"denominator":9},"stages":[{"io_s":1,"rows":7}],"declared_in":"x"}"#;
+    let d = r#"{"label":"walk","train_error":1.5,"fit_s":0.1,"duty_run":{"numerator":3,"denominator":9},"stages":[{"io_s":1,"rows":7}],"declared_in":"x"}"#;
+    assert_eq!(without_timing(a), without_timing(b));
+    assert_ne!(without_timing(a), without_timing(c));
+    assert_ne!(without_timing(a), without_timing(d));
 }
 
 #[test]
@@ -744,23 +777,24 @@ fn cv_folds_honour_exclude() {
 
 #[test]
 fn a_refused_cv_run_exits_before_the_search() {
-    let started = std::time::Instant::now();
     let dir = scratch("cvpreflight");
     let data = dir.join("d.csv");
     series_csv(&data);
     let d = s(&data);
     lockbox::write_sidecar(&d, &locked(), "test").unwrap();
     let run = dir.join("run.json");
+    let devlog = dir.join("dev.ndjson");
     let train = format!("ts < {}", T0 + 100 * H);
     let test = format!("(ts >= {}) * (ts < {})", T0 + 100 * H, T0 + 150 * H);
-    let (code, _, err) = plain(&[
-        "--data", &d, "--time", "ts", "--train-select", &train, "--test-select", &test, "--cv", "k-fold",
-        "--cv-k", "3", "--generations", "1000000", "--pop", "2000", "--json-out", &s(&run),
+    let (code, _, err) = rcsr(&[
+        "--target", "y", "--vars", "x", "--cpu", "--seed", "3", "--quiet", "--data", &d, "--time", "ts",
+        "--train-select", &train, "--test-select", &test, "--cv", "k-fold", "--cv-k", "3", "--generations",
+        "2", "--pop", "20", "--json-out", &s(&run), "--dev-log", &s(&devlog),
     ]);
     assert_eq!(code, 3, "{}", err);
     assert!(err.contains("cross-validation rows"), "{}", err);
     assert!(!run.exists(), "run.json written: the search ran");
-    assert!(started.elapsed().as_secs() < 30, "the search ran before the refusal");
+    assert!(!devlog.exists(), "the dev log was opened: the search started");
 }
 
 #[test]
