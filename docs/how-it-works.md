@@ -14,6 +14,8 @@ The data is split before the search. The training rows drive the fit. A validati
 
 A run can stop and continue. `--save` writes an atomic checkpoint and `--resume` restores the search state exactly, so a split run and an uninterrupted run give the same front. `--run-manifest` records the binary, data and configuration, and `rcsr verify-manifest` checks them later. `--report` turns a run into a Markdown document for another reader.
 
+The main use case is a long-only buy/sell signal trained on profit. `--objective pnl` (or `sharpe`, `log_growth`) scores finalists as a book that is long or flat only: no short, no leverage, a cost per side. `--fitness pnl` goes further and ranks every candidate in the search by that book's regret on the training rows, so profit drives the search and not only the final choice. `--pnl-blocks` cuts the training rows into equal time blocks and penalises a formula that earns in one regime only. `--fitness pnl` refuses `--cv`, `--stability` and `--null-runs`, with exit 2.
+
 `rcsr schema` prints a machine-readable description of the CLI. `--help` and `README.md` list every option.
 
 Details:
@@ -23,6 +25,7 @@ Details:
 * [`docs/convergence.md`](convergence.md): how to tell whether a run converged.
 * [`docs/checkpoint.md`](checkpoint.md): checkpoint format and resume rules.
 * [`docs/reports.md`](reports.md): summary, sensitivity and benchmark reports.
+* [`docs/optimisation.md`](optimisation.md#--fitness-pnl-rank-every-candidate-by-the-exact-pl-regret): the `--fitness pnl` ranking, `--pnl-blocks` and the refusals.
 
 ## GPU backend
 
