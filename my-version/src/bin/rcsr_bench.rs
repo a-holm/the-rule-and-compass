@@ -75,7 +75,6 @@ OPTIONS:
   --restart-interval <N>    generations between island restarts
   --variation <mode>        auto, node or postfix
   --selection <mode>        lexicographic (default) or afp (age-fitness Pareto)
-  --linear-scaling          wrap every candidate in a fitted affine output map (#470)
   --mutation-mix <mix>      classic (default) or extended: insert, delete, swap, rotate (#471)
   --tree-arity <mode>       uniform (default) or balanced random-tree operator draw (#471)
   --crossover-internal <P>  probability of an internal-node crossover cut (default 0) (#471)
@@ -326,7 +325,9 @@ fn parse(args: &[String]) -> Result<Args, String> {
                 a.knobs.restart_interval =
                     Some(num(take(&mut i, "--restart-interval")?, "--restart-interval")?)
             }
-            "--linear-scaling" => a.knobs.linear_scaling = true,
+            "--linear-scaling" => {
+                return Err("--linear-scaling was removed (#470): it lowered oracle_recovered in the default-decision A/B".to_string())
+            }
             "--mutation-mix" => {
                 a.knobs.mutation_mix = Some(rcsr::search::MutationMix::parse(&take(&mut i, "--mutation-mix")?)?)
             }
