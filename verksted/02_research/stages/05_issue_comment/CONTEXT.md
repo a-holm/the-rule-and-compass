@@ -18,7 +18,7 @@ Do NOT load: closing or relabelling the issue, implementation.
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. `gh issue comment "$N" --body-file <decision.md>`. One comment. Do not close, relabel or reassign the issue.
+2. The comment states only verified present facts (rule 35). `gh issue comment "$N" --body-file <decision.md>`. One comment. Do not close, relabel or reassign the issue.
 3. Write `report.md`: comment URL, premises that failed, the line the implementer brief must quote ("the decision in <URL> is the binding design").
 
 ## Outputs

@@ -12,13 +12,14 @@ One job: reproduce the hang in a small test that fails on the unfixed code.
 - `../../../_shared/rules.md`
 - `../../../_shared/commands.md`
 - `../../CONTEXT.md`
+- `../../../_tools/rc-run.sh`
 
 Do NOT load: the fix, the huge original test.
 
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. Write a Rust test or example that hangs on the unfixed commit. Run it N times under an outer `timeout -s KILL 300`, through the lock. For a deeper look run it under `gdb -q -batch -nx -ex run -ex 'thread apply all bt 25' --args <bin> <test> --exact --nocapture --test-threads=1`.
+2. Write a Rust test or example that hangs on the unfixed commit. Run it N times with `verksted/_tools/rc-run.sh run <W> <id> <tag> --timeout 300 -- <command>`, one log per run. For a deeper look run it under `gdb -q -batch -nx -ex run -ex 'thread apply all bt 25' --args <bin> <test> --exact --nocapture --test-threads=1`.
 3. Write `repro.md`: the commit, the command, the log path and the line `hangs: K/N`.
 
 ## Outputs
