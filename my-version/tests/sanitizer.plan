@@ -6,3 +6,4 @@ gpu_parity      *                                                      skip     
 gpu_alloc_guard *                                                      skip           allocation accounting at 1M rows; its kernels run under memcheck in gpu_fit, gpu_rank and gpu_tiled
 gpu_memory_plan a_refused_device_allocation_is_reported_with_its_bytes api-errors-no  provokes a cudaMalloc out-of-memory on purpose
 gpu_ring        stale_cuda_error_does_not_fail_the_transport           api-errors-no  provokes a cudaMalloc out-of-memory on purpose
+gpu_ring no_such_test_exists api-errors-no bogus line for prove-red
