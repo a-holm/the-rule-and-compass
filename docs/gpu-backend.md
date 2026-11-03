@@ -1386,6 +1386,7 @@ second one. Their resources, from `cuobjdump -res-usage` on the built
 | 20 | 128 | 128 | 38 992 B | 85 | 1 824 B |
 
 Both stay under the 48 KB static ceiling and fit two blocks per SM on `sm_86`.
+The 256-thread instantiation is launched as `fit_kernel_two_blocks` with `__launch_bounds__(256, 2)` (same device body as `fit_kernel`), so the register allocation keeps two resident blocks per SM on both CUDA 12.0 and CUDA 13.0. `gpu::toolchain_tests::fit_kernel_occupancy_report` prints the registers and the resident blocks from `cudaOccupancyMaxActiveBlocksPerMultiprocessor`.
 The rejected alternative — 20 constants with a 256-thread block and a 256-row
 chunk — is 50 768 B (one block per SM). At `N = 1e5`/`1e6`, `P = 256`, eight
 iterations, one batch per cell:
