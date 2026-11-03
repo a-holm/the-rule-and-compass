@@ -4403,7 +4403,7 @@ static int ft_launch(RcCtx *c,
 
 /* Resident blocks per SM and registers per thread of the p <= 16 fit kernel
    instantiation. Returns 0 on success. */
-int rc_fit_occupancy(int *blocks, int *regs)
+extern "C" int rc_fit_occupancy(int *blocks, int *regs)
 {
     const int bytes = (int)sizeof(FtSmem<16, 256, 128>);
     cudaFuncAttributes attr;
