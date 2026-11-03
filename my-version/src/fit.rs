@@ -940,7 +940,7 @@ pub const MAXIMUM_GPU_MIN_ROWS: usize = 512;
 /// seconds, for `sweeps` sweeps and `p` constants.
 ///
 /// ```text
-/// cpu_s = START_S + sweeps·p·6·CPU_EVAL_ROW_S·n
+/// cpu_s = START_S + sweeps·p·6·CPU_PROBE_FRACTION·CPU_EVAL_ROW_S·n
 /// gpu_s = START_S + calls·GPU_CALL_S + sweeps·ROUNDS·p·GPU_SCAN_ROW_S·n
 /// calls = 2 + sweeps·(ROUNDS + 1)
 /// ```
@@ -954,11 +954,15 @@ pub const MAXIMUM_GPU_MIN_ROWS: usize = 512;
 /// per-candidate share of one call at the search's minimum admitted batch
 /// (32 candidates).
 ///
-/// The coefficients are the paired measurement in
-/// `docs/gpu-backend.md` §"Maximum absolute error fitting" (RTX 3060, p = 2,
-/// 32 candidates, `--fit-iters 8`): CPU 23.4 / 78.3 / 623.8 ms and device
-/// 9.1 / 10.4 / 74.2 ms at 256 / 1 024 / 8 192 rows. The CPU term is linear in
-/// `n` over that range; the fitted intercept is within 20 % of `START_S`.
+/// `coordinate_polish` accepts the first improving rung of a constant and stops
+/// at the first sweep without a gain, so on candidates that the squared fit has
+/// already placed it makes only `CPU_PROBE_FRACTION` of the `sweeps·p·6` score
+/// calls of the full ladder. That share is counted, not timed (see
+/// `the_cpu_maximum_polish_makes_the_counted_share_of_the_full_ladder`). The
+/// device coefficients are the paired measurement in `docs/gpu-backend.md`
+/// §"Maximum absolute error fitting" (RTX 3060, p = 2, 32 candidates,
+/// `--fit-iters 8`): 9.1 / 10.4 / 74.2 ms at 256 / 1 024 / 8 192 rows. The CPU
+/// row cost is the `measure_the_cpu_maximum_polish_row_cost` measurement.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MaximumFitCost {
     /// Modelled CPU polish time, seconds.
@@ -985,9 +989,12 @@ impl MaximumFitCost {
 
 /// #227: fixed cost of the squared LM warm start (both sides run one), seconds.
 const MAXIMUM_START_S: f64 = 1.5e-4;
-/// #227: per-row cost of one CPU probe (`expr::eval` in `f64` plus the max
-/// fold), seconds. Measured 24.6 ns for the search's minimum batch.
-const MAXIMUM_CPU_EVAL_ROW_S: f64 = 2.46e-8;
+/// #227: per-row cost of one CPU score call of the polish (one prediction
+/// sweep in `f64` plus the max fold), seconds.
+const MAXIMUM_CPU_EVAL_ROW_S: f64 = 9.0e-9;
+/// #733: share of the full ladder (`sweeps·p·6` score calls) that the CPU
+/// polish makes on candidates the squared fit has already placed.
+const MAXIMUM_CPU_PROBE_FRACTION: f64 = 0.45;
 /// #227: per-candidate share of one device scan call (one packed upload, one
 /// launch, one event synchronisation and one download), seconds.
 const MAXIMUM_GPU_CALL_S: f64 = 8.2e-7;
@@ -1001,7 +1008,7 @@ pub fn maximum_fit_cost(n: usize, p: usize, sweeps: usize) -> MaximumFitCost {
     let sweeps = sweeps.max(1) as f64;
     let rounds = minimax::MINIMAX_BISECT_ROUNDS as f64;
     let p = p.max(1) as f64;
-    let probes = sweeps * p * 6.0;
+    let probes = sweeps * p * 6.0 * MAXIMUM_CPU_PROBE_FRACTION;
     let calls = 2.0 + sweeps * (rounds + 1.0);
     let scans = sweeps * rounds * p;
     MaximumFitCost {
@@ -6319,16 +6326,122 @@ mod tests {
         assert!(!maximum_fit_only(Metric::Squared));
     }
 
-    /// #227: the maximum cost model, as a decision. Below the row floor the
-    /// CPU polish stays; at and above it the device wins for every constant
-    /// count the kernel accepts, and the model is monotone in `n`.
+    /// The #227 benchmark data: a smooth signal, duplicate targets and a gross
+    /// outlier, so the squared start and the minimax optimum differ.
+    fn maximum_bench_data(n: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f64 / (n - 1) as f64 * 6.0 - 3.0;
+            let s = ((i as u32).wrapping_mul(2_654_435_761) ^ 21) as f64 / u32::MAX as f64;
+            x.push(vec![t, s * 2.0 - 1.0]);
+            let mut v = 1.7 * t.sin() + 0.4 * t + 0.3 * s - 0.2;
+            if i % 7 == 3 {
+                v = 0.0;
+            }
+            if i % 151 == 5 {
+                v += 9.0;
+            }
+            y.push(v);
+        }
+        (x, y)
+    }
+
+    /// Score evaluations the CPU maximum polish makes for `candidates` affine
+    /// trees `a·x0 + b`, each pre-fitted by the squared fit, with `iters`
+    /// sweeps. This is the work `fit_weighted_metric` does after its squared
+    /// start, counted instead of timed.
+    fn maximum_polish_score_calls(n: usize, candidates: usize, iters: usize) -> usize {
+        let (x, y) = maximum_bench_data(n);
+        let calls = std::cell::Cell::new(0usize);
+        for k in 0..candidates {
+            let a = 0.2 + 0.15 * k as f64;
+            let mut t = node(
+                Op::Add,
+                vec![node(Op::Mul, vec![constant(a), input(0)]), constant(0.1 * k as f64)],
+            );
+            fit_weighted(&mut t, &x, &y, &[], 8);
+            let cols = FitCols::gather(&t, &x);
+            let score_of = |tree: &Node| {
+                calls.set(calls.get() + 1);
+                metric_score_cols(tree, &x, &cols, &y, &[], Metric::Maximum)
+            };
+            let mut trial = t.clone();
+            fit_weighted(&mut trial, &x, &y, &[], iters);
+            coordinate_polish_by(&mut trial, iters.max(1).min(12), &score_of);
+        }
+        calls.get()
+    }
+
+    /// The model charges `CPU_PROBE_FRACTION` of the full ladder. The count is
+    /// work, not time, so it is the same on every run.
     #[test]
-    fn the_maximum_cost_model_prefers_the_device_only_above_its_row_floor() {
+    fn the_cpu_maximum_polish_makes_the_counted_share_of_the_full_ladder() {
+        let candidates = 24;
+        let iters = 8;
+        let calls = maximum_polish_score_calls(5_000, candidates, iters);
+        // One score call per candidate is the start score, not a probe.
+        let probes = (calls - candidates) as f64;
+        let full = (candidates * iters * 2 * 6) as f64;
+        let share = probes / full;
+        assert!(
+            (share - MAXIMUM_CPU_PROBE_FRACTION).abs() < 0.05,
+            "polish made {probes} of {full} ladder probes ({share:.3}), the model charges {MAXIMUM_CPU_PROBE_FRACTION}"
+        );
+        for iters in [1usize, 2, 4] {
+            let calls = maximum_polish_score_calls(5_000, candidates, iters);
+            assert!(calls <= candidates * (1 + iters * 2 * 6), "iters {iters}: {calls}");
+        }
+    }
+
+    #[test]
+    #[ignore = "timing measurement of the CPU maximum polish"]
+    fn measure_the_cpu_maximum_polish_row_cost() {
+        for n in [1_000usize, 5_000, 20_000] {
+            let (x, y) = maximum_bench_data(n);
+            let calls = maximum_polish_score_calls(n, 24, 8);
+            let mut reps = Vec::new();
+            for _ in 0..5 {
+                let mut trees: Vec<Node> = (0..24)
+                    .map(|k| {
+                        let a = 0.2 + 0.15 * k as f64;
+                        let mut t = node(
+                            Op::Add,
+                            vec![node(Op::Mul, vec![constant(a), input(0)]), constant(0.1 * k as f64)],
+                        );
+                        fit_weighted(&mut t, &x, &y, &[], 8);
+                        t
+                    })
+                    .collect();
+                let start = std::time::Instant::now();
+                for t in trees.iter_mut() {
+                    fit_weighted_metric(t, &x, &y, &[], 8, Metric::Maximum);
+                }
+                reps.push(start.elapsed().as_secs_f64());
+            }
+            reps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = reps[reps.len() / 2];
+            eprintln!(
+                "n={n}: 24 candidates {:.3} ms, {calls} score calls, {:.3e} s per call per row",
+                median * 1e3,
+                median / (calls as f64 * n as f64)
+            );
+        }
+    }
+    /// #227/#733: the maximum cost model, as a decision. Below the row floor the
+    /// CPU polish stays. Above it the device wins once `n` passes a crossover
+    /// that falls with the constant count (about 3 300 rows for one constant),
+    /// and the model is monotone in `n` and in `p`.
+    #[test]
+    fn the_maximum_cost_model_prefers_the_device_only_above_its_crossover() {
         assert!(!maximum_gpu_fit_worthwhile(MAXIMUM_GPU_MIN_ROWS - 1, 4, 8));
+        assert!(!maximum_gpu_fit_worthwhile(1_000, 1, 8), "one constant at 1 000 rows");
+        assert!(maximum_gpu_fit_worthwhile(4_096, 1, 8), "one constant at 4 096 rows");
+        assert!(maximum_gpu_fit_worthwhile(MAXIMUM_GPU_MIN_ROWS, 20, 8), "20 constants at the floor");
         for p in 1..=20 {
             assert!(
-                maximum_gpu_fit_worthwhile(MAXIMUM_GPU_MIN_ROWS, p, 8),
-                "p={p} must be admitted at the floor"
+                maximum_gpu_fit_worthwhile(4_096, p, 8),
+                "p={p} must be admitted at 4 096 rows"
             );
             assert!(
                 maximum_gpu_fit_worthwhile(154_000, p, 8),
@@ -6339,9 +6452,8 @@ mod tests {
         let large = maximum_fit_cost(154_000, 4, 8);
         assert!(large.speedup() > small.speedup());
         assert!(large.speedup() > 1.0, "the model must show a speed-up at 154k");
-        let floor = maximum_fit_cost(MAXIMUM_GPU_MIN_ROWS, 4, 8);
-        assert!(floor.prefers_gpu(), "floor cost {floor:?}");
-        assert!(floor.cpu_s > 0.0 && floor.gpu_s > 0.0);
+        assert!(maximum_fit_cost(MAXIMUM_GPU_MIN_ROWS, 1, 8).cpu_s > 0.0);
+        assert!(!maximum_fit_cost(MAXIMUM_GPU_MIN_ROWS, 1, 8).prefers_gpu());
         // More constants make the device relatively better, because every
         // coordinate of a candidate rides in the same batched call.
         for n in [MAXIMUM_GPU_MIN_ROWS, 5_000, 154_000] {
