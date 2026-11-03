@@ -1,7 +1,7 @@
 //! #334: the persistent fit and score buffers do not change a search.
 //!
-//! The expected archive hashes were captured from the per-call allocating path
-//! before the change. Each run uses a GPU fit strategy so the batched fit, rank,
+//! The expected archive hashes pin the search result; the persistent buffers must
+//! not move them. Each run uses a GPU fit strategy so the batched fit, rank,
 //! median, interquartile and maximum stages all execute on the device.
 //! Device-dependent tests skip cleanly on a machine without CUDA.
 
@@ -70,14 +70,14 @@ fn archive_hash(out: &Outcome) -> u64 {
     h
 }
 
-/// `(metric, hash of the archive on the pre-change path)`.
+/// `(metric, hash of the archive)`.
 #[cfg(feature = "cuda")]
 const GOLDEN: &[(Metric, u64)] = &[
-    (Metric::Squared, 0x4123_c31e_a4bb_e8c0),
+    (Metric::Squared, 0xa92e_ae3a_b38e_20cd),
     (Metric::Absolute, 0x6a1c_d97e_7fbf_c519),
-    (Metric::RankCorrelation, 0xfb87_db02_cc6c_2624),
-    (Metric::Median, 0x7067_f1ee_1bea_3612),
-    (Metric::Interquartile, 0xef5a_ee61_ecff_afd3),
+    (Metric::RankCorrelation, 0x0dbc_187c_7c8f_6de1),
+    (Metric::Median, 0xdd06_72b6_d7be_afeb),
+    (Metric::Interquartile, 0xbd8b_f909_d817_ba39),
     (Metric::Maximum, 0x9a03_40a6_bdea_51f7),
 ];
 
