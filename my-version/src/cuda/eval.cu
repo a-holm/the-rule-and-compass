@@ -497,14 +497,6 @@ static int rc_arena_dev_alloc(RcCtx *c, const char *tag, void **p, size_t bytes)
     return rc;
 }
 
-static void rc_arena_dev_free(RcCtx *c, void *p)
-{
-    if (!p) return;
-    rc_dev_free(c, p);
-    c->alloc_calls++;
-    if (c->warm) c->steady_alloc_calls++;
-}
-
 /* Reserve the device arena at the requested high-water mark. Capacity only
    grows, and only when no batch is in flight: reallocating a slot that a
    pending kernel still reads would be a use-after-free. */
@@ -3835,31 +3827,35 @@ __device__ void ft_corr_mask_gauge(double *jtj, double *jtr, int p, double rho, 
     }
 }
 
+#define FIT_KERNEL_PARAMS \
+    const float *__restrict__ cols, \
+    const float *__restrict__ y, \
+    const float *__restrict__ tsign, \
+    const double *__restrict__ cols64, \
+    const double *__restrict__ y64, \
+    const double *__restrict__ tsign64, \
+    const double *__restrict__ w64, \
+    const unsigned int *__restrict__ pmask, \
+    int n, \
+    int v, \
+    const unsigned int *__restrict__ prog, \
+    const unsigned int *__restrict__ off, \
+    const int *__restrict__ pcount, \
+    int kmax, \
+    const double *__restrict__ c0, \
+    const double *__restrict__ cbase, \
+    const int *__restrict__ gauge, \
+    int iters, \
+    int metric, \
+    int polish, \
+    double *__restrict__ outc, \
+    double *__restrict__ outsse, \
+    int *__restrict__ outstatus, \
+    unsigned long long *__restrict__ outcyc
+#define FIT_KERNEL_ARGS cols, y, tsign, cols64, y64, tsign64, w64, pmask, n, v, prog, off, pcount, kmax, c0, cbase, gauge, iters, metric, polish, outc, outsse, outstatus, outcyc
+
 template <int MAXC, int CHUNK, int PCHUNK>
-__global__ void fit_kernel(const float *__restrict__ cols,
-                           const float *__restrict__ y,
-                           const float *__restrict__ tsign,
-                           const double *__restrict__ cols64,
-                           const double *__restrict__ y64,
-                           const double *__restrict__ tsign64,
-                           const double *__restrict__ w64,
-                           const unsigned int *__restrict__ pmask,
-                           int n,
-                           int v,
-                           const unsigned int *__restrict__ prog,
-                           const unsigned int *__restrict__ off,
-                           const int *__restrict__ pcount,
-                           int kmax,
-                           const double *__restrict__ c0,
-                           const double *__restrict__ cbase,
-                           const int *__restrict__ gauge,
-                           int iters,
-                           int metric,
-                           int polish,
-                           double *__restrict__ outc,
-                           double *__restrict__ outsse,
-                           int *__restrict__ outstatus,
-                           unsigned long long *__restrict__ outcyc)
+__device__ __forceinline__ void fit_kernel_body(FIT_KERNEL_PARAMS)
 {
     const unsigned long long t_begin = clock64();
     unsigned long long t_lm_end = t_begin;
@@ -4289,6 +4285,26 @@ __global__ void fit_kernel(const float *__restrict__ cols,
     }
 }
 
+template <int MAXC, int CHUNK, int PCHUNK>
+__global__ void fit_kernel(FIT_KERNEL_PARAMS)
+{
+    fit_kernel_body<MAXC, CHUNK, PCHUNK>(FIT_KERNEL_ARGS);
+}
+
+/* Two resident 256-thread blocks per SM for the CHUNK = 256 instantiation. */
+template <int MAXC, int CHUNK, int PCHUNK>
+__global__ void __launch_bounds__(256, 2) fit_kernel_two_blocks(FIT_KERNEL_PARAMS)
+{
+    fit_kernel_body<MAXC, CHUNK, PCHUNK>(FIT_KERNEL_ARGS);
+}
+
+template <int MAXC, int CHUNK, int PCHUNK>
+static const void *fit_kernel_symbol()
+{
+    if constexpr (CHUNK == 256) return (const void *)fit_kernel_two_blocks<MAXC, CHUNK, PCHUNK>;
+    else return (const void *)fit_kernel<MAXC, CHUNK, PCHUNK>;
+}
+
 /* SM-1 probe: the statistics `fit_kernel` sees at each candidate's start
  * constants, without a step. Per candidate `out[k * FT_PROBE_STRIDE(kmax) + ...]`
  * holds the f32 assembly loss, the f32 trial loss, the f64 assembly loss, the
@@ -4394,7 +4410,7 @@ static int ft_launch(RcCtx *c,
     const int bytes = (int)sizeof(FtSmem<MAXC, CHUNK, PCHUNK>);
     static int opted_in = 0;
     if (!opted_in) {
-        if (cudaFuncSetAttribute((const void *)fit_kernel<MAXC, CHUNK, PCHUNK>,
+        if (cudaFuncSetAttribute(fit_kernel_symbol<MAXC, CHUNK, PCHUNK>(),
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
             cudaSuccess) {
             cudaGetLastError();
@@ -4402,11 +4418,33 @@ static int ft_launch(RcCtx *c,
         }
         opted_in = 1;
     }
-    fit_kernel<MAXC, CHUNK, PCHUNK><<<nprog, CHUNK, bytes, c->s_fit>>>(
-        c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->d_pmask, c->n,
-        c->v, d_prog, d_off, d_p, kmax, d_c0, d_cbase, d_gauge, iters, metric, polish, d_c,
-        d_sse, d_status, d_cyc);
+    if constexpr (CHUNK == 256) {
+        fit_kernel_two_blocks<MAXC, CHUNK, PCHUNK><<<nprog, CHUNK, bytes, c->s_fit>>>(
+            c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->d_pmask, c->n,
+            c->v, d_prog, d_off, d_p, kmax, d_c0, d_cbase, d_gauge, iters, metric, polish, d_c,
+            d_sse, d_status, d_cyc);
+    } else {
+        fit_kernel<MAXC, CHUNK, PCHUNK><<<nprog, CHUNK, bytes, c->s_fit>>>(
+            c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->d_pmask, c->n,
+            c->v, d_prog, d_off, d_p, kmax, d_c0, d_cbase, d_gauge, iters, metric, polish, d_c,
+            d_sse, d_status, d_cyc);
+    }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+/* Resident blocks per SM and registers per thread of the p <= 16 fit kernel
+   instantiation. Returns 0 on success. */
+extern "C" int rc_fit_occupancy(int *blocks, int *regs)
+{
+    const int bytes = (int)sizeof(FtSmem<16, 256, 128>);
+    cudaFuncAttributes attr;
+    if (cudaFuncGetAttributes(&attr, fit_kernel_symbol<16, 256, 128>()) != cudaSuccess) return -1;
+    if (cudaFuncSetAttribute(fit_kernel_symbol<16, 256, 128>(),
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) return -1;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(blocks, fit_kernel_symbol<16, 256, 128>(),
+                                                      256, (size_t)bytes) != cudaSuccess) return -1;
+    *regs = attr.numRegs;
+    return 0;
 }
 
 /* #122: canonical postfix hash, FNV-1a over the words up to and including
@@ -7905,6 +7943,15 @@ int rc_copy_probe(void *ctx, unsigned long long bytes, int reps, double *h2d_ms,
     return rc;
 }
 
+/* Version of the linked static runtime (13000 for 13.0), or -1. Since CUDA 12.0
+   this does not initialise the driver, so it works without a GPU. */
+int rc_runtime_version(void)
+{
+    int v = 0;
+    if (cudaRuntimeGetVersion(&v) != cudaSuccess) return -1;
+    return v;
+}
+
 /* 1 when the context uses managed (unified) memory, 0 for plain device memory.
    The benchmark prints this so a recorded run states which path it measured. */
 int rc_unified(void)
@@ -7918,7 +7965,7 @@ int rc_unified(void)
 
 const char *rc_device_name(void)
 {
-    static char name[256];
+    static char name[320];
     cudaDeviceProp p;
     if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) return "unknown";
     snprintf(name, sizeof(name), "%s (sm_%d%d, %d SMs, %d MB)",

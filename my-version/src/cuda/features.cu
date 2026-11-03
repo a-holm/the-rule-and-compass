@@ -994,7 +994,6 @@ int rc_features_flow_base(void *v)
     int threads = 256;
     int blocks = (c->n + threads - 1) / threads;
     FEAT_LAUNCH(c, (k_flow_base<<<blocks, threads>>>(c, c->d_feat)));
-    int seg_blocks = (c->nseg + 127) / 128;
     FEAT_LAUNCH(c, (k_flow_state<<<c->nseg, 256>>>(c, c->d_feat)));
     /* Counted reads: the elementwise base consumed each present optional flow
        column exactly once, independent of the requested output count. */

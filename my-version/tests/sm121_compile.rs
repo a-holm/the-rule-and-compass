@@ -17,6 +17,7 @@
 //! loaded or ran the kernels. That is the hardware-gated half of #28.
 
 #[path = "../src/cuda/arch.rs"]
+#[allow(dead_code)]
 mod arch;
 
 use std::path::{Path, PathBuf};

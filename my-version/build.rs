@@ -7,8 +7,10 @@
 //! have no run-time dependency on the build tree (only `libcuda.so.1`).
 //!
 //! Overridable via environment:
-//!   RCSR_CUDA_ARCH    target architecture (default `sm_86`, i.e. Ampere)
-//!   RCSR_NVCC         nvcc binary (default `nvcc`)
+//!   RCSRCUDA_ARCH    target architecture (default `sm_86`, i.e. Ampere)
+//!   RCSR_NVCC         nvcc binary; used exactly when non-empty. Otherwise the newest
+//!                     `/usr/local/cuda-13.<minor>/bin/nvcc` that can target the
+//!                     architecture, else `nvcc` on `PATH`
 //!   RCSR_GPU_UNIFIED  `1` selects `cudaMallocManaged` for every buffer
 //!                     (unified memory). Defaults to `1` for `sm_121`.
 //!
@@ -30,13 +32,59 @@ fn output_text(out: &std::process::Output) -> String {
     text
 }
 
-/// Run `nvcc --version` and parse the toolkit version out of it.
-fn detect_nvcc_version(nvcc: &str) -> Option<(u32, u32)> {
+/// Run `nvcc --version` and return its text.
+fn nvcc_version_text(nvcc: &str) -> Option<String> {
     let out = Command::new(nvcc).arg("--version").output().ok()?;
     if !out.status.success() {
         return None;
     }
-    parse_nvcc_version(&output_text(&out))
+    Some(output_text(&out))
+}
+
+/// Run `nvcc --version` and parse the toolkit version out of it.
+fn detect_nvcc_version(nvcc: &str) -> Option<(u32, u32)> {
+    parse_nvcc_version(&nvcc_version_text(nvcc)?)
+}
+
+/// Every `/usr/local/cuda-<major>.<minor>/bin/nvcc` that runs, with its version.
+/// The unversioned symlinks `cuda` and `cuda-<major>` are skipped.
+fn discover_preferred() -> Vec<(String, (u32, u32))> {
+    let Ok(entries) = std::fs::read_dir("/usr/local") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("cuda-") else {
+            continue;
+        };
+        let mut parts = rest.split('.');
+        let (Some(ma), Some(mi), None) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        if ma.is_empty() || mi.is_empty() || !ma.bytes().chain(mi.bytes()).all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let nvcc = e.path().join("bin/nvcc").to_string_lossy().into_owned();
+        if let Some(v) = detect_nvcc_version(&nvcc) {
+            out.push((nvcc, v));
+        }
+    }
+    out
+}
+
+/// The absolute path of `nvcc`: the path itself when it has a directory part,
+/// else the first `PATH` entry that holds it.
+fn resolve_nvcc(nvcc: &str) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(nvcc);
+    if path.components().count() > 1 {
+        return Some(path.to_path_buf());
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join(nvcc))
+            .find(|p| p.is_file())
+    })
 }
 
 /// Print each line as a build-script error, then fail. Keeping the explanation
@@ -112,26 +160,19 @@ fn cuda_library_fresh(lib: &str, stamp_path: &str, stamp: &str) -> bool {
 }
 
 /// Library directories of the toolkit that `nvcc` belongs to, where `libcudart_static.a`
-/// lives: `<root>/lib64`, `<root>/targets/*/lib` and the distro multiarch directories.
+/// lives: `<root>/lib64`, `<root>/targets/*/lib` and, for the distro toolkit
+/// rooted at `/usr`, the multiarch directories.
 fn cuda_lib_dirs(nvcc: &str) -> Vec<std::path::PathBuf> {
-    let path = std::path::Path::new(nvcc);
-    let resolved = if path.components().count() > 1 {
-        Some(path.to_path_buf())
-    } else {
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|d| d.join(nvcc))
-                .find(|p| p.is_file())
-        })
-    };
-    let Some(root) = resolved
+    let Some(root) = resolve_nvcc(nvcc)
         .and_then(|p| p.canonicalize().ok())
         .and_then(|p| p.parent().and_then(|b| b.parent()).map(|r| r.to_path_buf()))
     else {
         return Vec::new();
     };
     let mut dirs = vec![root.join("lib64")];
-    dirs.extend(["x86_64", "aarch64"].map(|a| std::path::PathBuf::from(format!("/usr/lib/{}-linux-gnu", a))));
+    if root == std::path::Path::new("/usr") {
+        dirs.extend(["x86_64", "aarch64"].map(|a| std::path::PathBuf::from(format!("/usr/lib/{}-linux-gnu", a))));
+    }
     if let Ok(entries) = std::fs::read_dir(root.join("targets")) {
         dirs.extend(entries.flatten().map(|e| e.path().join("lib")));
     }
@@ -151,22 +192,23 @@ fn emit_link(out: &str, nvcc: &str) {
     }
 }
 
+/// Number of non-empty lines in the captured nvcc output (a clean run prints none).
+fn diagnostic_lines(log: &str) -> usize {
+    log.lines().filter(|l| !l.trim().is_empty()).count()
+}
+
+/// Compile the toolchain facts into the binary (read by `src/provenance.rs`).
+fn emit_build_facts(toolkit: &str, nvcc: &str, source: NvccSource, arch: &Arch, diagnostics: usize) {
+    println!("cargo:rustc-env=RCSR_BUILD_CUDA_TOOLKIT={}", toolkit);
+    println!("cargo:rustc-env=RCSR_BUILD_CUDA_NVCC={}", nvcc);
+    println!("cargo:rustc-env=RCSR_BUILD_CUDA_SOURCE={}", source.name());
+    println!("cargo:rustc-env=RCSR_BUILD_CUDA_ARCH={}", arch.name());
+    println!("cargo:rustc-env=RCSR_BUILD_NVCC_DIAGNOSTICS={}", diagnostics);
+}
+
 fn main() {
     record_build_commit();
-    println!("cargo:rerun-if-changed=src/cuda/eval.cu");
-    println!("cargo:rerun-if-changed=src/cuda/enrich.cu");
-    println!("cargo:rerun-if-changed=src/cuda/tail.cu");
-    println!("cargo:rerun-if-changed=src/cuda/mtf.cu");
-    println!("cargo:rerun-if-changed=src/cuda/features.cu");
-    println!("cargo:rerun-if-changed=src/cuda/bench.cu");
-    println!("cargo:rerun-if-changed=src/cuda/enrich_common.h");
-    println!("cargo:rerun-if-changed=src/cuda/prep.cu");
-    println!("cargo:rerun-if-changed=src/cuda/pnl.cu");
-    println!("cargo:rerun-if-changed=src/cuda/pit.cu");
-    println!("cargo:rerun-if-changed=src/cuda/wf_batch.cu");
-    println!("cargo:rerun-if-changed=src/cuda/alloc_guard.h");
-    println!("cargo:rerun-if-changed=src/cuda/radix_select.h");
-    println!("cargo:rerun-if-changed=src/cuda/arch.rs");
+    println!("cargo:rerun-if-changed=src/cuda");
     println!("cargo:rerun-if-env-changed=RCSR_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=RCSR_NVCC");
     println!("cargo:rerun-if-env-changed=RCSR_GPU_UNIFIED");
@@ -176,7 +218,6 @@ fn main() {
     }
 
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
-    let nvcc = std::env::var("RCSR_NVCC").unwrap_or_else(|_| "nvcc".to_string());
     let arch_text = std::env::var("RCSR_CUDA_ARCH").unwrap_or_else(|_| "sm_86".to_string());
     let lib = format!("{}/librcsrcuda.a", out);
 
@@ -191,10 +232,22 @@ fn main() {
         ]),
     };
 
+    let override_nvcc = std::env::var("RCSR_NVCC").ok();
+    let (nvcc, source) = choose_nvcc(override_nvcc.as_deref(), &discover_preferred(), arch);
+    if let Some(path) = resolve_nvcc(&nvcc).filter(|p| p.is_absolute() && p.exists()) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+
     let detected = detect_nvcc_version(&nvcc);
     let detected_text = detected
         .map(format_version)
         .unwrap_or_else(|| "unknown (could not run `nvcc --version`)".to_string());
+    let toolkit = nvcc_version_text(&nvcc)
+        .and_then(|t| parse_nvcc_build_version(&t))
+        .unwrap_or_else(|| detected_text.clone());
+    let nvcc_abs = resolve_nvcc(&nvcc)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| nvcc.clone());
 
     // Tell the user about unified memory before compiling, so the configuration
     // is visible even when the build succeeds.
@@ -207,6 +260,22 @@ fn main() {
             "cargo:warning=CUDA backend: unified memory (cudaMallocManaged) enabled for {}",
             arch.name()
         );
+    }
+
+    if let Some(found) = detected.filter(|v| arch_dropped(arch, *v)) {
+        fail(&[
+            format!(
+                "RCSR_CUDA_ARCH={} cannot be built by CUDA {} (`{}`): CUDA 13 removed Maxwell, Pascal and Volta.",
+                arch.name(),
+                format_version(found),
+                nvcc_abs
+            ),
+            "Point RCSR_NVCC at a CUDA 12.x nvcc, for example:".to_string(),
+            format!(
+                "  RCSR_NVCC=/usr/bin/nvcc RCSR_CUDA_ARCH={} cargo build --release --features cuda",
+                arch.name()
+            ),
+        ]);
     }
 
     // Fail early, with a readable explanation, when the toolkit predates the
@@ -243,10 +312,14 @@ fn main() {
     }
 
     let stamp_path = format!("{}/nvcc.stamp", out);
-    let stamp = format!("{} {} {} {}", nvcc, arch.name(), unified, detected_text);
+    let stamp = format!("{} {} {} {}", nvcc, arch.name(), unified, toolkit);
+    let log_path = format!("{}/nvcc.log", out);
     if cuda_library_fresh(&lib, &stamp_path, &stamp) {
-        emit_link(&out, &nvcc);
-        return;
+        if let Ok(log) = std::fs::read_to_string(&log_path) {
+            emit_build_facts(&toolkit, &nvcc_abs, source, &arch, diagnostic_lines(&log));
+            emit_link(&out, &nvcc);
+            return;
+        }
     }
 
     let arch_flag = format!("-arch={}", arch.name());
@@ -280,6 +353,9 @@ fn main() {
         ])
     });
 
+    let log = output_text(&result);
+    let _ = std::fs::write(&log_path, &log);
+
     if !result.status.success() {
         // Do not dump the whole nvcc log: pick the first diagnostic so the
         // action (the target and toolkit) stays the headline.
@@ -307,5 +383,6 @@ fn main() {
     }
 
     let _ = std::fs::write(&stamp_path, &stamp);
+    emit_build_facts(&toolkit, &nvcc_abs, source, &arch, diagnostic_lines(&log));
     emit_link(&out, &nvcc);
 }

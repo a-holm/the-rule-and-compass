@@ -77,17 +77,36 @@ Environment overrides for the build:
 | Variable | Meaning | Default |
 |---|---|---|
 | `RCSR_CUDA_ARCH` | target architecture passed to `nvcc` as `-arch=` | `sm_86` (Ampere) |
-| `RCSR_NVCC` | `nvcc` binary to use | `nvcc` |
+| `RCSR_NVCC` | `nvcc` binary, used exactly when non-empty (no fallback) | the toolkit selection rule below |
 | `RCSR_GPU_UNIFIED` | `1`/`true`/`yes`/`on` selects `cudaMallocManaged` for every buffer; `0`/`false`/anything else selects plain device memory | `1` for `sm_121`, `0` otherwise |
 | `RCSR_GPU_SYNC` | `1`/`true`/`yes`/`on` forces the blocking copy path for the batch arena (the labelled fallback, #285) | unset (pinned asynchronous path) |
 
-The build compiles the `.cu` files with `-std=c++17` on every toolkit. CUDA 13 needs it (its CUB headers require C++17); CUDA 12.0 accepts it. Both toolkits build the crate; set `RCSR_NVCC=/usr/local/cuda-13.0/bin/nvcc` to use CUDA 13.
+The build compiles the `.cu` files with `-std=c++17` on every toolkit. CUDA 13 needs it (its CUB headers require C++17); CUDA 12.0 accepts it. Both toolkits build the crate.
+
+Toolkit selection, first match wins:
+
+1. `RCSR_NVCC` set and non-empty: that binary, source `RCSR_NVCC`.
+2. The newest `/usr/local/cuda-13.<minor>/bin/nvcc` that runs `--version` and can target `RCSR_CUDA_ARCH`, source `cuda-13`. Only directories named `cuda-13.<digits>` count; the symlinks `cuda` and `cuda-13` are skipped. CUDA 13.0 removed offline compilation for `sm_50` to `sm_72`, so those targets skip rule 2.
+3. `nvcc` on `PATH`, source `PATH`.
+
+The major is pinned to 13 (`PREFERRED_CUDA_MAJOR` in `src/cuda/arch.rs`). `NVCC`, `CUDA_HOME` and `CUDA_PATH` are not read. Installing a toolkit does not rerun `build.rs`: run `touch my-version/build.rs` after the install. A target that the chosen CUDA 13 `nvcc` cannot build, for example `sm_70` with only CUDA 13 on `PATH`, fails with a message that names `RCSR_NVCC=/usr/bin/nvcc`.
+
+The chosen toolkit is compiled into the binary. `rcsr --version` prints a second line in a CUDA build:
+
+```text
+rcsr 0.1.0
+cuda: toolkit 13.0.88 (nvcc /usr/local/cuda-13.0/bin/nvcc, source cuda-13), runtime 13.0, arch sm_86
+```
+
+`runtime` is `cudaRuntimeGetVersion` of the linked `libcudart_static.a`; it needs no device. The run manifest records the same facts in `binary.cuda_build` (`toolkit`, `nvcc`, `source`, `arch`, `runtime`), `null` in a CPU build. `rcsr-gpu-bench` prints a `toolkit` line after `device`.
+
+`build.rs` writes the `nvcc` output to `$OUT_DIR/nvcc.log` and compiles its line count into the binary (`RCSR_BUILD_NVCC_DIAGNOSTICS`). The unit test `nvcc_reported_no_diagnostics` fails when it is not zero. A rebuild is triggered by any change under `src/cuda`, by the chosen `nvcc` file, and by `RCSR_NVCC`, `RCSR_CUDA_ARCH`, `RCSR_GPU_UNIFIED`.
 
 Minimum toolkit per target, as used by the build-script check:
 
 | Target | Minimum CUDA | Notes |
 |---|---|---|
-| `sm_86` | 11.1 | RTX 3060 / Ampere; verified here with CUDA 12.0 |
+| `sm_86` | 11.1 | RTX 3060 / Ampere; verified here with CUDA 12.0.140 and 13.0.88 |
 | `sm_90` / `sm_90a` | 11.8 / 12.0 | Hopper |
 | `sm_100` | 12.8 | datacentre Blackwell |
 | `sm_120` | 12.8 | consumer Blackwell |
@@ -99,7 +118,7 @@ GB10 attached.
 
 ### Deploying a CUDA build (#659)
 
-`build.rs` compiles `src/cuda/*.cu` to a static archive and links it with the static CUDA runtime (`libcudart_static.a`, found next to the `nvcc` toolkit, in `targets/*/lib` or in `/usr/lib/<arch>-linux-gnu`). Every binary and test binary is therefore one self-contained file: no `librcsrcuda.so`, no RUNPATH, no run-time dependency on `target/`. The only CUDA dependency left at run time is the driver library `libcuda.so.1`. Deploying is `cp target/release/rcsr <dir>`; the SHA-256 of that file identifies the code that runs.
+`build.rs` compiles `src/cuda/*.cu` to a static archive and links it with the static CUDA runtime (`libcudart_static.a`, found in the chosen toolkit's `lib64` or `targets/*/lib`; the distro multiarch directories `/usr/lib/<arch>-linux-gnu` only for the distro toolkit rooted at `/usr`). Every binary and test binary is therefore one self-contained file: no `librcsrcuda.so`, no RUNPATH, no run-time dependency on `target/`. The only CUDA dependency left at run time is the driver library `libcuda.so.1`. Deploying is `cp target/release/rcsr <dir>`; the SHA-256 of that file identifies the code that runs.
 
 `scripts/tests/relocatable_bins.sh [target/release]` checks `readelf -d` (no RUNPATH into a build directory, no `librcsrcuda`), `ldd` (no library inside the target directory), a copied `rcsr --version` run and `--list` on each built test binary. It needs no GPU.
 
@@ -1367,6 +1386,7 @@ second one. Their resources, from `cuobjdump -res-usage` on the built
 | 20 | 128 | 128 | 38 992 B | 85 | 1 824 B |
 
 Both stay under the 48 KB static ceiling and fit two blocks per SM on `sm_86`.
+The 256-thread instantiation is launched as `fit_kernel_two_blocks` with `__launch_bounds__(256, 2)` (same device body as `fit_kernel`), so the register allocation keeps two resident blocks per SM on both CUDA 12.0 and CUDA 13.0. `gpu::toolchain_tests::fit_kernel_occupancy_report` prints the registers and the resident blocks from `cudaOccupancyMaxActiveBlocksPerMultiprocessor`.
 The rejected alternative — 20 constants with a 256-thread block and a 256-row
 chunk — is 50 768 B (one block per SM). At `N = 1e5`/`1e6`, `P = 256`, eight
 iterations, one batch per cell:
@@ -2629,6 +2649,7 @@ the CPU run apart from the backend labels.
 | Architecture parser/validator (accept/reject, toolkit minimums) | unit tests, any machine | **verified** |
 | CUDA 12.0 rejects `sm_121` with the target, toolkit and minimum version named | RTX 3060 host, `nvcc` 12.0 | **verified** |
 | Plain device-memory path: build, tests, benchmark | RTX 3060, `sm_86`, CUDA 12.0 | **verified** |
+| Plain device-memory path on the CUDA 13.0.88 default toolchain: build with 0 warnings, memcheck on the lib, parity, P&L fitness, fit and loop tests, `rcsr-bench --tiny --gpu` 27/27 | RTX 3060, `sm_86`, CUDA 13.0.88 | **verified** |
 | Unified-memory path: build, tests, benchmark | RTX 3060, `sm_86`, `RCSR_GPU_UNIFIED=1` | **verified on a discrete GPU** |
 | Whole-population batch equals one-at-a-time SSEs | RTX 3060, `cargo test --features cuda` | **verified** |
 | GPU-vs-CPU agreement | RTX 3060, test + benchmark | **verified** (tables above) |

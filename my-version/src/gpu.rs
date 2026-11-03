@@ -892,6 +892,7 @@ extern "C" {
         out: *mut u64,
     ) -> i32;
     fn rc_device_name() -> *const std::os::raw::c_char;
+    fn rc_runtime_version() -> i32;
     fn rc_unified() -> i32;
     fn rc_copy_probe(ctx: *mut RawCtx, bytes: u64, reps: i32, h2d_ms: *mut f64, d2h_ms: *mut f64) -> i32;
     fn rc_set_fit_data(ctx: *mut RawCtx, cols: *const f64, y: *const f64, w: *const f64) -> i32;
@@ -1044,6 +1045,16 @@ extern "C" {
         smem_bytes: *mut i32,
         max_constants: *mut i32,
     ) -> i32;
+}
+
+/// Version of the linked CUDA runtime as `(major, minor)`, from
+/// `cudaRuntimeGetVersion`. It does not need a device.
+pub fn cuda_runtime_version() -> Option<(u32, u32)> {
+    let v = unsafe { rc_runtime_version() };
+    if v <= 0 {
+        return None;
+    }
+    Some(((v / 1000) as u32, ((v % 1000) / 10) as u32))
 }
 
 /// #169: one candidate's batched-GPU fit result.
@@ -10971,3 +10982,7 @@ mod fit_polish_tests;
 #[cfg(test)]
 #[path = "gpu_hard_op_fit_tests.rs"]
 mod hard_op_fit_tests;
+
+#[cfg(test)]
+#[path = "gpu_toolchain_tests.rs"]
+mod toolchain_tests;

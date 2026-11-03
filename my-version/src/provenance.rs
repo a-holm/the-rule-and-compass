@@ -128,3 +128,61 @@ mod tests {
         assert_eq!(id.binary_sha256.len(), 64);
     }
 }
+
+/// CUDA build facts recorded by `build.rs`; `None` in a CPU-only build.
+#[derive(Clone, Copy, Debug)]
+pub struct CudaBuild {
+    pub toolkit: &'static str,
+    pub nvcc: &'static str,
+    pub source: &'static str,
+    pub arch: &'static str,
+}
+
+pub const CUDA_BUILD: Option<CudaBuild> = match (
+    option_env!("RCSR_BUILD_CUDA_TOOLKIT"),
+    option_env!("RCSR_BUILD_CUDA_NVCC"),
+    option_env!("RCSR_BUILD_CUDA_SOURCE"),
+    option_env!("RCSR_BUILD_CUDA_ARCH"),
+) {
+    (Some(toolkit), Some(nvcc), Some(source), Some(arch)) if cfg!(feature = "cuda") => Some(CudaBuild {
+        toolkit,
+        nvcc,
+        source,
+        arch,
+    }),
+    _ => None,
+};
+
+/// The linked CUDA runtime as `X.Y`, or `unknown`.
+pub fn runtime_text() -> String {
+    #[cfg(feature = "cuda")]
+    if let Some((major, minor)) = crate::gpu::cuda_runtime_version() {
+        return format!("{}.{}", major, minor);
+    }
+    "unknown".to_string()
+}
+
+/// The CUDA build facts as one line (without the `cuda: ` prefix), or `None` in a CPU build.
+pub fn cuda_build_summary() -> Option<String> {
+    CUDA_BUILD.map(|b| {
+        format!(
+            "toolkit {} (nvcc {}, source {}), runtime {}, arch {}",
+            b.toolkit,
+            b.nvcc,
+            b.source,
+            runtime_text(),
+            b.arch
+        )
+    })
+}
+
+/// The `--version` output: one line, plus a `cuda:` line in a CUDA build.
+pub fn version_text() -> String {
+    let mut text = format!("rcsr {}", env!("CARGO_PKG_VERSION"));
+    if let Some(s) = cuda_build_summary() {
+        text.push_str("\ncuda: ");
+        text.push_str(&s);
+    }
+    text
+}
+

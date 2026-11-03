@@ -93,11 +93,12 @@ impl Manifest {
             self.dirty
         ));
         out.push_str(&format!(
-            "  \"binary\":{{\"path\":{},\"sha256\":{},\"build_commit\":{},\"build_dirty\":{}}},\n",
+            "  \"binary\":{{\"path\":{},\"sha256\":{},\"build_commit\":{},\"build_dirty\":{},\"cuda_build\":{}}},\n",
             jstr(&self.exe_path),
             jstr(&self.exe_sha256),
             jstr(&self.commit),
-            self.dirty
+            self.dirty,
+            cuda_build_json()
         ));
         out.push_str(&format!(
             "  \"data\":{{\"path\":{},\"sha256\":{},\"full_rows\":{},\"sampled_rows\":{},\
@@ -742,6 +743,21 @@ impl Sha256Hasher {
     }
     pub fn finalize(self) -> String {
         self.state.finalize()
+    }
+}
+
+/// The `binary.cuda_build` value: a JSON object in a CUDA build, `null` otherwise.
+fn cuda_build_json() -> String {
+    match crate::provenance::CUDA_BUILD {
+        Some(b) => format!(
+            "{{\"toolkit\":{},\"nvcc\":{},\"source\":{},\"arch\":{},\"runtime\":{}}}",
+            jstr(b.toolkit),
+            jstr(b.nvcc),
+            jstr(b.source),
+            jstr(b.arch),
+            jstr(&crate::provenance::runtime_text())
+        ),
+        None => "null".to_string(),
     }
 }
 
