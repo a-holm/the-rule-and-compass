@@ -136,8 +136,7 @@ way every time. The contract is:
   echoed in every output format;
 * **do not use Python's `hash(label)`**: it is salted per process
   (`PYTHONHASHSEED`), so the same label gives a different seed in each
-  interpreter. The old scratch launcher did exactly that and a "reproduction"
-  was therefore a different run;
+  interpreter;
 * a launcher must write the resolved numeric seed and the exact command line
   into its log or run manifest, so the mapping is evidence rather than
   folklore.

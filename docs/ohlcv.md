@@ -319,7 +319,7 @@ so a multi-gigabyte store is not read a second time just to checksum it.
 | `xs` | `xs_rank_r1 xs_rank_r20 xs_rank_vol20` | per-timestamp PIT rank in `[-1,1]`, `N>=20` |
 | `btc` | `btc_r1 btc_r20 btc_vol20 rel_btc_r1 rel_btc_r20 beta_btc_60` | benchmark joins by exact timestamp |
 | `cross` | 45 columns | the complete #273 cross-asset, ETH, market-state, breadth, dispersion, average-correlation and rank family |
-| `py15m` | 35 columns | the Python `enrich_panel_15m.py` set, for parity |
+| `py15m` | 35 columns | the legacy 15 m enrichment set, kept for parity |
 | `mtf` | 36 columns | `mtf_<1h|4h|1d>_<12 leaves>`, higher-timeframe resample + causal close join |
 | `compact` | 52 columns, compact order | the exact compact-panel regression subset at the **15 m base** |
 | `flow` | `vwap` plus `taker_ratio96 taker_imb16 trade_intensity96 avg_trade_size96 amihud96 zero_ret_share96 obv_z96 cvd_proxy vwap_dev96` | the complete OHLCV/flow family (#270) |
@@ -412,9 +412,9 @@ tested by `engine_feature_groups_are_gap_masked` and
 
 The compact profile is computed by one 15 m reference pass. Every window is
 trailing, inclusive of `t`, and gap-masked; Wilder/EMA state restarts after a
-gap. The compact builder used positional NumPy windows and therefore bridged
+gap. The compact fixture was built with positional windows and therefore bridged
 gaps; that difference is deliberate and is why a gap row can be finite in the
-old compact CSV and `NaN` here. On contiguous rows the definitions agree.
+compact CSV and `NaN` here. On contiguous rows the definitions agree.
 
 `wasym1` is registered as `derived`. For `H > L`, with
 `R = H-L`, `B = C-O`, `U = H-max(O,C)`, `D = min(O,C)-L`:
@@ -473,7 +473,7 @@ NaN policy:
 `vwap_dev96`, `taker_ratio96`, `taker_imb16` and `trade_intensity96` also occur
 in the compact subset. There is exactly **one** implementation of each name:
 the quote-volume definition above. The compact regression fixture pins these
-four against that definition; the legacy Python builder used a typical-price
+four against that definition; the legacy compact builder used a typical-price
 VWAP proxy, which differs on rows where exchange `quote_volume` is not exactly
 `typical_price × volume`. The four values are compared at
 `abs/rel <= 1e-12` by `flow_shared_names_match_the_compact_regression_fixture`.
@@ -553,8 +553,7 @@ row (two symbols x 3,600 bars) 15 m slice with raw OHLCV/flow. The expected file
 holds the compact builder's 52 columns for the last 300 hourly rows. The test
 `compact_matches_the_python_builder_on_a_contiguous_slice` compares every finite
 value at `abs <= 1e-12` or `rel <= 1e-12`, requires exact NaN masks, and reports
-the per-feature worst error. Expected values are produced by the builder's own
-Python functions on the same slice; the full 25 GB panel is not checked in.
+the per-feature worst error. The expected values are the committed fixture; the full 25 GB panel is not checked in.
 
 The compact builder accumulates `rmean`/`rstd` with `np.cumsum` over the **whole symbol history**. On a 196k-row history, cancellation in `cs[i+1]-cs[i+1-w]` perturbs a 96-bar standard deviation by up to about `2e-8`, which a slice-local recomputation cannot reproduce. The engine windows are accurate to rounding, so the fixture compares at 1e-8 (`PARITY_TOL` in `tests/enrich.rs`).
 
@@ -660,17 +659,16 @@ declined until a larger share is measured.
 
 ### `py15m` parity
 
-`py15m` reproduces the 35 columns added by the Python
-`arbeidsmappe/crypto-rcsr/pilot/enrich_panel_15m.py` step (EMA/MACD, extra RSI
+`py15m` reproduces the 35 legacy enrichment columns (EMA/MACD, extra RSI
 and Bollinger windows, ATR50, stochastic, ADX/DI, OBV z-score, VWAP deviation,
 Parkinson/Garman-Klass, 96-bar skew/kurt, `r192`, month/day-of-month cycles and
 BTC market joins). The committed fixture
 `my-version/tests/fixtures/enrich/btc_15m_py15m_expected.csv` is 400 rows of the
-pilot's `panel_15m_rich.csv`, preceded by 1,000 rows of pre-roll in
+legacy `panel_15m_rich.csv`, preceded by 1,000 rows of pre-roll in
 `btc_15m_ohlcv.csv`; the test compares values within a pre-registered
 `1e-6` absolute-or-relative tolerance. Two deliberate fixes are documented:
-a gap is not bridged, and the first true range is `high - low` instead of
-NumPy's `np.roll` wrap-around that reads the last close.
+a gap is not bridged, and the first true range is `high - low` instead of a
+wrap-around that reads the last close.
 
 ### Fused flow and price-action device producers (#297)
 
@@ -1130,19 +1128,15 @@ The `gpu` arm also repeats the GPU run with `--dry-run` and requires identical p
 Machine: AMD/Intel 8-thread host, 31 GiB RAM, RTX 3060 (12 GiB), ext4 on
 `/mnt/lager`, release build. Source store: `rcsr prep --resample 1h` over the
 82 longest-lived pilot symbols, **3,874,994 rows x 11 columns** (310 MiB); the
-3.9M-row target is met to within 0.6 %. The Python baseline is the real
-`arbeidsmappe/crypto-rcsr/pilot/enrich_panel_15m.py` on the full
-`panel_15m.csv` (2,006,580 rows, 67 columns).
+3.9M-row target is met to within 0.6 %.
 
 | run | rows | columns added | wall | peak RSS | output |
 |---|---:|---:|---:|---:|---:|
-| Python `enrich_panel_15m.py` | 2,006,580 | 35 | 342 s | 875 MiB | 1.9 GiB CSV |
 | `rcsr enrich --features py15m` | 3,874,994 | 35 | **22.1 s** | **115 MiB** | 1.4 GiB store |
 | `rcsr enrich` full catalogue (no `xs`) | 3,874,994 | 168 | 105.4 s | 256 MiB | 5.2 GiB store |
 | `rcsr enrich --features xs` | 3,874,994 | 3 | 8.3 s | 164 MiB | 399 MiB store |
 
-The `py15m` comparison is per row: Rust processes 176k rows/s against Python's
-5.9k rows/s (**~30x**), with 7.6x lower peak RSS, on a store 1.9x larger. The
+The `py15m` run processes 176k rows/s. The
 full-catalogue run is 56.5 s of feature arithmetic, 15.8 s of append/copy,
 0.2 s of reads and the rest hashing the 5.2 GiB output. `--features xs` spends
 2.5 s in the cross-sectional pass; its working set is one source column, the
@@ -1160,7 +1154,7 @@ Reproduce (the stores are local, git-ignored data):
 # 82 symbols, resampled to 1h: 3,874,994 rows x 11 columns
 rcsr prep --input raw15_82 --resample 1h --out hourly_3p875m.rcsb --jobs 8
 
-# the new append-only enrichment
+# append-only enrichment
 /usr/bin/time -v rcsr enrich --data hourly_3p875m.rcsb --out py15m.rcsb \
   --features py15m --json > py15m.json
 /usr/bin/time -v rcsr enrich --data hourly_3p875m.rcsb --out rich.rcsb \
@@ -1170,7 +1164,4 @@ rcsr prep --input raw15_82 --resample 1h --out hourly_3p875m.rcsb --jobs 8
   --features returns --gpu off --dry-run --json > returns_cpu.json
 /usr/bin/time -v rcsr enrich --data hourly_3p875m.rcsb --out gpu.rcsb \
   --features returns --gpu auto --dry-run --json > returns_gpu.json
-
-# Python baseline (2,006,580 rows x 35 added columns)
-PANEL_OUT=panel_15m_rich_py.csv /usr/bin/time -v python3 enrich_panel_15m.py
 ```

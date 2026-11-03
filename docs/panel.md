@@ -471,9 +471,7 @@ already excluded), `top=100`, `lookback=90`, `min-history=90`.
 
 | panel | rows | symbols (union) | delisted | span | store | build |
 |---|---|---|---|---|---|---|
-| old `panel_daily_100` | 154,674 | 100 | 0 | 2021-05..2026-09 | 38 MB (local) | Python |
 | new PIT daily | 232,006 | 432 | 129 | 2018-04..2026-06 | 23.2 MB | 16.9 s |
-| old hourly compact | — | 100 | 0 | — | 1.8 GB `.rcsb` | Python |
 | old hourly PIT (109-name input) | 3,515,245 | 108 | 19 | 2021-01..2026-09 | 336 MB | 11.2 s |
 | **new PIT hourly (full archive)** | **4,775,757** | **445** | **332** | **2021-01..2026-06** | **478 MB** | **15.8 s** build (32.6 s before the binary parts) |
 

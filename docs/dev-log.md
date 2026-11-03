@@ -18,8 +18,7 @@ phase consumed the wall clock, whether the run was fit-bound or
 evaluation-bound, how many candidates de-duplication threw away, how often the
 GPU fell back to the CPU and for what cause, how the front and the convergence
 readings moved, and where a 10-hour run is stuck. `rcsr dev-report` turns the
-file into that summary with a ranked list of bottlenecks. Both are Rust; there is
-no separate Python evaluator.
+file into that summary with a ranked list of bottlenecks. Both are Rust.
 
 | flag | default | meaning |
 |---|---|---|
@@ -422,9 +421,7 @@ rcsr dev-report runs/btc-usd-2019h1.dev.ndjson   # explain it
 ```
 
 `scripts/run-long.sh` and `rcsr-launch` name one
-`<label>.dev.ndjson` per run at `summary` level. The old scratch
-`monitor_10h.py` was never part of the documented flow; it is tracked for
-deletion in #200. What the engine log does **not** replace is 1 Hz *process*
+`<label>.dev.ndjson` per run at `summary` level. What the engine log does **not** replace is 1 Hz *process*
 sampling (CPU, RSS, `nvidia-smi`): that belongs outside the engine, and
 `run_end` records the process peak RSS and the measured device-hours instead.
 
