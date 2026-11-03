@@ -23,7 +23,6 @@
 //! | `stopped_early <bool>` | the saved run had already stopped |
 //! | `best_prev <f64>` / `no_improve <n>` | patience bookkeeping |
 //! | `candidates_evaluated <n>` | #482: offspring scored so far |
-//! | `front_stable <n>` | #464: front-stop counter; absent means 0 |
 //! | `data train|test <rows> <hash>` | data fingerprint |
 //! | `archive <members> <cap>` | archive header |
 //! | `sol <complexity> <cost> <error> <tree>` | one archive member |
@@ -182,7 +181,7 @@ pub struct Checkpoint {
     pub config_hash: u64,
     /// Generations completed, i.e. the next generation to run.
     pub generations: usize,
-    /// True when the saved run declared itself finished (solved, patience or front_stable).
+    /// True when the saved run declared itself finished (solved or patience).
     /// Resuming such a checkpoint does not run more generations. A time-budget
     /// stop is never terminal (#256): the budget is a property of one process.
     pub stopped_early: bool,
@@ -190,8 +189,6 @@ pub struct Checkpoint {
     pub best_prev: f64,
     /// Consecutive generations without improvement.
     pub no_improve: usize,
-    /// #464: consecutive generations with a settled front (front stop).
-    pub front_stable: usize,
     pub train: Fingerprint,
     pub test: Fingerprint,
     pub archive: Archive,
@@ -551,9 +548,6 @@ impl Checkpoint {
         writeln!(out, "stopped_early {}", self.stopped_early).unwrap();
         writeln!(out, "best_prev {}", encode_f64(self.best_prev)).unwrap();
         writeln!(out, "no_improve {}", self.no_improve).unwrap();
-        if self.front_stable > 0 {
-            writeln!(out, "front_stable {}", self.front_stable).unwrap();
-        }
         writeln!(out, "data train {} {}", self.train.rows, self.train.hash).unwrap();
         writeln!(out, "data test {} {}", self.test.rows, self.test.hash).unwrap();
         writeln!(out, "error_kind {}", self.error_kind.as_str()).unwrap();
@@ -668,7 +662,6 @@ impl Checkpoint {
         let mut stopped_early: Option<bool> = None;
         let mut best_prev: Option<f64> = None;
         let mut no_improve: Option<usize> = None;
-        let mut front_stable: Option<usize> = None;
         let mut train: Option<Fingerprint> = None;
         let mut test: Option<Fingerprint> = None;
         let mut archive_header: Option<(usize, usize)> = None;
@@ -767,12 +760,10 @@ impl Checkpoint {
                     )?;
                 }
                 "front_stable" => {
-                    set_once(
-                        &mut front_stable,
-                        parse_num::<usize>(&parts, 1, lineno, "front_stable")?,
-                        "front_stable",
-                        lineno,
-                    )?;
+                    return Err(format!(
+                        "line {}: the checkpoint was written with --stop-on front, which was removed (#464); it cannot be resumed",
+                        lineno
+                    ));
                 }
                 "data" => {
                     let kind = parts
@@ -1163,7 +1154,6 @@ impl Checkpoint {
             stopped_early,
             best_prev,
             no_improve,
-            front_stable: front_stable.unwrap_or(0),
             train,
             test,
             archive,
@@ -1416,8 +1406,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "qd_cell_cap",   // #120
         "qd_cvt",        // #120
         "qd_policy",     // #120
-        "patience_tol",  // #464: missing means none
-        "stop_front",    // #464: missing means off
         "qd_control",    // #120
         "variation",     // #122: missing means auto
         "selection",     // #465: missing means lexicographic
@@ -1435,6 +1423,12 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         .map(|s| s.as_str())
         .filter(|k| !KEYS.contains(k) && !OPTIONAL_KEYS.contains(k))
         .collect();
+    if extras.contains(&"patience_tol") || extras.contains(&"stop_front") {
+        return Err(
+            "checkpoint was written with --patience-tol or --stop-on front, which were removed (#464); it cannot be resumed"
+                .to_string(),
+        );
+    }
     if !extras.is_empty() {
         return Err(format!(
             "checkpoint has unknown config field(s): {}",
@@ -1686,16 +1680,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             format!("config 'fit_irls' must be nested, reweighted or reweighted-final, got '{}'", raw)
         })?,
     };
-    let patience_tol = match fields.get("patience_tol") {
-        None => None,
-        Some(raw) => Some(decode_f64(raw)?),
-    };
-    let stop_front = match fields.get("stop_front") {
-        None => None,
-        Some(raw) => Some(raw.parse::<usize>().map_err(|_| {
-            format!("config 'stop_front' must be a count, got '{}'", raw)
-        })?),
-    };
     if require_dimensions && units.is_none() {
         return Err(
             "config 'require_dimensions' is true but 'units' is none; \
@@ -1810,8 +1794,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         dedup: bool_val("dedup")?,
         time_budget,
         patience: num_usize("patience")?,
-        patience_tol,
-        stop_front,
         predictor_samples,
         fit_samples, // #85
         fit_rows,     // #116
@@ -1925,12 +1907,6 @@ fn write_config(cfg: &Config, out: &mut String) {
     )
     .unwrap();
     writeln!(out, "config patience {}", cfg.patience).unwrap();
-    if let Some(r) = cfg.patience_tol {
-        writeln!(out, "config patience_tol {}", encode_f64(r)).unwrap();
-    }
-    if let Some(w) = cfg.stop_front {
-        writeln!(out, "config stop_front {}", w).unwrap();
-    }
     writeln!(
         out,
         "config predictor_samples {}",

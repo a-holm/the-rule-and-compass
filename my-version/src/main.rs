@@ -790,15 +790,6 @@ SEARCH:
                              selection and archiving. Independent of
                              --predictor-samples
   --patience <N>             stop after N generations without improvement (default 40)
-  --patience-tol <r>         count a generation as no improvement when the best
-                             error fell by at most r relative to itself (scale
-                             free). Default: the 1e-9 rule with a 1+|error|
-                             denominator
-  --stop-on front[:<W>]      stop after W generations (default: --patience) in
-                             which no front member beat the previous front by
-                             more than --patience-tol (default 1e-6) and the
-                             front hypervolume did not rise by that much;
-                             stop_reason front_stable. Off by default
   --time-budget <seconds>    wall-clock limit of this process (default: none).
                              The generation in progress finishes, its progress
                              event and checkpoint are written, and the result
@@ -2521,8 +2512,6 @@ fn main() {
     let mut fit_strategy_set = false;
     let mut dedup_set = false;
     let mut patience_set = false;
-    let mut patience_tol_set = false;
-    let mut stop_front_set = false;
     let mut time_budget_set = false;
     let mut predictor_samples_set = false;
     // #85: remember an explicit --fit-samples so a resume can refuse a
@@ -3276,34 +3265,12 @@ fn main() {
                 patience_set = true;
             }
             "--patience-tol" => {
-                let v = val!();
-                match v.parse::<f64>() {
-                    Ok(r) if r.is_finite() && r >= 0.0 => cfg.patience_tol = Some(r),
-                    _ => {
-                        eprintln!("error: --patience-tol needs a number >= 0, got '{}'", v);
-                        std::process::exit(EXIT_USAGE);
-                    }
-                }
-                patience_tol_set = true;
+                eprintln!("error: --patience-tol was removed (#464): it saved under 10 % of the noisy CPU in the default-decision A/B");
+                std::process::exit(EXIT_USAGE);
             }
             "--stop-on" => {
-                let v = val!();
-                let window = match v.strip_prefix("front") {
-                    Some("") => Some(0),
-                    Some(rest) => rest
-                        .strip_prefix(':')
-                        .and_then(|w| w.parse::<usize>().ok())
-                        .filter(|w| *w >= 1),
-                    None => None,
-                };
-                match window {
-                    Some(w) => cfg.stop_front = Some(w),
-                    None => {
-                        eprintln!("error: --stop-on needs front or front:<W> with W >= 1, got '{}'", v);
-                        std::process::exit(EXIT_USAGE);
-                    }
-                }
-                stop_front_set = true;
+                eprintln!("error: --stop-on was removed (#464): it saved under 10 % of the noisy CPU in the default-decision A/B");
+                std::process::exit(EXIT_USAGE);
             }
             "--time-budget" => {
                 cfg.time_budget = Some(parse_nonneg("--time-budget", &val!()));
@@ -3705,18 +3672,6 @@ fn main() {
             conflicts.push(format!(
                 "--patience {} (saved {})",
                 cfg.patience, saved.patience
-            ));
-        }
-        if patience_tol_set && cfg.patience_tol != saved.patience_tol {
-            conflicts.push(format!(
-                "--patience-tol {:?} (saved {:?})",
-                cfg.patience_tol, saved.patience_tol
-            ));
-        }
-        if stop_front_set && cfg.stop_front != saved.stop_front {
-            conflicts.push(format!(
-                "--stop-on front {:?} (saved {:?})",
-                cfg.stop_front, saved.stop_front
             ));
         }
         if predictor_samples_set && cfg.predictor_samples != saved.predictor_samples {
