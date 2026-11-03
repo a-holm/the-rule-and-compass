@@ -11,13 +11,14 @@ One job: create the worktree and branch for the issue and record them.
 - `../../../_shared/rules.md`
 - `../../../_shared/commands.md`
 - `../../CONTEXT.md`
+- `../../../_tools/wt-new.sh`
 
 Do NOT load: the issue discussion, other worktrees, the code.
 
 ## Process
 
 1. If `N`, `SLUG` or `BASE` is missing, or the issue is not open, stop and say which.
-2. Create the worktree and branch from the local tip of `BASE` (section "Worktree" of `commands.md`). Never commit on `main`.
+2. Run `verksted/_tools/wt-new.sh "$N" "$SLUG" --base "$BASE"`. It fetches, branches from `origin/$BASE` with `--no-track`, adds the worktree and creates the scratch dir `$GATES/issue$N-scratch/`. Never commit on `main`.
 3. Create `output/` inside the new worktree and write `worktree.md`: path, branch, base tip sha.
 4. Own `my-version/target/`: never set `CARGO_TARGET_DIR`.
 
