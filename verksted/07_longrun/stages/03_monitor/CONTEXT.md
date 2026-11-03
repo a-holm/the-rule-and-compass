@@ -12,14 +12,16 @@ One job: show that the run is alive and writing its log and checkpoints.
 - `../../../_shared/rules.md`
 - `../../../../docs/dev-log.md`
 - `../../CONTEXT.md`
+- `../../../_tools/status.sh`
+- `../../../_tools/wait-for.sh`
 
-Do NOT load: extra monitoring scripts, polling loops.
+Do NOT load: other monitoring scripts, polling loops.
 
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. `tail -n 5 runs/<label>.dev.ndjson` shows a summary event every 10 to 25 generations. The checkpoint is rewritten every `--save-every` generations.
-3. Check with one call per look. No wait loops. A stuck run is `../../05_diagnose/CONTEXT.md`.
+2. One look is one call: `../../../_tools/status.sh --section machine` and `tail -n 5 runs/<label>.dev.ndjson`. It shows a summary event every 10 to 25 generations. The checkpoint is rewritten every `--save-every` generations.
+3. A wait is `../../../_tools/wait-for.sh --log <log> --timeout S` in one background shell. No wait loops. A stuck run is `../../05_diagnose/CONTEXT.md`.
 4. Write `monitor.md`: time, generation, error, front size, GPU duty.
 
 ## Outputs
