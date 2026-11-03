@@ -647,6 +647,7 @@ fn cli_tiled_rank_metric_runs_on_the_cpu_with_device_memory() {
     assert!(stderr.contains("device_memory: the exact order/rank scorer"), "{stderr}");
     assert!(!stderr.contains("scorer runs on the CPU"), "{stderr}");
     assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
+}
 
 /// A hook in the environment of the test process must not reach the CLI children.
 #[test]
@@ -675,7 +676,6 @@ fn child_cli_children_ignore_the_hooks() {
     let plan = &stdout[stdout.find("\"memory_plan\"").expect("a plan")..];
     assert!(plan.contains("\"mode\":\"tiled\""), "{plan}");
     assert_ne!(number_after(plan, "\"tile_rows\":"), 512, "the tile-rows hook reached the CLI child: {plan}");
-}
 }
 
 /// Paired timing for the PR: 1,000,000 rows x 20 vars, 400 candidates,
