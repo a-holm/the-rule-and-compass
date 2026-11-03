@@ -11,15 +11,17 @@ One job: map each acceptance criterion to named evidence and post the verdict.
 - `../../../_shared/rules.md`
 - `../../../_templates/verification-comment.md`
 - `../../CONTEXT.md`
+- `../../../_tools/test-summary.sh`
 
 Do NOT load: running cargo, fixing code, the implementer's prose.
 
 ## Process
 
 1. The verifier is not the implementer. It runs no cargo: it reads code, the merged diff, PR bodies and gate logs.
-2. Copy `_templates/verification-comment.md` to `output/verification.md`. One row per acceptance criterion: `| AC1 | <criterion> | <test name or log path> | met|unmet |`.
-3. Check the six closure conditions of `issue-workflow.md` section 5. An inferred claim is not evidence.
-4. End with `Verdict: CLOSE` or `Verdict: KEEP OPEN`. Post it once with `gh issue comment "$N" --body-file`.
+2. Re-read every cited log with `verksted/_tools/test-summary.sh <log>`. Do not copy counts from a report.
+3. Copy `_templates/verification-comment.md` to `output/verification.md`. One row per acceptance criterion: `| AC1 | <criterion> | <test name or log path> | met|unmet |`.
+4. Check the six closure conditions of `issue-workflow.md` section 5. An inferred claim is not evidence.
+5. End with `Verdict: CLOSE` or `Verdict: KEEP OPEN`. Post it once with `gh issue comment "$N" --body-file`.
 
 ## Outputs
 

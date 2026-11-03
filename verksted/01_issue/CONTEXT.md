@@ -17,15 +17,19 @@ Evidence: every ticket since #254 followed this shape (docs/issue-workflow.md, 3
 - `../_templates/pr.md`
 - `../../AGENTS.md`
 - `../../docs/issue-workflow.md`
+- `../_tools/wt-new.sh`
+- `../_tools/rc-run.sh`
+- `../_tools/test-summary.sh`
+- `../_tools/sanitize.sh`
 
 Do NOT load: other pipelines' stages, earlier runs' `output/`, the rest of `../_shared/`.
 
 ## Process
 
-1. `stages/01_worktree/`: create `worktrees/issue-N-SLUG` on `issue/N-SLUG` from `BASE`.
+1. `stages/01_worktree/`: create (with `wt-new.sh`) `worktrees/issue-N-SLUG` on `issue/N-SLUG` from `BASE`.
 2. `stages/02_issue_body/`: freeze the issue into a run card, one proof line per acceptance criterion.
 3. `stages/03_prove_red/`: a failing test or repro on the unfixed code.
-4. `stages/04_implement/`: smallest change, targeted tests under the lock, commits with `Refs #N`.
+4. `stages/04_implement/`: smallest change, targeted tests through `rc-run.sh`, commits with `Refs #N`.
 5. `stages/05_docs_sync/`: `--help`, `rcsr schema`, README and `docs/` match the change.
 6. `stages/06_pr/`: push, open the pull request against `BASE`, write the report.
 
