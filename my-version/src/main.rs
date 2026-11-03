@@ -3649,6 +3649,17 @@ fn main() {
             }
         };
         let saved = cp.config.clone();
+        if cp.refit_band_unknown && !refit_band_set {
+            eprintln!(
+                "error: --resume '{}' has no saved --refit-band (written by an older binary), so its band is unknown",
+                path
+            );
+            eprintln!("  pass --refit-band <F|inf> to choose the band for the resumed run");
+            std::process::exit(EXIT_USAGE);
+        }
+        if cp.refit_band_unknown {
+            eprintln!("# resume: checkpoint has no saved refit band; using --refit-band {}", cfg.refit_band);
+        }
         let mut conflicts: Vec<String> = Vec::new();
         if generations_set && cfg.generations < saved.generations {
             conflicts.push(format!(
@@ -3769,7 +3780,7 @@ fn main() {
             ));
         }
         // #495: the band decides which finalists get the exact refit.
-        if refit_band_set && cfg.refit_band != saved.refit_band {
+        if refit_band_set && !cp.refit_band_unknown && cfg.refit_band != saved.refit_band {
             conflicts.push(format!(
                 "--refit-band {} (saved {})",
                 cfg.refit_band, saved.refit_band
@@ -3876,6 +3887,9 @@ fn main() {
         let requested_prune = (cfg.prune, cfg.prune_rows, cfg.prune_budget);
         let requested_fit_report = cfg.fit_report;
         let mut effective = saved;
+        if cp.refit_band_unknown {
+            effective.refit_band = cfg.refit_band;
+        }
         if generations_set {
             effective.generations = cfg.generations;
         }

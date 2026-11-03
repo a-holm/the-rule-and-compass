@@ -6150,6 +6150,7 @@ fn snapshot(
         config: cfg.clone(),
         backend,
         config_hash: crate::checkpoint::config_hash(cfg),
+        refit_band_unknown: false,
         generations: gens_done,
         stopped_early,
         best_prev,
@@ -7622,8 +7623,12 @@ fn run_search(
 
     if let Some(cp) = resume {
         cp.check_data(train, test)?;
-        if !cfg.same_search_settings(&cp.config) {
-            let diff = cfg.search_setting_differences(&cp.config);
+        let mut saved_settings = cp.config.clone();
+        if cp.refit_band_unknown {
+            saved_settings.refit_band = cfg.refit_band;
+        }
+        if !cfg.same_search_settings(&saved_settings) {
+            let diff = cfg.search_setting_differences(&saved_settings);
             return Err(format!(
                 "checkpoint search settings do not match ({})",
                 diff.join(", ")
