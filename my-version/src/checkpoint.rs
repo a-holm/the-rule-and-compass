@@ -171,6 +171,9 @@ impl ErrorKind {
 
 /// A complete, resumable search state.
 pub struct Checkpoint {
+    /// #495: true when the file has no `config refit_band` line, so the band
+    /// of the run that wrote it is unknown. A resume must then name the band.
+    pub refit_band_unknown: bool,
     /// The search settings that produced the saved state (including the
     /// generation budget).
     pub config: Config,
@@ -1004,7 +1007,18 @@ impl Checkpoint {
         }
 
         let config = build_config(&config_fields)?;
-        let computed_hash = config_hash(&config);
+        let refit_band_unknown = !config_fields.contains_key("refit_band");
+        let computed_hash = if refit_band_unknown {
+            let text = config_canonical(&config);
+            let legacy: String = text
+                .lines()
+                .filter(|l| !l.starts_with("config refit_band "))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            hash_config_text(&legacy)
+        } else {
+            config_hash(&config)
+        };
         if let Some(stored) = stored_config_hash {
             if stored != computed_hash {
                 return Err(format!(
@@ -1159,6 +1173,7 @@ impl Checkpoint {
             config,
             backend,
             config_hash: computed_hash,
+            refit_band_unknown,
             generations,
             stopped_early,
             best_prev,
@@ -1411,7 +1426,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "fitness",       // #480: missing means `metric`
         "fit_rows",      // #116: missing means 0 (off)
         "fit_fallback_max", // #255: missing means the default bound
-        "refit_band",       // #495: missing means the default band
+        "refit_band",       // #495: missing means unknown, a resume must name the band
         "qd_bins",       // #120
         "qd_cell_cap",   // #120
         "qd_cvt",        // #120
@@ -1756,7 +1771,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             .parse::<usize>()
             .map_err(|_| format!("bad config value for 'fit_fallback_max': '{}'", raw))?,
     };
-    // #495: absent means the default band.
+    // #495: absent means unknown; the loader flags it and keeps the default.
     let refit_band = match fields.get("refit_band") {
         None => crate::search::DEFAULT_REFIT_BAND,
         Some(raw) => decode_f64(raw)
@@ -1907,11 +1922,7 @@ fn write_config(cfg: &Config, out: &mut String) {
     }
     writeln!(out, "config fit_rows {}", cfg.fit_rows).unwrap(); // #116
     writeln!(out, "config fit_fallback_max {}", cfg.fit_fallback_max).unwrap(); // #255
-    // #495: written only when it differs from the default, so every other
-    // checkpoint and config hash keeps its bytes.
-    if cfg.refit_band != crate::search::DEFAULT_REFIT_BAND {
-        writeln!(out, "config refit_band {}", encode_f64(cfg.refit_band)).unwrap();
-    }
+    writeln!(out, "config refit_band {}", encode_f64(cfg.refit_band)).unwrap(); // #495
     // #122: absent means auto (the historical path for every old checkpoint).
     writeln!(out, "config variation {}", cfg.variation.as_str()).unwrap();
     writeln!(out, "config dedup {}", cfg.dedup).unwrap();
