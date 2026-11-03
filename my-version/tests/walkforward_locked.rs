@@ -62,7 +62,7 @@ fn panel_csv(kind: Fixture) -> String {
             let r = |k: i64| (((k * 29 + g * 7) % 11) as f64 - 5.0) * 0.0006 + (((k * 13 + g) % 5) as f64 - 2.0) * 0.0002;
             let f1 = if i == 0 { 0.0 } else { r(i - 1) * 100.0 };
             let f2 = (((i * 19 + g * 5) % 13) as f64 - 6.0) / 6.0;
-            let y = r(i + 1);
+            let y = if kind == Fixture::Poisoned && std::env::var("RED716").is_ok() && g == 0 && i == 10 { 0.05 } else { r(i + 1) };
             if kind == Fixture::Poisoned && locked {
                 match i % 7 {
                     0 => continue,
@@ -186,6 +186,7 @@ fn the_store_path_ignores_every_value_inside_the_declared_locked_range() {
             let (cb, ob, eb) = wf(&poisoned, &w, &extra);
             assert_eq!((ca, cb), (0, 0), "{name}: {ea}{eb}");
             assert!(oa.contains("\"report_sha256\":"), "{name}: {oa}");
+            if name == "front-batch" { eprintln!("EVIDENCE {name} end {end}: {}", oa.split(',').filter(|t| t.contains("device_fraction") || t.contains("duty_run")).collect::<Vec<_>>().join(",")); }
             assert_eq!(stable(&oa, &clean), stable(&ob, &poisoned), "{name} end {end}");
             // the batch report embeds its own timings, so only the other reports have a reproducible hash
             if !extra.iter().any(|a| a == "--batch-pnl") {
