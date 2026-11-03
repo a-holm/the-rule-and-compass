@@ -12,6 +12,8 @@ One job: write the decision: scope split, spec and measurable acceptance criteri
 - `../../../_shared/rules.md`
 - `../../../_templates/research-decision.md`
 - `../../CONTEXT.md`
+- `../../../_templates/issue-body.md`
+- `../../../_tools/issue-lint.sh`
 
 Do NOT load: new research, code, the issue comment.
 
@@ -21,6 +23,7 @@ Do NOT load: new research, code, the issue comment.
 2. Copy `_templates/research-decision.md` to `output/decision.md`.
 3. Split the scope by issue number. Out-of-scope items name the issue where they land.
 4. Spec: files, functions, flags and tests by name. Every acceptance criterion carries a command or a number.
+5. When the decision creates issues, start each body from `../../../_templates/issue-body.md` and run `verksted/_tools/issue-lint.sh <body> --number <expected n>`. Create the issue only on `OK`: `gh issue create --label roadmap,<type>,<area> --body-file <body>`. Create blockers first.
 
 ## Outputs
 

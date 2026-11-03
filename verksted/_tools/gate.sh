@@ -14,7 +14,7 @@ T=$2
 L=${RCSR_LOCK_SCRIPT:-/mnt/lager/tmp/opencode/one-full-suite.sh}
 D=${RCSR_GATE_DIR:-${RCSR_GATES:-/mnt/lager/tmp/rcsr-gates}}
 if [ ! -d "$D" ]; then
-  echo "gate dir $D missing; #684 creates the symlink" >&2
+  echo "gate dir $D missing; link it to the log directory or set RCSR_GATES" >&2
   exit 1
 fi
 step() {

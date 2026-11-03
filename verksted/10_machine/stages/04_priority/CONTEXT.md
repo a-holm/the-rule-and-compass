@@ -10,7 +10,7 @@ One job: act on processes you started, ask about everything else.
 
 **Reference (every run):**
 - `../../../_shared/rules.md`
-- `../../../_shared/rules.md`
+- `../../../_shared/commands.md`
 - `../../CONTEXT.md`
 
 Do NOT load: foreign processes, the terminal, the user's crawl.
@@ -20,7 +20,8 @@ Do NOT load: foreign processes, the terminal, the user's crawl.
 1. If an input is missing or empty, stop and say which.
 2. For each consumer decide: mine, the user's or the system's. Only mine may be stopped, and only with `kill <pid>` of a pid you started. Never `pkill` or `killall`.
 3. Restarting the terminal or multiplexer ends this session: ask first, and fix permanently so the user restarts in their own time.
-4. Write `actions.md`: rows `| pid | owner | started by me | action |`; the action is `none` when not mine.
+4. The desktop has priority (rules 25 and 42). Screen blanking and lock stay off. Set: `gsettings set org.cinnamon.desktop.session idle-delay 0`, `gsettings set org.cinnamon.desktop.screensaver lock-enabled false`, `gsettings set org.cinnamon.desktop.screensaver idle-activation-enabled false`. Check: `gsettings get` on the same three keys prints `uint32 0`, `false`, `false`.
+5. Write `actions.md`: rows `| pid | owner | started by me | action |`; the action is `none` when not mine.
 
 ## Outputs
 

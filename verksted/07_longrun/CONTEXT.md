@@ -17,15 +17,19 @@ Evidence: the 10-hour run of 2026-10-20 to 2026-10-22; eight `rcsr` processes wh
 - `../../docs/dev-log.md`
 - `../../docs/convergence.md`
 - `../../scripts/run-long.sh`
+- `../_tools/runlib.sh`
+- `../_tools/bin-pin.sh`
+- `../_tools/status.sh`
+- `../_tools/wait-for.sh`
 
 Do NOT load: the ticket and data pipelines' stages, earlier runs' `output/`, the rest of `../_shared/`.
 
 ## Process
 
-1. `stages/01_preconditions/`: no open work left, binary from the new `main`, nothing old running.
-2. `stages/02_launch/`: launch through `rcsr-launch` with an explicit backend and a dry run first.
-3. `stages/03_monitor/`: watch the development log, not an external script.
-4. `stages/04_resume/`: resume on the same backend after a stop.
+1. `stages/01_preconditions/`: no open work left, binary from the tip of `$BASE` pinned with sha256, nothing old running.
+2. `stages/02_launch/`: a runbook on `runlib.sh` (holds under 10 minutes), a dry run first.
+3. `stages/03_monitor/`: one look per call (`status.sh`, dev log tail); waits through `wait-for.sh`.
+4. `stages/04_resume/`: chunked search; resume from the checkpoint while the stop reason is the time budget.
 5. `stages/05_audit/`: `rcsr dev-report` and independent auditors with a verdict per axis.
 6. `stages/06_report/`: baselines beside the best model, honest result fields.
 

@@ -2,6 +2,8 @@
 
 One job: turn an unclear or hard issue into a decision note that a Sonnet implementer follows, without changing code.
 
+Model policy: hard or critical research uses an Opus agent with tractatus_thinking and context7 only, no web search or web fetch. Implementation and verification use Sonnet. Opus makes plans, Sonnet executes them (rule 40).
+
 Evidence: #254, #257, #291, #292, #293, #352 and #364 each got a research pass before implementation. Wrong premises died at the measurement stage (#364: the locality test already passed). Research is a pipeline, not a stage of `../01_issue/CONTEXT.md`, because it uses a different model, writes no code and ends in a comment, not a PR.
 
 ## Inputs
@@ -12,6 +14,11 @@ Evidence: #254, #257, #291, #292, #293, #352 and #364 each got a research pass b
 **Reference (every run):**
 - `../_shared/rules.md`
 - `../_shared/commands.md`
+- `../_tools/wt-new.sh`
+- `../_tools/wt-done.sh`
+- `../_tools/rc-run.sh`
+- `../_tools/ab-pair.sh`
+- `../_tools/issue-lint.sh`
 - `../_shared/output-format.md`
 - `../_templates/research-question.md`
 - `../_templates/research-decision.md`

@@ -12,13 +12,14 @@ One job: run the real path on a medium store in under 10 minutes.
 - `../../../_shared/rules.md`
 - `../../../_shared/commands.md`
 - `../../CONTEXT.md`
+- `../../../_tools/rc-run.sh`
 
 Do NOT load: the 39.8 GB test, a second lock holder.
 
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. Build a store of at least 200 groups and 100 feature columns. Run `rcsr enrich --gpu on` on it through the lock, each step with its own `timeout`, wrapped in `/usr/bin/time -f 'wall=%es maxrss=%MkB'`.
+2. Build a store of at least 200 groups and 100 feature columns. Run `rcsr enrich --gpu on` on it with `verksted/_tools/rc-run.sh run <W> <id> <tag> --timeout S -- /usr/bin/time -f 'wall=%es maxrss=%MkB' <command>` (S at most 600), one run per step.
 3. Write `medium.md`: `wall=<s>`, `exit: <code>`, `gpu_used: yes|no`, the commit.
 
 ## Outputs

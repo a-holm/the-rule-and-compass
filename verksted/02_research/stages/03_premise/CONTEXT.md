@@ -13,13 +13,15 @@ One job: measure each premise with a small Rust test or an existing log.
 - `../../../_shared/rules.md`
 - `../../../_shared/commands.md`
 - `../../CONTEXT.md`
+- `../../../_tools/rc-run.sh`
+- `../../../_tools/ab-pair.sh`
 
 Do NOT load: the full engine change, the decision text.
 
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. For every `P<n>` in `question.md`, run the cheapest measurement: an existing test, a log, `/proc` numbers, or a single-file Rust program built with `nice -n 19 rustc -O` outside the repo. No Python.
+2. For every `P<n>` in `question.md`, run the cheapest measurement: an existing test, a log, `/proc` numbers, or a single-file Rust program built with `nice -n 19 rustc -O` under `$G/research-<slug>-scratch/`. Run each measurement with `verksted/_tools/rc-run.sh run|cpu <W> research-<slug> <tag> -- <command>`: lock modes add the Xid line, the log goes to `$G`. A timing comparison uses `verksted/_tools/ab-pair.sh` on pinned binaries only (rule 38). Calculations use `awk`, `bc` or a single-file Rust program. No Python.
 3. Write `premise.md`: a table `| P1 | <command or log> | <result> | holds |`. The last column is `holds` or `fails`.
 4. A failed premise shrinks or removes the scope. Say so in one line below the table.
 

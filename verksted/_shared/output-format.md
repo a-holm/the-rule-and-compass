@@ -63,7 +63,7 @@ pass | fail: <reason>
 | run card | `../_templates/run.md` | one proof line per acceptance criterion |
 | pull request body | `../_templates/pr.md` | `Refs #N`, never `Closes` |
 | research question, decision | `../_templates/research-question.md`, `../_templates/research-decision.md` | premises, then a binding spec |
-| agent brief | `brief.md` + `../_templates/brief.md` | starts with the no-resume line |
+| agent brief | `brief.md` + `../_templates/brief.md`, `brief-research.md`, `brief-clerk.md`; `../_tools/brief.sh` prints the dispatch prompt | starts with the no-resume line |
 | verification comment | `../_templates/verification-comment.md` | one row per criterion |
 | status message | `../_templates/status.md` | outcome first |
 
@@ -71,5 +71,5 @@ pass | fail: <reason>
 
 - Stage folders: `NN_snake_case`. Pipeline folders: `NN_noun`.
 - Worktree `worktrees/issue-<n>-<slug>`, branch `issue/<n>-<slug>`, slug kebab-case from the issue title.
-- Logs: `/mnt/lager/tmp/eureqa-gates/issue<n>-<what>.log`, gate logs `<tag>-{cpu,cuda,bench}.log`.
+- Logs: `$GATES/issue<n>-<what>.log` (`$GATES` defaults to `/mnt/lager/tmp/rcsr-gates`), gate logs `<tag>-{cpu,cuda,bench}.log`.
 - Dates `YYYY-MM-DD`, never "today".
