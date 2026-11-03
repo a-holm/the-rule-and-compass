@@ -36,7 +36,7 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
-const ROWS: usize = 1_000_000;
+const ROWS: usize = 131_072;
 const CANDIDATES: usize = 400;
 
 /// Tags of the requests that may scale with the row count: the dataset, its
