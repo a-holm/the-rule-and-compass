@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Usage: sanitize.sh <worktree> <id> <tag> (--test <file> | --lib) [--timeout S] [-- <test filters and flags>]
+# Usage: sanitize.sh <worktree> <id> <tag> (--test <file> | --lib) [--timeout S] [--api-errors no|explicit|all] [-- <test filters and flags>]
 # Builds the CUDA test binary in the build slot with `cargo test --release --features cuda --no-run --message-format=json`,
 # takes its path from the compiler-artifact JSON line (profile.test true; target.name = <file>, or target.kind holding lib),
 # and runs it under the CUDA 13.0 compute-sanitizer memcheck through the test lock with the Xid check:
-# $SANITIZER --tool memcheck --leak-check no --error-exitcode 99 <binary> <filters>.
+# env RCSR_UNDER_SANITIZER=memcheck $SANITIZER --tool memcheck --leak-check no --error-exitcode 99 [--report-api-errors <v>] <binary> <filters>.
+# RCSR_UNDER_SANITIZER lets a test pick a smaller fixture (tests/common/sanitizer.rs). --api-errors no stops deliberate driver errors counting as sanitizer errors.
+# Run the whole planned pass with sanitize-all.sh.
 # Search-level tests must set dispatch: DispatchMode::Device (CLI --dispatch device), or every stage runs on the CPU.
 # Writes: the logs <id>-<tag>-build and <id>-<tag> (see rc-run.sh).
 # Exit: 0 when the log holds `ERROR SUMMARY: 0 errors` and the run exits 0; 1 otherwise; 3 when $SANITIZER is missing or not a CUDA 13 path; 70 Xid rose; 2 usage.
@@ -19,6 +21,7 @@ wt=$1 id=$2 tag=$3
 shift 3
 target=
 timeout_s=580
+api_errors=
 while [ $# -gt 0 ]; do
   case "$1" in
     --test)
@@ -30,6 +33,11 @@ while [ $# -gt 0 ]; do
       [ -z "$target" ] || { usage >&2; exit 2; }
       target=lib
       shift
+      ;;
+    --api-errors)
+      [ $# -ge 2 ] || { usage >&2; exit 2; }
+      api_errors=$2
+      shift 2
       ;;
     --timeout)
       [ $# -ge 2 ] || { usage >&2; exit 2; }
@@ -43,6 +51,10 @@ done
 [ -n "$target" ] || { usage >&2; exit 2; }
 case "$timeout_s" in
   ''|*[!0-9]*) echo "sanitize: --timeout must be whole seconds" >&2; exit 2 ;;
+esac
+case "$api_errors" in
+  ""|no|explicit|all) ;;
+  *) echo "sanitize: --api-errors must be no, explicit or all" >&2; exit 2 ;;
 esac
 if [ "$timeout_s" -gt "$LOCK_HOLD_MAX" ]; then
   echo "sanitize: --timeout $timeout_s exceeds the lock hold cap $LOCK_HOLD_MAX" >&2
@@ -83,7 +95,7 @@ if [ "$count" -ne 1 ]; then
 fi
 
 "$RC_RUN" run "$wt" "$id" "$tag" --cuda --timeout "$timeout_s" -- \
-  "$SANITIZER" --tool memcheck --leak-check no --error-exitcode 99 "$bins" "$@"
+  env RCSR_UNDER_SANITIZER=memcheck "$SANITIZER" --tool memcheck --leak-check no --error-exitcode 99 ${api_errors:+--report-api-errors "$api_errors"} "$bins" "$@"
 rc=$?
 log=$(log_path "$id" "$tag")
 [ "$rc" -ne 70 ] || exit 70
