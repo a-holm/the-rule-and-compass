@@ -718,7 +718,7 @@ SEARCH:
                              only the trees whose full-data error is within
                              this relative band of the lowest error at no
                              greater cost, then every reported front member
-                             still unrefit (default 0.001). inf refits every
+                             still unrefit. inf (default) refits every
                              unique tree
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
   --no-dedup                 disable structural de-duplication
