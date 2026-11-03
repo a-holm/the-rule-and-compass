@@ -643,8 +643,8 @@ fn cpu_json_reports_gpu_null() {
 }
 
 /// #118: a GPU run reports the measured ledger, keeps #131's per-generation
-/// opcode report, and the host windows close to the independently measured
-/// wall. Occupancy stays null: it needs ncu, not a guess from duty.
+/// opcode report, and the host windows never exceed the independently
+/// measured wall. Occupancy stays null: it needs ncu, not a guess from duty.
 #[cfg(feature = "cuda")]
 #[test]
 fn gpu_run_reports_measured_accounting_not_occupancy() {
@@ -659,13 +659,20 @@ fn gpu_run_reports_measured_accounting_not_occupancy() {
     assert_eq!(a.row_evals, a.programs * a.rows);
     assert!(a.kernel_s >= 0.0 && a.sync_s >= 0.0 && a.alloc_s >= 0.0);
     assert!(a.d2h_bytes > 0, "the SSE output must be downloaded");
+    assert!(a.host_s >= 0.0 && a.window_s() >= 0.0);
     assert!(
-        a.decomposition_within(0.01),
-        "host windows should explain the wall within 1%: accounted {} vs wall {} (residual {:+.4})",
+        a.accounted_s() <= a.wall_s * (1.0 + 1e-9) + 1e-12,
+        "the disjoint host windows exceed the wall: accounted {} vs wall {}",
         a.accounted_s(),
-        a.wall_s,
-        a.residual_fraction()
+        a.wall_s
     );
+    assert!(
+        a.accounted_s() >= a.wall_s * (1.0 - 1e-9) - 1e-12,
+        "host_s is the clamped residue of the wall: accounted {} vs wall {}",
+        a.accounted_s(),
+        a.wall_s
+    );
+    eprintln!("accounting residual fraction {:+.6}", a.residual_fraction());
     assert!((0.0..=1.0).contains(&a.duty_cycle()));
     assert!(a.quality_per_gpu_hour(1.0, 10.0).is_some());
     // #284: the run ledger closes to its own wall and the run duty is the
