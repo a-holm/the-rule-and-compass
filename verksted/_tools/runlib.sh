@@ -9,6 +9,7 @@
 #   RL_BIN, RL_BIN_SHA  pinned binary and its sha256 file (default $RL_BIN.sha256), checked before every hold
 #   RL_TIME           the time command (default /usr/bin/time)
 #   RL_CHUNK_GAP_S    pause between chunks (default 0)
+#   RL_GRACE_S        extra seconds of each rl_chunks hold beyond its budget (default 120)
 # Commands (runlib_main):
 #   (none)        run every step of STEPS without a done-file, in order; protected steps are skipped
 #                 unless SEALED=1
@@ -17,7 +18,8 @@
 #                 unless SEALED=1
 # Holds: rl_gpu (test lock, Xid-checked), rl_cpu (build slot), rl_chunks (resumable search).
 # The budget of rl_chunks counts the `[time] wall=` of each hold, never the wait for the lock.
-# The command of rl_chunks runs with RL_CHUNK_S (seconds for this hold) and RL_CHUNK_N exported.
+# The command of rl_chunks runs with RL_CHUNK_S (its search budget) and RL_CHUNK_N exported; the hold
+# timeout is RL_CHUNK_S + RL_GRACE_S, which must not exceed LOCK_HOLD_MAX.
 
 : "${RUN:?runlib: set RUN before sourcing}"
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -96,7 +98,8 @@ rl_chunks() {
   local name=$1 chunk_s=$2 budget=$3 stopcmd=$4; shift 4
   [ "${1:-}" = -- ] || rl_die "usage: rl_chunks <name> <chunk_s> <budget_s> <stop-cmd> -- <cmd...>"
   shift
-  local spent=0 n=0 reason=none this left hw n0 rc
+  local grace=${RL_GRACE_S:-120} spent=0 n=0 reason=none this left hw n0 rc
+  [ "$((chunk_s + grace))" -le "$LOCK_HOLD_MAX" ] || rl_die "refused: rl_chunks $name chunk ${chunk_s}s + grace ${grace}s is above LOCK_HOLD_MAX=${LOCK_HOLD_MAX}s"
   while [ "$spent" -lt "$budget" ]; do
     n=$((n + 1))
     left=$((budget - spent))
@@ -104,7 +107,7 @@ rl_chunks() {
     [ "$left" -lt "$this" ] && this=$left
     n0=$(grep -ac '^\[time\] wall=' "$RUN/$name.log" 2>/dev/null || true)
     export RL_CHUNK_S=$this RL_CHUNK_N=$n
-    rl_gpu "$name" "$this" -- "$@"
+    rl_gpu "$name" "$((this + grace))" -- "$@"
     rc=$?
     [ "$rc" -eq 0 ] || rl_die "$name chunk $n failed rc=$rc (log $RUN/$name.log)"
     hw=$(rl_hold_wall "$RUN/$name.log" "${n0:-0}") || rl_die "$name chunk $n: no [time] line in $RUN/$name.log"

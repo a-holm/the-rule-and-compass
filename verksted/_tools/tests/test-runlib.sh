@@ -157,6 +157,15 @@ rb 'rl_chunks s 100 50 "cat '"$T"'/stop_reason" -- '"$T"'/search.sh'; check budg
 check budget-lt-holds "$(wc -l < "$T/holds")" 1
 grep -q '^chunk_s=50 n=1$' "$T/run/s.log"; check budget-lt-trim $? 0
 
+# grace: a stub past its budget but inside the grace survives; past budget + grace it is killed
+rm -f "$T/holds" "$T/calls" "$T/run/gr.log"; echo 1 > "$T/wall"; echo 0 > "$T/tb"
+rb 'rl_chunks gr 1 1000 "echo converged" -- sleep 2' RL_GRACE_S=4; check grace-inside-rc $? 0
+grep -q "timeout 5s" "$T/run/run.log"; check grace-timeout-sum $? 0
+rb 'rl_chunks gk 1 1000 "echo converged" -- sleep 10' RL_GRACE_S=1; check grace-kill-rc $? 1
+grep -q "chunk 1 failed rc=124" "$T/out"; check grace-kill-msg $? 0
+rb 'rl_chunks gz 500 1000 "echo converged" -- true'; check grace-refuse-rc $? 1
+grep -q "refused: rl_chunks gz chunk 500s + grace 120s is above LOCK_HOLD_MAX=600s" "$T/out"; check grace-refuse-msg $? 0
+
 # a stop-cmd that prints nothing ends the loop
 rm -f "$T/holds" "$T/calls" "$T/run/s.log"; echo 1 > "$T/wall"
 rb 'rl_chunks s 100 1000 "true" -- '"$T"'/search.sh'; check silent-rc $? 0
