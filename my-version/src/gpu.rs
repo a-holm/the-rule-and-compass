@@ -1048,6 +1048,9 @@ extern "C" {
         smem_bytes: *mut i32,
         max_constants: *mut i32,
     ) -> i32;
+    /* #707: resident blocks per SM, registers per thread and dynamic shared bytes
+       of the fit-kernel instantiation a batch with `kmax` constants would use. */
+    fn rc_fit_occupancy_for(kmax: i32, blocks: *mut i32, regs: *mut i32, smem_bytes: *mut i32) -> i32;
 }
 
 /// Version of the linked CUDA runtime as `(major, minor)`, from
@@ -1842,6 +1845,16 @@ impl GpuEvaluator {
         unsafe {
             rc_set_fit_polish(self.ctx, mode.code());
         }
+    }
+
+    /// #707: `(resident blocks per SM, registers per thread, dynamic shared
+    /// bytes)` of the fit-kernel instantiation that owns a batch with `kmax`
+    /// constants, from the CUDA occupancy calculator. `None` when `kmax` is past
+    /// every instantiation or the query fails.
+    pub fn fit_occupancy_for(kmax: usize) -> Option<(i32, i32, i32)> {
+        let (mut blocks, mut regs, mut smem) = (0i32, 0i32, 0i32);
+        let rc = unsafe { rc_fit_occupancy_for(kmax as i32, &mut blocks, &mut regs, &mut smem) };
+        (rc == 0).then_some((blocks, regs, smem))
     }
 
     /// #496: the polish-phase part of `ms` kernel milliseconds, apportioned by

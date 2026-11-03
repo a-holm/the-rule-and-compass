@@ -38,3 +38,18 @@ fn fit_kernel_occupancy_report() {
     );
     assert!(blocks >= 1);
 }
+
+#[test]
+fn fit_kernel_large_runs_three_blocks_per_sm() {
+    let (blocks20, regs20, smem20) = GpuEvaluator::fit_occupancy_for(20).expect("occupancy of the p 17..20 kernel");
+    let (blocks16, regs16, smem16) = GpuEvaluator::fit_occupancy_for(16).expect("occupancy of the p <= 16 kernel");
+    let build = crate::provenance::CUDA_BUILD.expect("a CUDA build records its toolkit");
+    println!(
+        "toolkit {} fit_kernel<20,128,128> registers {} smem {} blocks {} ; fit_kernel<16,256,128> registers {} smem {} blocks {}",
+        build.toolkit, regs20, smem20, blocks20, regs16, smem16, blocks16
+    );
+    assert_eq!(smem20, 31_624);
+    assert_eq!(smem16, 28_040);
+    assert_eq!(blocks20, 3, "the p 17..20 kernel runs three blocks per SM");
+    assert_eq!(blocks16, 2, "the p <= 16 kernel keeps two blocks per SM");
+}
