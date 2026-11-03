@@ -106,7 +106,7 @@ gh issue create --title "feat(area): short imperative title" \
 ## 2. Starting an issue in its own worktree
 
 One issue gets its own checkout so that concurrent work never stomps on another
-branch.
+branch. The base branch is `main`, or the integration branch the orchestrator names (today `integration/gpu-hardening`). `wt-new.sh` fetches `origin` and branches from `origin/<base>`.
 
 ```sh
 cd /path/to/the-rule-and-compass
@@ -114,12 +114,8 @@ cd /path/to/the-rule-and-compass
 N=12
 SLUG=metrics-expansion          # short, kebab-case, from the issue title
 
-# make sure the base is current
-git fetch origin
-git switch main && git pull --ff-only
-
-# create branch + worktree in the ignored folder
-git worktree add -b "issue/$N-$SLUG" "worktrees/issue-$N-$SLUG" main
+# fetch, then create branch + worktree in the ignored folder
+verksted/_tools/wt-new.sh "$N" "$SLUG" --base <base>
 
 # work there from now on
 cd "worktrees/issue-$N-$SLUG"
@@ -195,7 +191,7 @@ $L scripts/stall-watch.sh -i 60 -m 10 -l /path/to/log -- bash -c "cargo test --r
 ```sh
 git push -u origin "issue/$N-$SLUG"
 
-gh pr create --fill --base main \
+gh pr create --fill --base <base> \
   --title "$(git log -1 --pretty=%s)" \
   --body "$(cat <<EOF
 Refs #$N
@@ -230,14 +226,14 @@ Before merging:
 3. No unrelated changes in the diff.
 4. Output/docs updated.
 
-Then squash-merge and clean up:
+Then squash-merge into the base (integration merges only; `main` only on the lead's written instruction):
 
 ```sh
-gh pr merge --squash --delete-branch
-git switch main && git pull --ff-only
-git worktree remove "worktrees/issue-$N-$SLUG"
-git branch -d "issue/$N-$SLUG" 2>/dev/null || true
+gh pr merge <pr> --squash --delete-branch --subject "<type(area): subject> (#<pr>)" --body-file <file>
+verksted/_tools/wt-done.sh "$N"
 ```
+
+`--delete-branch` fails to delete a local branch that a worktree has checked out, so the worktree goes first or is removed right after. `wt-done.sh` removes the worktree and both branches, and refuses unless the worktree is clean and the PR is merged.
 
 ### Closing the issue is a separate act
 
@@ -275,7 +271,7 @@ code**. Before fanning out:
 * If two issues must touch the same file or region, **serialise** them (one PR
   merged before the other starts).
 * Never let two agents merge at the same time; merges are done one at a time,
-  newest `main` first.
+  newest base first.
 
 A safe pattern:
 
@@ -349,22 +345,7 @@ Rules:
 
 ### Brief for a delegated agent
 
-> You are working on issue #<n> of `a-holm/the-rule-and-compass`. Read
-> `docs/issue-workflow.md` and follow it exactly. Create the worktree
-> `worktrees/issue-<n>-<slug>` on branch `issue/<n>-<slug>`, implement the
-> acceptance criteria in the issue (`gh issue view <n>`), add tests, commit,
-> push, and open a PR that says `Refs #<n>` with the acceptance checklist.
-> **Never use `Closes #<n>`** in a commit or PR; the issue stays open until a
-> separate verifier closes it after every acceptance item has evidence. Do not
-> touch files outside the issue's scope. Report back with the PR number and a
-> one-line summary.
->
-> **Do not start an independent full-suite run, and do not start one while any
-> other `cargo`/`rustc` process is running.** Use narrow checks while you work
-> (`cargo test --test <name>`). If a full suite is genuinely required, it must go
-> through `/mnt/lager/tmp/opencode/one-full-suite.sh`. The combined integration
-> branch is tested once, centrally; in your report, list what you did not
-> verify.
+The rules for every agent are in [`../verksted/_shared/brief.md`](../verksted/_shared/brief.md). The ticket section starts from [`../verksted/_templates/brief.md`](../verksted/_templates/brief.md). `verksted/_tools/brief.sh` prints the dispatch prompt.
 
 ---
 

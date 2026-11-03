@@ -24,7 +24,7 @@ LOCK_HOLD_MAX=600
 
 need_gates() {
   if [ ! -d "$GATES" ]; then
-    echo "gates dir $GATES missing; #684 creates the symlink" >&2
+    echo "gates dir $GATES missing; link it to the log directory or set RCSR_GATES" >&2
     exit 1
   fi
 }
