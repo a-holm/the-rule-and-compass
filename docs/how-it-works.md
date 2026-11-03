@@ -25,7 +25,7 @@ Details:
 * [`docs/convergence.md`](convergence.md): how to tell whether a run converged.
 * [`docs/checkpoint.md`](checkpoint.md): checkpoint format and resume rules.
 * [`docs/reports.md`](reports.md): summary, sensitivity and benchmark reports.
-* [`docs/optimisation.md`](optimisation.md#--fitness-pnl-rank-every-candidate-by-the-exact-pl-regret): the `--fitness pnl` ranking, `--pnl-blocks` and the refusals.
+* [`docs/optimisation.md`](optimisation.md), section "`--fitness pnl`": the ranking, `--pnl-blocks` and the refusals.
 
 ## GPU backend
 
