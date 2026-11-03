@@ -74,9 +74,11 @@ interquartile`, `--metric maximum` or a CPU strategy.
 Dispatch is planned per stage, not per run: a calibrated cost model returns
 `device`, `cpu` or `split` plus a machine reason, with hysteresis at the
 crossover and a route ledger in `--json`/`--run-manifest`. Structural and
-arithmetic refusals are a cause set, never a timing test. `--dispatch device` skips the timing comparison
-only (reason `forced`); a compute-sanitizer run needs it, or the slow sanitized
-device loses every stage and no kernel launches. See
+arithmetic refusals are a cause set, never a timing test. The routes come from a
+pinned calibration (`rcsr calibrate` writes it; `--calibration anchors|probe|<path>`
+selects it; the fixed corpus anchors apply when no file exists), so one seed gives
+one route and one front in every process. `--dispatch device` skips the cost
+comparison only (reason `forced`). See
 [`docs/dispatch.md`](docs/dispatch.md).
 Every arm falls back to the default LM path when it cannot prove a safe result,
 and the default remains the historical LM path bit for bit. `--metric signed`

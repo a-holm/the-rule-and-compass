@@ -1835,9 +1835,11 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         gpu_notes: true,
         gpu_memory: None,
         dispatch: crate::dispatch::DispatchMode::Auto,
+        calibration: crate::dispatch::CalibrationSource::Anchors,
         // #119: scheduling only, not saved search state.
         pipeline_depth: 2,
         threads: 1,
+        threads_explicit: false,
         variation,
         selection,
         mutation_mix,

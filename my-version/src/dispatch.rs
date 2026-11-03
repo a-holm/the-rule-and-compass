@@ -726,6 +726,16 @@ impl Calibration {
     /// archive and result bytes identical). The manifest variant below records
     /// the measured values.
     pub fn json(&self) -> String {
+        self.json_with(None)
+    }
+
+    /// [`Self::json`] plus the calibration file path and sha256 when a file
+    /// supplied the rates.
+    pub fn json_with(&self, origin: Option<&FileOrigin>) -> String {
+        with_origin_fields(self.json_plain(), origin)
+    }
+
+    fn json_plain(&self) -> String {
         format!(
             "{{\"model_version\":{},\"source\":\"{}\",\"device_source\":\"{}\",\"samples\":{},\"device_samples\":{},\"hysteresis\":{:.4},\"fit_ref\":{{\"rows\":{:.0},\"constants\":{:.0},\"sweeps\":{:.0}}}}}",
             MODEL_VERSION,
@@ -744,6 +754,14 @@ impl Calibration {
     /// sources, spreads and the probe time. A manifest is not compared
     /// byte-for-byte across runs.
     pub fn manifest_json(&self) -> String {
+        self.manifest_json_with(None)
+    }
+
+    pub fn manifest_json_with(&self, origin: Option<&FileOrigin>) -> String {
+        with_origin_fields(self.manifest_json_plain(), origin)
+    }
+
+    fn manifest_json_plain(&self) -> String {
         format!(
             "{{\"model_version\":{},\"source\":\"{}\",\"device_source\":\"{}\",\"probe_s\":{:.6},\"samples\":{},\"device_samples\":{},\"hysteresis\":{:.4},\"r_eval\":{:.6e},\"r_fit\":{:.6e},\"bw\":{:.6e},\"bw_h2d\":{:.6e},\"bw_d2h\":{:.6e},\"launch_s\":{:.9},\"cpu_eval\":{:.6e},\"cpu_fit\":{:.6e},\"host_rate\":{:.6e},\"spread\":{{\"r_eval\":{:.4},\"r_fit\":{:.4},\"bw\":{:.4},\"launch_s\":{:.4},\"cpu_eval\":{:.4}}},\"fit_ref\":{{\"rows\":{:.0},\"constants\":{:.0},\"sweeps\":{:.0}}}}}",
             MODEL_VERSION,
@@ -910,6 +928,7 @@ pub struct Dispatcher {
     last: BTreeMap<Stage, Route>,
     ledger: Ledger,
     mode: DispatchMode,
+    origin: Option<FileOrigin>,
 }
 
 impl Dispatcher {
@@ -919,7 +938,14 @@ impl Dispatcher {
             last: BTreeMap::new(),
             ledger: Ledger::default(),
             mode: DispatchMode::Auto,
+            origin: None,
         }
+    }
+
+    /// Record the calibration file this dispatcher prices with.
+    pub fn with_origin(mut self, origin: Option<FileOrigin>) -> Self {
+        self.origin = origin;
+        self
     }
 
     pub fn with_mode(mut self, mode: DispatchMode) -> Self {
@@ -1131,6 +1157,7 @@ impl Dispatcher {
         }
         DispatchReport {
             calibration: self.calibration,
+            origin: self.origin.clone(),
             ledger,
         }
     }
@@ -1140,6 +1167,7 @@ impl Dispatcher {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DispatchReport {
     pub calibration: Calibration,
+    pub origin: Option<FileOrigin>,
     pub ledger: Ledger,
 }
 
@@ -1147,6 +1175,7 @@ impl Default for DispatchReport {
     fn default() -> Self {
         DispatchReport {
             calibration: Calibration::default(),
+            origin: None,
             ledger: Ledger::default(),
         }
     }
@@ -1156,7 +1185,7 @@ impl DispatchReport {
     pub fn json(&self) -> String {
         format!(
             "{{\"calibration\":{},\"route_ledger\":{}}}",
-            self.calibration.json(),
+            self.calibration.json_with(self.origin.as_ref()),
             self.ledger.json()
         )
     }
@@ -1165,7 +1194,7 @@ impl DispatchReport {
     pub fn manifest_json(&self) -> String {
         format!(
             "{{\"calibration\":{},\"route_ledger\":{}}}",
-            self.calibration.manifest_json(),
+            self.calibration.manifest_json_with(self.origin.as_ref()),
             self.ledger.json()
         )
     }
@@ -1266,6 +1295,385 @@ fn probe_cpu_eval() -> HostProbe {
             spread: 1.0,
             samples: 0,
         },
+    }
+}
+
+/// Append `file_path` and `file_sha256` to a calibration JSON object.
+fn with_origin_fields(mut json: String, origin: Option<&FileOrigin>) -> String {
+    if let Some(o) = origin {
+        json.pop();
+        json.push_str(&format!(
+            ",\"file_path\":{},\"file_sha256\":\"{}\"}}",
+            crate::devlog::text(&o.path),
+            o.sha256
+        ));
+    }
+    json
+}
+
+/// Text of `rcsr calibrate --help`.
+pub const CALIBRATE_USAGE: &str = "rcsr calibrate [--out <path>] [--gpu | --cpu]
+
+Time this machine once and write the calibration file that Auto dispatch
+routes from (schema rcsr-calibration/1). The file is written atomically.
+
+  --out <path>   where to write (default $XDG_CACHE_HOME/rcsr/calibration.json,
+                 else ~/.cache/rcsr/calibration.json)
+  --gpu          also time the device; exit 2 when none is usable
+  --cpu          time the host only; the device terms stay the corpus anchors
+                 (default: time the device when one is usable)
+
+A search run never writes this file. --calibration <path> selects another one,
+--calibration anchors ignores any file.";
+
+/// `rcsr calibrate`: probe the host and the device and write the file.
+/// Exits 0 on success, 2 on a usage error or when `--gpu` finds no device.
+pub fn run_calibrate(args: &[String]) -> ! {
+    let mut out: Option<std::path::PathBuf> = None;
+    let mut gpu: Option<bool> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                println!("{}", CALIBRATE_USAGE);
+                std::process::exit(0);
+            }
+            "--out" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => out = Some(std::path::PathBuf::from(v)),
+                    None => {
+                        eprintln!("error: --out needs a path");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--gpu" => gpu = Some(true),
+            "--cpu" | "--no-gpu" => gpu = Some(false),
+            other => {
+                eprintln!("error: unknown calibrate argument '{}'\n\n{}", other, CALIBRATE_USAGE);
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    let path = match out.or_else(default_calibration_path) {
+        Some(p) => p,
+        None => {
+            eprintln!("error: no default location (HOME and XDG_CACHE_HOME are unset); pass --out <path>");
+            std::process::exit(2);
+        }
+    };
+    let mut calibration = Calibration::probe();
+    let mut device: Option<String> = None;
+    if gpu != Some(false) {
+        match measure_device() {
+            Some((name, rates)) => {
+                device = Some(name);
+                calibration = calibration.with_device_rates(rates);
+            }
+            None if gpu == Some(true) => {
+                eprintln!("error: --gpu needs a usable CUDA device (and a build with --features cuda)");
+                std::process::exit(2);
+            }
+            None => {}
+        }
+    }
+    if !calibration.is_usable() {
+        eprintln!("error: the probe produced an unusable rate; nothing written");
+        std::process::exit(2);
+    }
+    let build = format!(
+        "{} {}",
+        env!("CARGO_PKG_VERSION"),
+        crate::provenance::BUILD_COMMIT
+    );
+    let text = calibration.file_text(device.as_deref(), &build, &crate::manifest::utc_now());
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("error: cannot create '{}': {}", parent.display(), e);
+            std::process::exit(2);
+        }
+    }
+    if let Err(e) = write_calibration_file(&path, text.as_bytes()) {
+        eprintln!("error: {}", e);
+        std::process::exit(2);
+    }
+    println!(
+        "wrote {} (device {}, sha256 {})",
+        path.display(),
+        device.as_deref().unwrap_or("none"),
+        crate::manifest::sha256_hex(text.as_bytes())
+    );
+    std::process::exit(0);
+}
+
+/// Write through a sibling temporary file and a rename, so a reader sees the
+/// old file or the new one.
+fn write_calibration_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp{}", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot write '{}': {}", path.display(), e)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn measure_device() -> Option<(String, DeviceRates)> {
+    let probe = crate::backend::probe();
+    let name = probe.device.clone()?;
+    crate::dispatch_gpu::measure().map(|r| (name, r))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn measure_device() -> Option<(String, DeviceRates)> {
+    None
+}
+
+/// Schema tag of a calibration file.
+pub const CALIBRATION_SCHEMA: &str = "rcsr-calibration/1";
+
+/// Where the cost model's rates come from, as asked on the command line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CalibrationRequest {
+    /// The default calibration file when it exists, else the anchors.
+    Default,
+    Anchors,
+    /// The per-process timing probe. Routes can differ between processes.
+    Probe,
+    File(std::path::PathBuf),
+}
+
+impl CalibrationRequest {
+    pub fn parse(s: &str) -> CalibrationRequest {
+        match s {
+            "anchors" => CalibrationRequest::Anchors,
+            "probe" => CalibrationRequest::Probe,
+            path => CalibrationRequest::File(std::path::PathBuf::from(path)),
+        }
+    }
+
+    /// Read and validate the request once. `device` is the name of the device
+    /// this run uses, `None` for a run without one.
+    pub fn resolve(&self, device: Option<&str>) -> Result<CalibrationSource, String> {
+        match self {
+            CalibrationRequest::Anchors => Ok(CalibrationSource::Anchors),
+            CalibrationRequest::Probe => Ok(CalibrationSource::Probe),
+            CalibrationRequest::File(path) => load_calibration(path, device, false),
+            CalibrationRequest::Default => match default_calibration_path() {
+                Some(path) if path.exists() => load_calibration(&path, device, true),
+                _ => Ok(CalibrationSource::Anchors),
+            },
+        }
+    }
+}
+
+/// A resolved calibration source. Only `Probe` reads a clock.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum CalibrationSource {
+    #[default]
+    Anchors,
+    Probe,
+    File(FileCalibration),
+}
+
+/// A calibration file read from disk.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileCalibration {
+    pub origin: FileOrigin,
+    /// Device the file was measured on; `None` for a host-only file.
+    pub device: Option<String>,
+    pub calibration: Calibration,
+}
+
+/// Path and content hash of the calibration file a run used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileOrigin {
+    pub path: String,
+    pub sha256: String,
+}
+
+impl CalibrationSource {
+    /// The origin to record in the JSON and the manifest.
+    pub fn origin(&self) -> Option<FileOrigin> {
+        match self {
+            CalibrationSource::File(f) => Some(f.origin.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// `$XDG_CACHE_HOME/rcsr/calibration.json`, else `$HOME/.cache/rcsr/calibration.json`.
+pub fn default_calibration_path() -> Option<std::path::PathBuf> {
+    let base = match std::env::var_os("XDG_CACHE_HOME") {
+        Some(v) if !v.is_empty() => std::path::PathBuf::from(v),
+        _ => match std::env::var_os("HOME") {
+            Some(h) if !h.is_empty() => std::path::PathBuf::from(h).join(".cache"),
+            _ => return None,
+        },
+    };
+    Some(base.join("rcsr").join("calibration.json"))
+}
+
+fn load_calibration(
+    path: &std::path::Path,
+    device: Option<&str>,
+    is_default: bool,
+) -> Result<CalibrationSource, String> {
+    let shown = path.display();
+    let hint = if is_default {
+        " (the default calibration file; run `rcsr calibrate` again, delete it, or pass --calibration anchors)"
+    } else {
+        ""
+    };
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("cannot read calibration file '{}': {}{}", shown, e, hint))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| format!("calibration file '{}' is not UTF-8{}", shown, hint))?;
+    let (calibration, file_device) = parse_calibration_text(text)
+        .map_err(|e| format!("calibration file '{}' is invalid: {}{}", shown, e, hint))?;
+    if let (Some(want), Some(have)) = (device, file_device.as_deref()) {
+        if want != have {
+            return Err(format!(
+                "calibration file '{}' was measured on '{}' but this run uses '{}'; run `rcsr calibrate` on this machine or pass --calibration anchors",
+                shown, have, want
+            ));
+        }
+    }
+    Ok(CalibrationSource::File(FileCalibration {
+        origin: FileOrigin {
+            path: path.display().to_string(),
+            sha256: crate::manifest::sha256_hex(&bytes),
+        },
+        device: file_device,
+        calibration,
+    }))
+}
+
+fn parse_calibration_text(text: &str) -> Result<(Calibration, Option<String>), String> {
+    use crate::bench_stats::Json;
+    let doc = crate::bench_stats::parse_json(text)?;
+    match doc.get("schema").and_then(|v| v.as_str()) {
+        Some(CALIBRATION_SCHEMA) => {}
+        Some(other) => {
+            return Err(format!("unknown schema '{}', expected '{}'", other, CALIBRATION_SCHEMA))
+        }
+        None => return Err(format!("missing schema '{}'", CALIBRATION_SCHEMA)),
+    }
+    let num = |key: &str| -> Result<f64, String> {
+        match doc.get(key) {
+            Some(Json::Num(v)) if v.is_finite() => Ok(*v),
+            Some(_) => Err(format!("'{}' is not a finite number", key)),
+            None => Err(format!("missing '{}'", key)),
+        }
+    };
+    let mut cal = Calibration {
+        r_eval: num("r_eval")?,
+        r_fit: num("r_fit")?,
+        bw: num("bw")?,
+        bw_h2d: num("bw_h2d")?,
+        bw_d2h: num("bw_d2h")?,
+        launch_s: num("launch_s")?,
+        cpu_eval: num("cpu_eval")?,
+        cpu_fit: num("cpu_fit")?,
+        hysteresis: num("hysteresis")?,
+        source: "file",
+        ..Calibration::default()
+    };
+    if !(cal.is_usable() && cal.bw_h2d > 0.0 && cal.bw_d2h > 0.0) {
+        return Err("every rate must be finite and positive".to_string());
+    }
+    if let Some(spread) = doc.get("spread") {
+        let term = |key: &str| {
+            spread
+                .get(key)
+                .and_then(|v| v.as_f64())
+                .filter(|v| v.is_finite() && *v >= 1.0)
+        };
+        let d = Spread::default();
+        cal.spread = Spread {
+            r_eval: term("r_eval").unwrap_or(d.r_eval),
+            r_fit: term("r_fit").unwrap_or(d.r_fit),
+            bw: term("bw").unwrap_or(d.bw),
+            launch_s: term("launch_s").unwrap_or(d.launch_s),
+            cpu_eval: term("cpu_eval").unwrap_or(d.cpu_eval),
+        };
+    }
+    let device = match doc.get("device") {
+        Some(Json::Str(s)) => Some(s.clone()),
+        Some(Json::Null) | None => None,
+        Some(_) => return Err("'device' is not a string or null".to_string()),
+    };
+    cal.device_source = if device.is_some() { "file" } else { "anchor" };
+    Ok((cal, device))
+}
+
+impl Calibration {
+    /// The calibration a run prices with. `Anchors` and `File` read no clock.
+    pub fn pinned(source: &CalibrationSource) -> Calibration {
+        match source {
+            CalibrationSource::Anchors => Calibration::default(),
+            CalibrationSource::Probe => Calibration::probe(),
+            CalibrationSource::File(f) => f.calibration,
+        }
+    }
+
+    /// The same calibration with the device terms reset to the anchors, for a
+    /// build that has no device.
+    pub fn host_terms_only(mut self) -> Calibration {
+        let a = Calibration::default();
+        self.r_eval = a.r_eval;
+        self.r_fit = a.r_fit;
+        self.bw = a.bw;
+        self.bw_h2d = a.bw_h2d;
+        self.bw_d2h = a.bw_d2h;
+        self.launch_s = a.launch_s;
+        self.device_samples = 0;
+        self.device_source = "anchor";
+        self.spread.r_eval = 1.0;
+        self.spread.r_fit = 1.0;
+        self.spread.bw = 1.0;
+        self.spread.launch_s = 1.0;
+        self
+    }
+
+    /// The text `rcsr calibrate` writes. Floats print in the shortest form that
+    /// reads back bit for bit.
+    pub fn file_text(&self, device: Option<&str>, build: &str, written: &str) -> String {
+        let device = match device {
+            Some(d) => crate::devlog::text(d),
+            None => "null".to_string(),
+        };
+        format!(
+            "{{\"schema\":\"{}\",\"written\":{},\"device\":{},\"build\":{},\n \"r_eval\":{:?},\"r_fit\":{:?},\"bw\":{:?},\"bw_h2d\":{:?},\"bw_d2h\":{:?},\"launch_s\":{:?},\n \"cpu_eval\":{:?},\"cpu_fit\":{:?},\"hysteresis\":{:?},\n \"spread\":{{\"r_eval\":{:?},\"r_fit\":{:?},\"bw\":{:?},\"launch_s\":{:?},\"cpu_eval\":{:?}}}}}\n",
+            CALIBRATION_SCHEMA,
+            crate::devlog::text(written),
+            device,
+            crate::devlog::text(build),
+            self.r_eval,
+            self.r_fit,
+            self.bw,
+            self.bw_h2d,
+            self.bw_d2h,
+            self.launch_s,
+            self.cpu_eval,
+            self.cpu_fit,
+            self.hysteresis,
+            self.spread.r_eval,
+            self.spread.r_fit,
+            self.spread.bw,
+            self.spread.launch_s,
+            self.spread.cpu_eval,
+        )
     }
 }
 
@@ -1372,7 +1780,172 @@ mod tests {
         assert!(decision.cost.predicted_s > 0.0);
     }
 
+    fn temp_file(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "rcsr-calibration-{}-{}-{}",
+            std::process::id(),
+            name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    }
+
+    fn sample_calibration() -> Calibration {
+        Calibration {
+            r_eval: 3.1e11,
+            r_fit: 4.2e3,
+            bw: 1.1e10,
+            bw_h2d: 1.2e10,
+            bw_d2h: 1.0e10,
+            launch_s: 9.0e-6,
+            cpu_eval: 2.0e9 / 3.0,
+            cpu_fit: 0.1 + 0.2,
+            hysteresis: 0.3,
+            spread: Spread {
+                r_eval: 1.02,
+                r_fit: 1.05,
+                bw: 1.01,
+                launch_s: 1.3,
+                cpu_eval: 1.04,
+            },
+            ..Calibration::default()
+        }
+    }
+
     #[test]
+    fn pinned_anchors_twice_give_equal_fields_and_read_no_clock() {
+        let a = Calibration::pinned(&CalibrationSource::Anchors);
+        let b = Calibration::pinned(&CalibrationSource::Anchors);
+        assert_eq!(a, b);
+        assert_eq!(a.r_eval.to_bits(), b.r_eval.to_bits());
+        assert_eq!(a.cpu_fit.to_bits(), b.cpu_fit.to_bits());
+        assert_eq!(a.probe_s, 0.0);
+        assert_eq!((a.source, a.device_source), ("anchors", "anchor"));
+        assert_eq!(a, Calibration::default());
+    }
+
+    #[test]
+    fn a_written_then_read_file_round_trips_bit_for_bit() {
+        let want = sample_calibration();
+        let path = temp_file("roundtrip");
+        let text = want.file_text(Some("Test GPU"), "0.1.0 abc", "2026-11-05T10:00:00Z");
+        std::fs::write(&path, &text).unwrap();
+        let source = CalibrationRequest::File(path.clone())
+            .resolve(Some("Test GPU"))
+            .unwrap();
+        let CalibrationSource::File(file) = &source else {
+            panic!("expected a file source");
+        };
+        let got = Calibration::pinned(&source);
+        for (a, b) in [
+            (want.r_eval, got.r_eval),
+            (want.r_fit, got.r_fit),
+            (want.bw, got.bw),
+            (want.bw_h2d, got.bw_h2d),
+            (want.bw_d2h, got.bw_d2h),
+            (want.launch_s, got.launch_s),
+            (want.cpu_eval, got.cpu_eval),
+            (want.cpu_fit, got.cpu_fit),
+            (want.hysteresis, got.hysteresis),
+            (want.spread.r_eval, got.spread.r_eval),
+            (want.spread.cpu_eval, got.spread.cpu_eval),
+        ] {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+        assert_eq!(got.probe_s, 0.0);
+        assert_eq!((got.source, got.device_source), ("file", "file"));
+        assert_eq!(file.origin.sha256, crate::manifest::sha256_hex(text.as_bytes()));
+        assert_eq!(file.device.as_deref(), Some("Test GPU"));
+        let json = DispatchReport {
+            calibration: got,
+            origin: source.origin(),
+            ledger: Ledger::default(),
+        }
+        .json();
+        assert!(json.contains("\"source\":\"file\""), "{}", json);
+        assert!(json.contains(&format!("\"file_sha256\":\"{}\"", file.origin.sha256)), "{}", json);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_bad_calibration_file_is_refused_with_a_message_naming_it() {
+        let good = sample_calibration().file_text(Some("Test GPU"), "b", "2026-11-05T10:00:00Z");
+        let cases: Vec<(&str, String, &str)> = vec![
+            ("truncated", good[..good.len() / 2].to_string(), "invalid"),
+            ("garbage", "not json".to_string(), "invalid"),
+            ("empty", String::new(), "invalid"),
+            ("no_schema", good.replace("rcsr-calibration/1", "other/9"), "unknown schema"),
+            ("negative", good.replace(&format!("\"r_eval\":{:?}", 3.1e11_f64), "\"r_eval\":-1.0"), "finite and positive"),
+            ("zero_cpu", good.replace(&format!("\"cpu_fit\":{:?}", 0.1_f64 + 0.2), "\"cpu_fit\":0.0"), "finite and positive"),
+            ("missing", good.replace("\"bw\":", "\"bwx\":"), "missing 'bw'"),
+        ];
+        for (name, text, expect) in cases {
+            let path = temp_file(name);
+            std::fs::write(&path, &text).unwrap();
+            let err = CalibrationRequest::File(path.clone())
+                .resolve(Some("Test GPU"))
+                .unwrap_err();
+            assert!(err.contains(&path.display().to_string()), "{name}: {err}");
+            assert!(err.contains(expect), "{name}: {err}");
+            let _ = std::fs::remove_file(&path);
+        }
+        let missing = temp_file("absent");
+        let err = CalibrationRequest::File(missing.clone()).resolve(None).unwrap_err();
+        assert!(err.contains("cannot read calibration file"), "{err}");
+    }
+
+    #[test]
+    fn a_file_from_another_device_is_refused_naming_both() {
+        let path = temp_file("device");
+        let text = sample_calibration().file_text(Some("GPU A"), "b", "2026-11-05T10:00:00Z");
+        std::fs::write(&path, text).unwrap();
+        let err = CalibrationRequest::File(path.clone())
+            .resolve(Some("GPU B"))
+            .unwrap_err();
+        assert!(err.contains("GPU A") && err.contains("GPU B"), "{err}");
+        assert!(CalibrationRequest::File(path.clone()).resolve(None).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_host_only_file_keeps_the_anchor_device_terms_label() {
+        let path = temp_file("host");
+        let text = Calibration::default().file_text(None, "b", "2026-11-05T10:00:00Z");
+        std::fs::write(&path, text).unwrap();
+        let source = CalibrationRequest::File(path.clone()).resolve(Some("Any GPU")).unwrap();
+        assert_eq!(Calibration::pinned(&source).device_source, "anchor");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn host_terms_only_resets_the_device_terms_to_the_anchors() {
+        let host = sample_calibration().host_terms_only();
+        let anchor = Calibration::default();
+        assert_eq!(host.r_eval, anchor.r_eval);
+        assert_eq!(host.bw_h2d, anchor.bw_h2d);
+        assert_eq!(host.cpu_fit, sample_calibration().cpu_fit);
+    }
+
+    #[test]
+    fn anchors_and_probe_requests_ignore_the_file_system() {
+        assert_eq!(CalibrationRequest::parse("anchors"), CalibrationRequest::Anchors);
+        assert_eq!(CalibrationRequest::parse("probe"), CalibrationRequest::Probe);
+        assert_eq!(
+            CalibrationRequest::parse("/x/cal.json"),
+            CalibrationRequest::File("/x/cal.json".into())
+        );
+        assert_eq!(
+            CalibrationRequest::Anchors.resolve(None).unwrap(),
+            CalibrationSource::Anchors
+        );
+    }
+
+    #[test]
+    #[ignore = "timing measurement of the probes"]
     fn host_probe_three_runs_agree_within_the_larger_of_their_own_spreads() {
         let runs = [Calibration::probe(), Calibration::probe(), Calibration::probe()];
         for run in &runs {
