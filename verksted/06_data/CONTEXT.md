@@ -2,7 +2,7 @@
 
 One job: turn raw spot market files into a verified `.rcsb` store with point-in-time membership, appended features, a passed audit and a verified manifest.
 
-Evidence: the crypto work of 2026-10-19 to 2026-10-22 and the retirement of 41 Python scripts (`../../docs/python-pipeline-retirement.md`) into `rcsr prep`, `rcsr panel`, `rcsr enrich`, `rcsr audit` and `rcsr verify-manifest`. Acquisition is shell today; a Rust tool is a separate issue and replaces stage 01 only.
+Evidence: the crypto work of 2026-10-19 to 2026-10-22 and the Rust pipeline (`../../docs/data-pipeline.md`): `rcsr prep`, `rcsr panel`, `rcsr enrich`, `rcsr audit` and `rcsr verify-manifest`. Acquisition is shell today; a Rust tool is a separate issue and replaces stage 01 only.
 
 ## Inputs
 

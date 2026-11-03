@@ -113,14 +113,10 @@ Two tracked examples implement the contract:
   on resume, and writes one manifest/log/result set per window. `--dry-run`
   prints the resolved commands without searching.
 
-The scratch launchers in the git-ignored `arbeidsmappe/crypto-rcsr/pilot/`
-directory are **retired**. Their classification and the Rust command that
-replaces each one are in
-[`python-pipeline-retirement.md`](python-pipeline-retirement.md); one-off probes
-are archived under `pilot/archive/` and must not be used. In particular, do not
-resume a long run with them (per-process salted seeds, `/dev/null` stderr, plain
-`--json` redirected to a file without a manifest). Use the tracked launchers
-above, or the `rcsr walkforward` command directly. The repository contains no Python; `my-version/tests/no_python.rs` fails on a
+Use the tracked launchers
+above, or the `rcsr walkforward` command directly. Do not resume a long run
+with per-process salted seeds, `/dev/null` stderr, or plain `--json` redirected
+to a file without a manifest. The repository contains no Python; `my-version/tests/no_python.rs` fails on a
 tracked `.py` file or a `python` shebang.
 
 `my-version/tests/launchers.rs` enforces the contract on every tracked
@@ -140,8 +136,7 @@ run (the "10-hour run"):
 2. **Watch** the development log instead of an external monitor:
    `tail -f runs/<label>.dev.ndjson` shows a summary event every 10–25
    generations (error, front size, phase times, fit/GPU/fallback counts, GPU
-   duty). The old scratch `monitor_10h.py` is not part of this flow; it is
-   tracked for deletion in #200. 1 Hz *process* sampling (CPU, RSS,
+   duty). 1 Hz *process* sampling (CPU, RSS,
    `nvidia-smi`) is still an outside-the-engine job, and `run_end` records the
    process peak RSS and measured device-hours.
 3. **Resume** on the same backend with `--resume` when the wall-clock budget
