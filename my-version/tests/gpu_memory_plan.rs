@@ -7,17 +7,17 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+#[path = "common/scratch.rs"]
+mod scratch;
+
+use scratch::Scratch;
+
 fn has_device() -> bool {
     rcsr::gpu::probe().available()
 }
 
-fn tmp_csv(rows: usize) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-gpu-memory-plan-{}-{}",
-        std::process::id(),
-        rows
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+fn tmp_csv(rows: usize) -> (Scratch, PathBuf) {
+    let dir = Scratch::new("sine");
     let path = dir.join("sine.csv");
     let mut text = String::from("x,y\n");
     for i in 0..rows {
@@ -25,7 +25,7 @@ fn tmp_csv(rows: usize) -> PathBuf {
         text.push_str(&format!("{:.6},{:.9}\n", x, x.sin()));
     }
     std::fs::write(&path, text).unwrap();
-    path
+    (dir, path)
 }
 
 fn rcsr(csv: &PathBuf, extra: &[&str]) -> Output {
@@ -52,7 +52,7 @@ fn a_tiny_budget_under_gpu_exits_2_with_the_plan() {
     if !has_device() {
         return;
     }
-    let csv = tmp_csv(2000);
+    let (_dir, csv) = tmp_csv(2000);
     let out = rcsr(&csv, &["--gpu", "--gpu-memory", "1KiB"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
@@ -74,7 +74,7 @@ fn a_tiny_budget_without_gpu_keeps_the_cpu_and_names_the_cause() {
     if !has_device() {
         return;
     }
-    let csv = tmp_csv(2000);
+    let (_dir, csv) = tmp_csv(2000);
     let out = rcsr(&csv, &["--gpu-memory", "1KiB", "--json", "--quiet"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
@@ -88,7 +88,7 @@ fn an_explicit_device_fit_that_does_not_fit_exits_2_at_the_fit_stage() {
         return;
     }
     let rows = 100_000usize;
-    let csv = tmp_csv(rows);
+    let (_dir, csv) = tmp_csv(rows);
     let train = rows * 3 / 4;
     let budget = (train * 2 * 4 + (2 << 20)).to_string();
     let out = rcsr(
@@ -106,7 +106,7 @@ fn a_normal_gpu_run_reports_a_resident_plan() {
     if !has_device() {
         return;
     }
-    let csv = tmp_csv(5000);
+    let (_dir, csv) = tmp_csv(5000);
     let out = rcsr(&csv, &["--gpu", "--json", "--quiet"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
