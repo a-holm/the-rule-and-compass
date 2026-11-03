@@ -145,6 +145,7 @@ typedef struct RcArenaReport {
     unsigned long long tile_overlapped_uploads;
     unsigned long long tile_pinned_bytes;
     unsigned long long waves;
+    unsigned long long pipelined_uploads;
 } RcArenaReport;
 
 #define RC_LEDGER_SLOTS 256
@@ -356,6 +357,7 @@ struct RcCtx {
     int warm;
     unsigned long long alloc_calls;
     unsigned long long steady_alloc_calls;
+    unsigned long long pipelined_uploads;
     unsigned long long overlapped_uploads;
     unsigned long long arena_batches;
     char sync_reason[96];
@@ -5206,8 +5208,9 @@ int rc_set_programs(void *ctx, const unsigned int *prog, const unsigned int *off
     t = rc_now_ms();
     int slot = c->arena_slot ^ 1;
     if (c->ev_slot_done[slot]) cudaEventSynchronize(c->ev_slot_done[slot]);
-    if (c->pending.active && cudaEventQuery(c->t1) == cudaErrorNotReady) {
-        c->overlapped_uploads++;
+    if (c->pending.active) {
+        c->pipelined_uploads++;
+        if (cudaEventQuery(c->t1) == cudaErrorNotReady) c->overlapped_uploads++;
     }
     st->sync_ms += rc_now_ms() - t;
 
@@ -5411,6 +5414,7 @@ int rc_arena_report(void *ctx, RcArenaReport *out)
     out->tile_overlapped_uploads = c->tile_overlapped;
     out->tile_pinned_bytes = c->tiled ? 2ULL * (unsigned long long)c->tile_bytes : 0;
     out->waves = c->wave_count;
+    out->pipelined_uploads = c->pipelined_uploads;
     return 0;
 }
 
