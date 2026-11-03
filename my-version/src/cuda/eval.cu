@@ -5209,6 +5209,7 @@ int rc_set_programs(void *ctx, const unsigned int *prog, const unsigned int *off
     int slot = c->arena_slot ^ 1;
     if (c->ev_slot_done[slot]) cudaEventSynchronize(c->ev_slot_done[slot]);
     if (c->pending.active) {
+        c->pipelined_uploads++;
         if (cudaEventQuery(c->t1) == cudaErrorNotReady) c->overlapped_uploads++;
     }
     st->sync_ms += rc_now_ms() - t;
