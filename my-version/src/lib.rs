@@ -45,6 +45,7 @@ pub mod labels; // #262: long-only horizon, action and triple-barrier labels
 pub mod bench_gpu; // #299: device benchmark joins, beta and cross means
 pub mod features_gpu; // #297: fused flow / price-action device producers
 pub mod fit;
+pub mod fit_record; // #704: recorded fit batches for replay
 pub mod genome;
 #[cfg(feature = "cuda")]
 pub mod gpu;

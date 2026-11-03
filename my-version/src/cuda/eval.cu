@@ -191,6 +191,9 @@ struct RcCtx {
        per-block cycles of the LM and polish phases since the last read. */
     int fit_polish;
     unsigned long long fit_cyc[2];
+    /* #704: staging offset and candidate count of the last fit launch's cycle words. */
+    size_t fit_last_off;
+    int fit_last_n;
     unsigned int *d_prog;
     unsigned int *d_off;
     float *d_out;
@@ -6454,6 +6457,8 @@ static float rc_fit_launch(RcCtx *c,
     memcpy(outc, host + o_c, cbytes);
     memcpy(outsse, host + o_sse, sizeof(double) * (size_t)nprog);
     memcpy(outstatus, host + o_status, sizeof(int) * (size_t)nprog);
+    c->fit_last_off = o_cyc;
+    c->fit_last_n = nprog;
     {
         const unsigned long long *cyc = (const unsigned long long *)(host + o_cyc);
         for (int k = 0; k < nprog; ++k) {
@@ -6528,6 +6533,17 @@ int rc_take_fit_cycles(void *ctx, unsigned long long *out)
     c->fit_cyc[0] = 0;
     c->fit_cyc[1] = 0;
     return 0;
+}
+
+/* #704: the per-candidate cycle words (LM, polish) of the last fit launch, 2 per
+ * candidate. Reads the staging buffer, so call it before any other launch.
+ * Returns the candidate count copied, or -1. */
+int rc_fit_last_cycles(void *ctx, unsigned long long *out, int n)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !out || !c->fs_host || c->fit_last_n <= 0 || n < c->fit_last_n) return -1;
+    memcpy(out, c->fs_host + c->fit_last_off, sizeof(unsigned long long) * 2 * (size_t)c->fit_last_n);
+    return c->fit_last_n;
 }
 
 /* Shape of the fit-kernel instantiation that would run a batch whose largest
