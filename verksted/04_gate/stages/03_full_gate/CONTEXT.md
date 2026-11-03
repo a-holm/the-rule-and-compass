@@ -12,6 +12,8 @@ One job: run the CPU suite, the CUDA suite and the tiny benchmark once on the ba
 - `../../../_shared/rules.md`
 - `../../../_tools/gate.sh`
 - `../../../_tools/test-summary.sh`
+- `../../../_tools/sanitize-all.sh`
+- `../../../../my-version/tests/sanitizer.plan`
 - `../../CONTEXT.md`
 
 Do NOT load: per-ticket reruns, anything but the three suites.
@@ -21,7 +23,8 @@ Do NOT load: per-ticket reruns, anything but the three suites.
 1. If an input is missing or empty, stop and say which.
 2. Look first: no other cargo, rustc or `rcsr-bench` process (`ps -eo pcpu,args | grep -E 'cargo|rustc|rcsr-bench'`). Then run `verksted/_tools/gate.sh <integration worktree> <tag>` as one background shell and wait for its notification.
 3. Write `gate.md` from the output: `cpu: ok=N failed=0`, `cuda: ok=N failed=0`, the bench line, `tested: <sha>`, and the three log paths.
-4. A red suite is not retried silently. A flake gets its own issue (`../../_shared/failure-modes.md`).
+4. The memcheck pass is `verksted/_tools/sanitize-all.sh <integration worktree> <tag>` as one background shell. It runs every CUDA test binary from `my-version/tests/sanitizer.plan` under compute-sanitizer through the lock, one hold per run of at most 580 s, and writes `<tag>-san-summary.log`. A `skip` or `api-errors-no` line in the plan carries its reason. Exit 0 needs every run at rc 0 with `ERROR SUMMARY: 0 errors`; a `budget` line means a run hit the 580 s timeout. Do not raise the timeout; size the fixture or add a plan line with a reason.
+5. A red suite is not retried silently. A flake gets its own issue (`../../_shared/failure-modes.md`).
 
 ## Outputs
 

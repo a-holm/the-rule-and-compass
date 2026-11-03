@@ -1,0 +1,8 @@
+# <binary> <test or *> <mode> <reason>
+# binary: a --test target name, lib (library unit tests) or bin-<name> (that binary's unit tests)
+# mode: skip (not run under memcheck) | api-errors-no (run alone with --report-api-errors no)
+# An api-errors-no test is still memchecked; only driver API error reporting is off, for that test only.
+gpu_parity      *                                                      skip           #721: rc_mtf_gather writes into a host pointer; Xid 43 under memcheck
+gpu_alloc_guard *                                                      skip           allocation accounting at 1M rows; its kernels run under memcheck in gpu_fit, gpu_rank and gpu_tiled
+gpu_memory_plan a_refused_device_allocation_is_reported_with_its_bytes api-errors-no  provokes a cudaMalloc out-of-memory on purpose
+gpu_ring        stale_cuda_error_does_not_fail_the_transport           api-errors-no  provokes a cudaMalloc out-of-memory on purpose
