@@ -12,6 +12,7 @@
 # Writes: one log per run (<id>-san-<binary>[-<test>]), the build log <id>-san-build, and the summary <id>-san-summary
 # with one line per run: <binary>[:<test>] rc=<n> xid=<a>-><b> secs=<s> | <test result line> | <ERROR SUMMARY line>,
 # plus `<binary>[:<test>] skip | <reason>` lines.
+# A run with rc 255, `running 0 tests`, a non-zero filtered-out count and the sanitizer message `terminated before first instrumented API call` (the plan filtered out every test) is written as `<binary> skipped by plan | ...` and is not a failure.
 # Exit: 0 when every run has rc 0 and `ERROR SUMMARY: 0 errors`; 70 at once when the Xid count rose; 1 otherwise; 3 when $SANITIZER is missing or not CUDA 13; 2 usage.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -99,15 +100,23 @@ run_one() { # label tag api bin args...
   rc=$?
   t1=$(date +%s)
   log=$(log_path "$id" "$tag")
-  local xid res err extra=
+  local xid res err extra= by_plan=0
   xid=$(sed -n 's/^xid before=\([0-9]*\) after=\([0-9]*\)$/\1->\2/p' "$log" | tail -1)
   res=$(grep -a '^test result:' "$log" | tail -1)
   err=$(grep -a 'ERROR SUMMARY:' "$log" | tail -1)
   if [ "$rc" -eq 124 ]; then
     extra=" | budget"
   fi
-  emit "$label rc=$rc xid=${xid:-?} secs=$((t1 - t0)) | $res | $err$extra"
+  # The sanitizer exits 255 when the target makes no CUDA call, which happens when the plan filters out every test.
+  if [ "$rc" -eq 255 ] && grep -aq '^running 0 tests' "$log" && grep -aEq '[1-9][0-9]* filtered out' "$log" &&
+    grep -aq 'terminated before first instrumented API call' "$log"; then
+    by_plan=1
+    emit "$label skipped by plan | 0 tests ran, all filtered out | xid=${xid:-?}"
+  else
+    emit "$label rc=$rc xid=${xid:-?} secs=$((t1 - t0)) | $res | $err$extra"
+  fi
   [ "$rc" -ne 70 ] || { echo "sanitize-all: Xid count rose during $label; stopped" >&2; exit 70; }
+  [ "$by_plan" -eq 0 ] || return 0
   if [ "$rc" -eq 0 ] && grep -aq 'ERROR SUMMARY: 0 errors' "$log"; then
     return 0
   fi

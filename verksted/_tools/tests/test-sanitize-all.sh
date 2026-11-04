@@ -62,6 +62,17 @@ chmod +x "$T/bin/cargo"
 cat > "$T/cuda-13.0/bin/compute-sanitizer" <<'STUB'
 #!/usr/bin/env bash
 echo "san under=${RCSR_UNDER_SANITIZER:-} $*" >> "$FAKE_DIR/san-calls"
+case "$*" in
+  *"${FAKE_ZERO_ON:-@none@}"*)
+    case "${FAKE_ZERO_MODE:-plan}" in
+      run1) echo "running 1 test"; echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;" ;;
+      nofilter) echo "running 0 tests"; echo "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;" ;;
+      *) echo "running 0 tests"; echo "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out;" ;;
+    esac
+    [ "${FAKE_ZERO_MODE:-plan}" = nomsg ] || echo "========= Error: Target application terminated before first instrumented API call"
+    exit "${FAKE_ZERO_RC:-255}"
+    ;;
+esac
 echo "running 1 test"
 echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"
 rc=0
@@ -117,6 +128,21 @@ has err-others-ran "$sum" '^gpu_memory_plan rc=0'
 FAKE_FAIL_ON=gpu_big-ddd FAKE_SAN_RC=124 FAKE_SUMMARY='no summary' run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check budget-rc "$r" "1"
 has budget-line "$sum" '^gpu_big rc=124 .* \| budget$'
+
+# a binary whose tests are all filtered out by the plan makes the sanitizer exit 255: skipped by plan, not a failure
+FAKE_ZERO_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check zero-plan-rc "$r" "0"
+has zero-plan-line "$sum" '^gpu_fit skipped by plan \| 0 tests ran, all filtered out'
+hasnt zero-plan-not-run-line "$sum" '^gpu_fit rc='
+has zero-plan-others-ran "$sum" '^gpu_memory_plan rc=0'
+# real failures with the same exit code stay failures
+for mode in run1 nofilter nomsg; do
+  FAKE_ZERO_MODE=$mode FAKE_ZERO_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+  check "zero-$mode-rc" "$r" "1"
+  has "zero-$mode-line" "$sum" '^gpu_fit rc=255 '
+done
+FAKE_ZERO_RC=99 FAKE_ZERO_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check zero-rc99-rc "$r" "1"
 
 # a rising Xid count stops at once with 70
 echo 4 > "$T/xid"
