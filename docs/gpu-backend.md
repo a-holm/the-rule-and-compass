@@ -3423,3 +3423,16 @@ Resident scoring of 400 candidates over 4,775,757 x 20 f32 rows takes 0.139 s (m
 ## Panel build on the device
 
 `rcsr panel build --gpu auto|on|off` (alias `--no-gpu`/`--cpu` for `off`) joins every base bar against the membership decisions with the monotone as-of merge of `src/cuda/pit.cu`, then derives the gap tags and chain starts. The planner is the one of `panel base`: `off` is always CPU, `auto` needs a usable device and at least 1M base rows, `on` needs a device. The block is one segment per symbol and one launch. The store is byte-identical on every route. A CPU join under `auto` or `on` is named in the `v2.backend` block of the panel manifest with its reason (`too_few_rows`, `no_device`, `launch`). The device buffers go through `src/cuda/alloc_guard.h`. `panel validate` replays prefixes on the CPU reference. MTF columns have their own device path in `src/cuda/mtf.cu`. See `docs/panel.md`.
+
+## Kernel arguments are device memory
+
+A kernel never receives host memory. Under HMM addressing a host pointer in a launch works natively and memcheck does not reliably flag it, so `my-version/tests/cuda_kernel_args.rs` checks the `src/cuda/*.cu` and `*.h` text on every `cargo test` (no GPU, no CUDA build). Rules:
+
+| Rule | Rejects |
+|---|---|
+| L1 | a `__global__` or `__device__` parameter `T *` where `T` is allocated with `(T *)calloc(1, sizeof(T))` in any `.cu` file (a host context struct such as `RcEnrich`, `RcPrep`). Pass a by-value view of device pointers instead. |
+| L2 | a pointer parameter of an exported `rc_*` function that is a launch argument, bare or as `p + k`. Copy the data to a device buffer first. |
+| L3 | a local assigned from `malloc`, `calloc`, `realloc` or `new` that is a launch argument. |
+| L4 | a launch argument naming host staging: an identifier starting with `h_`, `fs_host`, `host`, or `->host`. |
+
+L2 has an allowlist (`ALLOW_L2` in the test) for entry points whose caller passes device memory by contract. Each entry carries a reason, and an entry that matches no launch fails `every_allowlist_entry_is_used`. The lint checks parameters, not data flow: an alias such as `double *p = out;` escapes it. `RCSR_LINT_CUDA_DIR=<dir>` runs the same test against another copy of the sources.
