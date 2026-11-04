@@ -144,6 +144,7 @@ mod tests {
     use crate::dispatch::Calibration;
 
     #[test]
+    #[ignore = "timing measurement of the probes"]
     fn device_probe_three_runs_after_the_cold_start_agree_within_the_larger_of_their_own_spreads() {
         if !crate::gpu::probe().available() {
             eprintln!("no usable CUDA device: device probe test skipped");

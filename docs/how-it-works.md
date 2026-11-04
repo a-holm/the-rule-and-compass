@@ -33,7 +33,7 @@ The backend is optional. A binary built with `--features cuda` links the CUDA co
 
 The device scores candidates in `f32`. It is a fast ranking of many candidates, not the source of reported numbers. Finalists are rebuilt and judged in CPU `f64`, and a device proposal for constants is accepted only after an exact CPU check. Device and CPU results can therefore differ in the search path but not in the reported values.
 
-Dispatch decides per stage, not per run, where work runs: on the device, on the CPU or split. A calibrated cost model chooses, and the reason for each route is recorded. Some stages are CPU by contract, such as selection and the exact finalist rebuild. `--dispatch device` skips the timing comparison only. A `compute-sanitizer` run needs it, because the slow sanitized device would otherwise lose every stage and launch no kernel.
+Dispatch decides per stage, not per run, where work runs: on the device, on the CPU or split. A cost model chooses from a pinned calibration, and the reason for each route is recorded. The calibration is a file written by `rcsr calibrate` or the fixed corpus anchors, so one seed gives one route and one front in every process. Some stages are CPU by contract, such as selection and the exact finalist rebuild. `--dispatch device` skips the cost comparison only.
 
 An explicit `--gpu` fails closed. If the device is missing or fails after the probe, the run exits non-zero and writes no result, and the last checkpoint stays for `--resume --gpu`. Without `--gpu`, a CUDA build prefers the device and falls back to the CPU with a recorded reason. A checkpoint records its backend, and `--resume` refuses a backend change unless you pass `--allow-backend-change`.
 

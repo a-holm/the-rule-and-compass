@@ -123,6 +123,9 @@ USAGE:
              [--lockbox <START,END|none>]
              [--target-spec <file>]
   rcsr verify-manifest <manifest.json> [--data <file>] [--binary <file>]
+  rcsr calibrate [--out <path>] [--gpu | --cpu]
+                              time this machine and write the calibration
+                              file that --dispatch auto routes from
   rcsr dev-report <log.ndjson>
                               summarise the development log rcsr writes by
                               default (phases, fit/eval share, fallback
@@ -859,20 +862,36 @@ SEARCH:
                              --fit-strategy gpu exits 2. JSON reports
                              gpu.memory_plan
   --dispatch <auto|device>   how the per-stage cost model (#290) routes the movable
-                             stages (default auto). device skips the timing
+                             stages (default auto). auto prices the stages from
+                             the calibration (--calibration), so one seed gives
+                             one route and one front in every process. device
+                             skips the cost
                              comparison only and sends every stage that is not
                              refused (launch, unsupported_plan, too_few_rows,
                              too_many_constants, ill_conditioned, non_finite,
                              metric_not_native, device_memory, no_device,
                              exactness) and not CPU by contract to the device;
                              the route ledger records reason forced. Needs
-                             --gpu (exit 2 otherwise). Required for
-                             compute-sanitizer runs: the sanitized device is
-                             slow, so auto keeps every stage on the CPU and no
-                             kernel launches. With auto, a CPU run whose stages
-                             all lost the timing comparison reports
+                             --gpu (exit 2 otherwise). With auto, a CPU run
+                             whose stages all lost the cost comparison reports
                              backend_reason `dispatch: cost model kept
                              every stage on the cpu`
+  --calibration <anchors|probe|PATH>
+                             where --dispatch auto takes its rates from (#733).
+                             Default: the file $XDG_CACHE_HOME/rcsr/calibration.json
+                             (else ~/.cache/rcsr/calibration.json) when it
+                             exists, else the fixed corpus anchors. anchors
+                             ignores any file. PATH names a file written by
+                             `rcsr calibrate`; a missing, corrupt or
+                             other-device file exits 2 (no silent fallback).
+                             probe times the host and device at startup; routes
+                             then differ between processes. The source and the
+                             file sha256 are in --json dispatch.calibration and
+                             --run-manifest
+                             A checkpoint records the source (and the file
+                             sha256); --resume exits 2 when this run resolves
+                             another one, and needs --calibration for a
+                             checkpoint from an older binary or a probe run
   --no-gpu                   force CPU evaluation (alias --cpu); also the
                              reproducibility escape hatch for a byte-identical
                              CPU trajectory
@@ -901,6 +920,9 @@ SEARCH:
                              The exact gate of gated device fits (log_loss,
                              correlation, signed) uses all N. Results, archive
                              and checkpoints are identical for every value
+                             (the default fit resolution assumes 8 cores unless
+                             --threads is given, so it never follows the CPU
+                             affinity of the process)
   --pipeline-depth <N>       overlap CPU generation with GPU scoring using a
                              bounded pending queue of N batches (default 2; 0 =
                              synchronous). Results and archive are identical;
@@ -964,12 +986,13 @@ RUN INTEGRITY (#140):
                              any mismatch (exit 0 when everything matches)
 
 DISPATCH (#290):
-  Dispatch is planned per stage, not per run. A short startup probe times the
-  host; with --gpu one device probe per process times the eval rate, fit rate,
-  H2D/D2H bandwidth and launch overhead, and without a device the corpus
-  anchors stay (device_source anchor). --json carries dispatch.calibration
-  labels and dispatch.route_ledger; --run-manifest adds the measured rates and
-  their spreads. The route is device, cpu or
+  Dispatch is planned per stage, not per run, from a pinned calibration: a
+  file written by `rcsr calibrate` (eval rate, fit rate, H2D/D2H bandwidth,
+  launch overhead, host rates), else the corpus anchors. No run times anything
+  unless --calibration probe is given, so a seeded run routes the same in every
+  process. --json carries dispatch.calibration labels (source anchors, file or
+  startup_probe; file_path and file_sha256 for a file) and
+  dispatch.route_ledger; --run-manifest adds the rates and their spreads. The route is device, cpu or
   split with a machine reason; hysteresis (h=0.3) prevents oscillation at the
   crossover. A structural/arithmetic refusal (launch, unsupported_plan,
   too_few_rows, too_many_constants, ill_conditioned, non_finite,
@@ -2291,6 +2314,10 @@ fn mean_of(it: impl Iterator<Item = f64>) -> f64 {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = format!("rcsr {}", args.join(" "));
+    // #733: write the calibration file Auto dispatch routes from.
+    if args.first().map(|s| s.as_str()) == Some("calibrate") {
+        rcsr::dispatch::run_calibrate(&args[1..]);
+    }
     // #71: `import` is a subcommand, handled before the search option parser.
     if args.first().map(|s| s.as_str()) == Some("import") {
         run_import(&args[1..]);
@@ -2362,6 +2389,9 @@ fn main() {
         .unwrap_or(1);
     // #438: `--dispatch auto|device`.
     let mut dispatch_mode = rcsr::dispatch::DispatchMode::Auto;
+    // #733: `--calibration anchors|probe|<path>`.
+    let mut calibration_request = rcsr::dispatch::CalibrationRequest::Default;
+    let mut threads_explicit = false;
     let mut data_path: Option<String> = None;
     let mut target: Option<String> = None;
     let mut vars: Vec<String> = Vec::new();
@@ -3137,7 +3167,10 @@ fn main() {
             "--threads" => {
                 let v = val!();
                 match v.parse::<usize>() {
-                    Ok(n) if (1..=1024).contains(&n) => threads = n,
+                    Ok(n) if (1..=1024).contains(&n) => {
+                        threads = n;
+                        threads_explicit = true;
+                    }
                     _ => {
                         eprintln!("error: --threads needs an integer from 1 to 1024, got '{}'", v);
                         std::process::exit(EXIT_USAGE);
@@ -3168,6 +3201,11 @@ fn main() {
                         std::process::exit(EXIT_USAGE);
                     }
                 }
+            }
+            // #733: where Auto dispatch takes its rates from.
+            "--calibration" => {
+                let v = val!();
+                calibration_request = rcsr::dispatch::CalibrationRequest::parse(&v);
             }
             "--no-gpu" | "--cpu" => {
                 cfg.gpu = false;
@@ -3882,6 +3920,55 @@ fn main() {
                     gpu_probe.reason.as_deref().unwrap_or("no usable CUDA device")
                 );
             }
+        }
+    }
+
+    // #733: the cost model's rates are read once here. A file the user named,
+    // or the default file when it exists, must be valid; there is no silent
+    // fallback to the anchors.
+    cfg.calibration = match calibration_request.resolve(if cfg.gpu {
+        gpu_probe.device.as_deref()
+    } else {
+        None
+    }) {
+        Ok(source) => source,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_USAGE);
+        }
+    };
+    // #733: a resumed run must price with the calibration the run started with.
+    if let Some(cp) = &resume_checkpoint {
+        let now = rcsr::checkpoint::CalibrationRecord::of(&cfg.calibration);
+        match &cp.calibration_record {
+            None if calibration_request == rcsr::dispatch::CalibrationRequest::Default => {
+                eprintln!(
+                    "error: --resume has no saved calibration source (written by an older binary), so the routes it used are unknown"
+                );
+                eprintln!("  pass --calibration <anchors|probe|PATH> to choose the source for the resumed run");
+                std::process::exit(EXIT_USAGE);
+            }
+            None => eprintln!(
+                "# resume: checkpoint has no saved calibration source; using --calibration {}",
+                now.describe()
+            ),
+            Some(saved) if *saved != now => {
+                eprintln!(
+                    "error: --resume was written with calibration {} but this run uses {}",
+                    saved.describe(),
+                    now.describe()
+                );
+                if saved.source == "probe" {
+                    eprintln!("  a probe run is not reproducible; pass --calibration probe to resume it");
+                } else {
+                    eprintln!("  pass the same --calibration (the file must have the same sha256)");
+                }
+                std::process::exit(EXIT_USAGE);
+            }
+            Some(saved) if saved.source == "probe" => eprintln!(
+                "# resume: --calibration probe times this process again, so its routes need not match the earlier run"
+            ),
+            Some(_) => {}
         }
     }
 
@@ -5954,6 +6041,7 @@ fn main() {
     cfg.gpu_notes = !quiet;
     cfg.gpu_memory = gpu_memory;
     cfg.threads = threads; // #463
+    cfg.threads_explicit = threads_explicit;
     // #293: the device memory plan runs before the search allocates anything.
     // A refused fit stage, or a refused eval stage under an explicit `--gpu`,
     // is a usage error naming the bytes and the smallest fix.
