@@ -12,6 +12,8 @@ BASE=${RCSR_BASE:-integration/gpu-hardening}
 GATES=${RCSR_GATES:-/mnt/lager/tmp/rcsr-gates}
 G=$GATES
 OC=${RCSR_MACHINE_DIR:-/mnt/lager/tmp/opencode}
+# /proc/*/fd links hold the physical path, so lock probes need $OC without symlinks.
+OC=$(cd "$OC" 2> /dev/null && pwd -P || echo "$OC")
 PAUSE=$OC/PAUSE
 STREAMING=$OC/STREAMING
 LOCKFILE=$OC/full-suite.lock
