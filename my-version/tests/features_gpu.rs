@@ -185,7 +185,7 @@ fn fused_plan_flips_to_gpu_at_the_column_count_the_cost_constants_imply() {
         first + 1
     };
     assert_eq!(first_gpu_columns("flow", rcsr::enrich::OpClass::RollingStd), 3);
-    assert_eq!(first_gpu_columns("price_action", rcsr::enrich::OpClass::WilderScan), 3);
+    assert_eq!(first_gpu_columns("price_action", rcsr::enrich::OpClass::WilderScan), 4);
 }
 
 #[cfg(feature = "cuda")]
