@@ -2,7 +2,7 @@
 //! the paired `compare` command.
 
 use rcsr::bench_stats::{parse_json, Json};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -151,11 +151,14 @@ fn list_prints_the_new_suites() {
 /// The first line is readable while the next run is still going.
 #[test]
 fn ndjson_lines_are_flushed_as_runs_finish() {
+    let scratch = Scratch::new("ndjson-hold");
+    let hold = scratch.path().join("go");
     let mut child = bin()
         .args([
             "--suite", "hard", "--problems", "nguyen9,pagie1", "--noise", "0", "--generations",
             "400", "--islands", "1", "--pop", "200", "--patience", "0", "--ndjson", "--cpu",
         ])
+        .env("RCSR_BENCH_HOLD", &hold)
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -163,8 +166,10 @@ fn ndjson_lines_are_flushed_as_runs_finish() {
     let mut first = String::new();
     reader.read_line(&mut first).unwrap();
     assert!(first.contains("\"problem\": \"nguyen9\""), "{first}");
-    let still_running = child.try_wait().unwrap().is_none();
-    let _ = child.kill();
-    let _ = child.wait();
-    assert!(still_running, "the process had already finished when the first line was read");
+    assert!(child.try_wait().unwrap().is_none(), "the child must wait in the hold after the first line");
+    std::fs::write(&hold, b"").unwrap();
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(rest.lines().filter(|l| l.contains("\"problem\": \"pagie1\"")).count(), 1, "{rest}");
 }

@@ -4,6 +4,7 @@
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/fakes.sh"
 SAN=$HERE/../sanitize.sh
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -48,6 +49,7 @@ echo '{"reason":"build-finished","success":true}'
 exit "${FAKE_BUILD_RC:-0}"
 STUB
 chmod +x "$T/bin/cargo"
+fake_timeout "$T/bin"
 for v in 13.0 12.0; do
   cat > "$T/cuda-$v/bin/compute-sanitizer" <<'STUB'
 #!/usr/bin/env bash
@@ -62,13 +64,13 @@ done
 run() {
   env FAKE_DIR="$T" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
     RCSR_XID_CMD="cat '$T/xid'" RCSR_SANITIZER="${SANITIZER_PATH:-$T/cuda-13.0/bin/compute-sanitizer}" \
-    PATH="$T/bin:$PATH" bash "$SAN" "$@"
+    FAKE_TIMEOUT_LOG="$T/timeouts" PATH="$T/bin:$PATH" bash "$SAN" "$@"
 }
 blog=$T/gates/issue7-s-build.log
 rlog=$T/gates/issue7-s.log
 
 # clean run: binary path from the JSON line, flags, filters, build in the slot, run in the lock
-: > "$T/calls"; : > "$T/san-calls"
+: > "$T/calls"; : > "$T/san-calls"; : > "$T/timeouts"
 run "$T/wt" 7 s --test gpu_fit -- some_test --exact > /dev/null 2>&1; r=$?
 check clean-rc "$r" "0"
 has clean-slot "$T/calls" '^slot .*cargo test'
@@ -78,6 +80,7 @@ has clean-cargo-args "$T/cargo-calls" 'cargo test --release --features cuda --no
 has clean-summary "$rlog" '^ERROR SUMMARY: 0 errors$'
 has clean-xid "$rlog" '^xid before=4 after=4$'
 has clean-done "$rlog" '^RC_DONE rc=0 '
+check clean-limits "$(grep -c "^580 .*compute-sanitizer" "$T/timeouts")" "$(wc -l < "$T/san-calls" | tr -d " ")"
 has clean-build-done "$blog" '^RC_DONE rc=0 '
 
 # --api-errors maps to --report-api-errors

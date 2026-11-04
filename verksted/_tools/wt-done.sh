@@ -42,12 +42,9 @@ registered=$(git -C "$ROOT" worktree list --porcelain)
 case $'\n'"$registered"$'\n' in *$'\nworktree '"$w"$'\n'*) ;; *) refuse "$w is not a registered worktree" ;; esac
 dirty=$(git -C "$w" status --porcelain) || refuse "git status failed in $w"
 [ -z "$dirty" ] || refuse "$w is not clean (git status --porcelain is not empty)"
-for c in /proc/[0-9]*/cwd; do
-  cwd=$(readlink "$c" 2>/dev/null) || continue
-  case "$cwd" in
-    "$w"|"$w"/*) pid=${c#/proc/}; refuse "process ${pid%/cwd} has its cwd inside $w" ;;
-  esac
-done
+pat=$(printf '%s' "$w" | sed 's/[][*?\\]/\\&/g')
+busy=$(find /proc/[0-9]*/cwd -maxdepth 0 \( -lname "$pat" -o -lname "$pat/*" \) -printf '%h\n' 2>/dev/null | head -n 1)
+[ -z "$busy" ] || refuse "process ${busy#/proc/} has its cwd inside $w"
 branch=
 if [ "$research" -eq 0 ]; then
   branch=$(git -C "$w" symbolic-ref -q --short HEAD) || refuse "$w has no branch checked out"

@@ -4,11 +4,11 @@
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/fakes.sh"
 TOOLS=$HERE/..
 T=$(cd "$(mktemp -d)" && pwd -P)
-sleeper=
 cleanup() {
-  [ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null
+  [ -z "${HOLD_PID:-}" ] || release
   rm -rf "$T"
 }
 trap cleanup EXIT
@@ -76,13 +76,11 @@ rm "$WT/issue-5-alpha-one/untracked.txt"
 out=$(FAKE_GH_STATE=OPEN done_ 5); rc=$?
 check done-open-rc "$rc" 1
 check done-open-msg "$(grep -c 'not MERGED' <<<"$out")" 1
-(cd "$WT/issue-5-alpha-one" && exec sleep 300) &
-sleeper=$!
-sleep 0.3
+hold "cd $(printf %q "$WT/issue-5-alpha-one")"; check done-busy-ready $? 0
 out=$(FAKE_GH_STATE=MERGED done_ 5); rc=$?
 check done-busy-rc "$rc" 1
-check done-busy-msg "$(grep -c "process $sleeper has its cwd" <<<"$out")" 1
-kill "$sleeper"; wait "$sleeper" 2>/dev/null; sleeper=
+check done-busy-msg "$(grep -c "process $HOLD_PID has its cwd" <<<"$out")" 1
+release
 out=$(FAKE_GH_STATE=MERGED done_ 99); rc=$?
 check done-none-rc "$rc" 1
 out=$(done_); rc=$?
