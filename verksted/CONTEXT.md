@@ -51,7 +51,7 @@ A run is set up once from `setup/questionnaire.md`. Its answers are already writ
 verksted/_tools/links.sh [--strict]
 ```
 
-It builds the crate `_tools/verksted-check/` in the build slot and runs `links` and `walk` on `verksted/`. `links` checks that every relative link and every backticked input path resolves. `walk` checks that every pipeline and stage holds the four contract headings in order, that `AGENTS.md` routes every pipeline, that no `.py` file exists, that `CLAUDE.md` is exactly `@AGENTS.md`, that every script header follows the convention below, and that every `_tools/<path>` mention in a markdown file exists. `--strict` adds three checks: `_index.md` matches the tree, every tool is mentioned in a file other than `_index.md`, and the repo `AGENTS.md` links `verksted/AGENTS.md`. The same rules run in `cargo test --release` in `my-version/` through `tests/verksted_links.rs`; `tests/verksted_tools.rs` runs `bash -n` on every script and every `_tools/tests/*.sh`. Exit 0 means the tree is clean.
+It builds the crate `_tools/verksted-check/` in the build slot and runs `links` and `walk` on `verksted/`. `links` checks that every relative link and every backticked input path resolves. `walk` checks that every pipeline and stage holds the four contract headings in order, that `AGENTS.md` routes every pipeline, that no `.py` file exists, that `CLAUDE.md` is exactly `@AGENTS.md`, that every script header follows the convention below, and that every `_tools/<path>` mention in a markdown file exists. `--strict` adds three checks: `_index.md` matches the tree, every tool is mentioned in a file other than `_index.md`, and the repo `AGENTS.md` links `verksted/AGENTS.md`. The non-strict rules run in `cargo test --release` in `my-version/` through `tests/verksted_links.rs`, the strict rules through `tests/verksted_walk.rs` (run `--test verksted_walk` after adding or renaming a tool); `tests/verksted_tools.rs` runs `bash -n` on every script and every `_tools/tests/*.sh`. Exit 0 means the tree is clean.
 
 ## Scripts
 
@@ -63,7 +63,7 @@ Every top-level `_tools/*.sh` follows one convention:
 - Exit codes: 0 ok, 1 failed or refused, 2 usage, 70 a GPU Xid error appeared, 75 the lock gave up, 124 timeout.
 - A script that runs a job prints `RC_DONE rc=<n> at=<time>` as its last line (`rc_done`).
 - A script never creates `$GATES`; it calls `need_gates` before it writes a log.
-- Each script has a hermetic test in `_tools/tests/test-<name>.sh`: no network, no GPU, no real lock, no real `gh`, temp dirs only, under 30 s. `tests/verksted_tools.rs` runs every file there.
+- Each script has a hermetic test in `_tools/tests/test-<name>.sh`: no network, no GPU, no real lock, no real `gh`, temp dirs only, no real timer and no wall-clock check. A wait ends on an event (`hold` in `_tools/tests/lib/fakes.sh`) or on a counted poll of the fake clock; `tools_tests_read_no_clock` enforces it. `tests/verksted_tools.rs` runs every `_tools/tests/test-*.sh`; a script fails on a non-zero exit, or when its whole process tree stays blocked with nothing running for 30 snapshots.
 
 ## Index
 

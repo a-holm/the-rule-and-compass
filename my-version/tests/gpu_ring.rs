@@ -13,18 +13,12 @@ use std::os::raw::{c_int, c_void};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-fn tmp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-gpu-ring-{}-{}-{}",
-        tag,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn tmp_dir(tag: &str) -> Scratch {
+    Scratch::new(tag)
 }
 
 /// Two contiguous symbols with a gap, enough groups to exercise slot reuse.
@@ -198,7 +192,6 @@ fn ring_is_bounded_constant_and_tiles_are_invariant() {
         assert_eq!(two[i], want, "tiled '{}' differs from the whole kernel", name);
     }
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -251,7 +244,7 @@ const RING_NAMES: [&str; 7] = [
 
 /// A 64-group store and device columns for every projected column.
 struct RingFixture {
-    dir: std::path::PathBuf,
+    _dir: Scratch,
     path: String,
     ctx: usize,
     cols: Vec<usize>,
@@ -277,7 +270,7 @@ impl RingFixture {
             cols.push(unsafe { rc_enrich_value_ptr(ctx, which) } as usize);
         }
         RingFixture {
-            dir,
+            _dir: dir,
             path,
             ctx: ctx as usize,
             cols,
@@ -297,7 +290,6 @@ impl RingFixture {
 impl Drop for RingFixture {
     fn drop(&mut self) {
         unsafe { rc_enrich_destroy(self.ctx as *mut c_void) };
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -538,7 +530,6 @@ fn stalled_reader_times_out_with_ring_state() {
             );
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -618,5 +609,4 @@ fn stale_cuda_error_does_not_fail_the_transport() {
         (clean, after)
     });
     assert_eq!(clean, after);
-    let _ = std::fs::remove_dir_all(&dir);
 }

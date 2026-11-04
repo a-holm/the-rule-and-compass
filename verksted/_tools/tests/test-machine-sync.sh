@@ -5,10 +5,10 @@
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/fakes.sh"
 TOOLS=$HERE/..
 T=$(mktemp -d)
-bg=""
-cleanup() { [ -z "$bg" ] || kill $bg 2> /dev/null; rm -rf "$T"; }
+cleanup() { [ -z "${HOLD_PID:-}" ] || release; rm -rf "$T"; }
 trap cleanup EXIT
 fails=0
 check() {
@@ -17,10 +17,11 @@ check() {
     fails=$((fails + 1))
   fi
 }
-sync() { RCSR_MACHINE_DIR=$T/oc bash "$TOOLS/machine-sync.sh" "$@"; }
+sync() { RCSR_MACHINE_DIR=$T/ocl bash "$TOOLS/machine-sync.sh" "$@"; }
 FILES="one-full-suite.sh desktop-busy.sh build-slot.sh"
 
 mkdir -p "$T/oc"
+ln -s oc "$T/ocl"
 for f in $FILES; do cp "$TOOLS/machine/$f" "$T/oc/$f"; done
 
 out=$(sync --check); rc=$?
@@ -41,32 +42,32 @@ check diff-body "$(echo "$out" | grep -c '^-# change')" 1
 sync --bogus > /dev/null 2>&1
 check usage-rc "$?" 2
 
-( exec 9> "$T/oc/full-suite.lock"; flock 9; exec sleep 60 ) &
-bg=$!
-for _ in $(seq 1 50); do
-  flock -n "$T/oc/full-suite.lock" true 2> /dev/null || break
-  sleep 0.1
-done
+hold "exec 9> $(printf %q "$T/ocl/full-suite.lock") && flock 9"; check holder-ready $? 0
 sync --install > /dev/null 2>&1
 check refused-rc "$?" 1
 check refused-untouched "$(grep -c '# change' "$T/oc/desktop-busy.sh")" 1
-kill $bg 2> /dev/null
-wait $bg 2> /dev/null
-bg=""
-
+release
 sync --install > /dev/null 2>&1
 check install-rc "$?" 0
 sync --check > /dev/null
 check recheck-rc "$?" 0
 
-# build-slot.sh: one slot serialises two jobs.
+# build-slot.sh: a held slot is refused once, then the job runs once.
 if [ ! -x /mnt/lager/tmp/opencode/desktop-busy.sh ]; then
   echo "SKIP build-slot serialisation: live desktop-busy.sh missing"
 else
-  export RCSR_BUILD_SLOT_DIR=$T/slots RCSR_TEST_PAUSE=$T/nopause RCSR_BUILD_SLOTS=1 RCSR_BUILD_MIN_AVAIL_KB=0
-  job() { bash "$TOOLS/machine/build-slot.sh" bash -c 'echo start; sleep 1; echo end' 2> /dev/null; }
-  { job & job & wait; } > "$T/jobs.out"
-  check slot-order "$(tr '\n' ' ' < "$T/jobs.out")" "start end start end "
+  mkdir -p "$T/fake" "$T/slots"
+  fake_slot_sleep "$T/fake" "$T/polls"
+  printf '#!/bin/sh\necho "0, 0"\n' > "$T/fake/nvidia-smi"; chmod +x "$T/fake/nvidia-smi"
+  exec 9> "$T/slots/slot1.lock"; flock 9
+  PATH="$T/fake:$PATH" RCSR_BUILD_SLOT_DIR=$T/slots RCSR_TEST_PAUSE=$T/nopause RCSR_BUILD_SLOTS=1 \
+    RCSR_BUILD_SLOTS_DISCORD=1 RCSR_BUILD_MIN_AVAIL_KB=0 RCSR_CPUS=0 RCSR_CPUS_DISCORD=0 \
+    bash "$TOOLS/machine/build-slot.sh" bash -c 'echo ran' > "$T/slot.out" 2> "$T/slot.err"; rc=$?
+  exec 9>&-
+  check slot-rc "$rc" 0
+  check slot-polls "$(cat "$T/polls")" 1
+  check slot-ran "$(cat "$T/slot.out")" ran
+  check slot-held "$(grep -c '^\[build-slot\] slot 1/1 held: bash -c echo ran$' "$T/slot.err")" 1
 fi
 
 if [ "$fails" -ne 0 ]; then

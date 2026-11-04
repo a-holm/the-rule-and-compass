@@ -12,6 +12,10 @@ use rcsr::panel::{
 use rcsr::walkforward::{self, EvalSpec, Window};
 use std::collections::BTreeMap;
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 const DAY: i64 = 86_400;
 /// 2020-01-01T00:00:00Z.
 const T0: i64 = 1_577_836_800;
@@ -330,8 +334,9 @@ fn the_panel_store_and_manifest_record_counts_delisted_and_checksums() {
     let s = series();
     let m = build_membership(&s, &cfg(2)).unwrap();
     let p = build_panel(&s, &m).unwrap();
-    let out = std::env::temp_dir().join(format!("rcsr-panel-test-{}.rcsb", std::process::id()));
-    let input = std::env::temp_dir().join(format!("rcsr-panel-in-{}.csv", std::process::id()));
+    let scratch = Scratch::new("store");
+    let out = scratch.join("panel.rcsb");
+    let input = scratch.join("in.csv");
     // Write a canonical daily CSV as the provenance input.
     let mut csv = String::from("ts,symbol,open,high,low,close,volume,quote_volume\n");
     for (sym, bs) in &s {
@@ -365,9 +370,6 @@ fn the_panel_store_and_manifest_record_counts_delisted_and_checksums() {
     assert!(text.contains(&format!("\"end\":{}", l.end)), "{}", text);
     assert!(text.contains("\"snapshot\""), "{}", text);
     assert!(text.contains("\"coverage_last\":\"2026-09-30\""), "{}", text);
-    let _ = std::fs::remove_file(out);
-    let _ = std::fs::remove_file(manifest_path);
-    let _ = std::fs::remove_file(input);
 }
 
 #[test]
@@ -375,8 +377,8 @@ fn a_resumed_build_reuses_parts_and_matches_the_one_shot_panel() {
     let s = series();
     let m = build_membership(&s, &cfg(2)).unwrap();
     let one = build_panel(&s, &m).unwrap();
-    let dir = std::env::temp_dir().join(format!("rcsr-panel-resume-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let scratch = Scratch::new("resume");
+    let dir = scratch.join("cache");
     let dir_s = dir.to_string_lossy().to_string();
     let store = "store-0000";
     let cold = build_panel_resumable(Some(&s), &m, DAY, &dir_s, store, "").unwrap();
@@ -402,8 +404,7 @@ fn a_resumed_build_reuses_parts_and_matches_the_one_shot_panel() {
     assert_eq!(again.rows, one.rows);
     assert_eq!(again.gaps, one.gaps);
     // A warm build with a missing part must fail loudly, not shrink the panel.
-    let dir2 = std::env::temp_dir().join(format!("rcsr-panel-resume-b-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir2);
+    let dir2 = scratch.join("cache-b");
     let dir2_s = dir2.to_string_lossy().to_string();
     build_panel_resumable(Some(&s), &m, DAY, &dir2_s, store, "").unwrap();
     let victim = std::fs::read_dir(&dir2)
@@ -420,16 +421,14 @@ fn a_resumed_build_reuses_parts_and_matches_the_one_shot_panel() {
         other.rows,
         panel::build_panel_with_step(&s, &m, DAY * 2).unwrap().rows
     );
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&dir2);
 }
 
 #[test]
 fn a_changed_store_or_membership_invalidates_the_panel_cache() {
     let s = series();
     let m = build_membership(&s, &cfg(2)).unwrap();
-    let dir = std::env::temp_dir().join(format!("rcsr-panel-key-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let scratch = Scratch::new("key");
+    let dir = scratch.join("cache");
     let dir_s = dir.to_string_lossy().to_string();
     build_panel_resumable(Some(&s), &m, DAY, &dir_s, "store-a", "").unwrap();
     // Same inputs: warm.
@@ -453,15 +452,14 @@ fn a_changed_store_or_membership_invalidates_the_panel_cache() {
     assert_eq!(rebuilt.rows, build_panel(&s2, &m3).unwrap().rows);
     assert!(panel::panel_cache_ready(&dir_s, DAY, "store-b", &m3, "").unwrap());
     assert!(!panel::panel_cache_ready(&dir_s, DAY, "store-a", &m, "").unwrap());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn a_corrupted_panel_part_and_a_stale_format_are_refused() {
     let s = series();
     let m = build_membership(&s, &cfg(2)).unwrap();
-    let dir = std::env::temp_dir().join(format!("rcsr-panel-corrupt-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let scratch = Scratch::new("corrupt");
+    let dir = scratch.join("cache");
     let dir_s = dir.to_string_lossy().to_string();
     let cold = build_panel_resumable(Some(&s), &m, DAY, &dir_s, "store-a", "").unwrap();
     let part = std::fs::read_dir(&dir)
@@ -491,15 +489,14 @@ fn a_corrupted_panel_part_and_a_stale_format_are_refused() {
     assert!(build_panel_resumable(None, &m, DAY, &dir_s, "store-a", "").is_err());
     let again = build_panel_resumable(Some(&s), &m, DAY, &dir_s, "store-a", "").unwrap();
     assert_eq!(again.rows, cold.rows);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn a_part_with_a_stale_series_end_is_rebuilt() {
     let s = series();
     let m = build_membership(&s, &cfg(2)).unwrap();
-    let dir = std::env::temp_dir().join(format!("rcsr-panel-grow-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let scratch = Scratch::new("grow");
+    let dir = scratch.join("cache");
     let dir_s = dir.to_string_lossy().to_string();
     let cold = build_panel_resumable(Some(&s), &m, DAY, &dir_s, "store-a", "").unwrap();
     let untouched = std::fs::metadata(dir.join("C.part")).unwrap().modified().unwrap();
@@ -527,15 +524,14 @@ fn a_part_with_a_stale_series_end_is_rebuilt() {
     // The repaired cache is warm again.
     let warm = build_panel_resumable(None, &m, DAY, &dir_s, "store-a", "").unwrap();
     assert_eq!(warm.rows, cold.rows);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn cold_and_warm_panel_stores_are_byte_identical() {
     let s = series();
     let m = build_membership(&s, &cfg(2)).unwrap();
-    let dir = std::env::temp_dir().join(format!("rcsr-panel-hash-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let scratch = Scratch::new("hash");
+    let dir = scratch.join("cache");
     let dir_s = dir.to_string_lossy().to_string();
     let store = "store-a";
     let cold = build_panel_resumable(Some(&s), &m, DAY, &dir_s, store, "").unwrap();
@@ -547,7 +543,7 @@ fn cold_and_warm_panel_stores_are_byte_identical() {
     assert_eq!((cold.gaps, cold.first_ts, cold.last_ts), (warm.gaps, warm.first_ts, warm.last_ts));
     // And the written stores hash the same, so a manifest checksum cannot tell
     // a warm rebuild from a cold one.
-    let csv = std::env::temp_dir().join(format!("rcsr-panel-hash-{}.csv", std::process::id()));
+    let csv = scratch.join("in.csv");
     let mut text = String::from("ts,symbol,open,high,low,close,volume,quote_volume\n");
     for (sym, bs) in &s {
         for b in bs {
@@ -559,8 +555,8 @@ fn cold_and_warm_panel_stores_are_byte_identical() {
     }
     std::fs::write(&csv, text).unwrap();
     let csv_s = csv.to_string_lossy().to_string();
-    let a = std::env::temp_dir().join(format!("rcsr-panel-hash-a-{}.rcsb", std::process::id()));
-    let b = std::env::temp_dir().join(format!("rcsr-panel-hash-b-{}.rcsb", std::process::id()));
+    let a = scratch.join("a.rcsb");
+    let b = scratch.join("b.rcsb");
     let a_s = a.to_string_lossy().to_string();
     let b_s = b.to_string_lossy().to_string();
     panel::write_panel_panel(&a_s, &cold, &m, &[csv_s.as_str()], 65_536, false, None).unwrap();
@@ -568,20 +564,12 @@ fn cold_and_warm_panel_stores_are_byte_identical() {
     let ha = rcsr::manifest::sha256_file(&a).unwrap();
     let hb = rcsr::manifest::sha256_file(&b).unwrap();
     assert_eq!(ha, hb, "cold and warm panel stores differ");
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_file(&a);
-    let _ = std::fs::remove_file(&b);
-    let _ = std::fs::remove_file(format!("{}.manifest.json", a_s));
-    let _ = std::fs::remove_file(format!("{}.manifest.json", b_s));
-    let _ = std::fs::remove_file(&csv);
 }
 
 #[test]
 fn a_store_key_reads_the_published_manifest_and_falls_back_to_hashing() {
-    let dir = std::env::temp_dir().join(format!("rcsr-panel-storekey-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let store = dir.join("s.rcsb");
+    let scratch = Scratch::new("storekey");
+    let store = scratch.join("s.rcsb");
     std::fs::write(&store, b"abc").unwrap();
     let store_s = store.to_string_lossy().to_string();
     let hashed = rcsr::manifest::sha256_hex(b"abc");
@@ -605,7 +593,6 @@ fn a_store_key_reads_the_published_manifest_and_falls_back_to_hashing() {
     let junk = manifest.replace(&recorded, "unknown");
     std::fs::write(format!("{}.manifest.json", store_s), &junk).unwrap();
     assert_eq!(panel::store_key(&store_s), hashed);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

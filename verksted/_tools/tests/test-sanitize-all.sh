@@ -4,6 +4,7 @@
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/fakes.sh"
 ALL=$HERE/../sanitize-all.sh
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -59,9 +60,21 @@ echo '{"reason":"build-finished","success":true}'
 exit "${FAKE_BUILD_RC:-0}"
 STUB
 chmod +x "$T/bin/cargo"
+fake_timeout "$T/bin"
 cat > "$T/cuda-13.0/bin/compute-sanitizer" <<'STUB'
 #!/usr/bin/env bash
 echo "san under=${RCSR_UNDER_SANITIZER:-} $*" >> "$FAKE_DIR/san-calls"
+case "$*" in
+  *"${FAKE_ZERO_ON:-@none@}"*)
+    case "${FAKE_ZERO_MODE:-plan}" in
+      run1) echo "running 1 test"; echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;" ;;
+      nofilter) echo "running 0 tests"; echo "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;" ;;
+      *) echo "running 0 tests"; echo "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out;" ;;
+    esac
+    [ "${FAKE_ZERO_MODE:-plan}" = nomsg ] || echo "========= Error: Target application terminated before first instrumented API call"
+    exit "${FAKE_ZERO_RC:-255}"
+    ;;
+esac
 echo "running 1 test"
 echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"
 rc=0
@@ -75,10 +88,10 @@ STUB
 chmod +x "$T/cuda-13.0/bin/compute-sanitizer"
 
 run() {
-  : > "$T/calls"; : > "$T/san-calls"; : > "$T/cargo-calls"
+  : > "$T/calls"; : > "$T/san-calls"; : > "$T/cargo-calls"; : > "$T/timeouts"
   env FAKE_DIR="$T" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
     RCSR_XID_CMD="cat '$T/xid'" RCSR_SANITIZER="$T/cuda-13.0/bin/compute-sanitizer" RCSR_SANITIZER_PLAN="$T/plan" \
-    PATH="$T/bin:$PATH" bash "$ALL" "$@"
+    FAKE_TIMEOUT_LOG="$T/timeouts" PATH="$T/bin:$PATH" bash "$ALL" "$@"
 }
 sum=$T/gates/issue9-san-summary.log
 
@@ -99,6 +112,8 @@ has full-lock "$T/calls" '^lock .*timeout 580 '
 has full-line "$sum" '^gpu_fit rc=0 xid=4->4 secs=[0-9]+ \| test result: ok\. 1 passed.* \| =+ ERROR SUMMARY: 0 errors$'
 has full-api-line "$sum" '^gpu_memory_plan:refused_alloc rc=0 xid=4->4 secs='
 check full-run-lines "$(grep -c ' rc=' "$sum")" "6"
+check full-limits "$(grep -c "^580 .*compute-sanitizer" "$T/timeouts")" "$(wc -l < "$T/san-calls" | tr -d " ")"
+check full-limits-all "$(grep -c compute-sanitizer "$T/timeouts")" "$(wc -l < "$T/san-calls" | tr -d " ")"
 
 # --only: two binaries, four-style runs for the api-errors-no binary
 run "$T/wt" 9 --only gpu_memory_plan --only gpu_fit > /dev/null 2>&1; r=$?
@@ -117,6 +132,21 @@ has err-others-ran "$sum" '^gpu_memory_plan rc=0'
 FAKE_FAIL_ON=gpu_big-ddd FAKE_SAN_RC=124 FAKE_SUMMARY='no summary' run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check budget-rc "$r" "1"
 has budget-line "$sum" '^gpu_big rc=124 .* \| budget$'
+
+# a binary whose tests are all filtered out by the plan makes the sanitizer exit 255: skipped by plan, not a failure
+FAKE_ZERO_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check zero-plan-rc "$r" "0"
+has zero-plan-line "$sum" '^gpu_fit skipped by plan \| 0 tests ran, all filtered out'
+hasnt zero-plan-not-run-line "$sum" '^gpu_fit rc='
+has zero-plan-others-ran "$sum" '^gpu_memory_plan rc=0'
+# real failures with the same exit code stay failures
+for mode in run1 nofilter nomsg; do
+  FAKE_ZERO_MODE=$mode FAKE_ZERO_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+  check "zero-$mode-rc" "$r" "1"
+  has "zero-$mode-line" "$sum" '^gpu_fit rc=255 '
+done
+FAKE_ZERO_RC=99 FAKE_ZERO_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check zero-rc99-rc "$r" "1"
 
 # a rising Xid count stops at once with 70
 echo 4 > "$T/xid"
