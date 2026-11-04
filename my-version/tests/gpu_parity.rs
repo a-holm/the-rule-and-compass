@@ -1031,10 +1031,10 @@ fn prefix_replay_at_twenty_cuts_is_bit_identical_and_the_canary_fails() {
     let per = per_symbol();
     let full: Vec<(String, Vec<f64>)> =
         s.names.iter().map(|n| (n.clone(), read_column(&s.gpu_out, n))).collect();
-    let cross = ["breadth", "dispersion"]
+    let cross = ["breadth", "dispersion", "mkt_breadth", "mkt_dispersion", "mkt_r16", "xs_rank_r16"]
         .into_iter()
         .find(|n| s.names.iter().any(|m| m == n))
-        .expect("a cross-market device column");
+        .expect("a device column that needs MIN_CROSS_MEMBERS members with a finite r16");
     let cuts = all_cuts(per, cross);
     assert_eq!(cuts.len(), 20);
     assert!(cuts.windows(2).all(|w| w[0].bar < w[1].bar), "two cuts share a bar: {cuts:?}");
