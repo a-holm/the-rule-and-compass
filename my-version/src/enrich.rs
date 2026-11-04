@@ -2342,14 +2342,15 @@ pub struct GroupPlan {
     /// Columns that stay on the CPU (unsupported names or a CPU dispatch).
     pub cpu_cols: usize,
     pub op: String,
-    /// CPU alternative of this family. A shared pass is split equally among the
-    /// families of its class that stay on the CPU.
+    /// CPU estimate of this family with the whole run on the CPU: a shared pass
+    /// is split equally among the families of its class, so the families sum to
+    /// the run estimate.
     pub cpu_ms: f64,
     pub gpu_ms: f64,
     /// Another family of the run needs the same CPU pass.
     pub pass_shared: bool,
-    /// Share of the shared pass this family adds to the run estimate; zero for a
-    /// family on the device.
+    /// Share of the shared pass this family adds to the planned run: the CPU
+    /// families of a class split it equally, a family on the device adds none.
     pub pass_cpu_ms: f64,
     pub backend: &'static str,
     pub reason: String,
@@ -3293,12 +3294,11 @@ pub fn plan_groups_rated(
         if f.in_pass {
             let pass_ms = mrow * rates.class(f.op).cpu_fixed_ms;
             let cpu_n = cpu_members.get(&f.op.index()).copied().unwrap_or(0);
-            pass_shared = all_members.get(&f.op.index()).copied().unwrap_or(0) > 1;
+            let all_n = all_members.get(&f.op.index()).copied().unwrap_or(1);
+            pass_shared = all_n > 1;
+            pass_share_ms = pass_ms / all_n as f64;
             if !gpu {
                 pass_cpu_ms = pass_ms / cpu_n as f64;
-                pass_share_ms = pass_cpu_ms;
-            } else {
-                pass_share_ms = pass_ms / (cpu_n + 1) as f64;
             }
         }
         let dispatched = backend == "gpu";

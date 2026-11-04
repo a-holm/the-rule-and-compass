@@ -3719,6 +3719,10 @@ fn shared_pass_saved_only_when_all_leave() {
         let both = plan_together(&[("returns", 3, op, 3), ("ma", 3, op, 3)], &rates);
         assert!(both.iter().all(|p| p.backend == "gpu"), "{:?}", op);
         assert!(both.iter().all(|p| p.pass_cpu_ms == 0.0 && p.pass_shared));
+        let alternative: f64 = both.iter().map(|p| p.cpu_ms).sum();
+        let pass_ms = MROW * rates.class(op).cpu_fixed_ms;
+        let col_ms = MROW * rates.class(op).cpu_col_ms;
+        assert!((alternative - (pass_ms + 6.0 * col_ms)).abs() < 1e-6, "{:?}", op);
     }
 }
 
