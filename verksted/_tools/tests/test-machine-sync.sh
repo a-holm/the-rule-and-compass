@@ -17,10 +17,11 @@ check() {
     fails=$((fails + 1))
   fi
 }
-sync() { RCSR_MACHINE_DIR=$T/oc bash "$TOOLS/machine-sync.sh" "$@"; }
+sync() { RCSR_MACHINE_DIR=$T/ocl bash "$TOOLS/machine-sync.sh" "$@"; }
 FILES="one-full-suite.sh desktop-busy.sh build-slot.sh"
 
 mkdir -p "$T/oc"
+ln -s oc "$T/ocl"
 for f in $FILES; do cp "$TOOLS/machine/$f" "$T/oc/$f"; done
 
 out=$(sync --check); rc=$?
@@ -41,10 +42,10 @@ check diff-body "$(echo "$out" | grep -c '^-# change')" 1
 sync --bogus > /dev/null 2>&1
 check usage-rc "$?" 2
 
-( exec 9> "$T/oc/full-suite.lock"; flock 9; exec sleep 60 ) &
+( exec 9> "$T/ocl/full-suite.lock"; flock 9; exec sleep 60 ) &
 bg=$!
 for _ in $(seq 1 50); do
-  flock -n "$T/oc/full-suite.lock" true 2> /dev/null || break
+  flock -n "$T/ocl/full-suite.lock" true 2> /dev/null || break
   sleep 0.1
 done
 sync --install > /dev/null 2>&1

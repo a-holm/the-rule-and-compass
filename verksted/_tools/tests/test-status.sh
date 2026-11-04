@@ -20,6 +20,7 @@ check() {
 g() { git -c user.name=t -c user.email=t@t.invalid "$@"; }
 
 mkdir -p "$T/bin" "$T/oc" "$T/repo"
+ln -s oc "$T/ocl"
 printf '#!/bin/sh\necho "#12 issue/12-x abc1234 2026-11-03T10:00:00Z"\n' > "$T/bin/gh"
 printf '#!/bin/sh\necho "37 %%, 1024 MiB, 12288 MiB"\n' > "$T/bin/nvidia-smi"
 printf '#!/bin/sh\nexit 1\n' > "$T/oc/desktop-busy.sh"
@@ -36,15 +37,15 @@ find "$T/repo/worktrees/old" -name .git -prune -o -type f -exec touch -d '3 hour
 touch "$T/repo/worktrees/new/f"
 rm -rf "$T/repo/worktrees/gone"
 
-( exec 9> "$T/oc/full-suite.lock"; flock 9; exec sleep 60 ) &
+( exec 9> "$T/ocl/full-suite.lock"; flock 9; exec sleep 60 ) &
 bg=$!
 for _ in $(seq 1 50); do
-  flock -n "$T/oc/full-suite.lock" true 2> /dev/null || break
+  flock -n "$T/ocl/full-suite.lock" true 2> /dev/null || break
   sleep 0.1
 done
 
 st() {
-  PATH=$T/bin:$PATH RCSR_ROOT=$T/repo RCSR_BASE=main RCSR_MACHINE_DIR=$T/oc RCSR_XID_CMD='echo 7' \
+  PATH=$T/bin:$PATH RCSR_ROOT=$T/repo RCSR_BASE=main RCSR_MACHINE_DIR=$T/ocl RCSR_XID_CMD='echo 7' \
     bash "$TOOLS/status.sh" --no-fetch "$@"
 }
 out=$(st); rc=$?
