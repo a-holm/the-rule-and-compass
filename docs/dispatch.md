@@ -173,7 +173,7 @@ come from the `f64` rebuild.
 
 The existing arm floors (`median`/`interquartile` 4 096 rows, `maximum` 512
 rows) are expressed through the same planner with a zero-hysteresis
-compatibility calibration, so their measured crossover is unchanged.
+compatibility calibration. The `maximum` fit arm also needs the cost model to prefer the device, which holds above about 3 300 / p rows (#733).
 
 ## The run-level fit rule
 
