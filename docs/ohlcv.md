@@ -1,3 +1,5 @@
+
+The ignored test `measure_fused_cost_on_one_million_rows` produces these numbers: `cargo test --release --features cuda --test features_gpu -- --ignored measure_fused_cost`. No test asserts them. The counted work (two base passes per family, one `f64` download per column) is asserted by `fused_families_pay_two_base_passes_and_one_download_per_column`.
 # OHLCV market-data layer
 
 `rcsr::ohlcv` and `rcsr::features` (issue #125) give market data a typed shape
