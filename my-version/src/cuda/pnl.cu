@@ -48,6 +48,7 @@ typedef struct RcPnlCtx {
     double *d_returns;
     unsigned long long *d_groups;
     float *d_scores;      /* tile_candidates x n, candidate major */
+    double *d_thr;        /* tile_candidates thresholds, refreshed per eval */
     RcPnlTotals *d_partials; /* tile_candidates x nsegments */
 } RcPnlCtx;
 
@@ -203,6 +204,7 @@ void *rc_pnl_create(const double *returns,
     if (rc_checked_malloc((void **)&ctx->d_returns, ret_bytes) != cudaSuccess) goto fail;
     if (rc_checked_malloc((void **)&ctx->d_groups, group_bytes) != cudaSuccess) goto fail;
     if (rc_checked_malloc((void **)&ctx->d_scores, score_bytes) != cudaSuccess) goto fail;
+    if (rc_checked_malloc((void **)&ctx->d_thr, (size_t)tile_candidates * sizeof(double)) != cudaSuccess) goto fail;
     if (rc_checked_malloc((void **)&ctx->d_partials, part_bytes) != cudaSuccess) goto fail;
 
     if (cudaMemcpy(ctx->d_returns, returns, ret_bytes, cudaMemcpyHostToDevice) != cudaSuccess) goto fail;
@@ -213,6 +215,7 @@ fail:
     if (ctx->d_returns) cudaFree(ctx->d_returns);
     if (ctx->d_groups) cudaFree(ctx->d_groups);
     if (ctx->d_scores) cudaFree(ctx->d_scores);
+    if (ctx->d_thr) cudaFree(ctx->d_thr);
     if (ctx->d_partials) cudaFree(ctx->d_partials);
     free(ctx);
     return NULL;
@@ -225,6 +228,7 @@ void rc_pnl_destroy(void *opaque)
     if (ctx->d_returns) cudaFree(ctx->d_returns);
     if (ctx->d_groups) cudaFree(ctx->d_groups);
     if (ctx->d_scores) cudaFree(ctx->d_scores);
+    if (ctx->d_thr) cudaFree(ctx->d_thr);
     if (ctx->d_partials) cudaFree(ctx->d_partials);
     free(ctx);
 }
@@ -263,6 +267,10 @@ int rc_pnl_eval(void *opaque,
     if (cudaMemcpy(ctx->d_scores, scores, score_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
         return 3;
     }
+    if (cudaMemcpy(ctx->d_thr, thresholds, (size_t)candidates * sizeof(double),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        return 3;
+    }
     if (cudaMemset(ctx->d_partials, 0, part_bytes) != cudaSuccess) return 3;
 
     for (long long lo = 0; lo < ctx->n; lo += chunk_rows) {
@@ -271,7 +279,7 @@ int rc_pnl_eval(void *opaque,
         pnl_kernel<<<candidates, threads>>>(ctx->d_returns,
                                             ctx->d_groups,
                                             ctx->d_scores,
-                                            thresholds,
+                                            ctx->d_thr,
                                             side,
                                             ctx->n,
                                             ctx->segment_rows,
