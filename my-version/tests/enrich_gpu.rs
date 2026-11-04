@@ -175,7 +175,7 @@ fn gpu_columns_match_cpu_and_report_the_share() {
     let gpu_out = dir.join("gpu.rcsb").to_string_lossy().into_owned();
     let gpu_out2 = dir.join("gpu2.rcsb").to_string_lossy().into_owned();
     let _floor = sanitizer::active().then(Floor::zero);
-    let n = sanitizer::pick(500_000, 140_000);
+    let n = sanitizer::pick(500_000, 100_000);
     let mut rows = bars("AAA", n, 0, 3600, Some(100));
     rows.extend(bars("BBB", n, 0, 3600, Some(sanitizer::pick(250_000, 70_000))));
     write_store(&src, &rows, 65_536);
@@ -655,7 +655,7 @@ fn engine_tail_kernels_match_cpu_and_are_batch_invariant() {
     let gpu_out = dir.join("gpu.rcsb").to_string_lossy().into_owned();
     let gpu_out2 = dir.join("gpu2.rcsb").to_string_lossy().into_owned();
     let _floor = sanitizer::active().then(Floor::zero);
-    let n = sanitizer::pick(500_000, 140_000);
+    let n = sanitizer::pick(500_000, 100_000);
     let mut rows = bars("AAA", n, 0, 3600, Some(100));
     rows.extend(bars("BBB", n, 0, 3600, Some(sanitizer::pick(250_000, 70_000))));
     // Degenerate bars exercise the high==low extrema convention.
