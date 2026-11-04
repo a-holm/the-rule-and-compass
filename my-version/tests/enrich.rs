@@ -3732,11 +3732,10 @@ fn shared_pass_search_prefers_the_cheaper_side_of_the_whole_run() {
         return;
     }
     let mut rates = enrich::EnrichRates::anchors();
-    // A pass cheaper than two device contexts keeps both families on the CPU
-    // although each family alone would go to the device.
-    rates.classes[OpClass::Py15mPass.index()].cpu_fixed_ms = 400.0;
-    let alone = plan_alone("returns", 3, OpClass::Py15mPass);
-    let _ = alone;
+    // A pass that one device family beats, but that two device families do
+    // not beat (the second adds its columns without a second context), keeps
+    // both families on the CPU.
+    rates.classes[OpClass::Py15mPass.index()].cpu_fixed_ms = 300.0;
     let one = plan_together(&[("returns", 3, OpClass::Py15mPass, 3)], &rates);
     let two = plan_together(
         &[
@@ -4036,4 +4035,33 @@ fn print_calibrated_plans() {
             p.backend, p.cpu_ms, p.gpu_ms
         );
     }
+}
+
+#[test]
+fn device_context_is_paid_once_across_families() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    let rates = enrich::EnrichRates::anchors();
+    assert_eq!(plan_alone("returns", 5, OpClass::Elementwise).backend, "cpu");
+    let together = plan_together(
+        &[
+            ("lags", 20, OpClass::Elementwise, 20),
+            ("returns", 5, OpClass::Elementwise, 5),
+        ],
+        &rates,
+    );
+    assert!(together.iter().all(|p| p.backend == "gpu"), "{:?}", together);
+    // Two CPU-bound families do not seed each other.
+    let none = plan_together(
+        &[
+            ("lags", 5, OpClass::Elementwise, 5),
+            ("returns", 5, OpClass::Elementwise, 5),
+        ],
+        &rates,
+    );
+    assert!(none.iter().all(|p| p.backend == "cpu"), "{:?}", none);
+    // The estimate of a family on its own still carries its context.
+    let alone = plan_alone("lags", 20, OpClass::Elementwise);
+    assert_eq!(alone.gpu_ms.to_bits(), together[0].gpu_ms.to_bits());
 }

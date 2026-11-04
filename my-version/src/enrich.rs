@@ -3097,6 +3097,9 @@ struct FamilyCost {
     /// CPU time of the columns that have a kernel, without any fixed part.
     cpu_supported_s: f64,
     gpu_s: f64,
+    /// Part of `gpu_s` that another family on the device already pays: the
+    /// context and fixed setup. Zero for the fused families.
+    ctx_s: f64,
     /// Decided by a rule before any cost comparison.
     forced: Option<(&'static str, String)>,
 }
@@ -3204,11 +3207,16 @@ pub fn plan_groups_rated(
             cpu_cols_s,
             cpu_supported_s,
             gpu_s,
+            ctx_s: if fused.is_some() { 0.0 } else { context_ms / 1000.0 },
             forced,
         });
     }
 
-    // Decide every family: gpu = true.
+    // Decide every family. The device context (host read, resident upload,
+    // setup) is paid once per run: a family decided while another family is
+    // on the device adds only its marginal cost. Rounds repeat until the
+    // decisions stop changing; a family joins the device only after a seed
+    // family does.
     let mut gpu_wins: Vec<Option<bool>> = fams
         .iter()
         .map(|f| match &f.forced {
@@ -3216,58 +3224,76 @@ pub fn plan_groups_rated(
             None => None,
         })
         .collect();
-    for (i, f) in fams.iter().enumerate() {
-        if f.forced.is_none() && !f.in_pass {
-            let saved_fixed = if f.supported == f.cols { f.cpu_fixed_s } else { 0.0 };
-            gpu_wins[i] = Some(f.gpu_s < saved_fixed + f.cpu_supported_s);
-        }
-    }
-    for pass_op in [OpClass::CompactPass, OpClass::Py15mPass] {
-        let members: Vec<usize> = (0..fams.len())
-            .filter(|&i| fams[i].in_pass && fams[i].op == pass_op)
-            .collect();
-        if members.is_empty() {
-            continue;
-        }
-        let pass_s = mrow * rates.class(pass_op).cpu_fixed_ms / 1000.0;
-        let mut free: Vec<usize> = members
-            .iter()
-            .copied()
-            .filter(|&i| fams[i].forced.is_none())
-            .collect();
-        // A family that stays on the CPU, or leaves a column there, keeps the
-        // pass on the CPU for the whole run.
-        let pinned = members
-            .iter()
-            .any(|&i| gpu_wins[i] == Some(false) || fams[i].supported < fams[i].cols);
-        if pinned {
-            for &i in &free {
-                gpu_wins[i] = Some(fams[i].gpu_s < fams[i].cpu_supported_s);
+    for _ in 0..fams.len() + 2 {
+        let before = gpu_wins.clone();
+        let on_device = |skip: &[usize]| {
+            (0..fams.len()).any(|j| !skip.contains(&j) && before[j] == Some(true))
+        };
+        for (i, f) in fams.iter().enumerate() {
+            if f.forced.is_none() && !f.in_pass {
+                let saved_fixed = if f.supported == f.cols { f.cpu_fixed_s } else { 0.0 };
+                let shared = if on_device(&[i]) { f.ctx_s } else { 0.0 };
+                gpu_wins[i] = Some(f.gpu_s - shared < saved_fixed + f.cpu_supported_s);
             }
-            continue;
         }
-        free.sort_by(|&a, &b| {
-            let da = fams[a].gpu_s - fams[a].cpu_cols_s;
-            let db = fams[b].gpu_s - fams[b].cpu_cols_s;
-            da.partial_cmp(&db)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(fams[a].group.cmp(fams[b].group))
-        });
-        let n = free.len();
-        let mut best_k = 0usize;
-        let mut best_cost = f64::INFINITY;
-        for k in 0..=n {
-            let mut cost = if k < n { pass_s } else { 0.0 };
+        for pass_op in [OpClass::CompactPass, OpClass::Py15mPass] {
+            let members: Vec<usize> = (0..fams.len())
+                .filter(|&i| fams[i].in_pass && fams[i].op == pass_op)
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let pass_s = mrow * rates.class(pass_op).cpu_fixed_ms / 1000.0;
+            let mut free: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|&i| fams[i].forced.is_none())
+                .collect();
+            let elsewhere = on_device(&free);
+            // A family that stays on the CPU, or leaves a column there, keeps
+            // the pass on the CPU for the whole run.
+            let pinned = members.iter().any(|&i| {
+                matches!(&fams[i].forced, Some((backend, _)) if *backend == "cpu")
+                    || fams[i].supported < fams[i].cols
+            });
+            if pinned {
+                for &i in &free {
+                    let shared = if elsewhere { fams[i].ctx_s } else { 0.0 };
+                    gpu_wins[i] = Some(fams[i].gpu_s - shared < fams[i].cpu_supported_s);
+                }
+                continue;
+            }
+            free.sort_by(|&a, &b| {
+                let da = fams[a].gpu_s - fams[a].cpu_cols_s;
+                let db = fams[b].gpu_s - fams[b].cpu_cols_s;
+                da.partial_cmp(&db)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(fams[a].group.cmp(fams[b].group))
+            });
+            let n = free.len();
+            let mut best_k = 0usize;
+            let mut best_cost = f64::INFINITY;
+            for k in 0..=n {
+                let mut cost = if k < n { pass_s } else { 0.0 };
+                for (j, &i) in free.iter().enumerate() {
+                    cost += if j < k {
+                        let shared = if elsewhere || j > 0 { fams[i].ctx_s } else { 0.0 };
+                        fams[i].gpu_s - shared
+                    } else {
+                        fams[i].cpu_cols_s
+                    };
+                }
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_k = k;
+                }
+            }
             for (j, &i) in free.iter().enumerate() {
-                cost += if j < k { fams[i].gpu_s } else { fams[i].cpu_cols_s };
-            }
-            if cost < best_cost {
-                best_cost = cost;
-                best_k = k;
+                gpu_wins[i] = Some(j < best_k);
             }
         }
-        for (j, &i) in free.iter().enumerate() {
-            gpu_wins[i] = Some(j < best_k);
+        if gpu_wins == before {
+            break;
         }
     }
 
