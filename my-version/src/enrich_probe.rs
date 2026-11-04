@@ -236,11 +236,14 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
 
     let anchors = EnrichRates::anchors();
     let mut rates = anchors;
-    rates.write_bps = enrich::measure_write_bandwidth(&dir.0, 128 * 1024 * 1024)?;
+    let mut write_bps: f64 = 0.0;
+    for _ in 0..3 {
+        write_bps = write_bps.max(enrich::measure_write_bandwidth(&dir.0, 64 * 1024 * 1024)?);
+    }
+    rates.write_bps = write_bps;
     let mrow = rows as f64 / 1_000_000.0;
     let mut spread_classes = [1.0; OP_CLASSES];
     let mut context_ms_per_mrow = None;
-    let mut spread_context = 1.0;
     for plan in PLANS.iter() {
         let (n1, n2) = plan.counts;
         let cpu_large = runner.run(plan.large, GpuMode::Off, plan.stage)?;
@@ -261,13 +264,11 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
                 8.0 * (1.0 / GPU_TRANSFER_BYTES_PER_SECOND + 1.0 / GPU_D2H_BYTES_PER_SECOND + 1.0 / rates.write_bps);
             let d_cells = rows as f64 * (n2 - n1) as f64;
             let kernel_s = (gpu_large - gpu_small) - d_cells * per_cell_transfer;
-            rate.gpu_cells_per_s = d_cells / kernel_s.max(d_cells / 1.0e12);
+            rate.gpu_cells_per_s =
+                d_cells / kernel_s.max(d_cells / (enrich::RATE_CLAMP * anchor.gpu_cells_per_s));
             if plan.op == OpClass::Elementwise && matches!(plan.stage, Stage::Feature) {
-                let first = runner.fresh_context(plan.small)?;
-                let second = runner.fresh_context(plan.small)?;
-                let (lo, hi) = (first.min(second), first.max(second));
-                spread_context = if lo > 0.0 { hi / lo } else { 1.0 };
-                context_ms_per_mrow = Some((lo * 1000.0 / mrow).max(1.0));
+                let context_s = runner.fresh_context(plan.small)?;
+                context_ms_per_mrow = Some((context_s * 1000.0 / mrow).max(1.0));
             }
         }
         rates.classes[plan.op.index()] = rate;
@@ -280,7 +281,7 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
     Ok(EnrichCalibration {
         rows,
         rates,
-        spread_context,
+        spread_context: 1.0,
         spread_classes,
     })
 }
