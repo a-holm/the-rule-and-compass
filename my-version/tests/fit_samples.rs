@@ -164,33 +164,26 @@ fn recovers_a_law_with_fit_samples() {
     assert!(best < 1e-6, "best test error = {}", best);
 }
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 /// A temporary CSV that removes itself when the test ends.
 struct TempCsv {
     path: std::path::PathBuf,
+    _scratch: Scratch,
 }
 
 impl TempCsv {
     fn new(contents: &str) -> Self {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SEQ: AtomicUsize = AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "rcsr-fit-samples-{}-{}.csv",
-            std::process::id(),
-            n
-        ));
+        let scratch = Scratch::new("fit-samples");
+        let path = scratch.join("data.csv");
         std::fs::write(&path, contents).expect("write temp csv");
-        TempCsv { path }
+        TempCsv { path, _scratch: scratch }
     }
 
     fn as_str(&self) -> &str {
         self.path.to_str().expect("utf-8 path")
-    }
-}
-
-impl Drop for TempCsv {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 

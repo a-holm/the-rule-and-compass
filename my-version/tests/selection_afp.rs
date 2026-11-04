@@ -5,6 +5,10 @@ use rcsr::data::Sample;
 use rcsr::search::{self, Config, Selection};
 use std::process::Command;
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 fn sample(n: usize) -> Sample {
     let mut x = Vec::with_capacity(n);
     let mut y = Vec::with_capacity(n);
@@ -122,7 +126,8 @@ fn unknown_selection_exits_two() {
 /// spelled out gives the pinned front.
 #[test]
 fn afp_off_is_bit_identical() {
-    let out_path = std::env::temp_dir().join(format!("rcsr-afp-off-{}.tsv", std::process::id()));
+    let scratch = Scratch::new("afp-off");
+    let out_path = scratch.join("front.tsv");
     let out = rcsr(&[
         "--seed", "3", "--islands", "1", "--pop", "60", "--generations", "20",
         "--no-front-parents", "--selection", "lexicographic", "--out",
@@ -130,7 +135,6 @@ fn afp_off_is_bit_identical() {
     ]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let got = std::fs::read_to_string(&out_path).expect("front");
-    let _ = std::fs::remove_file(&out_path);
     let want = "rank\tcomplexity\ttrain_error\ttest_error\texpression\n\
 1\t1\t2.97670764\t3.66924796\t(0.5726 * (0.1305 + x))\n\
 2\t2\t2.17852613\t2.42006255\texp((0.5726 * (0.1305 + x)))\n\

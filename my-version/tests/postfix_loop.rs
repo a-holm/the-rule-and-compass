@@ -12,6 +12,10 @@ use rcsr::expr::{self, Op};
 use rcsr::metrics::Metric;
 use rcsr::search::{self, Config, Outcome, VariationMode};
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 fn sample(n: usize) -> Sample {
     let mut x = Vec::with_capacity(n);
     let mut y = Vec::with_capacity(n);
@@ -130,12 +134,8 @@ fn checkpoint_resume_reproduces_the_uninterrupted_run() {
     let full = cfg(VariationMode::Postfix, 1, 4096, 4);
     let uninterrupted = run(&full, &data, &data);
 
-    let path = std::env::temp_dir().join(format!(
-        "rcsr-122-resume-{}-{:?}.ckpt",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("resume");
+    let path = scratch.join("run.ckpt");
     let short = cfg(VariationMode::Postfix, 1, 4096, 2);
     {
         let out = search::run_resumable(&short, &data, &data, None, 2, |cp| {
@@ -148,7 +148,6 @@ fn checkpoint_resume_reproduces_the_uninterrupted_run() {
     assert_eq!(cp.config.variation, VariationMode::Postfix);
     let resumed = search::run_resumable(&full, &data, &data, Some(cp), 0, |_| {})
         .expect("resume");
-    let _ = std::fs::remove_file(&path);
     assert_eq!(resumed.generations, 4);
     assert_eq!(
         describe(&uninterrupted),

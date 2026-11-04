@@ -15,30 +15,20 @@ fn rcsr(args: &[&str]) -> Output {
         .expect("run rcsr")
 }
 
-struct TempPath(PathBuf);
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+struct TempPath(PathBuf, #[allow(dead_code)] Scratch);
 
 impl TempPath {
     fn new(suffix: &str) -> Self {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SEQ: AtomicUsize = AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        TempPath(std::env::temp_dir().join(format!(
-            "rcsr-manifest-{}-{}-{}",
-            std::process::id(),
-            n,
-            suffix
-        )))
+        let scratch = Scratch::new("manifest");
+        let path = scratch.join(suffix);
+        TempPath(path, scratch)
     }
     fn as_str(&self) -> &str {
         self.0.to_str().expect("utf-8 path")
-    }
-}
-
-impl Drop for TempPath {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-        let _ = std::fs::remove_file(format!("{}.prev", self.as_str()));
-        let _ = std::fs::remove_file(format!("{}.tmp", self.as_str()));
     }
 }
 

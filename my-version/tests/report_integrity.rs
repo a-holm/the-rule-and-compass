@@ -290,25 +290,19 @@ fn rcsr(args: &[&str], envs: &[(&str, &str)], dir: &std::path::Path) -> Output {
     cmd.output().expect("run rcsr")
 }
 
-struct Dir(PathBuf);
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+struct Dir(PathBuf, #[allow(dead_code)] Scratch);
 
 impl Dir {
     fn new(tag: &str) -> Dir {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SEQ: AtomicUsize = AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("rcsr-256-{}-{}-{}", std::process::id(), n, tag));
-        std::fs::create_dir_all(&dir).unwrap();
-        Dir(dir)
+        let scratch = Scratch::new(tag);
+        Dir(scratch.path().to_path_buf(), scratch)
     }
     fn path(&self, name: &str) -> String {
         self.0.join(name).to_string_lossy().into_owned()
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
