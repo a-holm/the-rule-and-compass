@@ -2302,7 +2302,7 @@ impl OpClass {
             OpClass::RollingStd => (170.0, 122.0),
             OpClass::RollingExtrema => (170.0, 59.0),
             OpClass::WilderScan => (170.0, 15.0),
-            OpClass::Rank => (170.0, 67.0),
+            OpClass::Rank => (14.0, 209.0),
             OpClass::Mtf => (170.0, 87.0),
             // #299: per-row BTreeMap lookups; 15 lookup columns on the
             // 16.1M-row panel took 451.1 s (0.54 M cells/s), and the 28-column
@@ -2321,8 +2321,8 @@ impl OpClass {
             OpClass::RollingStd => 100_000_000.0,
             OpClass::RollingExtrema => 56_000_000.0,
             OpClass::WilderScan => 32_000_000.0,
-            OpClass::Rank => 61_000_000.0,
-            OpClass::Mtf => 240_000_000.0,
+            OpClass::Rank => 36_000_000.0,
+            OpClass::Mtf => 80_000_000.0,
             // #299: kernel + D2H of the 28-column family, 451 M cells in 3.78 s.
             OpClass::Join => 100_000_000.0,
             OpClass::Py15mPass => 59_000_000.0,
@@ -3177,6 +3177,16 @@ pub fn plan_groups_rated(
                 "cpu",
                 format!(
                     "{} symbol segments is below the {} segment floor for the fused {} family",
+                    n_segments, FUSED_MIN_SEGMENTS, group
+                ),
+            ))
+        } else if op == OpClass::Mtf && n_segments < FUSED_MIN_SEGMENTS {
+            // The MTF kernels run one thread per symbol segment: a few long
+            // segments leave the device idle.
+            Some((
+                "cpu",
+                format!(
+                    "{} symbol segments is below the {} segment floor for the one-thread-per-segment {} family",
                     n_segments, FUSED_MIN_SEGMENTS, group
                 ),
             ))
@@ -7544,7 +7554,7 @@ fn enrich_inner(
         rates.write_bps = bw;
     }
     let write_bw = rates.write_bps;
-    let mut plans = plan_groups_rated(
+    let plans = plan_groups_rated(
         &fam_counts,
         &gpu_cols,
         store.n_rows(),
@@ -7553,19 +7563,6 @@ fn enrich_inner(
         gpu_available,
         &rates,
     );
-    // #296: the 1.05M paired fixture measured the device MTF phase slower than
-    // the CPU reference (5.08 s vs 6.45 s on two symbol segments). Until a
-    // 16M paired run establishes the crossover, keep the new device path
-    // opt-in with `--gpu on`; `auto` remains the CPU reference.
-    if opts.gpu != GpuMode::On {
-        if let Some(plan) = plans.iter_mut().find(|p| p.group == "mtf" && p.backend == "gpu") {
-            plan.backend = "cpu";
-            plan.gpu_cols = 0;
-            plan.cpu_cols = plan.cols;
-            plan.reason =
-                "MTF device crossover not measured at 16M rows; use --gpu on".to_string();
-        }
-    }
 
     // Input checksum (the same file is copied, not rebuilt).
     let input_sha = manifest::sha256_file(&opts.data)
@@ -9150,8 +9147,8 @@ INPUT / OUTPUT:
                           forces every registered kernel above the 1M-row floor;
                           off runs the CPU reference. The MTF family uses one
                           device resample + causal join per timeframe and keeps
-                          the CPU NaN/gap/bar_age contract; it is opt-in with
-                          --gpu on until the 16M crossover is measured. The
+                          the CPU NaN/gap/bar_age contract; auto plans it from the
+                          cost model and keeps the CPU below 32 symbol segments. The
                           benchmark family (btc_*, eth_*, rel_*, beta_*,
                           cross_ret1, cross_beta20, beta384) joins the BTC/ETH
                           series by exact timestamp on the device (a missing
@@ -9205,10 +9202,11 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
              higher.time + timeframe_seconds <= base.time. Windows count
              higher-timeframe bars; a gap is NaN, and bar_age reports the
              exact seconds since the last closed higher bar. With --features
-             cuda and --gpu on, all 36 columns dispatch to the device resample
-             + causal join (src/cuda/mtf.cu); auto stays on the CPU until the
-             16M crossover is measured. Non-transcendental leaves are bitwise
-             and vol is within 1e-12.
+             cuda, all 36 columns dispatch to the device resample + causal join
+             (src/cuda/mtf.cu) under --gpu on, and under --gpu auto when the
+             cost model estimates it faster and the store has at least 32
+             symbol segments. Non-transcendental leaves are bitwise and vol is
+             within 1e-12.
   compact    the exact 52-column compact regression subset, 15m base, compact
              names and order (r16..don96). It is a parity/smoke subset, not the
              production feature set.

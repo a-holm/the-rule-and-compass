@@ -11,10 +11,15 @@ use crate::enrich::{
 };
 use std::fmt::Write as _;
 
-/// Symbols and bars per symbol of the probe store. The product is the device
+/// Symbols and bars per symbol of the probe store: the shape of the 1M-row,
+/// 109-symbol panel the planner anchors come from. The product reaches the device
 /// dispatch floor, so `--gpu on` really runs the kernels.
-pub const PROBE_SYMBOLS: usize = 50;
-pub const PROBE_BARS: usize = 20_000;
+pub const PROBE_SYMBOLS: usize = 109;
+pub const PROBE_BARS: usize = 9_175;
+
+/// The probe symbol that serves as the benchmark series: the shared compact pass
+/// computes the benchmark columns only when the series exists.
+const PROBE_BENCHMARK: &str = "S000";
 
 /// Which stage seconds carry a class: the feature stage, or the cross-section
 /// stage for the rank class.
@@ -103,9 +108,6 @@ const PLANS: [Plan; 8] = [
     },
 ];
 
-/// The probe's wall clock budget, seconds, for the `rcsr calibrate` summary.
-pub const PROBE_BUDGET_S: f64 = 60.0;
-
 struct ProbeDir(std::path::PathBuf);
 
 impl Drop for ProbeDir {
@@ -116,26 +118,37 @@ impl Drop for ProbeDir {
 
 fn probe_csv() -> String {
     let mut text = String::with_capacity(PROBE_SYMBOLS * PROBE_BARS * 64);
-    text.push_str("ts,symbol,open,high,low,close,volume\n");
+    text.push_str("ts,symbol,open,high,low,close,volume,quote_volume,trades,taker_buy_base\n");
+    // A deterministic random walk with the raw flow columns of a real panel.
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut uniform = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
     for s in 0..PROBE_SYMBOLS {
-        let phase = s as f64 * 0.37;
+        let mut close = 100.0 + s as f64;
         for i in 0..PROBE_BARS {
-            let x = i as f64;
-            let p = 100.0 + 5.0 * (x * 0.37 + phase).sin() + 0.002 * x;
-            let o = p + 0.4 * (x * 0.11 + phase).cos();
-            let c = p + 0.5 * (x * 0.7).sin();
-            let h = o.max(c) + 0.8 + (i % 5) as f64 * 0.03;
-            let l = o.min(c) - 0.7 - (i % 3) as f64 * 0.02;
+            let open = close;
+            let ret = 0.004 * (uniform() + uniform() + uniform() - 1.5);
+            close = open * ret.exp();
+            let high = open.max(close) * (1.0 + 0.002 * uniform());
+            let low = open.min(close) * (1.0 - 0.002 * uniform());
+            let volume = 10.0 + 90.0 * uniform() * uniform();
             let _ = writeln!(
                 text,
-                "{},S{:03},{:.4},{:.4},{:.4},{:.4},{}",
+                "{},S{:03},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.3}",
                 1_700_000_000 + i as i64 * 900,
                 s,
-                o,
-                h,
-                l,
-                c,
-                10 + i % 7
+                open,
+                high,
+                low,
+                close,
+                volume,
+                volume * close,
+                (20.0 + volume * 3.0 * uniform()) as u64,
+                volume * (0.3 + 0.4 * uniform())
             );
         }
     }
@@ -158,6 +171,7 @@ impl Runner {
             dry_run: true,
             allow_lockbox: true,
             calibration: crate::dispatch::CalibrationRequest::Anchors,
+            cross_symbol: PROBE_BENCHMARK.to_string(),
             ..Options::default()
         };
         let report = enrich::build(&opts)?;
@@ -171,6 +185,35 @@ impl Runner {
             Stage::Feature => report.feature_seconds,
             Stage::CrossSection => report.xs_seconds,
         })
+    }
+}
+
+impl Runner {
+    /// Context seconds (host read plus resident upload) of a device run in a
+    /// fresh process: the device initialisation is part of what a real run pays.
+    fn fresh_context(&self, features: &str) -> Result<f64, String> {
+        let exe = std::env::current_exe().map_err(|e| format!("current exe: {}", e))?;
+        let out = std::process::Command::new(exe)
+            .args(["enrich", "--data", &self.store, "--out", &self.out])
+            .args(["--features", features, "--gpu", "on", "--dry-run", "--json"])
+            .args(["--calibration", "anchors", "--cross-symbol", PROBE_BENCHMARK])
+            .output()
+            .map_err(|e| format!("cannot start rcsr enrich: {}", e))?;
+        if !out.status.success() {
+            return Err(format!(
+                "rcsr enrich exited {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let doc = crate::bench_stats::parse_json(&String::from_utf8_lossy(&out.stdout))?;
+        let field = |outer: &str, key: &str| {
+            doc.get(outer)
+                .and_then(|o| o.get(key))
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| format!("rcsr enrich report has no {}.{}", outer, key))
+        };
+        Ok(field("timing", "feature_context_s")? + field("gpu", "h2d_s")?)
     }
 }
 
@@ -220,13 +263,11 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
             let kernel_s = (gpu_large - gpu_small) - d_cells * per_cell_transfer;
             rate.gpu_cells_per_s = d_cells / kernel_s.max(d_cells / 1.0e12);
             if plan.op == OpClass::Elementwise && matches!(plan.stage, Stage::Feature) {
-                let repeat = runner.run(plan.small, GpuMode::On, plan.stage)?;
-                let (lo, hi) = (gpu_small.min(repeat), gpu_small.max(repeat));
+                let first = runner.fresh_context(plan.small)?;
+                let second = runner.fresh_context(plan.small)?;
+                let (lo, hi) = (first.min(second), first.max(second));
                 spread_context = if lo > 0.0 { hi / lo } else { 1.0 };
-                let cells = rows as f64 * n1 as f64;
-                let context_s = lo - cells / rate.gpu_cells_per_s - cells * per_cell_transfer;
-                context_ms_per_mrow =
-                    Some(((context_s * 1000.0 - anchors.fixed_overhead_ms) / mrow).max(1.0));
+                context_ms_per_mrow = Some((lo * 1000.0 / mrow).max(1.0));
             }
         }
         rates.classes[plan.op.index()] = rate;
@@ -255,6 +296,6 @@ mod tests {
             assert_eq!(plan.large.split(',').count(), plan.counts.1, "{:?}", plan.op);
             assert!(plan.counts.0 < plan.counts.1);
         }
-        assert_eq!(PROBE_SYMBOLS * PROBE_BARS, enrich::GPU_MIN_ROWS);
+        assert!(PROBE_SYMBOLS * PROBE_BARS >= enrich::GPU_MIN_ROWS);
     }
 }

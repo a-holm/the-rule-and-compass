@@ -576,8 +576,8 @@ fn measured_rates_set_the_gpu_crossover_per_op_class() {
         (OpClass::RollingStd, Some(2)),
         (OpClass::RollingExtrema, Some(22)),
         (OpClass::WilderScan, None),
-        (OpClass::Rank, Some(7)),
-        (OpClass::Mtf, Some(2)),
+        (OpClass::Rank, Some(2)),
+        (OpClass::Mtf, Some(3)),
         (OpClass::Join, Some(1)),
     ];
     for (op, want) in expected {
@@ -3903,5 +3903,133 @@ fn flags_and_the_rates_schema_are_documented() {
         assert!(text.contains("rcsr-calibration/2"), "{doc}");
         assert!(text.contains("--no-enrich"), "{doc}");
         assert!(text.contains("rcsr enrich") && text.contains("--calibration"), "{doc}");
+    }
+}
+
+#[test]
+fn xs_crossover_is_between_1_and_4_columns() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    let first_gpu = (1..=8usize)
+        .find(|&cols| plan_alone("xs", cols, OpClass::Rank).backend == "gpu")
+        .expect("the device wins some column count up to 8");
+    assert!((2..=4).contains(&first_gpu), "crossover at {first_gpu} columns");
+    assert_eq!(plan_alone("xs", 1, OpClass::Rank).backend, "cpu");
+    assert_eq!(plan_alone("xs", 4, OpClass::Rank).backend, "gpu");
+    for cols in first_gpu..=8 {
+        assert_eq!(plan_alone("xs", cols, OpClass::Rank).backend, "gpu", "{cols} columns");
+    }
+}
+
+/// The plan of every feature set of the #773 table, one family each, at
+/// 1,000,075 rows and 109 symbol segments: (set, group, columns, class, backend).
+const PLAN_773: [(&str, &str, usize, &str, &str); 42] = [
+    ("atr-1", "atr", 1, "wilder-scan", "cpu"),
+    ("atr-c", "atr", 5, "compact-pass", "gpu"),
+    ("atr-p", "atr", 5, "py15m-pass", "gpu"),
+    ("atr-s", "atr", 6, "py15m-pass", "gpu"),
+    ("bollinger-1", "bollinger", 1, "rolling-std", "cpu"),
+    ("bollinger-p", "bollinger", 2, "py15m-pass", "gpu"),
+    ("bollinger-s", "bollinger", 4, "py15m-pass", "gpu"),
+    ("bollinger-s2", "bollinger", 2, "rolling-std", "gpu"),
+    ("btc-c", "btc", 4, "compact-pass", "gpu"),
+    ("calendar-1", "calendar", 1, "calendar-trig", "cpu"),
+    ("calendar-c", "calendar", 2, "compact-pass", "gpu"),
+    ("calendar-s", "calendar", 8, "calendar-trig", "gpu"),
+    ("candle-c", "candle", 1, "compact-pass", "gpu"),
+    ("candle-s", "candle", 1, "elementwise", "cpu"),
+    ("donchian-c", "donchian", 1, "compact-pass", "gpu"),
+    ("donchian-s", "donchian", 1, "rolling-extrema", "cpu"),
+    ("exotic-1", "exotic", 1, "elementwise", "cpu"),
+    ("exotic-c", "exotic", 7, "compact-pass", "gpu"),
+    ("exotic-s", "exotic", 3, "elementwise", "cpu"),
+    ("lags-1", "lags", 1, "elementwise", "cpu"),
+    ("lags-s", "lags", 10, "elementwise", "gpu"),
+    ("ma-1", "ma", 1, "rolling-sum", "cpu"),
+    ("ma-c", "ma", 3, "compact-pass", "gpu"),
+    ("ma-p", "ma", 7, "py15m-pass", "gpu"),
+    ("ma-s", "ma", 7, "py15m-pass", "gpu"),
+    ("ma-s2", "ma", 6, "rolling-sum", "gpu"),
+    ("mtf-1", "mtf", 1, "mtf-join", "cpu"),
+    ("mtf-s", "mtf", 12, "mtf-join", "cpu"),
+    ("returns-1", "returns", 1, "elementwise", "cpu"),
+    ("returns-c", "returns", 3, "compact-pass", "gpu"),
+    ("returns-p", "returns", 1, "py15m-pass", "gpu"),
+    ("returns-s", "returns", 6, "py15m-pass", "gpu"),
+    ("returns-s2", "returns", 8, "elementwise", "gpu"),
+    ("rsi-1", "rsi", 1, "py15m-pass", "gpu"),
+    ("rsi-c", "rsi", 1, "compact-pass", "gpu"),
+    ("rsi-p", "rsi", 2, "py15m-pass", "gpu"),
+    ("rsi-s", "rsi", 2, "py15m-pass", "gpu"),
+    ("vol-1", "vol", 1, "rolling-std", "cpu"),
+    ("vol-c", "vol", 5, "compact-pass", "gpu"),
+    ("vol-s", "vol", 5, "rolling-std", "gpu"),
+    ("xs-1", "xs", 1, "segmented-rank", "cpu"),
+    ("xs-s", "xs", 4, "segmented-rank", "cpu"),
+];
+
+/// Sets whose plan changes against the #773 table: the xs pass is modelled
+/// (xs-s) and the mtf gate is gone (mtf-s).
+const CHANGED_BY_778: [(&str, &str); 2] = [("mtf-s", "gpu"), ("xs-s", "gpu")];
+
+#[test]
+fn single_family_plans_unchanged() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    let mut changed = Vec::new();
+    for (set, group, cols, op, was) in PLAN_773 {
+        let op = OpClass::from_name(op).unwrap_or_else(|| panic!("{set}: class {op}"));
+        let now = plan_alone(group, cols, op).backend;
+        if now != was {
+            changed.push((set, now));
+        }
+    }
+    assert_eq!(changed, CHANGED_BY_778.to_vec());
+}
+
+#[test]
+fn mtf_plan_follows_the_decision() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    // 109 segments: the device wins at 12 and 36 columns, the single column ties to the CPU.
+    assert_eq!(plan_alone("mtf", 12, OpClass::Mtf).backend, "gpu");
+    assert_eq!(plan_alone("mtf", 36, OpClass::Mtf).backend, "gpu");
+    assert_eq!(plan_alone("mtf", 1, OpClass::Mtf).backend, "cpu");
+    // Two segments: the CPU, with the segment floor as the reason; `on` still forces the device.
+    let mut counts = std::collections::BTreeMap::new();
+    counts.insert("mtf", (36usize, OpClass::Mtf));
+    let mut supported = std::collections::BTreeMap::new();
+    supported.insert("mtf", 36usize);
+    let few = enrich::plan_groups_with_segments(&counts, &supported, 1_050_000, 2, GpuMode::Auto, true);
+    assert_eq!(few[0].backend, "cpu");
+    assert!(few[0].reason.contains("2 symbol segments is below the 32 segment floor"), "{}", few[0].reason);
+    let forced = enrich::plan_groups_with_segments(&counts, &supported, 1_050_000, 2, GpuMode::On, true);
+    assert_eq!(forced[0].backend, "gpu");
+    let enough = enrich::plan_groups_with_segments(&counts, &supported, 1_050_000, 32, GpuMode::Auto, true);
+    assert_eq!(enough[0].backend, "gpu");
+}
+
+/// Print the plan of every #773 set under the rates of the calibration file in
+/// `RCSR_CAL`. Ignored: it reads a file `rcsr calibrate` wrote on this machine.
+#[test]
+#[ignore]
+fn print_calibrated_plans() {
+    let path = std::env::var("RCSR_CAL").expect("set RCSR_CAL to a calibration file");
+    let (rates, source) = enrich::resolve_rates(
+        &rcsr::dispatch::CalibrationRequest::File(path.into()),
+        None,
+    )
+    .unwrap();
+    eprintln!("# rates source={}", source.source);
+    for (set, group, cols, op, was) in PLAN_773 {
+        let op = OpClass::from_name(op).unwrap();
+        let p = plan_together(&[(group, cols, op, cols)], &rates).remove(0);
+        eprintln!(
+            "{set} was={was} now={} cpu_ms={:.1} gpu_ms={:.1}",
+            p.backend, p.cpu_ms, p.gpu_ms
+        );
     }
 }
