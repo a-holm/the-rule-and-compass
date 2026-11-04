@@ -41,29 +41,13 @@ struct Plan {
     host_once: bool,
 }
 
-const PLANS: [Plan; 8] = [
+const PLANS: [Plan; 6] = [
     Plan {
         op: OpClass::Elementwise,
         stage: Stage::Feature,
         small: "lag_r1_1,lag_r1_2",
         large: "lag_r1_1,lag_r1_2,lag_r1_3,lag_r1_4,lag_r1_5,lag_r1_6,lag_r1_7,lag_r1_8,lag_r1_9,lag_r1_10",
         counts: (2, 10),
-        host_once: false,
-    },
-    Plan {
-        op: OpClass::Calendar,
-        stage: Stage::Feature,
-        small: "dow_sin,dow_cos",
-        large: "dow_sin,dow_cos,hour_sin,hour_cos,month_sin,month_cos,dom_sin,dom_cos",
-        counts: (2, 8),
-        host_once: false,
-    },
-    Plan {
-        op: OpClass::RollingSum,
-        stage: Stage::Feature,
-        small: "ma5,ma10",
-        large: "ma5,ma10,ma20,ma50,ma100,ma200",
-        counts: (2, 6),
         host_once: false,
     },
     Plan {
@@ -236,11 +220,8 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
 
     let anchors = EnrichRates::anchors();
     let mut rates = anchors;
-    let mut write_bps: f64 = 0.0;
-    for _ in 0..3 {
-        write_bps = write_bps.max(enrich::measure_write_bandwidth(&dir.0, 64 * 1024 * 1024)?);
-    }
-    rates.write_bps = write_bps;
+    // (class index, extra cells, device seconds for those cells)
+    let mut slopes: Vec<(usize, f64, f64)> = Vec::new();
     let mrow = rows as f64 / 1_000_000.0;
     let mut spread_classes = [1.0; OP_CLASSES];
     let mut context_ms_per_mrow = None;
@@ -260,12 +241,8 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
         if device {
             let gpu_small = runner.run(plan.small, GpuMode::On, plan.stage)?;
             let gpu_large = runner.run(plan.large, GpuMode::On, plan.stage)?;
-            let per_cell_transfer =
-                8.0 * (1.0 / GPU_TRANSFER_BYTES_PER_SECOND + 1.0 / GPU_D2H_BYTES_PER_SECOND + 1.0 / rates.write_bps);
             let d_cells = rows as f64 * (n2 - n1) as f64;
-            let kernel_s = (gpu_large - gpu_small) - d_cells * per_cell_transfer;
-            rate.gpu_cells_per_s =
-                d_cells / kernel_s.max(d_cells / (enrich::RATE_CLAMP * anchor.gpu_cells_per_s));
+            slopes.push((plan.op.index(), d_cells, gpu_large - gpu_small));
             if plan.op == OpClass::Elementwise && matches!(plan.stage, Stage::Feature) {
                 let context_s = runner.fresh_context(plan.small)?;
                 context_ms_per_mrow = Some((context_s * 1000.0 / mrow).max(1.0));
@@ -273,6 +250,30 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
         }
         rates.classes[plan.op.index()] = rate;
         spread_classes[plan.op.index()] = 1.0;
+    }
+    // The write term is what a run pays per output cell beyond the bus and the
+    // kernel, fitted from the same runs that set the device rates, so a busy
+    // disk at probe time does not move the plans. Without a device the
+    // filesystem figure stands.
+    let per_cell_bus = 8.0 * (1.0 / GPU_TRANSFER_BYTES_PER_SECOND + 1.0 / GPU_D2H_BYTES_PER_SECOND);
+    let mut implied: Vec<f64> = slopes
+        .iter()
+        .filter_map(|(idx, cells, secs)| {
+            let left = secs / cells - per_cell_bus - 1.0 / anchors.classes[*idx].gpu_cells_per_s;
+            (left > 0.0).then(|| 8.0 / left)
+        })
+        .collect();
+    implied.sort_by(|a, b| a.total_cmp(b));
+    rates.write_bps = match implied.get(implied.len() / 2) {
+        Some(w) => *w,
+        None => enrich::measure_write_bandwidth(&dir.0, 128 * 1024 * 1024)?,
+    };
+    let per_cell_transfer = per_cell_bus + 8.0 / rates.write_bps;
+    for (idx, cells, secs) in &slopes {
+        let kernel_s = secs - cells * per_cell_transfer;
+        let anchor = anchors.classes[*idx].gpu_cells_per_s;
+        rates.classes[*idx].gpu_cells_per_s =
+            cells / kernel_s.max(cells / (enrich::RATE_CLAMP * anchor));
     }
     if let Some(ctx) = context_ms_per_mrow {
         rates.context_ms_per_mrow = ctx;
