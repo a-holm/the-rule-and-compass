@@ -2254,7 +2254,7 @@ impl OpClass {
     }
     /// CPU cost in milliseconds per million rows: a part paid once per family
     /// and a part per column. Both include the per-value temp write and hash
-    /// that both arms pay. Measured on a 1,000,075-row, 109-symbol 15 m store.
+    /// that both arms pay.
     fn cpu_ms_per_mrow(self) -> (f64, f64) {
         match self {
             OpClass::Elementwise => (170.0, 56.0),
@@ -2273,8 +2273,7 @@ impl OpClass {
             OpClass::CompactPass => (13780.0, 0.0),
         }
     }
-    /// Device kernel throughput in cells per second. Pooled over the columns
-    /// measured for the class; the kernel is a small part of the device time.
+    /// Device kernel throughput in cells per second.
     fn gpu_cells_per_second(self) -> f64 {
         match self {
             OpClass::Elementwise => 230_000_000.0,
