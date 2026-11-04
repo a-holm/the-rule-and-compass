@@ -5,10 +5,11 @@
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/fakes.sh"
 TOOLS=$HERE/..
 T=$(mktemp -d)
-bg=""
-cleanup() { [ -z "$bg" ] || kill $bg 2> /dev/null; rm -rf "$T"; }
+
+cleanup() { [ -z "${HOLD_PID:-}" ] || release; rm -rf "$T"; }
 trap cleanup EXIT
 fails=0
 check() {
@@ -33,19 +34,17 @@ g -C "$T/repo" worktree add -q -b issue/1-old "$T/repo/worktrees/old"
 g -C "$T/repo" worktree add -q -b issue/2-new "$T/repo/worktrees/new"
 g -C "$T/repo" worktree add -q -b issue/3-gone "$T/repo/worktrees/gone"
 echo x > "$T/repo/worktrees/old/f"
-find "$T/repo/worktrees/old" -name .git -prune -o -type f -exec touch -d '3 hours ago' {} +
-touch "$T/repo/worktrees/new/f"
+find "$T/repo/worktrees/old" -name .git -prune -o -type f -exec touch -d @1799989200 {} +
+touch -d @1799999940 "$T/repo/worktrees/new/f"
 rm -rf "$T/repo/worktrees/gone"
 
-( exec 9> "$T/ocl/full-suite.lock"; flock 9; exec sleep 60 ) &
-bg=$!
-for _ in $(seq 1 50); do
-  flock -n "$T/ocl/full-suite.lock" true 2> /dev/null || break
-  sleep 0.1
-done
+hold "exec 9> $(printf %q "$T/ocl/full-suite.lock") && flock 9"; check holder-ready $? 0
+mkdir -p "$T/clk"; fake_clock "$T/clk"
+export VCLOCK=$T/clock
+vclock_reset; echo 1800000000 > "$VCLOCK/now"
 
 st() {
-  PATH=$T/bin:$PATH RCSR_ROOT=$T/repo RCSR_BASE=main RCSR_MACHINE_DIR=$T/ocl RCSR_XID_CMD='echo 7' \
+  PATH=$T/clk:$T/bin:$PATH RCSR_ROOT=$T/repo RCSR_BASE=main RCSR_MACHINE_DIR=$T/ocl RCSR_XID_CMD='echo 7' \
     bash "$TOOLS/status.sh" --no-fetch "$@"
 }
 out=$(st); rc=$?
@@ -53,9 +52,9 @@ check rc "$rc" 0
 for s in git agents machine; do check "header-$s" "$(echo "$out" | grep -c "^== $s\$")" 1; done
 check tip "$(echo "$out" | grep -c '^origin/main: .* tip subject$')" 1
 check pr "$(echo "$out" | grep -c '#12 issue/12-x abc1234')" 1
-check holder "$(echo "$out" | grep -c "^lock: held by pid $bg ")" 1
-check silent-old "$(echo "$out" | grep -c '^old: .*dirty=y.* SILENT$')" 1
-check not-silent-new "$(echo "$out" | grep '^new: ' | grep -c SILENT)" 0
+check holder "$(echo "$out" | grep -c "^lock: held by pid $HOLD_PID ")" 1
+check silent-old "$(echo "$out" | grep -c '^old: .*dirty=y idle=180min SILENT$')" 1
+check new-idle "$(echo "$out" | grep -c '^new: .* idle=1min$')" 1
 check missing "$(echo "$out" | grep -c '^gone: missing$')" 1
 check gpu "$(echo "$out" | grep -c '^gpu: 37 %, 1024 MiB, 12288 MiB$')" 1
 check xid "$(echo "$out" | grep -c '^xid: 7$')" 1
@@ -67,9 +66,7 @@ check pause "$(st --section machine | grep -c '^flags: PAUSE=y')" 1
 only=$(st --section machine)
 check section-only "$(echo "$only" | grep -c '^== ')" 1
 
-kill $bg 2> /dev/null
-wait $bg 2> /dev/null
-bg=""
+release
 check lock-free "$(st --section machine | grep -c '^lock: free$')" 1
 
 st --section bogus > /dev/null 2>&1

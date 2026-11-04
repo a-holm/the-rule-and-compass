@@ -4,6 +4,7 @@
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/fakes.sh"
 RC=$HERE/../rc-run.sh
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -24,6 +25,7 @@ has() {
 }
 
 mkdir -p "$T/gates" "$T/wt/my-version" "$T/bin"
+fake_timeout "$T/bin"
 touch "$T/wt/my-version/Cargo.toml"
 echo 4 > "$T/xid"
 for kind in slot lock; do
@@ -45,7 +47,7 @@ chmod +x "$T/bin/show-args"
 
 rc() {
   env -u CARGO_TARGET_DIR RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
-    RCSR_XID_CMD="cat '$T/xid'" PATH="$T/bin:$PATH" "$@"
+    RCSR_XID_CMD="cat '$T/xid'" PATH="$T/bin:$PATH" FAKE_TIMEOUT_LOG="$T/timeouts" "$@"
 }
 log=$T/gates/issue9-t.log
 
@@ -58,6 +60,7 @@ check build-stdout-first "$(echo "$out" | head -n 1)" "$log"
 check build-stdout-last "$(echo "$out" | tail -n 1 | cut -d' ' -f1-2)" "RC_DONE rc=0"
 check build-no-xid "$(grep -c '^xid ' "$log")" "0"
 check build-last-line "$(tail -n 1 "$log" | cut -d' ' -f1-2)" "RC_DONE rc=0"
+check build-limit "$(head -n 1 "$T/timeouts")" "1500 show-args a"
 has build-jobs "$log" 'jobs=2'
 has build-noarch "$log" 'arch=none'
 has build-cwd "$log" "pwd=$T/wt/my-version"
@@ -86,14 +89,16 @@ check exit3-rc "$r" "3"
 check exit3-done "$(echo "$out" | tail -n 1 | cut -d' ' -f1-2)" "RC_DONE rc=3"
 check exit3-log "$(tail -n 1 "$log" | cut -d' ' -f1-2)" "RC_DONE rc=3"
 
-# a real timeout gives 124 and still ends with RC_DONE
+# a timeout gives 124 and still ends with RC_DONE
 cat > "$T/bin/hang" <<'STUB'
 #!/usr/bin/env bash
-sleep 30
+echo "hang ran" >&2
+exit 99
 STUB
 chmod +x "$T/bin/hang"
 rc bash "$RC" run "$T/wt" 9 t --timeout 1 -- hang > /dev/null; r=$?
 check timeout-rc "$r" "124"
+check timeout-limit "$(tail -n 1 "$T/timeouts")" "1 hang"
 check timeout-last "$(tail -n 1 "$log" | cut -d' ' -f1-2)" "RC_DONE rc=124"
 
 # slot or lock give-up (75) passes through
