@@ -669,7 +669,7 @@ mod device {
         let bytes = gpu.stats().d2h_bytes;
         let _ = gpu.flow_all(&flow).unwrap();
         let _ = gpu.price_action_all(&pa).unwrap();
-        assert_eq!(gpu.base_passes() - passes, 5, "two base kernels per family");
+        assert_eq!(gpu.base_passes() - passes, 4, "two base kernels per family");
         assert_eq!(
             gpu.stats().d2h_bytes - bytes,
             ((flow.len() + pa.len()) * all.len() * 8) as u64,
