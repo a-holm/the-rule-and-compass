@@ -926,7 +926,7 @@ fn static_cuts(per: usize) -> Vec<Cut> {
     .collect()
 }
 
-const WARMUP_CROSS: &str = "xs_rank_r99";
+const WARMUP_CROSS: &str = "xs_rank_r16";
 
 fn warmup(name: &str) -> usize {
     enrich::default_registry()
