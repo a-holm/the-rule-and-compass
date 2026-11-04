@@ -754,7 +754,7 @@ order.
 The CPU path is always present. `plan_groups` estimates CPU time and GPU time
 (kernel + transfers + the one-time resident upload) per family from rows,
 output columns and operation class (elementwise, calendar trig, rolling
-sum/std/extrema, Wilder scan, segmented rank, join). Cost model v2 (#300) adds
+sum/std/extrema, Wilder scan, segmented rank, mtf join, join, and the shared CPU passes). Cost model v2 (#300) adds
 the output write explicitly:
 
 ```text
@@ -775,6 +775,23 @@ registered for those columns, and the estimated GPU time is *strictly* lower
 than the CPU time. The context and source columns are uploaded once per run; a
 second family does not re-upload `time/open/high/low/close/volume/
 quote_volume`.
+
+**Measured generic rates.** Families other than flow and price_action use the per-class constants in `enrich::OpClass` (CPU `fixed + per column`, device kernel throughput) and `GPU_CONTEXT_MS_PER_MROW`, `GPU_FIXED_OVERHEAD_MS`. They were measured on a 1,000,075-row, 109-symbol, 15 m store with five interleaved CPU/GPU pairs per column set (`verksted/_tools/ab-pair.sh`). CPU cost in ms per Mrow:
+
+| class | fixed | per column |
+|---|---:|---:|
+| elementwise | 170 | 56 |
+| calendar-trig, rolling-sum | 170 | 83 |
+| rolling-std | 170 | 122 |
+| rolling-extrema | 170 | 59 |
+| wilder-scan | 170 | 15 |
+| segmented-rank | 170 | 67 |
+| mtf-join | 170 | 87 |
+| join | 0 | 2778 |
+| py15m-pass | 1780 | 45 |
+| compact-pass | 13780 | 0 |
+
+The two pass classes mark a family with a column that only a shared CPU reference pass computes (the py15m pass for names such as `ema8`, `rsi6`, `bb50`; the compact pass for names such as `r16`, `ma96`, `vol16`, `don96`). That pass costs the same for one column or all of them, and the device skips it only when it takes every column of the family. A family with a column left on the CPU keeps the pass, so the device saves only the per-column part. Re-measure the table when the CPU producers or the kernels change; `tests/enrich.rs::measured_rates_set_the_gpu_crossover_per_op_class` pins the column counts at which the plan flips.
 
 `--gpu auto` (the default) applies the cost model. `--gpu on` *forces* every
 registered kernel above the row floor, which is how the parity fixture exercises

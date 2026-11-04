@@ -2208,6 +2208,11 @@ pub fn peak_rss_bytes() -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Operation class a feature family reduces to.
+///
+/// `Py15mPass` and `CompactPass` mark a family with at least one column that
+/// only a shared CPU reference pass computes. That pass costs the same for one
+/// column or for all of them, so the device wins by taking every column of the
+/// family and so skipping the pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpClass {
     Elementwise,
@@ -2217,7 +2222,10 @@ pub enum OpClass {
     RollingExtrema,
     WilderScan,
     Rank,
+    Mtf,
     Join,
+    Py15mPass,
+    CompactPass,
 }
 
 impl OpClass {
@@ -2230,44 +2238,57 @@ impl OpClass {
             OpClass::RollingExtrema => "rolling-extrema",
             OpClass::WilderScan => "wilder-scan",
             OpClass::Rank => "segmented-rank",
+            OpClass::Mtf => "mtf-join",
             OpClass::Join => "join",
+            OpClass::Py15mPass => "py15m-pass",
+            OpClass::CompactPass => "compact-pass",
         }
     }
-    fn cpu_cells_per_second(self) -> f64 {
-        // Calibrated on the 3.875M-row store (2026-10-21), including the
-        // per-value temp write and hash that both arms pay. These are measured
-        // throughputs, not peak-core claims.
+    /// Order in which a family takes the class of its costliest shared pass.
+    pub fn pass_rank(self) -> u8 {
         match self {
-            OpClass::Elementwise => 15_000_000.0,
-            OpClass::Calendar => 10_000_000.0,
-            OpClass::RollingSum => 12_000_000.0,
-            OpClass::RollingStd => 10_000_000.0,
-            OpClass::RollingExtrema => 15_000_000.0,
-            OpClass::WilderScan => 20_000_000.0,
-            OpClass::Rank => 4_000_000.0,
+            OpClass::CompactPass => 2,
+            OpClass::Py15mPass => 1,
+            _ => 0,
+        }
+    }
+    /// CPU cost in milliseconds per million rows: a part paid once per family
+    /// and a part per column. Both include the per-value temp write and hash
+    /// that both arms pay. Measured on a 1,000,075-row, 109-symbol 15 m store.
+    fn cpu_ms_per_mrow(self) -> (f64, f64) {
+        match self {
+            OpClass::Elementwise => (170.0, 56.0),
+            OpClass::Calendar => (170.0, 83.0),
+            OpClass::RollingSum => (170.0, 83.0),
+            OpClass::RollingStd => (170.0, 122.0),
+            OpClass::RollingExtrema => (170.0, 59.0),
+            OpClass::WilderScan => (170.0, 15.0),
+            OpClass::Rank => (170.0, 67.0),
+            OpClass::Mtf => (170.0, 87.0),
             // #299: per-row BTreeMap lookups; 15 lookup columns on the
             // 16.1M-row panel took 451.1 s (0.54 M cells/s), and the 28-column
             // family with 7 rolling-beta columns 1250.6 s (0.36 M cells/s).
-            OpClass::Join => 360_000.0,
+            OpClass::Join => (0.0, 2777.8),
+            OpClass::Py15mPass => (1780.0, 45.0),
+            OpClass::CompactPass => (13780.0, 0.0),
         }
     }
+    /// Device kernel throughput in cells per second. Pooled over the columns
+    /// measured for the class; the kernel is a small part of the device time.
     fn gpu_cells_per_second(self) -> f64 {
-        // Conservative f64 figures for the RTX 3060; f64 is 1/64 of f32 on
-        // consumer Ampere, so these are deliberately far below a TFLOPS claim.
-        // Sequential one-thread-per-segment kernels are slower per cell than
-        // the CPU, which is why their rows below sit under the CPU rate.
         match self {
-            OpClass::Elementwise => 350_000_000.0,
-            OpClass::Calendar => 300_000_000.0,
-            OpClass::RollingSum => 100_000_000.0,
-            OpClass::RollingStd => 60_000_000.0,
-            // #298 blocked extrema: 4.58 ms for 1M rows at w=96 on the RTX
-            // 3060 (218M rows/s). 180M is the conservative planner figure.
-            OpClass::RollingExtrema => 180_000_000.0,
-            OpClass::WilderScan => 8_000_000.0,
-            OpClass::Rank => 40_000_000.0,
+            OpClass::Elementwise => 230_000_000.0,
+            OpClass::Calendar => 6_900_000_000.0,
+            OpClass::RollingSum => 700_000_000.0,
+            OpClass::RollingStd => 100_000_000.0,
+            OpClass::RollingExtrema => 56_000_000.0,
+            OpClass::WilderScan => 32_000_000.0,
+            OpClass::Rank => 61_000_000.0,
+            OpClass::Mtf => 240_000_000.0,
             // #299: kernel + D2H of the 28-column family, 451 M cells in 3.78 s.
             OpClass::Join => 100_000_000.0,
+            OpClass::Py15mPass => 59_000_000.0,
+            OpClass::CompactPass => 36_000_000.0,
         }
     }
 }
@@ -2642,12 +2663,10 @@ pub fn measure_write_bandwidth(dir: &Path, bytes: u64) -> Result<f64, String> {
 }
 
 /// Fixed per-run device setup (context, probe, launch glue).
-pub const GPU_FIXED_OVERHEAD_MS: f64 = 50.0;
+pub const GPU_FIXED_OVERHEAD_MS: f64 = 85.0;
 /// One-time host read of the source columns plus the resident upload, per
-/// million rows. Measured at roughly 0.65 s/Mrow on the 3.875M-row store; it is
-/// why a ten-column family does not pay for a GPU pass even though its kernel
-/// is milliseconds long.
-pub const GPU_CONTEXT_MS_PER_MROW: f64 = 650.0;
+/// million rows. A family pays it once, however few columns the kernel makes.
+pub const GPU_CONTEXT_MS_PER_MROW: f64 = 168.0;
 
 pub fn plan_groups(
     counts: &BTreeMap<&'static str, (usize, OpClass)>,
@@ -2742,14 +2761,11 @@ pub fn plan_groups_full(
     };
     for (group, (cols, op)) in counts {
         let op = *op;
-        let cells = n_rows.saturating_mul(*cols).max(1) as f64;
+        let mrow = n_rows as f64 / 1_000_000.0;
+        let (cpu_fixed_ms, cpu_column_ms) = op.cpu_ms_per_mrow();
         let cpu_s = match crate::features_gpu::fused_cost(group) {
-            Some(cost) => {
-                cost.cpu_ms_per_mrow_column * (n_rows as f64 / 1_000_000.0)
-                    * (*cols as f64)
-                    / 1000.0
-            }
-            None => cells / op.cpu_cells_per_second(),
+            Some(cost) => cost.cpu_ms_per_mrow_column * mrow * (*cols as f64) / 1000.0,
+            None => mrow * (cpu_fixed_ms + cpu_column_ms * *cols as f64) / 1000.0,
         };
         let supported = (*gpu_cols.get(group).unwrap_or(&0)).min(*cols);
         let gpu_cells_n = n_rows.saturating_mul(supported).max(1);
@@ -2775,12 +2791,15 @@ pub fn plan_groups_full(
                 + transfer_bytes / GPU_D2H_BYTES_PER_SECOND
                 + transfer_bytes / write_bps
         };
+        // CPU time the device would remove. The fixed part (the shared CPU pass
+        // for a pass class) goes away only when no column of the family stays
+        // on the CPU.
         let cpu_supported_s = match crate::features_gpu::fused_cost(group) {
-            Some(cost) => {
-                cost.cpu_ms_per_mrow_column * (n_rows as f64 / 1_000_000.0) * (supported as f64)
-                    / 1000.0
+            Some(cost) => cost.cpu_ms_per_mrow_column * mrow * (supported as f64) / 1000.0,
+            None => {
+                let fixed = if supported == *cols { cpu_fixed_ms } else { 0.0 };
+                mrow * (fixed + cpu_column_ms * supported as f64) / 1000.0
             }
-            None => gpu_cells / op.cpu_cells_per_second(),
         };
         let (backend, reason) = if gpu_requested == GpuMode::Off {
             ("cpu", "GPU disabled by --no-gpu/--cpu".to_string())
@@ -6980,7 +6999,11 @@ fn enrich_inner(
     let (gpu_available, gpu_device) = (gpu.available(), gpu.device.clone());
     let mut fam_counts: BTreeMap<&'static str, (usize, OpClass)> = BTreeMap::new();
     let classify = |name: &str| -> OpClass {
-        if name.starts_with("xs_") {
+        if compact_requested.iter().any(|c| c == name) {
+            OpClass::CompactPass
+        } else if py15m_requested.iter().any(|c| c == name) {
+            OpClass::Py15mPass
+        } else if name.starts_with("xs_") {
             OpClass::Rank
         } else if crate::features_gpu::is_device_flow(name) {
             OpClass::RollingStd
@@ -7029,8 +7052,7 @@ fn enrich_inner(
         {
             OpClass::Join
         } else if is_mtf(name) {
-            // Higher-timeframe resample + monotone causal join.
-            OpClass::Join
+            OpClass::Mtf
         } else {
             OpClass::Elementwise
         }
@@ -7038,7 +7060,11 @@ fn enrich_inner(
     let mut gpu_cols: BTreeMap<&'static str, usize> = BTreeMap::new();
     for n in requested.iter() {
         let fam = family_of(n);
-        let e = fam_counts.entry(fam).or_insert((0, classify(n)));
+        let class = classify(n);
+        let e = fam_counts.entry(fam).or_insert((0, class));
+        if class.pass_rank() > e.1.pass_rank() {
+            e.1 = class;
+        }
         e.0 += 1;
         if gpu_supports(n) {
             *gpu_cols.entry(fam).or_insert(0) += 1;

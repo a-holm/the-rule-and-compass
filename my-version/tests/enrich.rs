@@ -536,6 +536,98 @@ fn cost_model_v2_charges_the_measured_write_and_a_slow_disk_flips_the_verdict() 
     assert_eq!(default[0].gpu_ms, fast[0].gpu_ms);
 }
 
+/// Smallest column count at which `Auto` plans the GPU for a family of one op
+/// class at 1,000,000 rows and 109 symbol segments, or `None` when the CPU
+/// stays cheaper up to 300 columns. Counts columns, never time.
+fn first_gpu_column_count(op: OpClass) -> Option<usize> {
+    let mut first = None;
+    for cols in 1..=300usize {
+        let mut counts = std::collections::BTreeMap::new();
+        counts.insert("family", (cols, op));
+        let mut supported = std::collections::BTreeMap::new();
+        supported.insert("family", cols);
+        let plan = enrich::plan_groups_with_segments(
+            &counts,
+            &supported,
+            1_000_000,
+            109,
+            GpuMode::Auto,
+            true,
+        );
+        let gpu = plan[0].backend == "gpu";
+        match (first, gpu) {
+            (None, true) => first = Some(cols),
+            (Some(_), false) => panic!("{:?} returns to the CPU at {} columns", op, cols),
+            _ => {}
+        }
+    }
+    first
+}
+
+#[test]
+fn measured_rates_set_the_gpu_crossover_per_op_class() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    let expected = [
+        (OpClass::Elementwise, Some(6)),
+        (OpClass::Calendar, Some(2)),
+        (OpClass::RollingSum, Some(2)),
+        (OpClass::RollingStd, Some(2)),
+        (OpClass::RollingExtrema, Some(22)),
+        (OpClass::WilderScan, None),
+        (OpClass::Rank, Some(7)),
+        (OpClass::Mtf, Some(2)),
+        (OpClass::Join, Some(1)),
+    ];
+    for (op, want) in expected {
+        assert_eq!(first_gpu_column_count(op), want, "{:?}", op);
+    }
+}
+
+#[test]
+fn shared_pass_families_plan_the_gpu_only_when_it_takes_every_column() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    for op in [OpClass::Py15mPass, OpClass::CompactPass] {
+        for cols in 1..=100usize {
+            let mut counts = std::collections::BTreeMap::new();
+            counts.insert("family", (cols, op));
+            for supported_cols in [cols, cols - 1] {
+                let mut supported = std::collections::BTreeMap::new();
+                supported.insert("family", supported_cols);
+                let plan = enrich::plan_groups_with_segments(
+                    &counts,
+                    &supported,
+                    1_000_000,
+                    109,
+                    GpuMode::Auto,
+                    true,
+                );
+                let want = if supported_cols == cols { "gpu" } else { "cpu" };
+                assert_eq!(
+                    plan[0].backend, want,
+                    "{:?} with {} of {} columns on the device",
+                    op, supported_cols, cols
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_pass_cpu_estimate_does_not_grow_with_the_compact_column_count() {
+    let cpu_ms = |cols: usize| {
+        let mut counts = std::collections::BTreeMap::new();
+        counts.insert("family", (cols, OpClass::CompactPass));
+        let mut supported = std::collections::BTreeMap::new();
+        supported.insert("family", cols);
+        enrich::plan_groups(&counts, &supported, 1_000_000, GpuMode::Off, true)[0].cpu_ms
+    };
+    assert_eq!(cpu_ms(1), cpu_ms(50));
+}
+
 #[test]
 fn output_stage_is_bounded_at_64_mib_for_any_column_count() {
     let wide = rcsr::memory::enrich_output_stage_bytes(16_000_000, 358);
