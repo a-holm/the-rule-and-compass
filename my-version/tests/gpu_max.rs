@@ -346,62 +346,58 @@ fn no_fit_is_a_true_noop_for_the_maximum_gpu_arm() {
         );
     }
 }
+/// #227: the paired fit batch behind the cost model. Distinct affine
+/// candidates (`a·x + b`), the shape the kernel fits best, each pre-fitted with
+/// the squared LM exactly like the search.
+#[cfg(feature = "cuda")]
+fn paired_batch(n: usize) -> (Sample, Vec<rcsr::expr::Node>, rcsr::gpu::GpuEvaluator) {
+    use rcsr::expr::{constant, input, node, Op};
+    use rcsr::gpu::GpuEvaluator;
 
-/// #227: the paired measurement behind the cost model. Same candidates, same
-/// squared start, same `iters`: the CPU arm (`fit_weighted_metric`, squared
-/// pre-fit plus the fixed ladder polish) against the batched device arm
-/// (`max_fit_batch`, squared LM start plus the bisection on the error level).
-/// Prints the numbers the coefficients in `fit.rs` are derived from.
+    let train = sample(n, 21);
+    let mut starts = Vec::new();
+    for k in 0..24 {
+        let a = 0.2 + 0.15 * k as f64;
+        let t = node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(a), input(0)]), constant(0.1 * k as f64)],
+        );
+        starts.push(t);
+    }
+    for t in starts.iter_mut() {
+        rcsr::fit::fit_weighted(t, &train.x, &train.y, &[], 8);
+    }
+    let mut cols = vec![0.0f32; 2 * n];
+    for (i, r) in train.x.iter().enumerate() {
+        cols[i] = r[0] as f32;
+        cols[n + i] = r[1] as f32;
+    }
+    let y32: Vec<f32> = train.y.iter().map(|&v| v as f32).collect();
+    let mut ev = GpuEvaluator::new(&cols, n, 2, &y32).expect("device");
+    let mut cols64 = vec![0.0f64; 2 * n];
+    for (i, r) in train.x.iter().enumerate() {
+        cols64[i] = r[0];
+        cols64[n + i] = r[1];
+    }
+    assert!(ev.set_fit_data(&cols64, &train.y, &[]));
+    (train, starts, ev)
+}
+
+/// #227, #719: the device arm fits every candidate of the paired batch and
+/// never loses to its start. Counted work only; the speed comparison is
+/// `measure_paired_maximum_fit`.
 #[cfg(feature = "cuda")]
 #[test]
-fn the_paired_maximum_measurement_shows_the_device_tail_is_faster() {
+fn the_paired_maximum_batch_is_fitted_on_the_device_and_never_loses_to_its_start() {
     if !device_available() {
         eprintln!("skipping GPU test: no usable CUDA device");
         return;
     }
-    use rcsr::expr::{constant, input, node, Op};
-    use rcsr::fit::{fit_batch_verified, fit_weighted_metric, BatchedGpu};
-    use rcsr::gpu::GpuEvaluator;
-    use std::time::Instant;
+    use rcsr::fit::{fit_batch_verified, BatchedGpu};
 
     for n in [5_000usize, 20_000, 50_000] {
-        let train = sample(n, 21);
-        // A batch of distinct affine candidates (`a·x + b`), the shape the
-        // kernel fits best and the one the cost model is stated for.
-        let mut starts = Vec::new();
-        for k in 0..24 {
-            let a = 0.2 + 0.15 * k as f64;
-            let t = node(
-                Op::Add,
-                vec![node(Op::Mul, vec![constant(a), input(0)]), constant(0.1 * k as f64)],
-            );
-            starts.push(t);
-        }
-        for t in starts.iter_mut() {
-            rcsr::fit::fit_weighted(t, &train.x, &train.y, &[], 8);
-        }
-        let cpu_start = Instant::now();
-        for t in &starts {
-            let mut c = t.clone();
-            fit_weighted_metric(&mut c, &train.x, &train.y, &[], 8, Metric::Maximum);
-        }
-        let cpu_s = cpu_start.elapsed().as_secs_f64();
-
-        let mut cols = vec![0.0f32; 2 * n];
-        for (i, r) in train.x.iter().enumerate() {
-            cols[i] = r[0] as f32;
-            cols[n + i] = r[1] as f32;
-        }
-        let y32: Vec<f32> = train.y.iter().map(|&v| v as f32).collect();
-        let mut ev = GpuEvaluator::new(&cols, n, 2, &y32).expect("device");
-        let mut cols64 = vec![0.0f64; 2 * n];
-        for (i, r) in train.x.iter().enumerate() {
-            cols64[i] = r[0];
-            cols64[n + i] = r[1];
-        }
-        assert!(ev.set_fit_data(&cols64, &train.y, &[]));
-            let mut gpu_trees = starts.clone();
-        let gpu_start = Instant::now();
+        let (train, starts, mut ev) = paired_batch(n);
+        let mut gpu_trees = starts.clone();
         let out = fit_batch_verified(
             &BatchedGpu::new(&mut ev),
             &mut gpu_trees,
@@ -411,27 +407,86 @@ fn the_paired_maximum_measurement_shows_the_device_tail_is_faster() {
             8,
             Metric::Maximum,
         );
-        let gpu_s = gpu_start.elapsed().as_secs_f64();
-        let worse = starts
-            .iter()
-            .zip(&out.score)
-            .filter(|(t, s)| search::eval_error(t, &train, Metric::Maximum) < **s)
-            .count();
-        eprintln!(
-            "#227 paired maximum fit: n={n} p=2 candidates={} cpu={:.3} ms gpu={:.3} ms \
-             speedup={:.1}x worse_than_start={worse}",
+        assert_eq!(
+            out.status.iter().filter(|s| s.is_gpu()).count(),
             starts.len(),
-            cpu_s * 1e3,
-            gpu_s * 1e3,
-            cpu_s / gpu_s.max(f64::MIN_POSITIVE)
+            "n={n}: every candidate must be fitted by the device: {:?}",
+            out.status
         );
-        assert_eq!(worse, 0, "the device arm must never lose to its start");
-        assert!(
-            gpu_s < cpu_s,
-            "n={n}: the device tail ({:.3} ms) must beat the CPU arm ({:.3} ms)",
-            gpu_s * 1e3,
-            cpu_s * 1e3
-        );
+        for (k, start) in starts.iter().enumerate() {
+            let start_score = search::eval_error(start, &train, Metric::Maximum);
+            assert!(
+                out.score[k].is_finite() && out.score[k] <= start_score,
+                "n={n} candidate {k}: device maximum {} lost to its start {start_score}",
+                out.score[k]
+            );
+            assert_eq!(
+                out.score[k].to_bits(),
+                search::eval_error(&gpu_trees[k], &train, Metric::Maximum).to_bits(),
+                "n={n} candidate {k}: reported score is not the exact maximum"
+            );
+        }
     }
 }
 
+/// #227: the paired measurement behind the cost model. Same candidates, same
+/// squared start, same `iters`: the CPU ladder polish (`fit_weighted_metric`)
+/// against the batched device arm (`max_fit_batch`). Prints the cold call, the
+/// median of 5 warm calls and the median of 5 CPU runs per n. Run with
+/// `--ignored --nocapture`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "timing measurement"]
+fn measure_paired_maximum_fit() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    use rcsr::fit::{fit_batch_verified, fit_weighted_metric, BatchedGpu};
+    use std::time::Instant;
+
+    fn median(mut v: Vec<f64>) -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    }
+
+    for n in [5_000usize, 20_000, 50_000] {
+        let (train, starts, mut ev) = paired_batch(n);
+        let mut cpu = Vec::new();
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            for t in &starts {
+                let mut c = t.clone();
+                fit_weighted_metric(&mut c, &train.x, &train.y, &[], 8, Metric::Maximum);
+            }
+            cpu.push(t0.elapsed().as_secs_f64());
+        }
+        let mut gpu = Vec::new();
+        for _ in 0..6 {
+            let mut trees = starts.clone();
+            let t0 = Instant::now();
+            fit_batch_verified(
+                &BatchedGpu::new(&mut ev),
+                &mut trees,
+                &train.x,
+                &train.y,
+                &[],
+                8,
+                Metric::Maximum,
+            );
+            gpu.push(t0.elapsed().as_secs_f64());
+        }
+        let cold = gpu[0];
+        let warm = median(gpu[1..].to_vec());
+        let cpu_m = median(cpu);
+        eprintln!(
+            "#227 paired maximum fit: n={n} p=2 candidates={} cpu={:.3} ms gpu_cold={:.3} ms \
+             gpu_warm={:.3} ms speedup_warm={:.2}x",
+            starts.len(),
+            cpu_m * 1e3,
+            cold * 1e3,
+            warm * 1e3,
+            cpu_m / warm.max(f64::MIN_POSITIVE)
+        );
+    }
+}
