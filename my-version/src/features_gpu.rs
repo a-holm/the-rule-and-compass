@@ -160,15 +160,15 @@ pub struct FusedCost {
 /// fill the device at a realistic symbol count. Re-measure and update both the
 /// constant and `docs/ohlcv.md` when the kernels change.
 pub const FLOW_COST: FusedCost = FusedCost {
-    base_ms_per_mrow: 6.084,
-    column_ms_per_mrow: 12.534,
+    base_ms_per_mrow: 11.4,
+    column_ms_per_mrow: 3.3,
     cpu_ms_per_mrow_column: 110.0,
 };
 
 /// Fused price-action cost, measured on the same fixture.
 pub const PRICE_ACTION_COST: FusedCost = FusedCost {
-    base_ms_per_mrow: 9.224,
-    column_ms_per_mrow: 3.619,
+    base_ms_per_mrow: 8.8,
+    column_ms_per_mrow: 2.5,
     cpu_ms_per_mrow_column: 110.0,
 };
 
