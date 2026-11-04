@@ -39,11 +39,11 @@ impl Work {
     }
 
     fn json(&self, name: &str) -> PathBuf {
-        self.scratch.join(format!("{name}.json"))
+        self.scratch.join(&format!("{name}.json"))
     }
 
     fn log(&self, name: &str) -> PathBuf {
-        self.scratch.join(format!("{name}.log"))
+        self.scratch.join(&format!("{name}.log"))
     }
 
     fn run(&self, name: &str, args: &[&str], force: Option<&str>) -> Output {

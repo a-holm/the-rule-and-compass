@@ -136,7 +136,7 @@ fn shared_shape_recovery_beats_two_independent_runs() {
     assert!(shared_error.is_finite(), "shared error = {shared_error}");
 }
 
-struct TempPath(PathBuf, Scratch);
+struct TempPath(PathBuf, #[allow(dead_code)] Scratch);
 
 impl TempPath {
     fn new(name: &str) -> Self {

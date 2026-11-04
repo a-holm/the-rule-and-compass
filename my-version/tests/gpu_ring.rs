@@ -244,7 +244,7 @@ const RING_NAMES: [&str; 7] = [
 
 /// A 64-group store and device columns for every projected column.
 struct RingFixture {
-    dir: Scratch,
+    _dir: Scratch,
     path: String,
     ctx: usize,
     cols: Vec<usize>,
@@ -270,7 +270,7 @@ impl RingFixture {
             cols.push(unsafe { rc_enrich_value_ptr(ctx, which) } as usize);
         }
         RingFixture {
-            dir,
+            _dir: dir,
             path,
             ctx: ctx as usize,
             cols,

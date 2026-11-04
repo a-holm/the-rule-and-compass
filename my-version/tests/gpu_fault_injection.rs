@@ -105,7 +105,7 @@ impl Fixture {
     }
 
     fn gpu_run(&self, tag: &str) -> (Report, String) {
-        let out = self.scratch.join(format!("{tag}.rcsb")).to_string_lossy().into_owned();
+        let out = self.scratch.join(&format!("{tag}.rcsb")).to_string_lossy().into_owned();
         let report = enrich::build(&self.options(&out, GpuMode::On))
             .unwrap_or_else(|e| panic!("{tag}: build failed: {e}"));
         (report, out)
