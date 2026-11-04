@@ -11,6 +11,30 @@ use rcsr::data;
 use rcsr::enrich::{self, GpuMode, Options};
 use rcsr::store::{self, DType, FileStore};
 
+#[path = "common/sanitizer.rs"]
+mod sanitizer;
+
+static FLOOR: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Zeroes the process-wide GPU row floor and restores it on drop, so the
+/// smaller sanitizer fixtures still take the device route. The mutex keeps the
+/// tests that assert the below-floor route out of its window.
+struct Floor(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl Floor {
+    fn zero() -> Floor {
+        let guard = FLOOR.lock().unwrap_or_else(|e| e.into_inner());
+        enrich::set_gpu_floor_for_tests(0);
+        Floor(guard)
+    }
+}
+
+impl Drop for Floor {
+    fn drop(&mut self) {
+        enrich::set_gpu_floor_for_tests(usize::MAX);
+    }
+}
+
 fn bars(symbol: &str, n: usize, start: i64, step: i64, gap_at: Option<usize>) -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
     (0..n)
         .map(|i| {
@@ -150,8 +174,10 @@ fn gpu_columns_match_cpu_and_report_the_share() {
     let cpu_out = dir.join("cpu.rcsb").to_string_lossy().into_owned();
     let gpu_out = dir.join("gpu.rcsb").to_string_lossy().into_owned();
     let gpu_out2 = dir.join("gpu2.rcsb").to_string_lossy().into_owned();
-    let mut rows = bars("AAA", 500_000, 0, 3600, Some(100));
-    rows.extend(bars("BBB", 500_000, 0, 3600, Some(250_000)));
+    let _floor = sanitizer::active().then(Floor::zero);
+    let n = sanitizer::pick(500_000, 100_000);
+    let mut rows = bars("AAA", n, 0, 3600, Some(100));
+    rows.extend(bars("BBB", n, 0, 3600, Some(sanitizer::pick(250_000, 70_000))));
     write_store(&src, &rows, 65_536);
 
     let cpu = enrich::build(&opts(&src, &cpu_out, FEATURES, GpuMode::Off)).unwrap();
@@ -240,7 +266,8 @@ fn gpu_cross_section_ranks_are_exact_and_chunk_invariant() {
     }
     let dir = tmp_dir("xs-rank");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
-    let per_symbol = 48_000usize;
+    let _floor = sanitizer::active().then(Floor::zero);
+    let per_symbol = sanitizer::pick(48_000usize, 13_000);
     let symbols = 21usize;
     write_pit_store(&src, symbols, per_symbol, 65_536);
 
@@ -495,6 +522,7 @@ fn measure_cross_section_stage() {
 
 #[test]
 fn small_store_stays_on_the_cpu_with_a_reason() {
+    let _floor = FLOOR.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tmp_dir("small");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
@@ -626,8 +654,10 @@ fn engine_tail_kernels_match_cpu_and_are_batch_invariant() {
     let cpu_out = dir.join("cpu.rcsb").to_string_lossy().into_owned();
     let gpu_out = dir.join("gpu.rcsb").to_string_lossy().into_owned();
     let gpu_out2 = dir.join("gpu2.rcsb").to_string_lossy().into_owned();
-    let mut rows = bars("AAA", 500_000, 0, 3600, Some(100));
-    rows.extend(bars("BBB", 500_000, 0, 3600, Some(250_000)));
+    let _floor = sanitizer::active().then(Floor::zero);
+    let n = sanitizer::pick(500_000, 100_000);
+    let mut rows = bars("AAA", n, 0, 3600, Some(100));
+    rows.extend(bars("BBB", n, 0, 3600, Some(sanitizer::pick(250_000, 70_000))));
     // Degenerate bars exercise the high==low extrema convention.
     for i in [1000usize, 1001, 2000] {
         let (t, s, _o, _h, _l, c, v) = rows[i].clone();
