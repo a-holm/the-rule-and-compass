@@ -8,6 +8,10 @@ use rcsr::protocol::{Candidate, Ledger};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 /// 2024-01-01T00:00:00Z.
 const T0: i64 = 1_704_067_200;
 const H: i64 = 3600;
@@ -15,11 +19,10 @@ const DEFAULT_PURGE: i64 = 219_600;
 /// The embargo of a store whose writer declared none (`protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS`).
 const EXISTING_EMBARGO: i64 = 10_972_800;
 
-fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("rcsr-locked-window-{}-{}", std::process::id(), name));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn scratch(name: &str) -> (Scratch, PathBuf) {
+    let s = Scratch::new(name);
+    let d = s.path().to_path_buf();
+    (s, d)
 }
 
 fn rcsr(args: &[&str]) -> (i32, String, String) {
@@ -61,7 +64,7 @@ fn search(data: &str, run_json: &str, extra: &[&str]) -> (i32, String, String) {
 
 #[test]
 fn the_search_refuses_the_declared_locked_test_unless_the_rows_are_excluded() {
-    let dir = scratch("search");
+    let (_scratch, dir) = scratch("search");
     let data = dir.join("d.csv");
     series_csv(&data);
     let run = s(&dir.join("run.json"));
@@ -101,7 +104,7 @@ fn the_search_refuses_the_declared_locked_test_unless_the_rows_are_excluded() {
 
 #[test]
 fn an_explicit_lockbox_flag_declares_the_range_for_a_csv_without_a_sidecar() {
-    let dir = scratch("flag");
+    let (_scratch, dir) = scratch("flag");
     let data = dir.join("d.csv");
     series_csv(&data);
     let run = s(&dir.join("run.json"));
@@ -129,7 +132,7 @@ fn window(label: &str, a: i64, b: i64, c: i64, d: i64) -> String {
 
 #[test]
 fn walkforward_refuses_the_declared_range_without_a_ledger_and_still_reads_it_once() {
-    let dir = scratch("wf");
+    let (_scratch, dir) = scratch("wf");
     let data = dir.join("d.csv");
     series_csv(&data);
     let d = s(&data);
@@ -204,7 +207,7 @@ fn ladder(data: &str, windows: &str, out: &str, extra: &[&str]) -> (i32, String,
 
 #[test]
 fn the_ladder_refuses_the_locked_scheme_and_reads_it_once_through_the_ledger() {
-    let dir = scratch("ladder");
+    let (_scratch, dir) = scratch("ladder");
     let (data, win) = (dir.join("p.csv"), dir.join("w.csv"));
     panel_csv(&data);
     windows_file(&win, "locked");
@@ -250,7 +253,7 @@ fn the_ladder_refuses_the_locked_scheme_and_reads_it_once_through_the_ledger() {
 
 #[test]
 fn stored_reads_each_carrier_and_a_flag_must_cover_the_store_range() {
-    let dir = scratch("declared");
+    let (_scratch, dir) = scratch("declared");
     let p = s(&dir.join("a.rcsb"));
     assert_eq!(lockbox::stored(&p).unwrap().map(|(_, l)| l), None);
     let lb = locked();
@@ -395,7 +398,7 @@ fn without_timing_drops_timing_keys_and_keeps_data() {
 
 #[test]
 fn development_outputs_ignore_locked_prices() {
-    let dir = scratch("differential");
+    let (_scratch, dir) = scratch("differential");
     let a = diff_store(&dir, "a", false);
     let b = diff_store(&dir, "b", true);
     let s_start = T0 + 400 * H;
@@ -456,7 +459,7 @@ fn development_outputs_ignore_locked_prices() {
 
 #[test]
 fn walkforward_locked_scheme_trains_at_least_the_label_purge_before_the_start() {
-    let dir = scratch("locked-train");
+    let (_scratch, dir) = scratch("locked-train");
     let a = diff_store(&dir, "a", false);
     let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
     let dev = format!("dev,{},{},{},{}", T0, T0 + 150 * H, T0 + 160 * H, T0 + 250 * H);
@@ -507,7 +510,7 @@ fn panel_csv_at(path: &Path, t0: i64) {
 
 #[test]
 fn undeclared_data_gets_the_protocol_default_in_search_walkforward_and_ladder() {
-    let dir = scratch("undeclared");
+    let (_scratch, dir) = scratch("undeclared");
     let data = dir.join("d.csv");
     series_csv_at(&data, T1);
     let (d, run) = (s(&data), s(&dir.join("run.json")));
@@ -564,7 +567,7 @@ fn windows_file_at(path: &Path, scheme: &str, t0: i64) {
 
 #[test]
 fn a_flag_that_narrows_or_removes_the_store_declaration_is_refused() {
-    let dir = scratch("narrow");
+    let (_scratch, dir) = scratch("narrow");
     let data = dir.join("d.csv");
     series_csv(&data);
     let d = s(&data);
@@ -583,7 +586,7 @@ fn a_flag_that_narrows_or_removes_the_store_declaration_is_refused() {
 
 #[test]
 fn conflicting_declaration_files_are_refused_naming_both() {
-    let dir = scratch("conflict");
+    let (_scratch, dir) = scratch("conflict");
     let data = dir.join("d.csv");
     series_csv(&data);
     let d = s(&data);
@@ -600,7 +603,7 @@ fn conflicting_declaration_files_are_refused_naming_both() {
 
 #[test]
 fn audit_leaves_the_locked_rows_out_and_counts_them() {
-    let dir = scratch("audit");
+    let (_scratch, dir) = scratch("audit");
     let data = dir.join("d.csv");
     series_csv_at(&data, T1);
     let d = s(&data);
@@ -646,7 +649,7 @@ fn cv_part(json: &str) -> String {
 
 #[test]
 fn declared_split_without_time_is_refused() {
-    let dir = scratch("notime");
+    let (_scratch, dir) = scratch("notime");
     let data = dir.join("d.csv");
     series_csv(&data);
     let d = s(&data);
@@ -675,7 +678,7 @@ fn declared_split_without_time_is_refused() {
 
 #[test]
 fn declared_selectors_without_time_are_refused() {
-    let dir = scratch("selectors");
+    let (_scratch, dir) = scratch("selectors");
     let data = dir.join("d.csv");
     series_csv(&data);
     let d = s(&data);
@@ -689,7 +692,7 @@ fn declared_selectors_without_time_are_refused() {
 
 #[test]
 fn declared_non_epoch_time_is_refused() {
-    let dir = scratch("nonepoch");
+    let (_scratch, dir) = scratch("nonepoch");
     let data = dir.join("d.csv");
     let mut csv = String::from("ts,x,y\n");
     for i in 0..100i64 {
@@ -711,7 +714,7 @@ fn declared_non_epoch_time_is_refused() {
 
 #[test]
 fn declared_cv_ignores_allow_lockbox() {
-    let dir = scratch("cvallow");
+    let (_scratch, dir) = scratch("cvallow");
     let data = dir.join("d.csv");
     series_csv(&data);
     let d = s(&data);
@@ -742,7 +745,7 @@ fn declared_cv_ignores_allow_lockbox() {
 
 #[test]
 fn cv_folds_honour_exclude() {
-    let dir = scratch("cvexclude");
+    let (_scratch, dir) = scratch("cvexclude");
     let (a, b) = (dir.join("a.csv"), dir.join("b.csv"));
     ab_csv(&a, &b);
     let exclude = format!("ts >= {}", locked().start - DEFAULT_PURGE);
@@ -777,7 +780,7 @@ fn cv_folds_honour_exclude() {
 
 #[test]
 fn a_refused_cv_run_exits_before_the_search() {
-    let dir = scratch("cvpreflight");
+    let (_scratch, dir) = scratch("cvpreflight");
     let data = dir.join("d.csv");
     series_csv(&data);
     let d = s(&data);
@@ -799,7 +802,7 @@ fn a_refused_cv_run_exits_before_the_search() {
 
 #[test]
 fn a_flag_on_undeclared_data_adds_to_the_protocol_default() {
-    let dir = scratch("flag-adds");
+    let (_scratch, dir) = scratch("flag-adds");
     let (late, early) = (dir.join("late.csv"), dir.join("early.csv"));
     series_csv_at(&late, T1);
     series_csv(&early);
@@ -854,7 +857,7 @@ fn json_part(json: &str, from: &str, to: &str) -> String {
 
 #[test]
 fn audit_time_statistics_and_rows_ignore_the_locked_rows() {
-    let dir = scratch("audit-time");
+    let (_scratch, dir) = scratch("audit-time");
     let (a, b, kept) = (dir.join("a.csv"), dir.join("b.csv"), dir.join("kept.csv"));
     // A: regular hourly locked rows. B: locked rows with duplicates, jumps and
     // backwards steps. Identical outside the default locked test.
@@ -890,7 +893,7 @@ fn audit_time_statistics_and_rows_ignore_the_locked_rows() {
 
 #[test]
 fn a_second_declared_range_is_guarded_by_every_reader() {
-    let dir = scratch("also");
+    let (_scratch, dir) = scratch("also");
     let extra = Lockbox { start: T0 + 100 * H, end: T0 + 150 * H };
     let default = lockbox::protocol_default();
     for (name, t0) in [("flag.csv", T0), ("default.csv", T1)] {
@@ -1029,7 +1032,7 @@ fn emb_ladder(data: &str, win: &str, out: &str, extra: &[&str]) -> (i32, String)
 
 #[test]
 fn development_outputs_after_the_range_ignore_locked_prices() {
-    let dir = scratch("embargo-differential");
+    let (_scratch, dir) = scratch("embargo-differential");
     let a = emb_store(&dir, "a", false, EMB_L);
     let b = emb_store(&dir, "b", true, EMB_L);
     let (e, after) = (emb_range().end, emb_range().end + EMB_L);
@@ -1085,7 +1088,7 @@ fn development_outputs_after_the_range_ignore_locked_prices() {
 
 #[test]
 fn cross_validation_refuses_the_embargo_rows_and_ignores_the_locked_prices_after_it() {
-    let dir = scratch("embargo-cv");
+    let (_scratch, dir) = scratch("embargo-cv");
     let a = emb_store(&dir, "a", false, EMB_L);
     let b = emb_store(&dir, "b", true, EMB_L);
     let after = emb_range().end + EMB_L;
@@ -1110,7 +1113,7 @@ fn cross_validation_refuses_the_embargo_rows_and_ignores_the_locked_prices_after
 
 #[test]
 fn the_embargo_flag_widens_the_declared_value_and_never_narrows_it() {
-    let dir = scratch("embargo-flag");
+    let (_scratch, dir) = scratch("embargo-flag");
     let a = emb_store(&dir, "a", false, EMB_L);
     let run = s(&dir.join("r.json"));
     let after = emb_range().end + EMB_L;
@@ -1130,7 +1133,7 @@ fn the_embargo_flag_widens_the_declared_value_and_never_narrows_it() {
 
 #[test]
 fn a_store_without_a_declared_embargo_uses_the_protocol_default() {
-    let dir = scratch("embargo-default");
+    let (_scratch, dir) = scratch("embargo-default");
     let p = dir.join("a.csv");
     emb_panel(&p, false);
     let d = s(&p);
@@ -1143,7 +1146,7 @@ fn a_store_without_a_declared_embargo_uses_the_protocol_default() {
 
 #[test]
 fn audit_leaves_out_the_purge_band_and_the_embargo_rows() {
-    let dir = scratch("embargo-audit");
+    let (_scratch, dir) = scratch("embargo-audit");
     let a = emb_store(&dir, "a", false, EMB_L);
     let r = emb_range();
     let (_, out, err) = rcsr(&["audit", "--data", &a, "--target", "y", "--time", "ts", "--json"]);
@@ -1161,7 +1164,7 @@ fn audit_leaves_out_the_purge_band_and_the_embargo_rows() {
 
 #[test]
 fn ablation_prepare_segments_the_embargo_and_its_null_columns_ignore_locked_prices() {
-    let dir = scratch("embargo-ablation");
+    let (_scratch, dir) = scratch("embargo-ablation");
     let a = emb_store(&dir, "a", false, EMB_L);
     let b = emb_store(&dir, "b", true, EMB_L);
     let def = dir.join("def.json");
@@ -1223,7 +1226,7 @@ const LONG_LABEL_SPEC: &str = "{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{
 
 #[test]
 fn ladder_takes_the_target_spec_purge_before_the_range_start() {
-    let dir = scratch("embargo-spec-purge");
+    let (_scratch, dir) = scratch("embargo-spec-purge");
     let a = emb_store(&dir, "a", false, EMB_L);
     let spec = dir.join("spec.json");
     std::fs::write(&spec, LONG_LABEL_SPEC).unwrap();
@@ -1265,7 +1268,7 @@ fn ladder_takes_the_target_spec_purge_before_the_range_start() {
 
 #[test]
 fn a_sealed_read_keeps_every_other_declared_range_sealed() {
-    let dir = scratch("embargo-other-range");
+    let (_scratch, dir) = scratch("embargo-other-range");
     let data = dir.join("d.csv");
     emb_panel(&data, false);
     let d = s(&data);

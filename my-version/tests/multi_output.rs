@@ -12,6 +12,10 @@ use rcsr::search::{self, Config};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 fn config(seed: u32, generations: usize) -> Config {
     Config {
         generations,
@@ -132,21 +136,12 @@ fn shared_shape_recovery_beats_two_independent_runs() {
     assert!(shared_error.is_finite(), "shared error = {shared_error}");
 }
 
-struct TempPath(PathBuf);
+struct TempPath(PathBuf, Scratch);
 
 impl TempPath {
     fn new(name: &str) -> Self {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SEQ: AtomicUsize = AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("rcsr-multi-{}-{}-{}", std::process::id(), n, name));
-        TempPath(path)
-    }
-}
-
-impl Drop for TempPath {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let scratch = Scratch::new("multi");
+        TempPath(scratch.join(name), scratch)
     }
 }
 

@@ -11,33 +11,26 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-/// A temporary CSV that removes itself when the test ends.
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+/// A temporary CSV that lives in its own scratch directory.
 struct TempCsv {
     path: PathBuf,
+    _scratch: Scratch,
 }
 
 impl TempCsv {
     fn new(contents: &str) -> Self {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SEQ: AtomicUsize = AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "rcsr-reports-{}-{}.csv",
-            std::process::id(),
-            n
-        ));
+        let scratch = Scratch::new("reports");
+        let path = scratch.join("data.csv");
         std::fs::write(&path, contents).expect("write temp csv");
-        TempCsv { path }
+        TempCsv { path, _scratch: scratch }
     }
 
     fn as_str(&self) -> &str {
         self.path.to_str().expect("utf-8 path")
-    }
-}
-
-impl Drop for TempCsv {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -144,10 +137,8 @@ fn each_report_is_markdown_with_a_law_errors_and_a_table() {
 #[test]
 fn report_out_writes_a_file_and_keeps_stdout_clean() {
     let csv = TempCsv::new(&line_csv(40));
-    let out_path = std::env::temp_dir().join(format!(
-        "rcsr-report-{}-summary.md",
-        std::process::id()
-    ));
+    let out_dir = Scratch::new("report-out");
+    let out_path = out_dir.join("summary.md");
     let out_path_str = out_path.to_str().expect("utf-8");
     let out = report(csv.as_str(), "summary", &["--report-out", out_path_str]);
     assert!(
@@ -164,7 +155,6 @@ fn report_out_writes_a_file_and_keeps_stdout_clean() {
     assert!(text.contains("## Chosen law"), "{text}");
     assert!(text.contains("| rank | complexity |"), "{text}");
     assert!(text.contains("y = "), "{text}");
-    let _ = std::fs::remove_file(&out_path);
 }
 
 /// #134: the JSON timing block is complete, non-overlapping and its phases

@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 
 #[path = "common/sanitizer.rs"]
 mod sanitizer;
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
 
 const PLAN: &str = include_str!("sanitizer.plan");
 
@@ -169,7 +172,8 @@ fn an_empty_reason_or_unknown_mode_fails() {
 
 #[test]
 fn a_planned_name_that_is_a_substring_of_another_test_fails() {
-    let dir = std::env::temp_dir().join(format!("rcsr-sanplan-{}", std::process::id()));
+    let scratch = Scratch::new("sanplan");
+    let dir = scratch.path();
     fs::create_dir_all(dir.join("tests")).unwrap();
     fs::write(
         dir.join("tests/demo.rs"),
@@ -177,7 +181,6 @@ fn a_planned_name_that_is_a_substring_of_another_test_fails() {
     )
     .unwrap();
     let errors = check("demo short skip why\n", &dir);
-    fs::remove_dir_all(&dir).unwrap();
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("substring"), "{errors:?}");
 }

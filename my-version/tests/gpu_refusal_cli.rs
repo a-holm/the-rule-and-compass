@@ -8,19 +8,21 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 const ROWS: usize = 50_000;
 const KERNEL: &str = "score_kernel";
 
 struct Work {
-    dir: PathBuf,
+    scratch: Scratch,
     data: PathBuf,
 }
 
 impl Work {
     fn new(tag: &str) -> Work {
-        let dir = std::env::temp_dir().join(format!("rcsr-refusal-{}-{}", std::process::id(), tag));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = Scratch::new(tag);
         let mut text = String::from("x1,x2,x3,y\n");
         let mut s = 12345u64;
         let mut next = move || {
@@ -31,17 +33,17 @@ impl Work {
             let (a, b, c) = (next(), next(), next());
             text.push_str(&format!("{a:.6},{b:.6},{c:.6},{:.6}\n", 2.0 * a + b * b - 0.5 * c * a));
         }
-        let data = dir.join("data.csv");
+        let data = scratch.join("data.csv");
         std::fs::write(&data, text).unwrap();
-        Work { dir, data }
+        Work { scratch, data }
     }
 
     fn json(&self, name: &str) -> PathBuf {
-        self.dir.join(format!("{name}.json"))
+        self.scratch.join(format!("{name}.json"))
     }
 
     fn log(&self, name: &str) -> PathBuf {
-        self.dir.join(format!("{name}.log"))
+        self.scratch.join(format!("{name}.log"))
     }
 
     fn run(&self, name: &str, args: &[&str], force: Option<&str>) -> Output {
@@ -58,12 +60,6 @@ impl Work {
             cmd.env("RCSR_FORCE_LAUNCH_REFUSAL", k);
         }
         cmd.output().expect("run rcsr")
-    }
-}
-
-impl Drop for Work {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 

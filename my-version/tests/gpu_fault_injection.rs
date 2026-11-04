@@ -15,6 +15,9 @@ use rcsr::store::{self, FileStore};
 #[path = "common/sanitizer.rs"]
 #[allow(dead_code)]
 mod sanitizer;
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
 
 const SYMBOLS: usize = 6;
 const PER_SYMBOL: usize = 1_200;
@@ -81,7 +84,7 @@ static HOOKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Fixture {
     _lock: std::sync::MutexGuard<'static, ()>,
-    dir: std::path::PathBuf,
+    scratch: Scratch,
     src: String,
     features: String,
     names: Vec<String>,
@@ -102,7 +105,7 @@ impl Fixture {
     }
 
     fn gpu_run(&self, tag: &str) -> (Report, String) {
-        let out = self.dir.join(format!("{tag}.rcsb")).to_string_lossy().into_owned();
+        let out = self.scratch.join(format!("{tag}.rcsb")).to_string_lossy().into_owned();
         let report = enrich::build(&self.options(&out, GpuMode::On))
             .unwrap_or_else(|e| panic!("{tag}: build failed: {e}"));
         (report, out)
@@ -147,12 +150,11 @@ fn fixture(tag: &str) -> Option<Fixture> {
         .filter(|e| e.available && enrich::gpu_supports(&e.name))
         .map(|e| e.name)
         .collect();
-    let dir = std::env::temp_dir().join(format!("rcsr-fault-{}-{}", tag, std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let scratch = Scratch::new(tag);
+    let src = scratch.join("in.rcsb").to_string_lossy().into_owned();
     write_store(&src);
-    let cpu_out = dir.join("cpu.rcsb").to_string_lossy().into_owned();
-    let fx = Fixture { _lock: lock, dir, src, features: names.join(","), names: Vec::new(), cpu_out: cpu_out.clone() };
+    let cpu_out = scratch.join("cpu.rcsb").to_string_lossy().into_owned();
+    let fx = Fixture { _lock: lock, scratch, src, features: names.join(","), names: Vec::new(), cpu_out: cpu_out.clone() };
     let cpu = enrich::build(&fx.options(&cpu_out, GpuMode::Off)).unwrap();
     let names = cpu.features.iter().map(|f| f.name.clone()).collect();
     Some(Fixture { names, ..fx })
@@ -203,7 +205,6 @@ fn every_refused_device_allocation_falls_back_cleanly() {
     }
     eprintln!("allocations swept: {} of {total}, with CPU fallback: {with_fallback}", ks.len());
     assert!(with_fallback > 0, "no refused allocation produced a CPU fallback");
-    std::fs::remove_dir_all(&fx.dir).ok();
 }
 
 /// Make each launch site fail before the kernel is queued.
@@ -229,5 +230,4 @@ fn every_failed_kernel_launch_falls_back_cleanly() {
         }
         std::fs::remove_file(&out).ok();
     }
-    std::fs::remove_dir_all(&fx.dir).ok();
 }

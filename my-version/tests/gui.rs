@@ -10,6 +10,10 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 fn get(addr: SocketAddr, path: &str) -> (u16, String) {
     request(addr, &format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", path))
 }
@@ -312,16 +316,9 @@ fn stamped_table(first: i64, rows: i64) -> String {
     text
 }
 
-fn lockbox_dir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("rcsr-gui-lockbox-{}-{}", std::process::id(), name));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
-}
-
-fn declared_csv(name: &str) -> String {
-    let dir = lockbox_dir(name);
-    let path = dir.join("data.csv").to_string_lossy().to_string();
+fn declared_csv(name: &str) -> (Scratch, String) {
+    let scratch = Scratch::new(name);
+    let path = scratch.join("data.csv").to_string_lossy().to_string();
     std::fs::write(&path, stamped_table(1_714_521_600, 1500)).unwrap();
     rcsr::lockbox::write_sidecar(
         &path,
@@ -329,7 +326,7 @@ fn declared_csv(name: &str) -> String {
         "test",
     )
     .unwrap();
-    path
+    (scratch, path)
 }
 
 fn run_args(extra: &[&str]) -> String {
@@ -363,7 +360,7 @@ fn run_upload(table: &str, extra: &[&str]) -> (u16, String) {
 
 #[test]
 fn gui_refuses_a_sidecar_declared_range_in_the_test_block() {
-    let path = declared_csv("split");
+    let (_scratch, path) = declared_csv("split");
     let (status, body) = run_file(&path, &["--split", "temporal"]);
     assert_eq!(status, 400, "{}", body);
     assert!(body.contains("2024-06-01"), "{}", body);
@@ -372,7 +369,7 @@ fn gui_refuses_a_sidecar_declared_range_in_the_test_block() {
 
 #[test]
 fn gui_cv_needs_an_exclude_that_clears_the_declared_range() {
-    let path = declared_csv("cv");
+    let (_scratch, path) = declared_csv("cv");
     let (status, body) = run_file(&path, &["--cv", "k-fold", "--cv-k", "3"]);
     assert_eq!(status, 400, "{}", body);
     assert!(body.contains("2024-06-01"), "{}", body);
@@ -387,7 +384,7 @@ fn gui_cv_needs_an_exclude_that_clears_the_declared_range() {
 
 #[test]
 fn gui_refuses_rows_after_the_range_end_whose_features_read_it() {
-    let path = declared_csv("embargo");
+    let (_scratch, path) = declared_csv("embargo");
     let exclude = format!("ts >= {} and ts < {}", BOX_START - 219_600, BOX_END);
     let (status, body) = run_file(&path, &["--cv", "k-fold", "--cv-k", "3", "--exclude", &exclude]);
     assert_eq!(status, 400, "{}", body);

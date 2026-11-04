@@ -13,18 +13,12 @@ use rcsr::enrich::{self, GpuMode, Options};
 use rcsr::mtf_gpu;
 use rcsr::store::{self, FileStore};
 
-fn tmp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-mtf-gpu-{}-{}-{}",
-        tag,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn tmp_dir(tag: &str) -> Scratch {
+    Scratch::new(tag)
 }
 
 fn write_store(
