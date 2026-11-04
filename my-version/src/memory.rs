@@ -819,7 +819,7 @@ fn plan_core(w: &DeviceWorkload, d: &DeviceInfo, caps: &DeviceCaps) -> DevicePla
     let buffers = clamp_u64(device_buffer_bytes(w), &mut sat);
     let stat_wave = if w.stat {
         let min_wave = DEVICE_STAT_WAVE_TRIALS * (n * DEVICE_STAT_ROW_BYTES + (1 << 20));
-        clamp_u64(min_wave.max(DEVICE_STAT_WAVE_BYTES as u128) * w.candidates as u128, &mut sat)
+        clamp_u64(min_wave.max(DEVICE_STAT_WAVE_BYTES as u128), &mut sat)
     } else {
         0
     };
