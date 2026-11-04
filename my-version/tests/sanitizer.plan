@@ -2,7 +2,7 @@
 # binary: a --test target name, lib (library unit tests) or bin-<name> (that binary's unit tests)
 # mode: skip (not run under memcheck) | api-errors-no (run alone with --report-api-errors no)
 # An api-errors-no test is still memchecked; only driver API error reporting is off, for that test only.
-gpu_parity      *                                                      skip           clean under memcheck but 1314 s, over the 580 s lock hold; the plan format has no split mode
+signed_gpu      *                                                      skip           no CUDA call: mock backend and CPU fits; memcheck exits 255 (terminated before first instrumented API call)
 gpu_memory_plan a_refused_device_allocation_is_reported_with_its_bytes api-errors-no  provokes a cudaMalloc out-of-memory on purpose
 gpu_ring        stale_cuda_error_does_not_fail_the_transport           api-errors-no  provokes a cudaMalloc out-of-memory on purpose
 gpu_launch_guard malloc_argument_is_refused_before_the_kernel_runs       api-errors-no  refuses a launch on purpose; the refusal is a cudaErrorInvalidValue API error
