@@ -30,6 +30,8 @@ use std::sync::{Mutex, OnceLock};
 
 #[path = "common/pit.rs"]
 mod pit;
+#[path = "common/sanitizer.rs"]
+mod sanitizer;
 
 const TOL: f64 = 1e-12;
 
@@ -401,10 +403,12 @@ struct Shared {
 
 const SYMBOLS: usize = 24;
 const PER_SYMBOL: usize = 21_000;
+// Under memcheck: still crosses LATE_START, both timestamps of the edge-case test, the 5 h and 1 day holes, and more than one 65,536-row store group.
+const SANITIZER_PER_SYMBOL: usize = 6_000;
 
 /// `PER_SYMBOL` is overridable for quick iteration (`RCSR_PARITY_PER_SYMBOL`).
 fn per_symbol() -> usize {
-    std::env::var("RCSR_PARITY_PER_SYMBOL").ok().and_then(|v| v.parse().ok()).unwrap_or(PER_SYMBOL)
+    std::env::var("RCSR_PARITY_PER_SYMBOL").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| sanitizer::pick(PER_SYMBOL, SANITIZER_PER_SYMBOL))
 }
 
 fn shared() -> &'static Shared {
@@ -520,8 +524,8 @@ fn the_verdict_enforces_each_tier() {
 
 #[test]
 fn the_fixture_contains_every_required_edge_case() {
-    let rows = fixture(SYMBOLS, PER_SYMBOL);
-    assert!(rows.len() >= 470_000, "{} rows", rows.len());
+    let rows = fixture(SYMBOLS, sanitizer::pick(PER_SYMBOL, SANITIZER_PER_SYMBOL));
+    assert!(rows.len() >= sanitizer::pick(470_000, 100_000), "{} rows", rows.len());
     assert!(rows.iter().any(|r| r.c.is_nan()), "NaN close");
     assert!(rows.iter().any(|r| r.v == 0.0), "zero volume");
     assert!(rows.iter().any(|r| r.h == r.l), "H == L");
@@ -984,7 +988,7 @@ fn panel_prep_is_byte_identical_cpu_gpu_cold_warm_and_across_block_sizes() {
     for keep_partial in [false, true] {
         let cpu = cpu_prepare(&bars, &segments, STEP, 3_600, keep_partial).unwrap();
         let want = sha256_hex(&prep_bytes(&cpu));
-        assert!(!cpu.conflicts.is_empty() && cpu.buckets.len() > 100_000);
+        assert!(!cpu.conflicts.is_empty() && cpu.buckets.len() > sanitizer::pick(100_000, 20_000));
 
         let mut gpu = PrepGpu::new(&bars, &segments).expect("context");
         assert!(gpu.run(STEP, 3_600, keep_partial));
