@@ -10,8 +10,8 @@
 //!
 //! A registered column with no tier (`reference`, empty, unknown) fails. The
 //! harness also checks cold vs warm runs, `--chunk-rows` 1/4096/65536, store
-//! group (symbol batching) layouts, prefix replay at 20 cuts with a
-//! future-shift canary, panel prep and the PIT as-of joins. The `#[ignore]`
+//! group (symbol batching) layouts, prefix replay at 20 boundary cuts with a
+//! future-shift canary, calendar dates across month, year and leap-day ends, panel prep and the PIT as-of joins. The `#[ignore]`
 //! large-store test runs the same comparison on a real panel (see
 //! `docs/ohlcv.md`). Device tests skip cleanly when no CUDA device is present.
 
@@ -30,8 +30,6 @@ use std::sync::{Mutex, OnceLock};
 
 #[path = "common/pit.rs"]
 mod pit;
-#[path = "common/sanitizer.rs"]
-mod sanitizer;
 #[path = "common/scratch.rs"]
 mod scratch;
 use scratch::Scratch;
@@ -402,34 +400,32 @@ struct Shared {
 }
 
 const SYMBOLS: usize = 24;
-const PER_SYMBOL: usize = 21_000;
-// Under memcheck: still crosses LATE_START, both timestamps of the edge-case test, the 5 h and 1 day holes, and more than one 65,536-row store group.
-const SANITIZER_PER_SYMBOL: usize = 6_000;
+const PER_SYMBOL: usize = 6_000;
+const LONG_SYMBOL_BARS: usize = 21_000;
 
 /// `PER_SYMBOL` is overridable for quick iteration (`RCSR_PARITY_PER_SYMBOL`).
 fn per_symbol() -> usize {
-    std::env::var("RCSR_PARITY_PER_SYMBOL").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| sanitizer::pick(PER_SYMBOL, SANITIZER_PER_SYMBOL))
+    std::env::var("RCSR_PARITY_PER_SYMBOL").ok().and_then(|v| v.parse().ok()).unwrap_or(PER_SYMBOL)
 }
 
 extern "C" {
     fn atexit(callback: extern "C" fn()) -> std::os::raw::c_int;
 }
 
-static SHARED_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+static SHARED_SCRATCH: OnceLock<Scratch> = OnceLock::new();
 
 extern "C" fn remove_shared_dir() {
-    if std::env::var_os("RCSR_KEEP_TEST_DIRS").is_none() {
-        if let Some(dir) = SHARED_DIR.get() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+    if let Some(s) = SHARED_SCRATCH.get() {
+        s.cleanup();
     }
 }
 
-/// The shared fixture lives in a static, which never drops; an exit hook removes its directory.
+/// The shared fixture lives in a static, which never drops: an exit hook removes its directory, and after a kill the next run's sweep does.
 fn shared_dir() -> std::path::PathBuf {
-    let (scratch, dir) = work_dir("fixture");
-    std::mem::forget(scratch);
-    SHARED_DIR.set(dir.clone()).expect("one shared fixture");
+    scratch::sweep_dead_owners();
+    let s = Scratch::new("fixture");
+    let dir = s.path().to_path_buf();
+    assert!(SHARED_SCRATCH.set(s).is_ok(), "one shared fixture");
     assert_eq!(unsafe { atexit(remove_shared_dir) }, 0, "register the exit hook");
     dir
 }
@@ -547,8 +543,12 @@ fn the_verdict_enforces_each_tier() {
 
 #[test]
 fn the_fixture_contains_every_required_edge_case() {
-    let rows = fixture(SYMBOLS, sanitizer::pick(PER_SYMBOL, SANITIZER_PER_SYMBOL));
-    assert!(rows.len() >= sanitizer::pick(470_000, 100_000), "{} rows", rows.len());
+    let rows = fixture(SYMBOLS, PER_SYMBOL);
+    assert!(
+        rows.len() > 65_536 && rows.len().div_ceil(8_191) > 3,
+        "{} rows: need more than one 65,536-row store group and more 8,191-row groups than the 3 ring slots",
+        rows.len()
+    );
     assert!(rows.iter().any(|r| r.c.is_nan()), "NaN close");
     assert!(rows.iter().any(|r| r.v == 0.0), "zero volume");
     assert!(rows.iter().any(|r| r.h == r.l), "H == L");
@@ -810,8 +810,9 @@ fn mtf_device_context_accepts_a_long_holey_symbol() {
         return;
     }
     let _g = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
-    let rows = fixture(SYMBOLS, PER_SYMBOL);
+    let rows = fixture(1, LONG_SYMBOL_BARS);
     let sym0: Vec<Row> = rows.iter().copied().filter(|r| r.sym == 0).collect();
+    assert!(sym0.len() > 20_000, "{} rows", sym0.len());
     assert!(mtf_device_ok(&sym0), "the device MTF context failed on {} rows of one symbol", sym0.len());
 }
 
@@ -876,6 +877,150 @@ fn future_shifted(col: &[f64], rows: &[Row]) -> Vec<f64> {
     out
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kind {
+    TwoRows,
+    FlatLastBar,
+    ZeroVolume,
+    InOneBarHole,
+    AfterOneBarHole,
+    NanClose,
+    FewMembers,
+    Listing,
+    InShortHole,
+    InDayHole,
+    AfterDayHole,
+    AllButLast,
+    Short(&'static str),
+    First(&'static str),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Cut {
+    bar: usize,
+    kind: Kind,
+}
+
+fn bar_of(r: &Row) -> usize {
+    ((r.t - T0) / STEP) as usize
+}
+
+fn static_cuts(per: usize) -> Vec<Cut> {
+    use Kind::*;
+    [
+        (1, TwoRows),
+        (3, FlatLastBar),
+        (2 * 701, ZeroVolume),
+        (500 + 997, InOneBarHole),
+        (500 + 997 + 1, AfterOneBarHole),
+        (1500 + 7, NanClose),
+        (LATE_START - 1, FewMembers),
+        (LATE_START, Listing),
+        (per / 2 + 10, InShortHole),
+        (per * 3 / 4 + 65, InDayHole),
+        (per * 3 / 4 + 130, AfterDayHole),
+        (per - 2, AllButLast),
+    ]
+    .into_iter()
+    .map(|(bar, kind)| Cut { bar, kind })
+    .collect()
+}
+
+fn warmup(name: &str) -> usize {
+    enrich::default_registry()
+        .into_iter()
+        .find(|e| e.name == name)
+        .unwrap_or_else(|| panic!("{name} is not registered"))
+        .warmup
+}
+
+fn warmup_cuts(cross: &'static str) -> Vec<Cut> {
+    let mut out = Vec::new();
+    for (name, offset) in [("ma96", 0), ("ma672", 0), ("vol_z2880", 0), (cross, LATE_START)] {
+        let first = offset + warmup(name);
+        out.push(Cut { bar: first - 1, kind: Kind::Short(name) });
+        out.push(Cut { bar: first, kind: Kind::First(name) });
+    }
+    out
+}
+
+fn all_cuts(per: usize, cross: &'static str) -> Vec<Cut> {
+    let mut cuts = static_cuts(per);
+    cuts.extend(warmup_cuts(cross));
+    cuts.sort_by_key(|c| c.bar);
+    cuts
+}
+
+fn canary_bar(per: usize) -> usize {
+    per * 3 / 4 + 130
+}
+
+/// Every symbol's last row at or before `bar` and the row before it.
+fn tails(rows: &[Row], bar: usize) -> BTreeMap<usize, (Row, Option<Row>)> {
+    let mut out: BTreeMap<usize, (Row, Option<Row>)> = BTreeMap::new();
+    for r in rows.iter().filter(|r| bar_of(r) <= bar) {
+        match out.get_mut(&r.sym) {
+            Some(e) => *e = (*r, Some(e.0)),
+            None => {
+                out.insert(r.sym, (*r, None));
+            }
+        }
+    }
+    out
+}
+
+fn members_at(rows: &[Row], bar: usize) -> usize {
+    let t = T0 + bar as i64 * STEP;
+    rows.iter().filter(|r| r.t == t && r.member <= r.t).count()
+}
+
+/// `Err` unless `cut` lands on the boundary its kind names. Warm-up kinds are checked on device output.
+fn check_rows(rows: &[Row], per: usize, cut: &Cut) -> Result<(), String> {
+    let tails = tails(rows, cut.bar);
+    let kept = |k: usize| rows.iter().filter(|r| r.sym == k && bar_of(r) <= cut.bar).count();
+    let after = |k: usize| rows.iter().any(|r| r.sym == k && bar_of(r) > cut.bar);
+    let last = |k: usize| bar_of(&tails[&k].0);
+    let ok = match cut.kind {
+        Kind::TwoRows => tails.len() == 15 && tails.keys().all(|&k| kept(k) == 2),
+        Kind::FlatLastBar => tails.values().all(|(r, _)| r.h == r.l),
+        Kind::ZeroVolume => tails.iter().filter(|(k, _)| *k % 2 == 1).all(|(_, (r, _))| r.v == 0.0),
+        Kind::InOneBarHole => [0, 4, 8, 12]
+            .iter()
+            .all(|&k| last(k) == cut.bar - 1 && rows.iter().any(|r| r.sym == k && bar_of(r) == cut.bar + 1)),
+        Kind::AfterOneBarHole => [0, 4, 8, 12]
+            .iter()
+            .all(|&k| last(k) == cut.bar && tails[&k].1.map(|p| bar_of(&p)) == Some(cut.bar - 2)),
+        Kind::NanClose => tails[&9].0.c.is_nan(),
+        Kind::FewMembers => members_at(rows, cut.bar) < enrich::MIN_CROSS_MEMBERS,
+        Kind::Listing => {
+            (15..SYMBOLS).all(|k| kept(k) == 1) && members_at(rows, cut.bar) >= enrich::MIN_CROSS_MEMBERS
+        }
+        Kind::InShortHole => last(3) == per / 2 - 1 && after(3),
+        Kind::InDayHole => last(5) == per * 3 / 4 - 1 && after(5),
+        Kind::AfterDayHole => {
+            last(5) == cut.bar && tails[&5].1.is_some_and(|p| tails[&5].0.t - p.t > 86_400)
+        }
+        Kind::AllButLast => tails.values().all(|(r, _)| bar_of(r) == per - 2),
+        Kind::Short(_) | Kind::First(_) => true,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("cut at bar {} misses {:?}", cut.bar, cut.kind))
+    }
+}
+
+#[test]
+fn prefix_cuts_hit_their_boundaries() {
+    let per = PER_SYMBOL;
+    let rows = fixture(SYMBOLS, per);
+    let cuts = all_cuts(per, "breadth");
+    assert_eq!(cuts.len(), 20);
+    assert!(cuts.windows(2).all(|w| w[0].bar < w[1].bar), "two cuts share a bar: {cuts:?}");
+    let bad: Vec<String> = cuts.iter().filter_map(|c| check_rows(&rows, per, c).err()).collect();
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 #[test]
 fn prefix_replay_at_twenty_cuts_is_bit_identical_and_the_canary_fails() {
     if !have_device() {
@@ -883,27 +1028,51 @@ fn prefix_replay_at_twenty_cuts_is_bit_identical_and_the_canary_fails() {
     }
     let _g = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
     let s = shared();
-    let span = per_symbol() as i64 * STEP;
+    let per = per_symbol();
     let full: Vec<(String, Vec<f64>)> =
         s.names.iter().map(|n| (n.clone(), read_column(&s.gpu_out, n))).collect();
+    let cross = ["breadth", "dispersion", "mkt_breadth", "mkt_dispersion", "mkt_r16", "xs_rank_r16"]
+        .into_iter()
+        .find(|n| s.names.iter().any(|m| m == n))
+        .expect("a device column that needs MIN_CROSS_MEMBERS members with a finite r16");
+    let cuts = all_cuts(per, cross);
+    assert_eq!(cuts.len(), 20);
+    assert!(cuts.windows(2).all(|w| w[0].bar < w[1].bar), "two cuts share a bar: {cuts:?}");
     let mut canary_hits = 0usize;
     let mut canary_total = 0usize;
+    let mut kept_total = 0usize;
     let mut failures: BTreeMap<String, String> = BTreeMap::new();
     let mut known_prefix: BTreeMap<String, String> = BTreeMap::new();
-    for k in 0..20i64 {
-        let cut = T0 + span * (k + 1) / 21;
-        let kept: Vec<usize> = (0..s.rows.len()).filter(|&i| s.rows[i].t <= cut).collect();
+    for cut in &cuts {
+        let t_cut = T0 + cut.bar as i64 * STEP;
+        let kept: Vec<usize> = (0..s.rows.len()).filter(|&i| s.rows[i].t <= t_cut).collect();
+        kept_total += kept.len();
         let sub: Vec<Row> = kept.iter().map(|&i| s.rows[i]).collect();
         let src = p(&s.dir, "prefix-in.rcsb");
         let out = p(&s.dir, "prefix-out.rcsb");
         write_fixture(&src, &sub, 65_536);
         let r = enrich::build(&options(&src, &out, &s.names, GpuMode::On, 65_536)).unwrap();
-        assert_eq!(r.gpu_fallback, 0, "cut {k}");
+        assert_eq!(r.gpu_fallback, 0, "cut at bar {} ({:?})", cut.bar, cut.kind);
         for (name, col) in &full {
             let pre = read_column(&out, name);
+            match cut.kind {
+                Kind::Short(n) if n == name.as_str() => assert!(
+                    pre.iter().all(|v| v.is_nan()),
+                    "{name}: defined before its registry warm-up (cut at bar {})",
+                    cut.bar
+                ),
+                Kind::First(n) if n == name.as_str() => assert!(
+                    pre.iter().any(|v| v.is_finite()),
+                    "{name}: undefined at its registry warm-up (cut at bar {})",
+                    cut.bar
+                ),
+                _ => {}
+            }
             if let Err(row) = prefix_equal(col, &kept, &pre) {
                 let msg = format!(
-                    "cut {k} (t<={cut}): column '{name}' row {row} changed when later rows were removed: {:?} vs {:?}",
+                    "cut at bar {} ({:?}, t<={t_cut}): column '{name}' row {row} changed when later rows were removed: {:?} vs {:?}",
+                    cut.bar,
+                    cut.kind,
                     col[row],
                     pre[kept.iter().position(|&x| x == row).unwrap()]
                 );
@@ -914,9 +1083,10 @@ fn prefix_replay_at_twenty_cuts_is_bit_identical_and_the_canary_fails() {
                 }
                 continue;
             }
-            // Canary on the middle cut: a column that reads the future must be
-            // flagged against the replay (constant prefixes cannot be flagged).
-            if k == 10 {
+            // Canary on the cut after the > 1 day hole: a column that reads the
+            // future must be flagged against the replay (constant prefixes
+            // cannot be flagged).
+            if cut.bar == canary_bar(per) {
                 let distinct = pre.windows(2).any(|w| w[0].to_bits() != w[1].to_bits());
                 if distinct {
                     canary_total += 1;
@@ -934,9 +1104,61 @@ fn prefix_replay_at_twenty_cuts_is_bit_identical_and_the_canary_fails() {
         eprintln!("[parity] known bug (prefix replay) {n}: {m}");
     }
     assert!(failures.is_empty(), "{} columns are not prefix-causal:\n{}", failures.len(), failures.values().cloned().collect::<Vec<_>>().join("\n"));
-    eprintln!("[parity] prefix replay: 20 cuts x {} columns bit-identical; canary flagged {canary_hits}/{canary_total}", full.len());
+    eprintln!(
+        "[parity] prefix replay: {} cuts x {} columns bit-identical; kept rows {kept_total} = {:.2} x fixture; canary flagged {canary_hits}/{canary_total}",
+        cuts.len(),
+        full.len(),
+        kept_total as f64 / s.rows.len() as f64
+    );
+    assert!(kept_total < 7 * s.rows.len(), "prefix replay counted work: {kept_total} kept rows for {} fixture rows", s.rows.len());
     assert!(canary_total >= full.len() / 2, "canary had too few non-constant columns: {canary_total}");
     assert_eq!(canary_hits, canary_total, "a future-shifted column passed the replay check");
+}
+
+/// One symbol, the three bars up to every UTC midnight from 2023-01-01 to 2026-01-01.
+fn calendar_rows() -> Vec<Row> {
+    const FIRST_MIDNIGHT: i64 = 1_672_531_200;
+    const LAST_MIDNIGHT: i64 = 1_767_225_600;
+    let mut rows = Vec::new();
+    let mut midnight = FIRST_MIDNIGHT;
+    while midnight <= LAST_MIDNIGHT {
+        for t in [midnight - 2 * STEP, midnight - STEP, midnight] {
+            rows.push(Row { t, sym: 2, o: 100.0, h: 100.5, l: 99.5, c: 100.0, v: 1.0, qv: 100.0, trades: 1.0, tb: 0.5, tq: 50.0, member: t });
+        }
+        midnight += 86_400;
+    }
+    rows
+}
+
+#[test]
+fn calendar_columns_match_the_cpu_across_month_year_and_leap_day_boundaries() {
+    if !have_device() {
+        return;
+    }
+    let _g = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
+    enrich::set_gpu_floor_for_tests(0);
+    let cols: Vec<DeviceColumn> = device_columns().into_iter().filter(|c| c.family == "calendar").collect();
+    let names = gate_names(&cols);
+    for n in ["month_sin", "month_cos", "dom_sin", "dom_cos"] {
+        assert!(names.iter().any(|m| m == n), "{n} is not a device calendar column");
+    }
+    let rows = calendar_rows();
+    for t in [1_709_164_800i64, 1_709_251_200] {
+        assert!(rows.iter().any(|r| r.t == t), "calendar fixture misses {t}");
+    }
+    let (_scratch, dir) = work_dir("calendar");
+    let src = p(&dir, "in.rcsb");
+    write_fixture(&src, &rows, 65_536);
+    let (cpu_out, gpu_out) = (p(&dir, "cpu.rcsb"), p(&dir, "gpu.rcsb"));
+    enrich::build(&options(&src, &cpu_out, &names, GpuMode::Off, 65_536)).unwrap();
+    let gpu = enrich::build(&options(&src, &gpu_out, &names, GpuMode::On, 65_536)).unwrap();
+    assert_eq!(gpu.gpu_fallback, 0);
+    assert_eq!(gpu.gpu_columns, names.len());
+    for c in &cols {
+        let (o, cs, gs) = observe(&read_column(&cpu_out, &c.name), &read_column(&gpu_out, &c.name));
+        verdict(c.tier, &o, &cs, &gs).unwrap_or_else(|e| panic!("{} [{}]: {e}", c.name, c.tier));
+        assert_eq!(o.finite, rows.len(), "{}: defined on every row", c.name);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,7 +1232,7 @@ fn panel_prep_is_byte_identical_cpu_gpu_cold_warm_and_across_block_sizes() {
     for keep_partial in [false, true] {
         let cpu = cpu_prepare(&bars, &segments, STEP, 3_600, keep_partial).unwrap();
         let want = sha256_hex(&prep_bytes(&cpu));
-        assert!(!cpu.conflicts.is_empty() && cpu.buckets.len() > sanitizer::pick(100_000, 20_000));
+        assert!(!cpu.conflicts.is_empty() && cpu.buckets.len() > 20_000);
 
         let mut gpu = PrepGpu::new(&bars, &segments).expect("context");
         assert!(gpu.run(STEP, 3_600, keep_partial));
