@@ -4,10 +4,11 @@
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/fakes.sh"
 W=$HERE/../wait-for.sh
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
-export RCSR_POLL=0.2
+export VCLOCK=$T/clock
 fails=0
 check() {
   if [ "$2" != "$3" ]; then
@@ -15,62 +16,64 @@ check() {
     fails=$((fails + 1))
   fi
 }
-elapsed_ms() { echo $(( (${EPOCHREALTIME/./} - $1) / 1000 )); }
 
-# default pattern: background writer appends RC_DONE after 1 s
+# wait-for runs on a virtual clock: every sleep advances it by whole seconds and counts as one poll
+mkdir -p "$T/fake"; fake_clock "$T/fake"
+w() { PATH="$T/fake:$PATH" RCSR_POLL=1 bash "$W" "$@"; }
+
+# default pattern: the writer appends RC_DONE at virtual second 3
+vclock_reset
 : > "$T/a.log"
-(sleep 1; echo 'RC_DONE rc=0 at=x' >> "$T/a.log") &
-start=${EPOCHREALTIME/./}
-out=$(bash "$W" --log "$T/a.log"); rc=$?
-ms=$(elapsed_ms "$start")
+vclock_at 3 "echo 'RC_DONE rc=0 at=x' >> '$T/a.log'"
+out=$(w --log "$T/a.log"); rc=$?
 check log-rc "$rc" 0
 check log-line "$out" 'RC_DONE rc=0 at=x'
-[ "$ms" -lt 3000 ] || { echo "FAIL log-fast: $ms ms"; fails=$((fails + 1)); }
-[ "$ms" -ge 900 ] || { echo "FAIL log-waited: $ms ms"; fails=$((fails + 1)); }
-wait
+check log-polls "$(polls)" 3
 
-# timeout without a match, also for a missing log
+# timeout without a match, also for a missing log: one poll per second of the limit
+vclock_reset
 : > "$T/b.log"
-start=${EPOCHREALTIME/./}
-bash "$W" --log "$T/b.log" --timeout 1 > /dev/null; rc=$?
-ms=$(elapsed_ms "$start")
-check timeout-rc "$rc" 124
-[ "$ms" -lt 3000 ] || { echo "FAIL timeout-fast: $ms ms"; fails=$((fails + 1)); }
-bash "$W" --log "$T/missing.log" --timeout 1 > /dev/null; check timeout-missing-log "$?" 124
-bash "$W" --file "$T/nofile" --timeout 1 > /dev/null; check timeout-file "$?" 124
-bash "$W" --count 1 --dir "$T/nodir" --timeout 1 > /dev/null; check timeout-dir "$?" 124
-bash "$W" --log "$T/b.log" --timeout 0 > /dev/null; check timeout-zero "$?" 124
+w --log "$T/b.log" --timeout 3 > /dev/null; check timeout-rc "$?" 124
+check timeout-polls "$(polls)" 3
+vclock_reset; w --log "$T/missing.log" --timeout 1 > /dev/null; check timeout-missing-log "$?" 124
+check timeout-missing-log-polls "$(polls)" 1
+vclock_reset; w --file "$T/nofile" --timeout 1 > /dev/null; check timeout-file "$?" 124
+check timeout-file-polls "$(polls)" 1
+vclock_reset; w --count 1 --dir "$T/nodir" --timeout 1 > /dev/null; check timeout-dir "$?" 124
+check timeout-dir-polls "$(polls)" 1
+vclock_reset; w --log "$T/b.log" --timeout 0 > /dev/null; check timeout-zero "$?" 124
+check timeout-zero-polls "$(polls)" 0
 
 # a shell that waits on nothing else cannot be held by another process name
 check no-pgrep "$(grep -vE '^\s*#' "$W" | grep -cE 'pgrep|pkill|ps ')" 0
 
 # custom ERE
 printf 'x\nALLDONE 42\n' > "$T/c.log"
-out=$(bash "$W" --log "$T/c.log" --pattern 'ALLDONE [0-9]+' --timeout 2); rc=$?
+vclock_reset
+out=$(w --log "$T/c.log" --pattern 'ALLDONE [0-9]+' --timeout 2); rc=$?
 check pattern-rc "$rc" 0
 check pattern-line "$out" 'ALLDONE 42'
-bash "$W" --log "$T/c.log" --pattern '^RC_DONE' --timeout 1 > /dev/null; check pattern-nomatch "$?" 124
+check pattern-polls "$(polls)" 0
+vclock_reset; w --log "$T/c.log" --pattern '^RC_DONE' --timeout 1 > /dev/null; check pattern-nomatch "$?" 124
+check pattern-nomatch-polls "$(polls)" 1
 
 # --file waits for a non-empty file
+vclock_reset
 : > "$T/d.done"
-(sleep 1; echo ok > "$T/d.done") &
-start=${EPOCHREALTIME/./}
-bash "$W" --file "$T/d.done" --timeout 5; rc=$?
-ms=$(elapsed_ms "$start")
+vclock_at 2 "echo ok > '$T/d.done'"
+w --file "$T/d.done" --timeout 5; rc=$?
 check file-rc "$rc" 0
-[ "$ms" -ge 900 ] || { echo "FAIL file-waited-for-content: $ms ms"; fails=$((fails + 1)); }
-wait
+check file-polls "$(polls)" 2
 
 # --count returns once the third file appears
+vclock_reset
 mkdir "$T/dir"
 touch "$T/dir/f1.out" "$T/dir/skip.txt"
-(sleep 0.5; touch "$T/dir/f2.out"; sleep 0.7; touch "$T/dir/f3.out") &
-start=${EPOCHREALTIME/./}
-bash "$W" --count 3 --dir "$T/dir" --glob '*.out' --timeout 5; rc=$?
-ms=$(elapsed_ms "$start")
+vclock_at 1 "touch '$T/dir/f2.out'"
+vclock_at 2 "touch '$T/dir/f3.out'"
+w --count 3 --dir "$T/dir" --glob '*.out' --timeout 5; rc=$?
 check count-rc "$rc" 0
-[ "$ms" -ge 1100 ] || { echo "FAIL count-waited-for-third: $ms ms"; fails=$((fails + 1)); }
-wait
+check count-polls "$(polls)" 2
 
 # cargo log: matching line, then the summary block
 cat > "$T/e.log" <<'LOG'
@@ -80,14 +83,16 @@ test b ... ok
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 RC_DONE rc=0 at=2026-11-03T00:00:00Z
 LOG
-out=$(bash "$W" --log "$T/e.log" --timeout 2); rc=$?
+vclock_reset
+out=$(w --log "$T/e.log" --timeout 2); rc=$?
 check summary-rc "$rc" 0
 case $out in
   *'RC_DONE rc=0'*'tests: passed=2 failed=0 ignored=0 results=1/1'*'verdict: ok'*) ;;
   *) echo "FAIL summary-block: $out"; fails=$((fails + 1)) ;;
 esac
 # no summary for a plain log
-out=$(bash "$W" --log "$T/c.log" --pattern 'ALLDONE' --timeout 2)
+vclock_reset
+out=$(w --log "$T/c.log" --pattern "ALLDONE" --timeout 2)
 check no-summary "$out" 'ALLDONE 42'
 
 # usage errors

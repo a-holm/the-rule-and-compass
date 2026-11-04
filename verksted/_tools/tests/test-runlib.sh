@@ -4,7 +4,9 @@
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/fakes.sh"
 RLIB=$HERE/../runlib.sh
+ROOT_DIR=$(git -C "$HERE" rev-parse --show-toplevel)
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 fails=0
@@ -46,6 +48,8 @@ echo "chunk_s=\$RL_CHUNK_S n=\$RL_CHUNK_N"
 if [ \$n -le \$(cat "$T/tb") ]; then echo time_budget > "$T/stop_reason"; else echo converged > "$T/stop_reason"; fi
 EOF
 chmod +x "$T"/*.sh
+mkdir -p "$T/fake"; fake_timeout "$T/fake"
+printf '#!/usr/bin/env bash\necho "hang ran" >&2\nexit 99\n' > "$T/fake/hang"; chmod +x "$T/fake/hang"
 echo 0 > "$T/xid"
 cat > "$T/xid.sh" <<EOF
 cat "$T/xid"
@@ -56,7 +60,8 @@ rb() {
   local snippet=$1
   shift
   env RCSR_GATES="$T" RCSR_MACHINE_DIR="$T" RCSR_LOCK_SCRIPT="$T/lock.sh" RCSR_SLOT_SCRIPT="$T/slot.sh" \
-    RCSR_XID_CMD="bash $T/xid.sh" RL_TIME="$T/time.sh" RUN="$T/run" "$@" \
+    RCSR_XID_CMD="bash $T/xid.sh" RL_TIME="$T/time.sh" RUN="$T/run" RCSR_ROOT="$ROOT_DIR" \
+    PATH="$T/fake:$PATH" FAKE_TIMEOUT_LOG="$T/timeouts" "$@" \
     bash -c "set -uo pipefail; STEPS=(one two-b three); PROTECTED=(three); \
       step_one() { echo one >> '$T/order'; }; step_two_b() { echo two >> '$T/order'; }; \
       step_three() { echo three >> '$T/order'; }; \
@@ -157,12 +162,17 @@ rb 'rl_chunks s 100 50 "cat '"$T"'/stop_reason" -- '"$T"'/search.sh'; check budg
 check budget-lt-holds "$(wc -l < "$T/holds")" 1
 grep -q '^chunk_s=50 n=1$' "$T/run/s.log"; check budget-lt-trim $? 0
 
-# grace: a stub past its budget but inside the grace survives; past budget + grace it is killed
-rm -f "$T/holds" "$T/calls" "$T/run/gr.log"; echo 1 > "$T/wall"; echo 0 > "$T/tb"
-rb 'rl_chunks gr 1 1000 "echo converged" -- sleep 2' RL_GRACE_S=4; check grace-inside-rc $? 0
+# grace: a hold whose wall (fake, 3 s) is past its 1 s chunk but inside chunk + grace (5 s) succeeds;
+# a command that never ends is killed at chunk + grace
+rm -f "$T/holds" "$T/calls" "$T/run/gr.log"; : > "$T/timeouts"; echo 3 > "$T/wall"; echo 0 > "$T/tb"
+rb 'rl_chunks gr 1 1000 "echo converged" -- true' RL_GRACE_S=4; check grace-inside-rc $? 0
 grep -q "timeout 5s" "$T/run/run.log"; check grace-timeout-sum $? 0
-rb 'rl_chunks gk 1 1000 "echo converged" -- sleep 10' RL_GRACE_S=1; check grace-kill-rc $? 1
+check grace-inside-limit "$(tail -n 1 "$T/timeouts")" "5 true"
+grep -q '^\[chunk\] n=1 wall=3 stop=converged$' "$T/run/gr.log"; check grace-inside-wall $? 0
+rb 'rl_chunks gk 1 1000 "echo converged" -- hang' RL_GRACE_S=1; check grace-kill-rc $? 1
 grep -q "chunk 1 failed rc=124" "$T/out"; check grace-kill-msg $? 0
+check grace-kill-limit "$(tail -n 1 "$T/timeouts")" "2 hang"
+echo 1 > "$T/wall"
 rb 'rl_chunks gz 500 1000 "echo converged" -- true'; check grace-refuse-rc $? 1
 grep -q "refused: rl_chunks gz chunk 500s + grace 120s is above LOCK_HOLD_MAX=600s" "$T/out"; check grace-refuse-msg $? 0
 

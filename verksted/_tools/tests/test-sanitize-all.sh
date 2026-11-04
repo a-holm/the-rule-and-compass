@@ -4,6 +4,7 @@
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/fakes.sh"
 ALL=$HERE/../sanitize-all.sh
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -59,6 +60,7 @@ echo '{"reason":"build-finished","success":true}'
 exit "${FAKE_BUILD_RC:-0}"
 STUB
 chmod +x "$T/bin/cargo"
+fake_timeout "$T/bin"
 cat > "$T/cuda-13.0/bin/compute-sanitizer" <<'STUB'
 #!/usr/bin/env bash
 echo "san under=${RCSR_UNDER_SANITIZER:-} $*" >> "$FAKE_DIR/san-calls"
@@ -86,10 +88,10 @@ STUB
 chmod +x "$T/cuda-13.0/bin/compute-sanitizer"
 
 run() {
-  : > "$T/calls"; : > "$T/san-calls"; : > "$T/cargo-calls"
+  : > "$T/calls"; : > "$T/san-calls"; : > "$T/cargo-calls"; : > "$T/timeouts"
   env FAKE_DIR="$T" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
     RCSR_XID_CMD="cat '$T/xid'" RCSR_SANITIZER="$T/cuda-13.0/bin/compute-sanitizer" RCSR_SANITIZER_PLAN="$T/plan" \
-    PATH="$T/bin:$PATH" bash "$ALL" "$@"
+    FAKE_TIMEOUT_LOG="$T/timeouts" PATH="$T/bin:$PATH" bash "$ALL" "$@"
 }
 sum=$T/gates/issue9-san-summary.log
 
@@ -110,6 +112,8 @@ has full-lock "$T/calls" '^lock .*timeout 580 '
 has full-line "$sum" '^gpu_fit rc=0 xid=4->4 secs=[0-9]+ \| test result: ok\. 1 passed.* \| =+ ERROR SUMMARY: 0 errors$'
 has full-api-line "$sum" '^gpu_memory_plan:refused_alloc rc=0 xid=4->4 secs='
 check full-run-lines "$(grep -c ' rc=' "$sum")" "6"
+check full-limits "$(grep -c "^580 .*compute-sanitizer" "$T/timeouts")" "$(wc -l < "$T/san-calls" | tr -d " ")"
+check full-limits-all "$(grep -c compute-sanitizer "$T/timeouts")" "$(wc -l < "$T/san-calls" | tr -d " ")"
 
 # --only: two binaries, four-style runs for the api-errors-no binary
 run "$T/wt" 9 --only gpu_memory_plan --only gpu_fit > /dev/null 2>&1; r=$?

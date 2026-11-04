@@ -40,11 +40,10 @@ fd_holders() {
 }
 
 busy_under() {
-  local w=$1 p cwd comm
-  for p in /proc/[0-9]*; do
-    cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
-    case "$cwd/" in "$w"/*) ;; *) continue ;; esac
-    comm=$(cat "$p/comm" 2>/dev/null) || continue
+  local w=$1 pat pid comm
+  pat=$(printf '%s' "$w" | sed 's/[][*?\\]/\\&/g')
+  for pid in $(find /proc/[0-9]*/cwd -maxdepth 0 \( -lname "$pat" -o -lname "$pat/*" \) -printf '%h\n' 2>/dev/null | cut -d/ -f3); do
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
     case $comm in cargo | rustc | nvcc | rcsr | flock) return 0 ;; esac
   done
   return 1

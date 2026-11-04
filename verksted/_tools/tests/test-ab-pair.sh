@@ -4,6 +4,7 @@
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/fakes.sh"
 AB=$HERE/../ab-pair.sh
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -15,7 +16,8 @@ check() {
     fails=$((fails + 1))
   fi
 }
-mkdir "$T/gates" "$T/bin"
+mkdir "$T/gates" "$T/bin" "$T/fake"
+fake_timeout "$T/fake"
 echo 0 > "$T/xid"
 printf '#!/bin/sh\nexec "$@"\n' > "$T/lock.sh"
 cat > "$T/bin/good" <<'EOF'
@@ -26,11 +28,11 @@ while [ $i -lt 20000 ]; do i=$((i + 1)); done
 EOF
 printf '#!/bin/sh\necho "args: $*"\nexit 3\n' > "$T/bin/bad"
 printf '#!/bin/sh\necho 5 > "%s/xid"\n' "$T" > "$T/bin/bump"
-printf '#!/bin/sh\nsleep 5\n' > "$T/bin/slow"
+printf '#!/bin/sh\necho "hang ran" >&2\nexit 99\n' > "$T/bin/hang"
 chmod +x "$T"/lock.sh "$T"/bin/*
 
 ab() {
-  RCSR_GATES=$T/gates RCSR_LOCK_SCRIPT=$T/lock.sh RCSR_XID_CMD="cat $T/xid" bash "$AB" "$@" > "$T/out" 2>&1
+  PATH="$T/fake:$PATH" FAKE_TIMEOUT_LOG="$T/timeouts" RCSR_GATES=$T/gates RCSR_LOCK_SCRIPT=$T/lock.sh RCSR_XID_CMD="cat $T/xid" bash "$AB" "$@" > "$T/out" 2>&1
 }
 
 # three seeds: order AB, BA, AB; {seed} replaced
@@ -46,6 +48,7 @@ check ok-medians "$(grep -c 'median_user_s=' "$d/summary.txt")" "2"
 check ok-ratio "$(grep -cE '^ratio_user b/a ' "$d/summary.txt")" "1"
 check ok-sha "$(grep -c 'sha256=' "$d/summary.txt")" "2"
 check ok-done "$(tail -n 1 "$T/gates/ab-ok.log" | cut -c1-12)" "RC_DONE rc=0"
+check ok-limits "$(grep -c "^280 " "$T/timeouts")" "6"
 
 # a failing arm: exit 1, pair continues
 ab --label bad --a "$T/bin/good" --b "$T/bin/bad" --seeds 1,2 -- x; rc=$?
@@ -59,9 +62,10 @@ check one-rc "$rc" "0"
 check one-rows "$(wc -l < "$T/gates/ab-one/runs.tsv")" "2"
 
 # a timeout records rc 124
-ab --label slow --a "$T/bin/slow" --b "$T/bin/good" --seeds 1 --timeout 1 -- x; rc=$?
+ab --label slow --a "$T/bin/hang" --b "$T/bin/good" --seeds 1 --timeout 1 -- x; rc=$?
 check slow-rc "$rc" "1"
 check slow-124 "$(awk -F'\t' '$1 == "A" { print $8 }' "$T/gates/ab-slow/runs.tsv")" "124"
+check slow-limit "$(grep -c "^1 $T/bin/hang x\$" "$T/timeouts")" "1"
 
 # Xid rise
 ab --label xid --a "$T/bin/bump" --b "$T/bin/good" --seeds 1,2,3 -- x; rc=$?
