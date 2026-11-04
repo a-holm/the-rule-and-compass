@@ -738,7 +738,7 @@ segment-parallel consumers only fill the device at a realistic symbol count):
 | flow | 6.084 | 12.534 | 156.488 ms/Mrow | 194.235 ms/Mrow |
 | price_action | 9.224 | 3.619 | 49.031 ms/Mrow | 69.495 ms/Mrow |
 
-The wall figure is download-bound: the measured D2H rate is 2.77 GB/s, which is the output-path problem of #300. `features_gpu::{FLOW_COST, PRICE_ACTION_COST}` hold the earlier constants (flow 11.4 and 3.3, price_action 8.8 and 2.5 ms/Mrow); `plan_groups` costs with those constants, so the table and the constants differ. A fused family is not dispatched by `--gpu auto` below
+The wall figure is download-bound: the measured D2H rate is 2.77 GB/s, which is the output-path problem of #300. `features_gpu::{FLOW_COST, PRICE_ACTION_COST}` hold the base and per-column values of this table, and `plan_groups` costs with them. A fused family is not dispatched by `--gpu auto` below
 **32 symbol segments** (`FUSED_MIN_SEGMENTS`); `--gpu on` still forces it, which
 is how the two-symbol parity fixture exercises every kernel. At 16 M rows and
 109 symbols the measured rates give about 3.3 s of kernel time for the 23 columns
