@@ -96,8 +96,8 @@ Each device term is the median of its timed reps after untimed warm-up reps
 spread is the largest rep over the smallest rep. Nothing is clamped. Two probes
 agree on a term when their values differ by no more than the larger of the two
 probes' spreads (`Calibration::agreement`); the ignored tests
-`host_probe_three_runs_agree_within_the_larger_of_their_own_spreads` and the
-device counterpart measure this and are not part of a normal run.
+`host_probe_three_runs_print_their_agreement` and the device counterpart print
+the ratios and bands and assert nothing about them; they are not part of a normal run.
 
 The result JSON (`--json` → `dispatch.calibration`, `--ndjson` done event →
 `dispatch`) carries the provenance labels only: `source` (`anchors`, `file` or
