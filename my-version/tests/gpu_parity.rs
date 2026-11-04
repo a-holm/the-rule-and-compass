@@ -926,6 +926,8 @@ fn static_cuts(per: usize) -> Vec<Cut> {
     .collect()
 }
 
+const WARMUP_CROSS: &str = "xs_rank_r16";
+
 fn warmup(name: &str) -> usize {
     enrich::default_registry()
         .into_iter()
@@ -1014,7 +1016,8 @@ fn check_rows(rows: &[Row], per: usize, cut: &Cut) -> Result<(), String> {
 fn prefix_cuts_hit_their_boundaries() {
     let per = PER_SYMBOL;
     let rows = fixture(SYMBOLS, per);
-    let cuts = all_cuts(per, "breadth");
+    let cuts = all_cuts(per, WARMUP_CROSS);
+    assert_eq!(warmup(WARMUP_CROSS), 16, "registry warm-up of {WARMUP_CROSS}");
     assert_eq!(cuts.len(), 20);
     assert!(cuts.windows(2).all(|w| w[0].bar < w[1].bar), "two cuts share a bar: {cuts:?}");
     let bad: Vec<String> = cuts.iter().filter_map(|c| check_rows(&rows, per, c).err()).collect();
@@ -1031,11 +1034,12 @@ fn prefix_replay_at_twenty_cuts_is_bit_identical_and_the_canary_fails() {
     let per = per_symbol();
     let full: Vec<(String, Vec<f64>)> =
         s.names.iter().map(|n| (n.clone(), read_column(&s.gpu_out, n))).collect();
-    let cross = ["breadth", "dispersion", "mkt_breadth", "mkt_dispersion", "mkt_r16", "xs_rank_r16"]
-        .into_iter()
-        .find(|n| s.names.iter().any(|m| m == n))
-        .expect("a device column that needs MIN_CROSS_MEMBERS members with a finite r16");
-    let cuts = all_cuts(per, cross);
+    assert!(
+        s.names.iter().any(|m| m == WARMUP_CROSS),
+        "{WARMUP_CROSS} is not a device column: {:?}",
+        s.names
+    );
+    let cuts = all_cuts(per, WARMUP_CROSS);
     assert_eq!(cuts.len(), 20);
     assert!(cuts.windows(2).all(|w| w[0].bar < w[1].bar), "two cuts share a bar: {cuts:?}");
     let mut canary_hits = 0usize;
