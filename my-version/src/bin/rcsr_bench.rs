@@ -589,6 +589,12 @@ fn main() {
             let mut out = stdout.lock();
             let _ = writeln!(out, "{}", bench::run_ndjson(r, &cfg_ref));
             let _ = out.flush();
+            // Test hook: the hold must follow the flush so the child cannot exit while held.
+            if let Some(hold) = std::env::var_os("RCSR_BENCH_HOLD") {
+                while !std::path::Path::new(&hold).exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
         });
         let report = bench::build_report(results, &cfg);
         let mut out = stdout.lock();
