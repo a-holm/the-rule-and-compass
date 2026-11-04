@@ -18,6 +18,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "launch_guard.h"
 #include "alloc_guard.h"
 #include <math.h>
 #include <stdint.h>
@@ -318,9 +319,9 @@ static int tail_extrema_launch(const long long *t, const double *x, int n,
     if (n <= 0 || w <= 0) return -1;
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
-    k_tail_fill_nan<<<blocks, threads>>>(out, n);
-    k_tail_extrema_prefix<<<blocks, threads>>>(x, n, seg_id, ss, sl, w, want_max, pre);
-    k_tail_extrema_suffix<<<blocks, threads>>>(t, x, n, seg_id, ss, sl, step, w,
+    rc_launch("k_tail_fill_nan", k_tail_fill_nan, blocks, threads, 0, 0, out, n);
+    rc_launch("k_tail_extrema_prefix", k_tail_extrema_prefix, blocks, threads, 0, 0, x, n, seg_id, ss, sl, w, want_max, pre);
+    rc_launch("k_tail_extrema_suffix", k_tail_extrema_suffix, blocks, threads, 0, 0, t, x, n, seg_id, ss, sl, step, w,
                                                want_max, pre, out);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
@@ -379,7 +380,7 @@ extern "C" int rc_tail_donchian(const long long *t, const double *high,
     if (rc == 0) rc = tail_extrema_launch(t, low, n, seg_id, ss, sl, step, w, 0, pre, lo);
     if (rc == 0) {
         int threads = 256, blocks = (n + threads - 1) / threads;
-        k_tail_donchian_combine<<<blocks, threads>>>(close, hi, lo, n, centred, out);
+        rc_launch("k_tail_donchian_combine", k_tail_donchian_combine, blocks, threads, 0, 0, close, hi, lo, n, centred, out);
         if (cudaGetLastError() != cudaSuccess) rc = -1;
     }
     if (rc == 0 && cudaDeviceSynchronize() != cudaSuccess) rc = -1;
@@ -454,12 +455,12 @@ __global__ void k_tail_stoch_d(const long long *__restrict__ t,
     if (rc == 0) rc = tail_extrema_launch(t, low, n, seg_id, ss, sl, step, w, 0, pre, lo);
     if (rc == 0) {
         int threads = 256, blocks = (n + threads - 1) / threads;
-        k_tail_stoch_k<<<blocks, threads>>>(t, close, hi, lo, n, step, w, mean_w, out);
+        rc_launch("k_tail_stoch_k", k_tail_stoch_k, blocks, threads, 0, 0, t, close, hi, lo, n, step, w, mean_w, out);
         if (cudaGetLastError() != cudaSuccess) rc = -1;
     }
     if (rc == 0 && which == 1) {
         int threads = 128, sblocks = (nseg + threads - 1) / threads;
-        k_tail_stoch_d<<<sblocks, threads>>>(t, ss, sl, nseg, step, mean_w, out);
+        rc_launch("k_tail_stoch_d", k_tail_stoch_d, sblocks, threads, 0, 0, t, ss, sl, nseg, step, mean_w, out);
         if (cudaGetLastError() != cudaSuccess) rc = -1;
     }
     if (rc == 0 && cudaDeviceSynchronize() != cudaSuccess) rc = -1;
@@ -771,7 +772,7 @@ extern "C" int rc_tail_atr(const long long *t, const double *high,
     double *tr = NULL;
     if (rc_checked_malloc((void **)&tr, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
     int threads = 128, blocks = (nseg + threads - 1) / threads;
-    k_tail_atr<<<blocks, threads>>>(t, high, low, close, ss, sl, nseg, step,
+    rc_launch("k_tail_atr", k_tail_atr, blocks, threads, 0, 0, t, high, low, close, ss, sl, nseg, step,
                                     period, which, tr, out);
     int rc = cudaGetLastError() == cudaSuccess ? 0 : -1;
     if (rc == 0 && cudaDeviceSynchronize() != cudaSuccess) rc = -1;
@@ -787,7 +788,7 @@ extern "C" int rc_tail_batr(const long long *t, const double *open,
     double *tr = NULL;
     if (rc_checked_malloc((void **)&tr, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
     int threads = 128, blocks = (nseg + threads - 1) / threads;
-    k_tail_batr<<<blocks, threads>>>(t, open, high, low, close, ss, sl, nseg,
+    rc_launch("k_tail_batr", k_tail_batr, blocks, threads, 0, 0, t, open, high, low, close, ss, sl, nseg,
                                      step, period, tr, out);
     int rc = cudaGetLastError() == cudaSuccess ? 0 : -1;
     if (rc == 0 && cudaDeviceSynchronize() != cudaSuccess) rc = -1;
@@ -803,7 +804,7 @@ extern "C" int rc_tail_gapatr(const long long *t, const double *open,
     double *tr = NULL;
     if (rc_checked_malloc((void **)&tr, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
     int threads = 128, blocks = (nseg + threads - 1) / threads;
-    k_tail_gapatr<<<blocks, threads>>>(t, open, high, low, close, ss, sl, nseg,
+    rc_launch("k_tail_gapatr", k_tail_gapatr, blocks, threads, 0, 0, t, open, high, low, close, ss, sl, nseg,
                                        step, period, tr, out);
     int rc = cudaGetLastError() == cudaSuccess ? 0 : -1;
     if (rc == 0 && cudaDeviceSynchronize() != cudaSuccess) rc = -1;
@@ -823,7 +824,7 @@ extern "C" int rc_tail_volrat(const long long *t, const double *high,
         return -1;
     }
     int threads = 128, blocks = (nseg + threads - 1) / threads;
-    k_tail_volrat<<<blocks, threads>>>(t, high, low, close, ss, sl, nseg, step,
+    rc_launch("k_tail_volrat", k_tail_volrat, blocks, threads, 0, 0, t, high, low, close, ss, sl, nseg, step,
                                        p1, p2, tr, a1, out);
     int rc = cudaGetLastError() == cudaSuccess ? 0 : -1;
     if (rc == 0 && cudaDeviceSynchronize() != cudaSuccess) rc = -1;
@@ -849,7 +850,7 @@ extern "C" int rc_tail_adx(const long long *t, const double *high,
         return -1;
     }
     int threads = 128, blocks = (nseg + threads - 1) / threads;
-    k_tail_adx<<<blocks, threads>>>(t, high, low, close, ss, sl, nseg, step,
+    rc_launch("k_tail_adx", k_tail_adx, blocks, threads, 0, 0, t, high, low, close, ss, sl, nseg, step,
                                     period, which, tr, pdi, mdi, out);
     int rc = cudaGetLastError() == cudaSuccess ? 0 : -1;
     if (rc == 0 && cudaDeviceSynchronize() != cudaSuccess) rc = -1;
@@ -940,9 +941,9 @@ extern "C" int rc_tail_bb_z(const long long *t, const double *close,
 {
     int threads = 128, blocks = (nseg + threads - 1) / threads;
     if (mode == 0) {
-        k_tail_bb_z_direct<<<blocks, threads>>>(t, close, ss, sl, nseg, step, w, out);
+        rc_launch("k_tail_bb_z_direct", k_tail_bb_z_direct, blocks, threads, 0, 0, t, close, ss, sl, nseg, step, w, out);
     } else {
-        k_tail_bb_z_prefix<<<nseg, 32>>>(t, close, ss, sl, nseg, step, w, mode, out);
+        rc_launch("k_tail_bb_z_prefix", k_tail_bb_z_prefix, nseg, 32, 0, 0, t, close, ss, sl, nseg, step, w, mode, out);
     }
     int rc = cudaGetLastError() == cudaSuccess ? 0 : -1;
     if (rc == 0 && cudaDeviceSynchronize() != cudaSuccess) rc = -1;
@@ -989,7 +990,7 @@ extern "C" int rc_tail_ma_slope(const long long *t, const double *close,
                                 const int *ss, const int *sl, int nseg, int n,
                                 int step, int w, int lag, double *out)
 {
-    k_tail_ma_slope<<<nseg, 32>>>(t, close, ss, sl, nseg, step, w, lag, out);
+    rc_launch("k_tail_ma_slope", k_tail_ma_slope, nseg, 32, 0, 0, t, close, ss, sl, nseg, step, w, lag, out);
     int rc = cudaGetLastError() == cudaSuccess ? 0 : -1;
     if (rc == 0 && cudaDeviceSynchronize() != cudaSuccess) rc = -1;
     (void)n;
@@ -1015,7 +1016,7 @@ extern "C" int rc_tail_tod(const long long *t, int n, int step, int want_sin,
                            double *out)
 {
     int threads = 256, blocks = (n + threads - 1) / threads;
-    k_tail_tod<<<blocks, threads>>>(t, n, step, want_sin, out);
+    rc_launch("k_tail_tod", k_tail_tod, blocks, threads, 0, 0, t, n, step, want_sin, out);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
@@ -1373,7 +1374,7 @@ extern "C" int rc_tail_exotic(const long long *t, const double *high,
     switch (which) {
     case 0:
     case 1:
-        k_tail_exotic_simple5<<<blocks, threads>>>(t, close, ss, sl, nseg, step,
+        rc_launch("k_tail_exotic_simple5", k_tail_exotic_simple5, blocks, threads, 0, 0, t, close, ss, sl, nseg, step,
                                                    which, out);
         break;
     case 2: {
@@ -1392,7 +1393,7 @@ extern "C" int rc_tail_exotic(const long long *t, const double *high,
         if (rc == 0) rc = tail_extrema_launch(t, low, n, seg_id, ss, sl, step, 20, 0, pre, lo);
         if (rc == 0) {
             int tb = 256, bb = (n + tb - 1) / tb;
-            k_tail_close_pos_combine<<<bb, tb>>>(close, hi, lo, n, out);
+            rc_launch("k_tail_close_pos_combine", k_tail_close_pos_combine, bb, tb, 0, 0, close, hi, lo, n, out);
             if (cudaGetLastError() != cudaSuccess) rc = -1;
         }
         if (rc == 0 && cudaDeviceSynchronize() != cudaSuccess) rc = -1;
@@ -1402,25 +1403,25 @@ extern "C" int rc_tail_exotic(const long long *t, const double *high,
         return rc;
     }
     case 3:
-        k_tail_exotic_ou<<<blocks, threads>>>(t, close, ss, sl, nseg, step, out);
+        rc_launch("k_tail_exotic_ou", k_tail_exotic_ou, blocks, threads, 0, 0, t, close, ss, sl, nseg, step, out);
         break;
     case 4:
-        k_tail_exotic_acf<<<nseg, 32>>>(t, close, ss, sl, nseg, step, out);
+        rc_launch("k_tail_exotic_acf", k_tail_exotic_acf, nseg, 32, 0, 0, t, close, ss, sl, nseg, step, out);
         break;
     case 5:
-        k_tail_exotic_vr4<<<nseg, 32>>>(t, close, ss, sl, nseg, step, out);
+        rc_launch("k_tail_exotic_vr4", k_tail_exotic_vr4, nseg, 32, 0, 0, t, close, ss, sl, nseg, step, out);
         break;
     case 6:
-        k_tail_exotic_rskew<<<blocks, threads>>>(t, close, ss, sl, nseg, step, out);
+        rc_launch("k_tail_exotic_rskew", k_tail_exotic_rskew, blocks, threads, 0, 0, t, close, ss, sl, nseg, step, out);
         break;
     case 7:
-        k_tail_exotic_jump<<<nseg, 32>>>(t, close, ss, sl, nseg, step, out);
+        rc_launch("k_tail_exotic_jump", k_tail_exotic_jump, nseg, 32, 0, 0, t, close, ss, sl, nseg, step, out);
         break;
     case 8:
-        k_tail_exotic_semivar<<<nseg, 32>>>(t, close, ss, sl, nseg, step, out);
+        rc_launch("k_tail_exotic_semivar", k_tail_exotic_semivar, nseg, 32, 0, 0, t, close, ss, sl, nseg, step, out);
         break;
     case 9:
-        k_tail_exotic_cusum<<<blocks, threads>>>(t, close, ss, sl, nseg, step, out);
+        rc_launch("k_tail_exotic_cusum", k_tail_exotic_cusum, blocks, threads, 0, 0, t, close, ss, sl, nseg, step, out);
         break;
     default:
         return -1;

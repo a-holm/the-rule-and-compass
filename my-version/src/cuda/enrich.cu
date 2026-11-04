@@ -15,6 +15,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "launch_guard.h"
 #include "alloc_guard.h"
 #include "cub_guard.h"
 #include <math.h>
@@ -219,6 +220,15 @@ struct RwArena {
     double *c2;
     int *cn;
     int *bk;
+};
+
+template <>
+struct RcArgCheck<RwArena> {
+    static bool ok(const RwArena &a)
+    {
+        return rc_dev_ok(a.s1) && rc_dev_ok(a.c1) && rc_dev_ok(a.s2) && rc_dev_ok(a.c2) &&
+               rc_dev_ok(a.cn) && rc_dev_ok(a.bk);
+    }
 };
 
 struct RwArenaView {
@@ -1315,7 +1325,7 @@ int rc_enrich_ret(void *v, int k, double *out)
     RcEnrich *c = (RcEnrich *)v;
     RC_ELEM_BEGIN(c, 0, 0);
     int threads = 256, blocks = (c->n + threads - 1) / threads;
-    RC_ELEM_LAUNCH(c, (k_ret<<<blocks, threads>>>(c->d_times, c->d_close, c->d_seg_id,
+    RC_ELEM_LAUNCH(c, (rc_launch("k_ret", k_ret, blocks, threads, 0, 0, c->d_times, c->d_close, c->d_seg_id,
                                                   c->n, c->step, k, c->d_out)));
     RC_DOWNLOAD(c, out, c->d_out);
     RC_END(c);
@@ -1326,7 +1336,7 @@ int rc_enrich_lag(void *v, int k, double *out)
     RcEnrich *c = (RcEnrich *)v;
     RC_ELEM_BEGIN(c, 0, 0);
     int threads = 256, blocks = (c->n + threads - 1) / threads;
-    RC_ELEM_LAUNCH(c, (k_lag<<<blocks, threads>>>(c->d_times, c->d_close, c->d_seg_id,
+    RC_ELEM_LAUNCH(c, (rc_launch("k_lag", k_lag, blocks, threads, 0, 0, c->d_times, c->d_close, c->d_seg_id,
                                                   c->n, c->step, k, c->d_out)));
     RC_DOWNLOAD(c, out, c->d_out);
     RC_END(c);
@@ -1337,7 +1347,7 @@ int rc_enrich_range(void *v, double *out)
     RcEnrich *c = (RcEnrich *)v;
     RC_ELEM_BEGIN(c, 0, 0);
     int threads = 256, blocks = (c->n + threads - 1) / threads;
-    RC_ELEM_LAUNCH(c, (k_range<<<blocks, threads>>>(c->d_high, c->d_low, c->d_close,
+    RC_ELEM_LAUNCH(c, (rc_launch("k_range", k_range, blocks, threads, 0, 0, c->d_high, c->d_low, c->d_close,
                                                     c->n, c->d_out)));
     RC_DOWNLOAD(c, out, c->d_out);
     RC_END(c);
@@ -1348,7 +1358,7 @@ int rc_enrich_clv(void *v, double *out)
     RcEnrich *c = (RcEnrich *)v;
     RC_ELEM_BEGIN(c, 0, 0);
     int threads = 256, blocks = (c->n + threads - 1) / threads;
-    RC_ELEM_LAUNCH(c, (k_clv<<<blocks, threads>>>(c->d_high, c->d_low, c->d_close,
+    RC_ELEM_LAUNCH(c, (rc_launch("k_clv", k_clv, blocks, threads, 0, 0, c->d_high, c->d_low, c->d_close,
                                                   c->n, c->d_out)));
     RC_DOWNLOAD(c, out, c->d_out);
     RC_END(c);
@@ -1359,7 +1369,7 @@ int rc_enrich_calendar(void *v, int which, double *out)
     RcEnrich *c = (RcEnrich *)v;
     RC_ELEM_BEGIN(c, 0, 0);
     int threads = 256, blocks = (c->n + threads - 1) / threads;
-    RC_ELEM_LAUNCH(c, (k_calendar<<<blocks, threads>>>(c->d_times, c->n, which, c->d_out)));
+    RC_ELEM_LAUNCH(c, (rc_launch("k_calendar", k_calendar, blocks, threads, 0, 0, c->d_times, c->n, which, c->d_out)));
     RC_DOWNLOAD(c, out, c->d_out);
     RC_END(c);
 }
@@ -1372,7 +1382,7 @@ static RwArena rw_arena(const RcEnrich *c)
 
 static void rw_launch_pre(const RcEnrich *c, const double *x, bool sq)
 {
-    k_rw_pre<<<c->nseg, 32>>>(x, c->d_times, c->d_seg_start, c->d_seg_len, c->step, sq,
+    rc_launch("k_rw_pre", k_rw_pre, c->nseg, 32, 0, 0, x, c->d_times, c->d_seg_start, c->d_seg_len, c->step, sq,
                               rw_arena(c));
 }
 
@@ -1380,17 +1390,17 @@ static void rw_launch_ma(const RcEnrich *c, int w, int mode, double *out)
 {
     int threads = 256, blocks = (c->n + threads - 1) / threads;
     rw_launch_pre(c, c->d_close, false);
-    k_ma<<<blocks, threads>>>(c->d_times, c->d_close, c->d_seg_id, c->d_seg_start, c->n,
+    rc_launch("k_ma", k_ma, blocks, threads, 0, 0, c->d_times, c->d_close, c->d_seg_id, c->d_seg_start, c->n,
                               c->step, w, mode, rw_arena(c), out);
 }
 
 static void rw_launch_vol(const RcEnrich *c, int w, double *out)
 {
     int threads = 256, blocks = (c->n + threads - 1) / threads;
-    k_vol_ret<<<blocks, threads>>>(c->d_times, c->d_close, c->d_seg_id, c->d_seg_start, c->n,
+    rc_launch("k_vol_ret", k_vol_ret, blocks, threads, 0, 0, c->d_times, c->d_close, c->d_seg_id, c->d_seg_start, c->n,
                                    c->step, c->d_d);
     rw_launch_pre(c, c->d_d, true);
-    k_vol<<<blocks, threads>>>(c->d_times, c->d_d, c->d_seg_id, c->d_seg_start, c->n, c->step,
+    rc_launch("k_vol", k_vol, blocks, threads, 0, 0, c->d_times, c->d_d, c->d_seg_id, c->d_seg_start, c->n, c->step,
                                w, rw_arena(c), out);
 }
 
@@ -1398,16 +1408,16 @@ static void rw_launch_bb_width(const RcEnrich *c, int w, double *out)
 {
     int threads = 256, blocks = (c->n + threads - 1) / threads;
     rw_launch_pre(c, c->d_close, true);
-    k_bb_width<<<blocks, threads>>>(c->d_times, c->d_close, c->d_seg_id, c->d_seg_start, c->n,
+    rc_launch("k_bb_width", k_bb_width, blocks, threads, 0, 0, c->d_times, c->d_close, c->d_seg_id, c->d_seg_start, c->n,
                                     c->step, w, rw_arena(c), out);
 }
 
 static void rw_launch_vz(const RcEnrich *c, int w, double *out)
 {
     int threads = 256, blocks = (c->n + threads - 1) / threads;
-    k_vz_x<<<blocks, threads>>>(c->d_volume, c->n, c->d_d);
+    rc_launch("k_vz_x", k_vz_x, blocks, threads, 0, 0, c->d_volume, c->n, c->d_d);
     rw_launch_pre(c, c->d_d, true);
-    k_vz<<<blocks, threads>>>(c->d_times, c->d_d, c->d_seg_id, c->d_seg_start, c->n, c->step,
+    rc_launch("k_vz", k_vz, blocks, threads, 0, 0, c->d_times, c->d_d, c->d_seg_id, c->d_seg_start, c->n, c->step,
                               w, rw_arena(c), out);
 }
 
@@ -1591,7 +1601,7 @@ int rc_enrich_ema(void *v, int span, double *out)
     RcEnrich *c = (RcEnrich *)v;
     RC_ELEM_BEGIN(c, 0, 0);
     int threads = 128, blocks = (c->nseg + threads - 1) / threads;
-    RC_ELEM_LAUNCH(c, (k_ema_ratio<<<blocks, threads>>>(c->d_times, c->d_close,
+    RC_ELEM_LAUNCH(c, (rc_launch("k_ema_ratio", k_ema_ratio, blocks, threads, 0, 0, c->d_times, c->d_close,
                                                         c->d_seg_start, c->d_seg_len,
                                                         c->nseg, c->step, span, c->d_out)));
     RC_DOWNLOAD(c, out, c->d_out);
@@ -1603,7 +1613,7 @@ int rc_enrich_macd(void *v, double *macd, double *sig, double *hist)
     RcEnrich *c = (RcEnrich *)v;
     RC_ELEM_BEGIN(c, 0, 0);
     int threads = 128, blocks = (c->nseg + threads - 1) / threads;
-    RC_ELEM_LAUNCH(c, (k_macd<<<blocks, threads>>>(c->d_times, c->d_close,
+    RC_ELEM_LAUNCH(c, (rc_launch("k_macd", k_macd, blocks, threads, 0, 0, c->d_times, c->d_close,
                                                    c->d_seg_start, c->d_seg_len, c->nseg,
                                                    c->step, c->d_out, c->d_out2, c->d_out3)));
     RC_DOWNLOAD(c, macd, c->d_out);
@@ -1617,7 +1627,7 @@ int rc_enrich_rsi_py(void *v, int period, double *out)
     RcEnrich *c = (RcEnrich *)v;
     RC_ELEM_BEGIN(c, 0, 0);
     int threads = 128, blocks = (c->nseg + threads - 1) / threads;
-    RC_ELEM_LAUNCH(c, (k_rsi_py<<<blocks, threads>>>(c->d_times, c->d_close,
+    RC_ELEM_LAUNCH(c, (rc_launch("k_rsi_py", k_rsi_py, blocks, threads, 0, 0, c->d_times, c->d_close,
                                                      c->d_seg_start, c->d_seg_len, c->nseg,
                                                      c->step, period, c->d_a, c->d_b,
                                                      c->d_c, c->d_out)));
@@ -1630,7 +1640,7 @@ int rc_enrich_atr_py(void *v, int period, double *out)
     RcEnrich *c = (RcEnrich *)v;
     RC_ELEM_BEGIN(c, 0, 0);
     int threads = 128, blocks = (c->nseg + threads - 1) / threads;
-    RC_ELEM_LAUNCH(c, (k_atr_py<<<blocks, threads>>>(c->d_times, c->d_close, c->d_high,
+    RC_ELEM_LAUNCH(c, (rc_launch("k_atr_py", k_atr_py, blocks, threads, 0, 0, c->d_times, c->d_close, c->d_high,
                                                      c->d_low, c->d_seg_start, c->d_seg_len,
                                                      c->nseg, c->step, period, c->d_a,
                                                      c->d_out)));
@@ -1644,7 +1654,7 @@ int rc_enrich_label(void *v, int horizon, double cost_bps, int vol_window, int s
     RcEnrich *c = (RcEnrich *)v;
     RC_ELEM_BEGIN(c, 0, 0);
     int threads = 128, blocks = (c->nseg + threads - 1) / threads;
-    RC_ELEM_LAUNCH(c, (k_label<<<blocks, threads>>>(c->d_times, c->d_open, c->d_close,
+    RC_ELEM_LAUNCH(c, (rc_launch("k_label", k_label, blocks, threads, 0, 0, c->d_times, c->d_open, c->d_close,
                                                     c->d_seg_start, c->d_seg_len, c->nseg,
                                                     c->step, horizon, cost_bps, vol_window,
                                                     stride, c->d_out)));
@@ -1667,23 +1677,23 @@ static int rc_batch_launch(RcEnrich *c, const RcEnrichOp *op)
     int sthreads = 128, sblocks = (c->nseg + sthreads - 1) / sthreads;
     switch (op->kind) {
     case RC_OP_RET:
-        k_ret<<<blocks, threads>>>(c->d_times, c->d_close, c->d_seg_id,
+        rc_launch("k_ret", k_ret, blocks, threads, 0, 0, c->d_times, c->d_close, c->d_seg_id,
                                    c->n, c->step, op->a, c->d_out);
         return 1;
     case RC_OP_LAG:
-        k_lag<<<blocks, threads>>>(c->d_times, c->d_close, c->d_seg_id,
+        rc_launch("k_lag", k_lag, blocks, threads, 0, 0, c->d_times, c->d_close, c->d_seg_id,
                                    c->n, c->step, op->a, c->d_out);
         return 1;
     case RC_OP_RANGE:
-        k_range<<<blocks, threads>>>(c->d_high, c->d_low, c->d_close,
+        rc_launch("k_range", k_range, blocks, threads, 0, 0, c->d_high, c->d_low, c->d_close,
                                      c->n, c->d_out);
         return 1;
     case RC_OP_CLV:
-        k_clv<<<blocks, threads>>>(c->d_high, c->d_low, c->d_close,
+        rc_launch("k_clv", k_clv, blocks, threads, 0, 0, c->d_high, c->d_low, c->d_close,
                                    c->n, c->d_out);
         return 1;
     case RC_OP_CALENDAR:
-        k_calendar<<<blocks, threads>>>(c->d_times, c->n, op->a, c->d_out);
+        rc_launch("k_calendar", k_calendar, blocks, threads, 0, 0, c->d_times, c->n, op->a, c->d_out);
         return 1;
     case RC_OP_MA:
         rw_launch_ma(c, op->a, op->b, c->d_out);
@@ -1698,33 +1708,33 @@ static int rc_batch_launch(RcEnrich *c, const RcEnrichOp *op)
         rw_launch_vz(c, op->a, c->d_out);
         return 1;
     case RC_OP_DONCHIAN:
-        k_donchian<<<sblocks, sthreads>>>(c->d_times, c->d_high, c->d_low,
+        rc_launch("k_donchian", k_donchian, sblocks, sthreads, 0, 0, c->d_times, c->d_high, c->d_low,
                                           c->d_close, c->d_seg_start, c->d_seg_len,
                                           c->nseg, c->step, op->a, c->d_out);
         return 1;
     case RC_OP_EMA:
-        k_ema_ratio<<<sblocks, sthreads>>>(c->d_times, c->d_close,
+        rc_launch("k_ema_ratio", k_ema_ratio, sblocks, sthreads, 0, 0, c->d_times, c->d_close,
                                            c->d_seg_start, c->d_seg_len, c->nseg,
                                            c->step, op->a, c->d_out);
         return 1;
     case RC_OP_RSI:
-        k_rsi_py<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_seg_start,
+        rc_launch("k_rsi_py", k_rsi_py, sblocks, sthreads, 0, 0, c->d_times, c->d_close, c->d_seg_start,
                                         c->d_seg_len, c->nseg, c->step, op->a,
                                         c->d_a, c->d_b, c->d_c, c->d_out);
         return 1;
     case RC_OP_ATR:
-        k_atr_py<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_high,
+        rc_launch("k_atr_py", k_atr_py, sblocks, sthreads, 0, 0, c->d_times, c->d_close, c->d_high,
                                         c->d_low, c->d_seg_start, c->d_seg_len,
                                         c->nseg, c->step, op->a, c->d_a, c->d_out);
         return 1;
     case RC_OP_LABEL:
-        k_label<<<sblocks, sthreads>>>(c->d_times, c->d_open, c->d_close,
+        rc_launch("k_label", k_label, sblocks, sthreads, 0, 0, c->d_times, c->d_open, c->d_close,
                                        c->d_seg_start, c->d_seg_len, c->nseg,
                                        c->step, op->a, op->param, op->b,
                                        op->c, c->d_out);
         return 1;
     case RC_OP_MACD:
-        k_macd<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_seg_start,
+        rc_launch("k_macd", k_macd, sblocks, sthreads, 0, 0, c->d_times, c->d_close, c->d_seg_start,
                                       c->d_seg_len, c->nseg, c->step, c->d_out,
                                       c->d_out2, c->d_out3);
         return 3;
@@ -1953,8 +1963,8 @@ int rc_enrich_xs_prepare(void *v, const unsigned int *sym_key,
     int threads = 256;
     int blocks = (c->n + threads - 1) / threads;
     double l0 = rc_now_ms();
-    k_iota_u32<<<blocks, threads>>>(c->d_xs_order, c->n);
-    k_keys_from_sym<<<blocks, threads>>>(c->d_xs_sym, c->d_xs_keys, c->n);
+    rc_launch("k_iota_u32", k_iota_u32, blocks, threads, 0, 0, c->d_xs_order, c->n);
+    rc_launch("k_keys_from_sym", k_keys_from_sym, blocks, threads, 0, 0, c->d_xs_sym, c->d_xs_keys, c->n);
     c->last.launch_ms += rc_now_ms() - l0;
 
     /* Pass 1: stable by symbol. The value carried along is the row index. */
@@ -1970,7 +1980,7 @@ int rc_enrich_xs_prepare(void *v, const unsigned int *sym_key,
         return -1;
     }
     /* Pass 2: stable by time. Equal times retain the symbol/row order. */
-    k_keys_from_time<<<blocks, threads>>>(c->d_times, c->d_xs_order_tmp,
+    rc_launch("k_keys_from_time", k_keys_from_time, blocks, threads, 0, 0, c->d_times, c->d_xs_order_tmp,
                                           c->d_xs_keys, c->n);
     cub_err = RC_CUB(g_force_cub_fail, cub::DeviceRadixSort::SortPairs(
         c->d_xs_temp, temp_bytes, c->d_xs_keys, c->d_xs_keys_out,
@@ -1985,7 +1995,7 @@ int rc_enrich_xs_prepare(void *v, const unsigned int *sym_key,
     }
 
     /* Group boundaries, ids and starts from the time-ordered permutation. */
-    k_group_boundary<<<blocks, threads>>>(c->d_times, c->d_xs_order,
+    rc_launch("k_group_boundary", k_group_boundary, blocks, threads, 0, 0, c->d_times, c->d_xs_order,
                                           c->d_xs_rows_out, c->n);
     cub_err = RC_CUB(g_force_cub_fail, cub::DeviceScan::InclusiveSum(
         c->d_xs_temp, temp_bytes, c->d_xs_rows_out, c->d_xs_gid, c->n));
@@ -1997,7 +2007,7 @@ int rc_enrich_xs_prepare(void *v, const unsigned int *sym_key,
         stats_end(c);
         return -1;
     }
-    k_gid_zero_based<<<blocks, threads>>>(c->d_xs_gid, c->n);
+    rc_launch("k_gid_zero_based", k_gid_zero_based, blocks, threads, 0, 0, c->d_xs_gid, c->n);
     unsigned int last_gid = 0;
     cudaMemcpy(&last_gid, c->d_xs_gid + (c->n - 1), sizeof(unsigned int),
                cudaMemcpyDeviceToHost);
@@ -2024,7 +2034,7 @@ int rc_enrich_xs_prepare(void *v, const unsigned int *sym_key,
         }
     }
     if (ok) {
-        k_group_starts<<<blocks, threads>>>(c->d_xs_rows_out, c->d_xs_gid,
+        rc_launch("k_group_starts", k_group_starts, blocks, threads, 0, 0, c->d_xs_rows_out, c->d_xs_gid,
                                             c->d_xs_off, c->n);
         int end = c->n;
         cudaMemcpy(c->d_xs_off + groups, &end, sizeof(int),
@@ -2086,7 +2096,7 @@ int rc_enrich_xs_rank(void *v, const double *src, double *out)
     int threads = 256;
     int blocks = (c->n + threads - 1) / threads;
     double l0 = rc_now_ms();
-    k_rank_keys<<<blocks, threads>>>(c->d_xs_src, c->d_xs_order,
+    rc_launch("k_rank_keys", k_rank_keys, blocks, threads, 0, 0, c->d_xs_src, c->d_xs_order,
                                      c->d_xs_member, c->d_xs_keys, c->n);
     c->last.launch_ms = rc_now_ms() - l0;
     double l1 = rc_now_ms();
@@ -2103,9 +2113,9 @@ int rc_enrich_xs_rank(void *v, const double *src, double *out)
         return -1;
     }
     int cblocks = (c->xs_groups + threads - 1) / threads;
-    k_count_finite<<<cblocks, threads>>>(c->d_xs_keys_out, c->d_xs_off,
+    rc_launch("k_count_finite", k_count_finite, cblocks, threads, 0, 0, c->d_xs_keys_out, c->d_xs_off,
                                          c->xs_groups, c->d_xs_counts);
-    k_rank_scatter<<<blocks, threads>>>(c->d_xs_keys_out, c->d_xs_rows_out,
+    rc_launch("k_rank_scatter", k_rank_scatter, blocks, threads, 0, 0, c->d_xs_keys_out, c->d_xs_rows_out,
                                         c->d_xs_off, c->d_xs_counts,
                                         c->d_xs_gid, c->n, c->d_xs_src);
     cudaEventRecord(ev1, 0);
@@ -2336,8 +2346,7 @@ int rc_ring_launch_seg_id(void *rv, void *cv, int start, int len)
        e.g. an optional tile output whose allocation failed and was skipped.
        Clear it so only this launch decides the result. */
     (void)cudaGetLastError();
-    k_seg_id_tile<<<blocks, threads, 0, r->compute_stream>>>(
-        c->d_seg_start, c->d_seg_len, c->nseg, start, len, c->d_seg_id);
+    rc_launch("k_seg_id_tile", k_seg_id_tile, blocks, threads, 0, r->compute_stream, c->d_seg_start, c->d_seg_len, c->nseg, start, len, c->d_seg_id);
     cudaError_t e = cudaGetLastError();
     return e == cudaSuccess ? 0 : (int)e;
 }
@@ -2356,23 +2365,23 @@ int rc_ring_launch_feature(void *rv, void *cv, int kind, int k, int which,
     (void)cudaGetLastError();
     switch (kind) {
     case 0:
-        k_ret_tile<<<blocks, threads, 0, s>>>(c->d_times, c->d_close, c->d_seg_id,
+        rc_launch("k_ret_tile", k_ret_tile, blocks, threads, 0, s, c->d_times, c->d_close, c->d_seg_id,
                                               c->step, k, start, len, out);
         break;
     case 1:
-        k_lag_tile<<<blocks, threads, 0, s>>>(c->d_times, c->d_close, c->d_seg_id,
+        rc_launch("k_lag_tile", k_lag_tile, blocks, threads, 0, s, c->d_times, c->d_close, c->d_seg_id,
                                               c->step, k, start, len, out);
         break;
     case 2:
-        k_range_tile<<<blocks, threads, 0, s>>>(c->d_high, c->d_low, c->d_close,
+        rc_launch("k_range_tile", k_range_tile, blocks, threads, 0, s, c->d_high, c->d_low, c->d_close,
                                                 start, len, out);
         break;
     case 3:
-        k_clv_tile<<<blocks, threads, 0, s>>>(c->d_high, c->d_low, c->d_close,
+        rc_launch("k_clv_tile", k_clv_tile, blocks, threads, 0, s, c->d_high, c->d_low, c->d_close,
                                               start, len, out);
         break;
     case 4:
-        k_calendar_tile<<<blocks, threads, 0, s>>>(c->d_times, which, start, len, out);
+        rc_launch("k_calendar_tile", k_calendar_tile, blocks, threads, 0, s, c->d_times, which, start, len, out);
         break;
     default:
         return -1;
@@ -2571,7 +2580,7 @@ extern "C" int rc_ring_overlap_probe(size_t bytes, int iters, unsigned long long
         size_t len[1] = { bytes };
         if (rc_ring_upload(ring, slot, dev, off, hoff, len, 1) != 0) { ok = 0; break; }
         if (rc_ring_compute_begin(ring, slot) != 0) { ok = 0; break; }
-        k_ring_busy<<<1, 1, 0, r->compute_stream>>>(cycles);
+        rc_launch("k_ring_busy", k_ring_busy, 1, 1, 0, r->compute_stream, cycles);
         if (cudaGetLastError() != cudaSuccess) { ok = 0; break; }
         if (rc_ring_compute_end(ring, slot) != 0) { ok = 0; break; }
     }

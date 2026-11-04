@@ -1318,6 +1318,7 @@ device must exist (exit 2 otherwise), `--no-gpu`/`--cpu` forces the CPU, and
 with the backend, device, available threads and training rows/columns, and
 `--json` records `backend`, `backend_reason` and `device`.
 `RCSR_FIT_RECORD=<empty dir>` records every device fit launch for `rcsr-gpu-bench --fit-replay` (see `docs/gpu-backend.md`, "Comparing toolkits and fit kernel variants").
+`RCSR_DEVICE_PTR_CHECK=0` turns off the per-launch pointer check (#744): by default every kernel launch refuses an argument that is host memory (see `docs/gpu-backend.md`, "Kernel arguments are device memory").
 
 The kernel scores the configured metric natively through the #287
 `Metric -> ScoreDispatch` table. The objective kernel covers `squared`,

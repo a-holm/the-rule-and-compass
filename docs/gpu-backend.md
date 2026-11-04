@@ -3434,5 +3434,14 @@ A kernel never receives host memory. Under HMM addressing a host pointer in a la
 | L2 | a pointer parameter of an exported `rc_*` function that is a launch argument, bare or as `p + k`. Copy the data to a device buffer first. |
 | L3 | a local assigned from `malloc`, `calloc`, `realloc` or `new` that is a launch argument. |
 | L4 | a launch argument naming host staging: an identifier starting with `h_`, `fs_host`, `host`, or `->host`. |
+| L5 | kernel launch syntax (`<<<`) in any file except `launch_guard.h`. Launch through `rc_launch`, see "Checked launches". |
 
 L2 has an allowlist (`ALLOW_L2` in the test) for entry points whose caller passes device memory by contract. Each entry carries a reason, and an entry that matches no launch fails `every_allowlist_entry_is_used`. The lint checks parameters, not data flow: an alias such as `double *p = out;` escapes it. `RCSR_LINT_CUDA_DIR=<dir>` runs the same test against another copy of the sources.
+
+### Checked launches
+
+Every kernel launch in `src/cuda/*.cu` goes through `rc_launch` (`my-version/src/cuda/launch_guard.h`). `rc_launch` calls `cudaPointerGetAttributes` on each pointer argument before the launch and refuses it unless the pointer is NULL, device memory (`type` 2) or managed memory (`type` 3). The test uses `type`, not `devicePointer`: under HMM `devicePointer` is non-NULL for `malloc`, `calloc` and stack memory (`type` 0). Pinned host memory (`type` 1) is refused; a kernel that needs it must add a reviewed `RcArgCheck` specialisation. A by-value struct that carries pointers needs one too (`RwArena`, `RcFeatDev`, `RcPrepDev`); the build fails with a static assertion for a struct without one.
+
+A refused launch runs nothing: `rc_launch` launches the same kernel with zero blocks, which executes no code and leaves `cudaErrorInvalidValue` in the last-error slot. Every call site already reads that slot, so the call fails through its existing error path, the same as any failed launch: the device-failure rules apply (an explicit `--gpu` does not fall back silently; the automatic route uses the documented CPU fallback). The first refusal of each kernel prints `rcsr: refused launch of <kernel>: argument <i> is not device or managed memory` on stderr. Under `compute-sanitizer` a refusal shows as a `cudaErrorInvalidValue` API error, never as an `Invalid __global__` access.
+
+`RCSR_DEVICE_PTR_CHECK=0` turns the check off for the whole process (read once). It is on by default in every build. `cudaPointerGetAttributes` costs about 120 to 190 ns per pointer argument. `tests/cuda_kernel_args.rs` rule L5 rejects kernel launch syntax outside `launch_guard.h`, and its other rules read `rc_launch` calls as launches. `tests/gpu_launch_guard.rs` covers the accepted and refused argument kinds.

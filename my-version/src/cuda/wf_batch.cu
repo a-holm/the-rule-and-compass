@@ -18,6 +18,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "launch_guard.h"
 #include "alloc_guard.h"
 #include <math.h>
 #include <stdint.h>
@@ -269,7 +270,7 @@ int rc_wfb_eval(void *opaque,
         const long long jobs = (long long)candidates * (long long)ctx->chains;
         long long grid = (jobs + threads - 1) / threads;
         if (grid > 65535) grid = 65535;
-        rc_wfb_kernel<<<(unsigned int)grid, threads>>>(ctx->d_returns, ctx->d_win, ctx->d_chain_off,
+        rc_launch("rc_wfb_kernel", rc_wfb_kernel, (unsigned int)grid, threads, 0, 0, ctx->d_returns, ctx->d_win, ctx->d_chain_off,
                                                        ctx->d_chain_block0, ctx->d_scores, ctx->d_thr,
                                                        side, ctx->n, ctx->chains, ctx->blocks,
                                                        ctx->windows, candidates, ctx->d_out);

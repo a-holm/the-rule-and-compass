@@ -26,6 +26,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "launch_guard.h"
 #include "alloc_guard.h"
 #include <math.h>
 #include <stdint.h>
@@ -320,10 +321,10 @@ RcBench *rc_bench_create(const long long *times, const double *close, int n,
 
     const int threads = 256;
     int nbk = blocks_for(n, threads);
-    k_bench_seg_id<<<nbk, threads>>>(c->d_seg_start, nseg, n, c->d_seg_id);
+    rc_launch("k_bench_seg_id", k_bench_seg_id, nbk, threads, 0, 0, c->d_seg_start, nseg, n, c->d_seg_id);
     for (int k = 0; k < 2; ++k) {
         if (c->nb[k] == 0) continue;
-        k_bench_index<<<nbk, threads>>>(c->d_times, c->d_bt[k], c->nb[k], n,
+        rc_launch("k_bench_index", k_bench_index, nbk, threads, 0, 0, c->d_times, c->d_bt[k], c->nb[k], n,
                                         c->d_idx[k]);
     }
     cudaError_t err = cudaDeviceSynchronize();
@@ -376,7 +377,7 @@ int rc_bench_column(RcBench *c, int bench, int kind, int a, int use_self,
         if (kind == RC_BENCH_LOOKUP) {
             if (a < 0 || a >= RC_BENCH_PLANES) return 2;
             plane = c->d_bp[bench][a];
-            k_bench_gather<<<nbk, threads>>>(c->d_idx[bench], plane, c->n, c->d_out);
+            rc_launch("k_bench_gather", k_bench_gather, nbk, threads, 0, 0, c->d_idx[bench], plane, c->n, c->d_out);
         } else {
             int pl;
             switch (a) {
@@ -386,7 +387,7 @@ int rc_bench_column(RcBench *c, int bench, int kind, int a, int use_self,
             case 96: pl = RC_BENCH_R96; break;
             default: return 2;
             }
-            k_bench_rel<<<nbk, threads>>>(c->d_times, c->d_close, c->d_seg_start,
+            rc_launch("k_bench_rel", k_bench_rel, nbk, threads, 0, 0, c->d_times, c->d_close, c->d_seg_start,
                                           c->d_seg_id, c->d_idx[bench],
                                           c->d_bp[bench][pl], c->n, a, c->step,
                                           c->d_out);
@@ -399,18 +400,17 @@ int rc_bench_column(RcBench *c, int bench, int kind, int a, int use_self,
                 bstats_end(c);
                 return 3;
             }
-            k_bench_own_ret<<<nbk, threads>>>(c->d_times, c->d_close, c->d_seg_start,
+            rc_launch("k_bench_own_ret", k_bench_own_ret, nbk, threads, 0, 0, c->d_times, c->d_close, c->d_seg_start,
                                               c->d_seg_id, c->n, 1, c->step, c->d_x);
             c->x_ready = 1;
         }
         if (!c->y_ready[bench]) {
-            k_bench_gather<<<nbk, threads>>>(c->d_idx[bench],
+            rc_launch("k_bench_gather", k_bench_gather, nbk, threads, 0, 0, c->d_idx[bench],
                                              c->d_bp[bench][RC_BENCH_R1], c->n,
                                              c->d_y[bench]);
             c->y_ready[bench] = 1;
         }
-        k_bench_beta<<<nbk, threads>>>(
-            c->d_times, c->d_seg_start, c->d_seg_id, c->d_self + (size_t)bench * c->nseg,
+        rc_launch("k_bench_beta", k_bench_beta, nbk, threads, 0, 0, c->d_times, c->d_seg_start, c->d_seg_id, c->d_self + (size_t)bench * c->nseg,
             c->d_x, c->d_y[bench], c->n, a, c->step,
             kind == RC_BENCH_BETA_CLIPCOV ? 1 : 0, use_self, c->d_out);
     }
@@ -649,7 +649,7 @@ int rc_bench_market_group(void *v, const double *src, unsigned int want,
     double h2d = rc_now_ms() - t_start;
     int threads = 128;
     int blocks = blocks_for(c->xs_groups, threads);
-    k_market_group<<<blocks, threads>>>(c->d_xs_src, c->d_xs_order, c->d_xs_member,
+    rc_launch("k_market_group", k_market_group, blocks, threads, 0, 0, c->d_xs_src, c->d_xs_order, c->d_xs_member,
                                         c->d_xs_off, c->xs_groups, c->d_out,
                                         c->d_out2, c->d_out3, c->d_d);
     cudaError_t err = cudaGetLastError();
@@ -688,7 +688,7 @@ int rc_bench_market_volume_share(void *v, const double *vol, const long long *bt
     double h2d = rc_now_ms() - t_start;
     int threads = 128;
     int blocks = blocks_for(c->xs_groups, threads);
-    k_market_volume_share<<<blocks, threads>>>(c->d_xs_src, c->d_xs_order,
+    rc_launch("k_market_volume_share", k_market_volume_share, blocks, threads, 0, 0, c->d_xs_src, c->d_xs_order,
                                                c->d_xs_member, c->d_xs_off,
                                                c->xs_groups, c->d_times, d_bt, d_bv,
                                                nb, c->d_out);
@@ -731,20 +731,20 @@ int rc_bench_market_avg_corr(void *v, const double *r1, double *out)
     int threads = 128;
     int gblocks = blocks_for(c->xs_groups, threads);
     /* Market r1 mean per timestamp (d_out), breadth/dispersion/rel are scratch. */
-    k_market_group<<<gblocks, threads>>>(c->d_xs_src, c->d_xs_order, c->d_xs_member,
+    rc_launch("k_market_group", k_market_group, gblocks, threads, 0, 0, c->d_xs_src, c->d_xs_order, c->d_xs_member,
                                          c->d_xs_off, c->xs_groups, c->d_out,
                                          c->d_out2, c->d_out3, c->d_d);
     int sblocks = blocks_for(c->nseg, threads);
-    k_corr_prefix<<<sblocks, threads>>>(d_x, c->d_out, c->d_xs_member, c->d_seg_start,
+    rc_launch("k_corr_prefix", k_corr_prefix, sblocks, threads, 0, 0, d_x, c->d_out, c->d_xs_member, c->d_seg_start,
                                         c->d_seg_len, c->nseg, scratch[0], scratch[1],
                                         scratch[2], scratch[3], scratch[4], scratch[5]);
     int rblocks = blocks_for(c->n, 256);
-    k_corr_eval<<<rblocks, 256>>>(c->d_times, c->d_seg_start, c->d_seg_len, c->d_seg_id,
+    rc_launch("k_corr_eval", k_corr_eval, rblocks, 256, 0, 0, c->d_times, c->d_seg_start, c->d_seg_len, c->d_seg_id,
                                   scratch[0], scratch[1], scratch[2], scratch[3],
                                   scratch[4], scratch[5], c->n, (long long)c->step,
                                   d_corr);
     /* Mean of the member correlations per timestamp. */
-    k_market_group<<<gblocks, threads>>>(d_corr, c->d_xs_order, c->d_xs_member,
+    rc_launch("k_market_group", k_market_group, gblocks, threads, 0, 0, d_corr, c->d_xs_order, c->d_xs_member,
                                          c->d_xs_off, c->xs_groups, c->d_out,
                                          c->d_out2, c->d_out3, c->d_d);
     cudaError_t err = cudaGetLastError();

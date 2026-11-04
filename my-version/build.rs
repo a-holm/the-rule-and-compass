@@ -344,6 +344,7 @@ fn main() {
         "src/cuda/pnl.cu",
         "src/cuda/pit.cu",
         "src/cuda/wf_batch.cu",
+        "src/cuda/launch_guard.cu",
     ]);
 
     let result = cmd.output().unwrap_or_else(|e| {
