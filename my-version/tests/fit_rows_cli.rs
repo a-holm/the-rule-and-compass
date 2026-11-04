@@ -2,31 +2,31 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-static CSV_SEQ: AtomicUsize = AtomicUsize::new(0);
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
 
-fn csv() -> PathBuf {
-    let n = CSV_SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("rcsr-fit-rows-{}-{}.csv", std::process::id(), n));
+fn csv() -> (Scratch, PathBuf) {
+    let scratch = Scratch::new("small");
+    let path = scratch.join("data.csv");
     let mut text = String::from("x,y\n");
     for i in 0..60 {
         let x = i as f64 * 0.1;
         text.push_str(&format!("{x},{}\n", 2.0 * x + 1.0));
     }
     std::fs::write(&path, text).unwrap();
-    path
+    (scratch, path)
 }
 
 fn run(value: &str) -> Output {
-    let data = csv();
+    let (_scratch, data) = csv();
     let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args(["--data"])
         .arg(&data)
         .args(["--target", "y", "--generations", "1", "--pop", "20", "--fit-rows", value])
         .output()
         .expect("run rcsr");
-    let _ = std::fs::remove_file(&data);
     out
 }
 
@@ -54,21 +54,23 @@ fn fit_rows_accepts_zero_and_integers() {
     }
 }
 
-fn big_csv(tag: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("rcsr-fit-rows-big-{}-{}.csv", std::process::id(), tag));
+fn big_csv(tag: &str) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new(tag);
+    let path = scratch.join("big.csv");
     let mut text = String::from("x,y\n");
     for i in 0..360_000u32 {
         let x = (i % 1000) as f64 * 0.01;
         text.push_str(&format!("{x},{}\n", 2.0 * x + 1.0));
     }
     std::fs::write(&path, text).unwrap();
-    path
+    (scratch, path)
 }
 
 fn run_big(tag: &str, extra: &[&str]) -> Output {
+    let (_scratch, data) = big_csv(tag);
     Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args(["--data"])
-        .arg(big_csv(tag))
+        .arg(&data)
         .args(["--target", "y", "--generations", "1", "--pop", "20", "--fit-iters", "3"])
         .args(extra)
         .output()

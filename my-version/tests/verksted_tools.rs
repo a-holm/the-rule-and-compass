@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 const LIMIT: Duration = Duration::from_secs(60);
 
 fn tools_dir() -> PathBuf {
@@ -53,8 +57,8 @@ fn tools_tests_pass() {
         .unwrap_or_default();
     tests.retain(|p| p.extension().map(|e| e == "sh").unwrap_or(false));
     tests.sort();
-    let log_dir = std::env::temp_dir().join(format!("verksted_tools_{}", std::process::id()));
-    fs::create_dir_all(&log_dir).expect("create log dir");
+    let scratch = Scratch::new("logs");
+    let log_dir = scratch.path();
     let mut failures = Vec::new();
     for test in &tests {
         let name = test.file_name().and_then(|n| n.to_str()).unwrap_or("test").to_string();
@@ -90,6 +94,5 @@ fn tools_tests_pass() {
             failures.push(format!("{name}: {why}\n{}", tail(&output, 20)));
         }
     }
-    let _ = fs::remove_dir_all(&log_dir);
     assert!(failures.is_empty(), "script tests failed:\n{}", failures.join("\n\n"));
 }

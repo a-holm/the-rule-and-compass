@@ -32,6 +32,9 @@ use std::sync::{Mutex, OnceLock};
 mod pit;
 #[path = "common/sanitizer.rs"]
 mod sanitizer;
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
 
 const TOL: f64 = 1e-12;
 
@@ -324,13 +327,10 @@ fn write_fixture(path: &str, rows: &[Row], group_rows: usize) {
     store::write_store_with_time(path, &table, group_rows, Some(0)).unwrap();
 }
 
-fn work_dir(tag: &str) -> std::path::PathBuf {
-    let base = std::env::var("RCSR_PARITY_TMP")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    let dir = base.join(format!("rcsr-parity-{}-{}-{}", tag, std::process::id(), mix(1, 2) % 1000));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn work_dir(tag: &str) -> (Scratch, std::path::PathBuf) {
+    let scratch = Scratch::new(tag);
+    let dir = scratch.path().to_path_buf();
+    (scratch, dir)
 }
 
 fn p(dir: &std::path::Path, name: &str) -> String {
@@ -411,13 +411,36 @@ fn per_symbol() -> usize {
     std::env::var("RCSR_PARITY_PER_SYMBOL").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| sanitizer::pick(PER_SYMBOL, SANITIZER_PER_SYMBOL))
 }
 
+extern "C" {
+    fn atexit(callback: extern "C" fn()) -> std::os::raw::c_int;
+}
+
+static SHARED_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+extern "C" fn remove_shared_dir() {
+    if std::env::var_os("RCSR_KEEP_TEST_DIRS").is_none() {
+        if let Some(dir) = SHARED_DIR.get() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// The shared fixture lives in a static, which never drops; an exit hook removes its directory.
+fn shared_dir() -> std::path::PathBuf {
+    let (scratch, dir) = work_dir("fixture");
+    std::mem::forget(scratch);
+    SHARED_DIR.set(dir.clone()).expect("one shared fixture");
+    assert_eq!(unsafe { atexit(remove_shared_dir) }, 0, "register the exit hook");
+    dir
+}
+
 fn shared() -> &'static Shared {
     static S: OnceLock<Shared> = OnceLock::new();
     S.get_or_init(|| {
         enrich::set_gpu_floor_for_tests(0);
         let cols = device_columns();
         let names = gate_names(&cols);
-        let dir = work_dir("fixture");
+        let dir = shared_dir();
         let rows = fixture(SYMBOLS, per_symbol());
         let src = p(&dir, "in.rcsb");
         let src_small_groups = p(&dir, "in-small.rcsb");
@@ -697,7 +720,7 @@ fn ou_hl96_meets_its_1e12_tier() {
 
 #[test]
 fn ou_hl96_response_to_last_bit_close_noise_is_bounded() {
-    let dir = work_dir("ou-noise");
+    let (_scratch, dir) = work_dir("ou-noise");
     let rows = fixture(6, 3_000);
     let mut noisy = rows.clone();
     for (i, r) in noisy.iter_mut().enumerate() {
@@ -716,7 +739,6 @@ fn ou_hl96_response_to_last_bit_close_noise_is_bounded() {
     let (o, _, _) = observe(&run("base", &rows), &run("noisy", &noisy));
     eprintln!("[parity] ou_hl96 CPU response to 1-ulp close noise: max rel {:.3e}", o.max_rel);
     assert!(o.max_rel < 1e-9, "1-ulp noise moved ou_hl96 by {:.3e}", o.max_rel);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -804,7 +826,7 @@ fn mtf_family_matches_the_cpu_on_the_device() {
     enrich::set_gpu_floor_for_tests(0);
     let rows = fixture(SYMBOLS, 6_000);
     assert!(mtf_device_ok(&rows), "device MTF context must accept the 6,000-bar fixture");
-    let dir = work_dir("mtf");
+    let (_scratch, dir) = work_dir("mtf");
     let src = p(&dir, "in.rcsb");
     write_fixture(&src, &rows, 65_536);
     let names = enrich::mtf_names();
@@ -1349,10 +1371,9 @@ fn assert_cusum_matches_direct(label: &str, got: &[f64]) {
 
 #[test]
 fn cusum_abs_z_one_gap_window_uses_only_its_own_rows_on_the_cpu() {
-    let dir = work_dir("cusum-cpu");
+    let (_scratch, dir) = work_dir("cusum-cpu");
     let cpu = cusum_build(&dir, "cpu", GpuMode::Off);
     assert_cusum_matches_direct("cpu", &cpu);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -1362,12 +1383,11 @@ fn cusum_abs_z_one_gap_window_matches_the_cpu_on_the_device() {
     }
     let _g = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
     enrich::set_gpu_floor_for_tests(0);
-    let dir = work_dir("cusum-gpu");
+    let (_scratch, dir) = work_dir("cusum-gpu");
     let c = device_columns().into_iter().find(|c| c.name == "cusum_abs_z").expect("device column");
     let cpu = cusum_build(&dir, "cpu", GpuMode::Off);
     let gpu = cusum_build(&dir, "gpu", GpuMode::On);
     assert_cusum_matches_direct("gpu", &gpu);
     let (o, cs, gs) = observe(&cpu, &gpu);
     verdict(c.tier, &o, &cs, &gs).unwrap_or_else(|e| panic!("cusum_abs_z [{}] {}: {e}", c.family, c.tier));
-    std::fs::remove_dir_all(&dir).ok();
 }
