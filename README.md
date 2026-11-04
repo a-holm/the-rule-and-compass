@@ -78,7 +78,10 @@ arithmetic refusals are a cause set, never a timing test. The routes come from a
 pinned calibration (`rcsr calibrate` writes it; `--calibration anchors|probe|<path>`
 selects it; the fixed corpus anchors apply when no file exists), so one seed gives
 one route and one front in every process. `--dispatch device` skips the cost
-comparison only (reason `forced`). See
+comparison only (reason `forced`). `rcsr calibrate` also times the enrich
+planner on a synthetic panel (schema `rcsr-calibration/2`, skip with
+`--no-enrich`), and `rcsr enrich --calibration anchors|<path>` prices
+`--gpu auto` with those rates. See
 [`docs/dispatch.md`](docs/dispatch.md).
 Every arm falls back to the default LM path when it cannot prove a safe result,
 and the default remains the historical LM path bit for bit. `--metric signed`
@@ -836,6 +839,8 @@ run:
 | `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`; `long_only` is always true): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
 | `--allow-target-structure` | run a D13c target for a diagnostic replay (warns, records `check.status = overridden` and a proxy table) |
 | `--require-clean-inputs` | refuse (exit 5) a run whose inputs include a construction column of the target spec; default off, the column is only recorded in `check.construction_in_vars` |
+| `--calibration anchors` or `--calibration <path>` (`rcsr enrich`) | planner rates for `--gpu auto`: the measured anchors, or the `enrich` object of a `rcsr calibrate` file (schema `rcsr-calibration/2`, each value limited to 0.25x to 4x of its anchor). Default: the default calibration file when it exists, else the anchors. An invalid or other-device file exits 2. `--json` `plan_rates` and `<out>.enrich.json` record `source` (`anchors` or `file`), `file_path`, `file_sha256` and `schema`; `--write-bw` overrides the file's bandwidth |
+| `--no-enrich` (`rcsr calibrate`) | skip the enrich planner probe; the file then carries `enrich: null` and `rcsr enrich` uses its anchors |
 | `--allow-overlap` (`rcsr enrich`, `rcsr prep`) | permit a `--label` stride below the horizon for horizons of 4 h and longer; without it such a label is refused. `--side short` and `--allow-short` are always refused: labels are long-only (action `{0,+1}`, long-side barriers, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge)) |
 | `--label long:<horizon>,fee=<bp>,...` (`rcsr enrich`; `fee=` is required, `fee=0` for none) | long-only label family `lbl_<name>_{fwd,y,long_net,action,t1,exit_ret,m_net,m_barrier,weight}`, the label report with hash and top 10 absolute moves in `<out>.labels.json` (rows reaching the declared locked test, `--locked-test` or the input declaration, are left out of its statistics and counted; `<out>.enrich.json` leaves them out of every per-column statistic the same way and reports `rows_left_out`), the enrich report and `run.json` (`target_spec.label_report`); label columns are never `--vars` inputs, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |

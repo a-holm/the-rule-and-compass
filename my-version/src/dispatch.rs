@@ -559,6 +559,9 @@ pub struct Calibration {
     pub source: &'static str,
     /// Where the device values came from: `probe` or `anchor`.
     pub device_source: &'static str,
+    /// Enrich planner rates measured by `rcsr calibrate`; `None` for a host-only
+    /// file, a `/1` file or an anchor. Only `rcsr enrich` reads them.
+    pub enrich: Option<crate::enrich::EnrichCalibration>,
 }
 
 impl Default for Calibration {
@@ -580,6 +583,7 @@ impl Default for Calibration {
             spread: Spread::default(),
             source: "anchors",
             device_source: "anchor",
+            enrich: None,
         }
     }
 }
@@ -1312,16 +1316,20 @@ fn with_origin_fields(mut json: String, origin: Option<&FileOrigin>) -> String {
 }
 
 /// Text of `rcsr calibrate --help`.
-pub const CALIBRATE_USAGE: &str = "rcsr calibrate [--out <path>] [--gpu | --cpu]
+pub const CALIBRATE_USAGE: &str = "rcsr calibrate [--out <path>] [--gpu | --cpu] [--no-enrich]
 
 Time this machine once and write the calibration file that Auto dispatch
-routes from (schema rcsr-calibration/1). The file is written atomically.
+and `rcsr enrich --gpu auto` route from (schema rcsr-calibration/2). The file
+is written atomically.
 
   --out <path>   where to write (default $XDG_CACHE_HOME/rcsr/calibration.json,
                  else ~/.cache/rcsr/calibration.json)
   --gpu          also time the device; exit 2 when none is usable
   --cpu          time the host only; the device terms stay the corpus anchors
                  (default: time the device when one is usable)
+  --no-enrich    skip the enrich planner probe (a synthetic 1M-row,
+                 50-symbol panel run through the real enrich producers); the file
+                 then carries enrich: null and `rcsr enrich` uses its anchors
 
 A search run never writes this file. --calibration <path> selects another one,
 --calibration anchors ignores any file.";
@@ -1331,6 +1339,7 @@ A search run never writes this file. --calibration <path> selects another one,
 pub fn run_calibrate(args: &[String]) -> ! {
     let mut out: Option<std::path::PathBuf> = None;
     let mut gpu: Option<bool> = None;
+    let mut enrich = true;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1350,6 +1359,7 @@ pub fn run_calibrate(args: &[String]) -> ! {
             }
             "--gpu" => gpu = Some(true),
             "--cpu" | "--no-gpu" => gpu = Some(false),
+            "--no-enrich" => enrich = false,
             other => {
                 eprintln!("error: unknown calibrate argument '{}'\n\n{}", other, CALIBRATE_USAGE);
                 std::process::exit(2);
@@ -1382,6 +1392,15 @@ pub fn run_calibrate(args: &[String]) -> ! {
     if !calibration.is_usable() {
         eprintln!("error: the probe produced an unusable rate; nothing written");
         std::process::exit(2);
+    }
+    if enrich {
+        match crate::enrich_probe::measure(device.is_some()) {
+            Ok(e) => calibration.enrich = Some(e),
+            Err(e) => {
+                eprintln!("error: the enrich probe failed: {}; nothing written (pass --no-enrich to skip it)", e);
+                std::process::exit(2);
+            }
+        }
     }
     let build = format!(
         "{} {}",
@@ -1440,7 +1459,10 @@ fn measure_device() -> Option<(String, DeviceRates)> {
 }
 
 /// Schema tag of a calibration file.
-pub const CALIBRATION_SCHEMA: &str = "rcsr-calibration/1";
+pub const CALIBRATION_SCHEMA: &str = "rcsr-calibration/2";
+
+/// The previous schema. It parses with `enrich: None`.
+pub const CALIBRATION_SCHEMA_V1: &str = "rcsr-calibration/1";
 
 /// Where the cost model's rates come from, as asked on the command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1490,6 +1512,8 @@ pub enum CalibrationSource {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileCalibration {
     pub origin: FileOrigin,
+    /// Schema tag the file carries.
+    pub schema: String,
     /// Device the file was measured on; `None` for a host-only file.
     pub device: Option<String>,
     pub calibration: Calibration,
@@ -1548,7 +1572,7 @@ fn load_calibration(
         .map_err(|e| format!("cannot read calibration file '{}': {}{}", shown, e, hint))?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| format!("calibration file '{}' is not UTF-8{}", shown, hint))?;
-    let (calibration, file_device) = parse_calibration_text(text)
+    let (calibration, file_device, schema) = parse_calibration_text(text)
         .map_err(|e| format!("calibration file '{}' is invalid: {}{}", shown, e, hint))?;
     if let (Some(want), Some(have)) = (device, file_device.as_deref()) {
         if want != have {
@@ -1563,21 +1587,22 @@ fn load_calibration(
             path: path.display().to_string(),
             sha256: crate::manifest::sha256_hex(&bytes),
         },
+        schema,
         device: file_device,
         calibration,
     }))
 }
 
-fn parse_calibration_text(text: &str) -> Result<(Calibration, Option<String>), String> {
+fn parse_calibration_text(text: &str) -> Result<(Calibration, Option<String>, String), String> {
     use crate::bench_stats::Json;
     let doc = crate::bench_stats::parse_json(text)?;
-    match doc.get("schema").and_then(|v| v.as_str()) {
-        Some(CALIBRATION_SCHEMA) => {}
+    let schema = match doc.get("schema").and_then(|v| v.as_str()) {
+        Some(s) if s == CALIBRATION_SCHEMA || s == CALIBRATION_SCHEMA_V1 => s.to_string(),
         Some(other) => {
             return Err(format!("unknown schema '{}', expected '{}'", other, CALIBRATION_SCHEMA))
         }
         None => return Err(format!("missing schema '{}'", CALIBRATION_SCHEMA)),
-    }
+    };
     let num = |key: &str| -> Result<f64, String> {
         match doc.get(key) {
             Some(Json::Num(v)) if v.is_finite() => Ok(*v),
@@ -1623,7 +1648,13 @@ fn parse_calibration_text(text: &str) -> Result<(Calibration, Option<String>), S
         Some(_) => return Err("'device' is not a string or null".to_string()),
     };
     cal.device_source = if device.is_some() { "file" } else { "anchor" };
-    Ok((cal, device))
+    if schema == CALIBRATION_SCHEMA {
+        cal.enrich = match doc.get("enrich") {
+            None | Some(Json::Null) => None,
+            Some(v) => Some(crate::enrich::EnrichCalibration::from_json(v)?),
+        };
+    }
+    Ok((cal, device, schema))
 }
 
 impl Calibration {
@@ -1663,7 +1694,7 @@ impl Calibration {
             None => "null".to_string(),
         };
         format!(
-            "{{\"schema\":\"{}\",\"written\":{},\"device\":{},\"build\":{},\n \"r_eval\":{:?},\"r_fit\":{:?},\"bw\":{:?},\"bw_h2d\":{:?},\"bw_d2h\":{:?},\"launch_s\":{:?},\n \"cpu_eval\":{:?},\"cpu_fit\":{:?},\"hysteresis\":{:?},\n \"spread\":{{\"r_eval\":{:?},\"r_fit\":{:?},\"bw\":{:?},\"launch_s\":{:?},\"cpu_eval\":{:?}}}}}\n",
+            "{{\"schema\":\"{}\",\"written\":{},\"device\":{},\"build\":{},\n \"r_eval\":{:?},\"r_fit\":{:?},\"bw\":{:?},\"bw_h2d\":{:?},\"bw_d2h\":{:?},\"launch_s\":{:?},\n \"cpu_eval\":{:?},\"cpu_fit\":{:?},\"hysteresis\":{:?},\n \"spread\":{{\"r_eval\":{:?},\"r_fit\":{:?},\"bw\":{:?},\"launch_s\":{:?},\"cpu_eval\":{:?}}},\n \"enrich\":{}}}\n",
             CALIBRATION_SCHEMA,
             crate::devlog::text(written),
             device,
@@ -1682,6 +1713,7 @@ impl Calibration {
             self.spread.bw,
             self.spread.launch_s,
             self.spread.cpu_eval,
+            self.enrich.as_ref().map_or("null".to_string(), |e| e.json()),
         )
     }
 }
@@ -1887,7 +1919,7 @@ mod tests {
             ("truncated", good[..good.len() / 2].to_string(), "invalid"),
             ("garbage", "not json".to_string(), "invalid"),
             ("empty", String::new(), "invalid"),
-            ("no_schema", good.replace("rcsr-calibration/1", "other/9"), "unknown schema"),
+            ("no_schema", good.replace(CALIBRATION_SCHEMA, "other/9"), "unknown schema"),
             ("negative", good.replace(&format!("\"r_eval\":{:?}", 3.1e11_f64), "\"r_eval\":-1.0"), "finite and positive"),
             ("zero_cpu", good.replace(&format!("\"cpu_fit\":{:?}", 0.1_f64 + 0.2), "\"cpu_fit\":0.0"), "finite and positive"),
             ("missing", good.replace("\"bw\":", "\"bwx\":"), "missing 'bw'"),
@@ -1928,6 +1960,120 @@ mod tests {
         let source = CalibrationRequest::File(path.clone()).resolve(Some("Any GPU")).unwrap();
         assert_eq!(Calibration::pinned(&source).device_source, "anchor");
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn enrich_sample() -> crate::enrich::EnrichCalibration {
+        use crate::enrich::{ClassRate, EnrichCalibration, EnrichRates, OpClass};
+        let mut rates = EnrichRates::anchors();
+        rates.context_ms_per_mrow = 123.456789012345;
+        rates.fixed_overhead_ms = 0.1 + 0.2;
+        rates.write_bps = 2.5e8 / 3.0;
+        for (i, op) in OpClass::ALL.iter().enumerate() {
+            rates.classes[op.index()] = ClassRate {
+                cpu_fixed_ms: 10.0 / 7.0 * (i as f64),
+                cpu_col_ms: 1.0 / 3.0 * (i as f64 + 1.0),
+                gpu_cells_per_s: 1.0e7 * (i as f64 + 1.0) / 3.0,
+            };
+        }
+        let mut spread_classes = [1.0; OpClass::ALL.len()];
+        spread_classes[OpClass::Rank.index()] = 1.25;
+        EnrichCalibration {
+            rows: 1_000_000,
+            rates,
+            spread_context: 1.5,
+            spread_classes,
+        }
+    }
+
+    #[test]
+    fn calibration_v1_file_still_loads() {
+        let path = temp_file("v1");
+        let text = sample_calibration()
+            .file_text(Some("Test GPU"), "b", "2026-11-05T10:00:00Z")
+            .replace(CALIBRATION_SCHEMA, CALIBRATION_SCHEMA_V1)
+            .replace(",\n \"enrich\":null", "");
+        assert!(text.contains("rcsr-calibration/1") && !text.contains("enrich"), "{text}");
+        std::fs::write(&path, &text).unwrap();
+        let source = CalibrationRequest::File(path.clone()).resolve(Some("Test GPU")).unwrap();
+        let CalibrationSource::File(file) = &source else {
+            panic!("expected a file source");
+        };
+        assert_eq!(file.schema, CALIBRATION_SCHEMA_V1);
+        assert_eq!(Calibration::pinned(&source).enrich, None);
+        let (rates, plan) =
+            crate::enrich::resolve_rates(&CalibrationRequest::File(path.clone()), Some("Test GPU")).unwrap();
+        assert_eq!(rates, crate::enrich::EnrichRates::anchors());
+        assert_eq!(plan.source, "anchors");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn calibration_v2_enrich_roundtrip() {
+        let mut want = sample_calibration();
+        want.enrich = Some(enrich_sample());
+        let path = temp_file("v2");
+        let text = want.file_text(Some("Test GPU"), "b", "2026-11-05T10:00:00Z");
+        assert!(text.contains("rcsr-calibration/2"), "{text}");
+        std::fs::write(&path, &text).unwrap();
+        let source = CalibrationRequest::File(path.clone()).resolve(Some("Test GPU")).unwrap();
+        let got = Calibration::pinned(&source).enrich.expect("enrich object");
+        let sent = want.enrich.unwrap();
+        assert_eq!(got, sent);
+        assert_eq!(got.rates.context_ms_per_mrow.to_bits(), sent.rates.context_ms_per_mrow.to_bits());
+        assert_eq!(got.rates.fixed_overhead_ms.to_bits(), sent.rates.fixed_overhead_ms.to_bits());
+        assert_eq!(got.rates.write_bps.to_bits(), sent.rates.write_bps.to_bits());
+        for op in crate::enrich::OpClass::ALL {
+            let (a, b) = (got.rates.class(op), sent.rates.class(op));
+            assert_eq!(a.cpu_fixed_ms.to_bits(), b.cpu_fixed_ms.to_bits(), "{:?}", op);
+            assert_eq!(a.cpu_col_ms.to_bits(), b.cpu_col_ms.to_bits(), "{:?}", op);
+            assert_eq!(a.gpu_cells_per_s.to_bits(), b.gpu_cells_per_s.to_bits(), "{:?}", op);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_v2_file_without_an_enrich_object_gives_anchor_plans() {
+        let path = temp_file("v2-null");
+        let text = sample_calibration().file_text(Some("Test GPU"), "b", "2026-11-05T10:00:00Z");
+        assert!(text.contains("\"enrich\":null"), "{text}");
+        std::fs::write(&path, &text).unwrap();
+        let (rates, plan) =
+            crate::enrich::resolve_rates(&CalibrationRequest::File(path.clone()), Some("Test GPU")).unwrap();
+        assert_eq!(rates, crate::enrich::EnrichRates::anchors());
+        assert_eq!(plan.source, "anchors");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn invalid_enrich_values_make_the_file_invalid() {
+        let mut cal = sample_calibration();
+        cal.enrich = Some(enrich_sample());
+        let good = cal.file_text(Some("Test GPU"), "b", "2026-11-05T10:00:00Z");
+        let sent = enrich_sample();
+        let write_bps = format!("\"write_bps\":{:?}", sent.rates.write_bps);
+        let rank_gpu = format!(
+            "\"gpu_cells_per_s\":{:?}",
+            sent.rates.class(crate::enrich::OpClass::Rank).gpu_cells_per_s
+        );
+        let cases: Vec<(&str, String, &str)> = vec![
+            ("zero_bw", good.replace(&write_bps, "\"write_bps\":0.0"), "write_bps"),
+            ("negative_bw", good.replace(&write_bps, "\"write_bps\":-5.0"), "write_bps"),
+            ("nan_bw", good.replace(&write_bps, "\"write_bps\":NaN"), "invalid"),
+            ("zero_rate", good.replace(&rank_gpu, "\"gpu_cells_per_s\":0.0"), "segmented-rank.gpu_cells_per_s"),
+            ("unknown_class", good.replace("\"segmented-rank\"", "\"warp-drive\""), "unknown class"),
+            ("not_object", good.replace("\"enrich\":{", "\"enrich\":[{").replace("}}\n", "}]}\n"), "invalid"),
+        ];
+        for (name, text, expect) in cases {
+            assert_ne!(text, good, "{name}: the case must change the file");
+            let path = temp_file(name);
+            std::fs::write(&path, &text).unwrap();
+            let err = CalibrationRequest::File(path.clone())
+                .resolve(Some("Test GPU"))
+                .unwrap_err();
+            assert!(err.contains(&path.display().to_string()), "{name}: {err}");
+            assert!(err.contains(expect), "{name}: {err}");
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     #[test]

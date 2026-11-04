@@ -137,7 +137,7 @@ fn calibrate_writes_a_readable_file_atomically_and_a_run_never_writes_it() {
     let out = calibrate(dir.path(), &file, &["--cpu"]);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     let text = std::fs::read_to_string(&file).unwrap();
-    assert!(text.contains("\"schema\":\"rcsr-calibration/1\""), "{text}");
+    assert!(text.contains("\"schema\":\"rcsr-calibration/2\""), "{text}");
     assert!(text.contains("\"device\":null"), "{text}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(&sha256_of(&file)), "{stdout}");
@@ -155,7 +155,7 @@ fn calibrate_writes_a_readable_file_atomically_and_a_run_never_writes_it() {
     let second = calibrate(dir.path(), &file, &["--cpu"]);
     assert_eq!(second.status.code(), Some(0));
     let valid = std::fs::read_to_string(&file).unwrap();
-    assert!(valid.contains("\"schema\":\"rcsr-calibration/1\""));
+    assert!(valid.contains("\"schema\":\"rcsr-calibration/2\""));
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn a_corrupt_file_the_user_named_is_refused_with_a_message_and_no_output() {
         ("truncated.json", text[..text.len() / 2].to_string()),
         ("garbage.json", "not json".to_string()),
         ("negative.json", text.replacen("\"r_eval\":", "\"r_eval\":-", 1)),
-        ("schema.json", text.replace("rcsr-calibration/1", "rcsr-calibration/9")),
+        ("schema.json", text.replace("rcsr-calibration/2", "rcsr-calibration/9")),
     ] {
         let bad = dir.join(name);
         std::fs::write(&bad, body).unwrap();

@@ -67,10 +67,10 @@ only and keeps the anchors for the device terms.
 
 A checkpoint records `config calibration_source` (`anchors`, `probe` or `file`) and, for a file, `config calibration_sha256`. Neither line is part of the config hash. `--resume` exits 2 when the resolved source or the file hash differs from the record, naming both. A checkpoint without the lines (an older binary) resumes only with an explicit `--calibration`, and the run prints a `# resume:` notice. A `probe` run is not reproducible, so it resumes only with `--calibration probe`, also with a notice.
 
-`rcsr calibrate [--out <path>] [--gpu | --cpu]` is the only writer. It runs
+`rcsr calibrate [--out <path>] [--gpu | --cpu] [--no-enrich]` is the only writer. It runs
 `Calibration::probe()` (host, median of 31 reps) and `dispatch_gpu::measure()`
 (device) and writes the file atomically (a sibling temporary file, `fsync`, then
-`rename`). The file is JSON, schema `rcsr-calibration/1`: `written` (UTC),
+`rename`). The file is JSON, schema `rcsr-calibration/2` (a `rcsr-calibration/1` file still loads, with `enrich: null`): `written` (UTC),
 `device` (name or `null`), `build`, the rates `r_eval`, `r_fit`, `bw`, `bw_h2d`,
 `bw_d2h`, `launch_s`, `cpu_eval`, `cpu_fit`, `hysteresis`, and the `spread` of
 each probed term. Floats are written in the shortest form that reads back bit
@@ -178,3 +178,13 @@ compatibility calibration. The `maximum` fit arm also needs the cost model to pr
 ## The run-level fit rule
 
 The stage model above decides one candidate batch. The fit arm of a whole run (`exact` or the batched GPU LM for `squared`, `aic`, `aicc`, `bic`) is a separate, pure rule that reads no timing: `min(islands, cores) * (s * k + (1 - s) / W) * E * (1 + h) < 1`, with `k = 0.05`, `E = 1.32`, `h = 0.3`, `W` the fallback workers (`cores` is `--threads` when given, else 8, so the rule does not follow the CPU affinity of the process; `W = min(cores, 8)` unless `RCSR_CPU_FALLBACK_THREADS` is set) and `s = 1` only when every configured operator has a device fit opcode. It is resolved once before generation 0; see "Default fit arm" in `gpu-backend.md`. The per-candidate model cannot decide it: its device and CPU fit costs scale with the same row, constant and sweep factors, so the device always wins there and the floor of `32p` rows is the only guard.
+
+## Enrich planner rates
+
+`rcsr enrich --gpu auto` prices each feature family with the rates of `enrich::EnrichRates`. The anchors are the constants in `enrich.rs` (see `docs/ohlcv.md`). `rcsr enrich --calibration anchors|<path>` selects the source with the same rules as the search flag: the default is the default calibration file when it exists, else the anchors; a missing, invalid or other-device file exits 2 and there is no silent fallback. `probe` is refused. `--write-bw` overrides the file's bandwidth.
+
+The optional `enrich` object of a `rcsr-calibration/2` file holds `rows`, `context_ms_per_mrow`, `fixed_overhead_ms`, `write_bps`, `classes` (per operation class name: `cpu_fixed_ms`, `cpu_col_ms`, `gpu_cells_per_s`) and `spread`. A class the file leaves out keeps its anchor. Every `*_ms`, `write_bps` and rate must be finite; the rates and bandwidths must be positive and the CPU cost parts not negative, otherwise the file is invalid. The planner limits each value to 0.25x to 4x of its anchor. A `/1` file, a host-only file, `--cpu` and `--no-enrich` give `enrich: null` and the anchors.
+
+`rcsr calibrate` fills the object (skip with `--no-enrich`) by running the real enrich producers on a synthetic panel of 50 symbols and 1,000,000 bars, held in the temp directory. For each class it times a small and a large column set on the CPU and, with a device, on the GPU, and fits the CPU `fixed + per column` cost and the device throughput; the write bandwidth comes from `measure_write_bandwidth`. A pass class (`compact-pass`, `py15m-pass`) is fitted from the same runs. The classes `rolling-extrema`, `wilder-scan` and `join` have no column set that avoids a shared pass or a benchmark series, so they keep their anchors. The planner never reads a clock: only `rcsr calibrate` times anything.
+
+The enrich JSON carries `plan_rates` (`source` `anchors` or `file`, plus `file_path`, `file_sha256` and `schema` for a file) and `<out>.enrich.json` records the same object; `# enrich-plan` lines are unchanged. A family's shared CPU pass (`compact-pass`, `py15m-pass`) is costed once per run and saved only when every family that needs it goes to the device; the `plan[]` entries carry `pass_shared` and `pass_cpu_ms`.

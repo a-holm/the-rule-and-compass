@@ -10,6 +10,8 @@ use rcsr::features_gpu as fg;
 
 #[path = "common/sanitizer.rs"]
 mod sanitizer;
+#[path = "common/scratch.rs"]
+mod scratch;
 
 fn assert_registry_tiers() {
     let reg = rcsr::enrich::default_registry();
@@ -273,18 +275,10 @@ mod device {
         store::write_store_with_time(path, &table, group_rows, Some(0)).unwrap();
     }
 
-    fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rcsr-features-gpu-{}-{}-{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmp_dir(tag: &str) -> (super::scratch::Scratch, std::path::PathBuf) {
+        let scratch = super::scratch::Scratch::new(tag);
+        let path = scratch.path().to_path_buf();
+        (scratch, path)
     }
 
     fn opts(data: &str, out: &str, gpu: GpuMode, chunk_rows: usize) -> Options {
@@ -474,7 +468,7 @@ mod device {
             eprintln!("skipping: no CUDA device");
             return;
         }
-        let dir = tmp_dir("prefix");
+        let (_scratch, dir) = tmp_dir("prefix");
         let full_src = dir.join("full.rcsb").to_string_lossy().into_owned();
         let cut_src = dir.join("cut.rcsb").to_string_lossy().into_owned();
         let full_out = dir.join("full-out.rcsb").to_string_lossy().into_owned();
@@ -508,7 +502,7 @@ mod device {
             eprintln!("skipping: no CUDA device");
             return;
         }
-        let dir = tmp_dir("parity");
+        let (_scratch, dir) = tmp_dir("parity");
         let src = dir.join("in.rcsb").to_string_lossy().into_owned();
         let cpu_out = dir.join("cpu.rcsb").to_string_lossy().into_owned();
         let gpu_out = dir.join("gpu.rcsb").to_string_lossy().into_owned();
@@ -647,7 +641,7 @@ mod device {
             return;
         }
         let _floor = Floor::zero();
-        let dir = tmp_dir("nr4");
+        let (_scratch, dir) = tmp_dir("nr4");
         let src = dir.join("in.rcsb").to_string_lossy().into_owned();
         let cpu_out = dir.join("cpu.rcsb").to_string_lossy().into_owned();
         let gpu_out = dir.join("gpu.rcsb").to_string_lossy().into_owned();
