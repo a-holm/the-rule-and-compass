@@ -19,19 +19,20 @@ fn fixture(name: &str) -> String {
         .to_string()
 }
 
-fn tmp(name: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("rcsr-prep-test-{}-{}", std::process::id(), name));
-    let _ = std::fs::remove_file(&p);
-    p
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn tmp(name: &str) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new("prep");
+    let path = scratch.join(name);
+    (scratch, path)
 }
 
-fn tmp_dir(name: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("rcsr-prep-cache-test-{}-{}", std::process::id(), name));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    p
+fn tmp_dir(name: &str) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new(name);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 /// A three-symbol Binance-style directory with a distinct price level per
@@ -87,8 +88,8 @@ fn base(input: String) -> Options {
 fn a_fixture_produces_a_store_byte_identical_to_the_importer() {
     let opts = base(fixture("binance_1m.csv"));
     let build = prep::build(&opts).unwrap();
-    let prep_path = tmp("byte-identical-prep.rcsb");
-    let ref_path = tmp("byte-identical-ref.rcsb");
+    let (_scratch, prep_path) = tmp("byte-identical-prep.rcsb");
+    let (_scratch, ref_path) = tmp("byte-identical-ref.rcsb");
     store::write_store_with_time(&prep_path.to_string_lossy(), &build.table, 65_536, Some(0)).unwrap();
 
     // The reference is the current importer path on the canonical CSV.
@@ -99,8 +100,6 @@ fn a_fixture_produces_a_store_byte_identical_to_the_importer() {
     let a = std::fs::read(&prep_path).unwrap();
     let b = std::fs::read(&ref_path).unwrap();
     assert_eq!(a, b, "prep store must equal the importer on the same values");
-    let _ = std::fs::remove_file(&prep_path);
-    let _ = std::fs::remove_file(&ref_path);
 }
 
 #[test]
@@ -135,8 +134,7 @@ fn resampling_aggregates_to_known_15m_bars_and_writes_features() {
 
 #[test]
 fn millisecond_microsecond_and_second_inputs_normalise_to_the_same_times() {
-    let dir = tmp("units");
-    let _ = std::fs::create_dir_all(&dir);
+    let (_scratch, dir) = tmp_dir("units");
     let text = std::fs::read_to_string(fixture("binance_1m.csv")).unwrap();
     let (secs, ms, us): (Vec<String>, Vec<String>, Vec<String>) = {
         let mut s = Vec::new();
@@ -179,13 +177,11 @@ fn millisecond_microsecond_and_second_inputs_normalise_to_the_same_times() {
     assert_eq!(a, times(&p_ms));
     assert_eq!(a, times(&p_us));
     assert_eq!(a[0], 1_704_067_200);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn a_multi_symbol_directory_is_parallel_deterministic_and_keeps_symbols() {
-    let dir = tmp("panel");
-    let _ = std::fs::create_dir_all(&dir);
+    let (_scratch, dir) = tmp_dir("panel");
     let csv = std::fs::read_to_string(fixture("binance_1m.csv")).unwrap();
     for sym in ["AAA", "BBB", "CCC"] {
         // Shift each symbol's prices so a mis-merged panel is visible.
@@ -235,13 +231,11 @@ fn a_multi_symbol_directory_is_parallel_deterministic_and_keeps_symbols() {
         .map(|r| parallel.table.text(r, 1).unwrap().to_string())
         .collect();
     assert_eq!(syms, vec!["AAA"; 4].into_iter().chain(vec!["BBB"; 4]).chain(vec!["CCC"; 4]).collect::<Vec<_>>());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn a_zip_archive_is_read_without_an_intermediate_csv() {
-    let dir = tmp("zip");
-    let _ = std::fs::create_dir_all(&dir);
+    let (_scratch, dir) = tmp_dir("zip");
     let csv = std::fs::read(fixture("binance_1m.csv")).unwrap();
     let zip_path = dir.join("BTCUSDT-1m-2024-01.zip");
     std::fs::write(&zip_path, stored_zip("BTCUSDT-1m-2024-01.csv", &csv)).unwrap();
@@ -251,7 +245,6 @@ fn a_zip_archive_is_read_without_an_intermediate_csv() {
     assert_eq!(b.audit.rows_in, 60);
     assert_eq!(b.audit.rows_out, 60);
     assert_eq!(b.table.len(), 60);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -263,18 +256,16 @@ fn the_same_spec_and_inputs_reproduce_the_same_bytes() {
     let b = prep::build(&opts).unwrap();
     assert_eq!(prep::table_csv(&a.table), prep::table_csv(&b.table));
     assert_eq!(a.manifest, b.manifest);
-    let pa = tmp("determinism-a.rcsb");
-    let pb = tmp("determinism-b.rcsb");
+    let (_scratch, pa) = tmp("determinism-a.rcsb");
+    let (_scratch, pb) = tmp("determinism-b.rcsb");
     store::write_store_with_time(&pa.to_string_lossy(), &a.table, 65_536, Some(0)).unwrap();
     store::write_store_with_time(&pb.to_string_lossy(), &b.table, 65_536, Some(0)).unwrap();
     assert_eq!(std::fs::read(&pa).unwrap(), std::fs::read(&pb).unwrap());
-    let _ = std::fs::remove_file(pa);
-    let _ = std::fs::remove_file(pb);
 }
 
 #[test]
 fn a_resumed_prep_reuses_parts_and_reproduces_the_store_bytes() {
-    let dir = tmp_dir("resume");
+    let (_scratch, dir) = tmp_dir("resume");
     let input = dir.join("input");
     std::fs::create_dir_all(&input).unwrap();
     write_three_symbols(&input);
@@ -287,7 +278,7 @@ fn a_resumed_prep_reuses_parts_and_reproduces_the_store_bytes() {
     opts.resume = Some(cache.to_string_lossy().to_string());
 
     let cold = prep::build(&opts).unwrap();
-    let pa = tmp("resume-cold.rcsb");
+    let (_scratch, pa) = tmp("resume-cold.rcsb");
     store::write_store_with_time(&pa.to_string_lossy(), &cold.table, 65_536, Some(0)).unwrap();
     assert_eq!(cache_parts(&cache, "spool").len(), 3, "one spool per symbol");
     assert_eq!(cache_parts(&cache, "key").len(), 3, "one key per symbol");
@@ -300,7 +291,7 @@ fn a_resumed_prep_reuses_parts_and_reproduces_the_store_bytes() {
         .collect();
     opts.jobs = 1;
     let warm = prep::build(&opts).unwrap();
-    let pb = tmp("resume-warm.rcsb");
+    let (_scratch, pb) = tmp("resume-warm.rcsb");
     store::write_store_with_time(&pb.to_string_lossy(), &warm.table, 65_536, Some(0)).unwrap();
 
     assert_eq!(prep::table_csv(&cold.table), prep::table_csv(&warm.table));
@@ -326,14 +317,11 @@ fn a_resumed_prep_reuses_parts_and_reproduces_the_store_bytes() {
     assert_eq!(prep::table_csv(&warm.table), prep::table_csv(&again.table));
     assert_eq!(warm.manifest, again.manifest);
 
-    let _ = std::fs::remove_file(pa);
-    let _ = std::fs::remove_file(pb);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn a_changed_archive_invalidates_only_its_symbol_part() {
-    let dir = tmp_dir("invalidate");
+    let (_scratch, dir) = tmp_dir("invalidate");
     let input = dir.join("input");
     std::fs::create_dir_all(&input).unwrap();
     write_three_symbols(&input);
@@ -371,12 +359,11 @@ fn a_changed_archive_invalidates_only_its_symbol_part() {
     assert_eq!(prep::table_csv(&reference.table), prep::table_csv(&resumed.table));
     assert_eq!(reference.manifest, resumed.manifest);
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn a_resume_directory_with_other_settings_is_refused() {
-    let dir = tmp_dir("settings");
+    let (_scratch, dir) = tmp_dir("settings");
     let input = dir.join("input");
     std::fs::create_dir_all(&input).unwrap();
     std::fs::write(input.join("AAA.csv"), std::fs::read(fixture("aliased_1m.csv")).unwrap()).unwrap();
@@ -391,13 +378,11 @@ fn a_resume_directory_with_other_settings_is_refused() {
     assert!(err.contains("different settings"), "{}", err);
     assert!(err.contains("--resume"), "{}", err);
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn a_verified_splice_merges_the_two_legs_and_a_wrong_k_fails() {
-    let dir = tmp("splice");
-    let _ = std::fs::create_dir_all(&dir);
+    let (_scratch, dir) = tmp_dir("splice");
     // OLD trades at 100, NEW at 1.0 exactly when it takes over.
     std::fs::write(
         dir.join("OLD.csv"),
@@ -423,7 +408,6 @@ fn a_verified_splice_merges_the_two_legs_and_a_wrong_k_fails() {
     opts.migrations = prep::parse_migrations("OLD->NEW:1").unwrap();
     let err = prep::build(&opts).unwrap_err();
     assert!(err.contains("differs from k=1.000000"), "{}", err);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -444,8 +428,7 @@ fn dry_run_manifest_records_the_spec_hash_and_audit() {
 
 #[test]
 fn a_spec_file_is_parsed_in_fixed_order_and_hashed_into_the_manifest() {
-    let dir = tmp("spec");
-    let _ = std::fs::create_dir_all(&dir);
+    let (_scratch, dir) = tmp_dir("spec");
     let spec = dir.join("panel.spec");
     // `label` appears before `resample` on purpose: the loader must still
     // resolve 1h against the 15m base.
@@ -458,7 +441,6 @@ fn a_spec_file_is_parsed_in_fixed_order_and_hashed_into_the_manifest() {
     let hash = rcsr::manifest::sha256_file(&spec).unwrap();
     assert!(b.manifest.contains(&hash));
     assert!(b.manifest.contains("\"spec_path\""));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

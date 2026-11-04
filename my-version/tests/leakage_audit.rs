@@ -1,19 +1,14 @@
 //! `rcsr audit` is fail-closed and returns exit code 5 (#129).
 
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
 
-static NEXT: AtomicUsize = AtomicUsize::new(0);
-
-fn write_panel(leak: bool) -> (std::path::PathBuf, String) {
+fn write_panel(leak: bool) -> (Scratch, String) {
     let panel = rcsr::leakage::synthetic_panel(240, 77, leak);
-    let dir = std::env::temp_dir();
-    let path = dir.join(format!(
-        "rcsr-audit-{}-{}-{}.csv",
-        std::process::id(),
-        leak,
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    let scratch = Scratch::new("audit");
+    let path = scratch.join("panel.csv");
     let mut text = String::from("row,time,x,noise,y");
     if leak {
         text.push_str(",future_y");
@@ -35,7 +30,7 @@ fn write_panel(leak: bool) -> (std::path::PathBuf, String) {
     }
     let path_s = path.to_string_lossy().into_owned();
     std::fs::write(&path, text).expect("write fixture");
-    (path, path_s)
+    (scratch, path_s)
 }
 
 fn audit(path: &str) -> std::process::Output {
@@ -50,9 +45,8 @@ fn audit(path: &str) -> std::process::Output {
 
 #[test]
 fn a_clean_panel_exits_zero_with_a_machine_readable_report() {
-    let (path, p) = write_panel(false);
+    let (_scratch, p) = write_panel(false);
     let out = audit(&p);
-    let _ = std::fs::remove_file(path);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("\"clean\":true"), "{text}");
@@ -63,9 +57,8 @@ fn a_clean_panel_exits_zero_with_a_machine_readable_report() {
 
 #[test]
 fn a_leaky_panel_exits_five_and_names_the_column() {
-    let (path, p) = write_panel(true);
+    let (_scratch, p) = write_panel(true);
     let out = audit(&p);
-    let _ = std::fs::remove_file(path);
     assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("\"clean\":false"), "{text}");
@@ -75,7 +68,7 @@ fn a_leaky_panel_exits_five_and_names_the_column() {
 
 #[test]
 fn a_wall_time_gap_is_converted_and_never_silently_dropped() {
-    let (path, p) = write_panel(false);
+    let (_scratch, p) = write_panel(false);
     // 240 one-minute rows: 90m is 90 rows, and the split report says so.
     let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args([
@@ -85,7 +78,6 @@ fn a_wall_time_gap_is_converted_and_never_silently_dropped() {
         ])
         .output()
         .expect("run rcsr");
-    let _ = std::fs::remove_file(path);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("\"gap\":90"), "{text}");
@@ -93,7 +85,7 @@ fn a_wall_time_gap_is_converted_and_never_silently_dropped() {
 
 #[test]
 fn a_wall_time_gap_is_dropped_with_a_warning_under_explicit_row_selection() {
-    let (path, p) = write_panel(false);
+    let (_scratch, p) = write_panel(false);
     let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args([
             "--data", &p, "--target", "y", "--vars", "x", "--time", "time",
@@ -103,7 +95,6 @@ fn a_wall_time_gap_is_dropped_with_a_warning_under_explicit_row_selection() {
         ])
         .output()
         .expect("run rcsr");
-    let _ = std::fs::remove_file(path);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("--gap is dropped"), "{err}");
     assert!(out.status.success(), "{err}");

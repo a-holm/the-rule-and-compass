@@ -147,29 +147,21 @@ fn the_report_records_the_null_method_and_block_count() {
     assert_eq!(iid.block_len, 0);
 }
 
-struct TempCsv(PathBuf);
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+struct TempCsv(PathBuf, #[allow(dead_code)] Scratch);
 
 impl TempCsv {
     fn new(contents: &str) -> Self {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SEQ: AtomicUsize = AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "rcsr-null-block-{}-{}.csv",
-            std::process::id(),
-            n
-        ));
+        let scratch = Scratch::new("null-block");
+        let path = scratch.join("data.csv");
         std::fs::write(&path, contents).expect("write temp csv");
-        TempCsv(path)
+        TempCsv(path, scratch)
     }
     fn as_str(&self) -> &str {
         self.0.to_str().unwrap()
-    }
-}
-
-impl Drop for TempCsv {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
     }
 }
 

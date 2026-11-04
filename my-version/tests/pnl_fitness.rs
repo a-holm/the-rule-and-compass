@@ -6,7 +6,6 @@ use rcsr::devlog::Json;
 use rcsr::trading::{self, FitnessBook, TradingRows, TradingSpec};
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn frac(v: f64) -> f64 {
     v - v.floor()
@@ -224,16 +223,14 @@ fn the_hash_covers_rows_cost_threshold_and_trade_floor() {
 const T0: i64 = 1_600_000_000;
 const N: usize = 600;
 
-static NEXT: AtomicUsize = AtomicUsize::new(0);
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
 
-fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-pnl-fitness-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch() -> (Scratch, PathBuf) {
+    let scratch = Scratch::new("pnl-fitness");
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 /// `r = 0.01 x1 + noise` is the realised return; `y = r + 0.05 x2` is the
@@ -320,7 +317,7 @@ fn pareto(j: &Json) -> &Vec<Json> {
 
 #[test]
 fn pnl_fitness_prefers_the_tradable_signal() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, 900);
     let spec = write_spec(&dir);
 
@@ -350,7 +347,7 @@ fn pnl_fitness_prefers_the_tradable_signal() {
 
 #[test]
 fn pnl_fitness_is_identical_for_any_thread_count() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, 900);
     let spec = write_spec(&dir);
     let one = json(&run(&data, &spec, &["--fitness", "pnl", "--threads", "1"]));
@@ -375,7 +372,7 @@ fn pnl_fitness_is_identical_for_any_thread_count() {
 
 #[test]
 fn fitness_pnl_refusals_name_their_reason() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, 900);
     let spec = write_spec(&dir);
 
@@ -412,7 +409,7 @@ fn fitness_pnl_refusals_name_their_reason() {
 
 #[test]
 fn resume_needs_the_same_book() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, 900);
     let spec = write_spec(&dir);
     let cp = dir.join("cp.rcsr").to_string_lossy().into_owned();
@@ -474,7 +471,7 @@ fn best_expression(j: &Json) -> String {
 
 #[test]
 fn one_block_is_the_unblocked_fitness() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, 900);
     let spec = write_spec(&dir);
     let plain = run(&data, &spec, &["--fitness", "pnl"]);
@@ -492,7 +489,7 @@ fn one_block_is_the_unblocked_fitness() {
 
 #[test]
 fn blocks_report_per_block_regret_and_are_thread_invariant() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_regime_csv(&dir);
     let spec = write_spec(&dir);
     let args = ["--fitness", "pnl", "--pnl-blocks", "4", "--pnl-block-lambda", "1"];
@@ -521,7 +518,7 @@ fn blocks_report_per_block_regret_and_are_thread_invariant() {
 
 #[test]
 fn the_block_term_prefers_the_steady_signal() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_regime_csv(&dir);
     let spec = write_spec(&dir);
     let pooled = json(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "1", "--seed", "4"]));
@@ -533,7 +530,7 @@ fn the_block_term_prefers_the_steady_signal() {
 
 #[test]
 fn block_flags_name_their_reason() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, 900);
     let spec = write_spec(&dir);
     usage_error(&run(&data, &spec, &["--pnl-blocks", "4"]), "--pnl-blocks needs --fitness pnl");
@@ -546,7 +543,7 @@ fn block_flags_name_their_reason() {
 
 #[test]
 fn resume_needs_the_same_blocks() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_regime_csv(&dir);
     let spec = write_spec(&dir);
     let cp = dir.join("cp.rcsr").to_string_lossy().into_owned();
@@ -562,7 +559,7 @@ fn resume_needs_the_same_blocks() {
 
 #[test]
 fn prune_fits_candidates_under_pnl_above_prune_rows() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv_rows(&dir, 900, 3000);
     let spec = write_spec(&dir);
     let j = json(&run(

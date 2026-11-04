@@ -5,22 +5,19 @@ use rcsr::devlog::Json;
 use rcsr::store;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 const T0: i64 = 1_600_000_000;
 const STEP: i64 = 3600;
 const HOURS: i64 = 10;
 
-static NEXT: AtomicUsize = AtomicUsize::new(0);
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
 
-fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-panel-spread-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch() -> (Scratch, PathBuf) {
+    let scratch = Scratch::new("panel-spread");
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn p(dir: &Path, name: &str) -> String {
@@ -73,7 +70,7 @@ fn base<'a>(panel: &'a str, range: &'a str) -> Vec<&'a str> {
 
 #[test]
 fn spread_prints_the_hand_value_with_an_interval() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let panel = panel(&dir);
     let range = format!("{}..{}", T0, T0 + STEP * HOURS);
     let o = rcsr(&base(&panel, &range));
@@ -89,7 +86,7 @@ fn spread_prints_the_hand_value_with_an_interval() {
 
 #[test]
 fn a_range_reaching_the_declared_locked_test_is_refused() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let panel = panel(&dir);
     let lock = format!("{},{}", T0 + STEP * 6, T0 + STEP * HOURS + STEP);
     // Overlaps the lock outright.
@@ -118,7 +115,7 @@ fn a_range_reaching_the_declared_locked_test_is_refused() {
 
 #[test]
 fn lockbox_none_is_the_only_opt_out() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let panel = panel(&dir);
     let range = format!("{}..{}", T0, T0 + STEP * HOURS);
     let mut a = base(&panel, &range);
@@ -129,7 +126,7 @@ fn lockbox_none_is_the_only_opt_out() {
 
 #[test]
 fn a_range_whose_features_read_the_declared_locked_test_is_refused_until_the_embargo_has_passed() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let panel = panel(&dir);
     let lock = rcsr::lockbox::Lockbox { start: T0 + STEP * 2, end: T0 + STEP * 3 };
     let embargo = rcsr::lockbox::embargo_json(2 * STEP, "clv1", "test", STEP);

@@ -17,10 +17,14 @@ fn definition() -> Definition {
     ablation::parse_definition(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("rcsr-ablation-{}-{}", std::process::id(), name));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn scratch(name: &str) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new(name);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn gauss(rng: &mut Mt) -> f64 {
@@ -427,7 +431,7 @@ fn one_range_without_purge_is_unchanged() {
     use rcsr::lockbox::{self, Lockbox};
     let start = 1_000_000 + 200 * 60;
     let lb = Lockbox { start, end: start + 100 * 60 };
-    let dir = scratch("one-range");
+    let (_scratch, dir) = scratch("one-range");
     let raw = dir.join("raw.csv");
     std::fs::write(&raw, two_stores_csv(false, 200)).unwrap();
     lockbox::write_sidecar(raw.to_str().unwrap(), &lb, "test").unwrap();
@@ -465,7 +469,7 @@ fn sidecar_rows(out: &str) -> Vec<usize> {
 
 #[test]
 fn a_flag_range_disjoint_from_the_protocol_default_is_segmented() {
-    let dir = scratch("flag-range");
+    let (_scratch, dir) = scratch("flag-range");
     let (a, b) = (dir.join("A.csv"), dir.join("B.csv"));
     let f = range_of("2024-06-01", "2024-07-01");
     assert_eq!((f.start, f.end), (1_717_200_000, 1_719_792_000));
@@ -494,7 +498,7 @@ fn a_flag_range_disjoint_from_the_protocol_default_is_segmented() {
 #[test]
 fn a_second_prepare_keeps_the_range_roles() {
     use rcsr::lockbox;
-    let dir = scratch("roles");
+    let (_scratch, dir) = scratch("roles");
     let a = dir.join("A.csv");
     std::fs::write(&a, hourly_csv(&[])).unwrap();
     let f = range_of("2024-06-01", "2024-07-01");
@@ -513,7 +517,7 @@ fn a_second_prepare_keeps_the_range_roles() {
 #[test]
 fn a_two_range_sidecar_segments_both_ranges_through_the_cli() {
     use rcsr::lockbox;
-    let dir = scratch("two-range-sidecar");
+    let (_scratch, dir) = scratch("two-range-sidecar");
     let (r1, f) = (range_of("2024-03-01", "2024-04-01"), range_of("2024-06-01", "2024-07-01"));
     let write = |name: &str, redraw: &[(i64, i64)]| {
         let p = dir.join(name);
@@ -538,7 +542,7 @@ fn a_two_range_sidecar_segments_both_ranges_through_the_cli() {
 
 #[test]
 fn prepare_purge_source() {
-    let dir = scratch("purge-source");
+    let (_scratch, dir) = scratch("purge-source");
     let a = dir.join("A.csv");
     std::fs::write(&a, hourly_csv(&[])).unwrap();
     let f = range_of("2024-06-01", "2024-07-01");
@@ -654,7 +658,7 @@ fn search(data: &str, spec: &str, extra: &[&str]) -> std::process::Output {
 
 #[test]
 fn run_json_records_arm_feature_hash_and_generation_budget() {
-    let dir = scratch("runjson");
+    let (_scratch, dir) = scratch("runjson");
     let data = objective_csv(&dir);
     let spec = write_target_spec(&dir);
     let out = search(&data, &spec, &["--json", "--arm", "A7"]);
@@ -672,7 +676,7 @@ fn run_json_records_arm_feature_hash_and_generation_budget() {
 
 #[test]
 fn a_real_run_is_scored_on_the_folds_without_the_test_block_in_selection() {
-    let dir = scratch("score");
+    let (_scratch, dir) = scratch("score");
     let data = objective_csv(&dir);
     let spec = write_target_spec(&dir);
     let run_json = dir.join("A0-s3.run.json");
@@ -956,7 +960,7 @@ fn inconsistent_inputs_are_refused_not_averaged() {
 
 #[test]
 fn the_cli_verdict_reads_a_directory_of_result_files() {
-    let dir = scratch("verdict");
+    let (_scratch, dir) = scratch("verdict");
     let d = definition();
     for r in results(&d, &base_scenario(), 3) {
         std::fs::write(dir.join(format!("{}-s{}.result.json", r.arm, r.seed)), r.json()).unwrap();
@@ -976,7 +980,7 @@ fn the_cli_verdict_reads_a_directory_of_result_files() {
 
 #[test]
 fn the_cli_plan_writes_manifests_to_a_directory() {
-    let dir = scratch("plan");
+    let (_scratch, dir) = scratch("plan");
     let data = dir.join("panel.csv");
     let d = definition();
     let mut header = vec!["ts".to_string(), "sym".to_string(), "y".to_string()];
@@ -1034,7 +1038,7 @@ fn a_family_that_loses_only_on_pbo_is_dropped_with_reason_pbo() {
 fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
     use rcsr::lockbox::{self, Lockbox};
 
-    let dir = scratch("locked-test");
+    let (_scratch, dir) = scratch("locked-test");
     let data = objective_csv(&dir);
     let spec = write_target_spec_one_bar(&dir);
     let run_json = dir.join("A0-s3.run.json");
@@ -1145,7 +1149,7 @@ fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
 fn stale_sidecar_is_refused() {
     use rcsr::lockbox::{self, Lockbox};
 
-    let dir = scratch("stale-sidecar");
+    let (_scratch, dir) = scratch("stale-sidecar");
     let data = objective_csv(&dir);
     let spec = write_target_spec_one_bar(&dir);
     let run_json = dir.join("A0.run.json");
@@ -1275,13 +1279,13 @@ fn keep_of(script: &str) -> String {
 
 #[test]
 fn plan_keeps_the_return_and_construction_columns() {
-    let dir = scratch("plan-keep");
+    let (_scratch, dir) = scratch("plan-keep");
     let data = plan_store(&dir);
     let script = plan_cli(&dir, &data, &["--return-col", "lbl_fwd"]);
     assert_eq!(keep_of(&script), "lbl_y,lbl_fwd,vol96");
     assert!(script.lines().filter(|l| l.contains("--arm A")).all(|l| l.contains("--target-spec")), "{script}");
 
-    let no_spec = scratch("plan-keep-nospec");
+    let (_scratch, no_spec) = scratch("plan-keep-nospec");
     let data = plan_store(&no_spec);
     std::fs::remove_file(no_spec.join("panel.targets.json")).unwrap();
     assert_eq!(keep_of(&plan_cli(&no_spec, &data, &[])), "lbl_y");
@@ -1289,7 +1293,7 @@ fn plan_keeps_the_return_and_construction_columns() {
 
 #[test]
 fn the_planned_lines_for_one_arm_and_seed_run_as_written() {
-    let dir = scratch("plan-run");
+    let (_scratch, dir) = scratch("plan-run");
     let data = plan_store(&dir);
     let script = plan_cli(&dir, &data, &["--return-col", "lbl_fwd", "--search-args", "--objective pnl --cost-bps 5 --validation-frac 0.3 --split temporal --time ts --cpu --no-dev-log --pop 16 --quiet", "--score-args", "--purge-seconds 900"]);
     let lines: Vec<&str> = script

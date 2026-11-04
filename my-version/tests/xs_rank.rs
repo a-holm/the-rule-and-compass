@@ -9,21 +9,18 @@ use rcsr::target;
 use rcsr::trading::{self, PositionMap, TradingRows, TradingSpec};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 const T0: i64 = 1_600_000_000;
 const STEP: i64 = 3600;
 
-static NEXT: AtomicUsize = AtomicUsize::new(0);
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
 
-fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-xs-rank-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch() -> (Scratch, PathBuf) {
+    let scratch = Scratch::new("xs-rank");
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn p(dir: &Path, name: &str) -> String {
@@ -121,7 +118,7 @@ fn panel_fixture(dir: &Path) -> (String, Vec<f64>) {
 
 #[test]
 fn panel_rank_reproduces_the_hand_table_and_keeps_existing_blocks() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let (panel, want) = panel_fixture(&dir);
     let before = registry::write_schema(&panel, "2").map(|_| registry::read_hashes(&registry::schema_path(&panel)).unwrap()).unwrap();
     let panel_sha = rcsr::manifest::sha256_file(&panel).unwrap();
@@ -171,7 +168,7 @@ fn panel_rank_reproduces_the_hand_table_and_keeps_existing_blocks() {
 
 #[test]
 fn panel_rank_refuses_bad_input() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let (panel, _) = panel_fixture(&dir);
     let out = p(&dir, "o.rcsb");
     let bad_name = rcsr(&["panel", "rank", "--data", &panel, "--column", "lbl_h1_fwd", "--name", "rank_h1", "--out", &out]);
@@ -209,7 +206,7 @@ fn the_rank_column_is_a_label_never_an_input_and_never_projected() {
     }
 
     // The search: the target column or its return column in --vars is D13a (exit 5).
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_search_csv(&dir, "d.csv", None);
     let spec = write_xs_spec(&dir, "s.json");
     for vars in ["x,lbl_h1_xs", "x,r"] {
@@ -295,7 +292,7 @@ fn top_tercile_book_matches_hand_fixture() {
     assert_eq!(trading::top_tercile_positions(&[1.0, 1.0, 1.0], &[1.0, 1.0, 1.0]), vec![1.0, 0.0, 0.0]);
 
     // The same fixture through `rcsr walkforward --policy top-tercile`.
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_hand_csv(&dir, "wf.csv");
     let wf_path = p(&dir, "wf.json");
     let w = format!("w,{},{},{},{}", T0, T0 + STEP * 9, T0 + STEP * 10, T0 + STEP * 13);
@@ -435,7 +432,7 @@ fn search_vars(data: &str, spec: &str, vars: &str, extra: &[&str]) -> Output {
 
 #[test]
 fn xs_rank_spec_parses_and_the_objective_runs_on_it() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec_path = write_xs_spec(&dir, "s.json");
     let specs = target::parse_file(&std::fs::read_to_string(&spec_path).unwrap()).unwrap();
     assert_eq!(specs[0].kind, target::KIND_XS_RANK);
@@ -484,7 +481,7 @@ fn xs_rank_spec_parses_and_the_objective_runs_on_it() {
 
 #[test]
 fn a_forward_return_spec_keeps_working_with_both_position_maps() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let csv = write_search_csv(&dir, "d.csv", None);
     let text = std::fs::read_to_string(write_xs_spec(&dir, "s.json")).unwrap();
     let fwd = text.replace("\"xs_rank\"", "\"forward_return\"").replace("\"construction_columns\":[\"r\"]", "\"construction_columns\":[]");
@@ -500,7 +497,7 @@ fn a_forward_return_spec_keeps_working_with_both_position_maps() {
 
 #[test]
 fn the_finalist_does_not_depend_on_the_test_block() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_xs_spec(&dir, "s.json");
     let plain = write_search_csv(&dir, "a.csv", None);
     let shuffled = write_search_csv(&dir, "b.csv", Some(7));
@@ -518,7 +515,7 @@ fn the_finalist_does_not_depend_on_the_test_block() {
 
 #[test]
 fn walkforward_from_run_prices_the_top_tercile_book_of_the_search() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_xs_spec(&dir, "s.json");
     let csv = write_search_csv(&dir, "d.csv", None);
     let o = search(&csv, &spec, &["--objective", "pnl", "--position", "top_tercile", "--validation-frac", "0.1765", "--arm", "A0"]);
@@ -576,7 +573,7 @@ fn search_and_walkforward_rank_the_same_cross_section() {
     // Symbol 5 is delisted: no label and no return at the 2nd and 3rd timestamp of the
     // validation block and of the test block. Its score still ranks in both paths, it
     // earns nothing and pays nothing where the return is missing.
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_xs_spec(&dir, "s.json");
     let csv = write_search_csv_with(&dir, "d.csv", None, true);
     let o = search(

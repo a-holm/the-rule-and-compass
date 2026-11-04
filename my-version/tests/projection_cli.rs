@@ -6,18 +6,14 @@ use std::process::Command;
 use rcsr::data;
 use rcsr::store;
 
-fn tmp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-projection-cli-{}-{}-{}",
-        tag,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn tmp_dir(tag: &str) -> (Scratch, std::path::PathBuf) {
+    let scratch = Scratch::new(tag);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn wide_store(dir: &std::path::Path) -> String {
@@ -82,7 +78,7 @@ fn run(path: &str, manifest: &str, no_project: bool) -> String {
 
 #[test]
 fn the_run_manifest_records_the_projection_and_the_escape_hatch_matches() {
-    let dir = tmp_dir("manifest");
+    let (_scratch, dir) = tmp_dir("manifest");
     let path = wide_store(&dir);
     let m1 = dir.join("projected.json").to_string_lossy().into_owned();
     let m2 = dir.join("full.json").to_string_lossy().into_owned();
@@ -126,7 +122,6 @@ fn the_run_manifest_records_the_projection_and_the_escape_hatch_matches() {
     assert!(pa.starts_with("\"pareto\":"), "missing pareto in projected JSON");
     assert_eq!(pa, pb, "projection changed the search result");
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A minimal JSON reader for the manifest assertions; the crate has no

@@ -81,7 +81,7 @@ fn launch_dry_run(out: &Path, label: &str) -> String {
 fn the_seed_is_stable_across_processes() {
     // SHA-256("alpha:7") = 8855c828..., SHA-256("beta:7") = 98e9f534...; the
     // seed is the first 8 hex digits mod 100000.
-    let out = unique_dir("seed");
+    let (_scratch, out) = unique_dir("seed");
     let a1 = launch_dry_run(&out, "alpha");
     let a2 = launch_dry_run(&out, "alpha");
     let b = launch_dry_run(&out, "beta");
@@ -101,13 +101,11 @@ fn the_seed_is_stable_across_processes() {
         "{a1}"
     );
     assert!(a1.trim_end().ends_with("--dev-log-level summary --cpu"), "{a1}");
-    let _ = fs::remove_dir_all(out);
 }
 
 #[test]
 fn run_long_writes_manifest_result_and_live_log() {
-    let dir = unique_dir("runlong");
-    fs::create_dir_all(&dir).expect("create temp dir");
+    let (_scratch, dir) = unique_dir("runlong");
     let csv = dir.join("data.csv");
     let mut text = String::from("x,y\n");
     for i in 0..40 {
@@ -209,25 +207,21 @@ fn run_long_writes_manifest_result_and_live_log() {
         String::from_utf8_lossy(&verify.stdout)
     );
 
-    let _ = fs::remove_dir_all(dir);
 }
 
-fn unique_dir(tag: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static SEQ: AtomicUsize = AtomicUsize::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "rcsr-launcher-{}-{}-{}",
-        std::process::id(),
-        n,
-        tag
-    ))
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn unique_dir(tag: &str) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new(tag);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 #[test]
 fn rss_sampler_records_csv_and_summary_for_a_child() {
-    let dir = unique_dir("rss");
-    fs::create_dir_all(&dir).expect("create temp dir");
+    let (_scratch, dir) = unique_dir("rss");
     let csv = dir.join("rss.csv");
     let output = Command::new(env!("CARGO_BIN_EXE_rcsr-rss"))
         .args(["--csv", csv.to_str().unwrap(), "--interval", "0.02", "--", "sleep", "0.2"])
@@ -260,5 +254,4 @@ fn rss_sampler_records_csv_and_summary_for_a_child() {
         .output()
         .expect("run rcsr-rss");
     assert_eq!(failing.status.code(), Some(3), "the child's status is propagated");
-    let _ = fs::remove_dir_all(dir);
 }

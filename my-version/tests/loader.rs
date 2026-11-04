@@ -7,6 +7,10 @@ use rcsr::rng::Mt;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 const RAGGED: &str = "x,y\n1,2\n2,3,EXTRA\n3,6\n4,8\n";
 
 #[test]
@@ -260,9 +264,8 @@ fn streaming_shape_counts_quote_aware_rows_and_columns() {
 /// `read_to_string`. A quoted comma must parse and the run must finish.
 #[test]
 fn the_data_cli_reads_a_quoted_file_from_a_path() {
-    let dir = std::env::temp_dir().join(format!("rcsr-stream-data-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = Scratch::new("stream-data");
+    let dir = scratch.path().to_path_buf();
     let csv = dir.join("q.csv");
     std::fs::write(&csv, "x,y,label\r\n1,2,\"a,b\"\r\n3,4,\"c,d\"\r\n").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
@@ -287,15 +290,13 @@ fn the_data_cli_reads_a_quoted_file_from_a_path() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("\"tool\":\"rcsr\""), "{stdout}");
     assert!(!stdout.contains("ragged"), "{stdout}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// #126: `rcsr import` streams and stores the exact quoted values.
 #[test]
 fn the_import_cli_streams_quoted_values_from_a_path() {
-    let dir = std::env::temp_dir().join(format!("rcsr-stream-import-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = Scratch::new("stream-import");
+    let dir = scratch.path().to_path_buf();
     let csv = dir.join("q.csv");
     let store = dir.join("q.rcsb");
     std::fs::write(
@@ -327,5 +328,4 @@ fn the_import_cli_streams_quoted_values_from_a_path() {
     assert_eq!(t.text(2, 1), Some("two\nlines"));
     assert_eq!(t.text(3, 1), Some("he said \"hi\""));
     assert_eq!(t.text(4, 1), Some(""));
-    let _ = std::fs::remove_dir_all(&dir);
 }

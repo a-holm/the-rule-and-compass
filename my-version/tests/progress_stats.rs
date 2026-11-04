@@ -14,6 +14,10 @@ use rcsr::progress_stats::{
 use rcsr::search::{self, Config};
 use std::process::Command;
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 fn sol(tree: expr::Node) -> Sol {
     Sol {
         tree,
@@ -286,11 +290,8 @@ fn a_hard_problem_does_not_reach_the_converged_range() {
 
 #[test]
 fn progress_is_flag_gated_and_does_not_change_default_output() {
-    let path = std::env::temp_dir().join(format!(
-        "rcsr-convergence-{}-{}.csv",
-        std::process::id(),
-        std::thread::current().name().unwrap_or("main")
-    ));
+    let scratch = Scratch::new("convergence");
+    let path = scratch.join("data.csv");
     let mut csv = String::from("x,y\n");
     for i in 0..24 {
         let a = -1.0 + 2.0 * i as f64 / 23.0;
@@ -383,5 +384,4 @@ fn progress_is_flag_gated_and_does_not_change_default_output() {
         "NDJSON done event is missing convergence: {done}"
     );
 
-    let _ = std::fs::remove_file(&path);
 }

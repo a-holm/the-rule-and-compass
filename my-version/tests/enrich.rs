@@ -198,18 +198,14 @@ fn flow_rows(n: usize) -> Vec<(i64, String, f64, f64, f64, f64, f64, f64, f64, f
         .collect()
 }
 
-fn tmp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-enrich-{}-{}-{}",
-        tag,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn tmp_dir(tag: &str) -> (Scratch, std::path::PathBuf) {
+    let scratch = Scratch::new(tag);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn opts(data: &str, out: &str, features: &str) -> Options {
@@ -278,7 +274,7 @@ fn catalogue_expands_every_family_and_refuses_typos() {
 
 #[test]
 fn append_preserves_every_existing_column_and_metadata() {
-    let dir = tmp_dir("append");
+    let (_scratch, dir) = tmp_dir("append");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let mut rows = bars("AAA", 40, 0, 3600);
@@ -324,7 +320,7 @@ fn append_preserves_every_existing_column_and_metadata() {
 
 #[test]
 fn duplicate_columns_need_replace_and_replace_is_stable() {
-    let dir = tmp_dir("replace");
+    let (_scratch, dir) = tmp_dir("replace");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out1 = dir.join("out1.rcsb").to_string_lossy().into_owned();
     let out2 = dir.join("out2.rcsb").to_string_lossy().into_owned();
@@ -345,7 +341,7 @@ fn duplicate_columns_need_replace_and_replace_is_stable() {
 
 #[test]
 fn feature_hashes_and_store_checksum_are_identical_across_chunk_sizes() {
-    let dir = tmp_dir("chunks");
+    let (_scratch, dir) = tmp_dir("chunks");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let a = dir.join("a.rcsb").to_string_lossy().into_owned();
     let b = dir.join("b.rcsb").to_string_lossy().into_owned();
@@ -367,7 +363,7 @@ fn feature_hashes_and_store_checksum_are_identical_across_chunk_sizes() {
 
 #[test]
 fn gap_windows_are_nan_and_a_prefix_is_causal() {
-    let dir = tmp_dir("gaps");
+    let (_scratch, dir) = tmp_dir("gaps");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let short_store = dir.join("short.rcsb").to_string_lossy().into_owned();
@@ -409,7 +405,7 @@ fn gap_windows_are_nan_and_a_prefix_is_causal() {
 
 #[test]
 fn labels_enter_at_the_next_open_and_stay_out_of_features() {
-    let dir = tmp_dir("label");
+    let (_scratch, dir) = tmp_dir("label");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let rows = bars("AAA", 50, 0, 3600);
@@ -573,7 +569,7 @@ fn measure_write_bandwidth_on_a_filesystem() {
 
 #[test]
 fn dry_run_writes_nothing() {
-    let dir = tmp_dir("dry");
+    let (_scratch, dir) = tmp_dir("dry");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     write_store(&src, &bars("AAA", 30, 0, 3600), 8);
@@ -599,7 +595,7 @@ fn py15m_matches_the_python_panel_within_tolerance() {
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enrich");
     let input = base.join("btc_15m_ohlcv.csv");
     let expected_path = base.join("btc_15m_py15m_expected.csv");
-    let dir = tmp_dir("py15m");
+    let (_scratch, dir) = tmp_dir("py15m");
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
 
     // The #273 market-state columns now require 20 point-in-time members, so
@@ -822,7 +818,7 @@ fn default_financial_registry_is_complete_and_explicit() {
 /// marks it derived. The compact `H==L` convention is documented separately.
 #[test]
 fn wasym1_identity_holds_on_finite_range_bars() {
-    let dir = tmp_dir("wasym");
+    let (_scratch, dir) = tmp_dir("wasym");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = Vec::new();
@@ -860,7 +856,7 @@ fn wasym1_identity_holds_on_finite_range_bars() {
 /// A compact window that spans a hole is NaN; it is never bridged.
 #[test]
 fn compact_windows_are_gap_masked() {
-    let dir = tmp_dir("compact_gap");
+    let (_scratch, dir) = tmp_dir("compact_gap");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = Vec::new();
@@ -883,7 +879,7 @@ fn compact_windows_are_gap_masked() {
 /// hard error naming it, never a zero column.
 #[test]
 fn compact_flow_features_require_raw_trades_and_taker_columns() {
-    let dir = tmp_dir("compact_raw");
+    let (_scratch, dir) = tmp_dir("compact_raw");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     write_store(&src, &bars("AAA", 120, 0, 900), 16);
@@ -896,7 +892,7 @@ fn compact_flow_features_require_raw_trades_and_taker_columns() {
 /// Every derived flow formula on hand-built bars, to 1e-12 absolute-or-relative.
 #[test]
 fn flow_formulas_match_hand_built_bars() {
-    let dir = tmp_dir("flow_formulas");
+    let (_scratch, dir) = tmp_dir("flow_formulas");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let rows = flow_rows(160);
@@ -981,7 +977,7 @@ fn flow_formulas_match_hand_built_bars() {
 /// illiquidity; `avg_trade_size96` keeps its explicit max(trades, 1).
 #[test]
 fn flow_zero_volume_and_zero_trades_are_nan_not_zero() {
-    let dir = tmp_dir("flow_zero");
+    let (_scratch, dir) = tmp_dir("flow_zero");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let mut rows = flow_rows(160);
@@ -1008,7 +1004,7 @@ fn flow_zero_volume_and_zero_trades_are_nan_not_zero() {
         assert!(column(&out, name)[last].is_nan(), "{name} must be NaN at zero volume/trades");
     }
 
-    let dir = tmp_dir("flow_zero_trades");
+    let (_scratch, dir) = tmp_dir("flow_zero_trades");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let mut rows = flow_rows(160);
@@ -1030,7 +1026,7 @@ fn flow_zero_volume_and_zero_trades_are_nan_not_zero() {
 /// nothing is forward-filled.
 #[test]
 fn flow_windows_are_gap_masked() {
-    let dir = tmp_dir("flow_gap");
+    let (_scratch, dir) = tmp_dir("flow_gap");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let mut rows = flow_rows(300);
@@ -1099,22 +1095,22 @@ fn flow_windows_never_bridge_a_listing_boundary() {
     all.extend(new.clone());
     all.extend(late.clone());
 
-    let dir = tmp_dir("flow_boundary");
+    let (_scratch, dir) = tmp_dir("flow_boundary");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     write_flow_store(&src, &all, false, 32);
     enrich::build(&opts(&src, &out, "flow")).unwrap();
 
     let solo = |tag: &str, rows: &[(i64, String, f64, f64, f64, f64, f64, f64, f64, f64, f64)]| {
-        let d = tmp_dir(tag);
+        let (scratch, d) = tmp_dir(tag);
         let s = d.join("in.rcsb").to_string_lossy().into_owned();
         let o = d.join("out.rcsb").to_string_lossy().into_owned();
         write_flow_store(&s, rows, false, 32);
         enrich::build(&opts(&s, &o, "flow")).unwrap();
-        o
+        (scratch, o)
     };
-    let solo_new = solo("flow_boundary_new", &new);
-    let solo_late = solo("flow_boundary_late", &late);
+    let (_solo_new_dir, solo_new) = solo("flow_boundary_new", &new);
+    let (_solo_late_dir, solo_late) = solo("flow_boundary_late", &late);
 
     for name in names {
         let v = column(&out, name);
@@ -1152,7 +1148,7 @@ fn flow_shared_names_match_the_compact_regression_fixture() {
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enrich");
     let input = base.join("compact_15m_ohlcv.csv");
     let expected_path = base.join("compact_15m_expected.csv");
-    let dir = tmp_dir("flow_parity");
+    let (_scratch, dir) = tmp_dir("flow_parity");
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     enrich::build(&opts(&input.to_string_lossy(), &out, "flow")).unwrap();
 
@@ -1202,7 +1198,7 @@ fn flow_shared_names_match_the_compact_regression_fixture() {
 /// optional `vwap` column, while enrich appends derived columns.
 #[test]
 fn raw_ohlcv_flow_fields_round_trip_exactly() {
-    let dir = tmp_dir("flow_roundtrip");
+    let (_scratch, dir) = tmp_dir("flow_roundtrip");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let rows = flow_rows(80);
@@ -1256,7 +1252,7 @@ fn raw_ohlcv_flow_fields_round_trip_exactly() {
 /// feature and the column; an unknown name is still a hard error.
 #[test]
 fn flow_family_requires_raw_fields_and_unknown_names_fail() {
-    let dir = tmp_dir("flow_missing");
+    let (_scratch, dir) = tmp_dir("flow_missing");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     write_store(&src, &bars("AAA", 120, 0, 900), 16);
@@ -1290,7 +1286,7 @@ fn compact_matches_the_python_builder_on_a_contiguous_slice() {
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enrich");
     let input = base.join("compact_15m_ohlcv.csv");
     let expected_path = base.join("compact_15m_expected.csv");
-    let dir = tmp_dir("compact_parity");
+    let (_scratch, dir) = tmp_dir("compact_parity");
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let report = enrich::build(&opts(&input.to_string_lossy(), &out, "compact")).unwrap();
     assert_eq!(report.features.len(), 52);
@@ -1347,7 +1343,7 @@ fn compact_matches_the_python_builder_on_a_contiguous_slice() {
 
 #[test]
 fn every_catalogue_column_is_causal_on_a_prefix() {
-    let dir = tmp_dir("causal");
+    let (_scratch, dir) = tmp_dir("causal");
     let full = dir.join("full.rcsb").to_string_lossy().into_owned();
     let prefix = dir.join("prefix.rcsb").to_string_lossy().into_owned();
     let full_out = dir.join("full_out.rcsb").to_string_lossy().into_owned();
@@ -1377,7 +1373,7 @@ fn every_catalogue_column_is_causal_on_a_prefix() {
 
 #[test]
 fn replace_overwrites_the_existing_values() {
-    let dir = tmp_dir("replace_values");
+    let (_scratch, dir) = tmp_dir("replace_values");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     // A store that already carries a deliberately wrong r1 column.
@@ -1412,7 +1408,7 @@ fn replace_overwrites_the_existing_values() {
 
 #[test]
 fn time_major_panel_stores_are_refused_with_a_clear_message() {
-    let dir = tmp_dir("timemajor");
+    let (_scratch, dir) = tmp_dir("timemajor");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     // Interleave two symbols by timestamp.
@@ -1435,7 +1431,7 @@ fn time_major_panel_stores_are_refused_with_a_clear_message() {
 /// names are shared).
 #[test]
 fn advertised_column_set_is_exactly_what_a_real_run_appends() {
-    let dir = tmp_dir("advertised");
+    let (_scratch, dir) = tmp_dir("advertised");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     // A two-sided series: zero-loss windows make RSI undefined (NaN) by the
     // Python definition, so a monotonic ramp cannot exercise `rsi6`.
@@ -1572,7 +1568,7 @@ fn bench_rows(shift_btc: i64, btc_hole: bool) -> Vec<(i64, String, f64, f64, f64
 
 #[test]
 fn btc_and_eth_joins_use_the_same_timestamp_and_a_shift_fails() {
-    let dir = tmp_dir("cross-bench");
+    let (_scratch, dir) = tmp_dir("cross-bench");
     let input = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let features = "btc_r1,btc_r16,btc_r20,btc_vol20,rel_btc_r16,beta_btc_60,eth_r16,rel_eth_r16,beta_eth_60";
@@ -1658,7 +1654,7 @@ fn symbol_index(k: usize, i: usize, n: usize) -> usize {
 
 #[test]
 fn cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit() {
-    let dir = tmp_dir("cross-market");
+    let (_scratch, dir) = tmp_dir("cross-market");
     let input = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let n = 800usize;
@@ -1762,7 +1758,7 @@ fn cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit() {
 
 #[test]
 fn a_partial_cross_section_is_nan_and_a_prefix_is_causal() {
-    let dir = tmp_dir("cross-partial");
+    let (_scratch, dir) = tmp_dir("cross-partial");
     let input = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let n = 240usize;
@@ -1917,7 +1913,7 @@ fn mtf_36_columns_match_hand_built_higher_bars() {
     for (tf_name, step) in [("1h", 3600i64), ("4h", 14_400), ("1d", 86_400)] {
         let rows = mtf_single_bar_fixture(step, 60);
         let (o, h, l, c) = higher_arrays(&rows);
-        let dir = tmp_dir(&format!("mtf-unit-{tf_name}"));
+        let (_scratch, dir) = tmp_dir(&format!("mtf-unit-{tf_name}"));
         let src = dir.join("in.rcsb").to_string_lossy().into_owned();
         let out = dir.join("out.rcsb").to_string_lossy().into_owned();
         write_store(&src, &rows, 32);
@@ -1965,7 +1961,7 @@ fn mtf_gap_is_nan_and_bar_age_reports_staleness() {
             rows.push((t, "AAA".to_string(), p, p + 0.5, p - 0.4, p + 0.05, 10.0));
         }
     }
-    let dir = tmp_dir("mtf-gap");
+    let (_scratch, dir) = tmp_dir("mtf-gap");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     write_store(&src, &rows, 32);
@@ -2048,7 +2044,7 @@ fn mtf_join_is_causal_and_a_future_shift_is_caught() {
 
     // The enrich column at a 10:15 decision uses the 09:00 hourly bar (closed
     // at 10:00), never the in-progress 10:00 bar.
-    let dir = tmp_dir("mtf-causal");
+    let (_scratch, dir) = tmp_dir("mtf-causal");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     write_store(&src, &rows, 32);
@@ -2068,7 +2064,7 @@ fn mtf_prefix_truncation_replay_changes_no_earlier_value() {
     let rows = mtf_15m_rows(96);
     let prefix_len = 200usize;
     let prefix_rows = &rows[..prefix_len];
-    let dir = tmp_dir("mtf-prefix");
+    let (_scratch, dir) = tmp_dir("mtf-prefix");
     let full_src = dir.join("full.rcsb").to_string_lossy().into_owned();
     let full_out = dir.join("full-out.rcsb").to_string_lossy().into_owned();
     let pre_src = dir.join("pre.rcsb").to_string_lossy().into_owned();
@@ -2141,7 +2137,7 @@ fn mtf_every_column_is_nan_when_its_higher_bucket_is_missing() {
                 rows.push((t, "AAA".to_string(), p, p + 0.4, p - 0.3, p + 0.02, 10.0));
             }
         }
-        let dir = tmp_dir(&format!("mtf-missing-{tf}"));
+        let (_scratch, dir) = tmp_dir(&format!("mtf-missing-{tf}"));
         let src = dir.join("in.rcsb").to_string_lossy().into_owned();
         let out = dir.join("out.rcsb").to_string_lossy().into_owned();
         write_store(&src, &rows, 32);
@@ -2171,7 +2167,7 @@ fn mtf_every_column_is_nan_when_its_higher_bucket_is_missing() {
 /// geometry and structure block. ATR14 is 2.0 because every true range is 2.
 #[test]
 fn price_action_geometry_matches_flat_hand_bars() {
-    let dir = tmp_dir("pa_flat");
+    let (_scratch, dir) = tmp_dir("pa_flat");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..120i64)
@@ -2228,7 +2224,7 @@ fn price_action_geometry_matches_flat_hand_bars() {
 /// A rising close series produces the signed clipped streak.
 #[test]
 fn run8_tracks_the_signed_close_streak_and_clips_at_eight() {
-    let dir = tmp_dir("pa_run");
+    let (_scratch, dir) = tmp_dir("pa_run");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..20i64)
@@ -2254,7 +2250,7 @@ fn run8_tracks_the_signed_close_streak_and_clips_at_eight() {
 /// harami strengths, including their sign.
 #[test]
 fn price_action_strengths_are_continuous_and_signed() {
-    let dir = tmp_dir("pa_shapes");
+    let (_scratch, dir) = tmp_dir("pa_shapes");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let bars: Vec<(f64, f64, f64, f64)> = vec![
@@ -2300,7 +2296,7 @@ fn price_action_strengths_are_continuous_and_signed() {
 /// The three shape identities hold on random finite-range bars.
 #[test]
 fn price_action_identities_hold_on_random_bars() {
-    let dir = tmp_dir("pa_identities");
+    let (_scratch, dir) = tmp_dir("pa_identities");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = Vec::new();
@@ -2355,7 +2351,7 @@ fn price_action_identities_hold_on_random_bars() {
 /// The compact `batr` keeps its documented compact zero on `H == L`.
 #[test]
 fn price_action_zero_range_and_zero_volume_are_nan() {
-    let dir = tmp_dir("pa_degenerate");
+    let (_scratch, dir) = tmp_dir("pa_degenerate");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..220i64)
@@ -2387,7 +2383,7 @@ fn price_action_zero_range_and_zero_volume_are_nan() {
 /// window is NaN until the hole leaves it. Nothing bridges a gap.
 #[test]
 fn price_action_two_bar_and_window_gap_masked() {
-    let dir = tmp_dir("pa_gap");
+    let (_scratch, dir) = tmp_dir("pa_gap");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = Vec::new();
@@ -2428,7 +2424,7 @@ fn price_action_two_bar_and_window_gap_masked() {
 /// truncated store recomputes the same prefix.
 #[test]
 fn price_action_is_prefix_causal_under_a_shifted_future_bar() {
-    let dir = tmp_dir("pa_causal");
+    let (_scratch, dir) = tmp_dir("pa_causal");
     let full = dir.join("full.rcsb").to_string_lossy().into_owned();
     let cut = dir.join("cut.rcsb").to_string_lossy().into_owned();
     let shifted = dir.join("shifted.rcsb").to_string_lossy().into_owned();
@@ -2476,7 +2472,7 @@ fn compact_candle_subset_passes_parity_at_1e12() {
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enrich");
     let input = base.join("compact_15m_ohlcv.csv");
     let expected_path = base.join("compact_15m_expected.csv");
-    let dir = tmp_dir("candle_parity");
+    let (_scratch, dir) = tmp_dir("candle_parity");
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let names = [
         "clv1", "clv4", "body1", "batr", "wasym1", "lower_wick", "rng1", "volrat", "gapatr", "don96",
@@ -2540,7 +2536,7 @@ fn compact_candle_subset_passes_parity_at_1e12() {
 /// for every column, in text and JSON.
 #[test]
 fn enrich_report_lists_prevalence_and_first_finite_date() {
-    let dir = tmp_dir("pa_report");
+    let (_scratch, dir) = tmp_dir("pa_report");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..120i64)
@@ -2570,7 +2566,7 @@ fn enrich_report_lists_prevalence_and_first_finite_date() {
 /// once, through real producers.
 #[test]
 fn engine_inventory_is_complete_available_and_runs() {
-    let dir = tmp_dir("engine_inventory");
+    let (_scratch, dir) = tmp_dir("engine_inventory");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let n = 3200usize;
@@ -2690,7 +2686,7 @@ fn engine_inventory_is_complete_available_and_runs() {
 /// specification requested it.
 #[test]
 fn engine_shared_names_have_one_canonical_value() {
-    let dir = tmp_dir("engine_aliases");
+    let (_scratch, dir) = tmp_dir("engine_aliases");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let mut rows = bars("AAA", 400, 0, 900);
     rows.extend(bars("BTCUSDT", 400, 0, 900));
@@ -2738,7 +2734,7 @@ fn engine_shared_names_have_one_canonical_value() {
 /// rest of the catalogue: a return or window spanning a hole is NaN.
 #[test]
 fn engine_feature_groups_are_gap_masked() {
-    let dir = tmp_dir("engine_gap");
+    let (_scratch, dir) = tmp_dir("engine_gap");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let gap = 450i64;
@@ -2771,7 +2767,7 @@ fn engine_feature_groups_are_gap_masked() {
 /// changes an earlier row.
 #[test]
 fn engine_inventory_is_causal_on_a_prefix() {
-    let dir = tmp_dir("engine_causal");
+    let (_scratch, dir) = tmp_dir("engine_causal");
     let full = dir.join("full.rcsb").to_string_lossy().into_owned();
     let prefix = dir.join("prefix.rcsb").to_string_lossy().into_owned();
     let full_out = dir.join("full_out.rcsb").to_string_lossy().into_owned();
@@ -2819,7 +2815,7 @@ fn prefix_differs(full: &[f64], prefix: &[f64], cut: usize) -> bool {
 /// same prefix comparison must flag every engine column that varies.
 #[test]
 fn engine_inventory_future_shift_is_caught_by_the_prefix_check() {
-    let dir = tmp_dir("engine_causal_neg");
+    let (_scratch, dir) = tmp_dir("engine_causal_neg");
     let full = dir.join("full.rcsb").to_string_lossy().into_owned();
     let prefix = dir.join("prefix.rcsb").to_string_lossy().into_owned();
     let full_out = dir.join("full_out.rcsb").to_string_lossy().into_owned();
@@ -2874,7 +2870,7 @@ fn engine_inventory_future_shift_is_caught_by_the_prefix_check() {
 /// calendar families carry their own per-name tests, named in the inventory.
 #[test]
 fn every_available_name_is_nan_after_a_gap() {
-    let dir = tmp_dir("every_gap");
+    let (_scratch, dir) = tmp_dir("every_gap");
     let a_src = dir.join("a.rcsb").to_string_lossy().into_owned();
     let b_src = dir.join("b.rcsb").to_string_lossy().into_owned();
     let a_out = dir.join("a_out.rcsb").to_string_lossy().into_owned();
@@ -2944,7 +2940,7 @@ fn every_available_name_is_nan_after_a_gap() {
 /// compact order, and `wasym1` is the only name registered as derived.
 #[test]
 fn compact_run_emits_exactly_the_52_names_and_only_wasym1_is_derived() {
-    let dir = tmp_dir("compact_run");
+    let (_scratch, dir) = tmp_dir("compact_run");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let mut rows = wavy_rows("AAA", 400, 0, 900, 0.0);
@@ -3027,7 +3023,7 @@ fn two_symbol_rows(n: usize) -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
 #[test]
 fn long_label_family_is_stored_registered_and_reported() {
     use rcsr::labels::{self, LongLabelSpec, COLUMN_KINDS, TOP_MOVES};
-    let dir = tmp_dir("longlabel");
+    let (_scratch, dir) = tmp_dir("longlabel");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let rows = two_symbol_rows(120);
@@ -3093,7 +3089,7 @@ fn long_label_family_is_stored_registered_and_reported() {
 
 #[test]
 fn legacy_fwd_label_is_unchanged_next_to_a_long_label() {
-    let dir = tmp_dir("longlegacy");
+    let (_scratch, dir) = tmp_dir("longlegacy");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let a = dir.join("a.rcsb").to_string_lossy().into_owned();
     let b = dir.join("b.rcsb").to_string_lossy().into_owned();
@@ -3112,7 +3108,7 @@ fn legacy_fwd_label_is_unchanged_next_to_a_long_label() {
 
 #[test]
 fn long_label_dry_run_writes_no_sidecar_and_bad_specs_fail() {
-    let dir = tmp_dir("longdry");
+    let (_scratch, dir) = tmp_dir("longdry");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     write_store(&src, &two_symbol_rows(40), 30);
@@ -3139,7 +3135,7 @@ mod ledger;
 
 #[test]
 fn json_carries_a_phase_ledger_with_features_and_io() {
-    let dir = tmp_dir("ledger");
+    let (_scratch, dir) = tmp_dir("ledger");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let mut rows = bars("AAA", 120, 0, 3600);
@@ -3151,7 +3147,6 @@ fn json_carries_a_phase_ledger_with_features_and_io() {
     let l = ledger::check(&r.json(), "enrich", &["features", "io"]);
     assert_eq!(l.busy, 0.0, "a CPU run has no device intervals");
     assert!(l.wall <= r.total_seconds + 1e-6, "ledger wall {} vs total {}", l.wall, r.total_seconds);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 const LOCK_START: i64 = 1_717_200_000;
@@ -3180,7 +3175,7 @@ fn lock_rows(flip: bool) -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
 }
 
 fn label_report(tag: &str, flip: bool, locked: Option<&str>) -> String {
-    let dir = tmp_dir(tag);
+    let (_scratch, dir) = tmp_dir(tag);
     let data = dir.join("in.rcsb");
     write_store(data.to_str().unwrap(), &lock_rows(flip), 1000);
     let out = dir.join("out.rcsb");
@@ -3239,7 +3234,7 @@ fn feature_statistics(json: &str) -> String {
 }
 
 fn feature_report(tag: &str, poison: bool, locked: Option<&str>) -> String {
-    let dir = tmp_dir(tag);
+    let (_scratch, dir) = tmp_dir(tag);
     let data = dir.join("in.rcsb");
     let mut rows = lock_rows(false);
     if poison {
@@ -3370,7 +3365,7 @@ fn is_recursive_column(name: &str) -> bool {
 #[test]
 fn every_catalogue_column_forgets_a_perturbed_prefix_after_its_lookback() {
     let (n, s, e) = (7000usize, 2900usize, 3300usize);
-    let dir = tmp_dir("lookback-property");
+    let (_scratch, dir) = tmp_dir("lookback-property");
     let mut outs = Vec::new();
     for (tag, perturbed) in [("a", false), ("b", true)] {
         let src = dir.join(format!("{tag}.rcsb")).to_string_lossy().into_owned();
@@ -3458,7 +3453,7 @@ fn the_lookback_of_a_column_is_at_least_its_warmup_for_every_registry_entry() {
 
 #[test]
 fn enrich_writes_the_lockbox_embargo_and_the_lookback_of_every_feature() {
-    let dir = tmp_dir("embargo-sidecar");
+    let (_scratch, dir) = tmp_dir("embargo-sidecar");
     let src = dir.join("a.rcsb").to_string_lossy().into_owned();
     let out = dir.join("a_out.rcsb").to_string_lossy().into_owned();
     write_store_with_flow(&src, &embargo_rows(400, 100, 160, false), 256);
@@ -3487,7 +3482,7 @@ fn enrich_writes_the_lockbox_embargo_and_the_lookback_of_every_feature() {
 #[test]
 fn enrich_reports_leave_out_the_embargo_rows_and_ignore_locked_prices_after_it() {
     let (n, s, e) = (700usize, 200usize, 260usize);
-    let dir = tmp_dir("embargo-reports");
+    let (_scratch, dir) = tmp_dir("embargo-reports");
     let range = rcsr::lockbox::Lockbox { start: EMB_T0 + EMB_H * s as i64, end: EMB_T0 + EMB_H * e as i64 };
     let mut reports = Vec::new();
     for (tag, perturbed) in [("a", false), ("b", true)] {
@@ -3530,7 +3525,7 @@ fn enrich_reports_leave_out_the_embargo_rows_and_ignore_locked_prices_after_it()
 
 fn weight_columns(tag: &str, perturbed: bool, declare: bool) -> (Vec<f64>, Vec<f64>) {
     let (n, s, e) = (3000usize, 1500usize, 1800usize);
-    let dir = tmp_dir(tag);
+    let (_scratch, dir) = tmp_dir(tag);
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     write_store(&src, &embargo_rows(n, s, e, perturbed), 1024);

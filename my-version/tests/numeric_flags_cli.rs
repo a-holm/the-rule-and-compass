@@ -4,26 +4,27 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-fn csv() -> PathBuf {
-    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    PATH.get_or_init(write_csv).clone()
-}
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
 
-fn write_csv() -> PathBuf {
-    let path = std::env::temp_dir().join(format!("rcsr-numeric-flags-{}.csv", std::process::id()));
+fn csv() -> (Scratch, PathBuf) {
+    let scratch = Scratch::new("numeric-flags");
+    let path = scratch.join("data.csv");
     let mut text = String::from("x,y\n");
     for i in 0..60 {
         let x = i as f64 * 0.1;
         text.push_str(&format!("{x},{}\n", 2.0 * x + 1.0));
     }
     std::fs::write(&path, text).unwrap();
-    path
+    (scratch, path)
 }
 
 fn search(flag: &str, value: &str) -> Output {
+    let (_scratch, data) = csv();
     Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .arg("--data")
-        .arg(csv())
+        .arg(&data)
         .args(["--target", "y", "--generations", "1", "--pop", "20", "--quiet"])
         .args([flag, value])
         .output()
@@ -31,10 +32,11 @@ fn search(flag: &str, value: &str) -> Output {
 }
 
 fn audit(flag: &str, value: &str) -> Output {
+    let (_scratch, data) = csv();
     Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .arg("audit")
         .arg("--data")
-        .arg(csv())
+        .arg(&data)
         .args(["--target", "y"])
         .args([flag, value])
         .output()

@@ -6,6 +6,10 @@ use rcsr::data;
 use rcsr::enrich::{self, GpuMode, Options, Report};
 use rcsr::store;
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 #[path = "common/ledger.rs"]
 mod ledger;
 
@@ -64,8 +68,8 @@ fn feature_phase_partition_closes_and_json_matches_the_report() {
         return;
     }
     enrich::set_gpu_floor_for_tests(0);
-    let dir = std::env::temp_dir().join(format!("rcsr-enrich-ledger-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = Scratch::new("enrich-ledger");
+    let dir = scratch.path().to_path_buf();
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     write_input(&src);
@@ -146,5 +150,4 @@ fn feature_phase_partition_closes_and_json_matches_the_report() {
     assert!(l.busy > 0.0, "device kernels ran but the ledger has no device-busy time");
     let text = r.text_lines().join("\n");
     assert!(text.contains("feature_parts read="), "{text}");
-    let _ = std::fs::remove_dir_all(&dir);
 }

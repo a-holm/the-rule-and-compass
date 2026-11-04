@@ -10,15 +10,14 @@ use rcsr::memory::{EstimateOptions, StoreShape};
 use rcsr::store::{self, FileStore, MAGIC};
 use std::process::Command;
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-estimator-{}-{}",
-        tag,
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn temp_dir(tag: &str) -> (Scratch, std::path::PathBuf) {
+    let scratch = Scratch::new(tag);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 /// Historical v1 layout: every value and code block is f64 on disk.
@@ -104,7 +103,7 @@ fn table_with_text() -> Table {
 
 #[test]
 fn v1_header_charges_resident_widths_not_the_disk_code_width() {
-    let dir = temp_dir("v1");
+    let (_scratch, dir) = temp_dir("v1");
     let path = dir.join("v1.rcsb");
     let table = table_with_text();
     // Three groups: 30 rows with group_rows = 7.
@@ -133,7 +132,6 @@ fn v1_header_charges_resident_widths_not_the_disk_code_width() {
     assert_eq!(shape.storage_bytes(), n * 8 + n * 4 + n * 8 + level_bytes);
     // The old model would have charged 5000 * 3 * 300 = 4,500,000 B.
     assert!(shape.storage_bytes() < n * 3 * 300);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -186,7 +184,7 @@ fn v2_header_charges_the_i64_copy_and_pure_u32_columns() {
             bytes.extend_from_slice(&((r % 2) as u32).to_le_bytes());
         }
     }
-    let dir = temp_dir("v2");
+    let (_scratch, dir) = temp_dir("v2");
     let path = dir.join("v2.rcsb");
     std::fs::write(&path, bytes).unwrap();
     let fs = FileStore::open(path.to_str().unwrap()).unwrap();
@@ -201,7 +199,6 @@ fn v2_header_charges_the_i64_copy_and_pure_u32_columns() {
         shape.storage_bytes(),
         n as u64 * (8 + 16 + 4) + shape.columns[2].dictionary_bytes
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -347,7 +344,7 @@ fn small_store(dir: &std::path::Path) -> std::path::PathBuf {
 
 #[test]
 fn a_store_that_fits_loads_the_full_rows_not_a_sample() {
-    let dir = temp_dir("full");
+    let (_scratch, dir) = temp_dir("full");
     let path = small_store(&dir);
     let fs = FileStore::open(path.to_str().unwrap()).unwrap();
     let opts = EstimateOptions {
@@ -386,12 +383,11 @@ fn a_store_that_fits_loads_the_full_rows_not_a_sample() {
     assert!(stdout.contains("\"full_rows\":true"), "{stdout}");
     assert!(stdout.contains("\"sampled_rows\":null"), "{stdout}");
     assert!(stdout.contains("\"store_memory\":{"), "{stdout}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn an_over_budget_store_is_refused_never_silently_sampled() {
-    let dir = temp_dir("refuse");
+    let (_scratch, dir) = temp_dir("refuse");
     let path = small_store(&dir);
     let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args([
@@ -417,7 +413,6 @@ fn an_over_budget_store_is_refused_never_silently_sampled() {
     assert!(!stderr.contains("hash sample"), "{stderr}");
     assert!(!stderr.contains("sampling ("), "{stderr}");
     assert!(String::from_utf8_lossy(&output.stdout).is_empty());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The real pilot artifact is deliberately not committed. Run with
@@ -469,7 +464,7 @@ fn the_real_panel_store_loads_full_under_a_12gb_budget() {
 fn a_sample_request_covering_every_row_cannot_bypass_the_budget() {
     // `--sample-rows N` with `N >= rows` is a full load. It must not become a
     // quieter way to ignore `--max-memory`.
-    let dir = temp_dir("sample-full");
+    let (_scratch, dir) = temp_dir("sample-full");
     let path = small_store(&dir);
     let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args([
@@ -520,12 +515,11 @@ fn a_sample_request_covering_every_row_cannot_bypass_the_budget() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(3), "{stderr}");
     assert!(stderr.contains("would still exceed"), "{stderr}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn force_and_sample_rows_are_rejected_as_contradictory() {
-    let dir = temp_dir("force-sample");
+    let (_scratch, dir) = temp_dir("force-sample");
     let path = small_store(&dir);
     let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args([
@@ -549,12 +543,11 @@ fn force_and_sample_rows_are_rejected_as_contradictory() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("contradict"), "{stderr}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn explicit_sampling_is_recorded_as_full_rows_false() {
-    let dir = temp_dir("sample");
+    let (_scratch, dir) = temp_dir("sample");
     let path = small_store(&dir);
     let manifest = dir.join("run.manifest.json");
     let dev_log = dir.join("run.dev.ndjson");
@@ -594,5 +587,4 @@ fn explicit_sampling_is_recorded_as_full_rows_false() {
     let dev_text = std::fs::read_to_string(&dev_log).unwrap();
     assert!(dev_text.contains("\"full_rows\":false"), "{dev_text}");
     assert!(dev_text.contains("\"sampled_rows\":250"), "{dev_text}");
-    let _ = std::fs::remove_dir_all(&dir);
 }

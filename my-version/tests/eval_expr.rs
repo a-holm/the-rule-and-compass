@@ -3,6 +3,10 @@
 use rcsr::devlog::Json;
 use std::process::{Command, Output};
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 fn sine() -> String {
     concat!(env!("CARGO_MANIFEST_DIR"), "/examples/sine.csv").to_string()
 }
@@ -43,8 +47,8 @@ fn eval_expr_reports_the_test_error_with_one_fold() {
 #[test]
 fn eval_expr_json_out_writes_the_result_file() {
     let data = sine();
-    let dir = std::env::temp_dir().join(format!("rcsr-eval-json-out-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = Scratch::new("eval-json-out");
+    let dir = scratch.path().to_path_buf();
     let path = dir.join("eval.json");
     let path_s = path.to_str().unwrap();
     let mut args = eval_args(&data);
@@ -61,5 +65,4 @@ fn eval_expr_json_out_writes_the_result_file() {
     assert_eq!(doc.get("mode").and_then(|v| v.as_str()), Some("eval-expr"));
     let test = doc.get("eval").and_then(|e| e.get("test_error")).and_then(|v| v.as_f64());
     assert!((test.expect("test_error") - 3.621871760723742e-7).abs() < 1e-18);
-    let _ = std::fs::remove_dir_all(&dir);
 }

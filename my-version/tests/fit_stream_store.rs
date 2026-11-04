@@ -13,11 +13,14 @@ use rcsr::search::{self, Config};
 use rcsr::store::{self, FileStore};
 use std::sync::Arc;
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("rcsr-stream-{}-{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn temp_dir(tag: &str) -> (Scratch, std::path::PathBuf) {
+    let scratch = Scratch::new(tag);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn model() -> Node {
@@ -71,7 +74,7 @@ fn generated_table(n: usize) -> data::Table {
 fn store_rows_reproduce_the_resident_f64_fit_bit_for_bit() {
     let n = 5_000;
     let table = generated_table(n);
-    let dir = temp_dir("exact");
+    let (_scratch, dir) = temp_dir("exact");
     let path = dir.join("data.rcsb");
     // Groups deliberately do not divide the row count.
     store::write_store(path.to_str().unwrap(), &table, 997).unwrap();
@@ -116,7 +119,7 @@ fn store_rows_reproduce_the_resident_f64_fit_bit_for_bit() {
 fn store_rows_honour_weights_subsets_and_standardisation() {
     let n = 2_000;
     let table = generated_table(n);
-    let dir = temp_dir("projection");
+    let (_scratch, dir) = temp_dir("projection");
     let path = dir.join("data.rcsb");
     store::write_store(path.to_str().unwrap(), &table, 256).unwrap();
     let fs = Arc::new(FileStore::open(path.to_str().unwrap()).unwrap());
@@ -169,7 +172,7 @@ fn store_rows_honour_weights_subsets_and_standardisation() {
 #[test]
 fn non_finite_store_rows_reject_the_streaming_arm() {
     let table = data::parse_table("x,y\n0,1\n1,NaN\n2,3\n").unwrap();
-    let dir = temp_dir("nonfinite");
+    let (_scratch, dir) = temp_dir("nonfinite");
     let path = dir.join("data.rcsb");
     store::write_store(path.to_str().unwrap(), &table, 2).unwrap();
     let fs = Arc::new(FileStore::open(path.to_str().unwrap()).unwrap());
@@ -185,7 +188,7 @@ fn non_finite_store_rows_reject_the_streaming_arm() {
 fn search_streams_from_the_store_with_the_same_trajectory() {
     let n = 240;
     let table = generated_table(n);
-    let dir = temp_dir("search");
+    let (_scratch, dir) = temp_dir("search");
     let path = dir.join("data.rcsb");
     store::write_store(path.to_str().unwrap(), &table, 31).unwrap();
     let fs = Arc::new(FileStore::open(path.to_str().unwrap()).unwrap());

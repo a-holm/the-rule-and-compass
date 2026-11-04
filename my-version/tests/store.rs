@@ -7,11 +7,14 @@ use rcsr::data::{self, Table};
 use rcsr::store::{self, DType, FileStore, MAGIC};
 use std::process::Command;
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("rcsr-store-{}-{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn temp_dir(tag: &str) -> (Scratch, std::path::PathBuf) {
+    let scratch = Scratch::new(tag);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn full_table() -> Table {
@@ -30,7 +33,7 @@ fn full_table() -> Table {
 #[test]
 fn roundtrip_preserves_numbers_and_dictionaries() {
     let table = full_table();
-    let dir = temp_dir("roundtrip");
+    let (_scratch, dir) = temp_dir("roundtrip");
     let path = dir.join("t.rcsb");
     store::write_store(path.to_str().unwrap(), &table, 4).unwrap();
     // Deterministic: the same input and group size produce the same bytes.
@@ -64,7 +67,6 @@ fn roundtrip_preserves_numbers_and_dictionaries() {
     // The low-cardinality numeric dictionary survives too.
     assert_eq!(back.dict(2).unwrap().levels, table.dict(2).unwrap().levels);
     assert_eq!(back.dict(2).unwrap().codes, table.dict(2).unwrap().codes);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -85,7 +87,7 @@ fn a_readable_hand_built_store_has_the_expected_groups() {
     for v in [1.0f64, 2.0, 10.0, 20.0, 3.0, 4.0, 30.0, 40.0, 5.0, 50.0] {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
-    let dir = temp_dir("hand");
+    let (_scratch, dir) = temp_dir("hand");
     let path = dir.join("hand.rcsb");
     std::fs::write(&path, &bytes).unwrap();
 
@@ -101,12 +103,11 @@ fn a_readable_hand_built_store_has_the_expected_groups() {
     assert_eq!(g2.len(), 1, "the last group is short, not padded");
     assert_eq!(g2.col(0), &[5.0]);
     assert_eq!(g2.col(1), &[50.0]);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn version_mismatch_is_a_clear_error() {
-    let dir = temp_dir("version");
+    let (_scratch, dir) = temp_dir("version");
     let path = dir.join("v.rcsb");
     store::write_store(path.to_str().unwrap(), &full_table(), 4).unwrap();
     let mut bytes = std::fs::read(&path).unwrap();
@@ -116,24 +117,22 @@ fn version_mismatch_is_a_clear_error() {
     assert!(err.contains("version 99"), "{err}");
     assert!(err.contains("versions 1 and 2"), "{err}");
     assert!(err.contains("rcsr import"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn truncated_data_is_refused_not_read_past_the_end() {
-    let dir = temp_dir("truncated");
+    let (_scratch, dir) = temp_dir("truncated");
     let path = dir.join("t.rcsb");
     store::write_store(path.to_str().unwrap(), &full_table(), 2).unwrap();
     let bytes = std::fs::read(&path).unwrap();
     std::fs::write(&path, &bytes[..bytes.len() - 4]).unwrap();
     let err = FileStore::open(path.to_str().unwrap()).unwrap_err();
     assert!(err.contains("truncated"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn sampling_never_materialises_more_than_the_cap_and_keeps_rows_aligned() {
-    let dir = temp_dir("sample");
+    let (_scratch, dir) = temp_dir("sample");
     let path = dir.join("s.rcsb");
     let mut csv = String::from("x,y\n");
     for i in 0..1000 {
@@ -154,12 +153,11 @@ fn sampling_never_materialises_more_than_the_cap_and_keeps_rows_aligned() {
         assert!(sample.value(r, 0) > prev);
         prev = sample.value(r, 0);
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn import_then_search_is_byte_identical_to_the_csv_path() {
-    let dir = temp_dir("exact");
+    let (_scratch, dir) = temp_dir("exact");
     let store_path = dir.join("clean.rcsb");
     let csv = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/clean.csv");
     let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
@@ -215,7 +213,6 @@ fn import_then_search_is_byte_identical_to_the_csv_path() {
     let a = std::fs::read(&from_csv).unwrap();
     let b = std::fs::read(&from_store).unwrap();
     assert_eq!(a, b, "the imported store changed the search trajectory");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn nanosecond_table() -> Table {
@@ -233,7 +230,7 @@ fn nanosecond_table() -> Table {
 #[test]
 fn v2_has_per_column_dtypes_and_round_trips_nanoseconds_and_dictionaries() {
     let table = nanosecond_table();
-    let dir = temp_dir("v2-dtypes");
+    let (_scratch, dir) = temp_dir("v2-dtypes");
     let path = dir.join("t.rcsb");
     store::write_store(path.to_str().unwrap(), &table, 2).unwrap();
     let bytes = std::fs::read(&path).unwrap();
@@ -257,7 +254,6 @@ fn v2_has_per_column_dtypes_and_round_trips_nanoseconds_and_dictionaries() {
     assert!(back.col(1).is_empty());
     assert!(back.value(0, 1).is_nan());
     assert_eq!(back.col(2), table.col(2));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -267,7 +263,7 @@ fn v2_code_blocks_are_four_bytes_and_the_file_is_dictionary_heavy_smaller() {
         csv.push_str(&format!("L{},{},{}\n", i % 10, i % 7, i));
     }
     let table = data::parse_table(&csv).unwrap();
-    let dir = temp_dir("v2-size");
+    let (_scratch, dir) = temp_dir("v2-size");
     let path = dir.join("t.rcsb");
     store::write_store(path.to_str().unwrap(), &table, 1000).unwrap();
     let size = std::fs::metadata(&path).unwrap().len() as usize;
@@ -281,7 +277,6 @@ fn v2_code_blocks_are_four_bytes_and_the_file_is_dictionary_heavy_smaller() {
     assert_eq!(back.dict(0).unwrap().codes, table.dict(0).unwrap().codes);
     assert_eq!(back.dict(1).unwrap().codes, table.dict(1).unwrap().codes);
     assert_eq!(back.col(2), table.col(2));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -305,7 +300,7 @@ fn a_hundred_symbol_daily_panel_migrates_from_v1_to_v2_identically() {
     let table = data::parse_table(&csv).unwrap();
     assert_eq!(table.dict(1).unwrap().levels.len(), 100);
 
-    let dir = temp_dir("daily100");
+    let (_scratch, dir) = temp_dir("daily100");
     let v2 = dir.join("v2.rcsb");
     store::write_store(v2.to_str().unwrap(), &table, 997).unwrap();
     let v1 = dir.join("v1.rcsb");
@@ -337,7 +332,6 @@ fn a_hundred_symbol_daily_panel_migrates_from_v1_to_v2_identically() {
     assert_eq!(ta.dict(1).unwrap().levels, tb.dict(1).unwrap().levels);
     assert_eq!(ta.dict(1).unwrap().codes, tb.dict(1).unwrap().codes);
     assert!(std::fs::metadata(&v2).unwrap().len() < std::fs::metadata(&v1).unwrap().len());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Write the historical v1 layout (all values and codes as f64) for migration
@@ -442,7 +436,7 @@ fn the_memory_guard_refuses_a_csv_cleanly_with_exit_3() {
 
 #[test]
 fn the_import_command_honours_the_same_guard() {
-    let dir = temp_dir("import-guard");
+    let (_scratch, dir) = temp_dir("import-guard");
     let csv = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/clean.csv");
     let out = dir.join("x.rcsb");
     let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
@@ -458,12 +452,11 @@ fn the_import_command_honours_the_same_guard() {
     assert_eq!(output.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&output.stderr).contains("memory budget"));
     assert!(!out.exists());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn a_store_is_detected_by_magic_even_without_the_extension() {
-    let dir = temp_dir("magic");
+    let (_scratch, dir) = temp_dir("magic");
     let path = dir.join("store.bin");
     store::write_store(path.to_str().unwrap(), &full_table(), 4).unwrap();
     assert!(store::is_store_path(path.to_str().unwrap()));
@@ -471,5 +464,4 @@ fn a_store_is_detected_by_magic_even_without_the_extension() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/clean.csv"
     )));
-    let _ = std::fs::remove_dir_all(&dir);
 }

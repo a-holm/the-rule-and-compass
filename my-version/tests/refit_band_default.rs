@@ -52,19 +52,23 @@ fn resume(path: &str, extra: &[&str]) -> std::process::Output {
     rcsr(&args)
 }
 
-fn scratch(tag: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("rcsr-495-{}-{tag}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    dir.join("run.rcsr").to_string_lossy().into_owned()
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn scratch(tag: &str) -> (Scratch, String) {
+    let scratch = Scratch::new(tag);
+    let path = scratch.join("run.rcsr").to_string_lossy().into_owned();
+    (scratch, path)
 }
 
 #[test]
 fn fresh_checkpoint_always_carries_the_band() {
-    let p = scratch("fresh");
+    let (_scratch, p) = scratch("fresh");
     save_checkpoint(&p, &[]);
     let text = std::fs::read_to_string(&p).expect("read");
     assert!(text.lines().any(|l| l == "config refit_band inf"), "no refit_band inf line");
-    let q = scratch("explicit");
+    let (_scratch, q) = scratch("explicit");
     save_checkpoint(&q, &["--refit-band", "0.001"]);
     let text = std::fs::read_to_string(&q).expect("read");
     assert!(text.lines().any(|l| l.starts_with("config refit_band ") && l != "config refit_band inf"));
@@ -78,7 +82,7 @@ fn fresh_checkpoint_always_carries_the_band() {
 
 #[test]
 fn checkpoint_without_the_band_needs_an_explicit_flag() {
-    let p = scratch("legacy");
+    let (_scratch, p) = scratch("legacy");
     save_checkpoint(&p, &[]);
     let text = std::fs::read_to_string(&p).expect("read");
     let kept: Vec<&str> = text.lines().filter(|l| !l.starts_with("config refit_band ")).collect();

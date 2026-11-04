@@ -10,10 +10,14 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_rcsr-bench"))
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("rcsr-bench-cli-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join(name)
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn scratch(name: &str) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new("bench-cli");
+    let path = scratch.join(name);
+    (scratch, path)
 }
 
 const SMALL: [&str; 12] = [
@@ -63,7 +67,7 @@ fn ndjson_has_a_line_per_run_and_a_summary() {
 #[test]
 fn compare_with_itself_has_no_discordant_pairs() {
     let lines = small_run();
-    let path = scratch("self.ndjson");
+    let (_scratch, path) = scratch("self.ndjson");
     std::fs::write(&path, lines.join("\n")).unwrap();
     let out = bin()
         .args(["compare", "--json", "--base"])
@@ -83,8 +87,8 @@ fn compare_with_itself_has_no_discordant_pairs() {
 #[test]
 fn compare_exits_2_on_mismatched_key_sets() {
     let lines = small_run();
-    let a = scratch("keys-a.ndjson");
-    let b = scratch("keys-b.ndjson");
+    let (_scratch, a) = scratch("keys-a.ndjson");
+    let (_scratch, b) = scratch("keys-b.ndjson");
     std::fs::write(&a, lines.join("\n")).unwrap();
     std::fs::write(&b, lines[..3].join("\n")).unwrap();
     let out = bin().arg("compare").arg("--base").arg(&a).arg("--treat").arg(&b).output().unwrap();
@@ -97,8 +101,8 @@ fn compare_lists_pairs_with_an_undefined_criterion() {
     let run = |seed: u32, oracle: &str| {
         format!("{{\"type\":\"run\",\"suite\":\"hard\",\"problem\":\"p\",\"noise\":0.1,\"seed\":{seed},\"recovered\":true,\"oracle_recovered\":{oracle},\"signal_recovered\":null,\"seconds\":1.0,\"config\":{{\"generator\":\"g\"}}}}")
     };
-    let a = scratch("undef-a.ndjson");
-    let b = scratch("undef-b.ndjson");
+    let (_scratch, a) = scratch("undef-a.ndjson");
+    let (_scratch, b) = scratch("undef-b.ndjson");
     std::fs::write(&a, [run(1, "true"), run(2, "null")].join("\n")).unwrap();
     std::fs::write(&b, [run(1, "false"), run(2, "true")].join("\n")).unwrap();
     let out = bin()
@@ -117,8 +121,8 @@ fn compare_lists_pairs_with_an_undefined_criterion() {
 #[test]
 fn compare_exits_2_on_a_changed_data_generator() {
     let lines = small_run();
-    let a = scratch("gen-a.ndjson");
-    let b = scratch("gen-b.ndjson");
+    let (_scratch, a) = scratch("gen-a.ndjson");
+    let (_scratch, b) = scratch("gen-b.ndjson");
     std::fs::write(&a, lines.join("\n")).unwrap();
     std::fs::write(&b, lines.join("\n").replace("\"generator\":\"bench-v2\"", "\"generator\":\"bench-v3\"")).unwrap();
     let out = bin().arg("compare").arg("--base").arg(&a).arg("--treat").arg(&b).output().unwrap();

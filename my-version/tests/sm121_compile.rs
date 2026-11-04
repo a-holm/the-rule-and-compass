@@ -16,6 +16,10 @@
 //! the register/stack/smem budget. What it does **not** prove: that a GB10
 //! loaded or ran the kernels. That is the hardware-gated half of #28.
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 #[path = "../src/cuda/arch.rs"]
 #[allow(dead_code)]
 mod arch;
@@ -147,8 +151,8 @@ fn compiles_eval_cu_for_sm_121_without_a_gpu() {
 
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let eval_cu = manifest.join("src/cuda/eval.cu");
-    let dir = std::env::temp_dir().join(format!("rcsr-sm121-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temporary build directory");
+    let scratch = Scratch::new("sm121");
+    let dir = scratch.path().to_path_buf();
     let cubin = dir.join("eval.sm_121.cubin");
 
     // The same flags `build.rs` uses, minus `-shared`: a cubin is what
@@ -235,5 +239,4 @@ fn compiles_eval_cu_for_sm_121_without_a_gpu() {
         "compiled sm_121 with CUDA {}; this is compile evidence, not a GB10 run",
         arch::format_version(version)
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

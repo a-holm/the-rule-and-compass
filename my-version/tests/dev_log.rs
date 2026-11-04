@@ -22,12 +22,14 @@ fn fixture() -> String {
     concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/clean.csv").to_string()
 }
 
-/// A fresh directory per test, so parallel `cargo test` runs cannot collide.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("rcsr-devlog-{}-{}", name, std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch dir");
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn scratch(name: &str) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new(name);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 /// The baseline command: small, deterministic, `--cpu` so the pin does not
@@ -110,7 +112,7 @@ fn generation_numbers(events: &[Json]) -> Vec<usize> {
 /// working directory at `summary` level, with a bounded number of events.
 #[test]
 fn the_log_is_on_by_default_at_summary_level() {
-    let dir = scratch("default");
+    let (_scratch, dir) = scratch("default");
     let data = fixture();
     let args: Vec<String> = base_args(&data)
         .into_iter()
@@ -167,7 +169,7 @@ fn the_log_is_on_by_default_at_summary_level() {
 /// `--no-dev-log` writes nothing at all.
 #[test]
 fn no_dev_log_writes_nothing() {
-    let dir = scratch("off");
+    let (_scratch, dir) = scratch("off");
     let data = fixture();
     let mut args = base_args(&data);
     args.push("--out".into());
@@ -189,7 +191,7 @@ fn no_dev_log_writes_nothing() {
 /// next to `--save`, else the working directory.
 #[test]
 fn the_default_path_follows_json_out_then_save() {
-    let dir = scratch("path");
+    let (_scratch, dir) = scratch("path");
     let data = fixture();
     let results = dir.join("results");
     std::fs::create_dir_all(&results).unwrap();
@@ -243,7 +245,7 @@ fn the_default_path_follows_json_out_then_save() {
 /// A summary log keeps the cadence small: `clamp(generations/10, 10, 25)`.
 #[test]
 fn the_summary_cadence_is_bounded() {
-    let dir = scratch("cadence");
+    let (_scratch, dir) = scratch("cadence");
     let data = fixture();
     let mut args = base_args(&data);
     args.retain(|a| a != "--no-dev-log");
@@ -271,7 +273,7 @@ fn the_summary_cadence_is_bounded() {
 /// before comparing.
 #[test]
 fn logging_on_or_off_leaves_the_archive_results_and_config_hash_identical() {
-    let dir = scratch("identical");
+    let (_scratch, dir) = scratch("identical");
     let data = fixture();
     let mut outputs = Vec::new();
     let arms: [(&str, Vec<String>); 3] = [
@@ -356,7 +358,7 @@ fn logging_on_or_off_leaves_the_archive_results_and_config_hash_identical() {
 /// documented types.
 #[test]
 fn the_full_log_emits_the_documented_events_and_fields() {
-    let dir = scratch("fields");
+    let (_scratch, dir) = scratch("fields");
     let data = fixture();
     let mut args = base_args(&data);
     args.retain(|a| a != "--no-dev-log");
@@ -520,7 +522,7 @@ fn the_full_log_emits_the_documented_events_and_fields() {
 /// generation and nothing else.
 #[test]
 fn dev_log_every_overrides_the_cadence_at_both_levels() {
-    let dir = scratch("every");
+    let (_scratch, dir) = scratch("every");
     let data = fixture();
     for level in ["summary", "full"] {
         let mut args = base_args(&data);
@@ -541,7 +543,7 @@ fn dev_log_every_overrides_the_cadence_at_both_levels() {
 /// The byte cap bounds the generation stream, and `run_end` is always written.
 #[test]
 fn the_byte_cap_bounds_the_file_and_the_end_event_always_lands() {
-    let dir = scratch("cap");
+    let (_scratch, dir) = scratch("cap");
     let data = fixture();
     let mut args = base_args(&data);
     args.retain(|a| a != "--no-dev-log");
@@ -584,7 +586,7 @@ fn the_byte_cap_bounds_the_file_and_the_end_event_always_lands() {
 /// many lines it skipped and still ranks the bottlenecks.
 #[test]
 fn a_killed_run_leaves_a_valid_prefix_that_dev_report_reads() {
-    let dir = scratch("killed");
+    let (_scratch, dir) = scratch("killed");
     let data = fixture();
     let mut args = base_args(&data);
     args.retain(|a| a != "--no-dev-log");
@@ -623,7 +625,7 @@ fn a_killed_run_leaves_a_valid_prefix_that_dev_report_reads() {
 /// bottleneck list.
 #[test]
 fn dev_report_summarises_the_run_and_ranks_bottlenecks() {
-    let dir = scratch("report");
+    let (_scratch, dir) = scratch("report");
     let data = fixture();
     let mut args = base_args(&data);
     args.retain(|a| a != "--no-dev-log");
@@ -685,7 +687,7 @@ fn dev_report_summarises_the_run_and_ranks_bottlenecks() {
 /// out, and still ranks the bottlenecks.
 #[test]
 fn dev_report_reads_a_summary_log_and_names_what_it_omits() {
-    let dir = scratch("report-summary");
+    let (_scratch, dir) = scratch("report-summary");
     let data = fixture();
     let mut args = base_args(&data);
     args.retain(|a| a != "--no-dev-log");
@@ -718,7 +720,7 @@ fn dev_report_reads_a_summary_log_and_names_what_it_omits() {
 /// input or target value.
 #[test]
 fn the_log_contains_no_raw_data_rows() {
-    let dir = scratch("norows");
+    let (_scratch, dir) = scratch("norows");
     let data = dir.join("rows.csv");
     // Distinctive values so a leak is visible in a string search.
     let mut csv = String::from("a,b,y\n");
@@ -771,7 +773,7 @@ fn the_log_contains_no_raw_data_rows() {
 /// `--ndjson` stream never carries a `rcsr-devlog` line.
 #[test]
 fn the_log_is_independent_of_the_result_streams() {
-    let dir = scratch("streams");
+    let (_scratch, dir) = scratch("streams");
     let data = fixture();
     for format in ["--json", "--ndjson"] {
         let mut args = base_args(&data);
@@ -837,7 +839,7 @@ fn dev_log_flag_misuse_is_a_usage_error() {
 /// cached beside the data file, and a changed file invalidates the cache.
 #[test]
 fn data_digest_is_cached_beside_the_file_and_follows_changes() {
-    let dir = scratch("digest");
+    let (_scratch, dir) = scratch("digest");
     let data = dir.join("data.csv");
     std::fs::copy(fixture(), &data).expect("copy fixture");
     let sidecar = dir.join("data.csv.sha256.json");

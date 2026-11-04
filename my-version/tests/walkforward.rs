@@ -9,6 +9,10 @@ use rcsr::data;
 use rcsr::store;
 use rcsr::walkforward::{self, EvalSpec, Window};
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 fn table(rows: &[(f64, &str, f64, f64)]) -> data::Table {
     let mut s = String::from("ts,sym,x,target\n");
     for (ts, sym, x, y) in rows {
@@ -337,19 +341,10 @@ fn store_path_matches_the_resident_table() {
     s.cost_bps = 5.0;
     let resident = walkforward::run_table(&t, &s, "test").unwrap();
 
-    let dir = std::env::temp_dir();
-    let path = dir.join(format!(
-        "rcsr-walkforward-{}-{}.rcsb",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let path = path.to_string_lossy().into_owned();
+    let scratch = Scratch::new("walkforward");
+    let path = scratch.join("table.rcsb").to_string_lossy().into_owned();
     store::write_store(&path, &t, 3).unwrap();
     let streamed = walkforward::run_path(&path, &s).unwrap();
-    let _ = std::fs::remove_file(&path);
 
     assert_eq!(resident.source, "test");
     assert_eq!(streamed.source, "store-stream");
@@ -660,8 +655,8 @@ fn rows_without_a_return_do_not_count_toward_the_spacing() {
 
 #[test]
 fn the_cli_exits_2_on_overlapping_returns() {
-    let dir = std::env::temp_dir().join(format!("rcsr-wf-overlap-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = Scratch::new("wf-overlap");
+    let dir = scratch.path().to_path_buf();
     let data = dir.join("d.csv");
     let mut csv = String::from("ts,x,target\n");
     for i in 0..8 {
@@ -683,7 +678,6 @@ fn the_cli_exits_2_on_overlapping_returns() {
     assert!(String::from_utf8_lossy(&bad.stderr).contains("overlapping returns"));
     let ok = run("3600");
     assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 mod front {
@@ -691,10 +685,12 @@ mod front {
     use std::path::PathBuf;
     use std::process::Command;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("rcsr-front-{}-{}", std::process::id(), name));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    use super::scratch::Scratch;
+
+    fn scratch(name: &str) -> (Scratch, PathBuf) {
+        let scratch = Scratch::new(name);
+        let path = scratch.path().to_path_buf();
+        (scratch, path)
     }
 
     const MEMBERS: &str = r#"[{"expression":"x"},{"expression":"x * 2 + 0.1"},{"expression":"0.5 - x"}]"#;
@@ -746,7 +742,7 @@ mod front {
 
     #[test]
     fn front_scores_every_member_and_matches_explicit_expr_flags_bit_for_bit() {
-        let dir = scratch("equal");
+        let (_scratch, dir) = scratch("equal");
         let data = write_data(&dir);
         let run = write_run(&dir, RUN);
         let (code, a, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--batch-pnl"]);
@@ -781,7 +777,7 @@ mod front {
 
     #[test]
     fn batch_pnl_report_hash_is_reproducible_and_timings_stay_outside_it() {
-        let dir = scratch("batchhash");
+        let (_scratch, dir) = scratch("batchhash");
         let data = write_data(&dir);
         let run = write_run(&dir, RUN);
         let sha = |o: &str| o.split("\"report_sha256\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
@@ -807,7 +803,7 @@ mod front {
 
     #[test]
     fn front_trials_default_to_candidates_evaluated_and_can_be_overridden() {
-        let dir = scratch("trials");
+        let (_scratch, dir) = scratch("trials");
         let data = write_data(&dir);
         let run = write_run(&dir, RUN);
         let (code, a, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--bootstrap", "100"]);
@@ -820,7 +816,7 @@ mod front {
 
     #[test]
     fn a_window_inside_the_validation_slice_is_refused() {
-        let dir = scratch("inside");
+        let (_scratch, dir) = scratch("inside");
         let data = write_data(&dir);
         let run = write_run(&dir, RUN);
         let (code, _, err) = wf(&data, &["--front", &run], "bad,0,100,150,300", &[]);
@@ -835,7 +831,7 @@ mod front {
 
     #[test]
     fn a_window_starting_at_seen_plus_purge_passes() {
-        let dir = scratch("edge");
+        let (_scratch, dir) = scratch("edge");
         let data = write_data(&dir);
         let run = write_run(&dir, RUN);
         let (code, out, err) = wf(&data, &["--front", &run], OK_WINDOW, &[]);
@@ -845,7 +841,7 @@ mod front {
 
     #[test]
     fn the_override_reports_the_window_as_in_sample() {
-        let dir = scratch("override");
+        let (_scratch, dir) = scratch("override");
         let data = write_data(&dir);
         let run = write_run(&dir, RUN);
         let (code, out, err) = wf(&data, &["--front", &run], "bad,0,100,150,300", &["--allow-in-sample-windows"]);
@@ -855,7 +851,7 @@ mod front {
 
     #[test]
     fn the_run_position_rule_is_carried_and_explicit_flags_win() {
-        let dir = scratch("rule");
+        let (_scratch, dir) = scratch("rule");
         let data = write_data(&dir);
         let run = write_run(&dir, RUN);
         let (code, out, err) = wf(&data, &["--front", &run], OK_WINDOW, &[]);
@@ -870,7 +866,7 @@ mod front {
 
     #[test]
     fn refusals() {
-        let dir = scratch("refuse");
+        let (_scratch, dir) = scratch("refuse");
         let data = write_data(&dir);
         let run = write_run(&dir, RUN);
         let (code, _, err) = wf(&data, &["--front", &run, "--expr", "x"], OK_WINDOW, &[]);
@@ -910,11 +906,11 @@ fn the_printed_json_carries_a_phase_ledger_outside_the_reproduction_hash() {
     for t in 0..64 {
         csv.push_str(&format!("{},{},{}\n", t, (t % 7) as f64, ((t * 3) % 5) as f64 * 0.001 - 0.002));
     }
-    let path = std::env::temp_dir().join(format!("rcsr-wf-ledger-{}.csv", std::process::id()));
+    let scratch = Scratch::new("wf-ledger");
+    let path = scratch.join("data.csv");
     std::fs::write(&path, csv).unwrap();
     let s = spec("x", vec![window("w", 0.0, 32.0, 32.0, 64.0)]);
     let r = walkforward::run_path_with(path.to_str().unwrap(), &s, &walkforward::ProtocolOptions::default()).unwrap();
-    let _ = std::fs::remove_file(&path);
     assert!(!r.json().contains("\"ledger\""), "the hashed report must stay deterministic");
     let l = ledger::check(&r.json_with_ledger(None), "walkforward", &["io", "pnl"]);
     assert_eq!(l.busy, 0.0, "the scalar evaluator has no device intervals");

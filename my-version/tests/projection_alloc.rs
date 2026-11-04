@@ -37,18 +37,14 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
-fn tmp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-projection-alloc-{}-{}-{}",
-        tag,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn tmp_dir(tag: &str) -> (Scratch, std::path::PathBuf) {
+    let scratch = Scratch::new(tag);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 #[test]
@@ -70,7 +66,7 @@ fn the_projected_path_never_allocates_a_full_table() {
     }
     let table = data::parse_table_with_time(&text, false, Some("ts")).unwrap();
     drop(text);
-    let dir = tmp_dir("wide");
+    let (_scratch, dir) = tmp_dir("wide");
     let path = dir.join("wide.rcsb").to_string_lossy().into_owned();
     store::write_store_with_time(&path, &table, 4096, Some(0)).unwrap();
     let full_table_bytes = rows * (cols - 1) * 8 + rows * 4;
@@ -102,5 +98,4 @@ fn the_projected_path_never_allocates_a_full_table() {
         "largest single allocation {} bytes",
         largest
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

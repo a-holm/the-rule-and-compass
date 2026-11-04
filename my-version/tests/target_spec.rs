@@ -3,20 +3,17 @@
 use rcsr::devlog::Json;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 const T0: i64 = 1_600_000_000;
 
-static NEXT: AtomicUsize = AtomicUsize::new(0);
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
 
-fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-target-spec-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch() -> (Scratch, PathBuf) {
+    let scratch = Scratch::new("target-spec");
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn frac(v: f64) -> f64 {
@@ -228,7 +225,7 @@ fn m0(sigma: f64) -> f64 {
 
 #[test]
 fn structural_target_is_refused_with_the_scale_in_vars() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &grid(900, 80, 1), false);
     let spec = Spec::net("y").write(&dir, "s.json");
     let out = run(&data, &spec, "y", "sigma,x", &[]);
@@ -240,7 +237,7 @@ fn structural_target_is_refused_with_the_scale_in_vars() {
 
 #[test]
 fn structural_target_is_refused_without_the_scale_in_vars() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &grid(900, 80, 1), false);
     let spec = Spec::net("y").write(&dir, "s.json");
     let out = run(&data, &spec, "y", "x", &[]);
@@ -250,7 +247,7 @@ fn structural_target_is_refused_without_the_scale_in_vars() {
 
 #[test]
 fn override_runs_and_reports_the_rung() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let rows = grid(900, 120, 1);
     let data = write_csv(&dir, "d.csv", &rows, false);
     let spec = Spec::net("y").write(&dir, "s.json");
@@ -286,7 +283,7 @@ fn override_runs_and_reports_the_rung() {
 
 #[test]
 fn future_return_in_vars_is_refused_even_with_the_override() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &grid(900, 80, 1), false);
     let spec = Spec::net("y").write(&dir, "s.json");
     let out = run(&data, &spec, "y", "r,x", &["--allow-target-structure"]);
@@ -296,7 +293,7 @@ fn future_return_in_vars_is_refused_even_with_the_override() {
 
 #[test]
 fn look_ahead_scale_is_refused() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &grid(900, 80, 1), false);
     let s = Spec {
         scale: Some(("sigma", 4500.0)),
@@ -310,7 +307,7 @@ fn look_ahead_scale_is_refused() {
 
 #[test]
 fn gross_scaled_target_with_the_scale_in_vars_is_allowed() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let rows = grid(900, 120, 1);
     let data = write_csv(&dir, "d.csv", &rows, false);
     let spec = Spec::gross("yg").write(&dir, "s.json");
@@ -337,7 +334,7 @@ fn gross_scaled_target_with_the_scale_in_vars_is_allowed() {
 
 #[test]
 fn purge_is_derived_from_the_spec_not_the_name() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &grid(3600, 200, 1), false);
     let spec = Spec {
         name: "y60m",
@@ -357,7 +354,7 @@ fn purge_is_derived_from_the_spec_not_the_name() {
 
 fn adjacent(entry: f64, expect_steps: usize, required: f64) {
     let per_stamp = 2;
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &grid(900, 100, per_stamp), false);
     let spec = Spec {
         entry,
@@ -390,7 +387,7 @@ fn entry_offset_comes_from_the_spec() {
 
 #[test]
 fn validation_boundary_is_purged_on_a_panel() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &grid(900, 200, 3), false);
     let spec = Spec::raw("r").write(&dir, "s.json");
     let out = run(
@@ -409,7 +406,7 @@ fn validation_boundary_is_purged_on_a_panel() {
 
 #[test]
 fn misaligned_temporal_group_series_are_purged_across_symbols() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     // Group 0 covers steps 0..100, group 1 covers steps 40..140: the cut
     // times differ by 40 steps (10 hours).
     let mut rows = Vec::new();
@@ -454,7 +451,7 @@ fn misaligned_temporal_group_series_are_purged_across_symbols() {
 
 #[test]
 fn a_spec_without_an_epoch_time_column_is_a_usage_error() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let rows = grid(900, 80, 1);
     let spec = Spec::raw("r").write(&dir, "s.json");
     // The time column is a row index.
@@ -496,7 +493,7 @@ fn no_spec_keeps_the_default_run_bit_identical() {
 
 #[test]
 fn sidecar_is_loaded_and_the_flag_wins() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &grid(900, 80, 1), false);
     let sidecar = Spec::gross("yg");
     let sidecar_text = sidecar.json();
@@ -539,7 +536,7 @@ fn sidecar_is_loaded_and_the_flag_wins() {
 
 #[test]
 fn a_spec_without_an_entry_for_the_target_is_a_usage_error() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &grid(900, 80, 1), false);
     let spec = Spec::gross("yg").write(&dir, "s.json");
     let out = run(&data, &spec, "y", "x", &[]);
@@ -554,7 +551,7 @@ fn a_spec_without_an_entry_for_the_target_is_a_usage_error() {
 
 #[test]
 fn text_run_prints_the_target_purge_and_rung_lines() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &grid(3600, 200, 1), false);
     let spec = Spec {
         name: "y60m",
@@ -580,7 +577,7 @@ fn text_run_prints_the_target_purge_and_rung_lines() {
 
 #[test]
 fn eval_expr_carries_the_rung_and_spec() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let rows = grid(900, 120, 1);
     let data = write_csv(&dir, "d.csv", &rows, false);
     let spec = Spec::gross("yg").write(&dir, "s.json");
@@ -640,7 +637,7 @@ fn schema_documents_the_target_spec_contract() {
 
 #[test]
 fn audit_runs_the_target_structure_detector() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &grid(900, 80, 1), false);
     let spec = Spec::net("y").write(&dir, "s.json");
     let out = rcsr(&[
@@ -664,7 +661,7 @@ fn audit_runs_the_target_structure_detector() {
 
 #[test]
 fn the_spec_note_reaches_run_json() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &grid(900, 80, 1), false);
     let note = "survivor-biased universe, not point-in-time; \"quoted\"";
     let text = Spec::gross("yg")
@@ -711,7 +708,7 @@ fn lockbox_run(data: &str, extra: &[&str]) -> Output {
 
 #[test]
 fn a_validation_slice_in_the_lockbox_is_refused_like_a_test_block() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = lockbox_validation_csv(&dir);
     let l = rcsr::lockbox::Lockbox::crypto_2026h2();
 
@@ -757,7 +754,7 @@ fn resume_args<'a>(data: &'a str, spec: Option<&'a str>, cp: &'a str, sel: &'a [
 
 #[test]
 fn resume_with_a_different_target_spec_is_refused_naming_both_hashes() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &grid(900, 120, 1), false);
     let a = Spec::gross("yg").write(&dir, "a.json");
     let b = Spec {
@@ -796,7 +793,7 @@ fn resume_with_a_different_target_spec_is_refused_naming_both_hashes() {
 
 #[test]
 fn a_run_without_a_spec_writes_no_target_spec_record() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &grid(900, 120, 1), false);
     let cp = dir.join("cp.txt").to_string_lossy().into_owned();
     let out = rcsr(&[
@@ -860,7 +857,7 @@ fn run_labelled(data: &str, vars: &[&str]) -> Output {
 
 #[test]
 fn run_json_echoes_the_label_report_of_an_enriched_target() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = labelled_store(&dir);
     let o = run_labelled(&data, &["--vars", "r1"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -884,7 +881,7 @@ fn run_json_echoes_the_label_report_of_an_enriched_target() {
 
 #[test]
 fn label_columns_are_never_inputs_named_or_default() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = labelled_store(&dir);
     for bad in ["r1,lbl_h3_fwd", "r1,lbl_h3_weight", "r1,lbl_h3_action"] {
         let o = run_labelled(&data, &["--vars", bad]);
@@ -903,7 +900,7 @@ fn label_columns_are_never_inputs_named_or_default() {
 
 #[test]
 fn require_clean_inputs_refuses_a_construction_column_in_vars() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let rows = grid(900, 120, 1);
     let data = write_csv(&dir, "d.csv", &rows, false);
     let spec = Spec::gross("yg").write(&dir, "s.json");
