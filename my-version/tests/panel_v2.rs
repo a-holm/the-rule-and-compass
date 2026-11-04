@@ -12,11 +12,14 @@ use std::path::{Path, PathBuf};
 const T0: i64 = 1_609_459_200;
 const H: i64 = 3600;
 
-fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("rcsr-panel-v2-{}-{}", std::process::id(), name));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn scratch(name: &str) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new(name);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -108,7 +111,7 @@ impl Cols {
 
 #[test]
 fn a_hour_with_a_missing_quarter_is_dropped_unless_keep_partial() {
-    let dir = scratch("partial");
+    let (_scratch, dir) = scratch("partial");
     let mut lines = hours(10.0, 0, 3, &[], Unit::Ms);
     // hour 1 loses its :15 bar
     lines.remove(5);
@@ -154,7 +157,7 @@ fn a_hour_with_a_missing_quarter_is_dropped_unless_keep_partial() {
 
 #[test]
 fn identical_duplicates_collapse_and_differing_ones_aggregate_and_flag() {
-    let dir = scratch("dups");
+    let (_scratch, dir) = scratch("dups");
     let one = hours(10.0, 0, 48, &[], Unit::Ms);
     let mut four = Vec::new();
     for _ in 0..4 {
@@ -201,7 +204,7 @@ fn identical_duplicates_collapse_and_differing_ones_aggregate_and_flag() {
 
 #[test]
 fn snapshot_hashes_every_zip_and_lists_the_juv_duplicate_and_the_aud_bar() {
-    let dir = scratch("snap");
+    let (_scratch, dir) = scratch("snap");
     let raw = dir.join("raw");
     let one = hours(10.0, 0, 6, &[], Unit::Ms);
     let mut four = Vec::new();
@@ -239,7 +242,7 @@ fn snapshot_hashes_every_zip_and_lists_the_juv_duplicate_and_the_aud_bar() {
 
 #[test]
 fn the_lockbox_months_and_the_1m_interval_are_guarded() {
-    let dir = scratch("lockbox");
+    let (_scratch, dir) = scratch("lockbox");
     let raw = dir.join("raw");
     let dir1m = raw.join("BTCUSDT");
     std::fs::create_dir_all(&dir1m).unwrap();
@@ -310,7 +313,7 @@ fn build_market(dir: &Path, relist_gap_hours: i64, relists: &str) -> Result<(Pat
 
 #[test]
 fn the_panel_has_the_declared_columns_and_only_point_in_time_members() {
-    let dir = scratch("pit");
+    let (_scratch, dir) = scratch("pit");
     // 40 days after hour 200: > 30 day gap, so a new listing.
     let (base, m, out) = build_market(&dir, 24 * 40, "").unwrap();
     let c = Cols::open(&out);
@@ -380,7 +383,7 @@ fn the_panel_has_the_declared_columns_and_only_point_in_time_members() {
 
 #[test]
 fn an_undeclared_level_jump_fails_the_build_and_a_declared_relist_passes() {
-    let dir = scratch("jump");
+    let (_scratch, dir) = scratch("jump");
     // Only a 5 day gap: no automatic new listing, so 20x is an undeclared jump.
     let e = build_market(&dir, 24 * 5, "").unwrap_err();
     assert!(e.contains("undeclared level jump") && e.contains("LUNAUSDT"), "{e}");
@@ -395,7 +398,7 @@ fn an_undeclared_level_jump_fails_the_build_and_a_declared_relist_passes() {
 
 #[test]
 fn cold_and_warm_builds_are_byte_identical() {
-    let dir = scratch("warm");
+    let (_scratch, dir) = scratch("warm");
     let (raw, m) = market(&dir, 24 * 40);
     let cache = dir.join("cache");
     let sha = |p: &Path| manifest::sha256_file(p).unwrap();
@@ -429,7 +432,7 @@ fn cold_and_warm_builds_are_byte_identical() {
 
 #[test]
 fn the_archive_unit_follows_the_timestamp_unit_of_the_source() {
-    let dir = scratch("unit");
+    let (_scratch, dir) = scratch("unit");
     let raw = dir.join("raw");
     // 2024-12-31 22:00 .. 2025-01-01 02:00 across a ms and a us archive.
     let start = (1_735_682_400 - T0) / H;
@@ -445,7 +448,7 @@ fn the_archive_unit_follows_the_timestamp_unit_of_the_source() {
 
 #[test]
 fn validation_fails_on_a_corrupt_panel() {
-    let dir = scratch("corrupt");
+    let (_scratch, dir) = scratch("corrupt");
     let (base, m, out) = build_market(&dir, 24 * 40, "").unwrap();
     let mut t = FileStore::open(out.to_str().unwrap()).unwrap().to_table().unwrap();
     let hi = t.index_of("high").unwrap();
@@ -538,7 +541,7 @@ fn audit(base: &Path, extra: &[&str]) -> std::process::Output {
 
 #[test]
 fn the_audit_reports_jumps_and_fails_strict_on_an_undeclared_one() {
-    let dir = scratch("audit");
+    let (_scratch, dir) = scratch("audit");
     let (raw, _) = market(&dir, 24 * 5);
     let base = dir.join("base.rcsb");
     panel_v2::build_base(&base_opts(&raw, &base)).unwrap();
@@ -553,7 +556,7 @@ fn the_audit_reports_jumps_and_fails_strict_on_an_undeclared_one() {
     assert_eq!(ok.status.code(), Some(0), "{text}");
     assert!(text.contains("declared=true"), "{text}");
 
-    let long = scratch("audit_long");
+    let (_scratch, long) = scratch("audit_long");
     let (raw, _) = market(&long, 24 * 40);
     let base = long.join("base.rcsb");
     panel_v2::build_base(&base_opts(&raw, &base)).unwrap();
@@ -597,7 +600,7 @@ fn manifest_lines(base: &Path, keys: &[&str]) -> Vec<String> {
 #[test]
 fn the_device_base_is_byte_identical_to_the_cpu_and_labels_its_route() {
     use panel_v2::GpuMode;
-    let dir = scratch("dev-base");
+    let (_scratch, dir) = scratch("dev-base");
     let raw = device_market(&dir);
     let sha = |p: &Path| manifest::sha256_file(p).unwrap();
     let keys = ["\"quality\"", "\"conflicts\"", "\"invalid_ohlc\"", "\"unit_histogram\""];
@@ -655,7 +658,7 @@ fn the_device_base_is_byte_identical_to_the_cpu_and_labels_its_route() {
 #[test]
 fn a_cpu_wave_under_auto_or_without_a_device_is_labelled_in_the_manifest() {
     use panel_v2::GpuMode;
-    let dir = scratch("dev-label");
+    let (_scratch, dir) = scratch("dev-label");
     let raw = device_market(&dir);
     let mut o = base_opts(&raw, &dir.join("auto.rcsb"));
     o.gpu = GpuMode::Auto;
@@ -742,7 +745,7 @@ fn manifest_backend(panel: &Path) -> String {
 #[test]
 fn the_device_pit_panel_is_byte_identical_to_the_cpu_cold_and_warm() {
     use panel_v2::GpuMode;
-    let dir = scratch("dev-panel");
+    let (_scratch, dir) = scratch("dev-panel");
     let (raw, m) = pit_market(&dir);
     let sha = |p: &Path| manifest::sha256_file(p).unwrap();
     let cache = dir.join("cache");
@@ -791,7 +794,7 @@ fn the_device_pit_panel_is_byte_identical_to_the_cpu_cold_and_warm() {
 #[test]
 fn a_cpu_pit_join_under_auto_is_labelled_in_the_panel_manifest() {
     use panel_v2::GpuMode;
-    let dir = scratch("dev-panel-label");
+    let (_scratch, dir) = scratch("dev-panel-label");
     let (raw, m) = pit_market(&dir);
     panel_v2::build_base(&base_opts(&raw, &dir.join("base.rcsb"))).unwrap();
     let mut o = panel_opts(&dir.join("base.rcsb"), &m, &dir.join("auto.rcsb"));
@@ -839,7 +842,7 @@ fn universe_line(path: &str) -> String {
 
 #[test]
 fn universe_list_parsing_ignores_comments_blanks_and_duplicates_and_refuses_empty() {
-    let dir = scratch("universe-parse");
+    let (_scratch, dir) = scratch("universe-parse");
     let l = write_list(&dir.join("l.txt"), "# header\n\nAAAUSDT\n  BBBUSDT  \nAAAUSDT\n#CCCUSDT\n币安人生USDT\n");
     let got: Vec<&str> = l.symbols.iter().map(|s| s.as_str()).collect();
     assert_eq!(got, vec!["AAAUSDT", "BBBUSDT", "币安人生USDT"]);
@@ -852,7 +855,7 @@ fn universe_list_parsing_ignores_comments_blanks_and_duplicates_and_refuses_empt
 
 #[test]
 fn universe_base_keeps_listed_intersect_archive_and_drops_the_rest_with_zero_rows() {
-    let dir = scratch("universe-base");
+    let (_scratch, dir) = scratch("universe-base");
     let raw = universe_raw(&dir);
     let list = write_list(&dir.join("l.txt"), "AAAUSDT\nCCCUSDT\n");
     let mut o = base_opts(&raw, &dir.join("b.rcsb"));
@@ -868,7 +871,7 @@ fn universe_base_keeps_listed_intersect_archive_and_drops_the_rest_with_zero_row
 
 #[test]
 fn universe_blocks_in_snapshot_and_base_manifest_carry_all_fields() {
-    let dir = scratch("universe-block");
+    let (_scratch, dir) = scratch("universe-block");
     let raw = universe_raw(&dir);
     let text = "# pinned\nAAAUSDT\nCCCUSDT\nEMPTYUSDT\nGONEUSDT\nAAAUSDT\n";
     let list = write_list(&dir.join("l.txt"), text);
@@ -888,7 +891,7 @@ fn universe_blocks_in_snapshot_and_base_manifest_carry_all_fields() {
 
 #[test]
 fn universe_without_a_listed_archive_symbol_is_an_error_and_without_a_list_nothing_changes() {
-    let dir = scratch("universe-none");
+    let (_scratch, dir) = scratch("universe-none");
     let raw = universe_raw(&dir);
     let list = write_list(&dir.join("l.txt"), "GONEUSDT\nEMPTYUSDT\n");
     assert!(panel_v2::snapshot_text_with(raw.to_str().unwrap(), 1, Some(&list)).is_err());
@@ -910,7 +913,7 @@ fn universe_without_a_listed_archive_symbol_is_an_error_and_without_a_list_nothi
 
 #[test]
 fn universe_resume_rebuilds_on_a_changed_list_and_reuses_on_the_same_list() {
-    let dir = scratch("universe-resume");
+    let (_scratch, dir) = scratch("universe-resume");
     let raw = universe_raw(&dir);
     let cache = dir.join("cache").to_str().unwrap().to_string();
     let l1 = write_list(&dir.join("l1.txt"), "AAAUSDT\nBBBUSDT\n");
@@ -935,7 +938,7 @@ fn universe_resume_rebuilds_on_a_changed_list_and_reuses_on_the_same_list() {
 
 #[test]
 fn universe_filters_the_legacy_prep_path_and_records_the_block() {
-    let dir = scratch("universe-prep");
+    let (_scratch, dir) = scratch("universe-prep");
     let raw = universe_raw(&dir);
     let list = write_list(&dir.join("l.txt"), "AAAUSDT\nCCCUSDT\n");
     let mk = |symbols| rcsr::prep::Options {
@@ -957,7 +960,7 @@ fn locked_test_declaration_travels_with_the_store() {
     use rcsr::lockbox::{self, Lockbox};
     use rcsr::panel_append::{self, AppendOptions};
 
-    let dir = scratch("locked-test");
+    let (_scratch, dir) = scratch("locked-test");
     let (raw, m) = market(&dir, 24 * 40);
     let base = dir.join("base.rcsb");
     panel_v2::build_base(&base_opts(&raw, &base)).unwrap();
@@ -1044,7 +1047,7 @@ fn rcsr(args: &[&str]) -> (i32, String) {
 fn locked_test_starts_at_the_base() {
     use rcsr::lockbox::{self, Keep, Lockbox};
 
-    let dir = scratch("locked-base");
+    let (_scratch, dir) = scratch("locked-base");
     let (raw, m) = market(&dir, 24 * 40);
     let lb = Lockbox { start: T0 + 250 * H, end: T0 + 300 * H };
     let base = dir.join("base.rcsb");
@@ -1091,7 +1094,7 @@ fn locked_test_starts_at_the_base() {
 fn rebuild_without_locked_test_is_refused() {
     use rcsr::lockbox::{self, Keep, Lockbox};
 
-    let dir = scratch("locked-rebuild");
+    let (_scratch, dir) = scratch("locked-rebuild");
     let (raw, m) = market(&dir, 24 * 40);
     let base = dir.join("base.rcsb");
     panel_v2::build_base(&base_opts(&raw, &base)).unwrap();
@@ -1135,7 +1138,7 @@ fn append_refuses_a_family_store_with_another_declaration() {
     use rcsr::lockbox::{Keep, Lockbox};
     use rcsr::panel_append::{self, AppendOptions};
 
-    let dir = scratch("locked-append");
+    let (_scratch, dir) = scratch("locked-append");
     let (raw, m) = market(&dir, 24 * 40);
     let base = dir.join("base.rcsb");
     panel_v2::build_base(&base_opts(&raw, &base)).unwrap();
@@ -1166,7 +1169,7 @@ fn append_refuses_a_family_store_with_another_declaration() {
 fn prep_declares_the_locked_test_and_refuses_a_silent_drop() {
     use rcsr::lockbox::{self, Lockbox};
 
-    let dir = scratch("locked-prep");
+    let (_scratch, dir) = scratch("locked-prep");
     let raw = universe_raw(&dir);
     let (raw_s, out) = (raw.to_str().unwrap(), dir.join("prep.rcsb"));
     let out_s = out.to_str().unwrap();
@@ -1196,7 +1199,7 @@ fn prep_declares_the_locked_test_and_refuses_a_silent_drop() {
 
 #[test]
 fn enrich_fails_when_it_cannot_write_its_declaration() {
-    let dir = scratch("enrich-sidecar");
+    let (_scratch, dir) = scratch("enrich-sidecar");
     let (raw, _) = market(&dir, 24 * 40);
     let base = dir.join("base.rcsb");
     panel_v2::build_base(&base_opts(&raw, &base)).unwrap();
@@ -1224,7 +1227,7 @@ fn append_keeps_the_target_declaration_when_the_family_store_declares_none() {
     use rcsr::lockbox::{self, Keep, Lockbox};
     use rcsr::panel_append::{self, AppendOptions};
 
-    let dir = scratch("locked-append-undeclared-family");
+    let (_scratch, dir) = scratch("locked-append-undeclared-family");
     let (raw, m) = market(&dir, 24 * 40);
     let base = dir.join("base.rcsb");
     panel_v2::build_base(&base_opts(&raw, &base)).unwrap();
@@ -1254,7 +1257,7 @@ fn append_keeps_the_target_declaration_when_the_family_store_declares_none() {
 
 #[test]
 fn validation_does_not_flag_a_price_change_across_a_membership_exclusion() {
-    let dir = scratch("reentry");
+    let (_scratch, dir) = scratch("reentry");
     let raw = dir.join("raw");
     let mut lines = hours(10.0, 0, 50, &[], Unit::Ms);
     lines.extend(hours(20.0, 50, 50, &[], Unit::Ms));

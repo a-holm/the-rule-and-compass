@@ -11,10 +11,14 @@ const T0: f64 = 1_600_000_000.0;
 const STEP: f64 = 900.0;
 const ROWS: usize = 600;
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("rcsr-oof-sr-{}-{}", std::process::id(), name));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn scratch(name: &str) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new(name);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn run_json_text(train_end: f64, validation_end: Option<f64>, purge: f64) -> String {
@@ -48,6 +52,7 @@ struct Fixture {
     run: PathBuf,
     windows: PathBuf,
     dir: PathBuf,
+    _scratch: Scratch,
 }
 
 fn rcsr(args: &[&str]) -> Output {
@@ -55,7 +60,7 @@ fn rcsr(args: &[&str]) -> Output {
 }
 
 fn fixture(name: &str) -> Fixture {
-    let dir = scratch(name);
+    let (scratch, dir) = scratch(name);
     let frac = |v: f64| v - v.floor();
     let mut text = String::from("t,x1,x2,r,y\n");
     for i in 0..ROWS {
@@ -110,7 +115,7 @@ expanding,early,{},{},{},{},{}\nexpanding,late,{},{},{},{},{}\n",
         ),
     )
     .unwrap();
-    Fixture { data: data.to_string_lossy().into_owned(), spec: spec.to_string_lossy().into_owned(), run, windows, dir }
+    Fixture { data: data.to_string_lossy().into_owned(), spec: spec.to_string_lossy().into_owned(), run, windows, dir, _scratch: scratch }
 }
 
 fn p(path: &Path) -> &str {

@@ -21,11 +21,14 @@ enum Fixture {
     Poisoned,
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("rcsr-wf-locked-{}-{}", std::process::id(), name));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn scratch(name: &str) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new(name);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn s(p: &Path) -> String {
@@ -173,7 +176,7 @@ fn sha(out: &str) -> String {
 
 #[test]
 fn the_store_path_ignores_every_value_inside_the_declared_locked_range() {
-    let dir = scratch("diff");
+    let (_scratch, dir) = scratch("diff");
     let clean = write_data(&dir, "clean", Fixture::Clean, true);
     let poisoned = write_data(&dir, "poisoned", Fixture::Poisoned, true);
     assert_ne!(std::fs::read(&clean).unwrap(), std::fs::read(&poisoned).unwrap());
@@ -197,7 +200,7 @@ fn the_store_path_ignores_every_value_inside_the_declared_locked_range() {
 
 #[test]
 fn the_poison_changes_the_report_when_the_range_is_not_declared() {
-    let dir = scratch("power");
+    let (_scratch, dir) = scratch("power");
     let clean = write_data(&dir, "clean", Fixture::Clean, false);
     let poisoned = write_data(&dir, "poisoned", Fixture::Poisoned, false);
     // 2024 data is outside the protocol default range, so this window is legal here
@@ -212,7 +215,7 @@ fn the_poison_changes_the_report_when_the_range_is_not_declared() {
 
 #[test]
 fn a_window_that_reaches_the_range_is_refused_without_the_sealed_read() {
-    let dir = scratch("refuse");
+    let (_scratch, dir) = scratch("refuse");
     let poisoned = write_data(&dir, "poisoned", Fixture::Poisoned, true);
     let (_, extra) = variants(&dir).remove(0);
     for end in [LOCK_START, LOCK_START + 10 * H, LOCK_END] {
@@ -245,7 +248,7 @@ fn locked_ranges_are_dropped_at_read_time_on_the_store_and_the_table_path() {
         csv.push_str(&format!("{},{},{},{}\n", i, if i % 2 == 0 { "A" } else { "B" }, i, 0.001 * (i % 5) as f64));
     }
     let table = data::parse_table(&csv).unwrap();
-    let dir = scratch("library");
+    let (_scratch, dir) = scratch("library");
     let path = s(&dir.join("t.rcsb"));
     store::write_store_with_time(&path, &table, 7, Some(0)).unwrap();
     let spec = EvalSpec {
@@ -297,7 +300,7 @@ fn locked_ranges_are_dropped_at_read_time_on_the_store_and_the_table_path() {
 
 #[test]
 fn front_read_verifies_with_another_path_spelling() {
-    let dir = scratch("front-spelling");
+    let (_scratch, dir) = scratch("front-spelling");
     let data = write_data(&dir, "p", Fixture::Clean, false);
     std::fs::write(dir.join("run.json"), RUN).unwrap();
     let w = window(T0 + 300 * H);

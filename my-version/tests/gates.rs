@@ -3,21 +3,18 @@
 use rcsr::devlog::Json;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 const T0: i64 = 1_600_000_000;
 const STEP: i64 = 900;
 
-static NEXT: AtomicUsize = AtomicUsize::new(0);
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
 
-fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-gates-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch() -> (Scratch, PathBuf) {
+    let scratch = Scratch::new("gates");
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn frac(v: f64) -> f64 {
@@ -120,7 +117,7 @@ const TEMPORAL: &[&str] = &["--time", "t", "--split", "temporal", "--test-frac",
 
 #[test]
 fn require_validation_refuses_without_a_slice() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &panel(120, 1, true));
     let mut extra = TEMPORAL.to_vec();
     extra.push("--require-validation");
@@ -131,7 +128,7 @@ fn require_validation_refuses_without_a_slice() {
 
 #[test]
 fn time_ordered_run_without_a_slice_is_unvalidated() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &panel(120, 1, true));
     let out = search(&data, "x", TEMPORAL);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
@@ -148,7 +145,7 @@ fn time_ordered_run_without_a_slice_is_unvalidated() {
 
 #[test]
 fn random_split_default_run_has_no_gate_fields() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &panel(120, 1, true));
     let out = search(&data, "x", &["--split", "random"]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
@@ -169,7 +166,7 @@ fn random_split_default_run_has_no_gate_fields() {
 
 #[test]
 fn shuffling_the_test_block_leaves_the_selection_unchanged() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let rows = panel(160, 2, true);
     let test_from = T0 + STEP * 120;
     let mut shuffled = rows.clone();
@@ -204,7 +201,7 @@ fn shuffling_the_test_block_leaves_the_selection_unchanged() {
 
 #[test]
 fn structure_columns_are_not_search_inputs() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &panel(200, 1, false));
     let spec = spec_file(&dir);
     let mut extra = TEMPORAL.to_vec();
@@ -225,7 +222,7 @@ fn structure_columns_are_not_search_inputs() {
 
 #[test]
 fn synthetic_constructed_target_reports_no_signal() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &panel(400, 2, false));
     let spec = spec_file(&dir);
     let mut extra = TEMPORAL.to_vec();
@@ -243,7 +240,7 @@ fn synthetic_constructed_target_reports_no_signal() {
 
 #[test]
 fn validation_cut_respects_timestamp_boundaries() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &panel(100, 3, true));
     let mut extra = TEMPORAL.to_vec();
     extra[5] = "0.2";
@@ -258,7 +255,7 @@ fn validation_cut_respects_timestamp_boundaries() {
 
 #[test]
 fn gate_json_is_deterministic_across_runs() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &panel(160, 2, true));
     let mut extra = TEMPORAL.to_vec();
     extra.extend_from_slice(&["--validation-frac", "0.25"]);
@@ -275,7 +272,7 @@ fn gate_json_is_deterministic_across_runs() {
 
 #[test]
 fn invalid_gate_flags_are_usage_errors() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", &panel(60, 1, true));
     for bad in [["--equivalence-z", "0"], ["--equivalence-z", "abc"], ["--noise-lag", "-1"]] {
         let mut extra = TEMPORAL.to_vec();

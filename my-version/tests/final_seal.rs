@@ -11,11 +11,14 @@ use std::process::Command;
 const T0: i64 = 1_704_067_200;
 const H: i64 = 3600;
 
-fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("rcsr-final-seal-{}-{}", std::process::id(), name));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn scratch(name: &str) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new(name);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn rcsr(args: &[&str]) -> (i32, String, String) {
@@ -84,7 +87,7 @@ fn p_values(json: &str) -> Vec<String> {
 
 #[test]
 fn final_ledger_refuses_new_candidates() {
-    let dir = scratch("refuse");
+    let (_scratch, dir) = scratch("refuse");
     let data = store(&dir, "d.csv");
     let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
     dev(&data, &l, &["x"], &[]);
@@ -118,7 +121,7 @@ fn final_ledger_refuses_new_candidates() {
 
 #[test]
 fn final_seal_needs_a_ledger_without_a_seal_or_a_read() {
-    let dir = scratch("fresh");
+    let (_scratch, dir) = scratch("fresh");
     let data = store(&dir, "d.csv");
     let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
     dev(&data, &l, &["x"], &[]);
@@ -133,7 +136,7 @@ fn final_seal_needs_a_ledger_without_a_seal_or_a_read() {
 
 #[test]
 fn final_ledger_reads_once() {
-    let dir = scratch("once");
+    let (_scratch, dir) = scratch("once");
     let data = store(&dir, "d.csv");
     let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
     dev(&data, &l, &["x"], &[]);
@@ -204,7 +207,7 @@ fn final_ledger_reads_once() {
 
 #[test]
 fn final_read_reports_the_selected_candidate() {
-    let dir = scratch("selected");
+    let (_scratch, dir) = scratch("selected");
     let sub = |n: &str| {
         let d = dir.join(n);
         std::fs::create_dir_all(&d).unwrap();
@@ -253,7 +256,7 @@ fn final_read_reports_the_selected_candidate() {
 
 #[test]
 fn report_candidates_keeps_the_full_report_on_a_final_ledger() {
-    let dir = scratch("keep");
+    let (_scratch, dir) = scratch("keep");
     let data = store(&dir, "d.csv");
     let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
     let exprs = ["x", "0-x"];
@@ -269,7 +272,7 @@ fn report_candidates_keeps_the_full_report_on_a_final_ledger() {
 
 #[test]
 fn ladder_on_a_final_ledger_reads_once() {
-    let dir = scratch("ladder");
+    let (_scratch, dir) = scratch("ladder");
     let (data, win) = (dir.join("p.csv"), dir.join("w.csv"));
     let mut csv = String::from("ts,sym,f1,f2,y\n");
     for g in 0..3i64 {
@@ -383,7 +386,7 @@ fn a_final_read_never_scores_the_locked_rows_of_the_other_candidates() {
 
 #[test]
 fn a_locked_read_refuses_a_range_other_than_the_one_developed_against() {
-    let dir = scratch("bound-range");
+    let (_scratch, dir) = scratch("bound-range");
     let data = store(&dir, "d.csv");
     let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
     dev(&data, &l, &["x"], &[]);
@@ -417,7 +420,7 @@ fn a_locked_read_refuses_a_range_other_than_the_one_developed_against() {
 
 #[test]
 fn a_ledger_without_a_recorded_range_needs_the_unbound_flag() {
-    let dir = scratch("unbound");
+    let (_scratch, dir) = scratch("unbound");
     let data = store(&dir, "d.csv");
     let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
     dev(&data, &l, &["x"], &[]);
@@ -446,7 +449,7 @@ fn a_ledger_without_a_recorded_range_needs_the_unbound_flag() {
 
 #[test]
 fn a_sealed_batch_read_verifies() {
-    let dir = scratch("batch");
+    let (_scratch, dir) = scratch("batch");
     let data = store(&dir, "d.csv");
     let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
     let exprs = ["x", "0-x"];
@@ -466,8 +469,8 @@ fn a_sealed_batch_read_verifies() {
 
 /// One sealed ladder read on a fresh copy of the same synthetic panel. Returns
 /// the ledger text, the data path and the ledger path.
-fn sealed_ladder_read(name: &str) -> (String, String, String) {
-    let dir = scratch(name);
+fn sealed_ladder_read(name: &str) -> (Scratch, String, String, String) {
+    let (scratch, dir) = scratch(name);
     let (data, win) = (dir.join("p.csv"), dir.join("w.csv"));
     let mut csv = String::from("ts,sym,f1,f2,y\n");
     for g in 0..3i64 {
@@ -508,7 +511,7 @@ fn sealed_ladder_read(name: &str) -> (String, String, String) {
         "--max-fit-rows", "600", "--out", &out, "--locked-test", "--ledger", &l, "--sealed", &sealed,
     ]);
     assert_eq!(code, 0, "{}", err);
-    (std::fs::read_to_string(&l).unwrap(), d, l)
+    (scratch, std::fs::read_to_string(&l).unwrap(), d, l)
 }
 
 fn baseline_read_sha(ledger: &str) -> String {
@@ -518,17 +521,17 @@ fn baseline_read_sha(ledger: &str) -> String {
 
 #[test]
 fn a_sealed_ladder_read_hash_is_reproducible_and_verifies() {
-    let (a, da, la) = sealed_ladder_read("lad");
+    let (_sa, a, da, la) = sealed_ladder_read("lad");
     let (code, out, err) = rcsr(&["protocol", "verify", "--ledger", &la, "--data", &da]);
     assert_eq!(code, 0, "{}{}", out, err);
-    let (b, _, _) = sealed_ladder_read("lad");
+    let (_sb, b, _, _) = sealed_ladder_read("lad");
     assert_eq!(baseline_read_sha(&a), baseline_read_sha(&b));
 }
 
 #[test]
 fn ladder_read_hash_ignores_the_store_directory() {
-    let (a, da, _) = sealed_ladder_read("lad-dir-a");
-    let (b, db, _) = sealed_ladder_read("lad-dir-b");
+    let (_sa, a, da, _) = sealed_ladder_read("lad-dir-a");
+    let (_sb, b, db, _) = sealed_ladder_read("lad-dir-b");
     assert_ne!(da, db);
     assert_eq!(baseline_read_sha(&a), baseline_read_sha(&b));
     let printed = std::fs::read_to_string(Path::new(&da).with_file_name("ladder.json")).unwrap();

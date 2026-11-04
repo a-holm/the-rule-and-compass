@@ -296,16 +296,20 @@ fn the_report_is_deterministic() {
     assert_eq!(strip(&a), b);
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("rcsr-ladder-{}-{}", std::process::id(), name));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn scratch(name: &str) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new(name);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 #[test]
 fn one_command_reproduces_the_table() {
     let f = fixture(10);
-    let dir = scratch("cli");
+    let (_scratch, dir) = scratch("cli");
     let mut csv = String::from("ts,sym,signal,vol,n1,n2,lag,y,ret\n");
     for i in 0..f.panel.len() {
         csv.push_str(&format!(

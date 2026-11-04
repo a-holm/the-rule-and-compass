@@ -4,21 +4,18 @@
 use rcsr::devlog::Json;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 const T0: i64 = 1_600_000_000;
 const N: usize = 400;
 
-static NEXT: AtomicUsize = AtomicUsize::new(0);
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
 
-fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-objective-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch() -> (Scratch, PathBuf) {
+    let scratch = Scratch::new("objective");
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn frac(v: f64) -> f64 {
@@ -119,7 +116,7 @@ const PNL: &[&str] = &["--objective", "pnl", "--cost-bps", "5", "--validation-fr
 
 #[test]
 fn refusals_are_usage_errors() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", None);
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
 
@@ -153,7 +150,7 @@ fn refusals_are_usage_errors() {
 
 #[test]
 fn validation_selection_ignores_the_test_block_and_json_has_the_book() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let plain = write_csv(&dir, "a.csv", None);
     let shuffled = write_csv(&dir, "b.csv", Some(330));
@@ -197,7 +194,7 @@ fn validation_selection_ignores_the_test_block_and_json_has_the_book() {
 
 #[test]
 fn sharpe_and_log_growth_objectives_run() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let data = write_csv(&dir, "d.csv", None);
     for name in ["sharpe", "log_growth"] {
@@ -209,7 +206,7 @@ fn sharpe_and_log_growth_objectives_run() {
 
 #[test]
 fn the_default_run_has_no_objective_block() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let data = write_csv(&dir, "d.csv", None);
     let out = run(&data, &spec, &["--validation-frac", "0.3"]);
@@ -259,7 +256,7 @@ fn projection_columns(dir: &std::path::Path, data: &str, spec: &str, extra: &[&s
 
 #[test]
 fn a_projected_store_read_keeps_the_return_column() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let store = import_store(&dir, &write_csv(&dir, "d.csv", None));
     let (out, cols) = projection_columns(&dir, &store, &spec, PNL);
@@ -269,7 +266,7 @@ fn a_projected_store_read_keeps_the_return_column() {
 
 #[test]
 fn a_projected_store_read_keeps_the_funding_column() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let store = import_store(&dir, &write_csv_with_funding(&dir));
     let mut extra = PNL.to_vec();
@@ -282,7 +279,7 @@ fn a_projected_store_read_keeps_the_funding_column() {
 
 #[test]
 fn the_projection_without_an_objective_is_unchanged() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let store = import_store(&dir, &write_csv(&dir, "d.csv", None));
     let (_, cols) = projection_columns(&dir, &store, &spec, &["--validation-frac", "0.3"]);
@@ -291,7 +288,7 @@ fn the_projection_without_an_objective_is_unchanged() {
 
 #[test]
 fn a_missing_return_column_names_the_target_spec() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let text = std::fs::read_to_string(&spec).unwrap().replace("\"return_column\":\"r\"", "\"return_column\":\"gone\"");
     std::fs::write(&spec, text).unwrap();
@@ -303,7 +300,7 @@ fn a_missing_return_column_names_the_target_spec() {
 
 #[test]
 fn overlapping_rows_are_refused_and_the_spacing_is_reported() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", None);
     let overlapping = write_spec_horizon(&dir, "o.json", 0.0, "null", false, 3600);
     usage_error(&run(&data, &overlapping, PNL), "overlapping returns");
@@ -365,7 +362,7 @@ fn run_args(data: &str, spec: &str, expr: &[String], no_project: bool) -> Output
 
 #[test]
 fn row_expressions_keep_the_projection() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let store = import_store(&dir, &write_csv_with_spare_columns(&dir));
     for expr in row_expression_runs() {
@@ -381,7 +378,7 @@ fn row_expressions_keep_the_projection() {
 
 #[test]
 fn the_projection_includes_the_columns_an_expression_reads() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let store = import_store(&dir, &write_csv_with_spare_columns(&dir));
     let expr = vec!["--filter".to_string(), "z1 > 5 and z2 > 0".to_string()];
@@ -393,7 +390,7 @@ fn the_projection_includes_the_columns_an_expression_reads() {
 
 #[test]
 fn projected_and_full_reads_agree_with_row_expressions() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let store = import_store(&dir, &write_csv_with_spare_columns(&dir));
     for expr in row_expression_runs() {
@@ -411,7 +408,7 @@ fn projected_and_full_reads_agree_with_row_expressions() {
 
 #[test]
 fn an_unknown_column_in_a_row_expression_fails_before_the_read() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let store = import_store(&dir, &write_csv_with_spare_columns(&dir));
     let out = run_args(&store, &spec, &["--exclude".to_string(), "nope > 1".to_string()], false);
@@ -421,7 +418,7 @@ fn an_unknown_column_in_a_row_expression_fails_before_the_read() {
 
 #[test]
 fn run_json_carries_the_seen_time_ranges_and_the_candidate_count() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let data = write_csv(&dir, "a.csv", None);
     let out = run(&data, &spec, PNL);
@@ -441,7 +438,7 @@ fn run_json_carries_the_seen_time_ranges_and_the_candidate_count() {
 
 #[test]
 fn walkforward_front_of_a_real_run_guards_the_seen_rows() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let data = write_csv(&dir, "a.csv", None);
     let out = run(&data, &spec, PNL);
@@ -505,7 +502,7 @@ fn has_device(o: &Output) -> bool {
 #[cfg(feature = "cuda")]
 #[test]
 fn an_explicit_gpu_run_exits_non_zero_when_the_book_is_refused() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", None);
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let o = run_gpu(&data, &spec, &["--gpu"], "pnl_book", &[]);
@@ -521,7 +518,7 @@ fn an_explicit_gpu_run_exits_non_zero_when_the_book_is_refused() {
 #[cfg(feature = "cuda")]
 #[test]
 fn the_auto_mode_labels_the_cpu_fallback_when_the_book_is_refused() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", None);
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let o = run_gpu(&data, &spec, &[], "pnl_book", &[]);
@@ -535,7 +532,7 @@ fn the_auto_mode_labels_the_cpu_fallback_when_the_book_is_refused() {
 #[cfg(feature = "cuda")]
 #[test]
 fn an_explicit_gpu_run_exits_non_zero_on_a_mid_run_batch_failure() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", None);
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let o = run_gpu(&data, &spec, &["--gpu"], "batch", &["--dispatch", "device"]);
@@ -547,8 +544,8 @@ fn an_explicit_gpu_run_exits_non_zero_on_a_mid_run_batch_failure() {
     assert!(o.stdout.is_empty(), "no result is written");
 }
 
-fn from_run_fixture() -> (String, String, f64, f64) {
-    let dir = scratch();
+fn from_run_fixture() -> (Scratch, String, String, f64, f64) {
+    let (scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let data = write_csv(&dir, "a.csv", None);
     let out = run(&data, &spec, PNL);
@@ -561,7 +558,7 @@ fn from_run_fixture() -> (String, String, f64, f64) {
         _ => unreachable!(),
     };
     let purge = num(&j, &["split", "required_purge_seconds"]);
-    (data, run_path.to_string_lossy().into_owned(), seen, purge)
+    (scratch, data, run_path.to_string_lossy().into_owned(), seen, purge)
 }
 
 fn walk_from_run(data: &str, run_path: &str, test_start: f64, purge: f64, extra: &[&str]) -> Output {
@@ -579,7 +576,7 @@ fn walk_from_run(data: &str, run_path: &str, test_start: f64, purge: f64, extra:
 
 #[test]
 fn from_run_refuses_in_sample_windows() {
-    let (data, run_path, seen, purge) = from_run_fixture();
+    let (_scratch, data, run_path, seen, purge) = from_run_fixture();
     let inside = walk_from_run(&data, &run_path, seen, purge, &[]);
     assert_eq!(code(&inside), 2, "{}", stderr(&inside));
     assert!(stderr(&inside).contains("tests rows the run trained or selected on"), "{}", stderr(&inside));
@@ -589,7 +586,7 @@ fn from_run_refuses_in_sample_windows() {
 
 #[test]
 fn from_run_labels_allowed_in_sample_windows() {
-    let (data, run_path, seen, purge) = from_run_fixture();
+    let (_scratch, data, run_path, seen, purge) = from_run_fixture();
     let inside = walk_from_run(&data, &run_path, seen, purge, &["--allow-in-sample-windows"]);
     assert_eq!(code(&inside), 0, "{}", stderr(&inside));
     let text = String::from_utf8_lossy(&inside.stdout).into_owned();
@@ -600,7 +597,7 @@ fn from_run_labels_allowed_in_sample_windows() {
 }
 
 fn walk_table(extra: &[&str]) -> Output {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "a.csv", None);
     let at_row = |i: usize| T0 + 900 * i as i64;
     let table = format!(
@@ -653,7 +650,7 @@ fn windows_table_still_refuses_validation_frac_and_missing_slice() {
     let both = walk_table(&["--expr", "x1", "--expr", "x2", "--validation-frac", "0.2"]);
     assert_ne!(code(&both), 0);
     assert!(stderr(&both).contains("mutually exclusive"), "{}", stderr(&both));
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "a.csv", None);
     let none = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args([
@@ -672,7 +669,7 @@ fn windows_table_still_refuses_validation_frac_and_missing_slice() {
 /// The second search of the process hits an injected batch fault.
 #[cfg(feature = "cuda")]
 fn run_second_search_fault(extra: &[&str], keep_dev_log: bool) -> Output {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", None);
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let mut args = vec![
@@ -811,7 +808,7 @@ fn assert_members_match_rescore(j: &Json) -> usize {
 
 #[test]
 fn every_pareto_member_reports_its_validation_book() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let data = write_csv(&dir, "a.csv", None);
     let mut extra = PNL.to_vec();
@@ -839,7 +836,7 @@ fn every_pareto_member_reports_its_validation_book() {
 
 #[test]
 fn a_run_without_a_trading_objective_has_no_validation_book() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let data = write_csv(&dir, "a.csv", None);
     let out = run(&data, &spec, &["--validation-frac", "0.3"]);
@@ -849,7 +846,7 @@ fn a_run_without_a_trading_objective_has_no_validation_book() {
 
 #[test]
 fn a_declared_lockbox_is_never_part_of_a_member_book() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
     let data = write_csv(&dir, "a.csv", None);
     let lock_from = T0 + 900 * 340;

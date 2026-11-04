@@ -4,22 +4,19 @@
 use rcsr::devlog::Json;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 const T0: i64 = 1_600_000_000;
 const STEP: i64 = 900;
 const N: usize = 400;
 
-static NEXT: AtomicUsize = AtomicUsize::new(0);
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
 
-fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-cost-contract-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch() -> (Scratch, PathBuf) {
+    let scratch = Scratch::new("cost-contract");
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn frac(v: f64) -> f64 {
@@ -137,7 +134,7 @@ fn window_arg() -> String {
 
 #[test]
 fn one_cost_one_book_across_evaluators() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", |i| row(i).2);
     let spec = write_spec(&dir, "s.json", "log", "20.0");
     let windows = write_windows(&dir);
@@ -220,7 +217,7 @@ fn one_cost_one_book_across_evaluators() {
 
 #[test]
 fn walkforward_from_run_prices_the_selected_book() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", |i| row(i).2);
     let spec = write_spec(&dir, "s.json", "log", "20.0");
     let run = search(&dir, &data, &spec, &[]);
@@ -272,7 +269,7 @@ fn walkforward_from_run_prices_the_selected_book() {
 
 #[test]
 fn a_log_return_column_is_converted_with_exp_m1_in_every_evaluator() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", |_| 0.1);
     let log_spec = write_spec(&dir, "log.json", "log", "0.0");
     let simple_spec = write_spec(&dir, "simple.json", "simple", "0.0");
@@ -333,7 +330,7 @@ fn a_log_return_column_is_converted_with_exp_m1_in_every_evaluator() {
 
 #[test]
 fn the_cost_flag_must_agree_with_the_target_spec() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", |i| row(i).2);
     let spec = write_spec(&dir, "s.json", "log", "20.0");
     let windows = write_windows(&dir);
@@ -394,7 +391,7 @@ fn the_cost_flag_must_agree_with_the_target_spec() {
 
 #[test]
 fn the_cost_source_is_reported() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", |i| row(i).2);
     let w = window_arg();
     let wf_path = dir.join("wf.json").to_string_lossy().into_owned();
@@ -416,7 +413,7 @@ fn the_cost_source_is_reported() {
 
 #[test]
 fn from_run_refuses_a_run_without_an_objective_and_competing_rules() {
-    let dir = scratch();
+    let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", |i| row(i).2);
     let w = window_arg();
     let plain = dir.join("plain.json");

@@ -5,11 +5,14 @@ use rcsr::protocol::{self, Candidate, Ledger};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("rcsr-protocol-{}-{}", name, std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn scratch(name: &str) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new(name);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 #[test]
@@ -77,7 +80,7 @@ fn candidate(tag: &str) -> Candidate {
 
 #[test]
 fn ledger_seals_before_the_read_and_allows_one_read_per_candidate() {
-    let dir = scratch("ledger");
+    let (_scratch, dir) = scratch("ledger");
     let ledger = Ledger::new(dir.join("ledger.jsonl"));
     let sealed = dir.join("locked_candidates.json");
     let (a, b, c) = (candidate("a"), candidate("b"), candidate("c"));
@@ -117,7 +120,7 @@ fn ledger_seals_before_the_read_and_allows_one_read_per_candidate() {
 
 #[test]
 fn an_edited_ledger_breaks_the_chain() {
-    let dir = scratch("chain");
+    let (_scratch, dir) = scratch("chain");
     let ledger = Ledger::new(dir.join("ledger.jsonl"));
     ledger.add_candidate(&candidate("a")).unwrap();
     ledger.add_candidate(&candidate("b")).unwrap();
@@ -139,7 +142,7 @@ fn rcsr(args: &[&str]) -> (i32, String, String) {
 
 #[test]
 fn the_cli_runs_the_whole_protocol_and_refuses_a_second_read() {
-    let dir = scratch("cli");
+    let (_scratch, dir) = scratch("cli");
     let data = dir.join("d.csv");
     let mut csv = String::from("ts,x,target\n");
     for i in 0..300 {
@@ -212,7 +215,7 @@ fn the_cli_runs_the_whole_protocol_and_refuses_a_second_read() {
 
 #[test]
 fn generated_selectors_leave_the_required_purge_on_a_ragged_panel() {
-    let dir = scratch("selectors");
+    let (_scratch, dir) = scratch("selectors");
     let purge = 3.0 * 3600.0;
     let t0 = 1_600_000_000.0f64;
     let hour = 3600.0;
@@ -269,7 +272,7 @@ fn generated_selectors_leave_the_required_purge_on_a_ragged_panel() {
 
 #[test]
 fn final_seal_blocks_new_candidates_and_limits_reads() {
-    let dir = scratch("final");
+    let (_scratch, dir) = scratch("final");
     let ledger = Ledger::new(dir.join("ledger.jsonl"));
     let sealed = dir.join("locked_candidates.json");
     let (a, b) = (candidate("a"), candidate("b"));
@@ -297,7 +300,7 @@ fn final_seal_blocks_new_candidates_and_limits_reads() {
 
 #[test]
 fn final_seal_with_more_reads_allows_exactly_that_many() {
-    let dir = scratch("final2");
+    let (_scratch, dir) = scratch("final2");
     let ledger = Ledger::new(dir.join("ledger.jsonl"));
     let sealed = dir.join("locked_candidates.json");
     let (a, b, c) = (candidate("a"), candidate("b"), candidate("c"));
@@ -315,7 +318,7 @@ fn final_seal_with_more_reads_allows_exactly_that_many() {
 
 #[test]
 fn final_seal_refuses_a_ledger_that_has_a_seal_or_a_read() {
-    let dir = scratch("final3");
+    let (_scratch, dir) = scratch("final3");
     let ledger = Ledger::new(dir.join("ledger.jsonl"));
     let sealed = dir.join("locked_candidates.json");
     let a = candidate("a");
@@ -326,7 +329,7 @@ fn final_seal_refuses_a_ledger_that_has_a_seal_or_a_read() {
 
 #[test]
 fn the_read_marker_binds_a_store_to_one_ledger_chain() {
-    let dir = scratch("marker");
+    let (_scratch, dir) = scratch("marker");
     let data = dir.join("d.csv");
     std::fs::write(&data, "ts,x\n").unwrap();
     let d = data.to_str().unwrap();
@@ -368,7 +371,7 @@ fn the_read_marker_binds_a_store_to_one_ledger_chain() {
 fn a_ledger_binds_the_locked_range_and_a_read_refuses_another() {
     use rcsr::protocol::{Event, LockedRange, RangeBinding};
 
-    let dir = scratch("bound-range");
+    let (_scratch, dir) = scratch("bound-range");
     let ledger = Ledger::new(dir.join("ledger.jsonl"));
     let sealed = dir.join("locked_candidates.json");
     let range = |start: i64, end: i64| LockedRange { start, end, source: "store".to_string() };
