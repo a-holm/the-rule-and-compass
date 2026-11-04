@@ -113,9 +113,9 @@ fn fused_cost_model_is_sublinear_in_columns() {
 fn fused_families_dispatch_only_with_enough_segments() {
     use std::collections::BTreeMap;
     let mut counts = BTreeMap::new();
-    counts.insert("flow", (12usize, rcsr::enrich::OpClass::RollingStd));
+    counts.insert("flow", (20usize, rcsr::enrich::OpClass::RollingStd));
     let mut supported = BTreeMap::new();
-    supported.insert("flow", 12usize);
+    supported.insert("flow", 20usize);
 
     // 109 symbols and 1 M rows: the measured fused cost beats the measured CPU
     // reference estimate, so `auto` dispatches.
@@ -162,11 +162,11 @@ fn fused_families_dispatch_only_with_enough_segments() {
 #[test]
 fn fused_plan_flips_to_gpu_at_the_column_count_the_cost_constants_imply() {
     use std::collections::BTreeMap;
-    let first_gpu_columns = |family: &'static str| -> usize {
+    let first_gpu_columns = |family: &'static str, class: rcsr::enrich::OpClass| -> usize {
         let backends: Vec<bool> = (1..=100usize)
             .map(|cols| {
                 let mut counts = BTreeMap::new();
-                counts.insert(family, (cols, rcsr::enrich::OpClass::Elementwise));
+                counts.insert(family, (cols, class));
                 let mut supported = BTreeMap::new();
                 supported.insert(family, cols);
                 let plan = rcsr::enrich::plan_groups_with_segments(
@@ -184,8 +184,8 @@ fn fused_plan_flips_to_gpu_at_the_column_count_the_cost_constants_imply() {
         assert!(backends[first..].iter().all(|g| *g), "{family} plan is monotone");
         first + 1
     };
-    assert_eq!(first_gpu_columns("flow"), 43);
-    assert_eq!(first_gpu_columns("price_action"), 28);
+    assert_eq!(first_gpu_columns("flow", rcsr::enrich::OpClass::RollingStd), 15);
+    assert_eq!(first_gpu_columns("price_action", rcsr::enrich::OpClass::WilderScan), 79);
 }
 
 #[cfg(feature = "cuda")]
