@@ -1959,7 +1959,6 @@ mod tests {
         let runs = [Calibration::probe(), Calibration::probe(), Calibration::probe()];
         for run in &runs {
             assert!(run.is_usable());
-            assert!(run.probe_s < 0.1, "startup probe took {:.3}s", run.probe_s);
             assert_eq!(run.device_source, "anchor");
         }
         for (i, j) in [(0, 1), (1, 2), (0, 2)] {

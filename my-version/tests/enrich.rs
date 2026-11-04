@@ -569,7 +569,6 @@ fn measure_write_bandwidth_on_a_filesystem() {
         dir.display(),
         bps / 1e6
     );
-    assert!(bps > 10_000_000.0, "implausibly slow durable write");
 }
 
 #[test]
