@@ -335,6 +335,9 @@ pub struct Config {
     /// refusals and CPU-contract stages still route to the CPU. Not a search
     /// setting.
     pub dispatch: crate::dispatch::DispatchMode,
+    /// #733: where Auto dispatch takes its rates from: the corpus anchors, a
+    /// calibration file, or the per-process probe. Not a search setting.
+    pub calibration: crate::dispatch::CalibrationSource,
     /// #119: bounded producer/scorer overlap depth in batches (`0` disables).
     /// While the GPU scores a batch, the CPU keeps generating and fitting the
     /// next candidates. This is a scheduling choice only: the scored values,
@@ -345,6 +348,10 @@ pub struct Config {
     /// only: results are bit-identical for every value, so it is not saved in
     /// a checkpoint. `1` runs every phase serially on the island thread.
     pub threads: usize,
+    /// #733: `--threads` was given. Only then do the fit cost checks use
+    /// `threads`; otherwise they use [`DEFAULT_FIT_COST_CORES`], so the default
+    /// resolution does not follow the CPU affinity of the process.
+    pub threads_explicit: bool,
     /// #122: which variation engine to use. `auto` selects the flat postfix
     /// engine only for a large, fit-free GPU run.
     pub variation: VariationMode,
@@ -643,8 +650,10 @@ impl Default for Config {
             gpu_notes: true,
             gpu_memory: None,
             dispatch: crate::dispatch::DispatchMode::Auto,
+            calibration: crate::dispatch::CalibrationSource::Anchors,
             pipeline_depth: 2, // #119: only used when the GPU path is active
             threads: 1,
+            threads_explicit: false,
             variation: VariationMode::Auto,
             selection: Selection::Lexicographic,
             mutation_mix: MutationMix::Classic,
@@ -1005,6 +1014,8 @@ struct GpuSearch {
     pool: Option<crate::genome::GenomePool>,
     /// #131: per-generation opcode/fallback counts.
     stats: BTreeMap<usize, GpuGenStats>,
+    /// #733: workers of the CPU fallback fit; the pool is sized with it.
+    fallback_workers: usize,
     /// #500: rows version of the sample the next `score` call scores on, set
     /// by the caller; a CPU-confirmed `+inf` is recorded against it.
     rows_version: u64,
@@ -1197,6 +1208,8 @@ impl GpuSearch {
         plan: Option<&crate::memory::DevicePlan>,
         // #481: the long/flat book `ScoreObjective::LongPnl` reads.
         pnl_book: Option<&crate::trading::FitnessBook>,
+        // #733: size of the CPU fallback pool.
+        fallback_threads: usize,
     ) -> Result<Self, String> {
         let budget = plan.map(|p| p.budget);
         let tiled = plan.filter(|p| p.mode == crate::memory::Residency::Tiled);
@@ -1312,7 +1325,11 @@ impl GpuSearch {
                     pool: None,
                     stats: BTreeMap::new(),
                     rows_version: 0,
-                    fallback: Some(FallbackPool::new(fallback_workers(), fallback_workers())),
+                    fallback: Some(FallbackPool::new(
+                        fallback_workers(fallback_threads),
+                        fallback_workers(fallback_threads),
+                    )),
+                    fallback_workers: fallback_workers(fallback_threads),
                     fit_attempts: 0,
                     fit_gpu: 0,
                     fit_fallback: 0,
@@ -1677,7 +1694,7 @@ impl GpuSearch {
                 &fit_train.w,
                 cfg.fit_iters,
                 cfg.metric,
-                fallback_workers(),
+                self.fallback_workers,
             );
             for (&(_, _, cause), job) in fallbacks[..refit].iter().zip(&jobs) {
                 if job.improved {
@@ -2721,19 +2738,32 @@ struct FallbackTicket {
     started: std::time::Instant,
 }
 
-/// #121: size of the bounded CPU fallback pool.
+/// #121: size of the bounded CPU fallback pool: `RCSR_CPU_FALLBACK_THREADS`,
+/// else `min(threads, 8)`.
 #[cfg(feature = "cuda")]
-fn fallback_workers() -> usize {
+fn fallback_workers(threads: usize) -> usize {
     const MAX: usize = 8;
     if let Ok(v) = std::env::var("RCSR_CPU_FALLBACK_THREADS") {
         if let Ok(n) = v.parse::<usize>() {
             return n.clamp(1, 64);
         }
     }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(MAX)
+    threads.clamp(1, MAX)
+}
+
+/// #733: cores the fit cost checks assume when `--threads` is not given. A
+/// fixed number, so the default fit resolution does not follow the CPU
+/// affinity of the process.
+pub const DEFAULT_FIT_COST_CORES: usize = 8;
+
+/// #733: the thread count the fit cost checks use.
+#[cfg(feature = "cuda")]
+fn fit_cost_cores(cfg: &Config) -> usize {
+    if cfg.threads_explicit {
+        cfg.threads.max(1)
+    } else {
+        DEFAULT_FIT_COST_CORES
+    }
 }
 
 /// #604: the prefix of the error a run returns when `--gpu` was explicit and
@@ -3155,7 +3185,7 @@ fn finish_pipeline_fallbacks(
             &train.w,
             fit.iters,
             fit.metric,
-            fallback_workers(),
+            g.fallback_workers,
         );
         for (f, job) in fallbacks[..refit].iter_mut().zip(jobs) {
             if job.improved {
@@ -3666,11 +3696,9 @@ fn fit_memory_check(_cfg: &Config, _train: &Sample) -> Result<(), String> {
 
 #[cfg(feature = "cuda")]
 fn fit_cost_check(cfg: &Config) -> bool {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let cores = fit_cost_cores(cfg);
     let full = crate::fit::gpu_fit_op_coverage(&cfg.ops, !expr::current_blocks().is_empty());
-    crate::fit::ls_gpu_fit_worthwhile(cfg.islands.max(1), cores, fallback_workers(), full)
+    crate::fit::ls_gpu_fit_worthwhile(cfg.islands.max(1), cores, fallback_workers(cores), full)
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -6068,6 +6096,7 @@ fn snapshot(
         backend,
         config_hash: crate::checkpoint::config_hash(cfg),
         refit_band_unknown: false,
+        calibration_record: Some(crate::checkpoint::CalibrationRecord::of(&cfg.calibration)),
         generations: gens_done,
         stopped_early,
         best_prev,
@@ -7156,16 +7185,22 @@ fn run_search(
     // startup cost model; contract stages (variation, selection, archive, I/O,
     // features, P&L and exact refit) are planned once and recorded so the
     // ledger answers for every stage, not only the two that can move.
+    // #733: the rates come from the pinned source. Only `Probe` reads a clock.
     #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
-    let mut calibration = crate::dispatch::Calibration::probe();
+    let mut calibration = crate::dispatch::Calibration::pinned(&cfg.calibration);
     #[cfg(feature = "cuda")]
-    if cfg.gpu {
+    if cfg.gpu && cfg.calibration == crate::dispatch::CalibrationSource::Probe {
         if let Some(rates) = crate::dispatch_gpu::device_rates() {
             calibration = calibration.with_device_rates(rates);
         }
     }
-    let mut dispatcher =
-        crate::dispatch::Dispatcher::new(calibration).with_mode(cfg.dispatch);
+    #[cfg(not(feature = "cuda"))]
+    {
+        calibration = calibration.host_terms_only();
+    }
+    let mut dispatcher = crate::dispatch::Dispatcher::new(calibration)
+        .with_mode(cfg.dispatch)
+        .with_origin(cfg.calibration.origin());
     for stage in [
         crate::dispatch::Stage::Vary,
         crate::dispatch::Stage::Select,
@@ -7296,6 +7331,7 @@ fn run_search(
                         &fit_rows,
                         memory_plan.as_ref(),
                         cfg.fitness.book(),
+                        cfg.threads,
                     ),
                 };
                 match created {
@@ -7533,6 +7569,16 @@ fn run_search(
                 "checkpoint search settings do not match ({})",
                 diff.join(", ")
             ));
+        }
+        if let Some(saved) = &cp.calibration_record {
+            let now = crate::checkpoint::CalibrationRecord::of(&cfg.calibration);
+            if *saved != now {
+                return Err(format!(
+                    "cannot resume: the checkpoint was written with calibration {} but this run uses {}",
+                    saved.describe(),
+                    now.describe()
+                ));
+            }
         }
         if cfg.generations < cp.config.generations || cfg.generations < cp.generations {
             return Err(format!(
@@ -8194,7 +8240,10 @@ fn run_search(
                             .as_mut()
                             .map(|g| g.take_fallback())
                             .unwrap_or_else(|| {
-                                FallbackPool::new(fallback_workers(), fallback_workers())
+                                FallbackPool::new(
+                                    fallback_workers(cfg.threads),
+                                    fallback_workers(cfg.threads),
+                                )
                             });
                         gpu = None;
                         let train_view = EvalSample::new(train, cfg);
@@ -11571,6 +11620,7 @@ mod tests {
             &[],
             None,
             None,
+            2,
         )
         .expect("a device search");
         let mut dispatcher = crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::default())
@@ -11650,6 +11700,7 @@ mod tests {
             &[],
             None,
             cfg.fitness.book(),
+            2,
         )
         .expect("a device search");
         let mut dispatcher = crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::default())
@@ -11679,5 +11730,23 @@ mod tests {
         assert_eq!(default_fit_rows_for(DEFAULT_FIT_ROWS_ABOVE, true), None);
         assert_eq!(default_fit_rows_for(10 * above, false), None);
         assert_eq!(default_fit_rows_for(1_000, true), None);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn fit_cost_check_follows_explicit_threads_and_ignores_the_machine() {
+        let base = Config { islands: 12, ..Config::default() };
+        let with = |threads: usize, explicit: bool| {
+            fit_cost_check(&Config { threads, threads_explicit: explicit, ..base.clone() })
+        };
+        assert!(with(2, true), "2 threads: the device wins");
+        assert!(!with(16, true), "16 threads: the CPU wins");
+        for threads in [1, 2, 16, 64] {
+            assert_eq!(
+                with(threads, false),
+                with(DEFAULT_FIT_COST_CORES, true),
+                "without --threads the check uses {DEFAULT_FIT_COST_CORES} cores, not {threads}"
+            );
+        }
     }
 }

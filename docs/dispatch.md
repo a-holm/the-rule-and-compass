@@ -44,17 +44,45 @@ it becomes `(1+h)` (1.3×) more expensive than the CPU. A workload hovering at
 the crossover therefore has a stable route instead of switching every
 generation. The ledger labels the held case `hysteresis_device`.
 
-## Calibration
+## Calibration (#733)
 
-`Calibration::probe()` times the host (median of 31 reps). The host terms that
-route stages (`cpu_eval`, `cpu_fit`) stay within a fixed factor of their anchors,
-so the route ledger of two identical CPU runs has identical bytes (`predicted_s`
-in the result JSON follows the host rate); the raw probe
-rate is reported unclamped as `host_rate` with its spread. With `--gpu` and a
-usable device, `dispatch_gpu::device_rates()` times the device once per process
-and `Calibration::with_device_rates` installs the result. The launch term is small
-in the model and its band is wide; the other terms dominate a route. Without a device the
-device terms stay the corpus anchors:
+A run prices its stages from a **pinned calibration**, so one seed gives one route
+ledger and one front in every process. No run times anything unless
+`--calibration probe` is given. The source is chosen with
+`--calibration anchors|probe|<path>`:
+
+| source | rates | `dispatch.calibration.source` |
+|---|---|---|
+| (default) | the file `$XDG_CACHE_HOME/rcsr/calibration.json` (`~/.cache/rcsr/calibration.json` when unset) if it exists, else the anchors below | `file` or `anchors` |
+| `anchors` | the fixed corpus anchors below; any file is ignored | `anchors` |
+| `<path>` | the file at `<path>`, written by `rcsr calibrate` | `file` |
+| `probe` | `Calibration::probe()` and, with `--gpu`, `dispatch_gpu::device_rates()` at startup; routes can differ between processes | `startup_probe` |
+
+A file the user named, or the default file when it exists, must be valid. A
+missing, truncated, non-JSON, wrong-schema, non-finite or non-positive file exits
+2 with a message naming the file; there is no silent fallback to the anchors. A
+file measured on another device than the one the run uses exits 2 naming both
+devices. A CPU run, or a build without `--features cuda`, reads the host terms
+only and keeps the anchors for the device terms.
+
+A checkpoint records `config calibration_source` (`anchors`, `probe` or `file`) and, for a file, `config calibration_sha256`. Neither line is part of the config hash. `--resume` exits 2 when the resolved source or the file hash differs from the record, naming both. A checkpoint without the lines (an older binary) resumes only with an explicit `--calibration`, and the run prints a `# resume:` notice. A `probe` run is not reproducible, so it resumes only with `--calibration probe`, also with a notice.
+
+`rcsr calibrate [--out <path>] [--gpu | --cpu]` is the only writer. It runs
+`Calibration::probe()` (host, median of 31 reps) and `dispatch_gpu::measure()`
+(device) and writes the file atomically (a sibling temporary file, `fsync`, then
+`rename`). The file is JSON, schema `rcsr-calibration/1`: `written` (UTC),
+`device` (name or `null`), `build`, the rates `r_eval`, `r_fit`, `bw`, `bw_h2d`,
+`bw_d2h`, `launch_s`, `cpu_eval`, `cpu_fit`, `hysteresis`, and the `spread` of
+each probed term. Floats are written in the shortest form that reads back bit
+for bit. A search run never writes it.
+
+The probes behind `rcsr calibrate` and `--calibration probe` work as follows. The
+host terms that route stages (`cpu_eval`, `cpu_fit`) stay within a fixed factor of
+their anchors; the raw probe rate is reported unclamped as `host_rate` with its
+spread. The device probe times the device once per process and
+`Calibration::with_device_rates` installs the result. The launch term is small
+in the model and its band is wide; the other terms dominate a route. Without a
+device the device terms stay the corpus anchors:
 
 | term | anchor | device probe |
 |---|---:|---|
@@ -67,15 +95,16 @@ Each device term is the median of its timed reps after untimed warm-up reps
 (15 for eval and bandwidth, five for fit, 33 for launch). Its
 spread is the largest rep over the smallest rep. Nothing is clamped. Two probes
 agree on a term when their values differ by no more than the larger of the two
-probes' spreads (`Calibration::agreement`); the tests assert this for three runs
-of the host probe and, with a device, three runs of the device probe.
+probes' spreads (`Calibration::agreement`); the ignored tests
+`host_probe_three_runs_agree_within_the_larger_of_their_own_spreads` and the
+device counterpart measure this and are not part of a normal run.
 
 The result JSON (`--json` → `dispatch.calibration`, `--ndjson` done event →
-`dispatch`) carries the provenance labels only: `source` (`startup_probe` or
-`anchors`), `device_source` (`probe` or `anchor`), the sample counts, the
-hysteresis and the fit reference shape. The measured values are wall-clock noise
-and stay out of it, so the result bytes of two identical runs match. The
-`--run-manifest` `dispatch.calibration` object adds `probe_s`, `r_eval`,
+`dispatch`) carries the provenance labels only: `source` (`anchors`, `file` or
+`startup_probe`), `file_path` and `file_sha256` for a file, `device_source`
+(`file`, `probe` or `anchor`), the sample counts, the hysteresis and the fit
+reference shape. The rates stay out of it. The
+`--run-manifest` `dispatch.calibration` object records the same source fields and adds `probe_s`, `r_eval`,
 `r_fit`, `bw`, `bw_h2d`, `bw_d2h`, `launch_s`, `cpu_eval`, `cpu_fit`, `host_rate` and
 `spread` (`r_eval`, `r_fit`, `bw`, `launch_s`, `cpu_eval`).
 
@@ -94,7 +123,7 @@ Each run records one row per stage:
 it makes a wrong route or a tuning regression visible without reading source.
 A CPU-only run still gets the ledger (with `no_device`/`cpu_contract` reasons).
 
-`--dispatch device` records reason `forced` for a stage routed to the device without a timing comparison; refusals and `cpu_contract` still win. See `docs/gpu-backend.md` for why sanitizer runs need it.
+`--dispatch device` records reason `forced` for a stage routed to the device without a cost comparison; refusals and `cpu_contract` still win. With the pinned calibration, `auto` routes the same under `compute-sanitizer` as natively, so a sanitizer run exercises the kernels of the native run.
 
 ## Refusals are a cause set, never a stopwatch
 
@@ -138,14 +167,14 @@ come from the `f64` rebuild.
 * hysteresis at the crossover and stable re-entry;
 * the cause-set rule (timing cannot override a refusal);
 * the split route;
-* three-probe reproducibility within the larger of the probes' own spreads, for the host and for the device terms;
+* the pinned calibration: anchors twice give equal fields, a written file reads back bit for bit, and a corrupt, wrong-schema, unusable or other-device file is refused;
 * manifest/JSON and ledger fields;
 * the compact-cell batch still routes to the device.
 
 The existing arm floors (`median`/`interquartile` 4 096 rows, `maximum` 512
 rows) are expressed through the same planner with a zero-hysteresis
-compatibility calibration, so their measured crossover is unchanged.
+compatibility calibration. The `maximum` fit arm also needs the cost model to prefer the device, which holds above about 3 300 / p rows (#733).
 
 ## The run-level fit rule
 
-The stage model above decides one candidate batch. The fit arm of a whole run (`exact` or the batched GPU LM for `squared`, `aic`, `aicc`, `bic`) is a separate, pure rule that reads no timing: `min(islands, cores) * (s * k + (1 - s) / W) * E * (1 + h) < 1`, with `k = 0.05`, `E = 1.32`, `h = 0.3`, `W` the fallback workers and `s = 1` only when every configured operator has a device fit opcode. It is resolved once before generation 0; see "Default fit arm" in `gpu-backend.md`. The per-candidate model cannot decide it: its device and CPU fit costs scale with the same row, constant and sweep factors, so the device always wins there and the floor of `32p` rows is the only guard.
+The stage model above decides one candidate batch. The fit arm of a whole run (`exact` or the batched GPU LM for `squared`, `aic`, `aicc`, `bic`) is a separate, pure rule that reads no timing: `min(islands, cores) * (s * k + (1 - s) / W) * E * (1 + h) < 1`, with `k = 0.05`, `E = 1.32`, `h = 0.3`, `W` the fallback workers (`cores` is `--threads` when given, else 8, so the rule does not follow the CPU affinity of the process; `W = min(cores, 8)` unless `RCSR_CPU_FALLBACK_THREADS` is set) and `s = 1` only when every configured operator has a device fit opcode. It is resolved once before generation 0; see "Default fit arm" in `gpu-backend.md`. The per-candidate model cannot decide it: its device and CPU fit costs scale with the same row, constant and sweep factors, so the device always wins there and the floor of `32p` rows is the only guard.

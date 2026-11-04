@@ -586,8 +586,7 @@ the 4096-row device floor"`, and `GpuSearch::native_metric`/`native_stat` are
 inactive. The sort-based arms need at least
 [`MEDIAN_GPU_MIN_ROWS`](../my-version/src/fit.rs) = 4 096 training rows
 (median, interquartile, rank, AUC) and the maximum fit arm
-[`MAXIMUM_GPU_MIN_ROWS`](../my-version/src/fit.rs) = 512, the measured
-crossovers below which the CPU statistic is cheaper.
+[`MAXIMUM_GPU_MIN_ROWS`](../my-version/src/fit.rs) = 512, a floor below which the CPU statistic is cheaper. The maximum fit arm also needs the cost model of the maximum polish to prefer the device, which for one constant starts near 3 300 rows (see "Maximum absolute error fitting").
 
 Fallback and the flags:
 
@@ -1537,7 +1536,7 @@ When one fails, no flag keeps `exact` and `auto` keeps the structural CPU `auto`
 
 A resolved `gpu` arm admits every candidate with constants at every row count (`gpu.fit.admission` is `all`). An explicit `--fit-strategy gpu` keeps the `max(32, pop/4)` admission below 1 048 576 rows (`screened`). The admission is saved in checkpoints (`config fit_admission all`; a missing line means `screened`) and is part of the config hash.
 
-The cost model is pure and reads no timing. With `I` island threads, `C` cores, `W = min(C, 8)` fallback workers, `s = 1` when every configured operator has a device fit opcode and no custom block is defined (else `0`), `k = 0.05` (device cost of one fit-row relative to one CPU thread), `E = 1.32` (overhead of the batched arm) and `h = 0.3` (required margin):
+The cost model is pure and reads no timing. With `I` island threads, `C` cores (`--threads` when given, else 8; never the CPU affinity of the process, #733), `W = min(C, 8)` fallback workers (`RCSR_CPU_FALLBACK_THREADS` overrides), `s = 1` when every configured operator has a device fit opcode and no custom block is defined (else `0`), `k = 0.05` (device cost of one fit-row relative to one CPU thread), `E = 1.32` (overhead of the batched arm) and `h = 0.3` (required margin):
 
 ```text
 cpu = 1 / min(I, C)
@@ -2256,10 +2255,7 @@ Plan and status:
    evaluation share 273 GB/s; hand off between them rather than running both
    flat out.
 
-The expected gain over an optimised AVX-512 CPU implementation of the same
-evaluation is **10–40×** (reported figures for this style of workload range from
-~18× to ~40×; the 201–1 678× measured above is against a much slower
-single-threaded reference), rising further with row tiling and CUDA graphs.
+The 201–1 678× measured above is against a single-threaded reference interpreter, not an optimised AVX-512 CPU implementation; no such comparison is measured.
 
 ## Persistent batch arena and asynchronous copies (issue #285)
 
@@ -2717,8 +2713,7 @@ the CPU run apart from the backend labels.
 | `log_squashed` quality of the robust arm against the CPU IRLS over a corpus (basin splits on heavy tails) | RTX 3060, paired fit-stage and end-to-end benchmarks | **measured on one workload** — 34–49× fit-stage, 2.61× end-to-end, no-worse 64/64 at `p=4,8`; the corpus-wide basin-split rate is not measured |
 | Exact median selection (odd/even `n`, ties, constant predictions), CPU parity of the polished constants, determinism, fallback labels and the `--no-fit` no-op (#226) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` median tests, `src/fit/median.rs`, `src/fit/gpu.rs`, `tests/gpu_median.rs`) | **verified** (see the #226 section) |
 | Exact maximum and its lowest maximiser (unique/non-unique/ties/all-zero), the exact level interval on an affine coordinate, the exact 1-D minimiser (hand-solved midrange and Chebyshev line), dominance over the start and over the CPU polish, determinism, fallback labels, cost-model floor and the `--no-fit` no-op (#227) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` maximum tests, `src/fit/minimax.rs`, `src/fit/gpu.rs`, `tests/gpu_max.rs`) | **verified** (see the #227 section) |
-| Maximum paired fit stage (CPU ladder vs bisection on the error level) | RTX 3060, `tests/gpu_max.rs` (`the_paired_maximum_measurement_shows_the_device_tail_is_faster`) | **measured on three sample sizes** — 5.8–9.1× at 24 candidates, 2.6–8.4× at the search's 32-candidate batch; one-candidate batches lose (0.2–0.5×) and are never used |
-| Maximum end-to-end (`rcsr --metric maximum --fit-strategy gpu`) | RTX 3060, three seeds, 20k rows (`--fit-iters 8`), 5 generations, pop 60 | **measured on three seeds** — 1.75–4.0× end-to-end (9.38/3.72/8.48 s exact vs 2.36/2.12/2.89 s device), best front error 3.79/3.91/3.66 vs 3.90/3.63/3.42 (trajectory noise, not a quality claim); fit fallbacks 8.6–10.2 %, all `non_finite`/`unsupported_plan`/`ill_conditioned`, zero `maximum_declined`; the fitness is still CPU, so Amdahl caps the gain |
+| Maximum paired fit stage (CPU ladder vs bisection on the error level) | RTX 3060, `tests/gpu_max.rs` (`measure_paired_maximum_fit`) | **measured on three sample sizes** — warm speedup 0.81× at n=5000, 1.63× at n=20000, 1.68× at n=50000 (24 candidates, `measure_paired_maximum_fit`); one-candidate batches lose (0.2–0.5×) and are never used |
 | `absolute` native `\|r\|` loss in the evaluator and fit kernel, L1/IRLS weights, true-MAE Armijo, parity with CPU IRLS, determinism, zero-residual/ill-conditioned labels, `--no-fit` no-op, metric-aware gate and finalist refit (#222) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`, `src/fit.rs`) | **verified** (see the #222 section) |
 | Exact interquartile window mean (rank `[⌊n/4⌋, ⌊3n/4⌋)`, all rows below `n = 4`, ties at both boundaries, constant predictions, odd/even `n`), CPU parity of the score and of the polished constants, determinism across batch composition, ill-conditioned/declined labels and the `--no-fit` no-op (#232) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` order-statistic tests, `src/fit/interquartile.rs`, `src/fit/gpu.rs`, `tests/gpu_interquartile.rs`) | **verified** (see the #232 section) |
 | Exact order/rank **scoring** entry point (#288): median/IQR/maximum/rank/AUC bit-identical to the CPU for the same prediction vector, AUC integer identity and chance cases, non-binary AUC refusal, `+inf` for non-finite predictions, batch-composition/repeat determinism, gate admission and named row-floor refusals | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` `score_batch_*` and `auc_*` tests, `src/search.rs` gate tests) | **verified** (see the #288 section) |
@@ -3287,58 +3282,51 @@ least `32p` rows; every other candidate, and every batch the device marks
 non-finite (`non_finite`), ill-conditioned (`ill_conditioned`), launches badly
 (`launch`) or whose maximum scan declines (`maximum_declined`), is refit by the
 exact CPU maximum arm. The run-level decision has a reason too: the device arm
-needs `n ≥ MAXIMUM_GPU_MIN_ROWS = 512`, and below it the exact CPU arm runs
+needs `n ≥ MAXIMUM_GPU_MIN_ROWS = 512` and the cost model below to prefer the device (one constant: from about 3 300 rows), and otherwise the exact CPU arm runs
 with `# gpu-fit: off (maximum fit arm: the sample is too small for the device
 polish)` and the same string in `backend_reason`. `--no-fit` never enters the
 arm: the evaluator is not created and the archive is identical to the exact
 CPU run, bit for bit.
 
-**Paired measurement (RTX 3060, shared machine, indicative).** 24 affine
-candidates `a·x + b`, `--fit-iters 8`, same squared warm start on both arms:
+**Paired measurement (RTX 3060, #719).** 24 affine candidates `a·x + b` (`p = 2`), `--fit-iters 8`, same squared warm start on both arms, CPU median of 5 runs and device median of 5 warm calls, from the ignored test `cargo test --release --features cuda --test gpu_max -- --ignored --nocapture measure_paired_maximum_fit` (log `/mnt/lager/tmp/rcsr-gates/issue719-test1.log`):
 
-| rows `n` | CPU arm | GPU arm | speed-up |
-|---|---|---|---|
-| 5 000 | 277.9 ms | 48.1 ms | 5.8× |
-| 20 000 | 1 116.3 ms | 123.5 ms | 9.0× |
-| 50 000 | 2 620.6 ms | 287.3 ms | 9.1× |
+| rows `n` | CPU arm | GPU arm cold | GPU arm warm | warm speed-up |
+|---|---|---|---|---|
+| 5 000 | 27.585 ms | 48.839 ms | 33.864 ms | 0.81× |
+| 20 000 | 165.456 ms | 109.207 ms | 101.690 ms | 1.63× |
+| 50 000 | 448.860 ms | 280.227 ms | 266.985 ms | 1.68× |
 
-and at the search's **minimum admitted batch** (32 candidates, `p = 2`, best of
-three): 256 rows 23.4 vs 9.1 ms (2.6×), 512 rows 43.1 vs 10.9 ms (3.95×),
-1 024 rows 78.3 vs 10.4 ms (7.6×), 8 192 rows 623.8 vs 74.2 ms (8.4×). On a
-**single** candidate the device loses (0.2–0.5×): 266 sequential launches
-cannot be amortised over one block, which is why the arm is only ever reached
-through the batched search.
+The device is slower than the CPU arm at 5 000 rows and about 1.7× faster from 20 000 rows. The arm is only reached through the batched search; a single-candidate batch is not measured.
 
 The cost model in `src/fit.rs` is per candidate:
 
 ```text
-cpu_s = START_S + sweeps·p·6·CPU_EVAL_ROW_S·n
+cpu_s = START_S + sweeps·p·6·CPU_PROBE_FRACTION·CPU_EVAL_ROW_S·n
 gpu_s = START_S + calls·GPU_CALL_S + sweeps·ROUNDS·p·GPU_SCAN_ROW_S·n
 calls = 2 + sweeps·(ROUNDS + 1)
-START_S = 1.5e-4, CPU_EVAL_ROW_S = 2.46e-8, GPU_CALL_S = 8.2e-7, GPU_SCAN_ROW_S = 5.0e-10
+START_S = 1.5e-4, CPU_PROBE_FRACTION = 0.45, CPU_EVAL_ROW_S = 9.0e-9, GPU_CALL_S = 8.2e-7, GPU_SCAN_ROW_S = 5.0e-10
 ```
 
 Every coordinate of a candidate rides in **one** call, so the device term scales
 with `p` per row but not per call, and the modelled speed-up grows with `p`. The
 one-call packing matters: six separately synchronised `cudaMemcpy` calls per
 round were most of the latency before the request buffer was packed into a
-single upload (`rc_max_scan_batch`). The admission floor is **512 rows** — above
-the measured crossover, where the model predicts a speed-up for every `p = 1..=20`
-and the measurement shows at least 3.9× at the search's batch size.
+single upload (`rc_max_scan_batch`). The CPU terms were re-measured in #733. `coordinate_polish` accepts the first
+improving rung and stops at the first sweep without a gain, so on candidates the
+squared fit has already placed it makes 0.45 of the `sweeps·p·6` score calls of
+the full ladder (1 032 of 2 304 for 24 affine candidates at `--fit-iters 8`,
+pinned by `the_cpu_maximum_polish_makes_the_counted_share_of_the_full_ladder`),
+and a score call costs about 9 ns per row since the column gather of #473. The
+24 pre-fitted candidates of the paired measurement take 49 ms on the CPU
+(`measure_the_cpu_maximum_polish_row_cost`, shared machine, #733), and 25.6 to
+41.8 ms were measured in #719. The device terms give 1.65 ms per candidate at
+5 000 rows against 33 to 39 ms for 24 measured warm. With these CPU terms the
+device wins above about `3 300 / p` rows (3 300 rows for one constant, 165 for
+20), and `maximum_gpu_fit_worthwhile` answers that question per run (`p = 1`).
+`MAXIMUM_GPU_MIN_ROWS = 512` stays the lower bound for both the fit arm and the
+native maximum scorer.
 `maximum_fit_cost(n, p, sweeps)` exposes the model and a unit test pins the
-floor, the monotonicity in `n` and in `p`, and the coefficients' signs.
-
-**Measured end-to-end (three seeds, 20 000 rows, 5 generations, `--pop 60`).**
-CPU `--fit-strategy exact` 9.38 / 3.72 / 8.48 s against the device arm
-2.36 / 2.12 / 2.89 s (1.75–4.0×, the machine is shared so these are
-indicative), with best front error 3.90 / 3.63 / 3.42 against 3.79 / 3.91 /
-3.66 — the fit is kept monotone per candidate, but the search trajectory
-differs, so this is not a quality claim. Fallback share is
-8.6–10.2 %, entirely `non_finite`, `unsupported_plan` and `ill_conditioned`;
-zero `maximum_declined` after the mixed-`p` batch fix (below). This measurement
-predates #288's native maximum scoring, which removes the CPU fitness pass and
-raises the end-to-end share the arm can recover; the fit stage numbers are
-otherwise unchanged.
+floor, the crossover, the monotonicity in `n` and in `p`, and the coefficients' signs.
 
 **Mixed constant counts.** The driver sends one level/interval vector per
 constant of **each** candidate (`plan.order`), not one per slot of the batch's
@@ -3368,15 +3356,16 @@ hysteresis band `h = 0.3` so a stage does not oscillate at the crossover.
 `vary` stays CPU until #291; `select`, `archive`, `features`, `pnl`, `io` and
 the exact `refit` are CPU by contract.
 
-A host probe times the host rate. With `--gpu` and a usable device, one device
-probe per process times the scoring rate, the batched fit rate, the H2D and D2H
-bandwidth and the launch overhead on a small resident dataset, and those values
-replace the corpus anchors. Without a device the anchors stay and are labelled
-`anchor`. Every probed term is the median of its timed reps and carries the
-spread of those reps. `--json` under `dispatch.calibration` carries the
-provenance labels (`source`, `device_source`, sample counts), so the result JSON
-stays byte-stable. `--run-manifest` under `dispatch.calibration` adds the
-measured rates, their `spread` and the probe wall time.
+Auto dispatch prices the stages from a pinned calibration (#733), not from a
+timing taken in the run: the file written by `rcsr calibrate` (the scoring rate,
+the batched fit rate, the H2D and D2H bandwidth, the launch overhead and the host
+rates, each the median of its timed reps with the spread of those reps), else the
+fixed corpus anchors, labelled `anchor`. `--calibration anchors|probe|<path>`
+selects the source; `probe` keeps the per-process timing and routes can then
+differ between processes. `--json` under `dispatch.calibration` carries the
+provenance labels (`source`, `file_path`, `file_sha256`, `device_source`, sample
+counts). `--run-manifest` under `dispatch.calibration` adds the rates, their
+`spread` and the probe wall time. See `docs/dispatch.md`.
 The per-stage `dispatch.route_ledger` carries `route`, `reason`, `calls`,
 `candidates`, `predicted_s`, `actual_s`, `actual_over_predicted`, `bytes` and
 `switches`.
@@ -3394,10 +3383,10 @@ their measured crossovers.
 `--dispatch auto|device` (default `auto`, `Config.dispatch`) controls the timing
 comparison only. `device` routes every stage that is not refused and not CPU by
 contract to the device with reason `forced`; a `split_fraction` still splits.
-It needs `--gpu` (exit 2 otherwise). Under `compute-sanitizer` the device is
-many times slower, so `auto` routes every stage to the CPU and no kernel
-launches: sanitizer runs pass `--dispatch device`, and GPU test helpers set
-`DispatchMode::Device`. When `auto` keeps every stage on the CPU, the run
+It needs `--gpu` (exit 2 otherwise). With the pinned calibration `auto` routes the
+same under `compute-sanitizer` as natively, so a sanitizer run launches the
+kernels of the native run. `--dispatch device` stays the explicit override, and
+GPU test helpers that must force the device set `DispatchMode::Device`. When `auto` keeps every stage on the CPU, the run
 reports `backend_reason` `dispatch: cost model kept every stage on the cpu`.
 
 The memcheck pass is defined by `my-version/tests/sanitizer.plan` and run by `verksted/_tools/sanitize-all.sh`. Each line names a binary and a test (or `*`), a mode and a reason. `skip` runs nothing. `api-errors-no` runs that one test alone with `--report-api-errors no`, because it provokes a `cudaMalloc` out-of-memory on purpose and the default reports that call as an error. The runner exports `RCSR_UNDER_SANITIZER=memcheck`; a test reads it through `tests/common/sanitizer.rs` (`active()`, `pick(native, sanitized)`) to pick a smaller fixture that still crosses every chunk, tile and gap boundary. Every run is capped at 580 s; a run that hits the cap fails as `budget`. `tests/sanitizer_plan.rs` fails when the plan names a binary or test that does not exist.
