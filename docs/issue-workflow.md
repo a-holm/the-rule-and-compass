@@ -325,9 +325,9 @@ Rules:
 * Ticket tests are minimal: only the tests a change adds or touches. The one
   full test (gate plus large-store arms) runs once on the integration branch,
 
-* **Stable tests.** A test that can pass or fail on the same code tests nothing. `my-version/tests/test_hygiene.rs` enforces two rules over `tests/` and `src/`. R1: no `set_var` or `remove_var` call anywhere (a process-wide environment change races with other test threads and leaks into spawned children). R2: no `Instant::now` or `.elapsed()` inside a `#[test]` without `#[ignore`; a measurement goes into an `#[ignore = "..."]` test or `rcsr-bench`. A function that must break a rule is listed in `my-version/tests/hygiene-allow.txt` as `<path>:<fn> <reason>`; an entry that matches nothing fails the check.
-  after all issues are done.
 
+
+* **Stable tests.** A test that can pass or fail on the same code tests nothing. `my-version/tests/test_hygiene.rs` enforces two rules over `tests/` and `src/`. R1: no `set_var` or `remove_var` call anywhere (a process-wide environment change races with other test threads and leaks into spawned children). R2: no `Instant::now` or `.elapsed()` inside a `#[test]` without `#[ignore`; a measurement goes into an `#[ignore = "..."]` test or `rcsr-bench`. A function that must break a rule is listed in `my-version/tests/hygiene-allow.txt` as `<path>:<fn> <reason>`; an entry that matches nothing fails the check.
 * **Never point several worktrees at one `CARGO_TARGET_DIR`.** Cargo's
   fingerprints do not distinguish two checkouts of the same crate and version,
   so a build can link an artifact produced from a *different* source tree. This
