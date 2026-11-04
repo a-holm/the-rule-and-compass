@@ -5,4 +5,3 @@ tests/panel_gpu.rs:large_block_hash_is_equal_cpu_gpu_cold_warm_and_across_block_
 tests/gpu_parity.rs:chunk_rows_and_store_grouping_do_not_change_a_byte prints the time; no assertion reads it
 src/search.rs:device_nonfinite_is_checked_before_promotion passes a run-clock origin to GpuSearch::new; no assertion reads time
 src/search.rs:device_trade_floor_inf_is_checked_before_promotion passes a run-clock origin to GpuSearch::new; no assertion reads time
-tests/no_python.rs:gone stale on purpose
