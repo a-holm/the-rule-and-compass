@@ -41,7 +41,7 @@ fn resume(cache: &Path, path: &Path, extra: &[&str]) -> Output {
 
 fn calibrate(cache: &Path, file: &Path) {
     let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
-        .args(["calibrate", "--cpu", "--out"])
+        .args(["calibrate", "--cpu", "--no-enrich", "--out"])
         .arg(file)
         .env("XDG_CACHE_HOME", cache)
         .output()
