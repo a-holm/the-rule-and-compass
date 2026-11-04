@@ -65,6 +65,8 @@ file measured on another device than the one the run uses exits 2 naming both
 devices. A CPU run, or a build without `--features cuda`, reads the host terms
 only and keeps the anchors for the device terms.
 
+A checkpoint records `config calibration_source` (`anchors`, `probe` or `file`) and, for a file, `config calibration_sha256`. Neither line is part of the config hash. `--resume` exits 2 when the resolved source or the file hash differs from the record, naming both. A checkpoint without the lines (an older binary) resumes only with an explicit `--calibration`, and the run prints a `# resume:` notice. A `probe` run is not reproducible, so it resumes only with `--calibration probe`, also with a notice.
+
 `rcsr calibrate [--out <path>] [--gpu | --cpu]` is the only writer. It runs
 `Calibration::probe()` (host, median of 31 reps) and `dispatch_gpu::measure()`
 (device) and writes the file atomically (a sibling temporary file, `fsync`, then

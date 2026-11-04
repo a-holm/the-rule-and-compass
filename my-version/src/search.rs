@@ -6096,6 +6096,7 @@ fn snapshot(
         backend,
         config_hash: crate::checkpoint::config_hash(cfg),
         refit_band_unknown: false,
+        calibration_record: Some(crate::checkpoint::CalibrationRecord::of(&cfg.calibration)),
         generations: gens_done,
         stopped_early,
         best_prev,
@@ -7568,6 +7569,16 @@ fn run_search(
                 "checkpoint search settings do not match ({})",
                 diff.join(", ")
             ));
+        }
+        if let Some(saved) = &cp.calibration_record {
+            let now = crate::checkpoint::CalibrationRecord::of(&cfg.calibration);
+            if *saved != now {
+                return Err(format!(
+                    "cannot resume: the checkpoint was written with calibration {} but this run uses {}",
+                    saved.describe(),
+                    now.describe()
+                ));
+            }
         }
         if cfg.generations < cp.config.generations || cfg.generations < cp.generations {
             return Err(format!(

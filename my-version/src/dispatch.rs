@@ -1503,6 +1503,15 @@ pub struct FileOrigin {
 }
 
 impl CalibrationSource {
+    /// `anchors`, `probe` or `file`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            CalibrationSource::Anchors => "anchors",
+            CalibrationSource::Probe => "probe",
+            CalibrationSource::File(_) => "file",
+        }
+    }
+
     /// The origin to record in the JSON and the manifest.
     pub fn origin(&self) -> Option<FileOrigin> {
         match self {

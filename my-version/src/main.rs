@@ -888,6 +888,10 @@ SEARCH:
                              then differ between processes. The source and the
                              file sha256 are in --json dispatch.calibration and
                              --run-manifest
+                             A checkpoint records the source (and the file
+                             sha256); --resume exits 2 when this run resolves
+                             another one, and needs --calibration for a
+                             checkpoint from an older binary or a probe run
   --no-gpu                   force CPU evaluation (alias --cpu); also the
                              reproducibility escape hatch for a byte-identical
                              CPU trajectory
@@ -3933,6 +3937,40 @@ fn main() {
             std::process::exit(EXIT_USAGE);
         }
     };
+    // #733: a resumed run must price with the calibration the run started with.
+    if let Some(cp) = &resume_checkpoint {
+        let now = rcsr::checkpoint::CalibrationRecord::of(&cfg.calibration);
+        match &cp.calibration_record {
+            None if calibration_request == rcsr::dispatch::CalibrationRequest::Default => {
+                eprintln!(
+                    "error: --resume has no saved calibration source (written by an older binary), so the routes it used are unknown"
+                );
+                eprintln!("  pass --calibration <anchors|probe|PATH> to choose the source for the resumed run");
+                std::process::exit(EXIT_USAGE);
+            }
+            None => eprintln!(
+                "# resume: checkpoint has no saved calibration source; using --calibration {}",
+                now.describe()
+            ),
+            Some(saved) if *saved != now => {
+                eprintln!(
+                    "error: --resume was written with calibration {} but this run uses {}",
+                    saved.describe(),
+                    now.describe()
+                );
+                if saved.source == "probe" {
+                    eprintln!("  a probe run is not reproducible; pass --calibration probe to resume it");
+                } else {
+                    eprintln!("  pass the same --calibration (the file must have the same sha256)");
+                }
+                std::process::exit(EXIT_USAGE);
+            }
+            Some(saved) if saved.source == "probe" => eprintln!(
+                "# resume: --calibration probe times this process again, so its routes need not match the earlier run"
+            ),
+            Some(_) => {}
+        }
+    }
 
     // User-defined building blocks (issue #10). The definitions are parsed
     // before the data so a syntax error is reported as a usage error; the

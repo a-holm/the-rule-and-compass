@@ -169,7 +169,36 @@ impl ErrorKind {
 }
 
 /// A complete, resumable search state.
+/// #733: where a run took its dispatch rates from, as a checkpoint records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CalibrationRecord {
+    /// `anchors`, `probe` or `file`.
+    pub source: String,
+    /// sha256 of the calibration file, for `file`.
+    pub sha256: Option<String>,
+}
+
+impl CalibrationRecord {
+    pub fn of(source: &crate::dispatch::CalibrationSource) -> Self {
+        CalibrationRecord {
+            source: source.label().to_string(),
+            sha256: source.origin().map(|o| o.sha256),
+        }
+    }
+
+    /// `anchors`, `probe` or `file <sha256>`, for messages.
+    pub fn describe(&self) -> String {
+        match &self.sha256 {
+            Some(h) => format!("{} {}", self.source, h),
+            None => self.source.clone(),
+        }
+    }
+}
+
 pub struct Checkpoint {
+    /// #733: the calibration the run used, or `None` for a file written by an
+    /// older binary. A resume must then name the source.
+    pub calibration_record: Option<CalibrationRecord>,
     /// #495: true when the file has no `config refit_band` line, so the band
     /// of the run that wrote it is unknown. A resume must then name the band.
     pub refit_band_unknown: bool,
@@ -510,13 +539,14 @@ pub fn config_hash(cfg: &Config) -> u64 {
 }
 
 /// Hash a canonical configuration block, excluding the `generations` budget
-/// line (see [`config_hash`]).
+/// line (see [`config_hash`]) and the #733 calibration records, which a resume
+/// checks against the resolved source instead.
 pub fn hash_config_text(text: &str) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut h = OFFSET;
     for line in text.lines() {
-        if line.starts_with("config generations ") {
+        if line.starts_with("config generations ") || line.starts_with("config calibration_") {
             continue;
         }
         for &b in line.as_bytes() {
@@ -999,6 +1029,10 @@ impl Checkpoint {
 
         let config = build_config(&config_fields)?;
         let refit_band_unknown = !config_fields.contains_key("refit_band");
+        let calibration_record = config_fields.get("calibration_source").map(|s| CalibrationRecord {
+            source: s.clone(),
+            sha256: config_fields.get("calibration_sha256").cloned(),
+        });
         let computed_hash = if refit_band_unknown {
             let text = config_canonical(&config);
             let legacy: String = text
@@ -1165,6 +1199,7 @@ impl Checkpoint {
             backend,
             config_hash: computed_hash,
             refit_band_unknown,
+            calibration_record,
             generations,
             stopped_early,
             best_prev,
@@ -1417,6 +1452,8 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "fit_rows",      // #116: missing means 0 (off)
         "fit_fallback_max", // #255: missing means the default bound
         "refit_band",       // #495: missing means unknown, a resume must name the band
+        "calibration_source", // #733: missing means unknown, a resume must name the source
+        "calibration_sha256", // #733
         "qd_bins",       // #120
         "qd_cell_cap",   // #120
         "qd_cvt",        // #120
@@ -1901,6 +1938,11 @@ fn write_config(cfg: &Config, out: &mut String) {
     writeln!(out, "config fit_rows {}", cfg.fit_rows).unwrap(); // #116
     writeln!(out, "config fit_fallback_max {}", cfg.fit_fallback_max).unwrap(); // #255
     writeln!(out, "config refit_band {}", encode_f64(cfg.refit_band)).unwrap(); // #495
+    // #733: not part of the config hash.
+    writeln!(out, "config calibration_source {}", cfg.calibration.label()).unwrap();
+    if let Some(o) = cfg.calibration.origin() {
+        writeln!(out, "config calibration_sha256 {}", o.sha256).unwrap();
+    }
     // #122: absent means auto (the historical path for every old checkpoint).
     writeln!(out, "config variation {}", cfg.variation.as_str()).unwrap();
     writeln!(out, "config dedup {}", cfg.dedup).unwrap();
