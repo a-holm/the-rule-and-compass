@@ -17,6 +17,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "launch_guard.h"
 #include "alloc_guard.h"
 #include <math.h>
 #include <stdint.h>
@@ -276,7 +277,7 @@ int rc_pnl_eval(void *opaque,
     for (long long lo = 0; lo < ctx->n; lo += chunk_rows) {
         long long hi = lo + chunk_rows;
         if (hi > ctx->n) hi = ctx->n;
-        pnl_kernel<<<candidates, threads>>>(ctx->d_returns,
+        rc_launch("pnl_kernel", pnl_kernel, candidates, threads, 0, 0, ctx->d_returns,
                                             ctx->d_groups,
                                             ctx->d_scores,
                                             ctx->d_thr,
@@ -444,8 +445,7 @@ static int rc_pnl_select_rank(const unsigned int *d_keys,
             (shift >= 24) ? 0u : (0xffffffffu << (shift + 8));
         cudaError_t err = cudaMemset(d_hist, 0, 256 * sizeof(unsigned int));
         if (err != cudaSuccess) return 2;
-        rc_pnl_hist_kernel<<<blocks, threads>>>(
-            d_keys, key_count, shift, keep_mask, prefix, d_hist);
+        rc_launch("rc_pnl_hist_kernel", rc_pnl_hist_kernel, blocks, threads, 0, 0, d_keys, key_count, shift, keep_mask, prefix, d_hist);
         err = cudaGetLastError();
         if (err != cudaSuccess) return 3;
         err = cudaMemcpy(h_hist, d_hist, 256 * sizeof(unsigned int),
@@ -512,7 +512,7 @@ extern "C" int rc_threshold_select_f32_threads(const float *scores,
 
     {
         const int blocks = (int)((n + threads - 1) / threads);
-        rc_pnl_key_kernel<<<blocks, threads>>>(d_scores, n, d_keys, d_finite);
+        rc_launch("rc_pnl_key_kernel", rc_pnl_key_kernel, blocks, threads, 0, 0, d_scores, n, d_keys, d_finite);
         err = cudaGetLastError();
         if (err != cudaSuccess) { status = 10; goto done; }
     }
@@ -630,7 +630,7 @@ extern "C" int rc_valid_mask_f32(const float *scores,
     if (err != cudaSuccess) { status = 7; goto done; }
     {
         const int blocks = (int)((n + RC_PNL_THREADS - 1) / RC_PNL_THREADS);
-        rc_pnl_mask_kernel<<<blocks, RC_PNL_THREADS>>>(d_scores, d_targets, n,
+        rc_launch("rc_pnl_mask_kernel", rc_pnl_mask_kernel, blocks, RC_PNL_THREADS, 0, 0, d_scores, d_targets, n,
                                                        d_words);
         err = cudaGetLastError();
         if (err != cudaSuccess) { status = 8; goto done; }
@@ -884,7 +884,7 @@ int rc_band_scan(const double *scores,
         const int blocks = rc_scan_blocks(chains, threads);
         for (long long lo = 0; lo < n; lo += chunk_rows) {
             long long hi = n - lo > chunk_rows ? lo + chunk_rows : n;
-            rc_band_chain_kernel<<<blocks, threads>>>(d_scores, d_returns, d_offsets, d_thr,
+            rc_launch("rc_band_chain_kernel", rc_band_chain_kernel, blocks, threads, 0, 0, d_scores, d_returns, d_offsets, d_thr,
                                                       d_band, groups, states, n, chains, side,
                                                       lo, hi, d_state, d_reward, d_pos);
             if (cudaGetLastError() != cudaSuccess) {
@@ -958,7 +958,7 @@ int rc_dp_scan(const double *returns,
         const int blocks = rc_scan_blocks(chains, threads);
         for (long long lo = 0; lo < n; lo += chunk_rows) {
             long long hi = n - lo > chunk_rows ? lo + chunk_rows : n;
-            rc_dp_chain_kernel<<<blocks, threads>>>(d_returns, d_offsets, groups, side, lo, hi,
+            rc_launch("rc_dp_chain_kernel", rc_dp_chain_kernel, blocks, threads, 0, 0, d_returns, d_offsets, groups, side, lo, hi,
                                                     d_values);
             if (cudaGetLastError() != cudaSuccess) {
                 status = 5;

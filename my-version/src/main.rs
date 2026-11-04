@@ -845,7 +845,11 @@ SEARCH:
                              allocates once, keeps a <=64 MiB pinned staging
                              ring and copies on separate streams; set
                              RCSR_GPU_SYNC=1 to force the labelled blocking
-                             fallback (#285)
+                             fallback (#285). Every kernel launch
+                             checks its pointer arguments and refuses a launch
+                             that gets host memory (the run takes the usual
+                             device-failure path); RCSR_DEVICE_PTR_CHECK=0
+                             turns the check off (#744)
   --gpu-memory <size>        cap the device memory the run may plan on (bytes, or
                              KiB/MiB/GiB/GB; default min(10.5 GiB, free - 1 GiB)).
                              The plan runs before the first allocation. When

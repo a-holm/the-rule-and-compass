@@ -29,6 +29,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "launch_guard.h"
 #include "alloc_guard.h"
 #include "cub_guard.h"
 #include <math.h>
@@ -229,6 +230,66 @@ typedef struct RcPrepDev {
     long long in_step;
     long long out_step;
 } RcPrepDev;
+
+template <>
+struct RcArgCheck<RcPrepDev> {
+    static bool ok(const RcPrepDev &v)
+    {
+        return rc_dev_ok(v.d_bucket_lo)
+               && rc_dev_ok(v.d_emit)
+               && rc_dev_ok(v.d_out_at)
+               && rc_dev_ok(v.d_run_lo)
+               && rc_dev_ok(v.d_s_chain)
+               && rc_dev_ok(v.d_s_close)
+               && rc_dev_ok(v.d_s_complete)
+               && rc_dev_ok(v.d_s_high)
+               && rc_dev_ok(v.d_s_index)
+               && rc_dev_ok(v.d_s_low)
+               && rc_dev_ok(v.d_s_open)
+               && rc_dev_ok(v.d_s_quote_volume)
+               && rc_dev_ok(v.d_s_seg)
+               && rc_dev_ok(v.d_s_taker_buy_base)
+               && rc_dev_ok(v.d_s_taker_buy_quote)
+               && rc_dev_ok(v.d_s_time)
+               && rc_dev_ok(v.d_s_traded)
+               && rc_dev_ok(v.d_s_trades)
+               && rc_dev_ok(v.d_s_volume)
+               && rc_dev_ok(v.d_o_chain)
+               && rc_dev_ok(v.d_o_close)
+               && rc_dev_ok(v.d_o_cov)
+               && rc_dev_ok(v.d_o_dup_rows)
+               && rc_dev_ok(v.d_o_flags)
+               && rc_dev_ok(v.d_o_gap)
+               && rc_dev_ok(v.d_o_high)
+               && rc_dev_ok(v.d_o_low)
+               && rc_dev_ok(v.d_o_open)
+               && rc_dev_ok(v.d_o_quote_volume)
+               && rc_dev_ok(v.d_o_seg)
+               && rc_dev_ok(v.d_o_taker_buy_base)
+               && rc_dev_ok(v.d_o_taker_buy_quote)
+               && rc_dev_ok(v.d_o_time)
+               && rc_dev_ok(v.d_o_trades)
+               && rc_dev_ok(v.d_o_volume)
+               && rc_dev_ok(v.d_u_chain)
+               && rc_dev_ok(v.d_u_close)
+               && rc_dev_ok(v.d_u_complete)
+               && rc_dev_ok(v.d_u_conflict)
+               && rc_dev_ok(v.d_u_dup_rows)
+               && rc_dev_ok(v.d_u_first_row)
+               && rc_dev_ok(v.d_u_high)
+               && rc_dev_ok(v.d_u_len)
+               && rc_dev_ok(v.d_u_low)
+               && rc_dev_ok(v.d_u_open)
+               && rc_dev_ok(v.d_u_quote_volume)
+               && rc_dev_ok(v.d_u_seg)
+               && rc_dev_ok(v.d_u_taker_buy_base)
+               && rc_dev_ok(v.d_u_taker_buy_quote)
+               && rc_dev_ok(v.d_u_time)
+               && rc_dev_ok(v.d_u_traded)
+               && rc_dev_ok(v.d_u_trades)
+               && rc_dev_ok(v.d_u_volume);
+    }
+};
 
 static RcPrepDev prep_dev(const RcPrep *c)
 {
@@ -883,7 +944,7 @@ RcPrep *rc_prep_create(const long long *times, const double *open,
     {
         int threads = 256;
         int nb = blocks_for(n, threads);
-        rc_prep_iota<<<nb, threads>>>(c->d_iota, n);
+        rc_launch("rc_prep_iota", rc_prep_iota, nb, threads, 0, 0, c->d_iota, n);
     }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -1034,8 +1095,7 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
         return 3;
     }
 
-    rc_prep_gather_sorted<<<nb, threads>>>(
-        c->d_time, c->d_open, c->d_high, c->d_low, c->d_close,
+    rc_launch("rc_prep_gather_sorted", rc_prep_gather_sorted, nb, threads, 0, 0, c->d_time, c->d_open, c->d_high, c->d_low, c->d_close,
         c->d_volume, c->d_quote_volume, c->d_trades,
         c->d_taker_buy_base, c->d_taker_buy_quote, c->d_complete,
         c->d_traded, c->d_chain, c->d_seg_id, c->d_s_index, n,
@@ -1044,7 +1104,7 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
         c->d_s_taker_buy_base, c->d_s_taker_buy_quote, c->d_s_complete,
         c->d_s_traded, c->d_s_chain, c->d_s_seg);
 
-    rc_prep_run_flags<<<nb, threads>>>(c->d_s_time, c->d_s_seg, n, c->d_run_flags);
+    rc_launch("rc_prep_run_flags", rc_prep_run_flags, nb, threads, 0, 0, c->d_s_time, c->d_s_seg, n, c->d_run_flags);
     err = RC_CUB(g_force_cub_fail, cub::DeviceScan::ExclusiveSum(
         c->d_scan_tmp, c->scan_tmp_bytes, c->d_run_flags, c->d_run_of, n));
     if (err != cudaSuccess) {
@@ -1063,9 +1123,9 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
         return 5;
     }
 
-    rc_prep_run_lo<<<nb, threads>>>(c->d_run_of, c->d_run_flags, n, c->d_run_lo);
+    rc_launch("rc_prep_run_lo", rc_prep_run_lo, nb, threads, 0, 0, c->d_run_of, c->d_run_flags, n, c->d_run_lo);
     int ub = blocks_for(c->n_unique, threads);
-    rc_prep_unique<<<ub, threads>>>(prep_dev(c), c->n_unique);
+    rc_launch("rc_prep_unique", rc_prep_unique, ub, threads, 0, 0, prep_dev(c), c->n_unique);
 
     /* Deterministic conflict list: exclusive scan, then scatter. */
     err = rc_cub_status(cub::DeviceScan::ExclusiveSum(
@@ -1082,14 +1142,13 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
     c->n_conflict = conf_tail[0] + conf_tail[1];
     c->last.d2h_bytes += 2ULL * sizeof(int);
     if (c->n_conflict > 0) {
-        rc_prep_conflict_scatter<<<ub, threads>>>(
-            c->d_u_time, c->d_u_chain, c->d_u_seg, c->d_u_dup_rows,
+        rc_launch("rc_prep_conflict_scatter", rc_prep_conflict_scatter, ub, threads, 0, 0, c->d_u_time, c->d_u_chain, c->d_u_seg, c->d_u_dup_rows,
             c->d_u_first_row, c->d_u_len, c->d_u_conflict, c->d_conf_off,
             c->n_unique, c->d_conf_time, c->d_conf_chain, c->d_conf_seg,
             c->d_conf_dup_rows, c->d_conf_first_row, c->d_conf_len);
     }
 
-    rc_prep_bucket_flags<<<ub, threads>>>(c->d_u_time, c->d_u_seg, c->n_unique,
+    rc_launch("rc_prep_bucket_flags", rc_prep_bucket_flags, ub, threads, 0, 0, c->d_u_time, c->d_u_seg, c->n_unique,
                                     c->out_step, c->d_bucket_flags);
     err = rc_cub_status(cub::DeviceScan::ExclusiveSum(
         c->d_scan_tmp, c->scan_tmp_bytes, c->d_bucket_flags, c->d_bucket_of,
@@ -1110,10 +1169,10 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
         return 6;
     }
 
-    rc_prep_bucket_lo<<<ub, threads>>>(c->d_bucket_of, c->d_bucket_flags,
+    rc_launch("rc_prep_bucket_lo", rc_prep_bucket_lo, ub, threads, 0, 0, c->d_bucket_of, c->d_bucket_flags,
                                  c->n_unique, c->d_bucket_lo);
     int bb = blocks_for(n_buckets, threads);
-    rc_prep_emit_flags<<<bb, threads>>>(c->d_u_time, c->d_bucket_lo, n_buckets,
+    rc_launch("rc_prep_emit_flags", rc_prep_emit_flags, bb, threads, 0, 0, c->d_u_time, c->d_bucket_lo, n_buckets,
                                   c->n_unique, in_step, out_step,
                                   keep_partial, c->d_emit);
     err = rc_cub_status(cub::DeviceScan::ExclusiveSum(
@@ -1135,9 +1194,9 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
     }
 
     if (c->n_out > 0) {
-        rc_prep_fold<<<bb, threads>>>(prep_dev(c), n_buckets);
+        rc_launch("rc_prep_fold", rc_prep_fold, bb, threads, 0, 0, prep_dev(c), n_buckets);
         int ob = blocks_for(c->n_out, threads);
-        rc_prep_gap<<<ob, threads>>>(c->d_o_time, c->d_o_chain, c->d_o_seg,
+        rc_launch("rc_prep_gap", rc_prep_gap, ob, threads, 0, 0, c->d_o_time, c->d_o_chain, c->d_o_seg,
                                c->d_o_gap, c->d_o_flags, c->n_out, out_step);
     }
 

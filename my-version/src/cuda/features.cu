@@ -32,6 +32,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "launch_guard.h"
 #include "alloc_guard.h"
 #include <math.h>
 #include <stdint.h>
@@ -153,6 +154,27 @@ typedef struct RcFeatDev {
     const int *d_seg_len;
     double *d_d;
 } RcFeatDev;
+
+template <>
+struct RcArgCheck<RcFeatDev> {
+    static bool ok(const RcFeatDev &v)
+    {
+        return rc_dev_ok(v.d_times)
+               && rc_dev_ok(v.d_open)
+               && rc_dev_ok(v.d_high)
+               && rc_dev_ok(v.d_low)
+               && rc_dev_ok(v.d_close)
+               && rc_dev_ok(v.d_volume)
+               && rc_dev_ok(v.d_qvolume)
+               && rc_dev_ok(v.d_trades)
+               && rc_dev_ok(v.d_tb)
+               && rc_dev_ok(v.d_run_id)
+               && rc_dev_ok(v.d_seg_id)
+               && rc_dev_ok(v.d_seg_start)
+               && rc_dev_ok(v.d_seg_len)
+               && rc_dev_ok(v.d_d);
+    }
+};
 
 static RcFeatDev feat_dev(const RcEnrich *c)
 {
@@ -1027,8 +1049,8 @@ int rc_features_flow_base(void *v)
     FEAT_BEGIN(c);
     int threads = 256;
     int blocks = (c->n + threads - 1) / threads;
-    FEAT_LAUNCH(c, (k_flow_base<<<blocks, threads>>>(d, c->d_feat)));
-    FEAT_LAUNCH(c, (k_flow_state<<<c->nseg, 256>>>(d, c->d_feat)));
+    FEAT_LAUNCH(c, (rc_launch("k_flow_base", k_flow_base, blocks, threads, 0, 0, d, c->d_feat)));
+    FEAT_LAUNCH(c, (rc_launch("k_flow_state", k_flow_state, c->nseg, 256, 0, 0, d, c->d_feat)));
     /* Counted reads: the elementwise base consumed each present optional flow
        column exactly once, independent of the requested output count. */
     if (c->present & RC_PRESENT_TRADES) c->base_reads += 1;
@@ -1048,17 +1070,17 @@ int rc_features_flow_col(void *v, int which, double *out)
     int segs = c->nseg;
     switch (which) {
     case RC_FLOW_VWAP:
-        FEAT_LAUNCH(c, (k_flow_copy<<<rows, 256>>>(c->d_feat + (size_t)RC_FB_VWAP * c->n, c->d_out, c->n)));
+        FEAT_LAUNCH(c, (rc_launch("k_flow_copy", k_flow_copy, rows, 256, 0, 0, c->d_feat + (size_t)RC_FB_VWAP * c->n, c->d_out, c->n)));
         break;
     case RC_FLOW_VWAP20_DEV:
-        FEAT_LAUNCH(c, (k_flow_vwap20<<<rows, 256>>>(d, c->d_out)));
+        FEAT_LAUNCH(c, (rc_launch("k_flow_vwap20", k_flow_vwap20, rows, 256, 0, 0, d, c->d_out)));
         break;
     case RC_FLOW_AVG_TRADE_SIZE96:
     case RC_FLOW_AMIHUD96:
     case RC_FLOW_ZERO_RET_SHARE96:
     case RC_FLOW_OBV_Z96:
     case RC_FLOW_CVD_PROXY:
-        FEAT_LAUNCH(c, (k_flow_roll_single<<<segs, 256>>>(d, c->d_feat, which, c->d_out)));
+        FEAT_LAUNCH(c, (rc_launch("k_flow_roll_single", k_flow_roll_single, segs, 256, 0, 0, d, c->d_feat, which, c->d_out)));
         break;
     case RC_FLOW_TAKER_RATIO96:
     case RC_FLOW_TAKER_IMB16:
@@ -1071,7 +1093,7 @@ int rc_features_flow_col(void *v, int which, double *out)
             : (which == RC_FLOW_VWAP_DEV96 ? c->d_qvolume
                : (which == RC_FLOW_CMF20 ? c->d_feat + (size_t)RC_FB_MFV * n
                   : c->d_tb));
-        FEAT_LAUNCH(c, (k_flow_roll_two<<<segs, 256>>>(d, c->d_feat, which, x1, c->d_volume, c->d_out)));
+        FEAT_LAUNCH(c, (rc_launch("k_flow_roll_two", k_flow_roll_two, segs, 256, 0, 0, d, c->d_feat, which, x1, c->d_volume, c->d_out)));
         break;
     }
     default:
@@ -1090,9 +1112,9 @@ int rc_features_price_base(void *v)
     FEAT_BEGIN(c);
     int threads = 256;
     int blocks = (c->n + threads - 1) / threads;
-    FEAT_LAUNCH(c, (k_price_base<<<blocks, threads>>>(d, c->d_feat)));
+    FEAT_LAUNCH(c, (rc_launch("k_price_base", k_price_base, blocks, threads, 0, 0, d, c->d_feat)));
     int seg_blocks = (c->nseg + 127) / 128;
-    FEAT_LAUNCH(c, (k_price_wilder<<<seg_blocks, 128>>>(d, c->d_feat)));
+    FEAT_LAUNCH(c, (rc_launch("k_price_wilder", k_price_wilder, seg_blocks, 128, 0, 0, d, c->d_feat)));
     c->base_passes += 2;
     FEAT_END(c);
 }
@@ -1110,13 +1132,13 @@ int rc_features_price_col(void *v, int which, double *out)
     case RC_PA_CLV16:
     case RC_PA_BODY16:
     case RC_PA_TREND96:
-        FEAT_LAUNCH(c, (k_price_roll<<<segs, 256>>>(d, c->d_feat, which, c->d_out)));
+        FEAT_LAUNCH(c, (rc_launch("k_price_roll", k_price_roll, segs, 256, 0, 0, d, c->d_feat, which, c->d_out)));
         break;
     case RC_PA_RUN8:
-        FEAT_LAUNCH(c, (k_price_run8<<<segs, 128>>>(d, c->d_out)));
+        FEAT_LAUNCH(c, (rc_launch("k_price_run8", k_price_run8, segs, 128, 0, 0, d, c->d_out)));
         break;
     default:
-        FEAT_LAUNCH(c, (k_price_elem<<<rows, 256>>>(d, c->d_feat, which, c->d_out)));
+        FEAT_LAUNCH(c, (rc_launch("k_price_elem", k_price_elem, rows, 256, 0, 0, d, c->d_feat, which, c->d_out)));
         break;
     }
     FEAT_DOWNLOAD(c, out);

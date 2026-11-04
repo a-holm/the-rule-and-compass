@@ -2255,10 +2255,7 @@ Plan and status:
    evaluation share 273 GB/s; hand off between them rather than running both
    flat out.
 
-The expected gain over an optimised AVX-512 CPU implementation of the same
-evaluation is **10–40×** (reported figures for this style of workload range from
-~18× to ~40×; the 201–1 678× measured above is against a much slower
-single-threaded reference), rising further with row tiling and CUDA graphs.
+The 201–1 678× measured above is against a single-threaded reference interpreter, not an optimised AVX-512 CPU implementation; no such comparison is measured.
 
 ## Persistent batch arena and asynchronous copies (issue #285)
 
@@ -2717,7 +2714,6 @@ the CPU run apart from the backend labels.
 | Exact median selection (odd/even `n`, ties, constant predictions), CPU parity of the polished constants, determinism, fallback labels and the `--no-fit` no-op (#226) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` median tests, `src/fit/median.rs`, `src/fit/gpu.rs`, `tests/gpu_median.rs`) | **verified** (see the #226 section) |
 | Exact maximum and its lowest maximiser (unique/non-unique/ties/all-zero), the exact level interval on an affine coordinate, the exact 1-D minimiser (hand-solved midrange and Chebyshev line), dominance over the start and over the CPU polish, determinism, fallback labels, cost-model floor and the `--no-fit` no-op (#227) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` maximum tests, `src/fit/minimax.rs`, `src/fit/gpu.rs`, `tests/gpu_max.rs`) | **verified** (see the #227 section) |
 | Maximum paired fit stage (CPU ladder vs bisection on the error level) | RTX 3060, `tests/gpu_max.rs` (`measure_paired_maximum_fit`) | **measured on three sample sizes** — warm speedup 0.81× at n=5000, 1.63× at n=20000, 1.68× at n=50000 (24 candidates, `measure_paired_maximum_fit`); one-candidate batches lose (0.2–0.5×) and are never used |
-| Maximum end-to-end (`rcsr --metric maximum --fit-strategy gpu`) | RTX 3060, three seeds, 20k rows (`--fit-iters 8`), 5 generations, pop 60 | **measured on three seeds** — 1.75–4.0× end-to-end (9.38/3.72/8.48 s exact vs 2.36/2.12/2.89 s device), best front error 3.79/3.91/3.66 vs 3.90/3.63/3.42 (trajectory noise, not a quality claim); fit fallbacks 8.6–10.2 %, all `non_finite`/`unsupported_plan`/`ill_conditioned`, zero `maximum_declined`; the fitness is still CPU, so Amdahl caps the gain |
 | `absolute` native `\|r\|` loss in the evaluator and fit kernel, L1/IRLS weights, true-MAE Armijo, parity with CPU IRLS, determinism, zero-residual/ill-conditioned labels, `--no-fit` no-op, metric-aware gate and finalist refit (#222) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`, `src/fit.rs`) | **verified** (see the #222 section) |
 | Exact interquartile window mean (rank `[⌊n/4⌋, ⌊3n/4⌋)`, all rows below `n = 4`, ties at both boundaries, constant predictions, odd/even `n`), CPU parity of the score and of the polished constants, determinism across batch composition, ill-conditioned/declined labels and the `--no-fit` no-op (#232) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` order-statistic tests, `src/fit/interquartile.rs`, `src/fit/gpu.rs`, `tests/gpu_interquartile.rs`) | **verified** (see the #232 section) |
 | Exact order/rank **scoring** entry point (#288): median/IQR/maximum/rank/AUC bit-identical to the CPU for the same prediction vector, AUC integer identity and chance cases, non-binary AUC refusal, `+inf` for non-finite predictions, batch-composition/repeat determinism, gate admission and named row-floor refusals | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` `score_batch_*` and `auc_*` tests, `src/search.rs` gate tests) | **verified** (see the #288 section) |
@@ -3292,21 +3288,15 @@ polish)` and the same string in `backend_reason`. `--no-fit` never enters the
 arm: the evaluator is not created and the archive is identical to the exact
 CPU run, bit for bit.
 
-**Paired measurement (RTX 3060, shared machine, indicative).** 24 affine
-candidates `a·x + b`, `--fit-iters 8`, same squared warm start on both arms:
+**Paired measurement (RTX 3060, #719).** 24 affine candidates `a·x + b` (`p = 2`), `--fit-iters 8`, same squared warm start on both arms, CPU median of 5 runs and device median of 5 warm calls, from the ignored test `cargo test --release --features cuda --test gpu_max -- --ignored --nocapture measure_paired_maximum_fit` (log `/mnt/lager/tmp/rcsr-gates/issue719-test1.log`):
 
-| rows `n` | CPU arm | GPU arm | speed-up |
-|---|---|---|---|
-| 5 000 | 277.9 ms | 48.1 ms | 5.8× |
-| 20 000 | 1 116.3 ms | 123.5 ms | 9.0× |
-| 50 000 | 2 620.6 ms | 287.3 ms | 9.1× |
+| rows `n` | CPU arm | GPU arm cold | GPU arm warm | warm speed-up |
+|---|---|---|---|---|
+| 5 000 | 27.585 ms | 48.839 ms | 33.864 ms | 0.81× |
+| 20 000 | 165.456 ms | 109.207 ms | 101.690 ms | 1.63× |
+| 50 000 | 448.860 ms | 280.227 ms | 266.985 ms | 1.68× |
 
-and at the search's **minimum admitted batch** (32 candidates, `p = 2`, best of
-three): 256 rows 23.4 vs 9.1 ms (2.6×), 512 rows 43.1 vs 10.9 ms (3.95×),
-1 024 rows 78.3 vs 10.4 ms (7.6×), 8 192 rows 623.8 vs 74.2 ms (8.4×). On a
-**single** candidate the device loses (0.2–0.5×): 266 sequential launches
-cannot be amortised over one block, which is why the arm is only ever reached
-through the batched search.
+The device is slower than the CPU arm at 5 000 rows and about 1.7× faster from 20 000 rows. The arm is only reached through the batched search; a single-candidate batch is not measured.
 
 The cost model in `src/fit.rs` is per candidate:
 
@@ -3326,31 +3316,17 @@ improving rung and stops at the first sweep without a gain, so on candidates the
 squared fit has already placed it makes 0.45 of the `sweeps·p·6` score calls of
 the full ladder (1 032 of 2 304 for 24 affine candidates at `--fit-iters 8`,
 pinned by `the_cpu_maximum_polish_makes_the_counted_share_of_the_full_ladder`),
-and a score call costs about 9 ns per row since the column gather of #473 (was
-24.6 ns). The CPU row of the table above (277.9 ms at 5 000 rows) predates both;
-the same 24 pre-fitted candidates now take 49 ms
-(`measure_the_cpu_maximum_polish_row_cost`, shared machine), and 25.6 to
-41.8 ms were measured in #719, while the old coefficients predicted 287 ms. The
-device terms were unchanged: the model gives 1.65 ms per candidate at 5 000
-rows against 33 to 39 ms for 24 measured warm. With the corrected CPU terms the
+and a score call costs about 9 ns per row since the column gather of #473. The
+24 pre-fitted candidates of the paired measurement take 49 ms on the CPU
+(`measure_the_cpu_maximum_polish_row_cost`, shared machine, #733), and 25.6 to
+41.8 ms were measured in #719. The device terms give 1.65 ms per candidate at
+5 000 rows against 33 to 39 ms for 24 measured warm. With these CPU terms the
 device wins above about `3 300 / p` rows (3 300 rows for one constant, 165 for
 20), and `maximum_gpu_fit_worthwhile` answers that question per run (`p = 1`).
 `MAXIMUM_GPU_MIN_ROWS = 512` stays the lower bound for both the fit arm and the
 native maximum scorer.
 `maximum_fit_cost(n, p, sweeps)` exposes the model and a unit test pins the
 floor, the crossover, the monotonicity in `n` and in `p`, and the coefficients' signs.
-
-**Measured end-to-end (three seeds, 20 000 rows, 5 generations, `--pop 60`).**
-CPU `--fit-strategy exact` 9.38 / 3.72 / 8.48 s against the device arm
-2.36 / 2.12 / 2.89 s (1.75–4.0×, the machine is shared so these are
-indicative), with best front error 3.90 / 3.63 / 3.42 against 3.79 / 3.91 /
-3.66 — the fit is kept monotone per candidate, but the search trajectory
-differs, so this is not a quality claim. Fallback share is
-8.6–10.2 %, entirely `non_finite`, `unsupported_plan` and `ill_conditioned`;
-zero `maximum_declined` after the mixed-`p` batch fix (below). This measurement
-predates #288's native maximum scoring, which removes the CPU fitness pass and
-raises the end-to-end share the arm can recover; the fit stage numbers are
-otherwise unchanged.
 
 **Mixed constant counts.** The driver sends one level/interval vector per
 constant of **each** candidate (`plan.order`), not one per slot of the batch's
@@ -3447,5 +3423,14 @@ A kernel never receives host memory. Under HMM addressing a host pointer in a la
 | L2 | a pointer parameter of an exported `rc_*` function that is a launch argument, bare or as `p + k`. Copy the data to a device buffer first. |
 | L3 | a local assigned from `malloc`, `calloc`, `realloc` or `new` that is a launch argument. |
 | L4 | a launch argument naming host staging: an identifier starting with `h_`, `fs_host`, `host`, or `->host`. |
+| L5 | kernel launch syntax (`<<<`) in any file except `launch_guard.h`. Launch through `rc_launch`, see "Checked launches". |
 
 L2 has an allowlist (`ALLOW_L2` in the test) for entry points whose caller passes device memory by contract. Each entry carries a reason, and an entry that matches no launch fails `every_allowlist_entry_is_used`. The lint checks parameters, not data flow: an alias such as `double *p = out;` escapes it. `RCSR_LINT_CUDA_DIR=<dir>` runs the same test against another copy of the sources.
+
+### Checked launches
+
+Every kernel launch in `src/cuda/*.cu` goes through `rc_launch` (`my-version/src/cuda/launch_guard.h`). `rc_launch` calls `cudaPointerGetAttributes` on each pointer argument before the launch and refuses it unless the pointer is NULL, device memory (`type` 2) or managed memory (`type` 3). The test uses `type`, not `devicePointer`: under HMM `devicePointer` is non-NULL for `malloc`, `calloc` and stack memory (`type` 0). Pinned host memory (`type` 1) is refused; a kernel that needs it must add a reviewed `RcArgCheck` specialisation. A by-value struct that carries pointers needs one too (`RwArena`, `RcFeatDev`, `RcPrepDev`); the build fails with a static assertion for a struct without one.
+
+A refused launch runs nothing: `rc_launch` launches the same kernel with zero blocks, which executes no code and leaves `cudaErrorInvalidValue` in the last-error slot. Every call site already reads that slot, so the batch fails like any failed launch. Under an explicit `--gpu` the run exits 6 with `--gpu was requested but the device search failed: CUDA batch evaluation failed` and writes no result file. Under the default Auto dispatch the search reruns on the CPU: the result records `backend` `cpu` with `backend_reason` `CUDA batch evaluation failed`, and its archive hash equals a plain `--cpu` run of the same seed. `tests/gpu_refusal_cli.rs` proves both. The first refusal of each kernel prints `rcsr: refused launch of <kernel>: argument <i> is not device or managed memory` on stderr. Under `compute-sanitizer` a refusal shows as a `cudaErrorInvalidValue` API error, never as an `Invalid __global__` access.
+
+`RCSR_DEVICE_PTR_CHECK=0` turns the check off for the whole process (read once). `RCSR_FORCE_LAUNCH_REFUSAL=<kernel name prefix>` is a test hook (read once, inert when unset) that refuses every launch of the matching kernels; set it on child processes only. It is on by default in every build. `cudaPointerGetAttributes` costs about 120 to 190 ns per pointer argument. `tests/cuda_kernel_args.rs` rule L5 rejects kernel launch syntax outside `launch_guard.h`, and its other rules read `rc_launch` calls as launches. `tests/gpu_launch_guard.rs` covers the accepted and refused argument kinds.

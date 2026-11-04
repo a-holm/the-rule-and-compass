@@ -8,6 +8,9 @@
 
 use rcsr::features_gpu as fg;
 
+#[path = "common/sanitizer.rs"]
+mod sanitizer;
+
 fn assert_registry_tiers() {
     let reg = rcsr::enrich::default_registry();
     for col in fg::FLOW_DEVICE_COLUMNS.iter().chain(fg::PRICE_ACTION_DEVICE_COLUMNS.iter()) {
@@ -158,6 +161,7 @@ fn fused_families_dispatch_only_with_enough_segments() {
 #[cfg(feature = "cuda")]
 mod device {
     use super::fg;
+    use super::sanitizer;
     use rcsr::data;
     use rcsr::enrich::{self, GpuMode, Options};
     use rcsr::enrich_gpu::EnrichGpu;
@@ -330,6 +334,26 @@ mod device {
             | fg::PRESENT_TAKER_BUY_QV
     }
 
+    static FLOOR: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Zeroes the process-wide GPU row floor and restores it on drop. The mutex
+    /// serialises the tests that hold it.
+    struct Floor(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Floor {
+        fn zero() -> Floor {
+            let guard = FLOOR.lock().unwrap_or_else(|e| e.into_inner());
+            enrich::set_gpu_floor_for_tests(0);
+            Floor(guard)
+        }
+    }
+
+    impl Drop for Floor {
+        fn drop(&mut self) {
+            enrich::set_gpu_floor_for_tests(usize::MAX);
+        }
+    }
+
     fn context(rows: &[Row]) -> Option<EnrichGpu> {
         let (ts, o, h, l, c, v, qv, tr, tb, tbq, starts, lens) = flat(rows);
         EnrichGpu::new_with_flow(
@@ -461,8 +485,10 @@ mod device {
         let gpu_out2 = dir.join("gpu2.rcsb").to_string_lossy().into_owned();
         let gpu_out_chunk = dir.join("gpu-chunk.rcsb").to_string_lossy().into_owned();
 
-        let mut all = rows("AAA", 500_000, 0, 120);
-        all.extend(rows("BBB", 500_000, 0, 250_000));
+        let _floor = sanitizer::active().then(Floor::zero);
+        let n = sanitizer::pick(500_000, 140_000);
+        let mut all = rows("AAA", n, 0, 120);
+        all.extend(rows("BBB", n, 0, sanitizer::pick(250_000, 70_000)));
         write_store(&src, &all, 65_536);
 
         let cpu = enrich::build(&opts(&src, &cpu_out, GpuMode::Off, 65_536)).unwrap();
@@ -590,7 +616,7 @@ mod device {
             eprintln!("skipping: no CUDA device");
             return;
         }
-        enrich::set_gpu_floor_for_tests(0);
+        let _floor = Floor::zero();
         let dir = tmp_dir("nr4");
         let src = dir.join("in.rcsb").to_string_lossy().into_owned();
         let cpu_out = dir.join("cpu.rcsb").to_string_lossy().into_owned();
@@ -623,7 +649,44 @@ mod device {
         eprintln!("nr4 bit-exact: {finite} finite rows, {nan} NaN rows, {} rows", a.len());
     }
     #[test]
-    fn fused_cost_is_measured_on_one_million_rows() {
+    fn fused_families_pay_two_base_passes_and_one_download_per_column() {
+        if !rcsr::gpu::probe().available() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        // 109 symbols so segment-parallel consumers dispatch.
+        let n = 400usize;
+        let mut all = Vec::with_capacity(109 * n);
+        for s in 0..109u32 {
+            let sym: &'static str = Box::leak(format!("S{:03}", s).into_boxed_str());
+            all.extend(rows(sym, n, 0, n / 2));
+        }
+        let mut gpu = context(&all).unwrap();
+        let flow: Vec<&str> = fg::FLOW_DEVICE_COLUMNS.iter().map(|c| c.name).collect();
+        let pa: Vec<&str> = fg::PRICE_ACTION_DEVICE_COLUMNS.iter().map(|c| c.name).collect();
+
+        let passes = gpu.base_passes();
+        let bytes = gpu.stats().d2h_bytes;
+        let _ = gpu.flow_all(&flow).unwrap();
+        let _ = gpu.price_action_all(&pa).unwrap();
+        assert_eq!(gpu.base_passes() - passes, 4, "two base kernels per family");
+        assert_eq!(
+            gpu.stats().d2h_bytes - bytes,
+            ((flow.len() + pa.len()) * all.len() * 8) as u64,
+            "one f64 download per requested column"
+        );
+
+        let passes = gpu.base_passes();
+        let bytes = gpu.stats().d2h_bytes;
+        let _ = gpu.flow_all(&[]).unwrap();
+        let _ = gpu.price_action_all(&[]).unwrap();
+        assert_eq!(gpu.base_passes() - passes, 4, "the base reruns once per family call");
+        assert_eq!(gpu.stats().d2h_bytes, bytes, "base-only calls download no column");
+    }
+
+    #[test]
+    #[ignore = "timing measurement; feeds docs/ohlcv.md"]
+    fn measure_fused_cost_on_one_million_rows() {
         if !rcsr::gpu::probe().available() {
             eprintln!("skipping: no CUDA device");
             return;
@@ -676,7 +739,6 @@ mod device {
             }
         }
 
-        let passes_before = gpu.base_passes();
         let t0 = std::time::Instant::now();
         let _ = gpu.flow_all(&flow).unwrap();
         let flow_s = t0.elapsed().as_secs_f64();
@@ -702,23 +764,6 @@ mod device {
             all.len(),
             flow_s * 1e3 / mrow,
             pa_s * 1e3 / mrow
-        );
-        // The declared constants are kernel-time constants; the wall clock also
-        // includes one download per column, which is issue #300's output path.
-        assert!(
-            flow_kernel_ms <= fg::FLOW_COST.base_ms_per_mrow * 4.0
-                + fg::FLOW_COST.column_ms_per_mrow * 12.0 * 4.0,
-            "flow kernel measured {flow_kernel_ms:.3} ms/Mrow"
-        );
-        assert!(
-            pa_kernel_ms <= fg::PRICE_ACTION_COST.base_ms_per_mrow * 4.0
-                + fg::PRICE_ACTION_COST.column_ms_per_mrow * 11.0 * 4.0,
-            "price-action kernel measured {pa_kernel_ms:.3} ms/Mrow"
-        );
-        assert_eq!(
-            gpu.base_passes() - passes_before,
-            4,
-            "two base kernels per family"
         );
     }
 }

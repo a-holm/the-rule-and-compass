@@ -64,8 +64,8 @@ proposal is judged on the exact oriented score, never on SSE or `|rho|` (#231);
 `--metric interquartile` with the middle-50 % window mean of `|r|` (fit and
 native scoring from 4 096 training rows — the measured crossover of the batched
 selection, #226, #232 and #288), and `--metric maximum` fits the Chebyshev
-objective by **exact bisection on the error level** per constant (from 512
-training rows — the measured cost-model floor, #227) and is scored natively by
+objective by **exact bisection on the error level** per constant (floor 512
+training rows; the cost model puts the device ahead above about 3 300 / p rows for p constants, #227, #733) and is scored natively by
 the #287 maximum reducer. An explicit `gpu` with a metric that has no device fit
 objective is a usage error, because the kernel would otherwise fit a different
 loss; use `--metric squared`, `--metric log_squashed`, `--metric absolute`,
@@ -1195,8 +1195,8 @@ proposal is judged on the exact oriented score, never on SSE or `|rho|` (#231);
 `--metric interquartile` with the middle-50 % window mean of `|r|` (fit and
 native scoring from 4 096 training rows — the measured crossover of the batched
 selection, #226, #232 and #288), and `--metric maximum` fits the Chebyshev
-objective by **exact bisection on the error level** per constant (from 512
-training rows — the measured cost-model floor, #227) and is scored natively by
+objective by **exact bisection on the error level** per constant (floor 512
+training rows; the cost model puts the device ahead above about 3 300 / p rows for p constants, #227, #733) and is scored natively by
 the #287 maximum reducer. An explicit `gpu` with a metric that has no device fit
 objective is a usage error, because the kernel would otherwise fit a different
 loss; use `--metric squared`, `--metric log_squashed`, `--metric absolute`,
@@ -1320,6 +1320,7 @@ device must exist (exit 2 otherwise), `--no-gpu`/`--cpu` forces the CPU, and
 with the backend, device, available threads and training rows/columns, and
 `--json` records `backend`, `backend_reason` and `device`.
 `RCSR_FIT_RECORD=<empty dir>` records every device fit launch for `rcsr-gpu-bench --fit-replay` (see `docs/gpu-backend.md`, "Comparing toolkits and fit kernel variants").
+`RCSR_DEVICE_PTR_CHECK=0` turns off the per-launch pointer check (#744): by default every kernel launch refuses an argument that is host memory (see `docs/gpu-backend.md`, "Kernel arguments are device memory").
 
 The kernel scores the configured metric natively through the #287
 `Metric -> ScoreDispatch` table. The objective kernel covers `squared`,

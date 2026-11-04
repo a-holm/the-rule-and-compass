@@ -29,6 +29,9 @@ const ALLOW_L2: &[(&str, &str, &str)] = &[
     ("rc_tail_exotic", "*", TAIL_REASON),
 ];
 
+/// The only file that may contain kernel launch syntax.
+const GUARD_HEADER: &str = "launch_guard.h";
+
 const TAIL_REASON: &str = "called only from enrich.cu with c->d_* fields and rc_checked_malloc scratch; no Rust declaration exists";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -286,6 +289,53 @@ fn find_launches(t: &[u8]) -> Vec<Launch> {
         }
         i += 1;
     }
+    out.extend(find_rc_launches(t));
+    out
+}
+
+/// `rc_launch(name, kernel, grid, block, smem, stream, args...)` calls; the
+/// kernel argument may carry template arguments with commas.
+fn find_rc_launches(t: &[u8]) -> Vec<Launch> {
+    let mut out = Vec::new();
+    let key = b"rc_launch";
+    let mut i = 0;
+    while i + key.len() < t.len() {
+        let hit = &t[i..i + key.len()] == key
+            && (i == 0 || !is_ident(t[i - 1]))
+            && t[i + key.len()..].iter().find(|c| !c.is_ascii_whitespace()) == Some(&b'(');
+        if !hit {
+            i += 1;
+            continue;
+        }
+        let open = i + key.len() + t[i + key.len()..].iter().position(|&c| c == b'(').unwrap();
+        let Some(close) = match_close(t, open, b'(', b')') else {
+            i += 1;
+            continue;
+        };
+        let inner = String::from_utf8_lossy(&t[open + 1..close]).to_string();
+        let Some(comma) = inner.find(',') else {
+            i = close;
+            continue;
+        };
+        let rest = &inner[comma + 1..];
+        let start = rest.len() - rest.trim_start().len();
+        let kb = rest.as_bytes();
+        let mut k = start;
+        while k < kb.len() && is_ident(kb[k]) {
+            k += 1;
+        }
+        let mut e = k;
+        while e < kb.len() && kb[e].is_ascii_whitespace() {
+            e += 1;
+        }
+        if e < kb.len() && kb[e] == b'<' {
+            k = match_close(kb, e, b'<', b'>').map_or(kb.len(), |c| c + 1);
+        }
+        let tail = rest[k..].trim_start().strip_prefix(',').unwrap_or("");
+        let args = split_top(tail).into_iter().skip(4).collect();
+        out.push(Launch { pos: i, args });
+        i = close;
+    }
     out
 }
 
@@ -437,6 +487,20 @@ fn lint_sources(files: &[(String, String)], allow: &[(&str, &str, &str)]) -> Rep
     let mut findings = Vec::new();
     let mut used_allow = BTreeSet::new();
     for (file, t) in &cleaned {
+        if file == GUARD_HEADER {
+            continue;
+        }
+        let mut at = 0;
+        while let Some(off) = t[at..].windows(3).position(|w| w == b"<<<") {
+            findings.push(Finding {
+                rule: "L5",
+                file: file.clone(),
+                line: line_of(t, at + off),
+                func: String::new(),
+                what: format!("raw kernel launch syntax; use rc_launch ({GUARD_HEADER})"),
+            });
+            at += off + 3;
+        }
         let flat = blank_preprocessor(t);
         let funcs = find_functions(&flat);
         let launches = find_launches(t);
@@ -600,27 +664,51 @@ fn each_rule_fires_on_its_snippet() {
 
     // L2
     let l2_bad = "extern \"C\" int rc_run(double *out, int n) {\n\
-                  k<<<1, 32>>>(out + 4, n);\n return 0; }\n__global__ void k(double *o, int n) { o[0] = n; }\n";
+                  rc_launch(\"k\", k, 1, 32, 0, 0, out + 4, n);\n return 0; }\n__global__ void k(double *o, int n) { o[0] = n; }\n";
     assert_eq!(rules(l2_bad), ["L2"]);
     let l2_ok = "extern \"C\" int rc_run(double *out, int n) {\n\
                  double *d = 0; cudaMalloc((void **)&d, 8);\n\
-                 k<<<1, 32>>>(d, n);\n cudaMemcpy(out, d, 8, cudaMemcpyDeviceToHost);\n return 0; }\n\
+                 rc_launch(\"k\", k, 1, 32, 0, 0, d, n);\n cudaMemcpy(out, d, 8, cudaMemcpyDeviceToHost);\n return 0; }\n\
                  __global__ void k(double *o, int n) { o[0] = n; }\n";
     assert!(rules(l2_ok).is_empty());
 
     // L3
     let l3_bad = "static void f(int n) {\n double *p = (double *)malloc(8 * n);\n\
-                  k<<<1, 32>>>(p, n);\n}\n";
+                  rc_launch(\"k\", k, 1, 32, 0, 0, p, n);\n}\n";
     assert_eq!(rules(l3_bad), ["L3"]);
     let l3_ok = "static void f(int n) {\n double *p = (double *)rc_checked_malloc(8 * n);\n\
-                 k<<<1, 32>>>(p, n);\n}\n";
+                 rc_launch(\"k\", k, 1, 32, 0, 0, p, n);\n}\n";
     assert!(rules(l3_ok).is_empty());
 
     // L4
-    let l4_bad = "static void f(int n, Ring *r) {\n k<<<1, 32>>>(r->h_stage, n);\n}\n";
+    let l4_bad = "static void f(int n, Ring *r) {\n rc_launch(\"k\", k, 1, 32, 0, 0, r->h_stage, n);\n}\n";
     assert_eq!(rules(l4_bad), ["L4"]);
-    let l4_ok = "static void f(int n, Ring *r) {\n k<<<1, 32>>>(r->d_stage, n);\n}\n";
+    let l4_ok = "static void f(int n, Ring *r) {\n rc_launch(\"k\", k, 1, 32, 0, 0, r->d_stage, n);\n}\n";
     assert!(rules(l4_ok).is_empty());
+
+    // L5
+    let l5_bad = "static void f(int n) {\n k<<<1, 32>>>(d, n);\n}\n";
+    assert_eq!(rules(l5_bad), ["L5"]);
+    let l5_ok = "static void f(int n) {\n rc_launch(\"k\", k, 1, 32, 0, 0, d, n);\n}\n";
+    assert!(rules(l5_ok).is_empty());
+}
+
+#[test]
+fn rc_launch_arguments_follow_the_rules() {
+    // Template kernel arguments carry commas; the launch arguments start after them.
+    let bad = "static void f(int n, Ring *r) {\n\
+               rc_launch(\"k<A, B>\", k<A, B>, 1, 32, 0, 0, r->h_stage, n);\n}\n";
+    assert_eq!(rules(bad), ["L4"]);
+    let ok = "static void f(int n, Ring *r) {\n\
+              rc_launch(\"k<A, B>\", k<A, B>, nb, 32, 0, s, r->d_stage, n);\n}\n";
+    assert!(rules(ok).is_empty());
+    // The grid and block arguments are not launch arguments.
+    let cfg = "static void f(Ring *r) {\n rc_launch(\"k\", k, r->h_n, 32, 0, 0, r->d_a);\n}\n";
+    assert!(rules(cfg).is_empty());
+    // L2 follows pointer parameters through rc_launch.
+    let l2 = "extern \"C\" int rc_run(double *out, int n) {\n\
+              rc_launch(\"k\", k, 1, 32, 0, 0, out + 4, n);\n return 0; }\n";
+    assert_eq!(rules(l2), ["L2"]);
 }
 
 #[test]
@@ -630,17 +718,17 @@ fn lint_parses_launch_shapes() {
                static void f(Ring *r) {\n\
                // k<<<1, 1>>>(r->h_x);\n\
                const char *s = \"k<<<1, 1>>>(h_y)\";\n\
-               LAUNCH(c, (k<<<1, 32>>>(r->d_a,\n\
+               LAUNCH(c, (rc_launch(\"k\", k, 1, 32, 0, 0, r->d_a,\n\
                                        r->h_pinned)));\n}\n";
     let found = one(src);
     assert_eq!(found.len(), 1, "{}", render(&found));
     assert_eq!((found[0].rule, found[0].line), ("L4", 5));
 
     // A launch outside any function body is reported, not skipped.
-    assert_eq!(rules("LAUNCH(k<<<1, 32>>>(a));\n"), ["parse"]);
+    assert_eq!(rules("LAUNCH(rc_launch(\"k\", k, 1, 32, 0, 0, a));\n"), ["parse"]);
 
     // An allowlist entry silences exactly its parameter and is marked used.
-    let src = "extern \"C\" int rc_ok(double *a, double *b) { k<<<1, 1>>>(a, b); return 0; }\n";
+    let src = "extern \"C\" int rc_ok(double *a, double *b) { rc_launch(\"k\", k, 1, 1, 0, 0, a, b); return 0; }\n";
     let r = lint_sources(
         &[("s.cu".to_string(), src.to_string())],
         &[("rc_ok", "a", "test")],
@@ -653,7 +741,7 @@ fn lint_parses_launch_shapes() {
 #[test]
 fn arrow_arguments_split_on_commas() {
     let src = "extern \"C\" int rc_run(Ctx *c, double *out) {\n\
-               k<<<1, 32>>>(c->d_a, c->n, out);\n return 0; }\n";
+               rc_launch(\"k\", k, 1, 32, 0, 0, c->d_a, c->n, out);\n return 0; }\n";
     let found = one(src);
     assert_eq!(found.len(), 1, "{}", render(&found));
     assert!(found[0].what.contains("`out`"));
