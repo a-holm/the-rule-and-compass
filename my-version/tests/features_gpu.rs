@@ -159,6 +159,36 @@ fn fused_families_dispatch_only_with_enough_segments() {
 }
 
 #[cfg(feature = "cuda")]
+#[test]
+fn fused_plan_flips_to_gpu_at_the_column_count_the_cost_constants_imply() {
+    use std::collections::BTreeMap;
+    let first_gpu_columns = |family: &'static str| -> usize {
+        let backends: Vec<bool> = (1..=100usize)
+            .map(|cols| {
+                let mut counts = BTreeMap::new();
+                counts.insert(family, (cols, rcsr::enrich::OpClass::Elementwise));
+                let mut supported = BTreeMap::new();
+                supported.insert(family, cols);
+                let plan = rcsr::enrich::plan_groups_with_segments(
+                    &counts,
+                    &supported,
+                    1_000_000,
+                    109,
+                    rcsr::enrich::GpuMode::Auto,
+                    true,
+                );
+                plan[0].backend == "gpu"
+            })
+            .collect();
+        let first = backends.iter().position(|g| *g).expect("a gpu plan exists");
+        assert!(backends[first..].iter().all(|g| *g), "{family} plan is monotone");
+        first + 1
+    };
+    assert_eq!(first_gpu_columns("flow"), 43);
+    assert_eq!(first_gpu_columns("price_action"), 28);
+}
+
+#[cfg(feature = "cuda")]
 mod device {
     use super::fg;
     use super::sanitizer;
