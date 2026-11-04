@@ -1,0 +1,7 @@
+# <path relative to my-version>:<fn> <reason>. One line per exempt function; a stale entry fails test_hygiene.
+tests/gpu_ring.rs:stalled_reader_times_out_with_ring_state lower bound of a timeout: a correct wait cannot return early
+tests/verksted_tools.rs:tools_tests_pass hang guard per script test (#717 owns the file)
+tests/panel_gpu.rs:large_block_hash_is_equal_cpu_gpu_cold_warm_and_across_block_sizes prints the CPU time; no assertion reads it
+tests/gpu_parity.rs:chunk_rows_and_store_grouping_do_not_change_a_byte prints the time; no assertion reads it
+src/search.rs:device_nonfinite_is_checked_before_promotion passes a run-clock origin to GpuSearch::new; no assertion reads time
+src/search.rs:device_trade_floor_inf_is_checked_before_promotion passes a run-clock origin to GpuSearch::new; no assertion reads time
