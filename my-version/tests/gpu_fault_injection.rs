@@ -12,6 +12,10 @@ use rcsr::enrich::{self, GpuMode, Options, Report};
 use rcsr::enrich_gpu;
 use rcsr::store::{self, FileStore};
 
+#[path = "common/sanitizer.rs"]
+#[allow(dead_code)]
+mod sanitizer;
+
 const SYMBOLS: usize = 6;
 const PER_SYMBOL: usize = 1_200;
 
@@ -154,6 +158,20 @@ fn fixture(tag: &str) -> Option<Fixture> {
     Some(Fixture { names, ..fx })
 }
 
+/// Every `k` natively. Under memcheck a fixed subset derived from `total`: the
+/// first four, every eighth of the range, and the last.
+fn sweep(total: u64) -> Vec<u64> {
+    if !sanitizer::active() {
+        return (1..=total).collect();
+    }
+    let step = (total / 8).max(1);
+    let mut ks: Vec<u64> = (1..=4.min(total)).chain((5..=total).step_by(step as usize)).collect();
+    ks.push(total);
+    ks.sort_unstable();
+    ks.dedup();
+    ks
+}
+
 /// Refuse the k-th device allocation for every k the build makes. The run must
 /// finish, label every CPU fallback and match the CPU arm.
 #[test]
@@ -166,17 +184,10 @@ fn every_refused_device_allocation_falls_back_cleanly() {
     enrich_gpu::set_alloc_fault_for_tests(0);
     assert!(total > 20, "the build made only {total} guarded allocations");
     fx.assert_matches_cpu("baseline", &base, &base_out);
-    // RCSR_FAULT_SWEEP=<from>-<to> restricts the sweep so a slow sanitizer run
-    // can be split into several invocations; the default covers every k.
-    let (from, to) = std::env::var("RCSR_FAULT_SWEEP")
-        .ok()
-        .and_then(|v| {
-            let (a, b) = v.split_once('-')?;
-            Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))
-        })
-        .unwrap_or((1, u64::MAX));
+    let ks = sweep(total);
+    eprintln!("allocations swept: {ks:?} of {total}");
     let mut with_fallback = 0usize;
-    for k in from.max(1)..=to.min(total) {
+    for &k in &ks {
         let tag = format!("alloc-{k}");
         enrich_gpu::set_alloc_fault_for_tests(k);
         let (report, out) = fx.gpu_run(&tag);
@@ -190,11 +201,8 @@ fn every_refused_device_allocation_falls_back_cleanly() {
         }
         std::fs::remove_file(&out).ok();
     }
-    eprintln!("allocations swept: {} of {total}, with CPU fallback: {with_fallback}", to.min(total) + 1 - from.max(1));
-    assert!(
-        with_fallback > 0 || std::env::var("RCSR_FAULT_SWEEP").is_ok(),
-        "no refused allocation produced a CPU fallback"
-    );
+    eprintln!("allocations swept: {} of {total}, with CPU fallback: {with_fallback}", ks.len());
+    assert!(with_fallback > 0, "no refused allocation produced a CPU fallback");
     std::fs::remove_dir_all(&fx.dir).ok();
 }
 
