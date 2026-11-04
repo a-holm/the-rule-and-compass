@@ -8,18 +8,14 @@ use rcsr::registry;
 use rcsr::store::{self, ColumnPlan, DType, FileStore};
 use std::process::Command;
 
-fn tmp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-registry-{}-{}-{}",
-        tag,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn tmp_dir(tag: &str) -> (Scratch, std::path::PathBuf) {
+    let scratch = Scratch::new(tag);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn path(dir: &std::path::Path, name: &str) -> String {
@@ -97,7 +93,7 @@ fn the_default_set_is_registered_with_complete_metadata() {
 
 #[test]
 fn the_schema_sidecar_hashes_every_column_and_detects_a_change() {
-    let dir = tmp_dir("schema");
+    let (_scratch, dir) = tmp_dir("schema");
     let (p, names) = registry_store(&dir, 30, 200, "panel.rcsb");
     // `y` is not a registered feature, so a store with it has no valid schema.
     let err = registry::write_schema(&p, "2").unwrap_err();
@@ -141,12 +137,11 @@ fn the_schema_sidecar_hashes_every_column_and_detects_a_change() {
     store::write_store_with_time(&q, &table2, 50, Some(0)).unwrap();
     let bad = registry::verify_schema(&q).unwrap();
     assert_eq!(bad, vec![names[names.len() - 1].clone()], "{bad:?}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn an_unknown_vars_name_exits_nonzero_with_the_registry_name_and_family() {
-    let dir = tmp_dir("unknown");
+    let (_scratch, dir) = tmp_dir("unknown");
     let mut text = String::from("ts,symbol,y,r16,r96,vol20\n");
     for r in 0..300 {
         let sym = if r % 2 == 0 { "AAA" } else { "BBB" };
@@ -186,7 +181,6 @@ fn an_unknown_vars_name_exits_nonzero_with_the_registry_name_and_family() {
     assert!(err.contains("unknown column 'vol21'"), "{err}");
     assert!(err.contains("registry name 'vol20'") || err.contains("registry name 'vol2"), "{err}");
     assert!(err.contains("family '"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -214,7 +208,7 @@ fn views_are_deterministic_stratified_and_traceable() {
 
 #[test]
 fn a_truncated_store_yields_the_same_view_so_no_future_column_enters() {
-    let dir = tmp_dir("trunc");
+    let (_scratch, dir) = tmp_dir("trunc");
     let (full, names) = registry_store(&dir, 200, 400, "full.rcsb");
     let (prefix, _) = registry_store(&dir, 200, 160, "prefix.rcsb");
     let cols = |p: &str| FileStore::open(p).unwrap().header().names();
@@ -222,12 +216,11 @@ fn a_truncated_store_yields_the_same_view_so_no_future_column_enters() {
     let b = registry::select_view(&cols(&prefix), 36, 3, 2).unwrap();
     assert_eq!(a, b);
     assert_eq!(a.columns.len(), a.columns.iter().filter(|c| names.contains(c)).count());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn project_on_a_200_column_store_records_the_view_in_the_manifest() {
-    let dir = tmp_dir("project");
+    let (_scratch, dir) = tmp_dir("project");
     let (p, _) = registry_store(&dir, 200, 256, "wide.rcsb");
     let run = |view: &str, manifest: &str| {
         let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
@@ -251,7 +244,6 @@ fn project_on_a_200_column_store_records_the_view_in_the_manifest() {
     assert_eq!(id.len(), 12);
     let n = view(&m0).matches("\"r").count() + view(&m0).matches("\"ma").count();
     assert!(n > 0, "{}", view(&m0));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +267,7 @@ fn mixed_table() -> data::Table {
 
 #[test]
 fn the_grouped_writer_is_byte_identical_to_the_in_memory_path() {
-    let dir = tmp_dir("writer");
+    let (_scratch, dir) = tmp_dir("writer");
     let table = mixed_table();
     let mem = path(&dir, "mem.rcsb");
     store::write_store_with_time(&mem, &table, 128, Some(0)).unwrap();
@@ -319,7 +311,6 @@ fn the_grouped_writer_is_byte_identical_to_the_in_memory_path() {
     let err = store::write_store_grouped(&path(&dir, "bad.rcsb"), &plans[..1], 10, 5, |_, _, _| Ok(()))
         .unwrap_err();
     assert!(err.contains("producer returned 0 rows"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn vm_hwm_kib() -> u64 {
@@ -393,14 +384,13 @@ fn rss_child() {
 
 #[test]
 fn the_grouped_writer_and_projected_read_stay_far_below_the_table_size() {
-    let dir = tmp_dir("rss");
+    let (_scratch, dir) = tmp_dir("rss");
     let out = Command::new(std::env::current_exe().unwrap())
         .args(["rss_child", "--exact", "--nocapture", "--test-threads", "1"])
         .env("RCSR_REGISTRY_RSS_DIR", &dir)
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(out.status.success(), "{}\n{}", stdout, String::from_utf8_lossy(&out.stderr));
     assert!(stdout.contains("RSS file_mib="), "{stdout}");
 }
@@ -473,7 +463,7 @@ fn append(dir: &std::path::Path, target: &str, family: &str, cols: &[&str], out:
 
 #[test]
 fn a_time_major_family_is_appended_without_changing_existing_columns() {
-    let dir = tmp_dir("append");
+    let (_scratch, dir) = tmp_dir("append");
     let symbols = ["AAA", "BBB", "CCC"];
     let sym_major = bar_rows(&symbols, 150);
     let panel_rows = time_major(&sym_major);
@@ -538,12 +528,11 @@ fn a_time_major_family_is_appended_without_changing_existing_columns() {
     })
     .unwrap_err();
     assert!(err.contains("unknown column 'vol21'") && err.contains("family"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn an_appended_family_is_causal_on_a_prefix() {
-    let dir = tmp_dir("append-prefix");
+    let (_scratch, dir) = tmp_dir("append-prefix");
     let symbols = ["AAA", "BBB"];
     let full_rows = bar_rows(&symbols, 160);
     let cut = 100usize;
@@ -576,7 +565,6 @@ fn an_appended_family_is_causal_on_a_prefix() {
         }
         assert_eq!(matched, prefix_rows.len());
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -625,7 +613,7 @@ fn write_panel21(p: &str, rows: &[(i64, String, f64, f64, f64, f64, f64, f64, f6
 
 #[test]
 fn every_registered_available_column_is_causal_on_a_prefix() {
-    let dir = tmp_dir("registry-causal");
+    let (_scratch, dir) = tmp_dir("registry-causal");
     let n = 700usize;
     let prefix = 520usize;
     let full_rows = panel_rows21(n);
@@ -673,7 +661,6 @@ fn every_registered_available_column_is_causal_on_a_prefix() {
     }
     eprintln!("registered columns checked: {}, finite values compared: {}", names.len(), compared);
     assert!(compared > 100_000);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -734,7 +721,7 @@ fn the_lag_menu_adds_only_the_declared_delays_and_reports_nvars() {
 
 #[test]
 fn lags_and_lag_set_report_nvars_on_the_command_line() {
-    let dir = tmp_dir("lagcli");
+    let (_scratch, dir) = tmp_dir("lagcli");
     let mut text = String::from("ts,symbol,y,x0,x1\n");
     for r in 0..600 {
         let sym = if r % 2 == 0 { "AAA" } else { "BBB" };
@@ -766,7 +753,6 @@ fn lags_and_lag_set_report_nvars_on_the_command_line() {
     assert!(String::from_utf8_lossy(&blanket.stderr).contains("nvars 2 -> 10"));
     let both = run(&["--lags", "4", "--lag-set", "1,4"]);
     assert!(!both.status.success());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A projection may leave a column out, but it records the omission and the
@@ -853,13 +839,14 @@ fn view_records_requested_and_delivered_sizes() {
 }
 
 struct AppendFixture {
+    _scratch: Scratch,
     dir: std::path::PathBuf,
     panel: String,
     family: String,
 }
 
 fn append_fixture(tag: &str, family_close_shift: Option<(usize, f64)>) -> AppendFixture {
-    let dir = tmp_dir(tag);
+    let (_scratch, dir) = tmp_dir(tag);
     let symbols = ["AAA", "BBB"];
     let sym_major = bar_rows(&symbols, 60);
     let panel = path(&dir, "panel.rcsb");
@@ -870,7 +857,7 @@ fn append_fixture(tag: &str, family_close_shift: Option<(usize, f64)>) -> Append
         fam_rows[row].5 += d;
     }
     let family = enrich_family(&dir, "fam", &fam_rows, "r1,r4,ma5,vol20");
-    AppendFixture { dir, panel, family }
+    AppendFixture { _scratch, dir, panel, family }
 }
 
 fn options(f: &AppendFixture, cols: &[&str], skip_existing: bool, out: &str) -> AppendOptions {
@@ -923,7 +910,6 @@ fn a_duplicate_name_fails_before_any_column_is_read() {
     let text = String::from_utf8_lossy(&out.stderr);
     assert!(text.contains("'close'") && text.contains("'volume'"), "{text}");
     assert!(!std::path::Path::new(&path(&f.dir, "cli.rcsb")).exists());
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 #[test]
@@ -941,7 +927,6 @@ fn failed_append_leaves_no_output() {
     let err = panel_append::append_family(&o).unwrap_err();
     assert!(err.contains("in place"), "{err}");
     assert_eq!(leftovers(&f.dir), Vec::<String>::new());
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 #[test]
@@ -955,7 +940,6 @@ fn the_store_appender_leaves_no_file_on_an_error() {
     assert!(store::write_store_appending_hashed(&out, &source, &extras).is_err());
     assert!(!std::path::Path::new(&out).exists());
     assert_eq!(leftovers(&f.dir), Vec::<String>::new());
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 #[test]
@@ -969,7 +953,6 @@ fn skip_existing_drops_equal_columns_and_appends_the_rest() {
     assert!(leftovers(&f.dir).is_empty());
     let err = panel_append::append_family(&options(&f, &["close"], true, "out2.rcsb")).unwrap_err();
     assert!(err.contains("nothing to append"), "{err}");
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 #[test]
@@ -997,7 +980,6 @@ fn all_resolves_to_the_family_columns_the_panel_lacks() {
     for n in &want {
         assert!(got.header().column_index(n).is_some(), "{n}");
     }
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 fn timeframe_store(dir: &std::path::Path, file: &str, steps: &[i64]) -> String {
@@ -1028,7 +1010,7 @@ fn column_timeframes(body: &str) -> Vec<(String, String)> {
 
 #[test]
 fn schema_timeframe_matches_hourly_store() {
-    let dir = tmp_dir("schema_tf_hourly");
+    let (_scratch, dir) = tmp_dir("schema_tf_hourly");
     let p = timeframe_store(&dir, "hourly.rcsb", &[3600; 120]);
     let body = std::fs::read_to_string(registry::write_schema(&p, "2").unwrap()).unwrap();
     assert!(body.contains("\"bar_seconds\":3600,"), "{body}");
@@ -1042,12 +1024,11 @@ fn schema_timeframe_matches_hourly_store() {
         }
     }
     assert!(!body.contains("\"timeframe\":\"15m\""), "{body}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn schema_timeframe_of_a_15m_store_is_15m() {
-    let dir = tmp_dir("schema_tf_15m");
+    let (_scratch, dir) = tmp_dir("schema_tf_15m");
     let p = timeframe_store(&dir, "m15.rcsb", &[900; 120]);
     let body = std::fs::read_to_string(registry::write_schema(&p, "2").unwrap()).unwrap();
     assert!(body.contains("\"bar_seconds\":900,"), "{body}");
@@ -1059,12 +1040,11 @@ fn schema_timeframe_of_a_15m_store_is_15m() {
             assert_ne!(tf, "15m");
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn schema_timeframe_edge_cases_single_row_and_mixed_steps() {
-    let dir = tmp_dir("schema_tf_edge");
+    let (_scratch, dir) = tmp_dir("schema_tf_edge");
     let one = timeframe_store(&dir, "one.rcsb", &[3600]);
     let body = std::fs::read_to_string(registry::write_schema(&one, "2").unwrap()).unwrap();
     assert!(body.contains("\"bar_seconds\":null,"), "{body}");
@@ -1079,12 +1059,11 @@ fn schema_timeframe_edge_cases_single_row_and_mixed_steps() {
     let odd = timeframe_store(&dir, "odd.rcsb", &[1234; 20]);
     let body = std::fs::read_to_string(registry::write_schema(&odd, "2").unwrap()).unwrap();
     assert!(column_timeframes(&body).iter().any(|(n, tf)| n == "gap" && tf == "1234s"), "{body}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn rewriting_an_old_sidecar_keeps_hashes_and_verifies() {
-    let dir = tmp_dir("schema_tf_rewrite");
+    let (_scratch, dir) = tmp_dir("schema_tf_rewrite");
     let p = timeframe_store(&dir, "hourly.rcsb", &[3600; 120]);
     let schema = registry::write_schema(&p, "2").unwrap();
     let new = std::fs::read_to_string(&schema).unwrap();
@@ -1098,7 +1077,6 @@ fn rewriting_an_old_sidecar_keeps_hashes_and_verifies() {
     assert_eq!(registry::read_hashes(&schema).unwrap(), before);
     assert_eq!(std::fs::read_to_string(&schema).unwrap(), new);
     assert!(registry::verify_schema(&p).unwrap().is_empty());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Every available derived column of the first `n` registry families.
@@ -1142,7 +1120,7 @@ fn project_refuses_a_store_with_fewer_candidate_columns_than_requested() {
     let err = registry::select_view(&thirty, 48, 11, 0).unwrap_err().to_string();
     assert!(err.contains("30 candidate columns"), "{err}");
     assert!(registry::select_view(&thirty, 30, 11, 0).is_ok());
-    let dir = tmp_dir("shortfall");
+    let (_scratch, dir) = tmp_dir("shortfall");
     let (p, _) = registry_store(&dir, 30, 64, "short.rcsb");
     let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args(["--data", &p, "--target", "y", "--project", "48", "--time", "ts", "--group-by", "symbol", "--cpu"])
@@ -1151,7 +1129,6 @@ fn project_refuses_a_store_with_fewer_candidate_columns_than_requested() {
     assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("30 candidate columns"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

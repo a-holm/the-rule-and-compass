@@ -16,6 +16,10 @@ use rcsr::search::{self, Config, Fitness};
 use rcsr::trading::{FitnessBook, FitnessTotals, TradingRows, TradingSpec};
 use std::sync::{Arc, Mutex};
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 const VARS: usize = 4;
 
 struct Lcg(u64);
@@ -815,9 +819,9 @@ fn frac(v: f64) -> f64 {
 }
 
 /// `r = 0.01 x1 + noise` is the realised return; `y = r + 0.05 x2` the label.
-fn write_cli_fixture() -> (String, String) {
-    let dir = std::env::temp_dir().join(format!("rcsr-pnl-fitness-gpu-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+fn write_cli_fixture() -> (Scratch, String, String) {
+    let scratch = Scratch::new("pnl-fitness-gpu");
+    let dir = scratch.path().to_path_buf();
     let mut text = String::from("t,x1,x2,r,y\n");
     for i in 0..600 {
         let f = i as f64;
@@ -837,7 +841,7 @@ fn write_cli_fixture() -> (String, String) {
          \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}]}";
     let spec_path = dir.join("s.json");
     std::fs::write(&spec_path, spec).unwrap();
-    (data.to_string_lossy().into_owned(), spec_path.to_string_lossy().into_owned())
+    (scratch, data.to_string_lossy().into_owned(), spec_path.to_string_lossy().into_owned())
 }
 
 fn cli(data: &str, spec: &str, backend: &[&str]) -> rcsr::devlog::Json {
@@ -863,7 +867,7 @@ fn cli_names_the_device_scorer_and_reports_exact_values() {
         eprintln!("skipping GPU test: no usable CUDA device");
         return;
     }
-    let (data, spec) = write_cli_fixture();
+    let (_scratch, data, spec) = write_cli_fixture();
     let gpu = cli(&data, &spec, &["--gpu", "--dispatch", "device"]);
     assert_eq!(gpu.get("backend").and_then(|j| j.as_str()), Some("gpu"));
     let f = gpu.get("search_fitness").expect("search_fitness");

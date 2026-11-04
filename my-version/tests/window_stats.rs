@@ -11,6 +11,10 @@ use rcsr::enrich::{self, GpuMode, Options};
 use rcsr::window_stats::log1p_det;
 use rcsr::store::{self, FileStore};
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 const STEP: i64 = 900;
 const T0: i64 = 1_700_000_000 - (1_700_000_000 % 86_400);
 
@@ -132,15 +136,6 @@ fn write_store(path: &str, rows: &[Row]) {
     store::write_store_with_time(path, &table, 65_536, Some(0)).unwrap();
 }
 
-fn work_dir(tag: &str) -> std::path::PathBuf {
-    let base = std::env::var("RCSR_PARITY_TMP")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    let dir = base.join(format!("rcsr-wstats-{}-{}", tag, std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 fn options(data: &str, out: &str, names: &[String]) -> Options {
     Options {
         data: data.to_string(),
@@ -163,13 +158,14 @@ fn read_column(path: &str, name: &str) -> Vec<f64> {
     out
 }
 
-fn build(rows: &[Row], names: &[String], tag: &str) -> (String, rcsr::enrich::Report) {
-    let dir = work_dir(tag);
+fn build(rows: &[Row], names: &[String], tag: &str) -> (Scratch, String, rcsr::enrich::Report) {
+    let scratch = Scratch::new(tag);
+    let dir = scratch.path().to_path_buf();
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     write_store(&src, rows);
     let rep = enrich::build(&options(&src, &out, names)).unwrap();
-    (out, rep)
+    (scratch, out, rep)
 }
 
 // ---------------------------------------------------------------------------
@@ -552,7 +548,7 @@ fn compare(engine: &[f64], refc: &[Option<f64>], e: &mut Err) {
 fn measure(symbols: usize, per: usize) -> Vec<(&'static str, Err)> {
     let rows = fixture(symbols, per);
     let names: Vec<String> = FAMILIES.iter().map(|s| s.to_string()).collect();
-    let (out, _) = build(&rows, &names, "ref");
+    let (_scratch, out, _) = build(&rows, &names, "ref");
     let mut errs: Vec<(&'static str, Err)> =
         FAMILIES.iter().map(|f| (*f, Err { max_rel: 0.0, max_scaled: 0.0, compared: 0, mask: 0 })).collect();
     let cols: Vec<Vec<f64>> = FAMILIES.iter().map(|f| read_column(&out, f)).collect();
@@ -604,12 +600,12 @@ fn a_symbol_alone_equals_the_symbol_in_a_panel() {
     let per = 6_000;
     let rows = fixture(24, per);
     let names: Vec<String> = LOCAL.iter().map(|s| s.to_string()).collect();
-    let (panel_out, _) = build(&rows, &names, "panel");
+    let (_panel, panel_out, _) = build(&rows, &names, "panel");
     let mut bad = Vec::new();
     for k in [0usize, 3, 5, 9, 16] {
         let alone: Vec<Row> = rows.iter().filter(|r| r.sym == k).copied().collect();
         let first = rows.iter().position(|r| r.sym == k).unwrap();
-        let (alone_out, _) = build(&alone, &names, &format!("alone{k}"));
+        let (_alone, alone_out, _) = build(&alone, &names, &format!("alone{k}"));
         for name in LOCAL {
             let a = read_column(&alone_out, name);
             let p = read_column(&panel_out, name);
@@ -631,7 +627,7 @@ fn cpu_feature_phase_time() {
     let names: Vec<String> = enrich::engine_names();
     let mut best = f64::INFINITY;
     for _ in 0..5 {
-        let (_, rep) = build(&rows, &names, "time");
+        let (_scratch, _, rep) = build(&rows, &names, "time");
         best = best.min(rep.feature_seconds);
         eprintln!("[wstats] rows {} columns {} feature_seconds {:.3}", rep.rows, names.len(), rep.feature_seconds);
     }
@@ -645,7 +641,7 @@ fn dump_engine_columns() {
     let path = std::env::var("RCSR_WS_DUMP").expect("RCSR_WS_DUMP");
     let rows = fixture(24, 21_000);
     let names: Vec<String> = enrich::engine_names();
-    let (out, _) = build(&rows, &names, "dump");
+    let (_scratch, out, _) = build(&rows, &names, "dump");
     std::fs::copy(&out, &path).unwrap();
 }
 

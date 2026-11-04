@@ -51,7 +51,12 @@ fn inventory_and_declared_tiers() {
 }
 
 #[cfg(feature = "cuda")]
+#[path = "common/scratch.rs"]
+mod scratch;
+
+#[cfg(feature = "cuda")]
 mod device {
+    use super::scratch::Scratch;
     use super::*;
     use rcsr::bench_gpu::{BenchSeries, Kind, MarketDevice};
     use rcsr::data;
@@ -786,18 +791,10 @@ mod device {
     // Real enrich path
     // ---------------------------------------------------------------------
 
-    fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rcsr-bench-gpu-{}-{}-{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmp_dir(tag: &str) -> (Scratch, std::path::PathBuf) {
+        let scratch = Scratch::new(tag);
+        let path = scratch.path().to_path_buf();
+        (scratch, path)
     }
 
     fn column(path: &str, name: &str) -> Vec<f64> {
@@ -871,7 +868,7 @@ rel_mkt96,mkt_vol96,mkt_ew_ret1,avg_corr,btc_volume_share";
         if !have_device() {
             return;
         }
-        let dir = tmp_dir("store");
+        let (_scratch, dir) = tmp_dir("store");
         let src = dir.join("in.rcsb").to_string_lossy().into_owned();
         // 24 symbols x 44,200 rows crosses the 1M-row dispatch floor.
         write_panel(&src, 44_200);
@@ -943,6 +940,5 @@ rel_mkt96,mkt_vol96,mkt_ew_ret1,avg_corr,btc_volume_share";
             cpu.feature_seconds, cpu.xs_seconds, gpu.feature_seconds, gpu.xs_seconds,
             gpu.gpu_kernel_seconds
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

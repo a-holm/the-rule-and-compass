@@ -4,18 +4,14 @@ use rcsr::data;
 use rcsr::memory::{EstimateOptions, StoreShape};
 use rcsr::store::{self, DType, FileStore, ProjectedGroup, Projection};
 
-fn tmp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-projection-{}-{}-{}",
-        tag,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn tmp_dir(tag: &str) -> (Scratch, std::path::PathBuf) {
+    let scratch = Scratch::new(tag);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 /// A 364-column store: `ts`, `symbol` and 362 numeric columns. The first 20
@@ -53,7 +49,7 @@ fn projected_names(vars: &[String]) -> Vec<String> {
 
 #[test]
 fn projection_identity_is_canonical_and_never_drops_a_name() {
-    let dir = tmp_dir("identity");
+    let (_scratch, dir) = tmp_dir("identity");
     let (path, vars) = wide_store(&dir, 32);
     let fs = FileStore::open(&path).unwrap();
 
@@ -97,12 +93,11 @@ fn projection_identity_is_canonical_and_never_drops_a_name() {
     // Explicit index resolution is the same projection.
     let d = Projection::from_indices(&fs, &a.indices()).unwrap();
     assert_eq!(d.hash(), a.hash());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn projected_values_are_bit_identical_to_the_full_read() {
-    let dir = tmp_dir("values");
+    let (_scratch, dir) = tmp_dir("values");
     let (path, vars) = wide_store(&dir, 9_000);
     let fs = FileStore::open(&path).unwrap();
     let proj = Projection::resolve_owned(&fs, &projected_names(&vars)).unwrap();
@@ -161,7 +156,6 @@ fn projected_values_are_bit_identical_to_the_full_read() {
     let ints = table.ints(0).expect("the time column keeps i64");
     assert_eq!(ints[0], 1_700_000_000);
     assert_eq!(ints[ints.len() - 1], 1_700_000_000 + (fs.n_rows() as i64 - 1) * 3600);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

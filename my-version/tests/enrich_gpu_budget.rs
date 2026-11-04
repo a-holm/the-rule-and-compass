@@ -10,6 +10,10 @@ use rcsr::data;
 use rcsr::enrich::{self, GpuMode, Options};
 use rcsr::store;
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
 const SYMBOLS: usize = 4;
 const PER_SYMBOL: usize = 6_000;
 const STEP: i64 = 900;
@@ -71,8 +75,8 @@ fn resident_tile_outputs_leave_room_for_the_fused_families() {
         .collect();
     let tiles = names.iter().filter(|n| rcsr::enrich_gpu::tile_feature(n).is_some()).count();
     assert!(tiles > 16, "the budget must be smaller than the tile share");
-    let dir = std::env::temp_dir().join(format!("rcsr-budget-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = Scratch::new("budget");
+    let dir = scratch.path().to_path_buf();
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     let rows = write_store(&src);
@@ -90,5 +94,4 @@ fn resident_tile_outputs_leave_room_for_the_fused_families() {
     })
     .unwrap();
     assert_eq!(report.gpu_fallback, 0, "fallback columns: {:?}", report.gpu_fallback_columns);
-    std::fs::remove_dir_all(&dir).ok();
 }

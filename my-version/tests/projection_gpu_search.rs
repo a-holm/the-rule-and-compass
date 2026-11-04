@@ -32,18 +32,14 @@ fn has_device() -> bool {
     rcsr::gpu::probe().available()
 }
 
-fn tmp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-projection-gpu-{}-{}-{}",
-        tag,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn tmp_dir(tag: &str) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new(tag);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 struct Lcg(u64);
@@ -240,7 +236,7 @@ fn a_364_column_store_with_20_vars_searches_resident_on_the_gpu() {
     if !has_device() {
         return;
     }
-    let dir = tmp_dir("small");
+    let (_scratch, dir) = tmp_dir("small");
     let store_path = dir.join("wide364.rcsb");
     build_wide_store(store_path.to_str().unwrap(), 65_536, 8, &dir);
     let run = search(
@@ -253,14 +249,13 @@ fn a_364_column_store_with_20_vars_searches_resident_on_the_gpu() {
         "ac5 small: peak_rss {} B, device peak {} B, required {} B",
         run.peak_rss_bytes, p.peak_live_bytes, p.required_bytes
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// One append pass: writes about 14 GB to `FULL_STORE`.
 #[test]
 #[ignore]
 fn build_wide_364_store() {
-    let scratch = tmp_dir("full-build");
+    let (_scratch, scratch) = tmp_dir("full-build");
     let started = std::time::Instant::now();
     build_wide_store(FULL_STORE, FULL_ROWS, 73, &scratch);
     let header = store::FileStore::open(FULL_STORE).unwrap();
@@ -270,7 +265,6 @@ fn build_wide_364_store() {
         started.elapsed().as_secs_f64()
     );
     drop(header);
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 fn pool_of(trees: &[Node]) -> GenomePool {
