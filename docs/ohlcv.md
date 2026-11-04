@@ -1,5 +1,3 @@
-
-The ignored test `measure_fused_cost_on_one_million_rows` produces these numbers: `cargo test --release --features cuda --test features_gpu -- --ignored measure_fused_cost`. No test asserts them. The counted work (two base passes per family, one `f64` download per column) is asserted by `fused_families_pay_two_base_passes_and_one_download_per_column`.
 # OHLCV market-data layer
 
 `rcsr::ohlcv` and `rcsr::features` (issue #125) give market data a typed shape
@@ -732,23 +730,19 @@ columns. Repeated GPU runs and `--chunk-rows` 1/65,536 hash identically, and
 truncating the store leaves every earlier row bit-identical
 (`fused_gpu_is_prefix_causal`), so no future bar enters a value.
 
-**Measured cost model.** `features_gpu::{FLOW_COST, PRICE_ACTION_COST}` are
-kernel-time constants measured on a 1,000,075-row, 109-symbol fixture (the
+**Measured cost model.** The ignored test `measure_fused_cost_on_one_million_rows` produces the table: `cargo test --release --features cuda --test features_gpu -- --ignored --nocapture measure_fused_cost` (log `/mnt/lager/tmp/rcsr-gates/issue738-native10.log`, #738). No test asserts the numbers. The counted work (two base passes per family, one `f64` download per column) is asserted by `fused_families_pay_two_base_passes_and_one_download_per_column`. The measurement is of kernel time on a 1,000,075-row, 109-symbol fixture (the
 segment-parallel consumers only fill the device at a realistic symbol count):
 
 | family | base ms/Mrow | per column ms/Mrow | total, 12/11 columns | wall incl. D2H |
 |---|---:|---:|---:|---:|
-| flow | 11.4 | 3.3 | 51.2 ms/Mrow | 99.6 ms/Mrow |
-| price_action | 8.8 | 2.5 | 36.7 ms/Mrow | 64.6 ms/Mrow |
+| flow | 6.084 | 12.534 | 156.488 ms/Mrow | 194.235 ms/Mrow |
+| price_action | 9.224 | 3.619 | 49.031 ms/Mrow | 69.495 ms/Mrow |
 
-The wall figure is download-bound: per-column `cudaMemcpy` measured
-~2.1-3.8 GB/s, which is the output-path problem of #300. Kernel time is what
-`plan_groups` costs. A fused family is not dispatched by `--gpu auto` below
+The wall figure is download-bound: the measured D2H rate is 2.77 GB/s, which is the output-path problem of #300. `features_gpu::{FLOW_COST, PRICE_ACTION_COST}` hold the earlier constants (flow 11.4 and 3.3, price_action 8.8 and 2.5 ms/Mrow); `plan_groups` costs with those constants, so the table and the constants differ. A fused family is not dispatched by `--gpu auto` below
 **32 symbol segments** (`FUSED_MIN_SEGMENTS`); `--gpu on` still forces it, which
 is how the two-symbol parity fixture exercises every kernel. At 16 M rows and
-109 symbols the measured rate projects to ~1.4 s for the 23 columns, in line
-with the ~1.5 s candle+price-action / ~2 s flow estimate in
-`04-feature-enrich.md` §6.
+109 symbols the measured rates give about 3.3 s of kernel time for the 23 columns
+(16 x (156.488 + 49.031) ms).
 
 ### Determinism and the cost model
 

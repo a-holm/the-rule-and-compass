@@ -375,7 +375,7 @@ Out of core, the empirical policy is:
 | workload | mechanism |
 |---|---|
 | streamed groups / full scans | **`pread`** (`read_exact_at`) into reusable group buffers |
-| sorted or coalesced reads | `pread` (1.2–2.8× faster than `mmap` at ≥1 GiB) |
+| sorted or coalesced reads | `pread` |
 | sparse random gather | never a syscall per element; read the containing group sequentially |
 | `mmap` + `MADV_RANDOM` | not used here: group streaming with `pread` already bounds RSS, and needs no `madvise(MADV_DONTNEED)` |
 

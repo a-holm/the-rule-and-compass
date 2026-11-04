@@ -264,7 +264,7 @@ is mathematically well posed:
 | `rank_correlation`, `rank_correlation_signed` with `--fit-strategy gpu` (#230, signed: #231) | the same squared start and the same polish on the device: segmented radix sort, exact integer rank sums, first-improver ladder; `rank_correlation_signed` scores `1 − ρ` and can never accept a reflected model or an SSE/`|ρ|` proxy (#231); the fitness and the finalist refit stay on the CPU |
 | `median` with `--fit-strategy gpu` (#226) | the same squared start and the same ladder on the device: a segmented radix sort of the `|r|` bit patterns selects the exact `f64` median, two middle values averaged for even `n`; every trial is scored on that median, never on SSE. Fit-only: the fitness and the finalist refit stay on the CPU. Needs `n >= 4096` rows (the measured cost-model crossover) |
 | `interquartile` with `--fit-strategy gpu` (#232) | the same squared start and the same ladder on the same sort, averaging ranks `[⌊n/4⌋, ⌊3n/4⌋)` of `|r|` (all rows below `n = 4`) — the window is by rank, so a repeated boundary value cannot change it. Every trial is scored on that window mean, never on SSE. Fit-only, `n >= 4096` rows, and the score agrees with the CPU to `1e-12` relative (a fixed tree reduction, not bit-identical like the median) |
-| `maximum` with `--fit-strategy gpu` (#227) | the same squared start, then the **exact one-dimensional minimiser per constant**: with `rᵢ(δ) = aᵢ + bᵢ·δ` and the exact adjoint, the level `t` is attainable iff `max loᵢ <= min hiᵢ`, so a bisection on the error level `t ∈ [0, J(c)]` (at most 32 rounds, `1e-9` relative) finds the exact coordinate minimum with no step ladder. Steps are accepted only on a strictly lower exact `max |r|`, and every finalist keeps `min(J_device, J_cpu_polish)` with zero tolerance. Fit-only: the fitness and the finalist refit stay on the CPU. Needs `n >= 512` rows (the measured cost-model floor) |
+| `maximum` with `--fit-strategy gpu` (#227) | the same squared start, then the **exact one-dimensional minimiser per constant**: with `rᵢ(δ) = aᵢ + bᵢ·δ` and the exact adjoint, the level `t` is attainable iff `max loᵢ <= min hiᵢ`, so a bisection on the error level `t ∈ [0, J(c)]` (at most 32 rounds, `1e-9` relative) finds the exact coordinate minimum with no step ladder. Steps are accepted only on a strictly lower exact `max |r|`, and every finalist keeps `min(J_device, J_cpu_polish)` with zero tolerance. Fit-only: the fitness and the finalist refit stay on the CPU. Needs `n >= 512` rows (the floor); the cost model prefers the device above about 3 300 / p rows (#733) |
 | information criteria | least squares for the constants, with the parameter penalty applied at scoring time |
 
 The correlation family is no longer a squared fit plus polish (issue #224).
@@ -1141,8 +1141,7 @@ Its measured fit share was 97.5 % of a `log_loss` run's CPU work, which is why
 the #234 arm attacked the dominant cost where the #233 AUC arm could not
 (3.0–3.5 %); the remaining 8.1 % CPU fitness share is what #289 removes. The median and interquartile arms also require at least
 4 096 training rows, the measured crossover of the batched selection, and the
-maximum arm at least 512 rows, the measured floor of the bisection on the error
-level; below either bound the exact CPU arm runs with a labelled reason. An explicit `gpu` with any other
+maximum arm at least 512 rows (the floor; the cost model prefers the device above about 3 300 / p rows, #733); below either bound the exact CPU arm runs with a labelled reason. An explicit `gpu` with any other
 metric is a usage error (exit 2) naming `--metric squared`,
 `--metric log_squashed`, `--metric absolute`, `--metric log_loss`, a hinge form, a rank
 metric, `--metric median`, `--metric interquartile`, `--metric maximum` or a
@@ -1491,10 +1490,7 @@ FP32, fused reduction); the work is to scale and target it:
 6. **Do not oversubscribe the 273 GB/s** memory bus: hand off between CPU
    evolution and GPU evaluation rather than running both flat out.
 
-Reported GPU speed-ups for this style of workload range from ~18× (EvoGP) to
-~40× (stack-based GP) over tuned CPU implementations, so a realistic first
-target on GB10 is **10–40×** over an optimised AVX-512 CPU, rising further with
-row tiling and CUDA graphs. The status of the GPU path in this repository is in
+The status of the GPU path in this repository is in
 `docs/gpu-backend.md`.
 
 ---

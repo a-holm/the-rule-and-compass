@@ -64,8 +64,8 @@ proposal is judged on the exact oriented score, never on SSE or `|rho|` (#231);
 `--metric interquartile` with the middle-50 % window mean of `|r|` (fit and
 native scoring from 4 096 training rows — the measured crossover of the batched
 selection, #226, #232 and #288), and `--metric maximum` fits the Chebyshev
-objective by **exact bisection on the error level** per constant (from 512
-training rows — the measured cost-model floor, #227) and is scored natively by
+objective by **exact bisection on the error level** per constant (floor 512
+training rows; the cost model puts the device ahead above about 3 300 / p rows for p constants, #227, #733) and is scored natively by
 the #287 maximum reducer. An explicit `gpu` with a metric that has no device fit
 objective is a usage error, because the kernel would otherwise fit a different
 loss; use `--metric squared`, `--metric log_squashed`, `--metric absolute`,
@@ -1195,8 +1195,8 @@ proposal is judged on the exact oriented score, never on SSE or `|rho|` (#231);
 `--metric interquartile` with the middle-50 % window mean of `|r|` (fit and
 native scoring from 4 096 training rows — the measured crossover of the batched
 selection, #226, #232 and #288), and `--metric maximum` fits the Chebyshev
-objective by **exact bisection on the error level** per constant (from 512
-training rows — the measured cost-model floor, #227) and is scored natively by
+objective by **exact bisection on the error level** per constant (floor 512
+training rows; the cost model puts the device ahead above about 3 300 / p rows for p constants, #227, #733) and is scored natively by
 the #287 maximum reducer. An explicit `gpu` with a metric that has no device fit
 objective is a usage error, because the kernel would otherwise fit a different
 loss; use `--metric squared`, `--metric log_squashed`, `--metric absolute`,
