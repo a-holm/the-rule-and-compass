@@ -25,6 +25,12 @@ extern "C" int rc_launch_check_enabled(void)
     return enabled;
 }
 
+extern "C" int rc_launch_forced(const char *kernel)
+{
+    static const char *const prefix = getenv("RCSR_FORCE_LAUNCH_REFUSAL");
+    return prefix && prefix[0] && strncmp(kernel, prefix, strlen(prefix)) == 0;
+}
+
 extern "C" void rc_launch_refused(const char *kernel, int arg)
 {
     snprintf(g_last.kernel, sizeof(g_last.kernel), "%s", kernel);

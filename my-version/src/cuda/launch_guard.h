@@ -8,6 +8,9 @@
  * where every caller already reads it. rc_launch_last_refusal names the
  * kernel and argument.
  *
+ * RCSR_FORCE_LAUNCH_REFUSAL=<kernel name prefix> (test hook, read once) refuses every launch of the
+ * matching kernels as if one argument were host memory; unset, it does nothing.
+ *
  * RCSR_DEVICE_PTR_CHECK=0 turns the check off (read once per process). The
  * type test uses cudaPointerAttributes::type: under HMM devicePointer is
  * non-NULL for pageable host memory.
@@ -24,6 +27,8 @@
 extern "C" {
 #endif
 int rc_launch_check_enabled(void);
+/* Test hook: non-zero when RCSR_FORCE_LAUNCH_REFUSAL (read once) is set and is a prefix of the kernel name. */
+int rc_launch_forced(const char *kernel);
 void rc_launch_refused(const char *kernel, int arg);
 /* Kernel name of this thread's last refusal into buf; returns its argument
  * index, or -1 when there is none. */
@@ -65,16 +70,18 @@ template <typename... P, typename... A>
 static cudaError_t rc_launch(const char *name, void (*k)(P...), dim3 grid, dim3 block,
                              size_t smem, cudaStream_t s, A... a)
 {
-    if (rc_launch_check_enabled()) {
+    int bad = rc_launch_forced(name) ? 0 : -1;
+    if (bad < 0 && rc_launch_check_enabled()) {
         const bool ok[] = {true, RcArgCheck<std::decay_t<P>>::ok(rc_launch_conv<P>(a))...};
-        for (size_t i = 1; i < sizeof(ok) / sizeof(ok[0]); ++i) {
-            if (!ok[i]) {
-                rc_launch_refused(name, (int)i - 1);
-                k<<<dim3(0), block, 0, s>>>(rc_launch_conv<P>(a)...);
-                const cudaError_t e = cudaPeekAtLastError();
-                return e != cudaSuccess ? e : cudaErrorInvalidValue;
-            }
+        for (size_t i = 1; i < sizeof(ok) / sizeof(ok[0]) && bad < 0; ++i) {
+            if (!ok[i]) bad = (int)i - 1;
         }
+    }
+    if (bad >= 0) {
+        rc_launch_refused(name, bad);
+        k<<<dim3(0), block, 0, s>>>(rc_launch_conv<P>(a)...);
+        const cudaError_t e = cudaPeekAtLastError();
+        return e != cudaSuccess ? e : cudaErrorInvalidValue;
     }
     k<<<grid, block, smem, s>>>(rc_launch_conv<P>(a)...);
     return cudaPeekAtLastError();
