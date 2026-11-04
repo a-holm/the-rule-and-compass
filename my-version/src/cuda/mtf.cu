@@ -19,6 +19,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "launch_guard.h"
 #include "alloc_guard.h"
 #include "cub_guard.h"
 #include <math.h>
@@ -738,7 +739,7 @@ int rc_mtf_prepare(RcMtf *c, long long tf_seconds)
     const int threads = 256;
     int nb = blocks_for(c->n, threads);
 
-    k_bucket_flags<<<nb, threads>>>(c->d_times, c->d_seg_id, c->n,
+    rc_launch("k_bucket_flags", k_bucket_flags, nb, threads, 0, 0, c->d_times, c->d_seg_id, c->n,
                                     tf_seconds, c->d_flags);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -768,26 +769,24 @@ int rc_mtf_prepare(RcMtf *c, long long tf_seconds)
     }
     c->last.d2h_bytes += 2ULL * sizeof(int);
 
-    k_bucket_lo<<<nb, threads>>>(c->d_flags, c->d_bucket_of_row, c->n,
+    rc_launch("k_bucket_lo", k_bucket_lo, nb, threads, 0, 0, c->d_flags, c->d_bucket_of_row, c->n,
                                  c->d_bucket_lo);
     int bres = c->total_buckets > 0 ? blocks_for(c->total_buckets, threads) : 0;
     if (bres > 0) {
-        k_resample<<<bres, threads>>>(
-            c->d_times, c->d_open, c->d_high, c->d_low, c->d_close,
+        rc_launch("k_resample", k_resample, bres, threads, 0, 0, c->d_times, c->d_open, c->d_high, c->d_low, c->d_close,
             c->d_bucket_lo, c->n, c->total_buckets, tf_seconds,
             c->d_h_time, c->d_h_open, c->d_h_high, c->d_h_low, c->d_h_close);
     }
     int sres = blocks_for(c->nseg, threads);
-    k_seg_buckets<<<sres, threads>>>(c->d_seg_start, c->d_bucket_of_row,
+    rc_launch("k_seg_buckets", k_seg_buckets, sres, threads, 0, 0, c->d_seg_start, c->d_bucket_of_row,
                                      c->nseg, c->total_buckets,
                                      c->d_seg_bucket_start,
                                      c->d_seg_bucket_len);
-    k_mtf_leaves<<<sres, threads>>>(
-        c->d_h_time, c->d_h_open, c->d_h_high, c->d_h_low, c->d_h_close,
+    rc_launch("k_mtf_leaves", k_mtf_leaves, sres, threads, 0, 0, c->d_h_time, c->d_h_open, c->d_h_high, c->d_h_low, c->d_h_close,
         c->d_seg_bucket_start, c->d_seg_bucket_len, c->nseg, (int)tf_seconds,
         c->max_buckets, c->d_ps, c->d_ps2, c->d_pc, c->d_rs, c->d_rs2,
         c->d_rc, c->d_rs3, c->d_rs4, c->d_leaf);
-    k_join<<<sres, threads>>>(c->d_times, c->d_seg_start, c->d_seg_len,
+    rc_launch("k_join", k_join, sres, threads, 0, 0, c->d_times, c->d_seg_start, c->d_seg_len,
                               c->d_seg_bucket_start, c->d_seg_bucket_len,
                               c->d_h_time, c->nseg, tf_seconds,
                               c->d_join_idx, c->d_age);
@@ -818,10 +817,10 @@ int rc_mtf_gather(RcMtf *c, int leaf, double *out)
     const int threads = 256;
     int nb = blocks_for(c->n, threads);
     if (leaf == RC_MTF_BAR_AGE) {
-        k_copy_age<<<nb, threads>>>(c->d_age, c->n, c->d_out);
+        rc_launch("k_copy_age", k_copy_age, nb, threads, 0, 0, c->d_age, c->n, c->d_out);
     } else {
         const double *src = c->d_leaf + (size_t)leaf * c->max_buckets;
-        k_gather<<<nb, threads>>>(c->d_join_idx, src, c->n, c->d_out);
+        rc_launch("k_gather", k_gather, nb, threads, 0, 0, c->d_join_idx, src, c->n, c->d_out);
     }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {

@@ -21,6 +21,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "launch_guard.h"
 #include "alloc_guard.h"
 #include "cub_guard.h"
 #include "radix_select.h"
@@ -1613,6 +1614,11 @@ typedef struct RcPnlBlocks {
     int pad;
 } RcPnlBlocks;
 
+template <>
+struct RcArgCheck<RcPnlBlocks> {
+    static bool ok(const RcPnlBlocks &) { return true; }
+};
+
 static_assert(RC_PNL_MAX_BLOCKS == 8, "RcCtx::pnl_bound holds 8 block bounds");
 static_assert(RC_MAX_THREADS == 32 * RC_PNL_WARPS, "the long/flat block is RC_PNL_WARPS warps");
 static_assert(RC_PNL_SEGMENT_ROWS % 32 == 0, "a segment is whole warp steps");
@@ -1853,7 +1859,7 @@ static void rc_pnl_launch(RcCtx *c, const unsigned int *prog, const unsigned int
     RcPnlTotals *totals = (RcPnlTotals *)c->d_pnl_totals;
 #define RC_PNL_CASE(K)                                                                   \
     case K:                                                                              \
-        pnl_score_kernel<K><<<nprog, RC_MAX_THREADS>>>(                                  \
+        rc_launch("pnl_score_kernel<K>", pnl_score_kernel<K>, nprog, RC_MAX_THREADS, 0, 0, \
             c->d_cols, c->n, prog, off, width, pooled, excess, flags, c->pnl_side,       \
             c->pnl_threshold, blk, c->pnl_min_trades, c->d_score_out, c->d_score_status, \
             totals);                                                                     \
@@ -4437,13 +4443,11 @@ static int ft_launch(RcCtx *c,
         opted_in = 1;
     }
     if constexpr (CHUNK == 256) {
-        fit_kernel_two_blocks<MAXC, CHUNK, PCHUNK><<<nprog, CHUNK, bytes, c->s_fit>>>(
-            c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->d_pmask, c->n,
+        rc_launch("fit_kernel_two_blocks<MAXC, CHUNK, PCHUNK>", fit_kernel_two_blocks<MAXC, CHUNK, PCHUNK>, nprog, CHUNK, bytes, c->s_fit, c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->d_pmask, c->n,
             c->v, d_prog, d_off, d_p, kmax, d_c0, d_cbase, d_gauge, iters, metric, polish, d_c,
             d_sse, d_status, d_cyc);
     } else {
-        fit_kernel<MAXC, CHUNK, PCHUNK><<<nprog, CHUNK, bytes, c->s_fit>>>(
-            c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->d_pmask, c->n,
+        rc_launch("fit_kernel<MAXC, CHUNK, PCHUNK>", fit_kernel<MAXC, CHUNK, PCHUNK>, nprog, CHUNK, bytes, c->s_fit, c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->d_pmask, c->n,
             c->v, d_prog, d_off, d_p, kmax, d_c0, d_cbase, d_gauge, iters, metric, polish, d_c,
             d_sse, d_status, d_cyc);
     }
@@ -4689,7 +4693,7 @@ static int rc_fs_f64_twins(RcCtx *c)
         int threads = 256;
         long long total = (long long)c->n * (long long)c->v;
         long long blocks = (total + threads - 1) / threads;
-        cast_f32_to_f64_kernel<<<(int)blocks, threads, 0, c->s_fit>>>(c->d_cols, c->d_cols64, total);
+        rc_launch("cast_f32_to_f64_kernel", cast_f32_to_f64_kernel, (int)blocks, threads, 0, c->s_fit, c->d_cols, c->d_cols64, total);
     }
     if (!c->d_y64) {
         if (rc_dev_alloc(c, "y_f64", (void **)&c->d_y64, sizeof(double) * (size_t)c->n) != 0) {
@@ -4699,7 +4703,7 @@ static int rc_fs_f64_twins(RcCtx *c)
         c->fs_alloc_calls++;
         int threads = 256;
         long long yblocks = (c->n + threads - 1) / threads;
-        cast_f32_to_f64_kernel<<<(int)yblocks, threads, 0, c->s_fit>>>(c->d_y, c->d_y64, c->n);
+        rc_launch("cast_f32_to_f64_kernel", cast_f32_to_f64_kernel, (int)yblocks, threads, 0, c->s_fit, c->d_y, c->d_y64, c->n);
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
@@ -5275,8 +5279,7 @@ int rc_eval_submit(void *ctx, int loss)
     }
     double t = rc_now_ms();
     cudaEventRecord(c->t0, c->s_eval);
-    eval_kernel<<<c->nprog, threads, 0, c->s_eval>>>(
-        c->d_cols, c->d_y, c->n, c->v, c->arena_prog[slot], c->arena_off[slot],
+    rc_launch("eval_kernel", eval_kernel, c->nprog, threads, 0, c->s_eval, c->d_cols, c->d_y, c->n, c->v, c->arena_prog[slot], c->arena_off[slot],
         c->arena_out, loss);
     cudaEventRecord(c->t1, c->s_eval);
     cudaEventRecord(c->ev_slot_done[slot], c->s_eval);
@@ -5373,7 +5376,7 @@ int rc_predict(void *ctx, const unsigned int *prog, const unsigned int *off,
     if (rc_dev_alloc(c, "predict", (void **)&d_pred, sizeof(float) * total) != 0) return -1;
     int threads = RC_MIN_THREADS;
     while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
-    predict_kernel<<<nprog, threads>>>(c->d_cols, c->n, c->arena_prog[slot],
+    rc_launch("predict_kernel", predict_kernel, nprog, threads, 0, 0, c->d_cols, c->n, c->arena_prog[slot],
                                        c->arena_off[slot], d_pred);
     if (cudaGetLastError() != cudaSuccess) {
         rc_dev_free(c, d_pred);
@@ -5516,7 +5519,7 @@ float rc_pool_eval(void *ctx, int which, int nprog, int width, float *out, int l
     while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
     t = rc_now_ms();
     cudaEventRecord(c->t0, 0);
-    eval_pool_kernel<<<nprog, threads>>>(c->d_cols, c->d_y, c->n, c->v,
+    rc_launch("eval_pool_kernel", eval_pool_kernel, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v,
                                          c->d_pool[which & 1], width, c->d_out, loss);
     cudaEventRecord(c->t1, 0);
     st->launch_ms += rc_now_ms() - t;
@@ -5657,8 +5660,7 @@ static void rc_rows_pass(RcCtx *c, const unsigned int *prog, const unsigned int 
     double *pbar = lane_b + (size_t)nprog * (size_t)lanes;
     int *bad = (int *)(pbar + nprog);
     for (int k = 0; k + 1 < nbounds; ++k) {
-        score_rows_kernel<MODE, PASS><<<nprog, lanes>>>(
-            c->d_cols, c->n, 0, c->d_y, c->d_tsign, c->d_w64,
+        rc_launch("score_rows_kernel<MODE, PASS>", score_rows_kernel<MODE, PASS>, nprog, lanes, 0, 0, c->d_cols, c->n, 0, c->d_y, c->d_tsign, c->d_w64,
             bounds[k], bounds[k + 1], prog, off, width, pooled,
             lane_a, lane_b, bad, pbar, c->ybar);
     }
@@ -5677,11 +5679,10 @@ static void rc_rows_run(RcCtx *c, const unsigned int *prog, const unsigned int *
                     (size_t)nprog * ((size_t)lanes * 16 + 16), 0);
     rc_rows_pass<MODE, 0>(c, prog, off, width, pooled, nprog, lanes, bounds, nbounds);
     if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
-        score_mid_kernel<MODE><<<nprog, lanes>>>(lane_a, lane_b, pbar, (long long)c->n, c->d_w64 ? 1 : 0);
+        rc_launch("score_mid_kernel<MODE>", score_mid_kernel<MODE>, nprog, lanes, 0, 0, lane_a, lane_b, pbar, (long long)c->n, c->d_w64 ? 1 : 0);
         rc_rows_pass<MODE, 1>(c, prog, off, width, pooled, nprog, lanes, bounds, nbounds);
     }
-    score_finish_kernel<MODE><<<nprog, lanes>>>(
-        lane_a, lane_b, bad, (long long)c->n, c->syy, pbar, c->d_w64 ? 1 : 0,
+    rc_launch("score_finish_kernel<MODE>", score_finish_kernel<MODE>, nprog, lanes, 0, 0, lane_a, lane_b, bad, (long long)c->n, c->syy, pbar, c->d_w64 ? 1 : 0,
         c->d_score_out, c->d_score_status);
 }
 
@@ -5768,8 +5769,7 @@ static void rc_tiles_pass(RcCtx *c, const unsigned int *prog, const unsigned int
         const int slot = (int)(c->tile_seq++ & 1ULL);
         rc_tile_step(c, slot, r0, len,
             [&](const float *tile, int ld, long long b, long long e) {
-                score_rows_kernel<MODE, PASS><<<nw, lanes>>>(
-                    tile, ld, b, c->d_y, c->d_tsign, c->d_w64, b, e,
+                rc_launch("score_rows_kernel<MODE, PASS>", score_rows_kernel<MODE, PASS>, nw, lanes, 0, 0, tile, ld, b, c->d_y, c->d_tsign, c->d_w64, b, e,
                     prog, off, width, pooled, lane_a, lane_b, bad, pbar, c->ybar);
             });
         c->tile_count++;
@@ -5791,11 +5791,10 @@ static void rc_tiles_run(RcCtx *c, const unsigned int *prog, const unsigned int 
         cudaMemsetAsync(c->d_carry, 0, (size_t)nw * ((size_t)lanes * 16 + 16), 0);
         rc_tiles_pass<MODE, 0>(c, progw, offw, width, pooled, nw, lanes);
         if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
-            score_mid_kernel<MODE><<<nw, lanes>>>(lane_a, lane_b, pbar, (long long)c->n, c->d_w64 ? 1 : 0);
+            rc_launch("score_mid_kernel<MODE>", score_mid_kernel<MODE>, nw, lanes, 0, 0, lane_a, lane_b, pbar, (long long)c->n, c->d_w64 ? 1 : 0);
             rc_tiles_pass<MODE, 1>(c, progw, offw, width, pooled, nw, lanes);
         }
-        score_finish_kernel<MODE><<<nw, lanes>>>(
-            lane_a, lane_b, bad, (long long)c->n, c->syy, pbar, c->d_w64 ? 1 : 0,
+        rc_launch("score_finish_kernel<MODE>", score_finish_kernel<MODE>, nw, lanes, 0, 0, lane_a, lane_b, bad, (long long)c->n, c->syy, pbar, c->d_w64 ? 1 : 0,
             c->d_score_out + w0, c->d_score_status + w0);
         c->wave_count++;
     }
@@ -5902,98 +5901,82 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
         }
     } else switch (kind) {
         case RC_SCORE_SQUARED:
-            score_kernel<RC_SCORE_SQUARED><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_SQUARED>", score_kernel<RC_SCORE_SQUARED>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_ABSOLUTE:
-            score_kernel<RC_SCORE_ABSOLUTE><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_ABSOLUTE>", score_kernel<RC_SCORE_ABSOLUTE>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_LOG_SQUASHED:
-            score_kernel<RC_SCORE_LOG_SQUASHED><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_LOG_SQUASHED>", score_kernel<RC_SCORE_LOG_SQUASHED>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_SIGNED:
-            score_kernel<RC_SCORE_SIGNED><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_SIGNED>", score_kernel<RC_SCORE_SIGNED>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_MAXIMUM:
-            score_kernel<RC_SCORE_MAXIMUM><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_MAXIMUM>", score_kernel<RC_SCORE_MAXIMUM>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_CORRELATION:
-            score_kernel<RC_SCORE_CORRELATION><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_CORRELATION>", score_kernel<RC_SCORE_CORRELATION>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_CORRELATION_SIGNED:
-            score_kernel<RC_SCORE_CORRELATION_SIGNED><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_CORRELATION_SIGNED>", score_kernel<RC_SCORE_CORRELATION_SIGNED>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_AIC:
-            score_kernel<RC_SCORE_AIC><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_AIC>", score_kernel<RC_SCORE_AIC>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_AICC:
-            score_kernel<RC_SCORE_AICC><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_AICC>", score_kernel<RC_SCORE_AICC>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_BIC:
-            score_kernel<RC_SCORE_BIC><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_BIC>", score_kernel<RC_SCORE_BIC>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_LOG_LOSS:
-            score_kernel<RC_SCORE_LOG_LOSS><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_LOG_LOSS>", score_kernel<RC_SCORE_LOG_LOSS>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_BRIER:
-            score_kernel<RC_SCORE_BRIER><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_BRIER>", score_kernel<RC_SCORE_BRIER>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_HINGE_SIGMOID:
-            score_kernel<RC_SCORE_HINGE_SIGMOID><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_HINGE_SIGMOID>", score_kernel<RC_SCORE_HINGE_SIGMOID>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_HINGE_ORDINARY:
-            score_kernel<RC_SCORE_HINGE_ORDINARY><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_HINGE_ORDINARY>", score_kernel<RC_SCORE_HINGE_ORDINARY>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_HINGE_SQUARED:
-            score_kernel<RC_SCORE_HINGE_SQUARED><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_HINGE_SQUARED>", score_kernel<RC_SCORE_HINGE_SQUARED>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_SLOPE:
-            score_kernel<RC_SCORE_SLOPE><<<nprog, threads>>>(
-                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+            rc_launch("score_kernel<RC_SCORE_SLOPE>", score_kernel<RC_SCORE_SLOPE>, nprog, threads, 0, 0, c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
                 c->d_tsign, c->d_w64, c->d_pmask,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
@@ -6230,7 +6213,7 @@ int rc_pool_hash(void *ctx, int which, int nprog, int width, unsigned long long 
     if (!c || !c->d_pool[which & 1] || !c->d_hash || nprog <= 0) return -1;
     int threads = 128;
     int blocks = (nprog + threads - 1) / threads;
-    hash_kernel<<<blocks, threads>>>(c->d_pool[which & 1], width, nprog, c->d_hash);
+    rc_launch("hash_kernel", hash_kernel, blocks, threads, 0, 0, c->d_pool[which & 1], width, nprog, c->d_hash);
     if (cudaGetLastError() != cudaSuccess) return -1;
     rc_download(out, c->d_hash, sizeof(unsigned long long) * (size_t)nprog);
     return 0;
@@ -6646,9 +6629,7 @@ int rc_fit_probe(void *ctx,
     memcpy(host + o_p, pcount, sizeof(int) * (size_t)nprog);
     memcpy(host + o_c0, c0, cbytes);
     rc_fs_h2d(c, base, host, in_end);
-    fit_probe_kernel<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK>
-        <<<nprog, FT_CHUNK_SMALL, bytes, c->s_fit>>>(
-            c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->d_pmask, c->n,
+    rc_launch("fit_probe_kernel<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK>", fit_probe_kernel<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK>, nprog, FT_CHUNK_SMALL, bytes, c->s_fit, c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->d_pmask, c->n,
             (const unsigned int *)(base + o_prog), (const unsigned int *)(base + o_off),
             (const int *)(base + o_p), kmax, (const double *)(base + o_c0), metric, phase,
             (double *)(base + o_out));
@@ -6767,7 +6748,7 @@ static int rc_rank_runs(RcCtx *c, RcRankWork *w, const long long *d_b, int n, lo
             w->temp, tb, w->keys, w->keys_out, w->rows, w->rows_out, total, nsegs, d_off,
             d_off + 1, 0, (int)(sizeof(unsigned long long) * 8), s)) != cudaSuccess)
         return -1;
-    k_rank_flags<<<(int)blocks, threads, 0, s>>>(w->keys_out, w->rows_out, d_b, n, total,
+    rc_launch("k_rank_flags", k_rank_flags, (int)blocks, threads, 0, s, w->keys_out, w->rows_out, d_b, n, total,
                                                  w->flags, w->gather);
     if (cudaGetLastError() != cudaSuccess) return -1;
     tb = w->temp_bytes;
@@ -6780,9 +6761,9 @@ static int rc_rank_runs(RcCtx *c, RcRankWork *w, const long long *d_b, int n, lo
                 cub::DeviceScan::ExclusiveSum(w->temp, tb, w->gather, w->prefix, (int)total, s)) !=
         cudaSuccess)
         return -1;
-    k_rank_tail<<<1, 1, 0, s>>>(w->prefix, w->gather, total);
+    rc_launch("k_rank_tail", k_rank_tail, 1, 1, 0, s, w->prefix, w->gather, total);
     if (cudaGetLastError() != cudaSuccess) return -1;
-    k_rank_starts<<<(int)blocks, threads, 0, s>>>(w->flags, w->ord, w->starts, total);
+    rc_launch("k_rank_starts", k_rank_starts, (int)blocks, threads, 0, s, w->flags, w->ord, w->starts, total);
     if (cudaGetLastError() != cudaSuccess) return -1;
     return 0;
 }
@@ -6827,7 +6808,7 @@ static int rc_rank_prepare(void *ctx)
     int threads = 256;
     long long blocks = (total + threads - 1) / threads;
     if (blocks > 65535) blocks = 65535;
-    k_rank_keys_from_double<<<(int)blocks, threads, 0, c->s_fit>>>(c->d_y64, total, w.keys, w.rows);
+    rc_launch("k_rank_keys_from_double", k_rank_keys_from_double, (int)blocks, threads, 0, c->s_fit, c->d_y64, total, w.keys, w.rows);
     int ok = (cudaGetLastError() == cudaSuccess) &&
              (rc_rank_runs(c, &w, NULL, c->n, total, 1, d_off) == 0);
     if (ok) {
@@ -6839,7 +6820,7 @@ static int rc_rank_prepare(void *ctx)
         int tb = 256;
         long long rb = (nrun + tb - 1) / tb;
         if (rb > 65535) rb = 65535;
-        k_rank_fill_b<<<(int)rb, tb, 0, c->s_fit>>>(w.rows_out, w.starts, (int)nrun, c->n,
+        rc_launch("k_rank_fill_b", k_rank_fill_b, (int)rb, tb, 0, c->s_fit, w.rows_out, w.starts, (int)nrun, c->n,
                                                     c->d_rank_b);
         ok = cudaGetLastError() == cudaSuccess;
         if (rc_fs_finish(c) != 0) ok = 0;
@@ -6931,15 +6912,15 @@ float rc_rank_score_batch(void *ctx,
     long long blocks = (total + threads - 1) / threads;
     if (blocks > 65535) blocks = 65535;
     cudaEventRecord(c->t0, c->s_fit);
-    k_rank_predict<<<(int)blocks, threads, 0, c->s_fit>>>(d_prog, d_off, d_c0, kmax, c->d_cols64,
+    rc_launch("k_rank_predict", k_rank_predict, (int)blocks, threads, 0, c->s_fit, d_prog, d_off, d_c0, kmax, c->d_cols64,
                                                           c->n, nsegs, ntrials, w.keys, w.rows,
                                                           d_status);
     int ok = cudaGetLastError() == cudaSuccess;
     if (ok && rc_rank_runs(c, &w, c->d_rank_b, c->n, total, nsegs, d_seg_off) != 0) ok = 0;
     if (ok) {
-        k_rank_contrib<<<nsegs, 256, 0, c->s_fit>>>(w.starts, w.prefix, w.ord, c->n, total, nsegs,
+        rc_launch("k_rank_contrib", k_rank_contrib, nsegs, 256, 0, c->s_fit, w.starts, w.prefix, w.ord, c->n, total, nsegs,
                                                     d_out);
-        k_rank_bb<<<1, 256, 0, c->s_fit>>>(c->d_rank_b, c->n, d_bb);
+        rc_launch("k_rank_bb", k_rank_bb, 1, 256, 0, c->s_fit, c->d_rank_b, c->n, d_bb);
         ok = cudaGetLastError() == cudaSuccess;
     }
     cudaEventRecord(c->t1, c->s_fit);
@@ -7599,8 +7580,7 @@ float rc_max_scan_batch(void *ctx,
     }
     rc_fs_h2d(c, base, host, in_end);
     cudaEventRecord(c->t0, c->s_fit);
-    k_max_scan<<<nsegs, FT_MM_THREADS, 0, c->s_fit>>>(
-        (const unsigned int *)(base + o_prog), (const unsigned int *)(base + o_off),
+    rc_launch("k_max_scan", k_max_scan, nsegs, FT_MM_THREADS, 0, c->s_fit, (const unsigned int *)(base + o_prog), (const unsigned int *)(base + o_off),
         (const int *)(base + o_p), (const double *)(base + o_c0), kmax,
         (const int *)(base + o_coords), (const double *)(base + o_levels), c->d_cols64,
         c->d_y64, c->n, nsegs, ntrials, (RcMaxOut *)(base + o_out));
@@ -7724,7 +7704,7 @@ float rc_order_stat_score_batch(void *ctx,
     if (blocks > 65535) blocks = 65535;
     if (blocks < 1) blocks = 1;
     cudaEventRecord(c->t0, c->s_fit);
-    k_order_stat_keys<<<(int)blocks, threads, 0, c->s_fit>>>(d_prog, d_off, d_c0, kmax,
+    rc_launch("k_order_stat_keys", k_order_stat_keys, (int)blocks, threads, 0, c->s_fit, d_prog, d_off, d_c0, kmax,
                                                              c->d_cols64, c->d_y64, c->n, nsegs,
                                                              ntrials, d_keys, d_status);
     int ok = cudaGetLastError() == cudaSuccess;
@@ -7735,7 +7715,7 @@ float rc_order_stat_score_batch(void *ctx,
                  (int)(sizeof(unsigned long long) * 8), c->s_fit)) == cudaSuccess;
     }
     if (ok) {
-        k_order_stat_pick<<<nsegs, RC_OS_PICK_THREADS, 0, c->s_fit>>>(d_keys_out, c->n, nsegs,
+        rc_launch("k_order_stat_pick", k_order_stat_pick, nsegs, RC_OS_PICK_THREADS, 0, c->s_fit, d_keys_out, c->n, nsegs,
                                                                       what, d_val, d_status);
         ok = cudaGetLastError() == cudaSuccess;
     }
@@ -7888,19 +7868,18 @@ float rc_order_stat_select_batch(void *ctx,
     double *d_val = (double *)(base + o_val);
     const dim3 grid((unsigned int)nsegs, (unsigned int)bx);
     cudaEventRecord(c->t0, c->s_fit);
-    k_order_stat_select_keys<<<grid, RS_THREADS, 0, c->s_fit>>>(
-        (const unsigned int *)(base + o_prog), (const unsigned int *)(base + o_off),
+    rc_launch("k_order_stat_select_keys", k_order_stat_select_keys, grid, RS_THREADS, 0, c->s_fit, (const unsigned int *)(base + o_prog), (const unsigned int *)(base + o_off),
         (const double *)(base + o_c0), kmax, c->d_cols64, c->d_y64, n, nsegs, ntrials, d_keys,
         d_status, d_hist);
     int ok = cudaGetLastError() == cudaSuccess;
     for (int pass = 0; ok && pass < RS_PASSES; ++pass) {
         if (pass > 0) {
-            rs_hist_kernel<<<grid, RS_THREADS, 0, c->s_fit>>>(d_keys, n, nsegs, q, pass, d_status,
+            rc_launch("rs_hist_kernel", rs_hist_kernel, grid, RS_THREADS, 0, c->s_fit, d_keys, n, nsegs, q, pass, d_status,
                                                              d_prefix, d_hist);
             ok = cudaGetLastError() == cudaSuccess;
             if (!ok) break;
         }
-        rs_pick_kernel<<<nsegs, RS_THREADS, 0, c->s_fit>>>(d_hist, nsegs, q, pass, r0, r1, d_prefix,
+        rc_launch("rs_pick_kernel", rs_pick_kernel, nsegs, RS_THREADS, 0, c->s_fit, d_hist, nsegs, q, pass, r0, r1, d_prefix,
                                                           d_rank, d_status);
         ok = cudaGetLastError() == cudaSuccess;
     }
@@ -7911,12 +7890,12 @@ float rc_order_stat_select_batch(void *ctx,
         unsigned long long *d_mid_sorted = (unsigned long long *)(base + o_mid_sorted);
         int *d_begin = (int *)(base + o_begin);
         int *d_end = (int *)(base + o_end);
-        k_iqr_select_split<<<grid, RS_THREADS, 0, c->s_fit>>>(d_keys, n, nsegs, w, d_prefix,
+        rc_launch("k_iqr_select_split", k_iqr_select_split, grid, RS_THREADS, 0, c->s_fit, d_keys, n, nsegs, w, d_prefix,
                                                              d_status, d_le, d_nmid, d_mid);
         ok = cudaGetLastError() == cudaSuccess;
         if (ok) {
             const int fb = (nsegs + 255) / 256;
-            k_iqr_select_bounds<<<fb, 256, 0, c->s_fit>>>(nsegs, w, d_status, d_nmid, d_begin,
+            rc_launch("k_iqr_select_bounds", k_iqr_select_bounds, fb, 256, 0, c->s_fit, nsegs, w, d_status, d_nmid, d_begin,
                                                          d_end);
             ok = cudaGetLastError() == cudaSuccess;
         }
@@ -7928,13 +7907,12 @@ float rc_order_stat_select_batch(void *ctx,
                  cudaSuccess;
         }
         if (ok) {
-            k_iqr_select_sum<<<nsegs, RS_THREADS, 0, c->s_fit>>>(
-                d_prefix, d_mid_sorted, nsegs, lo, hi, d_le, d_nmid, d_status, d_val);
+            rc_launch("k_iqr_select_sum", k_iqr_select_sum, nsegs, RS_THREADS, 0, c->s_fit, d_prefix, d_mid_sorted, nsegs, lo, hi, d_le, d_nmid, d_status, d_val);
             ok = cudaGetLastError() == cudaSuccess;
         }
     } else if (ok) {
         const int fb = (nsegs + 255) / 256;
-        k_order_stat_select_final<<<fb, 256, 0, c->s_fit>>>(d_prefix, nsegs, q, d_status, d_val);
+        rc_launch("k_order_stat_select_final", k_order_stat_select_final, fb, 256, 0, c->s_fit, d_prefix, nsegs, q, d_status, d_val);
         ok = cudaGetLastError() == cudaSuccess;
     }
     cudaEventRecord(c->t1, c->s_fit);

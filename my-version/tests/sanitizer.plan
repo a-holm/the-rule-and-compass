@@ -5,3 +5,10 @@
 gpu_parity      *                                                      skip           clean under memcheck but 1314 s, over the 580 s lock hold; the plan format has no split mode
 gpu_memory_plan a_refused_device_allocation_is_reported_with_its_bytes api-errors-no  provokes a cudaMalloc out-of-memory on purpose
 gpu_ring        stale_cuda_error_does_not_fail_the_transport           api-errors-no  provokes a cudaMalloc out-of-memory on purpose
+gpu_launch_guard malloc_argument_is_refused_before_the_kernel_runs       api-errors-no  refuses a launch on purpose; the refusal is a cudaErrorInvalidValue API error
+gpu_launch_guard stack_argument_is_refused                               api-errors-no  refuses a launch on purpose; the refusal is a cudaErrorInvalidValue API error
+gpu_launch_guard pinned_argument_is_refused                              api-errors-no  refuses a launch on purpose; the refusal is a cudaErrorInvalidValue API error
+gpu_launch_guard by_value_struct_with_a_host_member_is_refused           api-errors-no  refuses a launch on purpose; the refusal is a cudaErrorInvalidValue API error
+gpu_launch_guard opt_out_disables_the_check                              api-errors-no  refuses a launch on purpose; the refusal is a cudaErrorInvalidValue API error
+gpu_refusal_cli explicit_gpu_run_fails_closed_when_a_launch_is_refused  api-errors-no  forces a launch refusal on purpose; the refusal is a cudaErrorInvalidValue API error
+gpu_refusal_cli auto_dispatch_falls_back_to_the_cpu_with_the_cause_and_the_cpu_archive api-errors-no  forces a launch refusal on purpose; the refusal is a cudaErrorInvalidValue API error

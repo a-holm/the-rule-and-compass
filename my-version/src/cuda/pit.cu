@@ -30,6 +30,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "launch_guard.h"
 #include "alloc_guard.h"
 #include "cub_guard.h"
 #include <math.h>
@@ -506,7 +507,7 @@ int rc_pit_run(RcPit *c, long long step, int threads, int chunk_rows)
 
     cudaMemset(c->d_counter, 0, sizeof(unsigned long long));
     int nb_chunk = blocks_for(nchunk, threads);
-    k_asof<<<nb_chunk, threads>>>(c->d_time, c->d_ch_seg, c->d_ch_lo, c->d_ch_hi,
+    rc_launch("k_asof", k_asof, nb_chunk, threads, 0, 0, c->d_time, c->d_ch_seg, c->d_ch_lo, c->d_ch_hi,
                                   nchunk, c->d_leaf_start, c->d_leaf_len, c->d_key,
                                   c->d_member, c->d_leaf, c->d_keep, c->d_found, c->d_as_of,
                                   c->d_counter);
@@ -523,10 +524,10 @@ int rc_pit_run(RcPit *c, long long step, int threads, int chunk_rows)
     int *d_row_seg = c->d_row_seg;
     int *d_first = c->d_first;
     int nbs = blocks_for(c->nseg, threads);
-    k_row_seg<<<nbs, threads>>>(c->d_seg_start, c->d_seg_len, c->nseg, d_row_seg,
+    rc_launch("k_row_seg", k_row_seg, nbs, threads, 0, 0, c->d_seg_start, c->d_seg_len, c->nseg, d_row_seg,
                                 d_first);
     int nb = blocks_for(c->n, threads);
-    k_gap_rows<<<nb, threads>>>(c->d_time, c->d_chain, d_first, c->n, step,
+    rc_launch("k_gap_rows", k_gap_rows, nb, threads, 0, 0, c->d_time, c->d_chain, d_first, c->n, step,
                                 c->d_keep, c->d_gap, c->d_start);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -541,8 +542,8 @@ int rc_pit_run(RcPit *c, long long step, int threads, int chunk_rows)
         c->last.failed = 1;
         return 11;
     }
-    k_rebase<<<nb, threads>>>(d_first, c->d_chain_ord, c->n, c->d_chain_loc);
-    k_keep_int<<<nb, threads>>>(c->d_keep, c->n, c->d_start);
+    rc_launch("k_rebase", k_rebase, nb, threads, 0, 0, d_first, c->d_chain_ord, c->n, c->d_chain_loc);
+    rc_launch("k_keep_int", k_keep_int, nb, threads, 0, 0, c->d_keep, c->n, c->d_start);
     tmp = c->scan_tmp_bytes;
     err = RC_CUB(g_force_cub_fail, cub::DeviceScan::ExclusiveSum(
         c->d_scan_tmp, tmp, c->d_start, c->d_dest, c->n));
@@ -550,7 +551,7 @@ int rc_pit_run(RcPit *c, long long step, int threads, int chunk_rows)
         c->last.failed = 1;
         return 12;
     }
-    k_scatter<<<nb, threads>>>(c->d_keep, c->d_dest, c->n, c->d_kept_rows);
+    rc_launch("k_scatter", k_scatter, nb, threads, 0, 0, c->d_keep, c->d_dest, c->n, c->d_kept_rows);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         c->last.failed = 1;
@@ -577,7 +578,7 @@ int rc_pit_run(RcPit *c, long long step, int threads, int chunk_rows)
 
     /* Self-check of the join just produced; the expected count is zero. */
     cudaMemset(c->d_counter, 0, sizeof(unsigned long long));
-    k_check<<<nb, threads>>>(c->d_time, d_row_seg, c->d_leaf_start, c->d_leaf_len,
+    rc_launch("k_check", k_check, nb, threads, 0, 0, c->d_time, d_row_seg, c->d_leaf_start, c->d_leaf_len,
                              c->d_key, c->d_leaf, c->n, c->d_counter);
     cudaDeviceSynchronize();
     unsigned long long viol = 0;
@@ -597,11 +598,9 @@ int rc_pit_check(RcPit *c, const int *idx, unsigned long long *violations)
     int *d_row_seg = c->d_row_seg;
     int *d_first = c->d_first;
     int threads = 256;
-    k_row_seg<<<blocks_for(c->nseg, threads), threads>>>(
-        c->d_seg_start, c->d_seg_len, c->nseg, d_row_seg, d_first);
+    rc_launch("k_row_seg", k_row_seg, blocks_for(c->nseg, threads), threads, 0, 0, c->d_seg_start, c->d_seg_len, c->nseg, d_row_seg, d_first);
     cudaMemset(c->d_counter, 0, sizeof(unsigned long long));
-    k_check<<<blocks_for(c->n, threads), threads>>>(
-        c->d_time, d_row_seg, c->d_leaf_start, c->d_leaf_len, c->d_key,
+    rc_launch("k_check", k_check, blocks_for(c->n, threads), threads, 0, 0, c->d_time, d_row_seg, c->d_leaf_start, c->d_leaf_len, c->d_key,
         c->d_check_idx, c->n, c->d_counter);
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
