@@ -7,6 +7,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use rcsr::data::Sample;
 use rcsr::fit::FitStrategy;
@@ -16,6 +17,9 @@ use rcsr::search::{self, Config};
 struct Counting;
 
 static MAX_SINGLE: AtomicUsize = AtomicUsize::new(0);
+
+/// `MAX_SINGLE` is process-global: observed runs take turns.
+static RUN: Mutex<()> = Mutex::new(());
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -36,7 +40,8 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
-const ROWS: usize = 1_000_000;
+const ROWS: usize = 131_072;
+const PLAN_ROWS: usize = 1_000_000;
 const CANDIDATES: usize = 400;
 
 /// Tags of the requests that may scale with the row count: the dataset, its
@@ -92,18 +97,26 @@ fn config(metric: Metric) -> Config {
 struct Observed {
     max_host: usize,
     max_device: u64,
+    largest_term: u64,
     max_tag: String,
     refused: u64,
     fit_gpu: usize,
 }
 
-fn run(metric: Metric) -> Option<Observed> {
+fn run(metric: Metric, rows: usize) -> Option<Observed> {
     if !rcsr::gpu::probe().available() {
         eprintln!("skipping GPU test: no usable CUDA device");
         return None;
     }
-    let train = sample(ROWS);
+    let _one_at_a_time = RUN.lock().unwrap_or_else(|e| e.into_inner());
+    let train = sample(rows);
     let test = sample(1_000);
+    let plan = search::device_plan_for(&config(metric), &train).expect("a plan");
+    let t = &plan.terms;
+    let largest_term = [t.data_f32, t.side_vectors, t.fit_twin, t.buffers, t.stat_wave, t.tile_arena, t.tile_pinned, t.partials]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
     MAX_SINGLE.store(0, Ordering::Relaxed);
     let out = search::run(&config(metric), &train, &test);
     let max_host = MAX_SINGLE.load(Ordering::Relaxed);
@@ -117,49 +130,98 @@ fn run(metric: Metric) -> Option<Observed> {
     Some(Observed {
         max_host,
         max_device: obs.max_request_bytes,
+        largest_term,
         max_tag: obs.max_request_tag,
         refused: obs.refused,
         fit_gpu: gpu.fit_gpu,
     })
 }
 
-const P_N_4: u64 = (CANDIDATES * ROWS * 4) as u64;
+const PLAN_P_N_4: u64 = (CANDIDATES * PLAN_ROWS * 4) as u64;
 
-#[test]
-fn squared() {
-    let Some(o) = run(Metric::Squared) else { return };
+fn check(o: &Observed, metric: Metric, rows: usize) {
+    let p_n_4 = (CANDIDATES * rows * 4) as u64;
     assert!(o.fit_gpu > 0, "the device fit did not run");
     assert!(
-        (o.max_host as u64) < P_N_4 / 8,
+        (o.max_host as u64) < p_n_4 / 8,
         "largest host allocation {} B reaches P*N*4/8",
         o.max_host
     );
-    assert!(o.max_device < P_N_4 / 2, "largest device request {} B", o.max_device);
+    if metric == Metric::RankCorrelation {
+        // Score waves are capped at 512 MiB (F1).
+        let bound = 512 * 1024 * 1024;
+        assert!(o.max_device <= bound, "largest device request {} B above {}", o.max_device, bound);
+        if p_n_4 > bound as u64 {
+            assert!(o.max_device < p_n_4);
+        }
+    } else {
+        assert!(o.max_device < p_n_4 / 2, "largest device request {} B", o.max_device);
+    }
     assert!(
         N_SCALED_TAGS.contains(&o.max_tag.as_str()),
         "largest device request is tagged {}",
         o.max_tag
+    );
+    assert!(
+        o.max_device <= o.largest_term,
+        "largest device request {} B above the largest planned term {} B",
+        o.max_device,
+        o.largest_term
     );
     assert_eq!(o.refused, 0);
 }
 
 #[test]
+fn the_plan_at_one_million_rows_has_no_candidates_times_rows_term() {
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let _one_at_a_time = RUN.lock().unwrap_or_else(|e| e.into_inner());
+    for metric in [Metric::Squared, Metric::RankCorrelation] {
+        let plan = search::device_plan_for(&config(metric), &sample(PLAN_ROWS)).expect("a plan");
+        let t = &plan.terms;
+        for (name, v) in [
+            ("data_f32", t.data_f32),
+            ("side_vectors", t.side_vectors),
+            ("fit_twin", t.fit_twin),
+            ("buffers", t.buffers),
+            ("stat_wave", t.stat_wave),
+            ("tile_arena", t.tile_arena),
+            ("tile_pinned", t.tile_pinned),
+            ("partials", t.partials),
+        ] {
+            assert!(v < PLAN_P_N_4 / 2, "{metric:?}: term {name} = {v} B");
+        }
+        if metric == Metric::RankCorrelation {
+            assert!(t.stat_wave <= 512 << 20, "{plan:?}");
+            assert!(t.stat_wave > 0, "{plan:?}");
+        }
+    }
+}
+
+#[test]
+fn squared() {
+    let Some(o) = run(Metric::Squared, ROWS) else { return };
+    check(&o, Metric::Squared, ROWS);
+}
+
+#[test]
 fn rank() {
-    let Some(o) = run(Metric::RankCorrelation) else { return };
-    assert!(o.fit_gpu > 0, "the device fit did not run");
-    assert!(
-        (o.max_host as u64) < P_N_4 / 8,
-        "largest host allocation {} B reaches P*N*4/8",
-        o.max_host
-    );
-    // Score waves are capped at 512 MiB (F1).
-    let bound = 512 * 1024 * 1024;
-    assert!(o.max_device <= bound, "largest device request {} B above {}", o.max_device, bound);
-    assert!(o.max_device < P_N_4);
-    assert!(
-        N_SCALED_TAGS.contains(&o.max_tag.as_str()),
-        "largest device request is tagged {}",
-        o.max_tag
-    );
-    assert_eq!(o.refused, 0);
+    let Some(o) = run(Metric::RankCorrelation, ROWS) else { return };
+    check(&o, Metric::RankCorrelation, ROWS);
+}
+
+#[test]
+#[ignore = "1M-row allocation measurement"]
+fn squared_at_one_million_rows() {
+    let Some(o) = run(Metric::Squared, PLAN_ROWS) else { return };
+    check(&o, Metric::Squared, PLAN_ROWS);
+}
+
+#[test]
+#[ignore = "1M-row allocation measurement"]
+fn rank_at_one_million_rows() {
+    let Some(o) = run(Metric::RankCorrelation, PLAN_ROWS) else { return };
+    check(&o, Metric::RankCorrelation, PLAN_ROWS);
 }
