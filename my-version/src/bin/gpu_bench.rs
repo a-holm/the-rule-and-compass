@@ -430,7 +430,7 @@ fn main() {
         gpu_stats.wall_s * 1e3,
     );
     println!(
-        "arena            : {} (pinned {} B, alloc calls {} -> steady {}, overlapped uploads {}, batches {}){}",
+        "arena            : {} (pinned {} B, alloc calls {} -> steady {}, overlapped uploads {}, pipelined uploads {}, batches {}){}",
         if arena.async_copy {
             "async pinned H2D/D2H"
         } else {
@@ -440,6 +440,7 @@ fn main() {
         arena.alloc_calls,
         arena.steady_alloc_calls,
         arena.overlapped_uploads,
+        arena.pipelined_uploads,
         arena.batches,
         if arena.reason.is_empty() {
             String::new()

@@ -51,7 +51,7 @@ chmod +x "$T/bin/cargo"
 for v in 13.0 12.0; do
   cat > "$T/cuda-$v/bin/compute-sanitizer" <<'STUB'
 #!/usr/bin/env bash
-echo "san $*" >> "$FAKE_DIR/san-calls"
+echo "san under=${RCSR_UNDER_SANITIZER:-} $*" >> "$FAKE_DIR/san-calls"
 [ -z "${FAKE_BANNER:-}" ] || echo "$FAKE_BANNER"
 echo "${FAKE_SUMMARY:-ERROR SUMMARY: 0 errors}"
 exit "${FAKE_SAN_RC:-0}"
@@ -73,12 +73,20 @@ run "$T/wt" 7 s --test gpu_fit -- some_test --exact > /dev/null 2>&1; r=$?
 check clean-rc "$r" "0"
 has clean-slot "$T/calls" '^slot .*cargo test'
 has clean-lock "$T/calls" '^lock .*compute-sanitizer'
-has clean-san-args "$T/san-calls" 'san --tool memcheck --leak-check no --error-exitcode 99 /fake/deps/gpu_fit-bbb some_test --exact'
+has clean-san-args "$T/san-calls" 'san under=memcheck --tool memcheck --leak-check no --error-exitcode 99 /fake/deps/gpu_fit-bbb some_test --exact'
 has clean-cargo-args "$T/cargo-calls" 'cargo test --release --features cuda --no-run --message-format=json --test gpu_fit'
 has clean-summary "$rlog" '^ERROR SUMMARY: 0 errors$'
 has clean-xid "$rlog" '^xid before=4 after=4$'
 has clean-done "$rlog" '^RC_DONE rc=0 '
 has clean-build-done "$blog" '^RC_DONE rc=0 '
+
+# --api-errors maps to --report-api-errors
+: > "$T/san-calls"
+run "$T/wt" 7 s --test gpu_fit --api-errors no -- t --exact > /dev/null 2>&1; r=$?
+check api-errors-rc "$r" "0"
+has api-errors-args "$T/san-calls" 'error-exitcode 99 --report-api-errors no /fake/deps/gpu_fit-bbb t --exact'
+run "$T/wt" 7 s --test gpu_fit --api-errors maybe > /dev/null 2>&1; r=$?
+check api-errors-bad-rc "$r" "2"
 
 # --lib picks the lib unit-test artifact
 : > "$T/san-calls"

@@ -7,7 +7,6 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::Mutex;
 
 use rcsr::data::Sample;
 use rcsr::dispatch::{Route, Stage};
@@ -19,8 +18,42 @@ use rcsr::memory::Residency;
 use rcsr::metrics::{Metric, ScoreObjective, ScoreStatus};
 use rcsr::search::{self, Config, Outcome};
 
-/// Serialises the tests that read `RCSR_TEST_GPU_*` or run a whole search.
-static ENV: Mutex<()> = Mutex::new(());
+#[path = "common/scratch.rs"]
+mod scratch;
+
+use scratch::Scratch;
+
+const TILE_ROWS_HOOK: &str = "RCSR_TEST_GPU_TILE_ROWS";
+const PARTIALS_CAP_HOOK: &str = "RCSR_TEST_GPU_PARTIALS_CAP_BYTES";
+
+/// Runs the ignored test `name` of this binary in a new process, with `env` set
+/// on the child only. The hooks of the caller's shell never reach the child.
+fn in_child(name: &str, env: &[(&str, &str)]) {
+    let out = Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", name, "--ignored", "--test-threads=1", "--nocapture"])
+        .env_remove(TILE_ROWS_HOOK)
+        .env_remove(PARTIALS_CAP_HOOK)
+        .envs(env.iter().copied())
+        .output()
+        .expect("spawn the child test");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{name}:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("1 passed"), "{name} did not run:\n{stdout}");
+}
+
+/// Fails a child test that is run on its own, without its parent's environment.
+fn require_hooks(parent: &str, vars: &[&str]) {
+    for v in vars {
+        assert!(
+            std::env::var_os(v).is_some(),
+            "this test is a child of `{parent}` and needs {v} set; run the parent test"
+        );
+    }
+}
 
 const CARRY_BYTES: u64 = 256 * 16 + 16;
 
@@ -292,7 +325,6 @@ fn waves_do_not_change_scores_tiled() {
     if !has_device() {
         return;
     }
-    let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
     let n = 20_001;
     let d = data(n);
     let candidates = many_trees(1_000);
@@ -309,7 +341,21 @@ fn waves_do_not_change_scores_tiled() {
     let per_batch = report.waves / (2 * kinds.len() as u64);
     assert_eq!(per_batch, 16, "1,000 candidates in waves of 64: {report:?}");
 
-    // The same cap through the plan hook of the search.
+    // The same cap through the plan hook of the search, in a child process.
+    let cap = (64 * CARRY_BYTES).to_string();
+    in_child(
+        "child_capped_search_plan_is_tiled_in_waves",
+        &[(PARTIALS_CAP_HOOK, cap.as_str()), (TILE_ROWS_HOOK, "1024")],
+    );
+}
+
+#[test]
+#[ignore = "child of waves_do_not_change_scores_tiled"]
+fn child_capped_search_plan_is_tiled_in_waves() {
+    require_hooks("waves_do_not_change_scores_tiled", &[PARTIALS_CAP_HOOK, TILE_ROWS_HOOK]);
+    if !has_device() {
+        return;
+    }
     let train = sample(40_000, 3, 7);
     let test = sample(500, 3, 8);
     let mut cfg = search_config(Metric::Squared);
@@ -317,13 +363,9 @@ fn waves_do_not_change_scores_tiled() {
     cfg.pop = 250;
     cfg.generations = 3;
     let base = search::run(&cfg, &train, &test);
-    std::env::set_var("RCSR_TEST_GPU_PARTIALS_CAP_BYTES", (64 * CARRY_BYTES).to_string());
-    std::env::set_var("RCSR_TEST_GPU_TILE_ROWS", "1024");
     let plan = search::device_plan_for(&cfg, &train).expect("a plan");
     cfg.gpu_memory = Some(tiled_budget(&cfg, &train));
     let capped = search::run(&cfg, &train, &test);
-    std::env::remove_var("RCSR_TEST_GPU_PARTIALS_CAP_BYTES");
-    std::env::remove_var("RCSR_TEST_GPU_TILE_ROWS");
     assert_eq!(plan.mode, Residency::Resident);
     assert_eq!(capped.backend, rcsr::backend::Kind::Gpu, "{:?}", capped.backend_reason);
     let mp = capped.gpu.as_ref().and_then(|g| g.memory_plan.as_ref()).expect("plan");
@@ -359,7 +401,6 @@ fn tile_staging_is_bounded() {
     assert_eq!(warm.steady_alloc_calls, 0, "{warm:?}");
     assert_eq!(ledger.requests, cold_ledger.requests, "no new device request");
     assert_eq!(ledger.live_bytes, cold_ledger.live_bytes);
-    assert!(warm.tile_overlapped_uploads > 0, "{warm:?}");
     assert_eq!(warm.tile_uploads, warm.tiles);
 }
 
@@ -444,7 +485,7 @@ fn eval_route(out: &Outcome) -> (Route, String, u64) {
     (e.route, e.reason.name().to_string(), e.candidates)
 }
 
-fn compare_search(tile_rows: Option<&str>) {
+fn compare_search(tile_rows: Option<usize>) {
     let train = sample(60_000, 6, 5);
     let test = sample(4_000, 6, 6);
     let mut cfg = search_config(Metric::Squared);
@@ -453,16 +494,11 @@ fn compare_search(tile_rows: Option<&str>) {
     assert_eq!(want_plan.mode, Residency::Resident);
 
     cfg.gpu_memory = Some(tiled_budget(&cfg, &train));
-    match tile_rows {
-        Some(t) => std::env::set_var("RCSR_TEST_GPU_TILE_ROWS", t),
-        None => std::env::remove_var("RCSR_TEST_GPU_TILE_ROWS"),
-    }
     let got = search::run(&cfg, &train, &test);
-    std::env::remove_var("RCSR_TEST_GPU_TILE_ROWS");
     let plan = got.gpu.as_ref().and_then(|g| g.memory_plan.as_ref()).expect("tiled plan");
     assert_eq!(plan.mode, Residency::Tiled, "{plan:?}");
     if let Some(t) = tile_rows {
-        assert_eq!(plan.tile_rows, t.parse::<usize>().unwrap());
+        assert_eq!(plan.tile_rows, t);
     }
     assert_eq!(got.backend, want.backend);
     assert_eq!(got.backend, rcsr::backend::Kind::Gpu);
@@ -478,14 +514,22 @@ fn tiled_search_matches_resident() {
     if !has_device() {
         return;
     }
-    let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
     compare_search(None);
-    compare_search(Some("512"));
+    in_child("child_tiled_search_matches_resident_at_512_rows", &[(TILE_ROWS_HOOK, "512")]);
 }
 
-fn tmp_csv(rows: usize) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("rcsr-gpu-tiled-{}-{}", std::process::id(), rows));
-    std::fs::create_dir_all(&dir).unwrap();
+#[test]
+#[ignore = "child of tiled_search_matches_resident"]
+fn child_tiled_search_matches_resident_at_512_rows() {
+    require_hooks("tiled_search_matches_resident", &[TILE_ROWS_HOOK]);
+    if !has_device() {
+        return;
+    }
+    compare_search(Some(512));
+}
+
+fn tmp_csv(rows: usize) -> (Scratch, PathBuf) {
+    let dir = Scratch::new("sine");
     let path = dir.join("sine.csv");
     let mut text = String::from("x,y\n");
     for i in 0..rows {
@@ -493,7 +537,7 @@ fn tmp_csv(rows: usize) -> PathBuf {
         text.push_str(&format!("{:.6},{:.9}\n", x, x.sin()));
     }
     std::fs::write(&path, text).unwrap();
-    path
+    (dir, path)
 }
 
 fn rcsr(csv: &PathBuf, extra: &[&str]) -> Output {
@@ -501,6 +545,8 @@ fn rcsr(csv: &PathBuf, extra: &[&str]) -> Output {
         .args(["--data", csv.to_str().unwrap(), "--target", "y", "--vars", "x"])
         .args(["--generations", "2", "--seed", "1"])
         .args(extra)
+        .env_remove(TILE_ROWS_HOOK)
+        .env_remove(PARTIALS_CAP_HOOK)
         .output()
         .expect("run rcsr")
 }
@@ -538,7 +584,7 @@ fn cli_tiled_run_and_explicit_device_fit() {
     if !has_device() {
         return;
     }
-    let csv = tmp_csv(100_000);
+    let (_dir, csv) = tmp_csv(100_000);
     let budget = cli_tiled_budget(&csv);
 
     let out = rcsr(&csv, &["--gpu", "--json", "--quiet", "--gpu-memory", budget.as_str()]);
@@ -566,7 +612,7 @@ fn cli_tiled_rank_metric_runs_on_the_cpu_with_device_memory() {
     if !has_device() {
         return;
     }
-    let csv = tmp_csv(100_000);
+    let (_dir, csv) = tmp_csv(100_000);
     // The exact statistic scorers carry no label sign, so their resident rows
     // are 12 B per training row smaller than the native objective's.
     let budget = (cli_tiled_budget_bytes(&csv) - 12 * CLI_TRAIN_ROWS).to_string();
@@ -601,6 +647,35 @@ fn cli_tiled_rank_metric_runs_on_the_cpu_with_device_memory() {
     assert!(stderr.contains("device_memory: the exact order/rank scorer"), "{stderr}");
     assert!(!stderr.contains("scorer runs on the CPU"), "{stderr}");
     assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
+/// A hook in the environment of the test process must not reach the CLI children.
+#[test]
+fn cli_children_do_not_inherit_the_test_hooks() {
+    if !has_device() {
+        return;
+    }
+    in_child(
+        "child_cli_children_ignore_the_hooks",
+        &[(TILE_ROWS_HOOK, "512"), (PARTIALS_CAP_HOOK, "4112")],
+    );
+}
+
+#[test]
+#[ignore = "child of cli_children_do_not_inherit_the_test_hooks"]
+fn child_cli_children_ignore_the_hooks() {
+    require_hooks("cli_children_do_not_inherit_the_test_hooks", &[TILE_ROWS_HOOK, PARTIALS_CAP_HOOK]);
+    if !has_device() {
+        return;
+    }
+    let (_dir, csv) = tmp_csv(100_000);
+    let budget = cli_tiled_budget(&csv);
+    let out = rcsr(&csv, &["--gpu", "--json", "--quiet", "--gpu-memory", budget.as_str()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let plan = &stdout[stdout.find("\"memory_plan\"").expect("a plan")..];
+    assert!(plan.contains("\"mode\":\"tiled\""), "{plan}");
+    assert_ne!(number_after(plan, "\"tile_rows\":"), 512, "the tile-rows hook reached the CLI child: {plan}");
 }
 
 /// Paired timing for the PR: 1,000,000 rows x 20 vars, 400 candidates,

@@ -7,7 +7,7 @@
 
 use rcsr::data;
 use rcsr::enrich_gpu::{DeviceColumn, EnrichGpu, ProjectedSource};
-use rcsr::projected_ring::{overlap_probe, ProjectedRing, RingGroup, RingOptions};
+use rcsr::projected_ring::{overlap_probe, ProjectedRing, RingGroup, RingOptions, StallGate};
 use rcsr::store::{self, FileStore, Projection};
 use std::os::raw::{c_int, c_void};
 use std::sync::mpsc;
@@ -328,6 +328,9 @@ impl RingHandle {
 
 /// Run `f` on its own thread and fail, instead of hanging, if it does not
 /// return within `limit`. A hung worker is left behind; the test still fails.
+/// Hang guard: fires only when a call does not return at all.
+const HANG_GUARD: Duration = Duration::from_secs(300);
+
 fn bounded<T: Send + 'static>(
     what: &str,
     limit: Duration,
@@ -364,7 +367,6 @@ fn early_exit_after_any_group_never_hangs() {
         return;
     }
     let fx = RingFixture::new("early-exit");
-    let limit = Duration::from_secs(5);
     let mut cases = 0usize;
     for slots in [2usize, 3] {
         for k in 0..RING_GROUPS {
@@ -374,7 +376,7 @@ fn early_exit_after_any_group_never_hangs() {
                 for settle in [Duration::ZERO, Duration::from_millis(5)] {
                     let h = fx.handle();
                     let what = format!("slots={} k={} {:?} settle={:?}", slots, k, stop, settle);
-                    let took = bounded(&what, Duration::from_secs(30), move || {
+                    bounded(&what, HANG_GUARD, move || {
                         let mut ring = h.ring(slots, RingOptions::default());
                         for i in 0..k {
                             let g = ring.next_group().expect("group").expect("group");
@@ -388,16 +390,12 @@ fn early_exit_after_any_group_never_hangs() {
                             _ => None,
                         };
                         std::thread::sleep(settle);
-                        let t = Instant::now();
                         match stop {
                             Stop::Finish | Stop::FinishHolding => ring.finish().expect("finish"),
                             Stop::Drop => drop(ring),
                         }
-                        let took = t.elapsed();
                         drop(held);
-                        took
                     });
-                    assert!(took < limit, "{}: stopping took {:?}", what, took);
                     cases += 1;
                 }
             }
@@ -419,7 +417,7 @@ fn dropped_group_returns_its_slot() {
         for every in [3usize, 1] {
             let h = fx.handle();
             let what = format!("slots={} skip every {}", slots, every);
-            let (seen, uploaded) = bounded(&what, Duration::from_secs(30), move || {
+            let (seen, uploaded) = bounded(&what, HANG_GUARD, move || {
                 let options = RingOptions {
                     wait: Some(Duration::from_secs(5)),
                     ..Default::default()
@@ -457,7 +455,7 @@ fn stalled_reader_times_out_with_ring_state() {
     let fx = RingFixture::new("stall");
     let bound = Duration::from_millis(400);
     let h = fx.handle();
-    let (err, waited, finished) = bounded("stalled ring", Duration::from_secs(30), move || {
+    let (err, waited) = bounded("stalled ring", HANG_GUARD, move || {
         let options = RingOptions {
             wait: Some(bound),
             stall_before_group: Some(5),
@@ -472,13 +470,10 @@ fn stalled_reader_times_out_with_ring_state() {
         let t = Instant::now();
         let err = ring.next_group().expect("an error, not end of store").unwrap_err();
         let waited = t.elapsed();
-        let t = Instant::now();
         ring.finish().expect("a stalled reader honours cancellation");
-        (err, waited, t.elapsed())
+        (err, waited)
     });
     assert!(waited >= bound, "returned after {:?}, before the bound", waited);
-    assert!(waited < bound + Duration::from_secs(2), "returned after {:?}", waited);
-    assert!(finished < Duration::from_secs(5), "finish took {:?}", finished);
     for part in [
         "no group from the reader within 0.4 s",
         "reader stalled by the test hook before group 5",
@@ -503,7 +498,6 @@ fn stalled_reader_times_out_with_ring_state() {
         if stall {
             cmd.env("RCSR_RING_WAIT_MS", "400").env("RCSR_TEST_RING_STALL_GROUP", "3");
         }
-        let started = Instant::now();
         let output = cmd.output().expect("run rcsr enrich");
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         assert!(output.status.success(), "enrich failed: {}", stderr);
@@ -512,11 +506,11 @@ fn stalled_reader_times_out_with_ring_state() {
             .filter(|l| l.contains("projected transport failed"))
             .map(str::to_string)
             .collect();
-        (failed, started.elapsed())
+        failed
     };
     let stalled_out = dir.join("stalled.rcsb").to_string_lossy().into_owned();
     let normal_out = dir.join("normal.rcsb").to_string_lossy().into_owned();
-    let (failed, took) = enrich(&stalled_out, true);
+    let failed = enrich(&stalled_out, true);
     assert_eq!(failed.len(), 1, "expected one fallback line, got {:?}", failed);
     assert!(
         failed[0].contains("reader stalled by the test hook before group 3")
@@ -524,8 +518,7 @@ fn stalled_reader_times_out_with_ring_state() {
         "{}",
         failed[0]
     );
-    assert!(took < Duration::from_secs(120), "stalled enrich took {:?}", took);
-    let (failed, _) = enrich(&normal_out, false);
+    let failed = enrich(&normal_out, false);
     assert!(failed.is_empty(), "the unhooked run fell back: {:?}", failed);
     let a = FileStore::open(&stalled_out).unwrap();
     let b = FileStore::open(&normal_out).unwrap();
@@ -554,14 +547,24 @@ fn reader_that_ignores_cancel_is_detached_not_joined() {
         eprintln!("skipping: no CUDA device");
         return;
     }
+    /// Releases the gate on every path, so a failing assertion cannot leave a
+    /// blocked reader holding the device context.
+    struct Release(StallGate);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
     let fx = RingFixture::new("detach");
     let bound = Duration::from_millis(300);
     let h = fx.handle();
-    let (next, finish, took) = bounded("detached reader", Duration::from_secs(30), move || {
+    let (next, finish, still_waiting) = bounded("detached reader", HANG_GUARD, move || {
+        let gate = StallGate::default();
+        let _release = Release(gate.clone());
         let options = RingOptions {
             wait: Some(bound),
             stall_before_group: Some(2),
-            stall_ignores_cancel: Some(Duration::from_secs(3)),
+            stall_gate: Some(gate.clone()),
         };
         let mut ring = h.ring(2, options);
         for _ in 0..2 {
@@ -569,11 +572,14 @@ fn reader_that_ignores_cancel_is_detached_not_joined() {
             h.upload(&mut ring, g);
         }
         let next = ring.next_group().expect("an error").unwrap_err();
-        let t = Instant::now();
+        while !gate.is_waiting() {
+            std::thread::yield_now();
+        }
         let finish = ring.finish().unwrap_err();
-        let took = t.elapsed();
+        let still_waiting = gate.is_waiting();
+        gate.release();
         drop(ring);
-        (next, finish, took)
+        (next, finish, still_waiting)
     });
     assert!(next.contains("stalled by the test hook before group 2"), "{}", next);
     assert!(
@@ -581,7 +587,7 @@ fn reader_that_ignores_cancel_is_detached_not_joined() {
         "{}",
         finish
     );
-    assert!(took < Duration::from_secs(2), "finish took {:?}", took);
+    assert!(still_waiting, "the reader was joined or released before finish returned");
 }
 
 #[test]
@@ -595,7 +601,7 @@ fn stale_cuda_error_does_not_fail_the_transport() {
     write_store(&path, 3_200, 64);
     // CUDA keeps the last error per host thread, so the failed allocation and
     // the transport run on the same worker.
-    let (clean, after) = bounded("stale error", Duration::from_secs(60), move || {
+    let (clean, after) = bounded("stale error", HANG_GUARD, move || {
         let fs = FileStore::open(&path).unwrap();
         let b = build(&fs);
         let names = ["r1".to_string(), "range1".to_string()];

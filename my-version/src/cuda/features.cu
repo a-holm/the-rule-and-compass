@@ -131,37 +131,70 @@ static void stats_end(RcEnrich *c)
     c->last.wall_ms = rc_now_ms() - c->batch_start_ms;
     c->last.batch = 1;
 }
+/* What the fused kernels read from the resident context. Passed by value so
+ * device code never dereferences the host-allocated RcEnrich. */
+typedef struct RcFeatDev {
+    int n;
+    int nseg;
+    int step;
+    unsigned int present;
+    const long long *d_times;
+    const double *d_open;
+    const double *d_high;
+    const double *d_low;
+    const double *d_close;
+    const double *d_volume;
+    const double *d_qvolume;
+    const double *d_trades;
+    const double *d_tb;
+    const int *d_run_id; /* NULL on the projected-arena path; rc_gap handles it */
+    const int *d_seg_id;
+    const int *d_seg_start;
+    const int *d_seg_len;
+    double *d_d;
+} RcFeatDev;
+
+static RcFeatDev feat_dev(const RcEnrich *c)
+{
+    RcFeatDev v = {c->n,        c->nseg,     c->step,     c->present,
+                   c->d_times,  c->d_open,   c->d_high,   c->d_low,
+                   c->d_close,  c->d_volume, c->d_qvolume, c->d_trades,
+                   c->d_tb,     c->d_run_id, c->d_seg_id, c->d_seg_start,
+                   c->d_seg_len, c->d_d};
+    return v;
+}
+
 
 /* ------------------------------------------------------------------------- */
 /* Device helpers                                                            */
 /* ------------------------------------------------------------------------- */
 
-__device__ __forceinline__ bool rc_seg_start(const RcEnrich *c, int i)
+__device__ __forceinline__ bool rc_seg_start(const RcFeatDev &c, int i)
 {
-    return i == 0 || c->d_seg_id[i] != c->d_seg_id[i - 1];
+    return i == 0 || c.d_seg_id[i] != c.d_seg_id[i - 1];
 }
 
-__device__ __forceinline__ bool rc_gap(const RcEnrich *c, int i)
+__device__ __forceinline__ bool rc_gap(const RcFeatDev &c, int i)
 {
-    if (i <= 0 || c->d_seg_id[i] != c->d_seg_id[i - 1]) return false;
+    if (i <= 0 || c.d_seg_id[i] != c.d_seg_id[i - 1]) return false;
     /* The projected-arena path (#294) uploads times through the ring and does
        not precompute d_run_id; the exact same test is one subtraction. */
-    if (c->d_run_id) return c->d_run_id[i] != c->d_run_id[i - 1];
-    return c->d_times[i] - c->d_times[i - 1] != (long long)c->step;
+    if (c.d_run_id) return c.d_run_id[i] != c.d_run_id[i - 1];
+    return c.d_times[i] - c.d_times[i - 1] != (long long)c.step;
 }
 
 /* CPU `contig(times, i, w, step)`: the whole window is one contiguous run. */
-__device__ __forceinline__ bool rc_contig(const RcEnrich *c, int i, int w)
+__device__ __forceinline__ bool rc_contig(const RcFeatDev &c, int i, int w)
 {
     if (i + 1 < w) return false;
-    return c->d_times[i + 1 - w] ==
-           c->d_times[i] - (long long)(w - 1) * (long long)c->step;
+    return c.d_times[i + 1 - w] ==
+           c.d_times[i] - (long long)(w - 1) * (long long)c.step;
 }
 
 /* Same as `rc_contig` plus the window does not cross a symbol boundary. */
-__device__ __forceinline__ bool rc_contig_seg(const RcEnrich *c, int i, int w)
+__device__ __forceinline__ bool rc_contig_seg(const RcFeatDev &c, int i, int w)
 {
-    return rc_contig(c, i, w) && c->d_seg_id[i + 1 - w] == c->d_seg_id[i];
+    return rc_contig(c, i, w) && c.d_seg_id[i + 1 - w] == c.d_seg_id[i];
 }
 
 __device__ __forceinline__ double rc_div_pos(double a, double b)
@@ -203,11 +236,11 @@ __device__ __forceinline__ double rc_neg_part(double x)
 /* Flow base                                                                 */
 /* ------------------------------------------------------------------------- */
 
-__global__ void k_flow_base(RcEnrich *c, double *f)
+__global__ void k_flow_base(RcFeatDev c, double *f)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= c->n) return;
-    const int n = c->n;
+    if (i >= c.n) return;
+    const int n = c.n;
     double *vwap = f + (size_t)RC_FB_VWAP * n;
     double *per_trade = f + (size_t)RC_FB_PER_TRADE * n;
     double *amihud = f + (size_t)RC_FB_AMIHUD * n;
@@ -215,18 +248,18 @@ __global__ void k_flow_base(RcEnrich *c, double *f)
     double *net = f + (size_t)RC_FB_NET * n;
     double *stepv = f + (size_t)RC_FB_STEP * n;
 
-    bool vol_present = (c->present & RC_PRESENT_VOLUME) != 0;
-    bool qv_present = (c->present & RC_PRESENT_QUOTE_VOLUME) != 0;
-    bool trades_present = (c->present & RC_PRESENT_TRADES) != 0;
-    bool tb_present = (c->present & RC_PRESENT_TAKER_BUY) != 0;
+    bool vol_present = (c.present & RC_PRESENT_VOLUME) != 0;
+    bool qv_present = (c.present & RC_PRESENT_QUOTE_VOLUME) != 0;
+    bool trades_present = (c.present & RC_PRESENT_TRADES) != 0;
+    bool tb_present = (c.present & RC_PRESENT_TAKER_BUY) != 0;
 
-    double v = vol_present ? c->d_volume[i] : NAN;
-    double qv = qv_present ? c->d_qvolume[i] : NAN;
-    double trades = trades_present ? c->d_trades[i] : NAN;
-    double tb = tb_present ? c->d_tb[i] : NAN;
-    double h = c->d_high[i];
-    double l = c->d_low[i];
-    double cl = c->d_close[i];
+    double v = vol_present ? c.d_volume[i] : NAN;
+    double qv = qv_present ? c.d_qvolume[i] : NAN;
+    double trades = trades_present ? c.d_trades[i] : NAN;
+    double tb = tb_present ? c.d_tb[i] : NAN;
+    double h = c.d_high[i];
+    double l = c.d_low[i];
+    double cl = c.d_close[i];
 
     /* The fused base reads each optional flow column once. These branches are
        on a uniform presence mask, not a per-consumer reload. */
@@ -240,12 +273,12 @@ __global__ void k_flow_base(RcEnrich *c, double *f)
     }
 
     bool lr_ok = !rc_seg_start(c, i) && !rc_gap(c, i) && isfinite(cl) &&
-                 isfinite(c->d_close[i - 1]) && cl > 0.0 &&
-                 c->d_close[i - 1] > 0.0;
+                 isfinite(c.d_close[i - 1]) && cl > 0.0 &&
+                 c.d_close[i - 1] > 0.0;
     /* The Amihud plane stores the per-bar |log return| / quote volume: the
        96-bar consumer averages this value directly. */
     if (lr_ok && isfinite(qv) && qv > 0.0) {
-        amihud[i] = fabs(log(cl / c->d_close[i - 1])) / qv;
+        amihud[i] = fabs(log(cl / c.d_close[i - 1])) / qv;
     } else {
         amihud[i] = NAN;
     }
@@ -265,8 +298,8 @@ __global__ void k_flow_base(RcEnrich *c, double *f)
     /* OBV step = sign(C_t - C_{t-1}) * volume, valid only inside a run. The CPU
        recurrence requires finite closes and volume, not positive closes. */
     if (i > 0 && !rc_gap(c, i) && isfinite(cl) &&
-        isfinite(c->d_close[i - 1]) && isfinite(v)) {
-        double pc = c->d_close[i - 1];
+        isfinite(c.d_close[i - 1]) && isfinite(v)) {
+        double pc = c.d_close[i - 1];
         double sign = cl > pc ? 1.0 : (cl < pc ? -1.0 : 0.0);
         stepv[i] = sign * v;
     } else {
@@ -278,23 +311,23 @@ __global__ void k_flow_base(RcEnrich *c, double *f)
  * global reads and writes are coalesced while thread 0 keeps the CPU's exact
  * left-to-right recurrence order. */
 #define ST_TILE 512
-__global__ void k_flow_state(RcEnrich *c, double *f)
+__global__ void k_flow_state(RcFeatDev c, double *f)
 {
     int s = blockIdx.x;
-    if (s >= c->nseg) return;
+    if (s >= c.nseg) return;
     __shared__ double sv[ST_TILE];
     __shared__ double sstep[ST_TILE];
     __shared__ double snet[ST_TILE];
     __shared__ double sobv[ST_TILE];
     __shared__ double scvd[ST_TILE];
-    const int n = c->n;
+    const int n = c.n;
     double *obv = f + (size_t)RC_FB_OBV * n;
     double *cvd = f + (size_t)RC_FB_CVD * n;
     double *net = f + (size_t)RC_FB_NET * n;
     double *stepv = f + (size_t)RC_FB_STEP * n;
-    int start = c->d_seg_start[s];
-    int len = c->d_seg_len[s];
-    bool vol_present = (c->present & RC_PRESENT_VOLUME) != 0;
+    int start = c.d_seg_start[s];
+    int len = c.d_seg_len[s];
+    bool vol_present = (c.present & RC_PRESENT_VOLUME) != 0;
     int tid = threadIdx.x;
     double obv_prev = NAN;
     double cvd_prev = NAN;
@@ -304,7 +337,7 @@ __global__ void k_flow_state(RcEnrich *c, double *f)
         if (tlen > ST_TILE) tlen = ST_TILE;
         for (int j = tid; j < tlen; j += blockDim.x) {
             int i = start + base + j;
-            sv[j] = vol_present ? c->d_volume[i] : NAN;
+            sv[j] = vol_present ? c.d_volume[i] : NAN;
             sstep[j] = stepv[i];
             snet[j] = net[i];
         }
@@ -398,7 +431,7 @@ struct RtView {
 
 /* Single-thread prefix of the staged tile in the CPU order: restart at the
  * segment start, at gap rows and every RW_BLOCK segment-relative rows. */
-__device__ __forceinline__ void rt_prefix_tile(RtShared *sh, const RcEnrich *c,
+__device__ __forceinline__ void rt_prefix_tile(RtShared *sh, const RcFeatDev &c,
                                                int start, int base, int tlen,
                                                RwAcc *acc, bool sq)
 {
@@ -483,36 +516,36 @@ __global__ void k_flow_copy(const double *src, double *out, int n)
 }
 
 /* `vwap20_dev`: direct 20-value sums in CPU order, one thread per row. */
-__global__ void k_flow_vwap20(const RcEnrich *c, double *out)
+__global__ void k_flow_vwap20(RcFeatDev c, double *out)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= c->n) return;
+    if (i >= c.n) return;
     out[i] = NAN;
     if (i + 1 < 20 || !rc_contig_seg(c, i, 20)) return;
     double q = 0.0;
     double vol = 0.0;
     for (int j = i + 1 - 20; j <= i; ++j) {
-        q += c->d_qvolume[j];
-        vol += c->d_volume[j];
+        q += c.d_qvolume[j];
+        vol += c.d_volume[j];
     }
     if (vol > 0.0) {
         double vw = q / vol;
-        if (vw > 0.0) out[i] = c->d_close[i] / vw - 1.0;
+        if (vw > 0.0) out[i] = c.d_close[i] / vw - 1.0;
     }
 }
 
 /* Single-source rolling columns: avg_trade_size96 (log mean), amihud96
  * (mean x 1e6), obv_z96 (z-score), cvd_proxy (cumulative / std) and
  * zero_ret_share96 (0/1 mean). */
-__global__ void k_flow_roll_single(const RcEnrich *c, const double *f,
+__global__ void k_flow_roll_single(RcFeatDev c, const double *f,
                                    int which, double *out)
 {
     int s = blockIdx.x;
-    if (s >= c->nseg) return;
+    if (s >= c.nseg) return;
     __shared__ RtShared sh;
-    int start = c->d_seg_start[s];
-    int len = c->d_seg_len[s];
-    const int n = c->n;
+    int start = c.d_seg_start[s];
+    int len = c.d_seg_len[s];
+    const int n = c.n;
     const double *obv = f + (size_t)RC_FB_OBV * n;
     const double *cvd = f + (size_t)RC_FB_CVD * n;
     const double *src = which == RC_FLOW_AVG_TRADE_SIZE96
@@ -534,10 +567,10 @@ __global__ void k_flow_roll_single(const RcEnrich *c, const double *f,
             if (which == RC_FLOW_ZERO_RET_SHARE96) {
                 int p = base + j;
                 v = NAN;
-                if (p > 0 && !rc_gap(c, i) && isfinite(c->d_close[i]) &&
-                    isfinite(c->d_close[i - 1]) && c->d_close[i] > 0.0 &&
-                    c->d_close[i - 1] > 0.0) {
-                    v = (c->d_close[i] == c->d_close[i - 1]) ? 1.0 : 0.0;
+                if (p > 0 && !rc_gap(c, i) && isfinite(c.d_close[i]) &&
+                    isfinite(c.d_close[i - 1]) && c.d_close[i] > 0.0 &&
+                    c.d_close[i - 1] > 0.0) {
+                    v = (c.d_close[i] == c.d_close[i - 1]) ? 1.0 : 0.0;
                 }
             } else {
                 v = src[i];
@@ -578,14 +611,14 @@ __global__ void k_flow_roll_single(const RcEnrich *c, const double *f,
 /* Two-source rolling columns: taker_ratio96, taker_imb16,
  * trade_intensity96, vwap_dev96 and cmf20. Pass A stages the x1 mean into the
  * global scratch plane, pass B stages x2 and writes the ratio. */
-__global__ void k_flow_roll_two(const RcEnrich *c, const double *f, int which,
+__global__ void k_flow_roll_two(RcFeatDev c, const double *f, int which,
                                 const double *x1, const double *x2, double *out)
 {
     int s = blockIdx.x;
-    if (s >= c->nseg) return;
+    if (s >= c.nseg) return;
     __shared__ RtShared sh;
-    int start = c->d_seg_start[s];
-    int len = c->d_seg_len[s];
+    int start = c.d_seg_start[s];
+    int len = c.d_seg_len[s];
     int w = which == RC_FLOW_TAKER_IMB16 ? 16 : (which == RC_FLOW_CMF20 ? 20 : 96);
     int tid = threadIdx.x;
 
@@ -605,7 +638,7 @@ __global__ void k_flow_roll_two(const RcEnrich *c, const double *f, int which,
             int i = start + p;
             sh.m1[j] = NAN;
             if (p >= w - 1 && rc_contig(c, i, w)) sh.m1[j] = rt_mean(&sh, j, w);
-            c->d_d[i] = sh.m1[j];
+            c.d_d[i] = sh.m1[j];
         }
         __syncthreads();
     }
@@ -625,7 +658,7 @@ __global__ void k_flow_roll_two(const RcEnrich *c, const double *f, int which,
             int i = start + p;
             out[i] = NAN;
             if (p < w - 1 || !rc_contig(c, i, w)) continue;
-            double m1 = c->d_d[i];
+            double m1 = c.d_d[i];
             double m2 = rt_mean(&sh, j, w);
             if (which == RC_FLOW_TAKER_RATIO96) {
                 out[i] = rc_div_pos(m1, m2);
@@ -639,8 +672,8 @@ __global__ void k_flow_roll_two(const RcEnrich *c, const double *f, int which,
                 }
             } else if (which == RC_FLOW_VWAP_DEV96) {
                 double vw = rc_div_pos(m1, m2);
-                if (isfinite(c->d_close[i]) && vw > 0.0) {
-                    out[i] = (c->d_close[i] - vw) / vw;
+                if (isfinite(c.d_close[i]) && vw > 0.0) {
+                    out[i] = (c.d_close[i] - vw) / vw;
                 }
             } else {
                 out[i] = rc_div_pos(m1, m2);
@@ -655,22 +688,22 @@ __global__ void k_flow_roll_two(const RcEnrich *c, const double *f, int which,
 /* Price-action base                                                         */
 /* ------------------------------------------------------------------------- */
 
-__global__ void k_price_base(RcEnrich *c, double *f)
+__global__ void k_price_base(RcFeatDev c, double *f)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= c->n) return;
-    const int n = c->n;
+    if (i >= c.n) return;
+    const int n = c.n;
     double *clv = f + (size_t)RC_PB_CLV * n;
     double *body = f + (size_t)RC_PB_BODY * n;
     double *rng = f + (size_t)RC_PB_RNG * n;
     double *valid = f + (size_t)RC_PB_VALID * n;
     double *tr = f + (size_t)RC_PB_ATR * n;
 
-    double o = c->d_open[i];
-    double h = c->d_high[i];
-    double l = c->d_low[i];
-    double cl = c->d_close[i];
-    double v = (c->present & RC_PRESENT_VOLUME) ? c->d_volume[i] : NAN;
+    double o = c.d_open[i];
+    double h = c.d_high[i];
+    double l = c.d_low[i];
+    double cl = c.d_close[i];
+    double v = (c.present & RC_PRESENT_VOLUME) ? c.d_volume[i] : NAN;
 
     bool volume_ok = !isfinite(v) || v > 0.0;
     bool finite = isfinite(o) && isfinite(h) && isfinite(l) && isfinite(cl);
@@ -689,11 +722,11 @@ __global__ void k_price_base(RcEnrich *c, double *f)
 
     if (!(isfinite(h) && isfinite(l))) {
         tr[i] = NAN;
-    } else if (i == 0 || rc_seg_start(c, i) || !isfinite(c->d_close[i - 1]) ||
+    } else if (i == 0 || rc_seg_start(c, i) || !isfinite(c.d_close[i - 1]) ||
                rc_gap(c, i)) {
         tr[i] = h - l;
     } else {
-        double pc = c->d_close[i - 1];
+        double pc = c.d_close[i - 1];
         double a = h - l;
         double b = fabs(h - pc);
         double d = fabs(l - pc);
@@ -703,14 +736,14 @@ __global__ void k_price_base(RcEnrich *c, double *f)
 }
 
 /* Wilder state, in place over the true-range plane. */
-__global__ void k_price_wilder(RcEnrich *c, double *f)
+__global__ void k_price_wilder(RcFeatDev c, double *f)
 {
     int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= c->nseg) return;
-    const int n = c->n;
+    if (s >= c.nseg) return;
+    const int n = c.n;
     double *atr = f + (size_t)RC_PB_ATR * n;
-    int start = c->d_seg_start[s];
-    int len = c->d_seg_len[s];
+    int start = c.d_seg_start[s];
+    int len = c.d_seg_len[s];
     const double a = 1.0 / 14.0;
     double prev = NAN;
     for (int p = 0; p < len; ++p) {
@@ -730,14 +763,14 @@ __global__ void k_price_wilder(RcEnrich *c, double *f)
 
 /* Strict rolling columns: clv16, body16 and trend96. One block per segment
  * with the same shared-tile prefix as the flow consumers. */
-__global__ void k_price_roll(const RcEnrich *c, const double *f, int which, double *out)
+__global__ void k_price_roll(RcFeatDev c, const double *f, int which, double *out)
 {
     int s = blockIdx.x;
-    if (s >= c->nseg) return;
+    if (s >= c.nseg) return;
     __shared__ RtShared sh;
-    int start = c->d_seg_start[s];
-    int len = c->d_seg_len[s];
-    const int n = c->n;
+    int start = c.d_seg_start[s];
+    int len = c.d_seg_len[s];
+    const int n = c.n;
     const double *clv = f + (size_t)RC_PB_CLV * n;
     const double *body = f + (size_t)RC_PB_BODY * n;
     const double *valid = f + (size_t)RC_PB_VALID * n;
@@ -753,7 +786,7 @@ __global__ void k_price_roll(const RcEnrich *c, const double *f, int which, doub
             int i = start + base + j;
             sh.xv[RT_W + j] = which == RC_PA_CLV16 ? clv[i]
                      : (which == RC_PA_BODY16 ? body[i]
-                        : (valid[i] != 0.0 ? c->d_close[i] : NAN));
+                        : (valid[i] != 0.0 ? c.d_close[i] : NAN));
         }
         __syncthreads();
         if (tid == 0) rt_prefix_tile(&sh, c, start, base, tlen, &acc, false);
@@ -765,8 +798,8 @@ __global__ void k_price_roll(const RcEnrich *c, const double *f, int which, doub
             if (p < w - 1 || !rc_contig(c, i, w)) continue;
             double m = rt_strict(&sh, j, w);
             if (which == RC_PA_TREND96) {
-                if (valid[i] != 0.0 && m > 0.0 && c->d_close[i] > 0.0) {
-                    out[i] = c->d_close[i] / m - 1.0;
+                if (valid[i] != 0.0 && m > 0.0 && c.d_close[i] > 0.0) {
+                    out[i] = c.d_close[i] / m - 1.0;
                 }
             } else {
                 out[i] = m;
@@ -777,23 +810,23 @@ __global__ void k_price_roll(const RcEnrich *c, const double *f, int which, doub
 }
 
 /* Run streak: one thread per segment; the state is a short integer recurrence. */
-__global__ void k_price_run8(const RcEnrich *c, double *out)
+__global__ void k_price_run8(RcFeatDev c, double *out)
 {
     int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= c->nseg) return;
-    int start = c->d_seg_start[s];
-    int len = c->d_seg_len[s];
+    if (s >= c.nseg) return;
+    int start = c.d_seg_start[s];
+    int len = c.d_seg_len[s];
     int streak = 0;
     for (int p = 0; p < len; ++p) {
         int i = start + p;
         out[i] = NAN;
-        if (p == 0 || rc_gap(c, i) || !isfinite(c->d_close[i]) ||
-            !isfinite(c->d_close[i - 1])) {
+        if (p == 0 || rc_gap(c, i) || !isfinite(c.d_close[i]) ||
+            !isfinite(c.d_close[i - 1])) {
             streak = 0;
             continue;
         }
-        double cur = c->d_close[i];
-        double prev = c->d_close[i - 1];
+        double cur = c.d_close[i];
+        double prev = c.d_close[i - 1];
         if (cur > prev) {
             streak = streak > 0 ? streak + 1 : 1;
         } else if (cur < prev) {
@@ -807,9 +840,9 @@ __global__ void k_price_run8(const RcEnrich *c, double *out)
 }
 
 /* Two-bar and single-bar columns: one thread per row. */
-__global__ void k_price_elem(const RcEnrich *c, const double *f, int which, double *out)
+__global__ void k_price_elem(RcFeatDev c, const double *f, int which, double *out)
 {
-    const int n = c->n;
+    const int n = c.n;
     const double *body = f + (size_t)RC_PB_BODY * n;
     const double *rng = f + (size_t)RC_PB_RNG * n;
     const double *valid = f + (size_t)RC_PB_VALID * n;
@@ -828,28 +861,28 @@ __global__ void k_price_elem(const RcEnrich *c, const double *f, int which, doub
         break;
     case RC_PA_PREV_RANGE_POS:
         if (v0 != 0.0 && v1 != 0.0 && !gap) {
-            double r0 = c->d_high[i - 1] - c->d_low[i - 1];
+            double r0 = c.d_high[i - 1] - c.d_low[i - 1];
             if (r0 > 0.0) {
-                out[i] = (c->d_close[i] - c->d_low[i - 1]) / r0 - 0.5;
+                out[i] = (c.d_close[i] - c.d_low[i - 1]) / r0 - 0.5;
             }
         }
         break;
     case RC_PA_INSIDE_S:
         if (v0 != 0.0 && v1 != 0.0 && !gap && isfinite(a) && a > 0.0) {
-            double h = c->d_high[i];
-            double l = c->d_low[i];
-            double hp = c->d_high[i - 1];
-            double lp = c->d_low[i - 1];
+            double h = c.d_high[i];
+            double l = c.d_low[i];
+            double hp = c.d_high[i - 1];
+            double lp = c.d_low[i - 1];
             out[i] = rc_relu(1.0 - rc_relu(h - hp) / a) *
                      rc_relu(1.0 - rc_relu(lp - l) / a);
         }
         break;
     case RC_PA_OUTSIDE_S:
         if (v0 != 0.0 && v1 != 0.0 && !gap && isfinite(a) && a > 0.0) {
-            double h = c->d_high[i];
-            double l = c->d_low[i];
-            double hp = c->d_high[i - 1];
-            double lp = c->d_low[i - 1];
+            double h = c.d_high[i];
+            double l = c.d_low[i];
+            double hp = c.d_high[i - 1];
+            double lp = c.d_low[i - 1];
             out[i] = rc_relu(1.0 - rc_relu(hp - h) / a) *
                      rc_relu(1.0 - rc_relu(l - lp) / a);
         }
@@ -861,9 +894,9 @@ __global__ void k_price_elem(const RcEnrich *c, const double *f, int which, doub
             double size = rc_relu((fabs(b1) - fabs(b0)) /
                                   (fabs(b1) + fabs(b0) + 1e-12));
             double bull = rc_pos_part(b1) * rc_neg_part(b0) * size *
-                          rc_clamp01(rc_relu(c->d_close[i] - c->d_open[i - 1]) / a);
+                          rc_clamp01(rc_relu(c.d_close[i] - c.d_open[i - 1]) / a);
             double bear = rc_neg_part(b1) * rc_pos_part(b0) * size *
-                          rc_clamp01(rc_relu(c->d_open[i] - c->d_close[i - 1]) / a);
+                          rc_clamp01(rc_relu(c.d_open[i] - c.d_close[i - 1]) / a);
             out[i] = bull - bear;
         }
         break;
@@ -874,11 +907,11 @@ __global__ void k_price_elem(const RcEnrich *c, const double *f, int which, doub
             double b1 = body[i];
             double shrink = fabs(b0) > 1e-12
                 ? rc_relu(1.0 - fabs(b1) / (0.5 * fabs(b0))) : 0.0;
-            double r0 = c->d_high[i - 1] - c->d_low[i - 1];
-            double hi0 = fmax(c->d_open[i - 1], c->d_close[i - 1]);
-            double lo0 = fmin(c->d_open[i - 1], c->d_close[i - 1]);
-            double hi1 = fmax(c->d_open[i], c->d_close[i]);
-            double lo1 = fmin(c->d_open[i], c->d_close[i]);
+            double r0 = c.d_high[i - 1] - c.d_low[i - 1];
+            double hi0 = fmax(c.d_open[i - 1], c.d_close[i - 1]);
+            double lo0 = fmin(c.d_open[i - 1], c.d_close[i - 1]);
+            double hi1 = fmax(c.d_open[i], c.d_close[i]);
+            double lo1 = fmin(c.d_open[i], c.d_close[i]);
             double contain = 0.0;
             if (r0 > 0.0) {
                 contain = rc_relu(1.0 - rc_relu(hi1 - hi0) / r0) *
@@ -900,11 +933,11 @@ __global__ void k_price_elem(const RcEnrich *c, const double *f, int which, doub
                 ok = false;
                 break;
             }
-            double r = c->d_high[j] - c->d_low[j];
+            double r = c.d_high[j] - c.d_low[j];
             if (r < min_r) min_r = r;
         }
         if (ok && min_r > 0.0) {
-            out[i] = (c->d_high[i] - c->d_low[i]) / min_r;
+            out[i] = (c.d_high[i] - c.d_low[i]) / min_r;
         }
         break;
     }
@@ -989,12 +1022,13 @@ int rc_features_flow_base(void *v)
 {
     RcEnrich *c = (RcEnrich *)v;
     if (!c) return -1;
+    const RcFeatDev d = feat_dev(c);
     if (feat_ensure(c, RC_FB_PLANES) != 0) return -1;
     FEAT_BEGIN(c);
     int threads = 256;
     int blocks = (c->n + threads - 1) / threads;
-    FEAT_LAUNCH(c, (k_flow_base<<<blocks, threads>>>(c, c->d_feat)));
-    FEAT_LAUNCH(c, (k_flow_state<<<c->nseg, 256>>>(c, c->d_feat)));
+    FEAT_LAUNCH(c, (k_flow_base<<<blocks, threads>>>(d, c->d_feat)));
+    FEAT_LAUNCH(c, (k_flow_state<<<c->nseg, 256>>>(d, c->d_feat)));
     /* Counted reads: the elementwise base consumed each present optional flow
        column exactly once, independent of the requested output count. */
     if (c->present & RC_PRESENT_TRADES) c->base_reads += 1;
@@ -1007,6 +1041,7 @@ int rc_features_flow_col(void *v, int which, double *out)
 {
     RcEnrich *c = (RcEnrich *)v;
     if (!c || !out || which < 0 || which >= RC_FLOW_COUNT) return -1;
+    const RcFeatDev d = feat_dev(c);
     if (!c->d_feat) return -1;
     FEAT_BEGIN(c);
     int rows = (c->n + 255) / 256;
@@ -1016,14 +1051,14 @@ int rc_features_flow_col(void *v, int which, double *out)
         FEAT_LAUNCH(c, (k_flow_copy<<<rows, 256>>>(c->d_feat + (size_t)RC_FB_VWAP * c->n, c->d_out, c->n)));
         break;
     case RC_FLOW_VWAP20_DEV:
-        FEAT_LAUNCH(c, (k_flow_vwap20<<<rows, 256>>>(c, c->d_out)));
+        FEAT_LAUNCH(c, (k_flow_vwap20<<<rows, 256>>>(d, c->d_out)));
         break;
     case RC_FLOW_AVG_TRADE_SIZE96:
     case RC_FLOW_AMIHUD96:
     case RC_FLOW_ZERO_RET_SHARE96:
     case RC_FLOW_OBV_Z96:
     case RC_FLOW_CVD_PROXY:
-        FEAT_LAUNCH(c, (k_flow_roll_single<<<segs, 256>>>(c, c->d_feat, which, c->d_out)));
+        FEAT_LAUNCH(c, (k_flow_roll_single<<<segs, 256>>>(d, c->d_feat, which, c->d_out)));
         break;
     case RC_FLOW_TAKER_RATIO96:
     case RC_FLOW_TAKER_IMB16:
@@ -1036,7 +1071,7 @@ int rc_features_flow_col(void *v, int which, double *out)
             : (which == RC_FLOW_VWAP_DEV96 ? c->d_qvolume
                : (which == RC_FLOW_CMF20 ? c->d_feat + (size_t)RC_FB_MFV * n
                   : c->d_tb));
-        FEAT_LAUNCH(c, (k_flow_roll_two<<<segs, 256>>>(c, c->d_feat, which, x1, c->d_volume, c->d_out)));
+        FEAT_LAUNCH(c, (k_flow_roll_two<<<segs, 256>>>(d, c->d_feat, which, x1, c->d_volume, c->d_out)));
         break;
     }
     default:
@@ -1050,13 +1085,14 @@ int rc_features_price_base(void *v)
 {
     RcEnrich *c = (RcEnrich *)v;
     if (!c) return -1;
+    const RcFeatDev d = feat_dev(c);
     if (feat_ensure(c, RC_PB_PLANES) != 0) return -1;
     FEAT_BEGIN(c);
     int threads = 256;
     int blocks = (c->n + threads - 1) / threads;
-    FEAT_LAUNCH(c, (k_price_base<<<blocks, threads>>>(c, c->d_feat)));
+    FEAT_LAUNCH(c, (k_price_base<<<blocks, threads>>>(d, c->d_feat)));
     int seg_blocks = (c->nseg + 127) / 128;
-    FEAT_LAUNCH(c, (k_price_wilder<<<seg_blocks, 128>>>(c, c->d_feat)));
+    FEAT_LAUNCH(c, (k_price_wilder<<<seg_blocks, 128>>>(d, c->d_feat)));
     c->base_passes += 2;
     FEAT_END(c);
 }
@@ -1065,6 +1101,7 @@ int rc_features_price_col(void *v, int which, double *out)
 {
     RcEnrich *c = (RcEnrich *)v;
     if (!c || !out || which < 0 || which >= RC_PA_COUNT) return -1;
+    const RcFeatDev d = feat_dev(c);
     if (!c->d_feat) return -1;
     FEAT_BEGIN(c);
     int rows = (c->n + 255) / 256;
@@ -1073,13 +1110,13 @@ int rc_features_price_col(void *v, int which, double *out)
     case RC_PA_CLV16:
     case RC_PA_BODY16:
     case RC_PA_TREND96:
-        FEAT_LAUNCH(c, (k_price_roll<<<segs, 256>>>(c, c->d_feat, which, c->d_out)));
+        FEAT_LAUNCH(c, (k_price_roll<<<segs, 256>>>(d, c->d_feat, which, c->d_out)));
         break;
     case RC_PA_RUN8:
-        FEAT_LAUNCH(c, (k_price_run8<<<segs, 128>>>(c, c->d_out)));
+        FEAT_LAUNCH(c, (k_price_run8<<<segs, 128>>>(d, c->d_out)));
         break;
     default:
-        FEAT_LAUNCH(c, (k_price_elem<<<rows, 256>>>(c, c->d_feat, which, c->d_out)));
+        FEAT_LAUNCH(c, (k_price_elem<<<rows, 256>>>(d, c->d_feat, which, c->d_out)));
         break;
     }
     FEAT_DOWNLOAD(c, out);

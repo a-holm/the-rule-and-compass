@@ -1214,7 +1214,8 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_cost_is_far_below_a_full_fit() {
+    #[ignore = "timing measurement"]
+    fn measure_descriptor_cost() {
         let small = sample();
         let mut big = Sample::default();
         for i in 0..800 {

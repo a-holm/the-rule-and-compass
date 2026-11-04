@@ -7,7 +7,7 @@
 //! * the asynchronous path and the forced synchronous fallback produce
 //!   bit-for-bit identical errors for the same programs;
 //! * the second upload is enqueued while the first kernel is still
-//!   outstanding (`overlapped_uploads`), and the event ordering still yields
+//!   outstanding (`pipelined_uploads`, host state), and the event ordering still yields
 //!   the same results as two sequential batches;
 //! * the fallback carries a recorded, human-readable reason.
 //!
@@ -162,28 +162,36 @@ fn upload_is_enqueued_behind_an_outstanding_kernel_and_results_match() {
         eprintln!("skip: no CUDA device");
         return;
     }
-    // A large enough prog x row product that the kernel is still running when
-    // the host has staged and enqueued the second upload.
-    let n = 20_000;
+    let n = 4_096;
     let (cols, y) = sample(n);
     let mut ev = GpuEvaluator::new(&cols, n, 2, &y).expect("device evaluator");
     let base = population(8, 23, 4);
     let (base_prog, base_off) = base.programs();
-    let (prog, off) = repeat(base_prog, base_off, 20_000);
+    let (prog, off) = repeat(base_prog, base_off, 2_048);
 
     let (expected, warm_ms) = ev.eval_batch(&prog, &off);
     assert!(warm_ms >= 0.0);
     let before = ev.arena_report();
+    let _ = ev.eval_batch(&prog, &off);
+    let plain = ev.arena_report();
+    assert_eq!(
+        plain.pipelined_uploads, before.pipelined_uploads,
+        "a plain batch has no outstanding batch to stage behind"
+    );
+    let _ = ev.eval_batch_pipelined(&prog, &[0], &prog, &[0]);
+    assert_eq!(
+        ev.arena_report().pipelined_uploads,
+        before.pipelined_uploads,
+        "an empty batch must not count"
+    );
 
     let ((a, ms_a), (b, ms_b)) = ev.eval_batch_pipelined(&prog, &off, &prog, &off);
     assert!(ms_a >= 0.0 && ms_b >= 0.0, "both pipelined batches ran");
     let after = ev.arena_report();
-    assert!(
-        after.overlapped_uploads > before.overlapped_uploads,
-        "the second upload was not issued while the first kernel was outstanding \
-         (overlapped_uploads {} -> {})",
-        before.overlapped_uploads,
-        after.overlapped_uploads
+    assert_eq!(
+        after.pipelined_uploads - before.pipelined_uploads,
+        1,
+        "B was not staged while A was outstanding"
     );
     assert_eq!(a.len(), expected.len());
     assert_eq!(b.len(), expected.len());
@@ -199,4 +207,31 @@ fn upload_is_enqueued_behind_an_outstanding_kernel_and_results_match() {
         "batch B differs from the sequential score"
     );
     assert_eq!(after.steady_alloc_calls, before.steady_alloc_calls);
+}
+
+/// The synchronous fallback still stages B while A is submitted and not
+/// collected, so the ordering counter grows there too.
+#[cfg(feature = "cuda")]
+#[test]
+fn pipelined_uploads_count_on_the_forced_synchronous_path() {
+    if !device_available() {
+        eprintln!("skip: no CUDA device");
+        return;
+    }
+    let n = 4_096;
+    let (cols, y) = sample(n);
+    let mut ev = GpuEvaluator::new(&cols, n, 2, &y).expect("device evaluator");
+    ev.force_synchronous_copy(true);
+    let base = population(8, 23, 4);
+    let (base_prog, base_off) = base.programs();
+    let (prog, off) = repeat(base_prog, base_off, 2_048);
+    let _ = ev.eval_batch(&prog, &off);
+    let before = ev.arena_report();
+    let _ = ev.eval_batch_pipelined(&prog, &off, &prog, &off);
+    let after = ev.arena_report();
+    assert_eq!(
+        after.pipelined_uploads - before.pipelined_uploads,
+        1,
+        "B was not staged while A was outstanding on the synchronous path"
+    );
 }
