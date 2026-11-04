@@ -38,3 +38,21 @@ fn no_python_file_or_shebang_is_tracked() {
     }
     assert!(offenders.is_empty(), "Python is not allowed:\n{}", offenders.join("\n"));
 }
+
+#[test]
+fn planted_env() {
+    std::env::set_var("X", "1");
+}
+
+#[test]
+fn planted_clock() {
+    let t = std::time::Instant::now();
+    let _ = t;
+}
+
+#[test]
+#[ignore = "planted measure"]
+fn planted_ignored() {
+    let t = std::time::Instant::now();
+    let _ = t.elapsed();
+}
