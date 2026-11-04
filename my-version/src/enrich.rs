@@ -2755,8 +2755,9 @@ pub fn plan_groups_full(
         let gpu_cells_n = n_rows.saturating_mul(supported).max(1);
         let gpu_cells = gpu_cells_n as f64;
         let transfer_bytes = gpu_cells_n as f64 * 8.0;
-        let context_ms =
-            GPU_FIXED_OVERHEAD_MS + GPU_CONTEXT_MS_PER_MROW * n_rows as f64 / 1_000_000.0;
+        let context_ms_per_mrow = crate::features_gpu::fused_cost(group)
+            .map_or(GPU_CONTEXT_MS_PER_MROW, |c| c.context_ms_per_mrow);
+        let context_ms = GPU_FIXED_OVERHEAD_MS + context_ms_per_mrow * n_rows as f64 / 1_000_000.0;
         let gpu_s = if let Some(fused_ms) =
             crate::features_gpu::estimate_fused_ms(group, n_rows, supported)
         {
@@ -2774,7 +2775,13 @@ pub fn plan_groups_full(
                 + transfer_bytes / GPU_D2H_BYTES_PER_SECOND
                 + transfer_bytes / write_bps
         };
-        let cpu_supported_s = gpu_cells / op.cpu_cells_per_second();
+        let cpu_supported_s = match crate::features_gpu::fused_cost(group) {
+            Some(cost) => {
+                cost.cpu_ms_per_mrow_column * (n_rows as f64 / 1_000_000.0) * (supported as f64)
+                    / 1000.0
+            }
+            None => gpu_cells / op.cpu_cells_per_second(),
+        };
         let (backend, reason) = if gpu_requested == GpuMode::Off {
             ("cpu", "GPU disabled by --no-gpu/--cpu".to_string())
         } else if n_rows < gpu_row_floor() {

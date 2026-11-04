@@ -153,6 +153,9 @@ pub struct FusedCost {
     /// Measured CPU reference cost per million rows per output column. The CPU
     /// producer has no fused base: every column recomputes its inputs.
     pub cpu_ms_per_mrow_column: f64,
+    /// Measured milliseconds per million rows for the one-time host read and
+    /// resident upload that precede the fused base pass.
+    pub context_ms_per_mrow: f64,
 }
 
 /// Fused flow cost. Measured by `tests/features_gpu.rs` on a 1,000,075-row,
@@ -162,14 +165,16 @@ pub struct FusedCost {
 pub const FLOW_COST: FusedCost = FusedCost {
     base_ms_per_mrow: 6.084,
     column_ms_per_mrow: 12.534,
-    cpu_ms_per_mrow_column: 110.0,
+    cpu_ms_per_mrow_column: 149.0,
+    context_ms_per_mrow: 175.0,
 };
 
 /// Fused price-action cost, measured on the same fixture.
 pub const PRICE_ACTION_COST: FusedCost = FusedCost {
     base_ms_per_mrow: 9.224,
     column_ms_per_mrow: 3.619,
-    cpu_ms_per_mrow_column: 110.0,
+    cpu_ms_per_mrow_column: 131.0,
+    context_ms_per_mrow: 205.0,
 };
 
 /// Cost model lookup for a fused family.
