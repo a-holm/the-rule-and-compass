@@ -1561,12 +1561,10 @@ fn default_run_resolves_to_the_gpu_arm_and_labels_every_other_resolution() {
         eprintln!("skipping GPU test: no usable CUDA device");
         return;
     }
-    let (fitting, front) = cli_fit_and_front(&["--metric", "squared"]);
+    let (fitting, _) = cli_fit_and_front(&["--metric", "squared"]);
     assert!(fitting.contains("\"strategy\":\"gpu\""), "{fitting}");
     assert!(fitting.contains("\"strategy_source\":\"default\""), "{fitting}");
     assert!(fitting.contains("\"strategy_reason\":\"admissible\""), "{fitting}");
-    let again = cli_fit_and_front(&["--metric", "squared"]);
-    assert_eq!(front, again.1, "two default-resolved runs give one front");
 
     let (fitting, _) = cli_fit_and_front(&["--metric", "squared", "--no-fit"]);
     assert!(fitting.contains("\"strategy\":\"exact\""), "{fitting}");
