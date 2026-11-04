@@ -6,8 +6,10 @@
 //! real end-to-end run of `scripts/run-long.sh`.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 fn scripts_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts")
@@ -223,15 +225,33 @@ fn unique_dir(tag: &str) -> (Scratch, PathBuf) {
 fn rss_sampler_records_csv_and_summary_for_a_child() {
     let (_scratch, dir) = unique_dir("rss");
     let csv = dir.join("rss.csv");
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr-rss"))
-        .args(["--csv", csv.to_str().unwrap(), "--interval", "0.02", "--", "sleep", "0.2"])
-        .output()
+    let fifo = dir.join("go");
+    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr-rss"))
+        .args(["--csv", csv.to_str().unwrap(), "--interval", "0.02", "--", "bash", "-c", "read -r _ < \"$1\"", "_", fifo.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .spawn()
         .expect("run rcsr-rss");
+    loop {
+        let rows = fs::read_to_string(&csv).map(|t| t.lines().count().saturating_sub(1)).unwrap_or(0);
+        if rows >= 2 {
+            break;
+        }
+        assert!(child.try_wait().unwrap().is_none(), "rcsr-rss exited before 2 samples");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // O_RDWR on a FIFO never blocks on Linux, so a dead reader cannot hang the test.
+    let mut release = fs::OpenOptions::new().read(true).write(true).open(&fifo).unwrap();
+    release.write_all(b"\n").unwrap();
+    drop(release);
+    let output = child.wait_with_output().expect("wait rcsr-rss");
+    assert!(output.status.success(), "{:?}", output);
     assert!(output.status.success(), "{:?}", output);
     let text = fs::read_to_string(&csv).expect("read csv");
     let mut lines = text.lines();
     assert_eq!(lines.next(), Some("elapsed_s,vmrss_kib,vmhwm_kib,threads"));
-    assert!(lines.count() >= 2, "expected at least 2 samples: {text}");
+    let rows = lines.count();
+    assert!(rows >= 2, "expected at least 2 samples: {text}");
     let summary = String::from_utf8_lossy(&output.stdout);
     for key in [
         "command",
@@ -248,6 +268,7 @@ fn rss_sampler_records_csv_and_summary_for_a_child() {
         assert!(summary.contains(&format!("\"{key}\": ")), "missing {key}: {summary}");
     }
     assert!(summary.contains("\"exit_code\": 0"), "{summary}");
+    assert!(summary.contains(&format!("\"samples\": {rows},")), "{summary}");
 
     let failing = Command::new(env!("CARGO_BIN_EXE_rcsr-rss"))
         .args(["--", "sh", "-c", "exit 3"])
