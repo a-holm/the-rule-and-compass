@@ -2105,6 +2105,153 @@ pub fn row_dependent(n: &Node) -> bool {
     }
 }
 
+/// #848: the closed interval holding every finite value of a tree over all real
+/// inputs, in exact arithmetic (`lo` and `hi` may be infinite).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OutputRange {
+    pub lo: f64,
+    pub hi: f64,
+}
+
+const ANY_RANGE: OutputRange = OutputRange { lo: f64::NEG_INFINITY, hi: f64::INFINITY };
+
+fn range_of(lo: f64, hi: f64) -> OutputRange {
+    let lo = if lo.is_nan() { f64::NEG_INFINITY } else { lo };
+    let hi = if hi.is_nan() { f64::INFINITY } else { hi };
+    OutputRange { lo, hi }
+}
+
+/// Hull of the four corner products; `0 * inf` counts as 0, because a finite
+/// factor times a bounded zero is 0 and an infinite factor is a non-finite row.
+fn range_product(a: OutputRange, b: OutputRange) -> OutputRange {
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for c in [a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi] {
+        let c = if c.is_nan() { 0.0 } else { c };
+        lo = lo.min(c);
+        hi = hi.max(c);
+    }
+    OutputRange { lo, hi }
+}
+
+/// Range of `x / b` for `b` in `r`, on the rows where `eval` is finite. `eval`
+/// returns NaN for `|b| < 1e-12`, so a denominator that reaches 0 only
+/// approaches it. `None` when `r` has both signs or is exactly 0.
+fn range_inverse(r: OutputRange) -> Option<OutputRange> {
+    if r.lo >= 0.0 && r.hi > 0.0 {
+        Some(OutputRange { lo: 1.0 / r.hi, hi: if r.lo == 0.0 { f64::INFINITY } else { 1.0 / r.lo } })
+    } else if r.hi <= 0.0 && r.lo < 0.0 {
+        Some(OutputRange { lo: if r.hi == 0.0 { f64::NEG_INFINITY } else { 1.0 / r.hi }, hi: 1.0 / r.lo })
+    } else {
+        None
+    }
+}
+
+/// Hull of `f` over the argument range `a` for a function that is even, or
+/// whose minimum sits at 0: `at` maps `|v|` to the function value.
+fn range_even(a: OutputRange, at: impl Fn(f64) -> f64) -> OutputRange {
+    let (la, ha) = (at(a.lo.abs()), at(a.hi.abs()));
+    if a.lo >= 0.0 {
+        OutputRange { lo: at(a.lo), hi: at(a.hi) }
+    } else if a.hi <= 0.0 {
+        OutputRange { lo: at(-a.hi), hi: at(-a.lo) }
+    } else {
+        OutputRange { lo: at(0.0), hi: la.max(ha) }
+    }
+}
+
+/// #848: range of `n` over all real inputs in exact arithmetic. One visit per
+/// node. An operator with no rule returns the whole real line, so the range
+/// only claims what it proves. Aggregates and meta operators are constants of
+/// the training sample.
+pub fn output_range(n: &Node) -> OutputRange {
+    use Op::*;
+    let k = |i: usize| output_range(&n.kids[i]);
+    match n.op {
+        Const => range_of(n.val, n.val),
+        Complexity | Variables | Constants | Contains | ContainsOp | Agg(_) => range_of(n.val, n.val),
+        Neg => {
+            let a = k(0);
+            range_of(-a.hi, -a.lo)
+        }
+        Exp => {
+            let a = k(0);
+            range_of(a.lo.exp(), a.hi.exp())
+        }
+        Gauss | Logistic => OutputRange { lo: 0.0, hi: 1.0 },
+        Tanh => {
+            let a = k(0);
+            range_of(a.lo.tanh(), a.hi.tanh())
+        }
+        Abs => range_even(k(0), |v| v),
+        Square => range_even(k(0), |v| v * v),
+        Cube => {
+            let a = k(0);
+            range_of(a.lo * a.lo * a.lo, a.hi * a.hi * a.hi)
+        }
+        Cosh => range_even(k(0), f64::cosh),
+        Sqrt => {
+            let a = k(0);
+            if a.hi < 0.0 {
+                ANY_RANGE
+            } else {
+                range_of(a.lo.max(0.0).sqrt(), a.hi.sqrt())
+            }
+        }
+        Erf => {
+            let a = k(0);
+            let at = |v: f64| if v == f64::INFINITY { 1.0 } else if v == f64::NEG_INFINITY { -1.0 } else { erf(v) };
+            range_of(at(a.lo), at(a.hi))
+        }
+        Erfc => {
+            let a = k(0);
+            let at = |v: f64| if v == f64::INFINITY { 0.0 } else if v == f64::NEG_INFINITY { 2.0 } else { erfc(v) };
+            range_of(at(a.hi), at(a.lo))
+        }
+        Step => {
+            let a = k(0);
+            let at = |v: f64| if v > 0.0 { 1.0 } else { 0.0 };
+            OutputRange { lo: at(a.lo), hi: if a.hi > 0.0 { 1.0 } else { 0.0 } }
+        }
+        Sign => {
+            let a = k(0);
+            let at = |v: f64| if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 };
+            OutputRange { lo: at(a.lo), hi: at(a.hi) }
+        }
+        Add => {
+            let (a, b) = (k(0), k(1));
+            range_of(a.lo + b.lo, a.hi + b.hi)
+        }
+        Sub => {
+            let (a, b) = (k(0), k(1));
+            range_of(a.lo - b.hi, a.hi - b.lo)
+        }
+        Mul => range_product(k(0), k(1)),
+        Div => match range_inverse(k(1)) {
+            Some(inv) => range_product(k(0), inv),
+            None => ANY_RANGE,
+        },
+        _ => ANY_RANGE,
+    }
+}
+
+/// #848: the one position a tree takes under the long/flat rule
+/// `1[pred > threshold]` on every real input, when it has one in exact
+/// arithmetic. `Some(true)`: long on every input, or on all but the inputs
+/// that hit the threshold exactly. `Some(false)`: flat on every input. `None`:
+/// the inputs decide. A range that touches the threshold counts as fixed, so
+/// `abs(x)` and `square(x)` at threshold 0 are `Some(true)`.
+pub fn fixed_position(n: &Node, threshold: f64) -> Option<bool> {
+    let r = output_range(n);
+    if r.hi <= threshold {
+        Some(false)
+    } else if r.lo >= threshold {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 /// FNV-1a structural hash, for de-duplicating equivalent candidates before
 /// they are evaluated.
 pub fn structural_hash(n: &Node) -> u64 {
@@ -3511,5 +3658,140 @@ mod tests {
             to_string_exact(&tree, &["x".to_string()]),
             "(0.30000000000000004 * x)"
         );
+    }
+
+    fn un(op: Op, a: Node) -> Node {
+        node(op, vec![a])
+    }
+
+    fn bin(op: Op, a: Node, b: Node) -> Node {
+        node(op, vec![a, b])
+    }
+
+    fn range_is(n: &Node, lo: f64, hi: f64) {
+        let r = output_range(n);
+        assert!(
+            r.lo == lo && r.hi == hi,
+            "{}: got [{}, {}], want [{}, {}]",
+            to_string_exact(n, &["x".to_string(), "y".to_string()]),
+            r.lo,
+            r.hi,
+            lo,
+            hi
+        );
+    }
+
+    /// #848: exact ranges of the operator table and the position they fix.
+    #[test]
+    fn output_range_table() {
+        use Op::*;
+        let (x, y) = (|| input(0), || input(1));
+        let c = constant;
+        let inf = f64::INFINITY;
+        let e = 1.0f64.exp();
+        let cases: Vec<(Node, f64, f64, Option<bool>)> = vec![
+            (c(2.0), 2.0, 2.0, Some(true)),
+            (c(-1.0), -1.0, -1.0, Some(false)),
+            (c(0.0), 0.0, 0.0, Some(false)),
+            (x(), -inf, inf, None),
+            (un(Neg, x()), -inf, inf, None),
+            (un(Exp, x()), 0.0, inf, Some(true)),
+            (un(Exp, c(1.0)), e, e, Some(true)),
+            (un(Exp, bin(Mul, c(1000.0), x())), 0.0, inf, Some(true)),
+            (un(Gauss, x()), 0.0, 1.0, Some(true)),
+            (un(Logistic, x()), 0.0, 1.0, Some(true)),
+            (un(Tanh, x()), -1.0, 1.0, None),
+            (bin(Add, c(0.5), un(Tanh, x())), -0.5, 1.5, None),
+            (bin(Add, c(2.0), un(Tanh, x())), 1.0, 3.0, Some(true)),
+            (bin(Add, c(-2.0), un(Gauss, x())), -2.0, -1.0, Some(false)),
+            (bin(Sub, un(Logistic, x()), c(1.0)), -1.0, 0.0, Some(false)),
+            (bin(Sub, un(Exp, x()), c(1.0)), -1.0, inf, None),
+            (bin(Sub, c(1.0), un(Exp, x())), -inf, 1.0, None),
+            (un(Abs, x()), 0.0, inf, Some(true)),
+            (un(Square, x()), 0.0, inf, Some(true)),
+            (un(Abs, c(-3.0)), 3.0, 3.0, Some(true)),
+            (un(Square, c(-3.0)), 9.0, 9.0, Some(true)),
+            (un(Abs, bin(Sub, un(Gauss, x()), c(2.0))), 1.0, 2.0, Some(true)),
+            (un(Square, bin(Add, un(Gauss, x()), c(1.0))), 1.0, 4.0, Some(true)),
+            (bin(Div, c(2.0), un(Exp, x())), 0.0, inf, Some(true)),
+            (bin(Div, c(-2.0), un(Exp, x())), -inf, 0.0, Some(false)),
+            (bin(Div, c(1.0), un(Gauss, x())), 1.0, inf, Some(true)),
+            (bin(Div, x(), x()), -inf, inf, None),
+            (bin(Div, un(Exp, x()), x()), -inf, inf, None),
+            (bin(Mul, un(Abs, x()), un(Gauss, y())), 0.0, inf, Some(true)),
+            (bin(Mul, un(Gauss, x()), un(Gauss, y())), 0.0, 1.0, Some(true)),
+            (bin(Mul, un(Exp, x()), c(-1.0)), -inf, 0.0, Some(false)),
+            (bin(Sub, un(Gauss, x()), un(Gauss, y())), -1.0, 1.0, None),
+            (bin(Sub, x(), x()), -inf, inf, None),
+            (un(Cube, c(-2.0)), -8.0, -8.0, Some(false)),
+            (un(Cube, un(Exp, x())), 0.0, inf, Some(true)),
+            (un(Cosh, x()), 1.0, inf, Some(true)),
+            (un(Sqrt, un(Exp, x())), 0.0, inf, Some(true)),
+            (un(Sqrt, c(-1.0)), -inf, inf, None),
+            (un(Erf, x()), -1.0, 1.0, None),
+            (un(Erfc, x()), 0.0, 2.0, Some(true)),
+            (un(Step, x()), 0.0, 1.0, Some(true)),
+            (un(Step, bin(Add, c(2.0), un(Gauss, x()))), 1.0, 1.0, Some(true)),
+            (un(Sign, x()), -1.0, 1.0, None),
+            (node(If, vec![x(), c(1.0), c(2.0)]), -inf, inf, None),
+            (aggregate(AggKind::Mean, Some(0), 0.5), 0.5, 0.5, Some(true)),
+            (constant(f64::NAN), -inf, inf, None),
+        ];
+        assert!(cases.len() >= 25);
+        for (tree, lo, hi, fixed) in &cases {
+            range_is(tree, *lo, *hi);
+            assert_eq!(fixed_position(tree, 0.0), *fixed, "{:?}", tree.op);
+        }
+    }
+
+    /// #848: the threshold moves the boundary: `gauss(x)` is always long at 0,
+    /// decided by the inputs at 1e-30 (underflow cannot flip it) and always
+    /// flat at 1.
+    #[test]
+    fn fixed_position_depends_on_the_threshold() {
+        let g = un(Op::Gauss, input(0));
+        assert_eq!(fixed_position(&g, 0.0), Some(true));
+        assert_eq!(fixed_position(&g, 1e-30), None);
+        assert_eq!(fixed_position(&g, 1.0), Some(false));
+        let shifted = bin(Op::Add, un(Op::Tanh, input(0)), constant(2.0));
+        assert_eq!(fixed_position(&shifted, 0.5), Some(true));
+        assert_eq!(fixed_position(&shifted, 1.0), Some(true));
+        assert_eq!(fixed_position(&shifted, 1.5), None);
+    }
+
+    /// #848: where the test claims a position, every finite value of the tree
+    /// on rows with `|x| <= 3` agrees with it.
+    #[test]
+    fn fixed_position_is_sound_on_random_trees() {
+        use Op::*;
+        let ops = [Add, Sub, Mul, Div, Abs, Exp, Square, Tanh, Logistic, Gauss, Neg];
+        let mut rng = Mt::new(848);
+        let rows: Vec<[f64; 2]> = (0..16)
+            .map(|_| [rng.range(-3.0, 3.0), rng.range(-3.0, 3.0)])
+            .collect();
+        let thresholds = [0.0, 1e-30, 0.5];
+        let (mut long, mut flat) = (0usize, 0usize);
+        for i in 0..100_000usize {
+            let tree = random_tree(&mut rng, 2, &ops, 1 + i % 5);
+            let t = thresholds[i % thresholds.len()];
+            let Some(fixed) = fixed_position(&tree, t) else { continue };
+            if fixed {
+                long += 1;
+            } else {
+                flat += 1;
+            }
+            for row in &rows {
+                let v = eval(&tree, row);
+                if !v.is_finite() {
+                    continue;
+                }
+                if fixed {
+                    assert!(v >= t, "long claim broken: {v} < {t} for {}", to_string_exact(&tree, &["x".into(), "y".into()]));
+                } else {
+                    assert!(v <= t, "flat claim broken: {v} > {t} for {}", to_string_exact(&tree, &["x".into(), "y".into()]));
+                }
+            }
+        }
+        assert!(long >= 500 && flat >= 500, "the test claims too few trees: {long} long, {flat} flat");
     }
 }

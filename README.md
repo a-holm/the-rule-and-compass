@@ -649,7 +649,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--fit-polish f64|f32|off] [--fit-irls nested|reweighted|reweighted-final] [--refit-band F|inf] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
-     [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring]
+     [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring] [--reject-fixed-position]
      [--selection lexicographic|afp]
      [--mutation-mix classic|extended] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
@@ -782,6 +782,9 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   timestamps into `K` blocks, scores each as its own long/flat book and ranks by the mean block
   regret plus `--pnl-block-lambda` (default 1.0) times their standard deviation, so a formula
   that earns in one regime only scores worse; the device computes it bit for bit like the CPU.
+  `--reject-fixed-position` (off by default) rejects trees whose position cannot depend on the
+  inputs, such as `gauss(...)` or `exp(...)` at threshold 0, before the constant fit and keeps them
+  off the front; see [`docs/optimisation.md`](docs/optimisation.md).
   `--json` adds `search_fitness` and a `fitness` block per
   Pareto member (`block_regret` with blocks). See
   [`docs/walkforward.md`](docs/walkforward.md) and
