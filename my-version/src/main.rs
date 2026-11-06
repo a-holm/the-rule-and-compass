@@ -11071,6 +11071,11 @@ fn run_walkforward(args: &[String]) -> ! {
         min_hold,
         gpu,
     };
+    if spec.policy == walkforward::Policy::TopTercile {
+        if let Some(msg) = walkforward::top_tercile_refusal(&spec, &popts) {
+            usage_fail(&msg);
+        }
+    }
     let resolved = rcsr::lockbox::resolve_with(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path).unwrap_or_else(|e| {
         eprintln!("error: {}", e.message);
         std::process::exit(e.exit);
