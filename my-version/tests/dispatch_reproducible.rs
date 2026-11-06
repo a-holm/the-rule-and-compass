@@ -134,10 +134,10 @@ fn a_calibrated_file_gives_equal_fronts_and_its_own_hash() {
 fn calibrate_writes_a_readable_file_atomically_and_a_run_never_writes_it() {
     let dir = Scratch::new("calibrate");
     let file = dir.join("cal.json");
-    let out = calibrate(dir.path(), &file, &["--cpu"]);
+    let out = calibrate(dir.path(), &file, &["--cpu", "--no-enrich"]);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     let text = std::fs::read_to_string(&file).unwrap();
-    assert!(text.contains("\"schema\":\"rcsr-calibration/1\""), "{text}");
+    assert!(text.contains("\"schema\":\"rcsr-calibration/2\""), "{text}");
     assert!(text.contains("\"device\":null"), "{text}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(&sha256_of(&file)), "{stdout}");
@@ -152,10 +152,10 @@ fn calibrate_writes_a_readable_file_atomically_and_a_run_never_writes_it() {
     assert!(calibration_block(&json).contains(&format!("\"file_sha256\":\"{before}\"")));
     assert_eq!(sha256_of(&file), before, "a search run leaves the file alone");
 
-    let second = calibrate(dir.path(), &file, &["--cpu"]);
+    let second = calibrate(dir.path(), &file, &["--cpu", "--no-enrich"]);
     assert_eq!(second.status.code(), Some(0));
     let valid = std::fs::read_to_string(&file).unwrap();
-    assert!(valid.contains("\"schema\":\"rcsr-calibration/1\""));
+    assert!(valid.contains("\"schema\":\"rcsr-calibration/2\""));
 }
 
 #[test]
@@ -176,13 +176,13 @@ fn calibrate_without_a_usable_device_refuses_gpu_and_writes_nothing() {
 fn a_corrupt_file_the_user_named_is_refused_with_a_message_and_no_output() {
     let dir = Scratch::new("corrupt");
     let good = dir.join("good.json");
-    assert_eq!(calibrate(dir.path(), &good, &["--cpu"]).status.code(), Some(0));
+    assert_eq!(calibrate(dir.path(), &good, &["--cpu", "--no-enrich"]).status.code(), Some(0));
     let text = std::fs::read_to_string(&good).unwrap();
     for (name, body) in [
         ("truncated.json", text[..text.len() / 2].to_string()),
         ("garbage.json", "not json".to_string()),
         ("negative.json", text.replacen("\"r_eval\":", "\"r_eval\":-", 1)),
-        ("schema.json", text.replace("rcsr-calibration/1", "rcsr-calibration/9")),
+        ("schema.json", text.replace("rcsr-calibration/2", "rcsr-calibration/9")),
     ] {
         let bad = dir.join(name);
         std::fs::write(&bad, body).unwrap();
@@ -208,7 +208,7 @@ fn the_default_file_is_used_when_it_exists_and_refused_when_corrupt() {
 
     let default = cache.join("rcsr").join("calibration.json");
     std::fs::create_dir_all(default.parent().unwrap()).unwrap();
-    assert_eq!(calibrate(cache.path(), &default, &["--cpu"]).status.code(), Some(0));
+    assert_eq!(calibrate(cache.path(), &default, &["--cpu", "--no-enrich"]).status.code(), Some(0));
     let json = ok_json(search(cache.path(), &["--cpu"]));
     let block = calibration_block(&json);
     assert!(block.contains("\"source\":\"file\""), "{block}");
@@ -228,7 +228,7 @@ fn the_default_file_is_used_when_it_exists_and_refused_when_corrupt() {
 fn the_probe_source_is_labelled_and_the_cpu_front_does_not_depend_on_the_source() {
     let dir = Scratch::new("probe");
     let file = dir.join("cal.json");
-    assert_eq!(calibrate(dir.path(), &file, &["--cpu"]).status.code(), Some(0));
+    assert_eq!(calibrate(dir.path(), &file, &["--cpu", "--no-enrich"]).status.code(), Some(0));
     let probe = ok_json(search(dir.path(), &["--cpu", "--calibration", "probe"]));
     assert!(calibration_block(&probe).contains("\"source\":\"startup_probe\""));
     let anchors = ok_json(search(dir.path(), &["--cpu", "--calibration", "anchors"]));
@@ -241,7 +241,7 @@ fn the_probe_source_is_labelled_and_the_cpu_front_does_not_depend_on_the_source(
 fn the_run_manifest_records_the_calibration_source() {
     let dir = Scratch::new("manifest");
     let file = dir.join("cal.json");
-    assert_eq!(calibrate(dir.path(), &file, &["--cpu"]).status.code(), Some(0));
+    assert_eq!(calibrate(dir.path(), &file, &["--cpu", "--no-enrich"]).status.code(), Some(0));
     let manifest = dir.join("run.manifest.json");
     ok_json(search(
         dir.path(),
@@ -257,4 +257,26 @@ fn the_run_manifest_records_the_calibration_source() {
     assert!(text.contains("\"source\":\"file\""), "{text}");
     assert!(text.contains(&format!("\"file_sha256\":\"{}\"", sha256_of(&file))), "{text}");
     assert!(text.contains("\"file_path\""), "{text}");
+}
+
+#[test]
+#[ignore = "runs the enrich probe on a synthetic panel; about a minute"]
+fn calibrate_with_the_enrich_probe_writes_valid_rates() {
+    let dir = Scratch::new("calibrate-enrich");
+    let file = dir.join("cal.json");
+    let out = calibrate(dir.path(), &file, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let source = rcsr::dispatch::CalibrationRequest::File(file.clone())
+        .resolve(None)
+        .unwrap();
+    let probe = rcsr::dispatch::Calibration::pinned(&source)
+        .enrich
+        .expect("the enrich object");
+    assert_eq!(probe.rows, rcsr::enrich_probe::PROBE_SYMBOLS * rcsr::enrich_probe::PROBE_BARS);
+    probe.rates.validate().unwrap();
+    assert_eq!(probe.rates.clamped().validate(), Ok(()));
+    let skipped = dir.join("skipped.json");
+    let out = calibrate(dir.path(), &skipped, &["--no-enrich"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(std::fs::read_to_string(&skipped).unwrap().contains("\"enrich\":null"));
 }

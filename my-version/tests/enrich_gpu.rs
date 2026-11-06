@@ -111,18 +111,14 @@ fn write_pit_store(path: &str, symbols: usize, per_symbol: usize, group_rows: us
     store::write_store_with_time(path, &table, group_rows, Some(0)).unwrap();
 }
 
-fn tmp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rcsr-enrich-gpu-{}-{}-{}",
-        tag,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::Scratch;
+
+fn tmp_dir(tag: &str) -> (Scratch, std::path::PathBuf) {
+    let scratch = Scratch::new(tag);
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
 }
 
 fn opts(data: &str, out: &str, features: &str, gpu: GpuMode) -> Options {
@@ -169,7 +165,7 @@ fn gpu_columns_match_cpu_and_report_the_share() {
         eprintln!("skipping: no CUDA device");
         return;
     }
-    let dir = tmp_dir("parity");
+    let (_scratch, dir) = tmp_dir("parity");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let cpu_out = dir.join("cpu.rcsb").to_string_lossy().into_owned();
     let gpu_out = dir.join("gpu.rcsb").to_string_lossy().into_owned();
@@ -264,7 +260,7 @@ fn gpu_cross_section_ranks_are_exact_and_chunk_invariant() {
         eprintln!("skipping: no CUDA device");
         return;
     }
-    let dir = tmp_dir("xs-rank");
+    let (_scratch, dir) = tmp_dir("xs-rank");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let _floor = sanitizer::active().then(Floor::zero);
     let per_symbol = sanitizer::pick(48_000usize, 13_000);
@@ -499,7 +495,7 @@ fn measure_cross_section_stage() {
     };
     let symbols = env("RCSR_XS_SYMBOLS", 100);
     let per_symbol = env("RCSR_XS_ROWS", 40_000);
-    let dir = tmp_dir("xs-measure");
+    let (_scratch, dir) = tmp_dir("xs-measure");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     write_pit_store(&src, symbols, per_symbol, 65_536);
     for features in ["xs", "cross"] {
@@ -523,7 +519,7 @@ fn measure_cross_section_stage() {
 #[test]
 fn small_store_stays_on_the_cpu_with_a_reason() {
     let _floor = FLOOR.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = tmp_dir("small");
+    let (_scratch, dir) = tmp_dir("small");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     write_store(&src, &bars("AAA", 200, 0, 3600, None), 32);
@@ -649,7 +645,7 @@ fn engine_tail_kernels_match_cpu_and_are_batch_invariant() {
         eprintln!("skipping: no CUDA device");
         return;
     }
-    let dir = tmp_dir("tail");
+    let (_scratch, dir) = tmp_dir("tail");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let cpu_out = dir.join("cpu.rcsb").to_string_lossy().into_owned();
     let gpu_out = dir.join("gpu.rcsb").to_string_lossy().into_owned();

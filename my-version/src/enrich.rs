@@ -1663,6 +1663,9 @@ pub struct Options {
     pub gpu: GpuMode,
     /// Measured sequential write bandwidth used by cost model v2 (#300).
     pub write_bw: Option<f64>,
+    /// Where the planner rates come from. The library default is the anchors;
+    /// the command line defaults to the calibration file when it exists.
+    pub calibration: crate::dispatch::CalibrationRequest,
     pub allow_lockbox: bool,
     pub allow_overlap: bool,
     /// Locked test left out of the label report; the input's declaration applies when unset.
@@ -1692,6 +1695,7 @@ impl Default for Options {
             eth_data: None,
             gpu: GpuMode::Auto,
             write_bw: None,
+            calibration: crate::dispatch::CalibrationRequest::Anchors,
             allow_lockbox: false,
             allow_overlap: false,
             locked_test: None,
@@ -1774,6 +1778,8 @@ pub struct Report {
     pub gpu_write_seconds: f64,
     /// Write bandwidth charged by cost model v2 (#300), bytes/second.
     pub write_bw: f64,
+    /// Where the planner rates came from.
+    pub plan_rates: PlanRates,
     pub gpu_transfer_bytes: u64,
     /// Measured host→device and device→host windows (#294 benchmark ledger).
     pub gpu_h2d_seconds: f64,
@@ -1913,7 +1919,7 @@ impl Report {
         }
         for p in &self.plans {
             out.push(format!(
-                "# enrich-plan: group={} rows={} cols={} gpu_cols={} cpu_cols={} op={} cpu_ms={:.1} gpu_ms={:.1} backend={} reason={}",
+                "# enrich-plan: group={} rows={} cols={} gpu_cols={} cpu_cols={} op={} cpu_ms={:.1} gpu_ms={:.1} pass_shared={} pass_cpu_ms={:.1} backend={} reason={}",
                 p.group,
                 p.rows,
                 p.cols,
@@ -1922,6 +1928,8 @@ impl Report {
                 p.op,
                 p.cpu_ms,
                 p.gpu_ms,
+                p.pass_shared,
+                p.pass_cpu_ms,
                 p.backend,
                 p.reason
             ));
@@ -1978,7 +1986,7 @@ impl Report {
             .iter()
             .map(|p| {
                 format!(
-                    "{{\"group\":{},\"rows\":{},\"columns\":{},\"gpu_columns\":{},\"cpu_columns\":{},\"op\":{},\"cpu_ms\":{:.3},\"gpu_ms\":{:.3},\"backend\":{},\"reason\":{}}}",
+                    "{{\"group\":{},\"rows\":{},\"columns\":{},\"gpu_columns\":{},\"cpu_columns\":{},\"op\":{},\"cpu_ms\":{:.3},\"gpu_ms\":{:.3},\"pass_shared\":{},\"pass_cpu_ms\":{:.3},\"backend\":{},\"reason\":{}}}",
                     jstr(&p.group),
                     p.rows,
                     p.cols,
@@ -1987,6 +1995,8 @@ impl Report {
                     jstr(&p.op),
                     p.cpu_ms,
                     p.gpu_ms,
+                    p.pass_shared,
+                    p.pass_cpu_ms,
                     jstr(p.backend),
                     jstr(&p.reason)
                 )
@@ -2000,7 +2010,7 @@ impl Report {
              \"lockbox_embargo\":{},\n  \
              \"backend\":{},\"gpu_requested\":{},\"gpu_available\":{},\"gpu_device\":{},\n  \
              \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"write_s\":{:.6},\"transfer_bytes\":{},\"write_bw\":{:.0},\"fallback_columns\":[{}]}},\n  \
-             \"projection\":{{\"hash\":{},\"columns\":[{}]}},\n  \
+             \"plan_rates\":{},\n  \"projection\":{{\"hash\":{},\"columns\":[{}]}},\n  \
              \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"feature_read_s\":{:.6},\"feature_context_s\":{:.6},\"feature_gpu_s\":{:.6},\"feature_cpu_s\":{:.6},\"feature_other_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"total_s\":{:.6}}},\n  \"ledger\":{},\n  \
              \"peak_rss_bytes\":{},\n  \"features\":[{}],\n  \"long_labels\":[{}],\n  \"plan\":[{}]\n}}\n",
             jstr(&self.input),
@@ -2040,6 +2050,7 @@ impl Report {
                 .map(|(n, r)| format!("{{\"name\":{},\"reason\":{}}}", jstr(n), jstr(r)))
                 .collect::<Vec<_>>()
                 .join(","),
+            self.plan_rates.json(),
             self.projection_hash
                 .as_deref()
                 .map(jstr)
@@ -2229,6 +2240,34 @@ pub enum OpClass {
 }
 
 impl OpClass {
+    pub const ALL: [OpClass; OP_CLASSES] = [
+        OpClass::Elementwise,
+        OpClass::Calendar,
+        OpClass::RollingSum,
+        OpClass::RollingStd,
+        OpClass::RollingExtrema,
+        OpClass::WilderScan,
+        OpClass::Rank,
+        OpClass::Mtf,
+        OpClass::Join,
+        OpClass::Py15mPass,
+        OpClass::CompactPass,
+    ];
+
+    pub fn index(self) -> usize {
+        OpClass::ALL.iter().position(|o| *o == self).unwrap_or(0)
+    }
+
+    pub fn from_name(name: &str) -> Option<OpClass> {
+        OpClass::ALL.iter().copied().find(|o| o.name() == name)
+    }
+
+    /// A family of this class pays one CPU pass that every family of the class
+    /// shares in a run.
+    pub fn is_shared_pass(self) -> bool {
+        self.pass_rank() > 0
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             OpClass::Elementwise => "elementwise",
@@ -2255,7 +2294,7 @@ impl OpClass {
     /// CPU cost in milliseconds per million rows: a part paid once per family
     /// and a part per column. Both include the per-value temp write and hash
     /// that both arms pay.
-    fn cpu_ms_per_mrow(self) -> (f64, f64) {
+    fn anchor_cpu_ms_per_mrow(self) -> (f64, f64) {
         match self {
             OpClass::Elementwise => (170.0, 56.0),
             OpClass::Calendar => (170.0, 83.0),
@@ -2263,7 +2302,7 @@ impl OpClass {
             OpClass::RollingStd => (170.0, 122.0),
             OpClass::RollingExtrema => (170.0, 59.0),
             OpClass::WilderScan => (170.0, 15.0),
-            OpClass::Rank => (170.0, 67.0),
+            OpClass::Rank => (14.0, 209.0),
             OpClass::Mtf => (170.0, 87.0),
             // #299: per-row BTreeMap lookups; 15 lookup columns on the
             // 16.1M-row panel took 451.1 s (0.54 M cells/s), and the 28-column
@@ -2274,7 +2313,7 @@ impl OpClass {
         }
     }
     /// Device kernel throughput in cells per second.
-    fn gpu_cells_per_second(self) -> f64 {
+    fn anchor_gpu_cells_per_second(self) -> f64 {
         match self {
             OpClass::Elementwise => 230_000_000.0,
             OpClass::Calendar => 6_900_000_000.0,
@@ -2282,8 +2321,8 @@ impl OpClass {
             OpClass::RollingStd => 100_000_000.0,
             OpClass::RollingExtrema => 56_000_000.0,
             OpClass::WilderScan => 32_000_000.0,
-            OpClass::Rank => 61_000_000.0,
-            OpClass::Mtf => 240_000_000.0,
+            OpClass::Rank => 36_000_000.0,
+            OpClass::Mtf => 80_000_000.0,
             // #299: kernel + D2H of the 28-column family, 451 M cells in 3.78 s.
             OpClass::Join => 100_000_000.0,
             OpClass::Py15mPass => 59_000_000.0,
@@ -2303,8 +2342,16 @@ pub struct GroupPlan {
     /// Columns that stay on the CPU (unsupported names or a CPU dispatch).
     pub cpu_cols: usize,
     pub op: String,
+    /// CPU estimate of this family with the whole run on the CPU: a shared pass
+    /// is split equally among the families of its class, so the families sum to
+    /// the run estimate.
     pub cpu_ms: f64,
     pub gpu_ms: f64,
+    /// Another family of the run needs the same CPU pass.
+    pub pass_shared: bool,
+    /// Share of the shared pass this family adds to the planned run: the CPU
+    /// families of a class split it equally, a family on the device adds none.
+    pub pass_cpu_ms: f64,
     pub backend: &'static str,
     pub reason: String,
 }
@@ -2667,6 +2714,274 @@ pub const GPU_FIXED_OVERHEAD_MS: f64 = 85.0;
 /// million rows. A family pays it once, however few columns the kernel makes.
 pub const GPU_CONTEXT_MS_PER_MROW: f64 = 168.0;
 
+/// Rate triple of one operation class: CPU cost in milliseconds per million
+/// rows (a part per family or shared pass, a part per column) and device
+/// kernel throughput in cells per second.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClassRate {
+    pub cpu_fixed_ms: f64,
+    pub cpu_col_ms: f64,
+    pub gpu_cells_per_s: f64,
+}
+
+/// Number of [`OpClass`] variants.
+pub const OP_CLASSES: usize = 11;
+
+/// Every rate the enrich planner reads. [`EnrichRates::anchors`] holds the
+/// measured constants; a calibration file can replace them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EnrichRates {
+    /// Host read plus resident upload, milliseconds per million rows.
+    pub context_ms_per_mrow: f64,
+    /// Fixed per-family device setup, milliseconds.
+    pub fixed_overhead_ms: f64,
+    /// Sequential write bandwidth, bytes per second.
+    pub write_bps: f64,
+    pub classes: [ClassRate; OP_CLASSES],
+}
+
+/// A calibrated value may differ from its anchor by this factor, either way.
+pub const RATE_CLAMP: f64 = 4.0;
+
+impl EnrichRates {
+    pub fn anchors() -> EnrichRates {
+        let mut classes = [ClassRate {
+            cpu_fixed_ms: 0.0,
+            cpu_col_ms: 0.0,
+            gpu_cells_per_s: 1.0,
+        }; OP_CLASSES];
+        for op in OpClass::ALL {
+            let (cpu_fixed_ms, cpu_col_ms) = op.anchor_cpu_ms_per_mrow();
+            classes[op.index()] = ClassRate {
+                cpu_fixed_ms,
+                cpu_col_ms,
+                gpu_cells_per_s: op.anchor_gpu_cells_per_second(),
+            };
+        }
+        EnrichRates {
+            context_ms_per_mrow: GPU_CONTEXT_MS_PER_MROW,
+            fixed_overhead_ms: GPU_FIXED_OVERHEAD_MS,
+            write_bps: GPU_WRITE_BYTES_PER_SECOND,
+            classes,
+        }
+    }
+
+    pub fn class(&self, op: OpClass) -> ClassRate {
+        self.classes[op.index()]
+    }
+
+    /// Every field finite; the rates that divide or scale a cost are positive
+    /// and the CPU cost parts are not negative.
+    pub fn validate(&self) -> Result<(), String> {
+        let positive = |name: &str, v: f64| -> Result<(), String> {
+            if v.is_finite() && v > 0.0 {
+                Ok(())
+            } else {
+                Err(format!("enrich '{}' must be finite and positive, got {}", name, v))
+            }
+        };
+        let non_negative = |name: &str, v: f64| -> Result<(), String> {
+            if v.is_finite() && v >= 0.0 {
+                Ok(())
+            } else {
+                Err(format!("enrich '{}' must be finite and not negative, got {}", name, v))
+            }
+        };
+        positive("context_ms_per_mrow", self.context_ms_per_mrow)?;
+        positive("fixed_overhead_ms", self.fixed_overhead_ms)?;
+        positive("write_bps", self.write_bps)?;
+        for op in OpClass::ALL {
+            let c = self.class(op);
+            non_negative(&format!("{}.cpu_fixed_ms", op.name()), c.cpu_fixed_ms)?;
+            non_negative(&format!("{}.cpu_col_ms", op.name()), c.cpu_col_ms)?;
+            positive(&format!("{}.gpu_cells_per_s", op.name()), c.gpu_cells_per_s)?;
+        }
+        Ok(())
+    }
+
+    /// These rates limited to [`RATE_CLAMP`] times below and above the anchor
+    /// of every field.
+    pub fn clamped(&self) -> EnrichRates {
+        let anchors = EnrichRates::anchors();
+        let clamp = |v: f64, a: f64| v.clamp(a / RATE_CLAMP, a * RATE_CLAMP);
+        let mut out = *self;
+        out.context_ms_per_mrow = clamp(self.context_ms_per_mrow, anchors.context_ms_per_mrow);
+        out.fixed_overhead_ms = clamp(self.fixed_overhead_ms, anchors.fixed_overhead_ms);
+        out.write_bps = clamp(self.write_bps, anchors.write_bps);
+        for op in OpClass::ALL {
+            let (a, v) = (anchors.class(op), self.class(op));
+            out.classes[op.index()] = ClassRate {
+                cpu_fixed_ms: clamp(v.cpu_fixed_ms, a.cpu_fixed_ms),
+                cpu_col_ms: clamp(v.cpu_col_ms, a.cpu_col_ms),
+                gpu_cells_per_s: clamp(v.gpu_cells_per_s, a.gpu_cells_per_s),
+            };
+        }
+        out
+    }
+}
+
+/// The `enrich` object of a calibration file: the rates that `rcsr calibrate`
+/// measured for the enrich planner, the row count of the probe store and the
+/// spread of each timed term (largest sample over smallest).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EnrichCalibration {
+    pub rows: usize,
+    pub rates: EnrichRates,
+    pub spread_context: f64,
+    pub spread_classes: [f64; OP_CLASSES],
+}
+
+impl EnrichCalibration {
+    /// Floats print in the shortest form that reads back bit for bit.
+    pub fn json(&self) -> String {
+        let classes: Vec<String> = OpClass::ALL
+            .iter()
+            .map(|op| {
+                let c = self.rates.class(*op);
+                format!(
+                    "\"{}\":{{\"cpu_fixed_ms\":{:?},\"cpu_col_ms\":{:?},\"gpu_cells_per_s\":{:?}}}",
+                    op.name(),
+                    c.cpu_fixed_ms,
+                    c.cpu_col_ms,
+                    c.gpu_cells_per_s
+                )
+            })
+            .collect();
+        let mut spread = vec![format!("\"context_ms_per_mrow\":{:?}", self.spread_context)];
+        for op in OpClass::ALL {
+            spread.push(format!("\"{}\":{:?}", op.name(), self.spread_classes[op.index()]));
+        }
+        format!(
+            "{{\"rows\":{},\"context_ms_per_mrow\":{:?},\"fixed_overhead_ms\":{:?},\"write_bps\":{:?},\n  \"classes\":{{{}}},\n  \"spread\":{{{}}}}}",
+            self.rows,
+            self.rates.context_ms_per_mrow,
+            self.rates.fixed_overhead_ms,
+            self.rates.write_bps,
+            classes.join(",\n    "),
+            spread.join(",")
+        )
+    }
+
+    /// Parse and validate the `enrich` object. A class the file leaves out
+    /// keeps its anchor.
+    pub fn from_json(v: &crate::bench_stats::Json) -> Result<EnrichCalibration, String> {
+        use crate::bench_stats::Json;
+        let num = |obj: &Json, key: &str, what: &str| -> Result<f64, String> {
+            match obj.get(key) {
+                Some(Json::Num(x)) => Ok(*x),
+                Some(_) => Err(format!("enrich {}'{}' is not a number", what, key)),
+                None => Err(format!("enrich {}is missing '{}'", what, key)),
+            }
+        };
+        if !matches!(v, Json::Obj(_)) {
+            return Err("'enrich' is not an object or null".to_string());
+        }
+        let mut rates = EnrichRates::anchors();
+        rates.context_ms_per_mrow = num(v, "context_ms_per_mrow", "")?;
+        rates.fixed_overhead_ms = num(v, "fixed_overhead_ms", "")?;
+        rates.write_bps = num(v, "write_bps", "")?;
+        match v.get("classes") {
+            Some(Json::Obj(kv)) => {
+                for (name, body) in kv {
+                    let op = OpClass::from_name(name)
+                        .ok_or_else(|| format!("enrich has an unknown class '{}'", name))?;
+                    let what = format!("class '{}' ", name);
+                    rates.classes[op.index()] = ClassRate {
+                        cpu_fixed_ms: num(body, "cpu_fixed_ms", &what)?,
+                        cpu_col_ms: num(body, "cpu_col_ms", &what)?,
+                        gpu_cells_per_s: num(body, "gpu_cells_per_s", &what)?,
+                    };
+                }
+            }
+            Some(_) => return Err("enrich 'classes' is not an object".to_string()),
+            None => return Err("enrich is missing 'classes'".to_string()),
+        }
+        rates.validate()?;
+        let rows = match v.get("rows") {
+            Some(Json::Num(x)) if x.is_finite() && *x >= 0.0 => *x as usize,
+            None => 0,
+            Some(_) => return Err("enrich 'rows' is not a count".to_string()),
+        };
+        let term = |s: Option<&Json>, key: &str| -> f64 {
+            s.and_then(|s| s.get(key))
+                .and_then(|x| x.as_f64())
+                .filter(|x| x.is_finite() && *x >= 1.0)
+                .unwrap_or(1.0)
+        };
+        let spread = v.get("spread");
+        let mut spread_classes = [1.0; OP_CLASSES];
+        for op in OpClass::ALL {
+            spread_classes[op.index()] = term(spread, op.name());
+        }
+        Ok(EnrichCalibration {
+            rows,
+            rates,
+            spread_context: term(spread, "context_ms_per_mrow"),
+            spread_classes,
+        })
+    }
+}
+
+/// Where the planner rates of a run came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanRates {
+    /// `anchors` or `file`.
+    pub source: &'static str,
+    pub file: Option<crate::dispatch::FileOrigin>,
+    pub schema: Option<String>,
+}
+
+impl Default for PlanRates {
+    fn default() -> Self {
+        PlanRates::anchors()
+    }
+}
+
+impl PlanRates {
+    pub fn anchors() -> PlanRates {
+        PlanRates {
+            source: "anchors",
+            file: None,
+            schema: None,
+        }
+    }
+
+    pub fn json(&self) -> String {
+        let text = |v: Option<&str>| v.map_or("null".to_string(), jstr);
+        format!(
+            "{{\"source\":{},\"file_path\":{},\"file_sha256\":{},\"schema\":{}}}",
+            jstr(self.source),
+            text(self.file.as_ref().map(|f| f.path.as_str())),
+            text(self.file.as_ref().map(|f| f.sha256.as_str())),
+            text(self.schema.as_deref()),
+        )
+    }
+}
+
+/// Read the planner rates a run prices with. A calibration file with an
+/// `enrich` object supplies them, limited to [`RATE_CLAMP`] times the anchors;
+/// any other source gives the anchors. An unreadable, invalid or other-device
+/// file is an error: there is no silent fallback.
+pub fn resolve_rates(
+    request: &crate::dispatch::CalibrationRequest,
+    device: Option<&str>,
+) -> Result<(EnrichRates, PlanRates), String> {
+    match request.resolve(device)? {
+        crate::dispatch::CalibrationSource::File(f) => match f.calibration.enrich {
+            Some(rates) => Ok((
+                rates.rates.clamped(),
+                PlanRates {
+                    source: "file",
+                    file: Some(f.origin),
+                    schema: Some(f.schema),
+                },
+            )),
+            None => Ok((EnrichRates::anchors(), PlanRates::anchors())),
+        },
+        _ => Ok((EnrichRates::anchors(), PlanRates::anchors())),
+    }
+}
+
 pub fn plan_groups(
     counts: &BTreeMap<&'static str, (usize, OpClass)>,
     gpu_cols: &BTreeMap<&'static str, usize>,
@@ -2740,8 +3055,8 @@ pub fn plan_groups_with_segments(
     )
 }
 
-/// The combined planner: symbol count (fused-family floor) and calibrated
-/// write bandwidth (#300).
+/// The combined planner with the anchor rates: symbol count (fused-family
+/// floor) and calibrated write bandwidth (#300).
 #[allow(clippy::too_many_arguments)]
 pub fn plan_groups_full(
     counts: &BTreeMap<&'static str, (usize, OpClass)>,
@@ -2752,27 +3067,83 @@ pub fn plan_groups_full(
     gpu_available: bool,
     write_bps: f64,
 ) -> Vec<GroupPlan> {
-    let mut out = Vec::new();
-    let write_bps = if write_bps.is_finite() && write_bps > 0.0 {
-        write_bps
-    } else {
-        GPU_WRITE_BYTES_PER_SECOND
-    };
+    let mut rates = EnrichRates::anchors();
+    if write_bps.is_finite() && write_bps > 0.0 {
+        rates.write_bps = write_bps;
+    }
+    plan_groups_rated(
+        counts,
+        gpu_cols,
+        n_rows,
+        n_segments,
+        gpu_requested,
+        gpu_available,
+        &rates,
+    )
+}
+
+/// One family's inputs to the dispatch decision. Seconds.
+struct FamilyCost {
+    group: &'static str,
+    cols: usize,
+    supported: usize,
+    op: OpClass,
+    /// The family joins the run's shared pass of its class.
+    in_pass: bool,
+    /// Per-family CPU part that goes away when the device takes every column.
+    cpu_fixed_s: f64,
+    /// CPU time of all columns, without any fixed part.
+    cpu_cols_s: f64,
+    /// CPU time of the columns that have a kernel, without any fixed part.
+    cpu_supported_s: f64,
+    gpu_s: f64,
+    /// Part of `gpu_s` that another family on the device already pays: the
+    /// context and fixed setup. Zero for the fused families.
+    ctx_s: f64,
+    /// Decided by a rule before any cost comparison.
+    forced: Option<(&'static str, String)>,
+}
+
+/// Plan every family with `rates`. A shared CPU pass (`Py15mPass`,
+/// `CompactPass`) is costed once per run: it is saved only when every family
+/// that needs it goes to the device, so the families of one pass class are
+/// decided together.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_groups_rated(
+    counts: &BTreeMap<&'static str, (usize, OpClass)>,
+    gpu_cols: &BTreeMap<&'static str, usize>,
+    n_rows: usize,
+    n_segments: usize,
+    gpu_requested: GpuMode,
+    gpu_available: bool,
+    rates: &EnrichRates,
+) -> Vec<GroupPlan> {
+    let mrow = n_rows as f64 / 1_000_000.0;
+    let write_bps = rates.write_bps;
+    let mut fams: Vec<FamilyCost> = Vec::new();
     for (group, (cols, op)) in counts {
-        let op = *op;
-        let mrow = n_rows as f64 / 1_000_000.0;
-        let (cpu_fixed_ms, cpu_column_ms) = op.cpu_ms_per_mrow();
-        let cpu_s = match crate::features_gpu::fused_cost(group) {
-            Some(cost) => cost.cpu_ms_per_mrow_column * mrow * (*cols as f64) / 1000.0,
-            None => mrow * (cpu_fixed_ms + cpu_column_ms * *cols as f64) / 1000.0,
+        let (group, cols, op) = (*group, *cols, *op);
+        let rate = rates.class(op);
+        let fused = crate::features_gpu::fused_cost(group);
+        let in_pass = fused.is_none() && op.is_shared_pass();
+        let supported = (*gpu_cols.get(group).unwrap_or(&0)).min(cols);
+        let (cpu_fixed_s, cpu_cols_s, cpu_supported_s) = match fused {
+            Some(cost) => (
+                0.0,
+                cost.cpu_ms_per_mrow_column * mrow * (cols as f64) / 1000.0,
+                cost.cpu_ms_per_mrow_column * mrow * (supported as f64) / 1000.0,
+            ),
+            None => (
+                if in_pass { 0.0 } else { mrow * rate.cpu_fixed_ms / 1000.0 },
+                mrow * rate.cpu_col_ms * cols as f64 / 1000.0,
+                mrow * rate.cpu_col_ms * supported as f64 / 1000.0,
+            ),
         };
-        let supported = (*gpu_cols.get(group).unwrap_or(&0)).min(*cols);
         let gpu_cells_n = n_rows.saturating_mul(supported).max(1);
         let gpu_cells = gpu_cells_n as f64;
         let transfer_bytes = gpu_cells_n as f64 * 8.0;
-        let context_ms_per_mrow = crate::features_gpu::fused_cost(group)
-            .map_or(GPU_CONTEXT_MS_PER_MROW, |c| c.context_ms_per_mrow);
-        let context_ms = GPU_FIXED_OVERHEAD_MS + context_ms_per_mrow * n_rows as f64 / 1_000_000.0;
+        let context_ms_per_mrow = fused.map_or(rates.context_ms_per_mrow, |c| c.context_ms_per_mrow);
+        let context_ms = rates.fixed_overhead_ms + context_ms_per_mrow * mrow;
         let gpu_s = if let Some(fused_ms) =
             crate::features_gpu::estimate_fused_ms(group, n_rows, supported)
         {
@@ -2786,60 +3157,188 @@ pub fn plan_groups_full(
         } else {
             context_ms / 1000.0
                 + transfer_bytes / GPU_TRANSFER_BYTES_PER_SECOND
-                + gpu_cells / op.gpu_cells_per_second()
+                + gpu_cells / rate.gpu_cells_per_s
                 + transfer_bytes / GPU_D2H_BYTES_PER_SECOND
                 + transfer_bytes / write_bps
         };
-        // CPU time the device would remove. The fixed part (the shared CPU pass
-        // for a pass class) goes away only when no column of the family stays
-        // on the CPU.
-        let cpu_supported_s = match crate::features_gpu::fused_cost(group) {
-            Some(cost) => cost.cpu_ms_per_mrow_column * mrow * (supported as f64) / 1000.0,
-            None => {
-                let fixed = if supported == *cols { cpu_fixed_ms } else { 0.0 };
-                mrow * (fixed + cpu_column_ms * supported as f64) / 1000.0
-            }
-        };
-        let (backend, reason) = if gpu_requested == GpuMode::Off {
-            ("cpu", "GPU disabled by --no-gpu/--cpu".to_string())
+        let forced = if gpu_requested == GpuMode::Off {
+            Some(("cpu", "GPU disabled by --no-gpu/--cpu".to_string()))
         } else if n_rows < gpu_row_floor() {
-            (
+            Some((
                 "cpu",
                 format!("{} rows is below the {} row GPU floor", n_rows, gpu_row_floor()),
-            )
+            ))
         } else if supported == 0 {
-            ("cpu", "no exact GPU kernel registered for this family".to_string())
+            Some(("cpu", "no exact GPU kernel registered for this family".to_string()))
         } else if !cfg!(feature = "cuda") {
-            ("cpu", "built without --features cuda".to_string())
+            Some(("cpu", "built without --features cuda".to_string()))
         } else if !gpu_available {
-            ("cpu", "no usable CUDA device".to_string())
+            Some(("cpu", "no usable CUDA device".to_string()))
         } else if gpu_requested == GpuMode::On {
-            ("gpu", "forced by --gpu on".to_string())
-        } else if crate::features_gpu::fused_cost(group).is_some()
-            && n_segments < FUSED_MIN_SEGMENTS
-        {
-            (
+            Some(("gpu", "forced by --gpu on".to_string()))
+        } else if fused.is_some() && n_segments < FUSED_MIN_SEGMENTS {
+            Some((
                 "cpu",
                 format!(
                     "{} symbol segments is below the {} segment floor for the fused {} family",
                     n_segments, FUSED_MIN_SEGMENTS, group
                 ),
-            )
-        } else if gpu_s < cpu_supported_s {
-            ("gpu", "estimated GPU time is below CPU".to_string())
+            ))
+        } else if op == OpClass::Mtf && n_segments < FUSED_MIN_SEGMENTS {
+            // The MTF kernels run one thread per symbol segment: a few long
+            // segments leave the device idle.
+            Some((
+                "cpu",
+                format!(
+                    "{} symbol segments is below the {} segment floor for the one-thread-per-segment {} family",
+                    n_segments, FUSED_MIN_SEGMENTS, group
+                ),
+            ))
         } else {
-            ("cpu", "estimated GPU time is not below CPU".to_string())
+            None
         };
+        fams.push(FamilyCost {
+            group,
+            cols,
+            supported,
+            op,
+            in_pass,
+            cpu_fixed_s,
+            cpu_cols_s,
+            cpu_supported_s,
+            gpu_s,
+            ctx_s: if fused.is_some() { 0.0 } else { context_ms / 1000.0 },
+            forced,
+        });
+    }
+
+    // Decide every family. The device context (host read, resident upload,
+    // setup) is paid once per run: a family decided while another family is
+    // on the device adds only its marginal cost. Rounds repeat until the
+    // decisions stop changing; a family joins the device only after a seed
+    // family does.
+    let mut gpu_wins: Vec<Option<bool>> = fams
+        .iter()
+        .map(|f| match &f.forced {
+            Some((backend, _)) => Some(*backend == "gpu"),
+            None => None,
+        })
+        .collect();
+    for _ in 0..fams.len() + 2 {
+        let before = gpu_wins.clone();
+        let on_device = |skip: &[usize]| {
+            (0..fams.len()).any(|j| !skip.contains(&j) && before[j] == Some(true))
+        };
+        for (i, f) in fams.iter().enumerate() {
+            if f.forced.is_none() && !f.in_pass {
+                let saved_fixed = if f.supported == f.cols { f.cpu_fixed_s } else { 0.0 };
+                let shared = if on_device(&[i]) { f.ctx_s } else { 0.0 };
+                gpu_wins[i] = Some(f.gpu_s - shared < saved_fixed + f.cpu_supported_s);
+            }
+        }
+        for pass_op in [OpClass::CompactPass, OpClass::Py15mPass] {
+            let members: Vec<usize> = (0..fams.len())
+                .filter(|&i| fams[i].in_pass && fams[i].op == pass_op)
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let pass_s = mrow * rates.class(pass_op).cpu_fixed_ms / 1000.0;
+            let mut free: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|&i| fams[i].forced.is_none())
+                .collect();
+            let elsewhere = on_device(&free);
+            // A family that stays on the CPU, or leaves a column there, keeps
+            // the pass on the CPU for the whole run.
+            let pinned = members.iter().any(|&i| {
+                matches!(&fams[i].forced, Some((backend, _)) if *backend == "cpu")
+                    || fams[i].supported < fams[i].cols
+            });
+            if pinned {
+                for &i in &free {
+                    let shared = if elsewhere { fams[i].ctx_s } else { 0.0 };
+                    gpu_wins[i] = Some(fams[i].gpu_s - shared < fams[i].cpu_supported_s);
+                }
+                continue;
+            }
+            free.sort_by(|&a, &b| {
+                let da = fams[a].gpu_s - fams[a].cpu_cols_s;
+                let db = fams[b].gpu_s - fams[b].cpu_cols_s;
+                da.partial_cmp(&db)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(fams[a].group.cmp(fams[b].group))
+            });
+            let n = free.len();
+            let mut best_k = 0usize;
+            let mut best_cost = f64::INFINITY;
+            for k in 0..=n {
+                let mut cost = if k < n { pass_s } else { 0.0 };
+                for (j, &i) in free.iter().enumerate() {
+                    cost += if j < k {
+                        let shared = if elsewhere || j > 0 { fams[i].ctx_s } else { 0.0 };
+                        fams[i].gpu_s - shared
+                    } else {
+                        fams[i].cpu_cols_s
+                    };
+                }
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_k = k;
+                }
+            }
+            for (j, &i) in free.iter().enumerate() {
+                gpu_wins[i] = Some(j < best_k);
+            }
+        }
+        if gpu_wins == before {
+            break;
+        }
+    }
+
+    // Pass accounting: the CPU families of a class share its pass equally.
+    let mut cpu_members: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut all_members: BTreeMap<usize, usize> = BTreeMap::new();
+    for (i, f) in fams.iter().enumerate() {
+        if f.in_pass {
+            *all_members.entry(f.op.index()).or_insert(0) += 1;
+            if gpu_wins[i] != Some(true) {
+                *cpu_members.entry(f.op.index()).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (i, f) in fams.iter().enumerate() {
+        let gpu = gpu_wins[i] == Some(true);
+        let (backend, reason) = match &f.forced {
+            Some((b, r)) => (*b, r.clone()),
+            None if gpu => ("gpu", "estimated GPU time is below CPU".to_string()),
+            None => ("cpu", "estimated GPU time is not below CPU".to_string()),
+        };
+        let (mut pass_cpu_ms, mut pass_share_ms, mut pass_shared) = (0.0, 0.0, false);
+        if f.in_pass {
+            let pass_ms = mrow * rates.class(f.op).cpu_fixed_ms;
+            let cpu_n = cpu_members.get(&f.op.index()).copied().unwrap_or(0);
+            let all_n = all_members.get(&f.op.index()).copied().unwrap_or(1);
+            pass_shared = all_n > 1;
+            pass_share_ms = pass_ms / all_n as f64;
+            if !gpu {
+                pass_cpu_ms = pass_ms / cpu_n as f64;
+            }
+        }
         let dispatched = backend == "gpu";
         out.push(GroupPlan {
-            group: (*group).to_string(),
+            group: f.group.to_string(),
             rows: n_rows,
-            cols: *cols,
-            gpu_cols: if dispatched { supported } else { 0 },
-            cpu_cols: if dispatched { *cols - supported } else { *cols },
-            op: op.name().to_string(),
-            cpu_ms: cpu_s * 1000.0,
-            gpu_ms: gpu_s * 1000.0,
+            cols: f.cols,
+            gpu_cols: if dispatched { f.supported } else { 0 },
+            cpu_cols: if dispatched { f.cols - f.supported } else { f.cols },
+            op: f.op.name().to_string(),
+            cpu_ms: (f.cpu_fixed_s + f.cpu_cols_s) * 1000.0 + pass_share_ms,
+            gpu_ms: f.gpu_s * 1000.0,
+            pass_shared,
+            pass_cpu_ms,
             backend,
             reason,
         });
@@ -7076,29 +7575,20 @@ fn enrich_inner(
             *gpu_cols.entry("labels").or_insert(0) += labels.len();
         }
     }
-    let write_bw = opts.write_bw.unwrap_or(GPU_WRITE_BYTES_PER_SECOND);
-    let mut plans = plan_groups_full(
+    let (mut rates, plan_rates) = resolve_rates(&opts.calibration, gpu_device.as_deref())?;
+    if let Some(bw) = opts.write_bw {
+        rates.write_bps = bw;
+    }
+    let write_bw = rates.write_bps;
+    let plans = plan_groups_rated(
         &fam_counts,
         &gpu_cols,
         store.n_rows(),
         segs.len(),
         opts.gpu,
         gpu_available,
-        write_bw,
+        &rates,
     );
-    // #296: the 1.05M paired fixture measured the device MTF phase slower than
-    // the CPU reference (5.08 s vs 6.45 s on two symbol segments). Until a
-    // 16M paired run establishes the crossover, keep the new device path
-    // opt-in with `--gpu on`; `auto` remains the CPU reference.
-    if opts.gpu != GpuMode::On {
-        if let Some(plan) = plans.iter_mut().find(|p| p.group == "mtf" && p.backend == "gpu") {
-            plan.backend = "cpu";
-            plan.gpu_cols = 0;
-            plan.cpu_cols = plan.cols;
-            plan.reason =
-                "MTF device crossover not measured at 16M rows; use --gpu on".to_string();
-        }
-    }
 
     // Input checksum (the same file is copied, not rebuilt).
     let input_sha = manifest::sha256_file(&opts.data)
@@ -8238,6 +8728,7 @@ fn enrich_inner(
             gpu_d2h_seconds,
             gpu_write_seconds,
             write_bw,
+            plan_rates,
             gpu_transfer_bytes,
             gpu_h2d_seconds,
             projection_hash: device_projection.as_ref().map(|(h, _)| h.clone()),
@@ -8305,6 +8796,7 @@ fn enrich_inner(
         gpu_d2h_seconds,
         gpu_write_seconds,
         write_bw,
+        plan_rates,
         gpu_transfer_bytes,
         gpu_h2d_seconds,
         projection_hash: device_projection.as_ref().map(|(h, _)| h.clone()),
@@ -8426,7 +8918,10 @@ fn expected_columns_out(
 // ---------------------------------------------------------------------------
 
 pub fn run(args: &[String]) -> ! {
-    let mut opts = Options::default();
+    let mut opts = Options {
+        calibration: crate::dispatch::CalibrationRequest::Default,
+        ..Options::default()
+    };
     let mut locked_test: Option<String> = None;
     let mut i = 0usize;
     macro_rules! val {
@@ -8515,6 +9010,13 @@ pub fn run(args: &[String]) -> ! {
                 }
                 opts.write_bw = Some(mbps * 1_000_000.0);
             }
+            "--calibration" => {
+                let v = val!();
+                if v == "probe" {
+                    fail("--calibration probe is for the search; enrich takes anchors or a calibration file");
+                }
+                opts.calibration = crate::dispatch::CalibrationRequest::parse(&v);
+            }
             "--locked-test" => {
                 locked_test = Some(val!())
             }
@@ -8546,6 +9048,10 @@ pub fn run(args: &[String]) -> ! {
             eprintln!("error: {}", e.message.replacen("--lockbox", "--locked-test", 2));
             std::process::exit(e.exit);
         }
+    }
+    if let Err(e) = resolve_rates(&opts.calibration, crate::backend::probe().device.as_deref()) {
+        eprintln!("error: {}", e);
+        std::process::exit(EXIT_USAGE);
     }
     let report = match enrich(&opts) {
         Ok(r) => r,
@@ -8667,8 +9173,8 @@ INPUT / OUTPUT:
                           forces every registered kernel above the 1M-row floor;
                           off runs the CPU reference. The MTF family uses one
                           device resample + causal join per timeframe and keeps
-                          the CPU NaN/gap/bar_age contract; it is opt-in with
-                          --gpu on until the 16M crossover is measured. The
+                          the CPU NaN/gap/bar_age contract; auto plans it from the
+                          cost model and keeps the CPU below 32 symbol segments. The
                           benchmark family (btc_*, eth_*, rel_*, beta_*,
                           cross_ret1, cross_beta20, beta384) joins the BTC/ETH
                           series by exact timestamp on the device (a missing
@@ -8678,6 +9184,13 @@ INPUT / OUTPUT:
   --no-gpu, --cpu         force CPU
   --write-bw <MB/s>       measured sequential write bandwidth for cost model v2
                           (default 222 MB/s on the shared ext4 store)
+  --calibration anchors|<path>
+                          planner rates: the measured anchors, or the enrich object of a
+                          `rcsr calibrate` file (schema rcsr-calibration/2, each value
+                          limited to 0.25x..4x of its anchor). Default: the default
+                          calibration file when it exists, else the anchors. An invalid
+                          file or one measured on another device exits 2; there is no
+                          silent fallback. --write-bw overrides the file's bandwidth.
   --dry-run               print the report and write nothing
   --json                  print the JSON report on stdout; gpu.fallback_columns lists
                           each column the device left to the CPU, with the failing path
@@ -8715,10 +9228,11 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
              higher.time + timeframe_seconds <= base.time. Windows count
              higher-timeframe bars; a gap is NaN, and bar_age reports the
              exact seconds since the last closed higher bar. With --features
-             cuda and --gpu on, all 36 columns dispatch to the device resample
-             + causal join (src/cuda/mtf.cu); auto stays on the CPU until the
-             16M crossover is measured. Non-transcendental leaves are bitwise
-             and vol is within 1e-12.
+             cuda, all 36 columns dispatch to the device resample + causal join
+             (src/cuda/mtf.cu) under --gpu on, and under --gpu auto when the
+             cost model estimates it faster and the store has at least 32
+             symbol segments. Non-transcendental leaves are bitwise and vol is
+             within 1e-12.
   compact    the exact 52-column compact regression subset, 15m base, compact
              names and order (r16..don96). It is a parity/smoke subset, not the
              production feature set.

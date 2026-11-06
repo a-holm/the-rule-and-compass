@@ -159,13 +159,13 @@ fn gpu_mtf_36_columns_match_cpu_and_dispatch_without_fallback() {
     assert_eq!(plan.backend, "gpu");
     assert_eq!(plan.gpu_cols, 36);
 
-    // The 1.05M paired phase is slower on the device, so the new path stays
-    // opt-in: `auto` keeps the CPU reference until a 16M crossover measurement.
+    // Two symbol segments leave the one-thread-per-segment kernels idle, so
+    // `auto` keeps the CPU reference on this fixture.
     assert_eq!(auto.gpu_columns, 0);
     let auto_plan = auto.plans.iter().find(|p| p.group == "mtf").expect("auto mtf plan");
     assert_eq!(auto_plan.backend, "cpu");
     assert!(
-        auto_plan.reason.contains("crossover") || auto_plan.reason.contains("not below"),
+        auto_plan.reason.contains("segment floor"),
         "reason: {}",
         auto_plan.reason
     );

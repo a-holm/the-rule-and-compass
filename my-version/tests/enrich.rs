@@ -576,8 +576,8 @@ fn measured_rates_set_the_gpu_crossover_per_op_class() {
         (OpClass::RollingStd, Some(2)),
         (OpClass::RollingExtrema, Some(22)),
         (OpClass::WilderScan, None),
-        (OpClass::Rank, Some(7)),
-        (OpClass::Mtf, Some(2)),
+        (OpClass::Rank, Some(2)),
+        (OpClass::Mtf, Some(3)),
         (OpClass::Join, Some(1)),
     ];
     for (op, want) in expected {
@@ -3650,4 +3650,418 @@ fn label_weights_ignore_locked_prices_in_a_declared_store() {
     let (_, b0) = weight_columns("w-undecl-b", true, false);
     let differ = (0..ts.len()).filter(|&i| ts[i] < s - purge && a0[i].is_finite() && a0[i].to_bits() != b0[i].to_bits()).count();
     assert!(differ > 1000, "{differ}");
+}
+
+/// One family planned alone at 1,000,075 rows and 109 symbol segments with
+/// every column supported by a kernel.
+fn plan_alone(group: &'static str, cols: usize, op: OpClass) -> enrich::GroupPlan {
+    let mut counts = std::collections::BTreeMap::new();
+    counts.insert(group, (cols, op));
+    let mut supported = std::collections::BTreeMap::new();
+    supported.insert(group, cols);
+    enrich::plan_groups_with_segments(&counts, &supported, 1_000_075, 109, GpuMode::Auto, true)
+        .remove(0)
+}
+
+/// Families planned together; `(group, columns, class, columns with a kernel)`.
+fn plan_together(
+    families: &[(&'static str, usize, OpClass, usize)],
+    rates: &enrich::EnrichRates,
+) -> Vec<enrich::GroupPlan> {
+    let mut counts = std::collections::BTreeMap::new();
+    let mut supported = std::collections::BTreeMap::new();
+    for (group, cols, op, kernels) in families {
+        counts.insert(*group, (*cols, *op));
+        supported.insert(*group, *kernels);
+    }
+    enrich::plan_groups_rated(&counts, &supported, 1_000_075, 109, GpuMode::Auto, true, rates)
+}
+
+const MROW: f64 = 1.000075;
+
+#[test]
+fn shared_pass_is_costed_once() {
+    let rates = enrich::EnrichRates::anchors();
+    for op in [OpClass::CompactPass, OpClass::Py15mPass] {
+        let pass_ms = MROW * rates.class(op).cpu_fixed_ms;
+        let col_ms = MROW * rates.class(op).cpu_col_ms;
+        let both = plan_together(&[("returns", 3, op, 0), ("ma", 3, op, 0)], &rates);
+        assert!(both.iter().all(|p| p.backend == "cpu" && p.pass_shared));
+        let sum: f64 = both.iter().map(|p| p.cpu_ms).sum();
+        assert!(
+            (sum - (pass_ms + 6.0 * col_ms)).abs() < 1e-6,
+            "{:?}: {} vs {}",
+            op,
+            sum,
+            pass_ms + 6.0 * col_ms
+        );
+        let charged: f64 = both.iter().map(|p| p.pass_cpu_ms).sum();
+        assert!((charged - pass_ms).abs() < 1e-6, "{:?}", op);
+        let alone = plan_alone("returns", 3, op);
+        assert!(!alone.pass_shared);
+        assert!((alone.cpu_ms - (pass_ms + 3.0 * col_ms)).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn shared_pass_saved_only_when_all_leave() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    let rates = enrich::EnrichRates::anchors();
+    for op in [OpClass::CompactPass, OpClass::Py15mPass] {
+        let pinned = plan_together(&[("returns", 3, op, 3), ("ma", 3, op, 0)], &rates);
+        let returns = pinned.iter().find(|p| p.group == "returns").unwrap();
+        assert_eq!(returns.backend, "cpu", "{:?}: ma keeps the pass on the CPU", op);
+        assert!(returns.pass_cpu_ms > 0.0);
+        let partial = plan_together(&[("returns", 3, op, 3), ("ma", 3, op, 2)], &rates);
+        assert!(partial.iter().all(|p| p.backend == "cpu"), "{:?}", op);
+        let both = plan_together(&[("returns", 3, op, 3), ("ma", 3, op, 3)], &rates);
+        assert!(both.iter().all(|p| p.backend == "gpu"), "{:?}", op);
+        assert!(both.iter().all(|p| p.pass_cpu_ms == 0.0 && p.pass_shared));
+        let alternative: f64 = both.iter().map(|p| p.cpu_ms).sum();
+        let pass_ms = MROW * rates.class(op).cpu_fixed_ms;
+        let col_ms = MROW * rates.class(op).cpu_col_ms;
+        assert!((alternative - (pass_ms + 6.0 * col_ms)).abs() < 1e-6, "{:?}", op);
+    }
+}
+
+#[test]
+fn shared_pass_search_prefers_the_cheaper_side_of_the_whole_run() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    let mut rates = enrich::EnrichRates::anchors();
+    // A pass that one device family beats, but that two device families do
+    // not beat (the second adds its columns without a second context), keeps
+    // both families on the CPU.
+    rates.classes[OpClass::Py15mPass.index()].cpu_fixed_ms = 300.0;
+    let one = plan_together(&[("returns", 3, OpClass::Py15mPass, 3)], &rates);
+    let two = plan_together(
+        &[
+            ("returns", 3, OpClass::Py15mPass, 3),
+            ("ma", 3, OpClass::Py15mPass, 3),
+        ],
+        &rates,
+    );
+    assert_eq!(one[0].backend, "gpu");
+    assert!(two.iter().all(|p| p.backend == "cpu"), "{:?}", two);
+}
+
+#[test]
+fn enrich_rates_clamp() {
+    let anchors = enrich::EnrichRates::anchors();
+    let mut wild = anchors;
+    wild.write_bps = anchors.write_bps * 100.0;
+    wild.context_ms_per_mrow = anchors.context_ms_per_mrow * 0.001;
+    wild.fixed_overhead_ms = anchors.fixed_overhead_ms * 3.0;
+    let rank = OpClass::Rank.index();
+    wild.classes[rank].gpu_cells_per_s = anchors.classes[rank].gpu_cells_per_s * 100.0;
+    wild.classes[rank].cpu_col_ms = anchors.classes[rank].cpu_col_ms * 0.001;
+    let c = wild.clamped();
+    assert_eq!(c.write_bps, anchors.write_bps * 4.0);
+    assert_eq!(c.context_ms_per_mrow, anchors.context_ms_per_mrow * 0.25);
+    assert_eq!(c.fixed_overhead_ms, anchors.fixed_overhead_ms * 3.0);
+    assert_eq!(c.classes[rank].gpu_cells_per_s, anchors.classes[rank].gpu_cells_per_s * 4.0);
+    assert_eq!(c.classes[rank].cpu_col_ms, anchors.classes[rank].cpu_col_ms * 0.25);
+    assert_eq!(anchors.clamped(), anchors);
+
+    type Mutate = Box<dyn Fn(&mut enrich::EnrichRates)>;
+    let cases: Vec<(&str, Mutate)> = vec![
+        ("write_bps", Box::new(|r| r.write_bps = f64::NAN)),
+        ("write_bps", Box::new(|r| r.write_bps = 0.0)),
+        ("context_ms_per_mrow", Box::new(|r| r.context_ms_per_mrow = -1.0)),
+        ("segmented-rank.gpu_cells_per_s", Box::new(|r| r.classes[OpClass::Rank.index()].gpu_cells_per_s = 0.0)),
+        ("mtf-join.cpu_col_ms", Box::new(|r| r.classes[OpClass::Mtf.index()].cpu_col_ms = -0.5)),
+        ("join.cpu_fixed_ms", Box::new(|r| r.classes[OpClass::Join.index()].cpu_fixed_ms = f64::INFINITY)),
+    ];
+    for (what, mutate) in cases {
+        let mut r = anchors;
+        mutate(&mut r);
+        let err = r.validate().unwrap_err();
+        assert!(err.contains(what), "{what}: {err}");
+    }
+    assert!(anchors.validate().is_ok());
+}
+
+#[test]
+fn enrich_calibration_changes_plan_deterministically() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    let slow_cpu = enrich::EnrichRates::anchors();
+    let mut slower_cpu = slow_cpu;
+    let rank = OpClass::Rank.index();
+    slower_cpu.classes[rank].cpu_col_ms = slow_cpu.classes[rank].cpu_col_ms * 4.0;
+    let xs1 = |r: &enrich::EnrichRates| plan_together(&[("xs", 1, OpClass::Rank, 1)], r).remove(0);
+    assert_ne!(xs1(&slow_cpu).backend, xs1(&slower_cpu).backend, "a 4x slower CPU rank flips the one-column xs plan");
+    assert_eq!(xs1(&slower_cpu).cpu_ms.to_bits(), xs1(&slower_cpu).cpu_ms.to_bits());
+}
+
+fn run_enrich_cli(
+    scratch: &std::path::Path,
+    data: &str,
+    out_name: &str,
+    extra: &[&str],
+    cache_dir: &std::path::Path,
+) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .arg("enrich")
+        .args(["--data", data, "--out"])
+        .arg(scratch.join(out_name))
+        .args(["--features", "r1,xs_rank_r1", "--gpu", "auto", "--json"])
+        .args(extra)
+        .env("XDG_CACHE_HOME", cache_dir)
+        .output()
+        .expect("run rcsr enrich")
+}
+
+fn json_field(text: &str, key: &str) -> String {
+    let text = &text[text.find("\"plan_rates\":").expect("plan_rates")..];
+    let at = text.find(&format!("\"{key}\":")).unwrap_or_else(|| panic!("no {key} in {text}"));
+    let rest = &text[at + key.len() + 3..];
+    let end = rest.find([',', '}']).unwrap();
+    rest[..end].trim_matches('"').to_string()
+}
+
+fn plan_array(text: &str) -> &str {
+    let at = text.find("\"plan\":[").expect("plan array");
+    &text[at..]
+}
+
+#[test]
+fn enrich_json_records_rate_source() {
+    let (_scratch, dir) = tmp_dir("rate-source");
+    let mut rows = Vec::new();
+    for s in 0..25 {
+        rows.extend(wavy_rows(&format!("S{s:02}"), 40, 0, 900, s as f64 * 0.1));
+    }
+    let data = dir.join("in.rcsb").to_string_lossy().into_owned();
+    write_store(&data, &rows, 1000);
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+
+    let anchors = run_enrich_cli(&dir, &data, "a.rcsb", &["--calibration", "anchors"], &cache);
+    assert!(anchors.status.success(), "{}", String::from_utf8_lossy(&anchors.stderr));
+    let anchors_text = String::from_utf8(anchors.stdout).unwrap();
+    assert!(anchors_text.contains("\"plan_rates\":{\"source\":\"anchors\",\"file_path\":null,\"file_sha256\":null,\"schema\":null}"), "{anchors_text}");
+    let default = run_enrich_cli(&dir, &data, "d.rcsb", &[], &cache);
+    assert!(String::from_utf8(default.stdout).unwrap().contains("\"plan_rates\":{\"source\":\"anchors\""));
+
+    let mut cal = rcsr::dispatch::Calibration::default();
+    let mut rates = enrich::EnrichRates::anchors();
+    rates.classes[OpClass::Rank.index()].cpu_col_ms *= 2.0;
+    cal.enrich = Some(enrich::EnrichCalibration {
+        rows: 1_000_000,
+        rates,
+        spread_context: 1.0,
+        spread_classes: [1.0; enrich::OP_CLASSES],
+    });
+    let file = dir.join("cal.json");
+    std::fs::write(&file, cal.file_text(None, "test", "2026-11-05T10:00:00Z")).unwrap();
+    let sha = rcsr::manifest::sha256_file(&file).unwrap();
+    let with_file = run_enrich_cli(&dir, &data, "f.rcsb", &["--calibration", file.to_str().unwrap()], &cache);
+    assert!(with_file.status.success(), "{}", String::from_utf8_lossy(&with_file.stderr));
+    let text = String::from_utf8(with_file.stdout).unwrap();
+    assert_eq!(json_field(&text, "source"), "file", "{text}");
+    assert_eq!(json_field(&text, "file_path"), file.to_str().unwrap());
+    assert_eq!(json_field(&text, "file_sha256"), sha);
+    assert_eq!(json_field(&text, "schema"), "rcsr-calibration/2");
+    let sidecar = std::fs::read_to_string(dir.join("f.rcsb.enrich.json")).unwrap();
+    assert!(sidecar.contains(&format!("\"file_sha256\":\"{sha}\"")), "{sidecar}");
+
+    // The same file in a second process gives the same plan; other rates give another.
+    let again = run_enrich_cli(&dir, &data, "g.rcsb", &["--calibration", file.to_str().unwrap()], &cache);
+    let again = String::from_utf8(again.stdout).unwrap();
+    assert_eq!(plan_array(&text), plan_array(&again));
+    assert_ne!(plan_array(&text), plan_array(&anchors_text), "a calibrated rank rate changes the estimate");
+
+    // A bad file and a missing file exit 2 with no fallback.
+    let bad = dir.join("bad.json");
+    std::fs::write(&bad, "{\"schema\":\"rcsr-calibration/9\"}").unwrap();
+    for path in [bad, dir.join("absent.json")] {
+        let run = run_enrich_cli(&dir, &data, "b.rcsb", &["--calibration", path.to_str().unwrap()], &cache);
+        assert_eq!(run.status.code(), Some(2), "{}", String::from_utf8_lossy(&run.stderr));
+        assert!(String::from_utf8_lossy(&run.stderr).contains(path.to_str().unwrap()));
+    }
+}
+
+#[test]
+fn flags_and_the_rates_schema_are_documented() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let rcsr = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
+    };
+    let schema = rcsr(&["schema"]);
+    assert!(schema.contains("rcsr-calibration/2"));
+    assert!(schema.contains("--no-enrich"));
+    let enrich_schema = &schema[schema.find("\"enrich\":{\"command\"").expect("enrich in schema")..];
+    assert!(enrich_schema.contains("\"--calibration\""));
+    assert!(rcsr(&["enrich", "--help"]).contains("--calibration anchors|<path>"));
+    let calibrate = rcsr(&["calibrate", "--help"]);
+    assert!(calibrate.contains("--no-enrich") && calibrate.contains("rcsr-calibration/2"));
+    for doc in ["README.md", "docs/dispatch.md"] {
+        let text = std::fs::read_to_string(root.join(doc)).unwrap();
+        assert!(text.contains("rcsr-calibration/2"), "{doc}");
+        assert!(text.contains("--no-enrich"), "{doc}");
+        assert!(text.contains("rcsr enrich") && text.contains("--calibration"), "{doc}");
+    }
+}
+
+#[test]
+fn xs_crossover_is_between_1_and_4_columns() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    let first_gpu = (1..=8usize)
+        .find(|&cols| plan_alone("xs", cols, OpClass::Rank).backend == "gpu")
+        .expect("the device wins some column count up to 8");
+    assert!((2..=4).contains(&first_gpu), "crossover at {first_gpu} columns");
+    assert_eq!(plan_alone("xs", 1, OpClass::Rank).backend, "cpu");
+    assert_eq!(plan_alone("xs", 4, OpClass::Rank).backend, "gpu");
+    for cols in first_gpu..=8 {
+        assert_eq!(plan_alone("xs", cols, OpClass::Rank).backend, "gpu", "{cols} columns");
+    }
+}
+
+/// The plan of every feature set of the #773 table, one family each, at
+/// 1,000,075 rows and 109 symbol segments: (set, group, columns, class, backend).
+const PLAN_773: [(&str, &str, usize, &str, &str); 42] = [
+    ("atr-1", "atr", 1, "wilder-scan", "cpu"),
+    ("atr-c", "atr", 5, "compact-pass", "gpu"),
+    ("atr-p", "atr", 5, "py15m-pass", "gpu"),
+    ("atr-s", "atr", 6, "py15m-pass", "gpu"),
+    ("bollinger-1", "bollinger", 1, "rolling-std", "cpu"),
+    ("bollinger-p", "bollinger", 2, "py15m-pass", "gpu"),
+    ("bollinger-s", "bollinger", 4, "py15m-pass", "gpu"),
+    ("bollinger-s2", "bollinger", 2, "rolling-std", "gpu"),
+    ("btc-c", "btc", 4, "compact-pass", "gpu"),
+    ("calendar-1", "calendar", 1, "calendar-trig", "cpu"),
+    ("calendar-c", "calendar", 2, "compact-pass", "gpu"),
+    ("calendar-s", "calendar", 8, "calendar-trig", "gpu"),
+    ("candle-c", "candle", 1, "compact-pass", "gpu"),
+    ("candle-s", "candle", 1, "elementwise", "cpu"),
+    ("donchian-c", "donchian", 1, "compact-pass", "gpu"),
+    ("donchian-s", "donchian", 1, "rolling-extrema", "cpu"),
+    ("exotic-1", "exotic", 1, "elementwise", "cpu"),
+    ("exotic-c", "exotic", 7, "compact-pass", "gpu"),
+    ("exotic-s", "exotic", 3, "elementwise", "cpu"),
+    ("lags-1", "lags", 1, "elementwise", "cpu"),
+    ("lags-s", "lags", 10, "elementwise", "gpu"),
+    ("ma-1", "ma", 1, "rolling-sum", "cpu"),
+    ("ma-c", "ma", 3, "compact-pass", "gpu"),
+    ("ma-p", "ma", 7, "py15m-pass", "gpu"),
+    ("ma-s", "ma", 7, "py15m-pass", "gpu"),
+    ("ma-s2", "ma", 6, "rolling-sum", "gpu"),
+    ("mtf-1", "mtf", 1, "mtf-join", "cpu"),
+    ("mtf-s", "mtf", 12, "mtf-join", "cpu"),
+    ("returns-1", "returns", 1, "elementwise", "cpu"),
+    ("returns-c", "returns", 3, "compact-pass", "gpu"),
+    ("returns-p", "returns", 1, "py15m-pass", "gpu"),
+    ("returns-s", "returns", 6, "py15m-pass", "gpu"),
+    ("returns-s2", "returns", 8, "elementwise", "gpu"),
+    ("rsi-1", "rsi", 1, "py15m-pass", "gpu"),
+    ("rsi-c", "rsi", 1, "compact-pass", "gpu"),
+    ("rsi-p", "rsi", 2, "py15m-pass", "gpu"),
+    ("rsi-s", "rsi", 2, "py15m-pass", "gpu"),
+    ("vol-1", "vol", 1, "rolling-std", "cpu"),
+    ("vol-c", "vol", 5, "compact-pass", "gpu"),
+    ("vol-s", "vol", 5, "rolling-std", "gpu"),
+    ("xs-1", "xs", 1, "segmented-rank", "cpu"),
+    ("xs-s", "xs", 4, "segmented-rank", "cpu"),
+];
+
+/// Sets whose plan changes against the #773 table: the xs pass is modelled
+/// (xs-s) and the mtf gate is gone (mtf-s).
+const CHANGED_BY_778: [(&str, &str); 2] = [("mtf-s", "gpu"), ("xs-s", "gpu")];
+
+#[test]
+fn single_family_plans_unchanged() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    let mut changed = Vec::new();
+    for (set, group, cols, op, was) in PLAN_773 {
+        let op = OpClass::from_name(op).unwrap_or_else(|| panic!("{set}: class {op}"));
+        let now = plan_alone(group, cols, op).backend;
+        if now != was {
+            changed.push((set, now));
+        }
+    }
+    assert_eq!(changed, CHANGED_BY_778.to_vec());
+}
+
+#[test]
+fn mtf_plan_follows_the_decision() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    // 109 segments: the device wins at 12 and 36 columns, the single column ties to the CPU.
+    assert_eq!(plan_alone("mtf", 12, OpClass::Mtf).backend, "gpu");
+    assert_eq!(plan_alone("mtf", 36, OpClass::Mtf).backend, "gpu");
+    assert_eq!(plan_alone("mtf", 1, OpClass::Mtf).backend, "cpu");
+    // Two segments: the CPU, with the segment floor as the reason; `on` still forces the device.
+    let mut counts = std::collections::BTreeMap::new();
+    counts.insert("mtf", (36usize, OpClass::Mtf));
+    let mut supported = std::collections::BTreeMap::new();
+    supported.insert("mtf", 36usize);
+    let few = enrich::plan_groups_with_segments(&counts, &supported, 1_050_000, 2, GpuMode::Auto, true);
+    assert_eq!(few[0].backend, "cpu");
+    assert!(few[0].reason.contains("2 symbol segments is below the 32 segment floor"), "{}", few[0].reason);
+    let forced = enrich::plan_groups_with_segments(&counts, &supported, 1_050_000, 2, GpuMode::On, true);
+    assert_eq!(forced[0].backend, "gpu");
+    let enough = enrich::plan_groups_with_segments(&counts, &supported, 1_050_000, 32, GpuMode::Auto, true);
+    assert_eq!(enough[0].backend, "gpu");
+}
+
+/// Print the plan of every #773 set under the rates of the calibration file in
+/// `RCSR_CAL`. Ignored: it reads a file `rcsr calibrate` wrote on this machine.
+#[test]
+#[ignore]
+fn print_calibrated_plans() {
+    let path = std::env::var("RCSR_CAL").expect("set RCSR_CAL to a calibration file");
+    let (rates, source) = enrich::resolve_rates(
+        &rcsr::dispatch::CalibrationRequest::File(path.into()),
+        None,
+    )
+    .unwrap();
+    eprintln!("# rates source={}", source.source);
+    for (set, group, cols, op, was) in PLAN_773 {
+        let op = OpClass::from_name(op).unwrap();
+        let p = plan_together(&[(group, cols, op, cols)], &rates).remove(0);
+        eprintln!(
+            "{set} was={was} now={} cpu_ms={:.1} gpu_ms={:.1}",
+            p.backend, p.cpu_ms, p.gpu_ms
+        );
+    }
+}
+
+#[test]
+fn device_context_is_paid_once_across_families() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    let rates = enrich::EnrichRates::anchors();
+    assert_eq!(plan_alone("returns", 5, OpClass::Elementwise).backend, "cpu");
+    let together = plan_together(
+        &[
+            ("lags", 20, OpClass::Elementwise, 20),
+            ("returns", 5, OpClass::Elementwise, 5),
+        ],
+        &rates,
+    );
+    assert!(together.iter().all(|p| p.backend == "gpu"), "{:?}", together);
+    // Two CPU-bound families do not seed each other.
+    let none = plan_together(
+        &[
+            ("lags", 5, OpClass::Elementwise, 5),
+            ("returns", 5, OpClass::Elementwise, 5),
+        ],
+        &rates,
+    );
+    assert!(none.iter().all(|p| p.backend == "cpu"), "{:?}", none);
+    // The estimate of a family on its own still carries its context.
+    let alone = plan_alone("lags", 20, OpClass::Elementwise);
+    assert_eq!(alone.gpu_ms.to_bits(), together[0].gpu_ms.to_bits());
 }

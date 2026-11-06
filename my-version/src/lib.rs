@@ -16,6 +16,7 @@ pub mod data;
 pub mod diagnostics;
 pub mod dispatch; // #290: per-stage CPU/GPU cost model and route ledger
 pub mod enrich; // #200: append-only OHLCV feature enrichment
+pub mod enrich_probe; // #778: enrich planner probe for `rcsr calibrate`
 #[cfg(feature = "cuda")]
 pub mod enrich_gpu; // #200: resident CUDA enrichment kernels
 #[cfg(feature = "cuda")]
