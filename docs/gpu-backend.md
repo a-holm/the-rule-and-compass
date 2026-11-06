@@ -814,19 +814,20 @@ The probe runs once, before the dataset is uploaded, and the effective backend
 is recorded from what ran rather than inferred from the flags. An explicit
 `--cpu`/`--no-gpu` skips the probe (`search` and `enrich`): the run makes no CUDA
 call, opens no `/dev/nvidia*` and reports the CPU as requested, with no device
-name. `RCSR_GPU=0` skips the CUDA call as well. Non-quiet runs
+name. `RCSR_GPU=0` skips the CUDA call as well. A run that skips the probe says so: it never reports "no device", because it did not look. Non-quiet runs
 print one line:
 
 ```
 # resource: backend=gpu device="NVIDIA GeForce RTX 3060 (sm_86, 28 SMs, 12288 MB)" threads=8 rows=2048 cols=3
 # resource: backend=cpu device=- threads=8 rows=2048 cols=3 (no CUDA device found)
+# resource: backend=cpu device=not probed threads=8 rows=2048 cols=3 (--cpu/--no-gpu)
 ```
 
 `rows`/`cols` are the training table. `threads` is the machine's available
 parallelism; the current search loop uses one thread per island, and a
 `--threads` control and the #132 baseline cap are separate workstreams.
 
-`--json` carries `"backend": "gpu"|"cpu"`, `"device": <name>|null` and
+`--json` carries `"backend": "gpu"|"cpu"`, `"device": <name>|null`, `"device_probed": true|false` (false under `--cpu`: `device` null then means unknown) and
 `"backend_reason": <why the CPU ran>|null`; NDJSON emits one
 `{"event":"backend",...}` object before the results. The run manifest from
 #140 will carry the same fields when it lands; until then JSON is the record.
