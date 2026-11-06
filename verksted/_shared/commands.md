@@ -124,12 +124,15 @@ gh pr view <pr> --json state,mergeCommit
 
 Ticket PRs merge into the integration branch only, squashed, by the merge clerk. `main` only on the lead's written instruction. Hand-write subject and body. Never `Closes`. The worktree is removed afterwards with `wt-done.sh` (next section).
 
+`gh pr merge --delete-branch` also removes the worktree that has the head branch checked out (gh 2.103.3; the exact conditions are not verified), so `clerk-check.sh` checks before the merge that this worktree is clean and at the PR head. Afterwards an already-gone worktree is expected, not an error.
+
 ## Close and clean up (this ticket only)
 
 ```sh
 gh issue close "$N" --reason completed
 verksted/_tools/wt-done.sh "$N" --dry-run       # prints the actions
 verksted/_tools/wt-done.sh "$N"                 # worktree, local and remote branch; refuses unless clean and merged
+verksted/_tools/wt-done.sh "$N" --pr <pr>       # worktree already removed by the merge: deletes leftover branches, exit 0 "already gone" when the PR is MERGED
 test ! -e "$W"
 ```
 

@@ -53,7 +53,7 @@ export PATH="$T/bin:$PATH" RCSR_ROOT="$T/clone" RCSR_GATES="$T/gates" RCSR_BASE=
 export FAKE_GH_COUNT=$T/count RCSR_RETRY_SLEEP=0
 
 pr_json() {
-  printf '{"state":"%s","baseRefName":"%s","headRefOid":"%s","mergeable":"%s","files":[{"path":"shared.txt"},{"path":"src/a.rs"}]}\n' \
+  printf '{"state":"%s","baseRefName":"%s","headRefName":"feat","headRefOid":"%s","mergeable":"%s","files":[{"path":"shared.txt"},{"path":"src/a.rs"}]}\n' \
     "$1" "$2" "$head" "$3" > "$T/pr.json"
   export FAKE_GH_JSON=$T/pr.json
 }
@@ -98,6 +98,28 @@ out=$(run); rc=$?
 check usage-rc "$rc" 2
 out=$(run abc); rc=$?
 check usage-nonnumeric-rc "$rc" 2
+
+# worktree section: gh pr merge --delete-branch removes the worktree that has the head branch
+pr_json OPEN main MERGEABLE
+out=$(run 7); check wt-none-msg "$(grep -c '^  none: gh pr merge --delete-branch has no worktree' <<<"$out")" 1
+git_q -C "$T/clone" worktree add -q "$T/wt-feat" feat
+out=$(run 7); rc=$?
+check wt-clean-rc "$rc" 0
+check wt-clean-msg "$(grep -c "^  $T/wt-feat clean at head" <<<"$out")" 1
+printf 'x\n' > "$T/wt-feat/untracked.txt"
+out=$(run 7); rc=$?
+check wt-dirty-rc "$rc" 1
+check wt-dirty-msg "$(grep -c "^  $T/wt-feat dirty" <<<"$out")" 1
+rm "$T/wt-feat/untracked.txt"
+git_q -C "$T/wt-feat" commit -q --allow-empty -m ahead
+out=$(run 7); rc=$?
+check wt-ahead-rc "$rc" 1
+check wt-ahead-msg "$(grep -c "^  $T/wt-feat at " <<<"$out")" 1
+git_q -C "$T/wt-feat" reset -q --hard "$head"
+pr_json MERGED main MERGEABLE
+out=$(run 7); check wt-merged-none "$(grep -c '^  none:' <<<"$out")" 1
+pr_json OPEN main MERGEABLE
+git_q -C "$T/clone" worktree remove "$T/wt-feat"
 
 # read-only: the clone's refs and worktree are unchanged apart from the fetch
 check readonly-status "$(git -C "$T/clone" status --porcelain)" ""

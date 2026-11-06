@@ -4,12 +4,14 @@
 #   state: <OPEN|MERGED|CLOSED>  base: <name>  mergeable: <MERGEABLE|CONFLICTING|UNKNOWN>  head: <sha>
 #   files: one changed path per line, `out of scope` after a path that matches no --scope glob
 #   stat:  git diff --stat origin/<base>...<head>
+#   worktree: for an OPEN PR, the worktree that has the head branch checked out: none | clean at head | dirty | at another commit than the PR head.
+#     `gh pr merge --delete-branch` removes that worktree after the merge (gh 2.103.3), so dirty or behind is exit 1 and none is expected after it.
 #   conflicts: on CONFLICTING, git merge-tree --write-tree --name-only origin/<base> <head>
 #   claims: one row per line `<label>|<log path>|<ERE>` of the claims file: found | no match | no log
 #   merge: the command to run, with a subject placeholder; never executed
 # Retries while an OPEN PR has mergeable UNKNOWN, every 5 s for up to 60 s.
 # Writes: nothing (git fetch only).
-# Exit: 0 when state OPEN, base matches (default $BASE), MERGEABLE, every claim found and nothing out of scope; 1 otherwise; 2 usage.
+# Exit: 0 when state OPEN, base matches (default $BASE), MERGEABLE, every claim found, nothing out of scope and the worktree (if any) clean at the PR head; 1 otherwise; 2 usage.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 base=$BASE
@@ -37,7 +39,7 @@ bad=0
 git -C "$ROOT" fetch -q origin || { echo "git fetch origin failed" >&2; exit 1; }
 tries=0
 while :; do
-  json=$(cd "$ROOT" && gh pr view "$pr" --json state,baseRefName,headRefOid,mergeable,files) \
+  json=$(cd "$ROOT" && gh pr view "$pr" --json state,baseRefName,headRefName,headRefOid,mergeable,files) \
     || { echo "gh pr view $pr failed" >&2; exit 1; }
   mergeable=$(jq -r .mergeable <<<"$json")
   [ "$mergeable" = UNKNOWN ] && [ "$(jq -r .state <<<"$json")" = OPEN ] && [ "$tries" -lt 12 ] || break
@@ -75,6 +77,28 @@ git -C "$ROOT" diff --stat "origin/$base...$head" | sed 's/^/  /'
 if [ "$mergeable" = CONFLICTING ]; then
   echo "conflicts:"
   git -C "$ROOT" merge-tree --write-tree --name-only "origin/$base" "$head" | sed 's/^/  /'
+fi
+
+echo "worktree:"
+hbranch=$(jq -r '.headRefName // empty' <<<"$json")
+wpath=
+if [ "$state" = OPEN ] && [ -n "$hbranch" ]; then
+  wpath=$(git -C "$ROOT" worktree list --porcelain \
+    | awk -v want="branch refs/heads/$hbranch" '/^worktree / { p = substr($0, 10) } $0 == want { print p; exit }')
+fi
+if [ -z "$wpath" ]; then
+  echo "  none: gh pr merge --delete-branch has no worktree to remove"
+else
+  whead=$(git -C "$wpath" rev-parse HEAD 2>/dev/null)
+  if [ -n "$(git -C "$wpath" status --porcelain 2>/dev/null)" ]; then
+    echo "  $wpath dirty: gh pr merge --delete-branch removes this worktree"
+    bad=1
+  elif [ "$whead" != "$head" ]; then
+    echo "  $wpath at ${whead:0:12}, PR head ${head:0:12}: gh pr merge --delete-branch removes this worktree"
+    bad=1
+  else
+    echo "  $wpath clean at head"
+  fi
 fi
 
 echo "claims:"
