@@ -3,7 +3,8 @@
 //!
 //! `cargo test --release --features cuda --test pnl_fitness_ab -- --ignored --nocapture`
 //!
-//! Environment: `RCSR_AB_DIR` (work directory), `RCSR_AB_SEEDS` (default `11,12,13`),
+//! Environment: `RCSR_AB_DIR` (work directory kept between runs; default a per-run
+//! scratch directory), `RCSR_AB_SEEDS` (default `11,12,13`),
 //! `RCSR_AB_BACKENDS` (default `cpu,gpu`), `RCSR_AB_SYMBOLS` and `RCSR_AB_BARS`
 //! (default 16 and 20000), `RCSR_AB_GENERATIONS` (default 30).
 
@@ -12,6 +13,8 @@ use std::process::Command;
 
 use rcsr::devlog::Json;
 
+#[path = "common/scratch.rs"]
+mod scratch;
 #[path = "common/synth_panel.rs"]
 mod synth_panel;
 
@@ -188,10 +191,11 @@ fn pnl_fitness_against_metric_fitness() {
     let generations: usize = env_or("RCSR_AB_GENERATIONS", "30").parse().unwrap();
     let seeds: Vec<u64> = env_or("RCSR_AB_SEEDS", "11,12,13").split(',').map(|x| x.parse().unwrap()).collect();
     let backends: Vec<String> = env_or("RCSR_AB_BACKENDS", "cpu,gpu").split(',').map(String::from).collect();
-    let dir = PathBuf::from(env_or(
-        "RCSR_AB_DIR",
-        &std::env::temp_dir().join(format!("rcsr-ab-{symbols}x{bars}")).to_string_lossy(),
-    ));
+    let scratch = scratch::Scratch::new("ab");
+    let dir = match std::env::var_os("RCSR_AB_DIR").filter(|v| !v.is_empty()) {
+        Some(d) => PathBuf::from(d),
+        None => scratch.path().to_path_buf(),
+    };
     std::fs::create_dir_all(&dir).unwrap();
     let (feat, spec) = prepare(&dir, symbols, bars);
 
