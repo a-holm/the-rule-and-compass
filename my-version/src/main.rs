@@ -11084,6 +11084,10 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: --ledger and --locked-test need a locked test range: drop --lockbox none");
         std::process::exit(EXIT_USAGE);
     }
+    if verify_read && !locked_test {
+        eprintln!("error: --verify-read applies to --locked-test only");
+        std::process::exit(EXIT_USAGE);
+    }
     if locked_test && (ledger_path.is_none() || sealed_path.is_none()) {
         eprintln!("error: --locked-test needs --ledger and --sealed");
         std::process::exit(EXIT_USAGE);
@@ -11224,6 +11228,7 @@ fn run_walkforward(args: &[String]) -> ! {
         }
     }
     let protocol_json: Option<String>;
+    let mut record_after_stage = false;
     if let Some((ls, le)) = declared_lock {
         let rows: usize = if locked_test { report.windows.iter().map(|w| w.test_rows).sum() } else { 0 };
         let first = report.windows.iter().map(|w| w.window.test_start).fold(f64::INFINITY, f64::min);
@@ -11236,8 +11241,9 @@ fn run_walkforward(args: &[String]) -> ! {
                     None => Err("no recorded read for this candidate".to_string()),
                 }
             } else if locked_test {
-                l.write_read_marker(&data_path, "test_read", &report_sha)
-                    .and_then(|_| l.record_read(&candidate_id, &report_sha, current_range.as_ref()))
+                // The record runs after the report files are staged; the report names the count it will produce.
+                record_after_stage = true;
+                Ok(read_count + 1)
             } else {
                 l.add_candidate(&rcsr::protocol::Candidate {
                     id: candidate_id.clone(),
@@ -11312,19 +11318,53 @@ fn run_walkforward(args: &[String]) -> ! {
     }
     let wrote_out = out.is_some();
     let wrote_markdown = markdown.is_some();
-    if let Some(path) = out {
-        if let Err(e) = std::fs::write(&path, report_json()) {
-            eprintln!("error: {}: {}", path, e);
-            std::process::exit(EXIT_INPUT);
+    let out_text = out.as_ref().map(|_| report_json());
+    let md_text = markdown.as_ref().filter(|p| p.as_str() != "-").map(|_| report.markdown());
+    let mut files: Vec<(&std::path::Path, &[u8])> = Vec::new();
+    if let (Some(p), Some(t)) = (&out, &out_text) {
+        files.push((std::path::Path::new(p), t.as_bytes()));
+    }
+    if let (Some(p), Some(t)) = (&markdown, &md_text) {
+        files.push((std::path::Path::new(p), t.as_bytes()));
+    }
+    match (&ledger, locked_test) {
+        (Some(l), true) => {
+            let written = rcsr::protocol::write_around_record(
+                &files,
+                || {
+                    if !record_after_stage {
+                        return Ok(());
+                    }
+                    l.write_read_marker(&data_path, "test_read", &report_sha)?;
+                    let count = l.record_read(&candidate_id, &report_sha, current_range.as_ref())?;
+                    if count == read_count {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "the ledger recorded read {} but the report names {}; the read is recorded: \
+                             rerun the same command with --verify-read",
+                            count, read_count
+                        ))
+                    }
+                },
+                None,
+            );
+            if let Err(e) = written {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+        _ => {
+            for (p, bytes) in &files {
+                if let Err(e) = std::fs::write(p, bytes) {
+                    eprintln!("error: {}: {}", p.display(), e);
+                    std::process::exit(EXIT_INPUT);
+                }
+            }
         }
     }
-    if let Some(path) = markdown {
-        if path == "-" {
-            print!("{}", report.markdown());
-        } else if let Err(e) = std::fs::write(&path, report.markdown()) {
-            eprintln!("error: {}: {}", path, e);
-            std::process::exit(EXIT_INPUT);
-        }
+    if markdown.as_deref() == Some("-") {
+        print!("{}", report.markdown());
     }
     if json {
         println!("{}", report_json());
