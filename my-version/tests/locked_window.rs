@@ -1561,7 +1561,7 @@ fn ladder_refuses_out_and_markdown_that_name_one_file() {
 fn ladder_refuses_a_relative_out_and_its_dot_slash_form() {
     let f = Sealed::new("lad-same-file-rel");
     let ledger_before = f.bytes(&f.ledger);
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .current_dir(&f.dir)
         .args([
             "ladder", "--data", &f.data, "--target", "y", "--time", "ts", "--group", "sym", "--features", "f1,f2",
