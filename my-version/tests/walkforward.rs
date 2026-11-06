@@ -727,7 +727,6 @@ fn device_pnl_is_refused_with_policy_band() {
 mod front {
     use rcsr::devlog::Json;
     use std::path::PathBuf;
-    use std::process::Command;
 
     use super::scratch::Scratch;
 
@@ -763,7 +762,7 @@ mod front {
     }
 
     fn rcsr(args: &[&str]) -> (i32, String, String) {
-        let out = rcsr_cmd::rcsr_for(args).args(args).output().unwrap();
+        let out = super::rcsr_cmd::rcsr_for(args).args(args).output().unwrap();
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),

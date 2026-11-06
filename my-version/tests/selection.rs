@@ -182,7 +182,7 @@ fn selection_is_deterministic() {
 #[test]
 fn a_bad_selection_expression_is_a_usage_error() {
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     let mut child = rcsr_cmd::rcsr()
         .args([
             "--data",

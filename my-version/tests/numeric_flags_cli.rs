@@ -5,7 +5,7 @@
 mod rcsr_cmd;
 
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -115,6 +115,7 @@ fn audit_flags_refuse_unparsable_values() {
 #[cfg(feature = "cuda")]
 #[test]
 fn gpu_bench_flags_refuse_unparsable_values() {
+    use std::process::Command;
     for flag in ["--batch", "--reps", "--depth", "--seed"] {
         let out = Command::new(env!("CARGO_BIN_EXE_rcsr-gpu-bench"))
             .args([flag, "abc"])
