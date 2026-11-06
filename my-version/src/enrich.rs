@@ -1919,7 +1919,7 @@ impl Report {
         }
         for p in &self.plans {
             out.push(format!(
-                "# enrich-plan: group={} rows={} cols={} gpu_cols={} cpu_cols={} op={} cpu_ms={:.1} gpu_ms={:.1} pass_shared={} pass_cpu_ms={:.1} backend={} reason={}",
+                "# enrich-plan: group={} rows={} cols={} gpu_cols={} cpu_cols={} op={} cpu_ms={:.1} gpu_ms={:.1} pass_shared={} pass_cpu_ms={:.1} benchmark_present={} backend={} reason={}",
                 p.group,
                 p.rows,
                 p.cols,
@@ -1930,6 +1930,7 @@ impl Report {
                 p.gpu_ms,
                 p.pass_shared,
                 p.pass_cpu_ms,
+                p.benchmark_present,
                 p.backend,
                 p.reason
             ));
@@ -1986,7 +1987,7 @@ impl Report {
             .iter()
             .map(|p| {
                 format!(
-                    "{{\"group\":{},\"rows\":{},\"columns\":{},\"gpu_columns\":{},\"cpu_columns\":{},\"op\":{},\"cpu_ms\":{:.3},\"gpu_ms\":{:.3},\"pass_shared\":{},\"pass_cpu_ms\":{:.3},\"backend\":{},\"reason\":{}}}",
+                    "{{\"group\":{},\"rows\":{},\"columns\":{},\"gpu_columns\":{},\"cpu_columns\":{},\"op\":{},\"cpu_ms\":{:.3},\"gpu_ms\":{:.3},\"pass_shared\":{},\"pass_cpu_ms\":{:.3},\"benchmark_present\":{},\"backend\":{},\"reason\":{}}}",
                     jstr(&p.group),
                     p.rows,
                     p.cols,
@@ -1997,6 +1998,7 @@ impl Report {
                     p.gpu_ms,
                     p.pass_shared,
                     p.pass_cpu_ms,
+                    p.benchmark_present,
                     jstr(p.backend),
                     jstr(&p.reason)
                 )
@@ -2352,6 +2354,8 @@ pub struct GroupPlan {
     /// Share of the shared pass this family adds to the planned run: the CPU
     /// families of a class split it equally, a family on the device adds none.
     pub pass_cpu_ms: f64,
+    /// The run priced the compact pass for a store with the benchmark series.
+    pub benchmark_present: bool,
     pub backend: &'static str,
     pub reason: String,
 }
@@ -2724,6 +2728,10 @@ pub struct ClassRate {
     pub gpu_cells_per_s: f64,
 }
 
+/// Anchor of the compact pass cost without the benchmark series, milliseconds
+/// per million rows.
+pub const COMPACT_NO_BENCHMARK_ANCHOR_MS: f64 = 3030.0;
+
 /// Number of [`OpClass`] variants.
 pub const OP_CLASSES: usize = 11;
 
@@ -2737,6 +2745,10 @@ pub struct EnrichRates {
     pub fixed_overhead_ms: f64,
     /// Sequential write bandwidth, bytes per second.
     pub write_bps: f64,
+    /// Fixed CPU cost of the shared compact pass in a store without the
+    /// benchmark series, milliseconds per million rows. `classes` holds the
+    /// cost with the series present.
+    pub compact_no_benchmark_ms: f64,
     pub classes: [ClassRate; OP_CLASSES],
 }
 
@@ -2762,12 +2774,23 @@ impl EnrichRates {
             context_ms_per_mrow: GPU_CONTEXT_MS_PER_MROW,
             fixed_overhead_ms: GPU_FIXED_OVERHEAD_MS,
             write_bps: GPU_WRITE_BYTES_PER_SECOND,
+            compact_no_benchmark_ms: COMPACT_NO_BENCHMARK_ANCHOR_MS,
             classes,
         }
     }
 
     pub fn class(&self, op: OpClass) -> ClassRate {
         self.classes[op.index()]
+    }
+
+    /// Fixed CPU cost of the shared pass of `op` for a store with or without
+    /// the benchmark series. Only the compact pass depends on it.
+    pub fn pass_fixed_ms(&self, op: OpClass, benchmark_present: bool) -> f64 {
+        if op == OpClass::CompactPass && !benchmark_present {
+            self.compact_no_benchmark_ms
+        } else {
+            self.class(op).cpu_fixed_ms
+        }
     }
 
     /// Every field finite; the rates that divide or scale a cost are positive
@@ -2790,6 +2813,7 @@ impl EnrichRates {
         positive("context_ms_per_mrow", self.context_ms_per_mrow)?;
         positive("fixed_overhead_ms", self.fixed_overhead_ms)?;
         positive("write_bps", self.write_bps)?;
+        non_negative("compact-pass.cpu_fixed_ms_no_benchmark", self.compact_no_benchmark_ms)?;
         for op in OpClass::ALL {
             let c = self.class(op);
             non_negative(&format!("{}.cpu_fixed_ms", op.name()), c.cpu_fixed_ms)?;
@@ -2808,6 +2832,7 @@ impl EnrichRates {
         out.context_ms_per_mrow = clamp(self.context_ms_per_mrow, anchors.context_ms_per_mrow);
         out.fixed_overhead_ms = clamp(self.fixed_overhead_ms, anchors.fixed_overhead_ms);
         out.write_bps = clamp(self.write_bps, anchors.write_bps);
+        out.compact_no_benchmark_ms = clamp(self.compact_no_benchmark_ms, anchors.compact_no_benchmark_ms);
         for op in OpClass::ALL {
             let (a, v) = (anchors.class(op), self.class(op));
             out.classes[op.index()] = ClassRate {
@@ -2838,12 +2863,21 @@ impl EnrichCalibration {
             .iter()
             .map(|op| {
                 let c = self.rates.class(*op);
+                let no_benchmark = if *op == OpClass::CompactPass {
+                    format!(
+                        ",\"cpu_fixed_ms_no_benchmark\":{:?}",
+                        self.rates.compact_no_benchmark_ms
+                    )
+                } else {
+                    String::new()
+                };
                 format!(
-                    "\"{}\":{{\"cpu_fixed_ms\":{:?},\"cpu_col_ms\":{:?},\"gpu_cells_per_s\":{:?}}}",
+                    "\"{}\":{{\"cpu_fixed_ms\":{:?},\"cpu_col_ms\":{:?},\"gpu_cells_per_s\":{:?}{}}}",
                     op.name(),
                     c.cpu_fixed_ms,
                     c.cpu_col_ms,
-                    c.gpu_cells_per_s
+                    c.gpu_cells_per_s,
+                    no_benchmark
                 )
             })
             .collect();
@@ -2891,6 +2925,18 @@ impl EnrichCalibration {
                         cpu_col_ms: num(body, "cpu_col_ms", &what)?,
                         gpu_cells_per_s: num(body, "gpu_cells_per_s", &what)?,
                     };
+                    match body.get("cpu_fixed_ms_no_benchmark") {
+                        Some(Json::Num(x)) if op == OpClass::CompactPass => {
+                            rates.compact_no_benchmark_ms = *x;
+                        }
+                        Some(_) => {
+                            return Err(format!(
+                                "enrich {}has an invalid 'cpu_fixed_ms_no_benchmark'",
+                                what
+                            ))
+                        }
+                        None => {}
+                    }
                 }
             }
             Some(_) => return Err("enrich 'classes' is not an object".to_string()),
@@ -3078,6 +3124,7 @@ pub fn plan_groups_full(
         n_segments,
         gpu_requested,
         gpu_available,
+        true,
         &rates,
     )
 }
@@ -3108,6 +3155,9 @@ struct FamilyCost {
 /// `CompactPass`) is costed once per run: it is saved only when every family
 /// that needs it goes to the device, so the families of one pass class are
 /// decided together.
+///
+/// `benchmark_present` is true when the store holds the benchmark series: the
+/// compact pass also joins it and costs more.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_groups_rated(
     counts: &BTreeMap<&'static str, (usize, OpClass)>,
@@ -3116,6 +3166,7 @@ pub fn plan_groups_rated(
     n_segments: usize,
     gpu_requested: GpuMode,
     gpu_available: bool,
+    benchmark_present: bool,
     rates: &EnrichRates,
 ) -> Vec<GroupPlan> {
     let mrow = n_rows as f64 / 1_000_000.0;
@@ -3243,7 +3294,7 @@ pub fn plan_groups_rated(
             if members.is_empty() {
                 continue;
             }
-            let pass_s = mrow * rates.class(pass_op).cpu_fixed_ms / 1000.0;
+            let pass_s = mrow * rates.pass_fixed_ms(pass_op, benchmark_present) / 1000.0;
             let mut free: Vec<usize> = members
                 .iter()
                 .copied()
@@ -3318,7 +3369,7 @@ pub fn plan_groups_rated(
         };
         let (mut pass_cpu_ms, mut pass_share_ms, mut pass_shared) = (0.0, 0.0, false);
         if f.in_pass {
-            let pass_ms = mrow * rates.class(f.op).cpu_fixed_ms;
+            let pass_ms = mrow * rates.pass_fixed_ms(f.op, benchmark_present);
             let cpu_n = cpu_members.get(&f.op.index()).copied().unwrap_or(0);
             let all_n = all_members.get(&f.op.index()).copied().unwrap_or(1);
             pass_shared = all_n > 1;
@@ -3339,6 +3390,7 @@ pub fn plan_groups_rated(
             gpu_ms: f.gpu_s * 1000.0,
             pass_shared,
             pass_cpu_ms,
+            benchmark_present,
             backend,
             reason,
         });
@@ -7587,6 +7639,7 @@ fn enrich_inner(
         segs.len(),
         opts.gpu,
         gpu_available,
+        !cross.symbol.is_empty(),
         &rates,
     );
 
