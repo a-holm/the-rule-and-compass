@@ -1967,10 +1967,20 @@ fn fmt_f(v: f64) -> String {
     }
 }
 
+/// The display form: constants rounded to 4 decimals, for people.
 pub fn to_string(n: &Node, vars: &[String]) -> String {
+    render(n, vars, &fmt_f)
+}
+
+/// Every constant as the shortest decimal that parses back to the same bits.
+pub fn to_string_exact(n: &Node, vars: &[String]) -> String {
+    render(n, vars, &|v| format!("{:?}", v))
+}
+
+fn render(n: &Node, vars: &[String], num: &dyn Fn(f64) -> String) -> String {
     use Op::*;
     match n.op {
-        Const => fmt_f(n.val),
+        Const => num(n.val),
         // A block prints by the user's name (or `customN`), with its arguments.
         Custom0 | Custom1 | Custom2 | Custom3 => {
             let name = n
@@ -1978,7 +1988,7 @@ pub fn to_string(n: &Node, vars: &[String]) -> String {
                 .as_ref()
                 .map(|b| b.name.clone())
                 .unwrap_or_else(|| n.op.symbol().to_string());
-            let args: Vec<String> = n.kids.iter().map(|k| to_string(k, vars)).collect();
+            let args: Vec<String> = n.kids.iter().map(|k| render(k, vars, num)).collect();
             format!("{}({})", name, args.join(", "))
         }
         Input => {
@@ -1987,12 +1997,12 @@ pub fn to_string(n: &Node, vars: &[String]) -> String {
                 .cloned()
                 .unwrap_or_else(|| format!("x{}", i))
         }
-        Neg => format!("(-{})", to_string(&n.kids[0], vars)),
+        Neg => format!("(-{})", render(&n.kids[0], vars, num)),
         Op::Agg(kind) => {
             if kind.arity() == 0 {
                 format!("{}()", kind.name())
             } else {
-                format!("{}({})", kind.name(), to_string(&n.kids[0], vars))
+                format!("{}({})", kind.name(), render(&n.kids[0], vars, num))
             }
         }
         Add | Sub | Mul | Div | Pow => {
@@ -2005,22 +2015,22 @@ pub fn to_string(n: &Node, vars: &[String]) -> String {
             };
             format!(
                 "({}{}{})",
-                to_string(&n.kids[0], vars),
+                render(&n.kids[0], vars, num),
                 s,
-                to_string(&n.kids[1], vars)
+                render(&n.kids[1], vars, num)
             )
         }
         If => format!(
             "if({}, {}, {})",
-            to_string(&n.kids[0], vars),
-            to_string(&n.kids[1], vars),
-            to_string(&n.kids[2], vars)
+            render(&n.kids[0], vars, num),
+            render(&n.kids[1], vars, num),
+            render(&n.kids[2], vars, num)
         ),
         Mod | Min | Max | Atan2 => format!(
             "{}({}, {})",
             n.op.symbol(),
-            to_string(&n.kids[0], vars),
-            to_string(&n.kids[1], vars)
+            render(&n.kids[0], vars, num),
+            render(&n.kids[1], vars, num)
         ),
         // Comparisons and the binary logical operators print infix inside
         // parentheses, so the printed form parses back unambiguously.
@@ -2037,19 +2047,19 @@ pub fn to_string(n: &Node, vars: &[String]) -> String {
             };
             format!(
                 "({}{}{})",
-                to_string(&n.kids[0], vars),
+                render(&n.kids[0], vars, num),
                 s,
-                to_string(&n.kids[1], vars)
+                render(&n.kids[1], vars, num)
             )
         }
-        Not => format!("(not {})", to_string(&n.kids[0], vars)),
+        Not => format!("(not {})", render(&n.kids[0], vars, num)),
         Between => format!(
             "between({}, {}, {})",
-            to_string(&n.kids[0], vars),
-            to_string(&n.kids[1], vars),
-            to_string(&n.kids[2], vars)
+            render(&n.kids[0], vars, num),
+            render(&n.kids[1], vars, num),
+            render(&n.kids[2], vars, num)
         ),
-        _ => format!("{}({})", n.op.symbol(), to_string(&n.kids[0], vars)),
+        _ => format!("{}({})", n.op.symbol(), render(&n.kids[0], vars, num)),
     }
 }
 
@@ -3448,5 +3458,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn signed_constants(n: &Node, sign: f64, out: &mut Vec<u64>) {
+        match n.op {
+            Op::Const => out.push((sign * n.val).to_bits()),
+            Op::Neg => signed_constants(&n.kids[0], -sign, out),
+            _ => n.kids.iter().for_each(|k| signed_constants(k, sign, out)),
+        }
+    }
+
+    #[test]
+    fn to_string_exact_round_trips_every_constant() {
+        let vars = vec!["x".to_string()];
+        let values = [
+            5e-324,
+            7.79843e-319,
+            1e-46,
+            1.1e-5,
+            0.30000000000000004,
+            -109066579.83882,
+            32514.419123515898,
+            1e300,
+        ];
+        for c in values {
+            let tree = node(
+                Op::Add,
+                vec![node(Op::Mul, vec![constant(c), input(0)]), constant(-c)],
+            );
+            let text = to_string_exact(&tree, &vars);
+            let back = crate::parse::parse(&text, &vars).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            let (mut want, mut got) = (Vec::new(), Vec::new());
+            signed_constants(&tree, 1.0, &mut want);
+            signed_constants(&back, 1.0, &mut got);
+            assert_eq!(want, got, "constants of {text}");
+            for i in 0..1000 {
+                let x = (i as f64 - 500.0) * 0.37;
+                assert_eq!(
+                    eval(&tree, &[x]).to_bits(),
+                    eval(&back, &[x]).to_bits(),
+                    "{text} at {x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn to_string_keeps_the_four_decimal_display() {
+        let tree = node(Op::Mul, vec![constant(0.30000000000000004), input(0)]);
+        assert_eq!(to_string(&tree, &["x".to_string()]), "(0.3 * x)");
+        assert_eq!(
+            to_string_exact(&tree, &["x".to_string()]),
+            "(0.30000000000000004 * x)"
+        );
     }
 }

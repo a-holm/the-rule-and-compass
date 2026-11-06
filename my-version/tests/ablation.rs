@@ -780,6 +780,7 @@ fn score_run_reads_the_expression_and_its_inputs() {
         generations_run: 7,
         variables: vec!["s".into(), "n".into()],
         expression: "s".into(),
+        expression_source: rcsr::run_json::ExpressionSource::Exact,
         seed: 2,
     };
     let r = ablation::score_run(&facts, &panel, &folds, &[0.5, 0.7], 1, &Options::default()).unwrap();
@@ -841,6 +842,7 @@ fn results(d: &Definition, sc: &Scenario, seeds: u32) -> Vec<SeedResult> {
                 thresholds,
                 net_by_fold_threshold: by,
                 net_period: period,
+                expression_source: rcsr::run_json::ExpressionSource::Exact,
             });
         }
     }

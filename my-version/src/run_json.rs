@@ -4,11 +4,49 @@
 
 use crate::devlog::Json;
 
+/// #807: which string of a run.json an evaluator prices. `Exact` is
+/// `expression_exact`, the lossless form; `Rounded` is the 4-decimal display
+/// `expression` of a run written before that field existed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpressionSource {
+    Exact,
+    Rounded,
+}
+
+impl ExpressionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExpressionSource::Exact => "exact",
+            ExpressionSource::Rounded => "rounded",
+        }
+    }
+
+    /// The exact form when present, else the display form.
+    pub(crate) fn pick(j: &Json) -> Option<(String, ExpressionSource)> {
+        if let Some(e) = j.get("expression_exact").and_then(Json::as_str) {
+            return Some((e.to_string(), ExpressionSource::Exact));
+        }
+        j.get("expression")
+            .and_then(Json::as_str)
+            .map(|e| (e.to_string(), ExpressionSource::Rounded))
+    }
+
+    /// Rounded if either is.
+    pub fn worst(self, other: ExpressionSource) -> ExpressionSource {
+        if self == ExpressionSource::Rounded || other == ExpressionSource::Rounded {
+            ExpressionSource::Rounded
+        } else {
+            ExpressionSource::Exact
+        }
+    }
+}
+
 /// One `pareto[k]` member, in archive order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrontMember {
     pub rank: usize,
     pub expression: String,
+    pub source: ExpressionSource,
 }
 
 #[derive(Clone, Debug)]
@@ -17,6 +55,8 @@ pub struct RunFile {
     pub sha256: String,
     pub variables: Vec<String>,
     pub front: Vec<FrontMember>,
+    /// #807: `Rounded` when any front member has no `expression_exact`.
+    pub front_source: ExpressionSource,
     /// `target_spec.return_column`.
     pub return_column: Option<String>,
     /// `objective.spec.threshold`: the objective's long rule is `1[pred > threshold]`.
@@ -70,18 +110,20 @@ impl RunFile {
             Some(Json::Arr(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
             _ => Vec::new(),
         };
-        let front = match j.get("pareto") {
+        let front: Vec<FrontMember> = match j.get("pareto") {
             Some(Json::Arr(a)) => a
                 .iter()
                 .enumerate()
                 .filter_map(|(k, m)| {
-                    m.get("expression")
-                        .and_then(Json::as_str)
-                        .map(|e| FrontMember { rank: k + 1, expression: e.to_string() })
+                    ExpressionSource::pick(m)
+                        .map(|(expression, source)| FrontMember { rank: k + 1, expression, source })
                 })
                 .collect(),
             _ => return Err("no 'pareto' array (not a single-target run.json)".to_string()),
         };
+        let front_source = front
+            .iter()
+            .fold(ExpressionSource::Exact, |acc, m| acc.worst(m.source));
         let split = j.get("split");
         let objective_spec = j.get("objective").and_then(|o| o.get("spec"));
         let purge = |key: &str| split.and_then(|s| s.get(key)).and_then(Json::as_f64);
@@ -90,6 +132,7 @@ impl RunFile {
             sha256: String::new(),
             variables,
             front,
+            front_source,
             return_column: j
                 .get("target_spec")
                 .and_then(|t| t.get("return_column"))
@@ -177,4 +220,14 @@ impl RunFile {
         }
         Ok(flags)
     }
+}
+
+/// #807: the sealed read prices only the selected tree, so it refuses a run
+/// whose strings are the 4-decimal display form.
+pub fn rounded_refusal(path: &str) -> String {
+    format!(
+        "{}: the run has no expression_exact, so the sealed read would price the rounded display string, not the selected tree; \
+         rerun the search with a build that writes expression_exact",
+        path
+    )
 }

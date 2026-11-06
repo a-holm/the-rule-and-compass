@@ -1436,6 +1436,8 @@ pub struct FinalistReport {
     pub candidates: usize,
     pub usable: usize,
     pub expression: String,
+    /// #807: the finalist with every constant at full precision.
+    pub expression_exact: String,
     pub archive_rank: usize,
     pub fit_metric: String,
     pub fit_error: f64,
@@ -1470,7 +1472,7 @@ impl FinalistReport {
             "{{\"name\":\"{}\",\"position\":\"{}\",\"selection\":\"validation_objective\",\
              \"cost\":{},\"candidates\":{},\"usable_candidates\":{},\"exact\":\"cpu_f64\",\
              \"backend\":{},\"backend_reason\":{},\"spec\":{},\
-             \"finalist\":{{\"expression\":{},\"archive_rank\":{},\"constant\":{},\"fit_metric\":{},\"fit_error\":{},\
+             \"finalist\":{{\"expression\":{},\"expression_exact\":{},\"archive_rank\":{},\"constant\":{},\"fit_metric\":{},\"fit_error\":{},\
              \"validation_error\":{},\"test_error\":{},\"validation_objective\":{}{}}},\
              \"validation\":{},\"test\":{}}}",
             self.objective.name(),
@@ -1484,6 +1486,7 @@ impl FinalistReport {
                 .unwrap_or_else(|| "null".to_string()),
             self.spec_json(),
             crate::devlog::text(&self.expression),
+            crate::devlog::text(&self.expression_exact),
             self.archive_rank,
             self.constant,
             crate::devlog::text(&self.fit_metric),
