@@ -845,6 +845,18 @@ pub enum CrashAt {
     AfterFirstRename,
 }
 
+/// Where an output lands: the canonical parent plus the file name (the file may
+/// not exist yet), and the device and inode when it does, so a hard link or a
+/// symlink to the same file is found.
+fn output_identity(path: &std::path::Path) -> Result<(std::path::PathBuf, Option<(u64, u64)>), String> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let dir = std::fs::canonicalize(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    let name = path.file_name().ok_or_else(|| format!("{}: no file name", path.display()))?;
+    let inode = std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+    Ok((dir.join(name), inode))
+}
+
 /// Write the report files of a locked read around the ledger record: every
 /// file is written beside its target and synced first, then `record` runs, then
 /// each file is renamed into place. A failure before `record` leaves the read
@@ -863,9 +875,22 @@ pub fn write_around_record<T>(
             Ok(())
         }
     };
-    for (i, (a, _)) in outs.iter().enumerate() {
-        if outs[..i].iter().any(|(b, _)| b == a) {
-            return Err(format!("{}: two outputs name the same file", a.display()));
+    let ids = outs
+        .iter()
+        .map(|(p, _)| {
+            output_identity(p).map_err(|e| format!("{}; nothing was recorded, the locked read is still available", e))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for i in 0..outs.len() {
+        for j in 0..i {
+            let same_inode = ids[i].1.is_some() && ids[i].1 == ids[j].1;
+            if ids[i].0 == ids[j].0 || same_inode {
+                return Err(format!(
+                    "{} and {}: two outputs name the same file; nothing was recorded, the locked read is still available",
+                    outs[j].0.display(),
+                    outs[i].0.display()
+                ));
+            }
         }
     }
     let mut staged = Vec::new();
