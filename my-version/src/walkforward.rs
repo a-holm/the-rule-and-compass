@@ -958,6 +958,9 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
             ));
         }
     }
+    if spec.policy == Policy::Band && spec.device_pnl {
+        return Err("--device-pnl is not supported with --policy band: the device arm prices the threshold book".to_string());
+    }
     let table_validation = !opts.validation_starts.is_empty()
         && spec.windows.iter().all(|w| opts.validation_starts.iter().any(|(l, _)| *l == w.label));
     if spec.candidates.len() > 1 && spec.validation_frac <= 0.0 && !table_validation {

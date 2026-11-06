@@ -10255,7 +10255,8 @@ OPTIONS:
                              the rest flat (no threshold; --threshold-quantile, --threshold-fixed,
                              --band, --min-hold, --select-band, --device-pnl and --batch-pnl are
                              refused). band is a
-                             long-only no-trade band; dp keeps the threshold book
+                             long-only no-trade band (--device-pnl is refused: the device arm prices
+                             the threshold book); dp keeps the threshold book
                              and reports the exact hindsight DP as a bound, never
                              as the strategy's P&L
   --band <f>                 half-width beta of the no-trade band in score units
@@ -10733,6 +10734,9 @@ fn run_walkforward(args: &[String]) -> ! {
     }
     if policy == walkforward::Policy::TopTercile && (quantile_set || threshold_fixed.is_some()) {
         usage_fail("--policy top-tercile has no threshold: do not pass --threshold-quantile or --threshold-fixed");
+    }
+    if policy == walkforward::Policy::Band && device_pnl {
+        usage_fail("--device-pnl is not supported with --policy band: the device arm prices the threshold book");
     }
     let mut cost_spec: Option<rcsr::target::TargetSpec> = None;
     let mut run_cost: Option<(f64, rcsr::target::CostSource)> = None;
