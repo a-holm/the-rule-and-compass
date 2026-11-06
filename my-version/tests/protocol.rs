@@ -106,7 +106,7 @@ fn ledger_seals_before_the_read_and_allows_one_read_per_candidate() {
     assert_eq!(ledger.record_read(&a.id, "locked-report-a", None).unwrap(), 1);
     // test_read:true cannot be read or selected again
     assert!(ledger.authorize_read(&sealed, &a.id, "data", "build", None).unwrap_err().contains("test_read:true"));
-    assert_eq!(ledger.read_report_sha(&a.id).as_deref(), Some("locked-report-a"));
+    assert_eq!(ledger.read_report_sha(&a.id).unwrap().as_deref(), Some("locked-report-a"));
     assert_eq!(ledger.record_read(&b.id, "locked-report-b", None).unwrap(), 2);
     assert_eq!(ledger.read_count().unwrap(), 2);
     let unread: Vec<String> = ledger.unread_candidates().unwrap().into_iter().map(|c| c.id).collect();
@@ -687,7 +687,7 @@ fn staged_write_crash_points_on_a_ledger_appended_under_the_lock() {
 }
 
 #[test]
-fn a_held_ledger_lock_delays_the_record_of_a_staged_write_without_deadlock() {
+fn a_staged_write_reaches_its_record_while_the_ledger_lock_is_held_and_completes_after_release() {
     use protocol::write_around_record;
     use std::sync::mpsc;
     let (_scratch, dir) = scratch("staged-lock");
@@ -716,6 +716,9 @@ fn a_held_ledger_lock_delays_the_record_of_a_staged_write_without_deadlock() {
     // staging finished without the ledger lock; only now is the lock released
     recorded_signal.recv().unwrap();
     assert!(!a.exists(), "the rename waits for the record, which waits for the lock");
+    // the lock is still held: an append that got through would show here. `concurrent_appenders_keep_one_chain_of_whole_lines` proves the lock itself.
+    assert_eq!(ledger.verify_chain().unwrap(), 1, "the ledger is unchanged while the lock is held");
+    assert_eq!(ledger.read_count().unwrap(), 0);
     holder.unlock().unwrap();
     assert_eq!(writer.join().unwrap().unwrap(), 1);
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "new a");

@@ -734,7 +734,7 @@ impl Ledger {
         bind: Option<RangeBinding>,
     ) -> Result<Candidate, String> {
         let candidate = self.authorize_sealed(sealed, id, data_sha256, build_commit, bind)?;
-        if self.read_report_sha(id).is_some() {
+        if self.read_report_sha(id)?.is_some() {
             return Err(format!(
                 "candidate {} already has test_read:true; the locked test is read once",
                 id
@@ -753,11 +753,11 @@ impl Ledger {
     }
 
     /// Report hash recorded by the read of `id`, if there was one.
-    pub fn read_report_sha(&self, id: &str) -> Option<String> {
-        self.events().ok()?.into_iter().find_map(|e| match e {
+    pub fn read_report_sha(&self, id: &str) -> Result<Option<String>, String> {
+        Ok(self.events()?.into_iter().find_map(|e| match e {
             Event::TestRead { id: read, report_sha256, .. } if read == id => Some(report_sha256),
             _ => None,
-        })
+        }))
     }
 
     /// Append `test_read:true` for `id`. Returns the new total read count.
@@ -786,11 +786,11 @@ impl Ledger {
     }
 
     /// Report hash recorded by the baseline read, if there was one.
-    pub fn baseline_report_sha(&self) -> Option<String> {
-        self.events().ok()?.into_iter().find_map(|e| match e {
+    pub fn baseline_report_sha(&self) -> Result<Option<String>, String> {
+        Ok(self.events()?.into_iter().find_map(|e| match e {
             Event::BaselineRead { report_sha256, .. } => Some(report_sha256),
             _ => None,
-        })
+        }))
     }
 
     fn baseline_checks(&self, sealed: &std::path::Path, bind: Option<RangeBinding>, refuse_second: bool) -> Result<(), String> {
@@ -1270,8 +1270,7 @@ fn complete_lines(path: &str, what: &str, text: &str) -> Result<Vec<String>, Str
     Ok(out)
 }
 
-fn marker_lines(data_path: &str)
- -> Result<Vec<MarkerLine>, String> {
+fn marker_lines(data_path: &str) -> Result<Vec<MarkerLine>, String> {
     let path = marker_path(data_path);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
