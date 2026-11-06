@@ -1,5 +1,5 @@
 //! #483: `--fitness pnl` against `--fitness metric` on the synthetic panel, with a
-//! walk-forward of each run's front. Ignored: it is a measurement.
+//! walk-forward of each run's front. The measurement is ignored; one small gpu smoke is not.
 //!
 //! `cargo test --release --features cuda --test pnl_fitness_ab -- --ignored --nocapture`
 //!
@@ -7,6 +7,8 @@
 //! scratch directory), `RCSR_AB_SEEDS` (default `11,12,13`),
 //! `RCSR_AB_BACKENDS` (default `cpu,gpu`), `RCSR_AB_SYMBOLS` and `RCSR_AB_BARS`
 //! (default 16 and 20000), `RCSR_AB_GENERATIONS` (default 30).
+//!
+//! The gpu arm runs `--gpu --dispatch device` and fails when the run reports no device time.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -121,7 +123,7 @@ fn run_arm(dir: &Path, feat: &Path, spec: &Path, arm: &Arm, generations: usize, 
     a.extend(s(&["--cost-bps", COST_BPS, "--fill", "drop", "--no-project", "--pop", "64", "--islands", "4"]));
     a.extend(s(&["--patience", "0", "--fitness", arm.fitness, "--seed", &arm.seed.to_string()]));
     a.extend(s(&["--generations", &generations.to_string()]));
-    a.extend(s(&[if arm.backend == "gpu" { "--gpu" } else { "--cpu" }]));
+    a.extend(s(if arm.backend == "gpu" { &["--gpu", "--dispatch", "device"] } else { &["--cpu"] }));
     a.extend(s(&["--json-out", run.to_str().unwrap(), "--dev-log", dev.to_str().unwrap(), "--dev-log-every", "1", "--json"]));
     must(&a);
 
@@ -143,6 +145,10 @@ fn run_arm(dir: &Path, feat: &Path, spec: &Path, arm: &Arm, generations: usize, 
             .sum()
     };
     let search_s = num(end, &["search"]);
+    let device_frac = opt_num(end, &["device_fraction_of_run"]);
+    if arm.backend == "gpu" {
+        assert!(device_frac > 0.0, "gpu arm {tag} ran no device work (device_fraction_of_run = {device_frac}); --dispatch device must reach the device");
+    }
 
     let mut w = s(&["walkforward", "--data", feat.to_str().unwrap(), "--front", run.to_str().unwrap()]);
     w.extend(s(&["--time", "ts", "--group-by", "symbol"]));
@@ -172,7 +178,7 @@ fn run_arm(dir: &Path, feat: &Path, spec: &Path, arm: &Arm, generations: usize, 
         sec_per_gen: search_s / generations as f64,
         eval_s: phase("eval_cpu"),
         fit_s: phase("fit_cpu"),
-        device_frac: opt_num(end, &["device_fraction_of_run"]),
+        device_frac,
         wf_net: opt_num(&wf, &["pooled", "total_return"]),
         wf_min_window: window_returns.iter().cloned().fold(f64::INFINITY, f64::min),
         wf_trades: opt_num(&wf, &["pooled", "trades"]),
@@ -180,6 +186,34 @@ fn run_arm(dir: &Path, feat: &Path, spec: &Path, arm: &Arm, generations: usize, 
         wf_sharpe: opt_num(&wf, &["pooled", "sharpe"]),
         wf_dsr: opt_num(&wf, &["inference", "multiple_testing", "dsr_at_n_eff", "dsr"]),
         wf_se: opt_num(&wf, &["inference", "bootstrap", "mean_ci", "se"]) * opt_num(&wf, &["pooled", "periods"]),
+    }
+}
+
+/// The search holds out the last 20 % as test rows; the windows split them in
+/// WINDOWS equal parts after the boundary purge of the 4-bar label.
+fn test_windows(bars: usize) -> Vec<String> {
+    let t0 = synth_panel::SYNTH_T0;
+    let test_first = t0 + HOUR * (bars as i64 * 8 / 10);
+    let first = test_first + HOUR * 6;
+    let last = t0 + HOUR * (bars as i64 - 6);
+    let step = (last - first) / WINDOWS as i64;
+    (0..WINDOWS as i64)
+        .map(|k| format!("w{},{},{},{},{}", k + 1, t0, first + k * step - 5 * HOUR, first + k * step, first + (k + 1) * step - HOUR))
+        .collect()
+}
+
+/// Not ignored: one gpu arm per fitness on a tiny panel. `run_arm` fails when the arm reports no device time,
+/// so a fallback to the CPU fails the test and the binary calls CUDA under the memcheck pass.
+#[cfg(feature = "cuda")]
+#[test]
+fn the_gpu_arm_reaches_the_device() {
+    let (symbols, bars) = (2, 600);
+    let scratch = scratch::Scratch::new("ab-smoke");
+    let (feat, spec) = prepare(scratch.path(), symbols, bars);
+    let windows = test_windows(bars);
+    for fitness in ["metric", "pnl"] {
+        let r = run_arm(scratch.path(), &feat, &spec, &Arm { backend: "gpu", fitness, seed: 11 }, 2, &windows);
+        assert!(r.front > 0, "gpu {fitness} arm returned an empty front");
     }
 }
 
@@ -199,16 +233,7 @@ fn pnl_fitness_against_metric_fitness() {
     std::fs::create_dir_all(&dir).unwrap();
     let (feat, spec) = prepare(&dir, symbols, bars);
 
-    // The search holds out the last 20 % as test rows; the windows split them in
-    // WINDOWS equal parts after the boundary purge of the 4-bar label.
-    let t0 = synth_panel::SYNTH_T0;
-    let test_first = t0 + HOUR * (bars as i64 * 8 / 10);
-    let first = test_first + HOUR * 6;
-    let last = t0 + HOUR * (bars as i64 - 6);
-    let step = (last - first) / WINDOWS as i64;
-    let windows: Vec<String> = (0..WINDOWS as i64)
-        .map(|k| format!("w{},{},{},{},{}", k + 1, t0, first + k * step - 5 * HOUR, first + k * step, first + (k + 1) * step - HOUR))
-        .collect();
+    let windows = test_windows(bars);
 
     println!("backend fitness seed | val_net test_net test_sharpe test_trades test_exposure front | search_s s/gen eval_cpu_s fit_cpu_s dev_frac | wf_net wf_min_win wf_trades wf_exposure wf_sharpe wf_dsr wf_se");
     let mut rows: Vec<(&str, &str, u64, ArmResult)> = Vec::new();
