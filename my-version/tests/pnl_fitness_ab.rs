@@ -123,7 +123,7 @@ fn run_arm(dir: &Path, feat: &Path, spec: &Path, arm: &Arm, generations: usize, 
     a.extend(s(&["--cost-bps", COST_BPS, "--fill", "drop", "--no-project", "--pop", "64", "--islands", "4"]));
     a.extend(s(&["--patience", "0", "--fitness", arm.fitness, "--seed", &arm.seed.to_string()]));
     a.extend(s(&["--generations", &generations.to_string()]));
-    a.extend(s(if arm.backend == "gpu" { &["--cpu"] } else { &["--cpu"] }));
+    a.extend(s(if arm.backend == "gpu" { &["--gpu", "--dispatch", "device"] } else { &["--cpu"] }));
     a.extend(s(&["--json-out", run.to_str().unwrap(), "--dev-log", dev.to_str().unwrap(), "--dev-log-every", "1", "--json"]));
     must(&a);
 
