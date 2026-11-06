@@ -431,7 +431,7 @@ engine's own interpreted `f64` tree walk (`cpu_sse`), timed once.
 `Agreement` is the relative difference between the f32 kernel and the f64
 reference, over candidates that both sides scored as ordinary finite results.
 A median of ~3 × 10⁻⁸ is f32 epsilon: the kernel is computing the same thing.
-Roughly 30% of candidates are *hard failures* on both sides (random
+Roughly 30% of candidates are *hard failures* on both sides (the bench prints the split: on both sides, on the device only, on the host only; random
 `exp`/`cosh`/`cube` trees exceed the magnitude limit) and are excluded from the
 agreement statistic, not from the search.
 
