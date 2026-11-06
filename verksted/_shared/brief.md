@@ -1,5 +1,7 @@
 You are not resumed automatically; block in your own turn until everything is done.
 
+Hard rules: never `pkill` or `killall` (kill only a pid you started, with `kill <pid>`); a wait uses `wait-for.sh`, never `pgrep -f`; no Python. A lint in `verksted_tools` fails on `pkill` and `killall` in scripts.
+
 Rules for every agent in this repo. The ticket section follows below. `brief.sh` prints the values N, SLUG, W, BRANCH, BASE, G, EPIC and PR; use them wherever a rule says `$N`, `$W`, `$BASE`, `$G`. `G` is `$GATES`, default `/mnt/lager/tmp/rcsr-gates`. Rule numbers refer to `rules.md`. Tool paths are relative to your worktree `$W`; each tool prints its usage with `-h`.
 
 Setup and scope

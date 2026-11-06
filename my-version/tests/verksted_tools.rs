@@ -380,6 +380,62 @@ fn the_pgrep_f_lint_catches_every_spelling_and_honours_a_reason() {
     assert!(pgrep_full("pgrep -f x # pgrep-f-ok:   "));
 }
 
+/// A line that runs `pkill` or `killall`: the first word of a command, after wrappers such as `sudo`, `xargs`, `env`, `timeout 5`.
+fn kills_by_name(line: &str) -> bool {
+    const WRAPPERS: [&str; 12] =
+        ["sudo", "env", "nohup", "exec", "command", "xargs", "time", "timeout", "nice", "ionice", "setsid", "!"];
+    unquoted(line).split([';', '|', '&', '(', ')', '{', '}', '`']).any(|segment| {
+        let mut words = segment.split_whitespace().skip_while(|w| {
+            let base = w.rsplit('/').next().unwrap_or(w);
+            WRAPPERS.contains(&base) || w.starts_with('-') || w.contains('=') || w.chars().all(|c| c.is_ascii_digit())
+        });
+        words.next().is_some_and(|w| matches!(w.rsplit('/').next(), Some("pkill" | "killall")))
+    })
+}
+
+/// No tracked script under verksted/ kills a process by name: a script kills a pid it started, with `kill <pid>`.
+#[test]
+fn tools_use_no_pkill_or_killall() {
+    let mut files = Vec::new();
+    shell_files(&tools_dir().join(".."), &mut files);
+    assert!(!files.is_empty());
+    let mut hits = Vec::new();
+    for file in files {
+        for (n, line) in fs::read_to_string(&file).expect("read script").lines().enumerate() {
+            if kills_by_name(line) {
+                hits.push(format!("{}:{}: {}", file.display(), n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(hits.is_empty(), "pkill and killall are forbidden; kill only a pid you started:\n{}", hits.join("\n"));
+}
+
+#[test]
+fn the_pkill_lint_catches_every_spelling_and_skips_quotes_and_comments() {
+    for bad in [
+        "pkill -f x",
+        "sudo killall foo",
+        "x | xargs pkill",
+        "/usr/bin/pkill rcsr",
+        "cleanup() { pkill rcsr; }",
+        "n=$(killall -q x)",
+        "true && pkill x # a reason",
+    ] {
+        assert!(kills_by_name(bad), "{bad}");
+    }
+    for good in [
+        "grep -c pkill file",
+        "grep -vE '^#' f | grep -cE 'pgrep|pkill'",
+        "# never pkill or killall",
+        "echo hi # pkill",
+        "kill \"$pid\"",
+        "my-pkill-notes",
+        "echo \"killall\"",
+    ] {
+        assert!(!kills_by_name(good), "{good}");
+    }
+}
+
 const FAST: Guard = Guard { poll: Duration::from_millis(10), snapshot_every: 5, idle_snapshots: 3 };
 
 #[test]
