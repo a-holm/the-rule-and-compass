@@ -104,7 +104,7 @@ Every record:
 | `data test <rows> <hash>` | fingerprint of the test sample. |
 | `error_kind <f32_proxy\|f64\|unknown>` | #256: what the `sol` and `ind` errors are. A GPU search stores `f32_proxy` (optimistic by up to a few `1e-7` relative); a CPU search stores `f64`. |
 | `target_spec <sha256>` | #345: sha256 of the declared target spec of the writing run. Absent without a spec. `--resume` refuses a different value, or a missing one on either side, with exit 2 naming both hashes. |
-| `build <field> <value>` | #256: the process that wrote the file: `version`, `commit` (recorded when the binary was built), `binary_sha256`, `device`, `driver`, `threads`. `--resume` refuses a mismatch unless `--allow-build-change` is given. A checkpoint without `build` records loads and is not checked. There is no timestamp, so a prefix run reproduces an earlier checkpoint byte for byte (apart from `config generations`). |
+| `build <field> <value>` | #256: the process that wrote the file: `version`, `commit` (recorded when the binary was built), `binary_sha256`, `device`, `driver`, `threads` (the CPU count of the process, `available_parallelism`). `--resume` refuses a mismatch unless `--allow-build-change` is given, except in `threads`: a different CPU count prints a `# checkpoint: build identity changed (threads: saved 8 -> current 4)` notice and resumes (#860). A checkpoint without `build` records loads and is not checked. There is no timestamp, so a prefix run reproduces an earlier checkpoint byte for byte (apart from `config generations`). |
 | `archive_hash <hex>` | #256: `Archive::hash` of the `sol` members, verified on load. |
 | `archive <members> <cap>` | number of Pareto members and the archive capacity. |
 | `sol <complexity> <cost> <error> <tree>` | one archive member (the search archive, with `error_kind` errors). |
@@ -194,7 +194,7 @@ Non-search flags (input file, column names, output format, reports, `--top`, …
 are free to change, subject to the data fingerprint. `--save` may be combined
 with `--resume`; saving to the same path overwrites it at the next boundary.
 
-Execution settings are not saved. A resumed run takes them from its own command line: `--gpu`, `--cpu`, `--dispatch`, `--pipeline-depth` (default `2`, not the earlier chunk's value), `--threads`, `--gpu-memory`, and the post-loop options `--prune`, `--prune-rows`, `--prune-budget` and `--fit-report`. None of them changes the search trajectory. Settings that do change it, such as `--fit-polish`, `--fit-irls` and `--fit-rows`, are saved and a mismatch is refused.
+Execution settings are not saved. A resumed run takes them from its own command line: `--gpu`, `--cpu`, `--dispatch`, `--pipeline-depth` (default `2`, not the earlier chunk's value), `--threads` (and the CPU count of the process), `--gpu-memory`, and the post-loop options `--prune`, `--prune-rows`, `--prune-budget` and `--fit-report`. None of them changes the search trajectory. Settings that do change it, such as `--fit-polish`, `--fit-irls` and `--fit-rows`, are saved and a mismatch is refused.
 
 ### Backend identity
 
@@ -263,7 +263,7 @@ Limits:
 | data fingerprint mismatch | `3` (input) |
 | saved `backend` differs and `--allow-backend-change` was not given | `3` (input) |
 | saved `target_spec` differs from this run's spec (or one side has none) | `2` (usage) |
-| saved `build` identity (binary, commit, version, device, driver, threads) differs and `--allow-build-change` was not given | `3` (input) |
+| saved `build` identity (binary, commit, version, device, driver) differs and `--allow-build-change` was not given | `3` (input) |
 | `--resume` contradicts a saved search setting; `--save-every` without `--save`; invalid flag value | `2` (usage) |
 | checkpoint cannot be written | `3` (input) |
 

@@ -969,9 +969,10 @@ CHECKPOINTS:
                              (cpu<->gpu) and say so on stderr and in the
                              run manifest
   --allow-build-change       resume a checkpoint written by a different
-                             binary, commit, version, device, driver or
-                             thread count (#256). Without it the mismatch
-                             is refused (exit 3). A time-budget stop is not
+                             binary, commit, version, device or driver
+                             (#256). Without it the mismatch is refused
+                             (exit 3). A different CPU count is never
+                             refused: stderr names it (#860). A time-budget stop is not
                              terminal: --resume continues it and
                              --time-budget may be set again
 
@@ -5676,8 +5677,8 @@ fn main() {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
         }
-        // #256: the binary, commit, device, driver and thread count are part
-        // of what produced the saved state.
+        // #256: the binary, commit, device and driver are part of what
+        // produced the saved state. The CPU count is reported, not refused.
         let current_identity =
             rcsr::provenance::BuildIdentity::current(current_backend == Backend::Gpu);
         if let Err(e) = cp.check_identity(&current_identity, allow_build_change) {
@@ -5687,9 +5688,15 @@ fn main() {
         if let Some(saved) = &cp.identity {
             let diff = saved.differences(&current_identity);
             if !diff.is_empty() {
+                let allowed = if saved.refusing_differences(&current_identity).is_empty() {
+                    ""
+                } else {
+                    " (allowed by --allow-build-change)"
+                };
                 eprintln!(
-                    "# checkpoint: build identity changed ({}) (allowed by --allow-build-change)",
-                    diff.join("; ")
+                    "# checkpoint: build identity changed ({}){}",
+                    diff.join("; "),
+                    allowed
                 );
             }
         }
