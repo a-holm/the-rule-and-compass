@@ -106,7 +106,7 @@ fn ledger_seals_before_the_read_and_allows_one_read_per_candidate() {
     assert_eq!(ledger.record_read(&a.id, "locked-report-a", None).unwrap(), 1);
     // test_read:true cannot be read or selected again
     assert!(ledger.authorize_read(&sealed, &a.id, "data", "build", None).unwrap_err().contains("test_read:true"));
-    assert_eq!(ledger.read_report_sha(&a.id).as_deref(), Some("locked-report-a"));
+    assert_eq!(ledger.read_report_sha(&a.id).unwrap().as_deref(), Some("locked-report-a"));
     assert_eq!(ledger.record_read(&b.id, "locked-report-b", None).unwrap(), 2);
     assert_eq!(ledger.read_count().unwrap(), 2);
     let unread: Vec<String> = ledger.unread_candidates().unwrap().into_iter().map(|c| c.id).collect();
@@ -687,7 +687,7 @@ fn staged_write_crash_points_on_a_ledger_appended_under_the_lock() {
 }
 
 #[test]
-fn a_held_ledger_lock_delays_the_record_of_a_staged_write_without_deadlock() {
+fn a_staged_write_reaches_its_record_while_the_ledger_lock_is_held_and_completes_after_release() {
     use protocol::write_around_record;
     use std::sync::mpsc;
     let (_scratch, dir) = scratch("staged-lock");
@@ -716,8 +716,45 @@ fn a_held_ledger_lock_delays_the_record_of_a_staged_write_without_deadlock() {
     // staging finished without the ledger lock; only now is the lock released
     recorded_signal.recv().unwrap();
     assert!(!a.exists(), "the rename waits for the record, which waits for the lock");
+    // the lock is still held: an append that got through would show here. `concurrent_appenders_keep_one_chain_of_whole_lines` proves the lock itself.
+    assert_eq!(ledger.verify_chain().unwrap(), 1, "the ledger is unchanged while the lock is held");
+    assert_eq!(ledger.read_count().unwrap(), 0);
     holder.unlock().unwrap();
     assert_eq!(writer.join().unwrap().unwrap(), 1);
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "new a");
     assert_eq!(ledger.verify_chain().unwrap(), 2);
+}
+
+#[test]
+fn outputs_that_reach_one_file_are_refused_before_staging_or_recording() {
+    use protocol::write_around_record;
+    let (_scratch, dir) = scratch("same-file");
+    std::fs::create_dir(dir.join("b")).unwrap();
+    let a = dir.join("a.json");
+    std::fs::write(&a, "old").unwrap();
+    std::os::unix::fs::symlink(&a, dir.join("sym.json")).unwrap();
+    std::fs::hard_link(&a, dir.join("hard.json")).unwrap();
+    let others = [
+        dir.join(".").join("a.json"),
+        dir.join("b").join("..").join("a.json"),
+        dir.join("sym.json"),
+        dir.join("hard.json"),
+    ];
+    for other in others {
+        let called = std::cell::Cell::new(false);
+        let files: [(&Path, &[u8]); 2] = [(&a, b"x"), (&other, b"y")];
+        let err = write_around_record(&files, || { called.set(true); Ok(()) }, None).unwrap_err();
+        assert!(err.contains("same file"), "{}: {err}", other.display());
+        assert!(!called.get(), "{}", other.display());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "old");
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(!name.ends_with(".tmp"), "{name} left behind for {}", other.display());
+        }
+    }
+    // different files in one directory, and a target that does not exist yet, still work
+    let (c, d) = (dir.join("c.json"), dir.join("b").join("..").join("d.md"));
+    let files: [(&Path, &[u8]); 2] = [(&c, b"x"), (&d, b"y")];
+    write_around_record(&files, || Ok(()), None).unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("d.md")).unwrap(), "y");
 }

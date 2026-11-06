@@ -1523,3 +1523,56 @@ fn ladder_retry_after_a_marker_without_a_ledger_line_records_the_read() {
     let (code, vout, err) = rcsr(&["protocol", "verify", "--ledger", &f.ledger, "--data", &f.data]);
     assert_eq!(code, 0, "{}{}", vout, err);
 }
+
+#[test]
+fn ladder_refuses_out_and_markdown_that_name_one_file() {
+    let f = Sealed::new("lad-same-file");
+    std::fs::create_dir(f.dir.join("b")).unwrap();
+    let out = f.dir.join("a.json");
+    let ledger_before = f.bytes(&f.ledger);
+    let forms = [
+        f.dir.join(".").join("a.json"),
+        f.dir.join("b").join("..").join("a.json"),
+    ];
+    for md in forms {
+        let (code, _, err) = f.read(&s(&out), &["--markdown", &s(&md)]);
+        assert_eq!(code, 3, "{}: {}", md.display(), err);
+        assert!(err.contains("same file"), "{}", err);
+        assert_eq!(f.bytes(&f.ledger), ledger_before);
+        assert!(f.bytes(&f.marker()).is_none());
+        assert!(!out.exists() && !f.dir.join("a.json.tmp").exists());
+    }
+    // a symlink and a hard link to an existing output
+    std::fs::write(&out, "old").unwrap();
+    std::os::unix::fs::symlink(&out, f.dir.join("sym.md")).unwrap();
+    std::fs::hard_link(&out, f.dir.join("hard.md")).unwrap();
+    for md in ["sym.md", "hard.md"] {
+        let (code, _, err) = f.read(&s(&out), &["--markdown", &s(&f.dir.join(md))]);
+        assert_eq!(code, 3, "{md}: {err}");
+        assert_eq!(f.bytes(&f.ledger), ledger_before);
+        assert!(f.bytes(&f.marker()).is_none());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "old");
+    }
+}
+
+#[test]
+fn ladder_refuses_a_relative_out_and_its_dot_slash_form() {
+    let f = Sealed::new("lad-same-file-rel");
+    let ledger_before = f.bytes(&f.ledger);
+    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .current_dir(&f.dir)
+        .args([
+            "ladder", "--data", &f.data, "--target", "y", "--time", "ts", "--group", "sym", "--features", "f1,f2",
+            "--windows", &f.windows, "--scheme", "locked", "--purge-seconds", "7200", "--gbm-trees", "10", "--draws",
+            "50", "--max-fit-rows", "600", "--out", "a.json", "--markdown", "./a.json", "--locked-test", "--ledger",
+            &f.ledger, "--sealed", &f.sealed,
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{err}");
+    assert!(err.contains("same file"), "{err}");
+    assert_eq!(f.bytes(&f.ledger), ledger_before);
+    assert!(f.bytes(&f.marker()).is_none());
+    assert!(!f.dir.join("a.json").exists() && !f.dir.join("a.json.tmp").exists());
+}

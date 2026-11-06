@@ -3456,12 +3456,13 @@ fn main() {
         eprintln!("error: --report cannot be combined with --eval-expr");
         std::process::exit(EXIT_USAGE);
     }
-    if let Some(p) = &ledger_arg {
-        if let Err(e) = rcsr::protocol::Ledger::new(p).read_count() {
+    let ledger_reads = match &ledger_arg {
+        Some(p) => rcsr::protocol::Ledger::new(p).read_count().unwrap_or_else(|e| {
             eprintln!("error: {}", e);
-            std::process::exit(EXIT_INPUT);
-        }
-    }
+            std::process::exit(EXIT_INPUT)
+        }),
+        None => 0,
+    };
     // #211: the development log describes one search. It is on by default, so
     // only an *explicit* request is refused where it cannot be honoured;
     // `--report benchmark` simply runs its repeats without a log.
@@ -7401,10 +7402,7 @@ fn main() {
                     _ => Vec::new(),
                 };
                 let overlap = lockbox.overlap(times.iter().copied());
-                let reads = ledger_arg
-                    .as_ref()
-                    .map(|p| rcsr::protocol::Ledger::new(p).read_count().unwrap_or(0))
-                    .unwrap_or(0);
+                let reads = ledger_reads;
                 let evaluated = spec.declared_lockbox.is_none() && allow_lockbox && overlap.rows > 0;
                 let mut j = lockbox.json(&overlap, allow_lockbox, false, evaluated);
                 j.pop();
@@ -11246,9 +11244,10 @@ fn run_walkforward(args: &[String]) -> ! {
         if let Some(l) = &ledger {
             let outcome = if locked_test && verify_read {
                 match l.read_report_sha(&candidate_id) {
-                    Some(h) if h == report_sha => Ok(read_count),
-                    Some(h) => Err(format!("report sha256 {} differs from the recorded read {}", report_sha, h)),
-                    None => Err("no recorded read for this candidate".to_string()),
+                    Ok(Some(h)) if h == report_sha => Ok(read_count),
+                    Ok(Some(h)) => Err(format!("report sha256 {} differs from the recorded read {}", report_sha, h)),
+                    Ok(None) => Err("no recorded read for this candidate".to_string()),
+                    Err(e) => Err(e),
                 }
             } else if locked_test {
                 // The record runs after the report files are staged; the report names the count it will produce.
