@@ -2300,6 +2300,7 @@ impl GpuSearch {
             fit_status_by_label: self.fit_status_by_label.clone(),
             fit_refits: 0,
             fit_refit_candidates: 0,
+            fit_carried_kept: 0,
             fit_refit_s: 0.0,
             fit_rescore_s: 0.0,
             fit_ms: self.fit_ms,
@@ -5033,7 +5034,7 @@ fn full_data_archive(
         ..RefitReport::default()
     };
     let refit_on = refit_gpu_fit && cfg.fit_iters > 0 && !train.sample.is_multi();
-    let carried: Vec<Node> = if false && refit_on && cfg.fitness.book().is_some() {
+    let carried: Vec<Node> = if refit_on && cfg.fitness.book().is_some() {
         archive.items.iter().map(|s| expr::simplify(&s.tree)).collect()
     } else {
         Vec::new()
@@ -5888,6 +5889,8 @@ pub struct GpuRunStats {
     pub fit_refit_s: f64,
     /// #495: wall seconds of full-data scoring in the finalist rebuild.
     pub fit_rescore_s: f64,
+    /// #850: front members that kept their carried constants at the rebuild.
+    pub fit_carried_kept: usize,
     /// #169: wall time spent in the batched fit kernels, milliseconds.
     pub fit_ms: f64,
     /// #496: the polish-phase part of `fit_ms`, apportioned by per-block cycles.
@@ -8943,6 +8946,7 @@ fn run_search(
             let mut s = g.run_stats();
             s.fit_refits = gpu_fit_refits;
             s.fit_refit_candidates = refit_report.candidates;
+            s.fit_carried_kept = refit_report.carried_kept;
             s.fit_refit_s = refit_report.refit_s;
             s.fit_rescore_s = refit_report.rescore_s;
             s.fit_admission = cfg.fit_admission;
