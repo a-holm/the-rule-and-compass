@@ -430,6 +430,159 @@ fn a_ledger_binds_the_locked_range_and_a_read_refuses_another() {
     assert_eq!(reads, vec![Some(same.clone()), Some(same)]);
 }
 
+const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The two ledger lines of the issue: a final seal and a locked read.
+fn issue_lines() -> (String, String) {
+    let l1 = format!(
+        "{{\"prev\":\"{ZERO}\",\"event\":\"seal\",\"sealed_sha256\":\"aa\",\"final\":true,\"max_reads\":1,\"report_candidates\":false,\"test_read\":false}}"
+    );
+    let h1 = rcsr::manifest::sha256_hex(l1.as_bytes());
+    let l2 = format!(
+        "{{\"prev\":\"{h1}\",\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"bb\",\"read_count\":1,\"test_read\":true}}"
+    );
+    (l1, l2)
+}
+
+fn path_str(p: &Path) -> String {
+    p.to_str().unwrap().to_string()
+}
+
+#[test]
+fn verify_fails_on_two_objects_in_one_line() {
+    let (_scratch, dir) = scratch("torn-join");
+    let (l1, l2) = issue_lines();
+    let (good, torn) = (dir.join("good.jsonl"), dir.join("torn.jsonl"));
+    std::fs::write(&good, format!("{l1}\n{l2}\n")).unwrap();
+    std::fs::write(&torn, format!("{l1}{l2}\n")).unwrap();
+    let (code, out, err) = rcsr(&["protocol", "verify", "--ledger", &path_str(&good)]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("ledger ok: 2 line(s), 1 locked read(s)"), "{out}");
+    let (code, out, err) = rcsr(&["protocol", "verify", "--ledger", &path_str(&torn)]);
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(!out.contains("ledger ok"), "{out}");
+    assert!(err.contains("line 1"), "{err}");
+    assert!(err.contains("not one complete JSON object"), "{err}");
+}
+
+#[test]
+fn verify_refuses_a_ledger_whose_last_line_has_no_newline() {
+    let (_scratch, dir) = scratch("torn-end");
+    let (l1, l2) = issue_lines();
+    let path = dir.join("cut.jsonl");
+    std::fs::write(&path, format!("{l1}\n{l2}")).unwrap();
+    let p = path_str(&path);
+    for args in [
+        vec!["protocol", "verify", "--ledger", p.as_str()],
+        vec!["protocol", "candidates", "--ledger", p.as_str()],
+    ] {
+        let (code, out, err) = rcsr(&args);
+        assert_eq!(code, 1, "{out}{err}");
+        assert!(err.contains("a write was cut"), "{err}");
+        assert!(err.contains("has no newline"), "{err}");
+    }
+    // a half line is refused the same way
+    std::fs::write(&path, format!("{l1}\n{}", &l2[..l2.len() / 2])).unwrap();
+    assert_eq!(rcsr(&["protocol", "verify", "--ledger", &p]).0, 1);
+    // so is a complete line that is not an object
+    std::fs::write(&path, format!("{l1}\nnot json\n")).unwrap();
+    let (code, _, err) = rcsr(&["protocol", "verify", "--ledger", &p]);
+    assert_eq!(code, 1);
+    assert!(err.contains("line 2"), "{err}");
+}
+
+#[test]
+fn seal_refuses_a_ledger_with_a_cut_last_line() {
+    let (_scratch, dir) = scratch("seal-cut");
+    let path = dir.join("ledger.jsonl");
+    let ledger = Ledger::new(&path);
+    ledger.add_candidate(&candidate("a")).unwrap();
+    ledger.add_candidate(&candidate("b")).unwrap();
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.ends_with('\n'));
+    text.pop();
+    std::fs::write(&path, &text).unwrap();
+    let out = dir.join("sealed.json");
+    for extra in [vec![], vec!["--final"]] {
+        let mut a = vec!["protocol", "seal"];
+        a.extend_from_slice(&extra);
+        let (l, o) = (path_str(&path), path_str(&out));
+        a.extend_from_slice(&["--ledger", &l, "--out", &o]);
+        let (code, _, err) = rcsr(&a);
+        assert_eq!(code, 1, "{err}");
+        assert!(err.contains("a write was cut"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "the file is unchanged");
+        assert!(!out.exists());
+    }
+    assert!(ledger.add_candidate(&candidate("c")).unwrap_err().contains("a write was cut"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+}
+
+#[test]
+fn verify_accepts_the_existing_ledger_format() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/protocol");
+    let ledger = dir.join("old_ledger.jsonl");
+    let (code, out, err) = rcsr(&["protocol", "verify", "--ledger", &path_str(&ledger)]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains("ledger ok: 3 line(s), 1 locked read(s)"), "{out}");
+    // the fixture keeps its terminated lines and hash chain: a new line extends it
+    let (_scratch, tmp) = scratch("old-ledger");
+    let copy = tmp.join("old_ledger.jsonl");
+    std::fs::copy(&ledger, &copy).unwrap();
+    assert_eq!(Ledger::new(&copy).verify_chain().unwrap(), 3);
+    let (l1, l2) = issue_lines();
+    let issue = tmp.join("issue.jsonl");
+    std::fs::write(&issue, format!("{l1}\n{l2}\n")).unwrap();
+    assert_eq!(Ledger::new(&issue).verify_chain().unwrap(), 2);
+}
+
+#[test]
+fn concurrent_appenders_keep_one_chain_of_whole_lines() {
+    let (_scratch, dir) = scratch("concurrent");
+    let path = dir.join("ledger.jsonl");
+    let threads: Vec<_> = (0..6)
+        .map(|t| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let ledger = Ledger::new(&path);
+                for k in 0..8 {
+                    ledger.add_candidate(&candidate(&format!("{t}-{k}"))).unwrap();
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    let ledger = Ledger::new(&path);
+    assert_eq!(ledger.verify_chain().unwrap(), 48);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.ends_with('\n'));
+    assert_eq!(text.lines().count(), 48);
+}
+
+#[test]
+fn the_search_refuses_a_ledger_with_a_cut_last_line_before_it_starts() {
+    let (_scratch, dir) = scratch("search-cut");
+    let data = dir.join("d.csv");
+    let mut csv = String::from("ts,x,y\n");
+    for i in 0..100 {
+        csv.push_str(&format!("{},{},{}\n", i, (i * 7) % 11, (i * 3) % 5));
+    }
+    std::fs::write(&data, csv).unwrap();
+    let (l1, _) = issue_lines();
+    let ledger = dir.join("cut.jsonl");
+    std::fs::write(&ledger, &l1).unwrap();
+    let (d, l) = (path_str(&data), path_str(&ledger));
+    let (code, _, err) = rcsr(&[
+        "--data", &d, "--target", "y", "--vars", "x", "--time", "ts", "--cpu", "--no-dev-log", "--seed", "3",
+        "--generations", "2", "--pop", "10", "--quiet", "--ledger", &l,
+    ]);
+    assert_eq!(code, 3, "{err}");
+    assert!(err.contains("a write was cut"), "{err}");
+    assert_eq!(std::fs::read_to_string(&ledger).unwrap(), l1);
+}
+
 fn tmp_of(p: &Path) -> PathBuf {
     PathBuf::from(format!("{}.tmp", p.display()))
 }
@@ -500,4 +653,71 @@ fn a_sealed_write_that_fails_before_the_record_records_nothing_and_leaves_no_sta
     let err = write_around_record(&files, || Ok(()), None).unwrap_err();
     assert!(err.contains("same file"), "{err}");
     assert!(!tmp_of(&good).exists());
+}
+
+#[test]
+fn staged_write_crash_points_on_a_ledger_appended_under_the_lock() {
+    use protocol::{write_around_record, CrashAt};
+    for crash in [CrashAt::AfterStage, CrashAt::AfterRecord, CrashAt::AfterFirstRename] {
+        let (_scratch, dir) = scratch("staged-ledger");
+        let (a, b) = (dir.join("a.json"), dir.join("b.md"));
+        let lp = dir.join("ledger.jsonl");
+        let ledger = Ledger::new(&lp);
+        ledger.add_candidate(&candidate("a")).unwrap();
+        let files: [(&Path, &[u8]); 2] = [(&a, b"new a"), (&b, b"new b")];
+        let record = || ledger.record_read(&candidate("a").id, "hash", None);
+        let err = write_around_record(&files, record, Some(crash)).unwrap_err();
+        assert!(err.contains("simulated kill"), "{err}");
+        let reads = if crash == CrashAt::AfterStage { 0 } else { 1 };
+        assert_eq!(ledger.read_count().unwrap(), reads, "{crash:?}");
+        assert!(std::fs::read_to_string(&lp).unwrap().ends_with('\n'));
+        assert_eq!(ledger.verify_chain().unwrap(), 1 + reads as usize);
+        // retry: a plain rerun records once; after the record the verify route records nothing
+        if reads == 0 {
+            write_around_record(&files, record, None).unwrap();
+        } else {
+            write_around_record(&files, || Ok(0), None).unwrap();
+        }
+        assert_eq!(ledger.read_count().unwrap(), 1);
+        assert_eq!(ledger.verify_chain().unwrap(), 2);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "new a");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "new b");
+        assert!(!tmp_of(&a).exists() && !tmp_of(&b).exists());
+    }
+}
+
+#[test]
+fn a_held_ledger_lock_delays_the_record_of_a_staged_write_without_deadlock() {
+    use protocol::write_around_record;
+    use std::sync::mpsc;
+    let (_scratch, dir) = scratch("staged-lock");
+    let (a, lp) = (dir.join("a.json"), dir.join("ledger.jsonl"));
+    let ledger = Ledger::new(&lp);
+    ledger.add_candidate(&candidate("a")).unwrap();
+    let holder = std::fs::OpenOptions::new().read(true).append(true).open(&lp).unwrap();
+    holder.lock().unwrap();
+    let (about_to_record, recorded_signal) = mpsc::channel();
+    let id = candidate("a").id;
+    let writer = std::thread::spawn({
+        let (a, lp) = (a.clone(), lp.clone());
+        move || {
+            let ledger = Ledger::new(&lp);
+            let files: [(&Path, &[u8]); 1] = [(&a, b"new a")];
+            write_around_record(
+                &files,
+                || {
+                    about_to_record.send(()).unwrap();
+                    ledger.record_read(&id, "hash", None)
+                },
+                None,
+            )
+        }
+    });
+    // staging finished without the ledger lock; only now is the lock released
+    recorded_signal.recv().unwrap();
+    assert!(!a.exists(), "the rename waits for the record, which waits for the lock");
+    holder.unlock().unwrap();
+    assert_eq!(writer.join().unwrap().unwrap(), 1);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "new a");
+    assert_eq!(ledger.verify_chain().unwrap(), 2);
 }

@@ -1404,7 +1404,16 @@ fn ladder_verify_read_recomputes_the_recorded_report() {
         without_timing(&std::fs::read_to_string(&out2).unwrap()),
         without_timing(&std::fs::read_to_string(&out).unwrap())
     );
-    assert_eq!(std::fs::read(&md2).unwrap(), std::fs::read(&md).unwrap());
+    // the last column of the table is the wall clock of the rung
+    let without_wall = |p: &str| -> String {
+        std::fs::read_to_string(p)
+            .unwrap()
+            .lines()
+            .map(|l| if l.starts_with('|') { l.trim_end_matches('|').rsplit_once('|').map_or(l, |(head, _)| head) } else { l })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(without_wall(&md2), without_wall(&md));
 }
 
 #[test]
