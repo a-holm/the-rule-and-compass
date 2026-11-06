@@ -192,10 +192,13 @@ fn every_refused_device_allocation_falls_back_cleanly() {
     for &k in &ks {
         let tag = format!("alloc-{k}");
         enrich_gpu::set_alloc_fault_for_tests(k);
+        let t0 = std::time::Instant::now();
         let (report, out) = fx.gpu_run(&tag);
+        let t1 = std::time::Instant::now();
         enrich_gpu::set_alloc_fault_for_tests(0);
         fx.assert_labelled(&tag, &report);
         fx.assert_matches_cpu(&tag, &report, &out);
+        eprintln!("PROFILE k={k} build={:.3} compare={:.3}", (t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
         let extra = report.gpu_fallback.saturating_sub(base.gpu_fallback);
         eprintln!("alloc {k}/{total}: fallback columns +{extra}");
         if extra > 0 {
