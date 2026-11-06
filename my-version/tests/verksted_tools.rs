@@ -287,8 +287,8 @@ fn has_word(line: &str, word: &str) -> bool {
     })
 }
 
-/// The text of a shell line that is not a comment or quoted. `#` starts a comment only after whitespace.
-fn outside_quotes(line: &str) -> String {
+/// The words a shell line runs: the comment and the quoted text are dropped. `#` starts a comment only after whitespace.
+fn unquoted(line: &str) -> String {
     let mut out = String::new();
     let mut quote: Option<char> = None;
     let mut prev = ' ';
@@ -310,11 +310,81 @@ fn outside_quotes(line: &str) -> String {
     out
 }
 
+/// A `pgrep` call with a full-command-line flag matches the wait loop that runs it.
+fn pgrep_full(line: &str) -> bool {
+    let reasoned = line.split_once("# pgrep-f-ok:").is_some_and(|(_, why)| !why.trim().is_empty());
+    if reasoned {
+        return false;
+    }
+    let code = unquoted(line).replace(['(', ')', '{', '}', '`'], " ");
+    let mut words = code.split_whitespace();
+    while let Some(word) = words.next() {
+        if word.rsplit('/').next() != Some("pgrep") {
+            continue;
+        }
+        for arg in words.by_ref() {
+            if matches!(arg, ";" | "|" | "&&" | "||") || arg.ends_with(';') {
+                break;
+            }
+            if arg == "--full" || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('f')) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Every tracked script under verksted/ waits without `pgrep -f`.
+#[test]
+fn tools_use_no_pgrep_f() {
+    let mut files = Vec::new();
+    shell_files(&tools_dir().join(".."), &mut files);
+    assert!(!files.is_empty());
+    let mut hits = Vec::new();
+    for file in files {
+        for (n, line) in fs::read_to_string(&file).expect("read script").lines().enumerate() {
+            if pgrep_full(line) {
+                hits.push(format!("{}:{}: {}", file.display(), n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "pgrep -f matches its own command line; wait with verksted/_tools/wait-for.sh (--pid, --exe, --log), or add `# pgrep-f-ok: <reason>`:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn the_pgrep_f_lint_catches_every_spelling_and_honours_a_reason() {
+    for bad in [
+        "until ! pgrep -f 'x'; do :; done",
+        "while pgrep -af x; do :; done",
+        "n=$(pgrep -fl x)",
+        "/usr/bin/pgrep --full x",
+        "pgrep -o -f x | head",
+    ] {
+        assert!(pgrep_full(bad), "{bad}");
+    }
+    for good in [
+        "pgrep -x rcsr",
+        "grep -c 'pgrep -f' file",
+        "# never pgrep -f",
+        "echo hi # pgrep -f",
+        "pgrep rcsr; echo -f",
+        "ps -eo comm= | grep -cx rcsr",
+        "pgrep -f x # pgrep-f-ok: exact pattern is a pid file name",
+    ] {
+        assert!(!pgrep_full(good), "{good}");
+    }
+    assert!(pgrep_full("pgrep -f x # pgrep-f-ok:   "));
+}
+
 /// A line that runs `pkill` or `killall`: the first word of a command, after wrappers such as `sudo`, `xargs`, `env`, `timeout 5`.
 fn kills_by_name(line: &str) -> bool {
     const WRAPPERS: [&str; 12] =
         ["sudo", "env", "nohup", "exec", "command", "xargs", "time", "timeout", "nice", "ionice", "setsid", "!"];
-    outside_quotes(line).split([';', '|', '&', '(', ')', '{', '}', '`']).any(|segment| {
+    unquoted(line).split([';', '|', '&', '(', ')', '{', '}', '`']).any(|segment| {
         let mut words = segment.split_whitespace().skip_while(|w| {
             let base = w.rsplit('/').next().unwrap_or(w);
             WRAPPERS.contains(&base) || w.starts_with('-') || w.contains('=') || w.chars().all(|c| c.is_ascii_digit())

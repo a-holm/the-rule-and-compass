@@ -26,7 +26,7 @@ Tests and builds (rules 12, 23, 34)
 Waiting (rules 26, 27)
 - One wait mechanism: one blocking call, or one background shell and its notification. Never start repeated wait loops.
 - Never write `pgrep -f` or `until ! pgrep -f` loops: `pgrep -f` matches the loop's own command line and the loop never ends. Never loop on an exact count that may never match.
-- Wait on a log line or a done-file with `verksted/_tools/wait-for.sh --log <file>` (or `--file`), which polls inside one process under an outer timeout. Stop your own wait loops before your final report.
+- Wait on a log line, a done-file or a process with `verksted/_tools/wait-for.sh --log <file>` (or `--file`, `--pid <N>`, `--exe <abs path>`), which polls inside one process under an outer timeout. A wait uses `wait-for.sh`, never `pgrep -f`. Stop your own wait loops before your final report.
 - Never use `pkill` or `killall`. Kill only a process you started.
 
 No Python (rule 9)

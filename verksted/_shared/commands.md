@@ -43,6 +43,7 @@ verksted/_tools/rc-run.sh test "$W" "$N" <what> --cuda -- cargo test --release -
 verksted/_tools/rc-run.sh run "$W" "$N" <what> -- ./target/release/rcsr <args>                          # rcsr and rcsr-bench: test lock
 # rc-run.sh lock modes run the command through verksted/_tools/lock-run.sh: its own session; after it ends, every process that shares the flock of that hold is TERMed then KILLed by pid (nothing is signalled unless the process itself owns the flock on the lock file)
 # A monitor or background job started under a hold must use setsid and 9>&- (close the lock fd), or the reap ends it with the hold
+# runlib.sh rl_gpu (and rl_chunks) holds run through lock-run.sh the same way; a runbook that takes the lock directly runs: bash verksted/_tools/lock-run.sh "$LOCKFILE" <command...> as the first command inside the lock script
 ps -eo pcpu,args | grep -E 'cargo|rustc'          # look first: one cargo at a time
 ```
 
@@ -70,12 +71,14 @@ Three lock holds: `cargo test --release --no-fail-fast`; `RCSR_CUDA_ARCH=sm_86 c
 
 ## Waiting
 
-One blocking call, or one background shell and its notification. Wait on a log line, a file or a count, never on a process name.
+One blocking call, or one background shell and its notification. A wait always uses `wait-for.sh`: on a log line, a file, a count, an exact pid or an executable path. Never write `pgrep -f` (it matches the waiting shell itself; the lint `tools_use_no_pgrep_f` fails on it).
 
 ```sh
 verksted/_tools/wait-for.sh --log "$G/issue$N-<what>.log"       # until RC_DONE; prints the test summary
 verksted/_tools/wait-for.sh --file <path> --timeout 3000
 verksted/_tools/wait-for.sh --count <n> --dir <dir> --glob '*.done'
+verksted/_tools/wait-for.sh --pid "$PID" --timeout 3000       # until that exact pid has ended (reads /proc, no command line)
+verksted/_tools/wait-for.sh --exe /abs/path/to/binary          # until no process runs that executable (exact /proc/<pid>/exe)
 tail --pid="$PID" -f /dev/null          # blocks until the pid you started exits
 kill -0 "$PID"                          # alive? exit 0 yes
 verksted/_tools/watch.sh -m 45 "$WT"/issue-*   # silence watcher: one background shell, prints SILENT <n>min: <path>
@@ -122,12 +125,15 @@ gh pr view <pr> --json state,mergeCommit
 
 Ticket PRs merge into the integration branch only, squashed, by the merge clerk. `main` only on the lead's written instruction. Hand-write subject and body. Never `Closes`. The worktree is removed afterwards with `wt-done.sh` (next section).
 
+`gh pr merge --delete-branch` also removes the worktree that has the head branch checked out (gh 2.103.3; the exact conditions are not verified), so `clerk-check.sh` checks before the merge that this worktree is clean and at the PR head. Afterwards an already-gone worktree is expected, not an error.
+
 ## Close and clean up (this ticket only)
 
 ```sh
 gh issue close "$N" --reason completed
 verksted/_tools/wt-done.sh "$N" --dry-run       # prints the actions
 verksted/_tools/wt-done.sh "$N"                 # worktree, local and remote branch; refuses unless clean and merged
+verksted/_tools/wt-done.sh "$N" --pr <pr>       # worktree already removed by the merge: deletes leftover branches, exit 0 "already gone" when the PR is MERGED
 test ! -e "$W"
 ```
 

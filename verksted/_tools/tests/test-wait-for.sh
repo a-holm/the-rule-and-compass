@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: test-wait-for.sh
-# Hermetic test of wait-for.sh: log match, timeout, file, count, custom pattern, usage errors, summary on cargo logs.
+# Hermetic test of wait-for.sh: log match, timeout, file, count, custom pattern, pid and exe waits, usage errors, summary on cargo logs.
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -95,12 +95,44 @@ vclock_reset
 out=$(w --log "$T/c.log" --pattern "ALLDONE" --timeout 2)
 check no-summary "$out" 'ALLDONE 42'
 
+# --pid and --exe: a live process times out, an ended one matches, the wait never matches its own command line
+# killwait.sh <pid>: TERM, then return once the process is gone or a zombie, so the next poll always sees it ended
+printf 'kill "$1"\nwhile [ -r "/proc/$1/stat" ] && [ "$(cut -d" " -f3 "/proc/$1/stat")" != Z ]; do :; done\n' > "$T/killwait.sh"
+hold "true"; check pid-hold-ready $? 0
+vclock_reset; w --pid "$HOLD_PID" --timeout 2 > /dev/null; check pid-live-rc "$?" 124
+check pid-live-polls "$(polls)" 2
+vclock_reset; vclock_at 1 "bash $T/killwait.sh $HOLD_PID"
+w --pid "$HOLD_PID" --timeout 5 > /dev/null; check pid-ends-rc "$?" 0
+check pid-ends-polls "$(polls)" 1
+release
+gone=$(bash -c 'echo $$')
+vclock_reset; w --pid "$gone" --timeout 2 > /dev/null; check pid-gone-rc "$?" 0
+check pid-gone-polls "$(polls)" 0
+mkdir "$T/bin"
+cp "$(command -v tail)" "$T/bin/blocker"
+"$T/bin/blocker" -f /dev/null &
+bp=$!
+vclock_reset; w --exe "$T/bin/blocker" --timeout 2 > /dev/null; check exe-live-rc "$?" 124
+check exe-live-polls "$(polls)" 2
+vclock_reset; vclock_at 1 "bash $T/killwait.sh $bp"
+w --exe "$T/bin/blocker" --timeout 5 > /dev/null; check exe-ends-rc "$?" 0
+check exe-ends-polls "$(polls)" 1
+kill "$bp" 2> /dev/null
+wait "$bp" 2> /dev/null
+vclock_reset; w --exe "$T/bin/blocker" --timeout 2 > /dev/null; check exe-self-rc "$?" 0
+check exe-self-polls "$(polls)" 0
+vclock_reset; w --exe "$T/bin/other" --timeout 2 > /dev/null; check exe-none-rc "$?" 0
+
 # usage errors
 bash "$W" > /dev/null 2>&1; check usage-none "$?" 2
 bash "$W" --log a --file b > /dev/null 2>&1; check usage-two-modes "$?" 2
 bash "$W" --log a --timeout x > /dev/null 2>&1; check usage-timeout "$?" 2
 bash "$W" --count 2 > /dev/null 2>&1; check usage-count-no-dir "$?" 2
 bash "$W" --bogus > /dev/null 2>&1; check usage-unknown "$?" 2
+bash "$W" --pid abc > /dev/null 2>&1; check usage-pid "$?" 2
+bash "$W" --pid 0 > /dev/null 2>&1; check usage-pid-zero "$?" 2
+bash "$W" --exe rel/path > /dev/null 2>&1; check usage-exe-relative "$?" 2
+bash "$W" --pid 1 --exe /x > /dev/null 2>&1; check usage-pid-and-exe "$?" 2
 bash "$W" --log > /dev/null 2>&1; check usage-missing-value "$?" 2
 bash "$W" -h > /dev/null 2>&1; check help "$?" 0
 
