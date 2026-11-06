@@ -58,7 +58,6 @@ scan() { # HOLD = pids sharing this hold's lock line; LOST=1 when our own line i
       [ "$n" = "$own_fd" ] && lockline "$p" "$n" && [ "$LL" = "$own_line" ] && own_seen=1
       continue
     fi
-    [ "$p" = "$BASHPID" ] && continue
     lockline "$p" "$n" && [ "$LL" = "$own_line" ] && HOLD+=("$p")
   done
   [ "$own_seen" -eq 1 ] || { LOST=1; HOLD=(); }
@@ -88,33 +87,40 @@ trap 'forward INT' INT
 trap 'forward HUP' HUP
 setsid "$@" <&0 &
 cpid=$!
-wait "$cpid"
-rc=$?
-while kill -0 "$cpid" 2> /dev/null; do
+while :; do
   wait "$cpid"
   rc=$?
+  kill -0 "$cpid" 2> /dev/null || break
 done
+wait "$cpid" 2> /dev/null
+st=$?
+[ "$st" -eq 127 ] || rc=$st
+cpid=
 
 lost_exit() {
   echo "lock-run: ownership of the flock is gone (the lock file was replaced or the flock was released); nothing more is signalled" >&2
   exit "$rc"
+}
+check_lost() { # a scan can come out partial (a fork failed, a signal hit it): scan once more before giving up
+  [ "$LOST" -eq 0 ] || scan
+  [ "$LOST" -eq 0 ] || lost_exit
 }
 signal_all() { local p; for p in "${HOLD[@]}"; do kill "-$1" "$p" 2> /dev/null; done; }
 wait_free() { # <count>: returns 0 once no process holds the lock, 1 after <count> waits
   local i
   for ((i = 0; i < $1; i++)); do
     scan
-    [ "$LOST" -eq 0 ] || lost_exit
+    check_lost
     [ ${#HOLD[@]} -eq 0 ] && return 0
     sleep 0.1
   done
   scan
-  [ "$LOST" -eq 0 ] || lost_exit
+  check_lost
   [ ${#HOLD[@]} -eq 0 ]
 }
 
 scan
-[ "$LOST" -eq 0 ] || lost_exit
+check_lost
 if [ ${#HOLD[@]} -gt 0 ]; then
   echo "lock-run: ended pids still holding the lock: ${HOLD[*]}" >&2
   signal_all TERM

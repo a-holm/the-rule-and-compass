@@ -352,6 +352,15 @@ cleanup_pids
 
 # finding 2: the command runs under timeout -k; a stub case reads the log, a real timeout ends a command that ignores TERM
 check kill-after-stub "$(tail -n 1 "$T/timeouts.kill")" "30"
+# RCSR_KILL_AFTER: only a positive number is used; 0 (which disables the KILL), words, negatives and anything with a space or a shell
+# character fall back to 30 and never reach the command line
+for v in 0 0.0 abc -1 "1 2" "1;touch $T/pwned"; do
+  RCSR_KILL_AFTER=$v rc bash "$RC" cpu "$T/wt" 9 t -- show-args > /dev/null 2>&1
+  check "kill-after-bad[$v]" "$(tail -n 1 "$T/timeouts.kill")" "30"
+done
+check kill-after-bad-no-injection "$([ -e "$T/pwned" ] && echo yes || echo no)" "no"
+RCSR_KILL_AFTER=2.5 rc bash "$RC" cpu "$T/wt" 9 t -- show-args > /dev/null 2>&1
+check kill-after-good "$(tail -n 1 "$T/timeouts.kill")" "2.5"
 cat > "$T/bin/ignore-term" <<'STUB'
 #!/usr/bin/env bash
 trap '' TERM

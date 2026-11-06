@@ -92,9 +92,13 @@ cap=$(bash -c ". '$HERE/../lib.sh'; echo \$LOCK_HOLD_MAX")
 over=0
 while IFS= read -r t; do
   [ "$t" -le "$cap" ] || over=$((over + 1))
-done < <(grep -- '--features cuda --no-fail-fast' "$T/cmds" | sed -n 's/.* timeout \([0-9]*\) cargo.*/\1/p')
+done < <(grep -- '--features cuda --no-fail-fast' "$T/cmds" | sed -n 's/.* timeout -k 30 \([0-9]*\) cargo.*/\1/p')
 check hold-under-cap "$over" 0
-check hold-timeouts-found "$(grep -- '--features cuda --no-fail-fast' "$T/cmds" | grep -c ' timeout [0-9]* cargo')" 6
+check hold-timeouts-found "$(grep -- '--features cuda --no-fail-fast' "$T/cmds" | grep -c ' timeout -k 30 [0-9]* cargo')" 6
+# every timeout the gate starts has a kill-after: none is left bare
+check no-bare-timeout "$(grep -cE 'timeout [0-9]' "$T/cmds")" 0
+check cpu-kill-after "$(grep -c 'timeout -k 30 5400 cargo test --release --no-fail-fast$' "$T/cmds")" 1
+check bench-kill-after "$(grep -c 'timeout -k 30 5400 cargo build.*timeout -k 30 1800 ' "$T/cmds")" 1
 
 # The first target times out: the others still run and the gate fails.
 cat > "$T/rc-timeout" <<'EOF'

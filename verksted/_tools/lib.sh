@@ -23,7 +23,12 @@ L=${RCSR_LOCK_SCRIPT:-$OC/one-full-suite.sh}
 SANITIZER=${RCSR_SANITIZER:-/usr/local/cuda-13.0/bin/compute-sanitizer}
 CUDA_ARCH=sm_86
 LOCK_HOLD_MAX=600
-KILL_AFTER=${RCSR_KILL_AFTER:-30}
+KILL_AFTER=${RCSR_KILL_AFTER:-30} # a positive number of seconds; anything else (0 disables the KILL) is 30
+case $KILL_AFTER in
+  ""|*[!0-9.]*|*.*.*) KILL_AFTER=30 ;;
+  *[1-9]*) ;;
+  *) KILL_AFTER=30 ;;
+esac
 
 need_gates() {
   if [ ! -d "$GATES" ]; then

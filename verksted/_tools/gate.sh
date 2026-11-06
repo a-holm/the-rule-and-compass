@@ -45,7 +45,7 @@ cuda_suite() {
   local targets name args tlog rc xb xa res line t0
   : > "$log"
   : > "$summary"
-  "$B" bash -c "cd '$W/my-version' && $cuda_env timeout 5400 $cuda_cargo --no-run --message-format=json" > "$build" 2>&1
+  "$B" bash -c "cd '$W/my-version' && $cuda_env timeout -k $KILL_AFTER 5400 $cuda_cargo --no-run --message-format=json" > "$build" 2>&1
   rc=$?
   if [ "$rc" -ne 0 ]; then
     cat "$build" >> "$log"
@@ -72,7 +72,7 @@ cuda_suite() {
     tlog=$D/$T-cuda-$name.log
     xb=$(xid_count)
     t0=$SECONDS
-    "$L" bash -c "cd '$W/my-version' && $cuda_env timeout $cuda_hold $cuda_cargo --no-fail-fast $args" > "$tlog" 2>&1
+    "$L" bash -c "cd '$W/my-version' && $cuda_env timeout -k $KILL_AFTER $cuda_hold $cuda_cargo --no-fail-fast $args" > "$tlog" 2>&1
     rc=$?
     xa=$(xid_count)
     res=$(grep -a '^test result:' "$tlog" | tail -n 1)
@@ -93,10 +93,10 @@ cuda_suite() {
   [ "$cuda_failed" -eq 0 ] || g=1
 }
 
-step cpu "timeout 5400 cargo test --release --no-fail-fast"; c=$?
+step cpu "timeout -k $KILL_AFTER 5400 cargo test --release --no-fail-fast"; c=$?
 g=0
 cuda_suite
-step bench "timeout 5400 cargo build --release && timeout 1800 ./target/release/rcsr-bench --tiny"; b=$?
+step bench "timeout -k $KILL_AFTER 5400 cargo build --release && timeout -k $KILL_AFTER 1800 ./target/release/rcsr-bench --tiny"; b=$?
 bad=0
 for k in cpu cuda; do
   f=$D/$T-$k.log
