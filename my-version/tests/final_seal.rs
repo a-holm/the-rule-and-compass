@@ -599,7 +599,10 @@ fn walkforward_report_lost_after_the_record_is_recovered() {
     let hash = recorded_read_sha(&l);
     let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--out", &out, "--verify-read", "--expect-report-sha256", &hash]);
     assert_eq!(code, 0, "{}", err);
-    assert_eq!(std::fs::read(&out).unwrap(), first);
+    let recovered = std::fs::read_to_string(&out).unwrap();
+    assert!(recovered.contains(&format!("\"report_sha256\":\"{hash}\"")), "{recovered}");
+    assert!(recovered.contains("\"read_count\":1"), "{recovered}");
+    assert!(String::from_utf8_lossy(&first).contains(&hash));
     assert!(!Path::new(&format!("{}.tmp", out)).exists());
     assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
     assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
@@ -632,5 +635,5 @@ fn walkforward_verify_read_needs_locked_test() {
     let w = window("dev", 0, 150, 160, 250);
     let (code, _, err) = wf(&data, &l, &["x"], &["--window", &w, "--verify-read"]);
     assert_eq!(code, 2, "{}", err);
-    assert!(err.contains("--verify-read"), "{}", err);
+    assert!(err.contains("--verify-read applies to --locked-test only"), "{}", err);
 }

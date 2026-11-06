@@ -429,3 +429,75 @@ fn a_ledger_binds_the_locked_range_and_a_read_refuses_another() {
         .collect();
     assert_eq!(reads, vec![Some(same.clone()), Some(same)]);
 }
+
+fn tmp_of(p: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.tmp", p.display()))
+}
+
+#[test]
+fn a_kill_at_each_point_of_a_sealed_write_has_a_defined_state_that_a_retry_handles() {
+    use protocol::{write_around_record, CrashAt};
+    for crash in [CrashAt::AfterStage, CrashAt::AfterRecord, CrashAt::AfterFirstRename] {
+        let (_scratch, dir) = scratch("crash");
+        let (a, b) = (dir.join("a.json"), dir.join("b.md"));
+        std::fs::write(&b, "old b").unwrap();
+        let recorded = std::cell::Cell::new(0);
+        let files: [(&Path, &[u8]); 2] = [(&a, b"new a"), (&b, b"new b")];
+        let err = write_around_record(&files, || { recorded.set(recorded.get() + 1); Ok(()) }, Some(crash)).unwrap_err();
+        assert!(err.contains("simulated kill"), "{err}");
+        match crash {
+            CrashAt::AfterStage => {
+                assert_eq!(recorded.get(), 0, "no record before the files are staged");
+                assert!(!a.exists());
+                assert_eq!(std::fs::read_to_string(&b).unwrap(), "old b");
+            }
+            CrashAt::AfterRecord => {
+                assert_eq!(recorded.get(), 1);
+                assert!(!a.exists());
+                assert_eq!(std::fs::read_to_string(&b).unwrap(), "old b");
+            }
+            CrashAt::AfterFirstRename => {
+                assert_eq!(recorded.get(), 1);
+                assert_eq!(std::fs::read_to_string(&a).unwrap(), "new a");
+                assert_eq!(std::fs::read_to_string(&b).unwrap(), "old b");
+                assert!(!tmp_of(&a).exists() && tmp_of(&b).exists());
+            }
+        }
+        if crash != CrashAt::AfterFirstRename {
+            assert_eq!(std::fs::read_to_string(tmp_of(&a)).unwrap(), "new a");
+            assert_eq!(std::fs::read_to_string(tmp_of(&b)).unwrap(), "new b");
+        }
+        // the retry: after the record the verify route records nothing; before it, a plain rerun records once
+        let again = std::cell::Cell::new(0);
+        write_around_record(&files, || { again.set(again.get() + 1); Ok(()) }, None).unwrap();
+        assert_eq!(again.get(), 1);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "new a");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "new b");
+        assert!(!tmp_of(&a).exists() && !tmp_of(&b).exists());
+    }
+}
+
+#[test]
+fn a_sealed_write_that_fails_before_the_record_records_nothing_and_leaves_no_staged_file() {
+    use protocol::write_around_record;
+    let (_scratch, dir) = scratch("no-record");
+    let good = dir.join("good.json");
+    let as_dir = dir.join("is-a-dir");
+    std::fs::create_dir(&as_dir).unwrap();
+    let called = std::cell::Cell::new(false);
+    let files: [(&Path, &[u8]); 2] = [(&good, b"x"), (&as_dir, b"y")];
+    let err = write_around_record(&files, || { called.set(true); Ok(()) }, None).unwrap_err();
+    assert!(err.contains("is a directory") && err.contains("still available"), "{err}");
+    assert!(!called.get());
+    assert!(!good.exists() && !tmp_of(&good).exists());
+    // a record that fails removes the staged files as well
+    let files: [(&Path, &[u8]); 1] = [(&good, b"x")];
+    let err = write_around_record::<()>(&files, || Err("ledger refused".to_string()), None).unwrap_err();
+    assert_eq!(err, "ledger refused");
+    assert!(!good.exists() && !tmp_of(&good).exists());
+    // two outputs naming one file are refused before anything is staged
+    let files: [(&Path, &[u8]); 2] = [(&good, b"x"), (&good, b"y")];
+    let err = write_around_record(&files, || Ok(()), None).unwrap_err();
+    assert!(err.contains("same file"), "{err}");
+    assert!(!tmp_of(&good).exists());
+}

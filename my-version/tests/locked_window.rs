@@ -1444,7 +1444,7 @@ fn ladder_verify_read_needs_locked_test() {
     let out = s(&f.dir.join("x.json"));
     let (code, _, err) = ladder(&f.data, &f.windows, &out, &["--verify-read"]);
     assert_eq!(code, 2, "{}", err);
-    assert!(err.contains("--verify-read"), "{}", err);
+    assert!(err.contains("--verify-read applies to --locked-test only"), "{}", err);
 }
 
 #[test]

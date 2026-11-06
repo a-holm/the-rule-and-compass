@@ -10359,20 +10359,24 @@ OPTIONS:
                              (exit 2) and the report holds the selected candidate
                              only (no per-candidate series, PBO or FDR)
   --sealed <file>            locked_candidates.json from `rcsr protocol seal`
-  --verify-read              with --locked-test: recompute a recorded read and
-                             compare its report hash; records nothing
+  --verify-read              with --locked-test (exit 2 without it): recompute a recorded
+                             read, compare its report hash, write --out and --markdown,
+                             record nothing; the route after a failed report write
   --allow-unbound-ledger     with --locked-test: read a candidate whose ledger
                              recorded no locked test range (old ledger); the read
                              is reported as unbound. Without it that read is
                              refused (exit 3), as is a range that differs from
                              the one the candidate was developed against
-  --expect-report-sha256 <h> exit 1 unless the report JSON hashes to h
+  --expect-report-sha256 <h> exit 3 unless the report JSON hashes to h
   --json                     print the full JSON report to stdout
                              (it ends with a ledger object: the phase ledger of the
                              command, io and pnl seconds on the run wall, outside the
                              report hash)
-  --out <file>               write the JSON report to a file
-  --markdown <file|->        write the Markdown report ('-' = stdout)
+  --out <file>               write the JSON report to a file; with --locked-test it is
+                             staged to <file>.tmp and synced before the read is
+                             recorded, then renamed (an unwritable path exits 3 and
+                             the read stays available)
+  --markdown <file|->        write the Markdown report ('-' = stdout); staged the same way
   --allow-lockbox            permit a test window overlapping 2026H2
                              (declared final test only; default refuses)
   --quiet                    reserved; text output stays on stdout
