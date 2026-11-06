@@ -8,6 +8,7 @@
 #   profile_<name>()  called when PROFILE=<name> (default real); an unknown PROFILE dies
 #   RL_BIN, RL_BIN_SHA  pinned binary and its sha256 file (default $RL_BIN.sha256), checked before every hold
 #   RL_TIME           the time command (default /usr/bin/time)
+#   RL_LOCK_RUN       the reaper script (default lock-run.sh next to this file); rl_gpu runs every hold through it
 #   RL_CHUNK_GAP_S    pause between chunks (default 0)
 #   RL_GRACE_S        extra seconds of each rl_chunks hold beyond its budget (default 120)
 # Commands (runlib_main):
@@ -16,7 +17,9 @@
 #   list          print each step with its done time or `pending`
 #   <step>...     run these steps; a done step is skipped, FORCE=1 reruns it; a protected step dies
 #                 unless SEALED=1
-# Holds: rl_gpu (test lock, Xid-checked), rl_cpu (build slot), rl_chunks (resumable search).
+# Holds: rl_gpu (test lock, Xid-checked, reaped by lock-run.sh), rl_cpu (build slot), rl_chunks (resumable search).
+# After a rl_gpu command ends, lock-run.sh ends by pid every process it left holding the test lock; it acts only on a flock
+# its own process holds. A runbook that takes the lock without runlib.sh runs `bash lock-run.sh "$LOCKFILE" <command...>` inside the lock script.
 # The budget of rl_chunks counts the `[time] wall=` of each hold, never the wait for the lock.
 # The command of rl_chunks runs with RL_CHUNK_S (its search budget) and RL_CHUNK_N exported; the hold
 # timeout is RL_CHUNK_S + RL_GRACE_S, which must not exceed LOCK_HOLD_MAX.
@@ -24,6 +27,7 @@
 : "${RUN:?runlib: set RUN before sourcing}"
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 RL_TIME=${RL_TIME:-/usr/bin/time}
+RL_LOCK_RUN=${RL_LOCK_RUN:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lock-run.sh}
 RL_TIMEF='[time] wall=%e s user=%U s sys=%S s maxrss=%M KB rc=%x'
 mkdir -p "$RUN/done"
 
@@ -68,7 +72,7 @@ rl_gpu() {
   rl_hold gpu "$@"
   shift 3
   x0=$(xid_count)
-  "$L" "$RL_TIME" -f "$RL_TIMEF" timeout -k "$KILL_AFTER" "$to" "$@" >> "$RUN/$name.log" 2>&1
+  "$L" bash "$RL_LOCK_RUN" "$LOCKFILE" "$RL_TIME" -f "$RL_TIMEF" timeout -k "$KILL_AFTER" "$to" "$@" >> "$RUN/$name.log" 2>&1
   rc=$?
   x1=$(xid_count)
   echo "[xid] before=$x0 after=$x1 rc=$rc" >> "$RUN/$name.log"
