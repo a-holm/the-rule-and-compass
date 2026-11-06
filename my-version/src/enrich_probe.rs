@@ -36,18 +36,18 @@ enum Stage {
     CrossSection,
 }
 
-/// Device runs of each large column set, each against the one small run of its
-/// class: the class rate is the median over the repeats and its spread is
-/// their largest over their smallest.
+/// Pairs of small and large device runs per class.
 const DEVICE_REPEATS: usize = 2;
 
-/// Extra cells of the large column set over the small one, and what the
-/// device runs of those cells cost beyond the small set.
-struct Slope {
+/// Device runs of one class: the small and the large column set, repeated in
+/// pairs. The rate is fitted from the smallest sample of each set and the
+/// spread is the largest over the smallest of the per-pair rates.
+struct ClassRuns {
     idx: usize,
+    /// Extra cells of the large set over the small one.
     d_cells: f64,
-    d_secs: f64,
-    d_write: f64,
+    small: Vec<Sample>,
+    large: Vec<Sample>,
 }
 
 fn median(mut v: Vec<f64>) -> Option<f64> {
@@ -268,45 +268,83 @@ impl Runner {
 struct DeviceFit {
     /// Output write bandwidth the runs reported; `None` when no run wrote.
     write_bps: Option<f64>,
-    /// Class index, kernel rate (median over the repeats) and spread (largest
-    /// over smallest repeat).
-    classes: Vec<(usize, f64, f64)>,
+    /// Per class, in index order.
+    classes: Vec<ClassFit>,
+}
+
+struct ClassFit {
+    idx: usize,
+    /// Kernel rate; the anchor when the class is not resolved.
+    rate: f64,
+    /// Largest over smallest repeat of a resolved class; 1.0 otherwise.
+    spread: f64,
+    /// The kernel term after the bus and the write exceeds the noise of the
+    /// repeats and is slower than `RATE_CLAMP` times the anchor.
+    resolved: bool,
+    /// Seconds of the extra cells left for the kernel, before any limit.
+    kernel_s: f64,
+    /// Largest minus smallest of the same figure over the repeat pairs.
+    noise_s: f64,
+}
+
+fn least(v: impl Iterator<Item = f64>) -> f64 {
+    v.fold(f64::INFINITY, f64::min)
 }
 
 /// The write term is the output write the same device runs report, seconds per
 /// cell, so a busy disk at probe time does not move the plans. A class's kernel
-/// rate is what its extra cells cost after the bus and the write. A class whose
-/// runs report their write subtracts that figure, so the write noise of a run
-/// cancels in its own kernel term. The rate is limited to `RATE_CLAMP` times
-/// the anchor: a kernel hidden behind the transfers is not resolved by timing.
-fn fit_device(slopes: &[Slope]) -> DeviceFit {
+/// rate is what its extra cells cost after the bus and the write. Timing noise
+/// on a fixed workload only adds time, so each run set is represented by its
+/// smallest sample. A class whose runs report their write subtracts that
+/// figure. A kernel that does not exceed the noise of the repeats, or that is
+/// more than `RATE_CLAMP` times faster than its anchor, is hidden behind the
+/// transfers: timing does not resolve it and the class keeps its anchor.
+fn fit_device(runs: &[ClassRuns]) -> DeviceFit {
     let anchors = EnrichRates::anchors();
     let per_cell_bus = 8.0 * (1.0 / GPU_TRANSFER_BYTES_PER_SECOND + 1.0 / GPU_D2H_BYTES_PER_SECOND);
-    let written: Vec<f64> = slopes
+    let diff = |r: &ClassRuns| {
+        let d_secs = least(r.large.iter().map(|s| s.stage_s)) - least(r.small.iter().map(|s| s.stage_s));
+        let d_write = least(r.large.iter().map(|s| s.write_s)) - least(r.small.iter().map(|s| s.write_s));
+        (d_secs, d_write)
+    };
+    let written: Vec<f64> = runs
         .iter()
-        .filter(|s| s.d_write > 0.0)
-        .map(|s| 8.0 * s.d_cells / s.d_write)
+        .map(|r| (r, diff(r).1))
+        .filter(|(_, w)| *w > 0.0)
+        .map(|(r, w)| 8.0 * r.d_cells / w)
         .collect();
     let write_bps = median(written);
     let per_cell_write = write_bps.map_or(0.0, |w| 8.0 / w);
-    let mut per_class: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
-    for s in slopes {
-        let write_s = if s.d_write > 0.0 { s.d_write } else { s.d_cells * per_cell_write };
-        let kernel_s = s.d_secs - write_s - s.d_cells * per_cell_bus;
-        let anchor = anchors.classes[s.idx].gpu_cells_per_s;
-        per_class
-            .entry(s.idx)
-            .or_default()
-            .push(s.d_cells / kernel_s.max(s.d_cells / (enrich::RATE_CLAMP * anchor)));
-    }
-    let classes = per_class
-        .into_iter()
-        .map(|(idx, samples)| {
-            let (lo, hi) = samples
+    let kernel = |r: &ClassRuns, d_secs: f64, d_write: f64| {
+        let write_s = if d_write > 0.0 { d_write } else { r.d_cells * per_cell_write };
+        d_secs - write_s - r.d_cells * per_cell_bus
+    };
+    let classes = runs
+        .iter()
+        .map(|r| {
+            let anchor = anchors.classes[r.idx].gpu_cells_per_s;
+            let (d_secs, d_write) = diff(r);
+            let kernel_s = kernel(r, d_secs, d_write);
+            let pairs: Vec<f64> = r
+                .small
                 .iter()
-                .fold((f64::INFINITY, 0.0f64), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
-            let rate = median(samples).unwrap_or(anchors.classes[idx].gpu_cells_per_s);
-            (idx, rate, hi / lo)
+                .zip(&r.large)
+                .map(|(s, l)| kernel(r, l.stage_s - s.stage_s, l.write_s - s.write_s))
+                .collect();
+            let (lo, hi) = pairs
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+            let noise_s = if pairs.len() > 1 { hi - lo } else { f64::INFINITY };
+            let fastest = r.d_cells / (enrich::RATE_CLAMP * anchor);
+            let resolved = kernel_s > noise_s && kernel_s >= fastest && lo > 0.0;
+            ClassFit {
+                idx: r.idx,
+                rate: if resolved { r.d_cells / kernel_s } else { anchor },
+                spread: if resolved { hi / lo } else { 1.0 },
+                resolved,
+                kernel_s,
+                noise_s,
+            }
         })
         .collect();
     DeviceFit { write_bps, classes }
@@ -343,7 +381,7 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
 
     let anchors = EnrichRates::anchors();
     let mut rates = anchors;
-    let mut slopes: Vec<Slope> = Vec::new();
+    let mut slopes: Vec<ClassRuns> = Vec::new();
     let mrow = rows as f64 / 1_000_000.0;
     let mut spread_classes = [1.0; OP_CLASSES];
     let mut context_ms_per_mrow = None;
@@ -372,16 +410,12 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
         }
         if device {
             let d_cells = rows as f64 * (n2 - n1) as f64;
-            let small = runner.sample(plan.small, GpuMode::On, plan.stage)?;
+            let mut run = ClassRuns { idx: plan.op.index(), d_cells, small: Vec::new(), large: Vec::new() };
             for _ in 0..DEVICE_REPEATS {
-                let large = runner.sample(plan.large, GpuMode::On, plan.stage)?;
-                slopes.push(Slope {
-                    idx: plan.op.index(),
-                    d_cells,
-                    d_secs: large.stage_s - small.stage_s,
-                    d_write: large.write_s - small.write_s,
-                });
+                run.small.push(runner.sample(plan.small, GpuMode::On, plan.stage)?);
+                run.large.push(runner.sample(plan.large, GpuMode::On, plan.stage)?);
             }
+            slopes.push(run);
             if plan.op == OpClass::Elementwise && matches!(plan.stage, Stage::Feature) {
                 let context_s = runner.fresh_context(plan.small)?;
                 context_ms_per_mrow = Some((context_s * 1000.0 / mrow).max(1.0));
@@ -394,9 +428,12 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
         Some(w) => w,
         None => enrich::measure_write_bandwidth(&dir.0, 128 * 1024 * 1024)?,
     };
-    for (idx, rate, spread) in fit.classes {
-        rates.classes[idx].gpu_cells_per_s = rate;
-        spread_classes[idx] = spread;
+    for c in fit.classes {
+        rates.classes[c.idx].gpu_cells_per_s = c.rate;
+        spread_classes[c.idx] = c.spread;
+        if std::env::var_os("RCSR_PROBE_TRACE").is_some() {
+            eprintln!("probe-trace idx={} resolved={} kernel_s={:.6} noise_s={:.6} rate={:.4e}", c.idx, c.resolved, c.kernel_s, c.noise_s, c.rate);
+        }
     }
     if let Some(ctx) = context_ms_per_mrow {
         rates.context_ms_per_mrow = ctx;
@@ -414,41 +451,88 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
 mod tests {
     use super::*;
 
-    fn slope(idx: usize, d_secs: f64, d_write: f64) -> Slope {
-        Slope { idx, d_cells: 4.0e6, d_secs, d_write }
+    const CELLS: f64 = 4.0e6;
+
+    fn bus() -> f64 {
+        CELLS * 8.0 * (1.0 / GPU_TRANSFER_BYTES_PER_SECOND + 1.0 / GPU_D2H_BYTES_PER_SECOND)
+    }
+
+    /// Pairs of (small stage, small write, large stage, large write) seconds.
+    fn runs(op: OpClass, pairs: &[(f64, f64, f64, f64)]) -> ClassRuns {
+        let sample = |stage_s, write_s| Sample { stage_s, write_s };
+        ClassRuns {
+            idx: op.index(),
+            d_cells: CELLS,
+            small: pairs.iter().map(|p| sample(p.0, p.1)).collect(),
+            large: pairs.iter().map(|p| sample(p.2, p.3)).collect(),
+        }
+    }
+
+    fn class(fit: &DeviceFit, op: OpClass) -> &ClassFit {
+        fit.classes.iter().find(|c| c.idx == op.index()).unwrap()
     }
 
     #[test]
     fn the_write_noise_of_a_run_cancels_in_its_kernel_rate() {
-        let rank = OpClass::Rank.index();
         let kernel = 0.05;
-        let bus = 4.0e6 * 8.0 * (1.0 / GPU_TRANSFER_BYTES_PER_SECOND + 1.0 / GPU_D2H_BYTES_PER_SECOND);
-        // Two repeats whose writes differ by 15% but whose kernel time is equal.
-        let a = slope(OpClass::CompactPass.index(), kernel + bus + 0.20, 0.20);
-        let b = slope(OpClass::CompactPass.index(), kernel + bus + 0.23, 0.23);
-        let fit = fit_device(&[a, b, slope(rank, 0.4, 0.0)]);
-        let (_, rate, spread) = *fit.classes.iter().find(|c| c.0 == OpClass::CompactPass.index()).unwrap();
-        assert!((rate - 4.0e6 / kernel).abs() < 1.0, "{rate}");
-        assert!((spread - 1.0).abs() < 1e-9, "{spread}");
+        // Two pairs whose writes differ by 15% but whose kernel time is equal.
+        let r = runs(
+            OpClass::CompactPass,
+            &[(0.2, 0.05, 0.2 + kernel + bus() + 0.20, 0.25), (0.2, 0.05, 0.2 + kernel + bus() + 0.23, 0.28)],
+        );
+        let fit = fit_device(&[r]);
+        let c = class(&fit, OpClass::CompactPass);
+        assert!(c.resolved && (c.rate - CELLS / kernel).abs() < 1.0, "{} {}", c.rate, c.kernel_s);
+        assert!((c.spread - 1.0).abs() < 1e-9, "{}", c.spread);
         let w = fit.write_bps.unwrap();
         assert!(w > 1.5e8 && w < 2.0e8, "{w}");
     }
 
     #[test]
-    fn a_hidden_kernel_gives_the_clamped_rate_and_no_write_means_no_fit() {
-        let ew = OpClass::Elementwise.index();
-        let anchor = EnrichRates::anchors().classes[ew].gpu_cells_per_s;
-        let fit = fit_device(&[slope(ew, 0.0, 0.0)]);
-        assert_eq!(fit.write_bps, None);
-        assert_eq!(fit.classes[0].1, enrich::RATE_CLAMP * anchor);
+    fn a_slow_outlier_in_one_run_does_not_move_the_rate() {
+        // Noise only adds time: the second small run is 30 ms slow, the pair
+        // rates differ, the smallest samples give the clean figure.
+        let kernel = 0.05;
+        let large = 0.2 + kernel + bus() + 0.2;
+        let r = runs(
+            OpClass::Mtf,
+            &[(0.2, 0.05, large, 0.25), (0.23, 0.05, large, 0.25)],
+        );
+        let fit = fit_device(&[r]);
+        let c = class(&fit, OpClass::Mtf);
+        assert!(c.resolved, "{} {}", c.kernel_s, c.noise_s);
+        assert!((c.rate - CELLS / kernel).abs() < 1.0, "{}", c.rate);
+        assert!(c.spread > 1.2, "the repeats still disagree: {}", c.spread);
     }
 
     #[test]
-    fn the_spread_is_the_largest_repeat_over_the_smallest() {
-        let idx = OpClass::Mtf.index();
-        let bus = 4.0e6 * 8.0 * (1.0 / GPU_TRANSFER_BYTES_PER_SECOND + 1.0 / GPU_D2H_BYTES_PER_SECOND);
-        let fit = fit_device(&[slope(idx, bus + 0.1 + 0.1, 0.1), slope(idx, bus + 0.15 + 0.1, 0.1)]);
-        assert!((fit.classes[0].2 - 1.5).abs() < 1e-9, "{:?}", fit.classes);
+    fn a_kernel_hidden_behind_the_transfers_keeps_the_anchor() {
+        let ew = OpClass::Elementwise;
+        let anchor = EnrichRates::anchors().class(ew).gpu_cells_per_s;
+        // The extra cells cost only bus and write: the kernel term is zero.
+        let hidden = runs(ew, &[(0.2, 0.05, 0.2 + bus() + 0.2, 0.25), (0.2, 0.05, 0.2 + bus() + 0.2, 0.25)]);
+        let fit = fit_device(&[hidden]);
+        let c = class(&fit, ew);
+        assert!(!c.resolved);
+        assert_eq!((c.rate, c.spread), (anchor, 1.0));
+        // A kernel below the noise of the repeats is not resolved either.
+        let tiny = 0.02;
+        let noisy = runs(
+            ew,
+            &[(0.2, 0.05, 0.2 + tiny + bus() + 0.2, 0.25), (0.2, 0.05, 0.2 + tiny + 0.02 + bus() + 0.2, 0.25)],
+        );
+        let c = fit_device(&[noisy]).classes.remove(0);
+        assert!(!c.resolved);
+        assert_eq!(c.rate, anchor);
+        // A single repeat has no noise estimate and is not resolved.
+        let single = runs(ew, &[(0.2, 0.05, 0.2 + 0.1 + bus() + 0.2, 0.25)]);
+        assert!(!fit_device(&[single]).classes[0].resolved);
+    }
+
+    #[test]
+    fn no_reported_write_means_no_write_fit() {
+        let fit = fit_device(&[runs(OpClass::Rank, &[(0.2, 0.0, 0.5, 0.0), (0.2, 0.0, 0.5, 0.0)])]);
+        assert_eq!(fit.write_bps, None);
     }
 
     #[test]
