@@ -811,7 +811,10 @@ and the sort-path fallback.
 ### Reported backend and the startup summary
 
 The probe runs once, before the dataset is uploaded, and the effective backend
-is recorded from what ran rather than inferred from the flags. Non-quiet runs
+is recorded from what ran rather than inferred from the flags. An explicit
+`--cpu`/`--no-gpu` skips the probe (`search` and `enrich`): the run makes no CUDA
+call, opens no `/dev/nvidia*` and reports the CPU as requested, with no device
+name. `RCSR_GPU=0` skips the CUDA call as well. Non-quiet runs
 print one line:
 
 ```
