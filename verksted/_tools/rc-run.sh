@@ -6,7 +6,7 @@
 # cpu:   any CPU-only command through the build slot; default 580 s.
 # The command runs in <worktree>/my-version with CARGO_BUILD_JOBS=2 (and RCSR_CUDA_ARCH=sm_86 with --cuda)
 # under an outer timeout. Lock modes refuse --timeout above LOCK_HOLD_MAX (600 s).
-# Lock modes run the command through lock-run.sh: its own session, and every process that still holds the lock after it ended is
+# Lock modes run the command through lock-run.sh: its own session; when it owns the flock on $LOCKFILE, every process sharing that flock after the command ended is
 # TERMed, then KILLed, by pid, so a crashed tool cannot leave the lock held.
 # Lock modes add the line `xid before=<a> after=<b>`; the last log line is `RC_DONE rc=<n> at=<UTC>`.
 # Writes: the log $(log_path <id> <tag>) (overwritten on rerun).

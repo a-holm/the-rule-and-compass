@@ -164,7 +164,7 @@ check refuse-no-log "$([ -e "$log" ] && echo yes || echo no)" "no"
 cat > "$T/lock.sh" <<STUB
 #!/usr/bin/env bash
 echo "lock \$*" >> "$T/calls"
-exec 9> "$T/oc/full-suite.lock"
+exec 9> "\${FAKE_LOCK:-$T/oc/full-suite.lock}"
 flock -n 9 || exit 75
 exec "\$@"
 STUB
@@ -196,6 +196,29 @@ kill "$bystander"
 FAKE_DIR=$T rc bash "$RC" run "$T/wt" 9 t --cuda -- show-args > /dev/null 2>&1; r=$?
 check clean-run-rc "$r" "0"
 hasnt clean-run-quiet "$log" 'lock-run:'
+
+# guard: lock-run signals only processes that share the flock of its own hold. Every path here is the temp dir; $T/oc/full-suite.lock
+# stands for the machine lock that rc-run.sh used to scan whatever lock the lock script took.
+holder_pid() { ( exec 7> "$1"; flock -n 7 && exec tail -f /dev/null > /dev/null 2>&1 ) & echo $!; }
+other=$(holder_pid "$T/oc/full-suite.lock")
+trap 'kill -KILL "$bystander" "$other" $(cat "$T/pid-same-session" "$T/pid-other-session" 2> /dev/null) 2> /dev/null; rm -rf "$T"' EXIT
+# a hold of another lock file: the holder of the standing lock file survives and nothing is signalled
+FAKE_LOCK=$T/second.lock FAKE_DIR=$T rc bash "$RC" run "$T/wt" 9 t --cuda -- leave-children > /dev/null 2>&1; r=$?
+check guard-other-lock-rc "$r" "3"
+check guard-other-lock-holder-kept "$(alive "$other" && echo alive || echo gone)" "alive"
+check guard-other-lock-children-left "$(alive "$(cat "$T/pid-same-session")" && echo alive || echo gone)" "alive"
+has guard-other-lock-logged "$log" '^lock-run: no flock held by this process; nothing will be signalled$'
+kill -KILL $(cat "$T/pid-same-session" "$T/pid-other-session") 2> /dev/null
+# a lock script that takes no flock: nothing is signalled, the children are left alone and the log says so
+sed -i '/^flock -n 9/d' "$T/lock.sh"
+# the caller holds an unrelated flock too (as the build slot does for cargo): it is not this hold and is never signalled
+( exec 8> "$T/slot.lock"; flock -n 8 || exit 1; FAKE_DIR=$T rc bash "$RC" run "$T/wt" 9 t --cuda -- leave-children > /dev/null 2>&1 ); r=$?
+check guard-no-flock-rc "$r" "3"
+check guard-no-flock-holder-kept "$(alive "$other" && echo alive || echo gone)" "alive"
+check guard-no-flock-child-kept "$(alive "$(cat "$T/pid-same-session")" && echo alive || echo gone)" "alive"
+has guard-no-flock-logged "$log" '^lock-run: no flock held by this process; nothing will be signalled$'
+hasnt guard-no-flock-no-signal "$log" 'ended pids'
+kill -KILL "$other" $(cat "$T/pid-same-session" "$T/pid-other-session") 2> /dev/null
 
 # -h prints the header
 check help-rc "$(bash "$RC" -h > "$T/h"; echo $?)" "0"
