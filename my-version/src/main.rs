@@ -3456,6 +3456,12 @@ fn main() {
         eprintln!("error: --report cannot be combined with --eval-expr");
         std::process::exit(EXIT_USAGE);
     }
+    if let Some(p) = &ledger_arg {
+        if let Err(e) = rcsr::protocol::Ledger::new(p).read_count() {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    }
     // #211: the development log describes one search. It is on by default, so
     // only an *explicit* request is refused where it cannot be honoured;
     // `--report benchmark` simply runs its repeats without a log.

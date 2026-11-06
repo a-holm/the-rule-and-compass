@@ -538,3 +538,57 @@ fn ladder_read_hash_ignores_the_store_directory() {
     let printed = std::fs::read_to_string(Path::new(&da).with_file_name("ladder.json")).unwrap();
     assert!(printed.contains(&format!("\"file\":\"{}.lockbox.json\"", da)), "{printed}");
 }
+
+fn sealed_store(name: &str) -> (Scratch, PathBuf, String, String, String) {
+    let (scratch, dir) = scratch(name);
+    let data = store(&dir, "d.csv");
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+    dev(&data, &l, &["x"], &[]);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    (scratch, dir, data, l, sealed)
+}
+
+#[test]
+fn read_refuses_a_marker_with_a_cut_last_line() {
+    let (_scratch, _dir, data, l, sealed) = sealed_store("marker-cut");
+    let marker = format!("{}.locked_reads.jsonl", data);
+    std::fs::write(&marker, "{\"ledger\":\"/x\",\"ledger_head\":\"ab").unwrap();
+    let ledger_before = std::fs::read(&l).unwrap();
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &[]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("a write was cut"), "{}", err);
+    assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "{\"ledger\":\"/x\",\"ledger_head\":\"ab");
+    // a complete line without its newline is refused too
+    std::fs::write(&marker, "{\"ledger\":\"/x\",\"ledger_head\":\"ab\",\"event\":\"test_read\",\"report_sha256\":\"cd\"}").unwrap();
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &[]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("a write was cut"), "{}", err);
+    assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+    let (code, _, err) = rcsr(&["protocol", "verify", "--ledger", &l, "--data", &data]);
+    assert_eq!(code, 1, "{}", err);
+    assert!(err.contains("a write was cut"), "{}", err);
+}
+
+#[test]
+fn every_reader_refuses_a_ledger_with_a_cut_last_line() {
+    let (_scratch, dir, data, l, sealed) = sealed_store("readers-cut");
+    let mut text = std::fs::read_to_string(&l).unwrap();
+    text.pop();
+    std::fs::write(&l, &text).unwrap();
+    // development run, locked read and verify read the same file
+    let w = window("dev", 0, 150, 160, 250);
+    let (code, _, err) = wf(&data, &l, &["x"], &["--window", &w]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("a write was cut"), "{}", err);
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &[]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("a write was cut"), "{}", err);
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--verify-read"]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("a write was cut"), "{}", err);
+    assert_eq!(std::fs::read_to_string(&l).unwrap(), text, "no run changed the ledger");
+    assert!(!Path::new(&format!("{}.locked_reads.jsonl", data)).exists());
+    drop(dir);
+}
