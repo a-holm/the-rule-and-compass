@@ -1967,6 +1967,10 @@ fn fmt_f(v: f64) -> String {
     }
 }
 
+pub fn to_string_exact(n: &Node, vars: &[String]) -> String {
+    to_string(n, vars)
+}
+
 pub fn to_string(n: &Node, vars: &[String]) -> String {
     use Op::*;
     match n.op {
@@ -3448,5 +3452,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn signed_constants(n: &Node, sign: f64, out: &mut Vec<u64>) {
+        match n.op {
+            Op::Const => out.push((sign * n.val).to_bits()),
+            Op::Neg => signed_constants(&n.kids[0], -sign, out),
+            _ => n.kids.iter().for_each(|k| signed_constants(k, sign, out)),
+        }
+    }
+
+    #[test]
+    fn to_string_exact_round_trips_every_constant() {
+        let vars = vec!["x".to_string()];
+        let values = [
+            5e-324,
+            7.79843e-319,
+            1e-46,
+            1.1e-5,
+            0.30000000000000004,
+            -109066579.83882,
+            32514.419123515898,
+            1e300,
+        ];
+        for c in values {
+            let tree = node(
+                Op::Add,
+                vec![node(Op::Mul, vec![constant(c), input(0)]), constant(-c)],
+            );
+            let text = to_string_exact(&tree, &vars);
+            let back = crate::parse::parse(&text, &vars).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            let (mut want, mut got) = (Vec::new(), Vec::new());
+            signed_constants(&tree, 1.0, &mut want);
+            signed_constants(&back, 1.0, &mut got);
+            assert_eq!(want, got, "constants of {text}");
+            for i in 0..1000 {
+                let x = (i as f64 - 500.0) * 0.37;
+                assert_eq!(
+                    eval(&tree, &[x]).to_bits(),
+                    eval(&back, &[x]).to_bits(),
+                    "{text} at {x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn to_string_keeps_the_four_decimal_display() {
+        let tree = node(Op::Mul, vec![constant(0.30000000000000004), input(0)]);
+        assert_eq!(to_string(&tree, &["x".to_string()]), "(0.3 * x)");
+        assert_eq!(
+            to_string_exact(&tree, &["x".to_string()]),
+            "(0.30000000000000004 * x)"
+        );
     }
 }

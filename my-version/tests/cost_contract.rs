@@ -443,3 +443,106 @@ fn a_long_label_needs_an_explicit_fee() {
     let ok = rcsr(&["enrich", "--data", "/nonexistent.rcsb", "--out", "/nonexistent-out.rcsb", "--label", "long:1h,fee=0"]);
     assert_eq!(code(&ok), 3, "fee=0 passes argument parsing and then fails on the missing input: {}", stderr(&ok));
 }
+
+const TINY_MEAN: f64 = 3.2e-5;
+const TINY_SCALE: f64 = 0.006;
+
+/// Training rows of the search below: 400 rows, test 0.225, validation 0.3.
+const TINY_TRAIN_ROWS: usize = 217;
+
+/// Table whose `x1` has training mean `TINY_MEAN` and scale about `TINY_SCALE`,
+/// so the display form rounds the centring to a signed zero. Every fourth row
+/// sits between 0 and the mean and pays a large return; the sign of the other
+/// returns follows `x1`.
+fn write_tiny_csv(dir: &Path) -> String {
+    let cluster = |i: usize| i % 4 == 3;
+    let base: Vec<f64> = (0..N).map(|i| if cluster(i) { 0.0 } else { row(i).0 * 3.4641 * TINY_SCALE }).collect();
+    let moving = (0..TINY_TRAIN_ROWS).filter(|&i| !cluster(i)).count() as f64;
+    let fixed = (0..TINY_TRAIN_ROWS).filter(|&i| cluster(i)).count() as f64;
+    let held: f64 = (0..TINY_TRAIN_ROWS).map(|i| base[i]).sum();
+    let shift = (TINY_MEAN * TINY_TRAIN_ROWS as f64 - held - fixed * TINY_MEAN / 2.0) / moving;
+    let mut text = String::from("t,x1,x2,r,y\n");
+    for i in 0..N {
+        let (u, x2, noise) = row(i);
+        let (x1, r) = if cluster(i) {
+            (TINY_MEAN / 2.0, 0.02)
+        } else {
+            (base[i] + shift, if u > 0.0 { 0.01 } else { -0.01 } + 0.002 * noise)
+        };
+        text.push_str(&format!("{},{:?},{:?},{:?},{:?}\n", T0 + STEP * i as i64, x1, x2, r, r));
+    }
+    let path = dir.join("tiny.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+/// `run.json` text with every `expression_exact` member removed.
+fn without_exact(text: &str) -> String {
+    let key = ",\"expression_exact\":\"";
+    let mut out = text.to_string();
+    while let Some(at) = out.find(key) {
+        let start = at + key.len();
+        let end = start + out[start..].find('"').expect("closing quote");
+        out.replace_range(at..=end, "");
+    }
+    out
+}
+
+#[test]
+fn the_evaluated_book_is_the_selected_book() {
+    let (_scratch, dir) = scratch();
+    let data = write_tiny_csv(&dir);
+    let spec = write_spec(&dir, "s.json", "simple", "20.0");
+    let run = search(&dir, &data, &spec, &[]);
+    let doc = read_json(&run);
+    let shown = at(&doc, &["objective", "finalist", "expression"]).as_str().unwrap().to_string();
+    assert!(shown.contains("-0 + x1"), "the display must round the centring to zero: {shown}");
+    let want_net = num(&doc, &["objective", "validation", "net_pnl"]);
+    let want_trades = num(&doc, &["objective", "validation", "trades"]);
+
+    let t = |k: i64| T0 + STEP * k;
+    let w = format!("v,{},{},{},{}", t(0), t(215), t(217), t(310));
+    let wf_path = dir.join("wf.json").to_string_lossy().into_owned();
+    let out = rcsr(&[
+        "walkforward", "--data", &data, "--time", "t", "--from-run", &run, "--window", &w,
+        "--allow-in-sample-windows", "--out", &wf_path,
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let wf = read_json(&wf_path);
+    let m = at(first_window(&wf), &["metrics"]);
+    let net = num(m, &["mean_return"]) * num(m, &["periods"]);
+    assert!((net - want_net).abs() <= 1e-9, "walkforward {net} search {want_net}");
+    assert_eq!(num(m, &["trades"]), want_trades);
+    assert_eq!(at(&wf, &["selection", "expression_source"]).as_str(), Some("exact"));
+}
+
+#[test]
+fn a_rounded_source_is_refused_by_the_sealed_read() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", |i| row(i).2);
+    let spec = write_spec(&dir, "s.json", "log", "20.0");
+    let run = search(&dir, &data, &spec, &[]);
+    let text = std::fs::read_to_string(&run).unwrap();
+    assert!(text.contains("\"expression_exact\":"));
+    let old = dir.join("old.run.json");
+    std::fs::write(&old, without_exact(&text)).unwrap();
+    let old = old.to_string_lossy().into_owned();
+
+    let t = |k: i64| T0 + STEP * k;
+    let w = format!("v,{},{},{},{}", t(0), t(215), t(217), t(310));
+    let wf_path = dir.join("wf.json").to_string_lossy().into_owned();
+    let dev = rcsr(&[
+        "walkforward", "--data", &data, "--time", "t", "--from-run", &old, "--window", &w,
+        "--allow-in-sample-windows", "--out", &wf_path,
+    ]);
+    assert_eq!(code(&dev), 0, "{}", stderr(&dev));
+    assert_eq!(at(&read_json(&wf_path), &["selection", "expression_source"]).as_str(), Some("rounded"));
+
+    let ledger = dir.join("ledger.jsonl").to_string_lossy().into_owned();
+    let sealed = dir.join("sealed.json").to_string_lossy().into_owned();
+    let sealed_read = rcsr(&[
+        "walkforward", "--data", &data, "--time", "t", "--from-run", &old, "--window", &w,
+        "--locked-test", "--ledger", &ledger, "--sealed", &sealed,
+    ]);
+    assert_eq!(code(&sealed_read), 3, "{}", stderr(&sealed_read));
+    assert!(stderr(&sealed_read).contains("expression_exact"), "{}", stderr(&sealed_read));
+}
