@@ -8,6 +8,7 @@
 
 use rcsr::features_gpu as fg;
 
+#[cfg(feature = "cuda")]
 #[path = "common/sanitizer.rs"]
 mod sanitizer;
 #[path = "common/scratch.rs"]
