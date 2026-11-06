@@ -118,6 +118,9 @@ fn run_bash(args: &[&str], log: &Path, guard: &Guard) -> Option<String> {
             cmd.env_remove(key);
         }
     }
+    // Script tests start with the machine paths pointing at nothing; a test that needs a directory sets its own.
+    cmd.env("RCSR_MACHINE_DIR", "/nonexistent-machine-dir");
+    cmd.env("RCSR_TEST_LOCK", "/nonexistent-machine-dir/full-suite.lock");
     let mut child = cmd
         .args(args)
         .stdin(Stdio::null())
@@ -217,6 +220,43 @@ fn tools_tests_pass() {
         }
     }
     assert!(failures.is_empty(), "script tests failed:\n{}", failures.join("\n\n"));
+}
+
+/// Every script test starts with the machine paths pointing at nothing: a test that forgets an override cannot reach the real lock.
+#[test]
+fn script_tests_start_with_the_machine_paths_poisoned() {
+    let scratch = Scratch::new("poison");
+    let log = scratch.path().join("env.log");
+    let script = "printf '%s\\n%s\\n' \"${RCSR_MACHINE_DIR-unset}\" \"${RCSR_TEST_LOCK-unset}\"";
+    assert_eq!(run_bash(&["-c", script], &log, &FAST), None);
+    let text = fs::read_to_string(&log).expect("read env log");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    for line in lines {
+        assert!(line != "unset" && !Path::new(line).exists(), "script tests must start with a nonexistent path, got '{line}'");
+    }
+}
+
+#[test]
+fn script_tests_never_reach_the_machine_directory() {
+    let mut hits = Vec::new();
+    for test in script_tests() {
+        let text: String = fs::read_to_string(&test)
+            .expect("read test")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let stubs_machine = text.contains("RCSR_LOCK_SCRIPT") || text.contains("RCSR_SLOT_SCRIPT");
+        if stubs_machine && !text.contains("RCSR_MACHINE_DIR") {
+            hits.push(test.display().to_string());
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "script tests that stub the lock or slot without RCSR_MACHINE_DIR (the real lock path is reachable):\n{}",
+        hits.join("\n")
+    );
 }
 
 /// No script test sleeps or reads the wall clock; tests/lib/fakes.sh holds the only timer stand-ins.

@@ -68,7 +68,7 @@ rl_gpu() {
   rl_hold gpu "$@"
   shift 3
   x0=$(xid_count)
-  "$L" "$RL_TIME" -f "$RL_TIMEF" timeout "$to" "$@" >> "$RUN/$name.log" 2>&1
+  "$L" "$RL_TIME" -f "$RL_TIMEF" timeout -k "$KILL_AFTER" "$to" "$@" >> "$RUN/$name.log" 2>&1
   rc=$?
   x1=$(xid_count)
   echo "[xid] before=$x0 after=$x1 rc=$rc" >> "$RUN/$name.log"
@@ -81,7 +81,7 @@ rl_cpu() {
   case "$to" in ''|*[!0-9]*) rl_die "rl_cpu $name: timeout must be whole seconds, got '$to'" ;; esac
   rl_hold cpu "$@"
   shift 3
-  "$B" "$RL_TIME" -f "$RL_TIMEF" timeout "$to" "$@" >> "$RUN/$name.log" 2>&1
+  "$B" "$RL_TIME" -f "$RL_TIMEF" timeout -k "$KILL_AFTER" "$to" "$@" >> "$RUN/$name.log" 2>&1
 }
 
 # Whole seconds, rounded up, of the last `[time] wall=` line after the first $2 such lines.

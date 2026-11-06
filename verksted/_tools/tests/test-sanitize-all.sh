@@ -72,7 +72,7 @@ case "$*" in
       ignored) echo "running 0 tests"; echo "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out;" ;;
       *) echo "running 17 tests"; echo "test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;" ;;
     esac
-    [ "${FAKE_NC_MODE:-ok}" = nomsg ] || echo "========= Error: Target application terminated before first instrumented API call"
+    case "${FAKE_NC_MODE:-ok}" in nomsg) ;; noattach) echo "========= Error: No attachable process found. compute-sanitizer timed-out." ;; *) echo "========= Error: Target application terminated before first instrumented API call" ;; esac
     exit "${FAKE_NC_RC:-255}"
     ;;
   *"${FAKE_ZERO_ON:-@none@}"*)
@@ -99,7 +99,7 @@ chmod +x "$T/cuda-13.0/bin/compute-sanitizer"
 
 run() {
   : > "$T/calls"; : > "$T/san-calls"; : > "$T/cargo-calls"; : > "$T/timeouts"
-  env FAKE_DIR="$T" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
+  env FAKE_DIR="$T" RCSR_MACHINE_DIR="$T" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
     RCSR_XID_CMD="cat '$T/xid'" RCSR_SANITIZER="$T/cuda-13.0/bin/compute-sanitizer" RCSR_SANITIZER_PLAN="${PLAN:-$T/plan}" \
     FAKE_TIMEOUT_LOG="$T/timeouts" PATH="$T/bin:$PATH" bash "$ALL" "$@"
 }
@@ -118,7 +118,7 @@ has full-api-run "$T/san-calls" 'error-exitcode 99 --report-api-errors no /fake/
 has full-plain "$T/san-calls" 'error-exitcode 99 /fake/deps/gpu_fit-fff$'
 has full-lib "$T/san-calls" 'error-exitcode 99 /fake/deps/rcsr-aaa$'
 has full-bin "$T/san-calls" 'error-exitcode 99 /fake/deps/rcsr_bin-bbb$'
-has full-lock "$T/calls" '^lock .*timeout 580 '
+has full-lock "$T/calls" '^lock .*timeout -k 30 580 '
 has full-line "$sum" '^gpu_fit rc=0 xid=4->4 secs=[0-9]+ \| test result: ok\. 1 passed.* \| =+ ERROR SUMMARY: 0 errors$'
 has full-api-line "$sum" '^gpu_memory_plan:refused_alloc rc=0 xid=4->4 secs='
 check full-run-lines "$(grep -c ' rc=' "$sum")" "6"
@@ -212,6 +212,33 @@ printf 'gpu_fit some_test no-cuda reason\n' > "$T/plan-bad"
 PLAN=$T/plan-bad run "$T/wt" 9 > "$T/out" 2>&1; r=$?
 check nc-named-rc "$r" "2"
 has nc-named-msg "$T/out" "no-cuda needs '\*'"
+
+# no-cuda-app-only: listed like no-cuda, and the sanitizer runs with --target-processes application-only
+cp "$T/plan" "$T/plan-app"
+echo 'gpu_fit * no-cuda-app-only children make no CUDA call either' >> "$T/plan-app"
+PLAN=$T/plan-app FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check app-rc "$r" "0"
+has app-line "$sum" '^gpu_fit no CUDA call \(listed\) \| test result: ok\. 17 passed'
+has app-flag "$T/san-calls" 'memcheck --target-processes application-only --leak-check no --error-exitcode 99 /fake/deps/gpu_fit-fff$'
+hasnt app-flag-only-there "$T/san-calls" 'target-processes.*gpu_memory_plan'
+hasnt app-flag-other-bins "$T/san-calls" 'target-processes.*(gpu_big|rcsr-aaa)'
+PLAN=$T/plan-app run "$T/wt" 9 --dry-run > "$T/out" 2>&1; r=$?
+check app-dry-rc "$r" "0"
+has app-dry-flag "$T/out" '^run gpu_fit: .*--target-processes application-only .*gpu_fit'
+printf 'gpu_fit some_test no-cuda-app-only reason\n' > "$T/plan-bad"
+PLAN=$T/plan-bad run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check app-named-rc "$r" "2"
+
+# application-only: a target that never calls CUDA can end with the launch timeout message; that counts only for no-cuda-app-only
+PLAN=$T/plan-app FAKE_NC_MODE=noattach FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check noattach-app-rc "$r" "0"
+has noattach-app-line "$sum" '^gpu_fit no CUDA call \(listed\) \| test result: ok\. 17 passed'
+PLAN=$T/plan-nc FAKE_NC_MODE=noattach FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check noattach-all-rc "$r" "1"
+has noattach-all-line "$sum" '^gpu_fit rc=255 '
+FAKE_NC_MODE=noattach FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check noattach-unlisted-rc "$r" "1"
+has noattach-unlisted-line "$sum" '^gpu_fit rc=255 '
 
 # a rising Xid count stops at once with 70
 echo 4 > "$T/xid"

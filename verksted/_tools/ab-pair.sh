@@ -23,7 +23,7 @@ if [ "${1:-}" = __pair ]; then
     arm=${order:$i:1}
     if [ "$arm" = A ]; then bin=$bin_a; else bin=$bin_b; fi
     base=$dir/$arm-s$seed
-    /usr/bin/time -f '%e %U %S %M %x' -o "$base.time" timeout "$tmo" "$bin" "${args[@]}" > "$base.out" 2> "$base.err"
+    /usr/bin/time -f '%e %U %S %M %x' -o "$base.time" timeout -k "$KILL_AFTER" "$tmo" "$bin" "${args[@]}" > "$base.out" 2> "$base.err"
     read -r wall user sys rss rc < <(tail -n 1 "$base.time")
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$arm" "$seed" "$order" "$wall" "$user" "$sys" "$rss" "$rc" >> "$dir/runs.tsv"
   done

@@ -2,12 +2,20 @@
 # Sourced by verksted/_tools/tests/test-*.sh; not run.
 # Writes: fake commands into the directory each fake_* function gets; the clock files under $VCLOCK.
 # Stand-ins for real timers, so a script test counts events instead of reading the wall clock.
+# A script test never reaches the real machine directory: a test that needs one sets RCSR_MACHINE_DIR itself.
+export RCSR_MACHINE_DIR=/nonexistent-machine-dir
+export RCSR_TEST_LOCK=/nonexistent-machine-dir/full-suite.lock
 
-# fake_timeout <dir>: <dir>/timeout appends "<limit> <cmd...>" to $FAKE_TIMEOUT_LOG. A command named hang stands for
-# one that never ends: exit 124 without running it. Any other command runs in place of the real timeout.
+# fake_timeout <dir>: <dir>/timeout appends "<limit> <cmd...>" to $FAKE_TIMEOUT_LOG and the -k value, when given, to
+# $FAKE_TIMEOUT_LOG.kill. A command named hang stands for one that never ends: exit 124 without running it. Any other
+# command runs in place of the real timeout.
 fake_timeout() {
   cat > "$1/timeout" <<'FAKE'
 #!/usr/bin/env bash
+if [ "$1" = -k ]; then
+  echo "$2" >> "${FAKE_TIMEOUT_LOG:?}.kill"
+  shift 2
+fi
 echo "$*" >> "${FAKE_TIMEOUT_LOG:?}"
 shift
 [ "$(basename "$1")" = hang ] && exit 124

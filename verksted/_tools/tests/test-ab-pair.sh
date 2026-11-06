@@ -32,7 +32,7 @@ printf '#!/bin/sh\necho "hang ran" >&2\nexit 99\n' > "$T/bin/hang"
 chmod +x "$T"/lock.sh "$T"/bin/*
 
 ab() {
-  PATH="$T/fake:$PATH" FAKE_TIMEOUT_LOG="$T/timeouts" RCSR_GATES=$T/gates RCSR_LOCK_SCRIPT=$T/lock.sh RCSR_XID_CMD="cat $T/xid" bash "$AB" "$@" > "$T/out" 2>&1
+  PATH="$T/fake:$PATH" FAKE_TIMEOUT_LOG="$T/timeouts" RCSR_GATES=$T/gates RCSR_MACHINE_DIR=$T RCSR_LOCK_SCRIPT=$T/lock.sh RCSR_XID_CMD="cat $T/xid" bash "$AB" "$@" > "$T/out" 2>&1
 }
 
 # three seeds: order AB, BA, AB; {seed} replaced
@@ -49,6 +49,8 @@ check ok-ratio "$(grep -cE '^ratio_user b/a ' "$d/summary.txt")" "1"
 check ok-sha "$(grep -c 'sha256=' "$d/summary.txt")" "2"
 check ok-done "$(tail -n 1 "$T/gates/ab-ok.log" | cut -c1-12)" "RC_DONE rc=0"
 check ok-limits "$(grep -c "^280 " "$T/timeouts")" "6"
+check ok-kill-after "$(sort -u "$T/timeouts.kill" | tr "\n" " ")" "30 "
+check ok-kill-after-count "$(wc -l < "$T/timeouts.kill" | tr -d " ")" "6"
 
 # a failing arm: exit 1, pair continues
 ab --label bad --a "$T/bin/good" --b "$T/bin/bad" --seeds 1,2 -- x; rc=$?

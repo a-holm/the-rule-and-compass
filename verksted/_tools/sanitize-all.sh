@@ -15,6 +15,7 @@
 # Plan mode `<binary> * no-cuda <reason>` lists a binary that makes no CUDA call by design. It still runs under memcheck.
 # Rc 255 with `terminated before first instrumented API call` and `test result: ok` (0 failed) is a pass only for a listed binary
 # (`<binary> no CUDA call (listed)`); for an unlisted binary it is a failure (`<binary> unexpected no CUDA call: add a plan line or fix the test`).
+# Plan mode `<binary> * no-cuda-app-only <reason>` is `no-cuda` plus `--target-processes application-only`: only for a binary whose child processes make no CUDA call either (children are then not traced). With it the sanitizer message `No attachable process found` (launch timeout) also counts as no CUDA call.
 # A listed binary whose run printed an ERROR SUMMARY called CUDA: it gets the normal verdict and the line ends `listed no-cuda but called CUDA`.
 # The summary ends with the counts `no-cuda binaries`, `unexpected no-cuda` and `listed no-cuda but called CUDA`.
 # A run with rc 255, `running 0 tests`, a non-zero filtered-out count and the sanitizer message `terminated before first instrumented API call` (the plan filtered out every test) is written as `<binary> skipped by plan | ...` and is not a failure.
@@ -61,7 +62,7 @@ plan_lines=$(awk '/^[[:space:]]*(#|$)/ { next } {
   printf "%s\t%s\t%s\t%s\n", $1, $2, $3, reason }' "$plan")
 while IFS=$'\t' read -r b t m r; do
   [ -n "$b" ] || continue
-  case "$m" in skip|api-errors-no) ;; no-cuda) [ "$t" = "*" ] || { echo "sanitize-all: no-cuda needs '*' as the test, got '$t' for $b in $plan" >&2; exit 2; } ;; *) echo "sanitize-all: bad mode '$m' in $plan" >&2; exit 2 ;; esac
+  case "$m" in skip|api-errors-no) ;; no-cuda|no-cuda-app-only) [ "$t" = "*" ] || { echo "sanitize-all: $m needs '*' as the test, got '$t' for $b in $plan" >&2; exit 2; } ;; *) echo "sanitize-all: bad mode '$m' in $plan" >&2; exit 2 ;; esac
   [ -n "$r" ] || { echo "sanitize-all: empty reason for $b $t in $plan" >&2; exit 2; }
 done <<< "$plan_lines"
 
@@ -69,6 +70,7 @@ summary=$(log_path "$id" san-summary)
 fails=0
 ok_re='^test result: ok\. [0-9]+ passed; 0 failed;'
 listed=0
+target_args=()
 n_nocuda=0
 n_unexpected=0
 n_called=0
@@ -80,7 +82,9 @@ emit() {
 san_cmd() { # <api-errors or empty> <bin> args...
   local api=$1 bin=$2
   shift 2
-  printf 'env RCSR_UNDER_SANITIZER=memcheck %s --tool memcheck --leak-check no --error-exitcode 99' "$SANITIZER"
+  printf 'env RCSR_UNDER_SANITIZER=memcheck %s --tool memcheck' "$SANITIZER"
+  [ ${#target_args[@]} -eq 0 ] || printf ' %s' "${target_args[@]}"
+  printf ' --leak-check no --error-exitcode 99'
   [ -z "$api" ] || printf ' --report-api-errors %s' "$api"
   printf ' %s' "$bin"
   [ $# -eq 0 ] || printf ' %s' "$@"
@@ -98,7 +102,7 @@ run_one() { # label tag api bin args...
   local label=$1 tag=$2 api=$3 bin=$4
   shift 4
   local log t0 t1 rc
-  local argv=(env RCSR_UNDER_SANITIZER=memcheck "$SANITIZER" --tool memcheck --leak-check no --error-exitcode 99)
+  local argv=(env RCSR_UNDER_SANITIZER=memcheck "$SANITIZER" --tool memcheck ${target_args[@]+"${target_args[@]}"} --leak-check no --error-exitcode 99)
   [ -z "$api" ] || argv+=(--report-api-errors "$api")
   argv+=("$bin" "$@")
   if [ "$dry" -eq 1 ]; then
@@ -122,8 +126,9 @@ run_one() { # label tag api bin args...
     grep -aq 'terminated before first instrumented API call' "$log"; then
     by_plan=1
     emit "$label skipped by plan | 0 tests ran, all filtered out | xid=${xid:-?}"
-  elif [ "$rc" -eq 255 ] && [ -z "$err" ] && grep -aq 'terminated before first instrumented API call' "$log" &&
-    [[ $res =~ $ok_re ]]; then
+  elif [ "$rc" -eq 255 ] && [ -z "$err" ] && [[ $res =~ $ok_re ]] &&
+    { grep -aq 'terminated before first instrumented API call' "$log" ||
+      { [ ${#target_args[@]} -gt 0 ] && grep -aq 'No attachable process found' "$log"; }; }; then
     no_cuda=1
     if [ "$listed" -eq 1 ]; then
       n_nocuda=$((n_nocuda + 1))
@@ -159,13 +164,17 @@ run_binary() { # name bin
     return 0
   fi
   listed=0
-  [ "$star" != no-cuda ] || listed=1
+  target_args=()
+  case "$star" in
+    no-cuda) listed=1 ;;
+    no-cuda-app-only) listed=1; target_args=(--target-processes application-only) ;;
+  esac
   if [ "$star" = api-errors-no ]; then
     run_one "$name" "san-$name" no "$bin"
     return 0
   fi
   while IFS=$'\t' read -r b t mode r; do
-    [ "$b" = "$name" ] && [ "$mode" != no-cuda ] || continue
+    [ "$b" = "$name" ] && [ "$mode" != no-cuda ] && [ "$mode" != no-cuda-app-only ] || continue
     args+=(--skip "$t")
   done <<< "$plan_lines"
   [ ${#args[@]} -eq 0 ] || args+=(--exact)

@@ -62,7 +62,7 @@ STUB
 done
 
 run() {
-  env FAKE_DIR="$T" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
+  env FAKE_DIR="$T" RCSR_MACHINE_DIR="$T" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
     RCSR_XID_CMD="cat '$T/xid'" RCSR_SANITIZER="${SANITIZER_PATH:-$T/cuda-13.0/bin/compute-sanitizer}" \
     FAKE_TIMEOUT_LOG="$T/timeouts" PATH="$T/bin:$PATH" bash "$SAN" "$@"
 }
