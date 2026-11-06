@@ -152,7 +152,7 @@ verksted/_tools/sanitize.sh "$W" "$N" memcheck --test <file> -- <filter>    # bu
 # search-level tests: the config helper must set dispatch: DispatchMode::Device (CLI: --dispatch device), else the sanitized run stays on the CPU
 journalctl -k --since "<start>" | grep -i xid   # must print nothing
 verksted/_tools/sanitize.sh "$W" "$N" memcheck --test <file> --api-errors no -- <test> --exact   # one test with driver API error reporting off
-verksted/_tools/sanitize-all.sh "$W" "$N" [--only <binary>]... [--dry-run]   # the planned memcheck pass (my-version/tests/sanitizer.plan), one lock hold per run, summary log <id>-san-summary
+verksted/_tools/sanitize-all.sh "$W" "$N" [--only <binary>]... [--dry-run]   # the planned memcheck pass (my-version/tests/sanitizer.plan), one lock hold per run, summary log <id>-san-summary; a run-bin line runs a release binary with stated arguments; gate.sh has no sanitizer stage
 ```
 
 ## Pinned binaries and paired runs
