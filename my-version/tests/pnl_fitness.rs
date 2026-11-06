@@ -581,7 +581,8 @@ fn run_fixed(data: &str, spec: &str, log: &std::path::Path, extra: &[&str]) -> O
         "--data", data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal",
         "--target-spec", spec, "--cpu", "--seed", "11", "--generations", "20", "--pop", "48",
         "--ops", FIXED_OPS, "--metric", "squared", "--json", "--quiet", "--objective", "pnl",
-        "--cost-bps", "5", "--validation-frac", "0.3", "--dev-log", &log,
+        "--cost-bps", "5", "--validation-frac", "0.3", "--dev-log", &log, "--dev-log-level", "full",
+        "--dev-log-every", "1",
     ];
     Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args(args)
