@@ -3,7 +3,6 @@
 # mode: skip (not run under memcheck) | api-errors-no (run alone with --report-api-errors no) | no-cuda (only with *: the binary runs and must make no CUDA call)
 #       | no-cuda-app-only (only with *: as no-cuda, run with --target-processes application-only; for a binary whose child processes make no CUDA call either)
 # An api-errors-no test is still memchecked; only driver API error reporting is off, for that test only.
-signed_gpu      *                                                      skip           no CUDA call: mock backend and CPU fits; memcheck exits 255 (terminated before first instrumented API call)
 gpu_memory_plan a_refused_device_allocation_is_reported_with_its_bytes api-errors-no  provokes a cudaMalloc out-of-memory on purpose
 gpu_ring        stale_cuda_error_does_not_fail_the_transport           api-errors-no  provokes a cudaMalloc out-of-memory on purpose
 gpu_launch_guard malloc_argument_is_refused_before_the_kernel_runs       api-errors-no  refuses a launch on purpose; the refusal is a cudaErrorInvalidValue API error
@@ -53,6 +52,7 @@ reject_constant        *  no-cuda  CPU-only tests; no CUDA call
 risk                   *  no-cuda  CPU-only tests; no CUDA call
 sanitizer_plan         *  no-cuda  CPU-only tests; no CUDA call
 scratch                *  no-cuda  CPU-only tests; no CUDA call
+signed_gpu             *  no-cuda  CPU fits and mock backends only; the device signed fit runs in gpu_fit (signed_arm_projects_the_device_proposal_exactly)
 simplify_sound         *  no-cuda  CPU-only tests; no CUDA call
 sm121_compile          *  no-cuda  runs nvcc and cuobjdump on a cubin; no CUDA runtime call
 split                  *  no-cuda  CPU-only tests; no CUDA call
@@ -68,3 +68,6 @@ verksted_walk          *  no-cuda  CPU-only tests; no CUDA call
 no_banned_words        *  no-cuda-app-only  no CUDA call in the test process or its children (git, grep, bash: no /dev/nvidia open under strace -f); memcheck with --target-processes all crashes in the sanitizer (SIGSEGV)
 panel_spread           *  no-cuda-app-only  no CUDA call in the test process or its rcsr children (no /dev/nvidia open under strace -f); memcheck with --target-processes all crashes in the sanitizer (SIGSEGV)
 verksted_tools         *  no-cuda-app-only  no CUDA call in the test process or its children (bash scripts, git, grep: no /dev/nvidia open under strace -f); memcheck with --target-processes all crashes in the sanitizer (SIGSEGV)
+final_seal             *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes all crashed in the sanitizer (rc 139)
+launchers              *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes all crashed or hung (rc 139, rc 124)
+numeric_flags_cli      *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes all crashed in the sanitizer (rc 139)
