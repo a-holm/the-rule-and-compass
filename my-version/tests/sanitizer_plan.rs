@@ -16,6 +16,8 @@ struct Line {
     no: usize,
     binary: String,
     test: String,
+    mode: String,
+    args: String,
 }
 
 fn parse(text: &str) -> Result<Vec<Line>, String> {
@@ -32,10 +34,10 @@ fn parse(text: &str) -> Result<Vec<Line>, String> {
             _ => return Err(format!("line {no}: need <binary> <test> <mode> <reason>")),
         };
         let reason = it.collect::<Vec<_>>().join(" ");
-        if !["skip", "api-errors-no", "no-cuda", "no-cuda-app-only"].contains(&mode) {
+        if !["skip", "api-errors-no", "no-cuda", "no-cuda-app-only", "run-bin"].contains(&mode) {
             return Err(format!("line {no}: unknown mode '{mode}'"));
         }
-        if mode.starts_with("no-cuda") && test != "*" {
+        if (mode.starts_with("no-cuda") || mode == "run-bin") && test != "*" {
             return Err(format!("line {no}: {mode} needs '*' as the test"));
         }
         if reason.is_empty() {
@@ -45,6 +47,8 @@ fn parse(text: &str) -> Result<Vec<Line>, String> {
             no,
             binary: binary.to_string(),
             test: test.to_string(),
+            mode: mode.to_string(),
+            args: reason,
         });
     }
     Ok(out)
@@ -94,6 +98,22 @@ fn sources(binary: &str, root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(vec![file])
 }
 
+/// A run-bin line names a cargo bin and flags that the bin's sources parse.
+fn check_run_bin(l: &Line, root: &Path) -> Vec<String> {
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
+    if !manifest.contains(&format!("name = \"{}\"", l.binary)) {
+        return vec![format!("line {}: no [[bin]] named '{}' in Cargo.toml", l.no, l.binary)];
+    }
+    let mut files = Vec::new();
+    rust_files(&root.join("src").join("bin"), &mut files);
+    let text: String = files.iter().map(|f| fs::read_to_string(f).expect("read source")).collect();
+    l.args
+        .split_whitespace()
+        .filter(|a| a.starts_with("--") && !text.contains(&format!("\"{a}\"")))
+        .map(|a| format!("line {}: '{}' does not parse the flag {a}", l.no, l.binary))
+        .collect()
+}
+
 fn check(plan: &str, root: &Path) -> Vec<String> {
     let lines = match parse(plan) {
         Ok(l) => l,
@@ -101,6 +121,10 @@ fn check(plan: &str, root: &Path) -> Vec<String> {
     };
     let mut errors = Vec::new();
     for l in &lines {
+        if l.mode == "run-bin" {
+            errors.extend(check_run_bin(l, root));
+            continue;
+        }
         let files = match sources(&l.binary, root) {
             Ok(f) => f,
             Err(e) => {
@@ -215,4 +239,32 @@ fn no_cuda_app_only_takes_only_a_star_line() {
     assert!(parse("launchers * no-cuda-app-only reason\n").is_ok());
     assert!(parse("launchers some_test no-cuda-app-only reason\n").is_err());
     assert!(parse("launchers * no-cuda-app-only\n").is_err());
+}
+
+#[test]
+fn run_bin_takes_only_a_star_line_with_arguments() {
+    assert!(parse("rcsr-gpu-bench * run-bin --batch 64\n").is_ok());
+    assert!(parse("rcsr-gpu-bench some_test run-bin --batch 64\n").is_err());
+    assert!(parse("rcsr-gpu-bench * run-bin\n").is_err());
+}
+
+#[test]
+fn a_run_bin_line_names_a_real_bin_and_flags_it_parses() {
+    let errors = check("no-such-bin * run-bin --batch 64\n", &root());
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("no [[bin]] named 'no-such-bin'"), "{errors:?}");
+    let errors = check("rcsr-gpu-bench * run-bin --no-such-flag 1\n", &root());
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("does not parse the flag --no-such-flag"), "{errors:?}");
+    assert!(check("rcsr-gpu-bench * run-bin --batch 64 --reps 1 --depth 3\n", &root()).is_empty());
+}
+
+#[test]
+fn the_gpu_bench_binary_runs_under_memcheck_with_the_smallest_arguments() {
+    let lines = parse(PLAN).expect("plan parses");
+    let run: Vec<&Line> = lines.iter().filter(|l| l.binary == "rcsr-gpu-bench").collect();
+    assert_eq!(run.len(), 1, "one rcsr-gpu-bench line");
+    assert_eq!((run[0].mode.as_str(), run[0].args.as_str()), ("run-bin", "--batch 64 --reps 1 --depth 3"));
+    let unit = lines.iter().find(|l| l.binary == "bin-rcsr-gpu-bench").expect("unit-test line");
+    assert_eq!(unit.mode, "skip", "the 0-test unit binary must not be listed as a no-CUDA run");
 }

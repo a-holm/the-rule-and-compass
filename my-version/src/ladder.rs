@@ -2303,14 +2303,19 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
                             else 2025-07-01,2026-07-01; none opts out. A fold ending after START minus\n\
                             --purge-seconds is refused (exit 3)\n\
   --locked-test             read the locked test: needs --scheme locked, --ledger and --sealed;\n\
-                            appends a baseline_read to the ledger, a second read is refused\n\
+                            appends a baseline_read to the ledger after the report files are staged, a second read is refused\n\
   --ledger <file>           candidate ledger (with --locked-test)\n\
   --sealed <file>           sealed candidate list recorded in the ledger (with --locked-test)\n\
   --allow-unbound-ledger    with --locked-test: accept a sealed list whose candidates recorded no\n\
                             locked test range (old ledger); a different range is refused (exit 3)\n\
+  --verify-read             with --locked-test: recompute a recorded baseline read, compare its report hash\n\
+                            with the ledger, write --out and --markdown, record nothing (the route after a\n\
+                            failed write); a mismatch writes no file (exit 3)\n\
+  --expect-report-sha256 <h> exit 3 and write no file unless the report hashes to h\n\
   --out <file>              write the JSON report (ends with a ledger object: io and\n\
-                            pnl seconds on the run wall)\n\
-  --markdown <file|->       write the Markdown table\n\
+                            pnl seconds on the run wall); with --locked-test it is staged to <file>.tmp\n\
+                            and synced before the read is recorded, then renamed\n\
+  --markdown <file|->       write the Markdown table (staged the same way with --locked-test)\n\
   --json                    print the JSON report\n"
 }
 
@@ -2349,6 +2354,8 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let mut lockbox_arg: Option<String> = None;
     let mut lockbox_embargo_arg: Option<String> = None;
     let mut locked_test = false;
+    let mut verify_read = false;
+    let mut expect_hash: Option<String> = None;
     let mut allow_unbound = false;
     let mut ledger_path: Option<String> = None;
     let mut sealed_path: Option<String> = None;
@@ -2414,6 +2421,8 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             "--lockbox" => lockbox_arg = Some(val()?),
             "--lockbox-embargo" => lockbox_embargo_arg = Some(val()?),
             "--locked-test" => locked_test = true,
+            "--verify-read" => verify_read = true,
+            "--expect-report-sha256" => expect_hash = Some(val()?),
             "--allow-unbound-ledger" => allow_unbound = true,
             "--ledger" => ledger_path = Some(val()?),
             "--sealed" => sealed_path = Some(val()?),
@@ -2492,6 +2501,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             purge_source = "target_spec";
         }
     }
+    if verify_read && !locked_test {
+        return Err(usage_err("--verify-read applies to --locked-test only".to_string()));
+    }
     if !locked_test && (ledger_path.is_some() || sealed_path.is_some()) {
         return Err(usage_err("--ledger and --sealed apply to --locked-test only".to_string()));
     }
@@ -2519,7 +2531,11 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         let l = protocol::Ledger::new(ledger);
         let current = protocol::LockedRange::new(&d.lockbox, d.source);
         let binding = protocol::RangeBinding { current: &current, allow_unbound };
-        l.authorize_baseline_read(std::path::Path::new(sealed), Some(binding)).map_err(input_err)?;
+        if verify_read {
+            l.authorize_baseline_sealed(std::path::Path::new(sealed), Some(binding)).map_err(input_err)?;
+        } else {
+            l.authorize_baseline_read(std::path::Path::new(sealed), Some(binding)).map_err(input_err)?;
+        }
         l.check_read_marker(&data_path).map_err(input_err)?;
         read = Some((l, crate::manifest::sha256_file(&data_path).map_err(input_err)?, current));
     }
@@ -2574,21 +2590,52 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         }
     };
     let json = finish(report.json(), false);
-    if let Some((ledger, data_sha, current)) = &read {
-        let report_sha = crate::manifest::sha256_hex(finish(report.hashed_json(), true).as_bytes());
-        ledger.write_read_marker(&data_path, "baseline_read", &report_sha).map_err(input_err)?;
-        ledger.record_baseline_read(data_sha, &report_sha, Some(current)).map_err(input_err)?;
-    }
+    let md = report.markdown();
+    let mut files: Vec<(&std::path::Path, &[u8])> = Vec::new();
     if let Some(p) = &out {
-        std::fs::write(p, &json).map_err(|e| input_err(format!("{}: {}", p, e)))?;
+        files.push((std::path::Path::new(p), json.as_bytes()));
     }
-    if let Some(p) = &markdown {
-        let md = report.markdown();
-        if p == "-" {
-            print!("{}", md);
-        } else {
-            std::fs::write(p, md).map_err(|e| input_err(format!("{}: {}", p, e)))?;
+    if let Some(p) = markdown.as_ref().filter(|p| p.as_str() != "-") {
+        files.push((std::path::Path::new(p), md.as_bytes()));
+    }
+    let report_sha = (read.is_some() || expect_hash.is_some())
+        .then(|| crate::manifest::sha256_hex(finish(report.hashed_json(), true).as_bytes()));
+    if let (Some(want), Some(got)) = (&expect_hash, &report_sha) {
+        if want != got {
+            return Err(input_err(format!("report sha256 {} differs from the expected {}", got, want)));
         }
+    }
+    if let (Some((ledger, data_sha, current)), Some(report_sha)) = (&read, &report_sha) {
+        if verify_read {
+            match ledger.baseline_report_sha() {
+                Some(h) if h == *report_sha => {}
+                Some(h) => {
+                    return Err(input_err(format!(
+                        "report sha256 {} differs from the recorded baseline read {}",
+                        report_sha, h
+                    )))
+                }
+                None => return Err(input_err("no recorded baseline read".to_string())),
+            }
+            protocol::write_around_record(&files, || Ok(()), None).map_err(input_err)?;
+        } else {
+            protocol::write_around_record(
+                &files,
+                || {
+                    ledger.write_read_marker(&data_path, "baseline_read", report_sha)?;
+                    ledger.record_baseline_read(data_sha, report_sha, Some(current))
+                },
+                None,
+            )
+            .map_err(input_err)?;
+        }
+    } else {
+        for (p, bytes) in &files {
+            std::fs::write(p, bytes).map_err(|e| input_err(format!("{}: {}", p.display(), e)))?;
+        }
+    }
+    if markdown.as_deref() == Some("-") {
+        print!("{}", md);
     }
     if print_json || (out.is_none() && markdown.is_none()) {
         println!("{}", json);

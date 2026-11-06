@@ -56,6 +56,8 @@ art gpu_parity test true '"/fake/deps/gpu_parity-ccc"'
 art gpu_big test true '"/fake/deps/gpu_big-ddd"'
 art gpu_memory_plan test true '"/fake/deps/gpu_memory_plan-eee"'
 art gpu_fit test true '"/fake/deps/gpu_fit-fff"'
+[ -z "${FAKE_BENCH_UNIT:-}" ] || art rcsr-gpu-bench bin true '"/fake/deps/rcsr_gpu_bench-unit"'
+[ -n "${FAKE_NO_RELEASE:-}" ] || art rcsr-gpu-bench bin false '"/fake/release/rcsr-gpu-bench"'
 echo '{"reason":"build-finished","success":true}'
 exit "${FAKE_BUILD_RC:-0}"
 STUB
@@ -271,6 +273,48 @@ run "$T/wt" 9 --bogus > /dev/null 2>&1; r=$?
 check bogus-rc "$r" "2"
 RCSR_SANITIZER_PLAN="$T/plan" RCSR_SANITIZER=/nonexistent/compute-sanitizer bash "$ALL" "$T/wt" 9 > /dev/null 2>&1; r=$?
 check san-rc "$r" "3"
+
+# run-bin: the release binary itself runs under memcheck with the planned arguments
+cat > "$T/plan-bin" <<'PLAN'
+gpu_fit              *  skip     not part of this check
+bin-rcsr-gpu-bench   *  skip     no tests in this binary; the binary runs on the next line
+rcsr-gpu-bench       *  run-bin  --batch 64 --reps 1 --depth 3
+PLAN
+FAKE_BENCH_UNIT=1 PLAN=$T/plan-bin run "$T/wt" 9 --only rcsr-gpu-bench > "$T/out" 2>&1; r=$?
+check runbin-rc "$r" "0"
+has runbin-build "$T/cargo-calls" '^cargo build --release --features cuda --bin rcsr-gpu-bench --message-format=json$'
+hasnt runbin-no-test-build "$T/cargo-calls" 'cargo test'
+check runbin-san-calls "$(wc -l < "$T/san-calls" | tr -d ' ')" "1"
+has runbin-san-args "$T/san-calls" 'san under=memcheck --tool memcheck --leak-check no --error-exitcode 99 /fake/release/rcsr-gpu-bench --batch 64 --reps 1 --depth 3$'
+hasnt runbin-not-unit "$T/san-calls" 'rcsr_gpu_bench-unit'
+has runbin-lock "$T/calls" '^lock .*timeout -k 30 580 '
+has runbin-line "$sum" '^rcsr-gpu-bench rc=0 xid=4->4 secs=[0-9]+ \| .*ERROR SUMMARY: 0 errors$'
+# a full pass runs the unit-test binaries and the run-bin line; the unit binary of the bench is skipped by plan
+FAKE_BENCH_UNIT=1 PLAN=$T/plan-bin run "$T/wt" 9 > "$T/out" 2>&1; r=$?
+check runbin-full-rc "$r" "0"
+has runbin-full-skip "$sum" '^bin-rcsr-gpu-bench skip \| no tests in this binary'
+hasnt runbin-full-unit-not-run "$T/san-calls" 'rcsr_gpu_bench-unit'
+has runbin-full-run "$T/san-calls" '/fake/release/rcsr-gpu-bench --batch 64 --reps 1 --depth 3$'
+has runbin-full-lib "$T/san-calls" 'error-exitcode 99 /fake/deps/rcsr-aaa$'
+# errors from the binary fail the pass
+FAKE_BENCH_UNIT=1 FAKE_FAIL_ON=rcsr-gpu-bench PLAN=$T/plan-bin run "$T/wt" 9 --only rcsr-gpu-bench > /dev/null 2>&1; r=$?
+check runbin-err-rc "$r" "1"
+has runbin-err-line "$sum" '^rcsr-gpu-bench rc=99 .*ERROR SUMMARY: 2 errors$'
+# no release executable in the build output fails the pass
+FAKE_BENCH_UNIT=1 FAKE_NO_RELEASE=1 PLAN=$T/plan-bin run "$T/wt" 9 --only rcsr-gpu-bench > /dev/null 2>&1; r=$?
+check runbin-noexe-rc "$r" "1"
+has runbin-noexe-line "$sum" '^rcsr-gpu-bench missing \| expected one release executable'
+check runbin-noexe-no-run "$(wc -l < "$T/san-calls" | tr -d ' ')" "0"
+# dry run builds and runs nothing
+FAKE_BENCH_UNIT=1 PLAN=$T/plan-bin run "$T/wt" 9 --dry-run --only rcsr-gpu-bench > "$T/out" 2>&1; r=$?
+check runbin-dry-rc "$r" "0"
+has runbin-dry-build "$T/out" '^build: cargo build --release --features cuda --bin rcsr-gpu-bench --message-format=json$'
+has runbin-dry-run "$T/out" '^run rcsr-gpu-bench: .*<rcsr-gpu-bench release binary> --batch 64 --reps 1 --depth 3$'
+check runbin-dry-no-cargo "$(wc -c < "$T/cargo-calls" | tr -d ' ')" "0"
+# run-bin needs * as the test
+printf '%s\n' 'rcsr-gpu-bench  x  run-bin  --batch 1' > "$T/plan-badbin"
+PLAN=$T/plan-badbin run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check runbin-badtest-rc "$r" "2"
 
 check help-rc "$(bash "$ALL" -h > "$T/h"; echo $?)" "0"
 has help-usage "$T/h" '^Usage: sanitize-all.sh <worktree>'

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Usage: sanitize.sh <worktree> <id> <tag> (--test <file> | --lib) [--timeout S] [--api-errors no|explicit|all] [-- <test filters and flags>]
+# Usage: sanitize.sh <worktree> <id> <tag> (--test <file> | --lib | --bin <name>) [--timeout S] [--api-errors no|explicit|all] [-- <test filters and flags>]
 # Builds the CUDA test binary in the build slot with `cargo test --release --features cuda --no-run --message-format=json`,
 # takes its path from the compiler-artifact JSON line (profile.test true; target.name = <file>, or target.kind holding lib),
 # and runs it under the CUDA 13.0 compute-sanitizer memcheck through the test lock with the Xid check:
 # env RCSR_UNDER_SANITIZER=memcheck RCSR_REQUIRE_DEVICE=1 $SANITIZER --tool memcheck --leak-check no --error-exitcode 99 [--report-api-errors <v>] <binary> <filters>.
 # RCSR_UNDER_SANITIZER lets a test pick a smaller fixture (tests/common/sanitizer.rs). --api-errors no stops deliberate driver errors counting as sanitizer errors.
+# --bin <name> builds `cargo build --release --features cuda --bin <name>` instead and runs that binary under memcheck with the arguments after `--`
+# (target.kind bin, profile.test false); use small arguments, for example `--bin rcsr-gpu-bench -- --batch 64 --reps 1 --depth 3`.
 # Run the whole planned pass with sanitize-all.sh.
 # Search-level tests must set dispatch: DispatchMode::Device (CLI --dispatch device), or every stage runs on the CPU.
 # Writes: the logs <id>-<tag>-build and <id>-<tag> (see rc-run.sh).
@@ -27,6 +29,11 @@ while [ $# -gt 0 ]; do
     --test)
       [ $# -ge 2 ] && [ -z "$target" ] || { usage >&2; exit 2; }
       target=test:$2
+      shift 2
+      ;;
+    --bin)
+      [ $# -ge 2 ] && [ -z "$target" ] || { usage >&2; exit 2; }
+      target=bin:$2
       shift 2
       ;;
     --lib)
@@ -69,9 +76,11 @@ esac
 [ -x "$san_real" ] && [ -f "$san_real" ] || { echo "sanitize: $SANITIZER is not executable" >&2; exit 3; }
 
 build_args=(cargo test --release --features cuda --no-run --message-format=json)
+[ "${target%%:*}" != bin ] || build_args=(cargo build --release --features cuda --message-format=json)
 case "$target" in
   test:*) build_args+=(--test "${target#test:}") ;;
   lib) build_args+=(--lib) ;;
+  bin:*) build_args+=(--bin "${target#bin:}") ;;
 esac
 "$RC_RUN" build "$wt" "$id" "$tag-build" --cuda -- "${build_args[@]}" > /dev/null
 brc=$?
@@ -84,6 +93,8 @@ fi
 case "$target" in
   test:*) name=${target#test:}
     filter='select(.reason=="compiler-artifact" and .profile.test==true and .target.name==$n and .executable != null) | .executable' ;;
+  bin:*) name=${target#bin:}
+    filter='select(.reason=="compiler-artifact" and .profile.test==false and (.target.kind | index("bin")) and .target.name==$n and .executable != null) | .executable' ;;
   lib) name=
     filter='select(.reason=="compiler-artifact" and .profile.test==true and (.target.kind | index("lib")) and .executable != null) | .executable' ;;
 esac
