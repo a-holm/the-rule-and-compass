@@ -6,9 +6,11 @@
 # cpu:   any CPU-only command through the build slot; default 580 s.
 # The command runs in <worktree>/my-version with CARGO_BUILD_JOBS=2 (and RCSR_CUDA_ARCH=sm_86 with --cuda)
 # under an outer timeout. Lock modes refuse --timeout above LOCK_HOLD_MAX (600 s).
+# Lock modes run the command through lock-run.sh: its own session, and every process that still holds the lock after it ended is
+# TERMed, then KILLed, by pid, so a crashed tool cannot leave the lock held.
 # Lock modes add the line `xid before=<a> after=<b>`; the last log line is `RC_DONE rc=<n> at=<UTC>`.
 # Writes: the log $(log_path <id> <tag>) (overwritten on rerun).
-# Exit: the command's exit code; 70 when the Xid count rose; 75 when the slot or lock gave up; 2 usage or refused input.
+# Exit: the command's exit code; 70 when the Xid count rose; 71 when a process still held the lock after the KILL; 75 when the slot or lock gave up; 2 usage or refused input.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -60,7 +62,11 @@ need_gates
 wt=$(cd "$wt" && pwd)
 env_prefix="CARGO_BUILD_JOBS=2"
 [ "$cuda" -eq 1 ] && env_prefix="$env_prefix RCSR_CUDA_ARCH=$CUDA_ARCH"
-inner=$(printf 'cd %q && %s timeout %s' "$wt/my-version" "$env_prefix" "$timeout_s")
+reap=
+if [ "$lock" -eq 1 ]; then
+  reap=$(printf 'bash %q %q ' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lock-run.sh" "$LOCKFILE")
+fi
+inner=$(printf 'cd %q && %s %stimeout %s' "$wt/my-version" "$env_prefix" "$reap" "$timeout_s")
 for arg in "$@"; do
   inner="$inner $(printf '%q' "$arg")"
 done
