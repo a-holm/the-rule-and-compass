@@ -9,7 +9,6 @@ use crate::enrich::{
     self, EnrichCalibration, EnrichRates, GpuMode, OpClass, Options, OP_CLASSES,
     GPU_D2H_BYTES_PER_SECOND, GPU_TRANSFER_BYTES_PER_SECOND,
 };
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 /// Symbols and bars per symbol of the probe store: the shape of the 1M-row,
@@ -279,13 +278,16 @@ struct ClassFit {
     /// Largest over smallest repeat of a resolved class; 1.0 otherwise.
     spread: f64,
     /// The kernel term after the bus and the write exceeds the noise of the
-    /// repeats and is slower than `RATE_CLAMP` times the anchor.
+    /// repeats. A resolved rate is limited to `RATE_CLAMP` times the anchor.
     resolved: bool,
     /// Seconds of the extra cells left for the kernel, before any limit.
     kernel_s: f64,
-    /// Largest minus smallest of the same figure over the repeat pairs.
+    /// Smaller of the stage-seconds ranges of the two sets over the repeats.
     noise_s: f64,
 }
+
+/// Largest spread a file records.
+const MAX_SPREAD: f64 = 1000.0;
 
 fn least(v: impl Iterator<Item = f64>) -> f64 {
     v.fold(f64::INFINITY, f64::min)
@@ -296,9 +298,9 @@ fn least(v: impl Iterator<Item = f64>) -> f64 {
 /// rate is what its extra cells cost after the bus and the write. Timing noise
 /// on a fixed workload only adds time, so each run set is represented by its
 /// smallest sample. A class whose runs report their write subtracts that
-/// figure. A kernel that does not exceed the noise of the repeats, or that is
-/// more than `RATE_CLAMP` times faster than its anchor, is hidden behind the
-/// transfers: timing does not resolve it and the class keeps its anchor.
+/// figure. A kernel that does not exceed the noise of the repeats (the smaller of the two sets' ranges, since a stall hits one set) is hidden
+/// behind the transfers: timing does not resolve it and the class keeps its
+/// anchor. A resolved rate is limited to `RATE_CLAMP` times the anchor.
 fn fit_device(runs: &[ClassRuns]) -> DeviceFit {
     let anchors = EnrichRates::anchors();
     let per_cell_bus = 8.0 * (1.0 / GPU_TRANSFER_BYTES_PER_SECOND + 1.0 / GPU_D2H_BYTES_PER_SECOND);
@@ -334,13 +336,21 @@ fn fit_device(runs: &[ClassRuns]) -> DeviceFit {
             let (lo, hi) = pairs
                 .iter()
                 .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
-            let noise_s = if pairs.len() > 1 { hi - lo } else { f64::INFINITY };
+            // A stall hits one sample of one set: the set that stayed clean sets
+            // the noise.
+            let range = |v: &[Sample]| {
+                let (lo, hi) = v
+                    .iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), s| (lo.min(s.stage_s), hi.max(s.stage_s)));
+                hi - lo
+            };
+            let noise_s = if pairs.len() > 1 { range(&r.small).min(range(&r.large)) } else { f64::INFINITY };
             let fastest = r.d_cells / (enrich::RATE_CLAMP * anchor);
-            let resolved = kernel_s > noise_s && kernel_s >= fastest && lo > 0.0;
+            let resolved = kernel_s > noise_s;
             ClassFit {
                 idx: r.idx,
-                rate: if resolved { r.d_cells / kernel_s } else { anchor },
-                spread: if resolved { hi / lo } else { 1.0 },
+                rate: if resolved { r.d_cells / kernel_s.max(fastest) } else { anchor },
+                spread: if resolved { (hi / lo.max(hi / MAX_SPREAD)).max(1.0) } else { 1.0 },
                 resolved,
                 kernel_s,
                 noise_s,
@@ -515,11 +525,11 @@ mod tests {
         let c = class(&fit, ew);
         assert!(!c.resolved);
         assert_eq!((c.rate, c.spread), (anchor, 1.0));
-        // A kernel below the noise of the repeats is not resolved either.
+        // A kernel below the noise of both sets is not resolved either.
         let tiny = 0.02;
         let noisy = runs(
             ew,
-            &[(0.2, 0.05, 0.2 + tiny + bus() + 0.2, 0.25), (0.2, 0.05, 0.2 + tiny + 0.02 + bus() + 0.2, 0.25)],
+            &[(0.2, 0.05, 0.2 + tiny + bus() + 0.2, 0.25), (0.23, 0.05, 0.2 + tiny + 0.03 + bus() + 0.2, 0.25)],
         );
         let c = fit_device(&[noisy]).classes.remove(0);
         assert!(!c.resolved);
@@ -527,6 +537,27 @@ mod tests {
         // A single repeat has no noise estimate and is not resolved.
         let single = runs(ew, &[(0.2, 0.05, 0.2 + 0.1 + bus() + 0.2, 0.25)]);
         assert!(!fit_device(&[single]).classes[0].resolved);
+    }
+
+    #[test]
+    fn a_stall_in_one_set_does_not_unresolve_the_class() {
+        let kernel = 0.05;
+        let large = 0.2 + kernel + bus() + 0.2;
+        let r = runs(OpClass::Mtf, &[(0.2, 0.05, large, 0.25), (0.2, 0.05, large + 0.1, 0.25)]);
+        let c = fit_device(&[r]).classes.remove(0);
+        assert!(c.resolved, "{} {}", c.kernel_s, c.noise_s);
+        assert!((c.rate - CELLS / kernel).abs() < 1.0, "{}", c.rate);
+    }
+
+    #[test]
+    fn a_resolved_kernel_faster_than_four_times_the_anchor_is_limited() {
+        let ew = OpClass::Elementwise;
+        let anchor = EnrichRates::anchors().class(ew).gpu_cells_per_s;
+        let fast = CELLS / (enrich::RATE_CLAMP * anchor) / 2.0;
+        let r = runs(ew, &[(0.2, 0.05, 0.2 + fast + bus() + 0.2, 0.25), (0.2, 0.05, 0.2 + fast + bus() + 0.2, 0.25)]);
+        let c = fit_device(&[r]).classes.remove(0);
+        assert!(c.resolved);
+        assert_eq!(c.rate, enrich::RATE_CLAMP * anchor);
     }
 
     #[test]

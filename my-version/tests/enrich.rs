@@ -4119,6 +4119,9 @@ fn calibrate_spread_runs() {
         use std::io::Write;
         writeln!(tsv, "{}\t{wall:.2}\t{load}", file.display()).unwrap();
         eprintln!("{} wall={wall:.2}s load={load}", file.display());
+        for line in String::from_utf8_lossy(&out.stderr).lines().filter(|l| l.starts_with("probe-trace")) {
+            eprintln!("{} {line}", file.display());
+        }
     }
 }
 
