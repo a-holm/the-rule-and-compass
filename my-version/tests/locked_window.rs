@@ -2,11 +2,13 @@
 //! search split, walk-forward and the ladder, and read only through the sealed
 //! path. Fixtures are synthetic; the locked range is a stand-in in 2024.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::devlog::Json;
 use rcsr::lockbox::{self, Lockbox};
 use rcsr::protocol::{Candidate, Ledger};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -26,7 +28,7 @@ fn scratch(name: &str) -> (Scratch, PathBuf) {
 }
 
 fn rcsr(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().unwrap();
+    let out = rcsr_cmd::rcsr().args(args).output().unwrap();
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -1559,7 +1561,7 @@ fn ladder_refuses_out_and_markdown_that_name_one_file() {
 fn ladder_refuses_a_relative_out_and_its_dot_slash_form() {
     let f = Sealed::new("lad-same-file-rel");
     let ledger_before = f.bytes(&f.ledger);
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .current_dir(&f.dir)
         .args([
             "ladder", "--data", &f.data, "--target", "y", "--time", "ts", "--group", "sym", "--features", "f1,f2",

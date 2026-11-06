@@ -4,12 +4,15 @@
 //! the test block is only scored. These tests pin the sizes, the purge, the
 //! selection API and the optimism of ranking by the test block.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{self, PrepSpec, SplitMode, SplitSpec};
 use rcsr::rng::Mt;
 use rcsr::selection::{select, Candidate, SelectBy};
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 fn table(n: usize) -> data::Table {
     let mut s = String::from("t,x,y\n");
@@ -166,7 +169,7 @@ impl TempCsv {
 }
 
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")

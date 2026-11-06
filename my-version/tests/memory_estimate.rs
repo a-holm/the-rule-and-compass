@@ -3,8 +3,10 @@
 //! fixtures are tiny; the 1M-row and 90-column peak-RSS measurements are in
 //! `docs/data-format.md`.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{self, CsvShape, PrepReport};
-use std::process::Command;
 
 const WIDE: &str = include_str!("fixtures/wide90_small.csv");
 const NARROW: &str = include_str!("fixtures/narrow2_large.csv");
@@ -91,7 +93,7 @@ fn the_cli_json_preparation_block_carries_the_estimate_for_a_wide_csv() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/wide90_small.csv"
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let output = rcsr_cmd::rcsr()
         .args([
             "--data",
             path,

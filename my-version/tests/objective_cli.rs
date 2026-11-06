@@ -1,9 +1,12 @@
 //! `--objective pnl|sharpe|log_growth`: refusals, validation-only selection
 //! and the `--json` block.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::devlog::Json;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const T0: i64 = 1_600_000_000;
 const N: usize = 400;
@@ -79,7 +82,7 @@ fn run(data: &str, spec: &str, extra: &[&str]) -> Output {
         "--pop", "32", "--metric", "squared", "--json", "--quiet",
     ];
     args.extend_from_slice(extra);
-    Command::new(env!("CARGO_BIN_EXE_rcsr")).args(&args).output().expect("run rcsr")
+    rcsr_cmd::rcsr().args(&args).output().expect("run rcsr")
 }
 
 fn code(o: &Output) -> i32 {
@@ -140,7 +143,7 @@ fn refusals_are_usage_errors() {
     let labelled = write_spec(&dir, "net.json", 0.002, "20.0", true);
     usage_error(&run(&data, &labelled, PNL), "cost_already_in_label");
 
-    let no_spec = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let no_spec = rcsr_cmd::rcsr()
         .args(["--data", data.as_str(), "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal", "--cpu", "--no-dev-log", "--generations", "1", "--pop", "8", "--json", "--quiet"])
         .args(PNL)
         .output()
@@ -218,7 +221,7 @@ fn the_default_run_has_no_objective_block() {
 /// write the CSV they want.
 fn import_store(dir: &std::path::Path, csv: &str) -> String {
     let store = dir.join("d.rcsb").to_string_lossy().into_owned();
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args(["import", "--data", csv, "--out", &store, "--time", "t", "--quiet"])
         .output()
         .expect("run rcsr import");
@@ -456,7 +459,7 @@ fn walkforward_front_of_a_real_run_guards_the_seen_rows() {
     let end = (T0 + 900 * N as i64) as f64;
     let walk = |test_start: f64| {
         let window = format!("w,{},{},{},{}", T0, test_start - purge, test_start, end);
-        Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        rcsr_cmd::rcsr()
             .args([
                 "walkforward", "--data", &data, "--time", "t", "--front", &run_path, "--window", &window,
                 "--horizon", "900", "--periods-per-year", "365", "--validation-frac", "0.3", "--json",
@@ -487,7 +490,7 @@ fn run_gpu(data: &str, spec: &str, flag: &[&str], fault: &str, extra: &[&str]) -
     args.extend_from_slice(PNL);
     args.extend_from_slice(flag);
     args.extend_from_slice(extra);
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr_on_device()
         .args(&args)
         .env("RCSR_FAULT", fault)
         .output()
@@ -564,7 +567,7 @@ fn from_run_fixture() -> (Scratch, String, String, f64, f64) {
 fn walk_from_run(data: &str, run_path: &str, test_start: f64, purge: f64, extra: &[&str]) -> Output {
     let end = (T0 + 900 * N as i64) as f64;
     let window = format!("w,{},{},{},{}", T0, test_start - purge, test_start, end);
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args([
             "walkforward", "--data", data, "--time", "t", "--from-run", run_path, "--window", &window,
             "--horizon", "900", "--periods-per-year", "365", "--json",
@@ -610,7 +613,7 @@ fn walk_table(extra: &[&str]) -> Output {
     );
     let table_path = dir.join("windows.csv");
     std::fs::write(&table_path, table).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args([
             "walkforward", "--data", &data, "--time", "t", "--target", "r", "--vars", "x1,x2",
             "--windows", &table_path.to_string_lossy(), "--windows-scheme", "expanding", "--horizon", "900",
@@ -652,7 +655,7 @@ fn windows_table_still_refuses_validation_frac_and_missing_slice() {
     assert!(stderr(&both).contains("mutually exclusive"), "{}", stderr(&both));
     let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "a.csv", None);
-    let none = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let none = rcsr_cmd::rcsr()
         .args([
             "walkforward", "--data", &data, "--time", "t", "--target", "r", "--vars", "x1,x2", "--expr", "x1",
             "--expr", "x2", "--window", &format!("w,{},{},{},{}", T0, T0 + 900 * 250, T0 + 900 * 260, T0 + 900 * 399),
@@ -682,7 +685,7 @@ fn run_second_search_fault(extra: &[&str], keep_dev_log: bool) -> Output {
     }
     args.extend_from_slice(PNL);
     args.extend_from_slice(extra);
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr_on_device()
         .args(&args)
         .current_dir(&dir)
         .env("RCSR_FAULT", "batch@2")

@@ -1,7 +1,9 @@
 //! #294: the CLI records the resolved projection and the unprojected escape
 //! hatch produces the same search result on the same bytes.
 
-use std::process::Command;
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 
 use rcsr::data;
 use rcsr::store;
@@ -67,7 +69,7 @@ fn run(path: &str, manifest: &str, no_project: bool) -> String {
     if no_project {
         args.push("--no-project".to_string());
     }
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args(&args)
         .output()
         .unwrap();

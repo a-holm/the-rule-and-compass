@@ -6,13 +6,16 @@
 //! indicators named `column=value`, with sorted levels so the encoding does not
 //! depend on row order.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{self, DType, FillMethod, PrepSpec, SplitMode, SplitSpec};
 use rcsr::expr::{self, Op};
 use rcsr::metrics::Metric;
 use rcsr::rng::Mt;
 use rcsr::search::{run, Config};
 use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 fn temporal() -> SplitSpec {
     SplitSpec {
@@ -24,7 +27,7 @@ fn temporal() -> SplitSpec {
 }
 
 fn run_cli(args: &[&str], stdin: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let mut child = rcsr_cmd::rcsr()
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

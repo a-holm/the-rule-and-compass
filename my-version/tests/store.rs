@@ -3,9 +3,11 @@
 //! The fixtures are tiny on purpose: the large-file measurement lives in the
 //! issue report, not in the test suite.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{self, Table};
 use rcsr::store::{self, DType, FileStore, MAGIC};
-use std::process::Command;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -160,7 +162,7 @@ fn import_then_search_is_byte_identical_to_the_csv_path() {
     let (_scratch, dir) = temp_dir("exact");
     let store_path = dir.join("clean.rcsb");
     let csv = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/clean.csv");
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let output = rcsr_cmd::rcsr()
         .args([
             "import",
             csv,
@@ -180,7 +182,7 @@ fn import_then_search_is_byte_identical_to_the_csv_path() {
     let from_csv = dir.join("csv.tsv");
     let from_store = dir.join("store.tsv");
     let common = |data: &str, out: &std::path::Path| {
-        let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        let output = rcsr_cmd::rcsr()
             .args([
                 "--data",
                 data,
@@ -409,7 +411,7 @@ fn write_v1_from_table(path: &std::path::Path, table: &Table, group_rows: usize)
 #[test]
 fn the_memory_guard_refuses_a_csv_cleanly_with_exit_3() {
     let csv = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/clean.csv");
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let output = rcsr_cmd::rcsr()
         .args([
             "--data",
             csv,
@@ -439,7 +441,7 @@ fn the_import_command_honours_the_same_guard() {
     let (_scratch, dir) = temp_dir("import-guard");
     let csv = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/clean.csv");
     let out = dir.join("x.rcsb");
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let output = rcsr_cmd::rcsr()
         .args([
             "import",
             csv,
