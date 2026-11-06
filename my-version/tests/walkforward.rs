@@ -694,7 +694,7 @@ fn device_pnl_is_refused_with_policy_band() {
     }
     std::fs::write(&data, csv).unwrap();
     let run = |extra: &[&str]| {
-        rcsr_cmd::rcsr_for(extra)
+        rcsr_cmd::rcsr()
             .args([
                 "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x",
                 "--time", "ts", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365",
@@ -762,7 +762,7 @@ mod front {
     }
 
     fn rcsr(args: &[&str]) -> (i32, String, String) {
-        let out = super::rcsr_cmd::rcsr_for(args).args(args).output().unwrap();
+        let out = super::rcsr_cmd::rcsr().args(args).output().unwrap();
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),

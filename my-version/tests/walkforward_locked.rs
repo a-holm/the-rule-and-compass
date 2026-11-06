@@ -38,7 +38,7 @@ fn s(p: &Path) -> String {
 }
 
 fn rcsr(args: &[&str]) -> (i32, String, String) {
-    let out = rcsr_cmd::rcsr_for(args).args(args).output().unwrap();
+    let out = rcsr_cmd::rcsr().args(args).output().unwrap();
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -313,7 +313,7 @@ fn front_read_verifies_with_another_path_spelling() {
             "--validation-frac", "0.2",
         ];
         a.extend_from_slice(extra);
-        let out = rcsr_cmd::rcsr_for(&a).current_dir(&dir).args(&a).output().unwrap();
+        let out = rcsr_cmd::rcsr().current_dir(&dir).args(&a).output().unwrap();
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),
