@@ -85,6 +85,8 @@ pub struct ProtocolOptions {
     pub cost: Option<crate::target::CostDecl>,
     /// #482: the run.json the candidates came from.
     pub front: Option<FrontSource>,
+    /// #807: which string of the run the candidates are; `None` for `--expr`.
+    pub expression_source: Option<crate::run_json::ExpressionSource>,
     /// #482: labels of windows that overlap the run's training or validation
     /// rows and were allowed anyway.
     pub in_sample_windows: Vec<String>,
@@ -126,6 +128,7 @@ impl Default for ProtocolOptions {
             batch_pnl: false,
             cost: None,
             front: None,
+            expression_source: None,
             in_sample_windows: Vec::new(),
             final_read: false,
             locked_ranges: Vec::new(),
@@ -550,6 +553,8 @@ pub struct Report {
     pub selected_on: String,
     /// #482: the run whose Pareto front supplied the candidates.
     pub front: Option<FrontSource>,
+    /// #807: `exact` or `rounded` for candidates read from a run.json.
+    pub expression_source: Option<crate::run_json::ExpressionSource>,
     /// #308: whether the band protocol selected the candidate.
     pub band_select: bool,
     /// True when no test row influenced candidate or threshold selection.
@@ -1716,6 +1721,7 @@ impl Accum {
             candidates: expressions,
             selected_on,
             front: opts.front.clone(),
+            expression_source: opts.expression_source,
             band_select: spec.band_select,
             test_used_for_selection: false,
             pool_reset_flat: spec.pool_reset_flat,
@@ -3195,7 +3201,7 @@ impl Report {
              \"annualized_alpha_scale\":\"periods_per_year\"}}}},\
              \"candidates\":[{}],\"selection\":{{\"selected_on\":{},\
              \"band_select\":{},\"test_used_for_selection\":{},\
-             \"candidate_count\":{}{}}},\
+             \"candidate_count\":{}{}{}}},\
              \"pooled_seam\":{{\"reset_flat\":{},\"seam_cost\":{},\"seam_trades\":{}}},\
              \"sign_test\":{{\"positive\":{},\"total\":{},\"applicable\":{},\
              \"p_value\":{},\"method\":{}}},\
@@ -3245,6 +3251,9 @@ impl Report {
             self.test_used_for_selection,
             self.candidates.len(),
             self.front_json(paths),
+            self.expression_source
+                .map(|s| format!(",\"expression_source\":\"{}\"", s.as_str()))
+                .unwrap_or_default(),
             self.pool_reset_flat,
             jnum(self.seam_cost),
             self.seam_trades,
