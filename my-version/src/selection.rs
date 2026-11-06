@@ -283,6 +283,9 @@ pub struct BandFinalist {
     /// Zero-based rank on the exact objective. With the exhaustive audit this
     /// is a rank over all candidates; otherwise over the admitted set only.
     pub exact_rank: Option<usize>,
+    /// Rows with a finite score and target whose position changes when the
+    /// score is narrowed to f32. Reported only; no selection step reads it.
+    pub f32_flip_rows: u64,
 }
 
 /// Result of the band protocol.
@@ -333,7 +336,7 @@ impl BandSelection {
                 format!(
                     "{{\"index\":{},\"surrogate\":{},\"surrogate_rank\":{},\
                      \"complexity\":{},\"threshold\":{},\"band\":{},\
-                     \"exact\":{},\"exact_rank\":{}}}",
+                     \"exact\":{},\"exact_rank\":{},\"f32_flip_rows\":{}}}",
                     c.index,
                     jnum(c.surrogate),
                     c.surrogate_rank,
@@ -349,7 +352,8 @@ impl BandSelection {
                         .unwrap_or_else(|| "null".to_string()),
                     c.exact_rank
                         .map(|r| r.to_string())
-                        .unwrap_or_else(|| "null".to_string())
+                        .unwrap_or_else(|| "null".to_string()),
+                    c.f32_flip_rows
                 )
             })
             .collect();
@@ -423,6 +427,16 @@ fn surrogate_order(candidates: &[BandCandidate<'_>]) -> Vec<usize> {
             .then_with(|| candidates[a].index.cmp(&candidates[b].index))
     });
     idx
+}
+
+fn band_flip_rows(rows: &BandRows<'_>, scores: &[f64], threshold: f64) -> u64 {
+    let valid: Vec<f64> = scores
+        .iter()
+        .zip(rows.targets)
+        .filter(|(s, t)| s.is_finite() && t.is_finite())
+        .map(|(&s, _)| s)
+        .collect();
+    trading_gpu::f32_flip_rows(&valid, threshold)
 }
 
 /// Exact CPU `f64` long-only rescore over the full rows.
@@ -568,6 +582,7 @@ pub fn select_band(
             band: false,
             exact: None,
             exact_rank: None,
+            f32_flip_rows: band_flip_rows(rows, c.scores, c.threshold),
         });
     }
     let mut ranked: Vec<BandFinalist> = ranked

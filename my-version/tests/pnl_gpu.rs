@@ -556,10 +556,6 @@ mod device {
         (scores, returns, groups)
     }
 
-    fn f32_scores(scores: &[f64]) -> Vec<f64> {
-        scores.iter().map(|&v| v as f32 as f64).collect()
-    }
-
     #[test]
     fn device_matches_canonical_cpu_on_100k_rows() {
         if !device_available() {
@@ -568,13 +564,12 @@ mod device {
         }
         let n = 100_000usize;
         let (scores, returns, groups) = data(n);
-        let cast = f32_scores(&scores);
         let params = PnlParams {
             threshold: 0.0,
             per_side_bps: 10.0,
             ..PnlParams::default()
         };
-        let cpu = reduce(&cast, &returns, &groups, &params).unwrap();
+        let cpu = reduce(&scores, &returns, &groups, &params).unwrap();
         let dev = reduce_device(&scores, &returns, &groups, &params, 256, 65_536)
             .expect("device P&L");
         let rel = (dev.strategy.net - cpu.strategy.net).abs()
@@ -658,6 +653,163 @@ mod device {
         )
         .expect("padded device batch");
         assert_eq!(alone.strategy.bits(), padded[0].strategy.bits());
+    }
+
+    fn assert_identical(dev: &rcsr::trading_gpu::PnlReport, cpu: &rcsr::trading_gpu::PnlReport, what: &str) {
+        assert!(
+            dev.strategy.identical(&cpu.strategy),
+            "{}: device {:?} against canonical {:?}",
+            what,
+            dev.strategy,
+            cpu.strategy
+        );
+    }
+
+    #[test]
+    fn device_reads_f64_scores_outside_the_f32_range() {
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let cycle = [
+            1e-46,
+            7.79843e-319,
+            5e-324,
+            -1e-46,
+            1e39,
+            -1e39,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+        ];
+        let n = 64usize;
+        let scores: Vec<f64> = (0..n).map(|i| cycle[i % cycle.len()]).collect();
+        let returns: Vec<f64> = (0..n).map(|i| 0.001 * (i as f64 + 1.0) - 0.03).collect();
+        let groups: Vec<u64> = (0..n).map(|i| (i / 32) as u64).collect();
+        let params = PnlParams {
+            threshold: 0.0,
+            per_side_bps: 10.0,
+            ..PnlParams::default()
+        };
+        let cpu = reduce(&scores, &returns, &groups, &params).unwrap();
+        let dev = reduce_device(&scores, &returns, &groups, &params, 256, 65_536)
+            .expect("device P&L");
+        assert_identical(&dev, &cpu, "scores outside the f32 range");
+    }
+
+    #[test]
+    fn device_compares_a_threshold_not_representable_in_f32() {
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let n = 64usize;
+        let returns: Vec<f64> = (0..n).map(|i| 0.001 * (i as f64 + 1.0) - 0.03).collect();
+        let groups: Vec<u64> = (0..n).map(|i| (i / 32) as u64).collect();
+        for t in [0.1f64, -0.1, 1e-300] {
+            let cycle = [
+                t,
+                f64::from_bits(t.to_bits() + 1),
+                f64::from_bits(t.to_bits() - 1),
+                t as f32 as f64,
+            ];
+            let scores: Vec<f64> = (0..n).map(|i| cycle[i % cycle.len()]).collect();
+            let params = PnlParams {
+                threshold: t,
+                per_side_bps: 10.0,
+                ..PnlParams::default()
+            };
+            let cpu = reduce(&scores, &returns, &groups, &params).unwrap();
+            let dev = reduce_device(&scores, &returns, &groups, &params, 256, 65_536)
+                .expect("device P&L");
+            assert_identical(&dev, &cpu, &format!("threshold {}", t));
+        }
+    }
+
+    #[test]
+    fn screening_net_is_the_exact_net_on_an_underflowing_score() {
+        use rcsr::selection::screening_net;
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let n = 200usize;
+        let returns: Vec<f64> = (0..n).map(|i| 0.002 * ((i % 7) as f64) - 0.005).collect();
+        let times: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let groups = vec![0u64; n];
+        let rows = BandRows {
+            targets: &returns,
+            groups: &groups,
+            times: &times,
+        };
+        let options = BandOptions::default();
+        let scores = vec![1e-46f64; n];
+        let screen = screening_net(&rows, &scores, 0.0, &options).unwrap();
+        let exact = rescore_exact(&rows, &scores, 0.0, &options).unwrap();
+        assert_eq!(screen.to_bits(), exact.net.to_bits());
+    }
+
+    #[test]
+    fn an_underflowing_winner_stays_inside_the_band() {
+        use rcsr::selection::screening_net;
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let n = 400usize;
+        let returns = vec![0.01f64; n];
+        let times: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let groups = vec![0u64; n];
+        let rows = BandRows {
+            targets: &returns,
+            groups: &groups,
+            times: &times,
+        };
+        let options = BandOptions::default();
+        let mut scores: Vec<Vec<f64>> = vec![vec![1e-46f64; n]];
+        for k in 1..16usize {
+            let long = 20 + 10 * k;
+            scores.push((0..n).map(|i| if i < long { 1.0 } else { -1.0 }).collect());
+        }
+        let candidates: Vec<BandCandidate<'_>> = scores
+            .iter()
+            .enumerate()
+            .map(|(c, s)| BandCandidate {
+                index: c,
+                surrogate: screening_net(&rows, s, 0.0, &options).unwrap(),
+                complexity: c,
+                scores: s,
+                threshold: 0.0,
+            })
+            .collect();
+        let selection = select_band(&rows, &candidates, &options).unwrap();
+        assert_eq!(selection.selected_index, 0);
+        assert_eq!(selection.recall_band, Some(1.0));
+    }
+
+    #[test]
+    fn a_one_ulp_device_fault_is_caught() {
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let r = 0.0123f64;
+        let faulty = f64::from_bits(r.to_bits() + 1);
+        let scores = [-1.0, 1.0, -1.0];
+        let groups = [0u64; 3];
+        let params = PnlParams {
+            threshold: 0.0,
+            per_side_bps: 0.0,
+            ..PnlParams::default()
+        };
+        let canonical = reduce(&scores, &[0.0, r, 0.0], &groups, &params).unwrap();
+        let device = reduce_device(&scores, &[0.0, faulty, 0.0], &groups, &params, 256, 65_536)
+            .expect("device P&L");
+        assert!(!device.strategy.identical(&canonical.strategy));
+        assert!((device.strategy.net - canonical.strategy.net).abs() <= 1e-9);
     }
 
     #[test]

@@ -915,3 +915,35 @@ fn the_printed_json_carries_a_phase_ledger_outside_the_reproduction_hash() {
     let l = ledger::check(&r.json_with_ledger(None), "walkforward", &["io", "pnl"]);
     assert_eq!(l.busy, 0.0, "the scalar evaluator has no device intervals");
 }
+
+#[test]
+fn device_pnl_check_is_clean_on_an_underflowing_score() {
+    // gauss(0.5) is normal, gauss(11) is below the f32 range, gauss(30) is
+    // exactly 0 in f64.
+    let xs = [0.5, 11.0, 30.0];
+    let mut rows: Vec<(f64, f64, f64)> = Vec::new();
+    for i in 0..4 {
+        rows.push((i as f64, 30.0, 0.0));
+    }
+    let mut flips = 0u64;
+    for i in 0..24 {
+        let x = xs[i % 3];
+        if x == 11.0 {
+            flips += 1;
+        }
+        rows.push((4.0 + i as f64, x, 0.002 * ((i % 5) as f64) - 0.003));
+    }
+    let t = single(&rows);
+    let mut s = spec("gauss(x)", vec![window("w", 0.0, 4.0, 4.0, 28.0)]);
+    s.threshold_fixed = Some(0.0);
+    s.device_pnl = true;
+    let r = walkforward::run_table(&t, &s, "test").unwrap();
+    let summary = r.device_pnl.as_ref().expect("report summary");
+    assert!(summary.max_abs_net_delta <= 1e-12, "{}", summary.max_abs_net_delta);
+    assert_eq!(summary.bit_mismatch_windows, 0);
+    assert_eq!(summary.count_mismatch_windows, 0);
+    assert_eq!(summary.f32_flip_rows, flips);
+    let d = r.windows[0].device_pnl.as_ref().expect("device P&L block");
+    assert_eq!(d.f32_flip_rows, flips);
+    assert_eq!(d.strategy.long_rows, 16);
+}
