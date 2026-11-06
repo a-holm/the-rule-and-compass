@@ -45,6 +45,10 @@ fi
 if [ -n "${FAKE_TWO_ARTIFACTS:-}" ]; then
   echo '{"reason":"compiler-artifact","target":{"name":"gpu_fit","kind":["test"]},"profile":{"test":true},"executable":"/fake/deps/gpu_fit-ccc"}'
 fi
+echo '{"reason":"compiler-artifact","target":{"name":"rcsr-gpu-bench","kind":["bin"]},"profile":{"test":true},"executable":"/fake/deps/rcsr_gpu_bench-unit"}'
+if [ -z "${FAKE_NO_BIN:-}" ]; then
+  echo '{"reason":"compiler-artifact","target":{"name":"rcsr-gpu-bench","kind":["bin"]},"profile":{"test":false},"executable":"/fake/release/rcsr-gpu-bench"}'
+fi
 echo '{"reason":"build-finished","success":true}'
 exit "${FAKE_BUILD_RC:-0}"
 STUB
@@ -97,6 +101,24 @@ run "$T/wt" 7 s --lib > /dev/null 2>&1; r=$?
 check lib-rc "$r" "0"
 has lib-bin "$T/san-calls" '/fake/deps/rcsr-aaa'
 has lib-cargo "$T/cargo-calls" 'no-run --message-format=json --lib'
+
+# --bin builds the binary (not its unit tests) and runs the release executable under memcheck with the args after --
+: > "$T/san-calls"; : > "$T/cargo-calls"; : > "$T/calls"
+run "$T/wt" 7 s --bin rcsr-gpu-bench -- --batch 64 --reps 1 --depth 3 > /dev/null 2>&1; r=$?
+check bin-rc "$r" "0"
+has bin-cargo "$T/cargo-calls" '^cargo build --release --features cuda --message-format=json --bin rcsr-gpu-bench$'
+has bin-san-args "$T/san-calls" 'san under=memcheck --tool memcheck --leak-check no --error-exitcode 99 /fake/release/rcsr-gpu-bench --batch 64 --reps 1 --depth 3$'
+has bin-slot "$T/calls" '^slot .*cargo build'
+has bin-lock "$T/calls" '^lock .*compute-sanitizer'
+has bin-xid "$rlog" '^xid before=4 after=4$'
+FAKE_SUMMARY='ERROR SUMMARY: 3 errors' run "$T/wt" 7 s --bin rcsr-gpu-bench > /dev/null 2>&1; r=$?
+check bin-errors-rc "$r" "1"
+FAKE_NO_BIN=1 run "$T/wt" 7 s --bin rcsr-gpu-bench > /dev/null 2>&1; r=$?
+check bin-no-artifact-rc "$r" "1"
+run "$T/wt" 7 s --bin > /dev/null 2>&1; r=$?
+check bin-no-name-rc "$r" "2"
+run "$T/wt" 7 s --bin rcsr-gpu-bench --test gpu_fit > /dev/null 2>&1; r=$?
+check bin-and-test-rc "$r" "2"
 
 # errors in the sanitizer output give 1
 FAKE_SUMMARY='ERROR SUMMARY: 2 errors' run "$T/wt" 7 s --test gpu_fit > /dev/null 2>&1; r=$?

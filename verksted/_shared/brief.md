@@ -1,5 +1,7 @@
 You are not resumed automatically; block in your own turn until everything is done.
 
+Hard rules: never `pkill` or `killall` (kill only a pid you started, with `kill <pid>`); a wait uses `wait-for.sh`, never `pgrep -f`; no Python. A lint in `verksted_tools` fails on `pkill` and `killall` in scripts.
+
 Rules for every agent in this repo. The ticket section follows below. `brief.sh` prints the values N, SLUG, W, BRANCH, BASE, G, EPIC and PR; use them wherever a rule says `$N`, `$W`, `$BASE`, `$G`. `G` is `$GATES`, default `/mnt/lager/tmp/rcsr-gates`. Rule numbers refer to `rules.md`. Tool paths are relative to your worktree `$W`; each tool prints its usage with `-h`.
 
 Setup and scope
@@ -24,7 +26,7 @@ Tests and builds (rules 12, 23, 34)
 Waiting (rules 26, 27)
 - One wait mechanism: one blocking call, or one background shell and its notification. Never start repeated wait loops.
 - Never write `pgrep -f` or `until ! pgrep -f` loops: `pgrep -f` matches the loop's own command line and the loop never ends. Never loop on an exact count that may never match.
-- Wait on a log line or a done-file with `verksted/_tools/wait-for.sh --log <file>` (or `--file`), which polls inside one process under an outer timeout. Stop your own wait loops before your final report.
+- Wait on a log line, a done-file or a process with `verksted/_tools/wait-for.sh --log <file>` (or `--file`, `--pid <N>`, `--exe <abs path>`), which polls inside one process under an outer timeout. A wait uses `wait-for.sh`, never `pgrep -f`. Stop your own wait loops before your final report.
 - Never use `pkill` or `killall`. Kill only a process you started.
 
 No Python (rule 9)

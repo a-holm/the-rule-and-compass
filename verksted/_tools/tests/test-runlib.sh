@@ -8,7 +8,7 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 RLIB=$HERE/../runlib.sh
 ROOT_DIR=$(git -C "$HERE" rev-parse --show-toplevel)
 T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
+trap 'kill "$(cat "$T/leftpid" 2> /dev/null)" 2> /dev/null; rm -rf "$T"' EXIT
 fails=0
 check() {
   local name=$1 got=$2 want=$3
@@ -185,6 +185,33 @@ check silent-holds "$(wc -l < "$T/holds")" 1
 rm -f "$T/holds" "$T/run/f.log"
 rb 'rl_chunks f 100 1000 "echo time_budget" -- false'; check chunk-fail-rc $? 1
 check chunk-fail-holds "$(wc -l < "$T/holds")" 1
+
+# every rl_gpu hold runs through lock-run.sh: a child the command leaves holding the test lock is ended, the rc stays
+cat > "$T/flocklock.sh" <<STUB
+#!/usr/bin/env bash
+exec 9> "$T/full-suite.lock"
+flock -n 9 || exit 75
+exec "\$@"
+STUB
+cat > "$T/leave.sh" <<STUB
+#!/usr/bin/env bash
+tail -f /dev/null &
+echo \$! > "$T/leftpid"
+exit 3
+STUB
+chmod +x "$T/flocklock.sh" "$T/leave.sh"
+lockreal=$(readlink -f "$T/full-suite.lock")
+lock_holders() { find /proc/[0-9]*/fd -lname "$lockreal" 2> /dev/null | cut -d/ -f3; }
+rm -f "$T/leftpid"
+rb 'rl_gpu leave 60 -- '"$T"'/leave.sh' RCSR_LOCK_SCRIPT="$T/flocklock.sh"; check reap-rc $? 3
+check reap-no-holder "$(lock_holders | tr '\n' ' ')" ""
+left=$(cat "$T/leftpid")
+check reap-child-gone "$([ -r "/proc/$left/stat" ] && [ "$(cut -d' ' -f3 "/proc/$left/stat")" != Z ] && echo alive || echo gone)" gone
+grep -q '^lock-run: ended pids still holding the lock: ' "$T/run/leave.log"; check reap-logged $? 0
+rb 'rl_gpu quiet 60 -- true' RCSR_LOCK_SCRIPT="$T/flocklock.sh"; check reap-clean-rc $? 0
+! grep -q 'lock-run:' "$T/run/quiet.log"; check reap-clean-quiet $? 0
+rb 'rl_gpu nolock 60 -- true'; check reap-noflock-rc $? 0
+grep -q '^lock-run: no flock held by this process; nothing will be signalled$' "$T/run/nolock.log"; check reap-noflock-logged $? 0
 
 # no pgrep, pkill or python outside comments
 check no-forbidden "$(grep -vE '^\s*#' "$RLIB" | grep -cE 'pgrep|pkill|python')" 0

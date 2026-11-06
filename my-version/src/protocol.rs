@@ -776,6 +776,24 @@ impl Ledger {
     /// Check that a baseline ladder may read the locked test: the sealed list
     /// was recorded in the ledger and no baseline read exists yet.
     pub fn authorize_baseline_read(&self, sealed: &std::path::Path, bind: Option<RangeBinding>) -> Result<(), String> {
+        self.baseline_checks(sealed, bind, true)
+    }
+
+    /// The checks of [`Ledger::authorize_baseline_read`] without the refusal of
+    /// a second read, for the recompute of a recorded read.
+    pub fn authorize_baseline_sealed(&self, sealed: &std::path::Path, bind: Option<RangeBinding>) -> Result<(), String> {
+        self.baseline_checks(sealed, bind, false)
+    }
+
+    /// Report hash recorded by the baseline read, if there was one.
+    pub fn baseline_report_sha(&self) -> Option<String> {
+        self.events().ok()?.into_iter().find_map(|e| match e {
+            Event::BaselineRead { report_sha256, .. } => Some(report_sha256),
+            _ => None,
+        })
+    }
+
+    fn baseline_checks(&self, sealed: &std::path::Path, bind: Option<RangeBinding>, refuse_second: bool) -> Result<(), String> {
         self.verify_chain()?;
         let bytes = std::fs::read(sealed).map_err(|e| format!("{}: {}", sealed.display(), e))?;
         let hash = sha256_hex(&bytes);
@@ -790,7 +808,7 @@ impl Ledger {
                 hash
             ));
         }
-        if events.iter().any(|e| matches!(e, Event::BaselineRead { .. })) {
+        if refuse_second && events.iter().any(|e| matches!(e, Event::BaselineRead { .. })) {
             return Err("the ledger already has a baseline_read; the locked test is read once".to_string());
         }
         if let Some(b) = bind {
@@ -817,6 +835,72 @@ impl Ledger {
             range.map(|l| format!("{},", l.json())).unwrap_or_default()
         ))
     }
+}
+
+/// Where a test stops [`write_around_record`] as a kill would.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CrashAt {
+    AfterStage,
+    AfterRecord,
+    AfterFirstRename,
+}
+
+/// Write the report files of a locked read around the ledger record: every
+/// file is written beside its target and synced first, then `record` runs, then
+/// each file is renamed into place. A failure before `record` leaves the read
+/// unconsumed and removes the staged files. A failure after it leaves the read
+/// recorded; the report is recomputed with `--verify-read`. `crash` stops the
+/// sequence without cleanup, as a kill would; production passes `None`.
+pub fn write_around_record<T>(
+    outs: &[(&std::path::Path, &[u8])],
+    record: impl FnOnce() -> Result<T, String>,
+    crash: Option<CrashAt>,
+) -> Result<T, String> {
+    let killed = |at: CrashAt| -> Result<(), String> {
+        if crash == Some(at) {
+            Err(format!("simulated kill {:?}", at))
+        } else {
+            Ok(())
+        }
+    };
+    for (i, (a, _)) in outs.iter().enumerate() {
+        if outs[..i].iter().any(|(b, _)| b == a) {
+            return Err(format!("{}: two outputs name the same file", a.display()));
+        }
+    }
+    let mut staged = Vec::new();
+    for (path, bytes) in outs {
+        match crate::atomic::stage(path, bytes) {
+            Ok(s) => staged.push(s),
+            Err(e) => {
+                staged.into_iter().for_each(crate::atomic::Staged::discard);
+                return Err(format!("{}; nothing was recorded, the locked read is still available", e));
+            }
+        }
+    }
+    killed(CrashAt::AfterStage)?;
+    let value = match record() {
+        Ok(v) => v,
+        Err(e) => {
+            staged.into_iter().for_each(crate::atomic::Staged::discard);
+            return Err(e);
+        }
+    };
+    killed(CrashAt::AfterRecord)?;
+    for (n, s) in staged.into_iter().enumerate() {
+        let (dest, tmp) = (s.dest().display().to_string(), s.tmp().display().to_string());
+        s.publish().map_err(|e| {
+            format!(
+                "{}; the read is recorded and the report is staged at {}: rerun the same command with \
+                 --verify-read to write {}",
+                e, tmp, dest
+            )
+        })?;
+        if n == 0 {
+            killed(CrashAt::AfterFirstRename)?;
+        }
+    }
+    Ok(value)
 }
 
 /// JSON for the report's `protocol` object.

@@ -108,6 +108,31 @@ out=$(FAKE_GH_STATE=OPEN done_ --research probe-a); rc=$?
 check research-done-rc "$rc" 0
 check research-done-gone "$([ -e "$WT/research-probe-a" ] && echo yes || echo no)" no
 
+# gh pr merge --delete-branch already removed the worktree: absent is expected, leftovers are cleaned
+new 11 gone-case > /dev/null
+git_q -C "$WT/issue-11-gone-case" push -q -u origin issue/11-gone-case 2>/dev/null
+git_q -C "$T/clone" worktree remove "$WT/issue-11-gone-case"
+out=$(FAKE_GH_STATE=OPEN done_ 11); rc=$?
+check gone-open-rc "$rc" 1
+check gone-open-branch-kept "$(git -C "$T/clone" branch --list issue/11-gone-case | wc -l)" 1
+out=$(FAKE_GH_STATE=MERGED done_ 11 --dry-run); rc=$?
+check gone-dry-rc "$rc" 0
+check gone-dry-branch-kept "$(git -C "$T/clone" branch --list issue/11-gone-case | wc -l)" 1
+out=$(FAKE_GH_STATE=MERGED done_ 11); rc=$?
+check gone-leftover-rc "$rc" 0
+check gone-leftover-msg "$(grep -c '^already gone: no worktree for issue 11' <<<"$out")" 1
+check gone-leftover-local "$(git -C "$T/clone" branch --list issue/11-gone-case | wc -l)" 0
+check gone-leftover-remote "$(git -C "$T/origin.git" branch --list issue/11-gone-case | wc -l)" 0
+out=$(FAKE_GH_STATE=MERGED done_ 12 --pr 40); rc=$?
+check gone-clean-rc "$rc" 0
+check gone-clean-msg "$(grep -c '^already gone: no worktree for issue 12' <<<"$out")" 1
+out=$(FAKE_GH_STATE=OPEN done_ 12 --pr 40); rc=$?
+check gone-clean-open-rc "$rc" 1
+out=$(done_ 12 --pr x); rc=$?
+check gone-pr-usage-rc "$rc" 2
+out=$(done_ --research probe-b --pr 40); rc=$?
+check gone-research-pr-usage-rc "$rc" 2
+
 if [ "$fails" -ne 0 ]; then
   echo "test-wt: $fails failed"
   exit 1

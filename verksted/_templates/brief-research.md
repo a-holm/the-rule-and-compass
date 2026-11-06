@@ -1,5 +1,7 @@
 # Brief research section: <issue number or topic>
 
+Hard rules: never `pkill` or `killall` (kill only a pid you started, with `kill <pid>`); a wait uses `wait-for.sh`, never `pgrep -f`; no Python. A lint in `verksted_tools` fails on `pkill` and `killall` in scripts.
+
 Used with `../_shared/brief.md`; `../_tools/brief.sh research --issue <N> --slug <slug>` prints the dispatch prompt. Replace every angle-bracket placeholder.
 
 Goal of the whole project: <goal paragraph>

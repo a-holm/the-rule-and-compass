@@ -12,6 +12,7 @@
 # Writes: one log per run (<id>-san-<binary>[-<test>]), the build log <id>-san-build, and the summary <id>-san-summary
 # with one line per run: <binary>[:<test>] rc=<n> xid=<a>-><b> secs=<s> | <test result line> | <ERROR SUMMARY line>,
 # plus `<binary>[:<test>] skip | <reason>` lines.
+# Plan mode `<cargo bin name> * run-bin <arguments>` (for example `rcsr-gpu-bench * run-bin --batch 64 --reps 1 --depth 3`) runs the release binary itself under memcheck, not its unit tests: it builds `cargo build --release --features cuda --bin <name>` and runs that executable with the arguments in a lock hold of its own, label `<name>`. `--only <name>` runs just that line and skips the test-binary build. The unit-test executable of the same binary (`bin-<name>`) has its own `skip` line.
 # Plan mode `<binary> * no-cuda <reason>` lists a binary that makes no CUDA call by design. It still runs under memcheck.
 # Rc 255 with `terminated before first instrumented API call` and `test result: ok` (0 failed) is a pass only for a listed binary
 # (`<binary> no CUDA call (listed)`); for an unlisted binary it is a failure (`<binary> unexpected no CUDA call: add a plan line or fix the test`).
@@ -62,9 +63,10 @@ plan_lines=$(awk '/^[[:space:]]*(#|$)/ { next } {
   printf "%s\t%s\t%s\t%s\n", $1, $2, $3, reason }' "$plan")
 while IFS=$'\t' read -r b t m r; do
   [ -n "$b" ] || continue
-  case "$m" in skip|api-errors-no) ;; no-cuda|no-cuda-app-only) [ "$t" = "*" ] || { echo "sanitize-all: $m needs '*' as the test, got '$t' for $b in $plan" >&2; exit 2; } ;; *) echo "sanitize-all: bad mode '$m' in $plan" >&2; exit 2 ;; esac
+  case "$m" in skip|api-errors-no) ;; no-cuda|no-cuda-app-only|run-bin) [ "$t" = "*" ] || { echo "sanitize-all: $m needs '*' as the test, got '$t' for $b in $plan" >&2; exit 2; } ;; *) echo "sanitize-all: bad mode '$m' in $plan" >&2; exit 2 ;; esac
   [ -n "$r" ] || { echo "sanitize-all: empty reason for $b $t in $plan" >&2; exit 2; }
 done <<< "$plan_lines"
+run_bin_names=$(printf '%s\n' "$plan_lines" | awk -F'\t' '$3 == "run-bin" { print $1 }')
 
 summary=$(log_path "$id" san-summary)
 fails=0
@@ -196,48 +198,97 @@ while IFS=$'\t' read -r b t m r; do
   if [ "$t" = "*" ]; then emit "$b skip | $r"; else emit "$b:$t skip | $r"; fi
 done <<< "$plan_lines"
 
+is_run_bin() { printf '%s\n' "$run_bin_names" | grep -qx -- "$1"; }
+run_bin_args() { printf '%s\n' "$plan_lines" | awk -F'\t' -v b="$1" '$1 == b && $3 == "run-bin" { print $4; exit }'; }
+
+# only_run_bins: --only names nothing but run-bin lines, so the test binaries are not built
+only_run_bins=0
+if [ ${#only[@]} -gt 0 ]; then
+  only_run_bins=1
+  for o in "${only[@]}"; do is_run_bin "$o" || only_run_bins=0; done
+fi
+
 if [ "$dry" -eq 1 ]; then
-  echo "build: cargo test --release --features cuda --no-run --message-format=json"
-  names=$(printf '%s\n' "$plan_lines" | awk -F'\t' '$1 != "" { print $1 }' | sort -u)
-  for n in $names; do
+  if [ "$only_run_bins" -eq 0 ]; then
+    echo "build: cargo test --release --features cuda --no-run --message-format=json"
+    names=$(printf '%s\n' "$plan_lines" | awk -F'\t' '$1 != "" && $3 != "run-bin" { print $1 }' | sort -u)
+    for n in $names; do
+      selected "$n" || continue
+      [ "$(plan_star_mode "$n")" != skip ] || continue
+      run_binary "$n" "<$n test binary>"
+    done
+  fi
+  for n in $run_bin_names; do
     selected "$n" || continue
-    [ "$(plan_star_mode "$n")" != skip ] || continue
-    run_binary "$n" "<$n test binary>"
+    echo "build: cargo build --release --features cuda --bin $n --message-format=json"
+    read -r -a ra <<< "$(run_bin_args "$n")"
+    listed=0
+    target_args=()
+    run_one "$n" "san-$n" "" "<$n release binary>" "${ra[@]}"
   done
-  echo "every other test binary: $(san_cmd "" "<binary>")"
+  [ "$only_run_bins" -eq 1 ] || echo "every other test binary: $(san_cmd "" "<binary>")"
   exit 0
 fi
 
-build_log_tag=san-build
-"$RC_RUN" build "$wt" "$id" "$build_log_tag" --cuda -- \
-  cargo test --release --features cuda --no-run --message-format=json > /dev/null
-brc=$?
-build_log=$(log_path "$id" "$build_log_tag")
-if [ "$brc" -ne 0 ]; then
-  echo "sanitize-all: build failed (rc=$brc); see $build_log" >&2
-  exit 1
+if [ "$only_run_bins" -eq 0 ]; then
+  build_log_tag=san-build
+  "$RC_RUN" build "$wt" "$id" "$build_log_tag" --cuda -- \
+    cargo test --release --features cuda --no-run --message-format=json > /dev/null
+  brc=$?
+  build_log=$(log_path "$id" "$build_log_tag")
+  if [ "$brc" -ne 0 ]; then
+    echo "sanitize-all: build failed (rc=$brc); see $build_log" >&2
+    exit 1
+  fi
+
+  bins=$(grep -a '^{' "$build_log" | jq -r '
+    select(.reason == "compiler-artifact" and .profile.test == true and .executable != null)
+    | (if (.target.kind | index("lib")) then "lib"
+       elif (.target.kind | index("bin")) then "bin-" + .target.name
+       elif (.target.kind | index("test")) then .target.name
+       else empty end) + "\t" + .executable' 2>/dev/null | sort -u)
+  [ -n "$bins" ] || { echo "sanitize-all: no test executables in $build_log" >&2; exit 1; }
+
+  for o in ${only[@]+"${only[@]}"}; do
+    is_run_bin "$o" && continue
+    if ! printf '%s\n' "$bins" | cut -f1 | grep -qx -- "$o"; then
+      case "$(plan_star_mode "$o")" in skip) continue ;; esac
+      emit "$o missing | no test executable with this name"
+      fails=$((fails + 1))
+    fi
+  done
+
+  while IFS=$'\t' read -r name bin; do
+    [ -n "$name" ] && selected "$name" || continue
+    run_binary "$name" "$bin"
+  done <<< "$bins"
 fi
 
-bins=$(grep -a '^{' "$build_log" | jq -r '
-  select(.reason == "compiler-artifact" and .profile.test == true and .executable != null)
-  | (if (.target.kind | index("lib")) then "lib"
-     elif (.target.kind | index("bin")) then "bin-" + .target.name
-     elif (.target.kind | index("test")) then .target.name
-     else empty end) + "\t" + .executable' 2>/dev/null | sort -u)
-[ -n "$bins" ] || { echo "sanitize-all: no test executables in $build_log" >&2; exit 1; }
-
-for o in ${only[@]+"${only[@]}"}; do
-  if ! printf '%s\n' "$bins" | cut -f1 | grep -qx -- "$o"; then
-    case "$(plan_star_mode "$o")" in skip) continue ;; esac
-    emit "$o missing | no test executable with this name"
+# run-bin lines: the release binary itself runs under memcheck with the planned arguments
+for n in $run_bin_names; do
+  selected "$n" || continue
+  bt=san-build-$n
+  "$RC_RUN" build "$wt" "$id" "$bt" --cuda -- \
+    cargo build --release --features cuda --bin "$n" --message-format=json > /dev/null
+  brc=$?
+  if [ "$brc" -ne 0 ]; then
+    emit "$n build failed | rc=$brc | see $(log_path "$id" "$bt")"
     fails=$((fails + 1))
+    continue
   fi
+  exe=$(grep -a '^{' "$(log_path "$id" "$bt")" | jq -r --arg n "$n" '
+    select(.reason == "compiler-artifact" and .profile.test == false and (.target.kind | index("bin")) and .target.name == $n and .executable != null)
+    | .executable' 2>/dev/null | sort -u)
+  if [ "$(printf '%s' "$exe" | grep -c .)" -ne 1 ]; then
+    emit "$n missing | expected one release executable, found: $(printf '%s' "$exe" | tr '\n' ' ')"
+    fails=$((fails + 1))
+    continue
+  fi
+  read -r -a ra <<< "$(run_bin_args "$n")"
+  listed=0
+  target_args=()
+  run_one "$n" "san-$n" "" "$exe" "${ra[@]}"
 done
-
-while IFS=$'\t' read -r name bin; do
-  [ -n "$name" ] && selected "$name" || continue
-  run_binary "$name" "$bin"
-done <<< "$bins"
 
 emit "no-cuda binaries: $n_nocuda"
 emit "unexpected no-cuda: $n_unexpected"
