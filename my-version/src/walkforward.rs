@@ -495,9 +495,8 @@ pub struct DevicePnlCheck {
     /// Device totals are bit-identical to the canonical CPU reduction on the
     /// same inputs, counts included: a kernel fault check.
     pub bit_equal: bool,
-    /// Device integer counts equal the scalar book's; `None` under
-    /// `--policy band`, whose scalar book is not the threshold book.
-    pub counts_equal: Option<bool>,
+    /// Device integer counts equal the scalar book's.
+    pub counts_equal: bool,
     /// Rows whose position changes when the score is narrowed to f32.
     pub f32_flip_rows: u64,
 }
@@ -957,6 +956,9 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
                 flag
             ));
         }
+    }
+    if spec.policy == Policy::Band && spec.device_pnl {
+        return Err("--device-pnl is not supported with --policy band: the device arm prices the threshold book".to_string());
     }
     let table_validation = !opts.validation_starts.is_empty()
         && spec.windows.iter().all(|w| opts.validation_starts.iter().any(|(l, _)| *l == w.label));
@@ -1668,7 +1670,7 @@ impl Accum {
                     count += 1;
                     max_abs_net_delta = max_abs_net_delta.max(d.net_delta.abs());
                     bit_mismatch_windows += usize::from(!d.bit_equal);
-                    count_mismatch_windows += usize::from(d.counts_equal == Some(false));
+                    count_mismatch_windows += usize::from(!d.counts_equal);
                     f32_flip_rows += d.f32_flip_rows;
                 }
             }
@@ -2459,7 +2461,7 @@ fn evaluate_window(
             .unwrap_or_else(|e| panic!("canonical P&L reduction failed: {}", e));
         let report = report.unwrap_or_else(|| canonical.clone());
         let bit_equal = report.strategy.identical(&canonical.strategy);
-        let counts_equal = band_scan.is_none().then(|| {
+        let counts_equal = {
             let s = &report.strategy;
             s.rows == stats.rows as u64
                 && s.long_rows == stats.active as u64
@@ -2468,7 +2470,7 @@ fn evaluate_window(
                 && s.hits == stats.hits as u64
                 && s.final_exits == stats.exits as u64
                 && s.exits == (stats.rule_exits + stats.exits) as u64
-        });
+        };
         let cpu_net = net.iter().sum::<f64>();
         Some(DevicePnlCheck {
             host_s,
@@ -2869,7 +2871,7 @@ fn device_pnl_json(d: &DevicePnlCheck) -> String {
         jnum(d.cpu_net),
         jnum(d.net_delta),
         d.bit_equal,
-        d.counts_equal.map_or("null".to_string(), |b| b.to_string()),
+        d.counts_equal,
         d.f32_flip_rows
     )
 }

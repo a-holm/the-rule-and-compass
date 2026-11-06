@@ -680,6 +680,47 @@ fn the_cli_exits_2_on_overlapping_returns() {
     assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
 }
 
+#[test]
+fn device_pnl_is_refused_with_policy_band() {
+    let scratch = Scratch::new("wf-band-device");
+    let dir = scratch.path().to_path_buf();
+    let data = dir.join("d.csv");
+    let mut csv = String::from("ts,x,target\n");
+    for i in 0..8 {
+        csv.push_str(&format!("{},{},0.001\n", 3600 * i, i));
+    }
+    std::fs::write(&data, csv).unwrap();
+    let run = |extra: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+            .args([
+                "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x",
+                "--time", "ts", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365",
+                "--window", "w,0,7200,14400,28800", "--json", "--policy", "band",
+            ])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    for band in ["0", "0.001"] {
+        let bad = run(&["--band", band, "--device-pnl"]);
+        let stderr = String::from_utf8_lossy(&bad.stderr);
+        assert_eq!(bad.status.code(), Some(2), "--band {band}: {stderr}");
+        assert!(
+            stderr.contains("--device-pnl is not supported with --policy band: the device arm prices the threshold book"),
+            "--band {band}: {stderr}"
+        );
+    }
+    let ok = run(&["--band", "0.001"]);
+    assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
+
+    let t = single(&[(0.0, 1.0, 0.001), (3600.0, 2.0, 0.001)]);
+    let mut s = spec("x", vec![window("w", 0.0, 1.0, 1.0, 2.0)]);
+    s.policy = walkforward::Policy::Band;
+    s.device_pnl = true;
+    let e = walkforward::run_table(&t, &s, "t").err().expect("band with device_pnl is refused");
+    assert!(e.contains("--device-pnl is not supported with --policy band"), "{e}");
+}
+
 mod front {
     use rcsr::devlog::Json;
     use std::path::PathBuf;

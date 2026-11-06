@@ -158,6 +158,7 @@ The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA
   long for `K` consecutive rows, counting the entry row. `β = 0` with
   `--min-hold 1` reproduces the threshold rule **bit for bit**. The band is a
   deterministic `{0,+1}` finite-state automaton; it never opens a short.
+* `--policy band` refuses `--device-pnl` (#810): the device arm prices the threshold book, so its delta against the band book would measure the band rule, not the kernel. The error is a usage error (exit 2) raised before any data work.
 * `--policy dp` keeps the reported book on the threshold rule and adds the
   exact hindsight-optimal DP as a diagnostic `hindsight_bound`. The DP is the
   best path with hindsight, so it always flatters the strategy and is **never**
