@@ -899,6 +899,7 @@ SEARCH:
   --no-gpu                   force CPU evaluation (alias --cpu); also the
                              reproducibility escape hatch for a byte-identical
                              CPU trajectory
+                             (makes no CUDA call: the device is not probed)
   --qd                       record an opt-in quality-diversity archive over
                              (variable usage x prediction skewness), passive;
                              it never changes parents or the Pareto front.
@@ -3897,7 +3898,11 @@ fn main() {
     }
     cfg.dispatch = dispatch_mode;
 
-    let gpu_probe = backend::probe();
+    let gpu_probe = if gpu_explicit == Some(false) {
+        backend::Probe::cpu("--cpu/--no-gpu (device not probed)")
+    } else {
+        backend::probe()
+    };
     match gpu_explicit {
         Some(true) => {
             if !gpu_probe.available() {
