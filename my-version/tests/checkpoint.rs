@@ -1321,3 +1321,28 @@ fn a_kill_during_an_interim_chunk_resumes_to_the_uninterrupted_report() {
     };
     assert_eq!(front(&killed), front(&whole));
 }
+
+/// #855: the same chain on the device, node path and flat path alike: the
+/// last chunk after interim chunks equals the last chunk after plain chunks.
+#[cfg(feature = "cuda")]
+#[test]
+fn interim_chunks_keep_the_final_hash_on_the_device() {
+    if !rcsr::backend::probe().available() {
+        eprintln!("no usable GPU; skipping the device interim chain");
+        return;
+    }
+    let train = sample(240);
+    let test = sample(80);
+    let mut base = Config {
+        generations: 6,
+        metric: rcsr::metrics::Metric::Squared,
+        ..config(17)
+    };
+    base.gpu = true;
+    base.dispatch = rcsr::dispatch::DispatchMode::Device;
+    let (plain, plain_text) = chunked(&base, false, 2, &train, &test);
+    let (interim, interim_text) = chunked(&base, true, 2, &train, &test);
+    assert_eq!(interim.backend, rcsr::backend::Kind::Gpu);
+    assert_same_report(&plain, &interim, "device interim against plain chunks");
+    assert_eq!(plain_text, interim_text, "device exit checkpoint bytes");
+}
