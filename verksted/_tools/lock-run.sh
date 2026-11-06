@@ -5,6 +5,9 @@
 # <lockfile> is the path the lock script locks (rc-run.sh passes its LOCKFILE). This process must itself own an flock on that
 # file through an fd it inherited; an flock on any other file (the build slot, another lock file) does not count. When it
 # owns none, nothing is signalled and the command runs as usual.
+# It also acts only when it is the sole holder at start: every process that holds the flock after the command ended was then
+# started by the command. A lock hold that an outer process shares with others (a test run under the lock that itself calls
+# rc-run.sh) is never reaped.
 # A holder is a process with an fd whose fdinfo shows that same flock. The kernel prints a lock only on the open file
 # description that owns it, so every holder shares the description lock-run.sh inherited: it was inherited from this
 # hold. A process that only has the lock file open (a waiter, or a holder of another lock file) shows no flock and is
@@ -73,6 +76,11 @@ if [ -z "$lockfd" ]; then
   exec "$@"
 fi
 
+shared=$(holders)
+if [ -n "$shared" ]; then
+  echo "lock-run: other processes already share this flock ($(echo $shared)); the hold is not this process alone, nothing will be signalled" >&2
+  exec "$@"
+fi
 setsid "$@" <&0 &
 pgid=$!
 wait "$pgid"

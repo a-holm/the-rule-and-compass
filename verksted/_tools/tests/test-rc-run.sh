@@ -220,6 +220,27 @@ has guard-no-flock-logged "$log" '^lock-run: no flock held by this process; noth
 hasnt guard-no-flock-no-signal "$log" 'ended pids'
 kill -KILL "$other" $(cat "$T/pid-same-session" "$T/pid-other-session") 2> /dev/null
 
+# nested: the caller already shares the flock on the lock file with a sibling (a test that runs under the lock and calls
+# rc-run.sh with a stub lock script). lock-run is not the sole holder at start: nothing is signalled, the caller and its sibling live
+cat > "$T/nested.sh" <<'STUB'
+#!/usr/bin/env bash
+exec 9> "$T/oc/full-suite.lock"
+flock -n 9 || exit 1
+tail -f /dev/null > /dev/null 2>&1 &
+echo $! > "$T/pid-sibling"
+rc=0
+FAKE_DIR=$T "$@" > /dev/null 2>&1 || rc=$?
+echo "$rc" > "$T/nested-rc"
+STUB
+export T
+printf '#!/usr/bin/env bash\nexec "$@"\n' > "$T/lock.sh"
+rc bash "$T/nested.sh" bash "$RC" run "$T/wt" 9 t --cuda -- leave-children
+check nested-rc "$(cat "$T/nested-rc" 2> /dev/null)" "3"
+check nested-sibling-kept "$(alive "$(cat "$T/pid-sibling")" && echo alive || echo gone)" "alive"
+check nested-child-kept "$(alive "$(cat "$T/pid-same-session")" && echo alive || echo gone)" "alive"
+has nested-logged "$log" '^lock-run: other processes already share this flock '
+kill -KILL "$(cat "$T/pid-sibling")" $(cat "$T/pid-same-session" "$T/pid-other-session") 2> /dev/null
+
 # -h prints the header
 check help-rc "$(bash "$RC" -h > "$T/h"; echo $?)" "0"
 has help-usage "$T/h" '^Usage: rc-run.sh build\|test\|run\|cpu'
