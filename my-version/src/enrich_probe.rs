@@ -9,6 +9,7 @@ use crate::enrich::{
     self, EnrichCalibration, EnrichRates, GpuMode, OpClass, Options, OP_CLASSES,
     GPU_D2H_BYTES_PER_SECOND, GPU_TRANSFER_BYTES_PER_SECOND,
 };
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 /// Symbols and bars per symbol of the probe store: the shape of the 1M-row,
@@ -27,6 +28,25 @@ const PROBE_BENCHMARK: &str = "S000";
 enum Stage {
     Feature,
     CrossSection,
+}
+
+/// Device runs of each large column set, each against the one small run of its
+/// class: the class rate is the median over the repeats and its spread is
+/// their largest over their smallest.
+const DEVICE_REPEATS: usize = 2;
+
+/// Extra cells of the large column set over the small one, and what the
+/// device runs of those cells cost beyond the small set.
+struct Slope {
+    idx: usize,
+    d_cells: f64,
+    d_secs: f64,
+    d_write: f64,
+}
+
+fn median(mut v: Vec<f64>) -> Option<f64> {
+    v.sort_by(|a, b| a.total_cmp(b));
+    v.get(v.len() / 2).copied()
 }
 
 struct Plan {
@@ -139,6 +159,13 @@ fn probe_csv() -> String {
     text
 }
 
+/// One timed run: the seconds of its stage and the seconds the run spent
+/// writing output values.
+struct Sample {
+    stage_s: f64,
+    write_s: f64,
+}
+
 struct Runner {
     store: String,
     out: String,
@@ -147,6 +174,11 @@ struct Runner {
 impl Runner {
     /// Stage seconds of one dry run with `features` on `gpu`.
     fn run(&self, features: &str, gpu: GpuMode, stage: Stage) -> Result<f64, String> {
+        Ok(self.sample(features, gpu, stage)?.stage_s)
+    }
+
+    /// Stage seconds and output write seconds of one dry run.
+    fn sample(&self, features: &str, gpu: GpuMode, stage: Stage) -> Result<Sample, String> {
         let opts = Options {
             data: self.store.clone(),
             out: Some(self.out.clone()),
@@ -165,9 +197,12 @@ impl Runner {
                 features, report.gpu_fallback
             ));
         }
-        Ok(match stage {
-            Stage::Feature => report.feature_seconds,
-            Stage::CrossSection => report.xs_seconds,
+        Ok(Sample {
+            stage_s: match stage {
+                Stage::Feature => report.feature_seconds,
+                Stage::CrossSection => report.xs_seconds,
+            },
+            write_s: report.gpu_write_seconds,
         })
     }
 }
@@ -201,6 +236,54 @@ impl Runner {
     }
 }
 
+/// Device terms fitted from the paired runs.
+struct DeviceFit {
+    /// Output write bandwidth the runs reported; `None` when no run wrote.
+    write_bps: Option<f64>,
+    /// Class index, kernel rate (median over the repeats) and spread (largest
+    /// over smallest repeat).
+    classes: Vec<(usize, f64, f64)>,
+}
+
+/// The write term is the output write the same device runs report, seconds per
+/// cell, so a busy disk at probe time does not move the plans. A class's kernel
+/// rate is what its extra cells cost after the bus and the write. A class whose
+/// runs report their write subtracts that figure, so the write noise of a run
+/// cancels in its own kernel term. The rate is limited to `RATE_CLAMP` times
+/// the anchor: a kernel hidden behind the transfers is not resolved by timing.
+fn fit_device(slopes: &[Slope]) -> DeviceFit {
+    let anchors = EnrichRates::anchors();
+    let per_cell_bus = 8.0 * (1.0 / GPU_TRANSFER_BYTES_PER_SECOND + 1.0 / GPU_D2H_BYTES_PER_SECOND);
+    let written: Vec<f64> = slopes
+        .iter()
+        .filter(|s| s.d_write > 0.0)
+        .map(|s| 8.0 * s.d_cells / s.d_write)
+        .collect();
+    let write_bps = median(written);
+    let per_cell_write = write_bps.map_or(0.0, |w| 8.0 / w);
+    let mut per_class: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
+    for s in slopes {
+        let write_s = if s.d_write > 0.0 { s.d_write } else { s.d_cells * per_cell_write };
+        let kernel_s = s.d_secs - write_s - s.d_cells * per_cell_bus;
+        let anchor = anchors.classes[s.idx].gpu_cells_per_s;
+        per_class
+            .entry(s.idx)
+            .or_default()
+            .push(s.d_cells / kernel_s.max(s.d_cells / (enrich::RATE_CLAMP * anchor)));
+    }
+    let classes = per_class
+        .into_iter()
+        .map(|(idx, samples)| {
+            let (lo, hi) = samples
+                .iter()
+                .fold((f64::INFINITY, 0.0f64), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+            let rate = median(samples).unwrap_or(anchors.classes[idx].gpu_cells_per_s);
+            (idx, rate, hi / lo)
+        })
+        .collect();
+    DeviceFit { write_bps, classes }
+}
+
 /// Measure the enrich planner rates on this machine. With `device` false only
 /// the host terms are timed and the device terms keep their anchors.
 pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
@@ -220,8 +303,7 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
 
     let anchors = EnrichRates::anchors();
     let mut rates = anchors;
-    // (class index, extra cells, device seconds for those cells)
-    let mut slopes: Vec<(usize, f64, f64)> = Vec::new();
+    let mut slopes: Vec<Slope> = Vec::new();
     let mrow = rows as f64 / 1_000_000.0;
     let mut spread_classes = [1.0; OP_CLASSES];
     let mut context_ms_per_mrow = None;
@@ -239,41 +321,32 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
             rate.cpu_fixed_ms = (cpu_small * 1000.0 / mrow - col_ms * n1 as f64).max(0.0);
         }
         if device {
-            let gpu_small = runner.run(plan.small, GpuMode::On, plan.stage)?;
-            let gpu_large = runner.run(plan.large, GpuMode::On, plan.stage)?;
             let d_cells = rows as f64 * (n2 - n1) as f64;
-            slopes.push((plan.op.index(), d_cells, gpu_large - gpu_small));
+            let small = runner.sample(plan.small, GpuMode::On, plan.stage)?;
+            for _ in 0..DEVICE_REPEATS {
+                let large = runner.sample(plan.large, GpuMode::On, plan.stage)?;
+                slopes.push(Slope {
+                    idx: plan.op.index(),
+                    d_cells,
+                    d_secs: large.stage_s - small.stage_s,
+                    d_write: large.write_s - small.write_s,
+                });
+            }
             if plan.op == OpClass::Elementwise && matches!(plan.stage, Stage::Feature) {
                 let context_s = runner.fresh_context(plan.small)?;
                 context_ms_per_mrow = Some((context_s * 1000.0 / mrow).max(1.0));
             }
         }
         rates.classes[plan.op.index()] = rate;
-        spread_classes[plan.op.index()] = 1.0;
     }
-    // The write term is what a run pays per output cell beyond the bus and the
-    // kernel, fitted from the same runs that set the device rates, so a busy
-    // disk at probe time does not move the plans. Without a device the
-    // filesystem figure stands.
-    let per_cell_bus = 8.0 * (1.0 / GPU_TRANSFER_BYTES_PER_SECOND + 1.0 / GPU_D2H_BYTES_PER_SECOND);
-    let mut implied: Vec<f64> = slopes
-        .iter()
-        .filter_map(|(idx, cells, secs)| {
-            let left = secs / cells - per_cell_bus - 1.0 / anchors.classes[*idx].gpu_cells_per_s;
-            (left > 0.0).then(|| 8.0 / left)
-        })
-        .collect();
-    implied.sort_by(|a, b| a.total_cmp(b));
-    rates.write_bps = match implied.get(implied.len() / 2) {
-        Some(w) => *w,
+    let fit = fit_device(&slopes);
+    rates.write_bps = match fit.write_bps {
+        Some(w) => w,
         None => enrich::measure_write_bandwidth(&dir.0, 128 * 1024 * 1024)?,
     };
-    let per_cell_transfer = per_cell_bus + 8.0 / rates.write_bps;
-    for (idx, cells, secs) in &slopes {
-        let kernel_s = secs - cells * per_cell_transfer;
-        let anchor = anchors.classes[*idx].gpu_cells_per_s;
-        rates.classes[*idx].gpu_cells_per_s =
-            cells / kernel_s.max(cells / (enrich::RATE_CLAMP * anchor));
+    for (idx, rate, spread) in fit.classes {
+        rates.classes[idx].gpu_cells_per_s = rate;
+        spread_classes[idx] = spread;
     }
     if let Some(ctx) = context_ms_per_mrow {
         rates.context_ms_per_mrow = ctx;
@@ -290,6 +363,43 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn slope(idx: usize, d_secs: f64, d_write: f64) -> Slope {
+        Slope { idx, d_cells: 4.0e6, d_secs, d_write }
+    }
+
+    #[test]
+    fn the_write_noise_of_a_run_cancels_in_its_kernel_rate() {
+        let rank = OpClass::Rank.index();
+        let kernel = 0.05;
+        let bus = 4.0e6 * 8.0 * (1.0 / GPU_TRANSFER_BYTES_PER_SECOND + 1.0 / GPU_D2H_BYTES_PER_SECOND);
+        // Two repeats whose writes differ by 15% but whose kernel time is equal.
+        let a = slope(OpClass::CompactPass.index(), kernel + bus + 0.20, 0.20);
+        let b = slope(OpClass::CompactPass.index(), kernel + bus + 0.23, 0.23);
+        let fit = fit_device(&[a, b, slope(rank, 0.4, 0.0)]);
+        let (_, rate, spread) = *fit.classes.iter().find(|c| c.0 == OpClass::CompactPass.index()).unwrap();
+        assert!((rate - 4.0e6 / kernel).abs() < 1.0, "{rate}");
+        assert!((spread - 1.0).abs() < 1e-9, "{spread}");
+        let w = fit.write_bps.unwrap();
+        assert!(w > 1.5e8 && w < 2.0e8, "{w}");
+    }
+
+    #[test]
+    fn a_hidden_kernel_gives_the_clamped_rate_and_no_write_means_no_fit() {
+        let ew = OpClass::Elementwise.index();
+        let anchor = EnrichRates::anchors().classes[ew].gpu_cells_per_s;
+        let fit = fit_device(&[slope(ew, 0.0, 0.0)]);
+        assert_eq!(fit.write_bps, None);
+        assert_eq!(fit.classes[0].1, enrich::RATE_CLAMP * anchor);
+    }
+
+    #[test]
+    fn the_spread_is_the_largest_repeat_over_the_smallest() {
+        let idx = OpClass::Mtf.index();
+        let bus = 4.0e6 * 8.0 * (1.0 / GPU_TRANSFER_BYTES_PER_SECOND + 1.0 / GPU_D2H_BYTES_PER_SECOND);
+        let fit = fit_device(&[slope(idx, bus + 0.1 + 0.1, 0.1), slope(idx, bus + 0.15 + 0.1, 0.1)]);
+        assert!((fit.classes[0].2 - 1.5).abs() < 1e-9, "{:?}", fit.classes);
+    }
 
     #[test]
     fn probe_sets_have_the_declared_column_counts_and_classes() {

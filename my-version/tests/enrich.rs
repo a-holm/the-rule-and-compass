@@ -4065,3 +4065,79 @@ fn device_context_is_paid_once_across_families() {
     let alone = plan_alone("lags", 20, OpClass::Elementwise);
     assert_eq!(alone.gpu_ms.to_bits(), together[0].gpu_ms.to_bits());
 }
+
+fn load_one_minute() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|t| t.split_whitespace().next().map(str::to_string))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+/// Measurement harness: `RCSR_SPREAD_DIR` names a directory, `RCSR_SPREAD_RUNS`
+/// the number of `rcsr calibrate` runs (default 4). Each run writes
+/// `cal-<n>.json` and appends `file wall_s load_at_start` to `runs.tsv`.
+/// Ignored: it needs the device and takes about a minute per run.
+#[test]
+#[ignore]
+fn calibrate_spread_runs() {
+    let dir = std::path::PathBuf::from(std::env::var("RCSR_SPREAD_DIR").expect("set RCSR_SPREAD_DIR"));
+    let runs: usize = std::env::var("RCSR_SPREAD_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    std::fs::create_dir_all(&dir).unwrap();
+    let have = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("cal-"))
+        .count();
+    for n in have..have + runs {
+        let file = dir.join(format!("cal-{n:02}.json"));
+        let load = load_one_minute();
+        let started = std::time::Instant::now();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+            .args(["calibrate", "--out"])
+            .arg(&file)
+            .output()
+            .unwrap();
+        let wall = started.elapsed().as_secs_f64();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        let mut tsv = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("runs.tsv")).unwrap();
+        use std::io::Write;
+        writeln!(tsv, "{}\t{wall:.2}\t{load}", file.display()).unwrap();
+        eprintln!("{} wall={wall:.2}s load={load}", file.display());
+    }
+}
+
+/// Prints min, median, max and max/min of every enrich rate over the
+/// `cal-*.json` files in `RCSR_SPREAD_DIR`.
+#[test]
+#[ignore]
+fn calibrate_spread_report() {
+    let dir = std::path::PathBuf::from(std::env::var("RCSR_SPREAD_DIR").expect("set RCSR_SPREAD_DIR"));
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("cal-") && p.extension().map_or(false, |x| x == "json"))
+        .collect();
+    files.sort();
+    let mut fields: std::collections::BTreeMap<String, Vec<f64>> = std::collections::BTreeMap::new();
+    for f in &files {
+        let source = rcsr::dispatch::CalibrationRequest::File(f.clone()).resolve(None).unwrap();
+        let raw = rcsr::dispatch::Calibration::pinned(&source).enrich.expect("enrich object").rates;
+        let mut put = |name: String, v: f64| fields.entry(name).or_default().push(v);
+        put("context_ms_per_mrow".into(), raw.context_ms_per_mrow);
+        put("fixed_overhead_ms".into(), raw.fixed_overhead_ms);
+        put("write_bps".into(), raw.write_bps);
+        for op in OpClass::ALL {
+            let c = raw.class(op);
+            put(format!("{}.cpu_fixed_ms", op.name()), c.cpu_fixed_ms);
+            put(format!("{}.cpu_col_ms", op.name()), c.cpu_col_ms);
+            put(format!("{}.gpu_cells_per_s", op.name()), c.gpu_cells_per_s);
+        }
+    }
+    eprintln!("# files={}", files.len());
+    eprintln!("field\tmin\tmedian\tmax\tmax/min");
+    for (name, mut v) in fields {
+        v.sort_by(|a, b| a.total_cmp(b));
+        let (min, max, med) = (v[0], v[v.len() - 1], v[v.len() / 2]);
+        let ratio = if min > 0.0 { max / min } else { f64::INFINITY };
+        eprintln!("{name}\t{min:.6e}\t{med:.6e}\t{max:.6e}\t{ratio:.3}");
+    }
+}
