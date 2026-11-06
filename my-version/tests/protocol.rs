@@ -581,6 +581,8 @@ fn the_search_refuses_a_ledger_with_a_cut_last_line_before_it_starts() {
     assert_eq!(code, 3, "{err}");
     assert!(err.contains("a write was cut"), "{err}");
     assert_eq!(std::fs::read_to_string(&ledger).unwrap(), l1);
+}
+
 fn tmp_of(p: &Path) -> PathBuf {
     PathBuf::from(format!("{}.tmp", p.display()))
 }

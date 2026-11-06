@@ -591,6 +591,8 @@ fn every_reader_refuses_a_ledger_with_a_cut_last_line() {
     assert_eq!(std::fs::read_to_string(&l).unwrap(), text, "no run changed the ledger");
     assert!(!Path::new(&format!("{}.locked_reads.jsonl", data)).exists());
     drop(dir);
+}
+
 fn recorded_read_sha(ledger: &str) -> String {
     let text = std::fs::read_to_string(ledger).unwrap();
     let line = text.lines().find(|l| l.contains("\"event\":\"test_read\"")).expect("test_read line");
