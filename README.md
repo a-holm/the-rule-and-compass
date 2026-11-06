@@ -1322,7 +1322,7 @@ A binary built with `--features cuda` probes the device once at startup and uses
 the GPU to guide the search whenever one is available **and the run's metric is
 scored on the device**; a build without the feature, or a machine with no usable
 device, falls back to the CPU and records the reason. `--gpu` asserts that a
-device must exist (exit 2 otherwise), `--no-gpu`/`--cpu` forces the CPU, and
+device must exist (exit 2 otherwise), `--no-gpu`/`--cpu` forces the CPU without probing the device (no CUDA call), and
 `RCSR_GPU=0` simulates a missing device. `--dispatch device` (needs `--gpu`) forces the device route past the cost model; refusals still win. `--calibration anchors|probe|<path>` selects the rates Auto dispatch prices with (default: `$XDG_CACHE_HOME/rcsr/calibration.json` if it exists, else the fixed corpus anchors); `rcsr calibrate` writes that file and a search run never does. Non-quiet runs print one resource line
 with the backend, device, available threads and training rows/columns, and
 `--json` records `backend`, `backend_reason` and `device`.
