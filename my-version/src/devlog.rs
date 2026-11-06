@@ -1379,7 +1379,7 @@ mod tests {
     /// terminal events always land.
     #[test]
     fn the_byte_cap_bounds_generation_events_but_never_the_end() {
-        let dir = std::env::temp_dir().join(format!("rcsr-devlog-cap-{}", std::process::id()));
+        let dir = crate::test_scratch::Scratch::new("devlog-cap");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cap.ndjson");
         // Room for the start event plus one full generation event (a
@@ -1407,14 +1407,13 @@ mod tests {
         for l in &lines {
             assert!(Json::parse(l).is_some(), "line is not JSON: {}", l);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A killed run leaves a valid prefix: truncating the file mid-line still
     /// leaves every earlier line parseable.
     #[test]
     fn a_truncated_log_keeps_a_valid_prefix() {
-        let dir = std::env::temp_dir().join(format!("rcsr-devlog-kill-{}", std::process::id()));
+        let dir = crate::test_scratch::Scratch::new("devlog-kill");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("kill.ndjson");
         let mut log = Log::create(&path, 0).unwrap();
@@ -1437,14 +1436,13 @@ mod tests {
         }
         assert_eq!(good, 3, "run_start plus two complete generations survive");
         assert_eq!(bad, 1, "only the torn last line is unreadable");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #211: the log grows by exactly one line plus a newline per event, and
     /// the summary record is smaller than the full one.
     #[test]
     fn dev_log_bytes_grow_by_exactly_the_event_lines() {
-        let dir = std::env::temp_dir().join(format!("rcsr-devlog-bytes-{}", std::process::id()));
+        let dir = crate::test_scratch::Scratch::new("devlog-bytes");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bytes.ndjson");
         let mut log = Log::create(&path, 0).unwrap();
@@ -1467,14 +1465,13 @@ mod tests {
         assert!(summary_len < full_len, "the summary record must be smaller than the full one");
         assert!(log.bytes() > 0);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), log.bytes());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #211: per-event cost of rendering and appending; run with `--ignored`.
     #[test]
     #[ignore = "timing measurement"]
     fn measure_dev_log_event_cost() {
-        let dir = std::env::temp_dir().join(format!("rcsr-devlog-cost-{}", std::process::id()));
+        let dir = crate::test_scratch::Scratch::new("devlog-cost");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cost.ndjson");
         let mut log = Log::create(&path, 0).unwrap();
@@ -1499,7 +1496,6 @@ mod tests {
             "# dev-log cost: summary {:.2} us/event ({} bytes), full {:.2} us/event ({} bytes)",
             summary_us, summary_bytes, per_event_us, full_bytes
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

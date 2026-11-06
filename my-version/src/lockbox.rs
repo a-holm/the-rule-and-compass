@@ -1238,11 +1238,8 @@ mod tests {
         assert!(!plausible_epoch_seconds(2_000.0, 2_026.0));
     }
 
-    fn resolve_dir(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("rcsr-lockbox-resolve-{}-{}", std::process::id(), name));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn resolve_dir(name: &str) -> crate::test_scratch::Scratch {
+        crate::test_scratch::Scratch::new(&format!("lockbox-resolve-{name}"))
     }
 
     fn declare(data: &str, ext: &str, lb: &Lockbox) {

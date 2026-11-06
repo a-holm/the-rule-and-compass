@@ -1789,18 +1789,10 @@ mod tests {
         assert!(decision.cost.predicted_s > 0.0);
     }
 
-    fn temp_file(name: &str) -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "rcsr-calibration-{}-{}-{}",
-            std::process::id(),
-            name,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        p
+    fn temp_file(name: &str) -> (crate::test_scratch::Scratch, std::path::PathBuf) {
+        let scratch = crate::test_scratch::Scratch::new("calibration");
+        let path = scratch.join(name);
+        (scratch, path)
     }
 
     fn sample_calibration() -> Calibration {
@@ -1840,7 +1832,7 @@ mod tests {
     #[test]
     fn a_written_then_read_file_round_trips_bit_for_bit() {
         let want = sample_calibration();
-        let path = temp_file("roundtrip");
+        let (_scratch, path) = temp_file("roundtrip");
         let text = want.file_text(Some("Test GPU"), "0.1.0 abc", "2026-11-05T10:00:00Z");
         std::fs::write(&path, &text).unwrap();
         let source = CalibrationRequest::File(path.clone())
@@ -1893,7 +1885,7 @@ mod tests {
             ("missing", good.replace("\"bw\":", "\"bwx\":"), "missing 'bw'"),
         ];
         for (name, text, expect) in cases {
-            let path = temp_file(name);
+            let (_scratch, path) = temp_file(name);
             std::fs::write(&path, &text).unwrap();
             let err = CalibrationRequest::File(path.clone())
                 .resolve(Some("Test GPU"))
@@ -1902,14 +1894,14 @@ mod tests {
             assert!(err.contains(expect), "{name}: {err}");
             let _ = std::fs::remove_file(&path);
         }
-        let missing = temp_file("absent");
+        let (_scratch, missing) = temp_file("absent");
         let err = CalibrationRequest::File(missing.clone()).resolve(None).unwrap_err();
         assert!(err.contains("cannot read calibration file"), "{err}");
     }
 
     #[test]
     fn a_file_from_another_device_is_refused_naming_both() {
-        let path = temp_file("device");
+        let (_scratch, path) = temp_file("device");
         let text = sample_calibration().file_text(Some("GPU A"), "b", "2026-11-05T10:00:00Z");
         std::fs::write(&path, text).unwrap();
         let err = CalibrationRequest::File(path.clone())
@@ -1922,7 +1914,7 @@ mod tests {
 
     #[test]
     fn a_host_only_file_keeps_the_anchor_device_terms_label() {
-        let path = temp_file("host");
+        let (_scratch, path) = temp_file("host");
         let text = Calibration::default().file_text(None, "b", "2026-11-05T10:00:00Z");
         std::fs::write(&path, text).unwrap();
         let source = CalibrationRequest::File(path.clone()).resolve(Some("Any GPU")).unwrap();

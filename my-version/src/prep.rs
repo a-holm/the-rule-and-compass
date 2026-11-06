@@ -2376,12 +2376,7 @@ mod tests {
 
     #[test]
     fn pass_four_worker_count_is_bounded_by_jobs() {
-        let dir = std::env::temp_dir().join(format!(
-            "rcsr-prep-workers-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_scratch::Scratch::new("prep-workers");
         for s in 0..9 {
             let mut text = String::new();
             for i in 0..8 {
@@ -2408,6 +2403,5 @@ mod tests {
             peak <= 3,
             "pass 4 used {peak} concurrent workers with --jobs 3"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

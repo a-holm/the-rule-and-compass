@@ -899,10 +899,8 @@ mod tests {
 
     #[test]
     fn streaming_file_hash_matches_in_memory_for_chunk_boundaries() {
-        let path = std::env::temp_dir().join(format!(
-            "rcsr-sha256-stream-{}",
-            std::process::id()
-        ));
+        let scratch = crate::test_scratch::Scratch::new("sha256-stream");
+        let path = scratch.join("stream.bin");
         // Around the 64-byte block and 56-byte padding boundaries, and more
         // than one 1 MiB read chunk.
         for len in [0usize, 1, 55, 56, 57, 63, 64, 65, 1_048_575, 1_048_576, 1_048_577] {
@@ -914,14 +912,11 @@ mod tests {
                 "length {len}"
             );
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn sidecar_rejects_changed_file() {
-        let dir = std::env::temp_dir().join(format!("rcsr-sha-sidecar-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_scratch::Scratch::new("sha-sidecar");
         let path = dir.join("d.bin");
         std::fs::write(&path, b"abc").unwrap();
         let abc = sha256_hex(b"abc");
@@ -933,7 +928,6 @@ mod tests {
         let changed = file_stamp(&path).unwrap();
         assert_eq!(read_digest_sidecar(&sidecar, changed), None);
         assert_eq!(sha256_file_cached(&path).unwrap(), sha256_hex(b"abcd"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
