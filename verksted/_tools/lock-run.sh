@@ -1,20 +1,11 @@
 #!/usr/bin/env bash
 # Usage: lock-run.sh <lockfile> <command...>
-# Runs <command> in its own session, waits for it, then ends every process of its tree that still holds the test lock.
-# It runs inside a lock hold: the lock script (one-full-suite.sh) took the flock on an fd that this process inherited.
-# <lockfile> is the path the lock script locks (rc-run.sh passes its LOCKFILE). This process must itself own an flock on that
-# file through an fd it inherited; an flock on any other file (the build slot, another lock file) does not count. When it
-# owns none, nothing is signalled and the command runs as usual.
-# It also acts only when it is the sole holder at start: every process that holds the flock after the command ended was then
-# started by the command. A lock hold that an outer process shares with others (a test run under the lock that itself calls
-# rc-run.sh) is never reaped.
-# A holder is a process with an fd whose fdinfo shows that same flock. The kernel prints a lock only on the open file
-# description that owns it, so every holder shares the description lock-run.sh inherited: it was inherited from this
-# hold. A process that only has the lock file open (a waiter, or a holder of another lock file) shows no flock and is
-# never touched.
-# Order: TERM to the command's process group and to each holder by pid; RCSR_REAP_TERM_WAITS (default 50) counted waits of
-# 0.1 s; KILL to the group and to each holder still left; RCSR_REAP_KILL_WAITS (default 50) counted waits.
-# Never uses pkill or killall.
+# Runs <command> in its own session, then ends the processes it left holding the test lock. Never pkill or killall.
+# Acts only when this process owns the flock on <lockfile> and is its sole holder at start (the lock script exec'd into it);
+# then every holder after the command ended started inside the command. Otherwise it runs the command and signals nothing.
+# A holder shows that same flock in /proc/<pid>/fdinfo, so it shares the open file description this hold took; a waiter or
+# a holder of another file does not. Order: TERM to the command's group and each holder by pid, RCSR_REAP_TERM_WAITS (50)
+# counted waits of 0.1 s, then KILL, RCSR_REAP_KILL_WAITS (50) counted waits.
 # Writes: nothing but messages on stderr.
 # Exit: the command's exit code; 71 when a process still holds the lock after the KILL; 2 usage.
 set -uo pipefail
