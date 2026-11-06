@@ -685,9 +685,10 @@ fn walkforward_verify_read_needs_locked_test() {
 #[test]
 fn walkforward_refuses_outputs_that_name_one_file() {
     let (_scratch, dir, data, l, sealed) = sealed_store("wf-same-file");
+    std::fs::create_dir(dir.join("b")).unwrap();
     let ledger_before = std::fs::read(&l).unwrap();
     let marker = format!("{}.locked_reads.jsonl", data);
-    let (out, md) = (s(&dir.join("a.json")), s(&dir.join(".").join("a.json")));
+    let (out, md) = (s(&dir.join("a.json")), s(&dir.join("b").join("..").join("a.json")));
     let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--out", &out, "--markdown", &md]);
     assert_eq!(code, 3, "{}", err);
     assert!(err.contains("same file"), "{}", err);

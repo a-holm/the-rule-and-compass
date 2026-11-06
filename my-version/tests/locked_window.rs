@@ -1554,3 +1554,25 @@ fn ladder_refuses_out_and_markdown_that_name_one_file() {
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "old");
     }
 }
+
+#[test]
+fn ladder_refuses_a_relative_out_and_its_dot_slash_form() {
+    let f = Sealed::new("lad-same-file-rel");
+    let ledger_before = f.bytes(&f.ledger);
+    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .current_dir(&f.dir)
+        .args([
+            "ladder", "--data", &f.data, "--target", "y", "--time", "ts", "--group", "sym", "--features", "f1,f2",
+            "--windows", &f.windows, "--scheme", "locked", "--purge-seconds", "7200", "--gbm-trees", "10", "--draws",
+            "50", "--max-fit-rows", "600", "--out", "a.json", "--markdown", "./a.json", "--locked-test", "--ledger",
+            &f.ledger, "--sealed", &f.sealed,
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{err}");
+    assert!(err.contains("same file"), "{err}");
+    assert_eq!(f.bytes(&f.ledger), ledger_before);
+    assert!(f.bytes(&f.marker()).is_none());
+    assert!(!f.dir.join("a.json").exists() && !f.dir.join("a.json.tmp").exists());
+}
