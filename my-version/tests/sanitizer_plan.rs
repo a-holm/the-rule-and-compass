@@ -199,7 +199,7 @@ fn pick_follows_the_marker() {
 #[test]
 fn no_cuda_takes_only_a_star_line() {
     assert!(parse("gpu_ring * no-cuda reason\n").is_ok());
-    let err = parse("gpu_ring some_test no-cuda reason\n").unwrap_err();
+    let Err(err) = parse("gpu_ring some_test no-cuda reason\n") else { panic!("accepted") };
     assert!(err.contains("no-cuda needs '*'"), "{err}");
 }
 
