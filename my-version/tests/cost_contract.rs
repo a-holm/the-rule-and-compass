@@ -223,7 +223,7 @@ fn walkforward_from_run_prices_the_selected_book() {
     let run = search(&dir, &data, &spec, &[]);
     let text = std::fs::read_to_string(&run).unwrap();
     let finalist = at(&parse(&text), &["objective", "finalist", "expression"]).as_str().unwrap().to_string();
-    let constant = text
+    let constant = without_exact(&text)
         .replacen(&format!("\"expression\":\"{finalist}\""), "\"expression\":\"0.0226\"", 1)
         .replacen("\"constant\":false", "\"constant\":true", 1);
     assert_ne!(constant, text);
@@ -314,7 +314,7 @@ fn a_log_return_column_is_converted_with_exp_m1_in_every_evaluator() {
     let text = std::fs::read_to_string(&run).unwrap();
     let finalist = at(&parse(&text), &["objective", "finalist", "expression"]).as_str().unwrap().to_string();
     let run = dir.join("x1.json").to_string_lossy().into_owned();
-    std::fs::write(&run, text.replacen(&format!("\"expression\":\"{finalist}\""), "\"expression\":\"x1\"", 1)).unwrap();
+    std::fs::write(&run, without_exact(&text).replacen(&format!("\"expression\":\"{finalist}\""), "\"expression\":\"x1\"", 1)).unwrap();
     let out = rcsr(&[
         "ablation", "score", "--run", &run, "--data", &data, "--target", "y", "--time", "t", "--windows", &windows,
         "--purge-seconds", "900", "--target-spec", &log_spec, "--cost-bps", "0", "--thresholds", "0.5", "--headline-threshold", "0.5",

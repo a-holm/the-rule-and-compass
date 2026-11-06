@@ -1967,14 +1967,20 @@ fn fmt_f(v: f64) -> String {
     }
 }
 
-pub fn to_string_exact(n: &Node, vars: &[String]) -> String {
-    to_string(n, vars)
+/// The display form: constants rounded to 4 decimals, for people.
+pub fn to_string(n: &Node, vars: &[String]) -> String {
+    render(n, vars, &fmt_f)
 }
 
-pub fn to_string(n: &Node, vars: &[String]) -> String {
+/// Every constant as the shortest decimal that parses back to the same bits.
+pub fn to_string_exact(n: &Node, vars: &[String]) -> String {
+    render(n, vars, &|v| format!("{:?}", v))
+}
+
+fn render(n: &Node, vars: &[String], num: &dyn Fn(f64) -> String) -> String {
     use Op::*;
     match n.op {
-        Const => fmt_f(n.val),
+        Const => num(n.val),
         // A block prints by the user's name (or `customN`), with its arguments.
         Custom0 | Custom1 | Custom2 | Custom3 => {
             let name = n
@@ -1982,7 +1988,7 @@ pub fn to_string(n: &Node, vars: &[String]) -> String {
                 .as_ref()
                 .map(|b| b.name.clone())
                 .unwrap_or_else(|| n.op.symbol().to_string());
-            let args: Vec<String> = n.kids.iter().map(|k| to_string(k, vars)).collect();
+            let args: Vec<String> = n.kids.iter().map(|k| render(k, vars, num)).collect();
             format!("{}({})", name, args.join(", "))
         }
         Input => {
@@ -1991,12 +1997,12 @@ pub fn to_string(n: &Node, vars: &[String]) -> String {
                 .cloned()
                 .unwrap_or_else(|| format!("x{}", i))
         }
-        Neg => format!("(-{})", to_string(&n.kids[0], vars)),
+        Neg => format!("(-{})", render(&n.kids[0], vars, num)),
         Op::Agg(kind) => {
             if kind.arity() == 0 {
                 format!("{}()", kind.name())
             } else {
-                format!("{}({})", kind.name(), to_string(&n.kids[0], vars))
+                format!("{}({})", kind.name(), render(&n.kids[0], vars, num))
             }
         }
         Add | Sub | Mul | Div | Pow => {
@@ -2009,22 +2015,22 @@ pub fn to_string(n: &Node, vars: &[String]) -> String {
             };
             format!(
                 "({}{}{})",
-                to_string(&n.kids[0], vars),
+                render(&n.kids[0], vars, num),
                 s,
-                to_string(&n.kids[1], vars)
+                render(&n.kids[1], vars, num)
             )
         }
         If => format!(
             "if({}, {}, {})",
-            to_string(&n.kids[0], vars),
-            to_string(&n.kids[1], vars),
-            to_string(&n.kids[2], vars)
+            render(&n.kids[0], vars, num),
+            render(&n.kids[1], vars, num),
+            render(&n.kids[2], vars, num)
         ),
         Mod | Min | Max | Atan2 => format!(
             "{}({}, {})",
             n.op.symbol(),
-            to_string(&n.kids[0], vars),
-            to_string(&n.kids[1], vars)
+            render(&n.kids[0], vars, num),
+            render(&n.kids[1], vars, num)
         ),
         // Comparisons and the binary logical operators print infix inside
         // parentheses, so the printed form parses back unambiguously.
@@ -2041,19 +2047,19 @@ pub fn to_string(n: &Node, vars: &[String]) -> String {
             };
             format!(
                 "({}{}{})",
-                to_string(&n.kids[0], vars),
+                render(&n.kids[0], vars, num),
                 s,
-                to_string(&n.kids[1], vars)
+                render(&n.kids[1], vars, num)
             )
         }
-        Not => format!("(not {})", to_string(&n.kids[0], vars)),
+        Not => format!("(not {})", render(&n.kids[0], vars, num)),
         Between => format!(
             "between({}, {}, {})",
-            to_string(&n.kids[0], vars),
-            to_string(&n.kids[1], vars),
-            to_string(&n.kids[2], vars)
+            render(&n.kids[0], vars, num),
+            render(&n.kids[1], vars, num),
+            render(&n.kids[2], vars, num)
         ),
-        _ => format!("{}({})", n.op.symbol(), to_string(&n.kids[0], vars)),
+        _ => format!("{}({})", n.op.symbol(), render(&n.kids[0], vars, num)),
     }
 }
 

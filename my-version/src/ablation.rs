@@ -933,6 +933,8 @@ pub struct SeedResult {
     pub net_by_fold_threshold: Vec<Vec<f64>>,
     /// Equal-weight period net returns at the headline threshold.
     pub net_period: Vec<f64>,
+    /// #807: `exact` when the run carried `expression_exact`; a result without the key priced `rounded`.
+    pub expression_source: crate::run_json::ExpressionSource,
 }
 
 impl SeedResult {
@@ -941,7 +943,7 @@ impl SeedResult {
         let strs = |v: &[String]| format!("[{}]", v.iter().map(|x| jstr(x)).collect::<Vec<_>>().join(","));
         format!(
             "{{\"schema\":{},\"arm\":{},\"seed\":{},\"feature_list_sha256\":{},\"generation_budget\":{},\"generations_run\":{},\
-\"features\":{},\"features_used\":{},\"return_mse\":{},\"folds\":{},\"thresholds\":{},\"net_by_fold_threshold\":[{}],\"net_period\":{}}}",
+\"features\":{},\"features_used\":{},\"return_mse\":{},\"folds\":{},\"thresholds\":{},\"net_by_fold_threshold\":[{}],\"net_period\":{},\"expression_source\":{}}}",
             jstr(RESULT_SCHEMA),
             jstr(&self.arm),
             self.seed,
@@ -954,7 +956,8 @@ impl SeedResult {
             strs(&self.folds),
             arr(&self.thresholds),
             self.net_by_fold_threshold.iter().map(|r| arr(r)).collect::<Vec<_>>().join(","),
-            arr(&self.net_period)
+            arr(&self.net_period),
+            jstr(self.expression_source.as_str())
         )
     }
 
@@ -986,6 +989,10 @@ impl SeedResult {
                 _ => return Err("net_by_fold_threshold must be an array".to_string()),
             },
             net_period: nums(field("net_period")?)?,
+            expression_source: match j.get("expression_source").and_then(Json::as_str) {
+                Some("exact") => crate::run_json::ExpressionSource::Exact,
+                _ => crate::run_json::ExpressionSource::Rounded,
+            },
         })
     }
 }
@@ -1000,6 +1007,7 @@ pub struct RunFacts {
     pub generations_run: u64,
     pub variables: Vec<String>,
     pub expression: String,
+    pub expression_source: crate::run_json::ExpressionSource,
     pub seed: u32,
 }
 
@@ -1011,16 +1019,14 @@ pub fn parse_run(text: &str) -> Result<RunFacts, String> {
     if hash != feature_list_sha256(&variables) {
         return Err("run.json feature_list_sha256 does not match its variables".to_string());
     }
-    let expression = j
+    let (expression, expression_source) = j
         .get("objective")
         .and_then(|o| o.get("finalist"))
-        .and_then(|f| f.get("expression"))
-        .and_then(Json::as_str)
+        .and_then(crate::run_json::ExpressionSource::pick)
         .ok_or_else(|| {
             "run.json has no objective.finalist: run with --objective and a validation slice so the finalist is chosen without the test block"
                 .to_string()
-        })?
-        .to_string();
+        })?;
     Ok(RunFacts {
         arm: req_str(ab, "arm")?,
         feature_list_sha256: hash,
@@ -1028,6 +1034,7 @@ pub fn parse_run(text: &str) -> Result<RunFacts, String> {
         generations_run: req_f64(ab, "generations_run")? as u64,
         variables,
         expression,
+        expression_source,
         seed: req_f64(&j, "seed")? as u32,
     })
 }
@@ -1131,6 +1138,7 @@ fn score_core(
         thresholds: thresholds.to_vec(),
         net_by_fold_threshold,
         net_period,
+        expression_source: facts.expression_source,
     })
 }
 
@@ -1729,7 +1737,7 @@ fn usage() -> &'static str {
             [--allow-in-sample]  a fold whose test starts before the run's last seen row + purge is refused (exit 3); with the flag it is labelled oof:false and left out of every pooled series\n\
             [--group <col>] [--return-col <col>] [--scheme expanding] [--thresholds 0.6,0.7,0.8]\n\
             [--headline-threshold 0.7] [--cost-bps 12 | --cost-override <bp>] [--purge-seconds 219600] [--target-spec <file>]\n\
-            scores the run's finalist (objective.finalist.expression) on every fold. Test rows of one group closer than the target spec horizon overlap and are refused (exit 2); the result carries min_group_step_seconds. --target-spec sets the per-side cost\n\
+            scores the run's finalist (objective.finalist.expression_exact, else the rounded expression; the result carries expression_source) on every fold. Test rows of one group closer than the target spec horizon overlap and are refused (exit 2); the result carries min_group_step_seconds. --target-spec sets the per-side cost\n\
             (cost_bps / 2), the return units (log is converted with exp_m1) and the return column; a --cost-bps that differs is refused.\n\
             --from-run prices the book the search selected: the run's target spec, per-side cost and fixed threshold\n\
             (objective.spec.threshold); it refuses --thresholds, --headline-threshold and --target-spec, and a run without an objective block\n
