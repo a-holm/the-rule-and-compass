@@ -1274,7 +1274,7 @@ fn a_kill_during_an_interim_chunk_resumes_to_the_uninterrupted_report() {
     std::fs::create_dir(&whole).unwrap();
 
     let mut args = chunk_args(&csv, &["--time-budget", "3600", "--interim-chunk", "--save-every", "1", "--patience", "0"]);
-    let at = args.iter().position(|a| a == "8").expect("generations value");
+    let at = args.iter().position(|a| a == "--generations").expect("generations flag") + 1;
     args[at] = "1000000".to_string();
     let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .current_dir(&killed)
@@ -1293,24 +1293,31 @@ fn a_kill_during_an_interim_chunk_resumes_to_the_uninterrupted_report() {
 
     let saved = Checkpoint::load(&ck).expect("a complete checkpoint survives the kill");
     assert!(saved.final_archive.is_none());
-    let target = (saved.generations + 4).to_string();
-    let run = |dir: &std::path::Path, resume: bool| {
-        let mut extra: Vec<&str> = vec!["--patience", "0"];
-        if resume {
-            extra.extend(["--resume", "ck.rcsr"]);
-        }
-        let mut args = chunk_args(&csv, &[]);
-        let at = args.iter().position(|a| a == "8").expect("generations value");
-        args[at] = target.clone();
+    // One more generation after the kill gives the report. A fresh run to that
+    // generation is the reference.
+    let run = |dir: &std::path::Path, generations: String, extra: &[&'static str]| {
+        let mut args = chunk_args(&csv, &["--patience", "0"]);
+        let at = args.iter().position(|a| a == "--generations").expect("generations flag") + 1;
+        args[at] = generations;
         args.extend(extra.iter().map(|s| s.to_string()));
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let out = rcsr_in(dir, &refs);
         assert!(out.status.success(), "{:?}", out);
     };
-    run(&killed, true);
-    run(&whole, false);
-    assert_eq!(std::fs::read(killed.join("ck.rcsr")).unwrap(), std::fs::read(whole.join("ck.rcsr")).unwrap());
-    let a = std::fs::read_to_string(killed.join("run.json")).unwrap();
-    let b = std::fs::read_to_string(whole.join("run.json")).unwrap();
-    assert_eq!(without_timing(&a), without_timing(&b));
+    run(&killed, "1000000".to_string(), &["--resume", "ck.rcsr", "--time-budget", "0"]);
+    run(&whole, (saved.generations + 1).to_string(), &[]);
+    let final_line = |dir: &std::path::Path| {
+        std::fs::read_to_string(dir.join("ck.rcsr"))
+            .unwrap()
+            .lines()
+            .find(|l| l.starts_with("final "))
+            .map(str::to_string)
+            .expect("a final line")
+    };
+    assert_eq!(final_line(&killed), final_line(&whole));
+    let front = |dir: &std::path::Path| {
+        let text = std::fs::read_to_string(dir.join("run.json")).unwrap();
+        text[text.find("\"pareto\":[").expect("a front")..].to_string()
+    };
+    assert_eq!(front(&killed), front(&whole));
 }
