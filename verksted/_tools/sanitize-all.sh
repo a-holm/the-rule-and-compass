@@ -12,6 +12,11 @@
 # Writes: one log per run (<id>-san-<binary>[-<test>]), the build log <id>-san-build, and the summary <id>-san-summary
 # with one line per run: <binary>[:<test>] rc=<n> xid=<a>-><b> secs=<s> | <test result line> | <ERROR SUMMARY line>,
 # plus `<binary>[:<test>] skip | <reason>` lines.
+# Plan mode `<binary> * no-cuda <reason>` lists a binary that makes no CUDA call by design. It still runs under memcheck.
+# Rc 255 with `terminated before first instrumented API call` and `test result: ok` (0 failed) is a pass only for a listed binary
+# (`<binary> no CUDA call (listed)`); for an unlisted binary it is a failure (`<binary> unexpected no CUDA call: add a plan line or fix the test`).
+# A listed binary whose run printed an ERROR SUMMARY called CUDA: it gets the normal verdict and the line ends `listed no-cuda but called CUDA`.
+# The summary ends with the counts `no-cuda binaries`, `unexpected no-cuda` and `listed no-cuda but called CUDA`.
 # A run with rc 255, `running 0 tests`, a non-zero filtered-out count and the sanitizer message `terminated before first instrumented API call` (the plan filtered out every test) is written as `<binary> skipped by plan | ...` and is not a failure.
 # Exit: 0 when every run has rc 0 and `ERROR SUMMARY: 0 errors`; 70 at once when the Xid count rose; 1 otherwise; 3 when $SANITIZER is missing or not CUDA 13; 2 usage.
 set -uo pipefail
@@ -56,12 +61,17 @@ plan_lines=$(awk '/^[[:space:]]*(#|$)/ { next } {
   printf "%s\t%s\t%s\t%s\n", $1, $2, $3, reason }' "$plan")
 while IFS=$'\t' read -r b t m r; do
   [ -n "$b" ] || continue
-  case "$m" in skip|api-errors-no) ;; *) echo "sanitize-all: bad mode '$m' in $plan" >&2; exit 2 ;; esac
+  case "$m" in skip|api-errors-no) ;; no-cuda) [ "$t" = "*" ] || { echo "sanitize-all: no-cuda needs '*' as the test, got '$t' for $b in $plan" >&2; exit 2; } ;; *) echo "sanitize-all: bad mode '$m' in $plan" >&2; exit 2 ;; esac
   [ -n "$r" ] || { echo "sanitize-all: empty reason for $b $t in $plan" >&2; exit 2; }
 done <<< "$plan_lines"
 
 summary=$(log_path "$id" san-summary)
 fails=0
+ok_re='^test result: ok\. [0-9]+ passed; 0 failed;'
+listed=0
+n_nocuda=0
+n_unexpected=0
+n_called=0
 emit() {
   echo "$1"
   [ "$dry" -eq 1 ] || echo "$1" >> "$summary"
@@ -100,7 +110,7 @@ run_one() { # label tag api bin args...
   rc=$?
   t1=$(date +%s)
   log=$(log_path "$id" "$tag")
-  local xid res err extra= by_plan=0
+  local xid res err extra= by_plan=0 no_cuda=0
   xid=$(sed -n 's/^xid before=\([0-9]*\) after=\([0-9]*\)$/\1->\2/p' "$log" | tail -1)
   res=$(grep -a '^test result:' "$log" | tail -1)
   err=$(grep -a 'ERROR SUMMARY:' "$log" | tail -1)
@@ -112,11 +122,30 @@ run_one() { # label tag api bin args...
     grep -aq 'terminated before first instrumented API call' "$log"; then
     by_plan=1
     emit "$label skipped by plan | 0 tests ran, all filtered out | xid=${xid:-?}"
+  elif [ "$rc" -eq 255 ] && [ -z "$err" ] && grep -aq 'terminated before first instrumented API call' "$log" &&
+    [[ $res =~ $ok_re ]]; then
+    no_cuda=1
+    if [ "$listed" -eq 1 ]; then
+      n_nocuda=$((n_nocuda + 1))
+      emit "$label no CUDA call (listed) | $res | xid=${xid:-?}"
+    else
+      n_unexpected=$((n_unexpected + 1))
+      emit "$label unexpected no CUDA call: add a plan line or fix the test | $res | xid=${xid:-?}"
+    fi
   else
+    if [ "$listed" -eq 1 ] && [ -n "$err" ]; then
+      extra="$extra | listed no-cuda but called CUDA"
+      n_called=$((n_called + 1))
+    fi
     emit "$label rc=$rc xid=${xid:-?} secs=$((t1 - t0)) | $res | $err$extra"
   fi
   [ "$rc" -ne 70 ] || { echo "sanitize-all: Xid count rose during $label; stopped" >&2; exit 70; }
   [ "$by_plan" -eq 0 ] || return 0
+  if [ "$no_cuda" -eq 1 ]; then
+    [ "$listed" -eq 1 ] && return 0
+    fails=$((fails + 1))
+    return 0
+  fi
   if [ "$rc" -eq 0 ] && grep -aq 'ERROR SUMMARY: 0 errors' "$log"; then
     return 0
   fi
@@ -129,12 +158,14 @@ run_binary() { # name bin
   if [ "$star" = skip ]; then
     return 0
   fi
+  listed=0
+  [ "$star" != no-cuda ] || listed=1
   if [ "$star" = api-errors-no ]; then
     run_one "$name" "san-$name" no "$bin"
     return 0
   fi
   while IFS=$'\t' read -r b t mode r; do
-    [ "$b" = "$name" ] || continue
+    [ "$b" = "$name" ] && [ "$mode" != no-cuda ] || continue
     args+=(--skip "$t")
   done <<< "$plan_lines"
   [ ${#args[@]} -eq 0 ] || args+=(--exact)
@@ -199,6 +230,9 @@ while IFS=$'\t' read -r name bin; do
   run_binary "$name" "$bin"
 done <<< "$bins"
 
+emit "no-cuda binaries: $n_nocuda"
+emit "unexpected no-cuda: $n_unexpected"
+emit "listed no-cuda but called CUDA: $n_called"
 echo "summary: $summary"
 [ "$fails" -eq 0 ] || exit 1
 exit 0

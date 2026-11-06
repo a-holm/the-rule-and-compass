@@ -153,7 +153,10 @@ has zero-plan-others-ran "$sum" '^gpu_memory_plan rc=0'
 for mode in run1 nofilter nomsg; do
   FAKE_ZERO_MODE=$mode FAKE_ZERO_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
   check "zero-$mode-rc" "$r" "1"
-  has "zero-$mode-line" "$sum" '^gpu_fit rc=255 '
+  case $mode in
+    nomsg) has "zero-$mode-line" "$sum" '^gpu_fit rc=255 ' ;;
+    *) has "zero-$mode-line" "$sum" '^gpu_fit unexpected no CUDA call: add a plan line or fix the test' ;;
+  esac
 done
 FAKE_ZERO_RC=99 FAKE_ZERO_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check zero-rc99-rc "$r" "1"

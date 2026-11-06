@@ -1,6 +1,6 @@
 # <binary> <test or *> <mode> <reason>
 # binary: a --test target name, lib (library unit tests) or bin-<name> (that binary's unit tests)
-# mode: skip (not run under memcheck) | api-errors-no (run alone with --report-api-errors no)
+# mode: skip (not run under memcheck) | api-errors-no (run alone with --report-api-errors no) | no-cuda (only with *: the binary runs and must make no CUDA call)
 # An api-errors-no test is still memchecked; only driver API error reporting is off, for that test only.
 signed_gpu      *                                                      skip           no CUDA call: mock backend and CPU fits; memcheck exits 255 (terminated before first instrumented API call)
 gpu_memory_plan a_refused_device_allocation_is_reported_with_its_bytes api-errors-no  provokes a cudaMalloc out-of-memory on purpose
@@ -12,3 +12,55 @@ gpu_launch_guard by_value_struct_with_a_host_member_is_refused           api-err
 gpu_launch_guard opt_out_disables_the_check                              api-errors-no  refuses a launch on purpose; the refusal is a cudaErrorInvalidValue API error
 gpu_refusal_cli explicit_gpu_run_fails_closed_when_a_launch_is_refused  api-errors-no  forces a launch refusal on purpose; the refusal is a cudaErrorInvalidValue API error
 gpu_refusal_cli auto_dispatch_falls_back_to_the_cpu_with_the_cause_and_the_cpu_archive api-errors-no  forces a launch refusal on purpose; the refusal is a cudaErrorInvalidValue API error
+# no-cuda: the binary makes no CUDA call by design and must keep it. A pass at rc 255 (terminated before first instrumented API call) is accepted only for a listed binary.
+# A listed binary that calls CUDA gets the normal memcheck verdict and the summary marks it; an unlisted binary with rc 255 fails the pass.
+attach                 *  no-cuda  its tests are ignored (measurement or external data): 0 tests run and none calls CUDA
+bin-cpu_bench          *  no-cuda  no tests in this binary: the harness runs 0 tests and makes no CUDA call
+bin-rcsr               *  no-cuda  CPU-only tests; no CUDA call
+bin-rcsr-bench         *  no-cuda  no tests in this binary: the harness runs 0 tests and makes no CUDA call
+bin-rcsr-gpu-bench     *  no-cuda  no tests in this binary: the harness runs 0 tests and makes no CUDA call
+bin-rcsr-launch        *  no-cuda  CPU-only tests; no CUDA call
+bin-rcsr-rss           *  no-cuda  no tests in this binary: the harness runs 0 tests and makes no CUDA call
+bin-rcsr_serve         *  no-cuda  no tests in this binary: the harness runs 0 tests and makes no CUDA call
+conflict_markers       *  no-cuda  CPU-only tests; no CUDA call
+cpu_bench              *  no-cuda  CPU-only tests; no CUDA call
+cuda_kernel_args       *  no-cuda  text lint of src/cuda sources; no CUDA call
+cv                     *  no-cuda  CPU-only tests; no CUDA call
+derivatives            *  no-cuda  CPU-only tests; no CUDA call
+diagnostics            *  no-cuda  CPU-only tests; no CUDA call
+dispatch_cli           *  no-cuda  CPU-only tests; no CUDA call
+eval_soa               *  no-cuda  CPU-only tests; no CUDA call
+fit_portfolio          *  no-cuda  CPU fits and a mock GPU fitter; no CUDA call
+fit_portfolio_bench    *  no-cuda  its tests are ignored (measurement or external data): 0 tests run and none calls CUDA
+fit_stream_store       *  no-cuda  CPU-only tests; no CUDA call
+inference              *  no-cuda  CPU-only tests; no CUDA call
+ladder                 *  no-cuda  CPU-only tests; no CUDA call
+leakage                *  no-cuda  CPU-only tests; no CUDA call
+long_labels            *  no-cuda  CPU-only tests; no CUDA call
+no_python              *  no-cuda  CPU-only tests; no CUDA call
+node_edits             *  no-cuda  CPU-only tests; no CUDA call
+ohlcv                  *  no-cuda  CPU-only tests; no CUDA call
+panel                  *  no-cuda  CPU-only tests; no CUDA call
+panel_pit              *  no-cuda  CPU-only tests; no CUDA call
+parse                  *  no-cuda  CPU-only tests; no CUDA call
+pinned_cell            *  no-cuda  its tests are ignored (measurement or external data): 0 tests run and none calls CUDA
+pnl_fitness_ab         *  no-cuda  under #803: its only test is ignored and runs rcsr --gpu; the GPU arm never reaches the device under memcheck
+prep_pipeline          *  no-cuda  CPU-only tests; no CUDA call
+projection             *  no-cuda  CPU-only tests; no CUDA call
+projection_alloc       *  no-cuda  CPU-only tests; no CUDA call
+reject_constant        *  no-cuda  CPU-only tests; no CUDA call
+risk                   *  no-cuda  CPU-only tests; no CUDA call
+sanitizer_plan         *  no-cuda  CPU-only tests; no CUDA call
+scratch                *  no-cuda  CPU-only tests; no CUDA call
+simplify_sound         *  no-cuda  CPU-only tests; no CUDA call
+sm121_compile          *  no-cuda  runs nvcc and cuobjdump on a cubin; no CUDA runtime call
+split                  *  no-cuda  CPU-only tests; no CUDA call
+synth_panel            *  no-cuda  CPU-only tests; no CUDA call
+target_golden          *  no-cuda  its tests are ignored (measurement or external data): 0 tests run and none calls CUDA
+test_attributes        *  no-cuda  CPU-only tests; no CUDA call
+test_hygiene           *  no-cuda  CPU-only tests; no CUDA call
+time_parsing           *  no-cuda  CPU-only tests; no CUDA call
+trading                *  no-cuda  CPU-only tests; no CUDA call
+ts_hazards             *  no-cuda  CPU-only tests; no CUDA call
+verksted_links         *  no-cuda  CPU-only tests; no CUDA call
+verksted_walk          *  no-cuda  CPU-only tests; no CUDA call
