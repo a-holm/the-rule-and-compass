@@ -4,6 +4,7 @@
 # Stand-ins for real timers, so a script test counts events instead of reading the wall clock.
 # A script test never reaches the real machine directory: a test that needs one sets RCSR_MACHINE_DIR itself.
 export RCSR_MACHINE_DIR=/nonexistent-machine-dir
+export RCSR_TEST_LOCK=/nonexistent-machine-dir/full-suite.lock
 
 # fake_timeout <dir>: <dir>/timeout appends "<limit> <cmd...>" to $FAKE_TIMEOUT_LOG and the -k value, when given, to
 # $FAKE_TIMEOUT_LOG.kill. A command named hang stands for one that never ends: exit 124 without running it. Any other

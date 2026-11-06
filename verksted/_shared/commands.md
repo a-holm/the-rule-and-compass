@@ -42,6 +42,7 @@ verksted/_tools/rc-run.sh test "$W" "$N" <what> -- cargo test --release --test <
 verksted/_tools/rc-run.sh test "$W" "$N" <what> --cuda -- cargo test --release --features cuda --test <file> <filter>   # GPU test: test lock
 verksted/_tools/rc-run.sh run "$W" "$N" <what> -- ./target/release/rcsr <args>                          # rcsr and rcsr-bench: test lock
 # rc-run.sh lock modes run the command through verksted/_tools/lock-run.sh: its own session; after it ends, every process that shares the flock of that hold is TERMed then KILLed by pid (nothing is signalled unless the process itself owns the flock on the lock file)
+# A monitor or background job started under a hold must use setsid and 9>&- (close the lock fd), or the reap ends it with the hold
 ps -eo pcpu,args | grep -E 'cargo|rustc'          # look first: one cargo at a time
 ```
 

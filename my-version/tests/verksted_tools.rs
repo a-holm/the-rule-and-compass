@@ -118,6 +118,9 @@ fn run_bash(args: &[&str], log: &Path, guard: &Guard) -> Option<String> {
             cmd.env_remove(key);
         }
     }
+    // Script tests start with the machine paths pointing at nothing; a test that needs a directory sets its own.
+    cmd.env("RCSR_MACHINE_DIR", "/nonexistent-machine-dir");
+    cmd.env("RCSR_TEST_LOCK", "/nonexistent-machine-dir/full-suite.lock");
     let mut child = cmd
         .args(args)
         .stdin(Stdio::null())
