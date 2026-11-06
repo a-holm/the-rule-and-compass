@@ -21,6 +21,9 @@ pub const PROBE_BARS: usize = 9_175;
 /// computes the benchmark columns only when the series exists.
 const PROBE_BENCHMARK: &str = "S000";
 
+/// A symbol the probe store does not hold: a run with it has no benchmark series.
+const PROBE_NO_BENCHMARK: &str = "NOBENCH";
+
 /// Which stage seconds carry a class: the feature stage, or the cross-section
 /// stage for the rank class.
 #[derive(Clone, Copy)]
@@ -147,6 +150,18 @@ struct Runner {
 impl Runner {
     /// Stage seconds of one dry run with `features` on `gpu`.
     fn run(&self, features: &str, gpu: GpuMode, stage: Stage) -> Result<f64, String> {
+        self.run_with(features, gpu, stage, PROBE_BENCHMARK)
+    }
+
+    /// As [`Runner::run`] with `cross_symbol` as the benchmark symbol; a name
+    /// the store does not hold leaves the benchmark series out.
+    fn run_with(
+        &self,
+        features: &str,
+        gpu: GpuMode,
+        stage: Stage,
+        cross_symbol: &str,
+    ) -> Result<f64, String> {
         let opts = Options {
             data: self.store.clone(),
             out: Some(self.out.clone()),
@@ -155,7 +170,7 @@ impl Runner {
             dry_run: true,
             allow_lockbox: true,
             calibration: crate::dispatch::CalibrationRequest::Anchors,
-            cross_symbol: PROBE_BENCHMARK.to_string(),
+            cross_symbol: cross_symbol.to_string(),
             ..Options::default()
         };
         let report = enrich::build(&opts)?;
@@ -232,6 +247,10 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
         let mut rate = anchor;
         if plan.host_once {
             rate.cpu_fixed_ms = (cpu_large * 1000.0 / mrow).max(0.0);
+            if plan.op == OpClass::CompactPass {
+                let bare = runner.run_with(plan.large, GpuMode::Off, plan.stage, PROBE_NO_BENCHMARK)?;
+                rates.compact_no_benchmark_ms = (bare * 1000.0 / mrow).max(0.0);
+            }
         } else {
             let cpu_small = runner.run(plan.small, GpuMode::Off, plan.stage)?;
             let col_ms = ((cpu_large - cpu_small) * 1000.0 / mrow / (n2 - n1) as f64).max(0.0);

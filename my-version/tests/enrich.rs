@@ -3668,13 +3668,30 @@ fn plan_together(
     families: &[(&'static str, usize, OpClass, usize)],
     rates: &enrich::EnrichRates,
 ) -> Vec<enrich::GroupPlan> {
+    plan_together_with(families, rates, true)
+}
+
+fn plan_together_with(
+    families: &[(&'static str, usize, OpClass, usize)],
+    rates: &enrich::EnrichRates,
+    benchmark_present: bool,
+) -> Vec<enrich::GroupPlan> {
     let mut counts = std::collections::BTreeMap::new();
     let mut supported = std::collections::BTreeMap::new();
     for (group, cols, op, kernels) in families {
         counts.insert(*group, (*cols, *op));
         supported.insert(*group, *kernels);
     }
-    enrich::plan_groups_rated(&counts, &supported, 1_000_075, 109, GpuMode::Auto, true, rates)
+    enrich::plan_groups_rated(
+        &counts,
+        &supported,
+        1_000_075,
+        109,
+        GpuMode::Auto,
+        true,
+        benchmark_present,
+        rates,
+    )
 }
 
 const MROW: f64 = 1.000075;
@@ -4064,4 +4081,141 @@ fn device_context_is_paid_once_across_families() {
     // The estimate of a family on its own still carries its context.
     let alone = plan_alone("lags", 20, OpClass::Elementwise);
     assert_eq!(alone.gpu_ms.to_bits(), together[0].gpu_ms.to_bits());
+}
+
+/// Compact-pass feature stage in milliseconds on the 1,000,075-row, 109-symbol
+/// panel without the benchmark series, median of the paired CPU runs.
+const COMPACT_STAGE_NO_BENCHMARK_MS: f64 = 3031.9;
+
+fn plan_json(p: &enrich::GroupPlan) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{:.3}|{:.3}|{}|{:.3}|{}|{}",
+        p.group, p.rows, p.cols, p.gpu_cols, p.cpu_cols, p.op, p.cpu_ms, p.gpu_ms, p.pass_shared,
+        p.pass_cpu_ms, p.backend, p.reason
+    )
+}
+
+#[test]
+fn compact_pass_cost_follows_the_benchmark_series() {
+    let rates = enrich::EnrichRates::anchors();
+    let families = [("returns", 3, OpClass::CompactPass, 0), ("ma", 3, OpClass::CompactPass, 0)];
+    let with = plan_together_with(&families, &rates, true);
+    let without = plan_together_with(&families, &rates, false);
+    assert!(with.iter().all(|p| p.benchmark_present));
+    assert!(without.iter().all(|p| !p.benchmark_present));
+    assert!(with.iter().chain(&without).all(|p| p.backend == "cpu" && p.pass_shared));
+
+    let sum = |plans: &[enrich::GroupPlan]| plans.iter().map(|p| p.cpu_ms).sum::<f64>();
+    let anchor_ms = MROW * rates.class(OpClass::CompactPass).cpu_fixed_ms;
+    assert!((sum(&with) - anchor_ms).abs() < 1e-6, "{}", sum(&with));
+    let planned = sum(&without);
+    assert!(
+        (planned - COMPACT_STAGE_NO_BENCHMARK_MS).abs() <= 0.1 * COMPACT_STAGE_NO_BENCHMARK_MS,
+        "planned {planned} ms against the measured {COMPACT_STAGE_NO_BENCHMARK_MS} ms"
+    );
+    assert_eq!(
+        planned.to_bits(),
+        (MROW * rates.compact_no_benchmark_ms).to_bits(),
+        "the no-benchmark anchor sets the estimate"
+    );
+
+    // With the series the plans are the ones the anchors always gave.
+    let mut counts = std::collections::BTreeMap::new();
+    let mut supported = std::collections::BTreeMap::new();
+    for (group, cols, op, kernels) in &families {
+        counts.insert(*group, (*cols, *op));
+        supported.insert(*group, *kernels);
+    }
+    let legacy = enrich::plan_groups_with_segments(&counts, &supported, 1_000_075, 109, GpuMode::Auto, true);
+    let a: Vec<String> = with.iter().map(plan_json).collect();
+    let b: Vec<String> = legacy.iter().map(plan_json).collect();
+    assert_eq!(a, b);
+
+    // Every other pass class ignores the benchmark series.
+    let py = [("returns", 3, OpClass::Py15mPass, 0), ("ma", 3, OpClass::Py15mPass, 0)];
+    let a: Vec<String> = plan_together_with(&py, &rates, true).iter().map(plan_json).collect();
+    let b: Vec<String> = plan_together_with(&py, &rates, false).iter().map(plan_json).collect();
+    assert_eq!(a, b);
+}
+
+#[test]
+fn compact_pass_without_the_benchmark_changes_a_mixed_run() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    let mut rates = enrich::EnrichRates::anchors();
+    rates.compact_no_benchmark_ms = 1.0;
+    let families = [("returns", 1, OpClass::CompactPass, 1)];
+    assert_eq!(plan_together_with(&families, &rates, true)[0].backend, "gpu");
+    assert_eq!(plan_together_with(&families, &rates, false)[0].backend, "cpu");
+}
+
+#[test]
+fn compact_no_benchmark_rate_roundtrips_and_defaults_to_the_anchor() {
+    let mut rates = enrich::EnrichRates::anchors();
+    rates.compact_no_benchmark_ms = 1.0 / 3.0 * 4000.0;
+    let cal = enrich::EnrichCalibration {
+        rows: 1_000_000,
+        rates,
+        spread_context: 1.0,
+        spread_classes: [1.0; enrich::OP_CLASSES],
+    };
+    let text = cal.json();
+    assert!(text.contains("\"cpu_fixed_ms_no_benchmark\":"), "{text}");
+    let parsed = rcsr::bench_stats::parse_json(&text).unwrap();
+    let got = enrich::EnrichCalibration::from_json(&parsed).unwrap();
+    assert_eq!(got.rates.compact_no_benchmark_ms.to_bits(), rates.compact_no_benchmark_ms.to_bits());
+    assert_eq!(got, cal);
+
+    // Only the compact-pass class carries the field, and absent means anchor.
+    assert_eq!(text.matches("cpu_fixed_ms_no_benchmark").count(), 1);
+    let start = text.find(",\"cpu_fixed_ms_no_benchmark\":").unwrap();
+    let end = start + text[start..].find('}').unwrap();
+    let without = format!("{}{}", &text[..start], &text[end..]);
+    let parsed = rcsr::bench_stats::parse_json(&without).unwrap();
+    let got = enrich::EnrichCalibration::from_json(&parsed).unwrap();
+    assert_eq!(got.rates.compact_no_benchmark_ms, enrich::EnrichRates::anchors().compact_no_benchmark_ms);
+
+    // A negative or non-numeric value makes the file invalid.
+    let value = &text[start + ",\"cpu_fixed_ms_no_benchmark\":".len()..end];
+    for bad in ["-1.0", "\"x\""] {
+        let broken = text.replacen(
+            &format!("\"cpu_fixed_ms_no_benchmark\":{value}"),
+            &format!("\"cpu_fixed_ms_no_benchmark\":{bad}"),
+            1,
+        );
+        let parsed = rcsr::bench_stats::parse_json(&broken).unwrap();
+        let err = enrich::EnrichCalibration::from_json(&parsed).unwrap_err();
+        assert!(err.contains("cpu_fixed_ms_no_benchmark"), "{err}");
+    }
+
+    // A calibrated value is limited to 0.25x..4x of the anchor.
+    let anchor = enrich::EnrichRates::anchors().compact_no_benchmark_ms;
+    let mut wild = enrich::EnrichRates::anchors();
+    wild.compact_no_benchmark_ms = anchor * 100.0;
+    assert_eq!(wild.clamped().compact_no_benchmark_ms, anchor * enrich::RATE_CLAMP);
+    wild.compact_no_benchmark_ms = anchor * 0.001;
+    assert_eq!(wild.clamped().compact_no_benchmark_ms, anchor / enrich::RATE_CLAMP);
+}
+
+#[test]
+fn enrich_json_and_plan_line_print_benchmark_present() {
+    let (_scratch, dir) = tmp_dir("benchmark-present");
+    let mut rows = Vec::new();
+    for s in 0..25 {
+        rows.extend(wavy_rows(&format!("S{s:02}"), 40, 0, 900, s as f64 * 0.1));
+    }
+    let data = dir.join("in.rcsb").to_string_lossy().into_owned();
+    write_store(&data, &rows, 1000);
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    for (name, symbol, want) in [("with.rcsb", "S03", "true"), ("without.rcsb", "NOBENCH", "false")] {
+        let run = run_enrich_cli(&dir, &data, name, &["--cross-symbol", symbol], &cache);
+        assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+        let text = String::from_utf8(run.stdout).unwrap();
+        let plans = plan_array(&text);
+        assert!(plans.contains(&format!("\"benchmark_present\":{want}")), "{symbol}: {plans}");
+        let flags = plans.matches("\"benchmark_present\":").count();
+        assert_eq!(flags, plans.matches("\"group\":").count(), "{symbol}");
+    }
 }
