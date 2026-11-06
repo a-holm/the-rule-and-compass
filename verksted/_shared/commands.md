@@ -41,6 +41,7 @@ verksted/_tools/rc-run.sh build "$W" "$N" build -- cargo test --release --no-run
 verksted/_tools/rc-run.sh test "$W" "$N" <what> -- cargo test --release --test <file> <filter>          # CPU test: build slot
 verksted/_tools/rc-run.sh test "$W" "$N" <what> --cuda -- cargo test --release --features cuda --test <file> <filter>   # GPU test: test lock
 verksted/_tools/rc-run.sh run "$W" "$N" <what> -- ./target/release/rcsr <args>                          # rcsr and rcsr-bench: test lock
+# rc-run.sh lock modes run the command through verksted/_tools/lock-run.sh: its own session; after it ends, every process still holding the test lock is TERMed then KILLed by pid
 ps -eo pcpu,args | grep -E 'cargo|rustc'          # look first: one cargo at a time
 ```
 

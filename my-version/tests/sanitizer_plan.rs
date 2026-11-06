@@ -32,11 +32,11 @@ fn parse(text: &str) -> Result<Vec<Line>, String> {
             _ => return Err(format!("line {no}: need <binary> <test> <mode> <reason>")),
         };
         let reason = it.collect::<Vec<_>>().join(" ");
-        if mode != "skip" && mode != "api-errors-no" && mode != "no-cuda" {
+        if !["skip", "api-errors-no", "no-cuda", "no-cuda-app-only"].contains(&mode) {
             return Err(format!("line {no}: unknown mode '{mode}'"));
         }
-        if mode == "no-cuda" && test != "*" {
-            return Err(format!("line {no}: no-cuda needs '*' as the test"));
+        if mode.starts_with("no-cuda") && test != "*" {
+            return Err(format!("line {no}: {mode} needs '*' as the test"));
         }
         if reason.is_empty() {
             return Err(format!("line {no}: empty reason"));
@@ -208,4 +208,11 @@ fn a_no_cuda_line_naming_a_missing_binary_fails() {
     let errors = check("no_such_binary * no-cuda reason\n", &root());
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("tests/no_such_binary.rs"), "{errors:?}");
+}
+
+#[test]
+fn no_cuda_app_only_takes_only_a_star_line() {
+    assert!(parse("launchers * no-cuda-app-only reason\n").is_ok());
+    assert!(parse("launchers some_test no-cuda-app-only reason\n").is_err());
+    assert!(parse("launchers * no-cuda-app-only\n").is_err());
 }

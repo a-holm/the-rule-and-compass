@@ -6,7 +6,8 @@
 # open file description owns the flock; a process that only has the file open (a waiter) is never touched.
 # Order: TERM to the command's process group and to each holder by pid; RCSR_REAP_TERM_WAITS (default 50) counted waits of
 # 0.1 s; KILL to the group and to each holder still left; RCSR_REAP_KILL_WAITS (default 50) counted waits.
-# Never uses pkill or killall. Writes: nothing but messages on stderr.
+# Never uses pkill or killall.
+# Writes: nothing but messages on stderr.
 # Exit: the command's exit code; 71 when a process still holds the lock after the KILL; 2 usage.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"

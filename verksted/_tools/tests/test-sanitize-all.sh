@@ -213,6 +213,22 @@ PLAN=$T/plan-bad run "$T/wt" 9 > "$T/out" 2>&1; r=$?
 check nc-named-rc "$r" "2"
 has nc-named-msg "$T/out" "no-cuda needs '\*'"
 
+# no-cuda-app-only: listed like no-cuda, and the sanitizer runs with --target-processes application-only
+cp "$T/plan" "$T/plan-app"
+echo 'gpu_fit * no-cuda-app-only children make no CUDA call either' >> "$T/plan-app"
+PLAN=$T/plan-app FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check app-rc "$r" "0"
+has app-line "$sum" '^gpu_fit no CUDA call \(listed\) \| test result: ok\. 17 passed'
+has app-flag "$T/san-calls" 'memcheck --target-processes application-only --leak-check no --error-exitcode 99 /fake/deps/gpu_fit-fff$'
+hasnt app-flag-only-there "$T/san-calls" 'target-processes.*gpu_memory_plan'
+hasnt app-flag-other-bins "$T/san-calls" 'target-processes.*(gpu_big|rcsr-aaa)'
+PLAN=$T/plan-app run "$T/wt" 9 --dry-run > "$T/out" 2>&1; r=$?
+check app-dry-rc "$r" "0"
+has app-dry-flag "$T/out" '^run gpu_fit: .*--target-processes application-only .*gpu_fit'
+printf 'gpu_fit some_test no-cuda-app-only reason\n' > "$T/plan-bad"
+PLAN=$T/plan-bad run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check app-named-rc "$r" "2"
+
 # a rising Xid count stops at once with 70
 echo 4 > "$T/xid"
 FAKE_XID_BUMP_ON=gpu_big-ddd run "$T/wt" 9 > /dev/null 2>&1; r=$?

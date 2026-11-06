@@ -171,9 +171,9 @@ STUB
 cat > "$T/bin/leave-children" <<'STUB'
 #!/usr/bin/env bash
 trap '' TERM
-sleep 1000 &
+tail -f /dev/null &
 echo $! > "$FAKE_DIR/pid-same-session"
-setsid sleep 1000 &
+setsid tail -f /dev/null &
 echo $! > "$FAKE_DIR/pid-other-session"
 exit 3
 STUB
@@ -181,7 +181,7 @@ chmod +x "$T/bin/leave-children"
 lockreal=$(readlink -f "$T/oc/full-suite.lock")
 lock_holders() { find /proc/[0-9]*/fd -lname "$lockreal" 2> /dev/null | cut -d/ -f3 | grep -vx "$bystander"; }
 alive() { [ -r "/proc/$1/stat" ] && [ "$(cut -d' ' -f3 "/proc/$1/stat")" != Z ]; }
-sleep 1000 8> "$T/oc/full-suite.lock" &
+tail -f /dev/null 8> "$T/oc/full-suite.lock" &
 bystander=$!
 trap 'kill -KILL "$bystander" $(cat "$T/pid-same-session" "$T/pid-other-session" 2> /dev/null) 2> /dev/null; rm -rf "$T"' EXIT
 FAKE_DIR=$T rc bash "$RC" run "$T/wt" 9 t --cuda -- leave-children > /dev/null 2>&1; r=$?
