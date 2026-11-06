@@ -543,11 +543,17 @@ fn walkforward_from_run_prices_the_top_tercile_book_of_the_search() {
         assert_eq!(code(&o), 2, "{}", stderr(&o));
         assert!(stderr(&o).contains("no threshold"), "{}", stderr(&o));
     }
-    for flag in ["--device-pnl", "--batch-pnl"] {
-        let o = rcsr(&["walkforward", "--data", &csv, "--target", "r", "--expr", "x", "--time", "t", "--horizon", "3600", "--window", &w, "--policy", "top-tercile", flag]);
-        assert_ne!(code(&o), 0);
+    for extra in [&["--device-pnl"][..], &["--batch-pnl"], &["--band", "0.1"], &["--min-hold", "2"], &["--select-band"]] {
+        let flag = extra[0];
+        let mut args = vec!["walkforward", "--data", csv.as_str(), "--target", "r", "--expr", "x", "--time", "t", "--horizon", "3600", "--window", w.as_str(), "--policy", "top-tercile"];
+        args.extend_from_slice(extra);
+        let o = rcsr(&args);
+        assert_eq!(code(&o), 2, "{flag}: {}", stderr(&o));
         assert!(stderr(&o).contains("top-tercile"), "{flag}: {}", stderr(&o));
     }
+    let o = rcsr(&["walkforward", "--data", &csv, "--time", "t", "--group-by", "sym", "--from-run", &run, "--window", &w, "--allow-in-sample-windows", "--device-pnl"]);
+    assert_eq!(code(&o), 2, "from-run: {}", stderr(&o));
+    assert!(stderr(&o).contains("top-tercile"), "{}", stderr(&o));
 
     // The ablation prices the threshold rule only.
     let windows = p(&dir, "windows.csv");

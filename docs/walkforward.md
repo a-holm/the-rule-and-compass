@@ -169,8 +169,8 @@ The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA
   `floor(n/3)` of the `n` rows with a finite score (ties by row order), else `0`. The ranks use the scores of
   that timestamp only and run before the target mask, so a row with a NaN target stays in the cross-section.
   A timestamp with fewer than 3 finite scores holds nothing. There is no threshold: `--threshold-quantile`,
-  `--threshold-fixed`, `--band`, `--min-hold`, `--select-band`, `--device-pnl` and `--batch-pnl` are refused,
-  the window `threshold` is `null` and `threshold_source` is `none`. Costs, the final exit and the equal-weight
+  `--threshold-fixed`, `--band`, `--min-hold`, `--select-band`, `--device-pnl` and `--batch-pnl` are refused
+  with a usage error (exit 2), the window `threshold` is `null` and `threshold_source` is `none`. Costs, the final exit and the equal-weight
   period aggregation are the threshold rule's. `--from-run` of a search run with `--position top_tercile`
   selects the policy; it conflicts with an explicit `--policy` of another kind. Pair it with an `xs_rank` target
   (`--target lbl_h1_xs --target-spec ...` resolves to its `return_column`; `docs/time-series.md`).
