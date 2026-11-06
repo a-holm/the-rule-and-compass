@@ -4156,6 +4156,9 @@ fn calibrate_spread_report() {
         let (min, max, med) = (v[0], v[v.len() - 1], v[v.len() / 2]);
         let ratio = if min > 0.0 { max / min } else { f64::INFINITY };
         eprintln!("{name}\t{min:.6e}\t{med:.6e}\t{max:.6e}\t{ratio:.3}");
+    }
+}
+
 /// Compact-pass feature stage in milliseconds on the 1,000,075-row, 109-symbol
 /// panel without the benchmark series, median of the paired CPU runs.
 const COMPACT_STAGE_NO_BENCHMARK_MS: f64 = 3031.9;
