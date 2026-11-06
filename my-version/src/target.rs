@@ -1205,8 +1205,7 @@ mod tests {
 
     #[test]
     fn resolve_prefers_the_flag_and_reads_the_sidecar() {
-        let dir = std::env::temp_dir().join(format!("rcsr-target-unit-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_scratch::Scratch::new("target-unit");
         let data = dir.join("d.csv");
         std::fs::write(&data, "x,y60\n1,2\n").unwrap();
         let side = dir.join("d.targets.json");
@@ -1230,7 +1229,6 @@ mod tests {
             resolve(d, Some("/nonexistent/x.json"), "y60"),
             Err(ResolveError::Input(_))
         ));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn with_cost(round_trip: Option<f64>, in_label: bool) -> TargetSpec {

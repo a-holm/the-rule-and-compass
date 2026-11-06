@@ -105,23 +105,15 @@ pub fn write_text_atomic(path: impl AsRef<Path>, text: &str) -> Result<(), Strin
 mod tests {
     use super::*;
 
-    fn temp(name: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "rcsr-atomic-{}-{}-{}",
-            std::process::id(),
-            name,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        p
+    fn temp(name: &str) -> (crate::test_scratch::Scratch, PathBuf) {
+        let scratch = crate::test_scratch::Scratch::new("atomic");
+        let path = scratch.join(name);
+        (scratch, path)
     }
 
     #[test]
     fn a_partial_write_leaves_the_previous_generation_intact() {
-        let path = temp("partial");
+        let (_scratch, path) = temp("partial");
         write_text_atomic(&path, "generation one").unwrap();
         let err = write_atomic(&path, b"generation two", Fault::Partial).unwrap_err();
         assert!(err.contains("partial"), "{}", err);

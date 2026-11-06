@@ -37,6 +37,8 @@ pub mod panel_spread; // #261: market-neutral bucket spread of a feature
 pub mod registry; // #260: versioned feature registry, schema sidecar, views
 pub mod derivatives; // reserved, gated funding/OI/basis family
 pub mod devlog; // #211: optional development log
+#[cfg(test)]
+mod test_scratch; // #775: drop-removing temp dirs for the unit tests
 pub mod devreport; // #211: `rcsr dev-report`
 pub mod eval_soa;
 pub mod expr;
