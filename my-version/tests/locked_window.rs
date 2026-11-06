@@ -1554,6 +1554,10 @@ fn ladder_refuses_out_and_markdown_that_name_one_file() {
         assert_eq!(f.bytes(&f.ledger), ledger_before);
         assert!(f.bytes(&f.marker()).is_none());
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "old");
+        for entry in std::fs::read_dir(&f.dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(!name.ends_with(".tmp"), "{name} left behind for {md}");
+        }
     }
 }
 
