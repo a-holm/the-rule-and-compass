@@ -540,3 +540,102 @@ fn ladder_read_hash_ignores_the_store_directory() {
     let printed = std::fs::read_to_string(Path::new(&da).with_file_name("ladder.json")).unwrap();
     assert!(printed.contains(&format!("\"file\":\"{}.lockbox.json\"", da)), "{printed}");
 }
+
+fn sealed_store(name: &str) -> (Scratch, PathBuf, String, String, String) {
+    let (scratch, dir) = scratch(name);
+    let data = store(&dir, "d.csv");
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+    dev(&data, &l, &["x"], &[]);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    (scratch, dir, data, l, sealed)
+}
+
+fn recorded_read_sha(ledger: &str) -> String {
+    let text = std::fs::read_to_string(ledger).unwrap();
+    let line = text.lines().find(|l| l.contains("\"event\":\"test_read\"")).expect("test_read line");
+    line.split("\"report_sha256\":\"").nth(1).unwrap().split('"').next().unwrap().to_string()
+}
+
+#[test]
+fn walkforward_report_that_cannot_be_written_leaves_the_read_available() {
+    let (_scratch, dir, data, l, sealed) = sealed_store("wf-unwritable");
+    let ledger_before = std::fs::read(&l).unwrap();
+    let marker = format!("{}.locked_reads.jsonl", data);
+    let dir_out = dir.join("is-a-directory");
+    std::fs::create_dir(&dir_out).unwrap();
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--out", &s(&dir_out)]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("the locked read is still available"), "{}", err);
+    assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+    assert!(!Path::new(&marker).exists());
+    let out = s(&dir.join("report.json"));
+    let bad_md = s(&dir.join("no-such-dir").join("r.md"));
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--out", &out, "--markdown", &bad_md]);
+    assert_eq!(code, 3, "{}", err);
+    assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+    assert!(!Path::new(&marker).exists());
+    assert!(!Path::new(&out).exists());
+    assert!(!Path::new(&format!("{}.tmp", out)).exists());
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--out", &out]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(std::fs::read_to_string(&out).unwrap().contains("\"read_count\":1"));
+    assert_eq!(std::fs::read_to_string(&l).unwrap().matches("\"event\":\"test_read\"").count(), 1);
+}
+
+#[test]
+fn walkforward_report_lost_after_the_record_is_recovered() {
+    let (_scratch, dir, data, l, sealed) = sealed_store("wf-lost");
+    let out = s(&dir.join("report.json"));
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--out", &out]);
+    assert_eq!(code, 0, "{}", err);
+    let marker = format!("{}.locked_reads.jsonl", data);
+    let (ledger_before, marker_before) = (std::fs::read(&l).unwrap(), std::fs::read(&marker).unwrap());
+    let first = std::fs::read(&out).unwrap();
+    // the state of a kill between the record and the rename
+    std::fs::remove_file(&out).unwrap();
+    std::fs::write(format!("{}.tmp", out), &first).unwrap();
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--out", &out]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(!Path::new(&out).exists());
+    let hash = recorded_read_sha(&l);
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--out", &out, "--verify-read", "--expect-report-sha256", &hash]);
+    assert_eq!(code, 0, "{}", err);
+    let recovered = std::fs::read_to_string(&out).unwrap();
+    assert!(recovered.contains(&format!("\"report_sha256\":\"{hash}\"")), "{recovered}");
+    assert!(recovered.contains("\"read_count\":1"), "{recovered}");
+    assert!(String::from_utf8_lossy(&first).contains(&hash));
+    assert!(!Path::new(&format!("{}.tmp", out)).exists());
+    assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+    assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
+}
+
+#[test]
+fn walkforward_retry_after_a_marker_without_a_ledger_line_records_the_read() {
+    let (_scratch, dir, data, l, sealed) = sealed_store("wf-marker-only");
+    let ledger_before = std::fs::read(&l).unwrap();
+    let out = s(&dir.join("report.json"));
+    assert_eq!(read(&data, &l, &sealed, &["x"], &["--out", &out]).0, 0);
+    let marker = format!("{}.locked_reads.jsonl", data);
+    let marker_before = std::fs::read(&marker).unwrap();
+    // the state of a kill between the marker line and the ledger line
+    std::fs::write(&l, &ledger_before).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--out", &out, "--verify-read"]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("no recorded read"), "{}", err);
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--out", &out]);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
+    let (code, o, err) = rcsr(&["protocol", "verify", "--ledger", &l, "--data", &data, "--expect-reads", "1"]);
+    assert_eq!(code, 0, "{}{}", o, err);
+}
+
+#[test]
+fn walkforward_verify_read_needs_locked_test() {
+    let (_scratch, _dir, data, l, _sealed) = sealed_store("wf-flag");
+    let w = window("dev", 0, 150, 160, 250);
+    let (code, _, err) = wf(&data, &l, &["x"], &["--window", &w, "--verify-read"]);
+    assert_eq!(code, 2, "{}", err);
+    assert!(err.contains("--verify-read applies to --locked-test only"), "{}", err);
+}

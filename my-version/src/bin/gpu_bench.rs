@@ -341,12 +341,22 @@ fn main() {
     // exponent range, so we report the median and the 99th percentile rather
     // than a single worst case.
     let mut rel: Vec<f64> = Vec::with_capacity(gpu_err.len());
-    let mut penalised = 0usize;
-    for (g, c) in gpu_err.iter().zip(&cpu_err) {
+    let (mut both_failed, mut device_only, mut host_only) = (0usize, 0usize, 0usize);
+    for (i, (g, c)) in gpu_err.iter().zip(&cpu_err).enumerate() {
         let gf = (*g as f64).is_finite() && *g < 1e29;
         let cf = c.is_finite() && *c < 1e29;
         if !gf || !cf {
-            penalised += 1;
+            match (gf, cf) {
+                (false, false) => both_failed += 1,
+                (false, true) => {
+                    device_only += 1;
+                    eprintln!("device-only failure: candidate {} device sse {} host sse {}", i, g, c);
+                }
+                _ => {
+                    host_only += 1;
+                    eprintln!("host-only failure: candidate {} device sse {} host sse {}", i, g, c);
+                }
+            }
             continue;
         }
         rel.push(((*g as f64) - c).abs() / (1.0 + c.abs()));
@@ -480,12 +490,14 @@ fn main() {
         None => println!("quality/GPU-hour : n/a (no finite positive SSE or no GPU wall)"),
     }
     println!(
-        "agreement        : median {:.1e}, p99 {:.1e} rel. error; {}/{} within 1e-3 ({} hard failures)",
+        "agreement        : median {:.1e}, p99 {:.1e} rel. error; {}/{} within 1e-3 (hard failures: {} on both sides, {} on the device only, {} on the host only)",
         med,
         p99,
         within,
         rel.len(),
-        penalised
+        both_failed,
+        device_only,
+        host_only
     );
     println!(
         "provenance       : duty from the harness ledger; for CUPTI/nsys/ncu commands see docs/gpu-backend.md"
