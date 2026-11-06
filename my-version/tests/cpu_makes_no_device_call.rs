@@ -33,7 +33,7 @@ fn strace_opens(path_env: Option<&str>, trace: &Path, prefix: &str, program: &st
     Ok(text.lines().filter(|l| l.contains(&needle) && !l.contains("= -1")).count())
 }
 
-const DEVICE_PREFIX: &str = "/dev/nvidia-none";
+const DEVICE_PREFIX: &str = "/dev/nvidia";
 
 fn rcsr_opens(trace: &Path, args: &[&str]) -> usize {
     strace_opens(None, trace, DEVICE_PREFIX, env!("CARGO_BIN_EXE_rcsr"), args).unwrap_or_else(|e| panic!("{e}"))
