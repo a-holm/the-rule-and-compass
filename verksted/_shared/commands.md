@@ -70,12 +70,14 @@ Three lock holds: `cargo test --release --no-fail-fast`; `RCSR_CUDA_ARCH=sm_86 c
 
 ## Waiting
 
-One blocking call, or one background shell and its notification. Wait on a log line, a file or a count, never on a process name.
+One blocking call, or one background shell and its notification. A wait always uses `wait-for.sh`: on a log line, a file, a count, an exact pid or an executable path. Never write `pgrep -f` (it matches the waiting shell itself; the lint `tools_use_no_pgrep_f` fails on it).
 
 ```sh
 verksted/_tools/wait-for.sh --log "$G/issue$N-<what>.log"       # until RC_DONE; prints the test summary
 verksted/_tools/wait-for.sh --file <path> --timeout 3000
 verksted/_tools/wait-for.sh --count <n> --dir <dir> --glob '*.done'
+verksted/_tools/wait-for.sh --pid "$PID" --timeout 3000       # until that exact pid has ended (reads /proc, no command line)
+verksted/_tools/wait-for.sh --exe /abs/path/to/binary          # until no process runs that executable (exact /proc/<pid>/exe)
 tail --pid="$PID" -f /dev/null          # blocks until the pid you started exits
 kill -0 "$PID"                          # alive? exit 0 yes
 verksted/_tools/watch.sh -m 45 "$WT"/issue-*   # silence watcher: one background shell, prints SILENT <n>min: <path>
