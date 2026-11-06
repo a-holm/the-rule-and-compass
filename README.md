@@ -442,7 +442,7 @@ atomically instead of streaming it. See
   (`start`, `progress`…, `solution`…, `done`) for long runs.
 * **Deterministic**: the same `--seed` gives the same answer, and the seed is
   echoed in the output.
-* **Bounded time**: `--time-budget <seconds>` guarantees the process returns.
+* **Bounded time**: `--time-budget <seconds>` guarantees the process returns. `--interim-chunk` skips the end-of-run report of a chunk that stops on it ([docs/checkpoint.md](docs/checkpoint.md#interim-chunks)).
 * **stdin**: `--data -` reads the table from standard input.
 * **Bounded memory**: `--max-memory 2GB` refuses an input whose estimated
   footprint would exceed the budget, with exit 3 and a fix, instead of being
@@ -656,7 +656,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--patience N]
      [--gpu] [--gpu-memory size] [--dispatch auto|device] [--calibration anchors|probe|PATH] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
      [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random]
-     [--time-budget seconds] [--save file] [--save-every N] [--resume file]
+     [--time-budget seconds] [--interim-chunk] [--save file] [--save-every N] [--resume file]
      [--allow-backend-change] [--allow-build-change] [--run-manifest file] [--json-out file]
      [--format text|json|ndjson] [--json] [--ndjson] [--progress]
      [--dev-log-level summary|full] [--dev-log file.ndjson] [--no-dev-log]

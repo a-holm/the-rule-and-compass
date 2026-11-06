@@ -797,17 +797,17 @@ SEARCH:
                              search state and skip the end-of-run report (exact
                              refit, test scoring, baselines, diagnostics,
                              gates). run.json is a short document with
-                             "interim":true; rcsr walkforward --from-run and
+                             interim true; rcsr walkforward --from-run and
                              rcsr verify-manifest refuse it (exit 2). A chunk
                              that stops for any other reason (generations,
                              patience, solved) writes the full report. The
                              last chunk's checkpoint, archive and run.json equal
                              those of a run without the flag. Execution setting:
                              not saved, not part of the config hash. Not for
-                             --target y1,y2. Without a last chunk no report
-                             exists: run rcsr again with --resume and without
-                             --interim-chunk (a --time-budget of 0 reports at
-                             once after one generation)
+                             --target y1,y2. When no last chunk ran, no report
+                             exists: run again with --resume and --time-budget 0
+                             and without --interim-chunk. That runs one more
+                             generation and writes the full report
   --gpu                      assert that the GPU must guide the search: an
                              error (exit 2) when the binary was not built with
                              --features cuda or no device is present. After
