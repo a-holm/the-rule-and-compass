@@ -5457,7 +5457,7 @@ fn offer(sink: &Option<(&std::sync::mpsc::SyncSender<PipelineJob>, usize)>, slot
 /// #848: whether the fixed-position filter applies: the flag is on, the fitness
 /// is the long/flat P&L and the data has input variables.
 fn fixed_position_filter(cfg: &Config, nvars: usize) -> bool {
-    false && cfg.reject_fixed_position && nvars > 0 && cfg.fitness.book().is_some()
+    cfg.reject_fixed_position && nvars > 0 && cfg.fitness.book().is_some()
 }
 
 /// #848: whether `t` holds one position on every input in exact arithmetic
