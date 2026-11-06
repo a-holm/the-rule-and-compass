@@ -56,6 +56,7 @@ fn calibration_block(json: &str) -> String {
 }
 
 /// `(stage, route, reason)` of every ledger row.
+#[cfg(feature = "cuda")]
 fn route_ledger(json: &str) -> Vec<(String, String, String)> {
     let ledger = json.split("\"route_ledger\":").nth(1).expect("dispatch.route_ledger");
     let field = |row: &str, key: &str| -> String {

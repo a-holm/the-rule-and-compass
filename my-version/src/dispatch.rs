@@ -1979,7 +1979,7 @@ mod tests {
 
     #[test]
     fn calibration_v1_file_still_loads() {
-        let path = temp_file("v1");
+        let (_scratch, path) = temp_file("v1");
         let text = sample_calibration()
             .file_text(Some("Test GPU"), "b", "2026-11-05T10:00:00Z")
             .replace(CALIBRATION_SCHEMA, CALIBRATION_SCHEMA_V1)
@@ -2003,7 +2003,7 @@ mod tests {
     fn calibration_v2_enrich_roundtrip() {
         let mut want = sample_calibration();
         want.enrich = Some(enrich_sample());
-        let path = temp_file("v2");
+        let (_scratch, path) = temp_file("v2");
         let text = want.file_text(Some("Test GPU"), "b", "2026-11-05T10:00:00Z");
         assert!(text.contains("rcsr-calibration/2"), "{text}");
         std::fs::write(&path, &text).unwrap();
@@ -2025,7 +2025,7 @@ mod tests {
 
     #[test]
     fn a_v2_file_without_an_enrich_object_gives_anchor_plans() {
-        let path = temp_file("v2-null");
+        let (_scratch, path) = temp_file("v2-null");
         let text = sample_calibration().file_text(Some("Test GPU"), "b", "2026-11-05T10:00:00Z");
         assert!(text.contains("\"enrich\":null"), "{text}");
         std::fs::write(&path, &text).unwrap();
@@ -2057,7 +2057,7 @@ mod tests {
         ];
         for (name, text, expect) in cases {
             assert_ne!(text, good, "{name}: the case must change the file");
-            let path = temp_file(name);
+            let (_scratch, path) = temp_file(name);
             std::fs::write(&path, &text).unwrap();
             let err = CalibrationRequest::File(path.clone())
                 .resolve(Some("Test GPU"))
