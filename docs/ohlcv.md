@@ -1103,20 +1103,20 @@ family.
 
 `1e-12` is declared for anything that evaluates `ln`, `sin` or `cos` (`r<k>`, `vol<w>`, `lag_r1_<k>`, `vz96`, `vol_z96`, calendar, the log-based exotic columns, the MTF `vol` leaf) and for the flow and benchmark columns named by #297 and #299. `ou_hl96` is `1e-12`: its window co-moments are double-word sums and its input is `ln_1p((C - SMA96) / SMA96)`, so a last-bit logarithm difference between the device and the host stays far below 1e-12 (`ou_hl96_response_to_last_bit_close_noise_is_bounded` measures the CPU response to 1-ulp close noise). Elementwise geometry, min/max, ranks, MTF lookups and recurrences evaluated in the CPU order are `bitwise`. A device column whose tier is not one of the two fails `every_device_column_declares_exactly_one_tier`.
 
-The fixture has 24 symbols x 21,000 bars (476,730 rows) with holes, a 5 h and a 32 h outage (stale 1h/4h and 1d buckets), a NaN close, zero volume, `H == L`, tied returns, PIT non-member rows and fewer than 20 members before bar 3,000.
+The fixture has 24 symbols x 6,000 bars (116,820 rows) with holes, a 5 h and a 32 h outage (stale 1h/4h and 1d buckets), a NaN close, zero volume, `H == L`, tied returns, PIT non-member rows and fewer than 20 members before bar 3,000.
 
 ```sh
-# Whole harness: ~9 minutes on an RTX 3060; one test at a time under the machine lock
+# Whole harness; one test at a time under the machine lock
 cd my-version && RCSR_CUDA_ARCH=sm_86 cargo test --release --features cuda --test gpu_parity -- --nocapture
-# Quick iteration (smaller fixture), one test by name
-RCSR_PARITY_PER_SYMBOL=6000 cargo test --release --features cuda --test gpu_parity device_columns_match -- --nocapture
+# One test by name; RCSR_PARITY_PER_SYMBOL sets a larger fixture
+RCSR_PARITY_PER_SYMBOL=21000 cargo test --release --features cuda --test gpu_parity device_columns_match -- --nocapture
 # Per-column numbers
 RCSR_PARITY_VERBOSE=1 ...
 # Known parity bugs (ignored, each asserts its column at its tier)
 cargo test --release --features cuda --test gpu_parity bug_ -- --ignored
 ```
 
-What the tests check: every column at its tier (`device_columns_match_the_cpu_at_their_declared_tier`, with a per-family table); cold vs warm store SHA-256; `--chunk-rows` 1 and 4,096 against 65,536 and an 8,191-row store layout (symbol batching); prefix replay at 20 cuts with a future-shift canary; panel prep (#301) and PIT as-of joins (#302) CPU vs device, cold/warm, block sizes, prefix replay and canary; the MTF family on a size its context accepts. `enrich::set_gpu_floor_for_tests(0)` lowers the 1,000,000-row `--gpu on` floor for this binary only.
+What the tests check: every column at its tier (`device_columns_match_the_cpu_at_their_declared_tier`, with a per-family table); cold vs warm store SHA-256; `--chunk-rows` 1 and 4,096 against 65,536 and an 8,191-row store layout (symbol batching); prefix replay at 20 boundary cuts (window edges, holes, listings, NaN, zero-volume and `H == L` last rows, all-but-last) with a future-shift canary, and `prefix_cuts_hit_their_boundaries` checks that each cut lands on its boundary; the calendar columns over every month, year and leap-day end from 2023 to 2026; panel prep (#301) and PIT as-of joins (#302) CPU vs device, cold/warm, block sizes, prefix replay and canary; the MTF family on a size its context accepts; the MTF device context on one 21,000-bar holey symbol. `enrich::set_gpu_floor_for_tests(0)` lowers the 1,000,000-row `--gpu on` floor for this binary only.
 
 Large store (not in git): `/mnt/lager/tmp/opencode/prep-measure/panel15m.rcsb` (16,113,108 rows). Each arm is its own invocation so no lock hold covers both.
 
