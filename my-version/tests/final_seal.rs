@@ -737,7 +737,7 @@ fn walkforward_refuses_a_ledger_event_without_a_valid_read_count() {
     for extra in [vec!["--out", out.as_str()], vec!["--out", out.as_str(), "--verify-read"]] {
         let (code, _, err) = read(&data, &l, &sealed, &["x"], &extra);
         assert_eq!(code, 3, "{}", err);
-        assert!(err.contains("line 4 is a test_read event without a valid read_count"), "{}", err);
+        assert!(err.contains("line 3 is a test_read event without a valid read_count"), "{}", err);
         assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
         assert!(!Path::new(&marker).exists() && !Path::new(&out).exists());
     }

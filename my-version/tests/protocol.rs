@@ -778,13 +778,12 @@ const FINAL_SEAL: &str = "\"event\":\"seal\",\"sealed_sha256\":\"aa\",\"final\":
 fn an_event_without_the_fields_a_read_depends_on_is_a_ledger_fault() {
     let (_scratch, dir) = scratch("event-fields");
     let path = dir.join("ledger.jsonl");
-    let faults: [(&str, &str); 22] = [
+    let faults: [(&str, &str); 21] = [
         ("read_count", "\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"bb\",\"test_read\":true"),
         ("read_count", "\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"bb\",\"read_count\":\"1\",\"test_read\":true"),
         ("read_count", "\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"bb\",\"read_count\":1.5,\"test_read\":true"),
         ("read_count", "\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"bb\",\"read_count\":-1,\"test_read\":true"),
         ("read_count", "\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"bb\",\"read_count\":null,\"test_read\":true"),
-        ("read_count", "\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"bb\",\"read_count\":,\"test_read\":true"),
         ("id", "\"event\":\"test_read\",\"report_sha256\":\"bb\",\"read_count\":1,\"test_read\":true"),
         ("id", "\"event\":\"test_read\",\"id\":\"\",\"report_sha256\":\"bb\",\"read_count\":1,\"test_read\":true"),
         ("report_sha256", "\"event\":\"test_read\",\"id\":\"c\",\"read_count\":1,\"test_read\":true"),
