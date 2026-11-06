@@ -54,6 +54,7 @@ for v in 13.0 12.0; do
   cat > "$T/cuda-$v/bin/compute-sanitizer" <<'STUB'
 #!/usr/bin/env bash
 echo "san under=${RCSR_UNDER_SANITIZER:-} $*" >> "$FAKE_DIR/san-calls"
+echo "req=${RCSR_REQUIRE_DEVICE:-}" >> "$FAKE_DIR/san-req"
 [ -z "${FAKE_BANNER:-}" ] || echo "$FAKE_BANNER"
 echo "${FAKE_SUMMARY:-ERROR SUMMARY: 0 errors}"
 exit "${FAKE_SAN_RC:-0}"
@@ -76,6 +77,7 @@ check clean-rc "$r" "0"
 has clean-slot "$T/calls" '^slot .*cargo test'
 has clean-lock "$T/calls" '^lock .*compute-sanitizer'
 has clean-san-args "$T/san-calls" 'san under=memcheck --tool memcheck --leak-check no --error-exitcode 99 /fake/deps/gpu_fit-bbb some_test --exact'
+check clean-require-device "$(sort -u "$T/san-req" | tr "\n" " ")" "req=1 "
 has clean-cargo-args "$T/cargo-calls" 'cargo test --release --features cuda --no-run --message-format=json --test gpu_fit'
 has clean-summary "$rlog" '^ERROR SUMMARY: 0 errors$'
 has clean-xid "$rlog" '^xid before=4 after=4$'

@@ -4264,7 +4264,7 @@ mod tests {
         match GpuEvaluator::new(cols, n, nv, y) {
             Some(ev) => Some(ev),
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 None
             }
         }
@@ -5987,7 +5987,7 @@ mod fit_tests {
         let (p, n, step) = (3usize, 800usize, 4usize);
         let (x, y, cols, y32, _target, start) = linear_fixture(p, n);
         let Some(scorer) = GpuEvaluator::new(&cols, n, p, &y32) else {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         };
         let rows: Vec<usize> = (0..n).step_by(step).collect();
@@ -6032,7 +6032,7 @@ mod fit_tests {
             let mut ev = match GpuEvaluator::new(&cols, n, p, &y32) {
                 Some(ev) => ev,
                 None => {
-                    eprintln!("skipping GPU test: no usable CUDA device");
+                    crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                     return;
                 }
             };
@@ -6112,7 +6112,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -6200,7 +6200,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, pmax, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -6306,7 +6306,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -6480,7 +6480,7 @@ mod fit_tests {
             let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
                 Some(ev) => ev,
                 None => {
-                    eprintln!("skipping GPU benchmark: no usable device");
+                    crate::backend::skip_without_device("skipping GPU benchmark: no usable device");
                     return;
                 }
             };
@@ -6569,7 +6569,7 @@ mod fit_tests {
             let mut ev = match GpuEvaluator::new(cols, n, pmax, y32) {
                 Some(ev) => ev,
                 None => {
-                    eprintln!("skipping GPU benchmark: no usable device");
+                    crate::backend::skip_without_device("skipping GPU benchmark: no usable device");
                     return;
                 }
             };
@@ -6700,7 +6700,7 @@ mod fit_tests {
             let mut ev = match GpuEvaluator::new(&cols, n, pmax, &y32) {
                 Some(ev) => ev,
                 None => {
-                    eprintln!("skipping GPU benchmark: no usable device");
+                    crate::backend::skip_without_device("skipping GPU benchmark: no usable device");
                     return;
                 }
             };
@@ -6783,7 +6783,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 2, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -6848,7 +6848,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -6908,7 +6908,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -6957,7 +6957,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -6992,7 +6992,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -7056,7 +7056,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -7102,7 +7102,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -7180,7 +7180,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -7244,7 +7244,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -7290,7 +7290,7 @@ mod fit_tests {
             let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
                 Some(ev) => ev,
                 None => {
-                    eprintln!("skipping GPU test: no usable CUDA device");
+                    crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                     return;
                 }
             };
@@ -7313,7 +7313,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -7367,7 +7367,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -7429,7 +7429,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -7481,7 +7481,7 @@ mod fit_tests {
                 let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
                     Some(ev) => ev,
                     None => {
-                        eprintln!("skipping GPU benchmark: no usable device");
+                        crate::backend::skip_without_device("skipping GPU benchmark: no usable device");
                         return;
                     }
                 };
@@ -7573,7 +7573,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU benchmark: no usable device");
+                crate::backend::skip_without_device("skipping GPU benchmark: no usable device");
                 return;
             }
         };
@@ -7669,7 +7669,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -7718,7 +7718,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -7754,7 +7754,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -7791,7 +7791,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -7825,7 +7825,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -7872,7 +7872,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -7906,7 +7906,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -7930,7 +7930,7 @@ mod fit_tests {
         let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return;
             }
         };
@@ -8013,7 +8013,7 @@ mod fit_tests {
             let mut ev = match GpuEvaluator::new(&cols, n, pmax, &y32) {
                 Some(ev) => ev,
                 None => {
-                    eprintln!("skipping GPU benchmark: no usable device");
+                    crate::backend::skip_without_device("skipping GPU benchmark: no usable device");
                     return;
                 }
             };
@@ -8124,7 +8124,7 @@ mod rank_tests {
         let mut ev = match GpuEvaluator::new(&f.cols32, f.n, f.nv, &f.y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return None;
             }
         };
@@ -8945,7 +8945,7 @@ mod score_batch_bench {
             .unwrap_or(8);
         let (c32, c64, nv, y32, y, x) = fixture(n);
         let Some(mut ev) = GpuEvaluator::new(&c32, n, nv, &y32) else {
-            eprintln!("skipping GPU measurement: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU measurement: no usable CUDA device");
             return;
         };
         assert!(ev.set_fit_data(&c64, &y, &[]), "f64 data upload");
@@ -9053,7 +9053,7 @@ mod maximum_tests {
         let mut ev = match GpuEvaluator::new(&f.cols32, f.n, f.nv, &f.y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return None;
             }
         };
@@ -9428,7 +9428,7 @@ mod order_stat_tests {
         let mut ev = match GpuEvaluator::new(&f.cols32, f.n, f.nv, &f.y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return None;
             }
         };
@@ -10195,7 +10195,7 @@ mod persistent_tests {
         let mut ev = match GpuEvaluator::new(&f.cols32, N, 2, &f.y32) {
             Some(ev) => ev,
             None => {
-                eprintln!("skipping GPU test: no usable CUDA device");
+                crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
                 return None;
             }
         };
@@ -10517,7 +10517,7 @@ mod classification_parity_tests {
     #[test]
     fn device_matches_cpu_for_every_classification_objective() {
         if !probe().available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let s = binary_sample(2_000, 0.35, 0.25, 21);
@@ -10574,7 +10574,7 @@ mod classification_parity_tests {
     #[test]
     fn large_finite_predictions_score_like_the_cpu() {
         if !probe().available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let s = binary_sample(512, 0.35, 0.25, 22);
@@ -10706,7 +10706,7 @@ mod alloc_ledger_tests {
     #[test]
     fn rank_trial_sub_waves_equal_the_unsplit_scores() {
         let Some(mut ev) = evaluator(3_000) else {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         };
         let t = linear();
@@ -10730,7 +10730,7 @@ mod alloc_ledger_tests {
     #[test]
     fn median_trial_sub_waves_equal_the_unsplit_scores() {
         let Some(mut ev) = evaluator(3_001) else {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         };
         let t = linear();
@@ -10763,7 +10763,7 @@ mod alloc_ledger_tests {
         let n = 1_500_000usize;
         assert!(6 * n as u64 * 64 > 512 * MIB);
         let Some(mut ev) = evaluator(n) else {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         };
         let t = linear();
@@ -10806,7 +10806,7 @@ mod alloc_ledger_tests {
         let n = 200_000usize;
         let (x32, _, y32, _) = data(n);
         let Some(mut ev) = GpuEvaluator::new(&x32, n, 1, &y32) else {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         };
         let trees: Vec<Node> = (0..100).map(|_| input(0)).collect();
@@ -10843,7 +10843,7 @@ mod alloc_ledger_tests {
         let (x32, x, y32, y) = data(n);
         let resident = (n * 4 + n * 4) as u64;
         let Some(mut ev) = GpuEvaluator::with_budget(&x32, n, 1, &y32, Some(resident + MIB)) else {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         };
         assert!(!ev.set_fit_data(&x, &y, &[]));
@@ -10863,7 +10863,7 @@ mod alloc_ledger_tests {
         let (x32, x, y32, y) = data(n);
         let resident = (n * 4 + n * 4) as u64;
         let Some(mut ev) = GpuEvaluator::with_budget(&x32, n, 1, &y32, Some(resident + MIB)) else {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         };
         assert!(!ev.set_fit_data(&x, &y, &[]));
@@ -10973,7 +10973,7 @@ mod carry_tests {
 
     fn evaluator(d: &Data, weights: &[f64]) -> Option<GpuEvaluator> {
         if !probe().available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return None;
         }
         let mut ev = GpuEvaluator::new(&d.cols, d.n, 2, &d.y)?;

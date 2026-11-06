@@ -147,7 +147,7 @@ mod tests {
     #[ignore = "timing measurement of the probes"]
     fn device_probe_three_runs_after_the_cold_start_print_their_agreement() {
         if !crate::gpu::probe().available() {
-            eprintln!("no usable CUDA device: device probe test skipped");
+            crate::backend::skip_without_device("no usable CUDA device: device probe test skipped");
             return;
         }
         let runs: Vec<Calibration> = (0..4)

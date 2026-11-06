@@ -81,7 +81,7 @@ fn run_big(tag: &str, extra: &[&str]) -> Output {
 #[test]
 fn fit_rows_default_applies_on_the_gpu_and_zero_turns_it_off() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let on = run_big("on", &["--gpu", "--fit-strategy", "gpu"]);

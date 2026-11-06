@@ -13,7 +13,11 @@ mod scratch;
 use scratch::Scratch;
 
 fn has_device() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 fn tmp_csv(rows: usize) -> (Scratch, PathBuf) {

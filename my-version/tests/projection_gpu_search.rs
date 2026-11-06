@@ -29,7 +29,11 @@ const FULL_ROWS: usize = 4_775_757;
 const FULL_STORE: &str = "/mnt/lager/tmp/opencode/293-wide364.rcsb";
 
 fn has_device() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 #[path = "common/scratch.rs"]

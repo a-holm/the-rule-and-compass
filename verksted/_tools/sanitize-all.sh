@@ -4,7 +4,7 @@
 # Builds once in the build slot (cargo test --release --features cuda --no-run --message-format=json), lists every test
 # executable (lib, bin-<name>, or the --test target name), then runs each one under the CUDA 13.0 memcheck through the
 # test lock, one lock hold per run, rc-run.sh run --cuda --timeout 580:
-#   env RCSR_UNDER_SANITIZER=memcheck $SANITIZER --tool memcheck --leak-check no --error-exitcode 99 <bin> --skip <test> ... --exact
+#   env RCSR_UNDER_SANITIZER=memcheck RCSR_REQUIRE_DEVICE=1 $SANITIZER --tool memcheck --leak-check no --error-exitcode 99 <bin> --skip <test> ... --exact
 # Plan modes: `<binary> * skip` runs nothing; `<binary> <test> skip` adds --skip <test>; `<binary> <test> api-errors-no`
 # is skipped in the binary run and gets its own run with --report-api-errors no and `--exact <test>`.
 # --only limits the pass to the named binaries. --dry-run prints the planned commands, builds and runs nothing.
@@ -82,7 +82,7 @@ emit() {
 san_cmd() { # <api-errors or empty> <bin> args...
   local api=$1 bin=$2
   shift 2
-  printf 'env RCSR_UNDER_SANITIZER=memcheck %s --tool memcheck' "$SANITIZER"
+  printf 'env RCSR_UNDER_SANITIZER=memcheck RCSR_REQUIRE_DEVICE=1 %s --tool memcheck' "$SANITIZER"
   [ ${#target_args[@]} -eq 0 ] || printf ' %s' "${target_args[@]}"
   printf ' --leak-check no --error-exitcode 99'
   [ -z "$api" ] || printf ' --report-api-errors %s' "$api"
@@ -102,7 +102,7 @@ run_one() { # label tag api bin args...
   local label=$1 tag=$2 api=$3 bin=$4
   shift 4
   local log t0 t1 rc
-  local argv=(env RCSR_UNDER_SANITIZER=memcheck "$SANITIZER" --tool memcheck ${target_args[@]+"${target_args[@]}"} --leak-check no --error-exitcode 99)
+  local argv=(env RCSR_UNDER_SANITIZER=memcheck RCSR_REQUIRE_DEVICE=1 "$SANITIZER" --tool memcheck ${target_args[@]+"${target_args[@]}"} --leak-check no --error-exitcode 99)
   [ -z "$api" ] || argv+=(--report-api-errors "$api")
   argv+=("$bin" "$@")
   if [ "$dry" -eq 1 ]; then

@@ -98,6 +98,8 @@ check hold-timeouts-found "$(grep -- '--features cuda --no-fail-fast' "$T/cmds" 
 # every timeout the gate starts has a kill-after: none is left bare
 check no-bare-timeout "$(grep -cE 'timeout [0-9]' "$T/cmds")" 0
 check cpu-kill-after "$(grep -c 'timeout -k 30 5400 cargo test --release --no-fail-fast$' "$T/cmds")" 1
+check cuda-require-device "$(grep -- "--features cuda --no-fail-fast" "$T/cmds" | grep -c "RCSR_REQUIRE_DEVICE=1")" 6
+check cpu-no-require-device "$(grep -c "RCSR_REQUIRE_DEVICE" <<< "$(grep -v -- "--features cuda" "$T/cmds")")" 0
 check bench-kill-after "$(grep -c 'timeout -k 30 5400 cargo build.*timeout -k 30 1800 ' "$T/cmds")" 1
 
 # The first target times out: the others still run and the gate fails.

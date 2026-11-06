@@ -170,7 +170,7 @@ fn afp_is_deterministic_on_the_device() {
         };
         let a = run(1);
         if a.backend != rcsr::backend::Kind::Gpu {
-            eprintln!("skipped: no usable device ({:?})", a.backend_reason);
+            rcsr::backend::skip_without_device(&format!("skipped: no usable device ({:?})", a.backend_reason));
             return;
         }
         let b = run(1);

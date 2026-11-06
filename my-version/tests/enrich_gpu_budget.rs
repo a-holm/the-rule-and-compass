@@ -59,7 +59,7 @@ impl Drop for BudgetReset {
 #[test]
 fn resident_tile_outputs_leave_room_for_the_fused_families() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     enrich::set_gpu_floor_for_tests(0);

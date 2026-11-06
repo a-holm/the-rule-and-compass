@@ -59,6 +59,32 @@ impl Probe {
     }
 }
 
+/// The environment variable that turns a skipped device test into a failure.
+pub const REQUIRE_DEVICE_ENV: &str = "RCSR_REQUIRE_DEVICE";
+
+/// The pure decision behind [`skip_without_device`]: `Err` carries the failure message
+/// when the device is required, `Ok` means the test may skip.
+pub fn skip_decision(required: bool, reason: &str) -> Result<(), String> {
+    if required {
+        Err(format!(
+            "{REQUIRE_DEVICE_ENV}=1 but the device test cannot run: {reason} (RCSR_GPU=0 also disables the device)"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Called by a device test that found no usable device, before it returns. It prints
+/// `reason` and lets the test skip, or panics when `RCSR_REQUIRE_DEVICE=1`, so a gate
+/// on a machine without its device fails instead of passing silently.
+pub fn skip_without_device(reason: &str) {
+    let required = std::env::var(REQUIRE_DEVICE_ENV).as_deref() == Ok("1");
+    match skip_decision(required, reason) {
+        Ok(()) => eprintln!("{reason}"),
+        Err(message) => panic!("{message}"),
+    }
+}
+
 /// Probe the CUDA device once. A non-CUDA build reports why it cannot.
 pub fn probe() -> Probe {
     #[cfg(feature = "cuda")]
@@ -83,6 +109,15 @@ mod tests {
             assert!(p.device.is_none());
             assert_eq!(p.reason.as_deref(), Some("built without --features cuda"));
         }
+    }
+
+    #[test]
+    fn a_required_device_that_is_missing_fails_the_skip() {
+        let err = skip_decision(true, "no usable CUDA device").unwrap_err();
+        assert!(err.contains("RCSR_REQUIRE_DEVICE=1"), "{err}");
+        assert!(err.contains("no usable CUDA device"), "{err}");
+        assert!(err.contains("RCSR_GPU=0"), "{err}");
+        assert!(skip_decision(false, "no usable CUDA device").is_ok());
     }
 
     #[test]

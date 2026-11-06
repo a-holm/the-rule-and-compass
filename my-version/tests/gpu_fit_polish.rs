@@ -78,7 +78,7 @@ fn fit_polish_defaults_to_f64_and_round_trips_through_the_checkpoint() {
 #[test]
 fn device_search_honours_fit_polish_and_splits_the_kernel_seconds() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(1200, 1);

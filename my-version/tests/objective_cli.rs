@@ -496,7 +496,11 @@ fn run_gpu(data: &str, spec: &str, flag: &[&str], fault: &str, extra: &[&str]) -
 
 #[cfg(feature = "cuda")]
 fn has_device(o: &Output) -> bool {
-    !(code(o) == 2 && stderr(o).contains("no GPU is available"))
+    let present = !(code(o) == 2 && stderr(o).contains("no GPU is available"));
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 #[cfg(feature = "cuda")]
