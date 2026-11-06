@@ -1,5 +1,7 @@
 # Brief clerk section: merge PR <PR> for issue <N>
 
+Hard rules: never `pkill` or `killall` (kill only a pid you started, with `kill <pid>`); a wait uses `wait-for.sh`, never `pgrep -f`; no Python. A lint in `verksted_tools` fails on `pkill` and `killall` in scripts.
+
 Used with `../_shared/brief.md`; `../_tools/brief.sh clerk --issue <N> --pr <PR>` prints the dispatch prompt. Replace every angle-bracket placeholder.
 
 Repo root, GitHub repo, use `gh`. Base branch `$BASE` (`integration/gpu-hardening`). Never merge to `main`. Never force-push, never rebase, never `git stash`, no Python, no pkill. Do not run cargo, do not edit code; you only verify and merge. The orchestrator already accepted the PR's design deviations; your job is to check the evidence and merge.

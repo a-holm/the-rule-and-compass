@@ -1,5 +1,7 @@
 # Brief ticket section: <issue number and title>
 
+Hard rules: never `pkill` or `killall` (kill only a pid you started, with `kill <pid>`); a wait uses `wait-for.sh`, never `pgrep -f`; no Python. A lint in `verksted_tools` fails on `pkill` and `killall` in scripts.
+
 Render the dispatch prompt with `../_tools/brief.sh impl --issue <N> --slug <slug>`; it names `../_shared/brief.md` and this file. Save it as `../03_orchestrate/stages/02_brief/output/brief-<N>.md` and append the filled ticket fields below. Replace every angle-bracket placeholder in what you append.
 
 Ticket fields (copy these lines into the brief; the steps stay here):
