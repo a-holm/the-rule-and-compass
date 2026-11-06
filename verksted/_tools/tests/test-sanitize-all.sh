@@ -65,6 +65,16 @@ cat > "$T/cuda-13.0/bin/compute-sanitizer" <<'STUB'
 #!/usr/bin/env bash
 echo "san under=${RCSR_UNDER_SANITIZER:-} $*" >> "$FAKE_DIR/san-calls"
 case "$*" in
+  *"${FAKE_NC_ON:-@none@}"*)
+    case "${FAKE_NC_MODE:-ok}" in
+      failed) echo "running 17 tests"; echo "test result: FAILED. 16 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out;" ;;
+      notr) echo "running 17 tests" ;;
+      ignored) echo "running 0 tests"; echo "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out;" ;;
+      *) echo "running 17 tests"; echo "test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;" ;;
+    esac
+    [ "${FAKE_NC_MODE:-ok}" = nomsg ] || echo "========= Error: Target application terminated before first instrumented API call"
+    exit "${FAKE_NC_RC:-255}"
+    ;;
   *"${FAKE_ZERO_ON:-@none@}"*)
     case "${FAKE_ZERO_MODE:-plan}" in
       run1) echo "running 1 test"; echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;" ;;
@@ -90,7 +100,7 @@ chmod +x "$T/cuda-13.0/bin/compute-sanitizer"
 run() {
   : > "$T/calls"; : > "$T/san-calls"; : > "$T/cargo-calls"; : > "$T/timeouts"
   env FAKE_DIR="$T" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
-    RCSR_XID_CMD="cat '$T/xid'" RCSR_SANITIZER="$T/cuda-13.0/bin/compute-sanitizer" RCSR_SANITIZER_PLAN="$T/plan" \
+    RCSR_XID_CMD="cat '$T/xid'" RCSR_SANITIZER="$T/cuda-13.0/bin/compute-sanitizer" RCSR_SANITIZER_PLAN="${PLAN:-$T/plan}" \
     FAKE_TIMEOUT_LOG="$T/timeouts" PATH="$T/bin:$PATH" bash "$ALL" "$@"
 }
 sum=$T/gates/issue9-san-summary.log
@@ -147,6 +157,58 @@ for mode in run1 nofilter nomsg; do
 done
 FAKE_ZERO_RC=99 FAKE_ZERO_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check zero-rc99-rc "$r" "1"
+
+# no CUDA call: rc 255 with the sanitizer message and passing tests is a pass only for a binary listed `* no-cuda`
+cp "$T/plan" "$T/plan-nc"
+echo 'gpu_fit * no-cuda pure CPU: no CUDA call by design' >> "$T/plan-nc"
+FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check nc-unlisted-rc "$r" "1"
+has nc-unlisted-line "$sum" '^gpu_fit unexpected no CUDA call: add a plan line or fix the test \| test result: ok\. 17 passed'
+hasnt nc-unlisted-not-listed "$sum" 'no CUDA call \(listed\)'
+has nc-unlisted-count "$sum" '^unexpected no-cuda: 1$'
+has nc-unlisted-others-ran "$sum" '^gpu_memory_plan rc=0'
+PLAN=$T/plan-nc FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > "$T/out" 2>&1; r=$?
+check nc-listed-rc "$r" "0"
+has nc-listed-line "$sum" '^gpu_fit no CUDA call \(listed\) \| test result: ok\. 17 passed; 0 failed'
+hasnt nc-listed-no-rc-line "$sum" '^gpu_fit rc='
+has nc-listed-count "$sum" '^no-cuda binaries: 1$'
+has nc-listed-unexpected-count "$sum" '^unexpected no-cuda: 0$'
+has nc-listed-called-count "$sum" '^listed no-cuda but called CUDA: 0$'
+has nc-listed-stdout "$T/out" '^no-cuda binaries: 1$'
+has nc-listed-runs-whole-binary "$T/san-calls" 'error-exitcode 99 /fake/deps/gpu_fit-fff$'
+# a listed binary whose only test is ignored ran no test and made no CUDA call
+PLAN=$T/plan-nc FAKE_NC_MODE=ignored FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check nc-ignored-rc "$r" "0"
+has nc-ignored-line "$sum" '^gpu_fit no CUDA call \(listed\) \| test result: ok\. 0 passed; 0 failed; 1 ignored'
+# a listed binary that calls CUDA gets the memcheck verdict and the summary says so
+PLAN=$T/plan-nc run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check nc-called-rc "$r" "0"
+has nc-called-line "$sum" '^gpu_fit rc=0 .*ERROR SUMMARY: 0 errors \| listed no-cuda but called CUDA$'
+has nc-called-count "$sum" '^listed no-cuda but called CUDA: 1$'
+has nc-called-zero-listed "$sum" '^no-cuda binaries: 0$'
+PLAN=$T/plan-nc FAKE_FAIL_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check nc-called-errors-rc "$r" "1"
+has nc-called-errors-line "$sum" '^gpu_fit rc=99 .*ERROR SUMMARY: 2 errors \| listed no-cuda but called CUDA$'
+# everything else stays a failure for a listed binary
+for mode in failed nomsg notr; do
+  PLAN=$T/plan-nc FAKE_NC_MODE=$mode FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+  check "nc-$mode-rc" "$r" "1"
+  has "nc-$mode-line" "$sum" '^gpu_fit rc=255 '
+  hasnt "nc-$mode-not-listed-pass" "$sum" 'no CUDA call \(listed\)'
+done
+PLAN=$T/plan-nc FAKE_NC_RC=99 FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check nc-rc99-rc "$r" "1"
+PLAN=$T/plan-nc FAKE_NC_RC=139 FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check nc-rc139-rc "$r" "1"
+has nc-rc139-line "$sum" '^gpu_fit rc=139 '
+PLAN=$T/plan-nc FAKE_NC_RC=124 FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check nc-budget-rc "$r" "1"
+has nc-budget-line "$sum" '^gpu_fit rc=124 .* \| budget$'
+# the directive takes only `*`; a named test with no-cuda is a plan error
+printf 'gpu_fit some_test no-cuda reason\n' > "$T/plan-bad"
+PLAN=$T/plan-bad run "$T/wt" 9 > "$T/out" 2>&1; r=$?
+check nc-named-rc "$r" "2"
+has nc-named-msg "$T/out" "no-cuda needs '\*'"
 
 # a rising Xid count stops at once with 70
 echo 4 > "$T/xid"
