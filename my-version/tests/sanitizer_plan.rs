@@ -32,8 +32,11 @@ fn parse(text: &str) -> Result<Vec<Line>, String> {
             _ => return Err(format!("line {no}: need <binary> <test> <mode> <reason>")),
         };
         let reason = it.collect::<Vec<_>>().join(" ");
-        if mode != "skip" && mode != "api-errors-no" {
+        if mode != "skip" && mode != "api-errors-no" && mode != "no-cuda" {
             return Err(format!("line {no}: unknown mode '{mode}'"));
+        }
+        if mode == "no-cuda" && test != "*" {
+            return Err(format!("line {no}: no-cuda needs '*' as the test"));
         }
         if reason.is_empty() {
             return Err(format!("line {no}: empty reason"));
@@ -168,6 +171,7 @@ fn star_and_named_lines_for_one_binary_fail() {
 fn an_empty_reason_or_unknown_mode_fails() {
     assert!(parse("gpu_ring * skip\n").is_err());
     assert!(parse("gpu_ring * maybe why\n").is_err());
+    assert!(parse("gpu_ring * no-cuda\n").is_err());
 }
 
 #[test]
@@ -190,4 +194,18 @@ fn pick_follows_the_marker() {
     let want = if std::env::var_os("RCSR_UNDER_SANITIZER").is_some() { 2 } else { 1 };
     assert_eq!(sanitizer::pick(1, 2), want);
     assert_eq!(sanitizer::active(), want == 2);
+}
+
+#[test]
+fn no_cuda_takes_only_a_star_line() {
+    assert!(parse("gpu_ring * no-cuda reason\n").is_ok());
+    let Err(err) = parse("gpu_ring some_test no-cuda reason\n") else { panic!("accepted") };
+    assert!(err.contains("no-cuda needs '*'"), "{err}");
+}
+
+#[test]
+fn a_no_cuda_line_naming_a_missing_binary_fails() {
+    let errors = check("no_such_binary * no-cuda reason\n", &root());
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("tests/no_such_binary.rs"), "{errors:?}");
 }
