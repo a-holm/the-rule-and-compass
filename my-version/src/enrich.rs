@@ -7545,11 +7545,7 @@ fn enrich_inner(
     }
 
     // GPU plan.
-    let gpu = if opts.gpu == GpuMode::Off {
-        crate::backend::Probe::cpu("--cpu/--no-gpu (device not probed)")
-    } else {
-        crate::backend::probe()
-    };
+    let gpu = crate::backend::probe();
     let (gpu_available, gpu_device) = (gpu.available(), gpu.device.clone());
     let mut fam_counts: BTreeMap<&'static str, (usize, OpClass)> = BTreeMap::new();
     let classify = |name: &str| -> OpClass {
@@ -9106,8 +9102,7 @@ pub fn run(args: &[String]) -> ! {
             std::process::exit(e.exit);
         }
     }
-    let rates_device = if opts.gpu == GpuMode::Off { None } else { crate::backend::probe().device };
-    if let Err(e) = resolve_rates(&opts.calibration, rates_device.as_deref()) {
+    if let Err(e) = resolve_rates(&opts.calibration, crate::backend::probe().device.as_deref()) {
         eprintln!("error: {}", e);
         std::process::exit(EXIT_USAGE);
     }
