@@ -96,6 +96,62 @@ pub fn write_atomic(path: impl AsRef<Path>, bytes: &[u8], fault: Fault) -> Resul
     Ok(())
 }
 
+/// A file written and synced to `<dest>.tmp` that is not yet visible at `dest`.
+pub struct Staged {
+    tmp: PathBuf,
+    dest: PathBuf,
+}
+
+/// Write `bytes` to `<dest>.tmp` and fsync it. `dest` is untouched. A directory
+/// at `dest` is refused here, because the rename in [`Staged::publish`] could
+/// not replace it.
+pub fn stage(dest: impl AsRef<Path>, bytes: &[u8]) -> Result<Staged, String> {
+    let dest = dest.as_ref();
+    if dest.is_dir() {
+        return Err(format!("{}: is a directory", dest.display()));
+    }
+    let tmp = sibling(dest, ".tmp");
+    let mut file =
+        std::fs::File::create(&tmp).map_err(|e| format!("cannot create temporary file '{}': {}", tmp.display(), e))?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| format!("cannot write temporary file '{}': {}", tmp.display(), e));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(Staged { tmp, dest: dest.to_path_buf() })
+}
+
+impl Staged {
+    pub fn dest(&self) -> &Path {
+        &self.dest
+    }
+
+    pub fn tmp(&self) -> &Path {
+        &self.tmp
+    }
+
+    /// Rename the staged file over `dest` and sync the directory entry.
+    pub fn publish(self) -> Result<(), String> {
+        std::fs::rename(&self.tmp, &self.dest).map_err(|e| {
+            format!("cannot publish '{}' (staged file '{}'): {}", self.dest.display(), self.tmp.display(), e)
+        })?;
+        if let Some(dir) = self.dest.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Ok(f) = std::fs::File::open(dir) {
+                let _ = f.sync_all();
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove the staged file.
+    pub fn discard(self) {
+        let _ = std::fs::remove_file(&self.tmp);
+    }
+}
+
 /// Atomically publish a UTF-8 text file.
 pub fn write_text_atomic(path: impl AsRef<Path>, text: &str) -> Result<(), String> {
     write_atomic(path, text.as_bytes(), Fault::None)

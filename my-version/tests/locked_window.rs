@@ -1327,3 +1327,190 @@ fn a_sealed_read_keeps_every_other_declared_range_sealed() {
     assert!(err.contains("reaches the declared locked test"), "{}", err);
     assert!(!std::fs::read_to_string(&l).unwrap().contains("baseline_read"), "no read is recorded");
 }
+
+/// A sealed ladder fixture with no read yet.
+struct Sealed {
+    _scratch: Scratch,
+    dir: PathBuf,
+    data: String,
+    windows: String,
+    ledger: String,
+    sealed: String,
+}
+
+impl Sealed {
+    fn new(name: &str) -> Sealed {
+        let (scratch, dir) = scratch(name);
+        let (data, win) = (dir.join("p.csv"), dir.join("w.csv"));
+        panel_csv(&data);
+        windows_file(&win, "locked");
+        let (d, w) = (s(&data), s(&win));
+        let range = Lockbox { start: T0 + 400 * H, end: T0 + 500 * H };
+        lockbox::write_sidecar(&d, &range, "test").unwrap();
+        let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+        Ledger::new(dir.join("ledger.jsonl"))
+            .add_candidate(&Candidate {
+                id: "c1".into(),
+                spec_sha256: "a".repeat(64),
+                data_sha256: "b".repeat(64),
+                build_commit: "build".into(),
+                report_sha256: "c".repeat(64),
+                expression: "x".into(),
+                locked_test: Some(rcsr::protocol::LockedRange { start: range.start, end: range.end, source: "store".into() }),
+            })
+            .unwrap();
+        let (code, _, err) = rcsr(&["protocol", "seal", "--ledger", &l, "--out", &sealed]);
+        assert_eq!(code, 0, "{}", err);
+        Sealed { _scratch: scratch, dir, data: d, windows: w, ledger: l, sealed }
+    }
+
+    fn read(&self, out: &str, extra: &[&str]) -> (i32, String, String) {
+        let mut a = vec!["--locked-test", "--ledger", self.ledger.as_str(), "--sealed", self.sealed.as_str()];
+        a.extend_from_slice(extra);
+        ladder(&self.data, &self.windows, out, &a)
+    }
+
+    fn marker(&self) -> String {
+        format!("{}.locked_reads.jsonl", self.data)
+    }
+
+    fn bytes(&self, path: &str) -> Option<Vec<u8>> {
+        std::fs::read(path).ok()
+    }
+
+    fn recorded_sha(&self) -> String {
+        let text = std::fs::read_to_string(&self.ledger).unwrap();
+        let line = text.lines().find(|l| l.contains("\"event\":\"baseline_read\"")).expect("baseline_read line");
+        line.split("\"report_sha256\":\"").nth(1).unwrap().split('"').next().unwrap().to_string()
+    }
+}
+
+#[test]
+fn ladder_verify_read_recomputes_the_recorded_report() {
+    let f = Sealed::new("lad-verify");
+    let (out, md) = (s(&f.dir.join("first.json")), s(&f.dir.join("first.md")));
+    let (code, _, err) = f.read(&out, &["--markdown", &md]);
+    assert_eq!(code, 0, "{}", err);
+    let sha = f.recorded_sha();
+    let (ledger_before, marker_before) = (f.bytes(&f.ledger), f.bytes(&f.marker()));
+    assert!(marker_before.is_some());
+
+    let (out2, md2) = (s(&f.dir.join("again.json")), s(&f.dir.join("again.md")));
+    let (code, _, err) = f.read(&out2, &["--markdown", &md2, "--verify-read", "--expect-report-sha256", &sha]);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(f.bytes(&f.ledger), ledger_before);
+    assert_eq!(f.bytes(&f.marker()), marker_before);
+    assert_eq!(
+        without_timing(&std::fs::read_to_string(&out2).unwrap()),
+        without_timing(&std::fs::read_to_string(&out).unwrap())
+    );
+    assert_eq!(std::fs::read(&md2).unwrap(), std::fs::read(&md).unwrap());
+}
+
+#[test]
+fn ladder_verify_read_refuses_a_wrong_hash() {
+    let f = Sealed::new("lad-wrong-hash");
+    let out = s(&f.dir.join("first.json"));
+    assert_eq!(f.read(&out, &[]).0, 0);
+    let good = std::fs::read(&out).unwrap();
+    let missing = s(&f.dir.join("none.json"));
+    let (code, _, err) = f.read(&missing, &["--verify-read", "--expect-report-sha256", &"0".repeat(64)]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("differs from the expected"), "{}", err);
+    assert!(!Path::new(&missing).exists());
+    assert!(!Path::new(&format!("{}.tmp", missing)).exists());
+    // the same refusal leaves a good report on disk alone
+    let (code, _, _) = f.read(&out, &["--verify-read", "--expect-report-sha256", &"0".repeat(64)]);
+    assert_eq!(code, 3);
+    assert_eq!(std::fs::read(&out).unwrap(), good);
+}
+
+#[test]
+fn ladder_verify_read_needs_a_recorded_read() {
+    let f = Sealed::new("lad-no-read");
+    let out = s(&f.dir.join("x.json"));
+    let ledger_before = f.bytes(&f.ledger);
+    let (code, _, err) = f.read(&out, &["--verify-read"]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("no recorded baseline read"), "{}", err);
+    assert!(!Path::new(&out).exists());
+    assert_eq!(f.bytes(&f.ledger), ledger_before);
+    assert!(f.bytes(&f.marker()).is_none());
+}
+
+#[test]
+fn ladder_verify_read_needs_locked_test() {
+    let f = Sealed::new("lad-flag");
+    let out = s(&f.dir.join("x.json"));
+    let (code, _, err) = ladder(&f.data, &f.windows, &out, &["--verify-read"]);
+    assert_eq!(code, 2, "{}", err);
+    assert!(err.contains("--verify-read applies to --locked-test only"), "{}", err);
+}
+
+#[test]
+fn ladder_report_that_cannot_be_written_leaves_the_read_available() {
+    let f = Sealed::new("lad-unwritable");
+    let ledger_before = f.bytes(&f.ledger);
+    let dir_out = f.dir.join("is-a-directory");
+    std::fs::create_dir(&dir_out).unwrap();
+    let (code, _, err) = f.read(&s(&dir_out), &[]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("the locked read is still available"), "{}", err);
+    assert_eq!(f.bytes(&f.ledger), ledger_before);
+    assert!(f.bytes(&f.marker()).is_none());
+    // an unwritable --markdown path refuses the same way, and stages nothing
+    let out = s(&f.dir.join("ok.json"));
+    let bad_md = s(&f.dir.join("no-such-dir").join("r.md"));
+    let (code, _, err) = f.read(&out, &["--markdown", &bad_md]);
+    assert_eq!(code, 3, "{}", err);
+    assert_eq!(f.bytes(&f.ledger), ledger_before);
+    assert!(f.bytes(&f.marker()).is_none());
+    assert!(!Path::new(&out).exists());
+    assert!(!Path::new(&format!("{}.tmp", out)).exists());
+    // the read still works with a good path
+    let (code, _, err) = f.read(&out, &[]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(std::fs::read_to_string(&f.ledger).unwrap().contains("\"event\":\"baseline_read\""));
+}
+
+#[test]
+fn ladder_report_lost_after_the_record_is_recovered() {
+    let f = Sealed::new("lad-lost");
+    let out = s(&f.dir.join("report.json"));
+    assert_eq!(f.read(&out, &[]).0, 0);
+    let (ledger_before, marker_before) = (f.bytes(&f.ledger), f.bytes(&f.marker()));
+    // the state of a kill between the record and the rename: recorded, no report, a staged file
+    let first = std::fs::read(&out).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    std::fs::write(format!("{}.tmp", out), &first).unwrap();
+    let (code, _, err) = f.read(&out, &[]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("already has a baseline_read"), "{}", err);
+    assert!(!Path::new(&out).exists());
+    let (code, _, err) = f.read(&out, &["--verify-read", "--expect-report-sha256", &f.recorded_sha()]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(Path::new(&out).exists());
+    assert!(!Path::new(&format!("{}.tmp", out)).exists(), "the staged file is replaced by the rename");
+    assert_eq!(f.bytes(&f.ledger), ledger_before);
+    assert_eq!(f.bytes(&f.marker()), marker_before);
+}
+
+#[test]
+fn ladder_retry_after_a_marker_without_a_ledger_line_records_the_read() {
+    let f = Sealed::new("lad-marker-only");
+    let out = s(&f.dir.join("report.json"));
+    let ledger_before = std::fs::read_to_string(&f.ledger).unwrap();
+    assert_eq!(f.read(&out, &[]).0, 0);
+    let marker_before = f.bytes(&f.marker());
+    // the state of a kill between the marker line and the ledger line
+    std::fs::write(&f.ledger, &ledger_before).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    let (code, _, err) = f.read(&out, &["--verify-read"]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("no recorded baseline read"), "{}", err);
+    let (code, _, err) = f.read(&out, &[]);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(f.bytes(&f.marker()), marker_before, "the retry writes no second marker line");
+    let (code, vout, err) = rcsr(&["protocol", "verify", "--ledger", &f.ledger, "--data", &f.data]);
+    assert_eq!(code, 0, "{}{}", vout, err);
+}
