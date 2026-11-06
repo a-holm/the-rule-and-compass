@@ -16,6 +16,13 @@ check() {
     fails=$((fails + 1))
   fi
 }
+hasnt() {
+  local name=$1 file=$2 pattern=$3
+  if grep -qE -- "$pattern" "$file"; then
+    echo "FAIL $name: '$pattern' found in $file"
+    fails=$((fails + 1))
+  fi
+}
 has() {
   local name=$1 file=$2 pattern=$3
   if ! grep -qE -- "$pattern" "$file"; then
@@ -24,7 +31,7 @@ has() {
   fi
 }
 
-mkdir -p "$T/gates" "$T/wt/my-version" "$T/bin"
+mkdir -p "$T/gates" "$T/wt/my-version" "$T/bin" "$T/oc"
 fake_timeout "$T/bin"
 touch "$T/wt/my-version/Cargo.toml"
 echo 4 > "$T/xid"
@@ -47,7 +54,7 @@ chmod +x "$T/bin/show-args"
 
 rc() {
   env -u CARGO_TARGET_DIR RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
-    RCSR_XID_CMD="cat '$T/xid'" PATH="$T/bin:$PATH" FAKE_TIMEOUT_LOG="$T/timeouts" "$@"
+    RCSR_XID_CMD="cat '$T/xid'" RCSR_MACHINE_DIR="$T/oc" RCSR_REAP_TERM_WAITS=2 RCSR_REAP_KILL_WAITS=50 PATH="$T/bin:$PATH" FAKE_TIMEOUT_LOG="$T/timeouts" "$@"
 }
 log=$T/gates/issue9-t.log
 
@@ -151,6 +158,44 @@ check refuse-no-command "$r" "2"
 rc bash "$RC" cpu "$T/wt" 9 t --timeout abc -- show-args > /dev/null 2>&1; r=$?
 check refuse-timeout-nan "$r" "2"
 check refuse-no-log "$([ -e "$log" ] && echo yes || echo no)" "no"
+
+# a command that ends but leaves children behind: every process that holds the test lock after it is ended by pid,
+# a child that ignores SIGTERM and one in its own session included; a process that only has the lock file open stays
+cat > "$T/lock.sh" <<STUB
+#!/usr/bin/env bash
+echo "lock \$*" >> "$T/calls"
+exec 9> "$T/oc/full-suite.lock"
+flock -n 9 || exit 75
+exec "\$@"
+STUB
+cat > "$T/bin/leave-children" <<'STUB'
+#!/usr/bin/env bash
+trap '' TERM
+sleep 1000 &
+echo $! > "$FAKE_DIR/pid-same-session"
+setsid sleep 1000 &
+echo $! > "$FAKE_DIR/pid-other-session"
+exit 3
+STUB
+chmod +x "$T/bin/leave-children"
+lockreal=$(readlink -f "$T/oc/full-suite.lock")
+lock_holders() { find /proc/[0-9]*/fd -lname "$lockreal" 2> /dev/null | cut -d/ -f3 | grep -vx "$bystander"; }
+alive() { [ -r "/proc/$1/stat" ] && [ "$(cut -d' ' -f3 "/proc/$1/stat")" != Z ]; }
+sleep 1000 8> "$T/oc/full-suite.lock" &
+bystander=$!
+trap 'kill -KILL "$bystander" $(cat "$T/pid-same-session" "$T/pid-other-session" 2> /dev/null) 2> /dev/null; rm -rf "$T"' EXIT
+FAKE_DIR=$T rc bash "$RC" run "$T/wt" 9 t --cuda -- leave-children > /dev/null 2>&1; r=$?
+check orphans-rc "$r" "3"
+check orphans-no-holder "$(lock_holders | tr '\n' ' ')" ""
+check orphans-same-session-gone "$(alive "$(cat "$T/pid-same-session")" && echo alive || echo gone)" "gone"
+check orphans-other-session-gone "$(alive "$(cat "$T/pid-other-session")" && echo alive || echo gone)" "gone"
+check orphans-waiter-kept "$(alive "$bystander" && echo alive || echo gone)" "alive"
+has orphans-logged "$log" '^lock-run: ended pids still holding the lock: '
+check orphans-last "$(tail -n 1 "$log" | cut -d' ' -f1-2)" "RC_DONE rc=3"
+kill "$bystander"
+FAKE_DIR=$T rc bash "$RC" run "$T/wt" 9 t --cuda -- show-args > /dev/null 2>&1; r=$?
+check clean-run-rc "$r" "0"
+hasnt clean-run-quiet "$log" 'lock-run:'
 
 # -h prints the header
 check help-rc "$(bash "$RC" -h > "$T/h"; echo $?)" "0"
