@@ -21,8 +21,9 @@ fn scratch(name: &str) -> (Scratch, PathBuf) {
     (scratch, path)
 }
 
+/// The children make no device call: `RCSR_GPU=0` skips even the startup device probe.
 fn rcsr(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).env("RCSR_GPU", "0").args(args).output().unwrap();
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).to_string(),

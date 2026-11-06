@@ -20,9 +20,11 @@ fn csv() -> (Scratch, PathBuf) {
     (scratch, path)
 }
 
+/// The children set `RCSR_GPU=0`: no device call, not even the startup probe that `--cpu` still runs.
 fn search(flag: &str, value: &str) -> Output {
     let (_scratch, data) = csv();
     Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .env("RCSR_GPU", "0")
         .arg("--data")
         .arg(&data)
         .args(["--target", "y", "--generations", "1", "--pop", "20", "--quiet"])
@@ -34,6 +36,7 @@ fn search(flag: &str, value: &str) -> Output {
 fn audit(flag: &str, value: &str) -> Output {
     let (_scratch, data) = csv();
     Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .env("RCSR_GPU", "0")
         .arg("audit")
         .arg("--data")
         .arg(&data)
