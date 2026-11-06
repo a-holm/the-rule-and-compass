@@ -45,7 +45,7 @@ panel                  *  no-cuda  CPU-only tests; no CUDA call
 panel_pit              *  no-cuda  CPU-only tests; no CUDA call
 parse                  *  no-cuda  CPU-only tests; no CUDA call
 pinned_cell            *  no-cuda  its tests are ignored (measurement or external data): 0 tests run and none calls CUDA
-pnl_fitness_ab         *  no-cuda  under #803: its only test is ignored and runs rcsr --gpu; the GPU arm never reaches the device under memcheck
+pnl_fitness_ab         *  no-cuda  under #803: its only test is ignored (a measurement, #483), so the pass runs 0 tests; the gpu arm forces --dispatch device and fails without device time, and is run by hand under memcheck with --ignored (see the file header)
 prep_pipeline          *  no-cuda  CPU-only tests; no CUDA call
 projection             *  no-cuda  CPU-only tests; no CUDA call
 projection_alloc       *  no-cuda  CPU-only tests; no CUDA call
