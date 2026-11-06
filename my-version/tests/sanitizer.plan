@@ -106,6 +106,7 @@ target_spec            *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=
 trajectory             *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 validation             *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 xs_rank                *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
+walkforward_locked     *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 rcsr_command_lint      *  no-cuda  text lint of tests/*.rs; no CUDA call
 # run-bin: the release binary runs with these arguments under memcheck (smallest run: 64 candidates, one rep, depth 3)
 rcsr-gpu-bench      *  run-bin  --batch 64 --reps 1 --depth 3
