@@ -2,7 +2,7 @@
 
 Used with `../_shared/brief.md`; `../_tools/brief.sh clerk --issue <N> --pr <PR>` prints the dispatch prompt. Replace every angle-bracket placeholder.
 
-Repo root, GitHub repo, use `gh`. Base branch `$BASE` (`integration/gpu-hardening`). Never merge to `main`. Never force-push, never rebase, never `git stash`, no Python, no pkill. Do not run cargo, do not edit code; you only verify and merge. The orchestrator already accepted the PR's design deviations; your job is to check the evidence and merge.
+Repo root, GitHub repo, use `gh`. Base branch `$BASE` (`integration/gpu-hardening`). Never merge to `main`. Never force-push, never rebase, never `git stash`, no Python, no pkill. A wait uses `verksted/_tools/wait-for.sh` (`--log`, `--file`, `--pid`), never `pgrep -f`. Do not run cargo, do not edit code; you only verify and merge. The orchestrator already accepted the PR's design deviations; your job is to check the evidence and merge.
 
 For the PR you are given:
 1. Write the claims of the hand-back summary to a claims file, one row per line `<label>|<log path>|<ERE>` (test counts, red runs, sanitizer 0 errors, warnings 0, speedups, wall times). Run `verksted/_tools/clerk-check.sh <PR> --claims <file>`. It fetches origin and prints state, base, mergeable, head, the changed files, the diff stat, the conflicts and one row per claim.
