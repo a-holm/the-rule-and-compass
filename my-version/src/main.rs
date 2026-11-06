@@ -761,7 +761,10 @@ SEARCH:
                              output range does not cross --threshold, for
                              example gauss(...), exp(...), abs(...)) before the
                              constant fit, and keep them off the front
-                             (#848). Saved search setting, off by default
+                             (#848). With --objective it also makes such a
+                             member unusable as finalist, under --fitness
+                             metric too (#849). Saved search setting, off by
+                             default
   --prune                    remove neutral code from the final front (off by
                              default): replace subtrees with a child or a
                              constant when the training error stays within
@@ -1197,15 +1200,21 @@ const NO_VALIDATION_BOOK: &str = ",\"validation_book\":null";
 
 /// #645: the `"validation_book"` member of a Pareto entry, from the same book
 /// that scores the member for selection.
-fn validation_book_member_json(objective: f64, stats: &rcsr::trading::PathStats, constant: bool) -> String {
+fn validation_book_member_json(
+    objective: f64,
+    stats: &rcsr::trading::PathStats,
+    constant: bool,
+    fixed: Option<bool>,
+) -> String {
     format!(
-        ",\"validation_book\":{{\"objective\":{},\"net_pnl\":{},\"sharpe\":{},\"trades\":{},\"exposure\":{},\"constant\":{}}}",
+        ",\"validation_book\":{{\"objective\":{},\"net_pnl\":{},\"sharpe\":{},\"trades\":{},\"exposure\":{},\"constant\":{},\"fixed_position\":{}}}",
         jnum(objective),
         jnum(stats.net_pnl),
         jnum(stats.sharpe),
         stats.trades,
         jnum(stats.exposure),
-        constant
+        constant,
+        rcsr::trading::fixed_position_json(fixed)
     )
 }
 
@@ -6499,10 +6508,26 @@ fn main() {
                     let ctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
                     match trading_book(&s.tree, &v.x, slice, ctx, tspec) {
                         Ok(stats) => {
-                            let value = objective.score(&stats, tspec.min_trades);
-                            let book = validation_book_member_json(value, &stats, rcsr::trading::is_constant(&s.tree));
+                            // #849: a fixed-position member is unusable as a finalist with the flag.
+                            let fixed = rcsr::trading::fixed_position(&s.tree, tspec);
+                            let value = if cfg.reject_fixed_position && fixed.is_some() {
+                                f64::INFINITY
+                            } else {
+                                objective.score(&stats, tspec.min_trades)
+                            };
+                            let book = validation_book_member_json(value, &stats, rcsr::trading::is_constant(&s.tree), fixed);
                             (value, book)
                         }
+OLD
+s/\Q$o\E/$n/ or die "b";
+$o = <<'OLD';
+                constant: rcsr::trading::is_constant(tree),
+                candidates: rows.len(),
+OLD
+$n = <<'NEW';
+                constant: rcsr::trading::is_constant(tree),
+                fixed_position: rcsr::trading::fixed_position(tree, tspec),
+                candidates: rows.len(),
                         Err(_) => (f64::INFINITY, NO_VALIDATION_BOOK.to_string()),
                     }
                 }

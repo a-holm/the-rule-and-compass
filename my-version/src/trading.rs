@@ -922,6 +922,26 @@ pub fn is_constant(tree: &crate::expr::Node) -> bool {
     tree.op != crate::expr::Op::Input && tree.kids.iter().all(is_constant)
 }
 
+/// #849: the one position the tree takes on every input under the book's rule
+/// (`Some(true)` long, `Some(false)` flat), or `None` when the inputs decide.
+/// Only the indicator rule `1[pred > threshold]` has a fixed position: a tau
+/// ramp sizes by the score and the tercile rule ranks it.
+pub fn fixed_position(tree: &crate::expr::Node, spec: &TradingSpec) -> Option<bool> {
+    if spec.position != PositionMap::Threshold || spec.tau.is_some() {
+        return None;
+    }
+    crate::expr::fixed_position(tree, spec.threshold)
+}
+
+/// The report text of [`fixed_position`]: `"long"`, `"flat"` or `null`.
+pub fn fixed_position_json(fixed: Option<bool>) -> &'static str {
+    match fixed {
+        Some(true) => "\"long\"",
+        Some(false) => "\"flat\"",
+        None => "null",
+    }
+}
+
 /// Rows per canonical summation segment of the fitness gross sum.
 pub const FITNESS_SEGMENT_ROWS: usize = trading_gpu::DEFAULT_SEGMENT_ROWS;
 /// Lanes inside one segment.
@@ -1433,6 +1453,8 @@ pub struct FinalistReport {
     /// The finalist expression has no variable: every quantile or fixed
     /// threshold makes it a flat or always-long book.
     pub constant: bool,
+    /// #849: the position the finalist holds on every input, when it has one.
+    pub fixed_position: Option<bool>,
     pub candidates: usize,
     pub usable: usize,
     pub expression: String,
@@ -1472,7 +1494,7 @@ impl FinalistReport {
             "{{\"name\":\"{}\",\"position\":\"{}\",\"selection\":\"validation_objective\",\
              \"cost\":{},\"candidates\":{},\"usable_candidates\":{},\"exact\":\"cpu_f64\",\
              \"backend\":{},\"backend_reason\":{},\"spec\":{},\
-             \"finalist\":{{\"expression\":{},\"expression_exact\":{},\"archive_rank\":{},\"constant\":{},\"fit_metric\":{},\"fit_error\":{},\
+             \"finalist\":{{\"expression\":{},\"expression_exact\":{},\"archive_rank\":{},\"constant\":{},\"fixed_position\":{},\"fit_metric\":{},\"fit_error\":{},\
              \"validation_error\":{},\"test_error\":{},\"validation_objective\":{}{}}},\
              \"validation\":{},\"test\":{}}}",
             self.objective.name(),
@@ -1489,6 +1511,7 @@ impl FinalistReport {
             crate::devlog::text(&self.expression_exact),
             self.archive_rank,
             self.constant,
+            fixed_position_json(self.fixed_position),
             crate::devlog::text(&self.fit_metric),
             num(self.fit_error),
             num(self.validation_error),

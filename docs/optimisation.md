@@ -1390,7 +1390,8 @@ Under `--fitness pnl` the position is `1[pred > threshold]`. A tree whose output
 * Offspring are tested after `simplify` and before the constant fit (`variation.fixed_position_rejected` in the development log). Random fill, restarts and the initial population redraw up to 8 times. Seeds and migrants are not filtered.
 * Archive admission and the rebuilt front also test the tree and the form it prints as (`x / x` prints as `1`), because a fit can move a tree into the class after the test and a fixed member at cost 1 sets a buy-and-hold bar that dominates every costlier member with a higher regret. When every candidate is fixed the front keeps them and `search.fixed_position_front_fallback` is true.
 * The threshold is the book's `--threshold`. At `--threshold 1e-30` the range of `gauss(x)` still crosses it, so the tree is not fixed there.
-* No effect under `--fitness metric` or without input variables. With the flag off no candidate, random draw or archive decision changes.
+* The search effect needs `--fitness pnl` and input variables. The finalist rule below applies under `--fitness metric` too. With the flag off no candidate, random draw or archive decision changes.
+* With a trading `--objective`, the flag also refuses a member with a fixed position as finalist (#849): its validation objective is `+inf`, it sorts last under `--select-by validation`, and `objective.usable_candidates` counts it out. A squared-error front then cannot hand the P&L choice an always-long member. `run.json` reports `validation_book.fixed_position` for every member and `objective.finalist.fixed_position` whether or not the flag is given; see `docs/reports.md`.
 
 #### `--pnl-blocks K`: a time-block consistency term
 

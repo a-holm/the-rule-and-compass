@@ -784,7 +784,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   that earns in one regime only scores worse; the device computes it bit for bit like the CPU.
   `--reject-fixed-position` (off by default) rejects trees whose position cannot depend on the
   inputs, such as `gauss(...)` or `exp(...)` at threshold 0, before the constant fit and keeps them
-  off the front; see [`docs/optimisation.md`](docs/optimisation.md).
+  off the front, and with a trading `--objective` refuses such a member as finalist; `run.json` reports `validation_book.fixed_position` for every member. See [`docs/optimisation.md`](docs/optimisation.md).
   `--json` adds `search_fitness` and a `fitness` block per
   Pareto member (`block_regret` with blocks). See
   [`docs/walkforward.md`](docs/walkforward.md) and
