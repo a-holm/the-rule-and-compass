@@ -124,7 +124,9 @@ fn run_long_writes_manifest_result_and_live_log() {
         std::env::var("PATH").unwrap_or_default()
     );
     let out = dir.join("runs");
+    // `RCSR_GPU=0` keeps every rcsr child off the device, even the startup probe that `--cpu` still runs.
     let output = Command::new("bash")
+        .env("RCSR_GPU", "0")
         .arg(scripts_dir().join("run-long.sh"))
         .args([
             "--data",
@@ -172,6 +174,7 @@ fn run_long_writes_manifest_result_and_live_log() {
     assert!(command_text.contains("resolved_seed="), "{command_text}");
 
     let verify = Command::new(rcsr)
+        .env("RCSR_GPU", "0")
         .args([
             "verify-manifest",
             manifest.to_str().unwrap(),
@@ -193,6 +196,7 @@ fn run_long_writes_manifest_result_and_live_log() {
     let preserved = out.join(format!("rcsr-{sha}"));
     assert!(preserved.exists(), "missing {}", preserved.display());
     let verify = Command::new(rcsr)
+        .env("RCSR_GPU", "0")
         .args([
             "verify-manifest",
             manifest.to_str().unwrap(),
