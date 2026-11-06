@@ -116,7 +116,7 @@ fn run(s: &Sealed, spec: &EvalSpec, opts: &ProtocolOptions) -> (Report, String) 
 
 #[test]
 fn a_sealed_device_pnl_read_runs_on_the_device_and_writes_its_marker() {
-    let (s, locked, opts) = sealed_store(false);
+    let (s, locked, opts) = sealed_store(true);
     authorize(&s).unwrap();
     let (report, sha) = run(&s, &locked, &opts);
     let summary = report.device_pnl.as_ref().expect("a --device-pnl summary");
