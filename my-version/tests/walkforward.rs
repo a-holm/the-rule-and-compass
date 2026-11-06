@@ -680,6 +680,47 @@ fn the_cli_exits_2_on_overlapping_returns() {
     assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
 }
 
+#[test]
+fn device_pnl_is_refused_with_policy_band() {
+    let scratch = Scratch::new("wf-band-device");
+    let dir = scratch.path().to_path_buf();
+    let data = dir.join("d.csv");
+    let mut csv = String::from("ts,x,target\n");
+    for i in 0..8 {
+        csv.push_str(&format!("{},{},0.001\n", 3600 * i, i));
+    }
+    std::fs::write(&data, csv).unwrap();
+    let run = |extra: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+            .args([
+                "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x",
+                "--time", "ts", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365",
+                "--window", "w,0,7200,14400,28800", "--json", "--policy", "band",
+            ])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    for band in ["0", "0.001"] {
+        let bad = run(&["--band", band, "--device-pnl"]);
+        let stderr = String::from_utf8_lossy(&bad.stderr);
+        assert_eq!(bad.status.code(), Some(2), "--band {band}: {stderr}");
+        assert!(
+            stderr.contains("--device-pnl is not supported with --policy band: the device arm prices the threshold book"),
+            "--band {band}: {stderr}"
+        );
+    }
+    let ok = run(&["--band", "0.001"]);
+    assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
+
+    let t = single(&[(0.0, 1.0, 0.001), (3600.0, 2.0, 0.001)]);
+    let mut s = spec("x", vec![window("w", 0.0, 1.0, 1.0, 2.0)]);
+    s.policy = walkforward::Policy::Band;
+    s.device_pnl = true;
+    let e = walkforward::run_table(&t, &s, "t").err().expect("band with device_pnl is refused");
+    assert!(e.contains("--device-pnl is not supported with --policy band"), "{e}");
+}
+
 mod front {
     use rcsr::devlog::Json;
     use std::path::PathBuf;
@@ -914,4 +955,36 @@ fn the_printed_json_carries_a_phase_ledger_outside_the_reproduction_hash() {
     assert!(!r.json().contains("\"ledger\""), "the hashed report must stay deterministic");
     let l = ledger::check(&r.json_with_ledger(None), "walkforward", &["io", "pnl"]);
     assert_eq!(l.busy, 0.0, "the scalar evaluator has no device intervals");
+}
+
+#[test]
+fn device_pnl_check_is_clean_on_an_underflowing_score() {
+    // gauss(0.5) is normal, gauss(11) is below the f32 range, gauss(30) is
+    // exactly 0 in f64.
+    let xs = [0.5, 11.0, 30.0];
+    let mut rows: Vec<(f64, f64, f64)> = Vec::new();
+    for i in 0..4 {
+        rows.push((i as f64, 30.0, 0.0));
+    }
+    let mut flips = 0u64;
+    for i in 0..24 {
+        let x = xs[i % 3];
+        if x == 11.0 {
+            flips += 1;
+        }
+        rows.push((4.0 + i as f64, x, 0.002 * ((i % 5) as f64) - 0.003));
+    }
+    let t = single(&rows);
+    let mut s = spec("gauss(x)", vec![window("w", 0.0, 4.0, 4.0, 28.0)]);
+    s.threshold_fixed = Some(0.0);
+    s.device_pnl = true;
+    let r = walkforward::run_table(&t, &s, "test").unwrap();
+    let summary = r.device_pnl.as_ref().expect("report summary");
+    assert!(summary.max_abs_net_delta <= 1e-12, "{}", summary.max_abs_net_delta);
+    assert_eq!(summary.bit_mismatch_windows, 0);
+    assert_eq!(summary.count_mismatch_windows, 0);
+    assert_eq!(summary.f32_flip_rows, flips);
+    let d = r.windows[0].device_pnl.as_ref().expect("device P&L block");
+    assert_eq!(d.f32_flip_rows, flips);
+    assert_eq!(d.strategy.long_rows, 16);
 }

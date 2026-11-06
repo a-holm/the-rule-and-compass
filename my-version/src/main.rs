@@ -2263,6 +2263,8 @@ struct Row {
     /// Fraction of `--stability` resamples that selected this same form.
     stability: Option<f64>,
     expression: String,
+    /// #807: the same tree with every constant at full precision.
+    expression_exact: String,
     /// #257: gate members of the pareto JSON (leading comma); empty when the
     /// gates did not run.
     gate_json: String,
@@ -6575,6 +6577,7 @@ fn main() {
                 shape: stability::shape(&expr::simplify(&s.tree)),
                 stability: None,
                 expression: expr::to_string(&den, &vars),
+                expression_exact: expr::to_string_exact(&den, &vars),
                 gate_json: String::new(),
                 fitness_json: fitness_book
                     .as_ref()
@@ -6664,6 +6667,7 @@ fn main() {
                 candidates: rows.len(),
                 usable,
                 expression: top.expression.clone(),
+                expression_exact: top.expression_exact.clone(),
                 archive_rank: top.archive_rank,
                 fit_metric: cfg.metric.name().to_string(),
                 fit_error: top.train_error,
@@ -7435,7 +7439,7 @@ fn main() {
                         String::new()
                     };
                     format!(
-                        "{{\"rank\":{},{}\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
+                        "{{\"rank\":{},{}\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{},\"expression_exact\":{}}}",
                         r.rank,
                         selection_json,
                         r.complexity,
@@ -7451,7 +7455,8 @@ fn main() {
                         constant_errors_json_g(&r.constant_errors, gates_active),
                         dimensions,
                         r.stability.map(jnum).unwrap_or_else(|| "null".to_string()),
-                        jstr(&r.expression)
+                        jstr(&r.expression),
+                        jstr(&r.expression_exact)
                     )
                 })
                 .collect();
@@ -7874,7 +7879,7 @@ fn main() {
                     String::new()
                 };
                 println!(
-                    "{{\"event\":\"solution\",\"rank\":{},{}\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
+                    "{{\"event\":\"solution\",\"rank\":{},{}\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{},\"expression_exact\":{}}}",
                     r.rank,
                     selection_json,
                     r.complexity,
@@ -7890,7 +7895,8 @@ fn main() {
                     constant_errors_json_g(&r.constant_errors, gates_active),
                     dimensions,
                     r.stability.map(jnum).unwrap_or_else(|| "null".to_string()),
-                    jstr(&r.expression)
+                    jstr(&r.expression),
+                    jstr(&r.expression_exact)
                 );
             }
             if let Some(c) = &null_control {
@@ -10193,6 +10199,9 @@ OPTIONS:
                              A window whose test_start is below the last train
                              or validation time of the run plus its required
                              purge exits 2
+                             Members are read from expression_exact (the lossless
+                             form) when the run has it; the report says
+                             selection.expression_source exact or rounded
   --allow-in-sample-windows  with --front or --from-run: report such a window as
                              in_sample:true instead of refusing it
                              (diagnostics only)
@@ -10233,6 +10242,9 @@ OPTIONS:
                              of the run. Refuses --expr, --threshold-quantile,
                              --threshold-fixed and --target-spec, and a run without an
                              objective block
+                             The expression is objective.finalist.expression_exact,
+                             else the 4-decimal expression (expression_source
+                             rounded); --locked-test refuses a rounded source (exit 3)
   --threshold-quantile <q>   exact type-7 training/validation score quantile
                              (default {DEFAULT_QUANTILE}); selected by order-preserving
                              radix count, so theta is bit-identical to numpy
@@ -10243,7 +10255,8 @@ OPTIONS:
                              the rest flat (no threshold; --threshold-quantile, --threshold-fixed,
                              --band, --min-hold, --select-band, --device-pnl and --batch-pnl are
                              refused). band is a
-                             long-only no-trade band; dp keeps the threshold book
+                             long-only no-trade band (--device-pnl is refused: the device arm prices
+                             the threshold book); dp keeps the threshold book
                              and reports the exact hindsight DP as a bound, never
                              as the strategy's P&L
   --band <f>                 half-width beta of the no-trade band in score units
@@ -10269,7 +10282,10 @@ OPTIONS:
                              long-only reduction (f64 canonical segments; the
                              CUDA kernel when built with --features cuda) and
                              report it with cash and buy-and-hold benchmarks.
-                             The scalar evaluator remains the reported authority
+                             The scalar evaluator remains the reported authority.
+                             The kernel reads f64 scores; the report adds bit_equal
+                             (device vs canonical CPU), counts_equal (device vs
+                             scalar counts) and f32_flip_rows
   --control-seed <n>         seed of the matched-exposure random-long control
                              (default 0). Every report lists the long-only
                              controls per window: cash, buy-and-hold, constant
@@ -10719,6 +10735,9 @@ fn run_walkforward(args: &[String]) -> ! {
     if policy == walkforward::Policy::TopTercile && (quantile_set || threshold_fixed.is_some()) {
         usage_fail("--policy top-tercile has no threshold: do not pass --threshold-quantile or --threshold-fixed");
     }
+    if policy == walkforward::Policy::Band && device_pnl {
+        usage_fail("--device-pnl is not supported with --policy band: the device arm prices the threshold book");
+    }
     let mut cost_spec: Option<rcsr::target::TargetSpec> = None;
     let mut run_cost: Option<(f64, rcsr::target::CostSource)> = None;
     let mut front_run: Option<rcsr::run_json::RunFile> = None;
@@ -10735,6 +10754,10 @@ fn run_walkforward(args: &[String]) -> ! {
         let run = rcsr::run_json::RunFile::load(path).unwrap_or_else(|e| input_fail(&e));
         let book = run.book().unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
         expressions.push(book.expression.clone());
+        popts.expression_source = Some(book.expression_source);
+        if locked_test && book.expression_source == rcsr::run_json::ExpressionSource::Rounded {
+            input_fail(&rcsr::run_json::rounded_refusal(path));
+        }
         vars_src = Some(book.variables.join(","));
         if book.position == rcsr::trading::PositionMap::TopTercile {
             if policy != walkforward::Policy::Threshold && policy != walkforward::Policy::TopTercile {
@@ -10775,6 +10798,10 @@ fn run_walkforward(args: &[String]) -> ! {
             std::process::exit(EXIT_INPUT);
         }
         expressions = run.front.iter().map(|m| m.expression.clone()).collect();
+        popts.expression_source = Some(run.front_source);
+        if locked_test && run.front_source == rcsr::run_json::ExpressionSource::Rounded {
+            input_fail(&rcsr::run_json::rounded_refusal(path));
+        }
         popts.front = Some(walkforward::FrontSource {
             run: path.clone(),
             run_sha256: run.sha256.clone(),

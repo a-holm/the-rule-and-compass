@@ -119,7 +119,7 @@ the winner.
 
 ## Candidates from a run's front (`--front`)
 
-`rcsr walkforward --front run.json` takes every `pareto[k].expression` of a `run.json` as one candidate, labelled `front_rank_<k+1>` in archive order. It replaces `--expr` (passing both exits 2). With one member the walk-forward is the single-expression case. An empty front, a run without `split.train_time` (no time column) and an expression that uses a column missing from `--data` exit 3.
+`rcsr walkforward --front run.json` takes every `pareto[k].expression` of a `run.json` (its `expression_exact` when present) as one candidate, labelled `front_rank_<k+1>` in archive order. It replaces `--expr` (passing both exits 2). With one member the walk-forward is the single-expression case. An empty front, a run without `split.train_time` (no time column) and an expression that uses a column missing from `--data` exit 3.
 
 Defaults taken from the run, each overridden by its explicit flag:
 
@@ -158,6 +158,7 @@ The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA
   long for `K` consecutive rows, counting the entry row. `β = 0` with
   `--min-hold 1` reproduces the threshold rule **bit for bit**. The band is a
   deterministic `{0,+1}` finite-state automaton; it never opens a short.
+* `--policy band` refuses `--device-pnl` (#810): the device arm prices the threshold book, so its delta against the band book would measure the band rule, not the kernel. The error is a usage error (exit 2) raised before any data work.
 * `--policy dp` keeps the reported book on the threshold rule and adds the
   exact hindsight-optimal DP as a diagnostic `hindsight_bound`. The DP is the
   best path with hindsight, so it always flatters the strategy and is **never**
@@ -313,9 +314,42 @@ net_i   = gross_i - cost_i
   (`p = 1`, `net = sum(r) - 2s * groups`) are reported with the strategy block.
 
 The JSON gains a `device_pnl` object per window and a report-level summary with
-`backend`, `segment_rows`, `tile_candidates`, `rows` and
-`max_abs_net_delta`. `backend` is `cuda` when the kernel ran and
-`cpu-canonical` on a non-CUDA build or when no device is available.
+`backend`, `segment_rows`, `tile_candidates`, `windows`, `rows`,
+`max_abs_net_delta`, `device_windows`, `bit_mismatch_windows`,
+`count_mismatch_windows` and `f32_flip_rows`. `backend` is `cuda` when the
+kernel ran and `cpu-canonical` on a non-CUDA build or when no device is
+available.
+
+The kernel reads the `f64` score of every row and compares it with the `f64`
+threshold (rule R: a row is long iff its score is finite and strictly greater
+than the threshold). A score below the f32 range, such as `1e-46`, is long, as
+in the scalar evaluator, the exact refit and a user's formula. Three
+comparisons run on every window, and each detects a different fault:
+
+* Device totals against the canonical CPU reduction (`trading_gpu::reduce`) on
+  the same inputs: `bit_equal`, the bits of every `f64` sum and every integer
+  count. A kernel fault, down to one ulp of one P&L term, makes it `false`.
+  `max_abs_net_delta` cannot see such a fault: summation-order noise between
+  the scalar evaluator and the canonical reduction is orders of magnitude above
+  one ulp.
+* Device net against the scalar evaluator's net: `net_delta` per window and
+  `max_abs_net_delta` in the summary. This is the reported book; the tolerance
+  is 1e-9.
+* Device integer counts against the scalar book: `counts_equal`. It finds a
+  position disagreement also on rows with a return of 0, where the net delta is
+  0. It is `null` under `--policy band`, whose scalar book is not the threshold
+  book.
+
+`f32_flip_rows` counts the rows whose position changes when the score is
+narrowed to `f32`. It is reported per window and summed in the summary. No gate
+or selection reads it; it shows how many rows the search's `f32` screening book
+can place differently from the reported book. With `--select-band`, every
+`band_selection.candidates[]` entry carries the same count on the validation
+rows.
+
+`bit_mismatch_windows` and `count_mismatch_windows` count the windows where
+`bit_equal` is `false` or `counts_equal` is `false`. `device_windows` counts the
+windows whose device block ran on the CUDA kernel.
 
 ## Batch scoring (`--batch-pnl`)
 
@@ -433,6 +467,7 @@ The search objective, `rcsr walkforward`, `rcsr ablation score` and `rcsr ladder
 
 * **Cost.** `rcsr enrich --label long:<h>` needs `fee=` (exit 2; `fee=0` is allowed). The spec carries `cost_bps` (round trip, `2 * fee + spread + slip`) and `cost_per_side_bps = cost_bps / 2`. Every evaluator charges `cost_bps / 2` per side. `--cost-bps` that differs from the spec is refused (exit 2); `--cost-override <bp>` prices a different cost on purpose. Without a spec cost the flag or the default applies (walk-forward 10 bp, ladder and ablation 12 bp per side; the search needs the flag). A spec whose label is already net of cost (`cost_in_label`) declares no per-side cost.
 * **Units.** A spec with `return_units: "log"` makes the walk-forward, the ladder and `ablation score` convert the return column with `exp_m1` before any P&L, as the objective does. Without a spec the column is read as a simple return.
+* **One tree.** A search run writes two strings per Pareto member and for `objective.finalist`: `expression` (constants rounded to 4 decimals, for people) and `expression_exact` (each constant as the shortest decimal that parses back to the same bits, written from the same tree). `walkforward --front`, `walkforward --from-run`, `ladder --sr-run` and `ablation score --run/--from-run` read `expression_exact` first, so the candidate priced after the search is the tree the search priced, and `selection.candidates` holds the exact strings (the candidate id binds them). `windows[].expression` stays the display form. Each report states `expression_source` (`selection.expression_source` in the walk-forward, `sr_run.expression_source` in the ladder, `expression_source` in an ablation result): `exact`, or `rounded` for a run written before the field existed. `walkforward --locked-test` and `ladder --locked-test` refuse a `rounded` source (exit 3, message names `expression_exact`): only the exact tree is the selected book. `simplify_display` still folds constants such as `1/s` before printing, so the exact string can differ from the search tree by rounding noise of the folded constants; no runtime check compares them, the tests do.
 * **Position rule.** `rcsr walkforward --from-run run.json` and `rcsr ablation score --from-run run.json` take the expression, the fixed threshold `objective.spec.threshold`, the per-side cost `objective.spec.per_side_bps` and the target spec (return column, units, horizon, entry offset, delay) from the run. A run without an `objective` block is refused (exit 3). `--expr`, `--threshold-quantile`, `--threshold-fixed` and `--target-spec` with `--from-run` are usage errors (exit 2). The quantile rule of a plain `walkforward --expr` is a different book: for a constant finalist every quantile threshold is flat, and the command warns. `walkforward --from-run` refuses a window inside the rows the run trained or selected on like `--front` does (exit 2); `--allow-in-sample-windows` labels it `in_sample:true`.
 * **Target spec in walk-forward.** `--target-spec <file>` fills `--horizon`, `--entry-offset`, `--delay`, the return column, the units and the cost from the entry whose `column`, `name` or `return_column` is `--target`. A flag that disagrees is refused like the cost.
 * **Ladder grid.** With a spec cost the default `--cost-grid` is 1x, 2x and 3.33x the per-side cost. With a flag or the default cost it stays `12,20,40`. An explicit `--cost-grid` is absolute.

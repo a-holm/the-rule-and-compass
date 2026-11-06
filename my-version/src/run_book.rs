@@ -11,6 +11,8 @@ use crate::target::{self, CostDecl, CostSource, TargetSpec};
 #[derive(Clone, Debug)]
 pub struct RunBook {
     pub expression: String,
+    /// #807: `Exact` when the finalist came from `expression_exact`.
+    pub expression_source: crate::run_json::ExpressionSource,
     pub variables: Vec<String>,
     /// Fixed threshold: the position is `1[score > threshold]`.
     pub threshold: f64,
@@ -79,11 +81,8 @@ impl RunBook {
         let finalist = obj
             .get("finalist")
             .ok_or_else(|| "run.json objective has no finalist".to_string())?;
-        let expression = finalist
-            .get("expression")
-            .and_then(Json::as_str)
-            .ok_or_else(|| "run.json objective.finalist has no expression".to_string())?
-            .to_string();
+        let (expression, expression_source) = crate::run_json::ExpressionSource::pick(finalist)
+            .ok_or_else(|| "run.json objective.finalist has no expression".to_string())?;
         let variables = match j.get("variables") {
             Some(Json::Arr(a)) => a
                 .iter()
@@ -103,6 +102,7 @@ impl RunBook {
             .unwrap_or(false);
         Ok(RunBook {
             expression,
+            expression_source,
             variables,
             threshold: num("threshold")?,
             position: crate::run_json::position_of(Some(spec_json)),

@@ -85,6 +85,8 @@ pub struct ProtocolOptions {
     pub cost: Option<crate::target::CostDecl>,
     /// #482: the run.json the candidates came from.
     pub front: Option<FrontSource>,
+    /// #807: which string of the run the candidates are; `None` for `--expr`.
+    pub expression_source: Option<crate::run_json::ExpressionSource>,
     /// #482: labels of windows that overlap the run's training or validation
     /// rows and were allowed anyway.
     pub in_sample_windows: Vec<String>,
@@ -126,6 +128,7 @@ impl Default for ProtocolOptions {
             batch_pnl: false,
             cost: None,
             front: None,
+            expression_source: None,
             in_sample_windows: Vec::new(),
             final_read: false,
             locked_ranges: Vec::new(),
@@ -489,6 +492,13 @@ pub struct DevicePnlCheck {
     pub cpu_net: f64,
     /// `strategy.net - cpu_net`; a screening check, not a reported P&L.
     pub net_delta: f64,
+    /// Device totals are bit-identical to the canonical CPU reduction on the
+    /// same inputs, counts included: a kernel fault check.
+    pub bit_equal: bool,
+    /// Device integer counts equal the scalar book's.
+    pub counts_equal: bool,
+    /// Rows whose position changes when the score is narrowed to f32.
+    pub f32_flip_rows: u64,
 }
 
 /// #304: report-level summary of the fused reduction.
@@ -500,6 +510,11 @@ pub struct DevicePnlSummary {
     pub windows: usize,
     pub rows: u64,
     pub max_abs_net_delta: f64,
+    /// Windows whose device block ran on the CUDA kernel.
+    pub device_windows: usize,
+    pub bit_mismatch_windows: usize,
+    pub count_mismatch_windows: usize,
+    pub f32_flip_rows: u64,
 }
 
 /// The complete report for all windows plus the pooled series.
@@ -537,6 +552,8 @@ pub struct Report {
     pub selected_on: String,
     /// #482: the run whose Pareto front supplied the candidates.
     pub front: Option<FrontSource>,
+    /// #807: `exact` or `rounded` for candidates read from a run.json.
+    pub expression_source: Option<crate::run_json::ExpressionSource>,
     /// #308: whether the band protocol selected the candidate.
     pub band_select: bool,
     /// True when no test row influenced candidate or threshold selection.
@@ -939,6 +956,9 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
                 flag
             ));
         }
+    }
+    if spec.policy == Policy::Band && spec.device_pnl {
+        return Err("--device-pnl is not supported with --policy band: the device arm prices the threshold book".to_string());
     }
     let table_validation = !opts.validation_starts.is_empty()
         && spec.windows.iter().all(|w| opts.validation_starts.iter().any(|(l, _)| *l == w.label));
@@ -1632,9 +1652,14 @@ impl Accum {
             let mut rows = 0u64;
             let mut count = 0usize;
             let mut max_abs_net_delta = 0.0f64;
+            let mut device_windows = 0usize;
+            let mut bit_mismatch_windows = 0usize;
+            let mut count_mismatch_windows = 0usize;
+            let mut f32_flip_rows = 0u64;
             for w in &windows {
                 if let Some(d) = &w.device_pnl {
                     if d.backend == "cuda" {
+                        device_windows += 1;
                         let at = d.started.saturating_duration_since(clock).as_secs_f64();
                         ledger.record_interval(crate::gpu_stats::Stage::Pnl, 0, at, at + d.host_s);
                     }
@@ -1644,6 +1669,9 @@ impl Accum {
                     rows += d.strategy.rows;
                     count += 1;
                     max_abs_net_delta = max_abs_net_delta.max(d.net_delta.abs());
+                    bit_mismatch_windows += usize::from(!d.bit_equal);
+                    count_mismatch_windows += usize::from(!d.counts_equal);
+                    f32_flip_rows += d.f32_flip_rows;
                 }
             }
             Some(DevicePnlSummary {
@@ -1653,6 +1681,10 @@ impl Accum {
                 windows: count,
                 rows,
                 max_abs_net_delta,
+                device_windows,
+                bit_mismatch_windows,
+                count_mismatch_windows,
+                f32_flip_rows,
             })
         } else {
             None
@@ -1691,6 +1723,7 @@ impl Accum {
             candidates: expressions,
             selected_on,
             front: opts.front.clone(),
+            expression_source: opts.expression_source,
             band_select: spec.band_select,
             test_used_for_selection: false,
             pool_reset_flat: spec.pool_reset_flat,
@@ -2423,14 +2456,24 @@ fn evaluate_window(
         let report: Option<crate::trading_gpu::PnlReport> = None;
         #[cfg(not(feature = "cuda"))]
         let backend = "cpu-canonical".to_string();
-        let report = match report {
-            Some(r) => r,
-            None => crate::trading_gpu::reduce(&ord_scores, &ord_returns, &ord_groups, &params)
-                .unwrap_or_else(|e| panic!("canonical P&L reduction failed: {}", e)),
+        let host_s = started.elapsed().as_secs_f64();
+        let canonical = crate::trading_gpu::reduce(&ord_scores, &ord_returns, &ord_groups, &params)
+            .unwrap_or_else(|e| panic!("canonical P&L reduction failed: {}", e));
+        let report = report.unwrap_or_else(|| canonical.clone());
+        let bit_equal = report.strategy.identical(&canonical.strategy);
+        let counts_equal = {
+            let s = &report.strategy;
+            s.rows == stats.rows as u64
+                && s.long_rows == stats.active as u64
+                && s.entries == stats.entries as u64
+                && s.trades == stats.trades as u64
+                && s.hits == stats.hits as u64
+                && s.final_exits == stats.exits as u64
+                && s.exits == (stats.rule_exits + stats.exits) as u64
         };
         let cpu_net = net.iter().sum::<f64>();
         Some(DevicePnlCheck {
-            host_s: started.elapsed().as_secs_f64(),
+            host_s,
             started,
             backend,
             segment_rows: crate::trading_gpu::DEFAULT_SEGMENT_ROWS,
@@ -2440,6 +2483,9 @@ fn evaluate_window(
             buy_and_hold: report.buy_and_hold,
             cpu_net,
             net_delta: report.strategy.net - cpu_net,
+            bit_equal,
+            counts_equal,
+            f32_flip_rows: crate::trading_gpu::f32_flip_rows(&ord_scores, threshold),
         })
     } else {
         None
@@ -2814,7 +2860,8 @@ fn device_pnl_json(d: &DevicePnlCheck) -> String {
     format!(
         "{{\"backend\":{},\"segment_rows\":{},\"tile_candidates\":{},\
          \"strategy\":{},\"cash\":{},\"buy_and_hold\":{},\
-         \"cpu_net\":{},\"net_delta\":{}}}",
+         \"cpu_net\":{},\"net_delta\":{},\"bit_equal\":{},\"counts_equal\":{},\
+         \"f32_flip_rows\":{}}}",
         jstr(&d.backend),
         d.segment_rows,
         d.tile_candidates,
@@ -2822,7 +2869,10 @@ fn device_pnl_json(d: &DevicePnlCheck) -> String {
         pnl_totals_json(&d.cash),
         pnl_totals_json(&d.buy_and_hold),
         jnum(d.cpu_net),
-        jnum(d.net_delta)
+        jnum(d.net_delta),
+        d.bit_equal,
+        d.counts_equal,
+        d.f32_flip_rows
     )
 }
 
@@ -3153,7 +3203,7 @@ impl Report {
              \"annualized_alpha_scale\":\"periods_per_year\"}}}},\
              \"candidates\":[{}],\"selection\":{{\"selected_on\":{},\
              \"band_select\":{},\"test_used_for_selection\":{},\
-             \"candidate_count\":{}{}}},\
+             \"candidate_count\":{}{}{}}},\
              \"pooled_seam\":{{\"reset_flat\":{},\"seam_cost\":{},\"seam_trades\":{}}},\
              \"sign_test\":{{\"positive\":{},\"total\":{},\"applicable\":{},\
              \"p_value\":{},\"method\":{}}},\
@@ -3203,6 +3253,9 @@ impl Report {
             self.test_used_for_selection,
             self.candidates.len(),
             self.front_json(paths),
+            self.expression_source
+                .map(|s| format!(",\"expression_source\":\"{}\"", s.as_str()))
+                .unwrap_or_default(),
             self.pool_reset_flat,
             jnum(self.seam_cost),
             self.seam_trades,
@@ -3218,13 +3271,19 @@ impl Report {
             self.device_pnl.as_ref().map_or("null".to_string(), |d| {
                 format!(
                     "{{\"backend\":{},\"segment_rows\":{},\"tile_candidates\":{},\
-                     \"windows\":{},\"rows\":{},\"max_abs_net_delta\":{}}}",
+                     \"windows\":{},\"rows\":{},\"max_abs_net_delta\":{},\
+                     \"device_windows\":{},\"bit_mismatch_windows\":{},\
+                     \"count_mismatch_windows\":{},\"f32_flip_rows\":{}}}",
                     jstr(&d.backend),
                     d.segment_rows,
                     d.tile_candidates,
                     d.windows,
                     d.rows,
-                    jnum(d.max_abs_net_delta)
+                    jnum(d.max_abs_net_delta),
+                    d.device_windows,
+                    d.bit_mismatch_windows,
+                    d.count_mismatch_windows,
+                    d.f32_flip_rows
                 )
             }),
             self.batch_pnl

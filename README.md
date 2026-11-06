@@ -605,7 +605,8 @@ cat examples/line.csv | rcsr --data - --target y --top 3
         "dof": 28, "ill_conditioned": false,
         "constants": [ { "value": 1.0, "std_error": 4.1e-7, "relative": 4.1e-7 },
                        { "value": 2.0, "std_error": 3.2e-7, "relative": 1.6e-7 } ] },
-      "expression": "(1 + (2 * x))" }
+      "expression": "(1 + (2 * x))",
+      "expression_exact": "(1.0 + (2.0 * x))" }
   ]
 }
 ```
@@ -768,6 +769,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   `--cost-bps` (or a target spec `cost_bps`, which gives `cost_bps / 2` per side; a different flag is refused, `--cost-override` prices another cost on purpose). Rows of one group closer than the label horizon overlap, so the per-row return would be earned several times against one cost: such a book is refused (exit 2); use `long:<h>,stride=<h>` or `long:1`. `--json` adds an `objective` block with the validation and test
   books, cash and buy-and-hold comparisons and the break-even cost.
   With a trading objective every `pareto[i]` in `run.json` also carries `validation_book`: `objective` (the selection score, lower is better), `net_pnl`, `sharpe`, `trades`, `exposure` and `constant`, from the same exact CPU `f64` validation book that ranks the member; `null` when the member has no usable book. Without a trading objective the field is absent.
+  Every `pareto[i]` and `objective.finalist` carries two strings for the same tree: `expression` rounds constants to 4 decimals for people, and `expression_exact` prints each constant as the shortest decimal that parses back to the same bits. `walkforward --front/--from-run`, `ladder --sr-run` and `ablation score` price `expression_exact` and say `expression_source` `exact`; a run without it is priced from the rounded string (`rounded`), and `walkforward --locked-test` and `ladder --locked-test` refuse that (exit 3).
 * `--fitness pnl` (default `metric`) ranks every candidate in the search by the exact long/flat net
   regret `(B - net) / B` on the training rows, `B` the hindsight DP bound at the same cost
   (lower is better, all-flat is 1). Constants are still fitted with `--metric`. It needs a

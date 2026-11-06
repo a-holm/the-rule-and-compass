@@ -1,18 +1,28 @@
 #!/usr/bin/env bash
 # Usage: gate.sh <worktree> <tag>
 # The full gate on an integration tip: CPU suite, CUDA suite, tiny benchmark (27/27).
-# Each step is its own lock hold with an outer timeout. Logs: $D/<tag>-{cpu,cuda,bench}.log.
-# Exit 0 only when every suite passes and the benchmark recovers 27/27.
-# Writes: $D/<tag>-{cpu,cuda,bench}.log
-set -u
+# The CPU suite and the benchmark are one lock hold each. The CUDA suite is built once in the build slot
+# (cargo test --features cuda --no-run --message-format=json), then every test target (lib, each bin, each
+# --test file, --doc) runs in its own lock hold under `timeout LOCK_HOLD_MAX-20`, so one target that times out or
+# fails never stops the others and no hold exceeds the cap. A target above the limit is a failure: size it, the
+# limit is never raised.
+# Exit 0 only when every suite passes, no CUDA target failed or timed out, and the benchmark recovers 27/27.
+# Exit 70 at once when the Xid count rose during a CUDA target (the remaining targets are not run).
+# Writes: $D/<tag>-{cpu,cuda,bench}.log, $D/<tag>-cuda-{build,summary}.log, $D/<tag>-cuda-<target>.log
+# The summary has one line per target: <target> rc=<n> xid=<a>-><b> secs=<s> | <test result line> [| timeout].
+# $D/<tag>-cuda.log is the build failure (if any) plus every target log under a `=== <target> ===` header.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
 if [ $# -ne 2 ]; then
-  echo "usage: gate.sh <worktree> <tag>" >&2
+  usage >&2
   exit 2
 fi
 W=$1
 T=$2
-L=${RCSR_LOCK_SCRIPT:-/mnt/lager/tmp/opencode/one-full-suite.sh}
-D=${RCSR_GATE_DIR:-${RCSR_GATES:-/mnt/lager/tmp/rcsr-gates}}
+D=${RCSR_GATE_DIR:-$GATES}
 if [ ! -d "$D" ]; then
   echo "gate dir $D missing; link it to the log directory or set RCSR_GATES" >&2
   exit 1
@@ -21,20 +31,85 @@ step() {
   local name=$1 cmd=$2
   "$L" bash -c "cd '$W/my-version' && CARGO_BUILD_JOBS=2 $cmd" > "$D/$T-$name.log" 2>&1
 }
+
+cuda_env="CARGO_BUILD_JOBS=2 RCSR_CUDA_ARCH=$CUDA_ARCH"
+cuda_cargo="cargo test --release --features cuda"
+cuda_hold=$((LOCK_HOLD_MAX - 20))
+cuda_targets=0
+cuda_failed=0
+cuda_timeouts=0
+
+# cuda_suite: sets g (0, 1 or 70) and the counters above.
+cuda_suite() {
+  local log=$D/$T-cuda.log summary=$D/$T-cuda-summary.log build=$D/$T-cuda-build.log
+  local targets name args tlog rc xb xa res line t0
+  : > "$log"
+  : > "$summary"
+  "$B" bash -c "cd '$W/my-version' && $cuda_env timeout 5400 $cuda_cargo --no-run --message-format=json" > "$build" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    cat "$build" >> "$log"
+    echo "cuda build failed rc=$rc" | tee -a "$summary" >> "$log"
+    g=1
+    return
+  fi
+  targets=$(grep -a '^{' "$build" | jq -r '
+    select(.reason == "compiler-artifact" and .profile.test == true and .executable != null)
+    | if (.target.kind | index("lib")) then "lib\t--lib"
+      elif (.target.kind | index("bin")) then "bin-" + .target.name + "\t--bin " + .target.name
+      elif (.target.kind | index("test")) then .target.name + "\t--test " + .target.name
+      else empty end' 2> /dev/null | sort -u)
+  if [ -z "$targets" ]; then
+    cat "$build" >> "$log"
+    echo "cuda build lists no test target" | tee -a "$summary" >> "$log"
+    g=1
+    return
+  fi
+  targets=$(printf '%s\ndoc\t--doc\n' "$targets")
+  g=0
+  while IFS=$'\t' read -r name args; do
+    cuda_targets=$((cuda_targets + 1))
+    tlog=$D/$T-cuda-$name.log
+    xb=$(xid_count)
+    t0=$SECONDS
+    "$L" bash -c "cd '$W/my-version' && $cuda_env timeout $cuda_hold $cuda_cargo --no-fail-fast $args" > "$tlog" 2>&1
+    rc=$?
+    xa=$(xid_count)
+    res=$(grep -a '^test result:' "$tlog" | tail -n 1)
+    line="$name rc=$rc xid=$xb->$xa secs=$((SECONDS - t0)) | ${res:-no test result line}"
+    if [ "$rc" -eq 124 ]; then
+      line="$line | timeout"
+      cuda_timeouts=$((cuda_timeouts + 1))
+    fi
+    [ "$rc" -eq 0 ] || cuda_failed=$((cuda_failed + 1))
+    echo "$line" >> "$summary"
+    { echo "=== $name ==="; cat "$tlog"; } >> "$log"
+    if [ "$xa" -gt "$xb" ]; then
+      echo "Xid count rose during $name; remaining CUDA targets not run" | tee -a "$summary" >> "$log"
+      g=70
+      return
+    fi
+  done <<< "$targets"
+  [ "$cuda_failed" -eq 0 ] || g=1
+}
+
 step cpu "timeout 5400 cargo test --release --no-fail-fast"; c=$?
-step cuda "RCSR_CUDA_ARCH=sm_86 timeout 5400 cargo test --release --features cuda --no-fail-fast"; g=$?
+g=0
+cuda_suite
 step bench "timeout 5400 cargo build --release && timeout 1800 ./target/release/rcsr-bench --tiny"; b=$?
 bad=0
 for k in cpu cuda; do
   f=$D/$T-$k.log
-  ok=$(grep -c 'test result: ok' "$f")
-  failed=$(grep -cE 'test result: FAILED|^error(\[|:)' "$f")
+  ok=$(grep -ac 'test result: ok' "$f")
+  failed=$(grep -aEc 'test result: FAILED|^error(\[|:)' "$f")
   echo "$k: ok=$ok failed=$failed"
   [ "$failed" -eq 0 ] || bad=1
 done
-rec=$(grep -E 'recovered [0-9]+/[0-9]+' "$D/$T-bench.log" | tail -n 1)
+echo "cuda: targets=$cuda_targets failed=$cuda_failed timeouts=$cuda_timeouts"
+rec=$(grep -a -E 'recovered [0-9]+/[0-9]+' "$D/$T-bench.log" | tail -n 1)
 echo "bench: ${rec:-no recovered line}"
 echo "exit cpu=$c cuda=$g bench=$b"
 echo "tested: $(git -C "$W" rev-parse HEAD)"
 case "$rec" in *"recovered 27/27"*) ;; *) bad=1 ;; esac
+[ "$g" -ne 70 ] || exit 70
 [ "$c" -eq 0 ] && [ "$g" -eq 0 ] && [ "$b" -eq 0 ] && [ "$bad" -eq 0 ]

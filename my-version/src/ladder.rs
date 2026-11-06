@@ -302,6 +302,8 @@ pub fn make_folds(
 pub struct SrRun {
     pub run: crate::run_json::RunFile,
     pub expression: String,
+    /// #807: `exact` when the run carried `expression_exact`.
+    pub expression_source: crate::run_json::ExpressionSource,
     pub variables: Vec<String>,
     pub threshold: f64,
     /// `(fold label, out-of-fold)` for every window of the table.
@@ -317,6 +319,7 @@ impl SrRun {
         }
         Ok(SrRun {
             expression: book.expression,
+            expression_source: book.expression_source,
             variables: book.variables,
             threshold: book.threshold,
             run,
@@ -337,11 +340,12 @@ impl SrRun {
             .map(|(l, ok)| format!("{{\"fold\":{},\"oof\":{}}}", jstr(l), ok))
             .collect();
         format!(
-            "{{{}\"run_sha256\":{},\"expression\":{},\"expression_source\":\"objective.finalist\",\
+            "{{{}\"run_sha256\":{},\"expression\":{},\"expression_source\":{},\"expression_from\":\"objective.finalist\",\
 \"threshold\":{},\"threshold_source\":\"run\",\"folds\":[{}]}}",
             run_path,
             jstr(&self.run.sha256),
             jstr(&self.expression),
+            jstr(self.expression_source.as_str()),
             jnum(self.threshold),
             folds.join(",")
         )
@@ -2280,6 +2284,8 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --target-spec <file>      target spec file: per-side cost (cost_bps / 2), return units (log is converted with exp_m1), return column and horizon; also the zero-parameter rung (scale column must be in the panel)\n\
   --sr-run <run.json>       one search run (rcsr --objective ... --json-out) scored on every fold with the run's fixed threshold;\n\
                             a fold whose test starts before the run's last seen row + purge is refused (exit 3)\n\
+                            prices objective.finalist.expression_exact, else the rounded expression (sr_run.expression_source);\n\
+                            --locked-test refuses a rounded source (exit 3)\n\
   --allow-in-sample         with --sr-run: drop in-sample folds from every rung and label them oof:false\n\
   --sr-score <col>          out-of-fold symbolic-regression score column from the caller (labelled oof=caller)\n\
   --sr-evals <n>            candidate evaluations of the symbolic-regression run\n\
@@ -2440,6 +2446,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         }
         if opts.sr_wall_seconds.is_none() {
             opts.sr_wall_seconds = sr.run.elapsed_seconds;
+        }
+        if locked_test && sr.expression_source == crate::run_json::ExpressionSource::Rounded {
+            return Err(input_err(crate::run_json::rounded_refusal(path)));
         }
         opts.sr_run = Some(sr);
     }
