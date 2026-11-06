@@ -223,6 +223,9 @@ pub struct Config {
     pub reject_constant_offspring: bool,
     /// Wall-clock budget in seconds; `None` means no limit.
     pub time_budget: Option<f64>,
+    /// #855: a chunk that stops on `time_budget` saves its search state and
+    /// skips the end-of-run report. Execution setting: not saved, not hashed.
+    pub interim_chunk: bool,
     /// Stop after this many generations with no improvement (0 disables).
     pub patience: usize,
     /// Number of training rows used to score and fit candidates in a
@@ -618,6 +621,7 @@ impl Default for Config {
             dedup: true,
             reject_constant_offspring: false,
             time_budget: None,
+            interim_chunk: false,
             patience: 40,
             predictor_samples: None,
             fit_samples: 0, // #85: off by default
@@ -5941,6 +5945,10 @@ pub struct Outcome {
     /// #482: offspring scored over the run, summed over islands and
     /// generations, including generations before a resume.
     pub candidates_evaluated: u64,
+    /// #855: the run stopped on `time_budget` under `--interim-chunk`. The
+    /// search state is saved; `archive` is the search archive at the last
+    /// generation, `test_errors` is empty and no end-of-run report ran.
+    pub interim: bool,
 }
 
 /// #256: the reported `converged_early`. `stopped` is the loop-control flag
@@ -7003,6 +7011,8 @@ fn run_postfix_search(
 
     // #256: the exit checkpoint is emitted after the exact f64 rebuild so it
     // carries the archive the run reports.
+    // #855: an interim chunk saves the search state and skips the report.
+    let interim = cfg.interim_chunk && stop_reason == "time_budget" && on_checkpoint.is_some();
     let mut io_final_s = 0.0f64;
     let io_mark = std::time::Instant::now();
     let pending_cp: Option<Checkpoint> = if on_checkpoint.is_some() {
@@ -7054,35 +7064,45 @@ fn run_postfix_search(
     // Exact f64 rebuild over the surviving front only. The generation errors
     // were the f32 kernel proxy; every number the user reads comes from here.
     let mut final_archive = Archive::new(archive.cap);
-    for sol in std::mem::take(&mut archive.items) {
-        let tree = expr::simplify(&sol.tree);
-        let error = if cfg.accepts_dimensions(&tree) {
-            score_tree(&tree, train_data, cfg)
-        } else {
-            f64::INFINITY
-        };
-        final_archive.try_insert(Sol {
-            complexity: expr::complexity(&tree),
-            cost: cfg.complexity_model.complexity(&tree),
-            tree,
-            error,
-        });
+    if interim {
+        final_archive.items = std::mem::take(&mut archive.items);
+    } else {
+        for sol in std::mem::take(&mut archive.items) {
+            let tree = expr::simplify(&sol.tree);
+            let error = if cfg.accepts_dimensions(&tree) {
+                score_tree(&tree, train_data, cfg)
+            } else {
+                f64::INFINITY
+            };
+            final_archive.try_insert(Sol {
+                complexity: expr::complexity(&tree),
+                cost: cfg.complexity_model.complexity(&tree),
+                tree,
+                error,
+            });
+        }
+        final_archive.canonicalize();
     }
-    final_archive.canonicalize();
-    let (final_archive, prune_report) = prune::prune_archive(final_archive, train, train_data, cfg);
+    let (final_archive, prune_report) = if interim {
+        (final_archive, PruneReport::default())
+    } else {
+        prune::prune_archive(final_archive, train, train_data, cfg)
+    };
     let sorted = final_archive.sorted();
-    let test_data = EvalSample::new(test, cfg);
+    let test_data = if interim { None } else { Some(EvalSample::new(test, cfg)) };
     let test_errors: Vec<f64> = sorted
         .iter()
-        .map(|s| eval_error_on(&s.tree, &test_data, cfg.metric))
+        .filter_map(|s| Some(eval_error_on(&s.tree, test_data.as_ref()?, cfg.metric)))
         .collect();
     let mut final_archive = Archive::new(final_archive.cap);
     final_archive.items = sorted;
     if let Some(mut cp) = pending_cp {
-        cp.final_archive = Some(Archive {
-            items: final_archive.items.clone(),
-            cap: final_archive.cap,
-        });
+        if !interim {
+            cp.final_archive = Some(Archive {
+                items: final_archive.items.clone(),
+                cap: final_archive.cap,
+            });
+        }
         let io_mark = std::time::Instant::now();
         emit(&mut on_checkpoint, &cp);
         io_final_s += io_mark.elapsed().as_secs_f64();
@@ -7093,7 +7113,11 @@ fn run_postfix_search(
         .iter()
         .map(|s| s.error)
         .fold(f64::INFINITY, f64::min);
-    let convergence = progress_stats.observe(gens_done, best, &final_archive);
+    let convergence = if interim {
+        progress_stats.current()
+    } else {
+        progress_stats.observe(gens_done, best, &final_archive)
+    };
 
     // #284: the remaining tail is one measured host window (final f64 rebuild,
     // test scoring and archive canonicalisation).
@@ -7138,6 +7162,7 @@ fn run_postfix_search(
         stop_reason,
         prune: prune_report,
         candidates_evaluated: candidates,
+        interim,
     })
 }
 
@@ -8742,7 +8767,9 @@ fn run_search(
     // #120: promoted cell elites are rebuilt exactly on every training row in
     // f64 before they are reported. Screening and row subsets may guide the
     // search, but the QD report is never a subset estimate.
-    if cfg.qd_policy {
+    // #855: an interim chunk saves the search state and skips the report.
+    let interim = cfg.interim_chunk && stop_reason == "time_budget" && on_checkpoint.is_some();
+    if cfg.qd_policy && !interim {
         if let Some(qd) = qd_archive.as_mut() {
             qd.refit_all(|tree| {
                 let sol = refit_survivor(tree, &train_data, cfg);
@@ -8792,12 +8819,13 @@ fn run_search(
     let gpu_fit_used =
         cfg.fit_strategy.defers_to_gpu() && (gpu_used || fit_only_device);
     let mut refit_report = RefitReport::default();
-    if subsampling_active(cfg, train)
-        || gpu_used
-        || fit_only_device
-        || resumed
-        || fit_screened
-        || cfg.fit_irls_active()
+    if !interim
+        && (subsampling_active(cfg, train)
+            || gpu_used
+            || fit_only_device
+            || resumed
+            || fit_screened
+            || cfg.fit_irls_active())
     {
         // Generation fitness was estimated on subsets, or on the GPU in f32, so
         // the front is rebuilt from the surviving trees and scored on every
@@ -8812,7 +8840,7 @@ fn run_search(
         );
         archive = rebuilt.0;
         refit_report = rebuilt.1;
-    } else {
+    } else if !interim {
         for pop in &islands {
             for ind in pop {
                 archive.try_insert(Sol {
@@ -8824,29 +8852,36 @@ fn run_search(
             }
         }
     }
-    let (archive, prune_report) = prune::prune_archive(archive, train, &train_data, cfg);
+    let (archive, prune_report) = if interim {
+        (archive, PruneReport::default())
+    } else {
+        prune::prune_archive(archive, train, &train_data, cfg)
+    };
     let sorted = archive.sorted();
     // #27: one transpose for the whole test sample, shared by every front
     // entry. Multi-output keeps its own scalar path.
-    let test_data = EvalSample::new(test, cfg);
+    let test_data = if interim { None } else { Some(EvalSample::new(test, cfg)) };
     let test_errors: Vec<f64> = sorted
         .iter()
-        .map(|s| {
+        .filter_map(|s| {
+            let test_data = test_data.as_ref()?;
             // #15: fit the per-output constants on train, then score test.
-            if train.is_multi() {
+            Some(if train.is_multi() {
                 multi::combined_test_error(&s.tree, train, test, cfg.metric, cfg.fit_iters)
             } else {
-                eval_error_on(&s.tree, &test_data, cfg.metric)
-            }
+                eval_error_on(&s.tree, test_data, cfg.metric)
+            })
         })
         .collect();
     let mut final_archive = Archive::new(archive.cap);
     final_archive.items = sorted;
     if let Some(mut cp) = pending_cp {
-        cp.final_archive = Some(Archive {
-            items: final_archive.items.clone(),
-            cap: final_archive.cap,
-        });
+        if !interim {
+            cp.final_archive = Some(Archive {
+                items: final_archive.items.clone(),
+                cap: final_archive.cap,
+            });
+        }
         let io_mark = std::time::Instant::now();
         emit(&mut on_checkpoint, &cp);
         io_final_s += io_mark.elapsed().as_secs_f64();
@@ -8859,7 +8894,7 @@ fn run_search(
     // #26: a GPU-guided run's in-loop readings are on the f32 proxy; take the
     // final reading from the rebuilt f64 archive so the reported statistics
     // describe the numbers the user sees.
-    if !stats_observed || gpu_used || resumed {
+    if !interim && (!stats_observed || gpu_used || resumed) {
         let best = final_archive
             .items
             .iter()
@@ -8965,6 +9000,7 @@ fn run_search(
         stop_reason, // #211
         prune: prune_report,
         candidates_evaluated: candidates,
+        interim,
     })
 }
 

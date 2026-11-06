@@ -996,3 +996,96 @@ fn a_resume_takes_the_requested_pipeline_depth() {
     assert_eq!(a, b, "the depth-0 resume must equal the uninterrupted depth-0 run");
     assert_eq!(a, c, "the depth-3 resume must give the same archive");
 }
+
+/// #855: `chunks` one-generation chunks (a zero `--time-budget` stops after one
+/// generation), each resumed from the previous exit checkpoint, then a last
+/// chunk to `base.generations`. Returns the last chunk's outcome and the text of
+/// its exit checkpoint.
+fn chunked(base: &Config, interim: bool, chunks: usize, train: &Sample, test: &Sample) -> (Outcome, String) {
+    let mut saved: Option<Checkpoint> = None;
+    for k in 1..=chunks {
+        let cfg = Config {
+            time_budget: Some(0.0),
+            interim_chunk: interim,
+            ..base.clone()
+        };
+        let mut text: Option<String> = None;
+        let out = search::run_resumable(&cfg, train, test, saved.take(), 0, |cp| {
+            text = Some(cp.to_text());
+        })
+        .expect("chunk");
+        assert_eq!(out.stop_reason, "time_budget");
+        assert_eq!(out.generations, k);
+        assert_eq!(out.interim, interim);
+        let cp = Checkpoint::from_text(&text.expect("exit checkpoint")).expect("parse");
+        if interim {
+            assert!(out.test_errors.is_empty(), "an interim chunk scores no test rows");
+            assert!(cp.final_archive.is_none(), "an interim checkpoint holds no reported archive");
+        } else {
+            assert_eq!(out.test_errors.len(), out.archive.items.len());
+            assert!(cp.final_archive.is_some());
+        }
+        saved = Some(cp);
+    }
+    let mut text: Option<String> = None;
+    let last = search::run_resumable(base, train, test, saved, 0, |cp| text = Some(cp.to_text()))
+        .expect("last chunk");
+    assert!(!last.interim);
+    (last, text.expect("exit checkpoint"))
+}
+
+fn assert_same_report(a: &Outcome, b: &Outcome, what: &str) {
+    assert_eq!(describe(a), describe(b), "{what}: archive");
+    let bits = |o: &Outcome| o.test_errors.iter().map(|e| e.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(a), bits(b), "{what}: test errors");
+    assert_eq!(a.archive.hash(), b.archive.hash(), "{what}: archive hash");
+    assert_eq!(a.candidates_evaluated, b.candidates_evaluated, "{what}: candidates");
+    assert_eq!(a.generations, b.generations, "{what}: generations");
+}
+
+/// #855: three interim chunks and a last chunk give the same last-chunk report
+/// and the same exit checkpoint, byte for byte, as the same chunks without the
+/// flag and as one uninterrupted run.
+#[test]
+fn interim_chunks_keep_the_final_hash() {
+    let train = sample(240);
+    let test = sample(80);
+    for seed in [11u32, 12] {
+        let bases = [
+            ("squared", Config { metric: rcsr::metrics::Metric::Squared, ..config(seed) }),
+            ("pnl", pnl_config(seed, 5.0, &train)),
+        ];
+        for (name, base) in bases {
+            let what = format!("{name} seed {seed}");
+            let uninterrupted = search::run(&base, &train, &test);
+            let uninterrupted_text = checkpoint_text(&base, &train, &test);
+            let (plain, plain_text) = chunked(&base, false, 3, &train, &test);
+            let (interim, interim_text) = chunked(&base, true, 3, &train, &test);
+            assert_same_report(&plain, &interim, &format!("{what}: interim against plain chunks"));
+            assert_same_report(&uninterrupted, &interim, &format!("{what}: interim against uninterrupted"));
+            assert_eq!(plain_text, interim_text, "{what}: exit checkpoint bytes");
+            assert_eq!(uninterrupted_text, interim_text, "{what}: exit checkpoint against uninterrupted");
+        }
+    }
+}
+
+/// #855: a chunk that stops on the generation budget is the last one in fact
+/// and reports in full.
+#[test]
+fn interim_stop_on_generations_reports() {
+    let train = sample(240);
+    let test = sample(80);
+    let cfg = Config {
+        time_budget: Some(1.0e9),
+        interim_chunk: true,
+        ..config(11)
+    };
+    let mut text: Option<String> = None;
+    let out = search::run_resumable(&cfg, &train, &test, None, 0, |cp| text = Some(cp.to_text()))
+        .expect("run");
+    assert_eq!(out.stop_reason, "generations");
+    assert!(!out.interim);
+    assert_eq!(out.test_errors.len(), out.archive.items.len());
+    let cp = Checkpoint::from_text(&text.expect("checkpoint")).expect("parse");
+    assert_eq!(cp.final_archive.expect("reported archive").hash(), out.archive.hash());
+}
