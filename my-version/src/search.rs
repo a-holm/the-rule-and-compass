@@ -6805,7 +6805,8 @@ fn run_postfix_search(
         let stage_eval = stage_lap(&mut stage_mark); // #284
         restart_flags = vec![false; n_islands];
 
-        let filter_fixed_archive = fixed_position_filter(cfg, nvars); // #848
+        let filter_fixed_archive =
+            fixed_position_filter(cfg, train.x.first().map_or(0, |r| r.len())); // #848
         // Archive: test `(error, cost)` first and rebuild a tree only for a
         // candidate that survives. This is the survivor-only hand-off.
         let mut gen_best = f64::INFINITY;
