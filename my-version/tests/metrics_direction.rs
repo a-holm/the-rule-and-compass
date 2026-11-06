@@ -5,11 +5,14 @@
 //! signed metric can be selected by name, and a fitted `step` produces the
 //! zero-adjoint warning.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 fn run(args: &[&str], csv: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let mut child = rcsr_cmd::rcsr()
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -30,6 +30,9 @@ impl Kind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Probe {
     pub kind: Kind,
+    /// `false` when the run never looked for a device (an explicit `--cpu`). Then
+    /// `device: None` means "unknown", not "no device".
+    pub probed: bool,
     /// The device description when a device answered, otherwise `None`.
     pub device: Option<String>,
     /// Why the CPU was selected (or the device is unusable). `None` for a
@@ -41,6 +44,17 @@ impl Probe {
     pub fn cpu(reason: impl Into<String>) -> Self {
         Probe {
             kind: Kind::Cpu,
+            probed: true,
+            device: None,
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// The CPU was requested and the device was not looked at.
+    pub fn not_probed(reason: impl Into<String>) -> Self {
+        Probe {
+            kind: Kind::Cpu,
+            probed: false,
             device: None,
             reason: Some(reason.into()),
         }
@@ -49,6 +63,7 @@ impl Probe {
     pub fn gpu(device: String) -> Self {
         Probe {
             kind: Kind::Gpu,
+            probed: true,
             device: Some(device),
             reason: None,
         }
@@ -74,9 +89,11 @@ pub fn skip_decision(required: bool, reason: &str) -> Result<(), String> {
     }
 }
 
+/// Test support, not production API: integration tests are separate crates, so it must be `pub`.
 /// Called by a device test that found no usable device, before it returns. It prints
 /// `reason` and lets the test skip, or panics when `RCSR_REQUIRE_DEVICE=1`, so a gate
 /// on a machine without its device fails instead of passing silently.
+#[doc(hidden)]
 pub fn skip_without_device(reason: &str) {
     let required = std::env::var(REQUIRE_DEVICE_ENV).as_deref() == Ok("1");
     match skip_decision(required, reason) {
@@ -118,6 +135,16 @@ mod tests {
         assert!(err.contains("no usable CUDA device"), "{err}");
         assert!(err.contains("RCSR_GPU=0"), "{err}");
         assert!(skip_decision(false, "no usable CUDA device").is_ok());
+    }
+
+    #[test]
+    fn not_probed_is_not_a_finding_about_the_device() {
+        let p = Probe::not_probed("--cpu/--no-gpu (device not probed)");
+        assert!(!p.probed);
+        assert!(!p.available());
+        assert!(p.device.is_none());
+        assert!(Probe::cpu("no CUDA device found").probed);
+        assert!(Probe::gpu("d".to_string()).probed);
     }
 
     #[test]

@@ -5,8 +5,11 @@
 //! The six printed laws of the 10 h run are seeded with `--fit-iters 0`, so the
 //! constants stay as printed and the errors are those of the audit.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::devlog::Json;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const INPUTS: &str = "r16,r96,r672,ma96,ma672,ma_slope672,macd_hist,natr14,vol16,vol96,vol_ts,vol_ratio,vol_z2880,parkinson96,rv_ratio,rsi14,bb96,bb_width96,adx14,di_diff14,cmf20,mfi14,vwap_dev96,vol_z96,taker_ratio96,taker_imb16,trade_intensity96,clv1,clv4,body1,batr,wasym1,lower_wick,rng1,volrat,gapatr,ou_hl96,acf1,vr4,rskew96,jump_share,semivar_asym,cusum_abs_z,btc_r96,btc_vol96,rel_btc96,beta384,tod_sin,tod_cos,dow_sin,dow_cos,don96";
 
@@ -42,7 +45,7 @@ fn run(extra: &[&str]) -> Json {
         args.push(law);
     }
     args.extend_from_slice(extra);
-    let out: Output = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(&args).output().expect("run rcsr");
+    let out: Output = rcsr_cmd::rcsr().args(&args).output().expect("run rcsr");
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     Json::parse(String::from_utf8_lossy(&out.stdout).trim()).expect("json")
 }

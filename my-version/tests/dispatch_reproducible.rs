@@ -2,13 +2,16 @@
 //! the default `--dispatch auto` gives one front and one route ledger in every
 //! process, and `rcsr calibrate` is the only writer of the calibration file.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 #[path = "common/scratch.rs"]
 mod scratch;
 
 use scratch::Scratch;
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 fn csv() -> String {
     let mut text = String::from("x0,x1,y\n");
@@ -24,7 +27,7 @@ fn csv() -> String {
 /// One CLI search. `cache` is the private `XDG_CACHE_HOME`, so no file of the
 /// machine's real cache is read.
 fn search(cache: &Path, extra: &[&str]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let mut child = rcsr_cmd::rcsr_for(extra)
         .args([
             "--data", "-", "--target", "y", "--vars", "x0,x1", "--islands", "1", "--pop", "30",
             "--generations", "3", "--seed", "1", "--patience", "0", "--json", "--no-dev-log",
@@ -73,7 +76,7 @@ fn route_ledger(json: &str) -> Vec<(String, String, String)> {
 }
 
 fn calibrate(cache: &Path, out: &Path, extra: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr_for(extra)
         .arg("calibrate")
         .arg("--out")
         .arg(out)

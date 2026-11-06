@@ -1,13 +1,16 @@
 //! #462: the `rcsr-bench` command line: NDJSON streaming, multi-seed runs and
 //! the paired `compare` command.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::bench_stats::{parse_json, Json};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rcsr-bench"))
+    rcsr_cmd::rcsr_bench()
 }
 
 #[path = "common/scratch.rs"]

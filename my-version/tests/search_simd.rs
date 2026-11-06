@@ -11,8 +11,11 @@
 //! 2. an unsupported operator falls back per tree and still agrees;
 //! 3. the `--no-simd` flag is accepted and changes nothing but the path.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use rcsr::data::Sample;
 use rcsr::eval_soa;
@@ -173,7 +176,7 @@ fn csv(rows: usize) -> String {
 }
 
 fn run(args: &[&str]) -> (Option<i32>, String, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let mut child = rcsr_cmd::rcsr()
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -226,7 +229,7 @@ fn no_simd_flag_is_accepted_and_changes_no_output() {
     );
 
     // The flag is documented where every other search flag is.
-    let help = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let help = rcsr_cmd::rcsr()
         .arg("--help")
         .output()
         .expect("run --help");

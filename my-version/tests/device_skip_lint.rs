@@ -65,3 +65,34 @@ fn the_lint_flags_device_skips_and_nothing_else() {
     assert!(!is_device_skip_print("eprintln!(\"skipping: a device is usable here\");"));
     assert!(!is_device_skip_print("eprintln!(\"rows={}\", n);"));
 }
+
+/// `RCSR_REQUIRE_DEVICE` is read only inside `backend::skip_without_device`, and no production
+/// code calls the helper: it may appear in `src/` only after the `#[cfg(test)]` marker.
+#[test]
+fn the_helper_and_its_variable_stay_out_of_production_code() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    files.sort();
+    let mut problems = Vec::new();
+    for file in files {
+        let rel = file.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+        if rel == "src/backend.rs" {
+            continue;
+        }
+        let text = fs::read_to_string(&file).unwrap();
+        let test_part = text.find("\n#[cfg(test)]").unwrap_or(text.len());
+        let whole_file_is_tests = rel.ends_with("_tests.rs");
+        for (n, line) in text.lines().enumerate() {
+            let offset: usize = text.lines().take(n).map(|l| l.len() + 1).sum();
+            let in_tests = whole_file_is_tests || offset >= test_part;
+            if line.contains("RCSR_REQUIRE_DEVICE") || line.contains("REQUIRE_DEVICE_ENV") {
+                problems.push(format!("{rel}:{}: reads the require-device variable outside backend.rs", n + 1));
+            }
+            if !in_tests && line.contains("skip_without_device") {
+                problems.push(format!("{rel}:{}: production code calls skip_without_device", n + 1));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}

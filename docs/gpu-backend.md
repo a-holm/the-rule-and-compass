@@ -605,6 +605,7 @@ Fallback and the flags:
   hatch: it is silent and yields the byte-identical CPU trajectory.
 * `RCSR_GPU=0` makes a CUDA build behave as if no device were present, which is
   how the fallback test runs on a machine that has one.
+  Tests build their `rcsr` and `rcsr-bench` children through `my-version/tests/common/rcsr.rs`: `rcsr()` sets `RCSR_GPU=0`, so the child makes no CUDA call, and `rcsr_on_device()` keeps the environment for a test whose purpose is the device (`rcsr_for(args)` picks by the device flags `--gpu`, `--dispatch`, `--batch-pnl`, `--device-pnl`, `--gpu-memory`). `tests/rcsr_command_lint.rs` fails on any other use of `CARGO_BIN_EXE_rcsr` or `CARGO_BIN_EXE_rcsr-bench` in `tests/`.
 * Any CUDA error during a batch prints the same `# gpu: unavailable (...)`
   note, re-scores the pending generation on the CPU and disables the GPU for the
   rest of the run. There is no panic and no stale result.
@@ -814,19 +815,20 @@ The probe runs once, before the dataset is uploaded, and the effective backend
 is recorded from what ran rather than inferred from the flags. An explicit
 `--cpu`/`--no-gpu` skips the probe (`search` and `enrich`): the run makes no CUDA
 call, opens no `/dev/nvidia*` and reports the CPU as requested, with no device
-name. `RCSR_GPU=0` skips the CUDA call as well. Non-quiet runs
+name. `RCSR_GPU=0` skips the CUDA call as well. A run that skips the probe says so: it never reports "no device", because it did not look. Non-quiet runs
 print one line:
 
 ```
 # resource: backend=gpu device="NVIDIA GeForce RTX 3060 (sm_86, 28 SMs, 12288 MB)" threads=8 rows=2048 cols=3
 # resource: backend=cpu device=- threads=8 rows=2048 cols=3 (no CUDA device found)
+# resource: backend=cpu device=not probed threads=8 rows=2048 cols=3 (--cpu/--no-gpu)
 ```
 
 `rows`/`cols` are the training table. `threads` is the machine's available
 parallelism; the current search loop uses one thread per island, and a
 `--threads` control and the #132 baseline cap are separate workstreams.
 
-`--json` carries `"backend": "gpu"|"cpu"`, `"device": <name>|null` and
+`--json` carries `"backend": "gpu"|"cpu"`, `"device": <name>|null`, `"device_probed": true|false` (false under `--cpu`: `device` null then means unknown) and
 `"backend_reason": <why the CPU ran>|null`; NDJSON emits one
 `{"event":"backend",...}` object before the results. The run manifest from
 #140 will carry the same fields when it lands; until then JSON is the record.

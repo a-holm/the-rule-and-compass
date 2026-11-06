@@ -2,11 +2,13 @@
 //! search split, walk-forward and the ladder, and read only through the sealed
 //! path. Fixtures are synthetic; the locked range is a stand-in in 2024.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::devlog::Json;
 use rcsr::lockbox::{self, Lockbox};
 use rcsr::protocol::{Candidate, Ledger};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -26,7 +28,7 @@ fn scratch(name: &str) -> (Scratch, PathBuf) {
 }
 
 fn rcsr(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().unwrap();
+    let out = rcsr_cmd::rcsr().args(args).output().unwrap();
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -1404,7 +1406,16 @@ fn ladder_verify_read_recomputes_the_recorded_report() {
         without_timing(&std::fs::read_to_string(&out2).unwrap()),
         without_timing(&std::fs::read_to_string(&out).unwrap())
     );
-    assert_eq!(std::fs::read(&md2).unwrap(), std::fs::read(&md).unwrap());
+    // the last column of the table is the wall clock of the rung
+    let without_wall = |p: &str| -> String {
+        std::fs::read_to_string(p)
+            .unwrap()
+            .lines()
+            .map(|l| if l.starts_with('|') { l.trim_end_matches('|').rsplit_once('|').map_or(l, |(head, _)| head) } else { l })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(without_wall(&md2), without_wall(&md));
 }
 
 #[test]
@@ -1513,4 +1524,61 @@ fn ladder_retry_after_a_marker_without_a_ledger_line_records_the_read() {
     assert_eq!(f.bytes(&f.marker()), marker_before, "the retry writes no second marker line");
     let (code, vout, err) = rcsr(&["protocol", "verify", "--ledger", &f.ledger, "--data", &f.data]);
     assert_eq!(code, 0, "{}{}", vout, err);
+}
+
+#[test]
+fn ladder_refuses_out_and_markdown_that_name_one_file() {
+    let f = Sealed::new("lad-same-file");
+    std::fs::create_dir(f.dir.join("b")).unwrap();
+    let out = f.dir.join("a.json");
+    let ledger_before = f.bytes(&f.ledger);
+    let forms = [
+        f.dir.join(".").join("a.json"),
+        f.dir.join("b").join("..").join("a.json"),
+    ];
+    for md in forms {
+        let (code, _, err) = f.read(&s(&out), &["--markdown", &s(&md)]);
+        assert_eq!(code, 3, "{}: {}", md.display(), err);
+        assert!(err.contains("same file"), "{}", err);
+        assert_eq!(f.bytes(&f.ledger), ledger_before);
+        assert!(f.bytes(&f.marker()).is_none());
+        assert!(!out.exists() && !f.dir.join("a.json.tmp").exists());
+    }
+    // a symlink and a hard link to an existing output
+    std::fs::write(&out, "old").unwrap();
+    std::os::unix::fs::symlink(&out, f.dir.join("sym.md")).unwrap();
+    std::fs::hard_link(&out, f.dir.join("hard.md")).unwrap();
+    for md in ["sym.md", "hard.md"] {
+        let (code, _, err) = f.read(&s(&out), &["--markdown", &s(&f.dir.join(md))]);
+        assert_eq!(code, 3, "{md}: {err}");
+        assert_eq!(f.bytes(&f.ledger), ledger_before);
+        assert!(f.bytes(&f.marker()).is_none());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "old");
+        for entry in std::fs::read_dir(&f.dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(!name.ends_with(".tmp"), "{name} left behind for {md}");
+        }
+    }
+}
+
+#[test]
+fn ladder_refuses_a_relative_out_and_its_dot_slash_form() {
+    let f = Sealed::new("lad-same-file-rel");
+    let ledger_before = f.bytes(&f.ledger);
+    let out = rcsr_cmd::rcsr()
+        .current_dir(&f.dir)
+        .args([
+            "ladder", "--data", &f.data, "--target", "y", "--time", "ts", "--group", "sym", "--features", "f1,f2",
+            "--windows", &f.windows, "--scheme", "locked", "--purge-seconds", "7200", "--gbm-trees", "10", "--draws",
+            "50", "--max-fit-rows", "600", "--out", "a.json", "--markdown", "./a.json", "--locked-test", "--ledger",
+            &f.ledger, "--sealed", &f.sealed,
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{err}");
+    assert!(err.contains("same file"), "{err}");
+    assert_eq!(f.bytes(&f.ledger), ledger_before);
+    assert!(f.bytes(&f.marker()).is_none());
+    assert!(!f.dir.join("a.json").exists() && !f.dir.join("a.json.tmp").exists());
 }

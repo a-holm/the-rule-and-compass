@@ -4,6 +4,9 @@
 //! answers, then end-to-end on one easy and one hard problem. The last test
 //! pins the flag gating: `--progress` never changes the default (text) output.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::Sample;
 use rcsr::expr::{self, input, node, Op};
 use rcsr::metrics::Metric;
@@ -12,7 +15,6 @@ use rcsr::progress_stats::{
     Convergence, ProgressStats, CONVERGED_THRESHOLD, DEFAULT_WINDOW,
 };
 use rcsr::search::{self, Config};
-use std::process::Command;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -300,7 +302,7 @@ fn progress_is_flag_gated_and_does_not_change_default_output() {
     std::fs::write(&path, csv).expect("write fixture");
 
     let run = |extra: &[&str]| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rcsr"));
+        let mut cmd = rcsr_cmd::rcsr();
         cmd.arg("--data")
             .arg(&path)
             .args(["--target", "y", "--vars", "x"])

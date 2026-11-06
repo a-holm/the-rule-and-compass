@@ -5,6 +5,9 @@
 //! archive, bit for bit. The tests also pin down exact tree/RNG round-trips and
 //! the refusal of corrupt checkpoints and mismatched data.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::atomic::Fault;
 use rcsr::checkpoint::{config_hash, decode_tree, encode_tree, Backend, Checkpoint};
 use rcsr::data::Sample;
@@ -12,7 +15,7 @@ use rcsr::expr::{self, constant, input, node, Op};
 use rcsr::rng::Mt;
 use rcsr::search::{self, Config, Outcome};
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 fn sample(n: usize) -> Sample {
     let mut x = Vec::with_capacity(n);
@@ -514,7 +517,15 @@ fn truncated_corrupt_and_wrong_version_checkpoints_are_clear_errors() {
 }
 
 fn rcsr(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
+        .args(args)
+        .output()
+        .expect("run rcsr")
+}
+
+#[cfg(feature = "cuda")]
+fn rcsr_on_device(args: &[&str]) -> Output {
+    rcsr_cmd::rcsr_on_device()
         .args(args)
         .output()
         .expect("run rcsr")
@@ -953,7 +964,7 @@ fn a_resume_takes_the_requested_pipeline_depth() {
     };
     let run = |args: Vec<String>| -> Output {
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        rcsr(&refs)
+        rcsr_on_device(&refs)
     };
 
     let mut saved_args = common(&["--generations", "3", "--save"]);

@@ -5,6 +5,9 @@
 //! refit on every training row. These tests pin down the off path (bit for
 //! bit), the full-data guarantee, the CLI note and a small recovery problem.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::Sample;
 use rcsr::expr;
 use rcsr::metrics::Metric;
@@ -200,7 +203,7 @@ fn line_csv(n: usize) -> String {
 #[test]
 fn cli_reports_the_screening_size_and_refit() {
     let csv = TempCsv::new(&line_csv(200));
-    let text = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let text = rcsr_cmd::rcsr()
         .args([
             "--data",
             csv.as_str(),
@@ -232,7 +235,7 @@ fn cli_reports_the_screening_size_and_refit() {
         err
     );
 
-    let json = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let json = rcsr_cmd::rcsr()
         .args([
             "--data",
             csv.as_str(),
@@ -264,7 +267,7 @@ fn cli_reports_the_screening_size_and_refit() {
 
 #[test]
 fn fit_samples_one_is_a_usage_error() {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args(["--data", "/nonexistent", "--target", "y"])
         .args(["--fit-samples", "1"])
         .output()

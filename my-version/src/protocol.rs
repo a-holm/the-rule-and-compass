@@ -18,9 +18,13 @@
 //!
 //! # Ledger
 //!
-//! One JSON object per line, append-only. Each line carries `prev`, the SHA-256
-//! of the previous line, so an edit anywhere breaks the chain
-//! ([`Ledger::verify_chain`]). Lines:
+//! One JSON object per line, append-only. Each line goes out in one `write` call
+//! on an append-mode file under an exclusive lock, followed by `fsync`; a file
+//! whose last line has no newline, or a line that is not one complete object, is
+//! refused by every reader and is never repaired by the tool.
+//!
+//! Each line carries `prev`, the SHA-256 of the previous line, so an edit
+//! anywhere breaks the chain ([`Ledger::verify_chain`]). Lines:
 //!
 //! * `candidate`: a development run (`id`, `expression`, `spec_sha256`,
 //!   `data_sha256`, `build_commit`, `report_sha256`, `test_read:false`).
@@ -281,12 +285,23 @@ fn field_str(line: &str, key: &str) -> Option<String> {
     None
 }
 
-fn field_num(line: &str, key: &str) -> Option<f64> {
+/// Read a non-negative integer field. A float, a negative number, a string or an
+/// overflow is `None`.
+fn field_u64(line: &str, key: &str) -> Option<u64> {
     let pat = format!("\"{}\":", key);
     let start = line.find(&pat)? + pat.len();
     let rest = &line[start..];
     let end = rest.find(|c| c == ',' || c == '}').unwrap_or(rest.len());
     rest[..end].trim().parse().ok()
+}
+
+fn fault_field(path: &std::path::Path, n: usize, event: &str, key: &str) -> String {
+    format!("{}: line {} is a {} event without a valid {}: the ledger was edited", path.display(), n, event, key)
+}
+
+/// A non-empty string field of a ledger line, or a ledger fault naming the line.
+fn need_str(path: &std::path::Path, n: usize, line: &str, event: &str, key: &str) -> Result<String, String> {
+    field_str(line, key).filter(|v| !v.is_empty()).ok_or_else(|| fault_field(path, n, event, key))
 }
 
 fn field_bool(line: &str, key: &str) -> bool {
@@ -406,17 +421,29 @@ impl Ledger {
 
     fn lines(&self) -> Result<Vec<String>, String> {
         match std::fs::read_to_string(&self.path) {
-            Ok(t) => Ok(t.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect()),
+            Ok(t) => complete_lines(&self.path.display().to_string(), "ledger", &t),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(format!("{}: {}", self.path.display(), e)),
         }
     }
 
-    /// Check that every line names the hash of the line before it.
+    /// Check that every line is one complete object and names the hash of the
+    /// line before it.
     pub fn verify_chain(&self) -> Result<usize, String> {
         let lines = self.lines()?;
+        self.chain_of(&lines)
+    }
+
+    fn chain_of(&self, lines: &[String]) -> Result<usize, String> {
         let mut prev = "0".repeat(64);
         for (i, line) in lines.iter().enumerate() {
+            if line.matches("\"prev\":\"").count() != 1 {
+                return Err(format!(
+                    "{}: line {} does not hold exactly one prev: two lines were joined or the ledger was edited",
+                    self.path.display(),
+                    i + 1
+                ));
+            }
             let got = field_str(line, "prev").unwrap_or_default();
             if got != prev {
                 return Err(format!(
@@ -432,12 +459,14 @@ impl Ledger {
 
     pub fn events(&self) -> Result<Vec<Event>, String> {
         let mut out = Vec::new();
-        for line in self.lines()? {
+        for (i, line) in self.lines()?.into_iter().enumerate() {
+            let (p, n) = (self.path.as_path(), i + 1);
             let kind = field_str(&line, "event").unwrap_or_default();
             let get = |k: &str| field_str(&line, k).unwrap_or_default();
+            let need = |k: &str| need_str(p, n, &line, &kind, k);
             out.push(match kind.as_str() {
                 "candidate" => Event::Candidate(Candidate {
-                    id: get("id"),
+                    id: need("id")?,
                     spec_sha256: get("spec_sha256"),
                     data_sha256: get("data_sha256"),
                     build_commit: get("build_commit"),
@@ -446,10 +475,12 @@ impl Ledger {
                     locked_test: LockedRange::parse(&line),
                 }),
                 "seal" => Event::Seal {
-                    sealed_sha256: get("sealed_sha256"),
+                    sealed_sha256: need("sealed_sha256")?,
                     final_seal: if field_bool(&line, "final") {
                         Some(FinalSeal {
-                            max_reads: field_num(&line, "max_reads").unwrap_or(1.0) as u64,
+                            max_reads: field_u64(&line, "max_reads")
+                                .filter(|m| *m >= 1)
+                                .ok_or_else(|| fault_field(p, n, &kind, "max_reads"))?,
                             report_candidates: field_bool(&line, "report_candidates"),
                         })
                     } else {
@@ -457,14 +488,14 @@ impl Ledger {
                     },
                 },
                 "test_read" => Event::TestRead {
-                    id: get("id"),
-                    report_sha256: get("report_sha256"),
-                    read_count: field_num(&line, "read_count").unwrap_or(0.0) as u64,
+                    id: need("id")?,
+                    report_sha256: need("report_sha256")?,
+                    read_count: field_u64(&line, "read_count").ok_or_else(|| fault_field(p, n, &kind, "read_count"))?,
                     locked_test: LockedRange::parse(&line),
                 },
                 "baseline_read" => Event::BaselineRead {
-                    data_sha256: get("data_sha256"),
-                    report_sha256: get("report_sha256"),
+                    data_sha256: need("data_sha256")?,
+                    report_sha256: need("report_sha256")?,
                     locked_test: LockedRange::parse(&line),
                 },
                 other => return Err(format!("unknown ledger event '{}'", other)),
@@ -473,19 +504,29 @@ impl Ledger {
         Ok(out)
     }
 
+    /// Append one line: an exclusive lock on the file keeps two appenders from
+    /// extending the same head, the chain is checked under the lock, and the
+    /// line and its newline go out in one `write` call.
     fn append(&self, body: &str) -> Result<(), String> {
-        self.verify_chain()?;
-        let lines = self.lines()?;
+        use std::io::Read;
+        let io = |e: std::io::Error| format!("{}: {}", self.path.display(), e);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(io)?;
+        f.lock().map_err(io)?;
+        let mut text = String::new();
+        f.read_to_string(&mut text).map_err(io)?;
+        let lines = complete_lines(&self.path.display().to_string(), "ledger", &text)?;
+        self.chain_of(&lines)?;
         let prev = lines
             .last()
             .map_or("0".repeat(64), |l| sha256_hex(l.as_bytes()));
-        let line = format!("{{\"prev\":\"{}\",{}}}", prev, body);
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|e| format!("{}: {}", self.path.display(), e))?;
-        writeln!(f, "{}", line).map_err(|e| format!("{}: {}", self.path.display(), e))
+        let line = format!("{{\"prev\":\"{}\",{}}}\n", prev, body);
+        f.write_all(line.as_bytes()).map_err(io)?;
+        f.sync_all().map_err(io)
     }
 
     /// Record a development candidate. Returns its id.
@@ -708,7 +749,7 @@ impl Ledger {
         bind: Option<RangeBinding>,
     ) -> Result<Candidate, String> {
         let candidate = self.authorize_sealed(sealed, id, data_sha256, build_commit, bind)?;
-        if self.read_report_sha(id).is_some() {
+        if self.read_report_sha(id)?.is_some() {
             return Err(format!(
                 "candidate {} already has test_read:true; the locked test is read once",
                 id
@@ -727,11 +768,11 @@ impl Ledger {
     }
 
     /// Report hash recorded by the read of `id`, if there was one.
-    pub fn read_report_sha(&self, id: &str) -> Option<String> {
-        self.events().ok()?.into_iter().find_map(|e| match e {
+    pub fn read_report_sha(&self, id: &str) -> Result<Option<String>, String> {
+        Ok(self.events()?.into_iter().find_map(|e| match e {
             Event::TestRead { id: read, report_sha256, .. } if read == id => Some(report_sha256),
             _ => None,
-        })
+        }))
     }
 
     /// Append `test_read:true` for `id`. Returns the new total read count.
@@ -760,11 +801,11 @@ impl Ledger {
     }
 
     /// Report hash recorded by the baseline read, if there was one.
-    pub fn baseline_report_sha(&self) -> Option<String> {
-        self.events().ok()?.into_iter().find_map(|e| match e {
+    pub fn baseline_report_sha(&self) -> Result<Option<String>, String> {
+        Ok(self.events()?.into_iter().find_map(|e| match e {
             Event::BaselineRead { report_sha256, .. } => Some(report_sha256),
             _ => None,
-        })
+        }))
     }
 
     fn baseline_checks(&self, sealed: &std::path::Path, bind: Option<RangeBinding>, refuse_second: bool) -> Result<(), String> {
@@ -819,6 +860,22 @@ pub enum CrashAt {
     AfterFirstRename,
 }
 
+/// Where an output lands: the canonical parent plus the file name (the file may
+/// not exist yet), and the device and inode when it does, so a hard link or a
+/// symlink to the same file is found.
+fn output_identity(path: &std::path::Path) -> Result<(std::path::PathBuf, Option<(u64, u64)>), String> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let dir = std::fs::canonicalize(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    let name = path.file_name().ok_or_else(|| format!("{}: no file name", path.display()))?;
+    let inode = match std::fs::metadata(path) {
+        Ok(m) => Some((m.dev(), m.ino())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{}: cannot stat the output: {}", path.display(), e)),
+    };
+    Ok((dir.join(name), inode))
+}
+
 /// Write the report files of a locked read around the ledger record: every
 /// file is written beside its target and synced first, then `record` runs, then
 /// each file is renamed into place. A failure before `record` leaves the read
@@ -837,9 +894,22 @@ pub fn write_around_record<T>(
             Ok(())
         }
     };
-    for (i, (a, _)) in outs.iter().enumerate() {
-        if outs[..i].iter().any(|(b, _)| b == a) {
-            return Err(format!("{}: two outputs name the same file", a.display()));
+    let ids = outs
+        .iter()
+        .map(|(p, _)| {
+            output_identity(p).map_err(|e| format!("{}; nothing was recorded, the locked read is still available", e))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for i in 0..outs.len() {
+        for j in 0..i {
+            let same_inode = ids[i].1.is_some() && ids[i].1 == ids[j].1;
+            if ids[i].0 == ids[j].0 || same_inode {
+                return Err(format!(
+                    "{} and {}: two outputs name the same file; nothing was recorded, the locked read is still available",
+                    outs[j].0.display(),
+                    outs[i].0.display()
+                ));
+            }
         }
     }
     let mut staged = Vec::new();
@@ -949,6 +1019,11 @@ pub fn procedure_spec(spec: &crate::walkforward::EvalSpec, o: &crate::walkforwar
     s
 }
 
+/// Exit code of `rcsr protocol` when the ledger or the read marker is faulty:
+/// a broken hash chain, an unterminated last line or a line that is not one
+/// complete JSON object. Locked reads report the same fault with exit 3.
+pub const LEDGER_FAULT_EXIT: i32 = 1;
+
 fn protocol_usage() -> &'static str {
     "rcsr protocol <windows|seal|verify|candidates|selectors> ...
 
@@ -970,8 +1045,10 @@ fn protocol_usage() -> &'static str {
       the train range (train_end = test_start - purge), in time and for every
       symbol; `--gap` does not apply to explicit selectors.
   verify --ledger FILE [--data PATH] [--sealed FILE] [--expect-reads N]
-      Check the ledger hash chain and print the line and read counts. --data
-      also checks the read marker beside the store against the ledger.
+      Check the ledger hash chain and print the line and read counts. A file
+      whose last line has no newline, or a line that is not one complete JSON
+      object, exits 1 (the tool does not repair it). --data also checks the read
+      marker beside the store against the ledger, with the same two refusals.
       --expect-reads N (needs --data) exits 1 unless the ledger has N locked
       reads, exactly one seal line that is final, and a consistent marker;
       with --sealed it also checks that the file is the final seal's list and
@@ -1103,14 +1180,14 @@ pub fn run(args: &[String]) -> ! {
             };
             match sealed_result {
                 Ok(h) => println!("sealed_sha256 {}", h),
-                Err(e) => fail(e, 1),
+                Err(e) => fail(e, LEDGER_FAULT_EXIT),
             }
         }
         "verify" => {
             let l = need_ledger();
             match (l.verify_chain(), l.read_count()) {
                 (Ok(n), Ok(r)) => println!("ledger ok: {} line(s), {} locked read(s)", n, r),
-                (Err(e), _) | (_, Err(e)) => fail(e, 1),
+                (Err(e), _) | (_, Err(e)) => fail(e, LEDGER_FAULT_EXIT),
             }
             if expect_reads.is_some() && data.is_none() {
                 fail("--expect-reads needs --data, the store the marker lives with".to_string(), 2);
@@ -1118,11 +1195,11 @@ pub fn run(args: &[String]) -> ! {
             match (&data, expect_reads) {
                 (Some(d), Some(n)) => match l.verify_expected(n, d, sealed.as_deref().map(std::path::Path::new)) {
                     Ok(lines) => lines.iter().for_each(|s| println!("{}", s)),
-                    Err(e) => fail(e, 1),
+                    Err(e) => fail(e, LEDGER_FAULT_EXIT),
                 },
                 (Some(d), None) => match l.verify_read_marker(d) {
                     Ok(s) => println!("{}", s),
-                    Err(e) => fail(e, 1),
+                    Err(e) => fail(e, LEDGER_FAULT_EXIT),
                 },
                 _ => {}
             }
@@ -1148,7 +1225,7 @@ pub fn run(args: &[String]) -> ! {
                         println!("{} {}", c.id, c.expression);
                     }
                 }
-                Err(e) => fail(e, 1),
+                Err(e) => fail(e, LEDGER_FAULT_EXIT),
             }
         }
         other => fail(format!("unknown protocol command '{}'\n\n{}", other, protocol_usage()), 2),
@@ -1180,6 +1257,38 @@ pub fn marker_path(data_path: &str) -> String {
     format!("{}.locked_reads.jsonl", data_path)
 }
 
+/// The non-blank lines of a ledger or marker file. A file whose last line has
+/// no newline, or a line that is not one complete JSON object, is refused: a
+/// write was cut or lines were joined, and the tool does not repair an audit
+/// record.
+fn complete_lines(path: &str, what: &str, text: &str) -> Result<Vec<String>, String> {
+    if !text.is_empty() && !text.ends_with('\n') {
+        return Err(format!(
+            "{}: the last line of the {} has no newline: a write was cut. Inspect the file, restore it from a \
+             copy or delete the partial last line by hand, then rerun; the tool does not repair it",
+            path, what
+        ));
+    }
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !matches!(crate::devlog::Json::parse(line), Some(crate::devlog::Json::Obj(_))) {
+            return Err(format!(
+                "{}: line {} of the {} is not one complete JSON object: a write was cut or two lines were \
+                 joined. Inspect the file, restore it from a copy or fix the line by hand, then rerun; the tool \
+                 does not repair it",
+                path,
+                i + 1,
+                what
+            ));
+        }
+        out.push(line.to_string());
+    }
+    Ok(out)
+}
+
 fn marker_lines(data_path: &str) -> Result<Vec<MarkerLine>, String> {
     let path = marker_path(data_path);
     let text = match std::fs::read_to_string(&path) {
@@ -1188,7 +1297,7 @@ fn marker_lines(data_path: &str) -> Result<Vec<MarkerLine>, String> {
         Err(e) => return Err(format!("{}: {}", path, e)),
     };
     let mut out = Vec::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+    for line in &complete_lines(&path, "read marker", &text)? {
         let get = |k: &str| field_str(line, k).unwrap_or_default();
         let m = MarkerLine {
             ledger: get("ledger"),
@@ -1196,7 +1305,11 @@ fn marker_lines(data_path: &str) -> Result<Vec<MarkerLine>, String> {
             event: get("event"),
             report_sha256: get("report_sha256"),
         };
-        if !matches!(m.event.as_str(), "test_read" | "baseline_read") || m.ledger.is_empty() {
+        if !matches!(m.event.as_str(), "test_read" | "baseline_read")
+            || m.ledger.is_empty()
+            || m.ledger_head.is_empty()
+            || m.report_sha256.is_empty()
+        {
             return Err(format!("{}: malformed read marker line", path));
         }
         out.push(m);
@@ -1257,25 +1370,23 @@ impl Ledger {
     pub fn write_read_marker(&self, data_path: &str, event: &str, report_sha256: &str) -> Result<(), String> {
         self.check_read_marker(data_path)?;
         let head = self.head()?;
+        let path = marker_path(data_path);
+        let io = |e: std::io::Error| format!("{}: {}", path, e);
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(io)?;
+        f.lock().map_err(io)?;
         let lines = marker_lines(data_path)?;
         if lines.last().map_or(false, |m| m.ledger_head == head && m.event == event) {
             return Ok(());
         }
-        let path = marker_path(data_path);
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| format!("{}: {}", path, e))?;
-        writeln!(
-            f,
-            "{{\"ledger\":{},\"ledger_head\":\"{}\",\"event\":\"{}\",\"report_sha256\":\"{}\"}}",
+        let line = format!(
+            "{{\"ledger\":{},\"ledger_head\":\"{}\",\"event\":\"{}\",\"report_sha256\":\"{}\"}}\n",
             esc(&self.absolute_path()?),
             head,
             event,
             report_sha256
-        )
-        .map_err(|e| format!("{}: {}", path, e))
+        );
+        f.write_all(line.as_bytes()).map_err(io)?;
+        f.sync_all().map_err(io)
     }
 
     /// Compare the marker with the ledger's reads. Returns one status line.

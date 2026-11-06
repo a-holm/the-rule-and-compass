@@ -5,6 +5,9 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data;
 use rcsr::enrich_gpu::{DeviceColumn, EnrichGpu, ProjectedSource};
 use rcsr::projected_ring::{overlap_probe, ProjectedRing, RingGroup, RingOptions, StallGate};
@@ -483,7 +486,8 @@ fn stalled_reader_times_out_with_ring_state() {
     write_store(&src, 520_000, 65_536);
     let features = "r1,r5,lag_r1_3,range1,clv1,hour_sin,ma20";
     let enrich = |out: &str, stall: bool| {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"));
+        // The test runs the projected device ring.
+        let mut cmd = rcsr_cmd::rcsr_on_device();
         cmd.args(["enrich", "--data", &src, "--out", out, "--features", features]);
         cmd.args(["--gpu", "on", "--allow-lockbox"]);
         cmd.env_remove("RCSR_RING_WAIT_MS").env_remove("RCSR_TEST_RING_STALL_GROUP");

@@ -1,11 +1,14 @@
 //! Out-of-fold symbolic-regression scores (#492): one search run scored on
 //! later folds by the ladder and by `ablation score`, and the in-sample guard.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::devlog::Json;
 use rcsr::protocol;
 use rcsr::run_json::RunFile;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 const T0: f64 = 1_600_000_000.0;
 const STEP: f64 = 900.0;
@@ -56,7 +59,7 @@ struct Fixture {
 }
 
 fn rcsr(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().expect("run rcsr")
+    rcsr_cmd::rcsr().args(args).output().expect("run rcsr")
 }
 
 fn fixture(name: &str) -> Fixture {

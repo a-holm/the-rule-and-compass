@@ -5,8 +5,11 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -47,7 +50,8 @@ impl Work {
     }
 
     fn run(&self, name: &str, args: &[&str], force: Option<&str>) -> Output {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rcsr"));
+        // Every test of this file needs the device, with and without `--gpu`.
+        let mut cmd = rcsr_cmd::rcsr_on_device();
         cmd.arg("--data").arg(&self.data);
         cmd.args(["--target", "y", "--generations", "2", "--pop", "60", "--seed", "3"]);
         cmd.args(["--threads", "1", "--quiet"]);
