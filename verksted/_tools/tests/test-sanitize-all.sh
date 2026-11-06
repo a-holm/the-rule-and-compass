@@ -72,7 +72,7 @@ case "$*" in
       ignored) echo "running 0 tests"; echo "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out;" ;;
       *) echo "running 17 tests"; echo "test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;" ;;
     esac
-    [ "${FAKE_NC_MODE:-ok}" = nomsg ] || echo "========= Error: Target application terminated before first instrumented API call"
+    case "${FAKE_NC_MODE:-ok}" in nomsg) ;; noattach) echo "========= Error: No attachable process found. compute-sanitizer timed-out." ;; *) echo "========= Error: Target application terminated before first instrumented API call" ;; esac
     exit "${FAKE_NC_RC:-255}"
     ;;
   *"${FAKE_ZERO_ON:-@none@}"*)
@@ -228,6 +228,17 @@ has app-dry-flag "$T/out" '^run gpu_fit: .*--target-processes application-only .
 printf 'gpu_fit some_test no-cuda-app-only reason\n' > "$T/plan-bad"
 PLAN=$T/plan-bad run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check app-named-rc "$r" "2"
+
+# application-only: a target that never calls CUDA can end with the launch timeout message; that counts only for no-cuda-app-only
+PLAN=$T/plan-app FAKE_NC_MODE=noattach FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check noattach-app-rc "$r" "0"
+has noattach-app-line "$sum" '^gpu_fit no CUDA call \(listed\) \| test result: ok\. 17 passed'
+PLAN=$T/plan-nc FAKE_NC_MODE=noattach FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check noattach-all-rc "$r" "1"
+has noattach-all-line "$sum" '^gpu_fit rc=255 '
+FAKE_NC_MODE=noattach FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check noattach-unlisted-rc "$r" "1"
+has noattach-unlisted-line "$sum" '^gpu_fit rc=255 '
 
 # a rising Xid count stops at once with 70
 echo 4 > "$T/xid"

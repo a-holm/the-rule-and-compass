@@ -15,7 +15,7 @@
 # Plan mode `<binary> * no-cuda <reason>` lists a binary that makes no CUDA call by design. It still runs under memcheck.
 # Rc 255 with `terminated before first instrumented API call` and `test result: ok` (0 failed) is a pass only for a listed binary
 # (`<binary> no CUDA call (listed)`); for an unlisted binary it is a failure (`<binary> unexpected no CUDA call: add a plan line or fix the test`).
-# Plan mode `<binary> * no-cuda-app-only <reason>` is `no-cuda` plus `--target-processes application-only`: only for a binary whose child processes make no CUDA call either (children are then not traced).
+# Plan mode `<binary> * no-cuda-app-only <reason>` is `no-cuda` plus `--target-processes application-only`: only for a binary whose child processes make no CUDA call either (children are then not traced). With it the sanitizer message `No attachable process found` (launch timeout) also counts as no CUDA call.
 # A listed binary whose run printed an ERROR SUMMARY called CUDA: it gets the normal verdict and the line ends `listed no-cuda but called CUDA`.
 # The summary ends with the counts `no-cuda binaries`, `unexpected no-cuda` and `listed no-cuda but called CUDA`.
 # A run with rc 255, `running 0 tests`, a non-zero filtered-out count and the sanitizer message `terminated before first instrumented API call` (the plan filtered out every test) is written as `<binary> skipped by plan | ...` and is not a failure.
@@ -126,8 +126,9 @@ run_one() { # label tag api bin args...
     grep -aq 'terminated before first instrumented API call' "$log"; then
     by_plan=1
     emit "$label skipped by plan | 0 tests ran, all filtered out | xid=${xid:-?}"
-  elif [ "$rc" -eq 255 ] && [ -z "$err" ] && grep -aq 'terminated before first instrumented API call' "$log" &&
-    [[ $res =~ $ok_re ]]; then
+  elif [ "$rc" -eq 255 ] && [ -z "$err" ] && [[ $res =~ $ok_re ]] &&
+    { grep -aq 'terminated before first instrumented API call' "$log" ||
+      { [ ${#target_args[@]} -gt 0 ] && grep -aq 'No attachable process found' "$log"; }; }; then
     no_cuda=1
     if [ "$listed" -eq 1 ]; then
       n_nocuda=$((n_nocuda + 1))
