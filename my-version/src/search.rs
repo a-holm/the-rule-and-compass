@@ -11723,6 +11723,83 @@ mod tests {
         assert_eq!(stats.nonfinite_cpu_finite, 1, "{:?}", stats);
     }
 
+    /// #854: the CPU check of a device `+inf` reads the run's column view. It
+    /// builds none of its own, for a status-2 slot and a trade-floor slot alike.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_check_uses_the_run_view() {
+        if !crate::gpu::probe().available() {
+            eprintln!("skipping GPU test: no usable CUDA device");
+            return;
+        }
+        let n = 300;
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let up = i % 2 == 0;
+            x.push(vec![if up { 1e-46 } else { -1e-46 }, if up { 1.0 } else { -1.0 }]);
+            y.push(if up { 0.003 } else { -0.001 });
+        }
+        let s = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
+        let rows = crate::trading::TradingRows {
+            time: (0..n).map(|i| 900.0 * i as f64).collect(),
+            group: vec![0; n],
+            funding: Vec::new(),
+        };
+        let slice = crate::data::TradingSlice { rows, ret: s.y.clone() };
+        let spec = crate::trading::TradingSpec {
+            cost_bps: 1.0,
+            min_trades: 5,
+            ..Default::default()
+        };
+        let book = std::sync::Arc::new(crate::trading::FitnessBook::new(&slice, &spec, 900.0).unwrap());
+        let cfg = Config {
+            fitness: Fitness::LongPnl(book),
+            gpu: true,
+            dispatch: crate::dispatch::DispatchMode::Device,
+            ..Config::default()
+        };
+        let view = EvalSample::new(&s, &cfg);
+        assert!(view.cols.is_some(), "the run view is a column view");
+        let overflow = (0..4).fold(input(1), |t, _| node(Op::Exp, vec![t]));
+        let trees = vec![input(0), constant(-1.0), overflow];
+        let mut island: Vec<Ind> = trees
+            .iter()
+            .map(|t| {
+                let mut ind = Ind::evaluated(t.clone(), &view, &cfg);
+                ind.error = f64::NAN;
+                ind
+            })
+            .collect();
+        let mut g = GpuSearch::new(
+            &s,
+            false,
+            crate::fit::DeviceLoss::Squared,
+            true,
+            None,
+            Some(crate::metrics::ScoreObjective::LongPnl),
+            false,
+            std::time::Instant::now(),
+            &[],
+            None,
+            cfg.fitness.book(),
+            2,
+        )
+        .expect("a device search");
+        let mut dispatcher = crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::default())
+            .with_mode(crate::dispatch::DispatchMode::Device);
+        let mut islands = vec![std::mem::take(&mut island)];
+        reset_transpose_count();
+        g.score(&mut islands, &s, &cfg, 0, &mut dispatcher).expect("device batch");
+        let stats = &g.stats[&0];
+        assert!(stats.nonfinite >= 1, "a status-2 slot is checked: {:?}", stats);
+        assert!(stats.nonfinite_trade_floor >= 1, "a floor slot is checked: {:?}", stats);
+        assert!(stats.nonfinite_full >= 1, "a full pass ran: {:?}", stats);
+        assert_eq!(transpose_count(), 0, "{:?}", stats);
+        let exact = score_tree(&islands[0][0].tree, &view, &cfg);
+        assert_eq!(islands[0][0].error.to_bits(), exact.to_bits());
+    }
+
     #[test]
     fn fit_rows_default_applies_above_threshold() {
         let above = DEFAULT_FIT_ROWS_ABOVE + 1;
