@@ -1758,11 +1758,12 @@ impl GpuSearch {
     fn score(
         &mut self,
         islands: &mut [Vec<Ind>],
-        train: &Sample,
+        data: &EvalSample,
         cfg: &Config,
         generation: usize,
         dispatcher: &mut crate::dispatch::Dispatcher,
     ) -> Result<(), String> {
+        let train = data.sample;
         if generation >= 2 && crate::gpu::injected_fault("batch") {
             return Err(format!("{}the generation batch", crate::gpu::INJECTED_REFUSAL));
         }
@@ -1814,18 +1815,18 @@ impl GpuSearch {
             self.fit_admitted_wide += unscreened;
             self.stats.entry(generation).or_default().fit_admitted_wide += unscreened;
             if !screened.is_empty() {
-                self.evaluate_the_batch(islands, &screened, train, cfg, generation, dispatcher)?;
+                self.evaluate_the_batch(islands, &screened, data, cfg, generation, dispatcher)?;
             }
             let admitted = select_promoted(islands, &pending, wide);
             let fit_start = std::time::Instant::now();
             self.fit_pending(islands, &admitted, train, cfg, generation, dispatcher);
             self.fit_host_ms += fit_start.elapsed().as_secs_f64() * 1000.0;
             // Re-score the survivors so selection sees their fitted constants.
-            self.evaluate_the_batch(islands, &admitted, train, cfg, generation, dispatcher)?;
+            self.evaluate_the_batch(islands, &admitted, data, cfg, generation, dispatcher)?;
             return Ok(());
         }
 
-        self.evaluate_the_batch(islands, &pending, train, cfg, generation, dispatcher)
+        self.evaluate_the_batch(islands, &pending, data, cfg, generation, dispatcher)
     }
 
     /// #288: dispatch one batch to the scorer that can rank this run's metric.
@@ -1838,15 +1839,15 @@ impl GpuSearch {
         &mut self,
         islands: &mut [Vec<Ind>],
         pending: &[(usize, usize)],
-        train: &Sample,
+        data: &EvalSample,
         cfg: &Config,
         generation: usize,
         dispatcher: &mut crate::dispatch::Dispatcher,
     ) -> Result<(), String> {
         if self.native_stat.is_some() {
-            self.evaluate_pending_stat(islands, pending, train, cfg, generation, dispatcher)
+            self.evaluate_pending_stat(islands, pending, data, cfg, generation, dispatcher)
         } else {
-            self.evaluate_pending(islands, pending, train, cfg, generation, dispatcher)
+            self.evaluate_pending(islands, pending, data, cfg, generation, dispatcher)
         }
     }
 
@@ -1864,10 +1865,11 @@ impl GpuSearch {
         islands: &mut [Vec<Ind>],
         slots: &[(usize, usize)],
         floor: &[(usize, usize)],
-        train: &Sample,
+        data: &EvalSample,
         cfg: &Config,
         generation: usize,
     ) {
+        let train = data.sample;
         let (status2, slots) = (slots.len(), [slots, floor].concat());
         if slots.is_empty() {
             return;
@@ -1893,7 +1895,6 @@ impl GpuSearch {
         if full.is_empty() {
             return;
         }
-        let view = EvalSample::new(train, cfg);
         let jobs: Vec<(usize, Node)> = full
             .iter()
             .map(|&(i, j)| (0, islands[i][j].tree.clone()))
@@ -1902,7 +1903,7 @@ impl GpuSearch {
             .fallback
             .as_ref()
             .expect("a GPU search owns its fallback pool")
-            .score(jobs, &view, cfg);
+            .score(jobs, data, cfg);
         let stats = self.stats.entry(generation).or_default();
         for (&(i, j), e) in full.iter().zip(errors) {
             stats.nonfinite_cpu_finite += e.is_finite() as usize;
@@ -1925,11 +1926,12 @@ impl GpuSearch {
         &mut self,
         islands: &mut [Vec<Ind>],
         pending: &[(usize, usize)],
-        train: &Sample,
+        data: &EvalSample,
         cfg: &Config,
         generation: usize,
         dispatcher: &mut crate::dispatch::Dispatcher,
     ) -> Result<(), String> {
+        let train = data.sample;
         let stage_start = std::time::Instant::now();
         let nodes = pending
             .iter()
@@ -1969,12 +1971,8 @@ impl GpuSearch {
             .expect("a GPU search owns its fallback pool")
             .workers();
 
-        let cpu_view = if on_cpu.is_empty() {
-            None
-        } else {
-            Some(EvalSample::new(train, cfg))
-        };
-        let ticket = cpu_view.as_ref().map(|view| {
+        let cpu_view = if on_cpu.is_empty() { None } else { Some(data) };
+        let ticket = cpu_view.map(|view| {
             let jobs: Vec<(usize, Node)> = on_cpu
                 .iter()
                 .map(|&(i, j)| (0, islands[i][j].tree.clone()))
@@ -2034,7 +2032,7 @@ impl GpuSearch {
         if let Some(e) = gpu_error {
             return Err(e);
         }
-        self.check_device_nonfinite(islands, &nonfinite, &[], train, cfg, generation);
+        self.check_device_nonfinite(islands, &nonfinite, &[], data, cfg, generation);
         Ok(())
     }
 
@@ -2050,11 +2048,12 @@ impl GpuSearch {
         &mut self,
         islands: &mut [Vec<Ind>],
         pending: &[(usize, usize)],
-        train: &Sample,
+        data: &EvalSample,
         cfg: &Config,
         generation: usize,
         dispatcher: &mut crate::dispatch::Dispatcher,
     ) -> Result<(), String> {
+        let train = data.sample;
         let stage_start = std::time::Instant::now();
         let nodes = pending
             .iter()
@@ -2139,24 +2138,25 @@ impl GpuSearch {
         // kernel launch, so CPU fallback and GPU evaluation overlap. The view
         // must outlive the ticket; `finish` below waits for every chunk before
         // it is dropped.
-        let cpu_view = if on_cpu.is_empty() {
+        let scalar_rows;
+        let cpu_view: Option<&EvalSample> = if on_cpu.is_empty() {
             None
         } else {
             // #290: a whole batch routed to the CPU by the cost model does not
             // need another SoA transpose. The scalar view scores exactly the
             // same rows without paying (or counting) a full-train transpose;
-            // the SoA view is kept for the mixed supported/unsupported case
-            // that already needed one before this routing existed.
+            // the run's SoA view serves the mixed supported/unsupported case.
             if force_cpu && slots.is_empty() {
-                Some(EvalSample {
+                scalar_rows = EvalSample {
                     sample: train,
                     cols: None,
-                })
+                };
+                Some(&scalar_rows)
             } else {
-                Some(EvalSample::new(train, cfg))
+                Some(data)
             }
         };
-        let ticket = cpu_view.as_ref().map(|view| {
+        let ticket = cpu_view.map(|view| {
             let jobs: Vec<(usize, Node)> = on_cpu
                 .iter()
                 .map(|&(i, j)| (0, islands[i][j].tree.clone()))
@@ -2247,7 +2247,7 @@ impl GpuSearch {
             pending.len(),
             eval_workload.bytes,
         );
-        self.check_device_nonfinite(islands, &nonfinite, &floor, train, cfg, generation);
+        self.check_device_nonfinite(islands, &nonfinite, &floor, data, cfg, generation);
         Ok(())
     }
 
@@ -2799,7 +2799,7 @@ fn score_generation(
     gpu: &mut Option<GpuSearch>,
     used: &mut bool,
     islands: &mut [Vec<Ind>],
-    train: &Sample,
+    data: &EvalSample,
     cfg: &Config,
     backend_reason: &mut Option<String>,
     generation: usize,
@@ -2810,7 +2810,8 @@ fn score_generation(
         return Ok(false);
     };
     g.rows_version = rows_version;
-    match g.score(islands, train, cfg, generation, dispatcher) {
+    let train = data.sample;
+    match g.score(islands, data, cfg, generation, dispatcher) {
         Ok(()) => {
             // #230: a fit-only evaluator scores on the CPU, so it must not make
             // the run claim `backend = gpu`. The device use is reported through
@@ -2852,9 +2853,8 @@ fn score_generation(
                 }
             }
             // #27: re-scoring the pending batch goes through the SoA view.
-            let train_view = EvalSample::new(train, cfg);
             // #121: the same bounded worker pool as the per-batch fallback.
-            rescore_pending_cpu(islands, &train_view, cfg, &fallback);
+            rescore_pending_cpu(islands, data, cfg, &fallback);
             Ok(false)
         }
     }
@@ -7796,7 +7796,7 @@ fn run_search(
     // before the first selection step reads an error.
     #[cfg(feature = "cuda")]
     {
-        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg, &mut backend_reason, gens_done, &mut dispatcher, 0)?;
+        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, &train_data, cfg, &mut backend_reason, gens_done, &mut dispatcher, 0)?;
     }
 
     // #122: the flat postfix generation loop. It is selected before the first
@@ -8217,7 +8217,7 @@ fn run_search(
                     }
                     if let Some(g) = gpu.as_mut() {
                         g.rows_version = rows_version;
-                        g.check_device_nonfinite(&mut islands, &nonfinite_slots, &floor_slots, gen_train, cfg, gen);
+                        g.check_device_nonfinite(&mut islands, &nonfinite_slots, &floor_slots, gen_data, cfg, gen);
                     }
                     if pipeline_error.is_none() {
                         if pipeline_scored {
@@ -8226,7 +8226,7 @@ fn run_search(
                         // Score anything the kernel could not compile (left
                         // pending) through the normal CPU fallback.
                         defer_gpu =
-                            score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
+                            score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_data, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
                     } else {
                         // Stop the GPU and re-score every still-pending
                         // candidate in f64 on the CPU; a failed batch must
@@ -8254,7 +8254,7 @@ fn run_search(
                     // #26: one batched call covers every candidate of the
                     // generation (the pre-#119 synchronous path).
                     defer_gpu =
-                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
+                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_data, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
                 }
             }
             let dev_eval = dev_lap(&mut dev_mark); // #211: evaluator batch
@@ -8649,7 +8649,7 @@ fn run_search(
             #[cfg(feature = "cuda")]
             {
                 defer_gpu =
-                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
+                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_data, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
             }
 
             // #120: record this generation's evaluated behaviours. The order
@@ -11627,7 +11627,7 @@ mod tests {
             .with_mode(crate::dispatch::DispatchMode::Device);
         let mut islands = vec![std::mem::take(&mut island)];
         g.rows_version = 7;
-        g.score(&mut islands, &s, &cfg, 0, &mut dispatcher).expect("device batch");
+        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher).expect("device batch");
         for (k, ind) in islands[0].iter().enumerate() {
             let exact = score_tree(&ind.tree, &view, &cfg);
             assert_eq!(ind.error.to_bits(), exact.to_bits(), "tree {k}");
@@ -11707,7 +11707,7 @@ mod tests {
             .with_mode(crate::dispatch::DispatchMode::Device);
         let mut islands = vec![std::mem::take(&mut island)];
         g.rows_version = 7;
-        g.score(&mut islands, &s, &cfg, 0, &mut dispatcher).expect("device batch");
+        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher).expect("device batch");
         let exact0 = score_tree(&islands[0][0].tree, &view, &cfg);
         assert!(exact0.is_finite(), "the f64 positions meet the floor: {exact0}");
         assert_eq!(islands[0][0].error.to_bits(), exact0.to_bits());
@@ -11790,7 +11790,7 @@ mod tests {
             .with_mode(crate::dispatch::DispatchMode::Device);
         let mut islands = vec![std::mem::take(&mut island)];
         reset_transpose_count();
-        g.score(&mut islands, &s, &cfg, 0, &mut dispatcher).expect("device batch");
+        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher).expect("device batch");
         let stats = &g.stats[&0];
         assert!(stats.nonfinite >= 1, "a status-2 slot is checked: {:?}", stats);
         assert!(stats.nonfinite_trade_floor >= 1, "a floor slot is checked: {:?}", stats);
