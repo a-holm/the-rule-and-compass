@@ -18,6 +18,9 @@ use std::fmt::Write as _;
 pub const PROBE_SYMBOLS: usize = 109;
 pub const PROBE_BARS: usize = 9_175;
 
+/// Symbols of the probe store that times the shared host passes.
+const PASS_SYMBOLS: usize = 27;
+
 /// The probe symbol that serves as the benchmark series: the shared compact pass
 /// computes the benchmark columns only when the series exists.
 const PROBE_BENCHMARK: &str = "S000";
@@ -123,8 +126,8 @@ impl Drop for ProbeDir {
     }
 }
 
-fn probe_csv() -> String {
-    let mut text = String::with_capacity(PROBE_SYMBOLS * PROBE_BARS * 64);
+fn probe_csv(symbols: usize) -> String {
+    let mut text = String::with_capacity(symbols * PROBE_BARS * 64);
     text.push_str("ts,symbol,open,high,low,close,volume,quote_volume,trades,taker_buy_base\n");
     // A deterministic random walk with the raw flow columns of a real panel.
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -134,7 +137,7 @@ fn probe_csv() -> String {
         state ^= state << 17;
         (state >> 11) as f64 / (1u64 << 53) as f64
     };
-    for s in 0..PROBE_SYMBOLS {
+    for s in 0..symbols {
         let mut close = 100.0 + s as f64;
         for i in 0..PROBE_BARS {
             let open = close;
@@ -317,13 +320,25 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
     let dir = ProbeDir(dir);
     let rows = PROBE_SYMBOLS * PROBE_BARS;
-    let table = crate::data::parse_table_with_time(&probe_csv(), false, Some("ts"))?;
+    let table = crate::data::parse_table_with_time(&probe_csv(PROBE_SYMBOLS), false, Some("ts"))?;
     let store = dir.0.join("probe.rcsb").to_string_lossy().into_owned();
     crate::store::write_store_with_time(&store, &table, 65_536, Some(0))?;
     drop(table);
     let runner = Runner {
         store,
         out: dir.0.join("out.rcsb").to_string_lossy().into_owned(),
+    };
+    // A shared pass costs the same per row on any number of symbols, so its
+    // host cost is timed on the first symbols only, which hold the benchmark
+    // series at full length.
+    let pass_rows = PASS_SYMBOLS * PROBE_BARS;
+    let pass_table = crate::data::parse_table_with_time(&probe_csv(PASS_SYMBOLS), false, Some("ts"))?;
+    let pass_store = dir.0.join("pass.rcsb").to_string_lossy().into_owned();
+    crate::store::write_store_with_time(&pass_store, &pass_table, 65_536, Some(0))?;
+    drop(pass_table);
+    let pass_runner = Runner {
+        store: pass_store,
+        out: dir.0.join("pass-out.rcsb").to_string_lossy().into_owned(),
     };
 
     let anchors = EnrichRates::anchors();
@@ -334,14 +349,20 @@ pub fn measure(device: bool) -> Result<EnrichCalibration, String> {
     let mut context_ms_per_mrow = None;
     for plan in PLANS.iter() {
         let (n1, n2) = plan.counts;
-        let cpu_large = runner.run(plan.large, GpuMode::Off, plan.stage)?;
+        let cpu_large = if plan.host_once {
+            pass_runner.run(plan.large, GpuMode::Off, plan.stage)?
+        } else {
+            runner.run(plan.large, GpuMode::Off, plan.stage)?
+        };
         let anchor = anchors.class(plan.op);
         let mut rate = anchor;
         if plan.host_once {
-            rate.cpu_fixed_ms = (cpu_large * 1000.0 / mrow).max(0.0);
+            let pass_mrow = pass_rows as f64 / 1_000_000.0;
+            rate.cpu_fixed_ms = (cpu_large * 1000.0 / pass_mrow).max(0.0);
             if plan.op == OpClass::CompactPass {
-                let bare = runner.run_with(plan.large, GpuMode::Off, plan.stage, PROBE_NO_BENCHMARK)?;
-                rates.compact_no_benchmark_ms = (bare * 1000.0 / mrow).max(0.0);
+                let bare =
+                    pass_runner.run_with(plan.large, GpuMode::Off, plan.stage, PROBE_NO_BENCHMARK)?;
+                rates.compact_no_benchmark_ms = (bare * 1000.0 / pass_mrow).max(0.0);
             }
         } else {
             let cpu_small = runner.run(plan.small, GpuMode::Off, plan.stage)?;
