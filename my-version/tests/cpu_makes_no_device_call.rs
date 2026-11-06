@@ -1,6 +1,9 @@
 //! #821: a CPU command opens no `/dev/nvidia*` file. The count comes from
 //! `strace -f -e trace=openat`; a missing or unusable strace fails the test.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -42,7 +45,7 @@ fn s(p: &Path) -> String {
 }
 
 fn run_ok(args: &[&str]) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).env("RCSR_GPU", "0").output().unwrap();
+    let out = rcsr_cmd::rcsr().args(args).env("RCSR_GPU", "0").output().unwrap();
     assert!(out.status.success(), "rcsr {args:?}: {}", String::from_utf8_lossy(&out.stderr));
 }
 

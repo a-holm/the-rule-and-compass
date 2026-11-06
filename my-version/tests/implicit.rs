@@ -5,13 +5,16 @@
 //! guard, the plain-residual path, the constant fit, the unit-circle recovery,
 //! the CLI warning and that every explicit metric is untouched.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{self, Sample};
 use rcsr::expr::{self, constant, input, node, Node, Op};
 use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::search::{self, Config};
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -99,7 +102,7 @@ fn config(seed: u32) -> Config {
 }
 
 fn rcsr(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")

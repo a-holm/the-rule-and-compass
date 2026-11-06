@@ -1,8 +1,11 @@
 //! Validation gates (#257): selection, verdict, flags, determinism.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::devlog::Json;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const T0: i64 = 1_600_000_000;
 const STEP: i64 = 900;
@@ -70,7 +73,7 @@ fn spec_file(dir: &std::path::Path) -> String {
 }
 
 fn rcsr(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")

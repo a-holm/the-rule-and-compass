@@ -1,6 +1,9 @@
 //! Data preparation: missing values, outliers, smoothing, normalisation and
 //! row filters (issue #2). Every default must reproduce the plain mean/std run.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{
     self, Center, FillMethod, Filter, PrepSpec, Scale, SplitMode, SplitSpec,
 };
@@ -9,7 +12,7 @@ use rcsr::metrics::Metric;
 use rcsr::rng::Mt;
 use rcsr::search::{run, Config};
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn temporal(test_frac: f64) -> SplitSpec {
     SplitSpec {
@@ -400,7 +403,7 @@ fn median_fill_still_recovers_the_law() {
 /// 1-based column.
 #[test]
 fn bad_filter_is_a_usage_error_with_the_column() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let mut child = rcsr_cmd::rcsr()
         .args(["--data", "-", "--target", "y", "--filter", "x > "])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

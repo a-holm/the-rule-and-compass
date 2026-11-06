@@ -1,9 +1,11 @@
 //! Windows table, candidate ledger, sealed list and the one-read lockbox.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::lockbox::LOCKBOX_START;
 use rcsr::protocol::{self, Candidate, Ledger};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -132,7 +134,7 @@ fn an_edited_ledger_breaks_the_chain() {
 }
 
 fn rcsr(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().unwrap();
+    let out = rcsr_cmd::rcsr().args(args).output().unwrap();
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).to_string(),

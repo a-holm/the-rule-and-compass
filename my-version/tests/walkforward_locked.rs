@@ -4,10 +4,12 @@
 //! must be byte-identical. Fixtures are synthetic; the range is a stand-in in
 //! 2024.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::lockbox::{self, Lockbox};
 use rcsr::{data, store};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// 2024-01-01T00:00:00Z.
 const T0: i64 = 1_704_067_200;
@@ -36,7 +38,7 @@ fn s(p: &Path) -> String {
 }
 
 fn rcsr(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().unwrap();
+    let out = rcsr_cmd::rcsr_for(args).args(args).output().unwrap();
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -311,7 +313,7 @@ fn front_read_verifies_with_another_path_spelling() {
             "--validation-frac", "0.2",
         ];
         a.extend_from_slice(extra);
-        let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).current_dir(&dir).args(&a).output().unwrap();
+        let out = rcsr_cmd::rcsr_for(&a).current_dir(&dir).args(&a).output().unwrap();
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),

@@ -4,12 +4,15 @@
 //! binary, data or configuration changes. These tests run the CLI, verify a
 //! manifest that should pass, then corrupt each check in turn.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::manifest;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 fn rcsr(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")

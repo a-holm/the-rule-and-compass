@@ -1,10 +1,13 @@
 //! #261: `rcsr panel spread` reproduces the market-neutral bucket spread and
 //! refuses a range whose label windows reach a declared locked test.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::devlog::Json;
 use rcsr::store;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 const T0: i64 = 1_600_000_000;
 const STEP: i64 = 3600;
@@ -25,7 +28,7 @@ fn p(dir: &Path, name: &str) -> String {
 }
 
 fn rcsr(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().expect("run rcsr")
+    rcsr_cmd::rcsr().args(args).output().expect("run rcsr")
 }
 
 fn code(o: &Output) -> i32 {

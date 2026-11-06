@@ -4,8 +4,11 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -29,7 +32,8 @@ fn tmp_csv(rows: usize) -> (Scratch, PathBuf) {
 }
 
 fn rcsr(csv: &PathBuf, extra: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    // Every test of this file needs the device, with and without `--gpu`.
+    rcsr_cmd::rcsr_on_device()
         .args(["--data", csv.to_str().unwrap(), "--target", "y", "--vars", "x"])
         .args(["--generations", "2", "--seed", "1"])
         .args(extra)

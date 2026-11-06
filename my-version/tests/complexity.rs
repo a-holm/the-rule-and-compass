@@ -1,13 +1,15 @@
 //! Configurable complexity (issue #13): defaults, per-operator costs, terminal
 //! weights, nesting depth, parsing errors, front ordering and a search run.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::complexity::ComplexityModel;
 use rcsr::data::Sample;
 use rcsr::expr::{self, constant, input, node, Node, Op};
 use rcsr::metrics::Metric;
 use rcsr::pareto::{Archive, Sol};
 use rcsr::search::{run, Config};
-use std::process::Command;
 
 fn representative_trees() -> Vec<Node> {
     vec![
@@ -158,7 +160,7 @@ fn depth_weight_penalises_nesting() {
 }
 
 fn rcsr(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")
