@@ -1,5 +1,5 @@
 //! #483: `--fitness pnl` against `--fitness metric` on the synthetic panel, with a
-//! walk-forward of each run's front. Ignored: it is a measurement.
+//! walk-forward of each run's front. The measurement is ignored; one small gpu smoke is not.
 //!
 //! `cargo test --release --features cuda --test pnl_fitness_ab -- --ignored --nocapture`
 //!
@@ -8,10 +8,7 @@
 //! `RCSR_AB_BACKENDS` (default `cpu,gpu`), `RCSR_AB_SYMBOLS` and `RCSR_AB_BARS`
 //! (default 16 and 20000), `RCSR_AB_GENERATIONS` (default 30).
 //!
-//! The gpu arm runs `--gpu --dispatch device` and fails when the run reports no device
-//! time. The memcheck pass does not run ignored tests: run it by hand with
-//! `RCSR_AB_BACKENDS=gpu RCSR_AB_SYMBOLS=2 RCSR_AB_BARS=600 RCSR_AB_GENERATIONS=2 RCSR_AB_SEEDS=11`
-//! and `-- --ignored pnl_fitness_against_metric_fitness --exact` under compute-sanitizer.
+//! The gpu arm runs `--gpu --dispatch device` and fails when the run reports no device time.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -192,6 +189,34 @@ fn run_arm(dir: &Path, feat: &Path, spec: &Path, arm: &Arm, generations: usize, 
     }
 }
 
+/// The search holds out the last 20 % as test rows; the windows split them in
+/// WINDOWS equal parts after the boundary purge of the 4-bar label.
+fn test_windows(bars: usize) -> Vec<String> {
+    let t0 = synth_panel::SYNTH_T0;
+    let test_first = t0 + HOUR * (bars as i64 * 8 / 10);
+    let first = test_first + HOUR * 6;
+    let last = t0 + HOUR * (bars as i64 - 6);
+    let step = (last - first) / WINDOWS as i64;
+    (0..WINDOWS as i64)
+        .map(|k| format!("w{},{},{},{},{}", k + 1, t0, first + k * step - 5 * HOUR, first + k * step, first + (k + 1) * step - HOUR))
+        .collect()
+}
+
+/// Not ignored: one gpu arm per fitness on a tiny panel. `run_arm` fails when the arm reports no device time,
+/// so a fallback to the CPU fails the test and the binary calls CUDA under the memcheck pass.
+#[cfg(feature = "cuda")]
+#[test]
+fn the_gpu_arm_reaches_the_device() {
+    let (symbols, bars) = (2, 600);
+    let scratch = scratch::Scratch::new("ab-smoke");
+    let (feat, spec) = prepare(scratch.path(), symbols, bars);
+    let windows = test_windows(bars);
+    for fitness in ["metric", "pnl"] {
+        let r = run_arm(scratch.path(), &feat, &spec, &Arm { backend: "gpu", fitness, seed: 11 }, 2, &windows);
+        assert!(r.front > 0, "gpu {fitness} arm returned an empty front");
+    }
+}
+
 #[test]
 #[ignore]
 fn pnl_fitness_against_metric_fitness() {
@@ -208,16 +233,7 @@ fn pnl_fitness_against_metric_fitness() {
     std::fs::create_dir_all(&dir).unwrap();
     let (feat, spec) = prepare(&dir, symbols, bars);
 
-    // The search holds out the last 20 % as test rows; the windows split them in
-    // WINDOWS equal parts after the boundary purge of the 4-bar label.
-    let t0 = synth_panel::SYNTH_T0;
-    let test_first = t0 + HOUR * (bars as i64 * 8 / 10);
-    let first = test_first + HOUR * 6;
-    let last = t0 + HOUR * (bars as i64 - 6);
-    let step = (last - first) / WINDOWS as i64;
-    let windows: Vec<String> = (0..WINDOWS as i64)
-        .map(|k| format!("w{},{},{},{},{}", k + 1, t0, first + k * step - 5 * HOUR, first + k * step, first + (k + 1) * step - HOUR))
-        .collect();
+    let windows = test_windows(bars);
 
     println!("backend fitness seed | val_net test_net test_sharpe test_trades test_exposure front | search_s s/gen eval_cpu_s fit_cpu_s dev_frac | wf_net wf_min_win wf_trades wf_exposure wf_sharpe wf_dsr wf_se");
     let mut rows: Vec<(&str, &str, u64, ArmResult)> = Vec::new();
