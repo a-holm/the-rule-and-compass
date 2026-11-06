@@ -23,6 +23,7 @@ L=${RCSR_LOCK_SCRIPT:-$OC/one-full-suite.sh}
 SANITIZER=${RCSR_SANITIZER:-/usr/local/cuda-13.0/bin/compute-sanitizer}
 CUDA_ARCH=sm_86
 LOCK_HOLD_MAX=600
+KILL_AFTER=${RCSR_KILL_AFTER:-30}
 
 need_gates() {
   if [ ! -d "$GATES" ]; then

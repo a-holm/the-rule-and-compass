@@ -64,7 +64,7 @@ run_gate() { # tag rc-file
   echo 0 > "$T/xid"
   : > "$T/cmds"
   RCSR_STUB_CMDS=$T/cmds RCSR_STUB_RC=$2 RCSR_STUB_XID=$T/xid RCSR_STUB_BUILD=$T/build.json \
-    RCSR_LOCK_SCRIPT=$T/lock.sh RCSR_SLOT_SCRIPT=$T/slot.sh RCSR_GATE_DIR=$T/gates RCSR_XID_CMD="cat $T/xid" \
+    RCSR_MACHINE_DIR=$T RCSR_LOCK_SCRIPT=$T/lock.sh RCSR_SLOT_SCRIPT=$T/slot.sh RCSR_GATE_DIR=$T/gates RCSR_XID_CMD="cat $T/xid" \
     bash "$GATE" "$T/wt" "$1" > "$T/out-$1" 2>&1
 }
 

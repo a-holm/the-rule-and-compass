@@ -219,6 +219,23 @@ fn tools_tests_pass() {
     assert!(failures.is_empty(), "script tests failed:\n{}", failures.join("\n\n"));
 }
 
+#[test]
+fn script_tests_never_reach_the_machine_directory() {
+    let mut hits = Vec::new();
+    for test in script_tests() {
+        let text = fs::read_to_string(&test).expect("read test");
+        let stubs_machine = text.contains("RCSR_LOCK_SCRIPT") || text.contains("RCSR_SLOT_SCRIPT");
+        if stubs_machine && !text.contains("RCSR_MACHINE_DIR") {
+            hits.push(test.display().to_string());
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "script tests that stub the lock or slot without RCSR_MACHINE_DIR (the real lock path is reachable):\n{}",
+        hits.join("\n")
+    );
+}
+
 /// No script test sleeps or reads the wall clock; tests/lib/fakes.sh holds the only timer stand-ins.
 #[test]
 fn tools_tests_read_no_clock() {

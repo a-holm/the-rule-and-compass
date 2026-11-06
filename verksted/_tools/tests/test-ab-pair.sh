@@ -32,7 +32,7 @@ printf '#!/bin/sh\necho "hang ran" >&2\nexit 99\n' > "$T/bin/hang"
 chmod +x "$T"/lock.sh "$T"/bin/*
 
 ab() {
-  PATH="$T/fake:$PATH" FAKE_TIMEOUT_LOG="$T/timeouts" RCSR_GATES=$T/gates RCSR_LOCK_SCRIPT=$T/lock.sh RCSR_XID_CMD="cat $T/xid" bash "$AB" "$@" > "$T/out" 2>&1
+  PATH="$T/fake:$PATH" FAKE_TIMEOUT_LOG="$T/timeouts" RCSR_GATES=$T/gates RCSR_MACHINE_DIR=$T RCSR_LOCK_SCRIPT=$T/lock.sh RCSR_XID_CMD="cat $T/xid" bash "$AB" "$@" > "$T/out" 2>&1
 }
 
 # three seeds: order AB, BA, AB; {seed} replaced
