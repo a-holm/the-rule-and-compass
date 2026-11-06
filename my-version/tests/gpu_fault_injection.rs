@@ -54,14 +54,19 @@ fn write_store(path: &str) {
     store::write_store_with_time(path, &table, 2_048, Some(0)).unwrap();
 }
 
-fn column(path: &str, name: &str) -> Vec<f64> {
+fn columns(path: &str, names: &[String]) -> Vec<Vec<f64>> {
     let s = FileStore::open(path).unwrap();
-    let c = s.header().column_index(name).unwrap();
-    let mut out = Vec::new();
-    for g in 0..s.n_groups() {
-        out.extend(s.read_f64_group(g, c).unwrap());
-    }
-    out
+    names
+        .iter()
+        .map(|name| {
+            let c = s.header().column_index(name).unwrap();
+            let mut out = Vec::new();
+            for g in 0..s.n_groups() {
+                out.extend(s.read_f64_group(g, c).unwrap());
+            }
+            out
+        })
+        .collect()
 }
 
 fn close_enough(a: f64, b: f64) -> bool {
@@ -88,7 +93,7 @@ struct Fixture {
     src: String,
     features: String,
     names: Vec<String>,
-    cpu_out: String,
+    cpu_columns: Vec<Vec<f64>>,
 }
 
 impl Fixture {
@@ -114,12 +119,11 @@ impl Fixture {
     /// Output equals the CPU arm: bit-equal on columns that fell back to the
     /// CPU, within the parity tolerance on device columns.
     fn assert_matches_cpu(&self, tag: &str, report: &Report, out: &str) {
-        for name in &self.names {
+        let got = columns(out, &self.names);
+        for ((name, a), b) in self.names.iter().zip(&self.cpu_columns).zip(&got) {
             let fell_back = report.gpu_fallback_columns.iter().any(|(n, _)| n == name);
-            let a = column(&self.cpu_out, name);
-            let b = column(out, name);
             assert_eq!(a.len(), b.len(), "{tag}: column {name} length");
-            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            for (i, (x, y)) in a.iter().zip(b).enumerate() {
                 let same = if fell_back { x.to_bits() == y.to_bits() } else { close_enough(*x, *y) };
                 assert!(same, "{tag}: column {name} row {i}: CPU {x:?} run {y:?} (fallback {fell_back})");
             }
@@ -154,10 +158,11 @@ fn fixture(tag: &str) -> Option<Fixture> {
     let src = scratch.join("in.rcsb").to_string_lossy().into_owned();
     write_store(&src);
     let cpu_out = scratch.join("cpu.rcsb").to_string_lossy().into_owned();
-    let fx = Fixture { _lock: lock, scratch, src, features: names.join(","), names: Vec::new(), cpu_out: cpu_out.clone() };
+    let fx = Fixture { _lock: lock, scratch, src, features: names.join(","), names: Vec::new(), cpu_columns: Vec::new() };
     let cpu = enrich::build(&fx.options(&cpu_out, GpuMode::Off)).unwrap();
-    let names = cpu.features.iter().map(|f| f.name.clone()).collect();
-    Some(Fixture { names, ..fx })
+    let names: Vec<String> = cpu.features.iter().map(|f| f.name.clone()).collect();
+    let cpu_columns = columns(&cpu_out, &names);
+    Some(Fixture { names, cpu_columns, ..fx })
 }
 
 /// Every `k` natively. Under memcheck a fixed subset derived from `total`: the
@@ -186,19 +191,17 @@ fn every_refused_device_allocation_falls_back_cleanly() {
     enrich_gpu::set_alloc_fault_for_tests(0);
     assert!(total > 20, "the build made only {total} guarded allocations");
     fx.assert_matches_cpu("baseline", &base, &base_out);
+    eprintln!("columns compared per k: {}", fx.names.len());
     let ks = sweep(total);
     eprintln!("allocations swept: {ks:?} of {total}");
     let mut with_fallback = 0usize;
     for &k in &ks {
         let tag = format!("alloc-{k}");
         enrich_gpu::set_alloc_fault_for_tests(k);
-        let t0 = std::time::Instant::now();
         let (report, out) = fx.gpu_run(&tag);
-        let t1 = std::time::Instant::now();
         enrich_gpu::set_alloc_fault_for_tests(0);
         fx.assert_labelled(&tag, &report);
         fx.assert_matches_cpu(&tag, &report, &out);
-        eprintln!("PROFILE k={k} build={:.3} compare={:.3}", (t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
         let extra = report.gpu_fallback.saturating_sub(base.gpu_fallback);
         eprintln!("alloc {k}/{total}: fallback columns +{extra}");
         if extra > 0 {
