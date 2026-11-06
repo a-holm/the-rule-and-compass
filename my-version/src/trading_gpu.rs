@@ -30,9 +30,10 @@
 //!   threads only change which warp owns a segment, never the summation order;
 //! * there are no floating-point atomics and no cross-lane tree over rows.
 //!
-//! All accumulation is `f64`, including on the device. Expression evaluation
-//! may stay `f32`; the score is converted once per row and every P&L term is
-//! then added in `f64`.
+//! All accumulation is `f64`, including on the device. The report kernel reads
+//! the `f64` score of each row and compares it with the `f64` threshold, so
+//! every reported book follows one rule: long iff the score is finite and
+//! strictly greater than the threshold.
 //!
 //! # Memory
 //!
@@ -1893,7 +1894,7 @@ mod device {
         fn rc_pnl_segment_rows(ctx: *mut std::ffi::c_void) -> i32;
         fn rc_pnl_eval(
             ctx: *mut std::ffi::c_void,
-            scores: *const f32,
+            scores: *const f64,
             candidates: i32,
             thresholds: *const f64,
             side: f64,
@@ -1958,10 +1959,10 @@ mod device {
         }
 
         /// Evaluate up to `tile_candidates` candidates. `scores` is candidate
-        /// major (`candidate * n + row`), one `f32` score per row.
+        /// major (`candidate * n + row`), one `f64` score per row.
         pub fn eval(
             &mut self,
-            scores: &[f32],
+            scores: &[f64],
             thresholds: &[f64],
             per_side_bps: f64,
             threads: usize,
@@ -2077,7 +2078,7 @@ mod device {
             let count = tile.min(scores.len() - base);
             let mut tile_scores = Vec::with_capacity(count * returns.len());
             for s in &scores[base..base + count] {
-                tile_scores.extend(s.iter().map(|&v| v as f32));
+                tile_scores.extend_from_slice(s);
             }
             let totals = dev.eval(
                 &tile_scores,

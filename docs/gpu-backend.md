@@ -2586,7 +2586,7 @@ The design follows the determinism contract of the batched fit:
   rows at a time instead of striding by the whole segment;
 * chunks that end inside a segment resume the per-segment accumulator in device
   memory, so alone/padded/4 k/64 k chunks are bit-identical;
-* all P&L terms are `f64`; only the input score is `f32`;
+* all P&L terms and the input score are `f64`;
 * candidates stream through a declared tile of at most 8 candidates, so the
   path never materialises `P x N` scores;
 * the final exit is charged once per group, positions are only `{0, 1}`, and a

@@ -143,7 +143,7 @@ impl<'a> BandRows<'a> {
 /// One candidate entering the band.
 ///
 /// `surrogate` is the screening score: larger is better. In the GPU path it is
-/// the device reduction over `f32` score rows; it is deliberately *not* the
+/// the device reduction over the `f64` score rows; it is deliberately *not* the
 /// reported value. `scores` is the full-row exact `f64` score vector used by
 /// the rescore, and `threshold` is the exact type-7 threshold for those rows.
 #[derive(Clone, Copy, Debug)]
@@ -491,7 +491,7 @@ fn canonical_rows(
 /// Score one candidate with the screening path.
 ///
 /// With `--features cuda` and a device this is the fused reduction, which
-/// converts score rows to `f32` and accumulates the P&L in `f64`; otherwise the
+/// reads `f64` score rows and accumulates the P&L in `f64`; otherwise the
 /// identical canonical CPU reduction runs and the screen is exact. The value is
 /// a *screening* score only: the reported finalist is always the CPU `f64`
 /// rescore from [`select_band`].

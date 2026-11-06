@@ -313,9 +313,42 @@ net_i   = gross_i - cost_i
   (`p = 1`, `net = sum(r) - 2s * groups`) are reported with the strategy block.
 
 The JSON gains a `device_pnl` object per window and a report-level summary with
-`backend`, `segment_rows`, `tile_candidates`, `rows` and
-`max_abs_net_delta`. `backend` is `cuda` when the kernel ran and
-`cpu-canonical` on a non-CUDA build or when no device is available.
+`backend`, `segment_rows`, `tile_candidates`, `windows`, `rows`,
+`max_abs_net_delta`, `device_windows`, `bit_mismatch_windows`,
+`count_mismatch_windows` and `f32_flip_rows`. `backend` is `cuda` when the
+kernel ran and `cpu-canonical` on a non-CUDA build or when no device is
+available.
+
+The kernel reads the `f64` score of every row and compares it with the `f64`
+threshold (rule R: a row is long iff its score is finite and strictly greater
+than the threshold). A score below the f32 range, such as `1e-46`, is long, as
+in the scalar evaluator, the exact refit and a user's formula. Three
+comparisons run on every window, and each detects a different fault:
+
+* Device totals against the canonical CPU reduction (`trading_gpu::reduce`) on
+  the same inputs: `bit_equal`, the bits of every `f64` sum and every integer
+  count. A kernel fault, down to one ulp of one P&L term, makes it `false`.
+  `max_abs_net_delta` cannot see such a fault: summation-order noise between
+  the scalar evaluator and the canonical reduction is orders of magnitude above
+  one ulp.
+* Device net against the scalar evaluator's net: `net_delta` per window and
+  `max_abs_net_delta` in the summary. This is the reported book; the tolerance
+  is 1e-9.
+* Device integer counts against the scalar book: `counts_equal`. It finds a
+  position disagreement also on rows with a return of 0, where the net delta is
+  0. It is `null` under `--policy band`, whose scalar book is not the threshold
+  book.
+
+`f32_flip_rows` counts the rows whose position changes when the score is
+narrowed to `f32`. It is reported per window and summed in the summary. No gate
+or selection reads it; it shows how many rows the search's `f32` screening book
+can place differently from the reported book. With `--select-band`, every
+`band_selection.candidates[]` entry carries the same count on the validation
+rows.
+
+`bit_mismatch_windows` and `count_mismatch_windows` count the windows where
+`bit_equal` is `false` or `counts_equal` is `false`. `device_windows` counts the
+windows whose device block ran on the CUDA kernel.
 
 ## Batch scoring (`--batch-pnl`)
 

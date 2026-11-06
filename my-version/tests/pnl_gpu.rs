@@ -839,7 +839,7 @@ mod device {
 
         // Scores are generated per tile and excluded from the timed sections,
         // so host memory holds one tile, never the population. The CPU arm
-        // reads the f32-cast scores the device receives. Timed work is the
+        // reads the same f64 scores the device receives. Timed work is the
         // position/cost/count reduction plus, for the device, packing and the
         // H2D transfer of the declared tile.
         let tile = MAX_TILE_CANDIDATES;
@@ -857,7 +857,7 @@ mod device {
                 let mut s = Vec::with_capacity(n);
                 for i in 0..n {
                     let v = (((i * 37 + p * 17) % 1009) as f64 / 500.0) - 1.0;
-                    s.push(v as f32 as f64);
+                    s.push(v);
                 }
                 score_sets.push(s);
             }
@@ -870,9 +870,9 @@ mod device {
             cpu_s += cpu_start.elapsed().as_secs_f64();
 
             let gpu_start = std::time::Instant::now();
-            let mut packed: Vec<f32> = Vec::with_capacity(count * n);
+            let mut packed: Vec<f64> = Vec::with_capacity(count * n);
             for s in &score_sets {
-                packed.extend(s.iter().map(|&v| v as f32));
+                packed.extend_from_slice(s);
             }
             let totals = dev
                 .eval(&packed, &thresholds[..count], params.per_side_bps, 256, 65_536)

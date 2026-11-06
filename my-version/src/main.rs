@@ -10269,7 +10269,10 @@ OPTIONS:
                              long-only reduction (f64 canonical segments; the
                              CUDA kernel when built with --features cuda) and
                              report it with cash and buy-and-hold benchmarks.
-                             The scalar evaluator remains the reported authority
+                             The scalar evaluator remains the reported authority.
+                             The kernel reads f64 scores; the report adds bit_equal
+                             (device vs canonical CPU), counts_equal (device vs
+                             scalar counts) and f32_flip_rows
   --control-seed <n>         seed of the matched-exposure random-long control
                              (default 0). Every report lists the long-only
                              controls per window: cash, buy-and-hold, constant
