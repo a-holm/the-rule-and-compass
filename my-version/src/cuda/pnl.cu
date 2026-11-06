@@ -48,7 +48,7 @@ typedef struct RcPnlCtx {
     int tile_candidates;
     double *d_returns;
     unsigned long long *d_groups;
-    float *d_scores;      /* tile_candidates x n, candidate major */
+    double *d_scores;     /* tile_candidates x n, candidate major */
     double *d_thr;        /* tile_candidates thresholds, refreshed per eval */
     RcPnlTotals *d_partials; /* tile_candidates x nsegments */
 } RcPnlCtx;
@@ -90,14 +90,14 @@ static void rc_pnl_merge_lanes(RcPnlTotals *out, RcPnlTotals *lanes)
     *out = lanes[0];
 }
 
-__device__ __forceinline__ double pnl_position(float score, double threshold)
+__device__ __forceinline__ double pnl_position(double score, double threshold)
 {
-    return (isfinite((double)score) && (double)score > threshold) ? 1.0 : 0.0;
+    return (isfinite(score) && score > threshold) ? 1.0 : 0.0;
 }
 
 __global__ void pnl_kernel(const double *__restrict__ returns,
                            const unsigned long long *__restrict__ groups,
-                           const float *__restrict__ scores,
+                           const double *__restrict__ scores,
                            const double *__restrict__ thresholds,
                            double side,
                            int n,
@@ -113,7 +113,7 @@ __global__ void pnl_kernel(const double *__restrict__ returns,
     const int warp = tid / PNL_LANES;
     const int warps = blockDim.x / PNL_LANES;
     const double threshold = thresholds[candidate];
-    const float *zc = scores + (size_t)candidate * (size_t)n;
+    const double *zc = scores + (size_t)candidate * (size_t)n;
     RcPnlTotals *pc = partials +
         (size_t)candidate * (size_t)nsegments * (size_t)PNL_LANES;
 
@@ -198,7 +198,7 @@ void *rc_pnl_create(const double *returns,
 
     size_t ret_bytes = (size_t)n * sizeof(double);
     size_t group_bytes = (size_t)n * sizeof(unsigned long long);
-    size_t score_bytes = (size_t)n * (size_t)tile_candidates * sizeof(float);
+    size_t score_bytes = (size_t)n * (size_t)tile_candidates * sizeof(double);
     size_t part_bytes = (size_t)nsegments * (size_t)tile_candidates *
                         (size_t)PNL_LANES * sizeof(RcPnlTotals);
 
@@ -247,7 +247,7 @@ int rc_pnl_segment_rows(void *opaque)
 }
 
 int rc_pnl_eval(void *opaque,
-                const float *scores,
+                const double *scores,
                 int candidates,
                 const double *thresholds,
                 double side,
@@ -261,7 +261,7 @@ int rc_pnl_eval(void *opaque,
     if (threads <= 0 || threads > 1024 || (threads % PNL_LANES) != 0 ||
         chunk_rows <= 0) return 1;
 
-    size_t score_bytes = (size_t)ctx->n * (size_t)candidates * sizeof(float);
+    size_t score_bytes = (size_t)ctx->n * (size_t)candidates * sizeof(double);
     size_t part_bytes = (size_t)ctx->nsegments * (size_t)candidates *
                         (size_t)PNL_LANES * sizeof(RcPnlTotals);
 

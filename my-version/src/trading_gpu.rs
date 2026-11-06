@@ -30,9 +30,10 @@
 //!   threads only change which warp owns a segment, never the summation order;
 //! * there are no floating-point atomics and no cross-lane tree over rows.
 //!
-//! All accumulation is `f64`, including on the device. Expression evaluation
-//! may stay `f32`; the score is converted once per row and every P&L term is
-//! then added in `f64`.
+//! All accumulation is `f64`, including on the device. The report kernel reads
+//! the `f64` score of each row and compares it with the `f64` threshold, so
+//! every reported book follows one rule: long iff the score is finite and
+//! strictly greater than the threshold.
 //!
 //! # Memory
 //!
@@ -666,6 +667,14 @@ pub fn long_position(score: f64, threshold: f64) -> u8 {
     }
 }
 
+/// Rows whose `long_position` changes when the score is narrowed to f32.
+pub fn f32_flip_rows(scores: &[f64], threshold: f64) -> u64 {
+    scores
+        .iter()
+        .filter(|&&s| long_position(s, threshold) != long_position(s as f32 as f64, threshold))
+        .count() as u64
+}
+
 /// Positions over the valid rows of a mask, in ascending row order.
 ///
 /// This is the vector the report is built from. A non-finite score can never
@@ -813,6 +822,18 @@ impl PnlTotals {
             self.turnover.to_bits(),
             self.net.to_bits(),
         ]
+    }
+
+    /// Every integer count and the bits of every f64 sum.
+    pub fn identical(&self, other: &PnlTotals) -> bool {
+        self.bits() == other.bits()
+            && self.rows == other.rows
+            && self.long_rows == other.long_rows
+            && self.entries == other.entries
+            && self.exits == other.exits
+            && self.trades == other.trades
+            && self.hits == other.hits
+            && self.final_exits == other.final_exits
     }
 }
 
@@ -1873,7 +1894,7 @@ mod device {
         fn rc_pnl_segment_rows(ctx: *mut std::ffi::c_void) -> i32;
         fn rc_pnl_eval(
             ctx: *mut std::ffi::c_void,
-            scores: *const f32,
+            scores: *const f64,
             candidates: i32,
             thresholds: *const f64,
             side: f64,
@@ -1938,10 +1959,10 @@ mod device {
         }
 
         /// Evaluate up to `tile_candidates` candidates. `scores` is candidate
-        /// major (`candidate * n + row`), one `f32` score per row.
+        /// major (`candidate * n + row`), one `f64` score per row.
         pub fn eval(
             &mut self,
-            scores: &[f32],
+            scores: &[f64],
             thresholds: &[f64],
             per_side_bps: f64,
             threads: usize,
@@ -2057,7 +2078,7 @@ mod device {
             let count = tile.min(scores.len() - base);
             let mut tile_scores = Vec::with_capacity(count * returns.len());
             for s in &scores[base..base + count] {
-                tile_scores.extend(s.iter().map(|&v| v as f32));
+                tile_scores.extend_from_slice(s);
             }
             let totals = dev.eval(
                 &tile_scores,
@@ -2682,6 +2703,50 @@ pub fn dp_scan_device(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identical_detects_one_ulp_in_every_sum_and_every_count() {
+        let base = PnlTotals {
+            rows: 10,
+            long_rows: 5,
+            entries: 2,
+            exits: 2,
+            trades: 3,
+            hits: 4,
+            final_exits: 1,
+            gross: 0.125,
+            cost: 0.0625,
+            turnover: 3.0,
+            net: 0.0625,
+        };
+        assert!(base.identical(&base));
+        let up = |v: f64| f64::from_bits(v.to_bits() + 1);
+        let mut cases: Vec<PnlTotals> = Vec::new();
+        cases.push(PnlTotals { gross: up(base.gross), ..base });
+        cases.push(PnlTotals { cost: up(base.cost), ..base });
+        cases.push(PnlTotals { turnover: up(base.turnover), ..base });
+        cases.push(PnlTotals { net: up(base.net), ..base });
+        cases.push(PnlTotals { rows: base.rows + 1, ..base });
+        cases.push(PnlTotals { long_rows: base.long_rows + 1, ..base });
+        cases.push(PnlTotals { entries: base.entries + 1, ..base });
+        cases.push(PnlTotals { exits: base.exits + 1, ..base });
+        cases.push(PnlTotals { trades: base.trades + 1, ..base });
+        cases.push(PnlTotals { hits: base.hits + 1, ..base });
+        cases.push(PnlTotals { final_exits: base.final_exits + 1, ..base });
+        for (k, c) in cases.iter().enumerate() {
+            assert!(!base.identical(c), "case {}", k);
+        }
+    }
+
+    #[test]
+    fn f32_flip_rows_counts_both_directions() {
+        let scores = [1e-46, -1e-46, 0.0, 1e39, f64::NAN, 0.5];
+        assert_eq!(f32_flip_rows(&scores, 0.0), 2);
+        assert_eq!(f32_flip_rows(&[0.1], 0.1), 1);
+        let t = 0.1f32 as f64;
+        assert_eq!(f32_flip_rows(&[f64::from_bits(t.to_bits() + 1)], t), 1);
+    }
+
 
     fn fixture() -> (Vec<f64>, Vec<f64>, Vec<u64>) {
         (

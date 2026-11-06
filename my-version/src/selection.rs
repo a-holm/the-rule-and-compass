@@ -143,7 +143,7 @@ impl<'a> BandRows<'a> {
 /// One candidate entering the band.
 ///
 /// `surrogate` is the screening score: larger is better. In the GPU path it is
-/// the device reduction over `f32` score rows; it is deliberately *not* the
+/// the device reduction over the `f64` score rows; it is deliberately *not* the
 /// reported value. `scores` is the full-row exact `f64` score vector used by
 /// the rescore, and `threshold` is the exact type-7 threshold for those rows.
 #[derive(Clone, Copy, Debug)]
@@ -283,6 +283,9 @@ pub struct BandFinalist {
     /// Zero-based rank on the exact objective. With the exhaustive audit this
     /// is a rank over all candidates; otherwise over the admitted set only.
     pub exact_rank: Option<usize>,
+    /// Rows with a finite score and target whose position changes when the
+    /// score is narrowed to f32. Reported only; no selection step reads it.
+    pub f32_flip_rows: u64,
 }
 
 /// Result of the band protocol.
@@ -333,7 +336,7 @@ impl BandSelection {
                 format!(
                     "{{\"index\":{},\"surrogate\":{},\"surrogate_rank\":{},\
                      \"complexity\":{},\"threshold\":{},\"band\":{},\
-                     \"exact\":{},\"exact_rank\":{}}}",
+                     \"exact\":{},\"exact_rank\":{},\"f32_flip_rows\":{}}}",
                     c.index,
                     jnum(c.surrogate),
                     c.surrogate_rank,
@@ -349,7 +352,8 @@ impl BandSelection {
                         .unwrap_or_else(|| "null".to_string()),
                     c.exact_rank
                         .map(|r| r.to_string())
-                        .unwrap_or_else(|| "null".to_string())
+                        .unwrap_or_else(|| "null".to_string()),
+                    c.f32_flip_rows
                 )
             })
             .collect();
@@ -425,6 +429,16 @@ fn surrogate_order(candidates: &[BandCandidate<'_>]) -> Vec<usize> {
     idx
 }
 
+fn band_flip_rows(rows: &BandRows<'_>, scores: &[f64], threshold: f64) -> u64 {
+    let valid: Vec<f64> = scores
+        .iter()
+        .zip(rows.targets)
+        .filter(|(s, t)| s.is_finite() && t.is_finite())
+        .map(|(&s, _)| s)
+        .collect();
+    trading_gpu::f32_flip_rows(&valid, threshold)
+}
+
 /// Exact CPU `f64` long-only rescore over the full rows.
 ///
 /// The rows are first filtered with the shared [`ValidMask`] (score **and**
@@ -477,7 +491,7 @@ fn canonical_rows(
 /// Score one candidate with the screening path.
 ///
 /// With `--features cuda` and a device this is the fused reduction, which
-/// converts score rows to `f32` and accumulates the P&L in `f64`; otherwise the
+/// reads `f64` score rows and accumulates the P&L in `f64`; otherwise the
 /// identical canonical CPU reduction runs and the screen is exact. The value is
 /// a *screening* score only: the reported finalist is always the CPU `f64`
 /// rescore from [`select_band`].
@@ -568,6 +582,7 @@ pub fn select_band(
             band: false,
             exact: None,
             exact_rank: None,
+            f32_flip_rows: band_flip_rows(rows, c.scores, c.threshold),
         });
     }
     let mut ranked: Vec<BandFinalist> = ranked
