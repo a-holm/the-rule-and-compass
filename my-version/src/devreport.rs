@@ -211,6 +211,8 @@ pub struct Analysis {
     pub fit_fallback_s: Option<f64>,
     pub fit_refit_s: Option<f64>,
     pub fit_refits: Option<usize>,
+    pub eval_check_s: Option<f64>,
+    pub eval_check_full_passes: Option<u64>,
     pub start_utc: String,
     pub end_utc: String,
     pub final_hash: String,
@@ -350,6 +352,8 @@ pub fn analyse(path: &str, events: &[Json], skipped: usize) -> Analysis {
         a.fit_kernel_s = opt_f(e.get("fit_kernel_s"));
         a.fit_fallback_s = opt_f(e.get("fit_fallback_s"));
         a.fit_refit_s = opt_f(e.get("fit_refit_s"));
+        a.eval_check_s = opt_f(e.get("eval_check_s"));
+        a.eval_check_full_passes = opt_f(e.get("eval_check_full_passes")).map(|v| v as u64);
         a.fit_refits = opt_f(e.get("fit_refits")).map(|v| v as usize);
         a.end_utc = string_field(e, "end");
         a.log_events = opt_f(e.get("events")).map(|v| v as u64).unwrap_or(0);
@@ -472,6 +476,15 @@ pub fn analyse(path: &str, events: &[Json], skipped: usize) -> Analysis {
             "refit",
             r,
             "post-loop exact CPU f64 refit of the finalists (outside the generation wall)",
+        ));
+    }
+    // #858: the CPU check of device +inf scores runs inside the eval phase, so
+    // its seconds overlap that row; it is ranked on its own to be visible.
+    if let Some(c) = a.eval_check_s.filter(|v| v.is_finite()).map(|v| v.max(0.0)) {
+        ranked.push((
+            "check",
+            c,
+            "exact CPU check of device +inf scores (a part of the eval window, listed apart)",
         ));
     }
     ranked.sort_by(|x, y| y.1.total_cmp(&x.1));
@@ -725,6 +738,13 @@ pub fn render(a: &Analysis) -> String {
     }
     if let Some(f) = a.fit_fallback_s {
         out.push_str(&format!("| fit CPU fallback | {:.3} s |\n", f));
+    }
+    if let Some(c) = a.eval_check_s {
+        out.push_str(&format!(
+            "| CPU check of device +inf (inside eval) | {:.3} s, {} full pass(es) |\n",
+            c,
+            a.eval_check_full_passes.unwrap_or(0)
+        ));
     }
     if let Some(r) = a.fit_refit_s {
         out.push_str(&format!(
@@ -1137,6 +1157,39 @@ mod tests {
         assert!(text.contains("first generation at or above 0.75 converged | 2"));
         assert!(text.contains("## Archive growth"));
         assert!(text.contains("0x0000000000000003"));
+    }
+
+    /// #858: `run_end` carries the CPU check of device `+inf` scores; the report
+    /// ranks it as its own row and prints its seconds and full passes. Without
+    /// the fields the ranking and the table are unchanged.
+    #[test]
+    fn dev_report_ranks_the_device_check() {
+        let log = sample_log();
+        let end_line = log.lines().last().unwrap().to_string();
+        let with_check = run_end_json(&RunEnd {
+            generations: 3,
+            stop: "patience".into(),
+            wall_s: 1.0,
+            search_s: 0.9,
+            archive_hash: 3,
+            eval_check_s: Some(2.5),
+            eval_check_full_passes: Some(40),
+            ..RunEnd::default()
+        });
+        assert!(with_check.contains("\"eval_check_s\":2.5,\"eval_check_full_passes\":40,"), "{with_check}");
+        let (events, skipped) = parse_log(&log.replace(&end_line, &with_check));
+        let a = analyse("x.ndjson", &events, skipped);
+        assert_eq!(a.eval_check_s, Some(2.5));
+        assert_eq!(a.eval_check_full_passes, Some(40));
+        let names: Vec<&str> = a.bottlenecks.iter().map(|b| b.name).collect();
+        assert_eq!(names[..2], ["search", "check"]);
+        let text = render(&a);
+        assert!(text.contains("| CPU check of device +inf (inside eval) | 2.500 s, 40 full pass(es) |"), "{text}");
+        assert!(text.contains("2. **check** — 2.500 s"), "{text}");
+        let (events, _) = parse_log(&sample_log());
+        let plain = analyse("x.ndjson", &events, 0);
+        assert!(plain.bottlenecks.iter().all(|b| b.name != "check"));
+        assert!(!render(&plain).contains("CPU check of device"));
     }
 
     /// #495: `run_end` carries the exact finalist refit; the report ranks it
