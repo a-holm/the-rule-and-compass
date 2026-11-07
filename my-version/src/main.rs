@@ -123,9 +123,11 @@ USAGE:
              [--lockbox <START,END|none>]
              [--target-spec <file>]
   rcsr verify-manifest <manifest.json> [--data <file>] [--binary <file>]
-  rcsr calibrate [--out <path>] [--gpu | --cpu]
+  rcsr calibrate [--out <path>] [--gpu | --cpu] [--strict]
                               time this machine and write the calibration
-                              file that --dispatch auto routes from
+                              file that --dispatch auto routes from; the file
+                              records the load, stderr warns when the probe ran
+                              under load, --strict refuses such a file (exit 3)
   rcsr dev-report <log.ndjson>
                               summarise the development log rcsr writes by
                               default (phases, fit/eval share, fallback

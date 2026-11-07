@@ -67,7 +67,7 @@ only and keeps the anchors for the device terms.
 
 A checkpoint records `config calibration_source` (`anchors`, `probe` or `file`) and, for a file, `config calibration_sha256`. Neither line is part of the config hash. `--resume` exits 2 when the resolved source or the file hash differs from the record, naming both. A checkpoint without the lines (an older binary) resumes only with an explicit `--calibration`, and the run prints a `# resume:` notice. A `probe` run is not reproducible, so it resumes only with `--calibration probe`, also with a notice.
 
-`rcsr calibrate [--out <path>] [--gpu | --cpu] [--no-enrich]` is the only writer. It runs
+`rcsr calibrate [--out <path>] [--gpu | --cpu] [--no-enrich] [--strict]` is the only writer. It runs
 `Calibration::probe()` (host, median of 31 reps) and `dispatch_gpu::measure()`
 (device) and writes the file atomically (a sibling temporary file, `fsync`, then
 `rename`). The file is JSON, schema `rcsr-calibration/2` (a `rcsr-calibration/1` file still loads, with `enrich: null`): `written` (UTC),
@@ -75,6 +75,14 @@ A checkpoint records `config calibration_source` (`anchors`, `probe` or `file`) 
 `bw_d2h`, `launch_s`, `cpu_eval`, `cpu_fit`, `hysteresis`, and the `spread` of
 each probed term. Floats are written in the shortest form that reads back bit
 for bit. A search run never writes it.
+
+The file also records `load1_start` and `load1_end`, the one-minute load average (`/proc/loadavg`) when the probe started and when it ended; both are left out on a host without `/proc/loadavg`, and a file without them loads as before. No rate and no route reads them. The probe times host work at idle priority, so a busy machine moves some terms: `r_eval` and `r_fit` hold, while `bw`, `launch_s`, `cpu_eval` and the enrich rates (elementwise, segmented-rank, mtf-join) move by up to 2.5x. When `load1_start` is above half the CPUs of the process, or any term has a spread above 1.5, `rcsr calibrate` writes the file and prints one line on stderr:
+
+```text
+# calibrate: measured under load 8.65 (limit 4.00); noisy terms: bw 1.89, launch_s 2.26, cpu_eval 21.68
+```
+
+`--strict` prints the line, exits 3 and writes nothing. A search that prices with a file whose `load1_start` is above that limit prints `# calibration: <path>: measured under load ...` once and routes as it would without the fields; it does not refuse, because that would invalidate files that exist. `rcsr calibrate` takes under 60 s at a load below 2.5 on the RTX 3060 (46.3 to 46.9 s at load 1.1 to 2.2) and longer above it.
 
 The probes behind `rcsr calibrate` and `--calibration probe` work as follows. The
 host terms that route stages (`cpu_eval`, `cpu_fit`) stay within a fixed factor of
