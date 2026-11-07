@@ -484,6 +484,9 @@ pub struct GenRecord {
     pub reevals: usize,
     /// #477: offspring rejected before the fit for holding no row-dependent input.
     pub constant_rejected: usize,
+    /// #848: offspring rejected before the fit because their position cannot
+    /// depend on the inputs.
+    pub fixed_position_rejected: usize,
     // Error distribution over this generation's population.
     pub best_error: f64,
     pub p05: f64,
@@ -600,7 +603,7 @@ impl GenRecord {
              \"error\":{{\"best\":{},\"p05\":{},\"p25\":{},\"median\":{},\"p75\":{},\"p95\":{}}},\
              \"archive\":{{\"size\":{},\"hypervolume\":{},\"hash\":{},\"offers\":{},\"admissions\":{}}},\
              \"variation\":{{\"attempts\":{},\"duplicates\":{},\"too_complex\":{},\"offspring\":{},\
-             \"fitted\":{},\"refits\":{},\"dedup_rate\":{},\"post_fit_drops\":{},\"reevals\":{},\"constant_rejected\":{}}},\
+             \"fitted\":{},\"refits\":{},\"dedup_rate\":{},\"post_fit_drops\":{},\"reevals\":{},\"constant_rejected\":{},\"fixed_position_rejected\":{}}},\
              \"gpu\":{},\"fit\":{},\
              \"fallback\":{{\"scope\":\"evaluator_pool\",\"seconds\":{},\"workers\":{}}},\
              \"qd\":{},\
@@ -643,6 +646,7 @@ impl GenRecord {
             self.post_fit_drops,
             self.reevals,
             self.constant_rejected,
+            self.fixed_position_rejected,
             self.gpu.as_ref().map(|g| g.json()).unwrap_or_else(|| "null".to_string()),
             self.fit.json(),
             num(self.fallback_s),
@@ -1180,6 +1184,7 @@ mod tests {
             post_fit_drops: 0,
             reevals: 0,
             constant_rejected: 0,
+            fixed_position_rejected: 0,
             best_error: 0.5,
             p05: 0.6,
             p25: 0.7,
