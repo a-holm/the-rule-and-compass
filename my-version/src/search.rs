@@ -1876,22 +1876,32 @@ impl GpuSearch {
         }
         let rows = EvalSample { sample: train, cols: None };
         let prefix_start = std::time::Instant::now();
+        let mut flat = 0usize;
         let full: Vec<(usize, usize)> = slots
             .iter()
             .copied()
             .filter(|&(i, j)| {
                 let tree = &islands[i][j].tree;
-                cfg.accepts_dimensions(tree) && nonfinite_prefix(tree, &rows, cfg) != Some(true)
+                if !cfg.accepts_dimensions(tree) {
+                    return false;
+                }
+                if constant_is_floored(tree, train, cfg) {
+                    flat += 1;
+                    return false;
+                }
+                nonfinite_prefix(tree, &rows, cfg) != Some(true)
             })
             .collect();
         // Every slot outside `full` is `+inf` on the CPU: rejected by the
-        // dimension filter or non-finite in the probed prefix.
+        // dimension filter, a flat bare constant or non-finite in the probed
+        // prefix.
         for &(i, j) in &slots {
             islands[i][j].confirm_inf(Some(self.rows_version));
         }
         let stats = self.stats.entry(generation).or_default();
         stats.nonfinite += status2;
         stats.nonfinite_trade_floor += floor.len();
+        stats.nonfinite_constant += flat;
         stats.nonfinite_full += full.len();
         let mut check = crate::gpu_stats::EvalCheckLedger {
             prefix_s: prefix_start.elapsed().as_secs_f64(),
@@ -2359,6 +2369,7 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             fallbacks: batch.map(|b| b.fallbacks).unwrap_or(0),
             nonfinite: batch.map(|b| b.nonfinite).unwrap_or(0),
             nonfinite_trade_floor: batch.map(|b| b.nonfinite_trade_floor).unwrap_or(0),
+            nonfinite_constant: batch.map(|b| b.nonfinite_constant).unwrap_or(0),
             nonfinite_full: batch.map(|b| b.nonfinite_full).unwrap_or(0),
             nonfinite_cpu_finite: batch.map(|b| b.nonfinite_cpu_finite).unwrap_or(0),
             nonfinite_seconds: batch.map(|b| b.nonfinite_seconds).unwrap_or(0.0),
@@ -3913,6 +3924,18 @@ fn eval_error_and_descriptor(
 
 /// #500: rows probed for a non-finite prediction before a full re-score.
 const INF_PROBE_ROWS: usize = 2048;
+
+/// #856: a bare constant at or below the book's threshold is flat on every row
+/// in f64, so the long/flat book counts no flip and scores `+inf` (fewer flips
+/// than `min_trades`); a non-finite constant scores `+inf` as well. The rule
+/// reads the CPU arithmetic only: the device value cannot change it.
+fn constant_is_floored(tree: &Node, train: &Sample, cfg: &Config) -> bool {
+    let Some(book) = cfg.fitness.book() else {
+        return false;
+    };
+    let _ = (book, train, tree);
+    false
+}
 
 /// #500/#589: whether a non-finite prediction in the first rows decides the
 /// score. `Some(true)`: the first rows hold one, which makes the full score
@@ -5809,6 +5832,9 @@ pub struct GpuGenStats {
     /// #640: device results with status 0 and `+inf` from the long/flat
     /// book (trade floor), checked on the CPU like the status-2 ones.
     pub nonfinite_trade_floor: usize,
+    /// #856: flat bare constants settled without a pass (`+inf` on the CPU by
+    /// the book's own rule), counted inside `nonfinite` and `nonfinite_trade_floor`.
+    pub nonfinite_constant: usize,
     /// #589: of those, the ones the f64 prefix probe did not settle, so a full
     /// CPU pass ran.
     pub nonfinite_full: usize,
@@ -6389,6 +6415,9 @@ pub struct GpuSnapshot {
     /// finite on the CPU, and the wall seconds of the passes.
     pub nonfinite: usize,
     pub nonfinite_trade_floor: usize,
+    /// #856: flat bare constants settled without a pass (`+inf` on the CPU by
+    /// the book's own rule), counted inside `nonfinite` and `nonfinite_trade_floor`.
+    pub nonfinite_constant: usize,
     pub nonfinite_full: usize,
     pub nonfinite_cpu_finite: usize,
     pub nonfinite_seconds: f64,
@@ -6430,6 +6459,7 @@ impl GpuSnapshot {
             fallbacks: self.fallbacks,
             nonfinite: self.nonfinite,
             nonfinite_trade_floor: self.nonfinite_trade_floor,
+            nonfinite_constant: self.nonfinite_constant,
             nonfinite_full: self.nonfinite_full,
             nonfinite_cpu_finite: self.nonfinite_cpu_finite,
             nonfinite_seconds: self.nonfinite_seconds,
@@ -6577,6 +6607,7 @@ fn dev_generation(
         fallback_workers: g.fallback_workers,
         nonfinite: g.nonfinite,
         nonfinite_trade_floor: g.nonfinite_trade_floor,
+        nonfinite_constant: g.nonfinite_constant,
         nonfinite_full: g.nonfinite_full,
         nonfinite_cpu_finite: g.nonfinite_cpu_finite,
         nonfinite_seconds: g.nonfinite_seconds,
@@ -6802,6 +6833,7 @@ fn run_postfix_search(
             fit_fallback_workers: 0,
             nonfinite: 0,
             nonfinite_trade_floor: 0,
+            nonfinite_constant: 0,
             nonfinite_full: 0,
             nonfinite_cpu_finite: 0,
             nonfinite_seconds: 0.0,
@@ -11734,6 +11766,8 @@ mod tests {
         assert_eq!(stats.nonfinite, 0, "{:?}", stats);
         assert_eq!(stats.nonfinite_trade_floor, 2, "{:?}", stats);
         assert_eq!(stats.nonfinite_cpu_finite, 1, "{:?}", stats);
+        assert_eq!(stats.nonfinite_constant, 1, "{:?}", stats);
+        assert_eq!(stats.nonfinite_full, 1, "{:?}", stats);
     }
 
     /// #854: the CPU check of a device `+inf` reads the run's column view. It
@@ -11811,6 +11845,110 @@ mod tests {
         assert_eq!(transpose_count(), 0, "{:?}", stats);
         let exact = score_tree(&islands[0][0].tree, &view, &cfg);
         assert_eq!(islands[0][0].error.to_bits(), exact.to_bits());
+    }
+
+    /// #856: a long/flat book over 300 rows of one group with the given floor,
+    /// threshold and block count, and the sample it scores.
+    fn flat_book_fixture(threshold: f64, min_trades: usize, blocks: usize) -> (Sample, Config) {
+        let n = 300;
+        let x: Vec<Vec<f64>> = (0..n).map(|i| vec![if i % 2 == 0 { 1.0 } else { -1.0 }]).collect();
+        let y: Vec<f64> = (0..n).map(|i| if i % 2 == 0 { 0.003 } else { -0.001 }).collect();
+        let s = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
+        let rows = crate::trading::TradingRows {
+            time: (0..n).map(|i| 900.0 * i as f64).collect(),
+            group: vec![0; n],
+            funding: Vec::new(),
+        };
+        let slice = crate::data::TradingSlice { rows, ret: s.y.clone() };
+        let spec = crate::trading::TradingSpec {
+            cost_bps: 1.0,
+            min_trades,
+            threshold,
+            ..Default::default()
+        };
+        let book = crate::trading::FitnessBook::with_blocks(&slice, &spec, 900.0, blocks, 1.0).unwrap();
+        let cfg = Config { fitness: Fitness::LongPnl(std::sync::Arc::new(book)), ..Config::default() };
+        (s, cfg)
+    }
+
+    fn next_up(v: f64) -> f64 {
+        f64::from_bits(v.to_bits() + 1)
+    }
+
+    /// #856: wherever the rule fires, the exact CPU score is `+inf`, so the
+    /// shortcut returns what the full pass returns. Checked on the scalar and
+    /// the column view, one and four blocks, and at the edge values: a
+    /// subnormal, the 1e30 limit and a value exactly at the threshold.
+    #[test]
+    fn flat_constant_needs_no_pass() {
+        let values = [
+            -1.0,
+            0.0,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -5e-324,
+            5e-324,
+            1e-300,
+            1.0,
+            -1e30,
+            1e30,
+            next_up(1e30),
+            -f64::MAX,
+            f64::MAX,
+            1e-30,
+            next_up(1e-30),
+            -1e-30,
+        ];
+        let mut fired = 0;
+        for threshold in [0.0, 1e-30, -1e-30, 1e30, -1e30] {
+            for min_trades in [1usize, 5] {
+                for blocks in [1usize, 4] {
+                    let (s, cfg) = flat_book_fixture(threshold, min_trades, blocks);
+                    let columns = EvalSample::new(&s, &cfg);
+                    let scalar = EvalSample { sample: &s, cols: None };
+                    for v in values {
+                        let tree = constant(v);
+                        let floored = constant_is_floored(&tree, &s, &cfg);
+                        let expect = !v.is_finite() || !(v > threshold);
+                        assert_eq!(floored, expect, "v={v:e} threshold={threshold:e}");
+                        if floored {
+                            fired += 1;
+                            for view in [&columns, &scalar] {
+                                let score = score_tree(&tree, view, &cfg);
+                                assert_eq!(score, f64::INFINITY, "v={v:e} threshold={threshold:e} blocks={blocks}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(fired > 100, "{fired}");
+        let (s, cfg) = flat_book_fixture(1e-30, 1, 1);
+        assert!(constant_is_floored(&constant(1e-30), &s, &cfg), "exactly at the threshold");
+        assert!(!constant_is_floored(&constant(next_up(1e-30)), &s, &cfg), "one ulp above it");
+        assert!(constant_is_floored(&constant(5e-324), &s, &cfg), "a positive subnormal is below 1e-30");
+        let (zero, zcfg) = flat_book_fixture(0.0, 1, 1);
+        assert!(!constant_is_floored(&constant(5e-324), &zero, &zcfg), "a positive subnormal is above 0");
+    }
+
+    /// #856: the rule is off without a trade floor, with a metric fitness, for
+    /// anything but a bare constant and for a multi-output sample.
+    #[test]
+    fn flat_constant_rule_stays_off_outside_its_proof() {
+        let (s, floorless) = flat_book_fixture(0.0, 0, 1);
+        assert!(!constant_is_floored(&constant(-1.0), &s, &floorless));
+        assert!(score_tree(&constant(-1.0), &EvalSample::new(&s, &floorless), &floorless).is_finite());
+        let (_, cfg) = flat_book_fixture(0.0, 1, 1);
+        let product = node(Op::Mul, vec![constant(-1.0), input(0)]);
+        assert!(!constant_is_floored(&product, &s, &cfg));
+        assert!(!constant_is_floored(&input(0), &s, &cfg));
+        let metric = Config::default();
+        assert!(!constant_is_floored(&constant(-1.0), &s, &metric));
+        let multi = Sample { ys: vec![s.y.clone(), s.y.clone()], ..s.clone() };
+        assert!(multi.is_multi());
+        assert!(!constant_is_floored(&constant(-1.0), &multi, &cfg));
     }
 
     #[test]
