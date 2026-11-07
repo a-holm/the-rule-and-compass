@@ -7,6 +7,8 @@
 
 #[path = "common/rcsr.rs"]
 mod rcsr_cmd;
+#[path = "common/launches.rs"]
+mod launches;
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -575,7 +577,7 @@ const CLI_TRAIN_ROWS: u64 = 75_000;
 
 /// `--gpu-memory` one byte under the resident rows of the run, as a number.
 fn cli_tiled_budget_bytes(csv: &PathBuf) -> u64 {
-    let out = rcsr(csv, &["--gpu", "--json", "--quiet"]);
+    let out = rcsr(csv, &["--gpu", "--dispatch", "device", "--json", "--quiet"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(stdout.contains("\"memory_plan\":{\"mode\":\"resident\""), "{stdout}");
@@ -595,10 +597,11 @@ fn cli_tiled_run_and_explicit_device_fit() {
     let (_dir, csv) = tmp_csv(100_000);
     let budget = cli_tiled_budget(&csv);
 
-    let out = rcsr(&csv, &["--gpu", "--json", "--quiet", "--gpu-memory", budget.as_str()]);
+    let out = rcsr(&csv, &["--gpu", "--dispatch", "device", "--json", "--quiet", "--gpu-memory", budget.as_str()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(stdout.contains("\"memory_plan\":{\"mode\":\"tiled\""), "{stdout}");
+    assert!(launches::device_launches(&stdout) > 0, "a forced device run launched no kernel: {stdout}");
     assert!(stdout.contains("\"backend\":\"gpu\""), "{stdout}");
     let plan = &stdout[stdout.find("\"memory_plan\"").unwrap()..];
     assert!(plan.contains("\"fit_reason\":\"device_memory\""), "{plan}");
@@ -607,7 +610,7 @@ fn cli_tiled_run_and_explicit_device_fit() {
 
     let out = rcsr(
         &csv,
-        &["--gpu", "--fit-strategy", "gpu", "--gpu-memory", budget.as_str()],
+        &["--gpu", "--dispatch", "device", "--fit-strategy", "gpu", "--gpu-memory", budget.as_str()],
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
@@ -647,7 +650,7 @@ fn cli_tiled_rank_metric_runs_on_the_cpu_with_device_memory() {
 
     let out = rcsr(
         &csv,
-        &["--gpu", "--metric", "rank_correlation", "--quiet", "--gpu-memory", budget.as_str()],
+        &["--gpu", "--dispatch", "device", "--metric", "rank_correlation", "--quiet", "--gpu-memory", budget.as_str()],
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
@@ -678,7 +681,7 @@ fn child_cli_children_ignore_the_hooks() {
     }
     let (_dir, csv) = tmp_csv(100_000);
     let budget = cli_tiled_budget(&csv);
-    let out = rcsr(&csv, &["--gpu", "--json", "--quiet", "--gpu-memory", budget.as_str()]);
+    let out = rcsr(&csv, &["--gpu", "--dispatch", "device", "--json", "--quiet", "--gpu-memory", budget.as_str()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     let plan = &stdout[stdout.find("\"memory_plan\"").expect("a plan")..];

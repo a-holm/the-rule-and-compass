@@ -9,6 +9,8 @@
 
 #[path = "common/rcsr.rs"]
 mod rcsr_cmd;
+#[path = "common/launches.rs"]
+mod launches;
 
 use rcsr::checkpoint::{Backend, Checkpoint};
 use rcsr::data::Sample;
@@ -1583,6 +1585,11 @@ fn default_run_resolves_to_the_gpu_arm_and_labels_every_other_resolution() {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
+    // The default route is checked, not a forced device route; the launch count makes a pass under
+    // memcheck a counted fact.
+    let launches = launches::device_launches(&cli_json_on_device(&["--metric", "squared"]));
+    eprintln!("default route: {launches} device launches counted");
+    assert!(launches > 0, "the default gpu arm launched no kernel");
     let (fitting, _) = cli_fit_and_front_on_device(&["--metric", "squared"]);
     assert!(fitting.contains("\"strategy\":\"gpu\""), "{fitting}");
     assert!(fitting.contains("\"strategy_source\":\"default\""), "{fitting}");
