@@ -1065,7 +1065,7 @@ fn search_results_do_not_depend_on_the_thread_count() {
 #[test]
 fn a_device_search_does_not_depend_on_the_thread_count() {
     if !rcsr::backend::probe().available() {
-        eprintln!("no usable GPU; skipping the device thread-count check");
+        rcsr::backend::skip_without_device("no usable GPU; skipping the device thread-count check");
         return;
     }
     let train = sample(2600);

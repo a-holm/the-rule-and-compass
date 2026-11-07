@@ -1532,7 +1532,6 @@ fn cli_json_on_device(extra: &[&str]) -> String {
 }
 
 fn cli_json_with(mut cmd: std::process::Command, extra: &[&str]) -> String {
-    use std::io::Write;
     use std::process::Stdio;
     let mut child = cmd
         .args([
