@@ -190,6 +190,8 @@ pub struct EvalCheckLedger {
     /// #893: of `finite`, the ones that were trade-floor slots (a floor slot
     /// whose f64 score is finite is one `--skip-floor-check` would have left at `+inf`).
     pub floor_finite: u64,
+    /// #893: the smallest f64 score among those floor slots.
+    pub floor_finite_best: Option<f64>,
     /// #893: trade-floor slots kept `+inf` without a pass.
     pub floor_unchecked: u64,
 }
@@ -477,6 +479,9 @@ impl RunLedger {
         self.eval_check.full_passes += c.full_passes;
         self.eval_check.finite += c.finite;
         self.eval_check.floor_finite += c.floor_finite;
+        if let Some(b) = c.floor_finite_best.filter(|b| b.is_finite()) {
+            self.eval_check.floor_finite_best = Some(self.eval_check.floor_finite_best.map_or(b, |m| m.min(b)));
+        }
         self.eval_check.floor_unchecked += c.floor_unchecked;
     }
 
@@ -1088,6 +1093,7 @@ mod tests {
             finite: 2,
             floor_finite: 1,
             floor_unchecked: 3,
+            floor_finite_best: Some(0.5),
         };
         l.record_eval_check(c);
         l.record_eval_check(EvalCheckLedger { pool_s: f64::NAN, prefix_s: -1.0, slots: 1, ..Default::default() });
@@ -1098,6 +1104,7 @@ mod tests {
         let got = l.eval_check();
         assert_eq!((got.slots, got.trade_floor_slots, got.full_passes, got.finite), (11, 4, 6, 2));
         assert_eq!((got.floor_finite, got.floor_unchecked), (1, 3));
+        assert_eq!(got.floor_finite_best, Some(0.5));
         assert_eq!(got.seconds(), 1.75);
         let mut total = RunLedger::new();
         total.absorb(&l);

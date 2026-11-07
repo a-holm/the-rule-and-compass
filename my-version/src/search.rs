@@ -2018,6 +2018,9 @@ impl GpuSearch {
             stats.nonfinite_cpu_finite += e.is_finite() as usize;
             check.finite += e.is_finite() as u64;
             check.floor_finite += (is_floor && e.is_finite()) as u64;
+            if is_floor && e.is_finite() {
+                check.floor_finite_best = Some(check.floor_finite_best.map_or(e, |m| m.min(e)));
+            }
             islands[i][j].set_error(e);
             islands[i][j].confirm_inf(Some(self.rows_version));
         }
