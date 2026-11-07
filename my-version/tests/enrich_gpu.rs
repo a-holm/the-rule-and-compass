@@ -162,7 +162,7 @@ const FEATURES: &str = "r1,r5,ma20,vol20,rsi6,rsi28,atr50,don20,vz96,bb20_bw,bb5
 #[test]
 fn gpu_columns_match_cpu_and_report_the_share() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let (_scratch, dir) = tmp_dir("parity");
@@ -257,7 +257,7 @@ fn gpu_columns_match_cpu_and_report_the_share() {
 #[test]
 fn gpu_cross_section_ranks_are_exact_and_chunk_invariant() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let (_scratch, dir) = tmp_dir("xs-rank");
@@ -354,7 +354,7 @@ fn gpu_cross_section_rank_edge_cases() {
     use rcsr::enrich_gpu::EnrichGpu;
 
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let symbols = 24usize;
@@ -487,7 +487,7 @@ fn gpu_cross_section_rank_edge_cases() {
 #[ignore = "throughput measurement; needs a CUDA device"]
 fn measure_cross_section_stage() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let env = |k: &str, d: usize| {
@@ -642,7 +642,7 @@ fn advertised_catalogue_matches_between_cpu_and_gpu_on_a_large_store() {
 #[test]
 fn engine_tail_kernels_match_cpu_and_are_batch_invariant() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let (_scratch, dir) = tmp_dir("tail");
@@ -772,7 +772,7 @@ fn compact_shared_names_are_registered_and_dispatched_at_16m() {
 #[ignore = "throughput measurement; needs a CUDA device"]
 fn measure_donchian_extrema_throughput() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let rows = 1_000_000usize;
@@ -829,7 +829,7 @@ fn measure_donchian_extrema_throughput() {
 #[test]
 fn batch_output_matches_per_column_downloads() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let rows = 20_000usize;
@@ -946,7 +946,7 @@ fn refused_cub_sort_fails_cross_section_prepare_then_recovers() {
     use rcsr::enrich_gpu::EnrichGpu;
 
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let (symbols, steps) = (24usize, 40usize);
@@ -988,7 +988,7 @@ fn refused_later_cub_calls_fail_cross_section_prepare_then_recover() {
     use rcsr::enrich_gpu::EnrichGpu;
 
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let (symbols, steps) = (24usize, 40usize);

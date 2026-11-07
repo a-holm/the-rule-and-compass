@@ -1354,8 +1354,11 @@ lowest finite pre-refit error among trees of cost `<= c`; tree `t` is refit when
 `pre(t) <= env(cost(t)) + band * |env(cost(t))|`. The refit is metric-monotone,
 so errors only fall. The front is then rebuilt from refit errors (refit trees)
 and pre-refit errors (the rest), and every front member that was not refit is
-refit, repeating until none is left, so every reported member is an exact CPU
-f64 refit. The refit set depends only on errors, costs and structural hashes,
+refit, repeating until none is left, so every reported member is scored exactly
+in f64 and, without `--fitness pnl`, is an exact CPU refit. Under `--fitness pnl` the
+rebuild also scores the archive members with their carried constants and a member
+may keep them when the refit changes its book (#850); `gpu.fit.carried_kept` counts
+those members. The refit set depends only on errors, costs and structural hashes,
 never on timing. `--refit-band F` sets the relative band (default `inf`);
 `--refit-band inf` (the default) refits every unique tree and reproduces the archive hash of
 the full refit. The default band is `inf`: in the default-decision A/B round (#495), 6 of 26 paired runs reported a different front with `0.001` (REAL seeds 23 and 27; TAB squared 15k seeds 11 and 13, log_loss 15k seed 12, log_loss 112k seed 12), all from the final refit, so `0.001` is opt-in and cuts `gpu.fit.refit_s` at the cost of that difference. The band is a saved search setting, written to a checkpoint only
@@ -3395,6 +3398,8 @@ GPU test helpers that must force the device set `DispatchMode::Device`. When `au
 reports `backend_reason` `dispatch: cost model kept every stage on the cpu`.
 
 The memcheck pass is defined by `my-version/tests/sanitizer.plan` and run by `verksted/_tools/sanitize-all.sh`. Each line names a binary and a test (or `*`), a mode and a reason. `skip` runs nothing. `run-bin` (only with `*`) names a cargo bin instead of a test target: the release binary itself runs under memcheck with the rest of the line as its arguments, in its own lock hold (`rcsr-gpu-bench * run-bin --batch 64 --reps 1 --depth 3`; `--only rcsr-gpu-bench` runs just that line). The bin's unit-test executable keeps a `skip` line. `no-cuda-app-only` (only with `*`) is `no-cuda` run with `--target-processes application-only`, for a binary whose child processes also make no CUDA call and on which the default `all` crashes the sanitizer; the launch-timeout message `No attachable process found` also counts as no CUDA call there. `no-cuda` (only with `*`) lists a binary that makes no CUDA call by design: it still runs, and rc 255 with `terminated before first instrumented API call` and passing tests is a pass only for a listed binary; an unlisted binary with that outcome fails the pass, and a listed binary that does call CUDA gets the normal verdict with a `listed no-cuda but called CUDA` mark. `api-errors-no` runs that one test alone with `--report-api-errors no`, because it provokes a `cudaMalloc` out-of-memory on purpose and the default reports that call as an error. The runner exports `RCSR_UNDER_SANITIZER=memcheck`; a test reads it through `tests/common/sanitizer.rs` (`active()`, `pick(native, sanitized)`) to pick a smaller fixture that still crosses every chunk, tile and gap boundary. Every run is capped at 580 s; a run that hits the cap fails as `budget`. `tests/sanitizer_plan.rs` fails when the plan names a binary or test that does not exist.
+
+A device test that finds no usable device calls `rcsr::backend::skip_without_device(reason)` and returns. The call prints `reason` and lets the test skip, or panics when `RCSR_REQUIRE_DEVICE=1`, so a gate on a machine whose device went missing fails instead of passing. `verksted/_tools/gate.sh`, `sanitize.sh` and `sanitize-all.sh` set it for every CUDA suite and memcheck run. `RCSR_GPU=0` in the environment of a test process hides the device and fails a required test with that message. Children that tests start with `RCSR_GPU=0` do not call the helper, so the two switches do not meet. `tests/device_skip_lint.rs` refuses a bare `eprintln!("skip...device")` in `tests/` and `src/`, and `tests/require_device.rs` runs the helper in a child process of the test binary to prove the panic without touching the environment of parallel tests.
 
 See [`dispatch.md`](dispatch.md) for the formulas, JSON shape and the tests.
 

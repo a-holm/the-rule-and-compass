@@ -66,7 +66,11 @@ fn rank_config(seed: u32, metric: Metric) -> Config {
 
 #[cfg(feature = "cuda")]
 fn device_available() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 #[cfg(feature = "cuda")]
@@ -139,7 +143,7 @@ fn rank_gpu_scoring_respects_the_measured_row_floor() {
 #[test]
 fn gpu_rank_run_is_deterministic_and_reports_the_exact_objective() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(240, 5);
@@ -189,7 +193,7 @@ fn gpu_rank_run_is_deterministic_and_reports_the_exact_objective() {
 #[test]
 fn no_fit_is_a_true_noop_for_the_rank_gpu_arm() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(160, 7);
@@ -236,7 +240,7 @@ fn no_fit_is_a_true_noop_for_the_rank_gpu_arm() {
 #[test]
 fn signed_rank_gpu_fit_is_deterministic_across_runs_and_island_counts() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(240, 41);
@@ -278,7 +282,7 @@ fn the_batched_verifier_is_rank_native_and_exact() {
     use rcsr::expr::{constant, input, node, Op};
     use rcsr::fit::{fit_batch_verified, fit_weighted_metric, BatchStatus, BatchedGpu};
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(400, 51);
@@ -299,7 +303,7 @@ fn the_batched_verifier_is_rank_native_and_exact() {
     let mut ev = match rcsr::gpu::GpuEvaluator::new(&cols, n, nv, &y32) {
         Some(ev) => ev,
         None => {
-            eprintln!("skipping GPU test: evaluator construction failed");
+            rcsr::backend::skip_without_device("skipping GPU test: evaluator construction failed");
             return;
         }
     };
@@ -349,7 +353,7 @@ fn the_batched_verifier_is_rank_native_and_exact() {
 #[ignore]
 fn bench_rank_end_to_end() {
     if !device_available() {
-        eprintln!("skipping GPU benchmark: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU benchmark: no usable CUDA device");
         return;
     }
     let n: usize = std::env::var("RCSR_BENCH_N")

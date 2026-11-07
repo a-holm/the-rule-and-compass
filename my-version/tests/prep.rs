@@ -376,7 +376,7 @@ fn median_fill_still_recovers_the_law() {
     assert_eq!(p.prep.rows_filled, 4);
     assert_eq!(p.prep.rows_dropped_missing, 0);
 
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
     cfg.generations = 300;
     cfg.pop = 200;
     cfg.islands = 2;

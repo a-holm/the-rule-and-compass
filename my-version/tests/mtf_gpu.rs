@@ -133,7 +133,7 @@ fn close_enough(a: f64, b: f64) -> bool {
 #[test]
 fn gpu_mtf_36_columns_match_cpu_and_dispatch_without_fallback() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     // Above the 1M-row dispatch floor, with two symbols and a real gap.
@@ -327,7 +327,7 @@ fn prefix_replay_at_many_cuts_is_bit_identical() {
 #[test]
 fn symbol_batches_and_chunk_sizes_write_the_same_bytes() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let wanted = enrich::mtf_names();
@@ -376,7 +376,7 @@ fn holey(symbol: &str, span: usize, step: i64, hole_every: usize, phase: f64) ->
 #[test]
 fn long_holey_symbol_stays_on_the_device() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     // 21,000-bar span, 21 single-bar holes: 20,979 rows.
@@ -430,7 +430,7 @@ fn sweep_rows(nseg: usize, step: i64, hole_k: usize, big_gap: bool) -> Vec<(i64,
 #[test]
 fn bucket_capacity_bounds_every_timeframe() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     for step in [60i64, 300, 420, 900, 3600] {
@@ -462,7 +462,7 @@ fn bucket_capacity_bounds_every_timeframe() {
 #[test]
 fn sub_hour_and_non_hour_multiple_timeframes_are_rejected_with_their_own_code() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let rows = holey("AAA", 2_000, 900, 0, 0.0);
@@ -485,7 +485,7 @@ fn big_holey_rows() -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
 #[test]
 fn enrich_on_the_long_holey_fixture_reports_no_fallback() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let rows = big_holey_rows();
@@ -501,7 +501,7 @@ fn enrich_on_the_long_holey_fixture_reports_no_fallback() {
 #[test]
 fn a_forced_device_failure_warns_once_and_matches_the_cpu_bytes() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let rows = big_holey_rows();
@@ -543,7 +543,7 @@ extern "C" {
 #[test]
 fn refused_cub_scan_fails_prepare_with_its_own_code_then_recovers() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let rows = holey("AAA", 2_000, 900, 0, 0.0);

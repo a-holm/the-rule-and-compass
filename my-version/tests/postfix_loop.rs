@@ -88,6 +88,7 @@ fn postfix_path_is_deterministic_and_bounded() {
 #[test]
 fn postfix_path_scores_the_configured_native_metric() {
     if !rcsr::backend::probe().available() {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
         return;
     }
     let data = sample(160);
@@ -293,6 +294,7 @@ fn fitting_runs_stay_on_the_owned_tree_path() {
 #[test]
 fn front_observer_does_not_change_the_postfix_archive() {
     if !rcsr::backend::probe().available() {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
         return;
     }
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -318,6 +320,7 @@ fn front_observer_does_not_change_the_postfix_archive() {
 #[test]
 fn prune_keeps_the_device_front_dominated() {
     if !rcsr::backend::probe().available() {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
         return;
     }
     let data = sample(160);
@@ -360,6 +363,7 @@ fn prune_keeps_the_device_front_dominated() {
 #[test]
 fn postfix_run_ledger_closes_exactly() {
     if !rcsr::backend::probe().available() {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
         return;
     }
     let data = sample(200);

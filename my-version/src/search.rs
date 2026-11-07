@@ -2304,6 +2304,7 @@ impl GpuSearch {
             fit_status_by_label: self.fit_status_by_label.clone(),
             fit_refits: 0,
             fit_refit_candidates: 0,
+            fit_carried_kept: 0,
             fit_refit_s: 0.0,
             fit_rescore_s: 0.0,
             fit_ms: self.fit_ms,
@@ -4881,6 +4882,40 @@ struct RefitReport {
     refit_s: f64,
     /// Wall seconds in full-data scoring of the unique trees.
     rescore_s: f64,
+    /// #850: members of the rebuilt front that kept their carried constants.
+    carried_kept: usize,
+}
+
+/// #850: under the long/flat fitness the squared-error refit can change a
+/// tree's book, so the rebuild also prices every archive member with the
+/// constants the search selected. A carried version joins the front only when
+/// it would survive insertion against the refit front; an equal book keeps
+/// the refit version. Returns the front and the carried members it holds.
+fn keep_carried(front: Archive, carried: Vec<Sol>) -> (Archive, usize) {
+    let cap = front.cap;
+    let admitted: Vec<Sol> = carried
+        .into_iter()
+        .filter(|s| {
+            front.admits(s.error, s.cost)
+                && !front
+                    .items
+                    .iter()
+                    .any(|it| it.cost == s.cost && (it.error - s.error).abs() < 1e-12)
+        })
+        .collect();
+    if admitted.is_empty() {
+        return (front, 0);
+    }
+    let hashes: HashSet<u64> = admitted.iter().map(|s| expr::structural_hash(&s.tree)).collect();
+    let mut all = front.items;
+    all.extend(admitted);
+    let front = canonical_front(cap, all);
+    let kept = front
+        .items
+        .iter()
+        .filter(|s| hashes.contains(&expr::structural_hash(&s.tree)))
+        .count();
+    (front, kept)
 }
 
 /// #495: indices of the trees worth an exact refit. `pre` are the pre-refit
@@ -5003,6 +5038,11 @@ fn full_data_archive(
         ..RefitReport::default()
     };
     let refit_on = refit_gpu_fit && cfg.fit_iters > 0 && !train.sample.is_multi();
+    let carried: Vec<Node> = if refit_on && cfg.fitness.book().is_some() {
+        archive.items.iter().map(|s| expr::simplify(&s.tree)).collect()
+    } else {
+        Vec::new()
+    };
     let workers = |n: usize| batch_workers(cfg.threads, n, train.sample.len());
     // #463: scoring is independent per tree; results keep the order.
     let score_all = |trees: Vec<Node>| -> Vec<Sol> {
@@ -5022,8 +5062,14 @@ fn full_data_archive(
         }
         let start = std::time::Instant::now();
         let scored = score_all(unique);
+        let mut front = canonical_front(archive.cap, scored);
+        if !carried.is_empty() {
+            let (kept_front, kept) = keep_carried(front, score_all(carried));
+            front = kept_front;
+            report.carried_kept = kept;
+        }
         report.rescore_s = start.elapsed().as_secs_f64();
-        return (canonical_front(archive.cap, scored), report);
+        return (front, report);
     }
 
     // #495: score with the carried constants, refit only the band around the
@@ -5045,6 +5091,13 @@ fn full_data_archive(
         rescored
     });
     report.refits = refits;
+    if carried.is_empty() {
+        return (front, report);
+    }
+    let start = std::time::Instant::now();
+    let (front, kept) = keep_carried(front, score_all(carried));
+    report.rescore_s += start.elapsed().as_secs_f64();
+    report.carried_kept = kept;
     (front, report)
 }
 
@@ -5840,6 +5893,8 @@ pub struct GpuRunStats {
     pub fit_refit_s: f64,
     /// #495: wall seconds of full-data scoring in the finalist rebuild.
     pub fit_rescore_s: f64,
+    /// #850: front members that kept their carried constants at the rebuild.
+    pub fit_carried_kept: usize,
     /// #169: wall time spent in the batched fit kernels, milliseconds.
     pub fit_ms: f64,
     /// #496: the polish-phase part of `fit_ms`, apportioned by per-block cycles.
@@ -8926,6 +8981,7 @@ fn run_search(
             let mut s = g.run_stats();
             s.fit_refits = gpu_fit_refits;
             s.fit_refit_candidates = refit_report.candidates;
+            s.fit_carried_kept = refit_report.carried_kept;
             s.fit_refit_s = refit_report.refit_s;
             s.fit_rescore_s = refit_report.rescore_s;
             s.fit_admission = cfg.fit_admission;
@@ -10929,6 +10985,101 @@ mod tests {
         assert!(banded.refits >= got.items.len());
     }
 
+    /// #850: long on `x < 0.9`, short loss above. The squared-error line through
+    /// these returns crosses 0 at about 2, outside the range of `x`.
+    fn step_returns() -> Sample {
+        let n = 201;
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..n {
+            let a = -1.0 + 2.0 * i as f64 / (n - 1) as f64;
+            x.push(vec![a]);
+            y.push(if a < 0.9 { 0.01 } else { -0.02 });
+        }
+        Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None }
+    }
+
+    fn cut_tree(a: f64, b: f64) -> Node {
+        node(Op::Mul, vec![constant(a), node(Op::Sub, vec![constant(b), input(0)])])
+    }
+
+    fn pnl_rebuild(tree: Node, band: f64) -> (Archive, RefitReport, f64) {
+        let s = step_returns();
+        let cfg = Config {
+            fitness: Fitness::LongPnl(pnl_book(&s)),
+            refit_band: band,
+            threads: 1,
+            ..Config::default()
+        };
+        let view = EvalSample::new(&s, &cfg);
+        let carried_error = score_tree(&tree, &view, &cfg);
+        let mut a = Archive::new(100);
+        a.items.push(Sol {
+            complexity: expr::complexity(&tree),
+            cost: cfg.complexity_model.complexity(&tree),
+            error: carried_error,
+            tree,
+        });
+        let (front, report) = full_data_archive(&a, &[], &view, &cfg, true);
+        (front, report, carried_error)
+    }
+
+    /// #850: the refit moves the cut of `a * (b - x)` outside the data, the book
+    /// turns buy and hold, and the rebuild must still report the carried tree.
+    #[test]
+    fn rebuild_keeps_carried_constants_when_the_refit_loses_the_book() {
+        for band in [f64::INFINITY, 0.0] {
+            let tree = cut_tree(1.0, 0.9);
+            let (front, report, carried_error) = pnl_rebuild(tree.clone(), band);
+            let s = step_returns();
+            let cfg = Config { fitness: Fitness::LongPnl(pnl_book(&s)), threads: 1, ..Config::default() };
+            let view = EvalSample::new(&s, &cfg);
+            let mut refit = vec![tree.clone()];
+            refit_exact(&mut refit, &view, &cfg);
+            let refit_error = score_tree(&refit[0], &view, &cfg);
+            assert!(refit[0].kids[1].kids[0].val > 1.0, "the refit cut leaves the data: {:?}", refit[0]);
+            assert!(carried_error < refit_error, "{carried_error} vs {refit_error}");
+            assert_eq!(front.items.len(), 1);
+            assert_eq!(front.items[0].error.to_bits(), carried_error.to_bits());
+            assert_eq!(expr::structural_hash(&front.items[0].tree), expr::structural_hash(&expr::simplify(&tree)));
+            assert_eq!(report.carried_kept, 1);
+        }
+    }
+
+    /// #850: where the refit keeps the book the rebuild is the refit alone.
+    #[test]
+    fn rebuild_with_an_unchanged_book_keeps_the_refit_version() {
+        let s = step_returns();
+        let cfg = Config { fitness: Fitness::LongPnl(pnl_book(&s)), threads: 1, ..Config::default() };
+        let view = EvalSample::new(&s, &cfg);
+        let mut refit = vec![expr::simplify(&cut_tree(1.0, 0.0))];
+        refit_exact(&mut refit, &view, &cfg);
+        let (front, report, _) = pnl_rebuild(cut_tree(1.0, 0.0), f64::INFINITY);
+        assert_eq!(report.carried_kept, 0);
+        assert_eq!(
+            expr::structural_hash(&front.items[0].tree),
+            expr::structural_hash(&refit[0])
+        );
+    }
+
+    /// #850: under the metric fitness the rebuild is the refit alone.
+    #[test]
+    fn rebuild_under_the_metric_fitness_does_not_price_carried_constants() {
+        let s = step_returns();
+        let cfg = Config { threads: 1, ..Config::default() };
+        let view = EvalSample::new(&s, &cfg);
+        let mut a = Archive::new(100);
+        let tree = cut_tree(1.0, 0.9);
+        a.items.push(Sol {
+            complexity: expr::complexity(&tree),
+            cost: cfg.complexity_model.complexity(&tree),
+            error: score_tree(&tree, &view, &cfg),
+            tree,
+        });
+        let (_, report) = full_data_archive(&a, &[], &view, &cfg, true);
+        assert_eq!(report.carried_kept, 0);
+    }
+
     /// #495: the saved setting round-trips through the checkpoint config.
     #[test]
     fn refit_band_is_a_saved_search_setting() {
@@ -11618,7 +11769,7 @@ mod tests {
     #[test]
     fn device_nonfinite_is_checked_before_promotion() {
         if !crate::gpu::probe().available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let s = overflow_sample(300);
@@ -11684,7 +11835,7 @@ mod tests {
     #[test]
     fn device_trade_floor_inf_is_checked_before_promotion() {
         if !crate::gpu::probe().available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let n = 300;

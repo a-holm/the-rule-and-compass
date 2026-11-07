@@ -58,7 +58,6 @@ fn calibration_block(json: &str) -> String {
 }
 
 /// `(stage, route, reason)` of every ledger row.
-#[cfg(feature = "cuda")]
 fn route_ledger(json: &str) -> Vec<(String, String, String)> {
     let ledger = json.split("\"route_ledger\":").nth(1).expect("dispatch.route_ledger");
     let field = |row: &str, key: &str| -> String {
@@ -91,14 +90,18 @@ fn sha256_of(path: &Path) -> String {
 
 #[cfg(feature = "cuda")]
 fn device_available() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 #[cfg(feature = "cuda")]
 #[test]
 fn two_auto_runs_give_one_front_and_one_route_ledger() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let cache = Scratch::new("auto-two");
@@ -116,7 +119,7 @@ fn two_auto_runs_give_one_front_and_one_route_ledger() {
 #[test]
 fn a_calibrated_file_gives_equal_fronts_and_its_own_hash() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let dir = Scratch::new("file-two");
@@ -282,6 +285,95 @@ fn calibrate_with_the_enrich_probe_writes_valid_rates() {
     let out = calibrate(dir.path(), &skipped, &["--no-enrich"]);
     assert_eq!(out.status.code(), Some(0));
     assert!(std::fs::read_to_string(&skipped).unwrap().contains("\"enrich\":null"));
+}
+
+/// The stderr lines that start with `prefix`.
+fn lines_with(out: &Output, prefix: &str) -> Vec<String> {
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| l.starts_with(prefix))
+        .map(str::to_string)
+        .collect()
+}
+
+fn cpu_calibrate(dir: &Scratch, file: &Path, strict: bool, env: &[(&str, &str)]) -> Output {
+    let mut cmd = rcsr_cmd::rcsr();
+    cmd.arg("calibrate").arg("--out").arg(file).args(["--cpu", "--no-enrich"]);
+    if strict {
+        cmd.arg("--strict");
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.env("XDG_CACHE_HOME", dir.path()).output().unwrap()
+}
+
+/// #862: a noisy term gets one warning line naming it, the file is written, and
+/// `--strict` exits 3 and writes nothing.
+#[test]
+fn calibrate_strict_refuses_noisy_terms() {
+    let dir = Scratch::new("calibrate-strict");
+    let noisy = [("RCSR_CALIBRATE_TEST_SPREAD", "bw=2.0"), ("RCSR_CALIBRATE_TEST_LOAD1", "0.25")];
+    let file = dir.join("lenient.json");
+    let out = cpu_calibrate(&dir, &file, false, &noisy);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let warnings = lines_with(&out, "# calibrate:");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("noisy terms: bw 2.00"), "{}", warnings[0]);
+    assert!(!warnings[0].contains("measured under load"), "{}", warnings[0]);
+    let text = std::fs::read_to_string(&file).expect("the file exists");
+    assert!(text.contains("\"load1_start\":0.25,\"load1_end\":0.25,"), "{text}");
+
+    let strict_file = dir.join("strict.json");
+    let out = cpu_calibrate(&dir, &strict_file, true, &noisy);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!strict_file.exists(), "--strict wrote a file");
+    assert_eq!(lines_with(&out, "# calibrate:").len(), 1);
+
+    let loaded = [("RCSR_CALIBRATE_TEST_LOAD1", "1000")];
+    let over_file = dir.join("over.json");
+    let out = cpu_calibrate(&dir, &over_file, false, &loaded);
+    assert_eq!(out.status.code(), Some(0));
+    let warnings = lines_with(&out, "# calibrate:");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].starts_with("# calibrate: measured under load 1000.00 (limit "), "{}", warnings[0]);
+    let refused = cpu_calibrate(&dir, &dir.join("over-strict.json"), true, &loaded);
+    assert_eq!(refused.status.code(), Some(3));
+    assert!(!dir.join("over-strict.json").exists());
+}
+
+/// #862: a probe at a low load and with quiet terms prints no `# calibrate:` line.
+#[test]
+fn calibrate_at_a_low_load_prints_no_warning() {
+    let dir = Scratch::new("calibrate-quiet");
+    let file = dir.join("quiet.json");
+    let out = cpu_calibrate(&dir, &file, true, &[("RCSR_CALIBRATE_TEST_LOAD1", "0.0"), ("RCSR_CALIBRATE_TEST_SPREAD", "cpu_eval=1.2")]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(lines_with(&out, "# calibrate:").is_empty());
+    assert!(file.exists());
+}
+
+/// #862: a search that prices with a file measured under load prints the notice
+/// once, and its route ledger equals the one of the same rates without the fields.
+#[test]
+fn a_file_measured_under_load_gives_one_notice_and_the_same_routes() {
+    let dir = Scratch::new("load-notice");
+    let plain = rcsr::dispatch::Calibration::default();
+    let loaded = rcsr::dispatch::Calibration { load1_start: Some(1000.0), load1_end: Some(1001.0), ..plain };
+    let plain_file = dir.join("plain.json");
+    let loaded_file = dir.join("loaded.json");
+    std::fs::write(&plain_file, plain.file_text(None, "test", "2026-01-01T00:00:00Z")).unwrap();
+    std::fs::write(&loaded_file, loaded.file_text(None, "test", "2026-01-01T00:00:00Z")).unwrap();
+    let a = search(dir.path(), &["--calibration", plain_file.to_str().unwrap()]);
+    let b = search(dir.path(), &["--calibration", loaded_file.to_str().unwrap()]);
+    assert!(lines_with(&a, "# calibration:").is_empty());
+    let notices = lines_with(&b, "# calibration:");
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("measured under load 1000.00"), "{}", notices[0]);
+    assert!(notices[0].contains(loaded_file.to_str().unwrap()), "{}", notices[0]);
+    let (a, b) = (ok_json(a), ok_json(b));
+    assert_eq!(route_ledger(&a), route_ledger(&b));
+    assert_eq!(front(&a), front(&b));
 }
 
 /// #861: `rcsr dispatch-plan` prints the route table of the anchors against a

@@ -101,7 +101,11 @@ fn log_loss_of(tree: &rcsr::expr::Node, s: &Sample) -> f64 {
 
 #[cfg(feature = "cuda")]
 fn device_available() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 // ------------------------------------------------------- the label rule ----
@@ -488,7 +492,7 @@ mod device {
     #[test]
     fn device_constant_model_matches_the_closed_form() {
         if !device_available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         for positives in [0.5, 0.2, 0.02] {
@@ -523,7 +527,7 @@ mod device {
     #[test]
     fn device_log_loss_parity_with_cpu_logistic_irls() {
         if !device_available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let s = binary_sample(2_000, 0.5, 0.2, 41);
@@ -561,7 +565,7 @@ mod device {
     #[test]
     fn device_log_loss_survives_extreme_logits() {
         if !device_available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let s = binary_sample(400, 0.3, 0.1, 42);
@@ -591,7 +595,7 @@ mod device {
     #[test]
     fn device_log_loss_is_deterministic_and_batch_independent() {
         if !device_available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let s = binary_sample(500, 0.4, 0.15, 43);
@@ -625,7 +629,7 @@ mod device {
     #[test]
     fn device_log_loss_declines_a_single_class_sample() {
         if !device_available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let s = Sample {
@@ -655,7 +659,7 @@ mod device {
     #[test]
     fn device_log_loss_with_a_large_iteration_budget_terminates() {
         if !device_available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let s = binary_sample(600, 0.05, 0.15, 49);
@@ -678,7 +682,7 @@ mod device {
     #[test]
     fn device_log_loss_moves_constants_and_lowers_the_loss() {
         if !device_available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let s = binary_sample(800, 0.5, 0.1, 44);
@@ -695,7 +699,7 @@ mod device {
     #[test]
     fn the_search_fits_log_loss_on_the_device() {
         if !device_available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let train = binary_sample(400, 0.5, 0.15, 45);
@@ -730,7 +734,7 @@ mod device {
     #[test]
     fn a_single_class_run_is_labelled() {
         if !device_available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let train = Sample {
@@ -762,7 +766,7 @@ mod device {
     #[test]
     fn the_log_loss_arm_is_deterministic() {
         if !device_available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let train = binary_sample(400, 0.5, 0.15, 47);

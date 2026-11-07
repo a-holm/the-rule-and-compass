@@ -86,7 +86,7 @@ const GOLDEN: &[(Metric, u64)] = &[
 #[test]
 fn gpu_search_archives_match_the_pre_change_path() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(2_048, 5);
