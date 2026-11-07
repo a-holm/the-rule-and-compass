@@ -6509,7 +6509,7 @@ fn main() {
                     match trading_book(&s.tree, &v.x, slice, ctx, tspec) {
                         Ok(stats) => {
                             // #849: a fixed-position member is unusable as a finalist with the flag.
-                            let fixed: Option<bool> = None;
+                            let fixed = rcsr::trading::fixed_position(&s.tree, tspec);
                             let value = if cfg.reject_fixed_position && fixed.is_some() {
                                 f64::INFINITY
                             } else {
@@ -6707,7 +6707,7 @@ fn main() {
                 horizon_seconds: target_horizon,
                 cost: trading_cost.clone().unwrap_or_else(|| target::CostDecl::new(None, tspec.per_side_bps(), target::CostSource::Flag)),
                 constant: rcsr::trading::is_constant(tree),
-                fixed_position: None,
+                fixed_position: rcsr::trading::fixed_position(tree, tspec),
                 candidates: rows.len(),
                 usable,
                 expression: top.expression.clone(),
