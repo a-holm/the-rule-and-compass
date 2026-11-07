@@ -3933,8 +3933,10 @@ fn constant_is_floored(tree: &Node, train: &Sample, cfg: &Config) -> bool {
     let Some(book) = cfg.fitness.book() else {
         return false;
     };
-    let _ = (book, train, tree);
-    false
+    tree.op == Op::Const
+        && !train.is_multi()
+        && book.min_trades() >= 1
+        && (!tree.val.is_finite() || !(tree.val > book.threshold()))
 }
 
 /// #500/#589: whether a non-finite prediction in the first rows decides the
