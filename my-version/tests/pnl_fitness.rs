@@ -587,7 +587,7 @@ fn run_fixed(data: &str, spec: &str, log: &std::path::Path, extra: &[&str]) -> O
         "--cost-bps", "5", "--validation-frac", "0.3", "--dev-log", &log, "--dev-log-level", "full",
         "--dev-log-every", "1",
     ];
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .args(extra)
         .output()

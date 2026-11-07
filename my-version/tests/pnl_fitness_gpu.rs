@@ -888,12 +888,12 @@ fn cli_names_the_device_scorer_and_reports_exact_values() {
 fn reject_fixed_position_runs_on_the_device() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let (scratch, data, spec) = write_cli_fixture();
     let log = scratch.path().join("fixed.jsonl");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr_on_device()
         .args([
             "--gpu", "--dispatch", "device", "--data", &data, "--target", "y", "--vars", "x1,x2", "--time", "t",
             "--split", "temporal", "--target-spec", &spec, "--seed", "11", "--generations", "20", "--pop", "48",
