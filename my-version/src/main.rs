@@ -6740,6 +6740,7 @@ fn main() {
         cfg.metric,
         baseline_samples,
         cfg.seed,
+        cfg.threads, // #859
     );
     let baselines_seconds = baselines_start.elapsed().as_secs_f64();
 
