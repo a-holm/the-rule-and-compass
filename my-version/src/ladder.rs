@@ -2449,7 +2449,13 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         if opts.sr_score_col.is_some() {
             return Err(usage_err("--sr-run and --sr-score are alternatives".to_string()));
         }
-        let sr = SrRun::load(path).map_err(|e| input_err(format!("--sr-run {}", e)))?;
+        let sr = SrRun::load(path).map_err(|e| {
+            if e.contains(crate::run_json::INTERIM_REFUSAL) {
+                usage_err(format!("--sr-run {}", e))
+            } else {
+                input_err(format!("--sr-run {}", e))
+            }
+        })?;
         if opts.sr_evals.is_none() {
             opts.sr_evals = sr.run.candidates_evaluated;
         }
