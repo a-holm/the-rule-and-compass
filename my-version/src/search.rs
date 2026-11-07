@@ -1032,6 +1032,8 @@ struct GpuSearch {
     /// #500: rows version of the sample the next `score` call scores on, set
     /// by the caller; a CPU-confirmed `+inf` is recorded against it.
     rows_version: u64,
+    /// #895: column pieces for the flat bound, built once per rows version.
+    check_pieces: Option<(CheckPiecesKey, crate::flat_bound::ColumnPieces)>,
     /// #121: persistent bounded CPU pool for unsupported programs.
     fallback: Option<FallbackPool>,
     /// #169: batched GPU-fit outcomes for this run.
@@ -1343,6 +1345,7 @@ impl GpuSearch {
                     pool: None,
                     stats: BTreeMap::new(),
                     rows_version: 0,
+                    check_pieces: None,
                     fallback: Some(FallbackPool::new(
                         fallback_workers(fallback_threads),
                         fallback_workers(fallback_threads),
@@ -1932,7 +1935,13 @@ impl GpuSearch {
         }
         let rows = EvalSample { sample: train, cols: None };
         let prefix_start = std::time::Instant::now();
+        let bound_rule = flat_bound_rule(train, cfg, self.pool_is_gradual());
+        if bound_rule.is_some() {
+            self.ensure_check_pieces(data);
+        }
+        let pieces = self.check_pieces.as_ref().map(|c| &c.1);
         let mut flat = 0usize;
+        let mut bound = 0usize;
         let full: Vec<(usize, usize)> = slots
             .iter()
             .copied()
@@ -1945,12 +1954,18 @@ impl GpuSearch {
                     flat += 1;
                     return false;
                 }
+                if let (Some(threshold), Some(pieces)) = (bound_rule, pieces) {
+                    if crate::flat_bound::flat(tree, pieces, threshold) {
+                        bound += 1;
+                        return false;
+                    }
+                }
                 nonfinite_prefix(tree, &rows, cfg) != Some(true)
             })
             .collect();
         // Every slot outside `full` is `+inf` on the CPU: rejected by the
-        // dimension filter, a flat bare constant or non-finite in the probed
-        // prefix.
+        // dimension filter, a flat bare constant, flat by the interval bound
+        // or non-finite in the probed prefix.
         for &(i, j) in &slots {
             islands[i][j].confirm_inf(Some(self.rows_version));
         }
@@ -1958,11 +1973,13 @@ impl GpuSearch {
         stats.nonfinite += status2;
         stats.nonfinite_trade_floor += floor.len();
         stats.nonfinite_constant += flat;
+        stats.nonfinite_bound += bound;
         stats.nonfinite_full += full.len();
         let mut check = crate::gpu_stats::EvalCheckLedger {
             prefix_s: prefix_start.elapsed().as_secs_f64(),
             slots: slots.len() as u64,
             trade_floor_slots: floor.len() as u64,
+            bound_flat: bound as u64,
             full_passes: full.len() as u64,
             ..Default::default()
         };
@@ -1982,6 +1999,27 @@ impl GpuSearch {
             .submit(jobs, data, cfg);
         check.pool_s = submit_start.elapsed().as_secs_f64();
         Some(PendingCheck { full, ticket, check })
+    }
+
+    /// #895: the calling thread and every pool worker round subnormals as IEEE does.
+    fn pool_is_gradual(&self) -> bool {
+        let workers = self.fallback.as_ref().map_or(&[false][..], |p| &p.worker_gradual);
+        crate::flat_bound::gate(crate::flat_bound::gradual_underflow(), workers)
+    }
+
+    /// #895: build the column pieces of `data` unless they are cached for this
+    /// rows version. The key also names the sample, so a different table never
+    /// reads another table's pieces.
+    fn ensure_check_pieces(&mut self, data: &EvalSample) {
+        let key = (self.rows_version, data.sample as *const Sample as usize, data.sample.x.len());
+        if self.check_pieces.as_ref().is_some_and(|c| c.0 == key) {
+            return;
+        }
+        let pieces = match &data.cols {
+            Some(cols) => crate::flat_bound::ColumnPieces::from_columns(cols),
+            None => crate::flat_bound::ColumnPieces::from_rows(&data.sample.x),
+        };
+        self.check_pieces = Some((key, pieces));
     }
 
     /// #857: the second half: wait for the submitted passes and write their
@@ -2450,6 +2488,7 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             nonfinite: batch.map(|b| b.nonfinite).unwrap_or(0),
             nonfinite_trade_floor: batch.map(|b| b.nonfinite_trade_floor).unwrap_or(0),
             nonfinite_constant: batch.map(|b| b.nonfinite_constant).unwrap_or(0),
+            nonfinite_bound: batch.map(|b| b.nonfinite_bound).unwrap_or(0),
             nonfinite_full: batch.map(|b| b.nonfinite_full).unwrap_or(0),
             nonfinite_cpu_finite: batch.map(|b| b.nonfinite_cpu_finite).unwrap_or(0),
             nonfinite_seconds: batch.map(|b| b.nonfinite_seconds).unwrap_or(0.0),
@@ -2662,6 +2701,9 @@ struct FallbackPool {
     /// Number of worker threads that have executed at least one chunk. Used by
     /// the tests to prove the scoring ran on the pool, not the caller.
     busy: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// #895: whether each worker thread rounds subnormals as IEEE does,
+    /// read on the worker itself when it starts.
+    worker_gradual: Vec<bool>,
 }
 
 /// Borrowed scoring context for one [`FallbackPool::score`] call. The raw
@@ -2705,13 +2747,16 @@ impl FallbackPool {
         let (done_tx, done) = std::sync::mpsc::channel::<FallbackResult>();
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
         let busy = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (gradual_tx, gradual_rx) = std::sync::mpsc::channel::<bool>();
         for i in 0..workers {
             let rx = std::sync::Arc::clone(&rx);
             let done_tx = done_tx.clone();
             let busy = std::sync::Arc::clone(&busy);
+            let gradual_tx = gradual_tx.clone();
             std::thread::Builder::new()
                 .name(format!("rcsr-fallback-{i}"))
                 .spawn(move || {
+                    let _ = gradual_tx.send(crate::flat_bound::gradual_underflow());
                     let mut counted = false;
                     loop {
                         let chunk = {
@@ -2745,12 +2790,15 @@ impl FallbackPool {
                 })
                 .expect("spawn a CPU fallback worker");
         }
+        drop(gradual_tx);
+        let worker_gradual: Vec<bool> = (0..workers).map(|_| gradual_rx.recv().unwrap_or(false)).collect();
         FallbackPool {
             tx,
             done,
             workers,
             queue,
             busy,
+            worker_gradual,
         }
     }
 
@@ -4027,6 +4075,27 @@ fn constant_is_floored(tree: &Node, train: &Sample, cfg: &Config) -> bool {
         && !train.is_multi()
         && book.min_trades() >= 1
         && (!tree.val.is_finite() || !(tree.val > book.threshold()))
+}
+
+/// #895: the key of cached column pieces: rows version, sample address, rows.
+#[cfg(feature = "cuda")]
+type CheckPiecesKey = (u64, usize, usize);
+
+/// #895: the book threshold when an f64 interval bound can settle a device
+/// `+inf` slot: a book with `min_trades >= 1` scores `+inf` when no row has a
+/// finite prediction above the threshold, and when a prediction is non-finite.
+/// The bound runs on this thread, the passes on pool threads; a flush-to-zero
+/// mode on either would make an upper bound unsound, so `threads_gradual` must
+/// hold for the calling thread and every worker.
+#[cfg(any(feature = "cuda", test))]
+fn flat_bound_rule(train: &Sample, cfg: &Config, threads_gradual: bool) -> Option<f64> {
+    let book = cfg.fitness.book()?;
+    (!train.is_multi()
+        && !train.is_empty()
+        && book.len() == train.len()
+        && book.min_trades() >= 1
+        && threads_gradual)
+    .then(|| book.threshold())
 }
 
 /// #500/#589: whether a non-finite prediction in the first rows decides the
@@ -6063,6 +6132,9 @@ pub struct GpuGenStats {
     /// #856: flat bare constants settled without a pass (`+inf` on the CPU by
     /// the book's own rule), counted inside `nonfinite` and `nonfinite_trade_floor`.
     pub nonfinite_constant: usize,
+    /// #895: of the trade-floor and status-2 slots, those an exact f64 interval bound
+    /// of the tree settled without a pass, counted inside `nonfinite` and `nonfinite_trade_floor`.
+    pub nonfinite_bound: usize,
     /// #589: of those, the ones the f64 prefix probe did not settle, so a full
     /// CPU pass ran.
     pub nonfinite_full: usize,
@@ -6654,6 +6726,9 @@ pub struct GpuSnapshot {
     /// #856: flat bare constants settled without a pass (`+inf` on the CPU by
     /// the book's own rule), counted inside `nonfinite` and `nonfinite_trade_floor`.
     pub nonfinite_constant: usize,
+    /// #895: of the trade-floor and status-2 slots, those an exact f64 interval bound
+    /// of the tree settled without a pass, counted inside `nonfinite` and `nonfinite_trade_floor`.
+    pub nonfinite_bound: usize,
     pub nonfinite_full: usize,
     pub nonfinite_cpu_finite: usize,
     pub nonfinite_seconds: f64,
@@ -6696,6 +6771,7 @@ impl GpuSnapshot {
             nonfinite: self.nonfinite,
             nonfinite_trade_floor: self.nonfinite_trade_floor,
             nonfinite_constant: self.nonfinite_constant,
+            nonfinite_bound: self.nonfinite_bound,
             nonfinite_full: self.nonfinite_full,
             nonfinite_cpu_finite: self.nonfinite_cpu_finite,
             nonfinite_seconds: self.nonfinite_seconds,
@@ -6844,6 +6920,7 @@ fn dev_generation(
         nonfinite: g.nonfinite,
         nonfinite_trade_floor: g.nonfinite_trade_floor,
         nonfinite_constant: g.nonfinite_constant,
+        nonfinite_bound: g.nonfinite_bound,
         nonfinite_full: g.nonfinite_full,
         nonfinite_cpu_finite: g.nonfinite_cpu_finite,
         nonfinite_seconds: g.nonfinite_seconds,
@@ -7079,6 +7156,7 @@ fn run_postfix_search(
             nonfinite: 0,
             nonfinite_trade_floor: 0,
             nonfinite_constant: 0,
+            nonfinite_bound: 0,
             nonfinite_full: 0,
             nonfinite_cpu_finite: 0,
             nonfinite_seconds: 0.0,
@@ -12257,6 +12335,158 @@ mod tests {
         assert_eq!(stats.nonfinite_cpu_finite, 1, "{:?}", stats);
         assert_eq!(stats.nonfinite_constant, 1, "{:?}", stats);
         assert_eq!(stats.nonfinite_full, 1, "{:?}", stats);
+    }
+
+    /// #895: wherever the interval bound fires, the exact CPU score is `+inf`,
+    /// so the shortcut returns what the full pass returns. Checked on the
+    /// scalar and the column view, one and four blocks, several thresholds.
+    #[test]
+    fn flat_bound_rule_matches_score_tree() {
+        let un = |op: Op, a: Node| node(op, vec![a]);
+        let bin = |op: Op, a: Node, b: Node| node(op, vec![a, b]);
+        let flat_trees = vec![
+            un(Op::Gauss, bin(Op::Mul, constant(1e6), input(0))),
+            un(Op::Logistic, bin(Op::Sub, input(0), constant(3423.03))),
+            un(Op::Exp, bin(Op::Sub, input(0), constant(1e6))),
+            bin(Op::Mul, constant(-0.0034), un(Op::Exp, input(0))),
+            bin(Op::Sub, input(0), input(0)),
+            un(Op::Tanh, bin(Op::Sub, input(0), input(0))),
+            bin(Op::Div, input(0), input(0)),
+            constant(-1.0),
+            bin(Op::Div, constant(1.0), constant(0.0)),
+            bin(Op::Add, input(1), input(0)),
+        ];
+        let open_trees = vec![
+            input(0),
+            un(Op::Gauss, input(0)),
+            bin(Op::Mul, constant(2.0), input(0)),
+            un(Op::Exp, input(0)),
+            un(Op::Logistic, input(0)),
+            un(Op::Ln, input(0)),
+        ];
+        let mut fired = 0;
+        for threshold in [0.0, 1e-30, 0.5, -1e-30] {
+            for min_trades in [1usize, 5] {
+                for blocks in [1usize, 4] {
+                    let (s, cfg) = flat_book_fixture(threshold, min_trades, blocks);
+                    let rule = flat_bound_rule(&s, &cfg, true);
+                    assert_eq!(rule, Some(threshold));
+                    let columns = EvalSample::new(&s, &cfg);
+                    let scalar = EvalSample { sample: &s, cols: None };
+                    for (view, from_columns) in [(&columns, true), (&scalar, false)] {
+                        let pieces = if from_columns {
+                            crate::flat_bound::ColumnPieces::from_columns(view.cols.as_ref().unwrap())
+                        } else {
+                            crate::flat_bound::ColumnPieces::from_rows(&s.x)
+                        };
+                        for tree in flat_trees.iter().chain(&open_trees) {
+                            if crate::flat_bound::flat(tree, &pieces, threshold) {
+                                fired += 1;
+                                let exact = score_tree(tree, view, &cfg);
+                                assert_eq!(exact.to_bits(), f64::INFINITY.to_bits(), "{tree:?} threshold={threshold:e}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(fired >= 150, "the bound fires on the planted flat trees: {fired}");
+        let (s, cfg) = flat_book_fixture(1e-30, 0, 1);
+        assert_eq!(flat_bound_rule(&s, &cfg, true), None, "a flat book scores 1 with --min-trades 0");
+        let (s, cfg) = flat_book_fixture(1e-30, 1, 1);
+        assert_eq!(flat_bound_rule(&s, &cfg, false), None, "a thread with flush-to-zero turns the rule off");
+        let metric = Config { fitness: Fitness::Metric, ..cfg.clone() };
+        assert_eq!(flat_bound_rule(&s, &metric, true), None, "no book, no rule");
+        let mut multi = s.clone();
+        multi.ys = vec![s.y.clone(), s.y.clone()];
+        assert_eq!(flat_bound_rule(&multi, &cfg, true), None, "a multi-output sample");
+        let short = Sample { x: s.x[..10].to_vec(), y: s.y[..10].to_vec(), ..s.clone() };
+        assert_eq!(flat_bound_rule(&short, &cfg, true), None, "a sample the book does not cover");
+    }
+
+    /// #895: the device check settles a tree whose f64 predictions cannot
+    /// exceed the threshold by the interval bound, and still runs the full
+    /// pass for a floor slot whose f32 and f64 positions differ (#640).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_inf_check_settles_flat_trees_by_bound() {
+        if !crate::gpu::probe().available() {
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+            return;
+        }
+        let n = 300;
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let up = i % 2 == 0;
+            x.push(vec![if up { 0.5 + 1e-12 } else { -1.0 }, if up { 1.0 } else { -1.0 }]);
+            y.push(if up { 0.003 } else { -0.001 });
+        }
+        let s = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
+        let rows = crate::trading::TradingRows {
+            time: (0..n).map(|i| 900.0 * i as f64).collect(),
+            group: vec![0; n],
+            funding: Vec::new(),
+        };
+        let slice = crate::data::TradingSlice { rows, ret: s.y.clone() };
+        let spec = crate::trading::TradingSpec {
+            cost_bps: 1.0,
+            min_trades: 5,
+            threshold: 0.5,
+            ..Default::default()
+        };
+        let book = std::sync::Arc::new(crate::trading::FitnessBook::new(&slice, &spec, 900.0).unwrap());
+        let cfg = Config {
+            fitness: Fitness::LongPnl(book),
+            gpu: true,
+            dispatch: crate::dispatch::DispatchMode::Device,
+            ..Config::default()
+        };
+        let view = EvalSample::new(&s, &cfg);
+        let flat_tree = node(Op::Gauss, vec![node(Op::Mul, vec![constant(1e6), input(1)])]);
+        let trees = vec![flat_tree, input(0)];
+        let mut island: Vec<Ind> = trees
+            .iter()
+            .map(|t| {
+                let mut ind = Ind::evaluated(t.clone(), &view, &cfg);
+                ind.error = f64::NAN;
+                ind
+            })
+            .collect();
+        let mut g = GpuSearch::new(
+            &s,
+            false,
+            crate::fit::DeviceLoss::Squared,
+            true,
+            None,
+            Some(crate::metrics::ScoreObjective::LongPnl),
+            false,
+            run_clock(),
+            &[],
+            None,
+            cfg.fitness.book(),
+            2,
+        )
+        .expect("a device search");
+        let mut dispatcher = crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::default())
+            .with_mode(crate::dispatch::DispatchMode::Device);
+        let mut islands = vec![std::mem::take(&mut island)];
+        g.rows_version = 7;
+        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher).expect("device batch");
+        let stats = &g.stats[&0];
+        assert_eq!(stats.nonfinite_bound, 1, "{:?}", stats);
+        assert_eq!(stats.nonfinite_trade_floor, 2, "{:?}", stats);
+        assert_eq!(stats.nonfinite_full, 1, "only the f32/f64 flip slot needs a pass: {:?}", stats);
+        assert_eq!(stats.nonfinite_cpu_finite, 1, "{:?}", stats);
+        assert_eq!(islands[0][0].error, f64::INFINITY);
+        assert_eq!(islands[0][0].inf_rows, Some(7));
+        let exact = score_tree(&islands[0][1].tree, &view, &cfg);
+        assert!(exact.is_finite(), "the f64 positions meet the floor: {exact}");
+        assert_eq!(islands[0][1].error.to_bits(), exact.to_bits());
+        assert_eq!(islands[0][1].inf_rows, None);
+        let ledger = g.ledger.eval_check();
+        assert_eq!((ledger.bound_flat, ledger.full_passes), (1, 1), "{ledger:?}");
+        assert_eq!(score_tree(&islands[0][0].tree, &view, &cfg), f64::INFINITY);
     }
 
     /// A run clock for the device searches built in tests (a clock read inside a

@@ -183,6 +183,8 @@ pub struct EvalCheckLedger {
     pub slots: u64,
     /// Of `slots`, the status-0 trade-floor ones.
     pub trade_floor_slots: u64,
+    /// #895: slots an exact f64 interval bound settled without a pass.
+    pub bound_flat: u64,
     /// Slots that needed a full f64 pass.
     pub full_passes: u64,
     /// Full passes that came out finite on the CPU.
@@ -469,6 +471,7 @@ impl RunLedger {
         self.eval_check.pool_s += keep(c.pool_s);
         self.eval_check.slots += c.slots;
         self.eval_check.trade_floor_slots += c.trade_floor_slots;
+        self.eval_check.bound_flat += c.bound_flat;
         self.eval_check.full_passes += c.full_passes;
         self.eval_check.finite += c.finite;
     }
@@ -1077,6 +1080,7 @@ mod tests {
             pool_s: 1.5,
             slots: 10,
             trade_floor_slots: 4,
+            bound_flat: 3,
             full_passes: 6,
             finite: 2,
         };
@@ -1087,7 +1091,7 @@ mod tests {
         assert_eq!(l.stage_s(Stage::Eval).to_bits(), eval.to_bits());
         assert_eq!(l.unaccounted_s(), 0.0);
         let got = l.eval_check();
-        assert_eq!((got.slots, got.trade_floor_slots, got.full_passes, got.finite), (11, 4, 6, 2));
+        assert_eq!((got.slots, got.trade_floor_slots, got.bound_flat, got.full_passes, got.finite), (11, 4, 3, 6, 2));
         assert_eq!(got.seconds(), 1.75);
         let mut total = RunLedger::new();
         total.absorb(&l);
