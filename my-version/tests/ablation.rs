@@ -1,6 +1,9 @@
 //! Add-one-family ablation: arm definitions and manifests, placebo and
 //! permuted columns, scoring of a real run, and the ship/drop verdict.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::ablation::{self, Definition, SeedResult};
 use rcsr::data;
 use rcsr::devlog::Json;
@@ -10,7 +13,6 @@ use rcsr::rng::Mt;
 use rcsr::walkforward::Window;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::Command;
 
 fn definition() -> Definition {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../protocol/ablation.json");
@@ -438,7 +440,7 @@ fn one_range_without_purge_is_unchanged() {
     let def = dir.join("def.json");
     std::fs::write(&def, NULL_DEF).unwrap();
     let out = dir.join("prepared.csv");
-    let run = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let run = rcsr_cmd::rcsr()
         .args(["ablation", "prepare", "--definition", def.to_str().unwrap(), "--data", raw.to_str().unwrap(), "--time", "ts", "--group", "sym"])
         .args(["--keep", "y", "--seed", "3", "--purge-seconds", "0", "--out", out.to_str().unwrap()])
         .output()
@@ -453,7 +455,7 @@ const PINNED_ONE_RANGE_SHA256: &str = "bcd7b921418ae0fe5339195fa4b3aa4c158cf3c80
 fn prepare_cli(dir: &std::path::Path, data: &str, out: &str, extra: &[&str]) -> std::process::Output {
     let def = dir.join("def.json");
     std::fs::write(&def, NULL_DEF).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(["ablation", "prepare", "--definition", def.to_str().unwrap(), "--data", data, "--time", "ts", "--group", "sym"])
         .args(["--keep", "y", "--seed", "3", "--out", out])
         .args(extra)
@@ -653,7 +655,7 @@ fn search(data: &str, spec: &str, extra: &[&str]) -> std::process::Output {
         "--no-dev-log", "--seed", "3", "--generations", "15", "--pop", "32", "--metric", "squared", "--quiet",
     ];
     args.extend_from_slice(extra);
-    Command::new(env!("CARGO_BIN_EXE_rcsr")).args(&args).output().expect("run rcsr")
+    rcsr_cmd::rcsr().args(&args).output().expect("run rcsr")
 }
 
 #[test]
@@ -697,7 +699,7 @@ fn a_real_run_is_scored_on_the_folds_without_the_test_block_in_selection() {
     )
     .unwrap();
     let res = dir.join("A0-s3.result.json");
-    let score = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let score = rcsr_cmd::rcsr()
         .args([
             "ablation", "score", "--run", run_json.to_str().unwrap(), "--data", &data, "--target", "y", "--return-col", "r", "--time", "t",
             "--windows", windows.to_str().unwrap(), "--purge-seconds", "1800", "--out", res.to_str().unwrap(),
@@ -721,7 +723,7 @@ fn a_real_run_is_scored_on_the_folds_without_the_test_block_in_selection() {
     assert!(std::fs::read_to_string(&res).unwrap().contains("\"min_group_step_seconds\":900"), "the result carries the measured step");
     let overlap = dir.join("spec2700.json");
     std::fs::write(&overlap, std::fs::read_to_string(&spec).unwrap().replace("\"horizon_seconds\":900", "\"horizon_seconds\":2700")).unwrap();
-    let refused = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let refused = rcsr_cmd::rcsr()
         .args([
             "ablation", "score", "--run", run_json.to_str().unwrap(), "--data", &data, "--target", "y", "--return-col", "r", "--time", "t",
             "--windows", windows.to_str().unwrap(), "--purge-seconds", "1800", "--target-spec", overlap.to_str().unwrap(),
@@ -737,7 +739,7 @@ fn a_real_run_is_scored_on_the_folds_without_the_test_block_in_selection() {
     let plain = dir.join("plain.run.json");
     let out = search(&data, &spec, &["--json-out", plain.to_str().unwrap(), "--arm", "A0"]);
     assert_eq!(out.status.code(), Some(0));
-    let bad = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let bad = rcsr_cmd::rcsr()
         .args(["ablation", "score", "--run", plain.to_str().unwrap(), "--data", &data, "--target", "y", "--time", "t", "--windows", windows.to_str().unwrap(), "--out", dir.join("x.json").to_str().unwrap()])
         .output()
         .unwrap();
@@ -970,7 +972,7 @@ fn the_cli_verdict_reads_a_directory_of_result_files() {
     let def_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../protocol/ablation.json");
     let out = dir.join("verdict.json");
     let md = dir.join("verdict.md");
-    let run = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let run = rcsr_cmd::rcsr()
         .args(["ablation", "verdict", "--definition", def_path.to_str().unwrap(), "--results", dir.to_str().unwrap(), "--out", out.to_str().unwrap(), "--markdown", md.to_str().unwrap()])
         .output()
         .unwrap();
@@ -989,7 +991,7 @@ fn the_cli_plan_writes_manifests_to_a_directory() {
     header.extend(d.real_columns());
     std::fs::write(&data, header.join(",") + "\n").unwrap();
     let def_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../protocol/ablation.json");
-    let run = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let run = rcsr_cmd::rcsr()
         .args([
             "ablation", "plan", "--definition", def_path.to_str().unwrap(), "--data", data.to_str().unwrap(), "--target", "y", "--time", "ts",
             "--group", "sym", "--windows", "protocol/windows.csv", "--out", dir.join("out").to_str().unwrap(),
@@ -1003,7 +1005,7 @@ fn the_cli_plan_writes_manifests_to_a_directory() {
     }
     assert!(dir.join("out/commands.sh").exists() && dir.join("out/definition.json").exists());
     let missing = std::fs::write(&data, "ts,sym,y\n").and_then(|_| {
-        Ok(Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        Ok(rcsr_cmd::rcsr()
             .args([
                 "ablation", "plan", "--definition", def_path.to_str().unwrap(), "--data", data.to_str().unwrap(), "--target", "y", "--time", "ts",
                 "--windows", "w.csv", "--out", dir.join("out2").to_str().unwrap(),
@@ -1063,7 +1065,7 @@ fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
     let lb = Lockbox { start: T0 as i64 + 900 * 300, end: T0 as i64 + 900 * 400 };
     lockbox::write_sidecar(&data, &lb, "test").unwrap();
     let score = |res: &str| {
-        Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        rcsr_cmd::rcsr()
             .args([
                 "ablation", "score", "--run", run_json.to_str().unwrap(), "--data", &data, "--target", "y", "--return-col", "r",
                 "--time", "t", "--windows", windows.to_str().unwrap(), "--purge-seconds", "1800", "--out", res,
@@ -1097,7 +1099,7 @@ fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
     std::fs::write(&raw, csv).unwrap();
     lockbox::write_sidecar(raw.to_str().unwrap(), &lb, "test").unwrap();
     let prepared = dir.join("prepared.csv");
-    let prep = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let prep = rcsr_cmd::rcsr()
         .args([
             "ablation", "prepare", "--definition", def.to_str().unwrap(), "--data", raw.to_str().unwrap(), "--time", "ts", "--group", "sym",
             "--keep", "y", "--out", prepared.to_str().unwrap(),
@@ -1109,7 +1111,7 @@ fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
     let side = std::fs::read_to_string(lockbox::sidecar_path(prepared.to_str().unwrap())).unwrap();
     assert_eq!(sidecar_rows(prepared.to_str().unwrap()), [112, 488, 200, 0, 0], "{}", side);
     assert!(side.contains("\"purge_source\":\"protocol_default\""), "{}", side);
-    let found = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let found = rcsr_cmd::rcsr()
         .args([
             "--data", prepared.to_str().unwrap(), "--target", "y", "--vars", "b,f1,f2", "--time", "ts", "--split", "temporal", "--cpu",
             "--no-dev-log", "--seed", "3", "--generations", "3", "--pop", "16", "--quiet",
@@ -1124,7 +1126,7 @@ fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
     std::fs::copy(&raw, &raw2).unwrap();
     let prepared2 = dir.join("prepared2.csv");
     let range = format!("{},{}", lb.start, lb.end);
-    let prep2 = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let prep2 = rcsr_cmd::rcsr()
         .args([
             "ablation", "prepare", "--definition", def.to_str().unwrap(), "--data", raw2.to_str().unwrap(), "--time", "ts", "--group", "sym",
             "--keep", "y", "--out", prepared2.to_str().unwrap(), "--lockbox", &range,
@@ -1136,7 +1138,7 @@ fn a_declared_locked_test_is_refused_by_score_and_carried_by_prepare() {
     assert_eq!((stored.range, stored.also), (lockbox::protocol_default(), Some(lb)));
     let resolved = lockbox::resolve(None, prepared2.to_str().unwrap()).unwrap();
     assert_eq!(resolved.ranges(), vec![lockbox::protocol_default(), lb]);
-    let found = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let found = rcsr_cmd::rcsr()
         .args([
             "--data", prepared2.to_str().unwrap(), "--target", "y", "--vars", "b,f1,f2", "--time", "ts", "--split", "temporal", "--cpu",
             "--no-dev-log", "--seed", "3", "--generations", "3", "--pop", "16", "--quiet",
@@ -1172,7 +1174,7 @@ fn stale_sidecar_is_refused() {
     )
     .unwrap();
     let score = || {
-        Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        rcsr_cmd::rcsr()
             .args([
                 "ablation", "score", "--run", run_json.to_str().unwrap(), "--data", &data, "--target", "y", "--return-col", "r",
                 "--time", "t", "--windows", windows.to_str().unwrap(), "--purge-seconds", "1800", "--out", dir.join("o.json").to_str().unwrap(),
@@ -1263,7 +1265,7 @@ fn plan_cli(dir: &std::path::Path, data: &str, extra: &[&str]) -> String {
     )
     .unwrap();
     let out = dir.join("plan");
-    let o = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let o = rcsr_cmd::rcsr()
         .args(["ablation", "plan", "--definition", def.to_str().unwrap(), "--data", data, "--target", "lbl_y", "--time", "ts", "--group", "sym"])
         .args(["--windows", windows.to_str().unwrap(), "--out", out.to_str().unwrap()])
         .args(extra)
@@ -1306,7 +1308,7 @@ fn the_planned_lines_for_one_arm_and_seed_run_as_written() {
     for line in lines {
         let mut words = line.split_whitespace();
         assert_eq!(words.next(), Some("rcsr"));
-        let o = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(words).output().unwrap();
+        let o = rcsr_cmd::rcsr().args(words).output().unwrap();
         assert_eq!(o.status.code(), Some(0), "{line}\n{}", String::from_utf8_lossy(&o.stderr));
     }
 }

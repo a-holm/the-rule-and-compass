@@ -5,6 +5,9 @@
 //! train-only threshold, the purge check, pooled aggregation and the direct
 //! `.rcsb` path.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data;
 use rcsr::store;
 use rcsr::walkforward::{self, EvalSpec, Window};
@@ -664,7 +667,7 @@ fn the_cli_exits_2_on_overlapping_returns() {
     }
     std::fs::write(&data, csv).unwrap();
     let run = |horizon: &str| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        rcsr_cmd::rcsr()
             .args([
                 "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x",
                 "--time", "ts", "--horizon", horizon, "--cost-bps", "5", "--periods-per-year", "365",
@@ -691,7 +694,7 @@ fn device_pnl_is_refused_with_policy_band() {
     }
     std::fs::write(&data, csv).unwrap();
     let run = |extra: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        rcsr_cmd::rcsr()
             .args([
                 "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x",
                 "--time", "ts", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365",
@@ -724,7 +727,6 @@ fn device_pnl_is_refused_with_policy_band() {
 mod front {
     use rcsr::devlog::Json;
     use std::path::PathBuf;
-    use std::process::Command;
 
     use super::scratch::Scratch;
 
@@ -760,7 +762,7 @@ mod front {
     }
 
     fn rcsr(args: &[&str]) -> (i32, String, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().unwrap();
+        let out = super::rcsr_cmd::rcsr().args(args).output().unwrap();
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),

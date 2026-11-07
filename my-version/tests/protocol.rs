@@ -1,9 +1,11 @@
 //! Windows table, candidate ledger, sealed list and the one-read lockbox.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::lockbox::LOCKBOX_START;
 use rcsr::protocol::{self, Candidate, Ledger};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -106,7 +108,7 @@ fn ledger_seals_before_the_read_and_allows_one_read_per_candidate() {
     assert_eq!(ledger.record_read(&a.id, "locked-report-a", None).unwrap(), 1);
     // test_read:true cannot be read or selected again
     assert!(ledger.authorize_read(&sealed, &a.id, "data", "build", None).unwrap_err().contains("test_read:true"));
-    assert_eq!(ledger.read_report_sha(&a.id).as_deref(), Some("locked-report-a"));
+    assert_eq!(ledger.read_report_sha(&a.id).unwrap().as_deref(), Some("locked-report-a"));
     assert_eq!(ledger.record_read(&b.id, "locked-report-b", None).unwrap(), 2);
     assert_eq!(ledger.read_count().unwrap(), 2);
     let unread: Vec<String> = ledger.unread_candidates().unwrap().into_iter().map(|c| c.id).collect();
@@ -132,7 +134,7 @@ fn an_edited_ledger_breaks_the_chain() {
 }
 
 fn rcsr(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().unwrap();
+    let out = rcsr_cmd::rcsr().args(args).output().unwrap();
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -687,7 +689,7 @@ fn staged_write_crash_points_on_a_ledger_appended_under_the_lock() {
 }
 
 #[test]
-fn a_held_ledger_lock_delays_the_record_of_a_staged_write_without_deadlock() {
+fn a_staged_write_reaches_its_record_while_the_ledger_lock_is_held_and_completes_after_release() {
     use protocol::write_around_record;
     use std::sync::mpsc;
     let (_scratch, dir) = scratch("staged-lock");
@@ -716,8 +718,150 @@ fn a_held_ledger_lock_delays_the_record_of_a_staged_write_without_deadlock() {
     // staging finished without the ledger lock; only now is the lock released
     recorded_signal.recv().unwrap();
     assert!(!a.exists(), "the rename waits for the record, which waits for the lock");
+    // the lock is still held: an append that got through would show here. `concurrent_appenders_keep_one_chain_of_whole_lines` proves the lock itself.
+    assert_eq!(ledger.verify_chain().unwrap(), 1, "the ledger is unchanged while the lock is held");
+    assert_eq!(ledger.read_count().unwrap(), 0);
     holder.unlock().unwrap();
     assert_eq!(writer.join().unwrap().unwrap(), 1);
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "new a");
     assert_eq!(ledger.verify_chain().unwrap(), 2);
+}
+
+#[test]
+fn outputs_that_reach_one_file_are_refused_before_staging_or_recording() {
+    use protocol::write_around_record;
+    let (_scratch, dir) = scratch("same-file");
+    std::fs::create_dir(dir.join("b")).unwrap();
+    let a = dir.join("a.json");
+    std::fs::write(&a, "old").unwrap();
+    std::os::unix::fs::symlink(&a, dir.join("sym.json")).unwrap();
+    std::fs::hard_link(&a, dir.join("hard.json")).unwrap();
+    let others = [
+        dir.join(".").join("a.json"),
+        dir.join("b").join("..").join("a.json"),
+        dir.join("sym.json"),
+        dir.join("hard.json"),
+    ];
+    for other in others {
+        let called = std::cell::Cell::new(false);
+        let files: [(&Path, &[u8]); 2] = [(&a, b"x"), (&other, b"y")];
+        let err = write_around_record(&files, || { called.set(true); Ok(()) }, None).unwrap_err();
+        assert!(err.contains("same file"), "{}: {err}", other.display());
+        assert!(!called.get(), "{}", other.display());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "old");
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(!name.ends_with(".tmp"), "{name} left behind for {}", other.display());
+        }
+    }
+    // different files in one directory, and a target that does not exist yet, still work
+    let (c, d) = (dir.join("c.json"), dir.join("b").join("..").join("d.md"));
+    let files: [(&Path, &[u8]); 2] = [(&c, b"x"), (&d, b"y")];
+    write_around_record(&files, || Ok(()), None).unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("d.md")).unwrap(), "y");
+}
+
+/// A ledger of the given line bodies, each chained to the hash of the line before.
+fn chained_ledger(bodies: &[&str]) -> String {
+    let mut prev = ZERO.to_string();
+    let mut text = String::new();
+    for body in bodies {
+        let line = format!("{{\"prev\":\"{prev}\",{body}}}");
+        prev = rcsr::manifest::sha256_hex(line.as_bytes());
+        text.push_str(&line);
+        text.push('\n');
+    }
+    text
+}
+
+const FINAL_SEAL: &str = "\"event\":\"seal\",\"sealed_sha256\":\"aa\",\"final\":true,\"max_reads\":1,\"report_candidates\":false,\"test_read\":false";
+
+#[test]
+fn an_event_without_the_fields_a_read_depends_on_is_a_ledger_fault() {
+    let (_scratch, dir) = scratch("event-fields");
+    let path = dir.join("ledger.jsonl");
+    let faults: [(&str, &str); 21] = [
+        ("read_count", "\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"bb\",\"test_read\":true"),
+        ("read_count", "\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"bb\",\"read_count\":\"1\",\"test_read\":true"),
+        ("read_count", "\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"bb\",\"read_count\":1.5,\"test_read\":true"),
+        ("read_count", "\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"bb\",\"read_count\":-1,\"test_read\":true"),
+        ("read_count", "\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"bb\",\"read_count\":null,\"test_read\":true"),
+        ("id", "\"event\":\"test_read\",\"report_sha256\":\"bb\",\"read_count\":1,\"test_read\":true"),
+        ("id", "\"event\":\"test_read\",\"id\":\"\",\"report_sha256\":\"bb\",\"read_count\":1,\"test_read\":true"),
+        ("report_sha256", "\"event\":\"test_read\",\"id\":\"c\",\"read_count\":1,\"test_read\":true"),
+        ("report_sha256", "\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"\",\"read_count\":1,\"test_read\":true"),
+        ("report_sha256", "\"event\":\"baseline_read\",\"data_sha256\":\"dd\",\"test_read\":true"),
+        ("report_sha256", "\"event\":\"baseline_read\",\"data_sha256\":\"dd\",\"report_sha256\":\"\",\"test_read\":true"),
+        ("data_sha256", "\"event\":\"baseline_read\",\"report_sha256\":\"bb\",\"test_read\":true"),
+        ("sealed_sha256", "\"event\":\"seal\",\"final\":true,\"max_reads\":1,\"report_candidates\":false,\"test_read\":false"),
+        ("sealed_sha256", "\"event\":\"seal\",\"sealed_sha256\":\"\",\"test_read\":false"),
+        ("max_reads", "\"event\":\"seal\",\"sealed_sha256\":\"aa\",\"final\":true,\"report_candidates\":false,\"test_read\":false"),
+        ("max_reads", "\"event\":\"seal\",\"sealed_sha256\":\"aa\",\"final\":true,\"max_reads\":0,\"test_read\":false"),
+        ("max_reads", "\"event\":\"seal\",\"sealed_sha256\":\"aa\",\"final\":true,\"max_reads\":2.5,\"test_read\":false"),
+        ("max_reads", "\"event\":\"seal\",\"sealed_sha256\":\"aa\",\"final\":true,\"max_reads\":\"1\",\"test_read\":false"),
+        ("id", "\"event\":\"candidate\",\"spec_sha256\":\"s\",\"data_sha256\":\"d\",\"build_commit\":\"b\",\"report_sha256\":\"r\",\"test_read\":false,\"expression\":\"x\""),
+        ("id", "\"event\":\"candidate\",\"id\":\"\",\"spec_sha256\":\"s\",\"data_sha256\":\"d\",\"build_commit\":\"b\",\"report_sha256\":\"r\",\"test_read\":false,\"expression\":\"x\""),
+        ("read_count", "\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"bb\",\"read_count\":99999999999999999999,\"test_read\":true"),
+    ];
+    for (key, bad) in faults {
+        std::fs::write(&path, chained_ledger(&[FINAL_SEAL, bad])).unwrap();
+        let ledger = Ledger::new(&path);
+        let err = ledger.read_count().unwrap_err();
+        assert!(err.contains("line 2") && err.contains(&format!("without a valid {key}")), "{bad}: {err}");
+        assert!(ledger.events().is_err(), "{bad}");
+        let (code, _, err) = rcsr(&["protocol", "verify", "--ledger", &path_str(&path)]);
+        assert_eq!(code, 1, "{bad}: {err}");
+        assert!(err.contains(&format!("without a valid {key}")), "{bad}: {err}");
+    }
+}
+
+#[test]
+fn a_marker_line_without_its_head_or_report_is_refused() {
+    let (_scratch, dir) = scratch("marker-fields");
+    let data = path_str(&dir.join("d.csv"));
+    let ledger_path = dir.join("ledger.jsonl");
+    std::fs::write(&ledger_path, "").unwrap();
+    let ledger = Ledger::new(&ledger_path);
+    let abs = std::fs::canonicalize(&ledger_path).unwrap();
+    let marker = protocol::marker_path(&data);
+    let line = |head: Option<&str>, report: Option<&str>| {
+        let mut s = format!("{{\"ledger\":\"{}\"", abs.display());
+        if let Some(h) = head {
+            s.push_str(&format!(",\"ledger_head\":\"{h}\""));
+        }
+        s.push_str(",\"event\":\"test_read\"");
+        if let Some(r) = report {
+            s.push_str(&format!(",\"report_sha256\":\"{r}\""));
+        }
+        s.push_str("}\n");
+        s
+    };
+    std::fs::write(&marker, line(Some(ZERO), Some("bb"))).unwrap();
+    ledger.check_read_marker(&data).unwrap();
+    for bad in [line(Some(ZERO), None), line(None, Some("bb")), line(Some(ZERO), Some("")), line(Some(""), Some("bb"))] {
+        std::fs::write(&marker, &bad).unwrap();
+        let err = ledger.check_read_marker(&data).unwrap_err();
+        assert!(err.contains("malformed read marker line"), "{bad}: {err}");
+    }
+}
+
+#[test]
+fn a_stat_error_other_than_a_missing_file_refuses_the_output() {
+    use protocol::write_around_record;
+    use std::os::unix::fs::PermissionsExt;
+    let (_scratch, dir) = scratch("stat-error");
+    let locked = dir.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let probe = std::fs::metadata(locked.join("a.json"));
+    let target = locked.join("a.json");
+    let called = std::cell::Cell::new(false);
+    let files: [(&Path, &[u8]); 1] = [(&target, b"x")];
+    let result = write_around_record(&files, || { called.set(true); Ok(()) }, None);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(probe.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied, "the test needs a non-root user");
+    let err = result.unwrap_err();
+    assert!(err.contains("cannot stat") && err.contains("nothing was recorded"), "{err}");
+    assert!(!called.get());
+    assert_eq!(std::fs::read_dir(&locked).unwrap().count(), 0);
 }

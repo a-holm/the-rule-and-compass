@@ -5,6 +5,9 @@
 //! in which that row appears twice. That is only true when the weighted mean is
 //! normalised by `Σw`, which these tests pin down.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{self, Prepared, Sample, SplitSpec};
 use rcsr::expr::{constant, input, node, Node, Op};
 use rcsr::fit;
@@ -12,7 +15,7 @@ use rcsr::metrics::{self, score, score_weighted, Metric};
 use rcsr::rng::Mt;
 use rcsr::search::{self, Config};
 use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 fn approx(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol
@@ -49,7 +52,7 @@ fn rows(xs: &[f64]) -> Vec<Vec<f64>> {
 }
 
 fn cli(args: &[&str], input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let mut child = rcsr_cmd::rcsr()
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -377,6 +380,7 @@ fn a_weighted_search_still_recovers_a_clean_law() {
         seed: 1,
         metric: Metric::Absolute,
         ops: vec![Op::Add, Op::Sub, Op::Mul, Op::Div],
+        gpu: false,
         ..Default::default()
     };
     let out = search::run(&cfg, &p.train, &p.test);

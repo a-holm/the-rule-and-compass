@@ -32,7 +32,7 @@ struct Outcome {
 
 fn launch(kind: c_int) -> Option<Outcome> {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return None;
     }
     let mut out = [0 as c_int; 5];
@@ -142,7 +142,7 @@ fn child_probe() {
 #[test]
 fn opt_out_disables_the_check() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     // The test kernel never reads the argument, so it is safe to let it run.

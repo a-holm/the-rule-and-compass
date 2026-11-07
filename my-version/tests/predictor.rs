@@ -5,6 +5,9 @@
 //! covers the training set, and the full-data guarantee for the archive (which
 //! is what the report uses for `train_error`).
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::expr;
 use rcsr::metrics::Metric;
 use rcsr::search::{self, Config, Outcome};
@@ -33,6 +36,7 @@ fn config(seed: u32) -> Config {
         fit_iters: 5,
         patience: 0,
         seed,
+        gpu: false,
         ..Default::default()
     }
 }
@@ -134,7 +138,7 @@ fn predictor_samples_at_least_the_training_size_is_an_exact_no_op() {
 #[test]
 fn effective_subset_accepts_750_and_rejects_near_full_requests() {
     let train = sample(1500);
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
 
     for n in [750, 900] {
         cfg.predictor_samples = Some(n);
@@ -195,7 +199,7 @@ fn archive_errors_are_full_data_even_when_fitness_is_subsampled() {
 #[test]
 fn predictor_samples_below_two_is_a_usage_error() {
     for bad in ["0", "1", "-3", "abc"] {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        let out = rcsr_cmd::rcsr()
             .args(["--data", "/nonexistent", "--target", "y"])
             .arg("--predictor-samples")
             .arg(bad)

@@ -32,7 +32,7 @@ fn recovers_identity() {
     let train = sample(xs.clone(), g.clone());
     let test = sample(xs, g);
 
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
     cfg.generations = 60;
     cfg.pop = 120;
     cfg.islands = 1;
@@ -56,7 +56,7 @@ fn recovers_x_squared() {
     let train = sample(xs.clone(), ys.clone());
     let test = sample(xs, ys);
 
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
     cfg.generations = 300;
     cfg.pop = 200;
     cfg.islands = 2;
@@ -86,7 +86,7 @@ fn recovers_product_of_two_vars() {
     let train = sample(xs.clone(), ys.clone());
     let test = sample(xs, ys);
 
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
     cfg.generations = 300;
     cfg.pop = 200;
     cfg.islands = 2;
@@ -357,7 +357,7 @@ fn recovers_floor() {
     let train = sample(xs.clone(), ys.clone());
     let test = sample(xs, ys);
 
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
     cfg.generations = 300;
     cfg.pop = 200;
     cfg.islands = 2;
@@ -383,7 +383,7 @@ fn recovers_max() {
     let train = sample(xs.clone(), ys.clone());
     let test = sample(xs, ys);
 
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
     cfg.generations = 300;
     cfg.pop = 200;
     cfg.islands = 2;
@@ -534,7 +534,7 @@ fn recovers_piecewise_x_times_positive() {
     let train = sample(xs.clone(), ys.clone());
     let test = sample(xs, ys);
 
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
     cfg.generations = 400;
     cfg.pop = 200;
     cfg.islands = 2;

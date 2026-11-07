@@ -469,7 +469,11 @@ mod device {
     use rcsr::gpu::GpuEvaluator;
 
     fn device_available() -> bool {
-        rcsr::gpu::probe().available()
+        let present = rcsr::gpu::probe().available();
+        if !present {
+            rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+        }
+        present
     }
 
     fn columns(s: &Sample) -> (Vec<f32>, Vec<f32>, usize, usize) {
@@ -499,7 +503,7 @@ mod device {
     #[test]
     fn zero_weight_rows_are_skipped_before_the_program_runs() {
         if !device_available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let mut s = binary_sample(500, 0.4, 0.1, 22);
@@ -533,7 +537,7 @@ mod device {
     #[test]
     fn device_classification_scores_are_deterministic_and_weighted_by_sum_w() {
         if !device_available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let mut s = binary_sample(777, 0.3, 0.2, 23);
@@ -568,7 +572,7 @@ mod device {
     #[test]
     fn device_classification_scores_do_not_invert_the_cpu_ranking() {
         if !device_available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let s = binary_sample(1_500, 0.3, 0.15, 24);
@@ -653,7 +657,7 @@ fn bench_classification_fitness() {
     #[cfg(feature = "cuda")]
     {
         if !rcsr::gpu::probe().available() {
-            eprintln!("skipping GPU arm: no usable CUDA device");
+            rcsr::backend::skip_without_device("skipping GPU arm: no usable CUDA device");
             return;
         }
         let mut ev = device::evaluator(&train);

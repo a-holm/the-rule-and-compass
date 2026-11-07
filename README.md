@@ -406,7 +406,7 @@ exit checkpoint carries the exact f64 post-refit archive and its `archive_hash`
 beside the search archive (labelled `error_kind`). A `--time-budget` stop is
 resumable: `--resume` continues it and may set a new budget. The checkpoint
 records version, build commit, binary SHA-256, device, driver and threads;
-`--resume` refuses a mismatch unless `--allow-build-change` is given. It also refuses a different target spec (sha256 recorded in the checkpoint), exit 2. Saves are crash-safe: temp file, `fsync`, atomic rename,
+`--resume` refuses a mismatch unless `--allow-build-change` is given. A different CPU count (`threads`) is reported and never refused. It also refuses a different target spec (sha256 recorded in the checkpoint), exit 2. Saves are crash-safe: temp file, `fsync`, atomic rename,
 with the previous good generation kept as `run.rcsr.prev`. Saving does not
 consume randomness, so it cannot change the result. The saved search settings
 win on resume; only the generation budget may be raised, and data that does not
@@ -1330,7 +1330,7 @@ device, falls back to the CPU and records the reason. `--gpu` asserts that a
 device must exist (exit 2 otherwise), `--no-gpu`/`--cpu` forces the CPU without probing the device (no CUDA call), and
 `RCSR_GPU=0` simulates a missing device. `--dispatch device` (needs `--gpu`) forces the device route past the cost model; refusals still win. `--calibration anchors|probe|<path>` selects the rates Auto dispatch prices with (default: `$XDG_CACHE_HOME/rcsr/calibration.json` if it exists, else the fixed corpus anchors); `rcsr calibrate` writes that file and a search run never does. Non-quiet runs print one resource line
 with the backend, device, available threads and training rows/columns, and
-`--json` records `backend`, `backend_reason` and `device`.
+`--json` records `backend`, `backend_reason`, `device` and `device_probed` (`false` under `--cpu`, which does not probe).
 `RCSR_FIT_RECORD=<empty dir>` records every device fit launch for `rcsr-gpu-bench --fit-replay` (see `docs/gpu-backend.md`, "Comparing toolkits and fit kernel variants").
 `RCSR_DEVICE_PTR_CHECK=0` turns off the per-launch pointer check (#744): by default every kernel launch refuses an argument that is host memory (see `docs/gpu-backend.md`, "Kernel arguments are device memory").
 

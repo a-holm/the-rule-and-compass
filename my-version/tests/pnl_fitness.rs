@@ -1,11 +1,14 @@
 //! `--fitness pnl`: the exact long/flat regret book, the search wiring and the
 //! CLI refusals (#480).
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::TradingSlice;
 use rcsr::devlog::Json;
 use rcsr::trading::{self, FitnessBook, TradingRows, TradingSpec};
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 fn frac(v: f64) -> f64 {
     v - v.floor()
@@ -274,7 +277,7 @@ fn run(data: &str, spec: &str, extra: &[&str]) -> Output {
         "--cost-bps", "5", "--validation-frac", "0.3",
     ];
     args.extend_from_slice(extra);
-    Command::new(env!("CARGO_BIN_EXE_rcsr")).args(&args).output().expect("run rcsr")
+    rcsr_cmd::rcsr().args(&args).output().expect("run rcsr")
 }
 
 fn code(o: &Output) -> i32 {
@@ -376,7 +379,7 @@ fn fitness_pnl_refusals_name_their_reason() {
     let data = write_csv(&dir, 900);
     let spec = write_spec(&dir);
 
-    let no_objective = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let no_objective = rcsr_cmd::rcsr()
         .args([
             "--data", &data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal",
             "--target-spec", &spec, "--cpu", "--no-dev-log", "--generations", "2", "--fitness", "pnl",
@@ -584,7 +587,7 @@ fn run_fixed(data: &str, spec: &str, log: &std::path::Path, extra: &[&str]) -> O
         "--cost-bps", "5", "--validation-frac", "0.3", "--dev-log", &log, "--dev-log-level", "full",
         "--dev-log-every", "1",
     ];
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .args(extra)
         .output()

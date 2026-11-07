@@ -1,6 +1,9 @@
 //! `rcsr enrich` (issue #200): append-only feature enrichment, gap/causality
 //! rules, determinism across chunk sizes and the CPU/GPU cost model.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data;
 use rcsr::enrich::{self, GpuMode, OpClass, Options};
 use rcsr::ohlcv::{self, Bar, Timeframe};
@@ -3551,7 +3554,7 @@ fn enrich_writes_the_lockbox_embargo_and_the_lookback_of_every_feature() {
     write_store_with_flow(&src, &embargo_rows(400, 100, 160, false), 256);
     let (s, e) = (EMB_T0 + 100 * EMB_H, EMB_T0 + 160 * EMB_H);
     let range = format!("{s},{e}");
-    let run = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let run = rcsr_cmd::rcsr()
         .args([
             "enrich", "--data", &src, "--out", &out, "--cpu", "--features", "r24,vol_z2880,cusum_abs_z,mtf_1d_rsi",
             "--label", "long:1h,name=h1,fee=10,vol=20", "--locked-test", &range,
@@ -3822,7 +3825,7 @@ fn run_enrich_cli(
     extra: &[&str],
     cache_dir: &std::path::Path,
 ) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .arg("enrich")
         .args(["--data", data, "--out"])
         .arg(scratch.join(out_name))
@@ -3907,7 +3910,7 @@ fn enrich_json_records_rate_source() {
 fn flags_and_the_rates_schema_are_documented() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let rcsr = |args: &[&str]| {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().unwrap();
+        let out = rcsr_cmd::rcsr().args(args).output().unwrap();
         String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
     };
     let schema = rcsr(&["schema"]);
@@ -4108,7 +4111,7 @@ fn calibrate_spread_runs() {
         let file = dir.join(format!("cal-{n:02}.json"));
         let load = load_one_minute();
         let started = std::time::Instant::now();
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        let out = rcsr_cmd::rcsr()
             .args(["calibrate", "--out"])
             .arg(&file)
             .output()

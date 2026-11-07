@@ -1,6 +1,9 @@
 //! Data preparation: missing values, outliers, smoothing, normalisation and
 //! row filters (issue #2). Every default must reproduce the plain mean/std run.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{
     self, Center, FillMethod, Filter, PrepSpec, Scale, SplitMode, SplitSpec,
 };
@@ -8,8 +11,7 @@ use rcsr::expr;
 use rcsr::metrics::Metric;
 use rcsr::rng::Mt;
 use rcsr::search::{run, Config};
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn temporal(test_frac: f64) -> SplitSpec {
     SplitSpec {
@@ -374,7 +376,7 @@ fn median_fill_still_recovers_the_law() {
     assert_eq!(p.prep.rows_filled, 4);
     assert_eq!(p.prep.rows_dropped_missing, 0);
 
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
     cfg.generations = 300;
     cfg.pop = 200;
     cfg.islands = 2;
@@ -400,17 +402,14 @@ fn median_fill_still_recovers_the_law() {
 /// 1-based column.
 #[test]
 fn bad_filter_is_a_usage_error_with_the_column() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let mut child = rcsr_cmd::rcsr()
         .args(["--data", "-", "--target", "y", "--filter", "x > "])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(b"x,y\n1,2\n2,3\n4,5\n").unwrap();
-    }
+    rcsr_cmd::feed_stdin(&mut child, b"x,y\n1,2\n2,3\n4,5\n");
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
