@@ -100,7 +100,7 @@ fn slope(tree: &Node, s: &Sample) -> f64 {
 
 fn evaluator(s: &Sample) -> Option<GpuEvaluator> {
     if !probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return None;
     }
     let n = s.len();
@@ -831,7 +831,7 @@ fn slope_pair_mask_is_cleared_by_a_fit_data_upload() {
 #[test]
 fn slope_panel_run_fits_slope_on_the_device() {
     if !probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let sizes = [1usize, 2, 900, 1, 700, 1, 395];
@@ -896,7 +896,7 @@ fn level_and_slope(n: usize, seed: u64) -> Sample {
 #[test]
 fn slope_gpu_front_is_ranked_on_slope() {
     if !probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = level_and_slope(3_000, 31);
@@ -932,7 +932,7 @@ fn slope_gpu_front_is_ranked_on_slope() {
 #[ignore]
 fn bench_slope_fit_stage() {
     if !probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let rows: usize = std::env::var("RCSR_BENCH_ROWS")

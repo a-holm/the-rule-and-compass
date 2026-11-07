@@ -83,7 +83,7 @@ fn gpu_available() -> bool {
     if rcsr::gpu::probe().available() {
         true
     } else {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         false
     }
 }

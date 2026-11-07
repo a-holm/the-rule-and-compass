@@ -299,6 +299,7 @@ fn cuda_build_defaults_to_gpu_when_a_device_is_available() {
     // default; the fallback test above covers that case. `RCSR_GPU=1` is not
     // an "off" value, so the probe reads the real device.
     if !rcsr::backend::probe().available() {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
         return;
     }
     let (code, stdout, stderr) = run_cli(
@@ -342,6 +343,7 @@ fn cuda_build_defaults_to_gpu_when_a_device_is_available() {
 #[test]
 fn non_squared_metric_on_gpu_prints_the_reason_and_matches_the_cpu() {
     if !rcsr::backend::probe().available() {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
         return;
     }
     let common = [
@@ -460,6 +462,7 @@ fn recovered_law_and_reported_errors_agree_with_the_cpu_backend() {
 #[test]
 fn mixed_supported_and_unsupported_candidates_are_deterministic_and_reported() {
     if !rcsr::backend::probe().available() {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
         return;
     }
     let train = sample(48);
