@@ -97,6 +97,7 @@ fn config(seed: u32) -> Config {
         seed,
         metric: Metric::ImplicitDerivative,
         ops: vec![Op::Add, Op::Sub, Op::Mul, Op::Square],
+        gpu: false,
         ..Default::default()
     }
 }

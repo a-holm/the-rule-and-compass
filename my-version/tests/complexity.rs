@@ -241,7 +241,7 @@ fn a_custom_model_still_recovers_a_known_law() {
         pairs: None,
     };
 
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
     cfg.generations = 120;
     cfg.pop = 160;
     cfg.islands = 2;

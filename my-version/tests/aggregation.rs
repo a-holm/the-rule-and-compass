@@ -363,6 +363,7 @@ fn recovery_needs_a_dataset_aggregate() {
             Op::Agg(AggKind::Median),
             Op::Agg(AggKind::Count),
         ],
+        gpu: false,
         ..Default::default()
     };
     let out = run(&cfg, &train, &test);
@@ -434,6 +435,7 @@ fn recovery_of_the_standardisation_law() {
             Op::Agg(AggKind::Std),
             Op::Agg(AggKind::Median),
         ],
+        gpu: false,
         ..Default::default()
     };
     let out = run(&cfg, &train, &test);

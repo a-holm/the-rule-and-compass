@@ -56,6 +56,7 @@ fn config(simd: bool, ops: Vec<Op>) -> Config {
         seed: 27,
         ops,
         simd,
+        gpu: false,
         ..Default::default()
     }
 }

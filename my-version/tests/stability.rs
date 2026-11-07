@@ -34,6 +34,7 @@ fn small_config(seed: u32) -> Config {
         max_complexity: 10,
         seed,
         fit_iters: 8,
+        gpu: false,
         ..Default::default()
     }
 }

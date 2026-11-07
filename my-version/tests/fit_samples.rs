@@ -42,6 +42,7 @@ fn config(seed: u32) -> Config {
         fit_iters: 5,
         patience: 0,
         seed,
+        gpu: false,
         ..Default::default()
     }
 }
@@ -156,6 +157,7 @@ fn recovers_a_law_with_fit_samples() {
         metric: Metric::Squared,
         ops: vec![expr::Op::Add, expr::Op::Sub, expr::Op::Mul],
         fit_samples: 40,
+        gpu: false,
         ..Default::default()
     };
     let out = search::run(&cfg, &train, &test);

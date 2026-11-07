@@ -378,7 +378,7 @@ fn recovers_x1_and_not_x2() {
     .unwrap();
     assert!(p.train.x.iter().all(|r| r.iter().all(|v| *v == 0.0 || *v == 1.0)));
 
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
     cfg.generations = 80;
     cfg.pop = 300;
     cfg.islands = 2;
