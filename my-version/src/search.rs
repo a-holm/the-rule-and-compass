@@ -9957,7 +9957,7 @@ mod tests {
     /// any row count; the default and an explicit `gpu` arm stay screened.
     #[test]
     fn admit_all_admits_every_candidate_with_constants() {
-        let screened = Config { metric: crate::metrics::Metric::Squared, ..Config::default() };
+        let screened = Config { metric: Metric::Squared, ..Config::default() };
         let all = Config { fit_admission: crate::fit::FitAdmission::All, ..screened.clone() };
         for rows in [10, 1_500, 115_500, WIDE_ADMISSION_ROWS - 1] {
             assert!(!admits_all(&screened, rows), "{rows}");
