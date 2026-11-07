@@ -941,6 +941,7 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
             "--no-dedup" => cfg.dedup = false,
             "--no-front-parents" => cfg.front_parents = false,
             "--reject-constant-offspring" => cfg.reject_constant_offspring = true,
+            "--reject-fixed-position" => cfg.reject_fixed_position = true,
             "--no-simd" => cfg.simd = false,
             "--qd" => {
                 if cfg.qd_bins == 0 {
