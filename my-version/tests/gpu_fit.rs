@@ -7,6 +7,9 @@
 
 #![cfg_attr(not(feature = "cuda"), allow(dead_code, unused_imports))]
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::checkpoint::{Backend, Checkpoint};
 use rcsr::data::Sample;
 use rcsr::expr;
@@ -1234,7 +1237,7 @@ fn bench_end_to_end() {
 // message are what a user sees.
 
 fn rcsr(args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr_for(args)
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
@@ -1516,9 +1519,18 @@ fn cli_csv() -> String {
 }
 
 fn cli_json(extra: &[&str]) -> String {
+    cli_json_with(rcsr_cmd::rcsr_for(extra), extra)
+}
+
+/// A run on the default backend, for a test whose purpose is the device default.
+fn cli_json_on_device(extra: &[&str]) -> String {
+    cli_json_with(rcsr_cmd::rcsr_on_device(), extra)
+}
+
+fn cli_json_with(mut cmd: std::process::Command, extra: &[&str]) -> String {
     use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    use std::process::Stdio;
+    let mut child = cmd
         .args([
             "--data", "-", "--target", "y", "--vars", "x0,x1", "--islands", "1", "--pop", "30",
             "--generations", "3", "--seed", "1", "--patience", "0", "--json", "--no-dev-log",
@@ -1538,7 +1550,14 @@ fn cli_json(extra: &[&str]) -> String {
 /// The `fitting` object and the Pareto array of one `--json` run: everything
 /// the fit arm can change, without the wall-clock fields.
 fn cli_fit_and_front(extra: &[&str]) -> (String, String) {
-    let json = cli_json(extra);
+    fit_and_front(cli_json(extra))
+}
+
+fn cli_fit_and_front_on_device(extra: &[&str]) -> (String, String) {
+    fit_and_front(cli_json_on_device(extra))
+}
+
+fn fit_and_front(json: String) -> (String, String) {
     let fitting = json.split("\"fitting\":").nth(1).unwrap().split('}').next().unwrap().to_string();
     let front = json.split("\"pareto\":").nth(1).unwrap().to_string();
     (fitting, front)
@@ -1561,24 +1580,24 @@ fn default_run_resolves_to_the_gpu_arm_and_labels_every_other_resolution() {
         eprintln!("skipping GPU test: no usable CUDA device");
         return;
     }
-    let (fitting, _) = cli_fit_and_front(&["--metric", "squared"]);
+    let (fitting, _) = cli_fit_and_front_on_device(&["--metric", "squared"]);
     assert!(fitting.contains("\"strategy\":\"gpu\""), "{fitting}");
     assert!(fitting.contains("\"strategy_source\":\"default\""), "{fitting}");
     assert!(fitting.contains("\"strategy_reason\":\"admissible\""), "{fitting}");
 
-    let (fitting, _) = cli_fit_and_front(&["--metric", "squared", "--no-fit"]);
+    let (fitting, _) = cli_fit_and_front_on_device(&["--metric", "squared", "--no-fit"]);
     assert!(fitting.contains("\"strategy\":\"exact\""), "{fitting}");
     assert!(fitting.contains("\"strategy_reason\":\"no_fit\""), "{fitting}");
 
-    let (fitting, _) = cli_fit_and_front(&["--metric", "absolute"]);
+    let (fitting, _) = cli_fit_and_front_on_device(&["--metric", "absolute"]);
     assert!(fitting.contains("\"strategy\":\"exact\""), "{fitting}");
     assert!(fitting.contains("\"strategy_reason\":\"metric_not_least_squares\""), "{fitting}");
 
-    let (fitting, _) = cli_fit_and_front(&["--metric", "squared", "--fit-strategy", "auto"]);
+    let (fitting, _) = cli_fit_and_front_on_device(&["--metric", "squared", "--fit-strategy", "auto"]);
     assert!(fitting.contains("\"strategy\":\"gpu\""), "{fitting}");
     assert!(fitting.contains("\"strategy_source\":\"auto\""), "{fitting}");
 
-    let (fitting, _) = cli_fit_and_front(&["--metric", "squared", "--fit-strategy", "gpu"]);
+    let (fitting, _) = cli_fit_and_front_on_device(&["--metric", "squared", "--fit-strategy", "gpu"]);
     assert!(!fitting.contains("strategy_source"), "an explicit arm is never resolved: {fitting}");
 }
 

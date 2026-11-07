@@ -2,11 +2,14 @@
 //! data order and in the same group (issue #397), whatever the split does to
 //! the row order.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{self, SplitSpec};
 use rcsr::metrics::{self, Metric, SLOPE_MIN_PAIRS};
 use rcsr::rng::Mt;
 use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 /// Rows `id,g,x,y` with `x = id` so that a sample row maps back to its table
 /// row, and `g = id / group_len` as the group column.
@@ -96,7 +99,7 @@ fn score_uses_only_the_listed_pairs() {
 }
 
 fn run(args: &[&str], csv: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let mut child = rcsr_cmd::rcsr()
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

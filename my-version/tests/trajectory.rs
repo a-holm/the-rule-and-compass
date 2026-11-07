@@ -11,7 +11,9 @@
 //! re-measured; `squared` remains bit-identical and is pinned separately in
 //! `fit.rs`.
 
-use std::process::Command;
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -41,7 +43,7 @@ fn pinned_front(threads: Option<&str>) {
     let dir = Scratch::new("front");
     let out = dir.join("front.tsv");
     let data = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/clean.csv");
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let output = rcsr_cmd::rcsr()
         .args([
             "--data",
             data,

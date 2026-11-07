@@ -1,9 +1,11 @@
 //! `--dispatch auto|device` (#438): usage errors and documentation.
 
-use std::process::Command;
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 
 fn rcsr(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")

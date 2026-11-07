@@ -8,6 +8,9 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data;
 use rcsr::enrich::{self, GpuMode, Options};
 use rcsr::mtf_gpu;
@@ -508,7 +511,8 @@ fn a_forced_device_failure_warns_once_and_matches_the_cpu_bytes() {
     let off_out = dir.join("off.rcsb").to_string_lossy().into_owned();
     write_store(&src, &rows, 65_536);
     let run = |out: &str, gpu: &str, force: bool| {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"));
+        // The test runs the device MTF path.
+        let mut cmd = rcsr_cmd::rcsr_on_device();
         cmd.args(["enrich", "--data", &src, "--out", out, "--features", "mtf", "--allow-lockbox", "--gpu", gpu]);
         if force {
             cmd.env("RCSR_MTF_GPU_FORCE_TF_SECONDS", "900");

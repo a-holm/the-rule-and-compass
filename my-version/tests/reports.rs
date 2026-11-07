@@ -5,11 +5,14 @@
 //! and statistics tests call the library directly so they check the numerics,
 //! not just the Markdown scaffolding.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::expr::{self, constant, input, node, Op};
 use rcsr::{data, diagnostics, fit};
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -48,7 +51,7 @@ fn obj_get<'a>(items: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
 }
 
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")

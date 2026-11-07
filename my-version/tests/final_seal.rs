@@ -3,9 +3,11 @@
 //! selected candidate only. Fixtures are synthetic; the locked range is a
 //! stand-in in 2024.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::lockbox::{self, Lockbox};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// 2024-01-01T00:00:00Z.
 const T0: i64 = 1_704_067_200;
@@ -23,7 +25,7 @@ fn scratch(name: &str) -> (Scratch, PathBuf) {
 
 /// The children make no device call: `RCSR_GPU=0` skips even the startup device probe.
 fn rcsr(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).env("RCSR_GPU", "0").args(args).output().unwrap();
+    let out = rcsr_cmd::rcsr().args(args).output().unwrap();
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -682,17 +684,63 @@ fn walkforward_verify_read_needs_locked_test() {
     assert!(err.contains("--verify-read applies to --locked-test only"), "{}", err);
 }
 
+fn no_staged_files(dir: &Path, what: &str) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        assert!(!name.ends_with(".tmp"), "{name} left behind for {what}");
+    }
+}
+
 #[test]
 fn walkforward_refuses_outputs_that_name_one_file() {
     let (_scratch, dir, data, l, sealed) = sealed_store("wf-same-file");
     std::fs::create_dir(dir.join("b")).unwrap();
     let ledger_before = std::fs::read(&l).unwrap();
     let marker = format!("{}.locked_reads.jsonl", data);
-    let (out, md) = (s(&dir.join("a.json")), s(&dir.join("b").join("..").join("a.json")));
-    let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--out", &out, "--markdown", &md]);
-    assert_eq!(code, 3, "{}", err);
-    assert!(err.contains("same file"), "{}", err);
-    assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
-    assert!(!Path::new(&marker).exists());
-    assert!(!dir.join("a.json.tmp").exists());
+    let out = dir.join("a.json");
+    let forms = [
+        dir.join(".").join("a.json"),
+        dir.join("b").join("..").join("a.json"),
+    ];
+    for md in forms {
+        let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--out", &s(&out), "--markdown", &s(&md)]);
+        assert_eq!(code, 3, "{}: {}", md.display(), err);
+        assert!(err.contains("same file"), "{}", err);
+        assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+        assert!(!Path::new(&marker).exists());
+        assert!(!out.exists());
+        no_staged_files(&dir, &md.display().to_string());
+    }
+    // a symlink and a hard link to an existing output
+    std::fs::write(&out, "old").unwrap();
+    std::os::unix::fs::symlink(&out, dir.join("sym.md")).unwrap();
+    std::fs::hard_link(&out, dir.join("hard.md")).unwrap();
+    for md in ["sym.md", "hard.md"] {
+        let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--out", &s(&out), "--markdown", &s(&dir.join(md))]);
+        assert_eq!(code, 3, "{md}: {err}");
+        assert!(err.contains("same file"), "{md}: {err}");
+        assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+        assert!(!Path::new(&marker).exists());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "old");
+        no_staged_files(&dir, md);
+    }
+}
+
+#[test]
+fn walkforward_refuses_a_ledger_event_without_a_valid_read_count() {
+    let (_scratch, dir, data, l, sealed) = sealed_store("wf-bad-count");
+    let marker = format!("{}.locked_reads.jsonl", data);
+    let text = std::fs::read_to_string(&l).unwrap();
+    let head = rcsr::manifest::sha256_hex(text.lines().last().unwrap().as_bytes());
+    let bad = format!("{{\"prev\":\"{head}\",\"event\":\"test_read\",\"id\":\"zz\",\"report_sha256\":\"bb\",\"test_read\":true}}\n");
+    std::fs::write(&l, format!("{text}{bad}")).unwrap();
+    let ledger_before = std::fs::read(&l).unwrap();
+    let out = s(&dir.join("report.json"));
+    for extra in [vec!["--out", out.as_str()], vec!["--out", out.as_str(), "--verify-read"]] {
+        let (code, _, err) = read(&data, &l, &sealed, &["x"], &extra);
+        assert_eq!(code, 3, "{}", err);
+        assert!(err.contains("line 3 is a test_read event without a valid read_count"), "{}", err);
+        assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+        assert!(!Path::new(&marker).exists() && !Path::new(&out).exists());
+    }
 }

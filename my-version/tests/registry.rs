@@ -1,6 +1,9 @@
 //! #260: feature registry, schema sidecar, family-stratified views, the
 //! group-by-group store writer, the time-major family append and the lag menu.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{self, LagSpec, TimeSpec};
 use rcsr::enrich::{self, Options};
 use rcsr::panel_append::{self, AppendOptions};
@@ -169,7 +172,7 @@ fn an_unknown_vars_name_exits_nonzero_with_the_registry_name_and_family() {
     store::write_store_with_time(&twin, &t2, 64, Some(0)).unwrap();
     registry::write_schema(&twin, "2").unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args([
             "--data", &twin, "--target", "close", "--vars", "r16,vol21", "--time", "ts",
             "--group-by", "symbol", "--generations", "1", "--pop", "8", "--cpu",
@@ -223,7 +226,7 @@ fn project_on_a_200_column_store_records_the_view_in_the_manifest() {
     let (_scratch, dir) = tmp_dir("project");
     let (p, _) = registry_store(&dir, 200, 256, "wide.rcsb");
     let run = |view: &str, manifest: &str| {
-        let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        let out = rcsr_cmd::rcsr()
             .args([
                 "--data", &p, "--target", "y", "--project", "24", "--view", view, "--time", "ts",
                 "--group-by", "symbol", "--generations", "1", "--pop", "8", "--seed", "5", "--cpu",
@@ -743,7 +746,7 @@ fn lags_and_lag_set_report_nvars_on_the_command_line() {
             "--generations", "1", "--pop", "8", "--cpu",
         ];
         args.extend_from_slice(extra);
-        Command::new(env!("CARGO_BIN_EXE_rcsr")).args(&args).output().unwrap()
+        rcsr_cmd::rcsr().args(&args).output().unwrap()
     };
     let menu = run(&["--lag-set", "1,4,24,96"]);
     assert!(menu.status.success(), "{}", String::from_utf8_lossy(&menu.stderr));
@@ -901,7 +904,7 @@ fn a_duplicate_name_fails_before_any_column_is_read() {
     assert!(!std::path::Path::new(&path(&f.dir, "scratch")).exists(), "scratch dir created before the name check");
     assert!(!std::path::Path::new(&path(&f.dir, "out.rcsb")).exists());
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args(["panel", "append", "--data", &f.panel, "--family", &f.family, "--columns", "close,r4,volume", "--out"])
         .arg(path(&f.dir, "cli.rcsb"))
         .output()
@@ -970,7 +973,7 @@ fn all_resolves_to_the_family_columns_the_panel_lacks() {
     assert!(want.contains(&"r4".to_string()));
     assert_eq!(panel_append::resolve_all(&panel, &family), want);
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args(["panel", "append", "--data", &f.panel, "--family", &f.family, "--columns", "@all", "--out"])
         .arg(path(&f.dir, "all.rcsb"))
         .output()
@@ -1122,7 +1125,7 @@ fn project_refuses_a_store_with_fewer_candidate_columns_than_requested() {
     assert!(registry::select_view(&thirty, 30, 11, 0).is_ok());
     let (_scratch, dir) = tmp_dir("shortfall");
     let (p, _) = registry_store(&dir, 30, 64, "short.rcsb");
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args(["--data", &p, "--target", "y", "--project", "48", "--time", "ts", "--group-by", "symbol", "--cpu"])
         .output()
         .unwrap();
