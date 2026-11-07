@@ -1013,6 +1013,9 @@ pub struct RunFacts {
 
 pub fn parse_run(text: &str) -> Result<RunFacts, String> {
     let j = Json::parse(text.trim()).ok_or_else(|| "run.json is not valid JSON".to_string())?;
+    if matches!(j.get("interim"), Some(Json::Bool(true))) {
+        return Err(crate::run_json::INTERIM_REFUSAL.to_string());
+    }
     let ab = j.get("ablation").ok_or_else(|| "run.json has no 'ablation' object: run with --arm".to_string())?;
     let variables = str_list(&j, "variables")?;
     let hash = req_str(ab, "feature_list_sha256")?;
@@ -1960,7 +1963,10 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 None => fl.need("--run")?,
             };
             let run_text = std::fs::read_to_string(run_path).map_err(|e| io_err(run_path, e))?;
-            let facts = parse_run(&run_text).map_err(|e| (3, format!("{}: {}", run_path, e)))?;
+            let facts = parse_run(&run_text).map_err(|e| {
+                let exit = if e == crate::run_json::INTERIM_REFUSAL { 2 } else { 3 };
+                (exit, format!("{}: {}", run_path, e))
+            })?;
             let book = match from_run {
                 Some(_) => {
                     for flag in ["--thresholds", "--headline-threshold", "--target-spec"] {
