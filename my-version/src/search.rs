@@ -4191,6 +4191,7 @@ fn score_tree_checked_work(tree: &Node, data: &EvalSample, cfg: &Config) -> (f64
     let book = cfg.fitness.book();
     let modelled = !s.is_multi()
         && !s.is_empty()
+        && s.x.len() == s.len()
         && s.w.is_empty()
         && match book {
             Some(b) => b.len() == s.len(),
@@ -12728,6 +12729,24 @@ mod tests {
         let view = EvalSample::new(&weighted, &cfg);
         let (got, work) = score_tree_checked_work(&input(2), &view, &cfg);
         assert_eq!((got.to_bits(), work), (score_tree(&input(2), &view, &cfg).to_bits(), CheckWork::default()), "weights take score_tree");
+    }
+
+    /// #896: a sample whose `x` has one row more than `y` is not modelled by the
+    /// checked pass: both paths give `+inf`.
+    #[test]
+    fn checked_score_takes_score_tree_when_x_and_y_differ() {
+        let (s, cfg) = checked_fixture(1, 1, false);
+        let mut x = s.x.clone();
+        x.push(x[0].clone());
+        let odd = Sample { x, ..s.clone() };
+        assert_eq!(odd.x.len(), 40_001);
+        assert_eq!(odd.y.len(), 40_000);
+        let view = EvalSample::new(&odd, &cfg);
+        let tree = input(0);
+        assert_eq!(score_tree(&tree, &view, &cfg), f64::INFINITY);
+        let (got, work) = score_tree_checked_work(&tree, &view, &cfg);
+        assert_eq!(got.to_bits(), f64::INFINITY.to_bits());
+        assert_eq!(work, CheckWork::default());
     }
 
     /// A run clock for the device searches built in tests (a clock read inside a
