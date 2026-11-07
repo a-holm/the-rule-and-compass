@@ -133,7 +133,7 @@ fn check(plan: &str, root: &Path) -> Vec<String> {
             }
         };
         if l.test == "*" {
-            if lines.iter().any(|o| o.binary == l.binary && o.test != "*" && !(l.mode == "app-only" && o.mode == "skip")) {
+            if lines.iter().any(|o| o.binary == l.binary && o.test != "*" && !(l.mode == "app-only" && (o.mode == "skip" || o.mode == "api-errors-no"))) {
                 errors.push(format!("line {}: '{}' has both '*' and named lines", l.no, l.binary));
             }
             continue;
@@ -280,8 +280,159 @@ fn the_gpu_bench_binary_runs_under_memcheck_with_the_smallest_arguments() {
 fn an_app_only_binary_may_skip_named_tests_and_nothing_else_mixes_with_star() {
     let ok = "dispatch_reproducible * app-only reason\ndispatch_reproducible a_calibrated_file_gives_equal_fronts_and_its_own_hash skip reason\n";
     assert_eq!(check(ok, &root()), Vec::<String>::new());
-    let bad = "dispatch_reproducible * app-only reason\ndispatch_reproducible a_calibrated_file_gives_equal_fronts_and_its_own_hash api-errors-no reason\n";
+    let bad = "dispatch_reproducible * app-only reason\ndispatch_reproducible a_calibrated_file_gives_equal_fronts_and_its_own_hash no-cuda reason\n";
     assert_eq!(check(bad, &root()).len(), 1);
     let bad = "dispatch_reproducible * no-cuda reason\ndispatch_reproducible a_calibrated_file_gives_equal_fronts_and_its_own_hash skip reason\n";
     assert_eq!(check(bad, &root()).len(), 1);
+}
+
+const SPAWN_CALLS: &[&str] = &["Command::new", "rcsr_cmd::rcsr(", "rcsr_cmd::rcsr_bench(", "rcsr_cmd::rcsr_on_device(", "rcsr_cmd::rcsr_for("];
+const PROCESS_METHODS: &[&str] = &[".spawn()", ".output()", ".status()"];
+
+/// The text of a test binary and of the `#[path]` modules it includes, without the shared child helper.
+fn binary_text(file: &Path) -> String {
+    let source = fs::read_to_string(file).expect("read test source");
+    let dir = file.parent().expect("test dir");
+    let mut text = source.clone();
+    for line in source.lines() {
+        let Some(rel) = line.trim().strip_prefix("#[path = \"").and_then(|r| r.strip_suffix("\"]")) else { continue };
+        let module = dir.join(rel);
+        if module.file_name().is_some_and(|n| n == "rcsr.rs") || !module.is_file() || !module.starts_with(dir) {
+            continue;
+        }
+        text.push_str(&fs::read_to_string(&module).expect("read test module"));
+    }
+    text
+}
+
+fn without_strings(line: &str) -> String {
+    let mut out = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in line.chars() {
+        if in_string {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_string = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            in_string = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn spawns_a_process(text: &str) -> bool {
+    let code: Vec<String> =
+        text.lines().filter(|l| !l.trim_start().starts_with("//")).map(without_strings).collect();
+    let names_a_command = code.iter().any(|l| l.contains("Command"));
+    code.iter().any(|l| {
+        SPAWN_CALLS.iter().any(|t| l.contains(t)) || (names_a_command && PROCESS_METHODS.iter().any(|t| l.contains(t)))
+    })
+}
+
+/// Test executables and the source text that decides whether they spawn: each `tests/<name>.rs` with its `#[path]` modules,
+/// `lib` (every file of src/ outside src/bin and main.rs), `bin-<name>` (src/main.rs is `bin-rcsr`, src/bin/<x>.rs is `bin-<x>`).
+fn spawn_units(root: &Path) -> Vec<(Vec<String>, String)> {
+    let mut units = Vec::new();
+    let mut files = Vec::new();
+    rust_files(&root.join("tests"), &mut files);
+    files.sort();
+    for f in files.into_iter().filter(|f| f.parent() == Some(&root.join("tests"))) {
+        let name = f.file_stem().expect("stem").to_string_lossy().to_string();
+        units.push((vec![name], binary_text(&f)));
+    }
+    let src = root.join("src");
+    let mut lib = String::new();
+    let mut srcs = Vec::new();
+    if src.is_dir() {
+        rust_files(&src, &mut srcs);
+    }
+    srcs.sort();
+    for f in srcs {
+        let text = fs::read_to_string(&f).expect("read source");
+        if f == src.join("main.rs") {
+            units.push((vec!["bin-rcsr".to_string()], text));
+        } else if f.parent() == Some(&src.join("bin")) {
+            let stem = f.file_stem().expect("stem").to_string_lossy().to_string();
+            units.push((vec![format!("bin-{stem}"), format!("bin-{}", stem.replace('_', "-"))], text));
+        } else if !f.starts_with(src.join("bin")) {
+            lib.push_str(&text);
+        }
+    }
+    units.push((vec!["lib".to_string()], lib));
+    units
+}
+
+/// Every test executable that spawns a process needs a `*` line that runs it with `--target-processes application-only` or not at all.
+fn spawners_not_app_only(plan: &str, root: &Path) -> Vec<String> {
+    let lines = parse(plan).expect("plan parses");
+    let mut bad = Vec::new();
+    for (names, text) in spawn_units(root) {
+        if !spawns_a_process(&text) {
+            continue;
+        }
+        let ok = lines.iter().any(|l| {
+            names.contains(&l.binary) && l.test == "*" && ["skip", "no-cuda-app-only", "app-only"].contains(&l.mode.as_str())
+        });
+        if !ok {
+            bad.push(names[0].clone());
+        }
+    }
+    bad
+}
+
+#[test]
+fn a_binary_that_spawns_processes_never_runs_under_target_processes_all() {
+    let bad = spawners_not_app_only(PLAN, &root());
+    assert!(
+        bad.is_empty(),
+        "these binaries spawn processes and need a skip, no-cuda-app-only or app-only star line (compute-sanitizer crashes while it tracks a process tree): {bad:#?}"
+    );
+}
+
+#[test]
+fn an_app_only_binary_may_also_name_api_errors_no_tests() {
+    let ok = "gpu_ring * app-only reason\ngpu_ring stale_cuda_error_does_not_fail_the_transport api-errors-no reason\n";
+    assert_eq!(check(ok, &root()), Vec::<String>::new());
+}
+
+#[test]
+fn a_spawning_binary_needs_an_application_only_star_line() {
+    let scratch = Scratch::new("sanspawn");
+    let dir = scratch.path();
+    fs::create_dir_all(dir.join("tests")).unwrap();
+    fs::write(dir.join("tests/runs.rs"), "fn t() { std::process::Command::new(\"true\").output().unwrap(); }\n").unwrap();
+    fs::write(dir.join("tests/quiet.rs"), "// Command::new in a comment\nfn t() { let s = \"Command::new\"; }\n").unwrap();
+    for plan in ["runs * no-cuda why\n", "runs * run-bin --x\n", "runs t skip why\n", ""] {
+        assert_eq!(spawners_not_app_only(plan, &dir), vec!["runs".to_string()], "plan {plan:?}");
+    }
+    for mode in ["skip", "no-cuda-app-only", "app-only"] {
+        assert!(spawners_not_app_only(&format!("runs * {mode} why\n"), &dir).is_empty(), "{mode}");
+    }
+}
+
+#[test]
+fn the_spawn_detector_ignores_strings_comments_and_plain_output_methods() {
+    assert!(!spawns_a_process("let s = \"Command::new\";\n// Command::new(x)\nlet y = gpu.output();"));
+    assert!(spawns_a_process("use std::process::Command;\nlet o = c.output();"));
+    assert!(spawns_a_process("let c = rcsr_cmd::rcsr_for(&a);"));
+}
+
+#[test]
+fn src_unit_tests_that_spawn_need_an_application_only_line() {
+    let scratch = Scratch::new("sansrc");
+    let dir = scratch.path();
+    fs::create_dir_all(dir.join("src/bin")).unwrap();
+    fs::create_dir_all(dir.join("tests")).unwrap();
+    fs::write(dir.join("src/lib.rs"), "pub fn g() { std::process::Command::new(\"git\").output().ok(); }\n").unwrap();
+    fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(dir.join("src/bin/tool_x.rs"), "fn main() { std::process::Command::new(\"x\").status().ok(); }\n").unwrap();
+    assert_eq!(spawners_not_app_only("", &dir), vec!["bin-tool_x".to_string(), "lib".to_string()]);
+    assert!(spawners_not_app_only("lib * app-only why\nbin-tool-x * no-cuda-app-only why\n", &dir).is_empty());
+    assert!(spawners_not_app_only("lib * skip why\nbin-tool_x * app-only why\n", &dir).is_empty());
 }
