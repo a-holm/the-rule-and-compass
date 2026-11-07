@@ -24,6 +24,7 @@ rcsr --data examples/line.csv --target y --vars x \
 | `--save-every <N>` | generation interval for `--save` (default `25`, requires `--save`). A checkpoint is also written when 15 minutes of wall time have passed since the last one (#256; `RCSR_CHECKPOINT_INTERVAL_S` overrides the 900 s). |
 | `--resume <file>` | continue from a checkpoint, refusing a data or backend mismatch |
 | `--allow-backend-change` | permit a CPU↔GPU resume, recorded on stderr and in the run manifest |
+| `--interim-chunk` | #855: a chunk that stops on `--time-budget` saves its state and skips the end-of-run report. Needs `--save` and `--time-budget`. See [Interim chunks](#interim-chunks) |
 
 A checkpoint is written at a **generation boundary**, after the generation's
 evolution, migration and island restarts have all completed. The final write on
@@ -41,6 +42,24 @@ fault-injection test in `tests/checkpoint.rs` proves this.
 `--save` and `--resume` apply to the main search. Auxiliary searches
 (`--cv`, `--stability`, `--null-runs`, `--report benchmark`) are reported as
 usual but are not checkpointed.
+
+## Interim chunks
+
+A search run in chunks (`--time-budget` per process, `--resume` between them) pays the end-of-run report at every chunk end, although only the last report is read. The saved state is captured before the report, so the report cannot change the next chunk. `--interim-chunk` skips it.
+
+When a chunk stops on `--time-budget` under `--interim-chunk`:
+
+- The checkpoint is written with the search state and no `final` archive.
+- The exact finalist refit, prune, test scoring, baselines, diagnostics, gates, QD refit and the report do not run.
+- `--json-out` receives a short document: `tool`, `version`, `interim` (`true`), `backend`, `backend_reason`, `device`, `threads`, `seed`, `stop_reason` (`time_budget`), `generations_run`, `elapsed_seconds`, `timing`, `gpu` and `checkpoint`. It has no `pareto` array.
+- The development log `run_end` and the run manifest carry `interim true`. Its archive fields describe the search archive, not a reported front.
+- `rcsr walkforward --from-run`, `--front` and every other reader of a result file refuse the short document by name (exit 2 for `--from-run`). `rcsr verify-manifest` refuses an interim manifest with exit 2.
+
+A chunk that stops for another reason (`generations`, `patience`, `solved`, `front_stable`) is the last one in fact and writes the full report. The flag is an execution setting: it is not saved and not part of the config hash.
+
+The last chunk is run without the flag. Its checkpoint, archive and `run.json` equal those of the same chunks run without the flag, apart from timing fields. `tests/checkpoint.rs` pins the checkpoint bytes and the report across interim chunks, plain chunks and one uninterrupted run.
+
+If the run stops early and the last chunk was an interim chunk, no report exists. `rcsr ... --resume <file> --time-budget 0` without `--interim-chunk` runs one more generation and writes the full report.
 
 ## Format, version 1
 

@@ -377,3 +377,41 @@ fn postfix_run_ledger_closes_exactly() {
         g.ledger
     );
 }
+
+/// #855: on the flat path, interim chunks skip the exact rebuild and the last
+/// chunk still reports the archive and checkpoint of the plain chunks.
+#[test]
+fn interim_chunks_keep_the_final_hash_on_the_flat_path() {
+    let data = sample(160);
+    let base = cfg(VariationMode::Postfix, 1, 4096, 5);
+    let chain = |interim: bool| {
+        let mut saved: Option<rcsr::checkpoint::Checkpoint> = None;
+        for k in 1..=2usize {
+            let mut leg = base.clone();
+            leg.time_budget = Some(0.0);
+            leg.interim_chunk = interim;
+            let mut text: Option<String> = None;
+            let out = search::run_resumable(&leg, &data, &data, saved.take(), 0, |cp| {
+                text = Some(cp.to_text());
+            })
+            .expect("chunk");
+            assert_eq!(out.stop_reason, "time_budget");
+            assert_eq!(out.generations, k);
+            assert_eq!(out.interim, interim);
+            assert_eq!(out.test_errors.is_empty(), interim);
+            let cp = rcsr::checkpoint::Checkpoint::from_text(&text.expect("checkpoint")).unwrap();
+            assert_eq!(cp.final_archive.is_none(), interim);
+            saved = Some(cp);
+        }
+        let mut text: Option<String> = None;
+        let last = search::run_resumable(&base, &data, &data, saved, 0, |cp| text = Some(cp.to_text()))
+            .expect("last chunk");
+        assert!(!last.interim);
+        (last, text.expect("checkpoint"))
+    };
+    let (plain, plain_text) = chain(false);
+    let (interim, interim_text) = chain(true);
+    assert_eq!(describe(&plain), describe(&interim));
+    assert_eq!(plain.archive.hash(), interim.archive.hash());
+    assert_eq!(plain_text, interim_text, "flat-path exit checkpoint bytes");
+}

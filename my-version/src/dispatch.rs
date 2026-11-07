@@ -562,6 +562,11 @@ pub struct Calibration {
     /// Enrich planner rates measured by `rcsr calibrate`; `None` for a host-only
     /// file, a `/1` file or an anchor. Only `rcsr enrich` reads them.
     pub enrich: Option<crate::enrich::EnrichCalibration>,
+    /// One-minute load average when `rcsr calibrate` started and when it
+    /// ended; `None` for an anchor, a file without the fields or a host
+    /// without `/proc/loadavg`. No rate and no route reads them.
+    pub load1_start: Option<f64>,
+    pub load1_end: Option<f64>,
 }
 
 impl Default for Calibration {
@@ -584,8 +589,28 @@ impl Default for Calibration {
             source: "anchors",
             device_source: "anchor",
             enrich: None,
+            load1_start: None,
+            load1_end: None,
         }
     }
+}
+
+/// Spread (largest sample over smallest) above which a fitted term is noisy.
+pub const NOISY_SPREAD: f64 = 1.5;
+
+/// The one-minute load average, the first field of `/proc/loadavg`.
+pub fn read_load1() -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/loadavg").ok()?;
+    text.split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+/// Load above which a probe is called suspect: half the CPUs of this process.
+pub fn load_limit() -> f64 {
+    std::thread::available_parallelism().map_or(1, |n| n.get()) as f64 / 2.0
 }
 
 impl Calibration {
@@ -645,6 +670,63 @@ impl Calibration {
         self.probe_s += rates.probe_s;
         self.device_source = "probe";
         self
+    }
+
+    /// Every probed term whose spread is above [`NOISY_SPREAD`], with the spread.
+    pub fn noisy_terms(&self) -> Vec<(String, f64)> {
+        let mut terms: Vec<(String, f64)> = vec![
+            ("r_eval".to_string(), self.spread.r_eval),
+            ("r_fit".to_string(), self.spread.r_fit),
+            ("bw".to_string(), self.spread.bw),
+            ("launch_s".to_string(), self.spread.launch_s),
+            ("cpu_eval".to_string(), self.spread.cpu_eval),
+        ];
+        if let Some(e) = &self.enrich {
+            terms.push(("context_ms_per_mrow".to_string(), e.spread_context));
+            for op in crate::enrich::OpClass::ALL {
+                terms.push((op.name().to_string(), e.spread_classes[op.index()]));
+            }
+        }
+        terms.retain(|(_, spread)| *spread > NOISY_SPREAD);
+        terms
+    }
+
+    /// The text of the load and noise note, or `None` when the probe ran at
+    /// a load below [`load_limit`] and every term is quiet.
+    pub fn probe_warning(&self) -> Option<String> {
+        let limit = load_limit();
+        let over = self.load1_start.filter(|l| *l > limit);
+        let noisy = self.noisy_terms();
+        if over.is_none() && noisy.is_empty() {
+            return None;
+        }
+        let load = match (over, self.load1_start) {
+            (Some(l), _) => format!("measured under load {:.2} (limit {:.2})", l, limit),
+            (None, Some(l)) => format!("load {:.2} (limit {:.2})", l, limit),
+            (None, None) => "load not recorded".to_string(),
+        };
+        let terms = if noisy.is_empty() {
+            "none".to_string()
+        } else {
+            noisy
+                .iter()
+                .map(|(name, spread)| format!("{} {:.2}", name, spread))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        Some(format!("{}; noisy terms: {}", load, terms))
+    }
+
+    /// The note for a search that prices with a file measured under load, or
+    /// `None` when the file records no load or a load below [`load_limit`].
+    pub fn load_notice(&self) -> Option<String> {
+        let limit = load_limit();
+        self.load1_start.filter(|l| *l > limit).map(|l| {
+            format!(
+                "measured under load {:.2} (limit {:.2}); bw, launch_s, cpu_eval and the enrich rates are suspect",
+                l, limit
+            )
+        })
     }
 
     /// True when every rate is finite and positive.
@@ -1316,7 +1398,7 @@ fn with_origin_fields(mut json: String, origin: Option<&FileOrigin>) -> String {
 }
 
 /// Text of `rcsr calibrate --help`.
-pub const CALIBRATE_USAGE: &str = "rcsr calibrate [--out <path>] [--gpu | --cpu] [--no-enrich]
+pub const CALIBRATE_USAGE: &str = "rcsr calibrate [--out <path>] [--gpu | --cpu] [--no-enrich] [--strict]
 
 Time this machine once and write the calibration file that Auto dispatch
 and `rcsr enrich --gpu auto` route from (schema rcsr-calibration/2). The file
@@ -1330,6 +1412,16 @@ is written atomically.
   --no-enrich    skip the enrich planner probe (a synthetic 1M-row,
                  50-symbol panel run through the real enrich producers); the file
                  then carries enrich: null and `rcsr enrich` uses its anchors
+  --strict       exit 3 and write nothing when the probe ran under load or a
+                 term is noisy (see below)
+
+The file records the one-minute load average at the start and the end of the
+probe (load1_start, load1_end). When the load at the start is above half the
+CPUs of the process, or a term has a spread above 1.5, the command writes the
+file and prints one line on stderr that names the load and each noisy term:
+those rates are suspect. The device terms r_eval and r_fit hold under load;
+bw, launch_s, cpu_eval and the enrich rates do not. The probe takes under 60 s
+at a load below 2.5 on an RTX 3060 and longer above it.
 
 A search run never writes this file. --calibration <path> selects another one,
 --calibration anchors ignores any file.";
@@ -1340,9 +1432,11 @@ pub fn run_calibrate(args: &[String]) -> ! {
     let mut out: Option<std::path::PathBuf> = None;
     let mut gpu: Option<bool> = None;
     let mut enrich = true;
+    let mut strict = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--strict" => strict = true,
             "-h" | "--help" => {
                 println!("{}", CALIBRATE_USAGE);
                 std::process::exit(0);
@@ -1374,6 +1468,7 @@ pub fn run_calibrate(args: &[String]) -> ! {
             std::process::exit(2);
         }
     };
+    let load1_start = test_load1().or_else(read_load1);
     let mut calibration = Calibration::probe();
     let mut device: Option<String> = None;
     if gpu != Some(false) {
@@ -1402,6 +1497,16 @@ pub fn run_calibrate(args: &[String]) -> ! {
             }
         }
     }
+    calibration.load1_start = load1_start;
+    calibration.load1_end = test_load1().or_else(read_load1);
+    apply_test_spreads(&mut calibration);
+    if let Some(warning) = calibration.probe_warning() {
+        eprintln!("# calibrate: {}", warning);
+        if strict {
+            eprintln!("error: --strict: the rates are suspect; nothing written");
+            std::process::exit(3);
+        }
+    }
     let build = format!(
         "{} {}",
         env!("CARGO_PKG_VERSION"),
@@ -1425,6 +1530,32 @@ pub fn run_calibrate(args: &[String]) -> ! {
         crate::manifest::sha256_hex(text.as_bytes())
     );
     std::process::exit(0);
+}
+
+/// `RCSR_CALIBRATE_TEST_LOAD1`: a load the probe records instead of reading
+/// `/proc/loadavg`, so a test reaches the load path without a loaded machine.
+fn test_load1() -> Option<f64> {
+    std::env::var("RCSR_CALIBRATE_TEST_LOAD1").ok()?.parse().ok()
+}
+
+/// `RCSR_CALIBRATE_TEST_SPREAD=<term>=<spread>[,...]`: set the spread of a
+/// term after the probe, so a test reaches the noise path without a timing race.
+fn apply_test_spreads(calibration: &mut Calibration) {
+    let Ok(spec) = std::env::var("RCSR_CALIBRATE_TEST_SPREAD") else {
+        return;
+    };
+    for pair in spec.split(',') {
+        let Some((term, value)) = pair.split_once('=') else { continue };
+        let Ok(spread) = value.parse::<f64>() else { continue };
+        match term {
+            "r_eval" => calibration.spread.r_eval = spread,
+            "r_fit" => calibration.spread.r_fit = spread,
+            "bw" => calibration.spread.bw = spread,
+            "launch_s" => calibration.spread.launch_s = spread,
+            "cpu_eval" => calibration.spread.cpu_eval = spread,
+            _ => {}
+        }
+    }
 }
 
 /// Write through a sibling temporary file and a rename, so a reader sees the
@@ -1647,6 +1778,15 @@ fn parse_calibration_text(text: &str) -> Result<(Calibration, Option<String>, St
         Some(Json::Null) | None => None,
         Some(_) => return Err("'device' is not a string or null".to_string()),
     };
+    let load = |key: &str| -> Result<Option<f64>, String> {
+        match doc.get(key) {
+            None | Some(Json::Null) => Ok(None),
+            Some(Json::Num(v)) if v.is_finite() && *v >= 0.0 => Ok(Some(*v)),
+            Some(_) => Err(format!("'{}' is not a non-negative number", key)),
+        }
+    };
+    cal.load1_start = load("load1_start")?;
+    cal.load1_end = load("load1_end")?;
     cal.device_source = if device.is_some() { "file" } else { "anchor" };
     if schema == CALIBRATION_SCHEMA {
         cal.enrich = match doc.get("enrich") {
@@ -1689,16 +1829,26 @@ impl Calibration {
     /// The text `rcsr calibrate` writes. Floats print in the shortest form that
     /// reads back bit for bit.
     pub fn file_text(&self, device: Option<&str>, build: &str, written: &str) -> String {
+        let load = match (self.load1_start, self.load1_end) {
+            (None, None) => String::new(),
+            (start, end) => {
+                let field = |name: &str, v: Option<f64>| {
+                    v.map_or(String::new(), |v| format!("\"{}\":{:?},", name, v))
+                };
+                format!("\n {}{}", field("load1_start", start), field("load1_end", end))
+            }
+        };
         let device = match device {
             Some(d) => crate::devlog::text(d),
             None => "null".to_string(),
         };
         format!(
-            "{{\"schema\":\"{}\",\"written\":{},\"device\":{},\"build\":{},\n \"r_eval\":{:?},\"r_fit\":{:?},\"bw\":{:?},\"bw_h2d\":{:?},\"bw_d2h\":{:?},\"launch_s\":{:?},\n \"cpu_eval\":{:?},\"cpu_fit\":{:?},\"hysteresis\":{:?},\n \"spread\":{{\"r_eval\":{:?},\"r_fit\":{:?},\"bw\":{:?},\"launch_s\":{:?},\"cpu_eval\":{:?}}},\n \"enrich\":{}}}\n",
+            "{{\"schema\":\"{}\",\"written\":{},\"device\":{},\"build\":{},{}\n \"r_eval\":{:?},\"r_fit\":{:?},\"bw\":{:?},\"bw_h2d\":{:?},\"bw_d2h\":{:?},\"launch_s\":{:?},\n \"cpu_eval\":{:?},\"cpu_fit\":{:?},\"hysteresis\":{:?},\n \"spread\":{{\"r_eval\":{:?},\"r_fit\":{:?},\"bw\":{:?},\"launch_s\":{:?},\"cpu_eval\":{:?}}},\n \"enrich\":{}}}\n",
             CALIBRATION_SCHEMA,
             crate::devlog::text(written),
             device,
             crate::devlog::text(build),
+            load,
             self.r_eval,
             self.r_fit,
             self.bw,
@@ -2021,6 +2171,58 @@ mod tests {
             assert_eq!(a.gpu_cells_per_s.to_bits(), b.gpu_cells_per_s.to_bits(), "{:?}", op);
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// #862: the load fields round-trip bit for bit, an older `/2` file without
+    /// them loads with `None`, and no rate reads them.
+    #[test]
+    fn calibration_records_the_load() {
+        let (_scratch, path) = temp_file("load");
+        let mut want = sample_calibration();
+        want.load1_start = Some(8.65);
+        want.load1_end = Some(9.0625);
+        let text = want.file_text(Some("Test GPU"), "b", "2026-11-05T10:00:00Z");
+        assert!(text.contains("\"load1_start\":8.65,\"load1_end\":9.0625,"), "{text}");
+        std::fs::write(&path, &text).unwrap();
+        let source = CalibrationRequest::File(path.clone()).resolve(Some("Test GPU")).unwrap();
+        let got = Calibration::pinned(&source);
+        assert_eq!(got.load1_start.map(f64::to_bits), want.load1_start.map(f64::to_bits));
+        assert_eq!(got.load1_end.map(f64::to_bits), want.load1_end.map(f64::to_bits));
+        assert_eq!(got.r_eval.to_bits(), want.r_eval.to_bits());
+        assert_eq!(got.cpu_eval.to_bits(), want.cpu_eval.to_bits());
+
+        let older = sample_calibration().file_text(Some("Test GPU"), "b", "2026-11-05T10:00:00Z");
+        assert!(!older.contains("load1"), "{older}");
+        std::fs::write(&path, &older).unwrap();
+        let source = CalibrationRequest::File(path.clone()).resolve(Some("Test GPU")).unwrap();
+        let got = Calibration::pinned(&source);
+        assert_eq!((got.load1_start, got.load1_end), (None, None));
+
+        std::fs::write(&path, older.replacen("\"build\":", "\"load1_start\":\"high\",\"build\":", 1)).unwrap();
+        let err = CalibrationRequest::File(path.clone()).resolve(Some("Test GPU")).unwrap_err();
+        assert!(err.contains("load1_start"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_probe_warning_names_the_load_and_every_noisy_term() {
+        let mut c = sample_calibration();
+        assert_eq!(c.probe_warning(), None);
+        c.load1_start = Some(0.0);
+        assert_eq!(c.probe_warning(), None);
+        c.spread.bw = 1.89;
+        c.spread.cpu_eval = 21.68;
+        c.spread.launch_s = 1.5;
+        let quiet = c.probe_warning().unwrap();
+        assert!(quiet.contains("noisy terms: bw 1.89, cpu_eval 21.68"), "{quiet}");
+        assert!(!quiet.contains("launch_s"), "a spread of 1.5 is not above the limit: {quiet}");
+        assert!(!quiet.contains("measured under load"), "{quiet}");
+        c.load1_start = Some(load_limit() + 1.0);
+        let loaded = c.probe_warning().unwrap();
+        assert!(loaded.starts_with("measured under load "), "{loaded}");
+        c.spread = Spread::default();
+        assert!(c.probe_warning().unwrap().ends_with("noisy terms: none"));
+        assert!(c.load_notice().unwrap().contains("suspect"));
     }
 
     #[test]
