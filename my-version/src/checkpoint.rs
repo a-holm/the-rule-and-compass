@@ -1841,6 +1841,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         fit_report: false,
         dedup: bool_val("dedup")?,
         time_budget,
+        interim_chunk: false,
         patience: num_usize("patience")?,
         predictor_samples,
         fit_samples, // #85

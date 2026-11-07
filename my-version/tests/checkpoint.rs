@@ -1210,3 +1210,393 @@ fn a_resume_prints_the_time_budget_it_uses() {
     assert!(resumed.status.success(), "{:?}", resumed);
     assert!(budget_lines(&resumed).is_empty(), "no budget, no line");
 }
+
+/// #855: `chunks` one-generation chunks (a zero `--time-budget` stops after one
+/// generation), each resumed from the previous exit checkpoint, then a last
+/// chunk to `base.generations`. Returns the last chunk's outcome and the text of
+/// its exit checkpoint.
+fn chunked(base: &Config, interim: bool, chunks: usize, train: &Sample, test: &Sample) -> (Outcome, String) {
+    let mut saved: Option<Checkpoint> = None;
+    for k in 1..=chunks {
+        let cfg = Config {
+            time_budget: Some(0.0),
+            interim_chunk: interim,
+            ..base.clone()
+        };
+        let mut text: Option<String> = None;
+        let out = search::run_resumable(&cfg, train, test, saved.take(), 0, |cp| {
+            text = Some(cp.to_text());
+        })
+        .expect("chunk");
+        assert_eq!(out.stop_reason, "time_budget");
+        assert_eq!(out.generations, k);
+        assert_eq!(out.interim, interim);
+        let cp = Checkpoint::from_text(&text.expect("exit checkpoint")).expect("parse");
+        if interim {
+            assert!(out.test_errors.is_empty(), "an interim chunk scores no test rows");
+            assert!(cp.final_archive.is_none(), "an interim checkpoint holds no reported archive");
+        } else {
+            assert_eq!(out.test_errors.len(), out.archive.items.len());
+            assert!(cp.final_archive.is_some());
+        }
+        saved = Some(cp);
+    }
+    let mut text: Option<String> = None;
+    let last = search::run_resumable(base, train, test, saved, 0, |cp| text = Some(cp.to_text()))
+        .expect("last chunk");
+    assert!(!last.interim);
+    (last, text.expect("exit checkpoint"))
+}
+
+fn assert_same_report(a: &Outcome, b: &Outcome, what: &str) {
+    assert_eq!(describe(a), describe(b), "{what}: archive");
+    let bits = |o: &Outcome| o.test_errors.iter().map(|e| e.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(a), bits(b), "{what}: test errors");
+    assert_eq!(a.archive.hash(), b.archive.hash(), "{what}: archive hash");
+    assert_eq!(a.candidates_evaluated, b.candidates_evaluated, "{what}: candidates");
+    assert_eq!(a.generations, b.generations, "{what}: generations");
+}
+
+/// #855: three interim chunks and a last chunk give the same last-chunk report
+/// and the same exit checkpoint, byte for byte, as the same chunks without the
+/// flag and as one uninterrupted run.
+#[test]
+fn interim_chunks_keep_the_final_hash() {
+    let train = sample(240);
+    let test = sample(80);
+    for seed in [11u32, 12] {
+        let bases = [
+            ("squared", Config { metric: rcsr::metrics::Metric::Squared, ..config(seed) }),
+            ("pnl", pnl_config(seed, 5.0, &train)),
+        ];
+        for (name, base) in bases {
+            let what = format!("{name} seed {seed}");
+            let uninterrupted = search::run(&base, &train, &test);
+            let uninterrupted_text = checkpoint_text(&base, &train, &test);
+            let (plain, plain_text) = chunked(&base, false, 3, &train, &test);
+            let (interim, interim_text) = chunked(&base, true, 3, &train, &test);
+            assert_same_report(&plain, &interim, &format!("{what}: interim against plain chunks"));
+            assert_same_report(&uninterrupted, &interim, &format!("{what}: interim against uninterrupted"));
+            assert_eq!(plain_text, interim_text, "{what}: exit checkpoint bytes");
+            assert_eq!(uninterrupted_text, interim_text, "{what}: exit checkpoint against uninterrupted");
+        }
+    }
+}
+
+/// #855: a chunk that stops on the generation budget is the last one in fact
+/// and reports in full.
+#[test]
+fn interim_stop_on_generations_reports() {
+    let train = sample(240);
+    let test = sample(80);
+    let cfg = Config {
+        time_budget: Some(1.0e9),
+        interim_chunk: true,
+        ..config(11)
+    };
+    let mut text: Option<String> = None;
+    let out = search::run_resumable(&cfg, &train, &test, None, 0, |cp| text = Some(cp.to_text()))
+        .expect("run");
+    assert_eq!(out.stop_reason, "generations");
+    assert!(!out.interim);
+    assert_eq!(out.test_errors.len(), out.archive.items.len());
+    let cp = Checkpoint::from_text(&text.expect("checkpoint")).expect("parse");
+    assert_eq!(cp.final_archive.expect("reported archive").hash(), out.archive.hash());
+}
+
+fn rcsr_in(dir: &std::path::Path, args: &[&str]) -> Output {
+    rcsr_cmd::rcsr()
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("run rcsr")
+}
+
+/// The CLI arguments shared by every chunk of the #855 chains. Paths are
+/// relative to the chunk's own directory so two chains write equal text.
+fn chunk_args(csv: &str, extra: &[&'static str]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--data", csv, "--target", "y", "--vars", "x", "--seed", "5", "--pop", "30",
+        "--max-complexity", "8", "--cpu", "--no-dev-log", "--quiet", "--generations", "8",
+        "--save", "ck.rcsr", "--json-out", "run.json",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    args.extend(extra.iter().map(|s| s.to_string()));
+    args
+}
+
+fn run_chunk(dir: &std::path::Path, csv: &str, extra: &[&'static str]) -> Output {
+    let args = chunk_args(csv, extra);
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    rcsr_in(dir, &refs)
+}
+
+/// `chunks` one-generation chunks (`--time-budget 0`), with or without
+/// `--interim-chunk`, then one last chunk with `last`.
+fn cli_chain(dir: &std::path::Path, csv: &str, interim: bool, chunks: usize, last: &[&'static str]) {
+    for k in 0..chunks {
+        let mut extra: Vec<&'static str> = vec!["--time-budget", "0"];
+        if interim {
+            extra.push("--interim-chunk");
+        }
+        if k > 0 {
+            extra.extend(["--resume", "ck.rcsr"]);
+        }
+        let out = run_chunk(dir, csv, &extra);
+        assert!(out.status.success(), "chunk {k} failed: {:?}", out);
+    }
+    let mut extra: Vec<&'static str> = vec!["--resume", "ck.rcsr"];
+    extra.extend(last);
+    let out = run_chunk(dir, csv, &extra);
+    assert!(out.status.success(), "last chunk failed: {:?}", out);
+}
+
+/// `run.json` with every wall-clock number replaced, so two runs compare equal
+/// exactly when only timing differs.
+fn without_timing(json: &str) -> String {
+    let bytes = json.as_bytes();
+    let mut out = String::with_capacity(json.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            if let Some(len) = json[i + 1..].find('"') {
+                let key = &json[i + 1..i + 1 + len];
+                let after = i + 2 + len;
+                let timed = key == "seconds" || key.ends_with("_seconds") || key.ends_with("_s");
+                if timed && bytes.get(after) == Some(&b':') {
+                    out.push_str(&json[i..=after]);
+                    let mut j = after + 1;
+                    while j < bytes.len() && !matches!(bytes[j], b',' | b'}' | b']') {
+                        j += 1;
+                    }
+                    out.push('0');
+                    i = j;
+                    continue;
+                }
+                out.push_str(&json[i..after]);
+                i = after;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+#[test]
+fn without_timing_masks_only_timing_keys() {
+    let json = r#"{"a":1,"elapsed_seconds":0.5,"timing":{"x_s":2,"y":3},"seconds":7}"#;
+    assert_eq!(
+        without_timing(json),
+        r#"{"a":1,"elapsed_seconds":0,"timing":{"x_s":0,"y":3},"seconds":0}"#
+    );
+}
+
+/// #855: through the CLI, the last chunk after interim chunks writes the same
+/// checkpoint bytes and the same `run.json`, apart from timing, as a chain
+/// without the flag.
+#[test]
+fn interim_chain_cli_matches_a_plain_chain() {
+    let scratch = Scratch::new("interim-chain");
+    let csv = scratch.join("d.csv");
+    std::fs::write(&csv, line_csv(60)).expect("csv");
+    let csv = csv.to_str().expect("utf-8").to_string();
+    let (a, b) = (scratch.join("interim"), scratch.join("plain"));
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    for last in [&[][..], &["--time-budget", "0"][..]] {
+        cli_chain(&a, &csv, true, 3, last);
+        cli_chain(&b, &csv, false, 3, last);
+        let ck_a = std::fs::read(a.join("ck.rcsr")).expect("interim checkpoint");
+        let ck_b = std::fs::read(b.join("ck.rcsr")).expect("plain checkpoint");
+        assert_eq!(ck_a, ck_b, "exit checkpoint bytes, last chunk {last:?}");
+        let run_a = std::fs::read_to_string(a.join("run.json")).expect("interim run.json");
+        let run_b = std::fs::read_to_string(b.join("run.json")).expect("plain run.json");
+        assert!(run_a.contains("\"pareto\":["), "the last chunk reports in full");
+        assert!(!run_a.contains("\"interim\""));
+        assert_eq!(without_timing(&run_a), without_timing(&run_b), "run.json, last chunk {last:?}");
+        for dir in [&a, &b] {
+            std::fs::remove_file(dir.join("ck.rcsr")).unwrap();
+        }
+    }
+}
+
+/// #855: an interim chunk writes a short run.json, and the readers of a result
+/// refuse it by name.
+#[test]
+fn interim_run_json_is_refused_by_evaluators() {
+    let scratch = Scratch::new("interim-refuse");
+    let csv = scratch.join("d.csv");
+    std::fs::write(&csv, line_csv(60)).expect("csv");
+    let csv = csv.to_str().expect("utf-8").to_string();
+    let dir = scratch.join("run");
+    std::fs::create_dir(&dir).unwrap();
+    let out = run_chunk(&dir, &csv, &["--time-budget", "0", "--interim-chunk", "--run-manifest", "m.json"]);
+    assert!(out.status.success(), "{:?}", out);
+    let run = std::fs::read_to_string(dir.join("run.json")).expect("run.json");
+    for key in ["\"interim\":true", "\"stop_reason\":\"time_budget\"", "\"generations_run\":1", "\"backend\":\"cpu\"", "\"threads\":", "\"checkpoint\":{"] {
+        assert!(run.contains(key), "short run.json lacks {key}: {run}");
+    }
+    assert!(!run.contains("\"pareto\""), "an interim run.json holds no front");
+    let ck = std::fs::read_to_string(dir.join("ck.rcsr")).expect("checkpoint");
+    assert!(!ck.contains("\nfinal "), "an interim checkpoint holds no reported archive");
+
+    let wf = rcsr_in(&dir, &["walkforward", "--data", &csv, "--from-run", "run.json"]);
+    assert_eq!(wf.status.code(), Some(2), "{:?}", wf);
+    assert!(String::from_utf8_lossy(&wf.stderr).contains("--interim-chunk"), "{:?}", wf);
+
+    let vm = rcsr_in(&dir, &["verify-manifest", "m.json"]);
+    assert_eq!(vm.status.code(), Some(2), "{:?}", vm);
+    assert!(String::from_utf8_lossy(&vm.stderr).contains("--interim-chunk"), "{:?}", vm);
+
+    let again = run_chunk(&dir, &csv, &["--resume", "ck.rcsr", "--run-manifest", "m.json"]);
+    assert!(again.status.success(), "{:?}", again);
+    let vm = rcsr_in(&dir, &["verify-manifest", "m.json"]);
+    assert_eq!(vm.status.code(), Some(0), "the last chunk's manifest verifies: {:?}", vm);
+}
+
+/// #855: the flag needs a checkpoint to write and a budget to stop on.
+#[test]
+fn interim_chunk_needs_save_and_time_budget() {
+    let scratch = Scratch::new("interim-usage");
+    let csv = scratch.join("d.csv");
+    std::fs::write(&csv, line_csv(60)).expect("csv");
+    let csv = csv.to_str().expect("utf-8");
+    for args in [
+        vec!["--data", csv, "--target", "y", "--vars", "x", "--cpu", "--interim-chunk", "--time-budget", "1"],
+        vec!["--data", csv, "--target", "y", "--vars", "x", "--cpu", "--interim-chunk", "--save", "ck.rcsr"],
+    ] {
+        let out = rcsr_in(scratch.path(), &args);
+        assert_eq!(out.status.code(), Some(2), "{:?}", out);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--interim-chunk requires"));
+    }
+}
+
+/// #855: a process killed inside an interim chunk leaves a checkpoint that
+/// resumes to the report of an uninterrupted run.
+#[test]
+fn a_kill_during_an_interim_chunk_resumes_to_the_uninterrupted_report() {
+    let scratch = Scratch::new("interim-kill");
+    let csv = scratch.join("d.csv");
+    std::fs::write(&csv, line_csv(60)).expect("csv");
+    let csv = csv.to_str().expect("utf-8").to_string();
+    let (killed, whole) = (scratch.join("killed"), scratch.join("whole"));
+    std::fs::create_dir(&killed).unwrap();
+    std::fs::create_dir(&whole).unwrap();
+
+    let mut args = chunk_args(&csv, &["--time-budget", "3600", "--interim-chunk", "--save-every", "1", "--patience", "0"]);
+    let at = args.iter().position(|a| a == "--generations").expect("generations flag") + 1;
+    args[at] = "1000000".to_string();
+    let mut child = rcsr_cmd::rcsr()
+        .current_dir(&killed)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let ck = killed.join("ck.rcsr");
+    while !ck.exists() {
+        assert!(child.try_wait().expect("poll").is_none(), "the chunk ended before it saved");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    child.kill().expect("kill the chunk");
+    child.wait().expect("reap the chunk");
+
+    let saved = Checkpoint::load(&ck).expect("a complete checkpoint survives the kill");
+    assert!(saved.final_archive.is_none());
+    // One more generation after the kill gives the report. A fresh run to that
+    // generation is the reference.
+    let run = |dir: &std::path::Path, generations: String, extra: &[&'static str]| {
+        let mut args = chunk_args(&csv, &["--patience", "0"]);
+        let at = args.iter().position(|a| a == "--generations").expect("generations flag") + 1;
+        args[at] = generations;
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let out = rcsr_in(dir, &refs);
+        assert!(out.status.success(), "{:?}", out);
+    };
+    run(&killed, "1000000".to_string(), &["--resume", "ck.rcsr", "--time-budget", "0"]);
+    run(&whole, (saved.generations + 1).to_string(), &[]);
+    let final_line = |dir: &std::path::Path| {
+        std::fs::read_to_string(dir.join("ck.rcsr"))
+            .unwrap()
+            .lines()
+            .find(|l| l.starts_with("final "))
+            .map(str::to_string)
+            .expect("a final line")
+    };
+    assert_eq!(final_line(&killed), final_line(&whole));
+    let front = |dir: &std::path::Path| {
+        let text = std::fs::read_to_string(dir.join("run.json")).unwrap();
+        text[text.find("\"pareto\":[").expect("a front")..].to_string()
+    };
+    assert_eq!(front(&killed), front(&whole));
+}
+
+/// #855: the same chain on the device, node path and flat path alike: the
+/// last chunk after interim chunks equals the last chunk after plain chunks.
+#[cfg(feature = "cuda")]
+#[test]
+fn interim_chunks_keep_the_final_hash_on_the_device() {
+    if !rcsr::backend::probe().available() {
+        rcsr::backend::skip_without_device("no usable GPU; skipping the device interim chain");
+        return;
+    }
+    let train = sample(240);
+    let test = sample(80);
+    let mut base = Config {
+        generations: 6,
+        metric: rcsr::metrics::Metric::Squared,
+        ..config(17)
+    };
+    base.gpu = true;
+    base.dispatch = rcsr::dispatch::DispatchMode::Device;
+    let (plain, plain_text) = chunked(&base, false, 2, &train, &test);
+    let (interim, interim_text) = chunked(&base, true, 2, &train, &test);
+    assert_eq!(interim.backend, rcsr::backend::Kind::Gpu);
+    assert_same_report(&plain, &interim, "device interim against plain chunks");
+    assert_eq!(plain_text, interim_text, "device exit checkpoint bytes");
+}
+
+/// An interim chunk's `run.json` in a fresh directory.
+fn interim_run_dir(scratch: &Scratch) -> (PathBuf, String) {
+    let csv = scratch.join("d.csv");
+    std::fs::write(&csv, line_csv(60)).expect("csv");
+    let csv = csv.to_str().expect("utf-8").to_string();
+    let dir = scratch.join("run");
+    std::fs::create_dir(&dir).unwrap();
+    let out = run_chunk(&dir, &csv, &["--time-budget", "0", "--interim-chunk"]);
+    assert!(out.status.success(), "{:?}", out);
+    (dir, csv)
+}
+
+/// #855: `ablation score --run` names the interim flag instead of a missing `ablation` field.
+#[test]
+fn interim_run_json_is_refused_by_ablation_score() {
+    let scratch = Scratch::new("interim-ablation");
+    let (dir, csv) = interim_run_dir(&scratch);
+    for flag in ["--run", "--from-run"] {
+        let out = rcsr_in(&dir, &["ablation", "score", flag, "run.json", "--data", &csv, "--target", "y", "--time", "t"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{flag}: {err}");
+        assert!(err.contains("--interim-chunk"), "{flag}: {err}");
+        assert!(!err.contains("no 'ablation' object"), "{flag}: {err}");
+    }
+}
+
+/// #855: `ladder --sr-run` refuses the interim document by name.
+#[test]
+fn interim_run_json_is_refused_by_the_ladder() {
+    let scratch = Scratch::new("interim-ladder");
+    let (dir, csv) = interim_run_dir(&scratch);
+    let out = rcsr_in(
+        &dir,
+        &["ladder", "--data", &csv, "--target", "y", "--time", "t", "--windows", "w.csv", "--sr-run", "run.json"],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("--interim-chunk"), "{err}");
+}
