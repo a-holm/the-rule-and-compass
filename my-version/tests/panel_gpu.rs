@@ -200,7 +200,7 @@ fn cpu_reference_matches_the_documented_policy() {
 #[test]
 fn device_matches_the_cpu_reference_on_a_mixed_block() {
     if !would_use_gpu() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let (bars, segments) = mixed_fixture();
@@ -216,7 +216,7 @@ fn device_matches_the_cpu_reference_on_a_mixed_block() {
 #[test]
 fn identical_copies_collapse_and_conflicts_are_prefixed_in_time_order() {
     if !would_use_gpu() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     // Four copies of a whole 2,976-row month (JUV-like), plus a conflicting
@@ -268,7 +268,7 @@ fn identical_copies_collapse_and_conflicts_are_prefixed_in_time_order() {
 #[test]
 fn gap_chains_reset_at_listing_delisting_migration_and_membership() {
     if !would_use_gpu() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     // Symbol A: listing at hour 0, then hour 3 after a hole.
@@ -314,7 +314,7 @@ fn gap_chains_reset_at_listing_delisting_migration_and_membership() {
 #[test]
 fn prefix_replay_at_many_cuts_keeps_earlier_buckets_bit_identical() {
     if !would_use_gpu() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let mut bars = Vec::new();
@@ -354,7 +354,7 @@ fn prefix_replay_at_many_cuts_keeps_earlier_buckets_bit_identical() {
 #[test]
 fn block_size_variants_produce_identical_bytes() {
     if !would_use_gpu() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let (bars, segments) = mixed_fixture();
@@ -459,7 +459,7 @@ fn large_fixture() -> (Vec<PrepBar>, Vec<PrepSegment>) {
 #[test]
 fn large_block_hash_is_equal_cpu_gpu_cold_warm_and_across_block_sizes() {
     if !would_use_gpu() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let (bars, segments) = large_fixture();
@@ -517,7 +517,7 @@ fn large_block_hash_is_equal_cpu_gpu_cold_warm_and_across_block_sizes() {
 #[test]
 fn nan_is_a_gap_not_zero_and_negative_zero_is_a_conflict() {
     if !would_use_gpu() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let mut bars: Vec<PrepBar> = (0..4).map(|k| q(k * 900, 100.0, 1.0)).collect();
@@ -762,7 +762,7 @@ extern "C" {
 #[test]
 fn refused_cub_sort_fails_prep_run_then_recovers() {
     if !would_use_gpu() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let (bars, segments) = mixed_fixture();
@@ -782,7 +782,7 @@ fn refused_cub_sort_fails_prep_run_then_recovers() {
 #[test]
 fn refused_cub_scan_fails_pit_run_then_recovers() {
     if !would_use_gpu() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let block = PitBlock {
@@ -810,7 +810,7 @@ fn refused_cub_scan_fails_pit_run_then_recovers() {
 #[test]
 fn refused_later_cub_scan_fails_prep_run_then_recovers() {
     if !would_use_gpu() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let (bars, segments) = mixed_fixture();
@@ -831,7 +831,7 @@ fn refused_later_cub_scan_fails_prep_run_then_recovers() {
 #[test]
 fn refused_later_cub_scan_fails_pit_run_then_recovers() {
     if !would_use_gpu() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let block = PitBlock {

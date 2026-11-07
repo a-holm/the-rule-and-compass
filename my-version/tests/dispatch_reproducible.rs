@@ -9,7 +9,6 @@ mod rcsr_cmd;
 mod scratch;
 
 use scratch::Scratch;
-use std::io::Write;
 use std::path::Path;
 use std::process::{Output, Stdio};
 
@@ -40,7 +39,7 @@ fn search(cache: &Path, extra: &[&str]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.as_mut().unwrap().write_all(csv().as_bytes()).unwrap();
+    rcsr_cmd::feed_stdin(&mut child, csv().as_bytes());
     child.wait_with_output().unwrap()
 }
 
@@ -92,14 +91,18 @@ fn sha256_of(path: &Path) -> String {
 
 #[cfg(feature = "cuda")]
 fn device_available() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 #[cfg(feature = "cuda")]
 #[test]
 fn two_auto_runs_give_one_front_and_one_route_ledger() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let cache = Scratch::new("auto-two");
@@ -117,7 +120,7 @@ fn two_auto_runs_give_one_front_and_one_route_ledger() {
 #[test]
 fn a_calibrated_file_gives_equal_fronts_and_its_own_hash() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let dir = Scratch::new("file-two");

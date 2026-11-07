@@ -795,7 +795,11 @@ SEARCH:
                              reports stop_reason time_budget with
                              converged_early false. The checkpoint is not
                              terminal: --resume runs more generations and may
-                             set a new --time-budget
+                             set a new --time-budget. The budget is saved with
+                             the checkpoint: a --resume without --time-budget
+                             runs with the saved one (not with none), and
+                             --time-budget replaces it for this process only.
+                             A resume prints the budget it uses
   --gpu                      assert that the GPU must guide the search: an
                              error (exit 2) when the binary was not built with
                              --features cuda or no device is present. After
@@ -3889,7 +3893,8 @@ fn main() {
         }
         // #256: the time budget limits one process, not the trajectory, so a
         // resumed run takes the budget it is given (a stopped run is resumed
-        // exactly to get more time).
+        // exactly to get more time). Without `--time-budget` it keeps the saved
+        // one (#880).
         if time_budget_set {
             effective.time_budget = cfg.time_budget;
         }
@@ -6065,6 +6070,13 @@ fn main() {
             );
         } else {
             eprintln!("# checkpoint: resumed from {} at generation {}", path, gen);
+        }
+        if let Some(budget) = cfg.time_budget {
+            eprintln!(
+                "# checkpoint: time budget {} s ({})",
+                budget,
+                if time_budget_set { "from --time-budget" } else { "saved with the checkpoint" }
+            );
         }
     }
 

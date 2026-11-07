@@ -2,6 +2,8 @@
 
 #[path = "common/rcsr.rs"]
 mod rcsr_cmd;
+#[path = "common/launches.rs"]
+mod launches;
 
 use std::path::PathBuf;
 use std::process::Output;
@@ -84,14 +86,17 @@ fn run_big(tag: &str, extra: &[&str]) -> Output {
 #[test]
 fn fit_rows_default_applies_on_the_gpu_and_zero_turns_it_off() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
-    let on = run_big("on", &["--gpu", "--fit-strategy", "gpu"]);
+    let on = run_big("on", &["--gpu", "--dispatch", "device", "--json", "--fit-strategy", "gpu"]);
     let on_err = String::from_utf8_lossy(&on.stderr);
     assert_eq!(on.status.code(), Some(0), "{on_err}");
     assert!(on_err.contains("# fit-rows: 65536 (default"), "{on_err}");
-    let off = run_big("off", &["--gpu", "--fit-strategy", "gpu", "--fit-rows", "0"]);
+    let launches = launches::device_launches(&String::from_utf8_lossy(&on.stdout));
+    eprintln!("forced device run: {launches} device launches counted");
+    assert!(launches > 0, "a forced device run launched no kernel: {on_err}");
+    let off = run_big("off", &["--gpu", "--dispatch", "device", "--fit-strategy", "gpu", "--fit-rows", "0"]);
     let off_err = String::from_utf8_lossy(&off.stderr);
     assert_eq!(off.status.code(), Some(0), "{off_err}");
     assert!(!off_err.contains("# fit-rows:"), "{off_err}");

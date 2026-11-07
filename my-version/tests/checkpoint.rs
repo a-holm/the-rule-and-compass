@@ -389,7 +389,7 @@ fn an_uninterrupted_run_and_a_saved_then_resumed_run_match_exactly() {
 #[test]
 fn a_gpu_run_and_a_gpu_resume_match_exactly() {
     if !rcsr::backend::probe().available() {
-        eprintln!("no usable GPU; skipping the GPU->GPU resume A/B test");
+        rcsr::backend::skip_without_device("no usable GPU; skipping the GPU->GPU resume A/B test");
         return;
     }
     let train = sample(240);
@@ -925,7 +925,7 @@ fn a_long_pnl_run_resumes_with_the_same_book_and_refuses_another() {
 #[test]
 fn a_resume_takes_the_requested_pipeline_depth() {
     if !rcsr::backend::probe().available() {
-        eprintln!("no usable GPU; skipping the resume pipeline-depth test");
+        rcsr::backend::skip_without_device("no usable GPU; skipping the resume pipeline-depth test");
         return;
     }
     let csv = TempPath::new("depth.csv");
@@ -1065,7 +1065,7 @@ fn search_results_do_not_depend_on_the_thread_count() {
 #[test]
 fn a_device_search_does_not_depend_on_the_thread_count() {
     if !rcsr::backend::probe().available() {
-        eprintln!("no usable GPU; skipping the device thread-count check");
+        rcsr::backend::skip_without_device("no usable GPU; skipping the device thread-count check");
         return;
     }
     let train = sample(2600);
@@ -1149,4 +1149,64 @@ fn resume_under_another_cpu_count_is_allowed() {
     };
     assert_eq!(final_line(&ck), final_line(&whole));
     assert_eq!(std::fs::read(&ck).unwrap(), std::fs::read(&whole).unwrap());
+}
+
+/// #880: a resume names the time budget it runs with, and without `--time-budget` that is
+/// the budget saved in the checkpoint.
+#[test]
+fn a_resume_prints_the_time_budget_it_uses() {
+    let csv = TempPath::new("budget.csv");
+    std::fs::write(&csv.0, line_csv(60)).expect("write csv");
+    let ck = TempPath::new("budget.rcsr");
+    let out = TempPath::new("budget.json");
+    let run = |extra: &[&str]| -> Output {
+        let mut args = vec![
+            "--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "5", "--pop", "30",
+            "--max-complexity", "8", "--cpu", "--no-dev-log", "--generations", "6", "--save",
+            ck.as_str(), "--json-out", out.as_str(),
+        ];
+        args.extend_from_slice(extra);
+        rcsr(&args)
+    };
+    let budget_lines = |o: &Output| -> Vec<String> {
+        String::from_utf8_lossy(&o.stderr)
+            .lines()
+            .filter(|l| l.starts_with("# checkpoint: time budget"))
+            .map(str::to_string)
+            .collect()
+    };
+    let stop = || {
+        let json = std::fs::read_to_string(&out.0).unwrap();
+        let reason = json.split("\"stop_reason\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        let gens = json.split("\"generations_run\":").nth(1).unwrap().split(',').next().unwrap().to_string();
+        (reason, gens)
+    };
+
+    let first = run(&["--time-budget", "0"]);
+    assert!(first.status.success(), "{:?}", first);
+    assert!(budget_lines(&first).is_empty(), "a fresh run prints no resume line");
+
+    let inherited = run(&["--resume", ck.as_str()]);
+    assert!(inherited.status.success(), "{:?}", inherited);
+    assert_eq!(budget_lines(&inherited), ["# checkpoint: time budget 0 s (saved with the checkpoint)"]);
+    assert_eq!(stop(), ("time_budget".to_string(), "2".to_string()));
+
+    let replaced = run(&["--resume", ck.as_str(), "--time-budget", "100000"]);
+    assert!(replaced.status.success(), "{:?}", replaced);
+    assert_eq!(budget_lines(&replaced), ["# checkpoint: time budget 100000 s (from --time-budget)"]);
+    assert_eq!(stop(), ("generations".to_string(), "6".to_string()));
+
+    let ck2 = TempPath::new("nobudget.rcsr");
+    let plain = rcsr(&[
+        "--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "5", "--pop", "30",
+        "--max-complexity", "8", "--cpu", "--no-dev-log", "--generations", "3", "--save", ck2.as_str(),
+        "--json-out", out.as_str(),
+    ]);
+    assert!(plain.status.success());
+    let resumed = rcsr(&[
+        "--data", csv.as_str(), "--target", "y", "--vars", "x", "--cpu", "--no-dev-log", "--generations", "6",
+        "--resume", ck2.as_str(), "--json-out", out.as_str(),
+    ]);
+    assert!(resumed.status.success(), "{:?}", resumed);
+    assert!(budget_lines(&resumed).is_empty(), "no budget, no line");
 }
