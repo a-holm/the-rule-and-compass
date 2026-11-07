@@ -768,8 +768,11 @@ SEARCH:
                              example gauss(c * x) at threshold 0) before the
                              constant fit, and keep them off the front. Before
                              the fit every constant counts as free, so c + abs(x)
-                             goes to the fit (#848). Saved search setting, off
-                             by default
+                             goes to the fit (#848). With --objective it also
+                             makes such a member unusable as finalist, under
+                             --fitness metric too; so is a member whose
+                             validation book was long on every row or on none
+                             (#849). Saved search setting, off by default
   --prune                    remove neutral code from the final front (off by
                              default): replace subtrees with a child or a
                              constant when the training error stays within
@@ -1226,15 +1229,23 @@ const NO_VALIDATION_BOOK: &str = ",\"validation_book\":null";
 
 /// #645: the `"validation_book"` member of a Pareto entry, from the same book
 /// that scores the member for selection.
-fn validation_book_member_json(objective: f64, stats: &rcsr::trading::PathStats, constant: bool) -> String {
+fn validation_book_member_json(
+    objective: f64,
+    stats: &rcsr::trading::PathStats,
+    constant: bool,
+    fixed: Option<bool>,
+    realised: Option<bool>,
+) -> String {
     format!(
-        ",\"validation_book\":{{\"objective\":{},\"net_pnl\":{},\"sharpe\":{},\"trades\":{},\"exposure\":{},\"constant\":{}}}",
+        ",\"validation_book\":{{\"objective\":{},\"net_pnl\":{},\"sharpe\":{},\"trades\":{},\"exposure\":{},\"constant\":{},\"fixed_position\":{},\"fixed_position_realised\":{}}}",
         jnum(objective),
         jnum(stats.net_pnl),
         jnum(stats.sharpe),
         stats.trades,
         jnum(stats.exposure),
-        constant
+        constant,
+        rcsr::trading::fixed_position_json(fixed),
+        rcsr::trading::fixed_position_json(realised)
     )
 }
 
@@ -6685,8 +6696,15 @@ fn main() {
                     let ctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
                     match trading_book(&s.tree, &v.x, slice, ctx, tspec) {
                         Ok(stats) => {
-                            let value = objective.score(&stats, tspec.min_trades);
-                            let book = validation_book_member_json(value, &stats, rcsr::trading::is_constant(&s.tree));
+                            // #849: a fixed-position member is unusable as a finalist with the flag.
+                            let fixed = rcsr::trading::fixed_position(&s.tree, tspec);
+                            let realised = rcsr::trading::realised_position(stats.exposure, tspec);
+                            let value = if cfg.reject_fixed_position && (fixed.is_some() || realised.is_some()) {
+                                f64::INFINITY
+                            } else {
+                                objective.score(&stats, tspec.min_trades)
+                            };
+                            let book = validation_book_member_json(value, &stats, rcsr::trading::is_constant(&s.tree), fixed, realised);
                             (value, book)
                         }
                         Err(_) => (f64::INFINITY, NO_VALIDATION_BOOK.to_string()),
@@ -6871,6 +6889,11 @@ fn main() {
             if usable == 0 && !quiet {
                 eprintln!("# warning: no candidate has a usable P&L book on the validation slice");
             }
+            let validation_book = match &prepared.validation {
+                Some(v) => book(v, split.and_then(|t| t.validation.as_ref()), split.and_then(|t| t.validation_context.as_ref())),
+                None => Err("no validation slice".to_string()),
+            };
+            let realised = validation_book.as_ref().ok().and_then(|s| rcsr::trading::realised_position(s.exposure, tspec));
             Some(rcsr::trading::FinalistReport {
                 objective,
                 spec: tspec.clone(),
@@ -6878,6 +6901,8 @@ fn main() {
                 horizon_seconds: target_horizon,
                 cost: trading_cost.clone().unwrap_or_else(|| target::CostDecl::new(None, tspec.per_side_bps(), target::CostSource::Flag)),
                 constant: rcsr::trading::is_constant(tree),
+                fixed_position: rcsr::trading::fixed_position(tree, tspec),
+                fixed_position_realised: realised,
                 candidates: rows.len(),
                 usable,
                 expression: top.expression.clone(),
@@ -6889,10 +6914,7 @@ fn main() {
                 test_error: top.test_error,
                 validation_value: top.objective_value,
                 search_fitness: fitness_book.as_ref().map(|_| "long_pnl_regret"),
-                validation: match &prepared.validation {
-                    Some(v) => book(v, split.and_then(|t| t.validation.as_ref()), split.and_then(|t| t.validation_context.as_ref())),
-                    None => Err("no validation slice".to_string()),
-                },
+                validation: validation_book,
                 test: book(&prepared.test, split.map(|t| &t.test), split.and_then(|t| t.test_context.as_ref())),
             })
         }

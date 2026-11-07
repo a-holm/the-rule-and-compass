@@ -922,6 +922,44 @@ pub fn is_constant(tree: &crate::expr::Node) -> bool {
     tree.op != crate::expr::Op::Input && tree.kids.iter().all(is_constant)
 }
 
+/// #849: the one position the tree takes on every input under the book's rule
+/// (`Some(true)` long, `Some(false)` flat), or `None` when the inputs decide.
+/// Only the indicator rule `1[pred > threshold]` has a fixed position: a tau
+/// ramp sizes by the score and the tercile rule ranks it.
+pub fn fixed_position(tree: &crate::expr::Node, spec: &TradingSpec) -> Option<bool> {
+    if spec.position != PositionMap::Threshold || spec.tau.is_some() {
+        return None;
+    }
+    crate::expr::fixed_position(tree, spec.threshold)
+}
+
+/// #849: the position the validation book realised on every evaluated row
+/// (`Some(true)` long on all rows, `Some(false)` on none), at any threshold. It
+/// reports the rows, where [`fixed_position`] reports the formula: a range that
+/// crosses a tiny threshold hides an always-long tree. Only the indicator rule
+/// has one position per row.
+pub fn realised_position(exposure: f64, spec: &TradingSpec) -> Option<bool> {
+    if spec.position != PositionMap::Threshold || spec.tau.is_some() {
+        return None;
+    }
+    if exposure == 1.0 {
+        Some(true)
+    } else if exposure == 0.0 {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The report text of [`fixed_position`]: `"long"`, `"flat"` or `null`.
+pub fn fixed_position_json(fixed: Option<bool>) -> &'static str {
+    match fixed {
+        Some(true) => "\"long\"",
+        Some(false) => "\"flat\"",
+        None => "null",
+    }
+}
+
 /// Rows per canonical summation segment of the fitness gross sum.
 pub const FITNESS_SEGMENT_ROWS: usize = trading_gpu::DEFAULT_SEGMENT_ROWS;
 /// Lanes inside one segment.
@@ -1433,6 +1471,10 @@ pub struct FinalistReport {
     /// The finalist expression has no variable: every quantile or fixed
     /// threshold makes it a flat or always-long book.
     pub constant: bool,
+    /// #849: the position the finalist holds on every input, when it has one.
+    pub fixed_position: Option<bool>,
+    /// #849: the position the validation book realised on every row, when it had one.
+    pub fixed_position_realised: Option<bool>,
     pub candidates: usize,
     pub usable: usize,
     pub expression: String,
@@ -1472,7 +1514,7 @@ impl FinalistReport {
             "{{\"name\":\"{}\",\"position\":\"{}\",\"selection\":\"validation_objective\",\
              \"cost\":{},\"candidates\":{},\"usable_candidates\":{},\"exact\":\"cpu_f64\",\
              \"backend\":{},\"backend_reason\":{},\"spec\":{},\
-             \"finalist\":{{\"expression\":{},\"expression_exact\":{},\"archive_rank\":{},\"constant\":{},\"fit_metric\":{},\"fit_error\":{},\
+             \"finalist\":{{\"expression\":{},\"expression_exact\":{},\"archive_rank\":{},\"constant\":{},\"fixed_position\":{},\"fixed_position_realised\":{},\"fit_metric\":{},\"fit_error\":{},\
              \"validation_error\":{},\"test_error\":{},\"validation_objective\":{}{}}},\
              \"validation\":{},\"test\":{}}}",
             self.objective.name(),
@@ -1489,6 +1531,8 @@ impl FinalistReport {
             crate::devlog::text(&self.expression_exact),
             self.archive_rank,
             self.constant,
+            fixed_position_json(self.fixed_position),
+            fixed_position_json(self.fixed_position_realised),
             crate::devlog::text(&self.fit_metric),
             num(self.fit_error),
             num(self.validation_error),
@@ -1741,5 +1785,60 @@ mod block_tests {
         assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 2, -1.0).is_err());
         assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 2, f64::NAN).is_err());
         assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 41, 1.0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod fixed_position_tests {
+    use super::*;
+    use crate::expr::{input, node, Op};
+
+    /// #849: the report names the one position of `gauss(x)` and `-gauss(x)`,
+    /// and leaves a tree the inputs decide at `null`.
+    #[test]
+    fn fixed_position_follows_the_book_rule() {
+        let spec = TradingSpec::default();
+        let g = node(Op::Gauss, vec![input(0)]);
+        let neg = node(Op::Neg, vec![g.clone()]);
+        assert_eq!(fixed_position(&g, &spec), Some(true));
+        assert_eq!(fixed_position(&neg, &spec), Some(false));
+        assert_eq!(fixed_position(&input(0), &spec), None);
+        assert_eq!(fixed_position_json(Some(true)), "\"long\"");
+        assert_eq!(fixed_position_json(Some(false)), "\"flat\"");
+        assert_eq!(fixed_position_json(None), "null");
+    }
+
+    /// #849: the threshold is the book's, and only the indicator rule has a
+    /// fixed position.
+    #[test]
+    fn fixed_position_reads_the_spec_threshold_and_rule() {
+        let g = node(Op::Gauss, vec![input(0)]);
+        let shifted = TradingSpec { threshold: 1e-30, ..TradingSpec::default() };
+        assert_eq!(fixed_position(&g, &shifted), None);
+        let high = TradingSpec { threshold: 1.0, ..TradingSpec::default() };
+        assert_eq!(fixed_position(&g, &high), Some(false));
+        let ramp = TradingSpec { tau: Some(0.5), ..TradingSpec::default() };
+        assert_eq!(fixed_position(&g, &ramp), None);
+        let tercile = TradingSpec { position: PositionMap::TopTercile, ..TradingSpec::default() };
+        assert_eq!(fixed_position(&g, &tercile), None);
+    }
+}
+
+#[cfg(test)]
+mod realised_position_tests {
+    use super::*;
+
+    /// #849: the realised position reads the book rows, at any threshold.
+    #[test]
+    fn realised_position_reads_the_exposure_of_the_book() {
+        let spec = TradingSpec { threshold: 1e-30, ..TradingSpec::default() };
+        assert_eq!(realised_position(1.0, &spec), Some(true));
+        assert_eq!(realised_position(0.0, &spec), Some(false));
+        assert_eq!(realised_position(0.5, &spec), None);
+        assert_eq!(realised_position(1.0, &TradingSpec { tau: Some(0.5), ..spec.clone() }), None);
+        assert_eq!(
+            realised_position(1.0, &TradingSpec { position: PositionMap::TopTercile, ..spec }),
+            None
+        );
     }
 }
