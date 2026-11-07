@@ -9,7 +9,9 @@
 # Exit 0 only when every suite passes, no CUDA target failed or timed out, and the benchmark recovers 27/27.
 # Exit 70 at once when the Xid count rose during a CUDA target (the remaining targets are not run).
 # Writes: $D/<tag>-{cpu,cuda,bench}.log, $D/<tag>-cuda-{build,summary}.log, $D/<tag>-cuda-<target>.log
-# The summary has one line per target: <target> rc=<n> xid=<a>-><b> secs=<s> | <test result line> [| timeout].
+# The summary has one line per target: <target> rc=<n> xid=<a>-><b> wait=<s> run=<s> | <test result line> [| timeout].
+# wait is the time from asking for the lock to the hold start (the hold writes its own start time, RCSR_NOW_CMD, default `date +%s`); run is the time from the hold start to its end.
+# Every hold (CPU suite, each CUDA target, benchmark) runs through lock-run.sh: a process the command leaves holding the lock is ended by pid.
 # $D/<tag>-cuda.log is the build failure (if any) plus every target log under a `=== <target> ===` header.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -27,9 +29,16 @@ if [ ! -d "$D" ]; then
   echo "gate dir $D missing; link it to the log directory or set RCSR_GATES" >&2
   exit 1
 fi
+LOCK_RUN=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lock-run.sh
+NOW_CMD=${RCSR_NOW_CMD:-date +%s}
+now() { bash -c "$NOW_CMD"; }
+# hold <command>: one test-lock hold; lock-run.sh ends every process the command leaves holding the lock
+hold() {
+  "$L" bash "$LOCK_RUN" "$LOCKFILE" bash -c "$1"
+}
 step() {
   local name=$1 cmd=$2
-  "$L" bash -c "cd '$W/my-version' && CARGO_BUILD_JOBS=2 $cmd" > "$D/$T-$name.log" 2>&1
+  hold "cd '$W/my-version' && CARGO_BUILD_JOBS=2 $cmd" > "$D/$T-$name.log" 2>&1
 }
 
 cuda_env="CARGO_BUILD_JOBS=2 RCSR_CUDA_ARCH=$CUDA_ARCH RCSR_REQUIRE_DEVICE=1"
@@ -39,10 +48,18 @@ cuda_targets=0
 cuda_failed=0
 cuda_timeouts=0
 
+hold_times() { # <call> <hold start> <end>: wait for the lock and run time of the hold, both in seconds
+  if [ -z "$2" ]; then
+    echo "wait=$(($3 - $1)) run=none"
+  else
+    echo "wait=$(($2 - $1)) run=$(($3 - $2))"
+  fi
+}
+
 # cuda_suite: sets g (0, 1 or 70) and the counters above.
 cuda_suite() {
   local log=$D/$T-cuda.log summary=$D/$T-cuda-summary.log build=$D/$T-cuda-build.log
-  local targets name args tlog rc xb xa res line t0
+  local targets name args tlog rc xb xa res line t0 t1 ts start
   : > "$log"
   : > "$summary"
   "$B" bash -c "cd '$W/my-version' && $cuda_env timeout -k $KILL_AFTER 5400 $cuda_cargo --no-run --message-format=json" > "$build" 2>&1
@@ -71,12 +88,17 @@ cuda_suite() {
     cuda_targets=$((cuda_targets + 1))
     tlog=$D/$T-cuda-$name.log
     xb=$(xid_count)
-    t0=$SECONDS
-    "$L" bash -c "cd '$W/my-version' && $cuda_env timeout -k $KILL_AFTER $cuda_hold $cuda_cargo --no-fail-fast $args" > "$tlog" 2>&1
+    start=$D/$T-cuda-$name.start
+    rm -f "$start"
+    t0=$(now)
+    hold "$NOW_CMD > '$start' && cd '$W/my-version' && $cuda_env timeout -k $KILL_AFTER $cuda_hold $cuda_cargo --no-fail-fast $args" > "$tlog" 2>&1
     rc=$?
+    t1=$(now)
+    ts=$(cat "$start" 2> /dev/null)
+    rm -f "$start"
     xa=$(xid_count)
     res=$(grep -a '^test result:' "$tlog" | tail -n 1)
-    line="$name rc=$rc xid=$xb->$xa secs=$((SECONDS - t0)) | ${res:-no test result line}"
+    line="$name rc=$rc xid=$xb->$xa $(hold_times "$t0" "$ts" "$t1") | ${res:-no test result line}"
     if [ "$rc" -eq 124 ]; then
       line="$line | timeout"
       cuda_timeouts=$((cuda_timeouts + 1))
@@ -106,7 +128,7 @@ for k in cpu cuda; do
   [ "$failed" -eq 0 ] || bad=1
 done
 echo "cuda: targets=$cuda_targets failed=$cuda_failed timeouts=$cuda_timeouts"
-rec=$(grep -a -E 'recovered [0-9]+/[0-9]+' "$D/$T-bench.log" | tail -n 1)
+rec=$(grep -a -E '^recovered [0-9]+/[0-9]+' "$D/$T-bench.log" | tail -n 1)
 echo "bench: ${rec:-no recovered line}"
 echo "exit cpu=$c cuda=$g bench=$b"
 echo "tested: $(git -C "$W" rev-parse HEAD)"
