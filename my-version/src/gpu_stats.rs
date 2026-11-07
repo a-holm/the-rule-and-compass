@@ -1086,6 +1086,8 @@ mod tests {
             trade_floor_slots: 4,
             full_passes: 6,
             finite: 2,
+            floor_finite: 1,
+            floor_unchecked: 3,
         };
         l.record_eval_check(c);
         l.record_eval_check(EvalCheckLedger { pool_s: f64::NAN, prefix_s: -1.0, slots: 1, ..Default::default() });
@@ -1095,6 +1097,7 @@ mod tests {
         assert_eq!(l.unaccounted_s(), 0.0);
         let got = l.eval_check();
         assert_eq!((got.slots, got.trade_floor_slots, got.full_passes, got.finite), (11, 4, 6, 2));
+        assert_eq!((got.floor_finite, got.floor_unchecked), (1, 3));
         assert_eq!(got.seconds(), 1.75);
         let mut total = RunLedger::new();
         total.absorb(&l);
