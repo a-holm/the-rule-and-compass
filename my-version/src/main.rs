@@ -3955,6 +3955,11 @@ fn main() {
             std::process::exit(EXIT_USAGE);
         }
     };
+    if let rcsr::dispatch::CalibrationSource::File(f) = &cfg.calibration {
+        if let Some(notice) = f.calibration.load_notice().filter(|_| !quiet) {
+            eprintln!("# calibration: {}: {}", f.origin.path, notice);
+        }
+    }
     // #733: a resumed run must price with the calibration the run started with.
     if let Some(cp) = &resume_checkpoint {
         let now = rcsr::checkpoint::CalibrationRecord::of(&cfg.calibration);
