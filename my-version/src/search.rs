@@ -1996,7 +1996,7 @@ impl GpuSearch {
             .fallback
             .as_ref()
             .expect("a GPU search owns its fallback pool")
-            .submit(jobs, data, cfg);
+            .submit_checked(jobs, data, cfg);
         check.pool_s = submit_start.elapsed().as_secs_f64();
         Some(PendingCheck { full, ticket, check })
     }
@@ -2028,13 +2028,16 @@ impl GpuSearch {
     fn check_end(&mut self, islands: &mut [Vec<Ind>], pending: PendingCheck, generation: usize) {
         let PendingCheck { full, ticket, mut check } = pending;
         let wait_start = std::time::Instant::now();
-        let (errors, seconds) = self
+        let (errors, seconds, work) = self
             .fallback
             .as_ref()
             .expect("a GPU search owns its fallback pool")
-            .finish(ticket);
+            .finish_checked(ticket);
         check.pool_s += wait_start.elapsed().as_secs_f64();
+        check.early_rows = work.early_rows;
         let stats = self.stats.entry(generation).or_default();
+        stats.nonfinite_early += work.early as usize;
+        stats.nonfinite_no_book += work.no_book as usize;
         for (&(i, j), e) in full.iter().zip(errors) {
             stats.nonfinite_cpu_finite += e.is_finite() as usize;
             check.finite += e.is_finite() as u64;
@@ -2489,6 +2492,8 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             nonfinite_trade_floor: batch.map(|b| b.nonfinite_trade_floor).unwrap_or(0),
             nonfinite_constant: batch.map(|b| b.nonfinite_constant).unwrap_or(0),
             nonfinite_bound: batch.map(|b| b.nonfinite_bound).unwrap_or(0),
+            nonfinite_early: batch.map(|b| b.nonfinite_early).unwrap_or(0),
+            nonfinite_no_book: batch.map(|b| b.nonfinite_no_book).unwrap_or(0),
             nonfinite_full: batch.map(|b| b.nonfinite_full).unwrap_or(0),
             nonfinite_cpu_finite: batch.map(|b| b.nonfinite_cpu_finite).unwrap_or(0),
             nonfinite_seconds: batch.map(|b| b.nonfinite_seconds).unwrap_or(0.0),
@@ -2727,12 +2732,15 @@ struct FallbackChunk {
     jobs: Vec<(usize, Node)>,
     ctx: ScoreContext,
     blocks: Vec<expr::Block>,
+    /// #896: jobs of the device `+inf` check run through [`score_tree_checked_work`].
+    checked: bool,
 }
 
 #[cfg(feature = "cuda")]
 struct FallbackResult {
     start: usize,
     errors: Vec<f64>,
+    work: CheckWork,
 }
 
 #[cfg(feature = "cuda")]
@@ -2774,13 +2782,21 @@ impl FallbackPool {
                         // `score`, which is blocked waiting for this result.
                         let (train, cfg) = unsafe { (&*chunk.ctx.0, &*chunk.ctx.1) };
                         let mut errors = Vec::with_capacity(chunk.jobs.len());
+                        let mut work = CheckWork::default();
                         for (_, tree) in &chunk.jobs {
-                            errors.push(score_tree(tree, train, cfg));
+                            if chunk.checked {
+                                let (error, w) = score_tree_checked_work(tree, train, cfg);
+                                work.add(w);
+                                errors.push(error);
+                            } else {
+                                errors.push(score_tree(tree, train, cfg));
+                            }
                         }
                         if done_tx
                             .send(FallbackResult {
                                 start: chunk.start,
                                 errors,
+                                work,
                             })
                             .is_err()
                         {
@@ -2808,6 +2824,22 @@ impl FallbackPool {
     /// results. Splitting submit from finish lets the caller overlap the CPU
     /// fallback with the GPU kernel instead of paying a serial tail.
     fn submit(&self, jobs: Vec<(usize, Node)>, train: &EvalSample, cfg: &Config) -> FallbackTicket {
+        self.submit_jobs(jobs, train, cfg, false)
+    }
+
+    /// #896: [`Self::submit`] for the jobs of the device `+inf` check, which
+    /// run through [`score_tree_checked_work`].
+    fn submit_checked(&self, jobs: Vec<(usize, Node)>, train: &EvalSample, cfg: &Config) -> FallbackTicket {
+        self.submit_jobs(jobs, train, cfg, true)
+    }
+
+    fn submit_jobs(
+        &self,
+        jobs: Vec<(usize, Node)>,
+        train: &EvalSample,
+        cfg: &Config,
+        checked: bool,
+    ) -> FallbackTicket {
         debug_assert!(self.queue >= 1, "the fallback queue is bounded but non-empty");
         debug_assert!(
             self.busy.load(std::sync::atomic::Ordering::Relaxed) <= self.workers,
@@ -2834,6 +2866,7 @@ impl FallbackPool {
                     jobs,
                     ctx,
                     blocks: blocks.clone(),
+                    checked,
                 })
                 .expect("the fallback pool is alive");
             chunks += 1;
@@ -2849,6 +2882,13 @@ impl FallbackPool {
     /// Wait for a submitted batch and return errors in job order plus the
     /// wall-clock seconds since submission.
     fn finish(&self, ticket: FallbackTicket) -> (Vec<f64>, f64) {
+        let (out, seconds, _) = self.finish_checked(ticket);
+        (out, seconds)
+    }
+
+    /// #896: [`Self::finish`] plus the work the early-exit passes did.
+    fn finish_checked(&self, ticket: FallbackTicket) -> (Vec<f64>, f64, CheckWork) {
+        let mut work = CheckWork::default();
         let mut out = vec![f64::NAN; ticket.total];
         let mut received = 0;
         while received < ticket.chunks {
@@ -2856,6 +2896,7 @@ impl FallbackPool {
                 .done
                 .recv()
                 .expect("the fallback pool returned a result");
+            work.add(result.work);
             for (offset, error) in result.errors.into_iter().enumerate() {
                 // `start` is the chunk ordinal; the absolute job index is
                 // recomputed from the chunk's own position in the job list.
@@ -2866,7 +2907,7 @@ impl FallbackPool {
             }
             received += 1;
         }
-        (out, ticket.started.elapsed().as_secs_f64())
+        (out, ticket.started.elapsed().as_secs_f64(), work)
     }
 
     /// Score `jobs` on the pool and return errors in the same order, plus the
@@ -4096,6 +4137,101 @@ fn flat_bound_rule(train: &Sample, cfg: &Config, threads_gradual: bool) -> Optio
         && book.min_trades() >= 1
         && threads_gradual)
     .then(|| book.threshold())
+}
+
+/// #896: work the early-exit passes of a check batch did.
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CheckWork {
+    /// Passes stopped at a non-finite row.
+    early: u64,
+    /// Rows evaluated by those passes.
+    early_rows: u64,
+    /// Flat passes that skipped the book.
+    no_book: u64,
+}
+
+#[cfg(feature = "cuda")]
+impl CheckWork {
+    fn add(&mut self, o: CheckWork) {
+        self.early += o.early;
+        self.early_rows += o.early_rows;
+        self.no_book += o.no_book;
+    }
+}
+
+/// #896: rows evaluated between two scans of a check pass.
+#[cfg(any(feature = "cuda", test))]
+const CHECK_CHUNK: usize = 16_384;
+
+/// #896: [`score_tree`] for a slot of the device `+inf` check. The same bits,
+/// cheaper for a `+inf` result.
+#[cfg(test)]
+fn score_tree_checked(tree: &Node, data: &EvalSample, cfg: &Config) -> f64 {
+    score_tree_checked_work(tree, data, cfg).0
+}
+
+/// #896: [`score_tree_checked`] and the work it saved.
+///
+/// The compiled program and the tile kernel are the ones [`PredBuf::fill`]
+/// uses, and every row value depends on its own row only, so a row range gives
+/// the bits of the full call. The book and the plain metric read the same
+/// buffer through the same functions. A non-finite prediction makes the book
+/// score `+inf` (`totals` sets `nonfinite`) and every plain unweighted metric
+/// too (`score_with_constants`). With `min_trades >= 1` and no row above the
+/// threshold the book counts no flip, so the score is `+inf` without it.
+/// Anything else, and every shape this does not model, takes [`score_tree`].
+#[cfg(any(feature = "cuda", test))]
+fn score_tree_checked_work(tree: &Node, data: &EvalSample, cfg: &Config) -> (f64, CheckWork) {
+    let mut work = CheckWork::default();
+    let s = data.sample;
+    let (Some(cols), Some(program)) = (&data.cols, crate::eval_soa::compile(tree)) else {
+        return (score_tree(tree, data, cfg), work);
+    };
+    let book = cfg.fitness.book();
+    let modelled = !s.is_multi()
+        && !s.is_empty()
+        && s.x.len() == s.len()
+        && s.w.is_empty()
+        && match book {
+            Some(b) => b.len() == s.len(),
+            None => !cfg.metric.is_implicit(),
+        };
+    if !modelled {
+        return (score_tree(tree, data, cfg), work);
+    }
+    PRED_BUF.with(|cell| {
+        let Ok(mut buf) = cell.try_borrow_mut() else {
+            return (score_tree(tree, data, cfg), CheckWork::default());
+        };
+        let PredBuf { pred, scratch } = &mut *buf;
+        pred.clear();
+        pred.resize(s.len(), 0.0);
+        let mut long = false;
+        let mut start = 0;
+        while start < s.len() {
+            let end = (start + CHECK_CHUNK).min(s.len());
+            crate::eval_soa::eval_rows_into(&program, cols, start, end, pred, scratch);
+            for &p in &pred[start..end] {
+                if !p.is_finite() {
+                    work.early = 1;
+                    work.early_rows = end as u64;
+                    return (f64::INFINITY, work);
+                }
+                long |= book.is_some_and(|b| p > b.threshold());
+            }
+            start = end;
+        }
+        let error = match book {
+            Some(b) if !long && b.min_trades() >= 1 => {
+                work.no_book = 1;
+                f64::INFINITY
+            }
+            Some(b) => b.regret(pred),
+            None => crate::metrics::score_sample(pred, s, cfg.metric, expr::count_constants(tree)),
+        };
+        (error, work)
+    })
 }
 
 /// #500/#589: whether a non-finite prediction in the first rows decides the
@@ -6135,6 +6271,9 @@ pub struct GpuGenStats {
     /// #895: of the trade-floor and status-2 slots, those an exact f64 interval bound
     /// of the tree settled without a pass, counted inside `nonfinite` and `nonfinite_trade_floor`.
     pub nonfinite_bound: usize,
+    /// #896: full passes stopped at a non-finite row, and flat passes that skipped the book.
+    pub nonfinite_early: usize,
+    pub nonfinite_no_book: usize,
     /// #589: of those, the ones the f64 prefix probe did not settle, so a full
     /// CPU pass ran.
     pub nonfinite_full: usize,
@@ -6729,6 +6868,9 @@ pub struct GpuSnapshot {
     /// #895: of the trade-floor and status-2 slots, those an exact f64 interval bound
     /// of the tree settled without a pass, counted inside `nonfinite` and `nonfinite_trade_floor`.
     pub nonfinite_bound: usize,
+    /// #896: full passes stopped at a non-finite row, and flat passes that skipped the book.
+    pub nonfinite_early: usize,
+    pub nonfinite_no_book: usize,
     pub nonfinite_full: usize,
     pub nonfinite_cpu_finite: usize,
     pub nonfinite_seconds: f64,
@@ -6772,6 +6914,8 @@ impl GpuSnapshot {
             nonfinite_trade_floor: self.nonfinite_trade_floor,
             nonfinite_constant: self.nonfinite_constant,
             nonfinite_bound: self.nonfinite_bound,
+            nonfinite_early: self.nonfinite_early,
+            nonfinite_no_book: self.nonfinite_no_book,
             nonfinite_full: self.nonfinite_full,
             nonfinite_cpu_finite: self.nonfinite_cpu_finite,
             nonfinite_seconds: self.nonfinite_seconds,
@@ -6921,6 +7065,8 @@ fn dev_generation(
         nonfinite_trade_floor: g.nonfinite_trade_floor,
         nonfinite_constant: g.nonfinite_constant,
         nonfinite_bound: g.nonfinite_bound,
+        nonfinite_early: g.nonfinite_early,
+        nonfinite_no_book: g.nonfinite_no_book,
         nonfinite_full: g.nonfinite_full,
         nonfinite_cpu_finite: g.nonfinite_cpu_finite,
         nonfinite_seconds: g.nonfinite_seconds,
@@ -7157,6 +7303,8 @@ fn run_postfix_search(
             nonfinite_trade_floor: 0,
             nonfinite_constant: 0,
             nonfinite_bound: 0,
+            nonfinite_early: 0,
+            nonfinite_no_book: 0,
             nonfinite_full: 0,
             nonfinite_cpu_finite: 0,
             nonfinite_seconds: 0.0,
@@ -12487,6 +12635,118 @@ mod tests {
         let ledger = g.ledger.eval_check();
         assert_eq!((ledger.bound_flat, ledger.full_passes), (1, 1), "{ledger:?}");
         assert_eq!(score_tree(&islands[0][0].tree, &view, &cfg), f64::INFINITY);
+    }
+
+    /// #896: a sample of 40,000 rows with a column of finite values, a flat
+    /// column and columns that are non-finite at one row each.
+    fn checked_fixture(min_trades: usize, blocks: usize, book: bool) -> (Sample, Config) {
+        let n = 40_000;
+        let x: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                vec![
+                    ((i * 7919) % 1000) as f64 / 1000.0 - 0.5,
+                    -1.0,
+                    if i == 0 { f64::NAN } else { 0.3 },
+                    if i == 20_000 { f64::NAN } else { 0.3 },
+                    if i == n - 1 { f64::NAN } else { 0.3 },
+                    if i == 25_000 { 7.0 } else { 0.3 },
+                ]
+            })
+            .collect();
+        let y: Vec<f64> = x.iter().map(|r| 0.01 * r[0]).collect();
+        let s = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
+        if !book {
+            return (s, Config { metric: crate::metrics::Metric::Squared, ..Config::default() });
+        }
+        let rows = crate::trading::TradingRows {
+            time: (0..n).map(|i| 900.0 * i as f64).collect(),
+            group: vec![0; n],
+            funding: Vec::new(),
+        };
+        let slice = crate::data::TradingSlice { rows, ret: s.y.clone() };
+        let spec = crate::trading::TradingSpec { cost_bps: 1.0, min_trades, ..Default::default() };
+        let book = crate::trading::FitnessBook::with_blocks(&slice, &spec, 900.0, blocks, 1.0).unwrap();
+        (s, Config { fitness: Fitness::LongPnl(std::sync::Arc::new(book)), ..Config::default() })
+    }
+
+    /// #896: `score_tree_checked` returns the bits of `score_tree`: for long
+    /// and finite trees, flat trees with `--min-trades` 1 and 0, trees that are
+    /// non-finite at the first, a middle and the last row, a status-2 shape, a
+    /// 4-block book and the squared metric. It stops at the first non-finite
+    /// chunk and skips the book for a flat pass.
+    #[test]
+    fn checked_score_matches_score_tree() {
+        let un = |op: Op, a: Node| node(op, vec![a]);
+        let rows = 40_000usize;
+        let stop = |row: usize| (((row / CHECK_CHUNK) + 1) * CHECK_CHUNK).min(rows) as u64;
+        // (tree, row of the first non-finite value)
+        let trees: Vec<(Node, Option<usize>)> = vec![
+            (input(0), None),
+            (un(Op::Logistic, input(0)), None),
+            (un(Op::Exp, un(Op::Exp, input(0))), None),
+            (input(1), None),
+            (constant(-1.0), None),
+            (input(2), Some(0)),
+            (input(3), Some(20_000)),
+            (input(4), Some(rows - 1)),
+            (un(Op::Exp, un(Op::Exp, input(5))), Some(25_000)),
+            (node(Op::Div, vec![input(0), constant(0.0)]), Some(0)),
+        ];
+        let cases = [(1usize, 1usize, true), (0, 1, true), (5, 4, true), (1, 1, false)];
+        let (mut early, mut no_book, mut full) = (0, 0, 0);
+        for (min_trades, blocks, book) in cases {
+            let (s, cfg) = checked_fixture(min_trades, blocks, book);
+            let view = EvalSample::new(&s, &cfg);
+            let scalar = EvalSample { sample: &s, cols: None };
+            for (tree, first_bad) in &trees {
+                let exact = score_tree(tree, &view, &cfg);
+                let (got, work) = score_tree_checked_work(tree, &view, &cfg);
+                assert_eq!(got.to_bits(), exact.to_bits(), "{tree:?} min_trades={min_trades} blocks={blocks} book={book}");
+                assert_eq!(score_tree_checked(tree, &view, &cfg).to_bits(), exact.to_bits());
+                assert_eq!(score_tree_checked(tree, &scalar, &cfg).to_bits(), score_tree(tree, &scalar, &cfg).to_bits());
+                match first_bad {
+                    Some(row) => {
+                        assert_eq!(got, f64::INFINITY);
+                        assert_eq!(work, CheckWork { early: 1, early_rows: stop(*row), no_book: 0 }, "{tree:?}");
+                        early += 1;
+                    }
+                    None => {
+                        assert_eq!((work.early, work.early_rows), (0, 0), "{tree:?}");
+                        no_book += work.no_book;
+                        full += (work.no_book == 0) as u64;
+                        let flat = matches!(tree.op, Op::Const) || tree.op == Op::Input && tree.val == 1.0;
+                        assert_eq!(work.no_book == 1, flat && book && min_trades >= 1, "{tree:?} {min_trades} {book}");
+                    }
+                }
+            }
+        }
+        assert_eq!((early, no_book), (20, 4), "full passes: {full}");
+        let (s, cfg) = checked_fixture(1, 1, true);
+        let view = EvalSample::new(&s, &cfg);
+        let long = score_tree(&input(0), &view, &cfg);
+        assert!(long.is_finite(), "a long tree scores finite: {long}");
+        let weighted = Sample { w: vec![1.0; s.len()], ..s.clone() };
+        let view = EvalSample::new(&weighted, &cfg);
+        let (got, work) = score_tree_checked_work(&input(2), &view, &cfg);
+        assert_eq!((got.to_bits(), work), (score_tree(&input(2), &view, &cfg).to_bits(), CheckWork::default()), "weights take score_tree");
+    }
+
+    /// #896: a sample whose `x` has one row more than `y` is not modelled by the
+    /// checked pass: both paths give `+inf`.
+    #[test]
+    fn checked_score_takes_score_tree_when_x_and_y_differ() {
+        let (s, cfg) = checked_fixture(1, 1, false);
+        let mut x = s.x.clone();
+        x.push(x[0].clone());
+        let odd = Sample { x, ..s.clone() };
+        assert_eq!(odd.x.len(), 40_001);
+        assert_eq!(odd.y.len(), 40_000);
+        let view = EvalSample::new(&odd, &cfg);
+        let tree = input(0);
+        assert_eq!(score_tree(&tree, &view, &cfg), f64::INFINITY);
+        let (got, work) = score_tree_checked_work(&tree, &view, &cfg);
+        assert_eq!(got.to_bits(), f64::INFINITY.to_bits());
+        assert_eq!(work, CheckWork::default());
     }
 
     /// A run clock for the device searches built in tests (a clock read inside a

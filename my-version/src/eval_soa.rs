@@ -640,6 +640,54 @@ pub fn eval_batch_into(
     tile::eval(p, cols, rows, out, stack);
 }
 
+/// #896: rows `start..end` of [`eval_batch_into`], written to `out[start..end]`.
+///
+/// Every value is an elementwise function of its own row, so a range gives the
+/// bits of the same rows of a full call. `start` need not be a multiple of
+/// [`TILE`]; tiles are cut from `start`. `end` is clamped to `out.len()`.
+pub fn eval_rows_into(
+    p: &Program,
+    cols: &[Vec<f64>],
+    start: usize,
+    end: usize,
+    out: &mut [f64],
+    scratch: &mut Scratch,
+) {
+    let end = end.min(out.len());
+    if start >= end {
+        return;
+    }
+    if p.steps.is_empty() {
+        for v in &mut out[start..end] {
+            *v = f64::NAN;
+        }
+        return;
+    }
+    let covered = p
+        .inputs
+        .iter()
+        .all(|&v| cols.get(v).is_some_and(|c| c.len() >= end));
+    if !covered {
+        eval_scalar_rows(p, cols, start, end, out);
+        return;
+    }
+    let need = p.stack_depth.max(1) * TILE;
+    if scratch.stack.len() < need {
+        scratch.stack.resize(need, 0.0);
+    }
+    let stack = &mut scratch.stack[..need];
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx") {
+            // SAFETY: the feature is detected above and the function is
+            // annotated `target_feature(enable = "avx")`.
+            unsafe { tile::eval_avx_range(p, cols, start, end, out, stack) };
+            return;
+        }
+    }
+    tile::eval_range(p, cols, start, end, out, stack);
+}
+
 /// The four-row AVX kernel: the whole program once per group of four rows.
 /// Kept as the reference [`eval_batch`] is measured and tested against.
 pub fn eval_batch_rows4(p: &Program, cols: &[Vec<f64>], rows: usize, out: &mut [f64]) {
@@ -852,10 +900,10 @@ mod tile {
     }
 
     #[inline(always)]
-    fn run(p: &Program, cols: &[Vec<f64>], rows: usize, out: &mut [f64], s: &mut [f64]) {
-        let mut base = 0;
-        while base < rows {
-            let n = TILE.min(rows - base);
+    fn run(p: &Program, cols: &[Vec<f64>], start: usize, end: usize, out: &mut [f64], s: &mut [f64]) {
+        let mut base = start;
+        while base < end {
+            let n = TILE.min(end - base);
             run_tile(p, cols, base, n, s);
             out[base..base + n].copy_from_slice(&s[..n]);
             base += n;
@@ -863,7 +911,18 @@ mod tile {
     }
 
     pub(super) fn eval(p: &Program, cols: &[Vec<f64>], rows: usize, out: &mut [f64], s: &mut [f64]) {
-        run(p, cols, rows, out, s);
+        run(p, cols, 0, rows, out, s);
+    }
+
+    pub(super) fn eval_range(
+        p: &Program,
+        cols: &[Vec<f64>],
+        start: usize,
+        end: usize,
+        out: &mut [f64],
+        s: &mut [f64],
+    ) {
+        run(p, cols, start, end, out, s);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -875,7 +934,20 @@ mod tile {
         out: &mut [f64],
         s: &mut [f64],
     ) {
-        run(p, cols, rows, out, s);
+        run(p, cols, 0, rows, out, s);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx")]
+    pub(super) unsafe fn eval_avx_range(
+        p: &Program,
+        cols: &[Vec<f64>],
+        start: usize,
+        end: usize,
+        out: &mut [f64],
+        s: &mut [f64],
+    ) {
+        run(p, cols, start, end, out, s);
     }
 }
 
@@ -1043,5 +1115,129 @@ mod avx {
         if base < rows {
             eval_scalar_rows(p, cols, base, rows, out);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::{constant, input, node};
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn u(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn pick(&mut self, n: usize) -> usize {
+            (self.u() % n as u64) as usize
+        }
+        fn value(&mut self) -> f64 {
+            let s = if self.u() & 1 == 0 { 1.0 } else { -1.0 };
+            let f = (self.u() >> 11) as f64 / (1u64 << 53) as f64;
+            match self.pick(14) {
+                0 => 0.0,
+                1 => -0.0,
+                2 => f64::NAN,
+                3 => s * f64::INFINITY,
+                4 => s * 1e-12,
+                5 => s * 700.0,
+                6 => s * 1e6,
+                7 => s * 0.5,
+                8 => s * 1e-30,
+                9 => s * (f * 4.0).floor(),
+                _ => s * f * 10.0,
+            }
+        }
+    }
+
+    const UNARY: [Op; 20] = [
+        Op::Neg, Op::Exp, Op::Ln, Op::Abs, Op::Sqrt, Op::Sin, Op::Cos, Op::Tan, Op::Sinh, Op::Cosh,
+        Op::Tanh, Op::Logistic, Op::Step, Op::Gauss, Op::Square, Op::Cube, Op::Floor, Op::Ceil,
+        Op::Round, Op::Sign,
+    ];
+    const BINARY: [Op; 7] = [Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Pow, Op::Min, Op::Max];
+
+    fn random_tree(r: &mut Rng, depth: u32, vars: usize) -> Node {
+        if depth == 0 || r.pick(5) == 0 {
+            return if r.pick(3) == 0 { constant(r.value()) } else { input(r.pick(vars)) };
+        }
+        match r.pick(8) {
+            0..=3 => node(UNARY[r.pick(UNARY.len())], vec![random_tree(r, depth - 1, vars)]),
+            4..=6 => node(
+                BINARY[r.pick(BINARY.len())],
+                vec![random_tree(r, depth - 1, vars), random_tree(r, depth - 1, vars)],
+            ),
+            _ => node(
+                Op::If,
+                vec![
+                    random_tree(r, depth - 1, vars),
+                    random_tree(r, depth - 1, vars),
+                    random_tree(r, depth - 1, vars),
+                ],
+            ),
+        }
+    }
+
+    /// #896: a row range gives the bits of the same rows of a full call, on
+    /// the AVX path, on the portable tile kernel and on the scalar loop that a
+    /// short column selects.
+    #[test]
+    fn rows_into_matches_batch() {
+        let (rows, vars) = (3 * TILE + 37, 3usize);
+        let mut r = Rng(0x2545_f491_4f6c_dd1d);
+        let cols: Vec<Vec<f64>> = (0..vars).map(|_| (0..rows).map(|_| r.value()).collect()).collect();
+        let short: Vec<Vec<f64>> = cols.iter().map(|c| c[..rows - 20].to_vec()).collect();
+        let mut scratch = Scratch::new();
+        let mut checked = 0u64;
+        for t in 0..2_000 {
+            let tree = random_tree(&mut r, 4, vars);
+            let Some(p) = compile(&tree) else { panic!("only supported operators: {tree:?}") };
+            let mut full = vec![0.0; rows];
+            eval_batch_into(&p, &cols, rows, &mut full, &mut scratch);
+            let mut tiles_full = vec![0.0; rows];
+            tile::eval(&p, &cols, rows, &mut tiles_full, &mut vec![0.0; p.stack_depth().max(1) * TILE]);
+            let mut full_short = vec![0.0; rows];
+            eval_batch_into(&p, &short, rows, &mut full_short, &mut scratch);
+            let mut ranges = vec![(0, rows), (rows - 1, rows), (TILE - 1, TILE + 1), (5, 5), (rows, rows)];
+            let a = r.pick(rows);
+            ranges.push((a, a + 1));
+            for _ in 0..4 {
+                let s = r.pick(rows);
+                ranges.push((s, s + r.pick(rows - s + 1)));
+            }
+            ranges.push((TILE + 3, 2 * TILE + 3));
+            let need = p.stack_depth().max(1) * TILE;
+            for (start, end) in ranges {
+                let mut avx = vec![f64::from_bits(0x7ff8_dead_beef_0001); rows];
+                eval_rows_into(&p, &cols, start, end, &mut avx, &mut scratch);
+                let mut tiles = vec![f64::from_bits(0x7ff8_dead_beef_0001); rows];
+                let mut stack = vec![0.0; need];
+                tile::eval_range(&p, &cols, start, end, &mut tiles, &mut stack);
+                let mut tail = vec![f64::from_bits(0x7ff8_dead_beef_0001); rows];
+                eval_rows_into(&p, &short, start, end, &mut tail, &mut scratch);
+                for i in 0..rows {
+                    let inside = start <= i && i < end;
+                    if inside {
+                        // The sign and payload of a NaN follow the operand order the compiler
+                        // chose for a loop, so a NaN compares as a NaN; every other value by bits.
+                        let same = |a: f64, b: f64| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+                        assert!(same(avx[i], full[i]), "avx tree {t} row {i} range {start}..{end}: {tree:?}");
+                        assert!(same(tiles[i], tiles_full[i]), "tile tree {t} row {i} range {start}..{end}: {tree:?}");
+                        assert!(same(tail[i], full_short[i]), "short tree {t} row {i} range {start}..{end}: {tree:?}");
+                        assert!(same(tiles_full[i], full[i]), "tile build tree {t} row {i}: {tree:?}");
+                        checked += 1;
+                    } else {
+                        for out in [&avx, &tiles, &tail] {
+                            assert_eq!(out[i].to_bits(), 0x7ff8_dead_beef_0001, "row {i} outside {start}..{end} was written");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 100_000, "{checked}");
     }
 }

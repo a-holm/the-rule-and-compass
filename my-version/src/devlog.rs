@@ -334,6 +334,9 @@ pub struct GpuGen {
     pub nonfinite_constant: usize,
     /// #895: of those, the slots an f64 interval bound settled without a pass.
     pub nonfinite_bound: usize,
+    /// #896: of the full passes, those stopped at a non-finite row, and flat passes without the book.
+    pub nonfinite_early: usize,
+    pub nonfinite_no_book: usize,
     /// #589: of those, the ones that needed a full CPU pass.
     pub nonfinite_full: usize,
     /// #589: of the full passes, the ones finite on the CPU.
@@ -346,7 +349,7 @@ impl GpuGen {
     fn json(&self) -> String {
         format!(
             "{{\"batches\":{},\"programs\":{},\"kernel_s\":{},\"wall_s\":{},\"duty\":{},\
-             \"native\":{},\"fallbacks\":{},\"fallback_s\":{},\"fallback_workers\":{},\"nonfinite\":{},\"nonfinite_trade_floor\":{},\"nonfinite_constant\":{},\"nonfinite_bound\":{},\"nonfinite_full\":{},\"nonfinite_cpu_finite\":{},\"nonfinite_seconds\":{}}}",
+             \"native\":{},\"fallbacks\":{},\"fallback_s\":{},\"fallback_workers\":{},\"nonfinite\":{},\"nonfinite_trade_floor\":{},\"nonfinite_constant\":{},\"nonfinite_bound\":{},\"nonfinite_early\":{},\"nonfinite_no_book\":{},\"nonfinite_full\":{},\"nonfinite_cpu_finite\":{},\"nonfinite_seconds\":{}}}",
             self.batches,
             self.programs,
             num(self.kernel_s),
@@ -360,6 +363,8 @@ impl GpuGen {
             self.nonfinite_trade_floor,
             self.nonfinite_constant,
             self.nonfinite_bound,
+            self.nonfinite_early,
+            self.nonfinite_no_book,
             self.nonfinite_full,
             self.nonfinite_cpu_finite,
             num(self.nonfinite_seconds)
@@ -1231,6 +1236,8 @@ mod tests {
                 nonfinite_trade_floor: 3,
                 nonfinite_constant: 1,
                 nonfinite_bound: 1,
+                nonfinite_early: 2,
+                nonfinite_no_book: 1,
                 nonfinite_full: 2,
                 nonfinite_cpu_finite: 1,
                 nonfinite_seconds: 0.002,
@@ -1287,6 +1294,8 @@ mod tests {
         assert_eq!(gpu.get("nonfinite_trade_floor").and_then(|v| v.as_usize()), Some(3));
         assert_eq!(gpu.get("nonfinite_constant").and_then(|v| v.as_usize()), Some(1));
         assert_eq!(gpu.get("nonfinite_bound").and_then(|v| v.as_usize()), Some(1));
+        assert_eq!(gpu.get("nonfinite_early").and_then(|v| v.as_usize()), Some(2));
+        assert_eq!(gpu.get("nonfinite_no_book").and_then(|v| v.as_usize()), Some(1));
         assert_eq!(gpu.get("nonfinite_full").and_then(|v| v.as_usize()), Some(2));
         assert_eq!(gpu.get("nonfinite_seconds").and_then(|v| v.as_f64()), Some(0.002));
         let fit = parsed.get("fit").unwrap();
