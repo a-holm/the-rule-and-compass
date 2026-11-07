@@ -2607,7 +2607,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     }
     if let (Some((ledger, data_sha, current)), Some(report_sha)) = (&read, &report_sha) {
         if verify_read {
-            match ledger.baseline_report_sha() {
+            match ledger.baseline_report_sha().map_err(input_err)? {
                 Some(h) if h == *report_sha => {}
                 Some(h) => {
                     return Err(input_err(format!(

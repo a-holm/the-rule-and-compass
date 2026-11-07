@@ -100,7 +100,7 @@ fn if_plan_carries_the_third_child_in_the_slot_word() {
 #[test]
 fn if_device_fit_matches_the_cpu_fit_including_the_switch_point() {
     if !probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let (x, y) = rows();
@@ -148,7 +148,7 @@ fn sample(x: Vec<Vec<f64>>, y: Vec<f64>) -> Sample {
 #[test]
 fn a_search_with_if_fits_on_the_device() {
     if !probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let (x, y) = rows();

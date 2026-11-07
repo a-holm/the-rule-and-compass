@@ -1,17 +1,20 @@
 //! #733: a checkpoint records the calibration source of its run, and `--resume`
 //! refuses a run that would price with another one.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 #[path = "common/scratch.rs"]
 mod scratch;
 
 use scratch::Scratch;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/clean.csv");
 
 fn run(cache: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(["--data", DATA, "--target", "y", "--vars", "x", "--cpu", "--quiet"])
         .args(args)
         .env("XDG_CACHE_HOME", cache)
@@ -40,7 +43,7 @@ fn resume(cache: &Path, path: &Path, extra: &[&str]) -> Output {
 }
 
 fn calibrate(cache: &Path, file: &Path) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args(["calibrate", "--cpu", "--no-enrich", "--out"])
         .arg(file)
         .env("XDG_CACHE_HOME", cache)

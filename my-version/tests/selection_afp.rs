@@ -1,9 +1,11 @@
 //! #465: age-fitness Pareto survivor selection (`--selection afp`).
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::checkpoint::Checkpoint;
 use rcsr::data::Sample;
 use rcsr::search::{self, Config, Selection};
-use std::process::Command;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -101,7 +103,7 @@ fn lexicographic_checkpoints_carry_no_selection_or_ages() {
 
 fn rcsr(args: &[&str]) -> std::process::Output {
     let data = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/clean.csv");
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(["--data", data, "--target", "y", "--vars", "x", "--cpu", "--quiet"])
         .args(args)
         .output()
@@ -170,7 +172,7 @@ fn afp_is_deterministic_on_the_device() {
         };
         let a = run(1);
         if a.backend != rcsr::backend::Kind::Gpu {
-            eprintln!("skipped: no usable device ({:?})", a.backend_reason);
+            rcsr::backend::skip_without_device(&format!("skipped: no usable device ({:?})", a.backend_reason));
             return;
         }
         let b = run(1);

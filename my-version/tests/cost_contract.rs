@@ -1,9 +1,12 @@
 //! #487: one cost, one return unit and one position rule from the search to
 //! walk-forward, ablation score and the ladder.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::devlog::Json;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 const T0: i64 = 1_600_000_000;
 const STEP: i64 = 900;
@@ -74,7 +77,7 @@ fn write_windows(dir: &Path) -> String {
 }
 
 fn rcsr(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().expect("run rcsr")
+    rcsr_cmd::rcsr().args(args).output().expect("run rcsr")
 }
 
 fn code(o: &Output) -> i32 {

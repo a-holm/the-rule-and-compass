@@ -9,9 +9,11 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use rcsr::data;
 use rcsr::devlog::Json;
@@ -29,7 +31,11 @@ const FULL_ROWS: usize = 4_775_757;
 const FULL_STORE: &str = "/mnt/lager/tmp/opencode/293-wide364.rcsb";
 
 fn has_device() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 #[path = "common/scratch.rs"]
@@ -141,7 +147,8 @@ fn search(store_path: &str, dir: &Path, extra: &[&str]) -> Run {
     let vars: Vec<String> = (0..VARS).map(|c| format!("x{c}")).collect();
     let manifest = dir.join("manifest.json");
     let devlog = dir.join("dev.log");
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    // The test runs the device search (`--gpu` is in the arguments).
+    let out = rcsr_cmd::rcsr_on_device()
         .args(["--data", store_path, "--target", "y", "--vars", &vars.join(",")])
         .args(["--time", "ts", "--group-by", "symbol"])
         .args(["--gpu", "--fit-strategy", "gpu", "--seed", "7"])

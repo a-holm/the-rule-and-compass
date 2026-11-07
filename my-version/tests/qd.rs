@@ -4,10 +4,13 @@
 //! change the Pareto front. These tests pin the off default, determinism and
 //! the presence of a real coverage report.
 
-use std::process::{Command, Output};
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
+use std::process::Output;
 
 fn rcsr(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")

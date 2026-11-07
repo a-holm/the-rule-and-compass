@@ -221,7 +221,7 @@ fn a_law_expressed_with_a_supplied_block_is_recovered() {
     let train = sample(xs.clone(), ys.clone());
     let test = sample(xs, ys);
 
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
     cfg.generations = 25;
     cfg.pop = 120;
     cfg.islands = 1;
@@ -265,7 +265,7 @@ fn no_functions_keeps_the_baseline_behaviour() {
     let train = sample(xs.clone(), g.clone());
     let test = sample(xs, g);
 
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
     cfg.generations = 50;
     cfg.pop = 100;
     cfg.islands = 1;

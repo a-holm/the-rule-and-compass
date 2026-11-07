@@ -5,6 +5,9 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data;
 use rcsr::enrich_gpu::{DeviceColumn, EnrichGpu, ProjectedSource};
 use rcsr::projected_ring::{overlap_probe, ProjectedRing, RingGroup, RingOptions, StallGate};
@@ -119,7 +122,7 @@ fn run(fs: &FileStore, b: &Built, slots: usize, names: &[String]) -> (Vec<Vec<u6
 #[test]
 fn ring_is_bounded_constant_and_tiles_are_invariant() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let dir = tmp_dir("bound");
@@ -197,7 +200,7 @@ fn ring_is_bounded_constant_and_tiles_are_invariant() {
 #[test]
 fn copy_overlaps_compute_with_events_not_stream_sync() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let probe = overlap_probe(8 * 1024 * 1024, 8, 20_000_000).expect("overlap probe");
@@ -355,7 +358,7 @@ enum Stop {
 #[test]
 fn early_exit_after_any_group_never_hangs() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let fx = RingFixture::new("early-exit");
@@ -399,7 +402,7 @@ fn early_exit_after_any_group_never_hangs() {
 #[test]
 fn dropped_group_returns_its_slot() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let fx = RingFixture::new("dropped-group");
@@ -440,7 +443,7 @@ fn dropped_group_returns_its_slot() {
 #[test]
 fn stalled_reader_times_out_with_ring_state() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     // Ring level: the wait expires within its bound and names the state.
@@ -483,7 +486,8 @@ fn stalled_reader_times_out_with_ring_state() {
     write_store(&src, 520_000, 65_536);
     let features = "r1,r5,lag_r1_3,range1,clv1,hour_sin,ma20";
     let enrich = |out: &str, stall: bool| {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"));
+        // The test runs the projected device ring.
+        let mut cmd = rcsr_cmd::rcsr_on_device();
         cmd.args(["enrich", "--data", &src, "--out", out, "--features", features]);
         cmd.args(["--gpu", "on", "--allow-lockbox"]);
         cmd.env_remove("RCSR_RING_WAIT_MS").env_remove("RCSR_TEST_RING_STALL_GROUP");
@@ -535,7 +539,7 @@ fn stalled_reader_times_out_with_ring_state() {
 #[test]
 fn reader_that_ignores_cancel_is_detached_not_joined() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     /// Releases the gate on every path, so a failing assertion cannot leave a
@@ -584,7 +588,7 @@ fn reader_that_ignores_cancel_is_detached_not_joined() {
 #[test]
 fn stale_cuda_error_does_not_fail_the_transport() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping: no CUDA device");
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
         return;
     }
     let dir = tmp_dir("stale");
