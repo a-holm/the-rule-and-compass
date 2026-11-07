@@ -545,6 +545,20 @@ mod tests {
     }
 
     #[test]
+    fn libm_widening_covers_two_ulps() {
+        let two_down = |v: f64| v.next_down().next_down();
+        let two_up = |v: f64| v.next_up().next_up();
+        for x in [-30.0f64, -1.0, 0.3, 1.0, 17.0, 300.0] {
+            let a = Iv { lo: x, hi: x };
+            let e = exp_guarded(a);
+            assert!(e.lo <= two_down(x.exp()) && two_up(x.exp()) <= e.hi, "exp {x}");
+            let t = tanh(a);
+            let (lo, hi) = (two_down(x.tanh()).max(-1.0), two_up(x.tanh()).min(1.0));
+            assert!(t.lo <= lo && hi <= t.hi, "tanh {x}");
+        }
+    }
+
+    #[test]
     fn libm_stays_inside_the_clamps() {
         for k in 0..200_000u32 {
             let x = -(k as f64) * 1e-3 - (k as f64).sqrt() * 1e-9;
