@@ -2208,10 +2208,12 @@ pub fn output_range(n: &Node) -> OutputRange {
             let at = |v: f64| if v == f64::INFINITY { 0.0 } else if v == f64::NEG_INFINITY { 2.0 } else { erfc(v) };
             range_of(at(a.hi), at(a.lo))
         }
+        // `eval` gives 0 for a NaN argument, and a step sits at the threshold 0 on a set
+        // of inputs, not at a single input, so the boundary rule must never call it fixed:
+        // the range reports a lower bound of -1 (sound, and below every threshold at 0).
         Step => {
             let a = k(0);
-            let at = |v: f64| if v > 0.0 { 1.0 } else { 0.0 };
-            OutputRange { lo: at(a.lo), hi: if a.hi > 0.0 { 1.0 } else { 0.0 } }
+            OutputRange { lo: -1.0, hi: if a.hi > 0.0 { 1.0 } else { 0.0 } }
         }
         Sign => {
             let a = k(0);
@@ -3730,8 +3732,8 @@ mod tests {
             (un(Sqrt, c(-1.0)), -inf, inf, None),
             (un(Erf, x()), -1.0, 1.0, None),
             (un(Erfc, x()), 0.0, 2.0, Some(true)),
-            (un(Step, x()), 0.0, 1.0, Some(true)),
-            (un(Step, bin(Add, c(2.0), un(Gauss, x()))), 1.0, 1.0, Some(true)),
+            (un(Step, x()), -1.0, 1.0, None),
+            (un(Step, bin(Add, c(2.0), un(Gauss, x()))), -1.0, 1.0, None),
             (un(Sign, x()), -1.0, 1.0, None),
             (node(If, vec![x(), c(1.0), c(2.0)]), -inf, inf, None),
             (aggregate(AggKind::Mean, Some(0), 0.5), 0.5, 0.5, Some(true)),
