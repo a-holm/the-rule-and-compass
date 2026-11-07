@@ -9,7 +9,6 @@ mod rcsr_cmd;
 mod scratch;
 
 use scratch::Scratch;
-use std::io::Write;
 use std::path::Path;
 use std::process::{Output, Stdio};
 
@@ -40,7 +39,7 @@ fn search(cache: &Path, extra: &[&str]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.as_mut().unwrap().write_all(csv().as_bytes()).unwrap();
+    rcsr_cmd::feed_stdin(&mut child, csv().as_bytes());
     child.wait_with_output().unwrap()
 }
 
@@ -287,4 +286,43 @@ fn calibrate_with_the_enrich_probe_writes_valid_rates() {
     let out = calibrate(dir.path(), &skipped, &["--no-enrich"]);
     assert_eq!(out.status.code(), Some(0));
     assert!(std::fs::read_to_string(&skipped).unwrap().contains("\"enrich\":null"));
+}
+
+/// #861: `rcsr dispatch-plan` prints the route table of the anchors against a
+/// calibration file, byte for byte the same in every process, and its flips
+/// stay few.
+#[test]
+fn dispatch_plan_prints_the_same_table_twice_and_few_flips() {
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/calibration_rtx3060.json");
+    let run = || {
+        rcsr_cmd::rcsr()
+            .args(["dispatch-plan", "--calibration", "anchors", "--against", fixture])
+            .output()
+            .unwrap()
+    };
+    let (a, b) = (run(), run());
+    assert_eq!(a.status.code(), Some(0), "{}", String::from_utf8_lossy(&a.stderr));
+    assert_eq!(a.stdout, b.stdout, "two processes print different bytes");
+    let text = String::from_utf8(a.stdout).unwrap();
+    let cells = text.lines().filter(|l| l.starts_with("eval ") || l.starts_with("fit ")).count();
+    assert_eq!(cells, 4950);
+    let summary = text.lines().last().unwrap();
+    let flips: usize = summary
+        .strip_prefix("grid cells 4950, flips ")
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("summary line: {summary}"));
+    assert!(flips <= 60, "{summary}");
+    let json = rcsr_cmd::rcsr()
+        .args(["dispatch-plan", "--against", fixture, "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json.status.code(), Some(0));
+    let json = String::from_utf8(json.stdout).unwrap();
+    assert!(json.starts_with("{\"schema\":\"rcsr-dispatch-plan/1\""), "{json}");
+    assert!(json.contains("\"cells\":4950"), "{json}");
+    let probe = rcsr_cmd::rcsr().args(["dispatch-plan", "--calibration", "probe"]).output().unwrap();
+    assert_eq!(probe.status.code(), Some(2));
+    let missing = rcsr_cmd::rcsr().args(["dispatch-plan", "--against", "/no/such/file.json"]).output().unwrap();
+    assert_eq!(missing.status.code(), Some(2));
 }

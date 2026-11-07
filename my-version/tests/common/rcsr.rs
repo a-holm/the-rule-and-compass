@@ -39,3 +39,14 @@ pub fn rcsr_for(args: &[&str]) -> Command {
         rcsr()
     }
 }
+
+/// Write `input` to the piped stdin of `child` and close it. A child that exits before it
+/// reads (a refused argument or file) closes the pipe: `BrokenPipe` then means "already
+/// exited", and the caller asserts on the exit status and output. Any other error panics.
+pub fn feed_stdin(child: &mut std::process::Child, input: &[u8]) {
+    use std::io::Write as _;
+    let mut stdin = child.stdin.take().expect("the child has a piped stdin");
+    if let Err(e) = stdin.write_all(input) {
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "cannot write the child's stdin: {e}");
+    }
+}
