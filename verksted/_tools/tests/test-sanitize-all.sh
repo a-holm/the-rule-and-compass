@@ -66,6 +66,7 @@ fake_timeout "$T/bin"
 cat > "$T/cuda-13.0/bin/compute-sanitizer" <<'STUB'
 #!/usr/bin/env bash
 echo "san under=${RCSR_UNDER_SANITIZER:-} $*" >> "$FAKE_DIR/san-calls"
+echo "req=${RCSR_REQUIRE_DEVICE:-}" >> "$FAKE_DIR/san-req"
 case "$*" in
   *"${FAKE_NC_ON:-@none@}"*)
     case "${FAKE_NC_MODE:-ok}" in
@@ -118,6 +119,7 @@ has full-named-skip-arg "$T/san-calls" 'san under=memcheck --tool memcheck --lea
 has full-api-skip-arg "$T/san-calls" 'error-exitcode 99 /fake/deps/gpu_memory_plan-eee --skip refused_alloc --exact$'
 has full-api-run "$T/san-calls" 'error-exitcode 99 --report-api-errors no /fake/deps/gpu_memory_plan-eee refused_alloc --exact$'
 has full-plain "$T/san-calls" 'error-exitcode 99 /fake/deps/gpu_fit-fff$'
+check full-require-device "$(sort -u "$T/san-req" | tr "\n" " ")" "req=1 "
 has full-lib "$T/san-calls" 'error-exitcode 99 /fake/deps/rcsr-aaa$'
 has full-bin "$T/san-calls" 'error-exitcode 99 /fake/deps/rcsr_bin-bbb$'
 has full-lock "$T/calls" '^lock .*timeout -k 30 580 '

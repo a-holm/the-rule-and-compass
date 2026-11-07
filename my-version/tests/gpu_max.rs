@@ -74,7 +74,11 @@ fn maximum_config(seed: u32) -> Config {
 
 #[cfg(feature = "cuda")]
 fn device_available() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 #[cfg(feature = "cuda")]
@@ -121,7 +125,7 @@ fn maximum_has_a_native_score_objective() {
 #[test]
 fn a_small_sample_keeps_the_cpu_maximum_fit_but_scores_natively() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(256, 4);
@@ -150,7 +154,7 @@ fn a_small_sample_keeps_the_cpu_maximum_fit_but_scores_natively() {
 #[test]
 fn gpu_maximum_run_is_deterministic_and_reports_the_exact_objective() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     // Above the crossover of the maximum fit cost model, so the fit arm runs on the device.
@@ -200,7 +204,7 @@ fn gpu_maximum_run_is_deterministic_and_reports_the_exact_objective() {
 #[test]
 fn the_maximum_arm_never_loses_to_the_cpu_polish_on_the_same_candidates() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     use rcsr::expr::{constant, input, node, Op};
@@ -300,7 +304,7 @@ fn the_maximum_arm_never_loses_to_the_cpu_polish_on_the_same_candidates() {
 #[test]
 fn no_fit_is_a_true_noop_for_the_maximum_gpu_arm() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     // Below the #288 scoring floor: `--no-fit` leaves neither a fit arm nor a
@@ -390,7 +394,7 @@ fn paired_batch(n: usize) -> (Sample, Vec<rcsr::expr::Node>, rcsr::gpu::GpuEvalu
 #[test]
 fn the_paired_maximum_batch_is_fitted_on_the_device_and_never_loses_to_its_start() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     use rcsr::fit::{fit_batch_verified, BatchedGpu};
@@ -439,7 +443,7 @@ fn the_paired_maximum_batch_is_fitted_on_the_device_and_never_loses_to_its_start
 #[ignore = "timing measurement"]
 fn measure_paired_maximum_fit() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     use rcsr::fit::{fit_batch_verified, fit_weighted_metric, BatchedGpu};

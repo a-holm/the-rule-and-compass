@@ -389,7 +389,7 @@ fn an_uninterrupted_run_and_a_saved_then_resumed_run_match_exactly() {
 #[test]
 fn a_gpu_run_and_a_gpu_resume_match_exactly() {
     if !rcsr::backend::probe().available() {
-        eprintln!("no usable GPU; skipping the GPU->GPU resume A/B test");
+        rcsr::backend::skip_without_device("no usable GPU; skipping the GPU->GPU resume A/B test");
         return;
     }
     let train = sample(240);
@@ -925,7 +925,7 @@ fn a_long_pnl_run_resumes_with_the_same_book_and_refuses_another() {
 #[test]
 fn a_resume_takes_the_requested_pipeline_depth() {
     if !rcsr::backend::probe().available() {
-        eprintln!("no usable GPU; skipping the resume pipeline-depth test");
+        rcsr::backend::skip_without_device("no usable GPU; skipping the resume pipeline-depth test");
         return;
     }
     let csv = TempPath::new("depth.csv");

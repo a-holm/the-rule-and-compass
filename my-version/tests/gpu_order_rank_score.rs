@@ -47,7 +47,11 @@ fn sample(n: usize, seed: u32, binary: bool) -> Sample {
 
 #[cfg(feature = "cuda")]
 fn device_available() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 #[cfg(feature = "cuda")]
@@ -75,7 +79,7 @@ fn no_fit_config(metric: Metric, seed: u32) -> Config {
 #[test]
 fn no_fit_scores_order_and_rank_metrics_on_the_device() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(rcsr::fit::MEDIAN_GPU_MIN_ROWS + 64, 7, false);
@@ -117,7 +121,7 @@ fn no_fit_scores_order_and_rank_metrics_on_the_device() {
 #[test]
 fn maximum_scores_natively_through_the_objective_kernel() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(rcsr::fit::MAXIMUM_GPU_MIN_ROWS + 64, 9, false);
@@ -138,7 +142,7 @@ fn maximum_scores_natively_through_the_objective_kernel() {
 #[test]
 fn auc_scores_natively_on_a_binary_target() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(rcsr::fit::MEDIAN_GPU_MIN_ROWS + 64, 11, true);

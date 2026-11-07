@@ -324,7 +324,7 @@ mod device {
     #[test]
     fn device_controls_match_the_cpu_reference_to_1e_9() {
         if !rcsr::trading_gpu::device_available() {
-            eprintln!("skip: no CUDA device");
+            rcsr::backend::skip_without_device("skip: no CUDA device");
             return;
         }
         for &(n, per_group) in &[(1usize, 1usize), (5, 5), (1_000_000, 20_000), (300_001, 7_777)] {
@@ -363,7 +363,7 @@ mod device {
     #[ignore]
     fn bench_ladder() {
         if !rcsr::trading_gpu::device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let n: usize = std::env::var("RCSR_LADDER_ROWS")

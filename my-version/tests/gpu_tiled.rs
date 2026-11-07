@@ -79,7 +79,11 @@ const KINDS: [ScoreObjective; 15] = [
 ];
 
 fn has_device() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 struct Lcg(u64);

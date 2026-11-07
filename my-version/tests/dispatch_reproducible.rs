@@ -92,14 +92,18 @@ fn sha256_of(path: &Path) -> String {
 
 #[cfg(feature = "cuda")]
 fn device_available() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 #[cfg(feature = "cuda")]
 #[test]
 fn two_auto_runs_give_one_front_and_one_route_ledger() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let cache = Scratch::new("auto-two");
@@ -117,7 +121,7 @@ fn two_auto_runs_give_one_front_and_one_route_ledger() {
 #[test]
 fn a_calibrated_file_gives_equal_fronts_and_its_own_hash() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let dir = Scratch::new("file-two");

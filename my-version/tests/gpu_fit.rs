@@ -224,7 +224,11 @@ fn log_squashed_is_admitted_to_the_gpu_evaluator() {
 
 #[cfg(feature = "cuda")]
 fn device_available() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 fn describe(out: &Outcome) -> Vec<(u64, usize, String)> {
@@ -366,7 +370,7 @@ fn checkpoint_round_trip_preserves_the_gpu_strategy() {
 #[test]
 fn gpu_fit_is_deterministic_for_repeated_seeds_and_island_counts() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(240, 5);
@@ -392,7 +396,7 @@ fn gpu_fit_is_deterministic_for_repeated_seeds_and_island_counts() {
 #[test]
 fn reported_finalists_are_refit_exactly_on_the_cpu() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(240, 7);
@@ -424,7 +428,7 @@ fn reported_finalists_are_refit_exactly_on_the_cpu() {
 #[test]
 fn reported_finalists_equal_cpu_score_for_every_native_metric() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let metrics = [
@@ -525,7 +529,7 @@ fn the_device_gate_admits_weighted_regression_metrics_with_a_weighted_form() {
 #[test]
 fn weighted_reported_finalists_equal_cpu_score_for_every_admitted_metric() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let metrics = [
@@ -583,7 +587,7 @@ fn weighted_reported_finalists_equal_cpu_score_for_every_admitted_metric() {
 #[test]
 fn unsupported_trees_fall_back_and_the_kernel_is_not_a_noop() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(240, 9);
@@ -609,7 +613,7 @@ fn unsupported_trees_fall_back_and_the_kernel_is_not_a_noop() {
 #[test]
 fn admission_fits_only_the_promoted_fraction() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(240, 31);
@@ -669,7 +673,7 @@ fn sample_with_outliers(n: usize, seed: u32) -> Sample {
 #[test]
 fn log_squashed_gpu_fit_runs_natively_and_reports_exact_f64() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample_with_outliers(240, 41);
@@ -718,7 +722,7 @@ fn log_squashed_gpu_fit_runs_natively_and_reports_exact_f64() {
 #[test]
 fn log_squashed_gpu_no_fit_is_a_true_noop() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample_with_outliers(240, 51);
@@ -746,7 +750,7 @@ fn log_squashed_gpu_no_fit_is_a_true_noop() {
 #[test]
 fn absolute_gpu_fit_runs_natively_and_reports_exact_f64() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample_with_outliers(240, 61);
@@ -786,7 +790,7 @@ fn absolute_gpu_fit_runs_natively_and_reports_exact_f64() {
 #[test]
 fn absolute_gpu_no_fit_is_a_true_noop() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample_with_outliers(240, 71);
@@ -818,7 +822,7 @@ fn absolute_gpu_no_fit_is_a_true_noop() {
 #[test]
 fn signed_arm_projects_the_device_proposal_exactly() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     use rcsr::fit::{fit_batch_verified, fit_weighted_metric, BatchStatus, BatchedGpu};
@@ -844,7 +848,7 @@ fn signed_arm_projects_the_device_proposal_exactly() {
     let mut ev = match rcsr::gpu::GpuEvaluator::new(&cols, n, nv, &y32) {
         Some(ev) => ev,
         None => {
-            eprintln!("skipping GPU test: evaluator construction failed");
+            rcsr::backend::skip_without_device("skipping GPU test: evaluator construction failed");
             return;
         }
     };
@@ -977,7 +981,7 @@ fn front_points(out: &Outcome) -> Vec<(f64, f64)> {
 #[ignore]
 fn bench_end_to_end() {
     if !device_available() {
-        eprintln!("skipping GPU benchmark: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU benchmark: no usable CUDA device");
         return;
     }
     let n = std::env::var("RCSR_BENCH_N")
@@ -1382,7 +1386,7 @@ fn the_usage_gate_only_refuses_explicit_gpu_outside_the_family() {
 #[test]
 fn zero_adjoint_constant_is_frozen_and_the_rest_are_fitted() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     use rcsr::expr::{constant, input, node, Op};
@@ -1407,7 +1411,7 @@ fn zero_adjoint_constant_is_frozen_and_the_rest_are_fitted() {
     let mut ev = match rcsr::gpu::GpuEvaluator::new(&cols, n, nv, &y32) {
         Some(ev) => ev,
         None => {
-            eprintln!("skipping GPU test: evaluator construction failed");
+            rcsr::backend::skip_without_device("skipping GPU test: evaluator construction failed");
             return;
         }
     };
@@ -1577,7 +1581,7 @@ fn cpu_default_run_is_byte_identical_to_explicit_exact() {
 #[test]
 fn default_run_resolves_to_the_gpu_arm_and_labels_every_other_resolution() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let (fitting, _) = cli_fit_and_front_on_device(&["--metric", "squared"]);
@@ -1620,7 +1624,7 @@ fn correlation_run(metric: Metric, seed: u32, fit_iters: usize) -> (Outcome, Sam
 #[cfg(feature = "cuda")]
 fn assert_correlation_gpu_fit_is_deterministic_and_exact(metric: Metric, seed: u32) {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let (a, train) = correlation_run(metric, seed, 4);
@@ -1661,7 +1665,7 @@ fn signed_gpu_fit_run_is_deterministic_and_exact() {
 #[test]
 fn correlation_gpu_no_fit_is_a_true_noop() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     for metric in [Metric::Correlation, Metric::CorrelationSigned] {
@@ -1682,7 +1686,7 @@ fn correlation_gpu_no_fit_is_a_true_noop() {
 #[test]
 fn an_affine_correlation_tree_takes_the_closed_form() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let (out, _) = correlation_run(Metric::CorrelationSigned, 111, 4);
@@ -1737,7 +1741,7 @@ fn implicit_residual_dispatch_is_absolute() {
 #[test]
 fn implicit_residual_gpu_search_defers_and_reports_the_exact_metric() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = implicit_circle(4096);
@@ -1778,7 +1782,7 @@ fn implicit_residual_gpu_search_defers_and_reports_the_exact_metric() {
 #[test]
 fn signed_bias_gpu_fit_run_is_deterministic_and_exact() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     assert!(rcsr::fit::gpu_fit_metric_error(Metric::Signed).is_none());
@@ -1833,7 +1837,7 @@ fn signed_bias_gpu_fit_run_is_deterministic_and_exact() {
 fn a_search_with_min_and_max_fits_on_the_device() {
     use rcsr::expr::Op;
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let s = sample(640, 3);
@@ -1859,7 +1863,7 @@ fn a_search_with_min_and_max_fits_on_the_device() {
 fn mixed_arm_books_the_island_cpu_fit_under_fit() {
     use rcsr::gpu_stats::Stage;
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(2000, 5);
@@ -1898,7 +1902,7 @@ fn gpu_fit_counters(json: &str) -> String {
 #[test]
 fn default_resolved_runs_with_one_seed_agree_on_front_and_fit_counters() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let args = ["--gpu", "--metric", "squared", "--dispatch", "device"];
@@ -1923,7 +1927,7 @@ fn default_resolved_runs_with_one_seed_agree_on_front_and_fit_counters() {
 #[test]
 fn gpu_run_ledger_closes_exactly() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(600, 7);
