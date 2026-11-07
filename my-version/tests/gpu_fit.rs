@@ -1541,7 +1541,7 @@ fn cli_json_with(mut cmd: std::process::Command, extra: &[&str]) -> String {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.as_mut().unwrap().write_all(cli_csv().as_bytes()).unwrap();
+    rcsr_cmd::feed_stdin(&mut child, cli_csv().as_bytes());
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8(out.stdout).unwrap()

@@ -617,13 +617,7 @@ fn rcsr_stdin(args: &[&str], table: &str) -> std::process::Output {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("run rcsr");
-    use std::io::Write as _;
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(table.as_bytes())
-        .expect("write stdin");
+    rcsr_cmd::feed_stdin(&mut child, table.as_bytes());
     child.wait_with_output().expect("wait for rcsr")
 }
 
@@ -696,12 +690,7 @@ fn cli_resolves_units_and_reports_them() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .and_then(|mut child| {
-            use std::io::Write as _;
-            child
-                .stdin
-                .as_mut()
-                .expect("stdin")
-                .write_all(table.as_bytes())?;
+            rcsr_cmd::feed_stdin(&mut child, table.as_bytes());
             child.wait_with_output()
         })
         .expect("run rcsr");
@@ -735,13 +724,7 @@ fn layer2_units_alone_reports_and_does_not_reject() {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("run rcsr");
-        use std::io::Write as _;
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin")
-            .write_all(table.as_bytes())
-            .expect("write stdin");
+        rcsr_cmd::feed_stdin(&mut child, table.as_bytes());
         child.wait_with_output().expect("wait for rcsr")
     };
 
