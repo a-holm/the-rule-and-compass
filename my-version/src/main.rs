@@ -123,11 +123,12 @@ USAGE:
              [--lockbox <START,END|none>]
              [--target-spec <file>]
   rcsr verify-manifest <manifest.json> [--data <file>] [--binary <file>]
-  rcsr calibrate [--out <path>] [--gpu | --cpu] [--strict]
+  rcsr calibrate [--out <path>] [--gpu | --cpu] [--no-enrich] [--strict]
                               time this machine and write the calibration
                               file that --dispatch auto routes from; the file
                               records the load, stderr warns when the probe ran
-                              under load, --strict refuses such a file (exit 3)
+                              under load, --strict refuses such a file (exit 3),
+                              --no-enrich skips the enrich planner probe
   rcsr dispatch-plan [--calibration <anchors|path>] [--against <anchors|path>] [--json]
                               print the device/cpu route of 4950 eval and fit
                               cells under a calibration and the cells that flip
