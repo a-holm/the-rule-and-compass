@@ -5,6 +5,9 @@
 //! covers the training set, and the full-data guarantee for the archive (which
 //! is what the report uses for `train_error`).
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::expr;
 use rcsr::metrics::Metric;
 use rcsr::search::{self, Config, Outcome};
@@ -195,7 +198,7 @@ fn archive_errors_are_full_data_even_when_fitness_is_subsampled() {
 #[test]
 fn predictor_samples_below_two_is_a_usage_error() {
     for bad in ["0", "1", "-3", "abc"] {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        let out = rcsr_cmd::rcsr()
             .args(["--data", "/nonexistent", "--target", "y"])
             .arg("--predictor-samples")
             .arg(bad)

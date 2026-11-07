@@ -11,6 +11,9 @@
 //!   and the *reported* law and errors agree with the CPU backend (the numbers
 //!   a user reads are always re-scored in `f64` on the full training sample).
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 #[cfg(feature = "cuda")]
 use rcsr::data::Sample;
 #[cfg(feature = "cuda")]
@@ -20,7 +23,7 @@ use rcsr::metrics::Metric;
 #[cfg(feature = "cuda")]
 use rcsr::search::{self, Config, Outcome};
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// `y = 2x + 1` on a deterministic grid with a little noise, two inputs.
 #[cfg(feature = "cuda")]
@@ -104,7 +107,8 @@ fn csv(n: usize) -> String {
 }
 
 fn run_cli(args: &[&str], gpu_env: Option<&str>) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rcsr"));
+    // Each caller states the device environment it needs through `gpu_env`.
+    let mut cmd = rcsr_cmd::rcsr_on_device();
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

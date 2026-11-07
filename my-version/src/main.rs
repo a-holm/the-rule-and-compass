@@ -3930,7 +3930,7 @@ fn main() {
     cfg.dispatch = dispatch_mode;
 
     let gpu_probe = if gpu_explicit == Some(false) {
-        backend::Probe::cpu("--cpu/--no-gpu (device not probed)")
+        backend::Probe::not_probed("--cpu/--no-gpu (device not probed)")
     } else {
         backend::probe()
     };
@@ -6116,7 +6116,7 @@ fn main() {
         } else {
             (
                 "cpu",
-                "-",
+                if gpu_probe.probed { "-" } else { "not probed" },
                 gpu_explicit
                     .filter(|explicit| !*explicit)
                     .map(|_| "--cpu/--no-gpu")
@@ -7840,7 +7840,7 @@ fn main() {
                     .or_else(|| gpu_probe.reason.clone())
             };
             let backend_json = format!(
-                "\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"threads\":{},",
+                "\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"device_probed\":{},\"threads\":{},",
                 outcome.backend.name(),
                 backend_reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
                 outcome
@@ -7848,6 +7848,7 @@ fn main() {
                     .as_deref()
                     .map(jstr)
                     .unwrap_or_else(|| "null".to_string()),
+                gpu_probe.probed,
                 cfg.threads, // #463
             );
             let backend_json = format!(
@@ -7980,7 +7981,7 @@ fn main() {
                     .or_else(|| gpu_probe.reason.clone())
             };
             println!(
-                "{{\"event\":\"backend\",\"backend\":\"{}\",\"backend_reason\":{},\"device\":{}}}",
+                "{{\"event\":\"backend\",\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"device_probed\":{}}}",
                 outcome.backend.name(),
                 nd_backend_reason
                     .as_deref()
@@ -7990,7 +7991,8 @@ fn main() {
                     .device
                     .as_deref()
                     .map(jstr)
-                    .unwrap_or_else(|| "null".to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+                gpu_probe.probed
             );
             for (expression, complexity, error) in &seed_rows {
                 println!(
@@ -11217,6 +11219,11 @@ fn run_walkforward(args: &[String]) -> ! {
         min_hold,
         gpu,
     };
+    if spec.policy == walkforward::Policy::TopTercile {
+        if let Some(msg) = walkforward::top_tercile_refusal(&spec, &popts) {
+            usage_fail(&msg);
+        }
+    }
     let resolved = rcsr::lockbox::resolve_with(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path).unwrap_or_else(|e| {
         eprintln!("error: {}", e.message);
         std::process::exit(e.exit);

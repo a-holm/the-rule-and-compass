@@ -14,9 +14,11 @@
 //! * `summary` stays concise and `full` carries the complete record, both
 //!   readable by the analyzer.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::devlog::Json;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn fixture() -> String {
     concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/clean.csv").to_string()
@@ -63,7 +65,7 @@ fn base_args(data: &str) -> Vec<String> {
 }
 
 fn run(args: &[String]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")
@@ -71,7 +73,7 @@ fn run(args: &[String]) -> std::process::Output {
 
 /// Run with `dir` as the working directory, so a default log lands there.
 fn run_in(dir: &Path, args: &[String]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .current_dir(dir)
         .args(args)
         .output()
@@ -602,7 +604,7 @@ fn a_killed_run_leaves_a_valid_prefix_that_dev_report_reads() {
     // Cut inside the last event, as a SIGKILL during the write would.
     std::fs::write(&path, &full[..full.len() - 12]).unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args(["dev-report", path.to_str().unwrap()])
         .output()
         .expect("run dev-report");
@@ -636,7 +638,7 @@ fn dev_report_summarises_the_run_and_ranks_bottlenecks() {
     let out = run_in(&dir, &args);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args(["dev-report", dir.join("run.ndjson").to_str().unwrap()])
         .output()
         .expect("run dev-report");
@@ -697,7 +699,7 @@ fn dev_report_reads_a_summary_log_and_names_what_it_omits() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let log = dir.join("rcsr.dev.ndjson");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args(["dev-report", log.to_str().unwrap()])
         .output()
         .expect("run dev-report");

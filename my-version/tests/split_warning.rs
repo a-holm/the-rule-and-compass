@@ -6,9 +6,12 @@
 //! said "using a chronological split", the warning contradicted the
 //! `split=random` line printed beside it.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// `t` is a perfectly spaced 1..n axis, `x = t`, `y = 2t + 1`.
 fn time_ordered_csv(n: usize) -> String {
@@ -20,7 +23,7 @@ fn time_ordered_csv(n: usize) -> String {
 }
 
 fn run(args: &[&str]) -> (Option<i32>, String, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let mut child = rcsr_cmd::rcsr()
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

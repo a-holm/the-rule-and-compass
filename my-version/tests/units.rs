@@ -4,6 +4,9 @@
 //! under `--require-dimensions`, an accepted dimensionally correct law, and
 //! the regression that the flag machinery leaves a units-free run unchanged.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::checkpoint::Checkpoint;
 use rcsr::data::Sample;
 use rcsr::devlog::Json;
@@ -600,14 +603,14 @@ fn layer1_units_free_checkpoint_has_no_units_fields() {
 
 
 fn rcsr(args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")
 }
 
 fn rcsr_stdin(args: &[&str], table: &str) -> std::process::Output {
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let mut child = rcsr_cmd::rcsr()
         .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -676,7 +679,7 @@ fn layer3_require_dimensions_without_units_is_usage_error() {
 #[test]
 fn cli_resolves_units_and_reports_them() {
     let table = "x,t,y\n1,1,1\n2,2,1\n4,2,2\n";
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args([
             "--data", "-",
             "--target", "y",
@@ -725,7 +728,7 @@ fn layer2_units_alone_reports_and_does_not_reject() {
             "--scale", "none",
         ];
         args.extend_from_slice(extra);
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        let mut child = rcsr_cmd::rcsr()
             .args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

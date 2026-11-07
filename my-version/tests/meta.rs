@@ -5,12 +5,14 @@
 //! semantics, the construction-time cache, the fitter's behaviour and the text
 //! round-trip, then exercise the operators through the search.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::Sample;
 use rcsr::expr::{self, constant, input, meta, node, Node, Op};
 use rcsr::fit;
 use rcsr::metrics::Metric;
 use rcsr::search::{self, Config};
-use std::process::Command;
 
 fn sample(xs: Vec<Vec<f64>>, y: Vec<f64>) -> Sample {
     Sample {
@@ -285,7 +287,7 @@ fn search_recovers_a_target_built_from_the_models_complexity() {
 
 #[test]
 fn ops_rejects_an_unknown_meta_name_with_exit_2() {
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args([
             "--data",
             "/nonexistent",
@@ -310,7 +312,7 @@ fn ops_accepts_every_meta_name_and_none_is_default() {
     }
     // Argument parsing succeeds, so the run proceeds to the (missing) data and
     // fails with the input exit code, not the usage code.
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args([
             "--data",
             "/nonexistent",

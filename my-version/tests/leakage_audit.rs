@@ -1,6 +1,8 @@
 //! `rcsr audit` is fail-closed and returns exit code 5 (#129).
 
-use std::process::Command;
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 #[path = "common/scratch.rs"]
 mod scratch;
 use scratch::Scratch;
@@ -34,7 +36,7 @@ fn write_panel(leak: bool) -> (Scratch, String) {
 }
 
 fn audit(path: &str) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args([
             "audit", "--data", path, "--target", "y", "--time", "time", "--horizon", "1",
             "--json",
@@ -70,7 +72,7 @@ fn a_leaky_panel_exits_five_and_names_the_column() {
 fn a_wall_time_gap_is_converted_and_never_silently_dropped() {
     let (_scratch, p) = write_panel(false);
     // 240 one-minute rows: 90m is 90 rows, and the split report says so.
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args([
             "--data", &p, "--target", "y", "--vars", "x", "--time", "time",
             "--split", "temporal", "--gap", "90m", "--quiet", "--json",
@@ -86,7 +88,7 @@ fn a_wall_time_gap_is_converted_and_never_silently_dropped() {
 #[test]
 fn a_wall_time_gap_is_dropped_with_a_warning_under_explicit_row_selection() {
     let (_scratch, p) = write_panel(false);
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args([
             "--data", &p, "--target", "y", "--vars", "x", "--time", "time",
             "--split", "temporal", "--gap", "90m", "--train-select", "row < 120",

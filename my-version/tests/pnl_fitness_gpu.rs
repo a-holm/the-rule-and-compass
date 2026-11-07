@@ -8,6 +8,9 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{Sample, TradingSlice};
 use rcsr::expr::{constant, input, node, Node, Op};
 use rcsr::gpu::{GpuEvaluator, Population};
@@ -841,7 +844,7 @@ fn write_cli_fixture() -> (Scratch, String, String) {
 }
 
 fn cli(data: &str, spec: &str, backend: &[&str]) -> rcsr::devlog::Json {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr_for(backend)
         .args(backend)
         .args([
             "--data", data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal",

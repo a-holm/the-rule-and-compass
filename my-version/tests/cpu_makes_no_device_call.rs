@@ -1,6 +1,9 @@
 //! #821: a CPU command opens no `/dev/nvidia*` file. The count comes from
 //! `strace -f -e trace=openat`; a missing or unusable strace fails the test.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -33,8 +36,10 @@ fn strace_opens(path_env: Option<&str>, trace: &Path, prefix: &str, program: &st
     Ok(text.lines().filter(|l| l.contains(&needle) && !l.contains("= -1")).count())
 }
 
+const DEVICE_PREFIX: &str = "/dev/nvidia";
+
 fn rcsr_opens(trace: &Path, args: &[&str]) -> usize {
-    strace_opens(None, trace, "/dev/nvidia", env!("CARGO_BIN_EXE_rcsr"), args).unwrap_or_else(|e| panic!("{e}"))
+    strace_opens(None, trace, DEVICE_PREFIX, env!("CARGO_BIN_EXE_rcsr"), args).unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn s(p: &Path) -> String {
@@ -42,7 +47,7 @@ fn s(p: &Path) -> String {
 }
 
 fn run_ok(args: &[&str]) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).env("RCSR_GPU", "0").output().unwrap();
+    let out = rcsr_cmd::rcsr().args(args).env("RCSR_GPU", "0").output().unwrap();
     assert!(out.status.success(), "rcsr {args:?}: {}", String::from_utf8_lossy(&out.stderr));
 }
 
@@ -95,7 +100,7 @@ fn the_counter_sees_opens_and_a_missing_strace_fails() {
     assert!(n >= 1, "the control open of /dev/null was not counted");
     let none = scratch.path().join("empty-path");
     std::fs::create_dir_all(&none).unwrap();
-    let err = strace_opens(Some(none.to_str().unwrap()), &scratch.path().join("t2.txt"), "/dev/nvidia", "sh", &["-c", "true"]).unwrap_err();
+    let err = strace_opens(Some(none.to_str().unwrap()), &scratch.path().join("t2.txt"), DEVICE_PREFIX, "sh", &["-c", "true"]).unwrap_err();
     assert!(err.contains("cannot run strace"), "{err}");
 }
 
@@ -134,4 +139,29 @@ fn explicit_cpu_commands_open_no_device() {
         "--scheme", "rolling", "--purge-seconds", "7200", "--gbm-trees", "10", "--draws", "50", "--max-fit-rows", "600", "--out", lout.as_str(),
     ];
     assert_eq!(rcsr_opens(&trace, &ladder), 0, "ladder opened /dev/nvidia*");
+}
+
+/// The control for `explicit_cpu_commands_open_no_device`: that test counts 0 on a build or
+/// machine that never opens the device, whatever the code does. On a CUDA build with a device
+/// the default run must open `/dev/nvidia*` more than 0 times, so the counter does see them.
+#[cfg(feature = "cuda")]
+#[test]
+fn default_run_opens_the_device_when_one_exists() {
+    if !rcsr::backend::probe().available() {
+        eprintln!("not checked: no usable CUDA device, so the zero counts of the CPU test prove nothing here");
+        return;
+    }
+    let scratch = Scratch::new("cpu-nodev-positive");
+    let dir = scratch.path();
+    let trace = fixtures(dir);
+    let d = s(&dir.join("d.csv"));
+    let search = ["--data", d.as_str(), "--target", "y", "--generations", "1", "--pop", "20", "--quiet"];
+    let opens = rcsr_opens(&trace, &search);
+    assert!(opens > 0, "the default run opened no {DEVICE_PREFIX}* file: the counter does not see device opens");
+}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn non_cuda_build_states_that_the_device_guard_was_not_checked() {
+    eprintln!("not checked: built without --features cuda, so explicit_cpu_commands_open_no_device cannot see a device open");
 }

@@ -285,12 +285,23 @@ fn field_str(line: &str, key: &str) -> Option<String> {
     None
 }
 
-fn field_num(line: &str, key: &str) -> Option<f64> {
+/// Read a non-negative integer field. A float, a negative number, a string or an
+/// overflow is `None`.
+fn field_u64(line: &str, key: &str) -> Option<u64> {
     let pat = format!("\"{}\":", key);
     let start = line.find(&pat)? + pat.len();
     let rest = &line[start..];
     let end = rest.find(|c| c == ',' || c == '}').unwrap_or(rest.len());
     rest[..end].trim().parse().ok()
+}
+
+fn fault_field(path: &std::path::Path, n: usize, event: &str, key: &str) -> String {
+    format!("{}: line {} is a {} event without a valid {}: the ledger was edited", path.display(), n, event, key)
+}
+
+/// A non-empty string field of a ledger line, or a ledger fault naming the line.
+fn need_str(path: &std::path::Path, n: usize, line: &str, event: &str, key: &str) -> Result<String, String> {
+    field_str(line, key).filter(|v| !v.is_empty()).ok_or_else(|| fault_field(path, n, event, key))
 }
 
 fn field_bool(line: &str, key: &str) -> bool {
@@ -448,12 +459,14 @@ impl Ledger {
 
     pub fn events(&self) -> Result<Vec<Event>, String> {
         let mut out = Vec::new();
-        for line in self.lines()? {
+        for (i, line) in self.lines()?.into_iter().enumerate() {
+            let (p, n) = (self.path.as_path(), i + 1);
             let kind = field_str(&line, "event").unwrap_or_default();
             let get = |k: &str| field_str(&line, k).unwrap_or_default();
+            let need = |k: &str| need_str(p, n, &line, &kind, k);
             out.push(match kind.as_str() {
                 "candidate" => Event::Candidate(Candidate {
-                    id: get("id"),
+                    id: need("id")?,
                     spec_sha256: get("spec_sha256"),
                     data_sha256: get("data_sha256"),
                     build_commit: get("build_commit"),
@@ -462,10 +475,12 @@ impl Ledger {
                     locked_test: LockedRange::parse(&line),
                 }),
                 "seal" => Event::Seal {
-                    sealed_sha256: get("sealed_sha256"),
+                    sealed_sha256: need("sealed_sha256")?,
                     final_seal: if field_bool(&line, "final") {
                         Some(FinalSeal {
-                            max_reads: field_num(&line, "max_reads").unwrap_or(1.0) as u64,
+                            max_reads: field_u64(&line, "max_reads")
+                                .filter(|m| *m >= 1)
+                                .ok_or_else(|| fault_field(p, n, &kind, "max_reads"))?,
                             report_candidates: field_bool(&line, "report_candidates"),
                         })
                     } else {
@@ -473,14 +488,14 @@ impl Ledger {
                     },
                 },
                 "test_read" => Event::TestRead {
-                    id: get("id"),
-                    report_sha256: get("report_sha256"),
-                    read_count: field_num(&line, "read_count").unwrap_or(0.0) as u64,
+                    id: need("id")?,
+                    report_sha256: need("report_sha256")?,
+                    read_count: field_u64(&line, "read_count").ok_or_else(|| fault_field(p, n, &kind, "read_count"))?,
                     locked_test: LockedRange::parse(&line),
                 },
                 "baseline_read" => Event::BaselineRead {
-                    data_sha256: get("data_sha256"),
-                    report_sha256: get("report_sha256"),
+                    data_sha256: need("data_sha256")?,
+                    report_sha256: need("report_sha256")?,
                     locked_test: LockedRange::parse(&line),
                 },
                 other => return Err(format!("unknown ledger event '{}'", other)),
@@ -853,7 +868,11 @@ fn output_identity(path: &std::path::Path) -> Result<(std::path::PathBuf, Option
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
     let dir = std::fs::canonicalize(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
     let name = path.file_name().ok_or_else(|| format!("{}: no file name", path.display()))?;
-    let inode = std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+    let inode = match std::fs::metadata(path) {
+        Ok(m) => Some((m.dev(), m.ino())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{}: cannot stat the output: {}", path.display(), e)),
+    };
     Ok((dir.join(name), inode))
 }
 
@@ -1286,7 +1305,11 @@ fn marker_lines(data_path: &str) -> Result<Vec<MarkerLine>, String> {
             event: get("event"),
             report_sha256: get("report_sha256"),
         };
-        if !matches!(m.event.as_str(), "test_read" | "baseline_read") || m.ledger.is_empty() {
+        if !matches!(m.event.as_str(), "test_read" | "baseline_read")
+            || m.ledger.is_empty()
+            || m.ledger_head.is_empty()
+            || m.report_sha256.is_empty()
+        {
             return Err(format!("{}: malformed read marker line", path));
         }
         out.push(m);

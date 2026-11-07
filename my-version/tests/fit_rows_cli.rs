@@ -1,7 +1,10 @@
 //! `--fit-rows` parsing: `0` and integers >= 2 are accepted, anything else exits 2.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -21,7 +24,7 @@ fn csv() -> (Scratch, PathBuf) {
 
 fn run(value: &str) -> Output {
     let (_scratch, data) = csv();
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args(["--data"])
         .arg(&data)
         .args(["--target", "y", "--generations", "1", "--pop", "20", "--fit-rows", value])
@@ -68,7 +71,7 @@ fn big_csv(tag: &str) -> (Scratch, PathBuf) {
 
 fn run_big(tag: &str, extra: &[&str]) -> Output {
     let (_scratch, data) = big_csv(tag);
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr_for(extra)
         .args(["--data"])
         .arg(&data)
         .args(["--target", "y", "--generations", "1", "--pop", "20", "--fit-iters", "3"])
