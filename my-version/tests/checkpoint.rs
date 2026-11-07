@@ -1560,3 +1560,43 @@ fn interim_chunks_keep_the_final_hash_on_the_device() {
     assert_same_report(&plain, &interim, "device interim against plain chunks");
     assert_eq!(plain_text, interim_text, "device exit checkpoint bytes");
 }
+
+/// An interim chunk's `run.json` in a fresh directory.
+fn interim_run_dir(scratch: &Scratch) -> (PathBuf, String) {
+    let csv = scratch.join("d.csv");
+    std::fs::write(&csv, line_csv(60)).expect("csv");
+    let csv = csv.to_str().expect("utf-8").to_string();
+    let dir = scratch.join("run");
+    std::fs::create_dir(&dir).unwrap();
+    let out = run_chunk(&dir, &csv, &["--time-budget", "0", "--interim-chunk"]);
+    assert!(out.status.success(), "{:?}", out);
+    (dir, csv)
+}
+
+/// #855: `ablation score --run` names the interim flag instead of a missing `ablation` field.
+#[test]
+fn interim_run_json_is_refused_by_ablation_score() {
+    let scratch = Scratch::new("interim-ablation");
+    let (dir, csv) = interim_run_dir(&scratch);
+    for flag in ["--run", "--from-run"] {
+        let out = rcsr_in(&dir, &["ablation", "score", flag, "run.json", "--data", &csv, "--target", "y", "--time", "t"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{flag}: {err}");
+        assert!(err.contains("--interim-chunk"), "{flag}: {err}");
+        assert!(!err.contains("no 'ablation' object"), "{flag}: {err}");
+    }
+}
+
+/// #855: `ladder --sr-run` refuses the interim document by name.
+#[test]
+fn interim_run_json_is_refused_by_the_ladder() {
+    let scratch = Scratch::new("interim-ladder");
+    let (dir, csv) = interim_run_dir(&scratch);
+    let out = rcsr_in(
+        &dir,
+        &["ladder", "--data", &csv, "--target", "y", "--time", "t", "--windows", "w.csv", "--sr-run", "run.json"],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("--interim-chunk"), "{err}");
+}
