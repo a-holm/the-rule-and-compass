@@ -698,7 +698,7 @@ fn run_drift(data: &str, spec: &str, extra: &[&str]) -> Json {
         "--metric", "squared", "--json", "--quiet", "--objective", "sharpe", "--cost-bps", "5",
         "--validation-frac", "0.3",
     ];
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).args(extra).output().expect("run rcsr");
+    let out = rcsr_cmd::rcsr().args(args).args(extra).output().expect("run rcsr");
     json(&out)
 }
 
