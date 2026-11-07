@@ -783,7 +783,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   regret plus `--pnl-block-lambda` (default 1.0) times their standard deviation, so a formula
   that earns in one regime only scores worse; the device computes it bit for bit like the CPU.
   `--reject-fixed-position` (off by default) rejects trees whose position cannot depend on the
-  inputs, such as `gauss(...)` or `exp(...)` at threshold 0, before the constant fit and keeps them
+  inputs, such as `gauss(c * x)` or `exp(c * x)` at threshold 0, before the constant fit and keeps them
   off the front; see [`docs/optimisation.md`](docs/optimisation.md).
   `--json` adds `search_fitness` and a `fitness` block per
   Pareto member (`block_regret` with blocks). See

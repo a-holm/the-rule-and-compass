@@ -765,9 +765,11 @@ SEARCH:
   --reject-fixed-position    under --fitness pnl, reject trees whose long/flat
                              position cannot depend on the inputs (the exact
                              output range does not cross --threshold, for
-                             example gauss(...), exp(...), abs(...)) before the
-                             constant fit, and keep them off the front
-                             (#848). Saved search setting, off by default
+                             example gauss(c * x) at threshold 0) before the
+                             constant fit, and keep them off the front. Before
+                             the fit every constant counts as free, so c + abs(x)
+                             goes to the fit (#848). Saved search setting, off
+                             by default
   --prune                    remove neutral code from the final front (off by
                              default): replace subtrees with a child or a
                              constant when the training error stays within
