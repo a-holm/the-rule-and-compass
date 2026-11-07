@@ -109,6 +109,11 @@ xs_rank                *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=
 walkforward_locked     *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 rcsr_command_lint      *  no-cuda  text lint of tests/*.rs; no CUDA call
 cpu_config_lint        *  no-cuda  text lint of tests/*.rs; no CUDA call
+device_launches        *  no-cuda-app-only  report-struct tests plus one rcsr child with RCSR_GPU=0 and --cpu; no CUDA call in the test process or its child (no /dev/nvidia open under strace -f)
+device_skip_lint       *  no-cuda  text lint of tests/*.rs and src/*.rs; no CUDA call (no /dev/nvidia open under strace -f)
+require_device         *  no-cuda-app-only  tests skip_without_device in child processes of the test binary; no CUDA call in the test process or its children (no /dev/nvidia open under strace -f)
+stdin_write_lint       *  no-cuda-app-only  text lint plus an sh child that exits early; no CUDA call in the test process or its child (no /dev/nvidia open under strace -f)
+window_stats           *  no-cuda  CPU enrich with GpuMode::Off; no CUDA call in the two tests or the three ignored ones (no /dev/nvidia open under strace -f)
 complexity             *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs) and every search config states gpu: false, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 dtypes                 *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs) and every search config states gpu: false, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 fit_samples            *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs) and every search config states gpu: false, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
