@@ -10,7 +10,6 @@
 mod rcsr_cmd;
 
 use rcsr::data;
-use std::io::Write;
 use std::process::Stdio;
 
 /// `t` is a perfectly spaced 1..n axis, `x = t`, `y = 2t + 1`.

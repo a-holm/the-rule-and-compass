@@ -14,7 +14,6 @@
 #[path = "common/rcsr.rs"]
 mod rcsr_cmd;
 
-use std::io::Write;
 use std::process::Stdio;
 
 use rcsr::data::Sample;

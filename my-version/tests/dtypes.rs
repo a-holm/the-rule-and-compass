@@ -14,7 +14,6 @@ use rcsr::expr::{self, Op};
 use rcsr::metrics::Metric;
 use rcsr::rng::Mt;
 use rcsr::search::{run, Config};
-use std::io::Write;
 use std::process::{Output, Stdio};
 
 fn temporal() -> SplitSpec {

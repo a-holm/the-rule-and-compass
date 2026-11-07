@@ -9,7 +9,6 @@ mod rcsr_cmd;
 mod scratch;
 
 use scratch::Scratch;
-use std::io::Write;
 use std::path::Path;
 use std::process::{Output, Stdio};
 

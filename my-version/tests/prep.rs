@@ -11,7 +11,6 @@ use rcsr::expr;
 use rcsr::metrics::Metric;
 use rcsr::rng::Mt;
 use rcsr::search::{run, Config};
-use std::io::Write;
 use std::process::Stdio;
 
 fn temporal(test_frac: f64) -> SplitSpec {

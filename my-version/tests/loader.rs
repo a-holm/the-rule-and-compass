@@ -7,7 +7,6 @@ mod rcsr_cmd;
 
 use rcsr::data::{self, PrepSpec, SplitSpec};
 use rcsr::rng::Mt;
-use std::io::Write;
 use std::process::Stdio;
 
 #[path = "common/scratch.rs"]
