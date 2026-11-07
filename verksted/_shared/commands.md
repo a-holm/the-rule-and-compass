@@ -147,6 +147,8 @@ git ls-files '*.py'                                                             
 
 ## GPU safety
 
+The build selects the newest CUDA 13 toolkit by rule (`docs/gpu-backend.md`); on this machine that is `/usr/local/cuda-13.0/bin/nvcc`. The sanitizer is `/usr/local/cuda-13.0/bin/compute-sanitizer` (`$SANITIZER`); the system 12.0 `compute-sanitizer` cannot attach on this driver.
+
 ```sh
 verksted/_tools/sanitize.sh "$W" "$N" memcheck --test <file> -- <filter>    # builds, then runs under compute-sanitizer through the lock; exit 0 before any plain GPU run
 # search-level tests: the config helper must set dispatch: DispatchMode::Device (CLI: --dispatch device), else the sanitized run stays on the CPU
