@@ -15,7 +15,7 @@ use rcsr::expr::{self, constant, input, node, Op};
 use rcsr::rng::Mt;
 use rcsr::search::{self, Config, Outcome};
 use std::path::PathBuf;
-use std::process::Output;
+use std::process::{Command, Output};
 
 fn sample(n: usize) -> Sample {
     let mut x = Vec::with_capacity(n);
@@ -1006,4 +1006,147 @@ fn a_resume_takes_the_requested_pipeline_depth() {
     let c = std::fs::read_to_string(&resumed_deep_out.0).expect("deep tsv");
     assert_eq!(a, b, "the depth-0 resume must equal the uninterrupted depth-0 run");
     assert_eq!(a, c, "the depth-3 resume must give the same archive");
+}
+
+/// #860: the exit checkpoint text and the report of one run at `threads`
+/// workers. `threads_explicit` makes the scheduler obey the count.
+fn run_at_threads(cfg: &Config, threads: usize, resume: Option<Checkpoint>, train: &Sample, test: &Sample) -> (Outcome, String) {
+    let cfg = Config { threads, threads_explicit: true, ..cfg.clone() };
+    let mut text: Option<String> = None;
+    let out = search::run_resumable(&cfg, train, test, resume, 0, |cp| text = Some(cp.to_text()))
+        .expect("run");
+    (out, text.expect("exit checkpoint"))
+}
+
+fn assert_thread_free(base: &Config, what: &str, train: &Sample, test: &Sample) {
+    let (reference, reference_text) = run_at_threads(base, 1, None, train, test);
+    for threads in [2usize, 3, 12] {
+        let (out, text) = run_at_threads(base, threads, None, train, test);
+        assert_eq!(describe(&reference), describe(&out), "{what}: archive at {threads} threads");
+        let bits = |o: &Outcome| o.test_errors.iter().map(|e| e.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&reference), bits(&out), "{what}: test errors at {threads} threads");
+        assert_eq!(reference_text, text, "{what}: exit checkpoint bytes at {threads} threads");
+    }
+    // A resume under another count continues the same trajectory.
+    let first = Config { generations: base.generations / 2, ..base.clone() };
+    let (_, half) = run_at_threads(&first, 12, None, train, test);
+    let saved = Checkpoint::from_text(&half).expect("parse");
+    let (resumed, resumed_text) = run_at_threads(base, 1, Some(saved), train, test);
+    assert_eq!(describe(&reference), describe(&resumed), "{what}: 12 threads then 1");
+    assert_eq!(reference_text, resumed_text, "{what}: resumed checkpoint bytes");
+}
+
+/// #860: no stage of the node-path search reads the thread count into a result:
+/// batch scoring, constant fits, the screened refit and the finalist rebuild
+/// give the same archive, test errors and checkpoint bytes at every count, and
+/// a resume under another count continues the same trajectory.
+#[test]
+fn search_results_do_not_depend_on_the_thread_count() {
+    let train = sample(2600);
+    let test = sample(300);
+    let base = Config {
+        generations: 6,
+        islands: 3,
+        pop: 40,
+        max_complexity: 10,
+        fit_iters: 3,
+        metric: rcsr::metrics::Metric::Squared,
+        ..config(11)
+    };
+    assert_thread_free(&base, "exact fit", &train, &test);
+    let screened = Config { fit_samples: 700, ..base.clone() };
+    assert_thread_free(&screened, "screened fit", &train, &test);
+    assert_thread_free(&pnl_config(12, 5.0, &train), "pnl", &train, &test);
+}
+
+/// #860: the same on the device with the device fit arm, whose exact CPU
+/// fallback pool and finalist refit read the thread count to size their workers.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_device_search_does_not_depend_on_the_thread_count() {
+    if !rcsr::backend::probe().available() {
+        eprintln!("no usable GPU; skipping the device thread-count check");
+        return;
+    }
+    let train = sample(2600);
+    let test = sample(300);
+    let mut base = Config {
+        generations: 6,
+        islands: 2,
+        pop: 40,
+        max_complexity: 10,
+        fit_iters: 3,
+        metric: rcsr::metrics::Metric::Squared,
+        fit_strategy: rcsr::fit::FitStrategy::Gpu,
+        ..config(11)
+    };
+    base.gpu = true;
+    base.dispatch = rcsr::dispatch::DispatchMode::Device;
+    assert_thread_free(&base, "device fit", &train, &test);
+}
+
+fn allowed_cpus() -> Vec<usize> {
+    let status = std::fs::read_to_string("/proc/self/status").expect("proc status");
+    let list = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+        .expect("Cpus_allowed_list")
+        .trim();
+    let mut cpus = Vec::new();
+    for part in list.split(',') {
+        match part.split_once('-') {
+            Some((a, b)) => cpus.extend(a.parse::<usize>().unwrap()..=b.parse::<usize>().unwrap()),
+            None => cpus.push(part.parse().unwrap()),
+        }
+    }
+    cpus
+}
+
+/// #860: three generations under two CPUs, then a resume under one CPU: exit 0,
+/// a notice on stderr and the same checkpoint as six uninterrupted generations.
+#[test]
+fn resume_under_another_cpu_count_is_allowed() {
+    let cpus = allowed_cpus();
+    assert!(cpus.len() >= 2, "the test needs two allowed CPUs, have {cpus:?}");
+    let (two, one) = (format!("{},{}", cpus[0], cpus[1]), cpus[0].to_string());
+    let scratch = Scratch::new("cpu-count");
+    let csv = scratch.join("d.csv");
+    std::fs::write(&csv, line_csv(60)).expect("csv");
+    let (ck, whole) = (scratch.join("ck.rcsr"), scratch.join("whole.rcsr"));
+    let program = rcsr_cmd::rcsr().get_program().to_owned();
+    let run = |cpus: &str, generations: &str, save: &std::path::Path, resume: bool| -> Output {
+        let mut cmd = Command::new("taskset");
+        cmd.env("RCSR_GPU", "0")
+            .args(["-c", cpus])
+            .arg(&program)
+            .args(["--data", csv.to_str().unwrap(), "--target", "y", "--vars", "x", "--seed", "5"])
+            .args(["--pop", "30", "--max-complexity", "8", "--cpu", "--no-dev-log", "--quiet"])
+            .args(["--generations", generations, "--save", save.to_str().unwrap()]);
+        if resume {
+            cmd.args(["--resume", ck.to_str().unwrap()]);
+        }
+        cmd.output().expect("run rcsr")
+    };
+    let first = run(&two, "3", &ck, false);
+    assert!(first.status.success(), "{:?}", first);
+    let resumed = run(&one, "6", &ck, true);
+    assert!(resumed.status.success(), "{:?}", resumed);
+    let err = String::from_utf8_lossy(&resumed.stderr);
+    assert!(
+        err.contains("# checkpoint: build identity changed (threads: saved 2 -> current 1)"),
+        "{err}"
+    );
+    assert!(!err.contains("--allow-build-change"), "{err}");
+    let uninterrupted = run(&one, "6", &whole, false);
+    assert!(uninterrupted.status.success(), "{:?}", uninterrupted);
+    let final_line = |p: &std::path::Path| {
+        std::fs::read_to_string(p)
+            .unwrap()
+            .lines()
+            .find(|l| l.starts_with("final "))
+            .map(str::to_string)
+            .expect("a final line")
+    };
+    assert_eq!(final_line(&ck), final_line(&whole));
+    assert_eq!(std::fs::read(&ck).unwrap(), std::fs::read(&whole).unwrap());
 }

@@ -95,7 +95,7 @@ The runner executes numbered steps in order. A step that has a done-file is skip
 
 Every development step reads a development-only store that holds no row at or after the lockbox start. Only the `seal` step and the single `sealed` step open the full store, and both refuse to run without `SEALED=1`. `seal` registers the chosen candidate and seals the ledger. `sealed` is the one locked-test read, and it is last.
 
-GPU work runs one command per lock hold. The runner counts kernel Xid errors before and after each GPU command and stops when the count rises. A search runs in chunks, one hold per chunk, with a pause between them so other jobs can take the lock. A resume refuses a changed thread count, so the runner pins the CPUs it uses. Each command logs under `/mnt/lager/tmp/rcsr-gates`.
+GPU work runs one command per lock hold. The runner counts kernel Xid errors before and after each GPU command and stops when the count rises. A search runs in chunks, one hold per chunk, with a pause between them so other jobs can take the lock. The runner pins the CPUs it uses; a resume under another CPU count is not refused. Each command logs under `/mnt/lager/tmp/rcsr-gates`.
 
 Details:
 * [`docs/walkforward.md`](walkforward.md): the ledger, the seal and the sealed read the runner drives.
