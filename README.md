@@ -416,7 +416,7 @@ unless `--allow-backend-change` is explicit. See
 [`docs/checkpoint.md`](docs/checkpoint.md) for the versioned text format, the
 determinism guarantee and its limits.
 
-`--refit-band` (default `inf`) refits every finalist exactly after a device-fit search. `--refit-band 0.001` refits only the trees near the lowest error and is opt-in (#495: 6 of 26 paired runs reported a different front with `0.001`).
+`--refit-band` (default `inf`) refits every finalist exactly after a device-fit search. `--refit-band 0.001` refits only the trees near the lowest error and is opt-in (#495: 6 of 26 paired runs reported a different front with `0.001`). Under `--fitness pnl` a reported member may keep its carried constants when the refit changes its book (#850).
 
 `--run-manifest <path>` records the evidence needed to reproduce a long run:
 the commit recorded when the binary was built, the SHA-256 of the running binary, the CUDA toolkit it was built with (`binary.cuda_build`, `null` in a CPU build), the data file
