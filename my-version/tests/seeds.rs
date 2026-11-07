@@ -157,6 +157,36 @@ fn seed_is_simplified_fitted_and_present_in_the_final_archive() {
     );
 }
 
+/// #197: a seed written with neutral terms reaches the canonical tree on the
+/// CPU path and the archive entry is the CPU-fitted seed. The device arm is
+/// `seed_is_canonical_and_present_on_cpu_and_gpu_paths` in `seeds_gpu`.
+#[test]
+fn seed_is_canonical_and_present_on_the_cpu_path() {
+    let (vars, train, test) = spring();
+    let seed = expr::parse("2 * sqrt(m / k) + 0", &vars).expect("parse seed");
+    let canonical = expr::simplify(&expr::parse("sqrt(m / k)", &vars).expect("parse canonical"));
+    let expected_hash = expr::structural_hash(&canonical);
+    let mut cfg = config(1, 8);
+    cfg.metric = Metric::Squared;
+    let out = search::run_seeded(&cfg, &train, &test, &[seed]);
+    assert_eq!(out.seeds.len(), 1, "one accepted seed");
+    let fitted = &out.seeds[0];
+    assert_eq!(
+        expr::structural_hash(&fitted.tree),
+        expected_hash,
+        "the neutral terms must canonicalise to sqrt(m / k), got {}",
+        expr::to_string(&fitted.tree, &vars),
+    );
+    assert!(fitted.error < 1e-10, "the fitted seed should explain the data, error = {}", fitted.error);
+    let archived = out
+        .archive
+        .items
+        .iter()
+        .find(|s| expr::structural_hash(&s.tree) == expected_hash)
+        .expect("the seed must survive in the final archive");
+    assert_eq!(archived.error.to_bits(), fitted.error.to_bits(), "the archived seed must carry the CPU-refitted error");
+}
+
 #[test]
 fn structurally_duplicate_seeds_are_inserted_once() {
     let (vars, train, test) = spring();
