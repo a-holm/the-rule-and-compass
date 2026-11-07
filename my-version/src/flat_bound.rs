@@ -11,8 +11,13 @@
 //!   and never reordered, so round-to-nearest corner arithmetic bounds the
 //!   evaluator's value without widening.
 //! * `exp` and `tanh` are libm calls and are not correctly rounded. Each
-//!   endpoint is widened by [`ULPS`] ulps, which covers a libm error of up to
-//!   `ULPS - 1` ulps, then clamped to the codomain of the true function.
+//!   endpoint is widened by [`ULPS`] ulps, then clamped to the codomain of the
+//!   true function. With a per-point error of at most `E` ulps, `libm(x)` can
+//!   exceed `libm(y)` for `x < y` by `2E` ulps, and twice that across a binade
+//!   boundary (an ulp of the upper binade is two ulps of the lower one). glibc
+//!   documents `E = 1` for `exp` and `E = 2` for `tanh`, so `4E = 8` ulps cover
+//!   the documented bounds; the condition is a libm error of at most `ULPS / 4`
+//!   ulps per point, or a monotone libm.
 //! * Every supported operator maps a NaN input to NaN, so a NaN row never
 //!   becomes a number downstream. The bound covers the non-NaN values only.
 //! * Any other operator gives no bound.
@@ -22,8 +27,14 @@ use std::hint::black_box;
 
 /// Pieces kept per node and per column.
 pub const MAX_PIECES: usize = 6;
-/// libm widening in ulps on each side of an `exp` or `tanh` endpoint.
-const ULPS: u32 = 4;
+/// libm widening in ulps on each side of an `exp` or `tanh` endpoint: `2E`
+/// for a monotonicity break of two points with error `E`, doubled across a
+/// binade boundary, with the documented glibc maximum `E = 2` (`tanh`).
+const ULPS: u32 = 8;
+
+/// The documented glibc error bound the widening must cover, in ulps.
+#[cfg(test)]
+const DOCUMENTED_LIBM_ULPS: u32 = 2;
 /// The protected division cuts the divisor at this magnitude.
 const GUARD: f64 = 1e-12;
 /// `exp` returns `+inf` above this argument.
@@ -388,6 +399,13 @@ pub fn bound(tree: &Node, cols: &ColumnPieces) -> Option<Pieces> {
     walk(tree, cols).map(Pieces::from_ivs)
 }
 
+/// Whether the bound may run: the calling thread and every pool worker round
+/// subnormals as IEEE does. A flush-to-zero or denormals-are-zero mode on a
+/// worker could make a tree that is flat in IEEE long there.
+pub fn gate(calling_thread_gradual: bool, worker_gradual: &[bool]) -> bool {
+    calling_thread_gradual && worker_gradual.iter().all(|&g| g)
+}
+
 /// True when no row can give a finite f64 prediction above `threshold`.
 pub fn flat(tree: &Node, cols: &ColumnPieces, threshold: f64) -> bool {
     !threshold.is_nan()
@@ -545,17 +563,26 @@ mod tests {
     }
 
     #[test]
-    fn libm_widening_covers_two_ulps() {
-        let two_down = |v: f64| v.next_down().next_down();
-        let two_up = |v: f64| v.next_up().next_up();
+    fn libm_widening_covers_the_documented_bound() {
+        assert!(ULPS >= 4 * DOCUMENTED_LIBM_ULPS);
+        let down = |v: f64| (0..4 * DOCUMENTED_LIBM_ULPS).fold(v, |v, _| v.next_down());
+        let up = |v: f64| (0..4 * DOCUMENTED_LIBM_ULPS).fold(v, |v, _| v.next_up());
         for x in [-30.0f64, -1.0, 0.3, 1.0, 17.0, 300.0] {
             let a = Iv { lo: x, hi: x };
             let e = exp_guarded(a);
-            assert!(e.lo <= two_down(x.exp()) && two_up(x.exp()) <= e.hi, "exp {x}");
+            assert!(e.lo <= down(x.exp()) && up(x.exp()) <= e.hi, "exp {x}");
             let t = tanh(a);
-            let (lo, hi) = (two_down(x.tanh()).max(-1.0), two_up(x.tanh()).min(1.0));
+            let (lo, hi) = (down(x.tanh()).max(-1.0), up(x.tanh()).min(1.0));
             assert!(t.lo <= lo && hi <= t.hi, "tanh {x}");
         }
+    }
+
+    #[test]
+    fn gate_needs_every_thread() {
+        assert!(gate(true, &[true, true]));
+        assert!(gate(true, &[]));
+        assert!(!gate(false, &[true, true]));
+        assert!(!gate(true, &[true, false, true]));
     }
 
     #[test]
