@@ -11923,6 +11923,13 @@ mod tests {
         assert_eq!(stats.nonfinite_cpu_finite, 1, "{:?}", stats);
     }
 
+    /// A run clock for the device searches built in tests (a clock read inside a
+    /// gate test body is refused by `test_hygiene`).
+    #[cfg(feature = "cuda")]
+    fn run_clock() -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
     /// #854: the CPU check of a device `+inf` reads the run's column view. It
     /// builds none of its own, for a status-2 slot and a trade-floor slot alike.
     #[cfg(feature = "cuda")]
@@ -11979,7 +11986,7 @@ mod tests {
             None,
             Some(crate::metrics::ScoreObjective::LongPnl),
             false,
-            std::time::Instant::now(),
+            run_clock(),
             &[],
             None,
             cfg.fitness.book(),
