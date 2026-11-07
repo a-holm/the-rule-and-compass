@@ -17,6 +17,7 @@
 # Rc 255 with `terminated before first instrumented API call` and `test result: ok` (0 failed) is a pass only for a listed binary
 # (`<binary> no CUDA call (listed)`); for an unlisted binary it is a failure (`<binary> unexpected no CUDA call: add a plan line or fix the test`).
 # Plan mode `<binary> * no-cuda-app-only <reason>` is `no-cuda` plus `--target-processes application-only`: only for a binary whose child processes make no CUDA call either (children are then not traced). With it the sanitizer message `No attachable process found` (launch timeout) also counts as no CUDA call.
+# Plan mode `<binary> * app-only <reason>` runs the test process under memcheck with `--target-processes application-only` and gives the normal verdict (rc 0 and `ERROR SUMMARY: 0 errors`): for a binary whose test process makes CUDA calls but whose children must not be traced (the sanitizer crashes on them or they are not meant to run on the device). The reason names what stays unsanitized.
 # A listed binary whose run printed an ERROR SUMMARY called CUDA: it gets the normal verdict and the line ends `listed no-cuda but called CUDA`.
 # The summary ends with the counts `no-cuda binaries`, `unexpected no-cuda` and `listed no-cuda but called CUDA`.
 # A run with rc 255, `running 0 tests`, a non-zero filtered-out count and the sanitizer message `terminated before first instrumented API call` (the plan filtered out every test) is written as `<binary> skipped by plan | ...` and is not a failure.
@@ -63,7 +64,7 @@ plan_lines=$(awk '/^[[:space:]]*(#|$)/ { next } {
   printf "%s\t%s\t%s\t%s\n", $1, $2, $3, reason }' "$plan")
 while IFS=$'\t' read -r b t m r; do
   [ -n "$b" ] || continue
-  case "$m" in skip|api-errors-no) ;; no-cuda|no-cuda-app-only|run-bin) [ "$t" = "*" ] || { echo "sanitize-all: $m needs '*' as the test, got '$t' for $b in $plan" >&2; exit 2; } ;; *) echo "sanitize-all: bad mode '$m' in $plan" >&2; exit 2 ;; esac
+  case "$m" in skip|api-errors-no) ;; no-cuda|no-cuda-app-only|app-only|run-bin) [ "$t" = "*" ] || { echo "sanitize-all: $m needs '*' as the test, got '$t' for $b in $plan" >&2; exit 2; } ;; *) echo "sanitize-all: bad mode '$m' in $plan" >&2; exit 2 ;; esac
   [ -n "$r" ] || { echo "sanitize-all: empty reason for $b $t in $plan" >&2; exit 2; }
 done <<< "$plan_lines"
 run_bin_names=$(printf '%s\n' "$plan_lines" | awk -F'\t' '$3 == "run-bin" { print $1 }')
@@ -170,13 +171,14 @@ run_binary() { # name bin
   case "$star" in
     no-cuda) listed=1 ;;
     no-cuda-app-only) listed=1; target_args=(--target-processes application-only) ;;
+    app-only) target_args=(--target-processes application-only) ;;
   esac
   if [ "$star" = api-errors-no ]; then
     run_one "$name" "san-$name" no "$bin"
     return 0
   fi
   while IFS=$'\t' read -r b t mode r; do
-    [ "$b" = "$name" ] && [ "$mode" != no-cuda ] && [ "$mode" != no-cuda-app-only ] || continue
+    [ "$b" = "$name" ] && [ "$mode" != no-cuda ] && [ "$mode" != no-cuda-app-only ] && [ "$mode" != app-only ] || continue
     args+=(--skip "$t")
   done <<< "$plan_lines"
   [ ${#args[@]} -eq 0 ] || args+=(--exact)

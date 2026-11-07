@@ -34,10 +34,10 @@ fn parse(text: &str) -> Result<Vec<Line>, String> {
             _ => return Err(format!("line {no}: need <binary> <test> <mode> <reason>")),
         };
         let reason = it.collect::<Vec<_>>().join(" ");
-        if !["skip", "api-errors-no", "no-cuda", "no-cuda-app-only", "run-bin"].contains(&mode) {
+        if !["skip", "api-errors-no", "no-cuda", "no-cuda-app-only", "app-only", "run-bin"].contains(&mode) {
             return Err(format!("line {no}: unknown mode '{mode}'"));
         }
-        if (mode.starts_with("no-cuda") || mode == "run-bin") && test != "*" {
+        if (mode.starts_with("no-cuda") || mode == "app-only" || mode == "run-bin") && test != "*" {
             return Err(format!("line {no}: {mode} needs '*' as the test"));
         }
         if reason.is_empty() {
@@ -239,6 +239,13 @@ fn no_cuda_app_only_takes_only_a_star_line() {
     assert!(parse("launchers * no-cuda-app-only reason\n").is_ok());
     assert!(parse("launchers some_test no-cuda-app-only reason\n").is_err());
     assert!(parse("launchers * no-cuda-app-only\n").is_err());
+}
+
+#[test]
+fn app_only_takes_only_a_star_line() {
+    assert!(parse("launchers * app-only reason\n").is_ok());
+    assert!(parse("launchers some_test app-only reason\n").is_err());
+    assert!(parse("launchers * app-only\n").is_err());
 }
 
 #[test]
