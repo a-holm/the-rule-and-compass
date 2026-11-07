@@ -19,8 +19,11 @@ fn a_child_that_exited_before_reading_is_not_a_write_error() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // The child has exited and its end of the pipe is closed before the first write.
+    // `wait` closes our end of the pipe, so keep the handle and put it back: the child has
+    // exited and its read end is closed before the first write.
+    let stdin = child.stdin.take();
     assert_eq!(child.wait().unwrap().code(), Some(3));
+    child.stdin = stdin;
     rcsr_cmd::feed_stdin(&mut child, &vec![b'x'; 1 << 20]);
     assert_eq!(child.wait_with_output().unwrap().status.code(), Some(3));
 }
@@ -38,7 +41,7 @@ fn bare_stdin_writes(text: &str) -> Vec<usize> {
         let after = lines[i..lines.len().min(i + 3)]
             .iter()
             .any(|l| l.contains(".unwrap()") || l.contains(".expect("));
-        let ignored = line.contains("let _ =") || (i > 0 && lines[i - 1].contains("let _ ="));
+        let ignored = lines[i.saturating_sub(6)..=i].iter().any(|l| l.contains("let _ ="));
         if before && after && !ignored {
             hits.push(i + 1);
         }
