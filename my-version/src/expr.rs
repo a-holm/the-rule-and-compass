@@ -2165,9 +2165,20 @@ fn range_even(a: OutputRange, at: impl Fn(f64) -> f64) -> OutputRange {
 /// only claims what it proves. Aggregates and meta operators are constants of
 /// the training sample.
 pub fn output_range(n: &Node) -> OutputRange {
+    range_with(n, false)
+}
+
+/// [`output_range`] with every `Const` taken as the whole real line: what holds for
+/// every value a constant fit could give the constants.
+pub fn output_range_free_constants(n: &Node) -> OutputRange {
+    range_with(n, true)
+}
+
+fn range_with(n: &Node, free: bool) -> OutputRange {
     use Op::*;
-    let k = |i: usize| output_range(&n.kids[i]);
+    let k = |i: usize| range_with(&n.kids[i], free);
     match n.op {
+        Const if free => ANY_RANGE,
         Const => range_of(n.val, n.val),
         Complexity | Variables | Constants | Contains | ContainsOp | Agg(_) => range_of(n.val, n.val),
         Neg => {
@@ -2244,7 +2255,17 @@ pub fn output_range(n: &Node) -> OutputRange {
 /// the inputs decide. A range that touches the threshold counts as fixed, so
 /// `abs(x)` and `square(x)` at threshold 0 are `Some(true)`.
 pub fn fixed_position(n: &Node, threshold: f64) -> Option<bool> {
-    let r = output_range(n);
+    classify_range(output_range(n), threshold)
+}
+
+/// [`fixed_position`] for every value of the constants: `Some` only when no constant
+/// values could make the position depend on the inputs. A constant fit moves the
+/// constants, so a test before the fit may only claim this.
+pub fn fixed_position_for_any_constants(n: &Node, threshold: f64) -> Option<bool> {
+    classify_range(output_range_free_constants(n), threshold)
+}
+
+fn classify_range(r: OutputRange, threshold: f64) -> Option<bool> {
     if r.hi <= threshold {
         Some(false)
     } else if r.lo >= threshold {
@@ -3744,6 +3765,30 @@ mod tests {
             range_is(tree, *lo, *hi);
             assert_eq!(fixed_position(tree, 0.0), *fixed, "{:?}", tree.op);
         }
+    }
+
+    /// #848: a test before the constant fit may only claim what holds for every
+    /// value of the constants.
+    #[test]
+    fn fixed_position_for_any_constants_leaves_the_constants_free() {
+        use Op::*;
+        let x = || input(0);
+        let c = constant;
+        // 0.461 + abs(x): fixed long with its constant, selective once the fit moves it.
+        let shifted = bin(Add, c(0.461), un(Abs, x()));
+        assert_eq!(fixed_position(&shifted, 0.0), Some(true));
+        assert_eq!(fixed_position_for_any_constants(&shifted, 0.0), None);
+        // The constant inside the argument cannot change the range.
+        let g = un(Gauss, bin(Mul, c(3.0), x()));
+        assert_eq!(fixed_position_for_any_constants(&g, 0.0), Some(true));
+        assert_eq!(fixed_position_for_any_constants(&un(Exp, bin(Mul, c(2.0), x())), 0.0), Some(true));
+        assert_eq!(fixed_position_for_any_constants(&bin(Mul, c(2.0), un(Gauss, x())), 0.0), None);
+        assert_eq!(fixed_position_for_any_constants(&bin(Div, c(2.0), un(Exp, x())), 0.0), None);
+        let family = bin(Add, c(-15.508), un(Exp, un(Abs, bin(Mul, c(12.1686), bin(Add, c(0.0023), x())))));
+        assert_eq!(fixed_position_for_any_constants(&family, 0.0), None);
+        // A tree with no constant is judged as before.
+        assert_eq!(fixed_position_for_any_constants(&un(Gauss, x()), 0.0), Some(true));
+        assert_eq!(fixed_position_for_any_constants(&x(), 0.0), None);
     }
 
     /// #848: the threshold moves the boundary: `gauss(x)` is always long at 0,

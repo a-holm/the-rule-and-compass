@@ -5535,6 +5535,22 @@ fn fixed_position_rejected(t: &Node, cfg: &Config) -> bool {
     cfg.fitness.book().is_some_and(|b| expr::fixed_position(t, b.threshold()).is_some())
 }
 
+/// #848: the test before the constant fit. The fit moves constants, so a tree
+/// may only be rejected when no constant values could make its position depend
+/// on the inputs (`c + abs(x)` goes to the fit, `gauss(c * x)` does not). A tree
+/// with no input is always rejected. Without a fit the actual values count.
+fn fixed_position_rejected_before_fit(t: &Node, cfg: &Config) -> bool {
+    let Some(book) = cfg.fitness.book() else { return false };
+    if !expr::row_dependent(t) {
+        return true;
+    }
+    if cfg.fit_iters > 0 {
+        expr::fixed_position_for_any_constants(t, book.threshold()).is_some()
+    } else {
+        expr::fixed_position(t, book.threshold()).is_some()
+    }
+}
+
 /// #848: the archive test, applied to the tree and to the form it prints as,
 /// because `x / x` is not fixed on the raw tree and prints as `1`.
 fn fixed_position_archived(t: &Node, cfg: &Config) -> bool {
@@ -5559,7 +5575,7 @@ fn draw_row_dependent(
         return t;
     }
     for _ in 0..8 {
-        if !(fixed_on && fixed_position_rejected(&t, cfg)) {
+        if !(fixed_on && fixed_position_rejected_before_fit(&t, cfg)) {
             if !constant_on || expr::row_dependent(&t) {
                 return t;
             }
@@ -5718,7 +5734,7 @@ fn evolve_island(
             }
 
             let tree = expr::simplify(&child);
-            if filter_fixed && fixed_position_rejected(&tree, cfg) {
+            if filter_fixed && fixed_position_rejected_before_fit(&tree, cfg) {
                 GenCounters::count(counters, |c| &c.fixed_position); // #848
                 continue;
             }
@@ -7852,8 +7868,8 @@ fn run_search(
                 if fixed_position_filter(cfg, nvars) {
                     // #848: redraw a tree whose position cannot depend on the inputs.
                     for _ in 0..8 {
-                        if !fixed_position_rejected(&tree, cfg)
-                            && !fixed_position_rejected(&expr::simplify(&tree), cfg)
+                        if !fixed_position_rejected_before_fit(&tree, cfg)
+                            && !fixed_position_rejected_before_fit(&expr::simplify(&tree), cfg)
                         {
                             break;
                         }
@@ -11164,6 +11180,24 @@ mod tests {
         assert_eq!(front[0].error, 0.25);
         let (front, fallback) = survivors_or_fixed(Vec::new(), Vec::new());
         assert!(!fallback && front.is_empty());
+    }
+
+    /// #848: the test before the fit leaves `0.461 + abs(x)` to the fit (it can
+    /// become `-1.1 + abs(x)`), still rejects `gauss(c * x)` and input-free trees,
+    /// and judges the actual values when there is no fit.
+    #[test]
+    fn the_test_before_the_fit_judges_free_constants() {
+        let s = sample();
+        let cfg = Config { fitness: Fitness::LongPnl(pnl_book(&s)), threads: 1, ..Config::default() };
+        assert!(cfg.fit_iters > 0);
+        let shifted = node(Op::Add, vec![constant(0.461), node(Op::Abs, vec![input(0)])]);
+        let g = node(Op::Gauss, vec![node(Op::Mul, vec![constant(3.0), input(0)])]);
+        assert!(!fixed_position_rejected_before_fit(&shifted, &cfg));
+        assert!(fixed_position_archived(&shifted, &cfg), "with its fitted constant it is still fixed");
+        assert!(fixed_position_rejected_before_fit(&g, &cfg));
+        assert!(fixed_position_rejected_before_fit(&constant(0.3), &cfg));
+        let no_fit = Config { fit_iters: 0, ..cfg };
+        assert!(fixed_position_rejected_before_fit(&shifted, &no_fit));
     }
 
     /// #848: the filter is a saved search setting and off by default.
