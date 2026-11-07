@@ -298,7 +298,7 @@ finite-population correction for sampling without replacement,
 scored, which is `O(N_train²·d)` and should be opt-in on large panels.
 The queries of one set run on `--threads` workers (one worker below 4,096
 reference rows); each prediction depends only on its query row and the index,
-so every number is the same for any `--threads`.
+so every number is the same for any `--threads`. Without a k-d tree (more than 8 inputs) one pass over the reference rows serves 8 queries; each distance is the same dimension-order sum and the neighbours are the `k` smallest `(distance, index)` pairs, so the result equals the one-query path bit for bit.
 `baselines.knn.reference_rows`, `train_query_rows`, `test_query_rows`,
 `capped`, `sample_size`, `sample_seed`, both SEMs and `seconds` are reported. The reference set is always the
 training size.
