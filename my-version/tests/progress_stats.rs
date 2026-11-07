@@ -232,6 +232,7 @@ fn config(seed: u32, max_complexity: usize) -> Config {
         max_complexity,
         seed,
         metric: Metric::Squared,
+        gpu: false,
         ..Config::default()
     }
 }

@@ -32,7 +32,7 @@ step() {
   "$L" bash -c "cd '$W/my-version' && CARGO_BUILD_JOBS=2 $cmd" > "$D/$T-$name.log" 2>&1
 }
 
-cuda_env="CARGO_BUILD_JOBS=2 RCSR_CUDA_ARCH=$CUDA_ARCH"
+cuda_env="CARGO_BUILD_JOBS=2 RCSR_CUDA_ARCH=$CUDA_ARCH RCSR_REQUIRE_DEVICE=1"
 cuda_cargo="cargo test --release --features cuda"
 cuda_hold=$((LOCK_HOLD_MAX - 20))
 cuda_targets=0

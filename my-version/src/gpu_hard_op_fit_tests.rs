@@ -86,7 +86,7 @@ fn check(name: &str, x: &[Vec<f64>], y: &[f64], start: &Node) {
 macro_rules! need_device {
     () => {
         if !probe().available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
     };

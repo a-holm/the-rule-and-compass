@@ -3,7 +3,7 @@
 # Builds the CUDA test binary in the build slot with `cargo test --release --features cuda --no-run --message-format=json`,
 # takes its path from the compiler-artifact JSON line (profile.test true; target.name = <file>, or target.kind holding lib),
 # and runs it under the CUDA 13.0 compute-sanitizer memcheck through the test lock with the Xid check:
-# env RCSR_UNDER_SANITIZER=memcheck $SANITIZER --tool memcheck --leak-check no --error-exitcode 99 [--report-api-errors <v>] <binary> <filters>.
+# env RCSR_UNDER_SANITIZER=memcheck RCSR_REQUIRE_DEVICE=1 $SANITIZER --tool memcheck --leak-check no --error-exitcode 99 [--report-api-errors <v>] <binary> <filters>.
 # RCSR_UNDER_SANITIZER lets a test pick a smaller fixture (tests/common/sanitizer.rs). --api-errors no stops deliberate driver errors counting as sanitizer errors.
 # --bin <name> builds `cargo build --release --features cuda --bin <name>` instead and runs that binary under memcheck with the arguments after `--`
 # (target.kind bin, profile.test false); use small arguments, for example `--bin rcsr-gpu-bench -- --batch 64 --reps 1 --depth 3`.
@@ -106,7 +106,7 @@ if [ "$count" -ne 1 ]; then
 fi
 
 "$RC_RUN" run "$wt" "$id" "$tag" --cuda --timeout "$timeout_s" -- \
-  env RCSR_UNDER_SANITIZER=memcheck "$SANITIZER" --tool memcheck --leak-check no --error-exitcode 99 ${api_errors:+--report-api-errors "$api_errors"} "$bins" "$@"
+  env RCSR_UNDER_SANITIZER=memcheck RCSR_REQUIRE_DEVICE=1 "$SANITIZER" --tool memcheck --leak-check no --error-exitcode 99 ${api_errors:+--report-api-errors "$api_errors"} "$bins" "$@"
 rc=$?
 log=$(log_path "$id" "$tag")
 [ "$rc" -ne 70 ] || exit 70

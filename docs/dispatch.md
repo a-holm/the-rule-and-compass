@@ -175,6 +175,24 @@ The existing arm floors (`median`/`interquartile` 4 096 rows, `maximum` 512
 rows) are expressed through the same planner with a zero-hysteresis
 compatibility calibration. The `maximum` fit arm also needs the cost model to prefer the device, which holds above about 3 300 / p rows (#733).
 
+## What the anchors decide
+
+The compiled anchors (`DEFAULT_R_EVAL`, `DEFAULT_R_FIT`, `DEFAULT_BW`, `DEFAULT_LAUNCH_S`, `DEFAULT_CPU_EVAL`, `DEFAULT_CPU_FIT`) price every run with `--calibration anchors`. Some are off by large factors from a measured file. That moves a route only where the device and the CPU are close. `rcsr dispatch-plan` shows where:
+
+```sh
+rcsr dispatch-plan --calibration anchors --against tests/fixtures/calibration_rtx3060.json
+rcsr dispatch-plan --calibration anchors --against my-calibration.json --json
+```
+
+It routes a fixed grid of 4,950 cells under both calibrations and prints one line per cell, then `grid cells 4950, flips <n>, largest flip cost <s> s, largest flipped work <w>`. The grid covers 16 to 3,911,395 rows, 1 to 1,024 candidates, 1 to 31 nodes (eval) or 1 to 14 constants and 3 or 8 sweeps (fit), planned from the CPU and with the stage held on the device. It reads no clock and opens no device.
+
+Two tests keep a stale anchor from moving a route unseen:
+
+* `pilot_sizes_route_to_the_device_under_a_tenfold_rate_error` scales each of the six rates of the anchors by 0.1 and by 10, one at a time, and asserts the device route for 1 to 1,024 candidates, at least 65,536 rows and every complexity and constant count of the grid. It reads no clock. A planner change that shrinks the margin fails it, whatever the anchors say.
+* `anchor_flips_stay_below_the_launch_scale` routes the anchors against the fixture `tests/fixtures/calibration_rtx3060.json` (an RTX 3060 file) and asserts at most 60 flips, each with at most 4,096 units of work and at most 8 microseconds of wall cost per call.
+
+A route that does not flip at a size is not decided by the difference between the two calibrations. A changed anchor gives a new binary SHA-256 and moves every `predicted_s`.
+
 ## The run-level fit rule
 
 The stage model above decides one candidate batch. The fit arm of a whole run (`exact` or the batched GPU LM for `squared`, `aic`, `aicc`, `bic`) is a separate, pure rule that reads no timing: `min(islands, cores) * (s * k + (1 - s) / W) * E * (1 + h) < 1`, with `k = 0.05`, `E = 1.32`, `h = 0.3`, `W` the fallback workers (`cores` is `--threads` when given, else 8, so the rule does not follow the CPU affinity of the process; `W = min(cores, 8)` unless `RCSR_CPU_FALLBACK_THREADS` is set) and `s = 1` only when every configured operator has a device fit opcode. It is resolved once before generation 0; see "Default fit arm" in `gpu-backend.md`. The per-candidate model cannot decide it: its device and CPU fit costs scale with the same row, constant and sweep factors, so the device always wins there and the floor of `32p` rows is the only guard.

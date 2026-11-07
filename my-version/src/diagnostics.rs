@@ -189,18 +189,23 @@ impl Baselines {
         baseline_samples: usize,
         seed: u32,
     ) -> Baselines {
-        Baselines::fit_sampled_coef(train, test_folds, metric, baseline_samples, seed).0
+        Baselines::fit_sampled_coef(train, test_folds, metric, baseline_samples, seed, 1).0
     }
 
     /// As [`Baselines::fit_sampled`], also returning the least-squares line
     /// `[b0, b1, ..]` of the linear baseline so that a caller scoring it on
     /// other rows does not refit it (#257).
+    ///
+    /// The k-NN queries run on up to `workers` threads (#859). Every query is
+    /// a pure function of its row and the index, so every number is the same
+    /// for any `workers`.
     pub fn fit_sampled_coef(
         train: &Sample,
         test_folds: &[Sample],
         metric: Metric,
         baseline_samples: usize,
         seed: u32,
+        workers: usize,
     ) -> (Baselines, Option<Vec<f64>>) {
         // Mean.
         let mean = if train.is_empty() {
@@ -224,15 +229,16 @@ impl Baselines {
         // for the training queries and every test fold.
         let knn_start = std::time::Instant::now();
         let k = knn_k(train.len());
-        let mut index = KnnIndex::new(train);
+        let index = KnnIndex::new(train);
         let sample = baseline_samples;
         let train_q = score_knn_queries(
-            &mut index,
+            &index,
             train,
             metric,
             k,
             sample,
             seed ^ 0x7472_6169,
+            workers,
         );
         let mut test_rows = 0usize;
         let mut test_var = 0.0;
@@ -245,7 +251,7 @@ impl Baselines {
                 let fold_seed = seed
                     ^ 0x666f_6c64u32
                     ^ (0x9e37_79b9u32.wrapping_mul(f as u32 + 1));
-                let q = score_knn_queries(&mut index, fold, metric, k, sample, fold_seed);
+                let q = score_knn_queries(&index, fold, metric, k, sample, fold_seed, workers);
                 test_rows += q.rows;
                 if q.sem.is_finite() {
                     test_sampled = true;
@@ -322,12 +328,13 @@ struct QueryScore {
 /// Score `query` against the fixed reference index, sampling only the query
 /// rows when `sample > 0`.
 fn score_knn_queries(
-    index: &mut KnnIndex<'_>,
+    index: &KnnIndex<'_>,
     query: &Sample,
     metric: Metric,
     k: usize,
     sample: usize,
     seed: u32,
+    workers: usize,
 ) -> QueryScore {
     if query.is_empty() {
         return QueryScore {
@@ -347,10 +354,7 @@ fn score_knn_queries(
     } else {
         Vec::new()
     };
-    let mut pred = Vec::with_capacity(take);
-    for &i in &idx {
-        pred.push(index.predict(&query.x[i], k));
-    }
+    let (pred, _) = predict_rows(index, query, &idx, k, workers);
     let y: Vec<f64> = idx.iter().map(|&i| query.y[i]).collect();
     // #497: the class labels of a sampled row come from the whole query set.
     let objective = metrics::ScoreObjective::for_metric(metric);
@@ -376,6 +380,71 @@ fn score_knn_queries(
         rows: take,
         sem,
     }
+}
+
+/// Reference rows below which the queries stay on one thread: a thread spawn
+/// costs more than the queries.
+const KNN_PARALLEL_MIN_REFERENCE_ROWS: usize = 4096;
+
+/// Queries one worker takes from the shared counter at a time.
+const KNN_QUERY_CHUNK: usize = 8;
+
+/// The prediction of every row `idx` of `query`, in the order of `idx`, and
+/// the number of workers that ran. Each worker owns its scratch and hands out
+/// work through one shared counter; a prediction never reads another one, so
+/// the vector is the same for every `workers`.
+fn predict_rows(
+    index: &KnnIndex<'_>,
+    query: &Sample,
+    idx: &[usize],
+    k: usize,
+    workers: usize,
+) -> (Vec<f64>, usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let workers = if index.train.len() < KNN_PARALLEL_MIN_REFERENCE_ROWS {
+        1
+    } else {
+        workers.max(1).min(idx.len().div_ceil(KNN_QUERY_CHUNK))
+    };
+    if workers <= 1 {
+        let mut scratch = KnnScratch::default();
+        let pred = idx
+            .iter()
+            .map(|&i| index.predict(&query.x[i], k, &mut scratch))
+            .collect();
+        return (pred, 1);
+    }
+    let next = AtomicUsize::new(0);
+    let parts: Vec<Vec<(usize, f64)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut scratch = KnnScratch::default();
+                    let mut done = Vec::new();
+                    loop {
+                        let start = next.fetch_add(KNN_QUERY_CHUNK, Ordering::Relaxed);
+                        if start >= idx.len() {
+                            break;
+                        }
+                        let end = (start + KNN_QUERY_CHUNK).min(idx.len());
+                        for pos in start..end {
+                            done.push((pos, index.predict(&query.x[idx[pos]], k, &mut scratch)));
+                        }
+                    }
+                    done
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("a k-NN worker panicked"))
+            .collect()
+    });
+    let mut pred = vec![f64::NAN; idx.len()];
+    for (pos, p) in parts.into_iter().flatten() {
+        pred[pos] = p;
+    }
+    (pred, workers)
 }
 
 /// Standard error of the mean for metrics that are a plain mean of per-row
@@ -491,7 +560,8 @@ struct KdNode {
     max: [f64; KNN_KD_MAX_DIM],
 }
 
-/// An exact k-NN index over every training row.
+/// An exact k-NN index over every training row. It is immutable, so workers
+/// share it; each query borrows a [`KnnScratch`].
 ///
 /// A balanced k-d tree is built for `1 <= d <= KNN_KD_MAX_DIM`; otherwise the
 /// brute-force path reuses one distance buffer and selects the k smallest with
@@ -501,6 +571,11 @@ struct KnnIndex<'a> {
     dim: usize,
     nodes: Vec<KdNode>,
     root: Option<usize>,
+}
+
+/// The buffers one worker reuses across its queries.
+#[derive(Default)]
+struct KnnScratch {
     buf: Vec<(f64, usize)>,
     best: Vec<Neighbor>,
 }
@@ -524,12 +599,10 @@ impl<'a> KnnIndex<'a> {
             dim,
             nodes,
             root,
-            buf: Vec::new(),
-            best: Vec::new(),
         }
     }
 
-    fn predict(&mut self, x: &[f64], k: usize) -> f64 {
+    fn predict(&self, x: &[f64], k: usize, scratch: &mut KnnScratch) -> f64 {
         if self.train.is_empty() {
             return f64::NAN;
         }
@@ -538,7 +611,7 @@ impl<'a> KnnIndex<'a> {
         // and box bounds; use the brute-force path, which matches `zip`.
         if let Some(root) = self.root {
             if x.len() == self.dim {
-                self.best.clear();
+                scratch.best.clear();
                 search_kd(
                     &self.nodes,
                     self.train,
@@ -546,29 +619,30 @@ impl<'a> KnnIndex<'a> {
                     x,
                     self.dim,
                     kk,
-                    &mut self.best,
+                    &mut scratch.best,
                 );
-                self.best.sort_unstable();
-                return self.best.iter().map(|n| self.train.y[n.idx]).sum::<f64>() / kk as f64;
+                scratch.best.sort_unstable();
+                return scratch.best.iter().map(|n| self.train.y[n.idx]).sum::<f64>() / kk as f64;
             }
         }
-        self.predict_brute(x, kk)
+        self.predict_brute(x, kk, scratch)
     }
 
-    fn predict_brute(&mut self, x: &[f64], kk: usize) -> f64 {
-        self.buf.clear();
-        self.buf.extend(
+    fn predict_brute(&self, x: &[f64], kk: usize, scratch: &mut KnnScratch) -> f64 {
+        let buf = &mut scratch.buf;
+        buf.clear();
+        buf.extend(
             self.train
                 .x
                 .iter()
                 .enumerate()
                 .map(|(i, r)| (sqdist(r, x), i)),
         );
-        if kk < self.buf.len() {
-            self.buf.select_nth_unstable_by(kk - 1, cmp_dist);
+        if kk < buf.len() {
+            buf.select_nth_unstable_by(kk - 1, cmp_dist);
         }
-        self.buf[..kk].sort_unstable_by(cmp_dist);
-        self.buf[..kk]
+        buf[..kk].sort_unstable_by(cmp_dist);
+        buf[..kk]
             .iter()
             .map(|&(_, i)| self.train.y[i])
             .sum::<f64>()
@@ -2506,11 +2580,12 @@ mod tests {
     #[test]
     fn classification_query_path_equals_metrics_score_without_sampling() {
         let train = class_sample(2_000, 2.0, 6);
-        let mut index = KnnIndex::new(&train);
+        let index = KnnIndex::new(&train);
         let k = knn_k(train.len());
-        let pred: Vec<f64> = train.x.iter().map(|x| index.predict(x, k)).collect();
+        let mut scratch = KnnScratch::default();
+        let pred: Vec<f64> = train.x.iter().map(|x| index.predict(x, k, &mut scratch)).collect();
         for m in CLASS_LOSSES {
-            let q = score_knn_queries(&mut index, &train, m, k, 0, 9);
+            let q = score_knn_queries(&index, &train, m, k, 0, 9, 1);
             let want = metrics::score(&pred, &train.y, m);
             assert_eq!(q.error.to_bits(), want.to_bits(), "{m:?}");
             assert_eq!(q.rows, train.len());
@@ -2523,7 +2598,8 @@ mod tests {
         let negatives = train.y.iter().filter(|&&v| v < 0.5).count();
         assert!(negatives >= 1, "fixture needs at least one negative");
         let labels = metrics::binary_labels(&train.y);
-        let mut index = KnnIndex::new(&train);
+        let index = KnnIndex::new(&train);
+        let mut scratch = KnnScratch::default();
         let k = knn_k(train.len());
         let obj = metrics::ScoreObjective::LogLoss;
         let mut seed = 0u32;
@@ -2531,14 +2607,14 @@ mod tests {
             seed += 1;
         }
         let idx = sample_indices(train.len(), 512, seed);
-        let pred: Vec<f64> = idx.iter().map(|&i| index.predict(&train.x[i], k)).collect();
+        let pred: Vec<f64> = idx.iter().map(|&i| index.predict(&train.x[i], k, &mut scratch)).collect();
         let want = pred
             .iter()
             .map(|&p| metrics::classification_row_loss(p, 1.0, obj))
             .sum::<f64>()
             / 512.0;
         let y: Vec<f64> = idx.iter().map(|&i| train.y[i]).collect();
-        let q = score_knn_queries(&mut index, &train, Metric::LogLoss, k, 512, seed);
+        let q = score_knn_queries(&index, &train, Metric::LogLoss, k, 512, seed, 1);
         assert_eq!(q.error.to_bits(), want.to_bits());
         // The sample-only midpoint rule is degenerate on a single-class sample.
         let old = metrics::score(&pred, &y, Metric::LogLoss);
@@ -2548,11 +2624,11 @@ mod tests {
     #[test]
     fn sampled_classification_estimate_lies_within_three_sems_of_the_exact_value() {
         let train = class_sample(20_000, 2.0, 8);
-        let mut index = KnnIndex::new(&train);
+        let index = KnnIndex::new(&train);
         let k = knn_k(train.len());
         for m in CLASS_LOSSES {
-            let exact = score_knn_queries(&mut index, &train, m, k, 0, 3);
-            let est = score_knn_queries(&mut index, &train, m, k, 512, 3);
+            let exact = score_knn_queries(&index, &train, m, k, 0, 3, 1);
+            let est = score_knn_queries(&index, &train, m, k, 512, 3, 1);
             assert!(est.sem.is_finite() && est.sem > 0.0, "{m:?}");
             assert!(
                 (est.error - exact.error).abs() <= 3.0 * est.sem,
@@ -2563,6 +2639,92 @@ mod tests {
             );
         }
     }
+    /// `n` rows of `dim` inputs and a noisy target, so the neighbour order
+    /// has real ties to break.
+    fn regression_sample(n: usize, dim: usize, seed: u32) -> Sample {
+        let mut rng = Mt::new(seed);
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for _ in 0..n {
+            let row: Vec<f64> = (0..dim)
+                .map(|_| rng.usize_below(2_000) as f64 / 1_000.0 - 1.0)
+                .collect();
+            let noise = rng.usize_below(1_000) as f64 / 1_000.0;
+            y.push(row.iter().sum::<f64>() + noise);
+            x.push(row);
+        }
+        Sample::new(x, y)
+    }
+
+    /// #859: the baseline numbers are the same bits for any worker count, on the
+    /// k-d tree path (few inputs) and the brute-force path (many inputs), with
+    /// every query row scored and with a sample.
+    #[test]
+    fn knn_baseline_is_identical_for_any_worker_count() {
+        for (dim, samples) in [(3usize, vec![0usize, 512]), (12, vec![512])] {
+            let train = regression_sample(20_000, dim, 31);
+            let fold = regression_sample(1_500, dim, 32);
+            for sample_size in samples {
+                let bits = |b: &Baselines| {
+                    [
+                        b.knn.train_error.to_bits(),
+                        b.knn.test_error.to_bits(),
+                        b.knn_train_query_sem.to_bits(),
+                        b.knn_test_query_sem.to_bits(),
+                        b.knn_train_query_rows as u64,
+                        b.knn_test_query_rows as u64,
+                    ]
+                };
+                let (one, _) = Baselines::fit_sampled_coef(
+                    &train,
+                    &[fold.clone()],
+                    Metric::Squared,
+                    sample_size,
+                    5,
+                    1,
+                );
+                for workers in [2usize, 8] {
+                    let (many, _) = Baselines::fit_sampled_coef(
+                        &train,
+                        &[fold.clone()],
+                        Metric::Squared,
+                        sample_size,
+                        5,
+                        workers,
+                    );
+                    assert_eq!(
+                        bits(&one),
+                        bits(&many),
+                        "dim {dim}, sample {sample_size}, {workers} workers"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #859: the query set is split across the workers, every worker owns its
+    /// scratch, and the predictions equal the serial ones row by row. A small
+    /// reference stays on one thread.
+    #[test]
+    fn knn_queries_use_the_requested_workers_and_keep_their_order() {
+        let train = regression_sample(6_000, 4, 41);
+        let index = KnnIndex::new(&train);
+        let idx: Vec<usize> = (0..train.len()).step_by(3).collect();
+        let k = knn_k(train.len());
+        let (serial, used) = predict_rows(&index, &train, &idx, k, 1);
+        assert_eq!(used, 1);
+        for workers in [2usize, 5, 8] {
+            let (parallel, used) = predict_rows(&index, &train, &idx, k, workers);
+            assert_eq!(used, workers);
+            let bits = |v: &[f64]| v.iter().map(|p| p.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&serial), bits(&parallel), "{workers} workers");
+        }
+        let tiny = regression_sample(KNN_PARALLEL_MIN_REFERENCE_ROWS - 1, 4, 42);
+        let tiny_index = KnnIndex::new(&tiny);
+        let all: Vec<usize> = (0..tiny.len()).collect();
+        assert_eq!(predict_rows(&tiny_index, &tiny, &all, 5, 8).1, 1);
+    }
+
     #[test]
     fn sample_indices_are_distinct_deterministic_and_sorted() {
         let a = sample_indices(10_000, 500, 42);
@@ -2587,10 +2749,11 @@ mod tests {
         }
         x[17] = vec![0.5, -0.25];
         let ragged = Sample::new(x, y);
-        let mut index = KnnIndex::new(&ragged);
+        let index = KnnIndex::new(&ragged);
+        let mut scratch = KnnScratch::default();
         for i in 0..40usize {
             let q = vec![i as f64 * 0.02, (i % 3) as f64, 0.5];
-            let got = index.predict(&q, 5);
+            let got = index.predict(&q, 5, &mut scratch);
             let want = knn_predict(&ragged, &q, 5);
             assert_eq!(got.to_bits(), want.to_bits(), "short training row");
         }
@@ -2603,10 +2766,10 @@ mod tests {
                 .collect(),
             (0..300).map(|i| (i % 5) as f64).collect(),
         );
-        let mut index = KnnIndex::new(&rect);
+        let index = KnnIndex::new(&rect);
         let wide = vec![0.2, 1.0, 0.5, 99.0, -99.0];
         assert_eq!(
-            index.predict(&wide, 5).to_bits(),
+            index.predict(&wide, 5, &mut KnnScratch::default()).to_bits(),
             knn_predict(&rect, &wide, 5).to_bits(),
             "wider query"
         );

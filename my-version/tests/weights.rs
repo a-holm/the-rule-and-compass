@@ -380,6 +380,7 @@ fn a_weighted_search_still_recovers_a_clean_law() {
         seed: 1,
         metric: Metric::Absolute,
         ops: vec![Op::Add, Op::Sub, Op::Mul, Op::Div],
+        gpu: false,
         ..Default::default()
     };
     let out = search::run(&cfg, &p.train, &p.test);
