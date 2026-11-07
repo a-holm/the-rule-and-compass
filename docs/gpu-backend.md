@@ -2576,6 +2576,8 @@ A non-finite prediction scores `+inf` with status 2; fewer flips than `--min-tra
 
 **Throughput.** On the RTX 3060 at 1,000,000 rows (100 groups) and 256 programs (random depth-4 trees over 4 variables under `tanh` or `logistic`), the long-P&L score batch runs at 6.425e9 row-evaluations per second against 7.079e9 for the squared score batch on the same programs, 0.908x (kernel time alone: 6.453e9 against 7.110e9). Measured with the ignored test `long_pnl_throughput_against_squared` (`cargo test --release --features cuda --test pnl_fitness_gpu -- --ignored --exact long_pnl_throughput_against_squared --nocapture`).
 
+**Fixed-position trees (#848).** A tree whose output range over all real inputs does not cross the threshold has one position in exact arithmetic. On the device such a tree can take flat rows from `f32` underflow that the `f64` evaluation does not have (`gauss(u)` is `0` in `f32` at `|u|` about 10 and in `f64` at 27.3), so the device can rank it above every clean member. `--reject-fixed-position` keeps the class out of the search before the constant fit; see `docs/optimisation.md`.
+
 ## Long-only P&L reduction (issue #304)
 
 `src/cuda/pnl.cu` is a separate, fused long-only `{0, +1}` P&L reduction over a

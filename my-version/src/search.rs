@@ -221,6 +221,10 @@ pub struct Config {
     /// before the constant fit, except the first constant of an island.
     /// Saved search state.
     pub reject_constant_offspring: bool,
+    /// #848: under the long/flat fitness, reject trees whose position cannot
+    /// depend on the inputs before the constant fit and keep them out of the
+    /// archive. Saved search state.
+    pub reject_fixed_position: bool,
     /// Wall-clock budget in seconds; `None` means no limit.
     pub time_budget: Option<f64>,
     /// #855: a chunk that stops on `time_budget` saves its search state and
@@ -421,6 +425,9 @@ pub struct GenCounters {
     /// #477: offspring rejected before the fit because no input reaches the
     /// rows outside an aggregate or meta operator.
     pub constant: std::sync::atomic::AtomicU64,
+    /// #848: offspring rejected before the fit because their position cannot
+    /// depend on the inputs.
+    pub fixed_position: std::sync::atomic::AtomicU64,
     /// Whether the fit, eval and batch timers read the clock. Off outside a
     /// development log; the counts are kept either way.
     pub timed: bool,
@@ -620,6 +627,7 @@ impl Default for Config {
             fit_report: false,
             dedup: true,
             reject_constant_offspring: false,
+            reject_fixed_position: false,
             time_budget: None,
             interim_chunk: false,
             patience: 40,
@@ -704,6 +712,7 @@ impl Config {
         compare!(migration_interval, "migration_interval");
         compare!(restart_interval, "restart_interval");
         compare!(reject_constant_offspring, "reject_constant_offspring"); // #477
+        compare!(reject_fixed_position, "reject_fixed_position"); // #848
         compare!(init_depth, "init_depth");
         compare!(fit_iters, "fit_iters");
         compare!(fit_strategy, "fit_strategy"); // #116
@@ -4920,6 +4929,8 @@ struct RefitReport {
     refit_s: f64,
     /// Wall seconds in full-data scoring of the unique trees.
     rescore_s: f64,
+    /// #848: every candidate had a fixed position, so the front keeps them.
+    fixed_position_fallback: bool,
     /// #850: members of the rebuilt front that kept their carried constants.
     carried_kept: usize,
 }
@@ -4954,6 +4965,18 @@ fn keep_carried(front: Archive, carried: Vec<Sol>) -> (Archive, usize) {
         .filter(|s| hashes.contains(&expr::structural_hash(&s.tree)))
         .count();
     (front, kept)
+}
+
+/// #848: the members the admission filter kept, or, when it kept none, the
+/// fixed-position candidates it skipped (flagged), so a run never ends with an
+/// empty front because of the filter.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn survivors_or_fixed(kept: Vec<Sol>, skipped: Vec<Sol>) -> (Vec<Sol>, bool) {
+    if kept.is_empty() && !skipped.is_empty() {
+        (skipped, true)
+    } else {
+        (kept, false)
+    }
 }
 
 /// #495: indices of the trees worth an exact refit. `pre` are the pre-refit
@@ -5058,6 +5081,28 @@ fn full_data_archive(
     // used the batched GPU constants.
     refit_gpu_fit: bool,
 ) -> (Archive, RefitReport) {
+    let nvars = train.sample.x.first().map_or(0, |r| r.len());
+    if !fixed_position_filter(cfg, nvars) {
+        return full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, false);
+    }
+    // #848: fixed-position trees stay off the front unless nothing else is left.
+    let (front, report) = full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, true);
+    if !front.items.is_empty() {
+        return (front, report);
+    }
+    let (front, mut report) = full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, false);
+    report.fixed_position_fallback = true;
+    (front, report)
+}
+
+fn full_data_archive_with(
+    archive: &Archive,
+    islands: &[Vec<Ind>],
+    train: &EvalSample,
+    cfg: &Config,
+    refit_gpu_fit: bool,
+    exclude_fixed: bool,
+) -> (Archive, RefitReport) {
     let trees: Vec<&Node> = archive
         .items
         .iter()
@@ -5085,7 +5130,11 @@ fn full_data_archive(
     // #463: scoring is independent per tree; results keep the order.
     let score_all = |trees: Vec<Node>| -> Vec<Sol> {
         par_map(workers(trees.len()), trees, |tree| {
-            let error = full_data_error(&tree, train, cfg);
+            let error = if exclude_fixed && fixed_position_archived(&tree, cfg) {
+                f64::INFINITY
+            } else {
+                full_data_error(&tree, train, cfg)
+            };
             full_data_sol(tree, error, cfg)
         })
     };
@@ -5512,9 +5561,44 @@ fn offer(sink: &Option<(&std::sync::mpsc::SyncSender<PipelineJob>, usize)>, slot
     }
 }
 
-/// #477: draw `make()` again (up to 8 times) while it returns a tree with no
-/// row-dependent input and `have_const` says the island already holds one. The
-/// first constant tree is kept and sets `have_const`. Off, or with no input
+/// #848: whether the fixed-position filter applies: the flag is on, the fitness
+/// is the long/flat P&L and the data has input variables.
+fn fixed_position_filter(cfg: &Config, nvars: usize) -> bool {
+    cfg.reject_fixed_position && nvars > 0 && cfg.fitness.book().is_some()
+}
+
+/// #848: whether `t` holds one position on every input in exact arithmetic
+/// under the book's threshold.
+fn fixed_position_rejected(t: &Node, cfg: &Config) -> bool {
+    cfg.fitness.book().is_some_and(|b| expr::fixed_position(t, b.threshold()).is_some())
+}
+
+/// #848: the test before the constant fit. The fit moves constants, so a tree
+/// may only be rejected when no constant values could make its position depend
+/// on the inputs (`c + abs(x)` goes to the fit, `gauss(c * x)` does not). A tree
+/// with no input is always rejected. Without a fit the actual values count.
+fn fixed_position_rejected_before_fit(t: &Node, cfg: &Config) -> bool {
+    let Some(book) = cfg.fitness.book() else { return false };
+    if !expr::row_dependent(t) {
+        return true;
+    }
+    if cfg.fit_iters > 0 {
+        expr::fixed_position_for_any_constants(t, book.threshold()).is_some()
+    } else {
+        expr::fixed_position(t, book.threshold()).is_some()
+    }
+}
+
+/// #848: the archive test, applied to the tree and to the form it prints as,
+/// because `x / x` is not fixed on the raw tree and prints as `1`.
+fn fixed_position_archived(t: &Node, cfg: &Config) -> bool {
+    fixed_position_rejected(t, cfg) || fixed_position_rejected(&expr::simplify_display(t), cfg)
+}
+
+/// #477, #848: draw `make()` again (up to 8 times) while it returns a tree with
+/// no row-dependent input and `have_const` says the island already holds one,
+/// or a tree whose position cannot depend on the inputs. The first constant
+/// tree is kept and sets `have_const`. With both filters off, or with no input
 /// variable, it is a single draw.
 fn draw_row_dependent(
     cfg: &Config,
@@ -5523,16 +5607,20 @@ fn draw_row_dependent(
     mut make: impl FnMut() -> Node,
 ) -> Node {
     let mut t = make();
-    if !cfg.reject_constant_offspring || nvars == 0 {
+    let constant_on = cfg.reject_constant_offspring && nvars > 0;
+    let fixed_on = fixed_position_filter(cfg, nvars);
+    if !constant_on && !fixed_on {
         return t;
     }
     for _ in 0..8 {
-        if expr::row_dependent(&t) {
-            return t;
-        }
-        if !*have_const {
-            *have_const = true;
-            return t;
+        if !(fixed_on && fixed_position_rejected_before_fit(&t, cfg)) {
+            if !constant_on || expr::row_dependent(&t) {
+                return t;
+            }
+            if !*have_const {
+                *have_const = true;
+                return t;
+            }
         }
         t = make();
     }
@@ -5615,6 +5703,7 @@ fn evolve_island(
     // #477: whether `next` already holds a constant individual. Only the
     // first constant of an island is kept when the filter is on.
     let filter_constant = cfg.reject_constant_offspring && nvars > 0;
+    let filter_fixed = fixed_position_filter(cfg, nvars); // #848
     let mut have_const = filter_constant && next.iter().any(|i| !expr::row_dependent(&i.tree));
     let mut seen: HashSet<u64> = HashSet::with_capacity(pop * 2);
     // #77: parents are candidates too; seeding them here rejects an unchanged
@@ -5683,6 +5772,10 @@ fn evolve_island(
             }
 
             let tree = expr::simplify(&child);
+            if filter_fixed && fixed_position_rejected_before_fit(&tree, cfg) {
+                GenCounters::count(counters, |c| &c.fixed_position); // #848
+                continue;
+            }
             if cfg.complexity_model.complexity(&tree) > cfg.max_complexity as f64 {
                 GenCounters::count(counters, |c| &c.too_complex); // #211
                 continue;
@@ -6041,6 +6134,8 @@ pub struct Outcome {
     /// #482: offspring scored over the run, summed over islands and
     /// generations, including generations before a resume.
     pub candidates_evaluated: u64,
+    /// #848: every candidate had a fixed position, so the front keeps them.
+    pub fixed_position_fallback: bool,
     /// #855: the run stopped on `time_budget` under `--interim-chunk`. The
     /// search state is saved; `archive` is the search archive at the last
     /// generation, `test_errors` is empty and no end-of-run report ran.
@@ -6702,6 +6797,7 @@ fn dev_generation(
         post_fit_drops: GenCounters::total(counters, |c| &c.post_fit_drops) as usize,
         reevals: GenCounters::total(counters, |c| &c.reevals) as usize,
         constant_rejected: GenCounters::total(counters, |c| &c.constant) as usize,
+        fixed_position_rejected: GenCounters::total(counters, |c| &c.fixed_position) as usize,
         best_error,
         p05: q(0.05),
         p25: q(0.25),
@@ -6764,6 +6860,8 @@ fn run_postfix_search(
     device: Option<String>,
     dispatcher: &mut crate::dispatch::Dispatcher,
 ) -> Result<Outcome, String> {
+    // #848: fixed-position candidates the admission filter skipped; the front falls back to them when it would be empty.
+    let mut fixed_shadow = Archive::new(archive.cap);
     let pop = cfg.pop;
     let n_islands = cfg.islands.max(1);
     let trees: Vec<Vec<crate::expr::Node>> = islands
@@ -6846,6 +6944,8 @@ fn run_postfix_search(
         let stage_eval = stage_lap(&mut stage_mark); // #284
         restart_flags = vec![false; n_islands];
 
+        let filter_fixed_archive =
+            fixed_position_filter(cfg, train.x.first().map_or(0, |r| r.len())); // #848
         // Archive: test `(error, cost)` first and rebuild a tree only for a
         // candidate that survives. This is the survivor-only hand-off.
         let mut gen_best = f64::INFINITY;
@@ -6867,6 +6967,10 @@ fn run_postfix_search(
                     dev_admissions += 1; // #211
                 }
                 let Some(tree) = next.decode(idx) else { continue };
+                if filter_fixed_archive && fixed_position_archived(&tree, cfg) {
+                    fixed_shadow.try_insert_view(&tree, error, expr::complexity(&tree), cost); // #848
+                    continue;
+                }
                 archive.try_insert_view(&tree, error, expr::complexity(&tree), cost);
             }
         }
@@ -7166,10 +7270,12 @@ fn run_postfix_search(
     // Exact f64 rebuild over the surviving front only. The generation errors
     // were the f32 kernel proxy; every number the user reads comes from here.
     let mut final_archive = Archive::new(archive.cap);
+    let (survivors, fixed_position_fallback) =
+        survivors_or_fixed(std::mem::take(&mut archive.items), std::mem::take(&mut fixed_shadow.items));
     if interim {
-        final_archive.items = std::mem::take(&mut archive.items);
+        final_archive.items = survivors;
     } else {
-        for sol in std::mem::take(&mut archive.items) {
+        for sol in survivors {
             let tree = expr::simplify(&sol.tree);
             let error = if cfg.accepts_dimensions(&tree) {
                 score_tree(&tree, train_data, cfg)
@@ -7264,6 +7370,7 @@ fn run_postfix_search(
         stop_reason,
         prune: prune_report,
         candidates_evaluated: candidates,
+        fixed_position_fallback,
         interim,
     })
 }
@@ -7804,13 +7911,19 @@ fn run_search(
         for isl in 0..cfg.islands.max(1) {
             let depth = cfg.init_depth.min(1 + isl % 3);
             for _ in 0..cfg.pop {
-                init_trees.push(random_tree_with(
-                    &mut rng,
-                    nvars,
-                    &cfg.ops,
-                    depth,
-                    Some(&aggs),
-                ));
+                let mut tree = random_tree_with(&mut rng, nvars, &cfg.ops, depth, Some(&aggs));
+                if fixed_position_filter(cfg, nvars) {
+                    // #848: redraw a tree whose position cannot depend on the inputs.
+                    for _ in 0..8 {
+                        if !fixed_position_rejected_before_fit(&tree, cfg)
+                            && !fixed_position_rejected_before_fit(&expr::simplify(&tree), cfg)
+                        {
+                            break;
+                        }
+                        tree = random_tree_with(&mut rng, nvars, &cfg.ops, depth, Some(&aggs));
+                    }
+                }
+                init_trees.push(tree);
             }
         }
         let mut init_inds = par_map(
@@ -8435,6 +8548,7 @@ fn run_search(
             let stage_select = stage_lap(&mut stage_mark); // #284
 
             // ---- archive + convergence bookkeeping ----------------------
+            let filter_fixed_archive = fixed_position_filter(cfg, nvars); // #848
             let mut gen_best = f64::INFINITY;
             for pop in &islands {
                 for ind in pop {
@@ -8449,6 +8563,12 @@ fn run_search(
                         if archive.admits(ind.error, ind.complexity) {
                             dev_admissions += 1;
                         }
+                    }
+                    if filter_fixed_archive
+                        && archive.admits(ind.error, ind.complexity)
+                        && fixed_position_archived(&ind.tree, cfg)
+                    {
+                        continue; // #848
                     }
                     archive.try_insert_view(
                         &ind.tree,
@@ -8921,6 +9041,7 @@ fn run_search(
     let gpu_fit_used =
         cfg.fit_strategy.defers_to_gpu() && (gpu_used || fit_only_device);
     let mut refit_report = RefitReport::default();
+    let mut fixed_position_fallback = false; // #848
     if !interim
         && (subsampling_active(cfg, train)
             || gpu_used
@@ -8942,15 +9063,33 @@ fn run_search(
         );
         archive = rebuilt.0;
         refit_report = rebuilt.1;
+        fixed_position_fallback = refit_report.fixed_position_fallback;
     } else if !interim {
+        let filter_fixed_archive = fixed_position_filter(cfg, nvars); // #848
         for pop in &islands {
             for ind in pop {
+                if filter_fixed_archive && fixed_position_archived(&ind.tree, cfg) {
+                    continue; // #848
+                }
                 archive.try_insert(Sol {
                     complexity: expr::complexity(&ind.tree),
                     cost: ind.complexity,
                     tree: ind.tree.clone(),
                     error: ind.error,
                 });
+            }
+        }
+        if filter_fixed_archive && archive.items.is_empty() {
+            fixed_position_fallback = true;
+            for pop in &islands {
+                for ind in pop {
+                    archive.try_insert(Sol {
+                        complexity: expr::complexity(&ind.tree),
+                        cost: ind.complexity,
+                        tree: ind.tree.clone(),
+                        error: ind.error,
+                    });
+                }
             }
         }
     }
@@ -9103,6 +9242,7 @@ fn run_search(
         stop_reason, // #211
         prune: prune_report,
         candidates_evaluated: candidates,
+        fixed_position_fallback,
         interim,
     })
 }
@@ -11030,6 +11170,90 @@ mod tests {
         assert_eq!(banded.candidates, full.candidates);
         assert!(banded.refits < full.refits, "{} of {}", banded.refits, full.refits);
         assert!(banded.refits >= got.items.len());
+    }
+
+    /// #848: a fixed-position tree stays off the rebuilt front, even when it
+    /// beats every other member, and the front keeps it when nothing else is left.
+    #[test]
+    fn rebuild_keeps_fixed_position_trees_off_the_front() {
+        let s = sample();
+        let fixed = node(Op::Exp, vec![node(Op::Mul, vec![constant(0.1), input(0)])]);
+        let free = node(Op::Neg, vec![input(0)]);
+        let rebuild = |reject: bool, trees: &[Node]| {
+            let cfg = Config {
+                fitness: Fitness::LongPnl(pnl_book(&s)),
+                reject_fixed_position: reject,
+                threads: 1,
+                ..Config::default()
+            };
+            let view = EvalSample::new(&s, &cfg);
+            let mut a = Archive::new(100);
+            for t in trees {
+                a.items.push(Sol {
+                    complexity: expr::complexity(t),
+                    cost: cfg.complexity_model.complexity(t),
+                    error: 0.0,
+                    tree: t.clone(),
+                });
+            }
+            full_data_archive(&a, &[], &view, &cfg, false)
+        };
+        let both = [fixed.clone(), free.clone()];
+        let (control, _) = rebuild(false, &both);
+        assert!(
+            control.items.iter().any(|s| expr::fixed_position(&s.tree, 0.0).is_some()),
+            "the control front holds the fixed tree"
+        );
+        let (front, report) = rebuild(true, &both);
+        assert!(!report.fixed_position_fallback);
+        assert!(!front.items.is_empty());
+        assert!(front.items.iter().all(|s| expr::fixed_position(&s.tree, 0.0).is_none()));
+        let (front, report) = rebuild(true, &[fixed]);
+        assert!(report.fixed_position_fallback);
+        assert_eq!(front.items.len(), 1);
+    }
+
+    /// #848: an admission filter that leaves nothing gives the skipped fixed
+    /// candidates back, flagged, instead of an empty front.
+    #[test]
+    fn an_empty_filtered_front_falls_back_to_the_skipped_candidates() {
+        let sol = |k: f64| Sol { tree: constant(k), error: k, complexity: 1, cost: 1.0 };
+        let (front, fallback) = survivors_or_fixed(Vec::new(), vec![sol(0.5)]);
+        assert!(fallback);
+        assert_eq!(front.len(), 1);
+        let (front, fallback) = survivors_or_fixed(vec![sol(0.25)], vec![sol(0.5)]);
+        assert!(!fallback);
+        assert_eq!(front.len(), 1);
+        assert_eq!(front[0].error, 0.25);
+        let (front, fallback) = survivors_or_fixed(Vec::new(), Vec::new());
+        assert!(!fallback && front.is_empty());
+    }
+
+    /// #848: the test before the fit leaves `0.461 + abs(x)` to the fit (it can
+    /// become `-1.1 + abs(x)`), still rejects `gauss(c * x)` and input-free trees,
+    /// and judges the actual values when there is no fit.
+    #[test]
+    fn the_test_before_the_fit_judges_free_constants() {
+        let s = sample();
+        let cfg = Config { fitness: Fitness::LongPnl(pnl_book(&s)), threads: 1, ..Config::default() };
+        assert!(cfg.fit_iters > 0);
+        let shifted = node(Op::Add, vec![constant(0.461), node(Op::Abs, vec![input(0)])]);
+        let g = node(Op::Gauss, vec![node(Op::Mul, vec![constant(3.0), input(0)])]);
+        assert!(!fixed_position_rejected_before_fit(&shifted, &cfg));
+        assert!(fixed_position_archived(&shifted, &cfg), "with its fitted constant it is still fixed");
+        assert!(fixed_position_rejected_before_fit(&g, &cfg));
+        assert!(fixed_position_rejected_before_fit(&constant(0.3), &cfg));
+        let no_fit = Config { fit_iters: 0, ..cfg };
+        assert!(fixed_position_rejected_before_fit(&shifted, &no_fit));
+    }
+
+    /// #848: the filter is a saved search setting and off by default.
+    #[test]
+    fn reject_fixed_position_is_a_saved_search_setting() {
+        let a = Config::default();
+        let b = Config { reject_fixed_position: true, ..Config::default() };
+        assert!(!a.reject_fixed_position);
+        assert_eq!(a.search_setting_differences(&b), vec!["reject_fixed_position"]);
     }
 
     /// #850: long on `x < 0.9`, short loss above. The squared-error line through
