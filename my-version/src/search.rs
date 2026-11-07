@@ -6266,10 +6266,10 @@ pub struct GpuGenStats {
     /// book (trade floor), checked on the CPU like the status-2 ones.
     pub nonfinite_trade_floor: usize,
     /// #856: flat bare constants settled without a pass (`+inf` on the CPU by
-    /// the book's own rule), counted inside `nonfinite` and `nonfinite_trade_floor`.
+    /// the book's own rule), part of `nonfinite + nonfinite_trade_floor` (a slot is in one list or the other).
     pub nonfinite_constant: usize,
     /// #895: of the trade-floor and status-2 slots, those an exact f64 interval bound
-    /// of the tree settled without a pass, counted inside `nonfinite` and `nonfinite_trade_floor`.
+    /// of the tree settled without a pass, part of `nonfinite + nonfinite_trade_floor` (a slot is in one list or the other).
     pub nonfinite_bound: usize,
     /// #896: full passes stopped at a non-finite row, and flat passes that skipped the book.
     pub nonfinite_early: usize,
@@ -6863,10 +6863,10 @@ pub struct GpuSnapshot {
     pub nonfinite: usize,
     pub nonfinite_trade_floor: usize,
     /// #856: flat bare constants settled without a pass (`+inf` on the CPU by
-    /// the book's own rule), counted inside `nonfinite` and `nonfinite_trade_floor`.
+    /// the book's own rule), part of `nonfinite + nonfinite_trade_floor` (a slot is in one list or the other).
     pub nonfinite_constant: usize,
     /// #895: of the trade-floor and status-2 slots, those an exact f64 interval bound
-    /// of the tree settled without a pass, counted inside `nonfinite` and `nonfinite_trade_floor`.
+    /// of the tree settled without a pass, part of `nonfinite + nonfinite_trade_floor` (a slot is in one list or the other).
     pub nonfinite_bound: usize,
     /// #896: full passes stopped at a non-finite row, and flat passes that skipped the book.
     pub nonfinite_early: usize,
