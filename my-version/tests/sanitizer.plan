@@ -17,12 +17,13 @@ gpu_refusal_cli auto_dispatch_falls_back_to_the_cpu_with_the_cause_and_the_cpu_a
 # no-cuda: the binary makes no CUDA call by design and must keep it. A pass at rc 255 (terminated before first instrumented API call) is accepted only for a listed binary.
 # A listed binary that calls CUDA gets the normal memcheck verdict and the summary marks it; an unlisted binary with rc 255 fails the pass.
 attach                 *  no-cuda-app-only  its tests are ignored (measurement or external data): 0 tests run; the gdb child makes no CUDA call; memcheck runs with --target-processes application-only because the binary spawns processes and the default all crashes the sanitizer on a process tree (#910)
+lib                    *  app-only  library unit tests run under memcheck with --target-processes application-only (the default all crashes the sanitizer on a process tree, #910); the one child is the git describe of the bench report (bench.rs), which makes no CUDA call and is not traced
 bin-cpu_bench          *  no-cuda  no tests in this binary: the harness runs 0 tests and makes no CUDA call
 bin-rcsr               *  no-cuda  CPU-only tests; no CUDA call
 bin-rcsr-bench         *  no-cuda  no tests in this binary: the harness runs 0 tests and makes no CUDA call
 bin-rcsr-gpu-bench     *  skip     no tests in this binary: the harness runs 0 tests; the binary itself runs on the rcsr-gpu-bench line
-bin-rcsr-launch        *  no-cuda  CPU-only tests; no CUDA call
-bin-rcsr-rss           *  no-cuda  no tests in this binary: the harness runs 0 tests and makes no CUDA call
+bin-rcsr-launch      *  no-cuda-app-only  CPU-only tests; no CUDA call; the binary spawns worker commands, so memcheck runs with --target-processes application-only (the default all crashes the sanitizer on a process tree, #910)
+bin-rcsr-rss         *  no-cuda-app-only  no tests in this binary: the harness runs 0 tests and makes no CUDA call; the binary spawns processes, so memcheck runs with --target-processes application-only (#910)
 bin-rcsr_serve         *  no-cuda  no tests in this binary: the harness runs 0 tests and makes no CUDA call
 conflict_markers       *  no-cuda-app-only  git children, no CUDA call; memcheck runs with --target-processes application-only because the binary spawns processes and the default all crashes the sanitizer on a process tree (#910)
 cpu_bench              *  no-cuda-app-only  the cpu_bench child runs CPU code only; no CUDA call; memcheck runs with --target-processes application-only because the binary spawns processes and the default all crashes the sanitizer on a process tree (#910)

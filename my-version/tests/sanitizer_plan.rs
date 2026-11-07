@@ -335,26 +335,52 @@ fn spawns_a_process(text: &str) -> bool {
     })
 }
 
-/// Every test binary that spawns a process needs a `*` line that runs it with `--target-processes application-only` or not at all.
-fn spawners_not_app_only(plan: &str, root: &Path) -> Vec<String> {
-    let lines = parse(plan).expect("plan parses");
+/// Test executables and the source text that decides whether they spawn: each `tests/<name>.rs` with its `#[path]` modules,
+/// `lib` (every file of src/ outside src/bin and main.rs), `bin-<name>` (src/main.rs is `bin-rcsr`, src/bin/<x>.rs is `bin-<x>`).
+fn spawn_units(root: &Path) -> Vec<(Vec<String>, String)> {
+    let mut units = Vec::new();
     let mut files = Vec::new();
     rust_files(&root.join("tests"), &mut files);
     files.sort();
-    let mut bad = Vec::new();
-    for f in files {
-        if f.parent() != Some(&root.join("tests")) {
-            continue;
-        }
+    for f in files.into_iter().filter(|f| f.parent() == Some(&root.join("tests"))) {
         let name = f.file_stem().expect("stem").to_string_lossy().to_string();
-        if !spawns_a_process(&binary_text(&f)) {
+        units.push((vec![name], binary_text(&f)));
+    }
+    let src = root.join("src");
+    let mut lib = String::new();
+    let mut srcs = Vec::new();
+    if src.is_dir() {
+        rust_files(&src, &mut srcs);
+    }
+    srcs.sort();
+    for f in srcs {
+        let text = fs::read_to_string(&f).expect("read source");
+        if f == src.join("main.rs") {
+            units.push((vec!["bin-rcsr".to_string()], text));
+        } else if f.parent() == Some(&src.join("bin")) {
+            let stem = f.file_stem().expect("stem").to_string_lossy().to_string();
+            units.push((vec![format!("bin-{stem}"), format!("bin-{}", stem.replace('_', "-"))], text));
+        } else if !f.starts_with(src.join("bin")) {
+            lib.push_str(&text);
+        }
+    }
+    units.push((vec!["lib".to_string()], lib));
+    units
+}
+
+/// Every test executable that spawns a process needs a `*` line that runs it with `--target-processes application-only` or not at all.
+fn spawners_not_app_only(plan: &str, root: &Path) -> Vec<String> {
+    let lines = parse(plan).expect("plan parses");
+    let mut bad = Vec::new();
+    for (names, text) in spawn_units(root) {
+        if !spawns_a_process(&text) {
             continue;
         }
-        let ok = lines
-            .iter()
-            .any(|l| l.binary == name && l.test == "*" && ["skip", "no-cuda-app-only", "app-only"].contains(&l.mode.as_str()));
+        let ok = lines.iter().any(|l| {
+            names.contains(&l.binary) && l.test == "*" && ["skip", "no-cuda-app-only", "app-only"].contains(&l.mode.as_str())
+        });
         if !ok {
-            bad.push(name);
+            bad.push(names[0].clone());
         }
     }
     bad
@@ -395,4 +421,18 @@ fn the_spawn_detector_ignores_strings_comments_and_plain_output_methods() {
     assert!(!spawns_a_process("let s = \"Command::new\";\n// Command::new(x)\nlet y = gpu.output();"));
     assert!(spawns_a_process("use std::process::Command;\nlet o = c.output();"));
     assert!(spawns_a_process("let c = rcsr_cmd::rcsr_for(&a);"));
+}
+
+#[test]
+fn src_unit_tests_that_spawn_need_an_application_only_line() {
+    let scratch = Scratch::new("sansrc");
+    let dir = scratch.path();
+    fs::create_dir_all(dir.join("src/bin")).unwrap();
+    fs::create_dir_all(dir.join("tests")).unwrap();
+    fs::write(dir.join("src/lib.rs"), "pub fn g() { std::process::Command::new(\"git\").output().ok(); }\n").unwrap();
+    fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(dir.join("src/bin/tool_x.rs"), "fn main() { std::process::Command::new(\"x\").status().ok(); }\n").unwrap();
+    assert_eq!(spawners_not_app_only("", &dir), vec!["bin-tool_x".to_string(), "lib".to_string()]);
+    assert!(spawners_not_app_only("lib * app-only why\nbin-tool-x * no-cuda-app-only why\n", &dir).is_empty());
+    assert!(spawners_not_app_only("lib * skip why\nbin-tool_x * app-only why\n", &dir).is_empty());
 }
