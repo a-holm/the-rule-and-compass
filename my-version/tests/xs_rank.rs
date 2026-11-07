@@ -2,13 +2,16 @@
 //! `xs_rank`) and the top-tercile long-only book (`--position top_tercile`,
 //! `rcsr walkforward --policy top-tercile`).
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::devlog::Json;
 use rcsr::registry;
 use rcsr::store::{self, FileStore};
 use rcsr::target;
 use rcsr::trading::{self, PositionMap, TradingRows, TradingSpec};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 const T0: i64 = 1_600_000_000;
 const STEP: i64 = 3600;
@@ -28,7 +31,7 @@ fn p(dir: &Path, name: &str) -> String {
 }
 
 fn rcsr(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().expect("run rcsr")
+    rcsr_cmd::rcsr().args(args).output().expect("run rcsr")
 }
 
 fn code(o: &Output) -> i32 {
@@ -543,11 +546,17 @@ fn walkforward_from_run_prices_the_top_tercile_book_of_the_search() {
         assert_eq!(code(&o), 2, "{}", stderr(&o));
         assert!(stderr(&o).contains("no threshold"), "{}", stderr(&o));
     }
-    for flag in ["--device-pnl", "--batch-pnl"] {
-        let o = rcsr(&["walkforward", "--data", &csv, "--target", "r", "--expr", "x", "--time", "t", "--horizon", "3600", "--window", &w, "--policy", "top-tercile", flag]);
-        assert_ne!(code(&o), 0);
+    for extra in [&["--device-pnl"][..], &["--batch-pnl"], &["--band", "0.1"], &["--min-hold", "2"], &["--select-band"]] {
+        let flag = extra[0];
+        let mut args = vec!["walkforward", "--data", csv.as_str(), "--target", "r", "--expr", "x", "--time", "t", "--horizon", "3600", "--window", w.as_str(), "--policy", "top-tercile"];
+        args.extend_from_slice(extra);
+        let o = rcsr(&args);
+        assert_eq!(code(&o), 2, "{flag}: {}", stderr(&o));
         assert!(stderr(&o).contains("top-tercile"), "{flag}: {}", stderr(&o));
     }
+    let o = rcsr(&["walkforward", "--data", &csv, "--time", "t", "--group-by", "sym", "--from-run", &run, "--window", &w, "--allow-in-sample-windows", "--device-pnl"]);
+    assert_eq!(code(&o), 2, "from-run: {}", stderr(&o));
+    assert!(stderr(&o).contains("top-tercile"), "{}", stderr(&o));
 
     // The ablation prices the threshold rule only.
     let windows = p(&dir, "windows.csv");

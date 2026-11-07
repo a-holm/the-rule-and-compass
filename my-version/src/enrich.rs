@@ -1758,6 +1758,8 @@ pub struct Report {
     pub long_labels: Vec<LongLabelOutput>,
     pub backend: String,
     pub gpu_requested: String,
+    /// `false` when the device was not probed; then `gpu_available` is not a finding.
+    pub gpu_probed: bool,
     pub gpu_available: bool,
     pub gpu_device: Option<String>,
     /// Output feature/label columns computed by a CUDA kernel.
@@ -1826,8 +1828,8 @@ impl Report {
                 "# enrich: backend={} gpu_requested={} gpu_available={} device={}",
                 self.backend,
                 self.gpu_requested,
-                self.gpu_available,
-                self.gpu_device.as_deref().unwrap_or("none")
+                if self.gpu_probed { self.gpu_available.to_string() } else { "not probed".to_string() },
+                self.gpu_device.as_deref().unwrap_or(if self.gpu_probed { "none" } else { "not probed" })
             ),
             format!(
                 "# enrich: gpu_columns={} cpu_columns={} gpu_share={:.3} fallback={} kernel={:.3}s d2h={:.3}s write={:.3}s transfer_bytes={} write_bw={:.0}",
@@ -2010,7 +2012,7 @@ impl Report {
              \"rows\":{},\"columns_in\":{},\"columns_out\":{},\"groups\":{},\"symbols\":{},\n  \
              \"group_rows\":{},\"chunk_rows\":{},\"bar_seconds\":{},\n  \
              \"lockbox_embargo\":{},\n  \
-             \"backend\":{},\"gpu_requested\":{},\"gpu_available\":{},\"gpu_device\":{},\n  \
+             \"backend\":{},\"gpu_requested\":{},\"gpu_probed\":{},\"gpu_available\":{},\"gpu_device\":{},\n  \
              \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"write_s\":{:.6},\"transfer_bytes\":{},\"write_bw\":{:.0},\"fallback_columns\":[{}]}},\n  \
              \"plan_rates\":{},\n  \"projection\":{{\"hash\":{},\"columns\":[{}]}},\n  \
              \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"feature_read_s\":{:.6},\"feature_context_s\":{:.6},\"feature_gpu_s\":{:.6},\"feature_cpu_s\":{:.6},\"feature_other_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"total_s\":{:.6}}},\n  \"ledger\":{},\n  \
@@ -2031,7 +2033,8 @@ impl Report {
             crate::lockbox::embargo_json(self.lockbox_embargo.0, &self.lockbox_embargo.1, EMBARGO_RULE, self.bar_seconds),
             jstr(&self.backend),
             jstr(&self.gpu_requested),
-            self.gpu_available,
+            self.gpu_probed,
+            if self.gpu_probed { self.gpu_available.to_string() } else { "null".to_string() },
             self.gpu_device
                 .as_deref()
                 .map(jstr)
@@ -7546,11 +7549,11 @@ fn enrich_inner(
 
     // GPU plan.
     let gpu = if opts.gpu == GpuMode::Off {
-        crate::backend::Probe::cpu("--cpu/--no-gpu (device not probed)")
+        crate::backend::Probe::not_probed("--cpu/--no-gpu (device not probed)")
     } else {
         crate::backend::probe()
     };
-    let (gpu_available, gpu_device) = (gpu.available(), gpu.device.clone());
+    let (gpu_available, gpu_device, gpu_probed) = (gpu.available(), gpu.device.clone(), gpu.probed);
     let mut fam_counts: BTreeMap<&'static str, (usize, OpClass)> = BTreeMap::new();
     let classify = |name: &str| -> OpClass {
         if compact_requested.iter().any(|c| c == name) {
@@ -8774,6 +8777,7 @@ fn enrich_inner(
             long_labels: long_outputs,
             backend: if gpu_columns > 0 { "gpu" } else { "cpu" }.to_string(),
             gpu_requested: format!("{:?}", opts.gpu).to_lowercase(),
+            gpu_probed,
             gpu_available,
             gpu_device,
             gpu_columns,
@@ -8842,6 +8846,7 @@ fn enrich_inner(
         long_labels: long_outputs,
         backend: backend.to_string(),
         gpu_requested: format!("{:?}", opts.gpu).to_lowercase(),
+        gpu_probed,
         gpu_available,
         gpu_device,
         gpu_columns,

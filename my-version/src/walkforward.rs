@@ -917,6 +917,25 @@ fn has_dataset_op(n: &Node) -> bool {
     n.op.is_agg() || n.op.is_meta() || n.kids.iter().any(has_dataset_op)
 }
 
+/// The refusal message when `--policy top-tercile` is combined with a flag it has no
+/// meaning for. The CLI reports it as a usage error (#832).
+pub fn top_tercile_refusal(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<String> {
+    let refused = [
+        (spec.threshold_fixed.is_some(), "--threshold-fixed"),
+        (spec.band_width != 0.0, "--band"),
+        (spec.min_hold != 1, "--min-hold"),
+        (spec.band_select, "--select-band"),
+        (spec.device_pnl, "--device-pnl"),
+        (opts.batch_pnl, "--batch-pnl"),
+    ];
+    refused.iter().find(|(set, _)| *set).map(|(_, flag)| {
+        format!(
+            "{} is not supported with --policy top-tercile: the book has no threshold, band or device arm",
+            flag
+        )
+    })
+}
+
 fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), String> {
     if spec.windows.is_empty() {
         return Err("at least one --window is required".to_string());
@@ -942,19 +961,8 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
         return Err("--min-hold must be at least 1".to_string());
     }
     if spec.policy == Policy::TopTercile {
-        let refused = [
-            (spec.threshold_fixed.is_some(), "--threshold-fixed"),
-            (spec.band_width != 0.0, "--band"),
-            (spec.min_hold != 1, "--min-hold"),
-            (spec.band_select, "--select-band"),
-            (spec.device_pnl, "--device-pnl"),
-            (opts.batch_pnl, "--batch-pnl"),
-        ];
-        if let Some((_, flag)) = refused.iter().find(|(set, _)| *set) {
-            return Err(format!(
-                "{} is not supported with --policy top-tercile: the book has no threshold, band or device arm",
-                flag
-            ));
+        if let Some(msg) = top_tercile_refusal(spec, opts) {
+            return Err(msg);
         }
     }
     if spec.policy == Policy::Band && spec.device_pnl {

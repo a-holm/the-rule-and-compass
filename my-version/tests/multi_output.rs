@@ -5,12 +5,15 @@
 //! budget, the JSON contract is checked, a single target is unchanged, and a
 //! missing target column is a clear input error.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::Sample;
 use rcsr::metrics::Metric;
 use rcsr::multi;
 use rcsr::search::{self, Config};
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -26,6 +29,7 @@ fn config(seed: u32, generations: usize) -> Config {
         patience: 0,
         seed,
         metric: Metric::Absolute,
+        gpu: false,
         ..Default::default()
     }
 }
@@ -146,7 +150,7 @@ impl TempPath {
 }
 
 fn rcsr(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")

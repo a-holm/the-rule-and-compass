@@ -4,8 +4,13 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+#[path = "common/launches.rs"]
+mod launches;
+
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -13,7 +18,11 @@ mod scratch;
 use scratch::Scratch;
 
 fn has_device() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 fn tmp_csv(rows: usize) -> (Scratch, PathBuf) {
@@ -29,7 +38,8 @@ fn tmp_csv(rows: usize) -> (Scratch, PathBuf) {
 }
 
 fn rcsr(csv: &PathBuf, extra: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    // Every test of this file needs the device, with and without `--gpu`.
+    rcsr_cmd::rcsr_on_device()
         .args(["--data", csv.to_str().unwrap(), "--target", "y", "--vars", "x"])
         .args(["--generations", "2", "--seed", "1"])
         .args(extra)
@@ -93,7 +103,7 @@ fn an_explicit_device_fit_that_does_not_fit_exits_2_at_the_fit_stage() {
     let budget = (train * 2 * 4 + (2 << 20)).to_string();
     let out = rcsr(
         &csv,
-        &["--gpu", "--fit-strategy", "gpu", "--gpu-memory", budget.as_str()],
+        &["--gpu", "--dispatch", "device", "--fit-strategy", "gpu", "--gpu-memory", budget.as_str()],
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
@@ -107,9 +117,12 @@ fn a_normal_gpu_run_reports_a_resident_plan() {
         return;
     }
     let (_dir, csv) = tmp_csv(5000);
-    let out = rcsr(&csv, &["--gpu", "--json", "--quiet"]);
+    let out = rcsr(&csv, &["--gpu", "--dispatch", "device", "--json", "--quiet"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let launches = launches::device_launches(&stdout);
+    eprintln!("forced device run: {launches} device launches counted");
+    assert!(launches > 0, "a forced device run launched no kernel: {stdout}");
     assert!(stdout.contains("\"memory_plan\":{\"mode\":\"resident\""), "{stdout}");
     let plan = &stdout[stdout.find("\"memory_plan\"").unwrap()..];
     let required = number_after(plan, "\"required_bytes\":");

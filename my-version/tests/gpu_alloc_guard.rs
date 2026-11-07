@@ -105,7 +105,7 @@ struct Observed {
 
 fn run(metric: Metric, rows: usize) -> Option<Observed> {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return None;
     }
     let _one_at_a_time = RUN.lock().unwrap_or_else(|e| e.into_inner());
@@ -174,7 +174,7 @@ fn check(o: &Observed, metric: Metric, rows: usize) {
 #[test]
 fn the_plan_at_one_million_rows_has_no_candidates_times_rows_term() {
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let _one_at_a_time = RUN.lock().unwrap_or_else(|e| e.into_inner());

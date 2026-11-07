@@ -257,7 +257,7 @@ mod device {
 
     fn have_device() -> bool {
         if !rcsr::gpu::probe().available() {
-            eprintln!("skipping: no CUDA device");
+            rcsr::backend::skip_without_device("skipping: no CUDA device");
             return false;
         }
         true

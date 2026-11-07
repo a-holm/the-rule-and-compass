@@ -5,13 +5,16 @@
 //! elite rule above `--max-complexity`, the CLI/file error contract, the
 //! reporting in text/JSON/NDJSON, and that a run without seeds is unchanged.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::bench;
 use rcsr::data::Sample;
 use rcsr::expr::{self, Node};
 use rcsr::metrics::Metric;
 use rcsr::search::{self, Config, Outcome};
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -37,6 +40,7 @@ fn config(seed: u32, generations: usize) -> Config {
         patience: 0,
         seed,
         metric: Metric::Absolute,
+        gpu: false,
         ..Default::default()
     }
 }
@@ -64,7 +68,7 @@ fn describe(out: &Outcome) -> Vec<(u64, u64, u64)> {
 }
 
 fn rcsr(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")

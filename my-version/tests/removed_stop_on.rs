@@ -1,19 +1,21 @@
 //! Flags removed after the default-decision A/B round (#464) fail with a message that names the removal. Checkpoints written with them refuse to load.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::checkpoint::Checkpoint;
 use rcsr::data::Sample;
 use rcsr::search::{self, Config};
-use std::process::Command;
 
 fn rcsr(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")
 }
 
 fn bench(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr-bench"))
+    rcsr_cmd::rcsr_bench()
         .args(args)
         .output()
         .expect("run rcsr-bench")
@@ -30,6 +32,7 @@ fn checkpoint_text() -> String {
         max_complexity: 8,
         fit_iters: 2,
         seed: 3,
+        gpu: false,
         ..Default::default()
     };
     let mut text = None;

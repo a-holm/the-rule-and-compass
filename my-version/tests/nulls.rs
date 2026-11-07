@@ -5,11 +5,14 @@
 //! permutation mechanics and show, on synthetic AR(1) series, that the i.i.d.
 //! null over-rejects while the block null is close to the nominal level.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::diagnostics::{block_count, block_permute, NullControl};
 use rcsr::rng::Mt;
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 /// A stationary-ish AR(1) series; innovations are a sum of three uniforms.
 fn ar1(n: usize, phi: f64, seed: u32) -> Vec<f64> {
@@ -166,7 +169,7 @@ impl TempCsv {
 }
 
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")

@@ -67,7 +67,11 @@ fn iqr_config(seed: u32) -> Config {
 
 #[cfg(feature = "cuda")]
 fn device_available() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 #[cfg(feature = "cuda")]
@@ -177,7 +181,7 @@ fn a_small_sample_keeps_the_labelled_cpu_interquartile_arm() {
 #[test]
 fn gpu_interquartile_run_is_deterministic_and_reports_the_exact_objective() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let n = rcsr::fit::INTERQUARTILE_GPU_MIN_ROWS + 64;
@@ -232,7 +236,7 @@ fn gpu_interquartile_run_is_deterministic_and_reports_the_exact_objective() {
 #[test]
 fn no_fit_is_a_true_noop_for_the_interquartile_gpu_arm() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     // Below the #288 scoring floor: `--no-fit` leaves neither a fit arm nor a

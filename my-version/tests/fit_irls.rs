@@ -1,15 +1,18 @@
 //! `--fit-irls` (issue #611): determinism, thread invariance, exact reported
 //! members and refusals of the opt-in reweighted L1 schedules.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::Sample;
 use rcsr::fit::{self, FitIrls};
 use rcsr::metrics::Metric;
 use rcsr::search::{self, Config};
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 fn rcsr(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")
