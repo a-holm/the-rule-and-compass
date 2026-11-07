@@ -187,6 +187,11 @@ pub struct EvalCheckLedger {
     pub full_passes: u64,
     /// Full passes that came out finite on the CPU.
     pub finite: u64,
+    /// #893: of `finite`, the ones that were trade-floor slots (a floor slot
+    /// whose f64 score is finite is one `--skip-floor-check` would have left at `+inf`).
+    pub floor_finite: u64,
+    /// #893: trade-floor slots kept `+inf` without a pass.
+    pub floor_unchecked: u64,
 }
 
 impl EvalCheckLedger {
@@ -471,6 +476,8 @@ impl RunLedger {
         self.eval_check.trade_floor_slots += c.trade_floor_slots;
         self.eval_check.full_passes += c.full_passes;
         self.eval_check.finite += c.finite;
+        self.eval_check.floor_finite += c.floor_finite;
+        self.eval_check.floor_unchecked += c.floor_unchecked;
     }
 
     pub fn eval_check(&self) -> EvalCheckLedger {

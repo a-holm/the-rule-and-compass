@@ -221,6 +221,10 @@ pub struct Config {
     /// before the constant fit, except the first constant of an island.
     /// Saved search state.
     pub reject_constant_offspring: bool,
+    /// #893: keep a device trade-floor `+inf` without the f64 check when the
+    /// book threshold is inside the f32 normal range and `--min-trades` is at
+    /// most 1. Not bit-identical to the check. Saved search state.
+    pub skip_floor_check: bool,
     /// Wall-clock budget in seconds; `None` means no limit.
     pub time_budget: Option<f64>,
     /// #855: a chunk that stops on `time_budget` saves its search state and
@@ -620,6 +624,7 @@ impl Default for Config {
             fit_report: false,
             dedup: true,
             reject_constant_offspring: false,
+            skip_floor_check: false,
             time_budget: None,
             interim_chunk: false,
             patience: 40,
@@ -704,6 +709,7 @@ impl Config {
         compare!(migration_interval, "migration_interval");
         compare!(restart_interval, "restart_interval");
         compare!(reject_constant_offspring, "reject_constant_offspring"); // #477
+        compare!(skip_floor_check, "skip_floor_check"); // #893
         compare!(init_depth, "init_depth");
         compare!(fit_iters, "fit_iters");
         compare!(fit_strategy, "fit_strategy"); // #116
@@ -1917,6 +1923,24 @@ impl GpuSearch {
         generation: usize,
     ) -> Option<PendingCheck> {
         let train = data.sample;
+        // #893: with the flag on and a threshold the f32 and f64 cuts share, a
+        // floor slot stays `+inf` without a pass.
+        let (floor, skipped): (&[(usize, usize)], &[(usize, usize)]) =
+            if cfg.skip_floor_check && floor_is_format_free(cfg) { (&[], floor) } else { (floor, &[]) };
+        if !skipped.is_empty() {
+            for &(i, j) in skipped {
+                islands[i][j].confirm_inf(Some(self.rows_version));
+            }
+            let stats = self.stats.entry(generation).or_default();
+            stats.nonfinite_trade_floor += skipped.len();
+            stats.nonfinite_floor_unchecked += skipped.len();
+            self.ledger.record_eval_check(crate::gpu_stats::EvalCheckLedger {
+                slots: skipped.len() as u64,
+                trade_floor_slots: skipped.len() as u64,
+                floor_unchecked: skipped.len() as u64,
+                ..Default::default()
+            });
+        }
         let (status2, slots) = (slots.len(), [slots, floor].concat());
         if slots.is_empty() {
             return None;
@@ -1972,14 +1996,16 @@ impl GpuSearch {
             .expect("a GPU search owns its fallback pool")
             .submit(jobs, data, cfg);
         check.pool_s = submit_start.elapsed().as_secs_f64();
-        Some(PendingCheck { full, ticket, check })
+        let floor_set: std::collections::HashSet<(usize, usize)> = floor.iter().copied().collect();
+        let full_is_floor: Vec<bool> = full.iter().map(|s| floor_set.contains(s)).collect();
+        Some(PendingCheck { full, ticket, check, full_is_floor })
     }
 
     /// #857: the second half: wait for the submitted passes and write their
     /// scores. `pool_s` counts the host time spent submitting and waiting, not
     /// the time the passes ran beside other work.
     fn check_end(&mut self, islands: &mut [Vec<Ind>], pending: PendingCheck, generation: usize) {
-        let PendingCheck { full, ticket, mut check } = pending;
+        let PendingCheck { full, ticket, mut check, full_is_floor } = pending;
         let wait_start = std::time::Instant::now();
         let (errors, seconds) = self
             .fallback
@@ -1988,9 +2014,10 @@ impl GpuSearch {
             .finish(ticket);
         check.pool_s += wait_start.elapsed().as_secs_f64();
         let stats = self.stats.entry(generation).or_default();
-        for (&(i, j), e) in full.iter().zip(errors) {
+        for ((&(i, j), e), is_floor) in full.iter().zip(errors).zip(full_is_floor) {
             stats.nonfinite_cpu_finite += e.is_finite() as usize;
             check.finite += e.is_finite() as u64;
+            check.floor_finite += (is_floor && e.is_finite()) as u64;
             islands[i][j].set_error(e);
             islands[i][j].confirm_inf(Some(self.rows_version));
         }
@@ -2441,6 +2468,7 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             nonfinite: batch.map(|b| b.nonfinite).unwrap_or(0),
             nonfinite_trade_floor: batch.map(|b| b.nonfinite_trade_floor).unwrap_or(0),
             nonfinite_constant: batch.map(|b| b.nonfinite_constant).unwrap_or(0),
+            nonfinite_floor_unchecked: batch.map(|b| b.nonfinite_floor_unchecked).unwrap_or(0),
             nonfinite_full: batch.map(|b| b.nonfinite_full).unwrap_or(0),
             nonfinite_cpu_finite: batch.map(|b| b.nonfinite_cpu_finite).unwrap_or(0),
             nonfinite_seconds: batch.map(|b| b.nonfinite_seconds).unwrap_or(0.0),
@@ -2831,6 +2859,8 @@ struct PendingCheck {
     full: Vec<(usize, usize)>,
     ticket: FallbackTicket,
     check: crate::gpu_stats::EvalCheckLedger,
+    /// Per entry of `full`: the slot is a trade-floor one.
+    full_is_floor: Vec<bool>,
 }
 
 /// #121: a submitted fallback batch, waiting to be collected.
@@ -4004,6 +4034,17 @@ fn eval_error_and_descriptor(
 
 /// #500: rows probed for a non-finite prediction before a full re-score.
 const INF_PROBE_ROWS: usize = 2048;
+
+/// #893: whether the long/flat book cuts the f32 device program and the f64 CPU
+/// program at a threshold both formats represent as a normal number, with a
+/// floor of one trade. Only then is a device trade-floor `+inf` skipped; a
+/// tree whose f32 program differs from the f64 one near the cut can still read
+/// flat on the device and long on the CPU.
+fn floor_is_format_free(cfg: &Config) -> bool {
+    cfg.fitness
+        .book()
+        .is_some_and(|b| b.min_trades() <= 1 && b.threshold().abs() >= f32::MIN_POSITIVE as f64)
+}
 
 /// #856: a bare constant at or below the book's threshold is flat on every row
 /// in f64, so the long/flat book counts no flip and scores `+inf` (fewer flips
@@ -5969,6 +6010,8 @@ pub struct GpuGenStats {
     /// #856: flat bare constants settled without a pass (`+inf` on the CPU by
     /// the book's own rule), counted inside `nonfinite` and `nonfinite_trade_floor`.
     pub nonfinite_constant: usize,
+    /// #893: trade-floor results kept `+inf` without a pass under `--skip-floor-check`.
+    pub nonfinite_floor_unchecked: usize,
     /// #589: of those, the ones the f64 prefix probe did not settle, so a full
     /// CPU pass ran.
     pub nonfinite_full: usize,
@@ -6558,6 +6601,8 @@ pub struct GpuSnapshot {
     /// #856: flat bare constants settled without a pass (`+inf` on the CPU by
     /// the book's own rule), counted inside `nonfinite` and `nonfinite_trade_floor`.
     pub nonfinite_constant: usize,
+    /// #893: trade-floor results kept `+inf` without a pass under `--skip-floor-check`.
+    pub nonfinite_floor_unchecked: usize,
     pub nonfinite_full: usize,
     pub nonfinite_cpu_finite: usize,
     pub nonfinite_seconds: f64,
@@ -6600,6 +6645,7 @@ impl GpuSnapshot {
             nonfinite: self.nonfinite,
             nonfinite_trade_floor: self.nonfinite_trade_floor,
             nonfinite_constant: self.nonfinite_constant,
+            nonfinite_floor_unchecked: self.nonfinite_floor_unchecked,
             nonfinite_full: self.nonfinite_full,
             nonfinite_cpu_finite: self.nonfinite_cpu_finite,
             nonfinite_seconds: self.nonfinite_seconds,
@@ -6748,6 +6794,7 @@ fn dev_generation(
         nonfinite: g.nonfinite,
         nonfinite_trade_floor: g.nonfinite_trade_floor,
         nonfinite_constant: g.nonfinite_constant,
+        nonfinite_floor_unchecked: g.nonfinite_floor_unchecked,
         nonfinite_full: g.nonfinite_full,
         nonfinite_cpu_finite: g.nonfinite_cpu_finite,
         nonfinite_seconds: g.nonfinite_seconds,
@@ -6974,6 +7021,7 @@ fn run_postfix_search(
             nonfinite: 0,
             nonfinite_trade_floor: 0,
             nonfinite_constant: 0,
+            nonfinite_floor_unchecked: 0,
             nonfinite_full: 0,
             nonfinite_cpu_finite: 0,
             nonfinite_seconds: 0.0,
@@ -12322,6 +12370,153 @@ mod tests {
         assert_eq!(changed, 39, "{:?}", g.stats[&0]);
         assert_eq!(islands[0][0].inf_rows, None, "a finite CPU score is not a confirmed +inf");
         assert!(g.deferred_check.is_none() && !g.defer_check);
+    }
+
+    /// #893: one device batch of a single tree on a long/flat book with the
+    /// floor at one trade. Rows alternate `xs.0` and `xs.1` on input 0. Returns
+    /// the search, its islands and the exact CPU score of the tree.
+    #[cfg(feature = "cuda")]
+    fn floor_slot_run(threshold: f64, skip: bool, xs: (f64, f64), tree: Node) -> (GpuSearch, Vec<Vec<Ind>>, f64) {
+        let n = 300;
+        let x: Vec<Vec<f64>> = (0..n).map(|i| vec![if i % 2 == 0 { xs.0 } else { xs.1 }]).collect();
+        let y: Vec<f64> = (0..n).map(|i| if i % 2 == 0 { 0.003 } else { -0.001 }).collect();
+        let s = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
+        let rows = crate::trading::TradingRows {
+            time: (0..n).map(|i| 900.0 * i as f64).collect(),
+            group: vec![0; n],
+            funding: Vec::new(),
+        };
+        let slice = crate::data::TradingSlice { rows, ret: s.y.clone() };
+        let spec = crate::trading::TradingSpec {
+            cost_bps: 1.0,
+            min_trades: 1,
+            threshold,
+            ..Default::default()
+        };
+        let book = std::sync::Arc::new(crate::trading::FitnessBook::new(&slice, &spec, 900.0).unwrap());
+        let cfg = Config {
+            fitness: Fitness::LongPnl(book),
+            gpu: true,
+            dispatch: crate::dispatch::DispatchMode::Device,
+            skip_floor_check: skip,
+            ..Config::default()
+        };
+        let view = EvalSample::new(&s, &cfg);
+        let mut ind = Ind::evaluated(tree, &view, &cfg);
+        ind.error = f64::NAN;
+        let mut g = GpuSearch::new(
+            &s,
+            false,
+            crate::fit::DeviceLoss::Squared,
+            true,
+            None,
+            Some(crate::metrics::ScoreObjective::LongPnl),
+            false,
+            std::time::Instant::now(),
+            &[],
+            None,
+            cfg.fitness.book(),
+            2,
+        )
+        .expect("a device search");
+        let mut dispatcher = crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::default())
+            .with_mode(crate::dispatch::DispatchMode::Device);
+        let mut islands = vec![vec![ind]];
+        g.rows_version = 5;
+        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher).expect("device batch");
+        let exact = score_tree(&islands[0][0].tree, &view, &cfg);
+        (g, islands, exact)
+    }
+
+    /// #893: where the cut is a normal f32 number, a flat floor slot stays
+    /// `+inf` without a pass and is confirmed.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn trade_floor_check_is_skipped_inside_the_f32_range() {
+        if !crate::gpu::probe().available() {
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+            return;
+        }
+        let (g, islands, exact) = floor_slot_run(1e-30, true, (1e-46, -1e-46), input(0));
+        let stats = &g.stats[&0];
+        assert_eq!(stats.nonfinite_trade_floor, 1, "{:?}", stats);
+        assert_eq!(stats.nonfinite_floor_unchecked, 1, "{:?}", stats);
+        assert_eq!(stats.nonfinite_full, 0, "{:?}", stats);
+        assert_eq!(islands[0][0].error, f64::INFINITY);
+        assert_eq!(islands[0][0].inf_rows, Some(5));
+        assert_eq!(exact, f64::INFINITY, "the CPU book is flat too");
+        assert_eq!(g.ledger.eval_check().floor_unchecked, 1);
+        let (g, islands, _) = floor_slot_run(1e-30, false, (1e-46, -1e-46), input(0));
+        assert_eq!(g.stats[&0].nonfinite_floor_unchecked, 0);
+        assert_eq!(g.stats[&0].nonfinite_full, 1);
+        assert_eq!(islands[0][0].error, f64::INFINITY);
+    }
+
+    /// #893: at threshold 0 (#640) and inside the f32 subnormal range the check
+    /// stays with the flag on. At 0 the f64 score replaces the device `+inf`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn trade_floor_check_stays_outside_the_f32_range() {
+        if !crate::gpu::probe().available() {
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+            return;
+        }
+        let (g, islands, exact) = floor_slot_run(0.0, true, (1e-46, -1e-46), input(0));
+        let stats = &g.stats[&0];
+        assert_eq!((stats.nonfinite_floor_unchecked, stats.nonfinite_full), (0, 1), "{:?}", stats);
+        assert!(exact.is_finite(), "the f64 positions meet the floor: {exact}");
+        assert_eq!(islands[0][0].error.to_bits(), exact.to_bits());
+        let (g, islands, exact) = floor_slot_run(1e-40, true, (1e-46, -1e-46), input(0));
+        let stats = &g.stats[&0];
+        assert_eq!((stats.nonfinite_floor_unchecked, stats.nonfinite_full), (0, 1), "{:?}", stats);
+        assert_eq!(exact, f64::INFINITY);
+        assert_eq!(islands[0][0].error, f64::INFINITY);
+    }
+
+    /// #893: the case the flag accepts. The cut is the f32 value nearest 1e-30,
+    /// the one long row sits one part in 1e9 above it. The CPU is long there;
+    /// the f32 program rounds it onto the cut and reads flat. The default check
+    /// finds the finite score. The flag keeps `+inf`, so this tree can neither
+    /// be promoted nor enter the archive.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn trade_floor_skip_loses_a_rounding_tree_and_the_default_keeps_it() {
+        if !crate::gpu::probe().available() {
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+            return;
+        }
+        let cut = 1e-30f32 as f64;
+        let p = cut * (1.0 + 1e-9);
+        assert!(p > cut && (p as f32) as f64 <= cut, "the premise: f64 long, f32 flat");
+        let (g, islands, exact) = floor_slot_run(cut, false, (p, -1.0), input(0));
+        assert!(exact.is_finite(), "{exact}");
+        assert_eq!(islands[0][0].error.to_bits(), exact.to_bits());
+        assert_eq!(g.ledger.eval_check().floor_finite, 1);
+        let (g, islands, exact) = floor_slot_run(cut, true, (p, -1.0), input(0));
+        assert!(exact.is_finite());
+        assert_eq!(islands[0][0].error, f64::INFINITY, "the flag keeps the device value");
+        assert_eq!(g.stats[&0].nonfinite_floor_unchecked, 1);
+    }
+
+    /// #893: the guard is arithmetic on the threshold and the floor.
+    #[test]
+    fn floor_is_format_free_follows_the_threshold_and_the_floor() {
+        let at = |threshold: f64, min_trades: usize| {
+            let (_, cfg) = flat_book_fixture(threshold, min_trades, 1);
+            floor_is_format_free(&cfg)
+        };
+        assert!(at(1e-30, 1));
+        assert!(at(-1e-30, 1));
+        assert!(at(f32::MIN_POSITIVE as f64, 1));
+        assert!(at(1e-30, 0));
+        assert!(at(0.05, 1));
+        assert!(!at(0.0, 1));
+        assert!(!at(1e-40, 1));
+        assert!(!at(-1e-40, 1));
+        assert!(!at(5e-324, 1));
+        assert!(!at(1e-30, 2));
+        assert!(!at(1e-30, 64));
+        assert!(!floor_is_format_free(&Config::default()), "no book");
     }
 
     #[test]

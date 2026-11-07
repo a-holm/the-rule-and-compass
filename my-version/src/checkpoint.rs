@@ -1444,6 +1444,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "fit_samples",
         "front_parents", // #76
         "reject_constant_offspring", // #477: missing means false
+        "skip_floor_check", // #893: missing means false
         "fit_strategy",  // #116: missing means `exact`
         "fit_admission", // #223: missing means `screened`
         "fit_polish",    // #496: missing means `f64`
@@ -1689,6 +1690,16 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             ))
         }
     };
+    let skip_floor_check = match fields.get("skip_floor_check").map(|s| s.as_str()) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "config 'skip_floor_check' must be true or false, got '{}'",
+                other
+            ))
+        }
+    };
     let reject_constant_offspring = match fields.get("reject_constant_offspring").map(|s| s.as_str()) {
         None | Some("false") => false,
         Some("true") => true,
@@ -1852,6 +1863,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         fit_stream_source: None,
         front_parents, // #76
         reject_constant_offspring, // #477
+        skip_floor_check, // #893
         units,
         require_dimensions,
         qd_bins,
@@ -1993,6 +2005,9 @@ fn write_config(cfg: &Config, out: &mut String) {
     }
     if cfg.reject_constant_offspring {
         writeln!(out, "config reject_constant_offspring true").unwrap(); // #477
+    }
+    if cfg.skip_floor_check {
+        writeln!(out, "config skip_floor_check true").unwrap(); // #893
     }
     // #25: only write these when units are active, so a units-free checkpoint
     // is byte-identical to one written before this feature existed.
