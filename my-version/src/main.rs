@@ -768,6 +768,14 @@ SEARCH:
                              Not bit-identical: a tree whose f32 program reads flat
                              where the f64 one is long stays +inf. Saved search
                              setting, off by default
+  --reject-fixed-position    under --fitness pnl, reject trees whose long/flat
+                             position cannot depend on the inputs (the exact
+                             output range does not cross --threshold, for
+                             example gauss(c * x) at threshold 0) before the
+                             constant fit, and keep them off the front. Before
+                             the fit every constant counts as free, so c + abs(x)
+                             goes to the fit (#848). Saved search setting, off
+                             by default
   --prune                    remove neutral code from the final front (off by
                              default): replace subtrees with a child or a
                              constant when the training error stays within
@@ -2612,6 +2620,7 @@ fn main() {
     let mut front_parents_set = false;
     let mut reject_constant_set = false;
     let mut skip_floor_set = false;
+    let mut reject_fixed_set = false; // #848
     // #465: explicit --selection for the resume settings check.
     let mut selection_set = false;
     let mut mutation_mix_set = false; // #471
@@ -3220,6 +3229,10 @@ fn main() {
             "--skip-floor-check" => {
                 cfg.skip_floor_check = true;
                 skip_floor_set = true;
+            }
+            "--reject-fixed-position" => {
+                cfg.reject_fixed_position = true;
+                reject_fixed_set = true;
             }
             // #27: evaluator path only; deliberately not a saved search
             // setting, because both paths produce identical errors.
@@ -3881,6 +3894,12 @@ fn main() {
             conflicts.push(format!(
                 "--skip-floor-check (saved skip_floor_check is {})",
                 saved.skip_floor_check
+            ));
+        }
+        if reject_fixed_set && cfg.reject_fixed_position != saved.reject_fixed_position {
+            conflicts.push(format!(
+                "--reject-fixed-position (saved reject_fixed_position is {})",
+                saved.reject_fixed_position
             ));
         }
         if let Some(spec) = &op_complexity_spec {
@@ -7994,11 +8013,19 @@ fn main() {
                 prepared.prep.json(),
                 outcome.generations,
                 outcome.candidates_evaluated,
-                if cfg.fit_irls_active() {
-                    format!(",\"fit_irls\":{}", jstr(cfg.fit_irls.name()))
-                } else {
-                    String::new()
-                },
+                format!(
+                    "{}{}",
+                    if cfg.fit_irls_active() {
+                        format!(",\"fit_irls\":{}", jstr(cfg.fit_irls.name()))
+                    } else {
+                        String::new()
+                    },
+                    if cfg.reject_fixed_position {
+                        format!(",\"fixed_position_front_fallback\":{}", outcome.fixed_position_fallback)
+                    } else {
+                        String::new()
+                    }
+                ),
                 outcome.converged_early,
                 jstr(outcome.stop_reason),
                 // #18: the four convergence numbers.

@@ -1445,6 +1445,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "front_parents", // #76
         "reject_constant_offspring", // #477: missing means false
         "skip_floor_check", // #893: missing means false
+        "reject_fixed_position", // #848: missing means false
         "fit_strategy",  // #116: missing means `exact`
         "fit_admission", // #223: missing means `screened`
         "fit_polish",    // #496: missing means `f64`
@@ -1710,6 +1711,16 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             ))
         }
     };
+    let reject_fixed_position = match fields.get("reject_fixed_position").map(|s| s.as_str()) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "config 'reject_fixed_position' must be true or false, got '{}'",
+                other
+            ))
+        }
+    };
     // #116: missing means `exact`, byte-identical to a checkpoint written
     // before the solver portfolio existed.
     let fit_strategy = match fields.get("fit_strategy").map(|s| s.as_str()) {
@@ -1864,6 +1875,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         front_parents, // #76
         reject_constant_offspring, // #477
         skip_floor_check, // #893
+        reject_fixed_position, // #848
         units,
         require_dimensions,
         qd_bins,
@@ -2008,6 +2020,9 @@ fn write_config(cfg: &Config, out: &mut String) {
     }
     if cfg.skip_floor_check {
         writeln!(out, "config skip_floor_check true").unwrap(); // #893
+    }
+    if cfg.reject_fixed_position {
+        writeln!(out, "config reject_fixed_position true").unwrap(); // #848
     }
     // #25: only write these when units are active, so a units-free checkpoint
     // is byte-identical to one written before this feature existed.

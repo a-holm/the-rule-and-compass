@@ -573,3 +573,101 @@ fn prune_fits_candidates_under_pnl_above_prune_rows() {
     let fits = num(&j, &["prune", "fits"]);
     assert!(fits > 0.0, "prune made {fits} fits");
 }
+
+// ---- #848: reject trees whose position cannot depend on the inputs ----
+
+const FIXED_OPS: &str = "add,sub,mul,div,abs,exp,square,tanh,logistic,gauss";
+
+fn run_fixed(data: &str, spec: &str, log: &std::path::Path, extra: &[&str]) -> Output {
+    let log = log.to_string_lossy().into_owned();
+    let args = [
+        "--data", data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal",
+        "--target-spec", spec, "--cpu", "--seed", "11", "--generations", "20", "--pop", "48",
+        "--ops", FIXED_OPS, "--metric", "squared", "--json", "--quiet", "--objective", "pnl",
+        "--cost-bps", "5", "--validation-frac", "0.3", "--dev-log", &log, "--dev-log-level", "full",
+        "--dev-log-every", "1",
+    ];
+    rcsr_cmd::rcsr()
+        .args(args)
+        .args(extra)
+        .output()
+        .expect("run rcsr")
+}
+
+/// Offspring the run rejected for a fixed position, summed over its generations.
+fn fixed_rejections(log: &std::path::Path) -> f64 {
+    std::fs::read_to_string(log)
+        .expect("dev log")
+        .lines()
+        .filter_map(Json::parse)
+        .filter(|e| e.get("event").and_then(Json::as_str) == Some("generation"))
+        .map(|e| num(&e, &["variation", "fixed_position_rejected"]))
+        .sum()
+}
+
+fn fixed_members(j: &Json) -> usize {
+    let vars = ["x1".to_string(), "x2".to_string()];
+    pareto(j)
+        .iter()
+        .filter(|m| {
+            let text = at(m, &["expression_exact"]).as_str().unwrap();
+            let tree = rcsr::parse::parse(text, &vars).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            rcsr::expr::fixed_position(&tree, 0.0).is_some()
+        })
+        .count()
+}
+
+#[test]
+fn reject_fixed_position_leaves_no_fixed_member_on_the_front() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv_rows(&dir, 900, 90_000);
+    let spec = write_spec(&dir);
+    let log = dir.join("on.jsonl");
+    let on = json(&run_fixed(&data, &spec, &log, &["--fitness", "pnl", "--reject-fixed-position"]));
+    assert!(fixed_rejections(&log) > 0.0, "the filter rejected nothing");
+    assert!(!pareto(&on).is_empty());
+    assert_eq!(fixed_members(&on), 0);
+    assert!(matches!(at(&on, &["search", "fixed_position_front_fallback"]), Json::Bool(false)));
+}
+
+#[test]
+fn the_flag_has_no_search_effect_under_the_metric_fitness() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv_rows(&dir, 900, 600);
+    let spec = write_spec(&dir);
+    let key = |j: &Json| {
+        pareto(j)
+            .iter()
+            .map(|m| (at(m, &["expression"]).as_str().unwrap().to_string(), num(m, &["train_error"]).to_bits()))
+            .collect::<Vec<_>>()
+    };
+    let off = json(&run_fixed(&data, &spec, &dir.join("off.jsonl"), &[]));
+    let log = dir.join("on.jsonl");
+    let on = json(&run_fixed(&data, &spec, &log, &["--reject-fixed-position"]));
+    assert_eq!(key(&off), key(&on));
+    assert_eq!(fixed_rejections(&log), 0.0);
+}
+
+#[test]
+fn resume_needs_the_same_reject_fixed_position() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv_rows(&dir, 900, 600);
+    let spec = write_spec(&dir);
+    let cp = dir.join("cp.rcsr").to_string_lossy().into_owned();
+    let first = run_fixed(
+        &data,
+        &spec,
+        &dir.join("a.jsonl"),
+        &["--fitness", "pnl", "--reject-fixed-position", "--generations", "10", "--save", &cp],
+    );
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    assert!(std::fs::read_to_string(&cp).unwrap().contains("config reject_fixed_position true"));
+    let same = run_fixed(&data, &spec, &dir.join("b.jsonl"), &["--fitness", "pnl", "--reject-fixed-position", "--resume", &cp]);
+    assert_eq!(code(&same), 0, "{}", stderr(&same));
+    let plain = dir.join("plain.rcsr").to_string_lossy().into_owned();
+    let off = run_fixed(&data, &spec, &dir.join("c.jsonl"), &["--fitness", "pnl", "--generations", "10", "--save", &plain]);
+    assert_eq!(code(&off), 0, "{}", stderr(&off));
+    assert!(!std::fs::read_to_string(&plain).unwrap().contains("reject_fixed_position"));
+    let other = run_fixed(&data, &spec, &dir.join("d.jsonl"), &["--fitness", "pnl", "--reject-fixed-position", "--resume", &plain]);
+    usage_error(&other, "--reject-fixed-position");
+}
