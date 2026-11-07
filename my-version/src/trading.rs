@@ -933,6 +933,24 @@ pub fn fixed_position(tree: &crate::expr::Node, spec: &TradingSpec) -> Option<bo
     crate::expr::fixed_position(tree, spec.threshold)
 }
 
+/// #849: the position the validation book realised on every evaluated row
+/// (`Some(true)` long on all rows, `Some(false)` on none), at any threshold. It
+/// reports the rows, where [`fixed_position`] reports the formula: a range that
+/// crosses a tiny threshold hides an always-long tree. Only the indicator rule
+/// has one position per row.
+pub fn realised_position(exposure: f64, spec: &TradingSpec) -> Option<bool> {
+    if spec.position != PositionMap::Threshold || spec.tau.is_some() {
+        return None;
+    }
+    if exposure == 1.0 {
+        Some(true)
+    } else if exposure == 0.0 {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// The report text of [`fixed_position`]: `"long"`, `"flat"` or `null`.
 pub fn fixed_position_json(fixed: Option<bool>) -> &'static str {
     match fixed {
@@ -1455,6 +1473,8 @@ pub struct FinalistReport {
     pub constant: bool,
     /// #849: the position the finalist holds on every input, when it has one.
     pub fixed_position: Option<bool>,
+    /// #849: the position the validation book realised on every row, when it had one.
+    pub fixed_position_realised: Option<bool>,
     pub candidates: usize,
     pub usable: usize,
     pub expression: String,
@@ -1494,7 +1514,7 @@ impl FinalistReport {
             "{{\"name\":\"{}\",\"position\":\"{}\",\"selection\":\"validation_objective\",\
              \"cost\":{},\"candidates\":{},\"usable_candidates\":{},\"exact\":\"cpu_f64\",\
              \"backend\":{},\"backend_reason\":{},\"spec\":{},\
-             \"finalist\":{{\"expression\":{},\"expression_exact\":{},\"archive_rank\":{},\"constant\":{},\"fixed_position\":{},\"fit_metric\":{},\"fit_error\":{},\
+             \"finalist\":{{\"expression\":{},\"expression_exact\":{},\"archive_rank\":{},\"constant\":{},\"fixed_position\":{},\"fixed_position_realised\":{},\"fit_metric\":{},\"fit_error\":{},\
              \"validation_error\":{},\"test_error\":{},\"validation_objective\":{}{}}},\
              \"validation\":{},\"test\":{}}}",
             self.objective.name(),
@@ -1512,6 +1532,7 @@ impl FinalistReport {
             self.archive_rank,
             self.constant,
             fixed_position_json(self.fixed_position),
+            fixed_position_json(self.fixed_position_realised),
             crate::devlog::text(&self.fit_metric),
             num(self.fit_error),
             num(self.validation_error),
@@ -1800,5 +1821,24 @@ mod fixed_position_tests {
         assert_eq!(fixed_position(&g, &ramp), None);
         let tercile = TradingSpec { position: PositionMap::TopTercile, ..TradingSpec::default() };
         assert_eq!(fixed_position(&g, &tercile), None);
+    }
+}
+
+#[cfg(test)]
+mod realised_position_tests {
+    use super::*;
+
+    /// #849: the realised position reads the book rows, at any threshold.
+    #[test]
+    fn realised_position_reads_the_exposure_of_the_book() {
+        let spec = TradingSpec { threshold: 1e-30, ..TradingSpec::default() };
+        assert_eq!(realised_position(1.0, &spec), Some(true));
+        assert_eq!(realised_position(0.0, &spec), Some(false));
+        assert_eq!(realised_position(0.5, &spec), None);
+        assert_eq!(realised_position(1.0, &TradingSpec { tau: Some(0.5), ..spec.clone() }), None);
+        assert_eq!(
+            realised_position(1.0, &TradingSpec { position: PositionMap::TopTercile, ..spec }),
+            None
+        );
     }
 }

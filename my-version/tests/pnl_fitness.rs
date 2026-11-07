@@ -748,6 +748,40 @@ fn every_front_member_reports_fixed_position() {
     }
 }
 
+fn member_realised(m: &Json) -> Option<String> {
+    match at(m, &["validation_book", "fixed_position_realised"]) {
+        Json::Str(s) => Some(s.clone()),
+        Json::Null => None,
+        other => panic!("fixed_position_realised is neither a string nor null: {other:?}"),
+    }
+}
+
+/// #849: the realised validation book is reported at any threshold: `"long"` when
+/// the book was long on every row, `"flat"` when on none, else `null`.
+#[test]
+fn the_realised_position_follows_the_validation_exposure() {
+    let (_scratch, dir) = scratch();
+    let data = write_drift_csv(&dir);
+    let spec = write_spec(&dir);
+    for threshold in ["0", "1e-30"] {
+        let j = run_drift(&data, &spec, &["--fitness", "metric", "--threshold", threshold]);
+        let mut seen_long = false;
+        for m in pareto(&j) {
+            let exposure = num(m, &["validation_book", "exposure"]);
+            let want = if exposure == 1.0 { Some("long") } else if exposure == 0.0 { Some("flat") } else { None };
+            assert_eq!(member_realised(m).as_deref(), want, "threshold {threshold}, exposure {exposure}");
+            seen_long |= want == Some("long");
+        }
+        assert!(seen_long, "threshold {threshold}: the rising market has an always-long member");
+        let fin = match at(&j, &["objective", "finalist", "fixed_position_realised"]) {
+            Json::Str(s) => Some(s.as_str()),
+            _ => None,
+        };
+        let e = num(&j, &["objective", "validation", "exposure"]);
+        assert_eq!(fin, if e == 1.0 { Some("long") } else if e == 0.0 { Some("flat") } else { None });
+    }
+}
+
 #[test]
 fn reject_fixed_position_refuses_the_finalist() {
     let (_scratch, dir) = scratch();
@@ -760,14 +794,17 @@ fn reject_fixed_position_refuses_the_finalist() {
         assert_eq!(finalist_fixed(&on), None, "{fitness}: the flag refuses the fixed finalist");
         assert!(num(&on, &["objective", "validation", "exposure"]) < 1.0, "{fitness}");
         for m in pareto(&on) {
-            if member_fixed(m).is_some() {
+            if member_fixed(m).is_some() || member_realised(m).is_some() {
                 assert!(matches!(at(m, &["validation_book", "objective"]), Json::Null), "{fitness}");
             }
         }
         if fitness == "metric" {
             let usable = |j: &Json| num(j, &["objective", "usable_candidates"]);
-            let fixed = pareto(&on).iter().filter(|m| member_fixed(m).is_some()).count() as f64;
-            assert_eq!(usable(&on), usable(&off) - fixed);
+            let refused = pareto(&off)
+                .iter()
+                .filter(|m| (member_fixed(m).is_some() || member_realised(m).is_some()) && !matches!(at(m, &["validation_book", "objective"]), Json::Null))
+                .count() as f64;
+            assert_eq!(usable(&on), usable(&off) - refused);
             assert_eq!(pareto(&on).len(), pareto(&off).len(), "the metric search is unchanged");
         }
     }
