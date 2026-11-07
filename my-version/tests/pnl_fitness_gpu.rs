@@ -883,6 +883,49 @@ fn cli_names_the_device_scorer_and_reports_exact_values() {
     assert_eq!(f.get("scorer_values").and_then(|j| j.as_str()), Some("exact_f64"));
 }
 
+/// #848: the same check as the CPU test, with the device ranking the candidates.
+#[test]
+fn reject_fixed_position_runs_on_the_device() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let (scratch, data, spec) = write_cli_fixture();
+    let log = scratch.path().join("fixed.jsonl");
+    let out = rcsr_cmd::rcsr_on_device()
+        .args([
+            "--gpu", "--dispatch", "device", "--data", &data, "--target", "y", "--vars", "x1,x2", "--time", "t",
+            "--split", "temporal", "--target-spec", &spec, "--seed", "11", "--generations", "20", "--pop", "48",
+            "--ops", "add,sub,mul,div,abs,exp,square,tanh,logistic,gauss", "--metric", "squared", "--json",
+            "--quiet", "--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--fitness", "pnl",
+            "--reject-fixed-position", "--dev-log", &log.to_string_lossy(), "--dev-log-level", "full",
+            "--dev-log-every", "1",
+        ])
+        .output()
+        .expect("run rcsr");
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let run = rcsr::devlog::Json::parse(text.trim()).unwrap_or_else(|| panic!("stdout is not json: {text}"));
+    assert_eq!(run.get("backend").and_then(|j| j.as_str()), Some("gpu"));
+    let rejected: f64 = std::fs::read_to_string(&log)
+        .expect("dev log")
+        .lines()
+        .filter_map(rcsr::devlog::Json::parse)
+        .filter(|e| e.get("event").and_then(|j| j.as_str()) == Some("generation"))
+        .filter_map(|e| e.get("variation")?.get("fixed_position_rejected")?.as_f64())
+        .sum();
+    assert!(rejected > 0.0, "the filter rejected nothing on the device route");
+    let vars = ["x1".to_string(), "x2".to_string()];
+    let Some(rcsr::devlog::Json::Arr(front)) = run.get("pareto") else { panic!("no pareto") };
+    assert!(!front.is_empty());
+    for member in front {
+        let exact = member.get("expression_exact").and_then(|j| j.as_str()).unwrap();
+        let tree = rcsr::parse::parse(exact, &vars).unwrap_or_else(|e| panic!("{exact}: {e:?}"));
+        assert!(rcsr::expr::fixed_position(&tree, 0.0).is_none(), "fixed member on the front: {exact}");
+    }
+}
+
 // ---- #604: an explicit --gpu never completes on the CPU ----
 
 /// Tests that run a device search hold the read side; a test that arms a fault holds the write side.

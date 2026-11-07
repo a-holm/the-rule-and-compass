@@ -1039,6 +1039,7 @@ mod tests {
             post_fit_drops: 0,
             reevals: 0,
             constant_rejected: 0,
+            fixed_position_rejected: 0,
             best_error: 1.0 / gen as f64,
             median: 2.0,
             p05: 0.0,
