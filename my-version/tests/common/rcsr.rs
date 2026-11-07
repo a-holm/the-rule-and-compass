@@ -5,18 +5,55 @@
 //! refuses any other spawn of `CARGO_BIN_EXE_rcsr`.
 #![allow(dead_code)]
 
+use std::ffi::{OsStr, OsString};
 use std::process::Command;
+
+const INJECTION_PREFIXES: &[&str] = &["NV_SANITIZER_INJECTION_", "NVIDIA_PROCESS_INJECTION_"];
+const INJECTION_NAMES: &[&str] = &["NVTX_INJECTION64_PATH", "CUDA_INJECTION64_PATH", "LD_PRELOAD"];
+
+/// #910: under a sanitized test run (`RCSR_UNDER_SANITIZER` in `vars`) the child must not load the
+/// compute-sanitizer injection: it would block in `libsanitizer-collection.so` or add a second tracked
+/// process. Removes the injection variables and the sanitizer directory from `LD_LIBRARY_PATH`.
+pub fn without_injection<I>(mut cmd: Command, vars: I) -> Command
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let vars: Vec<(OsString, OsString)> = vars.into_iter().collect();
+    if !vars.iter().any(|(k, _)| k == "RCSR_UNDER_SANITIZER") {
+        return cmd;
+    }
+    for (key, value) in &vars {
+        let name = key.to_string_lossy();
+        if INJECTION_PREFIXES.iter().any(|p| name.starts_with(p)) || INJECTION_NAMES.contains(&&*name) {
+            cmd.env_remove(key);
+        } else if key == OsStr::new("LD_LIBRARY_PATH") {
+            let kept: Vec<_> = std::env::split_paths(value)
+                .filter(|p| !p.components().any(|c| c.as_os_str() == "compute-sanitizer"))
+                .collect();
+            if kept.is_empty() {
+                cmd.env_remove(key);
+            } else {
+                cmd.env(key, std::env::join_paths(kept).expect("join library path"));
+            }
+        }
+    }
+    cmd
+}
+
+fn child(program: &str) -> Command {
+    without_injection(Command::new(program), std::env::vars_os())
+}
 
 /// `rcsr` with `RCSR_GPU=0`: no device probe, no CUDA context.
 pub fn rcsr() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rcsr"));
+    let mut cmd = child(env!("CARGO_BIN_EXE_rcsr"));
     cmd.env("RCSR_GPU", "0");
     cmd
 }
 
 /// `rcsr-bench` with `RCSR_GPU=0`, for the same reason as [`rcsr`].
 pub fn rcsr_bench() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rcsr-bench"));
+    let mut cmd = child(env!("CARGO_BIN_EXE_rcsr-bench"));
     cmd.env("RCSR_GPU", "0");
     cmd
 }
@@ -24,7 +61,7 @@ pub fn rcsr_bench() -> Command {
 /// `rcsr` that keeps the caller's environment: the default backend and `--gpu` run on the
 /// device. The test names a device purpose by calling this.
 pub fn rcsr_on_device() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    child(env!("CARGO_BIN_EXE_rcsr"))
 }
 
 /// Flags whose purpose is the device: `rcsr_for` keeps the device when any of them is present.

@@ -207,7 +207,7 @@ PLAN=$T/plan-nc FAKE_NC_RC=99 FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2
 check nc-rc99-rc "$r" "1"
 PLAN=$T/plan-nc FAKE_NC_RC=139 FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check nc-rc139-rc "$r" "1"
-has nc-rc139-line "$sum" '^gpu_fit rc=139 '
+has nc-rc139-line "$sum" '^gpu_fit tool crash rc=139 xid=4->4 secs=[0-9]+ \| compute-sanitizer died with SIGSEGV; not retried'
 PLAN=$T/plan-nc FAKE_NC_RC=124 FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check nc-budget-rc "$r" "1"
 has nc-budget-line "$sum" '^gpu_fit rc=124 .* \| budget$'
@@ -307,7 +307,7 @@ check runbin-rc "$r" "0"
 has runbin-build "$T/cargo-calls" '^cargo build --release --features cuda --bin rcsr-gpu-bench --message-format=json$'
 hasnt runbin-no-test-build "$T/cargo-calls" 'cargo test'
 check runbin-san-calls "$(wc -l < "$T/san-calls" | tr -d ' ')" "1"
-has runbin-san-args "$T/san-calls" 'san under=memcheck --tool memcheck --leak-check no --error-exitcode 99 /fake/release/rcsr-gpu-bench --batch 64 --reps 1 --depth 3$'
+has runbin-san-args "$T/san-calls" 'san under=memcheck --tool memcheck --target-processes application-only --leak-check no --error-exitcode 99 /fake/release/rcsr-gpu-bench --batch 64 --reps 1 --depth 3$'
 hasnt runbin-not-unit "$T/san-calls" 'rcsr_gpu_bench-unit'
 has runbin-lock "$T/calls" '^lock .*timeout -k 30 580 '
 has runbin-line "$sum" '^rcsr-gpu-bench rc=0 xid=4->4 secs=[0-9]+ \| .*ERROR SUMMARY: 0 errors$'
@@ -333,6 +333,32 @@ check runbin-dry-rc "$r" "0"
 has runbin-dry-build "$T/out" '^build: cargo build --release --features cuda --bin rcsr-gpu-bench --message-format=json$'
 has runbin-dry-run "$T/out" '^run rcsr-gpu-bench: .*<rcsr-gpu-bench release binary> --batch 64 --reps 1 --depth 3$'
 check runbin-dry-no-cargo "$(wc -c < "$T/cargo-calls" | tr -d ' ')" "0"
+# a compute-sanitizer crash (rc 139) is its own verdict, fails the pass and is never retried, for a test binary and for a run-bin line
+FAKE_FAIL_ON=gpu_fit-fff FAKE_SAN_RC=139 run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check crash-rc "$r" "1"
+has crash-line "$sum" '^gpu_fit tool crash rc=139 '
+hasnt crash-no-plain-line "$sum" '^gpu_fit rc='
+check crash-no-retry "$(grep -c 'gpu_fit-fff' "$T/san-calls")" "1"
+has crash-others-ran "$sum" '^gpu_memory_plan rc=0'
+FAKE_BENCH_UNIT=1 FAKE_FAIL_ON=rcsr-gpu-bench FAKE_SAN_RC=139 PLAN=$T/plan-bin run "$T/wt" 9 --only rcsr-gpu-bench > /dev/null 2>&1; r=$?
+check crash-runbin-rc "$r" "1"
+has crash-runbin-line "$sum" '^rcsr-gpu-bench tool crash rc=139 '
+check crash-runbin-no-retry "$(wc -l < "$T/san-calls" | tr -d ' ')" "1"
+
+# several run-bin lines of one binary build once and run one process each, all application-only; the later runs get their own log tag
+cat > "$T/plan-bins" <<'PLAN'
+rcsr-gpu-bench  *  run-bin  --batch 64 --reps 1 --depth 3
+rcsr-gpu-bench  *  run-bin  --batch 32 --reps 1 --depth 2
+PLAN
+PLAN=$T/plan-bins run "$T/wt" 9 --only rcsr-gpu-bench > /dev/null 2>&1; r=$?
+check runbin-two-rc "$r" "0"
+check runbin-two-builds "$(grep -c '^cargo build' "$T/cargo-calls")" "1"
+check runbin-two-runs "$(grep -c 'target-processes application-only' "$T/san-calls")" "2"
+has runbin-two-first "$T/san-calls" '/fake/release/rcsr-gpu-bench --batch 64 --reps 1 --depth 3$'
+has runbin-two-second "$T/san-calls" '/fake/release/rcsr-gpu-bench --batch 32 --reps 1 --depth 2$'
+has runbin-two-lines "$sum" '^rcsr-gpu-bench rc=0 '
+has runbin-two-lines2 "$sum" '^rcsr-gpu-bench-2 rc=0 '
+
 # run-bin needs * as the test
 printf '%s\n' 'rcsr-gpu-bench  x  run-bin  --batch 1' > "$T/plan-badbin"
 PLAN=$T/plan-badbin run "$T/wt" 9 > /dev/null 2>&1; r=$?

@@ -133,7 +133,7 @@ fn check(plan: &str, root: &Path) -> Vec<String> {
             }
         };
         if l.test == "*" {
-            if lines.iter().any(|o| o.binary == l.binary && o.test != "*" && !(l.mode == "app-only" && o.mode == "skip")) {
+            if lines.iter().any(|o| o.binary == l.binary && o.test != "*" && !(l.mode == "app-only" && (o.mode == "skip" || o.mode == "api-errors-no"))) {
                 errors.push(format!("line {}: '{}' has both '*' and named lines", l.no, l.binary));
             }
             continue;
@@ -280,22 +280,14 @@ fn the_gpu_bench_binary_runs_under_memcheck_with_the_smallest_arguments() {
 fn an_app_only_binary_may_skip_named_tests_and_nothing_else_mixes_with_star() {
     let ok = "dispatch_reproducible * app-only reason\ndispatch_reproducible a_calibrated_file_gives_equal_fronts_and_its_own_hash skip reason\n";
     assert_eq!(check(ok, &root()), Vec::<String>::new());
-    let bad = "dispatch_reproducible * app-only reason\ndispatch_reproducible a_calibrated_file_gives_equal_fronts_and_its_own_hash api-errors-no reason\n";
+    let bad = "dispatch_reproducible * app-only reason\ndispatch_reproducible a_calibrated_file_gives_equal_fronts_and_its_own_hash no-cuda reason\n";
     assert_eq!(check(bad, &root()).len(), 1);
     let bad = "dispatch_reproducible * no-cuda reason\ndispatch_reproducible a_calibrated_file_gives_equal_fronts_and_its_own_hash skip reason\n";
     assert_eq!(check(bad, &root()).len(), 1);
 }
 
-const SPAWN_TOKENS: &[&str] = &[
-    "Command::new",
-    "rcsr_cmd::rcsr(",
-    "rcsr_cmd::rcsr_bench(",
-    "rcsr_cmd::rcsr_on_device(",
-    "rcsr_cmd::rcsr_for(",
-    ".spawn()",
-    ".output()",
-    ".status()",
-];
+const SPAWN_CALLS: &[&str] = &["Command::new", "rcsr_cmd::rcsr(", "rcsr_cmd::rcsr_bench(", "rcsr_cmd::rcsr_on_device(", "rcsr_cmd::rcsr_for("];
+const PROCESS_METHODS: &[&str] = &[".spawn()", ".output()", ".status()"];
 
 /// The text of a test binary and of the `#[path]` modules it includes, without the shared child helper.
 fn binary_text(file: &Path) -> String {
@@ -313,8 +305,34 @@ fn binary_text(file: &Path) -> String {
     text
 }
 
+fn without_strings(line: &str) -> String {
+    let mut out = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in line.chars() {
+        if in_string {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_string = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            in_string = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn spawns_a_process(text: &str) -> bool {
-    text.lines().filter(|l| !l.trim_start().starts_with("//")).any(|l| SPAWN_TOKENS.iter().any(|t| l.contains(t)))
+    let code: Vec<String> =
+        text.lines().filter(|l| !l.trim_start().starts_with("//")).map(without_strings).collect();
+    let names_a_command = code.iter().any(|l| l.contains("Command"));
+    code.iter().any(|l| {
+        SPAWN_CALLS.iter().any(|t| l.contains(t)) || (names_a_command && PROCESS_METHODS.iter().any(|t| l.contains(t)))
+    })
 }
 
 /// Every test binary that spawns a process needs a `*` line that runs it with `--target-processes application-only` or not at all.
@@ -349,4 +367,32 @@ fn a_binary_that_spawns_processes_never_runs_under_target_processes_all() {
         bad.is_empty(),
         "these binaries spawn processes and need a skip, no-cuda-app-only or app-only star line (compute-sanitizer crashes while it tracks a process tree): {bad:#?}"
     );
+}
+
+#[test]
+fn an_app_only_binary_may_also_name_api_errors_no_tests() {
+    let ok = "gpu_ring * app-only reason\ngpu_ring stale_cuda_error_does_not_fail_the_transport api-errors-no reason\n";
+    assert_eq!(check(ok, &root()), Vec::<String>::new());
+}
+
+#[test]
+fn a_spawning_binary_needs_an_application_only_star_line() {
+    let scratch = Scratch::new("sanspawn");
+    let dir = scratch.path();
+    fs::create_dir_all(dir.join("tests")).unwrap();
+    fs::write(dir.join("tests/runs.rs"), "fn t() { std::process::Command::new(\"true\").output().unwrap(); }\n").unwrap();
+    fs::write(dir.join("tests/quiet.rs"), "// Command::new in a comment\nfn t() { let s = \"Command::new\"; }\n").unwrap();
+    for plan in ["runs * no-cuda why\n", "runs * run-bin --x\n", "runs t skip why\n", ""] {
+        assert_eq!(spawners_not_app_only(plan, &dir), vec!["runs".to_string()], "plan {plan:?}");
+    }
+    for mode in ["skip", "no-cuda-app-only", "app-only"] {
+        assert!(spawners_not_app_only(&format!("runs * {mode} why\n"), &dir).is_empty(), "{mode}");
+    }
+}
+
+#[test]
+fn the_spawn_detector_ignores_strings_comments_and_plain_output_methods() {
+    assert!(!spawns_a_process("let s = \"Command::new\";\n// Command::new(x)\nlet y = gpu.output();"));
+    assert!(spawns_a_process("use std::process::Command;\nlet o = c.output();"));
+    assert!(spawns_a_process("let c = rcsr_cmd::rcsr_for(&a);"));
 }
