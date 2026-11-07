@@ -34,10 +34,10 @@ fn parse(text: &str) -> Result<Vec<Line>, String> {
             _ => return Err(format!("line {no}: need <binary> <test> <mode> <reason>")),
         };
         let reason = it.collect::<Vec<_>>().join(" ");
-        if !["skip", "api-errors-no", "no-cuda", "no-cuda-app-only", "run-bin"].contains(&mode) {
+        if !["skip", "api-errors-no", "no-cuda", "no-cuda-app-only", "app-only", "run-bin"].contains(&mode) {
             return Err(format!("line {no}: unknown mode '{mode}'"));
         }
-        if (mode.starts_with("no-cuda") || mode == "run-bin") && test != "*" {
+        if (mode.starts_with("no-cuda") || mode == "app-only" || mode == "run-bin") && test != "*" {
             return Err(format!("line {no}: {mode} needs '*' as the test"));
         }
         if reason.is_empty() {
@@ -98,14 +98,14 @@ fn sources(binary: &str, root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(vec![file])
 }
 
-/// A run-bin line names a cargo bin and flags that the bin's sources parse.
+/// A run-bin line names a cargo bin and flags that some source under src/ parses (the bin may live in src/main.rs or src/bin, its flag parsers in the library).
 fn check_run_bin(l: &Line, root: &Path) -> Vec<String> {
     let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
     if !manifest.contains(&format!("name = \"{}\"", l.binary)) {
         return vec![format!("line {}: no [[bin]] named '{}' in Cargo.toml", l.no, l.binary)];
     }
     let mut files = Vec::new();
-    rust_files(&root.join("src").join("bin"), &mut files);
+    rust_files(&root.join("src"), &mut files);
     let text: String = files.iter().map(|f| fs::read_to_string(f).expect("read source")).collect();
     l.args
         .split_whitespace()
@@ -133,7 +133,7 @@ fn check(plan: &str, root: &Path) -> Vec<String> {
             }
         };
         if l.test == "*" {
-            if lines.iter().any(|o| o.binary == l.binary && o.test != "*") {
+            if lines.iter().any(|o| o.binary == l.binary && o.test != "*" && !(l.mode == "app-only" && o.mode == "skip")) {
                 errors.push(format!("line {}: '{}' has both '*' and named lines", l.no, l.binary));
             }
             continue;
@@ -242,6 +242,13 @@ fn no_cuda_app_only_takes_only_a_star_line() {
 }
 
 #[test]
+fn app_only_takes_only_a_star_line() {
+    assert!(parse("launchers * app-only reason\n").is_ok());
+    assert!(parse("launchers some_test app-only reason\n").is_err());
+    assert!(parse("launchers * app-only\n").is_err());
+}
+
+#[test]
 fn run_bin_takes_only_a_star_line_with_arguments() {
     assert!(parse("rcsr-gpu-bench * run-bin --batch 64\n").is_ok());
     assert!(parse("rcsr-gpu-bench some_test run-bin --batch 64\n").is_err());
@@ -267,4 +274,14 @@ fn the_gpu_bench_binary_runs_under_memcheck_with_the_smallest_arguments() {
     assert_eq!((run[0].mode.as_str(), run[0].args.as_str()), ("run-bin", "--batch 64 --reps 1 --depth 3"));
     let unit = lines.iter().find(|l| l.binary == "bin-rcsr-gpu-bench").expect("unit-test line");
     assert_eq!(unit.mode, "skip", "the 0-test unit binary must not be listed as a no-CUDA run");
+}
+
+#[test]
+fn an_app_only_binary_may_skip_named_tests_and_nothing_else_mixes_with_star() {
+    let ok = "dispatch_reproducible * app-only reason\ndispatch_reproducible a_calibrated_file_gives_equal_fronts_and_its_own_hash skip reason\n";
+    assert_eq!(check(ok, &root()), Vec::<String>::new());
+    let bad = "dispatch_reproducible * app-only reason\ndispatch_reproducible a_calibrated_file_gives_equal_fronts_and_its_own_hash api-errors-no reason\n";
+    assert_eq!(check(bad, &root()).len(), 1);
+    let bad = "dispatch_reproducible * no-cuda reason\ndispatch_reproducible a_calibrated_file_gives_equal_fronts_and_its_own_hash skip reason\n";
+    assert_eq!(check(bad, &root()).len(), 1);
 }
