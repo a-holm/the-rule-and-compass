@@ -82,12 +82,7 @@ fn the_cli_refuses_a_ragged_file_with_exit_3() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(RAGGED.as_bytes())
-        .unwrap();
+    rcsr_cmd::feed_stdin(&mut child, RAGGED.as_bytes());
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(3));
     let err = String::from_utf8_lossy(&out.stderr);
@@ -118,12 +113,7 @@ fn the_cli_skip_malformed_flag_reports_the_skipped_count() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(RAGGED.as_bytes())
-        .unwrap();
+    rcsr_cmd::feed_stdin(&mut child, RAGGED.as_bytes());
     let out = child.wait_with_output().unwrap();
     assert_eq!(
         out.status.code(),

@@ -34,12 +34,7 @@ fn run_cli(args: &[&str], stdin: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    rcsr_cmd::feed_stdin(&mut child, stdin.as_bytes());
     child.wait_with_output().unwrap()
 }
 

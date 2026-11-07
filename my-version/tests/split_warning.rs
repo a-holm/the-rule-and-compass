@@ -30,12 +30,7 @@ fn run(args: &[&str]) -> (Option<i32>, String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn rcsr");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(time_ordered_csv(40).as_bytes())
-        .unwrap();
+    rcsr_cmd::feed_stdin(&mut child, time_ordered_csv(40).as_bytes());
     let out = child.wait_with_output().unwrap();
     (
         out.status.code(),
