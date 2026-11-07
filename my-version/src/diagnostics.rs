@@ -387,7 +387,7 @@ fn score_knn_queries(
 const KNN_PARALLEL_MIN_REFERENCE_ROWS: usize = 4096;
 
 /// Queries one worker takes from the shared counter at a time.
-const KNN_QUERY_CHUNK: usize = 8;
+const KNN_QUERY_CHUNK: usize = KNN_BLOCK;
 
 /// The prediction of every row `idx` of `query`, in the order of `idx`, and
 /// the number of workers that ran. Each worker owns its scratch and hands out
@@ -406,12 +406,16 @@ fn predict_rows(
     } else {
         workers.max(1).min(idx.len().div_ceil(KNN_QUERY_CHUNK))
     };
+    let predict_chunk = |chunk: &[usize], scratch: &mut KnnScratch, out: &mut Vec<f64>| {
+        let xs: Vec<&[f64]> = chunk.iter().map(|&i| query.x[i].as_slice()).collect();
+        index.predict_many(&xs, k, scratch, out);
+    };
     if workers <= 1 {
         let mut scratch = KnnScratch::default();
-        let pred = idx
-            .iter()
-            .map(|&i| index.predict(&query.x[i], k, &mut scratch))
-            .collect();
+        let mut pred = Vec::with_capacity(idx.len());
+        for chunk in idx.chunks(KNN_QUERY_CHUNK) {
+            predict_chunk(chunk, &mut scratch, &mut pred);
+        }
         return (pred, 1);
     }
     let next = AtomicUsize::new(0);
@@ -427,9 +431,9 @@ fn predict_rows(
                             break;
                         }
                         let end = (start + KNN_QUERY_CHUNK).min(idx.len());
-                        for pos in start..end {
-                            done.push((pos, index.predict(&query.x[idx[pos]], k, &mut scratch)));
-                        }
+                        let mut out = Vec::with_capacity(end - start);
+                        predict_chunk(&idx[start..end], &mut scratch, &mut out);
+                        done.extend(out.into_iter().enumerate().map(|(o, p)| (start + o, p)));
                     }
                     done
                 })
@@ -569,15 +573,25 @@ struct KdNode {
 struct KnnIndex<'a> {
     train: &'a Sample,
     dim: usize,
+    /// Every training row has `dim` inputs.
+    rectangular: bool,
     nodes: Vec<KdNode>,
     root: Option<usize>,
 }
+
+/// Queries one pass over the reference rows serves in the brute-force path.
+const KNN_BLOCK: usize = 8;
 
 /// The buffers one worker reuses across its queries.
 #[derive(Default)]
 struct KnnScratch {
     buf: Vec<(f64, usize)>,
     best: Vec<Neighbor>,
+    /// The block's queries, transposed: input `d` of query `q` at `d * KNN_BLOCK + q`.
+    block: Vec<f64>,
+    heaps: Vec<std::collections::BinaryHeap<Neighbor>>,
+    /// Passes over the reference rows this scratch made (counted work).
+    passes: u64,
 }
 
 impl<'a> KnnIndex<'a> {
@@ -597,8 +611,79 @@ impl<'a> KnnIndex<'a> {
         KnnIndex {
             train,
             dim,
+            rectangular,
             nodes,
             root,
+        }
+    }
+
+    /// The prediction of every query of `xs`, in order, appended to `out`; each equals
+    /// [`KnnIndex::predict`] bit for bit. Queries that take the brute-force path are served
+    /// `KNN_BLOCK` per pass over the reference rows.
+    fn predict_many(&self, xs: &[&[f64]], k: usize, scratch: &mut KnnScratch, out: &mut Vec<f64>) {
+        let blocked = self.root.is_none()
+            && self.rectangular
+            && self.dim > 0
+            && !self.train.is_empty()
+            && xs.iter().all(|x| x.len() == self.dim);
+        if !blocked {
+            out.extend(xs.iter().map(|x| self.predict(x, k, scratch)));
+            return;
+        }
+        let kk = k.clamp(1, self.train.len());
+        for block in xs.chunks(KNN_BLOCK) {
+            self.predict_brute_block(block, kk, scratch, out);
+        }
+    }
+
+    /// One pass over the reference rows for up to `KNN_BLOCK` queries. Each distance is the
+    /// dimension-order sum of `predict_brute`, and each query keeps the `kk` smallest
+    /// `(distance, index)` pairs under `cmp_dist`, a total order on finite distances, so the
+    /// neighbours and their summing order are the same. A NaN distance makes that order
+    /// depend on the visiting order: the block then runs `predict_brute`.
+    fn predict_brute_block(&self, xs: &[&[f64]], kk: usize, scratch: &mut KnnScratch, out: &mut Vec<f64>) {
+        let (nq, dim) = (xs.len(), self.dim);
+        scratch.passes += 1;
+        scratch.block.clear();
+        scratch.block.resize(dim * KNN_BLOCK, 0.0);
+        for d in 0..dim {
+            for q in 0..KNN_BLOCK {
+                scratch.block[d * KNN_BLOCK + q] = xs[q.min(nq - 1)][d];
+            }
+        }
+        scratch.heaps.resize_with(nq, Default::default);
+        for h in scratch.heaps.iter_mut() {
+            h.clear();
+        }
+        let mut nan = false;
+        for (i, row) in self.train.x.iter().enumerate() {
+            let mut acc = [0.0f64; KNN_BLOCK];
+            for (d, &v) in row.iter().enumerate() {
+                let lane = &scratch.block[d * KNN_BLOCK..(d + 1) * KNN_BLOCK];
+                for q in 0..KNN_BLOCK {
+                    let t = v - lane[q];
+                    acc[q] += t * t;
+                }
+            }
+            for q in 0..nq {
+                let dist = acc[q];
+                nan |= dist.is_nan();
+                let heap = &mut scratch.heaps[q];
+                if heap.len() < kk {
+                    heap.push(Neighbor { dist, idx: i });
+                } else if dist < heap.peek().map_or(f64::INFINITY, |w| w.dist) {
+                    heap.pop();
+                    heap.push(Neighbor { dist, idx: i });
+                }
+            }
+        }
+        if nan {
+            out.extend(xs.iter().map(|x| self.predict_brute(x, kk, scratch)));
+            return;
+        }
+        for q in 0..nq {
+            let sorted = std::mem::take(&mut scratch.heaps[q]).into_sorted_vec();
+            out.push(sorted.iter().map(|n| self.train.y[n.idx]).sum::<f64>() / kk as f64);
         }
     }
 
@@ -2723,6 +2808,132 @@ mod tests {
         let tiny_index = KnnIndex::new(&tiny);
         let all: Vec<usize> = (0..tiny.len()).collect();
         assert_eq!(predict_rows(&tiny_index, &tiny, &all, 5, 8).1, 1);
+    }
+
+    /// `n` rows of `dim` inputs; `grid` > 0 draws every input from that many values, so
+    /// many distances tie exactly. `nan_rows` rows get a NaN in column 0.
+    fn tied_sample(n: usize, dim: usize, grid: usize, nan_rows: usize, rng: &mut Mt) -> Sample {
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for r in 0..n {
+            let mut row: Vec<f64> = (0..dim)
+                .map(|_| {
+                    if grid > 0 {
+                        rng.usize_below(grid) as f64
+                    } else {
+                        rng.usize_below(1_000_000) as f64 / 1.0e6
+                    }
+                })
+                .collect();
+            if r < nan_rows {
+                row[0] = f64::NAN;
+            }
+            y.push(rng.usize_below(1_000) as f64 / 7.0);
+            x.push(row);
+        }
+        Sample::new(x, y)
+    }
+
+    /// The old path: one query at a time through `predict`; `None` when it panics.
+    fn predict_each(index: &KnnIndex<'_>, queries: &[Vec<f64>], k: usize) -> Option<Vec<u64>> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut scratch = KnnScratch::default();
+            queries.iter().map(|q| index.predict(q, k, &mut scratch).to_bits()).collect()
+        }))
+        .ok()
+    }
+
+    fn predict_blocked(index: &KnnIndex<'_>, queries: &[Vec<f64>], k: usize) -> Option<Vec<u64>> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let xs: Vec<&[f64]> = queries.iter().map(|q| q.as_slice()).collect();
+            let mut out = Vec::new();
+            index.predict_many(&xs, k, &mut KnnScratch::default(), &mut out);
+            out.iter().map(|p| p.to_bits()).collect()
+        }))
+        .ok()
+    }
+
+    /// #881: the blocked kernel equals the one-query path bit for bit (or both panic) over
+    /// dimensions on both sides of the k-d tree limit, K from 1 to above the row count, exact
+    /// ties, NaN inputs in the reference rows and in the queries, and partial blocks.
+    #[test]
+    fn knn_blocked_equals_one_query_at_a_time() {
+        let mut rng = Mt::new(881);
+        let mut compared = 0usize;
+        for dim in [1usize, 2, 3, 8, 9, 12, 32] {
+            for (n, grid, nan_rows) in [(40usize, 3usize, 0usize), (300, 4, 0), (300, 0, 0), (120, 3, 5), (300, 0, 1)] {
+                let train = tied_sample(n, dim, grid, nan_rows, &mut rng);
+                let index = KnnIndex::new(&train);
+                for k in [1usize, 2, 5, 17, n, n + 5] {
+                    for q in [1usize, 3, 8, 13, 20] {
+                        let mut queries: Vec<Vec<f64>> =
+                            tied_sample(q, dim, grid, 0, &mut rng).x;
+                        if nan_rows > 0 {
+                            queries[0][dim - 1] = f64::NAN;
+                        }
+                        assert_eq!(
+                            predict_each(&index, &queries, k),
+                            predict_blocked(&index, &queries, k),
+                            "dim {dim} n {n} grid {grid} nan_rows {nan_rows} k {k} queries {q}"
+                        );
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 7 * 5 * 6 * 5);
+    }
+
+    /// #881: a NaN column in every reference row and a ragged index take the old path.
+    #[test]
+    fn knn_blocked_keeps_the_old_path_for_nan_columns_ragged_rows_and_wide_queries() {
+        let mut rng = Mt::new(882);
+        let mut train = tied_sample(200, 10, 0, 200, &mut rng);
+        let queries = tied_sample(9, 10, 0, 0, &mut rng).x;
+        let index = KnnIndex::new(&train);
+        assert_eq!(predict_each(&index, &queries, 5), predict_blocked(&index, &queries, 5));
+        train = tied_sample(200, 10, 3, 0, &mut rng);
+        train.x[17] = vec![0.5, 1.0];
+        let index = KnnIndex::new(&train);
+        assert_eq!(predict_each(&index, &queries, 5), predict_blocked(&index, &queries, 5));
+        let train = tied_sample(200, 10, 3, 0, &mut rng);
+        let index = KnnIndex::new(&train);
+        let wide: Vec<Vec<f64>> = (0..9).map(|i| vec![i as f64; 12]).collect();
+        assert_eq!(predict_each(&index, &wide, 5), predict_blocked(&index, &wide, 5));
+    }
+
+    /// #881: counted work. The brute-force path makes one pass over the reference rows per
+    /// block of 8 queries, the k-d tree path none.
+    #[test]
+    fn knn_brute_force_makes_one_pass_per_block_of_queries() {
+        let mut rng = Mt::new(883);
+        let wide = tied_sample(500, 12, 0, 0, &mut rng);
+        let queries: Vec<&[f64]> = (0..20).map(|i| wide.x[i].as_slice()).collect();
+        let mut scratch = KnnScratch::default();
+        KnnIndex::new(&wide).predict_many(&queries, 5, &mut scratch, &mut Vec::new());
+        assert_eq!(scratch.passes, 3, "20 queries in blocks of 8");
+        let narrow = tied_sample(500, 4, 0, 0, &mut rng);
+        let queries: Vec<&[f64]> = (0..20).map(|i| narrow.x[i].as_slice()).collect();
+        let mut scratch = KnnScratch::default();
+        KnnIndex::new(&narrow).predict_many(&queries, 5, &mut scratch, &mut Vec::new());
+        assert_eq!(scratch.passes, 0, "the k-d tree path reads no full pass");
+    }
+
+    /// #881: on the worker pool the brute-force predictions equal the one-query path for
+    /// any worker count.
+    #[test]
+    fn knn_pool_brute_force_equals_one_query_at_a_time() {
+        let mut rng = Mt::new(884);
+        let train = tied_sample(5_000, 12, 0, 0, &mut rng);
+        let index = KnnIndex::new(&train);
+        let idx: Vec<usize> = (0..train.len()).step_by(25).collect();
+        let queries: Vec<Vec<f64>> = idx.iter().map(|&i| train.x[i].clone()).collect();
+        let want = predict_each(&index, &queries, 5).expect("no panic");
+        for workers in [1usize, 3, 8] {
+            let (got, used) = predict_rows(&index, &train, &idx, 5, workers);
+            assert_eq!(used, workers);
+            assert_eq!(got.iter().map(|p| p.to_bits()).collect::<Vec<_>>(), want, "{workers} workers");
+        }
     }
 
     #[test]
