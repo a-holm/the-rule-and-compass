@@ -1542,7 +1542,7 @@ fn a_kill_during_an_interim_chunk_resumes_to_the_uninterrupted_report() {
 #[test]
 fn interim_chunks_keep_the_final_hash_on_the_device() {
     if !rcsr::backend::probe().available() {
-        eprintln!("no usable GPU; skipping the device interim chain");
+        rcsr::backend::skip_without_device("no usable GPU; skipping the device interim chain");
         return;
     }
     let train = sample(240);
