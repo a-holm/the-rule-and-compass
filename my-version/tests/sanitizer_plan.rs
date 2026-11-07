@@ -285,3 +285,68 @@ fn an_app_only_binary_may_skip_named_tests_and_nothing_else_mixes_with_star() {
     let bad = "dispatch_reproducible * no-cuda reason\ndispatch_reproducible a_calibrated_file_gives_equal_fronts_and_its_own_hash skip reason\n";
     assert_eq!(check(bad, &root()).len(), 1);
 }
+
+const SPAWN_TOKENS: &[&str] = &[
+    "Command::new",
+    "rcsr_cmd::rcsr(",
+    "rcsr_cmd::rcsr_bench(",
+    "rcsr_cmd::rcsr_on_device(",
+    "rcsr_cmd::rcsr_for(",
+    ".spawn()",
+    ".output()",
+    ".status()",
+];
+
+/// The text of a test binary and of the `#[path]` modules it includes, without the shared child helper.
+fn binary_text(file: &Path) -> String {
+    let source = fs::read_to_string(file).expect("read test source");
+    let dir = file.parent().expect("test dir");
+    let mut text = source.clone();
+    for line in source.lines() {
+        let Some(rel) = line.trim().strip_prefix("#[path = \"").and_then(|r| r.strip_suffix("\"]")) else { continue };
+        let module = dir.join(rel);
+        if module.file_name().is_some_and(|n| n == "rcsr.rs") || !module.is_file() || !module.starts_with(dir) {
+            continue;
+        }
+        text.push_str(&fs::read_to_string(&module).expect("read test module"));
+    }
+    text
+}
+
+fn spawns_a_process(text: &str) -> bool {
+    text.lines().filter(|l| !l.trim_start().starts_with("//")).any(|l| SPAWN_TOKENS.iter().any(|t| l.contains(t)))
+}
+
+/// Every test binary that spawns a process needs a `*` line that runs it with `--target-processes application-only` or not at all.
+fn spawners_not_app_only(plan: &str, root: &Path) -> Vec<String> {
+    let lines = parse(plan).expect("plan parses");
+    let mut files = Vec::new();
+    rust_files(&root.join("tests"), &mut files);
+    files.sort();
+    let mut bad = Vec::new();
+    for f in files {
+        if f.parent() != Some(&root.join("tests")) {
+            continue;
+        }
+        let name = f.file_stem().expect("stem").to_string_lossy().to_string();
+        if !spawns_a_process(&binary_text(&f)) {
+            continue;
+        }
+        let ok = lines
+            .iter()
+            .any(|l| l.binary == name && l.test == "*" && ["skip", "no-cuda-app-only", "app-only"].contains(&l.mode.as_str()));
+        if !ok {
+            bad.push(name);
+        }
+    }
+    bad
+}
+
+#[test]
+fn a_binary_that_spawns_processes_never_runs_under_target_processes_all() {
+    let bad = spawners_not_app_only(PLAN, &root());
+    assert!(
+        bad.is_empty(),
+        "these binaries spawn processes and need a skip, no-cuda-app-only or app-only star line (compute-sanitizer crashes while it tracks a process tree): {bad:#?}"
+    );
+}
