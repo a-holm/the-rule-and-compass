@@ -671,3 +671,141 @@ fn resume_needs_the_same_reject_fixed_position() {
     let other = run_fixed(&data, &spec, &dir.join("d.jsonl"), &["--fitness", "pnl", "--reject-fixed-position", "--resume", &plain]);
     usage_error(&other, "--reject-fixed-position");
 }
+
+// ---- #849: fixed-position report and finalist refusal ----
+
+/// A rising market: every row pays `0.003` plus a small `x1` term, so buy and
+/// hold has the best validation Sharpe and a positive constant is the finalist.
+fn write_drift_csv(dir: &std::path::Path) -> String {
+    let mut text = String::from("t,x1,x2,r,y\n");
+    for i in 0..600 {
+        let f = i as f64;
+        let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+        let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+        let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+        let r = 0.003 + 0.002 * x1 + 0.0004 * noise;
+        text.push_str(&format!("{},{},{},{},{}\n", T0 + 900 * i as i64, x1, x2, r, r + 0.05 * x2));
+    }
+    let path = dir.join("drift.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn run_drift(data: &str, spec: &str, extra: &[&str]) -> Json {
+    let args = [
+        "--data", data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal",
+        "--target-spec", spec, "--cpu", "--no-dev-log", "--seed", "3", "--generations", "20", "--pop", "48",
+        "--metric", "squared", "--json", "--quiet", "--objective", "sharpe", "--cost-bps", "5",
+        "--validation-frac", "0.3",
+    ];
+    let out = rcsr_cmd::rcsr().args(args).args(extra).output().expect("run rcsr");
+    json(&out)
+}
+
+fn member_fixed(m: &Json) -> Option<String> {
+    match at(m, &["validation_book", "fixed_position"]) {
+        Json::Str(s) => Some(s.clone()),
+        Json::Null => None,
+        other => panic!("fixed_position is neither a string nor null: {other:?}"),
+    }
+}
+
+fn finalist_fixed(j: &Json) -> Option<String> {
+    match at(j, &["objective", "finalist", "fixed_position"]) {
+        Json::Str(s) => Some(s.clone()),
+        Json::Null => None,
+        other => panic!("fixed_position is neither a string nor null: {other:?}"),
+    }
+}
+
+#[test]
+fn every_front_member_reports_fixed_position() {
+    let (_scratch, dir) = scratch();
+    let data = write_drift_csv(&dir);
+    let spec = write_spec(&dir);
+    for fitness in ["metric", "pnl"] {
+        let j = run_drift(&data, &spec, &["--fitness", fitness]);
+        let front = pareto(&j);
+        assert!(!front.is_empty());
+        let vars = ["x1".to_string(), "x2".to_string()];
+        for m in front {
+            let exact = at(m, &["expression_exact"]).as_str().unwrap();
+            let tree = rcsr::parse::parse(exact, &vars).unwrap();
+            let want = rcsr::expr::fixed_position(&tree, 0.0).map(|long| if long { "long" } else { "flat" });
+            assert_eq!(member_fixed(m).as_deref(), want, "{fitness}: {exact}");
+        }
+        assert!(
+            front.iter().any(|m| member_fixed(m).as_deref() == Some("long")),
+            "{fitness}: the rising market keeps a positive constant on the front"
+        );
+        if fitness == "metric" {
+            assert!(front.iter().any(|m| member_fixed(m).is_none()), "no member decided by the inputs");
+        }
+        let fin = at(&j, &["objective", "finalist", "expression_exact"]).as_str().unwrap().to_string();
+        let tree = rcsr::parse::parse(&fin, &vars).unwrap();
+        let want = rcsr::expr::fixed_position(&tree, 0.0).map(|long| if long { "long" } else { "flat" });
+        assert_eq!(finalist_fixed(&j).as_deref(), want);
+    }
+}
+
+fn member_realised(m: &Json) -> Option<String> {
+    match at(m, &["validation_book", "fixed_position_realised"]) {
+        Json::Str(s) => Some(s.clone()),
+        Json::Null => None,
+        other => panic!("fixed_position_realised is neither a string nor null: {other:?}"),
+    }
+}
+
+/// #849: the realised validation book is reported at any threshold: `"long"` when
+/// the book was long on every row, `"flat"` when on none, else `null`.
+#[test]
+fn the_realised_position_follows_the_validation_exposure() {
+    let (_scratch, dir) = scratch();
+    let data = write_drift_csv(&dir);
+    let spec = write_spec(&dir);
+    for threshold in ["0", "1e-30"] {
+        let j = run_drift(&data, &spec, &["--fitness", "metric", "--threshold", threshold]);
+        let mut seen_long = false;
+        for m in pareto(&j) {
+            let exposure = num(m, &["validation_book", "exposure"]);
+            let want = if exposure == 1.0 { Some("long") } else if exposure == 0.0 { Some("flat") } else { None };
+            assert_eq!(member_realised(m).as_deref(), want, "threshold {threshold}, exposure {exposure}");
+            seen_long |= want == Some("long");
+        }
+        assert!(seen_long, "threshold {threshold}: the rising market has an always-long member");
+        let fin = match at(&j, &["objective", "finalist", "fixed_position_realised"]) {
+            Json::Str(s) => Some(s.as_str()),
+            _ => None,
+        };
+        let e = num(&j, &["objective", "validation", "exposure"]);
+        assert_eq!(fin, if e == 1.0 { Some("long") } else if e == 0.0 { Some("flat") } else { None });
+    }
+}
+
+#[test]
+fn reject_fixed_position_refuses_the_finalist() {
+    let (_scratch, dir) = scratch();
+    let data = write_drift_csv(&dir);
+    let spec = write_spec(&dir);
+    for fitness in ["metric", "pnl"] {
+        let off = run_drift(&data, &spec, &["--fitness", fitness]);
+        assert_eq!(finalist_fixed(&off).as_deref(), Some("long"), "{fitness}: buy and hold wins without the flag");
+        let on = run_drift(&data, &spec, &["--fitness", fitness, "--reject-fixed-position"]);
+        assert_eq!(finalist_fixed(&on), None, "{fitness}: the flag refuses the fixed finalist");
+        assert!(num(&on, &["objective", "validation", "exposure"]) < 1.0, "{fitness}");
+        for m in pareto(&on) {
+            if member_fixed(m).is_some() || member_realised(m).is_some() {
+                assert!(matches!(at(m, &["validation_book", "objective"]), Json::Null), "{fitness}");
+            }
+        }
+        if fitness == "metric" {
+            let usable = |j: &Json| num(j, &["objective", "usable_candidates"]);
+            let refused = pareto(&off)
+                .iter()
+                .filter(|m| (member_fixed(m).is_some() || member_realised(m).is_some()) && !matches!(at(m, &["validation_book", "objective"]), Json::Null))
+                .count() as f64;
+            assert_eq!(usable(&on), usable(&off) - refused);
+            assert_eq!(pareto(&on).len(), pareto(&off).len(), "the metric search is unchanged");
+        }
+    }
+}
