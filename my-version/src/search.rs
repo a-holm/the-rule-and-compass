@@ -4018,6 +4018,7 @@ const INF_PROBE_ROWS: usize = 2048;
 /// in f64, so the long/flat book counts no flip and scores `+inf` (fewer flips
 /// than `min_trades`); a non-finite constant scores `+inf` as well. The rule
 /// reads the CPU arithmetic only: the device value cannot change it.
+#[cfg(any(feature = "cuda", test))]
 fn constant_is_floored(tree: &Node, train: &Sample, cfg: &Config) -> bool {
     let Some(book) = cfg.fitness.book() else {
         return false;
