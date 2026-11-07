@@ -11,7 +11,6 @@ use rcsr::expr;
 use rcsr::metrics::Metric;
 use rcsr::rng::Mt;
 use rcsr::search::{run, Config};
-use std::io::Write;
 use std::process::Stdio;
 
 fn temporal(test_frac: f64) -> SplitSpec {
@@ -410,10 +409,7 @@ fn bad_filter_is_a_usage_error_with_the_column() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(b"x,y\n1,2\n2,3\n4,5\n").unwrap();
-    }
+    rcsr_cmd::feed_stdin(&mut child, b"x,y\n1,2\n2,3\n4,5\n");
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
