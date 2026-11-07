@@ -1875,6 +1875,7 @@ impl GpuSearch {
             return;
         }
         let rows = EvalSample { sample: train, cols: None };
+        let prefix_start = std::time::Instant::now();
         let full: Vec<(usize, usize)> = slots
             .iter()
             .copied()
@@ -1892,9 +1893,18 @@ impl GpuSearch {
         stats.nonfinite += status2;
         stats.nonfinite_trade_floor += floor.len();
         stats.nonfinite_full += full.len();
+        let mut check = crate::gpu_stats::EvalCheckLedger {
+            prefix_s: prefix_start.elapsed().as_secs_f64(),
+            slots: slots.len() as u64,
+            trade_floor_slots: floor.len() as u64,
+            full_passes: full.len() as u64,
+            ..Default::default()
+        };
         if full.is_empty() {
+            self.ledger.record_eval_check(check);
             return;
         }
+        let pool_start = std::time::Instant::now();
         let jobs: Vec<(usize, Node)> = full
             .iter()
             .map(|&(i, j)| (0, islands[i][j].tree.clone()))
@@ -1904,14 +1914,17 @@ impl GpuSearch {
             .as_ref()
             .expect("a GPU search owns its fallback pool")
             .score(jobs, data, cfg);
+        check.pool_s = pool_start.elapsed().as_secs_f64();
         let stats = self.stats.entry(generation).or_default();
         for (&(i, j), e) in full.iter().zip(errors) {
             stats.nonfinite_cpu_finite += e.is_finite() as usize;
+            check.finite += e.is_finite() as u64;
             islands[i][j].set_error(e);
             islands[i][j].confirm_inf(Some(self.rows_version));
         }
         stats.nonfinite_seconds += seconds;
         self.ledger.record_eval_fallback(full.len() as u64, seconds);
+        self.ledger.record_eval_check(check);
     }
 
     /// #288: score one explicit set of pending candidates through the exact
