@@ -82,7 +82,7 @@ The file also records `load1_start` and `load1_end`, the one-minute load average
 # calibrate: measured under load 8.65 (limit 4.00); noisy terms: bw 1.89, launch_s 2.26, cpu_eval 21.68
 ```
 
-`--strict` prints the line, exits 3 and writes nothing. A search that prices with a file whose `load1_start` is above that limit prints `# calibration: <path>: measured under load ...` once and routes as it would without the fields; it does not refuse, because that would invalidate files that exist. `rcsr calibrate` takes under 60 s at a load below 2.5 on the RTX 3060 (46.3 to 46.9 s at load 1.1 to 2.2) and longer above it.
+`--strict` prints the line, exits 3 and writes nothing. A search that prices with a file whose `load1_start` is above that limit prints `# calibration: <path>: measured under load ...` once and routes as it would without the fields; it does not refuse, because that would invalidate files that exist. A load below the limit does not make the terms quiet: the line also names every term with a spread above 1.5, whatever the load. `rcsr calibrate` takes under 60 s at a load below 2.5 on the RTX 3060 and longer above it.
 
 The probes behind `rcsr calibrate` and `--calibration probe` work as follows. The
 host terms that route stages (`cpu_eval`, `cpu_fit`) stay within a fixed factor of
