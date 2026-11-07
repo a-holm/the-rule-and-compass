@@ -41,3 +41,13 @@ fn dispatch_is_in_help_and_schema() {
     let schema = String::from_utf8_lossy(&rcsr(&["schema"]).stdout).to_string();
     assert!(schema.contains("\"--dispatch\""));
 }
+
+#[test]
+fn top_level_help_lists_every_calibrate_flag() {
+    let out = rcsr(&["--help"]);
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("rcsr calibrate [--out <path>] [--gpu | --cpu] [--no-enrich] [--strict]"),
+        "calibrate usage line in --help:\n{help}"
+    );
+}

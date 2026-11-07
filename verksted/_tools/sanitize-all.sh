@@ -9,10 +9,11 @@
 # is skipped in the binary run and gets its own run with --report-api-errors no and `--exact <test>`.
 # --only limits the pass to the named binaries. --dry-run prints the planned commands, builds and runs nothing.
 # A run that hits the 580 s timeout is a failure labelled `budget`. The timeout is never raised: size the fixture or add a plan line.
+# A run that ends with rc 139 (compute-sanitizer itself died with SIGSEGV) is a failure labelled `tool crash`, written without a test verdict and never retried.
 # Writes: one log per run (<id>-san-<binary>[-<test>]), the build log <id>-san-build, and the summary <id>-san-summary
 # with one line per run: <binary>[:<test>] rc=<n> xid=<a>-><b> secs=<s> | <test result line> | <ERROR SUMMARY line>,
 # plus `<binary>[:<test>] skip | <reason>` lines.
-# Plan mode `<cargo bin name> * run-bin <arguments>` (for example `rcsr-gpu-bench * run-bin --batch 64 --reps 1 --depth 3`) runs the release binary itself under memcheck, not its unit tests: it builds `cargo build --release --features cuda --bin <name>` and runs that executable with the arguments in a lock hold of its own, label `<name>`. `--only <name>` runs just that line and skips the test-binary build. The unit-test executable of the same binary (`bin-<name>`) has its own `skip` line.
+# Plan mode `<cargo bin name> * run-bin <arguments>` (for example `rcsr-gpu-bench * run-bin --batch 64 --reps 1 --depth 3`) runs the release binary itself under memcheck, not its unit tests: it builds `cargo build --release --features cuda --bin <name>` and runs that executable with the arguments in a lock hold of its own, label `<name>`. `--only <name>` runs just that line and skips the test-binary build. The unit-test executable of the same binary (`bin-<name>`) has its own `skip` line. A run-bin run uses `--target-processes application-only` and must start no CUDA-using child. A name may have several run-bin lines: the first logs as `<name>`, later ones as `<name>-<n>`.
 # Plan mode `<binary> * no-cuda <reason>` lists a binary that makes no CUDA call by design. It still runs under memcheck.
 # Rc 255 with `terminated before first instrumented API call` and `test result: ok` (0 failed) is a pass only for a listed binary
 # (`<binary> no CUDA call (listed)`); for an unlisted binary it is a failure (`<binary> unexpected no CUDA call: add a plan line or fix the test`).
@@ -67,7 +68,7 @@ while IFS=$'\t' read -r b t m r; do
   case "$m" in skip|api-errors-no) ;; no-cuda|no-cuda-app-only|app-only|run-bin) [ "$t" = "*" ] || { echo "sanitize-all: $m needs '*' as the test, got '$t' for $b in $plan" >&2; exit 2; } ;; *) echo "sanitize-all: bad mode '$m' in $plan" >&2; exit 2 ;; esac
   [ -n "$r" ] || { echo "sanitize-all: empty reason for $b $t in $plan" >&2; exit 2; }
 done <<< "$plan_lines"
-run_bin_names=$(printf '%s\n' "$plan_lines" | awk -F'\t' '$3 == "run-bin" { print $1 }')
+run_bin_names=$(printf '%s\n' "$plan_lines" | awk -F'\t' '$3 == "run-bin" && !seen[$1]++ { print $1 }')
 
 summary=$(log_path "$id" san-summary)
 fails=0
@@ -123,6 +124,11 @@ run_one() { # label tag api bin args...
   err=$(grep -a 'ERROR SUMMARY:' "$log" | tail -1)
   if [ "$rc" -eq 124 ]; then
     extra=" | budget"
+  fi
+  if [ "$rc" -eq 139 ]; then
+    emit "$label tool crash rc=139 xid=${xid:-?} secs=$((t1 - t0)) | compute-sanitizer died with SIGSEGV; not retried | ${res:-no test result}"
+    fails=$((fails + 1))
+    return 0
   fi
   # The sanitizer exits 255 when the target makes no CUDA call, which happens when the plan filters out every test.
   if [ "$rc" -eq 255 ] && grep -aq '^running 0 tests' "$log" && grep -aEq '[1-9][0-9]* filtered out' "$log" &&
@@ -201,7 +207,8 @@ while IFS=$'\t' read -r b t m r; do
 done <<< "$plan_lines"
 
 is_run_bin() { printf '%s\n' "$run_bin_names" | grep -qx -- "$1"; }
-run_bin_args() { printf '%s\n' "$plan_lines" | awk -F'\t' -v b="$1" '$1 == b && $3 == "run-bin" { print $4; exit }'; }
+run_bin_args() { printf '%s\n' "$plan_lines" | awk -F'\t' -v b="$1" '$1 == b && $3 == "run-bin" { print $4 }'; }
+run_bin_tag() { if [ "$2" -eq 1 ]; then printf '%s' "$1"; else printf '%s-%s' "$1" "$2"; fi; }
 
 # only_run_bins: --only names nothing but run-bin lines, so the test binaries are not built
 only_run_bins=0
@@ -223,10 +230,14 @@ if [ "$dry" -eq 1 ]; then
   for n in $run_bin_names; do
     selected "$n" || continue
     echo "build: cargo build --release --features cuda --bin $n --message-format=json"
-    read -r -a ra <<< "$(run_bin_args "$n")"
-    listed=0
-    target_args=()
-    run_one "$n" "san-$n" "" "<$n release binary>" "${ra[@]}"
+    k=0
+    while IFS= read -r line; do
+      k=$((k + 1))
+      read -r -a ra <<< "$line"
+      listed=0
+      target_args=(--target-processes application-only)
+      run_one "$(run_bin_tag "$n" "$k")" "san-$(run_bin_tag "$n" "$k")" "" "<$n release binary>" "${ra[@]}"
+    done <<< "$(run_bin_args "$n")"
   done
   [ "$only_run_bins" -eq 1 ] || echo "every other test binary: $(san_cmd "" "<binary>")"
   exit 0
@@ -286,10 +297,14 @@ for n in $run_bin_names; do
     fails=$((fails + 1))
     continue
   fi
-  read -r -a ra <<< "$(run_bin_args "$n")"
-  listed=0
-  target_args=()
-  run_one "$n" "san-$n" "" "$exe" "${ra[@]}"
+  k=0
+  while IFS= read -r line; do
+    k=$((k + 1))
+    read -r -a ra <<< "$line"
+    listed=0
+    target_args=(--target-processes application-only)
+    run_one "$(run_bin_tag "$n" "$k")" "san-$(run_bin_tag "$n" "$k")" "" "$exe" "${ra[@]}"
+  done <<< "$(run_bin_args "$n")"
 done
 
 emit "no-cuda binaries: $n_nocuda"
