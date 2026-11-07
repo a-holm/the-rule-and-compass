@@ -3,8 +3,10 @@
 //! CPU-only plan reads CPU rates only.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
 #[path = "common/scratch.rs"]
 mod scratch;
 use scratch::Scratch;
@@ -13,7 +15,8 @@ const T0: i64 = 1_704_067_200;
 const H: i64 = 3600;
 
 fn rcsr(args: &[&str], gpu_env: Option<&str>) -> Output {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_rcsr"));
+    // Each call states its own `RCSR_GPU`: unset means the live default.
+    let mut c = rcsr_cmd::rcsr_on_device();
     c.args(args);
     match gpu_env {
         Some(v) => c.env("RCSR_GPU", v),
@@ -73,7 +76,7 @@ fn enrich_cpu_says_not_probed_and_a_probed_run_says_what_it_found() {
     let j = String::from_utf8_lossy(&o.stdout).to_string();
     assert!(j.contains("\"gpu_probed\":false,\"gpu_available\":null"), "{j}");
 
-    let o = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let o = rcsr_cmd::rcsr_on_device()
         .args(["enrich", "--data", &st, "--out", &s(&dir.join("d.rcsb")), "--features", "returns", "--cpu"])
         .env_remove("RCSR_GPU")
         .output()

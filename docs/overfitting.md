@@ -296,6 +296,9 @@ finite-population correction for sampling without replacement,
 `(s/√q)·√((N−q)/(N−1))`; they are `null` when every row was scored.
 `--baseline-samples 0` explicitly means no caps at all: every query row is
 scored, which is `O(N_train²·d)` and should be opt-in on large panels.
+The queries of one set run on `--threads` workers (one worker below 4,096
+reference rows); each prediction depends only on its query row and the index,
+so every number is the same for any `--threads`.
 `baselines.knn.reference_rows`, `train_query_rows`, `test_query_rows`,
 `capped`, `sample_size`, `sample_seed`, both SEMs and `seconds` are reported. The reference set is always the
 training size.

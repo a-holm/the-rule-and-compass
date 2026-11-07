@@ -124,6 +124,8 @@ fn explicit_cpu_commands_open_no_device() {
     let mut a = enrich.to_vec();
     a.push("--cpu");
     assert_eq!(rcsr_opens(&trace, &a), 0, "enrich --cpu opened /dev/nvidia*");
+    let plan = ["dispatch-plan", "--against", "anchors"];
+    assert_eq!(rcsr_opens(&trace, &plan), 0, "dispatch-plan opened /dev/nvidia*");
     let cal = s(&dir.join("cal.json"));
     assert_eq!(rcsr_opens(&trace, &["calibrate", "--cpu", "--out", cal.as_str()]), 0, "calibrate --cpu opened /dev/nvidia*");
 

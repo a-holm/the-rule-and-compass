@@ -82,6 +82,16 @@ impl BuildIdentity {
         );
         out
     }
+
+    /// The differences that refuse a resume: every field of
+    /// [`BuildIdentity::differences`] except `threads`. No search result
+    /// depends on the CPU count of the process.
+    pub fn refusing_differences(&self, now: &BuildIdentity) -> Vec<String> {
+        self.differences(now)
+            .into_iter()
+            .filter(|d| !d.starts_with("threads: "))
+            .collect()
+    }
 }
 
 /// SHA-256 of the running executable, hashed once per process.
@@ -109,6 +119,19 @@ mod tests {
         assert_eq!(d.len(), 2, "{:?}", d);
         assert!(d[0].starts_with("commit: "));
         assert!(d[1].starts_with("threads: "));
+    }
+
+    #[test]
+    fn a_thread_only_change_does_not_refuse() {
+        let a = BuildIdentity::current(false);
+        let mut b = a.clone();
+        b.threads += 3;
+        assert_eq!(a.differences(&b).len(), 1);
+        assert!(a.refusing_differences(&b).is_empty());
+        b.binary_sha256 = "0".repeat(64);
+        let refusing = a.refusing_differences(&b);
+        assert_eq!(refusing.len(), 1, "{:?}", refusing);
+        assert!(refusing[0].starts_with("binary_sha256: "));
     }
 
     #[test]
