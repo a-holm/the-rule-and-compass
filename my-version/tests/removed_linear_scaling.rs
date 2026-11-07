@@ -33,6 +33,7 @@ fn checkpoint_text() -> String {
         max_complexity: 8,
         fit_iters: 2,
         seed: 3,
+        gpu: false,
         ..Default::default()
     };
     let mut text = None;

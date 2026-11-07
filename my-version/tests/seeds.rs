@@ -40,6 +40,7 @@ fn config(seed: u32, generations: usize) -> Config {
         patience: 0,
         seed,
         metric: Metric::Absolute,
+        gpu: false,
         ..Default::default()
     }
 }

@@ -324,6 +324,7 @@ fn base_config() -> Config {
         patience: 0,
         metric: Metric::Absolute,
         seed: 7,
+        gpu: false,
         ..Default::default()
     }
 }
