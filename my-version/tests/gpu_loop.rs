@@ -13,6 +13,8 @@
 
 #[path = "common/rcsr.rs"]
 mod rcsr_cmd;
+#[path = "common/launches.rs"]
+mod launches;
 
 #[cfg(feature = "cuda")]
 use rcsr::data::Sample;
@@ -323,6 +325,11 @@ fn cuda_build_defaults_to_gpu_when_a_device_is_available() {
     );
     assert_eq!(code, Some(0));
     assert!(stdout.contains("\"backend\":\"gpu\""), "json: {stdout}");
+    // The default route is checked here, not a forced device route. The launch count makes a pass
+    // under memcheck a counted fact: a gpu run that launched no kernel is a defect.
+    let launches = launches::device_launches(&stdout);
+    eprintln!("default route: backend gpu, {launches} device launches counted");
+    assert!(launches > 0, "a gpu run launched no kernel, json: {stdout}");
     assert!(
         !stdout.contains("\"device\":null"),
         "a GPU run must name its device, json: {stdout}"
@@ -495,11 +502,14 @@ fn mixed_supported_and_unsupported_candidates_are_deterministic_and_reported() {
         &[
             "--data", "-", "--target", "y", "--vars", "x",
             "--generations", "3", "--pop", "24", "--seed", "37",
-            "--metric", "squared", "--ops", "add,mul,asinh,require", "--gpu", "--json",
+            "--metric", "squared", "--ops", "add,mul,asinh,require", "--gpu", "--dispatch", "device", "--json",
         ],
         Some("1"),
     );
     assert_eq!(code, Some(0), "stderr: {stderr}");
+    let launches = launches::device_launches(&stdout);
+    eprintln!("forced device run: {launches} device launches counted");
+    assert!(launches > 0, "a forced device run launched no kernel, json: {stdout}");
     for key in [
         "\"native\":",
         "\"supported\":",
