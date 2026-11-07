@@ -83,9 +83,11 @@ fn the_helper_and_its_variable_stay_out_of_production_code() {
         let text = fs::read_to_string(&file).unwrap();
         let test_part = text.find("\n#[cfg(test)]").unwrap_or(text.len());
         let whole_file_is_tests = rel.ends_with("_tests.rs");
+        let mut offset = 0usize;
         for (n, line) in text.lines().enumerate() {
-            let offset: usize = text.lines().take(n).map(|l| l.len() + 1).sum();
-            let in_tests = whole_file_is_tests || offset >= test_part;
+            let line_start = offset;
+            offset += line.len() + 1;
+            let in_tests = whole_file_is_tests || line_start >= test_part;
             if line.contains("RCSR_REQUIRE_DEVICE") || line.contains("REQUIRE_DEVICE_ENV") {
                 problems.push(format!("{rel}:{}: reads the require-device variable outside backend.rs", n + 1));
             }
