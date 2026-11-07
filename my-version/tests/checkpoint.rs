@@ -1102,7 +1102,7 @@ fn interim_stop_on_generations_reports() {
 }
 
 fn rcsr_in(dir: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .current_dir(dir)
         .args(args)
         .output()
@@ -1287,7 +1287,7 @@ fn a_kill_during_an_interim_chunk_resumes_to_the_uninterrupted_report() {
     let mut args = chunk_args(&csv, &["--time-budget", "3600", "--interim-chunk", "--save-every", "1", "--patience", "0"]);
     let at = args.iter().position(|a| a == "--generations").expect("generations flag") + 1;
     args[at] = "1000000".to_string();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let mut child = rcsr_cmd::rcsr()
         .current_dir(&killed)
         .args(&args)
         .stdout(std::process::Stdio::null())
