@@ -1032,6 +1032,8 @@ struct GpuSearch {
     /// #500: rows version of the sample the next `score` call scores on, set
     /// by the caller; a CPU-confirmed `+inf` is recorded against it.
     rows_version: u64,
+    /// #895: column pieces for the flat bound, built once per rows version.
+    check_pieces: Option<(CheckPiecesKey, crate::flat_bound::ColumnPieces)>,
     /// #121: persistent bounded CPU pool for unsupported programs.
     fallback: Option<FallbackPool>,
     /// #169: batched GPU-fit outcomes for this run.
@@ -1079,6 +1081,11 @@ struct GpuSearch {
     /// #284: device intervals and fit sub-ledger. The search adds the exclusive
     /// main-thread stages; this ledger owns what only the evaluator/fitter sees.
     ledger: crate::gpu_stats::RunLedger,
+    /// #857: when set, the evaluate calls keep their device `+inf` slots in
+    /// `deferred_check` instead of checking them, so `score` can run the check
+    /// beside the fit kernel.
+    defer_check: bool,
+    deferred_check: Option<(Vec<(usize, usize)>, Vec<(usize, usize)>)>,
     /// #230: true only when the CUDA evaluator scores this run's metric
     /// itself through the objective kernel. False for an exact order/rank run,
     /// which is scored through [`crate::gpu::GpuEvaluator::score_stat_batch`]
@@ -1338,6 +1345,7 @@ impl GpuSearch {
                     pool: None,
                     stats: BTreeMap::new(),
                     rows_version: 0,
+                    check_pieces: None,
                     fallback: Some(FallbackPool::new(
                         fallback_workers(fallback_threads),
                         fallback_workers(fallback_threads),
@@ -1365,6 +1373,8 @@ impl GpuSearch {
                     fit_fallback_workers: 0,
                     ledger_origin: run_start,
                     ledger: crate::gpu_stats::RunLedger::new(),
+                    defer_check: false,
+                    deferred_check: None,
                     native_metric,
                     native_stat,
                     score,
@@ -1771,11 +1781,12 @@ impl GpuSearch {
     fn score(
         &mut self,
         islands: &mut [Vec<Ind>],
-        train: &Sample,
+        data: &EvalSample,
         cfg: &Config,
         generation: usize,
         dispatcher: &mut crate::dispatch::Dispatcher,
     ) -> Result<(), String> {
+        let train = data.sample;
         if generation >= 2 && crate::gpu::injected_fault("batch") {
             return Err(format!("{}the generation batch", crate::gpu::INJECTED_REFUSAL));
         }
@@ -1826,19 +1837,35 @@ impl GpuSearch {
             let unscreened = pending.len() - screened.len();
             self.fit_admitted_wide += unscreened;
             self.stats.entry(generation).or_default().fit_admitted_wide += unscreened;
-            if !screened.is_empty() {
-                self.evaluate_the_batch(islands, &screened, train, cfg, generation, dispatcher)?;
-            }
+            // #857: with wide admission the fit reads no screening error, and
+            // the screened and admitted slots are disjoint, so the CPU check of
+            // the screened batch runs while the fit kernel runs. A narrow run
+            // promotes by the checked screening errors and keeps the order.
+            self.defer_check = wide;
+            let screened_scored = if screened.is_empty() {
+                Ok(())
+            } else {
+                self.evaluate_the_batch(islands, &screened, data, cfg, generation, dispatcher)
+            };
+            self.defer_check = false;
+            screened_scored?;
+            let deferred = self.deferred_check.take();
             let admitted = select_promoted(islands, &pending, wide);
+            let begun = deferred.and_then(|(status2, floor)| {
+                self.check_begin(islands, &status2, &floor, data, cfg, generation)
+            });
             let fit_start = std::time::Instant::now();
             self.fit_pending(islands, &admitted, train, cfg, generation, dispatcher);
             self.fit_host_ms += fit_start.elapsed().as_secs_f64() * 1000.0;
+            if let Some(pending_check) = begun {
+                self.check_end(islands, pending_check, generation);
+            }
             // Re-score the survivors so selection sees their fitted constants.
-            self.evaluate_the_batch(islands, &admitted, train, cfg, generation, dispatcher)?;
+            self.evaluate_the_batch(islands, &admitted, data, cfg, generation, dispatcher)?;
             return Ok(());
         }
 
-        self.evaluate_the_batch(islands, &pending, train, cfg, generation, dispatcher)
+        self.evaluate_the_batch(islands, &pending, data, cfg, generation, dispatcher)
     }
 
     /// #288: dispatch one batch to the scorer that can rank this run's metric.
@@ -1851,15 +1878,15 @@ impl GpuSearch {
         &mut self,
         islands: &mut [Vec<Ind>],
         pending: &[(usize, usize)],
-        train: &Sample,
+        data: &EvalSample,
         cfg: &Config,
         generation: usize,
         dispatcher: &mut crate::dispatch::Dispatcher,
     ) -> Result<(), String> {
         if self.native_stat.is_some() {
-            self.evaluate_pending_stat(islands, pending, train, cfg, generation, dispatcher)
+            self.evaluate_pending_stat(islands, pending, data, cfg, generation, dispatcher)
         } else {
-            self.evaluate_pending(islands, pending, train, cfg, generation, dispatcher)
+            self.evaluate_pending(islands, pending, data, cfg, generation, dispatcher)
         }
     }
 
@@ -1877,53 +1904,140 @@ impl GpuSearch {
         islands: &mut [Vec<Ind>],
         slots: &[(usize, usize)],
         floor: &[(usize, usize)],
-        train: &Sample,
+        data: &EvalSample,
         cfg: &Config,
         generation: usize,
     ) {
+        if let Some(pending) = self.check_begin(islands, slots, floor, data, cfg, generation) {
+            self.check_end(islands, pending, generation);
+        }
+    }
+
+    /// #857: the first half of [`Self::check_device_nonfinite`]. The prefix
+    /// probe and the dimension and constant filters run here, and the slots
+    /// that need a full f64 pass are submitted to the pool. The pool reads
+    /// `data` and `cfg` through raw pointers, so the caller keeps both alive
+    /// and in place until [`Self::check_end`] returns. `None` when no slot
+    /// needs a pass.
+    fn check_begin(
+        &mut self,
+        islands: &mut [Vec<Ind>],
+        slots: &[(usize, usize)],
+        floor: &[(usize, usize)],
+        data: &EvalSample,
+        cfg: &Config,
+        generation: usize,
+    ) -> Option<PendingCheck> {
+        let train = data.sample;
         let (status2, slots) = (slots.len(), [slots, floor].concat());
         if slots.is_empty() {
-            return;
+            return None;
         }
         let rows = EvalSample { sample: train, cols: None };
+        let prefix_start = std::time::Instant::now();
+        let bound_rule = flat_bound_rule(train, cfg);
+        if bound_rule.is_some() {
+            self.ensure_check_pieces(data);
+        }
+        let pieces = self.check_pieces.as_ref().map(|c| &c.1);
+        let mut flat = 0usize;
+        let mut bound = 0usize;
         let full: Vec<(usize, usize)> = slots
             .iter()
             .copied()
             .filter(|&(i, j)| {
                 let tree = &islands[i][j].tree;
-                cfg.accepts_dimensions(tree) && nonfinite_prefix(tree, &rows, cfg) != Some(true)
+                if !cfg.accepts_dimensions(tree) {
+                    return false;
+                }
+                if constant_is_floored(tree, train, cfg) {
+                    flat += 1;
+                    return false;
+                }
+                if let (Some(threshold), Some(pieces)) = (bound_rule, pieces) {
+                    if crate::flat_bound::flat(tree, pieces, threshold) {
+                        bound += 1;
+                        return false;
+                    }
+                }
+                nonfinite_prefix(tree, &rows, cfg) != Some(true)
             })
             .collect();
         // Every slot outside `full` is `+inf` on the CPU: rejected by the
-        // dimension filter or non-finite in the probed prefix.
+        // dimension filter, a flat bare constant, flat by the interval bound
+        // or non-finite in the probed prefix.
         for &(i, j) in &slots {
             islands[i][j].confirm_inf(Some(self.rows_version));
         }
         let stats = self.stats.entry(generation).or_default();
         stats.nonfinite += status2;
         stats.nonfinite_trade_floor += floor.len();
+        stats.nonfinite_constant += flat;
+        stats.nonfinite_bound += bound;
         stats.nonfinite_full += full.len();
+        let mut check = crate::gpu_stats::EvalCheckLedger {
+            prefix_s: prefix_start.elapsed().as_secs_f64(),
+            slots: slots.len() as u64,
+            trade_floor_slots: floor.len() as u64,
+            bound_flat: bound as u64,
+            full_passes: full.len() as u64,
+            ..Default::default()
+        };
         if full.is_empty() {
-            return;
+            self.ledger.record_eval_check(check);
+            return None;
         }
-        let view = EvalSample::new(train, cfg);
+        let submit_start = std::time::Instant::now();
         let jobs: Vec<(usize, Node)> = full
             .iter()
             .map(|&(i, j)| (0, islands[i][j].tree.clone()))
             .collect();
+        let ticket = self
+            .fallback
+            .as_ref()
+            .expect("a GPU search owns its fallback pool")
+            .submit(jobs, data, cfg);
+        check.pool_s = submit_start.elapsed().as_secs_f64();
+        Some(PendingCheck { full, ticket, check })
+    }
+
+    /// #895: build the column pieces of `data` unless they are cached for this
+    /// rows version. The key also names the sample, so a different table never
+    /// reads another table's pieces.
+    fn ensure_check_pieces(&mut self, data: &EvalSample) {
+        let key = (self.rows_version, data.sample as *const Sample as usize, data.sample.x.len());
+        if self.check_pieces.as_ref().is_some_and(|c| c.0 == key) {
+            return;
+        }
+        let pieces = match &data.cols {
+            Some(cols) => crate::flat_bound::ColumnPieces::from_columns(cols),
+            None => crate::flat_bound::ColumnPieces::from_rows(&data.sample.x),
+        };
+        self.check_pieces = Some((key, pieces));
+    }
+
+    /// #857: the second half: wait for the submitted passes and write their
+    /// scores. `pool_s` counts the host time spent submitting and waiting, not
+    /// the time the passes ran beside other work.
+    fn check_end(&mut self, islands: &mut [Vec<Ind>], pending: PendingCheck, generation: usize) {
+        let PendingCheck { full, ticket, mut check } = pending;
+        let wait_start = std::time::Instant::now();
         let (errors, seconds) = self
             .fallback
             .as_ref()
             .expect("a GPU search owns its fallback pool")
-            .score(jobs, &view, cfg);
+            .finish(ticket);
+        check.pool_s += wait_start.elapsed().as_secs_f64();
         let stats = self.stats.entry(generation).or_default();
         for (&(i, j), e) in full.iter().zip(errors) {
             stats.nonfinite_cpu_finite += e.is_finite() as usize;
+            check.finite += e.is_finite() as u64;
             islands[i][j].set_error(e);
             islands[i][j].confirm_inf(Some(self.rows_version));
         }
         stats.nonfinite_seconds += seconds;
         self.ledger.record_eval_fallback(full.len() as u64, seconds);
+        self.ledger.record_eval_check(check);
     }
 
     /// #288: score one explicit set of pending candidates through the exact
@@ -1938,11 +2052,12 @@ impl GpuSearch {
         &mut self,
         islands: &mut [Vec<Ind>],
         pending: &[(usize, usize)],
-        train: &Sample,
+        data: &EvalSample,
         cfg: &Config,
         generation: usize,
         dispatcher: &mut crate::dispatch::Dispatcher,
     ) -> Result<(), String> {
+        let train = data.sample;
         let stage_start = std::time::Instant::now();
         let nodes = pending
             .iter()
@@ -1982,12 +2097,8 @@ impl GpuSearch {
             .expect("a GPU search owns its fallback pool")
             .workers();
 
-        let cpu_view = if on_cpu.is_empty() {
-            None
-        } else {
-            Some(EvalSample::new(train, cfg))
-        };
-        let ticket = cpu_view.as_ref().map(|view| {
+        let cpu_view = if on_cpu.is_empty() { None } else { Some(data) };
+        let ticket = cpu_view.map(|view| {
             let jobs: Vec<(usize, Node)> = on_cpu
                 .iter()
                 .map(|&(i, j)| (0, islands[i][j].tree.clone()))
@@ -2047,7 +2158,11 @@ impl GpuSearch {
         if let Some(e) = gpu_error {
             return Err(e);
         }
-        self.check_device_nonfinite(islands, &nonfinite, &[], train, cfg, generation);
+        if self.defer_check {
+            self.deferred_check = Some((nonfinite, Vec::new()));
+            return Ok(());
+        }
+        self.check_device_nonfinite(islands, &nonfinite, &[], data, cfg, generation);
         Ok(())
     }
 
@@ -2063,11 +2178,12 @@ impl GpuSearch {
         &mut self,
         islands: &mut [Vec<Ind>],
         pending: &[(usize, usize)],
-        train: &Sample,
+        data: &EvalSample,
         cfg: &Config,
         generation: usize,
         dispatcher: &mut crate::dispatch::Dispatcher,
     ) -> Result<(), String> {
+        let train = data.sample;
         let stage_start = std::time::Instant::now();
         let nodes = pending
             .iter()
@@ -2152,24 +2268,25 @@ impl GpuSearch {
         // kernel launch, so CPU fallback and GPU evaluation overlap. The view
         // must outlive the ticket; `finish` below waits for every chunk before
         // it is dropped.
-        let cpu_view = if on_cpu.is_empty() {
+        let scalar_rows;
+        let cpu_view: Option<&EvalSample> = if on_cpu.is_empty() {
             None
         } else {
             // #290: a whole batch routed to the CPU by the cost model does not
             // need another SoA transpose. The scalar view scores exactly the
             // same rows without paying (or counting) a full-train transpose;
-            // the SoA view is kept for the mixed supported/unsupported case
-            // that already needed one before this routing existed.
+            // the run's SoA view serves the mixed supported/unsupported case.
             if force_cpu && slots.is_empty() {
-                Some(EvalSample {
+                scalar_rows = EvalSample {
                     sample: train,
                     cols: None,
-                })
+                };
+                Some(&scalar_rows)
             } else {
-                Some(EvalSample::new(train, cfg))
+                Some(data)
             }
         };
-        let ticket = cpu_view.as_ref().map(|view| {
+        let ticket = cpu_view.map(|view| {
             let jobs: Vec<(usize, Node)> = on_cpu
                 .iter()
                 .map(|&(i, j)| (0, islands[i][j].tree.clone()))
@@ -2260,7 +2377,11 @@ impl GpuSearch {
             pending.len(),
             eval_workload.bytes,
         );
-        self.check_device_nonfinite(islands, &nonfinite, &floor, train, cfg, generation);
+        if self.defer_check {
+            self.deferred_check = Some((nonfinite, floor));
+            return Ok(());
+        }
+        self.check_device_nonfinite(islands, &nonfinite, &floor, data, cfg, generation);
         Ok(())
     }
 
@@ -2360,6 +2481,8 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             fallbacks: batch.map(|b| b.fallbacks).unwrap_or(0),
             nonfinite: batch.map(|b| b.nonfinite).unwrap_or(0),
             nonfinite_trade_floor: batch.map(|b| b.nonfinite_trade_floor).unwrap_or(0),
+            nonfinite_constant: batch.map(|b| b.nonfinite_constant).unwrap_or(0),
+            nonfinite_bound: batch.map(|b| b.nonfinite_bound).unwrap_or(0),
             nonfinite_full: batch.map(|b| b.nonfinite_full).unwrap_or(0),
             nonfinite_cpu_finite: batch.map(|b| b.nonfinite_cpu_finite).unwrap_or(0),
             nonfinite_seconds: batch.map(|b| b.nonfinite_seconds).unwrap_or(0.0),
@@ -2743,6 +2866,15 @@ impl FallbackPool {
     }
 }
 
+/// #857: the full passes of a device `+inf` check that were submitted and not
+/// yet collected.
+#[cfg(feature = "cuda")]
+struct PendingCheck {
+    full: Vec<(usize, usize)>,
+    ticket: FallbackTicket,
+    check: crate::gpu_stats::EvalCheckLedger,
+}
+
 /// #121: a submitted fallback batch, waiting to be collected.
 #[cfg(feature = "cuda")]
 struct FallbackTicket {
@@ -2813,7 +2945,7 @@ fn score_generation(
     gpu: &mut Option<GpuSearch>,
     used: &mut bool,
     islands: &mut [Vec<Ind>],
-    train: &Sample,
+    data: &EvalSample,
     cfg: &Config,
     backend_reason: &mut Option<String>,
     generation: usize,
@@ -2824,7 +2956,8 @@ fn score_generation(
         return Ok(false);
     };
     g.rows_version = rows_version;
-    match g.score(islands, train, cfg, generation, dispatcher) {
+    let train = data.sample;
+    match g.score(islands, data, cfg, generation, dispatcher) {
         Ok(()) => {
             // #230: a fit-only evaluator scores on the CPU, so it must not make
             // the run claim `backend = gpu`. The device use is reported through
@@ -2866,9 +2999,8 @@ fn score_generation(
                 }
             }
             // #27: re-scoring the pending batch goes through the SoA view.
-            let train_view = EvalSample::new(train, cfg);
             // #121: the same bounded worker pool as the per-batch fallback.
-            rescore_pending_cpu(islands, &train_view, cfg, &fallback);
+            rescore_pending_cpu(islands, data, cfg, &fallback);
             Ok(false)
         }
     }
@@ -3914,6 +4046,41 @@ fn eval_error_and_descriptor(
 
 /// #500: rows probed for a non-finite prediction before a full re-score.
 const INF_PROBE_ROWS: usize = 2048;
+
+/// #856: a bare constant at or below the book's threshold is flat on every row
+/// in f64, so the long/flat book counts no flip and scores `+inf` (fewer flips
+/// than `min_trades`); a non-finite constant scores `+inf` as well. The rule
+/// reads the CPU arithmetic only: the device value cannot change it.
+#[cfg(any(feature = "cuda", test))]
+fn constant_is_floored(tree: &Node, train: &Sample, cfg: &Config) -> bool {
+    let Some(book) = cfg.fitness.book() else {
+        return false;
+    };
+    tree.op == Op::Const
+        && !train.is_multi()
+        && book.min_trades() >= 1
+        && (!tree.val.is_finite() || !(tree.val > book.threshold()))
+}
+
+/// #895: the key of cached column pieces: rows version, sample address, rows.
+#[cfg(feature = "cuda")]
+type CheckPiecesKey = (u64, usize, usize);
+
+/// #895: the book threshold when an f64 interval bound can settle a device
+/// `+inf` slot: a book with `min_trades >= 1` scores `+inf` when no row has a
+/// finite prediction above the threshold, and when a prediction is non-finite.
+/// The bound runs on this thread, the passes on pool threads; a flush-to-zero
+/// mode here would make an upper bound unsound.
+#[cfg(any(feature = "cuda", test))]
+fn flat_bound_rule(train: &Sample, cfg: &Config) -> Option<f64> {
+    let book = cfg.fitness.book()?;
+    (!train.is_multi()
+        && !train.is_empty()
+        && book.len() == train.len()
+        && book.min_trades() >= 1
+        && crate::flat_bound::gradual_underflow())
+    .then(|| book.threshold())
+}
 
 /// #500/#589: whether a non-finite prediction in the first rows decides the
 /// score. `Some(true)`: the first rows hold one, which makes the full score
@@ -5946,6 +6113,12 @@ pub struct GpuGenStats {
     /// #640: device results with status 0 and `+inf` from the long/flat
     /// book (trade floor), checked on the CPU like the status-2 ones.
     pub nonfinite_trade_floor: usize,
+    /// #856: flat bare constants settled without a pass (`+inf` on the CPU by
+    /// the book's own rule), counted inside `nonfinite` and `nonfinite_trade_floor`.
+    pub nonfinite_constant: usize,
+    /// #895: of the trade-floor and status-2 slots, those an exact f64 interval bound
+    /// of the tree settled without a pass, counted inside `nonfinite` and `nonfinite_trade_floor`.
+    pub nonfinite_bound: usize,
     /// #589: of those, the ones the f64 prefix probe did not settle, so a full
     /// CPU pass ran.
     pub nonfinite_full: usize,
@@ -6534,6 +6707,12 @@ pub struct GpuSnapshot {
     /// finite on the CPU, and the wall seconds of the passes.
     pub nonfinite: usize,
     pub nonfinite_trade_floor: usize,
+    /// #856: flat bare constants settled without a pass (`+inf` on the CPU by
+    /// the book's own rule), counted inside `nonfinite` and `nonfinite_trade_floor`.
+    pub nonfinite_constant: usize,
+    /// #895: of the trade-floor and status-2 slots, those an exact f64 interval bound
+    /// of the tree settled without a pass, counted inside `nonfinite` and `nonfinite_trade_floor`.
+    pub nonfinite_bound: usize,
     pub nonfinite_full: usize,
     pub nonfinite_cpu_finite: usize,
     pub nonfinite_seconds: f64,
@@ -6575,6 +6754,8 @@ impl GpuSnapshot {
             fallbacks: self.fallbacks,
             nonfinite: self.nonfinite,
             nonfinite_trade_floor: self.nonfinite_trade_floor,
+            nonfinite_constant: self.nonfinite_constant,
+            nonfinite_bound: self.nonfinite_bound,
             nonfinite_full: self.nonfinite_full,
             nonfinite_cpu_finite: self.nonfinite_cpu_finite,
             nonfinite_seconds: self.nonfinite_seconds,
@@ -6722,6 +6903,8 @@ fn dev_generation(
         fallback_workers: g.fallback_workers,
         nonfinite: g.nonfinite,
         nonfinite_trade_floor: g.nonfinite_trade_floor,
+        nonfinite_constant: g.nonfinite_constant,
+        nonfinite_bound: g.nonfinite_bound,
         nonfinite_full: g.nonfinite_full,
         nonfinite_cpu_finite: g.nonfinite_cpu_finite,
         nonfinite_seconds: g.nonfinite_seconds,
@@ -6956,6 +7139,8 @@ fn run_postfix_search(
             fit_fallback_workers: 0,
             nonfinite: 0,
             nonfinite_trade_floor: 0,
+            nonfinite_constant: 0,
+            nonfinite_bound: 0,
             nonfinite_full: 0,
             nonfinite_cpu_finite: 0,
             nonfinite_seconds: 0.0,
@@ -7989,7 +8174,7 @@ fn run_search(
     // before the first selection step reads an error.
     #[cfg(feature = "cuda")]
     {
-        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg, &mut backend_reason, gens_done, &mut dispatcher, 0)?;
+        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, &train_data, cfg, &mut backend_reason, gens_done, &mut dispatcher, 0)?;
     }
 
     // #122: the flat postfix generation loop. It is selected before the first
@@ -8410,7 +8595,7 @@ fn run_search(
                     }
                     if let Some(g) = gpu.as_mut() {
                         g.rows_version = rows_version;
-                        g.check_device_nonfinite(&mut islands, &nonfinite_slots, &floor_slots, gen_train, cfg, gen);
+                        g.check_device_nonfinite(&mut islands, &nonfinite_slots, &floor_slots, gen_data, cfg, gen);
                     }
                     if pipeline_error.is_none() {
                         if pipeline_scored {
@@ -8419,7 +8604,7 @@ fn run_search(
                         // Score anything the kernel could not compile (left
                         // pending) through the normal CPU fallback.
                         defer_gpu =
-                            score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
+                            score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_data, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
                     } else {
                         // Stop the GPU and re-score every still-pending
                         // candidate in f64 on the CPU; a failed batch must
@@ -8447,7 +8632,7 @@ fn run_search(
                     // #26: one batched call covers every candidate of the
                     // generation (the pre-#119 synchronous path).
                     defer_gpu =
-                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
+                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_data, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
                 }
             }
             let dev_eval = dev_lap(&mut dev_mark); // #211: evaluator batch
@@ -8849,7 +9034,7 @@ fn run_search(
             #[cfg(feature = "cuda")]
             {
                 defer_gpu =
-                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
+                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_data, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
             }
 
             // #120: record this generation's evaluated behaviours. The order
@@ -12038,7 +12223,7 @@ mod tests {
             .with_mode(crate::dispatch::DispatchMode::Device);
         let mut islands = vec![std::mem::take(&mut island)];
         g.rows_version = 7;
-        g.score(&mut islands, &s, &cfg, 0, &mut dispatcher).expect("device batch");
+        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher).expect("device batch");
         for (k, ind) in islands[0].iter().enumerate() {
             let exact = score_tree(&ind.tree, &view, &cfg);
             assert_eq!(ind.error.to_bits(), exact.to_bits(), "tree {k}");
@@ -12118,7 +12303,7 @@ mod tests {
             .with_mode(crate::dispatch::DispatchMode::Device);
         let mut islands = vec![std::mem::take(&mut island)];
         g.rows_version = 7;
-        g.score(&mut islands, &s, &cfg, 0, &mut dispatcher).expect("device batch");
+        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher).expect("device batch");
         let exact0 = score_tree(&islands[0][0].tree, &view, &cfg);
         assert!(exact0.is_finite(), "the f64 positions meet the floor: {exact0}");
         assert_eq!(islands[0][0].error.to_bits(), exact0.to_bits());
@@ -12132,6 +12317,456 @@ mod tests {
         assert_eq!(stats.nonfinite, 0, "{:?}", stats);
         assert_eq!(stats.nonfinite_trade_floor, 2, "{:?}", stats);
         assert_eq!(stats.nonfinite_cpu_finite, 1, "{:?}", stats);
+        assert_eq!(stats.nonfinite_constant, 1, "{:?}", stats);
+        assert_eq!(stats.nonfinite_full, 1, "{:?}", stats);
+    }
+
+    /// #895: wherever the interval bound fires, the exact CPU score is `+inf`,
+    /// so the shortcut returns what the full pass returns. Checked on the
+    /// scalar and the column view, one and four blocks, several thresholds.
+    #[test]
+    fn flat_bound_rule_matches_score_tree() {
+        let un = |op: Op, a: Node| node(op, vec![a]);
+        let bin = |op: Op, a: Node, b: Node| node(op, vec![a, b]);
+        let flat_trees = vec![
+            un(Op::Gauss, bin(Op::Mul, constant(1e6), input(0))),
+            un(Op::Logistic, bin(Op::Sub, input(0), constant(3423.03))),
+            un(Op::Exp, bin(Op::Sub, input(0), constant(1e6))),
+            bin(Op::Mul, constant(-0.0034), un(Op::Exp, input(0))),
+            bin(Op::Sub, input(0), input(0)),
+            un(Op::Tanh, bin(Op::Sub, input(0), input(0))),
+            bin(Op::Div, input(0), input(0)),
+            constant(-1.0),
+            bin(Op::Div, constant(1.0), constant(0.0)),
+            bin(Op::Add, input(1), input(0)),
+        ];
+        let open_trees = vec![
+            input(0),
+            un(Op::Gauss, input(0)),
+            bin(Op::Mul, constant(2.0), input(0)),
+            un(Op::Exp, input(0)),
+            un(Op::Logistic, input(0)),
+            un(Op::Ln, input(0)),
+        ];
+        let mut fired = 0;
+        for threshold in [0.0, 1e-30, 0.5, -1e-30] {
+            for min_trades in [1usize, 5] {
+                for blocks in [1usize, 4] {
+                    let (s, cfg) = flat_book_fixture(threshold, min_trades, blocks);
+                    let rule = flat_bound_rule(&s, &cfg);
+                    assert_eq!(rule, Some(threshold));
+                    let columns = EvalSample::new(&s, &cfg);
+                    let scalar = EvalSample { sample: &s, cols: None };
+                    for (view, from_columns) in [(&columns, true), (&scalar, false)] {
+                        let pieces = if from_columns {
+                            crate::flat_bound::ColumnPieces::from_columns(view.cols.as_ref().unwrap())
+                        } else {
+                            crate::flat_bound::ColumnPieces::from_rows(&s.x)
+                        };
+                        for tree in flat_trees.iter().chain(&open_trees) {
+                            if crate::flat_bound::flat(tree, &pieces, threshold) {
+                                fired += 1;
+                                let exact = score_tree(tree, view, &cfg);
+                                assert_eq!(exact.to_bits(), f64::INFINITY.to_bits(), "{tree:?} threshold={threshold:e}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(fired >= 150, "the bound fires on the planted flat trees: {fired}");
+        let (s, cfg) = flat_book_fixture(1e-30, 0, 1);
+        assert_eq!(flat_bound_rule(&s, &cfg), None, "a flat book scores 1 with --min-trades 0");
+        let (s, cfg) = flat_book_fixture(1e-30, 1, 1);
+        let metric = Config { fitness: Fitness::Metric, ..cfg.clone() };
+        assert_eq!(flat_bound_rule(&s, &metric), None, "no book, no rule");
+        let mut multi = s.clone();
+        multi.ys = vec![s.y.clone(), s.y.clone()];
+        assert_eq!(flat_bound_rule(&multi, &cfg), None, "a multi-output sample");
+        let short = Sample { x: s.x[..10].to_vec(), y: s.y[..10].to_vec(), ..s.clone() };
+        assert_eq!(flat_bound_rule(&short, &cfg), None, "a sample the book does not cover");
+    }
+
+    /// #895: the device check settles a tree whose f64 predictions cannot
+    /// exceed the threshold by the interval bound, and still runs the full
+    /// pass for a floor slot whose f32 and f64 positions differ (#640).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_inf_check_settles_flat_trees_by_bound() {
+        if !crate::gpu::probe().available() {
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+            return;
+        }
+        let n = 300;
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let up = i % 2 == 0;
+            x.push(vec![if up { 0.5 + 1e-12 } else { -1.0 }, if up { 1.0 } else { -1.0 }]);
+            y.push(if up { 0.003 } else { -0.001 });
+        }
+        let s = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
+        let rows = crate::trading::TradingRows {
+            time: (0..n).map(|i| 900.0 * i as f64).collect(),
+            group: vec![0; n],
+            funding: Vec::new(),
+        };
+        let slice = crate::data::TradingSlice { rows, ret: s.y.clone() };
+        let spec = crate::trading::TradingSpec {
+            cost_bps: 1.0,
+            min_trades: 5,
+            threshold: 0.5,
+            ..Default::default()
+        };
+        let book = std::sync::Arc::new(crate::trading::FitnessBook::new(&slice, &spec, 900.0).unwrap());
+        let cfg = Config {
+            fitness: Fitness::LongPnl(book),
+            gpu: true,
+            dispatch: crate::dispatch::DispatchMode::Device,
+            ..Config::default()
+        };
+        let view = EvalSample::new(&s, &cfg);
+        let flat_tree = node(Op::Gauss, vec![node(Op::Mul, vec![constant(1e6), input(1)])]);
+        let trees = vec![flat_tree, input(0)];
+        let mut island: Vec<Ind> = trees
+            .iter()
+            .map(|t| {
+                let mut ind = Ind::evaluated(t.clone(), &view, &cfg);
+                ind.error = f64::NAN;
+                ind
+            })
+            .collect();
+        let mut g = GpuSearch::new(
+            &s,
+            false,
+            crate::fit::DeviceLoss::Squared,
+            true,
+            None,
+            Some(crate::metrics::ScoreObjective::LongPnl),
+            false,
+            run_clock(),
+            &[],
+            None,
+            cfg.fitness.book(),
+            2,
+        )
+        .expect("a device search");
+        let mut dispatcher = crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::default())
+            .with_mode(crate::dispatch::DispatchMode::Device);
+        let mut islands = vec![std::mem::take(&mut island)];
+        g.rows_version = 7;
+        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher).expect("device batch");
+        let stats = &g.stats[&0];
+        assert_eq!(stats.nonfinite_bound, 1, "{:?}", stats);
+        assert_eq!(stats.nonfinite_trade_floor, 2, "{:?}", stats);
+        assert_eq!(stats.nonfinite_full, 1, "only the f32/f64 flip slot needs a pass: {:?}", stats);
+        assert_eq!(stats.nonfinite_cpu_finite, 1, "{:?}", stats);
+        assert_eq!(islands[0][0].error, f64::INFINITY);
+        assert_eq!(islands[0][0].inf_rows, Some(7));
+        let exact = score_tree(&islands[0][1].tree, &view, &cfg);
+        assert!(exact.is_finite(), "the f64 positions meet the floor: {exact}");
+        assert_eq!(islands[0][1].error.to_bits(), exact.to_bits());
+        assert_eq!(islands[0][1].inf_rows, None);
+        let ledger = g.ledger.eval_check();
+        assert_eq!((ledger.bound_flat, ledger.full_passes), (1, 1), "{ledger:?}");
+        assert_eq!(score_tree(&islands[0][0].tree, &view, &cfg), f64::INFINITY);
+    }
+
+    /// A run clock for the device searches built in tests (a clock read inside a
+    /// gate test body is refused by `test_hygiene`).
+    #[cfg(feature = "cuda")]
+    fn run_clock() -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    /// #854: the CPU check of a device `+inf` reads the run's column view. It
+    /// builds none of its own, for a status-2 slot and a trade-floor slot alike.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_check_uses_the_run_view() {
+        if !crate::gpu::probe().available() {
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+            return;
+        }
+        let n = 300;
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let up = i % 2 == 0;
+            x.push(vec![if up { 1e-46 } else { -1e-46 }, if up { 1.0 } else { -1.0 }]);
+            y.push(if up { 0.003 } else { -0.001 });
+        }
+        let s = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
+        let rows = crate::trading::TradingRows {
+            time: (0..n).map(|i| 900.0 * i as f64).collect(),
+            group: vec![0; n],
+            funding: Vec::new(),
+        };
+        let slice = crate::data::TradingSlice { rows, ret: s.y.clone() };
+        let spec = crate::trading::TradingSpec {
+            cost_bps: 1.0,
+            min_trades: 5,
+            ..Default::default()
+        };
+        let book = std::sync::Arc::new(crate::trading::FitnessBook::new(&slice, &spec, 900.0).unwrap());
+        let cfg = Config {
+            fitness: Fitness::LongPnl(book),
+            gpu: true,
+            dispatch: crate::dispatch::DispatchMode::Device,
+            ..Config::default()
+        };
+        let view = EvalSample::new(&s, &cfg);
+        assert!(view.cols.is_some(), "the run view is a column view");
+        let overflow = (0..4).fold(input(1), |t, _| node(Op::Exp, vec![t]));
+        let trees = vec![input(0), constant(-1.0), overflow];
+        let mut island: Vec<Ind> = trees
+            .iter()
+            .map(|t| {
+                let mut ind = Ind::evaluated(t.clone(), &view, &cfg);
+                ind.error = f64::NAN;
+                ind
+            })
+            .collect();
+        let mut g = GpuSearch::new(
+            &s,
+            false,
+            crate::fit::DeviceLoss::Squared,
+            true,
+            None,
+            Some(crate::metrics::ScoreObjective::LongPnl),
+            false,
+            run_clock(),
+            &[],
+            None,
+            cfg.fitness.book(),
+            2,
+        )
+        .expect("a device search");
+        let mut dispatcher = crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::default())
+            .with_mode(crate::dispatch::DispatchMode::Device);
+        let mut islands = vec![std::mem::take(&mut island)];
+        reset_transpose_count();
+        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher).expect("device batch");
+        let stats = &g.stats[&0];
+        assert!(stats.nonfinite >= 1, "a status-2 slot is checked: {:?}", stats);
+        assert!(stats.nonfinite_trade_floor >= 1, "a floor slot is checked: {:?}", stats);
+        assert!(stats.nonfinite_full >= 1, "a full pass ran: {:?}", stats);
+        assert_eq!(transpose_count(), 0, "{:?}", stats);
+        let exact = score_tree(&islands[0][0].tree, &view, &cfg);
+        assert_eq!(islands[0][0].error.to_bits(), exact.to_bits());
+    }
+
+    /// #856: a long/flat book over 300 rows of one group with the given floor,
+    /// threshold and block count, and the sample it scores.
+    fn flat_book_fixture(threshold: f64, min_trades: usize, blocks: usize) -> (Sample, Config) {
+        let n = 300;
+        let x: Vec<Vec<f64>> = (0..n).map(|i| vec![if i % 2 == 0 { 1.0 } else { -1.0 }]).collect();
+        let y: Vec<f64> = (0..n).map(|i| if i % 2 == 0 { 0.003 } else { -0.001 }).collect();
+        let s = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
+        let rows = crate::trading::TradingRows {
+            time: (0..n).map(|i| 900.0 * i as f64).collect(),
+            group: vec![0; n],
+            funding: Vec::new(),
+        };
+        let slice = crate::data::TradingSlice { rows, ret: s.y.clone() };
+        let spec = crate::trading::TradingSpec {
+            cost_bps: 1.0,
+            min_trades,
+            threshold,
+            ..Default::default()
+        };
+        let book = crate::trading::FitnessBook::with_blocks(&slice, &spec, 900.0, blocks, 1.0).unwrap();
+        let cfg = Config { fitness: Fitness::LongPnl(std::sync::Arc::new(book)), ..Config::default() };
+        (s, cfg)
+    }
+
+    fn next_up(v: f64) -> f64 {
+        f64::from_bits(v.to_bits() + 1)
+    }
+
+    /// #856: wherever the rule fires, the exact CPU score is `+inf`, so the
+    /// shortcut returns what the full pass returns. Checked on the scalar and
+    /// the column view, one and four blocks, and at the edge values: a
+    /// subnormal, the 1e30 limit and a value exactly at the threshold.
+    #[test]
+    fn flat_constant_needs_no_pass() {
+        let values = [
+            -1.0,
+            0.0,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -5e-324,
+            5e-324,
+            1e-300,
+            1.0,
+            -1e30,
+            1e30,
+            next_up(1e30),
+            -f64::MAX,
+            f64::MAX,
+            1e-30,
+            next_up(1e-30),
+            -1e-30,
+        ];
+        let mut fired = 0;
+        for threshold in [0.0, 1e-30, -1e-30, 1e30, -1e30] {
+            for min_trades in [1usize, 5] {
+                for blocks in [1usize, 4] {
+                    let (s, cfg) = flat_book_fixture(threshold, min_trades, blocks);
+                    let columns = EvalSample::new(&s, &cfg);
+                    let scalar = EvalSample { sample: &s, cols: None };
+                    for v in values {
+                        let tree = constant(v);
+                        let floored = constant_is_floored(&tree, &s, &cfg);
+                        let expect = !v.is_finite() || !(v > threshold);
+                        assert_eq!(floored, expect, "v={v:e} threshold={threshold:e}");
+                        if floored {
+                            fired += 1;
+                            for view in [&columns, &scalar] {
+                                let score = score_tree(&tree, view, &cfg);
+                                assert_eq!(score, f64::INFINITY, "v={v:e} threshold={threshold:e} blocks={blocks}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(fired > 100, "{fired}");
+        let (s, cfg) = flat_book_fixture(1e-30, 1, 1);
+        assert!(constant_is_floored(&constant(1e-30), &s, &cfg), "exactly at the threshold");
+        assert!(!constant_is_floored(&constant(next_up(1e-30)), &s, &cfg), "one ulp above it");
+        assert!(constant_is_floored(&constant(5e-324), &s, &cfg), "a positive subnormal is below 1e-30");
+        let (zero, zcfg) = flat_book_fixture(0.0, 1, 1);
+        assert!(!constant_is_floored(&constant(5e-324), &zero, &zcfg), "a positive subnormal is above 0");
+    }
+
+    /// #856: the rule is off without a trade floor, with a metric fitness, for
+    /// anything but a bare constant and for a multi-output sample.
+    #[test]
+    fn flat_constant_rule_stays_off_outside_its_proof() {
+        let (s, floorless) = flat_book_fixture(0.0, 0, 1);
+        assert!(!constant_is_floored(&constant(-1.0), &s, &floorless));
+        assert!(score_tree(&constant(-1.0), &EvalSample::new(&s, &floorless), &floorless).is_finite());
+        let (_, cfg) = flat_book_fixture(0.0, 1, 1);
+        let product = node(Op::Mul, vec![constant(-1.0), input(0)]);
+        assert!(!constant_is_floored(&product, &s, &cfg));
+        assert!(!constant_is_floored(&input(0), &s, &cfg));
+        let metric = Config::default();
+        assert!(!constant_is_floored(&constant(-1.0), &s, &metric));
+        let multi = Sample { ys: vec![s.y.clone(), s.y.clone()], ..s.clone() };
+        assert!(multi.is_multi());
+        assert!(!constant_is_floored(&constant(-1.0), &multi, &cfg));
+    }
+
+    #[cfg(feature = "cuda")]
+    fn bare() -> Node {
+        node(Op::Cos, vec![node(Op::Exp, vec![node(Op::Exp, vec![input(0)])])])
+    }
+
+    #[cfg(feature = "cuda")]
+    fn with_constant() -> Node {
+        node(Op::Mul, vec![constant(0.5), bare()])
+    }
+
+    /// #857: a squared run on the device with `--fit-strategy gpu`. One island of
+    /// 40 candidates: slot 0 is `cos(exp(exp(x0)))` (with a constant factor 0.5 when it must be
+    /// promotable; a factor 1 is simplified away), which the f32 program
+    /// overflows on the large rows (device `+inf`, status 2) but the f64 score
+    /// of the data it reproduces is finite and best; slots 1..40 are `1e6 * x0`.
+    /// Returns the search, the islands after `score`, the sample view's config
+    /// and the number of fillers whose constant the device fit changed.
+    #[cfg(feature = "cuda")]
+    fn overflow_island_after_score(admission: crate::fit::FitAdmission, special: Node) -> (GpuSearch, Vec<Vec<Ind>>, Config, usize) {
+        let n = 300;
+        let x: Vec<Vec<f64>> = (0..n).map(|i| vec![5.0 * i as f64 / (n - 1) as f64]).collect();
+        let y: Vec<f64> = x.iter().map(|r| eval(&special, r)).collect();
+        let s = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
+        let cfg = Config {
+            gpu: true,
+            dispatch: crate::dispatch::DispatchMode::Device,
+            fit_strategy: crate::fit::FitStrategy::Gpu,
+            fit_iters: 3,
+            fit_admission: admission,
+            ..Config::default()
+        };
+        let view = EvalSample::new(&s, &cfg);
+        let filler = || node(Op::Mul, vec![constant(1e6), input(0)]);
+        let mut island: Vec<Ind> = std::iter::once(special.clone())
+            .chain((1..40).map(|_| filler()))
+            .map(|t| {
+                let mut ind = Ind::evaluated(t, &view, &cfg);
+                ind.error = f64::NAN;
+                ind
+            })
+            .collect();
+        for (k, ind) in island.iter_mut().enumerate().skip(1) {
+            // Distinct trees keep the fillers apart; the value is irrelevant.
+            ind.tree = node(Op::Mul, vec![constant(1e6 + k as f64), input(0)]);
+        }
+        let mut g = GpuSearch::new(
+            &s,
+            true,
+            crate::fit::DeviceLoss::Squared,
+            true,
+            None,
+            Some(crate::metrics::ScoreObjective::Squared),
+            false,
+            std::time::Instant::now(),
+            &[],
+            None,
+            None,
+            2,
+        )
+        .expect("a device search");
+        let mut dispatcher = crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::default())
+            .with_mode(crate::dispatch::DispatchMode::Device);
+        let mut islands = vec![island];
+        g.rows_version = 3;
+        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher).expect("device batch");
+        let changed = islands[0]
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(k, ind)| ind.tree != node(Op::Mul, vec![constant(1e6 + *k as f64), input(0)]))
+            .count();
+        let exact = score_tree(&islands[0][0].tree, &view, &cfg);
+        assert_eq!(islands[0][0].error.to_bits(), exact.to_bits(), "the overflow slot holds its CPU score");
+        assert!(islands[0][0].error.is_finite(), "{}", islands[0][0].error);
+        assert!(g.stats[&0].nonfinite >= 1, "{:?}", g.stats[&0]);
+        (g, islands, cfg, changed)
+    }
+
+    /// #857: narrow admission promotes by the checked screening errors. The
+    /// overflow slot is finite and best on the CPU, so it takes one of the 32
+    /// admission slots and only 31 fillers are fitted. Unchecked, its device
+    /// `+inf` would rank it last and 32 fillers would be fitted.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn narrow_admission_checks_before_promotion() {
+        if !crate::gpu::probe().available() {
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+            return;
+        }
+        let (g, _, _, changed) = overflow_island_after_score(crate::fit::FitAdmission::Screened, with_constant());
+        assert_eq!(changed, 31, "{:?}", g.stats[&0]);
+    }
+
+    /// #857: wide admission fits every candidate with constants and runs the
+    /// check of the screening batch beside the fit. The scores are the CPU ones
+    /// and every filler is fitted.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn wide_admission_overlaps_the_check_and_keeps_the_scores() {
+        if !crate::gpu::probe().available() {
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+            return;
+        }
+        let (g, islands, _, changed) = overflow_island_after_score(crate::fit::FitAdmission::All, bare());
+        assert_eq!(changed, 39, "{:?}", g.stats[&0]);
+        assert_eq!(islands[0][0].inf_rows, None, "a finite CPU score is not a confirmed +inf");
+        assert!(g.deferred_check.is_none() && !g.defer_check);
     }
 
     #[test]
