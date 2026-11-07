@@ -3759,20 +3759,42 @@ mod tests {
         assert_eq!(fixed_position(&shifted, 1.5), None);
     }
 
-    /// #848: where the test claims a position, every finite value of the tree
-    /// on rows with `|x| <= 3` agrees with it.
+    /// #848: a property check, not a proof: where the test claims a position,
+    /// every finite value of random trees agrees with it on rows that include
+    /// zero, tiny and huge magnitudes (underflow and overflow), over the pilot
+    /// operators, the operators with their own range rules and aggregates.
     #[test]
-    fn fixed_position_is_sound_on_random_trees() {
+    fn fixed_position_property_check_on_random_trees() {
         use Op::*;
-        let ops = [Add, Sub, Mul, Div, Abs, Exp, Square, Tanh, Logistic, Gauss, Neg];
+        let ops = [
+            Add, Sub, Mul, Div, Abs, Exp, Square, Tanh, Logistic, Gauss, Neg, Sqrt, Cube, Cosh, Erf, Erfc, Step,
+            Sign, Agg(AggKind::Mean), Agg(AggKind::Std), Agg(AggKind::Median),
+        ];
+        let sample = crate::data::Sample {
+            x: (0..32).map(|i| vec![(i as f64) * 0.25 - 4.0, ((i * 7) % 32) as f64 * 0.1 - 1.0]).collect(),
+            y: (0..32).map(|i| i as f64).collect(),
+            w: Vec::new(),
+            ys: Vec::new(),
+            pairs: None,
+        };
+        let aggs = AggTable::from_sample(&sample);
         let mut rng = Mt::new(848);
-        let rows: Vec<[f64; 2]> = (0..16)
+        let mut rows: Vec<[f64; 2]> = (0..16)
             .map(|_| [rng.range(-3.0, 3.0), rng.range(-3.0, 3.0)])
             .collect();
+        let extreme = [
+            0.0, 1e-300, -1e-300, 1e-12, -1e-12, 1e-8, 1e3, -1e3, 700.0, -700.0, 1e6, 1e150, -1e150, f64::MAX,
+        ];
+        for a in extreme {
+            for b in extreme {
+                rows.push([a, b]);
+            }
+        }
+        let names = ["x".to_string(), "y".to_string()];
         let thresholds = [0.0, 1e-30, 0.5];
         let (mut long, mut flat) = (0usize, 0usize);
         for i in 0..100_000usize {
-            let tree = random_tree(&mut rng, 2, &ops, 1 + i % 5);
+            let tree = random_tree_with(&mut rng, 2, &ops, 1 + i % 5, Some(&aggs));
             let t = thresholds[i % thresholds.len()];
             let Some(fixed) = fixed_position(&tree, t) else { continue };
             if fixed {
@@ -3786,9 +3808,9 @@ mod tests {
                     continue;
                 }
                 if fixed {
-                    assert!(v >= t, "long claim broken: {v} < {t} for {}", to_string_exact(&tree, &["x".into(), "y".into()]));
+                    assert!(v >= t, "long claim broken: {v} < {t} at {row:?} for {}", to_string_exact(&tree, &names));
                 } else {
-                    assert!(v <= t, "flat claim broken: {v} > {t} for {}", to_string_exact(&tree, &["x".into(), "y".into()]));
+                    assert!(v <= t, "flat claim broken: {v} > {t} at {row:?} for {}", to_string_exact(&tree, &names));
                 }
             }
         }

@@ -828,6 +828,9 @@ pub struct RunEnd {
     pub fit_call_s_max: Option<f64>,
     /// #611: fits that ran on a reweighted L1 schedule.
     pub irls_reweighted: u64,
+    /// #855: the run was an interim chunk; the archive fields describe the
+    /// search archive, not a reported front.
+    pub interim: bool,
     /// Log bookkeeping: events written, bytes, events dropped by the cap.
     pub events: u64,
     pub bytes: u64,
@@ -845,7 +848,7 @@ pub fn run_end_json(r: &RunEnd) -> String {
          \"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"unaccounted_s\":{},\
          \"fit_kernel_s\":{},\"fit_kernel_lm_s\":{},\"fit_kernel_polish_s\":{},\"fit_fallback_s\":{},\"fit_refit_s\":{},\"fit_refits\":{},\"fit_calls\":{},\"fit_candidates\":{},\"fit_call_s_max\":{},\
          \"irls_reweighted\":{},\
-         \"prune\":{{\"fits\":{},\"accepted\":{},\"seconds\":{}}},\
+         \"prune\":{{\"fits\":{},\"accepted\":{},\"seconds\":{}}},{}\
          \"events\":{},\"bytes\":{},\"dropped\":{},\"end\":{}}}",
         SCHEMA,
         VERSION,
@@ -891,6 +894,7 @@ pub fn run_end_json(r: &RunEnd) -> String {
         r.prune_fits,
         r.prune_accepted,
         num(r.prune_s),
+        if r.interim { "\"interim\":true," } else { "" },
         r.events,
         r.bytes,
         r.dropped,

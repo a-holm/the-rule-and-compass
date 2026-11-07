@@ -123,9 +123,11 @@ USAGE:
              [--lockbox <START,END|none>]
              [--target-spec <file>]
   rcsr verify-manifest <manifest.json> [--data <file>] [--binary <file>]
-  rcsr calibrate [--out <path>] [--gpu | --cpu]
+  rcsr calibrate [--out <path>] [--gpu | --cpu] [--strict]
                               time this machine and write the calibration
-                              file that --dispatch auto routes from
+                              file that --dispatch auto routes from; the file
+                              records the load, stderr warns when the probe ran
+                              under load, --strict refuses such a file (exit 3)
   rcsr dispatch-plan [--calibration <anchors|path>] [--against <anchors|path>] [--json]
                               print the device/cpu route of 4950 eval and fit
                               cells under a calibration and the cells that flip
@@ -809,6 +811,22 @@ SEARCH:
                              runs with the saved one (not with none), and
                              --time-budget replaces it for this process only.
                              A resume prints the budget it uses
+  --interim-chunk            for a chunked run (needs --save and --time-budget):
+                             when the chunk stops on --time-budget, save the
+                             search state and skip the end-of-run report (exact
+                             refit, test scoring, baselines, diagnostics,
+                             gates). run.json is a short document with
+                             interim true; rcsr walkforward --from-run and
+                             rcsr verify-manifest refuse it (exit 2). A chunk
+                             that stops for any other reason (generations,
+                             patience, solved) writes the full report. The
+                             last chunk's checkpoint, archive and run.json equal
+                             those of a run without the flag. Execution setting:
+                             not saved, not part of the config hash. Not for
+                             --target y1,y2. When no last chunk ran, no report
+                             exists: run again with --resume and --time-budget 0
+                             and without --interim-chunk. That runs one more
+                             generation and writes the full report
   --gpu                      assert that the GPU must guide the search: an
                              error (exit 2) when the binary was not built with
                              --features cuda or no device is present. After
@@ -1498,7 +1516,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{},\"calls\":{},\"candidates\":{},\"call_s_max\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"carried_kept\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{},\"calls\":{},\"candidates\":{},\"call_s_max\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1514,6 +1532,7 @@ fn gpu_json(
         g.fit_refit_candidates,
         jnum(g.fit_refit_s),
         jnum(g.fit_rescore_s),
+        g.fit_carried_kept,
         jnum(g.fit_ms / 1000.0),
         jnum(g.ledger.fit_kernel_lm_s()),
         jnum(g.ledger.fit_kernel_polish_s()),
@@ -2028,6 +2047,7 @@ impl DevSink {
             fit_candidates: outcome.gpu.as_ref().map(|g| g.fit_call_candidates),
             fit_call_s_max: outcome.gpu.as_ref().map(|g| g.fit_call_ms_max / 1000.0),
             irls_reweighted: fit::fit_arm_counts_full().irls_reweighted,
+            interim: outcome.interim,
             events,
             bytes,
             dropped,
@@ -3340,6 +3360,7 @@ fn main() {
                 cfg.time_budget = Some(parse_nonneg("--time-budget", &val!()));
                 time_budget_set = true;
             }
+            "--interim-chunk" => cfg.interim_chunk = true, // #855
             "--save" => save_path = Some(val!()),
             "--save-every" => {
                 let v = val!();
@@ -3529,6 +3550,10 @@ fn main() {
     }
     if save_every_set && save_path.is_none() {
         eprintln!("error: --save-every requires --save <file>");
+        std::process::exit(EXIT_USAGE);
+    }
+    if cfg.interim_chunk && !(save_path.is_some() && time_budget_set) {
+        eprintln!("error: --interim-chunk requires --save <file> and --time-budget <seconds>");
         std::process::exit(EXIT_USAGE);
     }
     if cfg.selection == crate::search::Selection::Afp
@@ -3910,6 +3935,7 @@ fn main() {
         let requested_pipeline_depth = cfg.pipeline_depth;
         let requested_prune = (cfg.prune, cfg.prune_rows, cfg.prune_budget);
         let requested_fit_report = cfg.fit_report;
+        let requested_interim_chunk = cfg.interim_chunk;
         let mut effective = saved;
         if cp.refit_band_unknown {
             effective.refit_band = cfg.refit_band;
@@ -3930,6 +3956,7 @@ fn main() {
         effective.pipeline_depth = requested_pipeline_depth;
         (effective.prune, effective.prune_rows, effective.prune_budget) = requested_prune;
         effective.fit_report = requested_fit_report;
+        effective.interim_chunk = requested_interim_chunk;
         fit_request = None;
         cfg = effective;
         resumed_generation = Some(cp.generations);
@@ -3995,6 +4022,11 @@ fn main() {
             std::process::exit(EXIT_USAGE);
         }
     };
+    if let rcsr::dispatch::CalibrationSource::File(f) = &cfg.calibration {
+        if let Some(notice) = f.calibration.load_notice().filter(|_| !quiet) {
+            eprintln!("# calibration: {}: {}", f.origin.path, notice);
+        }
+    }
     // #733: a resumed run must price with the calibration the run started with.
     if let Some(cp) = &resume_checkpoint {
         let now = rcsr::checkpoint::CalibrationRecord::of(&cfg.calibration);
@@ -4143,6 +4175,7 @@ fn main() {
             (stability_runs > 0, "--stability"),
             (report.is_some(), "--report"),
             (run_manifest_path.is_some(), "--run-manifest"),
+            (cfg.interim_chunk, "--interim-chunk"),
         ];
         for (present, flag) in unsupported {
             if present {
@@ -6367,6 +6400,114 @@ fn main() {
     }
     // Compatibility: `elapsed_seconds` has always meant the search phase.
     let elapsed = search_seconds;
+
+    // #855: an interim chunk ends here. The search state is saved and no
+    // report, baseline, diagnostic or gate runs.
+    if outcome.interim {
+        let backend_reason = if gpu_explicit == Some(false) {
+            Some("--cpu/--no-gpu".to_string())
+        } else {
+            outcome
+                .backend_reason
+                .clone()
+                .or_else(|| gpu_probe.reason.clone())
+        };
+        let timing = PhaseTimings {
+            prep: (search_start - run_start).as_secs_f64(),
+            search: search_seconds,
+            baselines: 0.0,
+            diagnostics: 0.0,
+            report: 0.0,
+            total: run_start.elapsed().as_secs_f64(),
+            gpu: outcome
+                .gpu
+                .as_ref()
+                .map(|g| g.accounting.wall_s)
+                .unwrap_or(0.0),
+        };
+        if let (Some(path), Some(m)) = (&run_manifest_path, &mut manifest_state) {
+            if outcome.gpu.is_some() {
+                let (gpu, fallback, refits) = fit::gpu_fit_counts();
+                m.fit = Some((gpu, fallback, refits));
+            }
+            m.dispatch = Some(outcome.dispatch.clone());
+            m.interim = true;
+            let phases = [
+                ("data_prepare", data_prepare_secs),
+                ("search", timing.search),
+                ("total", timing.total),
+            ];
+            if let Err(e) = m.write(path, Some(&manifest::utc_now()), &phases) {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+        let checkpoint_json = format!(
+            "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{}}}",
+            resume_path.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
+            last_saved
+                .as_ref()
+                .map(|(_, p)| jstr(p))
+                .unwrap_or_else(|| "null".to_string()),
+            outcome.generations
+        );
+        let gpu = gpu_json(
+            &outcome.gpu,
+            f64::NAN,
+            f64::NAN,
+            cfg.fit_strategy.name(),
+            false,
+            timing.total,
+        );
+        match format {
+            Format::Json => {
+                let doc = format!(
+                    "{{\"tool\":\"rcsr\",\"version\":{},\"interim\":true,\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"threads\":{},\"seed\":{},\"stop_reason\":{},\"generations_run\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"checkpoint\":{}}}",
+                    jstr(VERSION),
+                    outcome.backend.name(),
+                    backend_reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
+                    outcome.device.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
+                    cfg.threads,
+                    cfg.seed,
+                    jstr(outcome.stop_reason),
+                    outcome.generations,
+                    jnum(elapsed),
+                    timing.json(),
+                    gpu,
+                    checkpoint_json
+                );
+                if let Some(path) = &json_out {
+                    if let Err(e) = rcsr::atomic::write_text_atomic(path, &doc) {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_INPUT);
+                    }
+                } else {
+                    println!("{}", doc);
+                }
+            }
+            Format::Ndjson => println!(
+                "{{\"event\":\"done\",\"interim\":true,\"generations_run\":{},\"stop_reason\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"checkpoint\":{}}}",
+                outcome.generations,
+                jstr(outcome.stop_reason),
+                jnum(elapsed),
+                timing.json(),
+                gpu,
+                checkpoint_json
+            ),
+            _ => {}
+        }
+        if !quiet {
+            eprintln!(
+                "# interim chunk: stopped on time_budget at generation {}, search state saved{}; no report was written",
+                outcome.generations,
+                last_saved
+                    .as_ref()
+                    .map(|(_, p)| format!(" to {}", p))
+                    .unwrap_or_default()
+            );
+        }
+        std::process::exit(EXIT_OK);
+    }
     let diagnostics_start = std::time::Instant::now();
 
     // #116: opt-in arm counts. This line is diagnostics only and never feeds
@@ -10835,7 +10976,12 @@ fn run_walkforward(args: &[String]) -> ! {
                  --threshold-quantile or --threshold-fixed",
             );
         }
-        let run = rcsr::run_json::RunFile::load(path).unwrap_or_else(|e| input_fail(&e));
+        let run = rcsr::run_json::RunFile::load(path).unwrap_or_else(|e| {
+            if e.contains(rcsr::run_json::INTERIM_REFUSAL) {
+                usage_fail(&e)
+            }
+            input_fail(&e)
+        });
         let book = run.book().unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
         expressions.push(book.expression.clone());
         popts.expression_source = Some(book.expression_source);
@@ -11549,6 +11695,13 @@ fn run_verify_manifest(args: &[String]) -> ! {
         eprintln!("error: verify-manifest needs a manifest path");
         std::process::exit(EXIT_USAGE);
     };
+    if std::fs::read_to_string(&path).map_or(false, |t| manifest::is_interim(&t)) {
+        eprintln!(
+            "error: manifest '{}' is from an interim chunk (--interim-chunk); only the manifest of the last chunk can be verified",
+            path
+        );
+        std::process::exit(EXIT_USAGE);
+    }
     match manifest::verify(&path, data.as_deref(), binary.as_deref()) {
         Ok(lines) => {
             for line in lines {
@@ -12366,7 +12519,7 @@ mod tests {
         g.ledger.record_fit_gate(0.375);
         let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true, 10.0);
         assert!(
-            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"admitted_wide\":0,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"refit_candidates\":0,\"refit_s\":0,\"rescore_s\":0,\"seconds\":0.25,\"kernel_lm_s\":0.5,\"kernel_polish_s\":0.25,\"polish\":\"f32\",\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"gate_s\":0.375,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096,\"fit_rows\":0,\"score_rows\":0,\"fit_twin_bytes\":0,\"subsample_hash\":null"),
+            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"admitted_wide\":0,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"refit_candidates\":0,\"refit_s\":0,\"rescore_s\":0,\"carried_kept\":0,\"seconds\":0.25,\"kernel_lm_s\":0.5,\"kernel_polish_s\":0.25,\"polish\":\"f32\",\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"gate_s\":0.375,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096,\"fit_rows\":0,\"score_rows\":0,\"fit_twin_bytes\":0,\"subsample_hash\":null"),
             "{}",
             json
         );

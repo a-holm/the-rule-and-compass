@@ -416,7 +416,7 @@ unless `--allow-backend-change` is explicit. See
 [`docs/checkpoint.md`](docs/checkpoint.md) for the versioned text format, the
 determinism guarantee and its limits.
 
-`--refit-band` (default `inf`) refits every finalist exactly after a device-fit search. `--refit-band 0.001` refits only the trees near the lowest error and is opt-in (#495: 6 of 26 paired runs reported a different front with `0.001`).
+`--refit-band` (default `inf`) refits every finalist exactly after a device-fit search. `--refit-band 0.001` refits only the trees near the lowest error and is opt-in (#495: 6 of 26 paired runs reported a different front with `0.001`). Under `--fitness pnl` a reported member may keep its carried constants when the refit changes its book (#850).
 
 `--run-manifest <path>` records the evidence needed to reproduce a long run:
 the commit recorded when the binary was built, the SHA-256 of the running binary, the CUDA toolkit it was built with (`binary.cuda_build`, `null` in a CPU build), the data file
@@ -442,7 +442,7 @@ atomically instead of streaming it. See
   (`start`, `progress`…, `solution`…, `done`) for long runs.
 * **Deterministic**: the same `--seed` gives the same answer, and the seed is
   echoed in the output.
-* **Bounded time**: `--time-budget <seconds>` guarantees the process returns.
+* **Bounded time**: `--time-budget <seconds>` guarantees the process returns. `--interim-chunk` skips the end-of-run report of a chunk that stops on it ([docs/checkpoint.md](docs/checkpoint.md#interim-chunks)).
 * **stdin**: `--data -` reads the table from standard input.
 * **Bounded memory**: `--max-memory 2GB` refuses an input whose estimated
   footprint would exceed the budget, with exit 3 and a fix, instead of being
@@ -656,7 +656,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--patience N]
      [--gpu] [--gpu-memory size] [--dispatch auto|device] [--calibration anchors|probe|PATH] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
      [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random]
-     [--time-budget seconds] [--save file] [--save-every N] [--resume file]
+     [--time-budget seconds] [--interim-chunk] [--save file] [--save-every N] [--resume file]
      [--allow-backend-change] [--allow-build-change] [--run-manifest file] [--json-out file]
      [--format text|json|ndjson] [--json] [--ndjson] [--progress]
      [--dev-log-level summary|full] [--dev-log file.ndjson] [--no-dev-log]
