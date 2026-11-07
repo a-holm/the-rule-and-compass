@@ -185,6 +185,7 @@ fn enrich_cpu_with_a_calibration_of_another_device_plans_with_cpu_rates_only() {
     }
 }
 
+#[cfg(feature = "cuda")]
 fn enrich_text(store: &str, dir: &Path, name: &str) -> Output {
     let target = s(&dir.join(name));
     rcsr(&["enrich", "--data", store, "--out", target.as_str(), "--features", "returns"], None)

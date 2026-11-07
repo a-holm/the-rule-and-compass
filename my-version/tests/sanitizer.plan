@@ -2,6 +2,7 @@
 # binary: a --test target name, lib (library unit tests) or bin-<name> (that binary's unit tests)
 # mode: run-bin (only with *: the cargo bin <binary> itself runs under memcheck; the rest of the line is its argument list) | skip (not run under memcheck) | api-errors-no (run alone with --report-api-errors no) | no-cuda (only with *: the binary runs and must make no CUDA call)
 #       | no-cuda-app-only (only with *: as no-cuda, run with --target-processes application-only; for a binary whose child processes make no CUDA call either)
+# app-only (only with *: the test process runs under memcheck with --target-processes application-only and gets the normal verdict; its children are not traced, the reason names what they do)
 # An api-errors-no test is still memchecked; only driver API error reporting is off, for that test only.
 gpu_memory_plan a_refused_device_allocation_is_reported_with_its_bytes api-errors-no  provokes a cudaMalloc out-of-memory on purpose
 gpu_ring        stale_cuda_error_does_not_fail_the_transport           api-errors-no  provokes a cudaMalloc out-of-memory on purpose
@@ -67,7 +68,9 @@ verksted_walk          *  no-cuda  CPU-only tests; no CUDA call
 no_banned_words        *  no-cuda-app-only  no CUDA call in the test process or its children (git, grep, bash: no /dev/nvidia open under strace -f); memcheck with --target-processes all crashes in the sanitizer (SIGSEGV)
 panel_spread           *  no-cuda-app-only  no CUDA call in the test process or its rcsr children (no /dev/nvidia open under strace -f); memcheck with --target-processes all crashes in the sanitizer (SIGSEGV)
 verksted_tools         *  no-cuda-app-only  no CUDA call in the test process or its children (bash scripts, git, grep: no /dev/nvidia open under strace -f); memcheck with --target-processes all crashes in the sanitizer (SIGSEGV)
-cpu_makes_no_device_call *  no-cuda-app-only  strace counts /dev/nvidia opens of rcsr --cpu commands, which are 0 by design; a ptrace tool under the sanitizer tree launcher is not traced
+cpu_makes_no_device_call *  app-only  the test process calls CUDA: default_run_opens_the_device_when_one_exists probes the device (rcsr::backend::probe) as the positive control, so memcheck attaches and gives a verdict; the explicit CPU commands open no /dev/nvidia (strace -f). The children run under strace, which memcheck cannot trace under the default all, so with application-only the one default-dispatch rcsr child of the control run is not sanitized
+dispatch_reproducible  *  app-only  the test process probes the device (rcsr::gpu::probe); memcheck with the default --target-processes all crashed in the compute-sanitizer executable itself (SIGSEGV, core dump of compute-sanitizer) on this process tree, so the rcsr children are not traced; the one child that uses the device in this run, the small device search of two_auto_runs_give_one_front_and_one_route_ledger, is not sanitized here; device searches run in-process under memcheck in gpu_fit
+dispatch_reproducible  a_calibrated_file_gives_equal_fronts_and_its_own_hash  skip  its rcsr calibrate --gpu children hang under --target-processes application-only (run hit the 580 s cap); the same device probe runs under memcheck on the rcsr run-bin line
 final_seal             *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes all crashed in the sanitizer (rc 139)
 launchers              *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes all crashed or hung (rc 139, rc 124)
 numeric_flags_cli      *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes all crashed in the sanitizer (rc 139)
@@ -109,6 +112,11 @@ xs_rank                *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=
 walkforward_locked     *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 rcsr_command_lint      *  no-cuda  text lint of tests/*.rs; no CUDA call
 cpu_config_lint        *  no-cuda  text lint of tests/*.rs; no CUDA call
+device_launches        *  no-cuda-app-only  report-struct tests plus one rcsr child with RCSR_GPU=0 and --cpu; no CUDA call in the test process or its child (no /dev/nvidia open under strace -f)
+device_skip_lint       *  no-cuda  text lint of tests/*.rs and src/*.rs; no CUDA call (no /dev/nvidia open under strace -f)
+require_device         *  no-cuda-app-only  tests skip_without_device in child processes of the test binary; no CUDA call in the test process or its children (no /dev/nvidia open under strace -f)
+stdin_write_lint       *  no-cuda-app-only  text lint plus an sh child that exits early; no CUDA call in the test process or its child (no /dev/nvidia open under strace -f)
+window_stats           *  no-cuda  CPU enrich with GpuMode::Off; no CUDA call in the two tests or the three ignored ones (no /dev/nvidia open under strace -f)
 complexity             *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs) and every search config states gpu: false, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 dtypes                 *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs) and every search config states gpu: false, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 fit_samples            *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs) and every search config states gpu: false, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
@@ -129,3 +137,4 @@ recover                *  no-cuda  every search config states gpu: false, so no 
 stability              *  no-cuda  every search config states gpu: false, so no CUDA call (no /dev/nvidia open under strace -f)
 # run-bin: the release binary runs with these arguments under memcheck (smallest run: 64 candidates, one rep, depth 3)
 rcsr-gpu-bench      *  run-bin  --batch 64 --reps 1 --depth 3
+rcsr                *  run-bin  calibrate --gpu --out target/sanitizer-calibration.json

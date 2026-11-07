@@ -233,6 +233,28 @@ printf 'gpu_fit some_test no-cuda-app-only reason\n' > "$T/plan-bad"
 PLAN=$T/plan-bad run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check app-named-rc "$r" "2"
 
+# app-only: normal verdict, sanitizer runs with --target-processes application-only, not listed as no-cuda
+cp "$T/plan" "$T/plan-ao"
+echo 'gpu_fit * app-only the test process calls CUDA; its children are not traced' >> "$T/plan-ao"
+PLAN=$T/plan-ao run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check ao-rc "$r" "0"
+has ao-line "$sum" '^gpu_fit rc=0 xid=4->4 secs=[0-9]+ \| test result: ok\. [0-9]+ passed.*ERROR SUMMARY: 0 errors$'
+hasnt ao-not-listed "$sum" 'listed no-cuda but called CUDA$'
+has ao-flag "$T/san-calls" 'memcheck --target-processes application-only --leak-check no --error-exitcode 99 /fake/deps/gpu_fit-fff$'
+hasnt ao-flag-other-bins "$T/san-calls" 'target-processes.*(gpu_big|rcsr-aaa|gpu_memory_plan)'
+PLAN=$T/plan-ao FAKE_FAIL_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check ao-errors-rc "$r" "1"
+has ao-errors-line "$sum" '^gpu_fit rc=99 .*ERROR SUMMARY: 2 errors$'
+PLAN=$T/plan-ao FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check ao-nocuda-rc "$r" "1"
+has ao-nocuda-line "$sum" '^gpu_fit unexpected no CUDA call'
+PLAN=$T/plan-ao FAKE_NC_MODE=noattach FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check ao-noattach-rc "$r" "1"
+printf 'gpu_fit some_test app-only reason\n' > "$T/plan-bad"
+PLAN=$T/plan-bad run "$T/wt" 9 > "$T/out" 2>&1; r=$?
+check ao-named-rc "$r" "2"
+has ao-named-msg "$T/out" "app-only needs '\*'"
+
 # application-only: a target that never calls CUDA can end with the launch timeout message; that counts only for no-cuda-app-only
 PLAN=$T/plan-app FAKE_NC_MODE=noattach FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check noattach-app-rc "$r" "0"
