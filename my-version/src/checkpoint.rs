@@ -1282,9 +1282,10 @@ impl Checkpoint {
         Ok(())
     }
 
-    /// Refuse a resume under a different binary, commit, version, device,
-    /// driver or thread count unless the caller explicitly allows it (#256).
-    /// A checkpoint written before the identity was recorded cannot be checked.
+    /// Refuse a resume under a different binary, commit, version, device or
+    /// driver unless the caller explicitly allows it (#256). A different CPU
+    /// count is reported by the caller and never refused (#860). A checkpoint
+    /// written before the identity was recorded cannot be checked.
     pub fn check_identity(
         &self,
         current: &BuildIdentity,
@@ -1293,14 +1294,13 @@ impl Checkpoint {
         let Some(saved) = &self.identity else {
             return Ok(());
         };
-        let diff = saved.differences(current);
+        let diff = saved.refusing_differences(current);
         if diff.is_empty() || allow_change {
             return Ok(());
         }
         Err(format!(
             "checkpoint build identity mismatch ({}); pass --allow-build-change to \
-             resume under a different binary, device or thread count (the trajectory \
-             may differ)",
+             resume under a different binary or device (the trajectory may differ)",
             diff.join("; ")
         ))
     }

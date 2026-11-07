@@ -144,8 +144,9 @@ run (the "10-hour run"):
    ends (a `time_budget` stop is not terminal, and `--time-budget` may be set
    again); the log is truncated per run, so a resumed run gets its own file.
    The checkpoint records the build identity; `--resume` refuses a different
-   binary, commit, device, driver or thread count unless `--allow-build-change`
-   is given. A run with a target spec also records the spec sha256;
+   binary, commit, device or driver unless `--allow-build-change` is given.
+   A different CPU count is not refused: stderr prints a `# checkpoint:` notice.
+   A run with a target spec also records the spec sha256;
    `--resume` with a different spec (or with none, or onto a checkpoint
    written without one) is refused with exit 2 and a message naming both
    hashes, before the data fingerprint is compared.
