@@ -22,7 +22,11 @@ use rcsr::rng::Mt;
 
 #[cfg(feature = "cuda")]
 fn device_available() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 /// A deterministic two-variable sample, column-major for the kernel.
@@ -69,7 +73,7 @@ fn repeat(prog: &[u32], offsets: &[u32], nprog: usize) -> (Vec<u32>, Vec<u32>) {
 #[test]
 fn steady_state_allocates_nothing_and_keeps_the_pinned_ring_bounded() {
     if !device_available() {
-        eprintln!("skip: no CUDA device");
+        rcsr::backend::skip_without_device("skip: no CUDA device");
         return;
     }
     let (cols, y) = sample(2_048);
@@ -119,7 +123,7 @@ fn steady_state_allocates_nothing_and_keeps_the_pinned_ring_bounded() {
 #[test]
 fn async_and_synchronous_paths_are_numerically_identical() {
     if !device_available() {
-        eprintln!("skip: no CUDA device");
+        rcsr::backend::skip_without_device("skip: no CUDA device");
         return;
     }
     let (cols, y) = sample(4_096);
@@ -159,7 +163,7 @@ fn async_and_synchronous_paths_are_numerically_identical() {
 #[test]
 fn upload_is_enqueued_behind_an_outstanding_kernel_and_results_match() {
     if !device_available() {
-        eprintln!("skip: no CUDA device");
+        rcsr::backend::skip_without_device("skip: no CUDA device");
         return;
     }
     let n = 4_096;
@@ -215,7 +219,7 @@ fn upload_is_enqueued_behind_an_outstanding_kernel_and_results_match() {
 #[test]
 fn pipelined_uploads_count_on_the_forced_synchronous_path() {
     if !device_available() {
-        eprintln!("skip: no CUDA device");
+        rcsr::backend::skip_without_device("skip: no CUDA device");
         return;
     }
     let n = 4_096;

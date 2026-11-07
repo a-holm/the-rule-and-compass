@@ -1,6 +1,9 @@
 //! #259: the default hourly point-in-time panel (v2): snapshot, base,
 //! build and validate on small synthetic archives.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::manifest;
 use rcsr::panel_v2::{
     self, BaseOptions, PanelOptions, ValidateOptions, FLAG_DUPLICATE_CONFLICT, FLAG_PARTIAL_BUCKET,
@@ -531,7 +534,7 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 fn audit(base: &Path, extra: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(["panel", "audit", "--data", base.to_str().unwrap(), "--bar-seconds", "3600"])
         .args(["--lookback", "3", "--min-history", "0", "--min-bars", "1", "--rebalance", "5", "--strict"])
         .args(extra)
@@ -984,7 +987,7 @@ fn locked_test_declaration_travels_with_the_store() {
     assert!(registry_verify(panel_s));
 
     // `rcsr panel schema` regenerates the schema and keeps the declaration
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args(["panel", "schema", "--data", panel_s])
         .output()
         .unwrap();
@@ -994,7 +997,7 @@ fn locked_test_declaration_travels_with_the_store() {
     // enrich on an undeclared base declares the protocol default next to a flag range that does not overlap it
     let fam = dir.join("fam.rcsb");
     let range = format!("{},{}", lb.start, lb.end);
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args(["enrich", "--data", base_s, "--out", fam.to_str().unwrap(), "--features", "r1", "--locked-test", &range])
         .output()
         .unwrap();
@@ -1010,7 +1013,7 @@ fn locked_test_declaration_travels_with_the_store() {
     // enrich copies the declaration of its input
     let fam2 = dir.join("fam2.rcsb");
     std::fs::write(format!("{base_s}.lockbox.json"), format!("{{\"locked_test\":{}}}", lb.declaration_json("t"))).unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let out = rcsr_cmd::rcsr()
         .args(["enrich", "--data", base_s, "--out", fam2.to_str().unwrap(), "--features", "r1"])
         .output()
         .unwrap();
@@ -1039,7 +1042,7 @@ fn registry_verify(store: &str) -> bool {
 }
 
 fn rcsr(args: &[&str]) -> (i32, String) {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().unwrap();
+    let out = rcsr_cmd::rcsr().args(args).output().unwrap();
     (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).to_string())
 }
 

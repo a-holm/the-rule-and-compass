@@ -2,13 +2,15 @@
 //! present, every rung shares rows, folds and costs, and the equal-cost and
 //! multiple-testing outputs are filled.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::ladder::{self, Fold, Options, Panel, Report};
 use rcsr::protocol::{self, WindowRow};
 use rcsr::rng::Mt;
 use rcsr::target;
 use rcsr::walkforward::Window;
 use std::path::PathBuf;
-use std::process::Command;
 
 const T0: f64 = 1_640_995_200.0;
 const STEP: f64 = 3600.0;
@@ -352,7 +354,7 @@ fn one_command_reproduces_the_table() {
     let out = dir.join("ladder.json");
     let md = dir.join("ladder.md");
     let run_cli = || {
-        Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        rcsr_cmd::rcsr()
             .args([
                 "ladder", "--data", data.to_str().unwrap(), "--target", "y", "--return-col", "ret", "--time", "ts",
                 "--group", "sym", "--features", "signal,vol,n1,n2,lag", "--windows", windows.to_str().unwrap(),
@@ -376,7 +378,7 @@ fn one_command_reproduces_the_table() {
 
     let overlap = dir.join("spec_overlap.json");
     std::fs::write(&overlap, spec_text.replace("\"horizon_seconds\":3600", "\"horizon_seconds\":10800")).unwrap();
-    let refused = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let refused = rcsr_cmd::rcsr()
         .args([
             "ladder", "--data", data.to_str().unwrap(), "--target", "y", "--return-col", "ret", "--time", "ts",
             "--group", "sym", "--features", "signal,vol,n1,n2,lag", "--windows", windows.to_str().unwrap(),
@@ -388,7 +390,7 @@ fn one_command_reproduces_the_table() {
     let err = String::from_utf8_lossy(&refused.stderr);
     assert!(err.contains("overlapping returns") && err.contains("10800-second label horizon"), "{err}");
 
-    let missing = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(["ladder", "--data", "x.csv"]).output().unwrap();
+    let missing = rcsr_cmd::rcsr().args(["ladder", "--data", "x.csv"]).output().unwrap();
     assert_eq!(missing.status.code(), Some(2));
 }
 

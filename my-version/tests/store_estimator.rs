@@ -5,10 +5,12 @@
 //! pin the replacement: resident dtypes, dictionaries, row groups, the
 //! used-column projection and the explicit full-load/sample decision.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{self, Table};
 use rcsr::memory::{EstimateOptions, StoreShape};
 use rcsr::store::{self, FileStore, MAGIC};
-use std::process::Command;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -355,7 +357,7 @@ fn a_store_that_fits_loads_the_full_rows_not_a_sample() {
     // `--cpu` pins the guard's model to the same options the estimate above
     // uses: a CUDA build defaults to the GPU backend, which legitimately adds
     // the f32 staging copy and would need a larger budget.
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let output = rcsr_cmd::rcsr()
         .args([
             "--data",
             path.to_str().unwrap(),
@@ -389,7 +391,7 @@ fn a_store_that_fits_loads_the_full_rows_not_a_sample() {
 fn an_over_budget_store_is_refused_never_silently_sampled() {
     let (_scratch, dir) = temp_dir("refuse");
     let path = small_store(&dir);
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let output = rcsr_cmd::rcsr()
         .args([
             "--data",
             path.to_str().unwrap(),
@@ -425,7 +427,7 @@ fn the_real_panel_store_loads_full_under_a_12gb_budget() {
         Ok(p) => p,
         Err(_) => return,
     };
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let output = rcsr_cmd::rcsr()
         .args([
             "--data",
             &path,
@@ -466,7 +468,7 @@ fn a_sample_request_covering_every_row_cannot_bypass_the_budget() {
     // quieter way to ignore `--max-memory`.
     let (_scratch, dir) = temp_dir("sample-full");
     let path = small_store(&dir);
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let output = rcsr_cmd::rcsr()
         .args([
             "--data",
             path.to_str().unwrap(),
@@ -492,7 +494,7 @@ fn a_sample_request_covering_every_row_cannot_bypass_the_budget() {
     assert!(stderr.contains("--force"), "{stderr}");
     assert!(String::from_utf8_lossy(&output.stdout).is_empty());
     // A real sample that is still over budget is refused too.
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let output = rcsr_cmd::rcsr()
         .args([
             "--data",
             path.to_str().unwrap(),
@@ -521,7 +523,7 @@ fn a_sample_request_covering_every_row_cannot_bypass_the_budget() {
 fn force_and_sample_rows_are_rejected_as_contradictory() {
     let (_scratch, dir) = temp_dir("force-sample");
     let path = small_store(&dir);
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let output = rcsr_cmd::rcsr()
         .args([
             "--data",
             path.to_str().unwrap(),
@@ -551,7 +553,7 @@ fn explicit_sampling_is_recorded_as_full_rows_false() {
     let path = small_store(&dir);
     let manifest = dir.join("run.manifest.json");
     let dev_log = dir.join("run.dev.ndjson");
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let output = rcsr_cmd::rcsr()
         .args([
             "--data",
             path.to_str().unwrap(),

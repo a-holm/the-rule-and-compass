@@ -6,13 +6,15 @@
 //! indicators named `column=value`, with sorted levels so the encoding does not
 //! depend on row order.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{self, DType, FillMethod, PrepSpec, SplitMode, SplitSpec};
 use rcsr::expr::{self, Op};
 use rcsr::metrics::Metric;
 use rcsr::rng::Mt;
 use rcsr::search::{run, Config};
-use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 fn temporal() -> SplitSpec {
     SplitSpec {
@@ -24,19 +26,14 @@ fn temporal() -> SplitSpec {
 }
 
 fn run_cli(args: &[&str], stdin: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let mut child = rcsr_cmd::rcsr()
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    rcsr_cmd::feed_stdin(&mut child, stdin.as_bytes());
     child.wait_with_output().unwrap()
 }
 
@@ -375,7 +372,7 @@ fn recovers_x1_and_not_x2() {
     .unwrap();
     assert!(p.train.x.iter().all(|r| r.iter().all(|v| *v == 0.0 || *v == 1.0)));
 
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
     cfg.generations = 80;
     cfg.pop = 300;
     cfg.islands = 2;

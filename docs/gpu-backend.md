@@ -605,6 +605,7 @@ Fallback and the flags:
   hatch: it is silent and yields the byte-identical CPU trajectory.
 * `RCSR_GPU=0` makes a CUDA build behave as if no device were present, which is
   how the fallback test runs on a machine that has one.
+  Tests build their `rcsr` and `rcsr-bench` children through `my-version/tests/common/rcsr.rs`: `rcsr()` sets `RCSR_GPU=0`, so the child makes no CUDA call, and `rcsr_on_device()` keeps the environment for a test whose purpose is the device (`rcsr_for(args)` picks by the device flags `--gpu`, `--dispatch`, `--batch-pnl`, `--device-pnl`, `--gpu-memory`). `tests/rcsr_command_lint.rs` fails on any other use of `CARGO_BIN_EXE_rcsr` or `CARGO_BIN_EXE_rcsr-bench` in `tests/`.
 * Any CUDA error during a batch prints the same `# gpu: unavailable (...)`
   note, re-scores the pending generation on the CPU and disables the GPU for the
   rest of the run. There is no panic and no stale result.
@@ -814,19 +815,20 @@ The probe runs once, before the dataset is uploaded, and the effective backend
 is recorded from what ran rather than inferred from the flags. An explicit
 `--cpu`/`--no-gpu` skips the probe (`search` and `enrich`): the run makes no CUDA
 call, opens no `/dev/nvidia*` and reports the CPU as requested, with no device
-name. `RCSR_GPU=0` skips the CUDA call as well. Non-quiet runs
+name. `RCSR_GPU=0` skips the CUDA call as well. A run that skips the probe says so: it never reports "no device", because it did not look. Non-quiet runs
 print one line:
 
 ```
 # resource: backend=gpu device="NVIDIA GeForce RTX 3060 (sm_86, 28 SMs, 12288 MB)" threads=8 rows=2048 cols=3
 # resource: backend=cpu device=- threads=8 rows=2048 cols=3 (no CUDA device found)
+# resource: backend=cpu device=not probed threads=8 rows=2048 cols=3 (--cpu/--no-gpu)
 ```
 
 `rows`/`cols` are the training table. `threads` is the machine's available
 parallelism; the current search loop uses one thread per island, and a
 `--threads` control and the #132 baseline cap are separate workstreams.
 
-`--json` carries `"backend": "gpu"|"cpu"`, `"device": <name>|null` and
+`--json` carries `"backend": "gpu"|"cpu"`, `"device": <name>|null`, `"device_probed": true|false` (false under `--cpu`: `device` null then means unknown) and
 `"backend_reason": <why the CPU ran>|null`; NDJSON emits one
 `{"event":"backend",...}` object before the results. The run manifest from
 #140 will carry the same fields when it lands; until then JSON is the record.
@@ -3397,6 +3399,8 @@ GPU test helpers that must force the device set `DispatchMode::Device`. When `au
 reports `backend_reason` `dispatch: cost model kept every stage on the cpu`.
 
 The memcheck pass is defined by `my-version/tests/sanitizer.plan` and run by `verksted/_tools/sanitize-all.sh`. Each line names a binary and a test (or `*`), a mode and a reason. `skip` runs nothing. `run-bin` (only with `*`) names a cargo bin instead of a test target: the release binary itself runs under memcheck with the rest of the line as its arguments, in its own lock hold (`rcsr-gpu-bench * run-bin --batch 64 --reps 1 --depth 3`; `--only rcsr-gpu-bench` runs just that line). The bin's unit-test executable keeps a `skip` line. `no-cuda-app-only` (only with `*`) is `no-cuda` run with `--target-processes application-only`, for a binary whose child processes also make no CUDA call and on which the default `all` crashes the sanitizer; the launch-timeout message `No attachable process found` also counts as no CUDA call there. `no-cuda` (only with `*`) lists a binary that makes no CUDA call by design: it still runs, and rc 255 with `terminated before first instrumented API call` and passing tests is a pass only for a listed binary; an unlisted binary with that outcome fails the pass, and a listed binary that does call CUDA gets the normal verdict with a `listed no-cuda but called CUDA` mark. `api-errors-no` runs that one test alone with `--report-api-errors no`, because it provokes a `cudaMalloc` out-of-memory on purpose and the default reports that call as an error. The runner exports `RCSR_UNDER_SANITIZER=memcheck`; a test reads it through `tests/common/sanitizer.rs` (`active()`, `pick(native, sanitized)`) to pick a smaller fixture that still crosses every chunk, tile and gap boundary. Every run is capped at 580 s; a run that hits the cap fails as `budget`. `tests/sanitizer_plan.rs` fails when the plan names a binary or test that does not exist.
+
+A device test that finds no usable device calls `rcsr::backend::skip_without_device(reason)` and returns. The call prints `reason` and lets the test skip, or panics when `RCSR_REQUIRE_DEVICE=1`, so a gate on a machine whose device went missing fails instead of passing. `verksted/_tools/gate.sh`, `sanitize.sh` and `sanitize-all.sh` set it for every CUDA suite and memcheck run. `RCSR_GPU=0` in the environment of a test process hides the device and fails a required test with that message. Children that tests start with `RCSR_GPU=0` do not call the helper, so the two switches do not meet. `tests/device_skip_lint.rs` refuses a bare `eprintln!("skip...device")` in `tests/` and `src/`, and `tests/require_device.rs` runs the helper in a child process of the test binary to prove the panic without touching the environment of parallel tests.
 
 See [`dispatch.md`](dispatch.md) for the formulas, JSON shape and the tests.
 

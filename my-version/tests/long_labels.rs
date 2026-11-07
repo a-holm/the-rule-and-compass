@@ -1,5 +1,8 @@
 //! Long-only horizon, action and triple-barrier labels on small synthetic bars.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{self, SplitMode, SplitSpec};
 use rcsr::features::LabelSpec;
 use rcsr::labels::{
@@ -223,13 +226,12 @@ fn short_is_refused_everywhere() {
     assert!(e.contains("long-only"), "{e}");
     assert!(LabelSpec::parse("fwd:1h,side=long", Timeframe::H1).is_ok());
 
-    let bin = env!("CARGO_BIN_EXE_rcsr");
     for flag in [["enrich", "--allow-short"], ["prep", "--allow-short"]] {
-        let out = std::process::Command::new(bin).args(flag).output().unwrap();
+        let out = rcsr_cmd::rcsr().args(flag).output().unwrap();
         assert!(!out.status.success(), "{flag:?}");
         assert!(String::from_utf8_lossy(&out.stderr).contains("long-only"), "{flag:?}");
     }
-    let out = std::process::Command::new(bin)
+    let out = rcsr_cmd::rcsr()
         .args(["enrich", "--side", "short"])
         .output()
         .unwrap();

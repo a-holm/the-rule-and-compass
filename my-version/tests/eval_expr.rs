@@ -1,7 +1,10 @@
 //! `--eval-expr` output contract (#254): one test block, `--json-out`.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::devlog::Json;
-use std::process::{Command, Output};
+use std::process::Output;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -12,7 +15,7 @@ fn sine() -> String {
 }
 
 fn rcsr(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")

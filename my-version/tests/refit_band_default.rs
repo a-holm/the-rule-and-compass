@@ -1,10 +1,12 @@
 //! #495: `--refit-band` defaults to `inf`; `0.001` stays an accepted opt-in value.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::search::Config;
-use std::process::Command;
 
 fn rcsr(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().expect("run rcsr")
+    rcsr_cmd::rcsr().args(args).output().expect("run rcsr")
 }
 
 #[test]

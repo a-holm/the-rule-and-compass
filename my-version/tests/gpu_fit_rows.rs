@@ -56,7 +56,11 @@ fn config(seed: u32, fit_rows: usize) -> Config {
 
 #[cfg(feature = "cuda")]
 fn device_available() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 #[cfg(feature = "cuda")]
@@ -99,7 +103,7 @@ fn cpu_fit_rows_full(train: &Sample) -> Config {
 #[test]
 fn a_fit_subsample_defers_fits_to_the_device_and_scores_all_rows() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(ROWS, 5, false);
@@ -131,7 +135,7 @@ fn a_fit_subsample_defers_fits_to_the_device_and_scores_all_rows() {
 #[test]
 fn the_fit_twin_is_charged_at_the_subsample_rows_with_weights() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(ROWS, 5, true);
@@ -149,7 +153,7 @@ fn the_fit_twin_is_charged_at_the_subsample_rows_with_weights() {
 #[test]
 fn a_fit_subsample_run_is_deterministic_and_reports_exact_cpu_errors() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = sample(ROWS, 7, false);
@@ -210,7 +214,7 @@ fn the_manifest_records_fit_rows_and_the_subsample_hash() {
 #[test]
 fn fit_rows_default_resolves_on_the_gpu_fit_path_only() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let big = sample(search::DEFAULT_FIT_ROWS_ABOVE + 1, 5, false);

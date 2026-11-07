@@ -3,13 +3,16 @@
 //! A report field must say what it measures, a checkpoint must describe the
 //! result it belongs to, and a time-budget stop must be resumable.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::checkpoint::{Checkpoint, ErrorKind};
 use rcsr::data::Sample;
 use rcsr::manifest;
 use rcsr::provenance::{self, BuildIdentity};
 use rcsr::search::{self, Config, Outcome};
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::{Arc, Mutex};
 
 fn sample(n: usize) -> Sample {
@@ -248,9 +251,12 @@ fn the_checkpoint_binds_the_build_identity() {
     other.threads += 1;
     let err = cp.check_identity(&other, false).unwrap_err();
     assert!(err.contains("binary_sha256"), "{}", err);
-    assert!(err.contains("threads"), "{}", err);
+    assert!(!err.contains("threads"), "a CPU count never refuses: {}", err);
     assert!(err.contains("--allow-build-change"), "{}", err);
     assert!(cp.check_identity(&other, true).is_ok());
+    let mut threads_only = id.clone();
+    threads_only.threads += 1;
+    assert!(cp.check_identity(&threads_only, false).is_ok());
 }
 
 #[test]
@@ -282,7 +288,7 @@ fn a_checkpoint_without_identity_still_loads() {
 // ---------------------------------------------------------------------------
 
 fn rcsr(args: &[&str], envs: &[(&str, &str)], dir: &std::path::Path) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rcsr"));
+    let mut cmd = rcsr_cmd::rcsr();
     cmd.args(args).current_dir(dir);
     for (k, v) in envs {
         cmd.env(k, v);
