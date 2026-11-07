@@ -6518,16 +6518,6 @@ fn main() {
                             let book = validation_book_member_json(value, &stats, rcsr::trading::is_constant(&s.tree), fixed);
                             (value, book)
                         }
-OLD
-s/\Q$o\E/$n/ or die "b";
-$o = <<'OLD';
-                constant: rcsr::trading::is_constant(tree),
-                candidates: rows.len(),
-OLD
-$n = <<'NEW';
-                constant: rcsr::trading::is_constant(tree),
-                fixed_position: rcsr::trading::fixed_position(tree, tspec),
-                candidates: rows.len(),
                         Err(_) => (f64::INFINITY, NO_VALIDATION_BOOK.to_string()),
                     }
                 }
@@ -6717,6 +6707,7 @@ $n = <<'NEW';
                 horizon_seconds: target_horizon,
                 cost: trading_cost.clone().unwrap_or_else(|| target::CostDecl::new(None, tspec.per_side_bps(), target::CostSource::Flag)),
                 constant: rcsr::trading::is_constant(tree),
+                fixed_position: rcsr::trading::fixed_position(tree, tspec),
                 candidates: rows.len(),
                 usable,
                 expression: top.expression.clone(),
