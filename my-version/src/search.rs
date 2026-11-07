@@ -4929,6 +4929,18 @@ fn keep_carried(front: Archive, carried: Vec<Sol>) -> (Archive, usize) {
     (front, kept)
 }
 
+/// #848: the members the admission filter kept, or, when it kept none, the
+/// fixed-position candidates it skipped (flagged), so a run never ends with an
+/// empty front because of the filter.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn survivors_or_fixed(kept: Vec<Sol>, skipped: Vec<Sol>) -> (Vec<Sol>, bool) {
+    if kept.is_empty() && !skipped.is_empty() {
+        (skipped, true)
+    } else {
+        (kept, false)
+    }
+}
+
 /// #495: indices of the trees worth an exact refit. `pre` are the pre-refit
 /// full-data errors and `costs` the complexity costs. A tree qualifies when its
 /// error is within `band` (relative) of the lowest finite error among trees of
@@ -6786,6 +6798,8 @@ fn run_postfix_search(
     device: Option<String>,
     dispatcher: &mut crate::dispatch::Dispatcher,
 ) -> Result<Outcome, String> {
+    // #848: fixed-position candidates the admission filter skipped; the front falls back to them when it would be empty.
+    let mut fixed_shadow = Archive::new(archive.cap);
     let pop = cfg.pop;
     let n_islands = cfg.islands.max(1);
     let trees: Vec<Vec<crate::expr::Node>> = islands
@@ -6892,7 +6906,8 @@ fn run_postfix_search(
                 }
                 let Some(tree) = next.decode(idx) else { continue };
                 if filter_fixed_archive && fixed_position_archived(&tree, cfg) {
-                    continue; // #848
+                    fixed_shadow.try_insert_view(&tree, error, expr::complexity(&tree), cost); // #848
+                    continue;
                 }
                 archive.try_insert_view(&tree, error, expr::complexity(&tree), cost);
             }
@@ -7192,10 +7207,12 @@ fn run_postfix_search(
     // Exact f64 rebuild over the surviving front only. The generation errors
     // were the f32 kernel proxy; every number the user reads comes from here.
     let mut final_archive = Archive::new(archive.cap);
+    let (survivors, fixed_position_fallback) =
+        survivors_or_fixed(std::mem::take(&mut archive.items), std::mem::take(&mut fixed_shadow.items));
     if interim {
-        final_archive.items = std::mem::take(&mut archive.items);
+        final_archive.items = survivors;
     } else {
-        for sol in std::mem::take(&mut archive.items) {
+        for sol in survivors {
             let tree = expr::simplify(&sol.tree);
             let error = if cfg.accepts_dimensions(&tree) {
                 score_tree(&tree, train_data, cfg)
@@ -7290,7 +7307,7 @@ fn run_postfix_search(
         stop_reason,
         prune: prune_report,
         candidates_evaluated: candidates,
-        fixed_position_fallback: false,
+        fixed_position_fallback,
         interim,
     })
 }
@@ -7835,7 +7852,9 @@ fn run_search(
                 if fixed_position_filter(cfg, nvars) {
                     // #848: redraw a tree whose position cannot depend on the inputs.
                     for _ in 0..8 {
-                        if !fixed_position_rejected(&tree, cfg) {
+                        if !fixed_position_rejected(&tree, cfg)
+                            && !fixed_position_rejected(&expr::simplify(&tree), cfg)
+                        {
                             break;
                         }
                         tree = random_tree_with(&mut rng, nvars, &cfg.ops, depth, Some(&aggs));
@@ -11129,6 +11148,22 @@ mod tests {
         let (front, report) = rebuild(true, &[fixed]);
         assert!(report.fixed_position_fallback);
         assert_eq!(front.items.len(), 1);
+    }
+
+    /// #848: an admission filter that leaves nothing gives the skipped fixed
+    /// candidates back, flagged, instead of an empty front.
+    #[test]
+    fn an_empty_filtered_front_falls_back_to_the_skipped_candidates() {
+        let sol = |k: f64| Sol { tree: constant(k), error: k, complexity: 1, cost: 1.0 };
+        let (front, fallback) = survivors_or_fixed(Vec::new(), vec![sol(0.5)]);
+        assert!(fallback);
+        assert_eq!(front.len(), 1);
+        let (front, fallback) = survivors_or_fixed(vec![sol(0.25)], vec![sol(0.5)]);
+        assert!(!fallback);
+        assert_eq!(front.len(), 1);
+        assert_eq!(front[0].error, 0.25);
+        let (front, fallback) = survivors_or_fixed(Vec::new(), Vec::new());
+        assert!(!fallback && front.is_empty());
     }
 
     /// #848: the filter is a saved search setting and off by default.
