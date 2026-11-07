@@ -12301,7 +12301,7 @@ mod tests {
     #[test]
     fn narrow_admission_checks_before_promotion() {
         if !crate::gpu::probe().available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let (g, _, _, changed) = overflow_island_after_score(crate::fit::FitAdmission::Screened, with_constant());
@@ -12315,7 +12315,7 @@ mod tests {
     #[test]
     fn wide_admission_overlaps_the_check_and_keeps_the_scores() {
         if !crate::gpu::probe().available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let (g, islands, _, changed) = overflow_island_after_score(crate::fit::FitAdmission::All, bare());
