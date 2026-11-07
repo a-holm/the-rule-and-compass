@@ -181,7 +181,6 @@ fn selection_is_deterministic() {
 
 #[test]
 fn a_bad_selection_expression_is_a_usage_error() {
-    use std::io::Write;
     use std::process::Stdio;
     let mut child = rcsr_cmd::rcsr()
         .args([
@@ -197,10 +196,7 @@ fn a_bad_selection_expression_is_a_usage_error() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(b"x,y\n1,2\n2,3\n4,5\n").unwrap();
-    }
+    rcsr_cmd::feed_stdin(&mut child, b"x,y\n1,2\n2,3\n4,5\n");
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);

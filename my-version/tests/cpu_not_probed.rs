@@ -3,8 +3,10 @@
 //! CPU-only plan reads CPU rates only.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
 #[path = "common/scratch.rs"]
 mod scratch;
 use scratch::Scratch;
@@ -13,7 +15,8 @@ const T0: i64 = 1_704_067_200;
 const H: i64 = 3600;
 
 fn rcsr(args: &[&str], gpu_env: Option<&str>) -> Output {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_rcsr"));
+    // Each call states its own `RCSR_GPU`: unset means the live default.
+    let mut c = rcsr_cmd::rcsr_on_device();
     c.args(args);
     match gpu_env {
         Some(v) => c.env("RCSR_GPU", v),
@@ -73,7 +76,7 @@ fn enrich_cpu_says_not_probed_and_a_probed_run_says_what_it_found() {
     let j = String::from_utf8_lossy(&o.stdout).to_string();
     assert!(j.contains("\"gpu_probed\":false,\"gpu_available\":null"), "{j}");
 
-    let o = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let o = rcsr_cmd::rcsr_on_device()
         .args(["enrich", "--data", &st, "--out", &s(&dir.join("d.rcsb")), "--features", "returns", "--cpu"])
         .env_remove("RCSR_GPU")
         .output()
@@ -88,6 +91,41 @@ fn enrich_cpu_says_not_probed_and_a_probed_run_says_what_it_found() {
     assert!(o.status.success(), "{}", out(&o));
     let j = String::from_utf8_lossy(&o.stdout).to_string();
     assert!(j.contains("\"gpu_probed\":true,\"gpu_available\":false,\"gpu_device\":null"), "{j}");
+}
+
+/// A default run on a machine with a device: the probe ran and found it. Skips through the
+/// shared helper, so `RCSR_REQUIRE_DEVICE=1` fails it on a machine without one.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_live_device_default_run_is_probed_and_names_the_device() {
+    if !rcsr::backend::probe().available() {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+        return;
+    }
+    let scratch = Scratch::new("cpu-not-probed-live");
+    let dir = scratch.path();
+    let st = store(dir);
+    let o = enrich(&st, dir, "live.rcsb", &[], None);
+    assert!(o.status.success(), "{}", out(&o));
+    let j = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(j.contains("\"gpu_probed\":true,\"gpu_available\":true,\"gpu_device\":\""), "{j}");
+    assert!(!j.contains("\"gpu_device\":null"), "{j}");
+    let text = out(&enrich_text(&st, dir, "live-text.rcsb"));
+    assert!(text.contains("gpu_available=true"), "{text}");
+    assert!(!text.contains("not probed"), "{text}");
+
+    let mut csv = String::from("x,y\n");
+    for i in 0..60 {
+        let x = i as f64 * 0.1;
+        csv.push_str(&format!("{x},{}\n", 2.0 * x + 1.0));
+    }
+    let d = s(&dir.join("d.csv"));
+    std::fs::write(&d, csv).unwrap();
+    let o = rcsr(&["--data", d.as_str(), "--target", "y", "--generations", "1", "--pop", "20", "--json"], None);
+    assert!(o.status.success(), "{}", out(&o));
+    let j = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(j.contains("\"device_probed\":true"), "{j}");
+    assert!(!j.contains("\"device_probed\":false"), "{j}");
 }
 
 #[test]
@@ -145,4 +183,25 @@ fn enrich_cpu_with_a_calibration_of_another_device_plans_with_cpu_rates_only() {
         assert_eq!(o.status.code(), Some(2), "{}", out(&o));
         assert!(out(&o).contains("was measured on 'Other Device (sm_00)'"), "{}", out(&o));
     }
+}
+
+fn enrich_text(store: &str, dir: &Path, name: &str) -> Output {
+    let target = s(&dir.join(name));
+    rcsr(&["enrich", "--data", store, "--out", target.as_str(), "--features", "returns"], None)
+}
+
+/// `rcsr schema` names the probe fields in the backend reporting text and in the enrich
+/// `--json` description, not only inside the `--no-gpu` description.
+#[test]
+fn the_schema_lists_the_probe_fields() {
+    let o = rcsr(&["schema"], Some("0"));
+    let schema = String::from_utf8_lossy(&o.stdout).to_string();
+    let reporting = &schema[schema.find("\"reporting\":\"").expect("backend reporting")..];
+    let reporting = &reporting[..reporting.find("\",\"").unwrap()];
+    assert!(reporting.contains("device_probed"), "{reporting}");
+    assert!(reporting.contains("gpu_probed"), "{reporting}");
+    let enrich = &schema[schema.find("\"enrich\":{\"command\"").expect("enrich in schema")..];
+    let json_flag = &enrich[enrich.find("\"name\":\"--json\"").expect("enrich --json")..];
+    let json_flag = &json_flag[..json_flag.find("\"}").unwrap()];
+    assert!(json_flag.contains("gpu_probed"), "{json_flag}");
 }

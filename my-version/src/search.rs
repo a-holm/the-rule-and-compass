@@ -11595,7 +11595,7 @@ mod tests {
     #[test]
     fn device_nonfinite_is_checked_before_promotion() {
         if !crate::gpu::probe().available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let s = overflow_sample(300);
@@ -11661,7 +11661,7 @@ mod tests {
     #[test]
     fn device_trade_floor_inf_is_checked_before_promotion() {
         if !crate::gpu::probe().available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let n = 300;

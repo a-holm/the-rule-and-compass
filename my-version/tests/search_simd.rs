@@ -14,7 +14,6 @@
 #[path = "common/rcsr.rs"]
 mod rcsr_cmd;
 
-use std::io::Write;
 use std::process::Stdio;
 
 use rcsr::data::Sample;
@@ -56,6 +55,7 @@ fn config(simd: bool, ops: Vec<Op>) -> Config {
         seed: 27,
         ops,
         simd,
+        gpu: false,
         ..Default::default()
     }
 }
@@ -183,12 +183,7 @@ fn run(args: &[&str]) -> (Option<i32>, String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn rcsr");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(csv(50).as_bytes())
-        .unwrap();
+    rcsr_cmd::feed_stdin(&mut child, csv(50).as_bytes());
     let out = child.wait_with_output().unwrap();
     (
         out.status.code(),
