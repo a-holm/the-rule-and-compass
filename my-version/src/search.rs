@@ -4150,7 +4150,7 @@ const CHECK_CHUNK: usize = 16_384;
 
 /// #896: [`score_tree`] for a slot of the device `+inf` check. The same bits,
 /// cheaper for a `+inf` result.
-#[cfg(any(feature = "cuda", test))]
+#[cfg(test)]
 fn score_tree_checked(tree: &Node, data: &EvalSample, cfg: &Config) -> f64 {
     score_tree_checked_work(tree, data, cfg).0
 }
