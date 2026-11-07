@@ -75,6 +75,9 @@ pub struct Manifest {
     pub fit_subsample: Option<(usize, u64, bool)>,
     /// #602: the subsample size came from the row-count default, not `--fit-rows`.
     pub fit_rows_default: bool,
+    /// #855: the run was an interim chunk (`--interim-chunk`): the search
+    /// state is saved and no report ran. The next full chunk overwrites it.
+    pub interim: bool,
 }
 
 impl Manifest {
@@ -89,6 +92,9 @@ impl Manifest {
             end_utc.map(jstr).unwrap_or_else(|| "null".to_string()),
             end_utc.is_some()
         ));
+        if self.interim {
+            out.push_str("  \"interim\":true,\n");
+        }
         out.push_str(&format!(
             "  \"commit\":{},\"dirty\":{},\n",
             jstr(&self.commit),
@@ -281,6 +287,7 @@ pub fn collect(
         fit_resolution: None,
         fit_subsample: None,
         fit_rows_default: false,
+        interim: false,
     }
 }
 
@@ -823,6 +830,11 @@ fn value_after<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let colon = rest.find(':')?;
     let rest = rest[colon + 1..].trim_start();
     Some(rest)
+}
+
+/// #855: whether a manifest was written by an interim chunk.
+pub fn is_interim(text: &str) -> bool {
+    text.lines().any(|l| l.trim() == "\"interim\":true,")
 }
 
 /// Extract a JSON string field, honouring escapes.

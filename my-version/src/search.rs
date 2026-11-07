@@ -223,6 +223,9 @@ pub struct Config {
     pub reject_constant_offspring: bool,
     /// Wall-clock budget in seconds; `None` means no limit.
     pub time_budget: Option<f64>,
+    /// #855: a chunk that stops on `time_budget` saves its search state and
+    /// skips the end-of-run report. Execution setting: not saved, not hashed.
+    pub interim_chunk: bool,
     /// Stop after this many generations with no improvement (0 disables).
     pub patience: usize,
     /// Number of training rows used to score and fit candidates in a
@@ -618,6 +621,7 @@ impl Default for Config {
             dedup: true,
             reject_constant_offspring: false,
             time_budget: None,
+            interim_chunk: false,
             patience: 40,
             predictor_samples: None,
             fit_samples: 0, // #85: off by default
@@ -2389,6 +2393,7 @@ impl GpuSearch {
             fit_status_by_label: self.fit_status_by_label.clone(),
             fit_refits: 0,
             fit_refit_candidates: 0,
+            fit_carried_kept: 0,
             fit_refit_s: 0.0,
             fit_rescore_s: 0.0,
             fit_ms: self.fit_ms,
@@ -4990,6 +4995,40 @@ struct RefitReport {
     refit_s: f64,
     /// Wall seconds in full-data scoring of the unique trees.
     rescore_s: f64,
+    /// #850: members of the rebuilt front that kept their carried constants.
+    carried_kept: usize,
+}
+
+/// #850: under the long/flat fitness the squared-error refit can change a
+/// tree's book, so the rebuild also prices every archive member with the
+/// constants the search selected. A carried version joins the front only when
+/// it would survive insertion against the refit front; an equal book keeps
+/// the refit version. Returns the front and the carried members it holds.
+fn keep_carried(front: Archive, carried: Vec<Sol>) -> (Archive, usize) {
+    let cap = front.cap;
+    let admitted: Vec<Sol> = carried
+        .into_iter()
+        .filter(|s| {
+            front.admits(s.error, s.cost)
+                && !front
+                    .items
+                    .iter()
+                    .any(|it| it.cost == s.cost && (it.error - s.error).abs() < 1e-12)
+        })
+        .collect();
+    if admitted.is_empty() {
+        return (front, 0);
+    }
+    let hashes: HashSet<u64> = admitted.iter().map(|s| expr::structural_hash(&s.tree)).collect();
+    let mut all = front.items;
+    all.extend(admitted);
+    let front = canonical_front(cap, all);
+    let kept = front
+        .items
+        .iter()
+        .filter(|s| hashes.contains(&expr::structural_hash(&s.tree)))
+        .count();
+    (front, kept)
 }
 
 /// #495: indices of the trees worth an exact refit. `pre` are the pre-refit
@@ -5112,6 +5151,11 @@ fn full_data_archive(
         ..RefitReport::default()
     };
     let refit_on = refit_gpu_fit && cfg.fit_iters > 0 && !train.sample.is_multi();
+    let carried: Vec<Node> = if refit_on && cfg.fitness.book().is_some() {
+        archive.items.iter().map(|s| expr::simplify(&s.tree)).collect()
+    } else {
+        Vec::new()
+    };
     let workers = |n: usize| batch_workers(cfg.threads, n, train.sample.len());
     // #463: scoring is independent per tree; results keep the order.
     let score_all = |trees: Vec<Node>| -> Vec<Sol> {
@@ -5131,8 +5175,14 @@ fn full_data_archive(
         }
         let start = std::time::Instant::now();
         let scored = score_all(unique);
+        let mut front = canonical_front(archive.cap, scored);
+        if !carried.is_empty() {
+            let (kept_front, kept) = keep_carried(front, score_all(carried));
+            front = kept_front;
+            report.carried_kept = kept;
+        }
         report.rescore_s = start.elapsed().as_secs_f64();
-        return (canonical_front(archive.cap, scored), report);
+        return (front, report);
     }
 
     // #495: score with the carried constants, refit only the band around the
@@ -5154,6 +5204,13 @@ fn full_data_archive(
         rescored
     });
     report.refits = refits;
+    if carried.is_empty() {
+        return (front, report);
+    }
+    let start = std::time::Instant::now();
+    let (front, kept) = keep_carried(front, score_all(carried));
+    report.rescore_s += start.elapsed().as_secs_f64();
+    report.carried_kept = kept;
     (front, report)
 }
 
@@ -5952,6 +6009,8 @@ pub struct GpuRunStats {
     pub fit_refit_s: f64,
     /// #495: wall seconds of full-data scoring in the finalist rebuild.
     pub fit_rescore_s: f64,
+    /// #850: front members that kept their carried constants at the rebuild.
+    pub fit_carried_kept: usize,
     /// #169: wall time spent in the batched fit kernels, milliseconds.
     pub fit_ms: f64,
     /// #496: the polish-phase part of `fit_ms`, apportioned by per-block cycles.
@@ -6057,6 +6116,10 @@ pub struct Outcome {
     /// #482: offspring scored over the run, summed over islands and
     /// generations, including generations before a resume.
     pub candidates_evaluated: u64,
+    /// #855: the run stopped on `time_budget` under `--interim-chunk`. The
+    /// search state is saved; `archive` is the search archive at the last
+    /// generation, `test_errors` is empty and no end-of-run report ran.
+    pub interim: bool,
 }
 
 /// #256: the reported `converged_early`. `stopped` is the loop-control flag
@@ -7125,6 +7188,8 @@ fn run_postfix_search(
 
     // #256: the exit checkpoint is emitted after the exact f64 rebuild so it
     // carries the archive the run reports.
+    // #855: an interim chunk saves the search state and skips the report.
+    let interim = cfg.interim_chunk && stop_reason == "time_budget" && on_checkpoint.is_some();
     let mut io_final_s = 0.0f64;
     let io_mark = std::time::Instant::now();
     let pending_cp: Option<Checkpoint> = if on_checkpoint.is_some() {
@@ -7176,35 +7241,45 @@ fn run_postfix_search(
     // Exact f64 rebuild over the surviving front only. The generation errors
     // were the f32 kernel proxy; every number the user reads comes from here.
     let mut final_archive = Archive::new(archive.cap);
-    for sol in std::mem::take(&mut archive.items) {
-        let tree = expr::simplify(&sol.tree);
-        let error = if cfg.accepts_dimensions(&tree) {
-            score_tree(&tree, train_data, cfg)
-        } else {
-            f64::INFINITY
-        };
-        final_archive.try_insert(Sol {
-            complexity: expr::complexity(&tree),
-            cost: cfg.complexity_model.complexity(&tree),
-            tree,
-            error,
-        });
+    if interim {
+        final_archive.items = std::mem::take(&mut archive.items);
+    } else {
+        for sol in std::mem::take(&mut archive.items) {
+            let tree = expr::simplify(&sol.tree);
+            let error = if cfg.accepts_dimensions(&tree) {
+                score_tree(&tree, train_data, cfg)
+            } else {
+                f64::INFINITY
+            };
+            final_archive.try_insert(Sol {
+                complexity: expr::complexity(&tree),
+                cost: cfg.complexity_model.complexity(&tree),
+                tree,
+                error,
+            });
+        }
+        final_archive.canonicalize();
     }
-    final_archive.canonicalize();
-    let (final_archive, prune_report) = prune::prune_archive(final_archive, train, train_data, cfg);
+    let (final_archive, prune_report) = if interim {
+        (final_archive, PruneReport::default())
+    } else {
+        prune::prune_archive(final_archive, train, train_data, cfg)
+    };
     let sorted = final_archive.sorted();
-    let test_data = EvalSample::new(test, cfg);
+    let test_data = if interim { None } else { Some(EvalSample::new(test, cfg)) };
     let test_errors: Vec<f64> = sorted
         .iter()
-        .map(|s| eval_error_on(&s.tree, &test_data, cfg.metric))
+        .filter_map(|s| Some(eval_error_on(&s.tree, test_data.as_ref()?, cfg.metric)))
         .collect();
     let mut final_archive = Archive::new(final_archive.cap);
     final_archive.items = sorted;
     if let Some(mut cp) = pending_cp {
-        cp.final_archive = Some(Archive {
-            items: final_archive.items.clone(),
-            cap: final_archive.cap,
-        });
+        if !interim {
+            cp.final_archive = Some(Archive {
+                items: final_archive.items.clone(),
+                cap: final_archive.cap,
+            });
+        }
         let io_mark = std::time::Instant::now();
         emit(&mut on_checkpoint, &cp);
         io_final_s += io_mark.elapsed().as_secs_f64();
@@ -7215,7 +7290,11 @@ fn run_postfix_search(
         .iter()
         .map(|s| s.error)
         .fold(f64::INFINITY, f64::min);
-    let convergence = progress_stats.observe(gens_done, best, &final_archive);
+    let convergence = if interim {
+        progress_stats.current()
+    } else {
+        progress_stats.observe(gens_done, best, &final_archive)
+    };
 
     // #284: the remaining tail is one measured host window (final f64 rebuild,
     // test scoring and archive canonicalisation).
@@ -7260,6 +7339,7 @@ fn run_postfix_search(
         stop_reason,
         prune: prune_report,
         candidates_evaluated: candidates,
+        interim,
     })
 }
 
@@ -8864,7 +8944,9 @@ fn run_search(
     // #120: promoted cell elites are rebuilt exactly on every training row in
     // f64 before they are reported. Screening and row subsets may guide the
     // search, but the QD report is never a subset estimate.
-    if cfg.qd_policy {
+    // #855: an interim chunk saves the search state and skips the report.
+    let interim = cfg.interim_chunk && stop_reason == "time_budget" && on_checkpoint.is_some();
+    if cfg.qd_policy && !interim {
         if let Some(qd) = qd_archive.as_mut() {
             qd.refit_all(|tree| {
                 let sol = refit_survivor(tree, &train_data, cfg);
@@ -8914,12 +8996,13 @@ fn run_search(
     let gpu_fit_used =
         cfg.fit_strategy.defers_to_gpu() && (gpu_used || fit_only_device);
     let mut refit_report = RefitReport::default();
-    if subsampling_active(cfg, train)
-        || gpu_used
-        || fit_only_device
-        || resumed
-        || fit_screened
-        || cfg.fit_irls_active()
+    if !interim
+        && (subsampling_active(cfg, train)
+            || gpu_used
+            || fit_only_device
+            || resumed
+            || fit_screened
+            || cfg.fit_irls_active())
     {
         // Generation fitness was estimated on subsets, or on the GPU in f32, so
         // the front is rebuilt from the surviving trees and scored on every
@@ -8934,7 +9017,7 @@ fn run_search(
         );
         archive = rebuilt.0;
         refit_report = rebuilt.1;
-    } else {
+    } else if !interim {
         for pop in &islands {
             for ind in pop {
                 archive.try_insert(Sol {
@@ -8946,29 +9029,36 @@ fn run_search(
             }
         }
     }
-    let (archive, prune_report) = prune::prune_archive(archive, train, &train_data, cfg);
+    let (archive, prune_report) = if interim {
+        (archive, PruneReport::default())
+    } else {
+        prune::prune_archive(archive, train, &train_data, cfg)
+    };
     let sorted = archive.sorted();
     // #27: one transpose for the whole test sample, shared by every front
     // entry. Multi-output keeps its own scalar path.
-    let test_data = EvalSample::new(test, cfg);
+    let test_data = if interim { None } else { Some(EvalSample::new(test, cfg)) };
     let test_errors: Vec<f64> = sorted
         .iter()
-        .map(|s| {
+        .filter_map(|s| {
+            let test_data = test_data.as_ref()?;
             // #15: fit the per-output constants on train, then score test.
-            if train.is_multi() {
+            Some(if train.is_multi() {
                 multi::combined_test_error(&s.tree, train, test, cfg.metric, cfg.fit_iters)
             } else {
-                eval_error_on(&s.tree, &test_data, cfg.metric)
-            }
+                eval_error_on(&s.tree, test_data, cfg.metric)
+            })
         })
         .collect();
     let mut final_archive = Archive::new(archive.cap);
     final_archive.items = sorted;
     if let Some(mut cp) = pending_cp {
-        cp.final_archive = Some(Archive {
-            items: final_archive.items.clone(),
-            cap: final_archive.cap,
-        });
+        if !interim {
+            cp.final_archive = Some(Archive {
+                items: final_archive.items.clone(),
+                cap: final_archive.cap,
+            });
+        }
         let io_mark = std::time::Instant::now();
         emit(&mut on_checkpoint, &cp);
         io_final_s += io_mark.elapsed().as_secs_f64();
@@ -8981,7 +9071,7 @@ fn run_search(
     // #26: a GPU-guided run's in-loop readings are on the f32 proxy; take the
     // final reading from the rebuilt f64 archive so the reported statistics
     // describe the numbers the user sees.
-    if !stats_observed || gpu_used || resumed {
+    if !interim && (!stats_observed || gpu_used || resumed) {
         let best = final_archive
             .items
             .iter()
@@ -9013,6 +9103,7 @@ fn run_search(
             let mut s = g.run_stats();
             s.fit_refits = gpu_fit_refits;
             s.fit_refit_candidates = refit_report.candidates;
+            s.fit_carried_kept = refit_report.carried_kept;
             s.fit_refit_s = refit_report.refit_s;
             s.fit_rescore_s = refit_report.rescore_s;
             s.fit_admission = cfg.fit_admission;
@@ -9087,6 +9178,7 @@ fn run_search(
         stop_reason, // #211
         prune: prune_report,
         candidates_evaluated: candidates,
+        interim,
     })
 }
 
@@ -11013,6 +11105,101 @@ mod tests {
         assert_eq!(banded.candidates, full.candidates);
         assert!(banded.refits < full.refits, "{} of {}", banded.refits, full.refits);
         assert!(banded.refits >= got.items.len());
+    }
+
+    /// #850: long on `x < 0.9`, short loss above. The squared-error line through
+    /// these returns crosses 0 at about 2, outside the range of `x`.
+    fn step_returns() -> Sample {
+        let n = 201;
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..n {
+            let a = -1.0 + 2.0 * i as f64 / (n - 1) as f64;
+            x.push(vec![a]);
+            y.push(if a < 0.9 { 0.01 } else { -0.02 });
+        }
+        Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None }
+    }
+
+    fn cut_tree(a: f64, b: f64) -> Node {
+        node(Op::Mul, vec![constant(a), node(Op::Sub, vec![constant(b), input(0)])])
+    }
+
+    fn pnl_rebuild(tree: Node, band: f64) -> (Archive, RefitReport, f64) {
+        let s = step_returns();
+        let cfg = Config {
+            fitness: Fitness::LongPnl(pnl_book(&s)),
+            refit_band: band,
+            threads: 1,
+            ..Config::default()
+        };
+        let view = EvalSample::new(&s, &cfg);
+        let carried_error = score_tree(&tree, &view, &cfg);
+        let mut a = Archive::new(100);
+        a.items.push(Sol {
+            complexity: expr::complexity(&tree),
+            cost: cfg.complexity_model.complexity(&tree),
+            error: carried_error,
+            tree,
+        });
+        let (front, report) = full_data_archive(&a, &[], &view, &cfg, true);
+        (front, report, carried_error)
+    }
+
+    /// #850: the refit moves the cut of `a * (b - x)` outside the data, the book
+    /// turns buy and hold, and the rebuild must still report the carried tree.
+    #[test]
+    fn rebuild_keeps_carried_constants_when_the_refit_loses_the_book() {
+        for band in [f64::INFINITY, 0.0] {
+            let tree = cut_tree(1.0, 0.9);
+            let (front, report, carried_error) = pnl_rebuild(tree.clone(), band);
+            let s = step_returns();
+            let cfg = Config { fitness: Fitness::LongPnl(pnl_book(&s)), threads: 1, ..Config::default() };
+            let view = EvalSample::new(&s, &cfg);
+            let mut refit = vec![tree.clone()];
+            refit_exact(&mut refit, &view, &cfg);
+            let refit_error = score_tree(&refit[0], &view, &cfg);
+            assert!(refit[0].kids[1].kids[0].val > 1.0, "the refit cut leaves the data: {:?}", refit[0]);
+            assert!(carried_error < refit_error, "{carried_error} vs {refit_error}");
+            assert_eq!(front.items.len(), 1);
+            assert_eq!(front.items[0].error.to_bits(), carried_error.to_bits());
+            assert_eq!(expr::structural_hash(&front.items[0].tree), expr::structural_hash(&expr::simplify(&tree)));
+            assert_eq!(report.carried_kept, 1);
+        }
+    }
+
+    /// #850: where the refit keeps the book the rebuild is the refit alone.
+    #[test]
+    fn rebuild_with_an_unchanged_book_keeps_the_refit_version() {
+        let s = step_returns();
+        let cfg = Config { fitness: Fitness::LongPnl(pnl_book(&s)), threads: 1, ..Config::default() };
+        let view = EvalSample::new(&s, &cfg);
+        let mut refit = vec![expr::simplify(&cut_tree(1.0, 0.0))];
+        refit_exact(&mut refit, &view, &cfg);
+        let (front, report, _) = pnl_rebuild(cut_tree(1.0, 0.0), f64::INFINITY);
+        assert_eq!(report.carried_kept, 0);
+        assert_eq!(
+            expr::structural_hash(&front.items[0].tree),
+            expr::structural_hash(&refit[0])
+        );
+    }
+
+    /// #850: under the metric fitness the rebuild is the refit alone.
+    #[test]
+    fn rebuild_under_the_metric_fitness_does_not_price_carried_constants() {
+        let s = step_returns();
+        let cfg = Config { threads: 1, ..Config::default() };
+        let view = EvalSample::new(&s, &cfg);
+        let mut a = Archive::new(100);
+        let tree = cut_tree(1.0, 0.9);
+        a.items.push(Sol {
+            complexity: expr::complexity(&tree),
+            cost: cfg.complexity_model.complexity(&tree),
+            error: score_tree(&tree, &view, &cfg),
+            tree,
+        });
+        let (_, report) = full_data_archive(&a, &[], &view, &cfg, true);
+        assert_eq!(report.carried_kept, 0);
     }
 
     /// #495: the saved setting round-trips through the checkpoint config.
