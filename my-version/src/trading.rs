@@ -1766,3 +1766,39 @@ mod block_tests {
         assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 41, 1.0).is_err());
     }
 }
+
+#[cfg(test)]
+mod fixed_position_tests {
+    use super::*;
+    use crate::expr::{input, node, Op};
+
+    /// #849: the report names the one position of `gauss(x)` and `-gauss(x)`,
+    /// and leaves a tree the inputs decide at `null`.
+    #[test]
+    fn fixed_position_follows_the_book_rule() {
+        let spec = TradingSpec::default();
+        let g = node(Op::Gauss, vec![input(0)]);
+        let neg = node(Op::Neg, vec![g.clone()]);
+        assert_eq!(fixed_position(&g, &spec), Some(true));
+        assert_eq!(fixed_position(&neg, &spec), Some(false));
+        assert_eq!(fixed_position(&input(0), &spec), None);
+        assert_eq!(fixed_position_json(Some(true)), "\"long\"");
+        assert_eq!(fixed_position_json(Some(false)), "\"flat\"");
+        assert_eq!(fixed_position_json(None), "null");
+    }
+
+    /// #849: the threshold is the book's, and only the indicator rule has a
+    /// fixed position.
+    #[test]
+    fn fixed_position_reads_the_spec_threshold_and_rule() {
+        let g = node(Op::Gauss, vec![input(0)]);
+        let shifted = TradingSpec { threshold: 1e-30, ..TradingSpec::default() };
+        assert_eq!(fixed_position(&g, &shifted), None);
+        let high = TradingSpec { threshold: 1.0, ..TradingSpec::default() };
+        assert_eq!(fixed_position(&g, &high), Some(false));
+        let ramp = TradingSpec { tau: Some(0.5), ..TradingSpec::default() };
+        assert_eq!(fixed_position(&g, &ramp), None);
+        let tercile = TradingSpec { position: PositionMap::TopTercile, ..TradingSpec::default() };
+        assert_eq!(fixed_position(&g, &tercile), None);
+    }
+}
