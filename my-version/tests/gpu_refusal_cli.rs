@@ -5,8 +5,11 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -47,7 +50,8 @@ impl Work {
     }
 
     fn run(&self, name: &str, args: &[&str], force: Option<&str>) -> Output {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rcsr"));
+        // Every test of this file needs the device, with and without `--gpu`.
+        let mut cmd = rcsr_cmd::rcsr_on_device();
         cmd.arg("--data").arg(&self.data);
         cmd.args(["--target", "y", "--generations", "2", "--pop", "60", "--seed", "3"]);
         cmd.args(["--threads", "1", "--quiet"]);
@@ -79,7 +83,7 @@ fn gpu_available() -> bool {
     if rcsr::gpu::probe().available() {
         true
     } else {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         false
     }
 }
@@ -90,11 +94,11 @@ fn explicit_gpu_run_fails_closed_when_a_launch_is_refused() {
         return;
     }
     let w = Work::new("explicit");
-    let ok = w.run("control", &["--gpu"], None);
+    let ok = w.run("control", &["--gpu", "--dispatch", "device"], None);
     assert_eq!(ok.status.code(), Some(0), "{}", text(&ok.stderr));
     assert!(std::fs::read_to_string(w.json("control")).unwrap().contains("\"backend\":\"gpu\""));
 
-    let out = w.run("forced", &["--gpu"], Some(KERNEL));
+    let out = w.run("forced", &["--gpu", "--dispatch", "device"], Some(KERNEL));
     let err = text(&out.stderr);
     assert_eq!(out.status.code(), Some(6), "{err}");
     assert!(err.contains(&format!("refused launch of {KERNEL}")), "{err}");

@@ -3,9 +3,11 @@
 //! selected candidate only. Fixtures are synthetic; the locked range is a
 //! stand-in in 2024.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::lockbox::{self, Lockbox};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// 2024-01-01T00:00:00Z.
 const T0: i64 = 1_704_067_200;
@@ -23,7 +25,7 @@ fn scratch(name: &str) -> (Scratch, PathBuf) {
 
 /// The children make no device call: `RCSR_GPU=0` skips even the startup device probe.
 fn rcsr(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).env("RCSR_GPU", "0").args(args).output().unwrap();
+    let out = rcsr_cmd::rcsr().args(args).output().unwrap();
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -271,9 +273,10 @@ fn report_candidates_keeps_the_full_report_on_a_final_ledger() {
     assert_eq!(p_values(&out).len(), 2, "{}", out);
 }
 
-#[test]
-fn ladder_on_a_final_ledger_reads_once() {
-    let (_scratch, dir) = scratch("ladder");
+/// A sealed panel for the ladder: `(scratch, dir, data, windows, out, ledger, sealed)`, one walk-forward
+/// development read on the ledger and a final seal, no ladder read yet.
+fn ladder_fixture(name: &str) -> (Scratch, PathBuf, String, String, String, String, String) {
+    let (scratch, dir) = scratch(name);
     let (data, win) = (dir.join("p.csv"), dir.join("w.csv"));
     let mut csv = String::from("ts,sym,f1,f2,y\n");
     for g in 0..3i64 {
@@ -308,13 +311,21 @@ fn ladder_on_a_final_ledger_reads_once() {
     assert_eq!(code, 0, "{}", err);
     let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);
     assert_eq!(code, 0, "{}", err);
-    let run = || {
-        rcsr(&[
+    (scratch, dir, d, w, out, l, sealed)
+}
+
+fn ladder_read(d: &str, w: &str, out: &str, l: &str, sealed: &str) -> (i32, String, String) {
+    rcsr(&[
             "ladder", "--data", &d, "--target", "y", "--time", "ts", "--group", "sym", "--features", "f1,f2",
             "--windows", &w, "--scheme", "locked", "--purge-seconds", "7200", "--gbm-trees", "10", "--draws", "50",
             "--max-fit-rows", "600", "--out", &out, "--locked-test", "--ledger", &l, "--sealed", &sealed,
-        ])
-    };
+    ])
+}
+
+#[test]
+fn ladder_on_a_final_ledger_reads_once() {
+    let (_scratch, _dir, d, w, out, l, sealed) = ladder_fixture("ladder");
+    let run = || ladder_read(&d, &w, &out, &l, &sealed);
     let (code, _, err) = run();
     assert_eq!(code, 0, "{}", err);
     let ledger = std::fs::read_to_string(&l).unwrap();
@@ -680,4 +691,130 @@ fn walkforward_verify_read_needs_locked_test() {
     let (code, _, err) = wf(&data, &l, &["x"], &["--window", &w, "--verify-read"]);
     assert_eq!(code, 2, "{}", err);
     assert!(err.contains("--verify-read applies to --locked-test only"), "{}", err);
+}
+
+fn no_staged_files(dir: &Path, what: &str) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        assert!(!name.ends_with(".tmp"), "{name} left behind for {what}");
+    }
+}
+
+#[test]
+fn walkforward_refuses_outputs_that_name_one_file() {
+    let (_scratch, dir, data, l, sealed) = sealed_store("wf-same-file");
+    std::fs::create_dir(dir.join("b")).unwrap();
+    let ledger_before = std::fs::read(&l).unwrap();
+    let marker = format!("{}.locked_reads.jsonl", data);
+    let out = dir.join("a.json");
+    let forms = [
+        dir.join(".").join("a.json"),
+        dir.join("b").join("..").join("a.json"),
+    ];
+    for md in forms {
+        let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--out", &s(&out), "--markdown", &s(&md)]);
+        assert_eq!(code, 3, "{}: {}", md.display(), err);
+        assert!(err.contains("same file"), "{}", err);
+        assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+        assert!(!Path::new(&marker).exists());
+        assert!(!out.exists());
+        no_staged_files(&dir, &md.display().to_string());
+    }
+    // a symlink and a hard link to an existing output
+    std::fs::write(&out, "old").unwrap();
+    std::os::unix::fs::symlink(&out, dir.join("sym.md")).unwrap();
+    std::fs::hard_link(&out, dir.join("hard.md")).unwrap();
+    for md in ["sym.md", "hard.md"] {
+        let (code, _, err) = read(&data, &l, &sealed, &["x"], &["--out", &s(&out), "--markdown", &s(&dir.join(md))]);
+        assert_eq!(code, 3, "{md}: {err}");
+        assert!(err.contains("same file"), "{md}: {err}");
+        assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+        assert!(!Path::new(&marker).exists());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "old");
+        no_staged_files(&dir, md);
+    }
+}
+
+#[test]
+fn walkforward_refuses_a_ledger_event_without_a_valid_read_count() {
+    let (_scratch, dir, data, l, sealed) = sealed_store("wf-bad-count");
+    let marker = format!("{}.locked_reads.jsonl", data);
+    let text = std::fs::read_to_string(&l).unwrap();
+    let head = rcsr::manifest::sha256_hex(text.lines().last().unwrap().as_bytes());
+    let bad = format!("{{\"prev\":\"{head}\",\"event\":\"test_read\",\"id\":\"zz\",\"report_sha256\":\"bb\",\"test_read\":true}}\n");
+    std::fs::write(&l, format!("{text}{bad}")).unwrap();
+    let ledger_before = std::fs::read(&l).unwrap();
+    let out = s(&dir.join("report.json"));
+    for extra in [vec!["--out", out.as_str()], vec!["--out", out.as_str(), "--verify-read"]] {
+        let (code, _, err) = read(&data, &l, &sealed, &["x"], &extra);
+        assert_eq!(code, 3, "{}", err);
+        assert!(err.contains("line 3 is a test_read event without a valid read_count"), "{}", err);
+        assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+        assert!(!Path::new(&marker).exists() && !Path::new(&out).exists());
+    }
+}
+
+/// Appends `body` as one ledger line chained to the last line.
+fn append_chained(ledger: &str, body: &str) {
+    let text = std::fs::read_to_string(ledger).unwrap();
+    let head = rcsr::manifest::sha256_hex(text.lines().last().unwrap().as_bytes());
+    std::fs::write(ledger, format!("{text}{{\"prev\":\"{head}\",{body}}}\n")).unwrap();
+}
+
+/// A faulty event per field a read depends on: `(field, body)`. `read_count` is covered by
+/// `walkforward_refuses_a_ledger_event_without_a_valid_read_count`.
+const FAULTY_EVENTS: &[(&str, &str)] = &[
+    ("id", "\"event\":\"test_read\",\"report_sha256\":\"bb\",\"read_count\":1,\"test_read\":true"),
+    ("id", "\"event\":\"test_read\",\"id\":\"\",\"report_sha256\":\"bb\",\"read_count\":1,\"test_read\":true"),
+    ("report_sha256", "\"event\":\"test_read\",\"id\":\"c\",\"read_count\":1,\"test_read\":true"),
+    ("report_sha256", "\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"\",\"read_count\":1,\"test_read\":true"),
+    ("read_count", "\"event\":\"test_read\",\"id\":\"c\",\"report_sha256\":\"bb\",\"read_count\":\"1\",\"test_read\":true"),
+    ("data_sha256", "\"event\":\"baseline_read\",\"report_sha256\":\"bb\""),
+    ("report_sha256", "\"event\":\"baseline_read\",\"data_sha256\":\"aa\",\"report_sha256\":\"\""),
+    ("sealed_sha256", "\"event\":\"seal\""),
+    ("sealed_sha256", "\"event\":\"seal\",\"sealed_sha256\":\"\""),
+    ("id", "\"event\":\"candidate\""),
+    ("id", "\"event\":\"candidate\",\"id\":\"\""),
+];
+
+#[test]
+fn walkforward_read_refuses_every_faulty_ledger_field_with_exit_3() {
+    let (_scratch, dir, data, l, sealed) = sealed_store("wf-faulty-fields");
+    let marker = format!("{}.locked_reads.jsonl", data);
+    let original = std::fs::read_to_string(&l).unwrap();
+    let out = s(&dir.join("report.json"));
+    for (field, body) in FAULTY_EVENTS {
+        std::fs::write(&l, &original).unwrap();
+        append_chained(&l, body);
+        let ledger_before = std::fs::read(&l).unwrap();
+        for extra in [vec!["--out", out.as_str()], vec!["--out", out.as_str(), "--verify-read"]] {
+            let (code, _, err) = read(&data, &l, &sealed, &["x"], &extra);
+            assert_eq!(code, 3, "{field} in {body}: {err}");
+            assert!(err.contains(&format!("without a valid {field}")), "{field} in {body}: {err}");
+            assert_eq!(std::fs::read(&l).unwrap(), ledger_before, "{body}");
+            assert!(!Path::new(&marker).exists() && !Path::new(&out).exists(), "{body}");
+        }
+        // the verifier reports the same fault with its own documented code
+        let (code, _, err) = rcsr(&["protocol", "verify", "--ledger", &l, "--data", &data]);
+        assert_eq!(code, 1, "{body}: {err}");
+        assert!(err.contains(&format!("without a valid {field}")), "{body}: {err}");
+    }
+}
+
+#[test]
+fn ladder_read_refuses_every_faulty_ledger_field_with_exit_3() {
+    let (_scratch, dir, d, w, out, l, sealed) = ladder_fixture("ladder-faulty-fields");
+    let marker = format!("{}.locked_reads.jsonl", d);
+    let original = std::fs::read_to_string(&l).unwrap();
+    for (field, body) in FAULTY_EVENTS {
+        std::fs::write(&l, &original).unwrap();
+        append_chained(&l, body);
+        let ledger_before = std::fs::read(&l).unwrap();
+        let (code, _, err) = ladder_read(&d, &w, &out, &l, &sealed);
+        assert_eq!(code, 3, "{field} in {body}: {err}");
+        assert!(err.contains(&format!("without a valid {field}")), "{field} in {body}: {err}");
+        assert_eq!(std::fs::read(&l).unwrap(), ledger_before, "{body}");
+        assert!(!Path::new(&marker).exists() && !Path::new(&out).exists(), "{body}");
+        no_staged_files(&dir, body);
+    }
 }

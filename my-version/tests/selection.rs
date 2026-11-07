@@ -4,6 +4,9 @@
 //! rows before anything else. The ambiguous cases have explicit rules and are
 //! counted in the split report, so nothing is silently discarded.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{self, Filter, PrepSpec, SplitMode, SplitSpec};
 use rcsr::expr;
 use rcsr::rng::Mt;
@@ -178,9 +181,8 @@ fn selection_is_deterministic() {
 
 #[test]
 fn a_bad_selection_expression_is_a_usage_error() {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    use std::process::Stdio;
+    let mut child = rcsr_cmd::rcsr()
         .args([
             "--data",
             "-",
@@ -194,10 +196,7 @@ fn a_bad_selection_expression_is_a_usage_error() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(b"x,y\n1,2\n2,3\n4,5\n").unwrap();
-    }
+    rcsr_cmd::feed_stdin(&mut child, b"x,y\n1,2\n2,3\n4,5\n");
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);

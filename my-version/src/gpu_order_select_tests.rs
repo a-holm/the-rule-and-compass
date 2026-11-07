@@ -73,7 +73,7 @@ fn one_column(x: &[f64], y: &[f64]) -> Fixture {
 
 fn evaluator(f: &Fixture) -> Option<GpuEvaluator> {
     if !probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return None;
     }
     let y32: Vec<f32> = f.y.iter().map(|&v| finite_f32(v)).collect();

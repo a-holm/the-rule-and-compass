@@ -5,12 +5,14 @@
 //! listed in `--help` and the README, and is either implemented by the web
 //! front end or rejected with a deliberate message (never "unknown argument").
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::gui;
 use rcsr::schema;
-use std::process::Command;
 
 fn rcsr(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr()
         .args(args)
         .output()
         .expect("run rcsr")

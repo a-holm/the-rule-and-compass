@@ -285,12 +285,23 @@ fn field_str(line: &str, key: &str) -> Option<String> {
     None
 }
 
-fn field_num(line: &str, key: &str) -> Option<f64> {
+/// Read a non-negative integer field. A float, a negative number, a string or an
+/// overflow is `None`.
+fn field_u64(line: &str, key: &str) -> Option<u64> {
     let pat = format!("\"{}\":", key);
     let start = line.find(&pat)? + pat.len();
     let rest = &line[start..];
     let end = rest.find(|c| c == ',' || c == '}').unwrap_or(rest.len());
     rest[..end].trim().parse().ok()
+}
+
+fn fault_field(path: &std::path::Path, n: usize, event: &str, key: &str) -> String {
+    format!("{}: line {} is a {} event without a valid {}: the ledger was edited", path.display(), n, event, key)
+}
+
+/// A non-empty string field of a ledger line, or a ledger fault naming the line.
+fn need_str(path: &std::path::Path, n: usize, line: &str, event: &str, key: &str) -> Result<String, String> {
+    field_str(line, key).filter(|v| !v.is_empty()).ok_or_else(|| fault_field(path, n, event, key))
 }
 
 fn field_bool(line: &str, key: &str) -> bool {
@@ -448,12 +459,14 @@ impl Ledger {
 
     pub fn events(&self) -> Result<Vec<Event>, String> {
         let mut out = Vec::new();
-        for line in self.lines()? {
+        for (i, line) in self.lines()?.into_iter().enumerate() {
+            let (p, n) = (self.path.as_path(), i + 1);
             let kind = field_str(&line, "event").unwrap_or_default();
             let get = |k: &str| field_str(&line, k).unwrap_or_default();
+            let need = |k: &str| need_str(p, n, &line, &kind, k);
             out.push(match kind.as_str() {
                 "candidate" => Event::Candidate(Candidate {
-                    id: get("id"),
+                    id: need("id")?,
                     spec_sha256: get("spec_sha256"),
                     data_sha256: get("data_sha256"),
                     build_commit: get("build_commit"),
@@ -462,10 +475,12 @@ impl Ledger {
                     locked_test: LockedRange::parse(&line),
                 }),
                 "seal" => Event::Seal {
-                    sealed_sha256: get("sealed_sha256"),
+                    sealed_sha256: need("sealed_sha256")?,
                     final_seal: if field_bool(&line, "final") {
                         Some(FinalSeal {
-                            max_reads: field_num(&line, "max_reads").unwrap_or(1.0) as u64,
+                            max_reads: field_u64(&line, "max_reads")
+                                .filter(|m| *m >= 1)
+                                .ok_or_else(|| fault_field(p, n, &kind, "max_reads"))?,
                             report_candidates: field_bool(&line, "report_candidates"),
                         })
                     } else {
@@ -473,14 +488,14 @@ impl Ledger {
                     },
                 },
                 "test_read" => Event::TestRead {
-                    id: get("id"),
-                    report_sha256: get("report_sha256"),
-                    read_count: field_num(&line, "read_count").unwrap_or(0.0) as u64,
+                    id: need("id")?,
+                    report_sha256: need("report_sha256")?,
+                    read_count: field_u64(&line, "read_count").ok_or_else(|| fault_field(p, n, &kind, "read_count"))?,
                     locked_test: LockedRange::parse(&line),
                 },
                 "baseline_read" => Event::BaselineRead {
-                    data_sha256: get("data_sha256"),
-                    report_sha256: get("report_sha256"),
+                    data_sha256: need("data_sha256")?,
+                    report_sha256: need("report_sha256")?,
                     locked_test: LockedRange::parse(&line),
                 },
                 other => return Err(format!("unknown ledger event '{}'", other)),
@@ -734,7 +749,7 @@ impl Ledger {
         bind: Option<RangeBinding>,
     ) -> Result<Candidate, String> {
         let candidate = self.authorize_sealed(sealed, id, data_sha256, build_commit, bind)?;
-        if self.read_report_sha(id).is_some() {
+        if self.read_report_sha(id)?.is_some() {
             return Err(format!(
                 "candidate {} already has test_read:true; the locked test is read once",
                 id
@@ -753,11 +768,11 @@ impl Ledger {
     }
 
     /// Report hash recorded by the read of `id`, if there was one.
-    pub fn read_report_sha(&self, id: &str) -> Option<String> {
-        self.events().ok()?.into_iter().find_map(|e| match e {
+    pub fn read_report_sha(&self, id: &str) -> Result<Option<String>, String> {
+        Ok(self.events()?.into_iter().find_map(|e| match e {
             Event::TestRead { id: read, report_sha256, .. } if read == id => Some(report_sha256),
             _ => None,
-        })
+        }))
     }
 
     /// Append `test_read:true` for `id`. Returns the new total read count.
@@ -786,11 +801,11 @@ impl Ledger {
     }
 
     /// Report hash recorded by the baseline read, if there was one.
-    pub fn baseline_report_sha(&self) -> Option<String> {
-        self.events().ok()?.into_iter().find_map(|e| match e {
+    pub fn baseline_report_sha(&self) -> Result<Option<String>, String> {
+        Ok(self.events()?.into_iter().find_map(|e| match e {
             Event::BaselineRead { report_sha256, .. } => Some(report_sha256),
             _ => None,
-        })
+        }))
     }
 
     fn baseline_checks(&self, sealed: &std::path::Path, bind: Option<RangeBinding>, refuse_second: bool) -> Result<(), String> {
@@ -845,6 +860,22 @@ pub enum CrashAt {
     AfterFirstRename,
 }
 
+/// Where an output lands: the canonical parent plus the file name (the file may
+/// not exist yet), and the device and inode when it does, so a hard link or a
+/// symlink to the same file is found.
+fn output_identity(path: &std::path::Path) -> Result<(std::path::PathBuf, Option<(u64, u64)>), String> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let dir = std::fs::canonicalize(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    let name = path.file_name().ok_or_else(|| format!("{}: no file name", path.display()))?;
+    let inode = match std::fs::metadata(path) {
+        Ok(m) => Some((m.dev(), m.ino())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{}: cannot stat the output: {}", path.display(), e)),
+    };
+    Ok((dir.join(name), inode))
+}
+
 /// Write the report files of a locked read around the ledger record: every
 /// file is written beside its target and synced first, then `record` runs, then
 /// each file is renamed into place. A failure before `record` leaves the read
@@ -863,9 +894,22 @@ pub fn write_around_record<T>(
             Ok(())
         }
     };
-    for (i, (a, _)) in outs.iter().enumerate() {
-        if outs[..i].iter().any(|(b, _)| b == a) {
-            return Err(format!("{}: two outputs name the same file", a.display()));
+    let ids = outs
+        .iter()
+        .map(|(p, _)| {
+            output_identity(p).map_err(|e| format!("{}; nothing was recorded, the locked read is still available", e))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for i in 0..outs.len() {
+        for j in 0..i {
+            let same_inode = ids[i].1.is_some() && ids[i].1 == ids[j].1;
+            if ids[i].0 == ids[j].0 || same_inode {
+                return Err(format!(
+                    "{} and {}: two outputs name the same file; nothing was recorded, the locked read is still available",
+                    outs[j].0.display(),
+                    outs[i].0.display()
+                ));
+            }
         }
     }
     let mut staged = Vec::new();
@@ -1245,8 +1289,7 @@ fn complete_lines(path: &str, what: &str, text: &str) -> Result<Vec<String>, Str
     Ok(out)
 }
 
-fn marker_lines(data_path: &str)
- -> Result<Vec<MarkerLine>, String> {
+fn marker_lines(data_path: &str) -> Result<Vec<MarkerLine>, String> {
     let path = marker_path(data_path);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -1262,7 +1305,11 @@ fn marker_lines(data_path: &str)
             event: get("event"),
             report_sha256: get("report_sha256"),
         };
-        if !matches!(m.event.as_str(), "test_read" | "baseline_read") || m.ledger.is_empty() {
+        if !matches!(m.event.as_str(), "test_read" | "baseline_read")
+            || m.ledger.is_empty()
+            || m.ledger_head.is_empty()
+            || m.report_sha256.is_empty()
+        {
             return Err(format!("{}: malformed read marker line", path));
         }
         out.push(m);

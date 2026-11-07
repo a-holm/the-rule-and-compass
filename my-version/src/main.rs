@@ -126,6 +126,10 @@ USAGE:
   rcsr calibrate [--out <path>] [--gpu | --cpu]
                               time this machine and write the calibration
                               file that --dispatch auto routes from
+  rcsr dispatch-plan [--calibration <anchors|path>] [--against <anchors|path>] [--json]
+                              print the device/cpu route of 4950 eval and fit
+                              cells under a calibration and the cells that flip
+                              under another (no clock, no device)
   rcsr dev-report <log.ndjson>
                               summarise the development log rcsr writes by
                               default (phases, fit/eval share, fallback
@@ -797,7 +801,11 @@ SEARCH:
                              reports stop_reason time_budget with
                              converged_early false. The checkpoint is not
                              terminal: --resume runs more generations and may
-                             set a new --time-budget
+                             set a new --time-budget. The budget is saved with
+                             the checkpoint: a --resume without --time-budget
+                             runs with the saved one (not with none), and
+                             --time-budget replaces it for this process only.
+                             A resume prints the budget it uses
   --gpu                      assert that the GPU must guide the search: an
                              error (exit 2) when the binary was not built with
                              --features cuda or no device is present. After
@@ -975,9 +983,10 @@ CHECKPOINTS:
                              (cpu<->gpu) and say so on stderr and in the
                              run manifest
   --allow-build-change       resume a checkpoint written by a different
-                             binary, commit, version, device, driver or
-                             thread count (#256). Without it the mismatch
-                             is refused (exit 3). A time-budget stop is not
+                             binary, commit, version, device or driver
+                             (#256). Without it the mismatch is refused
+                             (exit 3). A different CPU count is never
+                             refused: stderr names it (#860). A time-budget stop is not
                              terminal: --resume continues it and
                              --time-budget may be set again
 
@@ -2331,6 +2340,10 @@ fn main() {
     if args.first().map(|s| s.as_str()) == Some("calibrate") {
         rcsr::dispatch::run_calibrate(&args[1..]);
     }
+    // #861: print the dispatch route plan of a calibration.
+    if args.first().map(|s| s.as_str()) == Some("dispatch-plan") {
+        rcsr::dispatch_plan::run(&args[1..]);
+    }
     // #71: `import` is a subcommand, handled before the search option parser.
     if args.first().map(|s| s.as_str()) == Some("import") {
         run_import(&args[1..]);
@@ -3467,12 +3480,13 @@ fn main() {
         eprintln!("error: --report cannot be combined with --eval-expr");
         std::process::exit(EXIT_USAGE);
     }
-    if let Some(p) = &ledger_arg {
-        if let Err(e) = rcsr::protocol::Ledger::new(p).read_count() {
+    let ledger_reads = match &ledger_arg {
+        Some(p) => rcsr::protocol::Ledger::new(p).read_count().unwrap_or_else(|e| {
             eprintln!("error: {}", e);
-            std::process::exit(EXIT_INPUT);
-        }
-    }
+            std::process::exit(EXIT_INPUT)
+        }),
+        None => 0,
+    };
     // #211: the development log describes one search. It is on by default, so
     // only an *explicit* request is refused where it cannot be honoured;
     // `--report benchmark` simply runs its repeats without a log.
@@ -3896,7 +3910,8 @@ fn main() {
         }
         // #256: the time budget limits one process, not the trajectory, so a
         // resumed run takes the budget it is given (a stopped run is resumed
-        // exactly to get more time).
+        // exactly to get more time). Without `--time-budget` it keeps the saved
+        // one (#880).
         if time_budget_set {
             effective.time_budget = cfg.time_budget;
         }
@@ -3922,7 +3937,7 @@ fn main() {
     cfg.dispatch = dispatch_mode;
 
     let gpu_probe = if gpu_explicit == Some(false) {
-        backend::Probe::cpu("--cpu/--no-gpu (device not probed)")
+        backend::Probe::not_probed("--cpu/--no-gpu (device not probed)")
     } else {
         backend::probe()
     };
@@ -5692,8 +5707,8 @@ fn main() {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
         }
-        // #256: the binary, commit, device, driver and thread count are part
-        // of what produced the saved state.
+        // #256: the binary, commit, device and driver are part of what
+        // produced the saved state. The CPU count is reported, not refused.
         let current_identity =
             rcsr::provenance::BuildIdentity::current(current_backend == Backend::Gpu);
         if let Err(e) = cp.check_identity(&current_identity, allow_build_change) {
@@ -5703,9 +5718,15 @@ fn main() {
         if let Some(saved) = &cp.identity {
             let diff = saved.differences(&current_identity);
             if !diff.is_empty() {
+                let allowed = if saved.refusing_differences(&current_identity).is_empty() {
+                    ""
+                } else {
+                    " (allowed by --allow-build-change)"
+                };
                 eprintln!(
-                    "# checkpoint: build identity changed ({}) (allowed by --allow-build-change)",
-                    diff.join("; ")
+                    "# checkpoint: build identity changed ({}){}",
+                    diff.join("; "),
+                    allowed
                 );
             }
         }
@@ -6067,6 +6088,13 @@ fn main() {
         } else {
             eprintln!("# checkpoint: resumed from {} at generation {}", path, gen);
         }
+        if let Some(budget) = cfg.time_budget {
+            eprintln!(
+                "# checkpoint: time budget {} s ({})",
+                budget,
+                if time_budget_set { "from --time-budget" } else { "saved with the checkpoint" }
+            );
+        }
     }
 
     // #26/#141: the backend note belongs to the CLI, not to the library.
@@ -6107,7 +6135,7 @@ fn main() {
         } else {
             (
                 "cpu",
-                "-",
+                if gpu_probe.probed { "-" } else { "not probed" },
                 gpu_explicit
                     .filter(|explicit| !*explicit)
                     .map(|_| "--cpu/--no-gpu")
@@ -6741,6 +6769,7 @@ fn main() {
         cfg.metric,
         baseline_samples,
         cfg.seed,
+        cfg.threads, // #859
     );
     let baselines_seconds = baselines_start.elapsed().as_secs_f64();
 
@@ -7418,10 +7447,7 @@ fn main() {
                     _ => Vec::new(),
                 };
                 let overlap = lockbox.overlap(times.iter().copied());
-                let reads = ledger_arg
-                    .as_ref()
-                    .map(|p| rcsr::protocol::Ledger::new(p).read_count().unwrap_or(0))
-                    .unwrap_or(0);
+                let reads = ledger_reads;
                 let evaluated = spec.declared_lockbox.is_none() && allow_lockbox && overlap.rows > 0;
                 let mut j = lockbox.json(&overlap, allow_lockbox, false, evaluated);
                 j.pop();
@@ -7726,7 +7752,7 @@ fn main() {
                     .or_else(|| gpu_probe.reason.clone())
             };
             let backend_json = format!(
-                "\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"threads\":{},",
+                "\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"device_probed\":{},\"threads\":{},",
                 outcome.backend.name(),
                 backend_reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
                 outcome
@@ -7734,6 +7760,7 @@ fn main() {
                     .as_deref()
                     .map(jstr)
                     .unwrap_or_else(|| "null".to_string()),
+                gpu_probe.probed,
                 cfg.threads, // #463
             );
             let backend_json = format!(
@@ -7874,7 +7901,7 @@ fn main() {
                     .or_else(|| gpu_probe.reason.clone())
             };
             println!(
-                "{{\"event\":\"backend\",\"backend\":\"{}\",\"backend_reason\":{},\"device\":{}}}",
+                "{{\"event\":\"backend\",\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"device_probed\":{}}}",
                 outcome.backend.name(),
                 nd_backend_reason
                     .as_deref()
@@ -7884,7 +7911,8 @@ fn main() {
                     .device
                     .as_deref()
                     .map(jstr)
-                    .unwrap_or_else(|| "null".to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+                gpu_probe.probed
             );
             for (expression, complexity, error) in &seed_rows {
                 println!(
@@ -11106,6 +11134,11 @@ fn run_walkforward(args: &[String]) -> ! {
         min_hold,
         gpu,
     };
+    if spec.policy == walkforward::Policy::TopTercile {
+        if let Some(msg) = walkforward::top_tercile_refusal(&spec, &popts) {
+            usage_fail(&msg);
+        }
+    }
     let resolved = rcsr::lockbox::resolve_with(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path).unwrap_or_else(|e| {
         eprintln!("error: {}", e.message);
         std::process::exit(e.exit);
@@ -11271,9 +11304,10 @@ fn run_walkforward(args: &[String]) -> ! {
         if let Some(l) = &ledger {
             let outcome = if locked_test && verify_read {
                 match l.read_report_sha(&candidate_id) {
-                    Some(h) if h == report_sha => Ok(read_count),
-                    Some(h) => Err(format!("report sha256 {} differs from the recorded read {}", report_sha, h)),
-                    None => Err("no recorded read for this candidate".to_string()),
+                    Ok(Some(h)) if h == report_sha => Ok(read_count),
+                    Ok(Some(h)) => Err(format!("report sha256 {} differs from the recorded read {}", report_sha, h)),
+                    Ok(None) => Err("no recorded read for this candidate".to_string()),
+                    Err(e) => Err(e),
                 }
             } else if locked_test {
                 // The record runs after the report files are staged; the report names the count it will produce.

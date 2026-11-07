@@ -10,8 +10,10 @@
 //!
 //! The gpu arm runs `--gpu --dispatch device` and fails when the run reports no device time.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use rcsr::devlog::Json;
 
@@ -31,7 +33,8 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn rcsr(args: &[String]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rcsr")).args(args).output().unwrap();
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = rcsr_cmd::rcsr_for(&refs).args(args).output().unwrap();
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),

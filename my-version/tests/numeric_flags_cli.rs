@@ -1,8 +1,11 @@
 //! Numeric flags: an unparsable value exits 2 naming the flag and the value;
 //! 0 stays valid where it means "off" or "all".
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -23,8 +26,7 @@ fn csv() -> (Scratch, PathBuf) {
 /// The children set `RCSR_GPU=0`: no device call, not even the startup probe that `--cpu` still runs.
 fn search(flag: &str, value: &str) -> Output {
     let (_scratch, data) = csv();
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
-        .env("RCSR_GPU", "0")
+    rcsr_cmd::rcsr()
         .arg("--data")
         .arg(&data)
         .args(["--target", "y", "--generations", "1", "--pop", "20", "--quiet"])
@@ -35,8 +37,7 @@ fn search(flag: &str, value: &str) -> Output {
 
 fn audit(flag: &str, value: &str) -> Output {
     let (_scratch, data) = csv();
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
-        .env("RCSR_GPU", "0")
+    rcsr_cmd::rcsr()
         .arg("audit")
         .arg("--data")
         .arg(&data)
@@ -114,6 +115,7 @@ fn audit_flags_refuse_unparsable_values() {
 #[cfg(feature = "cuda")]
 #[test]
 fn gpu_bench_flags_refuse_unparsable_values() {
+    use std::process::Command;
     for flag in ["--batch", "--reps", "--depth", "--seed"] {
         let out = Command::new(env!("CARGO_BIN_EXE_rcsr-gpu-bench"))
             .args([flag, "abc"])

@@ -2,10 +2,12 @@
 //! of silently dropping it (issue #72). `--skip-malformed` is the explicit,
 //! counted opt-out.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 use rcsr::data::{self, PrepSpec, SplitSpec};
 use rcsr::rng::Mt;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 #[path = "common/scratch.rs"]
 mod scratch;
@@ -72,19 +74,14 @@ fn skip_malformed_drops_exactly_one_row_and_reports_it() {
 
 #[test]
 fn the_cli_refuses_a_ragged_file_with_exit_3() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let mut child = rcsr_cmd::rcsr()
         .args(["--data", "-", "--target", "y", "--generations", "1", "--pop", "8"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(RAGGED.as_bytes())
-        .unwrap();
+    rcsr_cmd::feed_stdin(&mut child, RAGGED.as_bytes());
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(3));
     let err = String::from_utf8_lossy(&out.stderr);
@@ -98,7 +95,7 @@ fn the_cli_refuses_a_ragged_file_with_exit_3() {
 
 #[test]
 fn the_cli_skip_malformed_flag_reports_the_skipped_count() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let mut child = rcsr_cmd::rcsr()
         .args([
             "--data",
             "-",
@@ -115,12 +112,7 @@ fn the_cli_skip_malformed_flag_reports_the_skipped_count() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(RAGGED.as_bytes())
-        .unwrap();
+    rcsr_cmd::feed_stdin(&mut child, RAGGED.as_bytes());
     let out = child.wait_with_output().unwrap();
     assert_eq!(
         out.status.code(),
@@ -268,7 +260,7 @@ fn the_data_cli_reads_a_quoted_file_from_a_path() {
     let dir = scratch.path().to_path_buf();
     let csv = dir.join("q.csv");
     std::fs::write(&csv, "x,y,label\r\n1,2,\"a,b\"\r\n3,4,\"c,d\"\r\n").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let output = rcsr_cmd::rcsr()
         .args([
             "--data",
             csv.to_str().unwrap(),
@@ -311,7 +303,7 @@ fn the_import_cli_streams_quoted_values_from_a_path() {
         ),
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let output = rcsr_cmd::rcsr()
         .args(["import", csv.to_str().unwrap(), store.to_str().unwrap()])
         .output()
         .unwrap();

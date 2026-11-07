@@ -36,7 +36,7 @@ fn fixture(p: usize, n: usize) -> (Vec<Vec<f64>>, Vec<f64>, Node) {
 
 fn evaluator(x: &[Vec<f64>], y: &[f64]) -> Option<GpuEvaluator> {
     if !probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return None;
     }
     let (n, p) = (x.len(), x[0].len());

@@ -559,7 +559,7 @@ mod device {
     #[test]
     fn device_matches_canonical_cpu_on_100k_rows() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let n = 100_000usize;
@@ -587,7 +587,7 @@ mod device {
     #[test]
     fn repeat_runs_and_chunks_and_threads_are_bit_identical() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let n = 70_000usize;
@@ -621,7 +621,7 @@ mod device {
     #[test]
     fn padded_batch_does_not_change_a_candidate() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let n = 30_000usize;
@@ -668,7 +668,7 @@ mod device {
     #[test]
     fn device_reads_f64_scores_outside_the_f32_range() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let cycle = [
@@ -703,7 +703,7 @@ mod device {
     #[test]
     fn device_compares_a_threshold_not_representable_in_f32() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let n = 64usize;
@@ -733,7 +733,7 @@ mod device {
     fn screening_net_is_the_exact_net_on_an_underflowing_score() {
         use rcsr::selection::screening_net;
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let n = 200usize;
@@ -756,7 +756,7 @@ mod device {
     fn an_underflowing_winner_stays_inside_the_band() {
         use rcsr::selection::screening_net;
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let n = 400usize;
@@ -793,7 +793,7 @@ mod device {
     #[test]
     fn a_one_ulp_device_fault_is_caught() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let r = 0.0123f64;
@@ -816,7 +816,7 @@ mod device {
     #[ignore]
     fn bench_pnl_vs_cpu() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let n: usize = std::env::var("RCSR_PNL_BENCH_ROWS")
@@ -1222,7 +1222,7 @@ fn device_threshold_and_mask_match_the_cpu_bit_for_bit() {
     };
 
     if !rcsr::trading_gpu::device_available() {
-        eprintln!("skip: no CUDA device");
+        rcsr::backend::skip_without_device("skip: no CUDA device");
         return;
     }
     let scores = sample_scores(1_000_000);
@@ -1876,7 +1876,7 @@ mod device_conformance {
     #[test]
     fn every_padded_candidate_equals_its_own_alone_run_at_every_thread_and_chunk() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let n = 70_000usize;
@@ -1918,7 +1918,7 @@ mod device_conformance {
         use rcsr::baselines::{control_positions, device_totals, position_totals};
         const POSITION_THRESHOLD: f64 = 0.5;
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let n = 70_000usize;
@@ -2065,7 +2065,7 @@ mod device_band_dp {
     #[test]
     fn device_band_cooldown_and_dp_scans_are_bit_identical_at_every_thread_count_and_chunk() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let side = 0.001;
@@ -2099,7 +2099,7 @@ mod device_band_dp {
     #[test]
     fn every_padded_band_candidate_equals_its_own_alone_run_at_every_thread_and_chunk() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let n = 20_000usize;
@@ -2159,7 +2159,7 @@ mod device_band_dp {
     #[test]
     fn device_dp_matches_brute_force_over_all_paths_for_n_le_20() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let side = 0.001;
@@ -2188,7 +2188,7 @@ mod device_band_dp {
     #[test]
     fn device_band_beta_zero_is_the_threshold_rule_bit_for_bit() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let scores = vec![
@@ -2232,7 +2232,7 @@ mod device_band_dp {
     #[test]
     fn device_scan_edges_seams_entry_final_exit_and_cooldown_minimum_match_the_cpu() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let side = 0.001;
@@ -2336,7 +2336,7 @@ mod device_band_dp {
     #[test]
     fn device_scan_refuses_with_a_label_instead_of_returning_inexact_bits() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let (scores, returns, groups) = rounding_data(100, 10);
@@ -2389,7 +2389,7 @@ mod device_band_dp {
     #[test]
     fn walkforward_gpu_band_and_dp_equal_the_cpu_report_bit_for_bit() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let mut rows: Vec<(f64, &str, f64, f64)> = Vec::new();
@@ -2456,7 +2456,7 @@ mod device_band_dp {
     #[ignore]
     fn bench_band_dp_device_vs_cpu() {
         if !device_available() {
-            eprintln!("skipped: no CUDA device");
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
             return;
         }
         let env = |name: &str, default: usize| -> usize {

@@ -2,13 +2,15 @@
 //! the default `--dispatch auto` gives one front and one route ledger in every
 //! process, and `rcsr calibrate` is the only writer of the calibration file.
 
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+
 #[path = "common/scratch.rs"]
 mod scratch;
 
 use scratch::Scratch;
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 fn csv() -> String {
     let mut text = String::from("x0,x1,y\n");
@@ -24,7 +26,7 @@ fn csv() -> String {
 /// One CLI search. `cache` is the private `XDG_CACHE_HOME`, so no file of the
 /// machine's real cache is read.
 fn search(cache: &Path, extra: &[&str]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    let mut child = rcsr_cmd::rcsr_for(extra)
         .args([
             "--data", "-", "--target", "y", "--vars", "x0,x1", "--islands", "1", "--pop", "30",
             "--generations", "3", "--seed", "1", "--patience", "0", "--json", "--no-dev-log",
@@ -37,7 +39,7 @@ fn search(cache: &Path, extra: &[&str]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.as_mut().unwrap().write_all(csv().as_bytes()).unwrap();
+    rcsr_cmd::feed_stdin(&mut child, csv().as_bytes());
     child.wait_with_output().unwrap()
 }
 
@@ -73,7 +75,7 @@ fn route_ledger(json: &str) -> Vec<(String, String, String)> {
 }
 
 fn calibrate(cache: &Path, out: &Path, extra: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+    rcsr_cmd::rcsr_for(extra)
         .arg("calibrate")
         .arg("--out")
         .arg(out)
@@ -89,14 +91,18 @@ fn sha256_of(path: &Path) -> String {
 
 #[cfg(feature = "cuda")]
 fn device_available() -> bool {
-    rcsr::gpu::probe().available()
+    let present = rcsr::gpu::probe().available();
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 #[cfg(feature = "cuda")]
 #[test]
 fn two_auto_runs_give_one_front_and_one_route_ledger() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let cache = Scratch::new("auto-two");
@@ -114,7 +120,7 @@ fn two_auto_runs_give_one_front_and_one_route_ledger() {
 #[test]
 fn a_calibrated_file_gives_equal_fronts_and_its_own_hash() {
     if !device_available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let dir = Scratch::new("file-two");
@@ -280,4 +286,43 @@ fn calibrate_with_the_enrich_probe_writes_valid_rates() {
     let out = calibrate(dir.path(), &skipped, &["--no-enrich"]);
     assert_eq!(out.status.code(), Some(0));
     assert!(std::fs::read_to_string(&skipped).unwrap().contains("\"enrich\":null"));
+}
+
+/// #861: `rcsr dispatch-plan` prints the route table of the anchors against a
+/// calibration file, byte for byte the same in every process, and its flips
+/// stay few.
+#[test]
+fn dispatch_plan_prints_the_same_table_twice_and_few_flips() {
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/calibration_rtx3060.json");
+    let run = || {
+        rcsr_cmd::rcsr()
+            .args(["dispatch-plan", "--calibration", "anchors", "--against", fixture])
+            .output()
+            .unwrap()
+    };
+    let (a, b) = (run(), run());
+    assert_eq!(a.status.code(), Some(0), "{}", String::from_utf8_lossy(&a.stderr));
+    assert_eq!(a.stdout, b.stdout, "two processes print different bytes");
+    let text = String::from_utf8(a.stdout).unwrap();
+    let cells = text.lines().filter(|l| l.starts_with("eval ") || l.starts_with("fit ")).count();
+    assert_eq!(cells, 4950);
+    let summary = text.lines().last().unwrap();
+    let flips: usize = summary
+        .strip_prefix("grid cells 4950, flips ")
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("summary line: {summary}"));
+    assert!(flips <= 60, "{summary}");
+    let json = rcsr_cmd::rcsr()
+        .args(["dispatch-plan", "--against", fixture, "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json.status.code(), Some(0));
+    let json = String::from_utf8(json.stdout).unwrap();
+    assert!(json.starts_with("{\"schema\":\"rcsr-dispatch-plan/1\""), "{json}");
+    assert!(json.contains("\"cells\":4950"), "{json}");
+    let probe = rcsr_cmd::rcsr().args(["dispatch-plan", "--calibration", "probe"]).output().unwrap();
+    assert_eq!(probe.status.code(), Some(2));
+    let missing = rcsr_cmd::rcsr().args(["dispatch-plan", "--against", "/no/such/file.json"]).output().unwrap();
+    assert_eq!(missing.status.code(), Some(2));
 }

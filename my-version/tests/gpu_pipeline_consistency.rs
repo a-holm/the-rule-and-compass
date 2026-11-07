@@ -208,7 +208,7 @@ fn report(label: &str, a: &Audit) {
 fn device_available() -> bool {
     let ok = rcsr::gpu::probe().available();
     if !ok {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
     }
     ok
 }
