@@ -235,6 +235,22 @@ The guarantee holds because the checkpoint carries all of the trajectory state:
   `no_improve`);
 * the archive, with its members and capacity.
 
+The CPU count and `--threads` are not part of the trajectory. Every stage that
+reads the thread count hands out independent items and writes each result at its
+own index: batch scoring and constant fits (`par_map`), the exact CPU fallback
+fits, the device-proposal gate, the finalist refit, the screened refit and the
+k-NN baseline queries. Islands are one thread each, and their RNG streams come
+from the seed and the island index. The island count is `--islands`, a saved
+setting, never derived from the CPU count. `tests/checkpoint.rs`
+(`search_results_do_not_depend_on_the_thread_count`,
+`a_device_search_does_not_depend_on_the_thread_count`,
+`resume_under_another_cpu_count_is_allowed`) checks the archive, test errors and
+checkpoint bytes at 1, 2, 3 and 12 threads and across a resume from 12 to 1.
+The one place `--threads` meets a routing rule is the start of a fresh run: with
+`--fit-strategy auto` it enters the device fit cost check once (`--threads` when
+given, else 8). The resolved strategy is saved, and a resume does not resolve it
+again.
+
 Limits:
 
 * **Wall-clock budgets are not reproducible.** The budget is a limit of one
