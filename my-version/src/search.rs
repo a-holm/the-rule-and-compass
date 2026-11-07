@@ -1935,7 +1935,7 @@ impl GpuSearch {
         }
         let rows = EvalSample { sample: train, cols: None };
         let prefix_start = std::time::Instant::now();
-        let bound_rule = flat_bound_rule(train, cfg);
+        let bound_rule = flat_bound_rule(train, cfg, self.pool_is_gradual());
         if bound_rule.is_some() {
             self.ensure_check_pieces(data);
         }
@@ -1999,6 +1999,12 @@ impl GpuSearch {
             .submit_checked(jobs, data, cfg);
         check.pool_s = submit_start.elapsed().as_secs_f64();
         Some(PendingCheck { full, ticket, check })
+    }
+
+    /// #895: the calling thread and every pool worker round subnormals as IEEE does.
+    fn pool_is_gradual(&self) -> bool {
+        let workers = self.fallback.as_ref().map_or(&[false][..], |p| &p.worker_gradual);
+        crate::flat_bound::gate(crate::flat_bound::gradual_underflow(), workers)
     }
 
     /// #895: build the column pieces of `data` unless they are cached for this
@@ -2700,6 +2706,9 @@ struct FallbackPool {
     /// Number of worker threads that have executed at least one chunk. Used by
     /// the tests to prove the scoring ran on the pool, not the caller.
     busy: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// #895: whether each worker thread rounds subnormals as IEEE does,
+    /// read on the worker itself when it starts.
+    worker_gradual: Vec<bool>,
 }
 
 /// Borrowed scoring context for one [`FallbackPool::score`] call. The raw
@@ -2746,13 +2755,16 @@ impl FallbackPool {
         let (done_tx, done) = std::sync::mpsc::channel::<FallbackResult>();
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
         let busy = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (gradual_tx, gradual_rx) = std::sync::mpsc::channel::<bool>();
         for i in 0..workers {
             let rx = std::sync::Arc::clone(&rx);
             let done_tx = done_tx.clone();
             let busy = std::sync::Arc::clone(&busy);
+            let gradual_tx = gradual_tx.clone();
             std::thread::Builder::new()
                 .name(format!("rcsr-fallback-{i}"))
                 .spawn(move || {
+                    let _ = gradual_tx.send(crate::flat_bound::gradual_underflow());
                     let mut counted = false;
                     loop {
                         let chunk = {
@@ -2794,12 +2806,15 @@ impl FallbackPool {
                 })
                 .expect("spawn a CPU fallback worker");
         }
+        drop(gradual_tx);
+        let worker_gradual: Vec<bool> = (0..workers).map(|_| gradual_rx.recv().unwrap_or(false)).collect();
         FallbackPool {
             tx,
             done,
             workers,
             queue,
             busy,
+            worker_gradual,
         }
     }
 
@@ -4111,15 +4126,16 @@ type CheckPiecesKey = (u64, usize, usize);
 /// `+inf` slot: a book with `min_trades >= 1` scores `+inf` when no row has a
 /// finite prediction above the threshold, and when a prediction is non-finite.
 /// The bound runs on this thread, the passes on pool threads; a flush-to-zero
-/// mode here would make an upper bound unsound.
+/// mode on either would make an upper bound unsound, so `threads_gradual` must
+/// hold for the calling thread and every worker.
 #[cfg(any(feature = "cuda", test))]
-fn flat_bound_rule(train: &Sample, cfg: &Config) -> Option<f64> {
+fn flat_bound_rule(train: &Sample, cfg: &Config, threads_gradual: bool) -> Option<f64> {
     let book = cfg.fitness.book()?;
     (!train.is_multi()
         && !train.is_empty()
         && book.len() == train.len()
         && book.min_trades() >= 1
-        && crate::flat_bound::gradual_underflow())
+        && threads_gradual)
     .then(|| book.threshold())
 }
 
@@ -12500,7 +12516,7 @@ mod tests {
             for min_trades in [1usize, 5] {
                 for blocks in [1usize, 4] {
                     let (s, cfg) = flat_book_fixture(threshold, min_trades, blocks);
-                    let rule = flat_bound_rule(&s, &cfg);
+                    let rule = flat_bound_rule(&s, &cfg, true);
                     assert_eq!(rule, Some(threshold));
                     let columns = EvalSample::new(&s, &cfg);
                     let scalar = EvalSample { sample: &s, cols: None };
@@ -12523,15 +12539,16 @@ mod tests {
         }
         assert!(fired >= 150, "the bound fires on the planted flat trees: {fired}");
         let (s, cfg) = flat_book_fixture(1e-30, 0, 1);
-        assert_eq!(flat_bound_rule(&s, &cfg), None, "a flat book scores 1 with --min-trades 0");
+        assert_eq!(flat_bound_rule(&s, &cfg, true), None, "a flat book scores 1 with --min-trades 0");
         let (s, cfg) = flat_book_fixture(1e-30, 1, 1);
+        assert_eq!(flat_bound_rule(&s, &cfg, false), None, "a thread with flush-to-zero turns the rule off");
         let metric = Config { fitness: Fitness::Metric, ..cfg.clone() };
-        assert_eq!(flat_bound_rule(&s, &metric), None, "no book, no rule");
+        assert_eq!(flat_bound_rule(&s, &metric, true), None, "no book, no rule");
         let mut multi = s.clone();
         multi.ys = vec![s.y.clone(), s.y.clone()];
-        assert_eq!(flat_bound_rule(&multi, &cfg), None, "a multi-output sample");
+        assert_eq!(flat_bound_rule(&multi, &cfg, true), None, "a multi-output sample");
         let short = Sample { x: s.x[..10].to_vec(), y: s.y[..10].to_vec(), ..s.clone() };
-        assert_eq!(flat_bound_rule(&short, &cfg), None, "a sample the book does not cover");
+        assert_eq!(flat_bound_rule(&short, &cfg, true), None, "a sample the book does not cover");
     }
 
     /// #895: the device check settles a tree whose f64 predictions cannot
