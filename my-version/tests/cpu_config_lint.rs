@@ -9,7 +9,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// `(file, reason)`: tests that run the default backend on purpose.
-const ALLOWED: &[(&str, &str)] = &[];
+const ALLOWED: &[(&str, &str)] = &[(
+    "tests/refit_band_default.rs",
+    "reads a field of the default config and runs no search",
+)];
 
 /// Problems of one file: the 1-based line of each `Config` literal or default call that does not
 /// state `gpu`.
