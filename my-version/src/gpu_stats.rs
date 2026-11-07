@@ -171,6 +171,30 @@ pub struct FitAlloc {
     pub batches: u64,
 }
 
+/// #858: the exact CPU check of device `+inf` scores. It runs inside the eval
+/// stage, so it is a measured leaf of `eval_s`, not a stage of its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EvalCheckLedger {
+    /// Seconds in the f64 prefix probe and the dimension filter.
+    pub prefix_s: f64,
+    /// Seconds the host waits for the full f64 passes on the pool.
+    pub pool_s: f64,
+    /// Slots checked: status-2 slots plus trade-floor slots.
+    pub slots: u64,
+    /// Of `slots`, the status-0 trade-floor ones.
+    pub trade_floor_slots: u64,
+    /// Slots that needed a full f64 pass.
+    pub full_passes: u64,
+    /// Full passes that came out finite on the CPU.
+    pub finite: u64,
+}
+
+impl EvalCheckLedger {
+    pub fn seconds(&self) -> f64 {
+        self.prefix_s + self.pool_s
+    }
+}
+
 /// #284: run-scoped telemetry. Stage seconds are exclusive main-thread windows;
 /// device intervals are used only for the union. The two measures may differ
 /// (device work can overlap host work), which is why the ledger reports both.
@@ -212,6 +236,8 @@ pub struct RunLedger {
     eval_fallback_programs: u64,
     /// Wall seconds the evaluator's CPU fallback pool spent.
     eval_fallback_s: f64,
+    /// #858: the CPU check of device `+inf` scores, a leaf of the eval stage.
+    eval_check: EvalCheckLedger,
     /// Finalist refits performed.
     refits: u64,
     /// #334: allocator activity of the fit and score regions.
@@ -435,6 +461,22 @@ impl RunLedger {
         }
     }
 
+    /// #858: add one CPU check of device `+inf` scores. Non-finite and negative
+    /// seconds are ignored.
+    pub fn record_eval_check(&mut self, c: EvalCheckLedger) {
+        let keep = |v: f64| if v.is_finite() && v > 0.0 { v } else { 0.0 };
+        self.eval_check.prefix_s += keep(c.prefix_s);
+        self.eval_check.pool_s += keep(c.pool_s);
+        self.eval_check.slots += c.slots;
+        self.eval_check.trade_floor_slots += c.trade_floor_slots;
+        self.eval_check.full_passes += c.full_passes;
+        self.eval_check.finite += c.finite;
+    }
+
+    pub fn eval_check(&self) -> EvalCheckLedger {
+        self.eval_check
+    }
+
     /// #284: set the evaluator full-path wall, the scope of the evaluator-window
     /// kernel duty. It can cover generation-0 scoring outside the loop stages.
     pub fn set_eval_window(&mut self, seconds: f64) {
@@ -469,6 +511,7 @@ impl RunLedger {
         self.fallback_fits += other.fallback_fits;
         self.eval_fallback_programs += other.eval_fallback_programs;
         self.eval_fallback_s += other.eval_fallback_s;
+        self.record_eval_check(other.eval_check);
         self.fit_alloc.alloc_calls += other.fit_alloc.alloc_calls;
         self.fit_alloc.growths += other.fit_alloc.growths;
         self.fit_alloc.steady_alloc_calls += other.fit_alloc.steady_alloc_calls;
@@ -1019,6 +1062,38 @@ mod tests {
         assert!((l.stage_s(Stage::Fit) - 5.0).abs() < 1e-12);
         assert!((l.stage_s(Stage::Vary) - 3.0).abs() < 1e-12);
         assert!((l.drain_wall_s() - 7.0).abs() < 1e-12);
+    }
+
+    /// #858: the CPU check is a leaf inside the eval stage. Recording it moves
+    /// no stage and no closure number, and a merge adds the counts.
+    #[test]
+    fn eval_check_is_a_leaf_of_eval() {
+        let mut l = RunLedger::new();
+        l.record_island_window_overlap(4.0, 8.0, 2, 3.0, 9.0);
+        l.set_wall(l.stage_sum_s());
+        let (sum, unaccounted, eval) = (l.stage_sum_s(), l.unaccounted_s(), l.stage_s(Stage::Eval));
+        let c = EvalCheckLedger {
+            prefix_s: 0.25,
+            pool_s: 1.5,
+            slots: 10,
+            trade_floor_slots: 4,
+            full_passes: 6,
+            finite: 2,
+        };
+        l.record_eval_check(c);
+        l.record_eval_check(EvalCheckLedger { pool_s: f64::NAN, prefix_s: -1.0, slots: 1, ..Default::default() });
+        assert_eq!(l.stage_sum_s().to_bits(), sum.to_bits());
+        assert_eq!(l.unaccounted_s().to_bits(), unaccounted.to_bits());
+        assert_eq!(l.stage_s(Stage::Eval).to_bits(), eval.to_bits());
+        assert_eq!(l.unaccounted_s(), 0.0);
+        let got = l.eval_check();
+        assert_eq!((got.slots, got.trade_floor_slots, got.full_passes, got.finite), (11, 4, 6, 2));
+        assert_eq!(got.seconds(), 1.75);
+        let mut total = RunLedger::new();
+        total.absorb(&l);
+        total.absorb(&l);
+        assert_eq!(total.eval_check().slots, 22);
+        assert_eq!(total.eval_check().seconds(), 3.5);
     }
 
     #[test]
