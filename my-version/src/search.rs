@@ -11929,7 +11929,7 @@ mod tests {
     #[test]
     fn device_check_uses_the_run_view() {
         if !crate::gpu::probe().available() {
-            eprintln!("skipping GPU test: no usable CUDA device");
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
             return;
         }
         let n = 300;
