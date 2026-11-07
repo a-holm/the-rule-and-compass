@@ -499,7 +499,11 @@ fn run_gpu(data: &str, spec: &str, flag: &[&str], fault: &str, extra: &[&str]) -
 
 #[cfg(feature = "cuda")]
 fn has_device(o: &Output) -> bool {
-    !(code(o) == 2 && stderr(o).contains("no GPU is available"))
+    let present = !(code(o) == 2 && stderr(o).contains("no GPU is available"));
+    if !present {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+    }
+    present
 }
 
 #[cfg(feature = "cuda")]
@@ -508,7 +512,7 @@ fn an_explicit_gpu_run_exits_non_zero_when_the_book_is_refused() {
     let (_scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", None);
     let spec = write_spec(&dir, "s.json", 0.0, "null", false);
-    let o = run_gpu(&data, &spec, &["--gpu"], "pnl_book", &[]);
+    let o = run_gpu(&data, &spec, &["--gpu", "--dispatch", "device"], "pnl_book", &[]);
     if !has_device(&o) {
         return;
     }

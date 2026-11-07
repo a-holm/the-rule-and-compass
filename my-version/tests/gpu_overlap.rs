@@ -133,7 +133,7 @@ fn small_default_cell_overlap_matches_serial() {
     use rcsr::fit::{FitAdmission, FitRequest};
 
     if !rcsr::gpu::probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = wide_sample(5_000);

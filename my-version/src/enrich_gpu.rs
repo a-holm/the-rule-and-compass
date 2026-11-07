@@ -1133,7 +1133,7 @@ mod tests {
     #[test]
     fn device_permutation_and_segmented_rank_match_cpu_reference() {
         if !crate::gpu::probe().available() {
-            eprintln!("skipping: no CUDA device");
+            crate::backend::skip_without_device("skipping: no CUDA device");
             return;
         }
         let (times, sym, src, member, seg_start, seg_len) = fixture(20_000, 21);
@@ -1166,7 +1166,7 @@ mod tests {
     #[test]
     fn device_rank_is_identical_across_reuse_and_column_order() {
         if !crate::gpu::probe().available() {
-            eprintln!("skipping: no CUDA device");
+            crate::backend::skip_without_device("skipping: no CUDA device");
             return;
         }
         let (times, sym, src, member, seg_start, seg_len) = fixture(10_000, 21);

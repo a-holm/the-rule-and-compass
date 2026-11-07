@@ -240,7 +240,7 @@ fn search_recovers_a_target_built_from_the_models_complexity() {
     let train = sample(xs.clone(), ys.clone());
     let test = sample(xs.clone(), ys.clone());
 
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
     cfg.generations = 30;
     cfg.pop = 80;
     cfg.islands = 1;

@@ -125,7 +125,7 @@ fn gpu_scoring_with_the_exact_fit_is_bit_identical_across_thread_counts() {
         };
         let a = run(1);
         if a.backend != rcsr::backend::Kind::Gpu {
-            eprintln!("skipped: no usable device ({:?})", a.backend_reason);
+            rcsr::backend::skip_without_device(&format!("skipped: no usable device ({:?})", a.backend_reason));
             return;
         }
         let b = run(8);

@@ -36,6 +36,7 @@ fn config(seed: u32) -> Config {
         fit_iters: 5,
         patience: 0,
         seed,
+        gpu: false,
         ..Default::default()
     }
 }
@@ -137,7 +138,7 @@ fn predictor_samples_at_least_the_training_size_is_an_exact_no_op() {
 #[test]
 fn effective_subset_accepts_750_and_rejects_near_full_requests() {
     let train = sample(1500);
-    let mut cfg = Config::default();
+    let mut cfg = Config { gpu: false, ..Config::default() };
 
     for n in [750, 900] {
         cfg.predictor_samples = Some(n);

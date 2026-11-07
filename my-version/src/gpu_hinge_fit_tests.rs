@@ -107,7 +107,7 @@ fn score(tree: &Node, s: &Sample, m: Metric) -> f64 {
 
 fn evaluator(s: &Sample) -> Option<GpuEvaluator> {
     if !probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return None;
     }
     let n = s.len();
@@ -509,7 +509,7 @@ fn tiny_config(metric: Metric, seed: u32) -> Config {
 #[test]
 fn reported_hinge_errors_are_exact_cpu_values() {
     if !probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = cell(160, 240, 1.5, 1.0, 0, 21);
@@ -568,7 +568,7 @@ fn hinge_no_fit_is_a_no_op() {
 #[test]
 fn a_single_class_hinge_run_is_labelled() {
     if !probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let train = Sample {
@@ -605,7 +605,7 @@ fn a_single_class_hinge_run_is_labelled() {
 #[ignore]
 fn bench_hinge_fit_stage() {
     if !probe().available() {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
     }
     let rows: usize = std::env::var("RCSR_BENCH_ROWS")

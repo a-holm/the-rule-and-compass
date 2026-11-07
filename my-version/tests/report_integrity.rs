@@ -251,9 +251,12 @@ fn the_checkpoint_binds_the_build_identity() {
     other.threads += 1;
     let err = cp.check_identity(&other, false).unwrap_err();
     assert!(err.contains("binary_sha256"), "{}", err);
-    assert!(err.contains("threads"), "{}", err);
+    assert!(!err.contains("threads"), "a CPU count never refuses: {}", err);
     assert!(err.contains("--allow-build-change"), "{}", err);
     assert!(cp.check_identity(&other, true).is_ok());
+    let mut threads_only = id.clone();
+    threads_only.threads += 1;
+    assert!(cp.check_identity(&threads_only, false).is_ok());
 }
 
 #[test]

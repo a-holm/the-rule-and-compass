@@ -402,7 +402,7 @@ mod device {
     #[test]
     fn fused_flow_reads_optional_raw_columns_once() {
         if !rcsr::gpu::probe().available() {
-            eprintln!("skipping: no CUDA device");
+            rcsr::backend::skip_without_device("skipping: no CUDA device");
             return;
         }
         let rows = rows("AAA", 2_000, 0, 700);
@@ -425,7 +425,7 @@ mod device {
     #[test]
     fn missing_raw_columns_produce_nan_not_zero() {
         if !rcsr::gpu::probe().available() {
-            eprintln!("skipping: no CUDA device");
+            rcsr::backend::skip_without_device("skipping: no CUDA device");
             return;
         }
         let rows = rows("AAA", 1_000, 0, 300);
@@ -466,7 +466,7 @@ mod device {
     #[test]
     fn fused_gpu_is_prefix_causal() {
         if !rcsr::gpu::probe().available() {
-            eprintln!("skipping: no CUDA device");
+            rcsr::backend::skip_without_device("skipping: no CUDA device");
             return;
         }
         let (_scratch, dir) = tmp_dir("prefix");
@@ -500,7 +500,7 @@ mod device {
     #[test]
     fn flow_and_price_action_match_the_cpu_reference() {
         if !rcsr::gpu::probe().available() {
-            eprintln!("skipping: no CUDA device");
+            rcsr::backend::skip_without_device("skipping: no CUDA device");
             return;
         }
         let (_scratch, dir) = tmp_dir("parity");
@@ -638,7 +638,7 @@ mod device {
     #[test]
     fn nr4_is_bit_exact_on_the_device() {
         if !rcsr::gpu::probe().available() {
-            eprintln!("skipping: no CUDA device");
+            rcsr::backend::skip_without_device("skipping: no CUDA device");
             return;
         }
         let _floor = Floor::zero();
@@ -676,7 +676,7 @@ mod device {
     #[test]
     fn fused_families_pay_two_base_passes_and_one_download_per_column() {
         if !rcsr::gpu::probe().available() {
-            eprintln!("skipping: no CUDA device");
+            rcsr::backend::skip_without_device("skipping: no CUDA device");
             return;
         }
         // 109 symbols so segment-parallel consumers dispatch.
@@ -713,7 +713,7 @@ mod device {
     #[ignore = "timing measurement; feeds docs/ohlcv.md"]
     fn measure_fused_cost_on_one_million_rows() {
         if !rcsr::gpu::probe().available() {
-            eprintln!("skipping: no CUDA device");
+            rcsr::backend::skip_without_device("skipping: no CUDA device");
             return;
         }
         // A real 15 m panel has ~109 symbols. Segment-parallel consumers only

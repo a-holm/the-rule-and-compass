@@ -83,7 +83,7 @@ fn gpu_available() -> bool {
     if rcsr::gpu::probe().available() {
         true
     } else {
-        eprintln!("skipping GPU test: no usable CUDA device");
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         false
     }
 }
@@ -94,11 +94,11 @@ fn explicit_gpu_run_fails_closed_when_a_launch_is_refused() {
         return;
     }
     let w = Work::new("explicit");
-    let ok = w.run("control", &["--gpu"], None);
+    let ok = w.run("control", &["--gpu", "--dispatch", "device"], None);
     assert_eq!(ok.status.code(), Some(0), "{}", text(&ok.stderr));
     assert!(std::fs::read_to_string(w.json("control")).unwrap().contains("\"backend\":\"gpu\""));
 
-    let out = w.run("forced", &["--gpu"], Some(KERNEL));
+    let out = w.run("forced", &["--gpu", "--dispatch", "device"], Some(KERNEL));
     let err = text(&out.stderr);
     assert_eq!(out.status.code(), Some(6), "{err}");
     assert!(err.contains(&format!("refused launch of {KERNEL}")), "{err}");
