@@ -126,6 +126,10 @@ USAGE:
   rcsr calibrate [--out <path>] [--gpu | --cpu]
                               time this machine and write the calibration
                               file that --dispatch auto routes from
+  rcsr dispatch-plan [--calibration <anchors|path>] [--against <anchors|path>] [--json]
+                              print the device/cpu route of 4950 eval and fit
+                              cells under a calibration and the cells that flip
+                              under another (no clock, no device)
   rcsr dev-report <log.ndjson>
                               summarise the development log rcsr writes by
                               default (phases, fit/eval share, fallback
@@ -2325,6 +2329,10 @@ fn main() {
     // #733: write the calibration file Auto dispatch routes from.
     if args.first().map(|s| s.as_str()) == Some("calibrate") {
         rcsr::dispatch::run_calibrate(&args[1..]);
+    }
+    // #861: print the dispatch route plan of a calibration.
+    if args.first().map(|s| s.as_str()) == Some("dispatch-plan") {
+        rcsr::dispatch_plan::run(&args[1..]);
     }
     // #71: `import` is a subcommand, handled before the search option parser.
     if args.first().map(|s| s.as_str()) == Some("import") {
