@@ -158,6 +158,19 @@ The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA
   long for `K` consecutive rows, counting the entry row. `β = 0` with
   `--min-hold 1` reproduces the threshold rule **bit for bit**. The band is a
   deterministic `{0,+1}` finite-state automaton; it never opens a short.
+* `--band-units score|sd` (#925, default `score`, needs `--policy band`, exit 2
+  otherwise) says how `--band B` is read. `sd`: per window and candidate,
+  `β = B * sd_train`, the sample sd (`n - 1`) of the candidate's finite scores
+  on the training rows of the window (`train_start <= t < train_end` and before
+  the validation start; never validation or test rows), in the tree order of
+  `trading::score_sd`, the same value the search fitness uses. A degenerate sd
+  (fewer than 2 scores, 0 or non-finite) gives `β = 0`. The test book of the
+  window takes that `β` and never computes an sd from test rows.
+  `windows[].band` records `band` (the multiple), `band_units`, `band_sd`,
+  `band_sd_rows`, `band_sd_max_time` (the latest training time in the sd),
+  `band_resolved` and `band_sd_degenerate`, and `band_width` is the resolved
+  `β`; `policy.band_units` names the units. The search prices the same book
+  with `--fitness pnl --band B --band-units sd` (docs/optimisation.md).
 * `--policy band` refuses `--device-pnl` (#810): the device arm prices the threshold book, so its delta against the band book would measure the band rule, not the kernel. The error is a usage error (exit 2) raised before any data work.
 * `--policy dp` keeps the reported book on the threshold rule and adds the
   exact hindsight-optimal DP as a diagnostic `hindsight_bound`. The DP is the
@@ -270,6 +283,9 @@ bound.
 ```sh
 # no-trade band, beta 0.1, minimum hold 3 rows
 rcsr walkforward ... --policy band --band 0.1 --min-hold 3
+
+# no-trade band of one training-score sd per window and candidate
+rcsr walkforward ... --policy band --band 1.0 --band-units sd --min-hold 3
 
 # threshold strategy plus the exact hindsight bound (never a strategy)
 rcsr walkforward ... --policy dp
@@ -459,7 +475,7 @@ A `.rcsb` store read with `--vars` and `--time` is projected to the columns the 
 
 Finalist selection with `--objective` scores every Pareto member this way on the validation slice only. The winner has the lowest objective value (`-net P&L`, `-Sharpe` or `-log growth`; ties keep the archive order, so the smaller expression wins). Candidates below `--min-trades` or with a non-finite value are unusable. The test block is scored once, for the winner.
 
-With `--fitness pnl` the search ranks every candidate by the regret `(B - net) / B` of this same book on the training rows, `B` being the hindsight DP bound (`trading_gpu::dp_bound`) at the same cost. `trading::FitnessBook` prices the plain threshold rule only (no `tau`, no band, `--min-holding 1`, `--max-position 1`): `net` is the excess net over cash, `sum p_i * (r_i - funding_i - cash) - c_side * (flips + exits)`, which equals `PathStats::net_pnl - cash * rows`. See section 3.5 of [`docs/optimisation.md`](optimisation.md).
+With `--fitness pnl` the search ranks every candidate by the regret `(B - net) / B` of this same book on the training rows, `B` being the hindsight DP bound (`trading_gpu::dp_bound`) at the same cost. `trading::FitnessBook` prices the threshold rule, or with `--band` and `--min-holding` (#925) the `--policy band` book of this page (no `tau`, `--max-position 1`): `net` is the excess net over cash, `sum p_i * (r_i - funding_i - cash) - c_side * (flips + exits)`, which equals `PathStats::net_pnl - cash * rows`. See section 3.5 of [`docs/optimisation.md`](optimisation.md).
 
 ## One book from search to evaluation (#487)
 

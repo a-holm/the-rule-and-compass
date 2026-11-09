@@ -634,7 +634,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--validation-frac f] [--select-by train|validation|aicc] [--require-validation]
      [--objective mse|pnl|sharpe|log_growth] [--position long_only|top_tercile] [--threshold f]
      [--cost-bps f | --cost-override f] [--slippage-bps f] [--cash-return f] [--funding col]
-     [--max-position f] [--min-trades n] [--min-holding n] [--allow-short]
+     [--max-position f] [--min-trades n] [--min-holding n] [--band B] [--band-units score|sd] [--allow-short]
      [--fitness metric|pnl] [--pnl-blocks K] [--pnl-block-lambda L]
 |pnl]
      [--equivalence-z z] [--noise-lag n|auto]
@@ -774,11 +774,15 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   regret `(B - net) / B` on the training rows, `B` the hindsight DP bound at the same cost
   (lower is better, all-flat is 1). Constants are still fitted with `--metric`. It needs a
   trading `--objective` and exits 2 with `--predictor-samples`, `--fit-samples`, `--implicit`,
-  `--min-holding` above 1, `--max-position` other than 1, multiple targets or overlapping rows.
+  `--max-position` other than 1, multiple targets or overlapping rows. `--band B` and
+  `--min-holding K` price the no-trade band of `walkforward --policy band` in the fitness and in
+  the validation and test books (#925); `--band-units sd` reads `B` as a multiple of each
+  candidate's training-score sd, resolved on the training rows only (`objective.spec.band_sd`,
+  `band_resolved`). The device holds at most 32 rows (`--gpu` exits 2 above that).
   On the GPU the device scores the regret natively, fused with the program interpreter
   (`search_fitness.scorer_backend` `cuda`); it equals the CPU book on the device's own `f32`
   predictions bit for bit, and every reported value stays exact CPU `f64`. Resume needs the
-  same cost, threshold and rows. `--pnl-blocks K` (1 to 8, default 1 = off) cuts the training
+  same cost, threshold, band, band units, minimum hold and rows. `--pnl-blocks K` (1 to 8, default 1 = off) cuts the training
   timestamps into `K` blocks, scores each as its own long/flat book and ranks by the mean block
   regret plus `--pnl-block-lambda` (default 1.0) times their standard deviation, so a formula
   that earns in one regime only scores worse; the device computes it bit for bit like the CPU.
