@@ -40,6 +40,7 @@ fn registry_map() -> &'static BTreeMap<String, RegistryEntry> {
     MAP.get_or_init(|| {
         enrich::default_registry()
             .into_iter()
+            .chain(crate::trend::registry())
             .map(|e| (e.name.clone(), e))
             .collect()
     })
@@ -125,12 +126,13 @@ fn resolve_entry(e: &RegistryEntry, lag: usize) -> Resolved {
             "atr" | "range" | "candle" | "donchian" | "price_action" => {
                 vec!["open", "high", "low", "close"]
             }
+            "trend" => vec!["high", "low", "close"],
             _ => vec!["open", "high", "low", "close", "volume"],
         }
     };
     let semantic_cost = if input {
         0
-    } else if matches!(e.family, "mtf" | "cross" | "xs" | "btc" | "exotic" | "py15m") {
+    } else if matches!(e.family, "mtf" | "trend" | "cross" | "xs" | "btc" | "exotic" | "py15m") {
         3
     } else if e.warmup > 0 {
         2
@@ -866,6 +868,14 @@ pub fn test_ids(e: &RegistryEntry) -> Vec<&'static str> {
             "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars",
             "tests/enrich.rs::mtf_every_column_is_nan_when_its_higher_bucket_is_missing",
             "tests/enrich.rs::mtf_join_is_causal_and_a_future_shift_is_caught",
+        ],
+        "trend" => vec![
+            "tests/enrich.rs::trend_columns_match_hand_built_daily_bars",
+            "tests/enrich.rs::trend_every_column_is_nan_across_a_gap",
+            "tests/enrich.rs::trend_partial_day_is_a_daily_bar_as_in_mtf",
+            "tests/enrich.rs::trend_join_is_causal_and_a_future_shift_is_caught",
+            "tests/enrich.rs::trend_causal_under_future_edits_cpu",
+            "tests/trend_gpu.rs::trend_gpu_matches_cpu",
         ],
         "price_action" => vec![
             "tests/enrich.rs::price_action_geometry_matches_flat_hand_bars",

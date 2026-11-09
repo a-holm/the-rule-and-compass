@@ -10,6 +10,10 @@
 //! A partial or current higher bucket is never visible (`higher.time + tf <=
 //! base.time`), and a stale bucket is `NaN` for every value leaf while
 //! `bar_age` remains the exact staleness in seconds.
+//!
+//! The #932 trend family runs in the same context: its leaves are evaluated on
+//! the `1d` buckets of the last daily `prepare` and gathered through the same
+//! join index, so `--features mtf,trend` resamples the base rows to days once.
 
 use crate::enrich::{MTF_LEAVES, MTF_TIMEFRAMES};
 use crate::gpu_stats::GpuStats;
@@ -54,6 +58,8 @@ extern "C" {
     fn rc_mtf_prepare(ctx: *mut Raw, tf_seconds: i64) -> c_int;
     fn rc_mtf_total_buckets(ctx: *mut Raw) -> c_int;
     fn rc_mtf_gather(ctx: *mut Raw, leaf: c_int, out: *mut f64) -> c_int;
+    fn rc_mtf_trend(ctx: *mut Raw) -> c_int;
+    fn rc_mtf_trend_gather(ctx: *mut Raw, leaf: c_int, out: *mut f64) -> c_int;
 }
 
 /// Why the device MTF path was abandoned: the failing stage and its return code.
@@ -230,6 +236,34 @@ impl MtfGpu {
         }
     }
 
+    /// Evaluate the 27 trend leaves on the daily buckets of the last
+    /// `prepare(86400)`.
+    pub fn trend(&mut self) -> Result<(), MtfError> {
+        let started = std::time::Instant::now();
+        let rc = unsafe { rc_mtf_trend(self.ctx) };
+        let ok = rc == 0;
+        self.record(started, ok);
+        if ok {
+            Ok(())
+        } else {
+            Err(MtfError { stage: "trend", code: rc })
+        }
+    }
+
+    /// Copy one base-length trend leaf (0..26, `trend::TREND_NAMES` order).
+    pub fn gather_trend(&mut self, leaf: usize) -> Result<Vec<f64>, MtfError> {
+        let started = std::time::Instant::now();
+        let mut out = vec![0.0; self.n];
+        let rc = unsafe { rc_mtf_trend_gather(self.ctx, leaf as c_int, out.as_mut_ptr()) };
+        let ok = rc == 0;
+        self.record(started, ok);
+        if ok {
+            Ok(out)
+        } else {
+            Err(MtfError { stage: "trend-gather", code: rc })
+        }
+    }
+
     pub fn stats(&self) -> GpuStats {
         self.stats
     }
@@ -257,7 +291,7 @@ fn mtf_parts(name: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// Compute every requested MTF column on the device.
+/// Compute every requested MTF and trend column on the device.
 ///
 /// Returns the columns in request-independent name order plus the measured
 /// device ledger. An error means the context or a launch failed; the caller
@@ -282,6 +316,7 @@ pub fn compute(
         .ok()
         .and_then(|v| v.parse().ok());
     let mut out: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let mut prepared: Option<i64> = None;
     for tf_name in MTF_TIMEFRAMES {
         let tf = Timeframe::parse(tf_name).map_err(|_| MtfError { stage: "timeframe", code: 0 })?;
         let leaves: Vec<&str> = requested
@@ -298,11 +333,27 @@ pub fn compute(
         if leaves.is_empty() {
             continue;
         }
-        gpu.prepare(forced.unwrap_or(tf.seconds()))?;
+        let tf_seconds = forced.unwrap_or(tf.seconds());
+        gpu.prepare(tf_seconds)?;
+        prepared = Some(tf_seconds);
         for leaf in leaves {
             let index = leaf_index(leaf).ok_or(MtfError { stage: "leaf", code: 0 })?;
             let values = gpu.gather(index)?;
             out.insert(format!("mtf_{}_{}", tf_name, leaf), values);
+        }
+    }
+    let trend: Vec<(&String, usize)> = requested
+        .iter()
+        .filter_map(|n| crate::trend::leaf_index(n).map(|i| (n, i)))
+        .collect();
+    if !trend.is_empty() {
+        crate::trend::check_bar(step).map_err(|_| MtfError { stage: "trend-bar", code: 0 })?;
+        if prepared != Some(crate::trend::DAY) {
+            gpu.prepare(crate::trend::DAY)?;
+        }
+        gpu.trend()?;
+        for (name, leaf) in trend {
+            out.insert(name.clone(), gpu.gather_trend(leaf)?);
         }
     }
     Ok((out, gpu.stats()))
