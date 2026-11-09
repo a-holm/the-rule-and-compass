@@ -1463,6 +1463,8 @@ impl GpuSearch {
         let fit_train: &Sample = fit_sample.as_ref().unwrap_or(train);
         let mut planned: Vec<(usize, usize, crate::fit::GpuFitPlan)> = Vec::new();
         let mut fallbacks: Vec<(usize, usize, FitFallbackCause)> = Vec::new();
+        // #968: the device constants of a routed tail fit, by island and slot.
+        let mut device_alts: std::collections::HashMap<(usize, usize), Node> = Default::default();
         // #229: the objective the batched kernel minimises. #230: the rank
         // family has no LM loss but has its own exact device polish, so it is
         // admitted through `rank_fit_only`. Anything else reaching here is
@@ -1538,7 +1540,7 @@ impl GpuSearch {
         let mut tail = PendingTail::default();
         let mut on_pool = 0usize;
         if overlap {
-            on_pool = self.tail_submit_prefix(&mut tail, islands, &fallbacks, on_pool, fit_train, cfg);
+            on_pool = self.tail_submit_prefix(&mut tail, islands, &fallbacks, &mut device_alts, on_pool, fit_train, cfg);
         }
 
         if !jobs.is_empty() {
@@ -1686,6 +1688,9 @@ impl GpuSearch {
                         crate::fit::note_gpu_fit(true);
                     } else {
                         let cause = if let Some(cause) = tail {
+                            if let Some(alt) = tail_device_tree(plan, &islands[*i][*j].tree, &res) {
+                                device_alts.insert((*i, *j), alt);
+                            }
                             cause
                         } else if !finite {
                             FitFallbackCause::NonFinite
@@ -1722,7 +1727,7 @@ impl GpuSearch {
         }
 
         if overlap {
-            on_pool = self.tail_submit_prefix(&mut tail, islands, &fallbacks, on_pool, fit_train, cfg);
+            on_pool = self.tail_submit_prefix(&mut tail, islands, &fallbacks, &mut device_alts, on_pool, fit_train, cfg);
         }
 
         // #255: exact CPU fallback, seeded with the GPU constants when there
@@ -1755,6 +1760,7 @@ impl GpuSearch {
                 .iter()
                 .map(|&(island, slot, _)| {
                     FallbackFitJob::new(island, slot, islands[island][slot].tree.clone())
+                        .with_device(device_alts.remove(&(island, slot)))
                 })
                 .collect();
             workers_used = fit_fallback_jobs(
@@ -1824,6 +1830,7 @@ impl GpuSearch {
         tail: &mut PendingTail,
         islands: &[Vec<Ind>],
         fallbacks: &[(usize, usize, FitFallbackCause)],
+        device_alts: &mut std::collections::HashMap<(usize, usize), Node>,
         from: usize,
         rows: &Sample,
         cfg: &Config,
@@ -1834,7 +1841,7 @@ impl GpuSearch {
         }
         let jobs: Vec<FallbackFitJob> = fallbacks[from..refit]
             .iter()
-            .map(|&(i, j, _)| FallbackFitJob::new(i, j, islands[i][j].tree.clone()))
+            .map(|&(i, j, _)| FallbackFitJob::new(i, j, islands[i][j].tree.clone()).with_device(device_alts.remove(&(i, j))))
             .collect();
         self.tail_submit(tail, jobs, rows, cfg.fit_iters, cfg.metric);
         refit
@@ -2637,6 +2644,43 @@ fn refit_lowers_error(
     after.is_finite() && (before.is_nan() || after < before)
 }
 
+/// #968: one exact CPU fallback fit. A job that carries its device constants
+/// (a routed tail status) keeps the lower exact error of the two answers; a tie
+/// keeps the CPU fit, and a non-finite device error never wins.
+#[cfg(feature = "cuda")]
+fn run_fallback_fit(
+    job: &mut FallbackFitJob,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    iters: usize,
+    metric: Metric,
+) {
+    job.improved = refit_lowers_error(&mut job.tree, x, y, w, iters, metric);
+    if let Some(device) = job.device.take() {
+        let cpu = exact_error(&job.tree, x, y, w, metric);
+        let dev = exact_error(&device, x, y, w, metric);
+        if dev.is_finite() && (cpu.is_nan() || dev < cpu) {
+            job.tree = device;
+        }
+    }
+}
+
+/// #968: the answer a routed tail fit keeps: the exact CPU fit from `start`, or
+/// `device` when its exact error is lower.
+#[cfg(feature = "cuda")]
+pub(crate) fn keep_better_tail_fit(
+    start: &Node,
+    device: Node,
+    sample: &Sample,
+    iters: usize,
+    metric: Metric,
+) -> Node {
+    let mut job = FallbackFitJob::new(0, 0, start.clone()).with_device(Some(device));
+    run_fallback_fit(&mut job, &sample.x, &sample.y, &sample.w, iters, metric);
+    job.tree
+}
+
 /// #265: count one improved refit under its fallback cause.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn count_improved(map: &mut BTreeMap<String, usize>, cause: FitFallbackCause) {
@@ -2667,6 +2711,9 @@ struct FallbackFitJob {
     slot: usize,
     tree: Node,
     improved: bool,
+    /// #968: the tree at its device constants, for a routed tail status. The
+    /// job keeps the lower error of this and the exact CPU fit.
+    device: Option<Node>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2677,7 +2724,13 @@ impl FallbackFitJob {
             slot,
             tree,
             improved: false,
+            device: None,
         }
+    }
+
+    fn with_device(mut self, device: Option<Node>) -> Self {
+        self.device = device;
+        self
     }
 }
 
@@ -2701,7 +2754,7 @@ fn fit_fallback_jobs(
     let workers = workers.max(1).min(jobs.len());
     if workers == 1 {
         for job in jobs.iter_mut() {
-            job.improved = refit_lowers_error(&mut job.tree, x, y, w, iters, metric);
+            run_fallback_fit(job, x, y, w, iters, metric);
         }
         return 1;
     }
@@ -2714,7 +2767,7 @@ fn fit_fallback_jobs(
             scope.spawn(move || {
                 expr::set_blocks(blocks);
                 for job in chunk.iter_mut() {
-                    job.improved = refit_lowers_error(&mut job.tree, x, y, w, iters, metric);
+                    run_fallback_fit(job, x, y, w, iters, metric);
                 }
             });
         }
@@ -2934,14 +2987,7 @@ impl FallbackPool {
                                 // SAFETY: see `FitContext`.
                                 let (x, y, w) = unsafe { (&*ctx.x, &*ctx.y, &*ctx.w) };
                                 for job in jobs.iter_mut() {
-                                    job.improved = refit_lowers_error(
-                                        &mut job.tree,
-                                        x,
-                                        y,
-                                        w,
-                                        ctx.iters,
-                                        ctx.metric,
-                                    );
+                                    run_fallback_fit(job, x, y, w, ctx.iters, ctx.metric);
                                 }
                                 ChunkOutput::Fits(jobs)
                             }
@@ -3606,7 +3652,9 @@ fn fit_pipeline_queue(
                     g.note_fit_fallback(generation, cause);
                     crate::fit::note_gpu_fit(false);
                     let kept = jobs[*k].2.clone();
-                    fallbacks.push(PipelineFallback::new(1, i, j, cause, offered_hash[*k], kept));
+                    let mut fb = PipelineFallback::new(1, i, j, cause, offered_hash[*k], kept);
+                    fb.device = tail_device_tree(plan, &jobs[*k].2, &res);
+                    fallbacks.push(fb);
                 }
             }
         }
@@ -3624,7 +3672,7 @@ fn fit_pipeline_queue(
             .enumerate()
             .map(|(k, f)| {
                 f.early = Some(base + k);
-                FallbackFitJob::new(f.island, f.slot, f.tree.clone())
+                FallbackFitJob::new(f.island, f.slot, f.tree.clone()).with_device(f.device.clone())
             })
             .collect();
         g.tail_submit(&mut tail.pending, jobs, tail.rows, fit.iters, fit.metric);
@@ -3685,6 +3733,23 @@ fn apply_device_fit(
     }
 }
 
+/// #968: the tree at the device constants of a routed tail status, when they
+/// are finite; the exact CPU fit then competes with it.
+#[cfg(feature = "cuda")]
+fn tail_device_tree(
+    plan: &crate::fit::GpuFitPlan,
+    tree: &Node,
+    res: &crate::gpu::GpuFitOutput,
+) -> Option<Node> {
+    tail_status_cause(res.status)?;
+    if !res.c.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let mut device = tree.clone();
+    plan.apply(&mut device, &res.c);
+    Some(device)
+}
+
 /// #578: a candidate that needs the exact CPU fit. The refit happens at the
 /// generation barrier, in the synchronous admission order, so
 /// `--fit-fallback-max` picks the same candidates as on the synchronous path.
@@ -3702,12 +3767,14 @@ struct PipelineFallback {
     /// #958: position of this fallback's early exact fit in the generation's
     /// [`PipelineTail`], when one was started.
     early: Option<usize>,
+    /// #968: the tree at its device constants for a routed tail status.
+    device: Option<Node>,
 }
 
 #[cfg(feature = "cuda")]
 impl PipelineFallback {
     fn new(group: u8, island: usize, slot: usize, cause: FitFallbackCause, offered: u64, tree: Node) -> Self {
-        Self { group, island, slot, cause, offered, tree, early: None }
+        Self { group, island, slot, cause, offered, tree, early: None, device: None }
     }
 }
 
@@ -3767,7 +3834,10 @@ fn finish_pipeline_fallbacks(
     if !rest.is_empty() {
         let mut jobs: Vec<FallbackFitJob> = rest
             .iter()
-            .map(|&n| FallbackFitJob::new(fallbacks[n].island, fallbacks[n].slot, fallbacks[n].tree.clone()))
+            .map(|&n| {
+                let f = &mut fallbacks[n];
+                FallbackFitJob::new(f.island, f.slot, f.tree.clone()).with_device(f.device.take())
+            })
             .collect();
         workers_used = workers_used.max(fit_fallback_jobs(
             &mut jobs,
