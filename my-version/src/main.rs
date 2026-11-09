@@ -7151,7 +7151,8 @@ fn main() {
                 let train_pred: Vec<f64> = prepared.train.x.iter().map(|row| expr::eval(tree, row)).collect();
                 member_spec(tspec, &train_pred, train_slice)
             };
-            let picked = rcsr::selection::select_robust_specs(&metas, robust_params, &mut spec_of, &ret, &book_rows, &mut |i| {
+            let _ = &mut spec_of;
+            let picked = rcsr::selection::select_robust_specs(&metas, robust_params, &mut |_| tspec.clone(), &ret, &book_rows, &mut |i| {
                 trading_pred(&sorted[rows[i].archive_rank - 1].tree, &v.x, ctx)
             })
             .unwrap_or_else(|e| trading_usage(&e));
