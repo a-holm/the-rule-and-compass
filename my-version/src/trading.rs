@@ -160,47 +160,106 @@ pub struct ScoreSd {
     pub rows: usize,
 }
 
-/// Tree sum of `term(x)` over the finite `x`: lane `(k - segment start) % 32`
-/// of each [`FITNESS_SEGMENT_ROWS`]-row segment adds its rows in ascending
-/// order, the lanes fold 16, 8, 4, 2, 1, segment `s` adds into warp sum
-/// `s % 8` and the warp sums fold 4, 2, 1: the device order term for term.
-fn tree_sum(x: &[f64], term: impl Fn(f64) -> f64) -> f64 {
-    let mut warps = [0.0f64; FITNESS_WARPS];
+/// #945: count, mean and centred sum of squares of a set of finite scores.
+#[derive(Clone, Copy, Debug, Default)]
+struct Moments {
+    n: u64,
+    mean: f64,
+    m2: f64,
+}
+
+impl Moments {
+    /// The pairwise merge of Chan, Golub and LeVeque with the count-weighted
+    /// mean; an empty side returns the other unchanged.
+    fn merge(self, b: Moments) -> Moments {
+        if b.n == 0 {
+            return self;
+        }
+        if self.n == 0 {
+            return b;
+        }
+        let (na, nb, nn) = (self.n as f64, b.n as f64, (self.n + b.n) as f64);
+        let d = b.mean - self.mean;
+        Moments { n: self.n + b.n, mean: (na * self.mean + nb * b.mean) / nn, m2: self.m2 + b.m2 + d * d * (na * nb / nn) }
+    }
+}
+
+/// #945: one lane's finite scores of a segment as the sums of `x - k` and
+/// `(x - k)^2`, with `k` its first score.
+#[derive(Clone, Copy, Debug, Default)]
+struct LaneSums {
+    n: u64,
+    k: f64,
+    s: f64,
+    q: f64,
+}
+
+impl LaneSums {
+    fn push(&mut self, x: f64) {
+        if self.n == 0 {
+            self.k = x;
+        }
+        self.n += 1;
+        let d = x - self.k;
+        self.s += d;
+        self.q += d * d;
+    }
+
+    /// The lane's [`Moments`]: mean `k + s / n`, centred sum of squares
+    /// `q - s * (s / n)`, at least 0.
+    fn moments(self) -> Moments {
+        if self.n == 0 {
+            return Moments::default();
+        }
+        let t = self.s / self.n as f64;
+        let m2 = self.q - self.s * t;
+        Moments { n: self.n, mean: self.k + t, m2: if m2 < 0.0 { 0.0 } else { m2 } }
+    }
+}
+
+/// [`Moments`] of the finite `x` in the device tree: lane `(k - segment
+/// start) % 32` of each [`FITNESS_SEGMENT_ROWS`]-row segment adds its rows in
+/// ascending order ([`LaneSums`]), the lanes merge 16, 8, 4, 2, 1, segment `s`
+/// merges into warp `s % 8` in ascending `s` and the warps merge 4, 2, 1: the
+/// device order operation for operation.
+fn tree_moments(x: &[f64]) -> Moments {
+    let mut warps = [Moments::default(); FITNESS_WARPS];
     let mut seg_start = 0usize;
     let mut seg = 0usize;
     while seg_start < x.len() {
         let seg_end = (seg_start + FITNESS_SEGMENT_ROWS).min(x.len());
-        let mut lanes = [0.0f64; FITNESS_LANES];
+        let mut sums = [LaneSums::default(); FITNESS_LANES];
         for k in seg_start..seg_end {
             if x[k].is_finite() {
-                lanes[(k - seg_start) % FITNESS_LANES] += term(x[k]);
+                sums[(k - seg_start) % FITNESS_LANES].push(x[k]);
             }
         }
+        let mut lanes = sums.map(LaneSums::moments);
         let mut half = FITNESS_LANES / 2;
         while half >= 1 {
             for i in 0..half {
-                lanes[i] += lanes[i + half];
+                lanes[i] = lanes[i].merge(lanes[i + half]);
             }
             half /= 2;
         }
-        warps[seg % FITNESS_WARPS] += lanes[0];
+        warps[seg % FITNESS_WARPS] = warps[seg % FITNESS_WARPS].merge(lanes[0]);
         seg += 1;
         seg_start = seg_end;
     }
     let mut half = FITNESS_WARPS / 2;
     while half >= 1 {
         for i in 0..half {
-            warps[i] += warps[i + half];
+            warps[i] = warps[i].merge(warps[i + half]);
         }
         half /= 2;
     }
     warps[0]
 }
 
-/// #925: the training-score standard deviation behind `--band-units sd`: the
-/// mean, then the centred sum of squares, both in the fixed tree order of
-/// [`tree_sum`], so the device reduction equals it bit for bit on the same
-/// `f32` predictions.
+/// #925, #945: the training-score standard deviation behind `--band-units
+/// sd`, in one pass over the scores: [`tree_moments`] in the fixed device
+/// order, so the device reduction equals it bit for bit on the same `f32`
+/// predictions.
 pub fn score_sd(scores: &[f64]) -> ScoreSd {
     let mut rows = 0usize;
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -209,17 +268,13 @@ pub fn score_sd(scores: &[f64]) -> ScoreSd {
         lo = lo.min(v);
         hi = hi.max(v);
     }
-    // A constant score is degenerate even when the rounded mean leaves a tiny
-    // centred sum of squares.
+    // A constant score is degenerate even when rounding leaves a tiny centred
+    // sum of squares.
     if rows < 2 || lo == hi {
         return ScoreSd { sd: None, rows };
     }
-    let mean = tree_sum(scores, |v| v) / rows as f64;
-    let ss = tree_sum(scores, |v| {
-        let d = v - mean;
-        d * d
-    });
-    let sd = (ss / (rows - 1) as f64).sqrt();
+    let m = tree_moments(scores);
+    let sd = (m.m2 / (rows - 1) as f64).sqrt();
     ScoreSd { sd: (sd.is_finite() && sd > 0.0).then_some(sd), rows }
 }
 
@@ -1476,6 +1531,9 @@ impl FitnessBook {
             fnv_u64(&mut hash, band.to_bits());
             fnv_u64(&mut hash, if spec.band.units == BandUnits::Sd { 1 } else { 0 });
             fnv_u64(&mut hash, spec.min_holding as u64);
+            if spec.band.units == BandUnits::Sd {
+                fnv_u64(&mut hash, SCORE_SD_ALGORITHM);
+            }
         }
         Ok(FitnessBook {
             excess,
