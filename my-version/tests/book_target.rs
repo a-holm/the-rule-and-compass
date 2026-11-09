@@ -353,8 +353,8 @@ fn book_target_fit_uses_finite_fit_rows_only() {
         &["--generations", "0", "--pop", "1", "--seed-expr", "0.5 * x1 + 0.1 * x2 + 0.01"],
         "book_target_fit_rows_constants",
     );
-    for key in ["train_rows", "validation_rows", "test_rows"] {
-        assert_eq!(num(&nan, &[key]), num(&fit, &[key]), "{key}: the fit rows are the same");
+    for path in [&["train_rows"][..], &["split", "validation_rows"][..], &["test_rows"][..]] {
+        assert_eq!(num(&nan, path), num(&fit, path), "{path:?}: the fit rows are the same");
     }
     assert_eq!(
         num(&nan, &["search_fitness", "rows"]) as usize,
