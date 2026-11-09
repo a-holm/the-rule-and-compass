@@ -1094,3 +1094,219 @@ fn walkforward_purge_floor_at_168h() {
     let out = String::from_utf8_lossy(&ok.stdout);
     assert!(out.contains("\"required_purge_seconds\":608400"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// #930: one book from K expressions (`--policy vote`).
+// ---------------------------------------------------------------------------
+
+/// Three members `x - 1`, `x - 2`, `x - 3` with theta 0: the votes of a row
+/// with score `x` are 0 for x <= 1, 1 for 2, 2 for 3 and 3 for x >= 4.
+const VOTE_X: [f64; 8] = [0.0, 2.0, 3.0, 4.0, 3.0, 2.0, 5.0, 1.0];
+const VOTE_Y: [f64; 8] = [0.01, 0.02, 0.03, -0.01, 0.02, 0.04, 0.01, 0.05];
+
+fn vote_table(x: &[f64; 8], y: &[f64; 8]) -> data::Table {
+    let mut rows = vec![(0.0, 0.0, 0.0), (1.0, 1.0, 0.0)];
+    for i in 0..8 {
+        rows.push((10.0 + i as f64, x[i], y[i]));
+    }
+    single(&rows)
+}
+
+fn vote_spec(quorum_members: &[&str]) -> EvalSpec {
+    let mut s = spec(quorum_members[0], vec![window("w", 0.0, 2.0, 10.0, 18.0)]);
+    s.candidates = quorum_members.iter().map(|m| m.to_string()).collect();
+    s.policy = walkforward::Policy::Vote;
+    s.threshold_fixed = Some(0.0);
+    s
+}
+
+fn vote_opts(q: f64) -> walkforward::ProtocolOptions {
+    walkforward::ProtocolOptions { quorum: Some(q), ..walkforward::ProtocolOptions::default() }
+}
+
+/// Equity of net returns `pos * y - cost * |delta pos|` (10 bp per side).
+fn book_return(pos: &[f64], y: &[f64; 8]) -> f64 {
+    let mut prev = 0.0;
+    let mut equity = 1.0;
+    for (i, (p, r)) in pos.iter().zip(y).enumerate() {
+        // The last row of a long book also pays the final exit.
+        let exit = if i + 1 == pos.len() { 0.001 * p } else { 0.0 };
+        equity *= 1.0 + p * r - 0.001 * (p - prev).abs() - exit;
+        prev = *p;
+    }
+    equity - 1.0
+}
+
+#[test]
+fn vote_majority_book() {
+    let t = vote_table(&VOTE_X, &VOTE_Y);
+    let s = vote_spec(&["x - 1", "x - 2", "x - 3"]);
+    let r = walkforward::run_table_with(&t, &s, "test", &vote_opts(0.66)).unwrap();
+    assert_eq!(r.votes_required, 2);
+    assert_eq!(r.candidates.len(), 3);
+    let w = &r.windows[0];
+    let pos = [0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0];
+    assert_eq!(w.metrics.rows, 8);
+    assert_eq!(w.metrics.active_rows, 4);
+    assert_eq!(w.metrics.entries, 2);
+    assert_eq!(w.metrics.trades, 4);
+    assert!((w.metrics.total_abs_delta - 4.0).abs() < 1e-15);
+    assert!((w.metrics.total_return - book_return(&pos, &VOTE_Y)).abs() < 1e-12);
+    assert_eq!(w.member_thresholds, vec![0.0, 0.0, 0.0]);
+    let json = r.json();
+    assert!(json.contains("\"name\":\"vote\""), "{json}");
+    assert!(json.contains("\"vote\":{\"quorum\":0.66,\"votes_required\":2,\"members\":[\"x - 1\",\"x - 2\",\"x - 3\"]}"), "{json}");
+
+    // Unanimity: only 4, 5 score 3 votes.
+    let r = walkforward::run_table_with(&t, &s, "test", &vote_opts(1.0)).unwrap();
+    assert_eq!(r.votes_required, 3);
+    let pos = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0];
+    assert!((r.windows[0].metrics.total_return - book_return(&pos, &VOTE_Y)).abs() < 1e-12);
+}
+
+#[test]
+fn vote_one_member_is_threshold() {
+    let t = vote_table(&VOTE_X, &VOTE_Y);
+    for (fixed, validation) in [(Some(1.5), 0.0), (None, 0.0)] {
+        let mut v = vote_spec(&["x"]);
+        v.candidates = Vec::new();
+        v.threshold_fixed = fixed;
+        v.threshold_quantile = 0.5;
+        v.validation_frac = validation;
+        let mut th = v.clone();
+        th.policy = walkforward::Policy::Threshold;
+        let a = walkforward::run_table_with(&t, &v, "test", &vote_opts(1.0)).unwrap();
+        let b = walkforward::run_table(&t, &th, "test").unwrap();
+        assert_eq!(a.period_net.len(), b.period_net.len());
+        for (x, y) in a.period_net.iter().zip(&b.period_net) {
+            assert_eq!(x.to_bits(), y.to_bits());
+        }
+        assert_eq!(a.period_time, b.period_time);
+        let (wa, wb) = (&a.windows[0], &b.windows[0]);
+        assert_eq!(
+            (wa.metrics.rows, wa.metrics.active_rows, wa.metrics.trades, wa.metrics.entries),
+            (wb.metrics.rows, wb.metrics.active_rows, wb.metrics.trades, wb.metrics.entries)
+        );
+        for (x, y) in [
+            (wa.metrics.total_return, wb.metrics.total_return),
+            (wa.metrics.mean_return, wb.metrics.mean_return),
+            (wa.metrics.total_cost, wb.metrics.total_cost),
+            (wa.metrics.total_abs_delta, wb.metrics.total_abs_delta),
+        ] {
+            assert_eq!(x.to_bits(), y.to_bits());
+        }
+        assert_eq!(a.pooled.total_return.to_bits(), b.pooled.total_return.to_bits());
+        assert_eq!(a.seam_cost.to_bits(), b.seam_cost.to_bits());
+    }
+}
+
+#[test]
+fn vote_band_applies_after_voting() {
+    let t = vote_table(&VOTE_X, &VOTE_Y);
+    let mut s = vote_spec(&["x - 1", "x - 2", "x - 3"]);
+    // Need 2 votes. Votes per row: 0 1 2 3 2 1 3 0. Band 1: enter at 2, stay
+    // while votes >= 1, exit at 0.
+    s.band_width = 1.0;
+    let r = walkforward::run_table_with(&t, &s, "test", &vote_opts(0.66)).unwrap();
+    let pos = [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0];
+    let w = &r.windows[0];
+    assert_eq!(w.metrics.active_rows, 5);
+    assert_eq!(w.metrics.trades, 2);
+    assert!((w.metrics.total_return - book_return(&pos, &VOTE_Y)).abs() < 1e-12);
+    assert!(w.band.is_some(), "the band scan priced the vote book");
+
+    // Minimum hold 2 with no band: the exit at row 5 is allowed after two
+    // long rows, the re-entry at row 6 is held through the exit signal at row 7.
+    s.band_width = 0.0;
+    s.min_hold = 2;
+    let r = walkforward::run_table_with(&t, &s, "test", &vote_opts(0.66)).unwrap();
+    let pos = [0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0];
+    assert!((r.windows[0].metrics.total_return - book_return(&pos, &VOTE_Y)).abs() < 1e-12);
+}
+
+#[test]
+fn vote_refusals_exit_before_data_work() {
+    let t = vote_table(&VOTE_X, &VOTE_Y);
+    let base = vote_spec(&["x - 1", "x - 2"]);
+    let refused = |s: &EvalSpec, o: &walkforward::ProtocolOptions, needle: &str| {
+        let e = walkforward::run_table_with(&t, s, "t", o).err().expect("refused");
+        assert!(e.contains(needle), "{e}");
+    };
+    let mut s = base.clone();
+    s.device_pnl = true;
+    refused(&s, &vote_opts(0.5), "--device-pnl is not supported with --policy vote");
+    for q in [0.0, -0.5, 1.5, f64::NAN] {
+        refused(&base, &vote_opts(q), "--quorum in (0, 1]");
+    }
+    refused(&base, &walkforward::ProtocolOptions::default(), "--quorum in (0, 1]");
+    let mut s = base.clone();
+    s.band_width = 0.5;
+    refused(&s, &vote_opts(0.5), "whole number");
+    let mut o = vote_opts(0.5);
+    o.batch_pnl = true;
+    refused(&base, &o, "--batch-pnl is not supported with --policy vote");
+
+    let dir = Scratch::new("wf-vote-cli");
+    let data = dir.path().join("d.csv");
+    let mut csv = String::from("ts,x,target\n");
+    for i in 0..8 {
+        csv.push_str(&format!("{},{},0.001\n", 3600 * i, i));
+    }
+    std::fs::write(&data, csv).unwrap();
+    let run = |extra: &[&str]| {
+        rcsr_cmd::rcsr()
+            .args([
+                "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x", "--expr", "x - 1",
+                "--time", "ts", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365",
+                "--window", "w,0,7200,14400,28800", "--json", "--threshold-fixed", "1.5",
+            ])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let bad = run(&["--policy", "vote", "--quorum", "0.5", "--device-pnl"]);
+    assert_eq!(bad.status.code(), Some(2), "{}", String::from_utf8_lossy(&bad.stderr));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("--device-pnl is not supported with --policy vote"));
+    let bad = run(&["--policy", "vote", "--quorum", "1.5"]);
+    assert_eq!(bad.status.code(), Some(2));
+    let bad = run(&["--policy", "vote"]);
+    assert_eq!(bad.status.code(), Some(2));
+    let bad = run(&["--quorum", "0.5"]);
+    assert_eq!(bad.status.code(), Some(2));
+    let ok = run(&["--policy", "vote", "--quorum", "0.5"]);
+    assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
+    assert!(String::from_utf8_lossy(&ok.stdout).contains("\"votes_required\":1"));
+}
+
+#[test]
+fn vote_members_and_thresholds_ignore_test_rows() {
+    // Quantile thresholds per member from the validation slice (rows 6..8 of
+    // the training range). Scaling and flipping the test block must move
+    // neither the members nor the member thresholds nor the vote threshold.
+    let build = |scale: f64, flip: f64| {
+        let mut rows: Vec<(f64, f64, f64)> = (0..10).map(|i| (i as f64, i as f64, 0.0)).collect();
+        for i in 0..8 {
+            rows.push((20.0 + i as f64, VOTE_X[i] * scale, flip * VOTE_Y[i]));
+        }
+        single(&rows)
+    };
+    let mut s = spec("x", vec![window("w", 0.0, 10.0, 20.0, 28.0)]);
+    s.candidates = vec!["x".to_string(), "2 * x".to_string(), "x + 3".to_string()];
+    s.policy = walkforward::Policy::Vote;
+    s.validation_frac = 0.4;
+    s.threshold_quantile = 0.5;
+    let base = walkforward::run_table_with(&build(1.0, 1.0), &s, "t", &vote_opts(0.66)).unwrap();
+    let w0 = &base.windows[0];
+    assert_eq!(w0.member_thresholds.len(), 3);
+    assert!(w0.member_thresholds.iter().all(|t| t.is_finite()));
+    assert_eq!(w0.threshold, 1.5);
+    for (scale, flip) in [(1000.0, 1.0), (1.0, -1.0), (-50.0, -3.0)] {
+        let other = walkforward::run_table_with(&build(scale, flip), &s, "t", &vote_opts(0.66)).unwrap();
+        assert_eq!(other.candidates, base.candidates);
+        let w = &other.windows[0];
+        assert_eq!(w.member_thresholds, w0.member_thresholds, "scale {scale}, flip {flip}");
+        assert_eq!(w.threshold.to_bits(), w0.threshold.to_bits());
+        assert_eq!(w.expression, w0.expression);
+        assert!(!other.test_used_for_selection);
+    }
+}

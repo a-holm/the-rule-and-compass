@@ -109,6 +109,8 @@ pub struct ProtocolOptions {
     /// `--from-run` or `--front`, in candidate order. A window never resolves
     /// another band from its rows.
     pub run_bands: Option<Vec<crate::trading::BandSpec>>,
+    /// #930: quorum of `--policy vote`, in (0, 1].
+    pub quorum: Option<f64>,
     /// `split.fit_label`: the label report facts of the target (see
     /// [`crate::labels::fit_label_json`]).
     pub fit_label: Option<String>,
@@ -146,6 +148,7 @@ impl Default for ProtocolOptions {
             locked_embargo: 0,
             band_units: crate::trading::BandUnits::Score,
             run_bands: None,
+            quorum: None,
             fit_label: None,
         }
     }
@@ -239,6 +242,8 @@ pub enum Policy {
     Dp,
     /// Per timestamp, the top `floor(n / 3)` finite scores are long (#493).
     TopTercile,
+    /// #930: long when at least `ceil(quorum x K)` of the K expressions are long.
+    Vote,
 }
 
 impl Policy {
@@ -248,8 +253,9 @@ impl Policy {
             "band" => Ok(Policy::Band),
             "dp" | "hindsight" => Ok(Policy::Dp),
             "top-tercile" | "top_tercile" => Ok(Policy::TopTercile),
+            "vote" => Ok(Policy::Vote),
             other => Err(format!(
-                "unknown policy '{}'; expected threshold | band | dp | top-tercile",
+                "unknown policy '{}'; expected threshold | band | dp | top-tercile | vote",
                 other
             )),
         }
@@ -261,6 +267,7 @@ impl Policy {
             Policy::Band => "band",
             Policy::Dp => "dp",
             Policy::TopTercile => "top_tercile",
+            Policy::Vote => "vote",
         }
     }
 }
@@ -405,6 +412,8 @@ pub struct WindowResult {
     /// the test block never enters it.
     pub validation_error: Option<f64>,
     pub threshold: f64,
+    /// #930: the threshold of each member under `--policy vote`; empty otherwise.
+    pub member_thresholds: Vec<f64>,
     /// `train` or `validation`.
     pub threshold_source: String,
     pub train_rows: usize,
@@ -558,6 +567,9 @@ pub struct Report {
     pub threshold_fixed: Option<f64>,
     /// #306: position policy and its band parameters.
     pub policy: Policy,
+    /// #930: quorum and votes needed of the members (`candidates`) under `--policy vote`.
+    pub quorum: Option<f64>,
+    pub votes_required: usize,
     pub band_width: f64,
     /// #925: how `band_width` is read.
     pub band_units: crate::trading::BandUnits,
@@ -965,6 +977,59 @@ pub fn top_tercile_refusal(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<St
     })
 }
 
+/// Votes needed for a long row: `ceil(quorum x K)`, at least 1.
+pub fn votes_required(quorum: f64, members: usize) -> usize {
+    ((quorum * members as f64 - 1e-9).ceil().max(1.0) as usize).min(members.max(1))
+}
+
+/// #930: the refusal message when `--policy vote` is combined with a flag or
+/// value it cannot honour. The CLI reports it as a usage error.
+pub fn vote_refusal(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<String> {
+    let refused = [
+        (spec.device_pnl, "--device-pnl", "the device arm prices the threshold book"),
+        (opts.batch_pnl, "--batch-pnl", "the batch arm scores one expression per column"),
+        (spec.band_select, "--select-band", "the members are all used, none is selected"),
+        (opts.final_read, "--locked-test", "the sealed read scores the selected candidate only"),
+        (opts.run_bands.is_some(), "--from-run/--front bands", "the band counts votes"),
+        (opts.band_units != crate::trading::BandUnits::Score, "--band-units", "the band counts votes"),
+    ];
+    if let Some((_, flag, why)) = refused.iter().find(|(set, _, _)| *set) {
+        return Some(format!("{} is not supported with --policy vote: {}", flag, why));
+    }
+    match opts.quorum {
+        Some(q) if q > 0.0 && q <= 1.0 => {}
+        _ => return Some("--policy vote needs --quorum in (0, 1]".to_string()),
+    }
+    if spec.band_width.fract() != 0.0 {
+        return Some("--band counts votes under --policy vote: pass a whole number".to_string());
+    }
+    None
+}
+
+/// #930: replace the member score columns of the test block by one vote count
+/// per row (NaN when any member is non-finite, so the shared valid-row mask
+/// drops the row) and return the threshold that reads it. The thresholds come
+/// from the training or validation rows through `select_candidate`; no test
+/// value enters them. A long book stays long while `votes >= need - band_votes`.
+fn apply_vote(d: &mut WindowData, thresholds: &[f64], need: usize, band_votes: f64) -> f64 {
+    let n = d.test_rows.len();
+    let votes: Vec<f64> = (0..n)
+        .map(|i| {
+            let mut count = 0usize;
+            for (scores, &theta) in d.test_scores.iter().zip(thresholds) {
+                let s = scores[i];
+                if !s.is_finite() {
+                    return f64::NAN;
+                }
+                count += usize::from(s > theta);
+            }
+            count as f64
+        })
+        .collect();
+    d.test_scores = vec![votes];
+    need as f64 - 0.5 - band_votes / 2.0
+}
+
 fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), String> {
     if spec.windows.is_empty() {
         return Err("at least one --window is required".to_string());
@@ -1003,9 +1068,14 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
     if spec.policy == Policy::Band && spec.device_pnl {
         return Err("--device-pnl is not supported with --policy band: the device arm prices the threshold book".to_string());
     }
+    if spec.policy == Policy::Vote {
+        if let Some(msg) = vote_refusal(spec, opts) {
+            return Err(msg);
+        }
+    }
     let table_validation = !opts.validation_starts.is_empty()
         && spec.windows.iter().all(|w| opts.validation_starts.iter().any(|(l, _)| *l == w.label));
-    if spec.candidates.len() > 1 && spec.validation_frac <= 0.0 && !table_validation {
+    if spec.candidates.len() > 1 && spec.policy != Policy::Vote && spec.validation_frac <= 0.0 && !table_validation {
         return Err(
             "multiple --expr candidates need a validation slice (--validation-frac > 0 or a windows \
              table with validation_start): select on a validation slice, never on the test block"
@@ -1343,7 +1413,16 @@ impl Accum {
         let mut pooled_previous: HashMap<u64, f64> = HashMap::new();
         let expressions = candidate_expressions(spec);
         let want_inference = opts.bootstrap_draws > 0 || opts.null_draws > 0;
-        let n_candidates = trees.len();
+        let vote = spec.policy == Policy::Vote;
+        let members = trees.len();
+        let need = if vote { votes_required(opts.quorum.unwrap_or(1.0), members) } else { 0 };
+        // A vote book is one synthetic candidate; its band counts votes.
+        let eval_policy = if vote {
+            if spec.band_width > 0.0 || spec.min_hold > 1 { Policy::Band } else { Policy::Threshold }
+        } else {
+            spec.policy
+        };
+        let n_candidates = if vote { 1 } else { members };
         let mut min_group_step: Option<f64> = None;
         let mut pooled_times: Vec<f64> = Vec::new();
         let mut fresh_all: Vec<f64> = Vec::new();
@@ -1385,12 +1464,21 @@ impl Accum {
                     d.window.label, d.window.test_start, d.window.test_end
                 ));
             }
-            let Selected { candidate, validation_error, threshold, band_selection, thresholds } =
+            let Selected { mut candidate, mut validation_error, mut threshold, band_selection, mut thresholds } =
                 select_candidate(&d, spec, trees, has_validation)?;
+            let member_thresholds = if vote { thresholds.clone() } else { Vec::new() };
+            if vote {
+                threshold = apply_vote(&mut d, &thresholds, need, spec.band_width);
+                thresholds = vec![threshold];
+                candidate = 0;
+                validation_error = None;
+            }
             // #925: each candidate's band, resolved on its own training scores.
-            let bands: Vec<crate::trading::BandSpec> = (0..d.train_scores.len())
-                .map(|c| window_band(&d, c, spec.band_width, opts))
-                .collect();
+            let bands: Vec<crate::trading::BandSpec> = if vote {
+                vec![crate::trading::BandSpec::score(spec.band_width / 2.0)]
+            } else {
+                (0..d.train_scores.len()).map(|c| window_band(&d, c, spec.band_width, opts)).collect()
+            };
             let band_width = bands[candidate].resolved;
             if let Some(fixed) = forced {
                 if fixed[window_index] != candidate {
@@ -1421,7 +1509,7 @@ impl Accum {
                 cost_side,
                 ppy,
                 &mut fresh_previous,
-                spec.policy,
+                eval_policy,
                 band_width,
                 spec.min_hold,
                 spec.gpu,
@@ -1447,7 +1535,7 @@ impl Accum {
                     cost_side,
                     ppy,
                     &mut HashMap::new(),
-                    spec.policy,
+                    eval_policy,
                     band_width,
                     spec.min_hold,
                     spec.gpu,
@@ -1463,7 +1551,7 @@ impl Accum {
                     cost_side,
                     ppy,
                     &mut pooled_previous,
-                    spec.policy,
+                    eval_policy,
                     band_width,
                     spec.min_hold,
                     spec.gpu,
@@ -1518,7 +1606,7 @@ impl Accum {
                         cost_side,
                         ppy,
                         &mut HashMap::new(),
-                        spec.policy,
+                        eval_policy,
                         bands[c].resolved,
                         spec.min_hold,
                         false,
@@ -1561,10 +1649,15 @@ impl Accum {
             let in_sample = opts.in_sample_windows.contains(&d.window.label);
             windows.push(WindowResult {
                 window: d.window,
-                expression: expr::to_string(&trees[candidate], &layout.var_names),
+                expression: if vote {
+                    format!("vote {}/{}: {}", need, members, expressions.join(" ; "))
+                } else {
+                    expr::to_string(&trees[candidate], &layout.var_names)
+                },
                 candidate,
                 validation_error,
                 threshold,
+                member_thresholds,
                 threshold_source: source_name.as_str().to_string(),
                 train_rows,
                 validation_rows: d.validation_scores[candidate].len(),
@@ -1740,7 +1833,9 @@ impl Accum {
         } else {
             None
         };
-        let selected_on = if expressions.len() > 1 {
+        let selected_on = if vote {
+            "none (all members vote; thresholds from validation or train rows)".to_string()
+        } else if expressions.len() > 1 {
             "validation".to_string()
         } else if spec.validation_frac > 0.0 {
             "validation (threshold only)".to_string()
@@ -1765,6 +1860,8 @@ impl Accum {
             threshold_quantile: spec.threshold_quantile,
             threshold_fixed: spec.threshold_fixed,
             policy: spec.policy,
+            quorum: if vote { opts.quorum } else { None },
+            votes_required: need,
             band_width: spec.band_width,
             band_units: opts.band_units,
             band_source: if opts.run_bands.is_some() { "run" } else { "flag" },
@@ -3122,6 +3219,10 @@ impl WindowResult {
                 .map_or("null".to_string(), |s| s.json()),
             self.train_last_time.map_or("null".to_string(), jnum)
         );
+        if !self.member_thresholds.is_empty() {
+            s.pop();
+            s.push_str(&format!(",\"member_thresholds\":[{}]}}", self.member_thresholds.iter().map(|t| jnum(*t)).collect::<Vec<_>>().join(",")));
+        }
         if self.in_sample {
             s.pop();
             s.push_str(",\"in_sample\":true}");
@@ -3251,6 +3352,9 @@ impl Report {
             Policy::TopTercile => {
                 "top-tercile long-only: per timestamp 1 for the top floor(n/3) finite scores (ties by row order), else 0; no threshold; never short; no leverage"
             }
+            Policy::Vote => {
+                "long/flat vote book: long when at least votes_required of the member expressions have score > their own threshold, flat otherwise (a member with a non-finite score drops the row); with band B the long book stays long while votes >= votes_required - B; never short; no leverage"
+            }
         };
         format!(
             "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"walkforward\",\
@@ -3263,7 +3367,7 @@ impl Report {
              \"cost\":{},\
              \"position_rule\":{},\
              \"policy\":{{\"name\":{},\"hindsight_bound\":{},\"band_width\":{},\
-             \"band_units\":{},\"band_source\":{},\"min_hold\":{},\"short\":false,\"gpu\":{}}},\
+             \"band_units\":{},\"band_source\":{},\"min_hold\":{},\"short\":false,\"gpu\":{}{}}},\
              \"threshold\":{{\"quantile\":{},\"fixed\":{},\
              \"method\":\"exact order-preserving radix select + linear interpolation (numpy type 7) in f64\",\
              \"sources\":[\"train_type7\",\"validation_type7\",\"fixed\"],\
@@ -3314,6 +3418,7 @@ impl Report {
             jstr(self.band_source),
             self.min_hold,
             self.gpu,
+            self.vote_json(),
             jnum(self.threshold_quantile),
             self.threshold_fixed.map_or("null".to_string(), jnum),
             jstr(self
@@ -3376,6 +3481,18 @@ impl Report {
         )
     }
 
+    fn vote_json(&self) -> String {
+        match self.quorum {
+            Some(q) if self.policy == Policy::Vote => format!(
+                ",\"vote\":{{\"quorum\":{},\"votes_required\":{},\"members\":[{}]}}",
+                jnum(q),
+                self.votes_required,
+                self.candidates.iter().map(|m| jstr(m)).collect::<Vec<_>>().join(",")
+            ),
+            _ => String::new(),
+        }
+    }
+
     /// #926: the pooled metrics with `period_net` and `period_time`.
     fn pooled_json(&self) -> String {
         let series = |v: &[f64]| v.iter().map(|x| jnum(*x)).collect::<Vec<_>>().join(",");
@@ -3436,6 +3553,13 @@ impl Report {
             Policy::TopTercile => {
                 "- Top-tercile long-only: per timestamp, `position = 1` for the top `floor(n/3)` finite scores (ties by row order), else `0`; fewer than 3 finite scores hold nothing; never short, no leverage.\n".to_string()
             }
+            Policy::Vote => format!(
+                "- Long/flat vote book: `position = 1` when at least {} of the {} members have `score > own threshold`, else `0`; vote band {}, minimum hold {}; never short, no leverage.\n",
+                self.votes_required,
+                self.candidates.len(),
+                md_num(self.band_width),
+                self.min_hold
+            ),
         };
         let threshold_rule = if self.policy == Policy::TopTercile {
             "none: the policy ranks the scores of each timestamp (source `none`)".to_string()
