@@ -281,11 +281,20 @@ pub fn make_folds(
         }
         if f.fit.is_empty() || f.valid.is_empty() || f.test.is_empty() {
             return Err(format!(
-                "fold {}: fit {} / validation {} / test {} rows; every range needs rows",
+                "fold {}: fit {} / validation {} / test {} rows; every range needs rows{}",
                 f.label,
                 f.fit.len(),
                 f.valid.len(),
-                f.test.len()
+                f.test.len(),
+                if f.valid.is_empty() && valid_end < win.train_end {
+                    format!(
+                        " (the validation slice ends one purge, {} s, before test_start, at {})",
+                        purge_seconds,
+                        protocol::iso(valid_end)
+                    )
+                } else {
+                    String::new()
+                }
             ));
         }
         folds.push(f);
