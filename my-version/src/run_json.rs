@@ -182,7 +182,12 @@ impl RunFile {
         })
     }
 
-    /// The book the run selected (#487): finalist, fixed threshold, cost and target spec, band and minimum hold (#946).
+    /// The book the run selected (#487): finalist, fixed threshold, cost and target spec.
+    pub fn book(&self) -> Result<crate::run_book::RunBook, String> {
+        crate::run_book::RunBook::from_json(&self.doc)?.threshold_only()
+    }
+
+    /// #946: the book the run selected including its band and minimum hold.
     pub fn band_book(&self) -> Result<crate::run_book::RunBook, String> {
         crate::run_book::RunBook::from_json(&self.doc)
     }

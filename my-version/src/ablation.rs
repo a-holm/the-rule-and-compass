@@ -1065,38 +1065,18 @@ pub fn score_run(
     headline: usize,
     opts: &Options,
 ) -> Result<SeedResult, String> {
-    score_core(facts, panel, folds, thresholds, headline, None, None, opts)
+    score_core(facts, panel, folds, thresholds, headline, None, opts)
 }
 
-/// #951: the no-trade band (half-width as recorded, minimum hold) a run priced.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RunBand {
-    pub half_width: f64,
-    pub min_hold: usize,
-}
-
-impl RunBand {
-    /// `None` for a run that priced the plain threshold book.
-    pub fn of(band: &crate::trading::BandSpec, min_holding: usize) -> Option<RunBand> {
-        (band.resolved > 0.0 || min_holding > 1).then_some(RunBand { half_width: band.resolved, min_hold: min_holding })
-    }
-}
-
-/// [`score_run`] under the run's band book: `fixed` is the run's threshold, else every quantile of `thresholds`.
-pub fn score_run_banded(
+/// [`score_run`] under the book the search selected: one fixed threshold, no quantile.
+pub fn score_run_fixed(
     facts: &RunFacts,
     panel: &Panel,
     folds: &[Fold],
-    thresholds: &[f64],
-    headline: usize,
-    fixed: Option<f64>,
-    band: Option<RunBand>,
+    theta: f64,
     opts: &Options,
 ) -> Result<SeedResult, String> {
-    match fixed {
-        Some(theta) => score_core(facts, panel, folds, &[theta], 0, Some(theta), band, opts),
-        None => score_core(facts, panel, folds, thresholds, headline, None, band, opts),
-    }
+    score_core(facts, panel, folds, &[theta], 0, Some(theta), opts)
 }
 
 fn score_core(
@@ -1106,7 +1086,6 @@ fn score_core(
     thresholds: &[f64],
     headline: usize,
     fixed: Option<f64>,
-    band: Option<RunBand>,
     opts: &Options,
 ) -> Result<SeedResult, String> {
     let tree = crate::expr::parse(&facts.expression, &facts.variables)
@@ -1135,14 +1114,7 @@ fn score_core(
         let mut per_thr = Vec::new();
         for (ti, &q) in thresholds.iter().enumerate() {
             let theta = fixed.unwrap_or_else(|| crate::walkforward::quantile(&fit_s, q));
-            let pos: Vec<f64> = match band {
-                None => test_s.iter().map(|&s| if s > theta { 1.0 } else { 0.0 }).collect(),
-                Some(b) => {
-                    let groups: Vec<u64> = f.test.iter().map(|&i| panel.group[i]).collect();
-                    let params = crate::trading_gpu::BandParams::new(theta, b.half_width, b.min_hold)?;
-                    crate::trading_gpu::band_positions(&test_s, &groups, &params)?
-                }
-            };
+            let pos: Vec<f64> = test_s.iter().map(|&s| if s > theta { 1.0 } else { 0.0 }).collect();
             let series = ladder::period_net(panel, &f.test, &pos, side);
             per_thr.push(series.iter().sum::<f64>());
             if ti == headline {
@@ -1773,8 +1745,6 @@ fn usage() -> &'static str {
             (cost_bps / 2), the return units (log is converted with exp_m1) and the return column; a --cost-bps that differs is refused.\n\
             --from-run prices the book the search selected: the run's target spec, per-side cost and fixed threshold\n\
             (objective.spec.threshold); it refuses --thresholds, --headline-threshold and --target-spec, and a run without an objective block\n
-            A run that priced a band or a minimum hold is priced with it: half-width objective.spec.band_resolved as recorded, objective.spec.min_holding,\n
-            every fold starts flat (result band_book); --run applies the band and hold around each quantile threshold\n
   verdict   --definition <file> --results <dir> [--plan <dir>] [--out <file>] [--markdown <file|->]\n\
             ship or drop per family under the committed decision rule\n"
 }
@@ -2006,7 +1976,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                             return Err((2, format!("{} cannot be combined with --from-run: the run fixes the threshold rule and the target spec", flag)));
                         }
                     }
-                    let book = crate::run_json::RunFile::parse(&run_text).and_then(|r| r.band_book()).map_err(|e| (3, format!("{}: {}", run_path, e)))?;
+                    let book = crate::run_book::RunBook::parse(&run_text).map_err(|e| (3, format!("{}: {}", run_path, e)))?;
                     if book.position != crate::trading::PositionMap::Threshold {
                         return Err((2, format!("{}: the run priced the top_tercile book; the ablation prices the threshold rule only", run_path)));
                     }
@@ -2073,7 +2043,6 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             let wtext = std::fs::read_to_string(windows_path).map_err(|e| io_err(windows_path, e))?;
             let rows = protocol::parse_windows_csv(&wtext, Some(fl.opt("--scheme").unwrap_or("expanding"))).map_err(|e| (3, e))?;
             let run_file = crate::run_json::RunFile::parse(&run_text).map_err(|e| (3, format!("{}: {}", run_path, e)))?;
-            let run_band = RunBand::of(&run_file.band, run_file.min_holding);
             let labelled: Vec<(String, f64)> = rows.iter().map(|r| (r.window.label.clone(), r.window.test_start)).collect();
             let oof = run_file
                 .oof_flags(&labelled, fl.has("--allow-in-sample"))
@@ -2094,7 +2063,10 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             if folds.is_empty() {
                 return Err((3, "no out-of-fold folds: every fold overlaps the rows the run trained or selected on".to_string()));
             }
-            let res = score_run_banded(&facts, &panel, &folds, &thresholds, headline, book.as_ref().map(|b| b.threshold), run_band, &opts)
+            let res = match &book {
+                Some(b) => score_run_fixed(&facts, &panel, &folds, b.threshold, &opts),
+                None => score_run(&facts, &panel, &folds, &thresholds, headline, &opts),
+            }
             .map_err(|e| (ladder::spacing_exit(&e, 3), e))?;
             let min_group_step = ladder::check_fold_spacing(&panel, &folds, opts.horizon_seconds).map_err(|e| (3, e))?;
             let cost_decl = opts.cost.clone().unwrap_or(crate::target::CostDecl {
@@ -2107,7 +2079,6 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 Some(b) => format!("{{\"kind\":\"fixed\",\"threshold\":{}}}", jnum(b.threshold)),
                 None => "{\"kind\":\"quantile\"}".to_string(),
             };
-            let band_rule = run_band.map_or_else(String::new, |b| format!(",\"band_book\":{{\"source\":\"run\",\"half_width\":{},\"min_holding\":{}}}", jnum(b.half_width), b.min_hold));
             let json = res.json();
             let fold_oof = format!(
                 "[{}]",
@@ -2119,12 +2090,11 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                     .join(",")
             );
             let mut json = format!(
-                "{},\"min_group_step_seconds\":{},\"cost\":{},\"threshold_rule\":{}{},\"fold_oof\":{}}}",
+                "{},\"min_group_step_seconds\":{},\"cost\":{},\"threshold_rule\":{},\"fold_oof\":{}}}",
                 &json[..json.len() - 1],
                 min_group_step.map_or_else(|| "null".to_string(), jnum),
                 cost_decl.json(),
                 rule,
-                band_rule,
                 fold_oof
             );
             json = format!(
