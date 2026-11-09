@@ -682,6 +682,139 @@ pub fn spa_test(d: &[Vec<f64>], block: usize, draws: usize, seed: u32) -> Result
 }
 
 // ---------------------------------------------------------------------------
+// Stationary bootstrap
+// ---------------------------------------------------------------------------
+
+/// Blocks `(start, len)` of one stationary bootstrap path over `n` periods.
+///
+/// Block lengths are geometric with mean `mean_block` (Politis and Romano
+/// 1994), starts are uniform, the last block is cut to fill `n` periods and
+/// blocks wrap around the series end.
+pub fn stationary_blocks(n: usize, mean_block: usize, rng: &mut Mt) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut remaining = n;
+    let p = 1.0 / mean_block.max(1) as f64;
+    let ln_q = (1.0 - p).ln();
+    while remaining > 0 {
+        let len = if p >= 1.0 {
+            1
+        } else {
+            let u = 1.0 - rng.next_f64();
+            1 + (u.ln() / ln_q).floor() as usize
+        };
+        let len = len.min(remaining);
+        out.push((rng.usize_below(n), len));
+        remaining -= len;
+    }
+    out
+}
+
+/// Stationary bootstrap of the mean and Sharpe of `x`. Same centred prefix
+/// sums as [`bootstrap_draws`], so a draw costs `O(n / L)`.
+pub fn stationary_bootstrap_draws(x: &[f64], mean_block: usize, draws: usize, seed: u32) -> Draws {
+    let n = x.len();
+    let mut out = Draws {
+        means: Vec::with_capacity(draws),
+        sharpes: Vec::with_capacity(draws),
+    };
+    if n < 2 {
+        return out;
+    }
+    let m0 = mean(x);
+    let mut p1 = vec![0.0f64; 2 * n + 1];
+    let mut p2 = vec![0.0f64; 2 * n + 1];
+    for i in 0..2 * n {
+        let y = x[i % n] - m0;
+        p1[i + 1] = p1[i] + y;
+        p2[i + 1] = p2[i] + y * y;
+    }
+    let mut rng = Mt::new(seed);
+    let nf = n as f64;
+    for _ in 0..draws {
+        let mut sum = 0.0;
+        let mut sumsq = 0.0;
+        for (s, len) in stationary_blocks(n, mean_block, &mut rng) {
+            sum += p1[s + len] - p1[s];
+            sumsq += p2[s + len] - p2[s];
+        }
+        let var = ((sumsq - sum * sum / nf) / (nf - 1.0)).max(0.0);
+        let m = m0 + sum / nf;
+        out.means.push(m);
+        out.sharpes.push(if var > 0.0 { m / var.sqrt() } else { f64::NAN });
+    }
+    out
+}
+
+/// One-sided p-value for `mean < 0`: the share of centred draws at most as
+/// large as the observed mean, `(1 + count) / (B + 1)`.
+pub fn bootstrap_p_mean_negative(x: &[f64], d: &Draws) -> f64 {
+    let m0 = mean(x);
+    let count = d.means.iter().filter(|&&m| m - m0 <= m0).count();
+    null_p_count(count, d.means.len())
+}
+
+/// Percentile interval of `v` at `level` (two-sided), with the sample sd.
+pub fn percentile_interval(v: &[f64], level: f64) -> Interval {
+    interval(v, level)
+}
+
+/// Sample variance of the finite draws.
+pub fn draws_variance(v: &[f64]) -> f64 {
+    draw_variance(v)
+}
+
+// ---------------------------------------------------------------------------
+// Trial clustering and MinBTL
+// ---------------------------------------------------------------------------
+
+/// Single-linkage clusters of a correlation matrix at `|rho| >= threshold`.
+/// The cluster index of every series, dense from 0 in order of first member.
+pub fn single_linkage_clusters(corr: &[Vec<f64>], threshold: f64) -> Vec<usize> {
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let k = corr.len();
+    let mut parent: Vec<usize> = (0..k).collect();
+    for i in 0..k {
+        for j in 0..i {
+            if corr[i][j].abs() >= threshold {
+                let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                if a != b {
+                    parent[a.max(b)] = a.min(b);
+                }
+            }
+        }
+    }
+    let mut label = vec![usize::MAX; k];
+    let mut next = 0usize;
+    let mut out = vec![0usize; k];
+    for i in 0..k {
+        let r = find(&mut parent, i);
+        if label[r] == usize::MAX {
+            label[r] = next;
+            next += 1;
+        }
+        out[i] = label[r];
+    }
+    out
+}
+
+/// Minimum backtest length in years (Bailey, Borwein, Lopez de Prado and Zhu
+/// 2014): `(E[max_N] / SR)^2`. `E[max_N]` is the expected maximum of `n_trials`
+/// independent standard-normal Sharpe estimates over one year, `SR` the annual
+/// Sharpe. `NaN` for a non-positive Sharpe.
+pub fn min_btl_years(sharpe_annual: f64, n_trials: f64) -> f64 {
+    if !(sharpe_annual > 0.0) {
+        return f64::NAN;
+    }
+    (expected_max_sharpe(n_trials, 1.0) / sharpe_annual).powi(2)
+}
+
+// ---------------------------------------------------------------------------
 // Benjamini-Hochberg
 // ---------------------------------------------------------------------------
 

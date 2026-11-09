@@ -100,6 +100,7 @@ pub mod trading_gpu; // #304/#305: fused long-only P&L, exact threshold and shar
 pub mod units;
 pub mod walkforward;
 pub mod wf_protocol; // #264: economics, block inference and nulls for the walk-forward report
+pub mod trials; // #926: campaign trial accounting and paired run comparison
 pub mod wf_batch; // #309: batch walk-forward P&L over (candidate, window)
 pub mod protocol; // #264: windows table, candidate ledger, sealed list, one-read lockbox
 pub mod window_stats;

@@ -2420,6 +2420,10 @@ fn main() {
     if args.first().map(|s| s.as_str()) == Some("ablation") {
         rcsr::ablation::run(&args[1..]);
     }
+    // #926: campaign trial accounting and paired run comparison.
+    if args.first().map(|s| s.as_str()) == Some("trials") {
+        rcsr::trials::run(&args[1..]);
+    }
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(
         args.first().map(|s| s.as_str()),
