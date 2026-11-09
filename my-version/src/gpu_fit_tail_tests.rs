@@ -175,3 +175,34 @@ fn a_search_counts_the_routed_tail_fits_in_the_ledger() {
     eprintln!("search: attempts {} gpu {} fallback {} routed {routed} causes {:?}", g.fit_attempts, g.fit_gpu, g.fit_fallback, g.fit_fallback_by_cause);
     assert!(routed > 0, "no tail fit was routed: {:?}", g.fit_fallback_by_cause);
 }
+
+/// #959: fixture trees whose device LM ended with status 0 above the CPU fit.
+const PINNED: [usize; 2] = [136, 150];
+
+/// #959: on trees 136 and 150 the answer the search keeps (the device
+/// constants, or the CPU fit for a routed status) is at most 1.001 times the
+/// CPU SSE.
+#[test]
+fn status_zero_device_fit_matches_cpu_on_pinned_trees() {
+    need_device!();
+    let (x, y) = rows();
+    let all = trees();
+    let pinned: Vec<Node> = PINNED.iter().map(|&k| all[k].clone()).collect();
+    let device = device_results(&x, &y, &pinned);
+    let mut worst = 0.0f64;
+    for ((start, (status, dev)), id) in pinned.iter().zip(&device).zip(PINNED) {
+        let mut cpu = start.clone();
+        let cpu_sse = fit::fit_weighted(&mut cpu, &x, &y, &[], ITERS);
+        let kept = if search::tail_status_cause(*status).is_some() { &cpu } else { dev };
+        let ratio = sse(kept, &x, &y) / cpu_sse;
+        eprintln!(
+            "pinned {id}: status {status} start sse {:.6} device c {:?} sse {:.6} cpu c {:?} sse {cpu_sse:.6} kept/cpu {ratio:.6}",
+            sse(start, &x, &y),
+            fit::constants_slots(dev),
+            sse(dev, &x, &y),
+            fit::constants_slots(&cpu),
+        );
+        worst = worst.max(ratio);
+    }
+    assert!(worst <= 1.001, "kept/cpu SSE ratio {worst:.6} above 1.001");
+}
