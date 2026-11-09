@@ -317,13 +317,17 @@ fn stationary_bootstrap_se_iid() {
 
 #[test]
 fn stationary_bootstrap_se_ar1() {
-    let (n, phi) = (2_000usize, 0.5f64);
-    let x = ar1(n, phi, 1);
-    let d = stationary_bootstrap_draws(&x, 20, 10_000, 4);
-    let se = sample_sd(&d.means);
-    let var = sample_sd(&x).powi(2);
-    let expect = (var / n as f64 * (1.0 + phi) / (1.0 - phi)).sqrt();
-    assert!((se - expect).abs() / expect <= 0.15, "se {} expect {}", se, expect);
+    let (n, phi, reps) = (2_000usize, 0.5f64, 50u32);
+    let expect = ((1.0 / (1.0 - phi * phi)) / n as f64 * (1.0 + phi) / (1.0 - phi)).sqrt();
+    for base in 1..=10u32 {
+        let mut sum = 0.0;
+        for r in 0..reps {
+            let x = ar1(n, phi, base * 1_000 + r);
+            sum += sample_sd(&stationary_bootstrap_draws(&x, 20, 400, base * 7 + r).means);
+        }
+        let se = sum / reps as f64;
+        assert!((se - expect).abs() / expect <= 0.15, "base {} se {} expect {}", base, se, expect);
+    }
 }
 
 #[test]
