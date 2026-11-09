@@ -4426,7 +4426,7 @@ fn check_split_lockbox(
         report.lockbox_embargo_seconds = d.embargo.seconds;
         report.lockbox_embargo_source = d.embargo.source.as_str();
         let name = t.names.get(tc).map(String::as_str).unwrap_or("time");
-        let floored = *d;
+        let floored = label_floored(d, spec);
         floored.check_times("training split", name, &train_times, boundary_purge)?;
         floored.check_times("validation split", name, &validation_times, boundary_purge)?;
         floored.check_times("test split", name, &test_times, boundary_purge)?;
