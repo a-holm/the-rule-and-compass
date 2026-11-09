@@ -1232,7 +1232,8 @@ fn ladder_takes_the_target_spec_purge_before_the_range_start() {
     let a = emb_store(&dir, "a", false, EMB_L);
     let spec = dir.join("spec.json");
     std::fs::write(&spec, LONG_LABEL_SPEC).unwrap();
-    // a fold ending 68 h before S: clear of the 61 h default purge, inside the 75 h label of the spec
+    // a fold ending 68 h before S: clear of a 1 h flag purge, inside the 75 h label of the spec;
+    // its validation slice ends 4 h before the test block, which only the 1 h purge leaves rows in
     let win = dir.join("w.csv");
     std::fs::write(
         &win,
@@ -1251,7 +1252,7 @@ fn ladder_takes_the_target_spec_purge_before_the_range_start() {
         let mut args = vec![
             "ladder", "--data", a.as_str(), "--target", "y", "--return-col", "ret", "--time", "ts", "--group", "sym",
             "--features", "f1,f2", "--windows", &win_s, "--scheme", "expanding", "--gbm-trees", "10", "--draws", "50",
-            "--max-fit-rows", "600", "--out", out,
+            "--max-fit-rows", "600", "--purge-seconds", "3600", "--out", out,
         ];
         args.extend_from_slice(extra);
         let args: Vec<String> = args.iter().map(|x| x.to_string()).collect();
@@ -1261,7 +1262,7 @@ fn ladder_takes_the_target_spec_purge_before_the_range_start() {
     let free = s(&dir.join("free.json"));
     let (code, _, err) = run(&[], &free);
     assert_eq!(code, 0, "{}", err);
-    assert!(std::fs::read_to_string(&free).unwrap().contains("\"purge_source\":\"protocol_default\""));
+    assert!(std::fs::read_to_string(&free).unwrap().contains("\"purge_seconds\":3600,\"purge_source\":\"flag\""));
     let (code, _, err) = run(&["--target-spec", &s(&spec)], &s(&dir.join("spec.out.json")));
     assert_eq!(code, 3, "{}", err);
     assert!(err.contains("reaches the declared locked test"), "{}", err);
