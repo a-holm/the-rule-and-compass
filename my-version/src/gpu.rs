@@ -1092,7 +1092,9 @@ pub struct GpuFitOutput {
     pub sse: f64,
     /// #286: `0` usable; `4` rank-deficient but finite; `5` recovered last
     /// accepted iterate; `6` no improvement, start kept; `7` non-finite start
-    /// (log-only, no fallback); `8` recovered with bad-gradient rows skipped.
+    /// (log-only, no fallback); `8` recovered with bad-gradient rows skipped;
+    /// `9` (#959, squared loss) the polish rejected an undamped step whose
+    /// model predicted a drop above `1e-3` of the loss.
     /// `1` is an arithmetic failure and `2` a non-finite row with no usable
     /// iterate; only those route to the exact CPU fallback.
     pub status: i32,

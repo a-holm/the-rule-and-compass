@@ -1,7 +1,7 @@
-//! #936: statuses 4, 5 and 7 of the LM kernel go to the exact CPU fit.
+//! #936, #959: statuses 4, 5, 7 and 9 of the LM kernel go to the exact CPU fit.
 //!
 //! The fixture is 240 deterministic trees over `min`, `max`, `if` and
-//! `greater` on 8 columns and 112,500 rows. A tree with one of the three
+//! `greater` on 8 columns and 112,500 rows. A tree with one of the four
 //! statuses ends at the CPU fit from its starting constants; every other tree
 //! keeps the device constants bit for bit. Device tests skip cleanly on a
 //! machine without CUDA.
@@ -96,7 +96,7 @@ fn device_results(x: &[Vec<f64>], y: &[f64], trees: &[Node]) -> Vec<(i32, Node)>
         .collect()
 }
 
-/// After routing, every tree with status 4, 5 or 7 equals the CPU fit and
+/// After routing, every tree with status 4, 5, 7 or 9 equals the CPU fit and
 /// every other tree keeps its device constants.
 #[test]
 fn device_fit_tail_statuses_fall_back() {
@@ -106,7 +106,7 @@ fn device_fit_tail_statuses_fall_back() {
     assert_eq!(trees.len(), 240);
     let device = device_results(&x, &y, &trees);
     let mut routed = std::collections::BTreeMap::<&str, usize>::new();
-    let mut seen = [0usize; 9];
+    let mut seen = [0usize; 10];
     let mut before = 1.0f64;
     let mut after = 1.0f64;
     let mut kept_worse: Vec<usize> = Vec::new();
@@ -134,9 +134,10 @@ fn device_fit_tail_statuses_fall_back() {
         }
     }
     eprintln!("tail: statuses {seen:?} routed {routed:?} device/cpu before routing {before:.6} kept after routing {after:.6} kept worse than 1.001 {kept_worse:?}");
-    let tails = seen[4] + seen[5] + seen[7];
+    let tails = seen[4] + seen[5] + seen[7] + seen[9];
     assert!(seen[4] > 0 && seen[5] > 0 && seen[7] > 0, "the fixture lost a status: {seen:?}");
     assert_eq!(routed.values().sum::<usize>(), tails);
+    assert!(kept_worse.is_empty(), "kept device answers above 1.001 of the CPU SSE: {kept_worse:?}");
 }
 
 /// A device-dispatched search over the hard operators counts the routed fits
@@ -165,10 +166,10 @@ fn a_search_counts_the_routed_tail_fits_in_the_ledger() {
     let out = search::run(&cfg, &train, &test);
     let g = out.gpu.as_ref().expect("a fit ledger");
     assert_eq!(g.fit_attempts, g.fit_gpu + g.fit_fallback, "{g:?}");
-    for label in ["rank_deficient", "recovered", "start_unusable"] {
+    for label in ["rank_deficient", "recovered", "start_unusable", "unconverged"] {
         assert_eq!(g.fit_status_by_label.get(label).copied().unwrap_or(0), 0, "{label} kept: {g:?}");
     }
-    let routed: usize = ["rank_deficient", "recovered_iterate", "non_finite_start"]
+    let routed: usize = ["rank_deficient", "recovered_iterate", "non_finite_start", "unconverged"]
         .iter()
         .map(|c| g.fit_fallback_by_cause.get(*c).copied().unwrap_or(0))
         .sum();
@@ -250,7 +251,7 @@ fn tail_fit_overlap_equals_serial_routing() {
         let serial = tail_trace(&Config { fit_tail_overlap: false, ..cfg.clone() }, &train, &test);
         let overlap = tail_trace(&Config { fit_tail_overlap: true, ..cfg.clone() }, &train, &test);
         let (s, o) = (&serial.stats, &overlap.stats);
-        let routed: usize = ["rank_deficient", "recovered_iterate", "non_finite_start"]
+        let routed: usize = ["rank_deficient", "recovered_iterate", "non_finite_start", "unconverged"]
             .iter()
             .map(|c| s.fit_fallback_by_cause.get(*c).copied().unwrap_or(0))
             .sum();
@@ -299,4 +300,35 @@ fn tail_fit_overlap_equals_serial_routing() {
             assert!(t.ledger.closure_residual().value.abs() < bound, "{label}: the ledger does not close");
         }
     }
+}
+
+/// #959: fixture trees whose device LM ended with status 0 above the CPU fit.
+const PINNED: [usize; 2] = [136, 150];
+
+/// #959: on trees 136 and 150 the answer the search keeps (the device
+/// constants, or the CPU fit for a routed status) is at most 1.001 times the
+/// CPU SSE.
+#[test]
+fn status_zero_device_fit_matches_cpu_on_pinned_trees() {
+    need_device!();
+    let (x, y) = rows();
+    let all = trees();
+    let pinned: Vec<Node> = PINNED.iter().map(|&k| all[k].clone()).collect();
+    let device = device_results(&x, &y, &pinned);
+    let mut worst = 0.0f64;
+    for ((start, (status, dev)), id) in pinned.iter().zip(&device).zip(PINNED) {
+        let mut cpu = start.clone();
+        let cpu_sse = fit::fit_weighted(&mut cpu, &x, &y, &[], ITERS);
+        let kept = if search::tail_status_cause(*status).is_some() { &cpu } else { dev };
+        let ratio = sse(kept, &x, &y) / cpu_sse;
+        eprintln!(
+            "pinned {id}: status {status} start sse {:.6} device c {:?} sse {:.6} cpu c {:?} sse {cpu_sse:.6} kept/cpu {ratio:.6}",
+            sse(start, &x, &y),
+            fit::constants_slots(dev),
+            sse(dev, &x, &y),
+            fit::constants_slots(&cpu),
+        );
+        worst = worst.max(ratio);
+    }
+    assert!(worst <= 1.001, "kept/cpu SSE ratio {worst:.6} above 1.001");
 }
