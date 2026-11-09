@@ -124,6 +124,183 @@ impl PositionMap {
     }
 }
 
+/// #925: how `--band B` is read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BandUnits {
+    /// `B` is the half-width in score units.
+    #[default]
+    Score,
+    /// `B` is a multiple of the candidate's training-score standard deviation.
+    Sd,
+}
+
+impl BandUnits {
+    pub fn parse(s: &str) -> Result<BandUnits, String> {
+        match s.trim() {
+            "score" => Ok(BandUnits::Score),
+            "sd" => Ok(BandUnits::Sd),
+            other => Err(format!("--band-units must be score or sd, got '{}'", other)),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BandUnits::Score => "score",
+            BandUnits::Sd => "sd",
+        }
+    }
+}
+
+/// #925: sample standard deviation (ddof 1) of the finite scores, and how many
+/// entered it. `sd` is `None` for fewer than 2 finite scores, equal finite
+/// scores (a constant score), or a zero or non-finite value.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScoreSd {
+    pub sd: Option<f64>,
+    pub rows: usize,
+}
+
+/// Tree sum of `term(x)` over the finite `x`: lane `(k - segment start) % 32`
+/// of each [`FITNESS_SEGMENT_ROWS`]-row segment adds its rows in ascending
+/// order, the lanes fold 16, 8, 4, 2, 1, segment `s` adds into warp sum
+/// `s % 8` and the warp sums fold 4, 2, 1: the device order term for term.
+fn tree_sum(x: &[f64], term: impl Fn(f64) -> f64) -> f64 {
+    let mut warps = [0.0f64; FITNESS_WARPS];
+    let mut seg_start = 0usize;
+    let mut seg = 0usize;
+    while seg_start < x.len() {
+        let seg_end = (seg_start + FITNESS_SEGMENT_ROWS).min(x.len());
+        let mut lanes = [0.0f64; FITNESS_LANES];
+        for k in seg_start..seg_end {
+            if x[k].is_finite() {
+                lanes[(k - seg_start) % FITNESS_LANES] += term(x[k]);
+            }
+        }
+        let mut half = FITNESS_LANES / 2;
+        while half >= 1 {
+            for i in 0..half {
+                lanes[i] += lanes[i + half];
+            }
+            half /= 2;
+        }
+        warps[seg % FITNESS_WARPS] += lanes[0];
+        seg += 1;
+        seg_start = seg_end;
+    }
+    let mut half = FITNESS_WARPS / 2;
+    while half >= 1 {
+        for i in 0..half {
+            warps[i] += warps[i + half];
+        }
+        half /= 2;
+    }
+    warps[0]
+}
+
+/// #925: the training-score standard deviation behind `--band-units sd`: the
+/// mean, then the centred sum of squares, both in the fixed tree order of
+/// [`tree_sum`], so the device reduction equals it bit for bit on the same
+/// `f32` predictions.
+pub fn score_sd(scores: &[f64]) -> ScoreSd {
+    let mut rows = 0usize;
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &v in scores.iter().filter(|v| v.is_finite()) {
+        rows += 1;
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    // A constant score is degenerate even when the rounded mean leaves a tiny
+    // centred sum of squares.
+    if rows < 2 || lo == hi {
+        return ScoreSd { sd: None, rows };
+    }
+    let mean = tree_sum(scores, |v| v) / rows as f64;
+    let ss = tree_sum(scores, |v| {
+        let d = v - mean;
+        d * d
+    });
+    let sd = (ss / (rows - 1) as f64).sqrt();
+    ScoreSd { sd: (sd.is_finite() && sd > 0.0).then_some(sd), rows }
+}
+
+/// #925: the no-trade band of the book. `resolved` is the half-width in score
+/// units that the book prices; with [`BandUnits::Sd`] it is `multiple` times
+/// the standard deviation of the candidate's scores on its training rows, and
+/// a book on other rows takes it as given.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BandSpec {
+    pub units: BandUnits,
+    /// `--band B`.
+    pub multiple: f64,
+    /// Training-score sd; `None` in score units or when degenerate.
+    pub sd: Option<f64>,
+    /// Finite training scores in the sd (sd units only).
+    pub sd_rows: Option<usize>,
+    /// Latest time of a row in the sd (sd units only).
+    pub sd_max_time: Option<f64>,
+    pub resolved: f64,
+}
+
+impl Default for BandSpec {
+    fn default() -> Self {
+        BandSpec::score(0.0)
+    }
+}
+
+impl BandSpec {
+    /// A band in score units: the multiple is the half-width.
+    pub fn score(multiple: f64) -> BandSpec {
+        BandSpec { units: BandUnits::Score, multiple, sd: None, sd_rows: None, sd_max_time: None, resolved: multiple }
+    }
+
+    /// Resolve the band from one candidate's scores on its training rows
+    /// (`time` aligned with `scores`). A degenerate sd resolves to 0.
+    pub fn from_training(units: BandUnits, multiple: f64, scores: &[f64], time: &[f64]) -> BandSpec {
+        if units == BandUnits::Score {
+            return BandSpec::score(multiple);
+        }
+        let max_time = scores
+            .iter()
+            .zip(time)
+            .filter(|(s, t)| s.is_finite() && t.is_finite())
+            .map(|(_, &t)| t)
+            .fold(None, |m: Option<f64>, t| Some(m.map_or(t, |m| m.max(t))));
+        BandSpec::from_sd(units, multiple, score_sd(scores), max_time)
+    }
+
+    /// The band from a computed training-score sd and the latest time of a
+    /// row in it.
+    pub fn from_sd(units: BandUnits, multiple: f64, sd: ScoreSd, max_time: Option<f64>) -> BandSpec {
+        if units == BandUnits::Score {
+            return BandSpec::score(multiple);
+        }
+        BandSpec {
+            units,
+            multiple,
+            sd: sd.sd,
+            sd_rows: Some(sd.rows),
+            sd_max_time: max_time,
+            resolved: sd.sd.map_or(0.0, |s| multiple * s),
+        }
+    }
+
+    /// The JSON members, each with a leading comma.
+    pub fn json_fields(&self) -> String {
+        let sd_units = self.units == BandUnits::Sd;
+        format!(
+            ",\"band\":{},\"band_units\":\"{}\",\"band_sd\":{},\"band_resolved\":{},\"band_sd_rows\":{},\
+             \"band_sd_max_time\":{},\"band_sd_degenerate\":{}",
+            num(self.multiple),
+            self.units.name(),
+            self.sd.map_or_else(|| "null".to_string(), num),
+            num(self.resolved),
+            self.sd_rows.map_or_else(|| "null".to_string(), |r| r.to_string()),
+            self.sd_max_time.map_or_else(|| "null".to_string(), num),
+            if sd_units { if self.sd.is_none() { "true" } else { "false" } } else { "null" }
+        )
+    }
+}
+
 /// The book's assumptions. Costs are per side, in basis points of notional.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TradingSpec {
@@ -140,6 +317,9 @@ pub struct TradingSpec {
     /// Minimum consecutive long rows, entry row included, before an exit
     /// (indicator rule only).
     pub min_holding: usize,
+    /// #925: no-trade band of the indicator rule: enter above
+    /// `threshold + band.resolved`, exit at or below `threshold - band.resolved`.
+    pub band: BandSpec,
     pub threshold: f64,
     /// Sizing scale; `None` is the `{0, 1}` indicator.
     pub tau: Option<f64>,
@@ -161,6 +341,7 @@ impl Default for TradingSpec {
             cash_return: 0.0,
             min_trades: 1,
             min_holding: 1,
+            band: BandSpec::default(),
             threshold: 0.0,
             tau: None,
             max_position: 1.0,
@@ -213,6 +394,19 @@ impl TradingSpec {
         if self.position == PositionMap::TopTercile && (self.tau.is_some() || self.min_holding > 1 || self.max_position != 1.0) {
             return Err("the top_tercile book is the unit {0, 1} position: it needs no tau, min_holding 1 and max_position 1".to_string());
         }
+        for (name, v) in [("band", self.band.multiple), ("resolved band", self.band.resolved)] {
+            if !v.is_finite() || v < 0.0 {
+                return Err(format!("the {} must be finite and non-negative, got {}", name, v));
+            }
+        }
+        if self.band.multiple > 0.0 {
+            if self.position == PositionMap::TopTercile {
+                return Err("--band is not supported with --position top_tercile: the tercile book has no threshold".to_string());
+            }
+            if self.tau.is_some() {
+                return Err("the band needs the indicator position (no tau)".to_string());
+            }
+        }
         if let Some(p) = self.periods_per_year {
             if !(p.is_finite() && p > 0.0) {
                 return Err(format!("periods_per_year must be positive, got {}", p));
@@ -226,7 +420,7 @@ impl TradingSpec {
             "{{\"position\":\"{}\",\"threshold\":{},\"tau\":{},\"max_position\":{},\
              \"cost_bps\":{},\"fee_bps\":{},\"half_spread_bps\":{},\"slippage_bps\":{},\
              \"per_side_bps\":{},\"funding_col\":{},\"cash_return\":{},\"min_trades\":{},\
-             \"min_holding\":{}}}",
+             \"min_holding\":{}{}}}",
             self.position.name(),
             num(self.threshold),
             self.tau.map(num).unwrap_or_else(|| "null".to_string()),
@@ -242,7 +436,8 @@ impl TradingSpec {
                 .unwrap_or_else(|| "null".to_string()),
             num(self.cash_return),
             self.min_trades,
-            self.min_holding
+            self.min_holding,
+            self.band.json_fields()
         )
     }
 }
@@ -883,23 +1078,24 @@ fn positions_of(pred: &[f64], rows: &TradingRows, keep: &[usize], ctx: &Ctx, spe
     if spec.position == PositionMap::TopTercile {
         let all = top_tercile_positions(pred, &rows.time);
         keep.iter().map(|&i| all[i]).collect()
-    } else if spec.min_holding > 1 {
+    } else if spec.min_holding > 1 || spec.band.resolved > 0.0 {
+        // #925: the band automaton of `walkforward --policy band`; with a zero
+        // band it is the minimum-hold rule.
+        let params = trading_gpu::BandParams {
+            threshold: spec.threshold,
+            band: spec.band.resolved,
+            min_hold: spec.min_holding,
+        };
         let mut positions = vec![0.0f64; keep.len()];
         let mut current: Option<u64> = None;
-        let mut held = 0usize;
+        let mut state = trading_gpu::BandState::default();
         for &i in &ctx.order {
             if current != Some(ctx.group[i]) {
                 current = Some(ctx.group[i]);
-                held = 0;
+                state = trading_gpu::BandState::default();
             }
-            let want = position_of(scores[i], spec);
-            let long = if held > 0 && want == 0.0 && held < spec.min_holding {
-                spec.max_position
-            } else {
-                want
-            };
-            held = if long > 0.0 { held + 1 } else { 0 };
-            positions[i] = long;
+            state = params.next(state, scores[i]);
+            positions[i] = if state.long { spec.max_position } else { 0.0 };
         }
         positions
     } else {
@@ -1072,6 +1268,9 @@ pub const FITNESS_LANES: usize = trading_gpu::PNL_LANES;
 pub const FITNESS_WARPS: usize = 8;
 /// Most time blocks of the consistency term (`--pnl-blocks`).
 pub const FITNESS_MAX_BLOCKS: usize = 8;
+/// #925: most minimum-hold rows the device band scorer carries (`K + 1`
+/// automaton states); a longer hold scores on the CPU.
+pub const FITNESS_DEVICE_MAX_HOLD: usize = 32;
 /// The block id of a row sits in bits 2 to 4 of its [`FitnessBook::flags`] byte.
 pub const FITNESS_BLOCK_SHIFT: u8 = 2;
 
@@ -1131,6 +1330,10 @@ pub struct FitnessBook {
     hash: u64,
     lambda: f64,
     block_bounds: Vec<f64>,
+    /// #925: `--band B` and its units, and the minimum hold.
+    band: f64,
+    band_units: BandUnits,
+    min_hold: usize,
 }
 
 fn fnv_u64(h: &mut u64, v: u64) {
@@ -1169,10 +1372,9 @@ impl FitnessBook {
         if spec.position != PositionMap::Threshold {
             return Err("the fitness book prices the threshold rule only, not the top_tercile map".to_string());
         }
-        if spec.tau.is_some() || spec.min_holding > 1 || spec.max_position != 1.0 {
+        if spec.tau.is_some() || spec.max_position != 1.0 {
             return Err(
-                "the fitness book is the plain {0, 1} indicator: it needs min_holding 1, max_position 1 and no tau"
-                    .to_string(),
+                "the fitness book is the {0, 1} indicator: it needs max_position 1 and no tau".to_string(),
             );
         }
         let n = slice.ret.len();
@@ -1265,6 +1467,12 @@ impl FitnessBook {
                 fnv_u64(&mut hash, b.to_bits());
             }
         }
+        let band = spec.band.multiple;
+        if band != 0.0 || spec.min_holding != 1 || spec.band.units != BandUnits::Score {
+            fnv_u64(&mut hash, band.to_bits());
+            fnv_u64(&mut hash, if spec.band.units == BandUnits::Sd { 1 } else { 0 });
+            fnv_u64(&mut hash, spec.min_holding as u64);
+        }
         Ok(FitnessBook {
             excess,
             flags,
@@ -1276,6 +1484,9 @@ impl FitnessBook {
             hash,
             lambda,
             block_bounds,
+            band,
+            band_units: spec.band.units,
+            min_hold: spec.min_holding,
         })
     }
 
@@ -1329,6 +1540,9 @@ impl FitnessBook {
     /// order-free.
     pub fn totals(&self, pred: &[f64]) -> FitnessTotals {
         debug_assert_eq!(pred.len(), self.excess.len());
+        if !self.is_plain() {
+            return self.band_pass(pred, self.resolve_band(pred), false)[0];
+        }
         let n = self.excess.len().min(pred.len());
         let mut warps = [0.0f64; FITNESS_WARPS];
         let mut flips = 0u64;
@@ -1441,6 +1655,9 @@ impl FitnessBook {
     /// exactly as [`FitnessBook::totals`] does for the whole book.
     pub fn block_totals(&self, pred: &[f64]) -> Vec<FitnessTotals> {
         debug_assert_eq!(pred.len(), self.excess.len());
+        if !self.is_plain() {
+            return self.band_pass(pred, self.resolve_band(pred), true);
+        }
         let nb = self.blocks();
         let n = self.excess.len().min(pred.len());
         let mut warps = vec![[0.0f64; FITNESS_WARPS]; nb];
@@ -1560,6 +1777,105 @@ impl FitnessBook {
         }
     }
 
+    /// #925: `--band B` (score units, or a multiple of the training-score sd).
+    pub fn band(&self) -> f64 {
+        self.band
+    }
+
+    pub fn band_units(&self) -> BandUnits {
+        self.band_units
+    }
+
+    /// #925: minimum consecutive long rows, entry row included.
+    pub fn min_hold(&self) -> usize {
+        self.min_hold
+    }
+
+    /// The plain threshold rule: no band and a minimum hold of 1.
+    pub fn is_plain(&self) -> bool {
+        self.band == 0.0 && self.min_hold == 1
+    }
+
+    /// #925: the half-width in score units this prediction vector is priced
+    /// with: `B`, or `B` times the sd of its finite predictions on these
+    /// training rows ([`score_sd`]; 0 when degenerate).
+    pub fn resolve_band(&self, pred: &[f64]) -> f64 {
+        match self.band_units {
+            BandUnits::Score => self.band,
+            BandUnits::Sd => score_sd(pred).sd.map_or(0.0, |s| self.band * s),
+        }
+    }
+
+    /// #925: the band automaton ([`trading_gpu::BandParams::next`]) over the
+    /// canonical rows at half-width `band`, the state reset to flat at every
+    /// run start of [`FitnessBook::flags`]. Per block when `per_block`, else
+    /// one book; each keeps the segment, lane and warp tree of
+    /// [`FitnessBook::totals`] for `gross`.
+    pub fn band_pass(&self, pred: &[f64], band: f64, per_block: bool) -> Vec<FitnessTotals> {
+        let nb = if per_block { self.blocks() } else { 1 };
+        let n = self.excess.len().min(pred.len());
+        let params = trading_gpu::BandParams { threshold: self.threshold, band, min_hold: self.min_hold };
+        let mut warps = vec![[0.0f64; FITNESS_WARPS]; nb];
+        let mut out = vec![FitnessTotals { gross: 0.0, flips: 0, exits: 0, long_rows: 0, nonfinite: false }; nb];
+        let mut state = trading_gpu::BandState::default();
+        let mut prev = false;
+        let mut seg_start = 0usize;
+        let mut seg = 0usize;
+        while seg_start < n {
+            let seg_end = (seg_start + FITNESS_SEGMENT_ROWS).min(n);
+            let mut lanes = vec![[0.0f64; FITNESS_LANES]; nb];
+            for k in seg_start..seg_end {
+                let p = pred[k];
+                let flag = self.flags[k];
+                let b = if per_block { (flag >> FITNESS_BLOCK_SHIFT) as usize & (FITNESS_MAX_BLOCKS - 1) } else { 0 };
+                if !p.is_finite() {
+                    out[b].nonfinite = true;
+                }
+                if flag & TradingRows::FIRST != 0 {
+                    state = trading_gpu::BandState::default();
+                    prev = false;
+                }
+                state = params.next(state, p);
+                let long = state.long;
+                if long != prev {
+                    out[b].flips += 1;
+                }
+                if long {
+                    out[b].long_rows += 1;
+                    lanes[b][(k - seg_start) % FITNESS_LANES] += self.excess[k];
+                    if flag & TradingRows::LAST != 0 {
+                        out[b].exits += 1;
+                    }
+                }
+                prev = long;
+            }
+            for b in 0..nb {
+                let l = &mut lanes[b];
+                let mut half = FITNESS_LANES / 2;
+                while half >= 1 {
+                    for i in 0..half {
+                        l[i] += l[i + half];
+                    }
+                    half /= 2;
+                }
+                warps[b][seg % FITNESS_WARPS] += l[0];
+            }
+            seg += 1;
+            seg_start = seg_end;
+        }
+        for b in 0..nb {
+            let w = &mut warps[b];
+            let mut half = FITNESS_WARPS / 2;
+            while half >= 1 {
+                for i in 0..half {
+                    w[i] += w[i + half];
+                }
+                half /= 2;
+            }
+            out[b].gross = w[0];
+        }
+        out
+    }
 }
 
 /// The finalist chosen by a trading objective, with both books.
@@ -1956,5 +2272,56 @@ mod realised_position_tests {
             realised_position(1.0, &TradingSpec { position: PositionMap::TopTercile, ..spec }),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+
+    /// #925: the tree sums of `score_sd` against a plain two-pass sd.
+    #[test]
+    fn score_sd_is_the_two_pass_sample_sd_over_finite_scores() {
+        let mut v: Vec<f64> = (0..20_000).map(|i| ((i as f64 * 0.618_033_988_749_894_9).fract() - 0.3) * 4.0).collect();
+        v[17] = f64::NAN;
+        v[9_000] = f64::INFINITY;
+        let finite: Vec<f64> = v.iter().copied().filter(|x| x.is_finite()).collect();
+        let mean = finite.iter().sum::<f64>() / finite.len() as f64;
+        let naive = (finite.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (finite.len() - 1) as f64).sqrt();
+        let got = score_sd(&v);
+        assert_eq!(got.rows, finite.len());
+        let sd = got.sd.unwrap();
+        assert!((sd - naive).abs() <= 1e-12 * naive, "{sd} vs {naive}");
+        assert_eq!(score_sd(&[1.0]).sd, None);
+        assert_eq!(score_sd(&[2.0, 2.0, 2.0]).sd, None);
+        assert_eq!(score_sd(&[1.0, f64::MAX, -f64::MAX]).sd, None);
+    }
+
+    /// #925: the objective's band positions are the walk-forward automaton's.
+    #[test]
+    fn evaluate_prices_the_walkforward_band_positions() {
+        let n = 400;
+        let rows = TradingRows {
+            time: (0..n).map(|i| (i % 200) as f64 * 900.0).collect(),
+            group: (0..n).map(|i| (i / 200) as u64).collect(),
+            funding: Vec::new(),
+        };
+        let mut v = 0.0f64;
+        let pred: Vec<f64> = (0..n)
+            .map(|i| {
+                v = 0.8 * v + ((i as f64 * 0.754_877_666_246_692_7).fract() - 0.5);
+                v
+            })
+            .collect();
+        let r: Vec<f64> = (0..n).map(|i| 0.01 * ((i as f64 * 0.324_717_957_244_746).fract() - 0.5)).collect();
+        for (band, hold) in [(0.0, 1usize), (0.25, 1), (0.0, 5), (0.4, 7)] {
+            let spec = TradingSpec { band: BandSpec::score(band), min_holding: hold, cost_bps: 5.0, ..TradingSpec::default() };
+            let book = evaluate(&pred, &r, &rows, &spec).unwrap();
+            let params = trading_gpu::BandParams::new(0.0, band, hold).unwrap();
+            let pos = trading_gpu::band_positions(&pred, &rows.group, &params).unwrap();
+            let explicit = evaluate_positions(&pos, &r, &rows, &spec).unwrap();
+            assert_eq!(book.net_pnl.to_bits(), explicit.net_pnl.to_bits(), "band {band} hold {hold}");
+            assert_eq!(book.trades, explicit.trades);
+        }
     }
 }

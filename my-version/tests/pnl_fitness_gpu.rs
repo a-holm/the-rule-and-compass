@@ -1071,3 +1071,312 @@ fn every_device_side_book_refusal_names_its_cause() {
     }
     ev.set_pnl_book(&b).expect("a valid book still uploads after the refusals");
 }
+
+// ---- #925: the band and the minimum hold ----
+
+use rcsr::trading::{BandSpec, BandUnits};
+
+const BAND_PAIRS: [(f64, usize); 3] = [(0.3, 1), (0.0, 8), (0.5, 24)];
+
+fn band_spec(min_trades: usize, band: f64, units: BandUnits, hold: usize) -> TradingSpec {
+    TradingSpec {
+        band: BandSpec { units, resolved: if units == BandUnits::Score { band } else { 0.0 }, ..BandSpec::score(band) },
+        min_holding: hold,
+        ..spec(min_trades)
+    }
+}
+
+fn band_book(f: &Fixture, band: f64, units: BandUnits, hold: usize, blocks: usize) -> FitnessBook {
+    FitnessBook::with_blocks(&f.slice, &band_spec(1, band, units, hold), 900.0, blocks, 1.0).expect("a profitable band book")
+}
+
+/// Persistent near-threshold programs, so the band and the hold change the
+/// positions, followed by the random programs.
+fn band_programs(count: usize, seed: u64) -> Vec<Node> {
+    let mut out = vec![
+        node(Op::Mul, vec![constant(0.75), input(0)]),
+        node(Op::Sub, vec![node(Op::Tanh, vec![input(1)]), constant(0.05)]),
+        node(Op::Mul, vec![constant(0.3), node(Op::Add, vec![input(0), input(2)])]),
+    ];
+    out.extend(programs(count.saturating_sub(3), seed));
+    out.truncate(count);
+    out
+}
+
+/// Every (B, K) pair, score and sd units, one and three blocks: device
+/// totals and values against the CPU book on the device predictions.
+fn assert_band_books(f: &Fixture, trees: &[Node], pairs: &[(f64, usize, BandUnits)], blocks: &[usize]) -> usize {
+    let mut finite = 0usize;
+    for &(band, hold, units) in pairs {
+        for &nb in blocks {
+            let b = band_book(f, band, units, hold, nb);
+            assert!(!b.is_plain());
+            let n = if nb == 1 {
+                let cpu = assert_exact(f, &b, trees);
+                if cpu.is_empty() {
+                    return 0;
+                }
+                cpu.iter().filter(|t| !t.nonfinite && t.flips > 0).count()
+            } else {
+                assert_exact_blocks(f, &b, trees)
+            };
+            assert!(n > 0, "band {band} hold {hold} {units:?} blocks {nb}: no finite trading program");
+            finite += n;
+        }
+    }
+    finite
+}
+
+/// The memcheck book: two segments and a partial third (one round of eight
+/// warps), the three acceptance pairs, an sd-unit band, a 32-row hold (the
+/// 33rd automaton state) and three time blocks.
+#[test]
+fn device_band_totals_equal_the_cpu_on_a_small_book() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    let mut pairs: Vec<(f64, usize, BandUnits)> = BAND_PAIRS.iter().map(|&(b, k)| (b, k, BandUnits::Score)).collect();
+    pairs.push((1.0, 12, BandUnits::Sd));
+    pairs.push((0.2, 32, BandUnits::Score));
+    assert_band_books(&f, &band_programs(16, 5), &pairs, &[1, 3]);
+}
+
+/// Thirteen segments: two rounds, segment seams inside groups and on group
+/// starts, and one group over three segments.
+#[test]
+fn device_band_totals_equal_the_cpu_over_two_rounds() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_100K, 100_003, 7);
+    let pairs = [(0.3, 1, BandUnits::Score), (0.5, 24, BandUnits::Score), (0.5, 3, BandUnits::Sd)];
+    assert_band_books(&f, &band_programs(8, 9), &pairs, &[1, 2]);
+}
+
+#[test]
+fn device_band_totals_equal_the_cpu_at_a_million_rows() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let starts: Vec<usize> = (0..100).map(|g| g * 10_000).collect();
+    let f = fixture(&starts, 1_000_000, 23);
+    let pairs: Vec<(f64, usize, BandUnits)> = BAND_PAIRS.iter().map(|&(b, k)| (b, k, BandUnits::Score)).collect();
+    let n = assert_band_books(&f, &band_programs(24, 13), &pairs, &[1]);
+    assert!(n == 0 || n >= 3 * 8, "{n} trading programs");
+}
+
+#[test]
+fn band_sd_device_matches_cpu() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let starts: Vec<usize> = (0..100).map(|g| g * 10_000).collect();
+    let f = fixture(&starts, 1_000_000, 37);
+    let b = band_book(&f, 1.0, BandUnits::Sd, 12, 1);
+    let Some(mut ev) = evaluator(&f, &b) else {
+        return;
+    };
+    let mut trees = band_programs(24, 21);
+    trees.push(constant(0.5));
+    let pop = compiled(&trees);
+    let (prog, off) = pop.programs();
+    let (batch, totals) = ev.long_pnl_totals_for_tests(prog, off).expect("the totals launch runs");
+    let sds = ev.long_pnl_band_sd_for_tests(trees.len()).expect("the sd download");
+    let mut checked = 0usize;
+    for k in 0..trees.len() {
+        let words = &prog[off[k] as usize..off[k + 1] as usize];
+        let pred: Vec<f64> = ev.predict_one_for_tests(words).expect("the device predicts").iter().map(|&p| p as f64).collect();
+        let cpu = rcsr::trading::score_sd(&pred);
+        let (dev_sd, dev_band, dev_rows) = sds[k];
+        assert_eq!(dev_rows as usize, cpu.rows, "program {k} rows");
+        match cpu.sd {
+            Some(sd) => {
+                assert_eq!(dev_sd.to_bits(), sd.to_bits(), "program {k} sd {dev_sd} vs {sd}");
+                assert_eq!(dev_band.to_bits(), (1.0 * sd).to_bits(), "program {k} band");
+                checked += 1;
+            }
+            None => {
+                assert!(dev_sd.is_nan(), "program {k}: degenerate sd {dev_sd}");
+                assert_eq!(dev_band, 0.0);
+            }
+        }
+        assert_eq!(dev_band.to_bits(), b.resolve_band(&pred).to_bits(), "program {k} resolved band");
+        let t = b.totals(&pred);
+        assert_eq!((totals[k].flips, totals[k].exits, totals[k].long_rows), (t.flips, t.exits, t.long_rows), "program {k}");
+        assert_eq!(totals[k].gross.to_bits(), t.gross.to_bits(), "program {k} gross");
+        assert_eq!(batch.values[k].to_bits(), b.regret_of(&t).to_bits(), "program {k} regret");
+    }
+    assert!(checked >= 16, "{checked} programs with a finite sd");
+    let (_, band, rows) = sds[trees.len() - 1];
+    assert_eq!((band, rows), (0.0, 1_000_000), "the constant program is degenerate");
+}
+
+#[test]
+fn a_hold_above_32_is_refused_by_the_device() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 3);
+    let b = band_book(&f, 0.1, BandUnits::Score, 33, 1);
+    let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+        return;
+    };
+    let why = ev.set_pnl_book(&b).unwrap_err();
+    assert!(why.contains("at most 32"), "{why}");
+    assert!(ev.set_pnl_band(0.1, false, 32).is_ok());
+    assert!(ev.set_pnl_band(-0.1, false, 2).unwrap_err().contains("band"));
+}
+
+fn band_search_fixture(band: f64, units: BandUnits, hold: usize) -> (Sample, Arc<FitnessBook>) {
+    let (sample, _) = search_fixture();
+    let f = fixture(&[0, 600, 1200, 1800], 2_400, 17);
+    (sample, Arc::new(band_book(&f, band, units, hold, 1)))
+}
+
+/// Every in-run archive value of a device band search against an independent
+/// reference: the CPU band book applied to the member's `f32` predictions from
+/// a fresh device interpreter (`rc_predict`, no device book). A slot the search
+/// settles on the CPU takes the exact `f64` regret: a tree without a device
+/// program, a non-finite `f32` prediction (#589) and a device `+inf` trade
+/// floor (#640). The plain book on the same predictions must differ for some
+/// member, so a device path that drops the band cannot pass.
+fn assert_archived_values_are_the_cpu_band_book(sample: &Sample, b: &FitnessBook, plain: &FitnessBook, seen: &Archived) {
+    let cols: Vec<f32> = (0..2)
+        .flat_map(|v| sample.x.iter().map(move |r| r[v] as f32))
+        .collect();
+    let y: Vec<f32> = sample.y.iter().map(|&v| v as f32).collect();
+    let mut ev = GpuEvaluator::new(&cols, sample.len(), 2, &y).expect("a fresh evaluator");
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    let (mut on_device, mut band_matters) = (0usize, 0usize);
+    for (tree, error) in seen.iter() {
+        let pred64: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(tree, r)).collect();
+        let exact = b.regret(&pred64);
+        let pop = Population::from_trees(std::iter::once(tree));
+        let want = if pop.len() == 1 {
+            let (prog, off) = pop.programs();
+            let words = &prog[off[0] as usize..off[1] as usize];
+            let pred32: Vec<f64> = ev.predict_one_for_tests(words).expect("the device predicts").iter().map(|&p| p as f64).collect();
+            let device = b.regret(&pred32);
+            if pred32.iter().any(|p| !p.is_finite()) || device.is_infinite() {
+                exact
+            } else {
+                on_device += 1;
+                if plain.regret(&pred32).to_bits() != device.to_bits() {
+                    band_matters += 1;
+                }
+                device
+            }
+        } else {
+            exact
+        };
+        assert_eq!(error.to_bits(), want.to_bits(), "{} archived {error}, CPU band book {want}", show(tree));
+    }
+    assert!(on_device > 0, "no archived value came from the device");
+    assert!(band_matters > 0, "the band changes no archived value");
+}
+
+#[test]
+fn band_pipelined_search_archives_device_scores() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    for (band, units, hold) in [(0.2, BandUnits::Score, 4), (0.5, BandUnits::Sd, 3)] {
+        let (sample, b) = band_search_fixture(band, units, hold);
+        let plain = book(&fixture(&[0, 600, 1200, 1800], 2_400, 17), 1);
+        let seen: Archived = Arc::default();
+        let out = search::run(&config(&b, &seen), &sample, &sample);
+        assert_device_scored(&out);
+        assert_archived_values_are_the_cpu_band_book(&sample, &b, &plain, &seen);
+        for s in &out.archive.items {
+            let pred: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(&s.tree, r)).collect();
+            assert_eq!(s.error.to_bits(), b.regret(&pred).to_bits(), "{}", show(&s.tree));
+        }
+    }
+}
+
+/// Throughput of the band kernels against the plain kernel on the same
+/// 1,000,000 rows and programs; the sd units add the reduction kernel.
+#[test]
+#[ignore]
+fn long_pnl_band_throughput_against_plain() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let n = 1_000_000usize;
+    let starts: Vec<usize> = (0..100).map(|g| g * 10_000).collect();
+    let f = fixture(&starts, n, 29);
+    let Some(mut ev) = evaluator(&f, &book(&f, 1)) else {
+        return;
+    };
+    let mut rng = Lcg(31);
+    let trees: Vec<Node> = (0..256)
+        .map(|k| {
+            let t = random_tree(&mut rng, 4);
+            if k % 2 == 0 {
+                node(Op::Tanh, vec![t])
+            } else {
+                node(Op::Logistic, vec![t])
+            }
+        })
+        .collect();
+    let pop = compiled(&trees);
+    let (prog, off) = pop.programs();
+    let zeros = vec![0; trees.len()];
+    let books: Vec<(String, FitnessBook)> = vec![
+        ("plain".to_string(), book(&f, 1)),
+        ("band 0.3 hold 1".to_string(), band_book(&f, 0.3, BandUnits::Score, 1, 1)),
+        ("band 0 hold 8".to_string(), band_book(&f, 0.0, BandUnits::Score, 8, 1)),
+        ("band 0.5 hold 24".to_string(), band_book(&f, 0.5, BandUnits::Score, 24, 1)),
+        ("band 1 sd hold 12".to_string(), band_book(&f, 1.0, BandUnits::Sd, 12, 1)),
+        ("plain again".to_string(), book(&f, 1)),
+    ];
+    let mut rates = Vec::new();
+    for (name, b) in &books {
+        ev.set_pnl_book(b).expect("the book uploads");
+        for _ in 0..2 {
+            assert!(ev.score_batch(prog, off, ScoreObjective::LongPnl, &zeros).ms >= 0.0);
+        }
+        let reps = 10;
+        let t = std::time::Instant::now();
+        let mut kernel_ms = 0.0f64;
+        for _ in 0..reps {
+            let s = ev.score_batch(prog, off, ScoreObjective::LongPnl, &zeros);
+            assert!(s.ms >= 0.0);
+            kernel_ms += s.ms as f64;
+        }
+        let rate = (n * trees.len()) as f64 / (t.elapsed().as_secs_f64() / reps as f64);
+        let kernel = (n * trees.len()) as f64 / (kernel_ms / reps as f64 / 1000.0);
+        println!("{name}: {rate:.3e} row-evals/s (kernel {kernel:.3e})");
+        rates.push(rate);
+    }
+    let base = rates[0].max(rates[5]);
+    for (k, (name, _)) in books.iter().enumerate().take(5).skip(1) {
+        println!("ratio to plain: {name} {:.3}", rates[k] / base);
+    }
+}
+
+/// `--gpu` refuses a hold the device cannot carry (exit 2); the automatic
+/// backend scores it on the CPU and names the reason.
+#[test]
+fn a_hold_above_32_exits_2_on_gpu_and_falls_back_in_auto() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if !device_present() {
+        return;
+    }
+    let (_scratch, data, spec) = write_cli_fixture();
+    let gpu = rcsr_cmd::rcsr_on_device()
+        .args([
+            "--gpu", "--data", &data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal",
+            "--target-spec", &spec, "--no-dev-log", "--seed", "3", "--generations", "4", "--pop", "32",
+            "--metric", "squared", "--json", "--quiet", "--objective", "pnl", "--cost-bps", "5",
+            "--validation-frac", "0.3", "--fitness", "pnl", "--min-holding", "33",
+        ])
+        .output()
+        .expect("run rcsr");
+    assert_eq!(gpu.status.code(), Some(2), "{}", String::from_utf8_lossy(&gpu.stderr));
+    assert!(String::from_utf8_lossy(&gpu.stderr).contains("at most 32"));
+    let (sample, _) = search_fixture();
+    let f = fixture(&[0, 600, 1200, 1800], 2_400, 17);
+    let b = Arc::new(band_book(&f, 0.1, BandUnits::Score, 33, 1));
+    let out = search::run_seeded_checked(&required_config(&b, false), &sample, &sample, &[]).expect("auto mode falls back");
+    assert_eq!(out.backend, rcsr::backend::Kind::Cpu);
+    let why = out.backend_reason.clone().unwrap_or_default();
+    assert!(why.contains("at most 32"), "{why}");
+    for s in &out.archive.items {
+        let pred: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(&s.tree, r)).collect();
+        assert_eq!(s.error.to_bits(), b.regret(&pred).to_bits(), "{}", show(&s.tree));
+    }
+}

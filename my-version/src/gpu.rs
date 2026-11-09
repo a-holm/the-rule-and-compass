@@ -625,6 +625,15 @@ struct RawPnlTotals {
     block_exits: [u64; 8],
 }
 
+/// #925: `RcPnlSd` in `src/cuda/eval.cu`, field for field.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct RawPnlSd {
+    sd: f64,
+    band: f64,
+    rows: u64,
+}
+
 /// #285: host-visible state of the persistent batch arena. Mirrors
 /// `RcArenaReport` in `src/cuda/eval.cu` field for field.
 #[repr(C)]
@@ -870,6 +879,9 @@ extern "C" {
         status: *mut i32,
         totals: *mut RawPnlTotals,
     ) -> i32;
+    /* #925: the band of the uploaded book and the test-only sd download. */
+    fn rc_set_pnl_band(ctx: *mut RawCtx, band: f64, sd_units: i32, hold: i32) -> i32;
+    fn rc_pnl_band_sd(ctx: *mut RawCtx, nprog: i32, out: *mut RawPnlSd) -> i32;
     /* #118: start and read one batch's host-time ledger. */
     fn rc_stats_begin(ctx: *mut RawCtx);
     fn rc_last_stats(ctx: *mut RawCtx, out: *mut RawStats) -> i32;
@@ -1921,7 +1933,42 @@ impl GpuEvaluator {
             book.block_bounds(),
             book.lambda(),
             book.min_trades() as u64,
-        )
+        )?;
+        self.set_pnl_band(book.band(), book.band_units() == crate::trading::BandUnits::Sd, book.min_hold())
+    }
+
+    /// #925: the band of the uploaded book: `band` in score units, or the
+    /// multiple of each candidate's training-score sd. A minimum hold above
+    /// [`crate::trading::FITNESS_DEVICE_MAX_HOLD`] is refused with its reason.
+    #[doc(hidden)]
+    pub fn set_pnl_band(&mut self, band: f64, sd_units: bool, min_hold: usize) -> Result<(), String> {
+        if min_hold > crate::trading::FITNESS_DEVICE_MAX_HOLD {
+            return Err(format!(
+                "the device band scorer holds at most {} minimum-hold rows, the book {}",
+                crate::trading::FITNESS_DEVICE_MAX_HOLD,
+                min_hold
+            ));
+        }
+        let rc = unsafe { rc_set_pnl_band(self.ctx, band, sd_units as i32, min_hold as i32) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let raw = unsafe { rc_last_pnl_book_error() };
+        let why = if raw.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(raw) }.to_string_lossy().into_owned()
+        };
+        Err(format!("the device refused the long_pnl band: {}", why))
+    }
+
+    /// #925 test hook: `(sd, half-width, rows)` of the first `nprog`
+    /// candidates of the last long/flat batch scored with `--band-units sd`;
+    /// a degenerate sd is NaN with a half-width of 0.
+    pub fn long_pnl_band_sd_for_tests(&mut self, nprog: usize) -> Option<Vec<(f64, f64, u64)>> {
+        let mut raw = vec![RawPnlSd::default(); nprog];
+        let rc = unsafe { rc_pnl_band_sd(self.ctx, i32::try_from(nprog).ok()?, raw.as_mut_ptr()) };
+        (rc == 0).then(|| raw.iter().map(|r| (r.sd, r.band, r.rows)).collect())
     }
 
     /// #604: [`GpuEvaluator::set_pnl_book`] on raw book parts. The row count is

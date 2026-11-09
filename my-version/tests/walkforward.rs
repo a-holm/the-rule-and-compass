@@ -926,6 +926,69 @@ fn the_printed_json_carries_a_phase_ledger_outside_the_reproduction_hash() {
 }
 
 
+// ---- #925: the band in units of the training-score sd ----
+
+fn sd_band_table(test_scale: f64, validation_scale: f64) -> data::Table {
+    let mut rows = Vec::new();
+    let mut v = 0.0f64;
+    for i in 0..300 {
+        let f = i as f64;
+        v = 0.8 * v + ((f * 0.618_033_988_749_894_9).fract() - 0.5);
+        let y = 0.01 * ((f * 0.754_877_666_246_692_7).fract() - 0.5);
+        let (x, y) = if i >= 200 {
+            (v * test_scale + 3.0, y * test_scale)
+        } else if i >= 150 {
+            (v * validation_scale - 2.0, y)
+        } else {
+            (v, y)
+        };
+        rows.push((f, x, y));
+    }
+    single(&rows)
+}
+
+fn sd_band_report(t: &data::Table, units: rcsr::trading::BandUnits) -> walkforward::Report {
+    let mut s = spec("x", vec![window("w", 0.0, 200.0, 200.0, 300.0)]);
+    s.policy = walkforward::Policy::Band;
+    s.band_width = 1.0;
+    s.min_hold = 2;
+    s.threshold_fixed = Some(0.0);
+    s.validation_frac = 0.25;
+    let opts = walkforward::ProtocolOptions { band_units: units, ..walkforward::ProtocolOptions::default() };
+    walkforward::run_table_with(t, &s, "test", &opts).unwrap()
+}
+
+#[test]
+fn walkforward_band_sd_ignores_test_rows() {
+    use rcsr::trading::BandUnits;
+    let base = sd_band_report(&sd_band_table(1.0, 1.0), BandUnits::Sd);
+    let band = |r: &walkforward::Report| r.windows[0].band.as_ref().expect("the band book").clone();
+    let b0 = band(&base);
+    let spec0 = b0.spec.clone().expect("the band spec");
+    let sd = spec0.sd.expect("a finite training sd");
+    assert_eq!(spec0.units, BandUnits::Sd);
+    assert_eq!(spec0.sd_rows, Some(150));
+    assert_eq!(spec0.sd_max_time, Some(149.0));
+    assert_eq!(b0.band_width.to_bits(), (1.0 * sd).to_bits());
+    assert_eq!(spec0.resolved.to_bits(), b0.band_width.to_bits());
+    // Rows at or after the training end, and validation rows, never enter the sd.
+    for (test_scale, validation_scale) in [(1000.0, 1.0), (1.0, 50.0), (1000.0, 50.0)] {
+        let other = sd_band_report(&sd_band_table(test_scale, validation_scale), BandUnits::Sd);
+        let s = band(&other).spec.expect("the band spec");
+        assert_eq!(s.sd.map(f64::to_bits), Some(sd.to_bits()), "test x{test_scale}, validation x{validation_scale}");
+        assert_eq!(s.resolved.to_bits(), spec0.resolved.to_bits());
+        assert_eq!(s.sd_max_time, Some(149.0));
+    }
+    let json = base.json();
+    assert!(json.contains("\"band_units\":\"sd\""), "policy band_units");
+    assert!(json.contains(&format!("\"band_sd\":{}", sd)), "windows[].band.band_sd");
+    // Score units keep the multiple as the half-width.
+    let score = sd_band_report(&sd_band_table(1.0, 1.0), BandUnits::Score);
+    let s = band(&score);
+    assert_eq!(s.band_width, 1.0);
+    assert_eq!(s.spec.expect("the band spec").sd, None);
+}
+
 // ---------------------------------------------------------------------------
 // #931: the purge at 72, 168 and 336 hours.
 // ---------------------------------------------------------------------------

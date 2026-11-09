@@ -215,16 +215,20 @@ INPUT:
                              Constants are still fitted with --metric (--weight
                              weights that fit only). Needs a trading --objective
                              and its refusals. Exit 2 with --predictor-samples,
-                             --fit-samples, --implicit, --min-holding above 1,
-                             --max-position other than 1, multiple targets,
+                             --fit-samples, --implicit, --max-position other
+                             than 1, multiple targets,
                              --cv, --stability, --null-runs or --null-block,
                              overlapping rows, or no profitable path. On the
                              GPU the device scores the regret of its own f32
                              predictions, fused with the interpreter
                              (search_fitness.scorer_backend cuda); tiled
                              residency keeps the CPU. Reported values stay
-                             exact CPU f64. Resume needs the same cost,
-                             threshold and rows
+                             exact CPU f64. --band and --min-holding price
+                             the band book of walkforward --policy band (the
+                             device holds at most 32 rows; above that --gpu
+                             exits 2 and auto falls back to the CPU scorer).
+                             Resume needs the same cost, threshold, band,
+                             band units, minimum hold and rows
   --pnl-blocks K          1 to 8 time blocks for --fitness pnl (default 1 =
                              off, the plain regret). The training timestamps
                              are cut into K equal runs, each block is its own
@@ -257,6 +261,18 @@ INPUT:
                              unusable (default 1)
   --min-holding <n>          rows a long position is held before an exit
                              (default 1)
+  --band <B>                 no-trade band (default 0, finite, >= 0): flat enters
+                             when pred > threshold + b, long exits when pred <=
+                             threshold - b after --min-holding rows; b = B in
+                             score units, or B x the candidate's training-score
+                             sd with --band-units sd. The fitness (--fitness
+                             pnl) and the validation and test books price it.
+                             Exit 2 with --position top_tercile
+  --band-units score|sd      how --band is read (default score). sd: b = B x the
+                             sample sd of the candidate's finite scores on the
+                             training rows only; the validation and test books
+                             take that b and never compute an sd; a degenerate
+                             sd gives b = 0. Needs --band (exit 2 otherwise)
   --require-validation       refuse (exit 2) when there is no validation slice
   --equivalence-z <z>        z for the validation gates: a member is supported
                              when it improves on the last supported entry by
@@ -1241,6 +1257,23 @@ fn trading_usage(msg: &str) -> ! {
     std::process::exit(EXIT_USAGE);
 }
 
+/// #925: the spec of one member's books: an sd-unit band resolved from its
+/// predictions on the training rows, never from the rows the book prices.
+fn member_spec(
+    tspec: &rcsr::trading::TradingSpec,
+    train_pred: &[f64],
+    train: Option<&data::TradingSlice>,
+) -> rcsr::trading::TradingSpec {
+    if tspec.band.units != rcsr::trading::BandUnits::Sd {
+        return tspec.clone();
+    }
+    let time = train.map_or(&[][..], |t| t.rows.time.as_slice());
+    rcsr::trading::TradingSpec {
+        band: rcsr::trading::BandSpec::from_training(tspec.band.units, tspec.band.multiple, train_pred, time),
+        ..tspec.clone()
+    }
+}
+
 /// #480: the `"fitness"` member of a Pareto entry, in exact CPU `f64` on the
 /// training rows. `train_net` is the excess net over cash.
 fn fitness_member_json(book: &rcsr::trading::FitnessBook, pred: &[f64]) -> String {
@@ -1288,9 +1321,16 @@ fn validation_book_member_json(
     constant: bool,
     fixed: Option<bool>,
     realised: Option<bool>,
+    band: &rcsr::trading::BandSpec,
 ) -> String {
+    // #925: an sd-unit band is the member's own, resolved on its training rows.
+    let band_json = if band.units == rcsr::trading::BandUnits::Sd {
+        format!(",\"band_sd\":{},\"band_resolved\":{}", band.sd.map_or_else(|| "null".to_string(), jnum), jnum(band.resolved))
+    } else {
+        String::new()
+    };
     format!(
-        ",\"validation_book\":{{\"objective\":{},\"net_pnl\":{},\"sharpe\":{},\"trades\":{},\"exposure\":{},\"constant\":{},\"fixed_position\":{},\"fixed_position_realised\":{}}}",
+        ",\"validation_book\":{{\"objective\":{},\"net_pnl\":{},\"sharpe\":{},\"trades\":{},\"exposure\":{},\"constant\":{},\"fixed_position\":{},\"fixed_position_realised\":{}{}}}",
         jnum(objective),
         jnum(stats.net_pnl),
         jnum(stats.sharpe),
@@ -1298,7 +1338,8 @@ fn validation_book_member_json(
         jnum(stats.exposure),
         constant,
         rcsr::trading::fixed_position_json(fixed),
-        rcsr::trading::fixed_position_json(realised)
+        rcsr::trading::fixed_position_json(realised),
+        band_json
     )
 }
 
@@ -2576,6 +2617,8 @@ fn main() {
     let mut trade_max_position = 1.0f64;
     let mut trade_min_trades = 1usize;
     let mut trade_min_holding = 1usize;
+    let mut trade_band: Option<f64> = None;
+    let mut trade_band_units: Option<String> = None;
     let mut out_path: Option<String> = None;
     let mut format = Format::Text;
     let mut progress = false;
@@ -2914,6 +2957,14 @@ fn main() {
             "--min-holding" => {
                 trading_flags.push("--min-holding");
                 trade_min_holding = parse_trade_number("--min-holding", &val!()) as usize;
+            }
+            "--band" => {
+                trading_flags.push("--band");
+                trade_band = Some(parse_trade_number("--band", &val!()));
+            }
+            "--band-units" => {
+                trading_flags.push("--band-units");
+                trade_band_units = Some(val!());
             }
             "--fill" => {
                 let v = val!();
@@ -5324,9 +5375,22 @@ fn main() {
             return_column: ts.return_column.clone(),
             log_returns: ts.return_units == "log",
             funding_column: trade_funding.clone(),
-            train: fitness_pnl, // #480
+            train: fitness_pnl || trade_band_units.as_deref() == Some("sd"), // #480, #925
             cross_section: top_tercile,
         });
+        // #925: an sd-unit band is resolved per candidate from its training rows.
+        let band_units = match trade_band_units.as_deref().map(rcsr::trading::BandUnits::parse) {
+            None => rcsr::trading::BandUnits::Score,
+            Some(Ok(_)) if trade_band.is_none() => trading_usage("--band-units needs --band"),
+            Some(Ok(u)) => u,
+            Some(Err(e)) => trading_usage(&e),
+        };
+        let band_multiple = trade_band.unwrap_or(0.0);
+        let band = rcsr::trading::BandSpec {
+            units: band_units,
+            resolved: if band_units == rcsr::trading::BandUnits::Score { band_multiple } else { 0.0 },
+            ..rcsr::trading::BandSpec::score(band_multiple)
+        };
         let tspec = rcsr::trading::TradingSpec {
             cost_bps: cost,
             slippage_bps: trade_slippage_bps,
@@ -5334,6 +5398,7 @@ fn main() {
             cash_return: trade_cash_return,
             min_trades: trade_min_trades,
             min_holding: trade_min_holding,
+            band,
             threshold: trade_threshold,
             max_position: trade_max_position,
             position: position_map,
@@ -5361,8 +5426,11 @@ fn main() {
         if implicit_mode || cfg.metric.is_implicit() {
             trading_usage("--fitness pnl is not supported with --implicit or an implicit metric");
         }
-        if trade_min_holding > 1 {
-            trading_usage("--fitness pnl is not supported with --min-holding > 1: the fitness is the plain threshold rule");
+        if trade_min_holding > rcsr::trading::FITNESS_DEVICE_MAX_HOLD && cfg.gpu_required {
+            trading_usage(&format!(
+                "--fitness pnl with --gpu holds at most {} minimum-hold rows on the device, got --min-holding {} (omit --gpu to fall back to the CPU scorer)",
+                rcsr::trading::FITNESS_DEVICE_MAX_HOLD, trade_min_holding
+            ));
         }
         if trading_spec.as_ref().is_some_and(|s| s.position != rcsr::trading::PositionMap::Threshold) {
             trading_usage("--fitness pnl is not supported with --position top_tercile: the fitness is the plain threshold rule");
@@ -5585,7 +5653,7 @@ fn main() {
     if let Some(cp) = &resume_checkpoint {
         if cp.config.fitness.key() != cfg.fitness.key() {
             trading_usage(&format!(
-                "--resume conflicts with the saved search settings: fitness {} (saved {}); the book depends on the cost, threshold, min-trades and training rows",
+                "--resume conflicts with the saved search settings: fitness {} (saved {}); the book depends on the cost, threshold, band, band units, minimum hold, min-trades and training rows",
                 cfg.fitness.key(),
                 cp.config.fitness.key()
             ));
@@ -6919,6 +6987,7 @@ fn main() {
     } else {
         None
     };
+    let train_slice = prepared.trading.as_ref().and_then(|t| t.train.as_ref());
     let mut rows: Vec<Row> = sorted
         .iter()
         .enumerate()
@@ -6941,10 +7010,17 @@ fn main() {
                 Some(v) => search::eval_error(&s.tree, v, cfg.metric),
                 None => f64::NAN,
             };
+            let pred: Vec<f64> = prepared
+                .train
+                .x
+                .iter()
+                .map(|row| expr::eval(&s.tree, row))
+                .collect();
             let (objective_value, validation_book_json) = match (&trading_spec, &prepared.validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
                 (Some(tspec), Some(v), Some(slice)) => {
                     let ctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
-                    match trading_book(&s.tree, &v.x, slice, ctx, tspec) {
+                    let mspec = member_spec(tspec, &pred, train_slice);
+                    match trading_book(&s.tree, &v.x, slice, ctx, &mspec) {
                         Ok(stats) => {
                             // #849: a fixed-position member is unusable as a finalist with the flag.
                             let fixed = rcsr::trading::fixed_position(&s.tree, tspec);
@@ -6954,7 +7030,7 @@ fn main() {
                             } else {
                                 objective.score(&stats, tspec.min_trades)
                             };
-                            let book = validation_book_member_json(value, &stats, rcsr::trading::is_constant(&s.tree), fixed, realised);
+                            let book = validation_book_member_json(value, &stats, rcsr::trading::is_constant(&s.tree), fixed, realised, &mspec.band);
                             (value, book)
                         }
                         Err(_) => (f64::INFINITY, NO_VALIDATION_BOOK.to_string()),
@@ -6963,12 +7039,6 @@ fn main() {
                 (Some(_), _, _) => (f64::NAN, NO_VALIDATION_BOOK.to_string()),
                 _ => (f64::NAN, String::new()),
             };
-            let pred: Vec<f64> = prepared
-                .train
-                .x
-                .iter()
-                .map(|row| expr::eval(&s.tree, row))
-                .collect();
             let resid: Vec<f64> = pred
                 .iter()
                 .zip(&prepared.train.y)
@@ -7135,7 +7205,13 @@ fn main() {
                     objective: r.objective_value,
                 })
                 .collect();
-            let picked = rcsr::selection::select_robust(&metas, robust_params, tspec, &ret, &book_rows, &mut |i| {
+            // #925: each member's book takes the band resolved on its training rows.
+            let mut spec_of = |i: usize| {
+                let tree = &sorted[rows[i].archive_rank - 1].tree;
+                let train_pred: Vec<f64> = prepared.train.x.iter().map(|row| expr::eval(tree, row)).collect();
+                member_spec(tspec, &train_pred, train_slice)
+            };
+            let picked = rcsr::selection::select_robust_specs(&metas, robust_params, &mut spec_of, &ret, &book_rows, &mut |i| {
                 trading_pred(&sorted[rows[i].archive_rank - 1].tree, &v.x, ctx)
             })
             .unwrap_or_else(|e| trading_usage(&e));
@@ -7160,8 +7236,11 @@ fn main() {
     let objective_report: Option<rcsr::trading::FinalistReport> = match (&trading_spec, rows.first()) {
         (Some(tspec), Some(top)) => {
             let tree = &sorted[top.archive_rank - 1].tree;
+            // #925: the validation and test books take the band resolved on the training rows.
+            let train_pred: Vec<f64> = prepared.train.x.iter().map(|row| expr::eval(tree, row)).collect();
+            let fspec = member_spec(tspec, &train_pred, train_slice);
             let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>, ctx: Option<&data::TradingContext>| match slice {
-                Some(slice) => trading_book(tree, &sample.x, slice, ctx, tspec),
+                Some(slice) => trading_book(tree, &sample.x, slice, ctx, &fspec),
                 None => Err("no trading rows".to_string()),
             };
             let split = prepared.trading.as_ref();
@@ -7176,7 +7255,7 @@ fn main() {
             let realised = validation_book.as_ref().ok().and_then(|s| rcsr::trading::realised_position(s.exposure, tspec));
             Some(rcsr::trading::FinalistReport {
                 objective,
-                spec: tspec.clone(),
+                spec: fspec.clone(),
                 min_group_step,
                 horizon_seconds: target_horizon,
                 cost: trading_cost.clone().unwrap_or_else(|| target::CostDecl::new(None, tspec.per_side_bps(), target::CostSource::Flag)),
@@ -8231,13 +8310,16 @@ fn main() {
                 backend_json,
                 match &fitness_book {
                     Some(b) => format!(
-                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}{}}},",
+                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"band\":{},\"band_units\":\"{}\",\"min_holding\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}{}}},",
                         b.len(),
                         b.groups(),
                         jnum(b.side()),
                         jnum(b.threshold()),
                         jnum(b.bound()),
                         b.min_trades(),
+                        jnum(b.band()),
+                        b.band_units().name(),
+                        b.min_hold(),
                         b.hash(),
                         // #484: omitted for one block, so the default report is unchanged.
                         if b.blocks() > 1 {
@@ -10793,9 +10875,17 @@ OPTIONS:
                              the threshold book); dp keeps the threshold book
                              and reports the exact hindsight DP as a bound, never
                              as the strategy's P&L
-  --band <f>                 half-width beta of the no-trade band in score units
-                             (default 0; with --policy band, beta=0 reproduces
-                             the threshold rule bit for bit)
+  --band <f>                 half-width beta of the no-trade band (default 0;
+                             with --policy band, beta=0 reproduces the threshold
+                             rule bit for bit); score units, or with --band-units
+                             sd a multiple of the candidate's training-score sd
+  --band-units score|sd      how --band is read (default score; needs --policy
+                             band). sd: per window and candidate, beta = B x the
+                             sample sd of its finite training scores (rows before
+                             the validation start; never validation or test
+                             rows); windows[].band records band, band_units,
+                             band_sd, band_resolved, band_sd_rows,
+                             band_sd_max_time and band_sd_degenerate
   --min-hold <n>             minimum consecutive long rows before a band exit
                              (default 1; requires --policy band)
   --gpu                      run the --policy band/cooldown scan and the --policy
@@ -10965,6 +11055,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut quiet = false;
     let mut allow_lockbox = false;
     let mut popts = walkforward::ProtocolOptions::default();
+    let mut band_units_arg: Option<String> = None;
     let mut windows_scheme: Option<String> = None;
     let mut ledger_path: Option<String> = None;
     let mut sealed_path: Option<String> = None;
@@ -11096,6 +11187,13 @@ fn run_walkforward(args: &[String]) -> ! {
             "--band" | "--band-width" => {
                 band_width = number(need(args, i + 1, "--band"), "--band");
                 i += 1;
+            }
+            "--band-units" => {
+                band_units_arg = Some(need(args, i + 1, "--band-units"));
+                i += 1;
+            }
+            other if other.starts_with("--band-units=") => {
+                band_units_arg = Some(other["--band-units=".len()..].to_string());
             }
             "--min-hold" => {
                 let src = need(args, i + 1, "--min-hold");
@@ -11620,6 +11718,13 @@ fn run_walkforward(args: &[String]) -> ! {
         min_hold,
         gpu,
     };
+    // #925: an sd-unit band resolves per window and candidate from training scores.
+    if let Some(src) = band_units_arg.as_deref() {
+        if spec.policy != walkforward::Policy::Band {
+            usage_fail("--band-units needs --policy band");
+        }
+        popts.band_units = rcsr::trading::BandUnits::parse(src).unwrap_or_else(|e| usage_fail(&e));
+    }
     if spec.policy == walkforward::Policy::TopTercile {
         if let Some(msg) = walkforward::top_tercile_refusal(&spec, &popts) {
             usage_fail(&msg);

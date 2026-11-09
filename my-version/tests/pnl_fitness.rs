@@ -194,11 +194,11 @@ fn the_book_refuses_what_it_cannot_price() {
     shuffled.rows.group.swap(10, 60);
     assert!(FitnessBook::new(&shuffled, &spec(), 900.0).unwrap_err().contains("canonical"));
     assert!(FitnessBook::new(&s, &spec(), 1800.0).unwrap_err().contains("overlapping returns"));
-    let holding = TradingSpec {
-        min_holding: 2,
+    let ramp = TradingSpec {
+        tau: Some(0.5),
         ..spec()
     };
-    assert!(FitnessBook::new(&s, &holding, 900.0).is_err());
+    assert!(FitnessBook::new(&s, &ramp, 900.0).unwrap_err().contains("no tau"));
     let mut losing = s.clone();
     losing.ret.iter_mut().for_each(|r| *r = -0.01);
     assert!(FitnessBook::new(&losing, &spec(), 900.0).unwrap_err().contains("no profitable"));
@@ -392,10 +392,12 @@ fn fitness_pnl_refusals_name_their_reason() {
         &run(&data, &spec, &["--fitness", "pnl", "--predictor-samples", "100"]),
         "--predictor-samples",
     );
-    usage_error(
-        &run(&data, &spec, &["--fitness", "pnl", "--min-holding", "2"]),
-        "--min-holding",
-    );
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--band-units", "sd"]), "--band-units needs --band");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--band", "-0.5"]), "band must be finite and non-negative");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--band", "nan"]), "--band needs a finite number");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--band", "1", "--band-units", "ticks"]), "--band-units must be score or sd");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--min-holding", "0"]), "min_holding must be at least 1");
+    usage_error(&run(&data, &spec, &["--band", "0.5", "--position", "top_tercile"]), "--band is not supported with --position top_tercile");
     usage_error(
         &run(&data, &spec, &["--fitness", "pnl", "--fit-samples", "50"]),
         "--fit-samples",
@@ -808,4 +810,624 @@ fn reject_fixed_position_refuses_the_finalist() {
             assert_eq!(pareto(&on).len(), pareto(&off).len(), "the metric search is unchanged");
         }
     }
+}
+
+// ---- #925: the no-trade band and the minimum hold ----
+
+use rcsr::trading::{BandSpec, BandUnits};
+
+fn band_spec(band: f64, units: BandUnits, hold: usize) -> TradingSpec {
+    TradingSpec {
+        band: BandSpec { units, resolved: if units == BandUnits::Score { band } else { 0.0 }, ..BandSpec::score(band) },
+        min_holding: hold,
+        ..spec()
+    }
+}
+
+/// A persistent score per group (AR(1), coefficient 0.8, LCG innovations), so
+/// a band and a hold change the book.
+fn persistent_scores(s: &TradingSlice, scale: f64) -> Vec<f64> {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut out = Vec::with_capacity(s.ret.len());
+    let mut v = 0.0;
+    for i in 0..s.ret.len() {
+        if i == 0 || s.rows.group[i] != s.rows.group[i - 1] {
+            v = 0.0;
+        }
+        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        let u = (state >> 11) as f64 / (1u64 << 53) as f64;
+        v = 0.8 * v + (u - 0.5);
+        out.push(scale * v);
+    }
+    out
+}
+
+#[test]
+fn band_book_refusals() {
+    let s = slice(&[50, 50]);
+    let negative = band_spec(-0.1, BandUnits::Score, 1);
+    assert!(FitnessBook::new(&s, &negative, 900.0).unwrap_err().contains("band must be finite"));
+    let ramp = TradingSpec { tau: Some(0.5), ..band_spec(0.2, BandUnits::Score, 1) };
+    assert!(ramp.validate().unwrap_err().contains("no tau"));
+    let zero = band_spec(0.2, BandUnits::Score, 0);
+    assert!(zero.validate().unwrap_err().contains("min_holding"));
+}
+
+/// The search book against the book `walkforward --policy band` reports and
+/// against the objective's book, on the same rows and scores.
+#[test]
+fn band_fitness_matches_walkforward_book() {
+    let s = slice(&[500, 500, 500]);
+    let scores = persistent_scores(&s, 1.0);
+    let names = ["A", "B", "C"];
+    let mut text = String::from("ts,sym,x,target\n");
+    for (g, name) in names.iter().enumerate() {
+        for i in 0..20 {
+            text.push_str(&format!("{},{},{},{}\n", i, name, 0.0, 0.0));
+        }
+        for i in 0..500 {
+            let k = g * 500 + i;
+            text.push_str(&format!("{},{},{},{}\n", 1000 + i, name, scores[k], s.ret[k]));
+        }
+    }
+    let table = rcsr::data::parse_table(&text).unwrap();
+    let mut rows = TradingRows::default();
+    for (g, _) in names.iter().enumerate() {
+        for i in 0..500 {
+            rows.group.push(g as u64);
+            rows.time.push(1000.0 + i as f64);
+        }
+    }
+    let book_slice = TradingSlice { rows, ret: s.ret.clone() };
+    for (band, hold) in [(0.3, 1usize), (0.0, 8), (0.5, 24)] {
+        let sp = band_spec(band, BandUnits::Score, hold);
+        let book = FitnessBook::new(&book_slice, &sp, 0.0).unwrap();
+        assert!(!book.is_plain());
+        let t = book.totals(&scores);
+        let net = book.net_of(&t);
+        let walk_spec = rcsr::walkforward::EvalSpec {
+            expression: "x".to_string(),
+            vars: vec!["x".to_string()],
+            target: "target".to_string(),
+            time: "ts".to_string(),
+            group: Some("sym".to_string()),
+            windows: vec![rcsr::walkforward::Window {
+                label: "w".to_string(),
+                train_start: 0.0,
+                train_end: 20.0,
+                test_start: 1000.0,
+                test_end: 1500.0,
+            }],
+            horizon: 0.0,
+            embargo: None,
+            cost_bps: sp.per_side_bps(),
+            threshold_quantile: 0.7,
+            threshold_fixed: Some(sp.threshold),
+            validation_frac: 0.0,
+            periods_per_year: Some(4.0),
+            candidates: Vec::new(),
+            band_select: false,
+            pool_reset_flat: false,
+            allow_lockbox: false,
+            device_pnl: false,
+            control_seed: 0,
+            policy: rcsr::walkforward::Policy::Band,
+            band_width: band,
+            min_hold: hold,
+            gpu: false,
+        };
+        let report = rcsr::walkforward::run_table(&table, &walk_spec, "test").unwrap();
+        let walk = report.windows[0].band.as_ref().expect("the band book").net;
+        assert!((net - walk).abs() <= 1e-12, "band {band} hold {hold}: fitness net {net} walkforward {walk}");
+        let objective = trading::evaluate(&scores, &book_slice.ret, &book_slice.rows, &sp).unwrap();
+        assert!((objective.net_pnl - walk).abs() <= 1e-12, "objective net {} walkforward {walk}", objective.net_pnl);
+        assert!(t.flips > 10 && t.exits > 0, "band {band} hold {hold}: {t:?}");
+    }
+}
+
+#[test]
+fn band_zero_hold_one_is_the_plain_book() {
+    let s = slice(&[300, 1, 300]);
+    let pred = persistent_scores(&s, 1.0);
+    let plain = FitnessBook::new(&s, &spec(), 900.0).unwrap();
+    let banded = FitnessBook::new(&s, &band_spec(0.0, BandUnits::Score, 1), 900.0).unwrap();
+    assert!(banded.is_plain());
+    assert_eq!(plain.hash(), banded.hash());
+    // The band pass at half-width 0 and hold 1 is the plain tree.
+    assert_eq!(plain.band_pass(&pred, 0.0, false)[0], plain.totals(&pred));
+    let blocked = FitnessBook::with_blocks(&s, &spec(), 900.0, 3, 1.0).unwrap();
+    assert_eq!(blocked.band_pass(&pred, 0.0, true), blocked.block_totals(&pred));
+}
+
+#[test]
+fn the_band_book_hash_covers_band_units_and_hold() {
+    let s = slice(&[50, 50]);
+    let hashes: Vec<u64> = [
+        band_spec(0.0, BandUnits::Score, 1),
+        band_spec(0.5, BandUnits::Score, 1),
+        band_spec(0.5, BandUnits::Sd, 1),
+        band_spec(0.5, BandUnits::Score, 3),
+        band_spec(0.0, BandUnits::Score, 3),
+        band_spec(0.0, BandUnits::Sd, 1),
+    ]
+    .iter()
+    .map(|sp| FitnessBook::new(&s, sp, 900.0).unwrap().hash())
+    .collect();
+    for i in 0..hashes.len() {
+        for j in i + 1..hashes.len() {
+            assert_ne!(hashes[i], hashes[j], "specs {i} and {j}");
+        }
+    }
+}
+
+#[test]
+fn band_sd_is_scale_invariant() {
+    let s = slice(&[400, 400, 1, 400]);
+    let pred = persistent_scores(&s, 1.0);
+    let scaled: Vec<f64> = pred.iter().map(|p| p * 1000.0).collect();
+    let sd_book = FitnessBook::new(&s, &band_spec(1.0, BandUnits::Sd, 4), 900.0).unwrap();
+    let (a, b) = (sd_book.totals(&pred), sd_book.totals(&scaled));
+    assert!(a.flips > 10, "{a:?}");
+    assert_eq!((a.flips, a.exits, a.long_rows), (b.flips, b.exits, b.long_rows));
+    assert_eq!(a.gross.to_bits(), b.gross.to_bits());
+    assert_eq!(sd_book.net_of(&a).to_bits(), sd_book.net_of(&b).to_bits());
+    let score_book = FitnessBook::new(&s, &band_spec(0.5, BandUnits::Score, 4), 900.0).unwrap();
+    let (c, d) = (score_book.totals(&pred), score_book.totals(&scaled));
+    assert_ne!((c.flips, c.long_rows), (d.flips, d.long_rows), "a fixed score band is not scale-free");
+    // The objective's book with the band resolved on the same rows.
+    let at = |p: &[f64]| {
+        let band = BandSpec::from_training(BandUnits::Sd, 1.0, p, &s.rows.time);
+        let sp = TradingSpec { band, min_holding: 4, ..spec() };
+        trading::evaluate(p, &s.ret, &s.rows, &sp).unwrap()
+    };
+    let (e, f) = (at(&pred), at(&scaled));
+    assert_eq!((e.trades, e.exposure.to_bits()), (f.trades, f.exposure.to_bits()));
+    assert_eq!(e.net_pnl.to_bits(), f.net_pnl.to_bits());
+}
+
+#[test]
+fn band_sd_degenerate_is_zero_band() {
+    let s = slice(&[200, 200]);
+    let n = s.ret.len();
+    let constant = vec![0.3; n];
+    let band = BandSpec::from_training(BandUnits::Sd, 1.0, &constant, &s.rows.time);
+    assert_eq!(band.sd, None);
+    assert_eq!(band.resolved, 0.0);
+    assert_eq!(band.sd_rows, Some(n));
+    let json = band.json_fields();
+    assert!(json.contains("\"band_sd\":null") && json.contains("\"band_resolved\":0") && json.contains("\"band_sd_degenerate\":true"), "{json}");
+    let mut one = vec![f64::NAN; n];
+    one[7] = 1.0;
+    let single = BandSpec::from_training(BandUnits::Sd, 1.0, &one, &s.rows.time);
+    assert_eq!((single.sd, single.sd_rows, single.resolved), (None, Some(1), 0.0));
+    assert_eq!(single.sd_max_time, Some(s.rows.time[7]));
+    let book = FitnessBook::new(&s, &band_spec(1.0, BandUnits::Sd, 3), 900.0).unwrap();
+    assert_eq!(book.resolve_band(&constant), 0.0);
+    let pred = persistent_scores(&s, 1.0);
+    let hold_only = FitnessBook::new(&s, &band_spec(0.0, BandUnits::Score, 3), 900.0).unwrap();
+    assert_eq!(book.band_pass(&pred, 0.0, false), hold_only.band_pass(&pred, 0.0, false));
+    let score = BandSpec::score(0.5).json_fields();
+    assert!(score.contains("\"band_sd\":null") && score.contains("\"band_resolved\":0.5") && score.contains("\"band_sd_degenerate\":null"), "{score}");
+}
+
+/// Two candidate groups priced on the same training and validation rows:
+/// clean candidates (score sd 0.02 around the threshold) that carry the
+/// signal, and exploding ones (score sd 5) with a weaker signal. The search
+/// ranks members by the training regret and the finalist is the member with
+/// the best validation objective (net P&L), as in the CLI.
+#[test]
+fn band_units_score_and_sd_select_different_sets() {
+    let rows = 1600usize;
+    let mut slice_rows = TradingRows::default();
+    let mut ret = Vec::with_capacity(rows);
+    let mut signal = Vec::with_capacity(rows);
+    let mut noise = Vec::with_capacity(rows);
+    let (mut s, mut w) = (0.0f64, 0.0f64);
+    for i in 0..rows {
+        let g = (i >= rows / 2) as u64;
+        if i == rows / 2 {
+            s = 0.0;
+            w = 0.0;
+        }
+        slice_rows.group.push(g);
+        slice_rows.time.push(1.6e9 + 900.0 * (i % (rows / 2)) as f64);
+        s = 0.95 * s + 0.3 * (frac(i as f64 * 0.618_033_988_749_894_9) - 0.5);
+        w = 0.9 * w + 0.4 * (frac(i as f64 * 0.754_877_666_246_692_7) - 0.5);
+        signal.push(s);
+        noise.push(w);
+        ret.push(0.004 * s + 0.0015 * w + 0.002 * (frac(i as f64 * 0.324_717_957_244_746) - 0.5));
+    }
+    let all = TradingSlice { rows: slice_rows, ret };
+    // Training: the first 300 rows of each group; validation: the rest.
+    let pick = |train: bool| {
+        let idx: Vec<usize> = (0..rows).filter(|&i| ((i % (rows / 2)) < 300) == train).collect();
+        let sl = TradingSlice {
+            rows: TradingRows {
+                time: idx.iter().map(|&i| all.rows.time[i]).collect(),
+                group: idx.iter().map(|&i| all.rows.group[i]).collect(),
+                funding: Vec::new(),
+            },
+            ret: idx.iter().map(|&i| all.ret[i]).collect(),
+        };
+        (idx, sl)
+    };
+    let (train_idx, train) = pick(true);
+    let (valid_idx, valid) = pick(false);
+    let sd_of = |v: &[f64]| trading::score_sd(v).sd.unwrap();
+    let base_sd = sd_of(&signal);
+    let wsd = sd_of(&noise);
+    let mut candidates: Vec<(&str, Vec<f64>)> = Vec::new();
+    for (k, shift) in [0.0, 0.1, -0.1].iter().enumerate() {
+        let clean: Vec<f64> = signal.iter().map(|v| 0.02 * (v / base_sd + shift)).collect();
+        candidates.push((["clean0", "clean1", "clean2"][k], clean));
+        let exploding: Vec<f64> = noise.iter().map(|v| 5.0 * (v / wsd + shift)).collect();
+        candidates.push((["exploding0", "exploding1", "exploding2"][k], exploding));
+    }
+    for (_, c) in &candidates {
+        let sd = sd_of(c);
+        assert!(sd > 0.015 && sd < 0.025 || sd > 4.0 && sd < 6.0, "candidate sd {sd}");
+    }
+    let select = |band: f64, units: BandUnits| {
+        let base = band_spec(band, units, 1);
+        let book = FitnessBook::new(&train, &base, 900.0).unwrap();
+        let mut trading = std::collections::BTreeSet::new();
+        let mut train_flips = Vec::new();
+        let mut best: Option<(f64, &str)> = None;
+        for (name, pred) in &candidates {
+            let tp: Vec<f64> = train_idx.iter().map(|&i| pred[i]).collect();
+            let vp: Vec<f64> = valid_idx.iter().map(|&i| pred[i]).collect();
+            let t = book.totals(&tp);
+            train_flips.push((*name, t.flips));
+            let resolved = BandSpec::from_training(units, band, &tp, &train.rows.time);
+            let sp = TradingSpec { band: resolved, ..base.clone() };
+            let v = trading::evaluate(&vp, &valid.ret, &valid.rows, &sp).unwrap();
+            if v.trades > 0 {
+                trading.insert(name.to_string());
+            }
+            if book.regret_of(&t).is_finite() && v.trades > 0 && best.map_or(true, |(net, _)| v.net_pnl > net) {
+                best = Some((v.net_pnl, name));
+            }
+        }
+        (trading, train_flips, best.map(|(_, n)| n.to_string()))
+    };
+    let (score_set, score_flips, score_final) = select(0.5, BandUnits::Score);
+    let (sd_set, sd_flips, sd_final) = select(1.0, BandUnits::Sd);
+    for (name, flips) in &score_flips {
+        if name.starts_with("clean") {
+            assert_eq!(*flips, 0, "{name} trades under the score band");
+        }
+    }
+    assert!(score_set.iter().all(|n| n.starts_with("exploding")), "{score_set:?}");
+    let score_final = score_final.expect("a finalist under the score band");
+    assert!(score_final.starts_with("exploding"), "{score_final}");
+    for (name, flips) in &sd_flips {
+        if name.starts_with("clean") {
+            assert!(*flips > 0, "{name} has no trades under the sd band");
+        }
+    }
+    assert!(sd_set.iter().any(|n| n.starts_with("clean")), "{sd_set:?}");
+    assert_ne!(score_set, sd_set);
+    let sd_final = sd_final.expect("a finalist under the sd band");
+    assert_ne!(score_final, sd_final, "both settings select {sd_final}");
+}
+
+// -- CLI --
+
+fn run_logged(data: &str, spec: &str, log: &std::path::Path, extra: &[&str]) -> Output {
+    let log = log.to_string_lossy().into_owned();
+    let mut args = vec![
+        "--data", data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal",
+        "--target-spec", spec, "--cpu", "--dev-log", &log, "--seed", "3", "--generations", "20",
+        "--pop", "48", "--metric", "squared", "--json", "--quiet", "--objective", "pnl",
+        "--cost-bps", "5", "--validation-frac", "0.3",
+    ];
+    args.extend_from_slice(extra);
+    rcsr_cmd::rcsr().args(&args).output().expect("run rcsr")
+}
+
+/// The `archive.hash` of the dev log's `run_end` event.
+fn archive_hash(log: &std::path::Path) -> String {
+    std::fs::read_to_string(log)
+        .expect("dev log")
+        .lines()
+        .filter_map(Json::parse)
+        .find(|e| e.get("event").and_then(Json::as_str) == Some("run_end"))
+        .and_then(|e| e.get("archive")?.get("hash")?.as_str().map(str::to_string))
+        .expect("run_end archive hash")
+}
+
+fn without_digits(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stdout).replace(|c: char| c.is_ascii_digit() || c == '.', "")
+}
+
+#[test]
+fn band_zero_hold_one_is_identity() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let plain = run(&data, &spec, &["--fitness", "pnl"]);
+    let zero = run(&data, &spec, &["--fitness", "pnl", "--band", "0", "--min-holding", "1"]);
+    let (a, b) = (json(&plain), json(&zero));
+    assert_eq!(members(&a), members(&b));
+    assert_eq!(at(&a, &["search_fitness"]).get("book_hash"), at(&b, &["search_fitness"]).get("book_hash"));
+    assert_eq!(without_digits(&plain), without_digits(&zero));
+    assert_eq!(num(&b, &["search_fitness", "band"]), 0.0);
+    assert_eq!(num(&b, &["search_fitness", "min_holding"]), 1.0);
+    assert_eq!(at(&b, &["search_fitness", "band_units"]).as_str(), Some("score"));
+    let (la, lb) = (dir.join("plain.jsonl"), dir.join("zero.jsonl"));
+    assert_eq!(code(&run_logged(&data, &spec, &la, &["--fitness", "pnl"])), 0);
+    assert_eq!(code(&run_logged(&data, &spec, &lb, &["--fitness", "pnl", "--band", "0", "--min-holding", "1"])), 0);
+    assert_eq!(archive_hash(&la), archive_hash(&lb));
+}
+
+#[test]
+fn band_units_score_is_default() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let args = ["--fitness", "pnl", "--band", "0.004", "--min-holding", "3"];
+    let implicit = run(&data, &spec, &args);
+    let explicit = run(&data, &spec, &[&args[..], &["--band-units", "score"]].concat());
+    let (a, b) = (json(&implicit), json(&explicit));
+    assert_eq!(members(&a), members(&b));
+    assert_eq!(at(&a, &["search_fitness"]).get("book_hash"), at(&b, &["search_fitness"]).get("book_hash"));
+    assert_eq!(without_digits(&implicit), without_digits(&explicit));
+    assert_eq!(at(&b, &["objective", "spec", "band_units"]).as_str(), Some("score"));
+    assert_eq!(num(&b, &["objective", "spec", "band_resolved"]), 0.004);
+    let (la, lb) = (dir.join("implicit.jsonl"), dir.join("explicit.jsonl"));
+    assert_eq!(code(&run_logged(&data, &spec, &la, &args)), 0);
+    assert_eq!(code(&run_logged(&data, &spec, &lb, &[&args[..], &["--band-units", "score"]].concat())), 0);
+    assert_eq!(archive_hash(&la), archive_hash(&lb));
+}
+
+#[test]
+fn resume_refuses_changed_band_units() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let cp = dir.join("band.rcsr").to_string_lossy().into_owned();
+    let saved = ["--fitness", "pnl", "--band", "0.5", "--min-holding", "2"];
+    let first = run(&data, &spec, &[&saved[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let resume = |extra: &[&str]| run(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
+    usage_error(&resume(&["--band", "0.5", "--min-holding", "2", "--band-units", "sd"]), "fitness");
+    usage_error(&resume(&["--band", "0.4", "--min-holding", "2"]), "fitness");
+    usage_error(&resume(&["--band", "0.5", "--min-holding", "3"]), "fitness");
+    usage_error(&resume(&[]), "fitness");
+    let same = resume(&["--band", "0.5", "--min-holding", "2"]);
+    assert_eq!(code(&same), 0, "{}", stderr(&same));
+}
+
+/// The rows of `split.validation_time` as `(time, x1, x2, simple return)`.
+fn csv_rows(path: &str) -> Vec<(f64, f64, f64, f64)> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|l| {
+            let v: Vec<f64> = l.split(',').map(|c| c.parse().unwrap()).collect();
+            (v[0], v[1], v[2], v[3].exp_m1())
+        })
+        .collect()
+}
+
+fn time_range(j: &Json, key: &str) -> (f64, f64) {
+    match at(j, &["split", key]) {
+        Json::Arr(a) => (a[0].as_f64().unwrap(), a[1].as_f64().unwrap()),
+        _ => panic!("split.{key} is not a range"),
+    }
+}
+
+/// A persistent fast signal: `x1` is AR(1) with coefficient 0.95 and unit
+/// variance, the realised return has correlation 0.05 with it, `x2` is
+/// independent noise of the same kind.
+fn write_fast_csv(dir: &std::path::Path, rows: usize) -> String {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut unit = || {
+        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    };
+    let mut normal = || {
+        let (u, v) = (unit(), unit());
+        (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+    };
+    let (phi, rho, sd) = (0.95f64, 0.05f64, 0.003f64);
+    let (mut x1, mut x2) = (0.0f64, 0.0f64);
+    let mut text = String::from("t,x1,x2,r,y\n");
+    for i in 0..rows {
+        x1 = phi * x1 + (1.0 - phi * phi).sqrt() * normal();
+        x2 = phi * x2 + (1.0 - phi * phi).sqrt() * normal();
+        let r = sd * (rho * x1 + (1.0 - rho * rho).sqrt() * normal());
+        text.push_str(&format!("{},{},{},{},{}\n", T0 + 900 * i as i64, x1, x2, r, r));
+    }
+    let path = dir.join("fast.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn band_fitness_rescues_fast_signal() {
+    let (_scratch, dir) = scratch();
+    let data = write_fast_csv(&dir, 120_000);
+    let spec = write_spec(&dir);
+    let run_json = json(&run(
+        &data,
+        &spec,
+        &["--fitness", "pnl", "--band", "0.5", "--min-holding", "12", "--cost-bps", "10", "--ops", "add,sub,mul,tanh", "--max-complexity", "7"],
+    ));
+    let best = pareto(&run_json)
+        .iter()
+        .min_by(|a, b| num(a, &["fitness", "train_regret"]).total_cmp(&num(b, &["fitness", "train_regret"])))
+        .unwrap();
+    let exact = at(best, &["expression_exact"]).as_str().unwrap();
+    let tree = rcsr::parse::parse(exact, &["x1".to_string(), "x2".to_string()]).unwrap();
+    let (lo, hi) = time_range(&run_json, "validation_time");
+    let rows: Vec<_> = csv_rows(&data).into_iter().filter(|r| r.0 >= lo && r.0 <= hi).collect();
+    let pred: Vec<f64> = rows.iter().map(|r| rcsr::expr::eval(&tree, &[r.1, r.2])).collect();
+    let ret: Vec<f64> = rows.iter().map(|r| r.3).collect();
+    let book_rows = TradingRows { time: rows.iter().map(|r| r.0).collect(), group: vec![0; rows.len()], funding: Vec::new() };
+    let priced = |band: f64, hold: usize| {
+        let sp = TradingSpec { cost_bps: 10.0, slippage_bps: 0.0, min_trades: 1, ..band_spec(band, BandUnits::Score, hold) };
+        trading::evaluate(&pred, &ret, &book_rows, &sp).unwrap()
+    };
+    let banded = priced(0.5, 12);
+    let plain = priced(0.0, 1);
+    let reported = num(best, &["validation_book", "net_pnl"]);
+    assert!((banded.net_pnl - reported).abs() <= 1e-9 * reported.abs().max(1e-6), "recomputed {} reported {reported}", banded.net_pnl);
+    let turnover = banded.trades as f64 / rows.len() as f64;
+    assert!(banded.net_pnl > 0.0, "{exact}: band validation net {}", banded.net_pnl);
+    assert!(turnover < 0.05, "{exact}: turnover per row {turnover}");
+    assert!(plain.net_pnl < 0.0, "{exact}: plain validation net {}", plain.net_pnl);
+}
+
+fn write_extreme_csv(src: &str, dst: &std::path::Path, from: f64, scale: f64, shift: f64) -> String {
+    let text = std::fs::read_to_string(src).unwrap();
+    let mut out = String::new();
+    for (k, line) in text.lines().enumerate() {
+        if k == 0 {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let v: Vec<f64> = line.split(',').map(|c| c.parse().unwrap()).collect();
+        if v[0] >= from {
+            let r = v[3] * scale;
+            out.push_str(&format!("{},{},{},{},{}\n", v[0], v[1] * scale + shift, v[2] * scale - shift, r, r + 0.05 * v[2] * scale));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    std::fs::write(dst, out).unwrap();
+    dst.to_string_lossy().into_owned()
+}
+
+const SD_ARGS: [&str; 6] = ["--fitness", "pnl", "--band", "1.0", "--band-units", "sd"];
+
+#[test]
+fn band_sd_ignores_rows_after_training_end() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let (la, lb) = (dir.join("a.jsonl"), dir.join("b.jsonl"));
+    let a_out = run_logged(&data, &spec, &la, &SD_ARGS);
+    let a = json(&a_out);
+    let (_, train_end) = time_range(&a, "train_time");
+    let (validation_start, _) = time_range(&a, "validation_time");
+    let other = write_extreme_csv(&data, &dir.join("extreme.csv"), train_end + 1.0, 40.0, 7.0);
+    let b = json(&run_logged(&other, &spec, &lb, &SD_ARGS));
+    // Every member's band is resolved on its training rows: the same in both runs.
+    let bands = |j: &Json| {
+        pareto(j)
+            .iter()
+            .map(|m| {
+                let v = at(m, &["validation_book"]);
+                (
+                    at(m, &["expression_exact"]).as_str().unwrap().to_string(),
+                    v.get("band_sd").and_then(Json::as_f64).map(f64::to_bits),
+                    num(v, &["band_resolved"]).to_bits(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    // The display order follows the validation books, which differ; compare by expression.
+    let sorted = |mut v: Vec<(String, Option<u64>, u64)>| {
+        v.sort();
+        v
+    };
+    let (ba, bb) = (sorted(bands(&a)), sorted(bands(&b)));
+    assert!(ba.iter().filter(|m| m.1.is_some()).count() >= 2, "{ba:?}");
+    assert_eq!(ba, bb);
+    let (mut ma, mut mb) = (members(&a), members(&b));
+    ma.sort();
+    mb.sort();
+    assert_eq!(ma, mb);
+    assert!(at(&a, &["objective", "spec", "band_sd"]).as_f64().is_some());
+    assert_eq!(archive_hash(&la), archive_hash(&lb));
+    let max_time = num(&a, &["objective", "spec", "band_sd_max_time"]);
+    assert!(max_time <= train_end && max_time < validation_start, "band_sd_max_time {max_time}, training end {train_end}");
+    assert_ne!(
+        num(&a, &["objective", "validation", "net_pnl"]).to_bits(),
+        num(&b, &["objective", "validation", "net_pnl"]).to_bits(),
+        "the validation rows differ"
+    );
+}
+
+#[test]
+fn band_sd_not_recomputed_on_test() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let a = json(&run(&data, &spec, &SD_ARGS));
+    let (_, validation_end) = time_range(&a, "validation_time");
+    let wide = write_extreme_csv(&data, &dir.join("wide.csv"), validation_end + 1.0, 100.0, 0.0);
+    let b = json(&run(&wide, &spec, &SD_ARGS));
+    assert_eq!(at(&a, &["objective", "finalist", "expression_exact"]), at(&b, &["objective", "finalist", "expression_exact"]));
+    for k in ["band_sd", "band_resolved"] {
+        assert_eq!(num(&a, &["objective", "spec", k]).to_bits(), num(&b, &["objective", "spec", k]).to_bits(), "{k}");
+    }
+    assert_ne!(
+        num(&a, &["objective", "test", "net_pnl"]).to_bits(),
+        num(&b, &["objective", "test", "net_pnl"]).to_bits(),
+        "the test rows differ"
+    );
+}
+
+#[test]
+fn band_sd_recorded_in_run_json() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let j = json(&run(&data, &spec, &[&SD_ARGS[..], &["--min-holding", "2"]].concat()));
+    assert_eq!(at(&j, &["search_fitness", "band_units"]).as_str(), Some("sd"));
+    assert_eq!(num(&j, &["search_fitness", "band"]), 1.0);
+    assert_eq!(num(&j, &["search_fitness", "min_holding"]), 2.0);
+    let s = at(&j, &["objective", "spec"]);
+    assert_eq!(s.get("band_units").and_then(Json::as_str), Some("sd"));
+    assert_eq!(num(s, &["band"]), 1.0);
+    assert_eq!(num(s, &["min_holding"]), 2.0);
+    let sd = num(s, &["band_sd"]);
+    assert!(sd.is_finite() && sd > 0.0, "band_sd {sd}");
+    assert_eq!(num(s, &["band_resolved"]).to_bits(), (1.0 * sd).to_bits());
+    let rows = num(s, &["band_sd_rows"]);
+    assert!(rows >= 2.0 && rows <= num(&j, &["split", "train_rows"]), "band_sd_rows {rows}");
+    let (_, train_end) = time_range(&j, "train_time");
+    assert!(num(s, &["band_sd_max_time"]) <= train_end);
+    assert_eq!(s.get("band_sd_degenerate"), Some(&Json::Bool(false)));
+}
+
+/// Robust finalist selection prices each member with its own sd band: its
+/// trade count on the validation rows is the member's validation book count.
+#[test]
+fn band_sd_robust_selection_uses_member_bands() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let j = json(&run(&data, &spec, &[&SD_ARGS[..], &["--select-rule", "robust"]].concat()));
+    assert_eq!(at(&j, &["objective", "selection_rule", "rule"]).as_str(), Some("robust"));
+    let robust = match at(&j, &["objective", "selection_rule", "members"]) {
+        Json::Arr(a) => a,
+        _ => panic!("selection_rule.members is not an array"),
+    };
+    let mut compared = 0usize;
+    for r in robust {
+        let rank = num(r, &["archive_rank"]);
+        let member = pareto(&j).iter().find(|m| num(m, &["archive_rank"]) == rank).expect("a front member per rank");
+        let book = at(member, &["validation_book"]);
+        if book.get("objective").and_then(Json::as_f64).is_some_and(f64::is_finite) && num(r, &["trades"]) > 0.0 {
+            assert_eq!(num(r, &["trades"]), num(book, &["trades"]), "archive rank {rank}");
+            assert!(book.get("band_sd").and_then(Json::as_f64).is_some());
+            compared += 1;
+        }
+    }
+    assert!(compared >= 2, "{compared} members compared");
+    let finalist = at(&j, &["objective", "finalist", "expression_exact"]).as_str().unwrap().to_string();
+    let member = pareto(&j)
+        .iter()
+        .find(|m| at(m, &["expression_exact"]).as_str() == Some(finalist.as_str()))
+        .expect("the finalist is a front member");
+    assert_eq!(
+        num(at(member, &["validation_book"]), &["band_resolved"]).to_bits(),
+        num(&j, &["objective", "spec", "band_resolved"]).to_bits()
+    );
 }
