@@ -279,6 +279,7 @@ INPUT:
                              sd with --band-units sd. The fitness (--fitness
                              pnl) and the validation and test books price it.
                              Exit 2 with --position top_tercile
+  --quorum <Q>              fraction of the K members that must vote long, with --policy vote
   --band-units score|sd      how --band is read (default score). sd: b = B x the
                              sample sd of the candidate's finite scores on the
                              training rows only; the validation and test books
@@ -10935,7 +10936,7 @@ OPTIONS:
                              radix count, so theta is bit-identical to numpy
   --threshold-fixed <theta>  pre-registered fixed threshold instead of a quantile;
                              reported with threshold_source = fixed
-  --policy <p>               threshold | band | dp | top-tercile (default threshold). top-tercile
+  --policy <p>               threshold | band | dp | top-tercile | vote (default threshold). top-tercile
                              holds the top floor(n/3) finite scores of each timestamp long and
                              the rest flat (no threshold; --threshold-quantile, --threshold-fixed,
                              --band, --min-hold, --select-band, --device-pnl and --batch-pnl are
@@ -10944,6 +10945,13 @@ OPTIONS:
                              the threshold book); dp keeps the threshold book
                              and reports the exact hindsight DP as a bound, never
                              as the strategy's P&L
+                             vote is one long/flat book from K repeated --expr: long when at least
+                             ceil(Q x K) members have score > their own threshold (--quorum Q in
+                             (0, 1], required). A member with a non-finite score drops the row.
+                             --band B (whole number) keeps a long book long while votes >=
+                             ceil(Q x K) - B; --min-hold applies after voting. K=1, Q=1 equals the
+                             threshold book. --device-pnl, --batch-pnl, --select-band, --locked-test
+                             and --band-units are refused
   --band <f>                 half-width beta of the no-trade band (default 0;
                              with --policy band, beta=0 reproduces the threshold
                              rule bit for bit); score units, or with --band-units
@@ -10956,7 +10964,7 @@ OPTIONS:
                              band_sd, band_resolved, band_sd_rows,
                              band_sd_max_time and band_sd_degenerate
   --min-hold <n>             minimum consecutive long rows before a band exit
-                             (default 1; requires --policy band)
+                             (default 1; requires --policy band or vote)
   --gpu                      run the --policy band/cooldown scan and the --policy
                              dp hindsight scan on the CUDA device. The result is
                              bit-identical to the CPU scan; when the device
@@ -11171,6 +11179,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut band_width = 0.0f64;
     let mut min_hold = 1usize;
     let mut gpu = false;
+    let mut quorum: Option<f64> = None;
     let mut validation_frac = 0.0f64;
     let mut periods_per_year: Option<f64> = None;
     let mut pool_reset_flat = false;
@@ -11314,6 +11323,10 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--band" | "--band-width" => {
                 band_width = number(need(args, i + 1, "--band"), "--band");
+                i += 1;
+            }
+            "--quorum" => {
+                quorum = Some(number(need(args, i + 1, "--quorum"), "--quorum"));
                 i += 1;
             }
             "--band-units" => {
@@ -11518,6 +11531,12 @@ fn run_walkforward(args: &[String]) -> ! {
     }
     if policy == walkforward::Policy::Band && device_pnl {
         usage_fail("--device-pnl is not supported with --policy band: the device arm prices the threshold book");
+    }
+    if policy == walkforward::Policy::Vote && device_pnl {
+        usage_fail("--device-pnl is not supported with --policy vote: the device arm prices the threshold book");
+    }
+    if quorum.is_some() && policy != walkforward::Policy::Vote {
+        usage_fail("--quorum needs --policy vote");
     }
     let mut cost_spec: Option<rcsr::target::TargetSpec> = None;
     let mut run_cost: Option<(f64, rcsr::target::CostSource)> = None;
@@ -11899,6 +11918,12 @@ fn run_walkforward(args: &[String]) -> ! {
             usage_fail(&msg);
         }
     }
+    popts.quorum = quorum;
+    if spec.policy == walkforward::Policy::Vote {
+        if let Some(msg) = walkforward::vote_refusal(&spec, &popts) {
+            usage_fail(&msg);
+        }
+    }
     let resolved = rcsr::lockbox::resolve_retired(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path, retired_arg.as_deref()).unwrap_or_else(|e| {
         eprintln!("error: {}", e.message);
         std::process::exit(e.exit);
@@ -11998,6 +12023,11 @@ fn run_walkforward(args: &[String]) -> ! {
                 eprintln!("error: {}", e);
                 std::process::exit(EXIT_INPUT);
             }
+        }
+    }
+    if spec.policy == walkforward::Policy::Vote {
+        if let Some(msg) = walkforward::vote_refusal(&spec, &popts) {
+            usage_fail(&msg);
         }
     }
     if let Some(l) = &ledger {
