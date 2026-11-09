@@ -1004,7 +1004,7 @@ fn band_sd_fitness_book_matches_validation_book() {
         let band = BandSpec::from_training(BandUnits::Sd, 1.0, &train_scores, &train.rows.time);
         assert!(band.resolved > 0.0);
         assert_eq!(train_book.resolve_band(&train_scores).to_bits(), band.resolved.to_bits());
-        let t = valid_book.band_pass(&valid_scores, valid_book.resolve_band(&valid_scores), false)[0];
+        let t = valid_book.band_pass(&valid_scores, band.resolved, false)[0];
         let net = valid_book.net_of(&t);
         let objective_spec = TradingSpec { band, min_holding: hold, ..spec() };
         let objective = trading::evaluate(&valid_scores, &valid.ret, &valid.rows, &objective_spec).unwrap();
