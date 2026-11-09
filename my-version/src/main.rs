@@ -7145,7 +7145,13 @@ fn main() {
                     objective: r.objective_value,
                 })
                 .collect();
-            let picked = rcsr::selection::select_robust(&metas, robust_params, tspec, &ret, &book_rows, &mut |i| {
+            // #925: each member's book takes the band resolved on its training rows.
+            let mut spec_of = |i: usize| {
+                let tree = &sorted[rows[i].archive_rank - 1].tree;
+                let train_pred: Vec<f64> = prepared.train.x.iter().map(|row| expr::eval(tree, row)).collect();
+                member_spec(tspec, &train_pred, train_slice)
+            };
+            let picked = rcsr::selection::select_robust_specs(&metas, robust_params, &mut spec_of, &ret, &book_rows, &mut |i| {
                 trading_pred(&sorted[rows[i].archive_rank - 1].tree, &v.x, ctx)
             })
             .unwrap_or_else(|e| trading_usage(&e));

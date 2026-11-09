@@ -1395,3 +1395,23 @@ fn band_sd_recorded_in_run_json() {
     assert!(num(s, &["band_sd_max_time"]) <= train_end);
     assert_eq!(s.get("band_sd_degenerate"), Some(&Json::Bool(false)));
 }
+
+/// Robust finalist selection prices each member with its own sd band, and
+/// the finalist's books use the band of its validation book.
+#[test]
+fn band_sd_robust_selection_uses_member_bands() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let j = json(&run(&data, &spec, &[&SD_ARGS[..], &["--select-rule", "robust"]].concat()));
+    let finalist = at(&j, &["objective", "finalist", "expression_exact"]).as_str().unwrap().to_string();
+    let member = pareto(&j)
+        .iter()
+        .find(|m| at(m, &["expression_exact"]).as_str() == Some(finalist.as_str()))
+        .expect("the finalist is a front member");
+    assert_eq!(
+        num(at(member, &["validation_book"]), &["band_resolved"]).to_bits(),
+        num(&j, &["objective", "spec", "band_resolved"]).to_bits()
+    );
+    assert_eq!(at(&j, &["objective", "spec", "band_units"]).as_str(), Some("sd"));
+}

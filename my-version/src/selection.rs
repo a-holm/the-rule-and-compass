@@ -855,6 +855,19 @@ pub fn select_robust(
     rows: &crate::trading::TradingRows,
     pred_of: &mut dyn FnMut(usize) -> Vec<f64>,
 ) -> Result<RobustSelection, String> {
+    select_robust_specs(metas, params, &mut |_| spec.clone(), ret, rows, pred_of)
+}
+
+/// #925: [`select_robust`] with the spec of each member, so an sd-unit band is
+/// the one resolved on that member's training rows.
+pub fn select_robust_specs(
+    metas: &[RobustMeta],
+    params: RobustParams,
+    spec_of: &mut dyn FnMut(usize) -> crate::trading::TradingSpec,
+    ret: &[f64],
+    rows: &crate::trading::TradingRows,
+    pred_of: &mut dyn FnMut(usize) -> Vec<f64>,
+) -> Result<RobustSelection, String> {
     params.validate()?;
     let mut stamps: Vec<f64> = rows.time.iter().copied().filter(|t| t.is_finite()).collect();
     stamps.sort_by(|a, b| a.total_cmp(b));
@@ -870,7 +883,7 @@ pub fn select_robust(
     let mut members = Vec::with_capacity(metas.len());
     for (i, m) in metas.iter().enumerate() {
         let scored = if m.usable {
-            crate::trading::blocked_alpha(&pred_of(i), ret, rows, spec, params.blocks).ok()
+            crate::trading::blocked_alpha(&pred_of(i), ret, rows, &spec_of(i), params.blocks).ok()
         } else {
             None
         };
