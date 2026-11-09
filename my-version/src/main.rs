@@ -1,4 +1,3 @@
-        let backend_reason = if report_only { backend_note.map(str::to_string) } else { backend_reason.or_else(|| backend_note.map(str::to_string)) };
 //! `rcsr` — command-line symbolic-regression engine.
 //!
 //! Designed to be driven by other programs (including AI agents):
@@ -6830,6 +6829,7 @@ fn main() {
                 .clone()
                 .or_else(|| gpu_probe.reason.clone())
         };
+        let backend_reason = if report_only { backend_note.map(str::to_string) } else { backend_reason.or_else(|| backend_note.map(str::to_string)) };
         let timing = PhaseTimings {
             prep: (search_start - run_start).as_secs_f64(),
             search: search_seconds,

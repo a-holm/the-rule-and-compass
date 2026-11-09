@@ -38,6 +38,9 @@ fn chunk(dir: &Path, csv: &str, resume: bool, interim: bool) -> Output {
     }
     if resume {
         args.extend(["--resume", "ck.rcsr"]);
+        if !interim {
+            args.extend(["--time-budget", "100000"]);
+        }
     }
     let out = rcsr_cmd::rcsr().current_dir(dir).args(&args).output().expect("run rcsr");
     assert!(out.status.success(), "{:?}", out);
@@ -85,8 +88,8 @@ fn resume_at_final_generation_reports_search_backend() {
     let (_s, dir, csv) = setup("final-generation");
     finished_chain(&dir, &csv);
     assert_eq!(backends(&dir), strs(["cpu", "cpu", "cpu", "cpu"]));
-    chunk(&dir, &csv, true, false);
     assert_eq!(run_json(&dir).get("generations_run").and_then(Json::as_usize), Some(8));
+    chunk(&dir, &csv, true, false);
     assert_eq!(backends(&dir), strs(["cpu", "cpu", "cpu", "cpu"]));
 
     set_sidecar_backend(&dir, "gpu");
