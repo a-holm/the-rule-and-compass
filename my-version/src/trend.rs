@@ -424,8 +424,7 @@ pub fn compute(base: &[Bar], bar_seconds: i64, requested: &[String]) -> Result<B
         .iter()
         .zip(base)
         .map(|(j, b)| match j {
-            Some(d) if d.time == tf.bucket_start(b.time) - DAY => index.get(&d.time).copied(),
-            _ => None,
+            _ => index.get(&tf.bucket_start(b.time)).copied(),
         })
         .collect();
     for (name, i) in wanted {

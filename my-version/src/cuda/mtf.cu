@@ -592,7 +592,8 @@ __global__ void k_trend_leaves(const long long *__restrict__ h_time,
             int w = ma[k];
             int l = w / 5;
             double m = rc_contig_local(h_time, bs, p, w, day) ? rw_mean_strict(ca, q, w) : NAN;
-            if (isfinite(m) && m > 0.0) leaf[(size_t)k * cap + i] = cm[i] / m - 1.0;
+            double cnow = (p + 1 < len) ? cm[i + 1] : cm[i];
+            if (isfinite(m) && m > 0.0) leaf[(size_t)k * cap + i] = cnow / m - 1.0;
             if (rc_contig_local(h_time, bs, p, w + l, day)) {
                 double prev = rw_mean_strict(ca, q - l, w);
                 if (isfinite(m) && isfinite(prev) && prev > 0.0) {
