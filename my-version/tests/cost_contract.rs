@@ -855,7 +855,7 @@ fn band_does_not_depend_on_test_rows() {
     assert_ne!(ladder_net(sr_row(&a)).to_bits(), ladder_net(sr_row(&b)).to_bits(), "the test rows must matter to the net");
     for lad in [&a, &b] {
         assert_eq!(num(at(lad, &["sr_run"]), &["band_resolved"]).to_bits(), resolved.to_bits());
-        assert!(at(sr_row(lad), &["params"]).as_str().unwrap().contains(&format!("half-width {}", rcsr::ladder::jnum(resolved))));
+        assert!(at(sr_row(lad), &["params"]).as_str().unwrap().contains(&format!("half-width {}", rcsr::devlog::num(resolved))));
     }
     let (c, d) = (
         ablation_score(&dir, &data, &windows, "--from-run", &run, "a"),
