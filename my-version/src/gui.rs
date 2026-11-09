@@ -797,6 +797,8 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("--max-position", "the GUI does not run the long/flat P&L objective"),
     ("--min-trades", "the GUI does not run the long/flat P&L objective"),
     ("--min-holding", "the GUI does not run the long/flat P&L objective"),
+    ("--band", "the GUI does not run the long/flat P&L objective"),
+    ("--band-units", "the GUI does not run the long/flat P&L objective"),
     ("--baseline-samples", "the GUI baseline uses the engine's default sample size"),
     ("--null-block", "the GUI null control only shuffles single rows"),
     ("--implicit", "the implicit target-as-input transform is not wired into the form"),
