@@ -47,6 +47,11 @@
 #define RC_MTF_TREND 10
 #define RC_MTF_BAR_AGE 11
 
+/* #932 trend family: 27 leaves on the daily buckets, in `trend::TREND_NAMES`
+   order. */
+#define RC_TREND_LEAVES 27
+#define RC_TREND_DAY 86400
+
 typedef struct RcMtfStats {
     double kernel_ms;
     double launch_ms;
@@ -103,6 +108,16 @@ typedef struct RcMtf {
     int *d_join_idx;
     double *d_age;
     double *d_out;
+
+    /* Trend arena, sized to the daily bucket count of the last trend pass. */
+    int trend_ready;
+    int trend_cap;
+    double *d_trend_leaf;
+    double *d_tc;
+    double *d_thi;
+    double *d_tlo;
+    double *d_tret;
+    double *d_ts20;
 
     RcMtfStats last;
     double batch_start_ms;
@@ -516,6 +531,115 @@ __global__ void k_mtf_leaves(const long long *__restrict__ h_time,
     }
 }
 
+/* #932: one thread per segment over its daily buckets. Mirrors
+   `trend::daily_leaves`: a bucket with fewer than `rows_per_day` base rows is
+   masked to NaN, moving averages and the 20-day volatility come from the same
+   block-compensated prefix arenas as the MTF leaves, extrema are sequential
+   window scans. */
+__global__ void k_trend_leaves(const long long *__restrict__ h_time,
+                               const double *__restrict__ h_high,
+                               const double *__restrict__ h_low,
+                               const double *__restrict__ h_close,
+                               const int *__restrict__ bucket_lo,
+                               int n, int total,
+                               const int *__restrict__ seg_bs,
+                               const int *__restrict__ seg_bl,
+                               int nseg, int rows_per_day, int cap,
+                               double *cm, double *him, double *lom,
+                               double *ret1, double *s20,
+                               double *ps, double *ps2, double *pc,
+                               double *rs, double *rs2, double *rc,
+                               double *rs3, double *rs4, double *leaf)
+{
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= nseg) return;
+    int bs = seg_bs[s];
+    int len = seg_bl[s];
+    if (len <= 0) return;
+    const int ma[4] = {20, 50, 100, 200};
+    const int weeks[4] = {4, 12, 26, 52};
+    const int day = RC_TREND_DAY;
+
+    for (int p = 0; p < len; ++p) {
+        int i = bs + p;
+        int end = (i + 1 < total) ? bucket_lo[i + 1] : n;
+        bool ok = (end - bucket_lo[i]) == rows_per_day;
+        cm[i] = (ok && isfinite(h_close[i])) ? h_close[i] : NAN;
+        him[i] = (ok && isfinite(h_high[i])) ? h_high[i] : NAN;
+        lom[i] = (ok && isfinite(h_low[i])) ? h_low[i] : NAN;
+        for (int k = 0; k < RC_TREND_LEAVES; ++k) leaf[(size_t)k * cap + i] = NAN;
+    }
+    for (int p = 0; p < len; ++p) {
+        int i = bs + p;
+        ret1[i] = NAN;
+        if (p >= 1 && h_time[i] - h_time[i - 1] == (long long)day &&
+            isfinite(cm[i]) && isfinite(cm[i - 1]) && cm[i - 1] > 0.0) {
+            ret1[i] = cm[i] / cm[i - 1] - 1.0;
+        }
+    }
+
+    int pb = bs + s;
+    MtfArena ca = {ps, ps2, ps2, ps2, (int *)pc, cm + bs - pb - 1};
+    MtfArena ra = {rs, rs2, rs3, rs4, (int *)rc, ret1 + bs - pb - 1};
+    rc_prefix_local(ca, cm, h_time, bs, len, pb, day, false);
+    rc_prefix_local(ra, ret1, h_time, bs, len, pb, day, true);
+
+    for (int p = 0; p < len; ++p) {
+        int i = bs + p;
+        int q = pb + 1 + p;
+        s20[i] = rc_contig_local(h_time, bs, p, 20, day) ? rw_std_pop(ra, q, 20) : NAN;
+        for (int k = 0; k < 4; ++k) {
+            int w = ma[k];
+            int l = w / 5;
+            double m = rc_contig_local(h_time, bs, p, w, day) ? rw_mean_strict(ca, q, w) : NAN;
+            if (isfinite(m) && m > 0.0) leaf[(size_t)k * cap + i] = cm[i] / m - 1.0;
+            if (rc_contig_local(h_time, bs, p, w + l, day)) {
+                double prev = rw_mean_strict(ca, q - l, w);
+                if (isfinite(m) && isfinite(prev) && prev > 0.0) {
+                    leaf[(size_t)(4 + k) * cap + i] = m / prev - 1.0;
+                }
+            }
+        }
+        if (rc_contig_local(h_time, bs, p, 364, day) && isfinite(cm[i])) {
+            double mx = -INFINITY;
+            double mn = INFINITY;
+            bool finite = true;
+            for (int j = p + 1 - 364; j <= p; ++j) {
+                double a = him[bs + j];
+                double b = lom[bs + j];
+                if (!isfinite(a) || !isfinite(b)) {
+                    finite = false;
+                    break;
+                }
+                mx = fmax(mx, a);
+                mn = fmin(mn, b);
+            }
+            if (finite) {
+                if (mx > mn) leaf[(size_t)8 * cap + i] = (cm[i] - mn) / (mx - mn) - 0.5;
+                if (mx > 0.0) leaf[(size_t)9 * cap + i] = cm[i] / mx - 1.0;
+                if (mn > 0.0) leaf[(size_t)10 * cap + i] = cm[i] / mn - 1.0;
+            }
+        }
+        for (int k = 0; k < 4; ++k) {
+            int span = 7 * weeks[k];
+            if (rc_contig_local(h_time, bs, p, span + 1, day) &&
+                ca.cn(q) - ca.cn(q - span - 1) == span + 1 && cm[i - span] > 0.0) {
+                leaf[(size_t)(11 + k) * cap + i] = cm[i] / cm[i - span] - 1.0;
+            }
+        }
+        double sd = s20[i];
+        if (isfinite(sd) && sd > 0.0) {
+            for (int k = 0; k < 4; ++k) {
+                double t = sqrt((double)ma[k]);
+                double tm = sqrt((double)(7 * weeks[k]));
+                leaf[(size_t)(15 + k) * cap + i] = leaf[(size_t)k * cap + i] / (sd * t);
+                leaf[(size_t)(19 + k) * cap + i] = leaf[(size_t)(4 + k) * cap + i] / (sd * t);
+                leaf[(size_t)(23 + k) * cap + i] = leaf[(size_t)(11 + k) * cap + i] / (sd * tm);
+            }
+        }
+    }
+}
+
 /* One thread per segment: the monotone causal merge cursor. */
 __global__ void k_join(const long long *__restrict__ t,
                        const int *__restrict__ seg_start,
@@ -709,6 +833,12 @@ void rc_mtf_destroy(RcMtf *c)
     cudaFree(c->d_join_idx);
     cudaFree(c->d_age);
     cudaFree(c->d_out);
+    cudaFree(c->d_trend_leaf);
+    cudaFree(c->d_tc);
+    cudaFree(c->d_thi);
+    cudaFree(c->d_tlo);
+    cudaFree(c->d_tret);
+    cudaFree(c->d_ts20);
     free(c);
 }
 
@@ -735,6 +865,7 @@ int rc_mtf_prepare(RcMtf *c, long long tf_seconds)
 {
     if (!c || tf_seconds <= 0) return 1;
     if (tf_seconds < 3600 || tf_seconds % 3600 != 0) return 6;
+    c->trend_ready = 0;
     stats_begin(c);
     const int threads = 256;
     int nb = blocks_for(c->n, threads);
@@ -822,6 +953,112 @@ int rc_mtf_gather(RcMtf *c, int leaf, double *out)
         const double *src = c->d_leaf + (size_t)leaf * c->max_buckets;
         rc_launch("k_gather", k_gather, nb, threads, 0, 0, c->d_join_idx, src, c->n, c->d_out);
     }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        c->last.failed = 1;
+        stats_end(c);
+        return 3;
+    }
+    err = cudaDeviceSynchronize();
+    if (err == cudaSuccess)
+        err = cudaMemcpy(out, c->d_out, (size_t)c->n * sizeof(double),
+                         cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        c->last.failed = 1;
+        stats_end(c);
+        return 4;
+    }
+    c->last.d2h_bytes = (unsigned long long)c->n * sizeof(double);
+    stats_end(c);
+    return 0;
+}
+
+static void trend_free(RcMtf *c)
+{
+    cudaFree(c->d_trend_leaf);
+    cudaFree(c->d_tc);
+    cudaFree(c->d_thi);
+    cudaFree(c->d_tlo);
+    cudaFree(c->d_tret);
+    cudaFree(c->d_ts20);
+    c->d_trend_leaf = NULL;
+    c->d_tc = NULL;
+    c->d_thi = NULL;
+    c->d_tlo = NULL;
+    c->d_tret = NULL;
+    c->d_ts20 = NULL;
+    c->trend_cap = 0;
+}
+
+/* #932: compute the 27 trend leaves on the daily buckets of the last
+   `rc_mtf_prepare(c, 86400)`. The join index of that pass is reused, so a
+   later `rc_mtf_trend_gather` is a pure row map. */
+int rc_mtf_trend(RcMtf *c, int rows_per_day)
+{
+    if (!c || c->prepared_tf != RC_TREND_DAY) return 1;
+    if (rows_per_day <= 0) return 2;
+    c->trend_ready = 0;
+    stats_begin(c);
+    int total = c->total_buckets;
+    if (total <= 0) {
+        c->last.failed = 1;
+        stats_end(c);
+        return 3;
+    }
+    if (c->trend_cap < total) {
+        trend_free(c);
+        size_t cap = (size_t)total;
+        int ok = 1;
+        ok &= rc_alloc((void **)&c->d_trend_leaf, (size_t)RC_TREND_LEAVES * cap * sizeof(double)) == 0;
+        ok &= rc_alloc((void **)&c->d_tc, cap * sizeof(double)) == 0;
+        ok &= rc_alloc((void **)&c->d_thi, cap * sizeof(double)) == 0;
+        ok &= rc_alloc((void **)&c->d_tlo, cap * sizeof(double)) == 0;
+        ok &= rc_alloc((void **)&c->d_tret, cap * sizeof(double)) == 0;
+        ok &= rc_alloc((void **)&c->d_ts20, cap * sizeof(double)) == 0;
+        if (!ok) {
+            trend_free(c);
+            c->last.failed = 1;
+            stats_end(c);
+            return 7;
+        }
+        c->trend_cap = total;
+    }
+    const int threads = 256;
+    int sres = blocks_for(c->nseg, threads);
+    rc_launch("k_trend_leaves", k_trend_leaves, sres, threads, 0, 0, c->d_h_time, c->d_h_high, c->d_h_low,
+              c->d_h_close, c->d_bucket_lo, c->n, total, c->d_seg_bucket_start,
+              c->d_seg_bucket_len, c->nseg, rows_per_day, c->trend_cap, c->d_tc, c->d_thi,
+              c->d_tlo, c->d_tret, c->d_ts20, c->d_ps, c->d_ps2, c->d_pc, c->d_rs, c->d_rs2,
+              c->d_rc, c->d_rs3, c->d_rs4, c->d_trend_leaf);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        c->last.failed = 1;
+        stats_end(c);
+        return 4;
+    }
+    err = cudaDeviceSynchronize();
+    if (err == cudaSuccess) err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        c->last.failed = 1;
+        stats_end(c);
+        return 5;
+    }
+    c->trend_ready = 1;
+    stats_end(c);
+    return 0;
+}
+
+/* Gather trend leaf `leaf` (0..26) into a base-length f64 column. */
+int rc_mtf_trend_gather(RcMtf *c, int leaf, double *out)
+{
+    if (!c || !out || !c->trend_ready) return 1;
+    if (leaf < 0 || leaf >= RC_TREND_LEAVES) return 2;
+    stats_begin(c);
+    const int threads = 256;
+    int nb = blocks_for(c->n, threads);
+    const double *src = c->d_trend_leaf + (size_t)leaf * c->trend_cap;
+    rc_launch("k_gather", k_gather, nb, threads, 0, 0, c->d_join_idx, src, c->n, c->d_out);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         c->last.failed = 1;

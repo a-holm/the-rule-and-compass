@@ -506,7 +506,13 @@ atomically instead of streaming it. See
   candle geometry and multi-bar structure of #261 (`clv16 body16 rng_atr
   prev_range_pos inside_s outside_s engulf_s harami_s run8 nr4 trend96`;
   `batr` is shared with `compact`) with strict zero-range/zero-volume and gap
-  masks, and the `cross` group adds the complete #273 BTC/ETH benchmark
+  masks, the opt-in `trend` group (#932, not in the default set) adds 27
+  long-term columns on closed UTC days (20/50/100/200-day MA ratios and
+  slopes, the 52-week Donchian position and distances, 4 to 52 week momentum
+  and their `_z` versions scaled by the 20-day volatility; a partial or
+  missing day is `NaN`, a store with the family declares a 366-day lookback
+  embargo, and the device path shares the MTF daily resample and join), and
+  the `cross` group adds the complete #273 BTC/ETH benchmark
   context, equal-weight market state, breadth, dispersion, average-correlation
   proxy, ex-self relative returns and `[-1,1]` PIT cross-sectional ranks. On
   the CUDA path one device `(time,symbol,row)` permutation serves every rank

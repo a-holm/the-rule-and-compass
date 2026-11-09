@@ -2255,6 +2255,773 @@ fn mtf_every_column_is_nan_when_its_higher_bucket_is_missing() {
 }
 
 // ---------------------------------------------------------------------------
+// Long-term trend family (#932)
+// ---------------------------------------------------------------------------
+
+const TREND_DAY: i64 = 86_400;
+
+/// Hourly bars of one symbol: a deterministic multiplicative random walk that
+/// starts at `start` (epoch seconds) and runs `hours` bars.
+fn trend_rows(symbol: &str, hours: usize, start: i64, seed: u64) -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut uniform = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut close = 100.0 + (seed % 17) as f64;
+    (0..hours)
+        .map(|i| {
+            let open = close;
+            close = open * (1.0 + 0.012 * (uniform() - 0.495));
+            let high = open.max(close) * (1.0 + 0.004 * uniform());
+            let low = open.min(close) * (1.0 - 0.004 * uniform());
+            let volume = 10.0 + 90.0 * uniform();
+            (start + i as i64 * 3600, symbol.to_string(), open, high, low, close, volume)
+        })
+        .collect()
+}
+
+fn trend_opts(src: &str, out: &str, features: &str) -> Options {
+    let mut o = opts(src, out, features);
+    o.gpu = GpuMode::Off;
+    o
+}
+
+/// Daily OHLC of hourly rows built by hand: a day is kept only with all 24
+/// hours. Returns (day start, high, low, close) of every complete day.
+fn hand_days(rows: &[(i64, String, f64, f64, f64, f64, f64)]) -> std::collections::BTreeMap<i64, (f64, f64, f64)> {
+    let mut by_day: std::collections::BTreeMap<i64, Vec<&(i64, String, f64, f64, f64, f64, f64)>> =
+        std::collections::BTreeMap::new();
+    for r in rows {
+        by_day.entry(r.0.div_euclid(TREND_DAY) * TREND_DAY).or_default().push(r);
+    }
+    by_day
+        .into_iter()
+        .filter(|(_, v)| v.len() == 24)
+        .map(|(d, v)| {
+            let hi = v.iter().map(|r| r.3).fold(f64::NEG_INFINITY, f64::max);
+            let lo = v.iter().map(|r| r.4).fold(f64::INFINITY, f64::min);
+            (d, (hi, lo, v[v.len() - 1].5))
+        })
+        .collect()
+}
+
+/// Naive value of one trend leaf at day `d` from complete days only: plain
+/// sums, a two-pass variance, explicit loops. `None` when a day of the window
+/// is missing.
+fn hand_leaf(name: &str, days: &std::collections::BTreeMap<i64, (f64, f64, f64)>, d: i64) -> Option<f64> {
+    let get = |k: i64| days.get(&(d - k * TREND_DAY)).copied();
+    let c = |k: i64| get(k).map(|x| x.2);
+    let sma = |lag: i64, n: i64| -> Option<f64> {
+        let mut s = 0.0;
+        for k in lag..lag + n {
+            s += c(k)?;
+        }
+        Some(s / n as f64)
+    };
+    let s20 = || -> Option<f64> {
+        let mut r = Vec::new();
+        for k in 0..20 {
+            r.push(c(k)? / c(k + 1)? - 1.0);
+        }
+        let m = r.iter().sum::<f64>() / 20.0;
+        let v = r.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / 20.0;
+        Some(v.sqrt())
+    };
+    let ma = |n: i64| -> Option<f64> { Some(c(0)? / sma(0, n)? - 1.0) };
+    let base = name.strip_suffix("_z").unwrap_or(name);
+    let raw: Option<f64> = match base {
+        "trend_don364_pos" | "trend_hi364_dist" | "trend_lo364_dist" => {
+            let mut hi = f64::NEG_INFINITY;
+            let mut lo = f64::INFINITY;
+            for k in 0..364 {
+                let x = get(k)?;
+                hi = hi.max(x.0);
+                lo = lo.min(x.1);
+            }
+            let cl = c(0)?;
+            Some(match base {
+                "trend_don364_pos" => (cl - lo) / (hi - lo) - 0.5,
+                "trend_hi364_dist" => cl / hi - 1.0,
+                _ => cl / lo - 1.0,
+            })
+        }
+        _ => {
+            if let Some(n) = base.strip_prefix("trend_ma").and_then(|s| s.strip_suffix("_ratio")) {
+                let n: i64 = n.parse().unwrap();
+                ma(n)
+            } else if let Some(n) = base.strip_prefix("trend_ma").and_then(|s| s.strip_suffix("_slope")) {
+                let n: i64 = n.parse().unwrap();
+                (|| Some(sma(0, n)? / sma(n / 5, n)? - 1.0))()
+            } else {
+                let k: i64 = base.strip_prefix("trend_mom").unwrap().strip_suffix('w').unwrap().parse().unwrap();
+                (|| {
+                    for q in 0..=7 * k {
+                        get(q)?;
+                    }
+                    Some(c(0)? / c(7 * k)? - 1.0)
+                })()
+            }
+        }
+    };
+    let raw = raw?;
+    if !name.ends_with("_z") {
+        return Some(raw);
+    }
+    let t = if let Some(k) = base.strip_prefix("trend_mom") {
+        7.0 * k.strip_suffix('w').unwrap().parse::<f64>().unwrap()
+    } else {
+        base.trim_start_matches("trend_ma").split('_').next().unwrap().parse::<f64>().unwrap()
+    };
+    let s = s20()?;
+    if s > 0.0 {
+        Some(raw / (s * t.sqrt()))
+    } else {
+        None
+    }
+}
+
+fn close_rel(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-12 * (1.0 + b.abs())
+}
+
+#[test]
+fn trend_group_adds_27_columns() {
+    assert_eq!(enrich::expand("trend").unwrap(), rcsr::trend::trend_names());
+    assert!(!enrich::expand("all").unwrap().iter().any(|n| n.starts_with("trend_")));
+    let (_scratch, dir) = tmp_dir("trend-group");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let mut rows = trend_rows("AAA", 30 * 24, 0, 1);
+    rows.extend(trend_rows("BBB", 30 * 24, 0, 2));
+    write_store(&src, &rows, 256);
+    let report = enrich::build(&trend_opts(&src, &out, "trend")).unwrap();
+    assert_eq!(report.features.len(), 27);
+    assert_eq!(report.columns_out, report.columns_in + 27);
+    let names: Vec<&str> = report.features.iter().map(|f| f.name.as_str()).collect();
+    for name in rcsr::trend::TREND_NAMES {
+        assert!(names.contains(&name), "{name} missing");
+    }
+    assert!(names.iter().all(|n| n.starts_with("trend_")));
+    let plan = report.plans.iter().find(|p| p.group == "trend").expect("trend plan");
+    assert_eq!(plan.cols, 27);
+    assert_eq!(plan.op, "trend-join");
+}
+
+#[test]
+fn trend_columns_match_hand_built_daily_bars() {
+    let rows = trend_rows("AAA", 500 * 24, 0, 7);
+    assert_eq!(rows.len(), 12_000);
+    let (_scratch, dir) = tmp_dir("trend-hand");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &rows, 1024);
+    enrich::build(&trend_opts(&src, &out, "trend")).unwrap();
+    let days = hand_days(&rows);
+    let mut finite = 0usize;
+    for name in rcsr::trend::TREND_NAMES {
+        let got = column(&out, name);
+        assert_eq!(got.len(), rows.len());
+        for (i, r) in rows.iter().enumerate() {
+            let decision_day = r.0.div_euclid(TREND_DAY) * TREND_DAY;
+            match hand_leaf(name, &days, decision_day - TREND_DAY) {
+                Some(want) => {
+                    assert!(close_rel(got[i], want), "{name} row {i}: got {}, want {want}", got[i]);
+                    finite += 1;
+                }
+                None => assert!(got[i].is_nan(), "{name} row {i}: got {}, want NaN", got[i]),
+            }
+        }
+    }
+    assert!(finite > 27 * 2_000, "only {finite} finite cells compared");
+}
+
+#[test]
+fn trend_warmup_first_finite_rows() {
+    let rows = trend_rows("AAA", 400 * 24, 0, 11);
+    let (_scratch, dir) = tmp_dir("trend-warmup");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &rows, 1024);
+    let report = enrich::build(&trend_opts(&src, &out, "trend")).unwrap();
+    for (name, row) in [
+        ("trend_ma200_ratio", 4_800usize),
+        ("trend_ma200_slope", 5_760),
+        ("trend_don364_pos", 8_736),
+        ("trend_mom52w", 8_760),
+        ("trend_mom4w", 696),
+        ("trend_ma20_ratio_z", 504),
+    ] {
+        assert_eq!(rcsr::trend::first_finite_hourly_row(name), Some(row), "{name}");
+    }
+    for name in rcsr::trend::TREND_NAMES {
+        let first = rcsr::trend::first_finite_hourly_row(name).unwrap();
+        let got = column(&out, name);
+        assert!(got[..first].iter().all(|v| v.is_nan()), "{name}: a value before row {first}");
+        assert!(got[first..].iter().all(|v| v.is_finite()), "{name}: a NaN at or after row {first}");
+        let f = report.features.iter().find(|f| f.name == name).unwrap();
+        assert_eq!(f.first_finite_row, Some(first), "{name} report");
+        assert_eq!(f.warmup, rcsr::trend::first_finite_day(name).unwrap(), "{name} warm-up");
+        assert_eq!(f.lookback_seconds, rcsr::trend::lookback_seconds(name), "{name} lookback");
+    }
+
+    // A series that starts at 13:00 drops its partial first day: 11 more rows.
+    let late = trend_rows("AAA", 60 * 24, 13 * 3600, 11);
+    let src2 = dir.join("late.rcsb").to_string_lossy().into_owned();
+    let out2 = dir.join("late-out.rcsb").to_string_lossy().into_owned();
+    write_store(&src2, &late, 1024);
+    let r2 = enrich::build(&trend_opts(&src2, &out2, "trend_ma20_ratio,trend_mom4w")).unwrap();
+    let ma = r2.features.iter().find(|f| f.name == "trend_ma20_ratio").unwrap();
+    assert_eq!(ma.first_finite_row, Some(480 + 11));
+    let mom = r2.features.iter().find(|f| f.name == "trend_mom4w").unwrap();
+    assert_eq!(mom.first_finite_row, Some(696 + 11));
+}
+
+/// Rows of `a` and `b` (same length) whose bits differ at a time before `t`.
+fn changed_before(times: &[i64], a: &[f64], b: &[f64], t: i64) -> Vec<usize> {
+    (0..a.len()).filter(|&i| times[i] < t && a[i].to_bits() != b[i].to_bits()).collect()
+}
+
+/// A trend column moved one day earlier: row `i` takes the value of row `i + 24`,
+/// so it reads the running day.
+fn shifted_one_day(x: &[f64]) -> Vec<f64> {
+    (0..x.len()).map(|i| x.get(i + 24).copied().unwrap_or(f64::NAN)).collect()
+}
+
+#[test]
+fn trend_join_is_causal_and_a_future_shift_is_caught() {
+    let rows = trend_rows("AAA", 60 * 24, 0, 3);
+    let bars: Vec<Bar> = rows.iter().map(|r| Bar::new(r.0, r.2, r.3, r.4, r.5, r.6)).collect();
+    let days = ohlcv::resample(&bars, Timeframe::D1).unwrap();
+    let joined = ohlcv::join_causal(&bars, &days, Timeframe::D1).unwrap();
+    assert!(ohlcv::lookahead_violations(&bars, &joined, Timeframe::D1).is_empty());
+    let mut shifted = joined.clone();
+    for i in 0..shifted.len().saturating_sub(24) {
+        shifted[i] = joined[i + 24];
+    }
+    assert!(
+        !ohlcv::lookahead_violations(&bars, &shifted, Timeframe::D1).is_empty(),
+        "a join moved one day earlier must be detected"
+    );
+
+    // At 13:00 on day 40 the momentum reads the close of day 39 over day 11,
+    // never the running day 40.
+    let (_scratch, dir) = tmp_dir("trend-causal");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &rows, 256);
+    enrich::build(&trend_opts(&src, &out, "trend")).unwrap();
+    let mom = column(&out, "trend_mom4w");
+    let i = 40 * 24 + 13;
+    assert_eq!(mom[i], days[39].close / days[11].close - 1.0);
+    assert_ne!(mom[i], days[40].close / days[12].close - 1.0);
+
+    // The perturbation check below catches the same leak in a stored column:
+    // a close changed at T moves the shifted column before T.
+    // The last bar of day 45 sets its close.
+    let t = 45 * TREND_DAY + 23 * 3600;
+    let mut edited = rows.clone();
+    let k = edited.iter().position(|r| r.0 == t).unwrap();
+    edited[k].5 *= 1.05;
+    edited[k].3 = edited[k].3.max(edited[k].5);
+    let src_b = dir.join("b.rcsb").to_string_lossy().into_owned();
+    let out_b = dir.join("b-out.rcsb").to_string_lossy().into_owned();
+    write_store(&src_b, &edited, 256);
+    enrich::build(&trend_opts(&src_b, &out_b, "trend")).unwrap();
+    let times: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    let a = column(&out, "trend_mom4w");
+    let b = column(&out_b, "trend_mom4w");
+    assert!(changed_before(&times, &a, &b, t).is_empty(), "the stored column is causal");
+    assert!(
+        !changed_before(&times, &shifted_one_day(&a), &shifted_one_day(&b), t).is_empty(),
+        "a one-day shift must move a value before the edited bar"
+    );
+}
+
+#[test]
+fn trend_unchanged_before_a_perturbed_day() {
+    let rows = trend_rows("AAA", 420 * 24, 0, 5);
+    let (_scratch, dir) = tmp_dir("trend-perturb");
+    let src = dir.join("a.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("a-out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &rows, 1024);
+    enrich::build(&trend_opts(&src, &out, "trend")).unwrap();
+    let times: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    for (tag, k) in [("mid", 380 * 24 + 7), ("first-hour", 390 * 24), ("last-hour", 400 * 24 + 23)] {
+        // A bar range wider than the rest of its day moves the daily high
+        // and low, whichever hour it is.
+        let mut edited = rows.clone();
+        edited[k].3 *= 1.5;
+        edited[k].4 *= 0.6;
+        edited[k].5 *= 1.03;
+        let t = edited[k].0;
+        let src_b = dir.join(format!("{tag}.rcsb")).to_string_lossy().into_owned();
+        let out_b = dir.join(format!("{tag}-out.rcsb")).to_string_lossy().into_owned();
+        write_store(&src_b, &edited, 1024);
+        enrich::build(&trend_opts(&src_b, &out_b, "trend")).unwrap();
+        let mut moved = 0usize;
+        for name in rcsr::trend::TREND_NAMES {
+            let a = column(&out, name);
+            let b = column(&out_b, name);
+            let bad = changed_before(&times, &a, &b, t);
+            assert!(bad.is_empty(), "{tag}: {name} changed at rows {:?} before the edit at {t}", &bad[..bad.len().min(5)]);
+            moved += (0..a.len()).filter(|&i| a[i].to_bits() != b[i].to_bits()).count();
+        }
+        assert!(moved > 0, "{tag}: the edit must change some later value");
+    }
+}
+
+#[test]
+fn trend_prefix_replay() {
+    let mut rows = trend_rows("AAA", 400 * 24, 0, 21);
+    rows.extend(trend_rows("BBB", 380 * 24, 5 * TREND_DAY, 22));
+    let (_scratch, dir) = tmp_dir("trend-prefix");
+    let full_src = dir.join("full.rcsb").to_string_lossy().into_owned();
+    let full_out = dir.join("full-out.rcsb").to_string_lossy().into_owned();
+    write_store(&full_src, &rows, 1024);
+    enrich::build(&trend_opts(&full_src, &full_out, "trend")).unwrap();
+    let full: Vec<Vec<f64>> = rcsr::trend::TREND_NAMES.iter().map(|n| column(&full_out, n)).collect();
+    let step = rows.len() / 20;
+    let mut cuts = 0usize;
+    for cut in (step..=rows.len()).step_by(step).take(20) {
+        let src = dir.join(format!("p{cut}.rcsb")).to_string_lossy().into_owned();
+        let out = dir.join(format!("p{cut}-out.rcsb")).to_string_lossy().into_owned();
+        write_store(&src, &rows[..cut], 1024);
+        enrich::build(&trend_opts(&src, &out, "trend")).unwrap();
+        for (k, name) in rcsr::trend::TREND_NAMES.iter().enumerate() {
+            let pre = column(&out, name);
+            assert_eq!(pre.len(), cut);
+            for i in 0..cut {
+                assert_eq!(full[k][i].to_bits(), pre[i].to_bits(), "{name} changed at row {i} under prefix cut {cut}");
+            }
+        }
+        std::fs::remove_file(&src).ok();
+        std::fs::remove_file(&out).ok();
+        cuts += 1;
+    }
+    assert_eq!(cuts, 20);
+}
+
+/// Days in the window of each leaf, counting the last closed day.
+fn trend_span_days(name: &str) -> i64 {
+    rcsr::trend::first_finite_day(name).unwrap() as i64 + 1
+}
+
+#[test]
+fn trend_every_column_is_nan_across_a_gap() {
+    // Day 30 is missing entirely in one series; in the other it lacks one hour.
+    let total_days = 430i64;
+    let gap = 30i64;
+    let full = trend_rows("AAA", total_days as usize * 24, 0, 9);
+    let missing: Vec<_> = full.iter().filter(|r| r.0.div_euclid(TREND_DAY) != gap).cloned().collect();
+    let partial: Vec<_> = full.iter().filter(|r| r.0 != gap * TREND_DAY + 17 * 3600).cloned().collect();
+    let (_scratch, dir) = tmp_dir("trend-gap");
+    for (tag, rows) in [("missing", &missing), ("partial", &partial)] {
+        let src = dir.join(format!("{tag}.rcsb")).to_string_lossy().into_owned();
+        let out = dir.join(format!("{tag}-out.rcsb")).to_string_lossy().into_owned();
+        write_store(&src, rows, 1024);
+        enrich::build(&trend_opts(&src, &out, "trend")).unwrap();
+        for name in rcsr::trend::TREND_NAMES {
+            let got = column(&out, name);
+            let span = trend_span_days(name);
+            for (i, r) in rows.iter().enumerate() {
+                let j = r.0.div_euclid(TREND_DAY) - 1;
+                let warm = j + 1 < span;
+                let covers_gap = j - span < gap && gap <= j;
+                if warm || covers_gap {
+                    assert!(got[i].is_nan(), "{tag}: {name} row {i} (day {j}) must be NaN");
+                } else {
+                    assert!(got[i].is_finite(), "{tag}: {name} row {i} (day {j}) must be finite");
+                }
+            }
+            // The first decision whose window no longer holds the gap day is
+            // finite again: N contiguous complete days after it.
+            let back = rows.iter().position(|r| r.0 == (gap + span + 1) * TREND_DAY).unwrap();
+            assert!(got[back].is_finite(), "{tag}: {name} must recover after {span} complete days");
+            // The day after the gap has its own bars, but the running day never
+            // feeds a value: its rows read the gap day and are NaN.
+            let next = rows.iter().position(|r| r.0 == (gap + 1) * TREND_DAY + 12 * 3600).unwrap();
+            assert!(got[next].is_nan(), "{tag}: {name} must not read the running day");
+        }
+    }
+}
+
+#[test]
+fn trend_embargo_is_366_days() {
+    let (_scratch, dir) = tmp_dir("trend-embargo");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    write_store_with_flow(&src, &trend_rows("AAA", 40 * 24, 0, 4), 256);
+    let run = |features: &str, out: &str| {
+        let r = rcsr_cmd::rcsr()
+            .args(["enrich", "--data", &src, "--out", out, "--cpu", "--features", features, "--locked-test", "none"])
+            .output()
+            .unwrap();
+        assert_eq!(r.status.code(), Some(0), "{}", String::from_utf8_lossy(&r.stderr));
+        std::fs::read_to_string(format!("{out}.enrich.json")).unwrap()
+    };
+    let with = dir.join("with.rcsb").to_string_lossy().into_owned();
+    let text = run("r24,trend", &with);
+    let embargo = rcsr::manifest::object(&text, "lockbox_embargo").unwrap();
+    assert!(embargo.contains("\"seconds\":31622400"), "{embargo}");
+    assert!(embargo.contains("\"column\":\"trend_mom52w\""), "{embargo}");
+    assert_eq!(rcsr::lockbox::declared_embargo(&with).unwrap().map(|(_, s)| s), Some(31_622_400));
+    let at = text.find("\"name\":\"trend_ma20_ratio\"").unwrap();
+    assert!(text[at..].contains("\"lookback_seconds\":1814400"), "{}", &text[at..at + 400]);
+
+    let without = dir.join("without.rcsb").to_string_lossy().into_owned();
+    let text = run("r24,mtf_1d_rsi", &without);
+    let embargo = rcsr::manifest::object(&text, "lockbox_embargo").unwrap();
+    assert!(embargo.contains("\"seconds\":10972800"), "{embargo}");
+    assert!(embargo.contains("\"column\":\"mtf_1d_rsi\""), "{embargo}");
+    assert_eq!(rcsr::protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS, 10_972_800);
+}
+
+#[test]
+fn trend_inventory_is_current_and_every_test_id_exists() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("../docs/trend-inventory.json");
+    let want = rcsr::trend::inventory_json();
+    if std::env::var("RCSR_WRITE_INVENTORY").is_ok() {
+        std::fs::write(&path, &want).unwrap();
+    }
+    let have = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert_eq!(have, want, "docs/trend-inventory.json is stale; rerun with RCSR_WRITE_INVENTORY=1");
+    assert_eq!(have.matches("\"name\":").count(), 27);
+    let reg = rcsr::trend::registry();
+    assert_eq!(reg.len(), 27);
+    for e in &reg {
+        assert_eq!(e.family, "trend");
+        assert!(!enrich::default_registry().iter().any(|d| d.name == e.name), "{} is in the default set", e.name);
+        let r = rcsr::registry::lookup(&e.name).unwrap_or_else(|| panic!("{} does not resolve", e.name));
+        assert_eq!(r.family, "trend");
+        assert_eq!(r.warmup, rcsr::trend::first_finite_day(&e.name).unwrap());
+        let ids = rcsr::registry::test_ids(e);
+        assert!(ids.len() >= 3, "{}", e.name);
+        for id in ids {
+            let (file, func) = id.split_once("::").unwrap();
+            let text = std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert!(text.contains(&format!("fn {func}(")), "{} cites missing test {id}", e.name);
+        }
+    }
+    let schema = rcsr::schema::json();
+    let at = schema.find("\"trend\":{\"family\":\"trend\"").expect("gpu_feature_parity.trend");
+    let block = &schema[at..];
+    let block = &block[..block.find("\"pit_asof\"").unwrap_or(block.len())];
+    for name in rcsr::trend::TREND_NAMES {
+        let row_at = block.find(&format!("\"name\":\"{name}\"")).unwrap_or_else(|| panic!("schema misses {name}"));
+        let row = &block[row_at..row_at + block[row_at..].find('}').unwrap()];
+        assert!(row.contains("\"family\":\"trend\""), "{row}");
+        assert!(row.contains(&format!("\"warmup\":{}", rcsr::trend::first_finite_day(name).unwrap())), "{row}");
+        assert!(row.contains("\"pit\":\"closed UTC daily bars only"), "{row}");
+    }
+    // The default financial feature set does not change.
+    assert!(!enrich::default_registry().iter().any(|e| e.name.starts_with("trend_")));
+}
+
+#[test]
+fn trend_refusals() {
+    let (_scratch, dir) = tmp_dir("trend-refuse");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &trend_rows("AAA", 10 * 24, 0, 6), 256);
+    let r = rcsr_cmd::rcsr()
+        .args(["enrich", "--data", &src, "--out", &out, "--cpu", "--features", "r1,trend_ma30_ratio"])
+        .output()
+        .unwrap();
+    assert_eq!(r.status.code(), Some(2), "{}", String::from_utf8_lossy(&r.stderr));
+    assert!(String::from_utf8_lossy(&r.stderr).contains("unknown trend feature 'trend_ma30_ratio'"));
+    assert!(enrich::expand("trend_ma30_ratio").unwrap_err().contains("unknown trend feature"));
+
+    let two_days: Vec<_> = (0..40i64)
+        .map(|k| (k * 2 * TREND_DAY, "AAA".to_string(), 100.0, 101.0, 99.0, 100.5, 10.0))
+        .collect();
+    let src2 = dir.join("slow.rcsb").to_string_lossy().into_owned();
+    write_store(&src2, &two_days, 256);
+    let r = rcsr_cmd::rcsr()
+        .args(["enrich", "--data", &src2, "--out", &out, "--cpu", "--features", "trend"])
+        .output()
+        .unwrap();
+    assert_eq!(r.status.code(), Some(2), "{}", String::from_utf8_lossy(&r.stderr));
+    assert!(String::from_utf8_lossy(&r.stderr).contains(rcsr::trend::BAR_REFUSAL));
+    assert!(!std::path::Path::new(&out).exists(), "a refused run writes no store");
+    // The same bar without a trend column is still accepted.
+    let r = rcsr_cmd::rcsr()
+        .args(["enrich", "--data", &src2, "--out", &out, "--cpu", "--features", "r1"])
+        .output()
+        .unwrap();
+    assert_eq!(r.status.code(), Some(0), "{}", String::from_utf8_lossy(&r.stderr));
+}
+
+/// Deterministic xorshift for the property tests.
+struct TrendRng(u64);
+impl TrendRng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+    fn unit(&mut self) -> f64 {
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// Replace every OHLCV value of the rows of `symbol` after `cut` (a time).
+fn edit_after(rows: &mut [(i64, String, f64, f64, f64, f64, f64)], symbol: &str, cut: i64, rng: &mut TrendRng) {
+    for r in rows.iter_mut().filter(|r| r.1 == symbol && r.0 > cut) {
+        let o = 20.0 + 300.0 * rng.unit();
+        let c = 20.0 + 300.0 * rng.unit();
+        r.2 = o;
+        r.5 = c;
+        r.3 = o.max(c) * (1.0 + 0.05 * rng.unit());
+        r.4 = o.min(c) * (1.0 - 0.05 * rng.unit());
+        r.6 = 1.0 + 1000.0 * rng.unit();
+    }
+}
+
+/// Indices of rows of `symbol` at or before `cut` whose bits differ.
+fn changed_up_to(rows: &[(i64, String, f64, f64, f64, f64, f64)], symbol: &str, cut: i64, a: &[f64], b: &[f64]) -> Vec<usize> {
+    (0..rows.len()).filter(|&i| rows[i].1 == symbol && rows[i].0 <= cut && a[i].to_bits() != b[i].to_bits()).collect()
+}
+
+#[test]
+fn trend_causal_under_future_edits_cpu() {
+    let mut rows = trend_rows("AAA", 400 * 24, 0, 31);
+    rows.extend(trend_rows("BBB", 400 * 24, 0, 32));
+    let (_scratch, dir) = tmp_dir("trend-future-cpu");
+    let src = dir.join("a.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("a-out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &rows, 2048);
+    enrich::build(&trend_opts(&src, &out, "trend")).unwrap();
+    let base: Vec<Vec<f64>> = rcsr::trend::TREND_NAMES.iter().map(|n| column(&out, n)).collect();
+    let mut rng = TrendRng(0x5DEECE66D);
+    let hours = 400 * 24;
+    let mut moved = 0usize;
+    // Twenty cuts per symbol; each run edits both symbols after their own cut.
+    for k in 0..20 {
+        let cut_a = rows[rng.below(hours)].0;
+        let cut_b = rows[hours + rng.below(hours)].0;
+        let mut edited = rows.clone();
+        edit_after(&mut edited, "AAA", cut_a, &mut rng);
+        edit_after(&mut edited, "BBB", cut_b, &mut rng);
+        let src_b = dir.join(format!("e{k}.rcsb")).to_string_lossy().into_owned();
+        let out_b = dir.join(format!("e{k}-out.rcsb")).to_string_lossy().into_owned();
+        write_store(&src_b, &edited, 2048);
+        enrich::build(&trend_opts(&src_b, &out_b, "trend")).unwrap();
+        for (q, name) in rcsr::trend::TREND_NAMES.iter().enumerate() {
+            let b = column(&out_b, name);
+            for (sym, cut) in [("AAA", cut_a), ("BBB", cut_b)] {
+                let bad = changed_up_to(&rows, sym, cut, &base[q], &b);
+                assert!(bad.is_empty(), "cut {k}: {name} of {sym} changed at rows {:?} (cut at {cut})", &bad[..bad.len().min(5)]);
+            }
+            moved += (0..b.len()).filter(|&i| b[i].to_bits() != base[q][i].to_bits()).count();
+        }
+        std::fs::remove_file(&src_b).ok();
+        std::fs::remove_file(&out_b).ok();
+    }
+    assert!(moved > 0, "the future edits must change some value after the cuts");
+}
+
+#[test]
+fn trend_z_scale_is_causal() {
+    let rows = trend_rows("AAA", 120 * 24, 0, 41);
+    let (_scratch, dir) = tmp_dir("trend-z");
+    let src = dir.join("a.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("a-out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &rows, 1024);
+    let z = "trend_ma20_ratio_z,trend_ma20_slope_z,trend_mom4w_z,trend_mom12w_z,trend_ma50_ratio_z";
+    enrich::build(&trend_opts(&src, &out, z)).unwrap();
+    let mut rng = TrendRng(0xC0FFEE);
+    for k in 0..10 {
+        let cut = rows[60 * 24 + rng.below(50 * 24)].0;
+        let mut edited = rows.clone();
+        // Ten times the volatility after the cut: a scale fitted over the whole
+        // column would move every earlier z value.
+        for r in edited.iter_mut().filter(|r| r.0 > cut) {
+            let c = r.5 * (1.0 + 0.3 * (rng.unit() - 0.5));
+            r.5 = c;
+            r.3 = r.3.max(c);
+            r.4 = r.4.min(c);
+        }
+        let src_b = dir.join(format!("z{k}.rcsb")).to_string_lossy().into_owned();
+        let out_b = dir.join(format!("z{k}-out.rcsb")).to_string_lossy().into_owned();
+        write_store(&src_b, &edited, 1024);
+        enrich::build(&trend_opts(&src_b, &out_b, z)).unwrap();
+        let mut moved = 0usize;
+        for name in z.split(',') {
+            let a = column(&out, name);
+            let b = column(&out_b, name);
+            let bad = changed_up_to(&rows, "AAA", cut, &a, &b);
+            assert!(bad.is_empty(), "cut {k}: {name} changed at rows {:?}", &bad[..bad.len().min(5)]);
+            moved += (0..a.len()).filter(|&i| a[i].to_bits() != b[i].to_bits()).count();
+        }
+        assert!(moved > 0, "cut {k}: the scale after the cut must change later values");
+    }
+}
+
+/// An enriched trend store with only registered columns and a locked range
+/// declared by `rcsr enrich --locked-test`.
+fn trend_locked_store(dir: &std::path::Path, days: usize, range: &str) -> String {
+    let rows = trend_rows("AAA", days * 24, 0, 51);
+    let mut text = String::from("ts,symbol,open,high,low,close,volume\n");
+    for (t, s, o, h, l, c, v) in &rows {
+        text.push_str(&format!("{t},{s},{o},{h},{l},{c},{v}\n"));
+    }
+    let table = data::parse_table_with_time(&text, false, Some("ts")).unwrap();
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    store::write_store_with_time(&src, &table, 1024, Some(0)).unwrap();
+    let out = dir.join("trend.rcsb").to_string_lossy().into_owned();
+    let r = rcsr_cmd::rcsr()
+        .args(["enrich", "--data", &src, "--out", &out, "--cpu", "--features", "trend", "--locked-test", range])
+        .output()
+        .unwrap();
+    assert_eq!(r.status.code(), Some(0), "{}", String::from_utf8_lossy(&r.stderr));
+    out
+}
+
+#[test]
+fn trend_lookback_overlap_is_allowed() {
+    let (_scratch, dir) = tmp_dir("trend-overlap");
+    let (s, e) = (500 * TREND_DAY, 530 * TREND_DAY);
+    let out = trend_locked_store(&dir, 920, &format!("{s},{e}"));
+    let resolved = rcsr::lockbox::resolve(None, &out).unwrap();
+    let declared = resolved.declared().expect("a declared range");
+    assert_eq!(declared.embargo.seconds, 31_622_400);
+    let purge = 3600;
+    // Training rows before the range: their 366-day lookback reads earlier
+    // prices, which is what a live trader has, and nothing is flagged.
+    let train: Vec<i64> = (380 * 24..(500 * 24 - 2)).map(|h| h as i64 * 3600).collect();
+    assert!(declared.check_times("training split", "ts", &train, purge).is_ok());
+    // Test rows from END + 366 d on: the lookback overlaps earlier development
+    // prices only, never the locked bars, and is not flagged either.
+    let test: Vec<i64> = (0..30 * 24).map(|h| e + 366 * TREND_DAY + h as i64 * 3600).collect();
+    assert!(declared.check_times("test split", "ts", &test, purge).is_ok());
+    let mom = column(&out, "trend_mom52w");
+    let first_test = ((e + 366 * TREND_DAY) / 3600) as usize;
+    assert!(mom[first_test].is_finite(), "the overlapping lookback is a usable value");
+}
+
+#[test]
+fn trend_lockbox_counts_rows_in_embargo() {
+    let (_scratch, dir) = tmp_dir("trend-lockbox");
+    let (s, e) = (400 * TREND_DAY, 430 * TREND_DAY);
+    let out = trend_locked_store(&dir, 900, &format!("{s},{e}"));
+    // --vars projection: the schema sidecar records each trend column with its
+    // registry family and the SHA-256 of its stored values.
+    rcsr::registry::write_schema(&out, rcsr::registry::DEFAULT_PANEL_VERSION).unwrap();
+    let names = rcsr::trend::trend_names();
+    rcsr::registry::check_vars(&out, &names).unwrap();
+    let hashes = rcsr::registry::read_hashes(&rcsr::registry::schema_path(&out)).unwrap();
+    let report = std::fs::read_to_string(format!("{out}.enrich.json")).unwrap();
+    let schema = std::fs::read_to_string(rcsr::registry::schema_path(&out)).unwrap();
+    for name in &names {
+        let h = hashes.get(name).unwrap_or_else(|| panic!("{name} has no hash"));
+        assert_eq!(h.len(), 64, "{name}");
+        let at = report.find(&format!("\"name\":\"{name}\"")).unwrap();
+        assert!(report[at..at + 600].contains(&format!("\"sha256\":\"{h}\"")), "{name}: enrich and schema hashes differ");
+        let row = schema.lines().find(|l| l.contains(&format!("\"name\":\"{name}\""))).unwrap();
+        assert!(row.contains("\"family\":\"trend\""), "{row}");
+        assert!(row.contains(&format!("\"lookback_seconds\":{}", rcsr::trend::lookback_seconds(name).unwrap())), "{row}");
+    }
+    assert!(schema.contains("\"lockbox_embargo\":{\"seconds\":31622400,\"column\":\"trend_mom52w\""), "{}", &schema[..400]);
+
+    // The lockbox check refuses a window that starts less than 366 days after
+    // END and counts the rows in scope.
+    let declared = rcsr::lockbox::resolve(None, &out).unwrap().declared().expect("declared");
+    assert_eq!(declared.embargo.seconds, 31_622_400);
+    let start = e + 300 * TREND_DAY;
+    let window: Vec<i64> = (0..100 * 24).map(|h| start + h as i64 * 3600).collect();
+    let in_scope = window.iter().filter(|t| **t < e + 366 * TREND_DAY).count();
+    assert_eq!(in_scope, 66 * 24);
+    let err = declared.check_times("test split", "ts", &window, 3600).unwrap_err();
+    let digits = in_scope.to_string();
+    let grouped = format!("{},{}", &digits[..digits.len() - 3], &digits[digits.len() - 3..]);
+    assert!(err.contains(&format!("{grouped} row(s) whose features read the declared locked test")), "{err}");
+    assert!(err.contains("lookback embargo 31622400 s after the end (declared with the data)"), "{err}");
+    let later: Vec<i64> = window.iter().map(|t| t + 66 * TREND_DAY).collect();
+    assert!(declared.check_times("test split", "ts", &later, 3600).is_ok());
+}
+
+#[test]
+fn trend_sensitivity_fold_is_optional() {
+    let (_scratch, dir) = tmp_dir("trend-sensitivity");
+    let t0 = 1_600_000_000i64 - 1_600_000_000i64.rem_euclid(TREND_DAY);
+    let gap = 366 * TREND_DAY;
+    let purge = 3 * 3600;
+    let test_start = t0 + 600 * TREND_DAY;
+    let windows = dir.join("w.csv");
+    std::fs::write(
+        &windows,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,w1,{},{},{},{},{}\n",
+            t0,
+            test_start - purge,
+            t0 + 100 * TREND_DAY,
+            test_start,
+            test_start + 60 * TREND_DAY
+        ),
+    )
+    .unwrap();
+    let selectors = |extra: &[&str]| {
+        let mut args = vec!["protocol", "selectors", "--windows", windows.to_str().unwrap(), "--label", "w1", "--time-col", "ts"];
+        args.extend_from_slice(extra);
+        let r = rcsr_cmd::rcsr().args(&args).output().unwrap();
+        assert_eq!(r.status.code(), Some(0), "{}", String::from_utf8_lossy(&r.stderr));
+        String::from_utf8_lossy(&r.stdout).into_owned()
+    };
+    let plain = selectors(&[]);
+    assert_eq!(plain.lines().count(), 1, "{plain}");
+    assert!(!plain.contains("sensitivity_fold"), "{plain}");
+    let gap_s = gap.to_string();
+    let with = selectors(&["--gap-seconds", &gap_s]);
+    let lines: Vec<&str> = with.lines().collect();
+    assert_eq!(lines.len(), 2, "{with}");
+    assert_eq!(lines[0], plain.trim_end(), "the normal fold is unchanged");
+    assert!(lines[1].starts_with(&format!("sensitivity_fold gap_seconds={gap} ")), "{}", lines[1]);
+    assert!(lines[1].contains(&format!("ts >= {t0} and ts < {}", test_start - gap)), "{}", lines[1]);
+    assert!(lines[1].contains(&format!("--test-select 'ts >= {test_start} and ts < {}'", test_start + 60 * TREND_DAY)), "{}", lines[1]);
+
+    // Both folds run on the same fixture; the sensitivity fold trains on less.
+    let mut csv = String::from("ts,x,y\n");
+    for h in 0..(660 * 24) {
+        let ts = t0 + h as i64 * 3600;
+        let x = ((h * 7) % 13) as f64 / 13.0;
+        csv.push_str(&format!("{ts},{x},{}\n", 0.5 * x));
+    }
+    let data = dir.join("d.csv");
+    std::fs::write(&data, csv).unwrap();
+    let pick = |line: &str, flag: &str| line.split(&format!("{flag} '")).nth(1).unwrap().split('\'').next().unwrap().to_string();
+    let mut train_rows = Vec::new();
+    for line in [lines[0], lines[1]] {
+        let (tr, te) = (pick(line, "--train-select"), pick(line, "--test-select"));
+        let r = rcsr_cmd::rcsr()
+            .args([
+                "--data", data.to_str().unwrap(), "--target", "y", "--vars", "x", "--cpu", "--no-dev-log", "--seed", "1",
+                "--generations", "2", "--pop", "16", "--json", "--quiet", "--time", "ts", "--train-select", &tr,
+                "--test-select", &te, "--lockbox", "none",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(r.status.code(), Some(0), "{}", String::from_utf8_lossy(&r.stderr));
+        let j = rcsr::devlog::Json::parse(String::from_utf8_lossy(&r.stdout).trim()).unwrap();
+        train_rows.push(j.get("train_rows").and_then(|v| v.as_f64()).unwrap_or(f64::NAN));
+    }
+    assert!(train_rows[1] < train_rows[0], "train rows: normal {} sensitivity {}", train_rows[0], train_rows[1]);
+
+    // A gap longer than the training span is refused.
+    let r = rcsr_cmd::rcsr()
+        .args(["protocol", "selectors", "--windows", windows.to_str().unwrap(), "--label", "w1", "--time-col", "ts", "--gap-seconds", &(700 * TREND_DAY).to_string()])
+        .output()
+        .unwrap();
+    assert_eq!(r.status.code(), Some(2), "{}", String::from_utf8_lossy(&r.stderr));
+}
+
+// ---------------------------------------------------------------------------
 // Candle and price-action family (#261)
 // ---------------------------------------------------------------------------
 
