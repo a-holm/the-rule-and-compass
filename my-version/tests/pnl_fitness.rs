@@ -3,6 +3,8 @@
 
 #[path = "common/rcsr.rs"]
 mod rcsr_cmd;
+#[path = "common/shape.rs"]
+mod shape;
 
 use rcsr::data::TradingSlice;
 use rcsr::devlog::Json;
@@ -486,10 +488,7 @@ fn one_block_is_the_unblocked_fitness() {
     assert_eq!(at(&a, &["search_fitness"]).get("book_hash"), at(&b, &["search_fitness"]).get("book_hash"));
     assert!(at(&b, &["search_fitness"]).get("blocks").is_none());
     assert!(pareto(&b).iter().all(|m| at(m, &["fitness"]).get("block_regret").is_none()));
-    assert_eq!(
-        String::from_utf8_lossy(&plain.stdout).replace(|c: char| c.is_ascii_digit() || c == '.', ""),
-        String::from_utf8_lossy(&one.stdout).replace(|c: char| c.is_ascii_digit() || c == '.', "")
-    );
+    assert_eq!(without_digits(&plain), without_digits(&one));
 }
 
 #[test]
@@ -1175,7 +1174,7 @@ fn archive_hash(log: &std::path::Path) -> String {
 }
 
 fn without_digits(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stdout).replace(|c: char| c.is_ascii_digit() || c == '.', "")
+    shape::timing_free_shape(&json(o))
 }
 
 #[test]

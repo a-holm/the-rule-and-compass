@@ -12,6 +12,8 @@ const T0: i64 = 1_600_000_000;
 const STEP: i64 = 900;
 const N: usize = 400;
 
+#[path = "common/shape.rs"]
+mod shape;
 #[path = "common/scratch.rs"]
 mod scratch;
 use scratch::Scratch;
@@ -590,11 +592,10 @@ fn walk(dir: &Path, data: &str, extra: &[&str]) -> Json {
     read_json(&out_path)
 }
 
-/// The report without its timing ledger, digits removed.
+/// The report without timing members, numbers masked.
 fn digits_stripped(j: &Json) -> String {
-    let Json::Obj(members) = j else { panic!("report is not an object") };
-    let kept: Vec<_> = members.iter().filter(|(k, _)| k != "ledger").collect();
-    format!("{kept:?}").chars().filter(|c| !c.is_ascii_digit()).collect()
+    assert!(matches!(j, Json::Obj(_)), "report is not an object");
+    shape::timing_free_shape(j)
 }
 
 #[test]
@@ -878,8 +879,7 @@ fn old_runs_keep_the_threshold_book_in_ladder_and_ablation() {
     std::fs::write(&old_path, without_band_keys(&std::fs::read_to_string(&plain).unwrap())).unwrap();
     let (a, b) = (ladder_sr(&dir, &data, &spec, &windows, &plain, "plain"), ladder_sr(&dir, &data, &spec, &windows, &old_path, "old"));
     assert!(at(&a, &["sr_run"]).get("policy").is_none());
-    let strip = |j: &Json| format!("{j:?}").chars().filter(|c| !c.is_ascii_digit()).collect::<String>();
-    assert_eq!(strip(at(&a, &["rungs"])), strip(at(&b, &["rungs"])));
+    assert_eq!(shape::timing_free_shape(at(&a, &["rungs"])), shape::timing_free_shape(at(&b, &["rungs"])));
     let (a, b) = (
         ablation_score(&dir, &data, &windows, "--from-run", &plain, "plain"),
         ablation_score(&dir, &data, &windows, "--from-run", &old_path, "old"),

@@ -1722,6 +1722,9 @@ pub struct Prepared {
     pub keys: Option<RowKeys>,
     /// #263: time, group, return and funding of the validation and test rows.
     pub trading: Option<TradingSplit>,
+    /// #948: the book row sets when some rows have no fit label: every row with a
+    /// finite book return. `None` when every book row has a fit label.
+    pub book: Option<BookRows>,
     /// Adjacent-row pairs of every sample (see [`Sample::pairs`]), kept so the
     /// `slope` metric can adopt them through [`Prepared::require_slope_pairs`].
     pub slope_pairs: SlopePairs,
@@ -1742,6 +1745,18 @@ pub struct TradingColumns {
     /// #493: also build the cross-section context of the validation and test
     /// blocks: rows that only a missing label or return removed.
     pub cross_section: bool,
+    /// #948: keep rows whose fit label is missing but whose return is finite; they
+    /// join the book samples and leave every fit input. Needs `return_column`.
+    pub book_rows: bool,
+}
+
+/// #948: the rows the books price, a superset of the fit rows. A row without a fit
+/// label has `y = NaN`; the trading slices align with these samples.
+#[derive(Clone, Default)]
+pub struct BookRows {
+    pub train: Sample,
+    pub validation: Option<Sample>,
+    pub test: Sample,
 }
 
 /// One slice of the trading rows, aligned with the sample rows.
@@ -3149,6 +3164,16 @@ fn prepare_full_targets_weighted_inner(
         );
     }
 
+    // #948: rows whose fit label is the only missing cell and whose book return is
+    // finite stay in the book. Only `--fill none` and `--fill drop` leave a label gap.
+    let book_only: Vec<bool> = match book_return(spec, filtered) {
+        Some(ret) if nt == 1 && matches!(prep.fill, FillMethod::None | FillMethod::Drop) => (0..n)
+            .map(|r| ret[r].is_finite() && cell(&cells, r, nv).is_nan() && (0..nv).all(|k| cell(&cells, r, k).is_finite()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let label_gap_kept = |r: usize| book_only.get(r).copied().unwrap_or(false);
+
     // 2. Missing values.
     match prep.fill {
         FillMethod::None => {
@@ -3160,7 +3185,9 @@ fn prepare_full_targets_weighted_inner(
             let mut detail: Vec<String> = Vec::new();
             let mut total = 0usize;
             for (k, &c) in used_cols.iter().enumerate() {
-                let missing = (0..n).filter(|&r| cell(&cells, r, k).is_nan()).count();
+                let missing = (0..n)
+                    .filter(|&r| cell(&cells, r, k).is_nan() && !(k == nv && label_gap_kept(r)))
+                    .count();
                 if missing > 0 {
                     total += missing;
                     let name = t
@@ -3182,7 +3209,7 @@ fn prepare_full_targets_weighted_inner(
         }
         FillMethod::Drop => {
             for r in 0..n {
-                if (0..nc).any(|k| cell(&cells, r, k).is_nan()) {
+                if !label_gap_kept(r) && (0..nc).any(|k| cell(&cells, r, k).is_nan()) {
                     keep[r] = false;
                     rows_dropped_missing += 1;
                     label_only_drop[r] = (0..nv).all(|k| cell(&cells, r, k).is_finite());
@@ -3435,6 +3462,44 @@ fn prepare_full_targets_weighted_inner(
         }
     }
 
+    // #948: the books price every row with a finite return; the fit and every
+    // statistic below read only the rows that also have a fit label.
+    let mut book_idx: Option<BookIdx> = None;
+    if book_only.iter().any(|&b| b) {
+        let fit_less: Vec<bool> = (0..n).map(|r| keep[r] && cell(&cells, r, nv).is_nan()).collect();
+        let test_union: Vec<usize> = fold_idx.iter().flatten().copied().collect();
+        if train_idx.iter().chain(&validation_idx).chain(&test_union).any(|&i| fit_less[i]) {
+            book_idx = Some(BookIdx {
+                train: train_idx.clone(),
+                validation: validation_idx.clone(),
+                test: test_union.clone(),
+            });
+            train_idx.retain(|&i| !fit_less[i]);
+            validation_idx.retain(|&i| !fit_less[i]);
+            for f in fold_idx.iter_mut() {
+                f.retain(|&i| !fit_less[i]);
+            }
+            fold_idx.retain(|f| !f.is_empty());
+            let b = book_idx.as_ref().expect("set above");
+            for (block, book_rows, fit_rows) in [
+                ("training", b.train.len(), train_idx.len()),
+                ("validation", b.validation.len(), validation_idx.len()),
+                ("test", b.test.len(), fold_idx.iter().map(|f| f.len()).sum()),
+            ] {
+                if book_rows > 0 && fit_rows == 0 {
+                    return Err(format!(
+                        "target spec: every fit label is NaN in the {} block ({} book rows have a finite return)",
+                        block, book_rows
+                    ));
+                }
+            }
+            report.train_rows = train_idx.len();
+            report.validation_rows = validation_idx.len();
+            report.test_rows = fold_idx.iter().map(|f| f.len()).sum();
+            report.folds = fold_idx.len().max(1);
+        }
+    }
+
     // `cells` is the single prepared copy: inputs in `0..nv`, targets after.
     // The samples below normalise out of it directly instead of keeping another
     // row-major copy (the old `x_vals`/`y_vals`).
@@ -3548,13 +3613,17 @@ fn prepare_full_targets_weighted_inner(
     if spec.canonical_train_order {
         let gid: Option<Vec<usize>> = spec.group_col.map(|gc| group_ids(filtered, gc).0);
         let tkeys = spec.time_col.map(|tc| time_keys(filtered, tc));
-        train_idx.sort_by(|&a, &b| {
+        let order = |a: usize, b: usize| {
             let ga = gid.as_ref().map_or(0, |g| g[a]);
             let gb = gid.as_ref().map_or(0, |g| g[b]);
             ga.cmp(&gb)
                 .then_with(|| tkeys.as_ref().map_or(std::cmp::Ordering::Equal, |k| k.cmp(a, b)))
                 .then(a.cmp(&b))
-        });
+        };
+        train_idx.sort_by(|&a, &b| order(a, b));
+        if let Some(b) = book_idx.as_mut() {
+            b.train.sort_by(|&x, &y| order(x, y));
+        }
     }
     let train = make(&train_idx);
     let validation = if validation_idx.is_empty() {
@@ -3622,17 +3691,24 @@ fn prepare_full_targets_weighted_inner(
             test: pick(&test_idx),
         }
     });
+    let book = book_idx.as_ref().map(|b| BookRows {
+        train: make(&b.train),
+        validation: (!b.validation.is_empty()).then(|| make(&b.validation)),
+        test: make(&b.test),
+    });
     let trading = match &spec.trading {
         Some(cols) => Some(build_trading(
             cols,
             spec,
             filtered,
-            &train_idx,
-            &validation_idx,
-            &test_idx,
-            &train,
-            validation.as_ref(),
-            &test,
+            match &book_idx {
+                Some(b) => (&b.train[..], &b.validation[..], &b.test[..]),
+                None => (&train_idx[..], &validation_idx[..], &test_idx[..]),
+            },
+            match &book {
+                Some(b) => (&b.train, b.validation.as_ref(), &b.test),
+                None => (&train, validation.as_ref(), &test),
+            },
             (&validation_context_idx, validation_context.as_ref()),
             (&test_context_idx, test_context.as_ref()),
         )?),
@@ -3658,6 +3734,7 @@ fn prepare_full_targets_weighted_inner(
     Ok(Prepared {
         keys,
         trading,
+        book,
         slope_pairs,
         target_scale,
         train,
@@ -4626,17 +4703,27 @@ fn sorted_by(keys: &TimeKeys) -> Vec<usize> {
     order
 }
 
+/// #948: the row ids of the book samples.
+struct BookIdx {
+    train: Vec<usize>,
+    validation: Vec<usize>,
+    test: Vec<usize>,
+}
+
+/// #948: the book return column of the training table, when book rows are requested.
+fn book_return(spec: &SplitSpec, t: &Table) -> Option<Vec<f64>> {
+    let cols = spec.trading.as_ref().filter(|c| c.book_rows)?;
+    let j = t.index_of(cols.return_column.as_deref()?).ok()?;
+    t.numeric[j].then(|| t.col(j).to_vec())
+}
+
 /// Time, group, return and funding of the validation and test rows (#263).
 fn build_trading(
     cols: &TradingColumns,
     spec: &SplitSpec,
     filtered: &Table,
-    train_idx: &[usize],
-    validation_idx: &[usize],
-    test_idx: &[usize],
-    train: &Sample,
-    validation: Option<&Sample>,
-    test: &Sample,
+    (train_idx, validation_idx, test_idx): (&[usize], &[usize], &[usize]),
+    (train, validation, test): (&Sample, Option<&Sample>, &Sample),
     validation_context: (&[usize], Option<&Sample>),
     test_context: (&[usize], Option<&Sample>),
 ) -> Result<TradingSplit, String> {
@@ -5934,6 +6021,7 @@ mod tests {
                 funding_column: None,
                 train,
                 cross_section: false,
+                book_rows: false,
             }),
             canonical_train_order: canonical,
             ..Default::default()
@@ -5952,6 +6040,77 @@ mod tests {
             &PrepSpec::default(),
         )
         .unwrap()
+    }
+
+    /// #948: fit label NaN where `id % 9 == 0`, book return NaN where `id % 18 == 0`.
+    fn book_rows_fixture() -> Table {
+        let (groups, steps) = (3usize, 50usize);
+        let mut s = String::from("t,g,x,r,s,y\n");
+        let mut id = 0usize;
+        for step in 0..steps {
+            for g in 0..groups {
+                let r = if id % 18 == 0 { "nan".to_string() } else { format!("{}", 0.001 * ((id * 7) % 11) as f64 - 0.004) };
+                let y = if id % 9 == 0 { "nan".to_string() } else { format!("{}", (id as f64).sin()) };
+                s.push_str(&format!("{},g{},{},{},{},{}\n", step, g, id, r, 1 + id % 5, y));
+                id += 1;
+            }
+        }
+        table(&s)
+    }
+
+    fn book_rows_prepare(t: &Table, book_rows: bool) -> Prepared {
+        let mut spec = trading_spec(true, true, t);
+        spec.trading.as_mut().unwrap().book_rows = book_rows;
+        let vars = vec!["x".to_string()];
+        let prep = PrepSpec { fill: FillMethod::Drop, ..PrepSpec::default() };
+        prepare_full_targets_weighted_with_indices(t, &vars, &["y"], None, &spec, &mut Mt::new(3), &prep).unwrap()
+    }
+
+    #[test]
+    fn book_rows_are_the_finite_returns_and_fit_rows_the_finite_labels() {
+        let t = book_rows_fixture();
+        let plain = book_rows_prepare(&t, false);
+        assert!(plain.book.is_none());
+        let p = book_rows_prepare(&t, true);
+        let book = p.book.as_ref().expect("fit-less rows with a finite return exist");
+        let id_of = |sample: &Sample, k: usize| (sample.x[k][0] * p.stds[0] + p.means[0]).round() as usize;
+        let slice = p.trading.as_ref().unwrap().train.as_ref().unwrap();
+        assert_eq!(slice.ret.len(), book.train.len());
+        assert_eq!(slice.rows.time.len(), book.train.len());
+        let mut book_ids = Vec::new();
+        for k in 0..book.train.len() {
+            let id = id_of(&book.train, k);
+            assert!(slice.ret[k].is_finite(), "book row {id} has a finite return");
+            assert_ne!(id % 18, 0, "a row with neither label nor return is not a book row");
+            assert_eq!(book.train.y[k].is_nan(), id % 9 == 0, "row {id}");
+            book_ids.push(id);
+        }
+        let fit_ids: Vec<usize> = (0..p.train.len()).map(|k| id_of(&p.train, k)).collect();
+        assert!(p.train.y.iter().all(|y| y.is_finite()));
+        assert!(fit_ids.iter().all(|id| id % 9 != 0));
+        let expected_fit: Vec<usize> = book_ids.iter().copied().filter(|id| id % 9 != 0).collect();
+        assert_eq!(fit_ids, expected_fit, "the fit rows are the book rows with a label, in the same order");
+        assert!(book_ids.len() > fit_ids.len());
+        assert_eq!(p.report.train_rows, p.train.len());
+        let plain_ids: Vec<usize> = (0..plain.train.len()).map(|k| (plain.train.x[k][0] * plain.stds[0] + plain.means[0]).round() as usize).collect();
+        assert!(plain_ids.iter().all(|id| id % 9 != 0));
+    }
+
+    #[test]
+    fn book_rows_leave_the_fit_samples_and_statistics_unchanged() {
+        let t = book_rows_fixture();
+        let plain = book_rows_prepare(&t, false);
+        let p = book_rows_prepare(&t, true);
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+        assert_eq!(bits(&plain.means), bits(&p.means));
+        assert_eq!(bits(&plain.stds), bits(&p.stds));
+        assert_eq!(bits(&plain.train.y), bits(&p.train.y));
+        assert_eq!(plain.train.x.len(), p.train.x.len());
+        for (a, b) in plain.train.x.iter().zip(&p.train.x) {
+            assert_eq!(bits(a), bits(b));
+        }
+        assert_eq!(plain.train_indices, p.train_indices);
+        assert_eq!(bits(&plain.test.y), bits(&p.test.y));
     }
 
     #[test]

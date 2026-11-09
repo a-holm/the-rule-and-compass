@@ -1460,7 +1460,7 @@ rcsr --data dev.rcsb --target lbl_h24_y --book-target lbl_h1_y --target-spec dev
 ```
 
 * The book spec supplies `return_column`, `horizon_seconds`, `entry_offset_seconds`, `cost_bps` and `cost_in_label`. Rows of one group closer than the book horizon exit 2, so an hourly book can sit on a daily fit label. Without the flag the same command exits 2 on the overlap of the daily label.
-* The row sets are those of the fit label: a row with a NaN fit label leaves the fit and the book alike.
+* The book rows are the rows with a finite book return. A row with a NaN fit label stays in the fitness, validation and test books and gets a position. The constant fit, `--weight` and `--fit-rows` read only the rows with a finite fit label, and the centre and scale statistics use those rows. `train_rows`, `validation_rows` and `test_rows` count fit rows; `search_fitness.rows` counts book rows. A block whose fit labels are all NaN exits 2 and names the block. The device search does not support separate fit rows: a CUDA build reports the backend reason and runs the search on the CPU.
 * The purge at the test boundary and the validation boundary is the larger `required_purge_seconds` of the two specs, so no training row has a fit or book label window that reaches the validation or test block.
 * `--book-target` equal to `--target` is the plain run. A column missing from the spec file, a label that is not `forward_return`, multiple targets or no trading `--objective` exit 2. A book label or its construction columns in `--vars` exit 5 like the fit label.
 * `--json` adds `objective.book_target` and `search_fitness.book_target` only when the book label differs from `--target`. The book hash covers the book returns, so resuming with another book column exits 2.
