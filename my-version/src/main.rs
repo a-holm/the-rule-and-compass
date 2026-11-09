@@ -6484,7 +6484,8 @@ fn main() {
     // #928: a re-selection reads a finished front and runs no generation.
     let mut reselected_from: Option<String> = None;
     let mut reselect_outcome: Option<search::Outcome> = None;
-    if let (Some(path), Some(cp)) = (&reselect_path, resume_checkpoint.take()) {
+    if let Some(path) = &reselect_path {
+        let cp = resume_checkpoint.take().expect("--reselect loads its checkpoint with the resume path");
         let sha = rcsr::manifest::sha256_file(path).unwrap_or_else(|e| {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);

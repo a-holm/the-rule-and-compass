@@ -228,10 +228,12 @@ fn resume_at_saved_generations_selects_same_finalist() {
     ok(&fx.reselect("a", "b", ROBUST));
     let saved = at(&fx.run_json("a"), &["generations_run"]).as_usize().unwrap().to_string();
     let (ck, out) = (fx.path("a.ckpt"), fx.path("r.run.json"));
-    let mut args = vec!["--resume", ck.as_str(), "--generations", saved.as_str(), "--json-out", out.as_str(), "--no-dev-log"];
+    let log = fx.path("r.dev.ndjson");
+    let mut args = vec!["--resume", ck.as_str(), "--generations", saved.as_str(), "--json-out", out.as_str(), "--dev-log", log.as_str()];
     args.extend_from_slice(ROBUST);
     ok(&fx.rcsr(&fx.data, &args));
     assert_eq!(finalist(&fx.run_json("b")), finalist(&fx.run_json("r")));
+    assert_eq!(generation_events(&fx, "r"), 0, "the resume had no generation left to run");
 }
 
 #[test]
@@ -242,9 +244,11 @@ fn select_rule_not_in_config_hash() {
     assert_eq!(checkpoint_line(&fx, "plain", "config_hash "), checkpoint_line(&fx, "rule", "config_hash "));
     let ck = fx.path("plain.ckpt");
     let out = fx.path("again.run.json");
-    let mut args = vec!["--resume", ck.as_str(), "--json-out", out.as_str(), "--no-dev-log"];
+    let log = fx.path("again.dev.ndjson");
+    let mut args = vec!["--resume", ck.as_str(), "--json-out", out.as_str(), "--dev-log", log.as_str()];
     args.extend_from_slice(ROBUST);
     ok(&fx.rcsr(&fx.data, &args));
+    assert_eq!(generation_events(&fx, "again"), 0, "the resume continued the checkpoint");
     let refused = fx.rcsr(&fx.data, &["--resume", ck.as_str(), "--pop", "64", "--no-dev-log"]);
     assert_eq!(code(&refused), 2, "{}", stderr(&refused));
 }
