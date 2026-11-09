@@ -758,10 +758,11 @@ fn ladder_sr(dir: &Path, data: &str, spec: &str, windows: &str, run: &str, tag: 
 
 fn ablation_score(dir: &Path, data: &str, windows: &str, mode: &str, run: &str, tag: &str) -> Json {
     let out_path = dir.join(format!("ablation-{tag}.json")).to_string_lossy().into_owned();
-    let out = rcsr(&[
-        "ablation", "score", mode, run, "--data", data, "--target", "y", "--time", "t", "--windows", windows,
-        "--purge-seconds", "900", "--thresholds", "0.5", "--headline-threshold", "0.5", "--out", &out_path,
-    ]);
+    let mut args = vec!["ablation", "score", mode, run, "--data", data, "--target", "y", "--time", "t", "--windows", windows, "--purge-seconds", "900", "--out", &out_path];
+    if mode == "--run" {
+        args.extend(["--thresholds", "0.5", "--headline-threshold", "0.5"]);
+    }
+    let out = rcsr(&args);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     read_json(&out_path)
 }
