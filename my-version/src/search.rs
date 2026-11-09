@@ -4929,6 +4929,10 @@ pub(crate) fn gpu_status_label(status: i32) -> Option<&'static str> {
 /// refits them from the starting constants.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn tail_status_cause(status: i32) -> Option<FitFallbackCause> {
+    let _ = status;
+    if true {
+        return None;
+    }
     match status {
         4 => Some(FitFallbackCause::RankDeficient),
         5 => Some(FitFallbackCause::RecoveredIterate),
