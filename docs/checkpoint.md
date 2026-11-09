@@ -291,7 +291,7 @@ The one place `--threads` meets a routing rule is the start of a fresh run: with
 given, else 8). The resolved strategy is saved, and a resume does not resolve it
 again.
 
-The time budget is saved with the checkpoint (`config time_budget`). A `--resume` without `--time-budget` runs with the saved budget, not with none; `--time-budget` replaces it for this process, and the next checkpoint saves the budget in force. A resume prints `# checkpoint: time budget <s> s (saved with the checkpoint)` or `(from --time-budget)`, and nothing when no budget applies.
+The time budget is a property of one process (#966). A `--resume` takes it only from its own `--time-budget`; without the flag the resumed process has no budget, whatever the checkpoint saved. The file still records the budget of the process that wrote it (`config time_budget`), and the field is read but not used. A resume with a budget prints `# checkpoint: time budget <s> s (from --time-budget)`; without one it prints nothing.
 
 Limits:
 

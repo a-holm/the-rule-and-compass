@@ -1151,8 +1151,8 @@ fn resume_under_another_cpu_count_is_allowed() {
     assert_eq!(std::fs::read(&ck).unwrap(), std::fs::read(&whole).unwrap());
 }
 
-/// #880: a resume names the time budget it runs with, and without `--time-budget` that is
-/// the budget saved in the checkpoint.
+/// #880, #966: a resume names the time budget it runs with, which is only the one on its own
+/// command line; the budget saved in the checkpoint is not used.
 #[test]
 fn a_resume_prints_the_time_budget_it_uses() {
     let csv = TempPath::new("budget.csv");
@@ -1186,11 +1186,13 @@ fn a_resume_prints_the_time_budget_it_uses() {
     assert!(first.status.success(), "{:?}", first);
     assert!(budget_lines(&first).is_empty(), "a fresh run prints no resume line");
 
-    let inherited = run(&["--resume", ck.as_str()]);
-    assert!(inherited.status.success(), "{:?}", inherited);
-    assert_eq!(budget_lines(&inherited), ["# checkpoint: time budget 0 s (saved with the checkpoint)"]);
-    assert_eq!(stop(), ("time_budget".to_string(), "2".to_string()));
+    let unlimited = run(&["--resume", ck.as_str()]);
+    assert!(unlimited.status.success(), "{:?}", unlimited);
+    assert!(budget_lines(&unlimited).is_empty(), "the saved budget is not inherited");
+    assert_eq!(stop(), ("generations".to_string(), "6".to_string()));
 
+    let first = run(&["--time-budget", "0"]);
+    assert!(first.status.success(), "{:?}", first);
     let replaced = run(&["--resume", ck.as_str(), "--time-budget", "100000"]);
     assert!(replaced.status.success(), "{:?}", replaced);
     assert_eq!(budget_lines(&replaced), ["# checkpoint: time budget 100000 s (from --time-budget)"]);
@@ -1209,6 +1211,59 @@ fn a_resume_prints_the_time_budget_it_uses() {
     ]);
     assert!(resumed.status.success(), "{:?}", resumed);
     assert!(budget_lines(&resumed).is_empty(), "no budget, no line");
+}
+
+/// #966: a checkpoint saved under `saved_budget`, resumed with `resume_extra`.
+/// Returns `(exit success, stop_reason, generations_run)` of the resume.
+fn resume_after_budget(tag: &str, saved_budget: &str, resume_extra: &[&str]) -> (bool, String, String) {
+    let csv = TempPath::new(&format!("{tag}.csv"));
+    std::fs::write(&csv.0, line_csv(60)).expect("write csv");
+    let ck = TempPath::new(&format!("{tag}.rcsr"));
+    let out = TempPath::new(&format!("{tag}.json"));
+    let run = |extra: &[&str]| -> Output {
+        let mut args = vec![
+            "--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "5", "--pop", "30",
+            "--max-complexity", "8", "--cpu", "--no-dev-log", "--generations", "6", "--save",
+            ck.as_str(), "--json-out", out.as_str(),
+        ];
+        args.extend_from_slice(extra);
+        rcsr(&args)
+    };
+    let first = run(&["--time-budget", saved_budget]);
+    assert!(first.status.success(), "{:?}", first);
+    let saved = Checkpoint::load(std::path::Path::new(ck.as_str())).expect("saved checkpoint");
+    assert!(saved.generations < 6, "the saved budget must stop the first run early");
+    let mut extra = vec!["--resume", ck.as_str()];
+    extra.extend_from_slice(resume_extra);
+    let resumed = run(&extra);
+    let json = std::fs::read_to_string(&out.0).unwrap();
+    let reason = json.split("\"stop_reason\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let gens = json.split("\"generations_run\":").nth(1).unwrap().split(',').next().unwrap().to_string();
+    (resumed.status.success(), reason, gens)
+}
+
+/// #966: a resume without `--time-budget` has no budget, whatever was saved.
+#[test]
+fn resume_without_time_budget_flag_is_unlimited() {
+    let (ok, reason, gens) = resume_after_budget("unlimited", "0.000000001", &[]);
+    assert!(ok);
+    assert_eq!((reason.as_str(), gens.as_str()), ("generations", "6"));
+}
+
+/// #966: `--time-budget` on the resume line still limits that process.
+#[test]
+fn resume_with_time_budget_flag_uses_it() {
+    let (ok, reason, _) = resume_after_budget("flagged", "0", &["--time-budget", "0"]);
+    assert!(ok);
+    assert_eq!(reason, "time_budget");
+}
+
+/// #966: a checkpoint saved under budget 0 resumes to `--generations` with exit code 0.
+#[test]
+fn resume_of_zero_budget_checkpoint_runs_to_generations() {
+    let (ok, reason, gens) = resume_after_budget("zero", "0", &[]);
+    assert!(ok);
+    assert_eq!((reason.as_str(), gens.as_str()), ("generations", "6"));
 }
 
 /// #855: `chunks` one-generation chunks (a zero `--time-budget` stops after one
