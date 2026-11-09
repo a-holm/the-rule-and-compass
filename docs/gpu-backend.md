@@ -1293,7 +1293,8 @@ and the whole fit stage's `host_seconds` (with the `gate_s` subset, #498); the r
 accepted/fallback/refit totals. Ledger invariant: `screened + admitted_wide >= attempts`. Below the wide threshold `admitted_wide` is 0 and every attempt was screened; under wide admission only constant-free candidates are screened and every other pending candidate is counted in `admitted_wide`.
 
 **Parallel fallback batch and its bound (#255).** The exact CPU refits are
-independent per candidate and are therefore split across scoped workers with
+independent per candidate. The serial arm (`RCSR_FIT_TAIL_SERIAL=1`, below)
+splits them across scoped workers with
 the same fixed-order pattern as the finalist refits in `full_data_archive`:
 `ceil(n / workers)` contiguous jobs per worker, one thread-local block registry
 per worker, and the fitted trees written back by their original island/slot in
@@ -1316,6 +1317,8 @@ generation carries `fit_fallback_seconds`, `fit_fallback_bounded` and
 `fit_fallback_workers`. `fallback_seconds` is a **subset** of `host_seconds`
 (kernel + launch + fallback + write-back), so the phase ledger still closes
 without double counting.
+
+**Tail overlap (#958).** By default the exact CPU fallback fits run on the persistent fallback pool beside the device work instead of after it. In the synchronous fit stage the plan rejects (unsupported plan, too many constants, metric not native, single class, affine closed form, dispatch refusals) are submitted before the device launch, so they run while the LM kernel runs; the device fallbacks (statuses `1`, `2`, `4`, `5`, `7`, `9`, gate verdicts, a failed launch) are submitted as soon as the batch is read, and the stage joins them before it re-scores the admitted set. On the overlap pipeline each device call submits its fallbacks when it is read and the generation barrier joins them. The synchronous stage submits only the first `--fit-fallback-max` fallbacks; the pipeline submits fallbacks as they come, at most `--fit-fallback-max` per generation, and the barrier keeps an early fit only inside the refit prefix of its sorted order and refits the rest of that prefix itself. Every fit starts from the tree the serial arm refits (the starting constants for statuses `4`, `5`, `7` and `9`, the finite device constants for the other statuses, the incoming constants for a plan reject or a failed launch) on the same rows, so trees, errors, archive and per-cause counts are bit-identical to the serial arm (`gpu::fit_tail_tests::tail_fit_overlap_equals_serial_routing` compares every generation snapshot on the narrow and wide synchronous paths, the pipeline and a binding `--fit-fallback-max`). The pool gives each submitted batch its own result channel, so the `+inf` check passes (#857) and the fallback fits can be in flight together; fits queue behind check passes submitted before them, and a submission that blocks on the full queue counts as join wait. `RCSR_FIT_TAIL_SERIAL=1` runs the serial arm after the device batch instead, for an A/B run. `gpu.fit.tail_overlap_s` and `gpu.ledger.fit.tail_overlap_s` are the seconds at least one fallback batch was in flight between the return of its submission and the start of the join, `tail_join_wait_s` the main-thread seconds spent waiting for the pool (a submission blocked behind a full queue, and the join), and `fallback_seconds = tail_overlap_s + tail_join_wait_s`; only the join wait is inside the exclusive fit host window. The serial arm books its whole fallback time as join wait. `--fit-report` prints both after `fallback_s`. The overlap can hide at most the device work that runs after a fallback is submitted. On the synchronous path the plan rejects run beside the LM kernel; the device fallbacks are known only when the batch is read and the re-score needs them next, so they gain the pool's dynamic hand-out (one fit per chunk while the batch is small) over the serial arm's fixed per-worker chunks, not overlap. On the overlap pipeline the fallbacks of one device call run beside the later calls and the island threads.
 
 Measured on the fit-heavy pinned cell (`tests/gpu_fit.rs::bench_end_to_end`:
 154 000 rows, 21 variables, 4 islands × pop 256, 5 generations, `--fit-iters 8`,
@@ -1514,9 +1517,10 @@ for the metric-specific gated arms (`log_loss`, rank, median, interquartile,
 maximum), the synchronous generation batch is still used. Selection and the
 archive still wait at the generation barrier, so all errors, the archive hash
 and the exact CPU finalist are unchanged; `--pipeline-depth 0` remains the
-synchronous schedule. The exact CPU fallback refits of a generation run at the
-barrier in the synchronous admission order, so `--fit-fallback-max` bounds them
-the same way on both paths, and a fallback after a non-usable device status
+synchronous schedule. The exact CPU fallback refits of a generation start on the
+fallback pool as each device call is read (#958) and are applied at the barrier
+in the synchronous admission order, so `--fit-fallback-max` bounds them the same
+way on both paths, and a fallback after a non-usable device status
 starts from the finite device constants. A candidate rejected by
 `--require-dimensions` is not offered to the queue.
 

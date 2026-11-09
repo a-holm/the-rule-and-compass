@@ -747,7 +747,11 @@ SEARCH:
   --fit-fallback-max <N>     hard per-generation bound on exact CPU fallback
                              refits for --fit-strategy gpu (default 4096,
                              0 = unbounded). Fallbacks beyond the bound keep
-                             their finite device constants and are counted
+                             their finite device constants and are counted.
+                             The refits run on the CPU fallback pool beside
+                             the device work (same trees as after it);
+                             RCSR_FIT_TAIL_SERIAL=1 runs them after the
+                             device batch
   --fit-polish <f64|f32|off>  arithmetic of the device fit kernel's polish, the
                              undamped Gauss-Newton steps after the damped LM
                              (default f64). f64 re-baselines and steps on the
@@ -1491,7 +1495,7 @@ fn ledger_json(
         rcsr::gpu_stats::Ratio::undefined(f64::NAN, f64::NAN, "decades_per_gpu_hour", "run")
     };
     format!(
-        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"drain_wall_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"fallback_s\":{},\"gate_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"eval_check\":{{\"scope\":\"run\",\"units\":\"seconds\",\"leaf_of\":\"eval\",\"prefix_s\":{},\"pool_s\":{},\"slots\":{},\"trade_floor_slots\":{},\"bound_flat\":{},\"early_rows\":{},\"full_passes\":{},\"finite\":{}}},\"quality_per_gpu_hour\":{}}}",
+        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"drain_wall_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"fallback_s\":{},\"tail_overlap_s\":{},\"tail_join_wait_s\":{},\"gate_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"eval_check\":{{\"scope\":\"run\",\"units\":\"seconds\",\"leaf_of\":\"eval\",\"prefix_s\":{},\"pool_s\":{},\"slots\":{},\"trade_floor_slots\":{},\"bound_flat\":{},\"early_rows\":{},\"full_passes\":{},\"finite\":{}}},\"quality_per_gpu_hour\":{}}}",
         jnum(l.wall_s()),
         stages,
         jnum(l.stage_sum_s()),
@@ -1520,6 +1524,8 @@ fn ledger_json(
         jnum(l.fit_kernel_lm_s()),
         jnum(l.fit_kernel_polish_s()),
         jnum(l.fit_fallback_s()),
+        jnum(l.fit_tail_overlap_s()),
+        jnum(l.fit_tail_join_wait_s()),
         jnum(l.fit_gate_s()),
         jnum(l.refit_s()),
         l.refits(),
@@ -1669,7 +1675,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"carried_kept\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{},\"calls\":{},\"candidates\":{},\"call_s_max\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"carried_kept\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"tail_overlap_s\":{},\"tail_join_wait_s\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{},\"calls\":{},\"candidates\":{},\"call_s_max\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1692,6 +1698,8 @@ fn gpu_json(
         jstr(g.fit_polish.name()),
         jnum(g.fit_host_ms / 1000.0),
         jnum(g.fit_fallback_ms / 1000.0),
+        jnum(g.ledger.fit_tail_overlap_s()),
+        jnum(g.ledger.fit_tail_join_wait_s()),
         jnum(g.ledger.fit_gate_s()),
         g.fit_fallback_bounded,
         g.fit_fallback_workers,
@@ -7011,7 +7019,7 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(" ");
             eprintln!(
-                "# fit: gpu-fit screened={} admitted_wide={} admitted={} gpu={} fallback={} [{}] labels=[{}] refit_candidates={} refits={} refit_s={:.3} rescore_s={:.3} fallback_s={:.3} bounded={}/{} workers={}",
+                "# fit: gpu-fit screened={} admitted_wide={} admitted={} gpu={} fallback={} [{}] labels=[{}] refit_candidates={} refits={} refit_s={:.3} rescore_s={:.3} fallback_s={:.3} tail_overlap_s={:.3} tail_join_wait_s={:.3} bounded={}/{} workers={}",
                 g.fit_screened,
                 g.fit_admitted_wide,
                 g.fit_attempts,
@@ -7024,6 +7032,8 @@ fn main() {
                 g.fit_refit_s,
                 g.fit_rescore_s,
                 g.fit_fallback_ms / 1000.0,
+                g.ledger.fit_tail_overlap_s(),
+                g.ledger.fit_tail_join_wait_s(),
                 g.fit_fallback_bounded,
                 g.fit_fallback_max,
                 g.fit_fallback_workers
@@ -13203,9 +13213,11 @@ mod tests {
         g.ledger.record_fit(0.5, 0.75, 0.125);
         g.ledger.record_fit_polish_split(0.25);
         g.ledger.record_fit_gate(0.375);
+        // #958: the fallback seconds split into pool overlap and join wait.
+        g.ledger.record_fit_tail(0.0625, 0.0625);
         let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true, 10.0, None);
         assert!(
-            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"admitted_wide\":0,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"refit_candidates\":0,\"refit_s\":0,\"rescore_s\":0,\"carried_kept\":0,\"seconds\":0.25,\"kernel_lm_s\":0.5,\"kernel_polish_s\":0.25,\"polish\":\"f32\",\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"gate_s\":0.375,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096,\"fit_rows\":0,\"score_rows\":0,\"fit_twin_bytes\":0,\"subsample_hash\":null"),
+            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"admitted_wide\":0,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"refit_candidates\":0,\"refit_s\":0,\"rescore_s\":0,\"carried_kept\":0,\"seconds\":0.25,\"kernel_lm_s\":0.5,\"kernel_polish_s\":0.25,\"polish\":\"f32\",\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"tail_overlap_s\":0.0625,\"tail_join_wait_s\":0.0625,\"gate_s\":0.375,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096,\"fit_rows\":0,\"score_rows\":0,\"fit_twin_bytes\":0,\"subsample_hash\":null"),
             "{}",
             json
         );
