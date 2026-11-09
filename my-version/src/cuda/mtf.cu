@@ -532,19 +532,16 @@ __global__ void k_mtf_leaves(const long long *__restrict__ h_time,
 }
 
 /* #932: one thread per segment over its daily buckets. Mirrors
-   `trend::daily_leaves`: a bucket with fewer than `rows_per_day` base rows is
-   masked to NaN, moving averages and the 20-day volatility come from the same
-   block-compensated prefix arenas as the MTF leaves, extrema are sequential
-   window scans. */
+   `trend::daily_leaves`: every bucket is a daily bar, as for the MTF leaves;
+   moving averages and the 20-day volatility come from the same
+   block-compensated prefix arenas, extrema are sequential window scans. */
 __global__ void k_trend_leaves(const long long *__restrict__ h_time,
                                const double *__restrict__ h_high,
                                const double *__restrict__ h_low,
                                const double *__restrict__ h_close,
-                               const int *__restrict__ bucket_lo,
-                               int n, int total,
                                const int *__restrict__ seg_bs,
                                const int *__restrict__ seg_bl,
-                               int nseg, int rows_per_day, int cap,
+                               int nseg, int cap,
                                double *cm, double *him, double *lom,
                                double *ret1, double *s20,
                                double *ps, double *ps2, double *pc,
@@ -562,11 +559,9 @@ __global__ void k_trend_leaves(const long long *__restrict__ h_time,
 
     for (int p = 0; p < len; ++p) {
         int i = bs + p;
-        int end = (i + 1 < total) ? bucket_lo[i + 1] : n;
-        bool ok = (end - bucket_lo[i]) == rows_per_day;
-        cm[i] = (ok && isfinite(h_close[i])) ? h_close[i] : NAN;
-        him[i] = (ok && isfinite(h_high[i])) ? h_high[i] : NAN;
-        lom[i] = (ok && isfinite(h_low[i])) ? h_low[i] : NAN;
+        cm[i] = isfinite(h_close[i]) ? h_close[i] : NAN;
+        him[i] = isfinite(h_high[i]) ? h_high[i] : NAN;
+        lom[i] = isfinite(h_low[i]) ? h_low[i] : NAN;
         for (int k = 0; k < RC_TREND_LEAVES; ++k) leaf[(size_t)k * cap + i] = NAN;
     }
     for (int p = 0; p < len; ++p) {
@@ -622,8 +617,8 @@ __global__ void k_trend_leaves(const long long *__restrict__ h_time,
         }
         for (int k = 0; k < 4; ++k) {
             int span = 7 * weeks[k];
-            if (rc_contig_local(h_time, bs, p, span + 1, day) &&
-                ca.cn(q) - ca.cn(q - span - 1) == span + 1 && cm[i - span] > 0.0) {
+            if (rc_contig_local(h_time, bs, p, span + 1, day) && isfinite(cm[i]) &&
+                isfinite(cm[i - span]) && cm[i - span] > 0.0) {
                 leaf[(size_t)(11 + k) * cap + i] = cm[i] / cm[i - span] - 1.0;
             }
         }
@@ -994,10 +989,9 @@ static void trend_free(RcMtf *c)
 /* #932: compute the 27 trend leaves on the daily buckets of the last
    `rc_mtf_prepare(c, 86400)`. The join index of that pass is reused, so a
    later `rc_mtf_trend_gather` is a pure row map. */
-int rc_mtf_trend(RcMtf *c, int rows_per_day)
+int rc_mtf_trend(RcMtf *c)
 {
     if (!c || c->prepared_tf != RC_TREND_DAY) return 1;
-    if (rows_per_day <= 0) return 2;
     c->trend_ready = 0;
     stats_begin(c);
     int total = c->total_buckets;
@@ -1027,8 +1021,8 @@ int rc_mtf_trend(RcMtf *c, int rows_per_day)
     const int threads = 256;
     int sres = blocks_for(c->nseg, threads);
     rc_launch("k_trend_leaves", k_trend_leaves, sres, threads, 0, 0, c->d_h_time, c->d_h_high, c->d_h_low,
-              c->d_h_close, c->d_bucket_lo, c->n, total, c->d_seg_bucket_start,
-              c->d_seg_bucket_len, c->nseg, rows_per_day, c->trend_cap, c->d_tc, c->d_thi,
+              c->d_h_close, c->d_seg_bucket_start,
+              c->d_seg_bucket_len, c->nseg, c->trend_cap, c->d_tc, c->d_thi,
               c->d_tlo, c->d_tret, c->d_ts20, c->d_ps, c->d_ps2, c->d_pc, c->d_rs, c->d_rs2,
               c->d_rc, c->d_rs3, c->d_rs4, c->d_trend_leaf);
     cudaError_t err = cudaGetLastError();

@@ -872,6 +872,7 @@ pub fn test_ids(e: &RegistryEntry) -> Vec<&'static str> {
         "trend" => vec![
             "tests/enrich.rs::trend_columns_match_hand_built_daily_bars",
             "tests/enrich.rs::trend_every_column_is_nan_across_a_gap",
+            "tests/enrich.rs::trend_partial_day_is_a_daily_bar_as_in_mtf",
             "tests/enrich.rs::trend_join_is_causal_and_a_future_shift_is_caught",
             "tests/enrich.rs::trend_causal_under_future_edits_cpu",
             "tests/trend_gpu.rs::trend_gpu_matches_cpu",

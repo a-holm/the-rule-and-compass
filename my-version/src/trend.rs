@@ -4,10 +4,10 @@
 //!
 //! Every leaf is a function of closed UTC daily bars. A base row at time `t`
 //! sees the last daily bucket with `day + 86400 <= t`, and only when that
-//! bucket is the day before the day of `t`; the running day is never used. A
-//! daily bucket counts only when it holds every base bar of the day
-//! (`86400 / bar_seconds` rows): a partial or missing day makes every window
-//! that contains it `NaN`, and no value is forward-filled.
+//! bucket is the day before the day of `t`; the running day is never used.
+//! Daily bars follow the `mtf_1d_*` contract: every UTC day with at least one
+//! base bar is a bar built from the bars it has, a missing day is a gap, and
+//! every window that spans a gap is `NaN`; no value is forward-filled.
 //!
 //! The device path (`mtf_gpu.rs`, `cuda/mtf.cu`) reproduces this module bit
 //! for bit: the moving averages and the volatility use the compensated block
@@ -115,7 +115,7 @@ fn raw_first_index(l: Leaf) -> usize {
     }
 }
 
-/// First daily index with a finite value on gap-free complete days. A scaled
+/// First daily index with a finite value on a series without missing days. A scaled
 /// leaf also needs the 20 daily returns of its volatility (21 closes).
 pub fn first_finite_day(name: &str) -> Option<usize> {
     let l = leaf(name)?;
@@ -159,7 +159,7 @@ pub fn formula(name: &str) -> Option<String> {
 }
 
 pub const PIT_RULE: &str = "closed UTC daily bars only: day + 86400 <= t and the day before the day of t; \
-                            the running day is never used; a day without every base bar is missing; \
+                            the running day is never used; a day with any base bar is a daily bar (as mtf_1d_*); \
                             a missing day makes every window containing it NaN; no forward fill";
 
 pub fn parity_tier(name: &str) -> &'static str {
@@ -183,8 +183,8 @@ pub fn registry() -> Vec<RegistryEntry> {
             available: true,
             derived: false,
             parity_tier: parity_tier(name),
-            formula: format!("resample to complete UTC days; {}; causal close join", formula(name).unwrap_or_default()),
-            source: "base OHLC bars resampled to complete UTC days",
+            formula: format!("resample to UTC days; {}; causal close join", formula(name).unwrap_or_default()),
+            source: "base OHLC bars resampled to UTC days",
             pit: PIT_RULE,
             reason: None,
         })
@@ -293,23 +293,13 @@ pub fn check_bar(bar_seconds: i64) -> Result<usize, String> {
 
 /// Daily leaves of one symbol, `[leaf][day]` in [`TREND_NAMES`] order.
 ///
-/// `times` are the day starts of every daily bucket (including partial ones),
-/// `counts` the base rows in each bucket. A bucket with fewer than
-/// `rows_per_day` rows is masked to `NaN`.
-pub fn daily_leaves(
-    times: &[i64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    counts: &[usize],
-    rows_per_day: usize,
-) -> Vec<Vec<f64>> {
+/// `times` are the day starts of the daily bars (a missing day is a gap); a
+/// non-finite value is missing. The windows are the `mtf_1d_*` ones: a moving
+/// average or extremum needs every bar of its contiguous window, a momentum
+/// its two contiguous ends.
+pub fn daily_leaves(times: &[i64], high: &[f64], low: &[f64], close: &[f64]) -> Vec<Vec<f64>> {
     let n = times.len();
-    let mask = |x: &[f64]| -> Vec<f64> {
-        (0..n)
-            .map(|j| if counts[j] == rows_per_day && x[j].is_finite() { x[j] } else { f64::NAN })
-            .collect()
-    };
+    let mask = |x: &[f64]| -> Vec<f64> { x.iter().map(|v| if v.is_finite() { *v } else { f64::NAN }).collect() };
     let c = mask(close);
     let hi = mask(high);
     let lo = mask(low);
@@ -369,7 +359,7 @@ pub fn daily_leaves(
         }
         for (k, &weeks) in MOM_WEEKS.iter().enumerate() {
             let span = 7 * weeks;
-            if contig(j, span + 1) && ws.count(j, span + 1) == span + 1 && c[j - span] > 0.0 {
+            if contig(j, span + 1) && c[j].is_finite() && c[j - span].is_finite() && c[j - span] > 0.0 {
                 out[11 + k][j] = c[j] / c[j - span] - 1.0;
             }
         }
@@ -401,23 +391,14 @@ pub fn compute(base: &[Bar], bar_seconds: i64, requested: &[String]) -> Result<B
     if wanted.is_empty() {
         return Ok(out);
     }
-    let rows_per_day = check_bar(bar_seconds)?;
+    check_bar(bar_seconds)?;
     let tf = Timeframe::D1;
     let days = ohlcv::resample(base, tf)?;
-    let mut counts = vec![0usize; days.len()];
-    let mut k = 0usize;
-    for b in base {
-        let start = tf.bucket_start(b.time);
-        while days[k].time != start {
-            k += 1;
-        }
-        counts[k] += 1;
-    }
     let times: Vec<i64> = days.iter().map(|d| d.time).collect();
     let high: Vec<f64> = days.iter().map(|d| d.high).collect();
     let low: Vec<f64> = days.iter().map(|d| d.low).collect();
     let close: Vec<f64> = days.iter().map(|d| d.close).collect();
-    let leaves = daily_leaves(&times, &high, &low, &close, &counts, rows_per_day);
+    let leaves = daily_leaves(&times, &high, &low, &close);
     let joined = ohlcv::join_causal(base, &days, tf)?;
     let index: BTreeMap<i64, usize> = times.iter().enumerate().map(|(i, t)| (*t, i)).collect();
     let slot: Vec<Option<usize>> = joined
@@ -501,14 +482,13 @@ mod tests {
 
     #[test]
     fn leaf_formulas_on_a_short_flat_then_rising_series() {
-        // 400 complete days, close 100 for the first 380 days, then +1 per day.
+        // 400 days, close 100 for the first 380 days, then +1 per day.
         let n = 400usize;
         let times: Vec<i64> = (0..n as i64).map(|d| d * DAY).collect();
         let close: Vec<f64> = (0..n).map(|d| if d < 380 { 100.0 } else { 100.0 + (d - 379) as f64 }).collect();
         let high: Vec<f64> = close.iter().map(|c| c + 2.0).collect();
         let low: Vec<f64> = close.iter().map(|c| c - 2.0).collect();
-        let counts = vec![24usize; n];
-        let v = daily_leaves(&times, &high, &low, &close, &counts, 24);
+        let v = daily_leaves(&times, &high, &low, &close);
         // Flat window: every ratio, slope and momentum is exactly zero; the
         // volatility is zero, so the scaled leaves are NaN.
         let j = 379;
@@ -531,25 +511,24 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_day_masks_every_window_that_contains_it() {
-        let n = 300usize;
-        let times: Vec<i64> = (0..n as i64).map(|d| d * DAY).collect();
+    fn a_missing_day_masks_every_window_that_spans_it() {
+        // Day 100 is missing: index 100 holds day 101.
+        let times: Vec<i64> = (0..300i64).filter(|d| *d != 100).map(|d| d * DAY).collect();
+        let n = times.len();
         let close: Vec<f64> = (0..n).map(|d| 100.0 + (d as f64 * 0.3).sin()).collect();
         let high: Vec<f64> = close.iter().map(|c| c + 1.0).collect();
         let low: Vec<f64> = close.iter().map(|c| c - 1.0).collect();
-        let mut counts = vec![24usize; n];
-        counts[100] = 23;
-        let v = daily_leaves(&times, &high, &low, &close, &counts, 24);
-        // ma20_ratio: windows ending in 100..=119 contain day 100.
-        for j in 100..120 {
+        let v = daily_leaves(&times, &high, &low, &close);
+        // ma20_ratio: windows ending on days 101..=119 (indices 100..=118) span the gap.
+        for j in 100..119 {
             assert!(v[0][j].is_nan(), "ma20_ratio at {j}");
         }
-        assert!(v[0][99].is_finite() && v[0][120].is_finite());
-        // mom4w: windows [j-28, j] containing day 100 end in 100..=128.
-        for j in 100..=128 {
+        assert!(v[0][99].is_finite() && v[0][119].is_finite());
+        // mom4w: the end 28 days back is missing or not contiguous up to day 128.
+        for j in 100..128 {
             assert!(v[11][j].is_nan(), "mom4w at {j}");
         }
-        assert!(v[11][129].is_finite());
+        assert!(v[11][128].is_finite());
     }
 
     #[test]

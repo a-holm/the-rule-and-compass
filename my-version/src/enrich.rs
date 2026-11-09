@@ -9381,9 +9381,9 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
              slopes and momenta scaled by s20 * sqrt(T) (s20 = population sd of
              20 one-day simple returns). Every leaf reads closed UTC daily bars:
              a row at t sees the day before its own day, never the running day.
-             A day counts only when it holds every base bar (86400 / bar
-             seconds rows); a partial or missing day makes every window that
-             contains it NaN. The base bar must divide 86400 s (else exit 2);
+             Daily bars are the mtf_1d_* bars: a day with any base bar is a
+             bar built from the bars it has; a missing day makes every window
+             that contains it NaN. The base bar must divide 86400 s (else exit 2);
              an unknown trend_* name exits 2. A store with the family declares
              a lookback embargo of 31622400 s (trend_mom52w, 366 days). With
              --features cuda the family shares the MTF daily resample and join

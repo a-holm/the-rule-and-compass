@@ -513,8 +513,9 @@ atomically instead of streaming it. See
   masks, the opt-in `trend` group (#932, not in the default set) adds 27
   long-term columns on closed UTC days (20/50/100/200-day MA ratios and
   slopes, the 52-week Donchian position and distances, 4 to 52 week momentum
-  and their `_z` versions scaled by the 20-day volatility; a partial or
-  missing day is `NaN`, a store with the family declares a 366-day lookback
+  and their `_z` versions scaled by the 20-day volatility; daily bars are
+  the `mtf_1d_*` bars and a window over a missing day is `NaN`,
+  a store with the family declares a 366-day lookback
   embargo, and the device path shares the MTF daily resample and join), and
   the `cross` group adds the complete #273 BTC/ETH benchmark
   context, equal-weight market state, breadth, dispersion, average-correlation

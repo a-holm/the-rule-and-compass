@@ -58,7 +58,7 @@ extern "C" {
     fn rc_mtf_prepare(ctx: *mut Raw, tf_seconds: i64) -> c_int;
     fn rc_mtf_total_buckets(ctx: *mut Raw) -> c_int;
     fn rc_mtf_gather(ctx: *mut Raw, leaf: c_int, out: *mut f64) -> c_int;
-    fn rc_mtf_trend(ctx: *mut Raw, rows_per_day: c_int) -> c_int;
+    fn rc_mtf_trend(ctx: *mut Raw) -> c_int;
     fn rc_mtf_trend_gather(ctx: *mut Raw, leaf: c_int, out: *mut f64) -> c_int;
 }
 
@@ -238,9 +238,9 @@ impl MtfGpu {
 
     /// Evaluate the 27 trend leaves on the daily buckets of the last
     /// `prepare(86400)`.
-    pub fn trend(&mut self, rows_per_day: usize) -> Result<(), MtfError> {
+    pub fn trend(&mut self) -> Result<(), MtfError> {
         let started = std::time::Instant::now();
-        let rc = unsafe { rc_mtf_trend(self.ctx, rows_per_day as c_int) };
+        let rc = unsafe { rc_mtf_trend(self.ctx) };
         let ok = rc == 0;
         self.record(started, ok);
         if ok {
@@ -347,11 +347,11 @@ pub fn compute(
         .filter_map(|n| crate::trend::leaf_index(n).map(|i| (n, i)))
         .collect();
     if !trend.is_empty() {
-        let rows_per_day = crate::trend::check_bar(step).map_err(|_| MtfError { stage: "trend-bar", code: 0 })?;
+        crate::trend::check_bar(step).map_err(|_| MtfError { stage: "trend-bar", code: 0 })?;
         if prepared != Some(crate::trend::DAY) {
             gpu.prepare(crate::trend::DAY)?;
         }
-        gpu.trend(rows_per_day)?;
+        gpu.trend()?;
         for (name, leaf) in trend {
             out.insert(name.clone(), gpu.gather_trend(leaf)?);
         }
