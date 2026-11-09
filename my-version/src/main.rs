@@ -5484,7 +5484,7 @@ fn main() {
                 .and_then(rcsr::devlog::Json::parse)
                 .and_then(|j| j.get("average_uniqueness").and_then(rcsr::devlog::Json::as_f64));
             if let (None, Some(u), Some((label, _))) = (&weight_name, uniqueness, rcsr::labels::parse_column(&r.spec.column)) {
-                if u < 0.0 {
+                if u < 1.0 {
                     eprintln!(
                         "note: target {} has overlapping labels (average_uniqueness {}) and no --weight; --weight {} weights the rows by uniqueness",
                         r.spec.column,
