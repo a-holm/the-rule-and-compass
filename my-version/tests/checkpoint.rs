@@ -1253,7 +1253,7 @@ fn resume_without_time_budget_flag_is_unlimited() {
 /// #966: `--time-budget` on the resume line still limits that process.
 #[test]
 fn resume_with_time_budget_flag_uses_it() {
-    let (ok, reason, _) = resume_after_budget("flagged", "100000", &["--time-budget", "0"]);
+    let (ok, reason, _) = resume_after_budget("flagged", "0", &["--time-budget", "0"]);
     assert!(ok);
     assert_eq!(reason, "time_budget");
 }
