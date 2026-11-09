@@ -882,6 +882,8 @@ extern "C" {
     /* #925: the band of the uploaded book and the test-only sd download. */
     fn rc_set_pnl_band(ctx: *mut RawCtx, band: f64, sd_units: i32, hold: i32) -> i32;
     fn rc_pnl_band_sd(ctx: *mut RawCtx, nprog: i32, out: *mut RawPnlSd) -> i32;
+    /* #945: the device time of the sd kernel and of the scorer (test-only). */
+    fn rc_pnl_kernel_ms(ctx: *mut RawCtx, sd_ms: *mut f32, score_ms: *mut f32) -> i32;
     /* #118: start and read one batch's host-time ledger. */
     fn rc_stats_begin(ctx: *mut RawCtx);
     fn rc_last_stats(ctx: *mut RawCtx, out: *mut RawStats) -> i32;
@@ -1969,6 +1971,14 @@ impl GpuEvaluator {
         let mut raw = vec![RawPnlSd::default(); nprog];
         let rc = unsafe { rc_pnl_band_sd(self.ctx, i32::try_from(nprog).ok()?, raw.as_mut_ptr()) };
         (rc == 0).then(|| raw.iter().map(|r| (r.sd, r.band, r.rows)).collect())
+    }
+
+    /// #945 test hook: after a long/flat batch, the device time in
+    /// milliseconds of its sd kernel (0 when none ran) and of its scorer.
+    pub fn long_pnl_kernel_ms_for_tests(&mut self) -> Option<(f64, f64)> {
+        let (mut sd, mut score) = (0.0f32, 0.0f32);
+        let rc = unsafe { rc_pnl_kernel_ms(self.ctx, &mut sd, &mut score) };
+        (rc == 0).then_some((sd as f64, score as f64))
     }
 
     /// #604: [`GpuEvaluator::set_pnl_book`] on raw book parts. The row count is

@@ -1236,6 +1236,77 @@ fn resume_refuses_changed_band_units() {
     assert_eq!(code(&same), 0, "{}", stderr(&same));
 }
 
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// One FNV-1a step over the eight little-endian bytes of `v`, as the book hash.
+fn fnv_u64(mut h: u64, v: u64) -> u64 {
+    for b in v.to_le_bytes() {
+        h = (h ^ b as u64).wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// The hash state before [`fnv_u64`]`(h, v)`: the prime is odd, so it has an
+/// inverse modulo 2^64.
+fn unfnv_u64(mut h: u64, v: u64) -> u64 {
+    let mut inv = FNV_PRIME;
+    for _ in 0..5 {
+        inv = inv.wrapping_mul(2u64.wrapping_sub(FNV_PRIME.wrapping_mul(inv)));
+    }
+    assert_eq!(inv.wrapping_mul(FNV_PRIME), 1);
+    for b in v.to_le_bytes().iter().rev() {
+        h = h.wrapping_mul(inv) ^ *b as u64;
+    }
+    h
+}
+
+/// The book hash in a checkpoint's `fitness long_pnl:<hash>` field.
+fn saved_book_hash(cp: &str) -> u64 {
+    let text = std::fs::read_to_string(cp).unwrap();
+    let at = text.find("long_pnl:").expect("a long_pnl fitness checkpoint") + "long_pnl:".len();
+    u64::from_str_radix(&text[at..at + 16], 16).unwrap()
+}
+
+/// #945: the one-pass sd moves an sd-unit book's rows in the last bits, so its
+/// book hash carries the sd algorithm. The #925 hash of the same book is the
+/// score-unit hash with the units word 1 instead of 0; a checkpoint holding it
+/// refuses to resume (exit 2).
+#[test]
+fn resume_refuses_a_two_pass_sd_checkpoint() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let save = |name: &str, units: &str| {
+        let cp = dir.join(name).to_string_lossy().into_owned();
+        let args = ["--fitness", "pnl", "--band", "0.5", "--band-units", units, "--min-holding", "2", "--generations", "10", "--save", &cp];
+        let out = run(&data, &spec, &args);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        cp
+    };
+    let sd_cp = save("sd.rcsr", "sd");
+    let score_cp = save("score.rcsr", "score");
+    let (sd_hash, score_hash) = (saved_book_hash(&sd_cp), saved_book_hash(&score_cp));
+    let band_prefix = unfnv_u64(unfnv_u64(score_hash, 2), 0);
+    let two_pass = fnv_u64(fnv_u64(band_prefix, 1), 2);
+    assert_ne!(two_pass, sd_hash, "the sd-unit book hash still equals the #925 hash");
+    assert_eq!(fnv_u64(two_pass, rcsr::trading::SCORE_SD_ALGORITHM), sd_hash, "the sd-algorithm word is the last one hashed");
+    // The checkpoint a #925 binary writes: its book hash, and the config hash
+    // over the config lines that hold it.
+    let old_cp = dir.join("two-pass.rcsr");
+    let text = std::fs::read_to_string(&sd_cp).unwrap().replace(&format!("long_pnl:{sd_hash:016x}"), &format!("long_pnl:{two_pass:016x}"));
+    let block: String = text.lines().filter(|l| l.starts_with("config ")).map(|l| format!("{l}\n")).collect();
+    let config_hash = format!("config_hash {:016x}", rcsr::checkpoint::hash_config_text(&block));
+    let old: String = text.lines().map(|l| if l.starts_with("config_hash ") { format!("{config_hash}\n") } else { format!("{l}\n") }).collect();
+    std::fs::write(&old_cp, old).unwrap();
+    let resume = |cp: &str| {
+        let args = ["--fitness", "pnl", "--band", "0.5", "--band-units", "sd", "--min-holding", "2", "--generations", "20", "--resume", cp];
+        run(&data, &spec, &args)
+    };
+    usage_error(&resume(&old_cp.to_string_lossy()), "fitness");
+    let same = resume(&sd_cp);
+    assert_eq!(code(&same), 0, "{}", stderr(&same));
+}
+
 /// The rows of `split.validation_time` as `(time, x1, x2, simple return)`.
 fn csv_rows(path: &str) -> Vec<(f64, f64, f64, f64)> {
     std::fs::read_to_string(path)

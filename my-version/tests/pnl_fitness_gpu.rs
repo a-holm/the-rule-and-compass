@@ -1160,6 +1160,58 @@ fn device_band_totals_equal_the_cpu_at_a_million_rows() {
     assert!(n == 0 || n >= 3 * 8, "{n} trading programs");
 }
 
+/// #945: more candidates than one band launch holds ballots for (1,024), so
+/// the last ones run in a second launch from a candidate offset.
+#[test]
+fn device_band_totals_equal_the_cpu_over_two_launches() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&[0, 31, 5000, 8191, 8193], 9_000, 19);
+    let pairs = [(0.3, 1, BandUnits::Score), (0.2, 3, BandUnits::Sd)];
+    let n = assert_band_books(&f, &band_programs(1_030, 41), &pairs, &[1]);
+    assert!(n == 0 || n >= 2 * 100, "{n} trading programs");
+}
+
+/// The #925 training-score sd: the mean, then the centred sum of squares,
+/// each summed per lane, lane tree and warp tree in the device order.
+fn two_pass_tree_sd(x: &[f64]) -> Option<f64> {
+    use rcsr::trading::{FITNESS_LANES, FITNESS_SEGMENT_ROWS, FITNESS_WARPS};
+    fn fold(v: &mut [f64]) {
+        let mut half = v.len() / 2;
+        while half >= 1 {
+            for i in 0..half {
+                v[i] += v[i + half];
+            }
+            half /= 2;
+        }
+    }
+    let finite: Vec<f64> = x.iter().copied().filter(|v| v.is_finite()).collect();
+    let (lo, hi) = finite.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &v| (l.min(v), h.max(v)));
+    if finite.len() < 2 || lo == hi {
+        return None;
+    }
+    let tree = |term: &dyn Fn(f64) -> f64| {
+        let mut warps = [0.0f64; FITNESS_WARPS];
+        for (seg, chunk) in x.chunks(FITNESS_SEGMENT_ROWS).enumerate() {
+            let mut lanes = [0.0f64; FITNESS_LANES];
+            for (k, &v) in chunk.iter().enumerate() {
+                if v.is_finite() {
+                    lanes[k % FITNESS_LANES] += term(v);
+                }
+            }
+            fold(&mut lanes);
+            warps[seg % FITNESS_WARPS] += lanes[0];
+        }
+        fold(&mut warps);
+        warps[0]
+    };
+    let mean = tree(&|v| v) / finite.len() as f64;
+    let sd = (tree(&|v| (v - mean) * (v - mean)) / (finite.len() - 1) as f64).sqrt();
+    (sd.is_finite() && sd > 0.0).then_some(sd)
+}
+
+/// #925, #945: the device sd, half-width and count equal `trading::score_sd`
+/// bit for bit, and the one-pass sd is within 1e-12 relative of the #925
+/// two-pass sd on the same predictions.
 #[test]
 fn band_sd_device_matches_cpu() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
@@ -1176,16 +1228,22 @@ fn band_sd_device_matches_cpu() {
     let (batch, totals) = ev.long_pnl_totals_for_tests(prog, off).expect("the totals launch runs");
     let sds = ev.long_pnl_band_sd_for_tests(trees.len()).expect("the sd download");
     let mut checked = 0usize;
+    let mut worst = 0.0f64;
     for k in 0..trees.len() {
         let words = &prog[off[k] as usize..off[k + 1] as usize];
         let pred: Vec<f64> = ev.predict_one_for_tests(words).expect("the device predicts").iter().map(|&p| p as f64).collect();
         let cpu = rcsr::trading::score_sd(&pred);
         let (dev_sd, dev_band, dev_rows) = sds[k];
         assert_eq!(dev_rows as usize, cpu.rows, "program {k} rows");
+        assert_eq!(cpu.sd.is_some(), two_pass_tree_sd(&pred).is_some(), "program {k} degenerate");
         match cpu.sd {
             Some(sd) => {
                 assert_eq!(dev_sd.to_bits(), sd.to_bits(), "program {k} sd {dev_sd} vs {sd}");
                 assert_eq!(dev_band.to_bits(), (1.0 * sd).to_bits(), "program {k} band");
+                let two = two_pass_tree_sd(&pred).unwrap();
+                let rel = (sd - two).abs() / two;
+                assert!(rel <= 1e-12, "program {k}: one-pass {sd} against two-pass {two}: {rel:e}");
+                worst = worst.max(rel);
                 checked += 1;
             }
             None => {
@@ -1200,6 +1258,7 @@ fn band_sd_device_matches_cpu() {
         assert_eq!(batch.values[k].to_bits(), b.regret_of(&t).to_bits(), "program {k} regret");
     }
     assert!(checked >= 16, "{checked} programs with a finite sd");
+    println!("one-pass against two-pass sd: largest relative difference {worst:e} over {checked} programs");
     let (_, band, rows) = sds[trees.len() - 1];
     assert_eq!((band, rows), (0.0, 1_000_000), "the constant program is degenerate");
 }
@@ -1290,7 +1349,9 @@ fn band_pipelined_search_archives_device_scores() {
 }
 
 /// Throughput of the band kernels against the plain kernel on the same
-/// 1,000,000 rows and programs; the sd units add the reduction kernel.
+/// 1,000,000 rows and programs; the sd units add the reduction kernel. Prints
+/// each book's rate, its ratio to plain and the device time per batch of the
+/// sd kernel and of the scorer.
 #[test]
 #[ignore]
 fn long_pnl_band_throughput_against_plain() {
@@ -1331,15 +1392,19 @@ fn long_pnl_band_throughput_against_plain() {
         }
         let reps = 10;
         let t = std::time::Instant::now();
-        let mut kernel_ms = 0.0f64;
+        let (mut kernel_ms, mut sd_ms, mut score_ms) = (0.0f64, 0.0f64, 0.0f64);
         for _ in 0..reps {
             let s = ev.score_batch(prog, off, ScoreObjective::LongPnl, &zeros);
             assert!(s.ms >= 0.0);
             kernel_ms += s.ms as f64;
+            let (sd, score) = ev.long_pnl_kernel_ms_for_tests().expect("the kernel times");
+            sd_ms += sd;
+            score_ms += score;
         }
         let rate = (n * trees.len()) as f64 / (t.elapsed().as_secs_f64() / reps as f64);
         let kernel = (n * trees.len()) as f64 / (kernel_ms / reps as f64 / 1000.0);
-        println!("{name}: {rate:.3e} row-evals/s (kernel {kernel:.3e})");
+        let (sd_ms, score_ms) = (sd_ms / reps as f64, score_ms / reps as f64);
+        println!("{name}: {rate:.3e} row-evals/s (kernel {kernel:.3e}; per batch: sd kernel {sd_ms:.2} ms, scorer {score_ms:.2} ms)");
         rates.push(rate);
     }
     let base = rates[0].max(rates[5]);

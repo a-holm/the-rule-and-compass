@@ -1049,6 +1049,12 @@ CHECKPOINTS:
                              the checkpoint, and run.json search.cumulative
                              then totals the search seconds over all chunks
                              (elapsed_seconds stays the last process)
+                             (#962) The sidecar also records the search
+                             backend (cpu, gpu, mixed, unknown); run.json
+                             search_backend reports it and process_backend
+                             the backend of this process. A resume at the
+                             final generation scores nothing: backend then
+                             equals search_backend
   --allow-backend-change     resume a checkpoint on a different backend
                              (cpu<->gpu) and say so on stderr and in the
                              run manifest
@@ -6686,6 +6692,7 @@ fn main() {
     let mut last_saved: Option<(usize, String)> = None;
     // #923: cost of the chunks before this process, from the checkpoint sidecar.
     let cost_resumed = resume_path.is_some();
+    let resumed_at_generation = resume_checkpoint.as_ref().map(|cp| cp.generations);
     let cost_base = match (&resume_path, &resume_checkpoint) {
         (Some(p), Some(cp)) => rcsr::resume_cost::load(p, cp.generations),
         _ => None,
@@ -6708,7 +6715,12 @@ fn main() {
                 }
                 let generation = cp.generations;
                 last_saved = Some((generation, path.clone()));
-                let so_far = rcsr::resume_cost::Cost::process(search_start.elapsed().as_secs_f64(), None, None);
+                let so_far = rcsr::resume_cost::Cost::process(
+                    search_start.elapsed().as_secs_f64(),
+                    None,
+                    None,
+                    rcsr::resume_cost::Search::Unknown,
+                );
                 if let Some(t) = rcsr::resume_cost::total(cost_resumed, cost_base.as_ref(), &so_far) {
                     if let Err(e) = rcsr::resume_cost::write(&path, generation, &t) {
                         eprintln!("warning: {}", e);
@@ -6761,10 +6773,13 @@ fn main() {
             .record_outside(rcsr::gpu_stats::Stage::Features, prepared_s - table_loaded_s);
     }
     let search_seconds = search_start.elapsed().as_secs_f64();
+    // #962: a resume at its final generation scores nothing, so this process says nothing about the search backend.
+    let report_only = resumed_at_generation == Some(outcome.generations);
     let process_cost = rcsr::resume_cost::Cost::process(
         search_seconds,
         outcome.gpu.as_ref().map(|g| g.ledger.wall_s()),
         outcome.gpu.as_ref().map(|g| g.accounting.wall_s + g.ledger.fit_kernel_s()),
+        if report_only { rcsr::resume_cost::Search::None } else { rcsr::resume_cost::Search::of(outcome.backend) },
     );
     let cumulative = rcsr::resume_cost::total(cost_resumed, cost_base.as_ref(), &process_cost);
     if let (Some(t), Some((generation, path))) = (&cumulative, &last_saved) {
@@ -6778,6 +6793,22 @@ fn main() {
         .as_ref()
         .map_or_else(|| rcsr::resume_cost::INCOMPLETE_JSON.to_string(), |t| t.json());
     let cumulative_ledger_wall_s = cumulative.as_ref().and_then(|t| t.ledger_wall_s);
+    let process_backend = outcome.backend.name();
+    let search_backend = match &cumulative {
+        Some(t) => t.backend.name(),
+        None => "unknown",
+    };
+    let (backend_name, backend_note) = match &cumulative {
+        Some(t) if report_only && t.backend != rcsr::resume_cost::Search::Unknown => (
+            t.backend.name(),
+            Some("report-only resume at generation G; search backend from checkpoint sidecar"),
+        ),
+        None => (process_backend, Some("search backend unknown: no cost sidecar for this checkpoint generation")),
+        Some(t) if t.backend == rcsr::resume_cost::Search::Unknown => {
+            (process_backend, Some("search backend unknown: the checkpoint sidecar records none"))
+        }
+        _ => (process_backend, None),
+    };
     // #211: close the development log now that the search has returned: the
     // final archive, the stop reason, the wall and the process peak RSS. It is
     // written before diagnostics so a later failure still leaves a complete
@@ -6806,6 +6837,7 @@ fn main() {
                 .clone()
                 .or_else(|| gpu_probe.reason.clone())
         };
+        let backend_reason = if report_only { backend_note.map(str::to_string) } else { backend_reason.or_else(|| backend_note.map(str::to_string)) };
         let timing = PhaseTimings {
             prep: (search_start - run_start).as_secs_f64(),
             search: search_seconds,
@@ -6857,9 +6889,11 @@ fn main() {
         match format {
             Format::Json => {
                 let doc = format!(
-                    "{{\"tool\":\"rcsr\",\"version\":{},\"interim\":true,\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"threads\":{},\"seed\":{},\"stop_reason\":{},\"generations_run\":{},\"elapsed_seconds\":{},\"search\":{{\"cumulative\":{}}},\"timing\":{},\"gpu\":{},\"checkpoint\":{}}}",
+                    "{{\"tool\":\"rcsr\",\"version\":{},\"interim\":true,\"backend\":\"{}\",\"search_backend\":\"{}\",\"process_backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"threads\":{},\"seed\":{},\"stop_reason\":{},\"generations_run\":{},\"elapsed_seconds\":{},\"search\":{{\"cumulative\":{}}},\"timing\":{},\"gpu\":{},\"checkpoint\":{}}}",
                     jstr(VERSION),
-                    outcome.backend.name(),
+                    backend_name,
+                    search_backend,
+                    process_backend,
                     backend_reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
                     outcome.device.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
                     cfg.threads,
@@ -8355,9 +8389,12 @@ fn main() {
                     .clone()
                     .or_else(|| gpu_probe.reason.clone())
             };
+            let backend_reason = if report_only { backend_note.map(str::to_string) } else { backend_reason.or_else(|| backend_note.map(str::to_string)) };
             let backend_json = format!(
-                "\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"device_probed\":{},\"threads\":{},",
-                outcome.backend.name(),
+                "\"backend\":\"{}\",\"search_backend\":\"{}\",\"process_backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"device_probed\":{},\"threads\":{},",
+                backend_name,
+                search_backend,
+                process_backend,
                 backend_reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
                 outcome
                     .device
