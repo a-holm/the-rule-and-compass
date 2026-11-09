@@ -561,6 +561,20 @@ fn search_as(dir: &Path, data: &str, spec: &str, extra: &[&str], name: &str) -> 
     kept.to_string_lossy().into_owned()
 }
 
+/// `run.json` text as a run written before #925: no band keys.
+fn without_band_keys(text: &str) -> String {
+    let mut old = text.to_string();
+    for key in ["band", "band_units", "band_sd", "band_resolved", "band_sd_rows", "band_sd_max_time", "band_sd_degenerate"] {
+        let needle = format!(",\"{key}\":");
+        while let Some(at) = old.find(&needle) {
+            let start = at + needle.len();
+            let end = start + old[start..].find(|c| c == ',' || c == '}').expect("end of value");
+            old.replace_range(at..end, "");
+        }
+    }
+    old
+}
+
 /// The window of the run's validation rows; it overlaps the run's own rows.
 fn validation_window() -> String {
     let t = |k: i64| T0 + STEP * k;
@@ -619,15 +633,7 @@ fn from_run_without_a_band_keeps_the_threshold_book() {
     let w = validation_window();
     let plain = search_as(&dir, &data, &spec, &[], "plain.json");
     let text = std::fs::read_to_string(&plain).unwrap();
-    let mut old = text.clone();
-    for key in ["band", "band_units", "band_sd", "band_resolved", "band_sd_rows", "band_sd_max_time", "band_sd_degenerate"] {
-        let needle = format!(",\"{key}\":");
-        while let Some(at) = old.find(&needle) {
-            let start = at + needle.len();
-            let end = start + old[start..].find(|c| c == ',' || c == '}').expect("end of value");
-            old.replace_range(at..end, "");
-        }
-    }
+    let old = without_band_keys(&text);
     assert_ne!(old, text);
     assert!(!old.contains("band_resolved"));
     let old_path = dir.join("old.json").to_string_lossy().into_owned();
@@ -738,4 +744,175 @@ fn from_run_records_the_band_source() {
         &["--target", "y", "--target-spec", &spec, "--expr", "x1", "--vars", "x1,x2", "--threshold-fixed", "0", "--policy", "band", "--band", "0.05", "--window", &w],
     );
     assert_eq!(at(&flag, &["policy", "band_source"]).as_str(), Some("flag"));
+}
+
+fn ladder_sr(dir: &Path, data: &str, spec: &str, windows: &str, run: &str, tag: &str) -> Json {
+    let out_path = dir.join(format!("ladder-{tag}.json")).to_string_lossy().into_owned();
+    let out = rcsr(&[
+        "ladder", "--data", data, "--target", "y", "--time", "t", "--windows", windows, "--features", "x1,x2",
+        "--purge-seconds", "900", "--target-spec", spec, "--draws", "50", "--gbm-trees", "10", "--sr-run", run, "--out", &out_path,
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    read_json(&out_path)
+}
+
+fn ablation_score(dir: &Path, data: &str, windows: &str, mode: &str, run: &str, tag: &str) -> Json {
+    let out_path = dir.join(format!("ablation-{tag}.json")).to_string_lossy().into_owned();
+    let out = rcsr(&[
+        "ablation", "score", mode, run, "--data", data, "--target", "y", "--time", "t", "--windows", windows,
+        "--purge-seconds", "900", "--thresholds", "0.5", "--headline-threshold", "0.5", "--out", &out_path,
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    read_json(&out_path)
+}
+
+fn sr_row(ladder: &Json) -> &Json {
+    let Json::Arr(rungs) = at(ladder, &["rungs"]) else { panic!("rungs") };
+    rungs.iter().find(|r| at(r, &["name"]).as_str() == Some("symbolic_regression")).expect("symbolic_regression rung")
+}
+
+fn ladder_net(row: &Json) -> f64 {
+    let Json::Arr(by_cost) = at(row, &["net_by_cost"]) else { panic!("net_by_cost") };
+    num(&by_cost[0], &["net"])
+}
+
+fn ablation_net(j: &Json) -> f64 {
+    let Json::Arr(by_fold) = at(j, &["net_by_fold_threshold"]) else { panic!("net_by_fold_threshold") };
+    let Json::Arr(by_threshold) = &by_fold[0] else { panic!("by threshold") };
+    by_threshold[0].as_f64().unwrap()
+}
+
+#[test]
+fn ladder_sr_rung_prices_the_run_band_book() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", |i| row(i).2);
+    let spec = write_spec(&dir, "s.json", "log", "20.0");
+    let windows = write_windows(&dir);
+    for (name, extra) in [("score.json", SCORE_BAND.to_vec()), ("sd.json", SD_BAND.to_vec())] {
+        let run = search_as(&dir, &data, &spec, &extra, name);
+        let doc = read_json(&run);
+        let want = at(&doc, &["objective", "test"]);
+        let s = at(&doc, &["objective", "spec"]);
+        assert!(num(s, &["band_resolved"]) > 0.0, "{name}: the band must be live");
+        assert!(num(want, &["trades"]) > 0.0, "{name}: the book must trade");
+        let lad = ladder_sr(&dir, &data, &spec, &windows, &run, name);
+        let row = sr_row(&lad);
+        assert_eq!(at(row, &["status"]).as_str(), Some("ok"), "{name}");
+        assert!(at(row, &["params"]).as_str().unwrap().contains("as recorded"), "{name}");
+        for (a, b) in [("exposure", "exposure"), ("entries", "entries")] {
+            assert!((num(row, &[a]) - num(want, &[b])).abs() <= 1e-12, "{name}: {a} {} vs {}", num(row, &[a]), num(want, &[b]));
+        }
+        assert!((ladder_net(row) - num(want, &["net_pnl"])).abs() <= 1e-12, "{name}: net {} vs {}", ladder_net(row), num(want, &["net_pnl"]));
+        let report = at(&lad, &["sr_run"]);
+        assert_eq!(at(report, &["policy"]).as_str(), Some("band"), "{name}");
+        assert_eq!(num(report, &["min_holding"]), num(s, &["min_holding"]), "{name}");
+        assert_eq!(num(report, &["band_resolved"]).to_bits(), num(s, &["band_resolved"]).to_bits(), "{name}: priced as recorded");
+    }
+}
+
+#[test]
+fn ablation_score_prices_the_run_band_book() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", |i| row(i).2);
+    let spec = write_spec(&dir, "s.json", "log", "20.0");
+    let windows = write_windows(&dir);
+    for (name, extra) in [("score.json", SCORE_BAND.to_vec()), ("sd.json", SD_BAND.to_vec())] {
+        let run = search_as(&dir, &data, &spec, &extra, name);
+        let doc = read_json(&run);
+        let want = at(&doc, &["objective", "test"]);
+        let s = at(&doc, &["objective", "spec"]);
+        let from = ablation_score(&dir, &data, &windows, "--from-run", &run, &format!("from-{name}"));
+        assert!((ablation_net(&from) - num(want, &["net_pnl"])).abs() <= 1e-12, "{name}: net {} vs {}", ablation_net(&from), num(want, &["net_pnl"]));
+        let rule = at(&from, &["band_book"]);
+        assert_eq!(num(rule, &["half_width"]).to_bits(), num(s, &["band_resolved"]).to_bits(), "{name}: priced as recorded");
+        assert_eq!(num(rule, &["min_holding"]), num(s, &["min_holding"]), "{name}");
+
+        let grid = ablation_score(&dir, &data, &windows, "--run", &run, &format!("run-{name}"));
+        let rule = at(&grid, &["band_book"]);
+        assert_eq!(num(rule, &["half_width"]).to_bits(), num(s, &["band_resolved"]).to_bits(), "{name}: --run band");
+        assert_eq!(num(rule, &["min_holding"]), num(s, &["min_holding"]), "{name}: --run hold");
+        let plain_run = dir.join(format!("plain-{name}"));
+        let text = std::fs::read_to_string(&run).unwrap();
+        std::fs::write(&plain_run, without_band_keys(&text).replace("\"min_holding\":3", "\"min_holding\":1").replace("\"min_holding\":4", "\"min_holding\":1")).unwrap();
+        let plain = ablation_score(&dir, &data, &windows, "--run", &plain_run.to_string_lossy(), &format!("plain-{name}"));
+        assert!(plain.get("band_book").is_none(), "{name}");
+        assert_ne!(ablation_net(&grid).to_bits(), ablation_net(&plain).to_bits(), "{name}: the band changes the --run book");
+    }
+}
+
+#[test]
+fn band_does_not_depend_on_test_rows() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", |i| row(i).2);
+    let other = write_csv(&dir, "d2.csv", |i| if i >= 310 { -row(i).2 } else { row(i).2 });
+    let spec = write_spec(&dir, "s.json", "log", "20.0");
+    let windows = write_windows(&dir);
+    let run = search_as(&dir, &data, &spec, &SD_BAND, "sd.json");
+    let doc = read_json(&run);
+    let resolved = num(at(&doc, &["objective", "spec"]), &["band_resolved"]);
+    assert!(resolved > 0.0);
+    let (a, b) = (ladder_sr(&dir, &data, &spec, &windows, &run, "a"), ladder_sr(&dir, &other, &spec, &windows, &run, "b"));
+    assert_ne!(ladder_net(sr_row(&a)).to_bits(), ladder_net(sr_row(&b)).to_bits(), "the test rows must matter to the net");
+    for lad in [&a, &b] {
+        assert_eq!(num(at(lad, &["sr_run"]), &["band_resolved"]).to_bits(), resolved.to_bits());
+        assert!(at(sr_row(lad), &["params"]).as_str().unwrap().contains(&format!("half-width {}", rcsr::ladder::jnum(resolved))));
+    }
+    let (c, d) = (
+        ablation_score(&dir, &data, &windows, "--from-run", &run, "a"),
+        ablation_score(&dir, &other, &windows, "--from-run", &run, "b"),
+    );
+    for abl in [&c, &d] {
+        assert_eq!(num(at(abl, &["band_book"]), &["half_width"]).to_bits(), resolved.to_bits());
+    }
+}
+
+#[test]
+fn old_runs_keep_the_threshold_book_in_ladder_and_ablation() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", |i| row(i).2);
+    let spec = write_spec(&dir, "s.json", "log", "20.0");
+    let windows = write_windows(&dir);
+    let plain = search_as(&dir, &data, &spec, &[], "plain.json");
+    let old_path = dir.join("old.json").to_string_lossy().into_owned();
+    std::fs::write(&old_path, without_band_keys(&std::fs::read_to_string(&plain).unwrap())).unwrap();
+    let (a, b) = (ladder_sr(&dir, &data, &spec, &windows, &plain, "plain"), ladder_sr(&dir, &data, &spec, &windows, &old_path, "old"));
+    assert!(at(&a, &["sr_run"]).get("policy").is_none());
+    assert_eq!(digits_stripped(at(&a, &["rungs"])), digits_stripped(at(&b, &["rungs"])));
+    let (a, b) = (
+        ablation_score(&dir, &data, &windows, "--from-run", &plain, "plain"),
+        ablation_score(&dir, &data, &windows, "--from-run", &old_path, "old"),
+    );
+    assert!(a.get("band_book").is_none());
+    assert_eq!(digits_stripped(&a), digits_stripped(&b));
+    let (a, b) = (
+        ablation_score(&dir, &data, &windows, "--run", &plain, "plain-run"),
+        ablation_score(&dir, &data, &windows, "--run", &old_path, "old-run"),
+    );
+    assert_eq!(digits_stripped(&a), digits_stripped(&b));
+}
+
+#[test]
+fn malformed_band_block_is_still_refused() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", |i| row(i).2);
+    let spec = write_spec(&dir, "s.json", "log", "20.0");
+    let windows = write_windows(&dir);
+    let run = search_as(&dir, &data, &spec, &SD_BAND, "sd.json");
+    let broken = dir.join("broken.json").to_string_lossy().into_owned();
+    let text = std::fs::read_to_string(&run).unwrap();
+    std::fs::write(&broken, text.replace("\"band_resolved\":", "\"band_resolvd\":")).unwrap();
+    let ladder = rcsr(&[
+        "ladder", "--data", &data, "--target", "y", "--time", "t", "--windows", &windows, "--features", "x1,x2",
+        "--purge-seconds", "900", "--target-spec", &spec, "--draws", "50", "--gbm-trees", "10", "--sr-run", &broken, "--out", "/dev/null",
+    ]);
+    assert_eq!(code(&ladder), 3, "{}", stderr(&ladder));
+    assert!(stderr(&ladder).contains("band_resolved"), "{}", stderr(&ladder));
+    for mode in ["--from-run", "--run"] {
+        let out = rcsr(&[
+            "ablation", "score", mode, &broken, "--data", &data, "--target", "y", "--time", "t", "--windows", &windows,
+            "--purge-seconds", "900", "--out", "/dev/null",
+        ]);
+        assert_eq!(code(&out), 3, "{mode}: {}", stderr(&out));
+        assert!(stderr(&out).contains("band_resolved"), "{mode}: {}", stderr(&out));
+    }
 }
