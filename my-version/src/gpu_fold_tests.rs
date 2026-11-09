@@ -126,7 +126,7 @@ fn a_tree_without_redundant_constants_keeps_its_device_fit() {
         ),
         node(
             Op::Sub,
-            vec![node(Op::Mul, vec![constant(0.5), node(Op::Sin, vec![node(Op::Mul, vec![constant(0.8), input(0)])])]), constant(0.2)],
+            vec![node(Op::Mul, vec![constant(0.4), node(Op::Sin, vec![input(0)])]), node(Op::Mul, vec![constant(0.2), input(1)])],
         ),
     ];
     for t in &trees {
