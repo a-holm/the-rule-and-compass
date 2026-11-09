@@ -235,6 +235,13 @@ struct RcCtx {
     int pnl_hold;
     void *d_pnl_sd;
     int pnl_sd_cap;
+    /* #945: the band kernels' ballot buffer, `pnl_ballot_cap` blocks of
+       RC_PNL_BALLOT_WORDS, and the event after the sd kernel of the last
+       long/flat batch (`pnl_sd_timed` when it was recorded). */
+    void *d_pnl_ballots;
+    int pnl_ballot_cap;
+    cudaEvent_t ev_pnl_sd;
+    int pnl_sd_timed;
     /* #293: tiled residency. `d_cols` is null; the feature columns stream from
        the host copy `h_cols` (column-major, caller-owned) through two device
        slots of `tile_rows` rows. The target, label sign and weights stay
@@ -1887,18 +1894,28 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
  * The block walks the segments in rounds of RC_PNL_WARPS: in round `r` warp
  * `w` takes segment `r * RC_PNL_WARPS + w`, the same segments in the same
  * order as the stateless kernel. Phase 1 runs the interpreter once per row,
- * keeps the enter and stay ballots of every warp step in shared memory and
- * folds the segment into a transition table (lane `l` follows start state `l`,
- * lane 0 also the state 32). Each warp then composes the tables of the
- * earlier segments of the round onto the state carried into the round, and
- * phase 2 replays the ballots from that state: positions, flips, exits and
- * long rows, and the gross in the per-lane order and trees of the stateless
- * kernel. No row is interpreted twice.
+ * keeps the enter and stay ballots of every warp step in this block's slice
+ * of `ballots` (#945: global memory, so the shared memory and the register
+ * budget allow the stateless kernel's occupancy) and folds the segment into a
+ * transition table (lane `l` follows start state `l`, lane 0 also the state
+ * 32; with `K = 1` the table is the type of the segment's last decisive row).
+ * After one barrier each warp composes the tables of the earlier segments of
+ * the round onto the state carried into the round, and phase 2 replays the
+ * ballots from that state: positions, flips, exits and long rows, and the
+ * gross in the per-lane order and trees of the stateless kernel. No row is
+ * interpreted twice. The tables alternate between two buffers by round
+ * parity, so the next round's tables never overwrite one a slower warp still
+ * reads, and the round needs no second barrier.
  *
  * `band_buf`, when not null, holds the half-width of every candidate (sd
  * units, from `pnl_sd_kernel`); otherwise every candidate uses `band`. */
 #define RC_PNL_MAX_HOLD 32
 #define RC_PNL_STEPS (RC_PNL_SEGMENT_ROWS / 32)
+/* #945: ballot words of one block: per warp, the enter ballots, the stay
+   ballots and the long rows of every step of a segment. */
+#define RC_PNL_BALLOT_WORDS (RC_PNL_WARPS * 3 * RC_PNL_STEPS)
+/* #945: candidates per band launch; the ballot buffer holds this many blocks. */
+#define RC_PNL_BALLOT_CAP 1024
 
 typedef struct RcPnlSd {
     double sd;
@@ -1947,16 +1964,36 @@ __device__ __forceinline__ unsigned int rc_band_step(int &st, unsigned int ent, 
     return pos;
 }
 
+/* #945: `rc_band_step` with a minimum hold of 1, without a loop. The 2-state
+   automaton forgets its past at every decisive row: an enter row is long, a
+   row that may not stay long (`~stay`) or starts a run (`fst`) without
+   entering is flat, and any other row keeps the state. Lane `l` takes the
+   type of the highest decisive row at or below it, or `st` when there is
+   none; rows past the valid ones are decisive and flat, above every valid
+   row. `st` becomes the state after the last valid row (`val` != 0). */
+__device__ __forceinline__ unsigned int rc_band1_step(int &st, unsigned int ent, unsigned int stay,
+                                                      unsigned int fst, unsigned int val, int lane)
+{
+    const unsigned int dec = (ent | ~stay | fst) & (0xffffffffu >> (31 - lane));
+    const int pos = dec ? (int)((ent >> (31 - __clz(dec))) & 1u) : st;
+    const unsigned int m = __ballot_sync(0xffffffffu, pos) & val;
+    st = (int)((m >> (31 - __clz(val))) & 1u);
+    return m;
+}
+
 static_assert(RC_PNL_MAX_HOLD + 1 <= 64, "two start states per lane");
 
-template <int NB>
-__global__ void __launch_bounds__(RC_MAX_THREADS, 4) pnl_band_kernel(
+/* `ONE`: the minimum hold is 1 (`rc_band1_step`, a 2-entry table). Candidate
+   `first + blockIdx.x`; the block's ballots are slice `blockIdx.x`. */
+template <int NB, int ONE>
+__global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_band_kernel(
     const float *__restrict__ cols,
     int n,
     const unsigned int *__restrict__ prog,
     const unsigned int *__restrict__ off,
     int width,
     int pooled,
+    int first,
     const double *__restrict__ excess,
     const unsigned char *__restrict__ flags,
     double side,
@@ -1966,24 +2003,27 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 4) pnl_band_kernel(
     double band,
     const RcPnlSd *__restrict__ band_buf,
     int hold,
+    unsigned int *__restrict__ ballots,
     double *__restrict__ out,
     int *__restrict__ status,
     RcPnlTotals *__restrict__ totals)
 {
-    const int p = blockIdx.x;
+    const int p = first + blockIdx.x;
     const unsigned int *code = pooled
         ? prog + (size_t)p * (size_t)width
         : prog + off[p];
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    __shared__ unsigned int sh_ent[RC_PNL_WARPS][RC_PNL_STEPS];
-    __shared__ unsigned int sh_stay[RC_PNL_WARPS][RC_PNL_STEPS];
-    __shared__ unsigned char sh_tab[RC_PNL_WARPS][RC_PNL_MAX_HOLD + 1];
+    __shared__ unsigned char sh_tab[2][RC_PNL_WARPS][RC_PNL_MAX_HOLD + 1];
     __shared__ double sh_gross[NB][RC_PNL_WARPS];
     __shared__ unsigned int sh_flips[NB][RC_PNL_WARPS];
     __shared__ unsigned int sh_exits[NB][RC_PNL_WARPS];
     __shared__ unsigned int sh_longs[RC_PNL_WARPS];
     __shared__ int sh_bad[RC_PNL_WARPS];
+    /* This warp's enter ballots, its stay ballots and its long rows, one word
+       per step. A lane stores and reloads only the words of the steps it
+       caches, so no other thread reads what it writes. */
+    unsigned int *const bw = ballots + (size_t)blockIdx.x * RC_PNL_BALLOT_WORDS + (size_t)warp * (3 * RC_PNL_STEPS);
 
     const double b = band_buf ? band_buf[p].band : band;
     const double hi = __dadd_rn(threshold, b);
@@ -1999,10 +2039,13 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 4) pnl_band_kernel(
     }
     int bad = 0;
     int carried = 0;
+    /* The first step of this warp's segment whose long rows phase 1 stored. */
+    int conv = RC_PNL_STEPS;
     const long long rows = (long long)n;
     const long long nseg = (rows + RC_PNL_SEGMENT_ROWS - 1) / RC_PNL_SEGMENT_ROWS;
     const long long rounds = (nseg + RC_PNL_WARPS - 1) / RC_PNL_WARPS;
     for (long long r = 0; r < rounds; ++r) {
+        const int buf = (int)(r & 1);
         const long long s = r * RC_PNL_WARPS + warp;
         const int live = (int)min((long long)RC_PNL_WARPS, nseg - r * RC_PNL_WARPS);
         const long long seg_start = s * RC_PNL_SEGMENT_ROWS;
@@ -2012,7 +2055,11 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 4) pnl_band_kernel(
         if (s < nseg) {
             int s0 = lane;
             int s1 = lane + 32;
+            int last = -1;
+            /* Lane `l` caches the words of step `32 * j + l`. */
+            unsigned int my_ent = 0u, my_stay = 0u, my_pos = 0u;
             int step = 0;
+            conv = RC_PNL_STEPS;
             for (long long base = seg_start; base < seg_end; base += 32, ++step) {
                 const long long row = base + lane;
                 const int in = row < seg_end;
@@ -2028,15 +2075,42 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 4) pnl_band_kernel(
                 const unsigned int stay = __ballot_sync(0xffffffffu, in && fin && (double)pred > lo);
                 const unsigned int fst = __ballot_sync(0xffffffffu, (f & 1u) != 0u);
                 const int nv = (int)min((long long)32, seg_end - base);
-                if (lane == 0) {
-                    sh_ent[warp][step] = ent;
-                    sh_stay[warp][step] = stay;
+                if (lane == (step & 31)) {
+                    my_ent = ent;
+                    my_stay = stay;
                 }
-                if (lane <= hold) rc_band_step(s0, ent, stay, fst, nv, hold);
-                if (lane + 32 <= hold) rc_band_step(s1, ent, stay, fst, nv, hold);
+                if (ONE) {
+                    const unsigned int valid = nv >= 32 ? 0xffffffffu : ((1u << nv) - 1u);
+                    const unsigned int dec = (ent | ~stay | fst) & valid;
+                    if (dec) last = (int)((ent >> (31 - __clz(dec))) & 1u);
+                } else {
+                    unsigned int pm = 0u;
+                    if (lane <= hold) pm = rc_band_step(s0, ent, stay, fst, nv, hold);
+                    if (lane + 32 <= hold) rc_band_step(s1, ent, stay, fst, nv, hold);
+                    /* Once every start state reached the same state, the long rows
+                       no longer depend on it: phase 2 takes them from here. */
+                    const unsigned int pw = __shfl_sync(0xffffffffu, pm, 0);
+                    if (lane == (step & 31)) my_pos = pw;
+                    if (conv > step) {
+                        const int ref = __shfl_sync(0xffffffffu, s0, 0);
+                        if (__all_sync(0xffffffffu, (lane > hold || s0 == ref) && (lane + 32 > hold || s1 == ref))) conv = step + 1;
+                    }
+                }
+                if ((step & 31) == 31 || base + 32 >= seg_end) {
+                    const int w = (step & ~31) + lane;
+                    if (w <= step) {
+                        bw[w] = my_ent;
+                        bw[RC_PNL_STEPS + w] = my_stay;
+                        if (!ONE) bw[2 * RC_PNL_STEPS + w] = my_pos;
+                    }
+                }
             }
-            if (lane <= hold) sh_tab[warp][lane] = (unsigned char)s0;
-            if (lane + 32 <= hold) sh_tab[warp][lane + 32] = (unsigned char)s1;
+            if (ONE) {
+                if (lane <= 1) sh_tab[buf][warp][lane] = (unsigned char)(last < 0 ? lane : last);
+            } else {
+                if (lane <= hold) sh_tab[buf][warp][lane] = (unsigned char)s0;
+                if (lane + 32 <= hold) sh_tab[buf][warp][lane + 32] = (unsigned char)s1;
+            }
         }
         __syncthreads();
         int st = carried;
@@ -2044,7 +2118,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 4) pnl_band_kernel(
             if (w == warp) {
                 carried = st;
             }
-            st = sh_tab[w][st];
+            st = sh_tab[buf][w][st];
         }
         /* `carried` is now this warp's start state; `st` the round's end. */
         const int start = carried;
@@ -2058,15 +2132,33 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 4) pnl_band_kernel(
             }
             double acc = 0.0;
             unsigned int cfc = 0, cec = 0;
+            unsigned int c_ent = 0u, c_stay = 0u, c_pos = 0u;
             int step = 0;
             for (long long base = seg_start; base < seg_end; base += 32, ++step) {
+                if ((step & 31) == 0) {
+                    const int w = step + lane;
+                    const int have = seg_start + 32LL * w < seg_end;
+                    if (ONE || step < conv) {
+                        c_ent = have ? bw[w] : 0u;
+                        c_stay = have ? bw[RC_PNL_STEPS + w] : 0u;
+                    }
+                    if (!ONE && step + 31 >= conv) c_pos = have && w >= conv ? bw[2 * RC_PNL_STEPS + w] : 0u;
+                }
                 const long long row = base + lane;
                 const int in = row < seg_end;
                 const unsigned int f = in ? (unsigned int)flags[row] : 0u;
                 const unsigned int fst = __ballot_sync(0xffffffffu, (f & 1u) != 0u);
                 const unsigned int lst = __ballot_sync(0xffffffffu, (f & 2u) != 0u);
                 const unsigned int val = __ballot_sync(0xffffffffu, in);
-                const unsigned int m = rc_band_step(state, sh_ent[warp][step], sh_stay[warp][step], fst, __popc(val), hold);
+                unsigned int m;
+                if (!ONE && step >= conv) {
+                    m = __shfl_sync(0xffffffffu, c_pos, step & 31);
+                } else {
+                    const unsigned int ent = __shfl_sync(0xffffffffu, c_ent, step & 31);
+                    const unsigned int stay = __shfl_sync(0xffffffffu, c_stay, step & 31);
+                    m = ONE ? rc_band1_step(state, ent, stay, fst, val, lane)
+                            : rc_band_step(state, ent, stay, fst, __popc(val), hold);
+                }
                 const int pos = (m >> lane) & 1u;
                 const unsigned int prev = ((m << 1) | carry) & ~fst;
                 const unsigned int fl = (m ^ prev) & val;
@@ -2117,7 +2209,6 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 4) pnl_band_kernel(
                 sg[k] = 0.0;
             }
         }
-        __syncthreads();
     }
     bad = __any_sync(0xffffffffu, bad);
     if (lane == 0) {
@@ -2135,13 +2226,38 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 4) pnl_band_kernel(
     rc_pnl_finish<NB>(sh_gross, sh_flips, sh_exits, sh_longs, sh_bad, side, blk, min_trades, p, out, status, totals);
 }
 
-/* #925: the training-score standard deviation of every candidate for
-   `--band-units sd`: the mean, then the centred sum of squares, each in the
-   segment / lane / warp tree of the gross (`trading::score_sd`), over the
-   finite predictions. Writes the sd, `multiple * sd` as the half-width, and
-   the count; fewer than 2 finite rows, equal finite predictions, a zero or a
-   non-finite sd give a half-width of 0 and an sd of NaN. */
-__global__ void __launch_bounds__(RC_MAX_THREADS, 4) pnl_sd_kernel(
+/* #945: `a` takes the pairwise merge (Chan, Golub and LeVeque) of the count,
+   mean and centred sum of squares `a` and `b`, with the count-weighted mean;
+   an empty side leaves the other unchanged (`trading::Moments::merge`). */
+__device__ __forceinline__ void rc_moments_merge(unsigned long long &na, double &ma, double &m2a,
+                                                 unsigned long long nb, double mb, double m2b)
+{
+    if (nb == 0) return;
+    if (na == 0) {
+        na = nb;
+        ma = mb;
+        m2a = m2b;
+        return;
+    }
+    const double fa = (double)na;
+    const double fb = (double)nb;
+    const double fn = (double)(na + nb);
+    const double d = __dsub_rn(mb, ma);
+    ma = __ddiv_rn(__dadd_rn(__dmul_rn(fa, ma), __dmul_rn(fb, mb)), fn);
+    m2a = __dadd_rn(__dadd_rn(m2a, m2b), __dmul_rn(__dmul_rn(d, d), __ddiv_rn(__dmul_rn(fa, fb), fn)));
+    na += nb;
+}
+
+/* #925, #945: the training-score standard deviation of every candidate for
+   `--band-units sd`, in one interpreter pass (`trading::score_sd`): each lane
+   sums its finite predictions of a segment shifted by its first one, `x - k`
+   and `(x - k)^2`, which give its count, mean `k + s / n` and centred sum of
+   squares `q - s * (s / n)` (at least 0); the lanes merge 16, 8, 4, 2, 1, the
+   segments merge into their warp in ascending order and the warps merge 4, 2,
+   1. Writes the sd, `multiple * sd` as the half-width, and the count; fewer
+   than 2 finite rows, equal finite predictions, a zero or a non-finite sd give
+   a half-width of 0 and an sd of NaN. */
+__global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_sd_kernel(
     const float *__restrict__ cols,
     int n,
     const unsigned int *__restrict__ prog,
@@ -2157,97 +2273,94 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 4) pnl_sd_kernel(
         : prog + off[p];
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    __shared__ double sh_sum[RC_PNL_WARPS];
-    __shared__ unsigned long long sh_cnt[RC_PNL_WARPS];
-    __shared__ double sh_mean;
+    __shared__ unsigned long long sh_n[RC_PNL_WARPS];
+    __shared__ double sh_mean[RC_PNL_WARPS];
+    __shared__ double sh_m2[RC_PNL_WARPS];
     __shared__ float sh_min[RC_PNL_WARPS];
     __shared__ float sh_max[RC_PNL_WARPS];
-    __shared__ int sh_const;
     const long long rows = (long long)n;
     const long long nseg = (rows + RC_PNL_SEGMENT_ROWS - 1) / RC_PNL_SEGMENT_ROWS;
-    double mean = 0.0;
-    unsigned long long total = 0;
-    for (int pass = 0; pass < 2; ++pass) {
-        double wsum = 0.0;
-        unsigned long long cnt = 0;
-        float mn = INFINITY, mx = -INFINITY;
-        for (long long s = warp; s < nseg; s += RC_PNL_WARPS) {
-            const long long seg_start = s * RC_PNL_SEGMENT_ROWS;
-            const long long seg_end = (seg_start + RC_PNL_SEGMENT_ROWS < rows)
-                ? seg_start + RC_PNL_SEGMENT_ROWS
-                : rows;
-            double acc = 0.0;
-            for (long long base = seg_start; base < seg_end; base += 32) {
-                const long long row = base + lane;
-                if (row < seg_end) {
-                    const float q = rc_exec_row(code, cols, n, (int)row);
-                    if (isfinite(q)) {
-                        if (pass == 0) {
-                            acc = __dadd_rn(acc, (double)q);
-                            ++cnt;
-                            mn = fminf(mn, q);
-                            mx = fmaxf(mx, q);
-                        } else {
-                            const double d = __dsub_rn((double)q, mean);
-                            acc = __dadd_rn(acc, __dmul_rn(d, d));
-                        }
-                    }
+    unsigned long long wn = 0;
+    double wmean = 0.0, wm2 = 0.0;
+    float mn = INFINITY, mx = -INFINITY;
+    for (long long s = warp; s < nseg; s += RC_PNL_WARPS) {
+        const long long seg_start = s * RC_PNL_SEGMENT_ROWS;
+        const long long seg_end = (seg_start + RC_PNL_SEGMENT_ROWS < rows)
+            ? seg_start + RC_PNL_SEGMENT_ROWS
+            : rows;
+        unsigned int c = 0;
+        double k = 0.0, sum = 0.0, sq = 0.0;
+        for (long long base = seg_start; base < seg_end; base += 32) {
+            const long long row = base + lane;
+            if (row < seg_end) {
+                const float q = rc_exec_row(code, cols, n, (int)row);
+                if (isfinite(q)) {
+                    const double x = (double)q;
+                    if (c == 0) k = x;
+                    ++c;
+                    const double d = __dsub_rn(x, k);
+                    sum = __dadd_rn(sum, d);
+                    sq = __dadd_rn(sq, __dmul_rn(d, d));
+                    mn = fminf(mn, q);
+                    mx = fmaxf(mx, q);
                 }
             }
-            for (int half = 16; half >= 1; half >>= 1) {
-                acc = __dadd_rn(acc, __shfl_down_sync(0xffffffffu, acc, half));
-            }
-            wsum = __dadd_rn(wsum, acc);
+        }
+        unsigned long long ln = c;
+        double lmean = 0.0, lm2 = 0.0;
+        if (c > 0) {
+            const double t = __ddiv_rn(sum, (double)c);
+            lmean = __dadd_rn(k, t);
+            lm2 = __dsub_rn(sq, __dmul_rn(sum, t));
+            if (lm2 < 0.0) lm2 = 0.0;
         }
         for (int half = 16; half >= 1; half >>= 1) {
-            cnt += __shfl_down_sync(0xffffffffu, cnt, half);
-            mn = fminf(mn, __shfl_down_sync(0xffffffffu, mn, half));
-            mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, half));
+            const unsigned long long bn = __shfl_down_sync(0xffffffffu, ln, half);
+            const double bmean = __shfl_down_sync(0xffffffffu, lmean, half);
+            const double bm2 = __shfl_down_sync(0xffffffffu, lm2, half);
+            if (lane < half) rc_moments_merge(ln, lmean, lm2, bn, bmean, bm2);
         }
-        if (lane == 0) {
-            sh_sum[warp] = wsum;
-            sh_cnt[warp] = cnt;
-            sh_min[warp] = mn;
-            sh_max[warp] = mx;
-        }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            double g[RC_PNL_WARPS];
-            unsigned long long c = 0;
-            for (int w = 0; w < RC_PNL_WARPS; ++w) {
-                g[w] = sh_sum[w];
-                c += sh_cnt[w];
-            }
-            for (int half = RC_PNL_WARPS / 2; half >= 1; half >>= 1) {
-                for (int i = 0; i < half; ++i) g[i] = __dadd_rn(g[i], g[i + half]);
-            }
-            float lo = INFINITY, hi = -INFINITY;
-            for (int w = 0; w < RC_PNL_WARPS; ++w) {
-                lo = fminf(lo, sh_min[w]);
-                hi = fmaxf(hi, sh_max[w]);
-            }
-            if (pass == 0) {
-                total = c;
-                sh_const = lo == hi;
-                sh_mean = c > 0 ? __ddiv_rn(g[0], (double)c) : 0.0;
-            } else {
-                double sd = NAN;
-                double hw = 0.0;
-                if (total >= 2 && !sh_const) {
-                    const double v = __dsqrt_rn(__ddiv_rn(g[0], (double)(total - 1)));
-                    if (isfinite(v) && v > 0.0) {
-                        sd = v;
-                        hw = __dmul_rn(multiple, v);
-                    }
-                }
-                out[p].sd = sd;
-                out[p].band = hw;
-                out[p].rows = total;
-            }
-        }
-        __syncthreads();
-        mean = sh_mean;
+        if (lane == 0) rc_moments_merge(wn, wmean, wm2, ln, lmean, lm2);
     }
+    for (int half = 16; half >= 1; half >>= 1) {
+        mn = fminf(mn, __shfl_down_sync(0xffffffffu, mn, half));
+        mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, half));
+    }
+    if (lane == 0) {
+        sh_n[warp] = wn;
+        sh_mean[warp] = wmean;
+        sh_m2[warp] = wm2;
+        sh_min[warp] = mn;
+        sh_max[warp] = mx;
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    unsigned long long gn[RC_PNL_WARPS];
+    double gmean[RC_PNL_WARPS], gm2[RC_PNL_WARPS];
+    float lo = INFINITY, hi = -INFINITY;
+    for (int w = 0; w < RC_PNL_WARPS; ++w) {
+        gn[w] = sh_n[w];
+        gmean[w] = sh_mean[w];
+        gm2[w] = sh_m2[w];
+        lo = fminf(lo, sh_min[w]);
+        hi = fmaxf(hi, sh_max[w]);
+    }
+    for (int half = RC_PNL_WARPS / 2; half >= 1; half >>= 1) {
+        for (int i = 0; i < half; ++i) rc_moments_merge(gn[i], gmean[i], gm2[i], gn[i + half], gmean[i + half], gm2[i + half]);
+    }
+    const unsigned long long total = gn[0];
+    double sd = NAN;
+    double hw = 0.0;
+    if (total >= 2 && lo != hi) {
+        const double v = __dsqrt_rn(__ddiv_rn(gm2[0], (double)(total - 1)));
+        if (isfinite(v) && v > 0.0) {
+            sd = v;
+            hw = __dmul_rn(multiple, v);
+        }
+    }
+    out[p].sd = sd;
+    out[p].band = hw;
+    out[p].rows = total;
 }
 
 /* #484: one instantiation per block count so the per-block accumulators stay
@@ -2262,33 +2375,46 @@ static void rc_pnl_launch(RcCtx *c, const unsigned int *prog, const unsigned int
     const double *excess = (const double *)c->d_pnl_book;
     const unsigned char *flags = c->d_pnl_book + sizeof(double) * (size_t)c->n;
     RcPnlTotals *totals = (RcPnlTotals *)c->d_pnl_totals;
+    c->pnl_sd_timed = 0;
     if (c->pnl_band != 0.0 || c->pnl_hold != 1) {
         const RcPnlSd *sd = 0;
         if (c->pnl_sd_units) {
             sd = (const RcPnlSd *)c->d_pnl_sd;
             rc_launch("pnl_sd_kernel", pnl_sd_kernel, nprog, RC_MAX_THREADS, 0, 0, c->d_cols, c->n, prog, off,
                 width, pooled, c->pnl_band, (RcPnlSd *)c->d_pnl_sd);
+            c->pnl_sd_timed = cudaEventRecord(c->ev_pnl_sd, 0) == cudaSuccess;
         }
-#define RC_PNL_BAND_CASE(K)                                                               \
-    case K:                                                                               \
-        rc_launch("pnl_band_kernel<K>", pnl_band_kernel<K>, nprog, RC_MAX_THREADS, 0, 0,  \
-            c->d_cols, c->n, prog, off, width, pooled, excess, flags, c->pnl_side,        \
-            c->pnl_threshold, blk, c->pnl_min_trades, c->pnl_band, sd, c->pnl_hold,       \
-            c->d_score_out, c->d_score_status, totals);                                   \
+        unsigned int *ballots = (unsigned int *)c->d_pnl_ballots;
+        for (int first = 0; first < nprog; first += RC_PNL_BALLOT_CAP) {
+            const int count = nprog - first < RC_PNL_BALLOT_CAP ? nprog - first : RC_PNL_BALLOT_CAP;
+#define RC_PNL_BAND_CASE(K)                                                                        \
+    case K:                                                                                        \
+        if (c->pnl_hold == 1) {                                                                    \
+            rc_launch("pnl_band_kernel<K, 1>", pnl_band_kernel<K, 1>, count, RC_MAX_THREADS, 0, 0, \
+                c->d_cols, c->n, prog, off, width, pooled, first, excess, flags, c->pnl_side,      \
+                c->pnl_threshold, blk, c->pnl_min_trades, c->pnl_band, sd, c->pnl_hold, ballots,   \
+                c->d_score_out, c->d_score_status, totals);                                        \
+        } else {                                                                                   \
+            rc_launch("pnl_band_kernel<K, 0>", pnl_band_kernel<K, 0>, count, RC_MAX_THREADS, 0, 0, \
+                c->d_cols, c->n, prog, off, width, pooled, first, excess, flags, c->pnl_side,      \
+                c->pnl_threshold, blk, c->pnl_min_trades, c->pnl_band, sd, c->pnl_hold, ballots,   \
+                c->d_score_out, c->d_score_status, totals);                                        \
+        }                                                                                          \
         break;
-        switch (c->pnl_blocks) {
-            RC_PNL_BAND_CASE(1)
-            RC_PNL_BAND_CASE(2)
-            RC_PNL_BAND_CASE(3)
-            RC_PNL_BAND_CASE(4)
-            RC_PNL_BAND_CASE(5)
-            RC_PNL_BAND_CASE(6)
-            RC_PNL_BAND_CASE(7)
-            RC_PNL_BAND_CASE(8)
-            default:
-                break;
-        }
+            switch (c->pnl_blocks) {
+                RC_PNL_BAND_CASE(1)
+                RC_PNL_BAND_CASE(2)
+                RC_PNL_BAND_CASE(3)
+                RC_PNL_BAND_CASE(4)
+                RC_PNL_BAND_CASE(5)
+                RC_PNL_BAND_CASE(6)
+                RC_PNL_BAND_CASE(7)
+                RC_PNL_BAND_CASE(8)
+                default:
+                    break;
+            }
 #undef RC_PNL_BAND_CASE
+        }
         return;
     }
 #define RC_PNL_CASE(K)                                                                   \
@@ -5524,6 +5650,7 @@ static void *rc_create_impl(const float *cols, int n, int v, const float *y,
     c->wrows = n;
     cudaEventCreate(&c->t0);
     cudaEventCreate(&c->t1);
+    cudaEventCreate(&c->ev_pnl_sd);
     c->base_ok = 0;
     c->span_ok[0] = c->span_ok[1] = 0;
     if (cudaEventCreate(&c->ev_base) == cudaSuccess) {
@@ -5618,6 +5745,7 @@ void rc_destroy(void *ctx)
     if (c->d_carry) rc_dev_free(c, c->d_carry);
     if (c->d_pnl_book) rc_dev_free(c, c->d_pnl_book);
     if (c->d_pnl_sd) rc_dev_free(c, c->d_pnl_sd);
+    if (c->d_pnl_ballots) rc_dev_free(c, c->d_pnl_ballots);
     if (c->d_pool[0]) rc_dev_free(c, c->d_pool[0]);
     if (c->d_pool[1]) rc_dev_free(c, c->d_pool[1]);
     if (c->d_hash) rc_dev_free(c, c->d_hash);
@@ -5647,6 +5775,7 @@ void rc_destroy(void *ctx)
     cudaEventDestroy(c->ev_base);
     cudaEventDestroy(c->t0);
     cudaEventDestroy(c->t1);
+    cudaEventDestroy(c->ev_pnl_sd);
     free(c);
 }
 
@@ -6039,6 +6168,21 @@ static int rc_pnl_sd_reserve(RcCtx *c, int nprog)
     return 0;
 }
 
+/* #945: grow the ballot buffer of the band kernels to `blocks` blocks.
+   Returns 0 on success. */
+static int rc_pnl_ballot_reserve(RcCtx *c, int blocks)
+{
+    if (c->pnl_ballot_cap >= blocks) return 0;
+    if (c->d_pnl_ballots) { rc_dev_free(c, c->d_pnl_ballots); c->d_pnl_ballots = 0; }
+    c->pnl_ballot_cap = 0;
+    if (rc_dev_alloc(c, "pnl_ballots", &c->d_pnl_ballots, sizeof(unsigned int) * RC_PNL_BALLOT_WORDS * (size_t)blocks) != 0) {
+        c->d_pnl_ballots = 0;
+        return -1;
+    }
+    c->pnl_ballot_cap = blocks;
+    return 0;
+}
+
 /* #287: AIC-family post-processing, kept on the host so `k` can differ per
    candidate without a device upload. The formula mirrors `metrics.rs`. */
 static double rc_aic_value(int kind, double rss, int n, int k)
@@ -6357,6 +6501,12 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
         st->wall_ms = rc_now_ms() - c->batch_start_ms;
         return -1.0f;
     }
+    if (kind == RC_SCORE_LONG_PNL && (c->pnl_band != 0.0 || c->pnl_hold != 1) &&
+        rc_pnl_ballot_reserve(c, nprog < RC_PNL_BALLOT_CAP ? nprog : RC_PNL_BALLOT_CAP) != 0) {
+        st->failed = 1;
+        st->wall_ms = rc_now_ms() - c->batch_start_ms;
+        return -1.0f;
+    }
     t = rc_now_ms();
     const int wave = c->tiled ? rc_wave_width(c, nprog) : nprog;
     if ((bounds || c->tiled) && rc_carry_reserve(c, wave) != 0) {
@@ -6651,6 +6801,26 @@ int rc_pnl_band_sd(void *ctx, int nprog, RcPnlSd *out)
     if (!c || !out || nprog <= 0 || !c->pnl_sd_units || !c->d_pnl_sd || nprog > c->pnl_sd_cap) return -1;
     rc_download(out, c->d_pnl_sd, sizeof(RcPnlSd) * (size_t)nprog);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+/* #945, test-only: the event time of the sd kernel and of the scorer of the
+   last batch, in milliseconds; the sd time is 0 when no sd kernel ran.
+   Returns 0, or -1 when a time is not available. */
+int rc_pnl_kernel_ms(void *ctx, float *sd_ms, float *score_ms)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !sd_ms || !score_ms) return -1;
+    float a = 0.0f, b = 0.0f;
+    const cudaError_t e = c->pnl_sd_timed
+        ? (cudaEventElapsedTime(&a, c->t0, c->ev_pnl_sd) == cudaSuccess ? cudaEventElapsedTime(&b, c->ev_pnl_sd, c->t1) : cudaErrorInvalidValue)
+        : cudaEventElapsedTime(&b, c->t0, c->t1);
+    if (e != cudaSuccess) {
+        cudaGetLastError();
+        return -1;
+    }
+    *sd_ms = a;
+    *score_ms = b;
+    return 0;
 }
 
 /* #481, test-only: score a packed batch with RC_SCORE_LONG_PNL and also write
