@@ -3610,8 +3610,12 @@ fn fit_pipeline_queue(
     // rest of the generation; the barrier joins them in its own order.
     if g.tail_overlap {
         let base = tail.pending.jobs;
+        // Past `--fit-fallback-max` fits of one generation an early fit could
+        // only be dropped at the barrier.
+        let room = if tail.cap == 0 { usize::MAX } else { tail.cap.saturating_sub(base) };
         let jobs: Vec<FallbackFitJob> = fallbacks[fresh..]
             .iter_mut()
+            .take(room)
             .enumerate()
             .map(|(k, f)| {
                 f.early = Some(base + k);
@@ -3708,6 +3712,8 @@ impl PipelineFallback {
 #[cfg(feature = "cuda")]
 struct PipelineTail<'a> {
     rows: &'a Sample,
+    /// `--fit-fallback-max`.
+    cap: usize,
     pending: PendingTail,
 }
 
@@ -9021,7 +9027,8 @@ fn run_search(
             #[cfg(feature = "cuda")]
             let mut pipeline_fallbacks: Vec<PipelineFallback> = Vec::new();
             #[cfg(feature = "cuda")]
-            let mut pipeline_tail = PipelineTail { rows: gen_train, pending: PendingTail::default() };
+            let mut pipeline_tail =
+                PipelineTail { rows: gen_train, cap: cfg.fit_fallback_max, pending: PendingTail::default() };
             #[cfg(feature = "cuda")]
             let mut fit_queue = PipelineFitQueue::default();
             std::thread::scope(|s| {
