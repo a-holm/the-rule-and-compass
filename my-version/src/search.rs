@@ -12046,6 +12046,32 @@ mod tests {
         );
     }
 
+    /// #958: two tickets in flight on one pool each collect only their own
+    /// results, whichever is collected first.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn pool_keeps_two_tickets_apart() {
+        let s = sample_rows(400);
+        let cfg = Config::default();
+        let view = EvalSample::new(&s, &cfg);
+        let pool = FallbackPool::new(3, 3);
+        let sin = |k: usize| node(Op::Sin, vec![node(Op::Mul, vec![constant(k as f64), input(0)])]);
+        let cos = |k: usize| node(Op::Cos, vec![node(Op::Mul, vec![constant(k as f64), input(0)])]);
+        let first: Vec<Node> = (0..40).map(sin).collect();
+        let second: Vec<Node> = (0..7).map(cos).collect();
+        let a = pool.submit(first.iter().cloned().enumerate().collect(), &view, &cfg);
+        let b = pool.submit(second.iter().cloned().enumerate().collect(), &view, &cfg);
+        let (errors_b, _) = pool.finish(b);
+        let (errors_a, _) = pool.finish(a);
+        for (trees, errors) in [(&first, &errors_a), (&second, &errors_b)] {
+            assert_eq!(trees.len(), errors.len());
+            for (k, (tree, e)) in trees.iter().zip(errors.iter()).enumerate() {
+                let want = score_tree(tree, &view, &cfg);
+                assert_eq!(e.to_bits(), want.to_bits(), "job {k} took another ticket's result");
+            }
+        }
+    }
+
     /// #120: scoring a candidate with the QD layer on must not require the
     /// evaluating descriptor fallback, and must not change the error. This is
     /// the one-pass contract for the CPU scoring path.
