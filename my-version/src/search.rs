@@ -4781,11 +4781,15 @@ pub enum FitFallbackCause {
     /// #936: the f32 start was non-finite while the f64 start is finite
     /// (status 7); the exact CPU fit decides.
     NonFiniteStart,
+    /// #959: the squared-loss polish rejected an undamped step whose model
+    /// predicted a drop above `1e-3` of the loss (status 9), so the answer is
+    /// not a stationary point; the exact CPU fit decides.
+    Unconverged,
 }
 
 impl FitFallbackCause {
     /// Every cause, in reporting order.
-    pub const ALL: [FitFallbackCause; 20] = [
+    pub const ALL: [FitFallbackCause; 21] = [
         FitFallbackCause::UnsupportedPlan,
         FitFallbackCause::TooFewRows,
         FitFallbackCause::TooManyConstants,
@@ -4806,6 +4810,7 @@ impl FitFallbackCause {
         FitFallbackCause::RankDeficient,
         FitFallbackCause::RecoveredIterate,
         FitFallbackCause::NonFiniteStart,
+        FitFallbackCause::Unconverged,
     ];
 
     /// Stable JSON label.
@@ -4831,6 +4836,7 @@ impl FitFallbackCause {
             FitFallbackCause::RankDeficient => "rank_deficient",
             FitFallbackCause::RecoveredIterate => "recovered_iterate",
             FitFallbackCause::NonFiniteStart => "non_finite_start",
+            FitFallbackCause::Unconverged => "unconverged",
         }
     }
 }
@@ -4920,19 +4926,21 @@ pub(crate) fn gpu_status_label(status: i32) -> Option<&'static str> {
         6 => Some("no_improvement"),
         7 => Some("start_unusable"),
         8 => Some("recovered_skipped"),
+        9 => Some("unconverged"),
         _ => None,
     }
 }
 
 /// #936: the LM kernel statuses whose result is not kept: 4 (rank deficient),
-/// 5 (recovered last iterate) and 7 (non-finite f32 start). The exact CPU fit
-/// refits them from the starting constants.
+/// 5 (recovered last iterate), 7 (non-finite f32 start) and (#959) 9
+/// (unconverged). The exact CPU fit refits them from the starting constants.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn tail_status_cause(status: i32) -> Option<FitFallbackCause> {
     match status {
         4 => Some(FitFallbackCause::RankDeficient),
         5 => Some(FitFallbackCause::RecoveredIterate),
         7 => Some(FitFallbackCause::NonFiniteStart),
+        9 => Some(FitFallbackCause::Unconverged),
         _ => None,
     }
 }
@@ -9621,6 +9629,7 @@ mod tests {
             (4, FitFallbackCause::RankDeficient),
             (5, FitFallbackCause::RecoveredIterate),
             (7, FitFallbackCause::NonFiniteStart),
+            (9, FitFallbackCause::Unconverged),
         ] {
             let mut t = tree.clone();
             assert_eq!(apply_device_fit(&plan, &mut t, &out(status, vec![2.0, 3.0])), Some(cause));
@@ -10323,6 +10332,10 @@ mod tests {
                 "worse",
                 "not_identifiable",
                 "affine_closed_form",
+                "rank_deficient",
+                "recovered_iterate",
+                "non_finite_start",
+                "unconverged",
             ]
         );
         assert_eq!(

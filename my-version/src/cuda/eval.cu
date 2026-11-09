@@ -4091,6 +4091,24 @@ __device__ int ft_solve(const double *jtj,
     return rank_deficient ? 4 : 0;
 }
 
+/* #959: the squared-loss decrease the Gauss-Newton model predicts for the step
+   `d` from the system `jtj` (packed lower) and `jtr`: −(2 dᵀJᵀr + dᵀJᵀJ d). */
+__device__ double ft_model_drop(const double *jtj, const double *jtr, const double *d, int p)
+{
+    double lin = 0.0;
+    double quad = 0.0;
+    for (int i = 0; i < p; ++i) {
+        lin += d[i] * jtr[i];
+        quad += jtj[i * (i + 1) / 2 + i] * d[i] * d[i];
+        for (int j = 0; j < i; ++j) quad += 2.0 * jtj[i * (i + 1) / 2 + j] * d[i] * d[j];
+    }
+    return -(2.0 * lin + quad);
+}
+
+/* #959: a rejected undamped polish step whose model drop exceeds this
+   fraction of the loss leaves a point that is not stationary (status 9). */
+#define FT_UNCONVERGED_DROP 1e-3
+
 __global__ void cast_f32_to_f64_kernel(const float *__restrict__ src,
                                       double *__restrict__ dst,
                                       long long n)
@@ -4666,6 +4684,8 @@ __device__ __forceinline__ void fit_kernel_body(FIT_KERNEL_PARAMS)
     /* #236: 1 when the slope arm returned the incoming constants. */
     int kept = 0;
     double kept_loss = 0.0;
+    /* #959: set by thread 0 only, read by thread 0 in the status block. */
+    int unconverged = 0;
 
     if (iters > 0) {
         /* First assembly also supplies the baseline objective. */
@@ -4804,6 +4824,10 @@ __device__ __forceinline__ void fit_kernel_body(FIT_KERNEL_PARAMS)
                 best = tsse;
                 if (tid == 0) S->simproved = 1;
             } else {
+                if (tid == 0 && metric == RC_LOSS_SQUARED) {
+                    const double drop = ft_model_drop(S->sjtj, S->sjtr, S->sdelta, p);
+                    unconverged = isfinite(drop) && drop > FT_UNCONVERGED_DROP * best;
+                }
                 break;
             }
             __syncthreads();
@@ -4840,6 +4864,8 @@ __device__ __forceinline__ void fit_kernel_body(FIT_KERNEL_PARAMS)
      *   6 no_improvement   finite start, no trial improved it
      *   7 start_unusable   the start itself has no finite value (log only)
      *   8 recovered_skipped a finite answer whose bad-gradient rows were skipped
+     *   9 unconverged      squared loss: the polish rejected an undamped step
+     *                      whose model drop exceeds FT_UNCONVERGED_DROP * loss
      * Only a genuine arithmetic failure with no finite start remains status 1,
      * and only a non-finite start with no accepted iterate is status 7; neither
      * needs the CPU arm, which cannot move a non-finite start either. */
@@ -4854,6 +4880,7 @@ __device__ __forceinline__ void fit_kernel_body(FIT_KERNEL_PARAMS)
             if (S->sskip > 0) status = 8;
             else if (S->srank) status = 4;
             else if (!S->simproved && iters > 0) status = 6;
+            else if (unconverged) status = 9;
         }
         for (int i = 0; i < p; ++i) outc[(size_t)cand * (size_t)kmax + (size_t)i] = S->sc[i];
         outsse[cand] = best;
