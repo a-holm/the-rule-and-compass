@@ -7230,6 +7230,9 @@ fn prepare_seeds(
         // #14: otherwise fit on the objective the metric actually scores.
         let mut fitted = None;
         if cfg.fit_iters > 0 && !train.sample.is_multi() {
+            // #982: a seed in standardised inputs, `c*(x*s + m) + d`, has
+            // redundant constants; fold them so the fit is identified.
+            tree = crate::fold::fold_constants(&tree).0;
             fitted = fit_constants(&mut tree, cfg, train.sample, train.sample); // #85 #87
             tree = expr::simplify(&tree);
         }
@@ -11428,6 +11431,24 @@ mod tests {
             "the fitted constant must replace 3, got {}",
             shown
         );
+    }
+
+    /// #982: a standardised seed `c*(x*s + m) + d` is folded to one scale and
+    /// one offset before its CPU fit, and the fit reaches the line.
+    #[test]
+    fn prepare_seeds_folds_a_standardised_seed_before_the_fit() {
+        let x: Vec<Vec<f64>> = (0..200).map(|i| vec![-1.0 + i as f64 / 100.0]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 0.0104 * r[0] - 0.0028).collect();
+        let s = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
+        let cfg = Config { fit_iters: 8, metric: Metric::Squared, ..Config::default() };
+        let affine = node(Op::Add, vec![node(Op::Mul, vec![input(0), constant(1.7)]), constant(0.3)]);
+        let seed = node(Op::Add, vec![node(Op::Mul, vec![constant(0.5), affine]), constant(0.1)]);
+        let aggs = AggTable::from_sample(&s);
+        let data = EvalSample::new(&s, &cfg);
+        let accepted = prepare_seeds(&cfg, &data, &[seed], &aggs);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(expr::count_constants(&accepted[0].tree), 2, "{:?}", accepted[0].tree);
+        assert!(accepted[0].error < 1e-12, "error = {}", accepted[0].error);
     }
 
     /// #86: a carried individual must be refitted on the generation's rows

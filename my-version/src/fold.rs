@@ -42,11 +42,13 @@ impl Factor {
         }
     }
 
+    /// A zero factor may scale (each scaled term becomes a zero constant the
+    /// fit can move) but never divide.
     fn usable(self) -> bool {
-        let k = match self {
-            Factor::Mul(k) | Factor::Div(k) => k,
-        };
-        k.is_finite() && k != 0.0
+        match self {
+            Factor::Mul(k) => k.is_finite(),
+            Factor::Div(k) => k.is_finite() && k != 0.0,
+        }
     }
 }
 
@@ -470,6 +472,19 @@ mod tests {
         check_rule(mul(neg(mul(c(3.0), x(1))), mul(c(0.5), x(0))), 1);
     }
 
+    /// A zero factor leaves the terms it scales as live zero constants, so the
+    /// dead constants under it can move again.
+    #[test]
+    fn a_zero_factor_folds_into_live_zero_constants() {
+        let xs = rows(64, 2, 0.25, 2.0, 7);
+        let t = mul(c(0.0), add(c(0.5), mul(c(3.0), x(0))));
+        let (f, n) = fold_constants(&t);
+        assert_eq!(n, 1);
+        assert!(same(&f, &add(c(0.0), mul(c(0.0), x(0)))), "{f:?}");
+        assert_eq!(max_rel(&t, &f, &xs), 0.0);
+        assert_eq!(rank(&f, &xs), 2);
+    }
+
     #[test]
     fn a_constant_distributes_into_both_branches_of_an_if() {
         let cond = || sub(x(0), x(1));
@@ -504,8 +519,8 @@ mod tests {
             mul(c(3.0), node(Op::If, vec![x(1), mul(c(0.5), x(0)), x(0)])),
             add(c(1.0), node(Op::If, vec![add(c(0.5), x(1)), x(0), add(c(2.0), x(0))])),
             mul(c(3.0), node(Op::Exp, vec![add(c(0.5), x(0))])),
-            // A zero or non-finite factor is not folded.
-            mul(c(0.0), mul(c(0.5), x(0))),
+            // A non-finite factor or a division by zero is not folded.
+            div(mul(c(0.5), x(0)), c(0.0)),
             mul(c(f64::INFINITY), mul(c(0.5), x(0))),
             mul(c(1e300), mul(c(1e300), x(0))),
         ];
