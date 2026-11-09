@@ -1225,6 +1225,49 @@ fn band_search_fixture(band: f64, units: BandUnits, hold: usize) -> (Sample, Arc
     (sample, Arc::new(band_book(&f, band, units, hold, 1)))
 }
 
+/// Every in-run archive value of a device band search against an independent
+/// reference: the CPU band book applied to the member's `f32` predictions from
+/// a fresh device interpreter (`rc_predict`, no device book). A slot the search
+/// settles on the CPU takes the exact `f64` regret: a tree without a device
+/// program, a non-finite `f32` prediction (#589) and a device `+inf` trade
+/// floor (#640). The plain book on the same predictions must differ for some
+/// member, so a device path that drops the band cannot pass.
+fn assert_archived_values_are_the_cpu_band_book(sample: &Sample, b: &FitnessBook, plain: &FitnessBook, seen: &Archived) {
+    let cols: Vec<f32> = (0..2)
+        .flat_map(|v| sample.x.iter().map(move |r| r[v] as f32))
+        .collect();
+    let y: Vec<f32> = sample.y.iter().map(|&v| v as f32).collect();
+    let mut ev = GpuEvaluator::new(&cols, sample.len(), 2, &y).expect("a fresh evaluator");
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    let (mut on_device, mut band_matters) = (0usize, 0usize);
+    for (tree, error) in seen.iter() {
+        let pred64: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(tree, r)).collect();
+        let exact = b.regret(&pred64);
+        let pop = Population::from_trees(std::iter::once(tree));
+        let want = if pop.len() == 1 {
+            let (prog, off) = pop.programs();
+            let words = &prog[off[0] as usize..off[1] as usize];
+            let pred32: Vec<f64> = ev.predict_one_for_tests(words).expect("the device predicts").iter().map(|&p| p as f64).collect();
+            let device = b.regret(&pred32);
+            if pred32.iter().any(|p| !p.is_finite()) || device.is_infinite() {
+                exact
+            } else {
+                on_device += 1;
+                if plain.regret(&pred32).to_bits() != device.to_bits() {
+                    band_matters += 1;
+                }
+                device
+            }
+        } else {
+            exact
+        };
+        assert_eq!(error.to_bits(), want.to_bits(), "{} archived {error}, CPU band book {want}", show(tree));
+    }
+    assert!(on_device > 0, "no archived value came from the device");
+    assert!(band_matters > 0, "the band changes no archived value");
+}
+
 #[test]
 fn band_pipelined_search_archives_device_scores() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
@@ -1234,10 +1277,11 @@ fn band_pipelined_search_archives_device_scores() {
     }
     for (band, units, hold) in [(0.2, BandUnits::Score, 4), (0.5, BandUnits::Sd, 3)] {
         let (sample, b) = band_search_fixture(band, units, hold);
+        let plain = book(&fixture(&[0, 600, 1200, 1800], 2_400, 17), 1);
         let seen: Archived = Arc::default();
         let out = search::run(&config(&b, &seen), &sample, &sample);
         assert_device_scored(&out);
-        assert_archived_values_are_device_scores(&sample, &b, &seen);
+        assert_archived_values_are_the_cpu_band_book(&sample, &b, &plain, &seen);
         for s in &out.archive.items {
             let pred: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(&s.tree, r)).collect();
             assert_eq!(s.error.to_bits(), b.regret(&pred).to_bits(), "{}", show(&s.tree));
