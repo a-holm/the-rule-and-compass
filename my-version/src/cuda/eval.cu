@@ -2685,10 +2685,12 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) predict_kernel(const float 
  * p=20 with a 256-row chunk needs about 50.8 KB, above the 48 KB static limit
  * and only one block per SM, while the 128-row chunk keeps it near 38.1 KB so
  * two blocks still fit per SM on sm_86. p<=16 keeps the 256-row chunk it was
- * measured with. Both instantiate the same code, and every statistic is
- * accumulated over rows in ascending index order by one thread, so the chunk
- * size changes which thread owns which row, never the sum: a candidate's
- * constants are bit-identical whichever instantiation fits it. */
+ * measured with. Both instantiate the same code. The assemblies accumulate
+ * every statistic over rows in ascending index order in one thread, and the
+ * value sweeps sum into FT_RED_LANES lanes whatever the block width (#977), so
+ * the chunk size changes which thread owns which row, never a sum: a
+ * candidate's constants, loss and status are bit-identical whichever
+ * instantiation fits it, and do not depend on its batch-mates. */
 #define FT_MAX_NODES 96
 #define FT_MAX_CONST_SMALL 16
 #define FT_CHUNK_SMALL 256
@@ -3493,6 +3495,37 @@ __device__ void ft_assemble_slope_d(const unsigned int *nd,
     __syncthreads();
 }
 
+/* #977: the f32 value sweeps (`ft_loss`, `ft_loss_slope`, `ft_corr_score`) sum
+   into FT_RED_LANES lanes whatever the block width. Lane `l` adds rows `l`,
+   `l + FT_RED_LANES`, ... in ascending order, and the lanes meet in one fixed
+   tree. A thread of a CHUNK-wide block holds lanes `tid + v * CHUNK` in slot
+   `v` and folds them as the tree's first levels, so a sweep has the same bits
+   in both instantiations. */
+#define FT_RED_LANES FT_CHUNK_SMALL
+
+/* Fold this thread's lanes, then the block tree over `red` (CHUNK slots). */
+template <int CHUNK>
+__device__ __forceinline__ double ft_lane_reduce(double *lane, double *red)
+{
+    static_assert(FT_RED_LANES % CHUNK == 0, "the block width divides the lane count");
+    constexpr int VL = FT_RED_LANES / CHUNK;
+#pragma unroll
+    for (int h = VL / 2; h > 0; h >>= 1) {
+#pragma unroll
+        for (int v = 0; v < h; ++v) lane[v] += lane[v + h];
+    }
+    const int tid = threadIdx.x;
+    red[tid] = lane[0];
+    __syncthreads();
+    for (int st = CHUNK / 2; st > 0; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    const double total = red[0];
+    __syncthreads();
+    return total;
+}
+
 /* Trial objective `Σ |g|` over the pairs (r - 1, r): each thread runs both rows
    of its pairs, so the sweep needs no synchronisation before the fixed-order
    reduction. A non-finite or f32-overflowing prediction adds 1e30. */
@@ -3506,36 +3539,36 @@ __device__ double ft_loss_slope(const unsigned int *nd,
                                 const double *c,
                                 double *red)
 {
+    constexpr int VL = FT_RED_LANES / CHUNK;
     const int tid = threadIdx.x;
-    double local = 0.0;
-    for (int row = tid; row < n; row += CHUNK) {
-        if (row < 1 && !pmask) continue;
-        float vt[FT_MAX_NODES];
-        ft_forward(nd, m, cols, n, row, c, vt);
-        const float pc = vt[m - 1];
-        if (!isfinite(pc) || fabsf(pc) > 1e30f) {
-            local += 1e30;
-            continue;
+    double lane[VL];
+#pragma unroll
+    for (int v = 0; v < VL; ++v) lane[v] = 0.0;
+    for (int base = tid; base < n; base += FT_RED_LANES) {
+#pragma unroll
+        for (int v = 0; v < VL; ++v) {
+            const int row = base + v * CHUNK;
+            if (row >= n) break;
+            if (row < 1 && !pmask) continue;
+            float vt[FT_MAX_NODES];
+            ft_forward(nd, m, cols, n, row, c, vt);
+            const float pc = vt[m - 1];
+            if (!isfinite(pc) || fabsf(pc) > 1e30f) {
+                lane[v] += 1e30;
+                continue;
+            }
+            if (row < 1 || (pmask && !rc_pair_on(pmask, row))) continue;
+            ft_forward(nd, m, cols, n, row - 1, c, vt);
+            const float pp = vt[m - 1];
+            if (!isfinite(pp) || fabsf(pp) > 1e30f) {
+                lane[v] += 1e30;
+                continue;
+            }
+            const double g = ((double)pc - (double)pp) - ((double)y[row] - (double)y[row - 1]);
+            lane[v] += isfinite(g) ? fabs(g) : 1e30;
         }
-        if (row < 1 || (pmask && !rc_pair_on(pmask, row))) continue;
-        ft_forward(nd, m, cols, n, row - 1, c, vt);
-        const float pp = vt[m - 1];
-        if (!isfinite(pp) || fabsf(pp) > 1e30f) {
-            local += 1e30;
-            continue;
-        }
-        const double g = ((double)pc - (double)pp) - ((double)y[row] - (double)y[row - 1]);
-        local += isfinite(g) ? fabs(g) : 1e30;
     }
-    red[tid] = local;
-    __syncthreads();
-    for (int st = CHUNK / 2; st > 0; st >>= 1) {
-        if (tid < st) red[tid] += red[tid + st];
-        __syncthreads();
-    }
-    const double total = red[0];
-    __syncthreads();
-    return total;
+    return ft_lane_reduce<CHUNK>(lane, red);
 }
 
 /* The f64 twin of `ft_loss_slope` on the exact rows. */
@@ -3944,46 +3977,46 @@ __device__ double ft_loss(const unsigned int *nd,
                           double *red)
 {
     if (metric == RC_LOSS_SLOPE) return ft_loss_slope<CHUNK>(nd, m, cols, y, pmask, n, c, red);
+    constexpr int VL = FT_RED_LANES / CHUNK;
     const int tid = threadIdx.x;
-    double local = 0.0;
-    for (int row = tid; row < n; row += CHUNK) {
-        const double wr = w ? w[row] : 1.0;
-        if (wr <= 0.0) continue; /* a masked row never influences the fit */
-        float vt[FT_MAX_NODES];
-        ft_forward(nd, m, cols, n, row, c, vt);
-        const float pred = vt[m - 1];
-        const float r = pred - y[row];
-        if (!isfinite(pred) || fabsf(pred) > 1e30f || !isfinite(r)) {
-            local += 1e30;
-        } else if (metric == RC_LOSS_LOGISTIC) {
-            /* #234: the configured loss is the logistic cross-entropy of the
-               signed margin, never an SSE of the 0/1 target. */
-            const double tt = tsign ? (double)tsign[row] : 0.0;
-            local += isfinite(tt) ? wr * rc_softplus_neg(tt * (double)pred) : 1e30;
-        } else if (rc_fit_class_code(metric) >= 0) {
-            const double tt = tsign ? (double)tsign[row] : 0.0;
-            local += isfinite(tt)
-                         ? wr * (double)rc_class_row_loss(pred, (float)tt, rc_fit_class_code(metric))
-                         : 1e30;
-        } else if (metric == RC_LOSS_SQUARED) {
-            /* Keep the historical f64 square: the f32 product would round the
-               trial score differently from the assembly's own statistic. */
-            local += wr * (double)r * (double)r;
-        } else {
-            /* #222: the configured objective itself (`|r|`, `ln(1+r²)`), in
-               f32 per row and f64 in the sum, exactly like the assembly. */
-            local += wr * (double)rc_row_loss(r, metric);
+    double lane[VL];
+#pragma unroll
+    for (int v = 0; v < VL; ++v) lane[v] = 0.0;
+    for (int base = tid; base < n; base += FT_RED_LANES) {
+#pragma unroll
+        for (int v = 0; v < VL; ++v) {
+            const int row = base + v * CHUNK;
+            if (row >= n) break;
+            const double wr = w ? w[row] : 1.0;
+            if (wr <= 0.0) continue; /* a masked row never influences the fit */
+            float vt[FT_MAX_NODES];
+            ft_forward(nd, m, cols, n, row, c, vt);
+            const float pred = vt[m - 1];
+            const float r = pred - y[row];
+            if (!isfinite(pred) || fabsf(pred) > 1e30f || !isfinite(r)) {
+                lane[v] += 1e30;
+            } else if (metric == RC_LOSS_LOGISTIC) {
+                /* #234: the configured loss is the logistic cross-entropy of the
+                   signed margin, never an SSE of the 0/1 target. */
+                const double tt = tsign ? (double)tsign[row] : 0.0;
+                lane[v] += isfinite(tt) ? wr * rc_softplus_neg(tt * (double)pred) : 1e30;
+            } else if (rc_fit_class_code(metric) >= 0) {
+                const double tt = tsign ? (double)tsign[row] : 0.0;
+                lane[v] += isfinite(tt)
+                               ? wr * (double)rc_class_row_loss(pred, (float)tt, rc_fit_class_code(metric))
+                               : 1e30;
+            } else if (metric == RC_LOSS_SQUARED) {
+                /* Keep the historical f64 square: the f32 product would round the
+                   trial score differently from the assembly's own statistic. */
+                lane[v] += wr * (double)r * (double)r;
+            } else {
+                /* #222: the configured objective itself (`|r|`, `ln(1+r²)`), in
+                   f32 per row and f64 in the sum, exactly like the assembly. */
+                lane[v] += wr * (double)rc_row_loss(r, metric);
+            }
         }
     }
-    red[tid] = local;
-    __syncthreads();
-    for (int st = CHUNK / 2; st > 0; st >>= 1) {
-        if (tid < st) red[tid] += red[tid + st];
-        __syncthreads();
-    }
-    const double total = red[0];
-    __syncthreads();
-    return total;
+    return ft_lane_reduce<CHUNK>(lane, red);
 }
 
 /* Damped Cholesky solve in f64. Returns 0 on success, 4 when the *undamped*
@@ -4351,42 +4384,53 @@ __device__ double ft_corr_score(const unsigned int *nd,
                                 double *red,
                                 int metric)
 {
+    constexpr int VL = FT_RED_LANES / CHUNK;
     const int tid = threadIdx.x;
-    double sw = 0.0, sf = 0.0, sf2 = 0.0, sft = 0.0, st = 0.0, st2 = 0.0;
-    for (int row = tid; row < n; row += CHUNK) {
-        const double wr = (w) ? w[row] : 1.0;
-        if (wr <= 0.0) continue;
-        float vt[FT_MAX_NODES];
-        ft_forward(nd, m, cols, n, row, c, vt);
-        const double f = (double)vt[m - 1];
-        const double t = (double)y[row];
-        if (!isfinite(f) || fabs(f) > 1e30 || !isfinite(t)) {
-            sw = 1.0;
-            sf = 1e30;
-            sf2 = 1e60;
-            sft = 0.0;
-            st = 0.0;
-            st2 = 0.0;
-            break;
-        }
-        sw += wr;
-        sf += wr * f;
-        sf2 += wr * f * f;
-        sft += wr * f * t;
-        st += wr * t;
-        st2 += wr * t * t;
+    /* sw, sf, sf2, sft, st, st2 per lane. */
+    double acc[6][VL];
+    bool open[VL];
+    int live = VL;
+#pragma unroll
+    for (int v = 0; v < VL; ++v) {
+#pragma unroll
+        for (int q = 0; q < 6; ++q) acc[q][v] = 0.0;
+        open[v] = true;
     }
-    double vals[6] = {sw, sf, sf2, sft, st, st2};
-    for (int q = 0; q < 6; ++q) {
-        red[tid] = vals[q];
-        __syncthreads();
-        for (int s = CHUNK / 2; s > 0; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            __syncthreads();
+    for (int base = tid; base < n && live > 0; base += FT_RED_LANES) {
+#pragma unroll
+        for (int v = 0; v < VL; ++v) {
+            const int row = base + v * CHUNK;
+            if (row >= n) break;
+            if (!open[v]) continue;
+            const double wr = (w) ? w[row] : 1.0;
+            if (wr <= 0.0) continue;
+            float vt[FT_MAX_NODES];
+            ft_forward(nd, m, cols, n, row, c, vt);
+            const double f = (double)vt[m - 1];
+            const double t = (double)y[row];
+            if (!isfinite(f) || fabs(f) > 1e30 || !isfinite(t)) {
+                /* The lane stops at its first bad row with these sums. */
+                acc[0][v] = 1.0;
+                acc[1][v] = 1e30;
+                acc[2][v] = 1e60;
+                acc[3][v] = 0.0;
+                acc[4][v] = 0.0;
+                acc[5][v] = 0.0;
+                open[v] = false;
+                --live;
+                continue;
+            }
+            acc[0][v] += wr;
+            acc[1][v] += wr * f;
+            acc[2][v] += wr * f * f;
+            acc[3][v] += wr * f * t;
+            acc[4][v] += wr * t;
+            acc[5][v] += wr * t * t;
         }
-        vals[q] = red[0];
-        __syncthreads();
     }
+    double vals[6];
+#pragma unroll
+    for (int q = 0; q < 6; ++q) vals[q] = ft_lane_reduce<CHUNK>(acc[q], red);
     const double W = vals[0];
     if (!(W > 0.0)) return 1e30;
     const double mf = vals[1] / W;

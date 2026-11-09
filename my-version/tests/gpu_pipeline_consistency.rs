@@ -558,3 +558,112 @@ fn overwritten_slot_keeps_the_error_of_its_own_tree() {
     }
     assert!(failures.is_empty(), "overwritten slots store the offered tree's error: {failures:?}");
 }
+
+/// #977: `c0 + c1 x0 + c2 x1 + c3 tanh(c4 x0) + c5 sin(c6 x0 + c7)
+/// + c8 cos(c9 x1 + c10) + c11 gauss(c12 x0) + c13 x0 x1 + c14 x1² + c15 (c16 x0)³`
+/// (17 constants), and with `wide` also `+ c17 tanh(c18 x1 + c19)` (20).
+#[cfg(feature = "cuda")]
+fn many_constants(wide: bool) -> Node {
+    use rcsr::expr::{constant as c, input, node};
+    let (x0, x1) = (input(0), input(1));
+    let mul = |a: Node, b: Node| node(Op::Mul, vec![a, b]);
+    let add = |a: Node, b: Node| node(Op::Add, vec![a, b]);
+    let terms = vec![
+        c(0.1),
+        mul(c(0.9), x0.clone()),
+        mul(c(0.3), x1.clone()),
+        mul(c(0.5), node(Op::Tanh, vec![mul(c(1.2), x0.clone())])),
+        mul(c(0.2), node(Op::Sin, vec![add(mul(c(0.8), x0.clone()), c(0.1))])),
+        mul(c(0.1), node(Op::Cos, vec![add(mul(c(1.1), x1.clone()), c(0.2))])),
+        mul(c(0.3), node(Op::Gauss, vec![mul(c(0.6), x0.clone())])),
+        mul(c(0.05), mul(x0.clone(), x1.clone())),
+        mul(c(0.07), node(Op::Square, vec![x1.clone()])),
+        mul(c(0.02), node(Op::Cube, vec![mul(c(0.4), x0.clone())])),
+    ];
+    let mut tree = terms.into_iter().reduce(add).expect("terms");
+    if wide {
+        tree = add(tree, mul(c(0.15), node(Op::Tanh, vec![add(mul(c(0.9), x1), c(0.05))])));
+    }
+    tree
+}
+
+/// #977: what a run must not change when only the device batch composition
+/// changes: every snapshot's trees with their constants and errors, bit for
+/// bit, the archive hash of every generation and the final archive hash.
+#[cfg(feature = "cuda")]
+#[derive(Debug, PartialEq)]
+struct Replay {
+    snapshots: Vec<Vec<(u64, u64)>>,
+    archive_hashes: Vec<u64>,
+    final_hash: u64,
+}
+
+/// #977: the overlap pipeline groups candidates into device fit calls in the
+/// order they reach the queue, so the batch-mates of a candidate depend on the
+/// pipeline depth here (and on island-thread timing in a real run). Seeds with
+/// 17 and 20 constants put candidates above 16 constants into some calls and
+/// not into others. The runs at depth 2 and 4 must agree bit for bit.
+#[cfg(feature = "cuda")]
+#[test]
+fn pipeline_fit_bits_independent_of_batch_mates() {
+    if !device_available() {
+        return;
+    }
+    let train = sample(2_048, 5);
+    let test = sample(256, 6);
+    let seeds = [many_constants(false), many_constants(true)];
+    assert_eq!(rcsr::expr::count_constants(&seeds[0]), 17);
+    assert_eq!(rcsr::expr::count_constants(&seeds[1]), 20);
+    let mut failures = Vec::new();
+    for metric in [Metric::Squared, Metric::Absolute] {
+        let mut runs = Vec::new();
+        let mut wide = 0usize;
+        for depth in [2usize, 4] {
+            let mut cfg = config(depth, 13);
+            cfg.ops.retain(|&op| op != Op::Asinh);
+            cfg.metric = metric;
+            cfg.pop = 256;
+            cfg.generations = 4;
+            cfg.max_complexity = 60;
+            let mut snapshots = Vec::new();
+            let mut archive_hashes = Vec::new();
+            let mut large = std::collections::BTreeSet::new();
+            let out = search::run_resumable_seeded(&cfg, &train, &test, None, 1, &seeds, |cp: &Checkpoint| {
+                let mut snap = Vec::new();
+                for ind in cp.islands.iter().flat_map(|isl| isl.population.iter()) {
+                    let h = rcsr::expr::structural_hash(&ind.tree);
+                    if (17..=20).contains(&rcsr::expr::count_constants(&ind.tree)) {
+                        large.insert(h);
+                    }
+                    snap.push((h, ind.error.to_bits()));
+                }
+                snapshots.push(snap);
+                archive_hashes.push(cp.archive.hash());
+            })
+            .expect("search runs");
+            let g = out.gpu.as_ref().expect("device run");
+            eprintln!(
+                "{metric:?} depth {depth}: fit calls {}, candidates {}, trees with 17..20 constants {}, final {:016x}",
+                g.fit_calls,
+                g.fit_call_candidates,
+                large.len(),
+                out.archive.hash()
+            );
+            wide = wide.max(large.len());
+            runs.push(Replay { snapshots, archive_hashes, final_hash: out.archive.hash() });
+        }
+        assert!(
+            wide > seeds.len(),
+            "{metric:?}: no fitted candidate above 16 constants beside the seeds, the case is not exercised"
+        );
+        let (a, b) = (&runs[0], &runs[1]);
+        if a != b {
+            let first = a.snapshots.iter().zip(&b.snapshots).position(|(x, y)| x != y);
+            failures.push(format!(
+                "{metric:?}: first differing snapshot {first:?}, archive hashes {:x?} vs {:x?}, final {:016x} vs {:016x}",
+                a.archive_hashes, b.archive_hashes, a.final_hash, b.final_hash
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "batch composition changed the run: {failures:#?}");
+}
