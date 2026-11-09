@@ -695,6 +695,282 @@ pub fn select_band(
     })
 }
 
+// ---------------------------------------------------------------------------
+// #928: robust finalist selection over validation blocks
+// ---------------------------------------------------------------------------
+
+/// Bootstrap resamples of the standard error.
+pub const ROBUST_RESAMPLES: usize = 500;
+/// Seed of the bootstrap; every member sees the same draws.
+pub const ROBUST_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+/// Default circular block length, in periods.
+pub const ROBUST_BLOCK_LEN: usize = 21;
+
+/// `--select-rule`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectRule {
+    ValidationObjective,
+    Robust,
+}
+
+impl SelectRule {
+    pub fn parse(s: &str) -> Result<SelectRule, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "validation_objective" | "validation-objective" => Ok(SelectRule::ValidationObjective),
+            "robust" => Ok(SelectRule::Robust),
+            other => Err(format!(
+                "unknown --select-rule '{}' (expected validation_objective or robust)",
+                other
+            )),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SelectRule::ValidationObjective => "validation_objective",
+            SelectRule::Robust => "robust",
+        }
+    }
+}
+
+/// The post-loop selection request. It is not search state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RobustParams {
+    pub blocks: usize,
+    pub se_z: f64,
+    pub block_len: usize,
+}
+
+impl RobustParams {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.blocks == 0 || self.blocks > crate::trading::FITNESS_MAX_BLOCKS {
+            return Err(format!(
+                "--select-blocks must be 1 to {}, got {}",
+                crate::trading::FITNESS_MAX_BLOCKS,
+                self.blocks
+            ));
+        }
+        if !self.se_z.is_finite() || self.se_z < 0.0 {
+            return Err(format!("--select-se must be finite and >= 0, got {}", self.se_z));
+        }
+        if self.block_len == 0 {
+            return Err("--select-block-len must be at least 1".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl Default for RobustParams {
+    fn default() -> Self {
+        RobustParams { blocks: 4, se_z: 1.0, block_len: ROBUST_BLOCK_LEN }
+    }
+}
+
+/// What the rule knows about a member before scoring it.
+#[derive(Clone, Copy, Debug)]
+pub struct RobustMeta {
+    pub archive_rank: usize,
+    pub complexity: f64,
+    /// False for a member the validation book cannot use (no book, or a fixed
+    /// position under `--reject-fixed-position`); it is never eligible.
+    pub usable: bool,
+    /// The validation objective of the member (lower is better), the key of
+    /// `validation_objective`.
+    pub objective: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RobustMember {
+    pub archive_rank: usize,
+    pub complexity: f64,
+    pub trades: usize,
+    pub block_alpha: Vec<f64>,
+    pub pooled_alpha: f64,
+    pub se: f64,
+    pub eligible: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RobustSelection {
+    pub params: RobustParams,
+    pub members: Vec<RobustMember>,
+    /// Index into `members`; `None` is the `no_signal` verdict.
+    pub chosen: Option<usize>,
+}
+
+struct SplitMix(u64);
+
+impl SplitMix {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+}
+
+/// Standard error of the mean of `series` under a circular block bootstrap.
+pub fn circular_block_se(series: &[f64], block_len: usize, resamples: usize, seed: u64) -> f64 {
+    let t = series.len();
+    if t < 2 || resamples < 2 {
+        return 0.0;
+    }
+    let len = block_len.clamp(1, t);
+    let mut prefix = vec![0.0f64; 2 * t + 1];
+    for k in 0..2 * t {
+        prefix[k + 1] = prefix[k] + series[k % t];
+    }
+    let mut rng = SplitMix(seed);
+    let mut means = Vec::with_capacity(resamples);
+    for _ in 0..resamples {
+        let mut sum = 0.0f64;
+        let mut taken = 0usize;
+        while taken < t {
+            let start = (rng.next() % t as u64) as usize;
+            let take = len.min(t - taken);
+            sum += prefix[start + take] - prefix[start];
+            taken += take;
+        }
+        means.push(sum / t as f64);
+    }
+    let mean = means.iter().sum::<f64>() / resamples as f64;
+    let var = means.iter().map(|m| (m - mean) * (m - mean)).sum::<f64>() / (resamples - 1) as f64;
+    var.sqrt()
+}
+
+/// The robust finalist rule. Reads the validation rows only: `ret` and `rows`
+/// are the validation book, `pred_of(i)` the prediction of member `i` on them.
+///
+/// A member is eligible when its alpha is positive in at least `blocks - 1`
+/// blocks and pooled. Among eligible members the lowest complexity whose
+/// pooled alpha is at least `best - se_z * se(best)` wins; ties go to fewer
+/// trades, then to the lower archive rank. No eligible member gives
+/// `chosen == None`.
+pub fn select_robust(
+    metas: &[RobustMeta],
+    params: RobustParams,
+    spec: &crate::trading::TradingSpec,
+    ret: &[f64],
+    rows: &crate::trading::TradingRows,
+    pred_of: &mut dyn FnMut(usize) -> Vec<f64>,
+) -> Result<RobustSelection, String> {
+    params.validate()?;
+    let mut stamps: Vec<f64> = rows.time.iter().copied().filter(|t| t.is_finite()).collect();
+    stamps.sort_by(|a, b| a.total_cmp(b));
+    stamps.dedup();
+    if stamps.len() < params.blocks {
+        return Err(format!(
+            "--select-blocks {} needs at least {} distinct validation timestamps, found {}",
+            params.blocks,
+            params.blocks,
+            stamps.len()
+        ));
+    }
+    let mut members = Vec::with_capacity(metas.len());
+    for (i, m) in metas.iter().enumerate() {
+        let scored = if m.usable {
+            crate::trading::blocked_alpha(&pred_of(i), ret, rows, spec, params.blocks).ok()
+        } else {
+            None
+        };
+        let member = match scored {
+            Some(a) => {
+                let positive = a.block_alpha.iter().filter(|&&v| v > 0.0).count();
+                let eligible = positive + 1 >= params.blocks && a.pooled_alpha > 0.0;
+                let se = circular_block_se(&a.series, params.block_len, ROBUST_RESAMPLES, ROBUST_SEED);
+                RobustMember {
+                    archive_rank: m.archive_rank,
+                    complexity: m.complexity,
+                    trades: a.trades,
+                    block_alpha: a.block_alpha,
+                    pooled_alpha: a.pooled_alpha,
+                    se,
+                    eligible,
+                }
+            }
+            None => RobustMember {
+                archive_rank: m.archive_rank,
+                complexity: m.complexity,
+                trades: 0,
+                block_alpha: vec![0.0; params.blocks],
+                pooled_alpha: 0.0,
+                se: 0.0,
+                eligible: false,
+            },
+        };
+        members.push(member);
+    }
+    let chosen = if params.blocks == 1 && params.se_z == 0.0 {
+        // One block and no tolerance is `validation_objective` itself: the same
+        // key, the same tie rule (archive order).
+        metas
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.usable && m.objective.is_finite())
+            .min_by(|(i, a), (j, b)| a.objective.total_cmp(&b.objective).then(i.cmp(j)))
+            .map(|(i, _)| i)
+    } else {
+        choose_robust(&members, params.se_z)
+    };
+    Ok(RobustSelection { params, members, chosen })
+}
+
+/// The parsimony choice among scored members: index of the winner, or `None`
+/// when no member is eligible.
+pub fn choose_robust(members: &[RobustMember], se_z: f64) -> Option<usize> {
+    let best = members
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.eligible)
+        .max_by(|(_, a), (_, b)| a.pooled_alpha.total_cmp(&b.pooled_alpha).then(b.archive_rank.cmp(&a.archive_rank)))
+        .map(|(i, _)| i)?;
+    let floor = members[best].pooled_alpha - se_z * members[best].se;
+    members
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.eligible && m.pooled_alpha >= floor)
+        .min_by(|(_, a), (_, b)| {
+            a.complexity
+                .total_cmp(&b.complexity)
+                .then(a.trades.cmp(&b.trades))
+                .then(a.archive_rank.cmp(&b.archive_rank))
+        })
+        .map(|(i, _)| i)
+}
+
+impl RobustSelection {
+    /// The members of `objective.selection_rule`, without braces.
+    pub fn fields_json(&self) -> String {
+        let num = crate::devlog::num;
+        let members: Vec<String> = self
+            .members
+            .iter()
+            .map(|m| {
+                format!(
+                    "{{\"archive_rank\":{},\"complexity\":{},\"trades\":{},\"block_alpha\":[{}],\"pooled_alpha\":{},\"se\":{},\"eligible\":{}}}",
+                    m.archive_rank,
+                    num(m.complexity),
+                    m.trades,
+                    m.block_alpha.iter().map(|v| num(*v)).collect::<Vec<_>>().join(","),
+                    num(m.pooled_alpha),
+                    num(m.se),
+                    m.eligible
+                )
+            })
+            .collect();
+        format!(
+            "\"rule\":\"robust\",\"blocks\":{},\"se_z\":{},\"block_len\":{},\"verdict\":\"{}\",\"members\":[{}],\"chosen_rank\":{}",
+            self.params.blocks,
+            num(self.params.se_z),
+            self.params.block_len,
+            if self.chosen.is_some() { "selected" } else { "no_signal" },
+            members.join(","),
+            self.chosen.map_or_else(|| "null".to_string(), |i| self.members[i].archive_rank.to_string())
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
