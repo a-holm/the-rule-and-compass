@@ -119,6 +119,7 @@ USAGE:
   rcsr prep --input <file|dir> --out <store.rcsb> [options]
   rcsr enrich --data <store.rcsb|CSV> --out <store.rcsb> --features <list> [options]
   rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
+  rcsr trials --wf <report.json>... [--baseline <ladder.json>] | --compare <A> <B> [options]
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
              [--lockbox <START,END|none>]
              [--target-spec <file>]
@@ -282,7 +283,9 @@ ROW WEIGHTS:
                              On the GPU backend the device scorer carries the
                              weights for every metric listed above that has a
                              native scorer; a weighted run is never ranked on
-                             unweighted loss.
+                             unweighted loss. A label target whose report has
+                             average_uniqueness < 1 and no --weight prints a note
+                             naming its lbl_<name>_weight column.
 
 DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   See docs/time-series.md for which preparation steps read ahead.
@@ -306,7 +309,8 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              widen the lookback embargo after the end of every locked range
                              (default: lockbox_embargo declared with the data, else 10972800);
                              a smaller value is refused (exit 2). Rows in
-                             [START - purge, END + embargo) are refused (exit 3)
+                             [START - purge, END + embargo) are refused (exit 3); with a
+                             target spec, rows before END + max(embargo, purge) too
   --retired <retired.json>
                              record from `rcsr protocol retire`: its range had its one sealed
                              read and no longer guards next to --lockbox on undeclared data;
@@ -2424,6 +2428,10 @@ fn main() {
     }
     if args.first().map(|s| s.as_str()) == Some("ablation") {
         rcsr::ablation::run(&args[1..]);
+    }
+    // #926: campaign trial accounting and paired run comparison.
+    if args.first().map(|s| s.as_str()) == Some("trials") {
+        rcsr::trials::run(&args[1..]);
     }
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(
@@ -5483,6 +5491,20 @@ fn main() {
             let rung = diagnostics::target_structure_rung(&r.spec, &prepared, cfg.metric);
             let purge_line = target::purge_line(&r.spec, &prepared.report);
             let label_report = target::label_report_for(&data_path, &r.spec.column);
+            let uniqueness = label_report
+                .as_deref()
+                .and_then(rcsr::devlog::Json::parse)
+                .and_then(|j| j.get("average_uniqueness").and_then(rcsr::devlog::Json::as_f64));
+            if let (None, Some(u), Some((label, _))) = (&weight_name, uniqueness, rcsr::labels::parse_column(&r.spec.column)) {
+                if u < 1.0 {
+                    eprintln!(
+                        "note: target {} has overlapping labels (average_uniqueness {}) and no --weight; --weight {} weights the rows by uniqueness",
+                        r.spec.column,
+                        rcsr::devlog::num(u),
+                        rcsr::labels::column_name(label, "weight")
+                    );
+                }
+            }
             Some(target::Active {
                 spec: r.spec,
                 source: r.source,
@@ -10431,8 +10453,11 @@ USAGE:
   Evaluates one expression with the engine's own f64 evaluator (no Python, no
   code strings), applies a long/flat rule and charges costs on position changes.
   Windows are half-open by time; the purge gap test_start-train_end must be at
-  least --horizon and --embargo. The threshold comes from training/validation
-  rows only. See docs/walkforward.md.
+  least --entry-offset + --horizon + --delay and --embargo (exit 2 otherwise).
+  The threshold comes from training/validation rows only. With a target spec
+  whose column has a report in <data>.labels.json, the JSON split records
+  fit_label (name, stride, average_uniqueness, effective_n, effective_n_hours).
+  See docs/walkforward.md.
 
 OPTIONS:
   --data <path>              .rcsb column store, or a CSV table as a fallback
@@ -10584,7 +10609,7 @@ OPTIONS:
                              widen the lookback embargo after the end of every locked range
                              (default: lockbox_embargo declared with the data, else 10972800);
                              a smaller value is refused (exit 2). Rows in
-                             [START - purge, END + embargo) are refused (exit 3)
+                             [START - purge, END + max(embargo, purge)) are refused (exit 3)
   --retired <retired.json>
                              record from `rcsr protocol retire`: its range had its one sealed
                              read and no longer guards next to --lockbox on undeclared data;
@@ -11155,6 +11180,7 @@ fn run_walkforward(args: &[String]) -> ! {
         };
         horizon = Some(agree("--horizon", horizon, s.horizon_seconds));
         popts.entry_offset = agree("--entry-offset", entry_offset_flag, s.entry_offset_seconds);
+        popts.fit_label = target::label_report_for(&data_path, &s.column).and_then(|r| rcsr::labels::fit_label_json(&r));
         popts.delay = agree("--delay", delay_flag, s.delay_seconds);
     } else {
         popts.entry_offset = entry_offset_flag.unwrap_or(0.0);
@@ -11474,7 +11500,7 @@ fn run_walkforward(args: &[String]) -> ! {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(if e.contains("overlapping returns") { EXIT_USAGE } else { EXIT_INPUT });
+            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") { EXIT_USAGE } else { EXIT_INPUT });
         }
     };
     if spec.threshold_fixed.is_none() {

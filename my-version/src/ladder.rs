@@ -213,12 +213,15 @@ pub struct Fold {
 }
 
 /// Row ranges per fold. Rows need a finite time and return. The fit range ends
-/// `purge_seconds` before the validation start so a fit label never reads into
-/// the validation slice.
+/// `purge_seconds` before the validation start and the validation range
+/// `purge_seconds` before the test start, so neither label reads into the next
+/// slice whatever purge the windows table was written with.
 /// A fold whose fit, validation or test range reaches `[locked start - purge_seconds,
-/// locked end + embargo_seconds)` of a guarded range (declared locked tests, half-open
-/// seconds) is refused: a label at the last development stamps reads bars inside
-/// the locked test, and a feature right after its end looks back into it.
+/// locked end + max(embargo_seconds, purge_seconds))` of a guarded range (declared
+/// locked tests, half-open seconds) is refused: a label at the last development
+/// stamps reads bars inside the locked test, a feature right after its end looks
+/// back into it, and a label right after its end shares returns with the last
+/// locked labels.
 pub fn make_folds(
     p: &Panel,
     windows: &[WindowRow],
@@ -231,7 +234,7 @@ pub fn make_folds(
         let win = &w.window;
         for &(ls, le) in locked {
             let boundary = ls - purge_seconds;
-            let reach_end = le + embargo_seconds.max(0.0);
+            let reach_end = le + embargo_seconds.max(purge_seconds).max(0.0);
             let side = if win.train_start < reach_end && win.train_end > boundary {
                 Some("fit or validation")
             } else if win.test_start < reach_end && win.test_end > boundary {
@@ -248,13 +251,14 @@ pub fn make_folds(
                     protocol::iso(ls),
                     protocol::iso(le),
                     purge_seconds,
-                    embargo_seconds,
+                    reach_end - le,
                     protocol::iso(boundary),
                     protocol::iso(reach_end)
                 ));
             }
         }
         let fit_end = w.validation_start - purge_seconds;
+        let valid_end = win.train_end.min(win.test_start - purge_seconds);
         let mut f = Fold {
             label: win.label.clone(),
             test_start: win.test_start,
@@ -269,7 +273,7 @@ pub fn make_folds(
             }
             if t >= win.train_start && t < fit_end {
                 f.fit.push(i);
-            } else if t >= w.validation_start && t < win.train_end {
+            } else if t >= w.validation_start && t < valid_end {
                 f.valid.push(i);
             } else if t >= win.test_start && t < win.test_end {
                 f.test.push(i);
@@ -277,11 +281,20 @@ pub fn make_folds(
         }
         if f.fit.is_empty() || f.valid.is_empty() || f.test.is_empty() {
             return Err(format!(
-                "fold {}: fit {} / validation {} / test {} rows; every range needs rows",
+                "fold {}: fit {} / validation {} / test {} rows; every range needs rows{}",
                 f.label,
                 f.fit.len(),
                 f.valid.len(),
-                f.test.len()
+                f.test.len(),
+                if f.valid.is_empty() && valid_end < win.train_end {
+                    format!(
+                        " (the validation slice ends one purge, {} s, before test_start, at {})",
+                        purge_seconds,
+                        protocol::iso(valid_end)
+                    )
+                } else {
+                    String::new()
+                }
             ));
         }
         folds.push(f);
@@ -354,6 +367,8 @@ impl SrRun {
 
 #[derive(Clone, Debug)]
 pub struct Options {
+    /// #926: write the per-period net series of every rung and the period grid (`series`).
+    pub emit_series: bool,
     pub cost_bps: f64,
     pub cost_grid: Vec<f64>,
     /// #487: where the cost and the return units came from. `None` is the
@@ -386,6 +401,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
+            emit_series: false,
             cost_bps: DEFAULT_COST_BPS,
             cost_grid: DEFAULT_COST_GRID.to_vec(),
             cost: None,
@@ -1054,6 +1070,9 @@ pub struct Row {
 #[derive(Clone, Debug)]
 pub struct Report {
     pub rows: Vec<Row>,
+    /// #926: period stamps of the pooled test periods; written with `--emit-series`.
+    pub period_time: Vec<f64>,
+    pub emit_series: bool,
     pub folds: Vec<String>,
     pub periods: usize,
     pub rows_scored: usize,
@@ -1861,6 +1880,8 @@ fn finish_report(
     let _ = market;
     Ok(Report {
         rows,
+        period_time: pool.times.clone(),
+        emit_series: opts.emit_series,
         folds: folds.iter().map(|f| f.label.clone()).collect(),
         periods: pool.times.len(),
         rows_scored: pool.len(),
@@ -1912,6 +1933,26 @@ impl Report {
     }
 
     fn json_with(&self, timed: bool) -> String {
+        let mut out = self.json_core(timed);
+        if self.emit_series {
+            let series = |v: &[f64]| v.iter().map(|x| jnum(*x)).collect::<Vec<_>>().join(",");
+            let nets: Vec<String> = self
+                .rows
+                .iter()
+                .filter(|r| !r.series.is_empty())
+                .map(|r| format!("{}:[{}]", jstr(&r.name), series(&r.series)))
+                .collect();
+            out.pop();
+            out.push_str(&format!(
+                ",\"series\":{{\"period_time\":[{}],\"period_net\":{{{}}}}}}}",
+                series(&self.period_time),
+                nets.join(",")
+            ));
+        }
+        out
+    }
+
+    fn json_core(&self, timed: bool) -> String {
         let rows: Vec<String> = self
             .rows
             .iter()
@@ -2272,7 +2313,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --features <a,b,...>      feature columns (default: every other numeric column)\n\
   --windows <file>          protocol windows table (rcsr protocol windows)\n\
   --scheme <name>           expanding | rolling | locked (default expanding)\n\
-  --purge-seconds <s>       gap between the fit range and the validation slice (default 219600)\n\
+  --purge-seconds <s>       gap between the fit range and the validation slice and between the validation slice and the test block (default 219600; the --target-spec purge when larger, reported as purge_source); with a spec whose column has a report in <data>.labels.json the JSON carries split.fit_label (name, stride, average_uniqueness, effective_n, effective_n_hours)\n\
   --horizon-seconds <s>     label horizon; floors the bootstrap block; test rows of one group closer than it overlap and are refused (exit 2); the report carries min_group_step_seconds (default 0)\n\
   --cost-bps <x>            per-side cost of the headline book (default 12; with a --target-spec cost, the spec cost, and a different value is refused)\n\
   --cost-override <x>       per-side cost that differs from the --target-spec cost on purpose; reported as source flag with the spec cost beside it\n\
@@ -2297,7 +2338,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --fdr-q <q>               BH-FDR level (default 0.10)\n\
   --pbo-blocks <even n>     CSCV blocks (default 8)\n\
   --seed <n>                seed of every draw (default 0)\n\
-  --lockbox-embargo <s>     widen the lookback embargo after the end of the locked range (default: declared with --data, else 10972800); smaller is refused (exit 2); a fold reaching [START - purge, END + embargo) is refused\n\
+  --lockbox-embargo <s>     widen the lookback embargo after the end of the locked range (default: declared with --data, else 10972800); smaller is refused (exit 2); a fold reaching [START - purge, END + max(embargo, purge)) is refused\n\
   --retired <retired.json>  record from rcsr protocol retire: its range no longer guards next to --lockbox on undeclared data (ledger re-hashed, mismatch exit 3; overlap with --lockbox exit 2)\n\
   --lockbox <START,END|none> locked test to guard: this flag (it must cover a stored\n\
                             declaration, else exit 2), the declaration stored with --data,\n\
@@ -2317,6 +2358,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
                             pnl seconds on the run wall); with --locked-test it is staged to <file>.tmp\n\
                             and synced before the read is recorded, then renamed\n\
   --markdown <file|->       write the Markdown table (staged the same way with --locked-test)\n\
+  --emit-series             add series.period_time and series.period_net (one array per rung) to the JSON report; the baseline input of rcsr trials\n\
   --json                    print the JSON report\n"
 }
 
@@ -2431,6 +2473,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             "--sealed" => sealed_path = Some(val()?),
             "--out" => out = Some(val()?),
             "--markdown" => markdown = Some(val()?),
+            "--emit-series" => opts.emit_series = true,
             "--json" => print_json = true,
             other => return Err(usage_err(format!("unknown argument '{}'", other))),
         }
@@ -2585,12 +2628,20 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     ledger.set_wall(wall);
     report.ledger = ledger;
     let in_scope = if locked_test { folds.iter().map(|f| f.test.len()).sum() } else { 0 };
+    let fit_label = opts
+        .spec
+        .as_ref()
+        .and_then(|s| crate::target::label_report_for(&data_path, &s.column))
+        .and_then(|r| crate::labels::fit_label_json(&r))
+        .map(|f| format!(",\"split\":{{\"fit_label\":{}}}", f))
+        .unwrap_or_default();
     let finish = |json: String, hashed: bool| {
         let json = format!(
-            "{},\"purge_seconds\":{},\"purge_source\":\"{}\"}}",
+            "{},\"purge_seconds\":{},\"purge_source\":\"{}\"{}}}",
             json.trim_end().strip_suffix('}').unwrap_or(json.trim_end()),
             opts.purge_seconds,
-            purge_source
+            purge_source,
+            if hashed { "" } else { fit_label.as_str() }
         );
         if hashed {
             resolved.splice_hashed_report(&json, in_scope, locked_test, true)

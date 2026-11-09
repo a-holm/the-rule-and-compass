@@ -5068,3 +5068,39 @@ fn enrich_json_and_plan_line_print_benchmark_present() {
         assert_eq!(flags, plans.matches("\"group\":").count(), "{symbol}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// #931: the label purge is a floor of the store embargo.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn label_purge_floors_the_embargo() {
+    let (_scratch, dir) = tmp_dir("label-floor");
+    let src = dir.join("a.rcsb").to_string_lossy().into_owned();
+    write_store_with_flow(&src, &embargo_rows(1200, 0, 0, false), 256);
+    let label = "long:336,name=h336,fee=10,stride=336".to_string();
+    let out = dir.join("ret1.rcsb").to_string_lossy().into_owned();
+    let mut o = opts(&src, &out, "ret1");
+    o.gpu = GpuMode::Off;
+    o.labels = vec![label.clone()];
+    let r = enrich::build(&o).unwrap();
+    assert_eq!(r.lockbox_embargo.0, 1_213_200, "{:?}", r.lockbox_embargo);
+    assert!(r.lockbox_embargo.1.starts_with("lbl_h336_"), "{:?}", r.lockbox_embargo);
+    for f in r.features.iter().filter(|f| f.name.starts_with("lbl_h336_")) {
+        assert_eq!(f.lookback_seconds, Some(1_213_200), "{}", f.name);
+    }
+    assert_eq!(r.features.iter().find(|f| f.name == "ret1").unwrap().lookback_seconds, Some(3600));
+    let json = r.json();
+    let embargo = rcsr::manifest::object(&json, "lockbox_embargo").unwrap();
+    assert!(embargo.contains("\"seconds\":1213200") && embargo.contains("\"column\":\"lbl_h336_"), "{embargo}");
+    let lr = &r.long_labels[0].report;
+    assert!(lr.json().contains("\"purge_rows_per_symbol\":337"), "{}", lr.json());
+
+    // A store whose features look back further keeps its own embargo.
+    let out = dir.join("default.rcsb").to_string_lossy().into_owned();
+    let mut o = opts(&src, &out, "ret1,mtf_1d_rsi");
+    o.gpu = GpuMode::Off;
+    o.labels = vec![label];
+    let r = enrich::build(&o).unwrap();
+    assert_eq!(r.lockbox_embargo, (10_972_800, "mtf_1d_rsi".to_string()));
+}

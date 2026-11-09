@@ -420,3 +420,119 @@ fn fold_spacing_refuses_a_label_horizon_longer_than_the_row_step() {
     o.horizon_seconds = STEP;
     assert!(run(&f, &o).json().contains("\"min_group_step_seconds\":3600"));
 }
+
+// ---------------------------------------------------------------------------
+// #931: the purge at 72, 168 and 336 hours.
+// ---------------------------------------------------------------------------
+
+#[path = "common/long_horizon.rs"]
+mod lh;
+
+/// Two symbols of hourly bars with stride-`h` labels: the panel (return =
+/// `lbl_fwd`, target = `lbl_y`) and the label end `t1` of every panel row.
+fn long_label_panel(h: usize, n: usize) -> (Panel, Vec<f64>) {
+    let (mut time, mut group, mut x, mut y, mut ret, mut t1) = (vec![], vec![], vec![], vec![], vec![], vec![]);
+    for (g, phase) in [0.0, 1.3].into_iter().enumerate() {
+        let bars = lh::bars(T0 as i64, n, phase);
+        let l = lh::build(&bars, &lh::src(h, &format!(",stride={h}")));
+        for t in 0..n {
+            time.push(bars[t].time as f64);
+            group.push(g as u64);
+            x.push(((t * 7 + g) % 11) as f64);
+            y.push(l.y[t]);
+            ret.push(l.fwd[t]);
+            t1.push(l.t1[t]);
+        }
+    }
+    (Panel::new(vec!["x".into()], vec![x], time, group, y, ret, vec![]).unwrap(), t1)
+}
+
+/// One fold of a windows table written with the protocol default purge.
+fn default_purge_fold(h: usize) -> WindowRow {
+    let test_start = T0 + (20 * h) as f64 * STEP;
+    let train_end = test_start - lh::DEFAULT_PURGE;
+    WindowRow {
+        scheme: "expanding".to_string(),
+        window: Window { label: "f0".to_string(), train_start: T0, train_end, test_start, test_end: test_start + (6 * h) as f64 * STEP },
+        validation_start: train_end - (8 * h) as f64 * STEP,
+    }
+}
+
+fn no_training_label_reaches_test_block(h: usize) {
+    let (panel, t1) = long_label_panel(h, 30 * h);
+    let spec = lh::spec(&lh::src(h, ""));
+    let purge = (spec.purge_seconds() as f64).max(lh::DEFAULT_PURGE);
+    assert_eq!(purge, spec.target_spec("y", "fwd").required_purge_seconds());
+    let row = default_purge_fold(h);
+    let folds = ladder::make_folds(&panel, &[row.clone()], purge, &[], 0.0).unwrap();
+    let f = &folds[0];
+    let test_start = row.window.test_start;
+    assert!(!f.fit.is_empty() && !f.valid.is_empty() && !f.test.is_empty());
+    for &i in f.fit.iter().chain(&f.valid) {
+        assert!(t1[i] < test_start, "h{h} row {i}: label end {} at or after the test start", t1[i]);
+        assert!(test_start - panel.time[i] >= purge, "h{h} row {i}: stamp {} within the purge of the test start", panel.time[i]);
+    }
+    let fit_end = f.fit.iter().map(|&i| panel.time[i]).fold(f64::MIN, f64::max);
+    assert!(row.validation_start - fit_end >= purge, "h{h}: fit rows reach the validation slice");
+    // The table's own gap is shorter than the label: the stride row one horizon
+    // before the test start lies inside [validation_start, train_end).
+    let near = test_start - (h as f64) * STEP;
+    assert!(near < row.window.train_end && near >= row.validation_start && near + purge > test_start);
+}
+
+#[test]
+fn no_training_label_reaches_test_block_h72() {
+    no_training_label_reaches_test_block(72);
+}
+
+#[test]
+fn no_training_label_reaches_test_block_h168() {
+    no_training_label_reaches_test_block(168);
+}
+
+#[test]
+fn no_training_label_reaches_test_block_h336() {
+    no_training_label_reaches_test_block(336);
+}
+
+#[test]
+fn ladder_takes_the_larger_purge_at_168h() {
+    let (_scratch, dir) = scratch("ladder-h168");
+    let h = 168usize;
+    let (panel, _) = long_label_panel(h, 60 * h);
+    let mut csv = String::from("ts,sym,x,vol96,lbl_h168_y,lbl_h168_fwd\n");
+    for i in 0..panel.len() {
+        if panel.ret[i].is_finite() && panel.y[i].is_finite() {
+            csv.push_str(&format!(
+                "{},s{},{},0.01,{},{}\n",
+                panel.time[i] as i64,
+                panel.group[i],
+                panel.col("x").unwrap()[i],
+                panel.y[i],
+                panel.ret[i]
+            ));
+        }
+    }
+    let data = dir.join("panel.csv");
+    std::fs::write(&data, csv).unwrap();
+    let wk = |k: usize| protocol::iso(T0 + (k * h) as f64 * STEP);
+    let windows = dir.join("windows.csv");
+    std::fs::write(
+        &windows,
+        format!("scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,f0,{},{},{},{},{}\n", wk(0), wk(30), wk(20), wk(32), wk(52)),
+    )
+    .unwrap();
+    let spec = dir.join("spec.json");
+    std::fs::write(&spec, lh::spec_file(&lh::spec(&lh::src(h, ",stride=168")))).unwrap();
+    let out = rcsr_cmd::rcsr()
+        .args([
+            "ladder", "--data", data.to_str().unwrap(), "--target", "lbl_h168_y", "--time", "ts", "--group", "sym", "--features", "x",
+            "--windows", windows.to_str().unwrap(), "--purge-seconds", "600000", "--target-spec", spec.to_str().unwrap(),
+            "--draws", "100", "--gbm-trees", "20", "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let json = String::from_utf8_lossy(&out.stdout);
+    assert!(json.contains("\"purge_seconds\":608400,\"purge_source\":\"target_spec\""), "{json}");
+}

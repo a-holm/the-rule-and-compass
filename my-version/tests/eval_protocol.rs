@@ -379,3 +379,27 @@ fn select_band_accepts_table_validation_starts() {
     let none = walkforward::run_table(&t, &s, "t").unwrap_err();
     assert!(none.contains("validation"), "{none}");
 }
+
+#[test]
+fn pooled_period_series_golden() {
+    // #926: pooled.period_net and pooled.period_time carry one value per pooled period.
+    let r = hand_fixture();
+    let want_net = [0.0, -0.02, 0.03, -0.02];
+    let want_time = [4.0, 5.0, 6.0, 7.0];
+    assert_eq!(r.period_net.len(), want_net.len());
+    for (got, want) in r.period_net.iter().zip(want_net) {
+        assert!(close(*got, want, 1e-15), "{:?}", r.period_net);
+    }
+    assert_eq!(r.period_time, want_time);
+    let j = rcsr::devlog::Json::parse(&r.json()).unwrap();
+    let pooled = j.get("pooled").unwrap();
+    let list = |k: &str| -> Vec<f64> {
+        match pooled.get(k) {
+            Some(rcsr::devlog::Json::Arr(a)) => a.iter().map(|v| v.as_f64().unwrap()).collect(),
+            _ => panic!("pooled.{k} missing"),
+        }
+    };
+    assert_eq!(list("period_net"), r.period_net);
+    assert_eq!(list("period_time"), want_time);
+    assert_eq!(list("period_net").len() as f64, pooled.get("periods").unwrap().as_f64().unwrap());
+}

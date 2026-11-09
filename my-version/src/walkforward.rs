@@ -95,12 +95,15 @@ pub struct ProtocolOptions {
     /// candidate columns and `batch_pnl` is refused.
     pub final_read: bool,
     /// Half-open time ranges `[S, E)` that stay sealed in this run. A window that
-    /// reaches `[S - P, E + L)` is refused and rows inside it are dropped at read
-    /// time, with `P` the required purge and `L` `locked_embargo`. The sealed
+    /// reaches `[S - P, E + max(L, P))` is refused and rows inside it are dropped at
+    /// read time, with `P` the required purge and `L` `locked_embargo`. The sealed
     /// read lists the other declared ranges only.
     pub locked_ranges: Vec<(i64, i64)>,
     /// Seconds after the end of every locked range whose rows read it.
     pub locked_embargo: i64,
+    /// `split.fit_label`: the label report facts of the target (see
+    /// [`crate::labels::fit_label_json`]).
+    pub fit_label: Option<String>,
 }
 
 /// #482: where a candidate list came from: a run's Pareto front.
@@ -133,6 +136,7 @@ impl Default for ProtocolOptions {
             final_read: false,
             locked_ranges: Vec::new(),
             locked_embargo: 0,
+            fit_label: None,
         }
     }
 }
@@ -160,12 +164,14 @@ impl ProtocolOptions {
         self.entry_offset + horizon + self.delay
     }
 
-    /// `[S - P, E + L)` of every sealed range with `P` the purge a training label needs.
+    /// `[S - P, E + max(L, P))` of every sealed range with `P` the purge a training
+    /// label needs: a label within `P` after the end shares returns with the last
+    /// locked labels.
     pub fn locked_reach(&self, spec: &EvalSpec) -> Vec<(f64, f64, f64, f64)> {
         let purge = self.required_purge_seconds(spec.horizon).max(spec.embargo_seconds());
         self.locked_ranges
             .iter()
-            .map(|&(s, e)| (s as f64, e as f64, s as f64 - purge, (e + self.locked_embargo.max(0)) as f64))
+            .map(|&(s, e)| (s as f64, e as f64, s as f64 - purge, e as f64 + (self.locked_embargo.max(0) as f64).max(purge)))
             .collect()
     }
 }
@@ -527,6 +533,10 @@ pub struct Report {
     pub group_by: Option<String>,
     pub windows: Vec<WindowResult>,
     pub pooled: Metrics,
+    /// #926: pooled out-of-fold net return of every period and the period
+    /// stamps, in the order of the pooled series.
+    pub period_net: Vec<f64>,
+    pub period_time: Vec<f64>,
     /// #487: cost source and return units of the book.
     pub cost: crate::target::CostDecl,
     pub cost_bps: f64,
@@ -583,6 +593,8 @@ pub struct Report {
     pub min_group_step: Option<f64>,
     /// Smallest `test_start - train_end` over the windows.
     pub min_purge_seconds: f64,
+    /// `split.fit_label` of the printed report; the reproduction hash leaves it out.
+    pub fit_label: Option<String>,
     pub economics: crate::wf_protocol::Economics,
     pub inference: Option<crate::wf_protocol::Inference>,
     dropped_rows: usize,
@@ -1715,6 +1727,8 @@ impl Accum {
             group_by: spec.group.clone(),
             windows,
             pooled,
+            period_net: pooled_returns,
+            period_time: pooled_times,
             cost: opts.cost_decl(spec.cost_bps),
             cost_bps: spec.cost_bps,
             threshold_quantile: spec.threshold_quantile,
@@ -1747,6 +1761,7 @@ impl Accum {
             required_purge_seconds: required_purge,
             min_group_step,
             min_purge_seconds: min_gap,
+            fit_label: opts.fit_label.clone(),
             economics,
             inference: inference_report,
             dropped_rows: dropped,
@@ -3092,12 +3107,16 @@ impl Report {
         s.pop();
         s.push_str(&format!(
             ",\"split\":{{\"required_purge_seconds\":{},\"purge_seconds\":{},\"horizon_seconds\":{},\
-             \"embargo_seconds\":{},\"min_group_step_seconds\":{}}},\"economics\":{},\"inference\":{}}}",
+             \"embargo_seconds\":{},\"min_group_step_seconds\":{}{}}},\"economics\":{},\"inference\":{}}}",
             jnum(self.required_purge_seconds),
             jnum(self.min_purge_seconds),
             jnum(self.horizon),
             jnum(self.embargo),
             self.min_group_step.map_or("null".to_string(), jnum),
+            match (&self.fit_label, paths) {
+                (Some(f), true) => format!(",\"fit_label\":{}", f),
+                _ => String::new(),
+            },
             self.economics.json(),
             self.inference.as_ref().map_or("null".to_string(), |i| i.json())
         ));
@@ -3298,8 +3317,21 @@ impl Report {
                 .as_ref()
                 .map_or("null".to_string(), |b| b.json()),
             windows.join(","),
-            self.pooled.json()
+            self.pooled_json()
         )
+    }
+
+    /// #926: the pooled metrics with `period_net` and `period_time`.
+    fn pooled_json(&self) -> String {
+        let series = |v: &[f64]| v.iter().map(|x| jnum(*x)).collect::<Vec<_>>().join(",");
+        let mut s = self.pooled.json();
+        s.pop();
+        s.push_str(&format!(
+            ",\"period_net\":[{}],\"period_time\":[{}]}}",
+            series(&self.period_net),
+            series(&self.period_time)
+        ));
+        s
     }
 
     fn windows_json(&self) -> String {

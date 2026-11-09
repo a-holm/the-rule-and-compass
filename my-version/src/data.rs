@@ -2846,6 +2846,20 @@ fn boundary_purge(spec: &SplitSpec) -> i64 {
         .ceil() as i64
 }
 
+/// The declared range whose embargo is at least the target spec's purge: a row
+/// within one label window after the end shares returns with the last locked
+/// labels. Without a spec the declared embargo stands.
+fn label_floored(d: &crate::lockbox::Declared, spec: &SplitSpec) -> crate::lockbox::Declared {
+    let mut d = *d;
+    if let Some(p) = spec.purge_seconds.or(spec.boundary_purge_seconds) {
+        let p = p.ceil() as i64;
+        if p > d.embargo.seconds {
+            d.embargo = crate::lockbox::Embargo { seconds: p, source: crate::lockbox::EmbargoSource::LabelPurge };
+        }
+    }
+    d
+}
+
 /// Cross-validation guard: every kept row is a potential training or test row
 /// of some fold. The declared locked test is always checked, whatever
 /// `allow_lockbox` says; the 2026H2 box only without it.
@@ -2881,7 +2895,7 @@ pub fn check_cv_lockbox(
                 unstamped
             ));
         }
-        d.check_times("cross-validation rows", name, &times, boundary_purge(spec))?;
+        label_floored(d, spec).check_times("cross-validation rows", name, &times, boundary_purge(spec))?;
     }
     Ok(())
 }
@@ -4412,9 +4426,10 @@ fn check_split_lockbox(
         report.lockbox_embargo_seconds = d.embargo.seconds;
         report.lockbox_embargo_source = d.embargo.source.as_str();
         let name = t.names.get(tc).map(String::as_str).unwrap_or("time");
-        d.check_times("training split", name, &train_times, boundary_purge)?;
-        d.check_times("validation split", name, &validation_times, boundary_purge)?;
-        d.check_times("test split", name, &test_times, boundary_purge)?;
+        let floored = label_floored(d, spec);
+        floored.check_times("training split", name, &train_times, boundary_purge)?;
+        floored.check_times("validation split", name, &validation_times, boundary_purge)?;
+        floored.check_times("test split", name, &test_times, boundary_purge)?;
     }
     Ok(())
 }
