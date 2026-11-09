@@ -78,6 +78,8 @@ pub struct RunFile {
     pub candidates_evaluated: Option<u64>,
     /// `elapsed_seconds`.
     pub elapsed_seconds: Option<f64>,
+    /// `search.cumulative.elapsed_seconds` when the block is complete (#923).
+    pub cumulative_elapsed_seconds: Option<f64>,
     /// The parsed document, for views such as `RunFile::book`.
     doc: Json,
 }
@@ -156,6 +158,12 @@ impl RunFile {
                 .and_then(Json::as_f64)
                 .map(|v| v as u64),
             elapsed_seconds: j.get("elapsed_seconds").and_then(Json::as_f64),
+            cumulative_elapsed_seconds: j
+                .get("search")
+                .and_then(|s| s.get("cumulative"))
+                .filter(|c| c.get("complete").map_or(false, |v| matches!(v, Json::Bool(true))))
+                .and_then(|c| c.get("elapsed_seconds"))
+                .and_then(Json::as_f64),
             doc: j.clone(),
         })
     }

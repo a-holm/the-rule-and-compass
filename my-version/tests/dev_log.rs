@@ -322,6 +322,12 @@ fn logging_on_or_off_leaves_the_archive_results_and_config_hash_identical() {
             _ => panic!("the JSON result is an object"),
         };
         fields.retain(|(k, _)| k != "elapsed_seconds" && k != "timing" && k != "baselines");
+        // `search.cumulative` holds wall-clock seconds too.
+        for (k, v) in fields.iter_mut() {
+            if let (true, Json::Obj(search)) = (k == "search", v) {
+                search.retain(|(k, _)| k != "cumulative");
+            }
+        }
         fields
             .into_iter()
             .map(|(k, v)| format!("{:?}", (k, v)))

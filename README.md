@@ -446,7 +446,7 @@ atomically instead of streaming it. See
   (`start`, `progress`…, `solution`…, `done`) for long runs.
 * **Deterministic**: the same `--seed` gives the same answer, and the seed is
   echoed in the output.
-* **Bounded time**: `--time-budget <seconds>` guarantees the process returns. `--interim-chunk` skips the end-of-run report of a chunk that stops on it ([docs/checkpoint.md](docs/checkpoint.md#interim-chunks)).
+* **Bounded time**: `--time-budget <seconds>` guarantees the process returns. `--interim-chunk` skips the end-of-run report of a chunk that stops on it ([docs/checkpoint.md](docs/checkpoint.md#interim-chunks)). A chunked run totals its search seconds in `search.cumulative` of `run.json`; `elapsed_seconds` stays the last process ([cost of a chunked run](docs/checkpoint.md#cost-of-a-chunked-run)).
 * **stdin**: `--data -` reads the table from standard input.
 * **Bounded memory**: `--max-memory 2GB` refuses an input whose estimated
   footprint would exceed the budget, with exit 3 and a fix, instead of being

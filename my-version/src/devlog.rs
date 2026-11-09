@@ -795,6 +795,8 @@ pub struct RunEnd {
     pub wall_s: f64,
     /// The search phase alone (the historical `elapsed_seconds`).
     pub search_s: f64,
+    /// #923: the search seconds of every chunk up to this one.
+    pub search_cumulative_s: Option<f64>,
     pub pareto_size: usize,
     pub best_error: f64,
     pub archive_hash: u64,
@@ -857,7 +859,7 @@ pub struct RunEnd {
 pub fn run_end_json(r: &RunEnd) -> String {
     format!(
         "{{\"schema\":\"{}\",\"v\":{},\"event\":\"run_end\",\"generations\":{},\"stop\":{},\
-         \"wall\":{},\"search\":{},\"archive\":{{\"size\":{},\"best_error\":{},\"hash\":{}}},\
+         \"wall\":{},\"search\":{},\"search_cumulative\":{},\"archive\":{{\"size\":{},\"best_error\":{},\"hash\":{}}},\
          \"json\":{},\"peak_rss_bytes\":{},\"gpu_wall_s\":{},\"device_hours\":{},\
          \"device_seconds_incl_fit\":{},\"device_fraction_of_run\":{},\
          \"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"unaccounted_s\":{},\
@@ -871,6 +873,7 @@ pub fn run_end_json(r: &RunEnd) -> String {
         text(&r.stop),
         num(r.wall_s),
         num(r.search_s),
+        opt_num(r.search_cumulative_s),
         r.pareto_size,
         num(r.best_error),
         hex(r.archive_hash),
