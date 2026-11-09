@@ -610,6 +610,33 @@ The PBO of the arms' seed-mean series is a ship gate: a family ships only when t
 
 `A3` is compared with the placebo arm `A4` and with `A2`, so it must beat both. Otherwise the family is `drop`, with every failed check listed. No family enters the default set on a single-cell t-test. The ablation is a selection on training data repeated inside every fold, and a family that only wins by making the search bigger has not won.
 
+### 3.14 Campaign trial accounting (`rcsr trials`)
+
+A campaign runs many arms, views, seeds and origins. The walk-forward `N_eff` (`trials x participation ratio / candidates`) counts every candidate evaluation and is far too large to judge the finalists. `rcsr trials` counts the finalists instead, from the pooled out-of-fold net series `pooled.period_net` of their walk-forward reports (`pooled.period_time` is the period grid).
+
+```sh
+rcsr ladder ... --emit-series --out ladder.json
+rcsr trials --wf wide/reports/wf-*.json --baseline ladder.json \
+  --cluster-rho 0.9 --block-len 21 --draws 10000 --out trials.json
+```
+
+* The reports must agree on the window definition, purge, cost, annualisation, threshold rule, policy and period grid; a mismatch exits 2 and names the field.
+* Distinct books: SHA-256 of each series rounded to 1e-12; equal hashes count once. A constant series (always flat) is one book, one cluster, and is left out of clustering, SPA and PBO.
+* Clusters: single-linkage on the correlation matrix at `|rho| >= --cluster-rho` (default 0.9, pre-register it). `N_eff` is the cluster count. The participation ratio is reported beside it.
+* DSR of the best finalist (highest per-period Sharpe) at `N_eff`, at `10 N_eff` and at the nominal series count. `V` is the variance of the Sharpes of the distinct series (the Mertens variance with one series); `T`, skew and kurtosis follow the walk-forward rule, so one series with `--block-len`, `--draws` and `--seed` equal to the report's gives the walk-forward DSR at `--trials 1`.
+* SPA (Hansen consistent p) of all distinct varying series against the best baseline of cash, buy-and-hold, constant long/flat, best single feature and any `trend*` rung, by mean. The baseline series come from `rcsr ladder --emit-series` (`series.period_time`, `series.period_net` per rung) and must sit on the same period grid. `--baseline-rung` picks one rung.
+* PBO by CSCV over the same series (`--pbo-blocks`, default 16). With fewer than 2 distinct varying series, SPA and PBO are skipped with a reason.
+* MinBTL: `(E[max_N] / SR)^2` years at the clustered `N_eff` for the best finalist's annual Sharpe, against the span of the series (`min_btl_years`, `span_years`).
+
+#### Paired comparison (`rcsr trials --compare A B`)
+
+`A` is the lever and `B` the reference; each is one report or a comma-separated list (one per seed). With `X_t` the mean over the side's seeds of `pooled.period_net[t]`, the series is `d_t = A_t - B_t`. One resampled index path is applied to `d_t`, so the pairing of the two books holds in every draw.
+
+* Default bootstrap: the stationary bootstrap of Politis and Romano (1994): uniform block starts, geometric block length with mean `L`, wrap-around. `--bootstrap circular` uses the walk-forward circular resampler on `d_t`. `L` defaults to `max(horizon, hold, ceil(n^(1/3)))` of the reports; draws default to 10,000 and the seed is recorded.
+* Output `rcsr-trials-compare/1`: `mean_diff` (per period and annualised), the percentile CI of the draw means at `--level`, the one-sided `p_period = P(mean d <= 0)` as `(1 + count) / (B + 1)` over the centred draws, the two-sided `min(1, 2 min(p, p'))`, the design effect and `effective_n`. A series shorter than `4 L` periods sets `short_series`.
+* Seed spread: the per-seed metric is the mean period net times `periods_per_year`; `delta` is the mean over `A` seeds minus the mean over `B` seeds; `s_seed` is the pooled within-side standard deviation (`df = nA + nB - 2`) or `--s-seed`; `z = delta / (s_seed sqrt(1/nA + 1/nB))`. With fewer than 2 seeds on a side and no `--s-seed`, `z` is null and `z_reason` says why.
+* The same file on both sides, a missing or non-finite series, or reports that differ in cost, annualisation, windows, threshold rule or grid exit 2 and name the field.
+
 ## 4. What `rcsr` reports today
 
 ### The test lockbox and the validation slice

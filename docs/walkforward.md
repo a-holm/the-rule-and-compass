@@ -638,6 +638,8 @@ sign test, per-window metrics and pooled metrics. `--out file` writes the
 same JSON, `--markdown file` writes a Markdown report and `--markdown -` prints
 it to stdout. Without those flags a compact text table is printed.
 
+`pooled.period_net` is the pooled out-of-fold net return of every period (`pooled.periods` values, in pooled order) and `pooled.period_time` the epoch-second stamp of each period. They are part of the report hash, so a hash recorded by an earlier build does not match. `rcsr trials` reads them; see `docs/overfitting.md` section 3.14.
+
 The printed and written JSON ends with a `ledger` object (#284): the phase ledger of the run with `io_s` (store row-group or CSV reads), `pnl_s` (scoring, windows, controls, `--batch-pnl`), `host_other_s`, `wall_s`, `unaccounted_s`, `closure` and `device_busy_s`, the union of the `--batch-pnl` device tile intervals and of the `--device-pnl` CUDA reduction calls (`host_envelope` basis; the canonical CPU backend adds none). The ledger and the `batch_timings` object (`--batch-pnl`: per seam `wall_s`, `device_s`, `score_s`, `layout_s`, `reference_s`, `candidates_per_s`, `row_evals_per_s`, `device_fraction`) hold wall-clock seconds, so `report_sha256`, `--expect-report-sha256` and `--verify-read` hash the report without them. They also leave out the `--front` path (`selection.run`; `run_sha256` stays), so `--front run.json` and `--front ./run.json` verify the same read. A hash recorded by an earlier build for a `--front` read does not match. The printed JSON keeps every path. See `docs/benchmarks.md`.
 
 ## Store handling and memory
