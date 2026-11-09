@@ -188,6 +188,18 @@ The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA
   period aggregation are the threshold rule's. `--from-run` of a search run with `--position top_tercile`
   selects the policy; it conflicts with an explicit `--policy` of another kind. Pair it with an `xs_rank` target
   (`--target lbl_h1_xs --target-spec ...` resolves to its `return_column`; `docs/time-series.md`).
+* `--policy vote --quorum Q` (#930) builds one long/flat book from the K repeated `--expr` members. Every member
+  keeps its own threshold (`--threshold-fixed`, or the member's validation or training quantile); nothing is fitted
+  on test rows, so the members and thresholds do not depend on any test value. Per row, `v` counts the members
+  with `score > threshold`; the row is long when `v >= ceil(Q x K)` (at least 1). `Q` must lie in `(0, 1]`
+  (usage error, exit 2) and is required. The shared valid-row mask covers all members: a member with a
+  non-finite score drops the row (flat, no return), as in the threshold book. `K = 1, Q = 1` is the threshold book
+  bit for bit. `Q = 0.67` with `K = 3` needs 3 votes (`ceil(2.01)`); pass `0.66` for a majority of three.
+  `--band B` (a whole number of votes) applies after voting: a flat book enters at `v >= ceil(Q x K)` and a long book
+  exits when `v < ceil(Q x K) - B`; `--min-hold` then holds a long book for that many rows (cooldown scan). The
+  vote count is priced as one strategy (one trial for the DSR unless `--trials` is given); the report lists
+  the members in `candidates` and `policy.vote.members`, with `policy.vote.quorum` and `votes_required`.
+  `--device-pnl`, `--batch-pnl`, `--select-band`, `--locked-test` and `--band-units` are refused (exit 2).
 * `--cost-bps` (default 10; a `--target-spec` cost wins, see "One book from search to evaluation") is charged **per side** on `|position - previous position|`,
   separately inside each `--group-by` series. Every series starts flat, so an
   entry costs one side and its exit (including the **final** exit of every
@@ -293,6 +305,9 @@ rcsr walkforward ... --policy dp
 
 # top-tercile long-only book per timestamp (no threshold)
 rcsr walkforward ... --policy top-tercile
+
+# one book from three expressions: long when 2 of 3 members are long
+rcsr walkforward ... --expr "<f1>" --expr "<f2>" --expr "<f3>" --policy vote --quorum 0.66 --threshold-fixed 1e-30
 
 # the same scans on the device, bit-identical to the CPU
 rcsr walkforward ... --policy band --band 0.1 --gpu
