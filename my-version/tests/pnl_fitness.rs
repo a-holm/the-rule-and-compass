@@ -1290,9 +1290,14 @@ fn resume_refuses_a_two_pass_sd_checkpoint() {
     let two_pass = fnv_u64(fnv_u64(band_prefix, 1), 2);
     assert_ne!(two_pass, sd_hash, "the sd-unit book hash still equals the #925 hash");
     assert_eq!(fnv_u64(two_pass, rcsr::trading::SCORE_SD_ALGORITHM), sd_hash, "the sd-algorithm word is the last one hashed");
+    // The checkpoint a #925 binary writes: its book hash, and the config hash
+    // over the config lines that hold it.
     let old_cp = dir.join("two-pass.rcsr");
-    let text = std::fs::read_to_string(&sd_cp).unwrap();
-    std::fs::write(&old_cp, text.replace(&format!("long_pnl:{sd_hash:016x}"), &format!("long_pnl:{two_pass:016x}"))).unwrap();
+    let text = std::fs::read_to_string(&sd_cp).unwrap().replace(&format!("long_pnl:{sd_hash:016x}"), &format!("long_pnl:{two_pass:016x}"));
+    let block: String = text.lines().filter(|l| l.starts_with("config ")).map(|l| format!("{l}\n")).collect();
+    let config_hash = format!("config_hash {:016x}", rcsr::checkpoint::hash_config_text(&block));
+    let old: String = text.lines().map(|l| if l.starts_with("config_hash ") { format!("{config_hash}\n") } else { format!("{l}\n") }).collect();
+    std::fs::write(&old_cp, old).unwrap();
     let resume = |cp: &str| {
         let args = ["--fitness", "pnl", "--band", "0.5", "--band-units", "sd", "--min-holding", "2", "--generations", "20", "--resume", cp];
         run(&data, &spec, &args)
