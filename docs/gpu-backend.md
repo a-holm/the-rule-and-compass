@@ -1239,11 +1239,28 @@ the shared block is dynamic (`extern __shared__`) and the opt-in limit is raised
 once with `cudaFuncSetAttribute`; it is measured below. A block narrower than
 the statistic count (231 entries at `p = 20`) gives each thread several
 statistics (`t`, `t + blockDim`, …), so every entry is still owned by exactly
-one thread and accumulated over rows in ascending order. That keeps the sum
-independent of the chunk size: a candidate fitted alone and the same candidate
-in a padded `kmax = 20` batch are **bit-identical**, which
-`a_mixed_p_batch_matches_single_fits_and_the_cpu_lm` asserts for `p = 4` beside
-`p = 17..20`.
+one thread and accumulated over rows in ascending order.
+
+**Width rule (#977).** The block width of a call follows the largest constant
+count in the call, so it depends on the batch-mates. No sum may depend on it.
+The assemblies above add rows in ascending order in one thread. The f32 value
+sweeps of the damped loop and the f32 polish (the trial loss, the slope trial
+loss and the correlation score) always sum over 256 lanes: lane `l` adds rows
+`l, l + 256, …` in ascending order and the lanes meet in one fixed binary tree.
+A 128-thread block holds lanes `t` and `t + 128` in thread `t` and adds them as
+the tree's first level. The f64 polish sweeps use 128 lanes in both
+instantiations. A candidate's constants, loss and status are therefore
+bit-identical whichever instantiation fits it: they depend on its own plan, its
+start and the rows only, never on the other candidates of the call or on how
+the overlap pipeline groups candidates into calls.
+`gpu::fit_width_tests::fit_bits_independent_of_batch_split` fits a pool of
+trees with 3 to 20 constants alone, in one call, split by width and in mixed
+pairs, from cold and warm starts, for the squared, absolute, log-squashed,
+slope and correlation arms under every `--fit-polish`, and asserts equal bits;
+`a_mixed_p_batch_matches_single_fits_and_the_cpu_lm` asserts it for `p = 4`
+beside `p = 17..20`, and `pipeline_fit_bits_independent_of_batch_mates`
+(`tests/gpu_pipeline_consistency.rs`) asserts equal snapshots and archive
+hashes for two pipeline depths with seeds of 17 and 20 constants.
 
 **Eligibility, admission and fallback.** A candidate is offered to the kernel
 only for a metric with a native device fit objective (squared/AIC family,
