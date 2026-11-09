@@ -213,7 +213,7 @@ Non-search flags (input file, column names, output format, reports, `--top`, …
 are free to change, subject to the data fingerprint. `--save` may be combined
 with `--resume`; saving to the same path overwrites it at the next boundary.
 
-Execution settings are not saved. A resumed run takes them from its own command line: `--gpu`, `--cpu`, `--dispatch`, `--pipeline-depth` (default `2`, not the earlier chunk's value), `--threads` (and the CPU count of the process), `--gpu-memory`, and the post-loop options `--prune`, `--prune-rows`, `--prune-budget` and `--fit-report`. None of them changes the search trajectory. Settings that do change it, such as `--fit-polish`, `--fit-irls` and `--fit-rows`, are saved and a mismatch is refused.
+Execution settings are not saved. A resumed run takes them from its own command line: `--gpu`, `--cpu`, `--dispatch`, `--pipeline-depth` (default `2`, not the earlier chunk's value), `--threads` (and the CPU count of the process), `--gpu-memory`, and the post-loop options `--prune`, `--prune-rows`, `--prune-budget`, `--fit-report` and the selection rule (`--select-rule`, `--select-blocks`, `--select-se`, `--select-block-len`; `--reselect` re-selects a finished checkpoint without a search, see overfitting.md). None of them changes the search trajectory. Settings that do change it, such as `--fit-polish`, `--fit-irls` and `--fit-rows`, are saved and a mismatch is refused.
 
 ### Backend identity
 

@@ -85,6 +85,7 @@ pub mod risk; // #307: exact risk monoids (Sharpe, Sortino, log-growth, drawdown
 pub mod rng;
 pub mod mix; // #471: adaptive edit weights
 pub mod run_json; // #482: reader for the parts of run.json later commands use
+pub mod reselect; // #928: re-select a finished front without a search
 pub mod schema;
 pub mod search;
 pub mod selection; // #111: select on train/validation, never the test lockbox
