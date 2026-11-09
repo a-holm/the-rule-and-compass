@@ -617,3 +617,438 @@ fn uniqueness_weights_are_nan_when_every_row_is_refused() {
     assert_eq!(l.weight_norm_rows, 0);
     assert!(l.weight.iter().all(|w| w.is_nan()));
 }
+
+// ---------------------------------------------------------------------------
+// #931: labels at 72, 168 and 336 hours, time-anchored stride, purge and embargo.
+// ---------------------------------------------------------------------------
+
+#[path = "common/long_horizon.rs"]
+mod lh;
+#[path = "common/scratch.rs"]
+mod scratch;
+
+use lh::{ANCHOR, HORIZONS};
+use rcsr::lockbox::Lockbox;
+
+fn path_str(p: &std::path::Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+fn run_rcsr(args: &[&str]) -> (i32, String, String) {
+    let out = rcsr_cmd::rcsr().args(args).output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Builds `out.rcsb` from `bars` (one series per symbol) through `rcsr enrich`
+/// with `ret1` and `labels`; `extra` adds flags such as `--locked-test`.
+fn enrich_cli(dir: &std::path::Path, series: &[(&str, &[Bar])], labels: &[String], extra: &[&str]) -> String {
+    let src = path_str(&dir.join("in.rcsb"));
+    let out = path_str(&dir.join("out.rcsb"));
+    lh::write_store(&src, series);
+    let mut a: Vec<String> = ["enrich", "--data", &src, "--out", &out, "--cpu", "--features", "ret1"].iter().map(|s| s.to_string()).collect();
+    for l in labels {
+        a.push("--label".to_string());
+        a.push(l.clone());
+    }
+    a.extend(extra.iter().map(|s| s.to_string()));
+    let args: Vec<&str> = a.iter().map(String::as_str).collect();
+    let (code, _, err) = run_rcsr(&args);
+    assert_eq!(code, 0, "{err}");
+    out
+}
+
+#[test]
+fn long_horizon_specs_and_purge() {
+    let s = scratch::Scratch::new("lh-specs");
+    let a = lh::bars(ANCHOR - 8 * HOUR, 1200, 0.0);
+    let labels: Vec<String> = HORIZONS.iter().map(|(h, _)| lh::src(*h, &format!(",stride={h},anchor=2021-01-04"))).collect();
+    let out = enrich_cli(s.path(), &[("AAA", &a)], &labels, &[]);
+    let store = rcsr::store::FileStore::open(&out).unwrap();
+    let names = store.header().names();
+    assert_eq!(names.iter().filter(|n| n.starts_with("lbl_h")).count(), 27, "{names:?}");
+    for (h, _) in HORIZONS {
+        for (kind, _) in labels::COLUMN_KINDS {
+            assert!(names.contains(&format!("lbl_h{h}_{kind}")), "lbl_h{h}_{kind}");
+        }
+    }
+    let tpath = target::sidecar_path(&out).unwrap();
+    let specs = target::parse_file(&std::fs::read_to_string(&tpath).unwrap()).unwrap();
+    for (h, purge) in HORIZONS {
+        let e = target::entry_for(&specs, &format!("lbl_h{h}_y")).unwrap_or_else(|| panic!("lbl_h{h}_y"));
+        assert_eq!(e.horizon_seconds, h as f64 * HOUR as f64, "h{h}");
+        assert_eq!(e.required_purge_seconds(), purge as f64, "h{h}");
+        assert_eq!(e.return_column.as_deref(), Some(format!("lbl_h{h}_fwd").as_str()));
+        assert_eq!(e.cost_bps, Some(20.0));
+        assert_eq!(lh::spec(&lh::src(h, "")).purge_seconds(), purge);
+    }
+    // An anchor needs a stride above one bar: exit 2.
+    let bad = path_str(&s.path().join("bad.rcsb"));
+    let src = path_str(&s.path().join("in.rcsb"));
+    for label in ["long:168,fee=0,anchor=2021-01-04", "long:168,fee=0,stride=1,anchor=2021-01-04", "long:168,fee=0,stride=168,anchor=soon"] {
+        let (code, _, err) = run_rcsr(&["enrich", "--data", &src, "--out", &bad, "--cpu", "--label", label]);
+        assert_eq!(code, 2, "{label}: {err}");
+        assert!(err.contains("anchor"), "{label}: {err}");
+    }
+}
+
+/// `sum_i mean_{k in span_i} 1 / c_k`, with `c_k` counted row by row.
+fn brute_force_effective_n(l: &labels::LongLabels, bars: &[Bar]) -> f64 {
+    let rows: Vec<(usize, usize)> = (0..bars.len())
+        .filter(|&t| l.fwd[t].is_finite())
+        .map(|t| (t + 1, lh::row_of(bars, l.t1[t] - HOUR as f64)))
+        .collect();
+    let mut c = vec![0usize; bars.len()];
+    for &(a, b) in &rows {
+        for slot in &mut c[a..=b] {
+            *slot += 1;
+        }
+    }
+    rows.iter().map(|&(a, b)| (a..=b).map(|k| 1.0 / c[k] as f64).sum::<f64>() / (b - a + 1) as f64).sum()
+}
+
+#[test]
+fn long_horizon_valid_rows_and_uniqueness() {
+    let bars = lh::bars(T0, 2000, 0.0);
+    let strided = lh::build(&bars, "long:168,fee=0,stride=168");
+    let valid: Vec<usize> = (0..bars.len()).filter(|&t| strided.fwd[t].is_finite()).collect();
+    assert_eq!(valid, (0..=10).map(|k| k * 168).collect::<Vec<_>>());
+    let r = strided.report();
+    assert_eq!(r.valid_rows, 11);
+    assert_eq!(r.average_uniqueness, 1.0);
+    let dense = lh::build(&bars, "long:168,fee=0");
+    assert_eq!(dense.report().valid_rows, 1832);
+    for l in [&strided, &dense] {
+        let want = brute_force_effective_n(l, &bars);
+        let got = l.report().effective_n;
+        assert!((got - want).abs() < 1e-9, "effective_n {got} vs brute force {want}");
+    }
+}
+
+fn kept_stamps(bars: &[Bar], src: &str) -> Vec<i64> {
+    let l = lh::build(bars, src);
+    (0..bars.len()).filter(|&t| l.fwd[t].is_finite()).map(|t| bars[t].time).collect()
+}
+
+#[test]
+fn anchored_stride_aligns_symbols() {
+    let a = lh::bars(ANCHOR - 8 * HOUR, 2000, 0.0);
+    let b = lh::bars(ANCHOR - 3 * HOUR, 2000, 1.3);
+    let anchored = "long:168,fee=0,stride=168,anchor=2021-01-04";
+    let (ka, kb) = (kept_stamps(&a, anchored), kept_stamps(&b, anchored));
+    assert_eq!(ka.len(), 11);
+    assert!(ka.iter().chain(&kb).all(|t| (t - ANCHOR).rem_euclid(168 * HOUR) == 0));
+    assert_eq!(ka, kb, "both symbols decide at the same stamps");
+    assert_eq!(kept_stamps(&a, "long:168,fee=0,stride=168,anchor=1609718400"), ka, "epoch spelling");
+    assert_eq!(kept_stamps(&a, "long:168,fee=0,stride=168,anchor=2021-02-01"), ka, "an anchor after the first bar");
+    let plain = "long:168,fee=0,stride=168";
+    assert_ne!(kept_stamps(&a, plain), kept_stamps(&b, plain), "row-index stride differs by symbol");
+    let r = lh::build(&a, anchored).report();
+    assert_eq!(r.stride_rows, 2000 - (0..2000).filter(|t| (a[*t].time - ANCHOR).rem_euclid(168 * HOUR) == 0).count());
+    assert!(r.json().contains("\"stride\":168,\"anchor\":1609718400"), "{}", r.json());
+    for bad in ["long:168,fee=0,anchor=2021-01-04", "long:168,fee=0,stride=1,anchor=2021-01-04", "long:168,fee=0,stride=168,anchor=soon", "long:168,fee=0,stride=168,anchor=1609718400.5"] {
+        assert!(LongLabelSpec::parse(bad, HOUR).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn existing_label_hashes_are_unchanged() {
+    let bars = wavy(600);
+    let pinned = [
+        ("long:1,name=h1,fee=10", "PIN_H1"),
+        ("long:4,name=h4,fee=10,stride=4", "PIN_H4"),
+        ("long:24,name=h24,fee=10,stride=24", "PIN_H24"),
+    ];
+    for (src, want) in pinned {
+        let got = build(&bars, &LongLabelSpec::parse(src, HOUR).unwrap(), None).unwrap().label_hash();
+        assert_eq!(got, want, "{src}");
+    }
+}
+
+#[test]
+fn lock_boundary_rows_per_horizon() {
+    let bars = lh::bars(T0, 3000, 0.0);
+    let range = Lockbox { start: T0 + 2000 * HOUR, end: T0 + 2500 * HOUR };
+    for ((h, purge), norm) in HORIZONS.into_iter().zip([1928usize, 1832, 1664]) {
+        let s = lh::spec(&lh::src(h, ""));
+        assert_eq!(s.purge_seconds(), purge);
+        let mut acc = labels::LabelAccumulator::with_range(&s, Some(range)).with_embargo(1000 * HOUR);
+        let l = acc.build(&bars, None).unwrap();
+        assert_eq!(l.weight_norm_rows, norm, "h{h}");
+        acc.add("AAA", &l);
+        let r = acc.finish();
+        assert_eq!(r.locked_test.unwrap().rows_left_out, 1000, "h{h}");
+        assert_eq!(r.weight_norm_rows, norm, "h{h}");
+        let json = r.json();
+        assert!(json.contains(&format!("\"purge_rows_per_symbol\":{}", h + 1)), "h{h}: {json}");
+        assert!(json.contains(&format!("\"tail_rows_without_label\":{h}")), "h{h}: {json}");
+    }
+}
+
+#[test]
+fn label_scale_is_causal_under_future_edits() {
+    let bars = lh::bars(T0, 1500, 0.0);
+    let cut = 700;
+    let mut edited = bars.clone();
+    for (k, b) in edited.iter_mut().enumerate().skip(cut + 1) {
+        b.open *= 1.5 + 0.001 * k as f64;
+        b.high *= 2.0;
+        b.low *= 0.5;
+        b.close *= 1.7;
+    }
+    for (h, _) in HORIZONS {
+        let src = lh::src(h, "");
+        let (x, y) = (lh::build(&bars, &src), lh::build(&edited, &src));
+        let mut compared = 0;
+        for t in 0..=cut {
+            assert_eq!(x.sigma_h[t].to_bits(), y.sigma_h[t].to_bits(), "h{h} row {t}");
+            compared += x.sigma_h[t].is_finite() as usize;
+        }
+        assert!(compared > 500, "h{h}: {compared}");
+        // The edit reaches the labels of rows whose window crosses the cut, so the test has teeth.
+        assert_ne!(x.fwd[cut].to_bits(), y.fwd[cut].to_bits());
+    }
+}
+
+#[test]
+fn weights_ignore_locked_rows() {
+    let n = 3000;
+    let (a, b) = (1500usize, 1800usize);
+    let base = noisy(n, 1, a..b);
+    let alt = noisy(n, 2, a..b);
+    let mut other = base.clone();
+    other[a..b].copy_from_slice(&alt[a..b]);
+    let range = Lockbox { start: T0 + a as i64 * HOUR, end: T0 + b as i64 * HOUR };
+    let embargo = 400 * HOUR;
+    for (h, purge) in HORIZONS {
+        let s = lh::spec(&lh::src(h, ""));
+        let acc = labels::LabelAccumulator::with_range(&s, Some(range)).with_embargo(embargo);
+        let (x, y) = (acc.build(&base, None).unwrap(), acc.build(&other, None).unwrap());
+        let mut compared = 0;
+        for t in 0..n {
+            let time = T0 + t as i64 * HOUR;
+            if (time + purge <= range.start || time >= range.end + embargo) && x.weight[t].is_finite() {
+                assert_eq!(x.weight[t].to_bits(), y.weight[t].to_bits(), "h{h} row {t}");
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, x.weight_norm_rows, "h{h}");
+        assert!(compared > 1500, "h{h}: {compared}");
+    }
+}
+
+/// A one-symbol store with stride-1 labels at the three horizons and a declared
+/// locked test `[S, S + 100 h)`, `S` at bar 1600.
+fn locked_store(dir: &std::path::Path) -> (String, i64) {
+    let start = ANCHOR - 8 * HOUR;
+    let a = lh::bars(start, 2600, 0.0);
+    let s = start + 1600 * HOUR;
+    let range = format!("{},{}", s, s + 100 * HOUR);
+    let labels: Vec<String> = HORIZONS.iter().map(|(h, _)| lh::src(*h, "")).collect();
+    let out = enrich_cli(dir, &[("AAA", &a)], &labels, &["--allow-overlap", "--locked-test", &range]);
+    (out, s)
+}
+
+fn search_args<'a>(data: &'a str, target: &'a str, vars: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut a = vec![
+        "--data", data, "--target", target, "--vars", vars, "--time", "ts", "--split", "temporal", "--cpu", "--no-dev-log",
+        "--seed", "3", "--generations", "2", "--pop", "8", "--quiet",
+    ];
+    a.extend_from_slice(extra);
+    a
+}
+
+#[test]
+fn new_label_columns_are_refused_as_inputs() {
+    let s = scratch::Scratch::new("lh-vars");
+    let (data, start) = locked_store(s.path());
+    let exclude = format!("ts >= {}", start - 400 * HOUR);
+    for (h, _) in HORIZONS {
+        for kind in ["fwd", "y", "long_net", "action", "t1", "exit_ret", "m_net", "m_barrier", "weight"] {
+            let col = format!("lbl_h{h}_{kind}");
+            let vars = format!("ret1,{col}");
+            let (code, _, err) = run_rcsr(&search_args(&data, "lbl_h72_y", &vars, &["--exclude", &exclude]));
+            assert_eq!(code, 5, "{col}: {err}");
+            assert!(err.contains(&col), "{col}: {err}");
+        }
+    }
+    // The scale column is a construction column of every y target: refused under the clean-input gate.
+    let (code, _, err) = run_rcsr(&search_args(&data, "lbl_h336_y", "ret1,vol96", &["--exclude", &exclude, "--require-clean-inputs"]));
+    assert_eq!(code, 5, "{err}");
+    assert!(err.contains("vol96"), "{err}");
+}
+
+#[test]
+fn lockbox_counts_purge_rows_per_horizon() {
+    let s = scratch::Scratch::new("lh-lockbox");
+    let (data, start) = locked_store(s.path());
+    let exclude = format!("ts >= {start}");
+    for (h, _) in HORIZONS {
+        let target = format!("lbl_h{h}_y");
+        let (code, _, err) = run_rcsr(&search_args(&data, &target, "ret1", &["--exclude", &exclude, "--test-frac", "0.5"]));
+        assert_eq!(code, 3, "h{h}: {err}");
+        assert!(err.contains(&format!("{} row(s) whose label window reaches the declared locked test", h + 1)), "h{h}: {err}");
+    }
+}
+
+/// Two symbols of hourly bars with h168 labels at an anchored weekly stride,
+/// and a windows table with one expanding fold.
+fn h168_store(dir: &std::path::Path) -> (String, String) {
+    let start = ANCHOR - 8 * HOUR;
+    let a = lh::bars(start, 9000, 0.0);
+    let b = lh::bars(start, 9000, 1.3);
+    let out = enrich_cli(dir, &[("AAA", &a), ("BBB", &b)], &[lh::src(168, ",stride=168,anchor=2021-01-04")], &[]);
+    let w = |weeks: i64| rcsr::protocol::iso((ANCHOR + weeks * 168 * HOUR) as f64);
+    let windows = path_str(&dir.join("windows.csv"));
+    std::fs::write(
+        &windows,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,f0,{},{},{},{},{}\n",
+            w(0),
+            w(30),
+            w(20),
+            w(32),
+            w(52)
+        ),
+    )
+    .unwrap();
+    (out, windows)
+}
+
+#[test]
+fn fit_label_effective_n_in_reports() {
+    let s = scratch::Scratch::new("lh-fit-label");
+    let (data, windows) = h168_store(s.path());
+    let report = rcsr::target::label_report_for(&data, "lbl_h168_y").expect("label report");
+    let j = rcsr::devlog::Json::parse(&report).unwrap();
+    assert_eq!(j.get("average_uniqueness").and_then(|v| v.as_f64()), Some(1.0));
+    let want = format!(
+        "\"fit_label\":{{\"name\":\"h168\",\"stride\":168,\"average_uniqueness\":{},\"effective_n\":{},\"effective_n_hours\":{}}}",
+        rcsr::devlog::num(j.get("average_uniqueness").unwrap().as_f64().unwrap()),
+        rcsr::devlog::num(j.get("effective_n").unwrap().as_f64().unwrap()),
+        rcsr::devlog::num(j.get("effective_n_hours").unwrap().as_f64().unwrap())
+    );
+    let spec = rcsr::target::sidecar_path(&data).unwrap();
+    let w = |weeks: i64| ANCHOR + weeks * 168 * HOUR;
+    let window = format!("f0,{},{},{},{}", w(0), w(30), w(32), w(52));
+    let (code, out, err) = run_rcsr(&[
+        "walkforward", "--data", &data, "--target", "lbl_h168_y", "--target-spec", &spec, "--expr", "ret1", "--vars", "ret1",
+        "--time", "ts", "--group-by", "symbol", "--periods-per-year", "52", "--window", &window, "--json",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let split = rcsr::manifest::object(&out, "split").expect("split");
+    assert!(split.contains(&want), "walkforward split {split} lacks {want}");
+    let (code, out, err) = run_rcsr(&[
+        "ladder", "--data", &data, "--target", "lbl_h168_y", "--time", "ts", "--group", "symbol", "--features", "ret1",
+        "--windows", &windows, "--target-spec", &spec, "--draws", "100", "--gbm-trees", "20", "--json",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let split = rcsr::manifest::object(&out, "split").expect("ladder split");
+    assert!(split.contains(&want), "ladder split {split} lacks {want}");
+}
+
+#[test]
+fn embargo_after_test_block_covers_h336() {
+    // Library guards: a declared embargo below the label purge still keeps every
+    // training row at least the purge after the locked end.
+    let purge = 1_213_200.0;
+    let (ls, le) = (T0 as f64 + 1000.0 * HOUR as f64, T0 as f64 + 1100.0 * HOUR as f64);
+    let bars = lh::bars(T0, 4000, 0.0);
+    let l = lh::build(&bars, &lh::src(336, ",stride=336"));
+    let n = bars.len();
+    let panel = rcsr::ladder::Panel::new(
+        vec!["x".to_string()],
+        vec![(0..n).map(|i| (i % 5) as f64).collect()],
+        bars.iter().map(|b| b.time as f64).collect(),
+        vec![0; n],
+        l.y.clone(),
+        l.fwd.clone(),
+        vec![],
+    )
+    .unwrap();
+    let fold = |train_start: f64| rcsr::protocol::WindowRow {
+        scheme: "expanding".to_string(),
+        window: rcsr::walkforward::Window {
+            label: "after".to_string(),
+            train_start,
+            train_end: train_start + 1500.0 * HOUR as f64,
+            test_start: train_start + 1500.0 * HOUR as f64 + purge,
+            test_end: train_start + 2500.0 * HOUR as f64 + purge,
+        },
+        validation_start: train_start + 1000.0 * HOUR as f64,
+    };
+    for embargo in [0.0, 345_600.0] {
+        let e = rcsr::ladder::make_folds(&panel, &[fold(le + purge - HOUR as f64)], purge, &[(ls, le)], embargo).unwrap_err();
+        assert!(e.contains("reaches the declared locked test"), "embargo {embargo}: {e}");
+        let folds = rcsr::ladder::make_folds(&panel, &[fold(le + purge)], purge, &[(ls, le)], embargo).unwrap();
+        let first = folds[0].fit.iter().map(|&i| panel.time[i]).fold(f64::INFINITY, f64::min);
+        assert!(first >= le + purge, "embargo {embargo}: first fit row {first}");
+    }
+    let mut spec = rcsr::walkforward::EvalSpec {
+        expression: "x".to_string(),
+        vars: vec!["x".to_string()],
+        target: "target".to_string(),
+        time: "ts".to_string(),
+        group: None,
+        windows: Vec::new(),
+        horizon: 336.0 * HOUR as f64,
+        embargo: None,
+        cost_bps: 10.0,
+        threshold_quantile: 0.5,
+        threshold_fixed: None,
+        validation_frac: 0.0,
+        periods_per_year: Some(26.0),
+        candidates: Vec::new(),
+        band_select: false,
+        pool_reset_flat: false,
+        allow_lockbox: false,
+        device_pnl: false,
+        control_seed: 0,
+        policy: rcsr::walkforward::Policy::Threshold,
+        band_width: 0.0,
+        min_hold: 1,
+        gpu: false,
+    };
+    spec.windows = vec![fold(le + purge).window];
+    let opts = rcsr::walkforward::ProtocolOptions {
+        entry_offset: HOUR as f64,
+        locked_ranges: vec![(ls as i64, le as i64)],
+        locked_embargo: 0,
+        ..rcsr::walkforward::ProtocolOptions::default()
+    };
+    assert_eq!(opts.locked_reach(&spec), vec![(ls, le, ls - purge, le + purge)]);
+
+    // The store path: a ret1-only store with an h336 label declares the label purge as its embargo.
+    let s = scratch::Scratch::new("lh-embargo");
+    let start = ANCHOR - 8 * HOUR;
+    let a = lh::bars(start, 9000, 0.0);
+    let (s0, e0) = (start + 2000 * HOUR, start + 2100 * HOUR);
+    let range = format!("{s0},{e0}");
+    let data = enrich_cli(s.path(), &[("AAA", &a)], &[lh::src(336, ",stride=336,anchor=2021-01-04")], &["--locked-test", &range]);
+    let enrich_json = std::fs::read_to_string(format!("{data}.enrich.json")).unwrap();
+    let embargo = rcsr::manifest::object(&enrich_json, "lockbox_embargo").unwrap();
+    assert!(embargo.contains("\"seconds\":1213200") && embargo.contains("\"column\":\"lbl_h336_"), "{embargo}");
+    let spec_path = rcsr::target::sidecar_path(&data).unwrap();
+    let wf = |train_start: i64| {
+        let window = format!(
+            "after,{},{},{},{}",
+            train_start,
+            train_start + 2016 * HOUR,
+            train_start + 2016 * HOUR + 1_213_200,
+            train_start + 4032 * HOUR + 1_213_200
+        );
+        run_rcsr(&[
+            "walkforward", "--data", &data, "--target", "lbl_h336_y", "--target-spec", &spec_path, "--expr", "ret1", "--vars",
+            "ret1", "--time", "ts", "--periods-per-year", "26", "--window", &window, "--json",
+        ])
+    };
+    let (code, _, err) = wf(e0 + 1_213_200 - HOUR);
+    assert_eq!(code, 3, "{err}");
+    assert!(err.contains("reaches the declared locked test"), "{err}");
+    let (code, out, err) = wf(e0 + 1_213_200);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("\"train_rows\":"), "{out}");
+}

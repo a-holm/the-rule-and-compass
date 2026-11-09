@@ -1312,3 +1312,113 @@ fn the_planned_lines_for_one_arm_and_seed_run_as_written() {
         assert_eq!(o.status.code(), Some(0), "{line}\n{}", String::from_utf8_lossy(&o.stderr));
     }
 }
+
+// ---------------------------------------------------------------------------
+// #931: `ablation score` folds at 72, 168 and 336 hours.
+// ---------------------------------------------------------------------------
+
+#[path = "common/long_horizon.rs"]
+mod lh;
+
+fn no_training_label_reaches_test_block(h: usize) {
+    let (_scratch, dir) = scratch(&format!("ablation-h{h}"));
+    let t0 = T0 as i64 - T0 as i64 % 3600;
+    let n = 30 * h;
+    let hour = 3600.0;
+    let (mut time, mut group, mut xs, mut ys, mut rets, mut t1) = (vec![], vec![], vec![], vec![], vec![], vec![]);
+    let mut csv = format!("ts,sym,x,vol96,lbl_h{h}_y,lbl_h{h}_fwd\n");
+    for (g, phase) in [0.0, 1.3].into_iter().enumerate() {
+        let bars = lh::bars(t0, n, phase);
+        let l = lh::build(&bars, &lh::src(h, &format!(",stride={h}")));
+        for t in 0..n {
+            if !(l.fwd[t].is_finite() && l.y[t].is_finite()) {
+                continue;
+            }
+            let x = ((t * 7 + g) % 11) as f64 - 5.0;
+            csv.push_str(&format!("{},s{g},{x},{},{},{}\n", bars[t].time, l.sigma_h[t] / (h as f64).sqrt(), l.y[t], l.fwd[t]));
+            time.push(bars[t].time as f64);
+            group.push(g as u64);
+            xs.push(x);
+            ys.push(l.y[t]);
+            rets.push(l.fwd[t]);
+            t1.push(l.t1[t]);
+        }
+    }
+    let data = dir.join("d.csv");
+    std::fs::write(&data, csv).unwrap();
+    let spec = lh::spec(&lh::src(h, &format!(",stride={h}")));
+    let spec_path = dir.join("spec.json");
+    std::fs::write(&spec_path, lh::spec_file(&spec)).unwrap();
+    let test_start = t0 as f64 + (20 * h) as f64 * hour;
+    let train_end = test_start - lh::DEFAULT_PURGE;
+    let validation_start = train_end - (8 * h) as f64 * hour;
+    let test_end = test_start + (6 * h) as f64 * hour;
+    let windows = dir.join("w.csv");
+    std::fs::write(
+        &windows,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,w0,{},{},{},{},{}\n",
+            protocol::iso(t0 as f64),
+            protocol::iso(train_end),
+            protocol::iso(validation_start),
+            protocol::iso(test_start),
+            protocol::iso(test_end)
+        ),
+    )
+    .unwrap();
+    let vars = vec!["x".to_string()];
+    let run = format!(
+        "{{\"seed\":3,\"variables\":[\"x\"],\"ablation\":{{\"arm\":\"A0\",\"feature_list_sha256\":\"{}\",\"generation_budget\":5,\"generations_run\":5}},\
+\"objective\":{{\"finalist\":{{\"expression\":\"x\"}}}},\"split\":{{\"train_time\":[{},{}],\"validation_time\":[{},{}],\"required_purge_seconds\":{}}}}}",
+        ablation::feature_list_sha256(&vars),
+        t0,
+        t0 + 100 * 3600,
+        t0 + 100 * 3600,
+        t0 + 200 * 3600,
+        spec.purge_seconds()
+    );
+    let run_path = dir.join("A0-s3.run.json");
+    std::fs::write(&run_path, run).unwrap();
+    let res = dir.join("A0-s3.result.json");
+    let out = rcsr_cmd::rcsr()
+        .args([
+            "ablation", "score", "--run", run_path.to_str().unwrap(), "--data", data.to_str().unwrap(), "--target",
+            &format!("lbl_h{h}_y"), "--time", "ts", "--group", "sym", "--windows", windows.to_str().unwrap(), "--target-spec",
+            spec_path.to_str().unwrap(), "--purge-seconds", "219600", "--out", res.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "h{h}: {}", String::from_utf8_lossy(&out.stderr));
+    let text = std::fs::read_to_string(&res).unwrap();
+    let purge = spec.purge_seconds() as f64;
+    assert!(text.contains(&format!("\"purge_seconds\":{},\"purge_source\":\"target_spec\"", spec.purge_seconds())), "h{h}: {text}");
+    // The folds `ablation score` builds with that purge.
+    let panel = Panel::new(vec!["x".into()], vec![xs], time, group, ys, rets, vec![]).unwrap();
+    let row = WindowRow {
+        scheme: "expanding".to_string(),
+        window: Window { label: "w0".to_string(), train_start: t0 as f64, train_end, test_start, test_end },
+        validation_start,
+    };
+    let folds = ladder::make_folds(&panel, &[row], purge, &[], 0.0).unwrap();
+    let f = &folds[0];
+    assert!(!f.valid.is_empty() && !f.fit.is_empty());
+    for &i in f.fit.iter().chain(&f.valid) {
+        assert!(t1[i] < test_start, "h{h} row {i}: label end {} at or after the test start", t1[i]);
+        assert!(test_start - panel.time[i] >= purge, "h{h} row {i}: stamp {} within the purge", panel.time[i]);
+    }
+}
+
+#[test]
+fn no_training_label_reaches_test_block_h72() {
+    no_training_label_reaches_test_block(72);
+}
+
+#[test]
+fn no_training_label_reaches_test_block_h168() {
+    no_training_label_reaches_test_block(168);
+}
+
+#[test]
+fn no_training_label_reaches_test_block_h336() {
+    no_training_label_reaches_test_block(336);
+}

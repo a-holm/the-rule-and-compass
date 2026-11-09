@@ -338,3 +338,139 @@ fn the_report_filter_drops_timing_ledger_fields_and_keeps_data_fields() {
     assert_ne!(stable(a, "/data.rcsb"), stable(&a.replace("1.5", "1.6"), "/data.rcsb"));
     assert_ne!(stable(a, "/data.rcsb"), stable(&a.replace("10", "11"), "/data.rcsb"));
 }
+
+// ---------------------------------------------------------------------------
+// #931: the lockbox reach at 168 and 336 hours.
+// ---------------------------------------------------------------------------
+
+#[path = "common/long_horizon.rs"]
+mod lh;
+
+#[test]
+fn locked_window_inside_h168_purge_exits_3() {
+    let (_scratch, dir) = scratch("h168-lock");
+    let (s0, e0) = (T0 + 4000 * H, T0 + 4100 * H);
+    let bars = lh::bars(T0, 168 * 30, 0.0);
+    let spec = lh::spec(&lh::src(168, ",stride=168"));
+    let l = rcsr::labels::build(&bars, &spec, None).unwrap();
+    let mut csv = String::from("ts,sym,x,vol96,lbl_h168_y,lbl_h168_fwd\n");
+    for (t, b) in bars.iter().enumerate() {
+        csv.push_str(&format!("{},s0,{},0.01,{},{}\n", b.time, ((t * 7) % 11) as f64, lh::fmt(l.y[t]), lh::fmt(l.fwd[t])));
+    }
+    let table = data::parse_table(&csv).unwrap();
+    let path = s(&dir.join("h168.rcsb"));
+    store::write_store_with_time(&path, &table, 512, Some(0)).unwrap();
+    lockbox::write_sidecar(&path, &Lockbox { start: s0, end: e0 }, "test").unwrap();
+    let spec_path = dir.join("spec.json");
+    std::fs::write(&spec_path, lh::spec_file(&spec)).unwrap();
+    let wf = |test_start: i64, test_end: i64| {
+        let w = format!("w,{},{},{},{}", T0, T0 + 1500 * H, test_start, test_end);
+        rcsr(&[
+            "walkforward", "--data", &path, "--target", "lbl_h168_y", "--target-spec", s(&spec_path).as_str(), "--expr", "x",
+            "--time", "ts", "--periods-per-year", "52", "--window", &w, "--json",
+        ])
+    };
+    let (code, out, err) = wf(s0 - 608_399, s0 - 1);
+    assert_eq!(code, 3, "{out}{err}");
+    assert!(err.contains("reaches the declared locked test") && err.contains("label end = stamp + 608400 s"), "{err}");
+    let (code, _, err) = wf(T0 + 1500 * H + 608_400, s0 - 608_400);
+    assert_eq!(code, 0, "{err}");
+    // The ladder refuses a fold whose test range starts inside the purge the same way.
+    let iso = |t: i64| rcsr::protocol::iso(t as f64);
+    let windows = dir.join("w.csv");
+    std::fs::write(
+        &windows,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,f0,{},{},{},{},{}\n",
+            iso(T0),
+            iso(T0 + 1500 * H),
+            iso(T0 + 1000 * H),
+            iso(s0 - 608_399),
+            iso(s0 - 1)
+        ),
+    )
+    .unwrap();
+    let (code, _, err) = rcsr(&[
+        "ladder", "--data", &path, "--target", "lbl_h168_y", "--time", "ts", "--group", "sym", "--features", "x", "--windows",
+        s(&windows).as_str(), "--target-spec", s(&spec_path).as_str(), "--draws", "100", "--gbm-trees", "20", "--json",
+    ]);
+    assert_eq!(code, 3, "{err}");
+    assert!(err.contains("reaches the declared locked test"), "{err}");
+}
+
+#[test]
+fn no_h336_fit_label_reaches_the_lockbox() {
+    use rcsr::ladder::{self, Panel};
+    use rcsr::walkforward::{self, EvalSpec, ProtocolOptions, Window};
+    let h = 336usize;
+    let purge = 1_213_200i64;
+    let bars = lh::bars(T0, h * 40, 0.0);
+    let l = lh::build(&bars, &lh::src(h, ",stride=336"));
+    let (s0, e0) = (T0 + (18 * h) as i64 * H, T0 + (18 * h) as i64 * H + 500 * H);
+    let n = bars.len();
+    let x: Vec<f64> = (0..n).map(|t| ((t * 7) % 11) as f64).collect();
+    let time: Vec<f64> = bars.iter().map(|b| b.time as f64).collect();
+    let panel = Panel::new(vec!["x".into()], vec![x.clone()], time.clone(), vec![0; n], l.y.clone(), l.fwd.clone(), vec![]).unwrap();
+    let after = (e0 + purge) as f64;
+    let fold = |train_end: f64| rcsr::protocol::WindowRow {
+        scheme: "expanding".to_string(),
+        window: Window {
+            label: "f0".to_string(),
+            train_start: T0 as f64,
+            train_end,
+            test_start: after,
+            test_end: after + (8 * h) as f64 * H as f64,
+        },
+        validation_start: train_end - (6 * h) as f64 * H as f64,
+    };
+    let edge = (s0 - purge) as f64;
+    let e = ladder::make_folds(&panel, &[fold(edge + H as f64)], purge as f64, &[(s0 as f64, e0 as f64)], 0.0).unwrap_err();
+    assert!(e.contains("reaches the declared locked test"), "{e}");
+    let folds = ladder::make_folds(&panel, &[fold(edge)], purge as f64, &[(s0 as f64, e0 as f64)], 0.0).unwrap();
+    let seen: Vec<usize> = folds[0].fit.iter().chain(&folds[0].valid).copied().collect();
+    assert!(seen.len() >= 15, "{}", seen.len());
+    for &i in &seen {
+        assert!(l.t1[i] <= s0 as f64, "row {i}: label end {} reaches the locked start", l.t1[i]);
+    }
+    let reaching: Vec<usize> = (0..n).filter(|&t| l.fwd[t].is_finite() && time[t] < s0 as f64 && time[t] + purge as f64 > s0 as f64).collect();
+    assert!(!reaching.is_empty(), "the fixture holds a row whose label reaches the range");
+    assert!(reaching.iter().all(|i| !seen.contains(i)));
+
+    // Walk-forward: the same boundary through the library guard.
+    let mut csv = String::from("ts,x,target\n");
+    for t in 0..n {
+        csv.push_str(&format!("{},{},{}\n", bars[t].time, x[t], lh::fmt(l.fwd[t])));
+    }
+    let table = data::parse_table(&csv).unwrap();
+    let spec = |train_end: f64| EvalSpec {
+        expression: "x".to_string(),
+        vars: vec!["x".to_string()],
+        target: "target".to_string(),
+        time: "ts".to_string(),
+        group: None,
+        windows: vec![fold(train_end).window],
+        horizon: (h as i64 * H) as f64,
+        embargo: None,
+        cost_bps: 10.0,
+        threshold_quantile: 0.5,
+        threshold_fixed: None,
+        validation_frac: 0.0,
+        periods_per_year: Some(26.0),
+        candidates: Vec::new(),
+        band_select: false,
+        pool_reset_flat: false,
+        allow_lockbox: false,
+        device_pnl: false,
+        control_seed: 0,
+        policy: walkforward::Policy::Threshold,
+        band_width: 0.0,
+        min_hold: 1,
+        gpu: false,
+    };
+    let opts = ProtocolOptions { entry_offset: H as f64, locked_ranges: vec![(s0, e0)], locked_embargo: 0, ..ProtocolOptions::default() };
+    let err = walkforward::run_table_with(&table, &spec(edge + H as f64), "t", &opts).unwrap_err();
+    assert!(err.contains("reaches the declared locked test"), "{err}");
+    let r = walkforward::run_table_with(&table, &spec(edge), "t", &opts).unwrap();
+    let last = r.windows[0].train_last_time.unwrap();
+    assert!(last + purge as f64 <= s0 as f64, "last training stamp {last}");
+}
