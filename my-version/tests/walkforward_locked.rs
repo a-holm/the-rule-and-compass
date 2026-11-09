@@ -474,3 +474,50 @@ fn no_h336_fit_label_reaches_the_lockbox() {
     let last = r.windows[0].train_last_time.unwrap();
     assert!(last + purge as f64 <= s0 as f64, "last training stamp {last}");
 }
+
+#[test]
+fn short_declared_embargo_keeps_h168_labels_after_the_end() {
+    let (_scratch, dir) = scratch("h168-short-embargo");
+    let (s0, e0) = (T0 + 1000 * H, T0 + 1100 * H);
+    let purge = 608_400i64;
+    let bars = lh::bars(T0, 168 * 30, 0.0);
+    let spec = lh::spec(&lh::src(168, ",stride=168"));
+    let l = rcsr::labels::build(&bars, &spec, None).unwrap();
+    let mut csv = String::from("ts,x,vol96,lbl_h168_y,lbl_h168_fwd\n");
+    for (t, b) in bars.iter().enumerate() {
+        csv.push_str(&format!("{},{},0.01,{},{}\n", b.time, ((t * 7) % 11) as f64, lh::fmt(l.y[t]), lh::fmt(l.fwd[t])));
+    }
+    let path = s(&dir.join("short.rcsb"));
+    store::write_store_with_time(&path, &data::parse_table(&csv).unwrap(), 512, Some(0)).unwrap();
+    let embargo = lockbox::embargo_json(3600, "x", "test", 3600);
+    lockbox::write_sidecar_with(&path, &Lockbox { start: s0, end: e0 }, "test", &lockbox::embargo_member(Some(&embargo))).unwrap();
+    std::fs::write(dir.join("short.targets.json"), lh::spec_file(&spec)).unwrap();
+    // The search: rows from one hour after the end read no locked bar, but their labels
+    // share returns with the last locked labels until one purge after the end.
+    let search = |from: i64| {
+        let exclude = format!("ts < {from}");
+        rcsr(&[
+            "--data", &path, "--target", "lbl_h168_y", "--vars", "x", "--time", "ts", "--split", "temporal", "--cpu",
+            "--no-dev-log", "--seed", "3", "--generations", "2", "--pop", "8", "--quiet", "--exclude", &exclude,
+        ])
+    };
+    let (code, _, err) = search(e0 + H);
+    assert_eq!(code, 3, "{err}");
+    assert!(err.contains("lookback embargo 608400 s after the end (the label purge of the target spec)"), "{err}");
+    let (code, _, err) = search(e0 + purge);
+    assert_eq!(code, 0, "{err}");
+    // Walk-forward refuses a window that starts inside the purge after the end.
+    let spec_path = s(&dir.join("short.targets.json"));
+    let wf = |train_start: i64| {
+        let w = format!("w,{},{},{},{}", train_start, train_start + 1500 * H, train_start + 1500 * H + purge, train_start + 3000 * H + purge);
+        rcsr(&[
+            "walkforward", "--data", &path, "--target", "lbl_h168_y", "--target-spec", &spec_path, "--expr", "x", "--time", "ts",
+            "--periods-per-year", "52", "--window", &w, "--json",
+        ])
+    };
+    let (code, _, err) = wf(e0 + H);
+    assert_eq!(code, 3, "{err}");
+    assert!(err.contains("reaches the declared locked test"), "{err}");
+    let (code, _, err) = wf(e0 + purge);
+    assert_eq!(code, 0, "{err}");
+}

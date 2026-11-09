@@ -1052,3 +1052,18 @@ fn embargo_after_test_block_covers_h336() {
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("\"train_rows\":"), "{out}");
 }
+
+#[test]
+fn overlapping_fit_label_without_weight_prints_one_note() {
+    let s = scratch::Scratch::new("lh-note");
+    let (data, start) = locked_store(s.path());
+    let exclude = format!("ts >= {}", start - 400 * HOUR);
+    let note = "note: target lbl_h168_y has overlapping labels";
+    let (code, _, err) = run_rcsr(&search_args(&data, "lbl_h168_y", "ret1", &["--exclude", &exclude]));
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(err.matches(note).count(), 1, "{err}");
+    assert!(err.contains("--weight lbl_h168_weight"), "{err}");
+    let (code, _, err) = run_rcsr(&search_args(&data, "lbl_h168_y", "ret1", &["--exclude", &exclude, "--weight", "lbl_h168_weight"]));
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains(note), "{err}");
+}

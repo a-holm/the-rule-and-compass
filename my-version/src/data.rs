@@ -2852,7 +2852,10 @@ fn boundary_purge(spec: &SplitSpec) -> i64 {
 fn label_floored(d: &crate::lockbox::Declared, spec: &SplitSpec) -> crate::lockbox::Declared {
     let mut d = *d;
     if let Some(p) = spec.purge_seconds.or(spec.boundary_purge_seconds) {
-        d.embargo.seconds = d.embargo.seconds.max(p.ceil() as i64);
+        let p = p.ceil() as i64;
+        if p > d.embargo.seconds {
+            d.embargo = crate::lockbox::Embargo { seconds: p, source: crate::lockbox::EmbargoSource::LabelPurge };
+        }
     }
     d
 }

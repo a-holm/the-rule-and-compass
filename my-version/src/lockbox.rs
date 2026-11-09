@@ -236,6 +236,8 @@ pub enum EmbargoSource {
     Flag,
     /// No declaration: `protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS`.
     ProtocolDefault,
+    /// Raised to the target spec's label purge, which is longer than the declaration.
+    LabelPurge,
 }
 
 impl EmbargoSource {
@@ -244,6 +246,7 @@ impl EmbargoSource {
             EmbargoSource::Store => "store",
             EmbargoSource::Flag => "flag",
             EmbargoSource::ProtocolDefault => "protocol_default",
+            EmbargoSource::LabelPurge => "label_purge",
         }
     }
 }
@@ -356,6 +359,7 @@ impl Declared {
                         EmbargoSource::Store => "declared with the data",
                         EmbargoSource::Flag => "--lockbox-embargo",
                         EmbargoSource::ProtocolDefault => "protocol default",
+                        EmbargoSource::LabelPurge => "the label purge of the target spec",
                     }
                 ));
             }
