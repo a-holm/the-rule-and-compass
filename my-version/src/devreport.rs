@@ -201,7 +201,6 @@ pub struct Analysis {
     pub stop: String,
     pub wall_s: f64,
     pub search_s: f64,
-    pub search_cumulative_s: Option<f64>,
     pub peak_rss_bytes: Option<u64>,
     pub device_hours: Option<f64>,
     pub run_wall_s: Option<f64>,
@@ -344,7 +343,6 @@ pub fn analyse(path: &str, events: &[Json], skipped: usize) -> Analysis {
         a.stop = string_field(e, "stop");
         a.wall_s = f(e.get("wall"));
         a.search_s = f(e.get("search"));
-        a.search_cumulative_s = opt_f(e.get("search_cumulative"));
         a.peak_rss_bytes = opt_f(e.get("peak_rss_bytes")).map(|v| v as u64);
         a.device_hours = opt_f(e.get("device_hours"));
         a.run_wall_s = opt_f(e.get("run_wall_s"));
@@ -711,9 +709,6 @@ pub fn render(a: &Analysis) -> String {
         "| wall | {:.3} s (search {:.3} s) |\n",
         a.wall_s, a.search_s
     ));
-    if let Some(c) = a.search_cumulative_s {
-        out.push_str(&format!("| search wall (all chunks) | {:.3} s |\n", c));
-    }
     match a.peak_rss_bytes {
         Some(b) => out.push_str(&format!("| peak RSS | {} |\n", human_bytes(b))),
         None => out.push_str("| peak RSS | not available on this platform |\n"),

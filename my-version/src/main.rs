@@ -1012,11 +1012,6 @@ CHECKPOINTS:
                              The target spec sha256 must match too (exit 2).
                              The saved backend (cpu/gpu) must also match; a
                              mismatch is refused unless overridden below
-                             (#923) Every save also writes <save>.cost; a
-                             resume restores it when its generation matches
-                             the checkpoint, and run.json search.cumulative
-                             then totals the search seconds over all chunks
-                             (elapsed_seconds stays the last process)
   --allow-backend-change     resume a checkpoint on a different backend
                              (cpu<->gpu) and say so on stderr and in the
                              run manifest
@@ -1027,6 +1022,30 @@ CHECKPOINTS:
                              refused: stderr names it (#860). A time-budget stop is not
                              terminal: --resume continues it and
                              --time-budget may be set again
+  --select-rule validation_objective|robust
+                             post-loop finalist rule (#928, like --prune: not
+                             saved search state, outside the config hash).
+                             robust needs --objective pnl|sharpe|log_growth:
+                             per member and validation block, alpha = net -
+                             exposure x buy-and-hold net of the same rows; a
+                             member is eligible when alpha > 0 in at least
+                             K-1 blocks and pooled; the lowest complexity
+                             within --select-se standard errors of the best
+                             pooled alpha wins. No eligible member: verdict
+                             no_signal, validation_objective finalist. Reads
+                             training and validation rows only
+  --select-blocks <K>        validation blocks of robust, 1 to 8 (default 4)
+  --select-se <Z>            one-standard-error multiple (default 1.0)
+  --select-block-len <L>     bootstrap block length in periods (default 21)
+  --reselect <checkpoint>    re-select a finished search, no new one: scores
+                             the checkpoint's final archive under --select-rule
+                             and writes run.json and the report. Pass the data
+                             and flags of the original run. Exit 2: no final
+                             archive, --generations above the saved value,
+                             other data, target spec or backend. Another
+                             build is accepted and recorded
+  --reselect-run <run.json>  the same from a run.json front (expression_exact);
+                             split and train rows must match the data
 
 RUN INTEGRITY (#140):
   --run-manifest <file>      atomically write a JSON manifest with the build
@@ -1173,6 +1192,29 @@ fn parse_trade_number(flag: &str, text: &str) -> f64 {
     }
 }
 
+/// Return and trading rows of a book slice, followed by its cross-section
+/// context rows.
+fn trading_inputs(slice: &data::TradingSlice, ctx: Option<&data::TradingContext>) -> (Vec<f64>, rcsr::trading::TradingRows) {
+    let mut ret = slice.ret.clone();
+    let mut rows = slice.rows.clone();
+    if let Some(c) = ctx {
+        ret.extend_from_slice(&c.slice.ret);
+        rows.time.extend_from_slice(&c.slice.rows.time);
+        rows.group.extend_from_slice(&c.slice.rows.group);
+        rows.funding.extend_from_slice(&c.slice.rows.funding);
+    }
+    (ret, rows)
+}
+
+/// Prediction of `tree` on the rows of [`trading_inputs`].
+fn trading_pred(tree: &expr::Node, x: &[Vec<f64>], ctx: Option<&data::TradingContext>) -> Vec<f64> {
+    let mut pred: Vec<f64> = x.iter().map(|row| expr::eval(tree, row)).collect();
+    if let Some(c) = ctx {
+        pred.extend(c.x.iter().map(|row| expr::eval(tree, row)));
+    }
+    pred
+}
+
 /// #263: a usage error for the P&L objective, exit 2.
 /// #493: the book of one prediction vector. The context rows (removed only by a
 /// missing label) join the ranks of a top-tercile book; they earn nothing
@@ -1184,17 +1226,8 @@ fn trading_book(
     ctx: Option<&data::TradingContext>,
     tspec: &rcsr::trading::TradingSpec,
 ) -> Result<rcsr::trading::PathStats, String> {
-    let mut pred: Vec<f64> = x.iter().map(|row| expr::eval(tree, row)).collect();
-    let Some(c) = ctx else {
-        return rcsr::trading::evaluate(&pred, &slice.ret, &slice.rows, tspec);
-    };
-    pred.extend(c.x.iter().map(|row| expr::eval(tree, row)));
-    let mut ret = slice.ret.clone();
-    ret.extend_from_slice(&c.slice.ret);
-    let mut rows = slice.rows.clone();
-    rows.time.extend_from_slice(&c.slice.rows.time);
-    rows.group.extend_from_slice(&c.slice.rows.group);
-    rows.funding.extend_from_slice(&c.slice.rows.funding);
+    let pred = trading_pred(tree, x, ctx);
+    let (ret, rows) = trading_inputs(slice, ctx);
     rcsr::trading::evaluate(&pred, &ret, &rows, tspec)
 }
 
@@ -1446,24 +1479,6 @@ fn ledger_json(
     )
 }
 
-/// #923: `gpu.quality_per_gpu_hour_run`: decades per hour over the run wall, which
-/// is the wall of every chunk when `cumulative_wall_s` is known.
-fn quality_run_ratio(
-    ledger: &rcsr::gpu_stats::RunLedger,
-    best_error: f64,
-    baseline_error: f64,
-    cumulative_wall_s: Option<f64>,
-) -> rcsr::gpu_stats::Ratio {
-    match cumulative_wall_s {
-        Some(wall) => {
-            let mut l = rcsr::gpu_stats::RunLedger::new();
-            l.set_wall(wall);
-            l.quality_per_gpu_hour(best_error, baseline_error)
-        }
-        None => ledger.quality_per_gpu_hour(best_error, baseline_error),
-    }
-}
-
 /// #118: the GPU block shared by `--json` and the final NDJSON event. It keeps
 /// #131's per-generation opcode/fallback report and adds the measured full-path
 /// accounting. `sm_occupancy` is explicitly `null`: it needs `ncu`, and
@@ -1480,9 +1495,6 @@ fn gpu_json(
     // #256: `timing.total_seconds`, the one runtime of the process. The
     // `*_of_run` fractions divide by it.
     process_total_s: f64,
-    // #923: ledger wall of every chunk, when known; `quality_per_gpu_hour_run`
-    // divides by it instead of this process's wall.
-    cumulative_ledger_wall_s: Option<f64>,
 ) -> String {
     let Some(g) = g else {
         return "null".to_string();
@@ -1670,7 +1682,7 @@ fn gpu_json(
         ratio_json(Some(&run_duty)),
         quality,
         jnum(if metric_is_squared {
-            quality_run_ratio(&g.ledger, best_error, baseline_error, cumulative_ledger_wall_s).value
+            g.ledger.quality_per_gpu_hour(best_error, baseline_error).value
         } else {
             f64::NAN
         }),
@@ -2053,7 +2065,6 @@ impl DevSink {
         outcome: &rcsr::search::Outcome,
         wall_s: f64,
         search_s: f64,
-        search_cumulative_s: Option<f64>,
         json_path: Option<String>,
     ) {
         let best = outcome
@@ -2075,7 +2086,6 @@ impl DevSink {
             stop: outcome.stop_reason.to_string(),
             wall_s,
             search_s,
-            search_cumulative_s,
             pareto_size: outcome.archive.items.len(),
             best_error: best,
             archive_hash: outcome.archive.hash(),
@@ -2619,6 +2629,13 @@ fn main() {
     let mut save_every = 25usize;
     let mut save_every_set = false;
     let mut resume_path: Option<String> = None;
+    // #928: post-loop selection. Not search state, so outside config_hash.
+    let mut select_rule_arg: Option<String> = None;
+    let mut select_blocks_arg: Option<usize> = None;
+    let mut select_se_arg: Option<f64> = None;
+    let mut select_block_len_arg: Option<usize> = None;
+    let mut reselect_path: Option<String> = None;
+    let mut reselect_run_path: Option<String> = None;
     // #140: run integrity flags.
     let mut allow_backend_change = false;
     let mut allow_build_change = false;
@@ -3439,6 +3456,12 @@ fn main() {
                 }
             }
             "--resume" => resume_path = Some(val!()),
+            "--select-rule" => select_rule_arg = Some(val!()),
+            "--select-blocks" => select_blocks_arg = Some(parse_uint("--select-blocks", &val!())),
+            "--select-se" => select_se_arg = Some(parse_nonneg("--select-se", &val!())),
+            "--select-block-len" => select_block_len_arg = Some(parse_uint("--select-block-len", &val!())),
+            "--reselect" => reselect_path = Some(val!()),
+            "--reselect-run" => reselect_run_path = Some(val!()),
             "--allow-backend-change" => allow_backend_change = true,
             "--allow-build-change" => allow_build_change = true,
             "--run-manifest" => run_manifest_path = Some(val!()),
@@ -3628,6 +3651,25 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
+    // #928: a re-selection is a resume that runs nothing.
+    if reselect_path.is_some() || reselect_run_path.is_some() {
+        let conflicts = [
+            (reselect_path.is_some() && reselect_run_path.is_some(), "--reselect with --reselect-run"),
+            (resume_path.is_some(), "--reselect with --resume"),
+            (save_path.is_some(), "--reselect with --save"),
+            (eval_expr.is_some(), "--reselect with --eval-expr"),
+            (!seed_exprs.is_empty() || !seed_files.is_empty(), "--reselect with --seed-expr/--seed-file"),
+        ];
+        if let Some((_, what)) = conflicts.iter().find(|(c, _)| *c) {
+            eprintln!("error: {}: a re-selection runs no search", what);
+            std::process::exit(EXIT_USAGE);
+        }
+        if select_rule_arg.is_none() {
+            eprintln!("error: --reselect and --reselect-run need --select-rule");
+            std::process::exit(EXIT_USAGE);
+        }
+        resume_path = reselect_path.clone();
+    }
     if allow_backend_change && resume_path.is_none() {
         eprintln!("error: --allow-backend-change only applies to --resume");
         std::process::exit(EXIT_USAGE);
@@ -3777,6 +3819,19 @@ fn main() {
                 std::process::exit(EXIT_INPUT);
             }
         };
+        if reselect_path.is_some() {
+            if cp.final_archive.is_none() {
+                eprintln!("error: --reselect '{}' has no final archive (a mid-run checkpoint): run it to the end first", path);
+                std::process::exit(EXIT_USAGE);
+            }
+            if generations_set && cfg.generations > cp.generations {
+                eprintln!(
+                    "error: --reselect with --generations {} above the saved {}: a new search is --resume",
+                    cfg.generations, cp.generations
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+        }
         let saved = cp.config.clone();
         if cp.refit_band_unknown && !refit_band_set {
             eprintln!(
@@ -5710,6 +5765,33 @@ fn main() {
         }
         select_by = Some(rcsr::selection::SelectBy::ValidationObjective);
     }
+    // #928: the post-loop rule. It never reaches the search, so it is not saved
+    // with a checkpoint and not part of the config hash.
+    let select_rule = match select_rule_arg.as_deref() {
+        Some(src) => rcsr::selection::SelectRule::parse(src).unwrap_or_else(|e| trading_usage(&e)),
+        None => rcsr::selection::SelectRule::ValidationObjective,
+    };
+    let robust_params = rcsr::selection::RobustParams {
+        blocks: select_blocks_arg.unwrap_or(rcsr::selection::RobustParams::default().blocks),
+        se_z: select_se_arg.unwrap_or(rcsr::selection::RobustParams::default().se_z),
+        block_len: select_block_len_arg.unwrap_or(rcsr::selection::ROBUST_BLOCK_LEN),
+    };
+    if select_blocks_arg.is_some() || select_se_arg.is_some() || select_block_len_arg.is_some() {
+        if select_rule != rcsr::selection::SelectRule::Robust {
+            trading_usage("--select-blocks, --select-se and --select-block-len need --select-rule robust");
+        }
+    }
+    if select_rule == rcsr::selection::SelectRule::Robust {
+        if !objective.is_trading() {
+            trading_usage("--select-rule robust ranks the validation P&L book: add --objective pnl|sharpe|log_growth");
+        }
+        if let Err(e) = robust_params.validate() {
+            trading_usage(&e);
+        }
+    }
+    if select_rule != rcsr::selection::SelectRule::ValidationObjective && !objective.is_trading() {
+        trading_usage("--select-rule needs --objective pnl|sharpe|log_growth");
+    }
     if select_by == Some(rcsr::selection::SelectBy::Validation) && prepared.validation.is_none() {
         eprintln!(
             "error: --select-by validation needs a validation slice;              add --validation-frac <f>"
@@ -5816,7 +5898,7 @@ fn main() {
         }
         if let Err(e) = cp.check_data(&prepared.train, &prepared.test) {
             eprintln!("error: {}", e);
-            std::process::exit(EXIT_INPUT);
+            std::process::exit(if reselect_path.is_some() { EXIT_USAGE } else { EXIT_INPUT });
         }
         // #140: a GPU checkpoint must not be continued on the CPU (or vice
         // versa) without an explicit override. The effective backend mirrors
@@ -5824,13 +5906,14 @@ fn main() {
         let current_backend = search::effective_backend(&cfg, &prepared.train);
         if let Err(e) = cp.check_backend(current_backend, allow_backend_change) {
             eprintln!("error: {}", e);
-            std::process::exit(EXIT_INPUT);
+            std::process::exit(if reselect_path.is_some() { EXIT_USAGE } else { EXIT_INPUT });
         }
         // #256: the binary, commit, device and driver are part of what
         // produced the saved state. The CPU count is reported, not refused.
         let current_identity =
             rcsr::provenance::BuildIdentity::current(current_backend == Backend::Gpu);
-        if let Err(e) = cp.check_identity(&current_identity, allow_build_change) {
+        // #928: no trajectory continues, so another build is recorded, not refused.
+        if let Err(e) = cp.check_identity(&current_identity, allow_build_change || reselect_path.is_some()) {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
         }
@@ -6398,14 +6481,57 @@ fn main() {
     // #116: arm counts are process-wide diagnostics; take a delta around this
     // run so repeated runs in one process (`--report benchmark`) stay readable.
     let fit_before = fit::fit_arm_counts_full();
+    // #928: a re-selection reads a finished front and runs no generation.
+    let mut reselected_from: Option<String> = None;
+    let mut reselect_outcome: Option<search::Outcome> = None;
+    if let Some(path) = &reselect_path {
+        let cp = resume_checkpoint.take().expect("--reselect loads its checkpoint with the resume path");
+        let sha = rcsr::manifest::sha256_file(path).unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        });
+        let now = rcsr::provenance::BuildIdentity::current(effective_backend == Backend::Gpu);
+        reselected_from = Some(rcsr::reselect::from_checkpoint_json(path, &sha, cp.identity.as_ref(), &now));
+        let front = rcsr::reselect::front_of(&cp).expect("checked when the checkpoint was loaded");
+        reselect_outcome = Some(rcsr::reselect::outcome(front, &prepared.test, cfg.metric, cp.generations, cp.candidates_evaluated));
+    } else if let Some(path) = &reselect_run_path {
+        let usage = |e: String| -> ! {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_USAGE);
+        };
+        let run = rcsr::reselect::RunFront::load(path).unwrap_or_else(|e| usage(e));
+        if run.variables != vars {
+            usage(format!("--reselect-run '{}': its variables differ from this run's --vars", path));
+        }
+        if run.train_rows != Some(prepared.train.len()) || run.split_mode.as_deref() != Some(prepared.report.mode) {
+            usage(format!(
+                "--reselect-run '{}': split {:?} with {:?} train rows, this data gives {} with {}",
+                path,
+                run.split_mode,
+                run.train_rows,
+                prepared.report.mode,
+                prepared.train.len()
+            ));
+        }
+        let mut front = rcsr::pareto::Archive::new(run.members.len());
+        for m in &run.members {
+            let tree = expr::parse(&m.expression_exact, &vars)
+                .unwrap_or_else(|e| usage(format!("--reselect-run '{}': archive_rank {}: {}", path, m.archive_rank, e)));
+            let tree = normalise_inputs(&tree, &prepared.means, &prepared.stds);
+            front.items.push(rcsr::pareto::Sol {
+                complexity: m.complexity as usize,
+                cost: m.complexity,
+                tree,
+                error: m.train_error,
+            });
+        }
+        reselected_from = Some(rcsr::reselect::from_run_json(path, &run.sha256));
+        reselect_outcome = Some(rcsr::reselect::outcome(front, &prepared.test, cfg.metric, run.generations_run, run.candidates_evaluated));
+    }
     let mut last_saved: Option<(usize, String)> = None;
-    // #923: cost of the chunks before this process, from the checkpoint sidecar.
-    let cost_resumed = resume_path.is_some();
-    let cost_base = match (&resume_path, &resume_checkpoint) {
-        (Some(p), Some(cp)) => rcsr::resume_cost::load(p, cp.generations),
-        _ => None,
-    };
-    let outcome_result = if let Some(path) = save_path.clone() {
+    let outcome_result = if let Some(done) = reselect_outcome {
+        Ok(done)
+    } else if let Some(path) = save_path.clone() {
         let resumed = resume_checkpoint.take();
         search::run_resumable_seeded(
             &cfg,
@@ -6421,12 +6547,6 @@ fn main() {
                 }
                 let generation = cp.generations;
                 last_saved = Some((generation, path.clone()));
-                let so_far = rcsr::resume_cost::Cost::process(search_start.elapsed().as_secs_f64(), None, None);
-                if let Some(t) = rcsr::resume_cost::total(cost_resumed, cost_base.as_ref(), &so_far) {
-                    if let Err(e) = rcsr::resume_cost::write(&path, generation, &t) {
-                        eprintln!("warning: {}", e);
-                    }
-                }
                 // #211: the checkpoint file is saved; record its size and hash.
                 if let Some(sink) = &dev_sink {
                     sink.checkpoint(generation, &path);
@@ -6474,23 +6594,6 @@ fn main() {
             .record_outside(rcsr::gpu_stats::Stage::Features, prepared_s - table_loaded_s);
     }
     let search_seconds = search_start.elapsed().as_secs_f64();
-    let process_cost = rcsr::resume_cost::Cost::process(
-        search_seconds,
-        outcome.gpu.as_ref().map(|g| g.ledger.wall_s()),
-        outcome.gpu.as_ref().map(|g| g.accounting.wall_s + g.ledger.fit_kernel_s()),
-    );
-    let cumulative = rcsr::resume_cost::total(cost_resumed, cost_base.as_ref(), &process_cost);
-    if let (Some(t), Some((generation, path))) = (&cumulative, &last_saved) {
-        if *generation == outcome.generations {
-            if let Err(e) = rcsr::resume_cost::write(path, *generation, t) {
-                eprintln!("warning: {}", e);
-            }
-        }
-    }
-    let cumulative_json = cumulative
-        .as_ref()
-        .map_or_else(|| rcsr::resume_cost::INCOMPLETE_JSON.to_string(), |t| t.json());
-    let cumulative_ledger_wall_s = cumulative.as_ref().and_then(|t| t.ledger_wall_s);
     // #211: close the development log now that the search has returned: the
     // final archive, the stop reason, the wall and the process peak RSS. It is
     // written before diagnostics so a later failure still leaves a complete
@@ -6501,7 +6604,6 @@ fn main() {
             &outcome,
             run_start.elapsed().as_secs_f64(),
             search_seconds,
-            cumulative.as_ref().map(|t| t.search_s),
             json_out.clone(),
         );
     }
@@ -6565,12 +6667,11 @@ fn main() {
             cfg.fit_strategy.name(),
             false,
             timing.total,
-            cumulative_ledger_wall_s,
         );
         match format {
             Format::Json => {
                 let doc = format!(
-                    "{{\"tool\":\"rcsr\",\"version\":{},\"interim\":true,\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"threads\":{},\"seed\":{},\"stop_reason\":{},\"generations_run\":{},\"elapsed_seconds\":{},\"search\":{{\"cumulative\":{}}},\"timing\":{},\"gpu\":{},\"checkpoint\":{}}}",
+                    "{{\"tool\":\"rcsr\",\"version\":{},\"interim\":true,\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"threads\":{},\"seed\":{},\"stop_reason\":{},\"generations_run\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"checkpoint\":{}}}",
                     jstr(VERSION),
                     outcome.backend.name(),
                     backend_reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
@@ -6580,7 +6681,6 @@ fn main() {
                     jstr(outcome.stop_reason),
                     outcome.generations,
                     jnum(elapsed),
-                    cumulative_json,
                     timing.json(),
                     gpu,
                     checkpoint_json
@@ -6934,6 +7034,7 @@ fn main() {
             );
         }
     }
+    let mut selection_rule_fields = format!("\"rule\":\"{}\"", select_rule.name());
     // #111: selection. Reorder the front by the chosen criterion and renumber
     // the display rank; the archive rank is kept for reports that need the
     // underlying search order. `test_error` is never a criterion. With no
@@ -6954,7 +7055,36 @@ fn main() {
                 aicc: r.aicc,
             })
             .collect();
-        let order = rcsr::selection::order(&candidates, by);
+        let mut order = rcsr::selection::order(&candidates, by);
+        if select_rule == rcsr::selection::SelectRule::Robust {
+            let (Some(tspec), Some(v), Some(slice)) = (
+                &trading_spec,
+                &prepared.validation,
+                prepared.trading.as_ref().and_then(|t| t.validation.as_ref()),
+            ) else {
+                trading_usage("--select-rule robust needs a validation slice: add --validation-frac <f>");
+            };
+            let ctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
+            let (ret, book_rows) = trading_inputs(slice, ctx);
+            let metas: Vec<rcsr::selection::RobustMeta> = rows
+                .iter()
+                .map(|r| rcsr::selection::RobustMeta {
+                    archive_rank: r.archive_rank,
+                    complexity: r.complexity,
+                    usable: r.objective_value.is_finite(),
+                    objective: r.objective_value,
+                })
+                .collect();
+            let picked = rcsr::selection::select_robust(&metas, robust_params, tspec, &ret, &book_rows, &mut |i| {
+                trading_pred(&sorted[rows[i].archive_rank - 1].tree, &v.x, ctx)
+            })
+            .unwrap_or_else(|e| trading_usage(&e));
+            if let Some(c) = picked.chosen {
+                order.retain(|&i| i != c);
+                order.insert(0, c);
+            }
+            selection_rule_fields = picked.fields_json();
+        }
         let reordered: Vec<Row> = order.into_iter().map(|i| rows[i].clone()).collect();
         rows = reordered;
         for (k, r) in rows.iter_mut().enumerate() {
@@ -7004,6 +7134,9 @@ fn main() {
                 test_error: top.test_error,
                 validation_value: top.objective_value,
                 search_fitness: fitness_book.as_ref().map(|_| "long_pnl_regret"),
+                selection: select_rule.name(),
+                selection_rule: selection_rule_fields.clone(),
+                reselected_from: reselected_from.clone(),
                 validation: validation_book,
                 test: book(&prepared.test, split.map(|t| &t.test), split.and_then(|t| t.test_context.as_ref())),
             })
@@ -8110,7 +8243,7 @@ fn main() {
                 outcome.generations,
                 outcome.candidates_evaluated,
                 format!(
-                    "{}{}{}",
+                    "{}{}",
                     if cfg.fit_irls_active() {
                         format!(",\"fit_irls\":{}", jstr(cfg.fit_irls.name()))
                     } else {
@@ -8120,8 +8253,7 @@ fn main() {
                         format!(",\"fixed_position_front_fallback\":{}", outcome.fixed_position_fallback)
                     } else {
                         String::new()
-                    },
-                    format!(",\"cumulative\":{}", cumulative_json)
+                    }
                 ),
                 outcome.converged_early,
                 jstr(outcome.stop_reason),
@@ -8136,7 +8268,6 @@ fn main() {
                     cfg.fit_strategy.name(),
                     cfg.metric == rcsr::metrics::Metric::Squared,
                     timing.total,
-                    cumulative_ledger_wall_s,
                 ),
                 outcome.dispatch.json(),
                 checkpoint_json,
@@ -8378,7 +8509,6 @@ fn main() {
                     cfg.fit_strategy.name(),
                     cfg.metric == rcsr::metrics::Metric::Squared,
                     timing.total,
-                    cumulative_ledger_wall_s,
                 ),
                 outcome.dispatch.json(),
                 outcome.archive.items.len(),
@@ -8788,7 +8918,6 @@ fn run_multi_output(
             &outcome,
             run_start.elapsed().as_secs_f64(),
             search_seconds,
-            None,
             json_out.clone(),
         );
     }
@@ -12650,7 +12779,7 @@ mod tests {
         g.ledger.record_fit(0.5, 0.75, 0.125);
         g.ledger.record_fit_polish_split(0.25);
         g.ledger.record_fit_gate(0.375);
-        let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true, 10.0, None);
+        let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true, 10.0);
         assert!(
             json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"admitted_wide\":0,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"refit_candidates\":0,\"refit_s\":0,\"rescore_s\":0,\"carried_kept\":0,\"seconds\":0.25,\"kernel_lm_s\":0.5,\"kernel_polish_s\":0.25,\"polish\":\"f32\",\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"gate_s\":0.375,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096,\"fit_rows\":0,\"score_rows\":0,\"fit_twin_bytes\":0,\"subsample_hash\":null"),
             "{}",
@@ -12682,7 +12811,7 @@ mod tests {
         l.record_interval(Stage::Fit, 1, 3.0, 5.0);
         let mut g = search::GpuRunStats::default();
         g.ledger = l;
-        let json = gpu_json(&Some(g), 0.1, 0.2, "gpu", true, 10.0, None);
+        let json = gpu_json(&Some(g), 0.1, 0.2, "gpu", true, 10.0);
         for key in [
             "\"ledger\":",
             "\"stages\":",
@@ -12762,27 +12891,12 @@ mod tests {
             "exact",
             true,
             38_114.998,
-            None,
         );
         assert!(!json.contains("3085.48"), "{}", json);
         assert!(json.contains("\"quality_per_gpu_hour\":4.8442"), "{}", json);
         // Batches per evaluator second, under its true name.
         assert!(json.contains("\"batches_per_s\":8.302"), "{}", json);
         assert!(!json.contains("\"generations_per_s\""), "{}", json);
-    }
-
-    /// #923: `quality_per_gpu_hour_run` divides by the wall of every chunk when
-    /// it is known, and by this process's ledger wall otherwise.
-    #[test]
-    fn quality_run_ratio_uses_cumulative_hours_when_known() {
-        let mut ledger = rcsr::gpu_stats::RunLedger::new();
-        ledger.set_wall(10.0);
-        let process = quality_run_ratio(&ledger, 0.1, 0.2, None);
-        let chunked = quality_run_ratio(&ledger, 0.1, 0.2, Some(40.0));
-        assert!((process.denominator * 3600.0 - 10.0).abs() < 1e-9, "{:?}", process);
-        assert!((chunked.denominator * 3600.0 - 40.0).abs() < 1e-9, "{:?}", chunked);
-        assert!(chunked.denominator >= 2.5 * process.denominator);
-        assert!((process.value / chunked.value - 4.0).abs() < 1e-9);
     }
 
     /// #256: the run-level device fractions, from the 10 h run's own numbers:
@@ -12798,7 +12912,7 @@ mod tests {
         let mut g = search::GpuRunStats::default();
         g.accounting.wall_s = 7.468;
         g.ledger = l;
-        let json = gpu_json(&Some(g), 0.1, 0.2, "gpu", true, 38_114.998, None);
+        let json = gpu_json(&Some(g), 0.1, 0.2, "gpu", true, 38_114.998);
         let key = "\"device_fraction_of_run\":{\"value\":";
         let at = json.find(key).expect("device_fraction_of_run") + key.len();
         let value: f64 = json[at..]

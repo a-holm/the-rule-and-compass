@@ -385,8 +385,6 @@ pub struct Options {
     /// Candidate evaluations and wall seconds of the symbolic-regression run.
     pub sr_evals: Option<u64>,
     pub sr_wall_seconds: Option<f64>,
-    /// Where `sr_wall_seconds` came from (#923): `cumulative` or `process`; none when set by `--sr-wall`.
-    pub sr_wall_basis: Option<&'static str>,
     /// A single search run scored on every fold (#492); see [`SrRun`].
     pub sr_run: Option<SrRun>,
     pub spec: Option<TargetSpec>,
@@ -416,7 +414,6 @@ impl Default for Options {
             sr_score_col: None,
             sr_evals: None,
             sr_wall_seconds: None,
-            sr_wall_basis: None,
             sr_run: None,
             spec: None,
             gbm_trees: DEFAULT_GBM_TREES,
@@ -1101,7 +1098,6 @@ pub struct Report {
     pub sr_run_hashed: Option<String>,
     pub sr_evals: Option<u64>,
     pub sr_wall_seconds: Option<f64>,
-    pub sr_wall_basis: Option<&'static str>,
     pub gbm_trees: usize,
     pub notes: Vec<String>,
     /// #284: run-scoped phase ledger (`io`, `pnl`, `host_other`); empty until a run fills it.
@@ -1916,7 +1912,6 @@ fn finish_report(
         sr_run_hashed: opts.sr_run.as_ref().map(|s| s.json_with(false)),
         sr_evals: opts.sr_evals,
         sr_wall_seconds: opts.sr_wall_seconds,
-        sr_wall_basis: opts.sr_wall_basis,
         gbm_trees: opts.gbm_trees,
         notes: std::mem::take(notes),
         ledger: RunLedger::new(),
@@ -2052,7 +2047,7 @@ impl Report {
         format!(
             "{{\"schema\":{},\"folds\":{},\"periods\":{},\"rows_scored\":{},\"periods_per_year\":{},\"block_len\":{},\
 \"min_group_step_seconds\":{},\"cost_bps\":{},\"cost\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
-\"sr_candidate_evaluations\":{},\"sr_wall_seconds\":{},\"sr_wall_basis\":{},\"gbm_beats_sr\":{}}},\"multiple_testing\":{{\"draws\":{},\"seed\":{},\
+\"sr_candidate_evaluations\":{},\"sr_wall_seconds\":{},\"gbm_beats_sr\":{}}},\"multiple_testing\":{{\"draws\":{},\"seed\":{},\
 \"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"sr_run\":{},\"rungs\":[{}]{}}}",
             jstr(SCHEMA),
             jarr_str(&self.folds),
@@ -2069,7 +2064,6 @@ impl Report {
             self.gbm_trees,
             self.sr_evals.map_or("null".to_string(), |v| v.to_string()),
             jopt(self.sr_wall_seconds),
-            self.sr_wall_basis.map_or("null".to_string(), jstr),
             self.gbm_beats_sr.map_or("null".to_string(), |b| b.to_string()),
             self.draws,
             self.seed,
@@ -2336,7 +2330,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --allow-in-sample         with --sr-run: drop in-sample folds from every rung and label them oof:false\n\
   --sr-score <col>          out-of-fold symbolic-regression score column from the caller (labelled oof=caller)\n\
   --sr-evals <n>            candidate evaluations of the symbolic-regression run\n\
-  --sr-wall <s>             wall seconds of the symbolic-regression run; default search.cumulative.elapsed_seconds of the run, else elapsed_seconds (equal_cost.sr_wall_basis)\n\
+  --sr-wall <s>             wall seconds of the symbolic-regression run\n\
   --gbm-trees <n>           GBM tuning budget in trees per fold (default 240)\n\
   --max-fit-rows <n>        cap on fit rows for ridge, GBM and bins (default 200000)\n\
   --draws <n>               bootstrap and SPA draws (default 2000)\n\
@@ -2381,16 +2375,6 @@ pub fn run(args: &[String]) -> ! {
             eprintln!("error: {}", msg);
             std::process::exit(code)
         }
-    }
-}
-
-/// The SR rung wall of a run.json (#923): the wall of every chunk when the file
-/// carries a complete `search.cumulative`, else the last process alone.
-fn sr_wall_of(run: &crate::run_json::RunFile) -> (Option<f64>, Option<&'static str>) {
-    match (run.cumulative_elapsed_seconds, run.elapsed_seconds) {
-        (Some(w), _) => (Some(w), Some("cumulative")),
-        (None, Some(w)) => (Some(w), Some("process")),
-        (None, None) => (None, None),
     }
 }
 
@@ -2522,7 +2506,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             opts.sr_evals = sr.run.candidates_evaluated;
         }
         if opts.sr_wall_seconds.is_none() {
-            (opts.sr_wall_seconds, opts.sr_wall_basis) = sr_wall_of(&sr.run);
+            opts.sr_wall_seconds = sr.run.elapsed_seconds;
         }
         if locked_test && sr.expression_source == crate::run_json::ExpressionSource::Rounded {
             return Err(input_err(crate::run_json::rounded_refusal(path)));
@@ -2768,27 +2752,5 @@ pub fn return_space_mse_rows(p: &Panel, rows: &[usize], score: &[f64], opts: &Op
         s / c
     } else {
         f64::NAN
-    }
-}
-
-#[cfg(test)]
-mod resume_cost_tests {
-    use super::*;
-
-    fn run(search: &str) -> crate::run_json::RunFile {
-        let text = format!(
-            "{{\"variables\":[\"x\"],\"pareto\":[],\"elapsed_seconds\":10,\"search\":{{\"candidates_evaluated\":5{}}}}}",
-            search
-        );
-        crate::run_json::RunFile::parse(&text).unwrap()
-    }
-
-    #[test]
-    fn sr_run_wall_prefers_cumulative_block() {
-        let cumulative = run(",\"cumulative\":{\"complete\":true,\"chunks\":3,\"elapsed_seconds\":40}");
-        assert_eq!(sr_wall_of(&cumulative), (Some(40.0), Some("cumulative")));
-        assert_eq!(sr_wall_of(&run("")), (Some(10.0), Some("process")));
-        let incomplete = run(",\"cumulative\":{\"complete\":false}");
-        assert_eq!(sr_wall_of(&incomplete), (Some(10.0), Some("process")));
     }
 }
