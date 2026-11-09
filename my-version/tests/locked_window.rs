@@ -82,14 +82,14 @@ fn the_search_refuses_the_declared_locked_test_unless_the_rows_are_excluded() {
     assert_eq!(code, 3, "{}", err);
     assert!(err.contains("split has"), "{}", err);
     assert!(err.contains("declared locked test 2024-01-13..2024-01-17 (store manifest"), "{}", err);
-    assert!(err.contains(&format!("--exclude 'ts >= {} and ts < {}'", locked().start - DEFAULT_PURGE, locked().end + EXISTING_EMBARGO)), "{}", err);
+    assert!(err.contains(&format!("--exclude 'ts >= {} and ts < {}'", locked().start - DEFAULT_PURGE + 1, locked().end + EXISTING_EMBARGO)), "{}", err);
 
     let at_start = format!("ts >= {}", locked().start);
     let (code, _, err) = search(&d, &run, &["--exclude", &at_start]);
     assert_eq!(code, 3, "{}", err);
     assert!(err.contains("whose label window reaches the declared locked test"), "{}", err);
 
-    let exclude = format!("ts >= {}", locked().start - DEFAULT_PURGE);
+    let exclude = format!("ts >= {}", locked().start - DEFAULT_PURGE + 1);
     assert!(err.contains(&format!("--exclude '{} and ts < {}'", exclude, locked().end + EXISTING_EMBARGO)), "{}", err);
     let (code, _, err) = search(&d, &run, &["--exclude", &exclude]);
     assert_eq!(code, 0, "{}", err);
@@ -410,7 +410,7 @@ fn development_outputs_ignore_locked_prices() {
     for d in [&a, &b] {
         let (code, err) = dev_search(d, &s(&dir.join("x.json")), &at_start);
         assert_eq!(code, 3, "{}", err);
-        assert!(err.contains(&format!("--exclude 'ts >= {} and ts < {}'", s_start - DEFAULT_PURGE, s_start + 100 * H + EXISTING_EMBARGO)), "{}", err);
+        assert!(err.contains(&format!("--exclude 'ts >= {} and ts < {}'", s_start - DEFAULT_PURGE + 1, s_start + 100 * H + EXISTING_EMBARGO)), "{}", err);
     }
     let at_purge = format!("ts >= {}", s_start - DEFAULT_PURGE);
     let (run_a, run_b) = (s(&dir.join("ra.json")), s(&dir.join("rb.json")));
@@ -765,7 +765,7 @@ fn cv_folds_honour_exclude() {
         assert_eq!(code, 3, "{}", err);
         assert!(err.contains("cross-validation rows has"), "{}", err);
         assert!(err.contains("whose label window reaches the declared locked test"), "{}", err);
-        assert!(err.contains(&format!("--exclude '{} and ts < {}'", exclude, locked().end + EXISTING_EMBARGO)), "{}", err);
+        assert!(err.contains(&format!("--exclude 'ts >= {} and ts < {}'", locked().start - DEFAULT_PURGE + 1, locked().end + EXISTING_EMBARGO)), "{}", err);
         let run = s(&dir.join(format!("{}.json", p.file_stem().unwrap().to_str().unwrap())));
         let train = format!("ts < {}", T0 + 100 * H);
         let test = format!("(ts >= {}) * (ts < {})", T0 + 100 * H, T0 + 150 * H);
