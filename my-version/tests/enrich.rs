@@ -5159,7 +5159,7 @@ fn label_purge_floors_the_embargo() {
     let embargo = rcsr::manifest::object(&json, "lockbox_embargo").unwrap();
     assert!(embargo.contains("\"seconds\":1213200") && embargo.contains("\"column\":\"lbl_h336_"), "{embargo}");
     let lr = &r.long_labels[0].report;
-    assert!(lr.json().contains("\"purge_rows_per_symbol\":337"), "{}", lr.json());
+    assert!(lr.json().contains("\"purge_rows_per_symbol\":336"), "{}", lr.json());
 
     // A store whose features look back further keeps its own embargo.
     let out = dir.join("default.rcsb").to_string_lossy().into_owned();

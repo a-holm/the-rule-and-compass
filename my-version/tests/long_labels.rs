@@ -783,7 +783,7 @@ fn lock_boundary_rows_per_horizon() {
         assert_eq!(r.locked_test.unwrap().rows_left_out, 1000, "h{h}");
         assert_eq!(r.weight_norm_rows, norm, "h{h}");
         let json = r.json();
-        assert!(json.contains(&format!("\"purge_rows_per_symbol\":{}", h + 1)), "h{h}: {json}");
+        assert!(json.contains(&format!("\"purge_rows_per_symbol\":{}", h)), "h{h}: {json}");
         assert!(json.contains(&format!("\"tail_rows_without_label\":{h}")), "h{h}: {json}");
     }
 }
@@ -830,7 +830,7 @@ fn weights_ignore_locked_rows() {
         let mut compared = 0;
         for t in 0..n {
             let time = T0 + t as i64 * HOUR;
-            if (time + purge <= range.start || time >= range.end + embargo) && x.weight[t].is_finite() {
+            if !range.reaches(time, purge, embargo) && x.weight[t].is_finite() {
                 assert_eq!(x.weight[t].to_bits(), y.weight[t].to_bits(), "h{h} row {t}");
                 compared += 1;
             }
@@ -890,7 +890,7 @@ fn lockbox_counts_purge_rows_per_horizon() {
         let target = format!("lbl_h{h}_y");
         let (code, _, err) = run_rcsr(&search_args(&data, &target, "ret1", &["--exclude", &exclude, "--test-frac", "0.5"]));
         assert_eq!(code, 3, "h{h}: {err}");
-        assert!(err.contains(&format!("{} row(s) whose label window reaches the declared locked test", h + 1)), "h{h}: {err}");
+        assert!(err.contains(&format!("{} row(s) whose label window reaches the declared locked test", h)), "h{h}: {err}");
     }
 }
 
@@ -1067,4 +1067,39 @@ fn overlapping_fit_label_without_weight_prints_one_note() {
     let (code, _, err) = run_rcsr(&search_args(&data, "lbl_h168_y", "ret1", &[fill[0], fill[1], fill[2], fill[3], "--weight", "lbl_h168_weight"]));
     assert_eq!(code, 0, "{err}");
     assert!(!err.contains(note), "{err}");
+}
+
+/// The label window `[t, t + purge)` is half-open: the row at `START - purge`
+/// ends exactly at `START`, so the label report and the lockbox check both keep
+/// it, and both drop the same rows between it and `START`.
+#[test]
+fn label_report_and_lockbox_check_drop_the_same_rows() {
+    use rcsr::lockbox::{Declared, Embargo};
+    let n = 3000usize;
+    let bars = lh::bars(T0, n, 0.0);
+    let start = T0 + 2000 * HOUR;
+    let end = T0 + 2500 * HOUR;
+    let range = Lockbox { start, end };
+    let lockbox = Declared { lockbox: range, source: "flag", also: None, embargo: Embargo::none() };
+    for h in [1usize, 4, 24, 72, 168, 336] {
+        let s = lh::spec(&lh::src(h, ""));
+        let purge = s.purge_seconds();
+        let mut acc = labels::LabelAccumulator::with_range(&s, Some(range));
+        let l = acc.build(&bars, None).unwrap();
+        acc.add("AAA", &l);
+        let r = acc.finish();
+        let dropped_before = r.locked_test.unwrap().rows_left_out - 500;
+        assert_eq!(dropped_before as i64, r.purge_rows_per_symbol, "h{h}");
+        assert_eq!(r.purge_rows_per_symbol, s.purge_rows(), "h{h}");
+        assert_eq!(r.purge_rows_per_symbol, h as i64, "h{h}");
+
+        let times: Vec<i64> = bars.iter().map(|b| b.time).filter(|&t| t < start).collect();
+        let err = lockbox.check_times("training split", "ts", &times, purge).unwrap_err();
+        let refused: usize = err.split(" row(s)").next().unwrap().rsplit(' ').next().unwrap().parse().unwrap();
+        assert_eq!(refused, dropped_before, "h{h}: {err}");
+
+        let boundary = start - purge;
+        assert!(lockbox.check_times("training split", "ts", &[boundary], purge).is_ok(), "h{h}");
+        assert!(lockbox.check_times("training split", "ts", &[boundary + HOUR], purge).is_err(), "h{h}");
+    }
 }

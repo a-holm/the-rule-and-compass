@@ -95,8 +95,29 @@ impl Lockbox {
         self.start <= ts && ts < self.end
     }
 
+    /// The label window `[t, t + purge)` of a row stamped `t` reaches the range
+    /// `[start, end)`, or the `embargo` seconds after its end. A window that ends
+    /// exactly at `start` does not reach it. A row has at least its own second,
+    /// so `purge == 0` tests the stamp itself.
+    pub fn reaches(&self, t: i64, purge: i64, embargo: i64) -> bool {
+        t + purge.max(1) > self.start && t < self.end + embargo.max(0)
+    }
+
+    /// First stamp whose label window reaches the range.
+    pub fn first_reaching(&self, purge: i64) -> i64 {
+        self.start - purge.max(1) + 1
+    }
+
     /// Count the timestamps inside the lockbox and group them by UTC month.
     pub fn overlap<I>(&self, times: I) -> Overlap
+    where
+        I: IntoIterator<Item = i64>,
+    {
+        self.overlap_reaching(times, 0, 0)
+    }
+
+    /// Like `overlap`, for the rows whose label window reaches the range.
+    pub fn overlap_reaching<I>(&self, times: I, purge: i64, embargo: i64) -> Overlap
     where
         I: IntoIterator<Item = i64>,
     {
@@ -104,7 +125,7 @@ impl Lockbox {
         let mut months: std::collections::BTreeMap<(i32, u32), OverlapWindow> =
             std::collections::BTreeMap::new();
         for ts in times {
-            if !self.contains(ts) {
+            if !self.reaches(ts, purge, embargo) {
                 continue;
             }
             if out.rows == 0 || ts < out.first_ts {
@@ -306,14 +327,9 @@ impl Declared {
         }
     }
 
-    /// `[start - purge, end + embargo)` of one range.
-    pub fn reach(&self, l: &Lockbox, purge: i64) -> Lockbox {
-        Lockbox { start: l.start - purge.max(0), end: l.end + self.embargo.seconds.max(0) }
-    }
-
     /// Refuse a row set with a timestamp whose label window reaches the
-    /// declared range or whose features read it: any stamp in
-    /// `[start - purge, end + embargo)`. The error names the first offending
+    /// declared range or whose features read it: any stamp for which
+    /// `Lockbox::reaches` holds. The error names the first offending
     /// row, the split side and the fix.
     pub fn check_times(&self, side: &str, time_name: &str, times: &[i64], purge: i64) -> Result<Overlap, String> {
         let overlap = self.check_range(&self.lockbox, self.origin(), side, time_name, times, purge)?;
@@ -333,8 +349,8 @@ impl Declared {
         purge: i64,
     ) -> Result<Overlap, String> {
         let purge = purge.max(0);
-        let reach = self.reach(lockbox, purge);
-        let overlap = reach.overlap(times.iter().copied());
+        let embargo = self.embargo.seconds.max(0);
+        let overlap = lockbox.overlap_reaching(times.iter().copied(), purge, embargo);
         if overlap.overlaps() {
             let after = overlap.first_ts >= lockbox.end;
             let subject = if after {
@@ -375,9 +391,9 @@ impl Declared {
                 notes,
                 crate::protocol::iso(overlap.first_ts as f64),
                 time_name,
-                reach.start,
+                lockbox.first_reaching(purge),
                 time_name,
-                reach.end
+                lockbox.end + embargo
             ));
         }
         Ok(overlap)
@@ -1154,6 +1170,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reaches_is_half_open_at_both_edges() {
+        let l = Lockbox { start: 1_000, end: 2_000 };
+        let (p, e) = (100, 50);
+        let table = [
+            (1_000 - p - 1, false),
+            (1_000 - p, false),
+            (1_000 - p + 1, true),
+            (1_999, true),
+            (2_000 + e - 1, true),
+            (2_000 + e, false),
+        ];
+        for (t, want) in table {
+            assert_eq!(l.reaches(t, p, e), want, "t {t}");
+        }
+        assert_eq!(l.first_reaching(p), 1_000 - p + 1);
+        assert!(!l.reaches(999, 0, 0) && l.reaches(1_000, 0, 0));
+        assert!(l.reaches(1_999, 0, 0) && !l.reaches(2_000, 0, 0));
+        assert!(l.reaches(2_000, 0, 1) && !l.reaches(2_000, 0, 0));
+        assert_eq!(l.first_reaching(0), 1_000);
+    }
+
+    #[test]
     fn a_window_abutting_the_lockbox_is_allowed_but_crossing_it_is_not() {
         let l = Lockbox::crypto_2026h2();
         assert!(l.check(1_700_000_000, l.start).is_ok());
@@ -1195,11 +1233,13 @@ mod tests {
             embargo: Embargo::none(),
         };
         let purge = 7_200;
-        let e = d.check_times("test split", "ts", &[1_000_000 - purge], purge).unwrap_err();
+        let e = d.check_times("test split", "ts", &[1_000_000 - purge + 1], purge).unwrap_err();
         assert!(e.contains("1 row(s) whose label window reaches the declared locked test"), "{}", e);
         assert!(e.contains("label end = stamp + 7200 s"), "{}", e);
-        assert!(e.contains("--exclude 'ts >= 992800 and ts < 2000000'"), "{}", e);
+        assert!(e.contains("--exclude 'ts >= 992801 and ts < 2000000'"), "{}", e);
         assert!(d.check_times("test split", "ts", &[1_000_000 - purge - 1], purge).is_ok());
+        assert!(d.check_times("test split", "ts", &[1_000_000 - purge], purge).is_ok());
+        assert!(d.check_times("test split", "ts", &[1_000_000 - purge + 1], purge).is_err());
         assert!(d.check_times("test split", "ts", &[2_000_000], purge).is_ok());
         assert!(d.check_times("test split", "ts", &[1_000_000 - 1], 0).is_ok());
     }
@@ -1216,10 +1256,9 @@ mod tests {
             let e = d.check_times("training split", "ts", &[t], 7_200).unwrap_err();
             assert!(e.contains("1 row(s) whose features read the declared locked test"), "{}", e);
             assert!(e.contains("lookback embargo 86400 s after the end (declared with the data)"), "{}", e);
-            assert!(e.contains("--exclude 'ts >= 992800 and ts < 2086400'"), "{}", e);
+            assert!(e.contains("--exclude 'ts >= 992801 and ts < 2086400'"), "{}", e);
         }
         assert!(d.check_times("training split", "ts", &[2_000_000 + 86_400], 7_200).is_ok());
-        assert_eq!(d.reach(&d.lockbox, 7_200), Lockbox { start: 992_800, end: 2_086_400 });
     }
 
     #[test]
