@@ -6491,7 +6491,7 @@ fn main() {
         });
         let now = rcsr::provenance::BuildIdentity::current(effective_backend == Backend::Gpu);
         reselected_from = Some(rcsr::reselect::from_checkpoint_json(path, &sha, cp.identity.as_ref(), &now));
-        let front = cp.final_archive.expect("checked when the checkpoint was loaded");
+        let front = cp.archive;
         reselect_outcome = Some(rcsr::reselect::outcome(front, &prepared.test, cfg.metric, cp.generations, cp.candidates_evaluated));
     } else if let Some(path) = &reselect_run_path {
         let usage = |e: String| -> ! {
