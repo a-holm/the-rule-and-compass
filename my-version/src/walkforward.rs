@@ -101,6 +101,10 @@ pub struct ProtocolOptions {
     pub locked_ranges: Vec<(i64, i64)>,
     /// Seconds after the end of every locked range whose rows read it.
     pub locked_embargo: i64,
+    /// #925: how `--band` is read under `--policy band`. With
+    /// [`crate::trading::BandUnits::Sd`] each window resolves the half-width of
+    /// every candidate from its finite training scores only.
+    pub band_units: crate::trading::BandUnits,
 }
 
 /// #482: where a candidate list came from: a run's Pareto front.
@@ -133,6 +137,7 @@ impl Default for ProtocolOptions {
             final_read: false,
             locked_ranges: Vec::new(),
             locked_embargo: 0,
+            band_units: crate::trading::BandUnits::Score,
         }
     }
 }
@@ -432,6 +437,9 @@ pub struct BandCheck {
     pub backend: String,
     /// Why `--gpu` fell back to the CPU scan; `None` without a fallback.
     pub fallback_reason: Option<String>,
+    /// #925: the band of this window's candidate; `band_width` is its
+    /// resolved half-width.
+    pub spec: Option<crate::trading::BandSpec>,
 }
 
 /// #306: the exact hindsight DP, labelled as a bound and not a strategy.
@@ -536,6 +544,8 @@ pub struct Report {
     /// #306: position policy and its band parameters.
     pub policy: Policy,
     pub band_width: f64,
+    /// #925: how `band_width` is read.
+    pub band_units: crate::trading::BandUnits,
     pub min_hold: usize,
     /// #306: `--gpu` was set for the band/DP scans.
     pub gpu: bool,
@@ -1121,6 +1131,8 @@ struct WindowData {
     validation_start: Option<f64>,
     /// One score vector per candidate, aligned with the validation/test rows.
     train_scores: Vec<Vec<f64>>,
+    /// #925: latest time of a row in `train_scores`, per candidate.
+    train_score_max_time: Vec<f64>,
     validation_rows: Vec<RowBase>,
     validation_scores: Vec<Vec<f64>>,
     test_rows: Vec<RowBase>,
@@ -1197,6 +1209,7 @@ impl Accum {
                 window: w.clone(),
                 validation_start,
                 train_scores: vec![Vec::new(); candidates],
+                train_score_max_time: vec![f64::NEG_INFINITY; candidates],
                 validation_rows: Vec::new(),
                 validation_scores: vec![Vec::new(); candidates],
                 test_rows: Vec::new(),
@@ -1349,6 +1362,11 @@ impl Accum {
             }
             let Selected { candidate, validation_error, threshold, band_selection, thresholds } =
                 select_candidate(&d, spec, trees, has_validation)?;
+            // #925: each candidate's band, resolved on its own training scores.
+            let bands: Vec<crate::trading::BandSpec> = (0..d.train_scores.len())
+                .map(|c| window_band(&d, c, spec.band_width, opts.band_units))
+                .collect();
+            let band_width = bands[candidate].resolved;
             if let Some(fixed) = forced {
                 if fixed[window_index] != candidate {
                     return Err(format!(
@@ -1379,7 +1397,7 @@ impl Accum {
                 ppy,
                 &mut fresh_previous,
                 spec.policy,
-                spec.band_width,
+                band_width,
                 spec.min_hold,
                 spec.gpu,
                 spec.device_pnl,
@@ -1405,7 +1423,7 @@ impl Accum {
                     ppy,
                     &mut HashMap::new(),
                     spec.policy,
-                    spec.band_width,
+                    band_width,
                     spec.min_hold,
                     spec.gpu,
                     false,
@@ -1421,7 +1439,7 @@ impl Accum {
                     ppy,
                     &mut pooled_previous,
                     spec.policy,
-                    spec.band_width,
+                    band_width,
                     spec.min_hold,
                     spec.gpu,
                     false,
@@ -1476,7 +1494,7 @@ impl Accum {
                         ppy,
                         &mut HashMap::new(),
                         spec.policy,
-                        spec.band_width,
+                        bands[c].resolved,
                         spec.min_hold,
                         false,
                         false,
@@ -1533,7 +1551,7 @@ impl Accum {
                 metrics: ev.metrics,
                 device_pnl: ev.device,
                 controls: ev.controls,
-                band: ev.band,
+                band: ev.band.map(|b| BandCheck { spec: Some(bands[candidate].clone()), ..b }),
                 hindsight_bound: ev.hindsight_bound,
                 band_selection,
             });
@@ -1721,6 +1739,7 @@ impl Accum {
             threshold_fixed: spec.threshold_fixed,
             policy: spec.policy,
             band_width: spec.band_width,
+            band_units: opts.band_units,
             min_hold: spec.min_hold,
             gpu: spec.gpu,
             validation_frac: spec.validation_frac,
@@ -1754,6 +1773,17 @@ impl Accum {
     }
 }
 
+/// #925: the band of candidate `c` in window `d`: `multiple` in score units, or
+/// `multiple` times the sd of the candidate's finite training scores (rows
+/// before the validation start, never validation or test rows).
+fn window_band(d: &WindowData, c: usize, multiple: f64, units: crate::trading::BandUnits) -> crate::trading::BandSpec {
+    if units == crate::trading::BandUnits::Score {
+        return crate::trading::BandSpec::score(multiple);
+    }
+    let t = d.train_score_max_time[c];
+    crate::trading::BandSpec::from_sd(units, multiple, crate::trading::score_sd(&d.train_scores[c]), t.is_finite().then_some(t))
+}
+
 fn push_scores(
     windows: &mut [WindowData],
     t: f64,
@@ -1783,9 +1813,12 @@ fn push_scores(
                     dst.push(if score.is_finite() { score } else { f64::NAN });
                 }
             } else {
-                for (dst, &score) in d.train_scores.iter_mut().zip(scores) {
+                for (c, (dst, &score)) in d.train_scores.iter_mut().zip(scores).enumerate() {
                     if score.is_finite() {
                         dst.push(score);
+                        if t > d.train_score_max_time[c] {
+                            d.train_score_max_time[c] = t;
+                        }
                     } else {
                         d.dropped += 1;
                     }
@@ -2502,6 +2535,7 @@ fn evaluate_window(
     let scalar_net = net.iter().sum::<f64>();
     let band = band_scan.map(
         |(_, band_net, groups, carry, backend, fallback_reason)| BandCheck {
+            spec: None,
             band_width,
             min_hold,
             carry,
@@ -2929,7 +2963,7 @@ fn band_check_json(b: &BandCheck) -> String {
     format!(
         "{{\"band_width\":{},\"min_hold\":{},\"carry\":{},\"groups\":{},\
          \"net\":{},\"scalar_net\":{},\"net_delta\":{},\"backend\":{},\
-         \"fallback_reason\":{}}}",
+         \"fallback_reason\":{}{}}}",
         jnum(b.band_width),
         b.min_hold,
         jstr(&b.carry),
@@ -2938,7 +2972,8 @@ fn band_check_json(b: &BandCheck) -> String {
         jnum(b.scalar_net),
         jnum(b.net - b.scalar_net),
         jstr(&b.backend),
-        b.fallback_reason.as_deref().map_or("null".to_string(), jstr)
+        b.fallback_reason.as_deref().map_or("null".to_string(), jstr),
+        b.spec.as_ref().map_or_else(String::new, |s| s.json_fields())
     )
 }
 
@@ -3191,7 +3226,7 @@ impl Report {
              \"cost\":{},\
              \"position_rule\":{},\
              \"policy\":{{\"name\":{},\"hindsight_bound\":{},\"band_width\":{},\
-             \"min_hold\":{},\"short\":false,\"gpu\":{}}},\
+             \"band_units\":{},\"min_hold\":{},\"short\":false,\"gpu\":{}}},\
              \"threshold\":{{\"quantile\":{},\"fixed\":{},\
              \"method\":\"exact order-preserving radix select + linear interpolation (numpy type 7) in f64\",\
              \"sources\":[\"train_type7\",\"validation_type7\",\"fixed\"],\
@@ -3238,6 +3273,7 @@ impl Report {
             jstr(self.policy.as_str()),
             self.policy == Policy::Dp,
             jnum(self.band_width),
+            jstr(self.band_units.name()),
             self.min_hold,
             self.gpu,
             jnum(self.threshold_quantile),
