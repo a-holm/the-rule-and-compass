@@ -10907,7 +10907,14 @@ OPTIONS:
                              matching --target; a flag that disagrees is refused
   --from-run <run.json>      the book a search with --objective selected: expression,
                              variables, fixed threshold, per-side cost and target spec
-                             of the run. Refuses --expr, --threshold-quantile,
+                             of the run. A run that priced a band or a minimum hold
+                             (--band, --min-holding) is priced with --policy band, the
+                             run's objective.spec.band_resolved as the half-width (never
+                             resolved again from window rows) and its minimum hold;
+                             policy.band_source is run. --front takes each candidate's
+                             validation_book.band_resolved (sd units). A --policy, --band,
+                             --band-units or --min-hold that differs from the run exits 2.
+                             Refuses --expr, --threshold-quantile,
                              --threshold-fixed and --target-spec, and a run without an
                              objective block
                              The expression is objective.finalist.expression_exact,
@@ -11061,6 +11068,65 @@ OPTIONS:
         DEFAULT_COST_BPS = walkforward::DEFAULT_COST_BPS,
         DEFAULT_QUANTILE = walkforward::DEFAULT_QUANTILE
     )
+}
+
+/// #946: which of the book flags the command line carried.
+struct BandFlags {
+    policy: bool,
+    band: bool,
+    units: Option<String>,
+    min_hold: bool,
+}
+
+/// #946: `--from-run` and `--front` price the book the search selected. When
+/// the run priced a band or a minimum hold, the policy, multiple and hold come
+/// from the run; flags that disagree are refused. Returns `true` when the run's
+/// band book was applied.
+fn apply_run_band(
+    has_band: bool,
+    band: &rcsr::trading::BandSpec,
+    min_holding: usize,
+    flags: &BandFlags,
+    policy: &mut walkforward::Policy,
+    band_width: &mut f64,
+    min_hold: &mut usize,
+) -> Result<bool, String> {
+    let units = match &flags.units {
+        Some(u) => Some(rcsr::trading::BandUnits::parse(u)?),
+        None => None,
+    };
+    let book = format!("band {} {}, min hold {}", band.multiple, band.units.name(), min_holding);
+    if !has_band {
+        if flags.policy && *policy == walkforward::Policy::Band {
+            return Err("--policy band conflicts with the run: it priced the threshold book".to_string());
+        }
+        if flags.band && *band_width != 0.0 {
+            return Err(format!("--band {} conflicts with the run: it priced no band", band_width));
+        }
+        if flags.min_hold && *min_hold != 1 {
+            return Err(format!("--min-hold {} conflicts with the run: it priced a minimum hold of 1", min_hold));
+        }
+        if units.is_some_and(|u| u != rcsr::trading::BandUnits::Score) {
+            return Err("--band-units conflicts with the run: it priced no band".to_string());
+        }
+        return Ok(false);
+    }
+    if flags.policy && *policy != walkforward::Policy::Band {
+        return Err(format!("--policy {} conflicts with the run: it priced the band book ({})", policy.as_str(), book));
+    }
+    if flags.band && (*band_width - band.multiple).abs() > 1e-12 {
+        return Err(format!("--band {} conflicts with the run: it priced {}", band_width, book));
+    }
+    if units.is_some_and(|u| u != band.units) {
+        return Err(format!("--band-units conflicts with the run: it priced {}", book));
+    }
+    if flags.min_hold && *min_hold != min_holding {
+        return Err(format!("--min-hold {} conflicts with the run: it priced a minimum hold of {}", min_hold, min_holding));
+    }
+    *policy = walkforward::Policy::Band;
+    *band_width = band.multiple;
+    *min_hold = min_holding;
+    Ok(true)
 }
 
 fn run_walkforward(args: &[String]) -> ! {
@@ -11424,6 +11490,13 @@ fn run_walkforward(args: &[String]) -> ! {
     };
     // #487: one declaration of the label window, the return units and the
     // cost, read from a target spec or from the run that selected the book.
+    let given = |names: &[&str]| args.iter().any(|a| names.iter().any(|n| a == n || a.starts_with(&format!("{}=", n))));
+    let band_flags = BandFlags {
+        policy: given(&["--policy"]),
+        band: given(&["--band", "--band-width"]),
+        units: band_units_arg.clone(),
+        min_hold: given(&["--min-hold"]),
+    };
     if from_run_path.is_some() && (target_spec_path.is_some() || front_path.is_some()) {
         usage_fail("--from-run, --front and --target-spec are alternatives: a run carries its own target spec");
     }
@@ -11455,7 +11528,7 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             input_fail(&e)
         });
-        let book = run.book().unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
+        let book = run.band_book().unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
         expressions.push(book.expression.clone());
         popts.expression_source = Some(book.expression_source);
         if locked_test && book.expression_source == rcsr::run_json::ExpressionSource::Rounded {
@@ -11472,6 +11545,16 @@ fn run_walkforward(args: &[String]) -> ! {
                 usage_fail("--policy top-tercile conflicts with the run: it priced the threshold book");
             }
             threshold_fixed = Some(book.threshold);
+            let applied = apply_run_band(book.has_band(), &book.band, book.min_holding, &band_flags, &mut policy, &mut band_width, &mut min_hold)
+                .unwrap_or_else(|e| usage_fail(&e));
+            if applied {
+                if device_pnl {
+                    usage_fail("--device-pnl is not supported with the run's band book: the device arm prices the threshold book");
+                }
+                popts.band_units = book.band.units;
+                popts.run_bands = Some(vec![book.band.clone()]);
+            }
+            band_units_arg = None;
         }
         run_cost = Some((book.per_side_bps, book.source));
         cost_spec = Some(book.spec);
@@ -11542,6 +11625,30 @@ fn run_walkforward(args: &[String]) -> ! {
             if threshold_fixed.is_none() && !quantile_set {
                 threshold_fixed = Some(theta);
             }
+            let bands: Vec<rcsr::trading::BandSpec> = run
+                .front
+                .iter()
+                .map(|m| match (run.band.units, m.band_resolved) {
+                    (rcsr::trading::BandUnits::Sd, Some(resolved)) => rcsr::trading::BandSpec {
+                        sd: m.band_sd,
+                        sd_rows: None,
+                        resolved,
+                        ..run.band.clone()
+                    },
+                    _ => run.band.clone(),
+                })
+                .collect();
+            let has_band = run.min_holding > 1 || bands.iter().any(|b| b.resolved > 0.0);
+            let applied = apply_run_band(has_band, &run.band, run.min_holding, &band_flags, &mut policy, &mut band_width, &mut min_hold)
+                .unwrap_or_else(|e| usage_fail(&e));
+            if applied {
+                if device_pnl {
+                    usage_fail("--device-pnl is not supported with the run's band book: the device arm prices the threshold book");
+                }
+                popts.band_units = run.band.units;
+                popts.run_bands = Some(bands);
+            }
+            band_units_arg = None;
         }
         if let Some(bps) = run.per_side_bps {
             run_cost = Some((bps, run.cost_source()));
