@@ -985,6 +985,44 @@ fn band_sd_is_scale_invariant() {
     assert_eq!(e.net_pnl.to_bits(), f.net_pnl.to_bits());
 }
 
+/// The sd-unit fitness book priced on validation rows with the member's own
+/// training-resolved band equals the objective's validation book: net, trades,
+/// exposure and cost.
+#[test]
+fn band_sd_fitness_book_matches_validation_book() {
+    let train = slice(&[400, 400, 1, 400]);
+    let valid = slice(&[300, 250, 300]);
+    let hold = 4usize;
+    let sp = band_spec(1.0, BandUnits::Sd, hold);
+    let train_book = FitnessBook::new(&train, &sp, 900.0).unwrap();
+    let valid_book = FitnessBook::new(&valid, &sp, 900.0).unwrap();
+    // (training scale, validation scale): the validation scale differs, so a band
+    // re-resolved on validation rows would price a different book.
+    for (train_scale, valid_scale) in [(1.0, 1.0), (1.0, 3.0), (2.0, 1.2)] {
+        let train_scores = persistent_scores(&train, train_scale);
+        let valid_scores = persistent_scores(&valid, valid_scale);
+        let band = BandSpec::from_training(BandUnits::Sd, 1.0, &train_scores, &train.rows.time);
+        assert!(band.resolved > 0.0);
+        assert_eq!(train_book.resolve_band(&train_scores).to_bits(), band.resolved.to_bits());
+        let t = valid_book.band_pass(&valid_scores, band.resolved, false)[0];
+        let net = valid_book.net_of(&t);
+        let objective_spec = TradingSpec { band, min_holding: hold, ..spec() };
+        let objective = trading::evaluate(&valid_scores, &valid.ret, &valid.rows, &objective_spec).unwrap();
+        let label = format!("scales {train_scale}/{valid_scale}");
+        assert!(t.flips > 5 && t.exits > 0, "{label}: {t:?}");
+        assert!((net - objective.net_pnl).abs() <= 1e-12, "{label}: fitness net {net} objective {}", objective.net_pnl);
+        assert_eq!(t.flips as usize, objective.trades, "{label}");
+        assert_eq!(t.exits as usize, objective.exits, "{label}");
+        let exposure = t.long_rows as f64 / valid.ret.len() as f64;
+        assert!((exposure - objective.exposure).abs() <= 1e-12, "{label}: exposure {exposure} vs {}", objective.exposure);
+        let cost = t.gross - net;
+        assert!((cost - objective.total_cost).abs() <= 1e-12, "{label}: cost {cost} vs {}", objective.total_cost);
+        let reresolved = valid_book.totals(&valid_scores);
+        if valid_scale != train_scale {
+            assert_ne!((reresolved.flips, reresolved.long_rows), (t.flips, t.long_rows), "{label}: the band is not re-resolved on validation");
+        }
+    }
+}
 #[test]
 fn band_sd_degenerate_is_zero_band() {
     let s = slice(&[200, 200]);
