@@ -2668,7 +2668,7 @@ fn run_fallback_fit(
 
 /// #968: the answer a routed tail fit keeps: the exact CPU fit from `start`, or
 /// `device` when its exact error is lower.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", test))]
 pub(crate) fn keep_better_tail_fit(
     start: &Node,
     device: Node,
