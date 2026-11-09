@@ -13267,7 +13267,7 @@ mod tests {
                 None,
                 Some(crate::metrics::ScoreObjective::LongPnl),
                 false,
-                std::time::Instant::now(),
+                run_clock(),
                 &rows,
                 device_fit_view(&cfg, &train),
                 None,
