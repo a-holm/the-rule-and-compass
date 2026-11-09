@@ -395,7 +395,7 @@ impl TradingSpec {
             return Err("the top_tercile book is the unit {0, 1} position: it needs no tau, min_holding 1 and max_position 1".to_string());
         }
         for (name, v) in [("band", self.band.multiple), ("resolved band", self.band.resolved)] {
-            if !v.is_finite() {
+            if !v.is_finite() || v < 0.0 {
                 return Err(format!("the {} must be finite and non-negative, got {}", name, v));
             }
         }
@@ -1366,6 +1366,7 @@ impl FitnessBook {
         let band = spec.band.multiple;
         if band != 0.0 || spec.min_holding != 1 || spec.band.units != BandUnits::Score {
             fnv_u64(&mut hash, band.to_bits());
+            fnv_u64(&mut hash, if spec.band.units == BandUnits::Sd { 1 } else { 0 });
             fnv_u64(&mut hash, spec.min_holding as u64);
         }
         Ok(FitnessBook {
@@ -1727,6 +1728,7 @@ impl FitnessBook {
                     out[b].nonfinite = true;
                 }
                 if flag & TradingRows::FIRST != 0 {
+                    state = trading_gpu::BandState::default();
                     prev = false;
                 }
                 state = params.next(state, p);
