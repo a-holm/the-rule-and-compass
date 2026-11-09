@@ -1330,10 +1330,18 @@ fn band_sd_ignores_rows_after_training_end() {
             })
             .collect::<Vec<_>>()
     };
-    let (ba, bb) = (bands(&a), bands(&b));
+    // The display order follows the validation books, which differ; compare by expression.
+    let sorted = |mut v: Vec<(String, Option<u64>, u64)>| {
+        v.sort();
+        v
+    };
+    let (ba, bb) = (sorted(bands(&a)), sorted(bands(&b)));
     assert!(ba.iter().filter(|m| m.1.is_some()).count() >= 2, "{ba:?}");
     assert_eq!(ba, bb);
-    assert_eq!(members(&a), members(&b));
+    let (mut ma, mut mb) = (members(&a), members(&b));
+    ma.sort();
+    mb.sort();
+    assert_eq!(ma, mb);
     assert!(at(&a, &["objective", "spec", "band_sd"]).as_f64().is_some());
     assert_eq!(archive_hash(&la), archive_hash(&lb));
     let max_time = num(&a, &["objective", "spec", "band_sd_max_time"]);
