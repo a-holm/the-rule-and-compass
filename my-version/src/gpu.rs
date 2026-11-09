@@ -11247,3 +11247,7 @@ mod toolchain_tests;
 #[cfg(test)]
 #[path = "gpu_fit_tail_tests.rs"]
 mod fit_tail_tests;
+
+#[cfg(test)]
+#[path = "gpu_fit_width_tests.rs"]
+mod fit_width_tests;
