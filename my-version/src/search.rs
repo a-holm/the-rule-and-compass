@@ -1294,6 +1294,7 @@ impl GpuSearch {
                         return Err("the long_pnl fitness book was not rebuilt".to_string());
                     };
                     ev.set_pnl_book(book)?;
+                    ev.set_pnl_band(0.0, false, 1)?;
                 }
                 // #289: a classification score uploads its label sign once per
                 // sample, whether or not the device also fits constants. The
