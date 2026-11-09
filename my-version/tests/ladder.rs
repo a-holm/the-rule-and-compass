@@ -762,3 +762,35 @@ fn trend_rung_matches_walkforward_band() {
     let wf_net = m.mean_return * m.periods as f64;
     assert!((wf_net - row.excess_over_cash).abs() <= 1e-12, "walkforward {} ladder {}", wf_net, row.excess_over_cash);
 }
+
+#[test]
+fn a_trend_rung_with_the_top_mean_is_the_best_long_flat_rule() {
+    let t = trend_fixture(11, true, &[], 3, None);
+    let on = run_trend(&t, true);
+    let off = run_trend(&t, false);
+    let trend_top = ["trend_ma", "trend_donchian"]
+        .into_iter()
+        .map(|n| on.row(n).unwrap().mean_period_net)
+        .fold(f64::NEG_INFINITY, f64::max);
+    for name in [
+        "constant_long_flat",
+        "zero_param",
+        "ols_ridge",
+        "best_single_feature",
+        "vol_binned20",
+        "naive_reversal",
+        "top_tercile_long",
+        "feature_threshold",
+    ] {
+        let row = on.row(name).unwrap();
+        if row.status == "ok" {
+            assert!(row.mean_period_net < trend_top, "{name} {} vs trend {trend_top}", row.mean_period_net);
+        }
+    }
+    assert!(on.best_long_flat_rule.starts_with("trend_"), "{}", on.best_long_flat_rule);
+    assert_eq!(on.row(&on.best_long_flat_rule).unwrap().mean_period_net, trend_top);
+    assert!(!off.best_long_flat_rule.starts_with("trend_"), "{}", off.best_long_flat_rule);
+    for name in ["trend_ma", "trend_donchian"] {
+        assert_eq!(off.row(name).unwrap().status, "not_run");
+    }
+}
