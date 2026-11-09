@@ -1589,7 +1589,9 @@ fn known_lookback_names() -> &'static BTreeSet<String> {
 /// weight, summed over its stages, plus one bar for a close difference or a
 /// true range. An MTF leaf counts `(K + 2)` higher bars (the current closed bar
 /// and the join lag). A cross-section column takes its source column. A label
-/// column takes the default volatility window for the kinds that use the scale.
+/// column takes the default volatility window for the kinds that use the scale;
+/// `rcsr enrich` raises the lookback of every label column it writes to the
+/// label purge, which a name does not carry.
 /// Calendar, identity and raw columns have none.
 pub fn lookback_seconds(name: &str, bar_seconds: i64) -> Option<i64> {
     if let Some((tf, leaf)) = mtf_parts(name) {
@@ -7680,9 +7682,11 @@ fn enrich_inner(
     for n in &requested {
         column_lookback.insert(n.clone(), lookback_seconds(n, step).unwrap_or(crate::protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS));
     }
+    // A label column counts its whole window: a training row within one label
+    // window after a locked end shares returns with the last locked labels.
     for sp in &long_specs {
         for (kind, _) in crate::labels::COLUMN_KINDS {
-            column_lookback.insert(sp.column(kind), sp.column_warmup(kind) as i64 * step);
+            column_lookback.insert(sp.column(kind), (sp.column_warmup(kind) as i64 * step).max(sp.purge_seconds()));
         }
     }
     for (n, _) in &labels {
@@ -9011,6 +9015,10 @@ pub fn run(args: &[String]) -> ! {
                     eprintln!("error: {}", crate::labels::missing_fee_message(&v));
                     std::process::exit(EXIT_USAGE);
                 }
+                if let Some(e) = v.trim_start().starts_with("long:").then(|| crate::labels::anchor_refusal(&v)).flatten() {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_USAGE);
+                }
                 opts.labels.push(v);
             }
             "--allow-overlap" => opts.allow_overlap = true,
@@ -9206,13 +9214,20 @@ INPUT / OUTPUT:
                           (repeatable; labels are targets, not features)
   --label long:<tf|bars>[,name=<id>][,delay=<bars>],fee=<bp>[,spread=<bp>]
                           [,slip=<bp>][,vol=<bars>][,floor=<bp>][,clip=<c>][,up=<u>]
-                          [,down=<d>][,stride=<n>]
+                          [,down=<d>][,stride=<n>][,anchor=<ISO date|epoch>]
                           long-only label family (CPU f64): lbl_<name>_{fwd,y,
                           long_net,action,t1,exit_ret,m_net,m_barrier,weight};
                           writes <out>.labels.json (reports, label hash, top
-                          10 absolute moves) and a y target spec (cost_bps, cost_per_side_bps)
-                          in <out>.targets.json; fee= is required (fee=0 for none, exit 2
-                          otherwise); never a --vars input
+                          10 absolute moves, stride, purge_rows_per_symbol,
+                          tail_rows_without_label) and a y target spec (cost_bps,
+                          cost_per_side_bps) in <out>.targets.json; fee= is required
+                          (fee=0 for none, exit 2 otherwise); never a --vars input.
+                          stride=<n> keeps every n-th row of a symbol; with
+                          anchor= a row is kept when (time - anchor) is a whole
+                          number of n bars, so every symbol decides at the same
+                          stamps (anchor without stride > 1 exits 2). The lookback
+                          of a label column is at least its purge, so
+                          lockbox_embargo covers the longest label window
   --allow-overlap         permit a label stride below the horizon for horizons of
                           4h and longer (labels overlap; use uniqueness weights)
   --side long             the only side; --side short and --allow-short are refused

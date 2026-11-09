@@ -1369,7 +1369,7 @@ fn no_training_label_reaches_test_block(h: usize) {
     let vars = vec!["x".to_string()];
     let run = format!(
         "{{\"seed\":3,\"variables\":[\"x\"],\"ablation\":{{\"arm\":\"A0\",\"feature_list_sha256\":\"{}\",\"generation_budget\":5,\"generations_run\":5}},\
-\"objective\":{{\"finalist\":{{\"expression\":\"x\"}}}},\"split\":{{\"train_time\":[{},{}],\"validation_time\":[{},{}],\"required_purge_seconds\":{}}}}}",
+\"objective\":{{\"finalist\":{{\"expression\":\"x\"}}}},\"pareto\":[{{\"expression\":\"x\"}}],\"split\":{{\"train_time\":[{},{}],\"validation_time\":[{},{}],\"required_purge_seconds\":{}}}}}",
         ablation::feature_list_sha256(&vars),
         t0,
         t0 + 100 * 3600,

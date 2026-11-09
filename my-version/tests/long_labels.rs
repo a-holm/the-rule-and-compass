@@ -758,9 +758,9 @@ fn anchored_stride_aligns_symbols() {
 fn existing_label_hashes_are_unchanged() {
     let bars = wavy(600);
     let pinned = [
-        ("long:1,name=h1,fee=10", "PIN_H1"),
-        ("long:4,name=h4,fee=10,stride=4", "PIN_H4"),
-        ("long:24,name=h24,fee=10,stride=24", "PIN_H24"),
+        ("long:1,name=h1,fee=10", "c651db18041c1fbe9b5b177ab27c633eac8f6488368ed8d9d31798e01045fed0"),
+        ("long:4,name=h4,fee=10,stride=4", "f7be5ce9530d5218ebfcde56afcbae9694adaf0c96d29312aecf78d6a276d3ca"),
+        ("long:24,name=h24,fee=10,stride=24", "9a66d623773e9795f42503a36ca021564609ec22b768708ea6f626f1d66f2c6d"),
     ];
     for (src, want) in pinned {
         let got = build(&bars, &LongLabelSpec::parse(src, HOUR).unwrap(), None).unwrap().label_hash();
