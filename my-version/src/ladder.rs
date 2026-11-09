@@ -325,6 +325,10 @@ pub struct SrRun {
     pub expression_source: crate::run_json::ExpressionSource,
     pub variables: Vec<String>,
     pub threshold: f64,
+    /// #951: the band the run priced, `resolved` taken as recorded.
+    pub band: crate::trading::BandSpec,
+    /// #951: the minimum hold the run priced.
+    pub min_holding: usize,
     /// `(fold label, out-of-fold)` for every window of the table.
     pub fold_oof: Vec<(String, bool)>,
 }
@@ -332,7 +336,7 @@ pub struct SrRun {
 impl SrRun {
     pub fn load(path: &str) -> Result<SrRun, String> {
         let run = crate::run_json::RunFile::load(path)?;
-        let book = run.book()?;
+        let book = run.band_book()?;
         if book.position != crate::trading::PositionMap::Threshold {
             return Err("the run priced the top_tercile book: the SR rung prices the threshold rule only".to_string());
         }
@@ -341,9 +345,16 @@ impl SrRun {
             expression_source: book.expression_source,
             variables: book.variables,
             threshold: book.threshold,
+            band: book.band.clone(),
+            min_holding: book.min_holding,
             run,
             fold_oof: Vec::new(),
         })
+    }
+
+    /// The run priced a no-trade band or a minimum hold.
+    pub fn has_band(&self) -> bool {
+        self.band.resolved > 0.0 || self.min_holding > 1
     }
 
     fn json(&self) -> String {
@@ -358,14 +369,20 @@ impl SrRun {
             .iter()
             .map(|(l, ok)| format!("{{\"fold\":{},\"oof\":{}}}", jstr(l), ok))
             .collect();
+        let book = if self.has_band() {
+            format!(",\"policy\":\"band\"{},\"min_holding\":{},\"band_source\":\"run\"", self.band.json_fields(), self.min_holding)
+        } else {
+            String::new()
+        };
         format!(
             "{{{}\"run_sha256\":{},\"expression\":{},\"expression_source\":{},\"expression_from\":\"objective.finalist\",\
-\"threshold\":{},\"threshold_source\":\"run\",\"folds\":[{}]}}",
+\"threshold\":{},\"threshold_source\":\"run\"{},\"folds\":[{}]}}",
             run_path,
             jstr(&self.run.sha256),
             jstr(&self.expression),
             jstr(self.expression_source.as_str()),
             jnum(self.threshold),
+            book,
             folds.join(",")
         )
     }
@@ -1753,6 +1770,8 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
         let mut r = Rung::new("symbolic_regression", "model");
         r.pos = vec![0.0; n];
         r.score = vec![f64::NAN; n];
+        let banded = sr_run.has_band();
+        let params = if banded { Some(BandParams::new(sr_run.threshold, sr_run.band.resolved, sr_run.min_holding)?) } else { None };
         for (fi, f) in folds.iter().enumerate() {
             let (s, _) = pool.ranges[fi];
             for (k, &i) in f.test.iter().enumerate() {
@@ -1763,8 +1782,25 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
                 r.score[s + k] = sc;
                 r.pos[s + k] = if sc > sr_run.threshold { 1.0 } else { 0.0 };
             }
+            if let Some(params) = &params {
+                let groups: Vec<u64> = f.test.iter().map(|&i| p.group[i]).collect();
+                let pos = band_positions(&r.score[s..s + f.test.len()], &groups, params)?;
+                r.pos[s..s + f.test.len()].copy_from_slice(&pos);
+            }
         }
-        r.params = format!("fixed threshold {} from the run; expression {}", jnum(sr_run.threshold), sr_run.expression);
+        r.params = if banded {
+            format!(
+                "fixed threshold {} from the run; band {} {} (half-width {} as recorded), min hold {}; expression {}",
+                jnum(sr_run.threshold),
+                jnum(sr_run.band.multiple),
+                sr_run.band.units.name(),
+                jnum(sr_run.band.resolved),
+                sr_run.min_holding,
+                sr_run.expression
+            )
+        } else {
+            format!("fixed threshold {} from the run; expression {}", jnum(sr_run.threshold), sr_run.expression)
+        };
         r.fits = opts.sr_evals.unwrap_or(0);
         r.wall = opts.sr_wall_seconds.unwrap_or(0.0);
         r.predicts_target = true;
@@ -2447,6 +2483,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --trend-donchian-cols <a,b,...> columns of trend_donchian (default don20,don96,mtf_4h_donchian_pos,mtf_1d_donchian_pos)\n\
   --target-spec <file>      target spec file: per-side cost (cost_bps / 2), return units (log is converted with exp_m1), return column and horizon; also the zero-parameter rung (scale column must be in the panel)\n\
   --sr-run <run.json>       one search run (rcsr --objective ... --json-out) scored on every fold with the run's fixed threshold;\n\
+                            a run that priced a band or a minimum hold is priced with it: half-width objective.spec.band_resolved as recorded, objective.spec.min_holding, every fold starts flat (sr_run.policy band);\n\
                             a fold whose test starts before the run's last seen row + purge is refused (exit 3)\n\
                             prices objective.finalist.expression_exact, else the rounded expression (sr_run.expression_source);\n\
                             --locked-test refuses a rounded source (exit 3)\n\

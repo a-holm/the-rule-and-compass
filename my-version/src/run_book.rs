@@ -2,7 +2,7 @@
 //!
 //! `rcsr --objective pnl|sharpe|log_growth --json` writes the finalist
 //! expression, the position rule (`objective.spec`) and the cost beside the
-//! declared target spec. [`RunBook::parse`] reads them back so an evaluator
+//! declared target spec. [`RunBook::from_json`] reads them back so an evaluator
 //! prices the same book instead of a book rebuilt from flags.
 
 use crate::devlog::Json;
@@ -93,20 +93,6 @@ pub(crate) fn band_of(spec: Option<&Json>) -> Result<(crate::trading::BandSpec, 
 }
 
 impl RunBook {
-    /// The book of a run for evaluators that price the plain threshold rule
-    /// only: a run that priced a band or a minimum hold is refused.
-    pub fn parse(text: &str) -> Result<RunBook, String> {
-        crate::run_json::RunFile::parse(text)?.book()
-    }
-
-    /// `Err` when the run priced a band or a minimum hold (#946).
-    pub(crate) fn threshold_only(self) -> Result<RunBook, String> {
-        if self.has_band() {
-            return Err("run.json objective.spec has a band or a min_holding > 1: only walkforward --from-run prices that book".to_string());
-        }
-        Ok(self)
-    }
-
     /// The run priced a no-trade band or a minimum hold.
     pub fn has_band(&self) -> bool {
         self.band.resolved > 0.0 || self.min_holding > 1
