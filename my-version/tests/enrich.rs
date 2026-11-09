@@ -2583,9 +2583,9 @@ fn trend_prefix_replay() {
     write_store(&full_src, &rows, 1024);
     enrich::build(&trend_opts(&full_src, &full_out, "trend")).unwrap();
     let full: Vec<Vec<f64>> = rcsr::trend::TREND_NAMES.iter().map(|n| column(&full_out, n)).collect();
-    let step = rows.len() / 20;
+    // Cuts land mid-day, so a prefix ends inside a running day.
     let mut cuts = 0usize;
-    for cut in (step..=rows.len()).step_by(step).take(20) {
+    for cut in (1..=20).map(|k| k * (rows.len() - 24) / 20 + 7 + k % 13) {
         let src = dir.join(format!("p{cut}.rcsb")).to_string_lossy().into_owned();
         let out = dir.join(format!("p{cut}-out.rcsb")).to_string_lossy().into_owned();
         write_store(&src, &rows[..cut], 1024);

@@ -182,8 +182,16 @@ fn trend_gpu_matches_cpu() {
     }
     let rows = two_symbols(400);
     let names = trend::trend_names();
-    let finite = assert_parity("direct", &cpu(&rows, 3600, &names), &gpu(&rows, 3600, &names));
+    let (want, got) = (cpu(&rows, 3600, &names), gpu(&rows, 3600, &names));
+    let finite = assert_parity("direct", &want, &got);
     assert!(finite > 27 * 2_000, "only {finite} finite cells compared");
+    let z: Vec<&String> = names.iter().filter(|n| n.ends_with("_z")).collect();
+    let z_cells = z.iter().map(|n| want[*n].iter().filter(|v| v.is_finite()).count()).sum::<usize>();
+    let z_bitwise = z
+        .iter()
+        .map(|n| want[*n].iter().zip(&got[*n]).filter(|(a, b)| a.is_finite() && a.to_bits() == b.to_bits()).count())
+        .sum::<usize>();
+    eprintln!("trend _z leaves: {z_bitwise} of {z_cells} finite cells bit-identical");
 
     // `mtf,trend` shares the daily resample: both families match the CPU.
     let mut both = enrich::mtf_names();
@@ -273,9 +281,9 @@ fn trend_gpu_prefix_replay() {
     let rows = two_symbols(390);
     let names = trend::trend_names();
     let full = gpu(&rows, 3600, &names);
-    let step = rows.len() / 20;
+    // Cuts land mid-day, so a prefix ends inside a running day.
     let mut cuts = 0;
-    for cut in (step..=rows.len()).step_by(step).take(20) {
+    for cut in (1..=20).map(|k| k * (rows.len() - 24) / 20 + 7 + k % 13) {
         let got = gpu(&rows[..cut], 3600, &names);
         for name in &names {
             for i in 0..cut {
