@@ -310,6 +310,11 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              a smaller value is refused (exit 2). Rows in
                              [START - purge, END + embargo) are refused (exit 3); with a
                              target spec, rows before END + max(embargo, purge) too
+  --retired <retired.json>
+                             record from `rcsr protocol retire`: its range had its one sealed
+                             read and no longer guards next to --lockbox on undeclared data;
+                             the ledger it names is re-hashed (mismatch: exit 3); a --lockbox
+                             range overlapping it is refused (exit 2)
   --lockbox <START,END|none>
                              locked test (UTC, half-open). Order: this flag, the range
                              declared with the data (<data>.manifest.json, .schema.json,
@@ -2558,6 +2563,7 @@ fn main() {
     // #264: declared locked test and the ledger whose reads run.json counts.
     let mut lockbox_arg: Option<String> = None;
     let mut lockbox_embargo_arg: Option<String> = None;
+    let mut retired_arg: Option<String> = None;
     let mut ledger_arg: Option<String> = None;
     // #266: ablation arm label recorded in the run report.
     let mut arm_arg: Option<String> = None;
@@ -2870,6 +2876,7 @@ fn main() {
             "--allow-interpolate" => allow_interpolate = true,
             "--lockbox" => lockbox_arg = Some(val!()),
             "--lockbox-embargo" => lockbox_embargo_arg = Some(val!()),
+            "--retired" => retired_arg = Some(val!()),
             "--ledger" => ledger_arg = Some(val!()),
             "--arm" => arm_arg = Some(val!()),
             "--allow-lockbox" => allow_lockbox = true,
@@ -5258,7 +5265,7 @@ fn main() {
         }
     }
 
-    let resolved_lockbox = rcsr::lockbox::resolve_with(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path).unwrap_or_else(|e| {
+    let resolved_lockbox = rcsr::lockbox::resolve_retired(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path, retired_arg.as_deref()).unwrap_or_else(|e| {
         eprintln!("error: {}", e.message);
         std::process::exit(e.exit);
     });
@@ -10598,6 +10605,11 @@ OPTIONS:
                              (default: lockbox_embargo declared with the data, else 10972800);
                              a smaller value is refused (exit 2). Rows in
                              [START - purge, END + max(embargo, purge)) are refused (exit 3)
+  --retired <retired.json>
+                             record from `rcsr protocol retire`: its range had its one sealed
+                             read and no longer guards next to --lockbox on undeclared data;
+                             the ledger it names is re-hashed (mismatch: exit 3); a --lockbox
+                             range overlapping it is refused (exit 2)
   --lockbox <START,END|none>
                              locked test, UTC half-open. Order: this flag, the range
                              declared with --data (store manifest, schema or sidecar),
@@ -10699,6 +10711,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut allow_unbound = false;
     let mut lockbox_arg: Option<String> = None;
     let mut lockbox_embargo_arg: Option<String> = None;
+    let mut retired_arg: Option<String> = None;
     let mut expect_hash: Option<String> = None;
     let mut front_path: Option<String> = None;
     let mut allow_in_sample = false;
@@ -10923,6 +10936,10 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--lockbox-embargo" => {
                 lockbox_embargo_arg = Some(need(args, i + 1, "--lockbox-embargo"));
+                i += 1;
+            }
+            "--retired" => {
+                retired_arg = Some(need(args, i + 1, "--retired"));
                 i += 1;
             }
             "--expect-report-sha256" => {
@@ -11346,7 +11363,7 @@ fn run_walkforward(args: &[String]) -> ! {
             usage_fail(&msg);
         }
     }
-    let resolved = rcsr::lockbox::resolve_with(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path).unwrap_or_else(|e| {
+    let resolved = rcsr::lockbox::resolve_retired(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path, retired_arg.as_deref()).unwrap_or_else(|e| {
         eprintln!("error: {}", e.message);
         std::process::exit(e.exit);
     });
@@ -11790,6 +11807,7 @@ fn run_audit(args: &[String]) -> ! {
     let mut session_gap: Option<f64> = None;
     let mut lockbox_arg: Option<String> = None;
     let mut lockbox_embargo_arg: Option<String> = None;
+    let mut retired_arg: Option<String> = None;
     let mut target_spec: Option<String> = None;
     let mut i = 0usize;
     while i < args.len() {
@@ -11830,6 +11848,7 @@ fn run_audit(args: &[String]) -> ! {
             "--report" => report_path = Some(take(&mut i)),
             "--lockbox" => lockbox_arg = Some(take(&mut i)),
             "--lockbox-embargo" => lockbox_embargo_arg = Some(take(&mut i)),
+            "--retired" => retired_arg = Some(take(&mut i)),
             "--target-spec" => target_spec = Some(take(&mut i)),
             "--join-on" => join_on = Some(take(&mut i)),
             "--bars" => bars_path = Some(take(&mut i)),
@@ -11935,7 +11954,7 @@ fn run_audit(args: &[String]) -> ! {
             (seconds, Some(audit), report)
         }
     };
-    let resolved = rcsr::lockbox::resolve_with(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &path).unwrap_or_else(|e| {
+    let resolved = rcsr::lockbox::resolve_retired(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &path, retired_arg.as_deref()).unwrap_or_else(|e| {
         eprintln!("error: {}", e.message);
         std::process::exit(e.exit);
     });

@@ -394,6 +394,7 @@ pub fn schema_json(
     locked_test: Option<&crate::lockbox::Lockbox>,
     also: Option<&crate::lockbox::Lockbox>,
     embargo_floor: Option<i64>,
+    retired: Option<&crate::retire::Retirement>,
 ) -> String {
     let base_bar = bar.seconds.unwrap_or(3600);
     let (embargo_seconds, embargo_column) = {
@@ -407,9 +408,10 @@ pub fn schema_json(
     let locked = locked_test
         .map(|l| {
             format!(
-                "\"locked_test\":{}{},",
+                "\"locked_test\":{}{}{},",
                 l.declaration_json("rcsr panel build --locked-test"),
-                crate::lockbox::also_json(also, "rcsr panel build --locked-test")
+                crate::lockbox::also_json(also, "rcsr panel build --locked-test"),
+                retired.map(crate::retire::Retirement::member).unwrap_or_default()
             )
         })
         .unwrap_or_default();
@@ -489,9 +491,21 @@ pub fn write_schema_embargo(
     also: Option<&crate::lockbox::Lockbox>,
     embargo_floor: Option<i64>,
 ) -> Result<String, String> {
+    write_schema_retired(store_path, panel_version, locked_test, also, embargo_floor, None)
+}
+
+/// As [`write_schema_embargo`], with the retirement record the output declares.
+pub fn write_schema_retired(
+    store_path: &str,
+    panel_version: &str,
+    locked_test: Option<&crate::lockbox::Lockbox>,
+    also: Option<&crate::lockbox::Lockbox>,
+    embargo_floor: Option<i64>,
+    retired: Option<&crate::retire::Retirement>,
+) -> Result<String, String> {
     let store = FileStore::open(store_path)?;
     let (columns, bar) = build_schema_with_bar(&store)?;
-    let text = schema_json(&columns, &bar, store.n_rows(), panel_version, locked_test, also, embargo_floor);
+    let text = schema_json(&columns, &bar, store.n_rows(), panel_version, locked_test, also, embargo_floor, retired);
     let out = schema_path(store_path);
     std::fs::write(&out, text).map_err(|e| format!("{}: {}", out, e))?;
     Ok(out)

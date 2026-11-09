@@ -1031,6 +1031,7 @@ fn locked_test_declaration_travels_with_the_store() {
         panel_version: "2".to_string(),
         scratch: Some(dir.join("scratch").to_str().unwrap().to_string()),
         locked_test: rcsr::lockbox::Keep::Unset,
+        retired: None,
     })
     .unwrap();
     assert_eq!(lockbox::stored(appended.to_str().unwrap()).unwrap().map(|(_, l)| l), Some(lb));
@@ -1159,6 +1160,7 @@ fn append_refuses_a_family_store_with_another_declaration() {
         panel_version: "2".to_string(),
         scratch: Some(dir.join("scratch").to_str().unwrap().to_string()),
         locked_test: lt,
+        retired: None,
     };
     // enrich of undeclared data declares the protocol default; the target declares none
     let err = panel_append::append_family(&opts("a.rcsb", Keep::Unset)).unwrap_err();
@@ -1253,6 +1255,7 @@ fn append_keeps_the_target_declaration_when_the_family_store_declares_none() {
         panel_version: "2".to_string(),
         scratch: Some(dir.join("scratch").to_str().unwrap().to_string()),
         locked_test: Keep::Unset,
+        retired: None,
     })
     .unwrap();
     assert_eq!(lockbox::stored(out.to_str().unwrap()).unwrap().map(|(_, l)| l), Some(lb));

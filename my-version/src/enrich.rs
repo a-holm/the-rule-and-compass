@@ -8989,6 +8989,7 @@ pub fn run(args: &[String]) -> ! {
         ..Options::default()
     };
     let mut locked_test: Option<String> = None;
+    let mut retired: Option<String> = None;
     let mut i = 0usize;
     macro_rules! val {
         () => {{
@@ -9090,6 +9091,7 @@ pub fn run(args: &[String]) -> ! {
             "--locked-test" => {
                 locked_test = Some(val!())
             }
+            "--retired" => retired = Some(val!()),
             "--allow-lockbox" => opts.allow_lockbox = true,
             "--dry-run" => opts.dry_run = true,
             "--json" => opts.json = true,
@@ -9106,7 +9108,7 @@ pub fn run(args: &[String]) -> ! {
     if opts.features.is_empty() && opts.labels.is_empty() {
         fail("enrich needs --features and/or --label");
     }
-    let resolved = crate::lockbox::resolve(locked_test.as_deref(), &opts.data).unwrap_or_else(|e| {
+    let resolved = crate::lockbox::resolve_retired(locked_test.as_deref(), None, &opts.data, retired.as_deref()).unwrap_or_else(|e| {
         eprintln!("error: {}", e.message.replacen("--lockbox", "--locked-test", 2));
         std::process::exit(e.exit);
     });
@@ -9137,7 +9139,7 @@ pub fn run(args: &[String]) -> ! {
                 let source = format!("rcsr enrich ({})", resolved.source.as_str());
                 text.insert_str(
                     at,
-                    &format!("\"locked_test\":{}{},", lb.declaration_json(&source), crate::lockbox::also_json(resolved.sidecar_also().as_ref(), &source)),
+                    &format!("\"locked_test\":{}{}{},", lb.declaration_json(&source), crate::lockbox::also_json(resolved.sidecar_also().as_ref(), &source), resolved.retired_member()),
                 );
             }
             let declared = resolved.sidecar_range();
@@ -9239,6 +9241,9 @@ INPUT / OUTPUT:
                           declared one is refused (exit 2); conflicting declarations of
                           --data are refused (exit 3); none writes no declaration and is
                           refused when --data declares one
+                          --retired <retired.json> (a record from rcsr protocol retire) drops the
+                          protocol default from the guard of the range; overlap with the
+                          range or with a declaration of --data is refused (exit 2)
                           label rows whose window reaches the range (entry at or after
                           START minus the purge, before END) are left out of every
                           <out>.labels.json statistic, and counted

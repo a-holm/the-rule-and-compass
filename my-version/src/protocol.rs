@@ -1,4 +1,4 @@
-//! Evaluation protocol: windows, candidate ledger, sealed list, one-read lockbox.
+//! Evaluation protocol: windows, candidate ledger, "rcsr protocol <windows|seal|verify|retire|candidates|selectors> ...ed list, one-read lockbox.
 //!
 //! Four tiers: training fits, validation selects, development out-of-sample
 //! evaluates the procedure, and a locked test is read once per sealed
@@ -261,7 +261,7 @@ fn esc(s: &str) -> String {
 
 /// Read a string field written by [`esc`]. Keys are unique per line and the
 /// expression, the only free text, is written after every key read back.
-fn field_str(line: &str, key: &str) -> Option<String> {
+pub(crate) fn field_str(line: &str, key: &str) -> Option<String> {
     let pat = format!("\"{}\":\"", key);
     let start = line.find(&pat)? + pat.len();
     let mut out = String::new();
@@ -417,6 +417,10 @@ pub struct Ledger {
 impl Ledger {
     pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
         Ledger { path: path.into() }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     fn lines(&self) -> Result<Vec<String>, String> {
@@ -1053,6 +1057,15 @@ fn protocol_usage() -> &'static str {
       reads, exactly one seal line that is final, and a consistent marker;
       with --sealed it also checks that the file is the final seal's list and
       that every read id is in it.
+  retire --ledger FILE --range START,END --out retired.json
+      Verify the ledger (same hash-chain check as verify) and write a retirement
+      record for a locked range. The ledger needs exactly one locked read of that
+      exact range, after a seal. Zero reads exit 2 (range not read); two or more,
+      or a read before any seal, exit 3. The record names the ledger by absolute
+      path and SHA-256. Commands given --retired RECORD re-hash that ledger
+      (a mismatch exits 3) and stop guarding the protocol default 2025-07-01,2026-07-01
+      next to a --lockbox or --locked-test range; the retired range is development
+      data from then on and a new locked range that overlaps it exits 2.
   candidates --ledger FILE
       List the candidates without a locked read.
 "
@@ -1081,6 +1094,7 @@ pub fn run(args: &[String]) -> ! {
     let mut max_reads: Option<u64> = None;
     let mut expect_reads: Option<u64> = None;
     let mut data: Option<String> = None;
+    let mut range: Option<String> = None;
     let mut sealed: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
@@ -1154,6 +1168,10 @@ pub fn run(args: &[String]) -> ! {
                 sealed = Some(value(i));
                 i += 1;
             }
+            "--range" => {
+                range = Some(value(i));
+                i += 1;
+            }
             other => fail(format!("unknown protocol option '{}'\n\n{}", other, protocol_usage()), 2),
         }
         i += 1;
@@ -1202,6 +1220,19 @@ pub fn run(args: &[String]) -> ! {
                     Err(e) => fail(e, LEDGER_FAULT_EXIT),
                 },
                 _ => {}
+            }
+        }
+        "retire" => {
+            let l = need_ledger();
+            let path = out.unwrap_or_else(|| fail("retire needs --out".to_string(), 2));
+            let range = range.unwrap_or_else(|| fail("retire needs --range START,END".to_string(), 2));
+            let range = crate::lockbox::Lockbox::parse(&range).unwrap_or_else(|e| fail(format!("--range: {}", e), 2));
+            match l.retire(range) {
+                Ok(r) => {
+                    crate::atomic::write_text_atomic(&path, &r.json()).unwrap_or_else(|e| fail(e, 1));
+                    println!("retired {} (read {}, ledger_sha256 {})", crate::lockbox::span(&range), r.read_event, r.ledger_sha256);
+                }
+                Err(e) => fail(e.message, e.exit),
             }
         }
         "selectors" => {

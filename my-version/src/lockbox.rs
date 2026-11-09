@@ -490,6 +490,8 @@ pub struct Resolved {
     pub declared_in: Vec<(String, Lockbox)>,
     /// Seconds after each range end whose rows still read the range.
     pub embargo: Embargo,
+    /// The verified retirement a `--retired` record gave.
+    pub retired: Option<crate::retire::Retirement>,
 }
 
 impl Resolved {
@@ -568,7 +570,7 @@ impl Resolved {
             })
             .collect();
         format!(
-            "\"declared\":{},\"also\":{},\"source\":{},\"declared_in\":[{}],\"embargo_seconds\":{},\"embargo_source\":{},\"rows_in_scope\":{},\"evaluated\":{},\"checked\":{}",
+            "\"declared\":{},\"also\":{},\"source\":{},\"declared_in\":[{}],\"embargo_seconds\":{},\"embargo_source\":{},\"rows_in_scope\":{},\"evaluated\":{},\"checked\":{}{}",
             declared,
             also,
             jstr(self.source.as_str()),
@@ -577,8 +579,14 @@ impl Resolved {
             jstr(self.embargo.source.as_str()),
             rows_in_scope,
             evaluated,
-            checked
+            checked,
+            self.retired_member()
         )
+    }
+
+    /// The `,"retired":{...}` member of a report or sidecar, or nothing.
+    pub fn retired_member(&self) -> String {
+        self.retired.as_ref().map(crate::retire::Retirement::member).unwrap_or_default()
     }
 
     /// Append a `lockbox` object to a JSON report object.
@@ -798,7 +806,15 @@ pub fn resolve(flag: Option<&str>, data_path: &str) -> Result<Resolved, ResolveE
 /// [`resolve`] with `--lockbox-embargo SECONDS`: it widens the declared embargo
 /// and is refused when smaller.
 pub fn resolve_with(flag: Option<&str>, embargo_flag: Option<&str>, data_path: &str) -> Result<Resolved, ResolveError> {
-    let mut r = resolve_ranges(flag, data_path)?;
+    resolve_retired(flag, embargo_flag, data_path, None)
+}
+
+/// [`resolve_with`] with `--retired RECORD`: the path of a record written by
+/// `rcsr protocol retire`. A record covering the protocol default drops it from
+/// the guard of a flag range on undeclared data.
+pub fn resolve_retired(flag: Option<&str>, embargo_flag: Option<&str>, data_path: &str, retired: Option<&str>) -> Result<Resolved, ResolveError> {
+    let retired = retired.map(crate::retire::Retirement::load).transpose()?;
+    let mut r = resolve_ranges(flag, data_path, retired)?;
     let requested = match embargo_flag {
         None => None,
         Some(s) => match s.trim().parse::<i64>() {
@@ -832,7 +848,7 @@ pub fn resolve_with(flag: Option<&str>, embargo_flag: Option<&str>, data_path: &
     Ok(r)
 }
 
-fn resolve_ranges(flag: Option<&str>, data_path: &str) -> Result<Resolved, ResolveError> {
+fn resolve_ranges(flag: Option<&str>, data_path: &str, retired: Option<crate::retire::Retirement>) -> Result<Resolved, ResolveError> {
     let explicit = match flag {
         None => None,
         Some(s) if s.trim().eq_ignore_ascii_case("none") => Some(None),
@@ -841,20 +857,20 @@ fn resolve_ranges(flag: Option<&str>, data_path: &str) -> Result<Resolved, Resol
     let stored = stored_all(data_path)?;
     let declared_in = declarations(data_path)?;
     let covers = |f: &Lockbox, l: &Lockbox| f.start <= l.start && f.end >= l.end;
-    match (explicit, stored) {
+    let resolved = match (explicit, stored) {
         (Some(None), Some(s)) => Err(usage(format!(
             "--lockbox none is refused: {} declares the locked test {}",
             s.file,
             s.describe()
         ))),
-        (Some(None), None) => Ok(Resolved { range: None, source: Source::None, also: None, declared_in, embargo: Embargo::none() }),
+        (Some(None), None) => Ok(Resolved { range: None, source: Source::None, also: None, declared_in, embargo: Embargo::none(), retired: None }),
         (Some(Some(f)), Some(s)) if !(covers(&f, &s.range) && s.also.map_or(true, |a| covers(&f, &a))) => Err(usage(format!(
             "--lockbox {} does not cover the declared locked test {} ({})",
             span(&f),
             s.describe(),
             s.file
         ))),
-        (Some(Some(f)), Some(_)) => Ok(Resolved { range: Some(f), source: Source::Flag, also: None, declared_in, embargo: Embargo::none() }),
+        (Some(Some(f)), Some(_)) => Ok(Resolved { range: Some(f), source: Source::Flag, also: None, declared_in, embargo: Embargo::none(), retired: None }),
         (Some(Some(f)), None) => {
             let d = protocol_default();
             let (source, also) = if f.start <= d.start && f.end >= d.end {
@@ -862,17 +878,48 @@ fn resolve_ranges(flag: Option<&str>, data_path: &str) -> Result<Resolved, Resol
             } else {
                 (Source::FlagAndDefault, Some(d))
             };
-            Ok(Resolved { range: Some(f), source, also, declared_in, embargo: Embargo::none() })
+            Ok(Resolved { range: Some(f), source, also, declared_in, embargo: Embargo::none(), retired: None })
         }
-        (None, Some(s)) => Ok(Resolved { range: Some(s.range), source: Source::Store, also: s.also, declared_in, embargo: Embargo::none() }),
+        (None, Some(s)) => Ok(Resolved { range: Some(s.range), source: Source::Store, also: s.also, declared_in, embargo: Embargo::none(), retired: None }),
         (None, None) => Ok(Resolved {
             range: Some(protocol_default()),
             source: Source::ProtocolDefault,
             also: None,
             declared_in,
             embargo: Embargo::none(),
+            retired: None,
         }),
+    }?;
+    match retired {
+        Some(r) => apply_retired(resolved, r),
+        None => Ok(resolved),
     }
+}
+
+/// Drop the protocol default from the guard when the record covers it. The
+/// record never frees a range a declaration or the flag still names: those
+/// overlapping it are refused (exit 2).
+fn apply_retired(mut r: Resolved, retired: crate::retire::Retirement) -> Result<Resolved, ResolveError> {
+    if r.range.is_none() || r.source == Source::ProtocolDefault {
+        return Err(usage("--retired needs --lockbox START,END naming the new locked range".to_string()));
+    }
+    if r.source == Source::FlagAndDefault {
+        let d = protocol_default();
+        if !(retired.range.start <= d.start && retired.range.end >= d.end) {
+            return Err(usage(format!(
+                "--retired range {} does not cover the protocol default {}",
+                span(&retired.range),
+                span(&d)
+            )));
+        }
+        r.also = None;
+        r.source = Source::Flag;
+    }
+    for l in r.range.iter().chain(r.also.iter()).chain(r.declared_in.iter().map(|(_, l)| l)) {
+        retired.check_new_range(l, "the locked range")?;
+    }
+    r.retired = Some(retired);
+    Ok(r)
 }
 
 /// Write the CSV sidecar for a declaration. It records the bytes and SHA-256 of
@@ -1258,6 +1305,59 @@ mod tests {
         Lockbox { start: lockbox_date(2024, 6, 1), end: lockbox_date(2024, 7, 1) }
     }
 
+
+    fn retirement(range: Lockbox) -> crate::retire::Retirement {
+        crate::retire::Retirement {
+            range,
+            ledger: "ledger.jsonl".to_string(),
+            ledger_sha256: "ab".repeat(32),
+            read_event: "event".to_string(),
+            sealed_sha256: "cd".repeat(32),
+            verified_reads: 1,
+            utc: "2026-11-09T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn retired_default_leaves_the_guard() {
+        let d = resolve_dir("retired");
+        let data = d.join("a.csv").to_str().unwrap().to_string();
+        let flag = "2026-07-01,2027-07-01";
+        let before = resolve_ranges(Some(flag), &data, None).unwrap();
+        assert_eq!((before.source, before.also), (Source::FlagAndDefault, Some(protocol_default())));
+        assert!(before.retired.is_none() && !before.report_fields(0, false, true).contains("retired"));
+
+        let r = resolve_ranges(Some(flag), &data, Some(retirement(protocol_default()))).unwrap();
+        assert_eq!((r.source, r.also), (Source::Flag, None));
+        assert_eq!(r.range, Some(Lockbox::parse(flag).unwrap()));
+        assert_eq!(r.ranges(), vec![Lockbox::parse(flag).unwrap()]);
+        assert_eq!(r.sidecar_range(), r.range);
+        assert_eq!(r.sidecar_also(), None);
+        assert!(r.report_fields(0, false, true).ends_with(&r.retired_member()));
+        assert!(r.retired_member().starts_with(",\"retired\":{\"range\":{\"start\":1751328000,\"end\":1782864000"));
+
+        // a record that does not cover the default frees nothing
+        let part = Lockbox::parse("2025-07-01,2026-01-01").unwrap();
+        let e = resolve_ranges(Some(flag), &data, Some(retirement(part))).unwrap_err();
+        assert_eq!(e.exit, 2);
+    }
+
+    #[test]
+    fn a_retired_range_never_overlaps_a_guarded_range() {
+        let d = resolve_dir("retired-overlap");
+        let data = d.join("a.csv").to_str().unwrap().to_string();
+        let ret = || retirement(protocol_default());
+        for flag in ["2026-06-30,2027-07-01", "2025-01-01,2027-01-01", "2025-07-01,2026-07-01"] {
+            let e = resolve_ranges(Some(flag), &data, Some(ret())).unwrap_err();
+            assert_eq!(e.exit, 2, "{}", flag);
+        }
+        assert_eq!(resolve_ranges(Some("2026-07-01,2027-07-01"), &data, Some(ret())).unwrap().source, Source::Flag);
+        assert_eq!(resolve_ranges(None, &data, Some(ret())).unwrap_err().exit, 2);
+        assert_eq!(resolve_ranges(Some("none"), &data, Some(ret())).unwrap_err().exit, 2);
+        declare(&data, "lockbox.json", &protocol_default());
+        assert_eq!(resolve_ranges(Some("2025-01-01,2030-01-01"), &data, Some(ret())).unwrap_err().exit, 2);
+        assert_eq!(resolve_ranges(None, &data, Some(ret())).unwrap_err().exit, 2);
+    }
     #[test]
     fn resolve_flag_on_undeclared_data_adds_to_the_protocol_default() {
         let d = resolve_dir("flag");
@@ -1296,11 +1396,11 @@ mod tests {
     fn a_stored_disjoint_pair_keeps_its_roles_in_a_derived_sidecar() {
         let first = stored();
         let second = Lockbox { start: lockbox_date(2024, 9, 1), end: lockbox_date(2024, 10, 1) };
-        let store = Resolved { range: Some(first), source: Source::Store, also: Some(second), declared_in: Vec::new(), embargo: Embargo::none() };
+        let store = Resolved { range: Some(first), source: Source::Store, also: Some(second), declared_in: Vec::new(), embargo: Embargo::none(), retired: None };
         assert_eq!((store.sidecar_range(), store.sidecar_also()), (Some(first), Some(second)));
-        let flag = Resolved { range: Some(second), source: Source::FlagAndDefault, also: Some(first), declared_in: Vec::new(), embargo: Embargo::none() };
+        let flag = Resolved { range: Some(second), source: Source::FlagAndDefault, also: Some(first), declared_in: Vec::new(), embargo: Embargo::none(), retired: None };
         assert_eq!((flag.sidecar_range(), flag.sidecar_also()), (Some(first), Some(second)));
-        let touching = Resolved { range: Some(first), source: Source::Store, also: Some(Lockbox { start: first.end, end: second.end }), declared_in: Vec::new(), embargo: Embargo::none() };
+        let touching = Resolved { range: Some(first), source: Source::Store, also: Some(Lockbox { start: first.end, end: second.end }), declared_in: Vec::new(), embargo: Embargo::none(), retired: None };
         assert_eq!(touching.sidecar_range(), Some(Lockbox { start: first.start, end: second.end }));
         assert_eq!(touching.sidecar_also(), None);
     }
