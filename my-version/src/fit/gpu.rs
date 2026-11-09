@@ -96,12 +96,14 @@ impl BatchStatus {
 
 /// #286: whether a fit status carries a finite answer the search may keep.
 ///
-/// Status 4–8 are *labels*, not failures: rank deficiency, a recovered last
+/// Status 4–9 are *labels*, not failures: rank deficiency, a recovered last
 /// iterate, no improvement on the start, a non-finite start the CPU cannot move
-/// either, and a recovered answer whose bad-gradient rows were skipped. Only 1
-/// (arithmetic) and 2 (no finite iterate) are CPU fallbacks.
+/// either, a recovered answer whose bad-gradient rows were skipped, and (#959)
+/// an unconverged squared-loss answer. Only 1 (arithmetic) and 2 (no finite
+/// iterate) are CPU fallbacks here; the search routes 4, 5, 7 and 9 of the LM
+/// arms to the exact CPU fit.
 pub fn fit_status_usable(status: i32) -> bool {
-    matches!(status, 0 | 4 | 5 | 6 | 7 | 8)
+    matches!(status, 0 | 4 | 5 | 6 | 7 | 8 | 9)
 }
 
 /// A batched fit backend. #169 implements this for the CUDA LM kernel.

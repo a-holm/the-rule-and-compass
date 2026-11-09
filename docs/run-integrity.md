@@ -150,6 +150,7 @@ run (the "10-hour run"):
    `--resume` with a different spec (or with none, or onto a checkpoint
    written without one) is refused with exit 2 and a message naming both
    hashes, before the data fingerprint is compared.
+   A run check that asks whether the search ran on the GPU reads `search_backend` of `run.json` (#962), not `backend`: a GPU search finished over chunks and then resumed at its final generation runs no generation in the last process, which is a CPU report step (`process_backend` `cpu`). `search_backend` is `gpu` when every chunk ran on the device, `cpu`, `mixed` for chunks on both, and `unknown` when the sidecar of the checkpoint is missing, stale or of version 1. See [checkpoint.md](checkpoint.md#backend-of-a-chunked-run).
 4. **Explain** the finished run with `rcsr dev-report runs/<label>.dev.ndjson`:
    phase table, fit vs evaluation share, fallback causes, convergence, archive
    growth and a ranked bottleneck list. Use `--dev-log-level full` when the

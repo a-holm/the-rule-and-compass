@@ -1351,7 +1351,7 @@ device, falls back to the CPU and records the reason. `--gpu` asserts that a
 device must exist (exit 2 otherwise), `--no-gpu`/`--cpu` forces the CPU without probing the device (no CUDA call), and
 `RCSR_GPU=0` simulates a missing device. `--dispatch device` (needs `--gpu`) forces the device route past the cost model; refusals still win. `--calibration anchors|probe|<path>` selects the rates Auto dispatch prices with (default: `$XDG_CACHE_HOME/rcsr/calibration.json` if it exists, else the fixed corpus anchors); `rcsr calibrate` writes that file and a search run never does. Non-quiet runs print one resource line
 with the backend, device, available threads and training rows/columns, and
-`--json` records `backend`, `backend_reason`, `device` and `device_probed` (`false` under `--cpu`, which does not probe).
+`--json` records `backend`, `search_backend` (the backend that scored the generations over all chunks of a resume chain; a run check reads it), `process_backend`, `backend_reason`, `device` and `device_probed` (`false` under `--cpu`, which does not probe).
 `RCSR_FIT_RECORD=<empty dir>` records every device fit launch for `rcsr-gpu-bench --fit-replay` (see `docs/gpu-backend.md`, "Comparing toolkits and fit kernel variants").
 `RCSR_DEVICE_PTR_CHECK=0` turns off the per-launch pointer check (#744): by default every kernel launch refuses an argument that is host memory (see `docs/gpu-backend.md`, "Kernel arguments are device memory").
 
