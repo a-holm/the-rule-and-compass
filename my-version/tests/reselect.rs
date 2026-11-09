@@ -355,5 +355,6 @@ fn reselect_reads_the_final_archive_not_the_search_archive() {
     let front = rcsr::reselect::front_of(&cp).expect("front");
     assert_eq!(front.items.iter().map(|s| s.cost).collect::<Vec<_>>(), reported);
     cp.final_archive = None;
-    assert!(rcsr::reselect::front_of(&cp).unwrap_err().contains("run it to the end first"));
+    let refusal = rcsr::reselect::front_of(&cp).err().expect("a checkpoint without a final archive is refused");
+    assert!(refusal.contains("run it to the end first"), "{refusal}");
 }
