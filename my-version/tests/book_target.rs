@@ -381,3 +381,21 @@ fn book_target_fit_rows_subsample_is_finite_only() {
     );
     assert!(num(&nan, &["search_fitness", "rows"]) > num(&fit, &["search_fitness", "rows"]));
 }
+
+#[test]
+fn book_target_without_return_column_is_refused() {
+    let scratch = Scratch::new("book_target_no_return_column");
+    let data = write_csv(scratch.path());
+    let no_return = entry("y1", "r1", STEP).replace("\"return_column\":\"r1\"", "\"return_column\":null");
+    let text = format!(
+        "{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{},{}]}}",
+        no_return,
+        entry("y24", "r24", STEP * DAY as i64)
+    );
+    let spec = scratch.path().join("no_return.json");
+    std::fs::write(&spec, text).unwrap();
+    let spec = spec.to_string_lossy().into_owned();
+    let o = run(&data, &spec, "y24", &["--book-target", "y1"]);
+    usage_error(&o, "book target 'y1'");
+    assert!(stderr(&o).contains("return_column"), "{}", stderr(&o));
+}
