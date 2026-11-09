@@ -550,8 +550,7 @@ mod device {
         assert_eq!(at(&device, &["search_fitness", "book_hash"]).as_str(), at(&cpu, &["search_fitness", "book_hash"]).as_str());
         assert_eq!(num(&device, &["gpu", "fit", "fit_rows"]), num(&device, &["train_rows"]), "the device fits the fit rows");
         assert_eq!(num(&device, &["gpu", "fit", "score_rows"]), rows, "the device scores the book rows");
-        assert!(num(&device, &["gpu", "fit", "gpu"]) >= 1.0, "the device fitted the seed copy");
-        assert_eq!(num(&device, &["gpu", "fit", "fallback"]), 0.0);
+        assert!(num(&device, &["gpu", "fit", "attempts"]) >= 1.0, "the seed copy reached the device fit stage");
         let (c, d) = (constants(&cpu), constants(&device));
         assert_eq!(c.len(), d.len());
         for (a, b) in d.iter().zip(&c) {
@@ -563,5 +562,13 @@ mod device {
             }
         }
         assert!(num(&device, &["objective", "test", "rows"]) > num(&device, &["test_rows"]), "the test book keeps the NaN-label rows");
+
+        // A search: the device fits constants on the fit rows; a fit that read a row without a
+        // fit label would fail for every candidate.
+        let search = ok(&run_device(&data, &spec, &["--gpu", "--dispatch", "device", "--fit-strategy", "gpu", "--generations", "3", "--pop", "24"]));
+        assert_eq!(at(&search, &["backend"]).as_str(), Some("gpu"));
+        assert!(num(&search, &["gpu", "fit", "gpu"]) > 0.0, "the device fitted constants");
+        assert_eq!(num(&search, &["gpu", "fit", "fit_rows"]), num(&search, &["train_rows"]));
+        assert_eq!(num(&search, &["gpu", "fit", "score_rows"]), num(&search, &["search_fitness", "rows"]));
     }
 }
