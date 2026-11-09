@@ -105,6 +105,10 @@ pub struct ProtocolOptions {
     /// [`crate::trading::BandUnits::Sd`] each window resolves the half-width of
     /// every candidate from its finite training scores only.
     pub band_units: crate::trading::BandUnits,
+    /// #946: the band each candidate was priced with by the search that wrote
+    /// `--from-run` or `--front`, in candidate order. A window never resolves
+    /// another band from its rows.
+    pub run_bands: Option<Vec<crate::trading::BandSpec>>,
     /// `split.fit_label`: the label report facts of the target (see
     /// [`crate::labels::fit_label_json`]).
     pub fit_label: Option<String>,
@@ -141,6 +145,7 @@ impl Default for ProtocolOptions {
             locked_ranges: Vec::new(),
             locked_embargo: 0,
             band_units: crate::trading::BandUnits::Score,
+            run_bands: None,
             fit_label: None,
         }
     }
@@ -556,6 +561,8 @@ pub struct Report {
     pub band_width: f64,
     /// #925: how `band_width` is read.
     pub band_units: crate::trading::BandUnits,
+    /// #946: `run` when the band is the one a run priced, else `flag`.
+    pub band_source: &'static str,
     pub min_hold: usize,
     /// #306: `--gpu` was set for the band/DP scans.
     pub gpu: bool,
@@ -982,6 +989,12 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
     if spec.min_hold == 0 {
         return Err("--min-hold must be at least 1".to_string());
     }
+    if let Some(bands) = &opts.run_bands {
+        let n = spec.candidates.len().max(1);
+        if bands.len() != n {
+            return Err(format!("the run carries {} bands for {} candidates", bands.len(), n));
+        }
+    }
     if spec.policy == Policy::TopTercile {
         if let Some(msg) = top_tercile_refusal(spec, opts) {
             return Err(msg);
@@ -1376,7 +1389,7 @@ impl Accum {
                 select_candidate(&d, spec, trees, has_validation)?;
             // #925: each candidate's band, resolved on its own training scores.
             let bands: Vec<crate::trading::BandSpec> = (0..d.train_scores.len())
-                .map(|c| window_band(&d, c, spec.band_width, opts.band_units))
+                .map(|c| window_band(&d, c, spec.band_width, opts))
                 .collect();
             let band_width = bands[candidate].resolved;
             if let Some(fixed) = forced {
@@ -1754,6 +1767,7 @@ impl Accum {
             policy: spec.policy,
             band_width: spec.band_width,
             band_units: opts.band_units,
+            band_source: if opts.run_bands.is_some() { "run" } else { "flag" },
             min_hold: spec.min_hold,
             gpu: spec.gpu,
             validation_frac: spec.validation_frac,
@@ -1791,7 +1805,11 @@ impl Accum {
 /// #925: the band of candidate `c` in window `d`: `multiple` in score units, or
 /// `multiple` times the sd of the candidate's finite training scores (rows
 /// before the validation start, never validation or test rows).
-fn window_band(d: &WindowData, c: usize, multiple: f64, units: crate::trading::BandUnits) -> crate::trading::BandSpec {
+fn window_band(d: &WindowData, c: usize, multiple: f64, opts: &ProtocolOptions) -> crate::trading::BandSpec {
+    if let Some(bands) = &opts.run_bands {
+        return bands[c].clone();
+    }
+    let units = opts.band_units;
     if units == crate::trading::BandUnits::Score {
         return crate::trading::BandSpec::score(multiple);
     }
@@ -3245,7 +3263,7 @@ impl Report {
              \"cost\":{},\
              \"position_rule\":{},\
              \"policy\":{{\"name\":{},\"hindsight_bound\":{},\"band_width\":{},\
-             \"band_units\":{},\"min_hold\":{},\"short\":false,\"gpu\":{}}},\
+             \"band_units\":{},\"band_source\":{},\"min_hold\":{},\"short\":false,\"gpu\":{}}},\
              \"threshold\":{{\"quantile\":{},\"fixed\":{},\
              \"method\":\"exact order-preserving radix select + linear interpolation (numpy type 7) in f64\",\
              \"sources\":[\"train_type7\",\"validation_type7\",\"fixed\"],\
@@ -3293,6 +3311,7 @@ impl Report {
             self.policy == Policy::Dp,
             jnum(self.band_width),
             jstr(self.band_units.name()),
+            jstr(self.band_source),
             self.min_hold,
             self.gpu,
             jnum(self.threshold_quantile),

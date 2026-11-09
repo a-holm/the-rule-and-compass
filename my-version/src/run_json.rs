@@ -47,6 +47,9 @@ pub struct FrontMember {
     pub rank: usize,
     pub expression: String,
     pub source: ExpressionSource,
+    /// #946: `validation_book.band_resolved` and `band_sd`, written under sd units.
+    pub band_resolved: Option<f64>,
+    pub band_sd: Option<f64>,
 }
 
 /// #855: the refusal for a run.json written by an `--interim-chunk` run.
@@ -68,6 +71,10 @@ pub struct RunFile {
     pub per_side_bps: Option<f64>,
     /// `objective.spec.position`: the position map the search priced.
     pub position: crate::trading::PositionMap,
+    /// #946: the band the search priced (`objective.spec`); band 0 in score units without it.
+    pub band: crate::trading::BandSpec,
+    /// `objective.spec.min_holding`; 1 without it.
+    pub min_holding: usize,
     /// `split.train_time`: `[first, last]` raw time keys.
     pub train_time: Option<(f64, f64)>,
     /// `split.validation_time`: `[first, last]`, absent without a validation slice.
@@ -124,7 +131,11 @@ impl RunFile {
                 .enumerate()
                 .filter_map(|(k, m)| {
                     ExpressionSource::pick(m)
-                        .map(|(expression, source)| FrontMember { rank: k + 1, expression, source })
+                        .map(|(expression, source)| {
+                        let vb = m.get("validation_book");
+                        let at = |key: &str| vb.and_then(|b| b.get(key)).and_then(Json::as_f64);
+                        FrontMember { rank: k + 1, expression, source, band_resolved: at("band_resolved"), band_sd: at("band_sd") }
+                    })
                 })
                 .collect(),
             _ => return Err("no 'pareto' array (not a single-target run.json)".to_string()),
@@ -134,6 +145,7 @@ impl RunFile {
             .fold(ExpressionSource::Exact, |acc, m| acc.worst(m.source));
         let split = j.get("split");
         let objective_spec = j.get("objective").and_then(|o| o.get("spec"));
+        let (band, min_holding) = crate::run_book::band_of(objective_spec)?;
         let purge = |key: &str| split.and_then(|s| s.get(key)).and_then(Json::as_f64);
         Ok(RunFile {
             path: String::new(),
@@ -149,6 +161,8 @@ impl RunFile {
             threshold: objective_spec.and_then(|s| s.get("threshold")).and_then(Json::as_f64),
             per_side_bps: objective_spec.and_then(|s| s.get("per_side_bps")).and_then(Json::as_f64),
             position: position_of(objective_spec),
+            band,
+            min_holding,
             train_time: pair(split.and_then(|s| s.get("train_time"))),
             validation_time: pair(split.and_then(|s| s.get("validation_time"))),
             purge_seconds: purge("required_purge_seconds").or_else(|| purge("purge_seconds")),
@@ -170,6 +184,11 @@ impl RunFile {
 
     /// The book the run selected (#487): finalist, fixed threshold, cost and target spec.
     pub fn book(&self) -> Result<crate::run_book::RunBook, String> {
+        crate::run_book::RunBook::from_json(&self.doc)?.threshold_only()
+    }
+
+    /// #946: the book the run selected including its band and minimum hold.
+    pub fn band_book(&self) -> Result<crate::run_book::RunBook, String> {
         crate::run_book::RunBook::from_json(&self.doc)
     }
 

@@ -549,3 +549,193 @@ fn a_rounded_source_is_refused_by_the_sealed_read() {
     assert_eq!(code(&sealed_read), 3, "{}", stderr(&sealed_read));
     assert!(stderr(&sealed_read).contains("expression_exact"), "{}", stderr(&sealed_read));
 }
+
+const SCORE_BAND: [&str; 6] = ["--fitness", "pnl", "--band", "0.05", "--min-holding", "4"];
+const SD_BAND: [&str; 8] = ["--fitness", "pnl", "--band", "1.0", "--band-units", "sd", "--min-holding", "3"];
+
+/// `search` with the run.json kept under `name`.
+fn search_as(dir: &Path, data: &str, spec: &str, extra: &[&str], name: &str) -> String {
+    let made = search(dir, data, spec, extra);
+    let kept = dir.join(name);
+    std::fs::rename(made, &kept).unwrap();
+    kept.to_string_lossy().into_owned()
+}
+
+/// The window of the run's validation rows; it overlaps the run's own rows.
+fn validation_window() -> String {
+    let t = |k: i64| T0 + STEP * k;
+    format!("v,{},{},{},{}", t(0), t(215), t(217), t(310))
+}
+
+fn walk(dir: &Path, data: &str, extra: &[&str]) -> Json {
+    let out_path = dir.join("walk.json").to_string_lossy().into_owned();
+    let mut args = vec!["walkforward", "--data", data, "--time", "t", "--allow-in-sample-windows", "--out", &out_path];
+    args.extend_from_slice(extra);
+    let out = rcsr(&args);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    read_json(&out_path)
+}
+
+/// The report without its timing ledger, digits removed.
+fn digits_stripped(j: &Json) -> String {
+    let Json::Obj(members) = j else { panic!("report is not an object") };
+    let kept: Vec<_> = members.iter().filter(|(k, _)| k != "ledger").collect();
+    format!("{kept:?}").chars().filter(|c| !c.is_ascii_digit()).collect()
+}
+
+#[test]
+fn from_run_prices_the_band_book_of_the_search() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", |i| row(i).2);
+    let spec = write_spec(&dir, "s.json", "log", "20.0");
+    let w = validation_window();
+    for (name, extra) in [("score.json", SCORE_BAND.to_vec()), ("sd.json", SD_BAND.to_vec())] {
+        let run = search_as(&dir, &data, &spec, &extra, name);
+        let doc = read_json(&run);
+        let want = at(&doc, &["objective", "validation"]);
+        let s = at(&doc, &["objective", "spec"]);
+        assert!(num(s, &["band_resolved"]) > 0.0, "{name}: the band must be live");
+        assert!(num(want, &["trades"]) > 0.0, "{name}: the book must trade");
+        let wf = walk(&dir, &data, &["--from-run", &run, "--window", &w]);
+        assert_eq!(at(&wf, &["policy", "name"]).as_str(), Some("band"), "{name}");
+        assert_eq!(num(&wf, &["policy", "min_hold"]), num(s, &["min_holding"]), "{name}");
+        let m = at(first_window(&wf), &["metrics"]);
+        assert_eq!(num(m, &["trades"]), num(want, &["trades"]), "{name}: trades");
+        for (a, b) in [("exposure", "exposure"), ("total_cost", "total_cost")] {
+            assert!((num(m, &[a]) - num(want, &[b])).abs() <= 1e-12, "{name}: {a} {} vs {}", num(m, &[a]), num(want, &[b]));
+        }
+        let net = num(m, &["mean_return"]) * num(m, &["periods"]);
+        assert!((net - num(want, &["net_pnl"])).abs() <= 1e-12, "{name}: net {net} vs {}", num(want, &["net_pnl"]));
+        let band = at(first_window(&wf), &["band"]);
+        assert_eq!(num(band, &["band_width"]).to_bits(), num(s, &["band_resolved"]).to_bits(), "{name}: priced as recorded");
+    }
+}
+
+#[test]
+fn from_run_without_a_band_keeps_the_threshold_book() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", |i| row(i).2);
+    let spec = write_spec(&dir, "s.json", "log", "20.0");
+    let w = validation_window();
+    let plain = search_as(&dir, &data, &spec, &[], "plain.json");
+    let text = std::fs::read_to_string(&plain).unwrap();
+    let mut old = text.clone();
+    for key in ["band", "band_units", "band_sd", "band_resolved", "band_sd_rows", "band_sd_max_time", "band_sd_degenerate"] {
+        let needle = format!(",\"{key}\":");
+        while let Some(at) = old.find(&needle) {
+            let start = at + needle.len();
+            let end = start + old[start..].find(|c| c == ',' || c == '}').expect("end of value");
+            old.replace_range(at..end, "");
+        }
+    }
+    assert_ne!(old, text);
+    assert!(!old.contains("band_resolved"));
+    let old_path = dir.join("old.json").to_string_lossy().into_owned();
+    std::fs::write(&old_path, &old).unwrap();
+    let a = walk(&dir, &data, &["--from-run", &plain, "--window", &w]);
+    let b = walk(&dir, &data, &["--from-run", &old_path, "--window", &w]);
+    assert_eq!(at(&a, &["policy", "name"]).as_str(), Some("threshold"));
+    assert_eq!(num(&a, &["policy", "min_hold"]), 1.0);
+    assert_eq!(digits_stripped(&a), digits_stripped(&b));
+    assert_eq!(at(&a, &["windows"]), at(&b, &["windows"]));
+}
+
+#[test]
+fn from_run_refuses_a_conflicting_band_flag() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", |i| row(i).2);
+    let spec = write_spec(&dir, "s.json", "log", "20.0");
+    let w = validation_window();
+    let run = search_as(&dir, &data, &spec, &SCORE_BAND, "band.json");
+    let base = ["walkforward", "--data", &data, "--time", "t", "--from-run", &run, "--window", &w, "--allow-in-sample-windows", "--out", "/dev/null"];
+    let cases: [(&[&str], &str); 5] = [
+        (&["--policy", "threshold"], "band book"),
+        (&["--policy", "dp"], "band book"),
+        (&["--band", "0.1"], "band 0.05 score"),
+        (&["--band-units", "sd"], "band 0.05 score"),
+        (&["--min-hold", "2"], "minimum hold of 4"),
+    ];
+    for (flags, named) in cases {
+        let mut a = base.to_vec();
+        a.extend_from_slice(flags);
+        let out = rcsr(&a);
+        assert_eq!(code(&out), 2, "{flags:?}: {}", stderr(&out));
+        assert!(stderr(&out).contains(named), "{flags:?}: {}", stderr(&out));
+    }
+    let free = walk(&dir, &data, &["--from-run", &run, "--window", &w]);
+    let agree = walk(
+        &dir,
+        &data,
+        &["--from-run", &run, "--window", &w, "--policy", "band", "--band", "0.05", "--band-units", "score", "--min-hold", "4"],
+    );
+    assert_eq!(digits_stripped(&free), digits_stripped(&agree));
+    assert_eq!(at(&free, &["windows"]), at(&agree, &["windows"]));
+}
+
+#[test]
+fn front_candidates_take_their_own_band() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", |i| row(i).2);
+    let spec = write_spec(&dir, "s.json", "log", "20.0");
+    let run = search_as(&dir, &data, &spec, &SD_BAND, "sd.json");
+    let doc = read_json(&run);
+    let Json::Arr(front) = at(&doc, &["pareto"]) else { panic!("pareto") };
+    let resolved: Vec<f64> = front.iter().map(|m| num(m, &["validation_book", "band_resolved"])).collect();
+    assert!(resolved.len() >= 2, "the front needs two members: {resolved:?}");
+    assert!(resolved.windows(2).any(|p| p[0] != p[1]), "members share one band: {resolved:?}");
+    let t = |k: i64| T0 + STEP * k;
+    let windows = dir.join("front-windows.csv");
+    std::fs::write(
+        &windows,
+        format!("scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,f,{},{},{},{},{}\n", t(0), t(150), t(100), t(217), t(310)),
+    )
+    .unwrap();
+    let windows = windows.to_string_lossy().into_owned();
+    let wf = walk(&dir, &data, &["--front", &run, "--windows", &windows]);
+    let win = first_window(&wf);
+    let chosen = num(win, &["candidate"]) as usize;
+    let want = resolved[chosen];
+    assert_eq!(num(at(win, &["band"]), &["band_width"]).to_bits(), want.to_bits(), "selected candidate {chosen}");
+    assert_eq!(at(&wf, &["policy", "band_source"]).as_str(), Some("run"));
+
+    let expr = at(&front[chosen], &["expression_exact"]).as_str().unwrap().to_string();
+    let theta = format!("{}", num(&doc, &["objective", "spec", "threshold"]));
+    let want_band = format!("{want:?}");
+    let by_hand = walk(
+        &dir,
+        &data,
+        &[
+            "--target", "y", "--target-spec", &spec, "--expr", &expr, "--vars", "x1,x2", "--threshold-fixed", &theta,
+            "--policy", "band", "--band", &want_band, "--min-hold", "3", "--windows", &windows,
+        ],
+    );
+    let (a, b) = (at(win, &["metrics"]), at(first_window(&by_hand), &["metrics"]));
+    for k in ["trades", "exposure", "total_cost", "mean_return", "periods"] {
+        assert!((num(a, &[k]) - num(b, &[k])).abs() <= 1e-12, "{k}: front {} by hand {}", num(a, &[k]), num(b, &[k]));
+    }
+}
+
+#[test]
+fn from_run_records_the_band_source() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", |i| row(i).2);
+    let spec = write_spec(&dir, "s.json", "log", "20.0");
+    let w = validation_window();
+    let run = search_as(&dir, &data, &spec, &SD_BAND, "sd.json");
+    let doc = read_json(&run);
+    let s = at(&doc, &["objective", "spec"]);
+    let wf = walk(&dir, &data, &["--from-run", &run, "--window", &w]);
+    assert_eq!(at(&wf, &["policy", "band_source"]).as_str(), Some("run"));
+    assert_eq!(at(&wf, &["policy", "band_units"]).as_str(), Some("sd"));
+    let band = at(first_window(&wf), &["band"]);
+    assert_eq!(at(band, &["band_units"]).as_str(), Some("sd"));
+    for k in ["band", "band_sd", "band_resolved", "band_sd_max_time"] {
+        assert_eq!(num(band, &[k]).to_bits(), num(s, &[k]).to_bits(), "{k}");
+    }
+    let flag = walk(
+        &dir,
+        &data,
+        &["--target", "y", "--target-spec", &spec, "--expr", "x1", "--vars", "x1,x2", "--threshold-fixed", "0", "--policy", "band", "--band", "0.05", "--window", &w],
+    );
+    assert_eq!(at(&flag, &["policy", "band_source"]).as_str(), Some("flag"));
+}
