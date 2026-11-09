@@ -1877,6 +1877,8 @@ fn finish_report(
         "naive_reversal",
         "top_tercile_long",
         "feature_threshold",
+        "trend_ma",
+        "trend_donchian",
     ];
     let mut best_rule = String::new();
     let mut best_rule_mean = f64::NEG_INFINITY;
