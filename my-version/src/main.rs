@@ -846,10 +846,9 @@ SEARCH:
                              reports stop_reason time_budget with
                              converged_early false. The checkpoint is not
                              terminal: --resume runs more generations and may
-                             set a new --time-budget. The budget is saved with
-                             the checkpoint: a --resume without --time-budget
-                             runs with the saved one (not with none), and
-                             --time-budget replaces it for this process only.
+                             set a new --time-budget. A --resume takes
+                             the budget only from its own command line; without
+                             --time-budget it runs with none.
                              A resume prints the budget it uses
   --interim-chunk            for a chunked run (needs --save and --time-budget):
                              when the chunk stops on --time-budget, save the
@@ -4163,13 +4162,9 @@ fn main() {
         if generations_set {
             effective.generations = cfg.generations;
         }
-        // #256: the time budget limits one process, not the trajectory, so a
-        // resumed run takes the budget it is given (a stopped run is resumed
-        // exactly to get more time). Without `--time-budget` it keeps the saved
-        // one (#880).
-        if time_budget_set {
-            effective.time_budget = cfg.time_budget;
-        }
+        // #256, #966: the time budget limits one process, so a resumed run takes
+        // only the budget on its own command line (none without the flag).
+        effective.time_budget = cfg.time_budget;
         effective.gpu = requested_gpu;
         effective.simd = requested_simd;
         effective.dispatch = requested_dispatch;
@@ -6445,9 +6440,8 @@ fn main() {
         }
         if let Some(budget) = cfg.time_budget {
             eprintln!(
-                "# checkpoint: time budget {} s ({})",
-                budget,
-                if time_budget_set { "from --time-budget" } else { "saved with the checkpoint" }
+                "# checkpoint: time budget {} s (from --time-budget)",
+                budget
             );
         }
     }
