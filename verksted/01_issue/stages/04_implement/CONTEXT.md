@@ -29,7 +29,7 @@ Do NOT load: the full suite, other tickets' branches, unrelated cleanups.
 3. Build and test only through `verksted/_tools/rc-run.sh` (`build`, `test`; a CPU-only test omits `--cuda` and uses the slot). Run only targeted tests (`--test <file> <filter>`), never the full suite. Log to `$GATES/issue$N-green.log`; a rerun overwrites it.
 4. Wait with one background shell, or `verksted/_tools/wait-for.sh --log <log>`. Leave no background job after the report (rule 37).
 5. GPU: any `.cu` change, allocation-failure path or device test of changed code runs first with `verksted/_tools/sanitize.sh`. Search-level tests set `DispatchMode::Device`.
-6. The build log shows `warnings: 0` in `test-summary.sh` output. Run `--test test_attributes` once at the end.
+6. The build log shows `warnings: 0` in `test-summary.sh` output. Run `--test test_attributes` and `--test sanitizer_plan` once at the end.
 7. Keep hunks small and local in `src/search.rs`, `src/main.rs`, `src/schema.rs` and `tests/gpu_fit.rs`: other agents edit them in parallel.
 8. A new refusal or check on a shared path: grep `tests/` for every test of that path and run those files too (rule 36).
 9. A performance claim is measured with `verksted/_tools/ab-pair.sh` on two binaries pinned by `verksted/_tools/bin-pin.sh` (rule 38). The numbers go in the issue.

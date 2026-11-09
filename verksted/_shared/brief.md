@@ -12,7 +12,7 @@ Setup and scope
 
 Tests and builds (rules 12, 23, 34)
 - Run only the tests your change needs, by exact filter: prove red first, then green. Never the full suite and never the large-store or long benchmark runs; the orchestrator runs one gate on the integration branch (rule 24).
-- The integration branch has a zero-warning baseline for the CPU and CUDA builds, and `tests/test_attributes.rs` guards lost `#[test]` attributes. Add no warnings. Run `--test test_attributes` once at the end.
+- The integration branch has a zero-warning baseline for the CPU and CUDA builds, and `tests/test_attributes.rs` guards lost `#[test]` attributes. Add no warnings. Run `--test test_attributes` and `--test sanitizer_plan` once at the end.
 - Builds use the CPU only. Every cargo command goes through `rc-run.sh`, with `CARGO_BUILD_JOBS=2`, and logs to `$G/issue$N-<tag>.log`. Builds use the build slot (up to 3 machine-wide), test and run use the test lock (one at a time). Both wait while the `PAUSE` file exists, run at nice 19, SCHED_IDLE and ionice idle, and pin work to fewer CPUs while the desktop streams video. Do not work around any of that. The desktop has priority (rule 25).
   `verksted/_tools/rc-run.sh build $W $N build1 --cuda -- cargo test --release --features cuda --no-run --test FILE`
   `verksted/_tools/rc-run.sh test $W $N test1 --cuda -- cargo test --release --features cuda --test FILE FILTER`
