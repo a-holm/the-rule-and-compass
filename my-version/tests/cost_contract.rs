@@ -877,7 +877,8 @@ fn old_runs_keep_the_threshold_book_in_ladder_and_ablation() {
     std::fs::write(&old_path, without_band_keys(&std::fs::read_to_string(&plain).unwrap())).unwrap();
     let (a, b) = (ladder_sr(&dir, &data, &spec, &windows, &plain, "plain"), ladder_sr(&dir, &data, &spec, &windows, &old_path, "old"));
     assert!(at(&a, &["sr_run"]).get("policy").is_none());
-    assert_eq!(digits_stripped(at(&a, &["rungs"])), digits_stripped(at(&b, &["rungs"])));
+    let strip = |j: &Json| format!("{j:?}").chars().filter(|c| !c.is_ascii_digit()).collect::<String>();
+    assert_eq!(strip(at(&a, &["rungs"])), strip(at(&b, &["rungs"])));
     let (a, b) = (
         ablation_score(&dir, &data, &windows, "--from-run", &plain, "plain"),
         ablation_score(&dir, &data, &windows, "--from-run", &old_path, "old"),
