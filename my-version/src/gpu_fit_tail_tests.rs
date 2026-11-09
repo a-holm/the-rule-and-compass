@@ -1,0 +1,177 @@
+//! #936: statuses 4, 5 and 7 of the LM kernel go to the exact CPU fit.
+//!
+//! The fixture is 240 deterministic trees over `min`, `max`, `if` and
+//! `greater` on 8 columns and 112,500 rows. A tree with one of the three
+//! statuses ends at the CPU fit from its starting constants; every other tree
+//! keeps the device constants bit for bit. Device tests skip cleanly on a
+//! machine without CUDA.
+
+use super::*;
+use crate::data::Sample;
+use crate::expr::Node;
+use crate::fit::{self, FitPolish, FitStrategy};
+use crate::search::{self, Config};
+
+const ROWS: usize = 112_500;
+const VARS: usize = 8;
+const ITERS: usize = 8;
+const TREES: &str = include_str!("../tests/fixtures/fit_tail_trees.tsv");
+
+fn gauss(rng: &mut crate::rng::Mt) -> f64 {
+    let u = rng.next_f64().max(1e-12);
+    let v = rng.next_f64();
+    (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+}
+
+/// Eight standard-normal columns, rounded to 6 decimals as in a CSV, and a
+/// target that mixes three of them with noise.
+fn rows() -> (Vec<Vec<f64>>, Vec<f64>) {
+    let mut rng = crate::rng::Mt::new(936);
+    let mut x = Vec::with_capacity(ROWS);
+    let mut y = Vec::with_capacity(ROWS);
+    for _ in 0..ROWS {
+        let r: Vec<f64> = (0..VARS).map(|_| (gauss(&mut rng) * 1e6).round() / 1e6).collect();
+        y.push(r[0] + 0.5 * r[1] * r[2] + 0.3 * gauss(&mut rng));
+        x.push(r);
+    }
+    (x, y)
+}
+
+fn trees() -> Vec<Node> {
+    let vars: Vec<String> = (0..VARS).map(|i| format!("x{i}")).collect();
+    TREES
+        .lines()
+        .map(|l| {
+            let expr = l.split('\t').nth(2).expect("an expression column");
+            crate::parse::parse(expr, &vars).unwrap_or_else(|e| panic!("{expr}: {e:?}"))
+        })
+        .collect()
+}
+
+fn sse(tree: &Node, x: &[Vec<f64>], y: &[f64]) -> f64 {
+    let mut t = tree.clone();
+    fit::fit_weighted(&mut t, x, y, &[], 0)
+}
+
+macro_rules! need_device {
+    () => {
+        if !probe().available() {
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+            return;
+        }
+    };
+}
+
+/// The device fit of every fixture tree: the plan, the result and the tree
+/// after the device constants are applied.
+fn device_results(x: &[Vec<f64>], y: &[f64], trees: &[Node]) -> Vec<(i32, Node)> {
+    let n = x.len();
+    let mut cols64 = vec![0.0f64; n * VARS];
+    for (r, row) in x.iter().enumerate() {
+        for (k, &val) in row.iter().enumerate() {
+            cols64[k * n + r] = val;
+        }
+    }
+    let cols32: Vec<f32> = cols64.iter().map(|&a| a as f32).collect();
+    let y32: Vec<f32> = y.iter().map(|&a| a as f32).collect();
+    let mut ev = GpuEvaluator::new(&cols32, n, VARS, &y32).expect("device evaluator");
+    assert!(ev.set_fit_data(&cols64, y, &[]), "f64 fit rows uploaded");
+    ev.set_fit_polish(FitPolish::F64);
+    let plans: Vec<fit::GpuFitPlan> =
+        trees.iter().map(|t| fit::gpu_fit_plan(t).expect("a fit plan")).collect();
+    let refs: Vec<&fit::GpuFitPlan> = plans.iter().collect();
+    let (out, ms) = ev.fit_batch(&refs, ITERS, fit::DeviceLoss::Squared);
+    assert!(ms >= 0.0, "the launch was refused");
+    trees
+        .iter()
+        .zip(&plans)
+        .zip(out)
+        .map(|((t, plan), res)| {
+            let mut dev = t.clone();
+            if res.c.iter().all(|v| v.is_finite()) {
+                plan.apply(&mut dev, &res.c);
+            }
+            (res.status, dev)
+        })
+        .collect()
+}
+
+/// After routing, every tree with status 4, 5 or 7 equals the CPU fit and
+/// every other tree keeps its device constants.
+#[test]
+fn device_fit_tail_statuses_fall_back() {
+    need_device!();
+    let (x, y) = rows();
+    let trees = trees();
+    assert_eq!(trees.len(), 240);
+    let device = device_results(&x, &y, &trees);
+    let mut routed = std::collections::BTreeMap::<&str, usize>::new();
+    let mut seen = [0usize; 9];
+    let mut before = 1.0f64;
+    let mut after = 1.0f64;
+    let mut kept_worse: Vec<usize> = Vec::new();
+    for ((start, (status, dev)), k) in trees.iter().zip(&device).zip(0..) {
+        seen[*status as usize] += 1;
+        let mut cpu = start.clone();
+        let cpu_sse = fit::fit_weighted(&mut cpu, &x, &y, &[], ITERS);
+        match search::tail_status_cause(*status) {
+            Some(cause) => {
+                *routed.entry(cause.label()).or_default() += 1;
+                let device_sse = sse(dev, &x, &y);
+                if device_sse.is_finite() && cpu_sse > 0.0 {
+                    before = before.max(device_sse / cpu_sse);
+                }
+            }
+            None => {
+                let device_sse = sse(dev, &x, &y);
+                if cpu_sse > 0.0 && device_sse.is_finite() {
+                    after = after.max(device_sse / cpu_sse);
+                    if device_sse > cpu_sse * 1.001 {
+                        kept_worse.push(k);
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("tail: statuses {seen:?} routed {routed:?} device/cpu before routing {before:.6} kept after routing {after:.6} kept worse than 1.001 {kept_worse:?}");
+    let tails = seen[4] + seen[5] + seen[7];
+    assert!(seen[4] > 0 && seen[5] > 0 && seen[7] > 0, "the fixture lost a status: {seen:?}");
+    assert_eq!(routed.values().sum::<usize>(), tails);
+}
+
+/// A device-dispatched search over the hard operators counts the routed fits
+/// as labelled fallbacks and no longer keeps them as finite device answers.
+#[test]
+fn a_search_counts_the_routed_tail_fits_in_the_ledger() {
+    need_device!();
+    let (x, y) = rows();
+    let n = 20_000;
+    let train = Sample { x: x[..n].to_vec(), y: y[..n].to_vec(), w: Vec::new(), ys: Vec::new(), pairs: None };
+    let test = Sample { x: x[n..2 * n].to_vec(), y: y[n..2 * n].to_vec(), w: Vec::new(), ys: Vec::new(), pairs: None };
+    let cfg = Config {
+        generations: 6,
+        islands: 1,
+        pop: 200,
+        max_complexity: 14,
+        fit_iters: ITERS,
+        patience: 0,
+        seed: 11,
+        ops: crate::expr::Op::parse_list("add,sub,mul,div,min,max,if,greater"),
+        dispatch: crate::dispatch::DispatchMode::Device,
+        gpu: true,
+        fit_strategy: FitStrategy::Gpu,
+        ..Default::default()
+    };
+    let out = search::run(&cfg, &train, &test);
+    let g = out.gpu.as_ref().expect("a fit ledger");
+    assert_eq!(g.fit_attempts, g.fit_gpu + g.fit_fallback, "{g:?}");
+    for label in ["rank_deficient", "recovered", "start_unusable"] {
+        assert_eq!(g.fit_status_by_label.get(label).copied().unwrap_or(0), 0, "{label} kept: {g:?}");
+    }
+    let routed: usize = ["rank_deficient", "recovered_iterate", "non_finite_start"]
+        .iter()
+        .map(|c| g.fit_fallback_by_cause.get(*c).copied().unwrap_or(0))
+        .sum();
+    eprintln!("search: attempts {} gpu {} fallback {} routed {routed} causes {:?}", g.fit_attempts, g.fit_gpu, g.fit_fallback, g.fit_fallback_by_cause);
+    assert!(routed > 0, "no tail fit was routed: {:?}", g.fit_fallback_by_cause);
+}

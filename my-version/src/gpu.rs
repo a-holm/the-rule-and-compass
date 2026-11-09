@@ -11231,3 +11231,7 @@ mod hard_op_fit_tests;
 #[cfg(test)]
 #[path = "gpu_toolchain_tests.rs"]
 mod toolchain_tests;
+
+#[cfg(test)]
+#[path = "gpu_fit_tail_tests.rs"]
+mod fit_tail_tests;
