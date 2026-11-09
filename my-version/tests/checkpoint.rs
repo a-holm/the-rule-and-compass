@@ -1600,3 +1600,112 @@ fn interim_run_json_is_refused_by_the_ladder() {
     assert_eq!(out.status.code(), Some(2), "{err}");
     assert!(err.contains("--interim-chunk"), "{err}");
 }
+
+/// One chunk of the #923 chains: `--dev-log` replaces `--no-dev-log`, so each
+/// chunk leaves its own `run_end`. `chunk` 0 starts fresh, the others resume.
+fn cost_chunk(dir: &std::path::Path, csv: &str, chunk: usize, last: bool) -> Output {
+    let mut args = chunk_args(csv, &[]);
+    let at = args.iter().position(|a| a == "--no-dev-log").expect("dev log flag");
+    args[at] = "--dev-log".to_string();
+    args.insert(at + 1, format!("dev{chunk}.jsonl"));
+    if !last {
+        args.extend(["--time-budget", "0", "--interim-chunk"].map(String::from));
+    }
+    if chunk > 0 {
+        args.extend(["--resume", "ck.rcsr"].map(String::from));
+    }
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = rcsr_in(dir, &refs);
+    assert!(out.status.success(), "chunk {chunk} failed: {:?}", out);
+    out
+}
+
+fn json_file(path: std::path::PathBuf) -> rcsr::devlog::Json {
+    rcsr::devlog::Json::parse(std::fs::read_to_string(path).expect("json file").trim()).expect("valid json")
+}
+
+fn run_end_of(dir: &std::path::Path, chunk: usize) -> rcsr::devlog::Json {
+    let text = std::fs::read_to_string(dir.join(format!("dev{chunk}.jsonl"))).expect("dev log");
+    let line = text.lines().rev().find(|l| l.contains("\"event\":\"run_end\"")).expect("run_end line");
+    rcsr::devlog::Json::parse(line).expect("run_end json")
+}
+
+fn cost_scratch(tag: &str) -> (Scratch, std::path::PathBuf, String) {
+    let scratch = Scratch::new(tag);
+    let csv = scratch.join("d.csv");
+    std::fs::write(&csv, line_csv(60)).expect("csv");
+    let dir = scratch.join("run");
+    std::fs::create_dir(&dir).unwrap();
+    (scratch, dir, csv.to_str().expect("utf-8").to_string())
+}
+
+/// #923: `search.cumulative` adds the search seconds of every chunk, while
+/// `elapsed_seconds` stays the last process alone.
+#[test]
+fn chunked_run_reports_cumulative_search_seconds() {
+    let (_scratch, dir, csv) = cost_scratch("cumulative-cost");
+    for chunk in 0..3 {
+        cost_chunk(&dir, &csv, chunk, chunk == 2);
+    }
+    let run = json_file(dir.join("run.json"));
+    let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
+    assert!(matches!(cumulative.get("complete"), Some(rcsr::devlog::Json::Bool(true))), "{cumulative:?}");
+    assert_eq!(cumulative.get("chunks").and_then(|v| v.as_usize()), Some(3));
+    let total = cumulative.get("elapsed_seconds").and_then(|v| v.as_f64()).expect("elapsed_seconds");
+    let chunk_search = |k: usize| run_end_of(&dir, k).get("search").and_then(|v| v.as_f64()).expect("run_end search");
+    let sum: f64 = (0..3).map(chunk_search).sum();
+    assert!((total - sum).abs() <= 0.05 * sum, "cumulative {total} against run_end sum {sum}");
+    let elapsed = run.get("elapsed_seconds").and_then(|v| v.as_f64()).expect("elapsed_seconds");
+    let timing = run.get("timing").and_then(|t| t.get("search_seconds")).and_then(|v| v.as_f64()).expect("timing");
+    assert_eq!(elapsed, timing, "elapsed_seconds keeps its per-process meaning");
+    assert!(elapsed < total, "last process {elapsed} against all chunks {total}");
+    let last_end = run_end_of(&dir, 2);
+    let end_total = last_end.get("search_cumulative").and_then(|v| v.as_f64()).expect("run_end search_cumulative");
+    assert!((end_total - total).abs() <= 1e-9 * total.max(1.0), "{end_total} against {total}");
+    assert!(dir.join("ck.rcsr.cost").exists(), "the sidecar sits next to the checkpoint");
+}
+
+/// #923: a run without `--resume` is its own total.
+#[test]
+fn fresh_run_cumulative_equals_its_own_elapsed_seconds() {
+    let (_scratch, dir, csv) = cost_scratch("fresh-cost");
+    cost_chunk(&dir, &csv, 0, true);
+    let run = json_file(dir.join("run.json"));
+    let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
+    assert_eq!(cumulative.get("chunks").and_then(|v| v.as_usize()), Some(1));
+    assert_eq!(
+        cumulative.get("elapsed_seconds").and_then(|v| v.as_f64()),
+        run.get("elapsed_seconds").and_then(|v| v.as_f64())
+    );
+}
+
+/// #923: a checkpoint from before the sidecar existed resumes, and the report
+/// says the total is unknown.
+#[test]
+fn resume_without_sidecar_marks_cumulative_incomplete() {
+    let (_scratch, dir, csv) = cost_scratch("no-sidecar-cost");
+    cost_chunk(&dir, &csv, 0, false);
+    std::fs::remove_file(dir.join("ck.rcsr.cost")).expect("sidecar written by the first chunk");
+    cost_chunk(&dir, &csv, 1, true);
+    let run = json_file(dir.join("run.json"));
+    let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
+    assert!(matches!(cumulative.get("complete"), Some(rcsr::devlog::Json::Bool(false))), "{cumulative:?}");
+    assert!(cumulative.get("elapsed_seconds").is_none());
+    assert!(run_end_of(&dir, 1).get("search_cumulative").map_or(false, |v| v.as_f64().is_none()));
+}
+
+/// #923: a sidecar left by another generation (a crash between the two writes)
+/// is not used.
+#[test]
+fn resume_ignores_sidecar_from_other_generation() {
+    let (_scratch, dir, csv) = cost_scratch("other-generation-cost");
+    cost_chunk(&dir, &csv, 0, false);
+    let first = std::fs::read_to_string(dir.join("ck.rcsr.cost")).expect("sidecar");
+    cost_chunk(&dir, &csv, 1, false);
+    assert_ne!(std::fs::read_to_string(dir.join("ck.rcsr.cost")).unwrap(), first);
+    std::fs::write(dir.join("ck.rcsr.cost"), first).unwrap();
+    cost_chunk(&dir, &csv, 2, true);
+    let run = json_file(dir.join("run.json"));
+    let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
+    assert!(matches!(cumulative.get("complete"), Some(rcsr::devlog::Json::Bool(false))), "{cumulative:?}");
+}

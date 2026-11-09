@@ -1012,6 +1012,11 @@ CHECKPOINTS:
                              The target spec sha256 must match too (exit 2).
                              The saved backend (cpu/gpu) must also match; a
                              mismatch is refused unless overridden below
+                             (#923) Every save also writes <save>.cost; a
+                             resume restores it when its generation matches
+                             the checkpoint, and run.json search.cumulative
+                             then totals the search seconds over all chunks
+                             (elapsed_seconds stays the last process)
   --allow-backend-change     resume a checkpoint on a different backend
                              (cpu<->gpu) and say so on stderr and in the
                              run manifest
@@ -1441,6 +1446,24 @@ fn ledger_json(
     )
 }
 
+/// #923: `gpu.quality_per_gpu_hour_run`: decades per hour over the run wall, which
+/// is the wall of every chunk when `cumulative_wall_s` is known.
+fn quality_run_ratio(
+    ledger: &rcsr::gpu_stats::RunLedger,
+    best_error: f64,
+    baseline_error: f64,
+    cumulative_wall_s: Option<f64>,
+) -> rcsr::gpu_stats::Ratio {
+    match cumulative_wall_s {
+        Some(wall) => {
+            let mut l = rcsr::gpu_stats::RunLedger::new();
+            l.set_wall(wall);
+            l.quality_per_gpu_hour(best_error, baseline_error)
+        }
+        None => ledger.quality_per_gpu_hour(best_error, baseline_error),
+    }
+}
+
 /// #118: the GPU block shared by `--json` and the final NDJSON event. It keeps
 /// #131's per-generation opcode/fallback report and adds the measured full-path
 /// accounting. `sm_occupancy` is explicitly `null`: it needs `ncu`, and
@@ -1457,6 +1480,9 @@ fn gpu_json(
     // #256: `timing.total_seconds`, the one runtime of the process. The
     // `*_of_run` fractions divide by it.
     process_total_s: f64,
+    // #923: ledger wall of every chunk, when known; `quality_per_gpu_hour_run`
+    // divides by it instead of this process's wall.
+    cumulative_ledger_wall_s: Option<f64>,
 ) -> String {
     let Some(g) = g else {
         return "null".to_string();
@@ -1644,7 +1670,7 @@ fn gpu_json(
         ratio_json(Some(&run_duty)),
         quality,
         jnum(if metric_is_squared {
-            g.ledger.quality_per_gpu_hour(best_error, baseline_error).value
+            quality_run_ratio(&g.ledger, best_error, baseline_error, cumulative_ledger_wall_s).value
         } else {
             f64::NAN
         }),
@@ -2027,6 +2053,7 @@ impl DevSink {
         outcome: &rcsr::search::Outcome,
         wall_s: f64,
         search_s: f64,
+        search_cumulative_s: Option<f64>,
         json_path: Option<String>,
     ) {
         let best = outcome
@@ -2048,6 +2075,7 @@ impl DevSink {
             stop: outcome.stop_reason.to_string(),
             wall_s,
             search_s,
+            search_cumulative_s,
             pareto_size: outcome.archive.items.len(),
             best_error: best,
             archive_hash: outcome.archive.hash(),
@@ -6371,6 +6399,12 @@ fn main() {
     // run so repeated runs in one process (`--report benchmark`) stay readable.
     let fit_before = fit::fit_arm_counts_full();
     let mut last_saved: Option<(usize, String)> = None;
+    // #923: cost of the chunks before this process, from the checkpoint sidecar.
+    let cost_resumed = resume_path.is_some();
+    let cost_base = match (&resume_path, &resume_checkpoint) {
+        (Some(p), Some(cp)) => rcsr::resume_cost::load(p, cp.generations),
+        _ => None,
+    };
     let outcome_result = if let Some(path) = save_path.clone() {
         let resumed = resume_checkpoint.take();
         search::run_resumable_seeded(
@@ -6387,6 +6421,12 @@ fn main() {
                 }
                 let generation = cp.generations;
                 last_saved = Some((generation, path.clone()));
+                let so_far = rcsr::resume_cost::Cost::process(search_start.elapsed().as_secs_f64(), None, None);
+                if let Some(t) = rcsr::resume_cost::total(cost_resumed, cost_base.as_ref(), &so_far) {
+                    if let Err(e) = rcsr::resume_cost::write(&path, generation, &t) {
+                        eprintln!("warning: {}", e);
+                    }
+                }
                 // #211: the checkpoint file is saved; record its size and hash.
                 if let Some(sink) = &dev_sink {
                     sink.checkpoint(generation, &path);
@@ -6434,6 +6474,23 @@ fn main() {
             .record_outside(rcsr::gpu_stats::Stage::Features, prepared_s - table_loaded_s);
     }
     let search_seconds = search_start.elapsed().as_secs_f64();
+    let process_cost = rcsr::resume_cost::Cost::process(
+        search_seconds,
+        outcome.gpu.as_ref().map(|g| g.ledger.wall_s()),
+        outcome.gpu.as_ref().map(|g| g.accounting.wall_s + g.ledger.fit_kernel_s()),
+    );
+    let cumulative = rcsr::resume_cost::total(cost_resumed, cost_base.as_ref(), &process_cost);
+    if let (Some(t), Some((generation, path))) = (&cumulative, &last_saved) {
+        if *generation == outcome.generations {
+            if let Err(e) = rcsr::resume_cost::write(path, *generation, t) {
+                eprintln!("warning: {}", e);
+            }
+        }
+    }
+    let cumulative_json = cumulative
+        .as_ref()
+        .map_or_else(|| rcsr::resume_cost::INCOMPLETE_JSON.to_string(), |t| t.json());
+    let cumulative_ledger_wall_s = cumulative.as_ref().and_then(|t| t.ledger_wall_s);
     // #211: close the development log now that the search has returned: the
     // final archive, the stop reason, the wall and the process peak RSS. It is
     // written before diagnostics so a later failure still leaves a complete
@@ -6444,6 +6501,7 @@ fn main() {
             &outcome,
             run_start.elapsed().as_secs_f64(),
             search_seconds,
+            cumulative.as_ref().map(|t| t.search_s),
             json_out.clone(),
         );
     }
@@ -6507,11 +6565,12 @@ fn main() {
             cfg.fit_strategy.name(),
             false,
             timing.total,
+            cumulative_ledger_wall_s,
         );
         match format {
             Format::Json => {
                 let doc = format!(
-                    "{{\"tool\":\"rcsr\",\"version\":{},\"interim\":true,\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"threads\":{},\"seed\":{},\"stop_reason\":{},\"generations_run\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"checkpoint\":{}}}",
+                    "{{\"tool\":\"rcsr\",\"version\":{},\"interim\":true,\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"threads\":{},\"seed\":{},\"stop_reason\":{},\"generations_run\":{},\"elapsed_seconds\":{},\"search\":{{\"cumulative\":{}}},\"timing\":{},\"gpu\":{},\"checkpoint\":{}}}",
                     jstr(VERSION),
                     outcome.backend.name(),
                     backend_reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
@@ -6521,6 +6580,7 @@ fn main() {
                     jstr(outcome.stop_reason),
                     outcome.generations,
                     jnum(elapsed),
+                    cumulative_json,
                     timing.json(),
                     gpu,
                     checkpoint_json
@@ -8050,7 +8110,7 @@ fn main() {
                 outcome.generations,
                 outcome.candidates_evaluated,
                 format!(
-                    "{}{}",
+                    "{}{}{}",
                     if cfg.fit_irls_active() {
                         format!(",\"fit_irls\":{}", jstr(cfg.fit_irls.name()))
                     } else {
@@ -8060,7 +8120,8 @@ fn main() {
                         format!(",\"fixed_position_front_fallback\":{}", outcome.fixed_position_fallback)
                     } else {
                         String::new()
-                    }
+                    },
+                    format!(",\"cumulative\":{}", cumulative_json)
                 ),
                 outcome.converged_early,
                 jstr(outcome.stop_reason),
@@ -8075,6 +8136,7 @@ fn main() {
                     cfg.fit_strategy.name(),
                     cfg.metric == rcsr::metrics::Metric::Squared,
                     timing.total,
+                    cumulative_ledger_wall_s,
                 ),
                 outcome.dispatch.json(),
                 checkpoint_json,
@@ -8316,6 +8378,7 @@ fn main() {
                     cfg.fit_strategy.name(),
                     cfg.metric == rcsr::metrics::Metric::Squared,
                     timing.total,
+                    cumulative_ledger_wall_s,
                 ),
                 outcome.dispatch.json(),
                 outcome.archive.items.len(),
@@ -8725,6 +8788,7 @@ fn run_multi_output(
             &outcome,
             run_start.elapsed().as_secs_f64(),
             search_seconds,
+            None,
             json_out.clone(),
         );
     }
@@ -12586,7 +12650,7 @@ mod tests {
         g.ledger.record_fit(0.5, 0.75, 0.125);
         g.ledger.record_fit_polish_split(0.25);
         g.ledger.record_fit_gate(0.375);
-        let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true, 10.0);
+        let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true, 10.0, None);
         assert!(
             json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"admitted_wide\":0,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"refit_candidates\":0,\"refit_s\":0,\"rescore_s\":0,\"carried_kept\":0,\"seconds\":0.25,\"kernel_lm_s\":0.5,\"kernel_polish_s\":0.25,\"polish\":\"f32\",\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"gate_s\":0.375,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096,\"fit_rows\":0,\"score_rows\":0,\"fit_twin_bytes\":0,\"subsample_hash\":null"),
             "{}",
@@ -12618,7 +12682,7 @@ mod tests {
         l.record_interval(Stage::Fit, 1, 3.0, 5.0);
         let mut g = search::GpuRunStats::default();
         g.ledger = l;
-        let json = gpu_json(&Some(g), 0.1, 0.2, "gpu", true, 10.0);
+        let json = gpu_json(&Some(g), 0.1, 0.2, "gpu", true, 10.0, None);
         for key in [
             "\"ledger\":",
             "\"stages\":",
@@ -12698,12 +12762,27 @@ mod tests {
             "exact",
             true,
             38_114.998,
+            None,
         );
         assert!(!json.contains("3085.48"), "{}", json);
         assert!(json.contains("\"quality_per_gpu_hour\":4.8442"), "{}", json);
         // Batches per evaluator second, under its true name.
         assert!(json.contains("\"batches_per_s\":8.302"), "{}", json);
         assert!(!json.contains("\"generations_per_s\""), "{}", json);
+    }
+
+    /// #923: `quality_per_gpu_hour_run` divides by the wall of every chunk when
+    /// it is known, and by this process's ledger wall otherwise.
+    #[test]
+    fn quality_run_ratio_uses_cumulative_hours_when_known() {
+        let mut ledger = rcsr::gpu_stats::RunLedger::new();
+        ledger.set_wall(10.0);
+        let process = quality_run_ratio(&ledger, 0.1, 0.2, None);
+        let chunked = quality_run_ratio(&ledger, 0.1, 0.2, Some(40.0));
+        assert!((process.denominator * 3600.0 - 10.0).abs() < 1e-9, "{:?}", process);
+        assert!((chunked.denominator * 3600.0 - 40.0).abs() < 1e-9, "{:?}", chunked);
+        assert!(chunked.denominator >= 2.5 * process.denominator);
+        assert!((process.value / chunked.value - 4.0).abs() < 1e-9);
     }
 
     /// #256: the run-level device fractions, from the 10 h run's own numbers:
@@ -12719,7 +12798,7 @@ mod tests {
         let mut g = search::GpuRunStats::default();
         g.accounting.wall_s = 7.468;
         g.ledger = l;
-        let json = gpu_json(&Some(g), 0.1, 0.2, "gpu", true, 38_114.998);
+        let json = gpu_json(&Some(g), 0.1, 0.2, "gpu", true, 38_114.998, None);
         let key = "\"device_fraction_of_run\":{\"value\":";
         let at = json.find(key).expect("device_fraction_of_run") + key.len();
         let value: f64 = json[at..]
