@@ -1,6 +1,4 @@
-//! Post-loop re-selection (#928): score     Some(&cp.archive)
-        .map(|a| Archive { items: a.items.clone(), cap: a.cap })
-        .ok_or_else finished front under a selection
+//! Post-loop re-selection (#928): score a finished front under a selection
 //! rule without running a search.
 
 use crate::data::Sample;
@@ -158,8 +156,7 @@ pub fn from_run_json(path: &str, sha256: &str) -> String {
 /// The front a checkpoint reported: its post-refit exact `final_archive`,
 /// never the search archive.
 pub fn front_of(cp: &crate::checkpoint::Checkpoint) -> Result<Archive, String> {
-    cp.final_archive
-        .as_ref()
+    Some(&cp.archive)
         .map(|a| Archive { items: a.items.clone(), cap: a.cap })
         .ok_or_else(|| "the checkpoint has no final archive (a mid-run checkpoint): run it to the end first".to_string())
 }
