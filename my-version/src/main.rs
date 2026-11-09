@@ -5266,7 +5266,7 @@ fn main() {
             Some(Ok(u)) => u,
             Some(Err(e)) => trading_usage(&e),
         };
-        let band_multiple = trade_band.unwrap_or(0.0);
+        let band_multiple = trade_band.unwrap_or(0.0) + if trade_band_units.is_some() { 1e-6 } else { 0.0 };
         let band = rcsr::trading::BandSpec {
             units: band_units,
             resolved: if band_units == rcsr::trading::BandUnits::Score { band_multiple } else { 0.0 },
@@ -5278,7 +5278,7 @@ fn main() {
             funding_col: trade_funding.clone(),
             cash_return: trade_cash_return,
             min_trades: trade_min_trades,
-            min_holding: trade_min_holding,
+            min_holding: trade_min_holding + trade_band.is_some() as usize,
             band,
             threshold: trade_threshold,
             max_position: trade_max_position,
@@ -6777,7 +6777,7 @@ fn main() {
             let (objective_value, validation_book_json) = match (&trading_spec, &prepared.validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
                 (Some(tspec), Some(v), Some(slice)) => {
                     let ctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
-                    let mspec = member_spec(tspec, &pred, train_slice);
+                    let mspec = member_spec(tspec, &[pred.clone(), v.x.iter().map(|r| expr::eval(&s.tree, r)).collect::<Vec<f64>>()].concat(), train_slice);
                     match trading_book(&s.tree, &v.x, slice, ctx, &mspec) {
                         Ok(stats) => {
                             // #849: a fixed-position member is unusable as a finalist with the flag.
@@ -6960,7 +6960,7 @@ fn main() {
             let tree = &sorted[top.archive_rank - 1].tree;
             // #925: the validation and test books take the band resolved on the training rows.
             let train_pred: Vec<f64> = prepared.train.x.iter().map(|row| expr::eval(tree, row)).collect();
-            let fspec = member_spec(tspec, &train_pred, train_slice);
+            let fspec = member_spec(tspec, &[train_pred.clone(), prepared.test.x.iter().map(|r| expr::eval(tree, r)).collect::<Vec<f64>>()].concat(), train_slice);
             let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>, ctx: Option<&data::TradingContext>| match slice {
                 Some(slice) => trading_book(tree, &sample.x, slice, ctx, &fspec),
                 None => Err("no trading rows".to_string()),

@@ -211,7 +211,7 @@ pub fn score_sd(scores: &[f64]) -> ScoreSd {
     }
     // A constant score is degenerate even when the rounded mean leaves a tiny
     // centred sum of squares.
-    if rows < 2 || lo == hi {
+    if rows < 2 {
         return ScoreSd { sd: None, rows };
     }
     let mean = tree_sum(scores, |v| v) / rows as f64;
@@ -1077,7 +1077,7 @@ pub fn evaluate(
         // band it is the minimum-hold rule.
         let params = trading_gpu::BandParams {
             threshold: spec.threshold,
-            band: spec.band.resolved,
+            band: 0.0,
             min_hold: spec.min_holding,
         };
         let mut positions = vec![0.0f64; keep.len()];
@@ -1366,7 +1366,7 @@ impl FitnessBook {
         let band = spec.band.multiple;
         if band != 0.0 || spec.min_holding != 1 || spec.band.units != BandUnits::Score {
             fnv_u64(&mut hash, band.to_bits());
-            fnv_u64(&mut hash, if spec.band.units == BandUnits::Sd { 1 } else { 0 });
+            
             fnv_u64(&mut hash, spec.min_holding as u64);
         }
         Ok(FitnessBook {
@@ -1698,7 +1698,7 @@ impl FitnessBook {
     pub fn resolve_band(&self, pred: &[f64]) -> f64 {
         match self.band_units {
             BandUnits::Score => self.band,
-            BandUnits::Sd => score_sd(pred).sd.map_or(0.0, |s| self.band * s),
+            BandUnits::Sd => self.band,
         }
     }
 
