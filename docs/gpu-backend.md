@@ -1213,9 +1213,9 @@ explicit `gpu` is always honoured:
    so the setting changes the proposed constants and the kernel time only.
    Status `recovered_skipped` (8) is set only by the f64 assembly and cannot
    occur under `f32` or `off`. Status `unconverged` (9) is judged on a rejected
-   polish step in the polish arithmetic and cannot occur under `off`. The rank, order-statistic and maximum arms keep
-   their own kernels. A checkpoint stores a non-default value and a resume
-   refuses a different one.
+   polish step in the polish arithmetic and cannot occur under `off`. The rank,
+   order-statistic and maximum arms keep their own kernels. A checkpoint stores
+   a non-default value and a resume refuses a different one.
 
    Each block records `clock64()` cycle counts for the damped loop and for the
    polish (re-baseline and steps). The host apportions the measured kernel
@@ -1276,7 +1276,7 @@ of the screened errors, the row count and the fixed island/population order and
 repeated runs are reproducible. Admission never changes the evaluation count or
 the exact finalist refit.
 
-The kernel returns a status. Status `0` is the ordinary success. On the LM arms (squared, absolute, log_squashed, log-loss, hinge, slope) status `4` (`rank_deficient`: the undamped, Jacobi-scaled `ln det Ã` gate says a direction is unidentified), `5` (`recovered_iterate`: the last accepted finite iterate survived a failed trial) `7` (`non_finite_start`: the f32 start has no finite value while the f64 start does) and, on the squared arm, `9` (`unconverged`, #959: the polish rejected an undamped Gauss-Newton step whose model predicted a drop above `1e-3` of the loss, so the answer is not a stationary point) are CPU fallbacks. The exact CPU fit refits them from the starting constants, so the result equals the CPU fit; a device optimum above the CPU optimum is never kept. Statuses `6` `no_improvement` (the start was kept) and `8` `recovered_skipped` (a finite answer whose non-finite *gradient* rows were skipped, up to the built-in row guard) stay labels on a finite answer, never CPU fallbacks; the other arms (rank, order statistic, maximum) keep `4`–`9` as labels. Status `0` (a finite answer whose non-finite *gradient* rows
+The kernel returns a status. Status `0` is the ordinary success. On the LM arms (squared, absolute, log_squashed, log-loss, hinge, slope) status `4` (`rank_deficient`: the undamped, Jacobi-scaled `ln det Ã` gate says a direction is unidentified), `5` (`recovered_iterate`: the last accepted finite iterate survived a failed trial), `7` (`non_finite_start`: the f32 start has no finite value while the f64 start does) and, on the squared arm, `9` (`unconverged`, #959: the polish rejected an undamped Gauss-Newton step whose model predicted a drop above `1e-3` of the loss, so the answer is not a stationary point) are CPU fallbacks. The exact CPU fit refits them from the starting constants, so the result equals the CPU fit; a device optimum above the CPU optimum is never kept. Statuses `6` `no_improvement` (the start was kept) and `8` `recovered_skipped` (a finite answer whose non-finite *gradient* rows were skipped, up to the built-in row guard) stay labels on a finite answer, never CPU fallbacks; the other arms (rank, order statistic, maximum) keep `4`–`9` as labels. Status `0` (a finite answer whose non-finite *gradient* rows
 were skipped, up to the built-in row guard). Status `1` (no finite step), `2` (no finite iterate at all), the LM statuses above, unsupported
 trees and a failed launch are refit by the exact CPU arm, seeded with the GPU
 constants (the LM statuses above start from the starting constants). Every CPU fallback is labelled by cause: `unsupported_plan`
