@@ -27,13 +27,15 @@ echo "$*" >> "$RCSR_STUB_HOLDS"
 echo "$cmd" >> "$RCSR_STUB_CMDS"
 case "$cmd" in
   *rcsr-bench*) cat "$RCSR_STUB_BENCH"; exit 0 ;;
-  *"--features cuda"*)
+  *"--no-fail-fast"*)
+    rcf=$RCSR_STUB_CPU_RC
+    case "$cmd" in *"--features cuda"*) rcf=$RCSR_STUB_RC ;; esac
     start=$(sed -n "s/.*> '\([^']*\.start\)' &&.*/\1/p" <<< "$cmd")
     now=$(cat "$RCSR_STUB_NOW")
     [ -z "$start" ] || echo $((now + 7)) > "$start"
     echo $((now + 37)) > "$RCSR_STUB_NOW"
     tgt=${cmd##*--no-fail-fast }
-    line=$(grep -F -- "$tgt " "$RCSR_STUB_RC" | head -n 1)
+    line=$(grep -F -- "$tgt " "$rcf" | head -n 1)
     rc=$(echo "$line" | awk '{print $(NF - (/xid$/ ? 1 : 0))}')
     case "$line" in *xid) echo $(( $(cat "$RCSR_STUB_XID") + 1 )) > "$RCSR_STUB_XID" ;; esac
     case "$rc" in
@@ -49,7 +51,7 @@ cat > "$T/slot.sh" <<'STUB'
 #!/usr/bin/env bash
 shift 2
 echo "$1" >> "$RCSR_STUB_CMDS"
-cat "$RCSR_STUB_BUILD"
+case "$1" in *"--features cuda"*) cat "$RCSR_STUB_BUILD" ;; *) cat "$RCSR_STUB_CPU_BUILD" ;; esac
 STUB
 chmod +x "$T/lock.sh" "$T/slot.sh"
 art() { # kind name
@@ -84,7 +86,7 @@ run_gate() { # tag rc-file
   echo 1000 > "$T/now"
   : > "$T/cmds"
   : > "$T/holds"
-  RCSR_STUB_HOLDS=$T/holds RCSR_STUB_NOW=$T/now RCSR_NOW_CMD="cat $T/now" RCSR_STUB_BENCH=${RCSR_STUB_BENCH:-$T/bench-ok} RCSR_STUB_CMDS=$T/cmds RCSR_STUB_RC=$2 RCSR_STUB_XID=$T/xid RCSR_STUB_BUILD=$T/build.json \
+  RCSR_STUB_HOLDS=$T/holds RCSR_STUB_NOW=$T/now RCSR_NOW_CMD="cat $T/now" RCSR_STUB_BENCH=${RCSR_STUB_BENCH:-$T/bench-ok} RCSR_STUB_CMDS=$T/cmds RCSR_STUB_RC=$2 RCSR_STUB_CPU_RC=${RCSR_STUB_CPU_RC:-$2} RCSR_STUB_XID=$T/xid RCSR_STUB_BUILD=$T/build.json RCSR_STUB_CPU_BUILD=${RCSR_STUB_CPU_BUILD:-$T/build.json} \
     RCSR_MACHINE_DIR=$T RCSR_LOCK_SCRIPT=$T/lock.sh RCSR_SLOT_SCRIPT=$T/slot.sh RCSR_GATE_DIR=$T/gates RCSR_XID_CMD="cat $T/xid" \
     bash "$GATE" "$T/wt" "$1" > "$T/out-$1" 2>&1
 }
@@ -102,30 +104,42 @@ EOF
 run_gate ok "$T/rc-ok"
 check ok-exit "$?" 0
 check ok-holds "$(grep -c -- '--features cuda --no-fail-fast' "$T/cmds")" 6
-check ok-doc-hold "$(grep -c -- '--no-fail-fast --doc$' "$T/cmds")" 1
-check ok-build "$(grep -c -- '--no-run --message-format=json' "$T/cmds")" 1
+check ok-doc-hold "$(grep -- '--features cuda --no-fail-fast --doc$' "$T/cmds" | grep -c .)" 1
+check ok-build "$(grep -c -- "--no-run --message-format=json" "$T/cmds")" 2
 check ok-no-run-in-hold "$(grep -- '--no-fail-fast' "$T/cmds" | grep -c -- '--no-run')" 0
 check ok-summary "$(grep -c 'rc=0' "$T/gates/ok-cuda-summary.log")" 6
 check ok-line "$(grep -c '^cuda: targets=6 failed=0 timeouts=0$' "$T/out-ok")" 1
-check ok-cpu-step "$(grep -c 'cargo test --release --no-fail-fast$' "$T/cmds")" 1
+check ok-cpu-holds "$(grep -v -- "--features cuda" "$T/cmds" | grep -c -- "--no-fail-fast")" 6
+check ok-cpu-doc-hold "$(grep -v -- "--features cuda" "$T/cmds" | grep -c -- "--no-fail-fast --doc$")" 1
+check ok-cpu-builds-in-slot "$(grep -v -- "--features cuda" "$T/cmds" | grep -c -- "cargo test --release --no-run --message-format=json")" 1
+check ok-cpu-no-run-in-hold "$(grep -v -- "--features cuda" "$T/cmds" | grep -- "--no-fail-fast" | grep -c -- "--no-run")" 0
+check ok-cpu-summary "$(grep -c "rc=0" "$T/gates/ok-cpu-summary.log")" 6
+check ok-cpu-line "$(grep -c "^cpu: targets=6 failed=0 timeouts=0$" "$T/out-ok")" 1
+check ok-cpu-log-results "$(grep -c "^test result" "$T/gates/ok-cpu.log")" 6
+check ok-cpu-log-headers "$(grep -c "^=== " "$T/gates/ok-cpu.log")" 6
+check ok-cpu-counts "$(grep "^cpu: ok=" "$T/out-ok")" "cpu: ok=6 failed=0"
+check ok-cpu-summary-no-xid "$(grep -c " xid=" "$T/gates/ok-cpu-summary.log")" 0
+check ok-cpu-wait-run "$(grep -c " wait=7 run=30 " "$T/gates/ok-cpu-summary.log")" 6
+check ok-exit-line "$(grep -c "^exit cpu=0 cuda=0 bench=0$" "$T/out-ok")" 1
 check ok-bench-line "$(grep -c "^bench: recovered 27/27 (100.0%)" "$T/out-ok")" 1
 check ok-wait-run "$(grep -c " wait=7 run=30 " "$T/gates/ok-cuda-summary.log")" 6
 check ok-no-secs "$(grep -c " secs=" "$T/gates/ok-cuda-summary.log")" 0
 # every CPU, CUDA and bench hold runs through lock-run.sh on the lock path of the machine dir
-check ok-holds-reaped "$(grep -c "lock-run.sh $LOCKP bash -c" "$T/holds")" 8
-check ok-holds-total "$(wc -l < "$T/holds")" 8
+check ok-holds-reaped "$(grep -c "lock-run.sh $LOCKP bash -c" "$T/holds")" 13
+check ok-holds-total "$(wc -l < "$T/holds")" 13
 
 # Every CUDA hold stays under the cap.
 cap=$(bash -c ". '$HERE/../lib.sh'; echo \$LOCK_HOLD_MAX")
 over=0
 while IFS= read -r t; do
   [ "$t" -le "$cap" ] || over=$((over + 1))
-done < <(grep -- '--features cuda --no-fail-fast' "$T/cmds" | sed -n 's/.* timeout -k 30 \([0-9]*\) cargo.*/\1/p')
+done < <(grep -- "--no-fail-fast" "$T/cmds" | sed -n 's/.* timeout -k 30 \([0-9]*\) cargo.*/\1/p')
 check hold-under-cap "$over" 0
-check hold-timeouts-found "$(grep -- '--features cuda --no-fail-fast' "$T/cmds" | grep -c ' timeout -k 30 [0-9]* cargo')" 6
+check hold-timeouts-found "$(grep -- "--no-fail-fast" "$T/cmds" | grep -c " timeout -k 30 [0-9]* cargo")" 12
 # every timeout the gate starts has a kill-after: none is left bare
 check no-bare-timeout "$(grep -cE 'timeout [0-9]' "$T/cmds")" 0
-check cpu-kill-after "$(grep -c 'timeout -k 30 5400 cargo test --release --no-fail-fast$' "$T/cmds")" 1
+check cpu-kill-after "$(grep -v -- "--features cuda" "$T/cmds" | grep -c "timeout -k 30 580 cargo test --release --no-fail-fast ")" 6
+check cpu-build-kill-after "$(grep -c "timeout -k 30 5400 cargo test --release .*--no-run" "$T/cmds")" 2
 check cuda-require-device "$(grep -- "--features cuda --no-fail-fast" "$T/cmds" | grep -c "RCSR_REQUIRE_DEVICE=1")" 6
 check cpu-no-require-device "$(grep -c "RCSR_REQUIRE_DEVICE" <<< "$(grep -v -- "--features cuda" "$T/cmds")")" 0
 check bench-kill-after "$(grep -c 'timeout -k 30 5400 cargo build.*timeout -k 30 1800 ' "$T/cmds")" 1
@@ -177,15 +191,53 @@ cat > "$T/rc-xid" <<'EOF'
 --test gamma 0
 --doc 0
 EOF
-run_gate xid "$T/rc-xid"
+RCSR_STUB_CPU_RC=$T/rc-ok run_gate xid "$T/rc-xid"
 check xid-exit "$?" 70
 check xid-stopped "$(grep -c -- '--features cuda --no-fail-fast' "$T/cmds")" 1
 
-# A build that fails runs no CUDA hold.
+# A CPU target that times out: only that target ends with rc 124 and `| timeout`, later CPU targets and the CUDA suite still run.
+RCSR_STUB_CPU_RC=$T/rc-timeout run_gate cputimeout "$T/rc-ok"
+check cputimeout-exit-nonzero "$([ "$?" -ne 0 ] && echo yes || echo no)" yes
+check cputimeout-cpu-holds "$(grep -v -- "--features cuda" "$T/cmds" | grep -c -- "--no-fail-fast")" 6
+check cputimeout-labelled "$(grep -c '^lib rc=124 .*| timeout$' "$T/gates/cputimeout-cpu-summary.log")" 1
+check cputimeout-others-ok "$(grep -c 'rc=0' "$T/gates/cputimeout-cpu-summary.log")" 5
+check cputimeout-line "$(grep -c '^cpu: targets=6 failed=1 timeouts=1$' "$T/out-cputimeout")" 1
+check cputimeout-cuda-line "$(grep -c '^cuda: targets=6 failed=0 timeouts=0$' "$T/out-cputimeout")" 1
+check cputimeout-exit-line "$(grep -c '^exit cpu=1 cuda=0 bench=0$' "$T/out-cputimeout")" 1
+
+# A failing CPU target is reported FAILED, every other target still reports a result, and exit cpu=1.
+RCSR_STUB_CPU_RC=$T/rc-fail run_gate cpufail "$T/rc-ok"
+check cpufail-exit-nonzero "$([ "$?" -ne 0 ] && echo yes || echo no)" yes
+check cpufail-cpu-holds "$(grep -v -- "--features cuda" "$T/cmds" | grep -c -- "--no-fail-fast")" 6
+check cpufail-failed-result "$(grep -c '^test result: FAILED' "$T/gates/cpufail-cpu.log")" 1
+check cpufail-every-target-has-a-result "$(grep -c '^test result' "$T/gates/cpufail-cpu.log")" 6
+check cpufail-counts "$(grep '^cpu: ok=' "$T/out-cpufail")" "cpu: ok=5 failed=1"
+check cpufail-line "$(grep -c '^cpu: targets=6 failed=1 timeouts=0$' "$T/out-cpufail")" 1
+check cpufail-exit-line "$(grep -c '^exit cpu=1 cuda=0 bench=0$' "$T/out-cpufail")" 1
+
+# A CPU build that fails runs no CPU hold, is counted by the error line, and the CUDA suite still runs.
+echo 'error: cpu build failed' > "$T/cpu-build-bad.json"
+RCSR_STUB_CPU_BUILD=$T/cpu-build-bad.json run_gate cpubuild "$T/rc-ok"
+check cpubuild-exit-nonzero "$([ "$?" -ne 0 ] && echo yes || echo no)" yes
+check cpubuild-no-cpu-holds "$(grep -v -- "--features cuda" "$T/cmds" | grep -c -- "--no-fail-fast")" 0
+check cpubuild-counted "$(grep '^cpu: ok=' "$T/out-cpubuild")" "cpu: ok=0 failed=1"
+check cpubuild-exit-line "$(grep -c '^exit cpu=1 cuda=0 bench=0$' "$T/out-cpubuild")" 1
+check cpubuild-cuda-ran "$(grep -c -- '--features cuda --no-fail-fast' "$T/cmds")" 6
+
+# An empty CPU target list is a failure and runs no hold.
+echo 'warning: noise line' > "$T/cpu-build-empty.json"
+RCSR_STUB_CPU_BUILD=$T/cpu-build-empty.json run_gate cpuempty "$T/rc-ok"
+check cpuempty-exit-nonzero "$([ "$?" -ne 0 ] && echo yes || echo no)" yes
+check cpuempty-no-cpu-holds "$(grep -v -- "--features cuda" "$T/cmds" | grep -c -- "--no-fail-fast")" 0
+check cpuempty-message "$(grep -c '^cpu build lists no test target$' "$T/gates/cpuempty-cpu-summary.log")" 1
+check cpuempty-exit-line "$(grep -c '^exit cpu=1 cuda=0 bench=0$' "$T/out-cpuempty")" 1
+
+# A build that fails (CPU and CUDA) runs no hold.
 echo 'error: build failed' > "$T/build.json"
 run_gate nobuild "$T/rc-ok"
 check nobuild-exit-nonzero "$([ "$?" -ne 0 ] && echo yes || echo no)" yes
 check nobuild-no-holds "$(grep -c -- '--features cuda --no-fail-fast' "$T/cmds")" 0
+check nobuild-no-cpu-holds "$(grep -v -- "--features cuda" "$T/cmds" | grep -c -- "--no-fail-fast")" 0
 
 if [ "$fails" -ne 0 ]; then
   echo "test-gate: $fails failed"
