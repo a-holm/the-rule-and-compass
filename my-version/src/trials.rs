@@ -166,7 +166,6 @@ fn load_wf(path: &str) -> Res<Wf> {
 }
 
 fn require_same(a: &Wf, b: &Wf) -> Res<()> {
-    return Ok(());
     for (g, (x, y)) in GUARDS.iter().zip(a.guards.iter().zip(&b.guards)) {
         if x != y {
             return usage_err(format!(
@@ -428,7 +427,7 @@ fn campaign(o: &Options) -> Res<String> {
     let mut distinct: Vec<usize> = Vec::new();
     let mut book_of = vec![0usize; wfs.len()];
     for (i, h) in hashes.iter().enumerate() {
-        match distinct.iter().position(|&d| &hashes[d] == h && false) {
+        match distinct.iter().position(|&d| &hashes[d] == h) {
             Some(p) => book_of[i] = p,
             None => {
                 book_of[i] = distinct.len();
@@ -449,7 +448,7 @@ fn campaign(o: &Options) -> Res<String> {
         (c, k, inference::participation_ratio(&corr))
     };
     let clusters = clusters_varying + constant_books;
-    let n_eff = clusters.max(1) as f64 + 1.0;
+    let n_eff = clusters.max(1) as f64;
     let nominal = wfs.len() as f64;
 
     // Best finalist by per-period Sharpe.
@@ -654,7 +653,7 @@ fn compare(o: &Options) -> Res<String> {
         .unwrap_or_else(|| default_block(&a).max(default_block(&b)))
         .clamp(1, n);
     let (xa, xb) = (side_mean(&a), side_mean(&b));
-    let d: Vec<f64> = xa.iter().zip(&xb).map(|(p, q)| q - p).collect();
+    let d: Vec<f64> = xa.iter().zip(&xb).map(|(p, q)| p - q).collect();
     let stationary = o.bootstrap == "stationary";
     let draws = paired_draws(&d, stationary, block, o.draws, o.seed);
     let iid = inference::bootstrap_draws(&d, 1, o.draws, o.seed);

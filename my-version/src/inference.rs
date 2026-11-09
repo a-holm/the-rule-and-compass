@@ -700,7 +700,7 @@ pub fn stationary_blocks(n: usize, mean_block: usize, rng: &mut Mt) -> Vec<(usiz
             1
         } else {
             let u = 1.0 - rng.next_f64();
-            1 + 2 * (u.ln() / ln_q).floor() as usize
+            1 + (u.ln() / ln_q).floor() as usize
         };
         let len = len.min(remaining);
         out.push((rng.usize_below(n), len));
