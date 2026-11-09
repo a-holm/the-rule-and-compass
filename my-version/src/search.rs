@@ -1585,6 +1585,9 @@ impl GpuSearch {
                 // their historical trajectory (their proposal is the kernel's
                 // own optimum of the same objective).
                 let gated = crate::fit::device_fit_is_gated(cfg.metric);
+                // #936: statuses 4, 5 and 7 of the LM kernel go to the exact CPU
+                // fit from the starting constants.
+                let lm_arm = want.is_none() && !maximum_arm && rank_loss.is_none();
                 // #498: the exact judgements are independent, so they run on
                 // the worker pool; the verdicts are applied below in admission
                 // order.
@@ -1597,6 +1600,7 @@ impl GpuSearch {
                         .enumerate()
                         .filter(|(_, (_, res))| {
                             crate::fit::fit_status_usable(res.status)
+                                && !(lm_arm && tail_status_cause(res.status).is_some())
                                 && res.c.iter().all(|v| v.is_finite())
                         })
                         .map(|(k, ((i, j, _), res))| {
@@ -1614,7 +1618,8 @@ impl GpuSearch {
                 }
                 for (k, ((i, j, plan), res)) in jobs.iter().zip(out).enumerate() {
                     let finite = res.c.iter().all(|v| v.is_finite());
-                    let usable = crate::fit::fit_status_usable(res.status);
+                    let tail = if lm_arm { tail_status_cause(res.status) } else { None };
+                    let usable = crate::fit::fit_status_usable(res.status) && tail.is_none();
                     if gated && usable && finite {
                         let (verdict, judged) =
                             verdicts[k].take().expect("every gated job has a verdict");
@@ -1642,7 +1647,7 @@ impl GpuSearch {
                         crate::fit::note_gpu_fit(false);
                         continue;
                     }
-                    if finite {
+                    if finite && tail.is_none() {
                         plan.apply(&mut islands[*i][*j].tree, &res.c);
                     }
                     if usable && finite {
@@ -1656,7 +1661,9 @@ impl GpuSearch {
                         }
                         crate::fit::note_gpu_fit(true);
                     } else {
-                        let cause = if !finite {
+                        let cause = if let Some(cause) = tail {
+                            cause
+                        } else if !finite {
                             FitFallbackCause::NonFinite
                         } else if let Some(want) = want {
                             order_stat_status_fallback_cause(res.status, want)
@@ -3308,13 +3315,17 @@ fn fit_pipeline_queue(
 
 /// #578: write the device constants into `tree` whenever they are finite, as
 /// the synchronous `fit_pending` does, so a CPU fallback starts from them. The
-/// result is the fallback cause, or `None` for a usable device fit.
+/// result is the fallback cause, or `None` for a usable device fit. #936:
+/// statuses 4, 5 and 7 leave the tree at its starting constants.
 #[cfg(feature = "cuda")]
 fn apply_device_fit(
     plan: &crate::fit::GpuFitPlan,
     tree: &mut Node,
     res: &crate::gpu::GpuFitOutput,
 ) -> Option<FitFallbackCause> {
+    if let Some(cause) = tail_status_cause(res.status) {
+        return Some(cause);
+    }
     let finite = res.c.iter().all(|v| v.is_finite());
     if finite {
         plan.apply(tree, &res.c);
@@ -4761,11 +4772,20 @@ pub enum FitFallbackCause {
     /// failure, and it carries its own label so it is never confused with
     /// `ill_conditioned` or `non_finite`.
     DispatchCost,
+    /// #936: the LM kernel finished rank deficient (status 4); the exact CPU
+    /// fit decides, because the device optimum can sit above the CPU one.
+    RankDeficient,
+    /// #936: the LM kernel returned its last iterate after a failed step
+    /// (status 5); the exact CPU fit decides.
+    RecoveredIterate,
+    /// #936: the f32 start was non-finite while the f64 start is finite
+    /// (status 7); the exact CPU fit decides.
+    NonFiniteStart,
 }
 
 impl FitFallbackCause {
     /// Every cause, in reporting order.
-    pub const ALL: [FitFallbackCause; 17] = [
+    pub const ALL: [FitFallbackCause; 20] = [
         FitFallbackCause::UnsupportedPlan,
         FitFallbackCause::TooFewRows,
         FitFallbackCause::TooManyConstants,
@@ -4783,6 +4803,9 @@ impl FitFallbackCause {
         FitFallbackCause::Worse,
         FitFallbackCause::NotIdentifiable,
         FitFallbackCause::AffineClosedForm,
+        FitFallbackCause::RankDeficient,
+        FitFallbackCause::RecoveredIterate,
+        FitFallbackCause::NonFiniteStart,
     ];
 
     /// Stable JSON label.
@@ -4805,6 +4828,9 @@ impl FitFallbackCause {
             FitFallbackCause::Worse => "worse",
             FitFallbackCause::NotIdentifiable => "not_identifiable",
             FitFallbackCause::AffineClosedForm => "affine_closed_form",
+            FitFallbackCause::RankDeficient => "rank_deficient",
+            FitFallbackCause::RecoveredIterate => "recovered_iterate",
+            FitFallbackCause::NonFiniteStart => "non_finite_start",
         }
     }
 }
@@ -4894,6 +4920,19 @@ pub(crate) fn gpu_status_label(status: i32) -> Option<&'static str> {
         6 => Some("no_improvement"),
         7 => Some("start_unusable"),
         8 => Some("recovered_skipped"),
+        _ => None,
+    }
+}
+
+/// #936: the LM kernel statuses whose result is not kept: 4 (rank deficient),
+/// 5 (recovered last iterate) and 7 (non-finite f32 start). The exact CPU fit
+/// refits them from the starting constants.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn tail_status_cause(status: i32) -> Option<FitFallbackCause> {
+    match status {
+        4 => Some(FitFallbackCause::RankDeficient),
+        5 => Some(FitFallbackCause::RecoveredIterate),
+        7 => Some(FitFallbackCause::NonFiniteStart),
         _ => None,
     }
 }
@@ -9577,6 +9616,15 @@ mod tests {
             plan.apply(&mut want, &[2.0, 3.0]);
             assert_eq!(t, want, "status {status}");
             assert_ne!(t, tree);
+        }
+        for (status, cause) in [
+            (4, FitFallbackCause::RankDeficient),
+            (5, FitFallbackCause::RecoveredIterate),
+            (7, FitFallbackCause::NonFiniteStart),
+        ] {
+            let mut t = tree.clone();
+            assert_eq!(apply_device_fit(&plan, &mut t, &out(status, vec![2.0, 3.0])), Some(cause));
+            assert_eq!(t, tree, "status {status} keeps the start");
         }
         let mut t = tree.clone();
         assert_eq!(apply_device_fit(&plan, &mut t, &out(0, vec![2.0, 3.0])), None);
