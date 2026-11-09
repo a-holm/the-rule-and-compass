@@ -7409,4 +7409,143 @@ mod tests {
             }
         }
     }
+
+    fn rel(a: f64, b: f64) -> f64 {
+        (a - b).abs() / b.abs()
+    }
+
+    /// #990: the least-squares optimum of `Σ (a·uᵢ + b·vᵢ − yᵢ)²`.
+    fn two_column_ls(u: &[f64], v: &[f64], y: &[f64]) -> (f64, f64) {
+        let (mut uu, mut uv, mut vv, mut uy, mut vy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for i in 0..y.len() {
+            uu += u[i] * u[i];
+            uv += u[i] * v[i];
+            vv += v[i] * v[i];
+            uy += u[i] * y[i];
+            vy += v[i] * y[i];
+        }
+        let det = uu * vv - uv * uv;
+        ((uy * vv - vy * uv) / det, (vy * uu - uy * uv) / det)
+    }
+
+    /// #990: `(square(z)/c1)/c2` and its fold `square(z)/(c1·c2)` span the same
+    /// functions, so their fits must reach the same SSE. The divisor's Jacobian
+    /// column is `−z²/c²`, far below any absolute diagonal floor. The fitted
+    /// constants are clamped to `[-1e6, 1e6]`, so the optimum is placed inside.
+    #[test]
+    fn cpu_fit_is_invariant_to_constant_scale() {
+        let x: Vec<Vec<f64>> = (0..64).map(|i| vec![2.0 * (1.3 * i as f64 + 0.4).sin()]).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, r)| r[0] * r[0] / 8e5 * (1.0 + 0.05 * (2.1 * i as f64).cos()))
+            .collect();
+        let z2: Vec<f64> = x.iter().map(|r| r[0] * r[0]).collect();
+        let (inv, _) = two_column_ls(&z2, &vec![0.0; y.len()], &y[..]);
+        let sse_min: f64 = z2.iter().zip(&y).map(|(z, t)| (z * inv - t).powi(2)).sum();
+
+        let (c1, c2) = (530.8156455944121, 9927.813354065755);
+        let square = || node(Op::Square, vec![input(0)]);
+        let mut folded = node(Op::Div, vec![square(), constant(c1 * c2)]);
+        let mut unfolded = node(Op::Div, vec![node(Op::Div, vec![square(), constant(c1)]), constant(c2)]);
+        let s_folded = fit(&mut folded, &x, &y, 200);
+        let s_unfolded = fit(&mut unfolded, &x, &y, 200);
+        let divisor = constants_slots(&folded)[0];
+        let ctx = format!(
+            "folded {s_folded:e} unfolded {s_unfolded:e} optimum {sse_min:e}; divisor {divisor} (optimum {}), unfolded {:?}",
+            1.0 / inv,
+            constants_slots(&unfolded)
+        );
+        assert!(divisor != c1 * c2, "{ctx}");
+        assert!(rel(s_folded, s_unfolded) <= 1e-9, "{ctx}");
+        assert!(rel(s_folded, sse_min) <= 1e-9, "{ctx}");
+        assert!(rel(divisor, 1.0 / inv) <= 1e-6, "{ctx}");
+    }
+
+    /// #990: a constant whose Jacobian column is exactly zero (`c1·z` on rows
+    /// where `z = 0`) keeps its value and the other constant is still fitted.
+    #[test]
+    fn a_zero_jacobian_column_stays_frozen() {
+        let x: Vec<Vec<f64>> = (0..20).map(|i| vec![0.1 * i as f64, 0.0]).collect();
+        let y: Vec<f64> = x.iter().map(|r| (0.7 * r[0]).exp()).collect();
+        let mut tree = node(
+            Op::Add,
+            vec![
+                node(Op::Exp, vec![node(Op::Mul, vec![constant(0.2), input(0)])]),
+                node(Op::Mul, vec![constant(3.0), input(1)]),
+            ],
+        );
+        let s = fit(&mut tree, &x, &y, 50);
+        let c = constants_slots(&tree);
+        assert!(s.is_finite() && s < 1e-20, "sse {s:e}, constants {c:?}");
+        assert_eq!(c.iter().filter(|v| v.to_bits() == 3.0f64.to_bits()).count(), 1, "{c:?}");
+        assert_eq!(c.iter().filter(|v| (**v - 0.7).abs() < 1e-9).count(), 1, "{c:?}");
+    }
+
+    /// #990: `t·exp(c0 + c1·x)` with `t = 1e-9` scales every Jacobian column and
+    /// the target by `1e-9`. The fitted constants match the unit-scale fit.
+    #[test]
+    fn a_fit_with_every_jacobian_column_tiny_matches_the_unit_scale_fit() {
+        let fit_at = |t: f64| {
+            let x: Vec<Vec<f64>> = (0..30).map(|i| vec![-1.0 + 0.07 * i as f64, t]).collect();
+            let y: Vec<f64> = x
+                .iter()
+                .enumerate()
+                .map(|(i, r)| t * ((0.3 + 1.2 * r[0]).exp() + 0.01 * (1.7 * i as f64).sin()))
+                .collect();
+            let mut tree = node(
+                Op::Mul,
+                vec![
+                    input(1),
+                    node(
+                        Op::Exp,
+                        vec![node(Op::Add, vec![constant(0.0), node(Op::Mul, vec![constant(1.0), input(0)])])],
+                    ),
+                ],
+            );
+            let s = fit(&mut tree, &x, &y, 200);
+            (s, constants_slots(&tree))
+        };
+        let (s1, c1) = fit_at(1.0);
+        let (st, ct) = fit_at(1e-9);
+        let ctx = format!("unit {s1:e} {c1:?}, tiny {st:e} {ct:?}");
+        assert!((c1[0] - 0.3).abs() < 0.05 && (c1[1] - 1.2).abs() < 0.05, "{ctx}");
+        for k in 0..2 {
+            assert!((c1[k] - ct[k]).abs() <= 1e-9, "{ctx}");
+        }
+        assert!(rel(st / 1e-18, s1) <= 1e-9, "{ctx}");
+    }
+
+    /// #990: `c0·h + square(z)/c1` with `h ~ 1e3` and `c1 ~ 7e5`: the columns
+    /// are about `1e3` and `1e-12`. Both constants reach the least-squares
+    /// optimum, which is linear in `(c0, 1/c1)`.
+    #[test]
+    fn a_fit_with_one_huge_and_one_tiny_jacobian_column_reaches_the_optimum() {
+        let x: Vec<Vec<f64>> = (0..40)
+            .map(|i| vec![1e3 * (1.0 + 0.5 * (0.9 * i as f64).sin()), 1.5 * (0.6 * i as f64 + 0.2).cos()])
+            .collect();
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, r)| 1.5e-9 * r[0] + r[1] * r[1] / 7e5 + 2e-8 * (2.3 * i as f64).sin())
+            .collect();
+        let h: Vec<f64> = x.iter().map(|r| r[0]).collect();
+        let z2: Vec<f64> = x.iter().map(|r| r[1] * r[1]).collect();
+        let (a, inv) = two_column_ls(&h, &z2, &y);
+        let sse_min: f64 = (0..y.len()).map(|i| (a * h[i] + inv * z2[i] - y[i]).powi(2)).sum();
+
+        let mut tree = node(
+            Op::Add,
+            vec![
+                node(Op::Mul, vec![constant(1e-9), input(0)]),
+                node(Op::Div, vec![node(Op::Square, vec![input(1)]), constant(9e5)]),
+            ],
+        );
+        let s = fit(&mut tree, &x, &y, 200);
+        let mut c = constants_slots(&tree);
+        c.sort_by(|p, q| p.abs().total_cmp(&q.abs()));
+        let ctx = format!("sse {s:e} optimum {sse_min:e}; constants {c:?}, optimum [{a}, {}]", 1.0 / inv);
+        assert!(rel(s, sse_min) <= 1e-9, "{ctx}");
+        assert!(rel(c[0], a) <= 1e-6 && rel(c[1], 1.0 / inv) <= 1e-6, "{ctx}");
+    }
 }
