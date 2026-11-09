@@ -332,3 +332,45 @@ fn status_zero_device_fit_matches_cpu_on_pinned_trees() {
     }
     assert!(worst <= 1.001, "kept/cpu SSE ratio {worst:.6} above 1.001");
 }
+
+/// #968: a routed tail fit keeps the lower SSE of the device and the CPU
+/// answer. Tree 22 (status 9) keeps the device answer.
+#[test]
+fn routed_tail_fits_keep_the_better_answer() {
+    need_device!();
+    let (x, y) = rows();
+    let trees = trees();
+    let device = device_results(&x, &y, &trees);
+    let sample = Sample { x: x.clone(), y: y.clone(), w: Vec::new(), ys: Vec::new(), pairs: None };
+    let mut worst = 0.0f64;
+    let mut device_kept = 0usize;
+    let mut routed = 0usize;
+    let mut tree22 = f64::NAN;
+    for (k, (start, (status, dev))) in trees.iter().zip(&device).enumerate() {
+        if search::tail_status_cause(*status).is_none() {
+            continue;
+        }
+        routed += 1;
+        let mut cpu = start.clone();
+        let cpu_sse = fit::fit_weighted(&mut cpu, &x, &y, &[], ITERS);
+        let device_sse = sse(dev, &x, &y);
+        let kept = search::keep_better_tail_fit(start, dev.clone(), &sample, ITERS, crate::metrics::Metric::Squared);
+        let again = search::keep_better_tail_fit(start, dev.clone(), &sample, ITERS, crate::metrics::Metric::Squared);
+        let bits = |t: &Node| fit::constants_slots(t).iter().map(|c| c.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&kept), bits(&again), "tree {k}: two runs differ");
+        let kept_sse = sse(&kept, &x, &y);
+        let best = if device_sse.is_finite() { cpu_sse.min(device_sse) } else { cpu_sse };
+        worst = worst.max(kept_sse / best - 1.0);
+        if bits(&kept) == bits(dev) && bits(&kept) != bits(&cpu) {
+            device_kept += 1;
+        }
+        if k == 22 {
+            tree22 = kept_sse / cpu_sse;
+            eprintln!("tree 22: status {status} device/cpu {:.6} kept/cpu {tree22:.6}", device_sse / cpu_sse);
+        }
+    }
+    eprintln!("keep-better: routed {routed} device kept {device_kept} worst kept/best - 1 {worst:.3e}");
+    assert!(routed > 0);
+    assert!(worst <= 1e-12, "a kept answer is above min(device, CPU) by {worst:e}");
+    assert!(tree22 <= 0.9367, "tree 22 kept/cpu SSE {tree22:.6}");
+}
