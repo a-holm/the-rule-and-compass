@@ -726,6 +726,8 @@ With `--fitness pnl --pnl-blocks K` (2 to 8) the search itself penalises a formu
 5. The finalist is the eligible member of lowest complexity whose pooled alpha is at least `best - --select-se x SE(best)` (default Z = 1). Ties go to fewer validation trades, then to the lower archive rank.
 6. No eligible member gives verdict `no_signal`; the finalist is then the `validation_objective` choice.
 
+With `--select-blocks 1 --select-se 0` the rule is `validation_objective` itself: the finalist is the member of best validation objective, with the same tie rule.
+
 The rule reads training and validation rows only. Changing the test block changes the reported test book and nothing in `objective.selection_rule` or the finalist. `--json` records `objective.selection_rule`: `rule`, `blocks`, `se_z`, `block_len`, `verdict`, `members` (`archive_rank`, `complexity`, `trades`, `block_alpha`, `pooled_alpha`, `se`, `eligible`) and `chosen_rank`.
 
 The rule is a post-loop option, like `--prune`. It is not saved search state and not part of `config_hash`: `--resume` accepts another `--select-rule`, but still refuses another `--pop`.

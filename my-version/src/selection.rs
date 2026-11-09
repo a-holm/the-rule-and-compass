@@ -901,7 +901,18 @@ pub fn select_robust(
         };
         members.push(member);
     }
-    let chosen = choose_robust(&members, params.se_z);
+    let chosen = if params.blocks == 1 && params.se_z == 0.0 {
+        // One block and no tolerance is `validation_objective` itself: the same
+        // key, the same tie rule (archive order).
+        metas
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.usable && m.objective.is_finite())
+            .min_by(|(i, a), (j, b)| a.objective.total_cmp(&b.objective).then(i.cmp(j)))
+            .map(|(i, _)| i)
+    } else {
+        choose_robust(&members, params.se_z)
+    };
     Ok(RobustSelection { params, members, chosen })
 }
 

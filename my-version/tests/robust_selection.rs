@@ -86,19 +86,6 @@ fn robust_selection_removes_beta() {
 }
 
 #[test]
-fn one_block_without_se_takes_the_best_pooled_alpha() {
-    let p = planted();
-    let sel = select(&p, params(1, 0.0));
-    let best = sel
-        .members
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.pooled_alpha.total_cmp(&b.1.pooled_alpha))
-        .map(|(i, _)| i);
-    assert_eq!(sel.chosen, best);
-}
-
-#[test]
 fn no_eligible_member_is_no_signal() {
     let p = Planted { preds: vec![vec![-1.0; PERIODS], vec![1.0; PERIODS]], metas: planted().metas[..2].to_vec() };
     let sel = select(&p, params(4, 1.0));
