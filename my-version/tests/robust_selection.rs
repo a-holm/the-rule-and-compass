@@ -194,9 +194,9 @@ fn one_block_without_se_ranks_by_the_validation_objective() {
     let by_alpha = (0..4).max_by(|&a, &b| alpha.members[a].pooled_alpha.total_cmp(&alpha.members[b].pooled_alpha)).unwrap();
     let worst_alpha = (0..4).min_by(|&a, &b| alpha.members[a].pooled_alpha.total_cmp(&alpha.members[b].pooled_alpha)).unwrap();
     assert_ne!(by_alpha, worst_alpha);
-    // The objective orders the members the other way round (lower is better).
+    // Lower objective is better, so the worst-alpha member has the best objective.
     for (i, m) in p.metas.iter_mut().enumerate() {
-        m.objective = 10.0 - alpha.members[i].pooled_alpha;
+        m.objective = alpha.members[i].pooled_alpha;
     }
     let sel = select(&p, params(1, 0.0));
     assert_eq!(sel.chosen, Some(worst_alpha), "K=1, Z=0 takes the validation_objective choice, not the best alpha");
