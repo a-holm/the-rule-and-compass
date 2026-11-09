@@ -1737,6 +1737,7 @@ fn usage() -> &'static str {
   score     (--run <run.json> | --from-run <run.json>) --data <csv|rcsb> --target <col> --time <col> --windows <file> --out <file>\n\
             [--lockbox START,END|none]  a fold ending after START minus --purge-seconds (same resolution) is refused (exit 3)\n\
             [--lockbox-embargo S]  widen the lookback embargo after the range end (prepare writes it as its own segment; score refuses a fold reaching it)\n\
+            [--retired retired.json]  a record from rcsr protocol retire drops the protocol default from the guard of --lockbox (ledger re-hashed, mismatch exit 3; overlap exit 2)\n\
             [--allow-in-sample]  a fold whose test starts before the run's last seen row + purge is refused (exit 3); with the flag it is labelled oof:false and left out of every pooled series\n\
             [--group <col>] [--return-col <col>] [--scheme expanding] [--thresholds 0.6,0.7,0.8]\n\
             [--headline-threshold 0.7] [--cost-bps 12 | --cost-override <bp>] [--purge-seconds 219600] [--target-spec <file>]\n\
@@ -1892,7 +1893,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 data::read_table(data).map_err(|e| (3, e))?
             };
             let seed: u32 = fl.opt("--seed").map_or(Ok(0), |s| s.parse().map_err(|_| (2, "--seed: invalid number".to_string())))?;
-            let resolved = crate::lockbox::resolve_with(fl.opt("--lockbox"), fl.opt("--lockbox-embargo"), data).map_err(|e| (e.exit, e.message))?;
+            let resolved = crate::lockbox::resolve_retired(fl.opt("--lockbox"), fl.opt("--lockbox-embargo"), data, fl.opt("--retired")).map_err(|e| (e.exit, e.message))?;
             let (purge, purge_source) = match (fl.opt("--purge-seconds"), fl.opt("--target-spec")) {
                 (Some(c), _) => {
                     let p: f64 = c.parse().map_err(|_| (2, "--purge-seconds: invalid number".to_string()))?;
@@ -1934,8 +1935,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                     let seg = format!(",\"purge_seconds\":{},\"purge_source\":\"{}\",\"segments\":[{}]", purge, purge_source, list.join(","));
                     let embargo = crate::lockbox::embargo_json(resolved.embargo.seconds, "(input)", crate::enrich::EMBARGO_RULE, 0);
                     let extra = format!(
-                        "{}{}{}",
+                        "{}{}{}{}",
                         crate::lockbox::also_json(resolved.sidecar_also().as_ref(), "rcsr ablation prepare"),
+                        resolved.retired_member(),
                         crate::lockbox::embargo_member(Some(&embargo)),
                         seg
                     );
@@ -2046,7 +2048,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 .oof_flags(&labelled, fl.has("--allow-in-sample"))
                 .map_err(|e| (3, format!("{}: {}", run_path, e)))?;
             let panel = ladder::load_panel(&inp, &opts).map_err(|e| (3, e))?;
-            let resolved = crate::lockbox::resolve_with(fl.opt("--lockbox"), fl.opt("--lockbox-embargo"), fl.need("--data")?).map_err(|e| (e.exit, e.message))?;
+            let resolved = crate::lockbox::resolve_retired(fl.opt("--lockbox"), fl.opt("--lockbox-embargo"), fl.need("--data")?, fl.opt("--retired")).map_err(|e| (e.exit, e.message))?;
             let mut purge_source = if fl.opt("--purge-seconds").is_some() { "flag" } else { "protocol_default" };
             if let Some(s) = &opts.spec {
                 if s.required_purge_seconds() > opts.purge_seconds {

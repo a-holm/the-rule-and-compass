@@ -700,6 +700,7 @@ struct RawOptions {
     allow_lockbox: bool,
     lockbox: Option<String>,
     lockbox_embargo: Option<String>,
+    retired: Option<String>,
     validation_frac: f64,
     date_only: DateOnlyPolicy,
     time_unit: Option<TimeUnit>,
@@ -746,6 +747,7 @@ impl Default for RawOptions {
             allow_lockbox: false,
             lockbox: None,
             lockbox_embargo: None,
+            retired: None,
             validation_frac: 0.0,
             date_only: DateOnlyPolicy::Error,
             time_unit: None,
@@ -887,6 +889,7 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
             "--allow-lockbox" => raw.allow_lockbox = true,
             "--lockbox" => raw.lockbox = Some(take(&mut i)?),
             "--lockbox-embargo" => raw.lockbox_embargo = Some(take(&mut i)?),
+            "--retired" => raw.retired = Some(take(&mut i)?),
             "--center" => raw.center = Center::parse(&take(&mut i)?)?,
             "--scale" => raw.scale = Scale::parse(&take(&mut i)?)?,
             "--filter" => raw.filter = Some(take(&mut i)?),
@@ -1328,7 +1331,7 @@ impl RunPlan {
             }
         }
 
-        let resolved_lockbox = crate::lockbox::resolve_with(raw.lockbox.as_deref(), raw.lockbox_embargo.as_deref(), &data_path).map_err(|e| e.message)?;
+        let resolved_lockbox = crate::lockbox::resolve_retired(raw.lockbox.as_deref(), raw.lockbox_embargo.as_deref(), &data_path, raw.retired.as_deref()).map_err(|e| e.message)?;
         let spec = data::SplitSpec {
             mode,
             time_col,

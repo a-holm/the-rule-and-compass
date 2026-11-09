@@ -102,5 +102,6 @@ pub mod walkforward;
 pub mod wf_protocol; // #264: economics, block inference and nulls for the walk-forward report
 pub mod wf_batch; // #309: batch walk-forward P&L over (candidate, window)
 pub mod protocol; // #264: windows table, candidate ledger, sealed list, one-read lockbox
+pub mod retire; // #924: retire a locked range after its one sealed read
 pub mod window_stats;
 pub mod zip; // #123: minimal stored/deflate ZIP reader

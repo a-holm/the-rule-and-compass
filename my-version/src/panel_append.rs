@@ -28,6 +28,8 @@ pub struct AppendOptions {
     pub scratch: Option<String>,
     /// `--locked-test START,END|none`; the output inherits the declaration of `target`.
     pub locked_test: crate::lockbox::Keep,
+    /// `--retired RECORD`: a verified retirement the output declares.
+    pub retired: Option<String>,
 }
 
 #[derive(Debug)]
@@ -176,6 +178,7 @@ fn bits_equal(a: f64, b: f64) -> bool {
 pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
     let declared = crate::lockbox::output_declaration(&opts.out, Some(&opts.target), opts.locked_test).map_err(|e| e.message)?;
     let also = crate::lockbox::inherited_also(&opts.target, declared.as_ref())?;
+    let retired = crate::retire::writer_retirement(opts.retired.as_deref(), declared.as_ref(), &[&opts.target, &opts.family]).map_err(|e| e.message)?;
     // The target's declaration wins and is kept. A family store with no declaration is accepted.
     if let Some(s) = crate::lockbox::stored_all(&opts.family).map_err(|e| e.message)? {
         if declared != Some(s.range) || also != s.also {
@@ -284,7 +287,7 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
             .flatten()
             .map(|(_, s)| s)
             .max();
-        let schema = registry::write_schema_embargo(&opts.out, &opts.panel_version, declared.as_ref(), also.as_ref(), floor)?;
+        let schema = registry::write_schema_retired(&opts.out, &opts.panel_version, declared.as_ref(), also.as_ref(), floor, retired.as_ref())?;
         crate::lockbox::finish_output(&opts.out, declared.as_ref(), &["schema.json"]).map_err(|e| e.message)?;
         Ok(schema)
     };
@@ -305,7 +308,7 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
 
 fn usage_text() -> &'static str {
     "rcsr panel schema --data panel.rcsb [--panel-version V] [--verify]
-rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b|@all --out out.rcsb [--skip-existing] [--panel-version V] [--scratch dir] [--locked-test START,END|none]
+rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b|@all --out out.rcsb [--skip-existing] [--panel-version V] [--scratch dir] [--locked-test START,END|none] [--retired retired.json]
 "
 }
 
@@ -324,6 +327,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
     let mut scratch: Option<String> = None;
     let mut verify = false;
     let mut skip_existing = false;
+    let mut retired: Option<String> = None;
     let mut locked_test = crate::lockbox::Keep::Unset;
     let mut i = 0usize;
     while i < args.len() {
@@ -344,6 +348,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
                 locked_test = crate::lockbox::Keep::parse(&value(args, &mut i))
                     .unwrap_or_else(|e| fail(&format!("--locked-test: {}", e), 2))
             }
+            "--retired" => retired = Some(value(args, &mut i)),
             "--verify" => verify = true,
             "--skip-existing" => skip_existing = true,
             "-h" | "--help" => {
@@ -380,9 +385,15 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
                 panel_version,
                 scratch,
                 locked_test,
+                retired,
             };
-            if let Err(e) = crate::lockbox::output_declaration(&opts.out, Some(&opts.target), opts.locked_test) {
-                fail(&e.message, e.exit);
+            match crate::lockbox::output_declaration(&opts.out, Some(&opts.target), opts.locked_test) {
+                Ok(declared) => {
+                    if let Err(e) = crate::retire::writer_retirement(opts.retired.as_deref(), declared.as_ref(), &[&opts.target, &opts.family]) {
+                        fail(&e.message, e.exit);
+                    }
+                }
+                Err(e) => fail(&e.message, e.exit),
             }
             let stores = FileStore::open(&opts.target).and_then(|t| FileStore::open(&opts.family).map(|f| (t, f)));
             let (panel_store, family_store) = stores.unwrap_or_else(|e| fail(&e, 3));
