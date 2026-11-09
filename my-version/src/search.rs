@@ -1158,12 +1158,14 @@ struct FitSubsample {
     sample: Sample,
     /// Its own context: f32 rows, the f64 twin and the weights of these rows.
     ev: crate::gpu::GpuEvaluator,
-    /// FNV-1a of the ascending row indices.
-    hash: u64,
+    /// FNV-1a of the ascending row indices; `None` when the context holds every
+    /// row of a fit view (#971).
+    hash: Option<u64>,
 }
 
 #[cfg(feature = "cuda")]
 impl FitSubsample {
+    /// `rows` index `train`; empty takes every row of `train`.
     fn new(
         train: &Sample,
         rows: &[usize],
@@ -1173,7 +1175,7 @@ impl FitSubsample {
         budget: Option<u64>,
         run_start: std::time::Instant,
     ) -> Result<Self, String> {
-        let sample = subset_sample(train, rows);
+        let sample = if rows.is_empty() { train.clone() } else { subset_sample(train, rows) };
         let n = sample.len();
         let cols64 = column_major(&sample, n_vars);
         let cols32: Vec<f32> = cols64.iter().map(|&v| v as f32).collect();
@@ -1197,7 +1199,7 @@ impl FitSubsample {
         Ok(FitSubsample {
             sample,
             ev,
-            hash: subsample_hash(rows),
+            hash: (!rows.is_empty()).then(|| subsample_hash(rows)),
         })
     }
 }
@@ -1236,9 +1238,12 @@ impl GpuSearch {
         run_start: std::time::Instant,
         // #293: the device plan: its budget is the ceiling on the live device
         // allocations, and a tiled plan streams the rows instead of holding them.
-        // #265: the fixed rows the device fit runs on (ascending training row
-        // indices), or empty to fit on every row.
+        // #265: the fixed rows the device fit runs on (ascending row indices of
+        // `fit_view`, else of the training sample), or empty to fit on every row.
         fit_rows: &[usize],
+        // #971: the rows with a fit label when the training sample also holds
+        // book rows without one. The device fits them in their own context.
+        fit_view: Option<&Sample>,
         plan: Option<&crate::memory::DevicePlan>,
         // #481: the long/flat book `ScoreObjective::LongPnl` reads.
         pnl_book: Option<&crate::trading::FitnessBook>,
@@ -1324,10 +1329,11 @@ impl GpuSearch {
                 // rows, so its constants are not limited by the f32 evaluator
                 // copy. Only the GPU-fit arm pays this second resident copy.
                 //
-                // With a fit subsample the twin lives in a second context that
-                // holds only those rows; this context keeps a full twin just
-                // for the exact order/rank scorer.
-                let sub = !fit_rows.is_empty() && fit_rows.len() < n_rows && fit_data;
+                // With a fit subsample or a fit view the twin lives in a second
+                // context that holds only those rows; this context keeps a full
+                // twin just for the exact order/rank scorer.
+                let sub = fit_data
+                    && (fit_view.is_some() || (!fit_rows.is_empty() && fit_rows.len() < n_rows));
                 if fit_data && (!sub || native_stat.is_some()) {
                     let cols64 = column_major(train, n_vars);
                     if !ev.set_fit_data(&cols64, &train.y, &train.w) {
@@ -1348,7 +1354,7 @@ impl GpuSearch {
                 }
                 let fit_sub = if sub {
                     Some(FitSubsample::new(
-                        train, fit_rows, n_vars, loss, logistic_fit, budget, run_start,
+                        fit_view.unwrap_or(train), fit_rows, n_vars, loss, logistic_fit, budget, run_start,
                     )?)
                 } else {
                     None
@@ -1456,7 +1462,7 @@ impl GpuSearch {
     ) {
         let (fit_sample, mut fit_ev, fit_hash) = match self.fit_sub.take() {
             Some(FitSubsample { sample, ev, hash }) => (Some(sample), Some(ev), hash),
-            None => (None, None, 0),
+            None => (None, None, None),
         };
         // Everything that judges or refits a device proposal sees the rows the
         // device fitted; the caller re-scores on every row afterwards.
@@ -2559,7 +2565,7 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             fit_rows: fit_ev.fit_twin().0 as usize,
             score_rows: self.ev.rows(),
             fit_twin_bytes: fit_ev.fit_twin().1,
-            fit_subsample_hash: self.fit_sub.as_ref().map(|s| s.hash),
+            fit_subsample_hash: self.fit_sub.as_ref().and_then(|s| s.hash),
             fit_polish: crate::fit::FitPolish::F64,
             fit_admission: crate::fit::FitAdmission::Screened,
             ledger,
@@ -3916,9 +3922,6 @@ fn search_score_objective(cfg: &Config) -> Option<crate::metrics::ScoreObjective
 /// resident book cannot represent and the fit arm's own row contract.
 #[cfg(feature = "cuda")]
 fn long_pnl_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
-    if cfg.fit_view.is_some() {
-        return Some("book rows without a fit label (--book-target): the device fit reads every training row");
-    }
     let Some(book) = cfg.fitness.book() else {
         return Some("the long_pnl fitness book was not rebuilt");
     };
@@ -3936,9 +3939,12 @@ fn long_pnl_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
             "--fit-samples/--fit-rows scores on all rows only with the device fit arm (--fit-strategy gpu)",
         );
     }
+    // #971: the fit context of a fit view holds no slope pair mask.
     if cfg.metric == crate::metrics::Metric::Slope
         && defers_fit_to_gpu(cfg, true)
-        && (slope_pair_mask(train).is_none() || effective_fit_rows(cfg, train) > 0)
+        && (device_fit_view(cfg, train).is_some()
+            || slope_pair_mask(train).is_none()
+            || effective_fit_rows(cfg, train) > 0)
     {
         return Some("slope pairs are not the consecutive rows of the device fit sample");
     }
@@ -4221,7 +4227,7 @@ pub fn device_plan_for(cfg: &Config, train: &Sample) -> Option<crate::memory::De
         candidates: cfg.pop.saturating_mul(cfg.islands.max(1)),
         program_words: crate::genome::width_for(cfg.max_complexity),
         device_fit,
-        fit_rows: if device_fit { effective_fit_rows(cfg, train) } else { 0 },
+        fit_rows: if device_fit { device_fit_context_rows(cfg, train) } else { 0 },
         stat: shape.score_admitted,
         weights: !train.w.is_empty(),
         label_sign,
@@ -5048,11 +5054,29 @@ pub fn default_fit_rows(cfg: &Config, train: &Sample) -> Option<usize> {
 }
 
 /// Rows the device fit arm sees: the fixed fit subsample when one is requested,
-/// every training row otherwise. Scoring always uses every row.
+/// every fit row otherwise. Scoring always uses every row.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn device_fit_rows(cfg: &Config, sample: &Sample) -> usize {
     match effective_fit_rows(cfg, sample) {
-        0 => sample.len(),
+        0 => fit_base(cfg, sample).len(),
+        n => n,
+    }
+}
+
+/// #971: the fit rows when the training sample also holds book rows without a
+/// fit label. The device fits them in their own context; `None` fits on the
+/// scoring rows.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn device_fit_view<'a>(cfg: &'a Config, sample: &Sample) -> Option<&'a Sample> {
+    cfg.fit_view.as_deref().filter(|view| view.len() < sample.len())
+}
+
+/// #971: rows of the device fit context when it is not the scoring context: the
+/// fixed fit subsample, else the fit view; `0` fits on the scoring rows.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn device_fit_context_rows(cfg: &Config, sample: &Sample) -> usize {
+    match effective_fit_rows(cfg, sample) {
+        0 => device_fit_view(cfg, sample).map_or(0, |view| view.len()),
         n => n,
     }
 }
@@ -6248,12 +6272,14 @@ struct PipelineFit {
 /// single-class decline.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn pipeline_fit_safe(cfg: &Config, train_rows: usize, screened: bool) -> bool {
-    // The overlap queue fits on the scoring context's rows; a fit subsample
-    // has its own context and takes the synchronous batches.
+    // The overlap queue fits on the scoring context's rows; a fit subsample or
+    // a fit view (#971) has its own context and takes the synchronous batches.
     let request = if cfg.fit_rows >= 2 { cfg.fit_rows } else { cfg.fit_samples };
     let fit_subsample = request >= 2 && request < train_rows;
+    let fit_view = cfg.fit_view.as_ref().is_some_and(|view| view.len() < train_rows);
     !screened
         && !fit_subsample
+        && !fit_view
         && cfg.pipeline_depth > 0
         && defers_fit_to_gpu(cfg, true)
         && (train_rows >= WIDE_ADMISSION_ROWS || cfg.fit_admission == crate::fit::FitAdmission::All)
@@ -6777,8 +6803,8 @@ pub struct GpuRunStats {
     pub fit_fallback_workers: usize,
     /// #255: configured per-generation fallback cap (`0` = unbounded).
     pub fit_fallback_max: usize,
-    /// Rows of the device fit twin: the fit subsample, else every row; `0`
-    /// without a device fit.
+    /// Rows of the device fit twin: the fit subsample, else the fit rows of a
+    /// fit view (#971), else every row; `0` without a device fit.
     pub fit_rows: usize,
     /// Rows the device evaluator scores.
     pub score_rows: usize,
@@ -8301,6 +8327,7 @@ fn run_search(
                         logistic_fit,
                         t0,
                         &fit_rows,
+                        device_fit_view(cfg, train),
                         memory_plan.as_ref(),
                         cfg.fitness.book(),
                         cfg.threads,
@@ -12995,6 +13022,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             2,
         )
         .expect("a device search");
@@ -13074,6 +13102,7 @@ mod tests {
             std::time::Instant::now(),
             &[],
             None,
+            None,
             cfg.fitness.book(),
             2,
         )
@@ -13098,6 +13127,180 @@ mod tests {
         assert_eq!(stats.nonfinite_cpu_finite, 1, "{:?}", stats);
         assert_eq!(stats.nonfinite_constant, 1, "{:?}", stats);
         assert_eq!(stats.nonfinite_full, 1, "{:?}", stats);
+    }
+
+    /// #971: a book sample whose rows `i % 7 == 3` and the last 24 rows have no fit label,
+    /// its fit rows and a long/flat book over every row.
+    fn label_free_book_rows(n: usize) -> (Sample, Sample, std::sync::Arc<crate::trading::FitnessBook>) {
+        let (mut x, mut y, mut fx, mut fy) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut ret = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = (i as f64 * 0.37).sin();
+            let b = ((i * 13) % 101) as f64 / 101.0 - 0.5;
+            let label = 0.8 * a - 0.3 * b + 0.05 + 0.01 * (i as f64 * 1.7).cos();
+            if i % 7 == 3 || i + 24 >= n {
+                y.push(f64::NAN);
+            } else {
+                y.push(label);
+                fx.push(vec![a, b]);
+                fy.push(label);
+            }
+            x.push(vec![a, b]);
+            ret.push(0.002 * a + 0.0004 * (i as f64 * 0.91).cos());
+        }
+        let rows = crate::trading::TradingRows {
+            time: (0..n).map(|i| 3600.0 * i as f64).collect(),
+            group: vec![0; n],
+            funding: Vec::new(),
+        };
+        let slice = crate::data::TradingSlice { rows, ret };
+        let spec = crate::trading::TradingSpec { cost_bps: 2.0, ..Default::default() };
+        let book = crate::trading::FitnessBook::new(&slice, &spec, 3600.0).expect("a profitable book");
+        (Sample::new(x, y), Sample::new(fx, fy), std::sync::Arc::new(book))
+    }
+
+    fn label_free_config(view: &Sample, book: &std::sync::Arc<crate::trading::FitnessBook>) -> Config {
+        Config {
+            metric: Metric::Squared,
+            fit_iters: 8,
+            fitness: Fitness::LongPnl(book.clone()),
+            fit_view: Some(std::sync::Arc::new(view.clone())),
+            gpu: true,
+            dispatch: crate::dispatch::DispatchMode::Device,
+            fit_strategy: crate::fit::FitStrategy::Gpu,
+            fit_admission: crate::fit::FitAdmission::All,
+            ..Config::default()
+        }
+    }
+
+    /// #971: the device fit context holds the fit rows (or the `--fit-rows` draw from them);
+    /// a fit view with every scoring row, or none, fits on the scoring context.
+    #[test]
+    fn device_fit_context_follows_the_fit_view() {
+        let (train, view, book) = label_free_book_rows(400);
+        let cfg = label_free_config(&view, &book);
+        assert_eq!(device_fit_view(&cfg, &train).map(|v| v.len()), Some(view.len()));
+        assert_eq!(device_fit_context_rows(&cfg, &train), view.len());
+        assert_eq!(device_fit_rows(&cfg, &train), view.len());
+        let drawn = Config { fit_rows: 100, ..cfg.clone() };
+        assert_eq!(device_fit_context_rows(&drawn, &train), 100);
+        assert!(device_fit_indices(&drawn, &train).iter().all(|&i| i < view.len()));
+        let none = Config { fit_view: None, ..cfg.clone() };
+        assert_eq!(device_fit_view(&none, &train).map(|v| v.len()), None);
+        assert_eq!(device_fit_context_rows(&none, &train), 0);
+        let every_row = Config { fit_view: Some(std::sync::Arc::new(view.clone())), ..cfg.clone() };
+        assert_eq!(device_fit_view(&every_row, &view).map(|v| v.len()), None, "a fit view with every row is the scoring sample");
+        assert_eq!(device_fit_context_rows(&every_row, &view), 0);
+        let overlap = Config { pipeline_depth: 2, ..cfg.clone() };
+        assert!(!pipeline_fit_safe(&overlap, train.len(), false), "the overlap queue fits on the scoring rows");
+        assert!(pipeline_fit_safe(&Config { fit_view: None, ..overlap.clone() }, train.len(), false));
+        assert!(pipeline_fit_safe(&overlap, view.len(), false));
+    }
+
+    /// #971: the device fit runs with a fit view; the slope pair rule keeps a masked device fit on the CPU.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn long_pnl_blocker_admits_a_fit_view_and_keeps_the_slope_pair_rule() {
+        let (train, view, book) = label_free_book_rows(400);
+        let cfg = label_free_config(&view, &book);
+        assert_eq!(long_pnl_blocker(&cfg, &train), None);
+        let slope = Config { metric: Metric::Slope, ..cfg.clone() };
+        assert_eq!(long_pnl_blocker(&slope, &train), Some("slope pairs are not the consecutive rows of the device fit sample"));
+        let slope_cpu_fit = Config { fit_strategy: crate::fit::FitStrategy::Exact, ..slope };
+        assert_eq!(long_pnl_blocker(&slope_cpu_fit, &train), None);
+    }
+
+    /// #971: with a fit view the device fits the CPU fit rows: the whole view, or the
+    /// `--fit-rows` draw from it, and the constants equal the CPU fit on those rows.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_fit_on_a_fit_view_equals_the_cpu_fit_on_the_fit_rows() {
+        if !crate::gpu::probe().available() {
+            crate::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+            return;
+        }
+        let (train, view, book) = label_free_book_rows(3_000);
+        let base = label_free_config(&view, &book);
+        let trees = vec![
+            node(Op::Add, vec![node(Op::Mul, vec![constant(0.3), input(0)]), node(Op::Mul, vec![constant(0.2), input(1)]), constant(0.1)]),
+            node(
+                Op::Add,
+                vec![
+                    node(Op::Mul, vec![constant(0.5), node(Op::Mul, vec![input(0), input(1)])]),
+                    node(Op::Mul, vec![constant(0.4), node(Op::Sin, vec![input(0)])]),
+                    constant(-0.2),
+                ],
+            ),
+        ];
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+        let shape = |t: &Node| {
+            fn zero(n: &Node) -> Node {
+                let mut out = n.clone();
+                if out.op == Op::Const {
+                    out.val = 0.0;
+                }
+                out.kids = n.kids.iter().map(zero).collect();
+                out
+            }
+            expr::structural_hash(&zero(t))
+        };
+        let consts = |t: &Node| {
+            fn walk(n: &Node, out: &mut Vec<f64>) {
+                if n.op == Op::Const {
+                    out.push(n.val);
+                }
+                n.kids.iter().for_each(|k| walk(k, out));
+            }
+            let mut out = Vec::new();
+            walk(t, &mut out);
+            out
+        };
+        for fit_rows in [0usize, 700] {
+            let cfg = Config { fit_rows, ..base.clone() };
+            let rows = if fit_subsample_on_device(&cfg, &train) { device_fit_indices(&cfg, &train) } else { Vec::new() };
+            assert_eq!(rows.len(), fit_rows);
+            let mut g = GpuSearch::new(
+                &train,
+                true,
+                crate::fit::DeviceLoss::Squared,
+                true,
+                None,
+                Some(crate::metrics::ScoreObjective::LongPnl),
+                false,
+                std::time::Instant::now(),
+                &rows,
+                device_fit_view(&cfg, &train),
+                None,
+                cfg.fitness.book(),
+                2,
+            )
+            .expect("a device search");
+            let cpu_rows = fit_for_generation(&cfg, &train, 0).unwrap_or_else(|| view.clone());
+            let sub = g.fit_sub.as_ref().expect("the fit rows have their own context");
+            assert_eq!(bits(&sub.sample.y), bits(&cpu_rows.y), "fit_rows {fit_rows}");
+            assert!(sub.sample.x.iter().zip(&cpu_rows.x).all(|(a, b)| bits(a) == bits(b)));
+            assert!(sub.sample.y.iter().all(|v| v.is_finite()));
+            assert_eq!(sub.hash, (fit_rows > 0).then(|| fit_subsample_record(&cfg, &train).unwrap().1));
+            let mut islands = vec![trees.iter().map(|t| Ind::pending(t.clone(), &cfg)).collect::<Vec<_>>()];
+            let admitted: Vec<(usize, usize)> = (0..trees.len()).map(|j| (0, j)).collect();
+            let mut dispatcher = crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::default())
+                .with_mode(crate::dispatch::DispatchMode::Device);
+            g.fit_pending(&mut islands, &admitted, &train, &cfg, 0, &mut dispatcher);
+            assert_eq!(g.fit_gpu, trees.len(), "fit_rows {fit_rows}: {:?}", g.fit_fallback_by_cause);
+            let stats = g.run_stats();
+            assert_eq!((stats.fit_rows, stats.score_rows), (cpu_rows.len(), train.len()));
+            let plain = Config { fit_view: None, fit_rows: 0, ..cfg.clone() };
+            for (k, t) in trees.iter().enumerate() {
+                let mut cpu = expr::simplify(t);
+                fit_constants(&mut cpu, &plain, &cpu_rows, &cpu_rows).expect("the CPU fit");
+                let cpu = expr::simplify(&cpu);
+                let device = &islands[0][k].tree;
+                assert_eq!(shape(device), shape(&cpu), "tree {k}");
+                for (d, c) in consts(device).iter().zip(consts(&cpu)) {
+                    assert!((d - c).abs() <= 1e-5 * (1.0 + c.abs()), "fit_rows {fit_rows} tree {k}: device {d} vs CPU {c}");
+                }
+            }
+        }
     }
 
     /// #895: wherever the interval bound fires, the exact CPU score is `+inf`,
@@ -13226,6 +13429,7 @@ mod tests {
             false,
             run_clock(),
             &[],
+            None,
             None,
             cfg.fitness.book(),
             2,
@@ -13430,6 +13634,7 @@ mod tests {
             run_clock(),
             &[],
             None,
+            None,
             cfg.fitness.book(),
             2,
         )
@@ -13607,6 +13812,7 @@ mod tests {
             false,
             std::time::Instant::now(),
             &[],
+            None,
             None,
             None,
             2,

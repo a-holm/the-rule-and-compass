@@ -399,3 +399,194 @@ fn book_target_without_return_column_is_refused() {
     usage_error(&o, "book target 'y1'");
     assert!(stderr(&o).contains("return_column"), "{}", stderr(&o));
 }
+
+/// #971: the device search with book rows that have no fit label.
+#[cfg(feature = "cuda")]
+mod device {
+    use super::*;
+    use rcsr::checkpoint::Backend;
+    use rcsr::data::Sample;
+    use rcsr::metrics::Metric;
+    use rcsr::search::{self, Config, Fitness};
+    use std::sync::Arc;
+
+    const GROUPS: usize = 4;
+    const LEN: usize = 600;
+
+    fn device_present() -> bool {
+        let present = rcsr::gpu::probe().available();
+        if !present {
+            rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+        }
+        present
+    }
+
+    /// Four hourly groups. The last `DAY` rows of each group and every 37th row have a NaN fit label
+    /// and a finite book return. Returns the book sample, its fit rows and the book.
+    fn book_rows() -> (Sample, Sample, Arc<FitnessBook>) {
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        let (mut fx, mut fy) = (Vec::new(), Vec::new());
+        let mut slice = TradingSlice { rows: TradingRows::default(), ret: Vec::new() };
+        for g in 0..GROUPS {
+            for i in 0..LEN {
+                let k = g * LEN + i;
+                let row = vec![x1(k), frac(k as f64 * 0.754_877_666_246_692_7) - 0.5];
+                let label = 0.6 * row[0] - 0.2 * row[1] + 0.01 * (k as f64 * 1.3).sin();
+                if i + DAY < LEN && k % 37 != 0 {
+                    fx.push(row.clone());
+                    fy.push(label);
+                    y.push(label);
+                } else {
+                    y.push(f64::NAN);
+                }
+                x.push(row);
+                slice.rows.group.push(g as u64);
+                slice.rows.time.push((T0 + STEP * i as i64) as f64);
+                slice.ret.push(r1(k) + 0.0003 * g as f64);
+            }
+        }
+        let sp = TradingSpec { cost_bps: 5.0, threshold: 1e-30, min_trades: 0, ..Default::default() };
+        let book = FitnessBook::new(&slice, &sp, STEP as f64).expect("a profitable book");
+        let sample = |x, y| Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
+        (sample(x, y), sample(fx, fy), Arc::new(book))
+    }
+
+    fn config(fit: &Sample, book: &Arc<FitnessBook>, pipeline_depth: usize, fit_rows: usize) -> Config {
+        Config {
+            generations: 4,
+            pop: 32,
+            islands: 2,
+            seed: 7,
+            metric: Metric::Squared,
+            fitness: Fitness::LongPnl(book.clone()),
+            fit_view: Some(Arc::new(fit.clone())),
+            gpu: true,
+            gpu_notes: false,
+            dispatch: rcsr::dispatch::DispatchMode::Device,
+            fit_strategy: rcsr::fit::FitStrategy::Gpu,
+            fit_admission: rcsr::fit::FitAdmission::All,
+            pipeline_depth,
+            fit_rows,
+            ..Default::default()
+        }
+    }
+
+    /// The device fitted constants and read no row without a fit label: such a row would
+    /// make the device fit non-finite.
+    fn assert_device_fit(out: &search::Outcome, fit_rows: usize, score_rows: usize) {
+        assert_eq!(out.backend, rcsr::backend::Kind::Gpu, "{:?}", out.backend_reason);
+        let g = out.gpu.as_ref().expect("the GPU report");
+        assert!(g.fit_gpu > 0, "the device fitted constants: {:?}", g.fit_fallback_by_cause);
+        assert!(!g.fit_fallback_by_cause.contains_key("non_finite"), "{:?}", g.fit_fallback_by_cause);
+        assert_eq!(g.fit_rows, fit_rows, "rows of the device fit");
+        assert_eq!(g.score_rows, score_rows, "the device scores every book row");
+    }
+
+    #[test]
+    fn label_free_book_rows_keep_the_device_search() {
+        let (train, fit, book) = book_rows();
+        assert!(fit.len() < train.len());
+        let cfg = config(&fit, &book, 0, 0);
+        assert_eq!(search::backend_blocker_reason(&cfg, &train), None);
+        assert_eq!(search::effective_backend(&cfg, &train), Backend::Gpu);
+        if !device_present() {
+            return;
+        }
+        for depth in [0, 2] {
+            let out = search::run(&config(&fit, &book, depth, 0), &train, &fit);
+            assert_device_fit(&out, fit.len(), train.len());
+            assert_eq!(out.gpu.as_ref().unwrap().fit_subsample_hash, None, "depth {depth}");
+            for s in &out.archive.items {
+                let pred: Vec<f64> = train.x.iter().map(|r| rcsr::expr::eval(&s.tree, r)).collect();
+                assert_eq!(s.error.to_bits(), book.regret(&pred).to_bits(), "depth {depth}: the book prices every book row");
+            }
+        }
+    }
+
+    #[test]
+    fn device_fit_rows_draw_only_fit_rows_as_the_cpu_draw() {
+        let (train, fit, book) = book_rows();
+        let cfg = config(&fit, &book, 0, 300);
+        let record = search::fit_subsample_record(&cfg, &train).expect("a subsample");
+        let on_fit_rows = search::fit_subsample_record(&Config { fit_view: None, ..cfg.clone() }, &fit).expect("a subsample");
+        assert_eq!((record.0, record.1), (on_fit_rows.0, on_fit_rows.1), "the draw is over the fit rows");
+        assert!(record.2, "the device fits the same drawn rows for the whole run");
+        if !device_present() {
+            return;
+        }
+        let out = search::run(&cfg, &train, &fit);
+        assert_device_fit(&out, 300, train.len());
+        assert_eq!(out.gpu.as_ref().unwrap().fit_subsample_hash, Some(record.1));
+    }
+
+    fn run_device(data: &str, spec: &str, extra: &[&str]) -> Output {
+        let mut args = vec![
+            "--data", data, "--target", "y24", "--book-target", "y1", "--vars", "x1,x2", "--time", "t", "--split",
+            "temporal", "--target-spec", spec, "--group-by", "g", "--fill", "drop", "--no-dev-log", "--seed", "3",
+            "--metric", "squared", "--json", "--quiet",
+        ];
+        args.extend_from_slice(PNL);
+        args.extend_from_slice(extra);
+        rcsr_cmd::rcsr_for(&args).args(&args).output().expect("run rcsr")
+    }
+
+    fn constants(j: &Json) -> Vec<f64> {
+        let exact = at(j, &["objective", "finalist", "expression_exact"]).as_str().unwrap();
+        let tree = rcsr::parse::parse(exact, &["x1".to_string(), "x2".to_string()]).unwrap_or_else(|e| panic!("{exact}: {e:?}"));
+        fn walk(n: &rcsr::expr::Node, out: &mut Vec<f64>) {
+            if n.op == rcsr::expr::Op::Const {
+                out.push(n.val);
+            }
+            n.kids.iter().for_each(|k| walk(k, out));
+        }
+        let mut out = Vec::new();
+        walk(&tree, &mut out);
+        out
+    }
+
+    #[test]
+    fn cli_device_search_prices_label_free_book_rows() {
+        if !device_present() {
+            return;
+        }
+        let scratch = Scratch::new("book_target_device_cli");
+        let data = write_panel_csv(scratch.path(), false);
+        let spec = write_spec(scratch.path());
+        let seed = ["--generations", "0", "--pop", "1", "--seed-expr", "0.5 * x1 + 0.1 * x2 + 0.01"];
+        let cpu_out = run_device(&data, &spec, &[&["--cpu"][..], &seed].concat());
+        let device_out = run_device(&data, &spec, &[&["--gpu", "--dispatch", "device", "--fit-strategy", "gpu"][..], &seed].concat());
+        for o in [&cpu_out, &device_out] {
+            assert!(!stderr(o).contains("without a fit label"), "{}", stderr(o));
+            assert!(!String::from_utf8_lossy(&o.stdout).contains("without a fit label"));
+        }
+        let cpu = ok(&cpu_out);
+        let device = ok(&device_out);
+        assert_eq!(at(&device, &["backend"]).as_str(), Some("gpu"), "{}", stderr(&device_out));
+        let rows = num(&device, &["search_fitness", "rows"]);
+        assert_eq!(rows, num(&cpu, &["search_fitness", "rows"]));
+        assert_eq!(rows as usize, num(&device, &["train_rows"]) as usize + DAY, "the book keeps the NaN-label rows");
+        assert_eq!(at(&device, &["search_fitness", "book_hash"]).as_str(), at(&cpu, &["search_fitness", "book_hash"]).as_str());
+        assert_eq!(num(&device, &["gpu", "fit", "fit_rows"]), num(&device, &["train_rows"]), "the device fits the fit rows");
+        assert_eq!(num(&device, &["gpu", "fit", "score_rows"]), rows, "the device scores the book rows");
+        assert!(num(&device, &["gpu", "fit", "attempts"]) >= 1.0, "the seed copy reached the device fit stage");
+        let (c, d) = (constants(&cpu), constants(&device));
+        assert_eq!(c.len(), d.len());
+        for (a, b) in d.iter().zip(&c) {
+            assert!((a - b).abs() <= 1e-5 * (1.0 + b.abs()), "device constant {a} vs CPU {b}");
+        }
+        for block in ["validation", "test"] {
+            for field in ["rows", "net_pnl", "gross_pnl", "trades", "exposure"] {
+                assert_eq!(num(&device, &["objective", block, field]), num(&cpu, &["objective", block, field]), "{block}.{field}");
+            }
+        }
+        assert!(num(&device, &["objective", "test", "rows"]) > num(&device, &["test_rows"]), "the test book keeps the NaN-label rows");
+
+        // A search: the device fits constants on the fit rows; a fit that read a row without a
+        // fit label would fail for every candidate.
+        let search = ok(&run_device(&data, &spec, &["--gpu", "--dispatch", "device", "--fit-strategy", "gpu", "--generations", "3", "--pop", "24"]));
+        assert_eq!(at(&search, &["backend"]).as_str(), Some("gpu"));
+        assert!(num(&search, &["gpu", "fit", "gpu"]) > 0.0, "the device fitted constants");
+        assert_eq!(num(&search, &["gpu", "fit", "fit_rows"]), num(&search, &["train_rows"]));
+        assert_eq!(num(&search, &["gpu", "fit", "score_rows"]), num(&search, &["search_fitness", "rows"]));
+    }
+}
