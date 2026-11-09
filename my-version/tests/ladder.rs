@@ -536,3 +536,229 @@ fn ladder_takes_the_larger_purge_at_168h() {
     let json = String::from_utf8_lossy(&out.stdout);
     assert!(json.contains("\"purge_seconds\":608400,\"purge_source\":\"target_spec\""), "{json}");
 }
+
+// ---------------------------------------------------------------------------
+// #927: trend_ma and trend_donchian
+// ---------------------------------------------------------------------------
+
+const TREND_COLS: [&str; 8] = [
+    "ma20_ratio",
+    "ma60_ratio",
+    "mtf_4h_ma_ratio",
+    "mtf_1d_ma_ratio",
+    "don20",
+    "don96",
+    "mtf_4h_donchian_pos",
+    "mtf_1d_donchian_pos",
+];
+
+struct Trend {
+    panel: Panel,
+    folds: Vec<Fold>,
+}
+
+/// Rows in `[cut.0, cut.1)` are replaced by a different draw of every column
+/// and return, after the rest of the panel has been generated.
+fn trend_fixture(seed: u32, trending: bool, drop: &[&str], windows_used: usize, cut: Option<(f64, f64)>) -> Trend {
+    let mut rng = Mt::new(seed);
+    let mut other = Mt::new(seed ^ 0x5eed);
+    let (mut time, mut group, mut ret) = (vec![], vec![], vec![]);
+    let mut cols: Vec<Vec<f64>> = vec![vec![]; TREND_COLS.len()];
+    for g in 0..SYMBOLS {
+        let mut s = 0.0;
+        for t in 0..STEPS {
+            s = 0.97 * s + 0.25 * gauss(&mut rng);
+            let mut r = (if trending { 0.002 * s } else { 0.0 }) + 0.004 * gauss(&mut rng);
+            let mut xs: Vec<f64> = (0..TREND_COLS.len()).map(|k| s * (1.0 + 0.1 * k as f64) + 0.5 * gauss(&mut rng)).collect();
+            let at = T0 + t as f64 * STEP;
+            if cut.is_some_and(|(a, b)| at >= a && at < b) {
+                r = 0.05 * other.next_f64() - 0.02;
+                for x in &mut xs {
+                    *x = 4.0 * gauss(&mut other) + 3.0;
+                }
+            }
+            time.push(at);
+            group.push(g as u64);
+            ret.push(r);
+            for (c, x) in cols.iter_mut().zip(xs) {
+                c.push(x);
+            }
+        }
+    }
+    let keep: Vec<usize> = (0..TREND_COLS.len()).filter(|&k| !drop.contains(&TREND_COLS[k])).collect();
+    let panel = Panel::new(
+        keep.iter().map(|&k| TREND_COLS[k].to_string()).collect(),
+        keep.iter().map(|&k| cols[k].clone()).collect(),
+        time,
+        group,
+        ret.clone(),
+        ret,
+        vec![],
+    )
+    .unwrap();
+    let rows: Vec<WindowRow> = windows().into_iter().take(windows_used).collect();
+    let folds = ladder::make_folds(&panel, &rows, 2.0 * STEP, &[], 0.0).unwrap();
+    Trend { panel, folds }
+}
+
+fn trend_options(on: bool) -> Options {
+    Options {
+        trend_rungs: on,
+        draws: 200,
+        gbm_trees: 60,
+        purge_seconds: 2.0 * STEP,
+        ..Options::default()
+    }
+}
+
+fn run_trend(t: &Trend, on: bool) -> Report {
+    ladder::run_ladder(&t.panel, &t.folds, &trend_options(on)).unwrap()
+}
+
+#[test]
+fn trend_rung_finds_trend() {
+    let t = trend_fixture(11, true, &[], 3, None);
+    let r = run_trend(&t, true);
+    for name in ["trend_ma", "trend_donchian"] {
+        let row = r.row(name).unwrap();
+        assert_eq!(row.status, "ok", "{name}");
+        assert!(row.excess_over_cash > 0.0, "{name} net {}", row.excess_over_cash);
+        assert!(row.params.contains("column@band_sd_multiple_by_fold=["), "{}", row.params);
+    }
+}
+
+#[test]
+fn trend_rung_noise_is_null() {
+    let t = trend_fixture(12, false, &[], 3, None);
+    let r = run_trend(&t, true);
+    for name in ["trend_ma", "trend_donchian"] {
+        let row = r.row(name).unwrap();
+        let matched = r.row("matched_exposure_random_long").unwrap();
+        assert!(row.mean_ci.0 <= 0.0 && 0.0 <= row.mean_ci.1, "{name} ci {:?}", row.mean_ci);
+        let sd = {
+            let m = row.series.iter().sum::<f64>() / row.series.len() as f64;
+            (row.series.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / (row.series.len() - 1) as f64).sqrt()
+        };
+        let band = 3.0 * sd * (row.series.len() as f64).sqrt();
+        assert!(
+            (row.excess_over_cash - matched.excess_over_cash).abs() <= band,
+            "{name} net {} matched {} band {}",
+            row.excess_over_cash,
+            matched.excess_over_cash,
+            band
+        );
+    }
+}
+
+#[test]
+fn trend_rungs_off_are_not_run_and_n_trials_grows_by_32() {
+    let t = trend_fixture(13, true, &[], 3, None);
+    let off = run_trend(&t, false);
+    let on = run_trend(&t, true);
+    for name in ["trend_ma", "trend_donchian"] {
+        assert_eq!(off.row(name).unwrap().status, "not_run");
+        assert_eq!(on.row(name).unwrap().trials, 16);
+    }
+    assert_eq!(on.n_trials, off.n_trials + 32);
+    let (so, sn) = (off.spa.as_ref().unwrap(), on.spa.as_ref().unwrap());
+    assert_eq!(sn.models, so.models + 2);
+    assert_eq!(on.pbo.as_ref().unwrap().candidates, off.pbo.as_ref().unwrap().candidates + 2);
+    for name in ["trend_ma", "trend_donchian"] {
+        assert!(on.row(name).unwrap().bh_rejected.is_some());
+    }
+}
+
+#[test]
+fn trend_rung_drops_a_missing_column_with_a_note() {
+    let t = trend_fixture(14, true, &["don96"], 3, None);
+    let on = run_trend(&t, true);
+    let row = on.row("trend_donchian").unwrap();
+    assert_eq!(row.trials, 12);
+    assert!(row.note.as_deref().unwrap().contains("dropped (not in the panel): don96"));
+    assert_eq!(on.row("trend_ma").unwrap().trials, 16);
+}
+
+fn chosen_by_fold(params: &str) -> Vec<String> {
+    let start = params.find('[').unwrap() + 1;
+    let end = params.find(']').unwrap();
+    params[start..end].split(',').map(|s| s.trim_matches('"').to_string()).collect()
+}
+
+#[test]
+fn trend_rung_ignores_test_block_rows() {
+    let base = trend_fixture(15, true, &[], 3, None);
+    let first = &base.folds[0];
+    let test_times: Vec<f64> = first.test.iter().map(|&i| base.panel.time[i]).collect();
+    let (lo, hi) = (
+        test_times.iter().cloned().fold(f64::INFINITY, f64::min),
+        test_times.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + 1.0,
+    );
+    let mid = lo + 30.0 * STEP;
+    let a = run_trend(&base, true);
+    // every test row of fold 0 changed: the fold's choice comes from fit and validation rows only
+    let all = trend_fixture(15, true, &[], 3, Some((lo, hi)));
+    let b = run_trend(&all, true);
+    // only the second half of the block changed: earlier periods are unchanged
+    let late = trend_fixture(15, true, &[], 3, Some((mid, hi)));
+    let c = run_trend(&late, true);
+    assert_ne!(a.row("buy_and_hold").unwrap().series, b.row("buy_and_hold").unwrap().series);
+    for name in ["trend_ma", "trend_donchian"] {
+        let (ra, rb, rc) = (a.row(name).unwrap(), b.row(name).unwrap(), c.row(name).unwrap());
+        assert_eq!(chosen_by_fold(&ra.params)[0], chosen_by_fold(&rb.params)[0], "{name} choice");
+        assert_eq!(chosen_by_fold(&ra.params)[0], chosen_by_fold(&rc.params)[0], "{name} choice");
+        let before = a.period_time.iter().filter(|&&t| t < mid).count();
+        assert!(before >= 30);
+        assert_eq!(ra.series[..before], rc.series[..before], "{name} earlier periods");
+        assert_ne!(ra.series, rc.series, "{name} later periods differ");
+    }
+}
+
+#[test]
+fn trend_rung_matches_walkforward_band() {
+    let t = trend_fixture(16, true, &[], 1, None);
+    let r = run_trend(&t, true);
+    let row = r.row("trend_ma").unwrap();
+    let pick = chosen_by_fold(&row.params).remove(0);
+    let (col, mult) = pick.split_once('@').unwrap();
+    let mult: f64 = mult.parse().unwrap();
+    let fold = &t.folds[0];
+    let x = t.panel.col(col).unwrap();
+    let fit: Vec<f64> = fold.fit.iter().map(|&i| x[i]).collect();
+    let theta = rcsr::walkforward::quantile(&fit, 0.5);
+    let band = mult * rcsr::trading::score_sd(&fit).sd.unwrap();
+    let w = windows().remove(0).window;
+    let mut csv = String::from("ts,sym,x,target\n");
+    for i in 0..t.panel.len() {
+        csv.push_str(&format!("{},{},{:e},{:e}\n", t.panel.time[i], t.panel.group[i], x[i], t.panel.ret[i]));
+    }
+    let table = rcsr::data::parse_table(&csv).unwrap();
+    let spec = rcsr::walkforward::EvalSpec {
+        expression: "x".to_string(),
+        vars: vec!["x".to_string()],
+        target: "target".to_string(),
+        time: "ts".to_string(),
+        group: Some("sym".to_string()),
+        windows: vec![w],
+        horizon: 0.0,
+        embargo: None,
+        cost_bps: 12.0,
+        threshold_quantile: 0.5,
+        threshold_fixed: Some(theta),
+        validation_frac: 0.0,
+        periods_per_year: Some(8760.0),
+        candidates: Vec::new(),
+        band_select: false,
+        pool_reset_flat: false,
+        allow_lockbox: false,
+        device_pnl: false,
+        control_seed: 0,
+        policy: rcsr::walkforward::Policy::Band,
+        band_width: band,
+        min_hold: 1,
+        gpu: false,
+    };
+    let wf = rcsr::walkforward::run_table(&table, &spec, "t").unwrap();
+    let m = &wf.windows[0].metrics;
+    let wf_net = m.mean_return * m.periods as f64;
+    assert!((wf_net - row.excess_over_cash).abs() <= 1e-12, "walkforward {} ladder {}", wf_net, row.excess_over_cash);
+}

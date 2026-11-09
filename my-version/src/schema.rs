@@ -255,6 +255,9 @@ pub fn json() -> String {
 {{\"name\":\"--vol-col\",\"type\":\"string\",\"default\":\"none\",\"description\":\"volatility column of the 20-bin rung\"}},\
 {{\"name\":\"--reversal-col\",\"type\":\"string\",\"default\":\"none\",\"description\":\"lagged return column of the naive reversal rung\"}},\
 {{\"name\":\"--signal-col\",\"type\":\"string\",\"default\":\"none\",\"description\":\"feature of the 1[f>tau] rung\"}},\
+{{\"name\":\"--trend-rungs\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"ladder: add the trend_ma and trend_donchian long/flat rungs with a no-trade band; theta is the fit-row median, the band a multiple of the fit-row sd, the (column, band) pair is chosen on validation net, 16 trials per rung\"}},\
+{{\"name\":\"--trend-cols\",\"type\":\"csv\",\"default\":\"ma20_ratio,ma60_ratio,mtf_4h_ma_ratio,mtf_1d_ma_ratio\",\"description\":\"ladder: columns of trend_ma\"}},\
+{{\"name\":\"--trend-donchian-cols\",\"type\":\"csv\",\"default\":\"don20,don96,mtf_4h_donchian_pos,mtf_1d_donchian_pos\",\"description\":\"ladder: columns of trend_donchian\"}},\
 {{\"name\":\"--target-spec\",\"type\":\"path\",\"default\":\"none\",\"description\":\"target spec file: per-side cost, return units (log is converted with exp_m1), return column and horizon; enables the zero-parameter rung\"}},\
 {{\"name\":\"--sr-score\",\"type\":\"string\",\"default\":\"none\",\"description\":\"out-of-fold symbolic-regression score column from the caller (labelled oof=caller)\"}},\
 {{\"name\":\"--sr-run\",\"type\":\"path\",\"default\":\"none\",\"description\":\"one search run.json (--objective) scored on every fold with its fixed threshold; a fold whose test starts before the run's last seen row + purge is refused (exit 3); prices objective.finalist.expression_exact, else the rounded expression, and reports sr_run.expression_source; --locked-test refuses a rounded source (exit 3)\"}},\
