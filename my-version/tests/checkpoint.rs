@@ -1639,29 +1639,35 @@ fn cost_scratch(tag: &str) -> (Scratch, std::path::PathBuf, String) {
     (scratch, dir, csv.to_str().expect("utf-8").to_string())
 }
 
-/// #923: `search.cumulative` adds the search seconds of every chunk, while
+/// #923: `search.cumulative` adds the `elapsed_seconds` of every chunk (the same value
+/// as the chunk's run_end `search`, one clock), while
 /// `elapsed_seconds` stays the last process alone.
 #[test]
 fn chunked_run_reports_cumulative_search_seconds() {
     let (_scratch, dir, csv) = cost_scratch("cumulative-cost");
+    let mut elapsed_of_chunk = Vec::new();
     for chunk in 0..3 {
         cost_chunk(&dir, &csv, chunk, chunk == 2);
+        let own = json_file(dir.join("run.json"));
+        elapsed_of_chunk.push(own.get("elapsed_seconds").and_then(|v| v.as_f64()).expect("elapsed_seconds"));
     }
     let run = json_file(dir.join("run.json"));
     let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
     assert!(matches!(cumulative.get("complete"), Some(rcsr::devlog::Json::Bool(true))), "{cumulative:?}");
     assert_eq!(cumulative.get("chunks").and_then(|v| v.as_usize()), Some(3));
     let total = cumulative.get("elapsed_seconds").and_then(|v| v.as_f64()).expect("elapsed_seconds");
-    let chunk_search = |k: usize| run_end_of(&dir, k).get("search").and_then(|v| v.as_f64()).expect("run_end search");
-    let sum: f64 = (0..3).map(chunk_search).sum();
-    assert!((total - sum).abs() <= 0.05 * sum, "cumulative {total} against run_end sum {sum}");
+    let sum: f64 = elapsed_of_chunk.iter().sum();
+    assert!((total - sum).abs() <= 1e-9, "cumulative {total} against the chunks' own elapsed_seconds {elapsed_of_chunk:?}");
     let elapsed = run.get("elapsed_seconds").and_then(|v| v.as_f64()).expect("elapsed_seconds");
+    assert_eq!(elapsed, elapsed_of_chunk[2], "the last chunk's elapsed_seconds is one term of the sum");
     let timing = run.get("timing").and_then(|t| t.get("search_seconds")).and_then(|v| v.as_f64()).expect("timing");
     assert_eq!(elapsed, timing, "elapsed_seconds keeps its per-process meaning");
-    assert!(elapsed < total, "last process {elapsed} against all chunks {total}");
-    let last_end = run_end_of(&dir, 2);
-    let end_total = last_end.get("search_cumulative").and_then(|v| v.as_f64()).expect("run_end search_cumulative");
-    assert!((end_total - total).abs() <= 1e-9 * total.max(1.0), "{end_total} against {total}");
+    for (k, own) in elapsed_of_chunk.iter().enumerate() {
+        let end = run_end_of(&dir, k);
+        assert_eq!(end.get("search").and_then(|v| v.as_f64()), Some(*own), "run_end search is the chunk's elapsed_seconds, chunk {k}");
+    }
+    let end_total = run_end_of(&dir, 2).get("search_cumulative").and_then(|v| v.as_f64()).expect("run_end search_cumulative");
+    assert!((end_total - total).abs() <= 1e-9, "{end_total} against {total}");
     assert!(dir.join("ck.rcsr.cost").exists(), "the sidecar sits next to the checkpoint");
 }
 
