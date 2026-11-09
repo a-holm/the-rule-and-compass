@@ -41,7 +41,7 @@ impl Cost {
         let both = |a: Option<f64>, b: Option<f64>| a.zip(b).map(|(a, b)| a + b);
         Cost {
             chunks: self.chunks + process.chunks,
-            search_s: self.search_s + process.search_s,
+            search_s: self.search_s,
             ledger_wall_s: both(self.ledger_wall_s, process.ledger_wall_s),
             device_s: both(self.device_s, process.device_s),
         }
