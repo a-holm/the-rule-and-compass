@@ -1742,7 +1742,7 @@ impl GpuSearch {
                 }
             }
             for job in joined.jobs {
-                drop(job.tree);
+                islands[job.island][job.slot].tree = job.tree;
             }
             self.book_fallback_seconds(generation, joined.overlap_s, joined.wait_s, joined.workers);
         } else if refit > 0 {
@@ -3746,7 +3746,7 @@ fn finish_pipeline_fallbacks(
                 if job.improved {
                     g.note_fit_fallback_improved(generation, f.cause);
                 }
-                drop(job.tree);
+                f.tree = job.tree;
             }
             None => rest.push(n),
         }
