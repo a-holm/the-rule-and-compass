@@ -127,3 +127,17 @@ fn the_option_table_has_no_duplicates_or_empty_fields() {
     }
     assert!(!schema::has_option("--not-a-flag"));
 }
+
+/// #962: the run.json backend fields are documented in the schema and the CLI help.
+#[test]
+fn schema_lists_search_and_process_backend() {
+    let doc = schema::json();
+    assert!(gui::is_valid_json(&doc), "schema is not valid JSON");
+    for field in ["search_backend", "process_backend"] {
+        assert!(doc.contains(field), "schema does not mention {field}");
+    }
+    let help = String::from_utf8_lossy(&rcsr(&["--help"]).stdout).to_string();
+    for field in ["search_backend", "process_backend"] {
+        assert!(help.contains(field), "--help does not mention {field}");
+    }
+}
