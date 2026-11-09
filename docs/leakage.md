@@ -58,6 +58,8 @@ The command runs the D0–D6/D11/D12 panel suite (the optional `--bars`,
 
 Rows in `[start - purge, end + embargo)` of the protocol locked test (`--lockbox START,END|none`, the range declared with the data, else 2025-07-01..2026-07-01) are left out of every detector: the purge is the `--target-spec` purge, else 219600 s, and the embargo is the lookback embargo of the store (`--lockbox-embargo` widens it). The features of a row after the range end read locked bars. The report holds `locked_test` with `source`, `declared_in` and `rows_left_out`.
 
+A locked range leaves the guard after its one sealed read. `rcsr protocol retire --ledger L --range START,END --out retired.json` checks the ledger hash chain and needs exactly one locked read of that exact range after a seal (none exits 2, two or more exit 3). The record holds the range, the ledger path and SHA-256, the read event id, the sealed list hash and `verified_reads`. `--retired retired.json` on the search, `walkforward`, `ladder`, `ablation`, `audit`, `enrich`, `panel base`, `panel build` and `panel append` re-hashes that ledger (a mismatch exits 3) and drops the protocol default from the guard of a `--lockbox` or `--locked-test` range on undeclared data. A new range that overlaps the retired one, or a data declaration of the retired range, exits 2. Reports and sidecars carry `lockbox.retired` (`range`, `ledger_sha256`, `read_event`). A retired range is development data and is never a confirmatory test again.
+
 `rcsr audit --target-spec FILE` adds D13a-c for the target against `--vars` (all
 numeric columns except the target and time when `--vars` is absent). The same
 check runs before every search with a spec and exits 5 on a finding. See

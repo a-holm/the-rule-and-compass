@@ -2298,6 +2298,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --pbo-blocks <even n>     CSCV blocks (default 8)\n\
   --seed <n>                seed of every draw (default 0)\n\
   --lockbox-embargo <s>     widen the lookback embargo after the end of the locked range (default: declared with --data, else 10972800); smaller is refused (exit 2); a fold reaching [START - purge, END + embargo) is refused\n\
+  --retired <retired.json>  record from rcsr protocol retire: its range no longer guards next to --lockbox on undeclared data (ledger re-hashed, mismatch exit 3; overlap with --lockbox exit 2)\n\
   --lockbox <START,END|none> locked test to guard: this flag (it must cover a stored\n\
                             declaration, else exit 2), the declaration stored with --data,\n\
                             else 2025-07-01,2026-07-01; none opts out. A fold ending after START minus\n\
@@ -2353,6 +2354,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let mut scheme = "expanding".to_string();
     let mut lockbox_arg: Option<String> = None;
     let mut lockbox_embargo_arg: Option<String> = None;
+    let mut retired_arg: Option<String> = None;
     let mut locked_test = false;
     let mut verify_read = false;
     let mut expect_hash: Option<String> = None;
@@ -2420,6 +2422,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             "--seed" => opts.seed = val()?.parse().map_err(|_| num_err(a))?,
             "--lockbox" => lockbox_arg = Some(val()?),
             "--lockbox-embargo" => lockbox_embargo_arg = Some(val()?),
+            "--retired" => retired_arg = Some(val()?),
             "--locked-test" => locked_test = true,
             "--verify-read" => verify_read = true,
             "--expect-report-sha256" => expect_hash = Some(val()?),
@@ -2498,7 +2501,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     }
     let text = std::fs::read_to_string(&windows).map_err(|e| input_err(format!("{}: {}", windows, e)))?;
     let rows = protocol::parse_windows_csv(&text, Some(&scheme)).map_err(input_err)?;
-    let resolved = crate::lockbox::resolve_with(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path).map_err(|e| (e.exit, e.message))?;
+    let resolved = crate::lockbox::resolve_retired(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path, retired_arg.as_deref()).map_err(|e| (e.exit, e.message))?;
     let declared = resolved.declared();
     let mut purge_source = if purge_given { "flag" } else { "protocol_default" };
     if let Some(s) = &opts.spec {
