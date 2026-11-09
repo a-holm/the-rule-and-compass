@@ -796,7 +796,8 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   On the GPU the device scores the regret natively, fused with the program interpreter
   (`search_fitness.scorer_backend` `cuda`); it equals the CPU book on the device's own `f32`
   predictions bit for bit, and every reported value stays exact CPU `f64`. Resume needs the
-  same cost, threshold, band, band units, minimum hold and rows. `--pnl-blocks K` (1 to 8, default 1 = off) cuts the training
+  same cost, threshold, band, band units, minimum hold and rows (an sd-unit checkpoint written
+  before the one-pass sd of #945 does not resume). `--pnl-blocks K` (1 to 8, default 1 = off) cuts the training
   timestamps into `K` blocks, scores each as its own long/flat book and ranks by the mean block
   regret plus `--pnl-block-lambda` (default 1.0) times their standard deviation, so a formula
   that earns in one regime only scores worse; the device computes it bit for bit like the CPU.
