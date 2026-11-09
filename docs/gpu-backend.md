@@ -1307,7 +1307,7 @@ constants), `too_few_rows`, `too_many_constants` (`p > 20`),
 the exact CPU arm took over). `--fit-report` and the `gpu.fit` JSON object count
 `screened` (scored with seed constants before admission), `admitted_wide` (candidates with constants fitted without a screening score under wide admission), `attempts`/`gpu`/`fallback`, the per-cause map, the
 `status_by_label` map of finite device answers, `refits`, the kernel `seconds`
-and the whole fit stage's `host_seconds` (with the `gate_s` subset, #498); the run manifest records the same
+and the whole fit stage's `host_seconds` (with the `gate_s` subset, #498), and `fold_count` and `folded` (constants and candidates of the fold before the fit, #982); the run manifest records the same
 accepted/fallback/refit totals. Ledger invariant: `screened + admitted_wide >= attempts`. Below the wide threshold `admitted_wide` is 0 and every attempt was screened; under wide admission only constant-free candidates are screened and every other pending candidate is counted in `admitted_wide`.
 
 **Parallel fallback batch and its bound (#255).** The exact CPU refits are
@@ -2221,6 +2221,18 @@ With `--book-target` a training row can have a finite book return and a NaN fit 
 * **What reads the fit rows.** Every fit kernel batch, the exact gate and the CPU fallback fits, as for a subsample. The overlapped fit pipeline is off and the fit batches run synchronously. When the training block has no row without a fit label, the fit rows are the scoring rows and the device fits on the scoring context, as without `--book-target`.
 * **Kept refusal.** `--metric slope` with the device fit arm keeps the CPU search with `slope pairs are not the consecutive rows of the device fit sample`: the fit context holds no slope pair mask.
 * **Memory.** The plan charges the fit context at the fit-row count, like a subsample of that size.
+
+### Folding redundant constants before the fit (#982)
+
+A tree whose constants trade off against one another, such as `c1*(c2*x)` or `c1 + (c2 + x)`, has a Jacobian with a null direction: the LM kernel reports `rank_deficient` and the exact CPU arm refits it. Before a candidate enters the device fit stage (`GpuSearch::fit_pending` and the overlap pipeline queue), `fold::fold_constants` removes such constants.
+
+* **Rules.** A constant factor of a product or quotient moves into the other operand when every additive term of that operand has a constant factor reachable through `mul`, `div` and `neg`: `c1*(c2*x)`, `(c1*x)/c2`, `c1/(c2*x)`, `c1/(c2/x)`, `(c1*x)*(c2*y)`, `c1*(c2 + c3*x)`. A constant term of a sum or difference moves into an additive constant of the other operand, also through a multiplication or division by a constant: `c1 + (c2 + x)`, `c1 - (c2 + x)`, `d + k*(c + x)`, `(c1 + x) + (c2 + y)`. Each rewrite removes one constant. The fold repeats until no rule applies, so folding a folded tree changes nothing.
+* **Boundaries.** Only `add`, `sub`, `mul`, `div` and `neg` chains are rewritten. A constant moves into an `if` only into both branches at once (`c + if(x, a, b)` becomes `if(x, c + a, c + b)`, the same value on every row), never into one branch or the condition. Every other operator is a boundary: its argument is folded on its own and no constant moves across it. Aggregates, meta operators and user blocks are never entered. A non-finite factor, a division by zero or a folded constant that would overflow leaves the tree unchanged. A zero factor folds: the terms it scales become zero constants the fit can move. Identities through a nonlinear operator (`k*exp(c + x)`) are not folded.
+* **Values.** A folded constant is the product, quotient, sum or difference of the constants it replaces, so the folded tree is the same function of the inputs. It differs only by the rounding of the re-associated products and sums: the unit tests bound the difference by `1e-12` relative on random rows (`fold::tests`).
+* **Stored tree.** The folded tree replaces the candidate. The device fit, a CPU fallback, the post-fit simplify, the in-search archive and the reported `expression_exact` all see that tree, so the reported expression is the tree that was fitted and scored. A tree with nothing to fold is left unchanged, bit for bit, and its fit is unchanged.
+* **Seeds.** A `--seed-expr` written in original units becomes `c*(z*s + m) + d` on the standardised input `z` (four constants, two directions). `prepare_seeds` folds every seed before its CPU fit, on both backends, so the seed fit is identified (one scale and one offset) and the seed enters the population folded.
+* **CPU search.** A CPU-only search folds only its seeds; its candidates are never folded.
+* **Reporting.** `gpu.fit.fold_count` counts the constants removed and `gpu.fit.folded` the candidates whose tree changed.
 
 ### Correlation arm
 

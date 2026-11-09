@@ -44,6 +44,7 @@ mod test_scratch; // #775: drop-removing temp dirs for the unit tests
 pub mod devreport; // #211: `rcsr dev-report`
 pub mod eval_soa;
 pub mod flat_bound;
+pub mod fold; // #982: fold redundant constants before the device fit
 pub mod expr;
 pub mod features;
 pub mod labels; // #262: long-only horizon, action and triple-barrier labels

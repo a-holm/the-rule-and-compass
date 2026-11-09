@@ -1293,6 +1293,14 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   `N`-row subsample, scores every training row and refits the archive on all
   rows. `--fit-rows 0` keeps every row; a CPU run is unchanged. The A/B
   evidence is on #602;
+- **redundant constants folded before the device fit** (#982): a constant
+  that trades off against another constant of the same `add`/`sub`/`mul`/
+  `div`/`neg` chain (`c1*(c2*x)`, `c1 + (c2 + x)`, a standardised
+  `--seed-expr`) is merged into it before the device fit, so the device does
+  not report the tree rank deficient and hand it to the CPU fit. The folded
+  tree is the same function and replaces the candidate; `gpu.fit.fold_count`
+  and `gpu.fit.folded` count the folds. Seeds are folded before their CPU
+  fit on both backends; a CPU run folds nothing else;
 - **screened constant fitting** (`--fit-samples N`): within each generation,
   all offspring are fitted and scored on a fresh deterministic `N`-row subset,
   the top 1/16 are promoted to a full-data refit and re-score, and the next

@@ -82,6 +82,8 @@ is rewritten into that space internally: each raw variable `x_i` becomes
 original units, just like a Pareto row, so a printed seed can be pasted back
 into `--eval-expr`.
 
+Before its CPU fit a seed's redundant constants are folded (#982): `c*(x_i * std_i + mean_i) + d` keeps one scale and one offset, so the four constants of the rewritten seed no longer trade off against one another and the fit is identified. The folded seed is the same function with fewer constants; it is the tree that is fitted, reported in `seeds[]` and inserted.
+
 ## The elite rule: `--max-complexity`
 
 `--max-complexity` governs **generated offspring**: mutation and crossover

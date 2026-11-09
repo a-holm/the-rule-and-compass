@@ -1063,6 +1063,10 @@ struct GpuSearch {
     /// `recovered`, `no_improvement`, `start_unusable`,
     /// `recovered_skipped`). None of these is a CPU fallback.
     fit_status_by_label: BTreeMap<String, usize>,
+    /// #982: constants removed by the fold before the fit, and the candidates
+    /// whose tree the fold changed.
+    fit_fold_count: usize,
+    fit_folded: usize,
     /// #169: wall time spent in the batched fit kernels, milliseconds.
     fit_ms: f64,
     /// #496: the polish-phase part of `fit_ms`, apportioned by cycle ratio.
@@ -1379,6 +1383,8 @@ impl GpuSearch {
                     fit_fallback_by_cause: BTreeMap::new(),
                     fit_fallback_improved_by_cause: BTreeMap::new(),
                     fit_status_by_label: BTreeMap::new(),
+                    fit_fold_count: 0,
+                    fit_folded: 0,
                     fit_ms: 0.0,
                     fit_polish_ms: 0.0,
                     fit_calls: 0,
@@ -1500,6 +1506,7 @@ impl GpuSearch {
                 pos == 0 || neg == 0
             };
         for &(i, j) in admitted {
+            self.fold_redundant(&mut islands[i][j].tree);
             if single_class {
                 fallbacks.push((i, j, FitFallbackCause::SingleClass));
                 continue;
@@ -1802,6 +1809,18 @@ impl GpuSearch {
         }
         for &(i, j) in admitted {
             refresh_after_fit(&mut islands[i][j], cfg);
+        }
+    }
+
+    /// #982: fold the redundant constants of a candidate before its fit. The
+    /// folded tree replaces the candidate, so the device fit, a CPU fallback
+    /// and the archive all see the tree that was fitted.
+    fn fold_redundant(&mut self, tree: &mut Node) {
+        let (folded, removed) = crate::fold::fold_constants(tree);
+        if removed > 0 {
+            *tree = folded;
+            self.fit_fold_count += removed;
+            self.fit_folded += 1;
         }
     }
 
@@ -2553,6 +2572,8 @@ impl GpuSearch {
             fit_fallback_by_cause: self.fit_fallback_by_cause.clone(),
             fit_fallback_improved_by_cause: self.fit_fallback_improved_by_cause.clone(),
             fit_status_by_label: self.fit_status_by_label.clone(),
+            fit_fold_count: self.fit_fold_count,
+            fit_folded: self.fit_folded,
             fit_refits: 0,
             fit_refit_candidates: 0,
             fit_carried_kept: 0,
@@ -3546,7 +3567,8 @@ fn score_pipeline_batch(
 
     // #601: the candidates with constants wait in the queue until a device
     // call is big enough to fill the GPU (`FIT_BATCH_MIN`).
-    for (k, job) in jobs.into_iter().enumerate() {
+    for (k, mut job) in jobs.into_iter().enumerate() {
+        g.fold_redundant(&mut job.2);
         match crate::fit::gpu_fit_plan_reason(&job.2) {
             Err(crate::fit::GpuFitReject::NoConstants) => {}
             plan => pending.push(job, offered_hash[k], plan),
@@ -6838,6 +6860,10 @@ pub struct GpuRunStats {
     pub fit_fallback_improved_by_cause: BTreeMap<String, usize>,
     /// #286: finite device answers by label; every entry is a non-fallback.
     pub fit_status_by_label: BTreeMap<String, usize>,
+    /// #982: constants removed by the fold before the fit.
+    pub fit_fold_count: usize,
+    /// #982: candidates whose tree the fold changed.
+    pub fit_folded: usize,
     /// #169: exact CPU f64 refits of finalists before reporting.
     pub fit_refits: usize,
     /// #495: unique trees considered for the finalist refit.
@@ -7274,6 +7300,9 @@ fn prepare_seeds(
         // #14: otherwise fit on the objective the metric actually scores.
         let mut fitted = None;
         if cfg.fit_iters > 0 && !train.sample.is_multi() {
+            // #982: a seed in standardised inputs, `c*(x*s + m) + d`, has
+            // redundant constants; fold them so the fit is identified.
+            tree = crate::fold::fold_constants(&tree).0;
             fitted = fit_constants(&mut tree, cfg, train.sample, train.sample); // #85 #87
             tree = expr::simplify(&tree);
         }
@@ -10092,6 +10121,10 @@ fn run_search(
     })
 }
 
+#[cfg(all(test, feature = "cuda"))]
+#[path = "gpu_fold_tests.rs"]
+mod gpu_fold_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11484,6 +11517,24 @@ mod tests {
             "the fitted constant must replace 3, got {}",
             shown
         );
+    }
+
+    /// #982: a standardised seed `c*(x*s + m) + d` is folded to one scale and
+    /// one offset before its CPU fit, and the fit reaches the line.
+    #[test]
+    fn prepare_seeds_folds_a_standardised_seed_before_the_fit() {
+        let x: Vec<Vec<f64>> = (0..200).map(|i| vec![-1.0 + i as f64 / 100.0]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 0.0104 * r[0] - 0.0028).collect();
+        let s = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
+        let cfg = Config { fit_iters: 8, metric: Metric::Squared, ..Config::default() };
+        let affine = node(Op::Add, vec![node(Op::Mul, vec![input(0), constant(1.7)]), constant(0.3)]);
+        let seed = node(Op::Add, vec![node(Op::Mul, vec![constant(0.5), affine]), constant(0.1)]);
+        let aggs = AggTable::from_sample(&s);
+        let data = EvalSample::new(&s, &cfg);
+        let accepted = prepare_seeds(&cfg, &data, &[seed], &aggs);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(expr::count_constants(&accepted[0].tree), 2, "{:?}", accepted[0].tree);
+        assert!(accepted[0].error < 1e-12, "error = {}", accepted[0].error);
     }
 
     /// #86: a carried individual must be refitted on the generation's rows
