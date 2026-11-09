@@ -15,7 +15,8 @@
 //! The rungs, in report order: `cash`, `buy_and_hold`, `equal_weight_universe`,
 //! `constant_long_flat`, `zero_param`, `ols_ridge`, `best_single_feature`,
 //! `vol_binned20`, `naive_reversal`, `top_tercile_long`, `feature_threshold`,
-//! `gbm`, `symbolic_regression`, `matched_exposure_random_long`. A rung whose
+//! `trend_ma`, `trend_donchian`, `gbm`, `symbolic_regression`,
+//! `matched_exposure_random_long`. A rung whose
 //! input column is not given is listed as `not_run` with the reason.
 //!
 //! OLS, GBM and the symbolic-regression score share the projection, the folds
@@ -32,6 +33,7 @@ use crate::protocol::{self, WindowRow};
 use crate::risk::{risk_stats, BetaAlpha, DEFAULT_SORTINO_MAR};
 use crate::target::TargetSpec;
 use crate::target_structure;
+use crate::trading_gpu::{band_positions, BandParams};
 use crate::walkforward::{quantile, SECONDS_PER_YEAR};
 use std::time::Instant;
 
@@ -49,6 +51,10 @@ const GBM_BINS: usize = 32;
 const GBM_CHECK_EVERY: usize = 5;
 const GBM_MIN_LEAF: usize = 20;
 const MAX_FIT_ROWS: usize = 200_000;
+pub const TREND_MA_COLS: [&str; 4] = ["ma20_ratio", "ma60_ratio", "mtf_4h_ma_ratio", "mtf_1d_ma_ratio"];
+pub const TREND_DONCHIAN_COLS: [&str; 4] = ["don20", "don96", "mtf_4h_donchian_pos", "mtf_1d_donchian_pos"];
+/// Band half-widths as multiples of the fit-row sd of the column.
+pub const TREND_BANDS: [f64; 4] = [0.0, 0.25, 0.5, 1.0];
 
 pub(crate) fn jstr(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
@@ -369,6 +375,11 @@ impl SrRun {
 pub struct Options {
     /// #926: write the per-period net series of every rung and the period grid (`series`).
     pub emit_series: bool,
+    /// #927: run the trend_ma and trend_donchian rungs.
+    pub trend_rungs: bool,
+    /// Columns of trend_ma and trend_donchian; empty means [`TREND_MA_COLS`] and [`TREND_DONCHIAN_COLS`].
+    pub trend_ma_cols: Vec<String>,
+    pub trend_donchian_cols: Vec<String>,
     pub cost_bps: f64,
     pub cost_grid: Vec<f64>,
     /// #487: where the cost and the return units came from. `None` is the
@@ -404,6 +415,9 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             emit_series: false,
+            trend_rungs: false,
+            trend_ma_cols: Vec::new(),
+            trend_donchian_cols: Vec::new(),
             cost_bps: DEFAULT_COST_BPS,
             cost_grid: DEFAULT_COST_GRID.to_vec(),
             cost: None,
@@ -983,6 +997,96 @@ fn score_rung(
     }
     r.trials = opts.quantiles.len() as u64;
     r.params = format!("quantile_by_fold={}", jarr(&chosen));
+    r.wall = started.elapsed().as_secs_f64();
+    r
+}
+
+
+/// #927: long/flat on a trend column with a no-trade band. Per fold, `theta` is
+/// the median and the band unit the sd of the column on the fit rows; the
+/// (column, band multiple) pair with the highest validation net at the ladder
+/// cost is scored once on the test rows. Every block starts flat. A column
+/// missing from the panel leaves the grid.
+fn trend_rung(
+    p: &Panel,
+    folds: &[Fold],
+    pool: &Pool,
+    opts: &Options,
+    name: &'static str,
+    defaults: &[&str],
+    custom: &[String],
+) -> Rung {
+    if !opts.trend_rungs {
+        return Rung::not_run(name, "model", "needs --trend-rungs");
+    }
+    let wanted: Vec<String> = if custom.is_empty() {
+        defaults.iter().map(|s| s.to_string()).collect()
+    } else {
+        custom.to_vec()
+    };
+    let cols: Vec<(&str, &[f64])> = wanted.iter().filter_map(|c| p.col(c).map(|v| (c.as_str(), v))).collect();
+    let missing: Vec<&str> = wanted.iter().map(|s| s.as_str()).filter(|c| p.col(c).is_none()).collect();
+    if cols.is_empty() {
+        return Rung::not_run(name, "model", "no trend column in the panel");
+    }
+    let started = Instant::now();
+    let side = opts.cost_bps * 1e-4;
+    let mut r = Rung::new(name, "model");
+    r.pos = vec![0.0; pool.len()];
+    r.score = vec![f64::NAN; pool.len()];
+    let mut chosen: Vec<String> = Vec::new();
+    for (fi, f) in folds.iter().enumerate() {
+        let groups_of = |rows: &[usize]| -> Vec<u64> { rows.iter().map(|&i| p.group[i]).collect() };
+        let (vg, tg) = (groups_of(&f.valid), groups_of(&f.test));
+        let mut best: Option<(f64, usize, usize, f64, f64)> = None;
+        for (ci, (_, col)) in cols.iter().enumerate() {
+            let fit: Vec<f64> = rows_of(col, &f.fit);
+            let theta = finite_quantile(&fit, 0.5);
+            if !theta.is_finite() {
+                continue;
+            }
+            let sd = crate::trading::score_sd(&fit).sd.unwrap_or(0.0);
+            let valid_x = rows_of(col, &f.valid);
+            for (bi, &m) in TREND_BANDS.iter().enumerate() {
+                let band = m * sd;
+                let Ok(params) = BandParams::new(theta, band, 1) else { continue };
+                let Ok(pos) = band_positions(&valid_x, &vg, &params) else { continue };
+                let net = net_sum_slice(p, &f.valid, &pos, side);
+                if best.map_or(true, |b| net > b.0) {
+                    best = Some((net, ci, bi, theta, band));
+                }
+            }
+        }
+        let (s, _) = pool.ranges[fi];
+        match best {
+            Some((_, ci, bi, theta, band)) => {
+                let test_x = rows_of(cols[ci].1, &f.test);
+                let params = BandParams { threshold: theta, band, min_hold: 1 };
+                let pos = band_positions(&test_x, &tg, &params).unwrap_or_else(|_| vec![0.0; test_x.len()]);
+                for (k, (&x, &q)) in test_x.iter().zip(&pos).enumerate() {
+                    r.score[s + k] = x;
+                    r.pos[s + k] = q;
+                }
+                chosen.push(format!("{}@{}", cols[ci].0, jnum(TREND_BANDS[bi])));
+            }
+            None => chosen.push("none".to_string()),
+        }
+    }
+    r.trials = (cols.len() * TREND_BANDS.len()) as u64;
+    r.params = format!(
+        "column@band_sd_multiple_by_fold={}; theta=fit-row median, band=multiple of fit-row sd, min_hold=1",
+        jarr_str(&chosen)
+    );
+    r.note = Some(if missing.is_empty() {
+        format!("selected on validation over {} columns x {} bands; trials counted", cols.len(), TREND_BANDS.len())
+    } else {
+        format!(
+            "selected on validation over {} columns x {} bands; trials counted; dropped (not in the panel): {}",
+            cols.len(),
+            TREND_BANDS.len(),
+            missing.join(",")
+        )
+    });
     r.wall = started.elapsed().as_secs_f64();
     r
 }
@@ -1602,6 +1706,9 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
         None => Rung::not_run("feature_threshold", "model", "needs --signal-col"),
     };
 
+    let trend_ma = trend_rung(p, folds, &pool, opts, "trend_ma", &TREND_MA_COLS, &opts.trend_ma_cols);
+    let trend_donchian = trend_rung(p, folds, &pool, opts, "trend_donchian", &TREND_DONCHIAN_COLS, &opts.trend_donchian_cols);
+
     // tuned GBM
     let started = Instant::now();
     let gbm = {
@@ -1700,6 +1807,8 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
     rungs.push(reversal);
     rungs.push(tercile);
     rungs.push(feature_threshold);
+    rungs.push(trend_ma);
+    rungs.push(trend_donchian);
     rungs.push(gbm);
     rungs.push(sr);
     rungs.push(matched);
@@ -1768,6 +1877,8 @@ fn finish_report(
         "naive_reversal",
         "top_tercile_long",
         "feature_threshold",
+        "trend_ma",
+        "trend_donchian",
     ];
     let mut best_rule = String::new();
     let mut best_rule_mean = f64::NEG_INFINITY;
@@ -2231,6 +2342,9 @@ pub fn load_panel(inp: &Input, opts: &Options) -> Result<Panel, String> {
     {
         extras.push(c.clone());
     }
+    if opts.trend_rungs {
+        extras.extend(opts.trend_ma_cols.iter().chain(&opts.trend_donchian_cols).cloned());
+    }
     if let Some(s) = &opts.spec {
         if let Some(c) = s.scale_column() {
             extras.push(c.to_string());
@@ -2328,6 +2442,9 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --vol-col <col>           volatility column for the 20-bin E[y|sigma] rung\n\
   --reversal-col <col>      lagged return column for the naive reversal rung\n\
   --signal-col <col>        feature for the 1[f > tau] rung\n\
+  --trend-rungs            add the trend_ma and trend_donchian rungs: long/flat on a trend column with a no-trade band; per fold theta is the fit-row median, the band a multiple (0, 0.25, 0.5, 1) of the fit-row sd, the (column, band) pair is chosen on validation net; 16 trials per rung\n\
+  --trend-cols <a,b,...>    columns of trend_ma (default ma20_ratio,ma60_ratio,mtf_4h_ma_ratio,mtf_1d_ma_ratio); a default column outside the loaded features is dropped with a note\n\
+  --trend-donchian-cols <a,b,...> columns of trend_donchian (default don20,don96,mtf_4h_donchian_pos,mtf_1d_donchian_pos)\n\
   --target-spec <file>      target spec file: per-side cost (cost_bps / 2), return units (log is converted with exp_m1), return column and horizon; also the zero-parameter rung (scale column must be in the panel)\n\
   --sr-run <run.json>       one search run (rcsr --objective ... --json-out) scored on every fold with the run's fixed threshold;\n\
                             a fold whose test starts before the run's last seen row + purge is refused (exit 3)\n\
@@ -2490,6 +2607,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             "--out" => out = Some(val()?),
             "--markdown" => markdown = Some(val()?),
             "--emit-series" => opts.emit_series = true,
+            "--trend-rungs" => opts.trend_rungs = true,
+            "--trend-cols" => opts.trend_ma_cols = val()?.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            "--trend-donchian-cols" => opts.trend_donchian_cols = val()?.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             "--json" => print_json = true,
             other => return Err(usage_err(format!("unknown argument '{}'", other))),
         }
