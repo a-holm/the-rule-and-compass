@@ -2289,8 +2289,9 @@ fn trend_opts(src: &str, out: &str, features: &str) -> Options {
     o
 }
 
-/// Daily OHLC of hourly rows built by hand: a day is kept only with all 24
-/// hours. Returns (day start, high, low, close) of every complete day.
+/// Daily OHLC of hourly rows built by hand, with the MTF daily-bar contract:
+/// every UTC day with at least one hour is a daily bar, built from the hours it
+/// has. Returns (day start, high, low, close) of every day.
 fn hand_days(rows: &[(i64, String, f64, f64, f64, f64, f64)]) -> std::collections::BTreeMap<i64, (f64, f64, f64)> {
     let mut by_day: std::collections::BTreeMap<i64, Vec<&(i64, String, f64, f64, f64, f64, f64)>> =
         std::collections::BTreeMap::new();
@@ -2299,7 +2300,6 @@ fn hand_days(rows: &[(i64, String, f64, f64, f64, f64, f64)]) -> std::collection
     }
     by_day
         .into_iter()
-        .filter(|(_, v)| v.len() == 24)
         .map(|(d, v)| {
             let hi = v.iter().map(|r| r.3).fold(f64::NEG_INFINITY, f64::max);
             let lo = v.iter().map(|r| r.4).fold(f64::INFINITY, f64::min);
@@ -2308,9 +2308,8 @@ fn hand_days(rows: &[(i64, String, f64, f64, f64, f64, f64)]) -> std::collection
         .collect()
 }
 
-/// Naive value of one trend leaf at day `d` from complete days only: plain
-/// sums, a two-pass variance, explicit loops. `None` when a day of the window
-/// is missing.
+/// Naive value of one trend leaf at day `d`: plain sums, a two-pass
+/// variance, explicit loops. `None` when a day of the window is missing.
 fn hand_leaf(name: &str, days: &std::collections::BTreeMap<i64, (f64, f64, f64)>, d: i64) -> Option<f64> {
     let get = |k: i64| days.get(&(d - k * TREND_DAY)).copied();
     let c = |k: i64| get(k).map(|x| x.2);
@@ -2412,30 +2411,43 @@ fn trend_group_adds_27_columns() {
 
 #[test]
 fn trend_columns_match_hand_built_daily_bars() {
-    let rows = trend_rows("AAA", 500 * 24, 0, 7);
-    assert_eq!(rows.len(), 12_000);
+    let full = trend_rows("AAA", 500 * 24, 0, 7);
+    assert_eq!(full.len(), 12_000);
+    // The same bars with holes: a start at 05:00, day 120 missing, two hours
+    // missing on day 200 and a day 310 with one hour only.
+    let holes: Vec<_> = full
+        .iter()
+        .filter(|r| {
+            let (d, h) = (r.0.div_euclid(TREND_DAY), r.0.rem_euclid(TREND_DAY) / 3600);
+            !(d == 0 && h < 5) && d != 120 && !(d == 200 && (h == 3 || h == 4)) && !(d == 310 && h != 12)
+        })
+        .cloned()
+        .collect();
+    assert_eq!(holes.len(), 12_000 - 5 - 24 - 2 - 23);
     let (_scratch, dir) = tmp_dir("trend-hand");
-    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
-    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
-    write_store(&src, &rows, 1024);
-    enrich::build(&trend_opts(&src, &out, "trend")).unwrap();
-    let days = hand_days(&rows);
-    let mut finite = 0usize;
-    for name in rcsr::trend::TREND_NAMES {
-        let got = column(&out, name);
-        assert_eq!(got.len(), rows.len());
-        for (i, r) in rows.iter().enumerate() {
-            let decision_day = r.0.div_euclid(TREND_DAY) * TREND_DAY;
-            match hand_leaf(name, &days, decision_day - TREND_DAY) {
-                Some(want) => {
-                    assert!(close_rel(got[i], want), "{name} row {i}: got {}, want {want}", got[i]);
-                    finite += 1;
+    for (tag, rows) in [("full", &full), ("holes", &holes)] {
+        let src = dir.join(format!("{tag}.rcsb")).to_string_lossy().into_owned();
+        let out = dir.join(format!("{tag}-out.rcsb")).to_string_lossy().into_owned();
+        write_store(&src, rows, 1024);
+        enrich::build(&trend_opts(&src, &out, "trend")).unwrap();
+        let days = hand_days(rows);
+        let mut finite = 0usize;
+        for name in rcsr::trend::TREND_NAMES {
+            let got = column(&out, name);
+            assert_eq!(got.len(), rows.len());
+            for (i, r) in rows.iter().enumerate() {
+                let decision_day = r.0.div_euclid(TREND_DAY) * TREND_DAY;
+                match hand_leaf(name, &days, decision_day - TREND_DAY) {
+                    Some(want) => {
+                        assert!(close_rel(got[i], want), "{tag}: {name} row {i}: got {}, want {want}", got[i]);
+                        finite += 1;
+                    }
+                    None => assert!(got[i].is_nan(), "{tag}: {name} row {i}: got {}, want NaN", got[i]),
                 }
-                None => assert!(got[i].is_nan(), "{name} row {i}: got {}, want NaN", got[i]),
             }
         }
+        assert!(finite > 27 * 2_000, "{tag}: only {finite} finite cells compared");
     }
-    assert!(finite > 27 * 2_000, "only {finite} finite cells compared");
 }
 
 #[test]
@@ -2467,16 +2479,17 @@ fn trend_warmup_first_finite_rows() {
         assert_eq!(f.lookback_seconds, rcsr::trend::lookback_seconds(name), "{name} lookback");
     }
 
-    // A series that starts at 13:00 drops its partial first day: 11 more rows.
+    // A series that starts at 13:00 keeps its partial first day as daily bar 0
+    // (the MTF contract): 13 rows fewer than a start at 00:00.
     let late = trend_rows("AAA", 60 * 24, 13 * 3600, 11);
     let src2 = dir.join("late.rcsb").to_string_lossy().into_owned();
     let out2 = dir.join("late-out.rcsb").to_string_lossy().into_owned();
     write_store(&src2, &late, 1024);
     let r2 = enrich::build(&trend_opts(&src2, &out2, "trend_ma20_ratio,trend_mom4w")).unwrap();
     let ma = r2.features.iter().find(|f| f.name == "trend_ma20_ratio").unwrap();
-    assert_eq!(ma.first_finite_row, Some(480 + 11));
+    assert_eq!(ma.first_finite_row, Some(480 - 13));
     let mom = r2.features.iter().find(|f| f.name == "trend_mom4w").unwrap();
-    assert_eq!(mom.first_finite_row, Some(696 + 11));
+    assert_eq!(mom.first_finite_row, Some(696 - 13));
 }
 
 /// Rows of `a` and `b` (same length) whose bits differ at a time before `t`.
@@ -2611,14 +2624,16 @@ fn trend_span_days(name: &str) -> i64 {
 
 #[test]
 fn trend_every_column_is_nan_across_a_gap() {
-    // Day 30 is missing entirely in one series; in the other it lacks one hour.
+    // Day 30 is missing entirely in one series, days 30 and 31 in the other.
     let total_days = 430i64;
     let gap = 30i64;
     let full = trend_rows("AAA", total_days as usize * 24, 0, 9);
-    let missing: Vec<_> = full.iter().filter(|r| r.0.div_euclid(TREND_DAY) != gap).cloned().collect();
-    let partial: Vec<_> = full.iter().filter(|r| r.0 != gap * TREND_DAY + 17 * 3600).cloned().collect();
+    let without = |skip: &[i64]| -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
+        full.iter().filter(|r| !skip.contains(&r.0.div_euclid(TREND_DAY))).cloned().collect()
+    };
     let (_scratch, dir) = tmp_dir("trend-gap");
-    for (tag, rows) in [("missing", &missing), ("partial", &partial)] {
+    for (tag, rows, last_gap) in [("one-day", without(&[gap]), gap), ("two-day", without(&[gap, gap + 1]), gap + 1)] {
+        let rows = &rows;
         let src = dir.join(format!("{tag}.rcsb")).to_string_lossy().into_owned();
         let out = dir.join(format!("{tag}-out.rcsb")).to_string_lossy().into_owned();
         write_store(&src, rows, 1024);
@@ -2629,7 +2644,7 @@ fn trend_every_column_is_nan_across_a_gap() {
             for (i, r) in rows.iter().enumerate() {
                 let j = r.0.div_euclid(TREND_DAY) - 1;
                 let warm = j + 1 < span;
-                let covers_gap = j - span < gap && gap <= j;
+                let covers_gap = j - span < last_gap && gap <= j;
                 if warm || covers_gap {
                     assert!(got[i].is_nan(), "{tag}: {name} row {i} (day {j}) must be NaN");
                 } else {
@@ -2637,15 +2652,65 @@ fn trend_every_column_is_nan_across_a_gap() {
                 }
             }
             // The first decision whose window no longer holds the gap day is
-            // finite again: N contiguous complete days after it.
-            let back = rows.iter().position(|r| r.0 == (gap + span + 1) * TREND_DAY).unwrap();
-            assert!(got[back].is_finite(), "{tag}: {name} must recover after {span} complete days");
+            // finite again: N contiguous days after it.
+            let back = rows.iter().position(|r| r.0 == (last_gap + span + 1) * TREND_DAY).unwrap();
+            assert!(got[back].is_finite(), "{tag}: {name} must recover after {span} contiguous days");
             // The day after the gap has its own bars, but the running day never
             // feeds a value: its rows read the gap day and are NaN.
-            let next = rows.iter().position(|r| r.0 == (gap + 1) * TREND_DAY + 12 * 3600).unwrap();
+            let next = rows.iter().position(|r| r.0 == (last_gap + 1) * TREND_DAY + 12 * 3600).unwrap();
             assert!(got[next].is_nan(), "{tag}: {name} must not read the running day");
         }
     }
+}
+
+#[test]
+fn trend_partial_day_is_a_daily_bar_as_in_mtf() {
+    // A start at 13:00, one hour missing on day 30, a day 90 with one hour only:
+    // partial days are daily bars built from the hours they have, exactly as
+    // the mtf_1d_* columns build them, so no window turns NaN.
+    let rows: Vec<_> = trend_rows("AAA", 420 * 24, 13 * 3600, 12)
+        .into_iter()
+        .filter(|r| {
+            let (d, h) = (r.0.div_euclid(TREND_DAY), r.0.rem_euclid(TREND_DAY) / 3600);
+            !(d == 30 && h == 17) && !(d == 90 && h != 9)
+        })
+        .collect();
+    let (_scratch, dir) = tmp_dir("trend-partial");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &rows, 1024);
+    enrich::build(&trend_opts(&src, &out, "trend,mtf_1d_ma_ratio,mtf_1d_vol")).unwrap();
+    for name in rcsr::trend::TREND_NAMES {
+        let got = column(&out, name);
+        let span = trend_span_days(name);
+        for (i, r) in rows.iter().enumerate() {
+            let j = r.0.div_euclid(TREND_DAY) - 1;
+            if j + 1 < span {
+                assert!(got[i].is_nan(), "{name} row {i} (day {j}) is warm-up");
+            } else {
+                assert!(got[i].is_finite(), "{name} row {i} (day {j}) must be finite: a partial day is a daily bar");
+            }
+        }
+    }
+    // The 20-day ratio is the mtf_1d_ma_ratio column bit for bit, and the
+    // scale of the _z leaves is mtf_1d_vol.
+    let (ratio, mtf_ratio) = (column(&out, "trend_ma20_ratio"), column(&out, "mtf_1d_ma_ratio"));
+    let (ratio_z, mtf_vol) = (column(&out, "trend_ma20_ratio_z"), column(&out, "mtf_1d_vol"));
+    let mut compared = 0usize;
+    for i in 0..rows.len() {
+        assert_eq!(ratio[i].to_bits(), mtf_ratio[i].to_bits(), "row {i}: trend {} mtf {}", ratio[i], mtf_ratio[i]);
+        if ratio_z[i].is_finite() {
+            assert_eq!(ratio_z[i].to_bits(), (ratio[i] / (mtf_vol[i] * 20f64.sqrt())).to_bits(), "row {i}");
+            compared += 1;
+        }
+    }
+    assert!(compared > 9_000, "only {compared} rows compared");
+    // The day with one hour is a bar whose close is that hour's close: the
+    // 4-week momentum read on day 119 divides by it.
+    let close90 = rows.iter().find(|r| r.0 == 90 * TREND_DAY + 9 * 3600).unwrap().5;
+    let close118 = rows.iter().filter(|r| r.0.div_euclid(TREND_DAY) == 118).last().unwrap().5;
+    let i = rows.iter().position(|r| r.0 == 119 * TREND_DAY + 6 * 3600).unwrap();
+    assert_eq!(column(&out, "trend_mom4w")[i], close118 / close90 - 1.0);
 }
 
 #[test]
