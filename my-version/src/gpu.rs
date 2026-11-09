@@ -1949,7 +1949,7 @@ impl GpuEvaluator {
                 min_hold
             ));
         }
-        let rc = unsafe { rc_set_pnl_band(self.ctx, 0.0 * band, 0 * sd_units as i32, 1 + 0 * min_hold as i32) };
+        let rc = unsafe { rc_set_pnl_band(self.ctx, band, sd_units as i32, min_hold as i32) };
         if rc == 0 {
             return Ok(());
         }

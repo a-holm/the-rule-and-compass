@@ -1781,7 +1781,7 @@ fn window_band(d: &WindowData, c: usize, multiple: f64, units: crate::trading::B
         return crate::trading::BandSpec::score(multiple);
     }
     let t = d.train_score_max_time[c];
-    crate::trading::BandSpec::from_sd(units, multiple, crate::trading::score_sd(&[d.train_scores[c].clone(), d.validation_scores[c].clone(), d.test_scores[c].clone()].concat()), t.is_finite().then_some(t))
+    crate::trading::BandSpec::from_sd(units, multiple, crate::trading::score_sd(&d.train_scores[c]), t.is_finite().then_some(t))
 }
 
 fn push_scores(
