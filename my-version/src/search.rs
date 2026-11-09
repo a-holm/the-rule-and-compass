@@ -251,6 +251,10 @@ pub struct Config {
     /// `0` keeps the historical path and `N` at least the sample size is an
     /// exact no-op. When both are set, `fit_rows` wins and is reported as such.
     pub fit_rows: usize,
+    /// #948: the fit rows when the training sample also holds book rows without a
+    /// fit label. Every constant fit and `--fit-rows` draw reads these rows only;
+    /// scoring reads the full training sample.
+    pub fit_view: Option<std::sync::Arc<Sample>>,
     /// #255: hard bound on how many admitted candidates one generation may
     /// refit with the exact CPU fallback arm. The first `N` fallbacks in the
     /// deterministic admission order are refit; any remainder keeps the finite
@@ -634,6 +638,7 @@ impl Default for Config {
             predictor_samples: None,
             fit_samples: 0, // #85: off by default
             fit_rows: 0,    // #116: off by default
+            fit_view: None,
             fit_fallback_max: DEFAULT_FIT_FALLBACK_MAX, // #255
             refit_band: DEFAULT_REFIT_BAND, // #495
             fit_stream_source: None,
@@ -3542,6 +3547,9 @@ fn search_score_objective(cfg: &Config) -> Option<crate::metrics::ScoreObjective
 /// resident book cannot represent and the fit arm's own row contract.
 #[cfg(feature = "cuda")]
 fn long_pnl_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
+    if cfg.fit_view.is_some() {
+        return Some("book rows without a fit label (--book-target): the device fit reads every training row");
+    }
     let Some(book) = cfg.fitness.book() else {
         return Some("the long_pnl fitness book was not rebuilt");
     };
@@ -4374,6 +4382,12 @@ fn fit_constants_with_iters(
     score: &Sample,
     iters: usize,
 ) -> Option<FitResult> {
+    let same_rows = std::ptr::eq(fit, score) && cfg.fit_view.is_none();
+    let full_fit = std::ptr::eq(fit, score);
+    let fit = match &cfg.fit_view {
+        Some(view) if full_fit => view.as_ref(),
+        _ => fit,
+    };
     if cfg.metric.is_implicit_derivative() {
         crate::implicit::fit(tree, &fit.x, &fit.w, iters);
         None
@@ -4387,7 +4401,7 @@ fn fit_constants_with_iters(
             cfg.metric,
             Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic
         );
-        let full_training_rows = std::ptr::eq(fit, score)
+        let full_training_rows = same_rows
             && cfg.fit_samples == 0
             && cfg.fit_rows == 0
             && cfg.predictor_samples.is_none();
@@ -4411,7 +4425,7 @@ fn fit_constants_with_iters(
             return Some(FitResult {
                 sse,
                 hash: expr::structural_hash(tree),
-                same_rows: std::ptr::eq(fit, score),
+                same_rows,
             });
         }
         // #116 + #117: strategy and metric together.
@@ -4431,7 +4445,7 @@ fn fit_constants_with_iters(
             hash: expr::structural_hash(tree),
             // #85: an SSE fitted on a screening subset is not the score of the
             // full sample, so the reuse below must stay off.
-            same_rows: std::ptr::eq(fit, score),
+            same_rows,
         })
     }
 }
@@ -4615,6 +4629,11 @@ fn training_for_generation(cfg: &Config, train: &Sample, generation: usize) -> O
 /// rows a generation is scored on.
 const FIT_SUBSET_SALT: u32 = 0x85F1_7A5B;
 
+/// #948: the rows constants are fitted on and drawn from.
+fn fit_base<'a>(cfg: &'a Config, sample: &'a Sample) -> &'a Sample {
+    cfg.fit_view.as_deref().unwrap_or(sample)
+}
+
 /// #85/#116: rows requested for the fit screen. `--fit-rows` takes precedence
 /// when both are set (the CLI says so), and both ignore a request at or above
 /// the sample size so that `--fit-rows N` with `N >= train` is an exact full
@@ -4625,7 +4644,7 @@ fn effective_fit_rows(cfg: &Config, sample: &Sample) -> usize {
     } else {
         cfg.fit_samples
     };
-    if cfg.fit_iters == 0 || request < 2 || request >= sample.len() {
+    if cfg.fit_iters == 0 || request < 2 || request >= fit_base(cfg, sample).len() {
         0
     } else {
         request
@@ -4678,7 +4697,7 @@ fn fit_subsample_on_device(cfg: &Config, sample: &Sample) -> bool {
 /// The fixed row indices of the device fit subsample, ascending.
 fn device_fit_indices(cfg: &Config, sample: &Sample) -> Vec<usize> {
     generation_subset(
-        sample.len(),
+        fit_base(cfg, sample).len(),
         effective_fit_rows(cfg, sample),
         cfg.seed ^ FIT_SUBSET_SALT,
         0,
@@ -5157,13 +5176,14 @@ fn fit_for_generation(cfg: &Config, sample: &Sample, generation: usize) -> Optio
     if !fit_sampling_active(cfg, sample) {
         return None;
     }
+    let base = fit_base(cfg, sample);
     let idx = generation_subset(
-        sample.len(),
+        base.len(),
         effective_fit_rows(cfg, sample),
         cfg.seed ^ FIT_SUBSET_SALT,
         generation,
     );
-    Some(subset_sample(sample, &idx))
+    Some(subset_sample(base, &idx))
 }
 
 /// #85: refit one screening survivor on the full training sample and score it
@@ -11072,6 +11092,55 @@ mod tests {
             "the reused SSE must equal the fresh score bit for bit"
         );
         assert_eq!(fitted_error.to_bits(), scored.error.to_bits());
+    }
+
+    /// #948: rows without a fit label (NaN target) stay in the scoring sample; the constant
+    /// fit and the `--fit-rows` draws read the rows with a label only, as on a pre-filtered sample.
+    #[test]
+    fn fit_view_keeps_label_free_rows_out_of_the_fit() {
+        let labelled = |i: usize| i % 5 != 0;
+        let (mut x, mut y, mut fx, mut fy) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for i in 0..80usize {
+            let a = (i as f64 * 0.37).sin();
+            let target = 0.7 * a + 0.1 * (i as f64 * 1.3).cos();
+            x.push(vec![a]);
+            y.push(if labelled(i) { target } else { f64::NAN });
+            if labelled(i) {
+                fx.push(vec![a]);
+                fy.push(target);
+            }
+        }
+        let union = Sample::new(x, y);
+        let fit = Sample::new(fx, fy);
+        let mut plain = Config::default();
+        plain.metric = Metric::Squared;
+        plain.fit_iters = 8;
+        let mut view = plain.clone();
+        view.fit_view = Some(std::sync::Arc::new(fit.clone()));
+
+        let mut a = node(Op::Mul, vec![constant(3.0), input(0)]);
+        let mut b = a.clone();
+        let with_view = fit_constants(&mut a, &view, &union, &union).expect("fit");
+        let on_fit_rows = fit_constants(&mut b, &plain, &fit, &fit).expect("fit");
+        assert!(with_view.sse.is_finite());
+        assert_eq!(with_view.sse.to_bits(), on_fit_rows.sse.to_bits());
+        assert!(!with_view.same_rows, "the SSE is over the fit rows, not the scoring rows");
+        assert_eq!(expr::eval(&a, &[0.3]).to_bits(), expr::eval(&b, &[0.3]).to_bits());
+
+        plain.fit_rows = 12;
+        view.fit_rows = 12;
+        for generation in 0..8 {
+            let drawn = fit_for_generation(&view, &union, generation).expect("a subsample is requested");
+            let control = fit_for_generation(&plain, &fit, generation).expect("a subsample is requested");
+            assert_eq!(drawn.len(), 12);
+            assert!(drawn.y.iter().all(|v| v.is_finite()), "generation {generation} drew a row without a label");
+            let bits = |s: &Sample| s.y.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&drawn), bits(&control));
+        }
+        assert_eq!(
+            fit_subsample_record(&view, &union).map(|r| (r.0, r.1)),
+            fit_subsample_record(&plain, &fit).map(|r| (r.0, r.1))
+        );
     }
 
     /// #87: when simplification folds a fitted constant, the stored SSE no
