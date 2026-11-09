@@ -1245,7 +1245,7 @@ fn resume_after_budget(tag: &str, saved_budget: &str, resume_extra: &[&str]) -> 
 /// #966: a resume without `--time-budget` has no budget, whatever was saved.
 #[test]
 fn resume_without_time_budget_flag_is_unlimited() {
-    let (ok, reason, gens) = resume_after_budget("unlimited", "1", &[]);
+    let (ok, reason, gens) = resume_after_budget("unlimited", "0.000000001", &[]);
     assert!(ok);
     assert_eq!((reason.as_str(), gens.as_str()), ("generations", "6"));
 }
