@@ -1,4 +1,6 @@
-//! Post-loop re-selection (#928): score a finished front under a selection
+//! Post-loop re-selection (#928): score     Some(&cp.archive)
+        .map(|a| Archive { items: a.items.clone(), cap: a.cap })
+        .ok_or_else finished front under a selection
 //! rule without running a search.
 
 use crate::data::Sample;
