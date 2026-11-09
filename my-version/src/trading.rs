@@ -1600,6 +1600,8 @@ pub struct FinalistReport {
     pub selection_rule: String,
     /// #928: object naming the front a re-selection read.
     pub reselected_from: Option<String>,
+    /// #929: the label whose return column prices the book, when it is not the fit label.
+    pub book_target: Option<String>,
     pub test: Result<PathStats, String>,
 }
 
@@ -1621,13 +1623,14 @@ impl FinalistReport {
             Err(e) => format!("{{\"unusable\":{}}}", crate::devlog::text(e)),
         };
         format!(
-            "{{\"name\":\"{}\",\"position\":\"{}\",\"selection\":\"{}\",\
+            "{{\"name\":\"{}\",{}\"position\":\"{}\",\"selection\":\"{}\",\
              \"selection_rule\":{{{}{}}},\"cost\":{},\"candidates\":{},\"usable_candidates\":{},\"exact\":\"cpu_f64\",\
              \"backend\":{},\"backend_reason\":{},\"spec\":{},\
              \"finalist\":{{\"expression\":{},\"expression_exact\":{},\"archive_rank\":{},\"constant\":{},\"fixed_position\":{},\"fixed_position_realised\":{},\"fit_metric\":{},\"fit_error\":{},\
              \"validation_error\":{},\"test_error\":{},\"validation_objective\":{}{}}},\
              \"validation\":{},\"test\":{}}}",
             self.objective.name(),
+            self.book_target.as_deref().map(|b| format!("\"book_target\":{},", crate::devlog::text(b))).unwrap_or_default(),
             self.spec.position.name(),
             self.selection,
             self.selection_rule,

@@ -233,6 +233,17 @@ INPUT:
                              standard deviation. Needs --fitness pnl
   --pnl-block-lambda L      weight of the block spread (default 1.0, finite,
                              >= 0; 0 is the plain mean). Needs --fitness pnl
+  --book-target COL         price the long/flat book on another label of the
+                             same --target-spec file: its return_column,
+                             horizon, entry offset and cost give the fitness,
+                             validation and test books, while --target keeps
+                             the constant fit (--metric). Rows of one group
+                             closer than the book horizon are refused (exit
+                             2); the purge is the larger required purge of
+                             the two specs. COL equal to --target is the
+                             plain run. Needs --objective pnl, sharpe or
+                             log_growth and forward_return labels. Rows with
+                             a NaN fit label are dropped from the book too
   --position long_only|top_tercile
                              long_only (default): 1[pred > --threshold]. top_tercile: per
                              timestamp the top floor(n/3) finite predictions are long (p=1),
@@ -2563,6 +2574,7 @@ fn main() {
     let mut fitness_arg: Option<String> = None;
     // #484: the time-block consistency term of the P&L fitness.
     let mut pnl_blocks_arg: Option<String> = None;
+    let mut book_target_arg: Option<String> = None;
     let mut pnl_lambda_arg: Option<String> = None;
     let mut trading_flags: Vec<&'static str> = Vec::new();
     let mut position_arg: Option<String> = None;
@@ -2871,6 +2883,10 @@ fn main() {
             "--fitness" => fitness_arg = Some(val!()),
             "--pnl-blocks" => pnl_blocks_arg = Some(val!()),
             "--pnl-block-lambda" => pnl_lambda_arg = Some(val!()),
+            "--book-target" => {
+                trading_flags.push("--book-target");
+                book_target_arg = Some(val!());
+            }
             "--position" => {
                 trading_flags.push("--position");
                 position_arg = Some(val!());
@@ -4366,6 +4382,25 @@ fn main() {
             }
         }
     };
+    // #929: the book label, from the same spec file as the fit label. Naming the
+    // fit label again is today's run.
+    let book_resolved: Option<target::Resolved> = match book_target_arg.as_deref() {
+        Some(book) if !multi_output && book != target_names[0] => {
+            let Some(fit) = target_resolved.as_ref() else {
+                trading_usage("--book-target needs a target spec holding both labels (--target-spec or <data>.targets.json)");
+            };
+            match target::resolve(&data_path, Some(fit.source.path()), book) {
+                Ok(r) => r,
+                Err(target::ResolveError::Usage(e)) => trading_usage(&e),
+                Err(target::ResolveError::Input(e)) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
+            }
+        }
+        Some(_) if multi_output => trading_usage("--book-target is not supported with multiple targets (--target y1,y2)"),
+        _ => None,
+    };
     if allow_target_structure && target_resolved.is_none() {
         eprintln!("error: --allow-target-structure needs a target spec (--target-spec or <data>.targets.json)");
         std::process::exit(EXIT_USAGE);
@@ -4628,11 +4663,11 @@ fn main() {
                         .as_deref()
                         .is_some_and(|o| rcsr::trading::Objective::parse(o).is_ok_and(|o| o.is_trading()));
                     if trading_requested {
-                        if let Some(c) = target_resolved.as_ref().and_then(|r| r.spec.return_column.as_deref()) {
+                        if let Some(c) = book_resolved.as_ref().or(target_resolved.as_ref()).and_then(|r| r.spec.return_column.as_deref()) {
                             if !fs.header().names().iter().any(|n| n == c) {
                                 eprintln!(
                                     "error: target spec '{}' declares return_column '{}', which is not in {}",
-                                    target_names[0], c, data_path
+                                    book_resolved.as_ref().map_or(target_names[0].as_str(), |b| b.spec.column.as_str()), c, data_path
                                 );
                                 std::process::exit(EXIT_INPUT);
                             }
@@ -4940,6 +4975,9 @@ fn main() {
     }
     if let (Some(r), None) = (&target_resolved, &target_check) {
         target_check = Some(enforce_target_check(&r.spec, &vars, allow_target_structure, require_clean_inputs));
+    }
+    if let Some(b) = &book_resolved {
+        enforce_target_check(&b.spec, &vars, allow_target_structure, require_clean_inputs);
     }
 
     let known_vars: Vec<usize> = vars.iter().filter_map(|v| table.index_of(v).ok()).collect();
@@ -5270,13 +5308,23 @@ fn main() {
                 name
             ));
         }
-        let ts = match &target_resolved {
+        let ts = match book_resolved.as_ref().or(target_resolved.as_ref()) {
             Some(r) => &r.spec,
             None => trading_usage(&format!(
                 "--objective {} needs a forward-return target: declare it with --target-spec",
                 name
             )),
         };
+        if let (Some(b), Some(f)) = (&book_resolved, &target_resolved) {
+            for s in [&b.spec, &f.spec] {
+                if s.kind != "forward_return" {
+                    trading_usage(&format!(
+                        "--book-target needs forward_return labels on both sides, '{}' declares '{}'",
+                        s.column, s.kind
+                    ));
+                }
+            }
+        }
         if ts.kind != "forward_return" && ts.kind != target::KIND_XS_RANK {
             trading_usage(&format!(
                 "--objective {} needs a forward_return or xs_rank target, the spec declares '{}'",
@@ -5426,7 +5474,9 @@ fn main() {
         },
         allow_lockbox,
         declared_lockbox,
-        purge_seconds: target_resolved.as_ref().map(|r| r.spec.required_purge_seconds()),
+        purge_seconds: target_resolved.as_ref().map(|r| {
+            book_resolved.as_ref().map_or(0.0, |b| b.spec.required_purge_seconds()).max(r.spec.required_purge_seconds())
+        }),
         boundary_purge_seconds: multi_boundary_purge,
         trading: trading_cols.clone(),
         canonical_train_order: fitness_pnl, // #480
@@ -5538,9 +5588,9 @@ fn main() {
 
     // #468: the long/flat book earns the full per-row return, so rows of one
     // group must not be closer than the label horizon.
-    let target_horizon = target_resolved.as_ref().map_or(0.0, |r| r.spec.horizon_seconds);
+    let target_horizon = book_resolved.as_ref().or(target_resolved.as_ref()).map_or(0.0, |r| r.spec.horizon_seconds);
     let mut min_group_step: Option<f64> = None;
-    if let (Some(_), Some(split), Some(r)) = (&trading_spec, prepared.trading.as_ref(), target_resolved.as_ref()) {
+    if let (Some(_), Some(split), Some(r)) = (&trading_spec, prepared.trading.as_ref(), book_resolved.as_ref().or(target_resolved.as_ref())) {
         let horizon = r.spec.horizon_seconds;
         for slice in split.validation.iter().chain(std::iter::once(&split.test)) {
             match rcsr::trading::check_return_spacing(&slice.rows, horizon) {
@@ -7194,6 +7244,7 @@ fn main() {
                 test_error: top.test_error,
                 validation_value: top.objective_value,
                 search_fitness: fitness_book.as_ref().map(|_| "long_pnl_regret"),
+                book_target: book_resolved.as_ref().map(|b| b.spec.column.clone()),
                 selection: select_rule.name(),
                 selection_rule: selection_rule_fields.clone(),
                 reselected_from: reselected_from.clone(),
@@ -8231,7 +8282,7 @@ fn main() {
                 backend_json,
                 match &fitness_book {
                     Some(b) => format!(
-                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}{}}},",
+                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}{}{}}},",
                         b.len(),
                         b.groups(),
                         jnum(b.side()),
@@ -8239,6 +8290,7 @@ fn main() {
                         jnum(b.bound()),
                         b.min_trades(),
                         b.hash(),
+                        book_resolved.as_ref().map(|r| format!("\"book_target\":{},", jstr(&r.spec.column))).unwrap_or_default(),
                         // #484: omitted for one block, so the default report is unchanged.
                         if b.blocks() > 1 {
                             format!(
