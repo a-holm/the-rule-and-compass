@@ -1044,10 +1044,15 @@ fn protocol_usage() -> &'static str {
       report and records the choice). Needs a ledger with no seal and no read.
       The first locked read writes <data>.locked_reads.jsonl beside the store;
       a read through any other ledger is refused.
-  selectors --windows FILE --label LABEL --time-col COL [--scheme S]
+  selectors --windows FILE --label LABEL --time-col COL [--scheme S] [--gap-seconds N]
       Print `--train-select` and `--test-select` for one window. The purge is in
       the train range (train_end = test_start - purge), in time and for every
-      symbol; `--gap` does not apply to explicit selectors.
+      symbol; `--gap` does not apply to explicit selectors. --gap-seconds N also
+      prints a second line `sensitivity_fold gap_seconds=N --train-select ...
+      --test-select ...` whose training range ends at test_start - N (or at
+      train_end when that is earlier), for example N = 31622400 for the 366-day
+      lookback of the trend family. It is a robustness view beside the normal
+      fold, not the leakage guard; a gap that leaves no training time exits 2.
   verify --ledger FILE [--data PATH] [--sealed FILE] [--expect-reads N]
       Check the ledger hash chain and print the line and read counts. A file
       whose last line has no newline, or a line that is not one complete JSON
@@ -1096,6 +1101,7 @@ pub fn run(args: &[String]) -> ! {
     let mut data: Option<String> = None;
     let mut range: Option<String> = None;
     let mut sealed: Option<String> = None;
+    let mut gap_seconds: Option<f64> = None;
     let mut i = 1;
     while i < args.len() {
         let value = |i: usize| -> String {
@@ -1170,6 +1176,16 @@ pub fn run(args: &[String]) -> ! {
             }
             "--range" => {
                 range = Some(value(i));
+                i += 1;
+            }
+            "--gap-seconds" => {
+                gap_seconds = Some(
+                    value(i)
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .unwrap_or_else(|| fail("--gap-seconds needs a non-negative number".to_string(), 2)),
+                );
                 i += 1;
             }
             other => fail(format!("unknown protocol option '{}'\n\n{}", other, protocol_usage()), 2),
@@ -1247,6 +1263,10 @@ pub fn run(args: &[String]) -> ! {
                 .unwrap_or_else(|| fail(format!("no window labelled '{}'", label), 1));
             let (train, test) = selector_exprs(row, &col);
             println!("--train-select '{}' --test-select '{}'", train, test);
+            if let Some(gap) = gap_seconds {
+                let (train, test) = sensitivity_selector_exprs(row, &col, gap).unwrap_or_else(|e| fail(e, 2));
+                println!("sensitivity_fold gap_seconds={} --train-select '{}' --test-select '{}'", gap, train, test);
+            }
         }
         "candidates" => {
             let l = need_ledger();
@@ -1273,6 +1293,24 @@ pub fn selector_exprs(row: &WindowRow, time_col: &str) -> (String, String) {
         format!("{} >= {} and {} < {}", time_col, w.train_start, time_col, w.train_end),
         format!("{} >= {} and {} < {}", time_col, w.test_start, time_col, w.test_end),
     )
+}
+
+/// Selectors of the sensitivity fold: the window with its training range
+/// ending `gap` seconds before the test start, or at its own end when that is
+/// earlier. An empty training range is refused.
+pub fn sensitivity_selector_exprs(row: &WindowRow, time_col: &str, gap: f64) -> Result<(String, String), String> {
+    let w = &row.window;
+    let train_end = w.train_end.min(w.test_start - gap);
+    if train_end <= w.train_start {
+        return Err(format!(
+            "--gap-seconds {} leaves no training time in window '{}' (train starts {}, test starts {})",
+            gap, w.label, w.train_start, w.test_start
+        ));
+    }
+    Ok((
+        format!("{} >= {} and {} < {}", time_col, w.train_start, time_col, train_end),
+        format!("{} >= {} and {} < {}", time_col, w.test_start, time_col, w.test_end),
+    ))
 }
 
 /// One line of `<data>.locked_reads.jsonl`, the read marker kept with the store.

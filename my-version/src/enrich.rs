@@ -79,6 +79,7 @@ pub const GROUPS: &[&str] = &[
     "compact",
     "flow",
     "price_action",
+    "trend",
     "all",
 ];
 
@@ -1330,6 +1331,7 @@ pub fn expand(spec: &str) -> Result<Vec<String>, String> {
             "compact" => compact_names(),
             "flow" => flow_names(),
             "price_action" => price_action_names(),
+            "trend" => crate::trend::trend_names(),
             "derivatives" => return Err(crate::derivatives::group_refusal()),
             "all" => {
                 let mut v = Vec::new();
@@ -1344,6 +1346,8 @@ pub fn expand(spec: &str) -> Result<Vec<String>, String> {
             other => {
                 if is_own(other) {
                     vec![other.to_string()]
+                } else if other.starts_with("trend_") {
+                    return Err(crate::trend::unknown_name(other));
                 } else if features::expand(other).is_ok() {
                     // #125 group or name.
                     features::expand(other)?
@@ -1377,6 +1381,7 @@ pub fn is_own(name: &str) -> bool {
         || is_mtf(name)
         || cross_names().iter().any(|n| n == name)
         || PRICE_ACTION_NAMES.contains(&name)
+        || crate::trend::is_trend(name)
     {
         return true;
     }
@@ -1487,6 +1492,9 @@ pub fn nominal_warmup(name: &str) -> usize {
     if let Some((_, leaf)) = mtf_parts(name) {
         return mtf_warmup(leaf);
     }
+    if let Some(d) = crate::trend::first_finite_day(name) {
+        return d;
+    }
     if let Some(w) = compact_warmup(name) {
         return w;
     }
@@ -1596,6 +1604,9 @@ fn known_lookback_names() -> &'static BTreeSet<String> {
 pub fn lookback_seconds(name: &str, bar_seconds: i64) -> Option<i64> {
     if let Some((tf, leaf)) = mtf_parts(name) {
         return Some((mtf_lookback_bars(leaf) + 2) * mtf_seconds(tf));
+    }
+    if let Some(l) = crate::trend::lookback_seconds(name) {
+        return Some(l);
     }
     if let Some((_, kind)) = crate::labels::parse_column(name) {
         let scaled = crate::labels::COLUMN_KINDS.iter().any(|(k, s)| *k == kind && *s);
@@ -2244,6 +2255,7 @@ pub enum OpClass {
     Join,
     Py15mPass,
     CompactPass,
+    Trend,
 }
 
 impl OpClass {
@@ -2259,6 +2271,7 @@ impl OpClass {
         OpClass::Join,
         OpClass::Py15mPass,
         OpClass::CompactPass,
+        OpClass::Trend,
     ];
 
     pub fn index(self) -> usize {
@@ -2288,6 +2301,7 @@ impl OpClass {
             OpClass::Join => "join",
             OpClass::Py15mPass => "py15m-pass",
             OpClass::CompactPass => "compact-pass",
+            OpClass::Trend => "trend-join",
         }
     }
     /// Order in which a family takes the class of its costliest shared pass.
@@ -2317,6 +2331,7 @@ impl OpClass {
             OpClass::Join => (0.0, 2777.8),
             OpClass::Py15mPass => (1780.0, 45.0),
             OpClass::CompactPass => (13780.0, 0.0),
+            OpClass::Trend => (170.0, 87.0),
         }
     }
     /// Device kernel throughput in cells per second.
@@ -2334,6 +2349,7 @@ impl OpClass {
             OpClass::Join => 100_000_000.0,
             OpClass::Py15mPass => 59_000_000.0,
             OpClass::CompactPass => 36_000_000.0,
+            OpClass::Trend => 80_000_000.0,
         }
     }
 }
@@ -2399,6 +2415,9 @@ pub fn family_of(name: &str) -> &'static str {
     }
     if is_mtf(name) {
         return "mtf";
+    }
+    if crate::trend::is_trend(name) {
+        return "trend";
     }
     match name {
         "ret1" | "ret5" => return "returns",
@@ -2547,8 +2566,9 @@ pub fn device_kernel_exists(name: &str) -> bool {
         // Cross-sectional ranks use the device segmented sort in the xs pass.
         return true;
     }
-    if is_mtf(name) {
-        // #296: the complete MTF family has a device resample + causal join.
+    if is_mtf(name) || crate::trend::is_trend(name) {
+        // #296: the complete MTF family has a device resample + causal join;
+        // #932: the trend family reuses its daily buckets and join.
         return true;
     }
     if name == "ret1" || name == "ret5" {
@@ -2738,7 +2758,7 @@ pub struct ClassRate {
 pub const COMPACT_NO_BENCHMARK_ANCHOR_MS: f64 = 3030.0;
 
 /// Number of [`OpClass`] variants.
-pub const OP_CLASSES: usize = 11;
+pub const OP_CLASSES: usize = 12;
 
 /// Every rate the enrich planner reads. [`EnrichRates::anchors`] holds the
 /// measured constants; a calibration file can replace them.
@@ -3240,7 +3260,7 @@ pub fn plan_groups_rated(
                     n_segments, FUSED_MIN_SEGMENTS, group
                 ),
             ))
-        } else if op == OpClass::Mtf && n_segments < FUSED_MIN_SEGMENTS {
+        } else if matches!(op, OpClass::Mtf | OpClass::Trend) && n_segments < FUSED_MIN_SEGMENTS {
             // The MTF kernels run one thread per symbol segment: a few long
             // segments leave the device idle.
             Some((
@@ -6224,7 +6244,8 @@ fn compute_series(
         }
     }
     if !ctx.mtf.is_empty() {
-        let all = mtf_all(s, &ctx.mtf)?;
+        let mut all = mtf_all(s, &ctx.mtf)?;
+        all.extend(crate::trend::compute(&s.bars(), s.step, &ctx.mtf)?);
         for name in &ctx.mtf {
             let values = all
                 .get(name)
@@ -7350,6 +7371,9 @@ fn enrich_inner(
     if requested.is_empty() && opts.labels.is_empty() {
         return Err("enrich needs --features and/or --label".to_string());
     }
+    if requested.iter().any(|n| crate::trend::is_trend(n)) {
+        crate::trend::check_bar(step)?;
+    }
     // The target spec names `vol<W>` as the scale column, so the store carries it.
     for src in opts.labels.iter().filter(|l| l.trim_start().starts_with("long:")) {
         let scale = format!("vol{}", crate::labels::LongLabelSpec::declared_sigma_window(src));
@@ -7404,7 +7428,7 @@ fn enrich_inner(
             // Computed in the whole-panel market-state pass. The five py15m
             // names are still produced by `py15m_all` and overwritten by the
             // canonical #273 pass below, so they are tracked there.
-        } else if is_mtf(n) {
+        } else if is_mtf(n) || crate::trend::is_trend(n) {
             // Computed by the per-symbol resample + causal join pass.
             mtf_requested.push(n.clone());
         } else if is_own(n) {
@@ -7612,6 +7636,8 @@ fn enrich_inner(
             OpClass::Join
         } else if is_mtf(name) {
             OpClass::Mtf
+        } else if crate::trend::is_trend(name) {
+            OpClass::Trend
         } else {
             OpClass::Elementwise
         }
@@ -7845,7 +7871,7 @@ fn enrich_inner(
         // reads only the base columns the projection also needs (time + OHLC).
         let mtf_wanted: Vec<String> = gpu_names
             .iter()
-            .filter(|n| is_mtf(n))
+            .filter(|n| is_mtf(n) || crate::trend::is_trend(n))
             .cloned()
             .collect();
         if !mtf_wanted.is_empty() {
@@ -7892,7 +7918,8 @@ fn enrich_inner(
                         "warning: device MTF failed ({e}); computing {} columns on the CPU",
                         mtf_wanted.len()
                     );
-                    fallback_log.record("mtf", &e.to_string(), mtf_wanted.iter().map(String::as_str));
+                    fallback_log.record("mtf", &e.to_string(), mtf_wanted.iter().map(String::as_str).filter(|n| is_mtf(n)));
+                    fallback_log.record("trend", &e.to_string(), mtf_wanted.iter().map(String::as_str).filter(|n| crate::trend::is_trend(n)));
                 }
             }
             for name in &mtf_wanted {
@@ -9108,6 +9135,12 @@ pub fn run(args: &[String]) -> ! {
     if opts.features.is_empty() && opts.labels.is_empty() {
         fail("enrich needs --features and/or --label");
     }
+    for spec in &opts.features {
+        if let Err(e) = crate::trend::check_spec(spec) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_USAGE);
+        }
+    }
     let resolved = crate::lockbox::resolve_retired(locked_test.as_deref(), None, &opts.data, retired.as_deref()).unwrap_or_else(|e| {
         eprintln!("error: {}", e.message.replacen("--lockbox", "--locked-test", 2));
         std::process::exit(e.exit);
@@ -9128,6 +9161,10 @@ pub fn run(args: &[String]) -> ! {
     }
     let report = match enrich(&opts) {
         Ok(r) => r,
+        Err(e) if e.starts_with(crate::trend::BAR_REFUSAL) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_USAGE);
+        }
         Err(e) => fail(&e),
     };
     if !opts.dry_run {
@@ -9335,7 +9372,23 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
              and completes the twelve-name default block. The eleven columns
              have a fused CUDA producer; `rcsr schema` declares their
              bitwise/1e-12 parity tier.
-  all        every legacy group above except cross, py15m, mtf, compact, flow and price_action
+  trend      the 27 long-term trend columns (#932), opt-in and not part of
+             the default financial feature set: trend_ma{20,50,100,200}_ratio
+             (close / SMA_N - 1), trend_ma{N}_slope (SMA_N(j) / SMA_N(j-N/5)
+             - 1), trend_don364_pos, trend_hi364_dist, trend_lo364_dist (52-week
+             Donchian position and distances), trend_mom{4,12,26,52}w (close
+             over the close 7k days back - 1), and _z versions of the ratios,
+             slopes and momenta scaled by s20 * sqrt(T) (s20 = population sd of
+             20 one-day simple returns). Every leaf reads closed UTC daily bars:
+             a row at t sees the day before its own day, never the running day.
+             Daily bars are the mtf_1d_* bars: a day with any base bar is a
+             bar built from the bars it has; a missing day makes every window
+             that contains it NaN. The base bar must divide 86400 s (else exit 2);
+             an unknown trend_* name exits 2. A store with the family declares
+             a lookback embargo of 31622400 s (trend_mom52w, 366 days). With
+             --features cuda the family shares the MTF daily resample and join
+             on the device: bitwise except the _z leaves (<=1e-12).
+  all        every legacy group above except cross, py15m, mtf, compact, flow, price_action and trend
 
   #125 names and groups (ta:core, ta:full, exotic:cheap, candle:geometry,
   cross:btc, calendar) are also accepted and are computed by `rcsr::features`.

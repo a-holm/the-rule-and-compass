@@ -66,7 +66,7 @@ struct Plan {
     host_once: bool,
 }
 
-const PLANS: [Plan; 6] = [
+const PLANS: [Plan; 7] = [
     Plan {
         op: OpClass::Elementwise,
         stage: Stage::Feature,
@@ -97,6 +97,14 @@ const PLANS: [Plan; 6] = [
         small: "mtf_1h_ret1",
         large: "mtf_1h_ret1,mtf_1h_ret4,mtf_1h_ret24,mtf_1h_ma_ratio,mtf_1h_vol,mtf_1h_atr_pct,mtf_1h_rsi,mtf_1h_close_pos,mtf_1h_donchian_pos,mtf_1h_range_pct,mtf_1h_trend_slope,mtf_1h_bar_age",
         counts: (1, 12),
+        host_once: false,
+    },
+    Plan {
+        op: OpClass::Trend,
+        stage: Stage::Feature,
+        small: "trend_ma20_ratio",
+        large: "trend_ma20_ratio,trend_ma50_ratio,trend_ma100_ratio,trend_ma200_ratio,trend_ma20_slope,trend_ma50_slope,trend_ma100_slope,trend_ma200_slope,trend_don364_pos,trend_hi364_dist,trend_lo364_dist,trend_mom4w,trend_mom12w,trend_mom26w,trend_mom52w,trend_ma20_ratio_z,trend_ma50_ratio_z,trend_ma100_ratio_z,trend_ma200_ratio_z,trend_ma20_slope_z,trend_ma50_slope_z,trend_ma100_slope_z,trend_ma200_slope_z,trend_mom4w_z,trend_mom12w_z,trend_mom26w_z,trend_mom52w_z",
+        counts: (1, 27),
         host_once: false,
     },
     Plan {
