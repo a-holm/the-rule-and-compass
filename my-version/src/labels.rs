@@ -167,9 +167,10 @@ impl LongLabelSpec {
         self.entry_offset_seconds() + self.horizon_seconds() + self.delay_seconds()
     }
 
-    /// Bars per series before a locked start whose label window reaches it.
+    /// Bars per series before a locked start whose label window reaches it: the
+    /// `k >= 1` with `k * bar_seconds < purge_seconds`.
     pub fn purge_rows(&self) -> i64 {
-        (self.purge_seconds() + self.bar_seconds - 1) / self.bar_seconds
+        ((self.purge_seconds() + self.bar_seconds - 1) / self.bar_seconds - 1).max(0)
     }
 
     /// Whether row `index` of a series, stamped `time`, is a decision row.
@@ -944,7 +945,7 @@ impl LabelAccumulator {
         let purge = self.spec.purge_seconds();
         let ranges = [self.range, self.also];
         let embargo = self.embargo;
-        move |t: i64| ranges.iter().flatten().all(|r| t + purge <= r.start || t >= r.end + embargo)
+        move |t: i64| ranges.iter().flatten().all(|r| !r.reaches(t, purge, embargo))
     }
 
     /// Builds the labels of one series with the weights normalised over the
