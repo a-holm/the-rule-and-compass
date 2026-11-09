@@ -246,7 +246,9 @@ INPUT:
                              2); the purge is the larger required purge of
                              the two specs. COL equal to --target is the
                              plain run. Needs --objective pnl, sharpe or
-                             log_growth and forward_return labels. A row with
+                             log_growth and forward_return labels. The book
+                             label must declare a return_column (exit 2
+                             otherwise) A row with
                              a NaN fit label and a finite book return stays in
                              the book; the constant fit and --fit-rows read the
                              labelled rows only (CUDA builds fall back to the
@@ -5423,6 +5425,14 @@ fn main() {
                 "the target is scaled, clipped or offset: declare a return_column in the \
                  target spec so the P&L uses realised returns",
             );
+        }
+        if let Some(b) = &book_resolved {
+            if b.spec.return_column.is_none() {
+                trading_usage(&format!(
+                    "--book-target: book target '{}' declares no return_column, so the book would be priced on the fit label: declare a return_column in the target spec",
+                    b.spec.column
+                ));
+            }
         }
         trading_cols = Some(data::TradingColumns {
             return_column: ts.return_column.clone(),
