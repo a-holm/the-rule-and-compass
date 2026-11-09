@@ -306,8 +306,8 @@ fn assert_fit_ledger(g: &rcsr::search::GpuRunStats) {
     assert!(g.ledger.device_busy_s() <= g.ledger.device_busy_sum_s() + 1e-12);
     if g.fit_gpu > 0 {
         assert!(g.ledger.fit_kernel_s() > 0.0, "a device fit must be recorded");
-        assert!(g.ledger.fit_host_s() >= g.ledger.fit_kernel_s());
-        assert!(g.ledger.fit_host_s() >= g.ledger.fit_fallback_s());
+        assert!(g.fit_calls > 0, "a device fit must launch a call: {:?}", g.ledger);
+        assert!(g.fit_call_candidates >= g.fit_gpu, "{:?}", g.ledger);
     }
 }
 
@@ -1169,8 +1169,8 @@ fn bench_end_to_end() {
                     g.fit_attempts,
                     "the ledger must count every admitted fit once"
                 );
-                assert!(g.ledger.fit_host_s() >= g.ledger.fit_kernel_s());
-                assert!(g.ledger.fit_host_s() >= g.ledger.fit_fallback_s());
+                assert!(g.fit_calls > 0, "a device fit must launch a call");
+                assert!(g.fit_call_candidates >= g.fit_gpu);
             }
             eprintln!(
 "  time: fit_host={:.2}s ({:.1}% of wall) kernel={:.2}s fallback={:.2}s bounded={}/{} workers={} duty={:.1}% run_duty={:.1}%",
