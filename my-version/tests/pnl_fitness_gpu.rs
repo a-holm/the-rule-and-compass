@@ -1160,6 +1160,17 @@ fn device_band_totals_equal_the_cpu_at_a_million_rows() {
     assert!(n == 0 || n >= 3 * 8, "{n} trading programs");
 }
 
+/// #945: more candidates than one band launch holds ballots for (1,024), so
+/// the last ones run in a second launch from a candidate offset.
+#[test]
+fn device_band_totals_equal_the_cpu_over_two_launches() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&[0, 31, 5000, 8191, 8193], 9_000, 19);
+    let pairs = [(0.3, 1, BandUnits::Score), (0.2, 3, BandUnits::Sd)];
+    let n = assert_band_books(&f, &band_programs(1_030, 41), &pairs, &[1]);
+    assert!(n == 0 || n >= 2 * 100, "{n} trading programs");
+}
+
 /// The #925 training-score sd: the mean, then the centred sum of squares,
 /// each summed per lane, lane tree and warp tree in the device order.
 fn two_pass_tree_sd(x: &[f64]) -> Option<f64> {
@@ -1338,7 +1349,9 @@ fn band_pipelined_search_archives_device_scores() {
 }
 
 /// Throughput of the band kernels against the plain kernel on the same
-/// 1,000,000 rows and programs; the sd units add the reduction kernel.
+/// 1,000,000 rows and programs; the sd units add the reduction kernel. Prints
+/// each book's rate, its ratio to plain and the device time per batch of the
+/// sd kernel and of the scorer.
 #[test]
 #[ignore]
 fn long_pnl_band_throughput_against_plain() {
@@ -1379,15 +1392,19 @@ fn long_pnl_band_throughput_against_plain() {
         }
         let reps = 10;
         let t = std::time::Instant::now();
-        let mut kernel_ms = 0.0f64;
+        let (mut kernel_ms, mut sd_ms, mut score_ms) = (0.0f64, 0.0f64, 0.0f64);
         for _ in 0..reps {
             let s = ev.score_batch(prog, off, ScoreObjective::LongPnl, &zeros);
             assert!(s.ms >= 0.0);
             kernel_ms += s.ms as f64;
+            let (sd, score) = ev.long_pnl_kernel_ms_for_tests().expect("the kernel times");
+            sd_ms += sd;
+            score_ms += score;
         }
         let rate = (n * trees.len()) as f64 / (t.elapsed().as_secs_f64() / reps as f64);
         let kernel = (n * trees.len()) as f64 / (kernel_ms / reps as f64 / 1000.0);
-        println!("{name}: {rate:.3e} row-evals/s (kernel {kernel:.3e})");
+        let (sd_ms, score_ms) = (sd_ms / reps as f64, score_ms / reps as f64);
+        println!("{name}: {rate:.3e} row-evals/s (kernel {kernel:.3e}; per batch: sd kernel {sd_ms:.2} ms, scorer {score_ms:.2} ms)");
         rates.push(rate);
     }
     let base = rates[0].max(rates[5]);
