@@ -273,7 +273,7 @@ pub fn make_folds(
             }
             if t >= win.train_start && t < fit_end {
                 f.fit.push(i);
-            } else if t >= w.validation_start && t < valid_end {
+            } else if t >= w.validation_start && t < win.train_end {
                 f.valid.push(i);
             } else if t >= win.test_start && t < win.test_end {
                 f.test.push(i);

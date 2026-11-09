@@ -171,7 +171,7 @@ impl ProtocolOptions {
         let purge = self.required_purge_seconds(spec.horizon).max(spec.embargo_seconds());
         self.locked_ranges
             .iter()
-            .map(|&(s, e)| (s as f64, e as f64, s as f64 - purge, e as f64 + (self.locked_embargo.max(0) as f64).max(purge)))
+            .map(|&(s, e)| (s as f64, e as f64, s as f64 - purge, (e + self.locked_embargo.max(0)) as f64))
             .collect()
     }
 }
