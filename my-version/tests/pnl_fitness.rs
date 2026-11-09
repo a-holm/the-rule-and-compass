@@ -1396,14 +1396,31 @@ fn band_sd_recorded_in_run_json() {
     assert_eq!(s.get("band_sd_degenerate"), Some(&Json::Bool(false)));
 }
 
-/// Robust finalist selection prices each member with its own sd band, and
-/// the finalist's books use the band of its validation book.
+/// Robust finalist selection prices each member with its own sd band: its
+/// trade count on the validation rows is the member's validation book count.
 #[test]
 fn band_sd_robust_selection_uses_member_bands() {
     let (_scratch, dir) = scratch();
     let data = write_csv(&dir, 900);
     let spec = write_spec(&dir);
     let j = json(&run(&data, &spec, &[&SD_ARGS[..], &["--select-rule", "robust"]].concat()));
+    assert_eq!(at(&j, &["objective", "selection_rule", "rule"]).as_str(), Some("robust"));
+    let robust = match at(&j, &["objective", "selection_rule", "members"]) {
+        Json::Arr(a) => a,
+        _ => panic!("selection_rule.members is not an array"),
+    };
+    let mut compared = 0usize;
+    for r in robust {
+        let rank = num(r, &["archive_rank"]);
+        let member = pareto(&j).iter().find(|m| num(m, &["archive_rank"]) == rank).expect("a front member per rank");
+        let book = at(member, &["validation_book"]);
+        if book.get("objective").and_then(Json::as_f64).is_some_and(f64::is_finite) && num(r, &["trades"]) > 0.0 {
+            assert_eq!(num(r, &["trades"]), num(book, &["trades"]), "archive rank {rank}");
+            assert!(book.get("band_sd").and_then(Json::as_f64).is_some());
+            compared += 1;
+        }
+    }
+    assert!(compared >= 2, "{compared} members compared");
     let finalist = at(&j, &["objective", "finalist", "expression_exact"]).as_str().unwrap().to_string();
     let member = pareto(&j)
         .iter()
@@ -1413,5 +1430,4 @@ fn band_sd_robust_selection_uses_member_bands() {
         num(at(member, &["validation_book"]), &["band_resolved"]).to_bits(),
         num(&j, &["objective", "spec", "band_resolved"]).to_bits()
     );
-    assert_eq!(at(&j, &["objective", "spec", "band_units"]).as_str(), Some("sd"));
 }
