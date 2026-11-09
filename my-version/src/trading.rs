@@ -1068,8 +1068,14 @@ pub fn evaluate(
         .filter(|&i| pred[i].is_finite() && usable(i, r, rows))
         .collect();
     let ctx = Ctx::new(&keep, r, rows, spec.cash_return);
+    let positions = positions_of(pred, rows, &keep, &ctx, spec);
+    finish(&ctx, &positions, spec)
+}
+
+/// Position of every usable row, in `ctx` row order.
+fn positions_of(pred: &[f64], rows: &TradingRows, keep: &[usize], ctx: &Ctx, spec: &TradingSpec) -> Vec<f64> {
     let scores: Vec<f64> = keep.iter().map(|&i| pred[i]).collect();
-    let positions: Vec<f64> = if spec.position == PositionMap::TopTercile {
+    if spec.position == PositionMap::TopTercile {
         let all = top_tercile_positions(pred, &rows.time);
         keep.iter().map(|&i| all[i]).collect()
     } else if spec.min_holding > 1 || spec.band.resolved > 0.0 {
@@ -1094,8 +1100,106 @@ pub fn evaluate(
         positions
     } else {
         scores.iter().map(|&s| position_of(s, spec)).collect()
-    };
-    finish(&ctx, &positions, spec)
+    }
+}
+
+/// Per-block alpha of one prediction vector against exposure-matched
+/// buy-and-hold (#928).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlockedAlpha {
+    /// `net_k - exposure_k * bh_k` per block, in net excess per period.
+    pub block_alpha: Vec<f64>,
+    /// Mean of `series`.
+    pub pooled_alpha: f64,
+    /// Alpha of every distinct timestamp, in time order.
+    pub series: Vec<f64>,
+    /// Position changes of the book.
+    pub trades: usize,
+}
+
+/// Cut the usable rows into `blocks` runs of distinct timestamps and price the
+/// book against buy-and-hold of the same rows.
+///
+/// Per timestamp the row means are taken, so every period weighs the same. In
+/// block `k`, `net_k` is the mean book net excess over the flat book,
+/// `exposure_k` the mean position and `bh_k` the mean buy-and-hold net excess
+/// (entry and exit costs included). A block without exposure has alpha 0.
+pub fn blocked_alpha(
+    pred: &[f64],
+    r: &[f64],
+    rows: &TradingRows,
+    spec: &TradingSpec,
+    blocks: usize,
+) -> Result<BlockedAlpha, String> {
+    spec.validate()?;
+    check_lengths(pred.len(), r, rows)?;
+    let keep: Vec<usize> = (0..pred.len())
+        .filter(|&i| pred[i].is_finite() && usable(i, r, rows))
+        .collect();
+    if keep.is_empty() {
+        return Err("no usable rows (every prediction or return is non-finite)".to_string());
+    }
+    let ctx = Ctx::new(&keep, r, rows, spec.cash_return);
+    let positions = positions_of(pred, rows, &keep, &ctx, spec);
+    let n = ctx.ret.len();
+    let cost_side = spec.per_side_bps() * BP;
+    let book = run_book(&ctx, &positions, cost_side);
+    let flat = run_book(&ctx, &vec![0.0; n], cost_side);
+    let held = run_book(&ctx, &vec![1.0; n], cost_side);
+    let ids = block_ids(&ctx.time, blocks)?;
+    let mut series_net: Vec<f64> = Vec::new();
+    let mut series_pos: Vec<f64> = Vec::new();
+    let mut series_bh: Vec<f64> = Vec::new();
+    let mut series_block: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let t = ctx.time[ctx.time_order[i]];
+        let (mut net, mut pos, mut bh, mut count) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+        let block = ids[ctx.time_order[i]] as usize;
+        while i < n && ctx.time[ctx.time_order[i]] == t {
+            let row = ctx.time_order[i];
+            net += book.net[row] - flat.net[row];
+            pos += positions[row];
+            bh += held.net[row] - flat.net[row];
+            count += 1;
+            i += 1;
+        }
+        let c = count as f64;
+        series_net.push(net / c);
+        series_pos.push(pos / c);
+        series_bh.push(bh / c);
+        series_block.push(block);
+    }
+    let mut block_alpha = vec![0.0f64; blocks];
+    let mut exposure = vec![0.0f64; blocks];
+    for b in 0..blocks {
+        let idx: Vec<usize> = (0..series_block.len()).filter(|&k| series_block[k] == b).collect();
+        let m = idx.len() as f64;
+        let e = idx.iter().map(|&k| series_pos[k]).sum::<f64>() / m;
+        exposure[b] = e;
+        if e > 0.0 {
+            let net = idx.iter().map(|&k| series_net[k]).sum::<f64>() / m;
+            let bh = idx.iter().map(|&k| series_bh[k]).sum::<f64>() / m;
+            block_alpha[b] = net - e * bh;
+        }
+    }
+    let series: Vec<f64> = (0..series_block.len())
+        .map(|k| {
+            let e = exposure[series_block[k]];
+            if e > 0.0 {
+                series_net[k] - e * series_bh[k]
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let pooled_alpha = series.iter().sum::<f64>() / series.len() as f64;
+    Ok(BlockedAlpha {
+        block_alpha,
+        pooled_alpha,
+        series,
+        trades: book.stats.trades,
+    })
 }
 
 /// Score explicit positions, one per row. A negative position is an error.
@@ -1806,6 +1910,12 @@ pub struct FinalistReport {
     pub validation: Result<PathStats, String>,
     /// #480: the value the search ranked candidates by, when it was not the metric.
     pub search_fitness: Option<&'static str>,
+    /// #928: the rule that chose the finalist.
+    pub selection: &'static str,
+    /// #928: members of `objective.selection_rule`, without braces.
+    pub selection_rule: String,
+    /// #928: object naming the front a re-selection read.
+    pub reselected_from: Option<String>,
     pub test: Result<PathStats, String>,
 }
 
@@ -1827,14 +1937,20 @@ impl FinalistReport {
             Err(e) => format!("{{\"unusable\":{}}}", crate::devlog::text(e)),
         };
         format!(
-            "{{\"name\":\"{}\",\"position\":\"{}\",\"selection\":\"validation_objective\",\
-             \"cost\":{},\"candidates\":{},\"usable_candidates\":{},\"exact\":\"cpu_f64\",\
+            "{{\"name\":\"{}\",\"position\":\"{}\",\"selection\":\"{}\",\
+             \"selection_rule\":{{{}{}}},\"cost\":{},\"candidates\":{},\"usable_candidates\":{},\"exact\":\"cpu_f64\",\
              \"backend\":{},\"backend_reason\":{},\"spec\":{},\
              \"finalist\":{{\"expression\":{},\"expression_exact\":{},\"archive_rank\":{},\"constant\":{},\"fixed_position\":{},\"fixed_position_realised\":{},\"fit_metric\":{},\"fit_error\":{},\
              \"validation_error\":{},\"test_error\":{},\"validation_objective\":{}{}}},\
              \"validation\":{},\"test\":{}}}",
             self.objective.name(),
             self.spec.position.name(),
+            self.selection,
+            self.selection_rule,
+            self.reselected_from
+                .as_deref()
+                .map(|r| format!(",\"reselected_from\":{}", r))
+                .unwrap_or_default(),
             self.cost.json(),
             self.candidates,
             self.usable,

@@ -90,8 +90,12 @@ pub struct LongLabelSpec {
     pub barrier_up: f64,
     /// Stop barrier multiple `d` of `sigma_H`.
     pub barrier_down: f64,
-    /// Keep every `stride`-th row (by row index in the series).
+    /// Keep every `stride`-th row (by row index in the series, or by time with `anchor`).
     pub stride: usize,
+    /// Epoch second of the time-anchored cadence: a row is kept when its stamp is
+    /// a whole number of `stride` bars from it, so every series decides at the
+    /// same stamps. Needs `stride > 1`.
+    pub anchor: Option<i64>,
 }
 
 impl LongLabelSpec {
@@ -108,6 +112,7 @@ impl LongLabelSpec {
             barrier_up: 1.0,
             barrier_down: 1.0,
             stride: 1,
+            anchor: None,
         }
     }
 
@@ -123,6 +128,9 @@ impl LongLabelSpec {
         }
         if self.stride == 0 {
             return Err("label: stride must be >= 1".to_string());
+        }
+        if self.anchor.is_some() && self.stride < 2 {
+            return Err(format!("label {}: anchor= needs stride=<n> with n > 1 (got stride {})", self.name, self.stride));
         }
         for (n, v) in [
             ("fee", self.cost.fee_bps),
@@ -157,6 +165,19 @@ impl LongLabelSpec {
     /// `entry_offset + horizon + delay`. Derived from the spec, never from a name.
     pub fn purge_seconds(&self) -> i64 {
         self.entry_offset_seconds() + self.horizon_seconds() + self.delay_seconds()
+    }
+
+    /// Bars per series before a locked start whose label window reaches it.
+    pub fn purge_rows(&self) -> i64 {
+        (self.purge_seconds() + self.bar_seconds - 1) / self.bar_seconds
+    }
+
+    /// Whether row `index` of a series, stamped `time`, is a decision row.
+    pub fn keeps(&self, index: usize, time: i64) -> bool {
+        match self.anchor {
+            Some(a) => (time - a).rem_euclid(self.stride as i64 * self.bar_seconds) == 0,
+            None => index % self.stride == 0,
+        }
     }
 
     /// A stride below the horizon overlaps labels. From four hours on it needs
@@ -214,7 +235,7 @@ impl LongLabelSpec {
 
     fn canonical(&self) -> String {
         format!(
-            "{{\"version\":{},\"name\":{},\"bar_seconds\":{},\"horizon_bars\":{},\"delay_bars\":{},\"sigma_window\":{},\"sigma_floor_bps\":{},\"clip\":{},\"cost_bps\":{},\"barrier_up\":{},\"barrier_down\":{},\"stride\":{},\"long_only\":true}}",
+            "{{\"version\":{},\"name\":{},\"bar_seconds\":{},\"horizon_bars\":{},\"delay_bars\":{},\"sigma_window\":{},\"sigma_floor_bps\":{},\"clip\":{},\"cost_bps\":{},\"barrier_up\":{},\"barrier_down\":{},\"stride\":{}{},\"long_only\":true}}",
             text(VERSION),
             text(&self.name),
             self.bar_seconds,
@@ -226,7 +247,8 @@ impl LongLabelSpec {
             num(self.cost.round_trip_bps()),
             num(self.barrier_up),
             num(self.barrier_down),
-            self.stride
+            self.stride,
+            self.anchor.map(|a| format!(",\"anchor\":{}", a)).unwrap_or_default()
         )
     }
 }
@@ -340,7 +362,7 @@ pub fn build_keep(
     let root_k = (h as f64).sqrt();
     for t in 0..n {
         let (e, last) = (t + 1 + d, t + h + d);
-        if last >= n || t % spec.stride != 0 {
+        if last >= n || !spec.keeps(t, bars[t].time) {
             continue;
         }
         if !contiguous_window(bars, t, last, step) || !(e..=last).all(|k| priced(&bars[k])) {
@@ -397,9 +419,11 @@ const FIXED_ONE: u128 = 1 << 62;
 
 /// `u_i = mean over the label's bars of 1 / c_t`, `w_i = u_i * n / sum(u)`,
 /// with `c_t` the number of labels whose span covers bar `t`. A span runs from
-/// the entry bar to the exit bar. `n` and `sum(u)` run over the valid rows whose
-/// stamp satisfies `keep`; every valid row gets `u * n / sum(u)`. The third
-/// value is that `n`.
+/// the entry bar to the exit bar; a row whose stamp fails `keep` spans to its
+/// vertical bar, because its barrier exit can depend on locked prices through
+/// its volatility window. `n` and `sum(u)` run over the valid rows whose stamp
+/// satisfies `keep`; every valid row gets `u * n / sum(u)`. The third value is
+/// that `n`.
 fn uniqueness_weights(l: &LongLabels, d: usize, keep: &dyn Fn(i64) -> bool) -> (Vec<f64>, Vec<f64>, usize) {
     let n = l.fwd.len();
     let rows: Vec<usize> = (0..n).filter(|&t| l.fwd[t].is_finite()).collect();
@@ -407,10 +431,12 @@ fn uniqueness_weights(l: &LongLabels, d: usize, keep: &dyn Fn(i64) -> bool) -> (
     if rows.is_empty() {
         return (w.clone(), w, 0);
     }
+    let h = l.spec.horizon_bars;
+    let end = |t: usize| if keep(l.time[t]) { l.end_idx[t] } else { t + h + d };
     let mut conc = vec![0i64; n + 1];
     for &t in &rows {
         conc[t + 1 + d] += 1;
-        conc[l.end_idx[t] + 1] -= 1;
+        conc[end(t) + 1] -= 1;
     }
     // With rows left out of the normalisation the window sums run in integers:
     // a float prefix sum rounds with every earlier term, so it would carry the
@@ -431,7 +457,7 @@ fn uniqueness_weights(l: &LongLabels, d: usize, keep: &dyn Fn(i64) -> bool) -> (
     let mut total = 0.0;
     let mut kept = 0usize;
     for &t in &rows {
-        let (a, b) = (t + 1 + d, l.end_idx[t]);
+        let (a, b) = (t + 1 + d, end(t));
         let sum = if exact {
             (prefix_fixed[b + 1] - prefix_fixed[a]) as f64 / FIXED_ONE as f64
         } else {
@@ -516,6 +542,32 @@ pub fn is_xs_column(name: &str) -> bool {
         .is_some_and(|label| !label.is_empty())
 }
 
+/// `anchor=` as epoch seconds: an ISO date or date-time (UTC) or whole epoch seconds.
+fn parse_anchor(value: &str) -> Option<i64> {
+    let v = crate::data::parse_time(value)?;
+    (v.is_finite() && v.fract() == 0.0 && v.abs() < 1e15).then_some(v as i64)
+}
+
+fn bad_anchor_message(src: &str, value: &str) -> String {
+    format!("label '{}': anchor '{}' is neither an ISO date nor whole epoch seconds", src, value)
+}
+
+/// The usage refusal for the `anchor=` option of a `long:` label spec, read
+/// without resolving the horizon: a value that is not a date or whole epoch
+/// seconds, or an anchor without `stride=<n>` and `n > 1`.
+pub fn anchor_refusal(src: &str) -> Option<String> {
+    let option = |key: &str| {
+        src.split(',')
+            .find_map(|p| p.trim().split_once('=').filter(|(k, _)| k.trim() == key).map(|(_, v)| v.trim().to_string()))
+    };
+    let anchor = option("anchor")?;
+    if parse_anchor(&anchor).is_none() {
+        return Some(bad_anchor_message(src, &anchor));
+    }
+    let stride = option("stride").and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+    (stride < 2).then(|| format!("label '{}': anchor= needs stride=<n> with n > 1 (got stride {})", src, stride))
+}
+
 /// The refusal for a `long:` label without `fee=`.
 pub fn missing_fee_message(src: &str) -> String {
     format!(
@@ -526,7 +578,7 @@ pub fn missing_fee_message(src: &str) -> String {
 
 impl LongLabelSpec {
     /// Parse `long:<horizon>[,name=ID][,delay=BARS][,fee=BP][,spread=BP]
-    /// [,slip=BP][,vol=BARS][,floor=BP][,clip=C][,up=U][,down=D][,stride=N]`.
+    /// [,slip=BP][,vol=BARS][,floor=BP][,clip=C][,up=U][,down=D][,stride=N][,anchor=DATE|EPOCH]`.
     /// The horizon is a bar count or a timeframe name resolved against
     /// `bar_seconds`. The default name is `h<bars>`.
     pub fn parse(src: &str, bar_seconds: i64) -> Result<Self, String> {
@@ -578,6 +630,7 @@ impl LongLabelSpec {
                 "up" => spec.barrier_up = float()?,
                 "down" => spec.barrier_down = float()?,
                 "stride" => spec.stride = count()?,
+                "anchor" => spec.anchor = Some(parse_anchor(value).ok_or_else(|| bad_anchor_message(src, value))?),
                 "side" => check_side(value)?,
                 _ => return Err(bad(part)),
             }
@@ -659,6 +712,12 @@ pub struct LabelReport {
     /// Valid rows the uniqueness weights are normalised over (development rows).
     pub weight_norm_rows: usize,
     pub purge_seconds: i64,
+    pub stride: usize,
+    pub anchor: Option<i64>,
+    /// Rows per series before a locked start whose label window reaches it.
+    pub purge_rows_per_symbol: i64,
+    /// Rows at the end of every series whose window runs past the last bar.
+    pub tail_rows_without_label: usize,
     /// The declared locked test the statistics leave out, with the number of
     /// valid rows left out. `None` when no range applies.
     pub locked_test: Option<LockedLeftOut>,
@@ -704,6 +763,7 @@ struct Tally {
     top: Vec<TopMove>,
     left_out: usize,
     weight_norm_rows: usize,
+    tail_rows: usize,
 }
 
 fn move_order(a: &TopMove, b: &TopMove) -> std::cmp::Ordering {
@@ -729,6 +789,7 @@ impl Tally {
         self.uniqueness_sum += other.uniqueness_sum;
         self.left_out += other.left_out;
         self.weight_norm_rows += other.weight_norm_rows;
+        self.tail_rows += other.tail_rows;
         self.top.extend(other.top);
         self.top.sort_by(move_order);
         self.top.truncate(TOP_MOVES);
@@ -766,6 +827,10 @@ impl Tally {
             effective_n_hours: self.uniqueness_sum * hours,
             weight_norm_rows: self.weight_norm_rows,
             purge_seconds: spec.purge_seconds(),
+            stride: spec.stride,
+            anchor: spec.anchor,
+            purge_rows_per_symbol: spec.purge_rows(),
+            tail_rows_without_label: self.tail_rows,
             locked_test: range.map(|range| LockedLeftOut { range, rows_left_out: self.left_out }),
             label_hash,
         }
@@ -818,7 +883,7 @@ impl LongLabels {
         top.truncate(TOP_MOVES);
         Tally {
             rows,
-            stride_rows: (0..rows).filter(|t| t % self.spec.stride != 0).count(),
+            stride_rows: (0..rows).filter(|&t| !self.spec.keeps(t, self.time[t])).count(),
             fwd: valid.iter().map(|&t| self.fwd[t]).collect(),
             barrier_rows: with_y.len(),
             clipped: with_y.iter().filter(|&&t| self.y[t].abs() >= self.spec.clip).count(),
@@ -828,6 +893,7 @@ impl LongLabels {
             top,
             left_out: finite - valid.len(),
             weight_norm_rows: self.weight_norm_rows,
+            tail_rows: rows.min(self.spec.horizon_bars + self.spec.delay_bars),
         }
     }
 
@@ -938,7 +1004,7 @@ impl LabelReport {
             })
             .unwrap_or_default();
         format!(
-            "{{\"version\":{},\"name\":{},\"long_only\":true,\"rows\":{},\"valid_rows\":{},\"barrier_rows\":{},\"stride_rows\":{},\"exits\":{{\"profit\":{},\"stop\":{},\"vertical\":{}}},\"action_long_share\":{},\"clipped_share\":{},\"sign_share\":{{\"positive\":{},\"negative\":{},\"zero\":{}}},\"fwd_mean\":{},\"fwd_quantiles\":{{{}}},\"cost_to_move\":{},\"top_abs_moves\":{{\"n\":{},\"moves\":[{}]}},\"average_uniqueness\":{},\"effective_n\":{},\"effective_n_hours\":{},\"weight_norm_rows\":{},\"purge_seconds\":{}{},\"label_hash\":{}}}",
+            "{{\"version\":{},\"name\":{},\"long_only\":true,\"rows\":{},\"valid_rows\":{},\"barrier_rows\":{},\"stride_rows\":{},\"exits\":{{\"profit\":{},\"stop\":{},\"vertical\":{}}},\"action_long_share\":{},\"clipped_share\":{},\"sign_share\":{{\"positive\":{},\"negative\":{},\"zero\":{}}},\"fwd_mean\":{},\"fwd_quantiles\":{{{}}},\"cost_to_move\":{},\"top_abs_moves\":{{\"n\":{},\"moves\":[{}]}},\"average_uniqueness\":{},\"effective_n\":{},\"effective_n_hours\":{},\"weight_norm_rows\":{},\"purge_seconds\":{},\"stride\":{}{},\"purge_rows_per_symbol\":{},\"tail_rows_without_label\":{}{},\"label_hash\":{}}}",
             text(VERSION),
             text(&self.name),
             self.rows,
@@ -963,10 +1029,31 @@ impl LabelReport {
             num(self.effective_n_hours),
             self.weight_norm_rows,
             self.purge_seconds,
+            self.stride,
+            self.anchor.map(|a| format!(",\"anchor\":{}", a)).unwrap_or_default(),
+            self.purge_rows_per_symbol,
+            self.tail_rows_without_label,
             locked,
             text(&self.label_hash)
         )
     }
+}
+
+/// The `fit_label` object of a walk-forward or ladder report: `name`, `stride`,
+/// `average_uniqueness`, `effective_n` and `effective_n_hours` of a label report
+/// (one `<data>.labels.json` entry). `stride` is `null` in a report written
+/// before it was recorded. `None` when the text is not a label report.
+pub fn fit_label_json(report: &str) -> Option<String> {
+    let j = crate::devlog::Json::parse(report)?;
+    let field = |k: &str| j.get(k).and_then(crate::devlog::Json::as_f64);
+    Some(format!(
+        "{{\"name\":{},\"stride\":{},\"average_uniqueness\":{},\"effective_n\":{},\"effective_n_hours\":{}}}",
+        text(j.get("name")?.as_str()?),
+        j.get("stride").and_then(crate::devlog::Json::as_usize).map_or("null".to_string(), |s| s.to_string()),
+        num(field("average_uniqueness")?),
+        num(field("effective_n")?),
+        num(field("effective_n_hours")?)
+    ))
 }
 
 /// The only side the label builder supports.

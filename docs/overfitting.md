@@ -610,6 +610,33 @@ The PBO of the arms' seed-mean series is a ship gate: a family ships only when t
 
 `A3` is compared with the placebo arm `A4` and with `A2`, so it must beat both. Otherwise the family is `drop`, with every failed check listed. No family enters the default set on a single-cell t-test. The ablation is a selection on training data repeated inside every fold, and a family that only wins by making the search bigger has not won.
 
+### 3.14 Campaign trial accounting (`rcsr trials`)
+
+A campaign runs many arms, views, seeds and origins. The walk-forward `N_eff` (`trials x participation ratio / candidates`) counts every candidate evaluation and is far too large to judge the finalists. `rcsr trials` counts the finalists instead, from the pooled out-of-fold net series `pooled.period_net` of their walk-forward reports (`pooled.period_time` is the period grid).
+
+```sh
+rcsr ladder ... --emit-series --out ladder.json
+rcsr trials --wf wide/reports/wf-*.json --baseline ladder.json \
+  --cluster-rho 0.9 --block-len 21 --draws 10000 --out trials.json
+```
+
+* The reports must agree on the window definition, purge, cost, annualisation, threshold rule, policy and period grid; a mismatch exits 2 and names the field.
+* Distinct books: SHA-256 of each series rounded to 1e-12; equal hashes count once. A constant series (always flat) is one book, one cluster, and is left out of clustering, SPA and PBO.
+* Clusters: single-linkage on the correlation matrix at `|rho| >= --cluster-rho` (default 0.9, pre-register it). `N_eff` is the cluster count. The participation ratio is reported beside it.
+* DSR of the best finalist (highest per-period Sharpe) at `N_eff`, at `10 N_eff` and at the nominal series count. `V` is the variance of the Sharpes of the distinct series (the Mertens variance with one series); `T`, skew and kurtosis follow the walk-forward rule, so one series with `--block-len`, `--draws` and `--seed` equal to the report's gives the walk-forward DSR at `--trials 1`.
+* SPA (Hansen consistent p) of all distinct varying series against the best baseline of cash, buy-and-hold, constant long/flat, best single feature and any `trend*` rung, by mean. The baseline series come from `rcsr ladder --emit-series` (`series.period_time`, `series.period_net` per rung) and must sit on the same period grid. `--baseline-rung` picks one rung.
+* PBO by CSCV over the same series (`--pbo-blocks`, default 16). With fewer than 2 distinct varying series, SPA and PBO are skipped with a reason.
+* MinBTL: `(E[max_N] / SR)^2` years at the clustered `N_eff` for the best finalist's annual Sharpe, against the span of the series (`min_btl_years`, `span_years`).
+
+#### Paired comparison (`rcsr trials --compare A B`)
+
+`A` is the lever and `B` the reference; each is one report or a comma-separated list (one per seed). With `X_t` the mean over the side's seeds of `pooled.period_net[t]`, the series is `d_t = A_t - B_t`. One resampled index path is applied to `d_t`, so the pairing of the two books holds in every draw.
+
+* Default bootstrap: the stationary bootstrap of Politis and Romano (1994): uniform block starts, geometric block length with mean `L`, wrap-around. `--bootstrap circular` uses the walk-forward circular resampler on `d_t`. `L` defaults to `max(horizon, hold, ceil(n^(1/3)))` of the reports; draws default to 10,000 and the seed is recorded.
+* Output `rcsr-trials-compare/1`: `mean_diff` (per period and annualised), the percentile CI of the draw means at `--level`, the one-sided `p_period = P(mean d <= 0)` as `(1 + count) / (B + 1)` over the centred draws, the two-sided `min(1, 2 min(p, p'))`, the design effect and `effective_n`. A series shorter than `4 L` periods sets `short_series`.
+* Seed spread: the per-seed metric is the mean period net times `periods_per_year`; `delta` is the mean over `A` seeds minus the mean over `B` seeds; `s_seed` is the pooled within-side standard deviation (`df = nA + nB - 2`) or `--s-seed`; `z = delta / (s_seed sqrt(1/nA + 1/nB))`. With fewer than 2 seeds on a side and no `--s-seed`, `z` is null and `z_reason` says why.
+* The same file on both sides, a missing or non-finite series, or reports that differ in cost, annualisation, windows, threshold rule or grid exit 2 and name the field.
+
 ## 4. What `rcsr` reports today
 
 ### The test lockbox and the validation slice
@@ -687,6 +714,33 @@ The run refuses a setup that would leak or mis-state the book:
 The target spec's purge already covers the label horizon between the training, validation and test blocks.
 
 With `--fitness pnl --pnl-blocks K` (2 to 8) the search itself penalises a formula that earns in one regime only: the training rows are cut into `K` contiguous time blocks, each block is scored as its own long/flat book, and the fitness is the mean block regret plus `--pnl-block-lambda` times their sample standard deviation (`docs/optimisation.md`). This is a ranking term on the training period. It does not replace the validation slice, the walk-forward of the front or the lockbox, and it does not refit constants per block.
+
+### Robust finalist selection and re-selection
+
+`--select-rule robust` (needs a trading `--objective`) replaces the best-net choice of `validation_objective`. It asks for an edge in most validation blocks, measured against exposure-matched buy-and-hold, and prefers the simplest member that is statistically as good as the best.
+
+1. The distinct validation timestamps are cut into `--select-blocks K` runs (1 to 8, default 4) with `trading::block_ids`. Fewer timestamps than blocks exits 2.
+2. Per timestamp the rows of all groups are averaged. In block `k`, `alpha_k = net_k - exposure_k x bh_k`: `net_k` is the member's mean net excess over cash per period, `exposure_k` its mean position and `bh_k` the mean buy-and-hold net excess of the same rows (entry and exit cost included). A member that only holds beta has alpha 0. A block without long rows has alpha 0 and does not count as positive.
+3. A member is eligible when `alpha_k > 0` in at least `K - 1` blocks and the pooled alpha (mean over all periods) is positive.
+4. The standard error of the pooled alpha comes from a circular block bootstrap of the per-period alpha series: block length `--select-block-len` (default 21 periods), 500 resamples, a fixed seed shared by all members.
+5. The finalist is the eligible member of lowest complexity whose pooled alpha is at least `best - --select-se x SE(best)` (default Z = 1). Ties go to fewer validation trades, then to the lower archive rank.
+6. No eligible member gives verdict `no_signal`; the finalist is then the `validation_objective` choice.
+
+With `--select-blocks 1 --select-se 0` the rule is `validation_objective` itself: the finalist is the member of best validation objective, with the same tie rule.
+
+The rule reads training and validation rows only. Changing the test block changes the reported test book and nothing in `objective.selection_rule` or the finalist. `--json` records `objective.selection_rule`: `rule`, `blocks`, `se_z`, `block_len`, `verdict`, `members` (`archive_rank`, `complexity`, `trades`, `block_alpha`, `pooled_alpha`, `se`, `eligible`) and `chosen_rank`.
+
+The rule is a post-loop option, like `--prune`. It is not saved search state and not part of `config_hash`: `--resume` accepts another `--select-rule`, but still refuses another `--pop`.
+
+A finished search is re-selected without a new one:
+
+```sh
+rcsr <data, target, objective and fitness flags of the original run> \
+  --reselect run.ckpt --select-rule robust --select-blocks 4 --select-se 1
+rcsr <same flags> --reselect-run run.json --select-rule robust
+```
+
+`--reselect` loads the checkpoint, runs no generation and scores its `final_archive` (the post-refit exact archive the run reported) on the validation slice. `search.generations_run` and `candidates_evaluated` are copied from the checkpoint and `objective.selection_rule.reselected_from` records the path and sha256 (and `build_differs` with both build identities: another build is accepted, because no trajectory continues). It exits 2 for a checkpoint without a final archive, for `--generations` above the saved value, and for another data fingerprint, target spec or backend (without `--allow-backend-change`). `--reselect-run` parses `pareto[].expression_exact` in `archive_rank` order and checks `split.mode`, `train_rows` and the variables against the data. A run.json holds the reported front only, after `--prune`. In-loop selection, `--reselect` and `--resume <checkpoint> --generations <generations_run>` call the same `selection::select_robust` on the same exact front.
 
 ## 5. Not yet implemented (on the roadmap)
 

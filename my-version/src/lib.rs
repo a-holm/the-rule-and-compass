@@ -85,6 +85,7 @@ pub mod risk; // #307: exact risk monoids (Sharpe, Sortino, log-growth, drawdown
 pub mod rng;
 pub mod mix; // #471: adaptive edit weights
 pub mod run_json; // #482: reader for the parts of run.json later commands use
+pub mod reselect; // #928: re-select a finished front without a search
 pub mod schema;
 pub mod search;
 pub mod selection; // #111: select on train/validation, never the test lockbox
@@ -100,6 +101,7 @@ pub mod trading_gpu; // #304/#305: fused long-only P&L, exact threshold and shar
 pub mod units;
 pub mod walkforward;
 pub mod wf_protocol; // #264: economics, block inference and nulls for the walk-forward report
+pub mod trials; // #926: campaign trial accounting and paired run comparison
 pub mod wf_batch; // #309: batch walk-forward P&L over (candidate, window)
 pub mod protocol; // #264: windows table, candidate ledger, sealed list, one-read lockbox
 pub mod retire; // #924: retire a locked range after its one sealed read

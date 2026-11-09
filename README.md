@@ -256,6 +256,10 @@ bash ablation/commands.sh   # prepare, one search and one score per arm and seed
 
 The verdict (`ablation/verdict.json`, `ablation/verdict.md`) says ship or drop per family. See [`docs/overfitting.md`](docs/overfitting.md#313-baseline-ladder-and-add-one-family-ablation-implemented).
 
+### Campaign trial accounting
+
+`rcsr trials --wf <reports...> --baseline ladder.json` counts the finalists of a campaign from the pooled out-of-fold series (`pooled.period_net`) of their walk-forward reports: distinct books, single-linkage clusters at `|rho| >= --cluster-rho` as the effective trial count, the DSR at that count, at 10x and at the nominal count, SPA against the best long-only baseline (`rcsr ladder --emit-series`), PBO by CSCV and MinBTL. `rcsr trials --compare A B` compares two runs, or two sets of seeds, with a paired stationary block bootstrap of the per-period difference and a seed-spread z. See [`docs/overfitting.md`](docs/overfitting.md#314-campaign-trial-accounting-rcsr-trials).
+
 ## GUI
 
 A local web front end ships as a second binary. It is a self-contained
@@ -658,6 +662,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random]
      [--time-budget seconds] [--interim-chunk] [--save file] [--save-every N] [--resume file]
      [--allow-backend-change] [--allow-build-change] [--run-manifest file] [--json-out file]
+     [--select-rule validation_objective|robust] [--select-blocks K] [--select-se Z] [--select-block-len L]
+     [--reselect checkpoint] [--reselect-run run.json]
      [--format text|json|ndjson] [--json] [--ndjson] [--progress]
      [--dev-log-level summary|full] [--dev-log file.ndjson] [--no-dev-log]
      [--dev-log-every N] [--dev-log-max-bytes size]
@@ -854,7 +860,7 @@ run:
 | `--calibration anchors` or `--calibration <path>` (`rcsr enrich`) | planner rates for `--gpu auto`: the measured anchors, or the `enrich` object of a `rcsr calibrate` file (schema `rcsr-calibration/2`, each value limited to 0.25x to 4x of its anchor). Default: the default calibration file when it exists, else the anchors. An invalid or other-device file exits 2. `--json` `plan_rates` and `<out>.enrich.json` record `source` (`anchors` or `file`), `file_path`, `file_sha256` and `schema`; `--write-bw` overrides the file's bandwidth. Every `plan[]` entry carries `benchmark_present` (the store holds the `--cross-symbol` series), which selects the compact-pass cost |
 | `--no-enrich` (`rcsr calibrate`) | skip the enrich planner probe; the file then carries `enrich: null` and `rcsr enrich` uses its anchors |
 | `--allow-overlap` (`rcsr enrich`, `rcsr prep`) | permit a `--label` stride below the horizon for horizons of 4 h and longer; without it such a label is refused. `--side short` and `--allow-short` are always refused: labels are long-only (action `{0,+1}`, long-side barriers, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge)) |
-| `--label long:<horizon>,fee=<bp>,...` (`rcsr enrich`; `fee=` is required, `fee=0` for none) | long-only label family `lbl_<name>_{fwd,y,long_net,action,t1,exit_ret,m_net,m_barrier,weight}`, the label report with hash and top 10 absolute moves in `<out>.labels.json` (rows reaching the declared locked test, `--locked-test` or the input declaration, are left out of its statistics and counted; `<out>.enrich.json` leaves them out of every per-column statistic the same way and reports `rows_left_out`), the enrich report and `run.json` (`target_spec.label_report`); label columns are never `--vars` inputs, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge) |
+| `--label long:<horizon>,fee=<bp>,...[,stride=<n>[,anchor=<ISO date\|epoch>]]` (`rcsr enrich`; `fee=` is required, `fee=0` for none; `anchor` aligns the stride of every symbol to the same stamps) | long-only label family `lbl_<name>_{fwd,y,long_net,action,t1,exit_ret,m_net,m_barrier,weight}`, the label report with hash and top 10 absolute moves in `<out>.labels.json` (rows reaching the declared locked test, `--locked-test` or the input declaration, are left out of its statistics and counted; `<out>.enrich.json` leaves them out of every per-column statistic the same way and reports `rows_left_out`), the enrich report and `run.json` (`target_spec.label_report`), and `split.fit_label` in `walkforward` and `ladder` reports; the store embargo is at least the longest label purge; label columns are never `--vars` inputs (exit 5), see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |
 | `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
 | `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |

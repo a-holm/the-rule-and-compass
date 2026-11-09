@@ -988,3 +988,109 @@ fn walkforward_band_sd_ignores_test_rows() {
     assert_eq!(s.band_width, 1.0);
     assert_eq!(s.spec.expect("the band spec").sd, None);
 }
+
+// ---------------------------------------------------------------------------
+// #931: the purge at 72, 168 and 336 hours.
+// ---------------------------------------------------------------------------
+
+#[path = "common/long_horizon.rs"]
+mod lh;
+
+/// 2020-09-13T12:00:00Z.
+const LH_T0: i64 = 1_600_000_000 - 1_600_000_000 % 3600;
+
+/// Hourly rows `ts,x,target` with the stride-`h` forward return of real bars;
+/// rows off the stride carry no return.
+fn long_label_table(h: usize, n: usize) -> (Vec<rcsr::ohlcv::Bar>, rcsr::labels::LongLabels, data::Table) {
+    let bars = lh::bars(LH_T0, n, 0.0);
+    let l = lh::build(&bars, &lh::src(h, &format!(",stride={h}")));
+    let mut csv = String::from("ts,x,target\n");
+    for t in 0..n {
+        csv.push_str(&format!("{},{},{}\n", bars[t].time, ((t * 7) % 11) as f64, lh::fmt(l.fwd[t])));
+    }
+    (bars, l, data::parse_table(&csv).unwrap())
+}
+
+fn no_training_label_reaches_test_block(h: usize) {
+    let (bars, l, table) = long_label_table(h, 30 * h);
+    let spec_l = lh::spec(&lh::src(h, ""));
+    let purge = spec_l.purge_seconds() as f64;
+    let opts = walkforward::ProtocolOptions { entry_offset: 3600.0, ..walkforward::ProtocolOptions::default() };
+    let test_start = bars[20 * h].time as f64;
+    let test_end = bars[26 * h].time as f64;
+    let run = |train_end: f64| {
+        let mut s = spec("x", vec![window("w", LH_T0 as f64, train_end, test_start, test_end)]);
+        s.horizon = spec_l.horizon_seconds() as f64;
+        s.periods_per_year = Some(8760.0 / h as f64);
+        walkforward::run_table_with(&table, &s, "t", &opts)
+    };
+    for short in [test_start - lh::DEFAULT_PURGE, test_start - purge + 1.0] {
+        let err = run(short).unwrap_err();
+        assert!(err.contains("purge gap") && err.contains(&format!("needs {purge}")), "h{h}: {err}");
+    }
+    let train_end = test_start - purge;
+    let r = run(train_end).unwrap();
+    let last = r.windows[0].train_last_time.expect("training rows");
+    assert!(last < train_end && test_start - last >= purge, "h{h}: last training stamp {last}");
+    let mut trained = 0;
+    for t in 0..bars.len() {
+        let time = bars[t].time as f64;
+        if time < train_end && l.fwd[t].is_finite() {
+            assert!(l.t1[t] < test_start, "h{h} row {t}: label end {} at or after the test start {test_start}", l.t1[t]);
+            trained += 1;
+        }
+    }
+    assert!(trained >= 18, "h{h}: {trained}");
+    // The stride row one horizon before the test start has a vertical label end after it and is not trained on.
+    let near = (bars[19 * h].time) as f64;
+    assert!(near + purge > test_start && near >= train_end, "h{h}");
+}
+
+#[test]
+fn no_training_label_reaches_test_block_h72() {
+    no_training_label_reaches_test_block(72);
+}
+
+#[test]
+fn no_training_label_reaches_test_block_h168() {
+    no_training_label_reaches_test_block(168);
+}
+
+#[test]
+fn no_training_label_reaches_test_block_h336() {
+    no_training_label_reaches_test_block(336);
+}
+
+#[test]
+fn walkforward_purge_floor_at_168h() {
+    let scratch = Scratch::new("wf-h168-floor");
+    let bars = lh::bars(LH_T0, 168 * 40, 0.0);
+    let l = lh::build(&bars, &lh::src(168, ",stride=168"));
+    let mut csv = String::from("ts,x,lbl_h168_fwd\n");
+    for (t, b) in bars.iter().enumerate() {
+        csv.push_str(&format!("{},{},{}\n", b.time, ((t * 7) % 11) as f64, lh::fmt(l.fwd[t])));
+    }
+    let data = scratch.join("d.csv");
+    std::fs::write(&data, csv).unwrap();
+    let spec_path = scratch.join("spec.json");
+    std::fs::write(&spec_path, lh::spec_file(&lh::spec(&lh::src(168, ",stride=168")))).unwrap();
+    let train_end = bars[20 * 168].time;
+    let run = |gap: i64| {
+        let w = format!("w,{},{},{},{}", LH_T0, train_end, train_end + gap, train_end + gap + 10 * 168 * 3600);
+        rcsr_cmd::rcsr()
+            .args([
+                "walkforward", "--data", data.to_str().unwrap(), "--target", "lbl_h168_y", "--target-spec",
+                spec_path.to_str().unwrap(), "--expr", "x", "--time", "ts", "--periods-per-year", "52", "--window", &w, "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let bad = run(608_399);
+    let err = String::from_utf8_lossy(&bad.stderr);
+    assert_eq!(bad.status.code(), Some(2), "{err}");
+    assert!(err.contains("608400"), "{err}");
+    let ok = run(608_400);
+    assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
+    let out = String::from_utf8_lossy(&ok.stdout);
+    assert!(out.contains("\"required_purge_seconds\":608400"), "{out}");
+}

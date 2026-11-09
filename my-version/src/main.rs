@@ -119,6 +119,7 @@ USAGE:
   rcsr prep --input <file|dir> --out <store.rcsb> [options]
   rcsr enrich --data <store.rcsb|CSV> --out <store.rcsb> --features <list> [options]
   rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
+  rcsr trials --wf <report.json>... [--baseline <ladder.json>] | --compare <A> <B> [options]
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
              [--lockbox <START,END|none>]
              [--target-spec <file>]
@@ -298,7 +299,9 @@ ROW WEIGHTS:
                              On the GPU backend the device scorer carries the
                              weights for every metric listed above that has a
                              native scorer; a weighted run is never ranked on
-                             unweighted loss.
+                             unweighted loss. A label target whose report has
+                             average_uniqueness < 1 and no --weight prints a note
+                             naming its lbl_<name>_weight column.
 
 DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   See docs/time-series.md for which preparation steps read ahead.
@@ -322,7 +325,8 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              widen the lookback embargo after the end of every locked range
                              (default: lockbox_embargo declared with the data, else 10972800);
                              a smaller value is refused (exit 2). Rows in
-                             [START - purge, END + embargo) are refused (exit 3)
+                             [START - purge, END + embargo) are refused (exit 3); with a
+                             target spec, rows before END + max(embargo, purge) too
   --retired <retired.json>
                              record from `rcsr protocol retire`: its range had its one sealed
                              read and no longer guards next to --lockbox on undeclared data;
@@ -1034,6 +1038,30 @@ CHECKPOINTS:
                              refused: stderr names it (#860). A time-budget stop is not
                              terminal: --resume continues it and
                              --time-budget may be set again
+  --select-rule validation_objective|robust
+                             post-loop finalist rule (#928, like --prune: not
+                             saved search state, outside the config hash).
+                             robust needs --objective pnl|sharpe|log_growth:
+                             per member and validation block, alpha = net -
+                             exposure x buy-and-hold net of the same rows; a
+                             member is eligible when alpha > 0 in at least
+                             K-1 blocks and pooled; the lowest complexity
+                             within --select-se standard errors of the best
+                             pooled alpha wins. No eligible member: verdict
+                             no_signal, validation_objective finalist. Reads
+                             training and validation rows only
+  --select-blocks <K>        validation blocks of robust, 1 to 8 (default 4)
+  --select-se <Z>            one-standard-error multiple (default 1.0)
+  --select-block-len <L>     bootstrap block length in periods (default 21)
+  --reselect <checkpoint>    re-select a finished search, no new one: scores
+                             the checkpoint's final archive under --select-rule
+                             and writes run.json and the report. Pass the data
+                             and flags of the original run. Exit 2: no final
+                             archive, --generations above the saved value,
+                             other data, target spec or backend. Another
+                             build is accepted and recorded
+  --reselect-run <run.json>  the same from a run.json front (expression_exact);
+                             split and train rows must match the data
 
 RUN INTEGRITY (#140):
   --run-manifest <file>      atomically write a JSON manifest with the build
@@ -1180,6 +1208,29 @@ fn parse_trade_number(flag: &str, text: &str) -> f64 {
     }
 }
 
+/// Return and trading rows of a book slice, followed by its cross-section
+/// context rows.
+fn trading_inputs(slice: &data::TradingSlice, ctx: Option<&data::TradingContext>) -> (Vec<f64>, rcsr::trading::TradingRows) {
+    let mut ret = slice.ret.clone();
+    let mut rows = slice.rows.clone();
+    if let Some(c) = ctx {
+        ret.extend_from_slice(&c.slice.ret);
+        rows.time.extend_from_slice(&c.slice.rows.time);
+        rows.group.extend_from_slice(&c.slice.rows.group);
+        rows.funding.extend_from_slice(&c.slice.rows.funding);
+    }
+    (ret, rows)
+}
+
+/// Prediction of `tree` on the rows of [`trading_inputs`].
+fn trading_pred(tree: &expr::Node, x: &[Vec<f64>], ctx: Option<&data::TradingContext>) -> Vec<f64> {
+    let mut pred: Vec<f64> = x.iter().map(|row| expr::eval(tree, row)).collect();
+    if let Some(c) = ctx {
+        pred.extend(c.x.iter().map(|row| expr::eval(tree, row)));
+    }
+    pred
+}
+
 /// #263: a usage error for the P&L objective, exit 2.
 /// #493: the book of one prediction vector. The context rows (removed only by a
 /// missing label) join the ranks of a top-tercile book; they earn nothing
@@ -1191,17 +1242,8 @@ fn trading_book(
     ctx: Option<&data::TradingContext>,
     tspec: &rcsr::trading::TradingSpec,
 ) -> Result<rcsr::trading::PathStats, String> {
-    let mut pred: Vec<f64> = x.iter().map(|row| expr::eval(tree, row)).collect();
-    let Some(c) = ctx else {
-        return rcsr::trading::evaluate(&pred, &slice.ret, &slice.rows, tspec);
-    };
-    pred.extend(c.x.iter().map(|row| expr::eval(tree, row)));
-    let mut ret = slice.ret.clone();
-    ret.extend_from_slice(&c.slice.ret);
-    let mut rows = slice.rows.clone();
-    rows.time.extend_from_slice(&c.slice.rows.time);
-    rows.group.extend_from_slice(&c.slice.rows.group);
-    rows.funding.extend_from_slice(&c.slice.rows.funding);
+    let pred = trading_pred(tree, x, ctx);
+    let (ret, rows) = trading_inputs(slice, ctx);
     rcsr::trading::evaluate(&pred, &ret, &rows, tspec)
 }
 
@@ -2466,6 +2508,10 @@ fn main() {
     if args.first().map(|s| s.as_str()) == Some("ablation") {
         rcsr::ablation::run(&args[1..]);
     }
+    // #926: campaign trial accounting and paired run comparison.
+    if args.first().map(|s| s.as_str()) == Some("trials") {
+        rcsr::trials::run(&args[1..]);
+    }
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(
         args.first().map(|s| s.as_str()),
@@ -2626,6 +2672,13 @@ fn main() {
     let mut save_every = 25usize;
     let mut save_every_set = false;
     let mut resume_path: Option<String> = None;
+    // #928: post-loop selection. Not search state, so outside config_hash.
+    let mut select_rule_arg: Option<String> = None;
+    let mut select_blocks_arg: Option<usize> = None;
+    let mut select_se_arg: Option<f64> = None;
+    let mut select_block_len_arg: Option<usize> = None;
+    let mut reselect_path: Option<String> = None;
+    let mut reselect_run_path: Option<String> = None;
     // #140: run integrity flags.
     let mut allow_backend_change = false;
     let mut allow_build_change = false;
@@ -3454,6 +3507,12 @@ fn main() {
                 }
             }
             "--resume" => resume_path = Some(val!()),
+            "--select-rule" => select_rule_arg = Some(val!()),
+            "--select-blocks" => select_blocks_arg = Some(parse_uint("--select-blocks", &val!())),
+            "--select-se" => select_se_arg = Some(parse_nonneg("--select-se", &val!())),
+            "--select-block-len" => select_block_len_arg = Some(parse_uint("--select-block-len", &val!())),
+            "--reselect" => reselect_path = Some(val!()),
+            "--reselect-run" => reselect_run_path = Some(val!()),
             "--allow-backend-change" => allow_backend_change = true,
             "--allow-build-change" => allow_build_change = true,
             "--run-manifest" => run_manifest_path = Some(val!()),
@@ -3643,6 +3702,25 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
+    // #928: a re-selection is a resume that runs nothing.
+    if reselect_path.is_some() || reselect_run_path.is_some() {
+        let conflicts = [
+            (reselect_path.is_some() && reselect_run_path.is_some(), "--reselect with --reselect-run"),
+            (resume_path.is_some(), "--reselect with --resume"),
+            (save_path.is_some(), "--reselect with --save"),
+            (eval_expr.is_some(), "--reselect with --eval-expr"),
+            (!seed_exprs.is_empty() || !seed_files.is_empty(), "--reselect with --seed-expr/--seed-file"),
+        ];
+        if let Some((_, what)) = conflicts.iter().find(|(c, _)| *c) {
+            eprintln!("error: {}: a re-selection runs no search", what);
+            std::process::exit(EXIT_USAGE);
+        }
+        if select_rule_arg.is_none() {
+            eprintln!("error: --reselect and --reselect-run need --select-rule");
+            std::process::exit(EXIT_USAGE);
+        }
+        resume_path = reselect_path.clone();
+    }
     if allow_backend_change && resume_path.is_none() {
         eprintln!("error: --allow-backend-change only applies to --resume");
         std::process::exit(EXIT_USAGE);
@@ -3792,6 +3870,19 @@ fn main() {
                 std::process::exit(EXIT_INPUT);
             }
         };
+        if reselect_path.is_some() {
+            if cp.final_archive.is_none() {
+                eprintln!("error: --reselect '{}' has no final archive (a mid-run checkpoint): run it to the end first", path);
+                std::process::exit(EXIT_USAGE);
+            }
+            if generations_set && cfg.generations > cp.generations {
+                eprintln!(
+                    "error: --reselect with --generations {} above the saved {}: a new search is --resume",
+                    cfg.generations, cp.generations
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+        }
         let saved = cp.config.clone();
         if cp.refit_band_unknown && !refit_band_set {
             eprintln!(
@@ -5551,6 +5642,20 @@ fn main() {
             let rung = diagnostics::target_structure_rung(&r.spec, &prepared, cfg.metric);
             let purge_line = target::purge_line(&r.spec, &prepared.report);
             let label_report = target::label_report_for(&data_path, &r.spec.column);
+            let uniqueness = label_report
+                .as_deref()
+                .and_then(rcsr::devlog::Json::parse)
+                .and_then(|j| j.get("average_uniqueness").and_then(rcsr::devlog::Json::as_f64));
+            if let (None, Some(u), Some((label, _))) = (&weight_name, uniqueness, rcsr::labels::parse_column(&r.spec.column)) {
+                if u < 1.0 {
+                    eprintln!(
+                        "note: target {} has overlapping labels (average_uniqueness {}) and no --weight; --weight {} weights the rows by uniqueness",
+                        r.spec.column,
+                        rcsr::devlog::num(u),
+                        rcsr::labels::column_name(label, "weight")
+                    );
+                }
+            }
             Some(target::Active {
                 spec: r.spec,
                 source: r.source,
@@ -5728,6 +5833,33 @@ fn main() {
         }
         select_by = Some(rcsr::selection::SelectBy::ValidationObjective);
     }
+    // #928: the post-loop rule. It never reaches the search, so it is not saved
+    // with a checkpoint and not part of the config hash.
+    let select_rule = match select_rule_arg.as_deref() {
+        Some(src) => rcsr::selection::SelectRule::parse(src).unwrap_or_else(|e| trading_usage(&e)),
+        None => rcsr::selection::SelectRule::ValidationObjective,
+    };
+    let robust_params = rcsr::selection::RobustParams {
+        blocks: select_blocks_arg.unwrap_or(rcsr::selection::RobustParams::default().blocks),
+        se_z: select_se_arg.unwrap_or(rcsr::selection::RobustParams::default().se_z),
+        block_len: select_block_len_arg.unwrap_or(rcsr::selection::ROBUST_BLOCK_LEN),
+    };
+    if select_blocks_arg.is_some() || select_se_arg.is_some() || select_block_len_arg.is_some() {
+        if select_rule != rcsr::selection::SelectRule::Robust {
+            trading_usage("--select-blocks, --select-se and --select-block-len need --select-rule robust");
+        }
+    }
+    if select_rule == rcsr::selection::SelectRule::Robust {
+        if !objective.is_trading() {
+            trading_usage("--select-rule robust ranks the validation P&L book: add --objective pnl|sharpe|log_growth");
+        }
+        if let Err(e) = robust_params.validate() {
+            trading_usage(&e);
+        }
+    }
+    if select_rule != rcsr::selection::SelectRule::ValidationObjective && !objective.is_trading() {
+        trading_usage("--select-rule needs --objective pnl|sharpe|log_growth");
+    }
     if select_by == Some(rcsr::selection::SelectBy::Validation) && prepared.validation.is_none() {
         eprintln!(
             "error: --select-by validation needs a validation slice;              add --validation-frac <f>"
@@ -5834,7 +5966,7 @@ fn main() {
         }
         if let Err(e) = cp.check_data(&prepared.train, &prepared.test) {
             eprintln!("error: {}", e);
-            std::process::exit(EXIT_INPUT);
+            std::process::exit(if reselect_path.is_some() { EXIT_USAGE } else { EXIT_INPUT });
         }
         // #140: a GPU checkpoint must not be continued on the CPU (or vice
         // versa) without an explicit override. The effective backend mirrors
@@ -5842,13 +5974,14 @@ fn main() {
         let current_backend = search::effective_backend(&cfg, &prepared.train);
         if let Err(e) = cp.check_backend(current_backend, allow_backend_change) {
             eprintln!("error: {}", e);
-            std::process::exit(EXIT_INPUT);
+            std::process::exit(if reselect_path.is_some() { EXIT_USAGE } else { EXIT_INPUT });
         }
         // #256: the binary, commit, device and driver are part of what
         // produced the saved state. The CPU count is reported, not refused.
         let current_identity =
             rcsr::provenance::BuildIdentity::current(current_backend == Backend::Gpu);
-        if let Err(e) = cp.check_identity(&current_identity, allow_build_change) {
+        // #928: no trajectory continues, so another build is recorded, not refused.
+        if let Err(e) = cp.check_identity(&current_identity, allow_build_change || reselect_path.is_some()) {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
         }
@@ -6416,8 +6549,57 @@ fn main() {
     // #116: arm counts are process-wide diagnostics; take a delta around this
     // run so repeated runs in one process (`--report benchmark`) stay readable.
     let fit_before = fit::fit_arm_counts_full();
+    // #928: a re-selection reads a finished front and runs no generation.
+    let mut reselected_from: Option<String> = None;
+    let mut reselect_outcome: Option<search::Outcome> = None;
+    if let Some(path) = &reselect_path {
+        let cp = resume_checkpoint.take().expect("--reselect loads its checkpoint with the resume path");
+        let sha = rcsr::manifest::sha256_file(path).unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        });
+        let now = rcsr::provenance::BuildIdentity::current(effective_backend == Backend::Gpu);
+        reselected_from = Some(rcsr::reselect::from_checkpoint_json(path, &sha, cp.identity.as_ref(), &now));
+        let front = rcsr::reselect::front_of(&cp).expect("checked when the checkpoint was loaded");
+        reselect_outcome = Some(rcsr::reselect::outcome(front, &prepared.test, cfg.metric, cp.generations, cp.candidates_evaluated));
+    } else if let Some(path) = &reselect_run_path {
+        let usage = |e: String| -> ! {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_USAGE);
+        };
+        let run = rcsr::reselect::RunFront::load(path).unwrap_or_else(|e| usage(e));
+        if run.variables != vars {
+            usage(format!("--reselect-run '{}': its variables differ from this run's --vars", path));
+        }
+        if run.train_rows != Some(prepared.train.len()) || run.split_mode.as_deref() != Some(prepared.report.mode) {
+            usage(format!(
+                "--reselect-run '{}': split {:?} with {:?} train rows, this data gives {} with {}",
+                path,
+                run.split_mode,
+                run.train_rows,
+                prepared.report.mode,
+                prepared.train.len()
+            ));
+        }
+        let mut front = rcsr::pareto::Archive::new(run.members.len());
+        for m in &run.members {
+            let tree = expr::parse(&m.expression_exact, &vars)
+                .unwrap_or_else(|e| usage(format!("--reselect-run '{}': archive_rank {}: {}", path, m.archive_rank, e)));
+            let tree = normalise_inputs(&tree, &prepared.means, &prepared.stds);
+            front.items.push(rcsr::pareto::Sol {
+                complexity: m.complexity as usize,
+                cost: m.complexity,
+                tree,
+                error: m.train_error,
+            });
+        }
+        reselected_from = Some(rcsr::reselect::from_run_json(path, &run.sha256));
+        reselect_outcome = Some(rcsr::reselect::outcome(front, &prepared.test, cfg.metric, run.generations_run, run.candidates_evaluated));
+    }
     let mut last_saved: Option<(usize, String)> = None;
-    let outcome_result = if let Some(path) = save_path.clone() {
+    let outcome_result = if let Some(done) = reselect_outcome {
+        Ok(done)
+    } else if let Some(path) = save_path.clone() {
         let resumed = resume_checkpoint.take();
         search::run_resumable_seeded(
             &cfg,
@@ -6922,6 +7104,7 @@ fn main() {
             );
         }
     }
+    let mut selection_rule_fields = format!("\"rule\":\"{}\"", select_rule.name());
     // #111: selection. Reorder the front by the chosen criterion and renumber
     // the display rank; the archive rank is kept for reports that need the
     // underlying search order. `test_error` is never a criterion. With no
@@ -6942,7 +7125,36 @@ fn main() {
                 aicc: r.aicc,
             })
             .collect();
-        let order = rcsr::selection::order(&candidates, by);
+        let mut order = rcsr::selection::order(&candidates, by);
+        if select_rule == rcsr::selection::SelectRule::Robust {
+            let (Some(tspec), Some(v), Some(slice)) = (
+                &trading_spec,
+                &prepared.validation,
+                prepared.trading.as_ref().and_then(|t| t.validation.as_ref()),
+            ) else {
+                trading_usage("--select-rule robust needs a validation slice: add --validation-frac <f>");
+            };
+            let ctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
+            let (ret, book_rows) = trading_inputs(slice, ctx);
+            let metas: Vec<rcsr::selection::RobustMeta> = rows
+                .iter()
+                .map(|r| rcsr::selection::RobustMeta {
+                    archive_rank: r.archive_rank,
+                    complexity: r.complexity,
+                    usable: r.objective_value.is_finite(),
+                    objective: r.objective_value,
+                })
+                .collect();
+            let picked = rcsr::selection::select_robust(&metas, robust_params, tspec, &ret, &book_rows, &mut |i| {
+                trading_pred(&sorted[rows[i].archive_rank - 1].tree, &v.x, ctx)
+            })
+            .unwrap_or_else(|e| trading_usage(&e));
+            if let Some(c) = picked.chosen {
+                order.retain(|&i| i != c);
+                order.insert(0, c);
+            }
+            selection_rule_fields = picked.fields_json();
+        }
         let reordered: Vec<Row> = order.into_iter().map(|i| rows[i].clone()).collect();
         rows = reordered;
         for (k, r) in rows.iter_mut().enumerate() {
@@ -6995,6 +7207,9 @@ fn main() {
                 test_error: top.test_error,
                 validation_value: top.objective_value,
                 search_fitness: fitness_book.as_ref().map(|_| "long_pnl_regret"),
+                selection: select_rule.name(),
+                selection_rule: selection_rule_fields.clone(),
+                reselected_from: reselected_from.clone(),
                 validation: validation_book,
                 test: book(&prepared.test, split.map(|t| &t.test), split.and_then(|t| t.test_context.as_ref())),
             })
@@ -10507,8 +10722,11 @@ USAGE:
   Evaluates one expression with the engine's own f64 evaluator (no Python, no
   code strings), applies a long/flat rule and charges costs on position changes.
   Windows are half-open by time; the purge gap test_start-train_end must be at
-  least --horizon and --embargo. The threshold comes from training/validation
-  rows only. See docs/walkforward.md.
+  least --entry-offset + --horizon + --delay and --embargo (exit 2 otherwise).
+  The threshold comes from training/validation rows only. With a target spec
+  whose column has a report in <data>.labels.json, the JSON split records
+  fit_label (name, stride, average_uniqueness, effective_n, effective_n_hours).
+  See docs/walkforward.md.
 
 OPTIONS:
   --data <path>              .rcsb column store, or a CSV table as a fallback
@@ -10668,7 +10886,7 @@ OPTIONS:
                              widen the lookback embargo after the end of every locked range
                              (default: lockbox_embargo declared with the data, else 10972800);
                              a smaller value is refused (exit 2). Rows in
-                             [START - purge, END + embargo) are refused (exit 3)
+                             [START - purge, END + max(embargo, purge)) are refused (exit 3)
   --retired <retired.json>
                              record from `rcsr protocol retire`: its range had its one sealed
                              read and no longer guards next to --lockbox on undeclared data;
@@ -11247,6 +11465,7 @@ fn run_walkforward(args: &[String]) -> ! {
         };
         horizon = Some(agree("--horizon", horizon, s.horizon_seconds));
         popts.entry_offset = agree("--entry-offset", entry_offset_flag, s.entry_offset_seconds);
+        popts.fit_label = target::label_report_for(&data_path, &s.column).and_then(|r| rcsr::labels::fit_label_json(&r));
         popts.delay = agree("--delay", delay_flag, s.delay_seconds);
     } else {
         popts.entry_offset = entry_offset_flag.unwrap_or(0.0);
@@ -11573,7 +11792,7 @@ fn run_walkforward(args: &[String]) -> ! {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(if e.contains("overlapping returns") { EXIT_USAGE } else { EXIT_INPUT });
+            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") { EXIT_USAGE } else { EXIT_INPUT });
         }
     };
     if spec.threshold_fixed.is_none() {
