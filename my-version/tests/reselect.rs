@@ -343,3 +343,17 @@ fn select_rule_refusals_are_usage_errors() {
     let o = fx.rcsr(&fx.data, &["--generations", "2", "--pop", "16", "--select-rule", "robust", "--select-blocks", "8", "--validation-frac", "0.02", "--no-dev-log"]);
     assert_eq!(code(&o), 2, "{}", stderr(&o));
 }
+
+#[test]
+fn reselect_reads_the_final_archive_not_the_search_archive() {
+    let fx = fixture();
+    ok(&fx.search("a", &[]));
+    let mut cp = rcsr::checkpoint::Checkpoint::load(fx.path("a.ckpt")).expect("checkpoint loads");
+    let reported: Vec<f64> = cp.final_archive.as_ref().expect("final archive").items.iter().map(|s| s.cost).collect();
+    assert!(reported.len() >= 2);
+    cp.archive.items.truncate(1);
+    let front = rcsr::reselect::front_of(&cp).expect("front");
+    assert_eq!(front.items.iter().map(|s| s.cost).collect::<Vec<_>>(), reported);
+    cp.final_archive = None;
+    assert!(rcsr::reselect::front_of(&cp).unwrap_err().contains("run it to the end first"));
+}

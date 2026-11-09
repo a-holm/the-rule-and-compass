@@ -152,3 +152,12 @@ pub fn from_checkpoint_json(path: &str, sha256: &str, saved: Option<&BuildIdenti
 pub fn from_run_json(path: &str, sha256: &str) -> String {
     format!("{{\"kind\":\"run\",\"path\":{},\"sha256\":{}}}", text(path), text(sha256))
 }
+
+/// The front a checkpoint reported: its post-refit exact `final_archive`,
+/// never the search archive.
+pub fn front_of(cp: &crate::checkpoint::Checkpoint) -> Result<Archive, String> {
+    cp.final_archive
+        .as_ref()
+        .map(|a| Archive { items: a.items.clone(), cap: a.cap })
+        .ok_or_else(|| "the checkpoint has no final archive (a mid-run checkpoint): run it to the end first".to_string())
+}
