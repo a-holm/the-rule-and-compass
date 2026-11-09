@@ -498,7 +498,7 @@ fn short_declared_embargo_keeps_h168_labels_after_the_end() {
         let exclude = format!("ts < {from}");
         rcsr(&[
             "--data", &path, "--target", "lbl_h168_y", "--vars", "x", "--time", "ts", "--split", "temporal", "--cpu",
-            "--no-dev-log", "--seed", "3", "--generations", "2", "--pop", "8", "--quiet", "--exclude", &exclude,
+            "--no-dev-log", "--seed", "3", "--generations", "2", "--pop", "8", "--quiet", "--exclude", &exclude, "--fill", "drop",
         ])
     };
     let (code, _, err) = search(e0 + H);

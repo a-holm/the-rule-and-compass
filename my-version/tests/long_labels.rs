@@ -1058,12 +1058,13 @@ fn overlapping_fit_label_without_weight_prints_one_note() {
     let s = scratch::Scratch::new("lh-note");
     let (data, start) = locked_store(s.path());
     let exclude = format!("ts >= {}", start - 400 * HOUR);
+    let fill = ["--exclude", exclude.as_str(), "--fill", "drop"];
     let note = "note: target lbl_h168_y has overlapping labels";
-    let (code, _, err) = run_rcsr(&search_args(&data, "lbl_h168_y", "ret1", &["--exclude", &exclude]));
+    let (code, _, err) = run_rcsr(&search_args(&data, "lbl_h168_y", "ret1", &fill));
     assert_eq!(code, 0, "{err}");
     assert_eq!(err.matches(note).count(), 1, "{err}");
     assert!(err.contains("--weight lbl_h168_weight"), "{err}");
-    let (code, _, err) = run_rcsr(&search_args(&data, "lbl_h168_y", "ret1", &["--exclude", &exclude, "--weight", "lbl_h168_weight"]));
+    let (code, _, err) = run_rcsr(&search_args(&data, "lbl_h168_y", "ret1", &[fill[0], fill[1], fill[2], fill[3], "--weight", "lbl_h168_weight"]));
     assert_eq!(code, 0, "{err}");
     assert!(!err.contains(note), "{err}");
 }
