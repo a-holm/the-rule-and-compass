@@ -162,3 +162,6 @@ walkforward            *  app-only  the test process runs under memcheck with --
 rcsr-gpu-bench      *  run-bin  --batch 64 --reps 1 --depth 3
 rcsr                *  run-bin  calibrate --gpu --no-enrich --out target/sanitizer-calibration.json
 rcsr                *  run-bin  --data examples/sine.csv --target y --vars x --generations 8 --pop 24 --seed 5 --metric squared --gpu
+reselect               *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children
+retire                 *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children
+trials                 *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children; its measurement test is ignored
