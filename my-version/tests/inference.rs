@@ -287,3 +287,75 @@ fn iid_over_rejects_on_ar1_and_the_block_does_not() {
     assert!(block_rate <= 0.20, "block rejection rate {}", block_rate);
     assert!(block_rate + 0.15 < iid_rate);
 }
+
+#[test]
+fn stationary_bootstrap_block_length() {
+    let n = 100_000;
+    for l in [5usize, 20, 50] {
+        let mut rng = Mt::new(11);
+        let (mut blocks, mut periods) = (0usize, 0usize);
+        for _ in 0..10_000 {
+            let b = stationary_blocks(n, l, &mut rng);
+            assert_eq!(b.iter().map(|x| x.1).sum::<usize>(), n);
+            blocks += b.len();
+            periods += n;
+        }
+        let mean_len = periods as f64 / blocks as f64;
+        assert!((mean_len - l as f64).abs() / l as f64 <= 0.05, "L {} mean {}", l, mean_len);
+    }
+}
+
+#[test]
+fn stationary_bootstrap_se_iid() {
+    let mut rng = Mt::new(5);
+    let x: Vec<f64> = (0..2_000).map(|_| normal(&mut rng)).collect();
+    let d = stationary_bootstrap_draws(&x, 1, 10_000, 3);
+    let se = sample_sd(&d.means);
+    let expect = sample_sd(&x) / (x.len() as f64).sqrt();
+    assert!((se - expect).abs() / expect <= 0.05, "se {} expect {}", se, expect);
+}
+
+#[test]
+fn stationary_bootstrap_se_ar1() {
+    let (n, phi, reps) = (2_000usize, 0.5f64, 50u32);
+    let expect = ((1.0 / (1.0 - phi * phi)) / n as f64 * (1.0 + phi) / (1.0 - phi)).sqrt();
+    for base in 1..=10u32 {
+        let mut sum = 0.0;
+        for r in 0..reps {
+            let x = ar1(n, phi, base * 1_000 + r);
+            sum += sample_sd(&stationary_bootstrap_draws(&x, 20, 400, base * 7 + r).means);
+        }
+        let se = sum / reps as f64;
+        assert!((se - expect).abs() / expect <= 0.15, "base {} se {} expect {}", base, se, expect);
+    }
+}
+
+#[test]
+fn stationary_bootstrap_is_deterministic() {
+    let x = ar1(500, 0.3, 2);
+    let a = stationary_bootstrap_draws(&x, 10, 200, 7);
+    let b = stationary_bootstrap_draws(&x, 10, 200, 7);
+    assert_eq!(a.means, b.means);
+    assert_ne!(a.means, stationary_bootstrap_draws(&x, 10, 200, 8).means);
+}
+
+#[test]
+fn single_linkage_chains_and_isolates() {
+    let c = vec![
+        vec![1.0, 0.95, 0.0, 0.0],
+        vec![0.95, 1.0, -0.92, 0.0],
+        vec![0.0, -0.92, 1.0, 0.1],
+        vec![0.0, 0.0, 0.1, 1.0],
+    ];
+    assert_eq!(single_linkage_clusters(&c, 0.9), vec![0, 0, 0, 1]);
+    assert_eq!(single_linkage_clusters(&c, 0.99), vec![0, 1, 2, 3]);
+}
+
+#[test]
+fn min_btl_matches_the_formula() {
+    assert!(min_btl_years(1.0, 1.0).abs() < 1e-15);
+    let e = expected_max_sharpe(30.0, 1.0);
+    assert!(close(min_btl_years(1.0, 30.0), e * e, 1e-12));
+    assert!(close(min_btl_years(2.0, 30.0), e * e / 4.0, 1e-12));
+    assert!(min_btl_years(-0.5, 30.0).is_nan());
+}

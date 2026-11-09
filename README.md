@@ -256,6 +256,10 @@ bash ablation/commands.sh   # prepare, one search and one score per arm and seed
 
 The verdict (`ablation/verdict.json`, `ablation/verdict.md`) says ship or drop per family. See [`docs/overfitting.md`](docs/overfitting.md#313-baseline-ladder-and-add-one-family-ablation-implemented).
 
+### Campaign trial accounting
+
+`rcsr trials --wf <reports...> --baseline ladder.json` counts the finalists of a campaign from the pooled out-of-fold series (`pooled.period_net`) of their walk-forward reports: distinct books, single-linkage clusters at `|rho| >= --cluster-rho` as the effective trial count, the DSR at that count, at 10x and at the nominal count, SPA against the best long-only baseline (`rcsr ladder --emit-series`), PBO by CSCV and MinBTL. `rcsr trials --compare A B` compares two runs, or two sets of seeds, with a paired stationary block bootstrap of the per-period difference and a seed-spread z. See [`docs/overfitting.md`](docs/overfitting.md#314-campaign-trial-accounting-rcsr-trials).
+
 ## GUI
 
 A local web front end ships as a second binary. It is a self-contained
