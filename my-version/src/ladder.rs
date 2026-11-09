@@ -354,6 +354,8 @@ impl SrRun {
 
 #[derive(Clone, Debug)]
 pub struct Options {
+    /// #926: write the per-period net series of every rung and the period grid (`series`).
+    pub emit_series: bool,
     pub cost_bps: f64,
     pub cost_grid: Vec<f64>,
     /// #487: where the cost and the return units came from. `None` is the
@@ -386,6 +388,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
+            emit_series: false,
             cost_bps: DEFAULT_COST_BPS,
             cost_grid: DEFAULT_COST_GRID.to_vec(),
             cost: None,
@@ -1054,6 +1057,9 @@ pub struct Row {
 #[derive(Clone, Debug)]
 pub struct Report {
     pub rows: Vec<Row>,
+    /// #926: period stamps of the pooled test periods; written with `--emit-series`.
+    pub period_time: Vec<f64>,
+    pub emit_series: bool,
     pub folds: Vec<String>,
     pub periods: usize,
     pub rows_scored: usize,
@@ -1861,6 +1867,8 @@ fn finish_report(
     let _ = market;
     Ok(Report {
         rows,
+        period_time: pool.times.clone(),
+        emit_series: opts.emit_series,
         folds: folds.iter().map(|f| f.label.clone()).collect(),
         periods: pool.times.len(),
         rows_scored: pool.len(),
@@ -1912,6 +1920,26 @@ impl Report {
     }
 
     fn json_with(&self, timed: bool) -> String {
+        let mut out = self.json_core(timed);
+        if self.emit_series {
+            let series = |v: &[f64]| v.iter().map(|x| jnum(*x)).collect::<Vec<_>>().join(",");
+            let nets: Vec<String> = self
+                .rows
+                .iter()
+                .filter(|r| !r.series.is_empty())
+                .map(|r| format!("{}:[{}]", jstr(&r.name), series(&r.series)))
+                .collect();
+            out.pop();
+            out.push_str(&format!(
+                ",\"series\":{{\"period_time\":[{}],\"period_net\":{{{}}}}}}}",
+                series(&self.period_time),
+                nets.join(",")
+            ));
+        }
+        out
+    }
+
+    fn json_core(&self, timed: bool) -> String {
         let rows: Vec<String> = self
             .rows
             .iter()
@@ -2317,6 +2345,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
                             pnl seconds on the run wall); with --locked-test it is staged to <file>.tmp\n\
                             and synced before the read is recorded, then renamed\n\
   --markdown <file|->       write the Markdown table (staged the same way with --locked-test)\n\
+  --emit-series             add series.period_time and series.period_net (one array per rung) to the JSON report; the baseline input of rcsr trials\n\
   --json                    print the JSON report\n"
 }
 
@@ -2431,6 +2460,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             "--sealed" => sealed_path = Some(val()?),
             "--out" => out = Some(val()?),
             "--markdown" => markdown = Some(val()?),
+            "--emit-series" => opts.emit_series = true,
             "--json" => print_json = true,
             other => return Err(usage_err(format!("unknown argument '{}'", other))),
         }

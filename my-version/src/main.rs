@@ -119,6 +119,7 @@ USAGE:
   rcsr prep --input <file|dir> --out <store.rcsb> [options]
   rcsr enrich --data <store.rcsb|CSV> --out <store.rcsb> --features <list> [options]
   rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
+  rcsr trials --wf <report.json>... [--baseline <ladder.json>] | --compare <A> <B> [options]
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
              [--lockbox <START,END|none>]
              [--target-spec <file>]
@@ -2424,6 +2425,10 @@ fn main() {
     }
     if args.first().map(|s| s.as_str()) == Some("ablation") {
         rcsr::ablation::run(&args[1..]);
+    }
+    // #926: campaign trial accounting and paired run comparison.
+    if args.first().map(|s| s.as_str()) == Some("trials") {
+        rcsr::trials::run(&args[1..]);
     }
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(

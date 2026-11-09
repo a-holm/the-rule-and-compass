@@ -527,6 +527,10 @@ pub struct Report {
     pub group_by: Option<String>,
     pub windows: Vec<WindowResult>,
     pub pooled: Metrics,
+    /// #926: pooled out-of-fold net return of every period and the period
+    /// stamps, in the order of the pooled series.
+    pub period_net: Vec<f64>,
+    pub period_time: Vec<f64>,
     /// #487: cost source and return units of the book.
     pub cost: crate::target::CostDecl,
     pub cost_bps: f64,
@@ -1715,6 +1719,8 @@ impl Accum {
             group_by: spec.group.clone(),
             windows,
             pooled,
+            period_net: pooled_returns,
+            period_time: pooled_times,
             cost: opts.cost_decl(spec.cost_bps),
             cost_bps: spec.cost_bps,
             threshold_quantile: spec.threshold_quantile,
@@ -3298,8 +3304,21 @@ impl Report {
                 .as_ref()
                 .map_or("null".to_string(), |b| b.json()),
             windows.join(","),
-            self.pooled.json()
+            self.pooled_json()
         )
+    }
+
+    /// #926: the pooled metrics with `period_net` and `period_time`.
+    fn pooled_json(&self) -> String {
+        let series = |v: &[f64]| v.iter().map(|x| jnum(*x)).collect::<Vec<_>>().join(",");
+        let mut s = self.pooled.json();
+        s.pop();
+        s.push_str(&format!(
+            ",\"period_net\":[{}],\"period_time\":[{}]}}",
+            series(&self.period_net),
+            series(&self.period_time)
+        ));
+        s
     }
 
     fn windows_json(&self) -> String {
