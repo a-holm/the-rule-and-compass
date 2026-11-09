@@ -801,7 +801,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   timestamps into `K` blocks, scores each as its own long/flat book and ranks by the mean block
   regret plus `--pnl-block-lambda` (default 1.0) times their standard deviation, so a formula
   that earns in one regime only scores worse; the device computes it bit for bit like the CPU.
-  `--book-target COL` prices the book on another label of the same target spec (fit on `--target`).
+  `--book-target COL` prices the book on another label of the same target spec (fit on `--target`); a row with a NaN fit label and a finite book return stays in the book and leaves the constant fit.
   `--reject-fixed-position` (off by default) rejects trees whose position cannot depend on the
   inputs, such as `gauss(c * x)` or `exp(c * x)` at threshold 0, before the constant fit and keeps them
   off the front, and with a trading `--objective` refuses such a member as finalist; `run.json` reports `validation_book.fixed_position` for every member. See [`docs/optimisation.md`](docs/optimisation.md).

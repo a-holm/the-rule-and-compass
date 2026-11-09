@@ -246,8 +246,11 @@ INPUT:
                              2); the purge is the larger required purge of
                              the two specs. COL equal to --target is the
                              plain run. Needs --objective pnl, sharpe or
-                             log_growth and forward_return labels. Rows with
-                             a NaN fit label are dropped from the book too
+                             log_growth and forward_return labels. A row with
+                             a NaN fit label and a finite book return stays in
+                             the book; the constant fit and --fit-rows read the
+                             labelled rows only (CUDA builds fall back to the
+                             CPU search for such rows)
   --position long_only|top_tercile
                              long_only (default): 1[pred > --threshold]. top_tercile: per
                              timestamp the top floor(n/3) finite predictions are long (p=1),
@@ -5426,6 +5429,7 @@ fn main() {
             funding_column: trade_funding.clone(),
             train: fitness_pnl || trade_band_units.as_deref() == Some("sd"), // #480, #925
             cross_section: top_tercile,
+            book_rows: book_resolved.is_some(),
         });
         // #925: an sd-unit band is resolved per candidate from its training rows.
         let band_units = match trade_band_units.as_deref().map(rcsr::trading::BandUnits::parse) {
@@ -5680,11 +5684,11 @@ fn main() {
             trading_usage("--fitness pnl found no training trading rows");
         };
         match rcsr::trading::FitnessBook::with_blocks(slice, tspec, target_horizon, pnl_blocks, pnl_lambda) {
-            Ok(book) if book.len() == prepared.train.len() => Some(std::sync::Arc::new(book)),
+            Ok(book) if book.len() == prepared.book.as_ref().map_or(prepared.train.len(), |b| b.train.len()) => Some(std::sync::Arc::new(book)),
             Ok(book) => trading_usage(&format!(
                 "--fitness pnl: {} training trading rows for {} training rows",
                 book.len(),
-                prepared.train.len()
+                prepared.book.as_ref().map_or(prepared.train.len(), |b| b.train.len())
             )),
             Err(e) => trading_usage(&format!("--fitness pnl: {}", e)),
         }
@@ -5973,6 +5977,22 @@ fn main() {
             );
         }
     }
+    if implicit_mode && prepared.book.is_some() {
+        trading_usage("--implicit cannot price a book on rows without a fit label (--book-target)");
+    }
+    // #948: the books price every row with a finite return; the fit reads the rows that also
+    // have a fit label.
+    let book_train: &data::Sample = prepared.book.as_ref().map_or(&prepared.train, |b| &b.train);
+    let book_validation: Option<&data::Sample> = match &prepared.book {
+        Some(b) => b.validation.as_ref(),
+        None => prepared.validation.as_ref(),
+    };
+    let book_test: &data::Sample = prepared.book.as_ref().map_or(&prepared.test, |b| &b.test);
+    let search_train: &data::Sample = if fitness_pnl { book_train } else { &prepared.train };
+    if fitness_pnl && prepared.book.is_some() {
+        cfg.fit_view = Some(std::sync::Arc::new(prepared.train.clone()));
+    }
+
     // #25: resolve --units names against the prepared input list. A lagged
     // copy (`x_lag1`) inherits the unit declared for its source (`x`); every
     // other undeclared name, including the target, is dimensionless.
@@ -6043,14 +6063,14 @@ fn main() {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_USAGE);
         }
-        if let Err(e) = cp.check_data(&prepared.train, &prepared.test) {
+        if let Err(e) = cp.check_data(search_train, &prepared.test) {
             eprintln!("error: {}", e);
             std::process::exit(if reselect_path.is_some() { EXIT_USAGE } else { EXIT_INPUT });
         }
         // #140: a GPU checkpoint must not be continued on the CPU (or vice
         // versa) without an explicit override. The effective backend mirrors
         // the search's own capability checks.
-        let current_backend = search::effective_backend(&cfg, &prepared.train);
+        let current_backend = search::effective_backend(&cfg, search_train);
         if let Err(e) = cp.check_backend(current_backend, allow_backend_change) {
             eprintln!("error: {}", e);
             std::process::exit(if reselect_path.is_some() { EXIT_USAGE } else { EXIT_INPUT });
@@ -6091,12 +6111,12 @@ fn main() {
             );
         }
     }
-    let effective_backend = search::effective_backend(&cfg, &prepared.train);
+    let effective_backend = search::effective_backend(&cfg, search_train);
 
     // #223: resolve the fit arm once, before the memory plan and the run
     // records. A CPU-only run keeps today's arm and prints nothing new.
     let fit_resolution: Option<fit::FitResolution> = fit_request
-        .map(|request| search::resolve_fit_strategy(&cfg, &prepared.train, request));
+        .map(|request| search::resolve_fit_strategy(&cfg, search_train, request));
     if let Some(r) = &fit_resolution {
         cfg.fit_strategy = r.strategy;
         cfg.fit_admission = r.admission;
@@ -6127,7 +6147,7 @@ fn main() {
     // keeps the saved value.
     let mut fit_rows_default = false;
     if !fit_rows_set && resume_checkpoint.is_none() {
-        if let Some(rows) = search::default_fit_rows(&cfg, &prepared.train) {
+        if let Some(rows) = search::default_fit_rows(&cfg, search_train) {
             cfg.fit_rows = rows;
             fit_rows_default = true;
             if !quiet {
@@ -6230,7 +6250,7 @@ fn main() {
         let m = manifest::collect(
             VERSION,
             &data_path,
-            rcsr::checkpoint::fingerprint(&prepared.train),
+            rcsr::checkpoint::fingerprint(search_train),
             rcsr::checkpoint::fingerprint(&prepared.test),
             &cfg,
             effective_backend.as_str(),
@@ -6243,7 +6263,7 @@ fn main() {
         let mut m = m;
         m.start_utc = run_start_utc.clone();
         m.fit_resolution = fit_provenance.clone();
-        m.fit_subsample = search::fit_subsample_record(&cfg, &prepared.train);
+        m.fit_subsample = search::fit_subsample_record(&cfg, search_train);
         m.fit_rows_default = fit_rows_default;
         if let Some(p) = &store_projection {
             m.projection = Some(manifest::ProjectionRecord {
@@ -6458,7 +6478,7 @@ fn main() {
     // is a usage error naming the bytes and the smallest fix.
     #[cfg(feature = "cuda")]
     if cfg.gpu {
-        if let Some(plan) = search::device_plan_for(&cfg, &prepared.train) {
+        if let Some(plan) = search::device_plan_for(&cfg, search_train) {
             if let (Some(refusal), Some(text)) = (&plan.refusal, plan.refusal_text()) {
                 if refusal.stage == "fit" || gpu_explicit == Some(true) {
                     eprintln!("error: {}", text);
@@ -6478,7 +6498,7 @@ fn main() {
             .map(|n| n.get())
             .unwrap_or(1);
         let cols = prepared.train.x.first().map(|r| r.len()).unwrap_or(0);
-        let blocked = search::backend_blocker_reason(&cfg, &prepared.train);
+        let blocked = search::backend_blocker_reason(&cfg, search_train);
         let (kind, device, reason) = if effective_backend == Backend::Gpu && gpu_probe.available() {
             ("gpu", gpu_probe.device.as_deref().unwrap_or("unknown"), None)
         } else {
@@ -6688,7 +6708,7 @@ fn main() {
         let resumed = resume_checkpoint.take();
         search::run_resumable_seeded(
             &cfg,
-            &prepared.train,
+            search_train,
             &prepared.test,
             resumed,
             save_every,
@@ -6727,12 +6747,12 @@ fn main() {
     } else if resume_checkpoint.is_none() {
         // A fresh run with no save does not need any snapshot at all: keep the
         // historical path (and avoid hashing the data on exit).
-        search::run_seeded_checked(&cfg, &prepared.train, &prepared.test, &seeds)
+        search::run_seeded_checked(&cfg, search_train, &prepared.test, &seeds)
     } else {
         let resumed = resume_checkpoint.take();
         search::run_resumable_seeded(
             &cfg,
-            &prepared.train,
+            search_train,
             &prepared.test,
             resumed,
             0,
@@ -7067,10 +7087,15 @@ fn main() {
                 .iter()
                 .map(|row| expr::eval(&s.tree, row))
                 .collect();
-            let (objective_value, validation_book_json) = match (&trading_spec, &prepared.validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
+            let book_pred: std::borrow::Cow<[f64]> = if prepared.book.is_some() {
+                std::borrow::Cow::Owned(book_train.x.iter().map(|row| expr::eval(&s.tree, row)).collect())
+            } else {
+                std::borrow::Cow::Borrowed(&pred)
+            };
+            let (objective_value, validation_book_json) = match (&trading_spec, book_validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
                 (Some(tspec), Some(v), Some(slice)) => {
                     let ctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
-                    let mspec = member_spec(tspec, &pred, train_slice);
+                    let mspec = member_spec(tspec, &book_pred, train_slice);
                     match trading_book(&s.tree, &v.x, slice, ctx, &mspec) {
                         Ok(stats) => {
                             // #849: a fixed-position member is unusable as a finalist with the flag.
@@ -7240,7 +7265,7 @@ fn main() {
         if select_rule == rcsr::selection::SelectRule::Robust {
             let (Some(tspec), Some(v), Some(slice)) = (
                 &trading_spec,
-                &prepared.validation,
+                book_validation,
                 prepared.trading.as_ref().and_then(|t| t.validation.as_ref()),
             ) else {
                 trading_usage("--select-rule robust needs a validation slice: add --validation-frac <f>");
@@ -7259,7 +7284,7 @@ fn main() {
             // #925: each member's book takes the band resolved on its training rows.
             let mut spec_of = |i: usize| {
                 let tree = &sorted[rows[i].archive_rank - 1].tree;
-                let train_pred: Vec<f64> = prepared.train.x.iter().map(|row| expr::eval(tree, row)).collect();
+                let train_pred: Vec<f64> = book_train.x.iter().map(|row| expr::eval(tree, row)).collect();
                 member_spec(tspec, &train_pred, train_slice)
             };
             let picked = rcsr::selection::select_robust_specs(&metas, robust_params, &mut spec_of, &ret, &book_rows, &mut |i| {
@@ -7288,7 +7313,7 @@ fn main() {
         (Some(tspec), Some(top)) => {
             let tree = &sorted[top.archive_rank - 1].tree;
             // #925: the validation and test books take the band resolved on the training rows.
-            let train_pred: Vec<f64> = prepared.train.x.iter().map(|row| expr::eval(tree, row)).collect();
+            let train_pred: Vec<f64> = book_train.x.iter().map(|row| expr::eval(tree, row)).collect();
             let fspec = member_spec(tspec, &train_pred, train_slice);
             let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>, ctx: Option<&data::TradingContext>| match slice {
                 Some(slice) => trading_book(tree, &sample.x, slice, ctx, &fspec),
@@ -7299,7 +7324,7 @@ fn main() {
             if usable == 0 && !quiet {
                 eprintln!("# warning: no candidate has a usable P&L book on the validation slice");
             }
-            let validation_book = match &prepared.validation {
+            let validation_book = match book_validation {
                 Some(v) => book(v, split.and_then(|t| t.validation.as_ref()), split.and_then(|t| t.validation_context.as_ref())),
                 None => Err("no validation slice".to_string()),
             };
@@ -7329,7 +7354,7 @@ fn main() {
                 selection_rule: selection_rule_fields.clone(),
                 reselected_from: reselected_from.clone(),
                 validation: validation_book,
-                test: book(&prepared.test, split.map(|t| &t.test), split.and_then(|t| t.test_context.as_ref())),
+                test: book(book_test, split.map(|t| &t.test), split.and_then(|t| t.test_context.as_ref())),
             })
         }
         _ => None,
@@ -7419,7 +7444,7 @@ fn main() {
     // variable is selected. A form that wins most resamples is what the data
     // supports; one that wins once is a coincidence.
     let stab: Option<stability::Stability> = if stability_runs > 0 {
-        let st = stability::run_checked(&cfg, &prepared.train, &prepared.test, stability_runs, &vars)
+        let st = stability::run_checked(&cfg, search_train, &prepared.test, stability_runs, &vars)
             .unwrap_or_else(|e| {
                 eprintln!("error: {}", e);
                 std::process::exit(gpu_required_exit(&e).unwrap_or(EXIT_INPUT));

@@ -227,3 +227,157 @@ fn book_target_refusals_are_usage_errors() {
         .unwrap();
     usage_error(&no_objective, "--book-target needs --objective");
 }
+
+const STOP: usize = 200;
+
+fn r1_group(i: usize, g: usize) -> f64 {
+    r1(i) + 0.0003 * g as f64
+}
+
+/// Two groups on one hourly clock. Group 1 ends at `STOP`. The last `DAY` rows of each group have a
+/// NaN `y24` and `r24` (the daily window is incomplete) and a finite `y1` and `r1`.
+fn write_panel_csv(dir: &std::path::Path, drop_nan_label_rows: bool) -> String {
+    let mut text = String::from("t,g,x1,x2,r1,y1,r24,y24\n");
+    for i in 0..N {
+        for g in 0..2usize {
+            let len = if g == 0 { N } else { STOP };
+            if i >= len {
+                continue;
+            }
+            let complete = i + DAY < len;
+            if drop_nan_label_rows && !complete {
+                continue;
+            }
+            let x2 = frac(i as f64 * 0.754_877_666_246_692_7) - 0.5;
+            let r24: f64 = (i + 1..(i + 1 + DAY).min(len)).map(|j| r1_group(j, g)).sum();
+            let (r24, y24) = if complete { (r24.to_string(), r24.to_string()) } else { ("nan".to_string(), "nan".to_string()) };
+            let r = r1_group(i, g);
+            text.push_str(&format!("{},g{},{},{},{},{},{},{}\n", T0 + STEP * i as i64, g, x1(i), x2, r, r, r24, y24));
+        }
+    }
+    let path = dir.join(if drop_nan_label_rows { "p_fit.csv" } else { "p.csv" });
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn run_panel(data: &str, spec: &str, extra: &[&str]) -> Output {
+    let mut args = vec!["--group-by", "g", "--fill", "drop"];
+    args.extend_from_slice(extra);
+    run(data, spec, "y24", &args)
+}
+
+#[test]
+fn book_target_keeps_rows_with_nan_fit_label() {
+    let scratch = Scratch::new("book_target_nan_fit_rows");
+    let data = write_panel_csv(scratch.path(), false);
+    let spec = write_spec(scratch.path());
+    let j = ok(&run_panel(&data, &spec, &["--book-target", "y1"]));
+    let fit_rows = num(&j, &["train_rows"]) as usize;
+    let book_rows = num(&j, &["search_fitness", "rows"]) as usize;
+    assert_eq!(num(&j, &["search_fitness", "groups"]) as usize, 2);
+    assert!(fit_rows > STOP, "group 1 ends inside the training block");
+    assert_eq!(book_rows, fit_rows + DAY, "the DAY NaN-label rows of group 1 stay in the book");
+}
+
+#[test]
+fn book_target_book_rows_include_nan_fit_rows() {
+    let scratch = Scratch::new("book_target_nan_fit_book");
+    let data = write_panel_csv(scratch.path(), false);
+    let spec = write_spec(scratch.path());
+    let j = ok(&run_panel(&data, &spec, &["--book-target", "y1"]));
+    let rows = num(&j, &["search_fitness", "rows"]) as usize;
+    let long = rows - STOP;
+    let mut slice = TradingSlice { rows: TradingRows::default(), ret: Vec::new() };
+    for (g, len) in [(0usize, long), (1, STOP)] {
+        for i in 0..len {
+            slice.rows.group.push(g as u64);
+            slice.rows.time.push((T0 + STEP * i as i64) as f64);
+            slice.ret.push(r1_group(i, g).exp_m1());
+        }
+    }
+    let sp = TradingSpec { cost_bps: 5.0, threshold: 1e-30, min_trades: 0, ..Default::default() };
+    let book = FitnessBook::new(&slice, &sp, STEP as f64).unwrap();
+    assert_eq!(at(&j, &["search_fitness", "book_hash"]).as_str(), Some(format!("{:016x}", book.hash()).as_str()));
+    let pred: Vec<f64> = (0..slice.ret.len()).map(|i| frac(i as f64 * 0.754_877_666_246_692_7) - 0.4).collect();
+    let net = book.net_of(&book.totals(&pred));
+    let exact = trading::evaluate(&pred, &slice.ret, &slice.rows, &sp).unwrap();
+    assert!((net - exact.net_pnl).abs() <= 1e-12 * exact.net_pnl.abs().max(1.0), "{net} vs {}", exact.net_pnl);
+}
+
+#[test]
+fn no_training_label_window_reaches_the_test_block_with_nan_fit_tails() {
+    let scratch = Scratch::new("book_target_nan_leakage");
+    let data = write_panel_csv(scratch.path(), false);
+    let spec = write_spec(scratch.path());
+    let j = ok(&run_panel(&data, &spec, &["--book-target", "y1"]));
+    let day_purge = (STEP + STEP * DAY as i64) as f64;
+    assert_eq!(num(&j, &["split", "required_purge_seconds"]), day_purge);
+    assert!(num(&j, &["split", "purge_seconds"]) >= day_purge, "every training row, with or without a fit label");
+    assert!(num(&j, &["split", "validation_purge_seconds"]) >= day_purge);
+}
+
+fn fit_split_flags() -> Vec<String> {
+    let train = format!("t < {}", T0 + STEP * 400);
+    let test = format!("t >= {}", T0 + STEP * 450);
+    ["--validation-frac", "0.0105", "--train-select", train.as_str(), "--test-select", test.as_str()]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// The panel with NaN-label rows, and the same panel with those rows deleted from the file.
+fn run_nan_and_prefiltered(extra: &[&str], manifest_name: &str) -> (Json, Json, Json, Json) {
+    let scratch = Scratch::new(manifest_name);
+    let spec = write_spec(scratch.path());
+    let with_nan = write_panel_csv(scratch.path(), false);
+    let prefiltered = write_panel_csv(scratch.path(), true);
+    let mut flags = fit_split_flags();
+    flags.extend(extra.iter().map(|s| s.to_string()));
+    let mut results = Vec::new();
+    for (name, data) in [("nan", &with_nan), ("fit", &prefiltered)] {
+        let manifest = scratch.path().join(format!("{name}.manifest.json")).to_string_lossy().into_owned();
+        let mut args: Vec<&str> = vec!["--book-target", "y1", "--run-manifest", manifest.as_str()];
+        args.extend(flags.iter().map(|s| s.as_str()));
+        let j = ok(&run_panel(data, &spec, &args));
+        let m = Json::parse(std::fs::read_to_string(&manifest).unwrap().trim()).expect("manifest is json");
+        results.push((j, m));
+    }
+    let (fit_run, fit_manifest) = results.pop().unwrap();
+    let (nan_run, nan_manifest) = results.pop().unwrap();
+    (nan_run, nan_manifest, fit_run, fit_manifest)
+}
+
+#[test]
+fn book_target_fit_uses_finite_fit_rows_only() {
+    let (nan, _, fit, _) = run_nan_and_prefiltered(
+        &["--generations", "0", "--pop", "1", "--seed-expr", "0.5 * x1 + 0.1 * x2 + 0.01"],
+        "book_target_fit_rows_constants",
+    );
+    for key in ["train_rows", "validation_rows", "test_rows"] {
+        assert_eq!(num(&nan, &[key]), num(&fit, &[key]), "{key}: the fit rows are the same");
+    }
+    assert_eq!(
+        num(&nan, &["search_fitness", "rows"]) as usize,
+        num(&fit, &["search_fitness", "rows"]) as usize + DAY,
+        "the book keeps the NaN-label rows"
+    );
+    let expression = |j: &Json| at(j, &["objective", "finalist", "expression_exact"]).as_str().unwrap().to_string();
+    assert!(!expression(&nan).contains("NaN"), "{}", expression(&nan));
+    assert_eq!(expression(&nan), expression(&fit), "constants equal those of the pre-filtered fit panel");
+}
+
+#[test]
+fn book_target_fit_rows_subsample_is_finite_only() {
+    let (nan, nan_manifest, fit, fit_manifest) = run_nan_and_prefiltered(
+        &["--generations", "6", "--pop", "16", "--fit-rows", "100"],
+        "book_target_fit_rows_subsample",
+    );
+    let sub = |m: &Json| at(m, &["fit_subsample"]).clone();
+    assert_eq!(num(&sub(&nan_manifest), &["fit_rows"]), 100.0);
+    assert_eq!(
+        at(&sub(&nan_manifest), &["hash"]).as_str(),
+        at(&sub(&fit_manifest), &["hash"]).as_str(),
+        "the draw is over the finite-label rows, the same indices as on the pre-filtered panel"
+    );
+    assert!(num(&nan, &["search_fitness", "rows"]) > num(&fit, &["search_fitness", "rows"]));
+}
