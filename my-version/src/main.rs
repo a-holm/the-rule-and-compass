@@ -7072,6 +7072,7 @@ fn main() {
                     archive_rank: r.archive_rank,
                     complexity: r.complexity,
                     usable: r.objective_value.is_finite(),
+                    objective: r.objective_value,
                 })
                 .collect();
             let picked = rcsr::selection::select_robust(&metas, robust_params, tspec, &ret, &book_rows, &mut |i| {

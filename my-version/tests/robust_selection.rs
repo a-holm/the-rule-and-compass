@@ -43,7 +43,7 @@ struct Planted {
 /// Rank 1 flat, rank 2 steady (complexity 3), rank 3 spiky (complexity 9),
 /// rank 4 always long (complexity 2).
 fn planted() -> Planted {
-    let meta = |archive_rank, complexity| RobustMeta { archive_rank, complexity, usable: true };
+    let meta = |archive_rank, complexity| RobustMeta { archive_rank, complexity, usable: true, objective: 0.0 };
     Planted {
         preds: vec![vec![-1.0; PERIODS], long_on(0), long_on(1), vec![1.0; PERIODS]],
         metas: vec![meta(1, 1.0), meta(2, 3.0), meta(3, 9.0), meta(4, 2.0)],
@@ -198,4 +198,25 @@ fn params_are_validated() {
     assert!(params(4, -1.0).validate().is_err());
     assert!(RobustParams { blocks: 4, se_z: 1.0, block_len: 0 }.validate().is_err());
     assert!(params(1, 0.0).validate().is_ok());
+}
+
+#[test]
+fn one_block_without_se_ranks_by_the_validation_objective() {
+    let mut p = planted();
+    let alpha = select(&p, params(1, 0.0));
+    let by_alpha = (0..4).max_by(|&a, &b| alpha.members[a].pooled_alpha.total_cmp(&alpha.members[b].pooled_alpha)).unwrap();
+    let worst_alpha = (0..4).min_by(|&a, &b| alpha.members[a].pooled_alpha.total_cmp(&alpha.members[b].pooled_alpha)).unwrap();
+    assert_ne!(by_alpha, worst_alpha);
+    // The objective orders the members the other way round (lower is better).
+    for (i, m) in p.metas.iter_mut().enumerate() {
+        m.objective = 10.0 - alpha.members[i].pooled_alpha;
+    }
+    let sel = select(&p, params(1, 0.0));
+    assert_eq!(sel.chosen, Some(worst_alpha), "K=1, Z=0 takes the validation_objective choice, not the best alpha");
+    assert_ne!(sel.chosen, Some(by_alpha));
+    let with_se = select(&p, params(1, 1.0));
+    assert_ne!(with_se.chosen, Some(worst_alpha), "any other setting keeps the alpha rule");
+    p.metas[worst_alpha].objective = f64::INFINITY;
+    let next = select(&p, params(1, 0.0)).chosen.unwrap();
+    assert_ne!(next, worst_alpha);
 }

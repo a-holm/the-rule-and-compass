@@ -774,6 +774,9 @@ pub struct RobustMeta {
     /// False for a member the validation book cannot use (no book, or a fixed
     /// position under `--reject-fixed-position`); it is never eligible.
     pub usable: bool,
+    /// The validation objective of the member (lower is better), the key of
+    /// `validation_objective`.
+    pub objective: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
