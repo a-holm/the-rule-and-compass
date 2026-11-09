@@ -1449,6 +1449,23 @@ Why the constants keep the metric fit. A fixed linear structure (`[1, tanh z24, 
 
 The P&L-aligned fits raise train net but not validation net. Turnover is set by the structure, not by the constants, so the leverage is in ranking structures by exact P&L.
 
+#### `--book-target COL`: fit on one label, price the book on another
+
+`--book-target COL` names a second `forward_return` label of the `--target-spec` file. The constants are fitted with `--metric` on `--target`; the long/flat book (the `--fitness pnl` regret, the validation and test books) is priced on `COL`.
+
+```sh
+rcsr --data dev.rcsb --target lbl_h24_y --book-target lbl_h1_y --target-spec dev.targets.json \
+  --time ts --group-by symbol --split temporal --validation-frac 0.3 --objective sharpe \
+  --position long_only --threshold 1e-30 --cost-bps 5 --fitness pnl
+```
+
+* The book spec supplies `return_column`, `horizon_seconds`, `entry_offset_seconds`, `cost_bps` and `cost_in_label`. Rows of one group closer than the book horizon exit 2, so an hourly book can sit on a daily fit label. Without the flag the same command exits 2 on the overlap of the daily label.
+* The row sets are those of the fit label: a row with a NaN fit label leaves the fit and the book alike.
+* The purge at the test boundary and the validation boundary is the larger `required_purge_seconds` of the two specs, so no training row has a fit or book label window that reaches the validation or test block.
+* `--book-target` equal to `--target` is the plain run. A column missing from the spec file, a label that is not `forward_return`, multiple targets or no trading `--objective` exit 2. A book label or its construction columns in `--vars` exit 5 like the fit label.
+* `--json` adds `objective.book_target` and `search_fitness.book_target` only when the book label differs from `--target`. The book hash covers the book returns, so resuming with another book column exits 2.
+* The interaction with `--band` and `--min-holding` is not specified or tested for this flag. The book spec prices whatever rule those flags set; no test covers the pair.
+
 ## 4. Hardware
 
 ### 4.1 The machine we have

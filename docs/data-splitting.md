@@ -94,6 +94,8 @@ counts and the realised minimum distances are in `split`
 top. Without a spec no row is dropped, and the realised distances are still
 recorded.
 
+With `--book-target COL` (`docs/optimisation.md`) the purge is the larger required purge of the fit label and the book label, at both the test and the validation boundary. A fit label of 24 h therefore purges at least 90,000 s even when the book label is 1 h.
+
 ### Validation slice and the test lockbox
 
 The test block answers one question: how well does the chosen law generalise?
