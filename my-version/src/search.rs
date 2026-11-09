@@ -10802,6 +10802,22 @@ mod tests {
         assert_eq!(map.values().sum::<usize>(), 3);
     }
 
+    /// #968: a routed tail fit's cause is a function of the kernel status
+    /// alone, so keeping the better answer cannot change a count.
+    #[test]
+    fn routed_tail_causes_follow_the_kernel_status() {
+        for status in -1..=10 {
+            let expected = match status {
+                4 => Some("rank_deficient"),
+                5 => Some("recovered_iterate"),
+                7 => Some("non_finite_start"),
+                9 => Some("unconverged"),
+                _ => None,
+            };
+            assert_eq!(tail_status_cause(status).map(|c| c.label()), expected, "status {status}");
+        }
+    }
+
     /// #169: every CPU fallback cause has a stable label, and both the plan
     /// rejection and the kernel status map into the documented set.
     #[test]
