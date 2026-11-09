@@ -1253,10 +1253,11 @@ instantiations. A candidate's constants, loss and status are therefore
 bit-identical whichever instantiation fits it: they depend on its own plan, its
 start and the rows only, never on the other candidates of the call or on how
 the overlap pipeline groups candidates into calls.
-`gpu::fit_width_tests::fit_bits_independent_of_batch_split` fits a pool of
-trees with 3 to 20 constants alone, in one call, split by width and in mixed
-pairs, from cold and warm starts, for the squared, absolute, log-squashed,
-slope and correlation arms under every `--fit-polish`, and asserts equal bits;
+The four `gpu::fit_width_tests::fit_bits_independent_of_batch_split_*` tests
+(squared, robust, slope, correlation) fit a pool of trees with 3 to 20
+constants alone, in one call, split by width and in mixed pairs, from cold and
+warm starts, for the squared, absolute, log-squashed, slope and correlation
+arms under every `--fit-polish`, and assert equal bits;
 `a_mixed_p_batch_matches_single_fits_and_the_cpu_lm` asserts it for `p = 4`
 beside `p = 17..20`, and `pipeline_fit_bits_independent_of_batch_mates`
 (`tests/gpu_pipeline_consistency.rs`) asserts equal snapshots and archive

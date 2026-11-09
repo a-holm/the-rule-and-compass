@@ -101,15 +101,14 @@ struct Arm {
     polish: FitPolish,
 }
 
-fn arms() -> Vec<Arm> {
+const POLISHES: [FitPolish; 3] = [FitPolish::F64, FitPolish::F32, FitPolish::Off];
+
+fn arms(losses: &[DeviceLoss], polishes: &[FitPolish]) -> Vec<Arm> {
     let mut out = Vec::new();
-    for loss in [DeviceLoss::Squared, DeviceLoss::Absolute, DeviceLoss::LogSquashed, DeviceLoss::Slope] {
-        for polish in [FitPolish::F64, FitPolish::F32, FitPolish::Off] {
+    for &loss in losses {
+        for &polish in polishes {
             out.push(Arm { loss, polish });
         }
-    }
-    for loss in [DeviceLoss::Correlation, DeviceLoss::CorrelationSigned] {
-        out.push(Arm { loss, polish: FitPolish::F64 });
     }
     out
 }
@@ -164,11 +163,10 @@ fn digest(rows: &[(usize, Bits)]) -> u64 {
     h
 }
 
-/// #977: every tree of the pool gets the bits of its own call in every split.
-/// The digests of the single-tree calls are printed so two builds can be
-/// compared on the trees whose calls had no batch-mates.
-#[test]
-fn fit_bits_independent_of_batch_split() {
+/// #977: every tree of the pool gets the bits of its own call in every split,
+/// for every arm. The digests of the single-tree calls are printed so two
+/// builds can be compared on the trees whose calls had no batch-mates.
+fn check_batch_splits(arms: Vec<Arm>) {
     let (cols64, y) = rows();
     let cols32: Vec<f32> = cols64.iter().map(|&v| v as f32).collect();
     let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
@@ -187,7 +185,7 @@ fn fit_bits_independent_of_batch_split() {
     let mut mismatches: Vec<String> = Vec::new();
     let mut compared = 0usize;
     let mut kinds = [0usize; 3];
-    for arm in arms() {
+    for arm in arms {
         let mut trees = cold.clone();
         for phase in ["cold", "warm"] {
             let plans: Vec<GpuFitPlan> =
@@ -241,4 +239,25 @@ fn fit_bits_independent_of_batch_split() {
         kinds[1],
         kinds[2]
     );
+}
+
+#[test]
+fn fit_bits_independent_of_batch_split_squared() {
+    check_batch_splits(arms(&[DeviceLoss::Squared], &POLISHES));
+}
+
+#[test]
+fn fit_bits_independent_of_batch_split_robust() {
+    check_batch_splits(arms(&[DeviceLoss::Absolute, DeviceLoss::LogSquashed], &POLISHES));
+}
+
+#[test]
+fn fit_bits_independent_of_batch_split_slope() {
+    check_batch_splits(arms(&[DeviceLoss::Slope], &POLISHES));
+}
+
+/// The correlation arms ignore `--fit-polish`.
+#[test]
+fn fit_bits_independent_of_batch_split_correlation() {
+    check_batch_splits(arms(&[DeviceLoss::Correlation, DeviceLoss::CorrelationSigned], &[FitPolish::F64]));
 }
