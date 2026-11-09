@@ -175,3 +175,128 @@ fn a_search_counts_the_routed_tail_fits_in_the_ledger() {
     eprintln!("search: attempts {} gpu {} fallback {} routed {routed} causes {:?}", g.fit_attempts, g.fit_gpu, g.fit_fallback, g.fit_fallback_by_cause);
     assert!(routed > 0, "no tail fit was routed: {:?}", g.fit_fallback_by_cause);
 }
+
+/// #958: what the tail overlap must not change, one search.
+struct TailTrace {
+    /// Every island individual of every generation snapshot.
+    islands: Vec<Vec<(Node, u64)>>,
+    archive: Vec<(Node, u64, u64)>,
+    test_errors: Vec<u64>,
+    by_cause: Vec<std::collections::BTreeMap<String, usize>>,
+    improved: Vec<std::collections::BTreeMap<String, usize>>,
+    bounded: Vec<usize>,
+    stats: search::GpuRunStats,
+}
+
+fn tail_trace(cfg: &Config, train: &Sample, test: &Sample) -> TailTrace {
+    let mut islands = Vec::new();
+    let out = search::run_resumable(cfg, train, test, None, 1, |cp: &crate::checkpoint::Checkpoint| {
+        islands.push(
+            cp.islands
+                .iter()
+                .flat_map(|isl| isl.population.iter().map(|ind| (ind.tree.clone(), ind.error.to_bits())))
+                .collect(),
+        );
+    })
+    .expect("the search runs");
+    let stats = out.gpu.expect("a device run");
+    TailTrace {
+        islands,
+        archive: out.archive.items.iter().map(|s| (s.tree.clone(), s.error.to_bits(), s.cost.to_bits())).collect(),
+        test_errors: out.test_errors.iter().map(|e| e.to_bits()).collect(),
+        by_cause: stats.generations.iter().map(|g| g.fit_fallback_by_cause.clone()).collect(),
+        improved: stats.generations.iter().map(|g| g.fit_fallback_improved_by_cause.clone()).collect(),
+        bounded: stats.generations.iter().map(|g| g.fit_fallback_bounded).collect(),
+        stats,
+    }
+}
+
+/// #958: the exact CPU fits on the fallback pool beside the device work give
+/// the serial routing's trees, errors and per-cause counts bit for bit, on the
+/// narrow synchronous path, the wide synchronous path (the `+inf` check is on
+/// the pool at the same time), the overlap pipeline, and under a binding
+/// `--fit-fallback-max`.
+#[test]
+fn tail_fit_overlap_equals_serial_routing() {
+    need_device!();
+    let (x, y) = rows();
+    let n = 6_000;
+    let train = Sample { x: x[..n].to_vec(), y: y[..n].to_vec(), w: Vec::new(), ys: Vec::new(), pairs: None };
+    let test = Sample { x: x[n..n + 1_000].to_vec(), y: y[n..n + 1_000].to_vec(), w: Vec::new(), ys: Vec::new(), pairs: None };
+    let base = Config {
+        generations: 4,
+        islands: 2,
+        pop: 96,
+        max_complexity: 14,
+        fit_iters: ITERS,
+        patience: 0,
+        seed: 11,
+        threads: 4,
+        ops: crate::expr::Op::parse_list("add,sub,mul,div,min,max,if,greater"),
+        dispatch: crate::dispatch::DispatchMode::Device,
+        gpu: true,
+        fit_strategy: FitStrategy::Gpu,
+        ..Default::default()
+    };
+    let wide = Config { fit_admission: fit::FitAdmission::All, ..base.clone() };
+    let cases = [
+        ("narrow synchronous", Config { pipeline_depth: 0, ..base.clone() }),
+        ("wide synchronous", Config { pipeline_depth: 0, ..wide.clone() }),
+        ("overlap pipeline", Config { pipeline_depth: 2, ..wide.clone() }),
+        ("narrow bounded", Config { pipeline_depth: 0, fit_fallback_max: 2, ..base.clone() }),
+        ("pipeline bounded", Config { pipeline_depth: 2, fit_fallback_max: 2, ..wide }),
+    ];
+    for (label, cfg) in cases {
+        let serial = tail_trace(&Config { fit_tail_overlap: false, ..cfg.clone() }, &train, &test);
+        let overlap = tail_trace(&Config { fit_tail_overlap: true, ..cfg.clone() }, &train, &test);
+        let (s, o) = (&serial.stats, &overlap.stats);
+        let routed: usize = ["rank_deficient", "recovered_iterate", "non_finite_start"]
+            .iter()
+            .map(|c| s.fit_fallback_by_cause.get(*c).copied().unwrap_or(0))
+            .sum();
+        eprintln!(
+            "{label}: attempts {} fallback {} routed {routed} bounded {} causes {:?} | overlap {:.4}s join wait {:.4}s fallback {:.4}s workers {} | serial join wait {:.4}s | calls {} vs {}",
+            o.fit_attempts,
+            o.fit_fallback,
+            o.fit_fallback_bounded,
+            o.fit_fallback_by_cause,
+            o.ledger.fit_tail_overlap_s(),
+            o.ledger.fit_tail_join_wait_s(),
+            o.ledger.fit_fallback_s(),
+            o.fit_fallback_workers,
+            s.ledger.fit_tail_join_wait_s(),
+            o.fit_calls,
+            s.fit_calls,
+        );
+        assert!(routed > 0, "{label}: no tail fit was routed");
+        assert_eq!(serial.islands.len(), overlap.islands.len(), "{label}: snapshots");
+        for (g, (a, b)) in serial.islands.iter().zip(&overlap.islands).enumerate() {
+            assert_eq!(a.len(), b.len(), "{label}: snapshot {g} size");
+            for (k, (p, q)) in a.iter().zip(b).enumerate() {
+                assert!(crate::expr::same(&p.0, &q.0) && p.1 == q.1, "{label}: generation {g} individual {k} differs");
+            }
+        }
+        assert_eq!(serial.archive.len(), overlap.archive.len(), "{label}: archive size");
+        for (k, (p, q)) in serial.archive.iter().zip(&overlap.archive).enumerate() {
+            assert!(crate::expr::same(&p.0, &q.0) && p.1 == q.1 && p.2 == q.2, "{label}: archive member {k} differs");
+        }
+        assert_eq!(serial.test_errors, overlap.test_errors, "{label}: test errors");
+        assert_eq!(serial.by_cause, overlap.by_cause, "{label}: per-generation fallback causes");
+        assert_eq!(serial.improved, overlap.improved, "{label}: per-generation improved refits");
+        assert_eq!(serial.bounded, overlap.bounded, "{label}: per-generation bound");
+        assert_eq!(
+            (s.fit_attempts, s.fit_gpu, s.fit_fallback, &s.fit_fallback_by_cause),
+            (o.fit_attempts, o.fit_gpu, o.fit_fallback, &o.fit_fallback_by_cause),
+            "{label}: run counters"
+        );
+        assert_eq!(s.ledger.fit_tail_overlap_s(), 0.0, "{label}: the serial arm overlaps nothing");
+        for t in [s, o] {
+            let split = t.ledger.fit_tail_overlap_s() + t.ledger.fit_tail_join_wait_s();
+            assert!((t.ledger.fit_fallback_s() - split).abs() < 1e-9, "{label}: fallback_s != overlap + wait");
+            // The overlap pipeline closes to its drain booking, as in
+            // `pipeline_books_fit_interval`.
+            let bound = if cfg.pipeline_depth == 0 { 1e-9 } else { 0.005 };
+            assert!(t.ledger.closure_residual().value.abs() < bound, "{label}: the ledger does not close");
+        }
+    }
+}

@@ -359,6 +359,11 @@ pub struct Config {
     /// `threads`; otherwise they use [`DEFAULT_FIT_COST_CORES`], so the default
     /// resolution does not follow the CPU affinity of the process.
     pub threads_explicit: bool,
+    /// #958: run the exact CPU fallback fits of the device fit stage on the
+    /// fallback pool beside the device work. Scheduling only: the trees and
+    /// errors equal the serial arm bit for bit, so it is not saved in a
+    /// checkpoint. `false` keeps the serial arm after the device batch.
+    pub fit_tail_overlap: bool,
     /// #122: which variation engine to use. `auto` selects the flat postfix
     /// engine only for a large, fit-free GPU run.
     pub variation: VariationMode,
@@ -666,6 +671,7 @@ impl Default for Config {
             pipeline_depth: 2, // #119: only used when the GPU path is active
             threads: 1,
             threads_explicit: false,
+            fit_tail_overlap: true,
             variation: VariationMode::Auto,
             selection: Selection::Lexicographic,
             mutation_mix: MutationMix::Classic,
@@ -1086,6 +1092,9 @@ struct GpuSearch {
     /// beside the fit kernel.
     defer_check: bool,
     deferred_check: Option<(Vec<(usize, usize)>, Vec<(usize, usize)>)>,
+    /// #958: the exact CPU fallback fits run on the pool beside the device
+    /// work; `false` keeps the serial arm after the device batch (#936).
+    tail_overlap: bool,
     /// #230: true only when the CUDA evaluator scores this run's metric
     /// itself through the objective kernel. False for an exact order/rank run,
     /// which is scored through [`crate::gpu::GpuEvaluator::score_stat_batch`]
@@ -1375,6 +1384,7 @@ impl GpuSearch {
                     ledger: crate::gpu_stats::RunLedger::new(),
                     defer_check: false,
                     deferred_check: None,
+                    tail_overlap: true,
                     native_metric,
                     native_stat,
                     score,
@@ -1515,6 +1525,15 @@ impl GpuSearch {
         for &(_, _, cause) in &fallbacks {
             self.note_fit_fallback(generation, cause);
             crate::fit::note_gpu_fit(false);
+        }
+        // #958: the exact CPU fits run on the fallback pool while the device
+        // works: the plan rejects before the launch, the device fallbacks as
+        // soon as the batch is read. `fallbacks[..on_pool]` are submitted.
+        let overlap = self.tail_overlap;
+        let mut tail = PendingTail::default();
+        let mut on_pool = 0usize;
+        if overlap {
+            on_pool = self.tail_submit_prefix(&mut tail, islands, &fallbacks, on_pool, fit_train, cfg);
         }
 
         if !jobs.is_empty() {
@@ -1697,6 +1716,10 @@ impl GpuSearch {
             }
         }
 
+        if overlap {
+            on_pool = self.tail_submit_prefix(&mut tail, islands, &fallbacks, on_pool, fit_train, cfg);
+        }
+
         // #255: exact CPU fallback, seeded with the GPU constants when there
         // were any. The candidates are independent and their admission order is
         // fixed, so the batch is split across scoped workers exactly like the
@@ -1710,7 +1733,19 @@ impl GpuSearch {
             stats.fit_fallback_bounded += bounded;
         }
         let mut workers_used = 0usize;
-        if refit > 0 {
+        if overlap {
+            debug_assert_eq!(on_pool, refit, "the refit prefix is on the pool");
+            let joined = self.tail_join(tail);
+            for (&(_, _, cause), job) in fallbacks[..refit].iter().zip(&joined.jobs) {
+                if job.improved {
+                    self.note_fit_fallback_improved(generation, cause);
+                }
+            }
+            for job in joined.jobs {
+                islands[job.island][job.slot].tree = job.tree;
+            }
+            self.book_fallback_seconds(generation, joined.overlap_s, joined.wait_s, joined.workers);
+        } else if refit > 0 {
             let mut jobs: Vec<FallbackFitJob> = fallbacks[..refit]
                 .iter()
                 .map(|&(island, slot, _)| {
@@ -1735,14 +1770,12 @@ impl GpuSearch {
                 islands[job.island][job.slot].tree = job.tree;
             }
         }
-        // #284: fallback seconds are measured around the CPU arm itself, not
-        // inferred from a count. This is a leaf of the fit host window.
-        let fallback_seconds = fallback_start.elapsed().as_secs_f64();
-        self.fit_fallback_ms += fallback_seconds * 1000.0;
-        self.fit_fallback_workers = self.fit_fallback_workers.max(workers_used);
-        let stats = self.stats.entry(generation).or_default();
-        stats.fit_fallback_seconds += fallback_seconds;
-        stats.fit_fallback_workers = stats.fit_fallback_workers.max(workers_used);
+        if !overlap {
+            // #284: fallback seconds are measured around the CPU arm itself,
+            // not inferred from a count. The serial arm holds the main thread.
+            let fallback_seconds = fallback_start.elapsed().as_secs_f64();
+            self.book_fallback_seconds(generation, 0.0, fallback_seconds, workers_used);
+        }
         if let (Some(sample), Some(ev)) = (fit_sample, fit_ev) {
             self.fit_sub = Some(FitSubsample {
                 sample,
@@ -1776,6 +1809,60 @@ impl GpuSearch {
         count_improved(&mut self.fit_fallback_improved_by_cause, cause);
         let stats = self.stats.entry(generation).or_default();
         count_improved(&mut stats.fit_fallback_improved_by_cause, cause);
+    }
+
+    /// #958: submit the exact CPU fits of `fallbacks[from..]` to the pool, up
+    /// to the `--fit-fallback-max` prefix, each from its slot's current tree.
+    /// Returns how many entries of `fallbacks` are now submitted.
+    fn tail_submit_prefix(
+        &self,
+        tail: &mut PendingTail,
+        islands: &[Vec<Ind>],
+        fallbacks: &[(usize, usize, FitFallbackCause)],
+        from: usize,
+        rows: &Sample,
+        cfg: &Config,
+    ) -> usize {
+        let (refit, _) = fallback_batch_split(fallbacks.len(), cfg.fit_fallback_max);
+        if refit <= from {
+            return from;
+        }
+        let jobs: Vec<FallbackFitJob> = fallbacks[from..refit]
+            .iter()
+            .map(|&(i, j, _)| FallbackFitJob::new(i, j, islands[i][j].tree.clone()))
+            .collect();
+        self.tail_submit(tail, jobs, rows, cfg.fit_iters, cfg.metric);
+        refit
+    }
+
+    /// #958: submit `jobs` to the fallback pool as one more batch of `tail`.
+    fn tail_submit(
+        &self,
+        tail: &mut PendingTail,
+        jobs: Vec<FallbackFitJob>,
+        rows: &Sample,
+        iters: usize,
+        metric: Metric,
+    ) {
+        let pool = self.fallback.as_ref().expect("a GPU search owns its fallback pool");
+        tail.submit(pool, jobs, rows, iters, metric);
+    }
+
+    /// #958: wait for every batch of `tail`.
+    fn tail_join(&self, tail: PendingTail) -> TailJoin {
+        tail.join(self.fallback.as_ref().expect("a GPU search owns its fallback pool"))
+    }
+
+    /// #958: book the exact CPU fallback seconds of one fit stage: `overlap_s`
+    /// ran beside other work, `wait_s` held the main thread.
+    fn book_fallback_seconds(&mut self, generation: usize, overlap_s: f64, wait_s: f64, workers: usize) {
+        let seconds = overlap_s + wait_s;
+        self.fit_fallback_ms += seconds * 1000.0;
+        self.fit_fallback_workers = self.fit_fallback_workers.max(workers);
+        let stats = self.stats.entry(generation).or_default();
+        stats.fit_fallback_seconds += seconds;
+        stats.fit_fallback_workers = stats.fit_fallback_workers.max(workers);
+        self.ledger.record_fit_tail(overlap_s, wait_s);
     }
 
     /// Score every pending (`error.is_nan()`) individual in every island in one
@@ -2707,7 +2794,6 @@ fn rescore_pending_cpu(
 #[cfg(feature = "cuda")]
 struct FallbackPool {
     tx: std::sync::mpsc::SyncSender<FallbackChunk>,
-    done: std::sync::mpsc::Receiver<FallbackResult>,
     workers: usize,
     queue: usize,
     /// Number of worker threads that have executed at least one chunk. Used by
@@ -2733,21 +2819,58 @@ unsafe impl Send for ScoreContext {}
 #[cfg(feature = "cuda")]
 unsafe impl Sync for ScoreContext {}
 
+/// #958: borrowed rows of one batch of exact CPU fits. The slices point at the
+/// heap buffers of the fit sample, so moving the `Sample` that owns them keeps
+/// them valid; the submitter keeps the buffers alive and unchanged until the
+/// ticket is collected or dropped (a dropped ticket waits for its chunks).
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+struct FitContext {
+    x: *const [Vec<f64>],
+    y: *const [f64],
+    w: *const [f64],
+    iters: usize,
+    metric: Metric,
+}
+
+// SAFETY: the rows are read-only while any chunk of the ticket is in flight;
+// see the type comment.
+#[cfg(feature = "cuda")]
+unsafe impl Send for FitContext {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for FitContext {}
+
+#[cfg(feature = "cuda")]
+enum ChunkWork {
+    /// #896: `checked` jobs belong to the device `+inf` check and run through
+    /// [`score_tree_checked_work`].
+    Score { jobs: Vec<(usize, Node)>, ctx: ScoreContext, checked: bool },
+    /// #958: exact CPU fallback fits.
+    Fit { jobs: Vec<FallbackFitJob>, ctx: FitContext },
+}
+
 #[cfg(feature = "cuda")]
 struct FallbackChunk {
     start: usize,
-    jobs: Vec<(usize, Node)>,
-    ctx: ScoreContext,
+    work: ChunkWork,
     blocks: Vec<expr::Block>,
-    /// #896: jobs of the device `+inf` check run through [`score_tree_checked_work`].
-    checked: bool,
+    /// #958: the result channel of the chunk's own ticket, so several tickets
+    /// can be in flight at once.
+    done: std::sync::mpsc::Sender<FallbackResult>,
+}
+
+#[cfg(feature = "cuda")]
+enum ChunkOutput {
+    Errors(Vec<f64>, CheckWork),
+    Fits(Vec<FallbackFitJob>),
 }
 
 #[cfg(feature = "cuda")]
 struct FallbackResult {
     start: usize,
-    errors: Vec<f64>,
-    work: CheckWork,
+    out: ChunkOutput,
+    /// #958: when the worker finished the chunk.
+    finished: std::time::Instant,
 }
 
 #[cfg(feature = "cuda")]
@@ -2759,13 +2882,11 @@ impl FallbackPool {
         let workers = workers.max(1);
         let queue = queue.max(1);
         let (tx, rx) = std::sync::mpsc::sync_channel::<FallbackChunk>(queue);
-        let (done_tx, done) = std::sync::mpsc::channel::<FallbackResult>();
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
         let busy = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (gradual_tx, gradual_rx) = std::sync::mpsc::channel::<bool>();
         for i in 0..workers {
             let rx = std::sync::Arc::clone(&rx);
-            let done_tx = done_tx.clone();
             let busy = std::sync::Arc::clone(&busy);
             let gradual_tx = gradual_tx.clone();
             std::thread::Builder::new()
@@ -2785,30 +2906,48 @@ impl FallbackPool {
                         }
                         // #10: custom blocks are thread-local.
                         expr::set_blocks(chunk.blocks);
-                        // SAFETY: the context borrows `train`/`cfg` from
-                        // `score`, which is blocked waiting for this result.
-                        let (train, cfg) = unsafe { (&*chunk.ctx.0, &*chunk.ctx.1) };
-                        let mut errors = Vec::with_capacity(chunk.jobs.len());
-                        let mut work = CheckWork::default();
-                        for (_, tree) in &chunk.jobs {
-                            if chunk.checked {
-                                let (error, w) = score_tree_checked_work(tree, train, cfg);
-                                work.add(w);
-                                errors.push(error);
-                            } else {
-                                errors.push(score_tree(tree, train, cfg));
+                        let out = match chunk.work {
+                            ChunkWork::Score { jobs, ctx, checked } => {
+                                // SAFETY: the context borrows `train`/`cfg`
+                                // from the submitter, whose ticket waits for
+                                // this result before the borrow ends.
+                                let (train, cfg) = unsafe { (&*ctx.0, &*ctx.1) };
+                                let mut errors = Vec::with_capacity(jobs.len());
+                                let mut work = CheckWork::default();
+                                for (_, tree) in &jobs {
+                                    if checked {
+                                        let (error, w) = score_tree_checked_work(tree, train, cfg);
+                                        work.add(w);
+                                        errors.push(error);
+                                    } else {
+                                        errors.push(score_tree(tree, train, cfg));
+                                    }
+                                }
+                                ChunkOutput::Errors(errors, work)
                             }
-                        }
-                        if done_tx
-                            .send(FallbackResult {
-                                start: chunk.start,
-                                errors,
-                                work,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
+                            ChunkWork::Fit { mut jobs, ctx } => {
+                                // SAFETY: see `FitContext`.
+                                let (x, y, w) = unsafe { (&*ctx.x, &*ctx.y, &*ctx.w) };
+                                for job in jobs.iter_mut() {
+                                    job.improved = refit_lowers_error(
+                                        &mut job.tree,
+                                        x,
+                                        y,
+                                        w,
+                                        ctx.iters,
+                                        ctx.metric,
+                                    );
+                                }
+                                ChunkOutput::Fits(jobs)
+                            }
+                        };
+                        // A ticket receives every chunk before its receiver
+                        // goes away, so the result is never lost.
+                        let _ = chunk.done.send(FallbackResult {
+                            start: chunk.start,
+                            out,
+                            finished: std::time::Instant::now(),
+                        });
                     }
                 })
                 .expect("spawn a CPU fallback worker");
@@ -2817,7 +2956,6 @@ impl FallbackPool {
         let worker_gradual: Vec<bool> = (0..workers).map(|_| gradual_rx.recv().unwrap_or(false)).collect();
         FallbackPool {
             tx,
-            done,
             workers,
             queue,
             busy,
@@ -2847,6 +2985,34 @@ impl FallbackPool {
         cfg: &Config,
         checked: bool,
     ) -> FallbackTicket {
+        let ctx = ScoreContext(
+            train as *const EvalSample as *const EvalSample<'static>,
+            cfg as *const Config,
+        );
+        self.send_chunks(jobs, |jobs| ChunkWork::Score { jobs, ctx, checked })
+    }
+
+    /// #958: submit exact CPU fallback fits on `rows`. The rows must stay alive
+    /// and unchanged until the ticket is collected with
+    /// [`Self::finish_fits`] or dropped.
+    fn submit_fits(
+        &self,
+        jobs: Vec<FallbackFitJob>,
+        rows: &Sample,
+        iters: usize,
+        metric: Metric,
+    ) -> FallbackTicket {
+        let ctx = FitContext {
+            x: &rows.x[..] as *const [Vec<f64>],
+            y: &rows.y[..] as *const [f64],
+            w: &rows.w[..] as *const [f64],
+            iters,
+            metric,
+        };
+        self.send_chunks(jobs, |jobs| ChunkWork::Fit { jobs, ctx })
+    }
+
+    fn send_chunks<J>(&self, jobs: Vec<J>, work: impl Fn(Vec<J>) -> ChunkWork) -> FallbackTicket {
         debug_assert!(self.queue >= 1, "the fallback queue is bounded but non-empty");
         debug_assert!(
             self.busy.load(std::sync::atomic::Ordering::Relaxed) <= self.workers,
@@ -2858,32 +3024,30 @@ impl FallbackPool {
         // fed without making the channel the bottleneck.
         let chunk_len = total.div_ceil(self.workers * 4).max(1);
         let blocks = expr::current_blocks();
-        let ctx = ScoreContext(
-            train as *const EvalSample as *const EvalSample<'static>,
-            cfg as *const Config,
-        );
-        let mut chunks = 0usize;
-        let mut pending = jobs.into_iter().peekable();
-        while pending.peek().is_some() {
-            let start = chunks;
-            let jobs: Vec<(usize, Node)> = pending.by_ref().take(chunk_len).collect();
-            self.tx
-                .send(FallbackChunk {
-                    start,
-                    jobs,
-                    ctx,
-                    blocks: blocks.clone(),
-                    checked,
-                })
-                .expect("the fallback pool is alive");
-            chunks += 1;
-        }
-        FallbackTicket {
-            chunks,
+        let (done_tx, done) = std::sync::mpsc::channel::<FallbackResult>();
+        let mut ticket = FallbackTicket {
+            done,
+            chunks: 0,
+            received: 0,
             chunk_len,
             total,
             started,
+        };
+        let mut pending = jobs.into_iter().peekable();
+        while pending.peek().is_some() {
+            let start = ticket.chunks;
+            let jobs: Vec<J> = pending.by_ref().take(chunk_len).collect();
+            self.tx
+                .send(FallbackChunk {
+                    start,
+                    work: work(jobs),
+                    blocks: blocks.clone(),
+                    done: done_tx.clone(),
+                })
+                .expect("the fallback pool is alive");
+            ticket.chunks += 1;
         }
+        ticket
     }
 
     /// Wait for a submitted batch and return errors in job order plus the
@@ -2894,17 +3058,15 @@ impl FallbackPool {
     }
 
     /// #896: [`Self::finish`] plus the work the early-exit passes did.
-    fn finish_checked(&self, ticket: FallbackTicket) -> (Vec<f64>, f64, CheckWork) {
+    fn finish_checked(&self, mut ticket: FallbackTicket) -> (Vec<f64>, f64, CheckWork) {
         let mut work = CheckWork::default();
         let mut out = vec![f64::NAN; ticket.total];
-        let mut received = 0;
-        while received < ticket.chunks {
-            let result = self
-                .done
-                .recv()
-                .expect("the fallback pool returned a result");
-            work.add(result.work);
-            for (offset, error) in result.errors.into_iter().enumerate() {
+        while let Some(result) = ticket.next_result() {
+            let ChunkOutput::Errors(errors, w) = result.out else {
+                unreachable!("a scoring ticket returns errors")
+            };
+            work.add(w);
+            for (offset, error) in errors.into_iter().enumerate() {
                 // `start` is the chunk ordinal; the absolute job index is
                 // recomputed from the chunk's own position in the job list.
                 let idx = result.start * ticket.chunk_len + offset;
@@ -2912,9 +3074,29 @@ impl FallbackPool {
                     out[idx] = error;
                 }
             }
-            received += 1;
         }
         (out, ticket.started.elapsed().as_secs_f64(), work)
+    }
+
+    /// #958: collect a fit ticket: the jobs in submission order and the instant
+    /// the last chunk finished.
+    fn finish_fits(&self, mut ticket: FallbackTicket) -> (Vec<FallbackFitJob>, std::time::Instant) {
+        let mut slots: Vec<Option<FallbackFitJob>> = (0..ticket.total).map(|_| None).collect();
+        let mut last = ticket.started;
+        while let Some(result) = ticket.next_result() {
+            last = last.max(result.finished);
+            let ChunkOutput::Fits(jobs) = result.out else {
+                unreachable!("a fit ticket returns fits")
+            };
+            for (offset, job) in jobs.into_iter().enumerate() {
+                slots[result.start * ticket.chunk_len + offset] = Some(job);
+            }
+        }
+        let jobs = slots
+            .into_iter()
+            .map(|job| job.expect("every submitted fit came back"))
+            .collect();
+        (jobs, last)
     }
 
     /// Score `jobs` on the pool and return errors in the same order, plus the
@@ -2938,13 +3120,151 @@ struct PendingCheck {
     check: crate::gpu_stats::EvalCheckLedger,
 }
 
+/// #958: exact CPU fallback fits submitted to the pool and not yet collected,
+/// one ticket per submitted batch, in submission order.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct PendingTail {
+    /// Each batch with the instant its submission returned.
+    batches: Vec<(FallbackTicket, std::time::Instant)>,
+    /// Jobs submitted so far, over every batch.
+    jobs: usize,
+    /// Seconds the submitter blocked on a full pool queue.
+    submit_wait_s: f64,
+}
+
+#[cfg(feature = "cuda")]
+impl PendingTail {
+    /// Submit `jobs` to `pool` as one more batch. The rows must stay alive and
+    /// unchanged until the tail is joined or dropped.
+    fn submit(
+        &mut self,
+        pool: &FallbackPool,
+        jobs: Vec<FallbackFitJob>,
+        rows: &Sample,
+        iters: usize,
+        metric: Metric,
+    ) {
+        if jobs.is_empty() {
+            return;
+        }
+        self.jobs += jobs.len();
+        let ticket = pool.submit_fits(jobs, rows, iters, metric);
+        let returned = std::time::Instant::now();
+        self.submit_wait_s += returned.saturating_duration_since(ticket.started).as_secs_f64();
+        self.batches.push((ticket, returned));
+    }
+
+    /// Wait for every batch. With no batch this returns at once. The overlap
+    /// counts a batch from the return of its submission, so time blocked on a
+    /// full queue (behind the `+inf` check, #857) is wait, not overlap.
+    fn join(self, pool: &FallbackPool) -> TailJoin {
+        let join_start = std::time::Instant::now();
+        let origin = self.batches.first().map_or(join_start, |b| b.1);
+        let since = |t: std::time::Instant| t.saturating_duration_since(origin).as_secs_f64();
+        let mut jobs = Vec::with_capacity(self.jobs);
+        let mut spans = Vec::new();
+        let mut workers = 0usize;
+        for (ticket, returned) in self.batches {
+            workers = workers.max(ticket.chunks.min(pool.workers()));
+            let (batch, last) = pool.finish_fits(ticket);
+            spans.push((since(returned), since(last.min(join_start))));
+            jobs.extend(batch);
+        }
+        TailJoin {
+            jobs,
+            overlap_s: span_union_s(spans),
+            wait_s: self.submit_wait_s + join_start.elapsed().as_secs_f64(),
+            workers,
+        }
+    }
+}
+
+/// #958: a collected [`PendingTail`].
+#[cfg(feature = "cuda")]
+struct TailJoin {
+    /// The fitted jobs in submission order.
+    jobs: Vec<FallbackFitJob>,
+    /// Seconds at least one batch was in flight, between the return of its
+    /// submission and the start of the join.
+    overlap_s: f64,
+    /// Main-thread seconds spent waiting for the pool: blocked submissions
+    /// and the join.
+    wait_s: f64,
+    /// Largest number of pool workers one batch could occupy.
+    workers: usize,
+}
+
+/// #958: total length of the union of `[start, end]` spans.
+#[cfg(any(feature = "cuda", test))]
+fn span_union_s(mut spans: Vec<(f64, f64)>) -> f64 {
+    spans.retain(|&(a, b)| b > a);
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut total = 0.0;
+    let mut open: Option<(f64, f64)> = None;
+    for (a, b) in spans {
+        open = match open {
+            Some((s, e)) if a <= e => Some((s, e.max(b))),
+            Some((s, e)) => {
+                total += e - s;
+                Some((a, b))
+            }
+            None => Some((a, b)),
+        };
+    }
+    if let Some((s, e)) = open {
+        total += e - s;
+    }
+    total
+}
+
 /// #121: a submitted fallback batch, waiting to be collected.
 #[cfg(feature = "cuda")]
 struct FallbackTicket {
+    /// #958: this batch's own result channel.
+    done: std::sync::mpsc::Receiver<FallbackResult>,
     chunks: usize,
+    received: usize,
     chunk_len: usize,
     total: usize,
     started: std::time::Instant,
+}
+
+#[cfg(feature = "cuda")]
+impl FallbackTicket {
+    /// The next chunk result, or `None` once every chunk has come back.
+    fn next_result(&mut self) -> Option<FallbackResult> {
+        if self.received == self.chunks {
+            return None;
+        }
+        let result = self.done.recv().expect("the fallback pool returned a result");
+        self.received += 1;
+        Some(result)
+    }
+}
+
+/// #958: the workers read the submitter's rows through raw pointers until
+/// their chunk is done, so a ticket that is not collected (an error path or a
+/// panic) waits for every chunk before the borrow can end.
+#[cfg(feature = "cuda")]
+impl Drop for FallbackTicket {
+    fn drop(&mut self) {
+        while self.received < self.chunks && self.done.recv().is_ok() {
+            self.received += 1;
+        }
+    }
+}
+
+/// #958: whether the exact CPU fallback fits overlap the device work. The
+/// config field is the test switch; `RCSR_FIT_TAIL_SERIAL=1` selects the serial
+/// arm from the command line for an A/B run.
+#[cfg(feature = "cuda")]
+fn fit_tail_overlap(cfg: &Config) -> bool {
+    cfg.fit_tail_overlap
+        && !matches!(
+            std::env::var("RCSR_FIT_TAIL_SERIAL").as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
 }
 
 /// #121: size of the bounded CPU fallback pool: `RCSR_CPU_FALLBACK_THREADS`,
@@ -3140,6 +3460,7 @@ fn score_pipeline_batch(
     fit: Option<PipelineFit>,
     pending: &mut PipelineFitQueue,
     fallbacks: &mut Vec<PipelineFallback>,
+    tail: &mut PipelineTail,
 ) -> Result<(), String> {
     let Some(g) = gpu.as_mut() else {
         return Err("pipeline scoring without a GPU evaluator".to_string());
@@ -3175,7 +3496,7 @@ fn score_pipeline_batch(
         }
     }
     if pending.planned() >= FIT_BATCH_MIN {
-        fit_pipeline_queue(pending, gpu, results, generation, fit, fallbacks)?;
+        fit_pipeline_queue(pending, gpu, results, generation, fit, fallbacks, tail)?;
     }
     Ok(())
 }
@@ -3191,6 +3512,7 @@ fn fit_pipeline_queue(
     generation: usize,
     fit: PipelineFit,
     fallbacks: &mut Vec<PipelineFallback>,
+    tail: &mut PipelineTail,
 ) -> Result<(), String> {
     let Some(g) = gpu.as_mut() else {
         return Err("pipeline scoring without a GPU evaluator".to_string());
@@ -3208,6 +3530,7 @@ fn fit_pipeline_queue(
     if offered == 0 {
         return Ok(());
     }
+    let fresh = fallbacks.len();
     let fit_start = std::time::Instant::now();
     g.fit_attempts += offered;
     {
@@ -3283,6 +3606,20 @@ fn fit_pipeline_queue(
             }
         }
     }
+    // #958: the exact CPU fits of this call's fallbacks start now, beside the
+    // rest of the generation; the barrier joins them in its own order.
+    if g.tail_overlap {
+        let base = tail.pending.jobs;
+        let jobs: Vec<FallbackFitJob> = fallbacks[fresh..]
+            .iter_mut()
+            .enumerate()
+            .map(|(k, f)| {
+                f.early = Some(base + k);
+                FallbackFitJob::new(f.island, f.slot, f.tree.clone())
+            })
+            .collect();
+        g.tail_submit(&mut tail.pending, jobs, tail.rows, fit.iters, fit.metric);
+    }
 
     let fit_ms_elapsed = fit_start.elapsed().as_secs_f64() * 1000.0;
     g.fit_host_ms += fit_ms_elapsed;
@@ -3353,18 +3690,32 @@ struct PipelineFallback {
     cause: FitFallbackCause,
     offered: u64,
     tree: Node,
+    /// #958: position of this fallback's early exact fit in the generation's
+    /// [`PipelineTail`], when one was started.
+    early: Option<usize>,
 }
 
 #[cfg(feature = "cuda")]
 impl PipelineFallback {
     fn new(group: u8, island: usize, slot: usize, cause: FitFallbackCause, offered: u64, tree: Node) -> Self {
-        Self { group, island, slot, cause, offered, tree }
+        Self { group, island, slot, cause, offered, tree, early: None }
     }
+}
+
+/// #958: the overlap pipeline's exact CPU fits, started as each device call
+/// is read and joined at the generation barrier. `rows` are the rows the
+/// barrier refits on.
+#[cfg(feature = "cuda")]
+struct PipelineTail<'a> {
+    rows: &'a Sample,
+    pending: PendingTail,
 }
 
 /// #578: refit the first `fit_fallback_max` fallbacks of the generation on the
 /// CPU, hold the rest at their device constants, then simplify and score every
-/// fallback tree on the device, as `fit_pending` and its re-score do.
+/// fallback tree on the device, as `fit_pending` and its re-score do. #958: a
+/// fallback whose exact fit started early on the pool takes that result; one
+/// past the prefix drops it.
 #[cfg(feature = "cuda")]
 fn finish_pipeline_fallbacks(
     g: &mut GpuSearch,
@@ -3374,6 +3725,7 @@ fn finish_pipeline_fallbacks(
     fit: PipelineFit,
     cap: usize,
     generation: usize,
+    tail: PendingTail,
 ) -> Result<(), String> {
     if fallbacks.is_empty() {
         return Ok(());
@@ -3385,13 +3737,28 @@ fn finish_pipeline_fallbacks(
         g.stats.entry(generation).or_default().fit_fallback_bounded += bounded;
     }
     let start = std::time::Instant::now();
-    let mut workers_used = 0usize;
-    if refit > 0 {
-        let mut jobs: Vec<FallbackFitJob> = fallbacks[..refit]
+    let joined = g.tail_join(tail);
+    let mut early: Vec<Option<FallbackFitJob>> = joined.jobs.into_iter().map(Some).collect();
+    let mut rest: Vec<usize> = Vec::new();
+    for (n, f) in fallbacks[..refit].iter_mut().enumerate() {
+        match f.early.and_then(|k| early[k].take()) {
+            Some(job) => {
+                if job.improved {
+                    g.note_fit_fallback_improved(generation, f.cause);
+                }
+                f.tree = job.tree;
+            }
+            None => rest.push(n),
+        }
+    }
+    let rest_start = std::time::Instant::now();
+    let mut workers_used = joined.workers;
+    if !rest.is_empty() {
+        let mut jobs: Vec<FallbackFitJob> = rest
             .iter()
-            .map(|f| FallbackFitJob::new(f.island, f.slot, f.tree.clone()))
+            .map(|&n| FallbackFitJob::new(fallbacks[n].island, fallbacks[n].slot, fallbacks[n].tree.clone()))
             .collect();
-        workers_used = fit_fallback_jobs(
+        workers_used = workers_used.max(fit_fallback_jobs(
             &mut jobs,
             &train.x,
             &train.y,
@@ -3399,21 +3766,17 @@ fn finish_pipeline_fallbacks(
             fit.iters,
             fit.metric,
             g.fallback_workers,
-        );
-        for (f, job) in fallbacks[..refit].iter_mut().zip(jobs) {
+        ));
+        for (&n, job) in rest.iter().zip(jobs) {
             if job.improved {
-                g.note_fit_fallback_improved(generation, f.cause);
+                g.note_fit_fallback_improved(generation, fallbacks[n].cause);
             }
-            f.tree = job.tree;
+            fallbacks[n].tree = job.tree;
         }
     }
-    let seconds = start.elapsed().as_secs_f64();
-    g.fit_fallback_ms += seconds * 1000.0;
-    g.fit_host_ms += seconds * 1000.0;
-    g.fit_fallback_workers = g.fit_fallback_workers.max(workers_used);
-    let stats = g.stats.entry(generation).or_default();
-    stats.fit_fallback_seconds += seconds;
-    stats.fit_fallback_workers = stats.fit_fallback_workers.max(workers_used);
+    let rest_s = rest_start.elapsed().as_secs_f64();
+    g.fit_host_ms += start.elapsed().as_secs_f64() * 1000.0;
+    g.book_fallback_seconds(generation, joined.overlap_s, joined.wait_s + rest_s, workers_used);
 
     let scored: Vec<PipelineJob> = fallbacks
         .iter()
@@ -7912,6 +8275,7 @@ fn run_search(
                 match created {
                     Ok(mut g) => {
                         g.memory_plan = memory_plan;
+                        g.tail_overlap = fit_tail_overlap(cfg);
                         let device = crate::gpu::GpuEvaluator::device_name();
                         if cfg.gpu_notes {
                             // #169: the GPU-fit arm runs at the generation
@@ -8657,6 +9021,8 @@ fn run_search(
             #[cfg(feature = "cuda")]
             let mut pipeline_fallbacks: Vec<PipelineFallback> = Vec::new();
             #[cfg(feature = "cuda")]
+            let mut pipeline_tail = PipelineTail { rows: gen_train, pending: PendingTail::default() };
+            #[cfg(feature = "cuda")]
             let mut fit_queue = PipelineFitQueue::default();
             std::thread::scope(|s| {
                 // The queue lives in the scope: producers take a clone of the
@@ -8724,6 +9090,7 @@ fn run_search(
                             pipeline_fit,
                             &mut fit_queue,
                             &mut pipeline_fallbacks,
+                            &mut pipeline_tail,
                         )
                     });
                     if pipeline_error.is_none() {
@@ -8735,6 +9102,7 @@ fn run_search(
                                 gen,
                                 fit,
                                 &mut pipeline_fallbacks,
+                                &mut pipeline_tail,
                             )
                             .err();
                         }
@@ -8762,6 +9130,7 @@ fn run_search(
                                 fit,
                                 cfg.fit_fallback_max,
                                 gen,
+                                std::mem::take(&mut pipeline_tail.pending),
                             )
                             .err();
                         }
@@ -8815,6 +9184,9 @@ fn run_search(
                         if let Some(e) = pipeline_error.take() {
                             gpu_lost(cfg, e, &mut backend_reason)?;
                         }
+                        // #958: the early fits are discarded; their tickets
+                        // wait for the workers before the pool moves.
+                        drop(std::mem::take(&mut pipeline_tail.pending));
                         // #121: keep the pool for the rescore, then drop the
                         // evaluator; a failed batch also scores via the pool.
                         let fallback = gpu
@@ -12070,6 +12442,86 @@ mod tests {
                 assert_eq!(e.to_bits(), want.to_bits(), "job {k} took another ticket's result");
             }
         }
+    }
+
+    /// #958: exact-fit jobs whose start constants are away from the optimum.
+    #[cfg(feature = "cuda")]
+    fn tail_jobs(n: usize) -> Vec<FallbackFitJob> {
+        (0..n)
+            .map(|k| {
+                let wave = node(
+                    Op::Sin,
+                    vec![node(Op::Mul, vec![constant(1.0 + k as f64 / 7.0), input(0)])],
+                );
+                let tree = node(
+                    Op::Add,
+                    vec![node(Op::Mul, vec![constant(0.5 + k as f64 / 10.0), wave]), constant(-0.3)],
+                );
+                FallbackFitJob::new(k / 5, k % 5, tree)
+            })
+            .collect()
+    }
+
+    /// #958: the pending tail returns every fit in submission order, bit for
+    /// bit equal to the serial scoped arm, across batches on several workers;
+    /// an empty batch is not submitted.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn pending_tail_returns_fits_in_submission_order() {
+        let s = sample_rows(400);
+        let pool = FallbackPool::new(4, 4);
+        let mut serial = tail_jobs(23);
+        fit_fallback_jobs(&mut serial, &s.x, &s.y, &s.w, 8, Metric::Squared, 1);
+        assert!(serial.iter().any(|j| j.improved), "the fixture must move constants");
+        let mut tail = PendingTail::default();
+        let mut jobs = tail_jobs(23);
+        let second = jobs.split_off(9);
+        tail.submit(&pool, jobs, &s, 8, Metric::Squared);
+        tail.submit(&pool, Vec::new(), &s, 8, Metric::Squared);
+        tail.submit(&pool, second, &s, 8, Metric::Squared);
+        assert_eq!((tail.batches.len(), tail.jobs), (2, 23));
+        let joined = tail.join(&pool);
+        assert_eq!(joined.jobs.len(), serial.len());
+        for (k, (a, b)) in serial.iter().zip(&joined.jobs).enumerate() {
+            assert_eq!((a.island, a.slot), (b.island, b.slot), "job {k} moved");
+            assert!(expr::same(&a.tree, &b.tree), "job {k}: the pool fit differs from the serial arm");
+            assert_eq!(a.improved, b.improved, "job {k}");
+        }
+        assert_eq!(joined.workers, 4);
+        assert!(joined.overlap_s >= 0.0 && joined.wait_s >= 0.0);
+        // A fit ticket and a scoring ticket in flight together stay apart.
+        let cfg = Config::default();
+        let view = EvalSample::new(&s, &cfg);
+        let probe: Vec<Node> = (0..30).map(|k| node(Op::Sin, vec![node(Op::Mul, vec![constant(k as f64), input(0)])])).collect();
+        let scores = pool.submit(probe.iter().cloned().enumerate().collect(), &view, &cfg);
+        let fits = pool.submit_fits(tail_jobs(23), &s, 8, Metric::Squared);
+        let (fitted, _) = pool.finish_fits(fits);
+        let (errors, _) = pool.finish(scores);
+        for (a, b) in serial.iter().zip(&fitted) {
+            assert!(expr::same(&a.tree, &b.tree));
+        }
+        for (tree, e) in probe.iter().zip(&errors) {
+            assert_eq!(e.to_bits(), score_tree(tree, &view, &cfg).to_bits());
+        }
+    }
+
+    /// #958: a tail with no fits joins at once and starts no worker.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn pending_tail_join_with_no_jobs_is_a_noop() {
+        let pool = FallbackPool::new(2, 2);
+        let joined = PendingTail::default().join(&pool);
+        assert!(joined.jobs.is_empty());
+        assert_eq!((joined.workers, joined.overlap_s), (0, 0.0));
+        assert_eq!(pool.busy.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// #958: the overlap is the union of the in-flight spans.
+    #[test]
+    fn span_union_merges_overlapping_spans() {
+        assert_eq!(span_union_s(Vec::new()), 0.0);
+        assert_eq!(span_union_s(vec![(0.0, 1.0), (0.5, 2.0), (3.0, 4.0), (5.0, 5.0)]), 3.0);
+        assert_eq!(span_union_s(vec![(3.0, 4.0), (0.0, 1.0)]), 2.0);
     }
 
     /// #120: scoring a candidate with the QD layer on must not require the

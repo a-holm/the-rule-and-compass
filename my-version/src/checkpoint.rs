@@ -1890,6 +1890,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         pipeline_depth: 2,
         threads: 1,
         threads_explicit: false,
+        fit_tail_overlap: true,
         variation,
         selection,
         mutation_mix,

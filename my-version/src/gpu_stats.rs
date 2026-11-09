@@ -222,8 +222,15 @@ pub struct RunLedger {
     fit_kernel_polish_s: f64,
     /// #498: exact host gate seconds of device proposals inside the fit stage.
     fit_gate_s: f64,
-    /// Exact CPU fallback seconds inside the fit stage.
+    /// Exact CPU fallback seconds inside the fit stage: tail overlap plus join
+    /// wait.
     fit_fallback_s: f64,
+    /// #958: the part of `fit_fallback_s` the fits ran on the pool beside
+    /// other work, before the stage joined them.
+    fit_tail_overlap_s: f64,
+    /// #958: the part of `fit_fallback_s` the main thread waited for the fits,
+    /// in a blocked submission or in the join.
+    fit_tail_join_wait_s: f64,
     /// Exact CPU f64 finalist refit seconds (a subset of the fit stage).
     refit_s: f64,
     /// Candidates admitted to the fit stage.
@@ -374,8 +381,9 @@ impl RunLedger {
     }
 
     /// Record the fit stage totals. `host_s` includes the device call, the CPU
-    /// fallback and write-back; `kernel_s` and `fallback_s` are its two
-    /// non-overlapping measured leaves.
+    /// fallback and write-back; `kernel_s` and `fallback_s` are its measured
+    /// leaves. #958: fallback fits on the pool can run beside the kernel, so
+    /// only their join wait ([`Self::record_fit_tail`]) is exclusive host time.
     pub fn record_fit(&mut self, host_s: f64, kernel_s: f64, fallback_s: f64) {
         if host_s.is_finite() && host_s > 0.0 {
             self.fit_host_s += host_s;
@@ -385,6 +393,17 @@ impl RunLedger {
         }
         if fallback_s.is_finite() && fallback_s > 0.0 {
             self.fit_fallback_s += fallback_s;
+        }
+    }
+
+    /// #958: record how the exact CPU fallback seconds of one fit stage split
+    /// into pool time beside other work and main-thread wait.
+    pub fn record_fit_tail(&mut self, overlap_s: f64, wait_s: f64) {
+        if overlap_s.is_finite() && overlap_s > 0.0 {
+            self.fit_tail_overlap_s += overlap_s;
+        }
+        if wait_s.is_finite() && wait_s > 0.0 {
+            self.fit_tail_join_wait_s += wait_s;
         }
     }
 
@@ -509,6 +528,8 @@ impl RunLedger {
         self.fit_kernel_s += other.fit_kernel_s;
         self.fit_kernel_polish_s += other.fit_kernel_polish_s;
         self.fit_fallback_s += other.fit_fallback_s;
+        self.fit_tail_overlap_s += other.fit_tail_overlap_s;
+        self.fit_tail_join_wait_s += other.fit_tail_join_wait_s;
         self.fit_gate_s += other.fit_gate_s;
         self.refit_s += other.refit_s;
         self.refits += other.refits;
@@ -626,6 +647,14 @@ impl RunLedger {
 
     pub fn fit_fallback_s(&self) -> f64 {
         self.fit_fallback_s
+    }
+
+    pub fn fit_tail_overlap_s(&self) -> f64 {
+        self.fit_tail_overlap_s
+    }
+
+    pub fn fit_tail_join_wait_s(&self) -> f64 {
+        self.fit_tail_join_wait_s
     }
 
     pub fn refit_s(&self) -> f64 {
