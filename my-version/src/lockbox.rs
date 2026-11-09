@@ -1233,7 +1233,7 @@ mod tests {
             embargo: Embargo::none(),
         };
         let purge = 7_200;
-        let e = d.check_times("test split", "ts", &[1_000_000 - purge], purge).unwrap_err();
+        let e = d.check_times("test split", "ts", &[1_000_000 - purge + 1], purge).unwrap_err();
         assert!(e.contains("1 row(s) whose label window reaches the declared locked test"), "{}", e);
         assert!(e.contains("label end = stamp + 7200 s"), "{}", e);
         assert!(e.contains("--exclude 'ts >= 992801 and ts < 2000000'"), "{}", e);
