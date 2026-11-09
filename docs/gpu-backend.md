@@ -2190,6 +2190,16 @@ The deferred device fit does per candidate what the CPU arm does.
 * **Kept refusals.** A run without the device fit arm (`--fit-strategy exact`/`auto`/other CPU arm, `--no-fit`, a metric with no device fit objective) keeps the CPU evaluator with the reason `--fit-samples/--fit-rows scores on all rows only with the device fit arm (--fit-strategy gpu)`. Tiled residency still refuses the device fit. The overlapped fit pipeline (`pipeline_fit_safe`) is off for a subsample and the batches run synchronously. `--predictor-samples` still refuses the device.
 * **Cost model.** The planner decides per candidate on the subsample row count. At small `N` the model can route a fit to the CPU (`dispatch_cost`), which is labelled in `fit_fallback_by_cause`.
 
+### Fit rows of `--book-target`
+
+With `--book-target` a training row can have a finite book return and a NaN fit label (#948). The scoring context holds every book row and the long/flat book prices all of them. The device fit reads only the rows with a fit label (#971):
+
+* **Fit context.** `GpuSearch` puts the fit rows (`Config::fit_view`) in the second context of the fit subsample above: f32 rows, f64 twin and fit weights. With `--fit-rows N` the context holds the `N` rows drawn from the fit rows with the same seed and hash as the CPU draw, so `gpu.fit.subsample_hash` equals the manifest `fit_subsample.hash`. Without `--fit-rows` the context holds every fit row and `subsample_hash` is null.
+* **Reporting.** `gpu.fit.fit_rows` counts the fit rows (`train_rows`, or `N`); `gpu.fit.score_rows` counts the book rows (`search_fitness.rows`).
+* **What reads the fit rows.** Every fit kernel batch, the exact gate and the CPU fallback fits, as for a subsample. The overlapped fit pipeline is off and the fit batches run synchronously. When the training block has no row without a fit label, the fit rows are the scoring rows and the device fits on the scoring context, as without `--book-target`.
+* **Kept refusal.** `--metric slope` with the device fit arm keeps the CPU search with `slope pairs are not the consecutive rows of the device fit sample`: the fit context holds no slope pair mask.
+* **Memory.** The plan charges the fit context at the fit-row count, like a subsample of that size.
+
 ### Correlation arm
 
 `--metric correlation` (`1 − |ρ|`) and `--metric correlation_signed` (`1 − ρ`) fit on the device through `fit::fit_loss`. The kernel minimises exactly the configured objective with an analytic gradient and curvature in `f64`. The affine gauge pair `(a, b)` of an outer `a*T + b` is renormalised to `(sign a, 0)` and frozen, so its step is exactly zero.

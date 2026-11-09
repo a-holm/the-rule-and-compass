@@ -249,8 +249,8 @@ INPUT:
                              log_growth and forward_return labels. A row with
                              a NaN fit label and a finite book return stays in
                              the book; the constant fit and --fit-rows read the
-                             labelled rows only (CUDA builds fall back to the
-                             CPU search for such rows)
+                             labelled rows only (on the GPU as well: the device
+                             fits the labelled rows and scores every book row)
   --position long_only|top_tercile
                              long_only (default): 1[pred > --threshold]. top_tercile: per
                              timestamp the top floor(n/3) finite predictions are long (p=1),
