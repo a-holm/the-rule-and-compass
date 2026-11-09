@@ -446,7 +446,7 @@ atomically instead of streaming it. See
   (`start`, `progress`…, `solution`…, `done`) for long runs.
 * **Deterministic**: the same `--seed` gives the same answer, and the seed is
   echoed in the output.
-* **Bounded time**: `--time-budget <seconds>` guarantees the process returns. `--interim-chunk` skips the end-of-run report of a chunk that stops on it ([docs/checkpoint.md](docs/checkpoint.md#interim-chunks)).
+* **Bounded time**: `--time-budget <seconds>` guarantees the process returns. `--interim-chunk` skips the end-of-run report of a chunk that stops on it ([docs/checkpoint.md](docs/checkpoint.md#interim-chunks)). A chunked run totals its search seconds in `search.cumulative` of `run.json`; `elapsed_seconds` stays the last process ([cost of a chunked run](docs/checkpoint.md#cost-of-a-chunked-run)).
 * **stdin**: `--data -` reads the table from standard input.
 * **Bounded memory**: `--max-memory 2GB` refuses an input whose estimated
   footprint would exceed the budget, with exit 3 and a fix, instead of being
@@ -668,6 +668,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random]
      [--time-budget seconds] [--interim-chunk] [--save file] [--save-every N] [--resume file]
      [--allow-backend-change] [--allow-build-change] [--run-manifest file] [--json-out file]
+     [--select-rule validation_objective|robust] [--select-blocks K] [--select-se Z] [--select-block-len L]
+     [--reselect checkpoint] [--reselect-run run.json]
      [--format text|json|ndjson] [--json] [--ndjson] [--progress]
      [--dev-log-level summary|full] [--dev-log file.ndjson] [--no-dev-log]
      [--dev-log-every N] [--dev-log-max-bytes size]

@@ -242,3 +242,38 @@ fn ladder_sr_run_hash_ignores_the_run_path() {
     assert!(a.json_with(true).contains(&format!("\"run\":\"{}\"", p(&f.run))));
     assert!(b.json_with(true).contains(&format!("\"run\":\"{}\"", p(&copied))));
 }
+
+/// #923: the SR rung wall is the wall of every chunk when run.json carries a
+/// complete `search.cumulative`, the last process otherwise, and `--sr-wall` wins.
+#[test]
+fn ladder_sr_wall_uses_the_cumulative_block_and_labels_its_basis() {
+    let f = fixture("cumulative-wall");
+    let late_only = f.dir.join("late.csv");
+    let text = std::fs::read_to_string(&f.windows).unwrap();
+    let kept: Vec<&str> = text.lines().filter(|l| !l.starts_with("expanding,early")).collect();
+    std::fs::write(&late_only, kept.join("\n") + "\n").unwrap();
+    let original = std::fs::read_to_string(&f.run).unwrap();
+    let marker = "\"chunks\":1,\"elapsed_seconds\":";
+    assert!(original.contains(marker), "a fresh run reports one chunk");
+    let chunked = f.dir.join("chunked.run.json");
+    std::fs::write(&chunked, original.replacen(marker, "\"chunks\":3,\"elapsed_seconds\":777.5,\"last_elapsed_seconds\":", 1)).unwrap();
+    let stale = f.dir.join("stale.run.json");
+    std::fs::write(&stale, original.replacen("\"cumulative\":{", "\"cumulative_none\":{", 1)).unwrap();
+    let out = f.dir.join("ladder.json");
+    let equal_cost = |run: &Path, extra: &[&str]| -> (Option<f64>, Option<String>) {
+        let mut args = vec!["--sr-run", p(run)];
+        args.extend_from_slice(extra);
+        let ok = ladder(&f, &late_only, &args, &out);
+        assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
+        let j = json_of(&out);
+        let ec = j.get("equal_cost").unwrap();
+        (
+            ec.get("sr_wall_seconds").and_then(Json::as_f64),
+            ec.get("sr_wall_basis").and_then(Json::as_str).map(str::to_string),
+        )
+    };
+    assert_eq!(equal_cost(&chunked, &[]), (Some(777.5), Some("cumulative".to_string())));
+    let process = RunFile::load(p(&f.run)).unwrap().elapsed_seconds;
+    assert_eq!(equal_cost(&stale, &[]), (process, Some("process".to_string())));
+    assert_eq!(equal_cost(&chunked, &["--sr-wall", "5"]), (Some(5.0), None));
+}

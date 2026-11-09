@@ -574,7 +574,7 @@ A formula is only as good as the best opponent it beat. `rcsr ladder` runs every
 | `symbolic_regression` | one search `run.json` (`--sr-run`) scored on every fold with its fixed threshold `objective.spec.threshold`, or the caller's out-of-fold score column (`--sr-score`, labelled `oof=caller`) |
 | `matched_exposure_random_long` | the run lengths of the searched book (else the OLS book) shuffled per symbol |
 
-`--sr-run run.json` evaluates the run's finalist on `fit`, `validation` and `test` of every fold. Out-of-fold rule: a fold whose `test_start` is below `max(split.train_time[1], split.validation_time[1]) + purge` of the run is in-sample and exits 3 naming the fold; a run without `split.train_time` is in-sample too. `--allow-in-sample` labels such folds `oof:false` in the report's `sr_run.folds` and drops them from every rung and every pooled series (Sharpe, SPA, DSR, PBO). `candidate_evaluations` and `wall_seconds` of the rung come from the run (`search.candidates_evaluated`, `elapsed_seconds`) unless `--sr-evals` or `--sr-wall` is given. The out-of-fold SR score comes from one search per arm trained before the first scored fold, not from a search per fold.
+`--sr-run run.json` evaluates the run's finalist on `fit`, `validation` and `test` of every fold. Out-of-fold rule: a fold whose `test_start` is below `max(split.train_time[1], split.validation_time[1]) + purge` of the run is in-sample and exits 3 naming the fold; a run without `split.train_time` is in-sample too. `--allow-in-sample` labels such folds `oof:false` in the report's `sr_run.folds` and drops them from every rung and every pooled series (Sharpe, SPA, DSR, PBO). `candidate_evaluations` and `wall_seconds` of the rung come from the run (`search.candidates_evaluated`, and `search.cumulative.elapsed_seconds` when that block is complete, else `elapsed_seconds`) unless `--sr-evals` or `--sr-wall` is given. `equal_cost.sr_wall_basis` is `cumulative` for the first, `process` for the fallback (the run is chunked and its last process alone is timed, so the wall is understated) and null under `--sr-wall`. See `docs/checkpoint.md`, "Cost of a chunked run". The out-of-fold SR score comes from one search per arm trained before the first scored fold, not from a search per fold.
 
 Per fold, a model fits on `[train_start, validation_start - purge)`, chooses its hyperparameters and its score-threshold quantile on `[validation_start, train_end)` and is scored once on the test range. A score rung is long iff `score > theta`, with `theta` a fit-score quantile from `--quantiles`. A rung whose input column is not given is `not_run` with the reason. The test range is never used for selection; the best long/flat rule and the SPA benchmark are reported from it for the reader only.
 
@@ -714,6 +714,33 @@ The run refuses a setup that would leak or mis-state the book:
 The target spec's purge already covers the label horizon between the training, validation and test blocks.
 
 With `--fitness pnl --pnl-blocks K` (2 to 8) the search itself penalises a formula that earns in one regime only: the training rows are cut into `K` contiguous time blocks, each block is scored as its own long/flat book, and the fitness is the mean block regret plus `--pnl-block-lambda` times their sample standard deviation (`docs/optimisation.md`). This is a ranking term on the training period. It does not replace the validation slice, the walk-forward of the front or the lockbox, and it does not refit constants per block.
+
+### Robust finalist selection and re-selection
+
+`--select-rule robust` (needs a trading `--objective`) replaces the best-net choice of `validation_objective`. It asks for an edge in most validation blocks, measured against exposure-matched buy-and-hold, and prefers the simplest member that is statistically as good as the best.
+
+1. The distinct validation timestamps are cut into `--select-blocks K` runs (1 to 8, default 4) with `trading::block_ids`. Fewer timestamps than blocks exits 2.
+2. Per timestamp the rows of all groups are averaged. In block `k`, `alpha_k = net_k - exposure_k x bh_k`: `net_k` is the member's mean net excess over cash per period, `exposure_k` its mean position and `bh_k` the mean buy-and-hold net excess of the same rows (entry and exit cost included). A member that only holds beta has alpha 0. A block without long rows has alpha 0 and does not count as positive.
+3. A member is eligible when `alpha_k > 0` in at least `K - 1` blocks and the pooled alpha (mean over all periods) is positive.
+4. The standard error of the pooled alpha comes from a circular block bootstrap of the per-period alpha series: block length `--select-block-len` (default 21 periods), 500 resamples, a fixed seed shared by all members.
+5. The finalist is the eligible member of lowest complexity whose pooled alpha is at least `best - --select-se x SE(best)` (default Z = 1). Ties go to fewer validation trades, then to the lower archive rank.
+6. No eligible member gives verdict `no_signal`; the finalist is then the `validation_objective` choice.
+
+With `--select-blocks 1 --select-se 0` the rule is `validation_objective` itself: the finalist is the member of best validation objective, with the same tie rule.
+
+The rule reads training and validation rows only. Changing the test block changes the reported test book and nothing in `objective.selection_rule` or the finalist. `--json` records `objective.selection_rule`: `rule`, `blocks`, `se_z`, `block_len`, `verdict`, `members` (`archive_rank`, `complexity`, `trades`, `block_alpha`, `pooled_alpha`, `se`, `eligible`) and `chosen_rank`.
+
+The rule is a post-loop option, like `--prune`. It is not saved search state and not part of `config_hash`: `--resume` accepts another `--select-rule`, but still refuses another `--pop`.
+
+A finished search is re-selected without a new one:
+
+```sh
+rcsr <data, target, objective and fitness flags of the original run> \
+  --reselect run.ckpt --select-rule robust --select-blocks 4 --select-se 1
+rcsr <same flags> --reselect-run run.json --select-rule robust
+```
+
+`--reselect` loads the checkpoint, runs no generation and scores its `final_archive` (the post-refit exact archive the run reported) on the validation slice. `search.generations_run` and `candidates_evaluated` are copied from the checkpoint and `objective.selection_rule.reselected_from` records the path and sha256 (and `build_differs` with both build identities: another build is accepted, because no trajectory continues). It exits 2 for a checkpoint without a final archive, for `--generations` above the saved value, and for another data fingerprint, target spec or backend (without `--allow-backend-change`). `--reselect-run` parses `pareto[].expression_exact` in `archive_rank` order and checks `split.mode`, `train_rows` and the variables against the data. A run.json holds the reported front only, after `--prune`. In-loop selection, `--reselect` and `--resume <checkpoint> --generations <generations_run>` call the same `selection::select_robust` on the same exact front.
 
 ## 5. Not yet implemented (on the roadmap)
 

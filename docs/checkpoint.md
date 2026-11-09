@@ -59,6 +59,23 @@ A chunk that stops for another reason (`generations`, `patience`, `solved`, `fro
 
 The last chunk is run without the flag. Its checkpoint, archive and `run.json` equal those of the same chunks run without the flag, apart from timing fields. `tests/checkpoint.rs` pins the checkpoint bytes and the report across interim chunks, plain chunks and one uninterrupted run.
 
+### Cost of a chunked run
+
+The checkpoint carries no timestamp, so a prefix run reproduces it byte for byte. The cost of the chunks before this process lives in `<save path>.cost`, written atomically (temp file and rename) in the same step as every checkpoint save: `{"v":1,"generation":G,"chunks":N,"search_seconds":S,"ledger_wall_s":W,"device_seconds_incl_fit":D}`. `--resume` reads the sidecar of the `--resume` path and uses it only when `generation` equals the checkpoint generation. A missing, unreadable or other-generation sidecar (a checkpoint from before this file existed, or a crash between the two writes) gives `search.cumulative` `{"complete":false}`, and the chain stays incomplete. A save inside a running chunk records `ledger_wall_s` and `device_seconds_incl_fit` as null; the exit save of the chunk records them from the GPU ledger (null for a CPU run).
+
+Scope of the result fields after a chunked run:
+
+| field | scope |
+|---|---|
+| `generations_run`, `checkpoint.generation`, `search.candidates_evaluated` | cumulative |
+| `elapsed_seconds`, `timing.*`, `gpu.ledger`, `gpu.generations`, `gpu.totals`, `gpu.evals`, `gpu.batches`, `gpu.quality_per_gpu_hour` | last process only |
+| `search.cumulative.chunks`, `.elapsed_seconds`, `.ledger_wall_s`, `.device_hours` | all chunks (`chunks` is 1 without `--resume`) |
+| `gpu.quality_per_gpu_hour_run` | best error of the cumulative archive over `search.cumulative.ledger_wall_s` when known, else over this process's ledger wall |
+| dev log `run_end` `wall`, `search`, `device_hours`, `run_wall_s` | last process only (one dev log per chunk) |
+| dev log `run_end` `search_cumulative` | all chunks; `rcsr dev-report` prints it as "search wall (all chunks)" |
+
+`elapsed_seconds` keeps its per-process meaning; `search.cumulative` carries the total. `rcsr ladder --sr-run` takes the SR rung wall from `search.cumulative.elapsed_seconds` when `complete` is true (`equal_cost.sr_wall_basis` is `cumulative`), else from `elapsed_seconds` (`process`). `--sr-wall` overrides both and leaves `sr_wall_basis` null. The interim `run.json` carries the same `search.cumulative` block.
+
 If the run stops early and the last chunk was an interim chunk, no report exists. `rcsr ... --resume <file> --time-budget 0` without `--interim-chunk` runs one more generation and writes the full report.
 
 ## Format, version 1
@@ -213,7 +230,7 @@ Non-search flags (input file, column names, output format, reports, `--top`, …
 are free to change, subject to the data fingerprint. `--save` may be combined
 with `--resume`; saving to the same path overwrites it at the next boundary.
 
-Execution settings are not saved. A resumed run takes them from its own command line: `--gpu`, `--cpu`, `--dispatch`, `--pipeline-depth` (default `2`, not the earlier chunk's value), `--threads` (and the CPU count of the process), `--gpu-memory`, and the post-loop options `--prune`, `--prune-rows`, `--prune-budget` and `--fit-report`. None of them changes the search trajectory. Settings that do change it, such as `--fit-polish`, `--fit-irls` and `--fit-rows`, are saved and a mismatch is refused.
+Execution settings are not saved. A resumed run takes them from its own command line: `--gpu`, `--cpu`, `--dispatch`, `--pipeline-depth` (default `2`, not the earlier chunk's value), `--threads` (and the CPU count of the process), `--gpu-memory`, and the post-loop options `--prune`, `--prune-rows`, `--prune-budget`, `--fit-report` and the selection rule (`--select-rule`, `--select-blocks`, `--select-se`, `--select-block-len`; `--reselect` re-selects a finished checkpoint without a search, see overfitting.md). None of them changes the search trajectory. Settings that do change it, such as `--fit-polish`, `--fit-irls` and `--fit-rows`, are saved and a mismatch is refused.
 
 ### Backend identity
 
