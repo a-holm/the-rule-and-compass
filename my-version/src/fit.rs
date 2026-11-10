@@ -7441,7 +7441,7 @@ mod tests {
             .map(|(i, r)| r[0] * r[0] / 8e5 * (1.0 + 0.05 * (2.1 * i as f64).cos()))
             .collect();
         let z2: Vec<f64> = x.iter().map(|r| r[0] * r[0]).collect();
-        let (inv, _) = two_column_ls(&z2, &vec![0.0; y.len()], &y[..]);
+        let inv = dot(&z2, &y) / dot(&z2, &z2);
         let sse_min: f64 = z2.iter().zip(&y).map(|(z, t)| (z * inv - t).powi(2)).sum();
 
         let (c1, c2) = (530.8156455944121, 9927.813354065755);
