@@ -10,14 +10,19 @@ use scratch::Scratch;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+fn clean_git_env(cmd: &mut Command) -> &mut Command {
+    for (k, _) in std::env::vars() {
+        if k.starts_with("GIT_") {
+            cmd.env_remove(k);
+        }
+    }
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1")
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main"])
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
+    let mut cmd = Command::new("git");
+    cmd.args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main"]).args(args).current_dir(dir);
+    let out = clean_git_env(&mut cmd).output()
         .expect("run git");
     assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
     String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -76,7 +81,8 @@ impl Fixture {
 
     fn build(&self) -> Build {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-        let out = Command::new(cargo)
+        let mut cmd = Command::new(cargo);
+        let out = clean_git_env(&mut cmd)
             .args(["build", "-vv", "--offline"])
             .current_dir(self.probe())
             .env("CARGO_TARGET_DIR", &self.target)
