@@ -224,9 +224,12 @@ fn reselect_run_json_matches_checkpoint() {
 #[test]
 fn resume_at_saved_generations_selects_same_finalist() {
     let fx = fixture();
-    ok(&fx.search("a", &[]));
+    // `--generations <generations_run>` is a resume with nothing left to run
+    // only when the search used its whole budget: a lower value is refused.
+    ok(&fx.search("a", &["--patience", "0"]));
     ok(&fx.reselect("a", "b", ROBUST));
     let saved = at(&fx.run_json("a"), &["generations_run"]).as_usize().unwrap().to_string();
+    assert_eq!(saved, "80", "the search ran its whole budget");
     let (ck, out) = (fx.path("a.ckpt"), fx.path("r.run.json"));
     let log = fx.path("r.dev.ndjson");
     let mut args = vec!["--resume", ck.as_str(), "--generations", saved.as_str(), "--json-out", out.as_str(), "--dev-log", log.as_str()];
