@@ -1460,6 +1460,7 @@ docs/weights.md               per-row weights, weighted metrics and weighted lea
 docs/implicit.md              implicit relations f(x, y) = 0 and the level-set metric
 docs/overfitting.md           avoiding and detecting overfitting, with references
 docs/meta-operators.md        structural meta operators and their cache rule
+docs/operator-semantics.md    domain and out-of-domain result of every operator, both f64 evaluators
 docs/aggregation.md           dataset aggregates: semantics, cache and leakage rules
 docs/seeds.md                 start the search from a known formula (--seed-expr/--seed-file)
 docs/checkpoint.md            save/resume state, atomic writes and backend identity

@@ -1562,13 +1562,7 @@ fn apply_op(op: Op, a0: f64, a1: f64, a2: f64, node_val: f64) -> f64 {
         Const => node_val,
         Input => node_val, // unused: inputs are folded in below
         Neg => -a(0),
-        // #87: `Exp` and `Div` are the two operators that can leave a
-        // *finite* fitter value where `expr::eval` returns NaN or infinity.
-        // The other operators' Rust implementations already produce a
-        // non-finite value in the same cases (Ln(0) -> -inf, Sqrt(<0) -> NaN,
-        // Tan(inf) -> NaN, Pow -> NaN, Atan2 -> NaN), so they cannot create a
-        // reusable finite SSE. Guarding them too changed the multi-output
-        // search trajectory without fixing a finite-vs-infinite divergence.
+        // Every operator follows the rule of `expr::eval` (docs/operator-semantics.md).
         Exp => {
             let x = a(0);
             if x > 700.0 {
@@ -1577,7 +1571,7 @@ fn apply_op(op: Op, a0: f64, a1: f64, a2: f64, node_val: f64) -> f64 {
                 x.exp()
             }
         }
-        Ln => a(0).ln(),
+        Ln => expr::ln(a(0)),
         Abs => a(0).abs(),
         Sqrt => a(0).sqrt(),
         Sin => a(0).sin(),
@@ -1649,7 +1643,7 @@ fn apply_op(op: Op, a0: f64, a1: f64, a2: f64, node_val: f64) -> f64 {
                 a(0) / b
             }
         }
-        Pow => a(0).powf(a(1)),
+        Pow => expr::pow(a(0), a(1)),
         Mod => {
             let (x, b) = (a(0), a(1));
             if !x.is_finite() || !b.is_finite() || b.abs() < 1e-12 {
@@ -7603,3 +7597,7 @@ mod tests {
         assert!(rel(c[0], a) <= 1e-6 && rel(c[1], 1.0 / inv) <= 1e-6, "{ctx}");
     }
 }
+
+#[cfg(test)]
+#[path = "fit_eval_agreement_tests.rs"]
+pub(crate) mod eval_agreement_tests;
