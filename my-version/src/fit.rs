@@ -2047,10 +2047,19 @@ fn ind(x: f64) -> f64 {
 }
 
 /// Solve `(A + λ·diag(A)) δ = b` for small symmetric `A` (Cholesky).
+///
+/// #990: the diagonal floor `1e-12·s` and the pivot limit `1e-18·s` use
+/// `s = min(Aᵢᵢ, 1)` (`s = 1` for a zero or non-finite `Aᵢᵢ`). An absolute
+/// floor swamps a tiny Jacobian column (a divisor near `1e6`) and freezes its
+/// constant; a column with `Aᵢᵢ >= 1` keeps the absolute values, so its step is
+/// bit-identical. A zero column still gets a zero step.
 fn solve(a: &[Vec<f64>], b: &mut [f64], lambda: f64, k: usize) -> Option<Vec<f64>> {
     let mut m = a.to_vec();
+    let scale: Vec<f64> = (0..k)
+        .map(|i| if a[i][i] > 0.0 && a[i][i] < 1.0 { a[i][i] } else { 1.0 })
+        .collect();
     for i in 0..k {
-        m[i][i] = m[i][i] * (1.0 + lambda) + 1e-12;
+        m[i][i] = m[i][i] * (1.0 + lambda) + 1e-12 * scale[i];
     }
     // Cholesky
     let mut l = vec![vec![0.0; k]; k];
@@ -2061,7 +2070,7 @@ fn solve(a: &[Vec<f64>], b: &mut [f64], lambda: f64, k: usize) -> Option<Vec<f64
                 s -= l[i][p] * l[j][p];
             }
             if i == j {
-                if s <= 1e-18 {
+                if s <= 1e-18 * scale[i] {
                     return None;
                 }
                 l[i][j] = s.sqrt();
