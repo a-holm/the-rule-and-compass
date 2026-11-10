@@ -1075,11 +1075,11 @@ struct GpuSearch {
     fit_calls: usize,
     fit_call_candidates: usize,
     fit_call_ms_max: f64,
-    /// #169: wall time spent in the whole fit stage (kernel, launch, CPU
-    /// fallback and write-back), milliseconds.
+    /// #169: wall time spent in the fit stage windows (kernel, launch, write-back,
+    /// join wait for CPU fallbacks), milliseconds.
     fit_host_ms: f64,
-    /// #284/#255: exact CPU fallback seconds inside the fit stage, milliseconds.
-    /// This is a subset of `fit_host_ms`, never added to it twice.
+    /// #284/#255: summed pool seconds of CPU fallback fits (overlap plus join wait), milliseconds.
+    /// It can exceed `fit_host_ms`; only the join wait lies inside it.
     fit_fallback_ms: f64,
     fit_gate_ms: f64,
     /// #600: main-thread milliseconds of the overlap drain spent in scoring and
@@ -6886,8 +6886,8 @@ pub struct GpuRunStats {
     pub fit_polish: crate::fit::FitPolish,
     /// #169: wall time spent in the whole fit stage, milliseconds.
     pub fit_host_ms: f64,
-/// #284/#255: wall time spent in the exact CPU fallback fits, milliseconds.
-    /// Already included in `fit_host_ms`; report it, never add it again.
+    /// #284/#255: summed pool seconds of the CPU fallback fits (overlap plus join wait), milliseconds.
+    /// It can exceed `fit_host_ms`; only the join wait lies inside it.
     pub fit_fallback_ms: f64,
     /// #498: wall time of the exact gate of device proposals, milliseconds.
     /// Already included in `fit_host_ms`; report it, never add it again.
@@ -7435,9 +7435,9 @@ pub struct GpuSnapshot {
     pub nonfinite_full: usize,
     pub nonfinite_cpu_finite: usize,
     pub nonfinite_seconds: f64,
-    /// #256: whole fit stage wall (device call, CPU fallback, write-back).
+    /// #256: host-clock wall of the fit stage windows (device call, gate, write-back, join wait for CPU fallbacks). Fallbacks that run on pool workers beside the device call are not part of it.
     pub fit_host_s: f64,
-    /// #256: exact CPU fit-fallback wall, a subset of `fit_host_s`.
+    /// #256: summed pool seconds of CPU fit fallbacks (overlap plus join wait). It can exceed `fit_host_s` because fallbacks run on parallel pool workers.
     pub fit_fallback_s: f64,
     /// #498: exact host gate wall, a subset of `fit_host_s`.
     pub fit_gate_s: f64,

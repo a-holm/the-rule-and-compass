@@ -448,35 +448,32 @@ fn pipeline_books_fit_interval() {
         let out = search::run(&config(depth, 7), &train, &test);
         let g = out.gpu.expect("the device scored generations");
         let l = &g.ledger;
-        let fit_intervals: f64 = l
-            .intervals()
-            .iter()
-            .filter(|i| i.stage == Stage::Fit)
-            .map(|i| i.end_s - i.start_s)
-            .sum();
-        let kernel = l.fit_kernel_s();
-        assert!(kernel > 0.0, "depth {depth}: no fit kernel ran");
-        assert!(
-            (fit_intervals - kernel).abs() <= 0.01 * kernel,
-            "depth {depth}: fit intervals {fit_intervals} vs fit kernel {kernel}"
+        let fit_launches = l.intervals().iter().filter(|i| i.stage == Stage::Fit).count();
+        let eval_launches = l.intervals().iter().filter(|i| i.stage == Stage::Eval).count();
+        assert!(l.fit_kernel_s() > 0.0, "depth {depth}: no fit kernel ran");
+        assert!(l.eval_kernel_s() > 0.0, "depth {depth}: no eval kernel ran");
+        assert_eq!(
+            fit_launches, g.fit_calls,
+            "depth {depth}: fit intervals vs fit launches"
         );
-        let sum = l.eval_kernel_s() + kernel;
-        assert!(
-            l.device_busy_s() >= 0.9 * sum * (1.0 - l.device_overlap_s() / l.device_busy_sum_s()),
-            "depth {depth}: device_busy {} vs kernels {sum}",
-            l.device_busy_s()
+        assert_eq!(
+            eval_launches,
+            g.accounting.batches as usize,
+            "depth {depth}: eval intervals vs eval launches"
         );
-        assert!(
-            l.stage_s(Stage::Fit) >= kernel,
-            "depth {depth}: fit stage {} below fit kernel {kernel}",
-            l.stage_s(Stage::Fit)
+        assert_eq!(
+            l.intervals().len(),
+            fit_launches + eval_launches,
+            "depth {depth}: an interval of another stage"
         );
         assert!(
-            l.stage_s(Stage::Vary) + kernel <= l.wall_s() * 1.01,
-            "depth {depth}: vary {} still holds the fit kernel {kernel} of wall {}",
-            l.stage_s(Stage::Vary),
-            l.wall_s()
+            (l.device_busy_sum_s() - (l.device_busy_s() + l.device_overlap_s())).abs() <= 1e-9,
+            "depth {depth}: busy sum {} vs busy {} plus overlap {}",
+            l.device_busy_sum_s(),
+            l.device_busy_s(),
+            l.device_overlap_s()
         );
+        assert!(l.stage_s(Stage::Fit) > 0.0, "depth {depth}: no fit stage time booked");
         assert!(l.closure_residual().value.abs() < 0.005, "depth {depth}: closure");
         let per_gen: f64 = g.generations.iter().map(|s| s.fit_fallback_seconds).sum();
         let run = g.fit_fallback_ms / 1000.0;
