@@ -667,7 +667,7 @@ mod tests {
         assert_unfolded(sub(c(-6e5), sub(c(6e5), x(0))));
         assert_unfolded(mul(c(1e4), add(mul(c(1e3), x(0)), c(1.0))));
         assert_unfolded(div(c(1e4), div(c(1e-3), x(0))));
-        assert_unfolded(mul(c(1e-3), div(x(0), c(1e-5))));
+        assert_unfolded(mul(c(1e4), div(c(1e3), x(0))));
     }
 
     #[test]
