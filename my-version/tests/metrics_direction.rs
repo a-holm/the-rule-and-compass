@@ -133,7 +133,8 @@ fn signed_correlation_is_a_selectable_metric() {
 
 #[test]
 fn a_fitted_step_warns_that_the_threshold_is_not_optimised() {
-    let data = csv(&[(0.0, 0.0), (1.0, 0.0), (2.0, 1.0), (3.0, 1.0)]);
+    // The seed fits every row, so no other member can push it off the front.
+    let data = csv(&[(0.0, 0.0), (1.0, 1.0), (2.0, 1.0), (3.0, 1.0)]);
     let out = run(
         &[
             "--data",
