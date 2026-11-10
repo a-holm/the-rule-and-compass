@@ -1019,7 +1019,7 @@ fn embargo_after_test_block_covers_h336() {
         locked_embargo: 0,
         ..rcsr::walkforward::ProtocolOptions::default()
     };
-    assert_eq!(opts.locked_reach(&spec), vec![(ls, le, ls - purge, le + purge)]);
+    assert_eq!(opts.locked_reach(&spec), vec![(ls, le, ls - purge + 1.0, le + purge)]);
 
     // The store path: a ret1-only store with an h336 label declares the label purge as its embargo.
     let s = scratch::Scratch::new("lh-embargo");

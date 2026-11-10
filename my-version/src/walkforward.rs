@@ -177,14 +177,31 @@ impl ProtocolOptions {
         self.entry_offset + horizon + self.delay
     }
 
-    /// `[S - P, E + max(L, P))` of every sealed range with `P` the purge a training
-    /// label needs: a label within `P` after the end shares returns with the last
-    /// locked labels.
+    /// Whole seconds of purge in front of a sealed range: the label purge, or
+    /// the spec embargo when that is larger.
+    pub fn locked_purge_seconds(&self, spec: &EvalSpec) -> i64 {
+        self.required_purge_seconds(spec.horizon).max(spec.embargo_seconds()).ceil() as i64
+    }
+
+    /// The seconds after the end of a sealed range that no row may read:
+    /// `max(L, P)`.
+    pub fn locked_embargo_seconds(&self, spec: &EvalSpec) -> i64 {
+        self.locked_embargo.max(0).max(self.locked_purge_seconds(spec))
+    }
+
+    /// `(S, E, first, E + max(L, P))` of every sealed range with `P` the purge a
+    /// training label needs. A row is read when `t < first` or `t >= E + max(L, P)`:
+    /// the half-open predicate of `Lockbox::reaches`, so the row at `S - P` is
+    /// kept. Stamps are whole seconds.
     pub fn locked_reach(&self, spec: &EvalSpec) -> Vec<(f64, f64, f64, f64)> {
-        let purge = self.required_purge_seconds(spec.horizon).max(spec.embargo_seconds());
+        let purge = self.locked_purge_seconds(spec);
+        let embargo = self.locked_embargo_seconds(spec);
         self.locked_ranges
             .iter()
-            .map(|&(s, e)| (s as f64, e as f64, s as f64 - purge, e as f64 + (self.locked_embargo.max(0) as f64).max(purge)))
+            .map(|&(s, e)| {
+                let range = crate::lockbox::Lockbox { start: s, end: e };
+                (s as f64, e as f64, range.first_reaching(purge) as f64, (e + embargo) as f64)
+            })
             .collect()
     }
 }
@@ -1152,7 +1169,7 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
                     side,
                     crate::protocol::iso(ls),
                     crate::protocol::iso(le),
-                    ls - lo,
+                    opts.locked_purge_seconds(spec),
                     hi - le,
                     crate::protocol::iso(lo),
                     crate::protocol::iso(hi)
@@ -1252,8 +1269,11 @@ enum Pass {
 }
 
 struct Accum {
-    /// `[S - P, E + L)` of the sealed ranges: rows inside are never read.
-    locked_reach: Vec<(f64, f64)>,
+    /// Sealed ranges with the purge before and the embargo after: rows that reach
+    /// one are never read.
+    locked: Vec<crate::lockbox::Lockbox>,
+    locked_purge: i64,
+    locked_embargo: i64,
     windows: Vec<WindowData>,
     candidates: usize,
     scores: Vec<f64>,
@@ -1316,7 +1336,9 @@ impl Accum {
             });
         }
         Ok(Accum {
-            locked_reach: opts.locked_reach(spec).iter().map(|r| (r.2, r.3)).collect(),
+            locked: opts.locked_ranges.iter().map(|&(start, end)| crate::lockbox::Lockbox { start, end }).collect(),
+            locked_purge: opts.locked_purge_seconds(spec),
+            locked_embargo: opts.locked_embargo_seconds(spec),
             windows,
             candidates,
             scores: vec![0.0; candidates],
@@ -1330,7 +1352,8 @@ impl Accum {
         if !t.is_finite() {
             return false;
         }
-        if self.locked_reach.iter().any(|&(a, b)| t >= a && t < b) {
+        let stamp = t.floor().clamp(-1e15, 1e15) as i64;
+        if self.locked.iter().any(|r| r.reaches(stamp, self.locked_purge, self.locked_embargo)) {
             return false;
         }
         self.windows.iter().any(|d| {
