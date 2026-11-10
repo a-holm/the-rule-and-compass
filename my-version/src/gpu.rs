@@ -9322,8 +9322,9 @@ mod maximum_tests {
     }
 
     /// A batch whose candidates have different constant counts is fitted for
-    /// every candidate: the device declines nothing (`status == 0`) and the
-    /// reported objective is the exact maximum of the returned constants.
+    /// every candidate: the device declines nothing (no status 1, 2 or 3; a
+    /// squared-start label 4 to 9 is not a decline) and the reported objective
+    /// is the exact maximum of the returned constants.
     #[test]
     fn a_mixed_batch_of_constant_counts_is_fitted_for_every_candidate() {
         let f = fixture(64);
@@ -9351,7 +9352,12 @@ mod maximum_tests {
         assert!(ms > 0.0);
         assert_eq!(out.len(), trees.len());
         for (k, res) in out.iter().enumerate() {
-            assert_eq!(res.status, 0, "candidate {k} (p = {}) was declined", plans[k].nconst);
+            assert!(
+                crate::fit::fit_status_usable(res.status),
+                "candidate {k} (p = {}) was declined with status {}",
+                plans[k].nconst,
+                res.status
+            );
             assert!(res.sse.is_finite());
             let applied = with_constants(&trees[k], &res.c);
             assert_eq!(cpu_max(&f, &applied).to_bits(), res.sse.to_bits());
