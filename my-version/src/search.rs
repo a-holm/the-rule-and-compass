@@ -2733,7 +2733,7 @@ fn run_fallback_fit(
     iters: usize,
     metric: Metric,
 ) {
-    if job.cause == Some(FitFallbackCause::NonFiniteStart) && refit_cannot_win(job, x, y, w, metric) {
+    if false && job.cause == Some(FitFallbackCause::NonFiniteStart) && refit_cannot_win(job, x, y, w, metric) {
         job.skipped = true;
         return;
     }
