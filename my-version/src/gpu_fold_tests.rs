@@ -18,7 +18,7 @@ macro_rules! need_device {
 }
 
 /// Two columns and a target close to `0.7*x0 - 0.4`, deterministic.
-fn sample(n: usize) -> Sample {
+pub(super) fn sample(n: usize) -> Sample {
     let x: Vec<Vec<f64>> = (0..n)
         .map(|r| {
             let t = r as f64;
@@ -29,7 +29,7 @@ fn sample(n: usize) -> Sample {
     Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None }
 }
 
-fn config() -> Config {
+pub(super) fn config() -> Config {
     Config {
         metric: Metric::Squared,
         gpu: true,
@@ -70,7 +70,7 @@ fn constants(t: &Node) -> Vec<f64> {
     out
 }
 
-fn fit_on_device(trees: &[Node], train: &Sample, cfg: &Config) -> (GpuSearch, Vec<Node>) {
+pub(super) fn fit_on_device(trees: &[Node], train: &Sample, cfg: &Config) -> (GpuSearch, Vec<Node>) {
     let mut g = device(train);
     let mut islands = vec![trees.iter().map(|t| Ind::pending(t.clone(), cfg)).collect::<Vec<_>>()];
     let admitted: Vec<(usize, usize)> = (0..trees.len()).map(|j| (0, j)).collect();

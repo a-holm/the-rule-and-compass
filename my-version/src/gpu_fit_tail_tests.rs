@@ -374,3 +374,35 @@ fn routed_tail_fits_keep_the_better_answer() {
     assert!(worst <= 1e-12, "a kept answer is above min(device, CPU) by {worst:e}");
     assert!(tree22 <= 0.9367, "tree 22 kept/cpu SSE {tree22:.6}");
 }
+
+/// #988: a status-7 tree with a non-finite exact start skips its refit; the
+/// kept answer of every other status-7 tree is bit for bit the unskipped one,
+/// and a skipped tree's unskipped answer has no finite error.
+#[test]
+fn skipping_a_dead_start_never_changes_a_finite_answer() {
+    need_device!();
+    let (x, y) = rows();
+    let trees = trees();
+    let device = device_results(&x, &y, &trees);
+    let sample = Sample { x: x.clone(), y: y.clone(), w: Vec::new(), ys: Vec::new(), pairs: None };
+    let metric = crate::metrics::Metric::Squared;
+    let bits = |t: &Node| fit::constants_slots(t).iter().map(|c| c.to_bits()).collect::<Vec<_>>();
+    let (mut status7, mut skipped) = (0usize, 0usize);
+    for (k, (start, (status, dev))) in trees.iter().zip(&device).enumerate() {
+        if search::tail_status_cause(*status) != Some(search::FitFallbackCause::NonFiniteStart) {
+            continue;
+        }
+        status7 += 1;
+        let (today, _) = search::routed_tail_fit(start, dev.clone(), &sample, ITERS, metric, None);
+        let (now, was_skipped) =
+            search::routed_tail_fit(start, dev.clone(), &sample, ITERS, metric, Some(search::FitFallbackCause::NonFiniteStart));
+        if was_skipped {
+            skipped += 1;
+            assert!(!sse(&today, &x, &y).is_finite(), "tree {k}: a skipped refit had a finite answer");
+        } else {
+            assert_eq!(bits(&now), bits(&today), "tree {k}");
+        }
+    }
+    eprintln!("dead start: status 7 trees {status7}, skipped {skipped}");
+    assert!(status7 > 0);
+}
