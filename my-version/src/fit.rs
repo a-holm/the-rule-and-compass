@@ -7603,3 +7603,7 @@ mod tests {
         assert!(rel(c[0], a) <= 1e-6 && rel(c[1], 1.0 / inv) <= 1e-6, "{ctx}");
     }
 }
+
+#[cfg(test)]
+#[path = "fit_eval_agreement_tests.rs"]
+pub(crate) mod eval_agreement_tests;

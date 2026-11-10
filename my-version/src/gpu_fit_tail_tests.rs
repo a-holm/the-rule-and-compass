@@ -406,3 +406,24 @@ fn skipping_a_dead_start_never_changes_a_finite_answer() {
     eprintln!("dead start: status 7 trees {status7}, skipped {skipped}");
     assert!(status7 > 0);
 }
+
+/// #997: the two status-7 trees agree on finiteness at their start constants
+/// on every fixture row. On a mismatch the message names the first row and the
+/// per-node values of both evaluators.
+#[test]
+fn evaluators_agree_on_finiteness_for_fixture_trees_216_and_237() {
+    let (x, _) = rows();
+    let trees = trees();
+    for k in [216usize, 237] {
+        let tree = &trees[k];
+        for (r, row) in x.iter().enumerate() {
+            let ev = crate::expr::eval(tree, row);
+            let (nodes, fl) = fit::eval_agreement_tests::flat_trace(tree, row);
+            assert_eq!(
+                ev.is_finite(),
+                fl.is_finite(),
+                "tree {k} row {r} {row:?}: eval {ev:e} flat {fl:e}; flat nodes {nodes:?}"
+            );
+        }
+    }
+}
