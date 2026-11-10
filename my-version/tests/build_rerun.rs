@@ -27,6 +27,7 @@ struct Build {
     fresh: bool,
     compiled: bool,
     commit: String,
+    log: String,
 }
 
 struct Fixture {
@@ -62,6 +63,7 @@ impl Fixture {
         }
         git(&main, &["add", "."]);
         git(&main, &["commit", "-q", "-m", "first"]);
+        git(&main, &["pack-refs", "--all"]);
         let wt = tmp.join("wt");
         git(&main, &["worktree", "add", "-q", "-b", "w", wt.to_str().unwrap()]);
         let target = tmp.join("target");
@@ -89,6 +91,7 @@ impl Fixture {
             fresh: log.contains("Fresh probe"),
             compiled: log.contains("Compiling probe"),
             commit: String::from_utf8_lossy(&ran.stdout).trim().to_string(),
+            log,
         }
     }
 
@@ -98,12 +101,12 @@ impl Fixture {
 
     fn assert_fresh(&self, what: &str) {
         let b = self.build();
-        assert!(b.fresh && !b.compiled, "{what}: the probe was rebuilt");
+        assert!(b.fresh && !b.compiled, "{what}: the probe was rebuilt\n{}", b.log);
     }
 
     fn assert_rebuilt_at_head(&self, what: &str) {
         let b = self.build();
-        assert!(b.compiled, "{what}: the probe was not rebuilt");
+        assert!(b.compiled, "{what}: the probe was not rebuilt\n{}", b.log);
         assert_eq!(b.commit, git(&self.wt, &["rev-parse", "HEAD"]), "{what}: stale commit");
     }
 
