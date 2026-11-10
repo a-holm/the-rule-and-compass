@@ -948,6 +948,11 @@ impl LabelAccumulator {
         move |t: i64| ranges.iter().flatten().all(|r| !r.reaches(t, purge, embargo))
     }
 
+    /// Whether the label report keeps the row stamped `t`.
+    pub fn keeps(&self, t: i64) -> bool {
+        self.keep_fn()(t)
+    }
+
     /// Builds the labels of one series with the weights normalised over the
     /// development rows of the declared ranges.
     pub fn build(&self, bars: &[Bar], funding: Option<&[f64]>) -> Result<LongLabels, String> {
