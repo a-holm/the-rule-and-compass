@@ -3972,15 +3972,100 @@ mod locked_reach_tests {
         }
     }
 
+
+    fn protocol(entry_offset: f64, embargo: i64, ranges: &[(i64, i64)]) -> ProtocolOptions {
+        ProtocolOptions { entry_offset, locked_ranges: ranges.to_vec(), locked_embargo: embargo, ..ProtocolOptions::default() }
+    }
+
+    fn wide(mut spec: EvalSpec) -> EvalSpec {
+        spec.windows[0] = Window { label: "w".to_string(), train_start: 0.0, train_end: 4e9, test_start: 4e9, test_end: 5e9 };
+        spec
+    }
+
     #[test]
     fn the_read_time_drop_spans_the_purge_before_and_the_embargo_after_a_sealed_range() {
         let mut spec = spec(3.0);
         spec.windows[0].test_end = 60.0;
         let opts = ProtocolOptions { locked_ranges: vec![(30, 36)], locked_embargo: 5, ..ProtocolOptions::default() };
         let acc = Accum::new(&spec, &opts, 1).unwrap();
-        assert_eq!(opts.locked_reach(&spec), vec![(30.0, 36.0, 27.0, 41.0)]);
+        assert_eq!(opts.locked_reach(&spec), vec![(30.0, 36.0, 28.0, 41.0)]);
         for t in 0..60 {
-            assert_eq!(acc.wants(t as f64), t < 27 || t >= 41, "row {t}");
+            assert_eq!(acc.wants(t as f64), t < 28 || t >= 41, "row {t}");
         }
+    }
+
+    #[test]
+    fn fold_reach_agrees_with_label_report_and_lockbox_check() {
+        use crate::labels::{LabelAccumulator, LongLabelSpec};
+        use crate::lockbox::{Declared, Embargo, EmbargoSource, Lockbox};
+        const HOUR: i64 = 3600;
+        let (start, end) = (1_600_200_000, 1_600_900_000);
+        let range = Lockbox { start, end };
+        for h in [1usize, 4, 24, 72, 168, 336] {
+            let mut labels = LongLabelSpec::new("a", HOUR, h);
+            labels.sigma_window = 5;
+            let purge = labels.purge_seconds();
+            let mut spec = wide(spec(0.0));
+            spec.horizon = (h as i64 * HOUR) as f64;
+            let opts = protocol(HOUR as f64, 0, &[(start, end)]);
+            let acc = Accum::new(&spec, &opts, 1).unwrap();
+            let report = LabelAccumulator::with_range(&labels, Some(range)).with_embargo(purge);
+            let declared = Declared {
+                lockbox: range,
+                source: "flag",
+                also: None,
+                embargo: Embargo { seconds: purge, source: EmbargoSource::LabelPurge },
+            };
+            let edges = (start - purge - 2..=start + 2).chain(end + purge - 2..=end + purge + 2);
+            for t in edges {
+                let fold = acc.wants(t as f64);
+                let kept = report.keeps(t);
+                let accepted = declared.check_times("training split", "ts", &[t], purge).is_ok();
+                assert_eq!((fold, kept), (accepted, accepted), "h{h} t {t} (S {start}, E {end}, purge {purge})");
+                let one_row = |a: i64| Window { label: "w".to_string(), train_start: a as f64, train_end: (a + 1) as f64, test_start: 4e9, test_end: 5e9 };
+                let mut one = spec.clone();
+                one.windows[0] = one_row(t);
+                assert_eq!(validate_windows(&one, &opts).is_ok(), accepted, "h{h} guard t {t}");
+            }
+        }
+    }
+
+    #[test]
+    fn locked_reach_edges_follow_the_shared_predicate() {
+        // purge 0: the row at S is the first one read.
+        let mut zero = wide(spec(0.0));
+        zero.horizon = 0.0;
+        let opts = protocol(0.0, 0, &[(30, 36)]);
+        let acc = Accum::new(&zero, &opts, 1).unwrap();
+        assert_eq!(opts.locked_reach(&zero), vec![(30.0, 36.0, 30.0, 36.0)]);
+        assert!([29.0, 36.0].iter().all(|&t| acc.wants(t)) && [30.0, 35.0].iter().all(|&t| !acc.wants(t)));
+
+        // embargo above the purge extends the upper side only.
+        let long = wide(spec(3.0));
+        let opts = protocol(0.0, 10, &[(30, 36)]);
+        let acc = Accum::new(&long, &opts, 1).unwrap();
+        assert_eq!(opts.locked_reach(&long), vec![(30.0, 36.0, 28.0, 46.0)]);
+        assert!(acc.wants(27.0) && !acc.wants(28.0) && !acc.wants(45.0) && acc.wants(46.0));
+
+        // embargo below the purge: the purge sets the upper side.
+        let opts = protocol(0.0, 1, &[(30, 36)]);
+        assert_eq!(opts.locked_reach(&long), vec![(30.0, 36.0, 28.0, 39.0)]);
+
+        // two ranges, a purge that is not a multiple of a bar.
+        let odd = wide(spec(7.0));
+        let opts = protocol(0.0, 0, &[(100, 110), (200, 210)]);
+        let acc = Accum::new(&odd, &opts, 1).unwrap();
+        let drop = |t: i64| (94..117).contains(&t) || (194..217).contains(&t);
+        for t in 80..230 {
+            assert_eq!(acc.wants(t as f64), !drop(t), "row {t}");
+        }
+
+        // a window that starts at the first reaching row is refused, one second later is not.
+        let mut guard = wide(spec(3.0));
+        let opts = protocol(0.0, 0, &[(30, 36)]);
+        guard.windows[0] = Window { label: "w".to_string(), train_start: 0.0, train_end: 28.0, test_start: 40.0, test_end: 50.0 };
+        assert!(validate_windows(&guard, &opts).is_ok());
+        guard.windows[0].train_end = 29.0;
+        assert!(validate_windows(&guard, &opts).unwrap_err().contains("reaches the declared locked test"));
     }
 }
