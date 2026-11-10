@@ -1050,6 +1050,29 @@ fn cmp(a: f64, b: f64, f: impl Fn(f64, f64) -> bool) -> f64 {
     }
 }
 
+/// `ln` as both f64 evaluators define it (docs/operator-semantics.md): NaN for
+/// every argument that is not strictly positive, `-0.0` and `0.0` included.
+#[inline(always)]
+pub(crate) fn ln(a: f64) -> f64 {
+    if a > 0.0 {
+        a.ln()
+    } else {
+        f64::NAN
+    }
+}
+
+/// `pow` as both f64 evaluators define it (docs/operator-semantics.md): NaN for a
+/// negative base with an exponent further than `1e-9` from an integer,
+/// otherwise `powf` (so `pow(x, 0)` and `pow(1, y)` are 1 even for NaN).
+#[inline(always)]
+pub(crate) fn pow(a: f64, b: f64) -> f64 {
+    if a < 0.0 && (b - b.round()).abs() > 1e-9 {
+        f64::NAN
+    } else {
+        a.powf(b)
+    }
+}
+
 /// Evaluate a tree against one input row.
 pub fn eval(n: &Node, x: &[f64]) -> f64 {
     use Op::*;
@@ -1099,14 +1122,7 @@ pub fn eval(n: &Node, x: &[f64]) -> f64 {
                 a.exp()
             }
         }
-        Ln => {
-            let a = eval(&n.kids[0], x);
-            if a > 0.0 {
-                a.ln()
-            } else {
-                f64::NAN
-            }
-        }
+        Ln => ln(eval(&n.kids[0], x)),
         Abs => eval(&n.kids[0], x).abs(),
         Sqrt => {
             let a = eval(&n.kids[0], x);
@@ -1200,12 +1216,7 @@ pub fn eval(n: &Node, x: &[f64]) -> f64 {
         }
         Pow => {
             let a = eval(&n.kids[0], x);
-            let b = eval(&n.kids[1], x);
-            if a < 0.0 && (b - b.round()).abs() > 1e-9 {
-                f64::NAN
-            } else {
-                a.powf(b)
-            }
+            pow(a, eval(&n.kids[1], x))
         }
         Mod => {
             let a = eval(&n.kids[0], x);
