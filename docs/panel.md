@@ -384,6 +384,8 @@ declared lock and where it came from (`declared lock 2026-07-01..2027-07-01 from
 lock of the store (`locked_test`), else inside the legacy box; its detail names
 the source.
 
+`rcsr enrich --label` applies the 2026H2 check to undeclared data only. A declared locked test replaces it: enrich keeps the rows of the declared range out of the label statistics and the runners refuse to read them.
+
 `--allow-lockbox` is the only override; it is for one declared final test, not
 routine runs. `rcsr walkforward` echoes it in its JSON as
 `"lockbox": {"permitted": true, "evaluated": true, ...}`. The check is skipped

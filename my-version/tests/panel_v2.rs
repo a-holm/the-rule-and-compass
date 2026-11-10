@@ -976,6 +976,7 @@ fn locked_test_declaration_travels_with_the_store() {
     let panel = dir.join("panel.rcsb");
     let mut p = panel_opts(&base, &m, &panel);
     p.locked_test = rcsr::lockbox::Keep::Range(lb);
+    p.allow_lockbox = true;
     panel_v2::build_panel(&p).unwrap();
     let (panel_s, base_s) = (panel.to_str().unwrap(), base.to_str().unwrap());
     let manifest_text = std::fs::read_to_string(format!("{panel_s}.manifest.json")).unwrap();
@@ -1057,6 +1058,7 @@ fn locked_test_starts_at_the_base() {
     let base = dir.join("base.rcsb");
     let mut o = base_opts(&raw, &base);
     o.locked_test = Keep::Range(lb);
+    o.allow_lockbox = true;
     panel_v2::build_base(&o).unwrap();
     let (base_s, m_s) = (base.to_str().unwrap(), m.to_str().unwrap());
     let manifest_text = std::fs::read_to_string(format!("{base_s}.manifest.json")).unwrap();
@@ -1071,7 +1073,9 @@ fn locked_test_starts_at_the_base() {
 
     // build inherits the declaration of its base
     let panel = dir.join("panel.rcsb");
-    panel_v2::build_panel(&panel_opts(&base, &m, &panel)).unwrap();
+    let mut inherit = panel_opts(&base, &m, &panel);
+    inherit.allow_lockbox = true;
+    panel_v2::build_panel(&inherit).unwrap();
     let panel_s = panel.to_str().unwrap();
     assert_eq!(lockbox::stored(panel_s).unwrap().map(|(_, l)| l), Some(lb));
     assert_eq!(Lockbox::from_declaration(&std::fs::read_to_string(format!("{panel_s}.schema.json")).unwrap()), Some(lb));
@@ -1089,7 +1093,7 @@ fn locked_test_starts_at_the_base() {
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("pass --locked-test"), "{err}");
     let range = format!("{},{}", lb.start, lb.end);
-    let (code, err) = rcsr(&["panel", "base", "--input", raw.to_str().unwrap(), "--out", base_s, "--locked-test", &range]);
+    let (code, err) = rcsr(&["panel", "base", "--input", raw.to_str().unwrap(), "--out", base_s, "--locked-test", &range, "--allow-lockbox"]);
     assert_eq!(code, 0, "{err}");
     assert_eq!(lockbox::stored(base_s).unwrap().map(|(_, l)| l), Some(lb));
 }
@@ -1106,6 +1110,7 @@ fn rebuild_without_locked_test_is_refused() {
     let panel = dir.join("panel.rcsb");
     let mut p = panel_opts(&base, &m, &panel);
     p.locked_test = Keep::Range(lb);
+    p.allow_lockbox = true;
     panel_v2::build_panel(&p).unwrap();
     let (base_s, m_s, panel_s) = (base.to_str().unwrap(), m.to_str().unwrap(), panel.to_str().unwrap());
 
@@ -1121,7 +1126,7 @@ fn rebuild_without_locked_test_is_refused() {
     assert_eq!(code, 2);
 
     let same = format!("{},{}", lb.start, lb.end);
-    let (code, err) = rcsr(&["panel", "build", "--data", base_s, "--membership", m_s, "--out", panel_s, "--locked-test", &same]);
+    let (code, err) = rcsr(&["panel", "build", "--data", base_s, "--membership", m_s, "--out", panel_s, "--locked-test", &same, "--allow-lockbox"]);
     assert_eq!(code, 0, "{err}");
     let manifest_text = std::fs::read_to_string(format!("{panel_s}.manifest.json")).unwrap();
     let schema_text = std::fs::read_to_string(format!("{panel_s}.schema.json")).unwrap();
@@ -1240,6 +1245,7 @@ fn append_keeps_the_target_declaration_when_the_family_store_declares_none() {
     let panel = dir.join("panel.rcsb");
     let mut p = panel_opts(&base, &m, &panel);
     p.locked_test = Keep::Range(lb);
+    p.allow_lockbox = true;
     panel_v2::build_panel(&p).unwrap();
     let fam = dir.join("fam.rcsb");
     let (code, err) = rcsr(&["enrich", "--data", base.to_str().unwrap(), "--out", fam.to_str().unwrap(), "--features", "r1", "--locked-test", "none"]);

@@ -7686,21 +7686,19 @@ fn enrich_inner(
         .or_else(|_| manifest::sha256_file(&input_path))
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let (label_range, label_also, label_origin) = match opts.locked_test {
-        Some(l) => (Some(l), opts.locked_also, match opts.locked_source {
-            Some(crate::lockbox::Source::Store) => "store sidecar",
-            _ => "--locked-test",
-        }),
+    let (label_range, label_also) = match opts.locked_test {
+        Some(l) => (Some(l), opts.locked_also),
         None => match crate::lockbox::stored_all(&opts.data).map_err(|e| e.message)? {
-            Some(s) => (Some(s.range), s.also, "store sidecar"),
-            None => (None, None, ""),
+            Some(s) => (Some(s.range), s.also),
+            None => (None, None),
         },
     };
-    // Lockbox guard for labelled builds: a label is an evaluation target. The
-    // protocol default is not a declaration, so it leaves the legacy box in place.
-    if !labels.is_empty() || !long_specs.is_empty() {
-        let declared = label_range.filter(|_| opts.locked_source != Some(crate::lockbox::Source::ProtocolDefault));
-        let guard = crate::lockbox::Guard::for_writer(declared.as_ref(), label_also.as_ref().filter(|_| declared.is_some()), label_origin, opts.allow_lockbox);
+    // Lockbox guard for labelled builds on undeclared data: a label is an evaluation
+    // target. A declared locked test replaces the legacy box and is kept out of the
+    // label statistics below, so a store may hold its rows.
+    let declared_lock = label_range.is_some() && opts.locked_source != Some(crate::lockbox::Source::ProtocolDefault);
+    if (!labels.is_empty() || !long_specs.is_empty()) && !declared_lock {
+        let guard = crate::lockbox::Guard::new(opts.allow_lockbox, None);
         for seg in &segs {
             let times = segment_i64(&store, seg, time_col, cols.time_dtype)?;
             crate::prep::check_labelled_rows_with(&times, &guard)?;
@@ -9279,7 +9277,7 @@ INPUT / OUTPUT:
   --allow-overlap         permit a label stride below the horizon for horizons of
                           4h and longer (labels overlap; use uniqueness weights)
   --side long             the only side; --side short and --allow-short are refused
-  --allow-lockbox         permit labelled rows in the guarded box: the declared locked test, else 2026H2 for undeclared data (final test only)
+  --allow-lockbox         permit labelled rows in 2026H2 of undeclared data (final test only); a declared locked test is left out of label statistics
   --locked-test <START,END|none>
                           declare the locked test (UTC, half-open) in <out>.enrich.json.
                           Without the flag: the range --data declares, else the protocol

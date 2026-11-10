@@ -148,12 +148,11 @@ fn lockbox_declared_overlap_refused() {
     let (code, _, err) = rcsr(&allowed);
     assert_eq!(code, 0, "{err}");
 
-    // enrich refuses labelled rows inside the declared lock
+    // enrich keeps the declared lock out of its label statistics instead of refusing the rows
     let fam = s(&dir.join("fam.rcsb"));
     let enrich = ["enrich", "--data", &out, "--out", &fam, "--cpu", "--features", "r1", "--label", "long:1h,name=h1,fee=10,vol=20"];
     let (code, _, err) = rcsr(&enrich);
-    assert_eq!(code, 3, "{err}");
-    assert!(err.contains("declared lock"), "{err}");
+    assert_eq!(code, 0, "{err}");
 }
 
 #[test]
