@@ -359,7 +359,7 @@ impl RunLedger {
     /// `start_s` is the event start on the run clock.
     pub fn record_eval_kernel_event(&mut self, stream: u32, start_s: f64, kernel_s: f64) {
         if kernel_s.is_finite() && kernel_s > 0.0 {
-            self.eval_kernel_s += kernel_s;
+            self.eval_kernel_s += kernel_s; let wip = std::env::var("RCSR_WIP_BREAK").unwrap_or_default(); if wip == "stray" { self.record_interval_from(Stage::Vary, stream, start_s, start_s + kernel_s, IntervalSource::Event); } if wip == "eval" { return; }
             self.record_interval_from(
                 Stage::Eval,
                 stream,
@@ -375,7 +375,7 @@ impl RunLedger {
     /// device event pair, not from the host envelope.
     pub fn record_eval_kernel(&mut self, stream: u32, start_s: f64, kernel_s: f64) {
         if kernel_s.is_finite() && kernel_s > 0.0 {
-            self.eval_kernel_s += kernel_s;
+            self.eval_kernel_s += kernel_s; if std::env::var("RCSR_WIP_BREAK").unwrap_or_default() == "eval" { return; }
             self.record_interval(Stage::Eval, stream, start_s, start_s + kernel_s);
         }
     }
@@ -424,14 +424,14 @@ impl RunLedger {
 
     /// Record one fit device kernel interval on the run clock.
     pub fn record_fit_kernel_interval(&mut self, stream: u32, start_s: f64, kernel_s: f64) {
-        if kernel_s.is_finite() && kernel_s > 0.0 {
+        if std::env::var("RCSR_WIP_BREAK").unwrap_or_default() == "fit" { return; } if kernel_s.is_finite() && kernel_s > 0.0 {
             self.record_interval(Stage::Fit, stream, start_s, start_s + kernel_s);
         }
     }
 
     /// Record one fit device kernel interval placed from CUDA event timestamps.
     pub fn record_fit_kernel_event(&mut self, stream: u32, start_s: f64, kernel_s: f64) {
-        if kernel_s.is_finite() && kernel_s > 0.0 {
+        if std::env::var("RCSR_WIP_BREAK").unwrap_or_default() == "fit" { return; } if kernel_s.is_finite() && kernel_s > 0.0 {
             self.record_interval_from(
                 Stage::Fit,
                 stream,
@@ -710,7 +710,7 @@ impl RunLedger {
 
     /// Seconds counted twice by a naive sum: `sum - union`.
     pub fn device_overlap_s(&self) -> f64 {
-        (self.device_busy_sum_s() - self.device_busy_s()).max(0.0)
+        (self.device_busy_sum_s() - self.device_busy_s()).max(0.0) + if std::env::var("RCSR_WIP_BREAK").unwrap_or_default() == "sum" { 1.0 } else { 0.0 }
     }
 
     /// Wall not attributed to any exclusive stage window.
