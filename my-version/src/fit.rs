@@ -2046,20 +2046,25 @@ fn ind(x: f64) -> f64 {
     }
 }
 
-/// Solve `(A + λ·diag(A)) δ = b` for small symmetric `A` (Cholesky).
-///
-/// #990: the diagonal floor `1e-12·s` and the pivot limit `1e-18·s` use
-/// `s = min(Aᵢᵢ, 1)` (`s = 1` for a zero or non-finite `Aᵢᵢ`). An absolute
-/// floor swamps a tiny Jacobian column (a divisor near `1e6`) and freezes its
-/// constant; a column with `Aᵢᵢ >= 1` keeps the absolute values, so its step is
-/// bit-identical. A zero column still gets a zero step.
+/// The absolute diagonal floor of [`solve`]. A Jacobian column whose `JᵀJ`
+/// diagonal is below it barely moves its constant.
+const DIAG_FLOOR: f64 = 1e-12;
+
+/// Solve `(A + λ·diag(A) + 1e-12·I) δ = b` for small symmetric `A` (Cholesky).
 fn solve(a: &[Vec<f64>], b: &mut [f64], lambda: f64, k: usize) -> Option<Vec<f64>> {
+    solve_floor(a, b, lambda, k, false)
+}
+
+/// [`solve`], with the floor and the pivot limit relative to a diagonal below
+/// 1 when `relative` (#990): they are scaled by `min(Aᵢᵢ, 1)`, and by 1 for a
+/// zero or non-finite `Aᵢᵢ`, so a zero column still gets a zero step.
+fn solve_floor(a: &[Vec<f64>], b: &mut [f64], lambda: f64, k: usize, relative: bool) -> Option<Vec<f64>> {
     let mut m = a.to_vec();
     let scale: Vec<f64> = (0..k)
-        .map(|i| if a[i][i] > 0.0 && a[i][i] < 1.0 { a[i][i] } else { 1.0 })
+        .map(|i| if relative && a[i][i] > 0.0 && a[i][i] < 1.0 { a[i][i] } else { 1.0 })
         .collect();
     for i in 0..k {
-        m[i][i] = m[i][i] * (1.0 + lambda) + 1e-12 * scale[i];
+        m[i][i] = m[i][i] * (1.0 + lambda) + DIAG_FLOOR * scale[i];
     }
     // Cholesky
     let mut l = vec![vec![0.0; k]; k];
@@ -2711,11 +2716,12 @@ fn gn_trial(
     lambda: f64,
     k: usize,
     n: &NormalEquations,
+    relative: bool,
 ) -> Option<(Vec<f64>, f64)> {
     #[cfg(test)]
     FIT_STEPS.with(|n| n.set(n.get() + 1));
     let mut rhs: Vec<f64> = n.jtr.iter().map(|v| -v).collect();
-    let step = solve(&n.jtj, &mut rhs, lambda, k)?;
+    let step = solve_floor(&n.jtj, &mut rhs, lambda, k, relative)?;
     let trial: Vec<f64> = (0..k)
         .map(|i| (c[i] + step[i]).clamp(-1e6, 1e6))
         .collect();
@@ -2730,9 +2736,10 @@ fn gn_step(
     c: &[f64],
     lambda: f64,
     k: usize,
+    relative: bool,
 ) -> Option<(Vec<f64>, f64)> {
     let n = pass.normal(c)?;
-    gn_trial(pass, c, lambda, k, &n)
+    gn_trial(pass, c, lambda, k, &n, relative)
 }
 
 /// Fit all constants of `tree` to minimise squared error on `x`/`y`.
@@ -2944,10 +2951,29 @@ fn fit_lm_with(tree: &mut Node, f: &Flat, iters: usize, pass: &mut impl LmPass) 
 }
 
 /// The LM loop from the constants `c`: the fitted constants and their SSE.
+///
+/// #990: the historical run's absolute diagonal floor freezes a constant whose
+/// Jacobian column is below it (a large divisor), so the fit depended on how
+/// the constants were written. When a damped-phase system has such a column, a
+/// second run with the relative floor continues from the first run's result.
+/// It accepts only steps that lower the SSE, so the fit is never worse than the
+/// historical one, and a fit without such a column keeps its bits.
 fn lm_core(pass: &mut impl LmPass, c: &[f64], k: usize, iters: usize) -> (Vec<f64>, f64) {
+    let (c, sse, tiny) = lm_run(pass, c, k, iters, false);
+    if !tiny {
+        return (c, sse);
+    }
+    let (c, sse, _) = lm_run(pass, &c, k, iters, true);
+    (c, sse)
+}
+
+/// One LM run with the floor of [`solve_floor`]. The flag is true when a
+/// damped-phase system has a nonzero diagonal below [`DIAG_FLOOR`].
+fn lm_run(pass: &mut impl LmPass, c: &[f64], k: usize, iters: usize, relative: bool) -> (Vec<f64>, f64, bool) {
     let mut c = c.to_vec();
+    let mut tiny = false;
     if k == 0 {
-        return (c, pass.sse(&[]));
+        return (c, pass.sse(&[]), tiny);
     }
     let mut best_c = c.clone();
     // #135: `--no-fit` / `--fit-iters 0` must not fit at all. The LM loop
@@ -2955,7 +2981,7 @@ fn lm_core(pass: &mut impl LmPass, c: &[f64], k: usize, iters: usize) -> (Vec<f6
     // return a "no fit" search still performs five LM iterations per candidate.
     if iters == 0 {
         let s = pass.sse(&c);
-        return (c, s);
+        return (c, s, tiny);
     }
     // #87: this standalone SSE is intentionally kept. The first `gn_step`
     // forms the same residuals, but using them as the acceptance baseline
@@ -2971,9 +2997,12 @@ fn lm_core(pass: &mut impl LmPass, c: &[f64], k: usize, iters: usize) -> (Vec<f6
     for _ in 0..iters.max(1) {
         if normal.is_none() {
             normal = pass.normal(&c);
+            if let Some(n) = normal.as_ref() {
+                tiny |= (0..k).any(|i| n.jtj[i][i] > 0.0 && n.jtj[i][i] < DIAG_FLOOR);
+            }
         }
         let Some(n) = normal.as_ref() else { break };
-        match gn_trial(pass, &c, lambda, k, n) {
+        match gn_trial(pass, &c, lambda, k, n, relative) {
             Some((trial, tsse)) => {
                 if tsse < best_sse {
                     c = trial;
@@ -3004,8 +3033,8 @@ fn lm_core(pass: &mut impl LmPass, c: &[f64], k: usize, iters: usize) -> (Vec<f6
             break;
         }
         let step = match held.take() {
-            Some(n) => gn_trial(pass, &best_c, 0.0, k, &n),
-            None => gn_step(pass, &best_c, 0.0, k),
+            Some(n) => gn_trial(pass, &best_c, 0.0, k, &n, relative),
+            None => gn_step(pass, &best_c, 0.0, k, relative),
         };
         match step {
             Some((trial, tsse)) if tsse < best_sse => {
@@ -3016,7 +3045,7 @@ fn lm_core(pass: &mut impl LmPass, c: &[f64], k: usize, iters: usize) -> (Vec<f6
         }
     }
 
-    (best_c, best_sse)
+    (best_c, best_sse, tiny)
 }
 
 /// Write fitted constant values back into the tree, including constants shared
@@ -7063,7 +7092,7 @@ mod tests {
                 normal = pass.normal(&c);
             }
             let Some(n) = normal.as_ref() else { break };
-            match gn_trial(pass, &c, lambda, k, n) {
+            match gn_trial(pass, &c, lambda, k, n, false) {
                 Some((trial, tsse)) => {
                     if tsse < best_sse {
                         c = trial;
@@ -7088,7 +7117,7 @@ mod tests {
             if best_sse == 0.0 {
                 break;
             }
-            match gn_step(pass, &best_c, 0.0, k) {
+            match gn_step(pass, &best_c, 0.0, k, false) {
                 Some((trial, tsse)) if tsse < best_sse => {
                     best_c = trial;
                     best_sse = tsse;
@@ -7113,7 +7142,7 @@ mod tests {
             let c0 = fitted_constants(&tree);
             let mut held = CountingPass { inner: row_pass(&f, &x, &y, &[]), normals: 0 };
             let mut rebuilt = CountingPass { inner: row_pass(&f, &x, &y, &[]), normals: 0 };
-            let (hc, hs) = lm_core(&mut held, &c0, f.nconst, 8);
+            let (hc, hs, _) = lm_run(&mut held, &c0, f.nconst, 8, false);
             let (rc, rs) = lm_core_rebuilding_the_polish(&mut rebuilt, &c0, f.nconst, 8);
             assert!(same_bits(&hc, &rc), "constants of tree {t}");
             assert_eq!(hs.to_bits(), rs.to_bits(), "sse of tree {t}");
@@ -7471,24 +7500,33 @@ mod tests {
         assert!(rel(divisor, 1.0 / inv) <= 1e-6, "{ctx}");
     }
 
-    /// #990: a constant whose Jacobian column is exactly zero (`c1·z` on rows
-    /// where `z = 0`) keeps its value and the other constant is still fitted.
+    /// #990: `square(x)/c0 + c1·z` on rows where `z = 0`: the column of `c1` is
+    /// exactly zero and the divisor's column is tiny, so the relative-floor run
+    /// solves a system with a zero diagonal. `c1` keeps its value and the
+    /// divisor reaches the optimum.
     #[test]
     fn a_zero_jacobian_column_stays_frozen() {
-        let x: Vec<Vec<f64>> = (0..20).map(|i| vec![0.1 * i as f64, 0.0]).collect();
-        let y: Vec<f64> = x.iter().map(|r| (0.7 * r[0]).exp()).collect();
+        let x: Vec<Vec<f64>> = (0..40).map(|i| vec![1.5 * (0.6 * i as f64 + 0.2).cos(), 0.0]).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, r)| r[0] * r[0] / 7e5 * (1.0 + 0.05 * (2.3 * i as f64).sin()))
+            .collect();
+        let z2: Vec<f64> = x.iter().map(|r| r[0] * r[0]).collect();
+        let inv = dot(&z2, &y) / dot(&z2, &z2);
         let mut tree = node(
             Op::Add,
             vec![
-                node(Op::Exp, vec![node(Op::Mul, vec![constant(0.2), input(0)])]),
+                node(Op::Div, vec![node(Op::Square, vec![input(0)]), constant(9e5)]),
                 node(Op::Mul, vec![constant(3.0), input(1)]),
             ],
         );
         let s = fit(&mut tree, &x, &y, 50);
         let c = constants_slots(&tree);
-        assert!(s.is_finite() && s < 1e-20, "sse {s:e}, constants {c:?}");
-        assert_eq!(c.iter().filter(|v| v.to_bits() == 3.0f64.to_bits()).count(), 1, "{c:?}");
-        assert_eq!(c.iter().filter(|v| (**v - 0.7).abs() < 1e-9).count(), 1, "{c:?}");
+        let ctx = format!("sse {s:e}, constants {c:?}, optimum divisor {}", 1.0 / inv);
+        assert!(s.is_finite(), "{ctx}");
+        assert_eq!(c.iter().filter(|v| v.to_bits() == 3.0f64.to_bits()).count(), 1, "{ctx}");
+        assert_eq!(c.iter().filter(|v| rel(**v, 1.0 / inv) <= 1e-6).count(), 1, "{ctx}");
     }
 
     /// #990: `t·exp(c0 + c1·x)` with `t = 1e-9` scales every Jacobian column and
