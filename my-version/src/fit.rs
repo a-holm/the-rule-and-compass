@@ -2390,6 +2390,10 @@ const SIGNED_RANK_TOL: f64 = 1e-12;
 /// is still fitted (the step is exact in exact arithmetic), but the arm does not
 /// pretend that a bias of `1e-6` is "exact zero": the outcome is then
 /// `not_converged`.
+/// Every fitted constant is clamped to `[-FIT_CONSTANT_BOUND, FIT_CONSTANT_BOUND]`;
+/// the device kernel clamps to the same box.
+pub const FIT_CONSTANT_BOUND: f64 = 1e6;
+
 const SIGNED_NOISE_COND_CAP: f64 = 1e6;
 
 /// #228: why a signed-bias projection did or did not move the constants.
@@ -2649,7 +2653,7 @@ fn signed_projection_inner(
             return SignedProjection::NonFinite;
         }
         let trial: Vec<f64> = (0..k)
-            .map(|i| (c[i] + step[i] - mu * dir[i]).clamp(-1e6, 1e6))
+            .map(|i| (c[i] + step[i] - mu * dir[i]).clamp(-FIT_CONSTANT_BOUND, FIT_CONSTANT_BOUND))
             .collect();
         let Some(trial_system) =
             signed_system(&f, x, y, w, &trial, k, &mut v, &mut adj, &mut grad)
@@ -2723,7 +2727,7 @@ fn gn_trial(
     let mut rhs: Vec<f64> = n.jtr.iter().map(|v| -v).collect();
     let step = solve_floor(&n.jtj, &mut rhs, lambda, k, relative)?;
     let trial: Vec<f64> = (0..k)
-        .map(|i| (c[i] + step[i]).clamp(-1e6, 1e6))
+        .map(|i| (c[i] + step[i]).clamp(-FIT_CONSTANT_BOUND, FIT_CONSTANT_BOUND))
         .collect();
     let s = pass.sse(&trial);
     Some((trial, s))
@@ -3652,7 +3656,7 @@ pub(crate) fn slope_irls(
     // without the undamped polish, as on the device.
     let mut stop = false;
     let step = |c: &[f64], delta: &[f64]| -> Vec<f64> {
-        (0..k).map(|i| (c[i] + delta[i]).clamp(-1e6, 1e6)).collect()
+        (0..k).map(|i| (c[i] + delta[i]).clamp(-FIT_CONSTANT_BOUND, FIT_CONSTANT_BOUND)).collect()
     };
     'rounds: for round in 0..rounds {
         if best == 0.0 {

@@ -50,7 +50,7 @@
 
 use crate::data::Sample;
 use crate::expr::{self, Node};
-use crate::fit;
+use crate::fit::{self, FIT_CONSTANT_BOUND};
 use crate::metrics::Metric;
 
 /// A level-set distance is rejected when this many evaluations/derivatives are
@@ -493,7 +493,7 @@ fn fit_with(
         let trial: Vec<f64> = c
             .iter()
             .zip(&step)
-            .map(|(v, d)| (v + d).clamp(-1e6, 1e6))
+            .map(|(v, d)| (v + d).clamp(-FIT_CONSTANT_BOUND, FIT_CONSTANT_BOUND))
             .collect();
         match level.residuals(&trial, x, w) {
             Some(rt) => {

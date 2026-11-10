@@ -16,8 +16,13 @@
 //! condition. Every other operator is a boundary: its arguments are folded on
 //! their own, and nothing moves across it. Aggregates, meta operators and user
 //! blocks are never entered.
+//!
+//! A fold that adds a constant outside the fit box `[-FIT_CONSTANT_BOUND,
+//! FIT_CONSTANT_BOUND]` is refused and the subtree stays unfolded: the fit
+//! clamps every trial to the box, so it can never move such a constant.
 
 use crate::expr::{constant, node, Node, Op};
+use crate::fit::FIT_CONSTANT_BOUND;
 
 /// A constant factor moved into a subtree: the subtree's value is multiplied
 /// (`Mul`) or divided (`Div`) by `k`.
@@ -304,6 +309,12 @@ fn opaque(n: &Node) -> bool {
     n.kids.is_empty() || n.op.is_meta() || n.op.is_agg() || n.op.is_custom()
 }
 
+/// Constants of `n` outside the fit box (non-finite counts as outside).
+fn outside_box(n: &Node) -> usize {
+    let own = n.op == Op::Const && !(n.val.abs() <= FIT_CONSTANT_BOUND);
+    own as usize + n.kids.iter().map(outside_box).sum::<usize>()
+}
+
 fn fold_pass(n: &Node, removed: &mut usize) -> Node {
     if opaque(n) {
         return n.clone();
@@ -314,7 +325,7 @@ fn fold_pass(n: &Node, removed: &mut usize) -> Node {
         kids: n.kids.iter().map(|k| fold_pass(k, removed)).collect(),
         block: n.block.clone(),
     };
-    match fold_root(&m) {
+    match fold_root(&m).filter(|f| outside_box(f) <= outside_box(&m)) {
         Some(folded) => {
             *removed += 1;
             folded
@@ -630,5 +641,69 @@ mod tests {
         }
         assert!(folded > 300, "only {folded} of 3000 random trees folded");
         assert!(worst < 1e-12, "max difference over the magnitude {worst:e}");
+    }
+
+    fn square(a: Node) -> Node {
+        node(Op::Square, vec![a])
+    }
+
+    fn assert_unfolded(t: Node) {
+        let (f, n) = fold_constants(&t);
+        assert_eq!(n, 0, "{t:?} -> {f:?}");
+        assert!(same(&f, &t), "{f:?}");
+    }
+
+    #[test]
+    fn fold_refuses_a_constant_outside_the_fit_box() {
+        let t = div(div(square(x(2)), c(530.8156455944121)), c(9927.813354));
+        assert_unfolded(t);
+    }
+
+    #[test]
+    fn fold_refuses_each_rule_that_leaves_the_box() {
+        assert_unfolded(mul(c(1e3), mul(c(1e4), x(0))));
+        assert_unfolded(div(div(x(0), c(1e3)), c(1e4)));
+        assert_unfolded(add(c(6e5), add(c(6e5), x(0))));
+        assert_unfolded(sub(c(-6e5), sub(c(6e5), x(0))));
+        assert_unfolded(mul(c(1e4), add(mul(c(1e3), x(0)), c(1.0))));
+        assert_unfolded(div(c(1e4), div(c(1e-3), x(0))));
+        assert_unfolded(mul(c(1e-3), div(x(0), c(1e-5))));
+    }
+
+    #[test]
+    fn fold_applies_on_the_box_edge_and_refuses_just_outside() {
+        let (f, n) = fold_constants(&mul(c(1e3), mul(c(1e3), x(0))));
+        assert_eq!(n, 1);
+        assert!(same(&f, &mul(c(FIT_CONSTANT_BOUND), x(0))), "{f:?}");
+        let (f, n) = fold_constants(&mul(c(-1e3), mul(c(1e3), x(0))));
+        assert_eq!(n, 1);
+        assert!(same(&f, &mul(c(-FIT_CONSTANT_BOUND), x(0))), "{f:?}");
+        assert_unfolded(mul(c(1e6), mul(c(1.0 + 1e-9), x(0))));
+    }
+
+    #[test]
+    fn fold_leaves_an_infinite_product_unfolded() {
+        assert_unfolded(mul(c(1e200), mul(c(1e200), x(0))));
+    }
+
+    #[test]
+    fn fold_still_folds_a_tree_that_already_holds_a_constant_outside_the_box() {
+        let (f, n) = fold_constants(&add(mul(c(2.0), mul(c(3.0), x(0))), c(2e6)));
+        assert_eq!(n, 1);
+        assert!(same(&f, &add(mul(c(6.0), x(0)), c(2e6))), "{f:?}");
+    }
+
+    #[test]
+    fn the_refused_tree_fits_as_the_unfolded_tree() {
+        let xs = rows(64, 3, 0.25, 2.0, 5);
+        let y: Vec<f64> = xs.iter().map(|r| r[2] * r[2] * 2e-7).collect();
+        let t = div(div(square(x(2)), c(530.8156455944121)), c(9927.813354));
+        let (f, _) = fold_constants(&t);
+        for iters in [8, 200] {
+            let (mut a, mut b) = (t.clone(), f.clone());
+            let (sa, sb) = (crate::fit::fit(&mut a, &xs, &y, iters), crate::fit::fit(&mut b, &xs, &y, iters));
+            assert_eq!(sa.to_bits(), sb.to_bits(), "{iters}");
+            assert!(same(&a, &b));
+        }
     }
 }
