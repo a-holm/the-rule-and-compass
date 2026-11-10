@@ -380,10 +380,11 @@ impl RunLedger {
         }
     }
 
-    /// Record the fit stage totals. `host_s` includes the device call, the CPU
-    /// fallback and write-back; `kernel_s` and `fallback_s` are its measured
-    /// leaves. #958: fallback fits on the pool can run beside the kernel, so
-    /// only their join wait ([`Self::record_fit_tail`]) is exclusive host time.
+    /// Record the fit stage totals. `host_s` is the host-clock wall of the fit
+    /// windows (device call, write-back, join wait); `kernel_s` is the event
+    /// kernel time; `fallback_s` is summed pool seconds and can exceed `host_s`.
+    /// #958: fallback fits on the pool can run beside the kernel, so only their
+    /// join wait ([`Self::record_fit_tail`]) is exclusive host time.
     pub fn record_fit(&mut self, host_s: f64, kernel_s: f64, fallback_s: f64) {
         if host_s.is_finite() && host_s > 0.0 {
             self.fit_host_s += host_s;
