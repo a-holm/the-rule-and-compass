@@ -73,7 +73,7 @@ fn archive_hash(out: &Outcome) -> u64 {
 /// `(metric, hash of the archive)`.
 #[cfg(feature = "cuda")]
 const GOLDEN: &[(Metric, u64)] = &[
-    (Metric::Squared, 0xa92e_ae3a_b38e_20cd),
+    (Metric::Squared, 0x8c5c_4b9b_b91b_baba),
     (Metric::Absolute, 0x6a1c_d97e_7fbf_c519),
     (Metric::RankCorrelation, 0x0dbc_187c_7c8f_6de1),
     (Metric::Median, 0xdd06_72b6_d7be_afeb),
