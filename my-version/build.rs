@@ -127,15 +127,27 @@ fn record_build_commit() {
     println!("cargo:rustc-env=RCSR_BUILD_COMMIT={}", commit);
     println!("cargo:rustc-env=RCSR_BUILD_DIRTY={}", dirty);
     let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let mut watch = vec!["HEAD".to_string(), "packed-refs".to_string()];
-    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
-        watch.push(branch);
-    }
-    for name in watch {
-        if let Some(path) = git(&["rev-parse", "--git-path", &name]) {
-            let path = std::path::Path::new(&dir).join(path);
-            println!("cargo:rerun-if-changed={}", path.display());
+    let git_path = |name: &str| {
+        git(&["rev-parse", "--git-path", name]).map(|p| std::path::Path::new(&dir).join(p))
+    };
+    let mut watch: Vec<std::path::PathBuf> = git_path("HEAD").into_iter().collect();
+    // #981: `packed-refs` and the branch refs live in the git directory shared
+    // by every worktree, so watching them reruns the script after another
+    // worktree's branch cleanup. This checkout's commit changes through its own
+    // HEAD file or its own HEAD reflog. Without a reflog, a new commit on a
+    // branch creates or rewrites its ref file. A path that does not exist makes
+    // cargo rerun on every build, so only existing paths are listed.
+    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]).and_then(|b| git_path(&b)) {
+        if let Some(log) = git_path("logs/HEAD").filter(|l| l.is_file()) {
+            watch.push(log);
+        } else if branch.is_file() {
+            watch.push(branch);
+        } else if let Some(parent) = branch.ancestors().skip(1).find(|p| p.is_dir()) {
+            watch.push(parent.to_path_buf());
         }
+    }
+    for path in watch {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
 }
 
