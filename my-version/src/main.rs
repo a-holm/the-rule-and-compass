@@ -336,8 +336,12 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   --smooth-centred <k>       the old centred window. Reads future bars and is
                              a look-ahead on time series; reported as centred
   --allow-interpolate        permit --fill interpolate on time-ordered data
-  --allow-lockbox            permit train/validation/test rows in 2026H2 (declared final test only)
-                             It never opens the declared locked test (--lockbox).
+  --allow-lockbox            permit rows in the legacy 2026H2 box, which guards undeclared
+                             data, the protocol default and --lockbox none (declared final
+                             test only). A declared lock (--lockbox here, --locked-test of
+                             a builder, the store sidecar) replaces that box: a run never
+                             opens it; prep and panel base/build/append refuse its rows
+                             (exit 3) unless this flag is set.
   --lockbox-embargo <SECONDS>
                              widen the lookback embargo after the end of every locked range
                              (default: lockbox_embargo declared with the data, else 10972800);
@@ -11147,8 +11151,10 @@ OPTIONS:
                              recorded, then renamed (an unwritable path exits 3 and
                              the read stays available)
   --markdown <file|->        write the Markdown report ('-' = stdout); staged the same way
-  --allow-lockbox            permit a test window overlapping 2026H2
-                             (declared final test only; default refuses)
+  --allow-lockbox            permit a test window overlapping the legacy 2026H2 box
+                             (undeclared data, protocol default, --lockbox none; declared
+                             final test only). A declared lock (--lockbox, store sidecar)
+                             replaces that box and is never opened by this flag.
   --quiet                    reserved; text output stays on stdout
   -h, --help                 show this help
 ",

@@ -819,7 +819,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   refuses such a run (exit 2).
 * Normalisation statistics are computed from the **training rows only**; the
   test set never influences the model's input scaling.
-* A split whose training **or** test rows fall inside the guarded box is refused unless `--allow-lockbox` is passed. The box is the declared locked test (`--locked-test`, the store sidecar), else for undeclared data the crypto 2026H2 lockbox (`2026-07-01 .. 2027-01-01`).
+* A split whose training **or** test rows fall inside the guarded box is refused (exit 3). Resolution order: a lock declared by `--lockbox`, `--locked-test` or the store sidecar is the guarded box; undeclared data, the protocol default and `--lockbox none` keep the legacy 2026H2 box (`2026-07-01 .. 2027-01-01`). `--allow-lockbox` opens the legacy box only; a run never opens a declared lock. Builders (`prep --label`, `panel base`, `panel build`, `panel append`) refuse rows inside a declared lock (exit 3) unless `--allow-lockbox`.
   The same central guard covers `rcsr run`, `rcsr walkforward`, an explicit
   `rcsr panel build` window and a labelled `rcsr prep`; see
   [`docs/panel.md`](docs/panel.md#the-2026h2-lockbox).
@@ -857,7 +857,7 @@ run:
 | `--smooth k` | `k`-wide **trailing** moving average per column (row `i` reads only itself and earlier rows); edges shrink |
 | `--smooth-centred k` | the old **centred** window; reads future bars, is opt-in, and is reported as look-ahead |
 | `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
-| `--allow-lockbox` | permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only); never opens the declared locked test |
+| `--allow-lockbox` | permit rows in the legacy 2026H2 box (undeclared data, protocol default, `--lockbox none`; declared final test only). A declared lock (`--lockbox`, the store sidecar) replaces that box and is never opened by this flag; builders (`prep`, `panel base/build/append`) use `--allow-lockbox` to accept rows inside their declared lock |
 | `--lockbox START,END` | declared locked test (UTC, half-open). Overrides the range declared with the data (`rcsr panel build --locked-test`). Train, validation and test rows inside it are refused (exit 3). The run.json `lockbox` object reports rows, date range, read count, `declared`, `source` (`store` or `flag`), `rows_in_scope` and `evaluated` |
 | `--lockbox-embargo SECONDS` | widen the lookback embargo after the end of every locked range (default: `lockbox_embargo` declared with the data, else 10972800). Rows in `[start - purge, end + embargo)` are refused; a smaller value is refused (exit 2). The `lockbox` object reports `embargo_seconds` and `embargo_source` (`store`, `flag` or `protocol_default`) |
 | `--retired retired.json` | retirement record from `rcsr protocol retire`: its range had its one sealed read and no longer guards next to a `--lockbox` range on undeclared data. The ledger it names is re-hashed (a mismatch exits 3); a `--lockbox` range or data declaration that overlaps the retired range exits 2. The `lockbox` object gains `retired` (`range`, `ledger_sha256`, `read_event`) |

@@ -209,15 +209,66 @@ fn lockbox_retired_drops_literal() {
     let (_s, dir) = scratch("retired");
     let raw = s(&archive(&dir, &all_months()));
     let record = retired_record(&dir);
+
+    // the record is verified and written to the manifest; without it the manifest has no member
+    let plain = s(&dir.join("plain.rcsb"));
+    let (code, _, err) = rcsr(&base_args(&raw, &plain, &["--locked-test", FORWARD]));
+    assert_eq!(code, 0, "{err}");
+    let text = std::fs::read_to_string(format!("{plain}.manifest.json")).unwrap();
+    assert!(!text.contains("\"retired\""), "{text}");
     let out = s(&dir.join("base.rcsb"));
     let (code, _, err) = rcsr(&base_args(&raw, &out, &["--locked-test", FORWARD, "--retired", &record]));
     assert_eq!(code, 0, "{err}");
     let text = std::fs::read_to_string(format!("{out}.manifest.json")).unwrap();
-    assert!(text.contains("\"retired\""), "{text}");
-    // the same record does not free a lock that still covers the data
+    assert!(text.contains("\"retired\"") && text.contains("2025-07-01"), "{text}");
+
+    // a lock that reaches the retired range is refused with the record and accepted without it
+    let reaching = "2026-05-01,2026-06-01";
+    let dev = s(&archive(&dir.join("dev"), &[0]));
+    let free = s(&dir.join("free.rcsb"));
+    let (code, _, err) = rcsr(&base_args(&dev, &free, &["--locked-test", reaching]));
+    assert_eq!(code, 0, "{err}");
+    let refused = s(&dir.join("refused.rcsb"));
+    let (code, _, err) = rcsr(&base_args(&dev, &refused, &["--locked-test", reaching, "--retired", &record]));
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("overlaps the retired range 2025-07-01..2026-07-01"), "{err}");
+    assert!(!Path::new(&refused).exists());
+
+    // the record needs a declared lock for the output
+    let (code, _, err) = rcsr(&base_args(&dev, &refused, &["--retired", &record]));
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("--retired needs a locked range"), "{err}");
+
+    // the record does not free a lock that still covers the data
     let again = s(&dir.join("again.rcsb"));
     let (code, _, err) = rcsr(&base_args(&raw, &again, &["--locked-test", OVERLAPPING, "--retired", &record]));
+    assert_ne!(code, 0, "{err}");
+    assert!(!Path::new(&again).exists());
+}
+
+#[test]
+fn lockbox_prep_refuses_rows_in_the_declared_lock() {
+    let (_s, dir) = scratch("prep-declared");
+    let raw = s(&archive(&dir, &all_months()));
+    let out = s(&dir.join("prep.rcsb"));
+    let prep = |lock: &str, extra: &[&str]| {
+        let mut a = vec![
+            "prep", "--input", &raw, "--format", "binance", "--resample", "1h", "--label", "fwd:1h,cost=10,volnorm=20", "--out", &out,
+            "--locked-test", lock,
+        ];
+        a.extend_from_slice(extra);
+        rcsr(&a)
+    };
+    let (code, _, err) = prep(OVERLAPPING, &[]);
     assert_eq!(code, 3, "{err}");
+    assert!(err.contains("declared lock 2026-07-01..2027-07-01 from --locked-test"), "{err}");
+    assert!(!Path::new(&out).exists());
+    let (code, _, err) = prep(OVERLAPPING, &["--allow-lockbox"]);
+    assert_eq!(code, 0, "{err}");
+    std::fs::remove_file(&out).unwrap();
+    std::fs::remove_file(format!("{out}.manifest.json")).unwrap();
+    let (code, _, err) = prep(FORWARD, &[]);
+    assert_eq!(code, 0, "{err}");
 }
 
 fn validate(panel: &Path) -> panel_v2::Report {
