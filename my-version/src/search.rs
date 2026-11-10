@@ -2706,11 +2706,16 @@ fn exact_start_finite(tree: &Node, x: &[Vec<f64>], y: &[f64], w: &[f64], metric:
     score_weighted(&pred, y, w, metric, expr::count_constants(tree)).is_finite()
 }
 
-/// #988: a refit from a non-finite exact start cannot change the kept answer
-/// when no finite device answer competes with it.
+/// #988: a refit cannot change the kept answer when the objective is non-finite
+/// at the starting constants both in the exact scorer and in the fit's own row
+/// pass, and no finite device answer competes with it.
 #[cfg(feature = "cuda")]
 fn refit_cannot_win(job: &FallbackFitJob, x: &[Vec<f64>], y: &[f64], w: &[f64], metric: Metric) -> bool {
     if exact_start_finite(&job.tree, x, y, w, metric) {
+        return false;
+    }
+    let mut probe = job.tree.clone();
+    if crate::fit::fit_weighted_metric(&mut probe, x, y, w, 0, metric).is_finite() {
         return false;
     }
     job.device.as_ref().is_none_or(|device| !exact_start_finite(device, x, y, w, metric))
