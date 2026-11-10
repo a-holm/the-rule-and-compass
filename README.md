@@ -819,8 +819,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   refuses such a run (exit 2).
 * Normalisation statistics are computed from the **training rows only**; the
   test set never influences the model's input scaling.
-* A split whose training **or** test rows fall inside the crypto 2026H2 lockbox
-  (`2026-07-01 .. 2027-01-01`) is refused unless `--allow-lockbox` is passed.
+* A split whose training **or** test rows fall inside the guarded box is refused unless `--allow-lockbox` is passed. The box is the declared locked test (`--locked-test`, the store sidecar), else for undeclared data the crypto 2026H2 lockbox (`2026-07-01 .. 2027-01-01`).
   The same central guard covers `rcsr run`, `rcsr walkforward`, an explicit
   `rcsr panel build` window and a labelled `rcsr prep`; see
   [`docs/panel.md`](docs/panel.md#the-2026h2-lockbox).

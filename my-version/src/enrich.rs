@@ -1685,6 +1685,8 @@ pub struct Options {
     pub locked_test: Option<crate::lockbox::Lockbox>,
     /// A second guarded range next to `locked_test`.
     pub locked_also: Option<crate::lockbox::Lockbox>,
+    /// Where `locked_test` came from when the command line resolved it; `None` for a library caller.
+    pub locked_source: Option<crate::lockbox::Source>,
     pub dry_run: bool,
     pub json: bool,
 }
@@ -1713,6 +1715,7 @@ impl Default for Options {
             allow_overlap: false,
             locked_test: None,
             locked_also: None,
+            locked_source: None,
             dry_run: false,
             json: false,
         }
@@ -7683,14 +7686,6 @@ fn enrich_inner(
         .or_else(|_| manifest::sha256_file(&input_path))
         .unwrap_or_else(|_| "unknown".to_string());
 
-    // Lockbox guard for labelled builds: a label is an evaluation target.
-    if !labels.is_empty() || !long_specs.is_empty() {
-        for seg in &segs {
-            let times = segment_i64(&store, seg, time_col, cols.time_dtype)?;
-            crate::prep::check_labelled_rows(&times, opts.allow_lockbox)?;
-        }
-    }
-
     let (label_range, label_also) = match opts.locked_test {
         Some(l) => (Some(l), opts.locked_also),
         None => match crate::lockbox::stored_all(&opts.data).map_err(|e| e.message)? {
@@ -7698,6 +7693,17 @@ fn enrich_inner(
             None => (None, None),
         },
     };
+    // Lockbox guard for labelled builds on undeclared data: a label is an evaluation
+    // target. A declared locked test replaces the legacy box and is kept out of the
+    // label statistics below, so a store may hold its rows.
+    let declared_lock = label_range.is_some() && opts.locked_source != Some(crate::lockbox::Source::ProtocolDefault);
+    if (!labels.is_empty() || !long_specs.is_empty()) && !declared_lock {
+        let guard = crate::lockbox::Guard::new(opts.allow_lockbox, None);
+        for seg in &segs {
+            let times = segment_i64(&store, seg, time_col, cols.time_dtype)?;
+            crate::prep::check_labelled_rows_with(&times, &guard)?;
+        }
+    }
     // Development rows by global row index, one mask per label purge. Feature
     // statistics leave out rows inside a guarded range; label columns also
     // leave out rows whose label window reaches it.
@@ -9147,6 +9153,7 @@ pub fn run(args: &[String]) -> ! {
     });
     opts.locked_test = resolved.sidecar_range();
     opts.locked_also = resolved.sidecar_also();
+    opts.locked_source = Some(resolved.source);
     if let (Some(out), false) = (&opts.out, opts.dry_run) {
         let keep = opts.locked_test.map_or(crate::lockbox::Keep::Remove, crate::lockbox::Keep::Range);
         if let Err(e) = crate::lockbox::output_declaration(out, Some(&opts.data), keep) {
@@ -9270,7 +9277,7 @@ INPUT / OUTPUT:
   --allow-overlap         permit a label stride below the horizon for horizons of
                           4h and longer (labels overlap; use uniqueness weights)
   --side long             the only side; --side short and --allow-short are refused
-  --allow-lockbox         permit labelled rows in 2026H2 (final test only)
+  --allow-lockbox         permit labelled rows in 2026H2 of undeclared data (final test only); a declared locked test is left out of label statistics
   --locked-test <START,END|none>
                           declare the locked test (UTC, half-open) in <out>.enrich.json.
                           Without the flag: the range --data declares, else the protocol

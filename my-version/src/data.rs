@@ -2901,7 +2901,7 @@ pub fn check_cv_lockbox(
         }
     }
     if !allow_lockbox {
-        crate::lockbox::Guard::default().check_times("cross-validation rows", &times)?;
+        crate::lockbox::Guard::for_run(spec.declared_lockbox.as_ref(), false).check_times("cross-validation rows", &times)?;
     }
     if let Some(d) = &spec.declared_lockbox {
         if unstamped > 0 && spec.strict_lockbox().is_some() {
@@ -4492,7 +4492,7 @@ fn check_split_lockbox(
         report.test_time_min = Some(a);
         report.test_time_max = Some(b);
     }
-    let guard = crate::lockbox::Guard::new(spec.allow_lockbox, None);
+    let guard = crate::lockbox::Guard::for_run(spec.declared_lockbox.as_ref(), spec.allow_lockbox);
     report.lockbox_train = guard.check_times("training split", &train_times)?;
     report.lockbox_validation = guard.check_times("validation split", &validation_times)?;
     report.lockbox_test = guard.check_times("test split", &test_times)?;
