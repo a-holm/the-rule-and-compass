@@ -3901,7 +3901,10 @@ impl IrlsSolver {
         EXACT_FITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let k = self.flat.nconst;
         let mut pass = tile::TileFit::new(&mut self.core, target, weights);
-        let (fitted, _) = lm_core(&mut pass, &self.c, k, iters);
+        // #990: the historical run only. A lower weighted SSE here can still
+        // fail the round's test on the configured metric and end the rounds
+        // earlier, so the relative-floor run of `lm_core` is not used.
+        let (fitted, _, _) = lm_run(&mut pass, &self.c, k, iters, false);
         let mut trial = tree.clone();
         if k > 0 && iters > 0 {
             write_constants(&mut trial, &self.flat, &fitted);
