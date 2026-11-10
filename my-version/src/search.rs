@@ -1,4 +1,4 @@
-//! Island-model, multi-objective evolutionary search.
+//! Island-model, multi-obje        c.map(|c| Self::get(field(c))).unwrap_or(0)tive evolutionary search.
 //!
 //! A population of expression individuals evolves on separate islands, tracked
 //! against a global Pareto front over (error, complexity), with generations,
@@ -1067,6 +1067,8 @@ struct GpuSearch {
     /// whose tree the fold changed.
     fit_fold_count: usize,
     fit_folded: usize,
+    /// #988: fallback refits skipped because the exact start loss was non-finite, by cause.
+    fit_fallback_skipped_by_cause: BTreeMap<String, usize>,
     /// #169: wall time spent in the batched fit kernels, milliseconds.
     fit_ms: f64,
     /// #496: the polish-phase part of `fit_ms`, apportioned by cycle ratio.
@@ -1384,6 +1386,7 @@ impl GpuSearch {
                     fit_fallback_improved_by_cause: BTreeMap::new(),
                     fit_status_by_label: BTreeMap::new(),
                     fit_fold_count: 0,
+                    fit_fallback_skipped_by_cause: BTreeMap::new(),
                     fit_folded: 0,
                     fit_ms: 0.0,
                     fit_polish_ms: 0.0,
@@ -1763,6 +1766,9 @@ impl GpuSearch {
                 if job.improved {
                     self.note_fit_fallback_improved(generation, cause);
                 }
+                if job.skipped {
+                    self.note_fit_fallback_skipped(cause);
+                }
             }
             for job in joined.jobs {
                 islands[job.island][job.slot].tree = job.tree;
@@ -1771,8 +1777,9 @@ impl GpuSearch {
         } else if refit > 0 {
             let mut jobs: Vec<FallbackFitJob> = fallbacks[..refit]
                 .iter()
-                .map(|&(island, slot, _)| {
+                .map(|&(island, slot, cause)| {
                     FallbackFitJob::new(island, slot, islands[island][slot].tree.clone())
+                        .with_cause(cause)
                         .with_device(device_alts.remove(&(island, slot)))
                 })
                 .collect();
@@ -1788,6 +1795,9 @@ impl GpuSearch {
             for (&(_, _, cause), job) in fallbacks[..refit].iter().zip(&jobs) {
                 if job.improved {
                     self.note_fit_fallback_improved(generation, cause);
+                }
+                if job.skipped {
+                    self.note_fit_fallback_skipped(cause);
                 }
             }
             for job in jobs {
@@ -1847,6 +1857,14 @@ impl GpuSearch {
         count_improved(&mut stats.fit_fallback_improved_by_cause, cause);
     }
 
+    /// #988: record that the CPU refit of a fallback of `cause` was skipped.
+    fn note_fit_fallback_skipped(&mut self, cause: FitFallbackCause) {
+        *self
+            .fit_fallback_skipped_by_cause
+            .entry(cause.label().to_string())
+            .or_default() += 1;
+    }
+
     /// #958: submit the exact CPU fits of `fallbacks[from..]` to the pool, up
     /// to the `--fit-fallback-max` prefix, each from its slot's current tree.
     /// Returns how many entries of `fallbacks` are now submitted.
@@ -1866,7 +1884,7 @@ impl GpuSearch {
         }
         let jobs: Vec<FallbackFitJob> = fallbacks[from..refit]
             .iter()
-            .map(|&(i, j, _)| FallbackFitJob::new(i, j, islands[i][j].tree.clone()).with_device(device_alts.remove(&(i, j))))
+            .map(|&(i, j, cause)| FallbackFitJob::new(i, j, islands[i][j].tree.clone()).with_cause(cause).with_device(device_alts.remove(&(i, j))))
             .collect();
         self.tail_submit(tail, jobs, rows, cfg.fit_iters, cfg.metric);
         refit
@@ -2573,6 +2591,7 @@ impl GpuSearch {
             fit_fallback_improved_by_cause: self.fit_fallback_improved_by_cause.clone(),
             fit_status_by_label: self.fit_status_by_label.clone(),
             fit_fold_count: self.fit_fold_count,
+            fit_fallback_skipped_by_cause: self.fit_fallback_skipped_by_cause.clone(),
             fit_folded: self.fit_folded,
             fit_refits: 0,
             fit_refit_candidates: 0,
@@ -2671,6 +2690,32 @@ fn refit_lowers_error(
     after.is_finite() && (before.is_nan() || after < before)
 }
 
+/// #988: whether the exact f64 objective at the tree's current constants is
+/// finite on the fit rows. A non-finite prediction on a row that counts makes
+/// the objective non-finite, so the scan stops there.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn exact_start_finite(tree: &Node, x: &[Vec<f64>], y: &[f64], w: &[f64], metric: Metric) -> bool {
+    let mut pred = Vec::with_capacity(x.len());
+    for (i, row) in x.iter().enumerate() {
+        let p = expr::eval(tree, row);
+        if !p.is_finite() && (w.is_empty() || w.get(i).is_none_or(|&wi| wi > 0.0)) {
+            return false;
+        }
+        pred.push(p);
+    }
+    score_weighted(&pred, y, w, metric, expr::count_constants(tree)).is_finite()
+}
+
+/// #988: a refit from a non-finite exact start cannot change the kept answer
+/// when no finite device answer competes with it.
+#[cfg(feature = "cuda")]
+fn refit_cannot_win(job: &FallbackFitJob, x: &[Vec<f64>], y: &[f64], w: &[f64], metric: Metric) -> bool {
+    if exact_start_finite(&job.tree, x, y, w, metric) {
+        return false;
+    }
+    job.device.as_ref().is_none_or(|device| !exact_start_finite(device, x, y, w, metric))
+}
+
 /// #968: one exact CPU fallback fit. A job that carries its device constants
 /// (a routed tail status) keeps the lower exact error of the two answers; a tie
 /// keeps the CPU fit, and a non-finite device error never wins.
@@ -2683,6 +2728,10 @@ fn run_fallback_fit(
     iters: usize,
     metric: Metric,
 ) {
+    if job.cause == Some(FitFallbackCause::NonFiniteStart) && refit_cannot_win(job, x, y, w, metric) {
+        job.skipped = true;
+        return;
+    }
     job.improved = refit_lowers_error(&mut job.tree, x, y, w, iters, metric);
     if let Some(device) = job.device.take() {
         let cpu = exact_error(&job.tree, x, y, w, metric);
@@ -2703,9 +2752,23 @@ pub(crate) fn keep_better_tail_fit(
     iters: usize,
     metric: Metric,
 ) -> Node {
+    routed_tail_fit(start, device, sample, iters, metric, None).0
+}
+
+/// #988: as [`keep_better_tail_fit`] for a fit of `cause`; the flag tells whether the refit was skipped.
+#[cfg(all(feature = "cuda", test))]
+pub(crate) fn routed_tail_fit(
+    start: &Node,
+    device: Node,
+    sample: &Sample,
+    iters: usize,
+    metric: Metric,
+    cause: Option<FitFallbackCause>,
+) -> (Node, bool) {
     let mut job = FallbackFitJob::new(0, 0, start.clone()).with_device(Some(device));
+    job.cause = cause;
     run_fallback_fit(&mut job, &sample.x, &sample.y, &sample.w, iters, metric);
-    job.tree
+    (job.tree, job.skipped)
 }
 
 /// #265: count one improved refit under its fallback cause.
@@ -2738,6 +2801,11 @@ struct FallbackFitJob {
     slot: usize,
     tree: Node,
     improved: bool,
+    /// #988: the cause of this fallback.
+    cause: Option<FitFallbackCause>,
+    /// #988: the refit was skipped: the exact start loss is non-finite and no
+    /// finite device answer competes.
+    skipped: bool,
     /// #968: the tree at its device constants, for a routed tail status. The
     /// job keeps the lower error of this and the exact CPU fit.
     device: Option<Node>,
@@ -2751,8 +2819,15 @@ impl FallbackFitJob {
             slot,
             tree,
             improved: false,
+            cause: None,
+            skipped: false,
             device: None,
         }
+    }
+
+    fn with_cause(mut self, cause: FitFallbackCause) -> Self {
+        self.cause = Some(cause);
+        self
     }
 
     fn with_device(mut self, device: Option<Node>) -> Self {
@@ -3700,7 +3775,7 @@ fn fit_pipeline_queue(
             .enumerate()
             .map(|(k, f)| {
                 f.early = Some(base + k);
-                FallbackFitJob::new(f.island, f.slot, f.tree.clone()).with_device(f.device.clone())
+                FallbackFitJob::new(f.island, f.slot, f.tree.clone()).with_cause(f.cause).with_device(f.device.clone())
             })
             .collect();
         g.tail_submit(&mut tail.pending, jobs, tail.rows, fit.iters, fit.metric);
@@ -3852,6 +3927,9 @@ fn finish_pipeline_fallbacks(
                 if job.improved {
                     g.note_fit_fallback_improved(generation, f.cause);
                 }
+                if job.skipped {
+                    g.note_fit_fallback_skipped(f.cause);
+                }
                 f.tree = job.tree;
             }
             None => rest.push(n),
@@ -3864,7 +3942,7 @@ fn finish_pipeline_fallbacks(
             .iter()
             .map(|&n| {
                 let f = &mut fallbacks[n];
-                FallbackFitJob::new(f.island, f.slot, f.tree.clone()).with_device(f.device.take())
+                FallbackFitJob::new(f.island, f.slot, f.tree.clone()).with_cause(f.cause).with_device(f.device.take())
             })
             .collect();
         workers_used = workers_used.max(fit_fallback_jobs(
@@ -3879,6 +3957,9 @@ fn finish_pipeline_fallbacks(
         for (&n, job) in rest.iter().zip(jobs) {
             if job.improved {
                 g.note_fit_fallback_improved(generation, fallbacks[n].cause);
+            }
+            if job.skipped {
+                g.note_fit_fallback_skipped(fallbacks[n].cause);
             }
             fallbacks[n].tree = job.tree;
         }
@@ -6862,6 +6943,8 @@ pub struct GpuRunStats {
     pub fit_status_by_label: BTreeMap<String, usize>,
     /// #982: constants removed by the fold before the fit.
     pub fit_fold_count: usize,
+    /// #988: fallback refits skipped because the exact f64 start loss was non-finite, by cause.
+    pub fit_fallback_skipped_by_cause: BTreeMap<String, usize>,
     /// #982: candidates whose tree the fold changed.
     pub fit_folded: usize,
     /// #169: exact CPU f64 refits of finalists before reporting.
@@ -10125,6 +10208,10 @@ fn run_search(
 #[path = "gpu_fold_tests.rs"]
 mod gpu_fold_tests;
 
+#[cfg(all(test, feature = "cuda"))]
+#[path = "gpu_dead_start_tests.rs"]
+mod gpu_dead_start_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10810,6 +10897,54 @@ mod tests {
         assert!(refit_lowers_error(&mut bad, &s.x, &s.y, &s.w, 8, Metric::Squared));
         let mut exact = line(1.0);
         assert!(!refit_lowers_error(&mut exact, &s.x, &s.y, &s.w, 8, Metric::Squared));
+    }
+
+    /// #988: the start objective is finite exactly when the scorer would give a
+    /// finite number at the current constants.
+    #[test]
+    fn exact_start_finite_follows_the_objective() {
+        let s = sample();
+        let dead = node(Op::Mul, vec![node(Op::Ln, vec![constant(-1.0)]), input(0)]);
+        let fractional = node(Op::Pow, vec![constant(-0.5), input(0)]);
+        let overflow_in_f32 = node(Op::Cosh, vec![node(Op::Mul, vec![constant(100.0), input(0)])]);
+        let ok = node(Op::Mul, vec![constant(0.25), input(0)]);
+        for (tree, finite) in [(&dead, false), (&fractional, false), (&overflow_in_f32, true), (&ok, true)] {
+            assert_eq!(exact_start_finite(tree, &s.x, &s.y, &s.w, Metric::Squared), finite, "{tree:?}");
+            let scored = exact_error(tree, &s.x, &s.y, &s.w, Metric::Squared).is_finite();
+            assert_eq!(scored, finite, "{tree:?}");
+        }
+        let positive = node(Op::Ln, vec![input(0)]);
+        let mut w: Vec<f64> = s.x.iter().map(|r| if r[0] > 0.0 { 1.0 } else { 0.0 }).collect();
+        assert!(exact_start_finite(&positive, &s.x, &s.y, &w, Metric::Squared));
+        w[0] = 1.0;
+        assert!(!exact_start_finite(&positive, &s.x, &s.y, &w, Metric::Squared));
+        assert!(!exact_start_finite(&positive, &s.x, &s.y, &[], Metric::Squared));
+    }
+
+    /// #988: only a `NonFiniteStart` job with a non-finite start skips its refit,
+    /// and a skipped job keeps its tree.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn only_dead_non_finite_start_jobs_skip_the_refit() {
+        let s = sample();
+        let dead = node(Op::Add, vec![node(Op::Mul, vec![constant(0.5), input(0)]), node(Op::Ln, vec![constant(-1.0)])]);
+        let live = node(Op::Mul, vec![constant(0.25), input(0)]);
+        let run = |tree: &Node, cause: Option<FitFallbackCause>, device: Option<Node>| {
+            let mut job = FallbackFitJob::new(0, 0, tree.clone()).with_device(device);
+            job.cause = cause;
+            run_fallback_fit(&mut job, &s.x, &s.y, &s.w, 8, Metric::Squared);
+            job
+        };
+        let skipped = run(&dead, Some(FitFallbackCause::NonFiniteStart), None);
+        assert!(skipped.skipped && !skipped.improved);
+        assert_eq!(format!("{:?}", skipped.tree), format!("{dead:?}"));
+        assert!(!run(&dead, Some(FitFallbackCause::Unconverged), None).skipped);
+        assert!(!run(&dead, None, None).skipped);
+        let fitted = run(&live, Some(FitFallbackCause::NonFiniteStart), None);
+        assert!(!fitted.skipped && fitted.improved);
+        let finite_device = node(Op::Mul, vec![constant(0.9), input(0)]);
+        let beaten = run(&dead, Some(FitFallbackCause::NonFiniteStart), Some(finite_device));
+        assert!(!beaten.skipped);
     }
 
     /// #265: improvements are tallied under the cause that sent the candidate
