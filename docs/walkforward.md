@@ -210,9 +210,9 @@ The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA
   period return is the mean net return over the groups present at that
   timestamp. With no `--group-by` the whole table is one series.
 * Every window is checked against the guarded box on **both** sides: the declared
-  locked test (`--lockbox`, the store sidecar), else for undeclared data the 2026H2 lockbox
+  locked test (`--lockbox`, the store sidecar), else for undeclared data, the protocol default and `--lockbox none` the 2026H2 lockbox
   `[2026-07-01, 2027-01-01)`. A training range inside the
-  holdout is refused even when the test block is in 2027. `--allow-lockbox` is
+  holdout is refused even when the test block is in 2027. `--allow-lockbox` (it opens the 2026H2 box only, never a declared lock) is
   the only override (declared final test only) and is echoed as
   `"lockbox": {"permitted": true, ...}` in the JSON report. The same
   `rcsr::lockbox::Guard` is used by `rcsr run` (the default search),
