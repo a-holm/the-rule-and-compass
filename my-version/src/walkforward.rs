@@ -101,6 +101,10 @@ pub struct ProtocolOptions {
     pub locked_ranges: Vec<(i64, i64)>,
     /// Seconds after the end of every locked range whose rows read it.
     pub locked_embargo: i64,
+    /// The locked test of the run when a flag or the store declared it. It replaces
+    /// the legacy 2026H2 box in the window guard; the declared ranges are enforced
+    /// through `locked_ranges`.
+    pub declared_lock: Option<crate::lockbox::Declared>,
     /// #925: how `--band` is read under `--policy band`. With
     /// [`crate::trading::BandUnits::Sd`] each window resolves the half-width of
     /// every candidate from its finite training scores only.
@@ -146,6 +150,7 @@ impl Default for ProtocolOptions {
             final_read: false,
             locked_ranges: Vec::new(),
             locked_embargo: 0,
+            declared_lock: None,
             band_units: crate::trading::BandUnits::Score,
             run_bands: None,
             quorum: None,
@@ -627,6 +632,8 @@ pub struct Report {
     pub memory_bound: String,
     /// #145: was the lockbox override explicitly set for this run?
     pub allow_lockbox: bool,
+    /// The box the window guard covered: the declared lock, else the legacy 2026H2 box.
+    pub guarded_lockbox: crate::lockbox::Lockbox,
     /// #304: fused long-only reduction summary when `--device-pnl` was set.
     pub device_pnl: Option<DevicePnlSummary>,
     /// #309: batch pass over all candidates and windows (`--batch-pnl`).
@@ -1141,7 +1148,7 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
         }
         // #145: a training range inside 2026H2 with a 2027 test would train on
         // the holdout. Check both sides through the one central guard.
-        let guard = crate::lockbox::Guard::new(spec.allow_lockbox, None);
+        let guard = crate::lockbox::Guard::for_run(opts.declared_lock.as_ref(), spec.allow_lockbox);
         guard.check(
             &format!("window '{}' training range", w.label),
             w.train_start.floor() as i64,
@@ -1908,6 +1915,7 @@ impl Accum {
             source: source.to_string(),
             memory_bound: memory_bound.to_string(),
             allow_lockbox: spec.allow_lockbox,
+            guarded_lockbox: crate::lockbox::Guard::for_run(opts.declared_lock.as_ref(), spec.allow_lockbox).lockbox,
             device_pnl,
             batch_pnl,
             ledger,
@@ -3335,7 +3343,7 @@ impl Report {
     /// by issue #124.
     fn base_json(&self, paths: bool) -> String {
         let windows: Vec<String> = self.windows.iter().map(WindowResult::json).collect();
-        let lb = crate::lockbox::Lockbox::crypto_2026h2();
+        let lb = self.guarded_lockbox;
         let overlap: Vec<String> = self
             .windows
             .iter()

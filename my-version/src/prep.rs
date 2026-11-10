@@ -1269,9 +1269,12 @@ impl Audit {
 /// Guard a labelled build with the central lockbox module. Exposed so a test
 /// can exercise the same path the CLI uses.
 pub fn check_labelled_rows(times: &[i64], allow_lockbox: bool) -> Result<(), String> {
-    crate::lockbox::Guard::new(allow_lockbox, None)
-        .check_times("prep labelled rows", times)
-        .map(|_| ())
+    check_labelled_rows_with(times, &crate::lockbox::Guard::new(allow_lockbox, None))
+}
+
+/// [`check_labelled_rows`] under the guard of the declared lock (or the legacy box).
+pub fn check_labelled_rows_with(times: &[i64], guard: &crate::lockbox::Guard) -> Result<(), String> {
+    guard.check_times("prep labelled rows", times).map(|_| ())
 }
 
 /// Split `items` into at most `jobs` deterministic round-robin chunks.
@@ -1849,10 +1852,15 @@ pub fn build(opts: &Options) -> Result<Build, String> {
     // #145: a labelled build creates an evaluation target. If any row is in the
     // lockbox, the same central guard decides. Unlabelled bars are provenance
     // and may retain the holdout.
-    let lb = crate::lockbox::Lockbox::crypto_2026h2();
+    let declared = match opts.locked_test {
+        crate::lockbox::Keep::Range(r) => Some(r),
+        _ => None,
+    };
+    let guard = crate::lockbox::Guard::for_writer(declared.as_ref(), None, opts.locked_test.origin(), opts.allow_lockbox);
+    let lb = guard.lockbox;
     let coverage = lb.overlap(times.iter().copied());
     if opts.label.is_some() {
-        check_labelled_rows(&times, opts.allow_lockbox)?;
+        check_labelled_rows_with(&times, &guard)?;
     }
 
     // The hashes were computed once per archive in pass 1, from the same bytes
@@ -2298,7 +2306,7 @@ TRANSFORMS:
                           the build settings; reuse prints on stderr
   --out, -o <store.rcsb>  output store (required unless --dry-run)
   --dry-run               print the audit and manifest, write nothing
-  --allow-lockbox         permit labelled rows in 2026H2 (final test only)
+  --allow-lockbox         permit labelled rows in the guarded box: --locked-test, else 2026H2 for undeclared data (final test only)
   --locked-test START,END|none
                           protocol locked test written to <out>.manifest.json; a
                           rebuild of a declared output must repeat it (exit 2)

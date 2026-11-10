@@ -249,7 +249,7 @@ Decodes the 15m archives and writes the symbol-major hourly base store `base_h1.
 * Duplicate instants follow the `panel_prep` policy. Identical copies collapse to one bar and `dup_rows` counts the source rows. Differing copies aggregate once (open first, high max, low min, close last, flows summed), set `DUPLICATE_CONFLICT` (flag bit 2) and are listed with symbol and timestamp in the manifest.
 * An hour is complete only with four contiguous 15m bars (`cov15m == 4`). A partial hour is dropped and counted (`--require-full-bucket`, the default). With `--keep-partial` it is written with `cov15m` 1 to 3 and `PARTIAL_BUCKET` (flag bit 1).
 * `gap` is the number of missing hourly buckets since the previous written bucket of the symbol.
-* The lockbox guard refuses an archive whose month intersects `[2026-07-01, 2027-01-01)` before it is decoded, and refuses decoded rows in it. `--interval 1m` is accepted only so that the guard fires first; the fold is defined for 15m bars. `--allow-lockbox` is the only override.
+* The lockbox guard refuses an archive whose month intersects the guarded box before it is decoded, and refuses decoded rows in it. The box is the declared `--locked-test` range, else the legacy `[2026-07-01, 2027-01-01)` for undeclared data (see "The 2026H2 lockbox"). `--interval 1m` is accepted only so that the guard fires first; the fold is defined for 15m bars. `--allow-lockbox` is the only override.
 * `--resume <dir>` writes one atomic cache file per symbol keyed by the SHA-256 of its archives and the settings. A warm run decodes nothing and writes a byte-identical store.
 
 Columns: `ts symbol open high low close volume quote_volume trades taker_buy_base taker_buy_quote cov15m gap flags traded dup_rows archive_unit`.
@@ -363,6 +363,28 @@ evaluate:
 | `rcsr --cv` (cross-validation) | any table row in 2026H2, because folds are not the split |
 | `rcsr prep --label` | labelled rows in the output |
 | `rcsr panel audit` / `rcsr audit` | read-only: the `lockbox` coverage block is reported, never scored |
+
+Which box the guard covers depends on the data. Resolution order for a builder,
+validator or runner:
+
+1. The declared locked test: `--locked-test START,END` of the writer (or
+   `--lockbox` of a runner), else the range in the store's sidecar, manifest or
+   schema (`locked_test`, plus `locked_test_also`). It replaces the 2026H2
+   literal. A `--retired` record that covers the protocol default drops the
+   default from the guard; the 2026H2 literal is not added.
+2. The 2026H2 literal `[2026-07-01, 2027-01-01)` only for undeclared data. Its
+   refusal text and exit code are unchanged.
+
+A declared lock turns archive months and rows after the legacy box into
+development data: `rcsr panel base --locked-test 2027-01-01,2027-07-01` accepts
+the months 2026-07 to 2026-12 without `--allow-lockbox`. The same input with
+`--locked-test 2026-07-01,2027-07-01` is refused, and the message names the
+declared lock and where it came from (`declared lock 2026-07-01..2027-07-01 from
+--locked-test`). `rcsr panel validate` V11 counts the rows inside the declared
+lock of the store (`locked_test`), else inside the legacy box; its detail names
+the source.
+
+`rcsr enrich --label` applies the 2026H2 check to undeclared data only. A declared locked test replaces it: enrich keeps the rows of the declared range out of the label statistics and the runners refuse to read them.
 
 `--allow-lockbox` is the only override; it is for one declared final test, not
 routine runs. `rcsr walkforward` echoes it in its JSON as

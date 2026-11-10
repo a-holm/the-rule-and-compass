@@ -440,7 +440,7 @@ pub fn snapshot_text_with(input: &str, jobs: usize, symbols: Option<&SymbolList>
     let root = PathBuf::from(input);
     let (sources, universe) = discover(input, symbols)?;
     let scans = parallel(sources, jobs, |s| scan_file(&root, &s))?;
-    let lb = Lockbox::crypto_2026h2();
+    let lb = crate::lockbox::guarded_range(None);
     let mut s = String::from("{\n");
     let _ = writeln!(s, "  \"tool\":\"rcsr panel snapshot\",\n  \"source\":\"local archive\",\n  \"network\":false,");
     let total_bytes: u64 = scans.iter().map(|f| f.bytes).sum();
@@ -1199,7 +1199,7 @@ pub fn build_base(opts: &BaseOptions) -> Result<BaseSummary, String> {
     let (sources, universe) = discover(&opts.input, opts.symbols.as_ref())?;
     let declared = crate::lockbox::output_declaration(&opts.out, None, opts.locked_test).map_err(|e| e.message)?;
     let retired = crate::retire::writer_retirement(opts.retired.as_deref(), declared.as_ref(), &[]).map_err(|e| e.message)?;
-    let guard = Guard::new(opts.allow_lockbox, None);
+    let guard = Guard::for_writer(declared.as_ref(), None, opts.locked_test.origin(), opts.allow_lockbox);
     guard_archive_names(&sources, &guard, "panel base")?;
     if opts.interval_seconds != IN_STEP {
         return Err(format!(
@@ -1264,7 +1264,7 @@ pub fn build_base(opts: &BaseOptions) -> Result<BaseSummary, String> {
         return Err("panel base: no complete hourly bucket was produced".to_string());
     }
     store::write_store_with_time(&opts.out, &table, opts.group_rows, Some(0))?;
-    let mut text = base_manifest(opts, &syms, &inputs, &overlap, guard.allow, &route, universe.as_ref());
+    let mut text = base_manifest(opts, &syms, &inputs, &overlap, &guard, &route, universe.as_ref());
     if let Some(lt) = &declared {
         text = crate::lockbox::insert_declaration(&text, lt, None, None, "rcsr panel base --locked-test");
     }
@@ -1354,7 +1354,7 @@ fn base_manifest(
     syms: &[BaseSymbol],
     inputs: &[(String, String, u64)],
     overlap: &crate::lockbox::Overlap,
-    allowed: bool,
+    guard: &Guard,
     route: &DeviceRoute,
     universe: Option<&Universe>,
 ) -> String {
@@ -1447,8 +1447,7 @@ fn base_manifest(
     let _ = writeln!(s, "  \"conflicts\":[{}],", conflicts.join(","));
     let _ = writeln!(s, "  \"invalid_ohlc\":[{}],", invalid.join(","));
     let _ = writeln!(s, "  \"unit_histogram\":[{}],", units.join(","));
-    let lb = Lockbox::crypto_2026h2();
-    let _ = writeln!(s, "  \"lockbox\":{},", lb.json(overlap, allowed, false, false));
+    let _ = writeln!(s, "  \"lockbox\":{},", guard.lockbox.json(overlap, guard.allow, false, false));
     let sha = manifest::sha256_file(&opts.out).unwrap_or_else(|_| "unknown".to_string());
     let bytes = std::fs::metadata(&opts.out).map(|m| m.len()).unwrap_or(0);
     let _ = writeln!(s, "  \"output\":{{\"path\":{},\"sha256\":{},\"bytes\":{}}}", jstr(&opts.out), jstr(&sha), bytes);
@@ -1935,7 +1934,7 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
     let retired = crate::retire::writer_retirement(opts.retired.as_deref(), declared.as_ref(), &[&opts.base]).map_err(|e| e.message)?;
     let membership = panel::read_membership(&opts.membership)?;
     let series = read_base(&opts.base)?;
-    let guard = Guard::new(opts.allow_lockbox, None);
+    let guard = Guard::for_writer(declared.as_ref(), also.as_ref(), opts.locked_test.origin(), opts.allow_lockbox);
     let all_times: Vec<i64> = series.values().flat_map(|(b, _)| b.iter().map(|x| x.time)).collect();
     guard.check_times("panel build", &all_times)?;
     let asm = assemble(&series, &membership, opts, None, opts.gpu)?;
@@ -1985,7 +1984,7 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
         .ok()
         .and_then(|t| manifest::object(&t, "quality").map(|s| s.to_string()));
     let invalid_ohlc = base_quality.as_deref().map(|b| int_field(b, "invalid_ohlc")).unwrap_or(0);
-    let mut text = panel::provenance_json_with(
+    let mut text = panel::provenance_json_boxed(
         &[&opts.base, &opts.membership],
         &BTreeMap::new(),
         &membership,
@@ -1993,6 +1992,7 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
         &opts.out,
         opts.allow_lockbox,
         snapshot_text.as_deref(),
+        &guard.lockbox,
     );
     let block = v2_block(opts, &asm, &q, invalid_ohlc, base_quality.as_deref(), ledger_misses);
     let marker = "  \"output\":";
@@ -2192,6 +2192,26 @@ fn check(id: &'static str, name: &'static str, violations: usize, detail: impl I
     Check { id, name, status: if violations == 0 { "pass" } else { "fail" }, violations, detail: detail.into() }
 }
 
+/// V11: no row inside the locked test the store declares (sidecar, manifest or
+/// schema), else inside the legacy 2026H2 box. The detail names the source.
+fn v11_check(panel_path: &str, ts: &[i64]) -> Check {
+    const NAME: &str = "zero lockbox rows";
+    let (boxes, detail) = match crate::lockbox::stored_all(panel_path) {
+        Ok(Some(s)) => {
+            let boxes: Vec<Lockbox> = std::iter::once(s.range).chain(s.also).collect();
+            let detail = format!("declared lock {} ({})", s.describe(), s.file);
+            (boxes, detail)
+        }
+        Ok(None) => {
+            let lb = crate::lockbox::guarded_range(None);
+            (vec![lb], format!("legacy default {} (no declared lock)", crate::lockbox::span(&lb)))
+        }
+        Err(e) => return check("V11", NAME, 1, e.message),
+    };
+    let v11 = ts.iter().filter(|t| boxes.iter().any(|b| b.contains(**t))).count();
+    check("V11", NAME, v11, detail)
+}
+
 fn skipped(id: &'static str, name: &'static str, why: &str) -> Check {
     Check { id, name, status: "skipped", violations: 0, detail: why.to_string() }
 }
@@ -2385,9 +2405,7 @@ pub fn validate(opts: &ValidateOptions) -> Report {
     }
 
     // V11
-    let lb = Lockbox::crypto_2026h2();
-    let v11 = ts.iter().filter(|t| lb.contains(**t)).count();
-    rep.checks.push(check("V11", "zero lockbox rows", v11, ""));
+    rep.checks.push(v11_check(&opts.panel, &ts));
 
     // V12
     match &opts.membership {

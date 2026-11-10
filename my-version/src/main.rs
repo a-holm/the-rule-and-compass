@@ -8106,7 +8106,7 @@ fn main() {
             let lockbox_json = {
                 let lockbox = match &spec.declared_lockbox {
                     Some(d) => d.lockbox,
-                    None => rcsr::lockbox::Lockbox::crypto_2026h2(),
+                    None => rcsr::lockbox::guarded_range(None),
                 };
                 let times: Vec<i64> = match data::lockbox_stamps(&table, &spec) {
                     Ok(Some((_, keys))) => keys
@@ -12002,6 +12002,7 @@ fn run_walkforward(args: &[String]) -> ! {
     // stays sealed until its own sealed read.
     popts.locked_ranges = resolved.ranges().iter().skip(usize::from(locked_test)).map(|r| (r.start, r.end)).collect();
     popts.locked_embargo = resolved.embargo.seconds;
+    popts.declared_lock = resolved.declared();
     if declared_lock.is_none() && (ledger_path.is_some() || locked_test) {
         eprintln!("error: --ledger and --locked-test need a locked test range: drop --lockbox none");
         std::process::exit(EXIT_USAGE);
@@ -12646,7 +12647,8 @@ fn run_audit(args: &[String]) -> ! {
     // #145: the leakage audit is read-only; it reports lockbox coverage rather
     // than refusing, but uses the same central guard's overlap counter.
     let mut report = time_report;
-    let lockbox_coverage = rcsr::lockbox::Guard::default().overlap(
+    let audit_guard = rcsr::lockbox::Guard::for_run(resolved.declared().as_ref(), false);
+    let lockbox_coverage = audit_guard.overlap(
         panel.time.iter().filter(|v| v.is_finite()).map(|v| *v as i64),
     );
     report.merge(leakage::audit_panel(&panel, &target, horizon));
@@ -12942,7 +12944,7 @@ fn run_audit(args: &[String]) -> ! {
         ta.max_dt,
         ta.duplicate_instants,
         ta.non_monotonic_rows,
-        rcsr::lockbox::Lockbox::crypto_2026h2().json(
+        audit_guard.lockbox.json(
             &lockbox_coverage,
             false,
             false,
