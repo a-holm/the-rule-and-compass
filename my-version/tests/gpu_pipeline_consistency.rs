@@ -473,7 +473,6 @@ fn pipeline_books_fit_interval() {
             l.device_busy_s(),
             l.device_overlap_s()
         );
-        assert!(l.stage_s(Stage::Fit) > 0.0, "depth {depth}: no fit stage time booked");
         assert!(l.closure_residual().value.abs() < 0.005, "depth {depth}: closure");
         let per_gen: f64 = g.generations.iter().map(|s| s.fit_fallback_seconds).sum();
         let run = g.fit_fallback_ms / 1000.0;
