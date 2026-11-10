@@ -187,53 +187,131 @@ impl Lockbox {
 }
 
 /// The one guard every runner uses.
+///
+/// Without a declaration the guard covers the legacy 2026H2 box. A declared lock
+/// (flag, store sidecar) replaces that box; the legacy literal is never added
+/// to a declaration.
 #[derive(Clone, Debug)]
 pub struct Guard {
     pub lockbox: Lockbox,
+    /// A second declared range (`locked_test_also`).
+    pub also: Option<Lockbox>,
+    /// Where the box came from: `None` for the legacy default, else a label such as
+    /// `--locked-test` or `store sidecar`.
+    pub origin: Option<String>,
     /// Explicit final-test override (`--allow-lockbox`).
     pub allow: bool,
     /// Free-text declaration echoed with the override (e.g. `final-2026h2`).
     pub declaration: Option<String>,
+    /// A declared lock is enforced elsewhere (the run reads it under its own
+    /// purge and embargo rules); the guard only reports its rows.
+    report_only: bool,
 }
 
 impl Default for Guard {
     fn default() -> Self {
-        Guard {
-            lockbox: Lockbox::crypto_2026h2(),
-            allow: false,
-            declaration: None,
-        }
+        Guard::new(false, None)
     }
 }
 
 impl Guard {
+    /// The legacy 2026H2 box, for data that declares no locked test.
     pub fn new(allow: bool, declaration: Option<String>) -> Self {
         Guard {
             lockbox: Lockbox::crypto_2026h2(),
+            also: None,
+            origin: None,
             allow,
             declaration,
+            report_only: false,
+        }
+    }
+
+    /// The guard of a writer: the declared range and its second range, else the
+    /// legacy box. `origin` names the declaring flag or file.
+    pub fn for_writer(declared: Option<&Lockbox>, also: Option<&Lockbox>, origin: &str, allow: bool) -> Self {
+        match declared {
+            Some(l) => Guard {
+                lockbox: *l,
+                also: also.copied(),
+                origin: Some(origin.to_string()),
+                allow,
+                declaration: None,
+                report_only: false,
+            },
+            None => Guard::new(allow, None),
+        }
+    }
+
+    /// The guard of a run whose resolved locked test is `declared`. A flag or a
+    /// store declaration replaces the legacy box and is enforced by the run's own
+    /// declared-range check, so this guard only reports rows; the protocol
+    /// default and `--lockbox none` keep the legacy box.
+    pub fn for_run(declared: Option<&Declared>, allow: bool) -> Self {
+        match declared.filter(|d| d.strict()) {
+            Some(d) => Guard {
+                lockbox: d.lockbox,
+                also: d.also,
+                origin: Some(d.origin().to_string()),
+                allow,
+                declaration: None,
+                report_only: true,
+            },
+            None => Guard::new(allow, None),
+        }
+    }
+
+    fn boxes(&self) -> impl Iterator<Item = &Lockbox> {
+        std::iter::once(&self.lockbox).chain(self.also.iter())
+    }
+
+    fn describe(&self, l: &Lockbox) -> String {
+        match &self.origin {
+            None => format!("[{}, {}) (2026H2)", l.start, l.end),
+            Some(o) => format!("[{}, {}) (declared lock {} from {})", l.start, l.end, span(l), o),
         }
     }
 
     /// Refuse a named half-open window unless the override is set.
     pub fn check(&self, what: &str, start: i64, end: i64) -> Result<(), String> {
-        if self.allow {
+        if self.allow || self.report_only {
             return Ok(());
         }
-        self.lockbox
-            .check(start, end)
-            .map_err(|e| format!("{}: {}", what, e))
+        for l in self.boxes() {
+            if start < l.end && end > l.start {
+                return Err(format!(
+                    "{}: window [{}, {}) overlaps the lockbox {}; \
+                     lock the holdout and use --allow-lockbox only for a declared final test",
+                    what,
+                    start,
+                    end,
+                    self.describe(l)
+                ));
+            }
+        }
+        Ok(())
     }
 
-    /// Refuse a row set if any timestamp is inside the lockbox.
+    /// Refuse a row set if any timestamp is inside the lockbox. The returned
+    /// coverage is that of the primary box.
     pub fn check_times(&self, what: &str, times: &[i64]) -> Result<Overlap, String> {
         let overlap = self.lockbox.overlap(times.iter().copied());
-        if overlap.overlaps() && !self.allow {
-            return Err(format!(
-                "{}: {} row(s) in [{}, {}) overlap the lockbox [{}, {}) (2026H2); \
-                 lock the holdout and use --allow-lockbox only for a declared final test",
-                what, overlap.rows, overlap.first_ts, overlap.last_ts, self.lockbox.start, self.lockbox.end
-            ));
+        if self.allow || self.report_only {
+            return Ok(overlap);
+        }
+        for l in self.boxes() {
+            let o = l.overlap(times.iter().copied());
+            if o.overlaps() {
+                return Err(format!(
+                    "{}: {} row(s) in [{}, {}) overlap the lockbox {}; \
+                     lock the holdout and use --allow-lockbox only for a declared final test",
+                    what,
+                    o.rows,
+                    o.first_ts,
+                    o.last_ts,
+                    self.describe(l)
+                ));
+            }
         }
         Ok(overlap)
     }
@@ -246,6 +324,12 @@ impl Guard {
     {
         self.lockbox.overlap(times)
     }
+}
+
+/// The range a manifest or report names as the guarded box: the declared one,
+/// else the legacy 2026H2 box for undeclared data.
+pub fn guarded_range(declared: Option<&Lockbox>) -> Lockbox {
+    declared.copied().unwrap_or_else(Lockbox::crypto_2026h2)
 }
 
 /// Where the lookback embargo of a run came from.
@@ -977,6 +1061,14 @@ pub enum Keep {
 }
 
 impl Keep {
+    /// The label a writer guard names for a declaration: the flag when it gave the range, else the file that declared it.
+    pub fn origin(self) -> &'static str {
+        match self {
+            Keep::Range(_) => "--locked-test",
+            _ => "store sidecar",
+        }
+    }
+
     pub fn parse(s: &str) -> Result<Keep, String> {
         if s.trim().eq_ignore_ascii_case("none") {
             Ok(Keep::Remove)
@@ -1319,6 +1411,57 @@ mod tests {
         let o = g.check_times("training split", &times).unwrap();
         assert_eq!(o.rows, 1);
         assert!(g.check("test window 'h2'", LOCKBOX_START, LOCKBOX_END).is_ok());
+    }
+
+    fn forward() -> Lockbox {
+        Lockbox::parse("2027-01-01,2027-07-01").unwrap()
+    }
+
+    #[test]
+    fn writer_guard_resolves_declared_before_the_legacy_literal() {
+        let dev = [LOCKBOX_START + 10, LOCKBOX_END - 10];
+        let inside = [forward().start + 5];
+        let g = Guard::for_writer(Some(&forward()), None, "--locked-test", false);
+        assert_eq!(g.lockbox, forward());
+        assert!(g.check_times("panel base", &dev).is_ok(), "rows after the legacy box are development data");
+        let err = g.check_times("panel base", &inside).unwrap_err();
+        assert!(err.contains("declared lock 2027-01-01..2027-07-01 from --locked-test"), "{}", err);
+        assert!(Guard::for_writer(Some(&forward()), None, "--locked-test", true).check_times("panel base", &inside).is_ok());
+        assert!(g.check("archive", forward().start - 10, forward().start + 10).is_err());
+        assert!(g.check("archive", LOCKBOX_START, LOCKBOX_END).is_ok());
+
+        let legacy = Guard::for_writer(None, None, "--locked-test", false);
+        assert_eq!(legacy.lockbox, Lockbox::crypto_2026h2());
+        assert!(legacy.origin.is_none());
+        assert!(legacy.check_times("panel base", &dev).unwrap_err().contains("(2026H2)"));
+    }
+
+    #[test]
+    fn writer_guard_covers_the_second_declared_range() {
+        let default = protocol_default();
+        let g = Guard::for_writer(Some(&forward()), Some(&default), "store sidecar", false);
+        let err = g.check_times("panel build", &[default.start + 1]).unwrap_err();
+        assert!(err.contains("store sidecar") && err.contains("2025-07-01..2026-07-01"), "{}", err);
+        assert!(g.check("archive", LOCKBOX_START, LOCKBOX_END).is_ok());
+    }
+
+    #[test]
+    fn run_guard_reports_a_declared_lock_and_keeps_the_legacy_box_for_the_default() {
+        let declared = |source| Declared { lockbox: forward(), source, also: None, embargo: Embargo::none() };
+        let g = Guard::for_run(Some(&declared("store")), false);
+        assert_eq!(g.lockbox, forward());
+        let o = g.check_times("test split", &[forward().start + 1, 5]).unwrap();
+        assert_eq!(o.rows, 1, "the declared range is read by its own check, the guard only reports");
+        let g = Guard::for_run(Some(&declared("protocol_default")), false);
+        assert_eq!(g.lockbox, Lockbox::crypto_2026h2());
+        assert!(g.check_times("test split", &[LOCKBOX_START + 1]).is_err());
+        assert_eq!(Guard::for_run(None, false).lockbox, Lockbox::crypto_2026h2());
+    }
+
+    #[test]
+    fn guarded_range_is_the_declaration_or_the_legacy_box() {
+        assert_eq!(guarded_range(Some(&forward())), forward());
+        assert_eq!(guarded_range(None), Lockbox::crypto_2026h2());
     }
 
     #[test]

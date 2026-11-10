@@ -129,7 +129,7 @@ fn lockbox_declared_overlap_refused() {
     let raw = s(&archive(&dir, &all_months()));
     let out = s(&dir.join("base.rcsb"));
     let (code, _, err) = rcsr(&base_args(&raw, &out, &["--locked-test", OVERLAPPING]));
-    assert_eq!(code, 2, "{err}");
+    assert_eq!(code, 3, "{err}");
     assert!(err.contains("2026-07-01..2027-07-01") && err.contains("--locked-test"), "{err}");
     assert!(!Path::new(&out).exists());
     let (code, _, err) = rcsr(&base_args(&raw, &out, &["--locked-test", OVERLAPPING, "--allow-lockbox"]));
@@ -141,7 +141,7 @@ fn lockbox_declared_overlap_refused() {
     let panel = s(&dir.join("panel.rcsb"));
     let build = ["panel", "build", "--data", &out, "--membership", &s(&m), "--out", &panel];
     let (code, _, err) = rcsr(&build);
-    assert_eq!(code, 2, "{err}");
+    assert_eq!(code, 3, "{err}");
     assert!(err.contains("declared lock"), "{err}");
     let mut allowed = build.to_vec();
     allowed.push("--allow-lockbox");
@@ -152,7 +152,7 @@ fn lockbox_declared_overlap_refused() {
     let fam = s(&dir.join("fam.rcsb"));
     let enrich = ["enrich", "--data", &out, "--out", &fam, "--cpu", "--features", "r1", "--label", "long:1h,name=h1,fee=10,vol=20"];
     let (code, _, err) = rcsr(&enrich);
-    assert_eq!(code, 2, "{err}");
+    assert_eq!(code, 3, "{err}");
     assert!(err.contains("declared lock"), "{err}");
 }
 
@@ -162,7 +162,7 @@ fn lockbox_legacy_default_unchanged() {
     let raw = s(&archive(&dir, &all_months()));
     let out = s(&dir.join("base.rcsb"));
     let (code, _, err) = rcsr(&base_args(&raw, &out, &[]));
-    assert_eq!(code, 2, "{err}");
+    assert_eq!(code, 3, "{err}");
     let file = dir.join("raw/AAAUSDT/AAAUSDT-15m-2026-07.zip");
     let want = format!(
         "error: panel base ({}): window [1782864000, 1785542400) overlaps the lockbox [1782864000, 1798761600) (2026H2); \
@@ -218,7 +218,7 @@ fn lockbox_retired_drops_literal() {
     // the same record does not free a lock that still covers the data
     let again = s(&dir.join("again.rcsb"));
     let (code, _, err) = rcsr(&base_args(&raw, &again, &["--locked-test", OVERLAPPING, "--retired", &record]));
-    assert_eq!(code, 2, "{err}");
+    assert_eq!(code, 3, "{err}");
 }
 
 fn validate(panel: &Path) -> panel_v2::Report {

@@ -1115,6 +1115,29 @@ pub fn provenance_json_with(
     allow_lockbox: bool,
     snapshot: Option<&str>,
 ) -> String {
+    provenance_json_boxed(
+        inputs,
+        known,
+        membership,
+        panel,
+        output,
+        allow_lockbox,
+        snapshot,
+        &crate::lockbox::guarded_range(None),
+    )
+}
+
+/// [`provenance_json_with`] naming `lb`, the box the builder guarded, in the lockbox block.
+pub fn provenance_json_boxed(
+    inputs: &[&str],
+    known: &BTreeMap<String, String>,
+    membership: &Membership,
+    panel: &Panel,
+    output: &str,
+    allow_lockbox: bool,
+    snapshot: Option<&str>,
+    lb: &Lockbox,
+) -> String {
     let mut s = String::from("{\n");
     let _ = writeln!(s, "  \"tool\":\"rcsr panel\",");
     let _ = writeln!(s, "  \"inputs\":[");
@@ -1185,7 +1208,6 @@ pub fn provenance_json_with(
     // #145: record what the builder retained. A panel may contain the holdout
     // for provenance; the flag says whether an explicit final test permitted
     // it, and `evaluated` stays false because building is not scoring.
-    let lb = Lockbox::crypto_2026h2();
     let overlap = lb.overlap(panel.rows.iter().map(|r| r.bar.time));
     let _ = writeln!(
         s,
@@ -1894,7 +1916,7 @@ pub fn run(args: &[String]) -> ! {
             if panel.rows.is_empty() {
                 fail("panel audit range selects no rows");
             }
-            let lb = Lockbox::crypto_2026h2();
+            let lb = crate::lockbox::guarded_range(None);
             let coverage = lb.overlap(panel.rows.iter().map(|r| r.bar.time));
             println!(
                 "# panel: rows={} symbols={} delisted={} gaps={} span={}..{}",
@@ -2074,7 +2096,7 @@ BUILD / AUDIT:
                           for an hourly panel, 900 for 15m)
   --start <epoch|date>    build window start (default: panel first bar)
   --end <epoch|date>      build window end (default: panel last bar)
-  --allow-lockbox         permit a window overlapping 2026H2 (declared final test only)
+  --allow-lockbox         permit a window inside the guarded box (declared final test only)
   --locked-test <START,END>
                           build (hourly v2): declare the protocol locked test (UTC,
                           half-open) in <out>.manifest.json and <out>.schema.json;
@@ -2089,7 +2111,7 @@ BUILD / AUDIT:
   --strict               audit: exit 3 on a level jump that is not declared (--relist) or
                           a listing break (gap over --listing-gap-days, default 30)
 
-`build` refuses 2026H2 by default. Every row is a real bar: delisted symbols
+`build` refuses the guarded box by default: the --locked-test range or the store declaration, else 2026H2 for undeclared data. Every row is a real bar: delisted symbols
 stop at their last bar, listings start at their first, and no value is
 forward-filled across a listing/delisting/migration boundary. `audit` reports
 splices, level jumps, long gaps, per-year symbol counts and delisted names.
@@ -2130,7 +2152,7 @@ HOURLY V2 PANEL (#259):
   --outage-share <x>      build: share of the cross-section missing for a venue outage (0.5)
   --replay <n>            validate: prefix-causality cuts (3)
   `build` uses the v2 builder when --data has a cov15m column. `validate` exits 3
-  when a check fails. A 2026H2 archive or row is refused without --allow-lockbox.
+  when a check fails. An archive or row inside the guarded box (the declared lock, else 2026H2 for undeclared data) is refused without --allow-lockbox. V11 counts rows in the declared lock of the store.
 
 REGISTRY SCHEMA AND FAMILY APPEND (#260):
   `build` and `append` write <panel>.schema.json: one entry per column with family,

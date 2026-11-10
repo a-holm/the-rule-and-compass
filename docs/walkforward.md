@@ -209,8 +209,9 @@ The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA
 * Rows sharing a timestamp are equal-weighted, exactly as in the pilot: the
   period return is the mean net return over the groups present at that
   timestamp. With no `--group-by` the whole table is one series.
-* Every window is checked against the 2026H2 lockbox
-  `[2026-07-01, 2027-01-01)`, on **both** sides: a training range inside the
+* Every window is checked against the guarded box on **both** sides: the declared
+  locked test (`--lockbox`, the store sidecar), else for undeclared data the 2026H2 lockbox
+  `[2026-07-01, 2027-01-01)`. A training range inside the
   holdout is refused even when the test block is in 2027. `--allow-lockbox` is
   the only override (declared final test only) and is echoed as
   `"lockbox": {"permitted": true, ...}` in the JSON report. The same
