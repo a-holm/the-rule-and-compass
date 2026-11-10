@@ -26,6 +26,7 @@ bin-rcsr-launch      *  no-cuda-app-only  CPU-only tests; no CUDA call; the bina
 bin-rcsr-rss         *  no-cuda-app-only  no tests in this binary: the harness runs 0 tests and makes no CUDA call; the binary spawns processes, so memcheck runs with --target-processes application-only (#910)
 bin-rcsr_serve         *  no-cuda  no tests in this binary: the harness runs 0 tests and makes no CUDA call
 conflict_markers       *  no-cuda-app-only  git children, no CUDA call; memcheck runs with --target-processes application-only because the binary spawns processes and the default all crashes the sanitizer on a process tree (#910)
+build_rerun           *  no-cuda-app-only  git and cargo children, no CUDA call; memcheck runs with --target-processes application-only because the binary spawns processes and the default all crashes the sanitizer on a process tree (#910)
 cpu_bench              *  no-cuda-app-only  the cpu_bench child runs CPU code only; no CUDA call; memcheck runs with --target-processes application-only because the binary spawns processes and the default all crashes the sanitizer on a process tree (#910)
 cuda_kernel_args       *  no-cuda  text lint of src/cuda sources; no CUDA call
 cv                     *  no-cuda  CPU-only tests; no CUDA call
