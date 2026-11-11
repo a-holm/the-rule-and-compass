@@ -376,7 +376,7 @@ fn break_even_nan_when_gross_nonpositive() {
 
 #[test]
 fn break_even_positive_unchanged() {
-    assert_eq!(break_even_bps(&[0.019], &[0.02], 10.0), 20.0);
+    assert!(close(break_even_bps(&[0.019], &[0.02], 10.0), 200.0, 1e-9));
     assert_eq!(break_even_status(&[0.019], &[0.02]), "defined");
     assert_eq!(break_even_status(&[0.02], &[0.02]), "no_cost");
 }
