@@ -2785,6 +2785,7 @@ fn run_fallback_fit(
         let dev = exact_error(&device, x, y, w, metric);
         if dev.is_finite() && (cpu.is_nan() || dev < cpu) {
             job.tree = device;
+            job.device_kept = true;
         }
     }
 }

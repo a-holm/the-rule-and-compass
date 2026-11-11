@@ -4084,7 +4084,19 @@ fn main() {
                 saved.fit_polish.name()
             ));
         }
-        let _ = fit_max_iters_set;
+        // #1042: compared as budgets, so `0` and `4 * fit_iters` agree.
+        if fit_max_iters_set {
+            let fit_iters = if fit_iters_set { cfg.fit_iters } else { saved.fit_iters };
+            let had = saved.fit_max_iters_effective();
+            if cfg.fit_max_iters != 0 && cfg.fit_max_iters < fit_iters {
+                conflicts.push(format!(
+                    "--fit-max-iters must be at least --fit-iters ({} < {})",
+                    cfg.fit_max_iters, fit_iters
+                ));
+            } else if search::fit_max_iters_budget(fit_iters, cfg.fit_max_iters) != had {
+                conflicts.push(format!("--fit-max-iters {} (saved {})", cfg.fit_max_iters, had));
+            }
+        }
         if fit_fallback_max_set && cfg.fit_fallback_max != saved.fit_fallback_max {
             conflicts.push(format!(
                 "--fit-fallback-max {} (saved {})",
