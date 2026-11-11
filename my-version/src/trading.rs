@@ -602,7 +602,7 @@ pub struct PathStats {
     /// Fraction of rows with a position.
     pub exposure: f64,
     pub hit_rate: f64,
-    /// Per-side cost at which `net_pnl` is zero.
+    /// Per-side cost at which `net_pnl` is zero. NaN when `gross_pnl <= 0`.
     pub break_even_bps: f64,
     pub cash: Headline,
     pub buy_and_hold: Headline,
@@ -946,7 +946,7 @@ fn finish(ctx: &Ctx, positions: &[f64], spec: &TradingSpec) -> Result<PathStats,
         .collect();
 
     let gross_pnl = book.gross.iter().sum::<f64>();
-    let break_even_bps = if book.abs_delta_with_exit > 0.0 {
+    let break_even_bps = if book.abs_delta_with_exit > 0.0 && gross_pnl > 0.0 {
         gross_pnl / book.abs_delta_with_exit / BP
     } else {
         f64::NAN
