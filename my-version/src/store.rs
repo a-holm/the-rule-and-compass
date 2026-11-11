@@ -848,6 +848,21 @@ impl FileStore {
         int_scratch: &mut Vec<i64>,
         byte_scratch: &mut Vec<u8>,
     ) -> Result<ProjectedReadStats, String> {
+        self.read_group_projected_impl(group, projection, out, int_scratch, byte_scratch, None)
+    }
+
+    /// Shared body of the projected group read. With `keep`, the exact `i64`
+    /// block of every `I64` column is appended in projection order, so the
+    /// time column is read once.
+    fn read_group_projected_impl(
+        &self,
+        group: usize,
+        projection: &Projection,
+        out: &mut [f64],
+        int_scratch: &mut Vec<i64>,
+        byte_scratch: &mut Vec<u8>,
+        mut keep: Option<&mut Vec<Vec<i64>>>,
+    ) -> Result<ProjectedReadStats, String> {
         if group >= self.header.n_groups() {
             return Err(format!(
                 "{}: group {} is out of range ({} groups)",
@@ -879,6 +894,9 @@ impl FileStore {
                 }
                 DType::I64 => {
                     read_i64_block(&self.file, &self.path, off, int_scratch, byte_scratch)?;
+                    if let Some(k) = keep.as_deref_mut() {
+                        k.push(int_scratch.clone());
+                    }
                     for (dst, &v) in out[lo..hi].iter_mut().zip(int_scratch.iter()) {
                         *dst = if v == i64::MIN { f64::NAN } else { v as f64 };
                     }
