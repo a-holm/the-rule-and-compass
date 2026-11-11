@@ -202,13 +202,16 @@ fn write_spec(dir: &Path, horizon_seconds: u64) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Two groups, `n` rows each, spaced by `step` seconds, shared timestamps.
+/// Two groups, hourly rows for `n` steps of `step` seconds; only every `step`-th stamp carries a
+/// label, the rest are unlabelled like the rows between the stamps of a strided label.
 fn write_csv(dir: &Path, step: u64, n: usize) -> String {
+    let per = (step / 3600) as usize;
     let mut text = String::from("t,sym,x,y\n");
-    for i in 0..n {
+    for h in 0..(n * per) {
         for g in 0..2usize {
-            let t = T0 as u64 + step * i as u64;
-            text.push_str(&format!("{t},s{g},{},{}\n", feature(i, g), ret(i, g)));
+            let t = T0 as u64 + 3600 * h as u64;
+            let y = if h % per == 0 { format!("{}", ret(h / per, g)) } else { "nan".to_string() };
+            text.push_str(&format!("{t},s{g},{},{y}\n", feature(h / per, g)));
         }
     }
     let path = dir.join(format!("d{step}.csv"));
