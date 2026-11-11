@@ -417,7 +417,7 @@ impl Fixture {
     /// `--reselect-run` of a hand-written front under the edge fixture's fitness flags.
     fn reselect_front(&self, front: &str, tag: &str, extra: &[&str]) -> Output {
         let out = self.path(&format!("{tag}.run.json"));
-        let mut args = vec!["--reselect-run", front, "--json-out", out.as_str(), "--no-dev-log"];
+        let mut args = vec!["--reselect-run", front, "--json-out", out.as_str(), "--no-dev-log", "--select-rule", "validation_objective"];
         args.extend_from_slice(EDGE_FIT);
         args.extend_from_slice(extra);
         self.rcsr(&self.data, &args)
