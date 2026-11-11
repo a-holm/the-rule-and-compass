@@ -359,3 +359,24 @@ fn min_btl_matches_the_formula() {
     assert!(close(min_btl_years(2.0, 30.0), e * e / 4.0, 1e-12));
     assert!(min_btl_years(-0.5, 30.0).is_nan());
 }
+
+#[test]
+fn break_even_nan_when_gross_nonpositive() {
+    let gross = [-0.01, 0.0];
+    let net = [-0.011, -0.001];
+    assert!(break_even_bps(&net, &gross, 10.0).is_nan());
+    assert_eq!(break_even_status(&net, &gross), "gross_nonpositive");
+    // g == 0 exactly with a cost paid.
+    assert!(break_even_bps(&[-0.001], &[0.0], 10.0).is_nan());
+    assert_eq!(break_even_status(&[-0.001], &[0.0]), "gross_nonpositive");
+    // g == 0 exactly and no cost: no_cost takes precedence.
+    assert!(break_even_bps(&[0.0], &[0.0], 10.0).is_nan());
+    assert_eq!(break_even_status(&[0.0], &[0.0]), "no_cost");
+}
+
+#[test]
+fn break_even_positive_unchanged() {
+    assert!(close(break_even_bps(&[0.019], &[0.02], 10.0), 200.0, 1e-9));
+    assert_eq!(break_even_status(&[0.019], &[0.02]), "defined");
+    assert_eq!(break_even_status(&[0.02], &[0.02]), "no_cost");
+}
