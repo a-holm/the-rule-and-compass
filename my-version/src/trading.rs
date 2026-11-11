@@ -29,8 +29,6 @@ use crate::trading_gpu;
 use crate::walkforward::{self, CrossSection, Metrics, Stats, SECONDS_PER_YEAR};
 use std::collections::BTreeMap;
 
-pub const SECONDS_PER_DAY: f64 = 86_400.0;
-
 /// Per-side costs, in basis points, at which the cost ladder re-prices the book.
 pub const LADDER_BPS: [f64; 5] = [0.0, 5.0, 10.0, 20.0, 50.0];
 
@@ -380,9 +378,12 @@ pub struct TradingSpec {
     pub tau: Option<f64>,
     pub max_position: f64,
     pub position: PositionMap,
-    /// Override of the annualisation. `None` compounds sub-daily periods per
-    /// day and uses 365.
+    /// Override of the annualisation. `None` derives it from `period_seconds`,
+    /// else from the median step of the period stamps.
     pub periods_per_year: Option<f64>,
+    /// Period width: the label horizon, equal to the label stride. Rows with the
+    /// same `floor(t / period_seconds)` form one equal-weight period.
+    pub period_seconds: Option<f64>,
 }
 
 impl Default for TradingSpec {
@@ -402,6 +403,7 @@ impl Default for TradingSpec {
             max_position: 1.0,
             position: PositionMap::Threshold,
             periods_per_year: None,
+            period_seconds: None,
         }
     }
 }
@@ -578,12 +580,14 @@ pub struct PathStats {
     pub groups: usize,
     pub periods: usize,
     pub periods_per_year: f64,
-    /// `daily_compounded` or `per_period`.
+    /// Always `per_period`: one equal-weight return per period of `period_seconds`.
     pub annualisation: &'static str,
     /// Sum over rows of `gross_t`.
     pub gross_pnl: f64,
     /// Sum over rows of `net_t`, including every exit.
     pub net_pnl: f64,
+    /// `net_pnl / rows * periods_per_year`: the mean net return per row, annualised.
+    pub net_per_row_annualised: f64,
     pub total_cost: f64,
     pub funding_paid: f64,
     pub total_return: f64,
@@ -627,7 +631,7 @@ impl PathStats {
             .collect();
         format!(
             "{{\"rows\":{},\"groups\":{},\"periods\":{},\"periods_per_year\":{},\"annualisation\":\"{}\",\
-             \"gross_pnl\":{},\"net_pnl\":{},\"total_cost\":{},\"funding_paid\":{},\"total_return\":{},\
+             \"gross_pnl\":{},\"net_pnl\":{},\"net_per_row_annualised\":{},\"total_cost\":{},\"funding_paid\":{},\"total_return\":{},\
              \"log_growth\":{},\"sharpe\":{},\"sortino\":{},\"max_drawdown\":{},\"calmar\":{},\
              \"turnover\":{},\"trades\":{},\"entries\":{},\"exits\":{},\"trades_per_year\":{},\
              \"exposure\":{},\"hit_rate\":{},\"break_even_bps_per_side\":{},\
@@ -639,6 +643,7 @@ impl PathStats {
             self.annualisation,
             num(self.gross_pnl),
             num(self.net_pnl),
+            num(self.net_per_row_annualised),
             num(self.total_cost),
             num(self.funding_paid),
             num(self.total_return),
@@ -674,6 +679,8 @@ struct Ctx {
     ret: Vec<f64>,
     funding: Option<Vec<f64>>,
     cash: f64,
+    /// Period bucket width in seconds; `0` is one period per timestamp.
+    bucket: f64,
     /// Row indices in `(group, time)` order.
     order: Vec<usize>,
     /// Row indices in `(time, group)` order.
@@ -687,6 +694,7 @@ impl Ctx {
         r: &[f64],
         rows: &TradingRows,
         cash: f64,
+        bucket: f64,
     ) -> Ctx {
         let time: Vec<f64> = keep.iter().map(|&i| rows.time[i]).collect();
         let group: Vec<u64> = keep.iter().map(|&i| rows.group[i]).collect();
@@ -725,6 +733,7 @@ impl Ctx {
             ret,
             funding,
             cash,
+            bucket,
             order,
             time_order,
             groups,
@@ -805,7 +814,7 @@ fn run_book(ctx: &Ctx, positions: &[f64], cost_side: f64) -> Book {
             abs_delta_with_exit += p.abs();
         }
     }
-    let mut cross = CrossSection::default();
+    let mut cross = CrossSection::with_bucket(ctx.bucket);
     for &i in &ctx.time_order {
         cross.add(ctx.time[i], net[i], gross[i]);
     }
@@ -847,37 +856,21 @@ fn median_step(times: &[f64]) -> Option<f64> {
 }
 
 fn series_of(cross: &CrossSection, spec: &TradingSpec) -> Series {
-    let times: Vec<f64> = cross.periods.iter().map(|p| p.time).collect();
     let (returns, gross_returns) = cross.series();
-    let step = median_step(&times);
-    let period_ppy = match spec.periods_per_year {
-        Some(v) => v,
-        None => match step {
-            Some(dt) if dt >= 1.0 && dt <= SECONDS_PER_YEAR => SECONDS_PER_YEAR / dt,
-            _ => 365.0,
-        },
-    };
-    let sub_daily = spec.periods_per_year.is_none() && step.is_some_and(|dt| dt < SECONDS_PER_DAY);
-    let (series, ppy, annualisation) = if sub_daily {
-        let mut days: Vec<f64> = Vec::new();
-        let mut last_day = i64::MIN;
-        for (t, r) in times.iter().zip(&returns) {
-            let day = (t / SECONDS_PER_DAY).floor() as i64;
-            if day != last_day {
-                days.push(1.0);
-                last_day = day;
-            }
-            if let Some(eq) = days.last_mut() {
-                *eq *= 1.0 + r;
+    let period_ppy = match (spec.periods_per_year, spec.period_seconds) {
+        (Some(v), _) => v,
+        (None, Some(s)) if s >= 1.0 && s <= SECONDS_PER_YEAR => SECONDS_PER_YEAR / s,
+        _ => {
+            let times: Vec<f64> = cross.periods.iter().map(|p| p.time).collect();
+            match median_step(&times) {
+                Some(dt) if dt >= 1.0 && dt <= SECONDS_PER_YEAR => SECONDS_PER_YEAR / dt,
+                _ => 365.0,
             }
         }
-        (days.iter().map(|eq| eq - 1.0).collect(), 365.0, "daily_compounded")
-    } else {
-        (returns.clone(), period_ppy, "per_period")
     };
     Series {
-        risk: risk::risk_stats(&series, ppy, risk::DEFAULT_SORTINO_MAR),
-        annualisation,
+        risk: risk::risk_stats(&returns, period_ppy, risk::DEFAULT_SORTINO_MAR),
+        annualisation: "per_period",
         period_ppy,
         returns,
         gross_returns,
@@ -969,6 +962,7 @@ fn finish(ctx: &Ctx, positions: &[f64], spec: &TradingSpec) -> Result<PathStats,
         annualisation: series.annualisation,
         gross_pnl,
         net_pnl: main.net_pnl,
+        net_per_row_annualised: main.net_pnl / n as f64 * series.period_ppy,
         total_cost: book.stats.total_cost,
         funding_paid: book.funding_paid,
         total_return: main.total_return,
@@ -1122,7 +1116,7 @@ pub fn evaluate(
     let keep: Vec<usize> = (0..pred.len())
         .filter(|&i| pred[i].is_finite() && usable(i, r, rows))
         .collect();
-    let ctx = Ctx::new(&keep, r, rows, spec.cash_return);
+    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0));
     let positions = positions_of(pred, rows, &keep, &ctx, spec);
     finish(&ctx, &positions, spec)
 }
@@ -1194,7 +1188,7 @@ pub fn blocked_alpha(
     if keep.is_empty() {
         return Err("no usable rows (every prediction or return is non-finite)".to_string());
     }
-    let ctx = Ctx::new(&keep, r, rows, spec.cash_return);
+    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0));
     let positions = positions_of(pred, rows, &keep, &ctx, spec);
     let n = ctx.ret.len();
     let cost_side = spec.per_side_bps() * BP;
@@ -1267,7 +1261,7 @@ pub fn evaluate_positions(
     spec.validate()?;
     check_lengths(positions.len(), r, rows)?;
     let keep: Vec<usize> = (0..positions.len()).filter(|&i| usable(i, r, rows)).collect();
-    let ctx = Ctx::new(&keep, r, rows, spec.cash_return);
+    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0));
     let kept: Vec<f64> = keep.iter().map(|&i| positions[i]).collect();
     finish(&ctx, &kept, spec)
 }

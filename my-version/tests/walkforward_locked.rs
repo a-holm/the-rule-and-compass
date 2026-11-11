@@ -367,7 +367,7 @@ fn locked_window_inside_h168_purge_exits_3() {
         let w = format!("w,{},{},{},{}", T0, T0 + 1500 * H, test_start, test_end);
         rcsr(&[
             "walkforward", "--data", &path, "--target", "lbl_h168_y", "--target-spec", s(&spec_path).as_str(), "--expr", "x",
-            "--time", "ts", "--periods-per-year", "52", "--window", &w, "--json",
+            "--time", "ts", "--window", &w, "--json",
         ])
     };
     let (code, out, err) = wf(s0 - 608_399, s0 - 1);
@@ -512,7 +512,7 @@ fn short_declared_embargo_keeps_h168_labels_after_the_end() {
         let w = format!("w,{},{},{},{}", train_start, train_start + 1500 * H, train_start + 1500 * H + purge, train_start + 3000 * H + purge);
         rcsr(&[
             "walkforward", "--data", &path, "--target", "lbl_h168_y", "--target-spec", &spec_path, "--expr", "x", "--time", "ts",
-            "--periods-per-year", "52", "--window", &w, "--json",
+            "--window", &w, "--json",
         ])
     };
     let (code, _, err) = wf(e0 + H);

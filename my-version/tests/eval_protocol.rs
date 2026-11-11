@@ -271,7 +271,7 @@ fn bootstrap_nulls_and_multiple_testing_are_reported_and_reproducible() {
     let r = walkforward::run_table_with(&t, &s, "t", &o).unwrap();
     let inf = r.inference.as_ref().unwrap();
     let b = inf.bootstrap.as_ref().unwrap();
-    assert!(b.block_len >= 5, "block length must cover the 5 h label: {}", b.block_len);
+    assert!(b.block_len >= 1 && b.block_len < b.n, "the 5 h label is one period: {}", b.block_len);
     assert!(b.mean_ci.lo <= b.mean && b.mean <= b.mean_ci.hi);
     assert!(b.design_effect > 0.0 && b.effective_n > 0.0);
     let m = inf.multiple.as_ref().unwrap();
@@ -301,12 +301,12 @@ fn bootstrap_nulls_and_multiple_testing_are_reported_and_reproducible() {
 }
 
 #[test]
-fn a_block_shorter_than_the_label_overlap_is_refused() {
+fn a_block_shorter_than_the_holding_floor_is_refused() {
     let t = panel(600, 3);
     let s = panel_spec(600);
     let mut o = ProtocolOptions::default();
     o.bootstrap_draws = 200;
-    o.block_len = Some(2);
+    o.block_len = Some(0);
     let err = walkforward::run_table_with(&t, &s, "t", &o).unwrap_err();
     assert!(err.contains("max(horizon, hold)"), "{}", err);
     o.block_len = Some(40);

@@ -67,6 +67,8 @@ pub struct Economics {
     pub break_even_bps_per_side: f64,
     pub ladder: Vec<LadderRow>,
     pub daily: Option<Daily>,
+    /// Why `daily` is null although the series has stamps: the period is a day or longer.
+    pub daily_unavailable: Option<&'static str>,
     /// Strategy, cash, buy-and-hold, equal-weight universe, constant long/flat.
     pub benchmarks: Vec<BenchRow>,
     /// The best of cash, buy-and-hold and constant long/flat by mean return.
@@ -78,6 +80,8 @@ pub struct EconomicsInput<'a> {
     pub gross: &'a [f64],
     pub times: &'a [f64],
     pub cost_bps: f64,
+    /// Period width in seconds when the run declares it.
+    pub period_seconds: Option<f64>,
     pub periods_per_year: f64,
     pub sortino: f64,
     pub cagr: f64,
@@ -149,7 +153,8 @@ pub fn economics(i: &EconomicsInput) -> Economics {
         name: "best_long_flat_baseline".to_string(),
         ..benchmarks[best].clone()
     });
-    let daily_ok = i.periods_per_year >= 2.0 && i.times.first().map_or(false, |&t| t > 1e8);
+    let period_is_day = i.period_seconds.is_some_and(|s| s >= 86_400.0);
+    let daily_ok = !period_is_day && i.periods_per_year >= 2.0 && i.times.first().map_or(false, |&t| t > 1e8);
     let daily = if daily_ok {
         let d = daily_returns(i.times, i.net);
         let r = risk_stats(&d, 365.0, DEFAULT_SORTINO_MAR);
@@ -171,6 +176,7 @@ pub fn economics(i: &EconomicsInput) -> Economics {
         break_even_bps_per_side: inference::break_even_bps(i.net, i.gross, i.cost_bps),
         ladder: inference::cost_ladder(i.net, i.gross, i.cost_bps, &COST_LADDER, i.periods_per_year),
         daily,
+        daily_unavailable: period_is_day.then_some("period >= 1 day"),
         benchmarks,
         best_baseline,
     }
@@ -564,10 +570,13 @@ impl Economics {
                 jnum(d.sortino)
             )
         });
+        let unavailable = self
+            .daily_unavailable
+            .map_or(String::new(), |why| format!(",\"daily_unavailable\":{}", jstr(why)));
         format!(
             "{{\"book\":\"long_flat_vs_cash\",\"cost_bps_per_side\":{},\"periods_per_year\":{},\
              \"sortino\":{},\"calmar\":{},\"cvar_95\":{},\"cvar_99\":{},\
-             \"break_even_bps_per_side\":{},\"cost_ladder\":[{}],\"daily\":{},\
+             \"break_even_bps_per_side\":{},\"cost_ladder\":[{}],\"daily\":{}{},\
              \"benchmark_series\":\"every window started flat\",\"best_baseline\":{},\"benchmarks\":[{}]}}",
             jnum(self.cost_bps),
             jnum(self.periods_per_year),
@@ -578,6 +587,7 @@ impl Economics {
             jnum(self.break_even_bps_per_side),
             ladder.join(","),
             daily,
+            unavailable,
             jstr(&self.best_baseline),
             bench.join(",")
         )
