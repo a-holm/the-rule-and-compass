@@ -11074,8 +11074,10 @@ OPTIONS:
                              (0, 1], required). A member with a non-finite score drops the row.
                              --band B (whole number) keeps a long book long while votes >=
                              ceil(Q x K) - B; --min-hold applies after voting. K=1, Q=1 equals the
-                             threshold book. --device-pnl, --batch-pnl, --select-band, --locked-test
-                             and --band-units are refused
+                             threshold book. --locked-test reads the whole book once:
+                             the sealed entry binds members, order, quorum, band, min-hold
+                             and threshold. --device-pnl, --batch-pnl, --select-band and
+                             --band-units are refused
   --band <f>                 half-width beta of the no-trade band (default 0;
                              with --policy band, beta=0 reproduces the threshold
                              rule bit for bit); score units, or with --band-units
