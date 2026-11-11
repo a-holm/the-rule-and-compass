@@ -603,6 +603,12 @@ fn fit_and_score(
 /// cell admitted at most 540 per generation.
 pub const DEFAULT_FIT_FALLBACK_MAX: usize = 4096;
 
+/// #1032: chunks a submission can queue without blocking the submitter; the
+/// largest per-generation tail is `--fit-fallback-max` (4096) and a generation
+/// never checks more slots than it has candidates.
+#[cfg(feature = "cuda")]
+const FALLBACK_QUEUE_CHUNKS: usize = 4096;
+
 /// #466: default `--prune-rows`.
 pub const DEFAULT_PRUNE_ROWS: usize = 20_000;
 /// #466: default `--prune-budget`.
@@ -3040,9 +3046,8 @@ struct FallbackResult {
 
 #[cfg(feature = "cuda")]
 impl FallbackPool {
-    /// Spawn `workers` named worker threads. `queue` bounds the number of
-    /// chunks waiting in the channel; with `queue == workers` at most
-    /// `2 * workers` chunks are in flight (one running per worker, one queued).
+    /// Spawn `workers` named worker threads. `queue` chunks can wait in the
+    /// channel; a submission blocks only above it.
     fn new(workers: usize, queue: usize) -> Self {
         let workers = workers.max(1);
         let queue = queue.max(1);
@@ -3178,8 +3183,6 @@ impl FallbackPool {
         );
         let total = jobs.len();
         let started = std::time::Instant::now();
-        // Contiguous, fixed-size chunks: ~4 chunks per worker keeps the queue
-        // fed without making the channel the bottleneck.
         let chunk_len = total.div_ceil(self.workers * 4).max(1);
         let blocks = expr::current_blocks();
         let (done_tx, done) = std::sync::mpsc::channel::<FallbackResult>();
@@ -12907,6 +12910,68 @@ mod tests {
         assert!(joined.jobs.is_empty());
         assert_eq!((joined.workers, joined.overlap_s), (0, 0.0));
         assert_eq!(pool.busy.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// #1032: every job is its own chunk, for fits, checked passes and plain
+    /// scoring, and results still come back in job order.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn fallback_pool_hands_out_one_job_per_chunk() {
+        let s = sample_rows(400);
+        let cfg = Config::default();
+        let view = EvalSample::new(&s, &cfg);
+        let pool = FallbackPool::new(4, FALLBACK_QUEUE_CHUNKS);
+        let fits = pool.submit_fits(tail_jobs(37), &s, 8, Metric::Squared);
+        assert_eq!((fits.chunks, fits.chunk_len, fits.total), (37, 1, 37));
+        let (fitted, _) = pool.finish_fits(fits);
+        let mut serial = tail_jobs(37);
+        fit_fallback_jobs(&mut serial, &s.x, &s.y, &s.w, 8, Metric::Squared, 1);
+        for (k, (a, b)) in serial.iter().zip(&fitted).enumerate() {
+            assert_eq!((a.island, a.slot), (b.island, b.slot), "job {k} moved");
+            assert!(expr::same(&a.tree, &b.tree), "job {k}: the pool fit differs from the serial arm");
+        }
+        let trees: Vec<Node> = (0..17)
+            .map(|k| node(Op::Sin, vec![node(Op::Mul, vec![constant(k as f64), input(0)])]))
+            .collect();
+        let checked = pool.submit_checked(trees.iter().cloned().enumerate().collect(), &view, &cfg);
+        assert_eq!((checked.chunks, checked.chunk_len), (17, 1));
+        let (errors, _, _) = pool.finish_checked(checked);
+        for (tree, e) in trees.iter().zip(&errors) {
+            assert_eq!(e.to_bits(), score_tree(tree, &view, &cfg).to_bits());
+        }
+        let plain = pool.submit(trees.iter().cloned().enumerate().collect(), &view, &cfg);
+        assert_eq!((plain.chunks, plain.chunk_len), (17, 1));
+        let (errors, _) = pool.finish(plain);
+        assert_eq!(errors.len(), 17);
+        let none = pool.submit(Vec::new(), &view, &cfg);
+        assert_eq!(none.chunks, 0);
+        let _ = pool.finish(none);
+    }
+
+    /// #1032: the pool queue holds a generation of chunks and both
+    /// constructions in the search use that capacity.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn fallback_pool_queue_holds_a_generation() {
+        assert_eq!(FALLBACK_QUEUE_CHUNKS, 4096);
+        assert!(FALLBACK_QUEUE_CHUNKS >= DEFAULT_FIT_FALLBACK_MAX);
+        assert_eq!(FallbackPool::new(4, FALLBACK_QUEUE_CHUNKS).queue, 4096);
+        let source = include_str!("search.rs");
+        let production = source.split("\nmod tests {").next().expect("source has a prefix");
+        let sites: Vec<&str> = production.split("FallbackPool::new(").skip(1).collect();
+        assert_eq!(sites.len(), 2, "the search builds its pool in two places");
+        for site in sites {
+            let second = site.split(',').nth(1).unwrap_or("");
+            assert!(
+                second.trim_start().starts_with("FALLBACK_QUEUE_CHUNKS"),
+                "a search pool queue is not FALLBACK_QUEUE_CHUNKS: {site:.80}"
+            );
+        }
+        let pool = FallbackPool::new(2, FALLBACK_QUEUE_CHUNKS);
+        let s = sample_rows(400);
+        let ticket = pool.submit_fits(tail_jobs(300), &s, 1, Metric::Squared);
+        assert_eq!(ticket.chunks, 300, "a whole generation queues as single jobs");
+        drop(ticket);
     }
 
     /// #958: the overlap is the union of the in-flight spans.
