@@ -11042,36 +11042,40 @@ mod tests {
     }
 
     /// #1042: a routed tail fit whose device constants have the lower exact
-    /// error keeps them and counts once under its cause; `improved` still
-    /// compares the CPU fit with the start, as it does without the device.
+    /// error keeps them and counts once under its cause; one whose CPU refit
+    /// wins counts nothing. `improved` compares the CPU fit with the start in
+    /// both, exactly as in the same job without device constants.
     #[test]
     fn routed_tail_fit_counts_a_kept_device_answer() {
-        let x: Vec<Vec<f64>> = (0..21).map(|i| vec![i as f64 / 20.0]).collect();
-        let curve = |c: f64| node(Op::Exp, vec![node(Op::Mul, vec![constant(c), input(0)])]);
-        let y: Vec<f64> = x.iter().map(|r| expr::eval(&curve(3.0), r)).collect();
-        let w: Vec<f64> = Vec::new();
-        let run = |device: Option<Node>| {
-            let mut job = FallbackFitJob::new(0, 0, curve(0.0))
+        let s = sample();
+        let line = |a: f64| node(Op::Mul, vec![constant(a), input(0)]);
+        let run = |iters: usize, device: Option<Node>| {
+            let mut job = FallbackFitJob::new(0, 0, line(0.25))
                 .with_cause(FitFallbackCause::Unconverged)
                 .with_device(device);
-            run_fallback_fit(&mut job, &x, &y, &w, 1, Metric::Squared);
+            run_fallback_fit(&mut job, &s.x, &s.y, &s.w, iters, Metric::Squared);
             job
         };
-        let alone = run(None);
-        let routed = run(Some(curve(3.0)));
-        assert!(exact_error(&alone.tree, &x, &y, &w, Metric::Squared) > 0.0, "the CPU refit stops short");
-        assert_eq!(exact_error(&routed.tree, &x, &y, &w, Metric::Squared), 0.0);
-        assert!(!alone.device_kept && routed.device_kept);
-        assert!(routed.improved);
-        assert_eq!(routed.improved, alone.improved, "improved compares the CPU fit with the start");
-        let mut kept = BTreeMap::new();
-        for job in [&alone, &routed] {
+        // `iters = 0` leaves the CPU answer at the start; the device holds the
+        // exact constant (`y = x0` on these rows), so it wins.
+        let kept = run(0, Some(line(1.0)));
+        let alone = run(0, None);
+        assert_eq!(exact_error(&kept.tree, &s.x, &s.y, &s.w, Metric::Squared), 0.0);
+        assert!(kept.device_kept && !alone.device_kept);
+        assert_eq!(kept.improved, alone.improved, "improved compares the CPU fit with the start");
+        // A refit that lowers the error beats a device answer above the start.
+        let lost = run(8, Some(line(0.0)));
+        let alone = run(8, None);
+        assert!(!lost.device_kept);
+        assert!(lost.improved && alone.improved);
+        let mut counter = BTreeMap::new();
+        for job in [&kept, &lost] {
             if job.device_kept {
-                count_improved(&mut kept, job.cause.expect("a routed cause"));
+                count_improved(&mut counter, job.cause.expect("a routed cause"));
             }
         }
-        assert_eq!(kept.get("unconverged"), Some(&1));
-        assert_eq!(kept.values().sum::<usize>(), 1);
+        assert_eq!(counter.get("unconverged"), Some(&1));
+        assert_eq!(counter.values().sum::<usize>(), 1);
     }
 
     /// #1042: `0` means `4 * fit_iters`, the budget is never below `fit_iters`,
