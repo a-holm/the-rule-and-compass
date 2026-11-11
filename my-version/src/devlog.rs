@@ -538,6 +538,12 @@ pub struct GenRecord {
     /// Hash of the island RNG states at this boundary: two logs with the same
     /// key at the same generation saw the same stream.
     pub rng_key: u64,
+    /// #1022: islands restarted at this generation's boundary.
+    pub restarts: usize,
+    /// #1022: islands restarted since the run (or resume) began.
+    pub restarts_total: u64,
+    /// #1022: islands inside their isolation window after this boundary.
+    pub isolated: usize,
 }
 
 impl GenRecord {
@@ -573,7 +579,7 @@ impl GenRecord {
              \"archive\":{{\"size\":{}}},\
              \"fit\":{{\"attempts\":{},\"gpu\":{},\"fallback\":{}}},\
              \"gpu\":{},\"fallback\":{{\"scope\":\"evaluator_pool\",\"seconds\":{},\"workers\":{}}},\
-             \"convergence\":{{\"percent_converged\":{}}}}}",
+             \"convergence\":{{\"percent_converged\":{}}},\"restarts\":{},\"restarts_total\":{}}}",
             SCHEMA,
             VERSION,
             self.generation,
@@ -598,7 +604,9 @@ impl GenRecord {
             self.gpu.as_ref().map(|g| g.json()).unwrap_or_else(|| "null".to_string()),
             num(self.fallback_s),
             self.fallback_workers,
-            num(self.percent_converged)
+            num(self.percent_converged),
+            self.restarts,
+            self.restarts_total
         )
     }
 
@@ -620,7 +628,7 @@ impl GenRecord {
              \"qd\":{},\
              \"convergence\":{{\"confidence\":{},\"stability\":{},\"maturity\":{},\
              \"percent_converged\":{}}},\
-             \"islands\":[{}],\"rng\":{}}}",
+             \"islands\":[{}],\"rng\":{},\"restarts\":{},\"restarts_total\":{},\"isolated\":{}}}",
             SCHEMA,
             VERSION,
             self.generation,
@@ -668,7 +676,10 @@ impl GenRecord {
             num(self.maturity),
             num(self.percent_converged),
             islands.join(","),
-            hex(self.rng_key)
+            hex(self.rng_key),
+            self.restarts,
+            self.restarts_total,
+            self.isolated
         )
     }
 }
@@ -1271,6 +1282,9 @@ mod tests {
             percent_converged: 0.85,
             island_best: vec![0.5, 0.55],
             rng_key: 0x1234,
+            restarts: 1,
+            restarts_total: 3,
+            isolated: 2,
         }
     }
 
@@ -1351,6 +1365,9 @@ mod tests {
         for key in ["generation", "t", "wall", "phases", "error", "archive", "fit", "gpu", "fallback", "convergence"] {
             assert!(j.get(key).is_some(), "summary has no '{}'", key);
         }
+        assert_eq!(j.get("restarts").and_then(|v| v.as_usize()), Some(1));
+        assert_eq!(j.get("restarts_total").and_then(|v| v.as_usize()), Some(3));
+        assert!(j.get("isolated").is_none(), "isolated is a full-level field");
         assert_eq!(j.get("error").and_then(|e| e.get("best")).and_then(|v| v.as_f64()), Some(0.5));
         assert_eq!(j.get("error").and_then(|e| e.get("median")).and_then(|v| v.as_f64()), Some(0.8));
         assert_eq!(j.get("archive").and_then(|a| a.get("size")).and_then(|v| v.as_usize()), Some(4));
@@ -1365,6 +1382,9 @@ mod tests {
         let full = Json::parse(&r.json()).unwrap();
         assert_eq!(full.get("level").and_then(|v| v.as_str()), Some("full"));
         assert!(full.get("variation").is_some() && full.get("islands").is_some());
+        assert_eq!(full.get("restarts").and_then(|v| v.as_usize()), Some(1));
+        assert_eq!(full.get("restarts_total").and_then(|v| v.as_usize()), Some(3));
+        assert_eq!(full.get("isolated").and_then(|v| v.as_usize()), Some(2));
         assert!(line.len() < r.json().len(), "summary must be smaller than full");
     }
 

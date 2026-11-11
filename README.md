@@ -662,7 +662,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring] [--reject-fixed-position]
-     [--selection lexicographic|afp]
+     [--selection lexicographic|afp] [--restart-policy archive|island] [--restart-isolation N]
      [--mutation-mix classic|extended] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
      [--patience N]
@@ -1262,6 +1262,14 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   crowding distance, a few random immigrants join each generation, and parents
   are drawn by Pareto rank. Small correct shapes and new lineages survive next
   to large approximations. Node path only; the default stays `lexicographic`;
+- **opt-in island-local restarts** (`--restart-policy island`, `--restart-isolation W`):
+  the default rule restarts an island only while its best is worse than the
+  archive best, which ring migration makes false for every island within a few
+  migration intervals. `island` restarts an island whose own best error has not
+  improved for one restart interval (never the keeper that holds the archive
+  best) and keeps it from front parents and migrants for `W` generations
+  (default 25). Node and flat postfix paths. Saved search setting; the default
+  stays `archive`;
 - **opt-in quality-diversity search** (`--qd`, `--qd-cvt`, `--qd-policy`,
   `--qd-cells`, `--qd-cell-cap`): CVT-MAP-Elites over variable usage ×
   prediction skewness, with deterministic Halton initialisation, Lloyd
