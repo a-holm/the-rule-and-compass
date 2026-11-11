@@ -927,6 +927,62 @@ mod tests {
     }
 
     #[test]
+    fn sha256_known_answer_boundaries() {
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        assert_eq!(
+            sha256_hex(&vec![b'a'; 1_000_000]),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+        assert_eq!(
+            sha256_hex(&[b'a'; 55]),
+            "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318"
+        );
+        assert_eq!(
+            sha256_hex(&[b'a'; 56]),
+            "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a"
+        );
+        assert_eq!(
+            sha256_hex(&[b'a'; 64]),
+            "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"
+        );
+    }
+
+    #[test]
+    fn direct_io_path_matches_buffered_path() {
+        let scratch = crate::test_scratch::Scratch::new("sha256-direct");
+        let path = scratch.join("direct.bin");
+        let mut direct_ran = false;
+        for len in [0usize, 4095, 4096, 4097, 8 << 20, (8 << 20) - 1, (8 << 20) + 4097] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&path, &bytes).unwrap();
+            let expected = sha256_hex(&bytes);
+            let (buffered, kind) = sha256_file_with(&path, u64::MAX).unwrap();
+            assert_eq!(kind, ReadPath::Buffered, "length {len}");
+            assert_eq!(buffered, expected, "buffered, length {len}");
+            let (direct, kind) = sha256_file_with(&path, 0).unwrap();
+            assert_eq!(direct, expected, "direct request, length {len} ({kind:?})");
+            direct_ran |= kind == ReadPath::Direct;
+        }
+        // The scratch directory may sit on a filesystem that refuses O_DIRECT; the
+        // fallback is then the buffered path, which the digest equality above covers.
+        let refused = !direct_ran;
+        if refused {
+            let (_, kind) = sha256_file_with(&path, 0).unwrap();
+            assert_eq!(kind, ReadPath::Buffered);
+        }
+    }
+
+    #[test]
+    fn file_hash_reports_missing_file() {
+        let scratch = crate::test_scratch::Scratch::new("sha256-missing");
+        let err = sha256_file(scratch.join("absent.bin")).unwrap_err();
+        assert!(err.starts_with("cannot read "), "{err}");
+    }
+
+    #[test]
     fn sidecar_rejects_changed_file() {
         let dir = crate::test_scratch::Scratch::new("sha-sidecar");
         let path = dir.join("d.bin");
