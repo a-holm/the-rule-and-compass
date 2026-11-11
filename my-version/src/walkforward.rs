@@ -4099,4 +4099,22 @@ mod locked_reach_tests {
         guard.windows[0].train_end = 29.0;
         assert!(validate_windows(&guard, &opts).unwrap_err().contains("reaches the declared locked test"));
     }
+
+    #[test]
+    fn infer_frequency_ignores_unlabelled_rows() {
+        let row = |i: usize, labelled: bool| RowBase {
+            time: i as f64 * 3600.0,
+            group: 0,
+            target: if labelled { 0.01 } else { f64::NAN },
+        };
+        let h1: Vec<RowBase> = (0..120).map(|i| row(i, i % 5 != 2)).collect();
+        let (ppy, dt) = infer_frequency(&h1);
+        assert_eq!(dt, Some(3600.0));
+        assert_eq!(ppy, 8760.0);
+
+        let daily: Vec<RowBase> = (0..24 * 20).map(|i| row(i, i % 24 == 0)).collect();
+        let (ppy, dt) = infer_frequency(&daily);
+        assert_eq!(dt, Some(86_400.0));
+        assert_eq!(ppy, 365.0);
+    }
 }

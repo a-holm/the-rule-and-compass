@@ -161,7 +161,7 @@ fn non_finite_predictions_and_returns_are_dropped() {
 }
 
 #[test]
-fn sub_daily_periods_are_compounded_per_day() {
+fn sub_daily_periods_use_their_own_annualisation() {
     // 3 days of hourly rows, always long, +0.1 % an hour.
     let n = 72;
     let rows = TradingRows {
@@ -171,11 +171,10 @@ fn sub_daily_periods_are_compounded_per_day() {
     };
     let r: Vec<f64> = (0..n).map(|i| if i % 24 < 12 { 0.002 } else { 0.0 }).collect();
     let s = trading::evaluate(&vec![1.0; n], &r, &rows, &spec(0.0)).unwrap();
-    assert_eq!(s.annualisation, "daily_compounded");
-    close(s.periods_per_year, 365.0);
+    assert_eq!(s.annualisation, "per_period");
+    close(s.periods_per_year, 8760.0);
     assert_eq!(s.periods, 72);
-    // Identical days: zero variance, so the daily Sharpe is undefined, not 0.
-    assert!(s.sharpe.is_nan());
+    assert!(s.sharpe.is_finite());
 }
 
 #[test]
