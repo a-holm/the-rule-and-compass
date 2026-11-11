@@ -403,3 +403,45 @@ fn pooled_period_series_golden() {
     assert_eq!(list("period_time"), want_time);
     assert_eq!(list("period_net").len() as f64, pooled.get("periods").unwrap().as_f64().unwrap());
 }
+
+fn book_with_test_rows(test: &[(f64, f64)]) -> walkforward::Report {
+    let mut rows = vec![(0.0, 0.0, 0.0), (1.0, 1.0, 0.0), (2.0, 2.0, 0.0), (3.0, 3.0, 0.0)];
+    for (k, &(x, y)) in test.iter().enumerate() {
+        rows.push((4.0 + k as f64, x, y));
+    }
+    let end = 4.0 + test.len() as f64;
+    let mut s = spec("x", vec![window("w", 0.0, 4.0, 4.0, end)]);
+    s.cost_bps = 100.0;
+    s.threshold_quantile = 0.5;
+    walkforward::run_table(&single(&rows), &s, "test").unwrap()
+}
+
+#[test]
+fn wf_break_even_null_for_losing_book() {
+    let r = book_with_test_rows(&[(4.0, -0.01), (5.0, -0.02), (6.0, -0.01), (7.0, -0.01)]);
+    assert!(r.economics.break_even_bps_per_side.is_nan());
+    let json = r.json();
+    assert!(json.contains("\"break_even_bps_per_side\":null"), "{json}");
+    assert!(json.contains("\"break_even_status\":\"gross_nonpositive\""), "{json}");
+}
+
+#[test]
+fn wf_break_even_flat_book() {
+    let r = book_with_test_rows(&[(-1.0, 0.01), (-2.0, 0.02), (-3.0, 0.01), (-4.0, 0.01)]);
+    assert!(r.economics.break_even_bps_per_side.is_nan());
+    let json = r.json();
+    assert!(json.contains("\"break_even_bps_per_side\":null"), "{json}");
+    assert!(json.contains("\"break_even_status\":\"no_cost\""), "{json}");
+}
+
+#[test]
+fn wf_break_even_defined_status() {
+    let json = hand_fixture().json();
+    assert!(json.contains("\"break_even_status\":\"defined\""), "{json}");
+}
+
+#[test]
+fn wf_markdown_break_even_na() {
+    let r = book_with_test_rows(&[(4.0, -0.01), (5.0, -0.02), (6.0, -0.01), (7.0, -0.01)]);
+    assert!(r.markdown().contains("break-even n/a (gross <= 0) bp/side"), "{}", r.markdown());
+}

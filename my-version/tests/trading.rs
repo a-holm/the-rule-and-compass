@@ -231,3 +231,13 @@ fn long_only_matches_the_walkforward_evaluator_bit_for_bit() {
         assert!(got.period.trades > 10);
     }
 }
+
+#[test]
+fn trading_break_even_nan_when_gross_nonpositive() {
+    let pred = [1.0, 1.0, -1.0, 1.0, 1.0];
+    let r = [-0.01, -0.02, 0.03, -0.04, -0.01];
+    let s = trading::evaluate(&pred, &r, &rows(5), &spec(10.0)).unwrap();
+    assert!(s.gross_pnl < 0.0);
+    assert!(s.break_even_bps.is_nan());
+    assert!(s.json().contains("\"break_even_bps_per_side\":null"));
+}
