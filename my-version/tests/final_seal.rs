@@ -818,3 +818,181 @@ fn ladder_read_refuses_every_faulty_ledger_field_with_exit_3() {
         no_staged_files(&dir, body);
     }
 }
+
+// ---------------------------------------------------------------------------
+// #961: the sealed read scores a vote book.
+// ---------------------------------------------------------------------------
+
+const VOTE_MEMBERS: [&str; 3] = ["x", "x - 2", "x + 2"];
+
+fn vote_flags<'a>(quorum: &'a str, tail: &[&'a str]) -> Vec<&'a str> {
+    let mut a = vec!["--policy", "vote", "--quorum", quorum, "--threshold-fixed", "0"];
+    a.extend_from_slice(tail);
+    a
+}
+
+/// A vote book developed, sealed (final) and ready to read. Returns the data, ledger and sealed paths.
+fn sealed_vote(name: &str, members: &[&str], quorum: &str, tail: &[&str], final_seal: bool) -> (Scratch, String, String, String) {
+    let (scratch, dir) = scratch(name);
+    let data = store(&dir, "d.csv");
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+    dev(&data, &l, members, &vote_flags(quorum, tail));
+    let mut a = vec!["protocol", "seal", "--ledger", l.as_str(), "--out", sealed.as_str()];
+    if final_seal {
+        a.splice(2..2, ["--final", "--max-reads", "2"]);
+    }
+    let (code, _, err) = rcsr(&a);
+    assert_eq!(code, 0, "{}", err);
+    (scratch, data, l, sealed)
+}
+
+fn test_reads(ledger: &str) -> usize {
+    std::fs::read_to_string(ledger).unwrap().lines().filter(|l| l.contains("\"event\":\"test_read\"")).count()
+}
+
+#[test]
+fn vote_locked_read_scores_sealed_book() {
+    let (_s, data, l, sealed) = sealed_vote("vote-read", &VOTE_MEMBERS, "0.67", &[], true);
+    let (code, out, err) = read(&data, &l, &sealed, &VOTE_MEMBERS, &vote_flags("0.67", &[]));
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("\"policy\":{\"name\":\"vote\""), "{}", out);
+    assert!(out.contains("\"quorum\":0.67"), "{}", out);
+    assert!(out.contains("\"votes_required\":3"), "{}", out);
+    for m in VOTE_MEMBERS {
+        assert!(out.contains(&format!("\"{}\"", m)), "member {} in {}", m, out);
+    }
+    assert!(out.contains("\"test_read\":true") && out.contains("\"read_count\":1"), "{}", out);
+    assert_eq!(test_reads(&l), 1);
+    let window_rows: usize = out.split("\"test_rows\":").nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
+    assert!(window_rows > 0, "{}", out);
+}
+
+#[test]
+fn vote_locked_second_read_refused() {
+    let (_s, data, l, sealed) = sealed_vote("vote-twice", &VOTE_MEMBERS, "0.67", &[], true);
+    let flags = vote_flags("0.67", &[]);
+    assert_eq!(read(&data, &l, &sealed, &VOTE_MEMBERS, &flags).0, 0);
+    assert_eq!(test_reads(&l), 1);
+    let (code, _, err) = read(&data, &l, &sealed, &VOTE_MEMBERS, &flags);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("already has test_read:true"), "{}", err);
+    assert_eq!(test_reads(&l), 1);
+}
+
+#[test]
+fn vote_locked_changed_spec_refused() {
+    let (_s, data, l, sealed) = sealed_vote("vote-changed", &VOTE_MEMBERS, "0.67", &[], false);
+    let order = ["x - 2", "x", "x + 2"];
+    let changed = ["x", "x - 2", "x + 3"];
+    let subset = ["x", "x - 2"];
+    let cases: Vec<(&str, Vec<&str>, Vec<String>)> = vec![
+        ("order", order.to_vec(), vote_flags("0.67", &[]).iter().map(|v| v.to_string()).collect()),
+        ("member", changed.to_vec(), vote_flags("0.67", &[]).iter().map(|v| v.to_string()).collect()),
+        ("subset", subset.to_vec(), vote_flags("0.67", &[]).iter().map(|v| v.to_string()).collect()),
+        ("quorum", VOTE_MEMBERS.to_vec(), vote_flags("0.34", &[]).iter().map(|v| v.to_string()).collect()),
+        ("band", VOTE_MEMBERS.to_vec(), vote_flags("0.67", &["--band", "1"]).iter().map(|v| v.to_string()).collect()),
+        ("min-hold", VOTE_MEMBERS.to_vec(), vote_flags("0.67", &["--min-hold", "2"]).iter().map(|v| v.to_string()).collect()),
+        (
+            "threshold",
+            VOTE_MEMBERS.to_vec(),
+            ["--policy", "vote", "--quorum", "0.67", "--threshold-fixed", "0.5"].iter().map(|v| v.to_string()).collect(),
+        ),
+    ];
+    for (what, members, flags) in cases {
+        let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+        let (code, _, err) = read(&data, &l, &sealed, &members, &flags);
+        assert_eq!(code, 3, "{}: {}", what, err);
+        assert!(err.contains("is not in the sealed list; the runner refuses it"), "{}: {}", what, err);
+        assert_eq!(test_reads(&l), 0, "{}", what);
+    }
+    let (code, _, err) = read(&data, &l, &sealed, &VOTE_MEMBERS, &vote_flags("0.67", &[]));
+    assert_eq!(code, 0, "{}", err);
+}
+
+/// The pooled metrics object of a walk-forward report.
+fn pooled(json: &str) -> String {
+    let rest = json.split("\"pooled\":{").nth(1).expect("pooled object");
+    let mut depth = 1;
+    let mut end = 0;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    rest[..end].to_string()
+}
+
+#[test]
+fn vote_locked_one_member_equals_single() {
+    let (_a, dir_a) = scratch("vote-one-single");
+    let data_a = store(&dir_a, "d.csv");
+    let (la, sa) = (s(&dir_a.join("ledger.jsonl")), s(&dir_a.join("sealed.json")));
+    let single = ["--threshold-fixed", "0"];
+    dev(&data_a, &la, &["x"], &single);
+    assert_eq!(rcsr(&["protocol", "seal", "--final", "--ledger", &la, "--out", &sa]).0, 0);
+    let (code, single_out, err) = read(&data_a, &la, &sa, &["x"], &single);
+    assert_eq!(code, 0, "{}", err);
+
+    let (_b, data_b, lb, sb) = sealed_vote("vote-one-vote", &["x"], "1", &[], true);
+    let (code, vote_out, err) = read(&data_b, &lb, &sb, &["x"], &vote_flags("1", &[]));
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(pooled(&single_out), pooled(&vote_out));
+}
+
+#[test]
+fn vote_locked_read_verifies_by_hash() {
+    let (_s, data, l, sealed) = sealed_vote("vote-verify", &VOTE_MEMBERS, "0.67", &[], true);
+    let (code, _, err) = read(&data, &l, &sealed, &VOTE_MEMBERS, &vote_flags("0.67", &[]));
+    assert_eq!(code, 0, "{}", err);
+    let sha = recorded_read_sha(&l);
+    let mut verify = vote_flags("0.67", &["--verify-read", "--expect-report-sha256", &sha]);
+    let (code, _, err) = read(&data, &l, &sealed, &VOTE_MEMBERS, &verify);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(test_reads(&l), 1, "verify appends no read");
+    let wrong = "0".repeat(64);
+    verify = vote_flags("0.67", &["--verify-read", "--expect-report-sha256", &wrong]);
+    let (code, _, err) = read(&data, &l, &sealed, &VOTE_MEMBERS, &verify);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("differs from the expected"), "{}", err);
+}
+
+/// The members and thresholds of a sealed vote read come from rows before the
+/// locked range: a store that differs inside the range only gives the same thresholds.
+#[test]
+fn vote_locked_members_and_thresholds_ignore_locked_rows() {
+    let run = |poison: bool| {
+        let (_s, dir) = scratch(if poison { "vote-leak-p" } else { "vote-leak-c" });
+        let data = dir.join("d.csv");
+        let mut csv = String::from("ts,x,y\n");
+        for i in 0..400i64 {
+            let locked = i >= 300;
+            let x = ((i * 37) % 17) as f64 - 8.0;
+            let x = if poison && locked { x * 100.0 + 50.0 } else { x };
+            let y = 0.0003 * x + (((i * 13) % 7) as f64 - 3.0) * 0.0004;
+            let y = if poison && locked { -y } else { y };
+            csv.push_str(&format!("{},{},{}\n", T0 + i * H, x, y));
+        }
+        std::fs::write(&data, csv).unwrap();
+        let d = s(&data);
+        lockbox::write_sidecar(&d, &Lockbox { start: T0 + 300 * H, end: T0 + 400 * H }, "test").unwrap();
+        let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+        let flags = ["--policy", "vote", "--quorum", "0.67", "--validation-frac", "0.3"];
+        dev(&d, &l, &VOTE_MEMBERS, &flags);
+        assert_eq!(rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]).0, 0);
+        let (code, out, err) = read(&d, &l, &sealed, &VOTE_MEMBERS, &flags);
+        assert_eq!(code, 0, "{}", err);
+        out
+    };
+    let (clean, poisoned) = (run(false), run(true));
+    let thresholds = |j: &str| j.split("\"member_thresholds\":[").nth(1).unwrap().split(']').next().unwrap().to_string();
+    assert_eq!(thresholds(&clean), thresholds(&poisoned));
+    assert_ne!(pooled(&clean), pooled(&poisoned), "the locked rows do reach the metrics");
+}
