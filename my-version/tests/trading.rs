@@ -174,7 +174,7 @@ fn sub_daily_periods_use_their_own_annualisation() {
     assert_eq!(s.annualisation, "per_period");
     close(s.periods_per_year, 8760.0);
     assert_eq!(s.periods, 72);
-    assert!(s.sharpe.is_finite());
+    close(s.sharpe, (8760.0f64 * 71.0 / 72.0).sqrt());
 }
 
 #[test]

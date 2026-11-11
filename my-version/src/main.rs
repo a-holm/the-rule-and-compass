@@ -11056,9 +11056,10 @@ OPTIONS:
   --periods-per-year <f>     annualisation override. Default: 31536000 / S, S the
                              label horizon (target spec, else --horizon), else
                              the median step of labelled test times. A period is
-                             the bucket floor(t / S). With a target spec a
-                             different value exits 2; with --horizon alone it
-                             overrides
+                             the bucket floor(t / S); without a declared
+                             horizon a period is one timestamp. With a target
+                             spec a different value exits 2; with --horizon
+                             alone it overrides
   --device-pnl               recompute each test block through the fused
                              long-only reduction (f64 canonical segments; the
                              CUDA kernel when built with --features cuda) and

@@ -284,7 +284,11 @@ fn wf_block_len_one_period() {
     let j = read_json(&path);
     let periods = num(&j, &["pooled", "periods"]);
     let block = num(&j, &["inference", "bootstrap", "block_len"]);
-    assert!(block < periods / 2.0, "block {block} of {periods} periods");
+    let hold = (num(&j, &["pooled", "active_rows"]) / num(&j, &["pooled", "entries"])).ceil();
+    let cube = periods.cbrt().ceil();
+    let want = 1.0f64.max(hold).max(cube).min(periods);
+    assert!(want < 168.0, "fixture must separate the one-period horizon from the hourly rule: {want}");
+    assert_eq!(block, want, "max(1, hold {hold}, ceil(n^(1/3)) {cube})");
     let ci = at(&j, &["inference", "bootstrap", "mean_ci"]);
     assert!(num(ci, &["hi"]) - num(ci, &["lo"]) > 0.0, "degenerate interval");
     // the horizon is one period, so a block of the holding period is accepted

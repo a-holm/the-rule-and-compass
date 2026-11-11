@@ -526,7 +526,7 @@ Per window and pooled:
 | break-even hit rate | `(average loss + realised cost per long row) / (average win + average loss)` |
 | trades | position changes (an entry and its exit count as two) |
 | entries | flat-to-long transitions |
-| rows / periods | test rows and distinct timestamps in the return series |
+| rows / periods | test rows and periods in the return series (buckets `floor(t / S)` with a declared horizon, else distinct timestamps) |
 | total cost / total variation | charged cost and `sum |position change|`; pooled values include the carried seam |
 
 **Period rule (#1016).** One period is one label horizon wide. The width `S` is, in order: the target spec's horizon (`annualization.source` `target_spec`), `--horizon` (`horizon_flag`), else the median positive step of the distinct times of rows with a finite target (`inferred_labelled_rows`). Unlabelled rows never enter the inference. `periods_per_year = 31536000 / S`: 8760 for hourly labels, 365 for daily, 52.1429 for 168 h. When `S` is declared, the period series is the bucket `floor(t / S)` with the equal-weight mean of its rows, so a stride at staggered phases yields one return per calendar bucket, not one per timestamp. For hourly labels and for anchored strides (every group on the same stamps, one stamp per `S`) the series equals the per-timestamp series. Empty buckets are absent. `annualization.period_seconds` and `windows[].inferred_period_seconds` report `S`.
