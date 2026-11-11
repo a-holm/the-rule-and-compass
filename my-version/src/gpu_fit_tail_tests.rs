@@ -62,9 +62,8 @@ macro_rules! need_device {
     };
 }
 
-/// The device fit of every fixture tree: the plan, the result and the tree
-/// after the device constants are applied.
-fn device_results(x: &[Vec<f64>], y: &[f64], trees: &[Node]) -> Vec<(i32, Node)> {
+/// The fixture rows on the device, with the f64 fit rows and the f64 polish.
+fn fixture_evaluator(x: &[Vec<f64>], y: &[f64]) -> GpuEvaluator {
     let n = x.len();
     let mut cols64 = vec![0.0f64; n * VARS];
     for (r, row) in x.iter().enumerate() {
@@ -77,10 +76,17 @@ fn device_results(x: &[Vec<f64>], y: &[f64], trees: &[Node]) -> Vec<(i32, Node)>
     let mut ev = GpuEvaluator::new(&cols32, n, VARS, &y32).expect("device evaluator");
     assert!(ev.set_fit_data(&cols64, y, &[]), "f64 fit rows uploaded");
     ev.set_fit_polish(FitPolish::F64);
+    ev
+}
+
+/// The device fit of every fixture tree at the damped budget `max_iters`
+/// (#1042): the status and the tree after the device constants are applied.
+fn device_results(x: &[Vec<f64>], y: &[f64], trees: &[Node], max_iters: usize) -> Vec<(i32, Node)> {
+    let mut ev = fixture_evaluator(x, y);
     let plans: Vec<fit::GpuFitPlan> =
         trees.iter().map(|t| fit::gpu_fit_plan(t).expect("a fit plan")).collect();
     let refs: Vec<&fit::GpuFitPlan> = plans.iter().collect();
-    let (out, ms) = ev.fit_batch(&refs, ITERS, fit::DeviceLoss::Squared);
+    let (out, ms) = ev.fit_batch_capped(&refs, ITERS, max_iters, fit::DeviceLoss::Squared);
     assert!(ms >= 0.0, "the launch was refused");
     trees
         .iter()
@@ -97,14 +103,15 @@ fn device_results(x: &[Vec<f64>], y: &[f64], trees: &[Node]) -> Vec<(i32, Node)>
 }
 
 /// After routing, every tree with status 4, 5, 7 or 9 equals the CPU fit and
-/// every other tree keeps its device constants.
+/// every other tree keeps its device constants. #1042: at the search's default
+/// budget `max_iters = 4 * iters` at most 5 trees end unconverged.
 #[test]
 fn device_fit_tail_statuses_fall_back() {
     need_device!();
     let (x, y) = rows();
     let trees = trees();
     assert_eq!(trees.len(), 240);
-    let device = device_results(&x, &y, &trees);
+    let device = device_results(&x, &y, &trees, 4 * ITERS);
     let mut routed = std::collections::BTreeMap::<&str, usize>::new();
     let mut seen = [0usize; 10];
     let mut before = 1.0f64;
@@ -138,6 +145,66 @@ fn device_fit_tail_statuses_fall_back() {
     assert!(seen[4] > 0 && seen[5] > 0 && seen[7] > 0, "the fixture lost a status: {seen:?}");
     assert_eq!(routed.values().sum::<usize>(), tails);
     assert!(kept_worse.is_empty(), "kept device answers above 1.001 of the CPU SSE: {kept_worse:?}");
+    assert!(seen[9] <= 5, "{} unconverged trees at max_iters {}: {seen:?}", seen[9], 4 * ITERS);
+}
+
+/// #1042: at `max_iters == iters` the kernel takes exactly the passes of the
+/// damped loop without the continuation. `RCSR_FIT_TIP_RECORD` names a
+/// recording (`RCSR_FIT_RECORD=<dir>`) of `device_fit_tail_statuses_fall_back`
+/// made with the base kernel, which fits the fixture at `iters = 8`. The
+/// fixture fitted here at `iters = max_iters = 8`, and the recorded call
+/// replayed at its recorded budget, both equal the recorded constants, SSE and
+/// status of all 240 trees bit for bit.
+#[test]
+#[ignore = "needs RCSR_FIT_TIP_RECORD, a fit recording of the fixture made with the base kernel"]
+fn fit_max_iters_equal_to_iters_is_bit_identical() {
+    need_device!();
+    let dir = std::env::var("RCSR_FIT_TIP_RECORD").expect("RCSR_FIT_TIP_RECORD names the base-kernel recording");
+    let rec = crate::fit_record::load_recording(std::path::Path::new(&dir)).expect("a readable recording");
+    let (_, call) = rec.calls.iter().find(|(_, c)| c.nprog == 240).expect("a recorded 240-tree call");
+    assert_eq!(
+        (call.iters, call.max_iters, call.loss, call.polish),
+        (ITERS as u32, ITERS as u32, fit::DeviceLoss::Squared.code(), FitPolish::F64.code())
+    );
+    let kmax = call.kmax as usize;
+    let recorded = |k: usize| {
+        crate::fit_record::candidate_hash(
+            call.status[k],
+            call.sse[k],
+            crate::fit_record::used_constants(&call.c, kmax, &call.pcount, k),
+        )
+    };
+
+    let (x, y) = rows();
+    let trees = trees();
+    let mut ev = fixture_evaluator(&x, &y);
+    let plans: Vec<fit::GpuFitPlan> =
+        trees.iter().map(|t| fit::gpu_fit_plan(t).expect("a fit plan")).collect();
+    let refs: Vec<&fit::GpuFitPlan> = plans.iter().collect();
+    let (out, ms) = ev.fit_batch_capped(&refs, ITERS, ITERS, fit::DeviceLoss::Squared);
+    assert!(ms >= 0.0, "the launch was refused");
+    assert_eq!(out.len(), 240);
+    let fresh: Vec<usize> = (0..out.len())
+        .filter(|&k| crate::fit_record::candidate_hash(out[k].status, out[k].sse, &out[k].c) != recorded(k))
+        .collect();
+
+    let (_, data) = rec.data.iter().find(|(j, _)| *j == call.data).expect("the call's recorded rows");
+    let mut replay = GpuEvaluator::from_recorded(data).expect("the recorded rows on the device");
+    let r = replay.fit_replay_call(call);
+    assert!(r.ms >= 0.0, "the replay launch was refused");
+    let replayed: Vec<usize> = (0..240)
+        .filter(|&k| {
+            let c = crate::fit_record::used_constants(&r.c, kmax, &call.pcount, k);
+            crate::fit_record::candidate_hash(r.status[k], r.sse[k], c) != recorded(k)
+        })
+        .collect();
+    let mut statuses = [0usize; 10];
+    for res in &out {
+        statuses[res.status as usize] += 1;
+    }
+    eprintln!("bit identity at max_iters == iters: statuses {statuses:?} fresh differs {fresh:?} replay differs {replayed:?}");
+    assert!(fresh.is_empty(), "the fresh fit differs from the base kernel on trees {fresh:?}");
+    assert!(replayed.is_empty(), "the replay differs from the base kernel on trees {replayed:?}");
 }
 
 /// A device-dispatched search over the hard operators counts the routed fits
@@ -166,6 +233,7 @@ fn a_search_counts_the_routed_tail_fits_in_the_ledger() {
     let out = search::run(&cfg, &train, &test);
     let g = out.gpu.as_ref().expect("a fit ledger");
     assert_eq!(g.fit_attempts, g.fit_gpu + g.fit_fallback, "{g:?}");
+    assert_eq!(g.fit_max_iters, 4 * ITERS, "#1042: the default budget");
     for label in ["rank_deficient", "recovered", "start_unusable", "unconverged"] {
         assert_eq!(g.fit_status_by_label.get(label).copied().unwrap_or(0), 0, "{label} kept: {g:?}");
     }
@@ -314,7 +382,7 @@ fn status_zero_device_fit_matches_cpu_on_pinned_trees() {
     let (x, y) = rows();
     let all = trees();
     let pinned: Vec<Node> = PINNED.iter().map(|&k| all[k].clone()).collect();
-    let device = device_results(&x, &y, &pinned);
+    let device = device_results(&x, &y, &pinned, 4 * ITERS);
     let mut worst = 0.0f64;
     for ((start, (status, dev)), id) in pinned.iter().zip(&device).zip(PINNED) {
         let mut cpu = start.clone();
@@ -340,7 +408,7 @@ fn routed_tail_fits_keep_the_better_answer() {
     need_device!();
     let (x, y) = rows();
     let trees = trees();
-    let device = device_results(&x, &y, &trees);
+    let device = device_results(&x, &y, &trees, ITERS);
     let sample = Sample { x: x.clone(), y: y.clone(), w: Vec::new(), ys: Vec::new(), pairs: None };
     let mut worst = 0.0f64;
     let mut device_kept = 0usize;
@@ -383,7 +451,7 @@ fn skipping_a_dead_start_never_changes_a_finite_answer() {
     need_device!();
     let (x, y) = rows();
     let trees = trees();
-    let device = device_results(&x, &y, &trees);
+    let device = device_results(&x, &y, &trees, ITERS);
     let sample = Sample { x: x.clone(), y: y.clone(), w: Vec::new(), ys: Vec::new(), pairs: None };
     let metric = crate::metrics::Metric::Squared;
     let bits = |t: &Node| fit::constants_slots(t).iter().map(|c| c.to_bits()).collect::<Vec<_>>();

@@ -1200,6 +1200,30 @@ explicit `gpu` is always honoured:
    conditioning gate, then the block scores the trial and accepts/rejects in the
    same order as the CPU loop. Damping retries reuse the cached normal
    equations.
+
+   **Budget and convergence test (#1042).** `--fit-iters` damped trials run
+   first. On the squared arm the kernel then tests convergence: thread 0 solves
+   the undamped system at the current constants and takes the model drop of
+   that step, `-(2 δᵀJᵀr + δᵀJᵀJ δ)`, the Gauss-Newton Newton decrement and the
+   quantity status `unconverged` (9) judges after the polish. The fit is
+   converged when the drop is at most `1e-3` of the loss, or when no finite
+   undamped step exists. A non-finite drop is unconverged. While the test fails
+   and the damped trial budget `--fit-max-iters` (default `4 x --fit-iters`,
+   counting accepted and rejected trials) is not spent, the same LM run
+   continues with its damping from the system the test assembled, and the test
+   repeats after each further `--fit-iters` trials. An exhausted budget, a
+   damping above `1e9`, a zero loss or a failed trial ends the damped phase. At `--fit-max-iters` equal to `--fit-iters` no test runs and the
+   kernel takes exactly the passes of the damped loop alone. The extra trials
+   are booked in `gpu.fit.kernel_lm_s`, run under every `--fit-polish`
+   (including `off`), and never run on the other arms (absolute,
+   log-squashed, the log-loss and hinge forms, slope and correlation). The
+   rank, order-statistic and maximum arms keep `--fit-iters` for their squared
+   start; the slope arm passes the budget to its squared warm start. Status `9`
+   keeps its meaning after the budget: the polish rejected an undamped step
+   whose model drop exceeds `1e-3` of the loss. The budget is saved search
+   state: a checkpoint stores a value other than the default, a resume refuses
+   a different one, and `--json` reports `fitting.fit_max_iters` and
+   `gpu.fit.max_iters`.
 4. After the damped loop, four undamped Gauss–Newton steps polish the constants
    in f64 on an exact f64 copy of the training rows (uploaded once, only when
    this arm is selected), so the returned constants are not limited by the f32
@@ -1228,8 +1252,8 @@ explicit `gpu` is always honoured:
 
 **Two instantiations.** The kernel is compiled twice and dispatched on the
 batch's largest constant count. `p <= 16` keeps the 256-thread block and 256-row
-chunk it was measured with (28 040 B of shared memory); `17 <= p <= 20` uses a
-128-thread block and a 128-row chunk (31 624 B). The f32 per-row gradients (`sg`)
+chunk it was measured with (28 048 B of shared memory); `17 <= p <= 20` uses a
+128-thread block and a 128-row chunk (31 632 B). The f32 per-row gradients (`sg`)
 and the f64 polish gradients (`sdg`) share one union in the shared block: no
 phase reads both. On `sm_86` the `p <= 16` kernel runs two blocks per SM
 (registers bind) and the `17 <= p <= 20` kernel runs three (shared memory binds;
@@ -1294,7 +1318,7 @@ of the screened errors, the row count and the fixed island/population order and
 repeated runs are reproducible. Admission never changes the evaluation count or
 the exact finalist refit.
 
-The kernel returns a status. Status `0` is the ordinary success. On the LM arms (squared, absolute, log_squashed, log-loss, hinge, slope) status `4` (`rank_deficient`: the undamped, Jacobi-scaled `ln det Ã` gate says a direction is unidentified), `5` (`recovered_iterate`: the last accepted finite iterate survived a failed trial), `7` (`non_finite_start`: the f32 start has no finite value while the f64 start does) and, on the squared arm, `9` (`unconverged`, #959: the polish rejected an undamped Gauss-Newton step whose model predicted a drop above `1e-3` of the loss, so the answer is not a stationary point) are CPU fallbacks. The exact CPU fit refits them from the starting constants. The routed fit then keeps the lower exact error (configured metric, f64, on the fit rows) of the CPU fit and the device constants (#968): the device constants are scored again in f64, a tie keeps the CPU fit, a non-finite device constant or error never wins, and a fit past `--fit-fallback-max` keeps its starting constants without a comparison. The choice depends only on the two errors, so two runs give the same bits, and the per-cause counts do not change. A status-7 fit skips the CPU refit when the objective at its starting constants is non-finite on the fit rows both in the exact f64 scorer (a non-finite prediction on a row of positive weight) and in the CPU fit's own start pass, and no finite device answer competes (#988): an LM fit cannot move a non-finite start, the candidate keeps its starting constants, and `gpu.fit.fallback_skipped_by_cause` counts it while `fallback_by_cause` still includes it. Statuses `6` `no_improvement` (the start was kept) and `8` `recovered_skipped` (a finite answer whose non-finite *gradient* rows were skipped, up to the built-in row guard) stay labels on a finite answer, never CPU fallbacks; the other arms (rank, order statistic, maximum) keep `4`–`9` as labels. Status `0` (a finite answer whose non-finite *gradient* rows
+The kernel returns a status. Status `0` is the ordinary success. On the LM arms (squared, absolute, log_squashed, log-loss, hinge, slope) status `4` (`rank_deficient`: the undamped, Jacobi-scaled `ln det Ã` gate says a direction is unidentified), `5` (`recovered_iterate`: the last accepted finite iterate survived a failed trial), `7` (`non_finite_start`: the f32 start has no finite value while the f64 start does) and, on the squared arm, `9` (`unconverged`, #959: the polish rejected an undamped Gauss-Newton step whose model predicted a drop above `1e-3` of the loss, so the answer is not a stationary point) are CPU fallbacks. The exact CPU fit refits them from the starting constants. The routed fit then keeps the lower exact error (configured metric, f64, on the fit rows) of the CPU fit and the device constants (#968): the device constants are scored again in f64, a tie keeps the CPU fit, a non-finite device constant or error never wins, and a fit past `--fit-fallback-max` keeps its starting constants without a comparison. The choice depends only on the two errors, so two runs give the same bits, and the per-cause counts do not change. `gpu.fit.fallback_device_kept_by_cause` (#1042) counts the routed fits whose device constants won, under the same cause labels; `fallback_improved_by_cause` still compares the CPU fit with the starting constants. The pair tells whether a routed status pays for its refit. A status-7 fit skips the CPU refit when the objective at its starting constants is non-finite on the fit rows both in the exact f64 scorer (a non-finite prediction on a row of positive weight) and in the CPU fit's own start pass, and no finite device answer competes (#988): an LM fit cannot move a non-finite start, the candidate keeps its starting constants, and `gpu.fit.fallback_skipped_by_cause` counts it while `fallback_by_cause` still includes it. Statuses `6` `no_improvement` (the start was kept) and `8` `recovered_skipped` (a finite answer whose non-finite *gradient* rows were skipped, up to the built-in row guard) stay labels on a finite answer, never CPU fallbacks; the other arms (rank, order statistic, maximum) keep `4`–`9` as labels. Status `0` (a finite answer whose non-finite *gradient* rows
 were skipped, up to the built-in row guard). Status `1` (no finite step), `2` (no finite iterate at all), the LM statuses above, unsupported
 trees and a failed launch are refit by the exact CPU arm, seeded with the GPU
 constants (the LM statuses above start from the starting constants). Every CPU fallback is labelled by cause: `unsupported_plan`
@@ -1405,8 +1429,8 @@ second one. Their resources, from `cuobjdump -res-usage` on the built
 
 | constant cap | block | row chunk | dynamic shared | registers | stack (local frame) |
 |---:|---:|---:|---:|---:|---:|
-| 16 | 256 | 256 | 28 040 B | 127 (12.0), 128 (13.0) | 5 056 B (12.0), 4 288 B (13.0) |
-| 20 | 128 | 128 | 31 624 B | 106 (12.0), 96 (13.0) | 5 200 B (12.0), 4 480 B (13.0) |
+| 16 | 256 | 256 | 28 048 B | 127 (12.0), 128 (13.0) | 5 056 B (12.0), 4 288 B (13.0) |
+| 20 | 128 | 128 | 31 632 B | 106 (12.0), 96 (13.0) | 5 200 B (12.0), 4 480 B (13.0) |
 
 Resident blocks per SM on `sm_86`: 2 for the 256-thread instantiation, 3 for the 128-thread one (`gpu::toolchain_tests::fit_kernel_large_runs_three_blocks_per_sm`, from `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, on both toolkits).
 The 256-thread instantiation is launched as `fit_kernel_two_blocks` with `__launch_bounds__(256, 2)` (same device body as `fit_kernel`), so the register allocation keeps two resident blocks per SM on both CUDA 12.0 and CUDA 13.0. `gpu::toolchain_tests::fit_kernel_occupancy_report` prints the registers and the resident blocks from `cudaOccupancyMaxActiveBlocksPerMultiprocessor`.
@@ -1581,7 +1605,7 @@ Evidence for the default is a paired comparison against `exact` on the GPU evalu
 | 15 000, 1 x 200, 10 | all | 3 | 4.20x | 2/1/0 | 2/1 |
 | 115 500, 4 x 64, 3 | all | 2 | 1.52x | 0/2/0 | 0/2 |
 
-Provenance. The non-quiet stderr line `# gpu-fit: default -> gpu (squared, admit all)` (or `-> exact (dispatch_cost)`) appears when the GPU evaluator runs the search. On a GPU run `--json` `fitting` carries `strategy_source` (`default` or `auto`) and `strategy_reason` (`admissible` or the failing factor). `--run-manifest` carries `fit_resolution` and the development log `run_start` carries `fit_strategy_source` and `fit_strategy_reason`, both for every resolved run.
+Provenance. The non-quiet stderr line `# gpu-fit: default -> gpu (squared, admit all)` (or `-> exact (dispatch_cost)`) appears when the GPU evaluator runs the search. On a GPU run `--json` `fitting` carries `strategy_source` (`default` or `auto`) and `strategy_reason` (`admissible` or the failing factor). `--run-manifest` carries `fit_resolution` (with `fit_max_iters`, the resolved damped budget of #1042) and the development log `run_start` carries `fit_strategy_source` and `fit_strategy_reason`, both for every resolved run. The expanded `fitting` object also carries `fit_max_iters`.
 
 ### LogSquashed on the batched kernel (issue #229)
 
@@ -2426,7 +2450,7 @@ Search-level `gpu.fit.fit_kernel_s` is not a kernel-speed metric. Two builds tha
 **Record.** `RCSR_FIT_RECORD=<dir>` makes every device fit launch (`GpuEvaluator::fit_launch`, which includes the #290 dispatch probe and the warm starts of the slope, rank, order-statistic and maximum arms) write its raw kernel inputs and its result:
 
 * `data-<j>.bin`: the f32 rows, the f64 twin and weights of `set_fit_data`, and the label sign. Written once before the first call that reads them.
-* `call-<k>.bin`: programs, offsets, constant counts, start constants, `cbase`, gauge, iteration count, loss code, polish mode, and the recorded `ms`, `status`, `sse` and constants.
+* `call-<k>.bin`: programs, offsets, constant counts, start constants, `cbase`, gauge, iteration count, damped trial budget `max_iters` (#1042, call version 2), loss code, polish mode, and the recorded `ms`, `status`, `sse` and constants. A version-1 call has no budget word and replays with `max_iters = iters`.
 
 `<dir>` must not exist or must be empty. A non-empty directory prints one warning and records nothing; the recorder never overwrites. Unset, the recorder is one `Option` check per launch and one `None` field per evaluator: no file, no copy, no device work. Recording writes after the launch and never changes a result. Format and field order: the header of `src/fit_record.rs`. A call made while a slope pair mask is resident carries a flag and is skipped by the replay (the mask is not recorded).
 
@@ -2438,9 +2462,9 @@ rcsr-gpu-bench --fit-replay $G/rec --reps 5 > replay.ndjson
 rcsr-gpu-bench --fit-replay-compare replay-a.ndjson replay-b.ndjson
 ```
 
-The replay rebuilds one evaluator per `data-<j>.bin`, applies each call's polish mode and launches the recorded arrays with one warm-up rep and `--reps` timed reps (default 5). One NDJSON line per call holds the rep times and their median, the per-candidate LM and polish cycles (median over reps), `status`, a hash per candidate (`status`, `sse` bits, bits of the `pcount` constants the host reads; the kernel leaves the padding slots of a row unwritten), `out_hash` over all candidates, `same_as_recorded` (bitwise against the recording) and `stable` (same `out_hash` in every rep). The last line is the summary: summed `ms_median`, toolkit, device and `recording_hash`. The cycle words are the ones the kernel already writes; `rc_fit_last_cycles` copies them from the staging buffer and the kernel source is unchanged. A block's cycles include the time it shares its SM with the other resident block, so compare them only between replays of the same batch.
+The replay rebuilds one evaluator per `data-<j>.bin`, applies each call's polish mode and launches the recorded arrays at the recorded budget (`--max-iters-factor F` replays every call at `max_iters = F * iters` instead, #1042) with one warm-up rep and `--reps` timed reps (default 5). One NDJSON line per call holds `iters` and the `max_iters` it launched with, the rep times and their median, the per-candidate LM and polish cycles (median over reps), `status`, a hash per candidate (`status`, `sse` bits, bits of the `pcount` constants the host reads; the kernel leaves the padding slots of a row unwritten), `out_hash` over all candidates, `same_as_recorded` (bitwise against the recording) and `stable` (same `out_hash` in every rep). The last line is the summary: summed `ms_median`, toolkit, device and `recording_hash`. The cycle words are the ones the kernel already writes; `rc_fit_last_cycles` copies them from the staging buffer and the kernel source is unchanged. A block's cycles include the time it shares its SM with the other resident block, so compare them only between replays of the same batch.
 
-`--fit-replay-compare a b` prints, per call, per instantiation (`16x256`, `20x128`) and in total: the time ratio b/a, the number of candidates whose hash is equal in both replays, and the cycle ratio b/a over those candidates (speed on identical paths) and over all. It exits 2 when the `recording_hash` values differ, or the device strings differ and `--allow-device-mismatch` is not given.
+`--fit-replay-compare a b` prints, per call, per instantiation (`16x256`, `20x128`) and in total: the time ratio b/a, the number of candidates whose hash is equal in both replays, and the cycle ratio b/a over those candidates (speed on identical paths) and over all. Each call row names the `max_iters` of a and b, so one recording replayed at two budgets compares the budgets on the same work. It exits 2 when the `recording_hash` values differ, or the device strings differ and `--allow-device-mismatch` is not given.
 
 **The 2x2.** Record `R12` with the 12.0 build and `R13` with the 13.0 build, replay each recording on each build, and let `T(b, R)` be the summed `ms_median`. Then
 
@@ -2502,7 +2526,7 @@ Definitions that matter:
   seconds. `Σ stage_s + unaccounted_s = wall_s`, and more than 1 % unaccounted
   is a telemetry defect. `fit` separates raw device kernel seconds from the
   measured exact-CPU fallback and finalist-refit seconds, with
-  `fallback_by_cause` and `fallback_improved` with `fallback_improved_by_cause` (the fallbacks whose exact CPU refit lowered the exact error against the device constants, or the incoming constants when the device gave none, counted under the same cause labels; `gpu.fit` and each `gpu.generations[]` entry carry the same fields); `eval_fallback` does the same for the evaluator's CPU
+  `fallback_by_cause` and `fallback_improved` with `fallback_improved_by_cause` (the fallbacks whose exact CPU refit lowered the exact error against the device constants, or the incoming constants when the device gave none, counted under the same cause labels) and `fallback_device_kept_by_cause` (#1042: routed fallbacks whose device answer had the lower exact error and was kept); `gpu.fit` and each `gpu.generations[]` entry (as `fit_fallback_device_kept_by_cause`) carry the same fields, and `gpu.fit.max_iters` is the resolved `--fit-max-iters`; `eval_fallback` does the same for the evaluator's CPU
   pool. Every derived value is
   `{value,numerator,denominator,units,scope}`. `features`, `pnl` and `io` are
   present even when their stage did not run, so a reader never has to infer a

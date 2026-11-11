@@ -51,7 +51,7 @@ fn run_compare(a: &str, b: &str, allow_device_mismatch: bool) -> i32 {
     }
 }
 
-fn run_replay(dir: &str, reps: usize) -> i32 {
+fn run_replay(dir: &str, reps: usize, max_iters_factor: Option<u32>) -> i32 {
     if reps == 0 {
         eprintln!("error: --reps needs at least 1 for --fit-replay");
         return 2;
@@ -83,6 +83,15 @@ fn run_replay(dir: &str, reps: usize) -> i32 {
             };
             evs.insert(call.data, ev);
         }
+        // #1042: `--max-iters-factor F` replays every call with `max_iters = F * iters`.
+        let scaled;
+        let call = match max_iters_factor {
+            Some(f) => {
+                scaled = fit_record::RecCall { max_iters: call.iters.saturating_mul(f), ..call.clone() };
+                &scaled
+            }
+            None => call,
+        };
         let ev = evs.get_mut(&call.data).unwrap();
         let kmax = call.kmax as usize;
         let inst = match rcsr::gpu::fit_kernel_shape(kmax) {
@@ -122,6 +131,8 @@ fn run_replay(dir: &str, reps: usize) -> i32 {
         let line = ReplayLine {
             call: *k,
             inst,
+            iters: call.iters,
+            max_iters: call.max_iters,
             ms_median: median(&mut ms.clone()),
             lm: (0..nprog).map(|i| mid(0, i)).collect(),
             polish: (0..nprog).map(|i| mid(1, i)).collect(),
@@ -153,6 +164,7 @@ fn main() {
     let mut compare: Option<(String, String)> = None;
     let mut allow_device_mismatch = false;
     let mut reps_given = false;
+    let mut max_iters_factor: Option<u32> = None;
     let mut path = "examples/sine.csv".to_string();
     let mut target = "y".to_string();
     let mut vars: Vec<String> = vec!["x".to_string()];
@@ -204,6 +216,15 @@ fn main() {
                 i += 2;
             }
             "--allow-device-mismatch" => allow_device_mismatch = true,
+            "--max-iters-factor" => {
+                i += 1;
+                let f: u32 = parse_uint("--max-iters-factor", args.get(i));
+                if f == 0 {
+                    eprintln!("error: --max-iters-factor needs an integer >= 1, got '0'");
+                    std::process::exit(2);
+                }
+                max_iters_factor = Some(f);
+            }
             "--reps" => {
                 i += 1;
                 reps_given = true;
@@ -219,7 +240,7 @@ fn main() {
             }
             "-h" | "--help" => {
                 println!(
-                    "rcsr-gpu-bench [--data file] [--target y] [--vars a,b] [--batch N] [--depth D] [--seed S] [--reps R]\n\nrcsr-gpu-bench --fit-replay <dir> [--reps N]\n    Replay the fit launches recorded with RCSR_FIT_RECORD=<dir> (rcsr run on a CUDA build).\n    One warm-up rep, then N timed reps (default 5). Prints one NDJSON line per call and a\n    summary line: per-candidate cycles, output hashes and same_as_recorded.\nrcsr-gpu-bench --fit-replay-compare <a.ndjson> <b.ndjson> [--allow-device-mismatch]\n    Per-call and total time ratio b/a, matching candidates and cycle ratios of two replays of\n    one recording. Exit 2 when the recordings or devices differ."
+                    "rcsr-gpu-bench [--data file] [--target y] [--vars a,b] [--batch N] [--depth D] [--seed S] [--reps R]\n\nrcsr-gpu-bench --fit-replay <dir> [--reps N] [--max-iters-factor F]\n    Replay the fit launches recorded with RCSR_FIT_RECORD=<dir> (rcsr run on a CUDA build).\n    One warm-up rep, then N timed reps (default 5). Prints one NDJSON line per call and a\n    summary line: per-candidate cycles, output hashes and same_as_recorded. Each call replays\n    with its recorded damped budget (a version-1 call: max_iters = iters); --max-iters-factor F\n    replays it with max_iters = F * iters.\nrcsr-gpu-bench --fit-replay-compare <a.ndjson> <b.ndjson> [--allow-device-mismatch]\n    Per-call and total time ratio b/a, matching candidates and cycle ratios of two replays of\n    one recording. Each call row names the max_iters of a and b. Exit 2 when the recordings or devices differ."
                 );
                 return;
             }
@@ -232,7 +253,7 @@ fn main() {
         std::process::exit(run_compare(&a, &b, allow_device_mismatch));
     }
     if let Some(dir) = replay_dir {
-        std::process::exit(run_replay(&dir, if reps_given { reps } else { 5 }));
+        std::process::exit(run_replay(&dir, if reps_given { reps } else { 5 }, max_iters_factor));
     }
 
     let table = match data::read_table(&path) {

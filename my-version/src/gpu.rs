@@ -938,7 +938,9 @@ extern "C" {
        #229: `metric` selects the objective: 0 = squared, 1 = log-squashed,
        2 = correlation (1-|rho|), 3 = correlation_signed (1-rho).
        #224: `gauge` holds two constant slots per candidate (scale, offset);
-       -1 means absent. The correlation path freezes and renormalises them. */
+       -1 means absent. The correlation path freezes and renormalises them.
+       #1042: `max_iters` is the damped trial budget of the squared arm, at
+       least `iters`; `max_iters == iters` runs no continuation. */
     fn rc_fit_batch(
         ctx: *mut RawCtx,
         prog: *const u32,
@@ -949,6 +951,7 @@ extern "C" {
         c0: *const f64,
         gauge: *const i32,
         iters: i32,
+        max_iters: i32,
         metric: i32,
         outc: *mut f64,
         outsse: *mut f64,
@@ -967,6 +970,7 @@ extern "C" {
         cbase: *const f64,
         gauge: *const i32,
         iters: i32,
+        max_iters: i32,
         metric: i32,
         outc: *mut f64,
         outsse: *mut f64,
@@ -1585,6 +1589,7 @@ struct FitInputs<'a> {
     cbase: Option<&'a [f64]>,
     gauge: &'a [i32],
     iters: usize,
+    max_iters: usize,
     loss: i32,
 }
 
@@ -2850,25 +2855,44 @@ impl GpuEvaluator {
     /// constants and downloads the results. A negative time means the launch
     /// failed and every result must be discarded (the caller falls back to the
     /// CPU for the whole batch).
+    ///
+    /// The damped budget is exactly `iters`: [`Self::fit_batch_capped`] with
+    /// `max_iters == iters`.
     pub(crate) fn fit_batch(
         &mut self,
         plans: &[&crate::fit::GpuFitPlan],
         iters: usize,
         loss: crate::fit::DeviceLoss,
     ) -> (Vec<GpuFitOutput>, f32) {
-        self.fit_launch(plans, None, false, iters, loss)
+        self.fit_batch_capped(plans, iters, iters, loss)
     }
 
-    /// #236: [`Self::fit_batch`] from explicit start constants, one vector per
-    /// plan in slot order. With `keep_incoming` the slope arm returns a plan's
-    /// own constants (`plan.c0`) unless its answer is finite and strictly lower
-    /// on the f64 slope sum.
+    /// #1042: [`Self::fit_batch`] with a damped trial budget `max_iters`
+    /// (clamped to at least `iters`). After `iters` trials the squared arm
+    /// tests convergence (the Gauss-Newton model drop at the current constants
+    /// against `1e-3` of the loss) and takes more damped trials while it
+    /// fails, up to `max_iters`, before the polish. Every other arm ignores it.
+    pub(crate) fn fit_batch_capped(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        iters: usize,
+        max_iters: usize,
+        loss: crate::fit::DeviceLoss,
+    ) -> (Vec<GpuFitOutput>, f32) {
+        self.fit_launch(plans, None, false, iters, max_iters, loss)
+    }
+
+    /// #236: [`Self::fit_batch_capped`] from explicit start constants, one
+    /// vector per plan in slot order. With `keep_incoming` the slope arm
+    /// returns a plan's own constants (`plan.c0`) unless its answer is finite
+    /// and strictly lower on the f64 slope sum.
     pub(crate) fn fit_batch_from(
         &mut self,
         plans: &[&crate::fit::GpuFitPlan],
         starts: &[Vec<f64>],
         keep_incoming: bool,
         iters: usize,
+        max_iters: usize,
         loss: crate::fit::DeviceLoss,
     ) -> (Vec<GpuFitOutput>, f32) {
         if starts.len() != plans.len()
@@ -2876,7 +2900,7 @@ impl GpuEvaluator {
         {
             return (Vec::new(), -1.0);
         }
-        self.fit_launch(plans, Some(starts), keep_incoming, iters, loss)
+        self.fit_launch(plans, Some(starts), keep_incoming, iters, max_iters, loss)
     }
 
     /// The one place the fit entry points are called from raw arrays.
@@ -2900,6 +2924,7 @@ impl GpuEvaluator {
                     a.c0.as_ptr(),
                     a.gauge.as_ptr(),
                     a.iters as i32,
+                    a.max_iters as i32,
                     a.loss,
                     outc.as_mut_ptr(),
                     outsse.as_mut_ptr(),
@@ -2917,6 +2942,7 @@ impl GpuEvaluator {
                     a.cbase.map_or(std::ptr::null(), |c| c.as_ptr()),
                     a.gauge.as_ptr(),
                     a.iters as i32,
+                    a.max_iters as i32,
                     a.loss,
                     outc.as_mut_ptr(),
                     outsse.as_mut_ptr(),
@@ -2937,6 +2963,7 @@ impl GpuEvaluator {
         cbase: Option<Vec<f64>>,
         gauge: Vec<i32>,
         iters: usize,
+        max_iters: usize,
         loss: i32,
         ms: f32,
         outc: &[f64],
@@ -2954,6 +2981,7 @@ impl GpuEvaluator {
             data: 0,
             flags,
             iters: iters as u32,
+            max_iters: max_iters.max(iters) as u32,
             loss,
             polish: rec.polish,
             nprog,
@@ -3007,6 +3035,7 @@ impl GpuEvaluator {
             cbase: call.cbase.as_deref(),
             gauge: &call.gauge,
             iters: call.iters as usize,
+            max_iters: call.max_iters as usize,
             loss: call.loss,
         };
         let ms = self.fit_raw(&inp, true, &mut outc, &mut outsse, &mut outstatus);
@@ -3032,6 +3061,7 @@ impl GpuEvaluator {
         starts: Option<&[Vec<f64>]>,
         keep_incoming: bool,
         iters: usize,
+        max_iters: usize,
         loss: crate::fit::DeviceLoss,
     ) -> (Vec<GpuFitOutput>, f32) {
         let nprog = plans.len();
@@ -3075,12 +3105,13 @@ impl GpuEvaluator {
                 cbase: if keep_incoming { Some(&cbase) } else { None },
                 gauge: &gauge,
                 iters,
+                max_iters,
                 loss: loss.code(),
             };
             self.fit_raw(&inp, from, &mut outc, &mut outsse, &mut outstatus)
         };
         if self.rec.is_some() {
-            self.record_fit(words, off, pcount, c0, keep_incoming.then_some(cbase), gauge, iters, loss.code(), ms, &outc, &outsse, &outstatus);
+            self.record_fit(words, off, pcount, c0, keep_incoming.then_some(cbase), gauge, iters, max_iters, loss.code(), ms, &outc, &outsse, &outstatus);
         }
         if ms < 0.0 {
             return (Vec::new(), ms);
@@ -3113,6 +3144,18 @@ impl GpuEvaluator {
         plans: &[&crate::fit::GpuFitPlan],
         iters: usize,
     ) -> (Vec<GpuFitOutput>, f32) {
+        self.slope_fit_batch_capped(plans, iters, iters)
+    }
+
+    /// #1042: [`Self::slope_fit_batch`] whose squared warm start has the
+    /// damped trial budget `max_iters` of [`Self::fit_batch_capped`]. The slope
+    /// IRLS keeps `iters`.
+    pub(crate) fn slope_fit_batch_capped(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        iters: usize,
+        max_iters: usize,
+    ) -> (Vec<GpuFitOutput>, f32) {
         if iters == 0 {
             let out = plans
                 .iter()
@@ -3124,7 +3167,8 @@ impl GpuEvaluator {
                 .collect();
             return (out, 0.0);
         }
-        let (mut out, lm_ms) = self.fit_batch(plans, iters, crate::fit::DeviceLoss::Squared);
+        let (mut out, lm_ms) =
+            self.fit_batch_capped(plans, iters, max_iters, crate::fit::DeviceLoss::Squared);
         if out.len() != plans.len() {
             return (Vec::new(), -1.0);
         }
@@ -3139,7 +3183,7 @@ impl GpuEvaluator {
         let sub: Vec<&crate::fit::GpuFitPlan> = idx.iter().map(|&k| plans[k]).collect();
         let starts: Vec<Vec<f64>> = idx.iter().map(|&k| out[k].c.clone()).collect();
         let (res, ms) =
-            self.fit_batch_from(&sub, &starts, true, iters, crate::fit::DeviceLoss::Slope);
+            self.fit_batch_from(&sub, &starts, true, iters, iters, crate::fit::DeviceLoss::Slope);
         if ms < 0.0 || res.len() != sub.len() {
             return (Vec::new(), -1.0);
         }

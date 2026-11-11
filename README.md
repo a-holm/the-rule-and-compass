@@ -658,7 +658,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--null-runs N] [--null-block N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
-     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--fit-polish f64|f32|off] [--fit-irls nested|reweighted|reweighted-final] [--refit-band F|inf] [--no-fit]
+     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--fit-polish f64|f32|off] [--fit-max-iters N] [--fit-irls nested|reweighted|reweighted-final] [--refit-band F|inf] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring] [--reject-fixed-position]
@@ -1310,6 +1310,7 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   `0` (the default) keeps the historical path; the flag is independent of
   `--predictor-samples`;
 - **a cheaper `absolute` fit** (`--fit-irls reweighted|reweighted-final`, default `nested`): the CPU twin of the device L1 kernel, one Levenberg-Marquardt over the true L1 loss with the weights rebuilt at every assembly, needing about half the row passes of today's nested IRLS. It changes the fitted constants, so it is off by default and saved in the checkpoint; every reported front member is refit on `nested` IRLS (see `docs/optimisation.md`);
+- **device fit convergence** (`--fit-max-iters N`, default `4 x --fit-iters`): after `--fit-iters` damped trials the device fit kernel tests convergence on the squared arm (the Gauss-Newton model drop at the current constants against `1e-3` of the loss) and takes more damped trials while it fails, up to `N` in all, before the polish. `N = --fit-iters` runs no extra trial. `gpu.fit.fallback_device_kept_by_cause` counts routed fits whose device answer beat the CPU refit (see `docs/gpu-backend.md`);
 - **seeded starts** (`--seed-expr`, `--seed-file`): prior solutions are parsed,
   simplified, fitted and inserted into the archive and every island before
   generation 1; a seed is an elite, kept even above `--max-complexity`;

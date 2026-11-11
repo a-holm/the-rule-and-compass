@@ -326,6 +326,28 @@ fn fit_portfolio_settings_round_trip() {
     assert_eq!(cp.to_text(), text, "round trip must preserve the new fields");
 }
 
+/// #1042: the default budget writes no record and resumes as `4 * fit_iters`;
+/// another budget is saved, read back and changes the config hash.
+#[test]
+fn fit_max_iters_round_trips_and_defaults_to_four_times_fit_iters() {
+    let train = sample(120);
+    let test = sample(40);
+    let base = config(5);
+    let default_text = checkpoint_text(&base, &train, &test);
+    assert!(!default_text.contains("fit_max_iters"), "the default leaves the checkpoint bytes unchanged");
+    let cp = Checkpoint::from_text(&default_text).expect("parse");
+    assert_eq!(cp.config.fit_max_iters_effective(), 4 * base.fit_iters);
+    let spelled = Config { fit_max_iters: 4 * base.fit_iters, ..base.clone() };
+    assert_eq!(config_hash(&spelled), config_hash(&base), "0 and 4 * fit_iters are one budget");
+    let wide = Config { fit_max_iters: 20, ..base.clone() };
+    let text = checkpoint_text(&wide, &train, &test);
+    assert!(text.contains("config fit_max_iters 20\n"), "{text}");
+    let cp = Checkpoint::from_text(&text).expect("parse");
+    assert_eq!(cp.config.fit_max_iters_effective(), 20);
+    assert_eq!(cp.to_text(), text);
+    assert_ne!(config_hash(&cp.config), config_hash(&base));
+}
+
 #[test]
 fn an_uninterrupted_run_and_a_saved_then_resumed_run_match_exactly() {
     let train = sample(240);
@@ -861,6 +883,53 @@ fn cli_resume_errors_use_the_documented_exit_codes() {
         corrupt.as_str(),
     ]);
     assert_eq!(refused.status.code(), Some(3), "corrupt input is exit 3");
+}
+
+/// #1042: `--fit-max-iters` is saved search state. A resume with a different
+/// explicit budget exits 2 naming the saved value; the same budget, or none,
+/// resumes. A budget below `--fit-iters` is a usage error.
+#[test]
+fn resume_refuses_a_different_fit_max_iters() {
+    let csv = TempPath::new("budget.csv");
+    std::fs::write(&csv.0, line_csv(40)).expect("write csv");
+    let checkpoint = TempPath::new("budget.rcsr");
+    let common = |extra: &[&str]| {
+        let mut args = vec![
+            "--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "1", "--islands", "1", "--pop", "20",
+            "--fit-iters", "4", "--cpu", "--quiet",
+        ];
+        args.extend_from_slice(extra);
+        rcsr(&args)
+    };
+    let low = common(&["--generations", "2", "--fit-max-iters", "3"]);
+    assert_eq!(low.status.code(), Some(2), "{}", String::from_utf8_lossy(&low.stderr));
+    let err = String::from_utf8_lossy(&low.stderr);
+    assert!(err.contains("--fit-max-iters must be at least --fit-iters (3 < 4)"), "{err}");
+
+    let made = common(&["--generations", "3", "--fit-max-iters", "20", "--save", checkpoint.as_str()]);
+    assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+    let text = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
+    assert!(text.contains("config fit_max_iters 20\n"), "{text}");
+
+    let refused = common(&["--generations", "6", "--fit-max-iters", "24", "--resume", checkpoint.as_str()]);
+    assert_eq!(refused.status.code(), Some(2), "{}", String::from_utf8_lossy(&refused.stderr));
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(err.contains("--fit-max-iters 24 (saved 20)"), "{err}");
+    let default = common(&["--generations", "6", "--fit-max-iters", "0", "--resume", checkpoint.as_str()]);
+    assert_eq!(default.status.code(), Some(2), "0 is the default 16, not the saved 20");
+    assert!(String::from_utf8_lossy(&default.stderr).contains("--fit-max-iters 0 (saved 20)"));
+
+    let same = common(&["--generations", "6", "--fit-max-iters", "20", "--resume", checkpoint.as_str()]);
+    assert!(same.status.success(), "{}", String::from_utf8_lossy(&same.stderr));
+    let implicit = common(&["--generations", "6", "--resume", checkpoint.as_str()]);
+    assert!(implicit.status.success(), "{}", String::from_utf8_lossy(&implicit.stderr));
+
+    let plain = TempPath::new("plain.rcsr");
+    let made = common(&["--generations", "3", "--save", plain.as_str()]);
+    assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+    assert!(!std::fs::read_to_string(&plain.0).expect("read checkpoint").contains("fit_max_iters"));
+    let spelled = common(&["--generations", "6", "--fit-max-iters", "16", "--resume", plain.as_str()]);
+    assert!(spelled.status.success(), "4 x --fit-iters is the saved default: {}", String::from_utf8_lossy(&spelled.stderr));
 }
 
 fn pnl_config(seed: u32, cost_bps: f64, train: &Sample) -> Config {
