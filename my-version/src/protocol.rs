@@ -742,6 +742,21 @@ impl Ledger {
         Ok(candidate)
     }
 
+    /// Check that a recompute of the locked read of `id` is allowed: sealed,
+    /// matching hashes and a recorded read. Refuses before any locked row is scored.
+    pub fn authorize_verify(
+        &self,
+        sealed: &std::path::Path,
+        id: &str,
+        data_sha256: &str,
+        build_commit: &str,
+        bind: Option<RangeBinding>,
+    ) -> Result<Candidate, String> {
+        let candidate = self.authorize_sealed(sealed, id, data_sha256, build_commit, bind)?;
+        self.read_report_sha(id)?.ok_or("no recorded read for this candidate")?;
+        Ok(candidate)
+    }
+
     /// Check that a locked read of `id` is allowed: sealed, matching hashes and
     /// not read before. Returns the sealed entry.
     pub fn authorize_read(
