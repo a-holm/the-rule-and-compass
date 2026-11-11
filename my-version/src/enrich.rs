@@ -1665,6 +1665,8 @@ pub struct Options {
     pub labels: Vec<String>,
     pub replace: bool,
     pub chunk_rows: usize,
+    /// Feature-pass workers; the default is the CPUs this process may run on.
+    pub threads: usize,
     pub group_rows: usize,
     pub bar_seconds: Option<i64>,
     pub time_col: Option<String>,
@@ -1691,6 +1693,11 @@ pub struct Options {
     pub json: bool,
 }
 
+/// CPUs this process may run on (the affinity mask is honoured), at least 1.
+fn default_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
 impl Default for Options {
     fn default() -> Self {
         Options {
@@ -1700,6 +1707,7 @@ impl Default for Options {
             labels: Vec::new(),
             replace: false,
             chunk_rows: store::DEFAULT_GROUP_ROWS,
+            threads: default_threads(),
             group_rows: 0,
             bar_seconds: None,
             time_col: None,
@@ -1765,6 +1773,7 @@ pub struct Report {
     pub symbols: usize,
     pub group_rows: usize,
     pub chunk_rows: usize,
+    pub threads: usize,
     pub bar_seconds: i64,
     /// Store-wide lookback embargo and the column that sets it.
     pub lockbox_embargo: (i64, String),
@@ -1834,11 +1843,12 @@ impl Report {
                 self.bar_seconds
             ),
             format!(
-                "# enrich: features={} labels={} group_rows={} chunk_rows={}",
+                "# enrich: features={} labels={} group_rows={} chunk_rows={} threads={}",
                 self.features.iter().filter(|f| !f.label).count(),
                 self.features.iter().filter(|f| f.label).count(),
                 self.group_rows,
-                self.chunk_rows
+                self.chunk_rows,
+                self.threads
             ),
             format!(
                 "# enrich: backend={} gpu_requested={} gpu_available={} device={}",
@@ -2026,7 +2036,7 @@ impl Report {
             "{{\n  \"tool\":\"rcsr enrich\",\n  \"input\":{},\"output\":{},\n  \
              \"input_sha256\":{},\"output_sha256\":{},\"output_bytes\":{},\n  \
              \"rows\":{},\"columns_in\":{},\"columns_out\":{},\"groups\":{},\"symbols\":{},\n  \
-             \"group_rows\":{},\"chunk_rows\":{},\"bar_seconds\":{},\n  \
+             \"group_rows\":{},\"chunk_rows\":{},\"threads\":{},\"bar_seconds\":{},\n  \
              \"lockbox_embargo\":{},\n  \
              \"backend\":{},\"gpu_requested\":{},\"gpu_probed\":{},\"gpu_available\":{},\"gpu_device\":{},\n  \
              \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"write_s\":{:.6},\"transfer_bytes\":{},\"write_bw\":{:.0},\"fallback_columns\":[{}]}},\n  \
@@ -2045,6 +2055,7 @@ impl Report {
             self.symbols,
             self.group_rows,
             self.chunk_rows,
+            self.threads,
             self.bar_seconds,
             crate::lockbox::embargo_json(self.lockbox_embargo.0, &self.lockbox_embargo.1, EMBARGO_RULE, self.bar_seconds),
             jstr(&self.backend),
@@ -6174,12 +6185,37 @@ struct Context<'a> {
     eth: &'a Cross,
 }
 
-fn compute_series(
-    s: &Series,
+/// Everything one segment contributes, computed away from the temp columns so
+/// workers can run in parallel; [`commit_segment`] applies it in segment order.
+struct SegmentOutput {
+    symbol: String,
+    /// Column values in the order they are written to the temp files.
+    columns: Vec<(String, Vec<f64>)>,
+    /// Exact warm-up of the #125 names, applied before the values are written.
+    warmups: Vec<(String, usize)>,
+    /// Nominal warm-up of the in-module names, asserted when committed.
+    own_warmups: Vec<(String, usize)>,
+    /// One per `ctx.long_labels`.
+    long: Vec<crate::labels::LongLabels>,
+}
+
+fn compute_segment(
+    store: &FileStore,
+    seg: &Segment,
+    cols: &Cols,
+    step: i64,
     ctx: &Context,
-    cols: &mut BTreeMap<String, TempColumn>,
-    long_acc: &mut [crate::labels::LabelAccumulator],
-) -> Result<(), String> {
+    long_build: &[crate::labels::LabelAccumulator],
+) -> Result<SegmentOutput, String> {
+    let s = load_series(store, seg, cols, step)?;
+    let s = &s;
+    let mut out = SegmentOutput {
+        symbol: s.symbol.clone(),
+        columns: Vec::new(),
+        warmups: Vec::new(),
+        own_warmups: Vec::new(),
+        long: Vec::new(),
+    };
     let base = Base::new(s);
     let bars = if !ctx.legacy.is_empty() || !ctx.labels.is_empty() || !ctx.long_labels.is_empty() {
         Some(s.bars())
@@ -6194,12 +6230,8 @@ fn compute_series(
             None,
         )?;
         for c in computed {
-            if let Some(t) = cols.get_mut(&c.name) {
-                // #125 reports the exact warm-up for its own names; use it
-                // rather than this module's nominal table.
-                t.warmup = c.warmup;
-                t.write_values(&c.values)?;
-            }
+            out.warmups.push((c.name.clone(), c.warmup));
+            out.columns.push((c.name, c.values));
         }
     }
     if !ctx.py15m_requested.is_empty() {
@@ -6208,9 +6240,7 @@ fn compute_series(
             let values = all
                 .get(name)
                 .ok_or_else(|| format!("py15m column '{}' was not produced", name))?;
-            if let Some(t) = cols.get_mut(name) {
-                t.write_values(values)?;
-            }
+            out.columns.push((name.clone(), values.clone()));
         }
     }
     if !ctx.compact.is_empty() {
@@ -6219,9 +6249,7 @@ fn compute_series(
             let values = all
                 .get(name)
                 .ok_or_else(|| format!("compact column '{}' was not produced", name))?;
-            if let Some(t) = cols.get_mut(name) {
-                t.write_values(values)?;
-            }
+            out.columns.push((name.clone(), values.clone()));
         }
     }
     if !ctx.flow.is_empty() {
@@ -6230,9 +6258,7 @@ fn compute_series(
             let values = all
                 .get(name)
                 .ok_or_else(|| format!("flow column '{}' was not produced", name))?;
-            if let Some(t) = cols.get_mut(name) {
-                t.write_values(values)?;
-            }
+            out.columns.push((name.clone(), values.clone()));
         }
     }
     if !ctx.price_action.is_empty() {
@@ -6241,9 +6267,7 @@ fn compute_series(
             let values = all
                 .get(name)
                 .ok_or_else(|| format!("price_action column '{}' was not produced", name))?;
-            if let Some(t) = cols.get_mut(name) {
-                t.write_values(values)?;
-            }
+            out.columns.push((name.clone(), values.clone()));
         }
     }
     if !ctx.mtf.is_empty() {
@@ -6253,17 +6277,13 @@ fn compute_series(
             let values = all
                 .get(name)
                 .ok_or_else(|| format!("multi-timeframe column '{}' was not produced", name))?;
-            if let Some(t) = cols.get_mut(name) {
-                t.write_values(values)?;
-            }
+            out.columns.push((name.clone(), values.clone()));
         }
     }
     for name in &ctx.own {
         let (values, warmup) = compute_own(name, s, &base, ctx)?;
-        if let Some(t) = cols.get_mut(name) {
-            debug_assert_eq!(t.warmup, warmup);
-            t.write_values(&values)?;
-        }
+        out.own_warmups.push((name.clone(), warmup));
+        out.columns.push((name.clone(), values));
     }
     if let Some(bars) = bars {
         for (lname, spec) in &ctx.labels {
@@ -6271,21 +6291,132 @@ fn compute_series(
                 .tf
                 .ok_or_else(|| "labels need a recognised timeframe (use --bar-seconds)".to_string())?;
             let col = features::forward_label(&bars, tf, spec);
-            if let Some(t) = cols.get_mut(lname) {
-                t.write_values(&col.values)?;
-            }
+            out.columns.push((lname.clone(), col.values));
         }
-        for (spec, acc) in ctx.long_labels.iter().zip(long_acc.iter_mut()) {
+        for (spec, acc) in ctx.long_labels.iter().zip(long_build.iter()) {
             let built = acc.build(&bars, None)?;
             for (kind, _) in crate::labels::COLUMN_KINDS {
-                if let (Some(t), Some(v)) = (cols.get_mut(&spec.column(kind)), built.column(kind)) {
-                    t.write_values(v)?;
+                if let Some(v) = built.column(kind) {
+                    out.columns.push((spec.column(kind), v.to_vec()));
                 }
             }
-            acc.add(&s.symbol, &built);
+            out.long.push(built);
         }
     }
+    Ok(out)
+}
+
+fn commit_segment(
+    out: SegmentOutput,
+    cols: &mut BTreeMap<String, TempColumn>,
+    long_acc: &mut [crate::labels::LabelAccumulator],
+) -> Result<(), String> {
+    for (name, warmup) in &out.warmups {
+        if let Some(t) = cols.get_mut(name) {
+            t.warmup = *warmup;
+        }
+    }
+    for (name, warmup) in &out.own_warmups {
+        if let Some(t) = cols.get(name) {
+            debug_assert_eq!(t.warmup, *warmup);
+        }
+    }
+    for (name, values) in &out.columns {
+        if let Some(t) = cols.get_mut(name) {
+            t.write_values(values)?;
+        }
+    }
+    for (acc, built) in long_acc.iter_mut().zip(&out.long) {
+        acc.add(&out.symbol, built);
+    }
     Ok(())
+}
+
+/// Computes the segments of one batch on up to `workers` threads and commits
+/// them in segment order. At most `2 * workers` outputs exist at once.
+#[allow(clippy::too_many_arguments)]
+fn run_segments(
+    store: &FileStore,
+    segs: &[Segment],
+    cols: &Cols,
+    step: i64,
+    ctx: &Context,
+    long_build: &[crate::labels::LabelAccumulator],
+    workers: usize,
+    temp: &mut BTreeMap<String, TempColumn>,
+    long_acc: &mut [crate::labels::LabelAccumulator],
+) -> Result<(), String> {
+    let workers = workers.min(segs.len());
+    if workers <= 1 {
+        for seg in segs {
+            let out = compute_segment(store, seg, cols, step, ctx, long_build)?;
+            commit_segment(out, temp, long_acc)?;
+        }
+        return Ok(());
+    }
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{mpsc, Condvar, Mutex};
+    let window = 2 * workers;
+    let next_claim = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let gate = (Mutex::new(0usize), Condvar::new());
+    let (tx, rx) = mpsc::sync_channel::<(usize, Result<SegmentOutput, String>)>(workers);
+    std::thread::scope(|sc| {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let (next_claim, stop, gate) = (&next_claim, &stop, &gate);
+            sc.spawn(move || loop {
+                let idx = next_claim.fetch_add(1, Ordering::Relaxed);
+                if idx >= segs.len() {
+                    break;
+                }
+                {
+                    let mut committed = gate.0.lock().unwrap();
+                    while idx >= *committed + window && !stop.load(Ordering::Relaxed) {
+                        committed = gate.1.wait(committed).unwrap();
+                    }
+                }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let r = compute_segment(store, &segs[idx], cols, step, ctx, long_build);
+                if tx.send((idx, r)).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(tx);
+        let mut buffer: BTreeMap<usize, Result<SegmentOutput, String>> = BTreeMap::new();
+        let mut next = 0usize;
+        let mut result: Result<(), String> = Ok(());
+        while next < segs.len() {
+            let item = match buffer.remove(&next) {
+                Some(r) => r,
+                None => match rx.recv() {
+                    Ok((idx, r)) => {
+                        buffer.insert(idx, r);
+                        continue;
+                    }
+                    Err(_) => Err("a feature worker ended without a result".to_string()),
+                },
+            };
+            match item.and_then(|out| commit_segment(out, temp, long_acc)) {
+                Ok(()) => {
+                    next += 1;
+                    *gate.0.lock().unwrap() = next;
+                    gate.1.notify_all();
+                }
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        gate.1.notify_all();
+        drop(rx);
+        result
+    })
 }
 
 fn benchmark_return(s: &Series, b: &Base, cross: &Cross, k: usize, relative: bool) -> Vec<f64> {
@@ -8442,8 +8573,9 @@ fn enrich_inner(
         eth: &eth,
     };
 
-    // Feature pass, one symbol at a time in row order. `--chunk-rows` bounds
-    // the read/compute batch; it never changes arithmetic or output order.
+    // Feature pass: segments are computed on `--threads` workers and committed
+    // in segment order. `--chunk-rows` bounds the read/compute batch; it never
+    // changes arithmetic or output order.
     let has_cpu_work = !ctx.legacy.is_empty()
         || !ctx.own.is_empty()
         || !ctx.py15m_requested.is_empty()
@@ -8454,18 +8586,19 @@ fn enrich_inner(
         || !ctx.labels.is_empty()
         || !ctx.long_labels.is_empty();
     if has_cpu_work {
+        let workers = opts.threads.max(1);
+        let long_build = long_acc.clone();
+        // One batch holds `--chunk-rows` rows per worker so every worker has a segment.
+        let batch_rows = opts.chunk_rows.saturating_mul(workers);
         let mut i = 0usize;
         while i < segs.len() {
             let start = i;
             let mut rows = 0usize;
-            while i < segs.len() && (rows == 0 || rows + segs[i].len <= opts.chunk_rows) {
+            while i < segs.len() && (rows == 0 || rows + segs[i].len <= batch_rows) {
                 rows += segs[i].len;
                 i += 1;
             }
-            for seg in &segs[start..i] {
-                let s = load_series(&store, seg, &cols, step)?;
-                compute_series(&s, &ctx, &mut temp, &mut long_acc)?;
-            }
+            run_segments(&store, &segs[start..i], &cols, step, &ctx, &long_build, workers, &mut temp, &mut long_acc)?;
         }
     }
     let feature_cpu_seconds = t_cpu_pass.elapsed().as_secs_f64();
@@ -8807,6 +8940,7 @@ fn enrich_inner(
             symbols: segs.len(),
             group_rows: store.group_rows(),
             chunk_rows: opts.chunk_rows,
+            threads: opts.threads.max(1),
             bar_seconds: step,
             lockbox_embargo: embargo_l.clone(),
             features: reports,
@@ -8876,6 +9010,7 @@ fn enrich_inner(
         symbols: segs.len(),
         group_rows: store.group_rows(),
         chunk_rows: opts.chunk_rows,
+        threads: opts.threads.max(1),
         bar_seconds: step,
         lockbox_embargo: embargo_l.clone(),
         features: reports,
@@ -9071,6 +9206,13 @@ pub fn run(args: &[String]) -> ! {
                     fail("--chunk-rows needs a positive integer");
                 }
             }
+            "--threads" => {
+                let v = val!();
+                opts.threads = v.parse().unwrap_or(0);
+                if opts.threads == 0 {
+                    fail("--threads needs a positive integer");
+                }
+            }
             "--group-rows" => {
                 let v = val!();
                 opts.group_rows = v.parse().unwrap_or(0);
@@ -9247,6 +9389,9 @@ INPUT / OUTPUT:
                           existing column is preserved byte for byte
   --chunk-rows <n>        read/compute batch size (default 65536); arithmetic
                           and output hashes are identical for every size
+  --threads <n>           feature-pass workers (default: available CPUs); at most 2 x n
+                          segment outputs are held at once; arithmetic and output
+                          hashes are identical for every n
   --group-rows <n>        group size for a CSV input store (store input keeps
                           its own layout)
   --bar-seconds <n>       expected bar spacing; inferred from the modal spacing
