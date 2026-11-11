@@ -141,20 +141,36 @@ pub fn calmar(cagr: f64, max_drawdown: f64) -> f64 {
 /// Per-side cost in basis points at which the mean net return is zero.
 ///
 /// The cost charged per period is `gross - net`, linear in the per-side cost,
-/// so the break-even is `base_bps * mean(gross) / mean(gross - net)`. `NaN`
-/// when the series paid no cost.
+/// so the break-even is `base_bps * sum(gross) / sum(gross - net)`. `NaN` when
+/// the series paid no cost or its summed gross return is not positive: no cost
+/// level zeroes the mean net return of a losing book.
 pub fn break_even_bps(net: &[f64], gross: &[f64], base_bps: f64) -> f64 {
-    let n = net.len().min(gross.len());
-    if n == 0 {
-        return f64::NAN;
-    }
-    let g = gross[..n].iter().sum::<f64>();
-    let c = gross[..n].iter().zip(&net[..n]).map(|(g, n)| g - n).sum::<f64>();
-    if c > 0.0 {
+    let (g, c) = gross_and_cost(net, gross);
+    if g > 0.0 && c > 0.0 {
         base_bps * g / c
     } else {
         f64::NAN
     }
+}
+
+/// Why `break_even_bps` is defined or not: `defined`, `gross_nonpositive`
+/// (summed gross <= 0 with a cost paid) or `no_cost` (no cost paid).
+pub fn break_even_status(net: &[f64], gross: &[f64]) -> &'static str {
+    let (g, c) = gross_and_cost(net, gross);
+    if !(c > 0.0) {
+        "no_cost"
+    } else if !(g > 0.0) {
+        "gross_nonpositive"
+    } else {
+        "defined"
+    }
+}
+
+fn gross_and_cost(net: &[f64], gross: &[f64]) -> (f64, f64) {
+    let n = net.len().min(gross.len());
+    let g = gross[..n].iter().sum::<f64>();
+    let c = gross[..n].iter().zip(&net[..n]).map(|(g, n)| g - n).sum::<f64>();
+    (g, c)
 }
 
 #[derive(Clone, Debug, PartialEq)]

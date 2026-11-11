@@ -65,6 +65,7 @@ pub struct Economics {
     pub cvar95: f64,
     pub cvar99: f64,
     pub break_even_bps_per_side: f64,
+    pub break_even_status: &'static str,
     pub ladder: Vec<LadderRow>,
     pub daily: Option<Daily>,
     /// Why `daily` is null although the series has stamps: the period is a day or longer.
@@ -174,6 +175,7 @@ pub fn economics(i: &EconomicsInput) -> Economics {
         cvar95: inference::cvar(i.net, 0.95),
         cvar99: inference::cvar(i.net, 0.99),
         break_even_bps_per_side: inference::break_even_bps(i.net, i.gross, i.cost_bps),
+        break_even_status: inference::break_even_status(i.net, i.gross),
         ladder: inference::cost_ladder(i.net, i.gross, i.cost_bps, &COST_LADDER, i.periods_per_year),
         daily,
         daily_unavailable: period_is_day.then_some("period >= 1 day"),
@@ -576,7 +578,7 @@ impl Economics {
         format!(
             "{{\"book\":\"long_flat_vs_cash\",\"cost_bps_per_side\":{},\"periods_per_year\":{},\
              \"sortino\":{},\"calmar\":{},\"cvar_95\":{},\"cvar_99\":{},\
-             \"break_even_bps_per_side\":{},\"cost_ladder\":[{}],\"daily\":{}{},\
+             \"break_even_bps_per_side\":{},\"break_even_status\":{},\"cost_ladder\":[{}],\"daily\":{}{},\
              \"benchmark_series\":\"every window started flat\",\"best_baseline\":{},\"benchmarks\":[{}]}}",
             jnum(self.cost_bps),
             jnum(self.periods_per_year),
@@ -585,6 +587,7 @@ impl Economics {
             jnum(self.cvar95),
             jnum(self.cvar99),
             jnum(self.break_even_bps_per_side),
+            jstr(self.break_even_status),
             ladder.join(","),
             daily,
             unavailable,
@@ -595,6 +598,11 @@ impl Economics {
 
     pub fn markdown(&self) -> String {
         let f = |v: f64| if v.is_finite() { format!("{:.4}", v) } else { "n/a".to_string() };
+        let break_even = if self.break_even_status == "gross_nonpositive" {
+            "n/a (gross <= 0)".to_string()
+        } else {
+            f(self.break_even_bps_per_side)
+        };
         let mut s = String::from("## Long-only economics\n\n");
         s.push_str(&format!(
             "Sortino {} | Calmar {} | CVaR 95 {} | CVaR 99 {} | break-even {} bp/side (cost {} bp/side)\n\n",
@@ -602,7 +610,7 @@ impl Economics {
             f(self.calmar),
             f(self.cvar95),
             f(self.cvar99),
-            f(self.break_even_bps_per_side),
+            break_even,
             f(self.cost_bps)
         ));
         if let Some(d) = &self.daily {
