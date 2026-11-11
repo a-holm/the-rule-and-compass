@@ -855,9 +855,9 @@ fn vote_locked_read_scores_sealed_book() {
     let (_s, data, l, sealed) = sealed_vote("vote-read", &VOTE_MEMBERS, "0.67", &[], true);
     let (code, out, err) = read(&data, &l, &sealed, &VOTE_MEMBERS, &vote_flags("0.67", &[]));
     assert_eq!(code, 0, "{}", err);
-    assert!(out.contains("\"policy\":\"vote\""), "{}", out);
+    assert!(out.contains("\"policy\":{\"name\":\"vote\""), "{}", out);
     assert!(out.contains("\"quorum\":0.67"), "{}", out);
-    assert!(out.contains("\"votes_required\":3") || out.contains("\"votes_required\":2"), "{}", out);
+    assert!(out.contains("\"votes_required\":3"), "{}", out);
     for m in VOTE_MEMBERS {
         assert!(out.contains(&format!("\"{}\"", m)), "member {} in {}", m, out);
     }
