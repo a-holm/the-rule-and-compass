@@ -1013,7 +1013,6 @@ pub fn vote_refusal(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<String> {
         (spec.device_pnl, "--device-pnl", "the device arm prices the threshold book"),
         (opts.batch_pnl, "--batch-pnl", "the batch arm scores one expression per column"),
         (spec.band_select, "--select-band", "the members are all used, none is selected"),
-        (opts.final_read, "--locked-test", "the sealed read scores the selected candidate only"),
         (opts.run_bands.is_some(), "--from-run/--front bands", "the band counts votes"),
         (opts.band_units != crate::trading::BandUnits::Score, "--band-units", "the band counts votes"),
     ];
@@ -1290,6 +1289,8 @@ struct Accum {
     forced: Option<Vec<usize>>,
     /// Candidates scored on the test pass (final read only).
     test_candidates: Vec<usize>,
+    /// `--policy vote`: the final read scores every member on the test rows.
+    vote: bool,
 }
 
 impl Accum {
@@ -1352,6 +1353,7 @@ impl Accum {
             pass: Pass::All,
             forced: None,
             test_candidates: Vec::new(),
+            vote: spec.policy == Policy::Vote,
         })
     }
 
@@ -1384,6 +1386,13 @@ impl Accum {
                 push_scores(&mut self.windows, t, group, target, &self.scores, self.pass == Pass::All);
             }
             Pass::TestOnly => {
+                if self.vote {
+                    for (s, tree) in self.scores.iter_mut().zip(trees) {
+                        *s = expr::eval(tree, features);
+                    }
+                    push_all_test(&mut self.windows, t, group, target, &self.scores);
+                    return;
+                }
                 for &c in &self.test_candidates {
                     self.scores[c] = expr::eval(&trees[c], features);
                 }
@@ -1408,6 +1417,12 @@ impl Accum {
                 ));
             }
             chosen.push(select_candidate(d, spec, trees, has_validation)?.candidate);
+        }
+        if self.vote {
+            self.test_candidates = (0..trees.len()).collect();
+            self.forced = Some(vec![0; self.windows.len()]);
+            self.pass = Pass::TestOnly;
+            return Ok(());
         }
         let mut distinct = chosen.clone();
         distinct.sort_unstable();
@@ -1997,6 +2012,21 @@ fn push_scores(
                 dst.push(score);
             }
             if bad {
+                d.dropped += 1;
+            }
+        }
+    }
+}
+
+/// Final read of a vote book: a test row with the score of every member.
+fn push_all_test(windows: &mut [WindowData], t: f64, group: u64, target: f64, scores: &[f64]) {
+    for d in windows {
+        if t >= d.window.test_start && t < d.window.test_end {
+            d.test_rows.push(RowBase { time: t, group, target });
+            for (dst, &score) in d.test_scores.iter_mut().zip(scores) {
+                dst.push(score);
+            }
+            if !target.is_finite() || scores.iter().any(|s| !s.is_finite()) {
                 d.dropped += 1;
             }
         }
