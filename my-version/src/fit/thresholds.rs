@@ -16,8 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Threshold constants fitted per tree; the rest keep their value.
 pub(super) const MAX_THRESHOLDS: usize = 2;
 
-/// Candidates per search stage: the coarse pass and the refinement each score
-/// at most this many thresholds.
+/// Candidates per search level. Each level scores at most this many thresholds,
+/// then the next level narrows the range around the best one, until every
+/// midpoint of the range is scored.
 const Q: usize = 64;
 
 /// Rounds of threshold search followed by a refit of the other constants.
@@ -243,7 +244,6 @@ impl Search<'_> {
         }
         let start = at(tree, &th.constant).val;
         let mut best = Best { obj: if start_obj.is_finite() { start_obj } else { f64::INFINITY }, t: start, current: true };
-        let mut best_mid: Option<(Best, usize)> = None;
         let try_index = |tree: &mut Node, j: usize, best: &mut Best, best_mid: &mut Option<(Best, usize)>| {
             let t = mids[j];
             at_mut(tree, &th.constant).val = t;
@@ -255,20 +255,21 @@ impl Search<'_> {
                 *best_mid = Some((cand, j));
             }
         };
-        let step = mids.len().div_ceil(Q);
-        let mut j = 0;
-        while j < mids.len() {
-            try_index(tree, j, &mut best, &mut best_mid);
-            j += step;
-        }
-        if let Some((_, jw)) = best_mid {
-            let lo = jw.saturating_sub(step - 1);
-            let hi = (jw + step).min(mids.len());
-            let range: Vec<usize> = (lo..hi).filter(|j| j % step != 0).collect();
-            let stride = range.len().div_ceil(Q).max(1);
-            for &j in range.iter().step_by(stride) {
-                try_index(tree, j, &mut best, &mut best_mid);
+        let (mut lo, mut hi) = (0, mids.len());
+        loop {
+            let stride = (hi - lo).div_ceil(Q);
+            let mut level_best: Option<(Best, usize)> = None;
+            let mut j = lo;
+            while j < hi {
+                try_index(tree, j, &mut best, &mut level_best);
+                j += stride;
             }
+            let Some((_, jw)) = level_best else { break };
+            if stride == 1 {
+                break;
+            }
+            lo = jw.saturating_sub(stride - 1);
+            hi = (jw + stride).min(mids.len());
         }
         if best.current {
             at_mut(tree, &th.constant).val = start;
@@ -420,6 +421,25 @@ mod tests {
         consts(&t, &mut c);
         assert!(c[0] > below && c[0] < above, "threshold {} outside ({below}, {above})", c[0]);
         assert!(sse(&t, &x, &y) < 1e-18, "sse {}", sse(&t, &x, &y));
+    }
+
+    #[test]
+    fn threshold_fit_hits_a_gap_finer_than_one_refinement() {
+        let n = 65_536usize;
+        let x: Vec<Vec<f64>> = (0..n)
+            .map(|i| vec![((i * 40_503) % n) as f64 / n as f64 + 0.5 / n as f64])
+            .collect();
+        let y: Vec<f64> = x.iter().map(|r| if r[0] > 0.3137 { 1.0 } else { 0.0 }).collect();
+        let mut s: Vec<f64> = x.iter().map(|r| r[0]).collect();
+        s.sort_by(f64::total_cmp);
+        let k = s.iter().position(|&v| v > 0.3137).unwrap();
+        let (below, above) = (s[k - 1], s[k]);
+        let mut t = tree("if(x0 - 0.9, 1, 0)");
+        fit(&mut t, &x, &y, true);
+        let mut c = Vec::new();
+        consts(&t, &mut c);
+        assert!(c[0] > below && c[0] < above, "threshold {} outside ({below}, {above})", c[0]);
+        assert!(sse(&t, &x, &y) < 1e-18);
     }
 
     #[test]

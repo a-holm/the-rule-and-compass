@@ -782,7 +782,7 @@ SEARCH:
                              1-D search (default off). The LM never moves such a
                              constant because its gradient is zero. Candidates are
                              the midpoints between sorted operand values on the
-                             fit rows (at most 64, then 64 more around the best),
+                             fit rows (levels of at most 64, narrowing around the best),
                              scored on the fitted loss (squared error for the
                              squared family and --fitness pnl); at most 2
                              constants per tree. Trees with such a constant take
