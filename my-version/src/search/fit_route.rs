@@ -2069,7 +2069,7 @@ mod tests {
     #[test]
     fn released_schedules_match_the_one_shot_route() {
         let mut tally = ReleaseTally::default();
-        for seed in 0..2000 {
+        for seed in 0..3000 {
             released_case(20_000 + seed, &mut tally);
         }
         eprintln!(
