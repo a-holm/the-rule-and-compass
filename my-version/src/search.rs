@@ -413,6 +413,9 @@ pub struct Config {
     /// #1022: generations a restarted island takes no front parent and no
     /// migrant. Read only under `--restart-policy island`.
     pub restart_isolation: usize,
+    /// #1100: the highest this many islands form the explore tier (0: none).
+    /// Saved search setting.
+    pub explore_islands: usize,
     /// #471: the node-path edit weights. Changes the trajectory, so it is a
     /// saved search setting.
     pub mutation_mix: MutationMix,
@@ -732,6 +735,7 @@ impl Default for Config {
             selection: Selection::Lexicographic,
             restart_policy: RestartPolicy::Archive,
             restart_isolation: 25,
+            explore_islands: 0,
             mutation_mix: MutationMix::Classic,
             crossover_internal: 0.0,
             adaptive_mix: false,
@@ -802,6 +806,7 @@ impl Config {
         if self.restart_policy == RestartPolicy::Island {
             compare!(restart_isolation, "restart_isolation"); // #1022
         }
+        compare!(explore_islands, "explore_islands"); // #1100
         compare!(qd_bins, "qd_bins"); // #120
         compare!(qd_cell_cap, "qd_cell_cap"); // #120
         compare!(qd_cvt, "qd_cvt"); // #120
@@ -8450,6 +8455,13 @@ fn run_search_scoped(
                 train.len()
             ));
         }
+    }
+    if cfg.explore_islands > 0 && cfg.explore_islands >= cfg.islands.max(1) {
+        return Err(format!(
+            "--explore-islands {} needs at least one exploit island (--islands {})",
+            cfg.explore_islands,
+            cfg.islands.max(1)
+        )); // #1100
     }
     #[cfg(feature = "cuda")]
     crate::gpu::note_search_start();

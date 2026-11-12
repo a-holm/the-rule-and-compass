@@ -824,6 +824,16 @@ SEARCH:
                              default 25 (the migration interval). Read only
                              with --restart-policy island; 0 turns the
                              isolation off. Saved search setting (#1022)
+  --explore-islands <K>      the highest K islands form an explore tier,
+                             default 0 (none). An explore island takes no
+                             front parent, no --qd-policy parent and no
+                             migrant, sends no migrant, and restarts at the
+                             end of each lifetime of a Luby schedule in
+                             units of --restart-interval generations. The
+                             other islands keep --restart-policy and a ring
+                             of their own; explore results reach them
+                             through the archive only. K must be below
+                             --islands. Saved search setting (#1100)
   --mutation-mix <M>         node-path edit weights: classic (point .25, terminal
                              .35, subtree .40; default) or extended (adds insert,
                              delete, swap and rotate). Not with --variation
@@ -2846,6 +2856,7 @@ fn main() {
     // #1022: explicit restart flags for the resume settings check.
     let mut restart_policy_set = false;
     let mut restart_isolation_set = false;
+    let mut explore_islands_set = false; // #1100
     let mut mutation_mix_set = false; // #471
     let mut crossover_internal_set = false;
     let mut adaptive_mix_set = false;
@@ -3472,6 +3483,10 @@ fn main() {
                 cfg.restart_isolation = parse_uint("--restart-isolation", &val!());
                 restart_isolation_set = true;
             }
+            "--explore-islands" => {
+                cfg.explore_islands = parse_uint("--explore-islands", &val!());
+                explore_islands_set = true;
+            }
             "--no-front-parents" => {
                 cfg.front_parents = false;
                 front_parents_set = true;
@@ -3844,6 +3859,15 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
+    // #1100: a resume is checked against its saved island count by the search.
+    if resume_path.is_none() && cfg.explore_islands > 0 && cfg.explore_islands >= cfg.islands.max(1) {
+        eprintln!(
+            "error: --explore-islands {} needs at least one exploit island (--islands {})",
+            cfg.explore_islands,
+            cfg.islands.max(1)
+        );
+        std::process::exit(EXIT_USAGE);
+    }
     // #928: a re-selection is a resume that runs nothing.
     if reselect_path.is_some() || reselect_run_path.is_some() {
         let conflicts = [
@@ -4160,6 +4184,12 @@ fn main() {
                 "--restart-isolation {} (saved restart_isolation is {})",
                 cfg.restart_isolation, saved.restart_isolation
             ));
+        }
+        if explore_islands_set && cfg.explore_islands != saved.explore_islands {
+            conflicts.push(format!(
+                "--explore-islands {} (saved explore_islands is {})",
+                cfg.explore_islands, saved.explore_islands
+            )); // #1100
         }
         // #495: the band decides which finalists get the exact refit.
         if refit_band_set && !cp.refit_band_unknown && cfg.refit_band != saved.refit_band {

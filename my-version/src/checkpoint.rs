@@ -1518,6 +1518,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "adaptive_mix",       // #471: missing means false
         "restart_policy",     // #1022: missing means archive
         "restart_isolation",  // #1022: missing means 25
+        "explore_islands",    // #1100: missing means 0
     ];
     for key in KEYS {
         required(fields, key)?;
@@ -1906,6 +1907,13 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             .parse::<usize>()
             .map_err(|_| format!("config 'restart_isolation' is invalid: '{}'", raw))?,
     };
+    // #1100: absent means no explore tier, matching every earlier checkpoint.
+    let explore_islands = match fields.get("explore_islands") {
+        None => 0,
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| format!("config 'explore_islands' is invalid: '{}'", raw))?,
+    };
 
     Ok(Config {
         generations: num_usize("generations")?,
@@ -1973,6 +1981,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         selection,
         restart_policy,
         restart_isolation,
+        explore_islands,
         mutation_mix,
         crossover_internal,
         adaptive_mix,
@@ -2076,6 +2085,11 @@ fn write_config(cfg: &Config, out: &mut String) {
         if cfg.restart_isolation != 25 {
             writeln!(out, "config restart_isolation {}", cfg.restart_isolation).unwrap();
         }
+    }
+    // #1100: written only with an explore tier, so every other checkpoint and
+    // config hash keeps its bytes.
+    if cfg.explore_islands > 0 {
+        writeln!(out, "config explore_islands {}", cfg.explore_islands).unwrap();
     }
     // #471: written only when set, so every other checkpoint keeps its bytes.
     if cfg.mutation_mix != crate::search::MutationMix::Classic {
