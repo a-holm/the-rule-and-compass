@@ -1,0 +1,35 @@
+config generations 200
+config islands 1
+config pop 200
+config max_complexity 30
+config complexity.op_costs 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0
+config complexity.var_weight 1.0
+config complexity.const_weight 1.0
+config complexity.depth_weight 0.0
+config metric absolute
+config seed 0
+config ops 2,3,4,5,6,7,8,9,10,11,12,13,15,16,17,27,28,29,30,31,36
+config migration_interval 25
+config restart_interval 60
+config init_depth 3
+config fit_iters 8
+config fit_strategy exact
+config fit_rows 0
+config fit_fallback_max 4096
+config refit_band inf
+config calibration_source anchors
+config variation auto
+config dedup true
+config time_budget none
+config patience 7
+config predictor_samples none
+config selection afp
+config restart_policy island
+config restart_isolation 7
+config mutation_mix extended
+config crossover_internal 0.25
+config adaptive_mix true
+config reject_constant_offspring true
+config reject_fixed_position true
+config fit_thresholds true
+config_hash 204c6fdca80df0ea

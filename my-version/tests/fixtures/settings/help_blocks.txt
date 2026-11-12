@@ -1,0 +1,72 @@
+@@ --fit-irls --refit-band
+  --fit-thresholds          after the LM, fit each constant that is an operand of a
+                             comparison or sits in the condition of if by an exact
+                             1-D search (default off). The LM never moves such a
+                             constant because its gradient is zero. Candidates are
+                             the midpoints between sorted operand values on the
+                             fit rows (levels of at most 64, narrowing around the best),
+                             scored on the fitted loss (squared error for the
+                             squared family and --fitness pnl); at most 2
+                             constants per tree. Trees with such a constant take
+                             the CPU fit arm, never the device. A saved search
+                             setting: a resume refuses a different value. No
+                             effect with --fit-iters 0
+@@ --no-dedup --no-front-parents
+  --selection lexicographic|afp
+                             survivor and parent selection inside an island.
+                             lexicographic (default) replaces the island with
+                             its offspring and picks parents by error, then
+                             size. afp keeps the Pareto-best of parents and
+                             offspring on (error, complexity, age), adds a few
+                             random immigrants per generation and picks
+                             parents by Pareto rank and crowding distance.
+                             Node path only; refuses --variation postfix
+  --restart-policy archive|island
+                             which stall rule restarts an island every
+                             restart interval (60 generations). archive
+                             (default) restarts an island after two checks
+                             in which its best error is worse than the
+                             archive best. island restarts an island whose
+                             own best error has not improved for one restart
+                             interval, except the lowest island that holds
+                             the archive best (the keeper), and isolates it
+                             from front parents, --qd-policy parents and
+                             migrants for --restart-isolation generations.
+                             With one island nothing restarts. Saved search
+                             setting (#1022)
+  --restart-isolation <N>    generations a restarted island takes no front
+                             parent, no --qd-policy parent and no migrant,
+                             default 25 (the migration interval). Read only
+                             with --restart-policy island; 0 turns the
+                             isolation off. Saved search setting (#1022)
+  --mutation-mix <M>         node-path edit weights: classic (point .25, terminal
+                             .35, subtree .40; default) or extended (adds insert,
+                             delete, swap and rotate). Not with --variation
+                             postfix (#471)
+  --crossover-internal <P>   probability that a crossover cut point is an
+                             internal node (default 0 = uniform cut). Not with
+                             --variation postfix (#471)
+  --adaptive-mix             per-island edit weights learned from the success
+                             rate of the last 10 generations (uses all seven edit
+                             kinds; learns from CPU-scored generations only).
+                             Off by default; not with --variation postfix (#471)
+@@ --no-front-parents --prune
+  --reject-constant-offspring
+                             reject offspring and random trees with no input
+                             outside an aggregate before the constant fit; the
+                             first constant of an island is kept (#477). Saved
+                             search setting, off by default
+                             and restores the pre-#76 trajectory exactly
+  --reject-fixed-position    under --fitness pnl, reject trees whose long/flat
+                             position cannot depend on the inputs (the exact
+                             output range does not cross --threshold, for
+                             example gauss(c * x) at threshold 0) before the
+                             constant fit, and keep them off the front. Before
+                             the fit every constant counts as free, so c + abs(x)
+                             goes to the fit (#848). With --objective it also
+                             makes such a member unusable as finalist, under
+                             --fitness metric too; so is a member whose
+                             validation book was long on every row or on none
+                             (#849). Saved search setting, off by default
+@@ --fit-samples --time-budget
+  --patience <N>             stop after N generations without improvement (default 40)

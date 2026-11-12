@@ -462,6 +462,8 @@ rcsr-bench --suite all --problems nguyen9,sig_tanh --seeds 1,2 --generations 20 
 | `--ndjson` | one JSON line per finished run, flushed at once, then one summary line |
 | `--json` | one JSON object, as before |
 
+Knobs that come from the search setting table (`src/settings.rs`) take the `rcsr` parser, its range checks and its error messages.
+
 Every NDJSON line carries a `config` object: `generator` (the data generator and criteria version), the thresholds, `knobs` (every search setting) and `build` (version, CUDA feature, backend request, jobs, `git describe`).
 
 **Chunks.** A run killed by a lock-hold timeout keeps every line it flushed. Run seeds as separate invocations, each under `timeout 580`, and merge the files in `compare` with a comma list. Seeds are independent, so the merged result equals one long invocation.
