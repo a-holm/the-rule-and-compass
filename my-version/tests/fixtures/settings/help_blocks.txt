@@ -77,3 +77,5 @@
                              population >= 4096; node keeps the owned-tree loop;
                              postfix requires the flat path and refuses a run
                              that does not qualify
+
+CHECKPOINTS:
