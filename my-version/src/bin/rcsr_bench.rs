@@ -21,12 +21,18 @@ use rcsr::bench::{self, BackendChoice, FitChoice, SuiteConfig};
 use rcsr::bench_stats::{self, Criterion};
 use rcsr::bench_suites;
 use rcsr::metrics::Metric;
+use rcsr::settings::{self, Group};
 use std::io::Write;
 
 const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
 
 fn usage() -> String {
+    let bench_stop = settings::bench_usage(Group::Stop);
+    let bench_island = settings::bench_usage(Group::Island);
+    let bench_variation = settings::bench_usage(Group::Variation);
+    let bench_filter = settings::bench_usage(Group::Filter);
+    let bench_fit = settings::bench_usage(Group::Fit);
     format!(
         "rcsr-bench {} — benchmarks for rule-and-compass
 
@@ -60,7 +66,7 @@ OPTIONS:
   --no-front-parents        disable the 15% Pareto-front parent feedback (#76)
   --prune                   enable the front prune (#466; off by default)
   --no-prune                keep the prune off (the default)
-  --reject-constant-offspring  reject input-free offspring before the constant fit (#477)
+{bench_filter}
   --cpu                     force the CPU evaluator (no environment variable)
   --gpu                     require the device evaluator; exit 2 without one
   --fit-strategy <name>     exact (bench default), auto, linear, varpro, stream,
@@ -68,24 +74,18 @@ OPTIONS:
   --fit-iters <N>           constant-fit iterations
   --ops <a,b,..>            operator set
   --max-complexity <N>      maximum expression complexity
-  --patience <N>            generations without improvement before stopping
+{bench_stop}
   --migration-interval <N>  generations between island migrations
   --restart-interval <N>    generations between island restarts
-  --restart-policy <mode>   archive (default) or island: restart an island on its own
-                            stall and isolate it afterwards (#1022)
-  --restart-isolation <N>   generations a restarted island takes no front parent and
-                            no migrant under --restart-policy island (default 25)
+{bench_island}
   --variation <mode>        auto, node or postfix
-  --selection <mode>        lexicographic (default) or afp (age-fitness Pareto)
-  --mutation-mix <mix>      classic (default) or extended: insert, delete, swap, rotate (#471)
-  --crossover-internal <P>  probability of an internal-node crossover cut (default 0) (#471)
-  --adaptive-mix            per-island edit weights from success rates (#471)
+{bench_variation}
   --dispatch <mode>         auto or device (device skips the timing comparison)
   --fit-polish <mode>      f64 (default), f32 or off: arithmetic of the device fit
                             kernel polish (--fit-strategy gpu)
   --fit-irls <mode>         nested (default), reweighted or reweighted-final: schedule
                             of the CPU absolute / implicit_residual constant fit (#611)
-  --fit-thresholds          fit comparison and if thresholds by an exact 1-D search (#1024)
+{bench_fit}
   --jobs <N>                runs in flight at once on the CPU (default 1);
                             seconds and hit_s are then contended
   --ndjson                  one JSON line per finished run, flushed at once,
@@ -303,7 +303,6 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--max-complexity" => {
                 a.knobs.max_complexity = Some(num(take(&mut i, "--max-complexity")?, "--max-complexity")?)
             }
-            "--patience" => a.knobs.patience = Some(num(take(&mut i, "--patience")?, "--patience")?),
             "--patience-tol" => return Err("--patience-tol was removed (#464): it saved under 10 % of the noisy CPU in the default-decision A/B".to_string()),
             "--stop-on" => return Err("--stop-on was removed (#464): it saved under 10 % of the noisy CPU in the default-decision A/B".to_string()),
             "--migration-interval" => {
@@ -314,34 +313,14 @@ fn parse(args: &[String]) -> Result<Args, String> {
                 a.knobs.restart_interval =
                     Some(num(take(&mut i, "--restart-interval")?, "--restart-interval")?)
             }
-            "--restart-policy" => {
-                a.knobs.restart_policy =
-                    Some(rcsr::search::RestartPolicy::parse(&take(&mut i, "--restart-policy")?)?)
-            }
-            "--restart-isolation" => {
-                a.knobs.restart_isolation =
-                    Some(num(take(&mut i, "--restart-isolation")?, "--restart-isolation")?)
-            }
             "--linear-scaling" => {
                 return Err("--linear-scaling was removed (#470): it lowered oracle_recovered in the default-decision A/B".to_string())
-            }
-            "--mutation-mix" => {
-                a.knobs.mutation_mix = Some(rcsr::search::MutationMix::parse(&take(&mut i, "--mutation-mix")?)?)
             }
             "--tree-arity" => {
                 return Err("--tree-arity was removed (#471): its only non-default value, balanced, lowered oracle_recovered in the default-decision A/B".to_string())
             }
-            "--crossover-internal" => {
-                a.knobs.crossover_internal =
-                    Some(num(take(&mut i, "--crossover-internal")?, "--crossover-internal")?)
-            }
-            "--adaptive-mix" => a.knobs.adaptive_mix = true,
             "--variation" => {
                 a.knobs.variation = Some(rcsr::search::VariationMode::parse(&take(&mut i, "--variation")?)?)
-            }
-            "--reject-constant-offspring" => a.knobs.reject_constant_offspring = true,
-            "--selection" => {
-                a.knobs.selection = Some(rcsr::search::Selection::parse(&take(&mut i, "--selection")?)?)
             }
             "--fit-polish" => {
                 let v = take(&mut i, "--fit-polish")?;
@@ -356,7 +335,6 @@ fn parse(args: &[String]) -> Result<Args, String> {
                     format!("--fit-irls needs nested, reweighted or reweighted-final, got '{}'", v)
                 })?);
             }
-            "--fit-thresholds" => a.knobs.fit_thresholds = true,
             "--dispatch" => {
                 let v = take(&mut i, "--dispatch")?;
                 a.knobs.dispatch = Some(
@@ -373,6 +351,12 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--threads" => a.threads = num(take(&mut i, "--threads")?, "--threads")?,
             "--list" => a.list = true,
             "-h" | "--help" => return Err(String::new()),
+            // #1083: knobs from the search setting table.
+            flag if settings::find(flag).is_some_and(|r| r.bench().is_some()) => {
+                let row = settings::find(flag).expect("matched by the guard");
+                let value = if row.takes_value() { Some(take(&mut i, flag)?) } else { None };
+                a.knobs.settings.set(row, value.as_deref())?;
+            }
             other => return Err(format!("unknown option '{}'", other)),
         }
         i += 1;
