@@ -1825,6 +1825,7 @@ fn ladder_verify_read_without_allow_in_sample_scores_nothing() {
         &run,
         format!(
             "{{\"variables\":[\"f1\",\"f2\"],\"pareto\":[{{\"expression\":\"f1\"}}],\
+             \"objective\":{{\"spec\":{{\"threshold\":0,\"per_side_bps\":5}}}},\
              \"split\":{{\"train_time\":[{},{}],\"required_purge_seconds\":3600}}}}",
             T0,
             T0 + 450 * H

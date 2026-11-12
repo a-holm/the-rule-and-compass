@@ -1154,6 +1154,7 @@ fn verify_read_with_gpu_scores_nothing() {
 }
 
 const FRONT_RUN: &str = r#"{"tool":"rcsr","variables":["x"],"target_spec":{"return_column":"y"},
+    "search":{"candidates_evaluated":4321},
     "split":{"train_time":[0,100],"validation_time":[101,200],"required_purge_seconds":3600,"purge_seconds":3600},
     "objective":{"spec":{"threshold":0,"per_side_bps":5}},
     "pareto":[{"expression":"x"}]}"#;
