@@ -2738,6 +2738,12 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         return Err(usage_err("--ledger and --sealed apply to --locked-test only".to_string()));
     }
     let mut read: Option<(protocol::Ledger, String, protocol::LockedRange)> = None;
+    let read_binding = protocol::binding_digest(&[
+        format!("{:?}", opts),
+        format!("{:?}", rows),
+        format!("{:?}/{:?}/{:?}/{:?}/{:?}", target, ret, time, group, features),
+        format!("{}/{}/{}", scheme, resolved.embargo.seconds, purge_source),
+    ]);
     if locked_test {
         let (Some(ledger), Some(sealed)) = (&ledger_path, &sealed_path) else {
             return Err(usage_err("--locked-test needs --ledger and --sealed".to_string()));
@@ -2763,6 +2769,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         let binding = protocol::RangeBinding { current: &current, allow_unbound };
         if verify_read {
             l.authorize_baseline_verify(std::path::Path::new(sealed), Some(binding)).map_err(input_err)?;
+            l.check_verify_binding(None, &read_binding).map_err(input_err)?;
         } else {
             l.authorize_baseline_read(std::path::Path::new(sealed), Some(binding)).map_err(input_err)?;
         }
@@ -2861,7 +2868,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 &files,
                 || {
                     ledger.write_read_marker(&data_path, "baseline_read", report_sha)?;
-                    ledger.record_baseline_read(data_sha, report_sha, Some(current))
+                    ledger.record_baseline_read_bound(data_sha, report_sha, Some(current), Some(&read_binding))
                 },
                 None,
             )
