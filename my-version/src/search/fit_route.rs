@@ -700,6 +700,7 @@ impl FitRoute {
         }
         for (f, job) in fallbacks.iter_mut().zip(done) {
             let job = job.expect("every refit fallback has a job");
+            debug_assert_eq!((job.island, job.slot), (f.key.1, f.key.2), "a refit belongs to its fallback");
             if job.improved {
                 *self.counts.improved.entry(f.cause).or_default() += 1;
             }
