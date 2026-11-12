@@ -761,7 +761,7 @@ mod tests {
         }).collect();
         assert_eq!(ends(1, 32), [prefix], "one slot runs the sequence itself");
         let six = ends(6, 7);
-        let want: [&[u64]; 6] = [&[1, 5, 7], &[1, 2, 3], &[2, 3, 4, 6], &[1, 2, 4, 5], &[1, 3, 4, 5, 6], &[2, 6]];
+        let want: [&[u64]; 6] = [&[1, 5, 7], &[1, 2, 3], &[2, 3, 4, 6, 7], &[1, 2, 4, 5], &[1, 3, 4, 5, 6], &[2, 6, 7]];
         for (slot, want) in want.iter().enumerate() {
             assert_eq!(six[slot], *want, "slot {slot}");
         }

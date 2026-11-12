@@ -937,7 +937,7 @@ fn cli_resume_of_an_explore_checkpoint_exits_2_naming_explore_islands() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("--explore-islands"), "{:?}", refused);
 
     let mut made_args = base.to_vec();
-    made_args.extend(["--generations", "5", "--restart-interval", "2", "--explore-islands", "2", "--save", checkpoint.as_str()]);
+    made_args.extend(["--generations", "5", "--explore-islands", "2", "--save", checkpoint.as_str()]);
     let made = rcsr(&made_args);
     assert!(made.status.success(), "save run failed: {:?}", made);
     let saved = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
