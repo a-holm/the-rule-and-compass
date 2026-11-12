@@ -407,6 +407,8 @@ pub struct Knobs {
     pub fit_polish: Option<crate::fit::FitPolish>,
     /// #611: schedule of the CPU L1 constant fit.
     pub fit_irls: Option<crate::fit::FitIrls>,
+    /// #1024: exact 1-D fit of comparison and `if` thresholds.
+    pub fit_thresholds: bool,
     /// #477: reject input-free offspring before the constant fit.
     pub reject_constant_offspring: bool,
 }
@@ -813,6 +815,7 @@ fn base_config(cfg: &SuiteConfig, seed: u32) -> Config {
         sc.prune = v;
     }
     sc.reject_constant_offspring = k.reject_constant_offspring; // #477
+    sc.fit_thresholds = k.fit_thresholds; // #1024
     sc
 }
 
@@ -1504,7 +1507,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
     };
     let opt_u = |v: Option<usize>| json_opt(v);
     format!(
-        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"selection\":{},\"restart_policy\":{},\"restart_isolation\":{},\"dispatch\":{},\"fit_polish\":{},\"reject_constant_offspring\":{},\"mutation_mix\":{},\"crossover_internal\":{},\"adaptive_mix\":{},\"prune\":{},\"fit_irls\":{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
+        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"selection\":{},\"restart_policy\":{},\"restart_isolation\":{},\"dispatch\":{},\"fit_polish\":{},\"reject_constant_offspring\":{},\"mutation_mix\":{},\"crossover_internal\":{},\"adaptive_mix\":{},\"prune\":{},\"fit_irls\":{}{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
         GENERATOR_VERSION,
         json_number(cfg.threshold),
         json_number(SIGNAL_THRESHOLD),
@@ -1533,6 +1536,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
         k.adaptive_mix,
         k.prune.map_or("null".to_string(), |v| v.to_string()),
         k.fit_irls.map_or("null".to_string(), |v| format!("\"{}\"", v.name())),
+        if k.fit_thresholds { ",\"fit_thresholds\":true" } else { "" },
         env!("CARGO_PKG_VERSION"),
         cfg!(feature = "cuda"),
         cfg.backend.name(),
