@@ -207,3 +207,12 @@ fn one_block_without_se_ranks_by_the_validation_objective() {
     let next = select(&p, params(1, 0.0)).chosen.unwrap();
     assert_ne!(next, worst_alpha);
 }
+
+#[test]
+fn edge_gate_rejects_every_fitness_not_below_one() {
+    use rcsr::selection::edge_rejected;
+    for (fitness, rejected) in [(0.99, false), (1.0, true), (1.01, true), (f64::NAN, true), (f64::INFINITY, true)] {
+        assert_eq!(edge_rejected(true, fitness), rejected, "fitness {fitness}");
+        assert!(!edge_rejected(false, fitness), "no gate without the flag: fitness {fitness}");
+    }
+}
