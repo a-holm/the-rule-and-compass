@@ -110,12 +110,108 @@ fn parse_unit_assignments(src: &str) -> Result<Vec<(String, Unit)>, String> {
     Ok(out)
 }
 
+/// #120: apply one `--qd*` flag to `cfg`. The error is the whole message after `error: `.
+fn apply_qd_flag(cfg: &mut rcsr::search::Config, flag: &str, value: Option<&str>) -> Result<(), String> {
+    let range = |lo: usize, hi: usize| -> Result<usize, String> {
+        let v = value.unwrap_or_default();
+        match v.parse::<usize>() {
+            Ok(n) if (lo..=hi).contains(&n) => Ok(n),
+            _ => Err(format!("{} needs an integer in {}..={}, got '{}'", flag, lo, hi, v)),
+        }
+    };
+    match flag {
+        "--qd" => {
+            if cfg.qd_bins == 0 {
+                cfg.qd_bins = if cfg.qd_cvt { 512 } else { 16 };
+            }
+            return Ok(());
+        }
+        "--qd-cells" => {
+            cfg.qd_bins = range(2, 512)?;
+            return Ok(());
+        }
+        "--qd-cell-cap" => {
+            cfg.qd_cell_cap = range(1, 64)?;
+            return Ok(());
+        }
+        "--qd-cvt" => cfg.qd_cvt = true,
+        "--qd-policy" => {
+            cfg.qd_policy = true;
+            cfg.qd_cvt = true;
+        }
+        "--qd-uniform" => {
+            cfg.qd_policy = true;
+            cfg.qd_control = 1;
+            cfg.qd_cvt = true;
+        }
+        "--qd-random" => {
+            cfg.qd_policy = true;
+            cfg.qd_control = 2;
+        }
+        other => return Err(format!("{} is not a quality-diversity flag", other)),
+    }
+    if cfg.qd_bins == 0 {
+        cfg.qd_bins = 512;
+    }
+    Ok(())
+}
+
+/// #1087: a resume line for every `--qd*` flag that would change the saved
+/// quality-diversity settings. A flag that leaves the saved settings as they are
+/// matches, so `--qd` or `--qd-cvt` on a run that already has them resumes.
+fn qd_conflicts(flags: &[(String, Option<String>)], saved: &rcsr::search::Config, out: &mut Vec<String>) {
+    for (flag, value) in flags {
+        let mut trial = saved.clone();
+        if apply_qd_flag(&mut trial, flag, value.as_deref()).is_err() {
+            continue;
+        }
+        let mut changed = Vec::new();
+        if trial.qd_bins != saved.qd_bins {
+            changed.push(format!("qd_bins is {}", saved.qd_bins));
+        }
+        if trial.qd_cell_cap != saved.qd_cell_cap {
+            changed.push(format!("qd_cell_cap is {}", saved.qd_cell_cap));
+        }
+        if trial.qd_policy != saved.qd_policy {
+            changed.push(format!("qd_policy is {}", saved.qd_policy));
+        }
+        if trial.qd_control != saved.qd_control {
+            changed.push(format!("qd_control is {}", saved.qd_control));
+        }
+        if trial.qd_cvt != saved.qd_cvt {
+            changed.push(format!("qd_cvt is {}", saved.qd_cvt));
+        }
+        if changed.is_empty() {
+            continue;
+        }
+        let shown = value.as_ref().map_or(flag.clone(), |v| format!("{} {}", flag, v));
+        let line = format!("{} (saved {})", shown, changed.join(", "));
+        if !out.contains(&line) {
+            out.push(line);
+        }
+    }
+}
+
+/// Exit 2 with the resume conflict block when `conflicts` is not empty.
+fn exit_on_resume_conflicts(path: &str, conflicts: &[String]) {
+    if conflicts.is_empty() {
+        return;
+    }
+    eprintln!("error: --resume '{}' conflicts with the saved search settings:", path);
+    for c in conflicts {
+        eprintln!("  - {}", c);
+    }
+    eprintln!("  the saved run wins; omit the flag or pass the saved value");
+    std::process::exit(EXIT_USAGE);
+}
+
 fn usage() -> String {
     let help_stop = settings::help(Group::Stop);
     let help_island = settings::help(Group::Island);
     let help_variation = settings::help(Group::Variation);
     let help_filter = settings::help(Group::Filter);
     let help_fit = settings::help(Group::Fit);
+    let help_engine = settings::help(Group::Engine);
     format!(
         "rcsr {VERSION} — symbolic regression (rule-and-compass)
 
@@ -1001,12 +1097,7 @@ SEARCH:
                              size (default min(cores, 8)). --json reports each
                              generation's native/unsupported counts and
                              fallback seconds
-  --variation auto|node|postfix
-                             variation engine. auto (default) uses the flat
-                             postfix arena for --no-fit GPU runs with a
-                             population >= 4096; node keeps the owned-tree loop;
-                             postfix requires the flat path and refuses a run
-                             that does not qualify
+{help_engine}
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
@@ -2790,6 +2881,8 @@ fn main() {
     // expressions themselves are parsed here so a typo is a usage error.
     let mut unit_assignments: Vec<(String, Unit)> = Vec::new();
     let mut require_dimensions = false;
+    let mut units_specs: Vec<String> = Vec::new();
+    let mut qd_flags: Vec<(String, Option<String>)> = Vec::new();
     let mut op_complexity_spec: Option<String> = None;
     let mut complexity_weights_spec: Option<String> = None;
     let mut depth_weight_spec: Option<f64> = None;
@@ -3278,64 +3371,14 @@ fn main() {
                 dedup_set = true;
             }
             // #120: opt-in quality-diversity coverage archive.
-            "--qd" => {
-                if cfg.qd_bins == 0 {
-                    cfg.qd_bins = if cfg.qd_cvt { 512 } else { 16 };
+            "--qd" | "--qd-cells" | "--qd-cell-cap" | "--qd-cvt" | "--qd-policy" | "--qd-uniform" | "--qd-random" => {
+                let flag = args[i].clone();
+                let value = if flag == "--qd-cells" || flag == "--qd-cell-cap" { Some(val!()) } else { None };
+                if let Err(e) = apply_qd_flag(&mut cfg, &flag, value.as_deref()) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_USAGE);
                 }
-            }
-            "--qd-cells" => {
-                let v = val!();
-                match v.parse::<usize>() {
-                    Ok(n) if (2..=512).contains(&n) => cfg.qd_bins = n,
-                    _ => {
-                        eprintln!(
-                            "error: --qd-cells needs an integer in 2..=512, got '{}'",
-                            v
-                        );
-                        std::process::exit(EXIT_USAGE);
-                    }
-                }
-            }
-            "--qd-cell-cap" => {
-                let v = val!();
-                match v.parse::<usize>() {
-                    Ok(n) if (1..=64).contains(&n) => cfg.qd_cell_cap = n,
-                    _ => {
-                        eprintln!(
-                            "error: --qd-cell-cap needs an integer in 1..=64, got '{}'",
-                            v
-                        );
-                        std::process::exit(EXIT_USAGE);
-                    }
-                }
-            }
-            "--qd-cvt" => {
-                cfg.qd_cvt = true;
-                if cfg.qd_bins == 0 {
-                    cfg.qd_bins = 512;
-                }
-            }
-            "--qd-policy" => {
-                cfg.qd_policy = true;
-                cfg.qd_cvt = true;
-                if cfg.qd_bins == 0 {
-                    cfg.qd_bins = 512;
-                }
-            }
-            "--qd-uniform" => {
-                cfg.qd_policy = true;
-                cfg.qd_control = 1;
-                cfg.qd_cvt = true;
-                if cfg.qd_bins == 0 {
-                    cfg.qd_bins = 512;
-                }
-            }
-            "--qd-random" => {
-                cfg.qd_policy = true;
-                cfg.qd_control = 2;
-                if cfg.qd_bins == 0 {
-                    cfg.qd_bins = 512;
-                }
+                qd_flags.push((flag, value));
             }
             "--linear-scaling" => {
                 eprintln!(
@@ -3433,17 +3476,6 @@ fn main() {
                     }
                 }
             }
-            // #122: variation engine selection.
-            "--variation" => {
-                let v = val!();
-                match crate::search::VariationMode::parse(&v) {
-                    Ok(mode) => cfg.variation = mode,
-                    Err(e) => {
-                        eprintln!("error: {}", e);
-                        std::process::exit(EXIT_USAGE);
-                    }
-                }
-            }
             "--predictor-samples" => {
                 let v = val!();
                 match v.parse::<usize>() {
@@ -3483,8 +3515,12 @@ fn main() {
                 }
             }
             "--units" => {
-                match parse_unit_assignments(&val!()) {
-                    Ok(mut entries) => unit_assignments.append(&mut entries),
+                let spec = val!();
+                match parse_unit_assignments(&spec) {
+                    Ok(mut entries) => {
+                        unit_assignments.append(&mut entries);
+                        units_specs.push(spec);
+                    }
                     Err(e) => {
                         eprintln!("error: --units: {}", e);
                         std::process::exit(EXIT_USAGE);
@@ -4036,6 +4072,14 @@ fn main() {
         }
         settings::conflicts(Group::Filter, &cfg, &saved, &explicit, &mut conflicts); // #1083
         settings::conflicts(Group::Fit, &cfg, &saved, &explicit, &mut conflicts);
+        settings::conflicts(Group::Engine, &cfg, &saved, &explicit, &mut conflicts); // #1087
+        qd_conflicts(&qd_flags, &saved, &mut conflicts);
+        if require_dimensions && !saved.require_dimensions {
+            conflicts.push(format!(
+                "--require-dimensions (saved require_dimensions is {})",
+                saved.require_dimensions
+            ));
+        }
         if let Some(spec) = &op_complexity_spec {
             let mut trial = saved.clone();
             if trial.complexity_model.apply_op_costs(spec).is_ok() && trial.complexity_model != saved.complexity_model
@@ -4067,17 +4111,7 @@ fn main() {
             }
         }
 
-        if !conflicts.is_empty() {
-            eprintln!(
-                "error: --resume '{}' conflicts with the saved search settings:",
-                path
-            );
-            for c in &conflicts {
-                eprintln!("  - {}", c);
-            }
-            eprintln!("  the saved run wins; omit the flag or pass the saved value");
-            std::process::exit(EXIT_USAGE);
-        }
+        exit_on_resume_conflicts(path, &conflicts);
 
         // The generation budget is the one setting that may be *raised* on
         // resume: all earlier generations are unaffected and a longer run is
@@ -6002,6 +6036,16 @@ fn main() {
                 " — not filtering; pass --require-dimensions to reject mismatches"
             }
         ));
+    }
+    // #1087: explicit units must match the saved declaration.
+    if let (Some(cp), Some(path), false) = (&resume_checkpoint, &resume_path, unit_assignments.is_empty()) {
+        if cfg.units != cp.config.units {
+            let saved = match &cp.config.units {
+                Some(u) => format!("units is {}, units.target is {}", u.encode_vars(), u.target),
+                None => "units is none".to_string(),
+            };
+            exit_on_resume_conflicts(path, &[format!("--units {} (saved {})", units_specs.join(","), saved)]);
+        }
     }
     if require_dimensions {
         cfg.require_dimensions = true;

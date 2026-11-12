@@ -1546,7 +1546,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "qd_cvt",        // #120
         "qd_policy",     // #120
         "qd_control",    // #120
-        "variation",     // #122: missing means auto
     ];
     for key in KEYS {
         required(fields, key)?;
@@ -1863,15 +1862,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             None => return Err(format!("config 'fitness' must be metric or long_pnl:<hash>, got '{}'", raw)),
         },
     };
-    // #122: absent means auto, matching checkpoints written before the flat
-    // postfix engine existed.
-    let variation = match fields.get("variation").map(|s| s.as_str()) {
-        None => crate::search::VariationMode::Auto,
-        Some(raw) => crate::search::VariationMode::parse(raw).map_err(|e| {
-            format!("config 'variation' is invalid: {}", e)
-        })?,
-    };
-
     let mut config = Config {
         generations: num_usize("generations")?,
         islands: num_usize("islands")?,
@@ -1930,7 +1920,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         threads: 1,
         threads_explicit: false,
         fit_tail_overlap: true,
-        variation,
         // #1083: the table rows are read below.
         ..Config::default()
     };
@@ -1997,7 +1986,7 @@ fn write_config(cfg: &Config, out: &mut String) {
         writeln!(out, "config calibration_sha256 {}", o.sha256).unwrap();
     }
     // #122: absent means auto (the historical path for every old checkpoint).
-    writeln!(out, "config variation {}", cfg.variation.as_str()).unwrap();
+    crate::settings::write(crate::settings::Group::Engine, cfg, out);
     writeln!(out, "config dedup {}", cfg.dedup).unwrap();
     writeln!(
         out,

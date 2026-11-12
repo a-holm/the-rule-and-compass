@@ -18,7 +18,7 @@ config fit_rows 0
 config fit_fallback_max 4096
 config refit_band inf
 config calibration_source anchors
-config variation auto
+config variation node
 config dedup true
 config time_budget none
 config patience 7
@@ -35,4 +35,4 @@ config reject_constant_offspring true
 config reject_fixed_position true
 config fit_thresholds true
 config fit_accept fitness
-config_hash d5d0cdbaf1d75622
+config_hash 44f4c18c911040c7
