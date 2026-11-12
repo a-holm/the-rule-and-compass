@@ -345,8 +345,8 @@ impl FitSlots<usize> for QueueSlots<'_> {
 /// dispatch and device groups never meet in one stage.
 pub(super) const PLAN: u8 = 0;
 pub(super) const ROW_FLOOR: u8 = 1;
-pub(super) const DISPATCH: u8 = 1;
-pub(super) const DEVICE: u8 = 2;
+pub(super) const DISPATCH: u8 = 2;
+pub(super) const DEVICE: u8 = 3;
 
 /// One candidate that needs the exact CPU fit.
 #[derive(Clone, Debug)]
