@@ -831,7 +831,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   `ablation score` then refuse any split or window that touches it (exit 3).
   Only `walkforward --locked-test` and `ladder --locked-test`, both with
   `--ledger` and `--sealed`, read it, once each; both write `--out` and `--markdown` before the
-  read is recorded and take `--verify-read` to recompute a recorded read (see
+  read is recorded and take `--verify-read` to recompute a recorded read (`walkforward` refuses a candidate with no recorded read before any locked row is scored, and `--expect-report-sha256` needs `--verify-read`) (see
   [`docs/walkforward.md`](docs/walkforward.md#report-files-of-a-locked-read)); see
   [`docs/panel.md`](docs/panel.md#the-declared-locked-test).
 * `--train-select` / `--test-select` assign rows by expression (`> 0` is true)

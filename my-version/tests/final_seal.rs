@@ -43,9 +43,14 @@ fn window(label: &str, a: i64, b: i64, c: i64, d: i64) -> String {
 
 /// A store with its declared locked test (hours 300..400) beside it.
 fn store(dir: &Path, name: &str) -> String {
+    store_rows(dir, name, 400)
+}
+
+/// `store` cut to `rows` hours; the declared lockbox stays at hours 300..400.
+fn store_rows(dir: &Path, name: &str, rows: i64) -> String {
     let path = dir.join(name);
     let mut csv = String::from("ts,x,y\n");
-    for i in 0..400i64 {
+    for i in 0..rows {
         let x = ((i * 37) % 17) as f64 - 8.0;
         let y = 0.0003 * x + (((i * 13) % 7) as f64 - 3.0) * 0.0004;
         csv.push_str(&format!("{},{},{}\n", T0 + i * H, x, y));
@@ -995,4 +1000,80 @@ fn vote_locked_members_and_thresholds_ignore_locked_rows() {
     let thresholds = |j: &str| j.split("\"member_thresholds\":[").nth(1).unwrap().split(']').next().unwrap().to_string();
     assert_eq!(thresholds(&clean), thresholds(&poisoned));
     assert_ne!(pooled(&clean), pooled(&poisoned), "the locked rows do reach the metrics");
+}
+
+fn marker_of(data: &str) -> String {
+    format!("{}.locked_reads.jsonl", data)
+}
+
+/// Seals a final book on a store; `rows` below 300 leaves no row in the locked range.
+fn sealed_book(name: &str, rows: i64, members: &[&str], flags: &[&str]) -> (Scratch, String, String, String) {
+    let (scratch, dir) = scratch(name);
+    let data = store_rows(&dir, "d.csv", rows);
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+    dev(&data, &l, members, flags);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    (scratch, data, l, sealed)
+}
+
+fn verify_without_a_recorded_read_scores_nothing(name: &str, members: &[&str], flags: &[&str]) {
+    let (_s, data, l, sealed) = sealed_book(name, 300, members, flags);
+    let ledger_before = std::fs::read(&l).unwrap();
+    let zeros = "0".repeat(64);
+    for extra in [vec!["--verify-read"], vec!["--verify-read", "--expect-report-sha256", zeros.as_str()]] {
+        let mut a = flags.to_vec();
+        a.extend_from_slice(&extra);
+        let (code, out, err) = read(&data, &l, &sealed, members, &a);
+        assert_eq!(code, 3, "{}", err);
+        assert!(err.contains("no recorded read for this candidate"), "{}", err);
+        assert!(!err.contains("no finite test rows"), "locked rows were scored: {}", err);
+        assert!(!err.contains("report sha256") && !out.contains("report_sha256"), "{}{}", out, err);
+        assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+        assert!(!Path::new(&marker_of(&data)).exists());
+    }
+}
+
+#[test]
+fn verify_read_without_a_recorded_read_scores_nothing() {
+    verify_without_a_recorded_read_scores_nothing("verify-unread", &["x"], &[]);
+}
+
+#[test]
+fn vote_verify_read_without_a_recorded_read_scores_nothing() {
+    verify_without_a_recorded_read_scores_nothing("vote-verify-unread", &VOTE_MEMBERS, &vote_flags("0.67", &[]));
+}
+
+fn expect_hash_without_verify_is_refused(name: &str, members: &[&str], flags: &[&str]) {
+    let (_s, data, l, sealed) = sealed_book(name, 400, members, flags);
+    let ledger_before = std::fs::read(&l).unwrap();
+    let zeros = "0".repeat(64);
+    let mut a = flags.to_vec();
+    a.extend_from_slice(&["--expect-report-sha256", zeros.as_str()]);
+    for _ in 0..2 {
+        let (code, out, err) = read(&data, &l, &sealed, members, &a);
+        assert_eq!(code, 2, "{}", err);
+        assert!(err.contains("--expect-report-sha256 with --locked-test needs --verify-read"), "{}", err);
+        assert!(!err.contains("differs") && !out.contains("report_sha256"), "{}{}", out, err);
+        assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+        assert!(!Path::new(&marker_of(&data)).exists());
+    }
+    let (code, _, err) = read(&data, &l, &sealed, members, flags);
+    assert_eq!(code, 0, "{}", err);
+    let sha = recorded_read_sha(&l);
+    let mut verify = flags.to_vec();
+    verify.extend_from_slice(&["--verify-read", "--expect-report-sha256", sha.as_str()]);
+    let (code, _, err) = read(&data, &l, &sealed, members, &verify);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(test_reads(&l), 1);
+}
+
+#[test]
+fn locked_read_refuses_expect_hash_without_verify() {
+    expect_hash_without_verify_is_refused("expect-no-verify", &["x"], &[]);
+}
+
+#[test]
+fn vote_locked_read_refuses_expect_hash_without_verify() {
+    expect_hash_without_verify_is_refused("vote-expect-no-verify", &VOTE_MEMBERS, &vote_flags("0.67", &[]));
 }

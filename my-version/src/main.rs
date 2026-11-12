@@ -11183,13 +11183,15 @@ OPTIONS:
   --sealed <file>            locked_candidates.json from `rcsr protocol seal`
   --verify-read              with --locked-test (exit 2 without it): recompute a recorded
                              read, compare its report hash, write --out and --markdown,
-                             record nothing; the route after a failed report write
+                             record nothing; a candidate with no recorded read is refused
+                             (exit 3) before any locked row is scored
   --allow-unbound-ledger     with --locked-test: read a candidate whose ledger
                              recorded no locked test range (old ledger); the read
                              is reported as unbound. Without it that read is
                              refused (exit 3), as is a range that differs from
                              the one the candidate was developed against
-  --expect-report-sha256 <h> exit 3 unless the report JSON hashes to h
+  --expect-report-sha256 <h> exit 3 unless the report JSON hashes to h; with --locked-test
+                             it needs --verify-read (exit 2 without it)
   --json                     print the full JSON report to stdout
                              (it ends with a ledger object: the phase ledger of the
                              command, io and pnl seconds on the run wall, outside the
@@ -12069,6 +12071,10 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: --locked-test needs --ledger and --sealed");
         std::process::exit(EXIT_USAGE);
     }
+    if locked_test && !verify_read && expect_hash.is_some() {
+        eprintln!("error: --expect-report-sha256 with --locked-test needs --verify-read");
+        std::process::exit(EXIT_USAGE);
+    }
     for (ri, rg) in resolved.ranges().into_iter().enumerate() {
         let sealed_read = locked_test && ri == 0;
         let (ls, le) = (rg.start as f64, rg.end as f64);
@@ -12160,7 +12166,7 @@ fn run_walkforward(args: &[String]) -> ! {
             if locked_test {
                 let sealed = std::path::Path::new(sealed_path.as_deref().unwrap_or(""));
                 let entry = if verify_read {
-                    l.authorize_sealed(sealed, &candidate_id, &data_sha, &build_id, binding)?
+                    l.authorize_verify(sealed, &candidate_id, &data_sha, &build_id, binding)?
                 } else {
                     l.authorize_read(sealed, &candidate_id, &data_sha, &build_id, binding)?
                 };
