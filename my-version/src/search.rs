@@ -820,7 +820,7 @@ impl Config {
         compare!(seed, "seed");
         compare!(ops, "ops");
         compare!(migration_interval, "migration_interval");
-        compare!(restart_interval, "restart_interval");
+        settings::differences(Group::Schedule, self, other, &mut diff); // #1109
         settings::differences(Group::Filter, self, other, &mut diff); // #1083
         settings::differences(Group::Fit, self, other, &mut diff);
         compare!(init_depth, "init_depth");

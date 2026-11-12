@@ -26,6 +26,8 @@ use std::collections::BTreeMap;
 pub enum Group {
     /// Next to the other stopping rules.
     Stop,
+    /// The restart cadence, written after the migration interval.
+    Schedule,
     /// Island selection and restarts.
     Island,
     /// Node-path variation.
@@ -39,12 +41,20 @@ pub enum Group {
 }
 
 impl Group {
-    pub const ALL: [Group; 6] =
-        [Group::Stop, Group::Island, Group::Variation, Group::Filter, Group::Fit, Group::Engine];
+    pub const ALL: [Group; 7] = [
+        Group::Stop,
+        Group::Schedule,
+        Group::Island,
+        Group::Variation,
+        Group::Filter,
+        Group::Fit,
+        Group::Engine,
+    ];
 
     pub const fn name(self) -> &'static str {
         match self {
             Group::Stop => "stop",
+            Group::Schedule => "schedule",
             Group::Island => "island",
             Group::Variation => "variation",
             Group::Filter => "filter",
@@ -502,6 +512,31 @@ pub static TABLE: &[&dyn Setting] = &[
         active: None,
         conflict: Conflict::Saved,
     },
+    &Row::<usize> {
+        flag: "--restart-interval",
+        key: "restart_interval",
+        group: Group::Schedule,
+        schema_type: "int",
+        schema_default: "60",
+        schema: "#1109: generations between island restart checks (0: no restart check, so no restart of any kind, explore islands included). The stall length of --restart-policy island and the lifetime unit of --explore-islands. Saved search setting: a resume refuses a different value",
+        help: "  --restart-interval <N>     generations between island restart checks,
+                             default 60. Also the stall length of
+                             --restart-policy island and the lifetime unit of
+                             --explore-islands. 0 turns every restart off,
+                             explore restarts included. Saved search setting
+                             (#1109)",
+        bench: Some(Bench {
+            usage: "  --restart-interval <N>    generations between island restarts",
+            omit_unset: false,
+        }),
+        gui: false,
+        get: |c| &c.restart_interval,
+        set: |c| &mut c.restart_interval,
+        cli: Cli::Value(|v| uint("--restart-interval", v)),
+        write: Write::Required,
+        active: None,
+        conflict: Conflict::SavedKey,
+    },
     &Row::<Selection> {
         flag: "--selection",
         key: "selection",
@@ -536,13 +571,13 @@ pub static TABLE: &[&dyn Setting] = &[
         group: Group::Island,
         schema_type: "enum",
         schema_default: "archive",
-        schema: "#1022: archive | island. Which stall rule restarts an island at every restart interval (60 generations). archive: an island restarts after two checks in which its best error is worse than the archive best; once ring migration has spread the archive best to every island no island is ever behind it, so no restart fires. island: an island restarts when its own best error has not improved (relative 1e-9, the patience rule) for one restart interval, except the keeper, the lowest island whose best error equals the archive best; the restarted island takes no front parent and no migrant for --restart-isolation generations. With --islands 1 the only island is the keeper and nothing restarts. Applies to the node path and the flat postfix path. An isolated island also takes no --qd-policy parent (neither its global-front share nor a QD-archive parent): it breeds from its own members only (#1067). Saved search setting: a resume refuses a different value; a checkpoint without it loads as archive; island adds island_stall records to the checkpoint. The development log carries restarts, restarts_total and isolated",
+        schema: "#1022: archive | island. Which stall rule restarts an island at every restart interval (--restart-interval, default 60 generations). archive: an island restarts after two checks in which its best error is worse than the archive best; once ring migration has spread the archive best to every island no island is ever behind it, so no restart fires. island: an island restarts when its own best error has not improved (relative 1e-9, the patience rule) for one restart interval, except the keeper, the lowest island whose best error equals the archive best; the restarted island takes no front parent and no migrant for --restart-isolation generations. With --islands 1 the only island is the keeper and nothing restarts. Applies to the node path and the flat postfix path. An isolated island also takes no --qd-policy parent (neither its global-front share nor a QD-archive parent): it breeds from its own members only (#1067). Saved search setting: a resume refuses a different value; a checkpoint without it loads as archive; island adds island_stall records to the checkpoint. The development log carries restarts, restarts_total and isolated",
         help: "  --restart-policy archive|island
                              which stall rule restarts an island every
-                             restart interval (60 generations). archive
-                             (default) restarts an island after two checks
-                             in which its best error is worse than the
-                             archive best. island restarts an island whose
+                             restart interval (--restart-interval, default
+                             60 generations). archive (default) restarts an
+                             island after two checks in which its best error
+                             is worse than the archive best. island restarts an island whose
                              own best error has not improved for one restart
                              interval, except the lowest island that holds
                              the archive best (the keeper), and isolates it
@@ -594,14 +629,15 @@ pub static TABLE: &[&dyn Setting] = &[
         group: Group::Island,
         schema_type: "int",
         schema_default: "0",
-        schema: "#1100: the highest K islands form an explore tier (0: none; K must be below --islands). An explore island takes no front parent and no --qd-policy parent, sends and receives no migrant, and restarts at the end of each lifetime of a Luby schedule (1, 1, 2, 1, 1, 2, 4, ... units of the restart interval, 60 generations, list-scheduled over the explore islands: each next lifetime goes to the island whose lifetimes add up to the least, ties to the lowest), so the restart generations depend on the generation alone. The other islands (the exploit tier) keep --restart-policy and a directed ring among themselves; explore results reach them only through the archive and its front parents. Applies to the node path and the flat postfix path. The development log counts explore restarts in restarts and restarts_total; isolated counts exploit windows only. Saved search setting: written to the checkpoint only when above 0, a resume refuses a different value, a checkpoint without it loads as 0",
+        schema: "#1100: the highest K islands form an explore tier (0: none; K must be below --islands). An explore island takes no front parent and no --qd-policy parent, sends and receives no migrant, and restarts at the end of each lifetime of a Luby schedule (1, 1, 2, 1, 1, 2, 4, ... units of --restart-interval, default 60 generations, list-scheduled over the explore islands: each next lifetime goes to the island whose lifetimes add up to the least, ties to the lowest), so the restart generations depend on the generation alone. The other islands (the exploit tier) keep --restart-policy and a directed ring among themselves; explore results reach them only through the archive and its front parents. Applies to the node path and the flat postfix path. The development log counts explore restarts in restarts and restarts_total; isolated counts exploit windows only. Saved search setting: written to the checkpoint only when above 0, a resume refuses a different value, a checkpoint without it loads as 0",
         help: "  --explore-islands <K>      the highest K islands form an explore tier,
                              default 0 (none). An explore island takes no
                              front parent, no --qd-policy parent and no
                              migrant, sends no migrant, and restarts at the
                              end of each lifetime of a Luby schedule in
-                             units of the restart interval (60
-                             generations). The other islands keep
+                             units of --restart-interval (default 60
+                             generations; 0 turns restarts off, explore
+                             islands included). The other islands keep
                              --restart-policy and a ring of their own;
                              explore results reach them through the
                              archive only. K must be below --islands.

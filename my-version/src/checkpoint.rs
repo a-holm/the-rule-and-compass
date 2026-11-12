@@ -1514,7 +1514,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "seed",
         "ops",
         "migration_interval",
-        "restart_interval",
         "init_depth",
         "fit_iters",
         "dedup",
@@ -1873,7 +1872,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         seed: num_u32("seed")?,
         ops,
         migration_interval: num_usize("migration_interval")?,
-        restart_interval: num_usize("restart_interval")?,
         init_depth: num_usize("init_depth")?,
         fit_iters: num_usize("fit_iters")?,
         fit_strategy, // #116
@@ -1959,7 +1957,7 @@ fn write_config(cfg: &Config, out: &mut String) {
     let ops: Vec<String> = cfg.ops.iter().map(|op| op.index().to_string()).collect();
     writeln!(out, "config ops {}", ops.join(",")).unwrap();
     writeln!(out, "config migration_interval {}", cfg.migration_interval).unwrap();
-    writeln!(out, "config restart_interval {}", cfg.restart_interval).unwrap();
+    crate::settings::write(crate::settings::Group::Schedule, cfg, out); // #1109
     writeln!(out, "config init_depth {}", cfg.init_depth).unwrap();
     writeln!(out, "config fit_iters {}", cfg.fit_iters).unwrap();
     writeln!(out, "config fit_strategy {}", cfg.fit_strategy.name()).unwrap(); // #116

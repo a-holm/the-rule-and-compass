@@ -916,6 +916,59 @@ mod tests {
     }
 
     #[test]
+    fn the_restart_interval_sets_the_explore_lifetime_unit() {
+        let (n, k, unit) = (4usize, 2usize, 3usize);
+        let cfg = Config { explore_islands: k, ..policy_cfg(n, RestartPolicy::Archive, 0, unit, 0) };
+        let mut policy = IslandPolicy::new(&cfg);
+        let mut pop = Bests { best: vec![0.1, 0.5, 0.7, 0.9], ..Default::default() };
+        let archive = [sol(0.1)];
+        let mut got: Vec<(usize, usize)> = Vec::new();
+        for gen in 0..36 {
+            policy.observe(&pop);
+            for island in policy.barrier(gen, &archive, &mut pop) {
+                if island >= n - k {
+                    got.push((gen, island));
+                }
+            }
+        }
+        let mut want: Vec<(usize, usize)> = Vec::new();
+        for b in 1..=12u64 {
+            for slot in explore_restarts(k, b) {
+                want.push((unit * b as usize - 1, n - k + slot));
+            }
+        }
+        assert_eq!(got, want);
+        assert!(got.len() >= 12, "{got:?}");
+        assert!(got.iter().all(|&(gen, _)| (gen + 1) % unit == 0), "{got:?}");
+    }
+
+    #[test]
+    fn the_restart_interval_sets_the_island_stall_length() {
+        for (unit, want) in [(3usize, vec![5usize, 11, 17, 23]), (4, vec![7, 15, 23])] {
+            let cfg = policy_cfg(3, RestartPolicy::Island, 0, unit, 0);
+            let mut policy = IslandPolicy::new(&cfg);
+            let mut pop = Bests { best: vec![0.1, 0.5, 0.5], ..Default::default() };
+            let archive = [sol(0.1)];
+            let mut at = Vec::new();
+            for gen in 0..24 {
+                policy.observe(&pop);
+                let restarts = policy.barrier(gen, &archive, &mut pop);
+                if !restarts.is_empty() {
+                    assert_eq!(restarts, [1, 2], "interval {unit} generation {gen}: the keeper is spared");
+                    at.push(gen);
+                }
+            }
+            assert_eq!(at, want, "interval {unit}");
+        }
+        let mut policy = IslandPolicy::new(&policy_cfg(3, RestartPolicy::Island, 0, 0, 0));
+        let mut pop = Bests { best: vec![0.1, 0.5, 0.5], ..Default::default() };
+        for gen in 0..24 {
+            policy.observe(&pop);
+            assert!(policy.barrier(gen, &[sol(0.1)], &mut pop).is_empty(), "interval 0 restarts nothing");
+        }
+    }
+
+    #[test]
     fn an_explore_island_takes_no_front_parent_and_exchanges_no_migrant() {
         let (n, k, unit) = (5usize, 2usize, 2usize);
         for rule in [RestartPolicy::Archive, RestartPolicy::Island] {
