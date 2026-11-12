@@ -834,6 +834,15 @@ SEARCH:
                              of their own; explore results reach them
                              through the archive only. K must be below
                              --islands. Saved search setting (#1100)
+  --front-scope global|island
+                             where front parents come from. global
+                             (default) draws them from the Pareto front of
+                             every island. island gives each island its own
+                             error/complexity front; a front moves only
+                             with a migrant (the destination front becomes
+                             the front of both) and a restart empties it.
+                             The reported archive stays global. Not with
+                             --qd-policy. Saved search setting (#1070)
   --mutation-mix <M>         node-path edit weights: classic (point .25, terminal
                              .35, subtree .40; default) or extended (adds insert,
                              delete, swap and rotate). Not with --variation
@@ -2857,6 +2866,7 @@ fn main() {
     let mut restart_policy_set = false;
     let mut restart_isolation_set = false;
     let mut explore_islands_set = false; // #1100
+    let mut front_scope_set = false; // #1070
     let mut mutation_mix_set = false; // #471
     let mut crossover_internal_set = false;
     let mut adaptive_mix_set = false;
@@ -3487,6 +3497,17 @@ fn main() {
                 cfg.explore_islands = parse_uint("--explore-islands", &val!());
                 explore_islands_set = true;
             }
+            // #1070: where front parents come from.
+            "--front-scope" => match crate::search::FrontScope::parse(&val!()) {
+                Ok(scope) => {
+                    cfg.front_scope = scope;
+                    front_scope_set = true;
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_USAGE);
+                }
+            },
             "--no-front-parents" => {
                 cfg.front_parents = false;
                 front_parents_set = true;
@@ -3868,6 +3889,12 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
+    if cfg.front_scope == crate::search::FrontScope::Island && cfg.qd_policy {
+        eprintln!(
+            "error: --front-scope island with --qd-policy: the QD archive is one parent pool shared by every island"
+        );
+        std::process::exit(EXIT_USAGE); // #1070
+    }
     // #928: a re-selection is a resume that runs nothing.
     if reselect_path.is_some() || reselect_run_path.is_some() {
         let conflicts = [
@@ -4190,6 +4217,13 @@ fn main() {
                 "--explore-islands {} (saved explore_islands is {})",
                 cfg.explore_islands, saved.explore_islands
             )); // #1100
+        }
+        if front_scope_set && cfg.front_scope != saved.front_scope {
+            conflicts.push(format!(
+                "--front-scope {} (saved front_scope is {})",
+                cfg.front_scope.as_str(),
+                saved.front_scope.as_str()
+            )); // #1070
         }
         // #495: the band decides which finalists get the exact refit.
         if refit_band_set && !cp.refit_band_unknown && cfg.refit_band != saved.refit_band {
