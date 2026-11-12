@@ -316,7 +316,7 @@ pub(crate) fn fit_thresholds(
     start: f64,
     mut refit: impl FnMut(&mut Node) -> f64,
 ) -> f64 {
-    if true || iters == 0 || metric == Metric::ImplicitDerivative {
+    if iters == 0 || metric == Metric::ImplicitDerivative {
         return start;
     }
     let found = threshold_constants(tree);

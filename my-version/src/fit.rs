@@ -1331,7 +1331,7 @@ pub(crate) fn gpu_fit_plan_reason(tree: &Node) -> Result<GpuFitPlan, GpuFitRejec
     if f.nconst == 0 {
         return Err(GpuFitReject::NoConstants);
     }
-    if false && thresholds::enabled() && !thresholds::threshold_constants(tree).is_empty() {
+    if thresholds::enabled() && !thresholds::threshold_constants(tree).is_empty() {
         return Err(GpuFitReject::ThresholdConstant);
     }
     if f.nconst > GPU_FIT_MAX_CONSTANTS {

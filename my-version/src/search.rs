@@ -11051,11 +11051,16 @@ mod tests {
                 "recovered_iterate",
                 "non_finite_start",
                 "unconverged",
+                "threshold_constant",
             ]
         );
         assert_eq!(
             plan_fallback_cause(GpuFitReject::TooManyConstants),
             FitFallbackCause::TooManyConstants
+        );
+        assert_eq!(
+            plan_fallback_cause(GpuFitReject::ThresholdConstant),
+            FitFallbackCause::ThresholdConstant
         );
         for reason in [
             GpuFitReject::TooManyNodes,
