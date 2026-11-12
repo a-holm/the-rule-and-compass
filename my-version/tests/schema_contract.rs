@@ -20,7 +20,7 @@ fn rcsr(args: &[&str]) -> std::process::Output {
 
 #[test]
 fn every_schema_option_is_accepted_by_the_cli() {
-    for (name, _, _, _) in schema::OPTIONS {
+    for (name, _, _, _) in schema::options().iter() {
         // No value: a flag reaches "missing --data"; a value option reaches
         // "requires a value". Either way the parser must not call it unknown.
         let out = rcsr(&[name]);
@@ -54,7 +54,7 @@ fn every_schema_option_is_in_help_and_the_readme_list() {
         .split("```")
         .nth(1)
         .expect("README option block");
-    for (name, _, _, _) in schema::OPTIONS {
+    for (name, _, _, _) in schema::options().iter() {
         assert!(help.contains(name), "--help is missing {name}");
         assert!(
             list.contains(name),
@@ -65,7 +65,7 @@ fn every_schema_option_is_in_help_and_the_readme_list() {
 
 #[test]
 fn every_schema_option_is_supported_or_explicitly_rejected_by_the_gui() {
-    for (name, _, _, _) in schema::OPTIONS {
+    for (name, _, _, _) in schema::options().iter() {
         match gui::parse_web_args(&[name.to_string()]) {
             Ok(()) => {}
             Err(message) => {
@@ -117,7 +117,7 @@ fn subcommands_carry_their_own_documented_options() {
 #[test]
 fn the_option_table_has_no_duplicates_or_empty_fields() {
     let mut seen = std::collections::HashSet::new();
-    for (name, ty, default, description) in schema::OPTIONS {
+    for (name, ty, default, description) in schema::options().iter() {
         assert!(name.starts_with("--"), "malformed option name {name}");
         assert!(seen.insert(*name), "duplicate option {name}");
         assert!(!ty.is_empty(), "{name} has no type");

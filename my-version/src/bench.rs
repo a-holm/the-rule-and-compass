@@ -388,29 +388,18 @@ pub struct Knobs {
     /// Comma list as given on the command line (`--ops`).
     pub ops: Option<String>,
     pub max_complexity: Option<usize>,
-    pub patience: Option<usize>,
     pub migration_interval: Option<usize>,
     pub restart_interval: Option<usize>,
     pub variation: Option<crate::search::VariationMode>,
-    pub selection: Option<crate::search::Selection>,
-    /// #1022: the restart rule and its isolation window.
-    pub restart_policy: Option<crate::search::RestartPolicy>,
-    pub restart_isolation: Option<usize>,
     pub dispatch: Option<crate::dispatch::DispatchMode>,
     /// #466: `Some(true)` turns the front prune on (`--prune`).
     pub prune: Option<bool>,
-    /// #471: node-path variation settings.
-    pub mutation_mix: Option<crate::search::MutationMix>,
-    pub crossover_internal: Option<f64>,
-    pub adaptive_mix: bool,
     /// #496: arithmetic of the device fit polish.
     pub fit_polish: Option<crate::fit::FitPolish>,
     /// #611: schedule of the CPU L1 constant fit.
     pub fit_irls: Option<crate::fit::FitIrls>,
-    /// #1024: exact 1-D fit of comparison and `if` thresholds.
-    pub fit_thresholds: bool,
-    /// #477: reject input-free offspring before the constant fit.
-    pub reject_constant_offspring: bool,
+    /// #1083: the knobs of the search setting table rows.
+    pub settings: crate::settings::Overrides,
 }
 
 /// How to run the suite: noise levels, search budget, seed and criterion.
@@ -774,9 +763,6 @@ fn base_config(cfg: &SuiteConfig, seed: u32) -> Config {
     if let Some(v) = k.max_complexity {
         sc.max_complexity = v;
     }
-    if let Some(v) = k.patience {
-        sc.patience = v;
-    }
     if let Some(v) = k.migration_interval {
         sc.migration_interval = v;
     }
@@ -786,25 +772,9 @@ fn base_config(cfg: &SuiteConfig, seed: u32) -> Config {
     if let Some(v) = k.variation {
         sc.variation = v;
     }
-    if let Some(v) = k.selection {
-        sc.selection = v;
-    }
-    if let Some(v) = k.restart_policy {
-        sc.restart_policy = v;
-    }
-    if let Some(v) = k.restart_isolation {
-        sc.restart_isolation = v;
-    }
     if let Some(v) = k.dispatch {
         sc.dispatch = v;
     }
-    if let Some(v) = k.mutation_mix {
-        sc.mutation_mix = v; // #471
-    }
-    if let Some(v) = k.crossover_internal {
-        sc.crossover_internal = v;
-    }
-    sc.adaptive_mix = k.adaptive_mix;
     if let Some(v) = k.fit_polish {
         sc.fit_polish = v;
     }
@@ -814,8 +784,7 @@ fn base_config(cfg: &SuiteConfig, seed: u32) -> Config {
     if let Some(v) = k.prune {
         sc.prune = v;
     }
-    sc.reject_constant_offspring = k.reject_constant_offspring; // #477
-    sc.fit_thresholds = k.fit_thresholds; // #1024
+    k.settings.apply(&mut sc); // #1083
     sc
 }
 
@@ -1499,44 +1468,43 @@ fn git_describe() -> String {
 /// The `config` object: everything that must match for two files to be
 /// comparable, then the search knobs and the build, which may differ.
 pub fn config_json(cfg: &SuiteConfig) -> String {
+    use crate::settings::Group;
     let k = &cfg.knobs;
     let fit = match k.fit_strategy {
         None => "exact".to_string(),
         Some(FitChoice::Default) => "default".to_string(),
         Some(FitChoice::Strategy(s)) => s.name().to_string(),
     };
-    let opt_u = |v: Option<usize>| json_opt(v);
+    let quoted = |v: Option<&str>| v.map_or("null".to_string(), |s| format!("\"{}\"", s));
+    let mut knobs = String::new();
+    knob(&mut knobs, "generations", cfg.generations);
+    knob(&mut knobs, "islands", cfg.islands);
+    knob(&mut knobs, "pop", cfg.pop);
+    knob(&mut knobs, "metric", format!("\"{}\"", cfg.metric.name()));
+    knob(&mut knobs, "time_budget", json_opt_f(cfg.time_budget));
+    knob(&mut knobs, "front_parents", cfg.front_parents);
+    knob(&mut knobs, "fit_strategy", format!("\"{}\"", fit));
+    knob(&mut knobs, "fit_iters", json_opt(k.fit_iters));
+    knob(&mut knobs, "ops", k.ops.as_ref().map_or("null".to_string(), |o| format!("\"{}\"", json_escape(o))));
+    knob(&mut knobs, "max_complexity", json_opt(k.max_complexity));
+    k.settings.json(Group::Stop, &mut knobs);
+    knob(&mut knobs, "migration_interval", json_opt(k.migration_interval));
+    knob(&mut knobs, "restart_interval", json_opt(k.restart_interval));
+    knob(&mut knobs, "variation", quoted(k.variation.map(|v| v.as_str())));
+    k.settings.json(Group::Island, &mut knobs);
+    knob(&mut knobs, "dispatch", quoted(k.dispatch.map(|v| v.name())));
+    knob(&mut knobs, "fit_polish", quoted(k.fit_polish.map(|v| v.name())));
+    k.settings.json(Group::Filter, &mut knobs);
+    k.settings.json(Group::Variation, &mut knobs);
+    knob(&mut knobs, "prune", k.prune.map_or("null".to_string(), |v| v.to_string()));
+    knob(&mut knobs, "fit_irls", quoted(k.fit_irls.map(|v| v.name())));
+    k.settings.json(Group::Fit, &mut knobs);
     format!(
-        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"selection\":{},\"restart_policy\":{},\"restart_isolation\":{},\"dispatch\":{},\"fit_polish\":{},\"reject_constant_offspring\":{},\"mutation_mix\":{},\"crossover_internal\":{},\"adaptive_mix\":{},\"prune\":{},\"fit_irls\":{}{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
+        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
         GENERATOR_VERSION,
         json_number(cfg.threshold),
         json_number(SIGNAL_THRESHOLD),
-        cfg.generations,
-        cfg.islands,
-        cfg.pop,
-        cfg.metric.name(),
-        json_opt_f(cfg.time_budget),
-        cfg.front_parents,
-        fit,
-        opt_u(k.fit_iters),
-        k.ops.as_ref().map_or("null".to_string(), |o| format!("\"{}\"", json_escape(o))),
-        opt_u(k.max_complexity),
-        opt_u(k.patience),
-        opt_u(k.migration_interval),
-        opt_u(k.restart_interval),
-        k.variation.map_or("null".to_string(), |v| format!("\"{}\"", v.as_str())),
-        k.selection.map_or("null".to_string(), |v| format!("\"{}\"", v.as_str())),
-        k.restart_policy.map_or("null".to_string(), |v| format!("\"{}\"", v.as_str())),
-        opt_u(k.restart_isolation),
-        k.dispatch.map_or("null".to_string(), |v| format!("\"{}\"", v.name())),
-        k.fit_polish.map_or("null".to_string(), |v| format!("\"{}\"", v.name())),
-        k.reject_constant_offspring,
-        k.mutation_mix.map_or("null".to_string(), |v| format!("\"{}\"", v.as_str())),
-        k.crossover_internal.map_or("null".to_string(), json_number),
-        k.adaptive_mix,
-        k.prune.map_or("null".to_string(), |v| v.to_string()),
-        k.fit_irls.map_or("null".to_string(), |v| format!("\"{}\"", v.name())),
-        if k.fit_thresholds { ",\"fit_thresholds\":true" } else { "" },
+        knobs.strip_prefix(',').unwrap_or(&knobs),
         env!("CARGO_PKG_VERSION"),
         cfg!(feature = "cuda"),
         cfg.backend.name(),
@@ -1544,6 +1512,11 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
         cfg.threads,
         json_escape(&git_describe()),
     )
+}
+
+/// Append `,"<name>":<value>` to the knobs object.
+fn knob(out: &mut String, name: &str, value: impl std::fmt::Display) {
+    out.push_str(&format!(",\"{}\":{}", name, value));
 }
 
 /// The fields of one run, without braces.
