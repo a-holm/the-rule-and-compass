@@ -11270,8 +11270,9 @@ OPTIONS:
   --sealed <file>            locked_candidates.json from `rcsr protocol seal`
   --verify-read              with --locked-test (exit 2 without it): recompute a recorded
                              read, compare its report hash, write --out and --markdown,
-                             record nothing; a candidate with no recorded read is refused
-                             (exit 3) before any locked row is scored
+                             record nothing; a candidate with no recorded read, a window set or
+                             setting that differs from the recorded read, and a read stored without a
+                             binding digest are refused (exit 3) before any locked row is scored
   --allow-unbound-ledger     with --locked-test: read a candidate whose ledger
                              recorded no locked test range (old ledger); the read
                              is reported as unbound. Without it that read is

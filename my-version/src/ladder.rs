@@ -2513,8 +2513,9 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --verify-read             with --locked-test: recompute a recorded baseline read, compare its report hash\n\
                             with the ledger, write --out and --markdown, record nothing (the route after a\n\
                             failed write); no recorded read, a store whose data hash differs from the\n\
-                            recorded read and a store with no read marker are refused (exit 3) before\n\
-                            the panel is loaded; a mismatch writes no file (exit 3)\n\
+                            recorded read, a store with no read marker, a window set or setting that differs\n\
+                            from the recorded read and a read stored without a binding digest are refused\n\
+                            (exit 3) before the panel is loaded; a mismatch writes no file (exit 3)\n\
   --expect-report-sha256 <h> exit 3 and write no file unless the report hashes to h;\n\
                             with --locked-test it needs --verify-read (exit 2 without it)\n\
   --out <file>              write the JSON report (ends with a ledger object: io and\n\
