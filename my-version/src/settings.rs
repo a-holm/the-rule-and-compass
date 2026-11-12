@@ -577,6 +577,37 @@ pub static TABLE: &[&dyn Setting] = &[
         active: Some(island_policy),
         conflict: Conflict::SavedKey,
     },
+    &Row::<usize> {
+        flag: "--explore-islands",
+        key: "explore_islands",
+        group: Group::Island,
+        schema_type: "int",
+        schema_default: "0",
+        schema: "#1100: the highest K islands form an explore tier (0: none; K must be below --islands). An explore island takes no front parent and no --qd-policy parent, sends and receives no migrant, and restarts at the end of each lifetime of a Luby schedule (1, 1, 2, 1, 1, 2, 4, ... units of the restart interval, 60 generations, list-scheduled over the explore islands: each next lifetime goes to the island whose lifetimes add up to the least, ties to the lowest), so the restart generations depend on the generation alone. The other islands (the exploit tier) keep --restart-policy and a directed ring among themselves; explore results reach them only through the archive and its front parents. Applies to the node path and the flat postfix path. The development log counts explore restarts in restarts and restarts_total; isolated counts exploit windows only. Saved search setting: written to the checkpoint only when above 0, a resume refuses a different value, a checkpoint without it loads as 0",
+        help: "  --explore-islands <K>      the highest K islands form an explore tier,
+                             default 0 (none). An explore island takes no
+                             front parent, no --qd-policy parent and no
+                             migrant, sends no migrant, and restarts at the
+                             end of each lifetime of a Luby schedule in
+                             units of the restart interval (60
+                             generations). The other islands keep
+                             --restart-policy and a ring of their own;
+                             explore results reach them through the
+                             archive only. K must be below --islands.
+                             Saved search setting (#1100)",
+        bench: Some(Bench {
+            usage: "  --explore-islands <K>     the highest K islands form an explore tier with Luby
+                            restarts, no front parents and no migrants (default 0)",
+            omit_unset: true,
+        }),
+        gui: false,
+        get: |c| &c.explore_islands,
+        set: |c| &mut c.explore_islands,
+        cli: Cli::Value(|v| uint("--explore-islands", v)),
+        write: Write::UnlessDefault,
+        active: None,
+        conflict: Conflict::SavedKey,
+    },
     &Row::<MutationMix> {
         flag: "--mutation-mix",
         key: "mutation_mix",

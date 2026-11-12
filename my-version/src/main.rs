@@ -3712,6 +3712,15 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
+    // #1100: a resume is checked against its saved island count by the search.
+    if resume_path.is_none() && cfg.explore_islands > 0 && cfg.explore_islands >= cfg.islands.max(1) {
+        eprintln!(
+            "error: --explore-islands {} needs at least one exploit island (--islands {})",
+            cfg.explore_islands,
+            cfg.islands.max(1)
+        );
+        std::process::exit(EXIT_USAGE);
+    }
     // #928: a re-selection is a resume that runs nothing.
     if reselect_path.is_some() || reselect_run_path.is_some() {
         let conflicts = [

@@ -664,7 +664,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring] [--reject-fixed-position]
-     [--selection lexicographic|afp] [--restart-policy archive|island] [--restart-isolation N]
+     [--selection lexicographic|afp] [--restart-policy archive|island] [--restart-isolation N] [--explore-islands K]
      [--mutation-mix classic|extended] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
      [--patience N]
@@ -1273,6 +1273,14 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   best) and keeps it from front parents and migrants for `W` generations
   (default 25). Node and flat postfix paths. Saved search setting; the default
   stays `archive`;
+- **opt-in scheduled explore tier** (`--explore-islands K`): the highest `K`
+  islands take no front parent and no `--qd-policy` parent, send and receive no
+  migrant, and restart at the end of each lifetime of a Luby schedule (1, 1, 2,
+  1, 1, 2, 4, ... units of the 60-generation restart interval, spread over the
+  explore islands), so a run holds many independent trials instead of one. The
+  other islands keep the restart rule and a ring of their own and see explore
+  results only through the archive. Node and flat postfix paths. Saved search
+  setting; the default stays 0;
 - **opt-in quality-diversity search** (`--qd`, `--qd-cvt`, `--qd-policy`,
   `--qd-cells`, `--qd-cell-cap`): CVT-MAP-Elites over variable usage ×
   prediction skewness, with deterministic Halton initialisation, Lloyd
