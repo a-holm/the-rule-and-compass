@@ -464,7 +464,7 @@ fn next_token<'a>(
     Ok(token)
 }
 
-fn encode_f64(v: f64) -> String {
+pub(crate) fn encode_f64(v: f64) -> String {
     if v.is_nan() {
         "NaN".to_string()
     } else if v == f64::INFINITY {
@@ -478,7 +478,7 @@ fn encode_f64(v: f64) -> String {
     }
 }
 
-fn decode_f64(s: &str) -> Result<f64, String> {
+pub(crate) fn decode_f64(s: &str) -> Result<f64, String> {
     match s {
         "NaN" => Ok(f64::NAN),
         "inf" => Ok(f64::INFINITY),
@@ -1480,7 +1480,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "fit_iters",
         "dedup",
         "time_budget",
-        "patience",
         "predictor_samples",
     ];
     // #25: optional so a checkpoint written before units existed still loads,
@@ -1493,9 +1492,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "require_dimensions",
         "fit_samples",
         "front_parents", // #76
-        "reject_constant_offspring", // #477: missing means false
-        "reject_fixed_position", // #848: missing means false
-        "fit_thresholds", // #1024: missing means false
         "fit_strategy",  // #116: missing means `exact`
         "fit_admission", // #223: missing means `screened`
         "fit_polish",    // #496: missing means `f64`
@@ -1512,20 +1508,18 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "qd_policy",     // #120
         "qd_control",    // #120
         "variation",     // #122: missing means auto
-        "selection",     // #465: missing means lexicographic
-        "mutation_mix",       // #471: missing means classic
-        "crossover_internal", // #471: missing means 0
-        "adaptive_mix",       // #471: missing means false
-        "restart_policy",     // #1022: missing means archive
-        "restart_isolation",  // #1022: missing means 25
     ];
     for key in KEYS {
         required(fields, key)?;
     }
+    // #1083: the table rows carry their own required and optional keys.
+    for row in crate::settings::rows().filter(|r| r.required()) {
+        required(fields, row.key())?;
+    }
     let extras: Vec<&str> = fields
         .keys()
         .map(|s| s.as_str())
-        .filter(|k| !KEYS.contains(k) && !OPTIONAL_KEYS.contains(k))
+        .filter(|k| !KEYS.contains(k) && !OPTIONAL_KEYS.contains(k) && crate::settings::find_key(k).is_none())
         .collect();
     if extras.contains(&"linear_scaling") {
         return Err(
@@ -1725,54 +1719,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             ))
         }
     };
-    let mutation_mix = match fields.get("mutation_mix") {
-        None => crate::search::MutationMix::Classic,
-        Some(s) => crate::search::MutationMix::parse(s).map_err(|e| format!("config 'mutation_mix': {}", e))?,
-    };
-    let crossover_internal = match fields.get("crossover_internal") {
-        None => 0.0,
-        Some(s) => decode_f64(s).map_err(|e| format!("config 'crossover_internal': {}", e))?,
-    };
-    let adaptive_mix = match fields.get("adaptive_mix").map(|s| s.as_str()) {
-        None | Some("false") => false,
-        Some("true") => true,
-        Some(other) => {
-            return Err(format!(
-                "config 'adaptive_mix' must be true or false, got '{}'",
-                other
-            ))
-        }
-    };
-    let reject_constant_offspring = match fields.get("reject_constant_offspring").map(|s| s.as_str()) {
-        None | Some("false") => false,
-        Some("true") => true,
-        Some(other) => {
-            return Err(format!(
-                "config 'reject_constant_offspring' must be true or false, got '{}'",
-                other
-            ))
-        }
-    };
-    let reject_fixed_position = match fields.get("reject_fixed_position").map(|s| s.as_str()) {
-        None | Some("false") => false,
-        Some("true") => true,
-        Some(other) => {
-            return Err(format!(
-                "config 'reject_fixed_position' must be true or false, got '{}'",
-                other
-            ))
-        }
-    };
-    let fit_thresholds = match fields.get("fit_thresholds").map(|s| s.as_str()) {
-        None | Some("false") => false,
-        Some("true") => true,
-        Some(other) => {
-            return Err(format!(
-                "config 'fit_thresholds' must be true or false, got '{}'",
-                other
-            ))
-        }
-    };
     // #116: missing means `exact`, byte-identical to a checkpoint written
     // before the solver portfolio existed.
     let fit_strategy = match fields.get("fit_strategy").map(|s| s.as_str()) {
@@ -1887,27 +1833,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         })?,
     };
 
-    // #465: absent means lexicographic, matching every earlier checkpoint.
-    let selection = match fields.get("selection").map(|s| s.as_str()) {
-        None => crate::search::Selection::Lexicographic,
-        Some(raw) => crate::search::Selection::parse(raw)
-            .map_err(|e| format!("config 'selection' is invalid: {}", e))?,
-    };
-
-    // #1022: absent means archive and 25, matching every earlier checkpoint.
-    let restart_policy = match fields.get("restart_policy").map(|s| s.as_str()) {
-        None => crate::search::RestartPolicy::Archive,
-        Some(raw) => crate::search::RestartPolicy::parse(raw)
-            .map_err(|e| format!("config 'restart_policy' is invalid: {}", e))?,
-    };
-    let restart_isolation = match fields.get("restart_isolation") {
-        None => 25,
-        Some(raw) => raw
-            .parse::<usize>()
-            .map_err(|_| format!("config 'restart_isolation' is invalid: '{}'", raw))?,
-    };
-
-    Ok(Config {
+    let mut config = Config {
         generations: num_usize("generations")?,
         islands: num_usize("islands")?,
         pop: num_usize("pop")?,
@@ -1929,7 +1855,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         dedup: bool_val("dedup")?,
         time_budget,
         interim_chunk: false,
-        patience: num_usize("patience")?,
         predictor_samples,
         fit_samples, // #85
         fit_rows,     // #116
@@ -1939,9 +1864,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         // #116: a disk row source is a path choice, not saved search state.
         fit_stream_source: None,
         front_parents, // #76
-        reject_constant_offspring, // #477
-        reject_fixed_position, // #848
-        fit_thresholds, // #1024
         units,
         require_dimensions,
         qd_bins,
@@ -1970,13 +1892,11 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         threads_explicit: false,
         fit_tail_overlap: true,
         variation,
-        selection,
-        restart_policy,
-        restart_isolation,
-        mutation_mix,
-        crossover_internal,
-        adaptive_mix,
-    })
+        // #1083: the table rows are read below.
+        ..Config::default()
+    };
+    crate::settings::read(&mut config, fields)?;
+    Ok(config)
 }
 
 fn write_config(cfg: &Config, out: &mut String) {
@@ -2049,7 +1969,7 @@ fn write_config(cfg: &Config, out: &mut String) {
         }
     )
     .unwrap();
-    writeln!(out, "config patience {}", cfg.patience).unwrap();
+    crate::settings::write(crate::settings::Group::Stop, cfg, out); // #1083
     writeln!(
         out,
         "config predictor_samples {}",
@@ -2064,43 +1984,15 @@ fn write_config(cfg: &Config, out: &mut String) {
     if cfg.fit_samples > 0 {
         writeln!(out, "config fit_samples {}", cfg.fit_samples).unwrap();
     }
-    // #465: written only when on, so every other checkpoint and config hash
-    // keeps its bytes.
-    if cfg.selection != crate::search::Selection::Lexicographic {
-        writeln!(out, "config selection {}", cfg.selection.as_str()).unwrap();
-    }
-    // #1022: written only under the island policy, so every other checkpoint and
-    // config hash keeps its bytes.
-    if cfg.restart_policy != crate::search::RestartPolicy::Archive {
-        writeln!(out, "config restart_policy {}", cfg.restart_policy.as_str()).unwrap();
-        if cfg.restart_isolation != 25 {
-            writeln!(out, "config restart_isolation {}", cfg.restart_isolation).unwrap();
-        }
-    }
-    // #471: written only when set, so every other checkpoint keeps its bytes.
-    if cfg.mutation_mix != crate::search::MutationMix::Classic {
-        writeln!(out, "config mutation_mix {}", cfg.mutation_mix.as_str()).unwrap();
-    }
-    if cfg.crossover_internal != 0.0 {
-        writeln!(out, "config crossover_internal {}", encode_f64(cfg.crossover_internal)).unwrap();
-    }
-    if cfg.adaptive_mix {
-        writeln!(out, "config adaptive_mix true").unwrap();
-    }
+    crate::settings::write(crate::settings::Group::Island, cfg, out); // #1083
+    crate::settings::write(crate::settings::Group::Variation, cfg, out);
     // #76: only write the field when front feedback is off, so an on run's
     // checkpoint stays byte-identical to one written before the flag existed.
     if !cfg.front_parents {
         writeln!(out, "config front_parents false").unwrap();
     }
-    if cfg.reject_constant_offspring {
-        writeln!(out, "config reject_constant_offspring true").unwrap(); // #477
-    }
-    if cfg.reject_fixed_position {
-        writeln!(out, "config reject_fixed_position true").unwrap(); // #848
-    }
-    if cfg.fit_thresholds {
-        writeln!(out, "config fit_thresholds true").unwrap(); // #1024
-    }
+    crate::settings::write(crate::settings::Group::Filter, cfg, out); // #1083
+    crate::settings::write(crate::settings::Group::Fit, cfg, out);
     // #25: only write these when units are active, so a units-free checkpoint
     // is byte-identical to one written before this feature existed.
     if let Some(u) = &cfg.units {
