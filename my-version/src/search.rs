@@ -790,6 +790,7 @@ impl Config {
     /// and `dev_log` (#211) are reporting callbacks, not search state, and are
     /// ignored.
     pub fn search_setting_differences(&self, other: &Config) -> Vec<&'static str> {
+        use crate::settings::{self, Group};
         let mut diff = Vec::new();
         macro_rules! compare {
             ($field:ident, $name:expr) => {
@@ -810,35 +811,26 @@ impl Config {
         compare!(ops, "ops");
         compare!(migration_interval, "migration_interval");
         compare!(restart_interval, "restart_interval");
-        compare!(reject_constant_offspring, "reject_constant_offspring"); // #477
-        compare!(reject_fixed_position, "reject_fixed_position"); // #848
-        compare!(fit_thresholds, "fit_thresholds"); // #1024
+        settings::differences(Group::Filter, self, other, &mut diff); // #1083
+        settings::differences(Group::Fit, self, other, &mut diff);
         compare!(init_depth, "init_depth");
         compare!(fit_iters, "fit_iters");
         compare!(fit_strategy, "fit_strategy"); // #116
         compare!(fit_polish, "fit_polish");
         compare!(fit_irls, "fit_irls"); // #611
         compare!(fit_admission, "fit_admission");
-        compare!(mutation_mix, "mutation_mix"); // #471
-        compare!(crossover_internal, "crossover_internal"); // #471
-        compare!(adaptive_mix, "adaptive_mix"); // #471
+        settings::differences(Group::Variation, self, other, &mut diff);
         compare!(dedup, "dedup");
         // #256: `time_budget` is a per-process limit, not search state; a resumed
         // run may set a new one.
-        compare!(patience, "patience");
+        settings::differences(Group::Stop, self, other, &mut diff);
         compare!(predictor_samples, "predictor_samples");
         compare!(fit_samples, "fit_samples"); // #85
         compare!(fit_rows, "fit_rows"); // #116
         compare!(fit_fallback_max, "fit_fallback_max"); // #255
         compare!(refit_band, "refit_band"); // #495
         compare!(front_parents, "front_parents"); // #76
-        compare!(selection, "selection"); // #465
-        compare!(restart_policy, "restart_policy"); // #1022
-        if self.restart_policy == RestartPolicy::Island {
-            compare!(restart_isolation, "restart_isolation"); // #1022
-        }
-        compare!(explore_islands, "explore_islands"); // #1100
-        compare!(front_scope, "front_scope"); // #1070
+        settings::differences(Group::Island, self, other, &mut diff);
         compare!(qd_bins, "qd_bins"); // #120
         compare!(qd_cell_cap, "qd_cell_cap"); // #120
         compare!(qd_cvt, "qd_cvt"); // #120

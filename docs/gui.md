@@ -644,7 +644,7 @@ shutdown flag.
 
 ### 6.3 Schema-driven forms (how a new flag reaches the GUI)
 
-1. A developer adds `--weight` to `schema::OPTIONS` in `src/schema.rs`.
+1. A developer adds `--weight` to `schema::OPTIONS` in `src/schema.rs`. A search setting is a row of the search setting table in `src/settings.rs` instead; `rcsr schema` lists it at the anchor of its group.
 2. The GUI, on next launch, reads the new option from `rcsr schema`.
 3. The generic renderer maps its `type` to a widget and, because it is not in
    the GUI's layout table, places it in the **"Other"** group automatically.
@@ -655,7 +655,7 @@ shutdown flag.
 
 The renderer needs no GUI change, but the execution parser is still a separate
 match in `gui.rs`: a new flag must be added to that match or to the explicit
-`UNSUPPORTED` table, with the reason shown to the user. `tests/gui.rs` enforces
+`UNSUPPORTED` table, with the reason shown to the user. A row of the search setting table states it in its `gui` field instead: `true` runs the row through its own parser, `false` rejects it by name. `tests/gui.rs` enforces
 this for every documented root option, so "rendered but rejected as unknown"
 cannot ship. The layout table only *improves* placement; it is never required
 for the form to render a flag.
