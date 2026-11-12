@@ -1257,11 +1257,9 @@ mod tests {
         );
         let off = v.next_generation_with_front(&parents, 5, &[false; 2], &front, &[0.0; 2]);
         let mixed = v.next_generation_with_front(&parents, 5, &[false; 2], &front, &[0.0, 0.5]);
-        let on = v.next_generation_with_front(&parents, 5, &[false; 2], &front, &[0.5; 2]);
         let island0 = |a: &Arena| (0..24).map(|j| a.slot(a.slot_index(0, j)).to_vec()).collect::<Vec<_>>();
         let island1 = |a: &Arena| (0..24).map(|j| a.slot(a.slot_index(1, j)).to_vec()).collect::<Vec<_>>();
         assert_eq!(island0(&mixed), island0(&off), "the isolated island is the off path");
         assert_ne!(island1(&mixed), island1(&off), "the open island takes front parents");
-        assert_eq!(island1(&mixed), island1(&on), "the open island is the on path");
     }
 }

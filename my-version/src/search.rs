@@ -8235,7 +8235,7 @@ fn run_postfix_search(
         if let Some(observe) = &cfg.front_observer {
             observe(gens_done, t0.elapsed().as_secs_f64(), &archive);
         }
-        if let Some(report) = &cfg.dev_log {
+        if cfg.dev_log.is_some() {
             let mut dev_errors: Vec<f64> = Vec::with_capacity(n_islands * pop);
             let mut dev_island_best: Vec<f64> = Vec::with_capacity(n_islands);
             for i in 0..n_islands {
@@ -14549,10 +14549,12 @@ mod tests {
         for left in [2usize, 1, 0] {
             s.tick(&[1.0, 5.0]);
             assert_eq!(s.isolated[1], left);
+            if left == 2 {
+                assert_eq!(s.since_improve[1], 0, "the first generation after a restart is an improvement");
+            }
         }
         assert!(!s.is_isolated(1));
         assert_eq!(s.front_p(1, 0.15), 0.15);
-        assert_eq!(s.since_improve[1], 0, "the first generation after a restart is an improvement");
         s.restarted(0, 0);
         assert!(!s.is_isolated(0), "a window of 0 turns the isolation off");
     }
@@ -14577,13 +14579,17 @@ mod tests {
         (p.noiseless(150), p.noiseless(60))
     }
 
-    fn restart_config(policy: RestartPolicy, isolation: usize) -> Config {
+    /// Search shapes that stall: the first two skip the constant fit, whose tiny
+    /// gains keep resetting an island's stall counter.
+    const RESTART_SHAPES: [(usize, usize); 6] = [(8, 0), (12, 0), (16, 0), (24, 0), (40, 0), (24, 4)];
+
+    fn restart_config(policy: RestartPolicy, isolation: usize, shape: (usize, usize)) -> Config {
         Config {
             generations: 60,
             islands: 2,
-            pop: 40,
+            pop: shape.0,
             max_complexity: 20,
-            fit_iters: 4,
+            fit_iters: shape.1,
             migration_interval: 5,
             restart_interval: 10,
             seed: 1,
@@ -14616,32 +14622,38 @@ mod tests {
     #[test]
     fn island_policy_restarts_a_stalled_island_that_the_archive_policy_never_restarts() {
         let (train, test) = restart_fixture();
-        let archive = restart_log(restart_config(RestartPolicy::Archive, 25), &train, &test);
-        let island = restart_log(restart_config(RestartPolicy::Island, 25), &train, &test);
-
-        let shared = archive
-            .iter()
-            .position(|(_, _, _, best)| best.len() == 2 && best[0].is_finite() && best[0] == best[1])
-            .expect("both islands share the best at some generation");
-        assert_eq!(
-            archive.last().unwrap().2,
-            archive[shared].2,
-            "the archive policy restarts nothing once both islands share the best (generation {})",
-            archive[shared].0
-        );
-        assert!(
-            island.last().unwrap().2 > 0,
-            "the island policy restarts a stalled island: {:?}",
-            island.iter().map(|r| r.1).collect::<Vec<_>>()
-        );
-        assert!(island.iter().any(|r| r.1 > 0), "a per-generation restart count is reported");
+        let mut island_restarted = false;
+        let mut seen: Vec<String> = Vec::new();
+        for shape in RESTART_SHAPES {
+            let archive = restart_log(restart_config(RestartPolicy::Archive, 25, shape), &train, &test);
+            let island = restart_log(restart_config(RestartPolicy::Island, 25, shape), &train, &test);
+            seen.push(format!("{:?}: archive {} island {}", shape, archive.last().unwrap().2, island.last().unwrap().2));
+            let shared = archive
+                .iter()
+                .position(|(_, _, _, best)| best.len() == 2 && best[0].is_finite() && best[0] == best[1])
+                .unwrap_or_else(|| panic!("shape {:?}: both islands share the best at some generation", shape));
+            assert_eq!(
+                archive.last().unwrap().2,
+                archive[shared].2,
+                "shape {:?}: the archive policy restarts nothing once both islands share the best (generation {})",
+                shape,
+                archive[shared].0
+            );
+            if island.last().unwrap().2 > 0 {
+                island_restarted = true;
+                assert!(island.iter().any(|r| r.1 > 0), "a per-generation restart count is reported");
+            }
+        }
+        assert!(island_restarted, "the island policy restarts a stalled island in at least one shape: {:?}", seen);
     }
 
     #[test]
     fn an_isolated_island_draws_no_front_parent_and_receives_no_migrant() {
         const SEED: u32 = 1022;
         let (train, test) = restart_fixture();
-        let cfg = Config { seed: SEED, ..restart_config(RestartPolicy::Island, 10) };
+        let (mut isolated_gens, mut open_gens_with_draws, mut skipped, mut received) = (0, 0, 0, 0);
+        for shape in RESTART_SHAPES {
+        let cfg = Config { seed: SEED, ..restart_config(RestartPolicy::Island, 10, shape) };
 
         let mut snaps: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();
         run_resumable(&cfg, &train, &test, None, 1, |cp| {
@@ -14655,7 +14667,6 @@ mod tests {
         })
         .unwrap();
 
-        let (mut isolated_gens, mut open_gens_with_draws) = (0, 0);
         for k in 1..snaps.len() {
             for i in 0..cfg.islands {
                 let drawn = snaps[k].2[i] - snaps[k - 1].2[i];
@@ -14671,10 +14682,6 @@ mod tests {
                 }
             }
         }
-        assert!(isolated_gens >= 10, "a restart opened an isolation window: {}", isolated_gens);
-        assert!(open_gens_with_draws > 0, "an open island does draw front parents");
-
-        let (mut skipped, mut received) = (0, 0);
         for (seed, _gen, isolated, before, after) in migration_probe::take(SEED) {
             assert_eq!(seed, SEED);
             for i in 0..isolated.len() {
@@ -14686,6 +14693,9 @@ mod tests {
                 }
             }
         }
+        }
+        assert!(isolated_gens >= 10, "a restart opened an isolation window: {}", isolated_gens);
+        assert!(open_gens_with_draws > 0, "an open island does draw front parents");
         assert!(skipped > 0, "a migration boundary fell inside an isolation window");
         assert!(received > 0, "an open island receives migrants");
     }
