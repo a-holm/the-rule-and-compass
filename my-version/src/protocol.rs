@@ -815,11 +815,27 @@ impl Ledger {
 
     /// Check that a recompute of the baseline read is allowed: the checks of
     /// [`Ledger::authorize_baseline_read`] without the refusal of a second read,
-    /// plus a recorded read. Refuses before any locked row is scored.
-    pub fn authorize_baseline_verify(&self, sealed: &std::path::Path, bind: Option<RangeBinding>) -> Result<(), String> {
+    /// plus a recorded read of the store with this data hash. Refuses before any
+    /// locked row is loaded or scored.
+    pub fn authorize_baseline_verify(
+        &self,
+        sealed: &std::path::Path,
+        data_sha256: &str,
+        bind: Option<RangeBinding>,
+    ) -> Result<(), String> {
         self.baseline_checks(sealed, bind, false)?;
-        self.baseline_report_sha()?.ok_or("no recorded baseline read")?;
-        Ok(())
+        let recorded = self.events()?.into_iter().find_map(|e| match e {
+            Event::BaselineRead { data_sha256, .. } => Some(data_sha256),
+            _ => None,
+        });
+        match recorded {
+            None => Err("no recorded baseline read".to_string()),
+            Some(r) if r != data_sha256 => Err(format!(
+                "data hash {} differs from the recorded baseline read {}; the verify is void",
+                data_sha256, r
+            )),
+            Some(_) => Ok(()),
+        }
     }
 
     /// Report hash recorded by the baseline read, if there was one.
@@ -1435,6 +1451,14 @@ impl Ledger {
         let mut out = vec!["0".repeat(64)];
         out.extend(self.lines()?.iter().map(|l| sha256_hex(l.as_bytes())));
         Ok(out)
+    }
+
+    /// Refuse `--verify-read` on a store that no read marker names.
+    pub fn require_read_marker(&self, data_path: &str) -> Result<(), String> {
+        if marker_lines(data_path)?.is_empty() {
+            return Err(format!("{} has no read marker; --verify-read applies to the store that was read", data_path));
+        }
+        Ok(())
     }
 
     /// Refuse a locked read of the store at `data_path` through a ledger that is

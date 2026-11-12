@@ -525,7 +525,7 @@ pub static TABLE: &[&dyn Setting] = &[
         group: Group::Island,
         schema_type: "enum",
         schema_default: "archive",
-        schema: "#1022: archive | island. Which stall rule restarts an island at every restart interval (60 generations). archive: an island restarts after two checks in which its best error is worse than the archive best; once ring migration has spread the archive best to every island no island is ever behind it, so no restart fires. island: an island restarts when its own best error has not improved (relative 1e-9, the patience rule) for one restart interval, except the keeper, the lowest island whose best error equals the archive best; the restarted island takes no front parent and no migrant for --restart-isolation generations. With --islands 1 the only island is the keeper and nothing restarts. Applies to the node path and the flat postfix path. --qd-policy parents still draw from the QD archive inside the isolation window. Saved search setting: a resume refuses a different value; a checkpoint without it loads as archive; island adds island_stall records to the checkpoint. The development log carries restarts, restarts_total and isolated",
+        schema: "#1022: archive | island. Which stall rule restarts an island at every restart interval (60 generations). archive: an island restarts after two checks in which its best error is worse than the archive best; once ring migration has spread the archive best to every island no island is ever behind it, so no restart fires. island: an island restarts when its own best error has not improved (relative 1e-9, the patience rule) for one restart interval, except the keeper, the lowest island whose best error equals the archive best; the restarted island takes no front parent and no migrant for --restart-isolation generations. With --islands 1 the only island is the keeper and nothing restarts. Applies to the node path and the flat postfix path. An isolated island also takes no --qd-policy parent (neither its global-front share nor a QD-archive parent): it breeds from its own members only (#1067). Saved search setting: a resume refuses a different value; a checkpoint without it loads as archive; island adds island_stall records to the checkpoint. The development log carries restarts, restarts_total and isolated",
         help: "  --restart-policy archive|island
                              which stall rule restarts an island every
                              restart interval (60 generations). archive
@@ -535,9 +535,10 @@ pub static TABLE: &[&dyn Setting] = &[
                              own best error has not improved for one restart
                              interval, except the lowest island that holds
                              the archive best (the keeper), and isolates it
-                             from front parents and migrants for
-                             --restart-isolation generations. With one island
-                             nothing restarts. Saved search setting (#1022)",
+                             from front parents, --qd-policy parents and
+                             migrants for --restart-isolation generations.
+                             With one island nothing restarts. Saved search
+                             setting (#1022)",
         bench: Some(Bench {
             usage: "  --restart-policy <mode>   archive (default) or island: restart an island on its own
                             stall and isolate it afterwards (#1022)",
@@ -557,12 +558,12 @@ pub static TABLE: &[&dyn Setting] = &[
         group: Group::Island,
         schema_type: "int",
         schema_default: "25",
-        schema: "#1022: generations a restarted island takes no front parent and no migrant (the migration interval by default; 0 turns the isolation off). Read only under --restart-policy island. Saved search setting under island: a resume refuses a different value",
+        schema: "#1022: generations a restarted island takes no front parent, no --qd-policy parent and no migrant (the migration interval by default; 0 turns the isolation off). Read only under --restart-policy island. Saved search setting under island: a resume refuses a different value",
         help: "  --restart-isolation <N>    generations a restarted island takes no front
-                             parent and no migrant, default 25 (the
-                             migration interval). Read only with
-                             --restart-policy island; 0 turns the isolation
-                             off. Saved search setting (#1022)",
+                             parent, no --qd-policy parent and no migrant,
+                             default 25 (the migration interval). Read only
+                             with --restart-policy island; 0 turns the
+                             isolation off. Saved search setting (#1022)",
         bench: Some(Bench {
             usage: "  --restart-isolation <N>   generations a restarted island takes no front parent and
                             no migrant under --restart-policy island (default 25)",

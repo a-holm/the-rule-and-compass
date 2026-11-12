@@ -139,9 +139,12 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   error has not improved for one restart interval, except the keeper (the lowest
   island whose best equals the archive best, so the best expression is never
   discarded). A restarted island is isolated for `--restart-isolation`
-  generations (default 25): it draws no parent from the global front and takes
-  no migrant, so its new random material is not pulled back at once to the
-  region the other islands share. With one island nothing restarts.
+  generations (default 25): it draws no parent from the global front, no
+  `--qd-policy` parent (#1067) and takes no migrant, so its new random material
+  is not pulled back at once to the region the other islands share; it breeds
+  from its own members only. With one island nothing restarts. One island-policy
+  module decides migration, restarts and parent sources for the owned-tree loop
+  and the flat postfix loop alike (#1081).
 - Termination is by generation count or a time/effort budget.
 
 ## 7. Simplification and presentation
