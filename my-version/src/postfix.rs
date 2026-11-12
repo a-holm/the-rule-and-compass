@@ -252,13 +252,19 @@ impl Arena {
     /// Ring migration: the best program of island `i` replaces the worst of
     /// island `i+1`. Slot order and the source fitness are preserved, so the
     /// next generation sees the same program the archive saw.
-    pub fn migrate(&mut self) {
+    ///
+    /// #1022: an island with `skip[i]` set (isolated after a restart) receives
+    /// no migrant; it still supplies its own best to its neighbour.
+    pub fn migrate(&mut self, skip: &[bool]) {
         if self.islands < 2 {
             return;
         }
         let bests: Vec<usize> = (0..self.islands).map(|i| self.best(i)).collect();
         let worsts: Vec<usize> = (0..self.islands).map(|i| self.worst(i)).collect();
         for i in 0..self.islands {
+            if skip.get(i).copied().unwrap_or(false) {
+                continue;
+            }
             let src = bests[(i + 1) % self.islands];
             self.copy_slot(worsts[i], src);
         }
@@ -509,20 +515,27 @@ impl Variation {
     /// the next attempt at that slot is used, and parent order is fixed, so
     /// the result never depends on thread or island scheduling.
     pub fn next_generation(&self, parents: &Arena, gen: u32, restart: &[bool]) -> Arena {
-        self.next_generation_with_front(parents, gen, restart, &FrontParents::empty(), 0.0)
+        self.next_generation_with_front(
+            parents,
+            gen,
+            restart,
+            &FrontParents::empty(),
+            &vec![0.0; parents.islands],
+        )
     }
 
     /// Generate the next generation with the archive-guided parent draw
     /// (#76 parity). `front_p` is the fraction of parent draws taken uniformly
-    /// from `front`; the search passes 0.15 when `--front-parents` is on and
-    /// 0.0 (with an empty pool and no RNG advance) when it is off.
+    /// from `front`, one value per island; the search passes 0.15 when
+    /// `--front-parents` is on and 0.0 (with an empty pool and no RNG advance)
+    /// when it is off or the island is isolated after a restart (#1022).
     pub fn next_generation_with_front(
         &self,
         parents: &Arena,
         gen: u32,
         restart: &[bool],
         front: &FrontParents,
-        front_p: f64,
+        front_p: &[f64],
     ) -> Arena {
         let mut attempts = 0usize;
         let mut scratch = Scratch::new(self.width);
@@ -556,7 +569,7 @@ impl Variation {
                     &mut attempts,
                     &mut scratch,
                     front,
-                    front_p,
+                    front_p.get(i).copied().unwrap_or(0.0),
                 );
             }
         }
@@ -1150,15 +1163,15 @@ mod tests {
             64,
             30,
         );
-        let a = v.next_generation_with_front(&parents, 5, &[false; 2], &front, 0.15);
-        let b = v.next_generation_with_front(&parents, 5, &[false; 2], &front, 0.15);
+        let a = v.next_generation_with_front(&parents, 5, &[false; 2], &front, &[0.15; 2]);
+        let b = v.next_generation_with_front(&parents, 5, &[false; 2], &front, &[0.15; 2]);
         assert_eq!(a.words, b.words);
         assert_eq!(a.hash, b.hash);
 
         // `--no-front-parents` must be bit-identical to the pre-#76 path.
         let off = v.next_generation(&parents, 5, &[false; 2]);
         let off_explicit =
-            v.next_generation_with_front(&parents, 5, &[false; 2], &FrontParents::empty(), 0.0);
+            v.next_generation_with_front(&parents, 5, &[false; 2], &FrontParents::empty(), &[0.0; 2]);
         assert_eq!(off.words, off_explicit.words);
         assert_eq!(off.hash, off_explicit.hash);
         assert_ne!(a.words, off.words, "the feedback must change some children");
@@ -1202,8 +1215,51 @@ mod tests {
             a.err[i] = i as f64;
         }
         // Best of island 0 is slot 0; worst of island 1 is slot 5.
-        a.migrate();
+        a.migrate(&[]);
         assert_eq!(a.slot(5), a.slot(0));
         assert_eq!(a.err[5], 0.0);
+    }
+
+    #[test]
+    fn migration_skips_an_isolated_destination_and_still_uses_it_as_a_source() {
+        let mut a = Arena::new(3, 2, 8);
+        for i in 0..6 {
+            a.set_slot(i, &[crate::gpu::OP_VAR, i as u32, OP_HALT]);
+            a.err[i] = i as f64;
+        }
+        let before: Vec<Vec<u32>> = (0..6).map(|i| a.slot(i).to_vec()).collect();
+        // Island 1 is isolated: its slots are untouched. Island 0 still takes the
+        // best of island 1 (slot 2), and island 2 takes the best of island 0.
+        a.migrate(&[false, true, false]);
+        assert_eq!(a.slot(2), &before[2][..]);
+        assert_eq!(a.slot(3), &before[3][..]);
+        assert_eq!(a.slot(1), &before[2][..]);
+        assert_eq!(a.slot(5), &before[0][..]);
+    }
+
+    #[test]
+    fn an_isolated_island_draws_no_front_parent_in_the_flat_path() {
+        let v = Variation::new(64, 2, 30, 1, &Op::default_set(), 3, true).unwrap();
+        let mut parents = Arena::new(2, 24, 64);
+        let mut rng = Philox::at(9, 0, 0, 0);
+        for i in 0..parents.islands * parents.pop {
+            let mut p = v.random_program(&mut rng, 3);
+            while spans(&p).is_none() {
+                p = v.random_program(&mut rng, 3);
+            }
+            parents.set_slot(i, &p);
+            parents.err[i] = ((i * 37) % 101) as f64 / 101.0;
+        }
+        let front = FrontParents::from_front(
+            &[solution(node(Op::Add, vec![input(0), constant(7.0)]), 0.25, 3.0)],
+            64,
+            30,
+        );
+        let off = v.next_generation_with_front(&parents, 5, &[false; 2], &front, &[0.0; 2]);
+        let mixed = v.next_generation_with_front(&parents, 5, &[false; 2], &front, &[0.0, 0.5]);
+        let island0 = |a: &Arena| (0..24).map(|j| a.slot(a.slot_index(0, j)).to_vec()).collect::<Vec<_>>();
+        let island1 = |a: &Arena| (0..24).map(|j| a.slot(a.slot_index(1, j)).to_vec()).collect::<Vec<_>>();
+        assert_eq!(island0(&mixed), island0(&off), "the isolated island is the off path");
+        assert_ne!(island1(&mixed), island1(&off), "the open island takes front parents");
     }
 }

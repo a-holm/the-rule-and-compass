@@ -130,7 +130,18 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   search. Without it, `y = a·sin(b·x) + c` would almost never be found, because
   random constants rarely land near the right values.
 - **Migration** periodically copies an island's best member into a neighbouring
-  island; **stagnant islands are restarted** to avoid getting stuck.
+  island; **stagnant islands are restarted** to avoid getting stuck. Every
+  restart interval (60 generations) the default rule (`--restart-policy archive`)
+  restarts an island after two checks in which its best error is worse than the
+  archive best. Once migration has copied the archive best into every island,
+  no island is behind it and that rule never fires. `--restart-policy island`
+  (#1022) reads the island's own stall instead: an island restarts when its best
+  error has not improved for one restart interval, except the keeper (the lowest
+  island whose best equals the archive best, so the best expression is never
+  discarded). A restarted island is isolated for `--restart-isolation`
+  generations (default 25): it draws no parent from the global front and takes
+  no migrant, so its new random material is not pulled back at once to the
+  region the other islands share. With one island nothing restarts.
 - Termination is by generation count or a time/effort budget.
 
 ## 7. Simplification and presentation

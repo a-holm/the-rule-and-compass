@@ -32,6 +32,7 @@
 //! | `fsol <complexity> <cost> <error> <tree>` | #256: one post-refit member |
 //! | `build <field> <value>` | #256: version, commit, binary_sha256, device, driver, threads |
 //! | `island <i> <stagnant>` | per-island counter |
+//! | `island_stall <i> <since_improve> <isolated> <best_prev>` | #1022: per-island stall counters, written only under `--restart-policy island` |
 //! | `mix <i> <numbers>` | #471: adaptive edit counts of island i, 14 numbers per generation |
 //! | `rng <i|main> <idx> <624 words>` | exact MT19937 state |
 //! | `ind <i> <error> <complexity> <tree>` | one population member |
@@ -85,6 +86,20 @@ pub struct IslandState {
     /// #471: the adaptive edit counts of the last generations. Empty unless
     /// `--adaptive-mix` is on.
     pub mix: crate::mix::MixWindow,
+    /// #1022: the island's own stall counters. `Some` only under
+    /// `--restart-policy island`.
+    pub stall: Option<IslandStall>,
+}
+
+/// #1022: per-island restart bookkeeping under `--restart-policy island`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IslandStall {
+    /// Generations since the island's best error last improved.
+    pub since_improve: usize,
+    /// Generations of isolation left after a restart.
+    pub isolated: usize,
+    /// The island's best error so far (`+inf` after a restart).
+    pub best_prev: f64,
 }
 
 /// A fingerprint of a sample: its row count and a hash of every stored value.
@@ -636,6 +651,14 @@ impl Checkpoint {
 
         for (i, isl) in self.islands.iter().enumerate() {
             writeln!(out, "island {} {}", i, self.stagnant.get(i).copied().unwrap_or(0)).unwrap();
+            if let Some(stall) = &isl.stall {
+                writeln!(
+                    out,
+                    "island_stall {} {} {} {:e}",
+                    i, stall.since_improve, stall.isolated, stall.best_prev
+                )
+                .unwrap();
+            }
             let (words, idx) = isl.rng.state();
             let mut line = format!("rng {} {} ", i, idx);
             for (j, w) in words.iter().enumerate() {
@@ -700,6 +723,7 @@ impl Checkpoint {
         let mut archive_header: Option<(usize, usize)> = None;
         let mut sols: Vec<Sol> = Vec::new();
         let mut island_stagnant: Vec<Option<usize>> = Vec::new();
+        let mut island_stall: Vec<Option<IslandStall>> = Vec::new();
         let mut island_rngs: Vec<Option<Mt>> = Vec::new();
         let mut island_mix: Vec<Option<crate::mix::MixWindow>> = Vec::new();
         let mut island_pops: Vec<Option<Vec<Individual>>> = Vec::new();
@@ -932,6 +956,15 @@ impl Checkpoint {
                         lineno,
                     )?;
                 }
+                "island_stall" => {
+                    let i = parse_num::<usize>(&parts, 1, lineno, "island_stall index")?;
+                    let stall = IslandStall {
+                        since_improve: parse_num::<usize>(&parts, 2, lineno, "island_stall since_improve")?,
+                        isolated: parse_num::<usize>(&parts, 3, lineno, "island_stall isolated")?,
+                        best_prev: parse_num::<f64>(&parts, 4, lineno, "island_stall best_prev")?,
+                    };
+                    set_slot(&mut island_stall, i, stall, "island_stall", lineno)?;
+                }
                 "rng" => {
                     let target = parts
                         .get(1)
@@ -1124,12 +1157,29 @@ impl Checkpoint {
                 .and_then(|s| s.take())
                 .ok_or_else(|| format!("checkpoint is incomplete: island {} has no counter", i))?;
             let mix = island_mix.get_mut(i).and_then(|s| s.take()).unwrap_or_default();
-            islands.push(IslandState { rng, population, mix });
+            let stall = island_stall.get_mut(i).and_then(|s| s.take());
+            match (config.restart_policy, stall.is_some()) {
+                (crate::search::RestartPolicy::Island, false) => {
+                    return Err(
+                        "checkpoint has no island_stall records; it was written under --restart-policy archive"
+                            .to_string(),
+                    );
+                }
+                (crate::search::RestartPolicy::Archive, true) => {
+                    return Err(
+                        "checkpoint has island_stall records; it was written under --restart-policy island"
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            }
+            islands.push(IslandState { rng, population, mix, stall });
             stagnant.push(st);
         }
         if island_rngs.iter().skip(expected_islands).any(|s| s.is_some())
             || island_pops.iter().skip(expected_islands).any(|s| s.is_some())
             || island_stagnant.iter().skip(expected_islands).any(|s| s.is_some())
+            || island_stall.iter().skip(expected_islands).any(|s| s.is_some())
         {
             return Err(format!(
                 "checkpoint has records for more than the saved {} island(s)",
@@ -1465,6 +1515,8 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "mutation_mix",       // #471: missing means classic
         "crossover_internal", // #471: missing means 0
         "adaptive_mix",       // #471: missing means false
+        "restart_policy",     // #1022: missing means archive
+        "restart_isolation",  // #1022: missing means 25
     ];
     for key in KEYS {
         required(fields, key)?;
@@ -1831,6 +1883,19 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             .map_err(|e| format!("config 'selection' is invalid: {}", e))?,
     };
 
+    // #1022: absent means archive and 25, matching every earlier checkpoint.
+    let restart_policy = match fields.get("restart_policy").map(|s| s.as_str()) {
+        None => crate::search::RestartPolicy::Archive,
+        Some(raw) => crate::search::RestartPolicy::parse(raw)
+            .map_err(|e| format!("config 'restart_policy' is invalid: {}", e))?,
+    };
+    let restart_isolation = match fields.get("restart_isolation") {
+        None => 25,
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| format!("config 'restart_isolation' is invalid: '{}'", raw))?,
+    };
+
     Ok(Config {
         generations: num_usize("generations")?,
         islands: num_usize("islands")?,
@@ -1894,6 +1959,8 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         fit_tail_overlap: true,
         variation,
         selection,
+        restart_policy,
+        restart_isolation,
         mutation_mix,
         crossover_internal,
         adaptive_mix,
@@ -1989,6 +2056,14 @@ fn write_config(cfg: &Config, out: &mut String) {
     // keeps its bytes.
     if cfg.selection != crate::search::Selection::Lexicographic {
         writeln!(out, "config selection {}", cfg.selection.as_str()).unwrap();
+    }
+    // #1022: written only under the island policy, so every other checkpoint and
+    // config hash keeps its bytes.
+    if cfg.restart_policy != crate::search::RestartPolicy::Archive {
+        writeln!(out, "config restart_policy {}", cfg.restart_policy.as_str()).unwrap();
+        if cfg.restart_isolation != 25 {
+            writeln!(out, "config restart_isolation {}", cfg.restart_isolation).unwrap();
+        }
     }
     // #471: written only when set, so every other checkpoint keeps its bytes.
     if cfg.mutation_mix != crate::search::MutationMix::Classic {

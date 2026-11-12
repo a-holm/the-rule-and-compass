@@ -794,6 +794,23 @@ SEARCH:
                              random immigrants per generation and picks
                              parents by Pareto rank and crowding distance.
                              Node path only; refuses --variation postfix
+  --restart-policy archive|island
+                             which stall rule restarts an island every
+                             restart interval (60 generations). archive
+                             (default) restarts an island after two checks
+                             in which its best error is worse than the
+                             archive best. island restarts an island whose
+                             own best error has not improved for one restart
+                             interval, except the lowest island that holds
+                             the archive best (the keeper), and isolates it
+                             from front parents and migrants for
+                             --restart-isolation generations. With one island
+                             nothing restarts. Saved search setting (#1022)
+  --restart-isolation <N>    generations a restarted island takes no front
+                             parent and no migrant, default 25 (the
+                             migration interval). Read only with
+                             --restart-policy island; 0 turns the isolation
+                             off. Saved search setting (#1022)
   --mutation-mix <M>         node-path edit weights: classic (point .25, terminal
                              .35, subtree .40; default) or extended (adds insert,
                              delete, swap and rotate). Not with --variation
@@ -2812,6 +2829,9 @@ fn main() {
     let mut reject_fixed_set = false; // #848
     // #465: explicit --selection for the resume settings check.
     let mut selection_set = false;
+    // #1022: explicit restart flags for the resume settings check.
+    let mut restart_policy_set = false;
+    let mut restart_isolation_set = false;
     let mut mutation_mix_set = false; // #471
     let mut crossover_internal_set = false;
     let mut adaptive_mix_set = false;
@@ -3419,6 +3439,24 @@ fn main() {
                         std::process::exit(EXIT_USAGE);
                     }
                 }
+            }
+            // #1022: which stall rule restarts an island.
+            "--restart-policy" => {
+                let v = val!();
+                match crate::search::RestartPolicy::parse(&v) {
+                    Ok(p) => {
+                        cfg.restart_policy = p;
+                        restart_policy_set = true;
+                    }
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--restart-isolation" => {
+                cfg.restart_isolation = parse_uint("--restart-isolation", &val!());
+                restart_isolation_set = true;
             }
             "--no-front-parents" => {
                 cfg.front_parents = false;
@@ -4086,6 +4124,23 @@ fn main() {
                 "--selection {} (saved {})",
                 cfg.selection.as_str(),
                 saved.selection.as_str()
+            ));
+        }
+        // #1022: the restart rule is saved search state.
+        if restart_policy_set && cfg.restart_policy != saved.restart_policy {
+            conflicts.push(format!(
+                "--restart-policy {} (saved restart_policy is {})",
+                cfg.restart_policy.as_str(),
+                saved.restart_policy.as_str()
+            ));
+        }
+        if restart_isolation_set
+            && saved.restart_policy == crate::search::RestartPolicy::Island
+            && cfg.restart_isolation != saved.restart_isolation
+        {
+            conflicts.push(format!(
+                "--restart-isolation {} (saved restart_isolation is {})",
+                cfg.restart_isolation, saved.restart_isolation
             ));
         }
         // #495: the band decides which finalists get the exact refit.
