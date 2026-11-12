@@ -1636,3 +1636,68 @@ fn ladder_refuses_a_relative_out_and_its_dot_slash_form() {
     assert!(f.bytes(&f.marker()).is_none());
     assert!(!f.dir.join("a.json").exists() && !f.dir.join("a.json.tmp").exists());
 }
+
+/// A second store with the same declared locked range and the given data file.
+fn second_store(f: &Sealed, name: &str) -> String {
+    let p = f.dir.join(name);
+    let d = s(&p);
+    lockbox::write_sidecar(&d, &Lockbox { start: T0 + 400 * H, end: T0 + 500 * H }, "test").unwrap();
+    d
+}
+
+#[test]
+fn ladder_verify_read_on_another_store_is_refused() {
+    let f = Sealed::new("lad-verify-other");
+    let out = s(&f.dir.join("first.json"));
+    assert_eq!(f.read(&out, &[]).0, 0);
+    let sha = f.recorded_sha();
+    // no rows inside the locked range: a run that reached scoring fails differently
+    let other = second_store(&f, "other.csv");
+    let text = std::fs::read_to_string(&f.data).unwrap();
+    let keep: Vec<&str> = text
+        .lines()
+        .enumerate()
+        .filter(|(i, l)| *i == 0 || l.split(',').next().unwrap().parse::<i64>().unwrap() < T0 + 400 * H)
+        .map(|(_, l)| l)
+        .collect();
+    std::fs::write(&other, keep.join("\n") + "\n").unwrap();
+    let (ledger_before, marker_before) = (f.bytes(&f.ledger), f.bytes(&f.marker()));
+    let out2 = s(&f.dir.join("other.json"));
+    for extra in [vec!["--verify-read"], vec!["--verify-read", "--expect-report-sha256", sha.as_str()]] {
+        let mut a = vec!["--locked-test", "--ledger", f.ledger.as_str(), "--sealed", f.sealed.as_str()];
+        a.extend_from_slice(&extra);
+        let (code, stdout, err) = ladder(&other, &f.windows, &out2, &a);
+        assert_eq!(code, 3, "{}", err);
+        assert!(err.contains("differs from the recorded baseline read") && err.contains("the verify is void"), "{}", err);
+        assert!(!err.contains("report sha256") && !stdout.contains("report_sha256"), "{}{}", stdout, err);
+        assert!(!Path::new(&out2).exists());
+        assert_eq!(f.bytes(&f.ledger), ledger_before);
+        assert_eq!(f.bytes(&f.marker()), marker_before);
+        assert!(!Path::new(&format!("{}.locked_reads.jsonl", other)).exists());
+    }
+    // the recorded read still verifies on its own store
+    let (code, _, err) = f.read(&out2, &["--verify-read", "--expect-report-sha256", &sha]);
+    assert_eq!(code, 0, "{}", err);
+}
+
+#[test]
+fn ladder_verify_read_needs_a_read_marker() {
+    let f = Sealed::new("lad-verify-marker");
+    let out = s(&f.dir.join("first.json"));
+    assert_eq!(f.read(&out, &[]).0, 0);
+    let copy = second_store(&f, "copy.csv");
+    std::fs::copy(&f.data, &copy).unwrap();
+    let ledger_before = f.bytes(&f.ledger);
+    let out2 = s(&f.dir.join("copy.json"));
+    let (code, _, err) = ladder(
+        &copy,
+        &f.windows,
+        &out2,
+        &["--locked-test", "--ledger", &f.ledger, "--sealed", &f.sealed, "--verify-read"],
+    );
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("has no read marker"), "{}", err);
+    assert!(!Path::new(&out2).exists());
+    assert_eq!(f.bytes(&f.ledger), ledger_before);
+    assert!(!Path::new(&format!("{}.locked_reads.jsonl", copy)).exists());
+}
