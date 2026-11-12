@@ -2754,6 +2754,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             "{:?}/{:?}/{:?}/{:?}/{:?}/{}",
             resolved.range, resolved.source, resolved.also, resolved.embargo, resolved.retired, allow_in_sample
         ),
+        resolved.hashed_report_fields(0, locked_test, true),
     ]);
     if locked_test {
         let (Some(ledger), Some(sealed)) = (&ledger_path, &sealed_path) else {
