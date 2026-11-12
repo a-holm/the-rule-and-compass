@@ -474,6 +474,36 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m as u32, d as u32)
 }
 
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn round(a: u32, b: u32, c: u32, d: &mut u32, e: u32, f: u32, g: u32, h: &mut u32, k: u32, w: u32) {
+    let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+    let ch = (e & f) ^ (!e & g);
+    let t1 = h
+        .wrapping_add(s1)
+        .wrapping_add(ch)
+        .wrapping_add(k)
+        .wrapping_add(w);
+    let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+    let maj = (a & b) ^ (a & c) ^ (b & c);
+    *d = d.wrapping_add(t1);
+    *h = t1.wrapping_add(s0.wrapping_add(maj));
+}
+
+/// Rolling 16-word message schedule: `w[i % 16]` becomes `W[i]` for `i >= 16`.
+#[inline(always)]
+fn schedule(w: &mut [u32; 16], i: usize) -> u32 {
+    let w15 = w[(i + 1) % 16];
+    let w2 = w[(i + 14) % 16];
+    let s0 = w15.rotate_right(7) ^ w15.rotate_right(18) ^ (w15 >> 3);
+    let s1 = w2.rotate_right(17) ^ w2.rotate_right(19) ^ (w2 >> 10);
+    w[i % 16] = w[i % 16]
+        .wrapping_add(s0)
+        .wrapping_add(w[(i + 9) % 16])
+        .wrapping_add(s1);
+    w[i % 16]
+}
+
 /// Streaming SHA-256 state. The file and in-memory entry points share it, so a
 /// multi-gigabyte store is hashed without reading or copying it into RAM.
 struct Sha256 {
@@ -522,70 +552,47 @@ impl Sha256 {
                 self.buf_len = 0;
             }
         }
-        while data.len() >= 64 {
-            self.compress(&data[..64]);
-            data = &data[64..];
+        let mut blocks = data.chunks_exact(64);
+        for block in &mut blocks {
+            let block: &[u8; 64] = block.try_into().expect("64-byte block");
+            self.compress(block);
         }
-        if !data.is_empty() {
-            self.buf[..data.len()].copy_from_slice(data);
-            self.buf_len = data.len();
+        let rest = blocks.remainder();
+        if !rest.is_empty() {
+            self.buf[..rest.len()].copy_from_slice(rest);
+            self.buf_len = rest.len();
         }
     }
 
-    fn compress(&mut self, chunk: &[u8]) {
-        let mut w = [0u32; 64];
-        for (i, word) in w.iter_mut().take(16).enumerate() {
-            *word = u32::from_be_bytes([
-                chunk[i * 4],
-                chunk[i * 4 + 1],
-                chunk[i * 4 + 2],
-                chunk[i * 4 + 3],
-            ]);
+    fn compress(&mut self, chunk: &[u8; 64]) {
+        let mut w = [0u32; 16];
+        for (word, bytes) in w.iter_mut().zip(chunk.chunks_exact(4)) {
+            *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.h;
+        macro_rules! r8 {
+            ($i:expr, $wf:expr) => {{
+                round(a, b, c, &mut d, e, f, g, &mut h, Self::K[$i], $wf($i));
+                round(h, a, b, &mut c, d, e, f, &mut g, Self::K[$i + 1], $wf($i + 1));
+                round(g, h, a, &mut b, c, d, e, &mut f, Self::K[$i + 2], $wf($i + 2));
+                round(f, g, h, &mut a, b, c, d, &mut e, Self::K[$i + 3], $wf($i + 3));
+                round(e, f, g, &mut h, a, b, c, &mut d, Self::K[$i + 4], $wf($i + 4));
+                round(d, e, f, &mut g, h, a, b, &mut c, Self::K[$i + 5], $wf($i + 5));
+                round(c, d, e, &mut f, g, h, a, &mut b, Self::K[$i + 6], $wf($i + 6));
+                round(b, c, d, &mut e, f, g, h, &mut a, Self::K[$i + 7], $wf($i + 7));
+            }};
         }
-        let mut a = self.h[0];
-        let mut b = self.h[1];
-        let mut c = self.h[2];
-        let mut d = self.h[3];
-        let mut e = self.h[4];
-        let mut f = self.h[5];
-        let mut g = self.h[6];
-        let mut hh = self.h[7];
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(Sha256::K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
+        r8!(0, |i: usize| w[i]);
+        r8!(8, |i: usize| w[i]);
+        r8!(16, |i: usize| schedule(&mut w, i));
+        r8!(24, |i: usize| schedule(&mut w, i));
+        r8!(32, |i: usize| schedule(&mut w, i));
+        r8!(40, |i: usize| schedule(&mut w, i));
+        r8!(48, |i: usize| schedule(&mut w, i));
+        r8!(56, |i: usize| schedule(&mut w, i));
+        for (state, v) in self.h.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *state = state.wrapping_add(v);
         }
-        self.h[0] = self.h[0].wrapping_add(a);
-        self.h[1] = self.h[1].wrapping_add(b);
-        self.h[2] = self.h[2].wrapping_add(c);
-        self.h[3] = self.h[3].wrapping_add(d);
-        self.h[4] = self.h[4].wrapping_add(e);
-        self.h[5] = self.h[5].wrapping_add(f);
-        self.h[6] = self.h[6].wrapping_add(g);
-        self.h[7] = self.h[7].wrapping_add(hh);
     }
 
     fn finalize(mut self) -> String {
@@ -604,24 +611,178 @@ impl Sha256 {
     }
 }
 
-/// SHA-256 of a file, as lowercase hex. The file is read in 1 MiB chunks, so
-/// hashing the output store does not add its size to the process RSS.
-pub fn sha256_file(path: impl AsRef<Path>) -> Result<String, String> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path.as_ref())
-        .map_err(|e| format!("cannot read '{}': {}", path.as_ref().display(), e))?;
-    let mut state = Sha256::new();
-    let mut buf = vec![0u8; 1024 * 1024];
-    loop {
-        let n = file
-            .read(&mut buf)
-            .map_err(|e| format!("cannot read '{}': {}", path.as_ref().display(), e))?;
-        if n == 0 {
-            break;
+/// Bytes per chunk handed from the reader thread to the hashing thread.
+const SHA256_CHUNK: usize = 8 << 20;
+/// Direct I/O alignment for offsets, lengths and the buffer start.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const DIRECT_ALIGN: usize = 4096;
+/// Default minimum file size for the direct path.
+const SHA256_DIRECT_MIN_DEFAULT: u64 = 1 << 30;
+
+/// Which read path a digest used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadPath {
+    Buffered,
+    Direct,
+}
+
+/// One chunk of file bytes: `buf[start..end]`.
+struct Chunk {
+    buf: Vec<u8>,
+    start: usize,
+    end: usize,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct DirectSource {
+    file: std::fs::File,
+    tail: std::fs::File,
+    offset: u64,
+    aligned_len: u64,
+    len: u64,
+}
+
+enum StreamSource {
+    Buffered(std::fs::File),
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    Direct(DirectSource),
+}
+
+impl StreamSource {
+    /// Opens `path`; a file of at least `direct_min` bytes uses O_DIRECT when the
+    /// filesystem accepts it, everything else the buffered path.
+    fn open(path: &Path, direct_min: u64) -> Result<StreamSource, String> {
+        let err = |e: std::io::Error| format!("cannot read '{}': {}", path.display(), e);
+        let buffered = std::fs::File::open(path).map_err(err)?;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let len = buffered.metadata().map_err(err)?.len();
+            if len >= direct_min {
+                // O_DIRECT is 0o40000 in asm-generic/fcntl.h on x86_64.
+                let direct = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(0o40000)
+                    .open(path);
+                if let Ok(file) = direct {
+                    return Ok(StreamSource::Direct(DirectSource {
+                        file,
+                        tail: buffered,
+                        offset: 0,
+                        aligned_len: len - len % DIRECT_ALIGN as u64,
+                        len,
+                    }));
+                }
+            }
         }
-        state.update(&buf[..n]);
+        let _ = direct_min;
+        Ok(StreamSource::Buffered(buffered))
     }
-    Ok(state.finalize())
+
+    fn path_kind(&self) -> ReadPath {
+        match self {
+            StreamSource::Buffered(_) => ReadPath::Buffered,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            StreamSource::Direct(_) => ReadPath::Direct,
+        }
+    }
+
+    fn next_chunk(&mut self, path: &Path) -> Result<Option<Chunk>, String> {
+        let err = |e: std::io::Error| format!("cannot read '{}': {}", path.display(), e);
+        match self {
+            StreamSource::Buffered(file) => {
+                use std::io::Read;
+                let mut buf = vec![0u8; SHA256_CHUNK];
+                let mut filled = 0;
+                while filled < buf.len() {
+                    let n = file.read(&mut buf[filled..]).map_err(err)?;
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                }
+                if filled == 0 {
+                    return Ok(None);
+                }
+                Ok(Some(Chunk {
+                    buf,
+                    start: 0,
+                    end: filled,
+                }))
+            }
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            StreamSource::Direct(src) => {
+                use std::os::unix::fs::FileExt;
+                if src.offset < src.aligned_len {
+                    let want = (src.aligned_len - src.offset).min(SHA256_CHUNK as u64) as usize;
+                    let mut buf = vec![0u8; SHA256_CHUNK + DIRECT_ALIGN];
+                    let start = buf.as_ptr().align_offset(DIRECT_ALIGN);
+                    src.file
+                        .read_exact_at(&mut buf[start..start + want], src.offset)
+                        .map_err(err)?;
+                    src.offset += want as u64;
+                    return Ok(Some(Chunk {
+                        buf,
+                        start,
+                        end: start + want,
+                    }));
+                }
+                if src.offset < src.len {
+                    let want = (src.len - src.offset) as usize;
+                    let mut buf = vec![0u8; want];
+                    src.tail.read_exact_at(&mut buf, src.offset).map_err(err)?;
+                    src.offset = src.len;
+                    return Ok(Some(Chunk {
+                        buf,
+                        start: 0,
+                        end: want,
+                    }));
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// SHA-256 of a file, as lowercase hex. A reader thread fills 8 MiB chunks while
+/// the calling thread hashes, so the file size is never added to the process RSS.
+/// On Linux x86_64 a file of at least `RCSR_SHA256_DIRECT_MIN_BYTES` bytes
+/// (default 1 GiB) is read with O_DIRECT so the stream does not evict the page
+/// cache; a filesystem that refuses O_DIRECT uses the buffered path.
+pub fn sha256_file(path: impl AsRef<Path>) -> Result<String, String> {
+    let direct_min = std::env::var("RCSR_SHA256_DIRECT_MIN_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(SHA256_DIRECT_MIN_DEFAULT);
+    sha256_file_with(path.as_ref(), direct_min).map(|(digest, _)| digest)
+}
+
+fn sha256_file_with(path: &Path, direct_min: u64) -> Result<(String, ReadPath), String> {
+    let mut source = StreamSource::open(path, direct_min)?;
+    let kind = source.path_kind();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Chunk, String>>(2);
+    std::thread::scope(|s| {
+        s.spawn(move || loop {
+            match source.next_chunk(path) {
+                Ok(Some(chunk)) => {
+                    if tx.send(Ok(chunk)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    break;
+                }
+            }
+        });
+        let mut state = Sha256::new();
+        for chunk in rx {
+            let chunk = chunk?;
+            state.update(&chunk.buf[chunk.start..chunk.end]);
+        }
+        Ok((state.finalize(), kind))
+    })
 }
 
 
@@ -924,6 +1085,62 @@ mod tests {
                 "length {len}"
             );
         }
+    }
+
+    #[test]
+    fn sha256_known_answer_boundaries() {
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        assert_eq!(
+            sha256_hex(&vec![b'a'; 1_000_000]),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+        assert_eq!(
+            sha256_hex(&[b'a'; 55]),
+            "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318"
+        );
+        assert_eq!(
+            sha256_hex(&[b'a'; 56]),
+            "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a"
+        );
+        assert_eq!(
+            sha256_hex(&[b'a'; 64]),
+            "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"
+        );
+    }
+
+    #[test]
+    fn direct_io_path_matches_buffered_path() {
+        let scratch = crate::test_scratch::Scratch::new("sha256-direct");
+        let path = scratch.join("direct.bin");
+        let mut direct_ran = false;
+        for len in [0usize, 4095, 4096, 4097, 8 << 20, (8 << 20) - 1, (8 << 20) + 4097] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&path, &bytes).unwrap();
+            let expected = sha256_hex(&bytes);
+            let (buffered, kind) = sha256_file_with(&path, u64::MAX).unwrap();
+            assert_eq!(kind, ReadPath::Buffered, "length {len}");
+            assert_eq!(buffered, expected, "buffered, length {len}");
+            let (direct, kind) = sha256_file_with(&path, 0).unwrap();
+            assert_eq!(direct, expected, "direct request, length {len} ({kind:?})");
+            direct_ran |= kind == ReadPath::Direct;
+        }
+        // The scratch directory may sit on a filesystem that refuses O_DIRECT; the
+        // fallback is then the buffered path, which the digest equality above covers.
+        let refused = !direct_ran;
+        if refused {
+            let (_, kind) = sha256_file_with(&path, 0).unwrap();
+            assert_eq!(kind, ReadPath::Buffered);
+        }
+    }
+
+    #[test]
+    fn file_hash_reports_missing_file() {
+        let scratch = crate::test_scratch::Scratch::new("sha256-missing");
+        let err = sha256_file(scratch.join("absent.bin")).unwrap_err();
+        assert!(err.starts_with("cannot read "), "{err}");
     }
 
     #[test]
