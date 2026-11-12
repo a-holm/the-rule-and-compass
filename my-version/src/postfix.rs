@@ -272,11 +272,10 @@ impl Arena {
     pub fn migrate_with(
         &mut self,
         moves: &[(usize, usize)],
-        _policy: MigrationPolicy,
+        policy: MigrationPolicy,
         seed: u32,
         gen: u32,
     ) -> (usize, usize) {
-        let policy = MigrationPolicy::Ring;
         let worsts: Vec<usize> = (0..self.islands).map(|i| self.worst(i)).collect();
         let picks: Vec<Option<(usize, bool)>> = moves
             .iter()
