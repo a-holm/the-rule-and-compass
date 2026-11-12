@@ -6412,7 +6412,10 @@ fn run_segments(
                 }
             }
         }
-        stop.store(true, Ordering::Relaxed);
+        {
+            let _gate = gate.0.lock().unwrap();
+            stop.store(true, Ordering::Relaxed);
+        }
         gate.1.notify_all();
         drop(rx);
         result

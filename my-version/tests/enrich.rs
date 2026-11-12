@@ -5235,3 +5235,42 @@ fn a_failing_segment_reports_the_first_error_in_segment_order() {
     assert!(messages[0].contains("'CCC'") && messages[0].contains("non-increasing"), "{}", messages[0]);
     assert_eq!(messages[0], messages[1]);
 }
+
+#[test]
+fn an_early_error_never_strands_parked_workers() {
+    let (_scratch, dir) = tmp_dir("threads_park");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let mut rows = Vec::new();
+    for k in 0..48 {
+        let name = format!("S{k:02}");
+        let mut part = wavy_rows(&name, 30, 0, 3600, k as f64);
+        if k == 1 || k == 30 {
+            part[10].0 = part[9].0;
+        }
+        rows.extend(part);
+    }
+    write_store(&src, &rows, 30);
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    for i in 0..60 {
+        let mut o = opts(&src, &out, "r1");
+        o.gpu = GpuMode::Off;
+        o.threads = 2 + i % 3;
+        o.chunk_rows = 30;
+        let err = enrich::build(&o).unwrap_err();
+        assert!(err.contains("'S01'") && err.contains("non-increasing"), "iteration {i}: {err}");
+    }
+}
+
+#[test]
+fn threads_zero_is_refused_with_exit_3() {
+    let (_scratch, dir) = tmp_dir("threads_zero");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &bars("AAA", 50, 0, 3600), 16);
+    let r = rcsr_cmd::rcsr()
+        .args(["enrich", "--data", &src, "--out", &out, "--cpu", "--features", "r1", "--threads", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(r.status.code(), Some(3), "{}", String::from_utf8_lossy(&r.stderr));
+    assert!(String::from_utf8_lossy(&r.stderr).contains("--threads needs a positive integer"));
+}
