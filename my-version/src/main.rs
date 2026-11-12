@@ -815,14 +815,15 @@ SEARCH:
                              own best error has not improved for one restart
                              interval, except the lowest island that holds
                              the archive best (the keeper), and isolates it
-                             from front parents and migrants for
-                             --restart-isolation generations. With one island
-                             nothing restarts. Saved search setting (#1022)
+                             from front parents, --qd-policy parents and
+                             migrants for --restart-isolation generations.
+                             With one island nothing restarts. Saved search
+                             setting (#1022)
   --restart-isolation <N>    generations a restarted island takes no front
-                             parent and no migrant, default 25 (the
-                             migration interval). Read only with
-                             --restart-policy island; 0 turns the isolation
-                             off. Saved search setting (#1022)
+                             parent, no --qd-policy parent and no migrant,
+                             default 25 (the migration interval). Read only
+                             with --restart-policy island; 0 turns the
+                             isolation off. Saved search setting (#1022)
   --mutation-mix <M>         node-path edit weights: classic (point .25, terminal
                              .35, subtree .40; default) or extended (adds insert,
                              delete, swap and rotate). Not with --variation

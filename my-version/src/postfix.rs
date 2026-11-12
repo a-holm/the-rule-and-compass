@@ -249,24 +249,17 @@ impl Arena {
         Ok(())
     }
 
-    /// Ring migration: the best program of island `i` replaces the worst of
-    /// island `i+1`. Slot order and the source fitness are preserved, so the
-    /// next generation sees the same program the archive saw.
-    ///
-    /// #1022: an island with `skip[i]` set (isolated after a restart) receives
-    /// no migrant; it still supplies its own best to its neighbour.
-    pub fn migrate(&mut self, skip: &[bool]) {
-        if self.islands < 2 {
-            return;
-        }
+    /// Migration: for each `(from, to)`, the best program of island `from`
+    /// replaces the worst of island `to`. Every best and worst is chosen before
+    /// the first copy, so a move reads the arena as it was before migration.
+    /// Slot order and the source fitness are preserved, so the next generation
+    /// sees the same program the archive saw. The island policy (#1081) chooses
+    /// the moves.
+    pub fn migrate(&mut self, moves: &[(usize, usize)]) {
         let bests: Vec<usize> = (0..self.islands).map(|i| self.best(i)).collect();
         let worsts: Vec<usize> = (0..self.islands).map(|i| self.worst(i)).collect();
-        for i in 0..self.islands {
-            if skip.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            let src = bests[(i + 1) % self.islands];
-            self.copy_slot(worsts[i], src);
+        for &(from, to) in moves {
+            self.copy_slot(worsts[to], bests[from]);
         }
     }
 }
@@ -1208,33 +1201,36 @@ mod tests {
     }
 
     #[test]
-    fn migration_moves_the_best_into_the_next_island() {
+    fn migration_moves_the_best_of_the_source_over_the_worst_of_the_destination() {
         let mut a = Arena::new(2, 3, 8);
         for i in 0..6 {
             a.set_slot(i, &[crate::gpu::OP_VAR, i as u32, OP_HALT]);
             a.err[i] = i as f64;
         }
+        let before: Vec<Vec<u32>> = (0..6).map(|i| a.slot(i).to_vec()).collect();
         // Best of island 0 is slot 0; worst of island 1 is slot 5.
-        a.migrate(&[]);
+        a.migrate(&[(0, 1)]);
         assert_eq!(a.slot(5), a.slot(0));
         assert_eq!(a.err[5], 0.0);
+        assert!((0..3).all(|i| a.slot(i) == &before[i][..]), "the source island is unchanged");
     }
 
     #[test]
-    fn migration_skips_an_isolated_destination_and_still_uses_it_as_a_source() {
+    fn migration_reads_every_source_before_the_first_copy() {
         let mut a = Arena::new(3, 2, 8);
-        for i in 0..6 {
+        for (i, e) in [5.0, 6.0, 3.0, 4.0, 0.0, 1.0].into_iter().enumerate() {
             a.set_slot(i, &[crate::gpu::OP_VAR, i as u32, OP_HALT]);
-            a.err[i] = i as f64;
+            a.err[i] = e;
         }
         let before: Vec<Vec<u32>> = (0..6).map(|i| a.slot(i).to_vec()).collect();
-        // Island 1 is isolated: its slots are untouched. Island 0 still takes the
-        // best of island 1 (slot 2), and island 2 takes the best of island 0.
-        a.migrate(&[false, true, false]);
-        assert_eq!(a.slot(2), &before[2][..]);
-        assert_eq!(a.slot(3), &before[3][..]);
+        // The first move puts island 2's best (slot 4) over island 1's worst
+        // (slot 3); the second still sends island 1's best before migration
+        // (slot 2), not the migrant.
+        a.migrate(&[(2, 1), (1, 0)]);
+        assert_eq!(a.slot(3), &before[4][..]);
         assert_eq!(a.slot(1), &before[2][..]);
-        assert_eq!(a.slot(5), &before[0][..]);
+        assert_eq!(a.err[1], 3.0);
+        assert_eq!(a.slot(5), &before[5][..], "island 2 receives nothing");
     }
 
     #[test]
