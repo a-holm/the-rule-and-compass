@@ -133,6 +133,7 @@ pub(super) struct DeviceRun {
     pub(super) span_start_s: Option<f64>,
 }
 
+#[cfg(test)]
 impl DeviceRun {
     fn failed() -> Self {
         DeviceRun { answers: None, ms: -1.0, polish_ms: 0.0, span_start_s: None }
@@ -671,7 +672,7 @@ impl FitRoute {
         self.offered = 0;
         self.early_jobs = 0;
         fallbacks.sort_by_key(|f| f.key);
-        let (refit, bounded) = fallback_batch_split(fallbacks.len(), 0);
+        let (refit, bounded) = fallback_batch_split(fallbacks.len(), self.settings.fallback_max);
         self.counts.bounded += bounded;
         let mut early: Vec<Option<FallbackFitJob>> = joined.jobs.into_iter().map(Some).collect();
         let mut done: Vec<Option<FallbackFitJob>> = (0..refit).map(|_| None).collect();
