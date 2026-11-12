@@ -766,9 +766,9 @@ is how the two-symbol parity fixture exercises every kernel. At 16 M rows and
 
 ### Determinism and the cost model
 
-`--chunk-rows` changes only read/compute batching; the arithmetic and output
+`--chunk-rows` and `--threads` change only read/compute batching and parallelism; the arithmetic and output
 order are fixed, so per-column hashes and the store checksum are identical for
-every chunk size (tested). Cross-sectional ties are resolved by symbol and row
+every chunk size and thread count (tested). Cross-sectional ties are resolved by symbol and row
 order.
 
 The CPU path is always present. `plan_groups` estimates CPU time and GPU time

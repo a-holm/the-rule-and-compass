@@ -132,6 +132,8 @@ or bridges a gap in the producer. The compact 52-name profile and every name in
 `engine_catalogue` follow the same rule, even where the historical compact
 builder used positional windows that bridged a hole.
 
+`rcsr enrich --threads <n>` (default: the CPUs the process may run on) computes the per-symbol feature segments on `n` workers and commits them in segment order. The temp columns, every per-feature SHA-256 and the output store are byte-identical for every `n` (`parallel_segments_are_byte_identical`). At most `2 x n` segment outputs are held in memory at once; one output is the segment rows times the feature columns times 8 bytes. `--chunk-rows` bounds each batch per worker.
+
 Every available time-series name in the registry is tested for this rule: for each name, the first `warmup` bars after a hole are `NaN` (`every_available_name_is_nan_after_a_gap`). The cross-section, higher-timeframe and calendar families carry their own per-name tests, listed in `docs/default_financial_features.json`.
 
 The candle/price-action family (#261) is stricter still for its new columns:

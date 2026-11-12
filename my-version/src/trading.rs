@@ -1959,6 +1959,8 @@ pub struct FinalistReport {
     pub fixed_position_realised: Option<bool>,
     pub candidates: usize,
     pub usable: usize,
+    /// #1026: members gated by `--select-require-edge`; `None` without the flag.
+    pub edge_rejected: Option<usize>,
     pub expression: String,
     /// #807: the finalist with every constant at full precision.
     pub expression_exact: String,
@@ -2002,7 +2004,7 @@ impl FinalistReport {
         };
         format!(
             "{{\"name\":\"{}\",{}\"position\":\"{}\",\"selection\":\"{}\",\
-             \"selection_rule\":{{{}{}}},\"cost\":{},\"candidates\":{},\"usable_candidates\":{},\"exact\":\"cpu_f64\",\
+             \"selection_rule\":{{{}{}}},\"cost\":{},\"candidates\":{},\"usable_candidates\":{}{},\"exact\":\"cpu_f64\",\
              \"backend\":{},\"backend_reason\":{},\"spec\":{},\
              \"finalist\":{{\"expression\":{},\"expression_exact\":{},\"archive_rank\":{},\"constant\":{},\"fixed_position\":{},\"fixed_position_realised\":{},\"fit_metric\":{},\"fit_error\":{},\
              \"validation_error\":{},\"test_error\":{},\"validation_objective\":{}{}}},\
@@ -2019,6 +2021,7 @@ impl FinalistReport {
             self.cost.json(),
             self.candidates,
             self.usable,
+            self.edge_rejected.map(|n| format!(",\"edge_rejected\":{}", n)).unwrap_or_default(),
             crate::devlog::text(backend),
             backend_reason
                 .map(crate::devlog::text)
