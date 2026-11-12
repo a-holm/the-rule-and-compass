@@ -327,7 +327,7 @@ impl IslandPolicy {
     /// The directed ring of the exploit tier: every exploit island that is not
     /// isolated receives the best member of the next exploit island.
     fn ring(&self, islands: usize) -> Vec<Move> {
-        let exploit = islands.min(self.explore_from);
+        let exploit = if self.restart_interval == usize::MAX { islands.min(self.explore_from) } else { islands };
         if exploit < 2 {
             return Vec::new();
         }
