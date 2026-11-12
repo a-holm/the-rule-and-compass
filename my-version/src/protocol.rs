@@ -813,13 +813,10 @@ impl Ledger {
         self.baseline_checks(sealed, bind, true)
     }
 
-    /// Check that a recompute of the baseline read is allowed: the checks of
-    /// [`Ledger::authorize_baseline_read`] without the refusal of a second read,
-    /// plus a recorded read. Refuses before any locked row is scored.
-    pub fn authorize_baseline_verify(&self, sealed: &std::path::Path, bind: Option<RangeBinding>) -> Result<(), String> {
-        self.baseline_checks(sealed, bind, false)?;
-        self.baseline_report_sha()?.ok_or("no recorded baseline read")?;
-        Ok(())
+    /// The checks of [`Ledger::authorize_baseline_read`] without the refusal of
+    /// a second read, for the recompute of a recorded read.
+    pub fn authorize_baseline_sealed(&self, sealed: &std::path::Path, bind: Option<RangeBinding>) -> Result<(), String> {
+        self.baseline_checks(sealed, bind, false)
     }
 
     /// Report hash recorded by the baseline read, if there was one.
