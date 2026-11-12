@@ -577,14 +577,14 @@ pub static TABLE: &[&dyn Setting] = &[
                              restart interval (--restart-interval, default
                              60 generations). archive (default) restarts an
                              island after two checks in which its best error
-                             is worse than the archive best. island restarts an island whose
-                             own best error has not improved for one restart
-                             interval, except the lowest island that holds
-                             the archive best (the keeper), and isolates it
-                             from front parents, --qd-policy parents and
-                             migrants for --restart-isolation generations.
-                             With one island nothing restarts. Saved search
-                             setting (#1022)",
+                             is worse than the archive best. island restarts
+                             an island whose own best error has not improved
+                             for one restart interval, except the lowest
+                             island that holds the archive best (the keeper),
+                             and isolates it from front parents, --qd-policy
+                             parents and migrants for --restart-isolation
+                             generations. With one island nothing restarts.
+                             Saved search setting (#1022)",
         bench: Some(Bench {
             usage: "  --restart-policy <mode>   archive (default) or island: restart an island on its own
                             stall and isolate it afterwards (#1022)",
