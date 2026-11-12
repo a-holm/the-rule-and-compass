@@ -842,7 +842,7 @@ impl FitRoute {
         let at: HashMap<(usize, usize), usize> = jobs.iter().enumerate().map(|(k, (key, _))| (slots.place(*key), k)).collect();
         for f in &mut self.fallbacks[from..] {
             let Some(hint) = at.get(&(f.key.1, f.key.2)).and_then(|&k| hints[k].take()) else { continue };
-            if hint.key == f.key {
+            if hint.key == f.key && hint.cause == f.cause && crate::expr::same(&hint.tree, &f.tree) && same_device(&hint.device, &f.device) {
                 f.early = hint.early;
                 step.early += 1;
             }
