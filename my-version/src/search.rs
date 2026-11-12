@@ -865,6 +865,7 @@ impl Config {
         compare!(fit_polish, "fit_polish");
         compare!(fit_irls, "fit_irls"); // #611
         compare!(fit_admission, "fit_admission");
+        settings::differences(Group::Engine, self, other, &mut diff);
         settings::differences(Group::Variation, self, other, &mut diff);
         compare!(dedup, "dedup");
         // #256: `time_budget` is a per-process limit, not search state; a resumed

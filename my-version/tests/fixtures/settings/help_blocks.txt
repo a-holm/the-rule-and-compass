@@ -98,3 +98,12 @@
                              (#849). Saved search setting, off by default
 @@ --fit-samples --time-budget
   --patience <N>             stop after N generations without improvement (default 40)
+@@ --pipeline-depth --save
+  --variation auto|node|postfix
+                             variation engine. auto (default) uses the flat
+                             postfix arena for --no-fit GPU runs with a
+                             population >= 4096; node keeps the owned-tree loop;
+                             postfix requires the flat path and refuses a run
+                             that does not qualify
+
+CHECKPOINTS:

@@ -2065,3 +2065,104 @@ fn resume_ignores_sidecar_from_other_generation() {
     let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
     assert!(matches!(cumulative.get("complete"), Some(rcsr::devlog::Json::Bool(false))), "{cumulative:?}");
 }
+
+/// #1087: a saved run, then a resume with explicit flags. `extra` goes on the
+/// save run, `resume` on the resume.
+fn resume_with(tag: &str, extra: &[&str], resume: &[&str]) -> Output {
+    let csv = TempPath::new("flags.csv");
+    std::fs::write(&csv.0, line_csv(40)).expect("write csv");
+    let checkpoint = TempPath::new(&format!("{tag}.rcsr"));
+    let base = ["--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "2", "--pop", "25"];
+    let mut made_args = base.to_vec();
+    made_args.extend(["--generations", "2", "--save", checkpoint.as_str()]);
+    made_args.extend(extra);
+    let made = rcsr(&made_args);
+    assert!(made.status.success(), "save run failed: {}", String::from_utf8_lossy(&made.stderr));
+    let mut resume_args = base.to_vec();
+    resume_args.extend(["--generations", "3", "--resume", checkpoint.as_str()]);
+    resume_args.extend(resume);
+    rcsr(&resume_args)
+}
+
+fn assert_conflict(out: &Output, line: &str) {
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("conflicts with the saved search settings:"), "{err}");
+    assert!(err.lines().any(|l| l == format!("  - {line}")), "missing '{line}' in:\n{err}");
+}
+
+fn assert_resumed(out: &Output) {
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn run_resumable_refuses_another_variation_mode() {
+    let (train, test) = (sample(60), sample(20));
+    let saved_cfg = Config { variation: search::VariationMode::Node, ..config(3) };
+    let text = checkpoint_text(&saved_cfg, &train, &test);
+    assert!(text.contains("config variation node\n"));
+    let other = Config { variation: search::VariationMode::Auto, ..config(3) };
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    let err = expect_err(search::run_resumable(&other, &train, &test, Some(saved), 0, |_| {}), "resume under auto");
+    assert!(err.contains("variation"), "{err}");
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    search::run_resumable(&saved_cfg, &train, &test, Some(saved), 0, |_| {}).expect("same mode resumes");
+}
+
+#[test]
+fn cli_resume_with_an_explicit_variation_conflicts_or_matches() {
+    assert_conflict(
+        &resume_with("var-node", &["--variation", "node"], &["--variation", "auto"]),
+        "--variation auto (saved variation is node)",
+    );
+    assert_conflict(
+        &resume_with("var-auto", &[], &["--variation", "node"]),
+        "--variation node (saved variation is auto)",
+    );
+    assert_resumed(&resume_with("var-same", &["--variation", "node"], &["--variation", "node"]));
+    assert_resumed(&resume_with("var-same-auto", &[], &["--variation", "auto"]));
+    assert_resumed(&resume_with("var-none", &["--variation", "node"], &[]));
+}
+
+#[test]
+fn cli_resume_with_an_explicit_qd_flag_conflicts_or_matches() {
+    let saved = ["--qd-cells", "8", "--qd-cell-cap", "2"];
+    assert_conflict(&resume_with("qd-cells", &saved, &["--qd-cells", "32"]), "--qd-cells 32 (saved qd_bins is 8)");
+    assert_conflict(&resume_with("qd-cap", &saved, &["--qd-cell-cap", "5"]), "--qd-cell-cap 5 (saved qd_cell_cap is 2)");
+    assert_conflict(&resume_with("qd-cvt", &saved, &["--qd-cvt"]), "--qd-cvt (saved qd_cvt is false)");
+    assert_conflict(
+        &resume_with("qd-policy", &saved, &["--qd-policy"]),
+        "--qd-policy (saved qd_policy is false, qd_cvt is false)",
+    );
+    assert_conflict(
+        &resume_with("qd-uniform", &saved, &["--qd-uniform"]),
+        "--qd-uniform (saved qd_policy is false, qd_control is 0, qd_cvt is false)",
+    );
+    assert_conflict(
+        &resume_with("qd-random", &saved, &["--qd-random"]),
+        "--qd-random (saved qd_policy is false, qd_control is 0)",
+    );
+    assert_conflict(&resume_with("qd-off", &[], &["--qd"]), "--qd (saved qd_bins is 0)");
+    assert_resumed(&resume_with("qd-same", &saved, &["--qd-cells", "8", "--qd-cell-cap", "2", "--qd"]));
+    assert_resumed(&resume_with("qd-none", &saved, &[]));
+    assert_resumed(&resume_with("qd-policy-same", &["--qd-policy"], &["--qd-policy", "--qd-cvt", "--qd-cells", "512"]));
+}
+
+#[test]
+fn cli_resume_with_explicit_units_flags_conflicts_or_matches() {
+    let units = ["--units", "x=m,y=m"];
+    assert_conflict(
+        &resume_with("units-other", &units, &["--units", "x=s,y=m"]),
+        "--units x=s,y=m (saved units is m, units.target is m)",
+    );
+    assert_conflict(&resume_with("units-new", &[], &["--units", "x=m,y=m"]), "--units x=m,y=m (saved units is none)");
+    assert_resumed(&resume_with("units-same", &units, &["--units", "x=m,y=m"]));
+    assert_resumed(&resume_with("units-none", &units, &[]));
+    let required = ["--units", "x=m,y=m", "--require-dimensions"];
+    assert_conflict(
+        &resume_with("req-new", &units, &["--require-dimensions"]),
+        "--require-dimensions (saved require_dimensions is false)",
+    );
+    assert_resumed(&resume_with("req-same", &required, &["--require-dimensions"]));
+    assert_resumed(&resume_with("req-none", &required, &[]));
+}
