@@ -605,7 +605,39 @@ pub fn declared_parity_tier(name: &str, family: &str) -> &'static str {
     if let Some(tier) = crate::bench_gpu::device_tier(name) {
         return tier;
     }
+    if device_kernel_exists(name) {
+        return engine_device_tier(name);
+    }
     "reference"
+}
+
+/// Declared tier of an engine column with a device kernel (#303).
+///
+/// `1e-12`: anything that evaluates `ln`, `sin` or `cos` (CUDA and the host
+/// libm differ in the last bit), anything derived from the 1-bar log return,
+/// and the MTF `vol` leaf. `bitwise`: elementwise geometry, min/max, lags of
+/// exact values, ranks, and recurrences evaluated in the CPU order.
+fn engine_device_tier(name: &str) -> &'static str {
+    let numeric = |s: Option<&str>| s.map_or(false, |r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()));
+    let log_based = numeric(name.strip_prefix('r'))
+        || numeric(name.strip_prefix("vol"))
+        || name.starts_with("lag_r1_")
+        || name.starts_with("dow_")
+        || name.starts_with("hour_")
+        || name.starts_with("month_")
+        || name.starts_with("dom_")
+        || name.starts_with("tod_")
+        || (is_mtf(name) && name.ends_with("_vol"))
+        || matches!(
+            name,
+            "ret1" | "ret5" | "vz96" | "vol_z96" | "ou_hl96" | "acf1" | "vr4" | "rskew96"
+                | "jump_share" | "semivar_asym" | "cusum_abs_z" | "rmean5" | "rstd5"
+        );
+    if log_based {
+        "1e-12"
+    } else {
+        "bitwise"
+    }
 }
 
 /// The default financial feature registry.
@@ -2005,9 +2037,13 @@ pub fn family_of(name: &str) -> &'static str {
 /// families whose parity test (`tests/enrich.rs::gpu_columns_match_cpu`) passes;
 /// every other name falls back to the CPU without changing the output.
 pub fn gpu_supports(name: &str) -> bool {
-    if !cfg!(feature = "cuda") {
-        return false;
-    }
+    cfg!(feature = "cuda") && device_kernel_exists(name)
+}
+
+/// True when the column has a device kernel in a `--features cuda` build,
+/// whatever this build is. Parity tiers are declared from this so the registry
+/// and `schema` do not depend on the build.
+pub fn device_kernel_exists(name: &str) -> bool {
     // #297: the fused flow and price-action producers materialise their
     // columns with a declared parity tier; they must be reachable even when a
     // shared name (cmf20) is also in the compact subset.
@@ -2175,6 +2211,23 @@ pub fn gpu_kernels_compiled() -> bool {
 /// strictly lower than the CPU estimate for the same columns. Small stores
 /// stay on the CPU.
 pub const GPU_MIN_ROWS: usize = 1_000_000;
+
+static GPU_FLOOR_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Test hook (#303): lower the row floor below which `--gpu on` still plans
+/// the CPU, so parity fixtures and prefix cuts below one million rows run on
+/// the device. Process-wide; never called by the CLI.
+pub fn set_gpu_floor_for_tests(rows: usize) {
+    GPU_FLOOR_OVERRIDE.store(rows, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn gpu_row_floor() -> usize {
+    match GPU_FLOOR_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        usize::MAX => GPU_MIN_ROWS,
+        n => n,
+    }
+}
 pub const GPU_TRANSFER_BYTES_PER_SECOND: f64 = 12_000_000_000.0;
 /// Measured sequential write bandwidth of the shared ext4 store on
 /// `/mnt/lager` (2026-10-23, 512 MiB `dd conv=fdatasync`: **222 MB/s**). This is
@@ -2358,10 +2411,10 @@ pub fn plan_groups_full(
         let cpu_supported_s = gpu_cells / op.cpu_cells_per_second();
         let (backend, reason) = if gpu_requested == GpuMode::Off {
             ("cpu", "GPU disabled by --no-gpu/--cpu".to_string())
-        } else if n_rows < GPU_MIN_ROWS {
+        } else if n_rows < gpu_row_floor() {
             (
                 "cpu",
-                format!("{} rows is below the {} row GPU floor", n_rows, GPU_MIN_ROWS),
+                format!("{} rows is below the {} row GPU floor", n_rows, gpu_row_floor()),
             )
         } else if supported == 0 {
             ("cpu", "no exact GPU kernel registered for this family".to_string())

@@ -115,6 +115,8 @@ CPU 0.43 s (11 M rows/s, 15.7 loads per row) and the device 0.029 s (167 M
 rows/s, 1.48 loads per row). The download is 0.12 s, so the device join pays when
 the block is already resident.
 
+The device prep and PIT joins are gated by `tests/gpu_parity.rs` (CPU vs device SHA-256, cold/warm, block sizes, prefix replay at 20 cuts, future-shift canary). See "Parity and batch-invariance harness" in `docs/ohlcv.md`.
+
 ### Cross-sections use the same PIT rule
 
 `rcsr enrich --features cross` computes equal-weight market state, breadth,
