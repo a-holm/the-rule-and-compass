@@ -145,6 +145,26 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   from its own members only. With one island nothing restarts. One island-policy
   module decides migration, restarts and parent sources for the owned-tree loop
   and the flat postfix loop alike (#1081).
+- **Explore tier** (`--explore-islands K`, #1100, default 0). Without it a run
+  behaves as one trial: the global front and the ring spread a new best to
+  every island within a few migration intervals, and the restart rules above
+  are fixed cutoffs. With it the highest `K` islands are explore islands. Each
+  is isolated for its whole life (no front parent, no `--qd-policy` parent, no
+  migrant in or out) and restarts at the end of each lifetime of the Luby
+  universal sequence 1, 1, 2, 1, 1, 2, 4, ... in units of `--restart-interval`
+  generations. One sequence is spread over the explore islands: each next
+  lifetime goes to the island whose lifetimes add up to the least, ties to the
+  lowest island (the list schedule of Cire, Kadioglu and Sellmann 2014). Luby,
+  Sinclair and Zuckerman (1993) show that this sequence reaches a target within
+  a logarithmic factor of the best fixed cutoff without knowing the run-time
+  distribution, provided the trials are independent. The restart generations
+  depend on the generation alone, so a checkpoint needs no extra record. The
+  other islands form the exploit tier: they keep `--restart-policy` and a
+  directed ring among themselves, and they see explore results only through the
+  archive and its front parents. QD niche immigrants and AFP immigrants still
+  arrive on an explore island; they are fresh random trees. On the flat postfix
+  path a child that duplicates a program on any island is redrawn, which is the
+  one remaining link between an explore island and the others.
 - Termination is by generation count or a time/effort budget.
 
 ## 7. Simplification and presentation
