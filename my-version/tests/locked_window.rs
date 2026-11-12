@@ -1343,9 +1343,23 @@ struct Sealed {
 
 impl Sealed {
     fn new(name: &str) -> Sealed {
+        Sealed::with_rows(name, 500)
+    }
+
+    fn with_rows(name: &str, rows: i64) -> Sealed {
         let (scratch, dir) = scratch(name);
         let (data, win) = (dir.join("p.csv"), dir.join("w.csv"));
         panel_csv(&data);
+        if rows < 500 {
+            let text = std::fs::read_to_string(&data).unwrap();
+            let keep: Vec<&str> = text
+                .lines()
+                .enumerate()
+                .filter(|(i, l)| *i == 0 || l.split(',').next().unwrap().parse::<i64>().unwrap() < T0 + rows * H)
+                .map(|(_, l)| l)
+                .collect();
+            std::fs::write(&data, keep.join("\n") + "\n").unwrap();
+        }
         windows_file(&win, "locked");
         let (d, w) = (s(&data), s(&win));
         let range = Lockbox { start: T0 + 400 * H, end: T0 + 500 * H };
@@ -1448,6 +1462,45 @@ fn ladder_verify_read_needs_a_recorded_read() {
     assert!(!Path::new(&out).exists());
     assert_eq!(f.bytes(&f.ledger), ledger_before);
     assert!(f.bytes(&f.marker()).is_none());
+}
+
+#[test]
+fn ladder_verify_read_without_a_recorded_read_scores_nothing() {
+    let f = Sealed::with_rows("lad-verify-unread", 400);
+    let out = s(&f.dir.join("x.json"));
+    let ledger_before = f.bytes(&f.ledger);
+    let zeros = "0".repeat(64);
+    for extra in [vec!["--verify-read"], vec!["--verify-read", "--expect-report-sha256", zeros.as_str()]] {
+        let (code, stdout, err) = f.read(&out, &extra);
+        assert_eq!(code, 3, "{}", err);
+        assert!(err.contains("no recorded baseline read"), "{}", err);
+        assert!(!err.contains("report sha256") && !stdout.contains("report_sha256"), "{}{}", stdout, err);
+        assert!(!Path::new(&out).exists());
+        assert_eq!(f.bytes(&f.ledger), ledger_before);
+        assert!(f.bytes(&f.marker()).is_none());
+    }
+}
+
+#[test]
+fn ladder_locked_read_refuses_expect_hash_without_verify() {
+    let f = Sealed::new("lad-expect-no-verify");
+    let out = s(&f.dir.join("x.json"));
+    let ledger_before = f.bytes(&f.ledger);
+    let zeros = "0".repeat(64);
+    for _ in 0..2 {
+        let (code, stdout, err) = f.read(&out, &["--expect-report-sha256", &zeros]);
+        assert_eq!(code, 2, "{}", err);
+        assert!(err.contains("--expect-report-sha256 with --locked-test needs --verify-read"), "{}", err);
+        assert!(!err.contains("differs") && !stdout.contains("report_sha256"), "{}{}", stdout, err);
+        assert!(!Path::new(&out).exists());
+        assert_eq!(f.bytes(&f.ledger), ledger_before);
+        assert!(f.bytes(&f.marker()).is_none());
+    }
+    let (code, _, err) = f.read(&out, &[]);
+    assert_eq!(code, 0, "{}", err);
+    let sha = f.recorded_sha();
+    let (code, _, err) = f.read(&out, &["--verify-read", "--expect-report-sha256", &sha]);
+    assert_eq!(code, 0, "{}", err);
 }
 
 #[test]
