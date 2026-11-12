@@ -28,10 +28,11 @@ config restart_policy island
 config restart_isolation 7
 config explore_islands 1
 config front_scope island
+config migration_policy ring-tournament
 config mutation_mix extended
 config crossover_internal 0.25
 config adaptive_mix true
 config reject_constant_offspring true
 config reject_fixed_position true
 config fit_thresholds true
-config_hash fa0e7d65df14464f
+config_hash 6eb8553a78de3f68
