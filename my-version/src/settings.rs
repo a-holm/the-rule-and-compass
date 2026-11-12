@@ -572,7 +572,7 @@ pub static TABLE: &[&dyn Setting] = &[
         get: |c| &c.restart_isolation,
         set: |c| &mut c.restart_isolation,
         cli: Cli::Value(|v| uint("--restart-isolation", v)),
-        write: Write::UnlessDefault,
+        write: Write::Required,
         active: Some(island_policy),
         conflict: Conflict::SavedKey,
     },
