@@ -654,6 +654,7 @@ pub const DEFAULT_PRUNE_ROWS: usize = 20_000;
 /// #466: default `--prune-budget`.
 pub const DEFAULT_PRUNE_BUDGET: usize = 20_000;
 
+mod island_policy;
 mod prune;
 pub use prune::PruneReport;
 /// #495: default relative band of the finalist refit (`inf`: refit every unique tree).
