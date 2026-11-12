@@ -581,7 +581,7 @@ fn eval_counted(counters: Option<&GenCounters>, make: impl FnOnce() -> Ind) -> I
 /// #1078: the tree before a fit, for the `--fit-accept fitness` gate. `None`
 /// under `always`.
 fn pre_fit_tree(cfg: &Config, tree: &Node) -> Option<Node> {
-    None::<Node>.or_else(|| (cfg.fit_accept == FitAccept::Fitness).then(|| expr::simplify(tree))).filter(|_| false) // WIP-RED
+    (cfg.fit_accept == FitAccept::Fitness).then(|| expr::simplify(tree))
 }
 
 /// #1078: keep `fitted` unless the candidate scored with its pre-fit tree
