@@ -365,3 +365,234 @@ fn reselect_reads_the_final_archive_not_the_search_archive() {
     let refusal = rcsr::reselect::front_of(&cp).err().expect("a checkpoint without a final archive is refused");
     assert!(refusal.contains("run it to the end first"), "{refusal}");
 }
+
+/// #1026: `--select-require-edge`. Rows before `FLIP` pay `+0.12 x1 x2`, later rows
+/// `-0.12 x1 x2` and a drift of -0.002, so the validation slice punishes the
+/// members the training slice rewards and rewards the ones it does not.
+const FLIP: usize = 205;
+const EDGE_FIT: &[&str] = &["--fitness", "pnl", "--pnl-blocks", "2"];
+const EDGE: &str = "--select-require-edge";
+const TRAIN_ROWS: usize = 209;
+
+fn write_regime_csv(dir: &Path, name: &str, r_of: impl Fn(usize, f64, f64) -> f64) -> String {
+    let mut text = String::from("t,x1,x2,r,y\n");
+    for i in 0..N {
+        let f = i as f64;
+        let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+        let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+        let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+        let r = r_of(i, x1, x2) + 0.0005 * noise;
+        text.push_str(&format!("{},{},{},{},{}\n", T0 + 900 * i as i64, x1, x2, r, r));
+    }
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn edge_fixture() -> Fixture {
+    let scratch = Scratch::new("require_edge");
+    let dir = scratch.path().to_path_buf();
+    let data = write_regime_csv(&dir, "d.csv", |i, x1, x2| if i < FLIP { 0.12 * x1 * x2 } else { -0.12 * x1 * x2 - 0.002 });
+    let spec = write_spec(&dir);
+    Fixture { _scratch: scratch, dir, data, spec }
+}
+
+impl Fixture {
+    /// A hand-written front for `--reselect-run`: `(expression_exact, complexity)`.
+    fn write_front(&self, name: &str, members: &[(&str, usize)]) -> String {
+        let items: Vec<String> = members
+            .iter()
+            .enumerate()
+            .map(|(k, (e, c))| format!("{{\"archive_rank\":{},\"expression_exact\":\"{e}\",\"complexity\":{c},\"train_error\":1.0}}", k + 1))
+            .collect();
+        let text = format!(
+            "{{\"variables\":[\"x1\",\"x2\"],\"train_rows\":{TRAIN_ROWS},\"split\":{{\"mode\":\"temporal\"}},\"generations_run\":0,\"pareto\":[{}]}}",
+            items.join(",")
+        );
+        let path = self.path(name);
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// `--reselect-run` of a hand-written front under the edge fixture's fitness flags.
+    fn reselect_front(&self, front: &str, tag: &str, extra: &[&str]) -> Output {
+        let out = self.path(&format!("{tag}.run.json"));
+        let mut args = vec!["--reselect-run", front, "--json-out", out.as_str(), "--no-dev-log", "--select-rule", "validation_objective"];
+        args.extend_from_slice(EDGE_FIT);
+        args.extend_from_slice(extra);
+        self.rcsr(&self.data, &args)
+    }
+}
+
+fn members(j: &Json) -> &Vec<Json> {
+    match at(j, &["pareto"]) {
+        Json::Arr(a) => a,
+        _ => panic!("pareto is not an array"),
+    }
+}
+
+fn member(j: &Json, archive_rank: usize) -> &Json {
+    members(j)
+        .iter()
+        .find(|m| m.get("archive_rank").and_then(Json::as_usize) == Some(archive_rank))
+        .expect("member")
+}
+
+fn train_regret(m: &Json) -> f64 {
+    at(m, &["fitness", "train_regret"]).as_f64().unwrap_or(f64::INFINITY)
+}
+
+fn edge_rejected_of(m: &Json) -> bool {
+    at(m, &["validation_book", "edge_rejected"]) == &Json::Bool(true)
+}
+
+fn selection_field<'a>(j: &'a Json, key: &str) -> &'a Json {
+    at(j, &["objective", "selection_rule", key])
+}
+
+#[test]
+fn require_edge_skips_members_without_training_edge() {
+    let fx = edge_fixture();
+    ok(&fx.search("plain", EDGE_FIT));
+    let plain = fx.run_json("plain");
+    let (plain_rank, _) = finalist(&plain);
+    assert!(train_regret(member(&plain, plain_rank)) >= 1.0, "the plain finalist has no training edge");
+
+    let mut with_flag = EDGE_FIT.to_vec();
+    with_flag.push(EDGE);
+    ok(&fx.search("edge", &with_flag));
+    let edge = fx.run_json("edge");
+    let (edge_rank, _) = finalist(&edge);
+    assert_ne!(plain_rank, edge_rank);
+    let best_with_edge = members(&plain)
+        .iter()
+        .filter(|m| train_regret(m) < 1.0)
+        .filter_map(|m| Some((at(m, &["validation_book", "objective"]).as_f64()?, m.get("archive_rank")?.as_usize()?)))
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .expect("a member with an edge");
+    assert_eq!(edge_rank, best_with_edge.1, "the finalist is the best validation member with an edge");
+    assert!(train_regret(member(&edge, edge_rank)) < 1.0);
+    assert_eq!(at(&edge, &["objective", "edge_rejected"]).as_usize(), Some(1));
+    assert!(edge_rejected_of(member(&edge, plain_rank)));
+    assert!(!edge_rejected_of(member(&edge, edge_rank)));
+    assert_eq!(selection_field(&edge, "require_edge"), &Json::Bool(true));
+}
+
+#[test]
+fn require_edge_off_output_matches_the_golden() {
+    let fx = edge_fixture();
+    ok(&fx.search("plain", EDGE_FIT));
+    let plain = fx.run_json("plain");
+    let golden = Json::parse(include_str!("fixtures/require_edge_plain.json").trim()).expect("golden parses");
+    assert_eq!(at(&plain, &["objective"]), at(&golden, &["objective"]));
+    assert_eq!(at(&plain, &["pareto"]), at(&golden, &["pareto"]));
+}
+
+#[test]
+fn require_edge_all_gated_is_no_edge() {
+    let fx = edge_fixture();
+    let front = fx.write_front("gated.front.json", &[("x2", 1), ("cos(x2)", 2)]);
+    ok(&fx.reselect_front(&front, "off", &[]));
+    assert_eq!(at(&fx.run_json("off"), &["objective", "usable_candidates"]).as_usize(), Some(2));
+    ok(&fx.reselect_front(&front, "gated", &[EDGE]));
+    let j = fx.run_json("gated");
+    assert!(members(&j).iter().all(|m| train_regret(m) >= 1.0));
+    assert_eq!(at(&j, &["objective", "usable_candidates"]).as_usize(), Some(0));
+    assert_eq!(at(&j, &["objective", "edge_rejected"]).as_usize(), Some(2));
+    assert_eq!(selection_field(&j, "verdict").as_str(), Some("no_edge"));
+    assert_eq!(finalist(&j).0, 1);
+    assert_eq!(at(&j, &["objective", "finalist", "validation_objective"]), &Json::Null);
+}
+
+#[test]
+fn require_edge_gates_the_flat_book() {
+    let fx = edge_fixture();
+    let front = fx.write_front("flat.front.json", &[("x2", 1), ("(x1 * x2)", 3), ("(x1 - 5)", 3)]);
+    ok(&fx.reselect_front(&front, "off", &["--min-trades", "0"]));
+    let off = fx.run_json("off");
+    let flat = |j: &Json| members(j).iter().find(|m| at(m, &["fitness", "train_exposure"]).as_f64() == Some(0.0)).expect("flat member").clone();
+    assert_eq!(train_regret(&flat(&off)), 1.0, "the flat book has fitness exactly 1");
+    let flat_rank = at(&flat(&off), &["archive_rank"]).as_usize().unwrap();
+    assert_eq!(finalist(&off).0, flat_rank, "without the flag the flat book wins on validation");
+
+    ok(&fx.reselect_front(&front, "on", &["--min-trades", "0", EDGE]));
+    let on = fx.run_json("on");
+    assert_ne!(finalist(&on).0, flat_rank);
+    assert!(edge_rejected_of(&flat(&on)));
+    assert!(train_regret(member(&on, finalist(&on).0)) < 1.0);
+}
+
+#[test]
+fn robust_require_edge_marks_ineligible() {
+    let scratch = Scratch::new("require_edge_robust");
+    let dir = scratch.path().to_path_buf();
+    let data = write_regime_csv(&dir, "d.csv", |i, _, x2| if i < FLIP { -0.03 * x2 } else { 0.03 * x2 });
+    let spec = write_spec(&dir);
+    let fx = Fixture { _scratch: scratch, dir, data, spec };
+    let front = fx.write_front("robust.front.json", &[("x2", 1), ("(x1 * x2)", 3)]);
+    let eligible = |j: &Json, rank: usize| match at(j, &["objective", "selection_rule", "members"]) {
+        Json::Arr(a) => a
+            .iter()
+            .find(|m| m.get("archive_rank").and_then(Json::as_usize) == Some(rank))
+            .and_then(|m| m.get("eligible").cloned())
+            .expect("robust member"),
+        _ => panic!("members is not an array"),
+    };
+    ok(&fx.reselect_front(&front, "off", ROBUST));
+    let off = fx.run_json("off");
+    assert!(train_regret(member(&off, 1)) >= 1.0);
+    assert_eq!(eligible(&off, 1), Json::Bool(true), "positive alpha in every validation block");
+    assert_eq!(selection_field(&off, "verdict").as_str(), Some("selected"));
+
+    let mut args = ROBUST.to_vec();
+    args.push(EDGE);
+    ok(&fx.reselect_front(&front, "on", &args));
+    let on = fx.run_json("on");
+    assert_eq!(eligible(&on, 1), Json::Bool(false));
+    assert_eq!(selection_field(&on, "verdict").as_str(), Some("no_edge"));
+    assert_eq!(selection_field(&on, "require_edge"), &Json::Bool(true));
+}
+
+#[test]
+fn reselect_run_json_honours_require_edge() {
+    let fx = edge_fixture();
+    let mut with_flag = EDGE_FIT.to_vec();
+    with_flag.push(EDGE);
+    ok(&fx.search("loop", &with_flag));
+    ok(&fx.search("plain", EDGE_FIT));
+    let run = fx.path("plain.run.json");
+    ok(&fx.reselect_front(&run, "again", &[EDGE]));
+    let (looped, again) = (fx.run_json("loop"), fx.run_json("again"));
+    assert_eq!(finalist(&looped), finalist(&again));
+    assert_ne!(finalist(&fx.run_json("plain")), finalist(&again));
+    assert_eq!(at(&looped, &["objective", "edge_rejected"]), at(&again, &["objective", "edge_rejected"]));
+}
+
+#[test]
+fn require_edge_not_in_config_hash() {
+    let fx = edge_fixture();
+    ok(&fx.search("plain", EDGE_FIT));
+    let mut with_flag = EDGE_FIT.to_vec();
+    with_flag.push(EDGE);
+    ok(&fx.search("edge", &with_flag));
+    assert_eq!(checkpoint_line(&fx, "plain", "config_hash "), checkpoint_line(&fx, "edge", "config_hash "));
+    let (ck, out, log) = (fx.path("plain.ckpt"), fx.path("again.run.json"), fx.path("again.dev.ndjson"));
+    let mut args = vec!["--resume", ck.as_str(), "--json-out", out.as_str(), "--dev-log", log.as_str()];
+    args.extend_from_slice(&with_flag);
+    ok(&fx.rcsr(&fx.data, &args));
+    assert_eq!(generation_events(&fx, "again"), 0, "the resume continued the checkpoint");
+    let ck = fx.path("edge.ckpt");
+    let mut args = vec!["--resume", ck.as_str(), "--json-out", out.as_str(), "--no-dev-log"];
+    args.extend_from_slice(EDGE_FIT);
+    ok(&fx.rcsr(&fx.data, &args));
+}
+
+#[test]
+fn require_edge_needs_fitness_pnl() {
+    let fx = fixture();
+    let o = fx.rcsr(&fx.data, &["--fitness", "metric", EDGE, "--generations", "2", "--pop", "16", "--no-dev-log"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("--select-require-edge needs --fitness pnl"), "{}", stderr(&o));
+    let o = fx.rcsr(&fx.data, &[EDGE, "--generations", "2", "--pop", "16", "--no-dev-log"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+}

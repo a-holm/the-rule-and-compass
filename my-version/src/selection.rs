@@ -87,6 +87,12 @@ pub fn select(candidates: &[Candidate], by: SelectBy) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// #1026: with `--select-require-edge`, a member whose training fitness is not
+/// below 1 (the all-flat book scores exactly 1) never wins; NaN is gated too.
+pub fn edge_rejected(require: bool, train_fitness: f64) -> bool {
+    require && !(train_fitness < 1.0)
+}
+
 /// Indices ordered best-first under `by`, stable on ties.
 pub fn order(candidates: &[Candidate], by: SelectBy) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..candidates.len()).collect();
@@ -955,6 +961,15 @@ pub fn choose_robust(members: &[RobustMember], se_z: f64) -> Option<usize> {
 impl RobustSelection {
     /// The members of `objective.selection_rule`, without braces.
     pub fn fields_json(&self) -> String {
+        self.fields(None)
+    }
+
+    /// #1026: the fields under `--select-require-edge`; `no_edge` replaces the verdict.
+    pub fn fields_json_edge(&self, no_edge: bool) -> String {
+        self.fields(Some(no_edge))
+    }
+
+    fn fields(&self, edge: Option<bool>) -> String {
         let num = crate::devlog::num;
         let members: Vec<String> = self
             .members
@@ -972,14 +987,22 @@ impl RobustSelection {
                 )
             })
             .collect();
+        let verdict = if edge == Some(true) {
+            "no_edge"
+        } else if self.chosen.is_some() {
+            "selected"
+        } else {
+            "no_signal"
+        };
         format!(
-            "\"rule\":\"robust\",\"blocks\":{},\"se_z\":{},\"block_len\":{},\"verdict\":\"{}\",\"members\":[{}],\"chosen_rank\":{}",
+            "\"rule\":\"robust\",\"blocks\":{},\"se_z\":{},\"block_len\":{},\"verdict\":\"{}\",\"members\":[{}],\"chosen_rank\":{}{}",
             self.params.blocks,
             num(self.params.se_z),
             self.params.block_len,
-            if self.chosen.is_some() { "selected" } else { "no_signal" },
+            verdict,
             members.join(","),
-            self.chosen.map_or_else(|| "null".to_string(), |i| self.members[i].archive_rank.to_string())
+            self.chosen.map_or_else(|| "null".to_string(), |i| self.members[i].archive_rank.to_string()),
+            if edge.is_some() { ",\"require_edge\":true" } else { "" }
         )
     }
 }

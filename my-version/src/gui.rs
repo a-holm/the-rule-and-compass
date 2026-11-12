@@ -820,6 +820,7 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("--select-blocks", "post-loop selection is a CLI option"),
     ("--select-se", "post-loop selection is a CLI option"),
     ("--select-block-len", "post-loop selection is a CLI option"),
+    ("--select-require-edge", "post-loop selection is a CLI option"),
     ("--reselect", "checkpoints depend on a process lifecycle the stream does not have"),
     ("--reselect-run", "re-selection reads files the server does not open"),
     ("--report", "Markdown reports are produced by the CLI"),
