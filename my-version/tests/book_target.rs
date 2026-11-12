@@ -590,3 +590,80 @@ mod device {
         assert_eq!(num(&search, &["gpu", "fit", "score_rows"]), num(&search, &["search_fitness", "rows"]));
     }
 }
+
+const STRIDE_N: usize = 2400;
+
+/// `y24` is finite on every `DAY`-th row only; `y1` is finite on every row.
+fn write_stride_csv(dir: &std::path::Path) -> String {
+    let mut text = String::from("t,x1,x2,r1,y1,r24,y24\n");
+    for i in 0..STRIDE_N {
+        let x2 = frac(i as f64 * 0.754_877_666_246_692_7) - 0.5;
+        let r24: f64 = (i + 1..i + 1 + DAY).take_while(|&j| j < STRIDE_N).map(r1).sum();
+        let t = T0 + STEP * i as i64;
+        if i % DAY == 0 && i + DAY < STRIDE_N {
+            text.push_str(&format!("{t},{},{x2},{},{},{r24},{r24}\n", x1(i), r1(i), r1(i)));
+        } else {
+            text.push_str(&format!("{t},{},{x2},{},{},nan,nan\n", x1(i), r1(i), r1(i)));
+        }
+    }
+    let path = dir.join("stride.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn run_stride(data: &str, spec: &str, extra: &[&str]) -> Output {
+    let mut args = vec!["--fill", "drop", "--book-target", "y1"];
+    args.extend_from_slice(extra);
+    run(data, spec, "y24", &args)
+}
+
+fn pareto(j: &Json) -> &[Json] {
+    match at(j, &["pareto"]) {
+        Json::Arr(items) => items,
+        _ => panic!("pareto is not an array"),
+    }
+}
+
+#[test]
+fn book_target_member_fitness_is_on_the_book_rows() {
+    let scratch = Scratch::new("book_target_member_fitness");
+    let data = write_stride_csv(scratch.path());
+    let spec = write_spec(scratch.path());
+    let j = ok(&run_stride(&data, &spec, &[]));
+    let rows = num(&j, &["search_fitness", "rows"]) as usize;
+    assert!(rows > num(&j, &["train_rows"]) as usize, "the book holds rows without a fit label");
+    let mut slice = TradingSlice { rows: TradingRows::default(), ret: Vec::new() };
+    for i in 0..rows {
+        slice.rows.group.push(0);
+        slice.rows.time.push((T0 + STEP * i as i64) as f64);
+        slice.ret.push(r1(i).exp_m1());
+    }
+    let sp = TradingSpec { cost_bps: 5.0, threshold: 1e-30, min_trades: 0, ..Default::default() };
+    let book = FitnessBook::new(&slice, &sp, STEP as f64).unwrap();
+    let vars = vec!["x1".to_string(), "x2".to_string()];
+    let members = pareto(&j);
+    assert!(!members.is_empty());
+    for m in members {
+        let tree = rcsr::parse::parse(at(m, &["expression_exact"]).as_str().unwrap(), &vars).unwrap();
+        let pred: Vec<f64> = (0..rows)
+            .map(|i| rcsr::expr::eval(&tree, &[x1(i), frac(i as f64 * 0.754_877_666_246_692_7) - 0.5]))
+            .collect();
+        let totals = book.totals(&pred);
+        let regret = num(m, &["fitness", "train_regret"]);
+        let want = book.regret(&pred);
+        assert!((regret - want).abs() <= 1e-9, "train_regret {regret} vs book {want}");
+        assert_eq!(num(m, &["fitness", "train_flips"]) as u64, totals.flips);
+        assert_eq!((num(m, &["fitness", "train_exposure"]) * rows as f64).round() as u64, totals.long_rows);
+    }
+}
+
+#[test]
+fn require_edge_reads_the_book_rows_under_book_target() {
+    let scratch = Scratch::new("book_target_require_edge");
+    let data = write_stride_csv(scratch.path());
+    let spec = write_spec(scratch.path());
+    let j = ok(&run_stride(&data, &spec, &["--select-require-edge"]));
+    assert_eq!(num(&j, &["objective", "edge_rejected"]), 0.0);
+    assert_eq!(num(&j, &["objective", "usable_candidates"]), 3.0);
+    assert!(at(&j, &["objective", "selection_rule"]).get("verdict").is_none());
+}

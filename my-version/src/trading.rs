@@ -1590,16 +1590,20 @@ impl FitnessBook {
         &self.flags
     }
 
+    fn check_len(&self, pred: &[f64]) {
+        assert_eq!(pred.len(), self.excess.len(), "fitness book: {} predictions for {} rows", pred.len(), self.excess.len());
+    }
+
     /// Reduce one prediction vector as a single book (a multi-block book uses
     /// [`FitnessBook::block_totals`]). `gross` uses the fixed segment, lane and
     /// warp tree documented on [`FITNESS_SEGMENT_ROWS`]; integer counts are
     /// order-free.
     pub fn totals(&self, pred: &[f64]) -> FitnessTotals {
-        debug_assert_eq!(pred.len(), self.excess.len());
+        self.check_len(pred);
         if !self.is_plain() {
             return self.band_pass(pred, self.resolve_band(pred), false)[0];
         }
-        let n = self.excess.len().min(pred.len());
+        let n = self.excess.len();
         let mut warps = [0.0f64; FITNESS_WARPS];
         let mut flips = 0u64;
         let mut exits = 0u64;
@@ -1710,12 +1714,12 @@ impl FitnessBook {
     /// the lanes of every segment, and spreads the segment sums over the warps
     /// exactly as [`FitnessBook::totals`] does for the whole book.
     pub fn block_totals(&self, pred: &[f64]) -> Vec<FitnessTotals> {
-        debug_assert_eq!(pred.len(), self.excess.len());
+        self.check_len(pred);
         if !self.is_plain() {
             return self.band_pass(pred, self.resolve_band(pred), true);
         }
         let nb = self.blocks();
-        let n = self.excess.len().min(pred.len());
+        let n = self.excess.len();
         let mut warps = vec![[0.0f64; FITNESS_WARPS]; nb];
         let mut out = vec![
             FitnessTotals { gross: 0.0, flips: 0, exits: 0, long_rows: 0, nonfinite: false };
@@ -1868,8 +1872,9 @@ impl FitnessBook {
     /// one book; each keeps the segment, lane and warp tree of
     /// [`FitnessBook::totals`] for `gross`.
     pub fn band_pass(&self, pred: &[f64], band: f64, per_block: bool) -> Vec<FitnessTotals> {
+        self.check_len(pred);
         let nb = if per_block { self.blocks() } else { 1 };
-        let n = self.excess.len().min(pred.len());
+        let n = self.excess.len();
         let params = trading_gpu::BandParams { threshold: self.threshold, band, min_hold: self.min_hold };
         let mut warps = vec![[0.0f64; FITNESS_WARPS]; nb];
         let mut out = vec![FitnessTotals { gross: 0.0, flips: 0, exits: 0, long_rows: 0, nonfinite: false }; nb];
@@ -2182,6 +2187,34 @@ mod block_tests {
 
     fn pred(n: usize) -> Vec<f64> {
         (0..n).map(|i| if (i * 7 + i / 5) % 3 == 0 { 1.0 } else { -1.0 }).collect()
+    }
+
+    fn short_book() -> (FitnessBook, Vec<f64>) {
+        let s = panel(&[60, 70]);
+        let book = FitnessBook::new(&s, &spec(), 900.0).unwrap();
+        let short = pred(s.ret.len() - 1);
+        (book, short)
+    }
+
+    #[test]
+    #[should_panic(expected = "fitness book")]
+    fn fitness_book_refuses_a_short_prediction_vector_in_totals() {
+        let (b, p) = short_book();
+        b.totals(&p);
+    }
+
+    #[test]
+    #[should_panic(expected = "fitness book")]
+    fn fitness_book_refuses_a_short_prediction_vector_in_block_totals() {
+        let (b, p) = short_book();
+        b.block_totals(&p);
+    }
+
+    #[test]
+    #[should_panic(expected = "fitness book")]
+    fn fitness_book_refuses_a_short_prediction_vector_in_band_pass() {
+        let (b, p) = short_book();
+        b.band_pass(&p, 0.0, false);
     }
 
     #[test]
