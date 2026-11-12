@@ -1,4 +1,4 @@
-@@ --fit-irls --refit-band
+@@ --fit-irls --fit-accept
   --fit-thresholds          after the LM, fit each constant that is an operand of a
                              comparison or sits in the condition of if by an exact
                              1-D search (default off). The LM never moves such a

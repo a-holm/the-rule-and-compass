@@ -1545,6 +1545,8 @@ way on both paths, and a fallback after a non-usable device status
 starts from the finite device constants. A candidate rejected by
 `--require-dimensions` is not offered to the queue.
 
+**Fit acceptance (#1078).** Under `--fit-accept fitness` every candidate of the synchronous generation batch is scored with its pre-fit constants (also under wide admission), the fit stage runs, the admitted slots are re-scored, and a slot keeps its fitted tree only when its fitted error is not above the pre-fit error. The pre-fit snapshot is taken before the redundant-constant fold, so the device fit, the routed CPU tail and the fallback refits are covered. The overlap pipeline carries no pre-fit score, so `pipeline_fit_safe` is false under `fitness` and the synchronous batches run.
+
 **Zero diagonal (#399).** `ft_solve` freezes a slot whose normal-equation diagonal is exactly `0.0` on every arm. A constant with a zero adjoint on all active rows cannot move the prediction, so its row and column become the identity, its right-hand side is `0` and its step is `0`. The other constants are still fitted, as the CPU ridge solve (`fit.rs::solve`, ridge `1e-12`) does. A negative or non-finite diagonal is still status `1`. `tests/gpu_fit.rs::zero_adjoint_constant_is_frozen_and_the_rest_are_fitted` pins it.
 
 ### Default fit arm

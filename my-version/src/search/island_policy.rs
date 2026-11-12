@@ -9,7 +9,8 @@
 //! per island and the flat path its positional `Philox` draws.
 
 use super::{
-    afp_worst, defers_fit_to_gpu, draw_row_dependent, fit_constants, population_best, Config, EvalSample, Ind,
+    afp_worst, defers_fit_to_gpu, draw_row_dependent, fit_constants, gate_fit, population_best, pre_fit_tree, Config,
+    EvalSample, Ind,
     RestartPolicy, Selection, FRONT_PARENT_P,
 };
 use crate::checkpoint::IslandStall;
@@ -480,15 +481,17 @@ impl IslandPopulation for TreeIslands<'_> {
             });
             // #15: multi-output fits per output inside the evaluator.
             let mut fitted = None;
+            let mut before = None; // #1078
             if cfg.fit_iters > 0 && !gen_train.is_multi() && !defers_fit_to_gpu(cfg, self.defer_gpu) {
+                before = pre_fit_tree(cfg, &t);
                 fitted = fit_constants(&mut t, cfg, self.fit_train, gen_train); // #85 #87
             }
             // #26: restart trees are batched with the next GPU call too, before
             // the checkpoint is taken.
-            *ind = if self.defer_gpu {
+            *ind = if self.defer_gpu && before.is_none() {
                 Ind::pending(t, cfg)
             } else {
-                Ind::evaluated_fitted(t, fitted, self.gen_data, cfg) // #87
+                gate_fit(None, before, Ind::evaluated_fitted(t, fitted, self.gen_data, cfg), self.gen_data, cfg) // #87 #1078
             };
         }
         self.rngs[island] = r;
@@ -1044,10 +1047,16 @@ mod tests {
                             t
                         });
                         let mut fitted = None;
+                        let mut before = None; // #1078
                         if cfg.fit_iters > 0 && !gen_train.is_multi() && !defers_fit_to_gpu(cfg, defer_gpu) {
+                            before = pre_fit_tree(cfg, &t);
                             fitted = fit_constants(&mut t, cfg, fit_train, gen_train);
                         }
-                        *ind = if defer_gpu { Ind::pending(t, cfg) } else { Ind::evaluated_fitted(t, fitted, gen_data, cfg) };
+                        *ind = if defer_gpu && before.is_none() {
+                            Ind::pending(t, cfg)
+                        } else {
+                            gate_fit(None, before, Ind::evaluated_fitted(t, fitted, gen_data, cfg), gen_data, cfg)
+                        };
                     }
                     rngs[ii] = r;
                     stagnant[ii] = 0;

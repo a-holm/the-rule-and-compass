@@ -1472,6 +1472,12 @@ Why the constants keep the metric fit. A fixed linear structure (`[1, tanh z24, 
 
 The P&L-aligned fits raise train net but not validation net. Turnover is set by the structure, not by the constants, so the leverage is in ranking structures by exact P&L.
 
+#### `--fit-accept fitness`: keep a fit only when the fitness is not worse (#1078)
+
+Under `--fitness pnl` a candidate is changed by two objectives in a row: the fit minimises `--metric` (squared error on the label), then the long/flat regret scores the tree. The position is `1[pred > threshold]`, so only the sign boundary of the prediction matters to the score, and the squared-error fit puts it where the regression wants it. `--fit-accept fitness` scores the candidate with its pre-fit constants too and keeps the fitted tree unless the unfitted one has a strictly lower error (or a finite error against a non-finite one). A tie keeps the fitted tree, so under the metric fitness on the scoring rows, where the fit does not raise the error, the rule changes nothing except the extra score. The comparison is exact (`<` on the stored errors) and a pure function of the two scores, so it draws no random number and does not depend on `--threads`.
+
+Where it runs: the CPU offspring fit, the restart fill, `refit_and_reeval` (the carried members under `--predictor-samples`), `GpuSearch::score` (the pre-fit score is the screening score of every candidate, the snapshot is taken before the redundant-constant fold, so the device fit, the CPU tail and the fallback fits all pass through it), the CPU refit after a lost device batch, `refit_survivor` (screening survivors), `refit_exact` (finalists) and the prune refit. A CPU fit under a device score is scored on the CPU under `fitness`. The overlap pipeline has no pre-fit score; `pipeline_fit_safe` is false under `fitness` and the synchronous fit batches run. The setting travels with `FitSettings` (`src/search/fit_route.rs`) and `Config`, never in a thread-local, so pool threads and scoped threads see it.
+
 #### `--book-target COL`: fit on one label, price the book on another
 
 `--book-target COL` names a second `forward_return` label of the `--target-spec` file. The constants are fitted with `--metric` on `--target`; the long/flat book (the `--fitness pnl` regret, the validation and test books) is priced on `COL`.

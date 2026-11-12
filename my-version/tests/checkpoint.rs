@@ -1962,3 +1962,42 @@ fn resume_ignores_sidecar_from_other_generation() {
     let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
     assert!(matches!(cumulative.get("complete"), Some(rcsr::devlog::Json::Bool(false))), "{cumulative:?}");
 }
+
+fn accept_config(generations: usize, accept: search::FitAccept) -> Config {
+    Config { fit_iters: 3, fit_accept: accept, ..island_config(9, generations) }
+}
+
+#[test]
+fn a_fit_accept_fitness_run_and_its_resume_match_exactly() {
+    let train = sample(240);
+    let test = sample(80);
+    let (uninterrupted, full_text, _) = island_run(&accept_config(30, search::FitAccept::Fitness), None, &train, &test);
+    assert!(full_text.contains("config fit_accept fitness\n"));
+
+    let (_, saved_text, _) = island_run(&accept_config(15, search::FitAccept::Fitness), None, &train, &test);
+    let saved = Checkpoint::from_text(&saved_text).expect("parse saved checkpoint");
+    let (resumed, resumed_text, _) =
+        island_run(&accept_config(30, search::FitAccept::Fitness), Some(saved), &train, &test);
+    assert_eq!(describe(&uninterrupted), describe(&resumed), "the archive");
+    assert_eq!(full_text, resumed_text, "archive, populations and rng state of the exit checkpoint");
+}
+
+#[test]
+fn a_default_checkpoint_has_no_fit_accept_key_and_a_fitness_one_resumes_only_under_fitness() {
+    let (_, always_text, _) = island_run(&accept_config(6, search::FitAccept::Always), None, &sample(100), &sample(30));
+    assert!(!always_text.contains("fit_accept"));
+    let (_, text, _) = island_run(&accept_config(6, search::FitAccept::Fitness), None, &sample(100), &sample(30));
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    let err = expect_err(
+        search::run_resumable(
+            &accept_config(6, search::FitAccept::Always),
+            &sample(100),
+            &sample(30),
+            Some(saved),
+            0,
+            |_| {},
+        ),
+        "resume under always",
+    );
+    assert!(err.contains("fit_accept"), "{err}");
+}

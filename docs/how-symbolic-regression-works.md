@@ -129,6 +129,10 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
 - **Constant fitting** tunes the numeric constants of a candidate by local
   search. Without it, `y = a·sin(b·x) + c` would almost never be found, because
   random constants rarely land near the right values.
+  By default every fit is kept. `--fit-accept fitness` (#1078) keeps the fitted
+  constants only when the search fitness is not worse than with the constants
+  before the fit; under `--fitness pnl` this protects a profitable sign boundary
+  from the squared-error fit.
 - **Migration** periodically copies an island's best member into a neighbouring
   island; **stagnant islands are restarted** to avoid getting stuck. Every
   restart interval (60 generations) the default rule (`--restart-policy archive`)

@@ -36,6 +36,7 @@ fn sample(row: &dyn Setting) -> Option<&'static str> {
         "--restart-isolation" => "7",
         "--mutation-mix" => "extended",
         "--crossover-internal" => "0.25",
+        "--fit-accept" => "fitness",
         other => panic!("no sample value for {other}: add one to tests/settings_table.rs"),
     })
 }
@@ -204,6 +205,7 @@ fn resume_conflict_lines_are_pinned() {
         .args(["--resume", cp, "--patience", "7", "--selection", "afp", "--restart-policy", "archive"])
         .args(["--restart-isolation", "7", "--mutation-mix", "extended", "--crossover-internal", "0.25"])
         .args(["--adaptive-mix", "--reject-constant-offspring", "--reject-fixed-position", "--fit-thresholds"])
+        .args(["--fit-accept", "fitness"])
         .output()
         .expect("run the resume");
     assert_eq!(resumed.status.code(), Some(2), "{}", String::from_utf8_lossy(&resumed.stderr));
@@ -222,6 +224,7 @@ fn resume_conflict_lines_are_pinned() {
             "--reject-constant-offspring (saved reject_constant_offspring is false)",
             "--reject-fixed-position (saved reject_fixed_position is false)",
             "--fit-thresholds (saved fit_thresholds is false)",
+            "--fit-accept fitness (saved fit_accept is always)",
         ],
         "{err}"
     );
