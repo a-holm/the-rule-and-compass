@@ -213,6 +213,8 @@ the pinned 4M-row benchmark protocol and the measured wall time.
 
 The long-only evaluation protocol builds on it: the UTC windows table `protocol/windows.csv`, a purge of `--entry-offset + --horizon + --delay`, an economics block (Sortino, Calmar, CVaR, break-even cost (null with a `break_even_status` when gross is not positive or no cost was paid), cost ladder, cash, buy-and-hold and equal-weight benchmarks with exposure and beta), a circular block bootstrap with a design effect (`--bootstrap`), block-permutation and matched-exposure nulls (`--null-draws`), DSR, PBO, SPA and BH-FDR, and a candidate ledger with a sealed list and a one-read locked test (`--ledger`, `--locked-test`, `rcsr protocol`). See the "Long-only evaluation protocol" section of [`docs/walkforward.md`](docs/walkforward.md).
 
+A walk-forward period is one label horizon `S` wide (the bucket `floor(t / S)`, equal-weight mean of its rows; without a declared horizon a period is one timestamp) and `periods_per_year = 31536000 / S`, so 8760 for hourly labels, 365 for daily and 52.14 for 168 h. `S` comes from the target spec, else `--horizon`, else the median step of labelled rows. `annualization.source` and `annualization.period_seconds` say which. A `--periods-per-year` that conflicts with the target spec exits 2. The search objective uses the same period rule and reports `net_per_row_annualised`.
+
 The search objective, `walkforward`, `ablation score` and `ladder` price one book: the cost (`cost_bps / 2` per side), the return units (`log` is converted with `exp_m1`) and the label window come from the target spec, and `rcsr walkforward --from-run run.json` / `rcsr ablation score --from-run run.json` take the expression, the fixed threshold and the cost of the book the search selected. A `--cost-bps` that differs from the spec is refused; `--cost-override` prices another cost on purpose. Every report carries `cost: {per_side_bps, source, return_units}`, and `rcsr enrich --label long:<h>` needs an explicit `fee=`. See the "One book from search to evaluation" section of [`docs/walkforward.md`](docs/walkforward.md).
 
 Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
@@ -662,7 +664,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring] [--reject-fixed-position]
-     [--selection lexicographic|afp]
+     [--selection lexicographic|afp] [--restart-policy archive|island] [--restart-isolation N]
      [--mutation-mix classic|extended] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
      [--patience N]
@@ -831,7 +833,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   `ablation score` then refuse any split or window that touches it (exit 3).
   Only `walkforward --locked-test` and `ladder --locked-test`, both with
   `--ledger` and `--sealed`, read it, once each; both write `--out` and `--markdown` before the
-  read is recorded and take `--verify-read` to recompute a recorded read (see
+  read is recorded and take `--verify-read` to recompute a recorded read (`walkforward` refuses a candidate with no recorded read before any locked row is scored, and `--expect-report-sha256` needs `--verify-read`) (see
   [`docs/walkforward.md`](docs/walkforward.md#report-files-of-a-locked-read)); see
   [`docs/panel.md`](docs/panel.md#the-declared-locked-test).
 * `--train-select` / `--test-select` assign rows by expression (`> 0` is true)
@@ -1263,6 +1265,14 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   crowding distance, a few random immigrants join each generation, and parents
   are drawn by Pareto rank. Small correct shapes and new lineages survive next
   to large approximations. Node path only; the default stays `lexicographic`;
+- **opt-in island-local restarts** (`--restart-policy island`, `--restart-isolation W`):
+  the default rule restarts an island only while its best is worse than the
+  archive best, which ring migration makes false for every island within a few
+  migration intervals. `island` restarts an island whose own best error has not
+  improved for one restart interval (never the keeper that holds the archive
+  best) and keeps it from front parents and migrants for `W` generations
+  (default 25). Node and flat postfix paths. Saved search setting; the default
+  stays `archive`;
 - **opt-in quality-diversity search** (`--qd`, `--qd-cvt`, `--qd-policy`,
   `--qd-cells`, `--qd-cell-cap`): CVT-MAP-Elites over variable usage ×
   prediction skewness, with deterministic Halton initialisation, Lloyd

@@ -393,6 +393,9 @@ pub struct Knobs {
     pub restart_interval: Option<usize>,
     pub variation: Option<crate::search::VariationMode>,
     pub selection: Option<crate::search::Selection>,
+    /// #1022: the restart rule and its isolation window.
+    pub restart_policy: Option<crate::search::RestartPolicy>,
+    pub restart_isolation: Option<usize>,
     pub dispatch: Option<crate::dispatch::DispatchMode>,
     /// #466: `Some(true)` turns the front prune on (`--prune`).
     pub prune: Option<bool>,
@@ -785,6 +788,12 @@ fn base_config(cfg: &SuiteConfig, seed: u32) -> Config {
     }
     if let Some(v) = k.selection {
         sc.selection = v;
+    }
+    if let Some(v) = k.restart_policy {
+        sc.restart_policy = v;
+    }
+    if let Some(v) = k.restart_isolation {
+        sc.restart_isolation = v;
     }
     if let Some(v) = k.dispatch {
         sc.dispatch = v;
@@ -1498,7 +1507,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
     };
     let opt_u = |v: Option<usize>| json_opt(v);
     format!(
-        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"selection\":{},\"dispatch\":{},\"fit_polish\":{},\"reject_constant_offspring\":{},\"mutation_mix\":{},\"crossover_internal\":{},\"adaptive_mix\":{},\"prune\":{},\"fit_irls\":{}{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
+        "{{\"generator\":\"{}\",\"threshold\":{},\"signal_threshold\":{},\"knobs\":{{\"generations\":{},\"islands\":{},\"pop\":{},\"metric\":\"{}\",\"time_budget\":{},\"front_parents\":{},\"fit_strategy\":\"{}\",\"fit_iters\":{},\"ops\":{},\"max_complexity\":{},\"patience\":{},\"migration_interval\":{},\"restart_interval\":{},\"variation\":{},\"selection\":{},\"restart_policy\":{},\"restart_isolation\":{},\"dispatch\":{},\"fit_polish\":{},\"reject_constant_offspring\":{},\"mutation_mix\":{},\"crossover_internal\":{},\"adaptive_mix\":{},\"prune\":{},\"fit_irls\":{}{}}},\"build\":{{\"version\":\"{}\",\"cuda\":{},\"backend\":\"{}\",\"jobs\":{},\"threads\":{},\"git\":\"{}\"}}}}",
         GENERATOR_VERSION,
         json_number(cfg.threshold),
         json_number(SIGNAL_THRESHOLD),
@@ -1517,6 +1526,8 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
         opt_u(k.restart_interval),
         k.variation.map_or("null".to_string(), |v| format!("\"{}\"", v.as_str())),
         k.selection.map_or("null".to_string(), |v| format!("\"{}\"", v.as_str())),
+        k.restart_policy.map_or("null".to_string(), |v| format!("\"{}\"", v.as_str())),
+        opt_u(k.restart_isolation),
         k.dispatch.map_or("null".to_string(), |v| format!("\"{}\"", v.name())),
         k.fit_polish.map_or("null".to_string(), |v| format!("\"{}\"", v.name())),
         k.reject_constant_offspring,

@@ -462,7 +462,7 @@ fn walkforward_front_of_a_real_run_guards_the_seen_rows() {
         rcsr_cmd::rcsr()
             .args([
                 "walkforward", "--data", &data, "--time", "t", "--front", &run_path, "--window", &window,
-                "--horizon", "900", "--periods-per-year", "365", "--validation-frac", "0.3", "--json",
+                "--horizon", "900", "--validation-frac", "0.3", "--json",
             ])
             .output()
             .unwrap()
@@ -574,7 +574,7 @@ fn walk_from_run(data: &str, run_path: &str, test_start: f64, purge: f64, extra:
     rcsr_cmd::rcsr()
         .args([
             "walkforward", "--data", data, "--time", "t", "--from-run", run_path, "--window", &window,
-            "--horizon", "900", "--periods-per-year", "365", "--json",
+            "--horizon", "900", "--json",
         ])
         .args(extra)
         .output()
@@ -621,7 +621,7 @@ fn walk_table(extra: &[&str]) -> Output {
         .args([
             "walkforward", "--data", &data, "--time", "t", "--target", "r", "--vars", "x1,x2",
             "--windows", &table_path.to_string_lossy(), "--windows-scheme", "expanding", "--horizon", "900",
-            "--periods-per-year", "365", "--json",
+            "--json",
         ])
         .args(extra)
         .output()
@@ -663,7 +663,7 @@ fn windows_table_still_refuses_validation_frac_and_missing_slice() {
         .args([
             "walkforward", "--data", &data, "--time", "t", "--target", "r", "--vars", "x1,x2", "--expr", "x1",
             "--expr", "x2", "--window", &format!("w,{},{},{},{}", T0, T0 + 900 * 250, T0 + 900 * 260, T0 + 900 * 399),
-            "--horizon", "900", "--periods-per-year", "365",
+            "--horizon", "900",
         ])
         .output()
         .unwrap();

@@ -789,6 +789,138 @@ fn help_and_schema_document_checkpoints() {
     }
 }
 
+fn island_config(seed: u32, generations: usize) -> Config {
+    Config {
+        generations,
+        islands: 3,
+        pop: 24,
+        max_complexity: 10,
+        fit_iters: 2,
+        migration_interval: 3,
+        restart_interval: 4,
+        restart_policy: search::RestartPolicy::Island,
+        restart_isolation: 7,
+        patience: 0,
+        seed,
+        ..Default::default()
+    }
+}
+
+/// The exit checkpoint text and the restart count of one run.
+fn island_run(
+    cfg: &Config,
+    resume: Option<Checkpoint>,
+    train: &Sample,
+    test: &Sample,
+) -> (Outcome, String, u64) {
+    let restarts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sink = restarts.clone();
+    let cfg = Config {
+        dev_log: Some(std::sync::Arc::new(move |r: &rcsr::devlog::GenRecord| {
+            sink.store(r.restarts_total, std::sync::atomic::Ordering::SeqCst);
+        })),
+        ..cfg.clone()
+    };
+    let mut text: Option<String> = None;
+    let out = search::run_resumable(&cfg, train, test, resume, 0, |cp| text = Some(cp.to_text()))
+        .expect("island run");
+    (out, text.expect("exit checkpoint"), restarts.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[test]
+fn an_island_policy_run_and_its_resume_match_exactly() {
+    let train = sample(240);
+    let test = sample(80);
+    let (uninterrupted, full_text, restarts) = island_run(&island_config(11, 40), None, &train, &test);
+    assert!(restarts > 0, "the fixture restarts an island, else the resume proves nothing");
+    assert!(full_text.contains("config restart_policy island\n"));
+    assert!(full_text.contains("config restart_isolation 7\n"));
+    assert_eq!(full_text.matches("\nisland_stall ").count(), 3, "one record per island");
+
+    let (_, saved_text, _) = island_run(&island_config(11, 20), None, &train, &test);
+    let saved = Checkpoint::from_text(&saved_text).expect("parse saved checkpoint");
+    let (resumed, resumed_text, _) =
+        island_run(&island_config(11, 40), Some(saved), &train, &test);
+
+    assert_eq!(describe(&uninterrupted), describe(&resumed), "the archive");
+    assert_eq!(
+        full_text, resumed_text,
+        "archive, populations, rng state and island_stall counters of the exit checkpoint"
+    );
+}
+
+#[test]
+fn an_archive_policy_checkpoint_keeps_its_bytes() {
+    let text = checkpoint_text(&config(3), &sample(60), &sample(20));
+    assert!(!text.contains("island_stall"));
+    assert!(!text.contains("restart_policy"));
+    assert!(!text.contains("restart_isolation"));
+}
+
+#[test]
+fn an_island_checkpoint_resumes_only_under_its_own_policy() {
+    let train = sample(100);
+    let test = sample(30);
+    let (_, text, _) = island_run(&island_config(5, 8), None, &train, &test);
+
+    let archive_cfg = Config { restart_policy: search::RestartPolicy::Archive, ..island_config(5, 8) };
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    let err = expect_err(
+        search::run_resumable(&archive_cfg, &train, &test, Some(saved), 0, |_| {}),
+        "resume under archive",
+    );
+    assert!(err.contains("restart_policy"), "{err}");
+
+    let isolation_cfg = Config { restart_isolation: 9, ..island_config(5, 8) };
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    let err = expect_err(
+        search::run_resumable(&isolation_cfg, &train, &test, Some(saved), 0, |_| {}),
+        "resume under another isolation",
+    );
+    assert!(err.contains("restart_isolation"), "{err}");
+
+    let stripped: String = text
+        .lines()
+        .filter(|l| !l.starts_with("island_stall "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let err = expect_err(Checkpoint::from_text(&stripped), "island checkpoint without records");
+    assert!(err.contains("island_stall"), "{err}");
+}
+
+#[test]
+fn cli_resume_of_an_island_checkpoint_exits_2_naming_restart_policy() {
+    let csv = TempPath::new("island.csv");
+    std::fs::write(&csv.0, line_csv(40)).expect("write csv");
+    let checkpoint = TempPath::new("island.rcsr");
+    let base = ["--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "2", "--pop", "25"];
+
+    let mut made_args = base.to_vec();
+    made_args.extend(["--generations", "5", "--restart-policy", "island", "--restart-isolation", "7", "--save", checkpoint.as_str()]);
+    let made = rcsr(&made_args);
+    assert!(made.status.success(), "save run failed: {:?}", made);
+    let saved = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
+    assert!(saved.contains("config restart_policy island\n") && saved.contains("island_stall 0 "));
+
+    let mut conflict_args = base.to_vec();
+    conflict_args.extend(["--resume", checkpoint.as_str(), "--restart-policy", "archive"]);
+    let conflict = rcsr(&conflict_args);
+    assert_eq!(conflict.status.code(), Some(2), "a contradictory policy is a usage error");
+    let err = String::from_utf8_lossy(&conflict.stderr);
+    assert!(err.contains("restart_policy"), "the error must name restart_policy: {}", err);
+
+    let mut isolation_args = base.to_vec();
+    isolation_args.extend(["--resume", checkpoint.as_str(), "--restart-isolation", "9"]);
+    let isolation = rcsr(&isolation_args);
+    assert_eq!(isolation.status.code(), Some(2), "a contradictory isolation is a usage error");
+    assert!(String::from_utf8_lossy(&isolation.stderr).contains("restart_isolation"));
+
+    let mut resume_args = base.to_vec();
+    resume_args.extend(["--resume", checkpoint.as_str()]);
+    let resumed = rcsr(&resume_args);
+    assert!(resumed.status.success(), "a resume that omits the flags keeps the saved policy: {:?}", resumed);
+}
+
 #[test]
 fn cli_resume_errors_use_the_documented_exit_codes() {
     let csv = TempPath::new("cli.csv");

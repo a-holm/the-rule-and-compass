@@ -1,4 +1,4 @@
-//! Island-model, multi-obje        c.map(|c| Self::get(field(c))).unwrap_or(0)tive evolutionary search.
+//! Island-model, multi-objective evolutionary search.
 //!
 //! A population of expression individuals evolves on separate islands, tracked
 //! against a global Pareto front over (error, complexity), with generations,
@@ -26,8 +26,6 @@ use crate::metrics::{score_weighted, Metric};
 // #15: multi-output combined error and per-output constant fitting.
 use crate::multi;
 use crate::pareto::{Archive, Sol};
-#[cfg(feature = "cuda")]
-#[cfg(feature = "cuda")]
 #[cfg(feature = "cuda")]
 use crate::postfix::{unique_slots, Arena, FrontParents, Variation};
 // #18: convergence statistics live in their own module; the search only calls
@@ -99,6 +97,39 @@ impl Selection {
             "afp" => Ok(Selection::Afp),
             other => Err(format!(
                 "selection must be 'lexicographic' or 'afp', got '{}'",
+                other
+            )),
+        }
+    }
+}
+
+/// #1022: which stall rule restarts an island.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RestartPolicy {
+    /// An island restarts after two checks 60 generations apart in which its
+    /// best error is worse than the archive's.
+    #[default]
+    Archive,
+    /// An island restarts when its own best error has not improved for one
+    /// restart interval, unless it is the keeper; a restarted island is
+    /// isolated from front parents and migrants.
+    Island,
+}
+
+impl RestartPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RestartPolicy::Archive => "archive",
+            RestartPolicy::Island => "island",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "archive" => Ok(RestartPolicy::Archive),
+            "island" => Ok(RestartPolicy::Island),
+            other => Err(format!(
+                "restart policy must be 'archive' or 'island', got '{}'",
                 other
             )),
         }
@@ -377,6 +408,11 @@ pub struct Config {
     pub variation: VariationMode,
     /// #465: survivor and parent selection inside an island.
     pub selection: Selection,
+    /// #1022: which stall rule restarts an island. Saved search setting.
+    pub restart_policy: RestartPolicy,
+    /// #1022: generations a restarted island takes no front parent and no
+    /// migrant. Read only under `--restart-policy island`.
+    pub restart_isolation: usize,
     /// #471: the node-path edit weights. Changes the trajectory, so it is a
     /// saved search setting.
     pub mutation_mix: MutationMix,
@@ -607,6 +643,12 @@ fn fit_and_score(
 /// cell admitted at most 540 per generation.
 pub const DEFAULT_FIT_FALLBACK_MAX: usize = 4096;
 
+/// #1032: chunks a submission can queue without blocking the submitter; the
+/// largest per-generation tail is `--fit-fallback-max` (4096) and a generation
+/// never checks more slots than it has candidates.
+#[cfg(feature = "cuda")]
+const FALLBACK_QUEUE_CHUNKS: usize = 4096;
+
 /// #466: default `--prune-rows`.
 pub const DEFAULT_PRUNE_ROWS: usize = 20_000;
 /// #466: default `--prune-budget`.
@@ -684,6 +726,8 @@ impl Default for Config {
             fit_tail_overlap: true,
             variation: VariationMode::Auto,
             selection: Selection::Lexicographic,
+            restart_policy: RestartPolicy::Archive,
+            restart_isolation: 25,
             mutation_mix: MutationMix::Classic,
             crossover_internal: 0.0,
             adaptive_mix: false,
@@ -750,6 +794,10 @@ impl Config {
         compare!(refit_band, "refit_band"); // #495
         compare!(front_parents, "front_parents"); // #76
         compare!(selection, "selection"); // #465
+        compare!(restart_policy, "restart_policy"); // #1022
+        if self.restart_policy == RestartPolicy::Island {
+            compare!(restart_isolation, "restart_isolation"); // #1022
+        }
         compare!(qd_bins, "qd_bins"); // #120
         compare!(qd_cell_cap, "qd_cell_cap"); // #120
         compare!(qd_cvt, "qd_cvt"); // #120
@@ -1380,7 +1428,7 @@ impl GpuSearch {
                     check_pieces: None,
                     fallback: Some(FallbackPool::new(
                         fallback_workers(fallback_threads),
-                        fallback_workers(fallback_threads),
+                        FALLBACK_QUEUE_CHUNKS,
                     )),
                     fallback_workers: fallback_workers(fallback_threads),
                     fit_attempts: 0,
@@ -3046,9 +3094,8 @@ struct FallbackResult {
 
 #[cfg(feature = "cuda")]
 impl FallbackPool {
-    /// Spawn `workers` named worker threads. `queue` bounds the number of
-    /// chunks waiting in the channel; with `queue == workers` at most
-    /// `2 * workers` chunks are in flight (one running per worker, one queued).
+    /// Spawn `workers` named worker threads. `queue` chunks can wait in the
+    /// channel; a submission blocks only above it.
     fn new(workers: usize, queue: usize) -> Self {
         let workers = workers.max(1);
         let queue = queue.max(1);
@@ -3184,9 +3231,7 @@ impl FallbackPool {
         );
         let total = jobs.len();
         let started = std::time::Instant::now();
-        // Contiguous, fixed-size chunks: ~4 chunks per worker keeps the queue
-        // fed without making the channel the bottleneck.
-        let chunk_len = total.div_ceil(self.workers * 4).max(1);
+        let chunk_len = 1;
         let blocks = expr::current_blocks();
         let (done_tx, done) = std::sync::mpsc::channel::<FallbackResult>();
         let mut ticket = FallbackTicket {
@@ -6214,6 +6259,72 @@ fn tournament(island: &[Ind], rng: &mut Mt, k: usize) -> usize {
 // the island tournament already does.
 const FRONT_PARENT_P: f64 = 0.15;
 
+/// #1022: counts the front-parent draws of each island in a test run. The island
+/// threads tag themselves with the run seed and their index; a thread without a
+/// tag is not counted.
+#[cfg(test)]
+pub(crate) mod front_draw_tag {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    thread_local! {
+        static TAG: Cell<Option<(u32, usize)>> = const { Cell::new(None) };
+    }
+    static DRAWS: Mutex<Option<HashMap<(u32, usize), usize>>> = Mutex::new(None);
+
+    pub fn set(seed: u32, island: usize) {
+        TAG.with(|t| t.set(Some((seed, island))));
+    }
+
+    pub fn record() {
+        if let Some(tag) = TAG.with(|t| t.get()) {
+            let mut map = DRAWS.lock().unwrap();
+            *map.get_or_insert_with(HashMap::new).entry(tag).or_insert(0) += 1;
+        }
+    }
+
+    pub fn count(seed: u32, island: usize) -> usize {
+        let map = DRAWS.lock().unwrap();
+        map.as_ref().and_then(|m| m.get(&(seed, island)).copied()).unwrap_or(0)
+    }
+}
+
+/// #1022: records each island's population hash just before and after every
+/// migration step of a test run, with the islands that were isolated at that
+/// moment.
+#[cfg(test)]
+pub(crate) mod migration_probe {
+    use super::Ind;
+    use std::sync::Mutex;
+
+    pub type Step = (u32, usize, Vec<bool>, Vec<u64>, Vec<u64>);
+    static LOG: Mutex<Vec<Step>> = Mutex::new(Vec::new());
+
+    pub(super) fn hashes(islands: &[Vec<Ind>]) -> Vec<u64> {
+        islands
+            .iter()
+            .map(|pop| {
+                pop.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, ind| {
+                    let h = (h ^ crate::expr::structural_hash(&ind.tree)).wrapping_mul(0x0000_0100_0000_01b3);
+                    (h ^ ind.error.to_bits()).wrapping_mul(0x0000_0100_0000_01b3)
+                })
+            })
+            .collect()
+    }
+
+    pub fn record(seed: u32, gens_done: usize, isolated: Vec<bool>, before: Vec<u64>, after: Vec<u64>) {
+        LOG.lock().unwrap().push((seed, gens_done, isolated, before, after));
+    }
+
+    pub fn take(seed: u32) -> Vec<Step> {
+        let mut log = LOG.lock().unwrap();
+        let (mine, rest): (Vec<Step>, Vec<Step>) = log.drain(..).partition(|s| s.0 == seed);
+        *log = rest;
+        mine
+    }
+}
+
 /// #76: optionally draw a parent tree from the front.
 ///
 /// Returns `None` without touching the RNG when the feature is off (`p == 0`)
@@ -6222,6 +6333,10 @@ const FRONT_PARENT_P: f64 = 0.15;
 /// different row subset (`--predictor-samples`), and the child is always scored
 /// on the generation's own sample anyway.
 fn front_parent<'a>(front: &'a [Sol], rng: &mut Mt, p: f64) -> Option<&'a Node> {
+    #[cfg(test)]
+    if p > 0.0 && !front.is_empty() {
+        front_draw_tag::record();
+    }
     if p > 0.0 && !front.is_empty() && rng.bool(p) {
         Some(&front[rng.usize_below(front.len())].tree)
     } else {
@@ -7217,6 +7332,122 @@ fn checkpoint_due(save_every: usize, gens_done: usize, since_last: f64, interval
     save_every > 0 && (gens_done % save_every == 0 || since_last >= interval_s)
 }
 
+/// #1022: report one generation's development-log record once its restarts are
+/// known.
+fn flush_dev_generation(
+    cfg: &Config,
+    rec: Option<crate::devlog::GenRecord>,
+    restarts: usize,
+    restarts_total: u64,
+    state: Option<&RestartState>,
+) {
+    if let (Some(report), Some(mut rec)) = (&cfg.dev_log, rec) {
+        rec.restarts = restarts;
+        rec.restarts_total = restarts_total;
+        rec.isolated = state.map_or(0, |s| s.isolated_count());
+        report(&rec);
+    }
+}
+
+/// #1022: per-island restart bookkeeping under `--restart-policy island`.
+/// Every counter is a pure function of the trajectory; nothing here draws from
+/// an RNG.
+#[derive(Clone, Debug, PartialEq)]
+struct RestartState {
+    /// Generations since each island's best error last improved.
+    since_improve: Vec<usize>,
+    /// Generations of isolation left after a restart.
+    isolated: Vec<usize>,
+    /// Each island's best error so far (`+inf` at the start and after a restart).
+    best_prev: Vec<f64>,
+}
+
+impl RestartState {
+    fn new(islands: usize) -> Self {
+        RestartState {
+            since_improve: vec![0; islands],
+            isolated: vec![0; islands],
+            best_prev: vec![f64::INFINITY; islands],
+        }
+    }
+
+    /// The saved counters of a resume; a checkpoint written under the archive
+    /// policy has none.
+    fn from_saved(saved: &[Option<crate::checkpoint::IslandStall>]) -> Result<Self, String> {
+        let mut state = RestartState::new(saved.len());
+        for (i, stall) in saved.iter().enumerate() {
+            let stall = stall.ok_or_else(|| {
+                "checkpoint has no island_stall records; it was written under --restart-policy archive"
+                    .to_string()
+            })?;
+            state.since_improve[i] = stall.since_improve;
+            state.isolated[i] = stall.isolated;
+            state.best_prev[i] = stall.best_prev;
+        }
+        Ok(state)
+    }
+
+    fn saved(&self, island: usize) -> crate::checkpoint::IslandStall {
+        crate::checkpoint::IslandStall {
+            since_improve: self.since_improve[island],
+            isolated: self.isolated[island],
+            best_prev: self.best_prev[island],
+        }
+    }
+
+    /// One generation's stall update, after the archive update. `island_best`
+    /// is each island's best error.
+    fn tick(&mut self, island_best: &[f64]) {
+        for (ii, &cur) in island_best.iter().enumerate() {
+            if cur.is_finite() && !crate::progress_stats::no_improvement(self.best_prev[ii], cur) {
+                self.since_improve[ii] = 0;
+            } else {
+                self.since_improve[ii] += 1;
+            }
+            self.best_prev[ii] = self.best_prev[ii].min(cur);
+            self.isolated[ii] = self.isolated[ii].saturating_sub(1);
+        }
+    }
+
+    /// The lowest island whose best error equals the archive's; it is never
+    /// restarted. `None` when no island holds the archive best.
+    fn keeper(island_best: &[f64], arch_best: f64) -> Option<usize> {
+        island_best.iter().position(|&b| b == arch_best)
+    }
+
+    fn due(&self, island: usize, keeper: Option<usize>, interval: usize) -> bool {
+        self.since_improve[island] >= interval && Some(island) != keeper
+    }
+
+    fn restarted(&mut self, island: usize, isolation: usize) {
+        self.since_improve[island] = 0;
+        self.best_prev[island] = f64::INFINITY;
+        self.isolated[island] = isolation;
+    }
+
+    fn is_isolated(&self, island: usize) -> bool {
+        self.isolated[island] > 0
+    }
+
+    /// The global-front parent probability of `island` this generation.
+    fn front_p(&self, island: usize, base: f64) -> f64 {
+        if self.is_isolated(island) {
+            0.0
+        } else {
+            base
+        }
+    }
+
+    fn isolated_count(&self) -> usize {
+        self.isolated.iter().filter(|&&w| w > 0).count()
+    }
+}
+
+/// Best error of one population.
+fn population_best(pop: &[Ind]) -> f64 {
+    pop.iter().map(|i| i.error).fold(f64::INFINITY, f64::min)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn snapshot(
     cfg: &Config,
@@ -7229,6 +7460,7 @@ fn snapshot(
     islands: &[Vec<Ind>],
     rngs: &[Mt],
     stagnant: &[usize],
+    restart: Option<&RestartState>, // #1022
     mixes: &[MixWindow],
     main_rng: &Mt,
     train: &Sample,
@@ -7262,6 +7494,7 @@ fn snapshot(
                 IslandState {
                     rng: Mt::from_state(*words, idx),
                     mix: mixes.get(i).cloned().unwrap_or_default(),
+                    stall: restart.map(|r| r.saved(i)),
                     population: pop.iter().map(Ind::to_checkpoint).collect(),
                 }
             })
@@ -7790,6 +8023,9 @@ fn dev_generation(
         percent_converged: convergence.percent_converged,
         island_best,
         rng_key,
+        restarts: 0,
+        restarts_total: 0,
+        isolated: 0,
     }
 }
 
@@ -7813,6 +8049,7 @@ fn run_postfix_search(
     rngs: Vec<Mt>,
     main_rng: Mt,
     mut stagnant: Vec<usize>,
+    mut restart_state: Option<RestartState>, // #1022
     mut gens_done: usize,
     mut converged_early: bool,
     mut best_prev: f64,
@@ -7840,6 +8077,7 @@ fn run_postfix_search(
     let mut progress_stats = ProgressStats::new(crate::progress_stats::DEFAULT_WINDOW);
     let mut gpu_stats: Vec<GpuGenStats> = Vec::new();
     let mut restart_flags = vec![false; n_islands];
+    let mut restarts_total = 0u64; // #1022
     let t0 = std::time::Instant::now();
     // #284: run clock and ledger for the flat path.
     let mut run_ledger = crate::gpu_stats::RunLedger::new();
@@ -7890,12 +8128,16 @@ fn run_postfix_search(
         } else {
             0.0
         };
+        // #1022: an isolated island draws no front parent.
+        let front_ps: Vec<f64> = (0..n_islands)
+            .map(|i| restart_state.as_ref().map_or(front_p, |r| r.front_p(i, front_p)))
+            .collect();
         let mut next = variation.next_generation_with_front(
             &pool,
             gen as u32,
             &restart_flags,
             &front,
-            front_p,
+            &front_ps,
         );
         let dev_generate = dev_lap(&mut dev_mark); // #211
         let stage_generate = stage_lap(&mut stage_mark); // #284
@@ -7938,8 +8180,20 @@ fn run_postfix_search(
                 archive.try_insert_view(&tree, error, expr::complexity(&tree), cost);
             }
         }
+        let mut dev_rec: Option<crate::devlog::GenRecord> = None; // #1022: reported after the restart step
         let dev_archive = dev_lap(&mut dev_mark); // #211
         let stage_archive = stage_lap(&mut stage_mark); // #284
+        // #1022: each island's own stall, after the archive update.
+        if let Some(rs) = restart_state.as_mut() {
+            let bests: Vec<f64> = (0..n_islands)
+                .map(|i| {
+                    (0..pop)
+                        .map(|j| next.err[next.slot_index(i, j)])
+                        .fold(f64::INFINITY, f64::min)
+                })
+                .collect();
+            rs.tick(&bests);
+        }
         run_ledger.record_stage(crate::gpu_stats::Stage::Vary, stage_generate);
         run_ledger.record_stage(crate::gpu_stats::Stage::Archive, stage_archive);
         eval_stage_total += stage_eval;
@@ -8000,7 +8254,7 @@ fn run_postfix_search(
         if let Some(observe) = &cfg.front_observer {
             observe(gens_done, t0.elapsed().as_secs_f64(), &archive);
         }
-        if let Some(report) = &cfg.dev_log {
+        if cfg.dev_log.is_some() {
             let mut dev_errors: Vec<f64> = Vec::with_capacity(n_islands * pop);
             let mut dev_island_best: Vec<f64> = Vec::with_capacity(n_islands);
             for i in 0..n_islands {
@@ -8052,7 +8306,7 @@ fn run_postfix_search(
                 g.native = gs.native;
                 g.fallbacks = gs.fallbacks;
             }
-            report(&rec);
+            dev_rec = Some(rec);
         }
 
         if gen_best.is_finite() {
@@ -8072,9 +8326,13 @@ fn run_postfix_search(
             }
         }
 
+        let mut restarts_now = 0usize; // #1022
         if n_islands > 1 && cfg.migration_interval > 0 && (gen + 1) % cfg.migration_interval == 0
         {
-            next.migrate();
+            let skip: Vec<bool> = (0..n_islands)
+                .map(|i| restart_state.as_ref().is_some_and(|r| r.is_isolated(i)))
+                .collect();
+            next.migrate(&skip);
         }
 
         // Stagnation and restart, exactly as the owned-tree loop: measured at
@@ -8086,20 +8344,42 @@ fn run_postfix_search(
                 .iter()
                 .map(|s| s.error)
                 .fold(f64::INFINITY, f64::min);
+            // #1022: the keeper holds the archive best and is never restarted.
+            let keeper = restart_state.as_ref().and_then(|_| {
+                let bests: Vec<f64> = (0..n_islands)
+                    .map(|i| {
+                        (0..pop)
+                            .map(|j| next.err[next.slot_index(i, j)])
+                            .fold(f64::INFINITY, f64::min)
+                    })
+                    .collect();
+                RestartState::keeper(&bests, arch_best)
+            });
             let mut restarted = false;
             for i in 0..n_islands {
-                let cur_best = (0..pop)
-                    .map(|j| next.err[next.slot_index(i, j)])
-                    .fold(f64::INFINITY, f64::min);
-                if cur_best > arch_best + 1e-9 {
-                    stagnant[i] += 1;
-                } else {
-                    stagnant[i] = 0;
-                }
-                if stagnant[i] >= 2 {
+                let restart_now = match restart_state.as_ref() {
+                    Some(rs) => rs.due(i, keeper, cfg.restart_interval),
+                    None => {
+                        let cur_best = (0..pop)
+                            .map(|j| next.err[next.slot_index(i, j)])
+                            .fold(f64::INFINITY, f64::min);
+                        if cur_best > arch_best + 1e-9 {
+                            stagnant[i] += 1;
+                        } else {
+                            stagnant[i] = 0;
+                        }
+                        stagnant[i] >= 2
+                    }
+                };
+                if restart_now {
                     variation.restart_island(&mut next, i, gen as u32);
                     stagnant[i] = 0;
+                    if let Some(rs) = restart_state.as_mut() {
+                        rs.restarted(i, cfg.restart_isolation);
+                    }
                     restarted = true;
+                    restarts_now += 1;
+                    restarts_total += 1;
                 }
             }
             if restarted {
@@ -8110,6 +8390,8 @@ fn run_postfix_search(
         )?;
             }
         }
+
+        flush_dev_generation(cfg, dev_rec.take(), restarts_now, restarts_total, restart_state.as_ref());
 
         if checkpoint_due(save_every, gens_done, last_save.elapsed().as_secs_f64(), save_interval_s) {
             last_save = std::time::Instant::now();
@@ -8146,6 +8428,7 @@ fn run_postfix_search(
                 &islands_now,
                 &rngs,
                 &stagnant,
+                restart_state.as_ref(), // #1022
                 &[],
                 &main_rng,
                 train,
@@ -8221,6 +8504,7 @@ fn run_postfix_search(
             &islands_now,
             &rngs,
             &stagnant,
+            restart_state.as_ref(), // #1022
             &[],
             &main_rng,
             train,
@@ -8758,6 +9042,8 @@ fn run_search_scoped(
     let mut islands: Vec<Vec<Ind>>;
     let mut stagnant: Vec<usize>;
     let mut mixes: Vec<MixWindow>;
+    // #1022: `Some` only under `--restart-policy island`.
+    let mut restart_state: Option<RestartState>;
     let mut gens_done: usize;
     let mut converged_early: bool;
     let mut best_prev: f64;
@@ -8826,9 +9112,11 @@ fn run_search_scoped(
         rng = main_rng;
         rngs = Vec::with_capacity(saved_islands.len());
         islands = Vec::with_capacity(saved_islands.len());
+        let mut saved_stalls = Vec::with_capacity(saved_islands.len());
         mixes = Vec::with_capacity(saved_islands.len());
         for isl in saved_islands {
             rngs.push(isl.rng);
+            saved_stalls.push(isl.stall);
             mixes.push(isl.mix);
             islands.push(
                 isl.population
@@ -8837,6 +9125,11 @@ fn run_search_scoped(
                     .collect(),
             );
         }
+        restart_state = if cfg.restart_policy == RestartPolicy::Island {
+            Some(RestartState::from_saved(&saved_stalls)?)
+        } else {
+            None
+        };
         let want = cfg.islands.max(1);
         if islands.len() != want || rngs.len() != want || stagnant.len() != want {
             return Err(format!(
@@ -8866,6 +9159,8 @@ fn run_search_scoped(
         islands = Vec::with_capacity(cfg.islands.max(1));
         stagnant = vec![0; cfg.islands.max(1)];
         mixes = vec![MixWindow::new(); cfg.islands.max(1)];
+        restart_state = (cfg.restart_policy == RestartPolicy::Island)
+            .then(|| RestartState::new(cfg.islands.max(1)));
         // Generation 0's subset also scores the initial population, so nothing
         // is evaluated on the full table before the first generation.
         let init_sample = training_for_generation(cfg, train, 0);
@@ -9042,6 +9337,7 @@ fn run_search_scoped(
                         rngs,
                         rng,
                         stagnant,
+                        restart_state,
                         gens_done,
                         converged_early,
                         best_prev,
@@ -9128,7 +9424,9 @@ fn run_search_scoped(
     let mut eval_stage_total = 0.0f64;
     let mut last_save = std::time::Instant::now();
     let save_interval_s = checkpoint_interval_s();
+    let mut restarts_total = 0u64; // #1022
     if !converged_early {
+        let mut dev_rec: Option<crate::devlog::GenRecord> = None; // #1022: reported after the restart step
         for gen in gens_done..cfg.generations {
             gens_done = gen + 1;
 
@@ -9244,6 +9542,10 @@ fn run_search_scoped(
             } else {
                 0.0
             };
+            // #1022: an isolated island draws no front parent.
+            let island_front_p: Vec<f64> = (0..islands.len())
+                .map(|i| restart_state.as_ref().map_or(front_p, |r| r.front_p(i, front_p)))
+                .collect();
             // #120: the archive as of the previous generation, borrowed exactly
             // like the Pareto front. It is updated only after the barrier.
             let qd_snapshot = qd_archive.as_ref();
@@ -9330,8 +9632,11 @@ fn run_search_scoped(
                     .map(|(i, (((isl, r), mix), sender))| {
                         // #10: carry the block registry into the island thread.
                         let blocks = blocks.clone();
+                        let island_front = island_front_p[i]; // #1022
                         s.spawn(move || {
                             expr::set_blocks(blocks);
+                            #[cfg(test)]
+                            front_draw_tag::set(cfg.seed, i);
                             evolve_island(
                                 isl,
                                 r,
@@ -9343,7 +9648,7 @@ fn run_search_scoped(
                                 screened,
                                 defer_gpu && !screened,
                                 front,   // #76
-                                front_p, // #76
+                                island_front, // #76 #1022
                                 qd_snapshot, // #120
                                 cfg.qd_policy, // #120
                                 cfg.qd_control, // #120 control
@@ -9474,7 +9779,7 @@ fn run_search_scoped(
                             .unwrap_or_else(|| {
                                 FallbackPool::new(
                                     fallback_workers(cfg.threads),
-                                    fallback_workers(cfg.threads),
+                                    FALLBACK_QUEUE_CHUNKS,
                                 )
                             });
                         gpu = None;
@@ -9573,6 +9878,12 @@ fn run_search_scoped(
             let dev_archive = dev_lap(&mut dev_mark); // #211
             let stage_archive = stage_lap(&mut stage_mark); // #284
 
+            // #1022: each island's own stall, after the archive update.
+            if let Some(rs) = restart_state.as_mut() {
+                let bests: Vec<f64> = islands.iter().map(|p| population_best(p)).collect();
+                rs.tick(&bests);
+            }
+
             #[cfg(feature = "cuda")]
             let (drain_eval_s, drain_fit_s) = gpu.as_ref().map_or((0.0, 0.0), |g| {
                 (
@@ -9628,7 +9939,7 @@ fn run_search_scoped(
             if let Some(observe) = &cfg.front_observer {
                 observe(gens_done, t0.elapsed().as_secs_f64(), &archive);
             }
-            if let Some(report) = &cfg.dev_log {
+            if cfg.dev_log.is_some() {
                 #[cfg(feature = "cuda")]
                 let gpu_now = gpu.as_ref().map(|g| g.dev_snapshot(gen));
                 #[cfg(not(feature = "cuda"))]
@@ -9673,13 +9984,14 @@ fn run_search_scoped(
                         }
                     }),
                 );
-                report(&rec);
+                dev_rec = Some(rec);
             }
 
             if gen_best.is_finite() {
                 if cfg.fitness.is_metric() && cfg.metric.is_solved(gen_best) {
                     converged_early = true;
                     stop_reason = "solved"; // #211
+                    flush_dev_generation(cfg, dev_rec.take(), 0, restarts_total, restart_state.as_ref());
                     break;
                 }
                 if crate::progress_stats::no_improvement(best_prev, gen_best) {
@@ -9691,15 +10003,19 @@ fn run_search_scoped(
                 if cfg.patience > 0 && no_improve >= cfg.patience {
                     converged_early = true;
                     stop_reason = "patience"; // #211
+                    flush_dev_generation(cfg, dev_rec.take(), 0, restarts_total, restart_state.as_ref());
                     break;
                 }
             }
 
+            let mut restarts_now = 0usize; // #1022
             // ---- migration between islands ------------------------------
             if cfg.islands > 1
                 && cfg.migration_interval > 0
                 && (gen + 1) % cfg.migration_interval == 0
             {
+                #[cfg(test)]
+                let probe_before = migration_probe::hashes(&islands);
                 let bests: Vec<Option<Node>> = islands
                     .iter()
                     .map(|pop| {
@@ -9721,6 +10037,10 @@ fn run_search_scoped(
                     })
                     .collect();
                 for ii in 0..islands.len() {
+                    // #1022: an isolated island receives no migrant.
+                    if restart_state.as_ref().is_some_and(|r| r.is_isolated(ii)) {
+                        continue;
+                    }
                     let src = (ii + 1) % islands.len();
                     if let Some(t) = &bests[src] {
                         // #120: stratified migration replaces the individual in
@@ -9790,6 +10110,16 @@ fn run_search_scoped(
                         }
                     }
                 }
+                #[cfg(test)]
+                migration_probe::record(
+                    cfg.seed,
+                    gens_done,
+                    (0..islands.len())
+                        .map(|i| restart_state.as_ref().is_some_and(|r| r.is_isolated(i)))
+                        .collect(),
+                    probe_before,
+                    migration_probe::hashes(&islands),
+                );
             }
 
             // ---- restart stagnant islands -------------------------------
@@ -9799,17 +10129,28 @@ fn run_search_scoped(
                     .iter()
                     .map(|s| s.error)
                     .fold(f64::INFINITY, f64::min);
+                // #1022: the keeper holds the archive best and is never restarted.
+                let keeper = restart_state.as_ref().and_then(|_| {
+                    let bests: Vec<f64> = islands.iter().map(|p| population_best(p)).collect();
+                    RestartState::keeper(&bests, arch_best)
+                });
                 for ii in 0..islands.len() {
-                    let cur_best = islands[ii]
-                        .iter()
-                        .map(|i| i.error)
-                        .fold(f64::INFINITY, f64::min);
-                    if cur_best > arch_best + 1e-9 {
-                        stagnant[ii] += 1;
-                    } else {
-                        stagnant[ii] = 0;
-                    }
-                    if stagnant[ii] >= 2 {
+                    let restart_now = match restart_state.as_ref() {
+                        Some(rs) => rs.due(ii, keeper, cfg.restart_interval),
+                        None => {
+                            let cur_best = islands[ii]
+                                .iter()
+                                .map(|i| i.error)
+                                .fold(f64::INFINITY, f64::min);
+                            if cur_best > arch_best + 1e-9 {
+                                stagnant[ii] += 1;
+                            } else {
+                                stagnant[ii] = 0;
+                            }
+                            stagnant[ii] >= 2
+                        }
+                    };
+                    if restart_now {
                         let mut r = rngs[ii].clone();
                         // #120: aim the restart at the least-visited region by
                         // rejection sampling a few cheap descriptor probes.
@@ -9879,9 +10220,15 @@ fn run_search_scoped(
                         }
                         rngs[ii] = r;
                         stagnant[ii] = 0;
+                        if let Some(rs) = restart_state.as_mut() {
+                            rs.restarted(ii, cfg.restart_isolation); // #1022
+                        }
+                        restarts_now += 1;
+                        restarts_total += 1;
                     }
                 }
             }
+            flush_dev_generation(cfg, dev_rec.take(), restarts_now, restarts_total, restart_state.as_ref());
 
             // #26: migration and restarts may have added pending individuals;
             // score them before the checkpoint so a saved state is never NaN.
@@ -9939,6 +10286,7 @@ fn run_search_scoped(
                     &islands,
                     &rngs,
                     &stagnant,
+                    restart_state.as_ref(), // #1022
                     &mixes,
                     &rng,
                     train,
@@ -10015,6 +10363,7 @@ fn run_search_scoped(
             &islands,
             &rngs,
             &stagnant,
+            restart_state.as_ref(), // #1022
             &mixes,
             &rng,
             train,
@@ -12944,6 +13293,68 @@ mod tests {
         assert_eq!(pool.busy.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
+    /// #1032: every job is its own chunk, for fits, checked passes and plain
+    /// scoring, and results still come back in job order.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn fallback_pool_hands_out_one_job_per_chunk() {
+        let s = sample_rows(400);
+        let cfg = Config::default();
+        let view = EvalSample::new(&s, &cfg);
+        let pool = FallbackPool::new(4, FALLBACK_QUEUE_CHUNKS);
+        let fits = pool.submit_fits(tail_jobs(37), &s, 8, Metric::Squared);
+        assert_eq!((fits.chunks, fits.chunk_len, fits.total), (37, 1, 37));
+        let (fitted, _) = pool.finish_fits(fits);
+        let mut serial = tail_jobs(37);
+        fit_fallback_jobs(&mut serial, &s.x, &s.y, &s.w, 8, Metric::Squared, 1);
+        for (k, (a, b)) in serial.iter().zip(&fitted).enumerate() {
+            assert_eq!((a.island, a.slot), (b.island, b.slot), "job {k} moved");
+            assert!(expr::same(&a.tree, &b.tree), "job {k}: the pool fit differs from the serial arm");
+        }
+        let trees: Vec<Node> = (0..17)
+            .map(|k| node(Op::Sin, vec![node(Op::Mul, vec![constant(k as f64), input(0)])]))
+            .collect();
+        let checked = pool.submit_checked(trees.iter().cloned().enumerate().collect(), &view, &cfg);
+        assert_eq!((checked.chunks, checked.chunk_len), (17, 1));
+        let (errors, _, _) = pool.finish_checked(checked);
+        for (tree, e) in trees.iter().zip(&errors) {
+            assert_eq!(e.to_bits(), score_tree(tree, &view, &cfg).to_bits());
+        }
+        let plain = pool.submit(trees.iter().cloned().enumerate().collect(), &view, &cfg);
+        assert_eq!((plain.chunks, plain.chunk_len), (17, 1));
+        let (errors, _) = pool.finish(plain);
+        assert_eq!(errors.len(), 17);
+        let none = pool.submit(Vec::new(), &view, &cfg);
+        assert_eq!(none.chunks, 0);
+        let _ = pool.finish(none);
+    }
+
+    /// #1032: the pool queue holds a generation of chunks and both
+    /// constructions in the search use that capacity.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn fallback_pool_queue_holds_a_generation() {
+        assert_eq!(FALLBACK_QUEUE_CHUNKS, 4096);
+        assert!(FALLBACK_QUEUE_CHUNKS >= DEFAULT_FIT_FALLBACK_MAX);
+        assert_eq!(FallbackPool::new(4, FALLBACK_QUEUE_CHUNKS).queue, 4096);
+        let source = include_str!("search.rs");
+        let production = source.split("\nmod tests {").next().expect("source has a prefix");
+        let sites: Vec<&str> = production.split("FallbackPool::new(").skip(1).collect();
+        assert_eq!(sites.len(), 2, "the search builds its pool in two places");
+        for site in sites {
+            let second = site.split(',').nth(1).unwrap_or("");
+            assert!(
+                second.trim_start().starts_with("FALLBACK_QUEUE_CHUNKS"),
+                "a search pool queue is not FALLBACK_QUEUE_CHUNKS: {site:.80}"
+            );
+        }
+        let pool = FallbackPool::new(2, FALLBACK_QUEUE_CHUNKS);
+        let s = sample_rows(400);
+        let ticket = pool.submit_fits(tail_jobs(300), &s, 1, Metric::Squared);
+        assert_eq!(ticket.chunks, 300, "a whole generation queues as single jobs");
+        drop(ticket);
+    }
+
     /// #958: the overlap is the union of the in-flight spans.
     #[test]
     fn span_union_merges_overlapping_spans() {
@@ -14204,5 +14615,188 @@ mod tests {
                 "without --threads the check uses {DEFAULT_FIT_COST_CORES} cores, not {threads}"
             );
         }
+    }
+
+    #[test]
+    fn restart_state_counts_the_islands_own_stall_and_spares_the_keeper() {
+        let mut s = RestartState::new(3);
+        s.tick(&[1.0, 1.0, 2.0]);
+        assert_eq!(s.since_improve, vec![0, 0, 0], "the first finite best is an improvement");
+        s.tick(&[1.0, 0.5, 2.0]);
+        assert_eq!(s.since_improve, vec![1, 0, 1]);
+        s.tick(&[1.0 - 1e-12, 0.5, f64::INFINITY]);
+        assert_eq!(s.since_improve, vec![2, 1, 2], "a 1e-12 gain and a non-finite best are stalls");
+        assert_eq!(s.best_prev[2], 2.0, "a non-finite best never lowers best_prev");
+
+        assert_eq!(RestartState::keeper(&[1.0, 0.5, 0.5], 0.5), Some(1), "the lowest holder keeps");
+        assert_eq!(RestartState::keeper(&[1.0, 0.7], 0.5), None);
+        assert_eq!(RestartState::keeper(&[0.5], 0.5), Some(0), "one island is its own keeper");
+        assert!(s.due(0, Some(1), 2));
+        assert!(!s.due(1, Some(1), 1), "the keeper is never due");
+        assert!(s.due(1, None, 1));
+        assert!(!s.due(1, None, 2), "not stalled for a whole interval yet");
+    }
+
+    #[test]
+    fn restart_state_isolation_zeroes_front_parents_and_counts_down() {
+        let mut s = RestartState::new(2);
+        s.tick(&[1.0, 1.0]);
+        s.restarted(1, 3);
+        assert_eq!(s.best_prev[1], f64::INFINITY);
+        assert_eq!(s.since_improve[1], 0);
+        assert_eq!((s.front_p(0, 0.15), s.front_p(1, 0.15)), (0.15, 0.0));
+        assert_eq!(s.isolated_count(), 1);
+        for left in [2usize, 1, 0] {
+            s.tick(&[1.0, 5.0]);
+            assert_eq!(s.isolated[1], left);
+            if left == 2 {
+                assert_eq!(s.since_improve[1], 0, "the first generation after a restart is an improvement");
+            }
+        }
+        assert!(!s.is_isolated(1));
+        assert_eq!(s.front_p(1, 0.15), 0.15);
+        s.restarted(0, 0);
+        assert!(!s.is_isolated(0), "a window of 0 turns the isolation off");
+    }
+
+    #[test]
+    fn restart_state_survives_a_checkpoint_round_trip_and_refuses_a_missing_record() {
+        let mut s = RestartState::new(2);
+        s.tick(&[2.0, 3.0]);
+        s.tick(&[2.0, 2.5]);
+        s.restarted(0, 7);
+        let saved: Vec<_> = (0..2).map(|i| Some(s.saved(i))).collect();
+        assert_eq!(RestartState::from_saved(&saved).unwrap(), s);
+        let err = RestartState::from_saved(&[Some(s.saved(0)), None]).unwrap_err();
+        assert!(err.contains("island_stall"), "{err}");
+    }
+
+    fn restart_fixture() -> (Sample, Sample) {
+        let p = crate::bench::known_truth()
+            .into_iter()
+            .find(|p| p.name == "pythagoras")
+            .expect("pythagoras is in the known-truth suite");
+        (p.noiseless(150), p.noiseless(60))
+    }
+
+    /// Search shapes that stall: the first two skip the constant fit, whose tiny
+    /// gains keep resetting an island's stall counter.
+    const RESTART_SHAPES: [(usize, usize); 6] = [(8, 0), (12, 0), (16, 0), (24, 0), (40, 0), (24, 4)];
+
+    fn restart_config(policy: RestartPolicy, isolation: usize, shape: (usize, usize)) -> Config {
+        Config {
+            generations: 60,
+            islands: 2,
+            pop: shape.0,
+            max_complexity: 20,
+            fit_iters: shape.1,
+            migration_interval: 5,
+            restart_interval: 10,
+            seed: 1,
+            patience: 0,
+            gpu: false,
+            restart_policy: policy,
+            restart_isolation: isolation,
+            ..Default::default()
+        }
+    }
+
+    type RestartRow = (usize, usize, u64, Vec<f64>);
+
+    fn restart_log(cfg: Config, train: &Sample, test: &Sample) -> Vec<RestartRow> {
+        let rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = rows.clone();
+        let cfg = Config {
+            dev_log: Some(std::sync::Arc::new(move |r: &crate::devlog::GenRecord| {
+                sink.lock()
+                    .unwrap()
+                    .push((r.generation, r.restarts, r.restarts_total, r.island_best.clone()));
+            })),
+            ..cfg
+        };
+        run(&cfg, train, test);
+        let out = rows.lock().unwrap().clone();
+        out
+    }
+
+    #[test]
+    fn island_policy_restarts_a_stalled_island_that_the_archive_policy_never_restarts() {
+        let (train, test) = restart_fixture();
+        let mut island_restarted = false;
+        let mut seen: Vec<String> = Vec::new();
+        for shape in RESTART_SHAPES {
+            let archive = restart_log(restart_config(RestartPolicy::Archive, 25, shape), &train, &test);
+            let island = restart_log(restart_config(RestartPolicy::Island, 25, shape), &train, &test);
+            seen.push(format!("{:?}: archive {} island {}", shape, archive.last().unwrap().2, island.last().unwrap().2));
+            let shared = archive
+                .iter()
+                .position(|(_, _, _, best)| best.len() == 2 && best[0].is_finite() && best[0] == best[1])
+                .unwrap_or_else(|| panic!("shape {:?}: both islands share the best at some generation", shape));
+            assert_eq!(
+                archive.last().unwrap().2,
+                archive[shared].2,
+                "shape {:?}: the archive policy restarts nothing once both islands share the best (generation {})",
+                shape,
+                archive[shared].0
+            );
+            if island.last().unwrap().2 > 0 {
+                island_restarted = true;
+                assert!(island.iter().any(|r| r.1 > 0), "a per-generation restart count is reported");
+            }
+        }
+        assert!(island_restarted, "the island policy restarts a stalled island in at least one shape: {:?}", seen);
+    }
+
+    #[test]
+    fn an_isolated_island_draws_no_front_parent_and_receives_no_migrant() {
+        const SEED: u32 = 1022;
+        let (train, test) = restart_fixture();
+        let (mut isolated_gens, mut open_gens_with_draws, mut skipped, mut received) = (0, 0, 0, 0);
+        for shape in RESTART_SHAPES {
+        let cfg = Config { seed: SEED, ..restart_config(RestartPolicy::Island, 10, shape) };
+
+        let mut snaps: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();
+        run_resumable(&cfg, &train, &test, None, 1, |cp| {
+            if snaps.last().map_or(true, |s| s.0 != cp.generations) {
+                snaps.push((
+                    cp.generations,
+                    cp.islands.iter().map(|i| i.stall.expect("island policy").isolated).collect(),
+                    (0..cfg.islands).map(|i| front_draw_tag::count(SEED, i)).collect(),
+                ));
+            }
+        })
+        .unwrap();
+
+        for k in 1..snaps.len() {
+            for i in 0..cfg.islands {
+                let drawn = snaps[k].2[i] - snaps[k - 1].2[i];
+                if snaps[k - 1].1[i] > 0 {
+                    isolated_gens += 1;
+                    assert_eq!(
+                        drawn, 0,
+                        "island {} drew {} front parents in generation {} while isolated",
+                        i, drawn, snaps[k].0
+                    );
+                } else if drawn > 0 {
+                    open_gens_with_draws += 1;
+                }
+            }
+        }
+        for (seed, _gen, isolated, before, after) in migration_probe::take(SEED) {
+            assert_eq!(seed, SEED);
+            for i in 0..isolated.len() {
+                if isolated[i] {
+                    skipped += 1;
+                    assert_eq!(before[i], after[i], "an isolated island's population is untouched by migration");
+                } else if before[i] != after[i] {
+                    received += 1;
+                }
+            }
+        }
+        }
+        assert!(isolated_gens >= 10, "a restart opened an isolation window: {}", isolated_gens);
+        assert!(open_gens_with_draws > 0, "an open island does draw front parents");
+        assert!(skipped > 0, "a migration boundary fell inside an isolation window");
+        assert!(received > 0, "an open island receives migrants");
     }
 }

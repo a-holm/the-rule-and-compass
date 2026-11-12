@@ -71,6 +71,10 @@ OPTIONS:
   --patience <N>            generations without improvement before stopping
   --migration-interval <N>  generations between island migrations
   --restart-interval <N>    generations between island restarts
+  --restart-policy <mode>   archive (default) or island: restart an island on its own
+                            stall and isolate it afterwards (#1022)
+  --restart-isolation <N>   generations a restarted island takes no front parent and
+                            no migrant under --restart-policy island (default 25)
   --variation <mode>        auto, node or postfix
   --selection <mode>        lexicographic (default) or afp (age-fitness Pareto)
   --mutation-mix <mix>      classic (default) or extended: insert, delete, swap, rotate (#471)
@@ -309,6 +313,14 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--restart-interval" => {
                 a.knobs.restart_interval =
                     Some(num(take(&mut i, "--restart-interval")?, "--restart-interval")?)
+            }
+            "--restart-policy" => {
+                a.knobs.restart_policy =
+                    Some(rcsr::search::RestartPolicy::parse(&take(&mut i, "--restart-policy")?)?)
+            }
+            "--restart-isolation" => {
+                a.knobs.restart_isolation =
+                    Some(num(take(&mut i, "--restart-isolation")?, "--restart-isolation")?)
             }
             "--linear-scaling" => {
                 return Err("--linear-scaling was removed (#470): it lowered oracle_recovered in the default-decision A/B".to_string())

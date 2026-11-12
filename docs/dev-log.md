@@ -239,6 +239,9 @@ Emitted at the same boundary as `--progress`, once per completed generation
 | `convergence.confidence/stability/maturity` | full | its three components |
 | `islands` | full | best error of each island's population, in island order |
 | `rng` | full | hash of the island and main MT19937 states at this boundary |
+| `restarts` | both | #1022: islands restarted at this generation's restart step (0 on every other generation; the record is reported after the step) |
+| `restarts_total` | both | #1022: islands restarted since the run, or the resume, began |
+| `isolated` | full | #1022: islands inside their isolation window after this generation (`--restart-policy island`; 0 under `archive`) |
 
 The six `phases` (excluding the two summed CPU times) are disjoint windows on
 the search's main thread and add up to `wall`. `fit_cpu` and `eval_cpu` overlap

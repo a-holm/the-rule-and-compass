@@ -806,6 +806,23 @@ SEARCH:
                              random immigrants per generation and picks
                              parents by Pareto rank and crowding distance.
                              Node path only; refuses --variation postfix
+  --restart-policy archive|island
+                             which stall rule restarts an island every
+                             restart interval (60 generations). archive
+                             (default) restarts an island after two checks
+                             in which its best error is worse than the
+                             archive best. island restarts an island whose
+                             own best error has not improved for one restart
+                             interval, except the lowest island that holds
+                             the archive best (the keeper), and isolates it
+                             from front parents and migrants for
+                             --restart-isolation generations. With one island
+                             nothing restarts. Saved search setting (#1022)
+  --restart-isolation <N>    generations a restarted island takes no front
+                             parent and no migrant, default 25 (the
+                             migration interval). Read only with
+                             --restart-policy island; 0 turns the isolation
+                             off. Saved search setting (#1022)
   --mutation-mix <M>         node-path edit weights: classic (point .25, terminal
                              .35, subtree .40; default) or extended (adds insert,
                              delete, swap and rotate). Not with --variation
@@ -2825,6 +2842,9 @@ fn main() {
     let mut fit_thresholds_set = false; // #1024
     // #465: explicit --selection for the resume settings check.
     let mut selection_set = false;
+    // #1022: explicit restart flags for the resume settings check.
+    let mut restart_policy_set = false;
+    let mut restart_isolation_set = false;
     let mut mutation_mix_set = false; // #471
     let mut crossover_internal_set = false;
     let mut adaptive_mix_set = false;
@@ -3432,6 +3452,24 @@ fn main() {
                         std::process::exit(EXIT_USAGE);
                     }
                 }
+            }
+            // #1022: which stall rule restarts an island.
+            "--restart-policy" => {
+                let v = val!();
+                match crate::search::RestartPolicy::parse(&v) {
+                    Ok(p) => {
+                        cfg.restart_policy = p;
+                        restart_policy_set = true;
+                    }
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--restart-isolation" => {
+                cfg.restart_isolation = parse_uint("--restart-isolation", &val!());
+                restart_isolation_set = true;
             }
             "--no-front-parents" => {
                 cfg.front_parents = false;
@@ -4103,6 +4141,23 @@ fn main() {
                 "--selection {} (saved {})",
                 cfg.selection.as_str(),
                 saved.selection.as_str()
+            ));
+        }
+        // #1022: the restart rule is saved search state.
+        if restart_policy_set && cfg.restart_policy != saved.restart_policy {
+            conflicts.push(format!(
+                "--restart-policy {} (saved restart_policy is {})",
+                cfg.restart_policy.as_str(),
+                saved.restart_policy.as_str()
+            ));
+        }
+        if restart_isolation_set
+            && saved.restart_policy == crate::search::RestartPolicy::Island
+            && cfg.restart_isolation != saved.restart_isolation
+        {
+            conflicts.push(format!(
+                "--restart-isolation {} (saved restart_isolation is {})",
+                cfg.restart_isolation, saved.restart_isolation
             ));
         }
         // #495: the band decides which finalists get the exact refit.
@@ -5727,6 +5782,9 @@ fn main() {
     // #468: the long/flat book earns the full per-row return, so rows of one
     // group must not be closer than the label horizon.
     let target_horizon = book_resolved.as_ref().or(target_resolved.as_ref()).map_or(0.0, |r| r.spec.horizon_seconds);
+    if let Some(s) = trading_spec.as_mut() {
+        s.period_seconds = (target_horizon > 0.0).then_some(target_horizon);
+    }
     let mut min_group_step: Option<f64> = None;
     if let (Some(_), Some(split), Some(r)) = (&trading_spec, prepared.trading.as_ref(), book_resolved.as_ref().or(target_resolved.as_ref())) {
         let horizon = r.spec.horizon_seconds;
@@ -11121,8 +11179,13 @@ OPTIONS:
   --pool-reset-flat          reset every group to flat at a window seam (the
                              historical pooled P&L); default carries the boundary
                              position, so total variation includes |p_end-q_start|
-  --periods-per-year <f>     annualisation override (default: infer from the
-                             median test time step; 365 for daily crypto bars)
+  --periods-per-year <f>     annualisation override. Default: 31536000 / S, S the
+                             label horizon (target spec, else --horizon), else
+                             the median step of labelled test times. A period is
+                             the bucket floor(t / S); without a declared
+                             horizon a period is one timestamp. With a target
+                             spec a different value exits 2; with --horizon
+                             alone it overrides
   --device-pnl               recompute each test block through the fused
                              long-only reduction (f64 canonical segments; the
                              CUDA kernel when built with --features cuda) and
@@ -11206,13 +11269,15 @@ OPTIONS:
   --sealed <file>            locked_candidates.json from `rcsr protocol seal`
   --verify-read              with --locked-test (exit 2 without it): recompute a recorded
                              read, compare its report hash, write --out and --markdown,
-                             record nothing; the route after a failed report write
+                             record nothing; a candidate with no recorded read is refused
+                             (exit 3) before any locked row is scored
   --allow-unbound-ledger     with --locked-test: read a candidate whose ledger
                              recorded no locked test range (old ledger); the read
                              is reported as unbound. Without it that read is
                              refused (exit 3), as is a range that differs from
                              the one the candidate was developed against
-  --expect-report-sha256 <h> exit 3 unless the report JSON hashes to h
+  --expect-report-sha256 <h> exit 3 unless the report JSON hashes to h; with --locked-test
+                             it needs --verify-read (exit 2 without it)
   --json                     print the full JSON report to stdout
                              (it ends with a ledger object: the phase ledger of the
                              command, io and pnl seconds on the run wall, outside the
@@ -11868,6 +11933,7 @@ fn run_walkforward(args: &[String]) -> ! {
             }
         };
         horizon = Some(agree("--horizon", horizon, s.horizon_seconds));
+        popts.horizon_from_spec = s.horizon_seconds > 0.0;
         popts.entry_offset = agree("--entry-offset", entry_offset_flag, s.entry_offset_seconds);
         popts.fit_label = target::label_report_for(&data_path, &s.column).and_then(|r| rcsr::labels::fit_label_json(&r));
         popts.delay = agree("--delay", delay_flag, s.delay_seconds);
@@ -12092,6 +12158,10 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: --locked-test needs --ledger and --sealed");
         std::process::exit(EXIT_USAGE);
     }
+    if locked_test && !verify_read && expect_hash.is_some() {
+        eprintln!("error: --expect-report-sha256 with --locked-test needs --verify-read");
+        std::process::exit(EXIT_USAGE);
+    }
     for (ri, rg) in resolved.ranges().into_iter().enumerate() {
         let sealed_read = locked_test && ri == 0;
         let (ls, le) = (rg.start as f64, rg.end as f64);
@@ -12183,7 +12253,7 @@ fn run_walkforward(args: &[String]) -> ! {
             if locked_test {
                 let sealed = std::path::Path::new(sealed_path.as_deref().unwrap_or(""));
                 let entry = if verify_read {
-                    l.authorize_sealed(sealed, &candidate_id, &data_sha, &build_id, binding)?
+                    l.authorize_verify(sealed, &candidate_id, &data_sha, &build_id, binding)?
                 } else {
                     l.authorize_read(sealed, &candidate_id, &data_sha, &build_id, binding)?
                 };
@@ -12208,7 +12278,7 @@ fn run_walkforward(args: &[String]) -> ! {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") { EXIT_USAGE } else { EXIT_INPUT });
+            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") || e.starts_with("--periods-per-year") { EXIT_USAGE } else { EXIT_INPUT });
         }
     };
     if spec.threshold_fixed.is_none() {
