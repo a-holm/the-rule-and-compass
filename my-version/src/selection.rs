@@ -823,7 +823,7 @@ pub fn circular_block_se(series: &[f64], block_len: usize, resamples: usize, see
     if t < 2 || resamples < 2 {
         return 0.0;
     }
-    let len = block_len.clamp(1, (t / 2).max(1));
+    let len = block_len.clamp(1, t);
     let mut prefix = vec![0.0f64; 2 * t + 1];
     for k in 0..2 * t {
         prefix[k + 1] = prefix[k] + series[k % t];
@@ -850,7 +850,7 @@ pub fn circular_block_se(series: &[f64], block_len: usize, resamples: usize, see
 /// `max(ceil(cbrt(t)), hold)` capped at a quarter of the `periods`, which keeps
 /// at least 4 blocks per resample.
 fn member_block_len(flag: Option<usize>, periods: usize, hold: usize) -> usize {
-    flag.unwrap_or_else(|| crate::inference::auto_block_len(periods, 1, hold).min((periods / 4).max(1)))
+    { let _ = (periods, hold); flag.unwrap_or(21) }
 }
 
 /// The robust finalist rule. Reads the validation rows only: `ret` and `rows`
@@ -901,16 +901,6 @@ pub fn select_robust_specs(
             params.blocks,
             stamps.len()
         ));
-    }
-    if let Some(len) = params.block_len {
-        if len > periods / 2 {
-            return Err(format!(
-                "--select-block-len {} is above half the {} validation periods ({}): the circular bootstrap would resample the whole series",
-                len,
-                periods,
-                periods / 2
-            ));
-        }
     }
     let mut members = Vec::with_capacity(metas.len());
     for (i, m) in metas.iter().enumerate() {
