@@ -1302,7 +1302,7 @@ constants (the LM statuses above start from the starting constants). Every CPU f
 (no analytic derivative, too many nodes, shared block constants or no
 constants), `too_few_rows`, `too_many_constants` (`p > 20`),
 `metric_not_native` (no device fit objective for the configured metric),
-`ill_conditioned`, `non_finite`, `launch`, `rank_deficient`, `recovered_iterate`, `non_finite_start`, `unconverged`, or — for the fit-only arms — the
+`ill_conditioned`, `non_finite`, `launch`, `rank_deficient`, `recovered_iterate`, `non_finite_start`, `unconverged`, `threshold_constant` (#1024, `--fit-thresholds`), or — for the fit-only arms — the
 `rank_declined` (#230), `median_declined` (#226), `interquartile_declined`
 (#232) and `maximum_declined` (#227) causes (the device declined the call and
 the exact CPU arm took over). `--fit-report` and the `gpu.fit` JSON object count
