@@ -81,6 +81,7 @@ OPTIONS:
                             kernel polish (--fit-strategy gpu)
   --fit-irls <mode>         nested (default), reweighted or reweighted-final: schedule
                             of the CPU absolute / implicit_residual constant fit (#611)
+  --fit-thresholds          fit comparison and if thresholds by an exact 1-D search (#1024)
   --jobs <N>                runs in flight at once on the CPU (default 1);
                             seconds and hit_s are then contended
   --ndjson                  one JSON line per finished run, flushed at once,
@@ -343,6 +344,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
                     format!("--fit-irls needs nested, reweighted or reweighted-final, got '{}'", v)
                 })?);
             }
+            "--fit-thresholds" => a.knobs.fit_thresholds = true,
             "--dispatch" => {
                 let v = take(&mut i, "--dispatch")?;
                 a.knobs.dispatch = Some(

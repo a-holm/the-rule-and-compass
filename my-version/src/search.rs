@@ -225,6 +225,10 @@ pub struct Config {
     /// depend on the inputs before the constant fit and keep them out of the
     /// archive. Saved search state.
     pub reject_fixed_position: bool,
+    /// #1024: fit the constants that only reach the root through a comparison
+    /// or an `if` condition by an exact 1-D search after the LM. Saved search
+    /// state.
+    pub fit_thresholds: bool,
     /// Wall-clock budget in seconds; `None` means no limit.
     pub time_budget: Option<f64>,
     /// #855: a chunk that stops on `time_budget` saves its search state and
@@ -637,6 +641,7 @@ impl Default for Config {
             dedup: true,
             reject_constant_offspring: false,
             reject_fixed_position: false,
+            fit_thresholds: false,
             time_budget: None,
             interim_chunk: false,
             patience: 40,
@@ -724,6 +729,7 @@ impl Config {
         compare!(restart_interval, "restart_interval");
         compare!(reject_constant_offspring, "reject_constant_offspring"); // #477
         compare!(reject_fixed_position, "reject_fixed_position"); // #848
+        compare!(fit_thresholds, "fit_thresholds"); // #1024
         compare!(init_depth, "init_depth");
         compare!(fit_iters, "fit_iters");
         compare!(fit_strategy, "fit_strategy"); // #116
@@ -4983,15 +4989,17 @@ fn fit_constants_with_iters(
         }
         // #116 + #117: strategy and metric together.
         let sse = crate::fit::with_fit_irls(cfg.fit_irls, || {
-            crate::fit::fit_weighted_strategy_metric(
-                tree,
-                &fit.x,
-                &fit.y,
-                &fit.w,
-                iters,
-                cfg.fit_strategy,
-                cfg.metric,
-            )
+            crate::fit::with_fit_thresholds(cfg.fit_thresholds, || {
+                crate::fit::fit_weighted_strategy_metric(
+                    tree,
+                    &fit.x,
+                    &fit.y,
+                    &fit.w,
+                    iters,
+                    cfg.fit_strategy,
+                    cfg.metric,
+                )
+            })
         });
         Some(FitResult {
             sse,
@@ -5375,11 +5383,14 @@ pub enum FitFallbackCause {
     /// predicted a drop above `1e-3` of the loss (status 9), so the answer is
     /// not a stationary point; the exact CPU fit decides.
     Unconverged,
+    /// #1024: the tree has a comparison or `if` threshold constant and
+    /// `--fit-thresholds` is on, so the exact CPU arm fits it.
+    ThresholdConstant,
 }
 
 impl FitFallbackCause {
     /// Every cause, in reporting order.
-    pub const ALL: [FitFallbackCause; 21] = [
+    pub const ALL: [FitFallbackCause; 22] = [
         FitFallbackCause::UnsupportedPlan,
         FitFallbackCause::TooFewRows,
         FitFallbackCause::TooManyConstants,
@@ -5401,6 +5412,7 @@ impl FitFallbackCause {
         FitFallbackCause::RecoveredIterate,
         FitFallbackCause::NonFiniteStart,
         FitFallbackCause::Unconverged,
+        FitFallbackCause::ThresholdConstant,
     ];
 
     /// Stable JSON label.
@@ -5427,6 +5439,7 @@ impl FitFallbackCause {
             FitFallbackCause::RecoveredIterate => "recovered_iterate",
             FitFallbackCause::NonFiniteStart => "non_finite_start",
             FitFallbackCause::Unconverged => "unconverged",
+            FitFallbackCause::ThresholdConstant => "threshold_constant",
         }
     }
 }
@@ -5499,6 +5512,7 @@ fn plan_fit_batch(
 fn plan_fallback_cause(reason: crate::fit::GpuFitReject) -> FitFallbackCause {
     match reason {
         crate::fit::GpuFitReject::TooManyConstants => FitFallbackCause::TooManyConstants,
+        crate::fit::GpuFitReject::ThresholdConstant => FitFallbackCause::ThresholdConstant,
         _ => FitFallbackCause::UnsupportedPlan,
     }
 }
@@ -5934,14 +5948,14 @@ fn refit_band_selection(pre: &[f64], costs: &[f64], band: f64) -> Vec<usize> {
 /// workers; the result order is unchanged.
 fn refit_exact(trees: &mut [Node], train: &EvalSample, cfg: &Config) {
     let fit_one = |t: &mut Node| {
-        crate::fit::fit_weighted_metric(
-            t,
-            &train.sample.x,
-            &train.sample.y,
-            &train.sample.w,
-            cfg.fit_iters,
-            cfg.metric,
-        );
+        let (x, y, w) = (&train.sample.x, &train.sample.y, &train.sample.w);
+        let (iters, metric) = (cfg.fit_iters, cfg.metric);
+        let fitted = crate::fit::fit_weighted_metric(t, x, y, w, iters, metric);
+        if cfg.fit_thresholds {
+            crate::fit::fit_thresholds(t, x, y, w, iters, metric, fitted, |t| {
+                crate::fit::fit_weighted_metric(t, x, y, w, iters, metric)
+            });
+        }
         *t = expr::simplify(t);
         crate::fit::note_gpu_refit();
     };
@@ -7687,6 +7701,7 @@ fn dev_generation(
                 fallback_seconds: g.fit_fallback_s,
                 gate_seconds: g.fit_gate_s,
                 fallback_workers: g.fit_fallback_workers,
+                threshold_moves: cfg.fit_thresholds.then(crate::fit::threshold_moves),
             },
             g.fallback_s,
             g.fallback_workers,
@@ -7694,6 +7709,7 @@ fn dev_generation(
         None => (
             crate::devlog::FitGen {
                 refits,
+                threshold_moves: cfg.fit_thresholds.then(crate::fit::threshold_moves),
                 ..Default::default()
             },
             0.0,
@@ -8327,6 +8343,20 @@ fn run_postfix_search(
 }
 
 fn run_search(
+    cfg: &Config,
+    train: &Sample,
+    test: &Sample,
+    resume: Option<Checkpoint>,
+    save_every: usize,
+    seeds: &[Node],
+    on_checkpoint: Option<CheckpointFn<'_>>,
+) -> Result<Outcome, String> {
+    crate::fit::with_fit_thresholds(cfg.fit_thresholds, || {
+        run_search_scoped(cfg, train, test, resume, save_every, seeds, on_checkpoint)
+    })
+}
+
+fn run_search_scoped(
     cfg: &Config,
     train: &Sample,
     test: &Sample,

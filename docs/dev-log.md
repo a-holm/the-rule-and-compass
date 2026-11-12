@@ -217,6 +217,7 @@ Emitted at the same boundary as `--progress`, once per completed generation
 | `fit.gpu` | both | candidates the GPU fit returned usable constants for |
 | `fit.fallback` | both | candidates refit by the exact CPU arm |
 | `fit.refits` | full | exact CPU refits recorded for this generation |
+| `fit.threshold_moves` | full | #1024: thresholds moved by the exact 1-D fit since process start; present only with `--fit-thresholds` |
 | `fit.host_seconds`, `fit.fallback_seconds`, `fit.fallback_workers` | full | #256: wall of the whole fit stage in this generation, the exact CPU fit-fallback inside it, and the width of the **fit** fallback pool |
 | `fit.gate_seconds` | full | #498: wall of the exact host gate of device proposals inside `fit.host_seconds` (log_loss, correlation, correlation_signed, signed; 0 otherwise) |
 | `fit.fallback_by_cause` | full | CPU fallback counts labelled by cause (`unsupported_plan`, `too_few_rows`, `too_many_constants`, `ill_conditioned`, `non_finite`, `launch`, …) |

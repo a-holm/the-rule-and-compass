@@ -777,6 +777,18 @@ SEARCH:
                              search setting: a resume refuses a different
                              value. No effect for other metrics or with
                              --fit-iters 0
+  --fit-thresholds          after the LM, fit each constant that is an operand of a
+                             comparison or sits in the condition of if by an exact
+                             1-D search (default off). The LM never moves such a
+                             constant because its gradient is zero. Candidates are
+                             the midpoints between sorted operand values on the
+                             fit rows (at most 64, then 64 more around the best),
+                             scored on the fitted loss (squared error for the
+                             squared family and --fitness pnl); at most 2
+                             constants per tree. Trees with such a constant take
+                             the CPU fit arm, never the device. A saved search
+                             setting: a resume refuses a different value. No
+                             effect with --fit-iters 0
   --refit-band <F>           after a device-fit search, refit exactly (CPU f64)
                              only the trees whose full-data error is within
                              this relative band of the lowest error at no
@@ -2795,6 +2807,7 @@ fn main() {
     let mut front_parents_set = false;
     let mut reject_constant_set = false;
     let mut reject_fixed_set = false; // #848
+    let mut fit_thresholds_set = false; // #1024
     // #465: explicit --selection for the resume settings check.
     let mut selection_set = false;
     let mut mutation_mix_set = false; // #471
@@ -3416,6 +3429,10 @@ fn main() {
             "--reject-fixed-position" => {
                 cfg.reject_fixed_position = true;
                 reject_fixed_set = true;
+            }
+            "--fit-thresholds" => {
+                cfg.fit_thresholds = true;
+                fit_thresholds_set = true;
             }
             // #27: evaluator path only; deliberately not a saved search
             // setting, because both paths produce identical errors.
@@ -4115,6 +4132,12 @@ fn main() {
             conflicts.push(format!(
                 "--reject-fixed-position (saved reject_fixed_position is {})",
                 saved.reject_fixed_position
+            ));
+        }
+        if fit_thresholds_set && cfg.fit_thresholds != saved.fit_thresholds {
+            conflicts.push(format!(
+                "--fit-thresholds (saved fit_thresholds is {})",
+                saved.fit_thresholds
             ));
         }
         if let Some(spec) = &op_complexity_spec {

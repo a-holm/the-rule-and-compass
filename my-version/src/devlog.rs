@@ -398,6 +398,9 @@ pub struct FitGen {
     /// #256: workers the fit-fallback batch used. This is the fit pool; the
     /// top-level `fallback.workers` is the evaluator's pool.
     pub fallback_workers: usize,
+    /// #1024: thresholds moved by the exact 1-D fit since process start; present
+    /// only with `--fit-thresholds`.
+    pub threshold_moves: Option<u64>,
 }
 
 impl FitGen {
@@ -415,7 +418,7 @@ impl FitGen {
         let improved_total: usize = self.fallback_improved_by_cause.iter().map(|(_, v)| *v).sum();
         format!(
             "{{\"attempts\":{},\"gpu\":{},\"fallback\":{},\"refits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\
-             \"host_seconds\":{},\"fallback_seconds\":{},\"gate_seconds\":{},\"fallback_workers\":{}}}",
+             \"host_seconds\":{},\"fallback_seconds\":{},\"gate_seconds\":{},\"fallback_workers\":{}{}}}",
             self.attempts,
             self.gpu,
             self.fallback,
@@ -426,7 +429,9 @@ impl FitGen {
             num(self.host_seconds),
             num(self.fallback_seconds),
             num(self.gate_seconds),
-            self.fallback_workers
+            self.fallback_workers,
+            self.threshold_moves
+                .map_or(String::new(), |m| format!(",\"threshold_moves\":{}", m)),
         )
     }
 }
@@ -1256,6 +1261,7 @@ mod tests {
                 fallback_seconds: 0.03,
                 gate_seconds: 0.02,
                 fallback_workers: 4,
+                threshold_moves: None,
             },
             fallback_s: 0.001,
             fallback_workers: 1,

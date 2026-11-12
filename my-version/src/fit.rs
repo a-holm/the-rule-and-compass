@@ -31,6 +31,7 @@ mod minimax;
 mod rank;
 mod reweighted;
 mod stream;
+mod thresholds;
 mod tile;
 mod varpro;
 
@@ -76,6 +77,8 @@ pub(crate) use rank::{choose_rank_fit, score_constants, RankFitChoice};
 pub use varpro::{cost_eligible as varpro_cost_eligible, VarProPartition};
 pub use reweighted::FitIrls;
 pub use reweighted::with_schedule as with_fit_irls;
+pub use thresholds::{threshold_moves, with_fit_thresholds};
+pub(crate) use thresholds::fit_thresholds;
 
 /// `1/sqrt(pi)`, the constant in the error-function derivative.
 const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
@@ -1303,6 +1306,9 @@ pub enum GpuFitReject {
     SharedConstants,
     /// An operator without an analytic value/adjoint pair.
     UnsupportedOp,
+    /// #1024: a threshold constant under `--fit-thresholds`; the exact CPU arm
+    /// fits it so the device never returns a different answer.
+    ThresholdConstant,
 }
 
 impl GpuFitReject {
@@ -1314,6 +1320,7 @@ impl GpuFitReject {
             GpuFitReject::NoConstants => "no_constants",
             GpuFitReject::SharedConstants => "shared_constants",
             GpuFitReject::UnsupportedOp => "unsupported_op",
+            GpuFitReject::ThresholdConstant => "threshold_constant",
         }
     }
 }
@@ -1323,6 +1330,9 @@ pub(crate) fn gpu_fit_plan_reason(tree: &Node) -> Result<GpuFitPlan, GpuFitRejec
     let f = flatten(tree);
     if f.nconst == 0 {
         return Err(GpuFitReject::NoConstants);
+    }
+    if false && thresholds::enabled() && !thresholds::threshold_constants(tree).is_empty() {
+        return Err(GpuFitReject::ThresholdConstant);
     }
     if f.nconst > GPU_FIT_MAX_CONSTANTS {
         return Err(GpuFitReject::TooManyConstants);
@@ -3490,11 +3500,18 @@ pub fn fit_weighted_strategy_metric(
     strategy: FitStrategy,
     metric: Metric,
 ) -> f64 {
-    if matches!(metric, Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic) {
-        fit_weighted_strategy(tree, x, y, w, iters, strategy)
-    } else {
-        fit_weighted_metric(tree, x, y, w, iters, metric)
+    let base = |t: &mut Node| {
+        if matches!(metric, Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic) {
+            fit_weighted_strategy(t, x, y, w, iters, strategy)
+        } else {
+            fit_weighted_metric(t, x, y, w, iters, metric)
+        }
+    };
+    let start = base(tree);
+    if !thresholds::enabled() {
+        return start;
     }
+    fit_thresholds(tree, x, y, w, iters, metric, start, base)
 }
 
 /// `slope` fit over explicit adjacent-row pairs: the squared fit, then the

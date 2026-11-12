@@ -658,7 +658,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--null-runs N] [--null-block N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
-     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--fit-polish f64|f32|off] [--fit-irls nested|reweighted|reweighted-final] [--refit-band F|inf] [--no-fit]
+     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--fit-polish f64|f32|off] [--fit-irls nested|reweighted|reweighted-final] [--fit-thresholds] [--refit-band F|inf] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring] [--reject-fixed-position]
@@ -1310,6 +1310,7 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   `0` (the default) keeps the historical path; the flag is independent of
   `--predictor-samples`;
 - **a cheaper `absolute` fit** (`--fit-irls reweighted|reweighted-final`, default `nested`): the CPU twin of the device L1 kernel, one Levenberg-Marquardt over the true L1 loss with the weights rebuilt at every assembly, needing about half the row passes of today's nested IRLS. It changes the fitted constants, so it is off by default and saved in the checkpoint; every reported front member is refit on `nested` IRLS (see `docs/optimisation.md`);
+- **exact threshold fit** (`--fit-thresholds`, default off): the LM never moves a constant that is an operand of a comparison or sits in the condition of `if` (its gradient is zero), so it keeps its random grid value. The flag adds an exact 1-D search over the midpoints between sorted operand values after the LM, on the loss the constants are fitted on. Trees with such a constant take the CPU fit arm. Details in `docs/optimisation.md` section 3.0.0a;
 - **seeded starts** (`--seed-expr`, `--seed-file`): prior solutions are parsed,
   simplified, fitted and inserted into the archive and every island before
   generation 1; a seed is an elite, kept even above `--max-complexity`;
