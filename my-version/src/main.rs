@@ -829,11 +829,12 @@ SEARCH:
                              front parent, no --qd-policy parent and no
                              migrant, sends no migrant, and restarts at the
                              end of each lifetime of a Luby schedule in
-                             units of --restart-interval generations. The
-                             other islands keep --restart-policy and a ring
-                             of their own; explore results reach them
-                             through the archive only. K must be below
-                             --islands. Saved search setting (#1100)
+                             units of the restart interval (60
+                             generations). The other islands keep
+                             --restart-policy and a ring of their own;
+                             explore results reach them through the
+                             archive only. K must be below --islands.
+                             Saved search setting (#1100)
   --front-scope global|island
                              where front parents come from. global
                              (default) draws them from the Pareto front of

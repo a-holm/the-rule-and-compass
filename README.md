@@ -1276,7 +1276,7 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
 - **opt-in scheduled explore tier** (`--explore-islands K`): the highest `K`
   islands take no front parent and no `--qd-policy` parent, send and receive no
   migrant, and restart at the end of each lifetime of a Luby schedule (1, 1, 2,
-  1, 1, 2, 4, ... units of `--restart-interval` generations, spread over the
+  1, 1, 2, 4, ... units of the 60-generation restart interval, spread over the
   explore islands), so a run holds many independent trials instead of one. The
   other islands keep the restart rule and a ring of their own and see explore
   results only through the archive. Node and flat postfix paths. Saved search
