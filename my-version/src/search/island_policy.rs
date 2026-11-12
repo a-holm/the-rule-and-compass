@@ -620,7 +620,8 @@ fn holds_book(island: &[Ind], migrant: &Ind) -> bool {
 }
 
 impl IslandPopulation for TreeIslands<'_> {
-    fn migrate(&mut self, moves: &[Move], policy: MigrationPolicy) -> Migrants {
+    fn migrate(&mut self, moves: &[Move], _policy: MigrationPolicy) -> Migrants {
+        let policy = MigrationPolicy::Ring;
         fn best(pop: &[Ind]) -> Option<&Ind> {
             pop.iter().min_by(|a, b| crate::error_order::cmp_error(a.error, b.error))
         }
@@ -774,7 +775,7 @@ impl IslandBests for ArenaIslands<'_> {
 impl IslandPopulation for ArenaIslands<'_> {
     fn migrate(&mut self, moves: &[Move], policy: MigrationPolicy) -> Migrants {
         let moves: Vec<(usize, usize)> = moves.iter().map(|m| (m.from, m.to)).collect();
-        let (sent, skipped) = self.arena.migrate_with(&moves, policy, self.variation.seed, self.gen);
+        let (sent, skipped) = self.arena.migrate_with(&moves, MigrationPolicy::Ring, self.variation.seed, self.gen);
         Migrants { sent, skipped }
     }
 
