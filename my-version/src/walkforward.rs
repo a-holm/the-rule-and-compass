@@ -118,6 +118,9 @@ pub struct ProtocolOptions {
     /// `split.fit_label`: the label report facts of the target (see
     /// [`crate::labels::fit_label_json`]).
     pub fit_label: Option<String>,
+    /// The horizon comes from a target spec, not from `--horizon` alone; the
+    /// report names it as the annualisation source.
+    pub horizon_from_spec: bool,
 }
 
 /// #482: where a candidate list came from: a run's Pareto front.
@@ -155,6 +158,7 @@ impl Default for ProtocolOptions {
             run_bands: None,
             quorum: None,
             fit_label: None,
+            horizon_from_spec: false,
         }
     }
 }
@@ -606,6 +610,10 @@ pub struct Report {
     pub periods_per_year: f64,
     /// How the pooled annualisation was chosen.
     pub annualization: String,
+    /// `target_spec`, `horizon_flag`, `explicit` or `inferred_labelled_rows`.
+    pub annualization_source: &'static str,
+    /// The period width in seconds; `None` for an explicit override without a declared horizon.
+    pub period_seconds: Option<f64>,
     /// Candidate expressions in report order.
     pub candidates: Vec<String>,
     /// Which fibre selected the candidate(s). Always validation when more than
@@ -1054,6 +1062,7 @@ fn apply_vote(d: &mut WindowData, thresholds: &[f64], need: usize, band_votes: f
 }
 
 fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), String> {
+    check_explicit_ppy(spec, opts)?;
     if spec.windows.is_empty() {
         return Err("at least one --window is required".to_string());
     }
@@ -1469,6 +1478,7 @@ impl Accum {
         };
         let n_candidates = if vote { 1 } else { members };
         let mut min_group_step: Option<f64> = None;
+        let mut period_source: Option<PeriodSource> = None;
         let mut pooled_times: Vec<f64> = Vec::new();
         let mut fresh_all: Vec<f64> = Vec::new();
         let mut market_all: Vec<f64> = Vec::new();
@@ -1542,10 +1552,8 @@ impl Accum {
             } else {
                 ThresholdSource::TrainType7
             };
-            let (ppy, inferred_dt) = match spec.periods_per_year {
-                Some(v) => (v, None),
-                None => infer_frequency(&d.test_rows),
-            };
+            let (ppy, inferred_dt, bucket, source) = window_period(spec, opts, &d.test_rows);
+            period_source = Some(source);
             let mut fresh_previous: HashMap<u64, f64> = HashMap::new();
             let ev = evaluate_window(
                 &d.test_rows,
@@ -1553,6 +1561,7 @@ impl Accum {
                 threshold,
                 cost_side,
                 ppy,
+                bucket,
                 &mut fresh_previous,
                 eval_policy,
                 band_width,
@@ -1579,6 +1588,7 @@ impl Accum {
                     threshold,
                     cost_side,
                     ppy,
+                    bucket,
                     &mut HashMap::new(),
                     eval_policy,
                     band_width,
@@ -1595,6 +1605,7 @@ impl Accum {
                     threshold,
                     cost_side,
                     ppy,
+                    bucket,
                     &mut pooled_previous,
                     eval_policy,
                     band_width,
@@ -1650,6 +1661,7 @@ impl Accum {
                         thresholds[c],
                         cost_side,
                         ppy,
+                        bucket,
                         &mut HashMap::new(),
                         eval_policy,
                         bands[c].resolved,
@@ -1730,10 +1742,11 @@ impl Accum {
             .iter()
             .map(|w| w.window.test_start - w.window.train_end)
             .fold(f64::INFINITY, f64::min);
-        let dt = {
+        let period_seconds = {
             let mut v: Vec<f64> = windows.iter().filter_map(|w| w.inferred_period_seconds).collect();
-            median(&mut v).unwrap_or(1.0)
+            median(&mut v)
         };
+        let dt = period_seconds.unwrap_or(1.0);
         let horizon_periods = if spec.horizon > 0.0 && dt > 0.0 {
             (spec.horizon / dt).ceil() as usize
         } else {
@@ -1762,6 +1775,7 @@ impl Accum {
             gross: &pooled_gross,
             times: &pooled_times,
             cost_bps: spec.cost_bps,
+            period_seconds,
             periods_per_year: pooled_ppy,
             sortino: pooled.sortino,
             cagr: pooled.cagr,
@@ -1810,10 +1824,15 @@ impl Accum {
         } else {
             None
         };
-        let annualization = if spec.periods_per_year.is_some() {
-            "explicit --periods-per-year".to_string()
-        } else {
-            "inferred from the median test time step (365-day year)".to_string()
+        let annualization_source = period_source.unwrap_or(PeriodSource::InferredLabelledRows);
+        let annualization = match annualization_source {
+            PeriodSource::TargetSpec | PeriodSource::HorizonFlag => {
+                "365-day year over the label horizon (one period per horizon)".to_string()
+            }
+            PeriodSource::Explicit => "explicit --periods-per-year".to_string(),
+            PeriodSource::InferredLabelledRows => {
+                "inferred from the median step of the labelled test times (365-day year)".to_string()
+            }
         };
         let sign_test = fold_sign_test(&windows);
         let batch_started = clock.elapsed().as_secs_f64();
@@ -1917,6 +1936,8 @@ impl Accum {
             embargo: spec.embargo_seconds(),
             periods_per_year: pooled_ppy,
             annualization,
+            annualization_source: annualization_source.as_str(),
+            period_seconds,
             candidates: expressions,
             selected_on,
             front: opts.front.clone(),
@@ -2246,15 +2267,19 @@ struct ControlInput {
     check_device: bool,
 }
 
-/// One timestamp's `(sum, count)` cross-section.
+/// One period's `(sum, count)` cross-section.
 ///
-/// The equal-weight return is `sum / count` over the groups present at the
-/// timestamp. Carrying the pair (rather than a pre-divided mean) is what makes
-/// a symbol-parallel decomposition merge to exactly the sequential result:
-/// denominators differ when a symbol is missing at a timestamp.
+/// A period is one timestamp, or with a bucket width `S` all timestamps with
+/// the same `floor(t / S)`; its stamp is the first timestamp seen. The
+/// equal-weight return is `sum / count` over the rows in the period. Carrying
+/// the pair (rather than a pre-divided mean) is what makes a symbol-parallel
+/// decomposition merge to exactly the sequential result: denominators differ
+/// when a symbol is missing at a timestamp.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CrossSection {
     pub periods: Vec<PeriodSum>,
+    /// Bucket width in seconds; `0` keeps one period per timestamp.
+    bucket: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2266,11 +2291,24 @@ pub struct PeriodSum {
 }
 
 impl CrossSection {
+    /// Periods of `seconds` width: rows with equal `floor(t / seconds)` share one
+    /// period. A non-positive width is one period per timestamp.
+    pub fn with_bucket(seconds: f64) -> CrossSection {
+        CrossSection { periods: Vec::new(), bucket: if seconds > 0.0 { seconds } else { 0.0 } }
+    }
+
+    fn key(&self, time: f64) -> f64 {
+        if self.bucket > 0.0 { (time / self.bucket).floor() } else { time }
+    }
+
     /// Add one row's net and gross return. Calls must arrive in nondecreasing
     /// time order; equal timestamps accumulate into one period.
     pub fn add(&mut self, time: f64, net: f64, gross: f64) {
+        let key = self.key(time);
+        let bucket = self.bucket;
         if let Some(last) = self.periods.last_mut() {
-            if last.time == time {
+            let last_key = if bucket > 0.0 { (last.time / bucket).floor() } else { last.time };
+            if last_key == key {
                 last.net_sum += net;
                 last.gross_sum += gross;
                 last.count += 1;
@@ -2297,20 +2335,19 @@ impl CrossSection {
             } else if j == other.periods.len() {
                 false
             } else {
-                other.periods[j]
-                    .time
-                    .partial_cmp(&self.periods[i].time)
+                self.key(other.periods[j].time)
+                    .partial_cmp(&self.key(self.periods[i].time))
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .is_lt()
             };
             if take_other {
                 out.push(other.periods[j]);
                 j += 1;
-            } else if j < other.periods.len() && other.periods[j].time == self.periods[i].time {
+            } else if j < other.periods.len() && self.key(other.periods[j].time) == self.key(self.periods[i].time) {
                 let a = self.periods[i];
                 let b = other.periods[j];
                 out.push(PeriodSum {
-                    time: a.time,
+                    time: a.time.min(b.time),
                     net_sum: a.net_sum + b.net_sum,
                     gross_sum: a.gross_sum + b.gross_sum,
                     count: a.count + b.count,
@@ -2372,6 +2409,7 @@ pub fn reference_metrics(
         threshold,
         cost_side,
         periods_per_year,
+        0.0,
         &mut previous,
         Policy::Threshold,
         0.0,
@@ -2410,6 +2448,7 @@ pub fn reference_cell(
         threshold,
         cost_side,
         1.0,
+        0.0,
         previous,
         Policy::Threshold,
         0.0,
@@ -2443,6 +2482,7 @@ fn evaluate_window(
     threshold: f64,
     cost_side: f64,
     ppy: f64,
+    bucket: f64,
     previous: &mut HashMap<u64, f64>,
     policy: Policy,
     band_width: f64,
@@ -2784,7 +2824,7 @@ fn evaluate_window(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| ra.group.cmp(&rb.group))
     });
-    let mut cross = CrossSection::default();
+    let mut cross = CrossSection::with_bucket(bucket);
     for &i in &time_order {
         let row = &rows[valid[i]];
         cross.add(row.time, net[i], positions[i] * row.target);
@@ -2800,7 +2840,7 @@ fn evaluate_window(
             for (k, &i) in group_order.iter().enumerate() {
                 by_index[i] = ord_net[k];
             }
-            let mut cs = CrossSection::default();
+            let mut cs = CrossSection::with_bucket(bucket);
             for &i in &time_order {
                 cs.add(rows[valid[i]].time, by_index[i], 0.0);
             }
@@ -2821,7 +2861,7 @@ fn evaluate_window(
     });
 
     let times: Vec<f64> = cross.periods.iter().map(|p| p.time).collect();
-    let mut market_cross = CrossSection::default();
+    let mut market_cross = CrossSection::with_bucket(bucket);
     for &i in &time_order {
         let row = &rows[valid[i]];
         market_cross.add(row.time, row.target, row.target);
@@ -2833,7 +2873,7 @@ fn evaluate_window(
         let mut last_time = f64::NAN;
         let mut period_count: Vec<u32> = Vec::new();
         for &i in &time_order {
-            let t = rows[valid[i]].time;
+            let t = if bucket > 0.0 { (rows[valid[i]].time / bucket).floor() } else { rows[valid[i]].time };
             if current < 0 || t != last_time {
                 current += 1;
                 last_time = t;
@@ -3022,8 +3062,73 @@ fn median(values: &mut [f64]) -> Option<f64> {
     }
 }
 
+/// Where the period width `S` of the annualisation came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeriodSource {
+    TargetSpec,
+    HorizonFlag,
+    Explicit,
+    InferredLabelledRows,
+}
+
+impl PeriodSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PeriodSource::TargetSpec => "target_spec",
+            PeriodSource::HorizonFlag => "horizon_flag",
+            PeriodSource::Explicit => "explicit",
+            PeriodSource::InferredLabelledRows => "inferred_labelled_rows",
+        }
+    }
+}
+
+/// The period width declared by the run: the target spec's horizon, else
+/// `--horizon`. One independent return per group spans exactly this width.
+fn declared_period(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<(f64, PeriodSource)> {
+    if spec.horizon.is_finite() && spec.horizon >= 1.0 && spec.horizon <= SECONDS_PER_YEAR {
+        let source = if opts.horizon_from_spec { PeriodSource::TargetSpec } else { PeriodSource::HorizonFlag };
+        Some((spec.horizon, source))
+    } else {
+        None
+    }
+}
+
+/// Refuse an explicit `--periods-per-year` that contradicts the declared period.
+fn check_explicit_ppy(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), String> {
+    if let (Some(given), Some((s, PeriodSource::TargetSpec))) = (spec.periods_per_year, declared_period(spec, opts)) {
+        let derived = SECONDS_PER_YEAR / s;
+        if ((given - derived) / derived).abs() > 1e-9 {
+            return Err(format!(
+                "--periods-per-year {} conflicts with {} derived from the target spec horizon ({} s); remove the flag or edit the spec",
+                given, derived, s
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Annualisation of one window: `(periods_per_year, period_seconds, bucket
+/// width, source)`. The bucket width is `0` (one period per timestamp) unless
+/// the run declares the period.
+fn window_period(spec: &EvalSpec, opts: &ProtocolOptions, rows: &[RowBase]) -> (f64, Option<f64>, f64, PeriodSource) {
+    if let Some((s, source)) = declared_period(spec, opts) {
+        return match spec.periods_per_year {
+            Some(v) if source == PeriodSource::HorizonFlag => (v, Some(s), s, PeriodSource::Explicit),
+            _ => (SECONDS_PER_YEAR / s, Some(s), s, source),
+        };
+    }
+    match spec.periods_per_year {
+        Some(v) => (v, None, 0.0, PeriodSource::Explicit),
+        None => {
+            let (ppy, dt) = infer_frequency(rows);
+            (ppy, dt, 0.0, PeriodSource::InferredLabelledRows)
+        }
+    }
+}
+
+/// Median step of the distinct times of rows that carry a finite target.
 fn infer_frequency(rows: &[RowBase]) -> (f64, Option<f64>) {
-    let mut times: Vec<f64> = rows.iter().map(|r| r.time).collect();
+    let mut times: Vec<f64> = rows.iter().filter(|r| r.target.is_finite()).map(|r| r.time).collect();
     times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     times.dedup_by(|a, b| *a == *b);
     let mut diffs: Vec<f64> = times
@@ -3433,7 +3538,7 @@ impl Report {
              \"method\":\"exact order-preserving radix select + linear interpolation (numpy type 7) in f64\",\
              \"sources\":[\"train_type7\",\"validation_type7\",\"fixed\"],\
              \"screening_only\":false,\"source\":{}}},\
-             \"annualization\":{{\"periods_per_year\":{},\"method\":{}}},\
+             \"annualization\":{{\"periods_per_year\":{},\"method\":{},\"source\":{},\"period_seconds\":{}}},\
              \"risk_model\":{{\"mode\":\"per-period\",\"periods_per_year\":{},\
              \"sharpe\":{{\"scale\":\"sqrt(periods_per_year)\",\"ddof\":1,\
              \"undefined\":\"n<2, sd=0 (cash) or periods_per_year<=0\"}},\
@@ -3489,6 +3594,8 @@ impl Report {
                 .unwrap_or("none")),
             jnum(self.periods_per_year),
             jstr(&self.annualization),
+            jstr(self.annualization_source),
+            self.period_seconds.map_or("null".to_string(), jnum),
             jnum(self.periods_per_year),
             jnum(crate::risk::DEFAULT_SORTINO_MAR),
             self.candidates
@@ -4128,5 +4235,62 @@ mod locked_reach_tests {
         assert!(validate_windows(&guard, &opts).is_ok());
         guard.windows[0].train_end = 29.0;
         assert!(validate_windows(&guard, &opts).unwrap_err().contains("reaches the declared locked test"));
+    }
+
+    #[test]
+    fn infer_frequency_ignores_unlabelled_rows() {
+        let row = |i: usize, labelled: bool| RowBase {
+            time: i as f64 * 3600.0,
+            group: 0,
+            target: if labelled { 0.01 } else { f64::NAN },
+        };
+        let h1: Vec<RowBase> = (0..120).map(|i| row(i, i % 5 != 2)).collect();
+        let (ppy, dt) = infer_frequency(&h1);
+        assert_eq!(dt, Some(3600.0));
+        assert_eq!(ppy, 8760.0);
+
+        let daily: Vec<RowBase> = (0..24 * 20).map(|i| row(i, i % 24 == 0)).collect();
+        let (ppy, dt) = infer_frequency(&daily);
+        assert_eq!(dt, Some(86_400.0));
+        assert_eq!(ppy, 365.0);
+    }
+
+    #[test]
+    fn bucket_series_equals_the_timestamp_series_on_a_shared_grid() {
+        let s = 3600.0;
+        let mut plain = CrossSection::default();
+        let mut bucket = CrossSection::with_bucket(s);
+        for k in 0..10 {
+            for g in 0..3 {
+                let r = 0.001 * (k * 3 + g) as f64;
+                plain.add(1000.0 * s + k as f64 * s, r, r);
+                bucket.add(1000.0 * s + k as f64 * s, r, r);
+            }
+        }
+        assert_eq!(plain.periods, bucket.periods);
+        assert_eq!(plain.series(), bucket.series());
+    }
+
+    #[test]
+    fn staggered_rows_share_a_bucket_and_merge_by_bucket() {
+        let day = 86_400.0;
+        let mut cs = CrossSection::with_bucket(day);
+        for (t, r) in [(0.0, 0.01), (7.0 * 3600.0, 0.02), (15.0 * 3600.0, 0.03), (day, 0.04)] {
+            cs.add(t, r, r);
+        }
+        assert_eq!(cs.periods.len(), 2);
+        assert_eq!(cs.periods[0].count, 3);
+        assert_eq!(cs.periods[0].time, 0.0);
+        let (net, _) = cs.series();
+        assert!((net[0] - 0.02).abs() < 1e-15);
+        let mut a = CrossSection::with_bucket(day);
+        let mut b = CrossSection::with_bucket(day);
+        a.add(0.0, 0.01, 0.01);
+        b.add(7.0 * 3600.0, 0.03, 0.03);
+        b.add(day, 0.04, 0.04);
+        a.merge(&b);
+        assert_eq!(a.periods.len(), 2);
+        assert_eq!(a.periods[0].count, 2);
+        assert_eq!(a.periods[0].time, 0.0);
     }
 }

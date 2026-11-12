@@ -1080,7 +1080,7 @@ fn walkforward_purge_floor_at_168h() {
         rcsr_cmd::rcsr()
             .args([
                 "walkforward", "--data", data.to_str().unwrap(), "--target", "lbl_h168_y", "--target-spec",
-                spec_path.to_str().unwrap(), "--expr", "x", "--time", "ts", "--periods-per-year", "52", "--window", &w, "--json",
+                spec_path.to_str().unwrap(), "--expr", "x", "--time", "ts", "--window", &w, "--json",
             ])
             .output()
             .unwrap()

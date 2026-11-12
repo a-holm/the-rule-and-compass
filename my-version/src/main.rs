@@ -5759,6 +5759,9 @@ fn main() {
     // #468: the long/flat book earns the full per-row return, so rows of one
     // group must not be closer than the label horizon.
     let target_horizon = book_resolved.as_ref().or(target_resolved.as_ref()).map_or(0.0, |r| r.spec.horizon_seconds);
+    if let Some(s) = trading_spec.as_mut() {
+        s.period_seconds = (target_horizon > 0.0).then_some(target_horizon);
+    }
     let mut min_group_step: Option<f64> = None;
     if let (Some(_), Some(split), Some(r)) = (&trading_spec, prepared.trading.as_ref(), book_resolved.as_ref().or(target_resolved.as_ref())) {
         let horizon = r.spec.horizon_seconds;
@@ -11153,8 +11156,13 @@ OPTIONS:
   --pool-reset-flat          reset every group to flat at a window seam (the
                              historical pooled P&L); default carries the boundary
                              position, so total variation includes |p_end-q_start|
-  --periods-per-year <f>     annualisation override (default: infer from the
-                             median test time step; 365 for daily crypto bars)
+  --periods-per-year <f>     annualisation override. Default: 31536000 / S, S the
+                             label horizon (target spec, else --horizon), else
+                             the median step of labelled test times. A period is
+                             the bucket floor(t / S); without a declared
+                             horizon a period is one timestamp. With a target
+                             spec a different value exits 2; with --horizon
+                             alone it overrides
   --device-pnl               recompute each test block through the fused
                              long-only reduction (f64 canonical segments; the
                              CUDA kernel when built with --features cuda) and
@@ -11902,6 +11910,7 @@ fn run_walkforward(args: &[String]) -> ! {
             }
         };
         horizon = Some(agree("--horizon", horizon, s.horizon_seconds));
+        popts.horizon_from_spec = s.horizon_seconds > 0.0;
         popts.entry_offset = agree("--entry-offset", entry_offset_flag, s.entry_offset_seconds);
         popts.fit_label = target::label_report_for(&data_path, &s.column).and_then(|r| rcsr::labels::fit_label_json(&r));
         popts.delay = agree("--delay", delay_flag, s.delay_seconds);
@@ -12246,7 +12255,7 @@ fn run_walkforward(args: &[String]) -> ! {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") { EXIT_USAGE } else { EXIT_INPUT });
+            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") || e.starts_with("--periods-per-year") { EXIT_USAGE } else { EXIT_INPUT });
         }
     };
     if spec.threshold_fixed.is_none() {

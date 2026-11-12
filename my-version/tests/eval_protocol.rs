@@ -271,7 +271,12 @@ fn bootstrap_nulls_and_multiple_testing_are_reported_and_reproducible() {
     let r = walkforward::run_table_with(&t, &s, "t", &o).unwrap();
     let inf = r.inference.as_ref().unwrap();
     let b = inf.bootstrap.as_ref().unwrap();
-    assert!(b.block_len >= 5, "block length must cover the 5 h label: {}", b.block_len);
+    assert_eq!(b.n, r.pooled.periods);
+    let hold = if r.pooled.entries > 0 { (r.pooled.active_rows as f64 / r.pooled.entries as f64).ceil() as usize } else { 1 };
+    let cube = (b.n as f64).cbrt().ceil() as usize;
+    let want = 1usize.max(hold).max(cube).min(b.n);
+    assert!(want < 5, "fixture must separate the one-period horizon from the old 5-period rule: {want}");
+    assert_eq!(b.block_len, want, "max(ceil(5h/5h)=1, hold {hold}, ceil(n^(1/3)) {cube})");
     assert!(b.mean_ci.lo <= b.mean && b.mean <= b.mean_ci.hi);
     assert!(b.design_effect > 0.0 && b.effective_n > 0.0);
     let m = inf.multiple.as_ref().unwrap();
@@ -301,15 +306,19 @@ fn bootstrap_nulls_and_multiple_testing_are_reported_and_reproducible() {
 }
 
 #[test]
-fn a_block_shorter_than_the_label_overlap_is_refused() {
+fn a_block_shorter_than_the_holding_floor_is_refused() {
     let t = panel(600, 3);
     let s = panel_spec(600);
     let mut o = ProtocolOptions::default();
     o.bootstrap_draws = 200;
-    o.block_len = Some(2);
+    let free = walkforward::run_table_with(&t, &s, "t", &o).unwrap();
+    let hold = if free.pooled.entries > 0 { (free.pooled.active_rows as f64 / free.pooled.entries as f64).ceil() as usize } else { 1 };
+    let floor = hold.max(1);
+    assert!(floor >= 2, "fixture must make the holding period the floor: {floor}");
+    o.block_len = Some(floor - 1);
     let err = walkforward::run_table_with(&t, &s, "t", &o).unwrap_err();
-    assert!(err.contains("max(horizon, hold)"), "{}", err);
-    o.block_len = Some(40);
+    assert!(err.contains(&format!("max(horizon, hold) = {floor} periods")), "{}", err);
+    o.block_len = Some(floor);
     assert!(walkforward::run_table_with(&t, &s, "t", &o).is_ok());
 }
 

@@ -936,7 +936,7 @@ fn fit_label_effective_n_in_reports() {
     let window = format!("f0,{},{},{},{}", w(0), w(30), w(32), w(52));
     let (code, out, err) = run_rcsr(&[
         "walkforward", "--data", &data, "--target", "lbl_h168_y", "--target-spec", &spec, "--expr", "ret1", "--vars", "ret1",
-        "--time", "ts", "--group-by", "symbol", "--periods-per-year", "52", "--window", &window, "--json",
+        "--time", "ts", "--group-by", "symbol", "--window", &window, "--json",
     ]);
     assert_eq!(code, 0, "{err}");
     let split = rcsr::manifest::object(&out, "split").expect("split");
@@ -1042,7 +1042,7 @@ fn embargo_after_test_block_covers_h336() {
         );
         run_rcsr(&[
             "walkforward", "--data", &data, "--target", "lbl_h336_y", "--target-spec", &spec_path, "--expr", "ret1", "--vars",
-            "ret1", "--time", "ts", "--periods-per-year", "26", "--window", &window, "--json",
+            "ret1", "--time", "ts", "--window", &window, "--json",
         ])
     };
     let (code, _, err) = wf(e0 + 1_213_200 - HOUR);
