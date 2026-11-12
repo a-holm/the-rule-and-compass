@@ -1445,3 +1445,69 @@ fn a_hold_above_32_exits_2_on_gpu_and_falls_back_in_auto() {
         assert_eq!(s.error.to_bits(), b.regret(&pred).to_bits(), "{}", show(&s.tree));
     }
 }
+
+// ---- #1082: book signatures from the kept device totals ----
+
+/// The kept device totals give every candidate the signature the CPU book
+/// gives the device's own predictions; a candidate whose regret is not finite
+/// has none.
+fn assert_signatures(f: &Fixture, b: &FitnessBook, trees: &[Node]) -> usize {
+    let Some(mut ev) = evaluator(f, b) else {
+        return 0;
+    };
+    assert!(ev.keep_pnl_totals(true));
+    let pop = compiled(trees);
+    let (prog, off) = pop.programs();
+    let scored = ev.score_batch(prog, off, ScoreObjective::LongPnl, &vec![0; trees.len()]);
+    assert!(scored.ms >= 0.0 && scored.values.len() == trees.len());
+    let sigs = ev.kept_pnl_signatures(trees.len(), b.blocks()).expect("the batch kept its totals");
+    assert!(ev.kept_pnl_signatures(trees.len() + 1, b.blocks()).is_none(), "another count is refused");
+    let mut signed = 0usize;
+    for k in 0..trees.len() {
+        let words = &prog[off[k] as usize..off[k + 1] as usize];
+        let pred: Vec<f64> = ev.predict_one_for_tests(words).expect("the device predicts").iter().map(|&p| p as f64).collect();
+        let (regret, want) = b.regret_signed(&pred);
+        assert_eq!(scored.values[k].to_bits(), regret.to_bits(), "program {k} regret");
+        if regret.is_finite() {
+            assert_eq!(sigs[k], want, "program {k} signature");
+            signed += 1;
+        }
+    }
+    signed
+}
+
+#[test]
+fn device_book_signatures_equal_the_cpu_signatures() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    for blocks in [1usize, 4] {
+        let b = book_blocks(&f, 1, blocks, 1.0);
+        let signed = assert_signatures(&f, &b, &programs(24, 5));
+        assert!(signed == 0 || signed >= 8, "{signed} signed programs at {blocks} blocks");
+    }
+    let band = band_book(&f, 0.05, BandUnits::Score, 3, 1);
+    let signed = assert_signatures(&f, &band, &band_programs(24, 5));
+    assert!(signed == 0 || signed >= 8, "{signed} signed programs on the band book");
+}
+
+#[test]
+fn device_pnl_search_signs_every_finite_member() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let (sample, b) = search_fixture();
+    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let seen: Archived = Arc::default();
+    for cfg in [
+        config(&b, &seen),
+        Config { fit_strategy: rcsr::fit::FitStrategy::Gpu, pipeline_depth: 0, ..config(&b, &seen) },
+    ] {
+        let out = search::run(&cfg, &sample, &sample);
+        assert_device_scored(&out);
+        let books = out.books.as_ref().expect("a long/flat search counts books");
+        assert!(books.signed > 0 && books.distinct >= 1 && books.distinct <= books.signed, "{books:?}");
+        assert_eq!(books.unsigned, 0, "every finite member carries a book");
+        assert_eq!(books.islands.len(), cfg.islands);
+    }
+}

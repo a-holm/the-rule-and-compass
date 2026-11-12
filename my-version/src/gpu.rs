@@ -625,6 +625,24 @@ struct RawPnlTotals {
     block_exits: [u64; 8],
 }
 
+/// #1082: [`crate::trading::book_signature`] of one candidate's device totals;
+/// `None` for a non-finite prediction.
+fn pnl_signature(t: &RawPnlTotals, blocks: usize) -> Option<crate::trading::BookSig> {
+    if t.nonfinite != 0 {
+        return None;
+    }
+    let per_block: Vec<crate::trading::FitnessTotals> = (0..blocks)
+        .map(|b| crate::trading::FitnessTotals {
+            gross: t.block_gross[b],
+            flips: t.block_flips[b],
+            exits: t.block_exits[b],
+            long_rows: 0,
+            nonfinite: false,
+        })
+        .collect();
+    Some(crate::trading::book_signature(t.longs, &per_block))
+}
+
 /// #925: `RcPnlSd` in `src/cuda/eval.cu`, field for field.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -879,6 +897,9 @@ extern "C" {
         status: *mut i32,
         totals: *mut RawPnlTotals,
     ) -> i32;
+    /* #1082: keep the totals of every long_pnl batch and download the last. */
+    fn rc_set_pnl_keep(ctx: *mut RawCtx, on: i32) -> i32;
+    fn rc_pnl_kept_totals(ctx: *mut RawCtx, nprog: i32, out: *mut RawPnlTotals) -> i32;
     /* #925: the band of the uploaded book and the test-only sd download. */
     fn rc_set_pnl_band(ctx: *mut RawCtx, band: f64, sd_units: i32, hold: i32) -> i32;
     fn rc_pnl_band_sd(ctx: *mut RawCtx, nprog: i32, out: *mut RawPnlSd) -> i32;
@@ -2043,6 +2064,32 @@ impl GpuEvaluator {
         let mut out = vec![0.0f32; n];
         let rc = unsafe { rc_predict(self.ctx, words.as_ptr(), offsets.as_ptr(), 1, out.as_mut_ptr()) };
         (rc == 0).then_some(out)
+    }
+
+    /// #1082: keep the per-candidate totals of every `long_pnl` batch on the
+    /// device for [`GpuEvaluator::kept_pnl_signatures`]. A refused allocation
+    /// turns keeping off and the batch runs without totals.
+    pub fn keep_pnl_totals(&mut self, on: bool) -> bool {
+        unsafe { rc_set_pnl_keep(self.ctx, on as i32) == 0 }
+    }
+
+    /// #1082: the book signature of each of the `n` candidates of the last
+    /// `long_pnl` batch, from the totals the kernel wrote; `None` for a
+    /// non-finite candidate. `None` overall when no totals were kept.
+    pub fn kept_pnl_signatures(
+        &mut self,
+        n: usize,
+        blocks: usize,
+    ) -> Option<Vec<Option<crate::trading::BookSig>>> {
+        if n == 0 || blocks == 0 || blocks > crate::trading::FITNESS_MAX_BLOCKS {
+            return None;
+        }
+        let mut raw = vec![RawPnlTotals::default(); n];
+        let rc = unsafe { rc_pnl_kept_totals(self.ctx, i32::try_from(n).ok()?, raw.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        Some(raw.iter().map(|t| pnl_signature(t, blocks)).collect())
     }
 
     /// #481 test hook: score a packed batch with [`ScoreObjective::LongPnl`]

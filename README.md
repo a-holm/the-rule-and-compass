@@ -664,7 +664,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring] [--reject-fixed-position]
-     [--selection lexicographic|afp] [--restart-policy archive|island] [--restart-isolation N]
+     [--selection lexicographic|afp] [--same-book-guard] [--restart-policy archive|island] [--restart-isolation N]
      [--mutation-mix classic|extended] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
      [--patience N]
@@ -1265,6 +1265,13 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   crowding distance, a few random immigrants join each generation, and parents
   are drawn by Pareto rank. Small correct shapes and new lineages survive next
   to large approximations. Node path only; the default stays `lexicographic`;
+- **distinct long/flat books** under `--fitness pnl`: every scored candidate carries a
+  book signature (per-block gross bits, flips and exits and the long rows, from the
+  totals the scorer already reduces on the CPU and the device), the development log
+  and run.json `search.books` count the distinct books per island and over all
+  islands, and the opt-in `--same-book-guard` draws parent tournaments over distinct
+  books (one entrant per book, its simplest holder) instead of members. Node path
+  only; saved search setting; off by default;
 - **opt-in island-local restarts** (`--restart-policy island`, `--restart-isolation W`):
   the default rule restarts an island only while its best is worse than the
   archive best, which ring migration makes false for every island within a few

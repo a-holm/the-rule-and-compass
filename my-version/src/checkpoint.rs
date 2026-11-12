@@ -36,6 +36,7 @@
 //! | `mix <i> <numbers>` | #471: adaptive edit counts of island i, 14 numbers per generation |
 //! | `rng <i|main> <idx> <624 words>` | exact MT19937 state |
 //! | `ind <i> <error> <complexity> <tree>` | one population member |
+//! | `books <i> <sig|->...` | #1082: book signature of each member of island i (16 hex digits), written only under `--same-book-guard` |
 //!
 //! Trees are encoded recursively as `op_index val arity child...`, where
 //! `op_index` is [`Op::index`] and `val` is the exact floating-point value
@@ -77,6 +78,9 @@ pub struct Individual {
     /// #465: generations since the lineage began. Written only by
     /// `--selection afp` runs; every other checkpoint reads back 0.
     pub age: u32,
+    /// #1082: the book signature. Written only by `--same-book-guard` runs;
+    /// every other checkpoint reads back `None`.
+    pub book: Option<crate::trading::BookSig>,
 }
 
 /// One island: its RNG stream and its population, in order.
@@ -464,6 +468,21 @@ fn next_token<'a>(
     Ok(token)
 }
 
+/// #1082: a book signature as 16 hex digits, `-` for none.
+fn encode_book(book: Option<crate::trading::BookSig>) -> String {
+    book.map_or_else(|| "-".to_string(), |b| format!("{:016x}", b.get()))
+}
+
+fn decode_book(token: &str) -> Option<Option<crate::trading::BookSig>> {
+    if token == "-" {
+        return Some(None);
+    }
+    if token.len() != 16 {
+        return None;
+    }
+    u64::from_str_radix(token, 16).ok().and_then(crate::trading::BookSig::new).map(Some)
+}
+
 fn encode_f64(v: f64) -> String {
     if v.is_nan() {
         "NaN".to_string()
@@ -687,6 +706,10 @@ impl Checkpoint {
                 let ages: Vec<String> = isl.population.iter().map(|ind| ind.age.to_string()).collect();
                 writeln!(out, "ages {} {}", i, ages.join(" ")).unwrap();
             }
+            if self.config.same_book_guard {
+                let books: Vec<String> = isl.population.iter().map(|ind| encode_book(ind.book)).collect();
+                writeln!(out, "books {} {}", i, books.join(" ")).unwrap();
+            }
         }
         out
     }
@@ -728,6 +751,7 @@ impl Checkpoint {
         let mut island_mix: Vec<Option<crate::mix::MixWindow>> = Vec::new();
         let mut island_pops: Vec<Option<Vec<Individual>>> = Vec::new();
         let mut island_ages: Vec<Option<Vec<u32>>> = Vec::new();
+        let mut island_books: Vec<Option<Vec<Option<crate::trading::BookSig>>>> = Vec::new();
         let mut main_rng: Option<Mt> = None;
         let mut error_kind: Option<ErrorKind> = None;
         let mut stored_archive_hash: Option<u64> = None;
@@ -1036,6 +1060,7 @@ impl Checkpoint {
                             error,
                             complexity,
                             age: 0,
+                            book: None,
                         });
                 }
                 "ages" => {
@@ -1049,6 +1074,22 @@ impl Checkpoint {
                     }
                     if island_ages[i].replace(ages).is_some() {
                         return Err(format!("line {}: duplicate ages record for island {}", lineno, i));
+                    }
+                }
+                "books" => {
+                    let i = parse_num::<usize>(&parts, 1, lineno, "books island")?;
+                    let mut books = Vec::with_capacity(parts.len().saturating_sub(2));
+                    for token in parts.iter().skip(2) {
+                        books.push(
+                            decode_book(token)
+                                .ok_or_else(|| format!("line {}: books value '{}' is not 16 hex digits or -", lineno, token))?,
+                        );
+                    }
+                    if island_books.len() <= i {
+                        island_books.resize_with(i + 1, || None);
+                    }
+                    if island_books[i].replace(books).is_some() {
+                        return Err(format!("line {}: duplicate books record for island {}", lineno, i));
                     }
                 }
                 other => {
@@ -1141,6 +1182,26 @@ impl Checkpoint {
                 }
                 None if config.selection == crate::search::Selection::Afp => {
                     return Err(format!("checkpoint is incomplete: island {} has no ages", i));
+                }
+                None => {}
+            }
+            // #1082: the guard draws its tournaments from these signatures.
+            match island_books.get_mut(i).and_then(|s| s.take()) {
+                Some(books) if books.len() == population.len() => {
+                    for (ind, book) in population.iter_mut().zip(books) {
+                        ind.book = book;
+                    }
+                }
+                Some(books) => {
+                    return Err(format!(
+                        "checkpoint is inconsistent: island {} has {} book signature(s) for {} individual(s)",
+                        i,
+                        books.len(),
+                        population.len()
+                    ));
+                }
+                None if config.same_book_guard => {
+                    return Err(format!("checkpoint is incomplete: island {} has no books record", i));
                 }
                 None => {}
             }
@@ -1513,6 +1574,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "qd_control",    // #120
         "variation",     // #122: missing means auto
         "selection",     // #465: missing means lexicographic
+        "same_book_guard", // #1082: missing means off
         "mutation_mix",       // #471: missing means classic
         "crossover_internal", // #471: missing means 0
         "adaptive_mix",       // #471: missing means false
@@ -1894,6 +1956,13 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             .map_err(|e| format!("config 'selection' is invalid: {}", e))?,
     };
 
+    // #1082: absent means off, matching every earlier checkpoint.
+    let same_book_guard = match fields.get("same_book_guard").map(|s| s.as_str()) {
+        None => false,
+        Some("on") => true,
+        Some(raw) => return Err(format!("config 'same_book_guard' is invalid: '{}'", raw)),
+    };
+
     // #1022: absent means archive and 25, matching every earlier checkpoint.
     let restart_policy = match fields.get("restart_policy").map(|s| s.as_str()) {
         None => crate::search::RestartPolicy::Archive,
@@ -1971,6 +2040,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         fit_tail_overlap: true,
         variation,
         selection,
+        same_book_guard,
         restart_policy,
         restart_isolation,
         mutation_mix,
@@ -2068,6 +2138,11 @@ fn write_config(cfg: &Config, out: &mut String) {
     // keeps its bytes.
     if cfg.selection != crate::search::Selection::Lexicographic {
         writeln!(out, "config selection {}", cfg.selection.as_str()).unwrap();
+    }
+    // #1082: written only when on, so every other checkpoint and config hash
+    // keeps its bytes.
+    if cfg.same_book_guard {
+        writeln!(out, "config same_book_guard on").unwrap();
     }
     // #1022: written only under the island policy, so every other checkpoint and
     // config hash keeps its bytes.

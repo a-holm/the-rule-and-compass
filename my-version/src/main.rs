@@ -806,6 +806,12 @@ SEARCH:
                              random immigrants per generation and picks
                              parents by Pareto rank and crowding distance.
                              Node path only; refuses --variation postfix
+  --same-book-guard          under --fitness pnl, parent tournaments draw over
+                             distinct long/flat books: one entrant per book,
+                             its simplest holder, so copies of one book are
+                             not selected several times. Needs --fitness pnl;
+                             refuses --selection afp, --qd-policy and
+                             --variation postfix. Saved search setting (#1082)
   --restart-policy archive|island
                              which stall rule restarts an island every
                              restart interval (60 generations). archive
@@ -2842,6 +2848,7 @@ fn main() {
     let mut fit_thresholds_set = false; // #1024
     // #465: explicit --selection for the resume settings check.
     let mut selection_set = false;
+    let mut same_book_guard_set = false; // #1082
     // #1022: explicit restart flags for the resume settings check.
     let mut restart_policy_set = false;
     let mut restart_isolation_set = false;
@@ -3453,6 +3460,11 @@ fn main() {
                     }
                 }
             }
+            // #1082: parent tournaments over distinct books.
+            "--same-book-guard" => {
+                cfg.same_book_guard = true;
+                same_book_guard_set = true;
+            }
             // #1022: which stall rule restarts an island.
             "--restart-policy" => {
                 let v = val!();
@@ -3843,6 +3855,22 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
+    // #1082: the guard replaces the lexicographic tournament of the node path.
+    if cfg.same_book_guard {
+        let clash = if cfg.selection == crate::search::Selection::Afp {
+            Some("--selection afp (parents come from the rank and crowding tournament)")
+        } else if cfg.qd_policy {
+            Some("--qd-policy (parents come from the QD archive)")
+        } else if cfg.variation == crate::search::VariationMode::Postfix {
+            Some("--variation postfix (the guard runs on the node path; use --variation auto or node)")
+        } else {
+            None
+        };
+        if let Some(what) = clash {
+            eprintln!("error: --same-book-guard is not supported with {}", what);
+            std::process::exit(EXIT_USAGE);
+        }
+    }
     // #928: a re-selection is a resume that runs nothing.
     if reselect_path.is_some() || reselect_run_path.is_some() {
         let conflicts = [
@@ -4142,6 +4170,10 @@ fn main() {
                 cfg.selection.as_str(),
                 saved.selection.as_str()
             ));
+        }
+        // #1082: the tournament rule is saved search state.
+        if same_book_guard_set && cfg.same_book_guard != saved.same_book_guard {
+            conflicts.push(format!("--same-book-guard (saved same_book_guard is {})", saved.same_book_guard));
         }
         // #1022: the restart rule is saved search state.
         if restart_policy_set && cfg.restart_policy != saved.restart_policy {
@@ -5428,6 +5460,9 @@ fn main() {
             if given {
                 trading_usage(&format!("{} needs --fitness pnl", flag));
             }
+        }
+        if cfg.same_book_guard {
+            trading_usage("--same-book-guard needs --fitness pnl: a book signature exists only for the long/flat fitness");
         }
     }
     let mut trading_spec: Option<rcsr::trading::TradingSpec> = None;
@@ -8648,7 +8683,7 @@ fn main() {
                 outcome.generations,
                 outcome.candidates_evaluated,
                 format!(
-                    "{}{}{}",
+                    "{}{}{}{}",
                     if cfg.fit_irls_active() {
                         format!(",\"fit_irls\":{}", jstr(cfg.fit_irls.name()))
                     } else {
@@ -8659,7 +8694,9 @@ fn main() {
                     } else {
                         String::new()
                     },
-                    format!(",\"cumulative\":{}", cumulative_json)
+                    format!(",\"cumulative\":{}", cumulative_json),
+                    // #1082: distinct books of the final population under --fitness pnl.
+                    outcome.books.as_ref().map_or_else(String::new, |b| format!(",\"books\":{}", b.json(true)))
                 ),
                 outcome.converged_early,
                 jstr(outcome.stop_reason),

@@ -1396,6 +1396,26 @@ fn fnv_u64(h: &mut u64, v: u64) {
     }
 }
 
+/// #1082: the identity of a long/flat book in the search, see [`book_signature`].
+pub type BookSig = std::num::NonZeroU64;
+
+/// #1082: FNV-1a over the block count, the whole-book long rows and, per time
+/// block, the gross bits, flips and exits. The regret is a function of these
+/// numbers, so two candidates with one signature have one error. `long_rows`
+/// is the whole-book count because the device counts long rows for the whole
+/// book only; the per-block `long_rows` of `blocks` are not read.
+pub fn book_signature(long_rows: u64, blocks: &[FitnessTotals]) -> BookSig {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    fnv_u64(&mut h, blocks.len() as u64);
+    fnv_u64(&mut h, long_rows);
+    for t in blocks {
+        fnv_u64(&mut h, t.gross.to_bits());
+        fnv_u64(&mut h, t.flips);
+        fnv_u64(&mut h, t.exits);
+    }
+    BookSig::new(h).unwrap_or(BookSig::MIN)
+}
+
 impl FitnessBook {
     /// `horizon_seconds` is the label horizon of the target; rows of one group
     /// closer than that are refused (#468). A non-positive horizon skips it.
@@ -1687,6 +1707,23 @@ impl FitnessBook {
         } else {
             self.fitness_of(&self.block_totals(pred))
         }
+    }
+
+    /// #1082: [`FitnessBook::regret`] and the [`book_signature`] of the same
+    /// totals, from one reduction of `pred`. `None` when the regret is not
+    /// finite.
+    pub fn regret_signed(&self, pred: &[f64]) -> (f64, Option<BookSig>) {
+        let blocks = if self.blocks() == 1 {
+            vec![self.totals(pred)]
+        } else {
+            self.block_totals(pred)
+        };
+        let regret = if self.blocks() == 1 { self.regret_of(&blocks[0]) } else { self.fitness_of(&blocks) };
+        if !regret.is_finite() {
+            return (regret, None);
+        }
+        let long_rows = blocks.iter().map(|t| t.long_rows).sum();
+        (regret, Some(book_signature(long_rows, &blocks)))
     }
 
     /// Time blocks of the consistency term; 1 is the plain regret.

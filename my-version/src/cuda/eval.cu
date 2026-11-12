@@ -226,6 +226,14 @@ struct RcCtx {
     int pnl_blocks;
     unsigned long long pnl_min_trades;
     void *d_pnl_totals;
+    /* #1082: when `pnl_keep` is set, every long/flat batch writes its
+       per-candidate totals to `d_pnl_keep` (`pnl_keep_cap` candidates wide);
+       `pnl_keep_n` is the candidate count of the last batch that wrote them, 0
+       when the last batch wrote none. */
+    void *d_pnl_keep;
+    int pnl_keep_cap;
+    int pnl_keep;
+    int pnl_keep_n;
     /* #925: the band `--band B` (score units, or the multiple of the training
        sd when `pnl_sd_units`), the minimum hold (1 to RC_PNL_MAX_HOLD) and the
        per-candidate sd buffer of `pnl_sd_kernel`, `pnl_sd_cap` candidates wide.
@@ -2374,7 +2382,7 @@ static void rc_pnl_launch(RcCtx *c, const unsigned int *prog, const unsigned int
     blk.nb = c->pnl_blocks;
     const double *excess = (const double *)c->d_pnl_book;
     const unsigned char *flags = c->d_pnl_book + sizeof(double) * (size_t)c->n;
-    RcPnlTotals *totals = (RcPnlTotals *)c->d_pnl_totals;
+    RcPnlTotals *totals = (RcPnlTotals *)(c->d_pnl_totals ? c->d_pnl_totals : (c->pnl_keep ? c->d_pnl_keep : 0));
     c->pnl_sd_timed = 0;
     if (c->pnl_band != 0.0 || c->pnl_hold != 1) {
         const RcPnlSd *sd = 0;
@@ -5790,6 +5798,7 @@ void rc_destroy(void *ctx)
     if (c->d_pnl_book) rc_dev_free(c, c->d_pnl_book);
     if (c->d_pnl_sd) rc_dev_free(c, c->d_pnl_sd);
     if (c->d_pnl_ballots) rc_dev_free(c, c->d_pnl_ballots);
+    if (c->d_pnl_keep) rc_dev_free(c, c->d_pnl_keep);
     if (c->d_pool[0]) rc_dev_free(c, c->d_pool[0]);
     if (c->d_pool[1]) rc_dev_free(c, c->d_pool[1]);
     if (c->d_hash) rc_dev_free(c, c->d_hash);
@@ -6212,6 +6221,22 @@ static int rc_pnl_sd_reserve(RcCtx *c, int nprog)
     return 0;
 }
 
+/* #1082: grow the kept long/flat totals to `nprog` candidates. A refused
+   allocation turns keeping off instead of failing the batch: the totals are a
+   measurement, the score does not need them. */
+static void rc_pnl_keep_reserve(RcCtx *c, int nprog)
+{
+    if (c->pnl_keep_cap >= nprog) return;
+    if (c->d_pnl_keep) { rc_dev_free(c, c->d_pnl_keep); c->d_pnl_keep = 0; }
+    c->pnl_keep_cap = 0;
+    if (rc_dev_alloc(c, "pnl_keep", &c->d_pnl_keep, sizeof(RcPnlTotals) * (size_t)nprog) != 0) {
+        c->d_pnl_keep = 0;
+        c->pnl_keep = 0;
+        return;
+    }
+    c->pnl_keep_cap = nprog;
+}
+
 /* #945: grow the ballot buffer of the band kernels to `blocks` blocks.
    Returns 0 on success. */
 static int rc_pnl_ballot_reserve(RcCtx *c, int blocks)
@@ -6501,6 +6526,7 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
 {
     RcStats *st = &c->stats;
     double t = rc_now_ms();
+    c->pnl_keep_n = 0;
     if (rc_score_reserve(c, nprog) != 0) {
         st->failed = 1;
         st->alloc_ms += rc_now_ms() - t;
@@ -6545,6 +6571,7 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
         st->wall_ms = rc_now_ms() - c->batch_start_ms;
         return -1.0f;
     }
+    if (kind == RC_SCORE_LONG_PNL && c->pnl_keep && !c->d_pnl_totals) rc_pnl_keep_reserve(c, nprog);
     if (kind == RC_SCORE_LONG_PNL && (c->pnl_band != 0.0 || c->pnl_hold != 1) &&
         rc_pnl_ballot_reserve(c, nprog < RC_PNL_BALLOT_CAP ? nprog : RC_PNL_BALLOT_CAP) != 0) {
         st->failed = 1;
@@ -6677,6 +6704,7 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
     t = rc_now_ms();
     rc_download(out, c->d_score_out, sizeof(double) * (size_t)nprog);
     rc_download(status, c->d_score_status, sizeof(int) * (size_t)nprog);
+    if (kind == RC_SCORE_LONG_PNL && c->pnl_keep && c->d_pnl_keep && !c->d_pnl_totals) c->pnl_keep_n = nprog;
     st->d2h_ms += rc_now_ms() - t;
     st->d2h_bytes += sizeof(double) * (unsigned long long)nprog
                    + sizeof(int) * (unsigned long long)nprog;
@@ -6844,6 +6872,33 @@ int rc_pnl_band_sd(void *ctx, int nprog, RcPnlSd *out)
     RcCtx *c = (RcCtx *)ctx;
     if (!c || !out || nprog <= 0 || !c->pnl_sd_units || !c->d_pnl_sd || nprog > c->pnl_sd_cap) return -1;
     rc_download(out, c->d_pnl_sd, sizeof(RcPnlSd) * (size_t)nprog);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+/* #1082: keep (on != 0) or stop keeping the per-candidate totals of every
+   long/flat batch. Stopping releases the buffer. Returns 0, or -1 for a null
+   context. */
+int rc_set_pnl_keep(void *ctx, int on)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c) return -1;
+    c->pnl_keep = on != 0;
+    c->pnl_keep_n = 0;
+    if (!c->pnl_keep && c->d_pnl_keep) {
+        rc_dev_free(c, c->d_pnl_keep);
+        c->d_pnl_keep = 0;
+        c->pnl_keep_cap = 0;
+    }
+    return 0;
+}
+
+/* #1082: download the totals of the last long/flat batch. Returns 0, or -1
+   when that batch kept none or `nprog` is not its candidate count. */
+int rc_pnl_kept_totals(void *ctx, int nprog, RcPnlTotals *out)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !out || nprog <= 0 || !c->d_pnl_keep || nprog != c->pnl_keep_n) return -1;
+    rc_download(out, c->d_pnl_keep, sizeof(RcPnlTotals) * (size_t)nprog);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
