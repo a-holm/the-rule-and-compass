@@ -482,6 +482,16 @@ iteration plus a four-step polish); after the #135 fix the same daily-panel
 search went from about 3 200 to 7 240 candidate evaluations per second. With the
 default `--fit-iters 8` the fit is bit-for-bit unchanged.
 
+The device fit kernel (`--fit-strategy gpu`) has a second budget on its squared
+arm, `--fit-max-iters N` (default `4 x --fit-iters`, `0` means the default).
+After `--fit-iters` damped trials it tests convergence (the Gauss-Newton model
+drop at the current constants against `1e-3` of the loss) and continues the
+same damped run while the test fails, up to `N` trials in all, before the
+undamped polish. `--fit-iters` stays the cost knob: the damped work of one fit
+is at most `N` trials, and `N = --fit-iters` runs no test and no extra trial.
+The CPU fits and the other device arms ignore it. See
+[the GPU backend](gpu-backend.md#batched-constant-fitting-issue-169).
+
 Three effects are visible. First, **accuracy**: constant fitting turns
 "approximately right" into "exact", which is why the errors drop by 13–20 orders
 of magnitude on the first two problems. Second, **speed**: the third problem is

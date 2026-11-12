@@ -765,6 +765,16 @@ SEARCH:
                              refit exactly on the CPU in every mode. Only the
                              device fit arm reads it; a resume refuses a
                              different saved value
+  --fit-max-iters <N>        damped trial budget of the device fit kernel's
+                             squared arm (default 4 x --fit-iters; 0 = the
+                             default). After --fit-iters trials the kernel
+                             tests convergence (the Gauss-Newton model drop at
+                             the current constants against 1e-3 of the loss)
+                             and takes more damped trials while it fails, up
+                             to N in all, before the polish. N = --fit-iters
+                             runs no extra trial; N below --fit-iters exits 2.
+                             Only the device fit arm reads it; a resume
+                             refuses a different saved value
   --fit-irls <nested|reweighted|reweighted-final>
                              schedule of the CPU constant fit for absolute and
                              implicit_residual (default nested, today's IRLS).
@@ -1492,6 +1502,12 @@ fn ledger_json(
         .map(|(name, n)| format!("{}:{}", jstr(name), n))
         .collect::<Vec<_>>()
         .join(",");
+    let kept_causes = l
+        .fallback_device_kept_by_cause()
+        .iter()
+        .map(|(name, n)| format!("{}:{}", jstr(name), n))
+        .collect::<Vec<_>>()
+        .join(",");
     let structural_zero = Stage::ALL
         .iter()
         .filter(|s| s.structurally_zero_in_search())
@@ -1511,7 +1527,7 @@ fn ledger_json(
         rcsr::gpu_stats::Ratio::undefined(f64::NAN, f64::NAN, "decades_per_gpu_hour", "run")
     };
     format!(
-        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"drain_wall_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"fallback_s\":{},\"tail_overlap_s\":{},\"tail_join_wait_s\":{},\"gate_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"eval_check\":{{\"scope\":\"run\",\"units\":\"seconds\",\"leaf_of\":\"eval\",\"prefix_s\":{},\"pool_s\":{},\"slots\":{},\"trade_floor_slots\":{},\"bound_flat\":{},\"early_rows\":{},\"full_passes\":{},\"finite\":{}}},\"quality_per_gpu_hour\":{}}}",
+        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"drain_wall_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"fallback_s\":{},\"tail_overlap_s\":{},\"tail_join_wait_s\":{},\"gate_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"fallback_device_kept_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"eval_check\":{{\"scope\":\"run\",\"units\":\"seconds\",\"leaf_of\":\"eval\",\"prefix_s\":{},\"pool_s\":{},\"slots\":{},\"trade_floor_slots\":{},\"bound_flat\":{},\"early_rows\":{},\"full_passes\":{},\"finite\":{}}},\"quality_per_gpu_hour\":{}}}",
         jnum(l.wall_s()),
         stages,
         jnum(l.stage_sum_s()),
@@ -1551,6 +1567,7 @@ fn ledger_json(
         causes,
         l.fallback_improved(),
         improved_causes,
+        kept_causes,
         l.fit_alloc().alloc_calls,
         l.fit_alloc().growths,
         l.fit_alloc().steady_alloc_calls,
@@ -1629,7 +1646,7 @@ fn gpu_json(
         .iter()
         .map(|s| {
             format!(
-                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_admitted_wide\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_improved\":{},\"fit_fallback_improved_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"nonfinite\":{},\"nonfinite_trade_floor\":{},\"nonfinite_constant\":{},\"nonfinite_bound\":{},\"nonfinite_early\":{},\"nonfinite_no_book\":{},\"nonfinite_full\":{},\"nonfinite_cpu_finite\":{},\"nonfinite_seconds\":{},\"opcodes\":{{{}}}}}",
+                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_admitted_wide\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_improved\":{},\"fit_fallback_improved_by_cause\":{{{}}},\"fit_fallback_device_kept_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"nonfinite\":{},\"nonfinite_trade_floor\":{},\"nonfinite_constant\":{},\"nonfinite_bound\":{},\"nonfinite_early\":{},\"nonfinite_no_book\":{},\"nonfinite_full\":{},\"nonfinite_cpu_finite\":{},\"nonfinite_seconds\":{},\"opcodes\":{{{}}}}}",
                 s.generation,
                 s.programs,
                 s.native,
@@ -1646,6 +1663,7 @@ fn gpu_json(
                 ops_json(&s.fit_fallback_by_cause),
                 s.fit_fallback_improved_by_cause.values().sum::<usize>(),
                 ops_json(&s.fit_fallback_improved_by_cause),
+                ops_json(&s.fit_fallback_device_kept_by_cause),
                 jnum(s.fit_fallback_seconds),
                 s.fit_fallback_bounded,
                 s.fit_fallback_workers,
@@ -1691,7 +1709,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"carried_kept\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"tail_overlap_s\":{},\"tail_join_wait_s\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{},\"calls\":{},\"candidates\":{},\"call_s_max\":{},\"fold_count\":{},\"folded\":{},\"fallback_skipped_by_cause\":{{{}}}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"carried_kept\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"tail_overlap_s\":{},\"tail_join_wait_s\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{},\"calls\":{},\"candidates\":{},\"call_s_max\":{},\"fold_count\":{},\"folded\":{},\"fallback_skipped_by_cause\":{{{}}},\"fallback_device_kept_by_cause\":{{{}}},\"max_iters\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1732,7 +1750,9 @@ fn gpu_json(
         jnum(g.fit_call_ms_max / 1000.0),
         g.fit_fold_count,
         g.fit_folded,
-        ops_json(&g.fit_fallback_skipped_by_cause)
+        ops_json(&g.fit_fallback_skipped_by_cause),
+        ops_json(&g.fit_fallback_device_kept_by_cause),
+        g.fit_max_iters
     );
     let run_wall = if g.ledger.wall_s() > 0.0 {
         g.ledger.wall_s()
@@ -2804,6 +2824,7 @@ fn main() {
     // #495: explicit --refit-band for the resume settings check.
     let mut refit_band_set = false;
     let mut fit_polish_set = false;
+    let mut fit_max_iters_set = false; // #1042
     let mut fit_irls_set = false;
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
@@ -3269,6 +3290,11 @@ fn main() {
                         std::process::exit(EXIT_USAGE);
                     }
                 }
+            }
+            // #1042: damped trial budget of the device fit kernel.
+            "--fit-max-iters" => {
+                cfg.fit_max_iters = parse_uint("--fit-max-iters", &val!());
+                fit_max_iters_set = true;
             }
             // #496: arithmetic of the device fit polish.
             "--fit-polish" => {
@@ -4074,6 +4100,19 @@ fn main() {
                 saved.fit_polish.name()
             ));
         }
+        // #1042: compared as budgets, so `0` and `4 * fit_iters` agree.
+        if fit_max_iters_set {
+            let fit_iters = if fit_iters_set { cfg.fit_iters } else { saved.fit_iters };
+            let had = saved.fit_max_iters_effective();
+            if cfg.fit_max_iters != 0 && cfg.fit_max_iters < fit_iters {
+                conflicts.push(format!(
+                    "--fit-max-iters must be at least --fit-iters ({} < {})",
+                    cfg.fit_max_iters, fit_iters
+                ));
+            } else if search::fit_max_iters_budget(fit_iters, cfg.fit_max_iters) != had {
+                conflicts.push(format!("--fit-max-iters {} (saved {})", cfg.fit_max_iters, had));
+            }
+        }
         if fit_fallback_max_set && cfg.fit_fallback_max != saved.fit_fallback_max {
             conflicts.push(format!(
                 "--fit-fallback-max {} (saved {})",
@@ -4213,6 +4252,17 @@ fn main() {
         resumed_generation = Some(cp.generations);
         resume_checkpoint = Some(cp);
     }
+
+    // #1042: `0` means `4 * fit_iters`; the run reports and saves the budget
+    // it resolves to.
+    if cfg.fit_max_iters != 0 && cfg.fit_max_iters < cfg.fit_iters {
+        eprintln!(
+            "error: --fit-max-iters must be at least --fit-iters ({} < {})",
+            cfg.fit_max_iters, cfg.fit_iters
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    cfg.fit_max_iters = cfg.fit_max_iters_effective();
 
     // #141: probe the device once, before the dataset is loaded. The probe
     // allocates nothing; the search opens its own resident context later. This
@@ -8439,12 +8489,13 @@ fn main() {
                 )
             } else {
                 format!(
-                    "{{\"loss\":{},\"value\":{},\"strategy\":{},\"fit_rows\":{},\"gpu_batches\":{}{}}}",
+                    "{{\"loss\":{},\"value\":{},\"strategy\":{},\"fit_rows\":{},\"gpu_batches\":{},\"fit_max_iters\":{}{}}}",
                     jstr(cfg.metric.name()),
                     jnum(best_fit_loss),
                     jstr(cfg.fit_strategy.name()),
                     outcome.fit_rows,
                     fit::fit_arm_counts_full().since(fit_before).gpu,
+                    cfg.fit_max_iters,
                     fit_provenance_json
                 )
             };
@@ -13288,6 +13339,37 @@ mod tests {
             "\"call_s_max\":0,\"fold_count\":7,\"folded\":6",
         ] {
             assert!(json.contains(key), "{key} in {json}");
+        }
+    }
+
+    /// #1042: the routed fits that kept their device answer are counted by cause
+    /// in `gpu.fit`, every `gpu.generations[]` entry and `gpu.ledger.fit`, and
+    /// `gpu.fit.max_iters` is the resolved budget; help and schema name both.
+    #[test]
+    fn gpu_json_reports_the_kept_device_answers_and_the_budget() {
+        let kept: BTreeMap<String, usize> = [("unconverged".to_string(), 2)].into_iter().collect();
+        let mut g = search::GpuRunStats::default();
+        g.fit_fallback_device_kept_by_cause = kept.clone();
+        g.fit_max_iters = 12;
+        g.generations.push(search::GpuGenStats {
+            generation: 1,
+            fit_fallback_device_kept_by_cause: kept.clone(),
+            ..Default::default()
+        });
+        g.ledger.record_fit_device_kept(kept);
+        let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true, 10.0, None);
+        assert!(
+            json.contains("\"fallback_skipped_by_cause\":{},\"fallback_device_kept_by_cause\":{\"unconverged\":2},\"max_iters\":12}"),
+            "{json}"
+        );
+        assert!(json.contains("\"fit_fallback_device_kept_by_cause\":{\"unconverged\":2}"), "{json}");
+        assert!(
+            json.contains("\"fallback_improved_by_cause\":{},\"fallback_device_kept_by_cause\":{\"unconverged\":2},\"alloc\":"),
+            "{json}"
+        );
+        assert!(usage().contains("--fit-max-iters <N>"));
+        for needle in ["\"--fit-max-iters\"", "fallback_device_kept_by_cause", "max_iters (#1042"] {
+            assert!(schema::json().contains(needle), "schema is missing {needle}");
         }
     }
 

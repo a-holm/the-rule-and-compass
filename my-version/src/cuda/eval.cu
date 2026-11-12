@@ -2735,6 +2735,8 @@ struct FtSmem {
     int sskip;
     int simproved;
     int sstart;
+    /* #1042: the convergence test after the damped trials passed. */
+    int sconv;
     double slambda;
     double sbest;
     /* #236: the previous chunk's last row for the slope pair of a chunk's
@@ -2743,8 +2745,8 @@ struct FtSmem {
     double sdcarry[MAXC + 1];
 };
 
-static_assert(sizeof(FtSmem<16, 256, 128>) == 28040, "FtSmem<16,256,128> shared block");
-static_assert(sizeof(FtSmem<20, 128, 128>) == 31624, "FtSmem<20,128,128> shared block");
+static_assert(sizeof(FtSmem<16, 256, 128>) == 28048, "FtSmem<16,256,128> shared block");
+static_assert(sizeof(FtSmem<20, 128, 128>) == 31632, "FtSmem<20,128,128> shared block");
 
 /* Fit-kernel helpers for the piecewise operators. `ft_ind` is the 0/1 truth
    indicator `[x > 0]`, `NaN` for `NaN`, as `ind` in fit.rs. `ft_mod_ok` is the
@@ -4139,7 +4141,9 @@ __device__ double ft_model_drop(const double *jtj, const double *jtr, const doub
 }
 
 /* #959: a rejected undamped polish step whose model drop exceeds this
-   fraction of the loss leaves a point that is not stationary (status 9). */
+   fraction of the loss leaves a point that is not stationary (status 9).
+   #1042: the same bound, on the undamped step at the end of the damped trials,
+   decides whether the squared arm spends more of its `max_iters` budget. */
 #define FT_UNCONVERGED_DROP 1e-3
 
 __global__ void cast_f32_to_f64_kernel(const float *__restrict__ src,
@@ -4486,13 +4490,14 @@ __device__ void ft_corr_mask_gauge(double *jtj, double *jtr, int p, double rho, 
     const double *__restrict__ cbase, \
     const int *__restrict__ gauge, \
     int iters, \
+    int max_iters, \
     int metric, \
     int polish, \
     double *__restrict__ outc, \
     double *__restrict__ outsse, \
     int *__restrict__ outstatus, \
     unsigned long long *__restrict__ outcyc
-#define FIT_KERNEL_ARGS cols, y, tsign, cols64, y64, tsign64, w64, pmask, n, v, prog, off, pcount, kmax, c0, cbase, gauge, iters, metric, polish, outc, outsse, outstatus, outcyc
+#define FIT_KERNEL_ARGS cols, y, tsign, cols64, y64, tsign64, w64, pmask, n, v, prog, off, pcount, kmax, c0, cbase, gauge, iters, max_iters, metric, polish, outc, outsse, outstatus, outcyc
 
 template <int MAXC, int CHUNK, int PCHUNK>
 __device__ __forceinline__ void fit_kernel_body(FIT_KERNEL_PARAMS)
@@ -4721,6 +4726,10 @@ __device__ __forceinline__ void fit_kernel_body(FIT_KERNEL_PARAMS)
                       metric == RC_LOSS_SLOPE);
     const int rounds = irls ? (iters < 1 ? 1 : (iters < 4 ? iters : 4)) : 1;
     const int inner = irls ? (iters / rounds < 1 ? 1 : iters / rounds) : iters;
+    /* #1042: damped trials of the whole fit, accepted or rejected. The first
+       pass of the rounds below never reaches it (`rounds * inner <= iters`);
+       only the squared continuation spends the part above `iters`. */
+    const int budget = max_iters > iters ? max_iters : iters;
     int phase = 0;
     /* #236: a slope step that is exactly zero (every slot frozen, e.g. a lone
        additive constant) can never improve, so the damped loop stops. */
@@ -4738,9 +4747,14 @@ __device__ __forceinline__ void fit_kernel_body(FIT_KERNEL_PARAMS)
         best = S->sbest;
         if (tid == 0) S->sstart = S->sbad ? 0 : 1;
         if (S->sbad) status = 2;
+        /* Block-uniform, like every exit of the loops below. */
+        int trials = 0;
+        /* #1042: the rounds, then the squared continuation that closes it. */
+        for (;;) {
         for (int round = 0; round < rounds && status == 0 && best != 0.0 && !stalled; ++round) {
             if (irls && round > 0) assembled = 0; /* new weights, new Gram */
-            for (int it = 0; it < inner && status == 0; ++it) {
+            for (int it = 0; it < inner && status == 0 && trials < budget; ++it) {
+                ++trials;
                 if (!assembled) {
                     ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, pmask, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad, S->scarry);
                     assembled = 1;
@@ -4816,6 +4830,31 @@ __device__ __forceinline__ void fit_kernel_body(FIT_KERNEL_PARAMS)
                 }
                 __syncthreads();
             }
+        }
+            /* #1042: every other arm, and the squared arm at
+               `max_iters == iters`, leave here before any extra pass. */
+            if (metric != RC_LOSS_SQUARED || status != 0 || best == 0.0 || stalled) break;
+            if (trials >= budget) break;
+            if (S->slambda > 1e9) break;
+            if (!assembled) {
+                ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, pmask, n, p, metric, phase, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad, S->scarry);
+                assembled = 1;
+                if (S->sbad) {
+                    status = 2;
+                    break;
+                }
+            }
+            /* The Newton decrement at the current constants: the model drop of
+               the undamped step, the quantity status 9 judges after the
+               polish. A non-finite drop is unconverged; the budget bounds it.
+               An unconverged fit takes more damped trials from this system. */
+            if (tid == 0) {
+                const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta, S->sL, scale_free);
+                const double drop = (solve == 1) ? 0.0 : ft_model_drop(S->sjtj, S->sjtr, S->sdelta, p);
+                S->sconv = (solve == 1) || (isfinite(drop) && drop <= FT_UNCONVERGED_DROP * best);
+            }
+            __syncthreads();
+            if (S->sconv) break;
         }
         t_lm_end = clock64();
         /* Re-baseline the acceptance objective in f64: `best` so far came from
@@ -5049,6 +5088,7 @@ static int ft_launch(RcCtx *c,
                      const double *d_cbase,
                      const int *d_gauge,
                      int iters,
+                     int max_iters,
                      int metric,
                      int polish,
                      double *d_c,
@@ -5075,11 +5115,11 @@ static int ft_launch(RcCtx *c,
     }
     if constexpr (CHUNK == 256) {
         rc_launch("fit_kernel_two_blocks<MAXC, CHUNK, PCHUNK>", fit_kernel_two_blocks<MAXC, CHUNK, PCHUNK>, nprog, CHUNK, bytes, c->s_fit, c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->d_pmask, c->n,
-            c->v, d_prog, d_off, d_p, kmax, d_c0, d_cbase, d_gauge, iters, metric, polish, d_c,
+            c->v, d_prog, d_off, d_p, kmax, d_c0, d_cbase, d_gauge, iters, max_iters, metric, polish, d_c,
             d_sse, d_status, d_cyc);
     } else {
         rc_launch("fit_kernel<MAXC, CHUNK, PCHUNK>", fit_kernel<MAXC, CHUNK, PCHUNK>, nprog, CHUNK, bytes, c->s_fit, c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->d_pmask, c->n,
-            c->v, d_prog, d_off, d_p, kmax, d_c0, d_cbase, d_gauge, iters, metric, polish, d_c,
+            c->v, d_prog, d_off, d_p, kmax, d_c0, d_cbase, d_gauge, iters, max_iters, metric, polish, d_c,
             d_sse, d_status, d_cyc);
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
@@ -7126,6 +7166,10 @@ int rc_set_slope_pairs(void *ctx, const unsigned int *bits, long long npairs)
  * the `c0` layout. The slope arm starts from `c0` (the squared warm start) and
  * returns `cbase` unless its own answer is finite and strictly lower on the
  * f64 slope sum. Every other code ignores it.
+ *
+ * #1042: `max_iters` is the damped trial budget of the squared arm, clamped
+ * to at least `iters`; `max_iters == iters` runs no continuation. Every other
+ * code ignores it.
  */
 static float rc_fit_launch(RcCtx *c,
                            const unsigned int *prog,
@@ -7137,6 +7181,7 @@ static float rc_fit_launch(RcCtx *c,
                            const double *cbase,
                            const int *gauge,
                            int iters,
+                           int max_iters,
                            int metric,
                            double *outc,
                            double *outsse,
@@ -7187,14 +7232,14 @@ static float rc_fit_launch(RcCtx *c,
         launched = ft_launch<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK>(
             c, nprog, kmax, (const unsigned int *)(base + o_prog),
             (const unsigned int *)(base + o_off), (const int *)(base + o_p),
-            (const double *)(base + o_c0), d_cbase, (const int *)(base + o_gauge), iters, metric,
+            (const double *)(base + o_c0), d_cbase, (const int *)(base + o_gauge), iters, max_iters, metric,
             c->fit_polish, (double *)(base + o_c), (double *)(base + o_sse),
             (int *)(base + o_status), (unsigned long long *)(base + o_cyc));
     } else {
         launched = ft_launch<FT_MAX_CONST_LARGE, FT_CHUNK_LARGE, FT_PCHUNK>(
             c, nprog, kmax, (const unsigned int *)(base + o_prog),
             (const unsigned int *)(base + o_off), (const int *)(base + o_p),
-            (const double *)(base + o_c0), d_cbase, (const int *)(base + o_gauge), iters, metric,
+            (const double *)(base + o_c0), d_cbase, (const int *)(base + o_gauge), iters, max_iters, metric,
             c->fit_polish, (double *)(base + o_c), (double *)(base + o_sse),
             (int *)(base + o_status), (unsigned long long *)(base + o_cyc));
     }
@@ -7233,12 +7278,13 @@ float rc_fit_batch(void *ctx,
                    const double *c0,
                    const int *gauge,
                    int iters,
+                   int max_iters,
                    int metric,
                    double *outc,
                    double *outsse,
                    int *outstatus)
 {
-    return rc_fit_launch((RcCtx *)ctx, prog, off, pcount, nprog, kmax, c0, 0, gauge, iters,
+    return rc_fit_launch((RcCtx *)ctx, prog, off, pcount, nprog, kmax, c0, 0, gauge, iters, max_iters,
                          metric, outc, outsse, outstatus);
 }
 
@@ -7254,12 +7300,13 @@ float rc_fit_batch_from(void *ctx,
                         const double *cbase,
                         const int *gauge,
                         int iters,
+                        int max_iters,
                         int metric,
                         double *outc,
                         double *outsse,
                         int *outstatus)
 {
-    return rc_fit_launch((RcCtx *)ctx, prog, off, pcount, nprog, kmax, c0, cbase, gauge, iters,
+    return rc_fit_launch((RcCtx *)ctx, prog, off, pcount, nprog, kmax, c0, cbase, gauge, iters, max_iters,
                          metric, outc, outsse, outstatus);
 }
 
