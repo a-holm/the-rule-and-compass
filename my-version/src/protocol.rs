@@ -387,8 +387,19 @@ impl RangeBinding<'_> {
 pub enum Event {
     Candidate(Candidate),
     Seal { sealed_sha256: String, final_seal: Option<FinalSeal> },
-    TestRead { id: String, report_sha256: String, read_count: u64, locked_test: Option<LockedRange> },
-    BaselineRead { data_sha256: String, report_sha256: String, locked_test: Option<LockedRange> },
+    TestRead {
+        id: String,
+        report_sha256: String,
+        read_count: u64,
+        locked_test: Option<LockedRange>,
+        binding_sha256: Option<String>,
+    },
+    BaselineRead {
+        data_sha256: String,
+        report_sha256: String,
+        locked_test: Option<LockedRange>,
+        binding_sha256: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -496,11 +507,13 @@ impl Ledger {
                     report_sha256: need("report_sha256")?,
                     read_count: field_u64(&line, "read_count").ok_or_else(|| fault_field(p, n, &kind, "read_count"))?,
                     locked_test: LockedRange::parse(&line),
+                    binding_sha256: field_str(&line, "binding_sha256"),
                 },
                 "baseline_read" => Event::BaselineRead {
                     data_sha256: need("data_sha256")?,
                     report_sha256: need("report_sha256")?,
                     locked_test: LockedRange::parse(&line),
+                    binding_sha256: field_str(&line, "binding_sha256"),
                 },
                 other => return Err(format!("unknown ledger event '{}'", other)),
             });
@@ -796,13 +809,26 @@ impl Ledger {
 
     /// Append `test_read:true` for `id`. Returns the new total read count.
     pub fn record_read(&self, id: &str, report_sha256: &str, range: Option<&LockedRange>) -> Result<u64, String> {
+        self.record_read_bound(id, report_sha256, range, None)
+    }
+
+    /// [`Ledger::record_read`] that also stores the binding digest of the read
+    /// (see [`binding_digest`]), the value `--verify-read` compares before scoring.
+    pub fn record_read_bound(
+        &self,
+        id: &str,
+        report_sha256: &str,
+        range: Option<&LockedRange>,
+        binding: Option<&str>,
+    ) -> Result<u64, String> {
         let count = self.read_count()? + 1;
         self.append(&format!(
-            "\"event\":\"test_read\",\"id\":\"{}\",\"report_sha256\":\"{}\",\"read_count\":{},{}\"test_read\":true",
+            "\"event\":\"test_read\",\"id\":\"{}\",\"report_sha256\":\"{}\",\"read_count\":{},{}{}\"test_read\":true",
             id,
             report_sha256,
             count,
-            range.map(|l| format!("{},", l.json())).unwrap_or_default()
+            range.map(|l| format!("{},", l.json())).unwrap_or_default(),
+            binding_field(binding)
         ))?;
         Ok(count)
     }
@@ -881,12 +907,45 @@ impl Ledger {
         report_sha256: &str,
         range: Option<&LockedRange>,
     ) -> Result<(), String> {
+        self.record_baseline_read_bound(data_sha256, report_sha256, range, None)
+    }
+
+    /// [`Ledger::record_baseline_read`] that also stores the binding digest.
+    pub fn record_baseline_read_bound(
+        &self,
+        data_sha256: &str,
+        report_sha256: &str,
+        range: Option<&LockedRange>,
+        binding: Option<&str>,
+    ) -> Result<(), String> {
         self.append(&format!(
-            "\"event\":\"baseline_read\",\"data_sha256\":\"{}\",\"report_sha256\":\"{}\",{}\"test_read\":true",
+            "\"event\":\"baseline_read\",\"data_sha256\":\"{}\",\"report_sha256\":\"{}\",{}{}\"test_read\":true",
             data_sha256,
             report_sha256,
-            range.map(|l| format!("{},", l.json())).unwrap_or_default()
+            range.map(|l| format!("{},", l.json())).unwrap_or_default(),
+            binding_field(binding)
         ))
+    }
+
+    /// Compare the binding digest of this `--verify-read` with the one stored by
+    /// the recorded read (`id` for a candidate read, `None` for the baseline
+    /// read). Refuses before any locked row is scored and names no report hash.
+    pub fn check_verify_binding(&self, id: Option<&str>, binding: &str) -> Result<(), String> {
+        let recorded = self.events()?.into_iter().find_map(|e| match (e, id) {
+            (Event::TestRead { id: read, binding_sha256, .. }, Some(want)) if read == want => Some(binding_sha256),
+            (Event::BaselineRead { binding_sha256, .. }, None) => Some(binding_sha256),
+            _ => None,
+        });
+        match recorded {
+            None => Err("no recorded read to verify".to_string()),
+            Some(None) => Err("the recorded read stores no binding digest (written by an older build); \
+                 --verify-read cannot compare the window set and settings and refuses to score"
+                .to_string()),
+            Some(Some(b)) if b == binding => Ok(()),
+            Some(Some(_)) => Err("the window set or another setting that binds the report differs from the \
+                 recorded read; the verify is void and nothing was scored"
+                .to_string()),
+        }
     }
 }
 
@@ -1014,6 +1073,27 @@ impl LockboxFacts {
             self.read_count
         )
     }
+}
+
+fn binding_field(binding: Option<&str>) -> String {
+    binding.map(|b| format!("\"binding_sha256\":\"{}\",", b)).unwrap_or_default()
+}
+
+/// SHA-256 of every input that binds a locked report beyond the sealed entry:
+/// the text of `parts` in order. Callers pass the debug form of the resolved
+/// windows and options, so a changed window set or setting changes the digest.
+pub fn binding_digest(parts: &[String]) -> String {
+    sha256_hex(parts.join("\n--\n").as_bytes())
+}
+
+/// Binding digest of a walkforward read. The `--front` path is left out: the
+/// run file's SHA-256 binds its content and the report hash ignores the spelling.
+pub fn walkforward_binding(spec: &crate::walkforward::EvalSpec, o: &crate::walkforward::ProtocolOptions) -> String {
+    let mut o = o.clone();
+    if let Some(f) = &mut o.front {
+        f.run.clear();
+    }
+    binding_digest(&[format!("{:?}", spec), format!("{:?}", o)])
 }
 
 /// Canonical text of the procedure a candidate stands for: everything that
