@@ -1098,6 +1098,15 @@ CHECKPOINTS:
   --select-blocks <K>        validation blocks of robust, 1 to 8 (default 4)
   --select-se <Z>            one-standard-error multiple (default 1.0)
   --select-block-len <L>     bootstrap block length in periods (default 21)
+  --select-require-edge      post-loop gate (#1026, not saved search state,
+                             outside the config hash): a member whose training
+                             fitness is not below 1 (no better than flat on
+                             the training rows; NaN and +inf too) is never the
+                             finalist, under validation_objective and robust,
+                             --reselect and --reselect-run. Needs --fitness
+                             pnl and --objective pnl|sharpe|log_growth. All
+                             members gated: verdict no_edge, archive-order
+                             finalist
   --reselect <checkpoint>    re-select a finished search, no new one: scores
                              the checkpoint's final archive under --select-rule
                              and writes run.json and the report. Pass the data
@@ -1316,7 +1325,7 @@ fn member_spec(
 
 /// #480: the `"fitness"` member of a Pareto entry, in exact CPU `f64` on the
 /// training rows. `train_net` is the excess net over cash.
-fn fitness_member_json(book: &rcsr::trading::FitnessBook, pred: &[f64]) -> String {
+fn fitness_member_json(book: &rcsr::trading::FitnessBook, pred: &[f64], regret: f64) -> String {
     if book.blocks() > 1 {
         // #484: `train_regret` is the search fitness (mean + lambda * sd of the
         // block regrets); net, flips and exits sum the blocks.
@@ -1332,7 +1341,7 @@ fn fitness_member_json(book: &rcsr::trading::FitnessBook, pred: &[f64]) -> Strin
         let regrets: Vec<String> = book.block_regrets(&blocks).into_iter().map(jnum).collect();
         return format!(
             ",\"fitness\":{{\"train_regret\":{},\"train_net\":{},\"train_flips\":{},\"train_exits\":{},\"train_exposure\":{},\"block_regret\":[{}]}}",
-            jnum(book.fitness_of(&blocks)),
+            jnum(regret),
             jnum(net),
             flips,
             exits,
@@ -1343,7 +1352,7 @@ fn fitness_member_json(book: &rcsr::trading::FitnessBook, pred: &[f64]) -> Strin
     let t = book.totals(pred);
     format!(
         ",\"fitness\":{{\"train_regret\":{},\"train_net\":{},\"train_flips\":{},\"train_exits\":{},\"train_exposure\":{}}}",
-        jnum(book.regret_of(&t)),
+        jnum(regret),
         jnum(book.net_of(&t)),
         t.flips,
         t.exits,
@@ -1362,7 +1371,9 @@ fn validation_book_member_json(
     fixed: Option<bool>,
     realised: Option<bool>,
     band: &rcsr::trading::BandSpec,
+    edge_rejected: Option<bool>,
 ) -> String {
+    let edge_json = edge_rejected.map_or_else(String::new, |e| format!(",\"edge_rejected\":{}", e));
     // #925: an sd-unit band is the member's own, resolved on its training rows.
     let band_json = if band.units == rcsr::trading::BandUnits::Sd {
         format!(",\"band_sd\":{},\"band_resolved\":{}", band.sd.map_or_else(|| "null".to_string(), jnum), jnum(band.resolved))
@@ -1370,7 +1381,7 @@ fn validation_book_member_json(
         String::new()
     };
     format!(
-        ",\"validation_book\":{{\"objective\":{},\"net_pnl\":{},\"sharpe\":{},\"trades\":{},\"exposure\":{},\"constant\":{},\"fixed_position\":{},\"fixed_position_realised\":{}{}}}",
+        ",\"validation_book\":{{\"objective\":{},\"net_pnl\":{},\"sharpe\":{},\"trades\":{},\"exposure\":{},\"constant\":{},\"fixed_position\":{},\"fixed_position_realised\":{}{}{}}}",
         jnum(objective),
         jnum(stats.net_pnl),
         jnum(stats.sharpe),
@@ -1379,7 +1390,8 @@ fn validation_book_member_json(
         constant,
         rcsr::trading::fixed_position_json(fixed),
         rcsr::trading::fixed_position_json(realised),
-        band_json
+        band_json,
+        edge_json
     )
 }
 
@@ -2471,6 +2483,8 @@ struct Row {
     /// #263: the P&L objective on the validation slice, lower is better;
     /// `NaN` without a trading objective.
     objective_value: f64,
+    /// #1026: the search fitness on the training rows (NaN without --fitness pnl).
+    train_fitness: f64,
     /// Small-sample-corrected AIC (fit vs. constants), lower is better.
     aicc: f64,
     /// Bayesian information criterion, lower is better.
@@ -2760,6 +2774,7 @@ fn main() {
     let mut resume_path: Option<String> = None;
     // #928: post-loop selection. Not search state, so outside config_hash.
     let mut select_rule_arg: Option<String> = None;
+    let mut select_require_edge = false;
     let mut select_blocks_arg: Option<usize> = None;
     let mut select_se_arg: Option<f64> = None;
     let mut select_block_len_arg: Option<usize> = None;
@@ -3604,6 +3619,7 @@ fn main() {
             }
             "--resume" => resume_path = Some(val!()),
             "--select-rule" => select_rule_arg = Some(val!()),
+            "--select-require-edge" => select_require_edge = true,
             "--select-blocks" => select_blocks_arg = Some(parse_uint("--select-blocks", &val!())),
             "--select-se" => select_se_arg = Some(parse_nonneg("--select-se", &val!())),
             "--select-block-len" => select_block_len_arg = Some(parse_uint("--select-block-len", &val!())),
@@ -3811,8 +3827,8 @@ fn main() {
             eprintln!("error: {}: a re-selection runs no search", what);
             std::process::exit(EXIT_USAGE);
         }
-        if select_rule_arg.is_none() {
-            eprintln!("error: --reselect and --reselect-run need --select-rule");
+        if select_rule_arg.is_none() && !select_require_edge {
+            eprintln!("error: --reselect and --reselect-run need --select-rule or --select-require-edge");
             std::process::exit(EXIT_USAGE);
         }
         resume_path = reselect_path.clone();
@@ -6019,6 +6035,14 @@ fn main() {
     if select_rule != rcsr::selection::SelectRule::ValidationObjective && !objective.is_trading() {
         trading_usage("--select-rule needs --objective pnl|sharpe|log_growth");
     }
+    if select_require_edge {
+        if !fitness_pnl {
+            trading_usage("--select-require-edge needs --fitness pnl");
+        }
+        if !objective.is_trading() {
+            trading_usage("--select-require-edge needs --objective pnl|sharpe|log_growth");
+        }
+    }
     if select_by == Some(rcsr::selection::SelectBy::Validation) && prepared.validation.is_none() {
         eprintln!(
             "error: --select-by validation needs a validation slice;              add --validation-frac <f>"
@@ -7197,6 +7221,8 @@ fn main() {
             } else {
                 std::borrow::Cow::Borrowed(&pred)
             };
+            let train_fitness = fitness_book.as_ref().map(|b| b.regret(&pred)).unwrap_or(f64::NAN);
+            let edge_rejected = rcsr::selection::edge_rejected(select_require_edge, train_fitness);
             let (objective_value, validation_book_json) = match (&trading_spec, book_validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
                 (Some(tspec), Some(v), Some(slice)) => {
                     let ctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
@@ -7206,12 +7232,20 @@ fn main() {
                             // #849: a fixed-position member is unusable as a finalist with the flag.
                             let fixed = rcsr::trading::fixed_position(&s.tree, tspec);
                             let realised = rcsr::trading::realised_position(stats.exposure, tspec);
-                            let value = if cfg.reject_fixed_position && (fixed.is_some() || realised.is_some()) {
+                            let value = if (cfg.reject_fixed_position && (fixed.is_some() || realised.is_some())) || edge_rejected {
                                 f64::INFINITY
                             } else {
                                 objective.score(&stats, tspec.min_trades)
                             };
-                            let book = validation_book_member_json(value, &stats, rcsr::trading::is_constant(&s.tree), fixed, realised, &mspec.band);
+                            let book = validation_book_member_json(
+                                value,
+                                &stats,
+                                rcsr::trading::is_constant(&s.tree),
+                                fixed,
+                                realised,
+                                &mspec.band,
+                                select_require_edge.then_some(edge_rejected),
+                            );
                             (value, book)
                         }
                         Err(_) => (f64::INFINITY, NO_VALIDATION_BOOK.to_string()),
@@ -7276,6 +7310,7 @@ fn main() {
                 validation_error,
                 test_error,
                 objective_value,
+                train_fitness,
                 aicc,
                 bic,
                 dw,
@@ -7314,7 +7349,7 @@ fn main() {
                 gate_json: String::new(),
                 fitness_json: fitness_book
                     .as_ref()
-                    .map(|b| fitness_member_json(b, &pred))
+                    .map(|b| fitness_member_json(b, &pred, train_fitness))
                     .unwrap_or_default(),
                 validation_book_json,
             }
@@ -7346,6 +7381,11 @@ fn main() {
         }
     }
     let mut selection_rule_fields = format!("\"rule\":\"{}\"", select_rule.name());
+    let edge_rejected_count = rows
+        .iter()
+        .filter(|r| rcsr::selection::edge_rejected(select_require_edge, r.train_fitness))
+        .count();
+    let no_edge = select_require_edge && edge_rejected_count > 0 && rows.iter().all(|r| !r.objective_value.is_finite());
     // #111: selection. Reorder the front by the chosen criterion and renumber
     // the display rank; the archive rank is kept for reports that need the
     // underlying search order. `test_error` is never a criterion. With no
@@ -7400,7 +7440,12 @@ fn main() {
                 order.retain(|&i| i != c);
                 order.insert(0, c);
             }
-            selection_rule_fields = picked.fields_json();
+            selection_rule_fields = if select_require_edge { picked.fields_json_edge(no_edge) } else { picked.fields_json() };
+        } else if select_require_edge {
+            selection_rule_fields.push_str(",\"require_edge\":true");
+            if no_edge {
+                selection_rule_fields.push_str(",\"verdict\":\"no_edge\"");
+            }
         }
         let reordered: Vec<Row> = order.into_iter().map(|i| rows[i].clone()).collect();
         rows = reordered;
@@ -7445,6 +7490,7 @@ fn main() {
                 fixed_position_realised: realised,
                 candidates: rows.len(),
                 usable,
+                edge_rejected: select_require_edge.then_some(edge_rejected_count),
                 expression: top.expression.clone(),
                 expression_exact: top.expression_exact.clone(),
                 archive_rank: top.archive_rank,

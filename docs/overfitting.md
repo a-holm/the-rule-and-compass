@@ -737,6 +737,8 @@ The rule reads training and validation rows only. Changing the test block change
 
 The rule is a post-loop option, like `--prune`. It is not saved search state and not part of `config_hash`: `--resume` accepts another `--select-rule`, but still refuses another `--pop`.
 
+`--select-require-edge` adds a training-side condition to both rules (needs `--fitness pnl`). A member whose training fitness (`pareto[].fitness.train_regret`) is not below 1, that is one the search rated no better than flat on the training rows, is never the finalist: under `validation_objective` its objective is unusable, under `robust` it is not eligible. When no member is left the verdict is `no_edge` and the finalist is the first member in archive order. The gate is a post-loop option like `--select-rule` and outside `config_hash`. `--json` adds `validation_book.edge_rejected`, `objective.selection_rule.require_edge` and `objective.edge_rejected` only with the flag.
+
 A finished search is re-selected without a new one:
 
 ```sh
