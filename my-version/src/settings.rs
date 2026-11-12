@@ -18,7 +18,7 @@
 //! so older checkpoints still load and default checkpoints keep their bytes.
 //! `tests/settings_table.rs` checks every row in every reader.
 
-use crate::search::{Config, FitAccept, MutationMix, RestartPolicy, Selection};
+use crate::search::{Config, FitAccept, FrontScope, MutationMix, RestartPolicy, Selection};
 use std::collections::BTreeMap;
 
 /// Where a row's lines appear in each reader.
@@ -150,7 +150,7 @@ macro_rules! enum_value {
     )*};
 }
 
-enum_value!(Selection, RestartPolicy, MutationMix, FitAccept);
+enum_value!(Selection, RestartPolicy, MutationMix, FrontScope, FitAccept);
 
 /// How the command line sets a row.
 pub enum Cli<T> {
@@ -575,6 +575,66 @@ pub static TABLE: &[&dyn Setting] = &[
         cli: Cli::Value(|v| uint("--restart-isolation", v)),
         write: Write::UnlessDefault,
         active: Some(island_policy),
+        conflict: Conflict::SavedKey,
+    },
+    &Row::<usize> {
+        flag: "--explore-islands",
+        key: "explore_islands",
+        group: Group::Island,
+        schema_type: "int",
+        schema_default: "0",
+        schema: "#1100: the highest K islands form an explore tier (0: none; K must be below --islands). An explore island takes no front parent and no --qd-policy parent, sends and receives no migrant, and restarts at the end of each lifetime of a Luby schedule (1, 1, 2, 1, 1, 2, 4, ... units of the restart interval, 60 generations, list-scheduled over the explore islands: each next lifetime goes to the island whose lifetimes add up to the least, ties to the lowest), so the restart generations depend on the generation alone. The other islands (the exploit tier) keep --restart-policy and a directed ring among themselves; explore results reach them only through the archive and its front parents. Applies to the node path and the flat postfix path. The development log counts explore restarts in restarts and restarts_total; isolated counts exploit windows only. Saved search setting: written to the checkpoint only when above 0, a resume refuses a different value, a checkpoint without it loads as 0",
+        help: "  --explore-islands <K>      the highest K islands form an explore tier,
+                             default 0 (none). An explore island takes no
+                             front parent, no --qd-policy parent and no
+                             migrant, sends no migrant, and restarts at the
+                             end of each lifetime of a Luby schedule in
+                             units of the restart interval (60
+                             generations). The other islands keep
+                             --restart-policy and a ring of their own;
+                             explore results reach them through the
+                             archive only. K must be below --islands.
+                             Saved search setting (#1100)",
+        bench: Some(Bench {
+            usage: "  --explore-islands <K>     the highest K islands form an explore tier with Luby
+                            restarts, no front parents and no migrants (default 0)",
+            omit_unset: true,
+        }),
+        gui: false,
+        get: |c| &c.explore_islands,
+        set: |c| &mut c.explore_islands,
+        cli: Cli::Value(|v| uint("--explore-islands", v)),
+        write: Write::UnlessDefault,
+        active: None,
+        conflict: Conflict::SavedKey,
+    },
+    &Row::<FrontScope> {
+        flag: "--front-scope",
+        key: "front_scope",
+        group: Group::Island,
+        schema_type: "enum",
+        schema_default: "global",
+        schema: "#1070: global | island. Where an island draws its front parents (the 15 % #76 draw). global: the Pareto front of every island's members, so a new best reaches every island within about one generation. island: each island keeps its own error/complexity front of the members it scored (same insert rule, cap and #848 filter as the archive); at a migration the destination island's front becomes the canonical front of its own and the source's members, an island that receives no migrant (isolated or explore) keeps its front, and a restart empties it. The reported archive, patience and the restart rules still read the global archive, which every member enters each generation. Applies to the node path and the flat postfix path. Not with --qd-policy (exit 2): the QD archive is one parent pool shared by every island. Saved search setting: written to the checkpoint only for island together with island_front records, a resume refuses a different value, a checkpoint without it loads as global",
+        help: "  --front-scope global|island
+                             where front parents come from. global
+                             (default) draws them from the Pareto front of
+                             every island. island gives each island its own
+                             error/complexity front; a front moves only
+                             with a migrant (the destination front becomes
+                             the front of both) and a restart empties it.
+                             The reported archive stays global. Not with
+                             --qd-policy. Saved search setting (#1070)",
+        bench: Some(Bench {
+            usage: "  --front-scope <scope>     global (default) or island: each island draws front parents
+                            from its own front, exchanged along the migration moves",
+            omit_unset: true,
+        }),
+        gui: false,
+        get: |c| &c.front_scope,
+        set: |c| &mut c.front_scope,
+        cli: Cli::Value(FrontScope::parse),
+        write: Write::UnlessDefault,
+        active: None,
         conflict: Conflict::SavedKey,
     },
     &Row::<MutationMix> {

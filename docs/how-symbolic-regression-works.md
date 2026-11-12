@@ -149,6 +149,41 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   from its own members only. With one island nothing restarts. One island-policy
   module decides migration, restarts and parent sources for the owned-tree loop
   and the flat postfix loop alike (#1081).
+- **Explore tier** (`--explore-islands K`, #1100, default 0). Without it a run
+  behaves as one trial: the global front and the ring spread a new best to
+  every island within a few migration intervals, and the restart rules above
+  are fixed cutoffs. With it the highest `K` islands are explore islands. Each
+  is isolated for its whole life (no front parent, no `--qd-policy` parent, no
+  migrant in or out) and restarts at the end of each lifetime of the Luby
+  universal sequence 1, 1, 2, 1, 1, 2, 4, ... in units of the restart interval
+  (60 generations; `restart_interval` in the library, `--restart-interval` in
+  `rcsr-bench`). One sequence is spread over the explore islands: each next
+  lifetime goes to the island whose lifetimes add up to the least, ties to the
+  lowest island (the list schedule of Cire, Kadioglu and Sellmann 2014). Luby,
+  Sinclair and Zuckerman (1993) show that this sequence reaches a target within
+  a logarithmic factor of the best fixed cutoff without knowing the run-time
+  distribution, provided the trials are independent. The restart generations
+  depend on the generation alone, so a checkpoint needs no extra record. The
+  other islands form the exploit tier: they keep `--restart-policy` and a
+  directed ring among themselves, and they see explore results only through the
+  archive and its front parents. QD niche immigrants and AFP immigrants still
+  arrive on an explore island; they are fresh random trees. On the flat postfix
+  path a child that duplicates a program on any island is redrawn, which is the
+  one remaining link between an explore island and the others.
+- **Front scope** (`--front-scope global|island`, #1070, default `global`).
+  With `global` every island draws its 15 % front parents from the one Pareto
+  front of all islands, a channel far stronger than the ring: a new best
+  reaches every island within about one generation. With `island` each island
+  keeps its own error/complexity front of the members it scored, with the
+  archive's insert rule, cap and fixed-position filter. Fronts travel only with
+  the migrants: at a migration the destination island's front becomes the
+  canonical front of its own and the source's members (`canonical_front`
+  depends on the member set only, so this merge is associative, commutative
+  and idempotent). An island that receives no migrant keeps its front, and a
+  restart empties the restarted island's front. The global archive still takes
+  every member of every island each generation, so the report, patience and
+  the restart rules read it unchanged. `--qd-policy` is refused with `island`:
+  its QD archive is one parent pool for every island.
 - Termination is by generation count or a time/effort budget.
 
 ## 7. Simplification and presentation

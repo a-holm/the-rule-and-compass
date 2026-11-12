@@ -34,6 +34,8 @@ fn sample(row: &dyn Setting) -> Option<&'static str> {
         "--selection" => "afp",
         "--restart-policy" => "island",
         "--restart-isolation" => "7",
+        "--explore-islands" => "1",
+        "--front-scope" => "island",
         "--mutation-mix" => "extended",
         "--crossover-internal" => "0.25",
         "--fit-accept" => "fitness",

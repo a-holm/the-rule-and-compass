@@ -33,6 +33,7 @@
 //! | `build <field> <value>` | #256: version, commit, binary_sha256, device, driver, threads |
 //! | `island <i> <stagnant>` | per-island counter |
 //! | `island_stall <i> <since_improve> <isolated> <best_prev>` | #1022: per-island stall counters, written only under `--restart-policy island` |
+//! | `island_front <i> <complexity> <cost> <error> <tree>` | #1070: one member of island i's own front, written only under `--front-scope island` |
 //! | `mix <i> <numbers>` | #471: adaptive edit counts of island i, 14 numbers per generation |
 //! | `rng <i|main> <idx> <624 words>` | exact MT19937 state |
 //! | `ind <i> <error> <complexity> <tree>` | one population member |
@@ -89,6 +90,9 @@ pub struct IslandState {
     /// #1022: the island's own stall counters. `Some` only under
     /// `--restart-policy island`.
     pub stall: Option<IslandStall>,
+    /// #1070: the island's own front, in archive order. Empty unless
+    /// `--front-scope island`.
+    pub front: Vec<Sol>,
 }
 
 /// #1022: per-island restart bookkeeping under `--restart-policy island`.
@@ -659,6 +663,18 @@ impl Checkpoint {
                 )
                 .unwrap();
             }
+            for sol in &isl.front {
+                writeln!(
+                    out,
+                    "island_front {} {} {} {} {}",
+                    i,
+                    sol.complexity,
+                    encode_f64(sol.cost),
+                    encode_f64(sol.error),
+                    encode_tree(&sol.tree)
+                )
+                .unwrap();
+            }
             let (words, idx) = isl.rng.state();
             let mut line = format!("rng {} {} ", i, idx);
             for (j, w) in words.iter().enumerate() {
@@ -724,6 +740,7 @@ impl Checkpoint {
         let mut sols: Vec<Sol> = Vec::new();
         let mut island_stagnant: Vec<Option<usize>> = Vec::new();
         let mut island_stall: Vec<Option<IslandStall>> = Vec::new();
+        let mut island_fronts: Vec<Vec<Sol>> = Vec::new();
         let mut island_rngs: Vec<Option<Mt>> = Vec::new();
         let mut island_mix: Vec<Option<crate::mix::MixWindow>> = Vec::new();
         let mut island_pops: Vec<Option<Vec<Individual>>> = Vec::new();
@@ -965,6 +982,21 @@ impl Checkpoint {
                     };
                     set_slot(&mut island_stall, i, stall, "island_stall", lineno)?;
                 }
+                "island_front" => {
+                    let i = parse_num::<usize>(&parts, 1, lineno, "island_front index")?;
+                    let complexity = parse_num::<usize>(&parts, 2, lineno, "island_front complexity")?;
+                    let cost = parse_f64_at(&parts, 3, lineno, "island_front cost")?;
+                    let error = parse_f64_at(&parts, 4, lineno, "island_front error")?;
+                    let tree_text = parts
+                        .get(5..)
+                        .filter(|t| !t.is_empty())
+                        .ok_or_else(|| format!("line {}: island_front record has no tree", lineno))?;
+                    let tree = decode_tree(&tree_text.join(" ")).map_err(|e| format!("line {}: {}", lineno, e))?;
+                    if island_fronts.len() <= i {
+                        island_fronts.resize(i + 1, Vec::new());
+                    }
+                    island_fronts[i].push(Sol { complexity, cost, error, tree });
+                }
                 "rng" => {
                     let target = parts
                         .get(1)
@@ -1173,13 +1205,20 @@ impl Checkpoint {
                 }
                 _ => {}
             }
-            islands.push(IslandState { rng, population, mix, stall });
+            let front = island_fronts.get_mut(i).map(std::mem::take).unwrap_or_default();
+            if !front.is_empty() && config.front_scope != crate::search::FrontScope::Island {
+                return Err(
+                    "checkpoint has island_front records; it was written under --front-scope island".to_string(),
+                );
+            }
+            islands.push(IslandState { rng, population, mix, stall, front });
             stagnant.push(st);
         }
         if island_rngs.iter().skip(expected_islands).any(|s| s.is_some())
             || island_pops.iter().skip(expected_islands).any(|s| s.is_some())
             || island_stagnant.iter().skip(expected_islands).any(|s| s.is_some())
             || island_stall.iter().skip(expected_islands).any(|s| s.is_some())
+            || island_fronts.iter().skip(expected_islands).any(|f| !f.is_empty())
         {
             return Err(format!(
                 "checkpoint has records for more than the saved {} island(s)",
