@@ -664,7 +664,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring] [--reject-fixed-position]
-     [--selection lexicographic|afp] [--restart-policy archive|island] [--restart-isolation N] [--explore-islands K]
+     [--selection lexicographic|afp] [--restart-policy archive|island] [--restart-isolation N] [--explore-islands K] [--front-scope global|island]
      [--mutation-mix classic|extended] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
      [--patience N]
@@ -1281,6 +1281,13 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   other islands keep the restart rule and a ring of their own and see explore
   results only through the archive. Node and flat postfix paths. Saved search
   setting; the default stays 0;
+- **opt-in island-local fronts** (`--front-scope island`): each island draws
+  its 15 % front parents from its own error/complexity front instead of the
+  global one, so a new best no longer reaches every island in about one
+  generation. A front moves only with a migrant (the destination front becomes
+  the front of both) and a restart empties it; the reported archive stays
+  global. Node and flat postfix paths; not with `--qd-policy`. Saved search
+  setting; the default stays `global`;
 - **opt-in quality-diversity search** (`--qd`, `--qd-cvt`, `--qd-policy`,
   `--qd-cells`, `--qd-cell-cap`): CVT-MAP-Elites over variable usage ×
   prediction skewness, with deterministic Halton initialisation, Lloyd

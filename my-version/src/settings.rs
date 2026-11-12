@@ -18,7 +18,7 @@
 //! so older checkpoints still load and default checkpoints keep their bytes.
 //! `tests/settings_table.rs` checks every row in every reader.
 
-use crate::search::{Config, MutationMix, RestartPolicy, Selection};
+use crate::search::{Config, FrontScope, MutationMix, RestartPolicy, Selection};
 use std::collections::BTreeMap;
 
 /// Where a row's lines appear in each reader.
@@ -150,7 +150,7 @@ macro_rules! enum_value {
     )*};
 }
 
-enum_value!(Selection, RestartPolicy, MutationMix);
+enum_value!(Selection, RestartPolicy, MutationMix, FrontScope);
 
 /// How the command line sets a row.
 pub enum Cli<T> {
@@ -604,6 +604,35 @@ pub static TABLE: &[&dyn Setting] = &[
         get: |c| &c.explore_islands,
         set: |c| &mut c.explore_islands,
         cli: Cli::Value(|v| uint("--explore-islands", v)),
+        write: Write::UnlessDefault,
+        active: None,
+        conflict: Conflict::SavedKey,
+    },
+    &Row::<FrontScope> {
+        flag: "--front-scope",
+        key: "front_scope",
+        group: Group::Island,
+        schema_type: "enum",
+        schema_default: "global",
+        schema: "#1070: global | island. Where an island draws its front parents (the 15 % #76 draw). global: the Pareto front of every island's members, so a new best reaches every island within about one generation. island: each island keeps its own error/complexity front of the members it scored (same insert rule, cap and #848 filter as the archive); at a migration the destination island's front becomes the canonical front of its own and the source's members, an island that receives no migrant (isolated or explore) keeps its front, and a restart empties it. The reported archive, patience and the restart rules still read the global archive, which every member enters each generation. Applies to the node path and the flat postfix path. Not with --qd-policy (exit 2): the QD archive is one parent pool shared by every island. Saved search setting: written to the checkpoint only for island together with island_front records, a resume refuses a different value, a checkpoint without it loads as global",
+        help: "  --front-scope global|island
+                             where front parents come from. global
+                             (default) draws them from the Pareto front of
+                             every island. island gives each island its own
+                             error/complexity front; a front moves only
+                             with a migrant (the destination front becomes
+                             the front of both) and a restart empties it.
+                             The reported archive stays global. Not with
+                             --qd-policy. Saved search setting (#1070)",
+        bench: Some(Bench {
+            usage: "  --front-scope <scope>     global (default) or island: each island draws front parents
+                            from its own front, exchanged along the migration moves",
+            omit_unset: true,
+        }),
+        gui: false,
+        get: |c| &c.front_scope,
+        set: |c| &mut c.front_scope,
+        cli: Cli::Value(FrontScope::parse),
         write: Write::UnlessDefault,
         active: None,
         conflict: Conflict::SavedKey,

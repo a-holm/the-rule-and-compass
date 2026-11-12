@@ -136,6 +136,34 @@ impl RestartPolicy {
     }
 }
 
+/// #1070: where an island draws its front parents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FrontScope {
+    /// The global Pareto front of every island's members.
+    #[default]
+    Global,
+    /// The island's own error/complexity front; fronts travel along the
+    /// migration moves only.
+    Island,
+}
+
+impl FrontScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FrontScope::Global => "global",
+            FrontScope::Island => "island",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "global" => Ok(FrontScope::Global),
+            "island" => Ok(FrontScope::Island),
+            other => Err(format!("front scope must be 'global' or 'island', got '{}'", other)),
+        }
+    }
+}
+
 /// #471: which edit kinds the node-path mutation draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MutationMix {
@@ -416,6 +444,8 @@ pub struct Config {
     /// #1100: the highest this many islands form the explore tier (0: none).
     /// Saved search setting.
     pub explore_islands: usize,
+    /// #1070: where front parents come from. Saved search setting.
+    pub front_scope: FrontScope,
     /// #471: the node-path edit weights. Changes the trajectory, so it is a
     /// saved search setting.
     pub mutation_mix: MutationMix,
@@ -739,6 +769,7 @@ impl Default for Config {
             restart_policy: RestartPolicy::Archive,
             restart_isolation: 25,
             explore_islands: 0,
+            front_scope: FrontScope::Global,
             mutation_mix: MutationMix::Classic,
             crossover_internal: 0.0,
             adaptive_mix: false,
@@ -6894,6 +6925,7 @@ fn snapshot(
                     rng: Mt::from_state(*words, idx),
                     mix: mixes.get(i).cloned().unwrap_or_default(),
                     stall: policy.stall(i),
+                    front: policy.island_front(i).to_vec(), // #1070
                     population: pop.iter().map(Ind::to_checkpoint).collect(),
                 }
             })
@@ -7515,18 +7547,25 @@ fn run_postfix_search(
         // flat engine draw 15 % of parents from it. With the feature off the
         // pool is empty and `front_p` is 0.0, so the draw consumes no RNG and
         // the trajectory is exactly the pre-#76 one.
-        let front = if cfg.front_parents {
-            FrontParents::from_front(&archive.items, variation.width, cfg.max_complexity)
+        // #1070: one compiled front per island under --front-scope island; every
+        // island shares the global one otherwise.
+        let fronts: Vec<FrontParents> = if !cfg.front_parents {
+            vec![FrontParents::empty()]
+        } else if cfg.front_scope == FrontScope::Island {
+            (0..n_islands)
+                .map(|i| FrontParents::from_front(policy.front(i, &archive.items), variation.width, cfg.max_complexity))
+                .collect()
         } else {
-            FrontParents::empty()
+            vec![FrontParents::from_front(&archive.items, variation.width, cfg.max_complexity)]
         };
+        let front_of: Vec<&FrontParents> = (0..n_islands).map(|i| fronts.get(i).unwrap_or(&fronts[0])).collect();
         // #1022 #1081: the island policy sets each island's front probability.
         let front_ps: Vec<f64> = (0..n_islands).map(|i| policy.parent_source(i).front_p).collect();
-        let mut next = variation.next_generation_with_front(
+        let mut next = variation.next_generation_with_fronts(
             &pool,
             gen as u32,
             &restart_flags,
-            &front,
+            &front_of,
             &front_ps,
         );
         let dev_generate = dev_lap(&mut dev_mark); // #211
@@ -7573,6 +7612,7 @@ fn run_postfix_search(
         let mut dev_rec: Option<crate::devlog::GenRecord> = None; // #1022: reported after the restart step
         let dev_archive = dev_lap(&mut dev_mark); // #211
         let stage_archive = stage_lap(&mut stage_mark); // #284
+        policy.offer(&next, &|t| !(filter_fixed_archive && fixed_position_archived(t, cfg))); // #1070
         policy.observe(&next); // #1022: each island's own stall, after the archive update
         run_ledger.record_stage(crate::gpu_stats::Stage::Vary, stage_generate);
         run_ledger.record_stage(crate::gpu_stats::Stage::Archive, stage_archive);
@@ -7993,6 +8033,12 @@ fn run_search_scoped(
             cfg.explore_islands,
             cfg.islands.max(1)
         )); // #1100
+    }
+    if cfg.front_scope == FrontScope::Island && cfg.qd_policy {
+        return Err(
+            "--front-scope island with --qd-policy: the QD archive is one parent pool shared by every island"
+                .to_string(),
+        ); // #1070
     }
     #[cfg(feature = "cuda")]
     crate::gpu::note_search_start();
@@ -8446,10 +8492,12 @@ fn run_search_scoped(
         rngs = Vec::with_capacity(saved_islands.len());
         islands = Vec::with_capacity(saved_islands.len());
         let mut saved_stalls = Vec::with_capacity(saved_islands.len());
+        let mut saved_fronts = Vec::with_capacity(saved_islands.len()); // #1070
         mixes = Vec::with_capacity(saved_islands.len());
         for isl in saved_islands {
             rngs.push(isl.rng);
             saved_stalls.push(isl.stall);
+            saved_fronts.push(isl.front);
             mixes.push(isl.mix);
             islands.push(
                 isl.population
@@ -8458,7 +8506,7 @@ fn run_search_scoped(
                     .collect(),
             );
         }
-        policy = IslandPolicy::resume(cfg, saved_stagnant, &saved_stalls)?;
+        policy = IslandPolicy::resume(cfg, saved_stagnant, &saved_stalls, saved_fronts)?;
         let want = cfg.islands.max(1);
         if islands.len() != want || rngs.len() != want || policy.stagnant().len() != want {
             return Err(format!(
@@ -8943,7 +8991,7 @@ fn run_search_scoped(
                     .map(|(i, (((isl, r), mix), sender))| {
                         // #10: carry the block registry into the island thread.
                         let blocks = blocks.clone();
-                        let parents = Parents { front, qd: qd_parents, source: policy.parent_source(i) }; // #76 #120 #1081
+                        let parents = Parents { front: policy.front(i, front), qd: qd_parents, source: policy.parent_source(i) }; // #76 #120 #1081 #1070
                         s.spawn(move || {
                             expr::set_blocks(blocks);
                             #[cfg(feature = "cuda")]
@@ -9177,6 +9225,7 @@ fn run_search_scoped(
             let dev_archive = dev_lap(&mut dev_mark); // #211
             let stage_archive = stage_lap(&mut stage_mark); // #284
 
+            policy.offer(&islands[..], &|t| !(filter_fixed_archive && fixed_position_archived(t, cfg))); // #1070
             policy.observe(&islands[..]); // #1022: each island's own stall, after the archive update
 
             #[cfg(feature = "cuda")]

@@ -35,6 +35,7 @@ fn sample(row: &dyn Setting) -> Option<&'static str> {
         "--restart-policy" => "island",
         "--restart-isolation" => "7",
         "--explore-islands" => "1",
+        "--front-scope" => "island",
         "--mutation-mix" => "extended",
         "--crossover-internal" => "0.25",
         other => panic!("no sample value for {other}: add one to tests/settings_table.rs"),

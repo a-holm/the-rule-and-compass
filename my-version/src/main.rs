@@ -3721,6 +3721,12 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
+    if cfg.front_scope == crate::search::FrontScope::Island && cfg.qd_policy {
+        eprintln!(
+            "error: --front-scope island with --qd-policy: the QD archive is one parent pool shared by every island"
+        );
+        std::process::exit(EXIT_USAGE); // #1070
+    }
     // #928: a re-selection is a resume that runs nothing.
     if reselect_path.is_some() || reselect_run_path.is_some() {
         let conflicts = [
