@@ -1272,21 +1272,19 @@ mod tests {
     fn ring_tournament_draws_the_flat_migrant_from_the_destination_stream() {
         let errors: Vec<f64> = (0..24).map(|i| 1.0 + i as f64).collect();
         let before = tagged_arena(&errors, 8);
+        let draw = |g: u32| before.tournament(1, &mut Philox::at(9, 0, g, MIGRATION_SLOT), MIGRANT_TOURNAMENT);
+        let gen = (0..200).find(|&g| draw(g) != before.best(1)).expect("a generation whose winner is not the best");
         let mut a = tagged_arena(&errors, 8);
-        let got = a.migrate_with(&[(1, 0)], MigrationPolicy::RingTournament, 9, 30);
+        let got = a.migrate_with(&[(1, 0)], MigrationPolicy::RingTournament, 9, gen);
         assert_eq!(got, (1, 0));
-        let mut rng = Philox::at(9, 0, 30, MIGRATION_SLOT);
+        let mut rng = Philox::at(9, 0, gen, MIGRATION_SLOT);
         let winner = before.tournament(1, &mut rng, MIGRANT_TOURNAMENT);
         assert_eq!(a.slot(7), before.slot(winner), "the migrant replaces the worst of island 0");
         assert_eq!(a.err[7], before.err[winner]);
         assert!((8..24).all(|i| a.slot(i) == before.slot(i)), "no other island changes");
         let mut again = tagged_arena(&errors, 8);
-        again.migrate_with(&[(1, 0)], MigrationPolicy::RingTournament, 9, 30);
+        again.migrate_with(&[(1, 0)], MigrationPolicy::RingTournament, 9, gen);
         assert_eq!(again.words, a.words, "a pure function of the position");
-        let winners: Vec<usize> = (30..60)
-            .map(|g| before.tournament(1, &mut Philox::at(9, 0, g, MIGRATION_SLOT), MIGRANT_TOURNAMENT))
-            .collect();
-        assert!(winners.iter().any(|&w| w != winner), "the generation moves the draw");
     }
 
     #[test]
