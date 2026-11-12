@@ -12,6 +12,12 @@
                              setting: a resume refuses a different value. No
                              effect with --fit-iters 0
 @@ --no-dedup --no-front-parents
+  --restart-interval <N>     generations between island restart checks,
+                             default 60. Also the stall length of
+                             --restart-policy island and the lifetime unit of
+                             --explore-islands. 0 turns every restart off,
+                             explore restarts included. Saved search setting
+                             (#1109)
   --selection lexicographic|afp
                              survivor and parent selection inside an island.
                              lexicographic (default) replaces the island with

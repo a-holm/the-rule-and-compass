@@ -664,7 +664,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring] [--reject-fixed-position]
-     [--selection lexicographic|afp] [--restart-policy archive|island] [--restart-isolation N] [--explore-islands K] [--front-scope global|island]
+     [--selection lexicographic|afp] [--restart-interval N] [--restart-policy archive|island] [--restart-isolation N] [--explore-islands K] [--front-scope global|island]
      [--mutation-mix classic|extended] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
      [--patience N]
@@ -1265,7 +1265,7 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   crowding distance, a few random immigrants join each generation, and parents
   are drawn by Pareto rank. Small correct shapes and new lineages survive next
   to large approximations. Node path only; the default stays `lexicographic`;
-- **opt-in island-local restarts** (`--restart-policy island`, `--restart-isolation W`):
+- **opt-in island-local restarts** (`--restart-policy island`, `--restart-isolation W`; the restart interval is `--restart-interval N`, default 60 generations, 0 for no restarts):
   the default rule restarts an island only while its best is worse than the
   archive best, which ring migration makes false for every island within a few
   migration intervals. `island` restarts an island whose own best error has not
@@ -1276,7 +1276,7 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
 - **opt-in scheduled explore tier** (`--explore-islands K`): the highest `K`
   islands take no front parent and no `--qd-policy` parent, send and receive no
   migrant, and restart at the end of each lifetime of a Luby schedule (1, 1, 2,
-  1, 1, 2, 4, ... units of the 60-generation restart interval, spread over the
+  1, 1, 2, 4, ... units of `--restart-interval`, default 60 generations, spread over the
   explore islands), so a run holds many independent trials instead of one. The
   other islands keep the restart rule and a ring of their own and see explore
   results only through the archive. Node and flat postfix paths. Saved search
