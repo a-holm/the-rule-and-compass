@@ -12,6 +12,10 @@
 //! Adapters: [`DeviceFit`] for the device evaluator and for recorded fit calls
 //! (`ReplayDevice`, tests); [`ExactFits`] for the fallback pool (`PoolFits` in
 //! `search.rs`) and for scoped threads (`ScopedFits`, tests).
+//!
+//! #1075: [`FitRoute::fit_on_device_released`] is `read` with the device
+//! answers released before the device call returns ([`DeviceFit::fit_released`]),
+//! so the exact fits of released fallbacks start while the device still works.
 
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
@@ -24,7 +28,7 @@ use crate::data::Sample;
 use crate::expr::Node;
 use crate::fit::{DeviceLoss, FitPolish, GpuFitPlan, OrderStat};
 use crate::metrics::Metric;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// The fit settings of a run, built once from the configuration. The exact
 /// refit jobs take every value from here, so a new fit setting reaches the
@@ -157,11 +161,44 @@ pub(super) struct DeviceRun {
     pub(super) span_start_s: Option<f64>,
 }
 
-#[cfg(test)]
 impl DeviceRun {
     fn failed() -> Self {
         DeviceRun { answers: None, ms: -1.0, polish_ms: 0.0, span_start_s: None }
     }
+}
+
+/// #601/#1075: one device launch of a fit call, for the ledger. A negative
+/// `ms` is a failed launch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Launch {
+    pub(super) ms: f32,
+    pub(super) polish_ms: f64,
+    pub(super) span_start_s: Option<f64>,
+    pub(super) candidates: usize,
+}
+
+/// #1075: a fit call whose answers may have reached the route before it
+/// returned. `answers` is authoritative; `launches` are in launch order.
+#[derive(Debug)]
+pub(super) struct Released {
+    pub(super) answers: Option<Vec<DeviceAnswer>>,
+    pub(super) launches: Vec<Launch>,
+}
+
+/// #1075: `min(k, n)` contiguous ranges that cover `0..n` in order, the first
+/// `n % k` of them one longer. `k` of 0 or 1 is one range.
+pub(super) fn wave_bounds(n: usize, k: usize) -> Vec<std::ops::Range<usize>> {
+    let k = k.clamp(1, n.max(1));
+    let (base, extra) = (n / k, n % k);
+    let mut start = 0;
+    (0..k)
+        .map(|i| {
+            let len = base + usize::from(i < extra);
+            let range = start..start + len;
+            start += len;
+            range
+        })
+        .collect()
 }
 
 /// The device side of the route.
@@ -169,6 +206,49 @@ pub(super) trait DeviceFit {
     /// Fit `plans` with `arm` in one device call. `rows` are the rows the
     /// device holds (the rank arm reads their targets).
     fn fit(&mut self, arm: DeviceArm, plans: &[&GpuFitPlan], settings: &FitSettings, rows: &Sample) -> DeviceRun;
+
+    /// #1075: fit `plans` in `waves` ordered calls of [`DeviceFit::fit`]
+    /// over [`wave_bounds`]. The answers of every slice but the last go to
+    /// `release`, indexed into `plans`, before the next call. The returned
+    /// answers are authoritative; `release` only lets work start early. A
+    /// failed call ends the schedule with no answers.
+    fn fit_released(
+        &mut self,
+        arm: DeviceArm,
+        plans: &[&GpuFitPlan],
+        settings: &FitSettings,
+        rows: &Sample,
+        waves: usize,
+        release: &mut dyn FnMut(&[(usize, DeviceAnswer)]),
+    ) -> Released {
+        let mut answers = Vec::with_capacity(plans.len());
+        let mut launches = Vec::new();
+        for range in wave_bounds(plans.len(), waves) {
+            let last = range.end == plans.len();
+            let run = self.fit(arm, &plans[range.clone()], settings, rows);
+            let (ms, polish_ms, span_start_s) = (run.ms, run.polish_ms, run.span_start_s);
+            launches.push(Launch { ms, polish_ms, span_start_s, candidates: range.len() });
+            let Some(part) = run.answers else {
+                return Released { answers: None, launches };
+            };
+            if !last {
+                let batch: Vec<(usize, DeviceAnswer)> = range.zip(part.iter().cloned()).collect();
+                release(&batch);
+            }
+            answers.extend(part);
+        }
+        Released { answers: Some(answers), launches }
+    }
+}
+
+/// #1075: a device call whose run is already known, so a released schedule
+/// settles through [`FitRoute::fit_on_device`] exactly like one call.
+struct Collected(Option<DeviceRun>);
+
+impl DeviceFit for Collected {
+    fn fit(&mut self, _arm: DeviceArm, _plans: &[&GpuFitPlan], _settings: &FitSettings, _rows: &Sample) -> DeviceRun {
+        self.0.take().unwrap_or_else(DeviceRun::failed)
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -412,14 +492,16 @@ pub(super) struct RouteDone {
 #[derive(Debug)]
 pub(super) struct DeviceStep<K> {
     pub(super) ms: f32,
-    pub(super) polish_ms: f64,
-    pub(super) span_start_s: Option<f64>,
     /// The device returned one answer per plan.
     pub(super) ok: bool,
     /// Keys whose device fit is kept, in job order.
     pub(super) fitted: Vec<K>,
     /// #498: seconds of the exact gate, for a gated metric.
     pub(super) gate_seconds: Option<f64>,
+    /// #601/#1075: the launches of the device call, in order.
+    pub(super) launches: Vec<Launch>,
+    /// #1075: fallbacks whose exact fit started from a released answer.
+    pub(super) early: usize,
 }
 
 /// The fit counters of a route, by cause and label. All are sums of events.
@@ -481,6 +563,15 @@ pub(super) fn triage(arm: DeviceArm, plan: &GpuFitPlan, tree: &mut Node, answer:
 /// #1071: the tree a fallback past `--fit-fallback-max` keeps: its own tree.
 fn hold_past_cap(fallback: Fallback) -> Node {
     fallback.tree
+}
+
+/// #1075: whether two device trees of a refit job are the same, bit for bit.
+fn same_device(a: &Option<Node>, b: &Option<Node>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => crate::expr::same(a, b),
+        _ => false,
+    }
 }
 
 /// The one place a refit job is built.
@@ -609,11 +700,16 @@ impl FitRoute {
         let run = device.fit(arm, &plans, &self.settings, rows);
         let mut step = DeviceStep {
             ms: run.ms,
-            polish_ms: run.polish_ms,
-            span_start_s: run.span_start_s,
             ok: false,
             fitted: Vec::new(),
             gate_seconds: None,
+            launches: vec![Launch {
+                ms: run.ms,
+                polish_ms: run.polish_ms,
+                span_start_s: run.span_start_s,
+                candidates: jobs.len(),
+            }],
+            early: 0,
         };
         let Some(answers) = run.answers else {
             for (key, _) in jobs {
@@ -689,8 +785,98 @@ impl FitRoute {
         step
     }
 
+    /// #1075: whether a release schedule of `waves` calls runs for `jobs`
+    /// device jobs: it can start exact fits early (overlap, at least two calls
+    /// of a single-launch LM arm), and every candidate of the stage falling
+    /// back still fits under `--fit-fallback-max`, so each released job lands
+    /// in the refit prefix.
+    pub(super) fn releases(&self, arm: DeviceArm, jobs: usize, waves: usize) -> bool {
+        let cap = self.settings.fallback_max;
+        self.overlap
+            && waves >= 2
+            && jobs >= 2
+            && matches!(arm, DeviceArm::Lm(loss) if loss != DeviceLoss::Slope)
+            && (cap == 0 || self.fallbacks.len() + jobs <= cap)
+    }
+
+    /// #1075: [`Self::fit_on_device`] with the answers released in `waves`
+    /// ordered calls ([`DeviceFit::fit_released`]). The exact fit of a released
+    /// fallback starts at once on `exact`. Every candidate is still settled
+    /// from the final answers, and a fallback keeps a released job only when
+    /// that job refits the same tree, device tree and cause, so the outcome
+    /// equals one call whatever was released. Without [`Self::releases`] this
+    /// is one call.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn fit_on_device_released<K, S, D, E>(
+        &mut self,
+        device: &mut D,
+        arm: DeviceArm,
+        jobs: &[(K, GpuFitPlan)],
+        slots: &mut S,
+        rows: &Sample,
+        threads: usize,
+        exact: &mut E,
+        waves: usize,
+    ) -> DeviceStep<K>
+    where
+        K: Copy,
+        S: FitSlots<K> + ?Sized,
+        D: DeviceFit + ?Sized,
+        E: ExactFits + ?Sized,
+    {
+        if !self.releases(arm, jobs.len(), waves) {
+            return self.fit_on_device(device, arm, jobs, slots, rows, threads);
+        }
+        let settings = self.settings;
+        let plans: Vec<&GpuFitPlan> = jobs.iter().map(|(_, p)| p).collect();
+        let mut hints: Vec<Option<Fallback>> = vec![None; jobs.len()];
+        let early_jobs = &mut self.early_jobs;
+        let released = device.fit_released(arm, &plans, &settings, rows, waves, &mut |batch: &[(usize, DeviceAnswer)]| {
+            let mut out = Vec::new();
+            for (k, answer) in batch {
+                let Some((key, plan)) = jobs.get(*k) else { continue };
+                if hints[*k].is_some() {
+                    continue;
+                }
+                let finite = answer.c.iter().all(|v| v.is_finite());
+                if finite && arm.tail_cause(answer.status).is_none() && crate::fit::fit_status_usable(answer.status) {
+                    continue;
+                }
+                let mut tree = slots.tree(*key).clone();
+                let Triage::Fallback { cause, device: device_tree } = triage(arm, plan, &mut tree, answer) else { continue };
+                let (island, slot) = slots.place(*key);
+                let early = Some(*early_jobs + out.len());
+                let hint = Fallback { key: (DEVICE, island, slot), cause, tree, device: device_tree, early, tag: slots.tag(*key) };
+                out.push(refit_job(&hint, hint.device.clone(), &settings));
+                hints[*k] = Some(hint);
+            }
+            *early_jobs += out.len();
+            exact.submit(out);
+        });
+        let ms = if released.answers.is_some() { released.launches.iter().map(|l| l.ms).sum() } else { -1.0 };
+        let run = DeviceRun {
+            ms,
+            polish_ms: released.launches.iter().map(|l| l.polish_ms).sum(),
+            span_start_s: released.launches.first().and_then(|l| l.span_start_s),
+            answers: released.answers,
+        };
+        let from = self.fallbacks.len();
+        let mut step = self.fit_on_device(&mut Collected(Some(run)), arm, jobs, slots, rows, threads);
+        step.launches = released.launches;
+        let at: HashMap<(usize, usize), usize> = jobs.iter().enumerate().map(|(k, (key, _))| (slots.place(*key), k)).collect();
+        for f in &mut self.fallbacks[from..] {
+            let Some(hint) = at.get(&(f.key.1, f.key.2)).and_then(|&k| hints[k].take()) else { continue };
+            if hint.key == f.key && hint.cause == f.cause && crate::expr::same(&hint.tree, &f.tree) && same_device(&hint.device, &f.device) {
+                f.early = hint.early;
+                step.early += 1;
+            }
+        }
+        step
+    }
+
     /// #958: with overlap, hand the fallbacks not yet offered to `exact`, in
-    /// insertion order, while fewer than `--fit-fallback-max` jobs are out.
+    /// insertion order, while fewer than `--fit-fallback-max` jobs are out. A
+    /// fallback that already has a released job (#1075) is skipped.
     pub(super) fn submit_early<E: ExactFits + ?Sized>(&mut self, exact: &mut E) {
         if !self.overlap {
             return;
@@ -698,14 +884,13 @@ impl FitRoute {
         let cap = self.settings.fallback_max;
         let room = if cap == 0 { usize::MAX } else { cap.saturating_sub(self.early_jobs) };
         let from = self.offered;
-        let n = (self.fallbacks.len() - from).min(room);
-        let mut jobs = Vec::with_capacity(n);
-        for (k, f) in self.fallbacks[from..from + n].iter_mut().enumerate() {
-            f.early = Some(self.early_jobs + k);
+        let mut jobs = Vec::new();
+        for f in self.fallbacks[from..].iter_mut().filter(|f| f.early.is_none()).take(room) {
+            f.early = Some(self.early_jobs + jobs.len());
             jobs.push(refit_job(f, f.device.clone(), &self.settings));
         }
         self.offered = self.fallbacks.len();
-        self.early_jobs += n;
+        self.early_jobs += jobs.len();
         exact.submit(jobs);
     }
 
@@ -1696,5 +1881,312 @@ mod tests {
         let mut iters = ReplayDevice::new([call]);
         let more = FitSettings { iters: ITERS + 1, ..settings };
         assert!(iters.fit(arm, &refs, &more, &sample).answers.is_none());
+    }
+
+    /// #1075: device calls recorded on demand for exactly the plans each call
+    /// gets, one recorded call per slice, served by the replay adapter. Call
+    /// `fail_call` fails.
+    struct OnDemand<'a> {
+        record: &'a dyn Fn(&[&GpuFitPlan], bool) -> RecCall,
+        fail_call: Option<usize>,
+        calls: usize,
+    }
+
+    impl DeviceFit for OnDemand<'_> {
+        fn fit(&mut self, arm: DeviceArm, plans: &[&GpuFitPlan], settings: &FitSettings, rows: &Sample) -> DeviceRun {
+            let failed = self.fail_call == Some(self.calls);
+            self.calls += 1;
+            ReplayDevice::new([(self.record)(plans, failed)]).fit(arm, plans, settings, rows)
+        }
+    }
+
+    /// #1075: one device call that releases every answer before it returns,
+    /// in a random order and grouping, plus a repeated and an out-of-range
+    /// index; with `wrong` one released answer differs from the final one,
+    /// with `fail_after` the call fails after releasing.
+    struct Scrambled<'a> {
+        inner: OnDemand<'a>,
+        rng: Mt,
+        wrong: bool,
+        fail_after: bool,
+    }
+
+    impl DeviceFit for Scrambled<'_> {
+        fn fit(&mut self, arm: DeviceArm, plans: &[&GpuFitPlan], settings: &FitSettings, rows: &Sample) -> DeviceRun {
+            self.inner.fit(arm, plans, settings, rows)
+        }
+
+        fn fit_released(
+            &mut self,
+            arm: DeviceArm,
+            plans: &[&GpuFitPlan],
+            settings: &FitSettings,
+            rows: &Sample,
+            _waves: usize,
+            release: &mut dyn FnMut(&[(usize, DeviceAnswer)]),
+        ) -> Released {
+            let run = self.inner.fit(arm, plans, settings, rows);
+            let launch = Launch { ms: run.ms, polish_ms: run.polish_ms, span_start_s: run.span_start_s, candidates: plans.len() };
+            if let Some(answers) = &run.answers {
+                let mut items: Vec<(usize, DeviceAnswer)> = answers.iter().cloned().enumerate().collect();
+                for k in (1..items.len()).rev() {
+                    items.swap(k, self.rng.usize_below(k + 1));
+                }
+                if self.wrong {
+                    // A non-tail fallback status released as a tail status
+                    // starts its refit from the wrong tree.
+                    let n = items
+                        .iter()
+                        .position(|(_, a)| matches!(a.status, 1..=3))
+                        .unwrap_or_else(|| self.rng.usize_below(items.len()));
+                    let answer = &mut items[n].1;
+                    if tail_status_cause(answer.status).is_some() && !answer.c.is_empty() {
+                        answer.c[0] += 0.5;
+                    } else {
+                        answer.status = 9;
+                    }
+                }
+                let repeat = items[0].clone();
+                items.push(repeat);
+                items.push((plans.len() + 3, answers[0].clone()));
+                let mut start = 0;
+                while start < items.len() {
+                    let len = 1 + self.rng.usize_below(items.len() - start);
+                    release(&items[start..start + len]);
+                    start += len;
+                }
+            }
+            let answers = if self.fail_after { None } else { run.answers };
+            Released { answers, launches: vec![launch] }
+        }
+    }
+
+    /// #1075: how a released case hands the device answers to the route.
+    #[derive(Clone, Copy, Debug)]
+    enum Schedule {
+        Waves(usize),
+        Scrambled,
+    }
+
+    /// #1075: cases in which a release schedule ran, and the fallbacks that
+    /// kept a released job under each schedule.
+    #[derive(Default)]
+    struct ReleaseTally {
+        released: usize,
+        waves_early: usize,
+        scrambled_early: usize,
+    }
+
+    /// #1075: one synchronous fit stage through the released verb against the
+    /// one-call inline reference.
+    fn released_case(seed: u32, tally: &mut ReleaseTally) {
+        let mut rng = Mt::new(seed);
+        let (metric, arm) = *rng.pick(&SYNC_ARMS);
+        let sample = rows(metric, *rng.pick(&[48usize, 72, 160]));
+        let cfg = Config::default();
+        let islands_n = 1 + rng.usize_below(3);
+        let slots_n = 2 + rng.usize_below(5);
+        let mut islands: Vec<Vec<Ind>> = (0..islands_n)
+            .map(|_| (0..slots_n).map(|_| Ind::pending(random_tree(&mut rng), &cfg)).collect())
+            .collect();
+        let admitted: Vec<(usize, usize)> = (0..islands_n)
+            .flat_map(|i| (0..slots_n).map(move |j| (i, j)))
+            .filter(|_| rng.bool(0.8))
+            .collect();
+        let scripts: HashMap<(usize, usize), Script> = admitted.iter().map(|&a| (a, script(&mut rng))).collect();
+        let single_class = rng.bool(0.05);
+        let arm = (!rng.bool(0.05)).then_some(arm);
+        let failed = rng.bool(0.05);
+        let overlap = rng.bool(0.75);
+        let kind = rng.usize_below(3);
+        let thresholds = rng.bool(0.25);
+        let settings = settings(metric, cap_for(&mut rng, admitted.len()), thresholds);
+        let schedule = match rng.usize_below(3) {
+            0 => Schedule::Waves(*rng.pick(&[0usize, 2, 3, 7])),
+            1 => Schedule::Waves(admitted.len() + 2),
+            _ => Schedule::Scrambled,
+        };
+        let wrong = rng.bool(0.2);
+        let mut grid: Vec<Vec<Node>> = islands.iter().map(|pop| pop.iter().map(|ind| ind.tree.clone()).collect()).collect();
+
+        crate::fit::with_fit_thresholds(thresholds, || {
+            let mut route = FitRoute::new(settings, overlap);
+            let mut exact = ScopedFits::new(&sample, &settings, 2);
+            let mut planned: Vec<(usize, usize, GpuFitPlan)> = Vec::new();
+            for &(i, j) in &admitted {
+                route.fold(&mut islands[i][j].tree);
+                if let Some(plan) = route.admit(i, j, &islands[i][j].tree, arm, single_class) {
+                    planned.push((i, j, plan));
+                }
+            }
+            let batch = route.plan_batch(&mut dispatcher(kind), sample.len(), planned, &mut islands[..]);
+            let jobs: Vec<((usize, usize), GpuFitPlan)> = batch.jobs.into_iter().map(|(i, j, p)| ((i, j), p)).collect();
+            route.submit_early(&mut exact);
+            let keys: Vec<(usize, usize)> = jobs.iter().map(|(k, _)| *k).collect();
+            if !jobs.is_empty() {
+                let arm = arm.expect("planned");
+                let key_of: HashMap<*const GpuFitPlan, (usize, usize)> =
+                    jobs.iter().map(|(k, p)| (p as *const GpuFitPlan, *k)).collect();
+                let record = |plans: &[&GpuFitPlan], failed: bool| {
+                    let s: Vec<Script> = plans.iter().map(|p| scripts[&key_of[&(*p as *const GpuFitPlan)]]).collect();
+                    recorded(plans, &s, arm, failed)
+                };
+                let waves = match schedule {
+                    Schedule::Waves(k) => k,
+                    Schedule::Scrambled => 2,
+                };
+                let releases = route.releases(arm, jobs.len(), waves);
+                let calls = match schedule {
+                    Schedule::Waves(k) if releases => k.clamp(1, jobs.len()),
+                    _ => 1,
+                };
+                let fail_call = failed.then(|| rng.usize_below(calls));
+                let step = match schedule {
+                    Schedule::Waves(k) => {
+                        let mut device = OnDemand { record: &record, fail_call, calls: 0 };
+                        route.fit_on_device_released(&mut device, arm, &jobs, &mut islands[..], &sample, 2, &mut exact, k)
+                    }
+                    Schedule::Scrambled => {
+                        let inner = OnDemand { record: &record, fail_call: if releases { None } else { fail_call }, calls: 0 };
+                        let mut device = Scrambled { inner, rng: Mt::new(seed ^ 0x5eed), wrong, fail_after: failed && releases };
+                        route.fit_on_device_released(&mut device, arm, &jobs, &mut islands[..], &sample, 2, &mut exact, waves)
+                    }
+                };
+                assert_eq!(step.ok, !failed, "seed {seed}");
+                let launches = match (schedule, fail_call) {
+                    (Schedule::Waves(_), Some(j)) => j + 1,
+                    _ => calls,
+                };
+                assert_eq!(step.launches.len(), launches, "seed {seed}: launches of {schedule:?}");
+                if !failed {
+                    assert_eq!(step.launches.iter().map(|l| l.candidates).sum::<usize>(), jobs.len(), "seed {seed}");
+                }
+                if releases {
+                    tally.released += 1;
+                    match schedule {
+                        Schedule::Waves(_) => tally.waves_early += step.early,
+                        Schedule::Scrambled => tally.scrambled_early += step.early,
+                    }
+                } else {
+                    assert_eq!(step.early, 0, "seed {seed}: nothing is released without the guard");
+                }
+            }
+            route.submit_early(&mut exact);
+            let done = route.finish(&mut exact);
+            for s in done.settled {
+                islands[s.island][s.slot].tree = s.tree;
+            }
+
+            let reference = reference_sync(
+                &mut grid,
+                &admitted,
+                &mut dispatcher(kind),
+                arm,
+                single_class,
+                &|plans: &[&GpuFitPlan]| {
+                    let s: Vec<Script> = keys.iter().map(|k| scripts[k]).collect();
+                    recorded(plans, &s, arm.unwrap_or(DeviceArm::Maximum), failed)
+                },
+                &sample,
+                &settings,
+            );
+            assert_eq!(done.counts, reference, "seed {seed}: counters under {schedule:?}");
+        });
+        for &(i, j) in &admitted {
+            assert_same_tree(&islands[i][j].tree, &grid[i][j], &format!("seed {seed}: slot ({i}, {j}) under {schedule:?}"));
+        }
+    }
+
+    /// #1075: whatever the device releases, in waves or in any order and
+    /// grouping, wrong, repeated or followed by a failed call, the route's
+    /// settled trees and counters equal the one-call inline route.
+    #[test]
+    fn released_schedules_match_the_one_shot_route() {
+        let mut tally = ReleaseTally::default();
+        for seed in 0..3000 {
+            released_case(20_000 + seed, &mut tally);
+        }
+        eprintln!(
+            "released cases {} early fits in waves {} scrambled {}",
+            tally.released, tally.waves_early, tally.scrambled_early
+        );
+        assert!(tally.released >= 100, "too few cases ran a release schedule: {}", tally.released);
+        assert!(tally.waves_early > 0 && tally.scrambled_early > 0, "no released job was kept");
+    }
+
+    /// #1075: the slices cover the batch in order, at most one candidate apart.
+    #[test]
+    fn wave_bounds_cover_the_batch_in_order() {
+        for n in 0..40usize {
+            for k in 0..50usize {
+                let bounds = wave_bounds(n, k);
+                assert_eq!(bounds.len(), k.clamp(1, n.max(1)), "n {n} k {k}");
+                assert_eq!(bounds.first().map(|r| r.start), Some(0));
+                assert_eq!(bounds.last().map(|r| r.end), Some(n));
+                for w in bounds.windows(2) {
+                    assert_eq!(w[0].end, w[1].start, "n {n} k {k}");
+                    assert!(w[0].len() == w[1].len() || w[0].len() == w[1].len() + 1, "n {n} k {k}");
+                }
+                assert!(n == 0 || bounds.iter().all(|r| !r.is_empty()), "n {n} k {k}");
+            }
+        }
+        assert_eq!(wave_bounds(10, 3), vec![0..4, 4..7, 7..10]);
+    }
+
+    /// #1075: the waves release every slice but the last, slice by slice, and
+    /// return every answer in plan order.
+    #[test]
+    fn waves_release_every_slice_but_the_last() {
+        struct Counting;
+        impl DeviceFit for Counting {
+            fn fit(&mut self, _: DeviceArm, plans: &[&GpuFitPlan], _: &FitSettings, _: &Sample) -> DeviceRun {
+                let answers = plans.iter().map(|p| DeviceAnswer { status: 0, c: p.c0.clone() }).collect();
+                DeviceRun { answers: Some(answers), ms: 1.0, polish_ms: 0.25, span_start_s: None }
+            }
+        }
+        let trees: Vec<Node> = (0..10).map(|k| node(Op::Mul, vec![constant(k as f64), input(0)])).collect();
+        let plans: Vec<GpuFitPlan> = trees.iter().map(|t| crate::fit::gpu_fit_plan_reason(t).expect("a plan")).collect();
+        let refs: Vec<&GpuFitPlan> = plans.iter().collect();
+        let sample = rows(Metric::Squared, 40);
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let got = Counting.fit_released(
+            DeviceArm::Lm(DeviceLoss::Squared),
+            &refs,
+            &settings(Metric::Squared, 0, false),
+            &sample,
+            3,
+            &mut |batch: &[(usize, DeviceAnswer)]| groups.push(batch.iter().map(|(k, _)| *k).collect()),
+        );
+        assert_eq!(groups, vec![vec![0, 1, 2, 3], vec![4, 5, 6]]);
+        let answers = got.answers.expect("every call succeeded");
+        assert_eq!(answers.iter().map(|a| a.c[0]).collect::<Vec<_>>(), (0..10).map(|k| k as f64).collect::<Vec<_>>());
+        assert_eq!(got.launches.iter().map(|l| l.candidates).collect::<Vec<_>>(), vec![4, 3, 3]);
+    }
+
+    /// #1075: a release schedule runs only where it can start exact fits early
+    /// and every released job lands in the refit prefix.
+    #[test]
+    fn release_runs_only_where_every_fallback_is_refit() {
+        let lm = DeviceArm::Lm(DeviceLoss::Squared);
+        let route = |cap: usize, overlap: bool, rejects: usize| {
+            let mut route = FitRoute::new(settings(Metric::Squared, cap, false), overlap);
+            for j in 0..rejects {
+                route.reject(0, j, PLAN, FitFallbackCause::UnsupportedPlan, &constant(1.0), 0);
+            }
+            route
+        };
+        assert!(route(0, true, 0).releases(lm, 2, 2));
+        assert!(route(0, true, 0).releases(DeviceArm::Lm(DeviceLoss::Logistic), 400, 64));
+        assert!(!route(0, false, 0).releases(lm, 10, 3), "the serial arm submits nothing early");
+        assert!(!route(0, true, 0).releases(lm, 10, 1), "one call");
+        assert!(!route(0, true, 0).releases(lm, 10, 0), "one call");
+        assert!(!route(0, true, 0).releases(lm, 1, 3), "one job");
+        assert!(!route(0, true, 0).releases(DeviceArm::Lm(DeviceLoss::Slope), 10, 3), "slope chains two launches");
+        for arm in [DeviceArm::Rank { signed: false }, DeviceArm::OrderStat(OrderStat::Median), DeviceArm::Maximum] {
+            assert!(!route(0, true, 0).releases(arm, 10, 3), "{arm:?} routes no tail");
+        }
+        assert!(route(0, true, 50).releases(lm, 10, 3), "no cap");
+        assert!(route(12, true, 2).releases(lm, 10, 3), "2 rejects and 10 jobs fit under 12");
+        assert!(!route(11, true, 2).releases(lm, 10, 3), "the cap could bind");
     }
 }

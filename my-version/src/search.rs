@@ -461,6 +461,12 @@ pub struct Config {
     /// errors equal the serial arm bit for bit, so it is not saved in a
     /// checkpoint. `false` keeps the serial arm after the device batch.
     pub fit_tail_overlap: bool,
+    /// #1075: release the device fit answers of the synchronous fit stage in
+    /// this many ordered device calls, so the exact fits of released fallbacks
+    /// start while later calls run. Scheduling only: the outcome equals one
+    /// call bit for bit, so it is not saved in a checkpoint. `0` and `1` keep
+    /// one call; `RCSR_FIT_RELEASE_WAVES` sets it from the command line.
+    pub fit_release_waves: usize,
     /// #122: which variation engine to use. `auto` selects the flat postfix
     /// engine only for a large, fit-free GPU run.
     pub variation: VariationMode,
@@ -832,6 +838,7 @@ impl Default for Config {
             threads: 1,
             threads_explicit: false,
             fit_tail_overlap: true,
+            fit_release_waves: 0,
             variation: VariationMode::Auto,
             selection: Selection::Lexicographic,
             restart_policy: RestartPolicy::Archive,
@@ -1266,6 +1273,10 @@ struct GpuSearch {
     /// #958: the exact CPU fallback fits run on the pool beside the device
     /// work; `false` keeps the serial arm after the device batch (#936).
     tail_overlap: bool,
+    /// #1075: ordered device calls of the synchronous fit (`0` is one call),
+    /// and the fallbacks whose exact fit started from a released answer.
+    release_waves: usize,
+    fit_tail_early: usize,
     /// #230: true only when the CUDA evaluator scores this run's metric
     /// itself through the objective kernel. False for an exact order/rank run,
     /// which is scored through [`crate::gpu::GpuEvaluator::score_stat_batch`]
@@ -1565,6 +1576,8 @@ impl GpuSearch {
                     defer_check: false,
                     deferred_check: None,
                     tail_overlap: true,
+                    release_waves: 0,
+                    fit_tail_early: 0,
                     native_metric,
                     native_stat,
                     score,
@@ -1673,8 +1686,14 @@ impl GpuSearch {
                 Some(ev) => ev,
                 None => &mut self.ev,
             };
-            let step = route.fit_on_device(dev, arm, &jobs, islands, fit_train, cfg.threads);
-            self.book_fit_kernel(&step, fit_device_start, jobs.len());
+            // #1075: the device answers may reach the route in waves, so the
+            // pool starts the exact fits of released fallbacks under the launch.
+            let pool = self.fallback.as_ref().expect("a GPU search owns its fallback pool");
+            let mut exact = PoolFits::new(pool, &mut pending, fit_train, &settings, self.fallback_workers);
+            let step =
+                route.fit_on_device_released(dev, arm, &jobs, islands, fit_train, cfg.threads, &mut exact, self.release_waves);
+            self.fit_tail_early += step.early;
+            self.book_fit_kernel(&step, fit_device_start);
             if step.ok {
                 // #290: a successful batch is what makes this run device-used.
                 self.device_fit_used = true;
@@ -1711,29 +1730,29 @@ impl GpuSearch {
 
     /// #1091: the fallback pool as the fit route's exact CPU adapter.
     fn pool_fits<'a>(&'a self, pending: &'a mut PendingTail, rows: &'a Sample, settings: &FitSettings) -> PoolFits<'a> {
-        PoolFits {
-            pool: self.fallback.as_ref().expect("a GPU search owns its fallback pool"),
-            pending,
-            rows,
-            iters: settings.iters,
-            metric: settings.metric,
-            workers: self.fallback_workers,
-        }
+        let pool = self.fallback.as_ref().expect("a GPU search owns its fallback pool");
+        PoolFits::new(pool, pending, rows, settings, self.fallback_workers)
     }
 
-    /// #284/#600: book one fit launch. The kernel is one device interval on the
-    /// run clock; its duration is the raw event time, not the host envelope.
-    fn book_fit_kernel<K>(&mut self, step: &fit_route::DeviceStep<K>, launch_start_s: f64, candidates: usize) {
-        let ms = step.ms;
-        if ms > 0.0 {
-            self.fit_ms += ms as f64;
-            self.fit_polish_ms += step.polish_ms;
-            self.fit_calls += 1;
-            self.fit_call_candidates += candidates;
-            self.fit_call_ms_max = self.fit_call_ms_max.max(ms as f64);
-            match step.span_start_s {
-                Some(start_s) => self.ledger.record_fit_kernel_event(0, start_s, ms as f64 / 1000.0),
-                None => self.ledger.record_fit_kernel_interval(0, launch_start_s, ms as f64 / 1000.0),
+    /// #284/#600: book the launches of one fit call. Each kernel is one device
+    /// interval on the run clock; its duration is the raw event time, not the
+    /// host envelope. Without event times the launches are placed back to back
+    /// from `launch_start_s` (#1075).
+    fn book_fit_kernel<K>(&mut self, step: &fit_route::DeviceStep<K>, launch_start_s: f64) {
+        let mut host_s = launch_start_s;
+        for launch in &step.launches {
+            let ms = launch.ms;
+            if ms > 0.0 {
+                self.fit_ms += ms as f64;
+                self.fit_polish_ms += launch.polish_ms;
+                self.fit_calls += 1;
+                self.fit_call_candidates += launch.candidates;
+                self.fit_call_ms_max = self.fit_call_ms_max.max(ms as f64);
+                match launch.span_start_s {
+                    Some(start_s) => self.ledger.record_fit_kernel_event(0, start_s, ms as f64 / 1000.0),
+                    None => self.ledger.record_fit_kernel_interval(0, host_s, ms as f64 / 1000.0),
+                }
+                host_s += ms as f64 / 1000.0;
             }
         }
     }
@@ -2489,6 +2508,8 @@ impl GpuSearch {
             fit_calls: self.fit_calls,
             fit_call_candidates: self.fit_call_candidates,
             fit_call_ms_max: self.fit_call_ms_max,
+            fit_release_waves: if self.release_waves >= 2 { self.release_waves } else { 0 },
+            fit_tail_early: self.fit_tail_early,
             fit_host_ms: self.fit_host_ms,
             fit_fallback_ms: self.fit_fallback_ms,
             fit_gate_ms: self.fit_gate_ms,
@@ -3260,6 +3281,13 @@ struct PoolFits<'a> {
 }
 
 #[cfg(feature = "cuda")]
+impl<'a> PoolFits<'a> {
+    fn new(pool: &'a FallbackPool, pending: &'a mut PendingTail, rows: &'a Sample, settings: &FitSettings, workers: usize) -> Self {
+        PoolFits { pool, pending, rows, iters: settings.iters, metric: settings.metric, workers }
+    }
+}
+
+#[cfg(feature = "cuda")]
 impl ExactFits for PoolFits<'_> {
     fn submit(&mut self, jobs: Vec<FallbackFitJob>) {
         self.pending.submit(self.pool, jobs, self.rows, self.iters, self.metric);
@@ -3344,6 +3372,24 @@ fn fit_tail_overlap(cfg: &Config) -> bool {
             std::env::var("RCSR_FIT_TAIL_SERIAL").as_deref(),
             Ok("1") | Ok("true") | Ok("on") | Ok("yes")
         )
+}
+
+/// #1075: ordered device calls of the synchronous fit stage:
+/// `RCSR_FIT_RELEASE_WAVES` (an integer from 0 to 64) for an A/B run, else the
+/// config field, the test switch. A value outside that range keeps the config
+/// field and prints one note.
+#[cfg(feature = "cuda")]
+fn fit_release_waves(cfg: &Config) -> usize {
+    match std::env::var("RCSR_FIT_RELEASE_WAVES") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(k) if k <= 64 => k,
+            _ => {
+                eprintln!("# gpu-fit: RCSR_FIT_RELEASE_WAVES={raw} ignored (an integer from 0 to 64)");
+                cfg.fit_release_waves
+            }
+        },
+        Err(_) => cfg.fit_release_waves,
+    }
 }
 
 /// #121: size of the bounded CPU fallback pool: `RCSR_CPU_FALLBACK_THREADS`,
@@ -3641,7 +3687,7 @@ fn fit_pipeline_queue(
         let mut slots = fit_route::QueueSlots { jobs: &mut jobs, offered: &offered_hash };
         let step = route.fit_on_device(&mut g.ev, arm, &plans, &mut slots, tail.rows, 1);
         // #600: the fit kernel is one device interval on the run clock.
-        g.book_fit_kernel(&step, fit_device_start, plans.len());
+        g.book_fit_kernel(&step, fit_device_start);
         fitted = step.fitted;
     }
     g.absorb_fit_counts(generation, route.take_counts());
@@ -6712,6 +6758,10 @@ pub struct GpuRunStats {
     pub fit_calls: usize,
     pub fit_call_candidates: usize,
     pub fit_call_ms_max: f64,
+    /// #1075: ordered device calls the synchronous fit was set to (`0` is one
+    /// call), and the fallbacks whose exact fit started from a released answer.
+    pub fit_release_waves: usize,
+    pub fit_tail_early: usize,
     /// #496: arithmetic of the device fit polish.
     pub fit_polish: crate::fit::FitPolish,
     /// #169: wall time spent in the whole fit stage, milliseconds.
@@ -8333,6 +8383,7 @@ fn run_search_scoped(
                     Ok(mut g) => {
                         g.memory_plan = memory_plan;
                         g.tail_overlap = fit_tail_overlap(cfg);
+                        g.release_waves = fit_release_waves(cfg);
                         let device = crate::gpu::GpuEvaluator::device_name();
                         if cfg.gpu_notes {
                             // #169: the GPU-fit arm runs at the generation
