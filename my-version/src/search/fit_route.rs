@@ -1251,6 +1251,12 @@ mod tests {
         for job in jobs {
             grid[job.island][job.slot] = job.tree;
         }
+        // #1071: a fallback past the cap keeps the device answer when there is one.
+        for &(island, slot, _) in &fallbacks[refit..] {
+            if let Some(alt) = device_alts.remove(&(island, slot)) {
+                grid[island][slot] = alt;
+            }
+        }
         counts
     }
 
@@ -1448,8 +1454,12 @@ mod tests {
                 fallbacks[n].tree = job.tree;
             }
         }
-        for f in fallbacks {
-            out.insert((f.island, f.slot), (f.tree, f.offered));
+        for (n, f) in fallbacks.into_iter().enumerate() {
+            let tree = match f.device {
+                Some(device) if n >= refit => device,
+                _ => f.tree,
+            };
+            out.insert((f.island, f.slot), (tree, f.offered));
         }
         (out, counts)
     }
@@ -1689,6 +1699,37 @@ mod tests {
                 assert_same_tree(&islands[0][j].tree, &grid[0][j], &format!("overlap {overlap}: slot {j}"));
             }
         }
+    }
+
+    /// #1071: a fallback past `--fit-fallback-max` keeps the device tree when
+    /// the device produced one, else its own tree.
+    #[test]
+    fn a_fallback_past_the_cap_keeps_the_device_answer() {
+        let sample = rows(Metric::Squared, 160);
+        let tree = node(Op::Add, vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.5)]);
+        let plan = crate::fit::gpu_fit_plan_reason(&tree).expect("a plan");
+        let mut device = tree.clone();
+        plan.apply(&mut device, &[2.0, 3.0]);
+        let settings = settings(Metric::Squared, 1, false);
+        let mut route = FitRoute::new(settings, false);
+        let mut exact = ScopedFits::new(&sample, &settings, 1);
+        let fallback = |slot: usize, device: Option<Node>| Fallback {
+            key: (DEVICE, 0, slot),
+            cause: FitFallbackCause::Unconverged,
+            tree: tree.clone(),
+            device,
+            early: None,
+            tag: 0,
+        };
+        route.push(fallback(0, Some(device.clone())));
+        route.push(fallback(1, Some(device.clone())));
+        route.push(fallback(2, None));
+        let done = route.finish(&mut exact);
+        assert_eq!(done.counts.bounded, 2);
+        let by_slot = |slot: usize| &done.settled.iter().find(|s| s.slot == slot).expect("settled").tree;
+        assert!(!crate::expr::same(by_slot(0), &tree), "the refit prefix is fitted");
+        assert_same_tree(by_slot(1), &device, "past the cap with a device answer");
+        assert_same_tree(by_slot(2), &tree, "past the cap without a device answer");
     }
 
     /// #1091: the route's decisions and outputs equal the inline route it
