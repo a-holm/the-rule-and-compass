@@ -299,7 +299,7 @@ fn every_row_round_trips_and_a_missing_key_reads_its_default() {
     }
     let default_fields = config_fields(&group_text(&Config::default()));
     for row in settings::rows() {
-        assert_eq!(default_fields.contains_key(row.key()), row.required(), "{} at its default", row.flag());
+        assert_eq!(default_fields.contains_key(row.key()), row.required() || row.always(), "{} at its default", row.flag());
     }
 }
 
