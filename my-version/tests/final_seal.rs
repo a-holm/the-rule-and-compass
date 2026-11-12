@@ -1147,3 +1147,41 @@ fn verify_read_of_a_read_without_a_binding_digest_is_refused() {
     assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
     assert!(!Path::new(&marker_of(&data)).exists());
 }
+
+#[test]
+fn verify_read_with_gpu_scores_nothing() {
+    verify_with_other_inputs_scores_nothing("verify-gpu", &["x"], &[], &["--gpu"]);
+}
+
+const FRONT_RUN: &str = r#"{"tool":"rcsr","variables":["x"],"target_spec":{"return_column":"y"},
+    "split":{"train_time":[0,100],"validation_time":[101,200],"required_purge_seconds":3600,"purge_seconds":3600},
+    "objective":{"spec":{"threshold":0,"per_side_bps":5}},
+    "pareto":[{"expression":"x"}]}"#;
+
+/// The `--front` path is not part of the report hash, so another spelling of
+/// the same file verifies; a changed file is another run and is refused.
+#[test]
+fn verify_read_accepts_another_spelling_of_the_front_path() {
+    let (_scratch, dir) = scratch("verify-front");
+    let data = store(&dir, "d.csv");
+    let run = s(&dir.join("run.json"));
+    std::fs::write(&run, FRONT_RUN).unwrap();
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+    let dev_w = window("dev", 0, 150, 160, 250);
+    let (code, _, err) = wf(&data, &l, &[], &["--window", dev_w.as_str(), "--front", run.as_str(), "--validation-frac", "0.2"]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let w = window("locked", 0, 250, 300, 400);
+    let go = |front: &str, extra: &[&str]| {
+        let mut a = vec!["--locked-test", "--sealed", sealed.as_str(), "--window", w.as_str(), "--front", front, "--validation-frac", "0.2"];
+        a.extend_from_slice(extra);
+        wf(&data, &l, &[], &a)
+    };
+    let (code, _, err) = go(&run, &[]);
+    assert_eq!(code, 0, "{}", err);
+    let sha = recorded_read_sha(&l);
+    let spelled = format!("{}/./run.json", s(&dir));
+    let (code, _, err) = go(&spelled, &["--verify-read", "--expect-report-sha256", &sha]);
+    assert_eq!(code, 0, "{}", err);
+}

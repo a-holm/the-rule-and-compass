@@ -1751,3 +1751,93 @@ fn ladder_verify_read_needs_a_read_marker() {
     assert_eq!(f.bytes(&f.ledger), ledger_before);
     assert!(!Path::new(&format!("{}.locked_reads.jsonl", copy)).exists());
 }
+
+fn verify_args<'a>(f: &'a Sealed, sha: Option<&'a str>, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut a = vec!["--locked-test", "--ledger", f.ledger.as_str(), "--sealed", f.sealed.as_str(), "--verify-read"];
+    if let Some(h) = sha {
+        a.extend_from_slice(&["--expect-report-sha256", h]);
+    }
+    a.extend_from_slice(extra);
+    a
+}
+
+/// A verify refused on the binding digest: exit 3, no hash, nothing written or recorded.
+fn assert_binding_refusal(f: &Sealed, name: &str, extra: &[&str], sha: &str, ledger: &Option<Vec<u8>>, marker: &Option<Vec<u8>>) {
+    for hash in [None, Some(sha)] {
+        let probe = s(&f.dir.join(format!("{name}.out.json")));
+        let (code, stdout, err) = ladder(&f.data, &f.windows, &probe, &verify_args(f, hash, extra));
+        assert_eq!(code, 3, "{name}: {stdout}{err}");
+        assert!(err.contains("binds the report"), "{name}: {err}");
+        assert!(!err.contains("report sha256") && !stdout.contains("report_sha256"), "{name}: {stdout}{err}");
+        assert!(!Path::new(&probe).exists());
+        assert_eq!(&f.bytes(&f.ledger), ledger);
+        assert_eq!(&f.bytes(&f.marker()), marker);
+    }
+}
+
+/// A `--retired` record whose ledger holds one read of the protocol default range.
+fn retired_record(dir: &Path) -> String {
+    let ledger = dir.join("retire-ledger.jsonl");
+    let l = Ledger::new(&ledger);
+    let spec = "spec-r".to_string();
+    let c = Candidate {
+        id: Candidate::address(&spec, "data", "build"),
+        spec_sha256: spec,
+        data_sha256: "data".into(),
+        build_commit: "build".into(),
+        report_sha256: "report".into(),
+        expression: "x".into(),
+        locked_test: None,
+    };
+    l.add_candidate(&c).unwrap();
+    l.seal(&dir.join("retire-sealed.json"), &[]).unwrap();
+    l.record_read(&c.id, "locked", Some(&rcsr::protocol::LockedRange::new(&lockbox::protocol_default(), "store"))).unwrap();
+    let out = s(&dir.join("retired.json"));
+    let (code, _, err) = rcsr(&["protocol", "retire", "--ledger", &s(&ledger), "--range", "2025-07-01,2026-07-01", "--out", &out]);
+    assert_eq!(code, 0, "{}", err);
+    out
+}
+
+#[test]
+fn ladder_verify_read_with_another_retirement_scores_nothing() {
+    let f = Sealed::new("lad-verify-retired");
+    let range = format!(
+        "{},{}",
+        rcsr::protocol::iso((T0 + 400 * H) as f64),
+        rcsr::protocol::iso((T0 + 500 * H) as f64)
+    );
+    let out = s(&f.dir.join("first.json"));
+    let (code, _, err) = f.read(&out, &["--lockbox", &range]);
+    assert_eq!(code, 0, "{}", err);
+    let sha = f.recorded_sha();
+    let (ledger, marker) = (f.bytes(&f.ledger), f.bytes(&f.marker()));
+    let record = retired_record(&f.dir);
+    assert_binding_refusal(&f, "retired", &["--lockbox", &range, "--retired", &record], &sha, &ledger, &marker);
+    let (code, _, err) = f.read(&s(&f.dir.join("again.json")), &["--lockbox", &range, "--verify-read", "--expect-report-sha256", &sha]);
+    assert_eq!(code, 0, "{}", err);
+}
+
+#[test]
+fn ladder_verify_read_without_allow_in_sample_scores_nothing() {
+    let f = Sealed::new("lad-verify-in-sample");
+    let run = s(&f.dir.join("run.json"));
+    std::fs::write(
+        &run,
+        format!(
+            "{{\"variables\":[\"f1\",\"f2\"],\"pareto\":[{{\"expression\":\"f1\"}}],\
+             \"split\":{{\"train_time\":[{},{}],\"required_purge_seconds\":3600}}}}",
+            T0,
+            T0 + 450 * H
+        ),
+    )
+    .unwrap();
+    let out = s(&f.dir.join("first.json"));
+    let (code, _, err) = f.read(&out, &["--sr-run", &run, "--allow-in-sample"]);
+    assert_eq!(code, 0, "{}", err);
+    let sha = f.recorded_sha();
+    let (ledger, marker) = (f.bytes(&f.ledger), f.bytes(&f.marker()));
+    assert_binding_refusal(&f, "in-sample", &["--sr-run", &run], &sha, &ledger, &marker);
+    let (code, _, err) =
+        f.read(&s(&f.dir.join("again.json")), &["--sr-run", &run, "--allow-in-sample", "--verify-read", "--expect-report-sha256", &sha]);
+    assert_eq!(code, 0, "{}", err);
+}
