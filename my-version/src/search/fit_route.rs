@@ -16,9 +16,9 @@
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
 use super::{
-    fallback_batch_split, gate_proposals, gpu_status_label, maximum_status_fallback_cause,
+    fallback_batch_split, gate_proposals, gpu_status_label, maximum_status_fallback_cause, plan_fit_batch,
     order_stat_status_fallback_cause, plan_fallback_cause, status_fallback_cause, tail_status_cause, Config,
-    FallbackFitJob, FitFallbackCause, Ind, PipelineJob, TailJoin,
+    FallbackFitJob, FitBatch, FitFallbackCause, Ind, PipelineJob, TailJoin,
 };
 use crate::data::Sample;
 use crate::expr::Node;
@@ -337,12 +337,15 @@ impl FitSlots<usize> for QueueSlots<'_> {
     }
 }
 
-/// The insertion groups. The synchronous stage inserts plan rejects, then
-/// batch-plan refusals, then device outcomes, and `admitted` is sorted by
-/// `(island, slot)`, so its insertion order is the order of the key
-/// `(group, island, slot)`.
+/// The insertion groups. The synchronous stage inserts plan rejects, then the
+/// row-floor refusals, then the dispatcher's refusal of the rest of the batch,
+/// then device outcomes; each group is in admission order, which is sorted by
+/// `(island, slot)`. So its insertion order is the order of the key
+/// `(group, island, slot)`. A refused batch makes no device call, so the
+/// dispatch and device groups never meet in one stage.
 pub(super) const PLAN: u8 = 0;
-pub(super) const BATCH: u8 = 1;
+pub(super) const ROW_FLOOR: u8 = 1;
+pub(super) const DISPATCH: u8 = 1;
 pub(super) const DEVICE: u8 = 2;
 
 /// One candidate that needs the exact CPU fit.
@@ -544,6 +547,26 @@ impl FitRoute {
         None
     }
 
+    /// #453: plan the device batch of the synchronous stage once. Its refusals
+    /// become fallbacks with their current trees: the row floor, then the
+    /// dispatcher's refusal of the rest.
+    pub(super) fn plan_batch<S: FitSlots<(usize, usize)> + ?Sized>(
+        &mut self,
+        dispatcher: &mut crate::dispatch::Dispatcher,
+        rows: usize,
+        planned: Vec<(usize, usize, GpuFitPlan)>,
+        slots: &mut S,
+    ) -> FitBatch {
+        let loss = crate::fit::fit_loss(self.settings.metric);
+        let batch = plan_fit_batch(dispatcher, rows, self.settings.iters, loss, planned);
+        for (n, &(island, slot, cause)) in batch.refused.iter().enumerate() {
+            let group = if n < batch.floor { ROW_FLOOR } else { DISPATCH };
+            let tree = slots.tree((island, slot)).clone();
+            self.push(Fallback { key: (group, island, slot), cause, tree, device: None, early: None, tag: 0 });
+        }
+        batch
+    }
+
     /// One device call over `jobs`, then the triage of every answer in job
     /// order. A failed call makes every job a `launch` fallback with its
     /// current tree. #234/#393: a gated metric judges each usable proposal in
@@ -739,14 +762,13 @@ mod tests {
     use crate::rng::Mt;
     use std::collections::HashMap;
 
-    const ROWS: usize = 40;
     const ITERS: usize = 3;
 
-    fn rows(metric: Metric) -> Sample {
-        let mut x = Vec::with_capacity(ROWS);
-        let mut y = Vec::with_capacity(ROWS);
-        for i in 0..ROWS {
-            let a = -1.0 + 2.0 * i as f64 / (ROWS - 1) as f64;
+    fn rows(metric: Metric, n: usize) -> Sample {
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = -1.0 + 2.0 * i as f64 / (n - 1) as f64;
             let b = (0.7 * i as f64).sin();
             x.push(vec![a, b]);
             let t = 1.5 * a + 0.3 + 0.2 * b * b;
@@ -759,10 +781,11 @@ mod tests {
         constant((rng.range(-2.0, 2.0) * 64.0).round() / 64.0)
     }
 
-    /// Small trees with constants; shape 2 has a foldable product of
-    /// constants, shape 4 has more constants than the device fits.
+    /// Small trees with one to three constants; shape 2 has a foldable product
+    /// of constants, shape 4 has more constants than the device fits, shape 8
+    /// has an `if` threshold constant (#1024).
     fn random_tree(rng: &mut Mt) -> Node {
-        match rng.usize_below(6) {
+        match rng.usize_below(9) {
             0 => node(Op::Add, vec![node(Op::Mul, vec![c(rng), input(0)]), c(rng)]),
             1 => node(Op::Mul, vec![c(rng), node(Op::Sin, vec![node(Op::Mul, vec![c(rng), input(1)])])]),
             2 => node(Op::Add, vec![node(Op::Mul, vec![node(Op::Mul, vec![c(rng), c(rng)]), input(0)]), c(rng)]),
@@ -774,7 +797,13 @@ mod tests {
                 ],
             ),
             4 => (0..21).fold(c(rng), |acc, _| node(Op::Add, vec![acc, node(Op::Mul, vec![c(rng), input(0)])])),
-            _ => node(Op::Add, vec![node(Op::Mul, vec![c(rng), input(0)]), node(Op::Mul, vec![c(rng), input(1)])]),
+            5 => node(Op::Add, vec![node(Op::Mul, vec![c(rng), input(0)]), node(Op::Mul, vec![c(rng), input(1)])]),
+            6 => node(Op::Mul, vec![c(rng), input(0)]),
+            7 => node(
+                Op::Add,
+                vec![node(Op::Add, vec![node(Op::Mul, vec![c(rng), input(0)]), node(Op::Mul, vec![c(rng), input(1)])]), c(rng)],
+            ),
+            _ => node(Op::If, vec![node(Op::Sub, vec![input(0), c(rng)]), node(Op::Mul, vec![c(rng), input(1)]), c(rng)]),
         }
     }
 
@@ -859,8 +888,22 @@ mod tests {
         *map.entry(cause).or_default() += 1;
     }
 
-    fn settings(metric: Metric, cap: usize) -> FitSettings {
-        FitSettings { iters: ITERS, metric, polish: FitPolish::default(), thresholds: false, fallback_max: cap }
+    fn settings(metric: Metric, cap: usize, thresholds: bool) -> FitSettings {
+        FitSettings { iters: ITERS, metric, polish: FitPolish::default(), thresholds, fallback_max: cap }
+    }
+
+    /// A dispatcher that sends every batch to the device (0), refuses every
+    /// batch (1), or decides by the default cost model (2).
+    fn dispatcher(kind: usize) -> crate::dispatch::Dispatcher {
+        match kind {
+            0 => crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::default())
+                .with_mode(crate::dispatch::DispatchMode::Device),
+            1 => crate::dispatch::Dispatcher::new(crate::dispatch::Calibration {
+                launch_s: 1.0e9,
+                ..crate::dispatch::Calibration::default()
+            }),
+            _ => crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::default()),
+        }
     }
 
     /// The reference: the synchronous route as `fit_pending` wrote it inline
@@ -870,7 +913,7 @@ mod tests {
     fn reference_sync(
         grid: &mut [Vec<Node>],
         admitted: &[(usize, usize)],
-        refused: &[Option<FitFallbackCause>],
+        dispatcher: &mut crate::dispatch::Dispatcher,
         arm: Option<DeviceArm>,
         single_class: bool,
         call: &dyn Fn(&[&GpuFitPlan]) -> RecCall,
@@ -914,14 +957,9 @@ mod tests {
                 Err(reason) => fallbacks.push((i, j, plan_fallback_cause(reason))),
             }
         }
-        let mut jobs = Vec::new();
-        for (i, j, plan) in planned {
-            let k = admitted.iter().position(|&a| a == (i, j)).expect("admitted");
-            match refused[k] {
-                Some(cause) => fallbacks.push((i, j, cause)),
-                None => jobs.push((i, j, plan)),
-            }
-        }
+        let batch = plan_fit_batch(dispatcher, sample.len(), settings.iters, crate::fit::fit_loss(metric), planned);
+        fallbacks.extend(batch.refused);
+        let jobs = batch.jobs;
         if !jobs.is_empty() {
             let plans: Vec<&GpuFitPlan> = jobs.iter().map(|(_, _, p)| p).collect();
             let out = answers_of(&call(&plans), &plans);
@@ -1045,13 +1083,15 @@ mod tests {
 
     /// The reference: the pipeline route as `fit_pipeline_queue` and
     /// `finish_pipeline_fallbacks` wrote it inline before the module, kept
-    /// verbatim (pool fits replaced by the scoped arm). Returns the final tree
-    /// and tag of every fitted or settled slot, and the counters.
+    /// verbatim (pool fits replaced by the scoped arm). With `relabel` a plan
+    /// reject takes the synchronous label (#1091 decision 9). Returns the final
+    /// tree and tag of every fitted or settled slot, and the counters.
     #[allow(clippy::type_complexity)]
     fn reference_pipeline(
         flushes: &[Vec<(usize, usize, Node)>],
         call: &dyn Fn(usize, &[&GpuFitPlan]) -> RecCall,
         overlap: bool,
+        relabel: bool,
         sample: &Sample,
         settings: &FitSettings,
     ) -> (BTreeMap<(usize, usize), (Node, u64)>, RouteCounts) {
@@ -1074,6 +1114,8 @@ mod tests {
             let fresh = fallbacks.len();
             for &k in &fallback_jobs {
                 let cause = match crate::fit::gpu_fit_plan_reason(&jobs[k].2) {
+                    // #1091 decision 9: the one label the route changes.
+                    Err(reason) if relabel => plan_fallback_cause(reason),
                     Err(GpuFitReject::TooManyConstants) => FitFallbackCause::TooManyConstants,
                     _ => FitFallbackCause::UnsupportedPlan,
                 };
@@ -1250,7 +1292,9 @@ mod tests {
     fn sync_case(seed: u32) {
         let mut rng = Mt::new(seed);
         let (metric, arm) = *rng.pick(&SYNC_ARMS);
-        let sample = rows(metric);
+        // Below 64 rows only one-constant trees pass the row floor, below 96
+        // only one and two; 160 rows pass every planned tree.
+        let sample = rows(metric, *rng.pick(&[48usize, 72, 160]));
         let cfg = Config::default();
         let islands_n = 1 + rng.usize_below(3);
         let slots_n = 2 + rng.usize_below(5);
@@ -1261,64 +1305,60 @@ mod tests {
             .flat_map(|i| (0..slots_n).map(move |j| (i, j)))
             .filter(|_| rng.bool(0.8))
             .collect();
-        let refused: Vec<Option<FitFallbackCause>> = admitted
-            .iter()
-            .map(|_| rng.bool(0.1).then(|| *rng.pick(&[FitFallbackCause::TooFewRows, FitFallbackCause::DispatchCost])))
-            .collect();
         let scripts: HashMap<(usize, usize), Script> = admitted.iter().map(|&a| (a, script(&mut rng))).collect();
         let single_class = rng.bool(0.05);
         let arm = (!rng.bool(0.05)).then_some(arm);
         let failed = rng.bool(0.05);
         let overlap = rng.bool(0.5);
-        let settings = settings(metric, cap_for(&mut rng, admitted.len()));
+        let kind = rng.usize_below(3);
+        let thresholds = rng.bool(0.25);
+        let settings = settings(metric, cap_for(&mut rng, admitted.len()), thresholds);
         let mut grid: Vec<Vec<Node>> = islands.iter().map(|pop| pop.iter().map(|ind| ind.tree.clone()).collect()).collect();
-
-        let mut route = FitRoute::new(settings, overlap);
-        let mut exact = ScopedFits::new(&sample, &settings, 2);
-        let mut planned: Vec<((usize, usize), GpuFitPlan)> = Vec::new();
-        for &(i, j) in &admitted {
-            route.fold(&mut islands[i][j].tree);
-            if let Some(plan) = route.admit(i, j, &islands[i][j].tree, arm, single_class) {
-                planned.push(((i, j), plan));
-            }
-        }
-        let mut jobs = Vec::new();
-        for (key, plan) in planned {
-            let k = admitted.iter().position(|&a| a == key).expect("admitted");
-            match refused[k] {
-                Some(cause) => route.reject(key.0, key.1, BATCH, cause, &islands[key.0][key.1].tree, 0),
-                None => jobs.push((key, plan)),
-            }
-        }
-        route.submit_early(&mut exact);
         let call = |plans: &[&GpuFitPlan], keys: &[(usize, usize)]| {
             let s: Vec<Script> = keys.iter().map(|k| scripts[k]).collect();
             recorded(plans, &s, arm.unwrap_or(DeviceArm::Maximum), failed)
         };
-        let keys: Vec<(usize, usize)> = jobs.iter().map(|(k, _)| *k).collect();
-        if !jobs.is_empty() {
-            let plans: Vec<&GpuFitPlan> = jobs.iter().map(|(_, p)| p).collect();
-            let mut device = ReplayDevice::new([call(&plans, &keys)]);
-            let step = route.fit_on_device(&mut device, arm.expect("planned"), &jobs, &mut islands[..], &sample, 2);
-            assert_eq!(step.ok, !failed, "seed {seed}");
-        }
-        route.submit_early(&mut exact);
-        let done = route.finish(&mut exact);
-        for s in done.settled {
-            islands[s.island][s.slot].tree = s.tree;
-        }
 
-        let reference = reference_sync(
-            &mut grid,
-            &admitted,
-            &refused,
-            arm,
-            single_class,
-            &|plans: &[&GpuFitPlan]| call(plans, &keys),
-            &sample,
-            &settings,
-        );
-        assert_eq!(done.counts, reference, "seed {seed}: counters");
+        // #1024: the threshold flag is a scope on the main thread for the plan
+        // and a setting of every refit job.
+        crate::fit::with_fit_thresholds(thresholds, || {
+            let mut route = FitRoute::new(settings, overlap);
+            let mut exact = ScopedFits::new(&sample, &settings, 2);
+            let mut planned: Vec<(usize, usize, GpuFitPlan)> = Vec::new();
+            for &(i, j) in &admitted {
+                route.fold(&mut islands[i][j].tree);
+                if let Some(plan) = route.admit(i, j, &islands[i][j].tree, arm, single_class) {
+                    planned.push((i, j, plan));
+                }
+            }
+            let batch = route.plan_batch(&mut dispatcher(kind), sample.len(), planned, &mut islands[..]);
+            let jobs: Vec<((usize, usize), GpuFitPlan)> = batch.jobs.into_iter().map(|(i, j, p)| ((i, j), p)).collect();
+            route.submit_early(&mut exact);
+            let keys: Vec<(usize, usize)> = jobs.iter().map(|(k, _)| *k).collect();
+            if !jobs.is_empty() {
+                let plans: Vec<&GpuFitPlan> = jobs.iter().map(|(_, p)| p).collect();
+                let mut device = ReplayDevice::new([call(&plans, &keys)]);
+                let step = route.fit_on_device(&mut device, arm.expect("planned"), &jobs, &mut islands[..], &sample, 2);
+                assert_eq!(step.ok, !failed, "seed {seed}");
+            }
+            route.submit_early(&mut exact);
+            let done = route.finish(&mut exact);
+            for s in done.settled {
+                islands[s.island][s.slot].tree = s.tree;
+            }
+
+            let reference = reference_sync(
+                &mut grid,
+                &admitted,
+                &mut dispatcher(kind),
+                arm,
+                single_class,
+                &|plans: &[&GpuFitPlan]| call(plans, &keys),
+                &sample,
+                &settings,
+            );
+            assert_eq!(done.counts, reference, "seed {seed}: counters");
+        });
         for &(i, j) in &admitted {
             assert_same_tree(&islands[i][j].tree, &grid[i][j], &format!("seed {seed}: slot ({i}, {j})"));
         }
@@ -1332,7 +1372,7 @@ mod tests {
             (Metric::Squared, DeviceArm::Lm(DeviceLoss::Slope)),
             (Metric::Absolute, DeviceArm::Lm(DeviceLoss::Absolute)),
         ]);
-        let sample = rows(metric);
+        let sample = rows(metric, 48);
         let islands_n = 1 + rng.usize_below(3);
         let slots_n = 2 + rng.usize_below(6);
         let mut all: Vec<(usize, usize, Node)> = Vec::new();
@@ -1353,62 +1393,116 @@ mod tests {
         let scripts: HashMap<(usize, usize), Script> = all.iter().map(|(i, j, _)| ((*i, *j), script(&mut rng))).collect();
         let failed: Vec<bool> = flushes.iter().map(|_| rng.bool(0.05)).collect();
         let overlap = rng.bool(0.5);
-        let settings = settings(metric, cap_for(&mut rng, all.len()));
+        let thresholds = rng.bool(0.25);
+        let settings = settings(metric, cap_for(&mut rng, all.len()), thresholds);
         let call = |n: usize, plans: &[&GpuFitPlan], keys: &[(usize, usize)]| {
             let s: Vec<Script> = keys.iter().map(|k| scripts[k]).collect();
             recorded(plans, &s, arm, failed[n])
         };
 
-        let mut route = FitRoute::new(settings, overlap);
-        let mut exact = ScopedFits::new(&sample, &settings, 2);
-        let mut got: BTreeMap<(usize, usize), (Node, u64)> = BTreeMap::new();
-        let mut keys_by_flush: Vec<Vec<(usize, usize)>> = Vec::new();
-        for (n, flush) in flushes.iter().enumerate() {
-            let mut jobs = flush.clone();
-            let offered: Vec<u64> = jobs.iter().map(|(_, _, t)| crate::expr::structural_hash(t)).collect();
-            let mut plans: Vec<(usize, GpuFitPlan)> = Vec::new();
-            for (k, (i, j, tree)) in jobs.iter().enumerate() {
-                match crate::fit::gpu_fit_plan_reason(tree) {
-                    Ok(plan) => plans.push((k, plan)),
-                    Err(reason) => route.reject(*i, *j, PLAN, plan_fallback_cause(reason), tree, offered[k]),
+        crate::fit::with_fit_thresholds(thresholds, || {
+            let mut route = FitRoute::new(settings, overlap);
+            let mut exact = ScopedFits::new(&sample, &settings, 2);
+            let mut got: BTreeMap<(usize, usize), (Node, u64)> = BTreeMap::new();
+            let mut keys_by_flush: Vec<Vec<(usize, usize)>> = Vec::new();
+            for (n, flush) in flushes.iter().enumerate() {
+                let mut jobs = flush.clone();
+                let offered: Vec<u64> = jobs.iter().map(|(_, _, t)| crate::expr::structural_hash(t)).collect();
+                let mut plans: Vec<(usize, GpuFitPlan)> = Vec::new();
+                for (k, (i, j, tree)) in jobs.iter().enumerate() {
+                    match crate::fit::gpu_fit_plan_reason(tree) {
+                        Ok(plan) => plans.push((k, plan)),
+                        Err(reason) => route.reject(*i, *j, PLAN, plan_fallback_cause(reason), tree, offered[k]),
+                    }
                 }
-            }
-            let keys: Vec<(usize, usize)> = plans.iter().map(|(k, _)| (jobs[*k].0, jobs[*k].1)).collect();
-            keys_by_flush.push(keys.clone());
-            if !plans.is_empty() {
-                let refs: Vec<&GpuFitPlan> = plans.iter().map(|(_, p)| p).collect();
-                let mut device = ReplayDevice::new([call(n, &refs, &keys)]);
-                let mut slots = QueueSlots { jobs: &mut jobs, offered: &offered };
-                let step = route.fit_on_device(&mut device, arm, &plans, &mut slots, &sample, 1);
-                for k in step.fitted {
-                    got.insert((jobs[k].0, jobs[k].1), (jobs[k].2.clone(), offered[k]));
+                let keys: Vec<(usize, usize)> = plans.iter().map(|(k, _)| (jobs[*k].0, jobs[*k].1)).collect();
+                keys_by_flush.push(keys.clone());
+                if !plans.is_empty() {
+                    let refs: Vec<&GpuFitPlan> = plans.iter().map(|(_, p)| p).collect();
+                    let mut device = ReplayDevice::new([call(n, &refs, &keys)]);
+                    let mut slots = QueueSlots { jobs: &mut jobs, offered: &offered };
+                    let step = route.fit_on_device(&mut device, arm, &plans, &mut slots, &sample, 1);
+                    for k in step.fitted {
+                        got.insert((jobs[k].0, jobs[k].1), (jobs[k].2.clone(), offered[k]));
+                    }
                 }
+                route.submit_early(&mut exact);
             }
+            let counts = if route.is_empty() {
+                route.take_counts()
+            } else {
+                let done = route.finish(&mut exact);
+                for s in done.settled {
+                    got.insert((s.island, s.slot), (s.tree, s.tag));
+                }
+                done.counts
+            };
+
+            let (want, reference) = reference_pipeline(
+                &flushes,
+                &|n: usize, plans: &[&GpuFitPlan]| call(n, plans, &keys_by_flush[n]),
+                overlap,
+                thresholds,
+                &sample,
+                &settings,
+            );
+            assert_eq!(counts, reference, "seed {seed}: counters");
+            assert_eq!(got.len(), want.len(), "seed {seed}: settled slots");
+            for ((key, (a, ta)), (want_key, (b, tb))) in got.iter().zip(&want) {
+                assert_eq!(key, want_key, "seed {seed}: settled slots");
+                assert_same_tree(a, b, &format!("seed {seed}: slot {key:?}"));
+                assert_eq!(ta, tb, "seed {seed}: slot {key:?} tag");
+            }
+        });
+    }
+
+    /// #255/#453: with a cap inside the batch refusals, the stage refits the
+    /// row-floor refusal that `plan_fit_batch` returns first, not the
+    /// dispatcher's refusal of a slot that sorts before it.
+    #[test]
+    fn a_cap_inside_the_batch_refusals_keeps_their_order() {
+        let sample = rows(Metric::Squared, 40);
+        let cfg = Config::default();
+        let one = node(Op::Mul, vec![constant(0.25), input(0)]);
+        let three = node(
+            Op::Add,
+            vec![node(Op::Add, vec![node(Op::Mul, vec![constant(0.5), input(0)]), node(Op::Mul, vec![constant(0.5), input(1)])]), constant(0.5)],
+        );
+        for overlap in [false, true] {
+            let mut islands = vec![vec![Ind::pending(one.clone(), &cfg), Ind::pending(three.clone(), &cfg)]];
+            let start: Vec<Node> = islands[0].iter().map(|ind| ind.tree.clone()).collect();
+            let settings = settings(Metric::Squared, 1, false);
+            let mut route = FitRoute::new(settings, overlap);
+            let mut exact = ScopedFits::new(&sample, &settings, 1);
+            let planned: Vec<(usize, usize, GpuFitPlan)> = (0..2)
+                .map(|j| (0, j, crate::fit::gpu_fit_plan_reason(&islands[0][j].tree).expect("a plan")))
+                .collect();
+            let batch = route.plan_batch(&mut dispatcher(1), sample.len(), planned, &mut islands[..]);
+            assert!(batch.jobs.is_empty());
+            assert_eq!(batch.refused, vec![(0, 1, FitFallbackCause::TooFewRows), (0, 0, FitFallbackCause::DispatchCost)]);
             route.submit_early(&mut exact);
-        }
-        let counts = if route.is_empty() {
-            route.take_counts()
-        } else {
             let done = route.finish(&mut exact);
             for s in done.settled {
-                got.insert((s.island, s.slot), (s.tree, s.tag));
+                islands[s.island][s.slot].tree = s.tree;
             }
-            done.counts
-        };
-
-        let (want, reference) = reference_pipeline(
-            &flushes,
-            &|n: usize, plans: &[&GpuFitPlan]| call(n, plans, &keys_by_flush[n]),
-            overlap,
-            &sample,
-            &settings,
-        );
-        assert_eq!(counts, reference, "seed {seed}: counters");
-        assert_eq!(got.len(), want.len(), "seed {seed}: settled slots");
-        for ((key, (a, ta)), (want_key, (b, tb))) in got.iter().zip(&want) {
-            assert_eq!(key, want_key, "seed {seed}: settled slots");
-            assert_same_tree(a, b, &format!("seed {seed}: slot {key:?}"));
-            assert_eq!(ta, tb, "seed {seed}: slot {key:?} tag");
+            assert_eq!(done.counts.bounded, 1);
+            assert_same_tree(&islands[0][0].tree, &start[0], "the dispatch refusal past the cap is held");
+            assert!(!crate::expr::same(&islands[0][1].tree, &start[1]), "the row-floor refusal is refit");
+            let mut grid = vec![start.clone()];
+            let reference = reference_sync(
+                &mut grid,
+                &[(0, 0), (0, 1)],
+                &mut dispatcher(1),
+                Some(DeviceArm::Lm(DeviceLoss::Squared)),
+                false,
+                &|_: &[&GpuFitPlan]| unreachable!("a refused batch makes no device call"),
+                &sample,
+                &settings,
+            );
+            assert_eq!(done.counts, reference);
+            for j in 0..2 {
+                assert_same_tree(&islands[0][j].tree, &grid[0][j], &format!("overlap {overlap}: slot {j}"));
+            }
         }
     }
 
@@ -1544,8 +1638,8 @@ mod tests {
         std::fs::write(scratch.join("call-1.bin"), call.encode()).expect("write call 1");
         let recording = crate::fit_record::load_recording(&scratch).expect("load the recording");
         let mut device = ReplayDevice::from_recording(recording);
-        let sample = rows(Metric::Squared);
-        let settings = settings(Metric::Squared, 0);
+        let sample = rows(Metric::Squared, 40);
+        let settings = settings(Metric::Squared, 0, false);
         let run = device.fit(arm, &refs, &settings, &sample);
         let want = answers_of(&call, &refs).expect("a recorded launch");
         assert_eq!(run.answers.as_ref(), Some(&want));

@@ -1553,10 +1553,7 @@ impl GpuSearch {
         }
         // #453: the device runs the admitted candidates as one batch, so the
         // cost model plans the batch once, not each candidate alone.
-        let batch = plan_fit_batch(dispatcher, fit_train.len(), cfg.fit_iters, crate::fit::fit_loss(cfg.metric), planned);
-        for &(i, j, cause) in &batch.refused {
-            route.reject(i, j, fit_route::BATCH, cause, &islands[i][j].tree, 0);
-        }
+        let batch = route.plan_batch(dispatcher, fit_train.len(), planned, islands);
         self.fit_attempts += admitted.len();
         let stats = self.stats.entry(generation).or_default();
         stats.generation = generation;
@@ -5065,8 +5062,11 @@ struct FitBatch {
     decision: Option<crate::dispatch::Decision>,
     /// Workload bytes of the batch decision.
     bytes: u64,
-    /// Candidates refused, with the cause each reports.
+    /// Candidates refused, with the cause each reports: the row floor first,
+    /// then the dispatcher's refusal of the rest of the batch.
     refused: Vec<(usize, usize, FitFallbackCause)>,
+    /// #1091: `refused[..floor]` are the row-floor refusals.
+    floor: usize,
 }
 
 /// #453: plan the fit stage once for the whole batch.
@@ -5092,8 +5092,9 @@ fn plan_fit_batch(
             valid.push((i, j, plan));
         }
     }
+    let floor = refused.len();
     if valid.is_empty() {
-        return FitBatch { jobs: valid, decision: None, bytes: 0, refused };
+        return FitBatch { jobs: valid, decision: None, bytes: 0, refused, floor };
     }
     let widest = valid.iter().map(|(_, _, p)| p.nconst).max().unwrap_or(1);
     let workload = crate::dispatch::Workload::fit(valid.len(), rows, widest, sweeps)
@@ -5104,7 +5105,7 @@ fn plan_fit_batch(
     };
     let decision = dispatcher.plan(crate::dispatch::Stage::Fit, &workload);
     if decision.route == crate::dispatch::Route::Device {
-        return FitBatch { jobs: valid, decision: Some(decision), bytes: workload.bytes, refused };
+        return FitBatch { jobs: valid, decision: Some(decision), bytes: workload.bytes, refused, floor };
     }
     // A cost-model refusal is a policy route, not an arithmetic fallback:
     // label it `dispatch_cost`.
@@ -5116,7 +5117,7 @@ fn plan_fit_batch(
     };
     refused.extend(valid.iter().map(|(i, j, _)| (*i, *j, cause)));
     dispatcher.record(decision, 0.0, valid.len(), workload.bytes);
-    FitBatch { jobs: Vec::new(), decision: Some(decision), bytes: workload.bytes, refused }
+    FitBatch { jobs: Vec::new(), decision: Some(decision), bytes: workload.bytes, refused, floor }
 }
 
 /// #169: map a structural fit-plan rejection to its reported cause.
