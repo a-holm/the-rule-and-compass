@@ -761,7 +761,9 @@ SEARCH:
                              The refits run on the CPU fallback pool beside
                              the device work (same trees as after it);
                              RCSR_FIT_TAIL_SERIAL=1 runs them after the
-                             device batch
+                             device batch; RCSR_FIT_RELEASE_WAVES=K runs the
+                             device fit as K ordered calls, so they start
+                             under the later calls (same trees)
   --fit-polish <f64|f32|off>  arithmetic of the device fit kernel's polish, the
                              undamped Gauss-Newton steps after the damped LM
                              (default f64). f64 re-baselines and steps on the
@@ -1664,7 +1666,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"carried_kept\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"tail_overlap_s\":{},\"tail_join_wait_s\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{},\"calls\":{},\"candidates\":{},\"call_s_max\":{},\"fold_count\":{},\"folded\":{},\"fallback_skipped_by_cause\":{{{}}}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"carried_kept\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"tail_overlap_s\":{},\"tail_join_wait_s\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{},\"calls\":{},\"candidates\":{},\"call_s_max\":{},\"release_waves\":{},\"tail_early_fits\":{},\"fold_count\":{},\"folded\":{},\"fallback_skipped_by_cause\":{{{}}}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1703,6 +1705,8 @@ fn gpu_json(
         g.fit_calls,
         g.fit_call_candidates,
         jnum(g.fit_call_ms_max / 1000.0),
+        g.fit_release_waves,
+        g.fit_tail_early,
         g.fit_fold_count,
         g.fit_folded,
         ops_json(&g.fit_fallback_skipped_by_cause)
@@ -6937,7 +6941,7 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(" ");
             eprintln!(
-                "# fit: gpu-fit screened={} admitted_wide={} admitted={} gpu={} fallback={} [{}] labels=[{}] refit_candidates={} refits={} refit_s={:.3} rescore_s={:.3} fallback_s={:.3} tail_overlap_s={:.3} tail_join_wait_s={:.3} bounded={}/{} workers={}",
+                "# fit: gpu-fit screened={} admitted_wide={} admitted={} gpu={} fallback={} [{}] labels=[{}] refit_candidates={} refits={} refit_s={:.3} rescore_s={:.3} fallback_s={:.3} tail_overlap_s={:.3} tail_join_wait_s={:.3} bounded={}/{} workers={} release_waves={} early={}",
                 g.fit_screened,
                 g.fit_admitted_wide,
                 g.fit_attempts,
@@ -6954,7 +6958,9 @@ fn main() {
                 g.ledger.fit_tail_join_wait_s(),
                 g.fit_fallback_bounded,
                 g.fit_fallback_max,
-                g.fit_fallback_workers
+                g.fit_fallback_workers,
+                g.fit_release_waves,
+                g.fit_tail_early
             );
         }
     }
