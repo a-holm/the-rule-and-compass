@@ -1020,6 +1020,9 @@ pub fn procedure_spec(spec: &crate::walkforward::EvalSpec, o: &crate::walkforwar
         spec.periods_per_year,
         spec.band_select
     ));
+    if spec.policy == crate::walkforward::Policy::Vote {
+        s.push_str(&format!("quorum={:?}\n", o.quorum));
+    }
     if o.band_units != crate::trading::BandUnits::Score {
         s.push_str(&format!("band_units={}\n", o.band_units.name()));
     }
