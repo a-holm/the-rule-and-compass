@@ -1005,7 +1005,7 @@ fn cli_resume_of_a_ring_tournament_checkpoint_exits_2_naming_migration_policy() 
     assert_eq!(refused.status.code(), Some(2), "an unknown policy is a usage error: {:?}", refused);
 
     let mut made_args = base.to_vec();
-    made_args.extend(["--generations", "5", "--migration-interval", "2", "--migration-policy", "ring-tournament", "--save", checkpoint.as_str()]);
+    made_args.extend(["--generations", "30", "--migration-policy", "ring-tournament", "--save", checkpoint.as_str()]);
     let made = rcsr(&made_args);
     assert!(made.status.success(), "save run failed: {:?}", made);
     let saved = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
@@ -1019,7 +1019,7 @@ fn cli_resume_of_a_ring_tournament_checkpoint_exits_2_naming_migration_policy() 
     assert!(err.contains("migration_policy"), "the error must name migration_policy: {}", err);
 
     let mut resume_args = base.to_vec();
-    resume_args.extend(["--resume", checkpoint.as_str(), "--generations", "8"]);
+    resume_args.extend(["--resume", checkpoint.as_str(), "--generations", "35"]);
     let resumed = rcsr(&resume_args);
     assert!(resumed.status.success(), "a resume that omits the flag keeps the saved policy: {:?}", resumed);
 }
