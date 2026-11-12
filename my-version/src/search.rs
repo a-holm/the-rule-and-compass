@@ -1834,6 +1834,7 @@ impl GpuSearch {
                 .map(|&(island, slot, cause)| {
                     FallbackFitJob::new(island, slot, islands[island][slot].tree.clone())
                         .with_cause(cause)
+                        .with_thresholds(cfg.fit_thresholds)
                         .with_device(device_alts.remove(&(island, slot)))
                 })
                 .collect();
@@ -1938,7 +1939,7 @@ impl GpuSearch {
         }
         let jobs: Vec<FallbackFitJob> = fallbacks[from..refit]
             .iter()
-            .map(|&(i, j, cause)| FallbackFitJob::new(i, j, islands[i][j].tree.clone()).with_cause(cause).with_device(device_alts.remove(&(i, j))))
+            .map(|&(i, j, cause)| FallbackFitJob::new(i, j, islands[i][j].tree.clone()).with_cause(cause).with_device(device_alts.remove(&(i, j))).with_thresholds(cfg.fit_thresholds))
             .collect();
         self.tail_submit(tail, jobs, rows, cfg.fit_iters, cfg.metric);
         refit
@@ -2737,9 +2738,10 @@ fn refit_lowers_error(
     w: &[f64],
     iters: usize,
     metric: Metric,
+    thresholds: bool,
 ) -> bool {
     let before = exact_error(tree, x, y, w, metric);
-    crate::fit::fit_weighted_metric(tree, x, y, w, iters, metric);
+    crate::fit::fit_weighted_metric_thresholds(tree, x, y, w, iters, metric, thresholds);
     let after = exact_error(tree, x, y, w, metric);
     after.is_finite() && (before.is_nan() || after < before)
 }
@@ -2791,7 +2793,7 @@ fn run_fallback_fit(
         job.skipped = true;
         return;
     }
-    job.improved = refit_lowers_error(&mut job.tree, x, y, w, iters, metric);
+    job.improved = refit_lowers_error(&mut job.tree, x, y, w, iters, metric, job.thresholds);
     if let Some(device) = job.device.take() {
         let cpu = exact_error(&job.tree, x, y, w, metric);
         let dev = exact_error(&device, x, y, w, metric);
@@ -2868,6 +2870,9 @@ struct FallbackFitJob {
     /// #968: the tree at its device constants, for a routed tail status. The
     /// job keeps the lower error of this and the exact CPU fit.
     device: Option<Node>,
+    /// #1024: run the threshold step after the LM; carried by the job so a pool
+    /// thread needs no scope.
+    thresholds: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -2881,6 +2886,7 @@ impl FallbackFitJob {
             cause: None,
             skipped: false,
             device: None,
+            thresholds: false,
         }
     }
 
@@ -2891,6 +2897,11 @@ impl FallbackFitJob {
 
     fn with_device(mut self, device: Option<Node>) -> Self {
         self.device = device;
+        self
+    }
+
+    fn with_thresholds(mut self, on: bool) -> Self {
+        self.thresholds = on;
         self
     }
 }
@@ -3578,13 +3589,14 @@ fn score_generation(
                 for pop in islands.iter_mut() {
                     for ind in pop.iter_mut() {
                         if ind.error.is_nan() {
-                            crate::fit::fit_weighted_metric(
+                            crate::fit::fit_weighted_metric_thresholds(
                                 &mut ind.tree,
                                 &train.x,
                                 &train.y,
                                 &train.w,
                                 cfg.fit_iters,
                                 cfg.metric,
+                                cfg.fit_thresholds,
                             );
                         }
                     }
@@ -3831,7 +3843,7 @@ fn fit_pipeline_queue(
             .enumerate()
             .map(|(k, f)| {
                 f.early = Some(base + k);
-                FallbackFitJob::new(f.island, f.slot, f.tree.clone()).with_cause(f.cause).with_device(f.device.clone())
+                FallbackFitJob::new(f.island, f.slot, f.tree.clone()).with_cause(f.cause).with_device(f.device.clone()).with_thresholds(fit.thresholds)
             })
             .collect();
         g.tail_submit(&mut tail.pending, jobs, tail.rows, fit.iters, fit.metric);
@@ -3998,7 +4010,7 @@ fn finish_pipeline_fallbacks(
             .iter()
             .map(|&n| {
                 let f = &mut fallbacks[n];
-                FallbackFitJob::new(f.island, f.slot, f.tree.clone()).with_cause(f.cause).with_device(f.device.take())
+                FallbackFitJob::new(f.island, f.slot, f.tree.clone()).with_cause(f.cause).with_device(f.device.take()).with_thresholds(fit.thresholds)
             })
             .collect();
         workers_used = workers_used.max(fit_fallback_jobs(
@@ -5995,12 +6007,7 @@ fn refit_exact(trees: &mut [Node], train: &EvalSample, cfg: &Config) {
     let fit_one = |t: &mut Node| {
         let (x, y, w) = (&train.sample.x, &train.sample.y, &train.sample.w);
         let (iters, metric) = (cfg.fit_iters, cfg.metric);
-        let fitted = crate::fit::fit_weighted_metric(t, x, y, w, iters, metric);
-        if cfg.fit_thresholds {
-            crate::fit::fit_thresholds(t, x, y, w, iters, metric, fitted, |t| {
-                crate::fit::fit_weighted_metric(t, x, y, w, iters, metric)
-            });
-        }
+        crate::fit::fit_weighted_metric_thresholds(t, x, y, w, iters, metric, cfg.fit_thresholds);
         *t = expr::simplify(t);
         crate::fit::note_gpu_refit();
     };
@@ -6569,6 +6576,7 @@ struct PipelineFit {
     iters: usize,
     metric: Metric,
     polish: crate::fit::FitPolish,
+    thresholds: bool,
 }
 
 /// #286: overlap-with-fit is legal only where the serial admission set is
@@ -9565,6 +9573,7 @@ fn run_search_scoped(
                 iters: cfg.fit_iters,
                 metric: cfg.metric,
                 polish: cfg.fit_polish,
+                thresholds: cfg.fit_thresholds,
             });
             #[cfg(feature = "cuda")]
             let pipeline_active = !screened
@@ -11278,9 +11287,9 @@ mod tests {
         let s = sample();
         let line = |a: f64| node(Op::Mul, vec![constant(a), input(0)]);
         let mut bad = line(0.25);
-        assert!(refit_lowers_error(&mut bad, &s.x, &s.y, &s.w, 8, Metric::Squared));
+        assert!(refit_lowers_error(&mut bad, &s.x, &s.y, &s.w, 8, Metric::Squared, false));
         let mut exact = line(1.0);
-        assert!(!refit_lowers_error(&mut exact, &s.x, &s.y, &s.w, 8, Metric::Squared));
+        assert!(!refit_lowers_error(&mut exact, &s.x, &s.y, &s.w, 8, Metric::Squared, false));
     }
 
     /// #988: the start objective is finite exactly when the scorer would give a
@@ -11303,6 +11312,53 @@ mod tests {
         w[0] = 1.0;
         assert!(!exact_start_finite(&positive, &s.x, &s.y, &w, Metric::Squared));
         assert!(!exact_start_finite(&positive, &s.x, &s.y, &[], Metric::Squared));
+    }
+
+    fn threshold_fixture() -> (Vec<Vec<f64>>, Vec<f64>, Node) {
+        let x: Vec<Vec<f64>> = (0..200).map(|i| vec![(i as f64 + 0.37) / 200.0]).collect();
+        let y: Vec<f64> = x.iter().map(|r| if r[0] > 0.3137 { 1.0 } else { 0.0 }).collect();
+        let tree = node(
+            Op::If,
+            vec![node(Op::Sub, vec![input(0), constant(0.5)]), constant(1.0), constant(0.0)],
+        );
+        (x, y, tree)
+    }
+
+    fn threshold_value(t: &Node) -> f64 {
+        t.kids[0].kids[1].val
+    }
+
+    /// #1024: the fallback refit runs the threshold step when it is asked to, with no
+    /// thread-local scope.
+    #[test]
+    fn fallback_refit_fits_thresholds_when_asked() {
+        let (x, y, tree) = threshold_fixture();
+        let (mut off, mut on) = (tree.clone(), tree);
+        refit_lowers_error(&mut off, &x, &y, &[], 8, Metric::Squared, false);
+        assert_eq!(threshold_value(&off), 0.5);
+        assert!(refit_lowers_error(&mut on, &x, &y, &[], 8, Metric::Squared, true));
+        let c = threshold_value(&on);
+        assert!(c > 0.3137 - 0.005 && c < 0.3137 + 0.005, "threshold {c}");
+        assert!(exact_error(&on, &x, &y, &[], Metric::Squared) < 1e-18);
+    }
+
+    /// #1024: every job of a multi-worker fallback pool fits its threshold; a job
+    /// without the flag keeps it. Runs on the host only.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn fallback_pool_fits_thresholds_on_every_worker() {
+        let (x, y, tree) = threshold_fixture();
+        let mut jobs: Vec<FallbackFitJob> = (0..5)
+            .map(|k| FallbackFitJob::new(0, k, tree.clone()).with_thresholds(k != 4))
+            .collect();
+        let used = fit_fallback_jobs(&mut jobs, &x, &y, &[], 8, Metric::Squared, 3);
+        assert!(used > 1, "the batch used {used} workers");
+        for job in &jobs[..4] {
+            let c = threshold_value(&job.tree);
+            assert!(c > 0.3137 - 0.005 && c < 0.3137 + 0.005, "threshold {c}");
+            assert!(job.improved);
+        }
+        assert_eq!(threshold_value(&jobs[4].tree), 0.5);
     }
 
     /// #988: only a `NonFiniteStart` job with a non-finite start skips its refit,
@@ -11345,7 +11401,7 @@ mod tests {
         ];
         for (cause, start) in runs {
             let mut t = node(Op::Mul, vec![constant(start), input(0)]);
-            if refit_lowers_error(&mut t, &s.x, &s.y, &s.w, 8, Metric::Squared) {
+            if refit_lowers_error(&mut t, &s.x, &s.y, &s.w, 8, Metric::Squared, false) {
                 count_improved(&mut map, cause);
             }
         }
