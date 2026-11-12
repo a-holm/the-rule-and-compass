@@ -921,6 +921,66 @@ fn cli_resume_of_an_island_checkpoint_exits_2_naming_restart_policy() {
     assert!(resumed.status.success(), "a resume that omits the flags keeps the saved policy: {:?}", resumed);
 }
 
+/// #1090: an `rcsr` run with the `island_panic` test fault (every island thread
+/// panics at the start of its generation). The fault hook exists in a `cuda`
+/// build only; the run itself stays on the CPU.
+#[cfg(feature = "cuda")]
+fn panicking_rcsr(args: &[&str]) -> Output {
+    rcsr_cmd::rcsr()
+        .args(args)
+        .env("RCSR_FAULT", "island_panic")
+        .output()
+        .expect("run rcsr")
+}
+
+/// #1090: a panic in an island thread fails the run with the search-error exit
+/// code, names every island that panicked, and writes no checkpoint for that
+/// generation: the last good checkpoint stays on disk.
+#[cfg(feature = "cuda")]
+#[test]
+fn an_island_panic_exits_non_zero_and_keeps_the_last_good_checkpoint() {
+    let csv = TempPath::new("panic.csv");
+    // No short formula fits these rows, so the run cannot stop early as solved.
+    let rows: String = (0..60)
+        .map(|i| {
+            let x = -2.0 + 4.0 * i as f64 / 59.0;
+            format!("{x:.6},{:.6}\n", (3.0 * x).sin() + 0.1 * ((i * 7919) % 13) as f64)
+        })
+        .collect();
+    std::fs::write(&csv.0, format!("x,y\n{rows}")).expect("write csv");
+    for (islands, named) in [("1", vec![0usize]), ("3", vec![0, 1, 2])] {
+        let checkpoint = TempPath::new(&format!("panic-{islands}.rcsr"));
+        let base = [
+            "--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "2", "--pop", "20", "--islands", islands,
+            "--cpu", "--save", checkpoint.as_str(), "--save-every", "1",
+        ];
+        let mut first = base.to_vec();
+        first.extend(["--generations", "3"]);
+        let made = rcsr(&first);
+        assert!(made.status.success(), "save run failed: {:?}", made);
+        let good = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
+        assert_eq!(Checkpoint::from_text(&good).expect("parse").generations, 3);
+
+        let mut resumed = base.to_vec();
+        resumed.extend(["--generations", "6", "--resume", checkpoint.as_str()]);
+        let failed = panicking_rcsr(&resumed);
+        let err = String::from_utf8_lossy(&failed.stderr);
+        assert_eq!(failed.status.code(), Some(3), "a search error exits 3: {err}");
+        for i in &named {
+            assert!(
+                err.contains(&format!("island {i} panicked in generation 3: injected island panic")),
+                "islands {islands}: the error names island {i}: {err}"
+            );
+        }
+        assert!(!err.contains(&format!("island {islands} panicked")), "only real islands are named: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&checkpoint.0).expect("read checkpoint"),
+            good,
+            "islands {islands}: the failing generation wrote no checkpoint"
+        );
+    }
+}
+
 #[test]
 fn cli_resume_errors_use_the_documented_exit_codes() {
     let csv = TempPath::new("cli.csv");

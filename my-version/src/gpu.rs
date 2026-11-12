@@ -540,7 +540,8 @@ pub const LONG_PNL_TILED: &str = "long_pnl fitness needs resident training rows 
 pub const INJECTED_REFUSAL: &str = "injected fault: the device refused ";
 
 /// #604: test hook. `RCSR_FAULT` is a comma list of sites (`pnl_book`, `batch`,
-/// `pipeline`) at which a device call fails before it reaches the driver.
+/// `pipeline`) at which a device call fails before it reaches the driver, and
+/// `island_panic` (#1090), at which every island thread of the node path panics.
 /// `site@N` fires only in the N-th search of the process (1-based). Unset in
 /// normal use. The variable is read once per process.
 pub fn injected_fault(site: &str) -> bool {

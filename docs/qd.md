@@ -85,6 +85,10 @@ cells so the partition has no behavioural information. A gain that survives
 only the proposed policy, not the controls, is search capacity rather than
 niche diversity.
 
+Under `--restart-policy island` an island inside its isolation window takes
+none of these draws: no cell parent and no global-front parent. It breeds from
+its own members by the island tournament until the window closes (#1067).
+
 Migration keeps the ring but replaces the individual nearest the
 **least-visited cell's centroid** instead of the globally worst error.
 Restarting a stagnant island aims at the least-visited region: it samples four
