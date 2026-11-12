@@ -71,6 +71,25 @@ fn non_default_config_text_and_hash_are_pinned() {
     );
 }
 
+/// The base build wrote, compared and checked `restart_isolation` only under
+/// `--restart-policy island`.
+#[test]
+fn restart_isolation_is_read_only_under_the_island_policy() {
+    let cfg = Config { restart_isolation: 7, ..Config::default() };
+    golden(
+        "default_config",
+        include_str!("fixtures/settings/default_config.txt"),
+        &config_text(&cfg),
+    );
+    assert!(Config::default().search_setting_differences(&cfg).is_empty());
+    assert!(cfg.search_setting_differences(&Config::default()).is_empty());
+    let mut named = settings::Explicit::default();
+    named.mark(settings::find("--restart-isolation").expect("row"));
+    let mut lines = Vec::new();
+    settings::conflicts(Group::Island, &cfg, &Config::default(), &named, &mut lines);
+    assert!(lines.is_empty(), "{lines:?}");
+}
+
 /// The `"knobs":{...}` object of the bench config JSON.
 fn knobs_json(cfg: &SuiteConfig) -> String {
     let json = bench::config_json(cfg);
