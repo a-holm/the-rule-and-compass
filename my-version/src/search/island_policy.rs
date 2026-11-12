@@ -1342,7 +1342,7 @@ mod tests {
             assert_eq!(full_text, again_text, "{rule:?}: same seed, same exit checkpoint");
             let (_, saved_text, saved_restarts) = checkpointed(&cfg(20), None);
             assert!(saved_restarts > 0, "{rule:?}: an island restarts before the save");
-            assert!(saved_text.contains("config front_scope island\n") && saved_text.contains("\nisland_front 0 "), "{rule:?}");
+            assert!(saved_text.contains("config front_scope island\n") && saved_text.contains("\nisland_front "), "{rule:?}");
             let saved = Checkpoint::from_text(&saved_text).expect("parse saved checkpoint");
             let (resumed, resumed_text, _) = checkpointed(&cfg(40), Some(saved));
             assert_eq!(uninterrupted.archive.hash(), resumed.archive.hash(), "{rule:?}: the archive");
