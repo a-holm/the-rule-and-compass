@@ -164,6 +164,38 @@ impl FrontScope {
     }
 }
 
+/// #1029: which member an island sends at a migration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MigrationPolicy {
+    /// The best member of the source island.
+    #[default]
+    Ring,
+    /// The winner of a tournament of [`MIGRANT_TOURNAMENT`] draws over the
+    /// source island, skipped when the destination already holds its error.
+    RingTournament,
+}
+
+/// #1029: draws of the migrant tournament under `--migration-policy
+/// ring-tournament`.
+pub const MIGRANT_TOURNAMENT: usize = 8;
+
+impl MigrationPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MigrationPolicy::Ring => "ring",
+            MigrationPolicy::RingTournament => "ring-tournament",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "ring" => Ok(MigrationPolicy::Ring),
+            "ring-tournament" => Ok(MigrationPolicy::RingTournament),
+            other => Err(format!("migration policy must be 'ring' or 'ring-tournament', got '{}'", other)),
+        }
+    }
+}
+
 /// #1078: when a candidate keeps its fitted constants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FitAccept {
@@ -482,6 +514,9 @@ pub struct Config {
     pub explore_islands: usize,
     /// #1070: where front parents come from. Saved search setting.
     pub front_scope: FrontScope,
+    /// #1029: which member an island sends at a migration. Saved search
+    /// setting.
+    pub migration_policy: MigrationPolicy,
     /// #471: the node-path edit weights. Changes the trajectory, so it is a
     /// saved search setting.
     pub mutation_mix: MutationMix,
@@ -845,6 +880,7 @@ impl Default for Config {
             restart_isolation: 25,
             explore_islands: 0,
             front_scope: FrontScope::Global,
+            migration_policy: MigrationPolicy::Ring,
             mutation_mix: MutationMix::Classic,
             crossover_internal: 0.0,
             adaptive_mix: false,
@@ -7003,6 +7039,8 @@ fn flush_dev_generation(cfg: &Config, rec: Option<crate::devlog::GenRecord>, res
         rec.restarts = restarts;
         rec.restarts_total = policy.restarts_total();
         rec.isolated = policy.isolated_count();
+        rec.migrants = policy.migrants().sent;
+        rec.migrants_skipped = policy.migrants().skipped;
         report(&rec);
     }
 }
@@ -7621,6 +7659,8 @@ fn dev_generation(
         restarts: 0,
         restarts_total: 0,
         isolated: 0,
+        migrants: 0,
+        migrants_skipped: 0,
     }
 }
 

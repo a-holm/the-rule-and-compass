@@ -59,6 +59,14 @@
                              the front of both) and a restart empties it.
                              The reported archive stays global. Not with
                              --qd-policy. Saved search setting (#1070)
+  --migration-policy ring|ring-tournament
+                             which member an island sends at a migration.
+                             ring (default) sends the best member of the next
+                             island. ring-tournament sends the winner of a
+                             tournament of 8 draws over it, drawn with the
+                             destination's generator, and skips a destination
+                             that holds a member with the same error. Saved
+                             search setting (#1029)
   --mutation-mix <M>         node-path edit weights: classic (point .25, terminal
                              .35, subtree .40; default) or extended (adds insert,
                              delete, swap and rotate). Not with --variation

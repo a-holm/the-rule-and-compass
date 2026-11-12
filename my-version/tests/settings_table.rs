@@ -36,6 +36,7 @@ fn sample(row: &dyn Setting) -> Option<&'static str> {
         "--restart-isolation" => "7",
         "--explore-islands" => "1",
         "--front-scope" => "island",
+        "--migration-policy" => "ring-tournament",
         "--mutation-mix" => "extended",
         "--crossover-internal" => "0.25",
         "--variation" => "node",

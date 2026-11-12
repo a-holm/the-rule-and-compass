@@ -4,7 +4,9 @@
 //! `run_search` and the flat postfix `Arena` of `run_postfix_search` are
 //! population adapters: they apply a decision and decide nothing.
 //!
-//! No decision draws from an RNG. A restart draws its trees from the
+//! No decision draws from an RNG. #1029: the tournament migrant of
+//! `--migration-policy ring-tournament` is resolved by the population adapter
+//! with the destination island's generator. A restart draws its trees from the
 //! population adapter's own generator, so the node path keeps its `Mt` stream
 //! per island and the flat path its positional `Philox` draws.
 //!
@@ -22,7 +24,8 @@
 
 use super::{
     afp_worst, canonical_front, defers_fit_to_gpu, draw_row_dependent, fit_constants, gate_fit, population_best,
-    pre_fit_tree, Config, EvalSample, FrontScope, Ind, RestartPolicy, Selection, FRONT_PARENT_P,
+    pre_fit_tree, tournament, Config, EvalSample, FrontScope, Ind, MigrationPolicy, RestartPolicy, Selection,
+    FRONT_PARENT_P, MIGRANT_TOURNAMENT,
 };
 use crate::checkpoint::IslandStall;
 use crate::data::Sample;
@@ -52,6 +55,14 @@ pub(crate) struct Move {
     pub to: usize,
 }
 
+/// #1029: what one migration step did: migrants copied, and migrants skipped
+/// because the destination already held the migrant's error.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Migrants {
+    pub sent: usize,
+    pub skipped: usize,
+}
+
 /// Read side of a population adapter.
 pub(crate) trait IslandBests {
     fn island_count(&self) -> usize;
@@ -70,10 +81,12 @@ pub(crate) trait IslandMembers: IslandBests {
 
 /// Write side of a population adapter.
 pub(crate) trait IslandPopulation: IslandBests {
-    /// Copy the best member of each move's source island over one member of
-    /// its destination. Every source best and every victim is chosen before
-    /// the first copy.
-    fn migrate(&mut self, moves: &[Move]);
+    /// Copy the migrant of each move's source island over one member of its
+    /// destination: the best member under `ring`, a tournament winner drawn by
+    /// the adapter with the destination's own generator under
+    /// `ring-tournament` (#1029). Every migrant and every victim is chosen
+    /// before the first copy.
+    fn migrate(&mut self, moves: &[Move], policy: MigrationPolicy) -> Migrants;
     /// Replace every member of `island` with fresh random material.
     fn restart(&mut self, island: usize);
 }
@@ -236,6 +249,7 @@ fn explore_restarts(k: usize, units: u64) -> Vec<usize> {
 #[derive(Clone, Debug)]
 pub(crate) struct IslandPolicy {
     migration_interval: usize,
+    migration_policy: MigrationPolicy,
     restart_interval: usize,
     isolation: usize,
     front_p: f64,
@@ -250,6 +264,8 @@ pub(crate) struct IslandPolicy {
     /// #1070: one front per island under `--front-scope island`. Saved in the
     /// checkpoint as `island_front` records.
     fronts: Option<Vec<Archive>>,
+    /// #1029: the migration step of the current generation.
+    migrants: Migrants,
 }
 
 /// #1070: the cap of an island front, the cap of the global archive of
@@ -289,6 +305,7 @@ impl IslandPolicy {
     fn with_state(cfg: &Config, stagnant: Vec<usize>, state: Option<RestartState>) -> Self {
         IslandPolicy {
             migration_interval: cfg.migration_interval,
+            migration_policy: cfg.migration_policy,
             restart_interval: cfg.restart_interval,
             isolation: cfg.restart_isolation,
             front_p: if cfg.front_parents { FRONT_PARENT_P } else { 0.0 },
@@ -298,6 +315,7 @@ impl IslandPolicy {
             explore_from: cfg.islands.max(1).saturating_sub(cfg.explore_islands),
             fronts: (cfg.front_scope == FrontScope::Island)
                 .then(|| vec![Archive::new(ISLAND_FRONT_CAP); cfg.islands.max(1)]),
+            migrants: Migrants::default(),
         }
     }
 
@@ -369,6 +387,7 @@ impl IslandPolicy {
 
     /// One generation's stall update, after the archive update.
     pub(crate) fn observe(&mut self, population: &(impl IslandBests + ?Sized)) {
+        self.migrants = Migrants::default();
         if let RestartRule::IslandStall(s) = &mut self.rule {
             let bests: Vec<f64> = (0..population.island_count()).map(|i| population.best_error(i)).collect();
             s.tick(&bests);
@@ -384,7 +403,7 @@ impl IslandPolicy {
         if islands > 1 && due(self.migration_interval, gen) {
             let moves = self.ring(islands);
             self.exchange_fronts(&moves);
-            population.migrate(&moves);
+            self.migrants = population.migrate(&moves, self.migration_policy);
         }
         if !due(self.restart_interval, gen) {
             return Vec::new();
@@ -399,6 +418,12 @@ impl IslandPolicy {
             }
         }
         restarts
+    }
+
+    /// #1029: the migrants the last barrier copied and skipped; zero from the
+    /// next observation on.
+    pub(crate) fn migrants(&self) -> Migrants {
+        self.migrants
     }
 
     /// The directed ring of the exploit tier: every exploit island that is not
@@ -587,26 +612,66 @@ impl TreeIslands<'_> {
     }
 }
 
+/// #1029: whether `island` already holds the migrant's book. Equal finite error
+/// bits stand for the same book; #1082's `Ind.book` replaces the comparison
+/// here.
+fn holds_book(island: &[Ind], migrant: &Ind) -> bool {
+    migrant.error.is_finite() && island.iter().any(|m| m.error.to_bits() == migrant.error.to_bits())
+}
+
 impl IslandPopulation for TreeIslands<'_> {
-    fn migrate(&mut self, moves: &[Move]) {
+    fn migrate(&mut self, moves: &[Move], policy: MigrationPolicy) -> Migrants {
         fn best(pop: &[Ind]) -> Option<&Ind> {
             pop.iter().min_by(|a, b| crate::error_order::cmp_error(a.error, b.error))
         }
-        let bests: Vec<Option<Node>> = self.islands.iter().map(|pop| best(pop).map(|i| i.tree.clone())).collect();
-        let best_ages: Vec<u32> = self.islands.iter().map(|pop| best(pop).map_or(0, |i| i.age)).collect();
-        for &Move { from, to } in moves {
-            let Some(t) = &bests[from] else { continue };
+        // Every migrant is chosen before the first copy. `None` sends nothing;
+        // `skip` marks a migrant the destination already holds.
+        struct Pick {
+            tree: Node,
+            age: u32,
+            skip: bool,
+        }
+        let picks: Vec<Option<Pick>> = moves
+            .iter()
+            .map(|&Move { from, to }| match policy {
+                MigrationPolicy::Ring => {
+                    best(&self.islands[from]).map(|i| Pick { tree: i.tree.clone(), age: i.age, skip: false })
+                }
+                MigrationPolicy::RingTournament => {
+                    // The destination's generator draws, so the source island's
+                    // own stream does not depend on who migrates from it.
+                    if !self.islands[from].iter().any(|i| i.error.is_finite()) {
+                        return None;
+                    }
+                    let winner = &self.islands[from][tournament(&self.islands[from], &mut self.rngs[to], MIGRANT_TOURNAMENT)];
+                    Some(Pick {
+                        tree: winner.tree.clone(),
+                        age: winner.age,
+                        skip: holds_book(&self.islands[to], winner),
+                    })
+                }
+            })
+            .collect();
+        let mut count = Migrants::default();
+        for (&Move { to, .. }, pick) in moves.iter().zip(&picks) {
+            let Some(pick) = pick else { continue };
+            if pick.skip {
+                count.skipped += 1;
+                continue;
+            }
             let slot = self.victim(to);
             if let Some(worst) = slot.and_then(|i| self.islands[to].get_mut(i)) {
                 // #26: batch the migrant with the next GPU call.
                 *worst = if self.defer_gpu {
-                    Ind::pending(t.clone(), self.cfg)
+                    Ind::pending(pick.tree.clone(), self.cfg)
                 } else {
-                    Ind::evaluated(t.clone(), self.gen_data, self.cfg) // #25
+                    Ind::evaluated(pick.tree.clone(), self.gen_data, self.cfg) // #25
                 };
-                worst.age = best_ages[from];
+                worst.age = pick.age;
+                count.sent += 1;
             }
         }
+        count
     }
 
     fn restart(&mut self, island: usize) {
@@ -709,9 +774,10 @@ impl IslandBests for ArenaIslands<'_> {
 
 #[cfg(feature = "cuda")]
 impl IslandPopulation for ArenaIslands<'_> {
-    fn migrate(&mut self, moves: &[Move]) {
+    fn migrate(&mut self, moves: &[Move], policy: MigrationPolicy) -> Migrants {
         let moves: Vec<(usize, usize)> = moves.iter().map(|m| (m.from, m.to)).collect();
-        self.arena.migrate(&moves);
+        let (sent, skipped) = self.arena.migrate_with(&moves, policy, self.variation.seed, self.gen);
+        Migrants { sent, skipped }
     }
 
     fn restart(&mut self, island: usize) {
@@ -749,8 +815,9 @@ mod tests {
     }
 
     impl IslandPopulation for Bests {
-        fn migrate(&mut self, moves: &[Move]) {
+        fn migrate(&mut self, moves: &[Move], _policy: MigrationPolicy) -> Migrants {
             self.moves.extend_from_slice(moves);
+            Migrants::default()
         }
 
         fn restart(&mut self, island: usize) {
@@ -789,8 +856,9 @@ mod tests {
     }
 
     impl IslandPopulation for Members {
-        fn migrate(&mut self, moves: &[Move]) {
+        fn migrate(&mut self, moves: &[Move], _policy: MigrationPolicy) -> Migrants {
             self.moves.extend_from_slice(moves);
+            Migrants::default()
         }
 
         fn restart(&mut self, island: usize) {
@@ -1774,9 +1842,9 @@ mod tests {
     }
 
     impl<P: IslandPopulation> IslandPopulation for Recorded<'_, P> {
-        fn migrate(&mut self, moves: &[Move]) {
+        fn migrate(&mut self, moves: &[Move], policy: MigrationPolicy) -> Migrants {
             self.moves.extend_from_slice(moves);
-            self.inner.migrate(moves);
+            self.inner.migrate(moves, policy)
         }
 
         fn restart(&mut self, island: usize) {
@@ -2049,6 +2117,182 @@ mod tests {
             assert!(!front.is_empty(), "island {i}");
             assert!(front.iter().all(|s| own.contains(&expr::structural_hash(&s.tree))), "island {i} took foreign material");
         }
+    }
+
+    fn tournament_fixture(n: usize, pop: usize, error: impl Fn(usize, usize) -> f64) -> (Sample, Config, AggTable, Vec<Vec<Ind>>) {
+        let (s, base) = breeding_fixture();
+        let cfg = Config {
+            islands: n,
+            pop,
+            qd_policy: false,
+            qd_bins: 0,
+            migration_policy: MigrationPolicy::RingTournament,
+            ..base
+        };
+        let aggs = AggTable::from_sample(&s);
+        let data = EvalSample::new(&s, &cfg);
+        let mut rng = Mt::new(1029);
+        let islands = (0..n)
+            .map(|i| {
+                (0..pop)
+                    .map(|j| {
+                        let mut ind = Ind::evaluated(random_tree_with(&mut rng, 2, &cfg.ops, 3, Some(&aggs)), &data, &cfg);
+                        ind.error = error(i, j);
+                        ind.age = (i * pop + j) as u32;
+                        ind
+                    })
+                    .collect()
+            })
+            .collect();
+        (s, cfg, aggs, islands)
+    }
+
+    fn migrate_tree(
+        s: &Sample,
+        cfg: &Config,
+        aggs: &AggTable,
+        islands: &mut [Vec<Ind>],
+        rngs: &mut [Mt],
+        moves: &[Move],
+        policy: MigrationPolicy,
+    ) -> Migrants {
+        let data = EvalSample::new(s, cfg);
+        TreeIslands {
+            islands,
+            rngs,
+            cfg,
+            nvars: 2,
+            aggs,
+            gen_train: s,
+            gen_data: &data,
+            fit_train: s,
+            defer_gpu: false,
+            qd: None,
+            cached_descriptors_valid: false,
+        }
+        .migrate(moves, policy)
+    }
+
+    #[test]
+    fn ring_tournament_draws_the_migrant_with_the_destination_rng() {
+        let (s, cfg, aggs, islands) = tournament_fixture(3, 16, |i, j| 1.0 + (i * 100 + j) as f64);
+        let rngs: Vec<Mt> = (0..3).map(|i| Mt::new(70 + i as u32)).collect();
+        let (mut after, mut after_rngs) = (islands.clone(), rngs.clone());
+        let moves = [Move { from: 1, to: 0 }];
+        let got = migrate_tree(&s, &cfg, &aggs, &mut after, &mut after_rngs, &moves, MigrationPolicy::RingTournament);
+        assert_eq!(got, Migrants { sent: 1, skipped: 0 });
+        let (before_rngs, after_view) = (rng_view(&rngs), rng_view(&after_rngs));
+        assert!(after_view[0] != before_rngs[0], "the destination generator draws");
+        assert!(after_view[1] == before_rngs[1] && after_view[2] == before_rngs[2], "the source stream is untouched");
+        assert!(tree_view(&after[1..]) == tree_view(&islands[1..]), "no other island changes");
+        let mut replay = rngs[0].clone();
+        let winner = tournament(&islands[1], &mut replay, MIGRANT_TOURNAMENT);
+        let worst = 15;
+        assert_eq!(expr::structural_hash(&after[0][worst].tree), expr::structural_hash(&islands[1][winner].tree));
+        assert_eq!(after[0][worst].age, islands[1][winner].age, "the migrant keeps its source age");
+        assert!(tree_view(&after[..1])
+            .iter()
+            .enumerate()
+            .all(|(k, v)| k == worst || *v == tree_view(&islands[..1])[k]));
+        let (mut again, mut again_rngs) = (islands.clone(), rngs.clone());
+        migrate_tree(&s, &cfg, &aggs, &mut again, &mut again_rngs, &moves, MigrationPolicy::RingTournament);
+        assert!(tree_view(&again) == tree_view(&after) && rng_view(&again_rngs) == after_view, "a pure function of the seeds");
+    }
+
+    #[test]
+    fn the_ring_policy_draws_no_random_number_and_sends_the_best() {
+        let (s, cfg, aggs, islands) = tournament_fixture(3, 16, |i, j| 1.0 + (i * 100 + j) as f64);
+        let rngs: Vec<Mt> = (0..3).map(|i| Mt::new(70 + i as u32)).collect();
+        let (mut after, mut after_rngs) = (islands.clone(), rngs.clone());
+        let got = migrate_tree(&s, &cfg, &aggs, &mut after, &mut after_rngs, &[Move { from: 1, to: 0 }], MigrationPolicy::Ring);
+        assert_eq!(got, Migrants { sent: 1, skipped: 0 });
+        assert!(rng_view(&after_rngs) == rng_view(&rngs));
+        assert_eq!(expr::structural_hash(&after[0][15].tree), expr::structural_hash(&islands[1][0].tree));
+    }
+
+    #[test]
+    fn a_migrant_whose_book_the_destination_holds_is_skipped() {
+        // Every member of island 1 has error 5.0, so the winner holds 5.0.
+        let (s, cfg, aggs, islands) = tournament_fixture(3, 16, |i, j| if i == 1 { 5.0 } else { 10.0 + (i * 100 + j) as f64 });
+        let rngs: Vec<Mt> = (0..3).map(|i| Mt::new(70 + i as u32)).collect();
+        let mut held = islands.clone();
+        held[0][3].error = 5.0;
+        let (mut after, mut after_rngs) = (held.clone(), rngs.clone());
+        let got = migrate_tree(&s, &cfg, &aggs, &mut after, &mut after_rngs, &[Move { from: 1, to: 0 }], MigrationPolicy::RingTournament);
+        assert_eq!(got, Migrants { sent: 0, skipped: 1 });
+        assert!(tree_view(&after) == tree_view(&held), "the destination population is unchanged");
+        let (mut free, mut free_rngs) = (islands.clone(), rngs.clone());
+        let got = migrate_tree(&s, &cfg, &aggs, &mut free, &mut free_rngs, &[Move { from: 1, to: 0 }], MigrationPolicy::RingTournament);
+        assert_eq!(got, Migrants { sent: 1, skipped: 0 }, "a destination without that error takes the migrant");
+        // The same count reaches the policy, and so the development log.
+        let two = Config { islands: 2, migration_interval: 1, ..cfg.clone() };
+        let mut pair = vec![held[1].clone(), held[1].clone()];
+        let mut pair_rngs = vec![Mt::new(1), Mt::new(2)];
+        let data = EvalSample::new(&s, &two);
+        let mut policy = IslandPolicy::new(&two);
+        policy.observe(&pair[..]);
+        policy.barrier(
+            0,
+            &[],
+            &mut TreeIslands {
+                islands: &mut pair,
+                rngs: &mut pair_rngs,
+                cfg: &two,
+                nvars: 2,
+                aggs: &aggs,
+                gen_train: &s,
+                gen_data: &data,
+                fit_train: &s,
+                defer_gpu: false,
+                qd: None,
+                cached_descriptors_valid: false,
+            },
+        );
+        assert_eq!(policy.migrants(), Migrants { sent: 0, skipped: 2 });
+        policy.observe(&pair[..]);
+        assert_eq!(policy.migrants(), Migrants::default(), "the count covers one generation");
+    }
+
+    #[test]
+    fn a_source_without_a_finite_member_sends_nothing() {
+        let (s, cfg, aggs, islands) = tournament_fixture(2, 8, |i, j| if i == 1 { f64::INFINITY } else { 1.0 + j as f64 });
+        let rngs = vec![Mt::new(1), Mt::new(2)];
+        let (mut after, mut after_rngs) = (islands.clone(), rngs.clone());
+        let got = migrate_tree(&s, &cfg, &aggs, &mut after, &mut after_rngs, &[Move { from: 1, to: 0 }], MigrationPolicy::RingTournament);
+        assert_eq!(got, Migrants::default());
+        assert!(tree_view(&after) == tree_view(&islands) && rng_view(&after_rngs) == rng_view(&rngs));
+    }
+
+    #[test]
+    fn a_ring_tournament_run_and_its_resume_match_exactly() {
+        let cfg = |generations| Config { generations, migration_policy: MigrationPolicy::RingTournament, ..golden_config() };
+        let (uninterrupted, full_text, _) = checkpointed(&cfg(40), None);
+        let (again, again_text, _) = checkpointed(&cfg(40), None);
+        assert_eq!(uninterrupted.archive.hash(), again.archive.hash(), "same seed, same archive");
+        assert_eq!(full_text, again_text, "same seed, same exit checkpoint");
+        let (_, saved_text, _) = checkpointed(&cfg(20), None);
+        assert!(saved_text.contains("config migration_policy ring-tournament\n"));
+        let saved = Checkpoint::from_text(&saved_text).expect("parse saved checkpoint");
+        let (resumed, resumed_text, _) = checkpointed(&cfg(40), Some(saved));
+        assert_eq!(uninterrupted.archive.hash(), resumed.archive.hash(), "the archive");
+        assert_eq!(full_text, resumed_text, "the exit checkpoint");
+        let (ring, _, _) = checkpointed(&Config { generations: 40, ..golden_config() }, None);
+        assert!(ring.archive.hash() != uninterrupted.archive.hash(), "the policy changes the trajectory");
+    }
+
+    #[test]
+    fn a_ring_tournament_checkpoint_resumes_only_under_its_own_policy() {
+        let cfg = |generations, migration_policy| Config { generations, migration_policy, ..golden_config() };
+        let (_, default_text, _) = checkpointed(&cfg(10, MigrationPolicy::Ring), None);
+        assert!(!default_text.contains("migration_policy"), "the key is written only for ring-tournament");
+        let old = Checkpoint::from_text(&default_text).expect("parse default checkpoint");
+        assert_eq!(old.config.migration_policy, MigrationPolicy::Ring, "a checkpoint without the key loads as ring");
+        let (_, text, _) = checkpointed(&cfg(10, MigrationPolicy::RingTournament), None);
+        let saved = Checkpoint::from_text(&text).expect("parse checkpoint");
+        let err = refused(&cfg(20, MigrationPolicy::Ring), Some(saved));
+        assert!(err.contains("migration_policy"), "{err}");
+        let err = refused(&cfg(20, MigrationPolicy::RingTournament), Some(old));
+        assert!(err.contains("migration_policy"), "{err}");
     }
 
     fn describe(cfg: &Config, defer_gpu: bool) -> String {
