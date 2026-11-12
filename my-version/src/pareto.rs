@@ -333,4 +333,24 @@ mod tests {
         assert_eq!(&errors[..2], &[0.9, 0.5]);
         assert!(errors[2].is_nan());
     }
+
+    /// #1082: one long/flat book has one error, so the dominance test already
+    /// keeps a single member per book: the strictly simplest, the first one at
+    /// equal cost. The search needs no separate same-book guard on the archive.
+    #[test]
+    fn the_archive_keeps_one_member_per_book() {
+        let e = 0.812_345_678_9;
+        let mut a = Archive::new(100);
+        for (cost, v) in [(5.0, 1.0), (3.0, 2.0), (3.0, 3.0), (7.0, 4.0)] {
+            a.try_insert(sol(cost, e, v));
+        }
+        assert_eq!(a.items.len(), 1);
+        assert_eq!(a.items[0].cost, 3.0);
+        assert_eq!(a.items[0].error.to_bits(), e.to_bits());
+        assert_eq!(
+            crate::expr::structural_hash(&a.items[0].tree),
+            crate::expr::structural_hash(&sol(3.0, e, 2.0).tree),
+            "the first member at the lowest cost holds the book"
+        );
+    }
 }

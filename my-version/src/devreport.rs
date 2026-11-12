@@ -1096,6 +1096,7 @@ mod tests {
             restarts: 0,
             restarts_total: 0,
             isolated: 0,
+            books: None,
         }
         .json()
     }

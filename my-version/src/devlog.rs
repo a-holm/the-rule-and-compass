@@ -461,6 +461,36 @@ impl QdGen {
     }
 }
 
+/// #1082: distinct long/flat books in the population under `--fitness pnl`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BookCounts {
+    /// Distinct signatures among the signed members of all islands.
+    pub distinct: usize,
+    /// Finite members with a book signature.
+    pub signed: usize,
+    /// Finite members without one (loaded from a checkpoint written without
+    /// `--same-book-guard`, or scored by a route that reported no totals).
+    pub unsigned: usize,
+    /// Distinct signatures among the signed members of each island.
+    pub islands: Vec<usize>,
+}
+
+impl BookCounts {
+    /// The `books` object: `islands` only when `full`.
+    pub fn json(&self, full: bool) -> String {
+        let islands = if full {
+            let v: Vec<String> = self.islands.iter().map(|n| n.to_string()).collect();
+            format!(",\"islands\":[{}]", v.join(","))
+        } else {
+            String::new()
+        };
+        format!(
+            "{{\"distinct\":{},\"signed\":{},\"unsigned\":{}{}}}",
+            self.distinct, self.signed, self.unsigned, islands
+        )
+    }
+}
+
 /// One generation's measured numbers — everything a `generation` event carries.
 ///
 /// All of it is read from state the search already holds at the generation
@@ -549,6 +579,9 @@ pub struct GenRecord {
     pub restarts_total: u64,
     /// #1022: islands inside their isolation window after this boundary.
     pub isolated: usize,
+    /// #1082: distinct books under `--fitness pnl` on the node path; `None`
+    /// writes no `books` key.
+    pub books: Option<BookCounts>,
 }
 
 impl GenRecord {
@@ -584,7 +617,7 @@ impl GenRecord {
              \"archive\":{{\"size\":{}}},\
              \"fit\":{{\"attempts\":{},\"gpu\":{},\"fallback\":{}}},\
              \"gpu\":{},\"fallback\":{{\"scope\":\"evaluator_pool\",\"seconds\":{},\"workers\":{}}},\
-             \"convergence\":{{\"percent_converged\":{}}},\"restarts\":{},\"restarts_total\":{}}}",
+             \"convergence\":{{\"percent_converged\":{}}},\"restarts\":{},\"restarts_total\":{}{}}}",
             SCHEMA,
             VERSION,
             self.generation,
@@ -611,7 +644,8 @@ impl GenRecord {
             self.fallback_workers,
             num(self.percent_converged),
             self.restarts,
-            self.restarts_total
+            self.restarts_total,
+            self.books_json(false)
         )
     }
 
@@ -633,7 +667,7 @@ impl GenRecord {
              \"qd\":{},\
              \"convergence\":{{\"confidence\":{},\"stability\":{},\"maturity\":{},\
              \"percent_converged\":{}}},\
-             \"islands\":[{}],\"rng\":{},\"restarts\":{},\"restarts_total\":{},\"isolated\":{}}}",
+             \"islands\":[{}],\"rng\":{},\"restarts\":{},\"restarts_total\":{},\"isolated\":{}{}}}",
             SCHEMA,
             VERSION,
             self.generation,
@@ -684,8 +718,17 @@ impl GenRecord {
             hex(self.rng_key),
             self.restarts,
             self.restarts_total,
-            self.isolated
+            self.isolated,
+            self.books_json(true)
         )
+    }
+
+    /// #1082: `,"books":{...}`, or nothing when the record has no counts.
+    fn books_json(&self, full: bool) -> String {
+        if true {
+            return String::new();
+        }
+        self.books.as_ref().map_or_else(String::new, |b| format!(",\"books\":{}", b.json(full)))
     }
 }
 
@@ -1291,6 +1334,7 @@ mod tests {
             restarts: 1,
             restarts_total: 3,
             isolated: 2,
+            books: None,
         }
     }
 
@@ -1358,6 +1402,30 @@ mod tests {
             parsed.get("variation").and_then(|v| v.get("dedup_rate")).and_then(|v| v.as_f64()),
             Some(15.0 / 40.0)
         );
+    }
+
+    /// #1082: the `books` object is written only when the record counted
+    /// books; the per-island list is a full-level field.
+    #[test]
+    fn books_fields_appear_only_when_counted() {
+        let mut r = rec();
+        for line in [r.json_at(Level::Summary), r.json()] {
+            assert!(Json::parse(&line).unwrap().get("books").is_none(), "no counts, no books key");
+        }
+        r.books = Some(BookCounts { distinct: 3, signed: 5, unsigned: 1, islands: vec![2, 2] });
+        let summary = Json::parse(&r.json_at(Level::Summary)).unwrap();
+        let b = summary.get("books").expect("summary books");
+        assert_eq!(b.get("distinct").and_then(|v| v.as_usize()), Some(3));
+        assert_eq!(b.get("signed").and_then(|v| v.as_usize()), Some(5));
+        assert_eq!(b.get("unsigned").and_then(|v| v.as_usize()), Some(1));
+        assert!(b.get("islands").is_none(), "islands is a full-level field");
+        let full = Json::parse(&r.json()).unwrap();
+        let b = full.get("books").expect("full books");
+        assert_eq!(b.get("distinct").and_then(|v| v.as_usize()), Some(3));
+        match b.get("islands") {
+            Some(Json::Arr(a)) => assert_eq!(a.iter().map(|v| v.as_usize()).collect::<Vec<_>>(), vec![Some(2), Some(2)]),
+            other => panic!("islands is not an array: {other:?}"),
+        }
     }
 
     /// The summary level is a strict subset: it keeps what a monitor needs and

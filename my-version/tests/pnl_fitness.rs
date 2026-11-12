@@ -1539,3 +1539,212 @@ fn band_sd_robust_selection_uses_member_bands() {
         num(&j, &["objective", "spec", "band_resolved"]).to_bits()
     );
 }
+
+// ---- #1082: book signatures, the distinct-book count and the same-book guard ----
+
+/// Returns where only rows 2 and 3 of each 10-row group move, so a long row
+/// elsewhere changes the long count but not the gross, flips or exits.
+fn sparse_slice() -> TradingSlice {
+    let mut rows = TradingRows::default();
+    let mut ret = Vec::new();
+    for g in 0..3u64 {
+        for i in 0..10usize {
+            rows.group.push(g);
+            rows.time.push(1.6e9 + 900.0 * i as f64);
+            ret.push(match i {
+                2 => 0.01,
+                3 => 0.02,
+                _ => 0.0,
+            });
+        }
+    }
+    TradingSlice { rows, ret }
+}
+
+fn signed(book: &FitnessBook, pred: &[f64]) -> trading::BookSig {
+    book.regret_signed(pred).1.expect("a finite regret has a signature")
+}
+
+#[test]
+fn equal_positions_give_equal_book_signatures() {
+    let s = slice(&[200, 200, 1, 200, 1]);
+    let plain = FitnessBook::new(&s, &spec(), 900.0).unwrap();
+    let blocks = FitnessBook::with_blocks(&s, &spec(), 900.0, 4, 1.0).unwrap();
+    let band = FitnessBook::new(&s, &band_spec(0.05, BandUnits::Score, 2), 900.0).unwrap();
+    let pred = prediction(&s);
+    // Same sign on every row, so the same position vector for the plain book.
+    let scaled: Vec<f64> = pred.iter().map(|p| if *p > 0.0 { 2.0 * p } else { 3.0 * p }).collect();
+    let mut moved = pred.clone();
+    let k = moved.iter().position(|p| *p <= 0.0).expect("a flat row");
+    moved[k] = 0.5;
+    for book in [&plain, &blocks] {
+        assert_eq!(signed(book, &pred), signed(book, &pred), "deterministic");
+        assert_eq!(signed(book, &pred), signed(book, &scaled), "one position vector, one signature");
+        assert_ne!(signed(book, &pred), signed(book, &moved), "one more long row is another book");
+    }
+    assert_eq!(signed(&band, &pred), signed(&band, &pred));
+    assert_ne!(signed(&band, &pred), signed(&band, &persistent_scores(&s, 0.1)));
+}
+
+#[test]
+fn book_signature_separates_books_with_equal_error_bits() {
+    let s = sparse_slice();
+    let book = FitnessBook::new(&s, &spec(), 900.0).unwrap();
+    // A: long on rows 2 and 3 of every group. B: also row 1, whose return is 0.
+    let a: Vec<f64> = (0..s.ret.len()).map(|r| if matches!(r % 10, 2 | 3) { 1.0 } else { -1.0 }).collect();
+    let b: Vec<f64> = (0..s.ret.len()).map(|r| if matches!(r % 10, 1..=3) { 1.0 } else { -1.0 }).collect();
+    let (ra, sa) = book.regret_signed(&a);
+    let (rb, sb) = book.regret_signed(&b);
+    assert!(ra.is_finite());
+    assert_eq!(ra.to_bits(), rb.to_bits(), "equal gross, flips and exits give equal error bits");
+    assert_eq!(book.totals(&a).long_rows + 3, book.totals(&b).long_rows);
+    assert_ne!(sa, sb, "the long rows tell the books apart");
+}
+
+#[test]
+fn regret_signed_returns_the_regret_bits() {
+    let s = slice(&[300, 200, 1, 250, 1]);
+    let floored = TradingSpec { min_trades: 1_000_000, ..spec() };
+    for blocks in [1usize, 4] {
+        let book = FitnessBook::with_blocks(&s, &spec(), 900.0, blocks, 1.0).unwrap();
+        for k in 0..64 {
+            let pred: Vec<f64> = prediction(&s).iter().enumerate().map(|(i, p)| p + 0.01 * frac((i * (k + 1)) as f64 * 0.37) - 0.005).collect();
+            let (regret, sig) = book.regret_signed(&pred);
+            assert_eq!(regret.to_bits(), book.regret(&pred).to_bits(), "blocks {blocks}, prediction {k}");
+            assert_eq!(sig.is_some(), regret.is_finite());
+        }
+        let mut bad = prediction(&s);
+        bad[7] = f64::NAN;
+        assert_eq!(book.regret_signed(&bad), (f64::INFINITY, None));
+        let floor = FitnessBook::with_blocks(&s, &floored, 900.0, blocks, 1.0).unwrap();
+        assert_eq!(floor.regret_signed(&prediction(&s)), (f64::INFINITY, None));
+    }
+}
+
+fn generation_records(log: &std::path::Path) -> Vec<Json> {
+    std::fs::read_to_string(log)
+        .expect("the development log exists")
+        .lines()
+        .filter_map(Json::parse)
+        .filter(|r| r.get("event").and_then(Json::as_str) == Some("generation"))
+        .collect()
+}
+
+#[test]
+fn run_json_and_dev_log_report_distinct_books() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    for level in ["summary", "full"] {
+        let log = dir.join(format!("{level}.jsonl"));
+        let j = json(&run_logged(&data, &spec, &log, &["--fitness", "pnl", "--islands", "4", "--dev-log-level", level, "--dev-log-every", "1"]));
+        let books = at(&j, &["search", "books"]);
+        let distinct = num(books, &["distinct"]);
+        assert!(distinct >= 1.0 && distinct <= num(books, &["signed"]), "{books:?}");
+        assert_eq!(num(books, &["unsigned"]), 0.0, "a fresh CPU run signs every finite member");
+        match at(books, &["islands"]) {
+            Json::Arr(a) => {
+                assert_eq!(a.len(), 4);
+                assert!(a.iter().all(|v| v.as_f64().is_some_and(|n| n >= 1.0 && n <= distinct)), "{a:?}");
+            }
+            other => panic!("search.books.islands is not an array: {other:?}"),
+        }
+        let gens = generation_records(&log);
+        assert!(!gens.is_empty());
+        for g in &gens {
+            let b = at(g, &["books"]);
+            assert!(num(b, &["distinct"]) <= num(b, &["signed"]), "{b:?}");
+            assert_eq!(num(b, &["unsigned"]), 0.0);
+            assert_eq!(b.get("islands").is_some(), level == "full", "{level}: {b:?}");
+        }
+    }
+    let log = dir.join("metric.jsonl");
+    let j = json(&run_logged(&data, &spec, &log, &["--islands", "4", "--dev-log-level", "full", "--dev-log-every", "1"]));
+    assert!(at(&j, &["search"]).get("books").is_none(), "a metric run reports no books");
+    assert!(generation_records(&log).iter().all(|g| g.get("books").is_none()));
+}
+
+#[test]
+fn same_book_guard_refusals_name_their_reason() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    usage_error(&run(&data, &spec, &["--same-book-guard"]), "--same-book-guard needs --fitness pnl");
+    usage_error(
+        &run(&data, &spec, &["--fitness", "pnl", "--same-book-guard", "--selection", "afp"]),
+        "--same-book-guard is not supported with --selection afp",
+    );
+    usage_error(
+        &run(&data, &spec, &["--fitness", "pnl", "--same-book-guard", "--qd-policy"]),
+        "--same-book-guard is not supported with --qd-policy",
+    );
+    usage_error(
+        &run(&data, &spec, &["--fitness", "pnl", "--same-book-guard", "--variation", "postfix"]),
+        "--same-book-guard is not supported with --variation postfix",
+    );
+}
+
+fn front_key(j: &Json) -> Vec<(String, u64)> {
+    pareto(j)
+        .iter()
+        .map(|m| (at(m, &["expression"]).as_str().unwrap().to_string(), num(m, &["fitness", "train_regret"]).to_bits()))
+        .collect()
+}
+
+#[test]
+fn same_book_guard_is_deterministic_and_changes_the_trajectory() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let log = |name: &str| dir.join(name);
+    let guard = ["--fitness", "pnl", "--same-book-guard", "--dev-log-level", "full", "--dev-log-every", "1"];
+    let a = json(&run_logged(&data, &spec, &log("a.jsonl"), &guard));
+    let b = json(&run_logged(&data, &spec, &log("b.jsonl"), &guard));
+    assert_eq!(front_key(&a), front_key(&b));
+    let hashes = |name: &str| {
+        generation_records(&log(name))
+            .iter()
+            .map(|g| at(g, &["archive", "hash"]).as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(hashes("a.jsonl"), hashes("b.jsonl"));
+    json(&run_logged(&data, &spec, &log("plain.jsonl"), &["--fitness", "pnl", "--dev-log-level", "full", "--dev-log-every", "1"]));
+    assert_ne!(hashes("a.jsonl"), hashes("plain.jsonl"), "the guard draws other parents");
+}
+
+#[test]
+fn same_book_guard_resume_matches_the_uninterrupted_run() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let (cp, straight_cp, resumed_cp, plain_cp) = (path("cp.rcsr"), path("straight.rcsr"), path("resumed.rcsr"), path("plain.rcsr"));
+    let guard = ["--fitness", "pnl", "--same-book-guard"];
+
+    let first = run(&data, &spec, &[&guard[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let text = std::fs::read_to_string(&cp).unwrap();
+    assert!(text.lines().any(|l| l == "config same_book_guard on"));
+    let islands = text.lines().filter(|l| l.starts_with("rng ") && !l.starts_with("rng main ")).count();
+    assert!(islands >= 1);
+    assert_eq!(text.lines().filter(|l| l.starts_with("books ")).count(), islands, "one books record per island");
+
+    let straight = json(&run(&data, &spec, &[&guard[..], &["--generations", "20", "--save", &straight_cp]].concat()));
+    let resumed = json(&run(&data, &spec, &[&guard[..], &["--generations", "20", "--resume", &cp, "--save", &resumed_cp]].concat()));
+    assert_eq!(front_key(&straight), front_key(&resumed));
+    let state = |p: &str| {
+        std::fs::read_to_string(p)
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("archive_hash ") || l.starts_with("ind ") || l.starts_with("books "))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(state(&straight_cp), state(&resumed_cp));
+
+    let plain = run(&data, &spec, &["--fitness", "pnl", "--generations", "10", "--save", &plain_cp]);
+    assert_eq!(code(&plain), 0, "{}", stderr(&plain));
+    let text = std::fs::read_to_string(&plain_cp).unwrap();
+    assert!(!text.contains("same_book_guard"));
+    assert!(!text.lines().any(|l| l.starts_with("books ")));
+}
