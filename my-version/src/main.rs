@@ -7079,7 +7079,7 @@ fn main() {
             } else {
                 std::borrow::Cow::Borrowed(&pred)
             };
-            let train_fitness = fitness_book.as_ref().map(|b| b.regret(&pred)).unwrap_or(f64::NAN);
+            let train_fitness = fitness_book.as_ref().map(|b| b.regret(&book_pred)).unwrap_or(f64::NAN);
             let edge_rejected = rcsr::selection::edge_rejected(select_require_edge, train_fitness);
             let (objective_value, validation_book_json) = match (&trading_spec, book_validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
                 (Some(tspec), Some(v), Some(slice)) => {
@@ -7207,7 +7207,7 @@ fn main() {
                 gate_json: String::new(),
                 fitness_json: fitness_book
                     .as_ref()
-                    .map(|b| fitness_member_json(b, &pred, train_fitness))
+                    .map(|b| fitness_member_json(b, &book_pred, train_fitness))
                     .unwrap_or_default(),
                 validation_book_json,
             }
