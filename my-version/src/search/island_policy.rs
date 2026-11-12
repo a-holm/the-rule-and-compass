@@ -18,12 +18,12 @@ mod tests {
     fn golden_config() -> Config {
         Config {
             generations: 40,
-            islands: 3,
-            pop: 24,
+            islands: 4,
+            pop: 16,
             max_complexity: 10,
             fit_iters: 2,
-            migration_interval: 3,
-            restart_interval: 4,
+            migration_interval: 6,
+            restart_interval: 2,
             patience: 0,
             seed: 11,
             gpu: false,
@@ -35,14 +35,18 @@ mod tests {
         bytes.iter().fold(h, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
     }
 
-    /// Archive hash, exit-checkpoint hash without the build lines, and restarts.
-    fn trajectory(cfg: &Config) -> (u64, u64, u64) {
+    /// Archive hash, exit-checkpoint hash without the build lines, restarts, and restarts in the first 20 generations.
+    fn trajectory(cfg: &Config) -> (u64, u64, u64, u64) {
         let (train, test) = (golden_sample(240), golden_sample(80));
         let restarts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let sink = restarts.clone();
+        let early = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (sink, early_sink) = (restarts.clone(), early.clone());
         let cfg = Config {
             dev_log: Some(std::sync::Arc::new(move |r: &crate::devlog::GenRecord| {
                 sink.store(r.restarts_total, std::sync::atomic::Ordering::SeqCst);
+                if r.generation < 20 {
+                    early_sink.store(r.restarts_total, std::sync::atomic::Ordering::SeqCst);
+                }
             })),
             ..cfg.clone()
         };
@@ -50,7 +54,7 @@ mod tests {
         let out = run_resumable(&cfg, &train, &test, None, 0, |cp| text = Some(cp.to_text())).expect("run");
         let text = text.expect("exit checkpoint");
         let kept = text.lines().filter(|l| !l.starts_with("build ")).fold(0xcbf2_9ce4_8422_2325u64, |h, l| fnv(fnv(h, l.as_bytes()), b"\n"));
-        (out.archive.hash(), kept, restarts.load(std::sync::atomic::Ordering::SeqCst))
+        (out.archive.hash(), kept, restarts.load(std::sync::atomic::Ordering::SeqCst), early.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Archive and exit-checkpoint hashes measured at the base.
@@ -70,11 +74,20 @@ mod tests {
         let mut seen = Vec::new();
         for ((name, cfg), (want_name, want_archive, want_text)) in golden_configs().into_iter().zip(GOLDEN) {
             assert_eq!(name, want_name);
-            let (archive, text, restarts) = trajectory(&cfg);
-            assert!(restarts > 0, "{name}: the run restarts an island, else the pin proves nothing");
-            seen.push(format!("(\"{name}\", {archive:#018x}, {text:#018x}) restarts {restarts}"));
+            let (archive, text, restarts, early) = trajectory(&cfg);
+            seen.push(format!("(\"{name}\", {archive:#018x}, {text:#018x}) restarts {restarts} by generation 20 {early}"));
+            if restarts == 0 {
+                seen.push(format!("{name}: no restart, differs from the base"));
+            }
             if (archive, text) != (want_archive, want_text) {
                 seen.push(format!("{name}: differs from the base"));
+            }
+        }
+        for (mi, ri, seed) in [(10, 2, 11), (4, 3, 11), (6, 2, 12), (6, 2, 13), (8, 2, 5)] {
+            for rule in [RestartPolicy::Archive, RestartPolicy::Island] {
+                let cfg = Config { migration_interval: mi, restart_interval: ri, seed, restart_policy: rule, restart_isolation: 7, ..golden_config() };
+                let (archive, text, restarts, early) = trajectory(&cfg);
+                seen.push(format!("candidate mi {mi} ri {ri} seed {seed} {rule:?}: {archive:#018x} {text:#018x} restarts {restarts} by generation 20 {early}"));
             }
         }
         assert!(!seen.iter().any(|s| s.ends_with("differs from the base")), "{}", seen.join("\n"));
