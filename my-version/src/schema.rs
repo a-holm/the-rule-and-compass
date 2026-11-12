@@ -423,6 +423,7 @@ pub fn json() -> String {
 {{\"name\":\"--side\",\"type\":\"enum\",\"default\":\"long\",\"description\":\"long only; --side short and --allow-short are refused (labels are long-only: action {{0,+1}}, long-side barriers)\"}},\
 {{\"name\":\"--replace\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"overwrite an existing numeric column in place; default refuses a duplicate and preserves every column\"}},\
 {{\"name\":\"--chunk-rows\",\"type\":\"int\",\"default\":\"65536\",\"description\":\"read/compute batch; arithmetic and output hashes are identical for every size\"}},\
+{{\"name\":\"--threads\",\"type\":\"int\",\"default\":\"available CPUs\",\"description\":\"feature-pass workers; at most 2 x n segment outputs are held at once; arithmetic and output hashes are identical for every n\"}},\
 {{\"name\":\"--group-rows\",\"type\":\"int\",\"default\":\"store default\",\"description\":\"group size for a CSV input store\"}},\
 {{\"name\":\"--bar-seconds\",\"type\":\"int\",\"default\":\"inferred\",\"description\":\"expected bar spacing; windows spanning a missing bucket are NaN\"}},\
 {{\"name\":\"--time\",\"type\":\"string\",\"default\":\"auto\",\"description\":\"time column\"}},\
