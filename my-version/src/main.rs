@@ -13175,6 +13175,9 @@ mod tests {
         g.fit_fallback_bounded = 0;
         g.fit_fallback_workers = 8;
         g.fit_fallback_max = 4096;
+        // #1075: the release schedule and the fits that started from it.
+        g.fit_release_waves = 3;
+        g.fit_tail_early = 5;
         g.fit_polish = rcsr::fit::FitPolish::F32;
         g.ledger.record_fit(0.5, 0.75, 0.125);
         g.ledger.record_fit_polish_split(0.25);
@@ -13190,7 +13193,7 @@ mod tests {
         for key in [
             "\"calls\":0",
             "\"candidates\":0",
-            "\"call_s_max\":0,\"fold_count\":7,\"folded\":6",
+            "\"call_s_max\":0,\"release_waves\":3,\"tail_early_fits\":5,\"fold_count\":7,\"folded\":6",
         ] {
             assert!(json.contains(key), "{key} in {json}");
         }
