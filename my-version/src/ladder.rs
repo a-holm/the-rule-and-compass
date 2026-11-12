@@ -2512,8 +2512,10 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
                             locked test range (old ledger); a different range is refused (exit 3)\n\
   --verify-read             with --locked-test: recompute a recorded baseline read, compare its report hash\n\
                             with the ledger, write --out and --markdown, record nothing (the route after a\n\
-                            failed write); a mismatch writes no file (exit 3)\n\
-  --expect-report-sha256 <h> exit 3 and write no file unless the report hashes to h\n\
+                            failed write); no recorded read is refused (exit 3) before the panel is\n\
+                            loaded; a mismatch writes no file (exit 3)\n\
+  --expect-report-sha256 <h> exit 3 and write no file unless the report hashes to h;\n\
+                            with --locked-test it needs --verify-read (exit 2 without it)\n\
   --out <file>              write the JSON report (ends with a ledger object: io and\n\
                             pnl seconds on the run wall); with --locked-test it is staged to <file>.tmp\n\
                             and synced before the read is recorded, then renamed\n\
@@ -2729,6 +2731,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     if verify_read && !locked_test {
         return Err(usage_err("--verify-read applies to --locked-test only".to_string()));
     }
+    if locked_test && !verify_read && expect_hash.is_some() {
+        return Err(usage_err("--expect-report-sha256 with --locked-test needs --verify-read".to_string()));
+    }
     if !locked_test && (ledger_path.is_some() || sealed_path.is_some()) {
         return Err(usage_err("--ledger and --sealed apply to --locked-test only".to_string()));
     }
@@ -2757,7 +2762,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         let current = protocol::LockedRange::new(&d.lockbox, d.source);
         let binding = protocol::RangeBinding { current: &current, allow_unbound };
         if verify_read {
-            l.authorize_baseline_sealed(std::path::Path::new(sealed), Some(binding)).map_err(input_err)?;
+            l.authorize_baseline_verify(std::path::Path::new(sealed), Some(binding)).map_err(input_err)?;
         } else {
             l.authorize_baseline_read(std::path::Path::new(sealed), Some(binding)).map_err(input_err)?;
         }
