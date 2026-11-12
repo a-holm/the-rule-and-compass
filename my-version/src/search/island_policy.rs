@@ -195,7 +195,7 @@ fn luby(mut n: u64) -> u64 {
 /// lowest slot (Cire, Kadioglu and Sellmann 2014). Every slot starts its first
 /// lifetime at unit 0.
 fn explore_restarts(k: usize, units: u64) -> Vec<usize> {
-    if k == 0 || units == 0 || k > 0 {
+    if k == 0 || units == 0 {
         return Vec::new();
     }
     let mut ends = vec![0u64; k];
@@ -268,7 +268,7 @@ impl IslandPolicy {
 
     /// #1100: whether `island` belongs to the explore tier.
     fn explores(&self, island: usize) -> bool {
-        island >= self.explore_from && self.restart_interval == usize::MAX
+        island >= self.explore_from
     }
 
     fn isolated(&self, island: usize) -> bool {
@@ -327,7 +327,7 @@ impl IslandPolicy {
     /// The directed ring of the exploit tier: every exploit island that is not
     /// isolated receives the best member of the next exploit island.
     fn ring(&self, islands: usize) -> Vec<Move> {
-        let exploit = if self.restart_interval == usize::MAX { islands.min(self.explore_from) } else { islands };
+        let exploit = islands.min(self.explore_from);
         if exploit < 2 {
             return Vec::new();
         }
