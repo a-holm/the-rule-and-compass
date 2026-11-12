@@ -6314,7 +6314,7 @@ struct Parents<'a> {
 /// reserves for the diversity policy. An island whose source is not `shared`
 /// (isolated after a restart, #1067) skips the QD branch.
 fn pick_parent_policy(island: &[Ind], parents: &Parents<'_>, rng: &mut Mt) -> Node {
-    if let Some((qd, qd_control)) = parents.qd {
+    if let (Some((qd, qd_control)), true) = (parents.qd, parents.source.shared) {
         // The issue reserves 5 % of QD parent draws for the global front.
         if let Some(tree) = front_parent(parents.front, rng, 0.05) {
             return tree.clone();
