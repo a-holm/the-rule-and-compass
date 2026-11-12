@@ -36,6 +36,7 @@ fn sample(row: &dyn Setting) -> Option<&'static str> {
         "--restart-isolation" => "7",
         "--mutation-mix" => "extended",
         "--crossover-internal" => "0.25",
+        "--variation" => "node",
         other => panic!("no sample value for {other}: add one to tests/settings_table.rs"),
     })
 }
@@ -156,7 +157,7 @@ fn help() -> String {
 fn help_blocks_of_migrated_settings_are_pinned() {
     let help = help();
     let pinned = blocks(include_str!("fixtures/settings/help_blocks.txt"));
-    assert_eq!(pinned.len(), 4, "help fixture blocks");
+    assert_eq!(pinned.len(), 5, "help fixture blocks");
     for (prev, next, block) in &pinned {
         assert_block(&help, prev, next, block, |flag| format!("  {flag}"));
     }
@@ -168,7 +169,7 @@ fn schema_rows_of_migrated_settings_are_pinned() {
     assert!(out.status.success());
     let schema = String::from_utf8(out.stdout).expect("utf-8 schema");
     let pinned = blocks(include_str!("fixtures/settings/schema_rows.txt"));
-    assert_eq!(pinned.len(), 5, "schema fixture blocks");
+    assert_eq!(pinned.len(), 6, "schema fixture blocks");
     for (prev, next, block) in &pinned {
         assert_block(&schema, prev, next, block, |flag| format!("    {{\"name\":\"{flag}"));
     }
@@ -204,6 +205,7 @@ fn resume_conflict_lines_are_pinned() {
         .args(["--resume", cp, "--patience", "7", "--selection", "afp", "--restart-policy", "archive"])
         .args(["--restart-isolation", "7", "--mutation-mix", "extended", "--crossover-internal", "0.25"])
         .args(["--adaptive-mix", "--reject-constant-offspring", "--reject-fixed-position", "--fit-thresholds"])
+        .args(["--variation", "node"])
         .output()
         .expect("run the resume");
     assert_eq!(resumed.status.code(), Some(2), "{}", String::from_utf8_lossy(&resumed.stderr));
@@ -222,6 +224,7 @@ fn resume_conflict_lines_are_pinned() {
             "--reject-constant-offspring (saved reject_constant_offspring is false)",
             "--reject-fixed-position (saved reject_fixed_position is false)",
             "--fit-thresholds (saved fit_thresholds is false)",
+            "--variation node (saved variation is auto)",
         ],
         "{err}"
     );
