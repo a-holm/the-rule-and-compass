@@ -20,6 +20,7 @@ use rcsr::fit;
 use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
+use rcsr::settings::{self, Group};
 use rcsr::units::{Unit, Units};
 use rcsr::{
     backend, data, diagnostics, leakage, multi, qd, registry, search, stability, store, target,
@@ -110,6 +111,11 @@ fn parse_unit_assignments(src: &str) -> Result<Vec<(String, Unit)>, String> {
 }
 
 fn usage() -> String {
+    let help_stop = settings::help(Group::Stop);
+    let help_island = settings::help(Group::Island);
+    let help_variation = settings::help(Group::Variation);
+    let help_filter = settings::help(Group::Filter);
+    let help_fit = settings::help(Group::Fit);
     format!(
         "rcsr {VERSION} — symbolic regression (rule-and-compass)
 
@@ -777,18 +783,7 @@ SEARCH:
                              search setting: a resume refuses a different
                              value. No effect for other metrics or with
                              --fit-iters 0
-  --fit-thresholds          after the LM, fit each constant that is an operand of a
-                             comparison or sits in the condition of if by an exact
-                             1-D search (default off). The LM never moves such a
-                             constant because its gradient is zero. Candidates are
-                             the midpoints between sorted operand values on the
-                             fit rows (levels of at most 64, narrowing around the best),
-                             scored on the fitted loss (squared error for the
-                             squared family and --fitness pnl); at most 2
-                             constants per tree. Trees with such a constant take
-                             the CPU fit arm, never the device. A saved search
-                             setting: a resume refuses a different value. No
-                             effect with --fit-iters 0
+{help_fit}
   --refit-band <F>           after a device-fit search, refit exactly (CPU f64)
                              only the trees whose full-data error is within
                              this relative band of the lowest error at no
@@ -797,62 +792,11 @@ SEARCH:
                              unique tree
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
   --no-dedup                 disable structural de-duplication
-  --selection lexicographic|afp
-                             survivor and parent selection inside an island.
-                             lexicographic (default) replaces the island with
-                             its offspring and picks parents by error, then
-                             size. afp keeps the Pareto-best of parents and
-                             offspring on (error, complexity, age), adds a few
-                             random immigrants per generation and picks
-                             parents by Pareto rank and crowding distance.
-                             Node path only; refuses --variation postfix
-  --restart-policy archive|island
-                             which stall rule restarts an island every
-                             restart interval (60 generations). archive
-                             (default) restarts an island after two checks
-                             in which its best error is worse than the
-                             archive best. island restarts an island whose
-                             own best error has not improved for one restart
-                             interval, except the lowest island that holds
-                             the archive best (the keeper), and isolates it
-                             from front parents and migrants for
-                             --restart-isolation generations. With one island
-                             nothing restarts. Saved search setting (#1022)
-  --restart-isolation <N>    generations a restarted island takes no front
-                             parent and no migrant, default 25 (the
-                             migration interval). Read only with
-                             --restart-policy island; 0 turns the isolation
-                             off. Saved search setting (#1022)
-  --mutation-mix <M>         node-path edit weights: classic (point .25, terminal
-                             .35, subtree .40; default) or extended (adds insert,
-                             delete, swap and rotate). Not with --variation
-                             postfix (#471)
-  --crossover-internal <P>   probability that a crossover cut point is an
-                             internal node (default 0 = uniform cut). Not with
-                             --variation postfix (#471)
-  --adaptive-mix             per-island edit weights learned from the success
-                             rate of the last 10 generations (uses all seven edit
-                             kinds; learns from CPU-scored generations only).
-                             Off by default; not with --variation postfix (#471)
+{help_island}
+{help_variation}
   --no-front-parents         draw every parent from the island tournament;
                              turns off the 15% Pareto-front feedback (#76)
-  --reject-constant-offspring
-                             reject offspring and random trees with no input
-                             outside an aggregate before the constant fit; the
-                             first constant of an island is kept (#477). Saved
-                             search setting, off by default
-                             and restores the pre-#76 trajectory exactly
-  --reject-fixed-position    under --fitness pnl, reject trees whose long/flat
-                             position cannot depend on the inputs (the exact
-                             output range does not cross --threshold, for
-                             example gauss(c * x) at threshold 0) before the
-                             constant fit, and keep them off the front. Before
-                             the fit every constant counts as free, so c + abs(x)
-                             goes to the fit (#848). With --objective it also
-                             makes such a member unusable as finalist, under
-                             --fitness metric too; so is a member whose
-                             validation book was long on every row or on none
-                             (#849). Saved search setting, off by default
+{help_filter}
   --prune                    remove neutral code from the final front (off by
                              default): replace subtrees with a child or a
                              constant when the training error stays within
@@ -881,7 +825,7 @@ SEARCH:
                              refit and scored on all training rows before
                              selection and archiving. Independent of
                              --predictor-samples
-  --patience <N>             stop after N generations without improvement (default 40)
+{help_stop}
   --time-budget <seconds>    wall-clock limit of this process (default: none).
                              The generation in progress finishes, its progress
                              event and checkpoint are written, and the result
@@ -2820,7 +2764,6 @@ fn main() {
     // contradiction with the saved configuration.
     let mut fit_strategy_set = false;
     let mut dedup_set = false;
-    let mut patience_set = false;
     let mut time_budget_set = false;
     let mut predictor_samples_set = false;
     // #85: remember an explicit --fit-samples so a resume can refuse a
@@ -2837,17 +2780,8 @@ fn main() {
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
     let mut front_parents_set = false;
-    let mut reject_constant_set = false;
-    let mut reject_fixed_set = false; // #848
-    let mut fit_thresholds_set = false; // #1024
-    // #465: explicit --selection for the resume settings check.
-    let mut selection_set = false;
-    // #1022: explicit restart flags for the resume settings check.
-    let mut restart_policy_set = false;
-    let mut restart_isolation_set = false;
-    let mut mutation_mix_set = false; // #471
-    let mut crossover_internal_set = false;
-    let mut adaptive_mix_set = false;
+    // #1083: the table rows named on the command line.
+    let mut explicit = settings::Explicit::default();
     // #25: `--units` is resolved against the prepared input list later; the
     // expressions themselves are parsed here so a typo is a usage error.
     let mut unit_assignments: Vec<(String, Unit)> = Vec::new();
@@ -3405,17 +3339,15 @@ fn main() {
                 );
                 std::process::exit(EXIT_USAGE);
             }
-            // #471: node-path variation settings, each off by default.
-            "--mutation-mix" => {
-                let v = val!();
-                match rcsr::search::MutationMix::parse(&v) {
-                    Ok(m) => cfg.mutation_mix = m,
-                    Err(e) => {
-                        eprintln!("error: --mutation-mix: {}", e);
-                        std::process::exit(EXIT_USAGE);
-                    }
+            // #1083: settings from the search setting table.
+            flag if settings::find(flag).is_some() => {
+                let row = settings::find(flag).expect("matched by the guard");
+                let value = if row.takes_value() { Some(val!()) } else { None };
+                if let Err(e) = row.apply_cli(&mut cfg, value.as_deref()) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_USAGE);
                 }
-                mutation_mix_set = true;
+                explicit.mark(row);
             }
             "--tree-arity" => {
                 eprintln!(
@@ -3423,69 +3355,10 @@ fn main() {
                 );
                 std::process::exit(EXIT_USAGE);
             }
-            "--crossover-internal" => {
-                let v = val!();
-                match v.parse::<f64>() {
-                    Ok(p) if (0.0..=1.0).contains(&p) => cfg.crossover_internal = p,
-                    _ => {
-                        eprintln!("error: --crossover-internal needs a probability in [0, 1], got '{}'", v);
-                        std::process::exit(EXIT_USAGE);
-                    }
-                }
-                crossover_internal_set = true;
-            }
-            "--adaptive-mix" => {
-                cfg.adaptive_mix = true;
-                adaptive_mix_set = true;
-            }
             // #76: exactness escape hatch; the default is on.
-            // #465: survivor and parent selection inside an island.
-            "--selection" => {
-                let v = val!();
-                match crate::search::Selection::parse(&v) {
-                    Ok(s) => {
-                        cfg.selection = s;
-                        selection_set = true;
-                    }
-                    Err(e) => {
-                        eprintln!("error: {}", e);
-                        std::process::exit(EXIT_USAGE);
-                    }
-                }
-            }
-            // #1022: which stall rule restarts an island.
-            "--restart-policy" => {
-                let v = val!();
-                match crate::search::RestartPolicy::parse(&v) {
-                    Ok(p) => {
-                        cfg.restart_policy = p;
-                        restart_policy_set = true;
-                    }
-                    Err(e) => {
-                        eprintln!("error: {}", e);
-                        std::process::exit(EXIT_USAGE);
-                    }
-                }
-            }
-            "--restart-isolation" => {
-                cfg.restart_isolation = parse_uint("--restart-isolation", &val!());
-                restart_isolation_set = true;
-            }
             "--no-front-parents" => {
                 cfg.front_parents = false;
                 front_parents_set = true;
-            }
-            "--reject-constant-offspring" => {
-                cfg.reject_constant_offspring = true;
-                reject_constant_set = true;
-            }
-            "--reject-fixed-position" => {
-                cfg.reject_fixed_position = true;
-                reject_fixed_set = true;
-            }
-            "--fit-thresholds" => {
-                cfg.fit_thresholds = true;
-                fit_thresholds_set = true;
             }
             // #27: evaluator path only; deliberately not a saved search
             // setting, because both paths produce identical errors.
@@ -3615,10 +3488,6 @@ fn main() {
                 }
             }
             "--require-dimensions" => require_dimensions = true,
-            "--patience" => {
-                cfg.patience = parse_uint("--patience", &val!());
-                patience_set = true;
-            }
             "--patience-tol" => {
                 eprintln!("error: --patience-tol was removed (#464): it saved under 10 % of the noisy CPU in the default-decision A/B");
                 std::process::exit(EXIT_USAGE);
@@ -4085,12 +3954,7 @@ fn main() {
         if dedup_set && cfg.dedup != saved.dedup {
             conflicts.push(format!("--no-dedup (saved dedup is {})", saved.dedup));
         }
-        if patience_set && cfg.patience != saved.patience {
-            conflicts.push(format!(
-                "--patience {} (saved {})",
-                cfg.patience, saved.patience
-            ));
-        }
+        settings::conflicts(Group::Stop, &cfg, &saved, &explicit, &mut conflicts); // #1083
         if predictor_samples_set && cfg.predictor_samples != saved.predictor_samples {
             conflicts.push(format!(
                 "--predictor-samples {:?} (saved {:?})",
@@ -4135,31 +3999,7 @@ fn main() {
                 cfg.fit_fallback_max, saved.fit_fallback_max
             ));
         }
-        // #465: the selection scheme is saved search state.
-        if selection_set && cfg.selection != saved.selection {
-            conflicts.push(format!(
-                "--selection {} (saved {})",
-                cfg.selection.as_str(),
-                saved.selection.as_str()
-            ));
-        }
-        // #1022: the restart rule is saved search state.
-        if restart_policy_set && cfg.restart_policy != saved.restart_policy {
-            conflicts.push(format!(
-                "--restart-policy {} (saved restart_policy is {})",
-                cfg.restart_policy.as_str(),
-                saved.restart_policy.as_str()
-            ));
-        }
-        if restart_isolation_set
-            && saved.restart_policy == crate::search::RestartPolicy::Island
-            && cfg.restart_isolation != saved.restart_isolation
-        {
-            conflicts.push(format!(
-                "--restart-isolation {} (saved restart_isolation is {})",
-                cfg.restart_isolation, saved.restart_isolation
-            ));
-        }
+        settings::conflicts(Group::Island, &cfg, &saved, &explicit, &mut conflicts); // #1083
         // #495: the band decides which finalists get the exact refit.
         if refit_band_set && !cp.refit_band_unknown && cfg.refit_band != saved.refit_band {
             conflicts.push(format!(
@@ -4167,25 +4007,7 @@ fn main() {
                 cfg.refit_band, saved.refit_band
             ));
         }
-        // #471: the node-path variation settings are saved search state.
-        {
-            if mutation_mix_set && cfg.mutation_mix != saved.mutation_mix {
-                conflicts.push(format!(
-                    "--mutation-mix {} (saved {})",
-                    cfg.mutation_mix.as_str(),
-                    saved.mutation_mix.as_str()
-                ));
-            }
-            if crossover_internal_set && cfg.crossover_internal != saved.crossover_internal {
-                conflicts.push(format!(
-                    "--crossover-internal {} (saved {})",
-                    cfg.crossover_internal, saved.crossover_internal
-                ));
-            }
-            if adaptive_mix_set && cfg.adaptive_mix != saved.adaptive_mix {
-                conflicts.push(format!("--adaptive-mix (saved adaptive_mix is {})", saved.adaptive_mix));
-            }
-        }
+        settings::conflicts(Group::Variation, &cfg, &saved, &explicit, &mut conflicts); // #1083
         // #76: front feedback is saved search state.
         if front_parents_set && cfg.front_parents != saved.front_parents {
             conflicts.push(format!(
@@ -4193,24 +4015,8 @@ fn main() {
                 saved.front_parents
             ));
         }
-        if reject_constant_set && cfg.reject_constant_offspring != saved.reject_constant_offspring {
-            conflicts.push(format!(
-                "--reject-constant-offspring (saved reject_constant_offspring is {})",
-                saved.reject_constant_offspring
-            ));
-        }
-        if reject_fixed_set && cfg.reject_fixed_position != saved.reject_fixed_position {
-            conflicts.push(format!(
-                "--reject-fixed-position (saved reject_fixed_position is {})",
-                saved.reject_fixed_position
-            ));
-        }
-        if fit_thresholds_set && cfg.fit_thresholds != saved.fit_thresholds {
-            conflicts.push(format!(
-                "--fit-thresholds (saved fit_thresholds is {})",
-                saved.fit_thresholds
-            ));
-        }
+        settings::conflicts(Group::Filter, &cfg, &saved, &explicit, &mut conflicts); // #1083
+        settings::conflicts(Group::Fit, &cfg, &saved, &explicit, &mut conflicts);
         if let Some(spec) = &op_complexity_spec {
             let mut trial = saved.clone();
             if trial.complexity_model.apply_op_costs(spec).is_ok() && trial.complexity_model != saved.complexity_model

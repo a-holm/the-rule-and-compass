@@ -90,6 +90,7 @@ pub mod resume_cost; // #923: cumulative cost of a chunked search, kept beside t
 pub mod reselect; // #928: re-select a finished front without a search
 pub mod schema;
 pub mod search;
+pub mod settings; // #1083: one table row per search setting
 pub mod selection; // #111: select on train/validation, never the test lockbox
 pub mod stability;
 pub mod store;
