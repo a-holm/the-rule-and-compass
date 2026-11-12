@@ -166,6 +166,18 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   arrive on an explore island; they are fresh random trees. On the flat postfix
   path a child that duplicates a program on any island is redrawn, which is the
   one remaining link between an explore island and the others.
+- **Migrant choice** (`--migration-policy ring|ring-tournament`, #1029, default
+  `ring`). Under `ring` every migration copies the best member of the source
+  island, so the global best reaches every island within a few migration
+  intervals. Under `ring-tournament` the migrant is the winner of a tournament
+  of 8 draws over the source island (a finite error beats a non-finite one).
+  The destination island's own generator makes the draws (a positional Philox
+  stream on the flat postfix path), so the source island's stream is untouched.
+  A source with no finite member sends nothing, and a destination that already
+  holds a member with the migrant's error bits skips the migration: under
+  `--fitness pnl` equal error means the same book. The victim, isolation and
+  explore rules are unchanged. The development log counts `migrants` and
+  `migrants_skipped` per generation.
 - **Front scope** (`--front-scope global|island`, #1070, default `global`).
   With `global` every island draws its 15 % front parents from the one Pareto
   front of all islands, a channel far stronger than the ring: a new best

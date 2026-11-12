@@ -28,7 +28,11 @@ use crate::expr::{node, Node, Op};
 use crate::genome::{postfix_hash, Philox, OP_HALT};
 use crate::gpu;
 use crate::pareto::Sol;
+use crate::search::{MigrationPolicy, MIGRANT_TOURNAMENT};
 use std::collections::HashSet;
+
+/// #1029: the counter slot of the migrant draw, past every population slot.
+const MIGRATION_SLOT: u32 = u32::MAX;
 
 /// One parsed node inside a postfix program: its word span and arity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,11 +260,53 @@ impl Arena {
     /// sees the same program the archive saw. The island policy (#1081) chooses
     /// the moves.
     pub fn migrate(&mut self, moves: &[(usize, usize)]) {
-        let bests: Vec<usize> = (0..self.islands).map(|i| self.best(i)).collect();
+        self.migrate_with(moves, MigrationPolicy::Ring, 0, 0);
+    }
+
+    /// Migration under `policy` (#1029) at generation `gen`: returns the
+    /// migrants copied and skipped. Under `ring-tournament` the migrant of a
+    /// move is the winner of `MIGRANT_TOURNAMENT` draws over island `from`,
+    /// drawn from the stream at `(seed, to, gen, MIGRATION_SLOT)`; a source
+    /// without a finite error sends nothing, and a destination that holds a
+    /// member with the migrant's error bits is skipped.
+    pub fn migrate_with(
+        &mut self,
+        moves: &[(usize, usize)],
+        policy: MigrationPolicy,
+        seed: u32,
+        gen: u32,
+    ) -> (usize, usize) {
         let worsts: Vec<usize> = (0..self.islands).map(|i| self.worst(i)).collect();
-        for &(from, to) in moves {
-            self.copy_slot(worsts[to], bests[from]);
+        let picks: Vec<Option<(usize, bool)>> = moves
+            .iter()
+            .map(|&(from, to)| match policy {
+                MigrationPolicy::Ring => Some((self.best(from), false)),
+                MigrationPolicy::RingTournament => {
+                    let base = from * self.pop;
+                    if !(base..base + self.pop).any(|i| self.err[i].is_finite()) {
+                        return None;
+                    }
+                    let mut rng = Philox::at(seed, to as u32, gen, MIGRATION_SLOT);
+                    let winner = self.tournament(from, &mut rng, MIGRANT_TOURNAMENT);
+                    let bits = self.err[winner].to_bits();
+                    let dest = to * self.pop;
+                    let held = self.err[winner].is_finite() && (dest..dest + self.pop).any(|i| self.err[i].to_bits() == bits);
+                    Some((winner, held))
+                }
+            })
+            .collect();
+        let (mut sent, mut skipped) = (0, 0);
+        for (&(_, to), pick) in moves.iter().zip(&picks) {
+            match *pick {
+                None => {}
+                Some((_, true)) => skipped += 1,
+                Some((src, false)) => {
+                    self.copy_slot(worsts[to], src);
+                    sent += 1;
+                }
+            }
         }
+        (sent, skipped)
     }
 }
 
@@ -1211,6 +1257,56 @@ mod tests {
             8,
         );
         assert_eq!(unique_slots(&a), vec![0, 2]);
+    }
+
+    fn tagged_arena(errors: &[f64], pop: usize) -> Arena {
+        let mut a = Arena::new(errors.len() / pop, pop, 8);
+        for (i, &e) in errors.iter().enumerate() {
+            a.set_slot(i, &[crate::gpu::OP_VAR, i as u32, OP_HALT]);
+            a.err[i] = e;
+        }
+        a
+    }
+
+    #[test]
+    fn ring_tournament_draws_the_flat_migrant_from_the_destination_stream() {
+        let errors: Vec<f64> = (0..24).map(|i| 1.0 + i as f64).collect();
+        let before = tagged_arena(&errors, 8);
+        let draw = |g: u32| before.tournament(1, &mut Philox::at(9, 0, g, MIGRATION_SLOT), MIGRANT_TOURNAMENT);
+        let gen = (0..200).find(|&g| draw(g) != before.best(1)).expect("a generation whose winner is not the best");
+        let mut a = tagged_arena(&errors, 8);
+        let got = a.migrate_with(&[(1, 0)], MigrationPolicy::RingTournament, 9, gen);
+        assert_eq!(got, (1, 0));
+        let mut rng = Philox::at(9, 0, gen, MIGRATION_SLOT);
+        let winner = before.tournament(1, &mut rng, MIGRANT_TOURNAMENT);
+        assert_eq!(a.slot(7), before.slot(winner), "the migrant replaces the worst of island 0");
+        assert_eq!(a.err[7], before.err[winner]);
+        assert!((8..24).all(|i| a.slot(i) == before.slot(i)), "no other island changes");
+        let mut again = tagged_arena(&errors, 8);
+        again.migrate_with(&[(1, 0)], MigrationPolicy::RingTournament, 9, gen);
+        assert_eq!(again.words, a.words, "a pure function of the position");
+    }
+
+    #[test]
+    fn a_flat_migrant_whose_error_the_destination_holds_is_skipped() {
+        let mut errors: Vec<f64> = (0..16).map(|i| if i < 8 { 100.0 + i as f64 } else { 5.0 }).collect();
+        errors[3] = 5.0;
+        let before = tagged_arena(&errors, 8);
+        let mut a = tagged_arena(&errors, 8);
+        assert_eq!(a.migrate_with(&[(1, 0)], MigrationPolicy::RingTournament, 1, 0), (0, 1));
+        assert_eq!(a.words, before.words, "the destination is unchanged");
+        errors[3] = 99.0;
+        let mut free = tagged_arena(&errors, 8);
+        assert_eq!(free.migrate_with(&[(1, 0)], MigrationPolicy::RingTournament, 1, 0), (1, 0));
+    }
+
+    #[test]
+    fn a_flat_source_without_a_finite_error_sends_nothing() {
+        let errors: Vec<f64> = (0..16).map(|i| if i < 8 { 1.0 + i as f64 } else { f64::INFINITY }).collect();
+        let before = tagged_arena(&errors, 8);
+        let mut a = tagged_arena(&errors, 8);
+        assert_eq!(a.migrate_with(&[(1, 0)], MigrationPolicy::RingTournament, 1, 0), (0, 0));
+        assert_eq!(a.words, before.words);
     }
 
     #[test]

@@ -1028,6 +1028,39 @@ fn cli_resume_of_an_island_front_checkpoint_exits_2_naming_front_scope() {
     assert!(resumed.status.success(), "a resume that omits the flag keeps the saved scope: {:?}", resumed);
 }
 
+/// #1029: the migration policy is a saved search setting.
+#[test]
+fn cli_resume_of_a_ring_tournament_checkpoint_exits_2_naming_migration_policy() {
+    let csv = TempPath::new("migrant.csv");
+    std::fs::write(&csv.0, line_csv(40)).expect("write csv");
+    let checkpoint = TempPath::new("migrant.rcsr");
+    let base = ["--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "2", "--pop", "25", "--islands", "3"];
+
+    let mut bad = base.to_vec();
+    bad.extend(["--generations", "2", "--migration-policy", "tournament"]);
+    let refused = rcsr(&bad);
+    assert_eq!(refused.status.code(), Some(2), "an unknown policy is a usage error: {:?}", refused);
+
+    let mut made_args = base.to_vec();
+    made_args.extend(["--generations", "30", "--migration-policy", "ring-tournament", "--save", checkpoint.as_str()]);
+    let made = rcsr(&made_args);
+    assert!(made.status.success(), "save run failed: {:?}", made);
+    let saved = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
+    assert!(saved.contains("config migration_policy ring-tournament\n"), "{saved}");
+
+    let mut conflict_args = base.to_vec();
+    conflict_args.extend(["--resume", checkpoint.as_str(), "--migration-policy", "ring"]);
+    let conflict = rcsr(&conflict_args);
+    assert_eq!(conflict.status.code(), Some(2), "a different migration policy is a usage error");
+    let err = String::from_utf8_lossy(&conflict.stderr);
+    assert!(err.contains("migration_policy"), "the error must name migration_policy: {}", err);
+
+    let mut resume_args = base.to_vec();
+    resume_args.extend(["--resume", checkpoint.as_str(), "--generations", "35"]);
+    let resumed = rcsr(&resume_args);
+    assert!(resumed.status.success(), "a resume that omits the flag keeps the saved policy: {:?}", resumed);
+}
+
 /// #1090: an `rcsr` run with the `island_panic` test fault (every island thread
 /// panics at the start of its generation). The fault hook exists in a `cuda`
 /// build only; the run itself stays on the CPU.

@@ -664,7 +664,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring] [--reject-fixed-position]
-     [--selection lexicographic|afp] [--restart-interval N] [--restart-policy archive|island] [--restart-isolation N] [--explore-islands K] [--front-scope global|island]
+     [--selection lexicographic|afp] [--restart-interval N] [--restart-policy archive|island] [--restart-isolation N] [--explore-islands K] [--front-scope global|island] [--migration-policy ring|ring-tournament]
      [--mutation-mix classic|extended] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
      [--patience N]
@@ -1265,7 +1265,7 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   crowding distance, a few random immigrants join each generation, and parents
   are drawn by Pareto rank. Small correct shapes and new lineages survive next
   to large approximations. Node path only; the default stays `lexicographic`;
-- **opt-in island-local restarts** (`--restart-policy island`, `--restart-isolation W`; the restart interval is `--restart-interval N`, default 60 generations, 0 for no restarts):
+- **opt-in island-local restarts** (`--restart-policy island`, `--restart-isolation W`):
   the default rule restarts an island only while its best is worse than the
   archive best, which ring migration makes false for every island within a few
   migration intervals. `island` restarts an island whose own best error has not
@@ -1276,7 +1276,7 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
 - **opt-in scheduled explore tier** (`--explore-islands K`): the highest `K`
   islands take no front parent and no `--qd-policy` parent, send and receive no
   migrant, and restart at the end of each lifetime of a Luby schedule (1, 1, 2,
-  1, 1, 2, 4, ... units of `--restart-interval`, default 60 generations, spread over the
+  1, 1, 2, 4, ... units of the 60-generation restart interval, spread over the
   explore islands), so a run holds many independent trials instead of one. The
   other islands keep the restart rule and a ring of their own and see explore
   results only through the archive. Node and flat postfix paths. Saved search
@@ -1288,6 +1288,15 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   the front of both) and a restart empties it; the reported archive stays
   global. Node and flat postfix paths; not with `--qd-policy`. Saved search
   setting; the default stays `global`;
+- **opt-in tournament migrant** (`--migration-policy ring-tournament`): the
+  migrant is the winner of a tournament of 8 draws over the source island
+  instead of its best member, drawn with the destination island's own
+  generator, so the source island's trajectory does not depend on who migrates
+  from it. A source without a finite member sends nothing, and a destination
+  that already holds a member with the migrant's error bits skips the
+  migration. The best then spreads far slower than under the default `ring`.
+  The development log counts `migrants` and `migrants_skipped`. Node and flat
+  postfix paths. Saved search setting; the default stays `ring`;
 - **opt-in quality-diversity search** (`--qd`, `--qd-cvt`, `--qd-policy`,
   `--qd-cells`, `--qd-cell-cap`): CVT-MAP-Elites over variable usage ×
   prediction skewness, with deterministic Halton initialisation, Lloyd

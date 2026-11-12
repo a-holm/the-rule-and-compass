@@ -18,7 +18,7 @@
 //! so older checkpoints still load and default checkpoints keep their bytes.
 //! `tests/settings_table.rs` checks every row in every reader.
 
-use crate::search::{Config, FrontScope, MutationMix, RestartPolicy, Selection, VariationMode};
+use crate::search::{Config, FrontScope, MigrationPolicy, MutationMix, RestartPolicy, Selection, VariationMode};
 use std::collections::BTreeMap;
 
 /// Where a row's lines appear in each reader.
@@ -164,7 +164,7 @@ macro_rules! enum_value {
     )*};
 }
 
-enum_value!(Selection, RestartPolicy, MutationMix, FrontScope, VariationMode);
+enum_value!(Selection, RestartPolicy, MutationMix, FrontScope, MigrationPolicy, VariationMode);
 
 /// How the command line sets a row.
 pub enum Cli<T> {
@@ -680,6 +680,34 @@ pub static TABLE: &[&dyn Setting] = &[
         get: |c| &c.front_scope,
         set: |c| &mut c.front_scope,
         cli: Cli::Value(FrontScope::parse),
+        write: Write::UnlessDefault,
+        active: None,
+        conflict: Conflict::SavedKey,
+    },
+    &Row::<MigrationPolicy> {
+        flag: "--migration-policy",
+        key: "migration_policy",
+        group: Group::Island,
+        schema_type: "enum",
+        schema_default: "ring",
+        schema: "#1029: ring | ring-tournament. Which member an island sends at a migration (every --migration-interval generations). ring: the best member of the next island replaces the worst member of this one, so the global best reaches every island within a few migrations. ring-tournament: the migrant is the winner of a tournament of 8 draws over the source island, drawn with the destination island's own generator (node path) or a positional Philox stream (flat postfix path), so the source island's trajectory does not depend on who migrates from it; a source without a finite member sends nothing, and a destination that already holds a member with the migrant's error bits skips the migration. The victim, the isolation and explore rules and the island fronts are unchanged. Applies to the node path and the flat postfix path. Saved search setting: written to the checkpoint only for ring-tournament, a resume refuses a different value, a checkpoint without it loads as ring. The development log carries migrants and migrants_skipped",
+        help: "  --migration-policy ring|ring-tournament
+                             which member an island sends at a migration.
+                             ring (default) sends the best member of the next
+                             island. ring-tournament sends the winner of a
+                             tournament of 8 draws over it, drawn with the
+                             destination's generator, and skips a destination
+                             that holds a member with the same error. Saved
+                             search setting (#1029)",
+        bench: Some(Bench {
+            usage: "  --migration-policy <mode> ring (default) or ring-tournament: a random good migrant,
+                            skipped when the destination holds its error (#1029)",
+            omit_unset: true,
+        }),
+        gui: false,
+        get: |c| &c.migration_policy,
+        set: |c| &mut c.migration_policy,
+        cli: Cli::Value(MigrationPolicy::parse),
         write: Write::UnlessDefault,
         active: None,
         conflict: Conflict::SavedKey,

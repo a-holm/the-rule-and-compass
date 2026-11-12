@@ -242,6 +242,8 @@ Emitted at the same boundary as `--progress`, once per completed generation
 | `restarts` | both | #1022: islands restarted at this generation's restart step (0 on every other generation; the record is reported after the step); explore islands (#1100) count too |
 | `restarts_total` | both | #1022: islands restarted since the run, or the resume, began |
 | `isolated` | full | #1022: islands inside their isolation window after this generation (`--restart-policy island`; 0 under `archive`); an explore island (#1100) is isolated by its tier and is not counted |
+| `migrants` | full | #1029: migrants copied at this generation's migration step (0 on every other generation; the record is reported after the step) |
+| `migrants_skipped` | full | #1029: migrants not copied because the destination already held a member with the migrant's error bits (`--migration-policy ring-tournament`; 0 under `ring`) |
 
 The six `phases` (excluding the two summed CPU times) are disjoint windows on
 the search's main thread and add up to `wall`. `fit_cpu` and `eval_cpu` overlap

@@ -1096,6 +1096,8 @@ mod tests {
             restarts: 0,
             restarts_total: 0,
             isolated: 0,
+            migrants: 0,
+            migrants_skipped: 0,
         }
         .json()
     }
