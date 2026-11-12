@@ -7276,12 +7276,35 @@ fn flush_dev_generation(cfg: &Config, rec: Option<crate::devlog::GenRecord>, res
     }
 }
 
-/// #1090: join every island thread of one generation.
-fn join_islands(handles: Vec<std::thread::ScopedJoinHandle<'_, ()>>, _gen: usize) -> Result<(), String> {
-    for h in handles {
-        let _ = h.join();
+/// #1090: join every island thread of one generation, then fail if any of them
+/// panicked. A panicking island leaves its population, generator and mix
+/// window half updated, so the generation must not reach the archive or a
+/// checkpoint.
+fn join_islands(handles: Vec<std::thread::ScopedJoinHandle<'_, ()>>, gen: usize) -> Result<(), String> {
+    let panics: Vec<String> = handles
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, h)| {
+            let payload = h.join().err()?;
+            Some(format!("island {i} panicked in generation {gen}: {}", panic_text(payload.as_ref())))
+        })
+        .collect();
+    if panics.is_empty() {
+        Ok(())
+    } else {
+        Err(panics.join("; "))
     }
-    Ok(())
+}
+
+/// #1090: the message of a panic payload.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        text.to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 /// Best error of one population.
