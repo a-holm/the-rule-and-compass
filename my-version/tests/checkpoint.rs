@@ -956,6 +956,41 @@ fn cli_resume_of_an_explore_checkpoint_exits_2_naming_explore_islands() {
     assert!(resumed.status.success(), "a resume that omits the flag keeps the saved tier: {:?}", resumed);
 }
 
+/// #1070: the front scope is a saved search setting, and it refuses the shared
+/// QD archive.
+#[test]
+fn cli_resume_of_an_island_front_checkpoint_exits_2_naming_front_scope() {
+    let csv = TempPath::new("front.csv");
+    std::fs::write(&csv.0, line_csv(40)).expect("write csv");
+    let checkpoint = TempPath::new("front.rcsr");
+    let base = ["--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "2", "--pop", "25", "--islands", "3"];
+
+    let mut qd = base.to_vec();
+    qd.extend(["--generations", "2", "--front-scope", "island", "--qd-policy"]);
+    let refused = rcsr(&qd);
+    assert_eq!(refused.status.code(), Some(2), "island fronts with the shared QD archive is a usage error");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("QD archive"), "{:?}", refused);
+
+    let mut made_args = base.to_vec();
+    made_args.extend(["--generations", "5", "--front-scope", "island", "--save", checkpoint.as_str()]);
+    let made = rcsr(&made_args);
+    assert!(made.status.success(), "save run failed: {:?}", made);
+    let saved = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
+    assert!(saved.contains("config front_scope island\n") && saved.contains("\nisland_front 0 "), "{saved}");
+
+    let mut conflict_args = base.to_vec();
+    conflict_args.extend(["--resume", checkpoint.as_str(), "--front-scope", "global"]);
+    let conflict = rcsr(&conflict_args);
+    assert_eq!(conflict.status.code(), Some(2), "a different front scope is a usage error");
+    let err = String::from_utf8_lossy(&conflict.stderr);
+    assert!(err.contains("front_scope"), "the error must name front_scope: {}", err);
+
+    let mut resume_args = base.to_vec();
+    resume_args.extend(["--resume", checkpoint.as_str(), "--generations", "8"]);
+    let resumed = rcsr(&resume_args);
+    assert!(resumed.status.success(), "a resume that omits the flag keeps the saved scope: {:?}", resumed);
+}
+
 /// #1090: an `rcsr` run with the `island_panic` test fault (every island thread
 /// panics at the start of its generation). The fault hook exists in a `cuda`
 /// build only; the run itself stays on the CPU.

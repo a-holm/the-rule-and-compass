@@ -296,7 +296,7 @@ impl IslandPolicy {
             rule: state.map_or(RestartRule::ArchiveStall, RestartRule::IslandStall),
             restarts_total: 0,
             explore_from: cfg.islands.max(1).saturating_sub(cfg.explore_islands),
-            fronts: (cfg.front_scope == FrontScope::Island && cfg.restart_interval == usize::MAX)
+            fronts: (cfg.front_scope == FrontScope::Island)
                 .then(|| vec![Archive::new(ISLAND_FRONT_CAP); cfg.islands.max(1)]),
         }
     }
