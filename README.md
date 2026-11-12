@@ -664,7 +664,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring] [--reject-fixed-position]
-     [--selection lexicographic|afp] [--restart-policy archive|island] [--restart-isolation N]
+     [--selection lexicographic|afp] [--restart-policy archive|island] [--restart-isolation N] [--explore-islands K] [--front-scope global|island]
      [--mutation-mix classic|extended] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
      [--patience N]
@@ -833,7 +833,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   `ablation score` then refuse any split or window that touches it (exit 3).
   Only `walkforward --locked-test` and `ladder --locked-test`, both with
   `--ledger` and `--sealed`, read it, once each; both write `--out` and `--markdown` before the
-  read is recorded and take `--verify-read` to recompute a recorded read (both refuse a verify with no recorded read before any locked row is scored; the ladder also refuses a store whose data hash differs from the recorded read or that has no read marker, and `--expect-report-sha256` needs `--verify-read`) (see
+  read is recorded and take `--verify-read` to recompute a recorded read (both refuse a verify with no recorded read, with a different window set or another setting that binds the report, and a read recorded without a binding digest or by another build line, before any locked row is scored and without printing a report hash; the ladder also refuses a store whose data hash differs from the recorded read or that has no read marker, and `--expect-report-sha256` needs `--verify-read`) (see
   [`docs/walkforward.md`](docs/walkforward.md#report-files-of-a-locked-read)); see
   [`docs/panel.md`](docs/panel.md#the-declared-locked-test).
 * `--train-select` / `--test-select` assign rows by expression (`> 0` is true)
@@ -1273,6 +1273,21 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   best) and keeps it from front parents and migrants for `W` generations
   (default 25). Node and flat postfix paths. Saved search setting; the default
   stays `archive`;
+- **opt-in scheduled explore tier** (`--explore-islands K`): the highest `K`
+  islands take no front parent and no `--qd-policy` parent, send and receive no
+  migrant, and restart at the end of each lifetime of a Luby schedule (1, 1, 2,
+  1, 1, 2, 4, ... units of the 60-generation restart interval, spread over the
+  explore islands), so a run holds many independent trials instead of one. The
+  other islands keep the restart rule and a ring of their own and see explore
+  results only through the archive. Node and flat postfix paths. Saved search
+  setting; the default stays 0;
+- **opt-in island-local fronts** (`--front-scope island`): each island draws
+  its 15 % front parents from its own error/complexity front instead of the
+  global one, so a new best no longer reaches every island in about one
+  generation. A front moves only with a migrant (the destination front becomes
+  the front of both) and a restart empties it; the reported archive stays
+  global. Node and flat postfix paths; not with `--qd-policy`. Saved search
+  setting; the default stays `global`;
 - **opt-in quality-diversity search** (`--qd`, `--qd-cvt`, `--qd-policy`,
   `--qd-cells`, `--qd-cell-cap`): CVT-MAP-Elites over variable usage ×
   prediction skewness, with deterministic Halton initialisation, Lloyd

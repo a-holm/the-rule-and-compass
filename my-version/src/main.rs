@@ -857,7 +857,9 @@ SEARCH:
                              The refits run on the CPU fallback pool beside
                              the device work (same trees as after it);
                              RCSR_FIT_TAIL_SERIAL=1 runs them after the
-                             device batch
+                             device batch; RCSR_FIT_RELEASE_WAVES=K runs the
+                             device fit as K ordered calls, so they start
+                             under the later calls (same trees)
   --fit-polish <f64|f32|off>  arithmetic of the device fit kernel's polish, the
                              undamped Gauss-Newton steps after the damped LM
                              (default f64). f64 re-baselines and steps on the
@@ -1755,7 +1757,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"carried_kept\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"tail_overlap_s\":{},\"tail_join_wait_s\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{},\"calls\":{},\"candidates\":{},\"call_s_max\":{},\"fold_count\":{},\"folded\":{},\"fallback_skipped_by_cause\":{{{}}}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"carried_kept\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"tail_overlap_s\":{},\"tail_join_wait_s\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{},\"calls\":{},\"candidates\":{},\"call_s_max\":{},\"release_waves\":{},\"tail_early_fits\":{},\"fold_count\":{},\"folded\":{},\"fallback_skipped_by_cause\":{{{}}}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1794,6 +1796,8 @@ fn gpu_json(
         g.fit_calls,
         g.fit_call_candidates,
         jnum(g.fit_call_ms_max / 1000.0),
+        g.fit_release_waves,
+        g.fit_tail_early,
         g.fit_fold_count,
         g.fit_folded,
         ops_json(&g.fit_fallback_skipped_by_cause)
@@ -3747,6 +3751,21 @@ fn main() {
              use --variation auto or node"
         );
         std::process::exit(EXIT_USAGE);
+    }
+    // #1100: a resume is checked against its saved island count by the search.
+    if resume_path.is_none() && cfg.explore_islands > 0 && cfg.explore_islands >= cfg.islands.max(1) {
+        eprintln!(
+            "error: --explore-islands {} needs at least one exploit island (--islands {})",
+            cfg.explore_islands,
+            cfg.islands.max(1)
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    if cfg.front_scope == crate::search::FrontScope::Island && cfg.qd_policy {
+        eprintln!(
+            "error: --front-scope island with --qd-policy: the QD archive is one parent pool shared by every island"
+        );
+        std::process::exit(EXIT_USAGE); // #1070
     }
     // #928: a re-selection is a resume that runs nothing.
     if reselect_path.is_some() || reselect_run_path.is_some() {
@@ -6981,7 +7000,7 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(" ");
             eprintln!(
-                "# fit: gpu-fit screened={} admitted_wide={} admitted={} gpu={} fallback={} [{}] labels=[{}] refit_candidates={} refits={} refit_s={:.3} rescore_s={:.3} fallback_s={:.3} tail_overlap_s={:.3} tail_join_wait_s={:.3} bounded={}/{} workers={}",
+                "# fit: gpu-fit screened={} admitted_wide={} admitted={} gpu={} fallback={} [{}] labels=[{}] refit_candidates={} refits={} refit_s={:.3} rescore_s={:.3} fallback_s={:.3} tail_overlap_s={:.3} tail_join_wait_s={:.3} bounded={}/{} workers={} release_waves={} early={}",
                 g.fit_screened,
                 g.fit_admitted_wide,
                 g.fit_attempts,
@@ -6998,7 +7017,9 @@ fn main() {
                 g.ledger.fit_tail_join_wait_s(),
                 g.fit_fallback_bounded,
                 g.fit_fallback_max,
-                g.fit_fallback_workers
+                g.fit_fallback_workers,
+                g.fit_release_waves,
+                g.fit_tail_early
             );
         }
     }
@@ -11119,8 +11140,10 @@ OPTIONS:
   --sealed <file>            locked_candidates.json from `rcsr protocol seal`
   --verify-read              with --locked-test (exit 2 without it): recompute a recorded
                              read, compare its report hash, write --out and --markdown,
-                             record nothing; a candidate with no recorded read is refused
-                             (exit 3) before any locked row is scored
+                             record nothing; a candidate with no recorded read, a window set or
+                             setting that differs from the recorded read, and a read stored without a
+                             binding digest are refused (exit 3) before any locked row is scored;
+                             the verify needs the same build line that recorded the read
   --allow-unbound-ledger     with --locked-test: read a candidate whose ledger
                              recorded no locked test range (old ledger); the read
                              is reported as unbound. Without it that read is
@@ -12097,13 +12120,16 @@ fn run_walkforward(args: &[String]) -> ! {
             usage_fail(&msg);
         }
     }
+    let read_binding = rcsr::protocol::walkforward_binding(&spec, &popts);
     if let Some(l) = &ledger {
         let r = (|| -> Result<u64, String> {
             l.verify_chain()?;
             if locked_test {
                 let sealed = std::path::Path::new(sealed_path.as_deref().unwrap_or(""));
                 let entry = if verify_read {
-                    l.authorize_verify(sealed, &candidate_id, &data_sha, &build_id, binding)?
+                    let entry = l.authorize_verify(sealed, &candidate_id, &data_sha, &build_id, binding)?;
+                    l.check_verify_binding(Some(&candidate_id), &read_binding)?;
+                    entry
                 } else {
                     l.authorize_read(sealed, &candidate_id, &data_sha, &build_id, binding)?
                 };
@@ -12262,7 +12288,7 @@ fn run_walkforward(args: &[String]) -> ! {
                         return Ok(());
                     }
                     l.write_read_marker(&data_path, "test_read", &report_sha)?;
-                    let count = l.record_read(&candidate_id, &report_sha, current_range.as_ref())?;
+                    let count = l.record_read_bound(&candidate_id, &report_sha, current_range.as_ref(), Some(&read_binding))?;
                     if count == read_count {
                         Ok(())
                     } else {
@@ -13213,6 +13239,9 @@ mod tests {
         g.fit_fallback_bounded = 0;
         g.fit_fallback_workers = 8;
         g.fit_fallback_max = 4096;
+        // #1075: the release schedule and the fits that started from it.
+        g.fit_release_waves = 3;
+        g.fit_tail_early = 5;
         g.fit_polish = rcsr::fit::FitPolish::F32;
         g.ledger.record_fit(0.5, 0.75, 0.125);
         g.ledger.record_fit_polish_split(0.25);
@@ -13228,7 +13257,7 @@ mod tests {
         for key in [
             "\"calls\":0",
             "\"candidates\":0",
-            "\"call_s_max\":0,\"fold_count\":7,\"folded\":6",
+            "\"call_s_max\":0,\"release_waves\":3,\"tail_early_fits\":5,\"fold_count\":7,\"folded\":6",
         ] {
             assert!(json.contains(key), "{key} in {json}");
         }

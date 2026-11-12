@@ -39,6 +39,26 @@
                              default 25 (the migration interval). Read only
                              with --restart-policy island; 0 turns the
                              isolation off. Saved search setting (#1022)
+  --explore-islands <K>      the highest K islands form an explore tier,
+                             default 0 (none). An explore island takes no
+                             front parent, no --qd-policy parent and no
+                             migrant, sends no migrant, and restarts at the
+                             end of each lifetime of a Luby schedule in
+                             units of the restart interval (60
+                             generations). The other islands keep
+                             --restart-policy and a ring of their own;
+                             explore results reach them through the
+                             archive only. K must be below --islands.
+                             Saved search setting (#1100)
+  --front-scope global|island
+                             where front parents come from. global
+                             (default) draws them from the Pareto front of
+                             every island. island gives each island its own
+                             error/complexity front; a front moves only
+                             with a migrant (the destination front becomes
+                             the front of both) and a restart empties it.
+                             The reported archive stays global. Not with
+                             --qd-policy. Saved search setting (#1070)
   --mutation-mix <M>         node-path edit weights: classic (point .25, terminal
                              .35, subtree .40; default) or extended (adds insert,
                              delete, swap and rotate). Not with --variation

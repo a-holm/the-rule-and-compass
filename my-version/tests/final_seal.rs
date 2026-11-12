@@ -1077,3 +1077,112 @@ fn locked_read_refuses_expect_hash_without_verify() {
 fn vote_locked_read_refuses_expect_hash_without_verify() {
     expect_hash_without_verify_is_refused("vote-expect-no-verify", &VOTE_MEMBERS, &vote_flags("0.67", &[]));
 }
+
+/// A verify with another window set or another report setting is refused before
+/// any locked row is scored: no report hash is printed and nothing is written.
+fn verify_with_other_inputs_scores_nothing(name: &str, members: &[&str], flags: &[&str], setting: &[&str]) {
+    let (_s, data, l, sealed) = sealed_book(name, 400, members, flags);
+    let (code, _, err) = read(&data, &l, &sealed, members, flags);
+    assert_eq!(code, 0, "{}", err);
+    let sha = recorded_read_sha(&l);
+    let (ledger_before, marker_before) = (std::fs::read(&l).unwrap(), std::fs::read(marker_of(&data)).unwrap());
+    let other = window("locked", 0, 250, 310, 400);
+    let unscorable = window("locked", 0, 3, 300, 400);
+    let mut cases: Vec<Vec<&str>> = vec![
+        vec!["--window", other.as_str()],
+        vec!["--window", unscorable.as_str()],
+    ];
+    if !setting.is_empty() {
+        cases.push(setting.to_vec());
+    }
+    for case in cases {
+        let default_window = window("locked", 0, 250, 300, 400);
+        for hash in [None, Some(sha.as_str())] {
+            let mut a = vec!["--locked-test", "--sealed", sealed.as_str(), "--verify-read"];
+            if let Some(h) = hash {
+                a.extend_from_slice(&["--expect-report-sha256", h]);
+            }
+            if !case.contains(&"--window") {
+                a.extend_from_slice(&["--window", default_window.as_str()]);
+            }
+            a.extend_from_slice(&case);
+            a.extend_from_slice(flags);
+            let (code, out, err) = wf(&data, &l, members, &a);
+            assert_eq!(code, 3, "{:?}: {}{}", case, out, err);
+            assert!(err.contains("binds the report"), "{:?}: {}", case, err);
+            assert!(!err.contains("report sha256") && !out.contains("report_sha256"), "{:?}: {}{}", case, out, err);
+            assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+            assert_eq!(std::fs::read(marker_of(&data)).unwrap(), marker_before);
+        }
+    }
+    let mut verify = flags.to_vec();
+    verify.extend_from_slice(&["--verify-read", "--expect-report-sha256", sha.as_str()]);
+    let (code, _, err) = read(&data, &l, &sealed, members, &verify);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+}
+
+#[test]
+fn verify_read_with_other_windows_scores_nothing() {
+    verify_with_other_inputs_scores_nothing("verify-windows", &["x"], &[], &["--bootstrap", "20"]);
+}
+
+#[test]
+fn vote_verify_read_with_other_windows_scores_nothing() {
+    verify_with_other_inputs_scores_nothing("vote-verify-windows", &VOTE_MEMBERS, &vote_flags("0.67", &[]), &[]);
+}
+
+/// A read written without a binding digest cannot be compared, so verify refuses it.
+#[test]
+fn verify_read_of_a_read_without_a_binding_digest_is_refused() {
+    let (_s, data, l, sealed) = sealed_book("verify-old-read", 400, &["x"], &[]);
+    let text = std::fs::read_to_string(&l).unwrap();
+    let id = text.split("\"id\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    rcsr::protocol::Ledger::new(&l).record_read(&id, &"a".repeat(64), None).unwrap();
+    let ledger_before = std::fs::read(&l).unwrap();
+    let (code, out, err) = read(&data, &l, &sealed, &["x"], &["--verify-read"]);
+    assert_eq!(code, 3, "{}{}", out, err);
+    assert!(err.contains("stores no binding digest"), "{}", err);
+    assert!(!err.contains("report sha256") && !out.contains("report_sha256"), "{}{}", out, err);
+    assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+    assert!(!Path::new(&marker_of(&data)).exists());
+}
+
+#[test]
+fn verify_read_with_gpu_scores_nothing() {
+    verify_with_other_inputs_scores_nothing("verify-gpu", &["x"], &[], &["--gpu"]);
+}
+
+const FRONT_RUN: &str = r#"{"tool":"rcsr","variables":["x"],"target_spec":{"return_column":"y"},
+    "search":{"candidates_evaluated":4321},
+    "split":{"train_time":[0,100],"validation_time":[101,200],"required_purge_seconds":3600,"purge_seconds":3600},
+    "objective":{"spec":{"threshold":0,"per_side_bps":5}},
+    "pareto":[{"expression":"x","expression_exact":"x"}]}"#;
+
+/// The `--front` path is not part of the report hash, so another spelling of
+/// the same file verifies; a changed file is another run and is refused.
+#[test]
+fn verify_read_accepts_another_spelling_of_the_front_path() {
+    let (_scratch, dir) = scratch("verify-front");
+    let data = store(&dir, "d.csv");
+    let run = s(&dir.join("run.json"));
+    std::fs::write(&run, FRONT_RUN).unwrap();
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+    let dev_w = window("dev", 0, 150, 160, 250);
+    let (code, _, err) = wf(&data, &l, &[], &["--window", dev_w.as_str(), "--front", run.as_str(), "--validation-frac", "0.2"]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let w = window("locked", 0, 250, 300, 400);
+    let go = |front: &str, extra: &[&str]| {
+        let mut a = vec!["--locked-test", "--sealed", sealed.as_str(), "--window", w.as_str(), "--front", front, "--validation-frac", "0.2"];
+        a.extend_from_slice(extra);
+        wf(&data, &l, &[], &a)
+    };
+    let (code, _, err) = go(&run, &[]);
+    assert_eq!(code, 0, "{}", err);
+    let sha = recorded_read_sha(&l);
+    let spelled = format!("{}/./run.json", s(&dir));
+    let (code, _, err) = go(&spelled, &["--verify-read", "--expect-report-sha256", &sha]);
+    assert_eq!(code, 0, "{}", err);
+}

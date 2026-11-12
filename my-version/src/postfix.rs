@@ -530,6 +530,19 @@ impl Variation {
         front: &FrontParents,
         front_p: &[f64],
     ) -> Arena {
+        self.next_generation_with_fronts(parents, gen, restart, &vec![front; parents.islands], front_p)
+    }
+
+    /// #1070: [`Variation::next_generation_with_front`] with one front per
+    /// island: island `i` draws its front parents from `fronts[i]`.
+    pub fn next_generation_with_fronts(
+        &self,
+        parents: &Arena,
+        gen: u32,
+        restart: &[bool],
+        fronts: &[&FrontParents],
+        front_p: &[f64],
+    ) -> Arena {
         let mut attempts = 0usize;
         let mut scratch = Scratch::new(self.width);
         let mut next = Arena::new(parents.islands, parents.pop, self.width);
@@ -561,7 +574,7 @@ impl Variation {
                     gen,
                     &mut attempts,
                     &mut scratch,
-                    front,
+                    fronts[i],
                     front_p.get(i).copied().unwrap_or(0.0),
                 );
             }
@@ -1257,5 +1270,38 @@ mod tests {
         let island1 = |a: &Arena| (0..24).map(|j| a.slot(a.slot_index(1, j)).to_vec()).collect::<Vec<_>>();
         assert_eq!(island0(&mixed), island0(&off), "the isolated island is the off path");
         assert_ne!(island1(&mixed), island1(&off), "the open island takes front parents");
+    }
+
+    #[test]
+    fn per_island_fronts_reproduce_the_shared_front_and_stay_local() {
+        let v = Variation::new(64, 2, 30, 1, &Op::default_set(), 3, true).unwrap();
+        let mut parents = Arena::new(2, 24, 64);
+        let mut rng = Philox::at(9, 0, 0, 0);
+        for i in 0..parents.islands * parents.pop {
+            let mut p = v.random_program(&mut rng, 3);
+            while spans(&p).is_none() {
+                p = v.random_program(&mut rng, 3);
+            }
+            parents.set_slot(i, &p);
+            parents.err[i] = ((i * 37) % 101) as f64 / 101.0;
+        }
+        let front = FrontParents::from_front(
+            &[solution(node(Op::Add, vec![input(0), constant(7.0)]), 0.25, 3.0)],
+            64,
+            30,
+        );
+        let other = FrontParents::from_front(
+            &[solution(node(Op::Mul, vec![input(1), constant(3.0)]), 0.3, 3.0)],
+            64,
+            30,
+        );
+        let shared = v.next_generation_with_front(&parents, 5, &[false; 2], &front, &[0.5; 2]);
+        let same = v.next_generation_with_fronts(&parents, 5, &[false; 2], &[&front, &front], &[0.5; 2]);
+        assert_eq!(shared.words, same.words, "one front per island equals the shared front");
+        assert_eq!(shared.hash, same.hash);
+        let split = v.next_generation_with_fronts(&parents, 5, &[false; 2], &[&front, &other], &[0.5; 2]);
+        let island = |a: &Arena, i: usize| (0..24).map(|j| a.slot(a.slot_index(i, j)).to_vec()).collect::<Vec<_>>();
+        assert_eq!(island(&split, 0), island(&shared, 0), "island 0 keeps its own front");
+        assert_ne!(island(&split, 1), island(&shared, 1), "island 1 draws from its own front");
     }
 }

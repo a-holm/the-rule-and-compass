@@ -7,15 +7,27 @@
 //! No decision draws from an RNG. A restart draws its trees from the
 //! population adapter's own generator, so the node path keeps its `Mt` stream
 //! per island and the flat path its positional `Philox` draws.
+//!
+//! #1100: with `--explore-islands K` the highest `K` islands form an explore
+//! tier. They take no front parent and no `--qd-policy` parent, send and
+//! receive no migrant, and restart at the end of each lifetime of a Luby
+//! schedule that depends on the generation alone. The other islands (the
+//! exploit tier) keep the restart rule and a ring of their own; explore
+//! results reach them only through the archive.
+//!
+//! #1070: with `--front-scope island` each island draws its front parents from
+//! its own error/complexity front instead of the global one. A front travels
+//! only along a migration move, where the destination front becomes the
+//! canonical front of both; a restart empties the island's front.
 
 use super::{
-    afp_worst, defers_fit_to_gpu, draw_row_dependent, fit_constants, population_best, Config, EvalSample, Ind,
-    RestartPolicy, Selection, FRONT_PARENT_P,
+    afp_worst, canonical_front, defers_fit_to_gpu, draw_row_dependent, fit_constants, population_best, Config,
+    EvalSample, FrontScope, Ind, RestartPolicy, Selection, FRONT_PARENT_P,
 };
 use crate::checkpoint::IslandStall;
 use crate::data::Sample;
 use crate::expr::{self, random_tree_with, AggTable, Node};
-use crate::pareto::Sol;
+use crate::pareto::{Archive, Sol};
 #[cfg(feature = "cuda")]
 use crate::postfix::{Arena, Variation};
 use crate::qd::{self, QdArchive};
@@ -46,6 +58,14 @@ pub(crate) trait IslandBests {
     /// The island's lowest error. A `NaN` (an unscored member) is skipped; an
     /// island without a non-`NaN` error gives `+inf`.
     fn best_error(&self, island: usize) -> f64;
+}
+
+/// #1070: the members of a population adapter, for the island fronts.
+pub(crate) trait IslandMembers: IslandBests {
+    /// Offer every member of `island` to `front`, in population order, as the
+    /// global archive update does. `keep` decides whether a tree the front
+    /// admits may enter (#848).
+    fn offer(&self, island: usize, front: &mut Archive, keep: &dyn Fn(&Node) -> bool);
 }
 
 /// Write side of a population adapter.
@@ -167,12 +187,50 @@ fn due(interval: usize, gen: usize) -> bool {
     interval > 0 && (gen + 1) % interval == 0
 }
 
+/// #1100: the `n`-th term (`n >= 1`) of the Luby sequence 1, 1, 2, 1, 1, 2,
+/// 4, ... (Luby, Sinclair and Zuckerman 1993).
+fn luby(mut n: u64) -> u64 {
+    loop {
+        let mut k = 1;
+        while (1u64 << k) - 1 < n {
+            k += 1;
+        }
+        if n == (1u64 << k) - 1 {
+            return 1u64 << (k - 1);
+        }
+        n -= (1u64 << (k - 1)) - 1;
+    }
+}
+
+/// #1100: the explore slots (`0..k`) whose lifetime ends after `units`
+/// lifetime units. One Luby sequence is list-scheduled onto the slots: each
+/// next term goes to the slot with the least accumulated length, ties to the
+/// lowest slot (Cire, Kadioglu and Sellmann 2014). Every slot starts its first
+/// lifetime at unit 0.
+fn explore_restarts(k: usize, units: u64) -> Vec<usize> {
+    if k == 0 || units == 0 {
+        return Vec::new();
+    }
+    let mut ends = vec![0u64; k];
+    let mut n = 0;
+    loop {
+        let slot = (0..k).min_by_key(|&s| (ends[s], s)).expect("k > 0");
+        if ends[slot] >= units {
+            break;
+        }
+        n += 1;
+        ends[slot] += luby(n);
+    }
+    (0..k).filter(|&s| ends[s] == units).collect()
+}
+
 /// The island policy of one run: parent sources at the start of a generation,
 /// the stall update after the archive update, and the migration and restart
 /// decisions at the generation barrier.
 ///
-/// Call order per generation: [`IslandPolicy::parent_source`] for each island,
-/// then [`IslandPolicy::observe`] after the archive update, then
+/// Call order per generation: [`IslandPolicy::parent_source`] and
+/// [`IslandPolicy::front`] for each island, then [`IslandPolicy::offer`] and
+/// [`IslandPolicy::observe`] after the archive update, then
 /// [`IslandPolicy::barrier`]. A run that stops early skips the barrier of its
 /// last generation, never the observation.
 #[derive(Clone, Debug)]
@@ -187,7 +245,16 @@ pub(crate) struct IslandPolicy {
     rule: RestartRule,
     /// Restarts since this process started the run (not saved).
     restarts_total: u64,
+    /// #1100: islands `explore_from..` form the explore tier.
+    explore_from: usize,
+    /// #1070: one front per island under `--front-scope island`. Saved in the
+    /// checkpoint as `island_front` records.
+    fronts: Option<Vec<Archive>>,
 }
+
+/// #1070: the cap of an island front, the cap of the global archive of
+/// `run_search`.
+const ISLAND_FRONT_CAP: usize = 4000;
 
 impl IslandPolicy {
     pub(crate) fn new(cfg: &Config) -> Self {
@@ -196,15 +263,27 @@ impl IslandPolicy {
         IslandPolicy::with_state(cfg, vec![0; islands], state)
     }
 
-    /// The policy of a resumed run: the saved archive-stall checks and, under
-    /// `--restart-policy island`, the saved `island_stall` records.
-    pub(crate) fn resume(cfg: &Config, stagnant: Vec<usize>, stalls: &[Option<IslandStall>]) -> Result<Self, String> {
+    /// The policy of a resumed run: the saved archive-stall checks, under
+    /// `--restart-policy island` the saved `island_stall` records, and under
+    /// `--front-scope island` the saved members of each island front.
+    pub(crate) fn resume(
+        cfg: &Config,
+        stagnant: Vec<usize>,
+        stalls: &[Option<IslandStall>],
+        fronts: Vec<Vec<Sol>>,
+    ) -> Result<Self, String> {
         let state = if cfg.restart_policy == RestartPolicy::Island {
             Some(RestartState::from_saved(stalls)?)
         } else {
             None
         };
-        Ok(IslandPolicy::with_state(cfg, stagnant, state))
+        let mut policy = IslandPolicy::with_state(cfg, stagnant, state);
+        if let Some(own) = policy.fronts.as_mut() {
+            for (front, items) in own.iter_mut().zip(fronts) {
+                front.items = items;
+            }
+        }
+        Ok(policy)
     }
 
     fn with_state(cfg: &Config, stagnant: Vec<usize>, state: Option<RestartState>) -> Self {
@@ -216,19 +295,69 @@ impl IslandPolicy {
             stagnant,
             rule: state.map_or(RestartRule::ArchiveStall, RestartRule::IslandStall),
             restarts_total: 0,
+            explore_from: cfg.islands.max(1).saturating_sub(cfg.explore_islands),
+            fronts: (cfg.front_scope == FrontScope::Island)
+                .then(|| vec![Archive::new(ISLAND_FRONT_CAP); cfg.islands.max(1)]),
         }
+    }
+
+    /// #1070: the front `island` draws its front parents from this generation:
+    /// its own under `--front-scope island`, else `global`.
+    pub(crate) fn front<'a>(&'a self, island: usize, global: &'a [Sol]) -> &'a [Sol] {
+        match &self.fronts {
+            Some(fronts) => &fronts[island].items,
+            None => global,
+        }
+    }
+
+    /// #1070: the island front for the checkpoint; empty under
+    /// `--front-scope global`.
+    pub(crate) fn island_front(&self, island: usize) -> &[Sol] {
+        self.fronts.as_ref().map_or(&[], |fronts| &fronts[island].items)
+    }
+
+    /// #1070: offer every member of every island to its own front, after the
+    /// archive update. Nothing happens under `--front-scope global`.
+    pub(crate) fn offer(&mut self, population: &(impl IslandMembers + ?Sized), keep: &dyn Fn(&Node) -> bool) {
+        if let Some(fronts) = self.fronts.as_mut() {
+            for (island, front) in fronts.iter_mut().enumerate().take(population.island_count()) {
+                population.offer(island, front, keep);
+            }
+        }
+    }
+
+    /// #1070: each move's destination front becomes the canonical front of
+    /// its own and the source's members, both read before the first change.
+    fn exchange_fronts(&mut self, moves: &[Move]) {
+        if let Some(fronts) = self.fronts.as_mut() {
+            let before = fronts.clone();
+            for &Move { from, to } in moves {
+                let union: Vec<Sol> = before[to].items.iter().chain(&before[from].items).cloned().collect();
+                fronts[to] = canonical_front(before[to].cap, union);
+            }
+        }
+    }
+
+    /// #1100: whether `island` belongs to the explore tier.
+    fn explores(&self, island: usize) -> bool {
+        island >= self.explore_from
     }
 
     fn isolated(&self, island: usize) -> bool {
-        match &self.rule {
-            RestartRule::ArchiveStall => false,
-            RestartRule::IslandStall(s) => s.is_isolated(island),
-        }
+        self.explores(island)
+            || match &self.rule {
+                RestartRule::ArchiveStall => false,
+                RestartRule::IslandStall(s) => s.is_isolated(island),
+            }
     }
 
     /// Where `island` draws its parents this generation. An isolated island
-    /// breeds from its own members only (#1022, #1067).
+    /// and an explore island breed from their own members only (#1022, #1067,
+    /// #1100).
     pub(crate) fn parent_source(&self, island: usize) -> ParentSource {
+        if self.explores(island) {
+            return ParentSource { front_p: 0.0, shared: false };
+        }
         match &self.rule {
             RestartRule::ArchiveStall => ParentSource { front_p: self.front_p, shared: true },
             RestartRule::IslandStall(s) => ParentSource {
@@ -253,52 +382,75 @@ impl IslandPolicy {
     pub(crate) fn barrier(&mut self, gen: usize, archive: &[Sol], population: &mut impl IslandPopulation) -> Vec<usize> {
         let islands = population.island_count();
         if islands > 1 && due(self.migration_interval, gen) {
-            population.migrate(&self.ring(islands));
+            let moves = self.ring(islands);
+            self.exchange_fronts(&moves);
+            population.migrate(&moves);
         }
         if !due(self.restart_interval, gen) {
             return Vec::new();
         }
         let archive_best = archive.iter().map(|s| s.error).fold(f64::INFINITY, f64::min);
         let bests: Vec<f64> = (0..islands).map(|i| population.best_error(i)).collect();
-        let restarts = self.restart_set(&bests, archive_best);
+        let restarts = self.restart_set(gen, &bests, archive_best);
         for &island in &restarts {
             population.restart(island);
+            if let Some(fronts) = self.fronts.as_mut() {
+                fronts[island].items.clear();
+            }
         }
         restarts
     }
 
-    /// The directed ring: every island that is not isolated receives the best
-    /// member of the next island.
+    /// The directed ring of the exploit tier: every exploit island that is not
+    /// isolated receives the best member of the next exploit island.
     fn ring(&self, islands: usize) -> Vec<Move> {
-        (0..islands)
+        let exploit = islands.min(self.explore_from);
+        if exploit < 2 {
+            return Vec::new();
+        }
+        (0..exploit)
             .filter(|&to| !self.isolated(to))
-            .map(|to| Move { from: (to + 1) % islands, to })
+            .map(|to| Move { from: (to + 1) % exploit, to })
             .collect()
     }
 
-    /// The islands to restart, in island order, with their counters updated.
-    fn restart_set(&mut self, bests: &[f64], archive_best: f64) -> Vec<usize> {
+    /// The islands to restart at the restart check of generation `gen`, in
+    /// island order, with their counters updated. An explore island restarts
+    /// exactly at the end of its lifetime; the restart rule decides the rest.
+    fn restart_set(&mut self, gen: usize, bests: &[f64], archive_best: f64) -> Vec<usize> {
         let keeper = match &self.rule {
             RestartRule::ArchiveStall => None,
             RestartRule::IslandStall(_) => RestartState::keeper(bests, archive_best),
         };
+        let explore_from = self.explore_from.min(bests.len());
+        let units = ((gen + 1) / self.restart_interval.max(1)) as u64;
+        let lifetime_ends: Vec<usize> =
+            explore_restarts(bests.len() - explore_from, units).into_iter().map(|slot| explore_from + slot).collect();
         let mut set = Vec::new();
         for (island, &best) in bests.iter().enumerate() {
-            let restart = match &self.rule {
-                RestartRule::IslandStall(s) => s.due(island, keeper, self.restart_interval),
-                RestartRule::ArchiveStall => {
-                    if best > archive_best + 1e-9 {
-                        self.stagnant[island] += 1;
-                    } else {
-                        self.stagnant[island] = 0;
+            let explore = self.explores(island);
+            let restart = if explore {
+                lifetime_ends.contains(&island)
+            } else {
+                match &self.rule {
+                    RestartRule::IslandStall(s) => s.due(island, keeper, self.restart_interval),
+                    RestartRule::ArchiveStall => {
+                        if best > archive_best + 1e-9 {
+                            self.stagnant[island] += 1;
+                        } else {
+                            self.stagnant[island] = 0;
+                        }
+                        self.stagnant[island] >= 2
                     }
-                    self.stagnant[island] >= 2
                 }
             };
             if restart {
                 self.stagnant[island] = 0;
+                // #1100: an explore island is isolated by its tier, not by a
+                // window, so `isolated` keeps counting exploit windows only.
+                let window = if explore { 0 } else { self.isolation };
                 if let RestartRule::IslandStall(s) = &mut self.rule {
-                    s.restarted(island, self.isolation);
+                    s.restarted(island, window);
                 }
                 self.restarts_total += 1;
                 set.push(island);
@@ -340,6 +492,17 @@ impl IslandBests for [Vec<Ind>] {
 
     fn best_error(&self, island: usize) -> f64 {
         population_best(&self[island])
+    }
+}
+
+impl IslandMembers for [Vec<Ind>] {
+    fn offer(&self, island: usize, front: &mut Archive, keep: &dyn Fn(&Node) -> bool) {
+        for ind in &self[island] {
+            if front.admits(ind.error, ind.complexity) && !keep(&ind.tree) {
+                continue;
+            }
+            front.try_insert_view(&ind.tree, ind.error, expr::complexity(&ind.tree), ind.complexity);
+        }
     }
 }
 
@@ -506,6 +669,23 @@ impl IslandBests for Arena {
     }
 }
 
+#[cfg(feature = "cuda")]
+impl IslandMembers for Arena {
+    fn offer(&self, island: usize, front: &mut Archive, keep: &dyn Fn(&Node) -> bool) {
+        for j in 0..self.pop {
+            let idx = self.slot_index(island, j);
+            let (error, cost) = (self.err[idx], self.cost[idx] as f64);
+            if !front.admits(error, cost) {
+                continue;
+            }
+            let Some(tree) = self.decode(idx) else { continue };
+            if keep(&tree) {
+                front.try_insert_view(&tree, error, expr::complexity(&tree), cost);
+            }
+        }
+    }
+}
+
 /// The flat postfix population of `run_postfix_search` in generation `gen`.
 #[cfg(feature = "cuda")]
 pub(super) struct ArenaIslands<'a> {
@@ -567,6 +747,46 @@ mod tests {
     }
 
     impl IslandPopulation for Bests {
+        fn migrate(&mut self, moves: &[Move]) {
+            self.moves.extend_from_slice(moves);
+        }
+
+        fn restart(&mut self, island: usize) {
+            self.restarts.push(island);
+        }
+    }
+
+    /// Scored island members for the island-front tests; records moves and
+    /// restarts like [`Bests`].
+    #[derive(Default)]
+    struct Members {
+        islands: Vec<Vec<Sol>>,
+        moves: Vec<Move>,
+        restarts: Vec<usize>,
+    }
+
+    impl IslandBests for Members {
+        fn island_count(&self) -> usize {
+            self.islands.len()
+        }
+
+        fn best_error(&self, island: usize) -> f64 {
+            self.islands[island].iter().map(|s| s.error).fold(f64::INFINITY, f64::min)
+        }
+    }
+
+    impl IslandMembers for Members {
+        fn offer(&self, island: usize, front: &mut Archive, keep: &dyn Fn(&Node) -> bool) {
+            for s in &self.islands[island] {
+                if front.admits(s.error, s.cost) && !keep(&s.tree) {
+                    continue;
+                }
+                front.try_insert_view(&s.tree, s.error, expr::complexity(&s.tree), s.cost);
+            }
+        }
+    }
+
+    impl IslandPopulation for Members {
         fn migrate(&mut self, moves: &[Move]) {
             self.moves.extend_from_slice(moves);
         }
@@ -658,6 +878,176 @@ mod tests {
             let cfg = Config { front_parents: false, ..policy_cfg(2, rule, 25, 60, 25) };
             let policy = IslandPolicy::new(&cfg);
             assert_eq!(policy.parent_source(1), ParentSource { front_p: 0.0, shared: true }, "{rule:?}");
+        }
+    }
+
+    #[test]
+    fn the_luby_list_schedule_is_pinned() {
+        let terms: Vec<u64> = (1..=31).map(luby).collect();
+        assert_eq!(terms, [1, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8, 1, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8, 16]);
+        let mut class = [0u64; 7];
+        for n in 1..=63 {
+            class[luby(n).trailing_zeros() as usize] += luby(n);
+        }
+        assert_eq!(class, [32, 32, 32, 32, 32, 32, 0], "every length class gets the same compute");
+
+        let ends = |k: usize, upto: u64| -> Vec<Vec<u64>> {
+            let mut out = vec![Vec::new(); k];
+            for units in 1..=upto {
+                for slot in explore_restarts(k, units) {
+                    out[slot].push(units);
+                }
+            }
+            out
+        };
+        let prefix: Vec<u64> = (1..=15).map(luby).scan(0, |s, t| {
+            *s += t;
+            Some(*s)
+        }).collect();
+        assert_eq!(ends(1, 32), [prefix], "one slot runs the sequence itself");
+        let six = ends(6, 7);
+        let want: [&[u64]; 6] = [&[1, 5, 7], &[1, 2, 3], &[2, 3, 4, 6, 7], &[1, 2, 4, 5], &[1, 3, 4, 5, 6], &[2, 6, 7]];
+        for (slot, want) in want.iter().enumerate() {
+            assert_eq!(six[slot], *want, "slot {slot}");
+        }
+        assert_eq!(ends(6, 11)[1], [1, 2, 3, 11], "slot 1 then runs 8 units");
+        assert_eq!(ends(6, 9)[3], [1, 2, 4, 5, 9]);
+        assert!(explore_restarts(0, 5).is_empty() && explore_restarts(3, 0).is_empty());
+    }
+
+    #[test]
+    fn an_explore_island_takes_no_front_parent_and_exchanges_no_migrant() {
+        let (n, k, unit) = (5usize, 2usize, 2usize);
+        for rule in [RestartPolicy::Archive, RestartPolicy::Island] {
+            let cfg = Config { explore_islands: k, ..policy_cfg(n, rule, 1, unit, 3) };
+            let mut policy = IslandPolicy::new(&cfg);
+            // Island 0 holds the archive best; the others stall at worse errors.
+            let mut pop = Bests { best: vec![0.1, 0.5, 0.7, 0.9, 0.3], ..Default::default() };
+            let archive = [sol(0.1)];
+            let mut explore_seen = 0;
+            for gen in 0..48 {
+                for island in n - k..n {
+                    assert_eq!(policy.parent_source(island), ISOLATED, "{rule:?} generation {gen} island {island}");
+                }
+                policy.observe(&pop);
+                pop.moves.clear();
+                let restarts = policy.barrier(gen, &archive, &mut pop);
+                let ring = [Move { from: 1, to: 0 }, Move { from: 2, to: 1 }, Move { from: 0, to: 2 }];
+                assert!(pop.moves.iter().all(|m| ring.contains(m)), "{rule:?} generation {gen}: {:?}", pop.moves);
+                if gen == 0 {
+                    assert_eq!(pop.moves, ring, "{rule:?}: the exploit ring");
+                }
+                let want: Vec<usize> = if (gen + 1) % unit == 0 {
+                    explore_restarts(k, ((gen + 1) / unit) as u64).into_iter().map(|s| n - k + s).collect()
+                } else {
+                    Vec::new()
+                };
+                let got: Vec<usize> = restarts.iter().copied().filter(|&i| i >= n - k).collect();
+                assert_eq!(got, want, "{rule:?} generation {gen}: explore restarts");
+                explore_seen += got.len();
+                assert_eq!(&policy.stagnant()[n - k..], &[0, 0], "{rule:?} generation {gen}");
+            }
+            assert!(explore_seen >= 10, "{rule:?}: {explore_seen} explore restarts");
+            assert!(pop.restarts.iter().any(|&i| i < n - k), "{rule:?}: the exploit rule still restarts");
+        }
+    }
+
+    #[test]
+    fn one_exploit_island_has_no_migration() {
+        let cfg = Config { explore_islands: 2, ..policy_cfg(3, RestartPolicy::Archive, 1, 1, 0) };
+        let mut policy = IslandPolicy::new(&cfg);
+        let mut pop = Bests { best: vec![0.2, 0.1, 0.3], ..Default::default() };
+        for gen in 0..12 {
+            policy.observe(&pop);
+            policy.barrier(gen, &[sol(0.1)], &mut pop);
+        }
+        assert!(pop.moves.is_empty(), "{:?}", pop.moves);
+        assert_eq!(policy.parent_source(0), OPEN);
+        assert!(pop.restarts.contains(&1) && pop.restarts.contains(&2));
+    }
+
+    /// Member `k` of `island`: `x0` plus `k` constants unique to the island.
+    fn member(island: usize, k: usize, error: f64) -> Sol {
+        let mut tree = input(0);
+        for j in 0..k {
+            tree = node(Op::Add, vec![tree, constant((island * 100 + j) as f64 + 0.5)]);
+        }
+        let complexity = expr::complexity(&tree);
+        Sol { tree, error, complexity, cost: complexity as f64 }
+    }
+
+    fn front_view(front: &[Sol]) -> Vec<(u64, u64, usize)> {
+        front.iter().map(|s| (expr::structural_hash(&s.tree), s.error.to_bits(), s.complexity)).collect()
+    }
+
+    #[test]
+    fn island_fronts_follow_the_migration_moves() {
+        let cfg = Config { front_scope: FrontScope::Island, explore_islands: 1, ..policy_cfg(4, RestartPolicy::Archive, 2, 3, 0) };
+        let global = [sol(0.0)];
+        let mut pop = Members {
+            islands: (0..4).map(|i| (0..3).map(|k| member(i, k, 1.0 / (k + 1) as f64 + 0.01 * i as f64)).collect()).collect(),
+            ..Default::default()
+        };
+        let mut blocked = IslandPolicy::new(&cfg);
+        blocked.offer(&pop, &|_| false);
+        assert!((0..4).all(|i| blocked.island_front(i).is_empty()), "a tree the filter refuses never enters");
+
+        let mut policy = IslandPolicy::new(&cfg);
+        let ring = [Move { from: 1, to: 0 }, Move { from: 2, to: 1 }, Move { from: 0, to: 2 }];
+        let (mut exchanges, mut emptied) = (0, 0);
+        for gen in 0..12 {
+            for (i, island) in pop.islands.iter_mut().enumerate() {
+                island.push(member(i, 3 + gen, 0.3 / (gen + 2) as f64 + 0.01 * i as f64));
+            }
+            let before: Vec<Vec<Sol>> = (0..4).map(|i| policy.island_front(i).to_vec()).collect();
+            policy.offer(&pop, &|_| true);
+            for i in 0..4 {
+                let own: std::collections::HashSet<u64> =
+                    pop.islands[i].iter().chain(&before[i]).map(|s| expr::structural_hash(&s.tree)).collect();
+                let front = policy.island_front(i);
+                assert!(!front.is_empty(), "generation {gen}: island {i}");
+                assert!(front.iter().all(|s| own.contains(&expr::structural_hash(&s.tree))), "generation {gen}: island {i} took foreign material");
+                assert_eq!(policy.front(i, &global).as_ptr(), front.as_ptr(), "island {i} draws from its own front");
+            }
+            let offered: Vec<Vec<Sol>> = (0..4).map(|i| policy.island_front(i).to_vec()).collect();
+            policy.observe(&pop);
+            pop.moves.clear();
+            pop.restarts.clear();
+            policy.barrier(gen, &global, &mut pop);
+            let moved: Vec<usize> = pop.moves.iter().map(|m| m.to).collect();
+            if (gen + 1) % 2 == 0 {
+                assert_eq!(pop.moves, ring, "generation {gen}: the explore island takes no front");
+                exchanges += 1;
+            } else {
+                assert!(pop.moves.is_empty());
+            }
+            for i in 0..4 {
+                let got = front_view(policy.island_front(i));
+                if pop.restarts.contains(&i) {
+                    assert!(got.is_empty(), "generation {gen}: a restart empties island {i}'s front");
+                    emptied += 1;
+                } else if let Some(m) = pop.moves.iter().find(|m| m.to == i) {
+                    let union: Vec<Sol> = offered[m.to].iter().chain(&offered[m.from]).cloned().collect();
+                    assert_eq!(got, front_view(&canonical_front(ISLAND_FRONT_CAP, union).items), "generation {gen}: island {i}");
+                } else {
+                    assert!(!moved.contains(&i));
+                    assert_eq!(got, front_view(&offered[i]), "generation {gen}: island {i} keeps its front");
+                }
+            }
+        }
+        assert!(exchanges >= 5 && emptied >= 2, "{exchanges} exchanges, {emptied} emptied fronts");
+    }
+
+    #[test]
+    fn the_global_scope_hands_every_island_the_global_front() {
+        let mut policy = IslandPolicy::new(&policy_cfg(3, RestartPolicy::Archive, 1, 1, 0));
+        let global = [sol(0.1), sol(0.2)];
+        let mut pop = Members { islands: (0..3).map(|i| vec![member(i, 1, 0.5)]).collect(), ..Default::default() };
+        policy.offer(&pop, &|_| true);
+        policy.barrier(0, &global, &mut pop);
+        for i in 0..3 {
+            assert_eq!(policy.front(i, &global).as_ptr(), global.as_ptr(), "island {i}");
+            assert!(policy.island_front(i).is_empty(), "island {i}");
         }
     }
 
@@ -807,6 +1197,230 @@ mod tests {
         let (resumed, resumed_text, _) = checkpointed(&cfg(40), Some(saved));
         assert_eq!(uninterrupted.archive.hash(), resumed.archive.hash(), "the archive");
         assert_eq!(full_text, resumed_text, "archive, populations, rng state and stagnant counters of the exit checkpoint");
+    }
+
+    #[test]
+    fn an_explore_tier_run_and_its_resume_match_exactly() {
+        for rule in [RestartPolicy::Archive, RestartPolicy::Island] {
+            let cfg = |generations| Config {
+                generations,
+                explore_islands: 2,
+                restart_policy: rule,
+                restart_isolation: 7,
+                ..golden_config()
+            };
+            let (uninterrupted, full_text, _) = checkpointed(&cfg(40), None);
+            let (again, again_text, _) = checkpointed(&cfg(40), None);
+            assert_eq!(uninterrupted.archive.hash(), again.archive.hash(), "{rule:?}: same seed, same archive");
+            assert_eq!(full_text, again_text, "{rule:?}: same seed, same exit checkpoint");
+            let (_, saved_text, saved_restarts) = checkpointed(&cfg(20), None);
+            assert!(saved_restarts > 0, "{rule:?}: an island restarts before the save");
+            assert!(saved_text.contains("config explore_islands 2\n"), "{rule:?}");
+            let saved = Checkpoint::from_text(&saved_text).expect("parse saved checkpoint");
+            let (resumed, resumed_text, resumed_restarts) = checkpointed(&cfg(40), Some(saved));
+            assert!(resumed_restarts > 0, "{rule:?}: an island restarts after the save");
+            assert_eq!(uninterrupted.archive.hash(), resumed.archive.hash(), "{rule:?}: the archive");
+            assert_eq!(full_text, resumed_text, "{rule:?}: the exit checkpoint");
+        }
+    }
+
+    fn refused(cfg: &Config, resume: Option<Checkpoint>) -> String {
+        let (train, test) = (golden_sample(240), golden_sample(80));
+        match run_resumable(cfg, &train, &test, resume, 0, |_| {}) {
+            Ok(_) => panic!("the run must be refused"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn an_explore_checkpoint_resumes_only_with_its_own_tier() {
+        let cfg = |generations, explore_islands| Config { generations, explore_islands, ..golden_config() };
+        let (_, default_text, _) = checkpointed(&cfg(10, 0), None);
+        assert!(!default_text.contains("explore_islands"), "the key is written only for a tier");
+        let old = Checkpoint::from_text(&default_text).expect("parse default checkpoint");
+        assert_eq!(old.config.explore_islands, 0, "a checkpoint without the key loads as 0");
+        let (_, text, _) = checkpointed(&cfg(10, 2), None);
+        assert!(text.contains("config explore_islands 2\n"));
+        for other in [0, 1, 3] {
+            let saved = Checkpoint::from_text(&text).expect("parse checkpoint");
+            let err = refused(&cfg(20, other), Some(saved));
+            assert!(err.contains("explore_islands"), "{other}: {err}");
+        }
+        let err = refused(&cfg(20, 2), Some(old));
+        assert!(err.contains("explore_islands"), "{err}");
+    }
+
+    #[test]
+    fn explore_islands_need_an_exploit_island() {
+        for (islands, explore_islands) in [(4, 4), (4, 5), (1, 1)] {
+            let err = refused(&Config { islands, explore_islands, generations: 2, ..golden_config() }, None);
+            assert!(err.contains("--explore-islands"), "{islands} {explore_islands}: {err}");
+        }
+    }
+
+    /// A noisy table that no run here solves, so every run uses its budget.
+    fn breadth_sample(seed: u32, n: usize) -> Sample {
+        let mut rng = Mt::new(seed);
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for _ in 0..n {
+            let a = rng.next_f64() * 4.0 - 2.0;
+            let b = rng.next_f64() * 2.0 - 1.0;
+            x.push(vec![a, b]);
+            y.push((1.5 * a).sin() * b + 0.5 * b * b + 0.3 * a + 0.1 * (rng.next_f64() - 0.5));
+        }
+        Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None }
+    }
+
+    /// From the development log of one run: the distinct island best errors
+    /// at the last generation, the islands whose best is the run's best error
+    /// (8 of 8 is one trial), and that best error.
+    fn breadth(cfg: &Config, train: &Sample, test: &Sample) -> (usize, usize, f64) {
+        use std::sync::{Arc, Mutex};
+        let seen = Arc::new(Mutex::new((Vec::<f64>::new(), f64::INFINITY)));
+        let sink = seen.clone();
+        let cfg = Config {
+            dev_log: Some(Arc::new(move |r: &crate::devlog::GenRecord| {
+                let mut s = sink.lock().unwrap();
+                s.0 = r.island_best.clone();
+                s.1 = s.1.min(r.best_error);
+            })),
+            ..cfg.clone()
+        };
+        run_resumable(&cfg, train, test, None, 0, |_| {}).expect("run");
+        let (island_best, best) = seen.lock().unwrap().clone();
+        let distinct = island_best.iter().map(|b| b.to_bits()).collect::<std::collections::HashSet<_>>().len();
+        (distinct, island_best.iter().filter(|&&b| b == best).count(), best)
+    }
+
+    #[test]
+    fn the_explore_tier_ends_on_more_distinct_island_bests_than_the_default() {
+        let (train, test) = (breadth_sample(7, 300), breadth_sample(8, 100));
+        // [arm][distinct island bests, islands holding the best]
+        let mut sums = [[0usize; 2]; 2];
+        for seed in 1..=3 {
+            for (arm, explore_islands) in [0usize, 6].into_iter().enumerate() {
+                let cfg = Config {
+                    islands: 8,
+                    pop: 16,
+                    generations: 300,
+                    max_complexity: 12,
+                    fit_iters: 2,
+                    patience: 0,
+                    seed,
+                    gpu: false,
+                    explore_islands,
+                    ..Default::default()
+                };
+                let (distinct, holders, best) = breadth(&cfg, &train, &test);
+                eprintln!(
+                    "breadth seed {seed} explore_islands {explore_islands}: distinct island bests {distinct}, \
+                     islands holding the best {holders}, best training error {best:.6e}"
+                );
+                sums[arm][0] += distinct;
+                sums[arm][1] += holders;
+            }
+        }
+        eprintln!("breadth sums over seeds 1-3: default {:?}, explore_islands 6 {:?}", sums[0], sums[1]);
+        assert!(sums[1][0] > sums[0][0], "distinct island bests: {sums:?}");
+        assert!(sums[1][1] < sums[0][1], "islands holding the best: {sums:?}");
+    }
+
+    #[test]
+    fn an_island_scope_run_and_its_resume_match_exactly() {
+        for rule in [RestartPolicy::Archive, RestartPolicy::Island] {
+            let cfg = |generations| Config {
+                generations,
+                front_scope: FrontScope::Island,
+                restart_policy: rule,
+                restart_isolation: 7,
+                ..golden_config()
+            };
+            let (uninterrupted, full_text, _) = checkpointed(&cfg(40), None);
+            let (again, again_text, _) = checkpointed(&cfg(40), None);
+            assert_eq!(uninterrupted.archive.hash(), again.archive.hash(), "{rule:?}: same seed, same archive");
+            assert_eq!(full_text, again_text, "{rule:?}: same seed, same exit checkpoint");
+            let (_, saved_text, saved_restarts) = checkpointed(&cfg(20), None);
+            assert!(saved_restarts > 0, "{rule:?}: an island restarts before the save");
+            assert!(saved_text.contains("config front_scope island\n") && saved_text.contains("\nisland_front "), "{rule:?}");
+            let saved = Checkpoint::from_text(&saved_text).expect("parse saved checkpoint");
+            let (resumed, resumed_text, _) = checkpointed(&cfg(40), Some(saved));
+            assert_eq!(uninterrupted.archive.hash(), resumed.archive.hash(), "{rule:?}: the archive");
+            assert_eq!(full_text, resumed_text, "{rule:?}: the exit checkpoint, island fronts included");
+        }
+    }
+
+    #[test]
+    fn an_island_scope_checkpoint_resumes_only_under_its_own_scope() {
+        let cfg = |generations, front_scope| Config { generations, front_scope, ..golden_config() };
+        let (_, global_text, _) = checkpointed(&cfg(10, FrontScope::Global), None);
+        assert!(!global_text.contains("front_scope") && !global_text.contains("island_front"));
+        let (_, text, _) = checkpointed(&cfg(10, FrontScope::Island), None);
+        let err = refused(&cfg(20, FrontScope::Global), Some(Checkpoint::from_text(&text).expect("parse")));
+        assert!(err.contains("front_scope"), "{err}");
+        let err = refused(&cfg(20, FrontScope::Island), Some(Checkpoint::from_text(&global_text).expect("parse")));
+        assert!(err.contains("front_scope"), "{err}");
+        let stripped: String = text
+            .lines()
+            .filter(|l| !l.starts_with("config front_scope") && !l.starts_with("config_hash "))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        match Checkpoint::from_text(&stripped) {
+            Ok(_) => panic!("island_front records under the global scope must be refused"),
+            Err(e) => assert!(e.contains("island_front"), "{e}"),
+        }
+    }
+
+    #[test]
+    fn one_island_front_scope_equals_the_global_front() {
+        let cfg = |front_scope| Config { islands: 1, front_scope, ..golden_config() };
+        let (global, global_text, _) = checkpointed(&cfg(FrontScope::Global), None);
+        let (island, island_text, _) = checkpointed(&cfg(FrontScope::Island), None);
+        assert_eq!(global.archive.hash(), island.archive.hash());
+        let state = |t: &str| -> Vec<String> {
+            t.lines().filter(|l| l.starts_with("ind ") || l.starts_with("rng ")).map(String::from).collect()
+        };
+        assert_eq!(state(&global_text), state(&island_text), "populations and generators");
+    }
+
+    #[test]
+    fn the_island_scope_refuses_the_qd_policy() {
+        let cfg = Config { front_scope: FrontScope::Island, qd_bins: 8, qd_policy: true, generations: 2, ..golden_config() };
+        let err = refused(&cfg, None);
+        assert!(err.contains("--qd-policy") && err.contains("QD archive"), "{err}");
+    }
+
+    #[test]
+    fn the_island_scope_ends_on_more_distinct_island_bests_than_the_global_front() {
+        let (train, test) = (breadth_sample(7, 300), breadth_sample(8, 100));
+        // [scope][distinct island bests, islands holding the best]
+        let mut sums = [[0usize; 2]; 2];
+        for seed in 1..=3 {
+            for (arm, front_scope) in [FrontScope::Global, FrontScope::Island].into_iter().enumerate() {
+                let cfg = Config {
+                    islands: 8,
+                    pop: 16,
+                    generations: 300,
+                    max_complexity: 12,
+                    fit_iters: 2,
+                    patience: 0,
+                    seed,
+                    gpu: false,
+                    front_scope,
+                    ..Default::default()
+                };
+                let (distinct, holders, best) = breadth(&cfg, &train, &test);
+                eprintln!(
+                    "breadth seed {seed} front_scope {}: distinct island bests {distinct}, \
+                     islands holding the best {holders}, best training error {best:.6e}",
+                    front_scope.as_str()
+                );
+                sums[arm][0] += distinct;
+                sums[arm][1] += holders;
+            }
+        }
+        eprintln!("breadth sums over seeds 1-3: global {:?}, island {:?}", sums[0], sums[1]);
+        assert!(sums[1][0] > sums[0][0], "distinct island bests: {sums:?}");
     }
 
     fn breeding_fixture() -> (Sample, Config) {
@@ -1361,6 +1975,72 @@ mod tests {
         assert!(trees.iter().all(|&c| c > 0), "owned trees: [moves, skipped, archive restarts, island restarts] = {trees:?}");
         #[cfg(feature = "cuda")]
         assert!(flat.iter().all(|&c| c > 0), "flat arena: [moves, skipped, archive restarts, island restarts] = {flat:?}");
+    }
+
+    /// Host code only: the arena adapter never calls the device here.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_flat_arena_applies_the_explore_tier() {
+        let (n, k, pop) = (4usize, 2usize, 3usize);
+        let cfg = Config { explore_islands: k, pop, ..policy_cfg(n, RestartPolicy::Archive, 1, 2, 0) };
+        let mut rng = Mt::new(1100);
+        let variation = Variation::new(64, 2, 12, 1100, &Op::default_set(), 3, true).expect("variation");
+        let mut arena = random_arena(&mut rng, n, pop);
+        let mut policy = IslandPolicy::new(&cfg);
+        let island_view = |a: &Arena, i: usize| -> Vec<(Vec<u32>, u64)> {
+            (0..pop)
+                .map(|j| {
+                    let idx = a.slot_index(i, j);
+                    (a.slot(idx).to_vec(), a.err[idx].to_bits())
+                })
+                .collect()
+        };
+        let mut explore_restarts_seen = 0;
+        for gen in 0..30 {
+            for idx in 0..n * pop {
+                arena.err[idx] = ERRORS[rng.usize_below(ERRORS.len())];
+            }
+            let before = arena.clone();
+            let archive = archive_of(&mut rng, (0..n).map(|i| arena.best_error(i)));
+            policy.observe(&arena);
+            let mut adapter = ArenaIslands { arena: &mut arena, variation: &variation, gen: gen as u32 };
+            let mut recorded = Recorded { inner: &mut adapter, moves: Vec::new() };
+            let restarts = policy.barrier(gen, &archive, &mut recorded);
+            assert_eq!(recorded.moves, [Move { from: 1, to: 0 }, Move { from: 0, to: 1 }], "generation {gen}");
+            for i in n - k..n {
+                let mut want = before.clone();
+                if restarts.contains(&i) {
+                    variation.restart_island(&mut want, i, gen as u32);
+                    explore_restarts_seen += 1;
+                }
+                assert!(island_view(&arena, i) == island_view(&want, i), "generation {gen}: explore island {i}");
+            }
+        }
+        assert!(explore_restarts_seen >= 8, "{explore_restarts_seen} explore restarts");
+    }
+
+    /// Host code only: decoding a slot never calls the device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_flat_arena_offers_each_island_to_its_own_front() {
+        let (n, pop) = (3usize, 4usize);
+        let mut rng = Mt::new(1070);
+        let mut arena = random_arena(&mut rng, n, pop);
+        for idx in 0..n * pop {
+            arena.err[idx] = 0.1 + idx as f64 * 0.01;
+        }
+        let cfg = Config { front_scope: FrontScope::Island, pop, ..policy_cfg(n, RestartPolicy::Archive, 1, 0, 0) };
+        let mut policy = IslandPolicy::new(&cfg);
+        policy.offer(&arena, &|_| true);
+        for i in 0..n {
+            let own: std::collections::HashSet<u64> = (0..pop)
+                .filter_map(|j| arena.decode(arena.slot_index(i, j)))
+                .map(|t| expr::structural_hash(&t))
+                .collect();
+            let front = policy.island_front(i);
+            assert!(!front.is_empty(), "island {i}");
+            assert!(front.iter().all(|s| own.contains(&expr::structural_hash(&s.tree))), "island {i} took foreign material");
+        }
     }
 
     fn describe(cfg: &Config, defer_gpu: bool) -> String {

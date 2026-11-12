@@ -302,6 +302,86 @@ fn tail_fit_overlap_equals_serial_routing() {
     }
 }
 
+/// #1075: the device fit released in waves gives the one-call trees, errors
+/// and per-cause counts bit for bit, carries the same candidates in more
+/// launches, and starts released exact fits early; a cap that could bind keeps
+/// one call per generation.
+#[test]
+fn release_waves_equal_one_shot() {
+    need_device!();
+    let (x, y) = rows();
+    let n = 6_000;
+    let train = Sample { x: x[..n].to_vec(), y: y[..n].to_vec(), w: Vec::new(), ys: Vec::new(), pairs: None };
+    let test = Sample { x: x[n..n + 1_000].to_vec(), y: y[n..n + 1_000].to_vec(), w: Vec::new(), ys: Vec::new(), pairs: None };
+    let base = Config {
+        generations: 4,
+        islands: 2,
+        pop: 96,
+        max_complexity: 14,
+        fit_iters: ITERS,
+        patience: 0,
+        seed: 11,
+        threads: 4,
+        pipeline_depth: 0,
+        ops: crate::expr::Op::parse_list("add,sub,mul,div,min,max,if,greater"),
+        dispatch: crate::dispatch::DispatchMode::Device,
+        gpu: true,
+        fit_strategy: FitStrategy::Gpu,
+        ..Default::default()
+    };
+    let cases = [
+        ("narrow synchronous", base.clone(), true),
+        ("wide synchronous", Config { fit_admission: fit::FitAdmission::All, ..base.clone() }, true),
+        ("narrow bounded", Config { fit_fallback_max: 2, ..base.clone() }, false),
+    ];
+    for (label, cfg, unbounded) in cases {
+        let one = tail_trace(&Config { fit_release_waves: 0, ..cfg.clone() }, &train, &test);
+        assert_eq!(one.stats.fit_tail_early, 0, "{label}: one call releases nothing");
+        assert_eq!(one.stats.fit_release_waves, 0, "{label}");
+        for waves in [3usize, 7] {
+            let label = format!("{label}, {waves} waves");
+            let w = tail_trace(&Config { fit_release_waves: waves, ..cfg.clone() }, &train, &test);
+            let (o, r) = (&one.stats, &w.stats);
+            eprintln!(
+                "{label}: calls {} vs {} candidates {} vs {} early {} | overlap {:.4}s join wait {:.4}s vs {:.4}s",
+                r.fit_calls,
+                o.fit_calls,
+                r.fit_call_candidates,
+                o.fit_call_candidates,
+                r.fit_tail_early,
+                r.ledger.fit_tail_overlap_s(),
+                r.ledger.fit_tail_join_wait_s(),
+                o.ledger.fit_tail_join_wait_s(),
+            );
+            assert_eq!(one.islands.len(), w.islands.len(), "{label}: snapshots");
+            for (g, (a, b)) in one.islands.iter().zip(&w.islands).enumerate() {
+                assert_eq!(a.len(), b.len(), "{label}: snapshot {g} size");
+                for (k, (p, q)) in a.iter().zip(b).enumerate() {
+                    assert!(crate::expr::same(&p.0, &q.0) && p.1 == q.1, "{label}: generation {g} individual {k} differs");
+                }
+            }
+            assert_eq!(one.archive.len(), w.archive.len(), "{label}: archive size");
+            for (k, (p, q)) in one.archive.iter().zip(&w.archive).enumerate() {
+                assert!(crate::expr::same(&p.0, &q.0) && p.1 == q.1 && p.2 == q.2, "{label}: archive member {k} differs");
+            }
+            assert_eq!(one.test_errors, w.test_errors, "{label}: test errors");
+            assert_eq!(one.by_cause, w.by_cause, "{label}: per-generation fallback causes");
+            assert_eq!(one.improved, w.improved, "{label}: per-generation improved refits");
+            assert_eq!(one.bounded, w.bounded, "{label}: per-generation bound");
+            assert_eq!(r.fit_release_waves, waves, "{label}");
+            assert_eq!(r.fit_call_candidates, o.fit_call_candidates, "{label}: the same candidates reach the device");
+            if unbounded {
+                assert!(r.fit_calls > o.fit_calls && r.fit_calls <= waves * o.fit_calls, "{label}: launches");
+                assert!(r.fit_tail_early > 0, "{label}: no exact fit started from a released answer");
+            } else {
+                assert_eq!(r.fit_calls, o.fit_calls, "{label}: a cap that could bind keeps one call");
+                assert_eq!(r.fit_tail_early, 0, "{label}");
+            }
+            assert!(r.ledger.closure_residual().value.abs() < 1e-9, "{label}: the ledger does not close");
+        }
+    }
+}
+
 /// #959: fixture trees whose device LM ended with status 0 above the CPU fit.
 const PINNED: [usize; 2] = [136, 150];
 

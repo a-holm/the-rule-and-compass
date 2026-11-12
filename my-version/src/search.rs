@@ -136,6 +136,34 @@ impl RestartPolicy {
     }
 }
 
+/// #1070: where an island draws its front parents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FrontScope {
+    /// The global Pareto front of every island's members.
+    #[default]
+    Global,
+    /// The island's own error/complexity front; fronts travel along the
+    /// migration moves only.
+    Island,
+}
+
+impl FrontScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FrontScope::Global => "global",
+            FrontScope::Island => "island",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "global" => Ok(FrontScope::Global),
+            "island" => Ok(FrontScope::Island),
+            other => Err(format!("front scope must be 'global' or 'island', got '{}'", other)),
+        }
+    }
+}
+
 /// #471: which edit kinds the node-path mutation draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MutationMix {
@@ -403,6 +431,12 @@ pub struct Config {
     /// errors equal the serial arm bit for bit, so it is not saved in a
     /// checkpoint. `false` keeps the serial arm after the device batch.
     pub fit_tail_overlap: bool,
+    /// #1075: release the device fit answers of the synchronous fit stage in
+    /// this many ordered device calls, so the exact fits of released fallbacks
+    /// start while later calls run. Scheduling only: the outcome equals one
+    /// call bit for bit, so it is not saved in a checkpoint. `0` and `1` keep
+    /// one call; `RCSR_FIT_RELEASE_WAVES` sets it from the command line.
+    pub fit_release_waves: usize,
     /// #122: which variation engine to use. `auto` selects the flat postfix
     /// engine only for a large, fit-free GPU run.
     pub variation: VariationMode,
@@ -413,6 +447,11 @@ pub struct Config {
     /// #1022: generations a restarted island takes no front parent and no
     /// migrant. Read only under `--restart-policy island`.
     pub restart_isolation: usize,
+    /// #1100: the highest this many islands form the explore tier (0: none).
+    /// Saved search setting.
+    pub explore_islands: usize,
+    /// #1070: where front parents come from. Saved search setting.
+    pub front_scope: FrontScope,
     /// #471: the node-path edit weights. Changes the trajectory, so it is a
     /// saved search setting.
     pub mutation_mix: MutationMix,
@@ -660,6 +699,9 @@ use island_policy::ArenaIslands;
 use island_policy::{IslandPolicy, ParentSource, TreeIslands};
 mod prune;
 pub use prune::PruneReport;
+mod fit_route; // #1091: the fit route of both device fit schedules
+#[cfg(feature = "cuda")]
+use fit_route::{DeviceArm, ExactFits, FitRoute, FitSettings, RouteCounts};
 /// #495: default relative band of the finalist refit (`inf`: refit every unique tree).
 pub const DEFAULT_REFIT_BAND: f64 = f64::INFINITY;
 
@@ -728,10 +770,13 @@ impl Default for Config {
             threads: 1,
             threads_explicit: false,
             fit_tail_overlap: true,
+            fit_release_waves: 0,
             variation: VariationMode::Auto,
             selection: Selection::Lexicographic,
             restart_policy: RestartPolicy::Archive,
             restart_isolation: 25,
+            explore_islands: 0,
+            front_scope: FrontScope::Global,
             mutation_mix: MutationMix::Classic,
             crossover_internal: 0.0,
             adaptive_mix: false,
@@ -1159,6 +1204,10 @@ struct GpuSearch {
     /// #958: the exact CPU fallback fits run on the pool beside the device
     /// work; `false` keeps the serial arm after the device batch (#936).
     tail_overlap: bool,
+    /// #1075: ordered device calls of the synchronous fit (`0` is one call),
+    /// and the fallbacks whose exact fit started from a released answer.
+    release_waves: usize,
+    fit_tail_early: usize,
     /// #230: true only when the CUDA evaluator scores this run's metric
     /// itself through the objective kernel. False for an exact order/rank run,
     /// which is scored through [`crate::gpu::GpuEvaluator::score_stat_batch`]
@@ -1458,6 +1507,8 @@ impl GpuSearch {
                     defer_check: false,
                     deferred_check: None,
                     tail_overlap: true,
+                    release_waves: 0,
+                    fit_tail_early: 0,
                     native_metric,
                     native_stat,
                     score,
@@ -1529,98 +1580,36 @@ impl GpuSearch {
         // Everything that judges or refits a device proposal sees the rows the
         // device fitted; the caller re-scores on every row afterwards.
         let fit_train: &Sample = fit_sample.as_ref().unwrap_or(train);
+        // #1091: the fit route decides the arm, the triage, the cap and the tail.
+        // Its refit prefix is the admission order only for a sorted `admitted`.
+        debug_assert!(admitted.windows(2).all(|w| w[0] < w[1]), "admitted is sorted by (island, slot)");
+        let settings = FitSettings::of(cfg);
+        let arm = DeviceArm::for_metric(cfg.metric, fit_train.len(), cfg.fit_iters);
+        let single_class = fit_route::single_class(cfg.metric, fit_train);
+        let mut route = FitRoute::new(settings, self.tail_overlap);
         let mut planned: Vec<(usize, usize, crate::fit::GpuFitPlan)> = Vec::new();
-        let mut fallbacks: Vec<(usize, usize, FitFallbackCause)> = Vec::new();
-        // #968: the device constants of a routed tail fit, by island and slot.
-        let mut device_alts: std::collections::HashMap<(usize, usize), Node> = Default::default();
-        // #229: the objective the batched kernel minimises. #230: the rank
-        // family has no LM loss but has its own exact device polish, so it is
-        // admitted through `rank_fit_only`. Anything else reaching here is
-        // labelled rather than guessed.
-        let fit_loss = crate::fit::fit_loss(cfg.metric);
-        let rank_loss = crate::fit::rank_fit_only(cfg.metric);
-        // #226/#232: `median` and `interquartile` have no LM loss but their own
-        // exact device polish on the same squared start and ladder.
-        let order_stat_arm = crate::fit::order_stat_fit_only(cfg.metric);
-        // #227: `maximum` likewise — an exact maximum-error polish, no LM
-        // loss, no order statistic. #287 scores maximum natively, but the fit
-        // arm keeps its measured cost model: below the crossover the exact CPU
-        // polish runs instead of paying a device launch.
-        let maximum_arm = crate::fit::maximum_fit_only(cfg.metric)
-            && crate::fit::maximum_gpu_fit_worthwhile(fit_train.len(), 1, cfg.fit_iters);
-        // #234: a single-class fit sample has no finite log-loss optimum. The
-        // counts come from the same midpoint rule the CPU arm uses, so the
-        // device never fits a sign the sample does not support.
-        // #289: the predicate is the *fit* objective, not the fit-only split:
-        // `log_loss` now has a native scorer, but its device fit still needs
-        // both classes to have a finite optimum. The hinge codes read the same
-        // sign and are declined the same way.
-        let single_class = crate::fit::fit_loss(cfg.metric)
-            .is_some_and(|loss| loss.needs_label_sign())
-            && {
-                let (pos, neg) = crate::fit::class_counts_weighted(&fit_train.y, &fit_train.w);
-                pos == 0 || neg == 0
-            };
         for &(i, j) in admitted {
-            self.fold_redundant(&mut islands[i][j].tree);
-            if single_class {
-                fallbacks.push((i, j, FitFallbackCause::SingleClass));
-                continue;
-            }
-            if matches!(cfg.metric, Metric::Correlation | Metric::CorrelationSigned)
-                && crate::fit::is_affine_correlation_tree(&islands[i][j].tree)
-            {
-                fallbacks.push((i, j, FitFallbackCause::AffineClosedForm));
-                continue;
-            }
-            match crate::fit::gpu_fit_plan_reason(&islands[i][j].tree) {
-                _ if fit_loss.is_none()
-                    && rank_loss.is_none()
-                    && !order_stat_arm
-                    && !maximum_arm =>
-                {
-                    fallbacks.push((i, j, FitFallbackCause::MetricNotNative))
-                }
-                Ok(plan) => planned.push((i, j, plan)),
-                Err(reason) => fallbacks.push((i, j, plan_fallback_cause(reason))),
+            route.fold(&mut islands[i][j].tree);
+            if let Some(plan) = route.admit(i, j, &islands[i][j].tree, arm, single_class) {
+                planned.push((i, j, plan));
             }
         }
         // #453: the device runs the admitted candidates as one batch, so the
         // cost model plans the batch once, not each candidate alone.
-        let batch = plan_fit_batch(dispatcher, fit_train.len(), cfg.fit_iters, fit_loss, planned);
-        let batch_bytes = batch.bytes;
-        let batch_decision = batch.decision;
-        fallbacks.extend(batch.refused);
-        let jobs = batch.jobs;
+        let batch = route.plan_batch(dispatcher, fit_train.len(), planned, islands);
         self.fit_attempts += admitted.len();
         let stats = self.stats.entry(generation).or_default();
         stats.generation = generation;
         stats.fit_attempts += admitted.len();
-        // A candidate the plan cannot offer is a labelled CPU fallback, so the
-        // process-wide `--fit-report` counter agrees with the run ledger.
-        for &(_, _, cause) in &fallbacks {
-            self.note_fit_fallback(generation, cause);
-            crate::fit::note_gpu_fit(false);
-        }
         // #958: the exact CPU fits run on the fallback pool while the device
         // works: the plan rejects before the launch, the device fallbacks as
-        // soon as the batch is read. `fallbacks[..on_pool]` are submitted.
-        let overlap = self.tail_overlap;
-        let mut tail = PendingTail::default();
-        let mut on_pool = 0usize;
-        if overlap {
-            on_pool = self.tail_submit_prefix(&mut tail, islands, &fallbacks, &mut device_alts, on_pool, fit_train, cfg);
-        }
-
+        // soon as the batch is read.
+        let mut pending = PendingTail::default();
+        route.submit_early(&mut self.pool_fits(&mut pending, fit_train, &settings));
+        let jobs: Vec<((usize, usize), crate::fit::GpuFitPlan)> =
+            batch.jobs.into_iter().map(|(i, j, plan)| ((i, j), plan)).collect();
         if !jobs.is_empty() {
-            let plans: Vec<&crate::fit::GpuFitPlan> = jobs.iter().map(|(_, _, p)| p).collect();
-            // #230: the rank family runs its own device arm — the same squared
-            // LM start as `fit_weighted_metric`, followed by the batched exact
-            // rank polish under the same first-improver ladder. #226/#232:
-            // `median` and `interquartile` do the same on their own exact order
-            // statistic. Every other metric stays on the LM kernel of
-            // #169/#229.
-            let want = crate::fit::OrderStat::for_metric(cfg.metric);
+            let arm = arm.expect("a planned candidate has a device arm");
             let fit_device_start = self.ledger_offset_s();
             // The fit subsample has its own context; without one the fit runs
             // on the scoring context's rows.
@@ -1628,242 +1617,36 @@ impl GpuSearch {
                 Some(ev) => ev,
                 None => &mut self.ev,
             };
-            dev.set_fit_polish(cfg.fit_polish);
-            let (out, ms) = if maximum_arm {
-                // #227: the exact maximum-error polish on the squared start.
-                dev.max_fit_batch(&plans, cfg.fit_iters)
-            } else if let Some(want) = want {
-                dev.order_stat_fit_batch(&plans, cfg.fit_iters, want)
-            } else {
-                match crate::fit::rank_metric_signed(cfg.metric) {
-                    Some(signed) => {
-                        dev.rank_fit_batch(&plans, cfg.fit_iters, &fit_train.y, signed)
-                    }
-                    // #236: the squared warm start, then the differenced IRLS,
-                    // keeping the incoming constants unless it improves on them.
-                    None if fit_loss == Some(crate::fit::DeviceLoss::Slope) => {
-                        dev.slope_fit_batch(&plans, cfg.fit_iters)
-                    }
-                    None => {
-                        let loss = fit_loss.expect(
-                            "jobs is only filled when a native, rank, order-statistic or \
-                             maximum arm exists",
-                        );
-                        dev.fit_batch(&plans, cfg.fit_iters, loss)
-                    }
-                }
-            };
-            if ms > 0.0 {
-                self.fit_ms += ms as f64;
-                self.fit_polish_ms += dev.take_polish_ms(ms);
-                self.fit_calls += 1;
-                self.fit_call_candidates += plans.len();
-                self.fit_call_ms_max = self.fit_call_ms_max.max(ms as f64);
-                // #284: the fit kernel is one device interval on the run clock;
-                // its duration is the raw event time, not the host envelope.
-                match dev.take_span_start_s(crate::gpu::SPAN_FIT) {
-                    Some(start_s) => self
-                        .ledger
-                        .record_fit_kernel_event(0, start_s, ms as f64 / 1000.0),
-                    None => self
-                        .ledger
-                        .record_fit_kernel_interval(0, fit_device_start, ms as f64 / 1000.0),
-                }
-            }
-            if out.len() == jobs.len() {
+            // #1075: the device answers may reach the route in waves, so the
+            // pool starts the exact fits of released fallbacks under the launch.
+            let pool = self.fallback.as_ref().expect("a GPU search owns its fallback pool");
+            let mut exact = PoolFits::new(pool, &mut pending, fit_train, &settings, self.fallback_workers);
+            let step =
+                route.fit_on_device_released(dev, arm, &jobs, islands, fit_train, cfg.threads, &mut exact, self.release_waves);
+            self.fit_tail_early += step.early;
+            self.book_fit_kernel(&step, fit_device_start);
+            if step.ok {
                 // #290: a successful batch is what makes this run device-used.
                 self.device_fit_used = true;
-                // #234: the log-loss arm judges the proposal by the configured
-                // objective in exact f64, against the exact value at the
-                // starting constants. The kernel's acceptance is therefore a
-                // suggestion, never the final word. The other LM arms keep
-                // their historical trajectory (their proposal is the kernel's
-                // own optimum of the same objective).
-                let gated = crate::fit::device_fit_is_gated(cfg.metric);
-                // #936: statuses 4, 5 and 7 of the LM kernel go to the exact CPU
-                // fit from the starting constants.
-                let lm_arm = want.is_none() && !maximum_arm && rank_loss.is_none();
-                // #498: the exact judgements are independent, so they run on
-                // the worker pool; the verdicts are applied below in admission
-                // order.
-                let mut verdicts: Vec<Option<(crate::fit::Verdict, Node)>> = Vec::new();
-                if gated {
-                    let gate_start = std::time::Instant::now();
-                    let gate_jobs: Vec<(usize, Node, Vec<f64>)> = jobs
-                        .iter()
-                        .zip(&out)
-                        .enumerate()
-                        .filter(|(_, (_, res))| {
-                            crate::fit::fit_status_usable(res.status)
-                                && !(lm_arm && tail_status_cause(res.status).is_some())
-                                && res.c.iter().all(|v| v.is_finite())
-                        })
-                        .map(|(k, ((i, j, _), res))| {
-                            (k, islands[*i][*j].tree.clone(), res.c.clone())
-                        })
-                        .collect();
-                    verdicts.resize_with(jobs.len(), || None);
-                    for (k, judged) in gate_proposals(gate_jobs, fit_train, cfg.metric, cfg.threads)
-                    {
-                        verdicts[k] = Some(judged);
-                    }
-                    let gate_seconds = gate_start.elapsed().as_secs_f64();
-                    self.fit_gate_ms += gate_seconds * 1000.0;
-                    self.stats.entry(generation).or_default().fit_gate_seconds += gate_seconds;
-                }
-                for (k, ((i, j, plan), res)) in jobs.iter().zip(out).enumerate() {
-                    let finite = res.c.iter().all(|v| v.is_finite());
-                    let tail = if lm_arm { tail_status_cause(res.status) } else { None };
-                    let usable = crate::fit::fit_status_usable(res.status) && tail.is_none();
-                    if gated && usable && finite {
-                        let (verdict, judged) =
-                            verdicts[k].take().expect("every gated job has a verdict");
-                        if matches!(verdict, crate::fit::Verdict::Accepted(_)) {
-                            islands[*i][*j].tree = judged;
-                        }
-                        let cause = match verdict {
-                            crate::fit::Verdict::Accepted(_) => {
-                                self.fit_gpu += 1;
-                                self.stats.entry(generation).or_default().fit_gpu += 1;
-                                crate::fit::note_gpu_fit(true);
-                                continue;
-                            }
-                            crate::fit::Verdict::NonFinite => FitFallbackCause::NonFinite,
-                            crate::fit::Verdict::Rejected if cfg.metric == Metric::LogLoss => {
-                                FitFallbackCause::LogLossWorse
-                            }
-                            crate::fit::Verdict::Rejected => FitFallbackCause::Worse,
-                            crate::fit::Verdict::NotIdentifiable => {
-                                FitFallbackCause::NotIdentifiable
-                            }
-                        };
-                        fallbacks.push((*i, *j, cause));
-                        self.note_fit_fallback(generation, cause);
-                        crate::fit::note_gpu_fit(false);
-                        continue;
-                    }
-                    if finite && tail.is_none() {
-                        plan.apply(&mut islands[*i][*j].tree, &res.c);
-                    }
-                    if usable && finite {
-                        self.fit_gpu += 1;
-                        self.stats.entry(generation).or_default().fit_gpu += 1;
-                        if let Some(label) = gpu_status_label(res.status) {
-                            *self
-                                .fit_status_by_label
-                                .entry(label.to_string())
-                                .or_default() += 1;
-                        }
-                        crate::fit::note_gpu_fit(true);
-                    } else {
-                        let cause = if let Some(cause) = tail {
-                            if let Some(alt) = tail_device_tree(plan, &islands[*i][*j].tree, &res) {
-                                device_alts.insert((*i, *j), alt);
-                            }
-                            cause
-                        } else if !finite {
-                            FitFallbackCause::NonFinite
-                        } else if let Some(want) = want {
-                            order_stat_status_fallback_cause(res.status, want)
-                        } else if maximum_arm {
-                            maximum_status_fallback_cause(res.status)
-                        } else {
-                            status_fallback_cause(res.status)
-                        };
-                        fallbacks.push((*i, *j, cause));
-                        self.note_fit_fallback(generation, cause);
-                        crate::fit::note_gpu_fit(false);
-                    }
-                }
-            } else {
-                // The launch failed: every offered candidate goes to the CPU.
-                for (i, j, _) in &jobs {
-                    fallbacks.push((*i, *j, FitFallbackCause::Launch));
-                    self.note_fit_fallback(generation, FitFallbackCause::Launch);
-                    crate::fit::note_gpu_fit(false);
-                }
+            }
+            if let Some(gate_seconds) = step.gate_seconds {
+                self.fit_gate_ms += gate_seconds * 1000.0;
+                self.stats.entry(generation).or_default().fit_gate_seconds += gate_seconds;
             }
             // #290: attribute the measured batch time to the one planned batch
             // decision (#453).
-            if let Some(decision) = batch_decision {
-                dispatcher.record(
-                    decision,
-                    ms.max(0.0) as f64 / 1000.0,
-                    jobs.len(),
-                    batch_bytes,
-                );
+            if let Some(decision) = batch.decision {
+                dispatcher.record(decision, step.ms.max(0.0) as f64 / 1000.0, jobs.len(), batch.bytes);
             }
         }
-
-        if overlap {
-            on_pool = self.tail_submit_prefix(&mut tail, islands, &fallbacks, &mut device_alts, on_pool, fit_train, cfg);
+        route.submit_early(&mut self.pool_fits(&mut pending, fit_train, &settings));
+        // #255: the refit prefix in admission order, written back by slot.
+        let done = route.finish(&mut self.pool_fits(&mut pending, fit_train, &settings));
+        for s in done.settled {
+            islands[s.island][s.slot].tree = s.tree;
         }
-
-        // #255: exact CPU fallback, seeded with the GPU constants when there
-        // were any. The candidates are independent and their admission order is
-        // fixed, so the batch is split across scoped workers exactly like the
-        // finalist refits in `full_data_archive`; the results are written back
-        // in the original order and are bit-identical to the serial loop.
-        let fallback_start = std::time::Instant::now();
-        let (refit, bounded) = fallback_batch_split(fallbacks.len(), cfg.fit_fallback_max);
-        if bounded > 0 {
-            self.fit_fallback_bounded += bounded;
-            let stats = self.stats.entry(generation).or_default();
-            stats.fit_fallback_bounded += bounded;
-        }
-        let mut workers_used = 0usize;
-        if overlap {
-            debug_assert_eq!(on_pool, refit, "the refit prefix is on the pool");
-            let joined = self.tail_join(tail);
-            for (&(_, _, cause), job) in fallbacks[..refit].iter().zip(&joined.jobs) {
-                if job.improved {
-                    self.note_fit_fallback_improved(generation, cause);
-                }
-                if job.skipped {
-                    self.note_fit_fallback_skipped(cause);
-                }
-            }
-            for job in joined.jobs {
-                islands[job.island][job.slot].tree = job.tree;
-            }
-            self.book_fallback_seconds(generation, joined.overlap_s, joined.wait_s, joined.workers);
-        } else if refit > 0 {
-            let mut jobs: Vec<FallbackFitJob> = fallbacks[..refit]
-                .iter()
-                .map(|&(island, slot, cause)| {
-                    FallbackFitJob::new(island, slot, islands[island][slot].tree.clone())
-                        .with_cause(cause)
-                        .with_thresholds(cfg.fit_thresholds)
-                        .with_device(device_alts.remove(&(island, slot)))
-                })
-                .collect();
-            workers_used = fit_fallback_jobs(
-                &mut jobs,
-                &fit_train.x,
-                &fit_train.y,
-                &fit_train.w,
-                cfg.fit_iters,
-                cfg.metric,
-                self.fallback_workers,
-            );
-            for (&(_, _, cause), job) in fallbacks[..refit].iter().zip(&jobs) {
-                if job.improved {
-                    self.note_fit_fallback_improved(generation, cause);
-                }
-                if job.skipped {
-                    self.note_fit_fallback_skipped(cause);
-                }
-            }
-            for job in jobs {
-                islands[job.island][job.slot].tree = job.tree;
-            }
-        }
-        if !overlap {
-            // #284: fallback seconds are measured around the CPU arm itself,
-            // not inferred from a count. The serial arm holds the main thread.
-            let fallback_seconds = fallback_start.elapsed().as_secs_f64();
-            self.book_fallback_seconds(generation, 0.0, fallback_seconds, workers_used);
-        }
+        self.book_fallback_seconds(generation, done.overlap_s, done.wait_s, done.workers);
+        self.absorb_fit_counts(generation, done.counts);
         if let (Some(sample), Some(ev)) = (fit_sample, fit_ev) {
             self.fit_sub = Some(FitSubsample {
                 sample,
@@ -1876,90 +1659,75 @@ impl GpuSearch {
         }
     }
 
-    /// #982: fold the redundant constants of a candidate before its fit. The
-    /// folded tree replaces the candidate, so the device fit, a CPU fallback
-    /// and the archive all see the tree that was fitted.
-    fn fold_redundant(&mut self, tree: &mut Node) {
-        let (folded, removed) = crate::fold::fold_constants(tree);
-        if removed > 0 {
-            *tree = folded;
-            self.fit_fold_count += removed;
-            self.fit_folded += 1;
-        }
-    }
-
-    /// #169: record one CPU fallback for this generation and the whole run.
-    fn note_fit_fallback(&mut self, generation: usize, cause: FitFallbackCause) {
-        self.fit_fallback += 1;
-        *self
-            .fit_fallback_by_cause
-            .entry(cause.label().to_string())
-            .or_default() += 1;
-        let stats = self.stats.entry(generation).or_default();
-        stats.fit_fallback += 1;
-        *stats
-            .fit_fallback_by_cause
-            .entry(cause.label().to_string())
-            .or_default() += 1;
-    }
-
-    /// #265: record that the CPU refit of a fallback of `cause` lowered the
-    /// exact error.
-    fn note_fit_fallback_improved(&mut self, generation: usize, cause: FitFallbackCause) {
-        count_improved(&mut self.fit_fallback_improved_by_cause, cause);
-        let stats = self.stats.entry(generation).or_default();
-        count_improved(&mut stats.fit_fallback_improved_by_cause, cause);
-    }
-
-    /// #988: record that the CPU refit of a fallback of `cause` was skipped.
-    fn note_fit_fallback_skipped(&mut self, cause: FitFallbackCause) {
-        *self
-            .fit_fallback_skipped_by_cause
-            .entry(cause.label().to_string())
-            .or_default() += 1;
-    }
-
-    /// #958: submit the exact CPU fits of `fallbacks[from..]` to the pool, up
-    /// to the `--fit-fallback-max` prefix, each from its slot's current tree.
-    /// Returns how many entries of `fallbacks` are now submitted.
-    fn tail_submit_prefix(
-        &self,
-        tail: &mut PendingTail,
-        islands: &[Vec<Ind>],
-        fallbacks: &[(usize, usize, FitFallbackCause)],
-        device_alts: &mut std::collections::HashMap<(usize, usize), Node>,
-        from: usize,
-        rows: &Sample,
-        cfg: &Config,
-    ) -> usize {
-        let (refit, _) = fallback_batch_split(fallbacks.len(), cfg.fit_fallback_max);
-        if refit <= from {
-            return from;
-        }
-        let jobs: Vec<FallbackFitJob> = fallbacks[from..refit]
-            .iter()
-            .map(|&(i, j, cause)| FallbackFitJob::new(i, j, islands[i][j].tree.clone()).with_cause(cause).with_device(device_alts.remove(&(i, j))).with_thresholds(cfg.fit_thresholds))
-            .collect();
-        self.tail_submit(tail, jobs, rows, cfg.fit_iters, cfg.metric);
-        refit
-    }
-
-    /// #958: submit `jobs` to the fallback pool as one more batch of `tail`.
-    fn tail_submit(
-        &self,
-        tail: &mut PendingTail,
-        jobs: Vec<FallbackFitJob>,
-        rows: &Sample,
-        iters: usize,
-        metric: Metric,
-    ) {
+    /// #1091: the fallback pool as the fit route's exact CPU adapter.
+    fn pool_fits<'a>(&'a self, pending: &'a mut PendingTail, rows: &'a Sample, settings: &FitSettings) -> PoolFits<'a> {
         let pool = self.fallback.as_ref().expect("a GPU search owns its fallback pool");
-        tail.submit(pool, jobs, rows, iters, metric);
+        PoolFits::new(pool, pending, rows, settings, self.fallback_workers)
     }
 
-    /// #958: wait for every batch of `tail`.
-    fn tail_join(&self, tail: PendingTail) -> TailJoin {
-        tail.join(self.fallback.as_ref().expect("a GPU search owns its fallback pool"))
+    /// #284/#600: book the launches of one fit call. Each kernel is one device
+    /// interval on the run clock; its duration is the raw event time, not the
+    /// host envelope. Without event times the launches are placed back to back
+    /// from `launch_start_s` (#1075).
+    fn book_fit_kernel<K>(&mut self, step: &fit_route::DeviceStep<K>, launch_start_s: f64) {
+        let mut host_s = launch_start_s;
+        for launch in &step.launches {
+            let ms = launch.ms;
+            if ms > 0.0 {
+                self.fit_ms += ms as f64;
+                self.fit_polish_ms += launch.polish_ms;
+                self.fit_calls += 1;
+                self.fit_call_candidates += launch.candidates;
+                self.fit_call_ms_max = self.fit_call_ms_max.max(ms as f64);
+                match launch.span_start_s {
+                    Some(start_s) => self.ledger.record_fit_kernel_event(0, start_s, ms as f64 / 1000.0),
+                    None => self.ledger.record_fit_kernel_interval(0, host_s, ms as f64 / 1000.0),
+                }
+                host_s += ms as f64 / 1000.0;
+            }
+        }
+    }
+
+    /// #1091: add the counters of a fit route to the run and generation
+    /// ledgers and to the process-wide `--fit-report` counts (#169, #265,
+    /// #286, #255, #982, #988).
+    fn absorb_fit_counts(&mut self, generation: usize, counts: RouteCounts) {
+        self.fit_fold_count += counts.fold_removed;
+        self.fit_folded += counts.folded;
+        for (cause, n) in counts.fallback {
+            let label = cause.label().to_string();
+            self.fit_fallback += n;
+            *self.fit_fallback_by_cause.entry(label.clone()).or_default() += n;
+            let stats = self.stats.entry(generation).or_default();
+            stats.fit_fallback += n;
+            *stats.fit_fallback_by_cause.entry(label).or_default() += n;
+            for _ in 0..n {
+                crate::fit::note_gpu_fit(false);
+            }
+        }
+        for (cause, n) in counts.improved {
+            for _ in 0..n {
+                count_improved(&mut self.fit_fallback_improved_by_cause, cause);
+                count_improved(&mut self.stats.entry(generation).or_default().fit_fallback_improved_by_cause, cause);
+            }
+        }
+        for (cause, n) in counts.skipped {
+            *self.fit_fallback_skipped_by_cause.entry(cause.label().to_string()).or_default() += n;
+        }
+        if counts.device_fits > 0 {
+            self.fit_gpu += counts.device_fits;
+            self.stats.entry(generation).or_default().fit_gpu += counts.device_fits;
+            for _ in 0..counts.device_fits {
+                crate::fit::note_gpu_fit(true);
+            }
+        }
+        for (label, n) in counts.labels {
+            *self.fit_status_by_label.entry(label.to_string()).or_default() += n;
+        }
+        if counts.bounded > 0 {
+            self.fit_fallback_bounded += counts.bounded;
+            self.stats.entry(generation).or_default().fit_fallback_bounded += counts.bounded;
+        }
     }
 
     /// #958: book the exact CPU fallback seconds of one fit stage: `overlap_s`
@@ -2657,6 +2425,8 @@ impl GpuSearch {
             fit_calls: self.fit_calls,
             fit_call_candidates: self.fit_call_candidates,
             fit_call_ms_max: self.fit_call_ms_max,
+            fit_release_waves: if self.release_waves >= 2 { self.release_waves } else { 0 },
+            fit_tail_early: self.fit_tail_early,
             fit_host_ms: self.fit_host_ms,
             fit_fallback_ms: self.fit_fallback_ms,
             fit_gate_ms: self.fit_gate_ms,
@@ -2764,7 +2534,7 @@ fn exact_start_finite(tree: &Node, x: &[Vec<f64>], y: &[f64], w: &[f64], metric:
 /// #988: a refit cannot change the kept answer when the objective is non-finite
 /// at the starting constants both in the exact scorer and in the fit's own row
 /// pass, and no finite device answer competes with it.
-#[cfg(feature = "cuda")]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn refit_cannot_win(job: &FallbackFitJob, x: &[Vec<f64>], y: &[f64], w: &[f64], metric: Metric) -> bool {
     if exact_start_finite(&job.tree, x, y, w, metric) {
         return false;
@@ -2779,7 +2549,7 @@ fn refit_cannot_win(job: &FallbackFitJob, x: &[Vec<f64>], y: &[f64], w: &[f64], 
 /// #968: one exact CPU fallback fit. A job that carries its device constants
 /// (a routed tail status) keeps the lower exact error of the two answers; a tie
 /// keeps the CPU fit, and a non-finite device error never wins.
-#[cfg(feature = "cuda")]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn run_fallback_fit(
     job: &mut FallbackFitJob,
     x: &[Vec<f64>],
@@ -2855,7 +2625,7 @@ fn fallback_batch_split(total: usize, cap: usize) -> (usize, usize) {
 
 /// #255: one exact CPU fallback fit, owned so the batch can be split across
 /// scoped workers without aliasing the islands.
-#[cfg(feature = "cuda")]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct FallbackFitJob {
     island: usize,
     slot: usize,
@@ -2874,7 +2644,7 @@ struct FallbackFitJob {
     thresholds: bool,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 impl FallbackFitJob {
     fn new(island: usize, slot: usize, tree: Node) -> Self {
         FallbackFitJob {
@@ -2909,7 +2679,7 @@ impl FallbackFitJob {
 /// threads, in fixed order. Each candidate is independent and writes only its
 /// own tree, so the outcome does not depend on which worker finishes first.
 /// Returns the number of workers that actually received a chunk.
-#[cfg(feature = "cuda")]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn fit_fallback_jobs(
     jobs: &mut [FallbackFitJob],
     x: &[Vec<f64>],
@@ -2950,7 +2720,7 @@ fn fit_fallback_jobs(
 /// threads. Each job is `(position, tree, proposal)`; the result keeps the job
 /// order and carries the tree as the gate left it, so the outcome does not
 /// depend on `workers`.
-#[cfg(feature = "cuda")]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn gate_proposals(
     jobs: Vec<(usize, Node, Vec<f64>)>,
     sample: &Sample,
@@ -3400,7 +3170,7 @@ impl PendingTail {
 }
 
 /// #958: a collected [`PendingTail`].
-#[cfg(feature = "cuda")]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct TailJoin {
     /// The fitted jobs in submission order.
     jobs: Vec<FallbackFitJob>,
@@ -3412,6 +3182,41 @@ struct TailJoin {
     wait_s: f64,
     /// Largest number of pool workers one batch could occupy.
     workers: usize,
+}
+
+/// #1091: the fallback pool as the fit route's exact CPU adapter. Submitted
+/// jobs run on the pool beside other work; `run` is the scoped serial arm.
+/// The rows must stay alive and unchanged until the tail is joined or dropped.
+#[cfg(feature = "cuda")]
+struct PoolFits<'a> {
+    pool: &'a FallbackPool,
+    pending: &'a mut PendingTail,
+    rows: &'a Sample,
+    iters: usize,
+    metric: Metric,
+    workers: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> PoolFits<'a> {
+    fn new(pool: &'a FallbackPool, pending: &'a mut PendingTail, rows: &'a Sample, settings: &FitSettings, workers: usize) -> Self {
+        PoolFits { pool, pending, rows, iters: settings.iters, metric: settings.metric, workers }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl ExactFits for PoolFits<'_> {
+    fn submit(&mut self, jobs: Vec<FallbackFitJob>) {
+        self.pending.submit(self.pool, jobs, self.rows, self.iters, self.metric);
+    }
+
+    fn run(&mut self, jobs: &mut [FallbackFitJob]) -> usize {
+        fit_fallback_jobs(jobs, &self.rows.x, &self.rows.y, &self.rows.w, self.iters, self.metric, self.workers)
+    }
+
+    fn join(&mut self) -> TailJoin {
+        std::mem::take(&mut *self.pending).join(self.pool)
+    }
 }
 
 /// #958: total length of the union of `[start, end]` spans.
@@ -3484,6 +3289,24 @@ fn fit_tail_overlap(cfg: &Config) -> bool {
             std::env::var("RCSR_FIT_TAIL_SERIAL").as_deref(),
             Ok("1") | Ok("true") | Ok("on") | Ok("yes")
         )
+}
+
+/// #1075: ordered device calls of the synchronous fit stage:
+/// `RCSR_FIT_RELEASE_WAVES` (an integer from 0 to 64) for an A/B run, else the
+/// config field, the test switch. A value outside that range keeps the config
+/// field and prints one note.
+#[cfg(feature = "cuda")]
+fn fit_release_waves(cfg: &Config) -> usize {
+    match std::env::var("RCSR_FIT_RELEASE_WAVES") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(k) if k <= 64 => k,
+            _ => {
+                eprintln!("# gpu-fit: RCSR_FIT_RELEASE_WAVES={raw} ignored (an integer from 0 to 64)");
+                cfg.fit_release_waves
+            }
+        },
+        Err(_) => cfg.fit_release_waves,
+    }
 }
 
 /// #121: size of the bounded CPU fallback pool: `RCSR_CPU_FALLBACK_THREADS`,
@@ -3677,9 +3500,9 @@ fn score_pipeline_batch(
     gpu: &mut Option<GpuSearch>,
     results: &mut [Vec<Option<PipelineResult>>],
     generation: usize,
-    fit: Option<PipelineFit>,
+    fit: Option<DeviceArm>,
     pending: &mut PipelineFitQueue,
-    fallbacks: &mut Vec<PipelineFallback>,
+    route: &mut FitRoute,
     tail: &mut PipelineTail,
 ) -> Result<(), String> {
     let Some(g) = gpu.as_mut() else {
@@ -3703,21 +3526,22 @@ fn score_pipeline_batch(
             tree: None,
         });
     }
-    let Some(fit) = fit else {
+    let Some(arm) = fit else {
         return Ok(());
     };
 
     // #601: the candidates with constants wait in the queue until a device
     // call is big enough to fill the GPU (`FIT_BATCH_MIN`).
     for (k, mut job) in jobs.into_iter().enumerate() {
-        g.fold_redundant(&mut job.2);
+        route.fold(&mut job.2);
         match crate::fit::gpu_fit_plan_reason(&job.2) {
             Err(crate::fit::GpuFitReject::NoConstants) => {}
             plan => pending.push(job, offered_hash[k], plan),
         }
     }
+    g.absorb_fit_counts(generation, route.take_counts());
     if pending.planned() >= FIT_BATCH_MIN {
-        fit_pipeline_queue(pending, gpu, results, generation, fit, fallbacks, tail)?;
+        fit_pipeline_queue(pending, gpu, results, generation, arm, route, tail)?;
     }
     Ok(())
 }
@@ -3731,8 +3555,8 @@ fn fit_pipeline_queue(
     gpu: &mut Option<GpuSearch>,
     results: &mut [Vec<Option<PipelineResult>>],
     generation: usize,
-    fit: PipelineFit,
-    fallbacks: &mut Vec<PipelineFallback>,
+    arm: DeviceArm,
+    route: &mut FitRoute,
     tail: &mut PipelineTail,
 ) -> Result<(), String> {
     let Some(g) = gpu.as_mut() else {
@@ -3740,18 +3564,17 @@ fn fit_pipeline_queue(
     };
     let (mut jobs, offered_hash, entries) = pending.take();
     let mut plans: Vec<(usize, crate::fit::GpuFitPlan)> = Vec::new();
-    let mut fallback_jobs: Vec<usize> = Vec::new();
+    let mut rejects: Vec<(usize, crate::fit::GpuFitReject)> = Vec::new();
     for (k, entry) in entries.into_iter().enumerate() {
         match entry {
             Ok(plan) => plans.push((k, plan)),
-            Err(_) => fallback_jobs.push(k),
+            Err(reason) => rejects.push((k, reason)),
         }
     }
-    let offered = plans.len() + fallback_jobs.len();
+    let offered = plans.len() + rejects.len();
     if offered == 0 {
         return Ok(());
     }
-    let fresh = fallbacks.len();
     let fit_start = std::time::Instant::now();
     g.fit_attempts += offered;
     {
@@ -3759,94 +3582,25 @@ fn fit_pipeline_queue(
         stats.generation = generation;
         stats.fit_attempts += offered;
     }
-    for &k in &fallback_jobs {
-        let (i, j) = (jobs[k].0, jobs[k].1);
-        let cause = match crate::fit::gpu_fit_plan_reason(&jobs[k].2) {
-            Err(crate::fit::GpuFitReject::TooManyConstants) => FitFallbackCause::TooManyConstants,
-            _ => FitFallbackCause::UnsupportedPlan,
-        };
-        g.note_fit_fallback(generation, cause);
-        crate::fit::note_gpu_fit(false);
-        fallbacks.push(PipelineFallback::new(0, i, j, cause, offered_hash[k], jobs[k].2.clone()));
+    // #1091: a plan reject carries the label of the synchronous stage.
+    for &(k, reason) in &rejects {
+        let (i, j, tree) = &jobs[k];
+        route.reject(*i, *j, fit_route::PLAN, plan_fallback_cause(reason), tree, offered_hash[k]);
     }
-
     let mut fitted: Vec<usize> = Vec::new();
     if !plans.is_empty() {
-        let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().map(|(_, p)| p).collect();
-        // #236: slope always starts from the squared warm start and keeps the
-        // incoming constants unless it improves on them.
-        g.ev.set_fit_polish(fit.polish);
         let fit_device_start = g.ledger_offset_s();
-        let (out, ms) = if fit.loss == crate::fit::DeviceLoss::Slope {
-            g.ev.slope_fit_batch(&refs, fit.iters)
-        } else {
-            g.ev.fit_batch(&refs, fit.iters, fit.loss)
-        };
-        if ms > 0.0 {
-            g.fit_ms += ms as f64;
-            g.fit_polish_ms += g.ev.take_polish_ms(ms);
-            g.fit_calls += 1;
-            g.fit_call_candidates += plans.len();
-            g.fit_call_ms_max = g.fit_call_ms_max.max(ms as f64);
-            // #600: the fit kernel is one device interval on the run clock.
-            match g.ev.take_span_start_s(crate::gpu::SPAN_FIT) {
-                Some(start_s) => g.ledger.record_fit_kernel_event(0, start_s, ms as f64 / 1000.0),
-                None => g.ledger.record_fit_kernel_interval(
-                    0,
-                    fit_device_start,
-                    ms as f64 / 1000.0,
-                ),
-            }
-        }
-        if ms < 0.0 || out.len() != plans.len() {
-            for (k, _) in &plans {
-                let (i, j) = (jobs[*k].0, jobs[*k].1);
-                g.note_fit_fallback(generation, FitFallbackCause::Launch);
-                crate::fit::note_gpu_fit(false);
-                let kept = jobs[*k].2.clone();
-                fallbacks.push(PipelineFallback::new(1, i, j, FitFallbackCause::Launch, offered_hash[*k], kept));
-            }
-        } else {
-            for ((k, plan), res) in plans.iter().zip(out) {
-                let verdict = apply_device_fit(plan, &mut jobs[*k].2, &res);
-                if verdict.is_none() {
-                    if let Some(label) = gpu_status_label(res.status) {
-                        *g.fit_status_by_label.entry(label.to_string()).or_default() += 1;
-                    }
-                    g.fit_gpu += 1;
-                    g.stats.entry(generation).or_default().fit_gpu += 1;
-                    crate::fit::note_gpu_fit(true);
-                    fitted.push(*k);
-                } else if let Some(cause) = verdict {
-                    let (i, j) = (jobs[*k].0, jobs[*k].1);
-                    g.note_fit_fallback(generation, cause);
-                    crate::fit::note_gpu_fit(false);
-                    let kept = jobs[*k].2.clone();
-                    let mut fb = PipelineFallback::new(1, i, j, cause, offered_hash[*k], kept);
-                    fb.device = tail_device_tree(plan, &jobs[*k].2, &res);
-                    fallbacks.push(fb);
-                }
-            }
-        }
+        let mut slots = fit_route::QueueSlots { jobs: &mut jobs, offered: &offered_hash };
+        let step = route.fit_on_device(&mut g.ev, arm, &plans, &mut slots, tail.rows, 1);
+        // #600: the fit kernel is one device interval on the run clock.
+        g.book_fit_kernel(&step, fit_device_start);
+        fitted = step.fitted;
     }
+    g.absorb_fit_counts(generation, route.take_counts());
     // #958: the exact CPU fits of this call's fallbacks start now, beside the
     // rest of the generation; the barrier joins them in its own order.
-    if g.tail_overlap {
-        let base = tail.pending.jobs;
-        // Past `--fit-fallback-max` fits of one generation an early fit could
-        // only be dropped at the barrier.
-        let room = if tail.cap == 0 { usize::MAX } else { tail.cap.saturating_sub(base) };
-        let jobs: Vec<FallbackFitJob> = fallbacks[fresh..]
-            .iter_mut()
-            .take(room)
-            .enumerate()
-            .map(|(k, f)| {
-                f.early = Some(base + k);
-                FallbackFitJob::new(f.island, f.slot, f.tree.clone()).with_cause(f.cause).with_device(f.device.clone()).with_thresholds(fit.thresholds)
-            })
-            .collect();
-        g.tail_submit(&mut tail.pending, jobs, tail.rows, fit.iters, fit.metric);
-    }
+    let settings = *route.settings();
+    route.submit_early(&mut g.pool_fits(&mut tail.pending, tail.rows, &settings));
 
     let fit_ms_elapsed = fit_start.elapsed().as_secs_f64() * 1000.0;
     g.fit_host_ms += fit_ms_elapsed;
@@ -3877,167 +3631,42 @@ fn fit_pipeline_queue(
     Ok(())
 }
 
-/// #578: write the device constants into `tree` whenever they are finite, as
-/// the synchronous `fit_pending` does, so a CPU fallback starts from them. The
-/// result is the fallback cause, or `None` for a usable device fit. #936:
-/// statuses 4, 5 and 7 leave the tree at its starting constants.
-#[cfg(feature = "cuda")]
-fn apply_device_fit(
-    plan: &crate::fit::GpuFitPlan,
-    tree: &mut Node,
-    res: &crate::gpu::GpuFitOutput,
-) -> Option<FitFallbackCause> {
-    if let Some(cause) = tail_status_cause(res.status) {
-        return Some(cause);
-    }
-    let finite = res.c.iter().all(|v| v.is_finite());
-    if finite {
-        plan.apply(tree, &res.c);
-    }
-    if !finite {
-        Some(FitFallbackCause::NonFinite)
-    } else if crate::fit::fit_status_usable(res.status) {
-        None
-    } else {
-        Some(status_fallback_cause(res.status))
-    }
-}
-
-/// #968: the tree at the device constants of a routed tail status, when they
-/// are finite; the exact CPU fit then competes with it.
-#[cfg(feature = "cuda")]
-fn tail_device_tree(
-    plan: &crate::fit::GpuFitPlan,
-    tree: &Node,
-    res: &crate::gpu::GpuFitOutput,
-) -> Option<Node> {
-    tail_status_cause(res.status)?;
-    if !res.c.iter().all(|v| v.is_finite()) {
-        return None;
-    }
-    let mut device = tree.clone();
-    plan.apply(&mut device, &res.c);
-    Some(device)
-}
-
-/// #578: a candidate that needs the exact CPU fit. The refit happens at the
-/// generation barrier, in the synchronous admission order, so
-/// `--fit-fallback-max` picks the same candidates as on the synchronous path.
-/// `tree` carries the finite device constants when the device produced any.
-#[cfg(feature = "cuda")]
-struct PipelineFallback {
-    /// 0: structural plan reject, 1: device status or launch failure; the order
-    /// of the synchronous `fallbacks` vector.
-    group: u8,
-    island: usize,
-    slot: usize,
-    cause: FitFallbackCause,
-    offered: u64,
-    tree: Node,
-    /// #958: position of this fallback's early exact fit in the generation's
-    /// [`PipelineTail`], when one was started.
-    early: Option<usize>,
-    /// #968: the tree at its device constants for a routed tail status.
-    device: Option<Node>,
-}
-
-#[cfg(feature = "cuda")]
-impl PipelineFallback {
-    fn new(group: u8, island: usize, slot: usize, cause: FitFallbackCause, offered: u64, tree: Node) -> Self {
-        Self { group, island, slot, cause, offered, tree, early: None, device: None }
-    }
-}
-
 /// #958: the overlap pipeline's exact CPU fits, started as each device call
 /// is read and joined at the generation barrier. `rows` are the rows the
 /// barrier refits on.
 #[cfg(feature = "cuda")]
 struct PipelineTail<'a> {
     rows: &'a Sample,
-    /// `--fit-fallback-max`.
-    cap: usize,
     pending: PendingTail,
 }
 
-/// #578: refit the first `fit_fallback_max` fallbacks of the generation on the
-/// CPU, hold the rest at their device constants, then simplify and score every
-/// fallback tree on the device, as `fit_pending` and its re-score do. #958: a
-/// fallback whose exact fit started early on the pool takes that result; one
-/// past the prefix drops it.
+/// #578: refit the first `--fit-fallback-max` fallbacks of the generation on
+/// the CPU in the synchronous order, hold the rest, then simplify and score
+/// every fallback tree on the device, as `fit_pending` and its re-score do.
+/// #958: a fallback whose exact fit started early on the pool takes that
+/// result; one past the prefix drops it.
 #[cfg(feature = "cuda")]
 fn finish_pipeline_fallbacks(
     g: &mut GpuSearch,
-    mut fallbacks: Vec<PipelineFallback>,
+    route: &mut FitRoute,
     results: &mut [Vec<Option<PipelineResult>>],
-    train: &Sample,
-    fit: PipelineFit,
-    cap: usize,
+    tail: &mut PipelineTail,
     generation: usize,
-    tail: PendingTail,
 ) -> Result<(), String> {
-    if fallbacks.is_empty() {
+    if route.is_empty() {
         return Ok(());
     }
-    fallbacks.sort_by_key(|f| (f.group, f.island, f.slot));
-    let (refit, bounded) = fallback_batch_split(fallbacks.len(), cap);
-    if bounded > 0 {
-        g.fit_fallback_bounded += bounded;
-        g.stats.entry(generation).or_default().fit_fallback_bounded += bounded;
-    }
+    let settings = *route.settings();
     let start = std::time::Instant::now();
-    let joined = g.tail_join(tail);
-    let mut early: Vec<Option<FallbackFitJob>> = joined.jobs.into_iter().map(Some).collect();
-    let mut rest: Vec<usize> = Vec::new();
-    for (n, f) in fallbacks[..refit].iter_mut().enumerate() {
-        match f.early.and_then(|k| early[k].take()) {
-            Some(job) => {
-                if job.improved {
-                    g.note_fit_fallback_improved(generation, f.cause);
-                }
-                if job.skipped {
-                    g.note_fit_fallback_skipped(f.cause);
-                }
-                f.tree = job.tree;
-            }
-            None => rest.push(n),
-        }
-    }
-    let rest_start = std::time::Instant::now();
-    let mut workers_used = joined.workers;
-    if !rest.is_empty() {
-        let mut jobs: Vec<FallbackFitJob> = rest
-            .iter()
-            .map(|&n| {
-                let f = &mut fallbacks[n];
-                FallbackFitJob::new(f.island, f.slot, f.tree.clone()).with_cause(f.cause).with_device(f.device.take()).with_thresholds(fit.thresholds)
-            })
-            .collect();
-        workers_used = workers_used.max(fit_fallback_jobs(
-            &mut jobs,
-            &train.x,
-            &train.y,
-            &train.w,
-            fit.iters,
-            fit.metric,
-            g.fallback_workers,
-        ));
-        for (&n, job) in rest.iter().zip(jobs) {
-            if job.improved {
-                g.note_fit_fallback_improved(generation, fallbacks[n].cause);
-            }
-            if job.skipped {
-                g.note_fit_fallback_skipped(fallbacks[n].cause);
-            }
-            fallbacks[n].tree = job.tree;
-        }
-    }
-    let rest_s = rest_start.elapsed().as_secs_f64();
+    let done = route.finish(&mut g.pool_fits(&mut tail.pending, tail.rows, &settings));
     g.fit_host_ms += start.elapsed().as_secs_f64() * 1000.0;
-    g.book_fallback_seconds(generation, joined.overlap_s, joined.wait_s + rest_s, workers_used);
+    g.book_fallback_seconds(generation, done.overlap_s, done.wait_s, done.workers);
+    g.absorb_fit_counts(generation, done.counts);
 
-    let scored: Vec<PipelineJob> = fallbacks
+    let scored: Vec<PipelineJob> = done
+        .settled
         .iter()
-        .map(|f| (f.island, f.slot, expr::simplify(&f.tree)))
+        .map(|s| (s.island, s.slot, expr::simplify(&s.tree)))
         .collect();
     let (kept, errs) = eval_pipeline_jobs(g, &scored, generation)?;
     for (&pos, &(err, bad)) in kept.iter().zip(&errs) {
@@ -4045,7 +3674,7 @@ fn finish_pipeline_fallbacks(
         results[*i][*j] = Some(PipelineResult {
             error: err,
             nonfinite: bad,
-            offered: fallbacks[pos].offered,
+            offered: done.settled[pos].tag,
             tree: Some(tree.clone()),
         });
     }
@@ -5509,8 +5138,11 @@ struct FitBatch {
     decision: Option<crate::dispatch::Decision>,
     /// Workload bytes of the batch decision.
     bytes: u64,
-    /// Candidates refused, with the cause each reports.
+    /// Candidates refused, with the cause each reports: the row floor first,
+    /// then the dispatcher's refusal of the rest of the batch.
     refused: Vec<(usize, usize, FitFallbackCause)>,
+    /// #1091: `refused[..floor]` are the row-floor refusals.
+    floor: usize,
 }
 
 /// #453: plan the fit stage once for the whole batch.
@@ -5536,8 +5168,9 @@ fn plan_fit_batch(
             valid.push((i, j, plan));
         }
     }
+    let floor = refused.len();
     if valid.is_empty() {
-        return FitBatch { jobs: valid, decision: None, bytes: 0, refused };
+        return FitBatch { jobs: valid, decision: None, bytes: 0, refused, floor };
     }
     let widest = valid.iter().map(|(_, _, p)| p.nconst).max().unwrap_or(1);
     let workload = crate::dispatch::Workload::fit(valid.len(), rows, widest, sweeps)
@@ -5548,7 +5181,7 @@ fn plan_fit_batch(
     };
     let decision = dispatcher.plan(crate::dispatch::Stage::Fit, &workload);
     if decision.route == crate::dispatch::Route::Device {
-        return FitBatch { jobs: valid, decision: Some(decision), bytes: workload.bytes, refused };
+        return FitBatch { jobs: valid, decision: Some(decision), bytes: workload.bytes, refused, floor };
     }
     // A cost-model refusal is a policy route, not an arithmetic fallback:
     // label it `dispatch_cost`.
@@ -5560,7 +5193,7 @@ fn plan_fit_batch(
     };
     refused.extend(valid.iter().map(|(i, j, _)| (*i, *j, cause)));
     dispatcher.record(decision, 0.0, valid.len(), workload.bytes);
-    FitBatch { jobs: Vec::new(), decision: Some(decision), bytes: workload.bytes, refused }
+    FitBatch { jobs: Vec::new(), decision: Some(decision), bytes: workload.bytes, refused, floor }
 }
 
 /// #169: map a structural fit-plan rejection to its reported cause.
@@ -6494,20 +6127,6 @@ impl PipelineFitQueue {
     }
 }
 
-/// #286: the device fit arm carried by the overlap queue when the admission
-/// set is every candidate with constants (wide panels). The fit of an earlier
-/// candidate then runs while the island threads keep generating later ones,
-/// instead of a single evaluate → fit → re-evaluate barrier.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-#[derive(Clone, Copy, Debug)]
-struct PipelineFit {
-    loss: crate::fit::DeviceLoss,
-    iters: usize,
-    metric: Metric,
-    polish: crate::fit::FitPolish,
-    thresholds: bool,
-}
-
 /// #286: overlap-with-fit is legal only where the serial admission set is
 /// already "every pending candidate with constants". That is exactly
 /// [`WIDE_ADMISSION_ROWS`], and only for the LM family (the rank/order/
@@ -7027,6 +6646,10 @@ pub struct GpuRunStats {
     pub fit_calls: usize,
     pub fit_call_candidates: usize,
     pub fit_call_ms_max: f64,
+    /// #1075: ordered device calls the synchronous fit was set to (`0` is one
+    /// call), and the fallbacks whose exact fit started from a released answer.
+    pub fit_release_waves: usize,
+    pub fit_tail_early: usize,
     /// #496: arithmetic of the device fit polish.
     pub fit_polish: crate::fit::FitPolish,
     /// #169: wall time spent in the whole fit stage, milliseconds.
@@ -7353,6 +6976,7 @@ fn snapshot(
                     rng: Mt::from_state(*words, idx),
                     mix: mixes.get(i).cloned().unwrap_or_default(),
                     stall: policy.stall(i),
+                    front: policy.island_front(i).to_vec(), // #1070
                     population: pop.iter().map(Ind::to_checkpoint).collect(),
                 }
             })
@@ -7974,18 +7598,25 @@ fn run_postfix_search(
         // flat engine draw 15 % of parents from it. With the feature off the
         // pool is empty and `front_p` is 0.0, so the draw consumes no RNG and
         // the trajectory is exactly the pre-#76 one.
-        let front = if cfg.front_parents {
-            FrontParents::from_front(&archive.items, variation.width, cfg.max_complexity)
+        // #1070: one compiled front per island under --front-scope island; every
+        // island shares the global one otherwise.
+        let fronts: Vec<FrontParents> = if !cfg.front_parents {
+            vec![FrontParents::empty()]
+        } else if cfg.front_scope == FrontScope::Island {
+            (0..n_islands)
+                .map(|i| FrontParents::from_front(policy.front(i, &archive.items), variation.width, cfg.max_complexity))
+                .collect()
         } else {
-            FrontParents::empty()
+            vec![FrontParents::from_front(&archive.items, variation.width, cfg.max_complexity)]
         };
+        let front_of: Vec<&FrontParents> = (0..n_islands).map(|i| fronts.get(i).unwrap_or(&fronts[0])).collect();
         // #1022 #1081: the island policy sets each island's front probability.
         let front_ps: Vec<f64> = (0..n_islands).map(|i| policy.parent_source(i).front_p).collect();
-        let mut next = variation.next_generation_with_front(
+        let mut next = variation.next_generation_with_fronts(
             &pool,
             gen as u32,
             &restart_flags,
-            &front,
+            &front_of,
             &front_ps,
         );
         let dev_generate = dev_lap(&mut dev_mark); // #211
@@ -8032,6 +7663,7 @@ fn run_postfix_search(
         let mut dev_rec: Option<crate::devlog::GenRecord> = None; // #1022: reported after the restart step
         let dev_archive = dev_lap(&mut dev_mark); // #211
         let stage_archive = stage_lap(&mut stage_mark); // #284
+        policy.offer(&next, &|t| !(filter_fixed_archive && fixed_position_archived(t, cfg))); // #1070
         policy.observe(&next); // #1022: each island's own stall, after the archive update
         run_ledger.record_stage(crate::gpu_stats::Stage::Vary, stage_generate);
         run_ledger.record_stage(crate::gpu_stats::Stage::Archive, stage_archive);
@@ -8446,6 +8078,19 @@ fn run_search_scoped(
             ));
         }
     }
+    if cfg.explore_islands > 0 && cfg.explore_islands >= cfg.islands.max(1) {
+        return Err(format!(
+            "--explore-islands {} needs at least one exploit island (--islands {})",
+            cfg.explore_islands,
+            cfg.islands.max(1)
+        )); // #1100
+    }
+    if cfg.front_scope == FrontScope::Island && cfg.qd_policy {
+        return Err(
+            "--front-scope island with --qd-policy: the QD archive is one parent pool shared by every island"
+                .to_string(),
+        ); // #1070
+    }
     #[cfg(feature = "cuda")]
     crate::gpu::note_search_start();
     let nvars = train.x.first().map(|r| r.len()).unwrap_or(0);
@@ -8626,6 +8271,7 @@ fn run_search_scoped(
                     Ok(mut g) => {
                         g.memory_plan = memory_plan;
                         g.tail_overlap = fit_tail_overlap(cfg);
+                        g.release_waves = fit_release_waves(cfg);
                         let device = crate::gpu::GpuEvaluator::device_name();
                         if cfg.gpu_notes {
                             // #169: the GPU-fit arm runs at the generation
@@ -8898,10 +8544,12 @@ fn run_search_scoped(
         rngs = Vec::with_capacity(saved_islands.len());
         islands = Vec::with_capacity(saved_islands.len());
         let mut saved_stalls = Vec::with_capacity(saved_islands.len());
+        let mut saved_fronts = Vec::with_capacity(saved_islands.len()); // #1070
         mixes = Vec::with_capacity(saved_islands.len());
         for isl in saved_islands {
             rngs.push(isl.rng);
             saved_stalls.push(isl.stall);
+            saved_fronts.push(isl.front);
             mixes.push(isl.mix);
             islands.push(
                 isl.population
@@ -8910,7 +8558,7 @@ fn run_search_scoped(
                     .collect(),
             );
         }
-        policy = IslandPolicy::resume(cfg, saved_stagnant, &saved_stalls)?;
+        policy = IslandPolicy::resume(cfg, saved_stagnant, &saved_stalls, saved_fronts)?;
         let want = cfg.islands.max(1);
         if islands.len() != want || rngs.len() != want || policy.stagnant().len() != want {
             return Err(format!(
@@ -9327,13 +8975,8 @@ fn run_search_scoped(
             // candidate with constants. Then fitting an earlier candidate
             // overlaps the island threads' generation of later ones, instead
             // of one evaluate → fit → re-evaluate barrier per generation.
-            let pipeline_fit = pipeline_fit_safe(cfg, train.len(), screened).then(|| PipelineFit {
-                loss: crate::fit::fit_loss(cfg.metric)
-                    .expect("pipeline_fit_safe admits only LM objectives"),
-                iters: cfg.fit_iters,
-                metric: cfg.metric,
-                polish: cfg.fit_polish,
-                thresholds: cfg.fit_thresholds,
+            let pipeline_fit = pipeline_fit_safe(cfg, train.len(), screened).then(|| {
+                DeviceArm::Lm(crate::fit::fit_loss(cfg.metric).expect("pipeline_fit_safe admits only LM objectives"))
             });
             #[cfg(feature = "cuda")]
             let pipeline_active = !screened
@@ -9348,7 +8991,7 @@ fn run_search_scoped(
             let pipeline_active = false;
             #[cfg(not(feature = "cuda"))]
             #[allow(unused_variables)]
-            let pipeline_fit: Option<PipelineFit> = None;
+            let pipeline_fit: Option<fit_route::DeviceArm> = None;
             // One batch is `pop / depth` candidates, so `depth` batches queue
             // ahead of the scorer; live memory is at most `(depth + 1) * batch`
             // candidate trees plus their compiled programs.
@@ -9368,10 +9011,9 @@ fn run_search_scoped(
             #[cfg(feature = "cuda")]
             let mut pipeline_scored = false;
             #[cfg(feature = "cuda")]
-            let mut pipeline_fallbacks: Vec<PipelineFallback> = Vec::new();
+            let mut pipeline_route = FitRoute::new(FitSettings::of(cfg), gpu.as_ref().is_some_and(|g| g.tail_overlap));
             #[cfg(feature = "cuda")]
-            let mut pipeline_tail =
-                PipelineTail { rows: gen_train, cap: cfg.fit_fallback_max, pending: PendingTail::default() };
+            let mut pipeline_tail = PipelineTail { rows: gen_train, pending: PendingTail::default() };
             #[cfg(feature = "cuda")]
             let mut fit_queue = PipelineFitQueue::default();
             std::thread::scope(|s| {
@@ -9401,7 +9043,7 @@ fn run_search_scoped(
                     .map(|(i, (((isl, r), mix), sender))| {
                         // #10: carry the block registry into the island thread.
                         let blocks = blocks.clone();
-                        let parents = Parents { front, qd: qd_parents, source: policy.parent_source(i) }; // #76 #120 #1081
+                        let parents = Parents { front: policy.front(i, front), qd: qd_parents, source: policy.parent_source(i) }; // #76 #120 #1081 #1070
                         s.spawn(move || {
                             expr::set_blocks(blocks);
                             #[cfg(feature = "cuda")]
@@ -9440,7 +9082,7 @@ fn run_search_scoped(
                             gen,
                             pipeline_fit,
                             &mut fit_queue,
-                            &mut pipeline_fallbacks,
+                            &mut pipeline_route,
                             &mut pipeline_tail,
                         )
                     });
@@ -9452,7 +9094,7 @@ fn run_search_scoped(
                                 &mut pipeline_results,
                                 gen,
                                 fit,
-                                &mut pipeline_fallbacks,
+                                &mut pipeline_route,
                                 &mut pipeline_tail,
                             )
                             .err();
@@ -9470,18 +9112,10 @@ fn run_search_scoped(
             {
                 if pipeline_active {
                     if pipeline_error.is_none() {
-                        if let (Some(g), Some(fit)) = (gpu.as_mut(), pipeline_fit) {
-                            pipeline_error = finish_pipeline_fallbacks(
-                                g,
-                                std::mem::take(&mut pipeline_fallbacks),
-                                &mut pipeline_results,
-                                gen_train,
-                                fit,
-                                cfg.fit_fallback_max,
-                                gen,
-                                std::mem::take(&mut pipeline_tail.pending),
-                            )
-                            .err();
+                        if let (Some(g), Some(_)) = (gpu.as_mut(), pipeline_fit) {
+                            pipeline_error =
+                                finish_pipeline_fallbacks(g, &mut pipeline_route, &mut pipeline_results, &mut pipeline_tail, gen)
+                                    .err();
                         }
                     }
                     // Results are keyed by (island, slot), so the arrival order
@@ -9643,6 +9277,7 @@ fn run_search_scoped(
             let dev_archive = dev_lap(&mut dev_mark); // #211
             let stage_archive = stage_lap(&mut stage_mark); // #284
 
+            policy.offer(&islands[..], &|t| !(filter_fixed_archive && fixed_position_archived(t, cfg))); // #1070
             policy.observe(&islands[..]); // #1022: each island's own stall, after the archive update
 
             #[cfg(feature = "cuda")]
@@ -10156,51 +9791,6 @@ mod gpu_dead_start_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// #578: a device result with a non-usable status but finite constants
-    /// still moves the tree, so the CPU fallback starts from them.
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn a_non_usable_device_status_still_applies_finite_constants() {
-        use crate::expr::{constant, input, node, Op};
-        let tree = node(Op::Add, vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.5)]);
-        let plan = crate::fit::gpu_fit_plan_reason(&tree).expect("an eligible plan");
-        let out = |status: i32, c: Vec<f64>| crate::gpu::GpuFitOutput {
-            c,
-            sse: 0.0,
-            status,
-        };
-        for (status, cause) in [
-            (1, FitFallbackCause::IllConditioned),
-            (2, FitFallbackCause::NonFinite),
-            (3, FitFallbackCause::RankDeclined),
-        ] {
-            let mut t = tree.clone();
-            assert_eq!(apply_device_fit(&plan, &mut t, &out(status, vec![2.0, 3.0])), Some(cause));
-            let mut want = tree.clone();
-            plan.apply(&mut want, &[2.0, 3.0]);
-            assert_eq!(t, want, "status {status}");
-            assert_ne!(t, tree);
-        }
-        for (status, cause) in [
-            (4, FitFallbackCause::RankDeficient),
-            (5, FitFallbackCause::RecoveredIterate),
-            (7, FitFallbackCause::NonFiniteStart),
-            (9, FitFallbackCause::Unconverged),
-        ] {
-            let mut t = tree.clone();
-            assert_eq!(apply_device_fit(&plan, &mut t, &out(status, vec![2.0, 3.0])), Some(cause));
-            assert_eq!(t, tree, "status {status} keeps the start");
-        }
-        let mut t = tree.clone();
-        assert_eq!(apply_device_fit(&plan, &mut t, &out(0, vec![2.0, 3.0])), None);
-        let mut t = tree.clone();
-        assert_eq!(
-            apply_device_fit(&plan, &mut t, &out(0, vec![f64::NAN, 3.0])),
-            Some(FitFallbackCause::NonFinite)
-        );
-        assert_eq!(t, tree, "non-finite constants are never applied");
-    }
 
     /// #453: `n` eligible `c0 * x0 + c1` plans, one constant pair each.
     fn affine_plans(n: usize) -> Vec<(usize, usize, crate::fit::GpuFitPlan)> {
@@ -10892,7 +10482,6 @@ mod tests {
 
     /// #1024: every job of a multi-worker fallback pool fits its threshold; a job
     /// without the flag keeps it. Runs on the host only.
-    #[cfg(feature = "cuda")]
     #[test]
     fn fallback_pool_fits_thresholds_on_every_worker() {
         let (x, y, tree) = threshold_fixture();
@@ -10911,7 +10500,6 @@ mod tests {
 
     /// #988: only a `NonFiniteStart` job with a non-finite start skips its refit,
     /// and a skipped job keeps its tree.
-    #[cfg(feature = "cuda")]
     #[test]
     fn only_dead_non_finite_start_jobs_skip_the_refit() {
         let s = sample();
@@ -12614,7 +12202,6 @@ mod tests {
     /// #255: the exact CPU fallback batch is a pure parallelisation. One worker
     /// and eight workers must produce the same tree bits, in the same order,
     /// including the seeded constants the device already applied.
-    #[cfg(feature = "cuda")]
     #[test]
     fn fit_fallback_is_identical_for_one_and_many_workers() {
         let s = sample();

@@ -88,6 +88,10 @@ niche diversity.
 Under `--restart-policy island` an island inside its isolation window takes
 none of these draws: no cell parent and no global-front parent. It breeds from
 its own members by the island tournament until the window closes (#1067).
+An explore island (`--explore-islands`, #1100) takes none of them for its whole
+life. `--front-scope island` (#1070) is refused with `--qd-policy`: the QD
+archive is one parent pool for every island, so the search would not be
+island-local.
 
 Migration keeps the ring but replaces the individual nearest the
 **least-visited cell's centroid** instead of the globally worst error.
