@@ -416,7 +416,7 @@ records version, build commit, binary SHA-256, device, driver and threads;
 `--resume` refuses a mismatch unless `--allow-build-change` is given. A different CPU count (`threads`) is reported and never refused. It also refuses a different target spec (sha256 recorded in the checkpoint), exit 2. Saves are crash-safe: temp file, `fsync`, atomic rename,
 with the previous good generation kept as `run.rcsr.prev`. Saving does not
 consume randomness, so it cannot change the result. The saved search settings
-win on resume; only the generation budget may be raised, and data that does not
+win on resume (an explicit flag that differs from the saved value, including `--variation`, `--qd*`, `--units` and `--require-dimensions`, exits 2); only the generation budget may be raised, and data that does not
 match the saved fingerprint is refused. A CPU checkpoint is never silently
 continued on the GPU (or vice versa): `--resume` refuses the backend change
 unless `--allow-backend-change` is explicit. See

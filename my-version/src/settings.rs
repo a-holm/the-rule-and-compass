@@ -18,7 +18,7 @@
 //! so older checkpoints still load and default checkpoints keep their bytes.
 //! `tests/settings_table.rs` checks every row in every reader.
 
-use crate::search::{Config, FrontScope, MutationMix, RestartPolicy, Selection};
+use crate::search::{Config, FrontScope, MutationMix, RestartPolicy, Selection, VariationMode};
 use std::collections::BTreeMap;
 
 /// Where a row's lines appear in each reader.
@@ -34,10 +34,13 @@ pub enum Group {
     Filter,
     /// Constant-fit options.
     Fit,
+    /// The variation engine selection, after the checkpoint options.
+    Engine,
 }
 
 impl Group {
-    pub const ALL: [Group; 5] = [Group::Stop, Group::Island, Group::Variation, Group::Filter, Group::Fit];
+    pub const ALL: [Group; 6] =
+        [Group::Stop, Group::Island, Group::Variation, Group::Filter, Group::Fit, Group::Engine];
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -46,6 +49,7 @@ impl Group {
             Group::Variation => "variation",
             Group::Filter => "filter",
             Group::Fit => "fit",
+            Group::Engine => "engine",
         }
     }
 }
@@ -150,7 +154,7 @@ macro_rules! enum_value {
     )*};
 }
 
-enum_value!(Selection, RestartPolicy, MutationMix, FrontScope);
+enum_value!(Selection, RestartPolicy, MutationMix, FrontScope, VariationMode);
 
 /// How the command line sets a row.
 pub enum Cli<T> {
@@ -165,6 +169,8 @@ pub enum Cli<T> {
 pub enum Write {
     /// Every checkpoint; a checkpoint without the key is refused.
     Required,
+    /// Every checkpoint; a checkpoint without the key loads the default.
+    Always,
     /// Only when the row is active and its value differs from `Config::default()`;
     /// a checkpoint without the key loads the default.
     UnlessDefault,
@@ -222,6 +228,8 @@ pub trait Setting: Sync {
     fn bench(&self) -> Option<&Bench>;
     fn gui(&self) -> bool;
     fn required(&self) -> bool;
+    /// The checkpoint writer emits the key even at the default.
+    fn always(&self) -> bool;
     fn takes_value(&self) -> bool;
     /// Set the row from the command line; `value` is `None` for a flag.
     fn apply_cli(&self, cfg: &mut Config, value: Option<&str>) -> Result<(), String>;
@@ -262,6 +270,9 @@ impl<T: Value> Setting for Row<T> {
     }
     fn required(&self) -> bool {
         self.write == Write::Required
+    }
+    fn always(&self) -> bool {
+        self.write == Write::Always
     }
     fn takes_value(&self) -> bool {
         matches!(self.cli, Cli::Value(_))
@@ -305,7 +316,7 @@ impl<T: Value> Setting for Row<T> {
     }
     fn write(&self, cfg: &Config, default: &Config, out: &mut String) {
         let emit = match self.write {
-            Write::Required => true,
+            Write::Required | Write::Always => true,
             Write::UnlessDefault => self.active(cfg) && self.differs(cfg, default),
         };
         if emit {
@@ -790,5 +801,27 @@ pub static TABLE: &[&dyn Setting] = &[
         write: Write::UnlessDefault,
         active: None,
         conflict: Conflict::Saved,
+    },
+    &Row::<VariationMode> {
+        flag: "--variation",
+        key: "variation",
+        group: Group::Engine,
+        schema_type: "enum",
+        schema_default: "auto",
+        schema: "variation engine: auto (flat postfix arena for --no-fit GPU runs with population >= 4096), node (historical owned-tree loop) or postfix (require the flat path; error when the run does not qualify)",
+        help: "  --variation auto|node|postfix
+                             variation engine. auto (default) uses the flat
+                             postfix arena for --no-fit GPU runs with a
+                             population >= 4096; node keeps the owned-tree loop;
+                             postfix requires the flat path and refuses a run
+                             that does not qualify",
+        bench: None,
+        gui: false,
+        get: |c| &c.variation,
+        set: |c| &mut c.variation,
+        cli: Cli::Value(VariationMode::parse),
+        write: Write::Always,
+        active: None,
+        conflict: Conflict::SavedKey,
     },
 ];
