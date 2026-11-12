@@ -1429,8 +1429,8 @@ second one. Their resources, from `cuobjdump -res-usage` on the built
 
 | constant cap | block | row chunk | dynamic shared | registers | stack (local frame) |
 |---:|---:|---:|---:|---:|---:|
-| 16 | 256 | 256 | 28 048 B | 127 (12.0), 128 (13.0) | 5 056 B (12.0), 4 288 B (13.0) |
-| 20 | 128 | 128 | 31 632 B | 106 (12.0), 96 (13.0) | 5 200 B (12.0), 4 480 B (13.0) |
+| 16 | 256 | 256 | 28 048 B | 128 (12.0), 128 (13.0) | 5 056 B (12.0), 5 040 B (13.0) |
+| 20 | 128 | 128 | 31 632 B | 102 (12.0), 105 (13.0) | 5 200 B (12.0), 5 232 B (13.0) |
 
 Resident blocks per SM on `sm_86`: 2 for the 256-thread instantiation, 3 for the 128-thread one (`gpu::toolchain_tests::fit_kernel_large_runs_three_blocks_per_sm`, from `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, on both toolkits).
 The 256-thread instantiation is launched as `fit_kernel_two_blocks` with `__launch_bounds__(256, 2)` (same device body as `fit_kernel`), so the register allocation keeps two resident blocks per SM on both CUDA 12.0 and CUDA 13.0. `gpu::toolchain_tests::fit_kernel_occupancy_report` prints the registers and the resident blocks from `cudaOccupancyMaxActiveBlocksPerMultiprocessor`.
