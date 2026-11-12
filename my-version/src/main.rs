@@ -853,7 +853,9 @@ SEARCH:
   --fit-fallback-max <N>     hard per-generation bound on exact CPU fallback
                              refits for --fit-strategy gpu (default 4096,
                              0 = unbounded). Fallbacks beyond the bound keep
-                             their finite device constants and are counted.
+                             their device constants, also after a routed tail
+                             status; only one with no finite device answer keeps
+                             its starting constants. All are counted.
                              The refits run on the CPU fallback pool beside
                              the device work (same trees as after it);
                              RCSR_FIT_TAIL_SERIAL=1 runs them after the

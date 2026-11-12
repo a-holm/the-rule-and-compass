@@ -1325,7 +1325,7 @@ The worker count is the same bounded pool setting as the evaluator fallback
 
 `--fit-fallback-max N` is a hard per-generation cap on those refits (default
 `4096`, `0` = unbounded). The first `N` fallbacks in deterministic admission
-order are refit; any remainder keeps the finite constants the device produced.
+order are refit; any remainder keeps the constants the device produced, including the device constants of a routed tail status (#1071). Only a remainder candidate with no finite device answer (a plan reject, a row-floor or dispatch refusal, a launch failure, a non-finite answer) keeps its starting constants.
 That case is **reported, never silent**: `gpu.fit.fallback_bounded` and each
 generation's `fit_fallback_bounded` count it, and `fallback_max` records the
 configured bound. The default is above every generation of the recorded cell

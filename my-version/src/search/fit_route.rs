@@ -536,9 +536,10 @@ pub(super) fn triage(arm: DeviceArm, plan: &GpuFitPlan, tree: &mut Node, answer:
     }
 }
 
-/// #1071: the tree a fallback past `--fit-fallback-max` keeps: its own tree.
+/// #1071: the tree a fallback past `--fit-fallback-max` keeps: the device
+/// answer when the device produced one, else its own tree.
 fn hold_past_cap(fallback: Fallback) -> Node {
-    fallback.tree
+    fallback.device.unwrap_or(fallback.tree)
 }
 
 /// #1075: whether two device trees of a refit job are the same, bit for bit.
@@ -1251,7 +1252,6 @@ mod tests {
         for job in jobs {
             grid[job.island][job.slot] = job.tree;
         }
-        // #1071: a fallback past the cap keeps the device answer when there is one.
         for &(island, slot, _) in &fallbacks[refit..] {
             if let Some(alt) = device_alts.remove(&(island, slot)) {
                 grid[island][slot] = alt;
