@@ -2512,8 +2512,9 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
                             locked test range (old ledger); a different range is refused (exit 3)\n\
   --verify-read             with --locked-test: recompute a recorded baseline read, compare its report hash\n\
                             with the ledger, write --out and --markdown, record nothing (the route after a\n\
-                            failed write); no recorded read is refused (exit 3) before the panel is\n\
-                            loaded; a mismatch writes no file (exit 3)\n\
+                            failed write); no recorded read, a store whose data hash differs from the\n\
+                            recorded read and a store with no read marker are refused (exit 3) before\n\
+                            the panel is loaded; a mismatch writes no file (exit 3)\n\
   --expect-report-sha256 <h> exit 3 and write no file unless the report hashes to h;\n\
                             with --locked-test it needs --verify-read (exit 2 without it)\n\
   --out <file>              write the JSON report (ends with a ledger object: io and\n\
@@ -2761,13 +2762,15 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         let l = protocol::Ledger::new(ledger);
         let current = protocol::LockedRange::new(&d.lockbox, d.source);
         let binding = protocol::RangeBinding { current: &current, allow_unbound };
+        let data_sha = crate::manifest::sha256_file(&data_path).map_err(input_err)?;
         if verify_read {
-            l.authorize_baseline_verify(std::path::Path::new(sealed), Some(binding)).map_err(input_err)?;
+            l.authorize_baseline_verify(std::path::Path::new(sealed), &data_sha, Some(binding)).map_err(input_err)?;
+            l.require_read_marker(&data_path).map_err(input_err)?;
         } else {
             l.authorize_baseline_read(std::path::Path::new(sealed), Some(binding)).map_err(input_err)?;
         }
         l.check_read_marker(&data_path).map_err(input_err)?;
-        read = Some((l, crate::manifest::sha256_file(&data_path).map_err(input_err)?, current));
+        read = Some((l, data_sha, current));
     }
     // A sealed read opens the primary range; every other declared range stays sealed.
     let guard: Vec<(f64, f64)> = resolved

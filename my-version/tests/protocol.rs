@@ -419,7 +419,12 @@ fn a_ledger_binds_the_locked_range_and_a_read_refuses_another() {
 
     // read lines carry the range
     ledger.record_read(&a.id, "report-a", Some(&same)).unwrap();
+    let err = ledger.authorize_baseline_verify(&sealed, "data", bind(&same, true)).unwrap_err();
+    assert_eq!(err, "no recorded baseline read");
     ledger.record_baseline_read("data", "report-base", Some(&same)).unwrap();
+    ledger.authorize_baseline_verify(&sealed, "data", bind(&same, true)).unwrap();
+    let err = ledger.authorize_baseline_verify(&sealed, "other", bind(&same, true)).unwrap_err();
+    assert!(err.contains("data hash other differs from the recorded baseline read data; the verify is void"), "{err}");
     let reads: Vec<Option<LockedRange>> = ledger
         .events()
         .unwrap()
