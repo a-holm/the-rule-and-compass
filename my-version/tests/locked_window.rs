@@ -1909,3 +1909,20 @@ fn ladder_verify_read_without_allow_in_sample_scores_nothing() {
     let (code, _, err) = go(&s(&dir.join("again.json")), &["--allow-in-sample", "--verify-read", "--expect-report-sha256", &sha]);
     assert_eq!(code, 0, "{}", err);
 }
+
+/// A second carrier that declares the same range changes the hashed lockbox
+/// object only; the verify is refused on the binding digest, before the load.
+#[test]
+fn ladder_verify_read_after_another_carrier_appears_scores_nothing() {
+    let f = Sealed::new("lad-verify-carrier");
+    let (code, _, err) = f.read(&s(&f.dir.join("first.json")), &[]);
+    assert_eq!(code, 0, "{}", err);
+    let sha = f.recorded_sha();
+    let (ledger, marker) = (f.bytes(&f.ledger), f.bytes(&f.marker()));
+    let carrier = format!("{}.enrich.json", f.data);
+    std::fs::copy(format!("{}.lockbox.json", f.data), &carrier).unwrap();
+    assert_binding_refusal(&f, "carrier", &[], &sha, &ledger, &marker);
+    std::fs::remove_file(&carrier).unwrap();
+    let (code, _, err) = f.read(&s(&f.dir.join("again.json")), &["--verify-read", "--expect-report-sha256", &sha]);
+    assert_eq!(code, 0, "{}", err);
+}
