@@ -1380,7 +1380,7 @@ impl GpuSearch {
                     check_pieces: None,
                     fallback: Some(FallbackPool::new(
                         fallback_workers(fallback_threads),
-                        fallback_workers(fallback_threads),
+                        FALLBACK_QUEUE_CHUNKS,
                     )),
                     fallback_workers: fallback_workers(fallback_threads),
                     fit_attempts: 0,
@@ -3183,7 +3183,7 @@ impl FallbackPool {
         );
         let total = jobs.len();
         let started = std::time::Instant::now();
-        let chunk_len = total.div_ceil(self.workers * 4).max(1);
+        let chunk_len = 1;
         let blocks = expr::current_blocks();
         let (done_tx, done) = std::sync::mpsc::channel::<FallbackResult>();
         let mut ticket = FallbackTicket {
@@ -9447,7 +9447,7 @@ fn run_search(
                             .unwrap_or_else(|| {
                                 FallbackPool::new(
                                     fallback_workers(cfg.threads),
-                                    fallback_workers(cfg.threads),
+                                    FALLBACK_QUEUE_CHUNKS,
                                 )
                             });
                         gpu = None;
