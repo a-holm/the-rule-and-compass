@@ -848,6 +848,21 @@ impl FileStore {
         int_scratch: &mut Vec<i64>,
         byte_scratch: &mut Vec<u8>,
     ) -> Result<ProjectedReadStats, String> {
+        self.read_group_projected_impl(group, projection, out, int_scratch, byte_scratch, None)
+    }
+
+    /// Shared body of the projected group read. With `keep`, the exact `i64`
+    /// block of every `I64` column is appended in projection order, so the
+    /// time column is read once.
+    fn read_group_projected_impl(
+        &self,
+        group: usize,
+        projection: &Projection,
+        out: &mut [f64],
+        int_scratch: &mut Vec<i64>,
+        byte_scratch: &mut Vec<u8>,
+        mut keep: Option<&mut Vec<Vec<i64>>>,
+    ) -> Result<ProjectedReadStats, String> {
         if group >= self.header.n_groups() {
             return Err(format!(
                 "{}: group {} is out of range ({} groups)",
@@ -879,6 +894,9 @@ impl FileStore {
                 }
                 DType::I64 => {
                     read_i64_block(&self.file, &self.path, off, int_scratch, byte_scratch)?;
+                    if let Some(k) = keep.as_deref_mut() {
+                        k.push(int_scratch.clone());
+                    }
                     for (dst, &v) in out[lo..hi].iter_mut().zip(int_scratch.iter()) {
                         *dst = if v == i64::MIN { f64::NAN } else { v as f64 };
                     }
@@ -960,9 +978,22 @@ impl FileStore {
     ///
     /// The result has exactly `projection.len()` columns in projection order.
     /// It is the narrow counterpart of [`FileStore::to_table`] used by the
-    /// 20-variable path; it never allocates a full-table image.
+    /// 20-variable path; it never allocates a full-table image. Groups are read
+    /// by [`store_readers`] concurrent readers (`RCSR_STORE_READERS`).
     pub fn to_table_projected(&self, projection: &Projection) -> Result<Table, String> {
+        self.to_table_projected_with_readers(projection, store_readers())
+    }
+
+    /// [`FileStore::to_table_projected`] with an explicit reader count. One
+    /// reader is the serial reference path; every count gives the same table.
+    pub fn to_table_projected_with_readers(
+        &self,
+        projection: &Projection,
+        readers: usize,
+    ) -> Result<Table, String> {
         let n = self.header.n_rows;
+        let n_groups = self.header.n_groups();
+        let readers = readers.min(n_groups).max(1);
         let mut values: Vec<Vec<f64>> = projection
             .columns()
             .iter()
@@ -994,34 +1025,40 @@ impl FileStore {
             .iter()
             .map(|c| {
                 if c.dtype == DType::U32 {
-                    Some(Vec::with_capacity(n))
+                    Some(vec![0u32; n])
                 } else {
                     None
                 }
             })
             .collect();
-        let mut group = ProjectedGroup::new();
-        for g in 0..self.header.n_groups() {
-            self.read_group_projected(g, projection, &mut group)?;
-            let base = g * self.header.group_rows;
-            for (c, col) in projection.columns().iter().enumerate() {
+        if readers == 1 {
+            let mut group = ProjectedGroup::new();
+            for g in 0..n_groups {
+                self.read_group_projected(g, projection, &mut group)?;
+                let base = g * self.header.group_rows;
                 let len = group.len();
-                if col.width > 0 {
-                    let dst = &mut values[c];
-                    dst[base..base + len].copy_from_slice(group.col(c));
-                }
-                if col.dtype == DType::I64 {
-                    if let Some(dst_ints) = ints[c].as_mut() {
-                        let exact = self.read_i64(g, col.index)?;
-                        dst_ints[base..base + len].copy_from_slice(&exact);
+                for (c, col) in projection.columns().iter().enumerate() {
+                    if col.width > 0 {
+                        values[c][base..base + len].copy_from_slice(group.col(c));
                     }
-                }
-                if col.dtype == DType::U32 {
-                    if let Some(dst_codes) = codes[c].as_mut() {
-                        dst_codes.extend(self.read_codes(g, col.index)?);
+                    if let Some(dst) = ints[c].as_mut() {
+                        let exact = self.read_i64(g, col.index)?;
+                        dst[base..base + len].copy_from_slice(&exact);
+                    }
+                    if let Some(dst) = codes[c].as_mut() {
+                        let exact = self.read_codes(g, col.index)?;
+                        dst[base..base + len].copy_from_slice(&exact);
                     }
                 }
             }
+        } else {
+            self.read_groups_concurrently(
+                projection,
+                readers,
+                &mut values,
+                &mut ints,
+                &mut codes,
+            )?;
         }
         let names = projection.names();
         let numeric: Vec<bool> = projection
@@ -1048,6 +1085,117 @@ impl FileStore {
         Ok(Table::from_parts(names, numeric, columns, n, 0))
     }
 
+    /// Reader pool of [`FileStore::to_table_projected_with_readers`]: workers
+    /// claim group indices, read them through their own handle and send them
+    /// to the calling thread, which copies each into its disjoint row range.
+    /// Emptied group buffers return to the workers.
+    fn read_groups_concurrently(
+        &self,
+        projection: &Projection,
+        readers: usize,
+        values: &mut [Vec<f64>],
+        ints: &mut [Option<Vec<i64>>],
+        codes: &mut [Option<Vec<u32>>],
+    ) -> Result<(), String> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{mpsc, Mutex};
+
+        struct Loaded {
+            group: usize,
+            values: ProjectedGroup,
+            ints: Vec<Vec<i64>>,
+            codes: Vec<Vec<u32>>,
+        }
+
+        let n_groups = self.header.n_groups();
+        let next = AtomicUsize::new(0);
+        let (tx, rx) = mpsc::sync_channel::<Result<Loaded, String>>(readers);
+        let (free_tx, free_rx) = mpsc::channel::<ProjectedGroup>();
+        let free_rx = Mutex::new(free_rx);
+        let handles: Vec<Result<FileStore, String>> =
+            (0..readers).map(|_| self.try_clone()).collect();
+        std::thread::scope(|s| {
+            for handle in handles {
+                let tx = tx.clone();
+                let next = &next;
+                let free_rx = &free_rx;
+                s.spawn(move || {
+                    let fs = match handle {
+                        Ok(f) => f,
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            return;
+                        }
+                    };
+                    loop {
+                        let g = next.fetch_add(1, Ordering::Relaxed);
+                        if g >= n_groups {
+                            break;
+                        }
+                        let mut pg = free_rx
+                            .lock()
+                            .map(|r| r.try_recv().unwrap_or_default())
+                            .unwrap_or_default();
+                        let len = fs.header.group_len(g);
+                        pg.prepare(len, projection.len());
+                        let mut kept_ints = Vec::new();
+                        let item = fs
+                            .read_group_projected_impl(
+                                g,
+                                projection,
+                                &mut pg.values,
+                                &mut pg.int_scratch,
+                                &mut pg.byte_scratch,
+                                Some(&mut kept_ints),
+                            )
+                            .and_then(|_| {
+                                let mut kept_codes = Vec::new();
+                                for col in projection.columns() {
+                                    if col.dtype == DType::U32 {
+                                        kept_codes.push(fs.read_codes(g, col.index)?);
+                                    }
+                                }
+                                Ok(kept_codes)
+                            })
+                            .map(|kept_codes| Loaded {
+                                group: g,
+                                values: pg,
+                                ints: kept_ints,
+                                codes: kept_codes,
+                            });
+                        if tx.send(item).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            for item in rx {
+                let mut loaded = item?;
+                let base = loaded.group * self.header.group_rows;
+                let len = loaded.values.len();
+                let mut int_blocks = loaded.ints.drain(..);
+                let mut code_blocks = loaded.codes.drain(..);
+                for (c, col) in projection.columns().iter().enumerate() {
+                    if col.width > 0 {
+                        values[c][base..base + len].copy_from_slice(loaded.values.col(c));
+                    }
+                    if let Some(dst) = ints[c].as_mut() {
+                        let block = int_blocks.next().ok_or("missing i64 block")?;
+                        dst[base..base + len].copy_from_slice(&block);
+                    }
+                    if let Some(dst) = codes[c].as_mut() {
+                        let block = code_blocks.next().ok_or("missing code block")?;
+                        dst[base..base + len].copy_from_slice(&block);
+                    }
+                }
+                drop(int_blocks);
+                drop(code_blocks);
+                let _ = free_tx.send(loaded.values);
+            }
+            Ok(())
+        })
+    }
 
     /// Load the whole store into the resident column-major image. This is the
     /// exact bridge for fixtures that fit: from here every path is identical to
@@ -1239,6 +1387,24 @@ impl FileStore {
             0,
         ))
     }
+}
+
+/// Default and cap of the projected reader pool.
+const STORE_READERS_DEFAULT: usize = 4;
+const STORE_READERS_MAX: usize = 64;
+
+/// `RCSR_STORE_READERS` value: default 4, clamped to 1..=64; 1 is the serial
+/// path. An unparsable value is the default.
+pub fn parse_store_readers(value: Option<&str>) -> usize {
+    match value.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) => n.clamp(1, STORE_READERS_MAX),
+        None => STORE_READERS_DEFAULT,
+    }
+}
+
+/// Concurrent group readers of a projected read (`RCSR_STORE_READERS`).
+pub fn store_readers() -> usize {
+    parse_store_readers(std::env::var("RCSR_STORE_READERS").ok().as_deref())
 }
 
 /// True when `path` is meant to be a column store (by extension or magic).

@@ -198,3 +198,62 @@ fn the_364_to_20_estimate_is_under_eight_gigabytes() {
     });
     assert!(full.storage_bytes > 8 * 1024 * 1024 * 1024);
 }
+
+/// 6 groups of 4096 rows: `ts` (i64), `symbol` (dictionary), `a`, `b` (f64).
+fn grouped_store(dir: &std::path::Path) -> String {
+    let rows = 5 * 4096 + 777;
+    let mut text = String::from("ts,symbol,a,b\n");
+    for r in 0..rows {
+        let sym = ["AAA", "BBB", "CCC"][r % 3];
+        text.push_str(&format!(
+            "{},{},{},{}\n",
+            1_700_000_000i64 + r as i64 * 3600,
+            sym,
+            r as f64 * 0.125 - 40.0,
+            (r % 977) as f64 / 7.0
+        ));
+    }
+    let table = data::parse_table_with_time(&text, false, Some("ts")).unwrap();
+    let path = dir.join("grouped.rcsb").to_string_lossy().into_owned();
+    store::write_store_with_time(&path, &table, 4096, Some(0)).unwrap();
+    path
+}
+
+#[test]
+fn projected_table_is_identical_for_one_and_four_readers() {
+    let (_scratch, dir) = tmp_dir("readers");
+    let path = grouped_store(&dir);
+    let fs = FileStore::open(&path).unwrap();
+    assert!(fs.n_groups() >= 5);
+    let proj = Projection::resolve(&fs, &["ts", "symbol", "a", "b"]).unwrap();
+    assert_eq!(proj.columns()[0].dtype, DType::I64);
+    assert_eq!(proj.columns()[1].dtype, DType::U32);
+
+    let one = fs.to_table_projected_with_readers(&proj, 1).unwrap();
+    for readers in [4usize, 64] {
+        let many = fs.to_table_projected_with_readers(&proj, readers).unwrap();
+        assert_eq!(one.names, many.names);
+        assert_eq!(one.numeric, many.numeric);
+        assert_eq!(one.len(), many.len());
+        for c in 0..one.n_cols() {
+            let a: Vec<u64> = one.col(c).iter().map(|v| v.to_bits()).collect();
+            let b: Vec<u64> = many.col(c).iter().map(|v| v.to_bits()).collect();
+            assert_eq!(a, b, "values of column {} differ at {} readers", c, readers);
+            assert_eq!(one.ints(c), many.ints(c), "ints of column {}", c);
+            assert_eq!(one.dict(c), many.dict(c), "codes of column {}", c);
+        }
+    }
+    assert!(one.ints(0).is_some());
+    assert_eq!(one.dict(1).unwrap().codes.len(), fs.n_rows());
+    assert_eq!(one.dict(1).unwrap().codes[4], 4 % 3);
+}
+
+#[test]
+fn store_readers_parses_the_environment_value() {
+    assert_eq!(store::parse_store_readers(None), 4);
+    assert_eq!(store::parse_store_readers(Some("1")), 1);
+    assert_eq!(store::parse_store_readers(Some("8")), 8);
+    assert_eq!(store::parse_store_readers(Some("0")), 1);
+    assert_eq!(store::parse_store_readers(Some("1000")), 64);
+    assert_eq!(store::parse_store_readers(Some("many")), 4);
+}
