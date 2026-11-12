@@ -2515,7 +2515,8 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
                             failed write); no recorded read, a store whose data hash differs from the\n\
                             recorded read, a store with no read marker, a window set or setting that differs\n\
                             from the recorded read and a read stored without a binding digest are refused\n\
-                            (exit 3) before the panel is loaded; a mismatch writes no file (exit 3)\n\
+                            (exit 3) before the panel is loaded; the verify needs the same build line\n\
+                            that recorded the read; a mismatch writes no file (exit 3)\n\
   --expect-report-sha256 <h> exit 3 and write no file unless the report hashes to h;\n\
                             with --locked-test it needs --verify-read (exit 2 without it)\n\
   --out <file>              write the JSON report (ends with a ledger object: io and\n\
@@ -2740,11 +2741,19 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         return Err(usage_err("--ledger and --sealed apply to --locked-test only".to_string()));
     }
     let mut read: Option<(protocol::Ledger, String, protocol::LockedRange)> = None;
+    let mut bound_opts = opts.clone();
+    if let Some(sr) = &mut bound_opts.sr_run {
+        sr.run.path.clear();
+    }
     let read_binding = protocol::binding_digest(&[
-        format!("{:?}", opts),
+        format!("{:?}", bound_opts),
         format!("{:?}", rows),
         format!("{:?}/{:?}/{:?}/{:?}/{:?}", target, ret, time, group, features),
         format!("{}/{}/{}", scheme, resolved.embargo.seconds, purge_source),
+        format!(
+            "{:?}/{:?}/{:?}/{:?}/{:?}/{}",
+            resolved.range, resolved.source, resolved.also, resolved.embargo, resolved.retired, allow_in_sample
+        ),
     ]);
     if locked_test {
         let (Some(ledger), Some(sealed)) = (&ledger_path, &sealed_path) else {

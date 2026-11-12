@@ -1157,7 +1157,7 @@ const FRONT_RUN: &str = r#"{"tool":"rcsr","variables":["x"],"target_spec":{"retu
     "search":{"candidates_evaluated":4321},
     "split":{"train_time":[0,100],"validation_time":[101,200],"required_purge_seconds":3600,"purge_seconds":3600},
     "objective":{"spec":{"threshold":0,"per_side_bps":5}},
-    "pareto":[{"expression":"x"}]}"#;
+    "pareto":[{"expression":"x","expression_exact":"x"}]}"#;
 
 /// The `--front` path is not part of the report hash, so another spelling of
 /// the same file verifies; a changed file is another run and is refused.

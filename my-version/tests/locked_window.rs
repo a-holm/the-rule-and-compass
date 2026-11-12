@@ -1817,28 +1817,95 @@ fn ladder_verify_read_with_another_retirement_scores_nothing() {
     assert_eq!(code, 0, "{}", err);
 }
 
+/// A verify without `--allow-in-sample` is refused on the binding digest, not
+/// after the panel load by the in-sample check of the run.
 #[test]
 fn ladder_verify_read_without_allow_in_sample_scores_nothing() {
-    let f = Sealed::new("lad-verify-in-sample");
-    let run = s(&f.dir.join("run.json"));
+    let (_scratch, dir) = scratch("lad-verify-in-sample");
+    let (data, win, spec, run) = (s(&dir.join("p.csv")), s(&dir.join("w.csv")), s(&dir.join("spec.json")), s(&dir.join("run.json")));
+    panel_csv(&dir.join("plain.csv"));
+    let text = std::fs::read_to_string(dir.join("plain.csv")).unwrap();
+    let with_r: Vec<String> = text
+        .lines()
+        .enumerate()
+        .map(|(i, l)| if i == 0 { format!("{l},r") } else { format!("{l},{}", l.rsplit(',').next().unwrap()) })
+        .collect();
+    std::fs::write(&data, with_r.join("\n") + "\n").unwrap();
     std::fs::write(
-        &run,
+        &spec,
+        "{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{\"column\":\"y\",\"name\":\"raw_target\",\"kind\":\"forward_return\",\
+\"deprecated\":false,\"return_column\":\"r\",\"return_units\":\"log\",\"horizon_seconds\":900,\"entry_offset_seconds\":0,\
+\"delay_seconds\":0,\"entry_price\":\"next open\",\"exit_price\":\"close\",\"offset\":0.0,\
+\"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"log_return\",\"cost_bps\":null,\
+\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}]}",
+    )
+    .unwrap();
+    let (code, _, err) = rcsr(&[
+        "--data", &data, "--target", "y", "--vars", "f1,f2", "--time", "ts", "--group-by", "sym", "--split", "temporal",
+        "--target-spec", &spec, "--cpu", "--no-dev-log", "--seed", "3", "--generations", "5", "--pop", "20",
+        "--metric", "squared", "--quiet", "--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3",
+        "--json-out", &run,
+    ]);
+    assert_eq!(code, 0, "{}", err);
+    // the run saw the first locked window but not the second
+    let text = std::fs::read_to_string(&run).unwrap();
+    let key = "\"validation_time\":[";
+    let at = text.find(key).unwrap() + key.len();
+    let end_at = at + text[at..].find(',').unwrap() + 1;
+    let close = end_at + text[end_at..].find(']').unwrap();
+    std::fs::write(&run, format!("{}{}{}", &text[..end_at], T0 + 425 * H, &text[close..])).unwrap();
+    let row = |label: &str, a: i64, b: i64| format!("locked,{label},{},{},{},{},{}\n", T0, T0 + 398 * H, T0 + 250 * H, T0 + a * H, T0 + b * H);
+    std::fs::write(
+        &win,
         format!(
-            "{{\"variables\":[\"f1\",\"f2\"],\"pareto\":[{{\"expression\":\"f1\"}}],\
-             \"objective\":{{\"spec\":{{\"threshold\":0,\"per_side_bps\":5}}}},\
-             \"split\":{{\"train_time\":[{},{}],\"required_purge_seconds\":3600}}}}",
-            T0,
-            T0 + 450 * H
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\n{}{}",
+            row("locked_0", 400, 450),
+            row("locked_1", 450, 500)
         ),
     )
     .unwrap();
-    let out = s(&f.dir.join("first.json"));
-    let (code, _, err) = f.read(&out, &["--sr-run", &run, "--allow-in-sample"]);
+    let lock = format!("{},{}", T0 + 400 * H, T0 + 500 * H);
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+    let dev = format!("dev,{},{},{},{}", T0, T0 + 150 * H, T0 + 160 * H, T0 + 250 * H);
+    let (code, _, err) = rcsr(&[
+        "walkforward", "--data", &data, "--target", "y", "--expr", "f1", "--time", "ts", "--group-by", "sym", "--horizon", "5",
+        "--cost-bps", "5", "--periods-per-year", "365", "--json", "--ledger", &l, "--lockbox", &lock, "--window", &dev,
+    ]);
     assert_eq!(code, 0, "{}", err);
-    let sha = f.recorded_sha();
-    let (ledger, marker) = (f.bytes(&f.ledger), f.bytes(&f.marker()));
-    assert_binding_refusal(&f, "in-sample", &["--sr-run", &run], &sha, &ledger, &marker);
-    let (code, _, err) =
-        f.read(&s(&f.dir.join("again.json")), &["--sr-run", &run, "--allow-in-sample", "--verify-read", "--expect-report-sha256", &sha]);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let go = |out: &str, extra: &[&str]| {
+        let mut a = vec![
+            "ladder", "--data", data.as_str(), "--target", "y", "--return-col", "r", "--time", "ts", "--group", "sym",
+            "--features", "f1,f2", "--windows", win.as_str(), "--scheme", "locked", "--purge-seconds", "7200",
+            "--gbm-trees", "10", "--draws", "50", "--max-fit-rows", "600", "--lockbox", lock.as_str(), "--locked-test",
+            "--ledger", l.as_str(), "--sealed", sealed.as_str(), "--sr-run", run.as_str(), "--out", out,
+        ];
+        a.extend_from_slice(extra);
+        rcsr(&a)
+    };
+    let first = s(&dir.join("first.json"));
+    let (code, _, err) = go(&first, &["--allow-in-sample"]);
+    assert_eq!(code, 0, "{}", err);
+    let text = std::fs::read_to_string(&l).unwrap();
+    let line = text.lines().find(|l| l.contains("\"event\":\"baseline_read\"")).unwrap();
+    let sha = line.split("\"report_sha256\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let marker = format!("{data}.locked_reads.jsonl");
+    let (ledger_before, marker_before) = (std::fs::read(&l).unwrap(), std::fs::read(&marker).unwrap());
+    for hash in [None, Some(sha.as_str())] {
+        let probe = s(&dir.join("probe.json"));
+        let mut extra = vec!["--verify-read"];
+        if let Some(h) = hash {
+            extra.extend_from_slice(&["--expect-report-sha256", h]);
+        }
+        let (code, stdout, err) = go(&probe, &extra);
+        assert_eq!(code, 3, "{stdout}{err}");
+        assert!(err.contains("binds the report"), "{err}");
+        assert!(!err.contains("report sha256") && !stdout.contains("report_sha256"), "{stdout}{err}");
+        assert!(!Path::new(&probe).exists());
+        assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+        assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
+    }
+    let (code, _, err) = go(&s(&dir.join("again.json")), &["--allow-in-sample", "--verify-read", "--expect-report-sha256", &sha]);
     assert_eq!(code, 0, "{}", err);
 }

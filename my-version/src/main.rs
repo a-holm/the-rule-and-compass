@@ -11272,7 +11272,8 @@ OPTIONS:
                              read, compare its report hash, write --out and --markdown,
                              record nothing; a candidate with no recorded read, a window set or
                              setting that differs from the recorded read, and a read stored without a
-                             binding digest are refused (exit 3) before any locked row is scored
+                             binding digest are refused (exit 3) before any locked row is scored;
+                             the verify needs the same build line that recorded the read
   --allow-unbound-ledger     with --locked-test: read a candidate whose ledger
                              recorded no locked test range (old ledger); the read
                              is reported as unbound. Without it that read is

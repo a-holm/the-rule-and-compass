@@ -1086,11 +1086,13 @@ pub fn binding_digest(parts: &[String]) -> String {
     sha256_hex(parts.join("\n--\n").as_bytes())
 }
 
-/// Binding digest of a walkforward read. `gpu` only picks the scan device and
-/// never changes the report, so it is left out.
+/// Binding digest of a walkforward read. The `--front` path is left out: the
+/// run file's SHA-256 binds its content and the report hash ignores the spelling.
 pub fn walkforward_binding(spec: &crate::walkforward::EvalSpec, o: &crate::walkforward::ProtocolOptions) -> String {
-    let mut spec = spec.clone();
-    spec.gpu = false;
+    let mut o = o.clone();
+    if let Some(f) = &mut o.front {
+        f.run.clear();
+    }
     binding_digest(&[format!("{:?}", spec), format!("{:?}", o)])
 }
 
