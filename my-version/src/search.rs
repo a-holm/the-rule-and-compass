@@ -7399,8 +7399,7 @@ impl RestartState {
     }
 
     fn due(&self, island: usize, keeper: Option<usize>, interval: usize) -> bool {
-        let _ = (island, keeper, interval);
-        false
+        self.since_improve[island] >= interval && Some(island) != keeper
     }
 
     fn restarted(&mut self, island: usize, isolation: usize) {
@@ -7410,8 +7409,7 @@ impl RestartState {
     }
 
     fn is_isolated(&self, island: usize) -> bool {
-        let _ = island;
-        false
+        self.isolated[island] > 0
     }
 
     /// The global-front parent probability of `island` this generation.
