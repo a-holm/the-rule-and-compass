@@ -11081,8 +11081,10 @@ OPTIONS:
   --sealed <file>            locked_candidates.json from `rcsr protocol seal`
   --verify-read              with --locked-test (exit 2 without it): recompute a recorded
                              read, compare its report hash, write --out and --markdown,
-                             record nothing; a candidate with no recorded read is refused
-                             (exit 3) before any locked row is scored
+                             record nothing; a candidate with no recorded read, a window set or
+                             setting that differs from the recorded read, and a read stored without a
+                             binding digest are refused (exit 3) before any locked row is scored;
+                             the verify needs the same build line that recorded the read
   --allow-unbound-ledger     with --locked-test: read a candidate whose ledger
                              recorded no locked test range (old ledger); the read
                              is reported as unbound. Without it that read is
@@ -12059,13 +12061,16 @@ fn run_walkforward(args: &[String]) -> ! {
             usage_fail(&msg);
         }
     }
+    let read_binding = rcsr::protocol::walkforward_binding(&spec, &popts);
     if let Some(l) = &ledger {
         let r = (|| -> Result<u64, String> {
             l.verify_chain()?;
             if locked_test {
                 let sealed = std::path::Path::new(sealed_path.as_deref().unwrap_or(""));
                 let entry = if verify_read {
-                    l.authorize_verify(sealed, &candidate_id, &data_sha, &build_id, binding)?
+                    let entry = l.authorize_verify(sealed, &candidate_id, &data_sha, &build_id, binding)?;
+                    l.check_verify_binding(Some(&candidate_id), &read_binding)?;
+                    entry
                 } else {
                     l.authorize_read(sealed, &candidate_id, &data_sha, &build_id, binding)?
                 };
@@ -12224,7 +12229,7 @@ fn run_walkforward(args: &[String]) -> ! {
                         return Ok(());
                     }
                     l.write_read_marker(&data_path, "test_read", &report_sha)?;
-                    let count = l.record_read(&candidate_id, &report_sha, current_range.as_ref())?;
+                    let count = l.record_read_bound(&candidate_id, &report_sha, current_range.as_ref(), Some(&read_binding))?;
                     if count == read_count {
                         Ok(())
                     } else {

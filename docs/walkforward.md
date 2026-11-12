@@ -652,6 +652,8 @@ A crash after the marker line and before the ledger line leaves a marker the led
 
 After a recorded read whose report is lost, run the same command again with `--verify-read` and the recorded hash (`--expect-report-sha256`). The error after a failed rename names the staged file and this command.
 
+Every locked read stores `binding_sha256` in its ledger line: the SHA-256 of the resolved window set and of every other setting that binds the report beyond the sealed entry (the whole walkforward spec and protocol options, `--gpu` included because it changes the report, with the `--front` path left out because the run file's SHA-256 binds its content and another spelling of the same file verifies; the whole ladder option set, columns, window rows, scheme, embargo, the resolved lock (`--lockbox`, `--retired`) and `--allow-in-sample`, with the `--sr-run` path left out for the same reason). `--verify-read` compares it with the recorded read before the panel is loaded and scores nothing when it differs: exit 3, `the window set or another setting that binds the report differs from the recorded read`, no report hash printed, ledger and marker unchanged. A read recorded without the field (written by an older build) cannot be compared: `--verify-read` refuses it (exit 3, `the recorded read stores no binding digest`) and the report hash stays unrecomputable. The digest is built from derived `Debug` text of the resolved structs, so a verify needs the same build line that recorded the read: another Rust version or a renamed field changes every digest and the verify is refused with the same message.
+
 ## Fold sign test
 
 The report also carries a one-sided binomial sign test over the per-window mean
