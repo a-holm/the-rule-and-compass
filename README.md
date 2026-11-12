@@ -664,7 +664,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring] [--reject-fixed-position]
-     [--selection lexicographic|afp] [--restart-policy archive|island] [--restart-isolation N] [--explore-islands K] [--front-scope global|island]
+     [--selection lexicographic|afp] [--restart-policy archive|island] [--restart-isolation N] [--explore-islands K] [--front-scope global|island] [--migration-policy ring|ring-tournament]
      [--mutation-mix classic|extended] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
      [--patience N]
@@ -1288,6 +1288,15 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   the front of both) and a restart empties it; the reported archive stays
   global. Node and flat postfix paths; not with `--qd-policy`. Saved search
   setting; the default stays `global`;
+- **opt-in tournament migrant** (`--migration-policy ring-tournament`): the
+  migrant is the winner of a tournament of 8 draws over the source island
+  instead of its best member, drawn with the destination island's own
+  generator, so the source island's trajectory does not depend on who migrates
+  from it. A source without a finite member sends nothing, and a destination
+  that already holds a member with the migrant's error bits skips the
+  migration. The best then spreads far slower than under the default `ring`.
+  The development log counts `migrants` and `migrants_skipped`. Node and flat
+  postfix paths. Saved search setting; the default stays `ring`;
 - **opt-in quality-diversity search** (`--qd`, `--qd-cvt`, `--qd-policy`,
   `--qd-cells`, `--qd-cell-cap`): CVT-MAP-Elites over variable usage ×
   prediction skewness, with deterministic Halton initialisation, Lloyd

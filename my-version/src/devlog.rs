@@ -549,6 +549,10 @@ pub struct GenRecord {
     pub restarts_total: u64,
     /// #1022: islands inside their isolation window after this boundary.
     pub isolated: usize,
+    /// #1029: migrants copied at this generation's migration step.
+    pub migrants: usize,
+    /// #1029: migrants skipped because the destination held their error.
+    pub migrants_skipped: usize,
 }
 
 impl GenRecord {
@@ -633,7 +637,7 @@ impl GenRecord {
              \"qd\":{},\
              \"convergence\":{{\"confidence\":{},\"stability\":{},\"maturity\":{},\
              \"percent_converged\":{}}},\
-             \"islands\":[{}],\"rng\":{},\"restarts\":{},\"restarts_total\":{},\"isolated\":{}}}",
+             \"islands\":[{}],\"rng\":{},\"restarts\":{},\"restarts_total\":{},\"isolated\":{},\"migrants\":{},\"migrants_skipped\":{}}}",
             SCHEMA,
             VERSION,
             self.generation,
@@ -684,7 +688,9 @@ impl GenRecord {
             hex(self.rng_key),
             self.restarts,
             self.restarts_total,
-            self.isolated
+            self.isolated,
+            self.migrants,
+            self.migrants_skipped
         )
     }
 }
@@ -1291,6 +1297,8 @@ mod tests {
             restarts: 1,
             restarts_total: 3,
             isolated: 2,
+            migrants: 4,
+            migrants_skipped: 1,
         }
     }
 
@@ -1391,6 +1399,8 @@ mod tests {
         assert_eq!(full.get("restarts").and_then(|v| v.as_usize()), Some(1));
         assert_eq!(full.get("restarts_total").and_then(|v| v.as_usize()), Some(3));
         assert_eq!(full.get("isolated").and_then(|v| v.as_usize()), Some(2));
+        assert_eq!(full.get("migrants").and_then(|v| v.as_usize()), Some(4));
+        assert_eq!(full.get("migrants_skipped").and_then(|v| v.as_usize()), Some(1));
         assert!(line.len() < r.json().len(), "summary must be smaller than full");
     }
 
