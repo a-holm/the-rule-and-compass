@@ -598,7 +598,7 @@ fn write_stride_csv(dir: &std::path::Path) -> String {
     let mut text = String::from("t,x1,x2,r1,y1,r24,y24\n");
     for i in 0..STRIDE_N {
         let x2 = frac(i as f64 * 0.754_877_666_246_692_7) - 0.5;
-        let r24: f64 = (i + 1..i + DAY).take_while(|&j| j < STRIDE_N).map(r1).sum();
+        let r24: f64 = (i + 1..i + 1 + DAY).take_while(|&j| j < STRIDE_N).map(r1).sum();
         let t = T0 + STEP * i as i64;
         if i % DAY == 0 && i + DAY < STRIDE_N {
             text.push_str(&format!("{t},{},{x2},{},{},{r24},{r24}\n", x1(i), r1(i), r1(i)));
