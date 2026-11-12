@@ -7276,6 +7276,14 @@ fn flush_dev_generation(cfg: &Config, rec: Option<crate::devlog::GenRecord>, res
     }
 }
 
+/// #1090: join every island thread of one generation.
+fn join_islands(handles: Vec<std::thread::ScopedJoinHandle<'_, ()>>, _gen: usize) -> Result<(), String> {
+    for h in handles {
+        let _ = h.join();
+    }
+    Ok(())
+}
+
 /// Best error of one population.
 fn population_best(pop: &[Ind]) -> f64 {
     pop.iter().map(|i| i.error).fold(f64::INFINITY, f64::min)
@@ -9378,6 +9386,10 @@ fn run_search_scoped(
                         let parents = Parents { front, qd: qd_parents, source: policy.parent_source(i) }; // #76 #120 #1081
                         s.spawn(move || {
                             expr::set_blocks(blocks);
+                            #[cfg(feature = "cuda")]
+                            if crate::gpu::injected_fault("island_panic") {
+                                panic!("injected island panic"); // #1090: test hook
+                            }
                             evolve_island(
                                 isl,
                                 r,
@@ -9430,10 +9442,8 @@ fn run_search_scoped(
                     }
                 }
 
-                for h in handles {
-                    let _ = h.join();
-                }
-            });
+                join_islands(handles, gen)
+            })?;
             let dev_search = dev_lap(&mut dev_mark); // #211: island scope
             candidates += GenCounters::total(dev_counters_ref, |c| &c.offspring);
             let stage_search = stage_lap(&mut stage_mark); // #284: see note below
@@ -14192,6 +14202,34 @@ mod tests {
                 "without --threads the check uses {DEFAULT_FIT_COST_CORES} cores, not {threads}"
             );
         }
+    }
+
+    /// #1090: every island thread is joined, and each panic becomes part of one
+    /// error with the island, the generation and the panic text.
+    #[test]
+    fn an_island_panic_is_an_error_naming_every_island_that_panicked() {
+        let joined = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|i| {
+                    s.spawn(move || match i {
+                        1 => panic!("injected island panic"),
+                        2 => std::panic::panic_any(7u8),
+                        3 => panic!("island {i} broke"),
+                        _ => {}
+                    })
+                })
+                .collect();
+            join_islands(handles, 5)
+        });
+        assert_eq!(
+            joined,
+            Err("island 1 panicked in generation 5: injected island panic; \
+                 island 2 panicked in generation 5: non-string panic payload; \
+                 island 3 panicked in generation 5: island 3 broke"
+                .to_string())
+        );
+        let quiet = std::thread::scope(|s| join_islands((0..3).map(|_| s.spawn(|| {})).collect(), 0));
+        assert_eq!(quiet, Ok(()));
     }
 
     fn restart_fixture() -> (Sample, Sample) {
