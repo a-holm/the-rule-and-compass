@@ -725,9 +725,6 @@ impl GenRecord {
 
     /// #1082: `,"books":{...}`, or nothing when the record has no counts.
     fn books_json(&self, full: bool) -> String {
-        if true {
-            return String::new();
-        }
         self.books.as_ref().map_or_else(String::new, |b| format!(",\"books\":{}", b.json(full)))
     }
 }

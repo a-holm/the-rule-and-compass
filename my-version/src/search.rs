@@ -6342,9 +6342,6 @@ fn tournament(island: &[Ind], rng: &mut Mt, k: usize) -> usize {
 /// A member without a signature is its own representative. Indices keep the
 /// order of each book's first holder.
 fn book_representatives(island: &[Ind]) -> Vec<usize> {
-    if true {
-        return (0..island.len()).collect();
-    }
     let mut reps: Vec<usize> = Vec::with_capacity(island.len());
     let mut slot: std::collections::HashMap<crate::trading::BookSig, usize> = std::collections::HashMap::new();
     for (i, ind) in island.iter().enumerate() {
@@ -6388,9 +6385,6 @@ fn tournament_over(island: &[Ind], reps: &[usize], rng: &mut Mt, k: usize) -> us
 /// and over all islands; `None` without a fitness book. A reading only: it
 /// draws nothing and writes nothing back.
 fn book_counts(islands: &[Vec<Ind>], cfg: &Config) -> Option<crate::devlog::BookCounts> {
-    if true {
-        return None;
-    }
     cfg.fitness.book()?;
     let mut counts = crate::devlog::BookCounts::default();
     let mut all: HashSet<crate::trading::BookSig> = HashSet::new();

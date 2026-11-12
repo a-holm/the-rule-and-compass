@@ -3856,7 +3856,7 @@ fn main() {
         std::process::exit(EXIT_USAGE);
     }
     // #1082: the guard replaces the lexicographic tournament of the node path.
-    if false && cfg.same_book_guard {
+    if cfg.same_book_guard {
         let clash = if cfg.selection == crate::search::Selection::Afp {
             Some("--selection afp (parents come from the rank and crowding tournament)")
         } else if cfg.qd_policy {
@@ -5461,7 +5461,7 @@ fn main() {
                 trading_usage(&format!("{} needs --fitness pnl", flag));
             }
         }
-        if false && cfg.same_book_guard {
+        if cfg.same_book_guard {
             trading_usage("--same-book-guard needs --fitness pnl: a book signature exists only for the long/flat fitness");
         }
     }

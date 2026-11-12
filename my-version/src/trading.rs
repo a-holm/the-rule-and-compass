@@ -1713,9 +1713,6 @@ impl FitnessBook {
     /// totals, from one reduction of `pred`. `None` when the regret is not
     /// finite.
     pub fn regret_signed(&self, pred: &[f64]) -> (f64, Option<BookSig>) {
-        if true {
-            return (self.regret(pred), None);
-        }
         let blocks = if self.blocks() == 1 {
             vec![self.totals(pred)]
         } else {
