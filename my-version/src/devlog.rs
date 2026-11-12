@@ -1448,19 +1448,21 @@ mod tests {
         let dir = crate::test_scratch::Scratch::new("devlog-cap");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cap.ndjson");
-        // Room for the start event plus one full generation event (a
-        // generation line is ~1.2 KiB with every optional section present).
-        let cap = run_start_json(&RunStart::default()).len() as u64 + 1500;
-        let mut log = Log::create(&path, cap).unwrap();
-        assert!(log.append(&run_start_json(&RunStart::default()), true));
+        let start = run_start_json(&RunStart::default());
         let line = rec().json();
+        // Room for the start event plus exactly one generation event, whatever
+        // the schema size.
+        let (start_bytes, line_bytes) = (start.len() as u64 + 1, line.len() as u64 + 1);
+        let cap = start_bytes + line_bytes + line_bytes / 2;
+        let mut log = Log::create(&path, cap).unwrap();
+        assert!(log.append(&start, true));
         let mut written = 0;
         for _ in 0..50 {
             if log.append(&line, false) {
                 written += 1;
             }
         }
-        assert!(written >= 1, "at least one event fits under the cap");
+        assert_eq!(written, 1, "exactly one event fits under the cap");
         assert!(log.dropped() > 0, "the cap must drop events");
         assert!(log.bytes() <= cap, "generation events never exceed the cap");
         assert!(log.append(&run_end_json(&RunEnd::default()), true));

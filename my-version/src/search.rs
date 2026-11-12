@@ -654,6 +654,10 @@ pub const DEFAULT_PRUNE_ROWS: usize = 20_000;
 /// #466: default `--prune-budget`.
 pub const DEFAULT_PRUNE_BUDGET: usize = 20_000;
 
+mod island_policy;
+#[cfg(feature = "cuda")]
+use island_policy::ArenaIslands;
+use island_policy::{IslandPolicy, ParentSource, TreeIslands};
 mod prune;
 pub use prune::PruneReport;
 /// #495: default relative band of the finalist refit (`inf`: refit every unique tree).
@@ -6266,72 +6270,6 @@ fn tournament(island: &[Ind], rng: &mut Mt, k: usize) -> usize {
 // the island tournament already does.
 const FRONT_PARENT_P: f64 = 0.15;
 
-/// #1022: counts the front-parent draws of each island in a test run. The island
-/// threads tag themselves with the run seed and their index; a thread without a
-/// tag is not counted.
-#[cfg(test)]
-pub(crate) mod front_draw_tag {
-    use std::cell::Cell;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    thread_local! {
-        static TAG: Cell<Option<(u32, usize)>> = const { Cell::new(None) };
-    }
-    static DRAWS: Mutex<Option<HashMap<(u32, usize), usize>>> = Mutex::new(None);
-
-    pub fn set(seed: u32, island: usize) {
-        TAG.with(|t| t.set(Some((seed, island))));
-    }
-
-    pub fn record() {
-        if let Some(tag) = TAG.with(|t| t.get()) {
-            let mut map = DRAWS.lock().unwrap();
-            *map.get_or_insert_with(HashMap::new).entry(tag).or_insert(0) += 1;
-        }
-    }
-
-    pub fn count(seed: u32, island: usize) -> usize {
-        let map = DRAWS.lock().unwrap();
-        map.as_ref().and_then(|m| m.get(&(seed, island)).copied()).unwrap_or(0)
-    }
-}
-
-/// #1022: records each island's population hash just before and after every
-/// migration step of a test run, with the islands that were isolated at that
-/// moment.
-#[cfg(test)]
-pub(crate) mod migration_probe {
-    use super::Ind;
-    use std::sync::Mutex;
-
-    pub type Step = (u32, usize, Vec<bool>, Vec<u64>, Vec<u64>);
-    static LOG: Mutex<Vec<Step>> = Mutex::new(Vec::new());
-
-    pub(super) fn hashes(islands: &[Vec<Ind>]) -> Vec<u64> {
-        islands
-            .iter()
-            .map(|pop| {
-                pop.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, ind| {
-                    let h = (h ^ crate::expr::structural_hash(&ind.tree)).wrapping_mul(0x0000_0100_0000_01b3);
-                    (h ^ ind.error.to_bits()).wrapping_mul(0x0000_0100_0000_01b3)
-                })
-            })
-            .collect()
-    }
-
-    pub fn record(seed: u32, gens_done: usize, isolated: Vec<bool>, before: Vec<u64>, after: Vec<u64>) {
-        LOG.lock().unwrap().push((seed, gens_done, isolated, before, after));
-    }
-
-    pub fn take(seed: u32) -> Vec<Step> {
-        let mut log = LOG.lock().unwrap();
-        let (mine, rest): (Vec<Step>, Vec<Step>) = log.drain(..).partition(|s| s.0 == seed);
-        *log = rest;
-        mine
-    }
-}
-
 /// #76: optionally draw a parent tree from the front.
 ///
 /// Returns `None` without touching the RNG when the feature is off (`p == 0`)
@@ -6340,10 +6278,6 @@ pub(crate) mod migration_probe {
 /// different row subset (`--predictor-samples`), and the child is always scored
 /// on the generation's own sample anyway.
 fn front_parent<'a>(front: &'a [Sol], rng: &mut Mt, p: f64) -> Option<&'a Node> {
-    #[cfg(test)]
-    if p > 0.0 && !front.is_empty() {
-        front_draw_tag::record();
-    }
     if p > 0.0 && !front.is_empty() && rng.bool(p) {
         Some(&front[rng.usize_below(front.len())].tree)
     } else {
@@ -6361,23 +6295,28 @@ fn pick_parent<'a>(island: &'a [Ind], front: &'a [Sol], rng: &mut Mt, p: f64) ->
     }
 }
 
+/// #1081: one island's parent pools for one generation and the island
+/// policy's source for it. The pools are the previous generation's front and
+/// QD archive, borrowed read-only for the island thread.
+#[derive(Clone, Copy)]
+struct Parents<'a> {
+    front: &'a [Sol],
+    /// `Some` under `--qd-policy` (#120): the QD archive snapshot and
+    /// `qd_control`.
+    qd: Option<(Option<&'a QdArchive>, u8)>,
+    source: ParentSource,
+}
+
 /// #120: one parent under the QD policy or the original #76 draw.
 ///
 /// The QD branch reads the archive snapshot only; it never mutates the archive
-/// inside a generation. `front_p` keeps the 5% global-front draw that the
-/// issue reserves for the diversity policy.
-fn pick_parent_policy(
-    island: &[Ind],
-    front: &[Sol],
-    qd: Option<&QdArchive>,
-    rng: &mut Mt,
-    front_p: f64,
-    qd_policy: bool,
-    qd_control: u8,
-) -> Node {
-    if qd_policy {
+/// inside a generation. It keeps the 5% global-front draw that the issue
+/// reserves for the diversity policy. An island whose source is not `shared`
+/// (isolated after a restart, #1067) skips the QD branch.
+fn pick_parent_policy(island: &[Ind], parents: &Parents<'_>, rng: &mut Mt) -> Node {
+    if let (Some((qd, qd_control)), true) = (parents.qd, parents.source.shared) {
         // The issue reserves 5 % of QD parent draws for the global front.
-        if let Some(tree) = front_parent(front, rng, 0.05) {
+        if let Some(tree) = front_parent(parents.front, rng, 0.05) {
             return tree.clone();
         }
         let parent = qd.and_then(|q| {
@@ -6391,7 +6330,7 @@ fn pick_parent_policy(
             return tree.clone();
         }
     }
-    pick_parent(island, front, rng, front_p).clone()
+    pick_parent(island, parents.front, rng, parents.source.front_p).clone()
 }
 
 // #465: age-fitness Pareto survivor selection (`--selection afp`).
@@ -6447,23 +6386,18 @@ fn afp_worst(island: &[Ind]) -> Option<usize> {
 /// #465: one parent and its age. Without AFP this is [`pick_parent_policy`]
 /// with age 0, draw for draw. With AFP a front parent counts as age 0 and the
 /// island tournament runs on rank and crowding distance.
-#[allow(clippy::too_many_arguments)]
 fn pick_parent_aged(
     island: &[Ind],
-    front: &[Sol],
-    qd: Option<&QdArchive>,
+    parents: &Parents<'_>,
     rng: &mut Mt,
-    front_p: f64,
-    qd_policy: bool,
-    qd_control: u8,
     afp: bool,
     rank: &[u32],
     crowd: &[f64],
 ) -> (Node, u32) {
-    if !afp || qd_policy {
-        return (pick_parent_policy(island, front, qd, rng, front_p, qd_policy, qd_control), 0);
+    if !afp || parents.qd.is_some() {
+        return (pick_parent_policy(island, parents, rng), 0);
     }
-    match front_parent(front, rng, front_p) {
+    match front_parent(parents.front, rng, parents.source.front_p) {
         Some(tree) => (tree.clone(), 0),
         None => {
             let i = afp::tournament(rank, crowd, rng, 4);
@@ -6704,15 +6638,10 @@ fn evolve_island(
     screened: bool,
     // #26: leave the fitness pending when the caller will batch it on the GPU.
     defer_gpu: bool,
-    // #76: the previous generation's Pareto front. Read-only and borrowed for
-    // the duration of the island thread; nothing is cloned and the islands
-    // still run in parallel. `front_p == 0.0` makes it a no-op.
-    front: &[Sol],
-    front_p: f64,
-    // #120: the QD archive at the start of this generation (read-only).
-    qd: Option<&QdArchive>,
-    qd_policy: bool,
-    qd_control: u8,
+    // #76 #120 #1081: the previous generation's Pareto front and QD archive,
+    // read-only and borrowed for the duration of the island thread, and where
+    // the island policy lets this island draw from them.
+    parents: Parents<'_>,
     // #119: when present, every pending candidate is also offered to the
     // bounded GPU queue as soon as it is fitted, so scoring overlaps the rest
     // of this generation. `None` is the synchronous path exactly.
@@ -6781,7 +6710,7 @@ fn evolve_island(
     let parent_errors: std::collections::HashMap<u64, f64> = if learn {
         isl.iter()
             .map(|i| (expr::structural_hash(&i.tree), i.error))
-            .chain(front.iter().map(|s| (expr::structural_hash(&s.tree), s.error)))
+            .chain(parents.front.iter().map(|s| (expr::structural_hash(&s.tree), s.error)))
             .collect()
     } else {
         std::collections::HashMap::new()
@@ -6805,9 +6734,7 @@ fn evolve_island(
             // #120: with the policy on, a UCB/stratified cell elite supplies most
             // parents; 5% still come from the global Pareto front. With the policy
             // off this is exactly the #76 draw.
-            let (p1, mut age) = pick_parent_aged(
-                isl, front, qd, rng, front_p, qd_policy, qd_control, afp, &par_rank, &par_crowd,
-            );
+            let (p1, mut age) = pick_parent_aged(isl, &parents, rng, afp, &par_rank, &par_crowd);
             let parent_err = if learn {
                 parent_errors.get(&expr::structural_hash(&p1)).copied()
             } else {
@@ -6816,9 +6743,7 @@ fn evolve_island(
             let mut used = 0u8; // #471: bit per edit kind applied to this child
             let mut child = p1;
             if rng.bool(0.5) {
-                let (parent2, age2) = pick_parent_aged(
-                    isl, front, qd, rng, front_p, qd_policy, qd_control, afp, &par_rank, &par_crowd,
-                );
+                let (parent2, age2) = pick_parent_aged(isl, &parents, rng, afp, &par_rank, &par_crowd);
                 age = age.max(age2);
                 crossover_with_opts(&mut child, &parent2, rng, Some(aggs), opts.crossover_internal);
             }
@@ -6906,7 +6831,7 @@ fn evolve_island(
     // island in the same descriptor region even when parents are drawn from
     // the archive. The immigrants are aimed at the least-visited cell and are
     // scored exactly like any other offspring (the GPU batch defers them too).
-    if qd_policy {
+    if let Some((qd, _)) = parents.qd {
         if let Some(target) = qd.and_then(|q| q.least_occupied_descriptor()) {
             let immigrants = (pop / 10).max(1).min(pop);
             let mut trees: Vec<Node> = Vec::with_capacity(immigrants);
@@ -7342,112 +7267,43 @@ fn checkpoint_due(save_every: usize, gens_done: usize, since_last: f64, interval
 
 /// #1022: report one generation's development-log record once its restarts are
 /// known.
-fn flush_dev_generation(
-    cfg: &Config,
-    rec: Option<crate::devlog::GenRecord>,
-    restarts: usize,
-    restarts_total: u64,
-    state: Option<&RestartState>,
-) {
+fn flush_dev_generation(cfg: &Config, rec: Option<crate::devlog::GenRecord>, restarts: usize, policy: &IslandPolicy) {
     if let (Some(report), Some(mut rec)) = (&cfg.dev_log, rec) {
         rec.restarts = restarts;
-        rec.restarts_total = restarts_total;
-        rec.isolated = state.map_or(0, |s| s.isolated_count());
+        rec.restarts_total = policy.restarts_total();
+        rec.isolated = policy.isolated_count();
         report(&rec);
     }
 }
 
-/// #1022: per-island restart bookkeeping under `--restart-policy island`.
-/// Every counter is a pure function of the trajectory; nothing here draws from
-/// an RNG.
-#[derive(Clone, Debug, PartialEq)]
-struct RestartState {
-    /// Generations since each island's best error last improved.
-    since_improve: Vec<usize>,
-    /// Generations of isolation left after a restart.
-    isolated: Vec<usize>,
-    /// Each island's best error so far (`+inf` at the start and after a restart).
-    best_prev: Vec<f64>,
+/// #1090: join every island thread of one generation, then fail if any of them
+/// panicked. A panicking island leaves its population, generator and mix
+/// window half updated, so the generation must not reach the archive or a
+/// checkpoint.
+fn join_islands(handles: Vec<std::thread::ScopedJoinHandle<'_, ()>>, gen: usize) -> Result<(), String> {
+    let panics: Vec<String> = handles
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, h)| {
+            let payload = h.join().err()?;
+            Some(format!("island {i} panicked in generation {gen}: {}", panic_text(payload.as_ref())))
+        })
+        .collect();
+    if panics.is_empty() {
+        Ok(())
+    } else {
+        Err(panics.join("; "))
+    }
 }
 
-impl RestartState {
-    fn new(islands: usize) -> Self {
-        RestartState {
-            since_improve: vec![0; islands],
-            isolated: vec![0; islands],
-            best_prev: vec![f64::INFINITY; islands],
-        }
-    }
-
-    /// The saved counters of a resume; a checkpoint written under the archive
-    /// policy has none.
-    fn from_saved(saved: &[Option<crate::checkpoint::IslandStall>]) -> Result<Self, String> {
-        let mut state = RestartState::new(saved.len());
-        for (i, stall) in saved.iter().enumerate() {
-            let stall = stall.ok_or_else(|| {
-                "checkpoint has no island_stall records; it was written under --restart-policy archive"
-                    .to_string()
-            })?;
-            state.since_improve[i] = stall.since_improve;
-            state.isolated[i] = stall.isolated;
-            state.best_prev[i] = stall.best_prev;
-        }
-        Ok(state)
-    }
-
-    fn saved(&self, island: usize) -> crate::checkpoint::IslandStall {
-        crate::checkpoint::IslandStall {
-            since_improve: self.since_improve[island],
-            isolated: self.isolated[island],
-            best_prev: self.best_prev[island],
-        }
-    }
-
-    /// One generation's stall update, after the archive update. `island_best`
-    /// is each island's best error.
-    fn tick(&mut self, island_best: &[f64]) {
-        for (ii, &cur) in island_best.iter().enumerate() {
-            if cur.is_finite() && !crate::progress_stats::no_improvement(self.best_prev[ii], cur) {
-                self.since_improve[ii] = 0;
-            } else {
-                self.since_improve[ii] += 1;
-            }
-            self.best_prev[ii] = self.best_prev[ii].min(cur);
-            self.isolated[ii] = self.isolated[ii].saturating_sub(1);
-        }
-    }
-
-    /// The lowest island whose best error equals the archive's; it is never
-    /// restarted. `None` when no island holds the archive best.
-    fn keeper(island_best: &[f64], arch_best: f64) -> Option<usize> {
-        island_best.iter().position(|&b| b == arch_best)
-    }
-
-    fn due(&self, island: usize, keeper: Option<usize>, interval: usize) -> bool {
-        self.since_improve[island] >= interval && Some(island) != keeper
-    }
-
-    fn restarted(&mut self, island: usize, isolation: usize) {
-        self.since_improve[island] = 0;
-        self.best_prev[island] = f64::INFINITY;
-        self.isolated[island] = isolation;
-    }
-
-    fn is_isolated(&self, island: usize) -> bool {
-        self.isolated[island] > 0
-    }
-
-    /// The global-front parent probability of `island` this generation.
-    fn front_p(&self, island: usize, base: f64) -> f64 {
-        if self.is_isolated(island) {
-            0.0
-        } else {
-            base
-        }
-    }
-
-    fn isolated_count(&self) -> usize {
-        self.isolated.iter().filter(|&&w| w > 0).count()
+/// #1090: the message of a panic payload.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        text.to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "non-string panic payload".to_string()
     }
 }
 
@@ -7467,8 +7323,7 @@ fn snapshot(
     archive: &Archive,
     islands: &[Vec<Ind>],
     rngs: &[Mt],
-    stagnant: &[usize],
-    restart: Option<&RestartState>, // #1022
+    policy: &IslandPolicy, // #1022 #1081
     mixes: &[MixWindow],
     main_rng: &Mt,
     train: &Sample,
@@ -7502,12 +7357,12 @@ fn snapshot(
                 IslandState {
                     rng: Mt::from_state(*words, idx),
                     mix: mixes.get(i).cloned().unwrap_or_default(),
-                    stall: restart.map(|r| r.saved(i)),
+                    stall: policy.stall(i),
                     population: pop.iter().map(Ind::to_checkpoint).collect(),
                 }
             })
             .collect(),
-        stagnant: stagnant.to_vec(),
+        stagnant: policy.stagnant().to_vec(),
         main_rng: Mt::from_state(*words, idx),
         // #256: the search state is f32 proxy fitness on the GPU. The refit
         // archive the run reports travels beside it, not instead of it.
@@ -8056,8 +7911,7 @@ fn run_postfix_search(
     islands: Vec<Vec<Ind>>,
     rngs: Vec<Mt>,
     main_rng: Mt,
-    mut stagnant: Vec<usize>,
-    mut restart_state: Option<RestartState>, // #1022
+    mut policy: IslandPolicy, // #1022 #1081
     mut gens_done: usize,
     mut converged_early: bool,
     mut best_prev: f64,
@@ -8085,7 +7939,6 @@ fn run_postfix_search(
     let mut progress_stats = ProgressStats::new(crate::progress_stats::DEFAULT_WINDOW);
     let mut gpu_stats: Vec<GpuGenStats> = Vec::new();
     let mut restart_flags = vec![false; n_islands];
-    let mut restarts_total = 0u64; // #1022
     let t0 = std::time::Instant::now();
     // #284: run clock and ledger for the flat path.
     let mut run_ledger = crate::gpu_stats::RunLedger::new();
@@ -8131,15 +7984,8 @@ fn run_postfix_search(
         } else {
             FrontParents::empty()
         };
-        let front_p = if cfg.front_parents {
-            FRONT_PARENT_P
-        } else {
-            0.0
-        };
-        // #1022: an isolated island draws no front parent.
-        let front_ps: Vec<f64> = (0..n_islands)
-            .map(|i| restart_state.as_ref().map_or(front_p, |r| r.front_p(i, front_p)))
-            .collect();
+        // #1022 #1081: the island policy sets each island's front probability.
+        let front_ps: Vec<f64> = (0..n_islands).map(|i| policy.parent_source(i).front_p).collect();
         let mut next = variation.next_generation_with_front(
             &pool,
             gen as u32,
@@ -8191,17 +8037,7 @@ fn run_postfix_search(
         let mut dev_rec: Option<crate::devlog::GenRecord> = None; // #1022: reported after the restart step
         let dev_archive = dev_lap(&mut dev_mark); // #211
         let stage_archive = stage_lap(&mut stage_mark); // #284
-        // #1022: each island's own stall, after the archive update.
-        if let Some(rs) = restart_state.as_mut() {
-            let bests: Vec<f64> = (0..n_islands)
-                .map(|i| {
-                    (0..pop)
-                        .map(|j| next.err[next.slot_index(i, j)])
-                        .fold(f64::INFINITY, f64::min)
-                })
-                .collect();
-            rs.tick(&bests);
-        }
+        policy.observe(&next); // #1022: each island's own stall, after the archive update
         run_ledger.record_stage(crate::gpu_stats::Stage::Vary, stage_generate);
         run_ledger.record_stage(crate::gpu_stats::Stage::Archive, stage_archive);
         eval_stage_total += stage_eval;
@@ -8334,72 +8170,23 @@ fn run_postfix_search(
             }
         }
 
-        let mut restarts_now = 0usize; // #1022
-        if n_islands > 1 && cfg.migration_interval > 0 && (gen + 1) % cfg.migration_interval == 0
-        {
-            let skip: Vec<bool> = (0..n_islands)
-                .map(|i| restart_state.as_ref().is_some_and(|r| r.is_isolated(i)))
-                .collect();
-            next.migrate(&skip);
+        // Migration, stagnation and restart, exactly as the owned-tree loop:
+        // decided by the island policy at the generation boundary, applied
+        // before the checkpoint so a saved state never carries the pre-restart
+        // population.
+        let restarts = policy.barrier(
+            gen,
+            &archive.items,
+            &mut ArenaIslands { arena: &mut next, variation: &variation, gen: gen as u32 },
+        );
+        if !restarts.is_empty() {
+            next.evaluate(
+                &mut gpu.ev,
+                gpu.score.expect("the pass-through postfix path only runs native score objectives"),
+            )?;
         }
 
-        // Stagnation and restart, exactly as the owned-tree loop: measured at
-        // the generation boundary, applied before the checkpoint so a saved
-        // state never carries the pre-restart population.
-        if cfg.restart_interval > 0 && (gen + 1) % cfg.restart_interval == 0 {
-            let arch_best = archive
-                .items
-                .iter()
-                .map(|s| s.error)
-                .fold(f64::INFINITY, f64::min);
-            // #1022: the keeper holds the archive best and is never restarted.
-            let keeper = restart_state.as_ref().and_then(|_| {
-                let bests: Vec<f64> = (0..n_islands)
-                    .map(|i| {
-                        (0..pop)
-                            .map(|j| next.err[next.slot_index(i, j)])
-                            .fold(f64::INFINITY, f64::min)
-                    })
-                    .collect();
-                RestartState::keeper(&bests, arch_best)
-            });
-            let mut restarted = false;
-            for i in 0..n_islands {
-                let restart_now = match restart_state.as_ref() {
-                    Some(rs) => rs.due(i, keeper, cfg.restart_interval),
-                    None => {
-                        let cur_best = (0..pop)
-                            .map(|j| next.err[next.slot_index(i, j)])
-                            .fold(f64::INFINITY, f64::min);
-                        if cur_best > arch_best + 1e-9 {
-                            stagnant[i] += 1;
-                        } else {
-                            stagnant[i] = 0;
-                        }
-                        stagnant[i] >= 2
-                    }
-                };
-                if restart_now {
-                    variation.restart_island(&mut next, i, gen as u32);
-                    stagnant[i] = 0;
-                    if let Some(rs) = restart_state.as_mut() {
-                        rs.restarted(i, cfg.restart_isolation);
-                    }
-                    restarted = true;
-                    restarts_now += 1;
-                    restarts_total += 1;
-                }
-            }
-            if restarted {
-                next.evaluate(
-            &mut gpu.ev,
-            gpu.score
-                .expect("the pass-through postfix path only runs native score objectives"),
-        )?;
-            }
-        }
-
-        flush_dev_generation(cfg, dev_rec.take(), restarts_now, restarts_total, restart_state.as_ref());
+        flush_dev_generation(cfg, dev_rec.take(), restarts.len(), &policy);
 
         if checkpoint_due(save_every, gens_done, last_save.elapsed().as_secs_f64(), save_interval_s) {
             last_save = std::time::Instant::now();
@@ -8435,8 +8222,7 @@ fn run_postfix_search(
                 &archive,
                 &islands_now,
                 &rngs,
-                &stagnant,
-                restart_state.as_ref(), // #1022
+                &policy, // #1022 #1081
                 &[],
                 &main_rng,
                 train,
@@ -8511,8 +8297,7 @@ fn run_postfix_search(
             &archive,
             &islands_now,
             &rngs,
-            &stagnant,
-            restart_state.as_ref(), // #1022
+            &policy, // #1022 #1081
             &[],
             &main_rng,
             train,
@@ -9048,10 +8833,8 @@ fn run_search_scoped(
     let mut archive: Archive;
     let mut rngs: Vec<Mt>;
     let mut islands: Vec<Vec<Ind>>;
-    let mut stagnant: Vec<usize>;
     let mut mixes: Vec<MixWindow>;
-    // #1022: `Some` only under `--restart-policy island`.
-    let mut restart_state: Option<RestartState>;
+    let mut policy: IslandPolicy; // #1022 #1081
     let mut gens_done: usize;
     let mut converged_early: bool;
     let mut best_prev: f64;
@@ -9116,7 +8899,6 @@ fn run_search_scoped(
         best_prev = saved_best;
         no_improve = saved_no_improve;
         archive = saved_archive;
-        stagnant = saved_stagnant;
         rng = main_rng;
         rngs = Vec::with_capacity(saved_islands.len());
         islands = Vec::with_capacity(saved_islands.len());
@@ -9133,19 +8915,15 @@ fn run_search_scoped(
                     .collect(),
             );
         }
-        restart_state = if cfg.restart_policy == RestartPolicy::Island {
-            Some(RestartState::from_saved(&saved_stalls)?)
-        } else {
-            None
-        };
+        policy = IslandPolicy::resume(cfg, saved_stagnant, &saved_stalls)?;
         let want = cfg.islands.max(1);
-        if islands.len() != want || rngs.len() != want || stagnant.len() != want {
+        if islands.len() != want || rngs.len() != want || policy.stagnant().len() != want {
             return Err(format!(
                 "checkpoint has {} island(s), {} rng state(s) and {} counter(s), \
                  but this configuration needs {}",
                 islands.len(),
                 rngs.len(),
-                stagnant.len(),
+                policy.stagnant().len(),
                 want
             ));
         }
@@ -9165,10 +8943,8 @@ fn run_search_scoped(
             .collect();
 
         islands = Vec::with_capacity(cfg.islands.max(1));
-        stagnant = vec![0; cfg.islands.max(1)];
         mixes = vec![MixWindow::new(); cfg.islands.max(1)];
-        restart_state = (cfg.restart_policy == RestartPolicy::Island)
-            .then(|| RestartState::new(cfg.islands.max(1)));
+        policy = IslandPolicy::new(cfg);
         // Generation 0's subset also scores the initial population, so nothing
         // is evaluated on the full table before the first generation.
         let init_sample = training_for_generation(cfg, train, 0);
@@ -9344,8 +9120,7 @@ fn run_search_scoped(
                         islands,
                         rngs,
                         rng,
-                        stagnant,
-                        restart_state,
+                        policy,
                         gens_done,
                         converged_early,
                         best_prev,
@@ -9432,7 +9207,6 @@ fn run_search_scoped(
     let mut eval_stage_total = 0.0f64;
     let mut last_save = std::time::Instant::now();
     let save_interval_s = checkpoint_interval_s();
-    let mut restarts_total = 0u64; // #1022
     if !converged_early {
         let mut dev_rec: Option<crate::devlog::GenRecord> = None; // #1022: reported after the restart step
         for gen in gens_done..cfg.generations {
@@ -9545,18 +9319,9 @@ fn run_search_scoped(
             // archive below. At generation 0 (or with the feature off) it is
             // empty or unused and the search is unchanged.
             let front: &[Sol] = &archive.items;
-            let front_p = if cfg.front_parents {
-                FRONT_PARENT_P
-            } else {
-                0.0
-            };
-            // #1022: an isolated island draws no front parent.
-            let island_front_p: Vec<f64> = (0..islands.len())
-                .map(|i| restart_state.as_ref().map_or(front_p, |r| r.front_p(i, front_p)))
-                .collect();
             // #120: the archive as of the previous generation, borrowed exactly
             // like the Pareto front. It is updated only after the barrier.
-            let qd_snapshot = qd_archive.as_ref();
+            let qd_parents = cfg.qd_policy.then_some((qd_archive.as_ref(), cfg.qd_control));
             // #119: overlap the GPU with the rest of this generation. The CPU
             // threads keep generating and fitting; the main thread drains a
             // bounded queue and scores batches. Selection still waits for every
@@ -9641,11 +9406,13 @@ fn run_search_scoped(
                     .map(|(i, (((isl, r), mix), sender))| {
                         // #10: carry the block registry into the island thread.
                         let blocks = blocks.clone();
-                        let island_front = island_front_p[i]; // #1022
+                        let parents = Parents { front, qd: qd_parents, source: policy.parent_source(i) }; // #76 #120 #1081
                         s.spawn(move || {
                             expr::set_blocks(blocks);
-                            #[cfg(test)]
-                            front_draw_tag::set(cfg.seed, i);
+                            #[cfg(feature = "cuda")]
+                            if crate::gpu::injected_fault("island_panic") {
+                                panic!("injected island panic"); // #1090: test hook
+                            }
                             evolve_island(
                                 isl,
                                 r,
@@ -9656,11 +9423,7 @@ fn run_search_scoped(
                                 aggs_ref,
                                 screened,
                                 defer_gpu && !screened,
-                                front,   // #76
-                                island_front, // #76 #1022
-                                qd_snapshot, // #120
-                                cfg.qd_policy, // #120
-                                cfg.qd_control, // #120 control
+                                parents,
                                 sender.as_ref().map(|t| (t, i)), // #119
                                 dev_counters_ref, // #211
                                 island_workers, // #463
@@ -9702,10 +9465,8 @@ fn run_search_scoped(
                     }
                 }
 
-                for h in handles {
-                    let _ = h.join();
-                }
-            });
+                join_islands(handles, gen)
+            })?;
             let dev_search = dev_lap(&mut dev_mark); // #211: island scope
             candidates += GenCounters::total(dev_counters_ref, |c| &c.offspring);
             let stage_search = stage_lap(&mut stage_mark); // #284: see note below
@@ -9887,11 +9648,7 @@ fn run_search_scoped(
             let dev_archive = dev_lap(&mut dev_mark); // #211
             let stage_archive = stage_lap(&mut stage_mark); // #284
 
-            // #1022: each island's own stall, after the archive update.
-            if let Some(rs) = restart_state.as_mut() {
-                let bests: Vec<f64> = islands.iter().map(|p| population_best(p)).collect();
-                rs.tick(&bests);
-            }
+            policy.observe(&islands[..]); // #1022: each island's own stall, after the archive update
 
             #[cfg(feature = "cuda")]
             let (drain_eval_s, drain_fit_s) = gpu.as_ref().map_or((0.0, 0.0), |g| {
@@ -10000,7 +9757,7 @@ fn run_search_scoped(
                 if cfg.fitness.is_metric() && cfg.metric.is_solved(gen_best) {
                     converged_early = true;
                     stop_reason = "solved"; // #211
-                    flush_dev_generation(cfg, dev_rec.take(), 0, restarts_total, restart_state.as_ref());
+                    flush_dev_generation(cfg, dev_rec.take(), 0, &policy);
                     break;
                 }
                 if crate::progress_stats::no_improvement(best_prev, gen_best) {
@@ -10012,232 +9769,30 @@ fn run_search_scoped(
                 if cfg.patience > 0 && no_improve >= cfg.patience {
                     converged_early = true;
                     stop_reason = "patience"; // #211
-                    flush_dev_generation(cfg, dev_rec.take(), 0, restarts_total, restart_state.as_ref());
+                    flush_dev_generation(cfg, dev_rec.take(), 0, &policy);
                     break;
                 }
             }
 
-            let mut restarts_now = 0usize; // #1022
-            // ---- migration between islands ------------------------------
-            if cfg.islands > 1
-                && cfg.migration_interval > 0
-                && (gen + 1) % cfg.migration_interval == 0
-            {
-                #[cfg(test)]
-                let probe_before = migration_probe::hashes(&islands);
-                let bests: Vec<Option<Node>> = islands
-                    .iter()
-                    .map(|pop| {
-                        pop.iter()
-                            .min_by(|a, b| {
-                                crate::error_order::cmp_error(a.error, b.error)
-                            })
-                            .map(|i| i.tree.clone())
-                    })
-                    .collect();
-                let best_ages: Vec<u32> = islands
-                    .iter()
-                    .map(|pop| {
-                        pop.iter()
-                            .min_by(|a, b| {
-                                crate::error_order::cmp_error(a.error, b.error)
-                            })
-                            .map_or(0, |i| i.age)
-                    })
-                    .collect();
-                for ii in 0..islands.len() {
-                    // #1022: an isolated island receives no migrant.
-                    if restart_state.as_ref().is_some_and(|r| r.is_isolated(ii)) {
-                        continue;
-                    }
-                    let src = (ii + 1) % islands.len();
-                    if let Some(t) = &bests[src] {
-                        // #120: stratified migration replaces the individual in
-                        // the least-visited descriptor cell, not the globally
-                        // worst error. With QD off this is the old best-to-worst
-                        // ring migration bit for bit.
-                        let victim = if cfg.qd_policy {
-                            match qd_archive
-                                .as_ref()
-                                .and_then(|q| q.least_occupied_descriptor())
-                            {
-                                Some(target) => {
-                                    // #120: reuse the descriptors the scoring
-                                    // pass already accumulated when they
-                                    // describe `gen_train`; only the GPU or
-                                    // subset paths pay for one here.
-                                    let descriptors: Vec<qd::Descriptor> = islands[ii]
-                                        .iter()
-                                        .map(|ind| {
-                                            if cached_descriptors_valid {
-                                                if let Some(d) = ind.descriptor {
-                                                    return d;
-                                                }
-                                            }
-                                            qd::descriptor(&ind.tree, gen_train)
-                                        })
-                                        .collect();
-                                    descriptors
-                                        .iter()
-                                        .enumerate()
-                                        .min_by(|(_, a), (_, b)| {
-                                            let score = |d: &qd::Descriptor| {
-                                                (d.usage - target.usage).powi(2)
-                                                    + (d.skew - target.skew).powi(2)
-                                            };
-                                            score(a)
-                                                .partial_cmp(&score(b))
-                                                .unwrap_or(std::cmp::Ordering::Equal)
-                                        })
-                                        .map(|(i, _)| i)
-                                }
-                                None => None,
-                            }
-                        } else {
-                            None
-                        };
-                        let slot = victim.or_else(|| {
-                            if cfg.selection == Selection::Afp {
-                                return afp_worst(&islands[ii]);
-                            }
-                            islands[ii]
-                                .iter()
-                                .enumerate()
-                                .max_by(|(_, a), (_, b)| {
-                                    crate::error_order::cmp_error(a.error, b.error)
-                                })
-                                .map(|(i, _)| i)
-                        });
-                        if let Some(worst) = slot.and_then(|i| islands[ii].get_mut(i)) {
-                            // #26: batch the migrant with the next GPU call.
-                            *worst = if defer_gpu {
-                                Ind::pending(t.clone(), cfg)
-                            } else {
-                                Ind::evaluated(t.clone(), gen_data, cfg) // #25
-                            };
-                            worst.age = best_ages[src];
-                        }
-                    }
-                }
-                #[cfg(test)]
-                migration_probe::record(
-                    cfg.seed,
-                    gens_done,
-                    (0..islands.len())
-                        .map(|i| restart_state.as_ref().is_some_and(|r| r.is_isolated(i)))
-                        .collect(),
-                    probe_before,
-                    migration_probe::hashes(&islands),
-                );
-            }
-
-            // ---- restart stagnant islands -------------------------------
-            if cfg.restart_interval > 0 && (gen + 1) % cfg.restart_interval == 0 {
-                let arch_best = archive
-                    .items
-                    .iter()
-                    .map(|s| s.error)
-                    .fold(f64::INFINITY, f64::min);
-                // #1022: the keeper holds the archive best and is never restarted.
-                let keeper = restart_state.as_ref().and_then(|_| {
-                    let bests: Vec<f64> = islands.iter().map(|p| population_best(p)).collect();
-                    RestartState::keeper(&bests, arch_best)
-                });
-                for ii in 0..islands.len() {
-                    let restart_now = match restart_state.as_ref() {
-                        Some(rs) => rs.due(ii, keeper, cfg.restart_interval),
-                        None => {
-                            let cur_best = islands[ii]
-                                .iter()
-                                .map(|i| i.error)
-                                .fold(f64::INFINITY, f64::min);
-                            if cur_best > arch_best + 1e-9 {
-                                stagnant[ii] += 1;
-                            } else {
-                                stagnant[ii] = 0;
-                            }
-                            stagnant[ii] >= 2
-                        }
-                    };
-                    if restart_now {
-                        let mut r = rngs[ii].clone();
-                        // #120: aim the restart at the least-visited region by
-                        // rejection sampling a few cheap descriptor probes.
-                        let qd_target = if cfg.qd_policy {
-                            qd_archive
-                                .as_ref()
-                                .and_then(|q| q.least_occupied_descriptor())
-                        } else {
-                            None
-                        };
-                        let mut have_const = false; // #477
-                        for ind in islands[ii].iter_mut() {
-                            let hc = have_const; // #477
-                            let mut t = draw_row_dependent(cfg, nvars, &mut have_const, || {
-                                let mut t = random_tree_with(
-                                    &mut r,
-                                    nvars,
-                                    &cfg.ops,
-                                    cfg.init_depth,
-                                    Some(&aggs),
-                                );
-                                if let Some(target) = qd_target {
-                                    let mut best = t.clone();
-                                    let mut best_d = qd::descriptor(&t, gen_train);
-                                    let mut best_score = if hc && !expr::row_dependent(&t) {
-                                        f64::INFINITY
-                                    } else {
-                                        (best_d.usage - target.usage).powi(2) + (best_d.skew - target.skew).powi(2)
-                                    };
-                                    for _ in 0..3 {
-                                        let cand = random_tree_with(
-                                            &mut r,
-                                            nvars,
-                                            &cfg.ops,
-                                            cfg.init_depth,
-                                            Some(&aggs),
-                                        );
-                                        let d = qd::descriptor(&cand, gen_train);
-                                        let score = (d.usage - target.usage).powi(2)
-                                            + (d.skew - target.skew).powi(2);
-                                        if score < best_score && !(hc && !expr::row_dependent(&cand)) {
-                                            best = cand;
-                                            best_d = d;
-                                            best_score = score;
-                                        }
-                                    }
-                                    let _ = best_d;
-                                    t = best;
-                                }
-                                t
-                            });
-                            // #15: multi-output fits per output inside the evaluator.
-                            let mut fitted = None;
-                            if cfg.fit_iters > 0
-                                && !gen_train.is_multi()
-                                && !defers_fit_to_gpu(cfg, defer_gpu)
-                            {
-                                fitted = fit_constants(&mut t, cfg, fit_train, gen_train); // #85 #87
-                            }
-                            // #26: restart trees are batched with the next GPU
-                            // call too, before the checkpoint is taken.
-                            *ind = if defer_gpu {
-                                Ind::pending(t, cfg)
-                            } else {
-                                Ind::evaluated_fitted(t, fitted, gen_data, cfg) // #87
-                            };
-                        }
-                        rngs[ii] = r;
-                        stagnant[ii] = 0;
-                        if let Some(rs) = restart_state.as_mut() {
-                            rs.restarted(ii, cfg.restart_isolation); // #1022
-                        }
-                        restarts_now += 1;
-                        restarts_total += 1;
-                    }
-                }
-            }
-            flush_dev_generation(cfg, dev_rec.take(), restarts_now, restarts_total, restart_state.as_ref());
+            // ---- migration and restarts (#1081: the island policy) --------
+            let restarts = policy.barrier(
+                gen,
+                &archive.items,
+                &mut TreeIslands {
+                    islands: &mut islands,
+                    rngs: &mut rngs,
+                    cfg,
+                    nvars,
+                    aggs: &aggs,
+                    gen_train,
+                    gen_data,
+                    fit_train,
+                    defer_gpu,
+                    qd: qd_archive.as_ref(),
+                    cached_descriptors_valid,
+                },
+            );
+            flush_dev_generation(cfg, dev_rec.take(), restarts.len(), &policy);
 
             // #26: migration and restarts may have added pending individuals;
             // score them before the checkpoint so a saved state is never NaN.
@@ -10294,8 +9849,7 @@ fn run_search_scoped(
                     &archive,
                     &islands,
                     &rngs,
-                    &stagnant,
-                    restart_state.as_ref(), // #1022
+                    &policy, // #1022 #1081
                     &mixes,
                     &rng,
                     train,
@@ -10371,8 +9925,7 @@ fn run_search_scoped(
             &archive,
             &islands,
             &rngs,
-            &stagnant,
-            restart_state.as_ref(), // #1022
+            &policy, // #1022 #1081
             &mixes,
             &rng,
             train,
@@ -11841,6 +11394,11 @@ mod tests {
     }
 
     // #76: two distinguishable front members.
+    /// No front, no QD archive: every parent comes from the island tournament.
+    fn no_parents() -> Parents<'static> {
+        Parents { front: &[], qd: None, source: ParentSource { front_p: 0.0, shared: true } }
+    }
+
     fn two_member_front() -> Vec<Sol> {
         vec![
             Sol {
@@ -11941,11 +11499,7 @@ mod tests {
                 &aggs,
                 false,
                 false,
-                front,
-                0.0,
-                None,  // #120: no QD snapshot in this test
-                false, // #120
-                0,     // #120 control
+                Parents { front, qd: None, source: ParentSource { front_p: 0.0, shared: true } },
                 None,  // #119: synchronous test path
                 None,  // #211: no development log in this test
                 1,     // #463
@@ -13519,8 +13073,8 @@ mod tests {
             .collect();
         let mut rng = Mt::new(11);
         evolve_island(
-            &mut isl, &mut rng, &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None, false,
-            0, None, None, 1, &mut MixWindow::new(), None,
+            &mut isl, &mut rng, &cfg, &data, &s, 1, &aggs, false, false, no_parents(), None, None, 1,
+            &mut MixWindow::new(), None,
         );
         let immigrants = afp_immigrants(cfg.pop);
         assert_eq!(isl.len(), cfg.pop + immigrants);
@@ -13623,8 +13177,8 @@ mod tests {
         let mut isl = inf_population(&data, &cfg);
         let counters = GenCounters::default();
         evolve_island(
-            &mut isl, &mut Mt::new(5), &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None,
-            false, 0, None, Some(&counters), 1, &mut MixWindow::new(), None,
+            &mut isl, &mut Mt::new(5), &cfg, &data, &s, 1, &aggs, false, false, no_parents(), None,
+            Some(&counters), 1, &mut MixWindow::new(), None,
         );
         assert_eq!(GenCounters::total(Some(&counters), |c| &c.reevals), 0);
     }
@@ -13697,8 +13251,8 @@ mod tests {
                 .collect();
             let counters = GenCounters::default();
             evolve_island(
-                &mut isl, &mut Mt::new(5), &cfg, &data, &s, 1, &aggs, false, false, &[], 0.0, None,
-                false, 0, None, Some(&counters), 1, &mut MixWindow::new(), rows,
+                &mut isl, &mut Mt::new(5), &cfg, &data, &s, 1, &aggs, false, false, no_parents(), None,
+                Some(&counters), 1, &mut MixWindow::new(), rows,
             );
             GenCounters::total(Some(&counters), |c| &c.reevals)
         };
@@ -14673,58 +14227,32 @@ mod tests {
         }
     }
 
+    /// #1090: every island thread is joined, and each panic becomes part of one
+    /// error with the island, the generation and the panic text.
     #[test]
-    fn restart_state_counts_the_islands_own_stall_and_spares_the_keeper() {
-        let mut s = RestartState::new(3);
-        s.tick(&[1.0, 1.0, 2.0]);
-        assert_eq!(s.since_improve, vec![0, 0, 0], "the first finite best is an improvement");
-        s.tick(&[1.0, 0.5, 2.0]);
-        assert_eq!(s.since_improve, vec![1, 0, 1]);
-        s.tick(&[1.0 - 1e-12, 0.5, f64::INFINITY]);
-        assert_eq!(s.since_improve, vec![2, 1, 2], "a 1e-12 gain and a non-finite best are stalls");
-        assert_eq!(s.best_prev[2], 2.0, "a non-finite best never lowers best_prev");
-
-        assert_eq!(RestartState::keeper(&[1.0, 0.5, 0.5], 0.5), Some(1), "the lowest holder keeps");
-        assert_eq!(RestartState::keeper(&[1.0, 0.7], 0.5), None);
-        assert_eq!(RestartState::keeper(&[0.5], 0.5), Some(0), "one island is its own keeper");
-        assert!(s.due(0, Some(1), 2));
-        assert!(!s.due(1, Some(1), 1), "the keeper is never due");
-        assert!(s.due(1, None, 1));
-        assert!(!s.due(1, None, 2), "not stalled for a whole interval yet");
-    }
-
-    #[test]
-    fn restart_state_isolation_zeroes_front_parents_and_counts_down() {
-        let mut s = RestartState::new(2);
-        s.tick(&[1.0, 1.0]);
-        s.restarted(1, 3);
-        assert_eq!(s.best_prev[1], f64::INFINITY);
-        assert_eq!(s.since_improve[1], 0);
-        assert_eq!((s.front_p(0, 0.15), s.front_p(1, 0.15)), (0.15, 0.0));
-        assert_eq!(s.isolated_count(), 1);
-        for left in [2usize, 1, 0] {
-            s.tick(&[1.0, 5.0]);
-            assert_eq!(s.isolated[1], left);
-            if left == 2 {
-                assert_eq!(s.since_improve[1], 0, "the first generation after a restart is an improvement");
-            }
-        }
-        assert!(!s.is_isolated(1));
-        assert_eq!(s.front_p(1, 0.15), 0.15);
-        s.restarted(0, 0);
-        assert!(!s.is_isolated(0), "a window of 0 turns the isolation off");
-    }
-
-    #[test]
-    fn restart_state_survives_a_checkpoint_round_trip_and_refuses_a_missing_record() {
-        let mut s = RestartState::new(2);
-        s.tick(&[2.0, 3.0]);
-        s.tick(&[2.0, 2.5]);
-        s.restarted(0, 7);
-        let saved: Vec<_> = (0..2).map(|i| Some(s.saved(i))).collect();
-        assert_eq!(RestartState::from_saved(&saved).unwrap(), s);
-        let err = RestartState::from_saved(&[Some(s.saved(0)), None]).unwrap_err();
-        assert!(err.contains("island_stall"), "{err}");
+    fn an_island_panic_is_an_error_naming_every_island_that_panicked() {
+        let joined = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|i| {
+                    s.spawn(move || match i {
+                        1 => panic!("injected island panic"),
+                        2 => std::panic::panic_any(7u8),
+                        3 => panic!("island {i} broke"),
+                        _ => {}
+                    })
+                })
+                .collect();
+            join_islands(handles, 5)
+        });
+        assert_eq!(
+            joined,
+            Err("island 1 panicked in generation 5: injected island panic; \
+                 island 2 panicked in generation 5: non-string panic payload; \
+                 island 3 panicked in generation 5: island 3 broke"
+                .to_string())
+        );
+        let quiet = std::thread::scope(|s| join_islands((0..3).map(|_| s.spawn(|| {})).collect(), 0));
+        assert_eq!(quiet, Ok(()));
     }
 
     fn restart_fixture() -> (Sample, Sample) {
@@ -14801,58 +14329,5 @@ mod tests {
             }
         }
         assert!(island_restarted, "the island policy restarts a stalled island in at least one shape: {:?}", seen);
-    }
-
-    #[test]
-    fn an_isolated_island_draws_no_front_parent_and_receives_no_migrant() {
-        const SEED: u32 = 1022;
-        let (train, test) = restart_fixture();
-        let (mut isolated_gens, mut open_gens_with_draws, mut skipped, mut received) = (0, 0, 0, 0);
-        for shape in RESTART_SHAPES {
-        let cfg = Config { seed: SEED, ..restart_config(RestartPolicy::Island, 10, shape) };
-
-        let mut snaps: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();
-        run_resumable(&cfg, &train, &test, None, 1, |cp| {
-            if snaps.last().map_or(true, |s| s.0 != cp.generations) {
-                snaps.push((
-                    cp.generations,
-                    cp.islands.iter().map(|i| i.stall.expect("island policy").isolated).collect(),
-                    (0..cfg.islands).map(|i| front_draw_tag::count(SEED, i)).collect(),
-                ));
-            }
-        })
-        .unwrap();
-
-        for k in 1..snaps.len() {
-            for i in 0..cfg.islands {
-                let drawn = snaps[k].2[i] - snaps[k - 1].2[i];
-                if snaps[k - 1].1[i] > 0 {
-                    isolated_gens += 1;
-                    assert_eq!(
-                        drawn, 0,
-                        "island {} drew {} front parents in generation {} while isolated",
-                        i, drawn, snaps[k].0
-                    );
-                } else if drawn > 0 {
-                    open_gens_with_draws += 1;
-                }
-            }
-        }
-        for (seed, _gen, isolated, before, after) in migration_probe::take(SEED) {
-            assert_eq!(seed, SEED);
-            for i in 0..isolated.len() {
-                if isolated[i] {
-                    skipped += 1;
-                    assert_eq!(before[i], after[i], "an isolated island's population is untouched by migration");
-                } else if before[i] != after[i] {
-                    received += 1;
-                }
-            }
-        }
-        }
-        assert!(isolated_gens >= 10, "a restart opened an isolation window: {}", isolated_gens);
-        assert!(open_gens_with_draws > 0, "an open island does draw front parents");
-        assert!(skipped > 0, "a migration boundary fell inside an isolation window");
-        assert!(received > 0, "an open island receives migrants");
     }
 }
