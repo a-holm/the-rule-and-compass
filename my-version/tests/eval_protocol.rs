@@ -530,6 +530,7 @@ fn matched_null_keeps_its_size_under_synchronised_positions() {
             fresh: &observed,
             candidates: &[],
             trials: 1,
+            trials_source: "flag",
             pbo_blocks: 4,
             fdr_q: 0.1,
             best_baseline: "cash",
@@ -573,6 +574,7 @@ fn matched_null_withholds_p_with_too_few_shifts() {
         fresh: &observed,
         candidates: &[],
         trials: 1,
+        trials_source: "flag",
         pbo_blocks: 4,
         fdr_q: 0.1,
         best_baseline: "cash",
@@ -624,4 +626,23 @@ fn block_permutation_null_is_pinned() {
         &json[at..at + end + 1],
         "\"block_permutation\":{\"p_mean\":0.8536585365853658,\"p_sharpe\":0.7073170731707317,\"null_mean_q95\":-0.00008283531167358163,\"null_sharpe_q95\":-0.1942474845702363}"
     );
+}
+
+#[test]
+fn wf_markdown_psr_row() {
+    let t = panel(600, 3);
+    let s = panel_spec(600);
+    let mut o = ProtocolOptions::default();
+    o.bootstrap_draws = 100;
+    o.trials = Some(1);
+    o.trials_source = "out_of_sample_book";
+    let md = walkforward::run_table_with(&t, &s, "t", &o).unwrap().markdown();
+    assert!(md.contains("Trials N = 1 (source out_of_sample_book) over"), "{md}");
+    assert!(md.contains("Deflate across runs with rcsr trials."), "{md}");
+    let psr = md.find("| PSR (N = 1) | 1 | 0 |").expect("PSR row");
+    let dsr = md.find("| N_eff |").expect("DSR row");
+    assert!(psr < dsr);
+    o.trials_source = "flag";
+    let md = walkforward::run_table_with(&t, &s, "t", &o).unwrap().markdown();
+    assert!(md.contains("(source flag)") && !md.contains("rcsr trials."), "{md}");
 }

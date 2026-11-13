@@ -11207,6 +11207,18 @@ struct BandFlags {
     min_hold: bool,
 }
 
+/// #1027: the N of the deflated Sharpe is what selected on the scored rows. An
+/// out-of-sample `--from-run` book is one trial and `--front` compares its
+/// front members; a window the search selected on brings the search trials.
+fn default_trials(run: &rcsr::run_json::RunFile, front: bool, in_sample: bool) -> (usize, &'static str) {
+    let front_size = run.front.len().max(1);
+    match (front, in_sample, run.candidates_evaluated) {
+        (_, true, Some(n)) if n > 0 => (n as usize, "run.candidates_evaluated"),
+        (_, true, _) | (true, false, _) => (front_size, "front_size"),
+        (false, false, _) => (1, "out_of_sample_book"),
+    }
+}
+
 /// #946: `--from-run` and `--front` price the book the search selected. When
 /// the run priced a band or a minimum hold, the policy, multiple and hold come
 /// from the run; flags that disagree are refused. Returns `true` when the run's
@@ -11739,18 +11751,6 @@ fn run_walkforward(args: &[String]) -> ! {
         if target.is_none() {
             target = run.return_column.clone();
         }
-        if popts.trials.is_none() {
-            popts.trials = Some(match run.candidates_evaluated {
-                Some(n) if n > 0 => n as usize,
-                _ => {
-                    eprintln!(
-                        "error: --front {}: the run has no search.candidates_evaluated; pass --trials",
-                        path
-                    );
-                    std::process::exit(EXIT_USAGE);
-                }
-            });
-        }
         // The front is priced as the books the search compared: the run's
         // fixed threshold, cost and target spec.
         if run.position == rcsr::trading::PositionMap::TopTercile {
@@ -11985,6 +11985,11 @@ fn run_walkforward(args: &[String]) -> ! {
                 std::process::exit(EXIT_USAGE);
             }
         }
+    }
+    if let (None, Some(run)) = (popts.trials, front_run.as_ref()) {
+        let (n, source) = default_trials(run, front_path.is_some(), !popts.in_sample_windows.is_empty());
+        popts.trials = Some(n);
+        popts.trials_source = source;
     }
     let vars: Vec<String> = vars_src
         .map(|s| {
