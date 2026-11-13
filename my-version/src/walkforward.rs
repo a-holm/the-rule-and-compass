@@ -1742,7 +1742,7 @@ impl Accum {
         };
         let pooled = summarize(&pooled_returns, &pooled_gross, &pooled_stats, pooled_ppy);
         if let (true, None, Some(step)) = (opts.horizon_from_spec, opts.stride_seconds, min_group_step) {
-            if false && step >= 2.0 * spec.horizon {
+            if step >= 2.0 * spec.horizon {
                 return Err(format!(
                     "the target spec has horizon_seconds {} and no stride_seconds, but labelled test rows of one group are at least {} s apart: \
                      one period per horizon would give a wrong periods_per_year; add \"stride_seconds\": {} to the spec \
@@ -3103,7 +3103,7 @@ fn declared_period(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<(f64, Peri
     if spec.horizon.is_finite() && spec.horizon >= 1.0 && spec.horizon <= SECONDS_PER_YEAR {
         let source = if opts.horizon_from_spec { PeriodSource::TargetSpec } else { PeriodSource::HorizonFlag };
         let width = match (source, opts.stride_seconds) {
-            (PeriodSource::TargetSpec, Some(_stride)) => spec.horizon,
+            (PeriodSource::TargetSpec, Some(stride)) => spec.horizon.max(stride),
             _ => spec.horizon,
         };
         if width > SECONDS_PER_YEAR {

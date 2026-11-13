@@ -176,7 +176,7 @@ impl TargetSpec {
 
     /// Width `S` of one return period: the label horizon, or the label stride when it is wider.
     pub fn period_width_seconds(&self) -> f64 {
-        self.horizon_seconds
+        self.stride_seconds.map_or(self.horizon_seconds, |s| s.max(self.horizon_seconds))
     }
 
     /// Per-side cost in basis points: half the round-trip `cost_bps`. `None`
