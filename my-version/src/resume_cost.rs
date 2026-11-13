@@ -33,6 +33,15 @@ impl Search {
         }
     }
 
+    /// The backend a checkpoint records for the process that saved it.
+    pub fn of_checkpoint(backend: crate::checkpoint::Backend) -> Search {
+        match backend {
+            crate::checkpoint::Backend::Cpu => Search::Cpu,
+            crate::checkpoint::Backend::Gpu => Search::Gpu,
+            crate::checkpoint::Backend::Unknown => Search::Unknown,
+        }
+    }
+
     fn parse(s: &str) -> Search {
         match s {
             "cpu" => Search::Cpu,
@@ -87,8 +96,8 @@ impl Cost {
     }
 
     /// The cost recorded by a periodic checkpoint save inside a running process.
-    pub fn periodic(search_s: f64, _backend: crate::checkpoint::Backend) -> Cost {
-        Cost::process(search_s, None, None, Search::Unknown)
+    pub fn periodic(search_s: f64, backend: crate::checkpoint::Backend) -> Cost {
+        Cost::process(search_s, None, None, Search::of_checkpoint(backend))
     }
 
     /// `self` is the cost before this process, `process` the cost so far in it.
