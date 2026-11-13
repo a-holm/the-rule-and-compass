@@ -160,6 +160,46 @@ pub fn matched_exposure_positions(
     Ok(out)
 }
 
+/// Circular shift of every group's position series by `floor(num * n_g / den)` rows,
+/// `n_g` the rows of the group. With every group present in every period of a
+/// window of `den` periods this is one joint period shift, so the cross-symbol
+/// timing of the book is kept. Each group keeps its long row count.
+pub fn shifted_positions(
+    positions: &[f64],
+    groups: &[u64],
+    num: u64,
+    den: u64,
+) -> Result<Vec<f64>, String> {
+    if positions.len() != groups.len() {
+        return Err(format!(
+            "length mismatch: positions {}, groups {}",
+            positions.len(),
+            groups.len()
+        ));
+    }
+    if den == 0 {
+        return Err("shift denominator is zero".to_string());
+    }
+    check_long_only(positions)?;
+    check_group_contiguous(groups)?;
+    let n = positions.len();
+    let mut out = vec![0.0f64; n];
+    let mut lo = 0usize;
+    while lo < n {
+        let mut hi = lo + 1;
+        while hi < n && groups[hi] == groups[lo] {
+            hi += 1;
+        }
+        let len = hi - lo;
+        let s = ((num as u128 * len as u128 / den as u128) % len as u128) as usize;
+        for j in 0..len {
+            out[lo + j] = positions[lo + (j + len - s) % len];
+        }
+        lo = hi;
+    }
+    Ok(out)
+}
+
 /// Per-row net return of a `{0, 1}` book: `p * r - s|dp|`, plus `s * p` on the
 /// last row of each group. Same arithmetic as the #304 row term.
 pub fn net_rows(positions: &[f64], returns: &[f64], groups: &[u64], side: f64) -> Vec<f64> {
@@ -465,6 +505,33 @@ mod tests {
         assert_eq!(counter_draw(1, 2, 3, 4), counter_draw(1, 2, 3, 4));
         assert_ne!(counter_draw(1, 2, 3, 4), counter_draw(1, 2, 3, 5));
         assert_ne!(counter_draw(1, 2, 3, 4), counter_draw(2, 2, 3, 4));
+    }
+
+    #[test]
+    fn shifted_positions_preserve_exposure_and_synchrony() {
+        for seed in 0..100u64 {
+            let (groups, periods) = (4usize, 9 + (seed as usize % 7));
+            let path: Vec<f64> = (0..periods)
+                .map(|t| if counter_draw(seed, 1, 2, t as u64) >> 63 == 1 { 1.0 } else { 0.0 })
+                .collect();
+            let mut p = Vec::new();
+            let mut g = Vec::new();
+            for k in 0..groups {
+                p.extend_from_slice(&path);
+                g.extend(std::iter::repeat(k as u64).take(periods));
+            }
+            for s in 0..=periods as u64 {
+                let out = shifted_positions(&p, &g, s, periods as u64).unwrap();
+                for k in 0..groups {
+                    let (a, b) = (k * periods, (k + 1) * periods);
+                    assert_eq!(p[a..b].iter().sum::<f64>(), out[a..b].iter().sum::<f64>());
+                    for t in 0..periods {
+                        let src = (t + periods - s as usize % periods) % periods;
+                        assert_eq!(out[a + t], path[src]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

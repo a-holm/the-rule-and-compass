@@ -11099,8 +11099,10 @@ OPTIONS:
   --block-len <L>            block length in periods (default
                              max(h, hold, n^(1/3))); must be >= max(h, hold)
   --null-draws <B>           draws of the hour-block permutation null and the
-                             matched-exposure random long/flat null (default 0
-                             = off); p = (1+count)/(B+1)
+                             matched-exposure shifted long/flat null (one
+                             circular shift per draw and window, shared by all
+                             symbols; p is null under 20 distinct shifts)
+                             (default 0 = off); p = (1+count)/(B+1)
   --trials <N>               total trials behind the candidates, the N of the
                              DSR (default: the candidate count)
   --protocol-seed <n>        seed of every bootstrap, null and SPA draw

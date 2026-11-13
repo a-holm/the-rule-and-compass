@@ -557,3 +557,71 @@ fn matched_null_keeps_its_size_under_synchronised_positions() {
     assert!(new_rejects <= 34, "shifted null rejected {new_rejects} of {panels} at 10 %");
     assert!(old_rejects >= 60, "per-group shuffle rejected {old_rejects} of {panels} at 10 %");
 }
+
+#[test]
+fn matched_null_withholds_p_with_too_few_shifts() {
+    let book = synchronised_book(2, 4, 5);
+    let observed = period_means(&book, &book.positions);
+    let input = rcsr::wf_protocol::InferenceInput {
+        draws: 0,
+        null_draws: 50,
+        block_len: 5,
+        seed: 11,
+        control_seed: 3,
+        periods_per_year: 365.0,
+        pooled: &observed,
+        fresh: &observed,
+        candidates: &[],
+        trials: 1,
+        pbo_blocks: 4,
+        fdr_q: 0.1,
+        best_baseline: "cash",
+        baseline_series: &[],
+        buy_and_hold: &[],
+        books: std::slice::from_ref(&book),
+    };
+    let n = rcsr::wf_protocol::infer(&input).unwrap().nulls.unwrap();
+    assert_eq!(n.matched_distinct_shifts, 3);
+    assert_eq!(n.matched_scheme, "shared_circular_shift");
+    assert!(n.matched_exposure_random.p_mean.is_nan());
+    assert!(n.matched_exposure_random.p_sharpe.is_nan());
+    assert!(n.matched_exposure_random.null_mean_q95.is_finite());
+    let json = rcsr::wf_protocol::Inference { bootstrap: None, multiple: None, spa: None, nulls: Some(n) }.json();
+    assert!(
+        json.contains("\"matched_exposure_random\":{\"scheme\":\"shared_circular_shift\",\"distinct_shifts\":3,\"p_mean\":null,\"p_sharpe\":null,\"null_mean_q95\":"),
+        "{json}"
+    );
+}
+
+#[test]
+fn walkforward_report_carries_the_shift_scheme() {
+    let t = panel(600, 3);
+    let s = panel_spec(600);
+    let mut o = ProtocolOptions::default();
+    o.null_draws = 40;
+    let r = walkforward::run_table_with(&t, &s, "t", &o).unwrap();
+    let n = r.inference.as_ref().unwrap().nulls.as_ref().unwrap();
+    assert!(n.matched_distinct_shifts >= 20);
+    let json = r.json();
+    assert!(json.contains("\"matched_exposure_random\":{\"scheme\":\"shared_circular_shift\",\"distinct_shifts\":"), "{json}");
+    assert!(r.markdown().contains("matched-exposure shifted long/flat"));
+}
+
+#[test]
+fn block_permutation_null_is_pinned() {
+    let t = panel(600, 3);
+    let s = panel_spec(600);
+    let mut o = ProtocolOptions::default();
+    o.bootstrap_draws = 300;
+    o.null_draws = 40;
+    o.trials = Some(20);
+    o.pbo_blocks = 8;
+    let r = walkforward::run_table_with(&t, &s, "t", &o).unwrap();
+    let json = r.json();
+    let at = json.find("\"block_permutation\":").unwrap();
+    let end = json[at..].find('}').unwrap();
+    assert_eq!(
+        &json[at..at + end + 1],
+        "\"block_permutation\":{\"p_mean\":0.8536585365853658,\"p_sharpe\":0.7073170731707317,\"null_mean_q95\":-0.00008283531167358163,\"null_sharpe_q95\":-0.1942474845702363}"
+    );
+}
