@@ -454,3 +454,106 @@ fn wf_markdown_break_even_na() {
     let r = book_with_test_rows(&[(4.0, -0.01), (5.0, -0.02), (6.0, -0.01), (7.0, -0.01)]);
     assert!(r.markdown().contains("break-even n/a (gross <= 0) bp/side"), "{}", r.markdown());
 }
+
+fn normal(rng: &mut Mt) -> f64 {
+    let u = rng.next_f64().max(1e-12);
+    let v = rng.next_f64();
+    (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+}
+
+/// `groups` symbols over `periods` periods, returns with a common share of 0.5, one
+/// long/flat path for every symbol that is independent of the returns.
+fn synchronised_book(groups: usize, periods: usize, seed: u32) -> rcsr::wf_protocol::NullBook {
+    let mut rng = Mt::new(seed);
+    let mut path = vec![0.0f64; periods];
+    let mut on = rng.next_f64() < 0.5;
+    for p in path.iter_mut() {
+        if rng.next_f64() < 0.03 {
+            on = !on;
+        }
+        *p = if on { 1.0 } else { 0.0 };
+    }
+    let common: Vec<f64> = (0..periods).map(|_| normal(&mut rng)).collect();
+    let mut positions = Vec::new();
+    let mut returns = Vec::new();
+    let mut ids = Vec::new();
+    let mut period = Vec::new();
+    for g in 0..groups {
+        for t in 0..periods {
+            positions.push(path[t]);
+            returns.push(0.01 * (0.5f64.sqrt() * common[t] + 0.5f64.sqrt() * normal(&mut rng)));
+            ids.push(g as u64 + 1);
+            period.push(t as u32);
+        }
+    }
+    rcsr::wf_protocol::NullBook {
+        positions,
+        returns,
+        groups: ids,
+        period,
+        period_count: vec![groups as u32; periods],
+        period_cost: vec![0.0; periods],
+        side: 0.0005,
+    }
+}
+
+fn period_means(book: &rcsr::wf_protocol::NullBook, positions: &[f64]) -> Vec<f64> {
+    let net = rcsr::baselines::net_rows(positions, &book.returns, &book.groups, book.side);
+    let mut bins = vec![0.0f64; book.period_count.len()];
+    for (row, v) in net.iter().enumerate() {
+        bins[book.period[row] as usize] += v;
+    }
+    bins.iter().zip(&book.period_count).map(|(s, &c)| s / c as f64).collect()
+}
+
+/// Rejections of a true null at 10 % over 200 seeded panels. The new null is exact at
+/// 10 % up to the discreteness of 99 draws, so a count above 34 has a binomial tail
+/// below 1e-3 at p = 0.10 and below 2e-2 at p = 0.12; the per-group shuffle of the
+/// old null rejects about 0.4 of the time.
+#[test]
+fn matched_null_keeps_its_size_under_synchronised_positions() {
+    let (panels, draws) = (200usize, 99usize);
+    let (mut new_rejects, mut old_rejects) = (0usize, 0usize);
+    for k in 0..panels {
+        let book = synchronised_book(20, 400, 1000 + k as u32);
+        let observed = period_means(&book, &book.positions);
+        let obs_mean = observed.iter().sum::<f64>() / observed.len() as f64;
+        let control_seed = 77 + k as u64;
+        let input = rcsr::wf_protocol::InferenceInput {
+            draws: 0,
+            null_draws: draws,
+            block_len: 5,
+            seed: 11,
+            control_seed,
+            periods_per_year: 365.0,
+            pooled: &observed,
+            fresh: &observed,
+            candidates: &[],
+            trials: 1,
+            pbo_blocks: 4,
+            fdr_q: 0.1,
+            best_baseline: "cash",
+            baseline_series: &[],
+            buy_and_hold: &[],
+            books: std::slice::from_ref(&book),
+        };
+        let inf = rcsr::wf_protocol::infer(&input).unwrap();
+        let p_new = inf.nulls.as_ref().unwrap().matched_exposure_random.p_mean;
+        if p_new <= 0.10 {
+            new_rejects += 1;
+        }
+        let old: Vec<f64> = (0..draws)
+            .map(|b| {
+                let seed = rcsr::baselines::counter_draw(control_seed, 0, 0, b as u64);
+                let pos = rcsr::baselines::matched_exposure_positions(&book.positions, &book.groups, seed).unwrap();
+                let m = period_means(&book, &pos);
+                m.iter().sum::<f64>() / m.len() as f64
+            })
+            .collect();
+        if rcsr::inference::null_p(obs_mean, &old) <= 0.10 {
+            old_rejects += 1;
+        }
+    }
+    assert!(new_rejects <= 34, "shifted null rejected {new_rejects} of {panels} at 10 %");
+    assert!(old_rejects >= 60, "per-group shuffle rejected {old_rejects} of {panels} at 10 %");
+}
