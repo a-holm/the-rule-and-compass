@@ -18,7 +18,7 @@
 //! so older checkpoints still load and default checkpoints keep their bytes.
 //! `tests/settings_table.rs` checks every row in every reader.
 
-use crate::search::{Config, FrontScope, MigrationPolicy, MutationMix, RestartPolicy, Selection, VariationMode};
+use crate::search::{Config, FitAccept, FrontScope, MigrationPolicy, MutationMix, RestartPolicy, Selection, VariationMode};
 use std::collections::BTreeMap;
 
 /// Where a row's lines appear in each reader.
@@ -154,7 +154,7 @@ macro_rules! enum_value {
     )*};
 }
 
-enum_value!(Selection, RestartPolicy, MutationMix, FrontScope, MigrationPolicy, VariationMode);
+enum_value!(Selection, RestartPolicy, MutationMix, FrontScope, MigrationPolicy, VariationMode, FitAccept);
 
 /// How the command line sets a row.
 pub enum Cli<T> {
@@ -849,6 +849,34 @@ pub static TABLE: &[&dyn Setting] = &[
         set: |c| &mut c.variation,
         cli: Cli::Value(VariationMode::parse),
         write: Write::Always,
+        active: None,
+        conflict: Conflict::SavedKey,
+    },
+    &Row::<FitAccept> {
+        flag: "--fit-accept",
+        key: "fit_accept",
+        group: Group::Fit,
+        schema_type: "enum",
+        schema_default: "always",
+        schema: "#1078: always | fitness. When a candidate keeps its fitted constants. always: every fit is kept. fitness: a candidate keeps the fitted constants only when its search fitness (the error the selection reads, scored on the scoring rows) is not worse than with the constants it had before the fit; a strictly lower unfitted error keeps the unfitted tree, a tie keeps the fitted one, a finite unfitted error beats a non-finite fitted one. Under --fitness pnl the fit minimises squared error and can move a profitable long/flat boundary; the rule keeps that boundary. Applies to the offspring fit, the restart fill, the carried-member refit under predictor subsampling, the device fit (including the exact CPU tail and fallback fits), the screening-survivor refit, the finalist refit and the prune refit. Costs one extra score per fitted candidate. With --fit-iters 0 nothing is fitted and the rule is idle. Under fitness the overlap pipeline does not fit (--pipeline-depth overlap falls back to the synchronous fit batches). Saved search setting: a resume refuses a different value; a checkpoint without it loads as always",
+        help: "  --fit-accept always|fitness
+                             when a candidate keeps its fitted constants.
+                             always (default) keeps every fit. fitness keeps
+                             them only when the search fitness is not worse
+                             than with the constants before the fit (a strictly
+                             better unfitted tree is kept; a tie keeps the fit).
+                             Under --fitness pnl the squared-error fit can move
+                             a profitable long/flat boundary. One extra score
+                             per fitted candidate. Saved search setting (#1078)",
+        bench: Some(Bench {
+            usage: "  --fit-accept <mode>       always (default) or fitness: keep fitted constants only when the fitness is not worse (#1078)",
+            omit_unset: true,
+        }),
+        gui: false,
+        get: |c| &c.fit_accept,
+        set: |c| &mut c.fit_accept,
+        cli: Cli::Value(FitAccept::parse),
+        write: Write::UnlessDefault,
         active: None,
         conflict: Conflict::SavedKey,
     },
