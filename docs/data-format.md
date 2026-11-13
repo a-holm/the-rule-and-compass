@@ -32,7 +32,7 @@ loaded when `--target-spec` is absent and it has an entry for `--target`:
 `rcsr schema` lists every field (`target_spec.fields`). An invalid file is exit 2,
 an unreadable one exit 3. A sidecar without an entry for the target means no
 spec; `--target-spec` without one is exit 2. The spec's scale column is read
-from the table even when it is not an input. `long_only` is optional and always true; `false` is exit 2. See `docs/time-series.md` §2b and §3b.
+from the table even when it is not an input. `long_only` is optional and always true; `false` is exit 2. `stride_seconds` is optional (written by `rcsr enrich` when a label stride is wider than its horizon, at least `horizon_seconds`): the period width of the walk-forward and the search objective is `max(horizon_seconds, stride_seconds)`. See `docs/time-series.md` §2b and §3b.
 
 ## Memory guard
 

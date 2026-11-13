@@ -188,16 +188,17 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
-fn write_spec(dir: &Path, horizon_seconds: u64) -> String {
+fn write_spec_stride(dir: &Path, horizon_seconds: u64, stride_seconds: Option<u64>) -> String {
+    let stride = stride_seconds.map_or(String::new(), |s| format!(",\"stride_seconds\":{s}"));
     let text = format!(
         "{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{{\"column\":\"y\",\"name\":\"raw_target\",\
          \"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"y\",\"return_units\":\"simple\",\
          \"horizon_seconds\":{horizon_seconds},\"entry_offset_seconds\":0,\"delay_seconds\":0,\
          \"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
          \"scale\":{{\"kind\":\"constant\",\"value\":1.0}},\"clip\":null,\"units\":\"simple_return\",\
-         \"cost_bps\":0.0,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}}]}}"
+         \"cost_bps\":0.0,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null{stride}}}]}}"
     );
-    let path = dir.join(format!("spec{horizon_seconds}.json"));
+    let path = dir.join(format!("spec{horizon_seconds}-{}.json", stride_seconds.unwrap_or(0)));
     std::fs::write(&path, text).unwrap();
     path.to_string_lossy().into_owned()
 }
@@ -220,10 +221,15 @@ fn write_csv(dir: &Path, step: u64, n: usize) -> String {
 }
 
 fn run_cli(dir: &Path, step: u64, extra: &[&str]) -> (Output, String) {
+    run_cli_spec(dir, step, step, None, extra)
+}
+
+/// A label every `step` seconds under a spec of `horizon` and `stride`.
+fn run_cli_spec(dir: &Path, step: u64, horizon: u64, stride: Option<u64>, extra: &[&str]) -> (Output, String) {
     let n = 60usize;
     let data = write_csv(dir, step, n);
-    let spec = write_spec(dir, step);
-    let out_path = dir.join(format!("wf{step}.json")).to_string_lossy().into_owned();
+    let spec = write_spec_stride(dir, horizon, stride);
+    let out_path = dir.join(format!("wf{step}-{horizon}-{}.json", stride.unwrap_or(0))).to_string_lossy().into_owned();
     let w = format!(
         "w,{},{},{},{}",
         T0 as u64,
@@ -312,4 +318,75 @@ fn wf_daily_block_by_period() {
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     let j = read_json(&path);
     assert_eq!(num(&j, &["economics", "daily", "periods_per_year"]), 365.0);
+}
+
+const STRIDE_FIELDS: [&str; 8] = ["periods", "rows", "periods_per_year", "sharpe", "mean_return", "total_return", "cagr", "turnover"];
+
+#[test]
+fn wf_ppy_stride_above_horizon() {
+    let scratch = Scratch::new("wf-period-stride");
+    let dir = scratch.path().to_path_buf();
+    let (out, path) = run_cli_spec(&dir, 86_400, 3600, Some(86_400), &[]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let j = read_json(&path);
+    assert_eq!(num(&j, &["pooled", "periods_per_year"]), 365.0);
+    assert_eq!(num(&j, &["annualization", "period_seconds"]), 86_400.0);
+    assert_eq!(at(&j, &["annualization", "source"]).as_str(), Some("target_spec"));
+    assert_eq!(num(&j, &["pooled", "periods"]), 40.0);
+    // the same labels declared with horizon = stride = one day give the same report values
+    let (out, path) = run_cli_spec(&dir, 86_400, 86_400, None, &[]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let day = read_json(&path);
+    for f in STRIDE_FIELDS {
+        assert_eq!(num(&j, &["pooled", f]).to_bits(), num(&day, &["pooled", f]).to_bits(), "{f}");
+    }
+}
+
+#[test]
+fn wf_stride_equal_horizon_identical() {
+    let scratch = Scratch::new("wf-period-stride-equal");
+    let dir = scratch.path().to_path_buf();
+    let (out, path) = run_cli_spec(&dir, 86_400, 86_400, None, &["--bootstrap", "200"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let plain = read_json(&path);
+    let (out, path) = run_cli_spec(&dir, 86_400, 86_400, Some(86_400), &["--bootstrap", "200"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let explicit = read_json(&path);
+    for f in STRIDE_FIELDS {
+        assert_eq!(num(&plain, &["pooled", f]).to_bits(), num(&explicit, &["pooled", f]).to_bits(), "{f}");
+    }
+    assert_eq!(
+        num(&plain, &["inference", "bootstrap", "block_len"]),
+        num(&explicit, &["inference", "bootstrap", "block_len"])
+    );
+}
+
+#[test]
+fn wf_ppy_stride_explicit_mismatch_refused() {
+    let scratch = Scratch::new("wf-period-stride-explicit");
+    let dir = scratch.path().to_path_buf();
+    let (out, _) = run_cli_spec(&dir, 86_400, 3600, Some(86_400), &["--periods-per-year", "8760"]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(stderr(&out).contains("--periods-per-year 8760"), "{}", stderr(&out));
+    let (out, path) = run_cli_spec(&dir, 86_400, 3600, Some(86_400), &["--periods-per-year", "365"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(num(&read_json(&path), &["pooled", "periods_per_year"]), 365.0);
+}
+
+#[test]
+fn wf_stride_unknown_above_horizon() {
+    let scratch = Scratch::new("wf-period-stride-unknown");
+    let dir = scratch.path().to_path_buf();
+    let (out, _) = run_cli_spec(&dir, 86_400, 3600, None, &[]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    let msg = stderr(&out);
+    assert!(msg.contains("missing stride_seconds") && msg.contains("86400"), "{msg}");
+    // without a spec the horizon flag keeps its behaviour
+    let data = write_csv(&dir, 86_400, 60);
+    let w = format!("w,{},{},{},{}", T0 as u64, T0 as u64 + 86_400 * 19, T0 as u64 + 86_400 * 20, T0 as u64 + 86_400 * 60);
+    let out = rcsr(&[
+        "walkforward", "--data", &data, "--time", "t", "--group-by", "sym", "--target", "y", "--horizon", "3600",
+        "--expr", "x", "--vars", "x", "--window", &w, "--threshold-quantile", "0.5",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
 }

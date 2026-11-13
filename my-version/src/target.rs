@@ -147,6 +147,8 @@ pub struct TargetSpec {
     /// `log` or `simple`.
     pub return_units: String,
     pub horizon_seconds: f64,
+    /// Spacing of one independent return per group, when it is wider than the horizon.
+    pub stride_seconds: Option<f64>,
     pub entry_offset_seconds: f64,
     pub delay_seconds: f64,
     pub entry_price: String,
@@ -170,6 +172,11 @@ impl TargetSpec {
     pub fn window_seconds(&self) -> (f64, f64) {
         let a = self.entry_offset_seconds + self.delay_seconds;
         (a, a + self.horizon_seconds)
+    }
+
+    /// Width `S` of one return period: the label horizon, or the label stride when it is wider.
+    pub fn period_width_seconds(&self) -> f64 {
+        self.stride_seconds.map_or(self.horizon_seconds, |s| s.max(self.horizon_seconds))
     }
 
     /// Per-side cost in basis points: half the round-trip `cost_bps`. `None`
@@ -302,7 +309,7 @@ impl TargetSpec {
         };
         let cols: Vec<String> = self.construction_columns.iter().map(|c| text(c)).collect();
         format!(
-            "\"column\":{},\"name\":{},\"kind\":{},\"deprecated\":{},\"return_column\":{},\"return_units\":{},\"horizon_seconds\":{},\"entry_offset_seconds\":{},\"delay_seconds\":{},\"entry_price\":{},\"exit_price\":{},\"offset\":{},\"scale\":{},\"clip\":{},\"units\":{},\"cost_bps\":{},\"cost_in_label\":{},\"construction_columns\":[{}],\"note\":{},\"long_only\":{}",
+            "\"column\":{},\"name\":{},\"kind\":{},\"deprecated\":{},\"return_column\":{},\"return_units\":{},\"horizon_seconds\":{},\"entry_offset_seconds\":{},\"delay_seconds\":{},\"entry_price\":{},\"exit_price\":{},\"offset\":{},\"scale\":{},\"clip\":{},\"units\":{},\"cost_bps\":{},\"cost_in_label\":{},\"construction_columns\":[{}],\"note\":{},\"long_only\":{}{}",
             text(&self.column),
             text(&self.name),
             text(&self.kind),
@@ -322,7 +329,8 @@ impl TargetSpec {
             self.cost_in_label,
             cols.join(","),
             opt_s(&self.note),
-            self.long_only
+            self.long_only,
+            self.stride_seconds.map(|s| format!(",\"stride_seconds\":{}", num(s))).unwrap_or_default()
         )
     }
 
@@ -397,6 +405,14 @@ fn opt_str(o: &Json, key: &str, what: &str) -> Result<Option<String>, String> {
         None | Some(Json::Null) => Ok(None),
         Some(Json::Str(s)) => Ok(Some(s.clone())),
         _ => Err(format!("{}: field '{}' must be a string or null", what, key)),
+    }
+}
+
+fn opt_f64(o: &Json, key: &str, what: &str) -> Result<Option<f64>, String> {
+    match o.get(key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::Num(v)) if v.is_finite() => Ok(Some(*v)),
+        _ => Err(format!("{}: field '{}' must be a finite number or null", what, key)),
     }
 }
 
@@ -490,6 +506,7 @@ fn parse_one(o: &Json, index: usize) -> Result<TargetSpec, String> {
         return_column: opt_str(o, "return_column", &what)?,
         return_units: str_field(o, "return_units", &what)?,
         horizon_seconds: f64_field(o, "horizon_seconds", &what)?,
+        stride_seconds: opt_f64(o, "stride_seconds", &what)?,
         entry_offset_seconds: f64_field(o, "entry_offset_seconds", &what)?,
         delay_seconds: f64_field(o, "delay_seconds", &what)?,
         entry_price: opt_str(o, "entry_price", &what)?.unwrap_or_default(),
@@ -553,6 +570,11 @@ fn validate(s: &TargetSpec, what: &str) -> Result<(), String> {
     }
     if !(s.horizon_seconds > 0.0) {
         return Err(format!("{}: horizon_seconds must be positive", what));
+    }
+    if let Some(stride) = s.stride_seconds {
+        if !(stride >= s.horizon_seconds) {
+            return Err(format!("{}: stride_seconds must be at least horizon_seconds", what));
+        }
     }
     for (n, v) in [
         ("entry_offset_seconds", s.entry_offset_seconds),
@@ -1006,6 +1028,7 @@ pub fn schema_json() -> String {
         ("return_column", "string|null", false, "column holding the raw future return; refused as an input (D13a)"),
         ("return_units", "enum", true, "log | simple"),
         ("horizon_seconds", "number", true, "length of the label window, > 0"),
+        ("stride_seconds", "number|null", false, "spacing of one independent return per group, written by rcsr enrich only when the label stride is wider than the horizon; absent means the horizon. The walk-forward and search period width is max(horizon_seconds, stride_seconds); must be >= horizon_seconds"),
         ("entry_offset_seconds", "number", true, "row stamp to entry price, >= 0"),
         ("delay_seconds", "number", true, "decision to entry delay, >= 0"),
         ("entry_price", "string", false, "free text"),
@@ -1040,7 +1063,7 @@ pub fn schema_json() -> String {
             "\"sidecar\":\"<data stem>.targets.json beside the data, used when --target-spec is absent\",",
             "\"file\":{},",
             "\"fields\":[{}],",
-            "\"derived\":{{\"window_seconds\":\"[entry_offset_seconds + delay_seconds, + horizon_seconds]\",",
+            "\"derived\":{{\"period_width_seconds\":\"max(horizon_seconds, stride_seconds); one return period of the walk-forward and the search objective\",\"window_seconds\":\"[entry_offset_seconds + delay_seconds, + horizon_seconds]\",",
             "\"required_purge_seconds\":\"entry_offset_seconds + delay_seconds + horizon_seconds\",",
             "\"structural_term\":\"scale is a column and (offset != 0 or clip is asymmetric)\",",
             "\"null_formula\":\"label at zero return, e.g. clip(-0.002/(6*vol96),-1,1); 0 for a raw return\",",

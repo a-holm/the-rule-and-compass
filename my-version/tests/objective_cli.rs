@@ -877,3 +877,27 @@ fn a_declared_lockbox_is_never_part_of_a_member_book() {
     let want = rescore(&first, validation_window(&j).0, to);
     assert_eq!(validation_rows, want.rows);
 }
+
+#[test]
+fn search_objective_period_width_follows_the_stride() {
+    let (_scratch, dir) = scratch();
+    let mut text = String::from("t,x1,x2,r,y\n");
+    for i in 0..N {
+        let (x1, x2, r) = row(i);
+        text.push_str(&format!("{},{},{},{},{}\n", T0 + 86_400 * i as i64, x1, x2, r, r));
+    }
+    let data = dir.join("daily.csv");
+    std::fs::write(&data, text).unwrap();
+    let data = data.to_string_lossy().into_owned();
+    let plain = write_spec_horizon(&dir, "h.json", 0.0, "null", false, 3600);
+    let wide = std::fs::read_to_string(&plain).unwrap().replace("\"note\":null", "\"note\":null,\"stride_seconds\":86400");
+    let wide_path = dir.join("s.json");
+    std::fs::write(&wide_path, wide).unwrap();
+    let wide_path = wide_path.to_string_lossy().into_owned();
+    let o = run(&data, &wide_path, PNL);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(num(&json(&o), &["objective", "validation", "periods_per_year"]), 365.0);
+    let o = run(&data, &plain, PNL);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(num(&json(&o), &["objective", "validation", "periods_per_year"]), 8760.0);
+}
