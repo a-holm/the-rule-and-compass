@@ -401,6 +401,9 @@ pub struct FitGen {
     /// #1024: thresholds moved by the exact 1-D fit since process start; present
     /// only with `--fit-thresholds`.
     pub threshold_moves: Option<u64>,
+    /// #1117: `--fit-accept fitness` decisions of this generation, `(accepted,
+    /// rejected)`, summed over the paths; present only under `fitness`.
+    pub accept: Option<(u64, u64)>,
 }
 
 impl FitGen {
@@ -418,7 +421,7 @@ impl FitGen {
         let improved_total: usize = self.fallback_improved_by_cause.iter().map(|(_, v)| *v).sum();
         format!(
             "{{\"attempts\":{},\"gpu\":{},\"fallback\":{},\"refits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\
-             \"host_seconds\":{},\"fallback_seconds\":{},\"gate_seconds\":{},\"fallback_workers\":{}{}}}",
+             \"host_seconds\":{},\"fallback_seconds\":{},\"gate_seconds\":{},\"fallback_workers\":{}{}{}}}",
             self.attempts,
             self.gpu,
             self.fallback,
@@ -432,6 +435,8 @@ impl FitGen {
             self.fallback_workers,
             self.threshold_moves
                 .map_or(String::new(), |m| format!(",\"threshold_moves\":{}", m)),
+            self.accept
+                .map_or(String::new(), |(a, r)| format!(",\"accepted\":{},\"rejected\":{}", a, r)),
         )
     }
 }
@@ -1279,6 +1284,7 @@ mod tests {
                 gate_seconds: 0.02,
                 fallback_workers: 4,
                 threshold_moves: None,
+                accept: None,
             },
             fallback_s: 0.001,
             fallback_workers: 1,

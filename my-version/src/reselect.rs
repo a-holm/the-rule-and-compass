@@ -120,6 +120,7 @@ pub fn outcome(
         candidates_evaluated,
         fixed_position_fallback: false,
         interim: false,
+        fit_accept: None,
     }
 }
 

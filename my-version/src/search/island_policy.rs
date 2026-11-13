@@ -24,6 +24,7 @@
 
 use super::{
     afp_worst, canonical_front, defers_fit_to_gpu, draw_row_dependent, fit_constants, gate_fit, population_best,
+    FitAcceptCounts, FitPath,
     pre_fit_tree, tournament, Config, EvalSample, FrontScope, Ind, MigrationPolicy, RestartPolicy, Selection,
     FRONT_PARENT_P, MIGRANT_TOURNAMENT,
 };
@@ -549,6 +550,8 @@ pub(super) struct TreeIslands<'a> {
     pub qd: Option<&'a QdArchive>,
     /// Whether a member's cached descriptor describes `gen_train` (#120).
     pub cached_descriptors_valid: bool,
+    /// #1117: where the restart fill counts its fit decisions.
+    pub fit_counts: Option<&'a FitAcceptCounts>,
 }
 
 impl IslandBests for TreeIslands<'_> {
@@ -718,7 +721,15 @@ impl IslandPopulation for TreeIslands<'_> {
             *ind = if self.defer_gpu && before.is_none() {
                 Ind::pending(t, cfg)
             } else {
-                gate_fit(None, before, Ind::evaluated_fitted(t, fitted, self.gen_data, cfg), self.gen_data, cfg) // #87 #1078
+                gate_fit(
+                    None,
+                    self.fit_counts,
+                    FitPath::Restart,
+                    before,
+                    Ind::evaluated_fitted(t, fitted, self.gen_data, cfg),
+                    self.gen_data,
+                    cfg,
+                ) // #87 #1078
             };
         }
         self.rngs[island] = r;
@@ -1789,7 +1800,7 @@ mod tests {
                         *ind = if defer_gpu && before.is_none() {
                             Ind::pending(t, cfg)
                         } else {
-                            gate_fit(None, before, Ind::evaluated_fitted(t, fitted, gen_data, cfg), gen_data, cfg)
+                            gate_fit(None, None, FitPath::Restart, before, Ind::evaluated_fitted(t, fitted, gen_data, cfg), gen_data, cfg)
                         };
                     }
                     rngs[ii] = r;
@@ -2037,6 +2048,7 @@ mod tests {
                 defer_gpu,
                 qd: qd.as_ref(),
                 cached_descriptors_valid: cached,
+                fit_counts: None,
             };
             let mut recorded = Recorded { inner: &mut adapter, moves: Vec::new() };
             let got_restarts = policy.barrier(gen, &archive, &mut recorded);
@@ -2222,6 +2234,7 @@ mod tests {
             defer_gpu: false,
             qd: None,
             cached_descriptors_valid: false,
+            fit_counts: None,
         }
         .migrate(moves, policy)
     }
@@ -2299,6 +2312,7 @@ mod tests {
                 defer_gpu: false,
                 qd: None,
                 cached_descriptors_valid: false,
+                fit_counts: None,
             },
         );
         assert_eq!(policy.migrants(), Migrants { sent: 0, skipped: 2 });
