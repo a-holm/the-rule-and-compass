@@ -727,8 +727,10 @@ fn close_ledger(ledger: &mut crate::gpu_stats::RunLedger, clock: std::time::Inst
 }
 
 fn close_ledger_at(ledger: &mut crate::gpu_stats::RunLedger, wall: f64) {
-    ledger.record_stage(crate::gpu_stats::Stage::HostOther, wall - ledger.stage_sum_s());
-    ledger.set_wall(wall);
+    let rest = wall - ledger.stage_sum_s();
+    ledger.record_stage(crate::gpu_stats::Stage::HostOther, rest);
+    // `s + (wall - s)` can land one ULP off `wall`; the booked sum is the wall then.
+    ledger.set_wall(if rest > 0.0 { ledger.stage_sum_s() } else { wall });
 }
 
 /// Evaluate a resident table. The CLI's CSV path and tests use this.
