@@ -297,7 +297,7 @@ fn bootstrap_nulls_and_multiple_testing_are_reported_and_reproducible() {
         assert!(close(count, count.round(), 1e-9) && count >= 0.0 && count <= n.draws as f64, "p {}", p);
     }
     let json = r.json();
-    for key in ["\"design_effect\"", "\"dsr_at_n_eff\"", "\"dsr_at_10_n_eff\"", "\"pbo\"", "\"bh_fdr\"", "\"spa\"", "\"block_permutation\"", "\"matched_exposure_random\"", "\"always_long\"", "\"p_formula\":\"(1+count)/(B+1)\""] {
+    for key in ["\"design_effect\"", "\"n_trials_source\"", "\"psr\"", "\"min_btl_years\"", "\"dsr_at_n_eff\"", "\"dsr_at_10_n_eff\"", "\"pbo\"", "\"bh_fdr\"", "\"spa\"", "\"block_permutation\"", "\"matched_exposure_random\"", "\"always_long\"", "\"p_formula\":\"(1+count)/(B+1)\""] {
         assert!(json.contains(key), "{}", key);
     }
     let again = walkforward::run_table_with(&t, &s, "t", &o).unwrap();
