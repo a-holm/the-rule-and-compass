@@ -9,7 +9,7 @@ config complexity.depth_weight 0.0
 config metric absolute
 config seed 0
 config ops 2,3,4,5,6,7,8,9,10,11,12,13,15,16,17,27,28,29,30,31,36
-config migration_interval 25
+config migration_interval 9
 config restart_interval 7
 config init_depth 3
 config fit_iters 8
@@ -36,4 +36,4 @@ config reject_constant_offspring true
 config reject_fixed_position true
 config fit_thresholds true
 config fit_accept fitness
-config_hash ad26c7711ae8caa1
+config_hash 74f8db2e1c59aa27

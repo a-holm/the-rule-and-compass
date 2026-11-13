@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 pub enum Group {
     /// Next to the other stopping rules.
     Stop,
-    /// The restart cadence, written after the migration interval.
+    /// The migration and restart cadence.
     Schedule,
     /// Island selection and restarts.
     Island,
@@ -511,6 +511,28 @@ pub static TABLE: &[&dyn Setting] = &[
         write: Write::Required,
         active: None,
         conflict: Conflict::Saved,
+    },
+    &Row::<usize> {
+        flag: "--migration-interval",
+        key: "migration_interval",
+        group: Group::Schedule,
+        schema_type: "int",
+        schema_default: "25",
+        schema: "#1116: generations between island migrations (0: no migration). No effect with --islands 1. Saved search setting: a resume refuses a different value",
+        help: "  --migration-interval <N>   generations between island migrations,
+                             default 25. 0 turns migration off. No effect
+                             with --islands 1. Saved search setting (#1116)",
+        bench: Some(Bench {
+            usage: "  --migration-interval <N>  generations between island migrations",
+            omit_unset: false,
+        }),
+        gui: false,
+        get: |c| &c.migration_interval,
+        set: |c| &mut c.migration_interval,
+        cli: Cli::Value(|v| uint("--migration-interval", v)),
+        write: Write::Required,
+        active: None,
+        conflict: Conflict::SavedKey,
     },
     &Row::<usize> {
         flag: "--restart-interval",

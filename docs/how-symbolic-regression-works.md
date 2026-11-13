@@ -133,8 +133,9 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   constants only when the search fitness is not worse than with the constants
   before the fit; under `--fitness pnl` this protects a profitable sign boundary
   from the squared-error fit.
-- **Migration** periodically copies an island's best member into a neighbouring
-  island; **stagnant islands are restarted** to avoid getting stuck. Every
+- **Migration** copies an island's best member into a neighbouring
+  island every migration interval (`--migration-interval`, default 25
+  generations; 0 turns migration off; no effect with one island); **stagnant islands are restarted** to avoid getting stuck. Every
   restart interval (`--restart-interval`, default 60 generations) the default rule (`--restart-policy archive`)
   restarts an island after two checks in which its best error is worse than the
   archive best. Once migration has copied the archive best into every island,
