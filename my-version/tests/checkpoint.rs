@@ -2280,27 +2280,32 @@ fn a_default_checkpoint_has_no_fit_accept_key_and_a_fitness_one_resumes_only_und
     assert!(err.contains("fit_accept"), "{err}");
 }
 
-/// #1060: the sidecar a periodic save leaves behind, as the product writes it
-/// (a killed process never reaches the exit write), for the checkpoint in `dir`.
-fn write_periodic_sidecar(dir: &std::path::Path) {
-    let ck = dir.join("ck.rcsr");
-    let path = ck.to_str().expect("utf-8");
-    let cp = rcsr::checkpoint::Checkpoint::load(path).expect("checkpoint");
-    let cost = rcsr::resume_cost::Cost::periodic(0.5, cp.backend);
-    rcsr::resume_cost::write(path, cp.generations, &cost).expect("sidecar");
+/// #1060: chunk 0 of a chain that stops right after its second periodic save
+/// (`RCSR_TEST_EXIT_AFTER_SAVES`), like a crashed process: it never reaches the exit write.
+fn crashed_chunk(dir: &std::path::Path, csv: &str) {
+    let args = chunk_args(csv, &["--save-every", "1"]);
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = rcsr_cmd::rcsr()
+        .current_dir(dir)
+        .args(&refs)
+        .env("RCSR_TEST_EXIT_AFTER_SAVES", "2")
+        .output()
+        .expect("run rcsr");
+    assert_eq!(out.status.code(), Some(137), "{:?}", out);
+    let cp = rcsr::checkpoint::Checkpoint::load(dir.join("ck.rcsr").to_str().expect("utf-8")).expect("checkpoint");
+    assert_eq!(cp.generations, 2);
 }
 
 fn sidecar_text(dir: &std::path::Path) -> String {
     std::fs::read_to_string(dir.join("ck.rcsr.cost")).expect("sidecar")
 }
 
-/// #1060: a chunk killed after a periodic save leaves a sidecar with its own
+/// #1060: a chunk that stops after a periodic save (through the real save callback) leaves a sidecar with its own
 /// backend, so the resumed search reports it instead of `unknown`.
 #[test]
 fn a_killed_chunk_does_not_poison_the_search_backend() {
     let (_scratch, dir, csv) = cost_scratch("killed-chunk-backend");
-    cost_chunk(&dir, &csv, 0, false);
-    write_periodic_sidecar(&dir);
+    crashed_chunk(&dir, &csv);
     assert!(sidecar_text(&dir).contains("\"backend\":\"cpu\""), "{}", sidecar_text(&dir));
     cost_chunk(&dir, &csv, 1, true);
     let run = json_file(dir.join("run.json"));

@@ -36,6 +36,7 @@ const EXIT_INPUT: i32 = 3;
 const EXIT_NO_SOLUTION: i32 = 4;
 /// #604: an explicit `--gpu` search lost the device after the start-up probe.
 const EXIT_DEVICE: i32 = 6;
+const EXIT_KILLED: i32 = 137;
 /// #129: a leakage audit failed. Stable so CI can distinguish a real leak from
 /// a usage (2) or input (3) error.
 const EXIT_LEAKAGE: i32 = leakage::AUDIT_EXIT_CODE;
@@ -6718,6 +6719,9 @@ fn main() {
         (Some(p), Some(cp)) => rcsr::resume_cost::load(p, cp.generations),
         _ => None,
     };
+    // Tests stop the process right after a save, as a crash would, without a kill race.
+    let exit_after_saves = std::env::var("RCSR_TEST_EXIT_AFTER_SAVES").ok().and_then(|v| v.parse::<usize>().ok());
+    let mut saves_done = 0usize;
     let outcome_result = if let Some(done) = reselect_outcome {
         Ok(done)
     } else if let Some(path) = save_path.clone() {
@@ -6736,11 +6740,18 @@ fn main() {
                 }
                 let generation = cp.generations;
                 last_saved = Some((generation, path.clone()));
-                let so_far = rcsr::resume_cost::Cost::periodic(search_start.elapsed().as_secs_f64(), cp.backend);
+                let so_far = rcsr::resume_cost::Cost::periodic(
+                    search_start.elapsed().as_secs_f64(),
+                    rcsr::resume_cost::Search::Unknown,
+                );
                 if let Some(t) = rcsr::resume_cost::total(cost_resumed, cost_base.as_ref(), &so_far) {
                     if let Err(e) = rcsr::resume_cost::write(&path, generation, &t) {
                         eprintln!("warning: {}", e);
                     }
+                }
+                saves_done += 1;
+                if exit_after_saves == Some(saves_done) {
+                    std::process::exit(EXIT_KILLED);
                 }
                 // #211: the checkpoint file is saved; record its size and hash.
                 if let Some(sink) = &dev_sink {
