@@ -130,6 +130,7 @@ fn prune_tree(
     fit: &Sample,
     cfg: &Config,
     budget: usize,
+    counts: Option<&FitAcceptCounts>,
 ) -> (Vec<Node>, usize) {
     let e0 = score_tree(tree, data, cfg);
     if !e0.is_finite() {
@@ -167,7 +168,11 @@ fn prune_tree(
             let (cost, err) = judge(&t);
             if let Some(before) = before.filter(|b| expr::structural_hash(b) != expr::structural_hash(&t)) {
                 let (before_cost, before_err) = judge(&before);
-                if unfitted_wins(before_err, err) {
+                let wins = unfitted_wins(before_err, err);
+                if let Some(counts) = counts {
+                    counts.record(FitPath::Prune, !wins);
+                }
+                if wins {
                     return (before, before_cost, before_err);
                 }
             }
@@ -214,6 +219,7 @@ pub(super) fn prune_archive(
     train: &Sample,
     train_data: &EvalSample,
     cfg: &Config,
+    counts: Option<&FitAcceptCounts>,
 ) -> (Archive, PruneReport) {
     let mut report = PruneReport::default();
     if !cfg.prune || cfg.prune_budget == 0 || archive.items.is_empty() {
@@ -246,7 +252,7 @@ pub(super) fn prune_archive(
         if sol.tree.kids.is_empty() {
             continue;
         }
-        let (trees, fits) = prune_tree(&sol.tree, data, fit, cfg, budget);
+        let (trees, fits) = prune_tree(&sol.tree, data, fit, cfg, budget, counts);
         budget -= fits.min(budget);
         report.fits += fits;
         pruned.extend(trees);
@@ -331,7 +337,7 @@ mod tests {
         let tree = coulomb_tree();
         assert_eq!(expr::complexity(&tree), 16);
         assert!(score_tree(&tree, &data, &cfg) <= 1e-24);
-        let (steps, fits) = prune_tree(&tree, &data, &s, &cfg, 20_000);
+        let (steps, fits) = prune_tree(&tree, &data, &s, &cfg, 20_000, None);
         assert!(fits > 0);
         let last = steps.last().expect("at least one accepted tree");
         assert!(expr::complexity(last) <= 7, "{}", expr::complexity(last));
@@ -344,12 +350,12 @@ mod tests {
         let s = coulomb_rows();
         let data = EvalSample::new(&s, &cfg);
         let tree = coulomb_tree();
-        let a = prune_tree(&tree, &data, &s, &cfg, 20_000);
-        let b = prune_tree(&tree, &data, &s, &cfg, 20_000);
+        let a = prune_tree(&tree, &data, &s, &cfg, 20_000, None);
+        let b = prune_tree(&tree, &data, &s, &cfg, 20_000, None);
         assert_eq!(a.1, b.1);
         assert_eq!(a.0, b.0);
         let threaded = Config { threads: 4, ..cfg.clone() };
-        let c = prune_tree(&tree, &data, &s, &threaded, 20_000);
+        let c = prune_tree(&tree, &data, &s, &threaded, 20_000, None);
         assert_eq!(a.0, c.0);
     }
 
@@ -358,7 +364,7 @@ mod tests {
         let cfg = cfg();
         let s = coulomb_rows();
         let data = EvalSample::new(&s, &cfg);
-        let (_, fits) = prune_tree(&coulomb_tree(), &data, &s, &cfg, 5);
+        let (_, fits) = prune_tree(&coulomb_tree(), &data, &s, &cfg, 5, None);
         assert!(fits <= 5);
     }
 
@@ -382,10 +388,11 @@ mod tests {
             &s,
             &data,
             &off,
+            None,
         );
         assert_eq!(same.hash(), before);
         assert_eq!(rep, PruneReport::default());
-        let (out, rep) = prune_archive(archive, &s, &data, &cfg);
+        let (out, rep) = prune_archive(archive, &s, &data, &cfg, None);
         assert!(rep.accepted > 0 && rep.fits > 0);
         assert!(out.items.iter().all(|m| m.complexity <= 7), "{:?}", out.items.iter().map(|m| m.complexity).collect::<Vec<_>>());
     }

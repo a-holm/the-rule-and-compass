@@ -894,7 +894,7 @@ pub static TABLE: &[&dyn Setting] = &[
         group: Group::Fit,
         schema_type: "enum",
         schema_default: "always",
-        schema: "#1078: always | fitness. When a candidate keeps its fitted constants. always: every fit is kept. fitness: a candidate keeps the fitted constants only when its search fitness (the error the selection reads, scored on the scoring rows) is not worse than with the constants it had before the fit; a strictly lower unfitted error keeps the unfitted tree, a tie keeps the fitted one, a finite unfitted error beats a non-finite fitted one. Under --fitness pnl the fit minimises squared error and can move a profitable long/flat boundary; the rule keeps that boundary. Applies to the offspring fit, the restart fill, the carried-member refit under predictor subsampling, the device fit (including the exact CPU tail and fallback fits), the screening-survivor refit, the finalist refit and the prune refit. Costs one extra score per fitted candidate. With --fit-iters 0 nothing is fitted and the rule is idle. Under fitness the overlap pipeline does not fit (--pipeline-depth overlap falls back to the synchronous fit batches). Saved search setting: a resume refuses a different value; a checkpoint without it loads as always",
+        schema: "#1078: always | fitness. When a candidate keeps its fitted constants. always: every fit is kept. fitness: a candidate keeps the fitted constants only when its search fitness (the error the selection reads, scored on the scoring rows) is not worse than with the constants it had before the fit; a strictly lower unfitted error keeps the unfitted tree, a tie keeps the fitted one, a finite unfitted error beats a non-finite fitted one. Under --fitness pnl the fit minimises squared error and can move a profitable long/flat boundary; the rule keeps that boundary. Applies to the offspring fit, the restart fill, the carried-member refit under predictor subsampling, the device fit (including the exact CPU tail and fallback fits), the screening-survivor refit, the finalist refit, the prune refit and the seed fit before generation 1 (a seed that loses keeps its pre-fit constants; seeds[].fit_kept reports it). Costs one extra score per fitted candidate. Under fitness the development log fit record carries accepted and rejected (this generation) and the run JSON search.fit_accept carries accepted, rejected and by_path [accepted, rejected] for offspring, restart, carried, device, lost_batch, survivor, finalist, prune and seed; a fit that moved nothing is not counted; nothing is written under always. With --fit-iters 0 nothing is fitted and the rule is idle. Under fitness the overlap pipeline does not fit (--pipeline-depth overlap falls back to the synchronous fit batches). Saved search setting: a resume refuses a different value; a checkpoint without it loads as always",
         help: "  --fit-accept always|fitness
                              when a candidate keeps its fitted constants.
                              always (default) keeps every fit. fitness keeps
@@ -903,7 +903,10 @@ pub static TABLE: &[&dyn Setting] = &[
                              better unfitted tree is kept; a tie keeps the fit).
                              Under --fitness pnl the squared-error fit can move
                              a profitable long/flat boundary. One extra score
-                             per fitted candidate. Saved search setting (#1078)",
+                             per fitted candidate, also for the seed fit. Under
+                             fitness the dev log and the --json search.fit_accept
+                             count the kept and refused fits. Saved search
+                             setting (#1078)",
         bench: Some(Bench {
             usage: "  --fit-accept <mode>       always (default) or fitness: keep fitted constants only when the fitness is not worse (#1078)",
             omit_unset: true,

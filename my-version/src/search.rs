@@ -581,10 +581,10 @@ pub struct GenCounters {
     /// #848: offspring rejected before the fit because their position cannot
     /// depend on the inputs.
     pub fixed_position: std::sync::atomic::AtomicU64,
-    /// #1078: fits kept and refused by `--fit-accept fitness` (the unfitted
-    /// candidate won).
-    pub fit_accepted: std::sync::atomic::AtomicU64,
-    pub fit_rejected: std::sync::atomic::AtomicU64,
+    /// #1078 #1117: the `--fit-accept fitness` decisions by path. The island
+    /// loop shares one run-level set with every generation, so a record reads
+    /// the change between two snapshots.
+    pub fit_paths: std::sync::Arc<FitAcceptCounts>,
     /// Whether the fit, eval and batch timers read the clock. Off outside a
     /// development log; the counts are kept either way.
     pub timed: bool,
@@ -663,6 +663,8 @@ fn pre_fit_tree(cfg: &Config, tree: &Node) -> Option<Node> {
 /// moved nothing costs no second score. `None` keeps `fitted`.
 fn gate_fit(
     counters: Option<&GenCounters>,
+    counts: Option<&FitAcceptCounts>,
+    path: FitPath,
     before: Option<Node>,
     fitted: Ind,
     train: &EvalSample,
@@ -674,10 +676,8 @@ fn gate_fit(
     }
     let unfitted = eval_counted(counters, || Ind::evaluated(before, train, cfg));
     let (ind, kept) = accept_fit(unfitted, fitted);
-    if kept {
-        GenCounters::count(counters, |c| &c.fit_accepted);
-    } else {
-        GenCounters::count(counters, |c| &c.fit_rejected);
+    if let Some(counts) = counts {
+        counts.record(path, kept);
     }
     ind
 }
@@ -766,7 +766,7 @@ fn fit_and_score(
             Ind::pending(tree, cfg)
         } else {
             let ind = eval_counted(counters, || Ind::evaluated_fitted(tree, fitted, train, cfg)); // #25 #87 #211
-            gate_fit(counters, before, ind, train, cfg) // #1078
+            gate_fit(counters, counters.map(|c| &*c.fit_paths), FitPath::Offspring, before, ind, train, cfg) // #1078
         };
         ind.confirm_inf(rows);
         ind
@@ -801,6 +801,8 @@ use island_policy::{IslandPolicy, ParentSource, TreeIslands};
 mod prune;
 pub use prune::PruneReport;
 mod fit_route; // #1091: the fit route of both device fit schedules
+mod fit_accept; // #1117: the fit-accept decision counts
+pub use fit_accept::{FitAcceptCounts, FitAcceptReport, FitPath};
 use fit_route::{accept_fit, unfitted_wins};
 #[cfg(feature = "cuda")]
 use fit_route::{DeviceArm, ExactFits, FitRoute, FitSettings, RouteCounts};
@@ -1173,7 +1175,13 @@ impl Ind {
     // and the elite — the longest-lived individual — was never refitted at all.
     // The fit sample always equals the scoring sample in this path, so the
     // final-SSE reuse stays exact (see `fit_constants`).
-    fn refit_and_reeval(&mut self, train: &EvalSample, fit_sample: &Sample, cfg: &Config) {
+    fn refit_and_reeval(
+        &mut self,
+        train: &EvalSample,
+        fit_sample: &Sample,
+        cfg: &Config,
+        counts: Option<&FitAcceptCounts>,
+    ) {
         let mut tree = expr::simplify(&self.tree);
         let before = pre_fit_tree(cfg, &tree); // #1078
         let fitted = if cfg.fit_iters > 0 && !train.sample.is_multi() {
@@ -1187,7 +1195,7 @@ impl Ind {
         };
         let age = self.age;
         let ind = Ind::evaluated_fitted(tree, fitted, train, cfg); // #25 #87
-        *self = gate_fit(None, before, ind, train, cfg); // #1078
+        *self = gate_fit(None, counts, FitPath::Carried, before, ind, train, cfg); // #1078
         self.age = age;
     }
 
@@ -1862,6 +1870,7 @@ impl GpuSearch {
         cfg: &Config,
         generation: usize,
         dispatcher: &mut crate::dispatch::Dispatcher,
+        counts: Option<&FitAcceptCounts>, // #1117
     ) -> Result<(), String> {
         let train = data.sample;
         if generation >= 2 && crate::gpu::injected_fault("batch") {
@@ -1951,7 +1960,12 @@ impl GpuSearch {
             // pre-fit score; this covers the fold, the device fit and the CPU tail.
             for (&(i, j), unfitted) in admitted.iter().zip(before) {
                 let fitted = islands[i][j].clone();
-                islands[i][j] = accept_fit(unfitted, fitted).0;
+                let moved = expr::structural_hash(&unfitted.tree) != expr::structural_hash(&fitted.tree);
+                let (ind, kept) = accept_fit(unfitted, fitted);
+                islands[i][j] = ind;
+                if let (Some(counts), true) = (counts, moved) {
+                    counts.record(FitPath::Device, kept);
+                }
             }
             return Ok(());
         }
@@ -3496,13 +3510,14 @@ fn score_generation(
     generation: usize,
     dispatcher: &mut crate::dispatch::Dispatcher,
     rows_version: u64, // #500
+    counts: Option<&FitAcceptCounts>, // #1117
 ) -> Result<bool, String> {
     let Some(g) = gpu.as_mut() else {
         return Ok(false);
     };
     g.rows_version = rows_version;
     let train = data.sample;
-    match g.score(islands, data, cfg, generation, dispatcher) {
+    match g.score(islands, data, cfg, generation, dispatcher, counts) {
         Ok(()) => {
             // #230: a fit-only evaluator scores on the CPU, so it must not make
             // the run claim `backend = gpu`. The device use is reported through
@@ -3556,7 +3571,12 @@ fn score_generation(
             for (i, j, mut before) in unfitted {
                 before.age = islands[i][j].age;
                 let fitted = islands[i][j].clone();
-                islands[i][j] = accept_fit(before, fitted).0;
+                let moved = expr::structural_hash(&before.tree) != expr::structural_hash(&fitted.tree);
+                let (ind, kept) = accept_fit(before, fitted);
+                islands[i][j] = ind;
+                if let (Some(counts), true) = (counts, moved) {
+                    counts.record(FitPath::LostBatch, kept);
+                }
             }
             Ok(false)
         }
@@ -5593,7 +5613,7 @@ fn fit_for_generation(cfg: &Config, sample: &Sample, generation: usize) -> Optio
 
 /// #85: refit one screening survivor on the full training sample and score it
 /// there, ready to enter the archive.
-fn refit_survivor(tree: &Node, train: &EvalSample, cfg: &Config) -> Sol {
+fn refit_survivor(tree: &Node, train: &EvalSample, cfg: &Config, counts: Option<&FitAcceptCounts>) -> Sol {
     let mut tree = expr::simplify(tree);
     // #85/#87: the promoted tree is fitted on exactly the rows that will score
     // it, so for the squared metric the fitter's final SSE is the score.
@@ -5621,7 +5641,11 @@ fn refit_survivor(tree: &Node, train: &EvalSample, cfg: &Config) -> Sol {
     };
     if let Some(before) = before.filter(|b| expr::structural_hash(b) != hash) {
         let unfitted = full_data_error(&before, train, cfg);
-        if unfitted_wins(unfitted, error) {
+        let wins = unfitted_wins(unfitted, error);
+        if let Some(counts) = counts {
+            counts.record(FitPath::Survivor, !wins);
+        }
+        if wins {
             (tree, error) = (before, unfitted);
         }
     }
@@ -5774,7 +5798,7 @@ fn refit_band_selection(pre: &[f64], costs: &[f64], band: f64) -> Vec<usize> {
 /// #169: exact CPU f64 refit of `trees` on all training rows, a warm start from
 /// the carried constants. Trees are independent, so the work is split across
 /// workers; the result order is unchanged.
-fn refit_exact(trees: &mut [Node], train: &EvalSample, cfg: &Config) {
+fn refit_exact(trees: &mut [Node], train: &EvalSample, cfg: &Config, counts: Option<&FitAcceptCounts>) {
     let fit_one = |t: &mut Node| {
         let (x, y, w) = (&train.sample.x, &train.sample.y, &train.sample.w);
         let (iters, metric) = (cfg.fit_iters, cfg.metric);
@@ -5782,7 +5806,11 @@ fn refit_exact(trees: &mut [Node], train: &EvalSample, cfg: &Config) {
         crate::fit::fit_weighted_metric_thresholds(t, x, y, w, iters, metric, cfg.fit_thresholds);
         *t = expr::simplify(t);
         if let Some(before) = before.filter(|b| expr::structural_hash(b) != expr::structural_hash(t)) {
-            if unfitted_wins(full_data_error(&before, train, cfg), full_data_error(t, train, cfg)) {
+            let wins = unfitted_wins(full_data_error(&before, train, cfg), full_data_error(t, train, cfg));
+            if let Some(counts) = counts {
+                counts.record(FitPath::Finalist, !wins);
+            }
+            if wins {
                 *t = before;
             }
         }
@@ -5842,17 +5870,18 @@ fn full_data_archive(
     // #169: refit the finalists with the exact CPU f64 arm because the search
     // used the batched GPU constants.
     refit_gpu_fit: bool,
+    counts: Option<&FitAcceptCounts>, // #1117
 ) -> (Archive, RefitReport) {
     let nvars = train.sample.x.first().map_or(0, |r| r.len());
     if !fixed_position_filter(cfg, nvars) {
-        return full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, false);
+        return full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, false, counts);
     }
     // #848: fixed-position trees stay off the front unless nothing else is left.
-    let (front, report) = full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, true);
+    let (front, report) = full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, true, counts);
     if !front.items.is_empty() {
         return (front, report);
     }
-    let (front, mut report) = full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, false);
+    let (front, mut report) = full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, false, counts);
     report.fixed_position_fallback = true;
     (front, report)
 }
@@ -5864,6 +5893,7 @@ fn full_data_archive_with(
     cfg: &Config,
     refit_gpu_fit: bool,
     exclude_fixed: bool,
+    counts: Option<&FitAcceptCounts>,
 ) -> (Archive, RefitReport) {
     let trees: Vec<&Node> = archive
         .items
@@ -5905,7 +5935,7 @@ fn full_data_archive_with(
         // #284: only the exact CPU refit window, not the whole archive rebuild.
         if refit_on {
             let start = std::time::Instant::now();
-            refit_exact(&mut unique, train, cfg);
+            refit_exact(&mut unique, train, cfg, counts);
             report.refits = unique.len();
             report.refit_s = start.elapsed().as_secs_f64();
         }
@@ -5932,7 +5962,7 @@ fn full_data_archive_with(
     let (front, refits) = refit_to_fixpoint(archive.cap, scored, first, |batch: Vec<Node>| {
         let start = std::time::Instant::now();
         let mut batch = batch;
-        refit_exact(&mut batch, train, cfg);
+        refit_exact(&mut batch, train, cfg, counts);
         report.refit_s += start.elapsed().as_secs_f64();
         let start = std::time::Instant::now();
         let rescored = score_all(batch);
@@ -6674,6 +6704,10 @@ pub struct SeedResult {
     pub complexity: f64,
     /// Training error under [`Config::metric`].
     pub error: f64,
+    /// #1117: under `--fit-accept fitness`, whether the seed kept its fitted
+    /// constants (`true` also when nothing was fitted or the fit moved nothing).
+    /// `None` under `always`.
+    pub fit_kept: Option<bool>,
 }
 
 /// #131: one GPU scoring batch, reported in `--json` under `gpu.generations`.
@@ -6898,6 +6932,9 @@ pub struct Outcome {
     pub candidates_evaluated: u64,
     /// #848: every candidate had a fixed position, so the front keeps them.
     pub fixed_position_fallback: bool,
+    /// #1117: the `--fit-accept fitness` decisions of this process, by path;
+    /// `None` under `always`.
+    pub fit_accept: Option<FitAcceptReport>,
     /// #855: the run stopped on `time_budget` under `--interim-chunk`. The
     /// search state is saved; `archive` is the search archive at the last
     /// generation, `test_errors` is empty and no end-of-run report ran.
@@ -7032,10 +7069,32 @@ fn checkpoint_due(save_every: usize, gens_done: usize, since_last: f64, interval
     save_every > 0 && (gens_done % save_every == 0 || since_last >= interval_s)
 }
 
+/// #1117: the run total for the run JSON, or `None` under `always`.
+fn fit_accept_report(cfg: &Config, run: &FitAcceptCounts) -> Option<FitAcceptReport> {
+    (cfg.fit_accept == FitAccept::Fitness).then(|| run.snapshot())
+}
+
+/// #1117: the `--fit-accept fitness` decisions made since the previous call, or
+/// `None` under `always`. `mark` is the run total at that call.
+fn fit_accept_delta(cfg: &Config, run: &FitAcceptCounts, mark: &mut FitAcceptReport) -> Option<(u64, u64)> {
+    let now = run.snapshot();
+    let (a0, r0) = mark.totals();
+    let (a1, r1) = now.totals();
+    *mark = now;
+    (cfg.fit_accept == FitAccept::Fitness).then(|| (a1 - a0, r1 - r0))
+}
+
 /// #1022: report one generation's development-log record once its restarts are
 /// known.
-fn flush_dev_generation(cfg: &Config, rec: Option<crate::devlog::GenRecord>, restarts: usize, policy: &IslandPolicy) {
+fn flush_dev_generation(
+    cfg: &Config,
+    rec: Option<crate::devlog::GenRecord>,
+    restarts: usize,
+    policy: &IslandPolicy,
+    fit_accept: Option<(u64, u64)>,
+) {
     if let (Some(report), Some(mut rec)) = (&cfg.dev_log, rec) {
+        rec.fit.accept = fit_accept; // #1117
         rec.restarts = restarts;
         rec.restarts_total = policy.restarts_total();
         rec.isolated = policy.isolated_count();
@@ -7247,8 +7306,9 @@ fn prepare_seeds(
     train: &EvalSample, // #27 sample + cached SoA columns
     seeds: &[Node],
     aggs: &AggTable,
-) -> Vec<Ind> {
-    let mut out: Vec<Ind> = Vec::new();
+    counts: Option<&FitAcceptCounts>, // #1117
+) -> Vec<(Ind, Option<bool>)> {
+    let mut out: Vec<(Ind, Option<bool>)> = Vec::new();
     // Two sets: one for the simplified input form (so a repeated line is
     // dropped even before fitting) and one for the fitted tree (so two
     // different starts that converge to the same expression count once).
@@ -7267,10 +7327,12 @@ fn prepare_seeds(
         // #15: multi-output fits per output inside the evaluator.
         // #14: otherwise fit on the objective the metric actually scores.
         let mut fitted = None;
+        let mut before = None; // #1117
         if cfg.fit_iters > 0 && !train.sample.is_multi() {
             // #982: a seed in standardised inputs, `c*(x*s + m) + d`, has
             // redundant constants; fold them so the fit is identified.
             tree = crate::fold::fold_constants(&tree).0;
+            before = (cfg.fit_accept == FitAccept::Fitness).then(|| tree.clone());
             fitted = fit_constants(&mut tree, cfg, train.sample, train.sample); // #85 #87
             tree = expr::simplify(&tree);
         }
@@ -7279,10 +7341,24 @@ fn prepare_seeds(
         // structurally distinct (and therefore dominated) later.
         tree = canonicalize_seed(&tree);
         tree = expr::simplify(&tree);
-        if !seen_fitted.insert(expr::structural_hash(&tree)) {
+        let mut ind = Ind::evaluated_fitted(tree, fitted, train, cfg); // #25 #87
+        // #1117: under `--fit-accept fitness` the seed keeps its fit only when
+        // the pre-fit seed, canonicalised the same way, does not score better.
+        let mut fit_kept = (cfg.fit_accept == FitAccept::Fitness).then_some(true);
+        let before = before.map(|b| expr::simplify(&canonicalize_seed(&expr::simplify(&b))));
+        if let Some(before) = before.filter(|b| expr::structural_hash(b) != expr::structural_hash(&ind.tree)) {
+            let unfitted = Ind::evaluated(before, train, cfg);
+            let (winner, kept) = accept_fit(unfitted, ind);
+            if let Some(counts) = counts {
+                counts.record(FitPath::Seed, kept);
+            }
+            ind = winner;
+            fit_kept = Some(kept);
+        }
+        if !seen_fitted.insert(expr::structural_hash(&ind.tree)) {
             continue;
         }
-        out.push(Ind::evaluated_fitted(tree, fitted, train, cfg)); // #25 #87
+        out.push((ind, fit_kept));
     }
     out
 }
@@ -7568,6 +7644,7 @@ fn dev_generation(
                 gate_seconds: g.fit_gate_s,
                 fallback_workers: g.fit_fallback_workers,
                 threshold_moves: cfg.fit_thresholds.then(crate::fit::threshold_moves),
+                accept: None,
             },
             g.fallback_s,
             g.fallback_workers,
@@ -7576,6 +7653,7 @@ fn dev_generation(
             crate::devlog::FitGen {
                 refits,
                 threshold_moves: cfg.fit_thresholds.then(crate::fit::threshold_moves),
+                accept: None,
                 ..Default::default()
             },
             0.0,
@@ -7695,6 +7773,7 @@ fn run_postfix_search(
     device: Option<String>,
     dispatcher: &mut crate::dispatch::Dispatcher,
 ) -> Result<Outcome, String> {
+    let run_fit = FitAcceptCounts::default(); // #1117: the postfix loop does not fit; the final prune may
     // #848: fixed-position candidates the admission filter skipped; the front falls back to them when it would be empty.
     let mut fixed_shadow = Archive::new(archive.cap);
     let pop = cfg.pop;
@@ -7813,6 +7892,7 @@ fn run_postfix_search(
                 archive.try_insert_view(&tree, error, expr::complexity(&tree), cost);
             }
         }
+        let mut fit_mark = FitAcceptReport::default(); // #1117
         let mut dev_rec: Option<crate::devlog::GenRecord> = None; // #1022: reported after the restart step
         let dev_archive = dev_lap(&mut dev_mark); // #211
         let stage_archive = stage_lap(&mut stage_mark); // #284
@@ -7966,7 +8046,7 @@ fn run_postfix_search(
             )?;
         }
 
-        flush_dev_generation(cfg, dev_rec.take(), restarts.len(), &policy);
+        flush_dev_generation(cfg, dev_rec.take(), restarts.len(), &policy, fit_accept_delta(cfg, &run_fit, &mut fit_mark));
 
         if checkpoint_due(save_every, gens_done, last_save.elapsed().as_secs_f64(), save_interval_s) {
             last_save = std::time::Instant::now();
@@ -8118,7 +8198,7 @@ fn run_postfix_search(
     let (final_archive, prune_report) = if interim {
         (final_archive, PruneReport::default())
     } else {
-        prune::prune_archive(final_archive, train, train_data, cfg)
+        prune::prune_archive(final_archive, train, train_data, cfg, Some(&run_fit))
     };
     let sorted = final_archive.sorted();
     let test_data = if interim { None } else { Some(EvalSample::new(test, cfg)) };
@@ -8196,6 +8276,7 @@ fn run_postfix_search(
         candidates_evaluated: candidates,
         fixed_position_fallback,
         interim,
+        fit_accept: fit_accept_report(cfg, &run_fit),
     })
 }
 
@@ -8830,6 +8911,8 @@ fn run_search_scoped(
     // every island's initial population. Seeds are elites: they are inserted
     // even above `max_complexity`, which only limits generated offspring.
     let mut seed_results: Vec<SeedResult> = Vec::new();
+    // #1117: every `--fit-accept fitness` decision of this process, by path.
+    let run_fit = std::sync::Arc::new(FitAcceptCounts::default());
     // #27: seeds are fitted on the full training sample and re-scored (when a
     // generation-0 subset exists) on the same rows as the initial population.
     if !seeds.is_empty() {
@@ -8846,7 +8929,7 @@ fn run_search_scoped(
             }
             None => &train_data,
         };
-        for (k, ind) in prepare_seeds(cfg, &train_data, seeds, &aggs)
+        for (k, (ind, fit_kept)) in prepare_seeds(cfg, &train_data, seeds, &aggs, Some(&run_fit))
             .into_iter()
             .enumerate()
         {
@@ -8886,6 +8969,7 @@ fn run_search_scoped(
                 tree: ind.tree,
                 complexity: ind.complexity,
                 error: ind.error,
+                fit_kept,
             });
         }
     }
@@ -8894,7 +8978,7 @@ fn run_search_scoped(
     // before the first selection step reads an error.
     #[cfg(feature = "cuda")]
     {
-        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, &train_data, cfg, &mut backend_reason, gens_done, &mut dispatcher, 0)?;
+        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, &train_data, cfg, &mut backend_reason, gens_done, &mut dispatcher, 0, Some(&run_fit))?;
     }
 
     // #122: the flat postfix generation loop. It is selected before the first
@@ -9004,6 +9088,7 @@ fn run_search_scoped(
     let mut last_save = std::time::Instant::now();
     let save_interval_s = checkpoint_interval_s();
     if !converged_early {
+        let mut fit_mark = run_fit.snapshot(); // #1117: records read the change since the last flush
         let mut dev_rec: Option<crate::devlog::GenRecord> = None; // #1022: reported after the restart step
         for gen in gens_done..cfg.generations {
             gens_done = gen + 1;
@@ -9016,11 +9101,13 @@ fn run_search_scoped(
             let mut stage_mark = std::time::Instant::now();
             let dev_counters = Some(GenCounters {
                 timed: cfg.dev_log.is_some() || cfg.gpu,
+                fit_paths: run_fit.clone(),
                 ..GenCounters::default()
             });
             // The island threads take `Option<&GenCounters>`, which is `Copy`;
             // the owning `Option` stays here for the readout below.
             let dev_counters_ref = dev_counters.as_ref();
+            let fit_counts = dev_counters_ref.map(|c| &*c.fit_paths);
             let mut dev_refits = 0usize;
             let mut dev_offers = 0usize;
             let mut dev_admissions = 0usize;
@@ -9088,7 +9175,7 @@ fn run_search_scoped(
             if gen > 0 && gen_sample.is_some() && !screened {
                 for pop in islands.iter_mut() {
                     for ind in pop.iter_mut() {
-                        ind.refit_and_reeval(gen_data, fit_train, cfg); // #25
+                        ind.refit_and_reeval(gen_data, fit_train, cfg, fit_counts); // #25
                         if dev_mark.is_some() {
                             dev_refits += 1; // #211
                         }
@@ -9312,7 +9399,7 @@ fn run_search_scoped(
                         // Score anything the kernel could not compile (left
                         // pending) through the normal CPU fallback.
                         defer_gpu =
-                            score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_data, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
+                            score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_data, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version, fit_counts)?;
                     } else {
                         // Stop the GPU and re-score every still-pending
                         // candidate in f64 on the CPU; a failed batch must
@@ -9343,7 +9430,7 @@ fn run_search_scoped(
                     // #26: one batched call covers every candidate of the
                     // generation (the pre-#119 synchronous path).
                     defer_gpu =
-                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_data, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
+                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_data, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version, fit_counts)?;
                 }
             }
             let dev_eval = dev_lap(&mut dev_mark); // #211: evaluator batch
@@ -9373,7 +9460,7 @@ fn run_search_scoped(
                         batch_workers(cfg.threads, top.len(), train_data.sample.len()),
                         top,
                         |mut ind| {
-                            let sol = refit_survivor(&ind.tree, &train_data, cfg);
+                            let sol = refit_survivor(&ind.tree, &train_data, cfg, fit_counts);
                             ind.tree = sol.tree;
                             ind.set_error(sol.error);
                             ind.complexity = sol.cost;
@@ -9540,7 +9627,7 @@ fn run_search_scoped(
                 if cfg.fitness.is_metric() && cfg.metric.is_solved(gen_best) {
                     converged_early = true;
                     stop_reason = "solved"; // #211
-                    flush_dev_generation(cfg, dev_rec.take(), 0, &policy);
+                    flush_dev_generation(cfg, dev_rec.take(), 0, &policy, fit_accept_delta(cfg, &run_fit, &mut fit_mark));
                     break;
                 }
                 if crate::progress_stats::no_improvement(best_prev, gen_best) {
@@ -9552,7 +9639,7 @@ fn run_search_scoped(
                 if cfg.patience > 0 && no_improve >= cfg.patience {
                     converged_early = true;
                     stop_reason = "patience"; // #211
-                    flush_dev_generation(cfg, dev_rec.take(), 0, &policy);
+                    flush_dev_generation(cfg, dev_rec.take(), 0, &policy, fit_accept_delta(cfg, &run_fit, &mut fit_mark));
                     break;
                 }
             }
@@ -9573,16 +9660,17 @@ fn run_search_scoped(
                     defer_gpu,
                     qd: qd_archive.as_ref(),
                     cached_descriptors_valid,
+                    fit_counts,
                 },
             );
-            flush_dev_generation(cfg, dev_rec.take(), restarts.len(), &policy);
+            flush_dev_generation(cfg, dev_rec.take(), restarts.len(), &policy, fit_accept_delta(cfg, &run_fit, &mut fit_mark));
 
             // #26: migration and restarts may have added pending individuals;
             // score them before the checkpoint so a saved state is never NaN.
             #[cfg(feature = "cuda")]
             {
                 defer_gpu =
-                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_data, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version)?;
+                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_data, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version, fit_counts)?;
             }
 
             // #120: record this generation's evaluated behaviours. The order
@@ -9680,7 +9768,7 @@ fn run_search_scoped(
     if cfg.qd_policy && !interim {
         if let Some(qd) = qd_archive.as_mut() {
             qd.refit_all(|tree| {
-                let sol = refit_survivor(tree, &train_data, cfg);
+                let sol = refit_survivor(tree, &train_data, cfg, Some(&run_fit));
                 (sol.error, sol.cost)
             });
         }
@@ -9746,6 +9834,7 @@ fn run_search_scoped(
             &train_data,
             cfg,
             gpu_fit_used || cfg.fit_irls_active(),
+            Some(&run_fit),
         );
         archive = rebuilt.0;
         refit_report = rebuilt.1;
@@ -9782,7 +9871,7 @@ fn run_search_scoped(
     let (archive, prune_report) = if interim {
         (archive, PruneReport::default())
     } else {
-        prune::prune_archive(archive, train, &train_data, cfg)
+        prune::prune_archive(archive, train, &train_data, cfg, Some(&run_fit))
     };
     let sorted = archive.sorted();
     // #27: one transpose for the whole test sample, shared by every front
@@ -9930,6 +10019,7 @@ fn run_search_scoped(
         candidates_evaluated: candidates,
         fixed_position_fallback,
         interim,
+        fit_accept: fit_accept_report(cfg, &run_fit),
     })
 }
 
@@ -11374,7 +11464,7 @@ mod tests {
         let seed = node(Op::Mul, vec![constant(3.0), input(0)]);
         let aggs = AggTable::from_sample(&s);
         let data = EvalSample::new(&s, &cfg);
-        let accepted = prepare_seeds(&cfg, &data, &[seed.clone(), seed], &aggs);
+        let accepted = prepare_seeds(&cfg, &data, &[seed.clone(), seed], &aggs, None).into_iter().map(|(ind, _)| ind).collect::<Vec<_>>();
         assert_eq!(accepted.len(), 1, "a repeated seed is inserted once");
         assert!(
             accepted[0].error < 1e-12,
@@ -11401,7 +11491,7 @@ mod tests {
         let seed = node(Op::Add, vec![node(Op::Mul, vec![constant(0.5), affine]), constant(0.1)]);
         let aggs = AggTable::from_sample(&s);
         let data = EvalSample::new(&s, &cfg);
-        let accepted = prepare_seeds(&cfg, &data, &[seed], &aggs);
+        let accepted = prepare_seeds(&cfg, &data, &[seed], &aggs, None).into_iter().map(|(ind, _)| ind).collect::<Vec<_>>();
         assert_eq!(accepted.len(), 1);
         assert_eq!(expr::count_constants(&accepted[0].tree), 2, "{:?}", accepted[0].tree);
         assert!(accepted[0].error < 1e-12, "error = {}", accepted[0].error);
@@ -11439,11 +11529,11 @@ mod tests {
             inf_rows: None,
         };
 
-        ind.refit_and_reeval(&first_data, &first, &cfg);
+        ind.refit_and_reeval(&first_data, &first, &cfg, None);
         let text_first = expr::to_string(&ind.tree, &["x".to_string()]);
         assert!(ind.error < 1e-12, "first refit error = {}", ind.error);
 
-        ind.refit_and_reeval(&second_data, &second, &cfg);
+        ind.refit_and_reeval(&second_data, &second, &cfg, None);
         let text_second = expr::to_string(&ind.tree, &["x".to_string()]);
         assert!(ind.error < 1e-12, "second refit error = {}", ind.error);
         assert_ne!(
@@ -11460,7 +11550,7 @@ mod tests {
         let seed = node(Op::Mul, vec![constant(3.0), input(0)]);
         let aggs = AggTable::from_sample(&s);
         let data = EvalSample::new(&s, &cfg);
-        let accepted = prepare_seeds(&cfg, &data, &[seed], &aggs);
+        let accepted = prepare_seeds(&cfg, &data, &[seed], &aggs, None).into_iter().map(|(ind, _)| ind).collect::<Vec<_>>();
         assert!(accepted[0].error > 1e-3, "an unfitted 3*x is not exact");
     }
 
@@ -11630,7 +11720,7 @@ mod tests {
         let mut tree = node(Op::Mul, vec![constant(3.0), input(0)]);
         fit_constants(&mut tree, &cfg, &screening, &screening);
         let view = EvalSample::new(&s, &cfg);
-        let sol = refit_survivor(&tree, &view, &cfg);
+        let sol = refit_survivor(&tree, &view, &cfg, None);
         let full = eval_error_with(&sol.tree, &s, Metric::Squared, true);
         assert_eq!(sol.error.to_bits(), full.to_bits());
         assert!(sol.error < 1e-12, "full-data error = {}", sol.error);
@@ -11662,7 +11752,7 @@ mod tests {
             vec![node(Op::Mul, vec![constant(1.0), input(0)])],
         );
         let before = REFIT_SSE_REUSED.with(|n| n.get());
-        refit_survivor(&tree, &view, &squared);
+        refit_survivor(&tree, &view, &squared, None);
         assert_eq!(
             REFIT_SSE_REUSED.with(|n| n.get()),
             before + 1,
@@ -11673,7 +11763,7 @@ mod tests {
         squared.metric = Metric::Absolute;
         let before = REFIT_SSE_REUSED.with(|n| n.get());
         let view = EvalSample::new(&s, &squared);
-        refit_survivor(&tree, &view, &squared);
+        refit_survivor(&tree, &view, &squared, None);
         assert_eq!(
             REFIT_SSE_REUSED.with(|n| n.get()),
             before,
@@ -11759,7 +11849,7 @@ mod tests {
             vec![node(Op::Mul, vec![constant(1.0), input(0)])],
         );
         let before = REFIT_SSE_REUSED.with(|n| n.get());
-        let sol = refit_survivor(&tree, &view, &cfg);
+        let sol = refit_survivor(&tree, &view, &cfg, None);
         assert_eq!(REFIT_SSE_REUSED.with(|n| n.get()), before);
         let pred = predictions(&sol.tree, &view);
         assert_eq!(sol.error.to_bits(), book.regret(&pred).to_bits());
@@ -11963,7 +12053,7 @@ mod tests {
                 tree: t,
             });
         }
-        full_data_archive(&a, &[], &view, &cfg, true)
+        full_data_archive(&a, &[], &view, &cfg, true, None)
     }
 
     /// #495: `inf` is the historical path: refit every unique tree, score,
@@ -12041,7 +12131,7 @@ mod tests {
                     tree: t.clone(),
                 });
             }
-            full_data_archive(&a, &[], &view, &cfg, false)
+            full_data_archive(&a, &[], &view, &cfg, false, None)
         };
         let both = [fixed.clone(), free.clone()];
         let (control, _) = rebuild(false, &both);
@@ -12136,7 +12226,7 @@ mod tests {
             error: carried_error,
             tree,
         });
-        let (front, report) = full_data_archive(&a, &[], &view, &cfg, true);
+        let (front, report) = full_data_archive(&a, &[], &view, &cfg, true, None);
         (front, report, carried_error)
     }
 
@@ -12151,7 +12241,7 @@ mod tests {
             let cfg = Config { fitness: Fitness::LongPnl(pnl_book(&s)), threads: 1, ..Config::default() };
             let view = EvalSample::new(&s, &cfg);
             let mut refit = vec![tree.clone()];
-            refit_exact(&mut refit, &view, &cfg);
+            refit_exact(&mut refit, &view, &cfg, None);
             let refit_error = score_tree(&refit[0], &view, &cfg);
             assert!(refit[0].kids[1].kids[0].val > 1.0, "the refit cut leaves the data: {:?}", refit[0]);
             assert!(carried_error < refit_error, "{carried_error} vs {refit_error}");
@@ -12169,7 +12259,7 @@ mod tests {
         let cfg = Config { fitness: Fitness::LongPnl(pnl_book(&s)), threads: 1, ..Config::default() };
         let view = EvalSample::new(&s, &cfg);
         let mut refit = vec![expr::simplify(&cut_tree(1.0, 0.0))];
-        refit_exact(&mut refit, &view, &cfg);
+        refit_exact(&mut refit, &view, &cfg, None);
         let (front, report, _) = pnl_rebuild(cut_tree(1.0, 0.0), f64::INFINITY);
         assert_eq!(report.carried_kept, 0);
         assert_eq!(
@@ -12192,7 +12282,7 @@ mod tests {
             error: score_tree(&tree, &view, &cfg),
             tree,
         });
-        let (_, report) = full_data_archive(&a, &[], &view, &cfg, true);
+        let (_, report) = full_data_archive(&a, &[], &view, &cfg, true, None);
         assert_eq!(report.carried_kept, 0);
     }
 
@@ -12230,7 +12320,7 @@ mod tests {
                     cost: cfg.complexity_model.complexity(t),
                 });
             }
-            full_data_archive(&a, &[], &view, &cfg, false).0
+            full_data_archive(&a, &[], &view, &cfg, false, None).0
         };
         let forward = build(&trees);
         let rev: Vec<Node> = trees.iter().rev().cloned().collect();
@@ -13098,7 +13188,7 @@ mod tests {
             .with_mode(crate::dispatch::DispatchMode::Device);
         let mut islands = vec![std::mem::take(&mut island)];
         g.rows_version = 7;
-        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher).expect("device batch");
+        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher, None).expect("device batch");
         for (k, ind) in islands[0].iter().enumerate() {
             let exact = score_tree(&ind.tree, &view, &cfg);
             assert_eq!(ind.error.to_bits(), exact.to_bits(), "tree {k}");
@@ -13179,7 +13269,7 @@ mod tests {
             .with_mode(crate::dispatch::DispatchMode::Device);
         let mut islands = vec![std::mem::take(&mut island)];
         g.rows_version = 7;
-        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher).expect("device batch");
+        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher, None).expect("device batch");
         let exact0 = score_tree(&islands[0][0].tree, &view, &cfg);
         assert!(exact0.is_finite(), "the f64 positions meet the floor: {exact0}");
         assert_eq!(islands[0][0].error.to_bits(), exact0.to_bits());
@@ -13507,7 +13597,7 @@ mod tests {
             .with_mode(crate::dispatch::DispatchMode::Device);
         let mut islands = vec![std::mem::take(&mut island)];
         g.rows_version = 7;
-        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher).expect("device batch");
+        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher, None).expect("device batch");
         let stats = &g.stats[&0];
         assert_eq!(stats.nonfinite_bound, 1, "{:?}", stats);
         assert_eq!(stats.nonfinite_trade_floor, 2, "{:?}", stats);
@@ -13711,7 +13801,7 @@ mod tests {
             .with_mode(crate::dispatch::DispatchMode::Device);
         let mut islands = vec![std::mem::take(&mut island)];
         reset_transpose_count();
-        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher).expect("device batch");
+        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher, None).expect("device batch");
         let stats = &g.stats[&0];
         assert!(stats.nonfinite >= 1, "a status-2 slot is checked: {:?}", stats);
         assert!(stats.nonfinite_trade_floor >= 1, "a floor slot is checked: {:?}", stats);
@@ -13890,7 +13980,7 @@ mod tests {
             .with_mode(crate::dispatch::DispatchMode::Device);
         let mut islands = vec![island];
         g.rows_version = 3;
-        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher).expect("device batch");
+        g.score(&mut islands, &view, &cfg, 0, &mut dispatcher, None).expect("device batch");
         let changed = islands[0]
             .iter()
             .enumerate()
@@ -14146,13 +14236,10 @@ mod tests {
             assert_eq!(expr::structural_hash(&a.tree), expr::structural_hash(&b.tree));
             assert_eq!(a.error.to_bits(), b.error.to_bits());
         }
-        let rejected = GenCounters::total(Some(&pooled), |c| &c.fit_rejected);
-        assert!(rejected > 0, "the gate refused no fit on the workers");
-        assert_eq!(rejected, GenCounters::total(Some(&serial), |c| &c.fit_rejected));
-        assert_eq!(
-            GenCounters::total(Some(&pooled), |c| &c.fit_accepted),
-            GenCounters::total(Some(&serial), |c| &c.fit_accepted)
-        );
+        let pooled = pooled.fit_paths.snapshot();
+        assert!(pooled.totals().1 > 0, "the gate refused no fit on the workers");
+        assert_eq!(pooled, serial.fit_paths.snapshot());
+        assert_eq!(pooled.path("offspring"), Some(pooled.totals()), "the batch counts as the offspring path");
     }
 
     #[test]
@@ -14182,22 +14269,129 @@ mod tests {
         let view = EvalSample::new(&s, &always);
         let start = Ind::evaluated(start_tree(0.5), &view, &fitness);
 
+        let counts = FitAcceptCounts::default();
         let mut carried = start.clone();
-        carried.refit_and_reeval(&view, &s, &fitness);
+        carried.refit_and_reeval(&view, &s, &fitness, Some(&counts));
         assert_eq!(carried.error.to_bits(), start.error.to_bits());
         let mut moved = start.clone();
-        moved.refit_and_reeval(&view, &s, &always);
+        moved.refit_and_reeval(&view, &s, &always, Some(&counts));
         assert!(moved.error > start.error);
 
-        let survivor = refit_survivor(&start_tree(0.5), &view, &fitness);
+        let survivor = refit_survivor(&start_tree(0.5), &view, &fitness, Some(&counts));
         assert_eq!(survivor.error.to_bits(), start.error.to_bits());
-        assert!(refit_survivor(&start_tree(0.5), &view, &always).error > start.error);
+        assert!(refit_survivor(&start_tree(0.5), &view, &always, None).error > start.error);
 
         let mut trees = vec![start_tree(0.5)];
-        refit_exact(&mut trees, &view, &fitness);
+        refit_exact(&mut trees, &view, &fitness, Some(&counts));
         assert_eq!(expr::structural_hash(&trees[0]), expr::structural_hash(&start.tree));
         let mut trees = vec![start_tree(0.5)];
-        refit_exact(&mut trees, &view, &always);
+        refit_exact(&mut trees, &view, &always, Some(&counts));
         assert_ne!(expr::structural_hash(&trees[0]), expr::structural_hash(&start.tree));
+        let report = counts.snapshot();
+        assert_eq!(report.path("carried"), Some((0, 1)));
+        assert_eq!(report.path("survivor"), Some((0, 1)));
+        assert_eq!(report.path("finalist"), Some((0, 1)));
+        assert_eq!(report.totals(), (0, 3), "the always arm counts nothing");
+    }
+
+    /// #1117: one tiny CPU run on the threshold panel with a development log;
+    /// returns the outcome and every generation's `(fit.accept, record json)`.
+    fn counted_run(accept: FitAccept, threads: usize, seeds: &[Node]) -> (Outcome, Vec<(Option<(u64, u64)>, String)>) {
+        let s = threshold_panel();
+        let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = records.clone();
+        let cfg = Config {
+            generations: 6,
+            islands: 2,
+            pop: 24,
+            seed: 5,
+            threads,
+            gpu: false,
+            max_complexity: 8,
+            dev_log: Some(std::sync::Arc::new(move |r: &crate::devlog::GenRecord| {
+                sink.lock().unwrap().push((r.fit.accept, r.json()));
+            })),
+            ..accept_config(&s, accept)
+        };
+        let out = run_seeded(&cfg, &s, &s, seeds);
+        let records = records.lock().unwrap().clone();
+        (out, records)
+    }
+
+    #[test]
+    fn fit_accept_counters_are_absent_by_default() {
+        let (out, records) = counted_run(FitAccept::Always, 1, &[start_tree(0.3)]);
+        assert_eq!(records.len(), 6);
+        for (accept, json) in &records {
+            assert_eq!(*accept, None);
+            assert!(!json.contains("\"accepted\"") && !json.contains("\"rejected\""), "{}", json);
+        }
+        assert!(out.fit_accept.is_none());
+        assert_eq!(out.seeds.len(), 1);
+        assert_eq!(out.seeds[0].fit_kept, None);
+    }
+
+    #[test]
+    fn fit_accept_counts_reach_the_dev_log() {
+        let (_, records) = counted_run(FitAccept::Fitness, 1, &[]);
+        assert_eq!(records.len(), 6);
+        let mut rejected = 0;
+        for (accept, json) in &records {
+            let (_, r) = accept.expect("every record carries the counts under fitness");
+            rejected += r;
+            assert!(json.contains("\"accepted\":") && json.contains("\"rejected\":"), "{}", json);
+        }
+        assert!(rejected > 0, "the gate refused no fit in the log");
+    }
+
+    #[test]
+    fn fit_accept_run_json_totals_match_the_paths() {
+        let (out, records) = counted_run(FitAccept::Fitness, 1, &[]);
+        let report = out.fit_accept.expect("counts under fitness");
+        let (accepted, rejected) = report.totals();
+        let mut sum = (0, 0);
+        for name in ["offspring", "restart", "carried", "device", "lost_batch", "survivor", "finalist", "prune", "seed"] {
+            let (a, r) = report.path(name).unwrap();
+            sum = (sum.0 + a, sum.1 + r);
+        }
+        assert_eq!((accepted, rejected), sum);
+        assert!(report.path("offspring").unwrap().1 > 0);
+        // The generations carry every path but the finalist, prune and seed ones.
+        let after_loop = ["finalist", "prune", "seed"].iter().fold((0, 0), |s, n| {
+            let (a, r) = report.path(n).unwrap();
+            (s.0 + a, s.1 + r)
+        });
+        let logged = records.iter().fold((0, 0), |s, (c, _)| {
+            let (a, r) = c.unwrap();
+            (s.0 + a, s.1 + r)
+        });
+        assert_eq!((logged.0 + after_loop.0, logged.1 + after_loop.1), (accepted, rejected));
+        assert!(report.json().starts_with(&format!("{{\"accepted\":{},\"rejected\":{},\"by_path\":{{\"offspring\":[", accepted, rejected)));
+    }
+
+    #[test]
+    fn fit_accept_counts_are_independent_of_threads() {
+        let (one, one_log) = counted_run(FitAccept::Fitness, 1, &[start_tree(0.3)]);
+        let (eight, eight_log) = counted_run(FitAccept::Fitness, 8, &[start_tree(0.3)]);
+        assert!(one.fit_accept.unwrap().totals().1 > 0);
+        assert_eq!(one.fit_accept, eight.fit_accept);
+        let counts = |log: &[(Option<(u64, u64)>, String)]| log.iter().map(|(c, _)| *c).collect::<Vec<_>>();
+        assert_eq!(counts(&one_log), counts(&eight_log));
+    }
+
+    #[test]
+    fn fit_accept_gates_the_seed_fit() {
+        let (gated, _) = counted_run(FitAccept::Fitness, 1, &[start_tree(0.3)]);
+        let (plain, _) = counted_run(FitAccept::Always, 1, &[start_tree(0.3)]);
+        assert_eq!(gated.seeds[0].fit_kept, Some(false));
+        assert_eq!(gated.fit_accept.unwrap().path("seed"), Some((0, 1)));
+        assert_eq!(plain.seeds[0].fit_kept, None);
+        let s = threshold_panel();
+        let cfg = accept_config(&s, FitAccept::Fitness);
+        let view = EvalSample::new(&s, &cfg);
+        let start = Ind::evaluated(start_tree(0.3), &view, &cfg);
+        assert_eq!(gated.seeds[0].error.to_bits(), start.error.to_bits());
+        assert_eq!(expr::structural_hash(&gated.seeds[0].tree), expr::structural_hash(&start.tree));
+        assert!(plain.seeds[0].error > gated.seeds[0].error, "{} vs {}", plain.seeds[0].error, gated.seeds[0].error);
     }
 }

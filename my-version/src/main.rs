@@ -1299,6 +1299,12 @@ fn expand_block_aliases(spec: &str, blocks: &[expr::Block]) -> String {
         .join(",")
 }
 
+/// #1117: `,"fit_accept":{...}` for the run JSON `search` object, empty unless
+/// `--fit-accept fitness`.
+fn fit_accept_json(report: Option<&search::FitAcceptReport>) -> String {
+    report.map_or(String::new(), |r| format!(",\"fit_accept\":{}", r.json()))
+}
+
 fn jstr(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
@@ -6904,7 +6910,7 @@ fn main() {
         match format {
             Format::Json => {
                 let doc = format!(
-                    "{{\"tool\":\"rcsr\",\"version\":{},\"interim\":true,\"backend\":\"{}\",\"search_backend\":\"{}\",\"process_backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"threads\":{},\"seed\":{},\"stop_reason\":{},\"generations_run\":{},\"elapsed_seconds\":{},\"search\":{{\"cumulative\":{}}},\"timing\":{},\"gpu\":{},\"checkpoint\":{}}}",
+                    "{{\"tool\":\"rcsr\",\"version\":{},\"interim\":true,\"backend\":\"{}\",\"search_backend\":\"{}\",\"process_backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"threads\":{},\"seed\":{},\"stop_reason\":{},\"generations_run\":{},\"elapsed_seconds\":{},\"search\":{{\"cumulative\":{}{}}},\"timing\":{},\"gpu\":{},\"checkpoint\":{}}}",
                     jstr(VERSION),
                     backend_name,
                     search_backend,
@@ -6917,6 +6923,7 @@ fn main() {
                     outcome.generations,
                     jnum(elapsed),
                     cumulative_json,
+                    fit_accept_json(outcome.fit_accept.as_ref()),
                     timing.json(),
                     gpu,
                     checkpoint_json
@@ -8141,12 +8148,14 @@ fn main() {
             };
             let seeds_json: Vec<String> = seed_rows
                 .iter()
-                .map(|(expression, complexity, error)| {
+                .zip(&outcome.seeds)
+                .map(|((expression, complexity, error), seed)| {
                     format!(
-                        "{{\"expression\":{},\"complexity\":{},\"train_error\":{}}}",
+                        "{{\"expression\":{},\"complexity\":{},\"train_error\":{}{}}}",
                         jstr(expression),
                         jnum(*complexity),
-                        jnum(*error)
+                        jnum(*error),
+                        seed.fit_kept.map_or(String::new(), |k| format!(",\"fit_kept\":{}", k))
                     )
                 })
                 .collect();
@@ -8529,7 +8538,7 @@ fn main() {
                 outcome.generations,
                 outcome.candidates_evaluated,
                 format!(
-                    "{}{}{}",
+                    "{}{}{}{}",
                     if cfg.fit_irls_active() {
                         format!(",\"fit_irls\":{}", jstr(cfg.fit_irls.name()))
                     } else {
@@ -8540,6 +8549,7 @@ fn main() {
                     } else {
                         String::new()
                     },
+                    fit_accept_json(outcome.fit_accept.as_ref()),
                     format!(",\"cumulative\":{}", cumulative_json)
                 ),
                 outcome.converged_early,
