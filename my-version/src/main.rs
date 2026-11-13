@@ -10967,9 +10967,10 @@ OPTIONS:
                              repeat to select among candidates on the validation slice
   --front <run.json>         candidates from the Pareto front of a run (one per
                              member, labelled front_rank_<k>), instead of --expr.
-                             --vars, --target (the run's return column) and
-                             --trials (search.candidates_evaluated) default to
-                             the run. The run's position rule is carried: the
+                             --vars and --target (the run's return column) default
+                             to the run; --trials defaults to the front size (the
+                             search trials when a window is in sample). The run's
+                             position rule is carried: the
                              objective threshold as a fixed threshold and its
                              per-side cost; --threshold-fixed,
                              --threshold-quantile and --cost-bps override.
@@ -11133,7 +11134,10 @@ OPTIONS:
                              symbols; p is null under 20 distinct shifts)
                              (default 0 = off); p = (1+count)/(B+1)
   --trials <N>               total trials behind the candidates, the N of the
-                             DSR (default: the candidate count)
+                             DSR. Default: --from-run 1 (out-of-sample book), --front
+                             the front size, the run's candidates_evaluated when a
+                             window is in sample, else the candidate count; the report
+                             names it in multiple_testing.n_trials_source
   --protocol-seed <n>        seed of every bootstrap, null and SPA draw
   --pbo-blocks <S>           even CSCV block count (default 16)
   --fdr-q <q>                Benjamini-Hochberg rate (default 0.10)
@@ -11211,6 +11215,18 @@ struct BandFlags {
     band: bool,
     units: Option<String>,
     min_hold: bool,
+}
+
+/// #1027: the N of the deflated Sharpe is what selected on the scored rows. An
+/// out-of-sample `--from-run` book is one trial and `--front` compares its
+/// front members; a window the search selected on brings the search trials.
+fn default_trials(run: &rcsr::run_json::RunFile, front: bool, in_sample: bool) -> (usize, &'static str) {
+    let front_size = run.front.len().max(1);
+    match (front, in_sample, run.candidates_evaluated) {
+        (_, true, Some(n)) if n > 0 => (n as usize, "run.candidates_evaluated"),
+        (_, true, _) | (true, false, _) => (front_size, "front_size"),
+        (false, false, _) => (1, "out_of_sample_book"),
+    }
 }
 
 /// #946: `--from-run` and `--front` price the book the search selected. When
@@ -11745,18 +11761,6 @@ fn run_walkforward(args: &[String]) -> ! {
         if target.is_none() {
             target = run.return_column.clone();
         }
-        if popts.trials.is_none() {
-            popts.trials = Some(match run.candidates_evaluated {
-                Some(n) if n > 0 => n as usize,
-                _ => {
-                    eprintln!(
-                        "error: --front {}: the run has no search.candidates_evaluated; pass --trials",
-                        path
-                    );
-                    std::process::exit(EXIT_USAGE);
-                }
-            });
-        }
         // The front is priced as the books the search compared: the run's
         // fixed threshold, cost and target spec.
         if run.position == rcsr::trading::PositionMap::TopTercile {
@@ -11991,6 +11995,11 @@ fn run_walkforward(args: &[String]) -> ! {
                 std::process::exit(EXIT_USAGE);
             }
         }
+    }
+    if let (None, Some(run)) = (popts.trials, front_run.as_ref()) {
+        let (n, source) = default_trials(run, front_path.is_some(), !popts.in_sample_windows.is_empty());
+        popts.trials = Some(n);
+        popts.trials_source = source;
     }
     let vars: Vec<String> = vars_src
         .map(|s| {

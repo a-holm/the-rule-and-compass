@@ -71,6 +71,8 @@ pub struct ProtocolOptions {
     pub null_draws: usize,
     /// Total trials behind the candidates, for DSR; `None` uses the candidate count.
     pub trials: Option<usize>,
+    /// Where `trials` comes from, named in the report.
+    pub trials_source: &'static str,
     /// Seed of every protocol draw.
     pub seed: u32,
     /// Even block count of the CSCV PBO.
@@ -145,6 +147,7 @@ impl Default for ProtocolOptions {
             block_len: None,
             null_draws: 0,
             trials: None,
+            trials_source: "candidate_count",
             seed: 20_260_101,
             pbo_blocks: 16,
             fdr_q: 0.10,
@@ -1821,6 +1824,7 @@ impl Accum {
                 fresh: &fresh_all,
                 candidates: &candidates,
                 trials: opts.trials.unwrap_or(0),
+                trials_source: if opts.trials.is_some() && opts.trials_source == "candidate_count" { "flag" } else { opts.trials_source },
                 pbo_blocks: opts.pbo_blocks,
                 fdr_q: opts.fdr_q,
                 best_baseline: &economics.best_baseline,

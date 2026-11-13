@@ -746,6 +746,14 @@ mod front {
         rcsr(&a)
     }
 
+    /// Like `wf` for a run that declares its target spec: the spec sets the period width.
+    fn wf_book(data: &str, source: &[&str], window: &str, extra: &[&str]) -> (i32, String, String) {
+        let mut a = vec!["walkforward", "--data", data, "--time", "ts", "--validation-frac", "0.3", "--window", window, "--json"];
+        a.extend_from_slice(source);
+        a.extend_from_slice(extra);
+        rcsr(&a)
+    }
+
     /// last seen 179 + required purge 5
     const OK_WINDOW: &str = "late,0,150,184,300";
 
@@ -810,17 +818,149 @@ mod front {
         }
     }
 
+    const BOOK_RUN: &str = r#"{"tool":"rcsr","variables":["x"],
+        "target_spec":{"column":"target","name":"target","kind":"forward_return","deprecated":false,
+            "return_column":"target","return_units":"log","horizon_seconds":1,"entry_offset_seconds":0,
+            "delay_seconds":0,"entry_price":"next open","exit_price":"close","offset":0.0,
+            "scale":{"kind":"constant","value":1.0},"clip":null,"units":"log_return","cost_bps":null,
+            "cost_in_label":false,"construction_columns":[],"note":null},
+        "split":{"train_time":[0,119],"validation_time":[120,179],"required_purge_seconds":5,"purge_seconds":9},
+        "search":{"candidates_evaluated":1000},
+        "objective":{"spec":{"threshold":0,"per_side_bps":5,"max_position":1,"cash_return":0},
+            "finalist":{"expression":"x"}},
+        "pareto":[{"expression":"x"},{"expression":"x * 2 + 0.1"},{"expression":"0.5 - x"}]}"#;
+
+    const IN_SAMPLE_WINDOW: &str = "bad,0,100,150,300";
+
+    fn num(j: &Json, path: &[&str]) -> f64 {
+        let mut cur = j;
+        for k in path {
+            cur = cur.get(k).unwrap_or_else(|| panic!("missing {k} in {path:?}"));
+        }
+        cur.as_f64().unwrap_or_else(|| panic!("{path:?} is not a number"))
+    }
+
+    fn multiple(out: &str) -> Json {
+        let j = Json::parse(out.trim()).unwrap();
+        j.get("inference").and_then(|i| i.get("multiple_testing")).expect("multiple_testing").clone()
+    }
+
+    fn source(m: &Json) -> String {
+        m.get("n_trials_source").and_then(Json::as_str).expect("n_trials_source").to_string()
+    }
+
+    fn mt(m: &Json, path: &[&str]) -> f64 {
+        num(m, path)
+    }
+
     #[test]
-    fn front_trials_default_to_candidates_evaluated_and_can_be_overridden() {
+    fn from_run_trials_are_one_out_of_sample_book() {
+        let (_scratch, dir) = scratch("fromrun1");
+        let data = write_data(&dir);
+        let run = write_run(&dir, BOOK_RUN);
+        let (code, a, err) = wf_book(&data, &["--from-run", &run], OK_WINDOW, &["--bootstrap", "100"]);
+        assert_eq!(code, 0, "{err}");
+        let m = multiple(&a);
+        assert_eq!(mt(&m, &["trials"]), 1.0);
+        assert_eq!(source(&m), "out_of_sample_book");
+        let (code, b, err) = wf_book(&data, &["--from-run", &run], OK_WINDOW, &["--bootstrap", "100", "--trials", "1"]);
+        assert_eq!(code, 0, "{err}");
+        let mb = multiple(&b);
+        assert_eq!(source(&mb), "flag");
+        for k in ["dsr_at_n_eff", "dsr_at_10_n_eff"] {
+            assert_eq!(format!("{:?}", m.get(k)), format!("{:?}", mb.get(k)), "{k}");
+        }
+        assert_eq!(format!("{:?}", m.get("psr")), format!("{:?}", m.get("dsr_at_n_eff")));
+        let (code, c, err) = wf_book(&data, &["--from-run", &run], OK_WINDOW, &["--bootstrap", "100", "--trials", "77"]);
+        assert_eq!(code, 0, "{err}");
+        let mc = multiple(&c);
+        assert_eq!(mt(&mc, &["trials"]), 77.0);
+        assert_eq!(source(&mc), "flag");
+    }
+
+    #[test]
+    fn in_sample_window_deflates_by_the_search_trials() {
+        let (_scratch, dir) = scratch("fromrun2");
+        let data = write_data(&dir);
+        let run = write_run(&dir, BOOK_RUN);
+        let extra = ["--bootstrap", "100", "--allow-in-sample-windows"];
+        let (code, a, err) = wf_book(&data, &["--from-run", &run], IN_SAMPLE_WINDOW, &extra);
+        assert_eq!(code, 0, "{err}");
+        let m = multiple(&a);
+        assert_eq!(mt(&m, &["trials"]), 1000.0);
+        assert_eq!(source(&m), "run.candidates_evaluated");
+        assert!(mt(&m, &["dsr_at_n_eff", "sr0"]) > 0.0);
+        assert!(mt(&m, &["dsr_at_n_eff", "dsr"]) < mt(&m, &["psr", "dsr"]));
+        assert_eq!(mt(&m, &["psr", "sr0"]), 0.0);
+    }
+
+    #[test]
+    fn front_trials_follow_what_selected_on_the_scored_rows() {
         let (_scratch, dir) = scratch("trials");
         let data = write_data(&dir);
         let run = write_run(&dir, RUN);
         let (code, a, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--bootstrap", "100"]);
         assert_eq!(code, 0, "{err}");
-        assert!(a.contains("\"trials\":4321"), "{a}");
+        let m = multiple(&a);
+        assert_eq!(mt(&m, &["trials"]), 3.0);
+        assert_eq!(source(&m), "front_size");
+        let (code, a, err) = wf(&data, &["--front", &run], IN_SAMPLE_WINDOW, &["--bootstrap", "100", "--allow-in-sample-windows"]);
+        assert_eq!(code, 0, "{err}");
+        let m = multiple(&a);
+        assert_eq!(mt(&m, &["trials"]), 4321.0);
+        assert_eq!(source(&m), "run.candidates_evaluated");
         let (code, b, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--trials", "77", "--bootstrap", "100"]);
         assert_eq!(code, 0, "{err}");
-        assert!(b.contains("\"trials\":77"), "{b}");
+        let m = multiple(&b);
+        assert_eq!(mt(&m, &["trials"]), 77.0);
+        assert_eq!(source(&m), "flag");
+    }
+
+    #[test]
+    fn trials_fall_back_to_front_size() {
+        let (_scratch, dir) = scratch("fallback");
+        let data = write_data(&dir);
+        let no_count = [
+            ("--front", RUN.replace(r#""search":{"candidates_evaluated":4321},"#, "")),
+            ("--from-run", BOOK_RUN.replace(r#""search":{"candidates_evaluated":1000},"#, "")),
+        ];
+        for (flag, text) in &no_count {
+            let path = write_run(&dir, text);
+            for (window, extra) in [
+                (OK_WINDOW, vec!["--bootstrap", "100"]),
+                (IN_SAMPLE_WINDOW, vec!["--bootstrap", "100", "--allow-in-sample-windows"]),
+            ] {
+                let (code, out, err) = if *flag == "--from-run" { wf_book(&data, &[*flag, &path], window, &extra) } else { wf(&data, &[*flag, &path], window, &extra) };
+                assert_eq!(code, 0, "{flag} {window}: {err}");
+                let m = multiple(&out);
+                let in_sample = window == IN_SAMPLE_WINDOW;
+                let (n, s) = match (*flag, in_sample) {
+                    ("--from-run", false) => (1.0, "out_of_sample_book"),
+                    _ => (3.0, "front_size"),
+                };
+                assert_eq!(mt(&m, &["trials"]), n, "{flag} {window}");
+                assert_eq!(source(&m), s, "{flag} {window}");
+            }
+        }
+    }
+
+    #[test]
+    fn min_btl_years_in_report() {
+        let (_scratch, dir) = scratch("minbtl");
+        let data = write_data(&dir);
+        let run = write_run(&dir, RUN);
+        let (code, out, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--bootstrap", "100"]);
+        assert_eq!(code, 0, "{err}");
+        let j = Json::parse(out.trim()).unwrap();
+        let m = multiple(&out);
+        let sharpe_annual = num(&j, &["inference", "bootstrap", "sharpe_annual"]);
+        let want = rcsr::inference::min_btl_years(sharpe_annual, mt(&m, &["n_eff"]));
+        let got = m.get("min_btl_years").and_then(Json::as_f64);
+        if want.is_nan() {
+            assert!(got.is_none(), "{got:?}");
+        } else {
+            assert!((got.expect("min_btl_years") - want).abs() < 1e-12, "{got:?} vs {want}");
+        }
     }
 
     #[test]
@@ -894,8 +1034,7 @@ mod front {
 
         let no_count = write_run(&dir, &RUN.replace(r#""search":{"candidates_evaluated":4321},"#, ""));
         let (code, _, err) = wf(&data, &["--front", &no_count], OK_WINDOW, &[]);
-        assert_eq!(code, 2, "{err}");
-        assert!(err.contains("--trials"), "{err}");
+        assert_eq!(code, 0, "{err}");
         let (code, _, err) = wf(&data, &["--front", &no_count], OK_WINDOW, &["--trials", "10"]);
         assert_eq!(code, 0, "{err}");
 
