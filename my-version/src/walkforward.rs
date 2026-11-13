@@ -4353,7 +4353,10 @@ mod close_ledger_tests {
             if sum + (wall - sum) != wall {
                 inexact_sum += 1;
             }
+            let booked: Vec<u64> = [Stage::Io, Stage::Pnl, Stage::Fit].iter().map(|s| ledger.stage_s(*s).to_bits()).collect();
             close_ledger_at(&mut ledger, wall);
+            let after: Vec<u64> = [Stage::Io, Stage::Pnl, Stage::Fit].iter().map(|s| ledger.stage_s(*s).to_bits()).collect();
+            assert_eq!(booked, after, "set {set}: measured stages are untouched");
             assert_eq!(ledger.closure_residual().value, 0.0, "set {set}");
             assert_eq!(ledger.stage_sum_s(), ledger.wall_s(), "set {set}");
             assert!((ledger.wall_s() - wall).abs() <= wall * 2.3e-16, "set {set}: wall moved more than one ULP");
