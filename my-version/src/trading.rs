@@ -1160,16 +1160,22 @@ pub struct BlockedAlpha {
     pub block_alpha: Vec<f64>,
     /// Mean of `series`.
     pub pooled_alpha: f64,
-    /// Alpha of every distinct timestamp, in time order.
+    /// Alpha of every period bucket (every distinct timestamp without `period_seconds`), in time order.
     pub series: Vec<f64>,
     /// Position changes of the book.
     pub trades: usize,
+    /// Rows held long.
+    pub long_rows: usize,
+    /// Entries into a long position.
+    pub entries: usize,
 }
 
 /// Cut the usable rows into `blocks` runs of distinct timestamps and price the
 /// book against buy-and-hold of the same rows.
 ///
-/// Per timestamp the row means are taken, so every period weighs the same. In
+/// Per period the row means are taken, so every period weighs the same. A
+/// period is one timestamp, or one `floor(t / period_seconds)` bucket when the
+/// spec sets `period_seconds`; a bucket never straddles two blocks. In
 /// block `k`, `net_k` is the mean book net excess over the flat book,
 /// `exposure_k` the mean position and `bh_k` the mean buy-and-hold net excess
 /// (entry and exit costs included). A block without exposure has alpha 0.
@@ -1195,17 +1201,18 @@ pub fn blocked_alpha(
     let book = run_book(&ctx, &positions, cost_side);
     let flat = run_book(&ctx, &vec![0.0; n], cost_side);
     let held = run_book(&ctx, &vec![1.0; n], cost_side);
-    let ids = block_ids(&ctx.time, blocks)?;
+    let keys: Vec<f64> = if ctx.bucket > 0.0 { ctx.time.iter().map(|t| (t / ctx.bucket).floor()).collect() } else { ctx.time.clone() };
+    let ids = block_ids(&keys, blocks)?;
     let mut series_net: Vec<f64> = Vec::new();
     let mut series_pos: Vec<f64> = Vec::new();
     let mut series_bh: Vec<f64> = Vec::new();
     let mut series_block: Vec<usize> = Vec::new();
     let mut i = 0usize;
     while i < n {
-        let t = ctx.time[ctx.time_order[i]];
+        let t = keys[ctx.time_order[i]];
         let (mut net, mut pos, mut bh, mut count) = (0.0f64, 0.0f64, 0.0f64, 0usize);
         let block = ids[ctx.time_order[i]] as usize;
-        while i < n && ctx.time[ctx.time_order[i]] == t {
+        while i < n && keys[ctx.time_order[i]] == t {
             let row = ctx.time_order[i];
             net += book.net[row] - flat.net[row];
             pos += positions[row];
@@ -1248,6 +1255,8 @@ pub fn blocked_alpha(
         pooled_alpha,
         series,
         trades: book.stats.trades,
+        long_rows: book.stats.active,
+        entries: book.stats.entries,
     })
 }
 

@@ -1157,7 +1157,12 @@ CHECKPOINTS:
                              training and validation rows only
   --select-blocks <K>        validation blocks of robust, 1 to 8 (default 4)
   --select-se <Z>            one-standard-error multiple (default 1.0)
-  --select-block-len <L>     bootstrap block length in periods (default 21)
+  --select-block-len <L>     bootstrap block length in periods, at most half the
+                             validation periods (exit 2 above). Default per
+                             member: max(ceil(cbrt(T)), mean long hold) for T
+                             validation periods, capped at T/4. A period is one
+                             timestamp, or one floor(t / horizon) bucket under
+                             a label stride
   --select-require-edge      post-loop gate (#1026, not saved search state,
                              outside the config hash): a member whose training
                              fitness is not below 1 (no better than flat on
@@ -5912,7 +5917,7 @@ fn main() {
     let robust_params = rcsr::selection::RobustParams {
         blocks: select_blocks_arg.unwrap_or(rcsr::selection::RobustParams::default().blocks),
         se_z: select_se_arg.unwrap_or(rcsr::selection::RobustParams::default().se_z),
-        block_len: select_block_len_arg.unwrap_or(rcsr::selection::ROBUST_BLOCK_LEN),
+        block_len: select_block_len_arg,
     };
     if select_blocks_arg.is_some() || select_se_arg.is_some() || select_block_len_arg.is_some() {
         if select_rule != rcsr::selection::SelectRule::Robust {
@@ -11102,8 +11107,10 @@ OPTIONS:
   --block-len <L>            block length in periods (default
                              max(h, hold, n^(1/3))); must be >= max(h, hold)
   --null-draws <B>           draws of the hour-block permutation null and the
-                             matched-exposure random long/flat null (default 0
-                             = off); p = (1+count)/(B+1)
+                             matched-exposure shifted long/flat null (one
+                             circular shift per draw and window, shared by all
+                             symbols; p is null under 20 distinct shifts)
+                             (default 0 = off); p = (1+count)/(B+1)
   --trials <N>               total trials behind the candidates, the N of the
                              DSR (default: the candidate count)
   --protocol-seed <n>        seed of every bootstrap, null and SPA draw

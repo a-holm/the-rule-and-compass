@@ -607,8 +607,10 @@ Candidates are evaluated on the test periods with their own validation threshold
 ### Nulls (`--null-draws B`)
 
 * **Hour-block permutation**: within each test window the cross-sections of targets are permuted in blocks of `L` periods (the same permutation for all symbols); positions and costs stay fixed.
-* **Matched-exposure random long/flat**: the strategy's own long and flat runs shuffled inside each symbol (see Long-only controls), `B` times.
+* **Matched-exposure shifted long/flat**: one circular time shift per draw and window, shared by all symbols. Each symbol's long and flat series is rotated by the same fraction of the window (a joint period shift when every symbol has every period), so each symbol keeps its exposure and the symbols keep their timing relative to each other. The offset is drawn uniformly from `[lo, P - lo]` with `P` the periods of the window and `lo = min(L, P / 4)` (at least 1), so a draw is never the observed book inside its own holding time. Costs are priced on the shifted book, so a run cut by the wrap pays its flips. The report field is `inference.nulls.matched_exposure_random` with `scheme` (`"shared_circular_shift"`), `distinct_shifts` (the product over windows of `P - 2 lo + 1`, saturating), `p_mean`, `p_sharpe` and the 95 % quantiles. With fewer than 20 distinct shifts `p_mean` and `p_sharpe` are `null` (a p-value below 0.05 cannot be reached); the quantiles stay.
 * **Always-long**: the buy-and-hold series, reported without a p-value.
+
+Why the shift is shared: a market-wide signal is long in many symbols at the same hours, so the book return carries the common component of the returns. Shuffling each symbol alone removes that component and makes the null far too narrow (a true null was rejected 40 % of the time at 5 % in a simulation with 50 symbols and common share 0.5). Limits: the null assumes the return process is stationary inside a window, and it tests the timing given the book's own exposure path, not the exposure level. The per-window benchmark `matched_exposure_random_long` keeps the per-symbol shuffle and has no p-value.
 
 `p = (1 + #{null >= observed}) / (B + 1)` for the mean and for the per-period Sharpe. A search-budget null is `--null-block` in the search.
 
