@@ -643,7 +643,7 @@ fn select_block_len_above_half_the_series_is_refused() {
     let fx = fixture();
     let o = fx.rcsr(
         &fx.data,
-        &["--generations", "2", "--pop", "16", "--select-rule", "robust", "--select-block-len", "7", "--validation-frac", "0.04", "--no-dev-log"],
+        &["--generations", "2", "--pop", "16", "--select-rule", "robust", "--select-block-len", "7", "--validation-frac", "0.044", "--no-dev-log"],
     );
     assert_eq!(code(&o), 2, "{}", stderr(&o));
     let e = stderr(&o);
