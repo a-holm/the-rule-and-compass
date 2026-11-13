@@ -152,16 +152,27 @@ fn prune_tree(
         let workers = batch_workers(cfg.threads, cands.len(), fit.len());
         let scored = par_map(workers, cands, |c| {
             let mut t = c;
+            let before = (cfg.fit_accept == FitAccept::Fitness).then(|| expr::simplify_equal_branches(&t)); // #1078
             refit(&mut t, cfg, fit);
             let t = expr::simplify_equal_branches(&t);
-            let cost = cfg.complexity_model.complexity(&t);
-            let err = if cfg.accepts_dimensions(&t) {
-                score_tree(&t, data, cfg)
-            } else {
-                f64::INFINITY
+            let judge = |t: &Node| {
+                let cost = cfg.complexity_model.complexity(t);
+                let err = if cfg.accepts_dimensions(t) {
+                    score_tree(t, data, cfg)
+                } else {
+                    f64::INFINITY
+                };
+                (cost, err)
             };
+            let (cost, err) = judge(&t);
+            if let Some(before) = before.filter(|b| expr::structural_hash(b) != expr::structural_hash(&t)) {
+                let (before_cost, before_err) = judge(&before);
+                if unfitted_wins(before_err, err) {
+                    return (before, before_cost, before_err);
+                }
+            }
             (t, cost, err)
-        });
+        }); 
         let mut best: Option<usize> = None;
         for (i, (_, cost, err)) in scored.iter().enumerate() {
             if !(*err <= bound) || !(*cost < cur_cost) {

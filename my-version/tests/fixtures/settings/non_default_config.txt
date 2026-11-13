@@ -35,4 +35,5 @@ config adaptive_mix true
 config reject_constant_offspring true
 config reject_fixed_position true
 config fit_thresholds true
-config_hash 6eb8553a78de3f68
+config fit_accept fitness
+config_hash 113b736a19c3b7e0
