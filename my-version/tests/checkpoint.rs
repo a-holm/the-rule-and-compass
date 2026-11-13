@@ -2309,7 +2309,6 @@ fn a_killed_chunk_does_not_poison_the_search_backend() {
     assert_eq!(run.get("search_backend").and_then(|v| v.as_str()), Some("cpu"));
     let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
     assert_eq!(cumulative.get("backend").and_then(|v| v.as_str()), Some("cpu"));
-| Some(rcsr::devlog::Json::Null)), "{:?}", run.get("backend_reason"));
 }
 
 /// #1060: a sidecar already poisoned by an older binary (real example from
@@ -2329,8 +2328,8 @@ fn a_poisoned_sidecar_stays_unknown_on_resume() {
     cost_chunk(&dir, &csv, 1, true);
     let run = json_file(dir.join("run.json"));
     assert_eq!(run.get("search_backend").and_then(|v| v.as_str()), Some("unknown"));
-    let reason = run.get("backend_reason").and_then(|v| v.as_str()).expect("backend_reason");
-    assert!(reason.contains("the checkpoint sidecar records none"), "{reason}");
+    let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
+    assert_eq!(cumulative.get("backend").and_then(|v| v.as_str()), Some("unknown"));
     assert!(sidecar_text(&dir).contains("\"backend\":\"unknown\""));
 }
 
