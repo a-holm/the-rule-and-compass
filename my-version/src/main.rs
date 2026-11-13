@@ -12182,7 +12182,7 @@ fn run_walkforward(args: &[String]) -> ! {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") || e.starts_with("--periods-per-year") { EXIT_USAGE } else { EXIT_INPUT });
+            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") || e.starts_with("--periods-per-year") || e.starts_with("missing stride_seconds") { EXIT_USAGE } else { EXIT_INPUT });
         }
     };
     if spec.threshold_fixed.is_none() {

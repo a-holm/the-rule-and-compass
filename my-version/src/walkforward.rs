@@ -1744,7 +1744,7 @@ impl Accum {
         if let (true, None, Some(step)) = (opts.horizon_from_spec, opts.stride_seconds, min_group_step) {
             if step >= 2.0 * spec.horizon {
                 return Err(format!(
-                    "the target spec has horizon_seconds {} and no stride_seconds, but labelled test rows of one group are at least {} s apart: \
+                    "missing stride_seconds: the target spec has horizon_seconds {} and no stride_seconds, but labelled test rows of one group are at least {} s apart: \
                      one period per horizon would give a wrong periods_per_year; add \"stride_seconds\": {} to the spec \
                      (rcsr enrich writes it for a label with stride above the horizon)",
                     spec.horizon, step, step

@@ -380,7 +380,7 @@ fn wf_stride_unknown_above_horizon() {
     let (out, _) = run_cli_spec(&dir, 86_400, 3600, None, &[]);
     assert_eq!(code(&out), 2, "{}", stderr(&out));
     let msg = stderr(&out);
-    assert!(msg.contains("no stride_seconds") && msg.contains("86400"), "{msg}");
+    assert!(msg.contains("missing stride_seconds") && msg.contains("86400"), "{msg}");
     // without a spec the horizon flag keeps its behaviour
     let data = write_csv(&dir, 86_400, 60);
     let w = format!("w,{},{},{},{}", T0 as u64, T0 as u64 + 86_400 * 19, T0 as u64 + 86_400 * 20, T0 as u64 + 86_400 * 60);
