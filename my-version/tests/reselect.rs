@@ -621,7 +621,7 @@ fn rule_without_block_len(j: &Json) -> Json {
     )
 }
 
-const EXPLICIT_21_GOLDEN: &str = r#"GOLDEN"#;
+const EXPLICIT_21_GOLDEN: &str = r#"{"rule":"robust","blocks":4,"se_z":1,"block_len":21,"verdict":"selected","members":[{"archive_rank":1,"complexity":1,"trades":1,"block_alpha":[0,0,0,0],"pooled_alpha":0,"se":0,"eligible":false},{"archive_rank":2,"complexity":3,"trades":68,"block_alpha":[0.003448414357680999,0.00318745296680618,0.0034700610713886406,0.0032726717948161456],"pooled_alpha":0.0033438413032588696,"se":0.000031885123491145875,"eligible":true},{"archive_rank":3,"complexity":7,"trades":68,"block_alpha":[0.003448414357680999,0.0032716454183990304,0.0034700610713886406,0.0032726717948161456],"pooled_alpha":0.0033646529205065396,"se":0.000027725298681147136,"eligible":true}],"chosen_rank":2}"#;
 
 #[test]
 fn robust_explicit_block_len_unchanged() {
@@ -630,7 +630,6 @@ fn robust_explicit_block_len_unchanged() {
     let mut args = ROBUST.to_vec();
     args.extend_from_slice(&["--select-block-len", "21"]);
     ok(&fx.reselect("a", "b", &args));
-    { let t = std::fs::read_to_string(fx.path("b.run.json")).unwrap(); let i = t.find("\"selection_rule\"").unwrap(); eprintln!("DUMP {}", &t[i..i + 6000.min(t.len() - i)]); }
     let b = fx.run_json("b");
     let sel = at(&b, &["objective", "selection_rule"]);
     assert_eq!(at(sel, &["block_len"]).as_usize(), Some(21));

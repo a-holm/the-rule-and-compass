@@ -1201,7 +1201,7 @@ pub fn blocked_alpha(
     let book = run_book(&ctx, &positions, cost_side);
     let flat = run_book(&ctx, &vec![0.0; n], cost_side);
     let held = run_book(&ctx, &vec![1.0; n], cost_side);
-    let keys: Vec<f64> = ctx.time.clone();
+    let keys: Vec<f64> = if ctx.bucket > 0.0 { ctx.time.iter().map(|t| (t / ctx.bucket).floor()).collect() } else { ctx.time.clone() };
     let ids = block_ids(&keys, blocks)?;
     let mut series_net: Vec<f64> = Vec::new();
     let mut series_pos: Vec<f64> = Vec::new();
