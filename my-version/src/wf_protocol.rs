@@ -191,15 +191,12 @@ pub fn economics(i: &EconomicsInput) -> Economics {
 #[derive(Clone, Debug)]
 pub struct Multiple {
     pub trials: usize,
-    pub trials_source: &'static str,
     pub candidates: usize,
     pub participation_ratio: f64,
     pub n_eff: f64,
     pub t_used: f64,
-    pub psr: Dsr,
     pub dsr_n_eff: Dsr,
     pub dsr_10_n_eff: Dsr,
-    pub min_btl_years: f64,
     pub pbo: Option<Pbo>,
     pub pbo_error: Option<String>,
     pub p_values: Vec<f64>,
@@ -250,7 +247,6 @@ pub struct InferenceInput<'a> {
     /// One column per candidate on the strategy's periods.
     pub candidates: &'a [Vec<f64>],
     pub trials: usize,
-    pub trials_source: &'static str,
     pub pbo_blocks: usize,
     pub fdr_q: f64,
     pub best_baseline: &'a str,
@@ -310,15 +306,12 @@ pub fn infer(i: &InferenceInput) -> Result<Inference, String> {
         out.bootstrap = Some(summary.clone());
         out.multiple = Some(Multiple {
             trials,
-            trials_source: i.trials_source,
             candidates: k.max(1),
             participation_ratio: pr,
             n_eff,
             t_used,
-            psr: inference::deflated_sharpe(sr, t_used, skew, kurt, 1.0, var_sr),
             dsr_n_eff: inference::deflated_sharpe(sr, t_used, skew, kurt, n_eff, var_sr),
             dsr_10_n_eff: inference::deflated_sharpe(sr, t_used, skew, kurt, 10.0 * n_eff, var_sr),
-            min_btl_years: inference::min_btl_years(sr * i.periods_per_year.sqrt(), n_eff),
             pbo,
             pbo_error,
             bh: inference::bh_fdr(&p_values, i.fdr_q),
@@ -736,19 +729,16 @@ impl Inference {
                 )
             });
             format!(
-                "{{\"trials\":{},\"n_trials_source\":{},\"candidates\":{},\"participation_ratio\":{},\"n_eff\":{},\
-                 \"t_used\":{},\"psr\":{},\"dsr_at_n_eff\":{},\"dsr_at_10_n_eff\":{},\"min_btl_years\":{},\"pbo\":{},\"pbo_error\":{},\
+                "{{\"trials\":{},\"candidates\":{},\"participation_ratio\":{},\"n_eff\":{},\
+                 \"t_used\":{},\"dsr_at_n_eff\":{},\"dsr_at_10_n_eff\":{},\"pbo\":{},\"pbo_error\":{},\
                  \"p_values\":[{}],\"bh_fdr\":{{\"q\":{},\"rejected\":{},\"adjusted\":[{}]}}}}",
                 m.trials,
-                jstr(m.trials_source),
                 m.candidates,
                 jnum(m.participation_ratio),
                 jnum(m.n_eff),
                 jnum(m.t_used),
-                dsr_json(&m.psr),
                 dsr_json(&m.dsr_n_eff),
                 dsr_json(&m.dsr_10_n_eff),
-                jnum(m.min_btl_years),
                 pbo,
                 m.pbo_error.as_ref().map_or("null".to_string(), |e| jstr(e)),
                 m.p_values.iter().map(|v| jnum(*v)).collect::<Vec<_>>().join(","),
@@ -822,17 +812,15 @@ impl Inference {
         }
         if let Some(m) = &self.multiple {
             s.push_str(&format!(
-                "Trials N = {} (source {}) over {} candidate(s); participation ratio {}, N_eff {}; T used {}.{}\n\n",
+                "Trials N = {} over {} candidate(s); participation ratio {}, N_eff {}; T used {}.\n\n",
                 m.trials,
-                m.trials_source,
                 m.candidates,
                 f(m.participation_ratio),
                 f(m.n_eff),
-                f(m.t_used),
-                if m.trials_source == "out_of_sample_book" { " Deflate across runs with rcsr trials." } else { "" }
+                f(m.t_used)
             ));
             s.push_str("| DSR at | N | SR0 | DSR | Sharpe/period | skew | kurtosis | T |\n|---|---|---|---|---|---|---|---|\n");
-            for (name, d) in [("PSR (N = 1)", &m.psr), ("N_eff", &m.dsr_n_eff), ("10 N_eff", &m.dsr_10_n_eff)] {
+            for (name, d) in [("N_eff", &m.dsr_n_eff), ("10 N_eff", &m.dsr_10_n_eff)] {
                 s.push_str(&format!(
                     "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
                     name,
