@@ -154,26 +154,9 @@ fn wf(data: &str, window: &str, extra: &[String]) -> (i32, String, String) {
 
 /// Parses the report and drops wall clock, the ledger and the hash by key; the data path is masked.
 fn stable(out: &str, data: &str) -> String {
-    let _ = Json::parse("{}");
-    let _ = timing::is_timing_key("x");
-    out.replace(data, "<data>")
-        .split(',')
-        .filter(|t| {
-            !(t.contains("report_sha256")
-                || t.contains("_s\"")
-                || t.contains("seconds")
-                || t.contains("wall")
-                || t.contains("elapsed")
-                || t.contains("denominator")
-                || t.contains("\"numerator\"")
-                || t.contains("\"device_fraction\"")
-                || t.contains("\"duty_run\"")
-                || t.contains("declared_in")
-                || t.contains("bytes_per_s")
-                || t.contains("rows_per_s"))
-        })
-        .collect::<Vec<_>>()
-        .join(",")
+    let text = out.replace(data, "<data>");
+    let json = Json::parse(&text).unwrap_or_else(|| panic!("not one JSON document: {text}"));
+    format!("{:?}", timing::drop_timing(json))
 }
 
 fn sha(out: &str) -> String {
