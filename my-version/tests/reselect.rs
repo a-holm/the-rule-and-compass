@@ -630,6 +630,7 @@ fn robust_explicit_block_len_unchanged() {
     let mut args = ROBUST.to_vec();
     args.extend_from_slice(&["--select-block-len", "21"]);
     ok(&fx.reselect("a", "b", &args));
+    { let t = std::fs::read_to_string(fx.path("b.run.json")).unwrap(); let i = t.find("\"selection_rule\"").unwrap(); eprintln!("DUMP {}", &t[i..i + 6000.min(t.len() - i)]); }
     let b = fx.run_json("b");
     let sel = at(&b, &["objective", "selection_rule"]);
     assert_eq!(at(sel, &["block_len"]).as_usize(), Some(21));
@@ -643,7 +644,7 @@ fn select_block_len_above_half_the_series_is_refused() {
     let fx = fixture();
     let o = fx.rcsr(
         &fx.data,
-        &["--generations", "2", "--pop", "16", "--select-rule", "robust", "--select-block-len", "7", "--validation-frac", "0.03", "--no-dev-log"],
+        &["--generations", "2", "--pop", "16", "--select-rule", "robust", "--select-block-len", "7", "--validation-frac", "0.04", "--no-dev-log"],
     );
     assert_eq!(code(&o), 2, "{}", stderr(&o));
     let e = stderr(&o);
