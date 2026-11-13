@@ -104,6 +104,17 @@ impl Membership {
     pub fn rebalances(&self) -> &[i64] {
         &self.as_of
     }
+
+    /// The decisions whose instant lies outside `range`, for the summaries a
+    /// lock record guards (#1130).
+    pub fn without_range(&self, range: &Lockbox) -> Membership {
+        let rows: Vec<MembershipRow> = self.rows.iter().filter(|r| !range.contains(r.as_of)).cloned().collect();
+        Membership {
+            as_of: self.as_of.iter().copied().filter(|t| !range.contains(*t)).collect(),
+            selected: rows.iter().filter(|r| r.member).map(|r| r.symbol.clone()).collect(),
+            rows,
+        }
+    }
 }
 
 /// A symbol/bar pair before the panel table is built.
@@ -143,6 +154,20 @@ impl Panel {
         self.rows.retain(|r| {
             start.map_or(true, |s| r.bar.time >= s) && end.map_or(true, |e| r.bar.time < e)
         });
+        self.summarize();
+    }
+
+    /// This panel without the rows inside `range`, with the summary fields
+    /// recomputed (#1130).
+    pub fn without_range(&self, range: &Lockbox) -> Panel {
+        let mut p = self.clone();
+        p.rows.retain(|r| !range.contains(r.bar.time));
+        p.summarize();
+        p
+    }
+
+    /// Recompute the summary fields of the retained rows.
+    fn summarize(&mut self) {
         // Rows are ordered by time, so the last write per symbol is its latest
         // bar; borrowing the symbol avoids 4.7M string clones on a big panel.
         let mut last: BTreeMap<&str, i64> = BTreeMap::new();
@@ -1072,13 +1097,50 @@ pub fn write_panel_panel_hashed(
     allow_lockbox: bool,
     snapshot: Option<&str>,
 ) -> Result<String, String> {
+    write_panel_panel_hashed_locked(out, panel, membership, inputs, first_sha256, group_rows, allow_lockbox, snapshot, None)
+}
+
+/// [`write_panel_panel_hashed`] with a lock record: the store keeps every row and the manifest
+/// summarises the rows outside the record's range only (#1130). A snapshot with an entry
+/// inside the range is refused.
+pub fn write_panel_panel_hashed_locked(
+    out: &str,
+    panel: &Panel,
+    membership: &Membership,
+    inputs: &[&str],
+    first_sha256: &str,
+    group_rows: usize,
+    allow_lockbox: bool,
+    snapshot: Option<&str>,
+    record: Option<&crate::lockrec::LockRecord>,
+) -> Result<String, String> {
+    if let (Some(rec), Some(text)) = (record, snapshot) {
+        crate::lockrec::refuse_snapshot(text, rec)?;
+    }
     let table = panel_table(panel);
     store::write_store_with_time(out, &table, group_rows, Some(0))?;
     let mut known: BTreeMap<String, String> = BTreeMap::new();
     if let Some(first) = inputs.first() {
         known.insert((*first).to_string(), first_sha256.to_string());
     }
-    let text = provenance_json_with(inputs, &known, membership, panel, out, allow_lockbox, snapshot);
+    let text = match record {
+        Some(rec) => {
+            let dev = panel.without_range(&rec.range);
+            let kept = membership.without_range(&rec.range);
+            provenance_json_locked(
+                inputs,
+                &known,
+                &kept,
+                &dev,
+                out,
+                allow_lockbox,
+                snapshot,
+                &crate::lockbox::guarded_range(None),
+                Some((rec, panel.rows.len() - dev.rows.len())),
+            )
+        }
+        None => provenance_json_with(inputs, &known, membership, panel, out, allow_lockbox, snapshot),
+    };
     let manifest_path = format!("{}.manifest.json", out);
     std::fs::write(&manifest_path, text).map_err(|e| format!("{}: {}", manifest_path, e))?;
     Ok(manifest_path)
@@ -1137,6 +1199,22 @@ pub fn provenance_json_boxed(
     allow_lockbox: bool,
     snapshot: Option<&str>,
     lb: &Lockbox,
+) -> String {
+    provenance_json_locked(inputs, known, membership, panel, output, allow_lockbox, snapshot, lb, None)
+}
+
+/// [`provenance_json_boxed`] for a panel summarised without a lock record's range: `membership` and
+/// `panel` already leave it out, and `record` carries the record with the number of rows left out (#1130).
+pub fn provenance_json_locked(
+    inputs: &[&str],
+    known: &BTreeMap<String, String>,
+    membership: &Membership,
+    panel: &Panel,
+    output: &str,
+    allow_lockbox: bool,
+    snapshot: Option<&str>,
+    lb: &Lockbox,
+    record: Option<(&crate::lockrec::LockRecord, usize)>,
 ) -> String {
     let mut s = String::from("{\n");
     let _ = writeln!(s, "  \"tool\":\"rcsr panel\",");
@@ -1209,6 +1287,9 @@ pub fn provenance_json_boxed(
     // for provenance; the flag says whether an explicit final test permitted
     // it, and `evaluated` stays false because building is not scoring.
     let overlap = lb.overlap(panel.rows.iter().map(|r| r.bar.time));
+    if let Some((rec, left_out)) = record {
+        let _ = writeln!(s, "  \"lock_record\":{},", rec.declaration_json(left_out));
+    }
     let _ = writeln!(
         s,
         "  \"lockbox\":{},",
@@ -1619,6 +1700,7 @@ pub fn run(args: &[String]) -> ! {
     let mut resume: Option<String> = None;
     let mut membership_cache: Option<String> = None;
     let mut snapshot_path: Option<String> = None;
+    let mut lock_record: Option<String> = None;
     let mut strict = false;
     let mut relists: Vec<(String, i64)> = Vec::new();
     let mut jump_factor = 5.0f64;
@@ -1712,6 +1794,10 @@ pub fn run(args: &[String]) -> ! {
             }
             "--snapshot" => {
                 snapshot_path = Some(val(i));
+                i += 1;
+            }
+            "--lock-record" => {
+                lock_record = Some(val(i));
                 i += 1;
             }
             other => {
@@ -1880,7 +1966,11 @@ pub fn run(args: &[String]) -> ! {
                 None => None,
             };
             let out = out.unwrap_or_else(|| "panel.rcsb".to_string());
-            match write_panel_panel_hashed(
+            let record = lock_record.as_deref().map(crate::lockrec::LockRecord::load).transpose().unwrap_or_else(|e| {
+                eprintln!("error: {}", e.message);
+                std::process::exit(e.exit);
+            });
+            match write_panel_panel_hashed_locked(
                 &out,
                 &panel,
                 &m,
@@ -1889,6 +1979,7 @@ pub fn run(args: &[String]) -> ! {
                 group_rows,
                 allow_lockbox,
                 snapshot_text.as_deref(),
+                record.as_ref(),
             ) {
                 Ok(manifest) => eprintln!(
                     "panel build: {} rows, {} symbols, {} delisted, {} gaps -> {} (manifest {})",
@@ -2102,6 +2193,19 @@ BUILD / AUDIT:
                           half-open) in <out>.manifest.json and <out>.schema.json;
                           append and enrich copy it, and the search, walkforward,
                           ladder and ablation score refuse it
+  --lock-record <PATH>    snapshot, base, build, validate, schema, append: a campaign lock
+                          record (range.start_epoch, range.end_epoch, range.end_exclusive
+                          true; #1130). The store keeps every row; the sidecars (snapshot.json,
+                          the manifests, the schema) summarise only rows outside the range:
+                          per-year counts, rebalances, per-symbol and per-file extents, quality
+                          counts, relist dates and column availability. Archives wholly inside
+                          the range leave the snapshot; each sidecar carries a lock_record object
+                          with rows_left_out. base writes the raw ledger counts that cannot be
+                          split by time (input_rows, unique_rows, duplicate_rows,
+                          identical_collapsed, partial_dropped) as null and the unit histogram
+                          empty. build refuses a --snapshot with an entry inside the range;
+                          validate counts per-year rows outside the range. A record that does
+                          not parse exits 2. Check sidecars with `rcsr lock check`
   --resume <dir>          resumable build: one atomic binary part per symbol,
                           keyed by the store SHA-256, the membership decisions
                           and the settings; a fully warm re-run reads the parts

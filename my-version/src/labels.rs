@@ -726,6 +726,8 @@ pub struct LabelReport {
     /// The declared locked test the statistics leave out, with the number of
     /// valid rows left out. `None` when no range applies.
     pub locked_test: Option<LockedLeftOut>,
+    /// The second declared range, reported only when a lock record supplied it.
+    pub locked_also: Option<LockedLeftOut>,
     pub label_hash: String,
 }
 
@@ -767,6 +769,7 @@ struct Tally {
     uniqueness_sum: f64,
     top: Vec<TopMove>,
     left_out: usize,
+    left_out_also: usize,
     weight_norm_rows: usize,
     tail_rows: usize,
 }
@@ -793,6 +796,7 @@ impl Tally {
         self.action_long += other.action_long;
         self.uniqueness_sum += other.uniqueness_sum;
         self.left_out += other.left_out;
+        self.left_out_also += other.left_out_also;
         self.weight_norm_rows += other.weight_norm_rows;
         self.tail_rows += other.tail_rows;
         self.top.extend(other.top);
@@ -800,7 +804,7 @@ impl Tally {
         self.top.truncate(TOP_MOVES);
     }
 
-    fn into_report(mut self, spec: &LongLabelSpec, range: Option<Lockbox>, label_hash: String) -> LabelReport {
+    fn into_report(mut self, spec: &LongLabelSpec, range: Option<Lockbox>, also: Option<Lockbox>, label_hash: String) -> LabelReport {
         let nv = self.fwd.len();
         self.fwd.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mean_abs = if nv == 0 { f64::NAN } else { self.fwd.iter().map(|v| v.abs()).sum::<f64>() / nv as f64 };
@@ -837,6 +841,7 @@ impl Tally {
             purge_rows_per_symbol: spec.purge_rows(),
             tail_rows_without_label: self.tail_rows,
             locked_test: range.map(|range| LockedLeftOut { range, rows_left_out: self.left_out }),
+            locked_also: also.map(|range| LockedLeftOut { range, rows_left_out: self.left_out_also }),
             label_hash,
         }
     }
@@ -875,6 +880,11 @@ impl LongLabels {
     }
 
     fn tally(&self, symbol: Option<&str>, keep: &dyn Fn(i64) -> bool) -> Tally {
+        self.tally_with(symbol, keep, None)
+    }
+
+    /// `tally`, also counting the finite rows `also_keep` refuses.
+    fn tally_with(&self, symbol: Option<&str>, keep: &dyn Fn(i64) -> bool, also_keep: Option<&dyn Fn(i64) -> bool>) -> Tally {
         let rows = self.fwd.len();
         let finite = (0..rows).filter(|&t| self.fwd[t].is_finite()).count();
         let valid: Vec<usize> = (0..rows).filter(|&t| self.fwd[t].is_finite() && keep(self.time[t])).collect();
@@ -897,6 +907,7 @@ impl LongLabels {
             uniqueness_sum: valid.iter().map(|&t| self.uniqueness[t]).sum(),
             top,
             left_out: finite - valid.len(),
+            left_out_also: also_keep.map_or(0, |k| (0..rows).filter(|&t| self.fwd[t].is_finite() && !k(self.time[t])).count()),
             weight_norm_rows: self.weight_norm_rows,
             tail_rows: rows.min(self.spec.horizon_bars + self.spec.delay_bars),
         }
@@ -904,7 +915,7 @@ impl LongLabels {
 
     /// Report of this one series. Top moves carry no symbol.
     pub fn report(&self) -> LabelReport {
-        self.tally(None, &|_| true).into_report(&self.spec, None, self.label_hash())
+        self.tally(None, &|_| true).into_report(&self.spec, None, None, self.label_hash())
     }
 }
 
@@ -917,6 +928,7 @@ pub struct LabelAccumulator {
     range: Option<Lockbox>,
     also: Option<Lockbox>,
     embargo: i64,
+    report_also: bool,
     tally: Tally,
     chain: Vec<u8>,
 }
@@ -930,12 +942,18 @@ impl LabelAccumulator {
     /// before its start, or inside it) are left out of every statistic. The
     /// label hash still covers every row.
     pub fn with_range(spec: &LongLabelSpec, range: Option<Lockbox>) -> Self {
-        LabelAccumulator { spec: spec.clone(), range, also: None, embargo: 0, tally: Tally::default(), chain: spec.canonical().into_bytes() }
+        LabelAccumulator { spec: spec.clone(), range, also: None, embargo: 0, report_also: false, tally: Tally::default(), chain: spec.canonical().into_bytes() }
     }
 
     /// A second range left out the same way.
     pub fn with_also(mut self, also: Option<Lockbox>) -> Self {
         self.also = also;
+        self
+    }
+
+    /// Report the rows the second range alone leaves out (`locked_test_also`).
+    pub fn with_also_reported(mut self) -> Self {
+        self.report_also = true;
         self
     }
 
@@ -966,7 +984,9 @@ impl LabelAccumulator {
     pub fn add(&mut self, symbol: &str, labels: &LongLabels) {
         let symbol = (!symbol.is_empty()).then_some(symbol);
         let keep = self.keep_fn();
-        self.tally.merge(labels.tally(symbol, &keep));
+        let (purge, embargo) = (self.spec.purge_seconds(), self.embargo);
+        let also_keep = self.also.filter(|_| self.report_also).map(|r| move |t: i64| !r.reaches(t, purge, embargo));
+        self.tally.merge(labels.tally_with(symbol, &keep, also_keep.as_ref().map(|k| k as &dyn Fn(i64) -> bool)));
         self.chain.extend_from_slice(symbol.unwrap_or("").as_bytes());
         self.chain.push(0);
         self.chain.extend_from_slice(labels.label_hash().as_bytes());
@@ -974,7 +994,7 @@ impl LabelAccumulator {
 
     pub fn finish(self) -> LabelReport {
         let hash = sha256_hex(&self.chain);
-        self.tally.into_report(&self.spec, self.range, hash)
+        self.tally.into_report(&self.spec, self.range, self.also.filter(|_| self.report_also), hash)
     }
 }
 
@@ -1013,6 +1033,19 @@ impl LabelReport {
                 )
             })
             .unwrap_or_default();
+        let locked = format!(
+            "{}{}",
+            locked,
+            self.locked_also
+                .map(|l| format!(
+                    ",\"locked_test_also\":{{\"start_date\":{},\"end_date\":{},\"purge_seconds\":{},\"rows_left_out\":{}}}",
+                    text(&crate::lockbox::date(l.range.start)),
+                    text(&crate::lockbox::date(l.range.end)),
+                    self.purge_seconds,
+                    l.rows_left_out
+                ))
+                .unwrap_or_default()
+        );
         format!(
             "{{\"version\":{},\"name\":{},\"long_only\":true,\"rows\":{},\"valid_rows\":{},\"barrier_rows\":{},\"stride_rows\":{},\"exits\":{{\"profit\":{},\"stop\":{},\"vertical\":{}}},\"action_long_share\":{},\"clipped_share\":{},\"sign_share\":{{\"positive\":{},\"negative\":{},\"zero\":{}}},\"fwd_mean\":{},\"fwd_quantiles\":{{{}}},\"cost_to_move\":{},\"top_abs_moves\":{{\"n\":{},\"moves\":[{}]}},\"average_uniqueness\":{},\"effective_n\":{},\"effective_n_hours\":{},\"weight_norm_rows\":{},\"purge_seconds\":{},\"stride\":{}{},\"purge_rows_per_symbol\":{},\"tail_rows_without_label\":{}{},\"label_hash\":{}}}",
             text(VERSION),

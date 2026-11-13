@@ -156,6 +156,9 @@ struct Decoded {
     rows: Vec<Raw>,
     invalid: Vec<InvalidBar>,
     units: [usize; 3],
+    /// Rows inside this range are counted in `left_out` and read no further (a lock record).
+    exclude: Option<Lockbox>,
+    left_out: usize,
 }
 
 fn unit_of(raw: i64) -> (i64, u8) {
@@ -211,6 +214,10 @@ fn decode_text(name: &str, symbol: &str, text: &str, out: &mut Decoded) -> Resul
             .or_else(|_| f[0].parse::<f64>().map(|v| v as i64))
             .map_err(|_| format!("{}:{}: bad timestamp '{}'", name, i + 1, f[0]))?;
         let (time, unit) = unit_of(raw_t);
+        if out.exclude.is_some_and(|r| r.contains(time)) {
+            out.left_out += 1;
+            continue;
+        }
         out.units[unit as usize] += 1;
         let (o, h, l, c) = (num(1)?, num(2)?, num(3)?, num(4)?);
         if let Some(reason) = ohlc_defect(o, h, l, c) {
@@ -244,8 +251,12 @@ fn decode_text(name: &str, symbol: &str, text: &str, out: &mut Decoded) -> Resul
 }
 
 fn decode_bytes(path: &Path, symbol: &str, bytes: Vec<u8>) -> Result<Decoded, String> {
+    decode_bytes_excluding(path, symbol, bytes, None)
+}
+
+fn decode_bytes_excluding(path: &Path, symbol: &str, bytes: Vec<u8>, exclude: Option<Lockbox>) -> Result<Decoded, String> {
     let name = path.display().to_string();
-    let mut out = Decoded::default();
+    let mut out = Decoded { exclude, ..Decoded::default() };
     let is_zip = path
         .extension()
         .and_then(|e| e.to_str())
@@ -368,9 +379,10 @@ struct FileScan {
     duplicate_rows: usize,
     duplicate_conflicts: usize,
     invalid: Vec<InvalidBar>,
+    left_out: usize,
 }
 
-fn scan_file(root: &Path, src: &prep::Source) -> Result<FileScan, String> {
+fn scan_file(root: &Path, src: &prep::Source, exclude: Option<Lockbox>) -> Result<FileScan, String> {
     let bytes = std::fs::read(&src.path).map_err(|e| format!("{}: {}", src.path.display(), e))?;
     let meta = std::fs::metadata(&src.path).map_err(|e| format!("{}: {}", src.path.display(), e))?;
     let mtime = meta
@@ -382,7 +394,7 @@ fn scan_file(root: &Path, src: &prep::Source) -> Result<FileScan, String> {
     let sha256 = manifest::sha256_hex(&bytes);
     let size = bytes.len() as u64;
     let rel = relative(root, &src.path);
-    let mut dec = decode_bytes(&src.path, &src.symbol, bytes)?;
+    let mut dec = decode_bytes_excluding(&src.path, &src.symbol, bytes, exclude)?;
     for b in &mut dec.invalid {
         b.path = rel.clone();
     }
@@ -421,6 +433,7 @@ fn scan_file(root: &Path, src: &prep::Source) -> Result<FileScan, String> {
         duplicate_rows,
         duplicate_conflicts,
         invalid: dec.invalid,
+        left_out: dec.left_out,
     })
 }
 
@@ -437,12 +450,29 @@ pub fn snapshot_text(input: &str, jobs: usize) -> Result<String, String> {
 /// `snapshot_text` restricted to a pinned symbol universe. The file hash and
 /// the kept, dropped, missing and empty symbols go into a `universe` block.
 pub fn snapshot_text_with(input: &str, jobs: usize, symbols: Option<&SymbolList>) -> Result<String, String> {
+    snapshot_text_locked(input, jobs, symbols, None)
+}
+
+/// `snapshot_text_with` that leaves the rows inside the range of a lock record out of every
+/// entry. An archive with no row outside the range has no entry (#1130).
+pub fn snapshot_text_locked(
+    input: &str,
+    jobs: usize,
+    symbols: Option<&SymbolList>,
+    record: Option<&crate::lockrec::LockRecord>,
+) -> Result<String, String> {
     let root = PathBuf::from(input);
     let (sources, universe) = discover(input, symbols)?;
-    let scans = parallel(sources, jobs, |s| scan_file(&root, &s))?;
+    let exclude = record.map(|r| r.range);
+    let mut scans = parallel(sources, jobs, |s| scan_file(&root, &s, exclude))?;
+    let left_out: usize = scans.iter().map(|f| f.left_out).sum();
+    scans.retain(|f| !(f.rows == 0 && f.left_out > 0));
     let lb = crate::lockbox::guarded_range(None);
     let mut s = String::from("{\n");
     let _ = writeln!(s, "  \"tool\":\"rcsr panel snapshot\",\n  \"source\":\"local archive\",\n  \"network\":false,");
+    if let Some(r) = record {
+        let _ = writeln!(s, "  \"lock_record\":{},", r.declaration_json(left_out));
+    }
     let total_bytes: u64 = scans.iter().map(|f| f.bytes).sum();
     let symbols: BTreeSet<&str> = scans.iter().map(|f| f.symbol.as_str()).collect();
     let lockbox_rows: usize = 0;
@@ -615,6 +645,8 @@ pub struct BaseOptions {
     pub locked_test: crate::lockbox::Keep,
     /// `--retired RECORD`, written to the manifest of the base store.
     pub retired: Option<String>,
+    /// `--lock-record PATH`: the manifest summarises only rows outside the record's range.
+    pub lock_record: Option<crate::lockrec::LockRecord>,
 }
 
 impl BaseOptions {
@@ -632,6 +664,7 @@ impl BaseOptions {
             symbols: None,
             locked_test: crate::lockbox::Keep::Unset,
             retired: None,
+            lock_record: None,
         }
     }
 }
@@ -1358,48 +1391,79 @@ fn base_manifest(
     route: &DeviceRoute,
     universe: Option<&Universe>,
 ) -> String {
+    // With a lock record every count is over the rows outside its range. The raw ledger counts and the
+    // unit histogram cannot be split by time and are left out (null, empty).
+    let rec = opts.lock_record.as_ref();
+    let locked = rec.is_some();
+    let keep = |t: i64| !rec.is_some_and(|r| r.range.contains(t));
+    let dev_symbols: Vec<&str> = syms.iter().filter(|s| s.rows.iter().any(|r| keep(r.time))).map(|s| s.symbol.as_str()).collect();
+    let inputs: Vec<&(String, String, u64)> = inputs
+        .iter()
+        .filter(|(p, _, _)| {
+            !rec.is_some_and(|r| {
+                let name = Path::new(p).file_name().and_then(|n| n.to_str()).unwrap_or("");
+                month_of_name(Path::new(p)).is_some_and(|(a, b)| a >= r.range.start && b <= r.range.end)
+                    || !dev_symbols.iter().any(|s| name.starts_with(&format!("{s}-")))
+            })
+        })
+        .collect();
     let mut input_rows = 0usize;
     let mut unique_rows = 0usize;
     let mut partial_dropped = 0usize;
     let mut partial_kept = 0usize;
     let mut zero_volume = 0usize;
     let mut rows_out = 0usize;
+    let mut rows_left_out = 0usize;
+    let mut symbols_out = 0usize;
     let mut cov = [0usize; 5];
     let mut conflicts = Vec::new();
     let mut invalid = Vec::new();
     let mut units = Vec::new();
+    let mut conflict_n = 0usize;
+    let mut conflict_rows = 0usize;
+    let mut invalid_n = 0usize;
     for s in syms {
         let l = &s.ledger;
-        input_rows += l.input_rows;
-        unique_rows += l.unique_rows;
-        partial_dropped += l.partial_dropped;
-        partial_kept += l.partial_kept;
-        zero_volume += l.zero_volume;
-        rows_out += s.rows.len();
-        for r in &s.rows {
-            cov[(r.cov15m as usize).min(4)] += 1;
+        if !locked {
+            input_rows += l.input_rows;
+            unique_rows += l.unique_rows;
+            partial_dropped += l.partial_dropped;
+            partial_kept += l.partial_kept;
+            zero_volume += l.zero_volume;
+            units.push(format!("{{\"symbol\":{},\"units\":{}}}", jstr(&s.symbol), units_json(&l.units)));
         }
-        for (t, len) in &l.conflicts {
+        let mut kept = 0usize;
+        for r in s.rows.iter().filter(|r| keep(r.time)) {
+            kept += 1;
+            cov[(r.cov15m as usize).min(4)] += 1;
+            if locked {
+                zero_volume += usize::from(!r.traded);
+                partial_kept += usize::from(r.flags & FLAG_PARTIAL_BUCKET != 0);
+            }
+        }
+        rows_out += kept;
+        rows_left_out += s.rows.len() - kept;
+        symbols_out += usize::from(kept > 0 || !locked);
+        for (t, len) in l.conflicts.iter().filter(|(t, _)| keep(*t)) {
+            conflict_n += 1;
+            conflict_rows += *len as usize - 1;
             conflicts.push(format!("{{\"symbol\":{},\"ts\":{},\"date\":{},\"rows\":{}}}", jstr(&s.symbol), t, jstr(&date(*t)), len));
         }
-        for b in &l.invalid {
+        for b in l.invalid.iter().filter(|b| keep(b.time)) {
+            invalid_n += 1;
             invalid.push(format!(
                 "{{\"symbol\":{},\"path\":{},\"ts\":{},\"reason\":{},\"open\":{},\"high\":{},\"low\":{},\"close\":{}}}",
                 jstr(&b.symbol), jstr(&b.path), b.time, jstr(b.reason), b.open, b.high, b.low, b.close
             ));
         }
-        units.push(format!("{{\"symbol\":{},\"units\":{}}}", jstr(&s.symbol), units_json(&l.units)));
     }
-    let duplicate_rows = input_rows - unique_rows;
-    let conflict_rows: usize = syms
-        .iter()
-        .flat_map(|s| s.ledger.conflicts.iter())
-        .map(|(_, len)| *len as usize - 1)
-        .sum();
-    let invalid_n: usize = syms.iter().map(|s| s.ledger.invalid.len()).sum();
-    let conflict_n: usize = syms.iter().map(|s| s.ledger.conflicts.len()).sum();
+    let duplicate_rows = input_rows.saturating_sub(unique_rows);
+    let raw = |v: usize| if locked { "null".to_string() } else { v.to_string() };
     let mut s = String::from("{\n");
     let _ = writeln!(s, "  \"tool\":\"rcsr panel base\",\n  \"schema\":\"panel-base-1\",");
+    if let Some(r) = rec {
+        let _ = writeln!(s, "  \"lock_record\":{},", r.declaration_json(rows_left_out));
+    }
     let _ = writeln!(
         s,
         "  \"resample\":{{\"in_step\":{},\"out_step\":{},\"require_full_bucket\":{},\"keep_partial\":{}}},",
@@ -1427,17 +1491,17 @@ fn base_manifest(
     let _ = writeln!(
         s,
         "  \"quality\":{{\"input_rows\":{},\"unique_rows\":{},\"duplicate_rows\":{},\"identical_collapsed\":{},\"duplicate_conflicts\":{},\"invalid_ohlc\":{},\"partial_dropped\":{},\"partial_kept\":{},\"zero_volume\":{},\"rows_out\":{},\"symbols\":{},\"cov15m\":[{},{},{},{},{}]}},",
-        input_rows,
-        unique_rows,
-        duplicate_rows,
-        duplicate_rows - conflict_rows,
+        raw(input_rows),
+        raw(unique_rows),
+        raw(duplicate_rows),
+        raw(duplicate_rows.saturating_sub(conflict_rows)),
         conflict_n,
         invalid_n,
-        partial_dropped,
+        raw(partial_dropped),
         partial_kept,
         zero_volume,
         rows_out,
-        syms.len(),
+        symbols_out,
         cov[0],
         cov[1],
         cov[2],
@@ -1482,6 +1546,8 @@ pub struct PanelOptions {
     pub outage_share: f64,
     pub outage_min_symbols: usize,
     pub gpu: GpuMode,
+    /// `--lock-record PATH`: the manifest and the schema summarise only rows outside its range.
+    pub lock_record: Option<crate::lockrec::LockRecord>,
 }
 
 impl PanelOptions {
@@ -1501,6 +1567,7 @@ impl PanelOptions {
             outage_share: 0.5,
             outage_min_symbols: 3,
             gpu: GpuMode::Auto,
+            lock_record: None,
         }
     }
 }
@@ -1850,10 +1917,17 @@ pub struct Quality {
 }
 
 pub fn quality(rows: &[V2Row], opts: &PanelOptions) -> Quality {
+    quality_outside(rows, opts, None)
+}
+
+/// [`quality`] over the rows outside `exclude` (a lock record range), with the buckets missing
+/// inside it left out of the outage runs.
+pub fn quality_outside(rows: &[V2Row], opts: &PanelOptions, exclude: Option<Lockbox>) -> Quality {
+    let skip = |t: i64| exclude.is_some_and(|r| r.contains(t));
     let mut q = Quality::default();
     let mut present: BTreeMap<i64, usize> = BTreeMap::new();
     let mut missing: BTreeMap<i64, usize> = BTreeMap::new();
-    for r in rows {
+    for r in rows.iter().filter(|r| !skip(r.row.bar.time)) {
         *present.entry(r.row.bar.time).or_insert(0) += 1;
         q.cov15m[(r.cov15m as usize).min(4)] += 1;
         if r.dup_rows > r.cov15m as u32 {
@@ -1870,8 +1944,10 @@ pub fn quality(rows: &[V2Row], opts: &PanelOptions) -> Quality {
             q.zero_volume += 1;
         }
         let g = r.row.gap_buckets;
-        q.max_gap = q.max_gap.max(g);
-        for k in 1..=g as i64 {
+        if !(1..=g as i64).any(|k| skip(r.row.bar.time - k * OUT_STEP)) {
+            q.max_gap = q.max_gap.max(g);
+        }
+        for k in (1..=g as i64).filter(|k| !skip(r.row.bar.time - k * OUT_STEP)) {
             *missing.entry(r.row.bar.time - k * OUT_STEP).or_insert(0) += 1;
         }
     }
@@ -1938,42 +2014,63 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
     let all_times: Vec<i64> = series.values().flat_map(|(b, _)| b.iter().map(|x| x.time)).collect();
     guard.check_times("panel build", &all_times)?;
     let asm = assemble(&series, &membership, opts, None, opts.gpu)?;
+    let rec = opts.lock_record.as_ref();
+    let excl = rec.map(|r| r.range);
+    let outside = |t: i64| !excl.is_some_and(|r| r.contains(t));
     if !asm.jumps.is_empty() {
+        let shown: Vec<&Jump> = asm.jumps.iter().filter(|j| outside(j.at)).collect();
         let mut msg = format!(
             "{} undeclared level jump(s) (open/previous close beyond {}x inside one listing); \
              declare a listing break with --relist SYMBOL@DATE or split at the outage:",
-            asm.jumps.len(),
+            shown.len(),
             opts.jump_factor
         );
-        for j in asm.jumps.iter().take(20) {
+        for j in shown.iter().take(20) {
             let _ = write!(msg, " {} at {} ratio {:.4};", j.symbol, date(j.at), j.ratio);
+        }
+        if shown.len() < asm.jumps.len() {
+            let _ = write!(msg, " {} more inside the lock record range, not listed;", asm.jumps.len() - shown.len());
         }
         return Err(msg);
     }
-    let q = quality(&asm.rows, opts);
-    let panel_rows: Vec<PanelRow> = asm.rows.iter().map(|r| r.row.clone()).collect();
-    let panel: Panel = panel::assemble_panel_with_last(panel_rows, &asm.last)?;
-    debug_assert!(panel.rows.iter().zip(&asm.rows).all(|(a, b)| a == &b.row));
+    let q = quality_outside(&asm.rows, opts, excl);
+    let panel_rows: Vec<PanelRow> = asm.rows.iter().filter(|r| outside(r.row.bar.time)).map(|r| r.row.clone()).collect();
+    let rows_left_out = asm.rows.len() - panel_rows.len();
+    let (last, listings, declared_breaks) = match &excl {
+        None => (asm.last.clone(), asm.listings.clone(), asm.declared_breaks),
+        Some(r) => {
+            let (listings, breaks) = listings_outside(&series, opts, r);
+            (last_outside(&series, r), listings, breaks)
+        }
+    };
+    let panel: Panel = panel::assemble_panel_with_last(panel_rows, &last)?;
+    if excl.is_none() {
+        debug_assert!(panel.rows.iter().zip(&asm.rows).all(|(a, b)| a == &b.row));
+    }
     let table = v2_table(&asm.rows);
     store::write_store_with_time(&opts.out, &table, opts.group_rows, Some(0))?;
     let embargo_floor = crate::lockbox::declared_embargo(&opts.base)
         .map_err(|e| e.message)?
         .map_or(0, |(_, s)| s)
         .max(panel::membership_embargo_seconds(&opts.membership));
-    crate::registry::write_schema_retired(
+    crate::registry::write_schema_locked(
         &opts.out,
         crate::registry::DEFAULT_PANEL_VERSION,
         declared.as_ref(),
         also.as_ref(),
         Some(embargo_floor),
         retired.as_ref(),
+        rec,
     )?;
-    let ledger_misses = ledger_violations(&asm.rows, &membership);
+    let ledger_misses = ledger_violations_outside(&asm.rows, &membership, excl);
     let snapshot_text = match &opts.snapshot {
         Some(p) => {
             let t = std::fs::read_to_string(p).map_err(|e| format!("{}: {}", p, e))?;
             if !(t.trim().starts_with('{') && t.trim().ends_with('}')) {
                 return Err(format!("snapshot '{}' is not a JSON object", p));
+            }
+            if let Some(r) = rec {
+                crate::lockrec::refuse_snapshot(&t, r)?;
             }
             Some(t)
         }
@@ -1984,17 +2081,21 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
         .ok()
         .and_then(|t| manifest::object(&t, "quality").map(|s| s.to_string()));
     let invalid_ohlc = base_quality.as_deref().map(|b| int_field(b, "invalid_ohlc")).unwrap_or(0);
-    let mut text = panel::provenance_json_boxed(
+    let kept_membership = rec.map(|r| membership.without_range(&r.range));
+    let mut text = panel::provenance_json_locked(
         &[&opts.base, &opts.membership],
         &BTreeMap::new(),
-        &membership,
+        kept_membership.as_ref().unwrap_or(&membership),
         &panel,
         &opts.out,
         opts.allow_lockbox,
         snapshot_text.as_deref(),
         &guard.lockbox,
+        rec.map(|r| (r, rows_left_out)),
     );
-    let block = v2_block(opts, &asm, &q, invalid_ohlc, base_quality.as_deref(), ledger_misses);
+    let mut shown = opts.clone();
+    shown.relists.retain(|(_, t)| outside(*t));
+    let block = v2_block(&shown, &asm, &listings, declared_breaks, &q, invalid_ohlc, base_quality.as_deref(), ledger_misses);
     let marker = "  \"output\":";
     let at = text.rfind(marker).ok_or("manifest has no output block")?;
     let locked = declared
@@ -2021,17 +2122,48 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
         symbols: panel.symbols.len(),
         delisted: panel.delisted.len(),
         gaps: panel.gaps,
-        listings: asm.listings.values().map(|c| *c as usize).sum(),
+        listings: listings.values().map(|c| *c as usize).sum(),
         manifest: manifest_path,
         route: asm.route.clone(),
     })
 }
 
+/// Listings per symbol and declared breaks over the bars outside `range`.
+fn listings_outside(series: &BTreeMap<String, (Vec<Bar>, Vec<Aux>)>, opts: &PanelOptions, range: &Lockbox) -> (BTreeMap<String, u32>, usize) {
+    let mut listings = BTreeMap::new();
+    let mut breaks = 0usize;
+    for (symbol, (bars, _)) in series {
+        let times: Vec<i64> = bars.iter().map(|b| b.time).filter(|t| !range.contains(*t)).collect();
+        if times.is_empty() {
+            continue;
+        }
+        let relists: Vec<i64> = opts.relists.iter().filter(|(s, _)| s == symbol).map(|(_, t)| *t).collect();
+        let count = listing_ordinals(&times, &relists, opts.listing_gap_days).last().copied().unwrap_or(0) + 1;
+        breaks += count as usize - 1;
+        listings.insert(symbol.clone(), count);
+    }
+    (listings, breaks)
+}
+
+/// The last bar of every symbol outside `range`.
+fn last_outside(series: &BTreeMap<String, (Vec<Bar>, Vec<Aux>)>, range: &Lockbox) -> BTreeMap<String, i64> {
+    series
+        .iter()
+        .filter_map(|(s, (bars, _))| bars.iter().map(|b| b.time).filter(|t| !range.contains(*t)).max().map(|t| (s.clone(), t)))
+        .collect()
+}
+
 /// Rows whose `member_asof` is not the latest membership decision for the
 /// symbol at that instant, or whose decision is not a selection.
 pub fn ledger_violations(rows: &[V2Row], membership: &Membership) -> usize {
+    ledger_violations_outside(rows, membership, None)
+}
+
+/// [`ledger_violations`] over the rows outside `exclude` (a lock record range).
+pub fn ledger_violations_outside(rows: &[V2Row], membership: &Membership, exclude: Option<Lockbox>) -> usize {
     let index = panel::membership_index(membership);
     rows.iter()
+        .filter(|r| !exclude.is_some_and(|x| x.contains(r.row.bar.time)))
         .filter(|r| {
             let Some(v) = index.get(r.row.symbol.as_str()) else { return true };
             let pos = v.partition_point(|d| d.as_of <= r.row.bar.time);
@@ -2043,16 +2175,18 @@ pub fn ledger_violations(rows: &[V2Row], membership: &Membership) -> usize {
         .count()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn v2_block(
     opts: &PanelOptions,
     asm: &Assembled,
+    listings: &BTreeMap<String, u32>,
+    declared_breaks: usize,
     q: &Quality,
     invalid_ohlc: usize,
     base_quality: Option<&str>,
     ledger_misses: usize,
 ) -> String {
-    let multi: Vec<String> = asm
-        .listings
+    let multi: Vec<String> = listings
         .iter()
         .filter(|(_, c)| **c > 1)
         .map(|(s, c)| format!("{{\"symbol\":{},\"listings\":{}}}", jstr(s), c))
@@ -2091,7 +2225,7 @@ fn v2_block(
             .map(|(s, t)| format!("{{\"symbol\":{},\"date\":{}}}", jstr(s), jstr(&date(*t))))
             .collect::<Vec<_>>()
             .join(","),
-        asm.listings.values().map(|c| *c as usize).sum::<usize>(),
+        listings.values().map(|c| *c as usize).sum::<usize>(),
         multi.join(",")
     );
     let _ = write!(
@@ -2099,7 +2233,7 @@ fn v2_block(
         "\"jump_check\":{{\"factor\":{},\"undeclared\":{},\"listing_breaks\":{}}},",
         opts.jump_factor,
         asm.jumps.len(),
-        asm.declared_breaks
+        declared_breaks
     );
     let _ = write!(
         s,
@@ -2423,7 +2557,8 @@ pub fn validate(opts: &ValidateOptions) -> Report {
                     })
                     .count();
                 let mut rows_per_year: BTreeMap<i32, usize> = BTreeMap::new();
-                for t in &ts {
+                let excl = opts.panel_options.lock_record.as_ref().map(|r| r.range);
+                for t in ts.iter().filter(|t| !excl.is_some_and(|r| r.contains(**t))) {
                     *rows_per_year.entry(ohlcv::civil_from_days(t.div_euclid(86_400)).0).or_insert(0) += 1;
                 }
                 let mut extra = 0usize;
@@ -2476,6 +2611,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
     let mut base: Option<String> = None;
     let mut jobs = 1usize;
     let mut keep_partial = false;
+    let mut lock_record_path: Option<String> = None;
     let mut retired: Option<String> = None;
     let mut locked_test = crate::lockbox::Keep::Unset;
     let mut allow_lockbox = false;
@@ -2538,6 +2674,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
                 locked_test = crate::lockbox::Keep::parse(&value(args, &mut i)).unwrap_or_else(|e| cli_usage(&format!("--locked-test: {}", e)))
             }
             "--retired" => retired = Some(value(args, &mut i)),
+            "--lock-record" => lock_record_path = Some(value(args, &mut i)),
             "--allow-lockbox" => allow_lockbox = true,
             other => cli_usage(&format!("unknown option '{}' for `rcsr panel {}` (hourly v2)", other, cmd)),
         }
@@ -2555,6 +2692,10 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
     if gpu.is_some() && cmd != "base" && cmd != "build" {
         cli_usage(&format!("--gpu applies to `rcsr panel base` and `rcsr panel build`, not `{}`", cmd));
     }
+    let record = lock_record_path.as_deref().map(crate::lockrec::LockRecord::load).transpose().unwrap_or_else(|e| {
+        eprintln!("error: {}", e.message);
+        std::process::exit(e.exit);
+    });
     let mut po = |membership: &str, out: &str| -> PanelOptions {
         let mut p = PanelOptions::new(data.as_deref().unwrap_or(""), membership, out);
         p.group_rows = group_rows;
@@ -2567,13 +2708,14 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
         p.jump_factor = jump_factor;
         p.outage_share = outage_share;
         p.gpu = gpu.unwrap_or(GpuMode::Auto);
+        p.lock_record = record.clone();
         p
     };
     match cmd {
         "snapshot" => {
             let input = input.unwrap_or_else(|| cli_usage("snapshot needs --input <archive dir>"));
             let out = out.unwrap_or_else(|| "snapshot.json".to_string());
-            let text = snapshot_text_with(&input, jobs, symbols.as_ref()).unwrap_or_else(|e| cli_fail(&e));
+            let text = snapshot_text_locked(&input, jobs, symbols.as_ref(), record.as_ref()).unwrap_or_else(|e| cli_fail(&e));
             if let Err(e) = std::fs::write(&out, &text) {
                 cli_fail(&format!("{}: {}", out, e));
             }
@@ -2603,6 +2745,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
             o.locked_test = locked_test;
             o.retired = retired.clone();
             o.group_rows = group_rows;
+            o.lock_record = record.clone();
             o.gpu = gpu.unwrap_or(GpuMode::Auto);
             o.interval_seconds = match interval.as_str() {
                 "15m" => IN_STEP,

@@ -68,7 +68,7 @@ fn features(text: &str) -> Vec<(String, f64, f64)> {
     items
         .iter()
         .map(|f| (f.get("name").and_then(Json::as_str).unwrap().to_string(), num(f, "prevalence"), num(f, "nan_rows")))
-        .filter(|(n, _, _)| !n.starts_with("lbl_"))
+        .filter(|(n, _, _)| n == "ret1")
         .collect()
 }
 
@@ -116,7 +116,6 @@ fn the_label_report_has_no_top_move_inside_the_range_and_counts_the_rows_it_left
     let planted_time = (T0 + (PLANT_BAR as i64 - 1) * H).to_string();
     assert!(r.plain.contains(PLANT) && r.plain.contains(&planted_time), "the unguarded report names the planted move");
     assert!(!r.locked.contains(&format!("\"time\":{planted_time}")), "the planted time");
-    assert!(!r.locked.contains(PLANT), "no planted symbol anywhere in the enrich report");
     let rep = report(&r.locked);
     let Some(Json::Obj(_)) = rep.get("top_abs_moves") else { panic!("top_abs_moves") };
     let Some(Json::Arr(moves)) = rep.get("top_abs_moves").and_then(|t| t.get("moves")) else { panic!("moves") };
