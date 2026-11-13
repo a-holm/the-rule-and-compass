@@ -4343,11 +4343,11 @@ mod close_ledger_tests {
         let mut inexact_sum = 0usize;
         for set in 0..1000 {
             let mut ledger = RunLedger::new();
+            let wall = next(&mut state);
             for stage in [Stage::Io, Stage::Pnl, Stage::Fit] {
-                ledger.record_stage(stage, next(&mut state) * 0.1);
+                ledger.record_stage(stage, wall * (next(&mut state) / 10.0) / 3.0);
             }
             let sum = ledger.stage_sum_s();
-            let wall = sum + next(&mut state);
             if sum + (wall - sum) != wall {
                 inexact_sum += 1;
             }
