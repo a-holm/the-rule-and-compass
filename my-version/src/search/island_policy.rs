@@ -986,6 +986,32 @@ mod tests {
     }
 
     #[test]
+    fn the_migration_interval_sets_the_migration_generations() {
+        let archive = [sol(0.1)];
+        for (interval, want) in [(4usize, (3..36).step_by(4).collect::<Vec<usize>>()), (1, (0..36).collect()), (0, Vec::new())] {
+            let mut policy = IslandPolicy::new(&policy_cfg(3, RestartPolicy::Archive, interval, 0, 0));
+            let mut pop = Bests { best: vec![0.1, 0.5, 0.9], ..Default::default() };
+            let mut at = Vec::new();
+            for gen in 0..36 {
+                policy.observe(&pop);
+                pop.moves.clear();
+                policy.barrier(gen, &archive, &mut pop);
+                if !pop.moves.is_empty() {
+                    at.push(gen);
+                }
+            }
+            assert_eq!(at, want, "interval {interval}");
+        }
+        let mut policy = IslandPolicy::new(&policy_cfg(1, RestartPolicy::Archive, 4, 0, 0));
+        let mut pop = Bests { best: vec![0.1], ..Default::default() };
+        for gen in 0..36 {
+            policy.observe(&pop);
+            policy.barrier(gen, &archive, &mut pop);
+        }
+        assert!(pop.moves.is_empty(), "one island never migrates");
+    }
+
+    #[test]
     fn the_restart_interval_sets_the_explore_lifetime_unit() {
         let (n, k, unit) = (4usize, 2usize, 3usize);
         let cfg = Config { explore_islands: k, ..policy_cfg(n, RestartPolicy::Archive, 0, unit, 0) };
