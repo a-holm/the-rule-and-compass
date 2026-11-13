@@ -2279,3 +2279,68 @@ fn a_default_checkpoint_has_no_fit_accept_key_and_a_fitness_one_resumes_only_und
     );
     assert!(err.contains("fit_accept"), "{err}");
 }
+
+/// #1060: the sidecar a periodic save leaves behind, as the product writes it
+/// (a killed process never reaches the exit write), for the checkpoint in `dir`.
+fn write_periodic_sidecar(dir: &std::path::Path) {
+    let ck = dir.join("ck.rcsr");
+    let path = ck.to_str().expect("utf-8");
+    let cp = rcsr::checkpoint::Checkpoint::load(path).expect("checkpoint");
+    let cost = rcsr::resume_cost::Cost::periodic(0.5, cp.backend);
+    rcsr::resume_cost::write(path, cp.generations, &cost).expect("sidecar");
+}
+
+fn sidecar_text(dir: &std::path::Path) -> String {
+    std::fs::read_to_string(dir.join("ck.rcsr.cost")).expect("sidecar")
+}
+
+/// #1060: a chunk killed after a periodic save leaves a sidecar with its own
+/// backend, so the resumed search reports it instead of `unknown`.
+#[test]
+fn a_killed_chunk_does_not_poison_the_search_backend() {
+    let (_scratch, dir, csv) = cost_scratch("killed-chunk-backend");
+    cost_chunk(&dir, &csv, 0, false);
+    write_periodic_sidecar(&dir);
+    assert!(sidecar_text(&dir).contains("\"backend\":\"cpu\""), "{}", sidecar_text(&dir));
+    cost_chunk(&dir, &csv, 1, true);
+    let run = json_file(dir.join("run.json"));
+    assert_eq!(run.get("search_backend").and_then(|v| v.as_str()), Some("cpu"));
+    let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
+    assert_eq!(cumulative.get("backend").and_then(|v| v.as_str()), Some("cpu"));
+    assert!(matches!(run.get("backend_reason"), None | Some(rcsr::devlog::Json::Null)), "{:?}", run.get("backend_reason"));
+}
+
+/// #1060: a sidecar already poisoned by an older binary (real example from
+/// campaign #268, generation rewritten to the checkpoint's) is not repaired:
+/// nothing in it says which chunks ran on which backend, so the total stays
+/// `unknown` with the existing reason.
+#[test]
+fn a_poisoned_sidecar_stays_unknown_on_resume() {
+    let (_scratch, dir, csv) = cost_scratch("poisoned-sidecar");
+    cost_chunk(&dir, &csv, 0, false);
+    let cp = rcsr::checkpoint::Checkpoint::load(dir.join("ck.rcsr").to_str().expect("utf-8")).expect("checkpoint");
+    std::fs::write(
+        dir.join("ck.rcsr.cost"),
+        format!("{{\"v\":2,\"generation\":{},\"chunks\":1,\"search_seconds\":268.351034924,\"ledger_wall_s\":null,\"device_seconds_incl_fit\":null,\"backend\":\"unknown\"}}", cp.generations),
+    )
+    .unwrap();
+    cost_chunk(&dir, &csv, 1, true);
+    let run = json_file(dir.join("run.json"));
+    assert_eq!(run.get("search_backend").and_then(|v| v.as_str()), Some("unknown"));
+    let reason = run.get("backend_reason").and_then(|v| v.as_str()).expect("backend_reason");
+    assert!(reason.contains("the checkpoint sidecar records none"), "{reason}");
+    assert!(sidecar_text(&dir).contains("\"backend\":\"unknown\""));
+}
+
+/// #1060: an uninterrupted chunk still ends with the exit write: the sidecar
+/// of the final checkpoint carries the outcome backend and the full ledger
+/// fields, and the periodic callback does not touch the checkpoint bytes.
+#[test]
+fn an_uninterrupted_chunk_keeps_its_exit_sidecar() {
+    let (_scratch, dir, csv) = cost_scratch("uninterrupted-sidecar");
+    cost_chunk(&dir, &csv, 0, true);
+    let cp = rcsr::checkpoint::Checkpoint::load(dir.join("ck.rcsr").to_str().expect("utf-8")).expect("checkpoint");
+    let text = sidecar_text(&dir);
+    assert!(text.starts_with(&format!("{{\"v\":2,\"generation\":{},\"chunks\":1,\"search_seconds\":", cp.generations)), "{text}");
+    assert!(text.ends_with("\"ledger_wall_s\":null,\"device_seconds_incl_fit\":null,\"backend\":\"cpu\"}"), "{text}");
+}

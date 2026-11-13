@@ -6736,12 +6736,7 @@ fn main() {
                 }
                 let generation = cp.generations;
                 last_saved = Some((generation, path.clone()));
-                let so_far = rcsr::resume_cost::Cost::process(
-                    search_start.elapsed().as_secs_f64(),
-                    None,
-                    None,
-                    rcsr::resume_cost::Search::Unknown,
-                );
+                let so_far = rcsr::resume_cost::Cost::periodic(search_start.elapsed().as_secs_f64(), cp.backend);
                 if let Some(t) = rcsr::resume_cost::total(cost_resumed, cost_base.as_ref(), &so_far) {
                     if let Err(e) = rcsr::resume_cost::write(&path, generation, &t) {
                         eprintln!("warning: {}", e);
