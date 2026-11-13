@@ -34,6 +34,7 @@ fn sample(row: &dyn Setting) -> Option<&'static str> {
         "--selection" => "afp",
         "--restart-policy" => "island",
         "--restart-isolation" => "7",
+        "--migration-interval" => "9",
         "--restart-interval" => "7",
         "--explore-islands" => "1",
         "--front-scope" => "island",

@@ -388,7 +388,6 @@ pub struct Knobs {
     /// Comma list as given on the command line (`--ops`).
     pub ops: Option<String>,
     pub max_complexity: Option<usize>,
-    pub migration_interval: Option<usize>,
     pub variation: Option<crate::search::VariationMode>,
     pub dispatch: Option<crate::dispatch::DispatchMode>,
     /// #466: `Some(true)` turns the front prune on (`--prune`).
@@ -761,9 +760,6 @@ fn base_config(cfg: &SuiteConfig, seed: u32) -> Config {
     }
     if let Some(v) = k.max_complexity {
         sc.max_complexity = v;
-    }
-    if let Some(v) = k.migration_interval {
-        sc.migration_interval = v;
     }
     if let Some(v) = k.variation {
         sc.variation = v;
@@ -1484,7 +1480,6 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
     knob(&mut knobs, "ops", k.ops.as_ref().map_or("null".to_string(), |o| format!("\"{}\"", json_escape(o))));
     knob(&mut knobs, "max_complexity", json_opt(k.max_complexity));
     k.settings.json(Group::Stop, &mut knobs);
-    knob(&mut knobs, "migration_interval", json_opt(k.migration_interval));
     k.settings.json(Group::Schedule, &mut knobs); // #1109
     knob(&mut knobs, "variation", quoted(k.variation.map(|v| v.as_str())));
     k.settings.json(Group::Island, &mut knobs);

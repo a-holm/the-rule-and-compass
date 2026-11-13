@@ -76,7 +76,6 @@ OPTIONS:
   --ops <a,b,..>            operator set
   --max-complexity <N>      maximum expression complexity
 {bench_stop}
-  --migration-interval <N>  generations between island migrations
 {bench_schedule}
 {bench_island}
   --variation <mode>        auto, node or postfix
@@ -306,10 +305,6 @@ fn parse(args: &[String]) -> Result<Args, String> {
             }
             "--patience-tol" => return Err("--patience-tol was removed (#464): it saved under 10 % of the noisy CPU in the default-decision A/B".to_string()),
             "--stop-on" => return Err("--stop-on was removed (#464): it saved under 10 % of the noisy CPU in the default-decision A/B".to_string()),
-            "--migration-interval" => {
-                a.knobs.migration_interval =
-                    Some(num(take(&mut i, "--migration-interval")?, "--migration-interval")?)
-            }
             "--linear-scaling" => {
                 return Err("--linear-scaling was removed (#470): it lowered oracle_recovered in the default-decision A/B".to_string())
             }

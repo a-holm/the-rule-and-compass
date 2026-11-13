@@ -993,6 +993,43 @@ fn cli_resume_refuses_a_different_restart_interval() {
     assert!(again.contains("config restart_interval 30\n"), "{again}");
 }
 
+/// #1116: the migration interval is a saved search setting set from the command
+/// line.
+#[test]
+fn cli_resume_refuses_a_different_migration_interval() {
+    let csv = TempPath::new("migration-interval.csv");
+    std::fs::write(&csv.0, line_csv(40)).expect("write csv");
+    let checkpoint = TempPath::new("migration-interval.rcsr");
+    let resaved = TempPath::new("migration-interval-resaved.rcsr");
+    let base = ["--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "2", "--pop", "25", "--islands", "4"];
+
+    let mut made_args = base.to_vec();
+    made_args.extend(["--generations", "5", "--migration-interval", "5", "--save", checkpoint.as_str()]);
+    let made = rcsr(&made_args);
+    assert!(made.status.success(), "save run failed: {:?}", made);
+    let saved = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
+    assert!(saved.contains("config migration_interval 5\n"), "{saved}");
+
+    let mut conflict_args = base.to_vec();
+    conflict_args.extend(["--resume", checkpoint.as_str(), "--migration-interval", "25"]);
+    let conflict = rcsr(&conflict_args);
+    assert_eq!(conflict.status.code(), Some(2), "a different interval is a usage error");
+    let err = String::from_utf8_lossy(&conflict.stderr);
+    assert!(err.contains("--migration-interval 25 (saved migration_interval is 5)"), "{err}");
+
+    let mut same_args = base.to_vec();
+    same_args.extend(["--resume", checkpoint.as_str(), "--migration-interval", "5", "--generations", "6"]);
+    let same = rcsr(&same_args);
+    assert!(same.status.success(), "the saved value is no conflict: {:?}", same);
+
+    let mut resume_args = base.to_vec();
+    resume_args.extend(["--resume", checkpoint.as_str(), "--generations", "8", "--save", resaved.as_str()]);
+    let resumed = rcsr(&resume_args);
+    assert!(resumed.status.success(), "a resume that omits the flag keeps the saved interval: {:?}", resumed);
+    let again = std::fs::read_to_string(&resaved.0).expect("read resaved checkpoint");
+    assert!(again.contains("config migration_interval 5\n"), "{again}");
+}
+
 /// #1070: the front scope is a saved search setting, and it refuses the shared
 /// QD archive.
 #[test]
