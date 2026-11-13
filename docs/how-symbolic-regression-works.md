@@ -135,7 +135,7 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   from the squared-error fit.
 - **Migration** periodically copies an island's best member into a neighbouring
   island; **stagnant islands are restarted** to avoid getting stuck. Every
-  restart interval (60 generations) the default rule (`--restart-policy archive`)
+  restart interval (`--restart-interval`, default 60 generations) the default rule (`--restart-policy archive`)
   restarts an island after two checks in which its best error is worse than the
   archive best. Once migration has copied the archive best into every island,
   no island is behind it and that rule never fires. `--restart-policy island`
@@ -156,8 +156,8 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   is isolated for its whole life (no front parent, no `--qd-policy` parent, no
   migrant in or out) and restarts at the end of each lifetime of the Luby
   universal sequence 1, 1, 2, 1, 1, 2, 4, ... in units of the restart interval
-  (60 generations; `restart_interval` in the library, `--restart-interval` in
-  `rcsr-bench`). One sequence is spread over the explore islands: each next
+  (`--restart-interval`, default 60 generations; 0 turns every restart off,
+  explore restarts included). One sequence is spread over the explore islands: each next
   lifetime goes to the island whose lifetimes add up to the least, ties to the
   lowest island (the list schedule of Cire, Kadioglu and Sellmann 2014). Luby,
   Sinclair and Zuckerman (1993) show that this sequence reaches a target within

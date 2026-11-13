@@ -29,6 +29,7 @@ const EXIT_USAGE: i32 = 2;
 
 fn usage() -> String {
     let bench_stop = settings::bench_usage(Group::Stop);
+    let bench_schedule = settings::bench_usage(Group::Schedule);
     let bench_island = settings::bench_usage(Group::Island);
     let bench_variation = settings::bench_usage(Group::Variation);
     let bench_filter = settings::bench_usage(Group::Filter);
@@ -76,7 +77,7 @@ OPTIONS:
   --max-complexity <N>      maximum expression complexity
 {bench_stop}
   --migration-interval <N>  generations between island migrations
-  --restart-interval <N>    generations between island restarts
+{bench_schedule}
 {bench_island}
   --variation <mode>        auto, node or postfix
 {bench_variation}
@@ -308,10 +309,6 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--migration-interval" => {
                 a.knobs.migration_interval =
                     Some(num(take(&mut i, "--migration-interval")?, "--migration-interval")?)
-            }
-            "--restart-interval" => {
-                a.knobs.restart_interval =
-                    Some(num(take(&mut i, "--restart-interval")?, "--restart-interval")?)
             }
             "--linear-scaling" => {
                 return Err("--linear-scaling was removed (#470): it lowered oracle_recovered in the default-decision A/B".to_string())

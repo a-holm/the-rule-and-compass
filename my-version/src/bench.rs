@@ -389,7 +389,6 @@ pub struct Knobs {
     pub ops: Option<String>,
     pub max_complexity: Option<usize>,
     pub migration_interval: Option<usize>,
-    pub restart_interval: Option<usize>,
     pub variation: Option<crate::search::VariationMode>,
     pub dispatch: Option<crate::dispatch::DispatchMode>,
     /// #466: `Some(true)` turns the front prune on (`--prune`).
@@ -765,9 +764,6 @@ fn base_config(cfg: &SuiteConfig, seed: u32) -> Config {
     }
     if let Some(v) = k.migration_interval {
         sc.migration_interval = v;
-    }
-    if let Some(v) = k.restart_interval {
-        sc.restart_interval = v;
     }
     if let Some(v) = k.variation {
         sc.variation = v;
@@ -1489,7 +1485,7 @@ pub fn config_json(cfg: &SuiteConfig) -> String {
     knob(&mut knobs, "max_complexity", json_opt(k.max_complexity));
     k.settings.json(Group::Stop, &mut knobs);
     knob(&mut knobs, "migration_interval", json_opt(k.migration_interval));
-    knob(&mut knobs, "restart_interval", json_opt(k.restart_interval));
+    k.settings.json(Group::Schedule, &mut knobs); // #1109
     knob(&mut knobs, "variation", quoted(k.variation.map(|v| v.as_str())));
     k.settings.json(Group::Island, &mut knobs);
     knob(&mut knobs, "dispatch", quoted(k.dispatch.map(|v| v.name())));
