@@ -226,6 +226,10 @@ pub struct Checkpoint {
     pub config: Config,
     /// The evaluator that produced this state: `cpu` or `gpu` (issue #140).
     pub backend: Backend,
+    /// In memory only, never saved: the backend that scored the generations of
+    /// the process that took this snapshot (what `Outcome.backend` reports).
+    /// `None` for a loaded checkpoint.
+    pub process_backend: Option<crate::backend::Kind>,
     /// FNV-1a hash of the canonical, trajectory-relevant configuration
     /// (issue #140). The generation budget is excluded because resuming may
     /// raise it.
@@ -1286,6 +1290,7 @@ impl Checkpoint {
             candidates_evaluated: candidates_evaluated.unwrap_or(0),
             config,
             backend,
+            process_backend: None,
             config_hash: computed_hash,
             refit_band_unknown,
             calibration_record,

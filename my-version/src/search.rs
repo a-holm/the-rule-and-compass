@@ -7143,6 +7143,7 @@ fn population_best(pop: &[Ind]) -> f64 {
 fn snapshot(
     cfg: &Config,
     backend: Backend,
+    process_backend: crate::backend::Kind,
     gens_done: usize,
     stopped_early: bool,
     best_prev: f64,
@@ -7162,6 +7163,7 @@ fn snapshot(
     Checkpoint {
         config: cfg.clone(),
         backend,
+        process_backend: Some(process_backend),
         config_hash: crate::checkpoint::config_hash(cfg),
         refit_band_unknown: false,
         calibration_record: Some(crate::checkpoint::CalibrationRecord::of(&cfg.calibration)),
@@ -7204,6 +7206,17 @@ fn snapshot(
         )),
         target_spec: None,
         candidates_evaluated,
+    }
+}
+
+/// The backend that scored the generations of this process: what the outcome
+/// and the cost sidecar report. A device that only fits (`defer_gpu`) does not
+/// make it `Gpu`; the checkpoint identity field is a separate value.
+fn scoring_kind(gpu_used: bool) -> crate::backend::Kind {
+    if gpu_used {
+        crate::backend::Kind::Gpu
+    } else {
+        crate::backend::Kind::Cpu
     }
 }
 
@@ -8074,6 +8087,7 @@ fn run_postfix_search(
             let cp = snapshot(
                 cfg,
                 Backend::Gpu,
+                crate::backend::Kind::Gpu,
                 gens_done,
                 converged_early,
                 best_prev,
@@ -8149,6 +8163,7 @@ fn run_postfix_search(
         let cp = snapshot(
             cfg,
             Backend::Gpu,
+            crate::backend::Kind::Gpu,
             gens_done,
             converged_early,
             best_prev,
@@ -9712,6 +9727,7 @@ fn run_search_scoped(
                 let cp = snapshot(
                     cfg,
                     backend,
+                    scoring_kind(gpu_used),
                     gens_done,
                     converged_early,
                     best_prev,
@@ -9788,6 +9804,7 @@ fn run_search_scoped(
         let cp = snapshot(
             cfg,
             backend,
+            scoring_kind(gpu_used),
             gens_done,
             converged_early,
             best_prev,
@@ -9993,11 +10010,7 @@ fn run_search_scoped(
         archive_refit: fit_screened,
         // #86: the effective subset actually used, after the break-even rule.
         predictor_samples: effective_predictor_samples(cfg, train).unwrap_or(0),
-        backend: if gpu_used {
-            crate::backend::Kind::Gpu
-        } else {
-            crate::backend::Kind::Cpu
-        },
+        backend: scoring_kind(gpu_used),
         backend_reason: if backend_reason.is_none() && dispatcher.ledger().cost_model_kept_cpu() {
             Some("dispatch: cost model kept every stage on the cpu".to_string())
         } else {
@@ -10033,6 +10046,20 @@ mod gpu_dead_start_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1060: a fit-only device run defers the fit to the device (the periodic
+    /// checkpoint identity says `gpu`) but scores every candidate on the host
+    /// (`gpu_used` stays false), so the cost sidecar must say `cpu`, as the exit
+    /// write does.
+    #[test]
+    fn the_sidecar_backend_of_a_fit_only_device_run_is_cpu() {
+        let (defer_gpu, fit_only_device, gpu_used) = (true, true, false);
+        let periodic_identity = if defer_gpu || gpu_used { Backend::Gpu } else { Backend::Cpu };
+        assert_eq!(periodic_identity, Backend::Gpu);
+        assert!(fit_only_device);
+        assert_eq!(scoring_kind(gpu_used), crate::backend::Kind::Cpu);
+        assert_eq!(scoring_kind(true), crate::backend::Kind::Gpu);
+    }
 
     /// #453: `n` eligible `c0 * x0 + c1` plans, one constant pair each.
     fn affine_plans(n: usize) -> Vec<(usize, usize, crate::fit::GpuFitPlan)> {
