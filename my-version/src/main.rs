@@ -6742,7 +6742,7 @@ fn main() {
                 last_saved = Some((generation, path.clone()));
                 let so_far = rcsr::resume_cost::Cost::periodic(
                     search_start.elapsed().as_secs_f64(),
-                    rcsr::resume_cost::Search::Unknown,
+                    cp.process_backend.map_or(rcsr::resume_cost::Search::Unknown, rcsr::resume_cost::Search::of),
                 );
                 if let Some(t) = rcsr::resume_cost::total(cost_resumed, cost_base.as_ref(), &so_far) {
                     if let Err(e) = rcsr::resume_cost::write(&path, generation, &t) {
