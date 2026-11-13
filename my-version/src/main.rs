@@ -5657,8 +5657,9 @@ fn main() {
     // #468: the long/flat book earns the full per-row return, so rows of one
     // group must not be closer than the label horizon.
     let target_horizon = book_resolved.as_ref().or(target_resolved.as_ref()).map_or(0.0, |r| r.spec.horizon_seconds);
+    let period_width = book_resolved.as_ref().or(target_resolved.as_ref()).map_or(0.0, |r| r.spec.period_width_seconds());
     if let Some(s) = trading_spec.as_mut() {
-        s.period_seconds = (target_horizon > 0.0).then_some(target_horizon);
+        s.period_seconds = (period_width > 0.0).then_some(period_width);
     }
     let mut min_group_step: Option<f64> = None;
     if let (Some(_), Some(split), Some(r)) = (&trading_spec, prepared.trading.as_ref(), book_resolved.as_ref().or(target_resolved.as_ref())) {
@@ -11071,8 +11072,12 @@ OPTIONS:
                              historical pooled P&L); default carries the boundary
                              position, so total variation includes |p_end-q_start|
   --periods-per-year <f>     annualisation override. Default: 31536000 / S, S the
-                             label horizon (target spec, else --horizon), else
-                             the median step of labelled test times. A period is
+                             label horizon, or the label stride when the
+                             spec has a wider stride_seconds (target spec, else
+                             --horizon), else the median step of labelled test
+                             times. A spec with no stride_seconds whose labelled
+                             rows of one group are 2 horizons or more apart
+                             exits 2. A period is
                              the bucket floor(t / S); without a declared
                              horizon a period is one timestamp. With a target
                              spec a different value exits 2; with --horizon
@@ -11829,6 +11834,7 @@ fn run_walkforward(args: &[String]) -> ! {
         };
         horizon = Some(agree("--horizon", horizon, s.horizon_seconds));
         popts.horizon_from_spec = s.horizon_seconds > 0.0;
+        popts.stride_seconds = s.stride_seconds;
         popts.entry_offset = agree("--entry-offset", entry_offset_flag, s.entry_offset_seconds);
         popts.fit_label = target::label_report_for(&data_path, &s.column).and_then(|r| rcsr::labels::fit_label_json(&r));
         popts.delay = agree("--delay", delay_flag, s.delay_seconds);

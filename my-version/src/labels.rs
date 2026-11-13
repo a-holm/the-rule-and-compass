@@ -213,6 +213,10 @@ impl LongLabelSpec {
             return_column: Some(return_column.to_string()),
             return_units: "log".to_string(),
             horizon_seconds: self.horizon_seconds() as f64,
+            stride_seconds: {
+                let stride = self.stride as i64 * self.bar_seconds;
+                (stride > self.horizon_seconds()).then_some(stride as f64)
+            },
             entry_offset_seconds: self.entry_offset_seconds() as f64,
             delay_seconds: self.delay_seconds() as f64,
             entry_price: "open[t+1]".to_string(),

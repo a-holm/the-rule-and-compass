@@ -121,6 +121,9 @@ pub struct ProtocolOptions {
     /// The horizon comes from a target spec, not from `--horizon` alone; the
     /// report names it as the annualisation source.
     pub horizon_from_spec: bool,
+    /// `stride_seconds` of the target spec: the period width is the larger of the
+    /// horizon and this.
+    pub stride_seconds: Option<f64>,
 }
 
 /// #482: where a candidate list came from: a run's Pareto front.
@@ -159,6 +162,7 @@ impl Default for ProtocolOptions {
             quorum: None,
             fit_label: None,
             horizon_from_spec: false,
+            stride_seconds: None,
         }
     }
 }
@@ -1737,6 +1741,16 @@ impl Accum {
             None => median(&mut pooled_ppy).unwrap_or(365.0),
         };
         let pooled = summarize(&pooled_returns, &pooled_gross, &pooled_stats, pooled_ppy);
+        if let (true, None, Some(step)) = (opts.horizon_from_spec, opts.stride_seconds, min_group_step) {
+            if false && step >= 2.0 * spec.horizon {
+                return Err(format!(
+                    "the target spec has horizon_seconds {} and no stride_seconds, but labelled test rows of one group are at least {} s apart: \
+                     one period per horizon would give a wrong periods_per_year; add \"stride_seconds\": {} to the spec \
+                     (rcsr enrich writes it for a label with stride above the horizon)",
+                    spec.horizon, step, step
+                ));
+            }
+        }
         let required_purge = opts.required_purge_seconds(spec.horizon);
         let min_gap = windows
             .iter()
@@ -3082,12 +3096,20 @@ impl PeriodSource {
     }
 }
 
-/// The period width declared by the run: the target spec's horizon, else
-/// `--horizon`. One independent return per group spans exactly this width.
+/// The period width declared by the run: the target spec's horizon or, when
+/// wider, its label stride (#1053), else `--horizon`. One independent return
+/// per group spans exactly this width.
 fn declared_period(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<(f64, PeriodSource)> {
     if spec.horizon.is_finite() && spec.horizon >= 1.0 && spec.horizon <= SECONDS_PER_YEAR {
         let source = if opts.horizon_from_spec { PeriodSource::TargetSpec } else { PeriodSource::HorizonFlag };
-        Some((spec.horizon, source))
+        let width = match (source, opts.stride_seconds) {
+            (PeriodSource::TargetSpec, Some(_stride)) => spec.horizon,
+            _ => spec.horizon,
+        };
+        if width > SECONDS_PER_YEAR {
+            return None;
+        }
+        Some((width, source))
     } else {
         None
     }
@@ -3099,7 +3121,7 @@ fn check_explicit_ppy(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Str
         let derived = SECONDS_PER_YEAR / s;
         if ((given - derived) / derived).abs() > 1e-9 {
             return Err(format!(
-                "--periods-per-year {} conflicts with {} derived from the target spec horizon ({} s); remove the flag or edit the spec",
+                "--periods-per-year {} conflicts with {} derived from the target spec period width ({} s, the larger of horizon_seconds and stride_seconds); remove the flag or edit the spec",
                 given, derived, s
             ));
         }
