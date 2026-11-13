@@ -221,6 +221,8 @@ pub struct NullTests {
     pub observed_sharpe: f64,
     pub block_permutation: NullRow,
     pub matched_exposure_random: NullRow,
+    pub matched_scheme: &'static str,
+    pub matched_distinct_shifts: u64,
     pub always_long_mean: f64,
     pub always_long_sharpe: f64,
 }
@@ -415,6 +417,16 @@ fn permuted_sources(periods: usize, block: usize, rng: &mut Mt) -> Vec<u32> {
     src
 }
 
+/// Smallest offset of the shared shift and the number of offsets of a window of `periods`.
+fn shift_range(periods: usize, block: usize) -> (u64, u64) {
+    let lo = block.min(periods / 4).max(1) as u64;
+    let p = periods as u64;
+    (lo, (p + 1).saturating_sub(2 * lo))
+}
+
+/// Fewer distinct shifts than this cannot give a p-value below 0.05.
+const MIN_DISTINCT_SHIFTS: u64 = 20;
+
 fn run_nulls(i: &InferenceInput) -> Result<NullTests, String> {
     if i.books.is_empty() {
         return Err("nulls need the window books".to_string());
@@ -449,7 +461,9 @@ fn run_nulls(i: &InferenceInput) -> Result<NullTests, String> {
                 p_stat.push(sum[k] / book.period_count[k] as f64 - book.period_cost[k]);
             }
             let seed = splitmix(i.control_seed ^ splitmix((b as u64) << 20 | w as u64));
-            let pos = baselines::matched_exposure_positions(&book.positions, &book.groups, seed)?;
+            let (lo, count) = shift_range(periods, block);
+            let shift = if count == 0 { 0 } else { lo + ((seed as u128 * count as u128) >> 64) as u64 };
+            let pos = baselines::shifted_positions(&book.positions, &book.groups, shift, periods as u64)?;
             let net = baselines::net_rows(&pos, &book.returns, &book.groups, book.side);
             let mut bins = vec![0.0f64; periods];
             for (row, &v) in net.iter().enumerate() {
@@ -469,6 +483,10 @@ fn run_nulls(i: &InferenceInput) -> Result<NullTests, String> {
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
         inference::quantile_sorted(&s, 0.95)
     };
+    let distinct_shifts = dense_books
+        .iter()
+        .fold(1u64, |acc, d| acc.saturating_mul(shift_range(d.periods, block).1.max(1)));
+    let shifts_ok = distinct_shifts >= MIN_DISTINCT_SHIFTS;
     let row = |mean: &[f64], sharpe: &[f64]| NullRow {
         p_mean: inference::null_p(obs_mean, mean),
         p_sharpe: inference::null_p(obs_sharpe, sharpe),
@@ -487,7 +505,16 @@ fn run_nulls(i: &InferenceInput) -> Result<NullTests, String> {
         observed_mean: obs_mean,
         observed_sharpe: obs_sharpe,
         block_permutation: row(&perm_mean, &perm_sharpe),
-        matched_exposure_random: row(&rand_mean, &rand_sharpe),
+        matched_exposure_random: {
+            let mut r = row(&rand_mean, &rand_sharpe);
+            if !shifts_ok {
+                r.p_mean = f64::NAN;
+                r.p_sharpe = f64::NAN;
+            }
+            r
+        },
+        matched_scheme: "shared_circular_shift",
+        matched_distinct_shifts: distinct_shifts,
         always_long_mean: bh.mean(),
         always_long_sharpe: bh.sharpe(),
     })
@@ -513,6 +540,16 @@ fn dsr_json(d: &Dsr) -> String {
         jnum(d.var_sr),
         jnum(d.sr0),
         jnum(d.dsr)
+    )
+}
+
+fn matched_row_json(n: &NullTests) -> String {
+    let row = null_row_json(&n.matched_exposure_random);
+    format!(
+        "{{\"scheme\":{},\"distinct_shifts\":{},{}",
+        jstr(n.matched_scheme),
+        n.matched_distinct_shifts,
+        &row[1..]
     )
 }
 
@@ -740,7 +777,7 @@ impl Inference {
                 jnum(n.observed_mean),
                 jnum(n.observed_sharpe),
                 null_row_json(&n.block_permutation),
-                null_row_json(&n.matched_exposure_random),
+                matched_row_json(n),
                 jnum(n.always_long_mean),
                 jnum(n.always_long_sharpe)
             )
@@ -836,7 +873,7 @@ impl Inference {
             s.push_str("| null | p (mean) | p (Sharpe) | null mean q95 |\n|---|---|---|---|\n");
             for (name, r) in [
                 ("hour-block permutation", &n.block_permutation),
-                ("matched-exposure random long/flat", &n.matched_exposure_random),
+                ("matched-exposure shifted long/flat", &n.matched_exposure_random),
             ] {
                 s.push_str(&format!(
                     "| {} | {} | {} | {} |\n",
