@@ -1,4 +1,6 @@
-//! Save/resume tests (issue #17).
+//! Sa    let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
+    assert_eq!(cumulative.get("backend").and_then(|v| v.as_str()), Some("unknown"));
+e/resume tests (issue #17).
 //!
 //! The central guarantee is trajectory determinism: an uninterrupted run and
 //! a run split at an arbitrary generation boundary must produce the same
@@ -2307,13 +2309,13 @@ fn a_killed_chunk_does_not_poison_the_search_backend() {
     assert_eq!(run.get("search_backend").and_then(|v| v.as_str()), Some("cpu"));
     let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
     assert_eq!(cumulative.get("backend").and_then(|v| v.as_str()), Some("cpu"));
-    assert!(matches!(run.get("backend_reason"), None | Some(rcsr::devlog::Json::Null)), "{:?}", run.get("backend_reason"));
+| Some(rcsr::devlog::Json::Null)), "{:?}", run.get("backend_reason"));
 }
 
 /// #1060: a sidecar already poisoned by an older binary (real example from
 /// campaign #268, generation rewritten to the checkpoint's) is not repaired:
 /// nothing in it says which chunks ran on which backend, so the total stays
-/// `unknown` with the existing reason.
+/// `unknown`.
 #[test]
 fn a_poisoned_sidecar_stays_unknown_on_resume() {
     let (_scratch, dir, csv) = cost_scratch("poisoned-sidecar");
