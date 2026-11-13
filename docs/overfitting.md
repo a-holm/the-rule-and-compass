@@ -543,7 +543,7 @@ A walk-forward report on many candidates is a selection problem. The report quan
 |---|---|---|
 | block bootstrap CI and design effect | is the mean or Sharpe distinguishable from zero once labels overlap and returns are serially dependent | CI excludes 0 |
 | `N_eff` (participation ratio) | how many independent trials the candidate set is worth | reported |
-| DSR at `N_eff` and `10 N_eff` | probability the true Sharpe is positive after deflating for the trials, skew and kurtosis | reported with its inputs |
+| PSR (`N = 1`), DSR at `N_eff` and `10 N_eff`, MinBTL | probability the true Sharpe is positive after deflating for the trials (`n_trials_source` names where they come from), skew and kurtosis | reported with its inputs |
 | PBO (CSCV) | how often the in-sample winner ranks in the lower half out of sample | at most 0.20 (ablation ship gate: below 0.5) |
 | SPA vs the best long/flat baseline | does any candidate beat cash, buy-and-hold or the constant book after data snooping | p at most 0.05 |
 | BH-FDR | which candidates survive a false discovery rate | q = 0.10 |

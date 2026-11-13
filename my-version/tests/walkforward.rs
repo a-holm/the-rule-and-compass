@@ -746,6 +746,14 @@ mod front {
         rcsr(&a)
     }
 
+    /// Like `wf` for a run that declares its target spec: the spec sets the period width.
+    fn wf_book(data: &str, source: &[&str], window: &str, extra: &[&str]) -> (i32, String, String) {
+        let mut a = vec!["walkforward", "--data", data, "--time", "ts", "--validation-frac", "0.3", "--window", window, "--json"];
+        a.extend_from_slice(source);
+        a.extend_from_slice(extra);
+        rcsr(&a)
+    }
+
     /// last seen 179 + required purge 5
     const OK_WINDOW: &str = "late,0,150,184,300";
 
@@ -850,12 +858,12 @@ mod front {
         let (_scratch, dir) = scratch("fromrun1");
         let data = write_data(&dir);
         let run = write_run(&dir, BOOK_RUN);
-        let (code, a, err) = wf(&data, &["--from-run", &run], OK_WINDOW, &["--bootstrap", "100"]);
+        let (code, a, err) = wf_book(&data, &["--from-run", &run], OK_WINDOW, &["--bootstrap", "100"]);
         assert_eq!(code, 0, "{err}");
         let m = multiple(&a);
         assert_eq!(mt(&m, &["trials"]), 1.0);
         assert_eq!(source(&m), "out_of_sample_book");
-        let (code, b, err) = wf(&data, &["--from-run", &run], OK_WINDOW, &["--bootstrap", "100", "--trials", "1"]);
+        let (code, b, err) = wf_book(&data, &["--from-run", &run], OK_WINDOW, &["--bootstrap", "100", "--trials", "1"]);
         assert_eq!(code, 0, "{err}");
         let mb = multiple(&b);
         assert_eq!(source(&mb), "flag");
@@ -863,7 +871,7 @@ mod front {
             assert_eq!(format!("{:?}", m.get(k)), format!("{:?}", mb.get(k)), "{k}");
         }
         assert_eq!(format!("{:?}", m.get("psr")), format!("{:?}", m.get("dsr_at_n_eff")));
-        let (code, c, err) = wf(&data, &["--from-run", &run], OK_WINDOW, &["--bootstrap", "100", "--trials", "77"]);
+        let (code, c, err) = wf_book(&data, &["--from-run", &run], OK_WINDOW, &["--bootstrap", "100", "--trials", "77"]);
         assert_eq!(code, 0, "{err}");
         let mc = multiple(&c);
         assert_eq!(mt(&mc, &["trials"]), 77.0);
@@ -876,7 +884,7 @@ mod front {
         let data = write_data(&dir);
         let run = write_run(&dir, BOOK_RUN);
         let extra = ["--bootstrap", "100", "--allow-in-sample-windows"];
-        let (code, a, err) = wf(&data, &["--from-run", &run], IN_SAMPLE_WINDOW, &extra);
+        let (code, a, err) = wf_book(&data, &["--from-run", &run], IN_SAMPLE_WINDOW, &extra);
         assert_eq!(code, 0, "{err}");
         let m = multiple(&a);
         assert_eq!(mt(&m, &["trials"]), 1000.0);
@@ -919,7 +927,7 @@ mod front {
                 (OK_WINDOW, vec!["--bootstrap", "100"]),
                 (IN_SAMPLE_WINDOW, vec!["--bootstrap", "100", "--allow-in-sample-windows"]),
             ] {
-                let (code, out, err) = wf(&data, &[flag, path], window, &extra);
+                let (code, out, err) = if flag == "--from-run" { wf_book(&data, &[flag, path], window, &extra) } else { wf(&data, &[flag, path], window, &extra) };
                 assert_eq!(code, 0, "{flag} {window}: {err}");
                 let m = multiple(&out);
                 let in_sample = window == IN_SAMPLE_WINDOW;
