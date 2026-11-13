@@ -920,18 +920,21 @@ mod front {
     fn trials_fall_back_to_front_size() {
         let (_scratch, dir) = scratch("fallback");
         let data = write_data(&dir);
-        let front = write_run(&dir, &RUN.replace(r#""search":{"candidates_evaluated":4321},"#, ""));
-        let book = write_run(&dir, &BOOK_RUN.replace(r#""search":{"candidates_evaluated":1000},"#, ""));
-        for (flag, path) in [("--front", &front), ("--from-run", &book)] {
+        let no_count = [
+            ("--front", RUN.replace(r#""search":{"candidates_evaluated":4321},"#, "")),
+            ("--from-run", BOOK_RUN.replace(r#""search":{"candidates_evaluated":1000},"#, "")),
+        ];
+        for (flag, text) in &no_count {
+            let path = &write_run(&dir, text);
             for (window, extra) in [
                 (OK_WINDOW, vec!["--bootstrap", "100"]),
                 (IN_SAMPLE_WINDOW, vec!["--bootstrap", "100", "--allow-in-sample-windows"]),
             ] {
-                let (code, out, err) = if flag == "--from-run" { wf_book(&data, &[flag, path], window, &extra) } else { wf(&data, &[flag, path], window, &extra) };
+                let (code, out, err) = if *flag == "--from-run" { wf_book(&data, &[flag, path], window, &extra) } else { wf(&data, &[flag, path], window, &extra) };
                 assert_eq!(code, 0, "{flag} {window}: {err}");
                 let m = multiple(&out);
                 let in_sample = window == IN_SAMPLE_WINDOW;
-                let (n, s) = match (flag, in_sample) {
+                let (n, s) = match (*flag, in_sample) {
                     ("--from-run", false) => (1.0, "out_of_sample_book"),
                     _ => (3.0, "front_size"),
                 };

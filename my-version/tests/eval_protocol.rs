@@ -637,9 +637,9 @@ fn wf_markdown_psr_row() {
     o.trials = Some(1);
     o.trials_source = "out_of_sample_book";
     let md = walkforward::run_table_with(&t, &s, "t", &o).unwrap().markdown();
-    assert!(md.contains("Trials N = 1 (source out_of_sample_book) over"), "{md}");
+    assert!(md.contains("Trials N = 3 (source out_of_sample_book) over 3 candidate(s)"), "{md}");
     assert!(md.contains("Deflate across runs with rcsr trials."), "{md}");
-    let psr = md.find("| PSR (N = 1) | 1 | 0 |").expect("PSR row");
+    let psr = md.find("| PSR (N = 1) | 1.0000 | 0.0000 |").expect("PSR row");
     let dsr = md.find("| N_eff |").expect("DSR row");
     assert!(psr < dsr);
     o.trials_source = "flag";
