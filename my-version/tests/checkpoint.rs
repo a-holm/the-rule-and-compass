@@ -1,6 +1,4 @@
-//! Sa    let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
-    assert_eq!(cumulative.get("backend").and_then(|v| v.as_str()), Some("unknown"));
-e/resume tests (issue #17).
+//! Save/resume tests (issue #17).
 //!
 //! The central guarantee is trajectory determinism: an uninterrupted run and
 //! a run split at an arbitrary generation boundary must produce the same
