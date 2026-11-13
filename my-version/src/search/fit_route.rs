@@ -22,7 +22,7 @@
 use super::{
     fallback_batch_split, gate_proposals, gpu_status_label, maximum_status_fallback_cause, plan_fit_batch,
     order_stat_status_fallback_cause, plan_fallback_cause, status_fallback_cause, tail_status_cause, Config,
-    FallbackFitJob, FitBatch, FitFallbackCause, Ind, PipelineJob, TailJoin,
+    FallbackFitJob, FitAccept, FitBatch, FitFallbackCause, Ind, PipelineJob, TailJoin,
 };
 use crate::data::Sample;
 use crate::expr::Node;
@@ -42,6 +42,8 @@ pub(super) struct FitSettings {
     pub(super) thresholds: bool,
     /// `--fit-fallback-max`; `0` means unbounded.
     pub(super) fallback_max: usize,
+    /// #1078: when a candidate keeps its fitted constants.
+    pub(super) accept: FitAccept,
 }
 
 impl FitSettings {
@@ -52,7 +54,29 @@ impl FitSettings {
             polish: cfg.fit_polish,
             thresholds: cfg.fit_thresholds,
             fallback_max: cfg.fit_fallback_max,
+            accept: cfg.fit_accept,
         }
+    }
+}
+
+/// #1078: the acceptance rule of `--fit-accept fitness`. The unfitted candidate
+/// wins when its error is strictly lower, or finite against a non-finite fitted
+/// one; a tie keeps the fitted constants. A pure function of the two errors.
+pub(super) fn unfitted_wins(unfitted: f64, fitted: f64) -> bool {
+    match (unfitted.is_finite(), fitted.is_finite()) {
+        (true, false) => true,
+        (true, true) => unfitted < fitted,
+        _ => false,
+    }
+}
+
+/// #1078: [`unfitted_wins`] on two scored candidates. Returns the winner and
+/// whether it is the fitted one.
+pub(super) fn accept_fit(unfitted: Ind, fitted: Ind) -> (Ind, bool) {
+    if unfitted_wins(unfitted.error, fitted.error) {
+        (unfitted, false)
+    } else {
+        (fitted, true)
     }
 }
 
@@ -1075,7 +1099,7 @@ mod tests {
     }
 
     fn settings(metric: Metric, cap: usize, thresholds: bool) -> FitSettings {
-        FitSettings { iters: ITERS, metric, polish: FitPolish::default(), thresholds, fallback_max: cap }
+        FitSettings { iters: ITERS, metric, polish: FitPolish::default(), thresholds, fallback_max: cap, accept: FitAccept::Always }
     }
 
     /// A dispatcher that sends every batch to the device (0), refuses every
@@ -1479,6 +1503,16 @@ mod tests {
         *rng.pick(&[0, 1, 2, n / 2, n, n + 3])
     }
 
+    /// #1078: the acceptance rule runs after the route and never reaches it, so
+    /// both values must give the same route output.
+    fn accept_of(seed: u32) -> FitAccept {
+        if seed % 2 == 0 {
+            FitAccept::Always
+        } else {
+            FitAccept::Fitness
+        }
+    }
+
     fn assert_same_tree(a: &Node, b: &Node, what: &str) {
         assert!(crate::expr::same(a, b), "{what}: {a:?} against {b:?}");
     }
@@ -1507,7 +1541,7 @@ mod tests {
         let overlap = rng.bool(0.5);
         let kind = rng.usize_below(3);
         let thresholds = rng.bool(0.25);
-        let settings = settings(metric, cap_for(&mut rng, admitted.len()), thresholds);
+        let settings = FitSettings { accept: accept_of(seed), ..settings(metric, cap_for(&mut rng, admitted.len()), thresholds) };
         let mut grid: Vec<Vec<Node>> = islands.iter().map(|pop| pop.iter().map(|ind| ind.tree.clone()).collect()).collect();
         let call = |plans: &[&GpuFitPlan], keys: &[(usize, usize)]| {
             let s: Vec<Script> = keys.iter().map(|k| scripts[k]).collect();
@@ -1589,7 +1623,7 @@ mod tests {
         let failed: Vec<bool> = flushes.iter().map(|_| rng.bool(0.05)).collect();
         let overlap = rng.bool(0.5);
         let thresholds = rng.bool(0.25);
-        let settings = settings(metric, cap_for(&mut rng, all.len()), thresholds);
+        let settings = FitSettings { accept: accept_of(seed), ..settings(metric, cap_for(&mut rng, all.len()), thresholds) };
         let call = |n: usize, plans: &[&GpuFitPlan], keys: &[(usize, usize)]| {
             let s: Vec<Script> = keys.iter().map(|k| scripts[k]).collect();
             recorded(plans, &s, arm, failed[n])
