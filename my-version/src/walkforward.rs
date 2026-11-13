@@ -723,7 +723,10 @@ pub fn run_path_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Res
 /// #284: the ledger clock covers the whole call. Stage windows are measured;
 /// `host_other` is the rest of the wall (layout, parsing, assembly).
 fn close_ledger(ledger: &mut crate::gpu_stats::RunLedger, clock: std::time::Instant) {
-    let wall = clock.elapsed().as_secs_f64();
+    close_ledger_at(ledger, clock.elapsed().as_secs_f64());
+}
+
+fn close_ledger_at(ledger: &mut crate::gpu_stats::RunLedger, wall: f64) {
     ledger.record_stage(crate::gpu_stats::Stage::HostOther, wall - ledger.stage_sum_s());
     ledger.set_wall(wall);
 }
@@ -4318,5 +4321,50 @@ mod locked_reach_tests {
         assert_eq!(a.periods.len(), 2);
         assert_eq!(a.periods[0].count, 2);
         assert_eq!(a.periods[0].time, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod close_ledger_tests {
+    use super::*;
+    use crate::gpu_stats::{RunLedger, Stage};
+
+    fn next(state: &mut u64) -> f64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        let unit = (*state >> 11) as f64 / (1u64 << 53) as f64;
+        1e-6 * (1e7f64).powf(unit)
+    }
+
+    #[test]
+    fn the_ledger_closes_exactly_for_any_stage_seconds() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut inexact_sum = 0usize;
+        for set in 0..1000 {
+            let mut ledger = RunLedger::new();
+            for stage in [Stage::Io, Stage::Pnl, Stage::Fit] {
+                ledger.record_stage(stage, next(&mut state) * 0.1);
+            }
+            let sum = ledger.stage_sum_s();
+            let wall = sum + next(&mut state);
+            if sum + (wall - sum) != wall {
+                inexact_sum += 1;
+            }
+            close_ledger_at(&mut ledger, wall);
+            assert_eq!(ledger.closure_residual().value, 0.0, "set {set}");
+            assert_eq!(ledger.stage_sum_s(), ledger.wall_s(), "set {set}");
+            assert!((ledger.wall_s() - wall).abs() <= wall * 2.3e-16, "set {set}: wall moved more than one ULP");
+        }
+        assert!(inexact_sum > 0, "the generated sets never hit s + (wall - s) != wall");
+    }
+
+    #[test]
+    fn an_overbooked_ledger_keeps_its_wall() {
+        let mut ledger = RunLedger::new();
+        ledger.record_stage(Stage::Pnl, 2.0);
+        close_ledger_at(&mut ledger, 1.0);
+        assert_eq!(ledger.wall_s(), 1.0);
+        assert_eq!(ledger.closure_residual().value, 0.0);
     }
 }

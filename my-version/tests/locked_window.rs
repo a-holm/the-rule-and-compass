@@ -4,6 +4,8 @@
 
 #[path = "common/rcsr.rs"]
 mod rcsr_cmd;
+#[path = "common/timing.rs"]
+mod timing;
 
 use rcsr::devlog::Json;
 use rcsr::lockbox::{self, Lockbox};
@@ -359,32 +361,8 @@ fn dev_ladder(data: &str, win: &str, out: &str, purge: &str) -> (i32, String) {
     (code, err)
 }
 
-fn is_timing_key(key: &str) -> bool {
-    key.ends_with("_s")
-        || key.ends_with("_ms")
-        || key.ends_with("_seconds")
-        || key.starts_with("wall")
-        || key.starts_with("elapsed")
-        || ["numerator", "denominator", "device_fraction", "duty_run", "declared_in", "bytes_per_s", "rows_per_s"]
-            .contains(&key)
-}
-
-fn drop_timing(value: Json) -> Json {
-    match value {
-        Json::Obj(items) => Json::Obj(
-            items
-                .into_iter()
-                .filter(|(key, _)| !is_timing_key(key))
-                .map(|(key, v)| (key, drop_timing(v)))
-                .collect(),
-        ),
-        Json::Arr(items) => Json::Arr(items.into_iter().map(drop_timing).collect()),
-        other => other,
-    }
-}
-
 fn without_timing(json: &str) -> Json {
-    drop_timing(Json::parse(json).unwrap_or_else(|| panic!("not one JSON document: {json}")))
+    timing::drop_timing(Json::parse(json).unwrap_or_else(|| panic!("not one JSON document: {json}")))
 }
 
 #[test]
@@ -396,6 +374,14 @@ fn without_timing_drops_timing_keys_and_keeps_data() {
     assert_eq!(without_timing(a), without_timing(b));
     assert_ne!(without_timing(a), without_timing(c));
     assert_ne!(without_timing(a), without_timing(d));
+}
+
+#[test]
+fn without_timing_drops_the_ledger_closure_ratio() {
+    let a = r#"{"ledger":{"closure":{"value":1e-16}},"rows":5}"#;
+    let b = r#"{"ledger":{"closure":{"value":0}},"rows":5}"#;
+    assert_eq!(without_timing(a), without_timing(b));
+    assert_ne!(without_timing(a), without_timing(&a.replace("5", "6")));
 }
 
 #[test]
