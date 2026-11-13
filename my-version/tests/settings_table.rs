@@ -34,6 +34,7 @@ fn sample(row: &dyn Setting) -> Option<&'static str> {
         "--selection" => "afp",
         "--restart-policy" => "island",
         "--restart-isolation" => "7",
+        "--restart-interval" => "7",
         "--explore-islands" => "1",
         "--front-scope" => "island",
         "--migration-policy" => "ring-tournament",
@@ -206,7 +207,8 @@ fn resume_conflict_lines_are_pinned() {
     assert!(made.status.success(), "save run failed: {}", String::from_utf8_lossy(&made.stderr));
     let resumed = rcsr_cmd::rcsr()
         .args(base)
-        .args(["--resume", cp, "--patience", "7", "--selection", "afp", "--restart-policy", "archive"])
+        .args(["--resume", cp, "--patience", "7", "--restart-interval", "7", "--selection", "afp"])
+        .args(["--restart-policy", "archive"])
         .args(["--restart-isolation", "7", "--mutation-mix", "extended", "--crossover-internal", "0.25"])
         .args(["--adaptive-mix", "--reject-constant-offspring", "--reject-fixed-position", "--fit-thresholds"])
         .args(["--variation", "node"])
@@ -220,6 +222,7 @@ fn resume_conflict_lines_are_pinned() {
         lines,
         [
             "--patience 7 (saved 40)",
+            "--restart-interval 7 (saved restart_interval is 60)",
             "--selection afp (saved lexicographic)",
             "--restart-policy archive (saved restart_policy is island)",
             "--restart-isolation 7 (saved restart_isolation is 25)",

@@ -207,6 +207,7 @@ fn exit_on_resume_conflicts(path: &str, conflicts: &[String]) {
 
 fn usage() -> String {
     let help_stop = settings::help(Group::Stop);
+    let help_schedule = settings::help(Group::Schedule);
     let help_island = settings::help(Group::Island);
     let help_variation = settings::help(Group::Variation);
     let help_filter = settings::help(Group::Filter);
@@ -892,6 +893,7 @@ SEARCH:
                              unique tree
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
   --no-dedup                 disable structural de-duplication
+{help_schedule}
 {help_island}
 {help_variation}
   --no-front-parents         draw every parent from the island tournament;
@@ -4056,6 +4058,7 @@ fn main() {
                 cfg.fit_fallback_max, saved.fit_fallback_max
             ));
         }
+        settings::conflicts(Group::Schedule, &cfg, &saved, &explicit, &mut conflicts); // #1109
         settings::conflicts(Group::Island, &cfg, &saved, &explicit, &mut conflicts); // #1083
         // #495: the band decides which finalists get the exact refit.
         if refit_band_set && !cp.refit_band_unknown && cfg.refit_band != saved.refit_band {
