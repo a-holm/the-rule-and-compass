@@ -709,8 +709,6 @@ pub fn select_band(
 pub const ROBUST_RESAMPLES: usize = 500;
 /// Seed of the bootstrap; every member sees the same draws.
 pub const ROBUST_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
-/// Default circular block length, in periods.
-pub const ROBUST_BLOCK_LEN: usize = 21;
 
 /// `--select-rule`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -744,7 +742,8 @@ impl SelectRule {
 pub struct RobustParams {
     pub blocks: usize,
     pub se_z: f64,
-    pub block_len: usize,
+    /// `--select-block-len`; `None` is the per-member default rule.
+    pub block_len: Option<usize>,
 }
 
 impl RobustParams {
@@ -759,7 +758,7 @@ impl RobustParams {
         if !self.se_z.is_finite() || self.se_z < 0.0 {
             return Err(format!("--select-se must be finite and >= 0, got {}", self.se_z));
         }
-        if self.block_len == 0 {
+        if self.block_len == Some(0) {
             return Err("--select-block-len must be at least 1".to_string());
         }
         Ok(())
@@ -768,7 +767,7 @@ impl RobustParams {
 
 impl Default for RobustParams {
     fn default() -> Self {
-        RobustParams { blocks: 4, se_z: 1.0, block_len: ROBUST_BLOCK_LEN }
+        RobustParams { blocks: 4, se_z: 1.0, block_len: None }
     }
 }
 
@@ -794,6 +793,8 @@ pub struct RobustMember {
     pub pooled_alpha: f64,
     pub se: f64,
     pub eligible: bool,
+    /// Circular block length of the standard error, in periods.
+    pub block_len: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -822,7 +823,7 @@ pub fn circular_block_se(series: &[f64], block_len: usize, resamples: usize, see
     if t < 2 || resamples < 2 {
         return 0.0;
     }
-    let len = block_len.clamp(1, t);
+    let len = block_len.clamp(1, (t / 2).max(1));
     let mut prefix = vec![0.0f64; 2 * t + 1];
     for k in 0..2 * t {
         prefix[k + 1] = prefix[k] + series[k % t];
@@ -843,6 +844,13 @@ pub fn circular_block_se(series: &[f64], block_len: usize, resamples: usize, see
     let mean = means.iter().sum::<f64>() / resamples as f64;
     let var = means.iter().map(|m| (m - mean) * (m - mean)).sum::<f64>() / (resamples - 1) as f64;
     var.sqrt()
+}
+
+/// Block length of one member: the flag when given, else the walk-forward rule
+/// `max(ceil(cbrt(t)), hold)` capped at a quarter of the `periods`, which keeps
+/// at least 4 blocks per resample.
+fn member_block_len(flag: Option<usize>, periods: usize, hold: usize) -> usize {
+    flag.unwrap_or_else(|| crate::inference::auto_block_len(periods, 1, hold).min((periods / 4).max(1)))
 }
 
 /// The robust finalist rule. Reads the validation rows only: `ret` and `rows`
@@ -875,9 +883,17 @@ pub fn select_robust_specs(
     pred_of: &mut dyn FnMut(usize) -> Vec<f64>,
 ) -> Result<RobustSelection, String> {
     params.validate()?;
-    let mut stamps: Vec<f64> = rows.time.iter().copied().filter(|t| t.is_finite()).collect();
+    let bucket = if metas.is_empty() { None } else { spec_of(0).period_seconds.filter(|s| *s > 0.0) };
+    let mut stamps: Vec<f64> = rows
+        .time
+        .iter()
+        .copied()
+        .filter(|t| t.is_finite())
+        .map(|t| bucket.map_or(t, |s| (t / s).floor()))
+        .collect();
     stamps.sort_by(|a, b| a.total_cmp(b));
     stamps.dedup();
+    let periods = stamps.len();
     if stamps.len() < params.blocks {
         return Err(format!(
             "--select-blocks {} needs at least {} distinct validation timestamps, found {}",
@@ -885,6 +901,16 @@ pub fn select_robust_specs(
             params.blocks,
             stamps.len()
         ));
+    }
+    if let Some(len) = params.block_len {
+        if len > periods / 2 {
+            return Err(format!(
+                "--select-block-len {} is above half the {} validation periods ({}): the circular bootstrap would resample the whole series",
+                len,
+                periods,
+                periods / 2
+            ));
+        }
     }
     let mut members = Vec::with_capacity(metas.len());
     for (i, m) in metas.iter().enumerate() {
@@ -897,7 +923,9 @@ pub fn select_robust_specs(
             Some(a) => {
                 let positive = a.block_alpha.iter().filter(|&&v| v > 0.0).count();
                 let eligible = positive + 1 >= params.blocks && a.pooled_alpha > 0.0;
-                let se = circular_block_se(&a.series, params.block_len, ROBUST_RESAMPLES, ROBUST_SEED);
+                let hold = if a.entries == 0 { 1 } else { a.long_rows.div_ceil(a.entries) };
+                let block_len = member_block_len(params.block_len, periods, hold);
+                let se = circular_block_se(&a.series, block_len, ROBUST_RESAMPLES, ROBUST_SEED);
                 RobustMember {
                     archive_rank: m.archive_rank,
                     complexity: m.complexity,
@@ -906,6 +934,7 @@ pub fn select_robust_specs(
                     pooled_alpha: a.pooled_alpha,
                     se,
                     eligible,
+                    block_len,
                 }
             }
             None => RobustMember {
@@ -916,6 +945,7 @@ pub fn select_robust_specs(
                 pooled_alpha: 0.0,
                 se: 0.0,
                 eligible: false,
+                block_len: member_block_len(params.block_len, periods, 1),
             },
         };
         members.push(member);
@@ -976,14 +1006,15 @@ impl RobustSelection {
             .iter()
             .map(|m| {
                 format!(
-                    "{{\"archive_rank\":{},\"complexity\":{},\"trades\":{},\"block_alpha\":[{}],\"pooled_alpha\":{},\"se\":{},\"eligible\":{}}}",
+                    "{{\"archive_rank\":{},\"complexity\":{},\"trades\":{},\"block_alpha\":[{}],\"pooled_alpha\":{},\"se\":{},\"eligible\":{},\"block_len\":{}}}",
                     m.archive_rank,
                     num(m.complexity),
                     m.trades,
                     m.block_alpha.iter().map(|v| num(*v)).collect::<Vec<_>>().join(","),
                     num(m.pooled_alpha),
                     num(m.se),
-                    m.eligible
+                    m.eligible,
+                    m.block_len
                 )
             })
             .collect();
@@ -998,7 +1029,7 @@ impl RobustSelection {
             "\"rule\":\"robust\",\"blocks\":{},\"se_z\":{},\"block_len\":{},\"verdict\":\"{}\",\"members\":[{}],\"chosen_rank\":{}{}",
             self.params.blocks,
             num(self.params.se_z),
-            self.params.block_len,
+            self.params.block_len.map_or_else(|| "null".to_string(), |l| l.to_string()),
             verdict,
             members.join(","),
             self.chosen.map_or_else(|| "null".to_string(), |i| self.members[i].archive_rank.to_string()),
