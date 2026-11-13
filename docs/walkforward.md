@@ -127,9 +127,22 @@ Defaults taken from the run, each overridden by its explicit flag:
 |---|---|---|
 | variables | `variables` | `--vars` |
 | return column | `target_spec.return_column` | `--target` |
-| trials of the deflated Sharpe | `search.candidates_evaluated` (offspring scored over the run, summed over islands and generations, kept across `--resume`) | `--trials` (without either, exit 2) |
+| trials of the deflated Sharpe | the trials that selected on the scored rows (rule below); `search.candidates_evaluated` (offspring scored over the run, summed over islands and generations, kept across `--resume`) only when a window is in sample | `--trials` |
 | position rule | `objective.spec.threshold`, used as a fixed threshold | `--threshold-fixed`, `--threshold-quantile` |
 | per-side cost | `objective.spec.per_side_bps` | `--cost-bps` |
+
+Default trials of the deflated Sharpe (#1027), shared by `--front` and `--from-run`. The report states the source in `multiple_testing.n_trials_source`:
+
+| case | trials | `n_trials_source` |
+|---|---|---|
+| `--trials N` | `N` | `flag` |
+| `--from-run`, no in-sample window | 1 | `out_of_sample_book` |
+| `--front`, no in-sample window | front size `k` | `front_size` |
+| a window is in sample (`--allow-in-sample-windows`), run has `search.candidates_evaluated > 0` | `candidates_evaluated` | `run.candidates_evaluated` |
+| the same without `candidates_evaluated` | front size | `front_size` |
+| `--expr` | candidate count | `candidate_count` |
+
+An out-of-sample window is not in the sample the search compared, so the search trials do not shift the null of its Sharpe. With `N = 1` the expected maximum Sharpe is 0 and the value is the probabilistic Sharpe ratio (PSR), reported as `multiple_testing.psr`. Deflate across the books of a campaign with `rcsr trials`.
 
 A run with an `--objective` selects under `1[pred > threshold]`. Without the carried threshold the walk-forward would use its 0.70 training quantile and score the front under a different book than the one it was selected on.
 
@@ -600,6 +613,8 @@ The benchmark table has the same fields for the strategy, `cash`, `buy_and_hold`
 * **Design effect**: the variance of the bootstrap mean with blocks over the same with iid rows (`L = 1`). `effective_n = n / design_effect`, in periods (hours on an hourly grid). The `p_mean_positive` field is the one-sided centred p-value `(1 + count) / (B + 1)`.
 * **N_eff**: the participation ratio of the candidate correlation matrix, `N^2 / sum c_ij^2`; identical candidates give 1 and uncorrelated ones give `N`. With `--trials N` the effective trials are `N * PR / candidates`.
 * **DSR** (Bailey and Lopez de Prado) at `N_eff` and `10 N_eff`, with `SR0 = sqrt(V) ((1-g) Z(1-1/N) + g Z(1-1/(N e)))`, `V` the variance of the candidate Sharpes (the Mertens estimator variance with one candidate), `T` the effective n, and skew and raw kurtosis of the series. All inputs are in the report.
+* **PSR** (`multiple_testing.psr`): the same formula at `N = 1` (`SR0 = 0`), the probabilistic Sharpe ratio against a zero benchmark. `--from-run` with no in-sample window has `N = 1`, so `psr` equals `dsr_at_n_eff`. `n_trials_source` names where `trials` comes from (see the default table under `--front`).
+* **MinBTL** (`multiple_testing.min_btl_years`): `inference::min_btl_years(sharpe_annual, n_eff)`; 0 at `n_eff = 1`, NaN (null) when the annual Sharpe is not positive.
 * **PBO** by CSCV with `--pbo-blocks` (default 16) blocks, per-period Sharpe as the measure; needs two candidates.
 * **SPA** (Hansen 2005, joint circular block bootstrap, consistent, lower and upper recentering) of the candidates against the best long/flat baseline.
 * **BH-FDR** at `--fdr-q` over the per-candidate one-sided block-bootstrap p-values.
