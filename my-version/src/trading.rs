@@ -1386,6 +1386,8 @@ pub const FITNESS_MAX_BLOCKS: usize = 8;
 pub const FITNESS_DEVICE_MAX_HOLD: usize = 32;
 /// The block id of a row sits in bits 2 to 4 of its [`FitnessBook::flags`] byte.
 pub const FITNESS_BLOCK_SHIFT: u8 = 2;
+/// #1180: bit 5 of a [`FitnessBook::flags`] byte marks a row outside the regime mask.
+pub const FITNESS_MASK_OFF: u8 = 0x20;
 
 /// Time block of every row: the sorted distinct timestamps are cut into
 /// `blocks` runs of equal count, the last run takes the remainder. Rows with
@@ -1462,6 +1464,15 @@ impl BookShape {
     }
 }
 
+/// #1180: the regime mask of a [`FitnessBook`]: `on[i]` is the gate state of
+/// training row `i`; `identity` names the gate (expression, band and dwell) for
+/// the book hash.
+#[derive(Clone, Copy, Debug)]
+pub struct BookMask<'a> {
+    pub on: &'a [bool],
+    pub identity: &'a str,
+}
+
 /// Exact CPU `f64` long/flat net regret on the canonical training rows.
 ///
 /// `regret = (B - net) / B`, with `net` the excess net over cash and `B` the
@@ -1484,6 +1495,8 @@ pub struct FitnessBook {
     min_hold: usize,
     /// #1023: the sub-books of the lexicase cases, built on first use.
     cases: std::sync::OnceLock<BookCases>,
+    /// #1180: rows with the regime mask off; 0 for an unmasked book.
+    off_rows: usize,
 }
 
 /// #1023: the `(group, time block)` sub-books of a [`FitnessBook`]: one per run
@@ -1525,14 +1538,18 @@ impl FitnessBook {
         blocks: usize,
         lambda: f64,
     ) -> Result<Self, String> {
-        Self::with_segments(slice, spec, horizon_seconds, blocks, lambda, &[])
+        Self::with_segments(slice, spec, horizon_seconds, blocks, lambda, &[], None)
     }
 
-    /// #1173: [`FitnessBook::with_blocks`] where the rows stamped from
-    /// `segment_starts[k]` up to the next start form segment `k`: every
-    /// `(group, segment)` run is its own book (it starts flat and pays its final
-    /// exit) and the hindsight bound is the sum of the run bounds. With fewer than
-    /// two starts it is `with_blocks` exactly.
+    /// #1173 and #1180: the one constructor. The rows stamped from
+    /// `segment_starts[k]` up to the next start form interval segment `k`; with
+    /// fewer than two starts there are no segments. Under a regime mask, rows
+    /// with the mask off are forced flat and earn and pay nothing. Every
+    /// maximal run of on rows of a `(group, segment)` starts flat and pays its
+    /// exit at its last row, so it is a book segment like a group or a time
+    /// block; the hindsight bounds are computed on those runs. No segments and
+    /// no mask is `with_blocks` exactly, and a mask with every row on is the
+    /// unmasked book, hash included.
     pub fn with_segments(
         slice: &crate::data::TradingSlice,
         spec: &TradingSpec,
@@ -1540,6 +1557,7 @@ impl FitnessBook {
         blocks: usize,
         lambda: f64,
         segment_starts: &[f64],
+        mask: Option<BookMask>,
     ) -> Result<Self, String> {
         if blocks == 0 || blocks > FITNESS_MAX_BLOCKS {
             return Err(format!("the block count must be 1 to {}, got {}", FITNESS_MAX_BLOCKS, blocks));
@@ -1588,7 +1606,13 @@ impl FitnessBook {
         let mut flags = rows.seam_flags();
         let groups = flags.iter().filter(|&&f| f & TradingRows::FIRST != 0).count();
         let side = spec.per_side_bps() * BP;
-        let run_key: Option<Vec<u64>> = (segment_starts.len() > 1).then(|| {
+        if let Some(m) = &mask {
+            if m.on.len() != n {
+                return Err(format!("the regime mask has {} rows, the training slice {}", m.on.len(), n));
+            }
+        }
+        let mask = mask.filter(|m| m.on.iter().any(|&o| !o));
+        if segment_starts.len() > 1 {
             let segment = |t: f64| segment_starts.partition_point(|s| *s <= t);
             for i in 1..n {
                 if rows.group[i] == rows.group[i - 1] && segment(rows.time[i]) != segment(rows.time[i - 1]) {
@@ -1596,6 +1620,24 @@ impl FitnessBook {
                     flags[i - 1] |= TradingRows::LAST;
                 }
             }
+        }
+        let mut off_rows = 0usize;
+        if let Some(m) = &mask {
+            let seam = flags.clone();
+            for i in 0..n {
+                let off = !m.on[i];
+                let first = seam[i] & TradingRows::FIRST != 0 || off || (i > 0 && !m.on[i - 1]);
+                let last = seam[i] & TradingRows::LAST != 0 || off || (i + 1 < n && !m.on[i + 1]);
+                flags[i] = (if first { TradingRows::FIRST } else { 0 })
+                    | (if last { TradingRows::LAST } else { 0 })
+                    | (if off { FITNESS_MASK_OFF } else { 0 });
+                if off {
+                    excess[i] = 0.0;
+                    off_rows += 1;
+                }
+            }
+        }
+        let run_key: Option<Vec<u64>> = (segment_starts.len() > 1 || mask.is_some()).then(|| {
             let mut id = 0u64;
             (0..n)
                 .map(|i| {
@@ -1610,7 +1652,8 @@ impl FitnessBook {
         let bound = trading_gpu::dp_bound(&excess, run_of, side)?;
         if !(bound > 0.0) {
             return Err(format!(
-                "no profitable long/flat path exists on the training rows at {} bp per side (hindsight bound {})",
+                "no profitable long/flat path exists on the {}training rows at {} bp per side (hindsight bound {})",
+                if mask.is_some() { "masked " } else { "" },
                 spec.per_side_bps(),
                 bound
             ));
@@ -1631,11 +1674,12 @@ impl FitnessBook {
                 let bb = trading_gpu::dp_bound(&e, &g, side)?;
                 if !(bb > 0.0) {
                     return Err(format!(
-                        "no profitable long/flat path exists in time block {} of {} at {} bp per side (hindsight bound {})",
+                        "no profitable long/flat path exists in time block {} of {} at {} bp per side (hindsight bound {}){}",
                         b + 1,
                         blocks,
                         spec.per_side_bps(),
-                        bb
+                        bb,
+                        if mask.is_some() { ": the regime mask has no profitable on row in this block" } else { "" }
                     ));
                 }
                 block_bounds.push(bb);
@@ -1645,6 +1689,7 @@ impl FitnessBook {
                 let last = flags[i] & TradingRows::LAST != 0 || (i + 1 < n && ids[i] != ids[i + 1]);
                 flags[i] = (if first { TradingRows::FIRST } else { 0 })
                     | (if last { TradingRows::LAST } else { 0 })
+                    | (flags[i] & FITNESS_MASK_OFF)
                     | (ids[i] << FITNESS_BLOCK_SHIFT);
             }
         }
@@ -1674,6 +1719,13 @@ impl FitnessBook {
                 fnv_u64(&mut hash, SCORE_SD_ALGORITHM);
             }
         }
+        if let Some(m) = &mask {
+            fnv_u64(&mut hash, 0x6d61_736b_u64);
+            fnv_u64(&mut hash, off_rows as u64);
+            for b in m.identity.bytes() {
+                fnv_u64(&mut hash, b as u64);
+            }
+        }
         Ok(FitnessBook {
             excess,
             flags,
@@ -1689,6 +1741,7 @@ impl FitnessBook {
             band_units: spec.band.units,
             min_hold: spec.min_holding,
             cases: std::sync::OnceLock::new(),
+            off_rows,
         })
     }
 
@@ -1746,8 +1799,10 @@ impl FitnessBook {
     /// order-free.
     pub fn totals(&self, pred: &[f64]) -> FitnessTotals {
         self.check_len(pred);
+        let forced = self.force_flat(pred);
+        let pred: &[f64] = &forced;
         if !self.is_plain() {
-            return self.band_pass(pred, self.resolve_band(pred), false)[0];
+            return self.band_pass_forced(pred, self.resolve_band(pred), false)[0];
         }
         let n = self.excess.len();
         let mut warps = [0.0f64; FITNESS_WARPS];
@@ -1840,10 +1895,10 @@ impl FitnessBook {
     pub fn regret_and_shape(&self, pred: &[f64]) -> (f64, BookShape) {
         if self.blocks() == 1 {
             let t = self.totals(pred);
-            (self.regret_of(&t), BookShape::of(self.len(), std::slice::from_ref(&t)))
+            (self.regret_of(&t), BookShape::of(self.len() - self.off_rows, std::slice::from_ref(&t)))
         } else {
             let t = self.block_totals(pred);
-            (self.fitness_of(&t), BookShape::of(self.len(), &t))
+            (self.fitness_of(&t), BookShape::of(self.len() - self.off_rows, &t))
         }
     }
 
@@ -1869,8 +1924,10 @@ impl FitnessBook {
     /// exactly as [`FitnessBook::totals`] does for the whole book.
     pub fn block_totals(&self, pred: &[f64]) -> Vec<FitnessTotals> {
         self.check_len(pred);
+        let forced = self.force_flat(pred);
+        let pred: &[f64] = &forced;
         if !self.is_plain() {
-            return self.band_pass(pred, self.resolve_band(pred), true);
+            return self.band_pass_forced(pred, self.resolve_band(pred), true);
         }
         let nb = self.blocks();
         let n = self.excess.len();
@@ -2016,8 +2073,34 @@ impl FitnessBook {
     pub fn resolve_band(&self, pred: &[f64]) -> f64 {
         match self.band_units {
             BandUnits::Score => self.band,
+            BandUnits::Sd if self.off_rows > 0 => {
+                // #1180: the sd reads the rows inside the mask only.
+                let on: Vec<f64> = pred.iter().zip(&self.flags).filter(|(_, f)| *f & FITNESS_MASK_OFF == 0).map(|(p, _)| *p).collect();
+                score_sd(&on).sd.map_or(0.0, |s| self.band * s)
+            }
             BandUnits::Sd => score_sd(pred).sd.map_or(0.0, |s| self.band * s),
         }
+    }
+
+    /// #1180: rows outside the regime mask; 0 for an unmasked book.
+    pub fn masked_rows(&self) -> usize {
+        self.off_rows
+    }
+
+    pub fn is_masked(&self) -> bool {
+        self.off_rows > 0
+    }
+
+    /// #1180: the prediction vector with every row outside the regime mask
+    /// replaced by the lowest finite score, so the book holds no position
+    /// there; a non-finite score outside the mask is ignored.
+    fn force_flat<'a>(&self, pred: &'a [f64]) -> std::borrow::Cow<'a, [f64]> {
+        if self.off_rows == 0 {
+            return std::borrow::Cow::Borrowed(pred);
+        }
+        std::borrow::Cow::Owned(
+            pred.iter().zip(&self.flags).map(|(&p, &f)| if f & FITNESS_MASK_OFF != 0 { f64::MIN } else { p }).collect(),
+        )
     }
 
     /// #925: the band automaton ([`trading_gpu::BandParams::next`]) over the
@@ -2027,6 +2110,10 @@ impl FitnessBook {
     /// [`FitnessBook::totals`] for `gross`.
     pub fn band_pass(&self, pred: &[f64], band: f64, per_block: bool) -> Vec<FitnessTotals> {
         self.check_len(pred);
+        self.band_pass_forced(&self.force_flat(pred), band, per_block)
+    }
+
+    fn band_pass_forced(&self, pred: &[f64], band: f64, per_block: bool) -> Vec<FitnessTotals> {
         let nb = if per_block { self.blocks() } else { 1 };
         let n = self.excess.len();
         let params = trading_gpu::BandParams { threshold: self.threshold, band, min_hold: self.min_hold };
@@ -2124,7 +2211,8 @@ impl FitnessBook {
     pub fn case_totals(&self, pred: &[f64]) -> Vec<FitnessTotals> {
         self.check_len(pred);
         let band = (!self.is_plain()).then(|| self.resolve_band(pred));
-        self.cases().ranges.iter().map(|&(s, e)| self.run_totals(pred, s, e, band)).collect()
+        let forced = self.force_flat(pred);
+        self.cases().ranges.iter().map(|&(s, e)| self.run_totals(&forced, s, e, band)).collect()
     }
 
     /// #1023: the regret `(B_c - net_c) / B_c` of every kept case, from the same
@@ -2134,6 +2222,8 @@ impl FitnessBook {
     pub fn case_errors(&self, pred: &[f64]) -> Vec<f32> {
         self.check_len(pred);
         let band = (!self.is_plain()).then(|| self.resolve_band(pred));
+        let forced = self.force_flat(pred);
+        let pred: &[f64] = &forced;
         let cases = self.cases();
         cases
             .kept
@@ -2228,6 +2318,9 @@ impl FitnessBook {
                 time.len(),
                 n
             ));
+        }
+        if self.is_masked() {
+            return Err("cut sweep: the book has a regime mask".to_string());
         }
         if !self.is_plain() {
             return Err("cut sweep: the book is not plain (it has a band or a minimum hold)".to_string());
@@ -2530,6 +2623,43 @@ pub struct FinalistReport {
     /// #929: the label whose return column prices the book, when it is not the fit label.
     pub book_target: Option<String>,
     pub test: Result<PathStats, String>,
+    /// #1180: the regime mask of `--pnl-mask`, when the books were priced under one.
+    pub mask: Option<MaskReport>,
+}
+
+/// #1180: the mask of one validation or test block.
+#[derive(Clone, Debug)]
+pub struct MaskedBlock {
+    /// Rows with the mask on over rows.
+    pub on_share: f64,
+    /// Maximal on-runs over all groups: the segments of the book.
+    pub runs: usize,
+    /// Net P&L of the same formula without the mask, for reference.
+    pub unmasked_net_pnl: Option<f64>,
+}
+
+/// #1180: `objective.validation.mask` and `objective.test.mask`.
+#[derive(Clone, Debug)]
+pub struct MaskReport {
+    pub expr: String,
+    pub band: f64,
+    pub dwell: usize,
+    pub validation: Option<MaskedBlock>,
+    pub test: MaskedBlock,
+}
+
+impl MaskReport {
+    fn json(&self, block: &MaskedBlock) -> String {
+        format!(
+            "\"mask\":{{\"expr\":{},\"band\":{},\"dwell\":{},\"on_share\":{},\"runs\":{}}},\"unmasked_net_pnl\":{}",
+            crate::devlog::text(&self.expr),
+            num(self.band),
+            self.dwell,
+            num(block.on_share),
+            block.runs,
+            block.unmasked_net_pnl.map_or_else(|| "null".to_string(), num)
+        )
+    }
 }
 
 impl FinalistReport {
@@ -2537,17 +2667,35 @@ impl FinalistReport {
         let mut s = self.spec.json();
         s.pop();
         s.push_str(&format!(
-            ",\"min_group_step_seconds\":{},\"horizon_seconds\":{}}}",
+            ",\"min_group_step_seconds\":{},\"horizon_seconds\":{}",
             self.min_group_step.map_or_else(|| "null".to_string(), num),
             num(self.horizon_seconds)
         ));
+        if let Some(m) = &self.mask {
+            s.push_str(&format!(
+                ",\"pnl_mask\":{{\"expr\":{},\"band\":{},\"dwell\":{}}}",
+                crate::devlog::text(&m.expr),
+                num(m.band),
+                m.dwell
+            ));
+        }
+        s.push('}');
         s
     }
 
     pub fn json(&self, backend: &str, backend_reason: Option<&str>) -> String {
-        let block = |r: &Result<PathStats, String>| match r {
-            Ok(s) => s.json(),
-            Err(e) => format!("{{\"unusable\":{}}}", crate::devlog::text(e)),
+        let block = |r: &Result<PathStats, String>, mask: Option<&MaskedBlock>| {
+            let mut out = match r {
+                Ok(s) => s.json(),
+                Err(e) => format!("{{\"unusable\":{}}}", crate::devlog::text(e)),
+            };
+            if let (Some(rep), Some(m)) = (&self.mask, mask) {
+                out.pop();
+                out.push(',');
+                out.push_str(&rep.json(m));
+                out.push('}');
+            }
+            out
         };
         format!(
             "{{\"name\":\"{}\",{}\"position\":\"{}\",\"selection\":\"{}\",\
@@ -2588,8 +2736,8 @@ impl FinalistReport {
             self.search_fitness
                 .map(|k| format!(",\"search_fitness\":\"{}\"", k))
                 .unwrap_or_default(),
-            block(&self.validation),
-            block(&self.test)
+            block(&self.validation, self.mask.as_ref().and_then(|m| m.validation.as_ref())),
+            block(&self.test, self.mask.as_ref().map(|m| &m.test))
         )
     }
 

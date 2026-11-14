@@ -27,6 +27,8 @@ pub struct RunBook {
     pub band: crate::trading::BandSpec,
     /// `objective.spec.min_holding`.
     pub min_holding: usize,
+    /// #1180: the regime gate of `objective.spec.pnl_mask`, when the run priced a masked book.
+    pub mask: Option<crate::regime_gate::GateSpec>,
     /// The finalist reads no variable.
     pub constant: bool,
 }
@@ -90,6 +92,15 @@ pub(crate) fn band_of(spec: Option<&Json>) -> Result<(crate::trading::BandSpec, 
     let sd_rows = number("band_sd_rows")?.map(|r| r as usize);
     let sd_max_time = number("band_sd_max_time")?;
     Ok((BandSpec { units, multiple, sd, sd_rows, sd_max_time, resolved }, min_holding))
+}
+
+/// #1180: the regime gate of an `objective.spec` (`pnl_mask`); `None` without one.
+pub(crate) fn mask_of(spec: Option<&Json>) -> Result<Option<crate::regime_gate::GateSpec>, String> {
+    let Some(m) = spec.and_then(|s| s.get("pnl_mask")).filter(|m| !matches!(m, Json::Null)) else { return Ok(None) };
+    let expr = m.get("expr").and_then(Json::as_str).ok_or_else(|| "run.json objective.spec.pnl_mask has no expr".to_string())?;
+    let band = m.get("band").and_then(Json::as_f64).ok_or_else(|| "run.json objective.spec.pnl_mask has no band".to_string())?;
+    let dwell = m.get("dwell").and_then(Json::as_f64).filter(|d| *d >= 1.0 && d.fract() == 0.0).ok_or_else(|| "run.json objective.spec.pnl_mask has no integer dwell >= 1".to_string())?;
+    crate::regime_gate::GateSpec::parse(expr, band, dwell as usize).map(Some).map_err(|e| format!("run.json objective.spec.pnl_mask: {}", e))
 }
 
 impl RunBook {
@@ -162,6 +173,7 @@ impl RunBook {
             spec,
             band,
             min_holding,
+            mask: mask_of(Some(spec_json))?,
             constant,
         })
     }
