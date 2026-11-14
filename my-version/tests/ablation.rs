@@ -613,6 +613,10 @@ fn placebo_marginal_stays_inside_its_segment() {
 const T0: f64 = 1_600_000_000.0;
 
 fn objective_csv(dir: &std::path::Path) -> String {
+    objective_csv_step(dir, 900)
+}
+
+fn objective_csv_step(dir: &std::path::Path, step: i64) -> String {
     let n = 400usize;
     let frac = |v: f64| v - v.floor();
     let mut text = String::from("t,x1,x2,r,y\n");
@@ -622,7 +626,7 @@ fn objective_csv(dir: &std::path::Path) -> String {
         let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
         let noise = frac(f * 0.324_717_957_244_746) - 0.5;
         let r = 0.01 * x1 + 0.0005 * noise;
-        text.push_str(&format!("{},{},{},{},{}\n", (T0 as i64) + 900 * i as i64, x1, x2, r, r));
+        text.push_str(&format!("{},{},{},{},{}\n", (T0 as i64) + step * i as i64, x1, x2, r, r));
     }
     let path = dir.join("d.csv");
     std::fs::write(&path, text).unwrap();
@@ -790,6 +794,143 @@ fn score_run_reads_the_expression_and_its_inputs() {
     assert_eq!(r.generations_run, 7);
     assert_eq!(r.net_period.len(), 95);
     assert!(r.net_by_fold_threshold[0][1] > 0.0);
+}
+
+/// The spec of [`write_target_spec`] with the horizon (and optionally the stride) replaced.
+fn write_spec_with(dir: &std::path::Path, name: &str, horizon: i64, stride: Option<i64>) -> String {
+    let text = std::fs::read_to_string(write_target_spec(dir)).unwrap();
+    let from = "\"horizon_seconds\":900,";
+    let to = match stride {
+        Some(s) => format!("\"horizon_seconds\":{horizon},\"stride_seconds\":{s},"),
+        None => format!("\"horizon_seconds\":{horizon},"),
+    };
+    let path = dir.join(name);
+    std::fs::write(&path, text.replace(from, &to)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// One expanding window over rows 0..400 of a `step`-second store: test rows 300..400.
+fn write_windows_step(dir: &std::path::Path, step: i64) -> String {
+    let iso = |i: i64| protocol::iso(T0 + step as f64 * i as f64);
+    let path = dir.join("w.csv");
+    std::fs::write(
+        &path,
+        format!("scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,w0,{},{},{},{},{}\n", iso(0), iso(280), iso(200), iso(300), iso(400)),
+    )
+    .unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// A pnl search over a `step`-second store with a spec of one-bar horizon; returns (data, run.json, windows).
+fn scored_fixture(dir: &std::path::Path, step: i64) -> (String, String, String) {
+    let data = objective_csv_step(dir, step);
+    let spec = write_spec_with(dir, "spec_run.json", step, None);
+    let run = dir.join("run.json");
+    let out = search(&data, &spec, &["--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--arm", "A0", "--json-out", run.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    (data, run.to_string_lossy().into_owned(), write_windows_step(dir, step))
+}
+
+fn score_cli(data: &str, windows: &str, step: i64, out: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    let purge = step.to_string();
+    let mut args = vec![
+        "ablation", "score", "--data", data, "--target", "y", "--return-col", "r", "--time", "t", "--windows", windows, "--purge-seconds", purge.as_str(),
+        "--out", out.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    rcsr_cmd::rcsr().args(&args).output().unwrap()
+}
+
+#[test]
+fn ablation_score_stride_unknown_above_horizon() {
+    let (_scratch, dir) = scratch("stride_unknown");
+    let (data, run, windows) = scored_fixture(&dir, 900);
+    let spec = write_spec_with(&dir, "spec300.json", 300, None);
+    let out = score_cli(&data, &windows, 900, &dir.join("r.json"), &["--run", &run, "--target-spec", &spec]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("error: missing stride_seconds") && err.contains("900"), "{err}");
+}
+
+#[test]
+fn ablation_score_stride_wider_than_step_refused() {
+    let (_scratch, dir) = scratch("stride_wide");
+    let (data, run, windows) = scored_fixture(&dir, 900);
+    let spec = write_spec_with(&dir, "spec_stride.json", 900, Some(3600));
+    let out = score_cli(&data, &windows, 900, &dir.join("r.json"), &["--run", &run, "--target-spec", &spec]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("error: stride_seconds 3600") && err.contains("900"), "{err}");
+}
+
+#[test]
+fn ablation_score_one_bar_hourly_horizon_scores() {
+    let (_scratch, dir) = scratch("hourly");
+    let (data, run, windows) = scored_fixture(&dir, 3600);
+    let spec = write_spec_with(&dir, "spec3600.json", 3600, None);
+    let res = dir.join("r.json");
+    let out = score_cli(&data, &windows, 3600, &res, &["--run", &run, "--target-spec", &spec]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(std::fs::read_to_string(&res).unwrap().contains("\"min_group_step_seconds\":3600"));
+}
+
+#[test]
+fn ablation_score_from_run_applies_the_run_spec_horizon() {
+    let (_scratch, dir) = scratch("from_run_overlap");
+    let (data, run, windows) = scored_fixture(&dir, 900);
+    let text = std::fs::read_to_string(&run).unwrap();
+    let edited = text.replace("\"horizon_seconds\":900,", "\"horizon_seconds\":2700,");
+    assert_ne!(edited, text, "the run records its spec horizon");
+    let overlap = dir.join("overlap.run.json");
+    std::fs::write(&overlap, edited).unwrap();
+    let out = score_cli(&data, &windows, 900, &dir.join("r.json"), &["--from-run", overlap.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("overlapping returns") && err.contains("2700-second label horizon"), "{err}");
+    let ok = score_cli(&data, &windows, 900, &dir.join("ok.json"), &["--from-run", &run]);
+    assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
+}
+
+#[test]
+fn ablation_score_period_staggered_daily() {
+    let day = 86_400.0;
+    let base = 18_519.0 * day;
+    let (mut time, mut group, mut s, mut ret) = (vec![], vec![], vec![], vec![]);
+    for g in 0..3u64 {
+        for d in 0..120 {
+            let k = (g * 120 + d) as f64;
+            time.push(base + d as f64 * day + g as f64 * 8.0 * 3600.0);
+            group.push(g);
+            let x = (k * 0.618_033_988_749_894_9).fract() - 0.5;
+            s.push(x);
+            ret.push(0.01 * x);
+        }
+    }
+    let panel = Panel::new(vec!["s".into()], vec![s], time, group, ret.clone(), ret, vec![]).unwrap();
+    let rows = vec![WindowRow {
+        scheme: "expanding".into(),
+        window: Window { label: "w".into(), train_start: base, train_end: base + 60.0 * day, test_start: base + 70.0 * day, test_end: base + 120.0 * day },
+        validation_start: base + 40.0 * day,
+    }];
+    let folds: Vec<Fold> = ladder::make_folds(&panel, &rows, day, &[], 0.0).unwrap();
+    let facts = ablation::RunFacts {
+        arm: "A1".into(),
+        feature_list_sha256: ablation::feature_list_sha256(&["s".into()]),
+        generation_budget: 10,
+        generations_run: 7,
+        variables: vec!["s".into()],
+        expression: "s".into(),
+        expression_source: rcsr::run_json::ExpressionSource::Exact,
+        seed: 2,
+    };
+    let (_scratch, dir) = scratch("staggered");
+    let spec_text = std::fs::read_to_string(write_spec_with(&dir, "spec_day.json", 86_400, None)).unwrap();
+    let spec = rcsr::target::entry_for(&rcsr::target::parse_file(&spec_text).unwrap(), "y").cloned().unwrap();
+    let opts = Options { horizon_seconds: 86_400.0, spec: Some(spec), ..Options::default() };
+    let r = ablation::score_run(&facts, &panel, &folds, &[0.5, 0.7], 1, &opts).unwrap();
+    let test_rows: usize = folds.iter().map(|f| f.test.len()).sum();
+    assert_eq!(test_rows % 3, 0);
+    assert_eq!(r.net_period.len(), test_rows / 3, "one period per test day, not per timestamp");
 }
 
 // --- verdict ------------------------------------------------------------------------
