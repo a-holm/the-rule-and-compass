@@ -964,6 +964,54 @@ mod front {
     }
 
     #[test]
+    fn front_identical_columns_dsr_equals_psr() {
+        let (_scratch, dir) = scratch("identical");
+        let data = write_data(&dir);
+        let same = RUN.replace(r#"{"expression":"x * 2 + 0.1"},{"expression":"0.5 - x"}"#, r#"{"expression":"x"}"#);
+        let run = write_run(&dir, &same);
+        let (code, out, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--bootstrap", "100"]);
+        assert_eq!(code, 0, "{err}");
+        let m = multiple(&out);
+        assert_eq!(mt(&m, &["trials"]), 2.0);
+        assert!(mt(&m, &["n_eff"]) <= 1.0 + 1e-9, "{m:?}");
+        assert_eq!(format!("{:?}", m.get("psr").and_then(|p| p.get("dsr"))), format!("{:?}", m.get("dsr_at_n_eff").and_then(|p| p.get("dsr"))));
+        assert_eq!(mt(&m, &["dsr_at_n_eff", "sr0"]), 0.0);
+        assert_eq!(m.get("min_btl_years").and_then(Json::as_f64).unwrap_or(0.0), 0.0);
+    }
+
+    #[test]
+    fn trials_source_labels_for_vote_and_a_raised_flag() {
+        let (_scratch, dir) = scratch("labels");
+        let data = write_data(&dir);
+        let run = write_run(&dir, BOOK_RUN);
+        let vote = ["--bootstrap", "100", "--policy", "vote", "--quorum", "0.5"];
+        let (code, a, err) = wf_book(&data, &["--from-run", &run], OK_WINDOW, &vote);
+        assert_eq!(code, 0, "{err}");
+        let m = multiple(&a);
+        assert_eq!(source(&m), "out_of_sample_book", "{m:?}");
+        let mut flagged = vote.to_vec();
+        flagged.extend(["--trials", "5"]);
+        let (code, b, err) = wf_book(&data, &["--from-run", &run], OK_WINDOW, &flagged);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(source(&multiple(&b)), "flag");
+        assert_eq!(mt(&multiple(&b), &["trials"]), 5.0);
+        let exprs = ["--target", "target", "--vars", "x", "--expr", "x", "--expr", "x * 2 + 0.1", "--expr", "0.5 - x", "--expr", "x - 0.1", "--expr", "x + 0.2"];
+        let mut raised = exprs.to_vec();
+        raised.extend(["--bootstrap", "100", "--trials", "2"]);
+        let (code, c, err) = wf(&data, &[], OK_WINDOW, &raised);
+        assert_eq!(code, 0, "{err}");
+        let m = multiple(&c);
+        assert_eq!(mt(&m, &["trials"]), 5.0);
+        assert_eq!(source(&m), "candidate_count");
+        let mut kept = exprs.to_vec();
+        kept.extend(["--bootstrap", "100", "--trials", "9"]);
+        let (code, d, err) = wf(&data, &[], OK_WINDOW, &kept);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(mt(&multiple(&d), &["trials"]), 9.0);
+        assert_eq!(source(&multiple(&d)), "flag");
+    }
+
+    #[test]
     fn a_window_inside_the_validation_slice_is_refused() {
         let (_scratch, dir) = scratch("inside");
         let data = write_data(&dir);

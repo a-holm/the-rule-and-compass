@@ -420,14 +420,16 @@ pub fn participation_ratio(corr: &[Vec<f64>]) -> f64 {
 }
 
 /// Expected maximum Sharpe of `n_trials` independent zero-skill trials whose
-/// Sharpe estimates have variance `var_sr`.
+/// Sharpe estimates have variance `var_sr`. The asymptotic form is negative for
+/// `1 < n_trials` below its root; the result is floored at 0, the one-trial
+/// value, so deflation never raises a statistic.
 pub fn expected_max_sharpe(n_trials: f64, var_sr: f64) -> f64 {
     if !(n_trials > 1.0) || !(var_sr >= 0.0) {
         return 0.0;
     }
-    var_sr.sqrt()
-        * ((1.0 - EULER_GAMMA) * normal_quantile(1.0 - 1.0 / n_trials)
-            + EULER_GAMMA * normal_quantile(1.0 - 1.0 / (n_trials * std::f64::consts::E)))
+    let bracket = (1.0 - EULER_GAMMA) * normal_quantile(1.0 - 1.0 / n_trials)
+        + EULER_GAMMA * normal_quantile(1.0 - 1.0 / (n_trials * std::f64::consts::E));
+    var_sr.sqrt() * bracket.max(0.0)
 }
 
 /// Inputs and result of one deflated Sharpe computation.

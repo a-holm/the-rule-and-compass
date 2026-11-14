@@ -141,3 +141,12 @@ fn schema_lists_search_and_process_backend() {
         assert!(help.contains(field), "--help does not mention {field}");
     }
 }
+
+#[test]
+fn trials_default_names_every_mode() {
+    let (_, _, default, description) = schema::options().iter().find(|o| o.0 == "--trials").copied().expect("--trials");
+    assert_ne!(default, "candidate count");
+    for part in ["candidates_evaluated", "front size", "--from-run", "--expr", "n_trials_source"] {
+        assert!(description.contains(part), "--trials description misses {part}: {description}");
+    }
+}
