@@ -99,3 +99,60 @@ fn the_projected_path_never_allocates_a_full_table() {
         largest
     );
 }
+
+/// Deterministic proxy for the memory passes of a warm projected load: with
+/// one reader the load allocates the table columns and nothing else, so no
+/// group buffer, byte scratch or per-block vector exists to copy through.
+#[test]
+fn a_projected_load_allocates_only_the_table_columns() {
+    let rows = 4 * 8192 + 500usize;
+    let n_numeric = 35usize;
+    let mut header = String::from("ts,symbol");
+    for c in 0..n_numeric {
+        header.push_str(&format!(",v{}", c));
+    }
+    header.push('\n');
+    let mut text = header;
+    for r in 0..rows {
+        text.push_str(&format!(
+            "{},{}",
+            1_700_000_000i64 + r as i64 * 60,
+            ["A", "B", "C"][r % 3]
+        ));
+        for c in 0..n_numeric {
+            text.push_str(&format!(",{}", (c + 1) as f64 * 0.5 + (r % 101) as f64 * 0.01));
+        }
+        text.push('\n');
+    }
+    let table = data::parse_table_with_time(&text, false, Some("ts")).unwrap();
+    drop(text);
+    let (_scratch, dir) = tmp_dir("proxy");
+    let path = dir.join("proxy.rcsb").to_string_lossy().into_owned();
+    store::write_store_with_time(&path, &table, 8192, Some(0)).unwrap();
+    drop(table);
+
+    let fs = FileStore::open(&path).unwrap();
+    let mut names = vec!["ts".to_string(), "symbol".to_string()];
+    names.extend((0..n_numeric).map(|c| format!("v{}", c)));
+    let proj = Projection::resolve_owned(&fs, &names).unwrap();
+    assert_eq!(proj.len(), 37);
+
+    // 35 f64 columns, the time column as f64 and i64, the codes as u32.
+    let table_bytes = rows * (n_numeric * 8 + 8 + 8 + 4);
+    let group_buffer = 37 * 8192 * 8;
+
+    TOTAL.store(0, Ordering::Relaxed);
+    let t = fs.to_table_projected_with_readers(&proj, 1).unwrap();
+    let total = TOTAL.load(Ordering::Relaxed);
+    assert_eq!(t.n_cols(), 37);
+    eprintln!(
+        "proxy: allocated {} bytes for {} bytes of columns, {} bytes of group buffer on the old path",
+        total, table_bytes, group_buffer
+    );
+    assert!(
+        total <= table_bytes + 64 * 1024,
+        "allocated {} bytes for {} bytes of columns",
+        total,
+        table_bytes
+    );
+}

@@ -2071,6 +2071,36 @@ fn read_u32(file: &mut File, path: &str) -> Result<u32, String> {
     Ok(u32::from_le_bytes(b))
 }
 
+/// The bytes of a value slice, for a positional read straight into it.
+#[cfg(target_endian = "little")]
+fn bytes_of_mut<T: Copy>(out: &mut [T]) -> &mut [u8] {
+    // SAFETY: called only with f64, i64 and u32, which have no invalid bit patterns and no
+    // padding; u8 has alignment 1; the view covers exactly the bytes of `out` and borrows it.
+    unsafe {
+        std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, std::mem::size_of_val(out))
+    }
+}
+
+fn block_error(path: &str, bytes: usize, offset: u64, e: std::io::Error) -> String {
+    format!(
+        "{}: reading {} bytes at offset {}: {}",
+        path, bytes, offset, e
+    )
+}
+
+#[cfg(target_endian = "little")]
+fn read_f64_block(
+    file: &File,
+    path: &str,
+    offset: u64,
+    out: &mut [f64],
+    _scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    let bytes = out.len() * 8;
+    read_exact_at(file, bytes_of_mut(out), offset).map_err(|e| block_error(path, bytes, offset, e))
+}
+
+#[cfg(not(target_endian = "little"))]
 fn read_f64_block(
     file: &File,
     path: &str,
@@ -2080,12 +2110,8 @@ fn read_f64_block(
 ) -> Result<(), String> {
     let bytes = out.len() * 8;
     scratch.resize(bytes, 0);
-    read_exact_at(file, &mut scratch[..], offset).map_err(|e| {
-        format!(
-            "{}: reading {} bytes at offset {}: {}",
-            path, bytes, offset, e
-        )
-    })?;
+    read_exact_at(file, &mut scratch[..], offset)
+        .map_err(|e| block_error(path, bytes, offset, e))?;
     for (dst, src) in out.iter_mut().zip(scratch.chunks_exact(8)) {
         let mut b = [0u8; 8];
         b.copy_from_slice(src);
@@ -2094,6 +2120,19 @@ fn read_f64_block(
     Ok(())
 }
 
+#[cfg(target_endian = "little")]
+fn read_i64_block(
+    file: &File,
+    path: &str,
+    offset: u64,
+    out: &mut [i64],
+    _scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    let bytes = out.len() * 8;
+    read_exact_at(file, bytes_of_mut(out), offset).map_err(|e| block_error(path, bytes, offset, e))
+}
+
+#[cfg(not(target_endian = "little"))]
 fn read_i64_block(
     file: &File,
     path: &str,
@@ -2103,12 +2142,8 @@ fn read_i64_block(
 ) -> Result<(), String> {
     let bytes = out.len() * 8;
     scratch.resize(bytes, 0);
-    read_exact_at(file, &mut scratch[..], offset).map_err(|e| {
-        format!(
-            "{}: reading {} bytes at offset {}: {}",
-            path, bytes, offset, e
-        )
-    })?;
+    read_exact_at(file, &mut scratch[..], offset)
+        .map_err(|e| block_error(path, bytes, offset, e))?;
     for (dst, src) in out.iter_mut().zip(scratch.chunks_exact(8)) {
         let mut b = [0u8; 8];
         b.copy_from_slice(src);
@@ -2117,6 +2152,19 @@ fn read_i64_block(
     Ok(())
 }
 
+#[cfg(target_endian = "little")]
+fn read_u32_block(
+    file: &File,
+    path: &str,
+    offset: u64,
+    out: &mut [u32],
+    _scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    let bytes = out.len() * 4;
+    read_exact_at(file, bytes_of_mut(out), offset).map_err(|e| block_error(path, bytes, offset, e))
+}
+
+#[cfg(not(target_endian = "little"))]
 fn read_u32_block(
     file: &File,
     path: &str,
@@ -2126,12 +2174,8 @@ fn read_u32_block(
 ) -> Result<(), String> {
     let bytes = out.len() * 4;
     scratch.resize(bytes, 0);
-    read_exact_at(file, &mut scratch[..], offset).map_err(|e| {
-        format!(
-            "{}: reading {} bytes at offset {}: {}",
-            path, bytes, offset, e
-        )
-    })?;
+    read_exact_at(file, &mut scratch[..], offset)
+        .map_err(|e| block_error(path, bytes, offset, e))?;
     for (dst, src) in out.iter_mut().zip(scratch.chunks_exact(4)) {
         let mut b = [0u8; 4];
         b.copy_from_slice(src);
@@ -2581,5 +2625,132 @@ mod tests {
         let text = header_json(&h);
         let back = parse_header(&text, VERSION).unwrap();
         assert_eq!(h, back);
+    }
+
+    fn write_raw(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, File) {
+        let path = std::env::temp_dir().join(format!(
+            "rcsr-1076-{}-{}.bin",
+            tag,
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let file = File::open(&path).unwrap();
+        (path, file)
+    }
+
+    #[test]
+    fn direct_block_reads_match_the_decode_loop() {
+        let f64s = [
+            f64::NAN,
+            f64::from_bits(0x7ff8_0000_dead_beef),
+            f64::from_bits(0xfff4_0000_0000_0001),
+            -0.0,
+            0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN_POSITIVE / 8.0,
+            1.5e300,
+            -3.25,
+        ];
+        let i64s = [i64::MIN, i64::MAX, 0, -1, 1_700_000_000_000_000_000, 42];
+        let u32s = [0u32, 1, u32::MAX, 7, 0x8000_0000];
+        let mut raw: Vec<u8> = vec![0xAA; 3];
+        for v in f64s {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let i_off = raw.len() as u64;
+        for v in i64s {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let u_off = raw.len() as u64;
+        for v in u32s {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let (path, file) = write_raw("blocks", &raw);
+        let p = path.to_string_lossy().into_owned();
+        let mut scratch = Vec::new();
+
+        let mut got = vec![0.0f64; f64s.len()];
+        read_f64_block(&file, &p, 3, &mut got, &mut scratch).unwrap();
+        let want: Vec<u64> = raw[3..]
+            .chunks_exact(8)
+            .take(f64s.len())
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()).to_bits())
+            .collect();
+        assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), want);
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            f64s.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+
+        let mut got = vec![0i64; i64s.len()];
+        read_i64_block(&file, &p, i_off, &mut got, &mut scratch).unwrap();
+        let want: Vec<i64> = raw[i_off as usize..]
+            .chunks_exact(8)
+            .take(i64s.len())
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(got, i64s);
+
+        let mut got = vec![0u32; u32s.len()];
+        read_u32_block(&file, &p, u_off, &mut got, &mut scratch).unwrap();
+        let want: Vec<u32> = raw[u_off as usize..]
+            .chunks_exact(4)
+            .take(u32s.len())
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(got, u32s);
+
+        let mut short = vec![0.0f64; f64s.len() + 40];
+        let e = read_f64_block(&file, &p, 3, &mut short, &mut scratch).unwrap_err();
+        assert!(e.contains("reading 400 bytes at offset 3"), "{}", e);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_failed_group_read_reports_the_lowest_group() {
+        let rows = 5 * 16usize;
+        let mut text = String::from("ts,sym,a,b\n");
+        for r in 0..rows {
+            text.push_str(&format!(
+                "{},{},{},{}\n",
+                1_700_000_000i64 + r as i64,
+                ["P", "Q"][r % 2],
+                r as f64 * 0.5,
+                r as f64 - 3.0
+            ));
+        }
+        let table = crate::data::parse_table_with_time(&text, false, Some("ts")).unwrap();
+        let path = std::env::temp_dir()
+            .join(format!("rcsr-1076-trunc-{}.rcsb", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        write_store_with_time(&path, &table, 16, Some(0)).unwrap();
+        let fs = FileStore::open(&path).unwrap();
+        assert_eq!(fs.n_groups(), 5);
+        let proj = Projection::resolve(&fs, &["ts", "sym", "a", "b"]).unwrap();
+        let cut = fs.data_start + fs.header.columns[2].offsets[3] + 8;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(cut)
+            .unwrap();
+        let expect = format!(
+            "reading 128 bytes at offset {}",
+            fs.data_start + fs.header.columns[2].offsets[3]
+        );
+        for readers in [1usize, 2, 4, 64] {
+            for _ in 0..8 {
+                let e = fs
+                    .to_table_projected_with_readers(&proj, readers)
+                    .err()
+                    .expect("truncated store");
+                assert!(e.contains(&expect), "{} readers: {}", readers, e);
+            }
+        }
+        let _ = std::fs::remove_file(path);
     }
 }
