@@ -176,12 +176,18 @@ fn bits_equal(a: f64, b: f64) -> bool {
 
 /// Append `opts.columns` from the family store to the panel.
 pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
+    append_family_locked(opts, None)
+}
+
+/// [`append_family`] whose schema sidecar summarises only the rows outside the range of a lock record.
+pub fn append_family_locked(opts: &AppendOptions, record: Option<&crate::lockrec::LockRecord>) -> Result<AppendReport, String> {
     let declared = crate::lockbox::output_declaration(&opts.out, Some(&opts.target), opts.locked_test).map_err(|e| e.message)?;
     let also = crate::lockbox::inherited_also(&opts.target, declared.as_ref())?;
     let retired = crate::retire::writer_retirement(opts.retired.as_deref(), declared.as_ref(), &[&opts.target, &opts.family]).map_err(|e| e.message)?;
     // The target's declaration wins and is kept. A family store with no declaration is accepted.
     if let Some(s) = crate::lockbox::stored_all(&opts.family).map_err(|e| e.message)? {
-        if declared != Some(s.range) || also != s.also {
+        let record_also = record.is_some_and(|r| also.is_none() && s.also == Some(r.range));
+        if declared != Some(s.range) || (also != s.also && !record_also) {
             return Err(format!(
                 "family store {} declares the locked test {} ({}), the target {} declares {}",
                 opts.family,
@@ -287,7 +293,7 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
             .flatten()
             .map(|(_, s)| s)
             .max();
-        let schema = registry::write_schema_retired(&opts.out, &opts.panel_version, declared.as_ref(), also.as_ref(), floor, retired.as_ref())?;
+        let schema = registry::write_schema_locked(&opts.out, &opts.panel_version, declared.as_ref(), also.as_ref(), floor, retired.as_ref(), record)?;
         crate::lockbox::finish_output(&opts.out, declared.as_ref(), &["schema.json"]).map_err(|e| e.message)?;
         Ok(schema)
     };
@@ -307,8 +313,8 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
 }
 
 fn usage_text() -> &'static str {
-    "rcsr panel schema --data panel.rcsb [--panel-version V] [--verify]
-rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b|@all --out out.rcsb [--skip-existing] [--panel-version V] [--scratch dir] [--locked-test START,END|none] [--retired retired.json]
+    "rcsr panel schema --data panel.rcsb [--panel-version V] [--verify] [--lock-record record.json]
+rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b|@all --out out.rcsb [--skip-existing] [--panel-version V] [--scratch dir] [--locked-test START,END|none] [--retired retired.json] [--lock-record record.json]
 "
 }
 
@@ -327,6 +333,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
     let mut scratch: Option<String> = None;
     let mut verify = false;
     let mut skip_existing = false;
+    let mut lock_record: Option<String> = None;
     let mut retired: Option<String> = None;
     let mut locked_test = crate::lockbox::Keep::Unset;
     let mut i = 0usize;
@@ -349,6 +356,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
                     .unwrap_or_else(|e| fail(&format!("--locked-test: {}", e), 2))
             }
             "--retired" => retired = Some(value(args, &mut i)),
+            "--lock-record" => lock_record = Some(value(args, &mut i)),
             "--verify" => verify = true,
             "--skip-existing" => skip_existing = true,
             "-h" | "--help" => {
@@ -360,6 +368,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
         i += 1;
     }
     let data = data.unwrap_or_else(|| fail(&format!("`rcsr panel {}` needs --data", cmd), 2));
+    let record = lock_record.as_deref().map(crate::lockrec::LockRecord::load).transpose().unwrap_or_else(|e| fail(&e.message, e.exit));
     match cmd {
         "schema" => {
             if verify {
@@ -369,7 +378,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
                     Err(e) => fail(&e, 3),
                 }
             } else {
-                match registry::write_schema(&data, &panel_version) {
+                match registry::write_schema_for(&data, &panel_version, record.as_ref()) {
                     Ok(p) => eprintln!("schema written: {}", p),
                     Err(e) => fail(&e, 3),
                 }
@@ -407,7 +416,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
                 fail(&e, 2);
             }
             drop((panel_store, family_store));
-            match append_family(&opts) {
+            match append_family_locked(&opts, record.as_ref()) {
                 Ok(r) => {
                     eprintln!(
                         "appended {} column(s); skipped existing {} ({}); unmatched rows {}; input sha256 {} (unchanged: {}); output sha256 {}; schema {}",

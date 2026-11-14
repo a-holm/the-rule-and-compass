@@ -61,6 +61,7 @@ pub mod gui;
 pub mod implicit;
 pub mod leakage; // #129: differential leakage detectors
 pub mod lockbox; // #145: the 2026H2 holdout
+pub mod lockrec; // #1130: the campaign lock record and `rcsr lock check`
 pub mod manifest;
 pub mod memory;
 pub mod metrics;

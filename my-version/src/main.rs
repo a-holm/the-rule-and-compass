@@ -224,6 +224,7 @@ USAGE:
   rcsr enrich --data <store.rcsb|CSV> --out <store.rcsb> --features <list> [options]
   rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
   rcsr trials --wf <report.json>... [--baseline <ladder.json>] | --compare <A> <B> [options]
+  rcsr lock check --record <record.json> <path>...
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
              [--lockbox <START,END|none>]
              [--target-spec <file>]
@@ -2689,6 +2690,10 @@ fn main() {
     // #140: verify a run manifest without starting a search.
     if args.first().map(|s| s.as_str()) == Some("verify-manifest") {
         run_verify_manifest(&args[1..]);
+    }
+    // #1130: the campaign lock record check.
+    if args.first().map(|s| s.as_str()) == Some("lock") {
+        rcsr::lockrec::run(&args[1..]);
     }
     // #129: differential leakage audit. Exit 5 when any detector fires.
     if args.first().map(|s| s.as_str()) == Some("audit") {

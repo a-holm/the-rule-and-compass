@@ -288,6 +288,14 @@ impl BarStep {
 /// label is the base default ("15m", and the quality columns) carry the bar
 /// name; multi-timeframe and label columns keep their registry label.
 pub fn build_schema_with_bar(store: &FileStore) -> Result<(Vec<ColumnSchema>, BarStep), String> {
+    build_schema_excluding(store, None).map(|(columns, bar, _)| (columns, bar))
+}
+
+/// [`build_schema_with_bar`] whose availability extents and bar step leave out the rows inside
+/// `exclude` (a lock record range), with the number of rows it kept. Column hashes cover every row.
+pub fn build_schema_excluding(store: &FileStore, exclude: Option<crate::lockbox::Lockbox>) -> Result<(Vec<ColumnSchema>, BarStep, usize), String> {
+    let skip = |t: i64| exclude.is_some_and(|r| r.contains(t));
+    let mut kept = 0usize;
     let header = store.header();
     let names = header.names();
     let dtypes = header.dtypes();
@@ -328,6 +336,11 @@ pub fn build_schema_with_bar(store: &FileStore) -> Result<(Vec<ColumnSchema>, Ba
             None => Vec::new(),
         };
         for &t in &times {
+            if skip(t) {
+                prev_time = None;
+                continue;
+            }
+            kept += 1;
             if let Some(p) = prev_time {
                 if t > p {
                     *step_counts.entry(t - p).or_insert(0) += 1;
@@ -348,7 +361,7 @@ pub fn build_schema_with_bar(store: &FileStore) -> Result<(Vec<ColumnSchema>, Ba
                     for (r, v) in values.iter().enumerate() {
                         bytes.extend_from_slice(&v.to_le_bytes());
                         if v.is_finite() {
-                            if let Some(&t) = times.get(r) {
+                            if let Some(&t) = times.get(r).filter(|t| !skip(**t)) {
                                 first[c].get_or_insert(t);
                                 last[c] = Some(t);
                             }
@@ -380,7 +393,10 @@ pub fn build_schema_with_bar(store: &FileStore) -> Result<(Vec<ColumnSchema>, Ba
             sha256: hasher.finalize(),
         });
     }
-    Ok((out, bar))
+    if time_col.is_none() {
+        kept = store.n_rows();
+    }
+    Ok((out, bar, kept))
 }
 
 fn opt_i64(v: Option<i64>) -> String {
@@ -474,6 +490,21 @@ pub fn write_schema(store_path: &str, panel_version: &str) -> Result<String, Str
     write_schema_declared(store_path, panel_version, kept.as_ref().map(|s| &s.range), kept.as_ref().and_then(|s| s.also.as_ref()))
 }
 
+/// As [`write_schema`], summarising only the rows outside the range of `record` when one is given.
+pub fn write_schema_for(store_path: &str, panel_version: &str, record: Option<&crate::lockrec::LockRecord>) -> Result<String, String> {
+    let kept = crate::lockbox::stored_all(store_path).map_err(|e| e.message)?;
+    let floor = crate::lockbox::declared_embargo(store_path).map_err(|e| e.message)?.map(|(_, s)| s);
+    write_schema_locked(
+        store_path,
+        panel_version,
+        kept.as_ref().map(|s| &s.range),
+        kept.as_ref().and_then(|s| s.also.as_ref()),
+        floor,
+        None,
+        record,
+    )
+}
+
 /// As [`write_schema`], with an explicit locked test declaration (or none).
 pub fn write_schema_declared(
     store_path: &str,
@@ -505,9 +536,27 @@ pub fn write_schema_retired(
     embargo_floor: Option<i64>,
     retired: Option<&crate::retire::Retirement>,
 ) -> Result<String, String> {
+    write_schema_locked(store_path, panel_version, locked_test, also, embargo_floor, retired, None)
+}
+
+/// As [`write_schema_retired`], summarising only the rows outside the range of a lock record (#1130): the
+/// row count and the availability extents leave the range out and a `lock_record` object says how many rows.
+pub fn write_schema_locked(
+    store_path: &str,
+    panel_version: &str,
+    locked_test: Option<&crate::lockbox::Lockbox>,
+    also: Option<&crate::lockbox::Lockbox>,
+    embargo_floor: Option<i64>,
+    retired: Option<&crate::retire::Retirement>,
+    record: Option<&crate::lockrec::LockRecord>,
+) -> Result<String, String> {
     let store = FileStore::open(store_path)?;
-    let (columns, bar) = build_schema_with_bar(&store)?;
-    let text = schema_json(&columns, &bar, store.n_rows(), panel_version, locked_test, also, embargo_floor, retired);
+    let (columns, bar, kept) = build_schema_excluding(&store, record.map(|r| r.range))?;
+    let rows = if record.is_some() { kept } else { store.n_rows() };
+    let mut text = schema_json(&columns, &bar, rows, panel_version, locked_test, also, embargo_floor, retired);
+    if let Some(r) = record {
+        text = r.insert_declaration(&text, store.n_rows() - kept);
+    }
     let out = schema_path(store_path);
     std::fs::write(&out, text).map_err(|e| format!("{}: {}", out, e))?;
     Ok(out)

@@ -1689,6 +1689,8 @@ pub struct Options {
     pub locked_also: Option<crate::lockbox::Lockbox>,
     /// Where `locked_test` came from when the command line resolved it; `None` for a library caller.
     pub locked_source: Option<crate::lockbox::Source>,
+    /// The campaign lock record whose range `locked_test` or `locked_also` carries (#1130).
+    pub lock_record: Option<crate::lockrec::LockRecord>,
     pub dry_run: bool,
     pub json: bool,
 }
@@ -1724,6 +1726,7 @@ impl Default for Options {
             locked_test: None,
             locked_also: None,
             locked_source: None,
+            lock_record: None,
             dry_run: false,
             json: false,
         }
@@ -7919,7 +7922,14 @@ fn enrich_inner(
     }
     let mut long_acc: Vec<crate::labels::LabelAccumulator> = long_specs
         .iter()
-        .map(|sp| crate::labels::LabelAccumulator::with_range(sp, label_range).with_also(label_also).with_embargo(embargo_l.0))
+        .map(|sp| {
+            let acc = crate::labels::LabelAccumulator::with_range(sp, label_range).with_also(label_also).with_embargo(embargo_l.0);
+            if opts.lock_record.is_some() {
+                acc.with_also_reported()
+            } else {
+                acc
+            }
+        })
         .collect();
 
     // Cross-sectional source columns are computed even when the user did not
@@ -8987,6 +8997,9 @@ fn enrich_inner(
         return Ok(report);
     }
 
+    if let Some(rec) = &opts.lock_record {
+        refuse_carried_labels(&opts.data, out, &long_outputs, rec)?;
+    }
     // Append pass: copy existing blocks and write the new columns. The writer
     // hashes the bytes as they stream out, so the report gets the output
     // checksum without a second multi-gigabyte read.
@@ -9066,6 +9079,32 @@ fn label_sidecar_entries(path: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Under a lock record a label sidecar entry this run does not recompute may only carry over when it was
+/// computed under the same record; any other entry holds range information, so the run is refused.
+fn refuse_carried_labels(data: &str, out: &str, outputs: &[LongLabelOutput], rec: &crate::lockrec::LockRecord) -> Result<(), String> {
+    if outputs.is_empty() {
+        return Ok(());
+    }
+    let Some(labels_path) = crate::target::label_sidecar_path(out) else { return Ok(()) };
+    let from = if Path::new(&labels_path).is_file() {
+        Some(labels_path)
+    } else {
+        crate::target::label_sidecar_path(data).filter(|p| Path::new(p).is_file())
+    };
+    let Some(from) = from else { return Ok(()) };
+    for line in label_sidecar_entries(&from) {
+        let recomputed = outputs.iter().any(|o| line.starts_with(&format!("{{\"target\":{},", jstr(&o.target))));
+        if !recomputed && !rec.computed_entry(&line) {
+            let target = crate::manifest::string_field(&line, "target").unwrap_or_default();
+            return Err(format!(
+                "{}: carries the label report of {} computed without this lock record; it would hold locked-range information. Rebuild that label with --lock-record or remove it from the sidecar",
+                from, target
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Write `<out>.labels.json` (the label reports) and add the `y` target specs
@@ -9161,6 +9200,7 @@ pub fn run(args: &[String]) -> ! {
     };
     let mut locked_test: Option<String> = None;
     let mut retired: Option<String> = None;
+    let mut lock_record: Option<String> = None;
     let mut i = 0usize;
     macro_rules! val {
         () => {{
@@ -9270,6 +9310,7 @@ pub fn run(args: &[String]) -> ! {
                 locked_test = Some(val!())
             }
             "--retired" => retired = Some(val!()),
+            "--lock-record" => lock_record = Some(val!()),
             "--allow-lockbox" => opts.allow_lockbox = true,
             "--dry-run" => opts.dry_run = true,
             "--json" => opts.json = true,
@@ -9299,11 +9340,33 @@ pub fn run(args: &[String]) -> ! {
     opts.locked_test = resolved.sidecar_range();
     opts.locked_also = resolved.sidecar_also();
     opts.locked_source = Some(resolved.source);
+    if let Some(path) = &lock_record {
+        let record = crate::lockrec::LockRecord::load(path).unwrap_or_else(|e| {
+            eprintln!("error: {}", e.message);
+            std::process::exit(e.exit);
+        });
+        let (range, also) = crate::lockrec::with_record(opts.locked_test, opts.locked_also, &record.range).unwrap_or_else(|e| {
+            eprintln!("error: {}", e.message);
+            std::process::exit(e.exit);
+        });
+        opts.locked_test = range;
+        opts.locked_also = also;
+        if opts.locked_source == Some(crate::lockbox::Source::ProtocolDefault) {
+            opts.locked_source = Some(crate::lockbox::Source::Flag);
+        }
+        opts.lock_record = Some(record);
+    }
     if let (Some(out), false) = (&opts.out, opts.dry_run) {
         let keep = opts.locked_test.map_or(crate::lockbox::Keep::Remove, crate::lockbox::Keep::Range);
         if let Err(e) = crate::lockbox::output_declaration(out, Some(&opts.data), keep) {
             eprintln!("error: {}", e.message.replacen("--lockbox", "--locked-test", 2));
             std::process::exit(e.exit);
+        }
+        if opts.lock_record.is_some() {
+            if let Err(e) = crate::lockbox::check_also_carriers(out, opts.locked_test.as_ref(), opts.locked_also.as_ref()) {
+                eprintln!("error: {}", e.message);
+                std::process::exit(e.exit);
+            }
         }
     }
     let rates_device = if opts.gpu == GpuMode::Off { None } else { crate::backend::probe().device };
@@ -9323,15 +9386,16 @@ pub fn run(args: &[String]) -> ! {
         if let Some(out) = &opts.out {
             let sidecar = format!("{}.enrich.json", out);
             let mut text = report.json();
-            if let Some(lb) = resolved.sidecar_range() {
+            if let Some(lb) = opts.locked_test {
                 let at = text.find('{').map_or(0, |i| i + 1);
                 let source = format!("rcsr enrich ({})", resolved.source.as_str());
-                text.insert_str(
-                    at,
-                    &format!("\"locked_test\":{}{}{},", lb.declaration_json(&source), crate::lockbox::also_json(resolved.sidecar_also().as_ref(), &source), resolved.retired_member()),
-                );
+                let also = match (&opts.lock_record, opts.locked_also) {
+                    (Some(r), Some(a)) if a == r.range => crate::lockbox::also_json(Some(&a), crate::lockrec::SOURCE),
+                    (_, a) => crate::lockbox::also_json(a.as_ref(), &source),
+                };
+                text.insert_str(at, &format!("\"locked_test\":{}{}{},", lb.declaration_json(&source), also, resolved.retired_member()));
             }
-            let declared = resolved.sidecar_range();
+            let declared = opts.locked_test;
             if let Err(e) = crate::atomic::write_text_atomic(&sidecar, &text) {
                 if declared.is_some() {
                     if out != &opts.data {
@@ -9443,6 +9507,17 @@ INPUT / OUTPUT:
                           prevalence, first finite row) leaves out rows inside the range
                           (label columns also the purge) and counts them as
                           rows_left_out; sha256 covers all rows
+  --lock-record <PATH>    a campaign lock record (range.start_epoch, range.end_epoch,
+                          range.end_exclusive true; #1130). Its range takes the second-range
+                          slot next to the resolved locked test and is left out of the label
+                          report (top moves, statistics, locked_test_also.rows_left_out) and
+                          of every per-feature statistic, like --locked-test. A data
+                          declaration that already uses the second slot with another range,
+                          or a record that does not parse, exits 2 (also undeclared data with --locked-test X, where the protocol default fills the slot). The output declares the
+                          range as locked_test_also. A label sidecar entry that was not
+                          recomputed here and not computed under this record is refused
+                          (exit 3); so is an output whose other carriers lack the range.
+                          Check sidecars with `rcsr lock check`
   --gpu [auto|on|off]     auto (default) dispatches a registered exact kernel
                           only when the cost model estimates it faster; on
                           forces every registered kernel above the 1M-row floor;
