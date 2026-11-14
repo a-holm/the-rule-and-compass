@@ -201,7 +201,7 @@ fn training_intervals_are_book_segments() {
     let second: Vec<i64> = (300..420).collect();
     let all: Vec<i64> = first.iter().chain(&second).copied().collect();
     let spec = book_spec();
-    let joint = FitnessBook::with_segments(&two_group_slice(&all), &spec, H as f64, 1, 1.0, &[hour(0) as f64, hour(300) as f64]).unwrap();
+    let joint = FitnessBook::with_segments(&two_group_slice(&all), &spec, H as f64, 1, 1.0, &[hour(0) as f64, hour(300) as f64], None).unwrap();
     let a = FitnessBook::new(&two_group_slice(&first), &spec, H as f64).unwrap();
     let b = FitnessBook::new(&two_group_slice(&second), &spec, H as f64).unwrap();
     assert!((joint.bound() - (a.bound() + b.bound())).abs() <= 1e-12, "bound {} vs {} + {}", joint.bound(), a.bound(), b.bound());
@@ -234,7 +234,7 @@ fn training_intervals_are_book_segments() {
         assert!((joint.regret(&pj) - want).abs() <= 1e-12, "regret {} vs {}", joint.regret(&pj), want);
         assert_ne!(carried.totals(&pj).exits, tj.exits, "seed {seed}: the carried book pays fewer exits");
     }
-    let one = FitnessBook::with_segments(&two_group_slice(&all), &spec, H as f64, 1, 1.0, &[hour(0) as f64]).unwrap();
+    let one = FitnessBook::with_segments(&two_group_slice(&all), &spec, H as f64, 1, 1.0, &[hour(0) as f64], None).unwrap();
     assert_eq!(one.hash(), carried.hash(), "one segment is the plain book");
 }
 
@@ -524,6 +524,96 @@ fn resume_with_other_intervals_exits_2() {
     let out = search(&data, &spec, &["--split", "temporal", "--save", &plain, "--generations", "2"]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(!std::fs::read_to_string(&plain).unwrap().contains("split_intervals"), "a run without a table writes no line");
+}
+
+fn gate_on(g: u64, h: i64) -> bool {
+    (h % 10 != 4 && h % 10 != 5) || (g == 1 && h % 3 == 0)
+}
+
+#[test]
+fn a_mask_splits_each_interval_segment_at_its_on_runs() {
+    let first: Vec<i64> = (0..120).collect();
+    let second: Vec<i64> = (300..420).collect();
+    let all: Vec<i64> = first.iter().chain(&second).copied().collect();
+    let spec = book_spec();
+    let starts = [hour(0) as f64, hour(300) as f64];
+    let mask_of = |hours: &[i64]| -> Vec<bool> { (0..2u64).flat_map(|g| hours.iter().map(move |&h| gate_on(g, h))).collect() };
+    let book = |hours: &[i64], starts: &[f64], on: &[bool]| {
+        FitnessBook::with_segments(&two_group_slice(hours), &spec, H as f64, 1, 1.0, starts, Some(rcsr::trading::BookMask { on, identity: "m" })).unwrap()
+    };
+    let on_all = mask_of(&all);
+    let joint = book(&all, &starts, &on_all);
+    let (ma, mb) = (mask_of(&first), mask_of(&second));
+    let (a, b) = (book(&first, &[], &ma), book(&second, &[], &mb));
+    assert!((joint.bound() - (a.bound() + b.bound())).abs() <= 1e-12, "bound {} vs {} + {}", joint.bound(), a.bound(), b.bound());
+    let carried = book(&all, &[], &on_all);
+    assert_ne!(carried.hash(), joint.hash(), "the segments change a masked book");
+    assert!(joint.is_masked());
+    // No mask: the segments alone; all-on mask: the same book, hash included.
+    let plain = FitnessBook::with_segments(&two_group_slice(&all), &spec, H as f64, 1, 1.0, &starts, None).unwrap();
+    let all_on = vec![true; on_all.len()];
+    let on = book(&all, &starts, &all_on);
+    assert_eq!(on.hash(), plain.hash());
+    assert_eq!(on.bound(), plain.bound());
+    assert!(!on.is_masked());
+    // Predictions hold through the masked rows: the masked rows still earn nothing.
+    let pj: Vec<f64> = (0..on_all.len()).map(|i| if i % 5 < 3 { 1.0 } else { -1.0 }).collect();
+    let flat: Vec<f64> = pj.iter().zip(&on_all).map(|(&p, &o)| if o { p } else { f64::MIN }).collect();
+    assert_eq!(joint.totals(&pj).exits, joint.totals(&flat).exits);
+    assert!((joint.regret(&pj) - joint.regret(&flat)).abs() <= 1e-15);
+}
+
+#[test]
+fn the_gate_restarts_at_each_training_interval_segment() {
+    // The gate is off for the last two rows of the first interval and on at the first row of the
+    // second; with dwell 5 a gate carried over the gap would still be off there.
+    let mut text = String::from("ts,g,r,y\n");
+    for h in (0..120).chain(300..420).chain(420..480) {
+        let g = if h == 118 || h == 119 { -1.0 } else { 1.0 };
+        text.push_str(&format!("{},{},{},{}\n", hour(h), g, 0.001 * frac(h as f64 * 0.37), 0.001 * frac(h as f64 * 0.53)));
+    }
+    let table = data::parse_table(&text).unwrap();
+    let d = Declared {
+        split_id: "r".to_string(),
+        train: vec![(hour(0), hour(120)), (hour(300), hour(420))],
+        validation: Vec::new(),
+        test: vec![(hour(420), hour(480))],
+    };
+    let iv = IntervalSplit::new(d, 0, 0, EmbargoSource::Purge, None);
+    let mut cols = data::TradingColumns { return_column: Some("r".to_string()), log_returns: true, train: true, ..Default::default() };
+    cols.mask = Some(rcsr::regime_gate::GateSpec::parse("g", 0.0, 5).unwrap());
+    let spec = SplitSpec { mode: SplitMode::TemporalIntervals, time_col: Some(0), intervals: Some(iv), trading: Some(cols), ..SplitSpec::default() };
+    let p = data::prepare_full(&table, &["g".to_string()], "y", &spec, &mut rcsr::rng::Mt::new(1)).unwrap();
+    let train = p.trading.expect("trading split").masks.expect("masks").train.expect("train mask");
+    assert_eq!(train.len(), 240);
+    assert!(!train[119], "off after the flip at row 118 holds");
+    assert!(train[120], "the first row of the second segment takes the raw state");
+}
+
+#[test]
+fn embargo_auto_covers_the_mask_columns() {
+    let s = Scratch::new("interval-split-embargo-mask");
+    let dir = s.path();
+    let data = write_series(dir, 2400);
+    let table = write_table(
+        dir,
+        "t.csv",
+        &[("c", "train", hour(0), hour(720)), ("c", "test", hour(720), hour(960)), ("c", "train", hour(960), hour(2300)), ("c", "validation", hour(2300), hour(2400))],
+    );
+    let h1 = write_spec(dir, "h1.json", H, H);
+    let args = ["--vars", "r16", "--split-table", &table, "--split-id", "c", "--generations", "1", "--pop", "8", "--fitness", "pnl", "--objective", "sharpe"];
+    let plain = ok_json(&search(&data, &h1, &args));
+    assert_eq!(num(&plain, &["split", "embargo_seconds"]), (16 * H) as f64, "r16 alone reads 16 bars");
+    let mut masked = args.to_vec();
+    masked.extend_from_slice(&["--pnl-mask", "r672"]);
+    let j = ok_json(&search(&data, &h1, &masked));
+    assert_eq!(num(&j, &["split", "embargo_seconds"]), (28 * D) as f64);
+    assert_eq!(at(&j, &["split", "embargo_source"]).as_str(), Some("lookback"));
+    assert_eq!(at(&j, &["split", "embargo_column"]).as_str(), Some("r672"));
+    masked.extend_from_slice(&["--embargo", "3600"]);
+    let out = search(&data, &h1, &masked);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(stderr(&out).contains("below the automatic embargo 2419200"), "{}", stderr(&out));
 }
 
 fn split_of(validation: &[(i64, i64)], test: &[(i64, i64)]) -> IntervalSplit {

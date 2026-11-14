@@ -1759,6 +1759,18 @@ pub struct TradingColumns {
     /// #948: keep rows whose fit label is missing but whose return is finite; they
     /// join the book samples and leave every fit input. Needs `return_column`.
     pub book_rows: bool,
+    /// #1180: the regime gate of `--pnl-mask`: the gate state of every slice row
+    /// is built into [`TradingSplit::masks`].
+    pub mask: Option<crate::regime_gate::GateSpec>,
+}
+
+/// #1180: the regime mask of each slice, aligned with its trading rows.
+#[derive(Clone, Debug, Default)]
+pub struct TradingMasks {
+    /// Training rows; `Some` exactly when [`TradingColumns::train`] is set.
+    pub train: Option<Vec<bool>>,
+    pub validation: Option<Vec<bool>>,
+    pub test: Vec<bool>,
 }
 
 /// #948: the rows the books price, a superset of the fit rows. A row without a fit
@@ -1809,6 +1821,8 @@ pub struct TradingSplit {
     /// walk-forward.
     pub validation_context: Option<TradingContext>,
     pub test_context: Option<TradingContext>,
+    /// #1180: the regime mask of each slice under `--pnl-mask`.
+    pub masks: Option<TradingMasks>,
 }
 
 /// Feature rows (as in [`Sample::x`]) and trading rows of a cross-section context.
@@ -4945,7 +4959,36 @@ fn build_trading(
             ret,
         }
     };
+    let masks = match &cols.mask {
+        None => None,
+        Some(gate) => {
+            let gate_cols = gate.columns.iter().map(|n| numeric(n, "mask")).collect::<Result<Vec<_>, _>>()?;
+            // The gate restarts at each training interval segment, like the
+            // book: a gap holds rows the gate never saw.
+            let starts = spec.intervals.as_ref().map(|s| s.segment_starts()).unwrap_or_default();
+            let states = |idx: &[usize], segmented: bool| -> Result<Vec<bool>, String> {
+                let selected: Vec<Vec<f64>> = gate_cols.iter().map(|c| idx.iter().map(|&i| c[i]).collect()).collect();
+                let mut ids: std::collections::HashMap<(u64, usize), u64> = std::collections::HashMap::new();
+                let g: Vec<u64> = idx
+                    .iter()
+                    .map(|&i| {
+                        let seg = if segmented && starts.len() > 1 { starts.partition_point(|s| *s <= time[i]) } else { 0 };
+                        let next = ids.len() as u64;
+                        *ids.entry((group[i], seg)).or_insert(next)
+                    })
+                    .collect();
+                let t: Vec<f64> = idx.iter().map(|&i| time[i]).collect();
+                crate::regime_gate::gate_states(gate, &g, &t, &selected)
+            };
+            Some(TradingMasks {
+                train: if cols.train { Some(states(train_idx, true)?) } else { None },
+                validation: if validation.is_some() { Some(states(validation_idx, false)?) } else { None },
+                test: states(test_idx, false)?,
+            })
+        }
+    };
     Ok(TradingSplit {
+        masks,
         train: cols.train.then(|| slice(train_idx, train)),
         validation: validation.map(|v| slice(validation_idx, v)),
         test: slice(test_idx, test),
@@ -6193,6 +6236,7 @@ mod tests {
                 train,
                 cross_section: false,
                 book_rows: false,
+                mask: None,
             }),
             canonical_train_order: canonical,
             ..Default::default()

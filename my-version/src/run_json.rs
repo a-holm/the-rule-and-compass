@@ -75,6 +75,8 @@ pub struct RunFile {
     pub band: crate::trading::BandSpec,
     /// `objective.spec.min_holding`; 1 without it.
     pub min_holding: usize,
+    /// #1180: the regime gate the run priced its books under (`objective.spec.pnl_mask`).
+    pub mask: Option<crate::regime_gate::GateSpec>,
     /// `split.train_time`: `[first, last]` raw time keys.
     pub train_time: Option<(f64, f64)>,
     /// `split.validation_time`: `[first, last]`, absent without a validation slice.
@@ -166,6 +168,7 @@ impl RunFile {
             position: position_of(objective_spec),
             band,
             min_holding,
+            mask: crate::run_book::mask_of(objective_spec)?,
             train_time: pair(split.and_then(|s| s.get("train_time"))),
             validation_time: pair(split.and_then(|s| s.get("validation_time"))),
             purge_seconds: purge("required_purge_seconds").or_else(|| purge("purge_seconds")),
