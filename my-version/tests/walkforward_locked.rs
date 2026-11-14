@@ -6,7 +6,10 @@
 
 #[path = "common/rcsr.rs"]
 mod rcsr_cmd;
+#[path = "common/timing.rs"]
+mod timing;
 
+use rcsr::devlog::Json;
 use rcsr::lockbox::{self, Lockbox};
 use rcsr::{data, store};
 use std::path::{Path, PathBuf};
@@ -149,26 +152,11 @@ fn wf(data: &str, window: &str, extra: &[String]) -> (i32, String, String) {
     rcsr(&a)
 }
 
-/// Drops the tokens that carry wall clock, timing-derived ledger ratios and the data path.
+/// Parses the report and drops wall clock, the ledger and the hash by key; the data path is masked.
 fn stable(out: &str, data: &str) -> String {
-    out.replace(data, "<data>")
-        .split(',')
-        .filter(|t| {
-            !(t.contains("report_sha256")
-                || t.contains("_s\"")
-                || t.contains("seconds")
-                || t.contains("wall")
-                || t.contains("elapsed")
-                || t.contains("denominator")
-                || t.contains("\"numerator\"")
-                || t.contains("\"device_fraction\"")
-                || t.contains("\"duty_run\"")
-                || t.contains("declared_in")
-                || t.contains("bytes_per_s")
-                || t.contains("rows_per_s"))
-        })
-        .collect::<Vec<_>>()
-        .join(",")
+    let text = out.replace(data, "<data>");
+    let json = Json::parse(&text).unwrap_or_else(|| panic!("not one JSON document: {text}"));
+    format!("{:?}", timing::drop_timing(json))
 }
 
 fn sha(out: &str) -> String {
@@ -337,6 +325,16 @@ fn the_report_filter_drops_timing_ledger_fields_and_keeps_data_fields() {
     assert_eq!(stable(a, "/data.rcsb"), stable(b, "/data.rcsb"));
     assert_ne!(stable(a, "/data.rcsb"), stable(&a.replace("1.5", "1.6"), "/data.rcsb"));
     assert_ne!(stable(a, "/data.rcsb"), stable(&a.replace("10", "11"), "/data.rcsb"));
+}
+
+#[test]
+fn the_report_filter_drops_the_closure_ratio() {
+    let ledger = |v: &str| format!(r#"{{"ledger":{{"wall_s":1.0,"unaccounted_s":0,"closure":{{"value":{v},"numerator":0,"denominator":1,"units":"fraction","scope":"run"}}}},"batch_timings":{{"a":{v}}},"sharpe":1.5,"n_rows":10,"label":"a"}}"#);
+    let (a, b) = (ledger("0"), ledger("1.18e-16"));
+    assert_eq!(stable(&a, "/data.rcsb"), stable(&b, "/data.rcsb"));
+    assert_ne!(stable(&a, "/data.rcsb"), stable(&a.replace("1.5", "1.6"), "/data.rcsb"));
+    assert_ne!(stable(&a, "/data.rcsb"), stable(&a.replace("10", "11"), "/data.rcsb"));
+    assert_ne!(stable(&a, "/data.rcsb"), stable(&a.replace("\"a\"}", "\"b\"}"), "/data.rcsb"));
 }
 
 // ---------------------------------------------------------------------------
