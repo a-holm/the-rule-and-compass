@@ -508,6 +508,18 @@ fn island_policy(cfg: &Config) -> bool {
     cfg.restart_policy == RestartPolicy::Island
 }
 
+fn lexicase_selection(cfg: &Config) -> bool {
+    cfg.selection == Selection::Lexicase
+}
+
+fn lexicase_cases(text: &str) -> Result<usize, String> {
+    let max = crate::search::MAX_LEXICASE_CASES;
+    match text.parse::<usize>() {
+        Ok(k) if (2..=max).contains(&k) => Ok(k),
+        _ => Err(format!("--lexicase-cases needs an integer from 2 to {}, got '{}'", max, text)),
+    }
+}
+
 /// The table. Within a group, the order is the order of every reader.
 pub static TABLE: &[&dyn Setting] = &[
     &Row::<usize> {
@@ -583,8 +595,8 @@ pub static TABLE: &[&dyn Setting] = &[
         group: Group::Island,
         schema_type: "enum",
         schema_default: "lexicographic",
-        schema: "#465: survivor and parent selection inside an island: lexicographic (generational replacement, tournament on error then size) or afp (age-fitness Pareto: survivors of parents, offspring and random immigrants by non-dominated sorting on error, complexity and age with crowding distance; parents by Pareto rank and crowding). Saved search setting. afp runs on the node path; --variation postfix with afp exits 2, auto picks the node path",
-        help: "  --selection lexicographic|afp
+        schema: "#465: survivor and parent selection inside an island: lexicographic (generational replacement, tournament on error then size), afp (age-fitness Pareto: survivors of parents, offspring and random immigrants by non-dominated sorting on error, complexity and age with crowding distance; parents by Pareto rank and crowding) or lexicase (#1023: generational replacement with the elite; parents by semi-dynamic epsilon-lexicase on --lexicase-cases cases drawn per generation: row losses under the metric fitness, (group, time block) sub-book regrets under --fitness pnl; epsilon is the median absolute deviation of the island's errors on each case). Saved search setting. afp and lexicase run on the node path; --variation postfix with either exits 2, auto picks the node path. lexicase runs on the CPU: --gpu with it exits 2 and a CUDA build without --gpu notes the reason and stays on the CPU. Under the metric fitness lexicase needs a metric with a per-row loss (absolute, squared, log_squashed, aic, aicc, bic, log_loss, brier, hinge, hinge_ordinary, hinge_squared), one target and no --weight; any other exits 2",
+        help: "  --selection lexicographic|afp|lexicase
                              survivor and parent selection inside an island.
                              lexicographic (default) replaces the island with
                              its offspring and picks parents by error, then
@@ -592,9 +604,16 @@ pub static TABLE: &[&dyn Setting] = &[
                              offspring on (error, complexity, age), adds a few
                              random immigrants per generation and picks
                              parents by Pareto rank and crowding distance.
-                             Node path only; refuses --variation postfix",
+                             lexicase replaces the island like lexicographic
+                             and picks parents by epsilon-lexicase on cases
+                             drawn per generation (--lexicase-cases): row
+                             losses under the metric fitness, (group, time
+                             block) sub-book regrets under --fitness pnl.
+                             lexicase runs on the CPU and needs a per-row
+                             loss metric. Node path only; refuses --variation
+                             postfix",
         bench: Some(Bench {
-            usage: "  --selection <mode>        lexicographic (default) or afp (age-fitness Pareto)",
+            usage: "  --selection <mode>        lexicographic (default), afp (age-fitness Pareto) or lexicase",
             omit_unset: false,
         }),
         gui: false,
@@ -604,6 +623,30 @@ pub static TABLE: &[&dyn Setting] = &[
         write: Write::UnlessDefault,
         active: None,
         conflict: Conflict::Saved,
+    },
+    &Row::<usize> {
+        flag: "--lexicase-cases",
+        key: "lexicase_cases",
+        group: Group::Island,
+        schema_type: "int",
+        schema_default: "256",
+        schema: "#1023: cases one --selection lexicase generation selects on, 2 to 4096. Metric fitness: this many rows of the generation's sample (all rows when fewer), drawn from the seed and the generation. --fitness pnl: every (group, time block) sub-book with a positive hindsight bound is a case; when there are more, this many are drawn per generation. Read only under --selection lexicase. Saved search setting: a resume refuses a different value; a checkpoint without it loads 256",
+        help: "  --lexicase-cases <K>       cases one --selection lexicase generation selects
+                             on, default 256, 2 to 4096: rows under the metric
+                             fitness, sub-books under --fitness pnl, drawn per
+                             generation from the seed. Saved search setting
+                             (#1023)",
+        bench: Some(Bench {
+            usage: "  --lexicase-cases <K>      cases per generation under --selection lexicase",
+            omit_unset: true,
+        }),
+        gui: false,
+        get: |c| &c.lexicase_cases,
+        set: |c| &mut c.lexicase_cases,
+        cli: Cli::Value(lexicase_cases),
+        write: Write::UnlessDefault,
+        active: Some(lexicase_selection),
+        conflict: Conflict::SavedKey,
     },
     &Row::<RestartPolicy> {
         flag: "--restart-policy",

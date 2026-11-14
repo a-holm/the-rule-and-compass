@@ -1288,6 +1288,72 @@ fn a_long_pnl_run_resumes_with_the_same_book_and_refuses_another() {
     assert!(err.contains("fitness"), "{err}");
 }
 
+/// #1023: a saved-then-resumed `--selection lexicase` run equals the
+/// uninterrupted run: the metric cases are drawn from the seed and the
+/// generation, and a member's case errors are recomputed from its saved tree.
+#[test]
+fn a_lexicase_run_and_its_resume_match_exactly() {
+    let train = sample(240);
+    let test = sample(80);
+    let lex = |generations| Config {
+        generations,
+        selection: search::Selection::Lexicase,
+        lexicase_cases: 48,
+        gpu: false,
+        ..config(11)
+    };
+    let uninterrupted = search::run(&lex(30), &train, &test);
+    let text = checkpoint_text(&lex(15), &train, &test);
+    assert!(text.contains("config selection lexicase\n") && text.contains("config lexicase_cases 48\n"));
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    let resumed = search::run_resumable(&lex(30), &train, &test, Some(saved), 0, |_| {}).expect("resume");
+    assert_eq!(describe(&uninterrupted), describe(&resumed));
+    assert_eq!(uninterrupted.candidates_evaluated, resumed.candidates_evaluated);
+    assert_eq!(uninterrupted.archive.hash(), resumed.archive.hash());
+    let mut end_a = None;
+    search::run_resumable(&lex(30), &train, &test, None, 0, |cp| end_a = Some(cp.to_text())).expect("full");
+    let mut end_b = None;
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    search::run_resumable(&lex(30), &train, &test, Some(saved), 0, |cp| end_b = Some(cp.to_text())).expect("resume");
+    assert_eq!(end_a, end_b, "the final population and generators must match");
+}
+
+/// #1023: the same under `--fitness pnl` with 2 groups and 2 time blocks
+/// (4 sub-book cases): the resumed members get their sub-book regrets from one
+/// pass over their saved trees, the bits the scoring pass kept.
+#[test]
+fn a_lexicase_long_pnl_run_resumes_exactly() {
+    let train = sample(240);
+    let test = sample(80);
+    let slice = rcsr::data::TradingSlice {
+        rows: rcsr::trading::TradingRows {
+            time: (0..train.len()).map(|i| 900.0 * (i % 120) as f64).collect(),
+            group: (0..train.len()).map(|i| (i / 120) as u64).collect(),
+            funding: Vec::new(),
+        },
+        ret: train.x.iter().map(|r| 0.002 * (r[1] - 0.5)).collect(),
+    };
+    let spec = rcsr::trading::TradingSpec { cost_bps: 2.0, min_trades: 0, ..Default::default() };
+    let book = rcsr::trading::FitnessBook::with_blocks(&slice, &spec, 900.0, 2, 1.0).expect("book");
+    assert_eq!(book.cases().kept.len(), 4);
+    let fitness = search::Fitness::LongPnl(std::sync::Arc::new(book));
+    let lex = |generations| Config {
+        generations,
+        selection: search::Selection::Lexicase,
+        fitness: fitness.clone(),
+        gpu: false,
+        ..config(11)
+    };
+    let uninterrupted = search::run(&lex(24), &train, &test);
+    let text = checkpoint_text(&lex(12), &train, &test);
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    let resumed = search::run_resumable(&lex(24), &train, &test, Some(saved), 0, |_| {}).expect("resume");
+    assert_eq!(describe(&uninterrupted), describe(&resumed));
+    assert_eq!(uninterrupted.archive.hash(), resumed.archive.hash());
+    let lexicographic = search::run(&Config { selection: search::Selection::Lexicographic, ..lex(24) }, &train, &test);
+    assert_ne!(uninterrupted.archive.hash(), lexicographic.archive.hash(), "lexicase must change the trajectory");
+}
+
 /// #598: the pipeline depth is an execution setting. A resume takes the one it
 /// is given, and the archive equals an uninterrupted run at that depth.
 #[cfg(feature = "cuda")]

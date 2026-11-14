@@ -81,6 +81,8 @@ pub enum Selection {
     Lexicographic,
     /// Age-fitness Pareto survivor selection over parents and offspring.
     Afp,
+    /// #1023: generational replacement with epsilon-lexicase parent selection.
+    Lexicase,
 }
 
 impl Selection {
@@ -88,6 +90,7 @@ impl Selection {
         match self {
             Selection::Lexicographic => "lexicographic",
             Selection::Afp => "afp",
+            Selection::Lexicase => "lexicase",
         }
     }
 
@@ -95,8 +98,9 @@ impl Selection {
         match s {
             "lexicographic" => Ok(Selection::Lexicographic),
             "afp" => Ok(Selection::Afp),
+            "lexicase" => Ok(Selection::Lexicase),
             other => Err(format!(
-                "selection must be 'lexicographic' or 'afp', got '{}'",
+                "selection must be 'lexicographic', 'afp' or 'lexicase', got '{}'",
                 other
             )),
         }
@@ -508,6 +512,10 @@ pub struct Config {
     pub variation: VariationMode,
     /// #465: survivor and parent selection inside an island.
     pub selection: Selection,
+    /// #1023: cases one `--selection lexicase` generation selects on (rows
+    /// under the metric fitness, sub-books under `--fitness pnl`). Saved search
+    /// setting, read only under lexicase.
+    pub lexicase_cases: usize,
     /// #1022: which stall rule restarts an island. Saved search setting.
     pub restart_policy: RestartPolicy,
     /// #1022: generations a restarted island takes no front parent and no
@@ -807,6 +815,8 @@ pub use prune::PruneReport;
 mod fit_route; // #1091: the fit route of both device fit schedules
 mod fit_accept; // #1117: the fit-accept decision counts
 pub use fit_accept::{FitAcceptCounts, FitAcceptReport, FitPath};
+mod lexicase; // #1023: epsilon-lexicase parent selection
+pub use lexicase::{metric_refusal as lexicase_metric_refusal, DEFAULT_LEXICASE_CASES, MAX_LEXICASE_CASES};
 use fit_route::{accept_fit, unfitted_wins};
 #[cfg(feature = "cuda")]
 use fit_route::{DeviceArm, ExactFits, FitRoute, FitSettings, Rotation, RouteCounts};
@@ -883,6 +893,7 @@ impl Default for Config {
             fit_release_waves: 0,
             variation: VariationMode::Auto,
             selection: Selection::Lexicographic,
+            lexicase_cases: DEFAULT_LEXICASE_CASES,
             restart_policy: RestartPolicy::Archive,
             restart_isolation: 25,
             explore_islands: 0,
@@ -1029,12 +1040,17 @@ struct Ind {
     /// error and the bit set of edit kinds that made this offspring. Consumed
     /// by `learn_mix_at_barrier` in the generation that set it; never saved.
     edit: Option<(f64, u8)>,
+    /// #1023: under `--selection lexicase --fitness pnl`, the regret of every
+    /// kept sub-book from the prediction vector that produced `error`. Any
+    /// write of `error` clears it; never saved.
+    cases: Option<std::sync::Arc<[f32]>>,
 }
 
 impl Ind {
     fn set_error(&mut self, error: f64) {
         self.error = error;
         self.inf_rows = None;
+        self.cases = None;
     }
 
     /// #500: mark a `+inf` error as confirmed on the CPU for rows `rows`.
@@ -1076,16 +1092,16 @@ impl Ind {
         // fallback. The folded path applies whenever scoring already produces
         // predictions, which is every metric except the squared reuse case.
         let want_descriptor = cfg.qd_bins > 0 && !train.sample.is_multi();
-        let (error, descriptor) = if cfg.accepts_dimensions(&tree) {
+        let (error, descriptor, cases) = if cfg.accepts_dimensions(&tree) {
             match fitted {
                 Some(fit) if can_reuse_sse(cfg, train, &fit, hash) => {
                     let d = want_descriptor.then(|| qd_descriptor_of(&tree, train, cfg)); // #1084
-                    (fit.sse / train.sample.len() as f64, d)
+                    (fit.sse / train.sample.len() as f64, d, None)
                 }
-                _ => fitness_error_and_descriptor(&tree, train, cfg, want_descriptor), // #27 #480
+                _ => fitness_scored(&tree, train, cfg, want_descriptor, lexicase::stores_cases(cfg)), // #27 #480 #1023
             }
         } else {
-            (f64::INFINITY, None)
+            (f64::INFINITY, None, None)
         };
         Ind {
             tree,
@@ -1095,6 +1111,7 @@ impl Ind {
             age: 0,
             inf_rows: None,
             edit: None,
+            cases,
         }
     }
 
@@ -1123,6 +1140,7 @@ impl Ind {
             age: 0,
             inf_rows: None,
             edit: None,
+            cases: None,
         }
     }
 
@@ -1135,13 +1153,14 @@ impl Ind {
     fn score_in_place(&mut self, train: &EvalSample, cfg: &Config) {
         // #25: re-evaluation must not resurrect a rejected candidate.
         let want_descriptor = cfg.qd_bins > 0 && !train.sample.is_multi();
-        let (error, descriptor) = if cfg.accepts_dimensions(&self.tree) {
-            fitness_error_and_descriptor(&self.tree, train, cfg, want_descriptor) // #27 #480
+        let (error, descriptor, cases) = if cfg.accepts_dimensions(&self.tree) {
+            fitness_scored(&self.tree, train, cfg, want_descriptor, lexicase::stores_cases(cfg)) // #27 #480 #1023
         } else {
-            (f64::INFINITY, None)
+            (f64::INFINITY, None, None)
         };
         self.set_error(error);
         self.descriptor = descriptor;
+        self.cases = cases;
     }
 
     /// #500: `reeval` for an individual with a non-finite error. A `+inf` error
@@ -1230,6 +1249,7 @@ impl Ind {
             age: ind.age,
             inf_rows: None,
             edit: None,
+            cases: None,
         }
     }
 }
@@ -4463,24 +4483,41 @@ fn fitness_error_and_descriptor(
     cfg: &Config,
     want_descriptor: bool,
 ) -> (f64, Option<qd::Descriptor>) {
+    let (error, descriptor, _) = fitness_scored(tree, data, cfg, want_descriptor, false);
+    (error, descriptor)
+}
+
+/// #1023: [`fitness_error_and_descriptor`] and, when `want_cases` and the
+/// regret is finite, the sub-book regrets of the same prediction vector.
+#[allow(clippy::type_complexity)]
+fn fitness_scored(
+    tree: &Node,
+    data: &EvalSample,
+    cfg: &Config,
+    want_descriptor: bool,
+    want_cases: bool,
+) -> (f64, Option<qd::Descriptor>, Option<std::sync::Arc<[f32]>>) {
     let Some(book) = cfg.fitness.book() else {
-        return eval_error_and_descriptor(tree, data, cfg.metric, want_descriptor);
+        let (error, descriptor) = eval_error_and_descriptor(tree, data, cfg.metric, want_descriptor);
+        return (error, descriptor, None);
     };
     let s = data.sample;
     if s.is_empty() || s.len() != book.len() {
         debug_assert!(false, "fitness book has {} rows, the sample {}", book.len(), s.len());
-        return (f64::INFINITY, None);
+        return (f64::INFINITY, None, None);
     }
     let nvars = s.x.first().map(Vec::len).unwrap_or(0);
     with_predictions(tree, data, |pred| {
-        if want_descriptor && cfg.qd_descriptor == qd::DescriptorKind::Book {
+        let (error, descriptor) = if want_descriptor && cfg.qd_descriptor == qd::DescriptorKind::Book {
             // #1084: the descriptor reads the reduction that gives the regret.
             let (error, shape) = book.regret_and_shape(pred);
-            return (error, Some(qd::book_descriptor(&shape)));
-        }
-        let error = book.regret(pred);
-        let descriptor = want_descriptor.then(|| qd::descriptor_from_prediction(tree, pred, nvars));
-        (error, descriptor)
+            (error, Some(qd::book_descriptor(&shape)))
+        } else {
+            let error = book.regret(pred);
+            (error, want_descriptor.then(|| qd::descriptor_from_prediction(tree, pred, nvars)))
+        };
+        let cases = (want_cases && error.is_finite()).then(|| book.case_errors(pred).into());
+        (error, descriptor, cases)
     })
 }
 
@@ -6137,6 +6174,10 @@ struct Parents<'a> {
     /// `qd_control`.
     qd: Option<(Option<&'a QdArchive>, u8)>,
     source: ParentSource,
+    /// #1023: this generation's lexicase cases, set by the generation loop.
+    cases: Option<&'a lexicase::CaseSet>,
+    /// #1023: the island's lexicase pool, set by `evolve_island` from `cases`.
+    lexicase: Option<&'a lexicase::Pool>,
 }
 
 /// #120: one parent under the QD policy or the original #76 draw.
@@ -6161,6 +6202,13 @@ fn pick_parent_policy(island: &[Ind], parents: &Parents<'_>, rng: &mut Mt) -> No
         if let Some(tree) = parent {
             return tree.clone();
         }
+    }
+    if let Some(pool) = parents.lexicase {
+        // #1023: the front draw stays in front of the island selection.
+        return match front_parent(parents.front, rng, parents.source.front_p) {
+            Some(tree) => tree.clone(),
+            None => island[pool.select(island, rng)].tree.clone(),
+        };
     }
     pick_parent(island, parents.front, rng, parents.source.front_p).clone()
 }
@@ -6486,6 +6534,10 @@ fn evolve_island(
             }
         }
     }
+
+    // #1023: the island's lexicase pool on this generation's cases.
+    let lex_pool = parents.cases.map(|set| lexicase::Pool::build(isl, set, cfg, train, workers));
+    let parents = Parents { lexicase: lex_pool.as_ref(), ..parents };
 
     let afp = cfg.selection == Selection::Afp;
     // #465: Pareto rank and crowding of the parents drive the tournament.
@@ -7458,6 +7510,9 @@ fn postfix_variation_for(cfg: &Config, train: &Sample) -> Result<Variation, Stri
     if cfg.selection == Selection::Afp {
         return Err("--selection afp runs on the node path".to_string());
     }
+    if cfg.selection == Selection::Lexicase {
+        return Err("--selection lexicase runs on the node path".to_string()); // #1023
+    }
     if cfg.fit_iters != 0 {
         return Err("constant fitting is enabled".to_string());
     }
@@ -7814,6 +7869,7 @@ fn dev_generation(
         isolated: 0,
         migrants: 0,
         migrants_skipped: 0,
+        lexicase_cases: None,
     }
 }
 
@@ -8144,6 +8200,7 @@ fn run_postfix_search(
                             age: 0,
                             inf_rows: None,
                             edit: None,
+                            cases: None,
                         })
                         .collect()
                 })
@@ -8221,6 +8278,7 @@ fn run_postfix_search(
                         age: 0,
                         inf_rows: None,
                         edit: None,
+                        cases: None,
                     })
                     .collect()
             })
@@ -8393,6 +8451,9 @@ fn run_search(
     if cfg.qd_bins > 0 && cfg.qd_descriptor == qd::DescriptorKind::Book && cfg.fitness.book().is_none() {
         return Err("--qd-descriptor book needs --fitness pnl: the book descriptor reads the long/flat fitness book".to_string()); // #1084
     }
+    if let Some(reason) = lexicase::refusal(cfg, train) {
+        return Err(reason); // #1023
+    }
     #[cfg(feature = "cuda")]
     crate::gpu::note_search_start();
     let nvars = train.x.first().map(|r| r.len()).unwrap_or(0);
@@ -8467,6 +8528,14 @@ fn run_search(
     let mut backend_reason: Option<String> = None;
     #[cfg(feature = "cuda")]
     let mut gpu: Option<GpuSearch> = if !cfg.gpu {
+        None
+    } else if cfg.selection == Selection::Lexicase {
+        // #1023: the device returns no per-case errors; lexicase runs on the CPU.
+        let reason = "--selection lexicase reads per-case errors the device scorer does not return";
+        if cfg.gpu_notes {
+            eprintln!("# gpu: off ({})", reason);
+        }
+        backend_reason = Some(reason.to_string());
         None
     } else {
         // #230: the evaluator still has no native rank scorer, but the exact
@@ -9233,6 +9302,8 @@ fn run_search(
             // scored `eval_data`. It describes `gen_train` only when those are
             // the same rows: no per-generation subset and no screening subset.
             let cached_descriptors_valid = gen_sample.is_none() && !screened;
+            // #1023: the generation's lexicase cases, from the seed and `gen` alone.
+            let lex_cases = (cfg.selection == Selection::Lexicase).then(|| lexicase::CaseSet::for_generation(cfg, gen_train, gen));
 
             // #86: with predictor subsampling active (and no screening), refit
             // the carried-over population on this generation's fit rows, then
@@ -9353,7 +9424,7 @@ fn run_search(
                     .map(|(i, (((isl, r), mix), sender))| {
                         // #10: carry the block registry into the island thread.
                         let blocks = blocks.clone();
-                        let parents = Parents { front: policy.front(i, front), qd: qd_parents, source: policy.parent_source(i) }; // #76 #120 #1081 #1070
+                        let parents = Parents { front: policy.front(i, front), qd: qd_parents, source: policy.parent_source(i), cases: lex_cases.as_ref(), lexicase: None }; // #76 #120 #1081 #1070 #1023
                         s.spawn(move || {
                             expr::set_blocks(blocks);
                             #[cfg(feature = "cuda")]
@@ -9668,7 +9739,7 @@ fn run_search(
                     }
                     dev_island_best.push(best);
                 }
-                let rec = dev_generation(
+                let mut rec = dev_generation(
                     gens_done,
                     cfg,
                     dev_errors,
@@ -9693,6 +9764,7 @@ fn run_search(
                         }
                     }),
                 );
+                rec.lexicase_cases = lex_cases.as_ref().map(|c| c.len()); // #1023
                 dev_rec = Some(rec);
             }
 
@@ -10368,6 +10440,7 @@ mod tests {
             age: 0,
             inf_rows: None,
             edit: None,
+            cases: None,
         }
     }
 
@@ -10678,6 +10751,7 @@ mod tests {
             age: 0,
             inf_rows: None,
             edit: None,
+            cases: None,
         };
         refresh_after_fit(&mut ind, &cfg);
         let want = expr::simplify(&tree);
@@ -11317,7 +11391,7 @@ mod tests {
     // #76: two distinguishable front members.
     /// No front, no QD archive: every parent comes from the island tournament.
     fn no_parents() -> Parents<'static> {
-        Parents { front: &[], qd: None, source: ParentSource { front_p: 0.0, shared: true } }
+        Parents { front: &[], qd: None, source: ParentSource { front_p: 0.0, shared: true }, cases: None, lexicase: None }
     }
 
     fn two_member_front() -> Vec<Sol> {
@@ -11352,6 +11426,7 @@ mod tests {
             age: 0,
             inf_rows: None,
             edit: None,
+            cases: None,
         }];
 
         let mut rng = Mt::new(11);
@@ -11421,7 +11496,7 @@ mod tests {
                 &aggs,
                 false,
                 false,
-                Parents { front, qd: None, source: ParentSource { front_p: 0.0, shared: true } },
+                Parents { front, qd: None, source: ParentSource { front_p: 0.0, shared: true }, cases: None, lexicase: None },
                 None,  // #119: synchronous test path
                 None,  // #211: no development log in this test
                 1,     // #463
@@ -11624,6 +11699,7 @@ mod tests {
             age: 0,
             inf_rows: None,
             edit: None,
+            cases: None,
         };
 
         ind.refit_and_reeval(&first_data, &first, &cfg, None);
@@ -12995,7 +13071,7 @@ mod tests {
     }
 
     fn aged_ind(tree: Node, error: f64, complexity: f64, age: u32) -> Ind {
-        Ind { tree, error, complexity, descriptor: None, age, inf_rows: None, edit: None }
+        Ind { tree, error, complexity, descriptor: None, age, inf_rows: None, edit: None, cases: None }
     }
 
     /// #465: the lowest-error individual always survives, whatever its age or

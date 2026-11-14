@@ -1633,9 +1633,9 @@ mod tests {
                 .collect();
             (picks, *rng.state().0, rng.state().1)
         };
-        let own = draws(Parents { front: &[], qd: None, source: ParentSource { front_p: 0.0, shared: true } });
+        let own = draws(Parents { front: &[], qd: None, source: ParentSource { front_p: 0.0, shared: true }, cases: None, lexicase: None });
         for control in [0u8, 1] {
-            let pools = |source| Parents { front: &front, qd: Some((Some(&qd), control)), source };
+            let pools = |source| Parents { front: &front, qd: Some((Some(&qd), control)), source, cases: None, lexicase: None };
             assert!(draws(pools(ISOLATED)) == own, "control {control}: an isolated island drew a --qd-policy parent");
             assert!(draws(pools(OPEN)) != own, "control {control}: an open island draws --qd-policy parents");
         }

@@ -1431,6 +1431,21 @@ pub struct FitnessBook {
     band: f64,
     band_units: BandUnits,
     min_hold: usize,
+    /// #1023: the sub-books of the lexicase cases, built on first use.
+    cases: std::sync::OnceLock<BookCases>,
+}
+
+/// #1023: the `(group, time block)` sub-books of a [`FitnessBook`]: one per run
+/// of its seam flags, in row order. Canonical rows keep each group's rows in
+/// time order, so one group's rows inside one block are one run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BookCases {
+    /// Row range `[start, end)` of each run.
+    pub ranges: Vec<(usize, usize)>,
+    /// Hindsight bound of each run's rows.
+    pub bounds: Vec<f64>,
+    /// The runs with a positive bound: the lexicase cases, in run order.
+    pub kept: Vec<usize>,
 }
 
 fn fnv_u64(h: &mut u64, v: u64) {
@@ -1587,6 +1602,7 @@ impl FitnessBook {
             band,
             band_units: spec.band.units,
             min_hold: spec.min_holding,
+            cases: std::sync::OnceLock::new(),
         })
     }
 
@@ -1988,6 +2004,129 @@ impl FitnessBook {
             out[b].gross = w[0];
         }
         out
+    }
+
+    /// #1023: the sub-books of the lexicase cases.
+    pub fn cases(&self) -> &BookCases {
+        self.cases.get_or_init(|| {
+            let n = self.excess.len();
+            let mut ranges = Vec::new();
+            let mut start = 0usize;
+            for i in 1..n {
+                if self.flags[i] & TradingRows::FIRST != 0 {
+                    ranges.push((start, i));
+                    start = i;
+                }
+            }
+            if n > 0 {
+                ranges.push((start, n));
+            }
+            let bounds: Vec<f64> = ranges
+                .iter()
+                .map(|&(s, e)| trading_gpu::dp_bound(&self.excess[s..e], &vec![0; e - s], self.side).unwrap_or(f64::NAN))
+                .collect();
+            let kept = (0..ranges.len()).filter(|&c| bounds[c] > 0.0).collect();
+            BookCases { ranges, bounds, kept }
+        })
+    }
+
+    /// #1023: the totals of every run of [`FitnessBook::cases`] under the
+    /// position rule of the whole book (its band, resolved on all of `pred`, and
+    /// its minimum hold). Each run keeps the segment, lane and warp tree of
+    /// [`FitnessBook::totals`] from its own first row, so a run of a plain book
+    /// or of a score-unit band totals as a separate book of its rows.
+    pub fn case_totals(&self, pred: &[f64]) -> Vec<FitnessTotals> {
+        self.check_len(pred);
+        let band = (!self.is_plain()).then(|| self.resolve_band(pred));
+        self.cases().ranges.iter().map(|&(s, e)| self.run_totals(pred, s, e, band)).collect()
+    }
+
+    /// #1023: the regret `(B_c - net_c) / B_c` of every kept case, from the same
+    /// reduction as [`FitnessBook::case_totals`]; `+inf` for a non-finite
+    /// prediction in the case or a non-finite regret. A case has no trade
+    /// floor: a flat case scores exactly 1.
+    pub fn case_errors(&self, pred: &[f64]) -> Vec<f32> {
+        self.check_len(pred);
+        let band = (!self.is_plain()).then(|| self.resolve_band(pred));
+        let cases = self.cases();
+        cases
+            .kept
+            .iter()
+            .map(|&c| {
+                let (s, e) = cases.ranges[c];
+                let t = self.run_totals(pred, s, e, band);
+                let r = (cases.bounds[c] - self.net_of(&t)) / cases.bounds[c];
+                if t.nonfinite || !r.is_finite() {
+                    f32::INFINITY
+                } else {
+                    r as f32
+                }
+            })
+            .collect()
+    }
+
+    /// #1023: one run `[start, end)` as one book; `band` is `None` for the
+    /// plain rule, else the band automaton's half-width.
+    fn run_totals(&self, pred: &[f64], start: usize, end: usize, band: Option<f64>) -> FitnessTotals {
+        let params = band.map(|band| trading_gpu::BandParams { threshold: self.threshold, band, min_hold: self.min_hold });
+        let mut state = trading_gpu::BandState::default();
+        let mut t = FitnessTotals { gross: 0.0, flips: 0, exits: 0, long_rows: 0, nonfinite: false };
+        let mut warps = [0.0f64; FITNESS_WARPS];
+        let mut prev = false;
+        let mut seg_start = start;
+        let mut seg = 0usize;
+        while seg_start < end {
+            let seg_end = ((seg_start / FITNESS_SEGMENT_ROWS + 1) * FITNESS_SEGMENT_ROWS).min(end); // WIP red
+            let mut lanes = [0.0f64; FITNESS_LANES];
+            for k in seg_start..seg_end {
+                let p = pred[k];
+                let flag = self.flags[k];
+                if !p.is_finite() {
+                    t.nonfinite = true;
+                }
+                if flag & TradingRows::FIRST != 0 {
+                    state = trading_gpu::BandState::default();
+                    prev = false;
+                }
+                let long = match params {
+                    Some(params) => {
+                        state = params.next(state, p);
+                        state.long
+                    }
+                    None => p.is_finite() && p > self.threshold,
+                };
+                if long != prev {
+                    t.flips += 1;
+                }
+                if long {
+                    t.long_rows += 1;
+                    lanes[k % FITNESS_LANES] += self.excess[k]; // WIP red
+                    if flag & TradingRows::LAST != 0 {
+                        t.exits += 1;
+                    }
+                }
+                prev = long;
+            }
+            let mut half = FITNESS_LANES / 2;
+            while half >= 1 {
+                for i in 0..half {
+                    lanes[i] += lanes[i + half];
+                }
+                half /= 2;
+            }
+            warps[seg % FITNESS_WARPS] += lanes[0];
+            seg += 1;
+            seg_start = seg_end;
+        }
+        let mut half = FITNESS_WARPS / 2;
+        while half >= 1 {
+            for i in 0..half {
+                warps[i] += warps[i + half];
+            }
+            half /= 2;
+        }
+        t.gross = warps[0];
+        t
     }
 
     /// #1094: every root cut of `pred` in one sort and one sweep. `time` is the
@@ -2613,6 +2752,59 @@ mod block_tests {
         assert!((fit - (mean + lambda * sd)).abs() <= 1e-12, "{fit} vs {}", mean + lambda * sd);
         let flat = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 0.0).unwrap();
         assert!((flat.regret(&p) - mean).abs() <= 1e-12);
+    }
+
+    /// #1023: every `(group, block)` run totals as a separate book of its own
+    /// rows, bit for bit, for the plain rule and the minimum-hold automaton;
+    /// the case regret is that book's regret.
+    #[test]
+    fn case_totals_equal_separate_books() {
+        // 20 000 distinct stamps cut into 2 blocks of 10 000: each of the 3
+        // groups has rows in both blocks, and a 10 000-row run spans two
+        // 8 192-row segments.
+        let s = panel(&[20_000, 18_000, 16_000]);
+        let ids = block_ids(&s.rows.time, 2).unwrap();
+        for sp in [spec(), TradingSpec { min_holding: 3, ..spec() }] {
+            let book = FitnessBook::with_blocks(&s, &sp, 900.0, 2, 1.0).unwrap();
+            let cases = book.cases();
+            assert_eq!(cases.ranges.len(), 6, "3 groups x 2 blocks");
+            assert_eq!(cases.kept, (0..6).collect::<Vec<_>>());
+            let p = pred(s.ret.len());
+            let totals = book.case_totals(&p);
+            let errors = book.case_errors(&p);
+            for (c, &(start, end)) in cases.ranges.iter().enumerate() {
+                assert!((start..end).all(|i| s.rows.group[i] == s.rows.group[start] && ids[i] == ids[start]));
+                let mut rows = TradingRows::default();
+                rows.group = s.rows.group[start..end].to_vec();
+                rows.time = s.rows.time[start..end].to_vec();
+                let one = crate::data::TradingSlice { rows, ret: s.ret[start..end].to_vec() };
+                let separate = FitnessBook::new(&one, &sp, 900.0).unwrap();
+                let want = separate.totals(&p[start..end]);
+                let got = totals[c];
+                assert_eq!(got.gross.to_bits(), want.gross.to_bits(), "case {c}: gross");
+                assert_eq!((got.flips, got.exits, got.long_rows), (want.flips, want.exits, want.long_rows), "case {c}");
+                assert_eq!(cases.bounds[c].to_bits(), separate.bound().to_bits(), "case {c}: bound");
+                assert_eq!(errors[c].to_bits(), (separate.regret_of(&want) as f32).to_bits(), "case {c}: regret");
+            }
+            // The runs of one block hold the block's counts.
+            let blocks = book.block_totals(&p);
+            for (b, block) in blocks.iter().enumerate() {
+                let of_block: Vec<&FitnessTotals> =
+                    cases.ranges.iter().zip(&totals).filter(|((s0, _), _)| ids[*s0] as usize == b).map(|(_, t)| t).collect();
+                assert_eq!(of_block.iter().map(|t| t.flips + t.exits).sum::<u64>(), block.flips + block.exits);
+                assert_eq!(of_block.iter().map(|t| t.long_rows).sum::<u64>(), block.long_rows);
+            }
+        }
+        // A non-finite prediction makes its case `+inf` and leaves the others.
+        let book = FitnessBook::with_blocks(&s, &spec(), 900.0, 2, 1.0).unwrap();
+        let mut p = pred(s.ret.len());
+        p[book.cases().ranges[3].0 + 5] = f64::NAN;
+        let errors = book.case_errors(&p);
+        assert_eq!(errors[3], f32::INFINITY);
+        assert!(errors.iter().enumerate().all(|(c, e)| c == 3 || e.is_finite()));
+        // A flat case scores exactly 1.
+        let flat = book.case_errors(&vec![-1.0; s.ret.len()]);
+        assert!(flat.iter().all(|&e| e == 1.0), "{flat:?}");
     }
 
     /// `F` flat, `L` long; one character per row.
