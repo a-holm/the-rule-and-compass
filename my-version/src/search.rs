@@ -3529,6 +3529,10 @@ fn finish_on_cpu(
     counts: Option<&FitAcceptCounts>,
 ) {
     let train = rows.sample;
+    for &(i, j) in entry {
+        let ind = &mut islands[i][j];
+        ind.set_error(if cfg.accepts_dimensions(&ind.tree) { f64::NAN } else { f64::INFINITY });
+    }
     let mut unfitted: Vec<(usize, usize, Ind)> = Vec::new();
     if refit {
         for &(i, j) in entry {

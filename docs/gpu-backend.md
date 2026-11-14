@@ -608,8 +608,16 @@ Fallback and the flags:
   how the fallback test runs on a machine that has one.
   Tests build their `rcsr` and `rcsr-bench` children through `my-version/tests/common/rcsr.rs`: `rcsr()` sets `RCSR_GPU=0`, so the child makes no CUDA call, and `rcsr_on_device()` keeps the environment for a test whose purpose is the device (`rcsr_for(args)` picks by the device flags `--gpu`, `--dispatch`, `--batch-pnl`, `--device-pnl`, `--gpu-memory`). `tests/rcsr_command_lint.rs` fails on any other use of `CARGO_BIN_EXE_rcsr` or `CARGO_BIN_EXE_rcsr-bench` in `tests/`.
 * Any CUDA error during a batch prints the same `# gpu: unavailable (...)`
-  note, re-scores the pending generation on the CPU and disables the GPU for the
-  rest of the run. There is no panic and no stale result.
+  note and disables the GPU for the rest of the run. There is no panic and no
+  stale result: every candidate that was pending when the generation's scoring
+  began, in the synchronous batch and in the overlap pipeline, is fitted by the
+  exact CPU arm (when the fit was deferred to the device) and scored by the exact
+  CPU scorer on the generation's rows, whatever stage failed. Device scores of
+  that generation, including a screening score written before the failure, are
+  dropped; a fitted tree only seeds the CPU fit (`search::finish_on_cpu`, #1089). The fault sites
+  `RCSR_FAULT=rescore` (after the fit, before the re-score) and
+  `RCSR_FAULT=pipeline_fit` (before the device fit of the overlap queue) reach
+  these paths.
 
 ### Exact order-statistic and rank scoring (issue #288)
 
