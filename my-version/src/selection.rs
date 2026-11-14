@@ -882,6 +882,26 @@ pub fn select_robust_specs(
     rows: &crate::trading::TradingRows,
     pred_of: &mut dyn FnMut(usize) -> Vec<f64>,
 ) -> Result<RobustSelection, String> {
+    select_robust_specs_cuts(metas, params, None, spec_of, ret, rows, pred_of)
+}
+
+/// #1173: [`select_robust_specs`] with explicit block cuts (`--select-blocks
+/// intervals`: the validation interval starts); `params.blocks` must equal their
+/// count.
+pub fn select_robust_specs_cuts(
+    metas: &[RobustMeta],
+    params: RobustParams,
+    cuts: Option<&[f64]>,
+    spec_of: &mut dyn FnMut(usize) -> crate::trading::TradingSpec,
+    ret: &[f64],
+    rows: &crate::trading::TradingRows,
+    pred_of: &mut dyn FnMut(usize) -> Vec<f64>,
+) -> Result<RobustSelection, String> {
+    if let Some(c) = cuts {
+        if c.len() != params.blocks {
+            return Err(format!("--select-blocks intervals: {} cuts for {} blocks", c.len(), params.blocks));
+        }
+    }
     params.validate()?;
     let bucket = if metas.is_empty() { None } else { spec_of(0).period_seconds.filter(|s| *s > 0.0) };
     let mut stamps: Vec<f64> = rows
@@ -915,7 +935,10 @@ pub fn select_robust_specs(
     let mut members = Vec::with_capacity(metas.len());
     for (i, m) in metas.iter().enumerate() {
         let scored = if m.usable {
-            crate::trading::blocked_alpha(&pred_of(i), ret, rows, &spec_of(i), params.blocks).ok()
+            match cuts {
+                None => crate::trading::blocked_alpha(&pred_of(i), ret, rows, &spec_of(i), params.blocks).ok(),
+                Some(c) => crate::trading::blocked_alpha_cuts(&pred_of(i), ret, rows, &spec_of(i), c).ok(),
+            }
         } else {
             None
         };

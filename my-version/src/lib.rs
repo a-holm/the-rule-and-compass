@@ -57,6 +57,7 @@ pub mod genome;
 pub mod gpu;
 pub mod gpu_stats;
 pub mod inference; // #264: block bootstrap, DSR, PBO, SPA, BH-FDR
+pub mod intervals; // #1173: interval-list splits, purge, lookback embargo and the interval guard
 pub mod gui;
 pub mod implicit;
 pub mod leakage; // #129: differential leakage detectors
