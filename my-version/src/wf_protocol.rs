@@ -482,7 +482,7 @@ fn run_nulls(i: &InferenceInput) -> Result<NullTests, String> {
     let mut rand_sharpe = Vec::with_capacity(i.null_draws);
     for b in 0..i.null_draws {
         let mut p_stat = Stat::new();
-        for (w, (book, d)) in i.books.iter().zip(&dense_books).enumerate() {
+        for (book, d) in i.books.iter().zip(&dense_books) {
             let periods = d.periods;
             let src = permuted_sources(periods, block, &mut perm_rng);
             let mut sum = vec![0.0f64; periods];
