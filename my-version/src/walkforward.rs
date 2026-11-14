@@ -1806,7 +1806,7 @@ impl Accum {
             );
             // Pooled path: carry each group's position across the seam unless
             // the caller asked for the historical flat reset.
-            let flat_here = spec.pool_reset_flat || (opts.flat_gaps && false && previous_test_end != Some(d.window.test_start));
+            let flat_here = spec.pool_reset_flat || (opts.flat_gaps && previous_test_end != Some(d.window.test_start));
             previous_test_end = Some(d.window.test_end);
             let pev = if spec.pool_reset_flat {
                 evaluate_window(

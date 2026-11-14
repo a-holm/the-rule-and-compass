@@ -536,10 +536,12 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
                              reaches a declared locked range exits 3. A split with
                              no test interval is a final all-data run. Under
                              --fitness pnl every maximal contiguous training
-                             interval is its own book segment per group. run.json
-                             split records split_id, split_table_sha256, intervals,
-                             effective_intervals, interval_purge_seconds,
-                             embargo_seconds, embargo_source and embargo_column
+                             interval is its own book segment per group; so is
+                             every validation and test interval in the validation
+                             and test books. run.json split records split_id,
+                             split_table_sha256, intervals, effective_intervals,
+                             interval_purge_seconds, embargo_seconds,
+                             embargo_source, embargo_column and book_segments
   --split-id <id>            the split of --split-table to use
   --embargo <seconds|auto>   embargo after every test interval of --split-table
                              (default auto: the larger of the label purge and the
@@ -11308,7 +11310,9 @@ OPTIONS:
                              (default 0: use all training rows)
   --pool-reset-flat          reset every group to flat at a window seam (the
                              historical pooled P&L); default carries the boundary
-                             position, so total variation includes |p_end-q_start|
+                             position, so total variation includes |p_end-q_start|.
+                             Windows from a --windows splits table always reset
+                             at a gap between test intervals
   --periods-per-year <f>     annualisation override. Default: 31536000 / S, S the
                              label horizon, or the label stride when the
                              spec has a wider stride_seconds (target spec, else
@@ -12278,7 +12282,7 @@ fn run_walkforward(args: &[String]) -> ! {
             }
         }
     }
-    if split_windows && false {
+    if split_windows {
         // #1189: test intervals of a split are separate books; adjacent ones keep the carry.
         let touching = windows.windows(2).any(|p| p[0].test_end == p[1].test_start);
         if !touching {

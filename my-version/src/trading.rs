@@ -763,8 +763,7 @@ struct Book {
 
 /// Index of the book segment that holds stamp `t`.
 fn segment_of(starts: &[f64], t: f64) -> usize {
-    let _ = (starts, t);
-    0
+    starts.partition_point(|s| *s <= t)
 }
 
 fn run_book(ctx: &Ctx, positions: &[f64], cost_side: f64) -> Book {
