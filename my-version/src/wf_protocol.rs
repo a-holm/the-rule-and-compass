@@ -290,6 +290,7 @@ pub fn infer(i: &InferenceInput) -> Result<Inference, String> {
             1.0
         };
         let trials = i.trials.max(k).max(1);
+        let trials_source = if i.trials_source == "flag" && i.trials < trials { "candidate_count" } else { i.trials_source };
         let n_eff = if k >= 2 { trials as f64 * pr / k as f64 } else { trials as f64 };
         let (pbo, pbo_error) = match inference::pbo_cscv(i.candidates, i.pbo_blocks) {
             Ok(p) => (Some(p), None),
@@ -310,7 +311,7 @@ pub fn infer(i: &InferenceInput) -> Result<Inference, String> {
         out.bootstrap = Some(summary.clone());
         out.multiple = Some(Multiple {
             trials,
-            trials_source: i.trials_source,
+            trials_source,
             candidates: k.max(1),
             participation_ratio: pr,
             n_eff,

@@ -380,3 +380,93 @@ fn break_even_positive_unchanged() {
     assert_eq!(break_even_status(&[0.019], &[0.02]), "defined");
     assert_eq!(break_even_status(&[0.02], &[0.02]), "no_cost");
 }
+
+/// The unfloored closed form, written out independently of the library.
+fn closed_form_emax(n: f64, v: f64) -> f64 {
+    if !(n > 1.0) || !(v >= 0.0) {
+        return 0.0;
+    }
+    use rcsr::noise::normal_quantile as z;
+    v.sqrt() * ((1.0 - EULER_GAMMA) * z(1.0 - 1.0 / n) + EULER_GAMMA * z(1.0 - 1.0 / (n * std::f64::consts::E)))
+}
+
+fn n_grid() -> Vec<f64> {
+    let mut g: Vec<f64> = vec![1.0, 1.0001, 1.001, 1.01, 1.1, 1.2, 1.25, 1.2835, 1.2836, 1.2837, 1.3, 1.5, 2.0, 3.0, 5.0, 10.0, 1e3, 1e6];
+    let mut n = 1.0;
+    while n <= 3.0 {
+        g.push(n);
+        n += 0.0005;
+    }
+    for i in 0..=20 {
+        g.push(3.0 * (1e6f64 / 3.0).powf(i as f64 / 20.0));
+    }
+    g
+}
+
+#[test]
+fn expected_max_sharpe_nonnegative_for_n_ge_1() {
+    for n in n_grid() {
+        for v in [0.0, 1e-6, 1.0, 4.0] {
+            let e = expected_max_sharpe(n, v);
+            assert!(e >= 0.0, "n={n} v={v} e={e}");
+        }
+    }
+}
+
+#[test]
+fn expected_max_sharpe_monotone() {
+    let mut g = n_grid();
+    g.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut prev = expected_max_sharpe(g[0], 1.0);
+    for &n in &g[1..] {
+        let e = expected_max_sharpe(n, 1.0);
+        assert!(e >= prev, "n={n} e={e} prev={prev}");
+        prev = e;
+    }
+}
+
+#[test]
+fn expected_max_sharpe_unchanged_above_root() {
+    let mut n_values = vec![1.2836 + 1e-9, 3.0, 10.0, 1000.0];
+    for i in 0..200 {
+        n_values.push(1.3 * (1e6f64 / 1.3).powf(i as f64 / 199.0));
+    }
+    for n in n_values {
+        for v in [1e-6, 1.0, 4.0] {
+            assert_eq!(expected_max_sharpe(n, v).to_bits(), closed_form_emax(n, v).to_bits(), "n={n} v={v}");
+        }
+    }
+    for n in [-3.0, 0.0, 0.5, 1.0, f64::NAN] {
+        assert_eq!(expected_max_sharpe(n, 1.0).to_bits(), closed_form_emax(n, 1.0).to_bits(), "n={n}");
+    }
+    assert_eq!(expected_max_sharpe(5.0, f64::NAN), 0.0);
+    assert_eq!(expected_max_sharpe(5.0, -1.0), 0.0);
+}
+
+#[test]
+fn dsr_not_above_psr_for_any_n_eff() {
+    for sharpe in [-0.02, 0.01, 0.05] {
+        let psr = deflated_sharpe(sharpe, 500.0, -0.1, 4.0, 1.0, 1e-4);
+        for n in n_grid() {
+            let d = deflated_sharpe(sharpe, 500.0, -0.1, 4.0, n, 1e-4);
+            assert!(d.sr0 >= 0.0, "n={n}");
+            assert!(d.dsr <= psr.dsr, "sharpe={sharpe} n={n} dsr={} psr={}", d.dsr, psr.dsr);
+        }
+    }
+}
+
+#[test]
+fn min_btl_monotone_and_bounded() {
+    assert_eq!(min_btl_years(1.0, 1.0001), 0.0);
+    let mut g = n_grid();
+    g.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut prev = min_btl_years(1.0, g[0]);
+    for &n in &g[1..] {
+        let y = min_btl_years(1.0, n);
+        assert!(y >= prev, "n={n} y={y} prev={prev}");
+        prev = y;
+        if n >= 1.0767 {
+            assert!(expected_max_sharpe(n, 1.0).powi(2) <= 2.0 * n.ln(), "n={n}");
+        }
+    }
+}
