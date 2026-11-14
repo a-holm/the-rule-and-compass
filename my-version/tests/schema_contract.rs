@@ -144,9 +144,15 @@ fn schema_lists_search_and_process_backend() {
 
 #[test]
 fn trials_default_names_every_mode() {
-    let (_, _, default, description) = schema::options().iter().find(|o| o.0 == "--trials").copied().expect("--trials");
-    assert_ne!(default, "candidate count");
-    for part in ["candidates_evaluated", "front size", "--from-run", "--expr", "n_trials_source"] {
-        assert!(description.contains(part), "--trials description misses {part}: {description}");
+    let doc = schema::json();
+    let walk = &doc[doc.find("\"walkforward\"").expect("walkforward block")..];
+    let entry = walk.split("\"name\":\"--trials\"").nth(1).expect("--trials entry").split("\"name\":\"--").next().unwrap();
+    assert!(!entry.contains("\"default\":\"candidate count\""), "{entry}");
+    let help = String::from_utf8_lossy(&rcsr(&["walkforward", "--help"]).stdout).to_string();
+    let help_trials = help.split("--trials <N>").nth(1).expect("--trials help").split("--protocol-seed").next().unwrap();
+    for (label, text) in [("schema", entry), ("help", help_trials)] {
+        for part in ["candidates_evaluated", "front size", "--from-run", "--expr", "n_trials_source"] {
+            assert!(text.contains(part), "{label} --trials text misses {part}: {text}");
+        }
     }
 }
