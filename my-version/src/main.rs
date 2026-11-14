@@ -7302,6 +7302,8 @@ fn main() {
         None
     };
     let train_slice = prepared.trading.as_ref().and_then(|t| t.train.as_ref());
+    let validation_segments = interval_split.as_ref().map_or_else(Vec::new, |s| s.validation_segment_starts());
+    let test_segments = interval_split.as_ref().map_or_else(Vec::new, |s| s.test_segment_starts());
     let mut rows: Vec<Row> = sorted
         .iter()
         .enumerate()
@@ -7340,7 +7342,7 @@ fn main() {
             let (objective_value, validation_book_json) = match (&trading_spec, book_validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
                 (Some(tspec), Some(v), Some(slice)) => {
                     let ctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
-                    let mspec = member_spec(tspec, &book_pred, train_slice);
+                    let mspec = rcsr::trading::TradingSpec { segment_starts: validation_segments.clone(), ..member_spec(tspec, &book_pred, train_slice) };
                     match trading_book(&s.tree, &v.x, slice, ctx, &mspec) {
                         Ok(stats) => {
                             // #849: a fixed-position member is unusable as a finalist with the flag.
@@ -7544,7 +7546,7 @@ fn main() {
             let mut spec_of = |i: usize| {
                 let tree = &sorted[rows[i].archive_rank - 1].tree;
                 let train_pred: Vec<f64> = book_train.x.iter().map(|row| expr::eval(tree, row)).collect();
-                member_spec(tspec, &train_pred, train_slice)
+                rcsr::trading::TradingSpec { segment_starts: validation_segments.clone(), ..member_spec(tspec, &train_pred, train_slice) }
             };
             let picked = rcsr::selection::select_robust_specs_cuts(&metas, robust_params, interval_cuts.as_deref(), &mut spec_of, &ret, &book_rows, &mut |i| {
                 trading_pred(&sorted[rows[i].archive_rank - 1].tree, &v.x, ctx)
@@ -7582,8 +7584,8 @@ fn main() {
             // #925: the validation and test books take the band resolved on the training rows.
             let train_pred: Vec<f64> = book_train.x.iter().map(|row| expr::eval(tree, row)).collect();
             let fspec = member_spec(tspec, &train_pred, train_slice);
-            let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>, ctx: Option<&data::TradingContext>| match slice {
-                Some(slice) => trading_book(tree, &sample.x, slice, ctx, &fspec),
+            let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>, ctx: Option<&data::TradingContext>, segments: &[f64]| match slice {
+                Some(slice) => trading_book(tree, &sample.x, slice, ctx, &rcsr::trading::TradingSpec { segment_starts: segments.to_vec(), ..fspec.clone() }),
                 None => Err("no trading rows".to_string()),
             };
             let split = prepared.trading.as_ref();
@@ -7592,7 +7594,7 @@ fn main() {
                 eprintln!("# warning: no candidate has a usable P&L book on the validation slice");
             }
             let validation_book = match book_validation {
-                Some(v) => book(v, split.and_then(|t| t.validation.as_ref()), split.and_then(|t| t.validation_context.as_ref())),
+                Some(v) => book(v, split.and_then(|t| t.validation.as_ref()), split.and_then(|t| t.validation_context.as_ref()), &validation_segments),
                 None => Err("no validation slice".to_string()),
             };
             let realised = validation_book.as_ref().ok().and_then(|s| rcsr::trading::realised_position(s.exposure, tspec));
@@ -7622,7 +7624,7 @@ fn main() {
                 selection_rule: selection_rule_fields.clone(),
                 reselected_from: reselected_from.clone(),
                 validation: validation_book,
-                test: book(book_test, split.map(|t| &t.test), split.and_then(|t| t.test_context.as_ref())),
+                test: book(book_test, split.map(|t| &t.test), split.and_then(|t| t.test_context.as_ref()), &test_segments),
             })
         }
         _ => None,
@@ -12274,6 +12276,18 @@ fn run_walkforward(args: &[String]) -> ! {
                 eprintln!("error: {}: {}", file, e);
                 std::process::exit(EXIT_INPUT);
             }
+        }
+    }
+    if split_windows && false {
+        // #1189: test intervals of a split are separate books; adjacent ones keep the carry.
+        let touching = windows.windows(2).any(|p| p[0].test_end == p[1].test_start);
+        if !touching {
+            pool_reset_flat = true;
+        } else if popts.batch_pnl {
+            eprintln!("error: --batch-pnl needs windows that do not touch, or none that do: a splits table with adjacent test intervals mixes carried and flat seams\n\n{}", walkforward_usage());
+            std::process::exit(EXIT_USAGE);
+        } else {
+            popts.flat_gaps = true;
         }
     }
     if windows_split_id.is_some() && !split_windows {
