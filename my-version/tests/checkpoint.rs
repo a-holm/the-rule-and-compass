@@ -2314,6 +2314,33 @@ fn a_killed_chunk_does_not_poison_the_search_backend() {
     assert_eq!(cumulative.get("backend").and_then(|v| v.as_str()), Some("cpu"));
 }
 
+/// #1127: rewrite the saved checkpoint with the identity a fit-only device run writes (the device
+/// defers the fit, the host scores): the one value both snapshot sites take.
+fn stamp_fit_only_device_identity(dir: &std::path::Path) {
+    let path = dir.join("ck.rcsr");
+    let mut cp = Checkpoint::load(path.to_str().expect("utf-8")).expect("checkpoint");
+    cp.backend = search::checkpoint_backend(true, true, false);
+    cp.error_kind = rcsr::checkpoint::ErrorKind::for_backend(cp.backend);
+    cp.save(&path).expect("save checkpoint");
+}
+
+/// #1127: a fit-only device run scores on the host, and a resume computes the backend it will use
+/// from the configuration alone (`cpu` for a metric the device does not score natively). Both
+/// stopping points of the previous chunk, a periodic save (killed chunk) and the exit save, leave a
+/// checkpoint that resumes without `--allow-backend-change`.
+#[test]
+fn a_fit_only_device_run_resumes_from_its_periodic_and_its_exit_checkpoint() {
+    let (_scratch, dir, csv) = cost_scratch("fit-only-identity-periodic");
+    crashed_chunk(&dir, &csv);
+    stamp_fit_only_device_identity(&dir);
+    cost_chunk(&dir, &csv, 1, true);
+
+    let (_scratch, dir, csv) = cost_scratch("fit-only-identity-exit");
+    cost_chunk(&dir, &csv, 0, false);
+    stamp_fit_only_device_identity(&dir);
+    cost_chunk(&dir, &csv, 1, true);
+}
+
 /// #1060: a sidecar already poisoned by an older binary (real example from
 /// campaign #268, generation rewritten to the checkpoint's) is not repaired:
 /// nothing in it says which chunks ran on which backend, so the total stays

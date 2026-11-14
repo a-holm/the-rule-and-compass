@@ -7251,6 +7251,17 @@ fn scoring_kind(gpu_used: bool) -> crate::backend::Kind {
     }
 }
 
+/// The `backend` identity field of a checkpoint, the one value every snapshot of a
+/// process writes (#1127). WIP.
+pub fn checkpoint_backend(defer_gpu: bool, fit_only_device: bool, gpu_used: bool) -> Backend {
+    let _ = fit_only_device;
+    if defer_gpu || gpu_used {
+        Backend::Gpu
+    } else {
+        Backend::Cpu
+    }
+}
+
 fn emit(on_checkpoint: &mut Option<CheckpointFn<'_>>, cp: &Checkpoint) {
     if let Some(cb) = on_checkpoint.as_deref_mut() {
         cb(cp);
@@ -9757,11 +9768,7 @@ fn run_search_scoped(
             if checkpoint_due(save_every, gens_done, last_save.elapsed().as_secs_f64(), save_interval_s) {
                 last_save = std::time::Instant::now();
                 let io_mark = std::time::Instant::now();
-                let backend = if defer_gpu || gpu_used {
-                    Backend::Gpu
-                } else {
-                    Backend::Cpu
-                };
+                let backend = checkpoint_backend(defer_gpu, fit_only_device, gpu_used);
                 let cp = snapshot(
                     cfg,
                     backend,
@@ -9834,11 +9841,7 @@ fn run_search_scoped(
     let mut io_final_s = 0.0f64;
     let io_mark = std::time::Instant::now();
     let pending_cp: Option<Checkpoint> = if on_checkpoint.is_some() {
-        let backend = if (defer_gpu && !fit_only_device) || gpu_used {
-            Backend::Gpu
-        } else {
-            Backend::Cpu
-        };
+        let backend = checkpoint_backend(defer_gpu, fit_only_device, gpu_used);
         let cp = snapshot(
             cfg,
             backend,
@@ -10085,16 +10088,32 @@ mod gpu_dead_start_tests;
 mod tests {
     use super::*;
 
-    /// #1060: a fit-only device run defers the fit to the device (the periodic
-    /// checkpoint identity says `gpu`) but scores every candidate on the host
-    /// (`gpu_used` stays false), so the cost sidecar must say `cpu`, as the exit
-    /// write does.
+    /// #1127: the exit rule of the checkpoint identity, a fit-only device run
+    /// scores on the host, so both snapshot sites of its process say `cpu`.
+    #[test]
+    fn checkpoint_backend_of_a_fit_only_device_run_is_cpu() {
+        let (defer_gpu, fit_only_device, gpu_used) = (true, true, false);
+        assert_eq!(checkpoint_backend(defer_gpu, fit_only_device, gpu_used), Backend::Cpu);
+        assert_eq!(checkpoint_backend(true, true, true), Backend::Gpu);
+    }
+
+    /// #1127: no run that is not fit-only changes a checkpoint byte, for every
+    /// state either site can see.
+    #[test]
+    fn checkpoint_backend_is_unchanged_for_runs_that_are_not_fit_only() {
+        for defer_gpu in [false, true] {
+            for gpu_used in [false, true] {
+                let old = if defer_gpu || gpu_used { Backend::Gpu } else { Backend::Cpu };
+                assert_eq!(checkpoint_backend(defer_gpu, false, gpu_used), old);
+            }
+        }
+    }
+
+    /// #1060: a fit-only device run defers the fit to the device but scores every
+    /// candidate on the host (`gpu_used` stays false), so the cost sidecar says `cpu`.
     #[test]
     fn the_sidecar_backend_of_a_fit_only_device_run_is_cpu() {
-        let (defer_gpu, fit_only_device, gpu_used) = (true, true, false);
-        let periodic_identity = if defer_gpu || gpu_used { Backend::Gpu } else { Backend::Cpu };
-        assert_eq!(periodic_identity, Backend::Gpu);
-        assert!(fit_only_device);
+        let gpu_used = false;
         assert_eq!(scoring_kind(gpu_used), crate::backend::Kind::Cpu);
         assert_eq!(scoring_kind(true), crate::backend::Kind::Gpu);
     }
