@@ -964,6 +964,19 @@ On the 16.1M-row cell the CPU arm went from 1408.5 s to 900.7 s (23:30 -> 15:01)
 with the **same output SHA-256** (`a4c99c95...`): the 27.26 GB second read
 disappeared and the bytes did not change.
 
+### Append memory budget (#1158)
+
+The append pass stages several groups of every temp column per read. One batch holds `groups x temp columns x group rows x 8` bytes.
+
+| variable | default | rule |
+|---|---|---|
+| `RCSR_APPEND_BUDGET_MIB` | 1024 | memory the staged batch may use; clamped to `64..=65536`; unparsable values fall back to 1024 |
+| `RCSR_APPEND_BATCH_GROUPS` | as many groups as fit the budget | groups per read; clamped to `1..=groups`, to 16 and to the budget; unparsable values fall back to the default |
+
+When the clamp lowers the override, `rcsr enrich` prints one line, for example `RCSR_APPEND_BATCH_GROUPS=16 clamped to 4 by the 1024 MiB append budget`. Batch 1 is the floor: when one group alone exceeds the budget, the pass stages 1 group and prints `one group (N MiB) exceeds the append budget (M MiB); staging 1 group`. The output bytes are identical for any batch size and budget. Both variables are listed under `enrich` in `rcsr schema`.
+
+A failed append (read error, write error, hash thread panic) returns the error, joins the hash thread, and leaves neither the output file nor its `.tmp-<pid>` file (`store::tests::append_mid_stream_*_leaves_no_output`, `append_hash_thread_panic_leaves_no_output`).
+
 ### Batched output arc and pinned chunked D2H (#300)
 
 The GPU output path no longer allocates one host `Vec` and issues one download
