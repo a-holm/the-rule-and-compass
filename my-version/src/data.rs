@@ -4972,7 +4972,7 @@ fn build_trading(
                 let g: Vec<u64> = idx
                     .iter()
                     .map(|&i| {
-                        let seg = if false && segmented && starts.len() > 1 { starts.partition_point(|s| *s <= time[i]) } else { 0 };
+                        let seg = if segmented && starts.len() > 1 { starts.partition_point(|s| *s <= time[i]) } else { 0 };
                         let next = ids.len() as u64;
                         *ids.entry((group[i], seg)).or_insert(next)
                     })
