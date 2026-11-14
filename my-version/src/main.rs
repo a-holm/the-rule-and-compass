@@ -214,6 +214,8 @@ fn usage() -> String {
     let help_filter = settings::help(Group::Filter);
     let help_fit = settings::help(Group::Fit);
     let help_engine = settings::help(Group::Engine);
+    let help_dedup = settings::help(Group::Dedup);
+    let help_front_parents = settings::help(Group::FrontParents);
     format!(
         "rcsr {VERSION} — symbolic regression (rule-and-compass)
 
@@ -899,12 +901,11 @@ SEARCH:
                              still unrefit. inf (default) refits every
                              unique tree
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
-  --no-dedup                 disable structural de-duplication
+{help_dedup}
 {help_schedule}
 {help_island}
 {help_variation}
-  --no-front-parents         draw every parent from the island tournament;
-                             turns off the 15% Pareto-front feedback (#76)
+{help_front_parents}
 {help_filter}
   --prune                    remove neutral code from the final front (off by
                              default): replace subtrees with a child or a
@@ -2884,7 +2885,6 @@ fn main() {
     // #116: remember an explicit --fit-strategy so a resume can refuse a
     // contradiction with the saved configuration.
     let mut fit_strategy_set = false;
-    let mut dedup_set = false;
     let mut time_budget_set = false;
     let mut predictor_samples_set = false;
     // #85: remember an explicit --fit-samples so a resume can refuse a
@@ -2898,9 +2898,6 @@ fn main() {
     let mut refit_band_set = false;
     let mut fit_polish_set = false;
     let mut fit_irls_set = false;
-    // #76: remember an explicit --no-front-parents so a resume can refuse a
-    // contradiction with the saved configuration.
-    let mut front_parents_set = false;
     // #1083: the table rows named on the command line.
     let mut explicit = settings::Explicit::default();
     // #25: `--units` is resolved against the prepared input list later; the
@@ -3392,10 +3389,6 @@ fn main() {
                     }
                 }
             }
-            "--no-dedup" => {
-                cfg.dedup = false;
-                dedup_set = true;
-            }
             // #120: opt-in quality-diversity coverage archive.
             "--qd" | "--qd-cells" | "--qd-cell-cap" | "--qd-cvt" | "--qd-policy" | "--qd-uniform" | "--qd-random" => {
                 let flag = args[i].clone();
@@ -3427,11 +3420,6 @@ fn main() {
                     "error: --tree-arity was removed (#471): its only non-default value, balanced, lowered oracle_recovered in the default-decision A/B"
                 );
                 std::process::exit(EXIT_USAGE);
-            }
-            // #76: exactness escape hatch; the default is on.
-            "--no-front-parents" => {
-                cfg.front_parents = false;
-                front_parents_set = true;
             }
             // #27: evaluator path only; deliberately not a saved search
             // setting, because both paths produce identical errors.
@@ -4032,9 +4020,7 @@ fn main() {
                 saved.fit_strategy.name()
             ));
         }
-        if dedup_set && cfg.dedup != saved.dedup {
-            conflicts.push(format!("--no-dedup (saved dedup is {})", saved.dedup));
-        }
+        settings::conflicts(Group::Dedup, &cfg, &saved, &explicit, &mut conflicts);
         settings::conflicts(Group::Stop, &cfg, &saved, &explicit, &mut conflicts); // #1083
         if predictor_samples_set && cfg.predictor_samples != saved.predictor_samples {
             conflicts.push(format!(
@@ -4090,13 +4076,7 @@ fn main() {
             ));
         }
         settings::conflicts(Group::Variation, &cfg, &saved, &explicit, &mut conflicts); // #1083
-        // #76: front feedback is saved search state.
-        if front_parents_set && cfg.front_parents != saved.front_parents {
-            conflicts.push(format!(
-                "--no-front-parents (saved front_parents is {})",
-                saved.front_parents
-            ));
-        }
+        settings::conflicts(Group::FrontParents, &cfg, &saved, &explicit, &mut conflicts);
         settings::conflicts(Group::Filter, &cfg, &saved, &explicit, &mut conflicts); // #1083
         settings::conflicts(Group::Fit, &cfg, &saved, &explicit, &mut conflicts);
         settings::conflicts(Group::Engine, &cfg, &saved, &explicit, &mut conflicts); // #1087

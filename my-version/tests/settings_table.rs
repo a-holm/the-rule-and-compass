@@ -163,7 +163,7 @@ fn help() -> String {
 fn help_blocks_of_migrated_settings_are_pinned() {
     let help = help();
     let pinned = blocks(include_str!("fixtures/settings/help_blocks.txt"));
-    assert_eq!(pinned.len(), 5, "help fixture blocks");
+    assert_eq!(pinned.len(), 7, "help fixture blocks");
     for (prev, next, block) in &pinned {
         assert_block(&help, prev, next, block, |flag| format!("  {flag}"));
     }
@@ -175,7 +175,7 @@ fn schema_rows_of_migrated_settings_are_pinned() {
     assert!(out.status.success());
     let schema = String::from_utf8(out.stdout).expect("utf-8 schema");
     let pinned = blocks(include_str!("fixtures/settings/schema_rows.txt"));
-    assert_eq!(pinned.len(), 6, "schema fixture blocks");
+    assert_eq!(pinned.len(), 8, "schema fixture blocks");
     for (prev, next, block) in &pinned {
         assert_block(&schema, prev, next, block, |flag| format!("    {{\"name\":\"{flag}"));
     }
@@ -213,6 +213,7 @@ fn resume_conflict_lines_are_pinned() {
         .args(["--restart-isolation", "7", "--mutation-mix", "extended", "--crossover-internal", "0.25"])
         .args(["--adaptive-mix", "--reject-constant-offspring", "--reject-fixed-position", "--fit-thresholds"])
         .args(["--variation", "node"])
+        .args(["--no-dedup", "--no-front-parents"])
         .args(["--fit-accept", "fitness"])
         .output()
         .expect("run the resume");
@@ -222,6 +223,7 @@ fn resume_conflict_lines_are_pinned() {
     assert_eq!(
         lines,
         [
+            "--no-dedup (saved dedup is true)",
             "--patience 7 (saved 40)",
             "--restart-interval 7 (saved restart_interval is 60)",
             "--selection afp (saved lexicographic)",
@@ -230,6 +232,7 @@ fn resume_conflict_lines_are_pinned() {
             "--mutation-mix extended (saved classic)",
             "--crossover-internal 0.25 (saved 0)",
             "--adaptive-mix (saved adaptive_mix is false)",
+            "--no-front-parents (saved front_parents is true)",
             "--reject-constant-offspring (saved reject_constant_offspring is false)",
             "--reject-fixed-position (saved reject_fixed_position is false)",
             "--fit-thresholds (saved fit_thresholds is false)",
@@ -251,7 +254,8 @@ fn every_row_has_one_schema_entry_with_its_texts_and_default() {
     for row in settings::rows() {
         let entries: Vec<_> = options.iter().filter(|o| o.0 == row.flag()).collect();
         assert_eq!(entries, [&row.schema_row()], "{}", row.flag());
-        assert_eq!(row.schema_row().2, row.show(&Config::default()), "schema default of {}", row.flag());
+        let default = if row.negative() { "false".to_string() } else { row.show(&Config::default()) };
+        assert_eq!(row.schema_row().2, default, "schema default of {}", row.flag());
         assert!(schema::has_option(row.flag()));
         assert_eq!(settings::find_key(row.key()).map(|r| r.flag()), Some(row.flag()));
     }

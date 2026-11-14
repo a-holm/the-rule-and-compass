@@ -937,7 +937,7 @@ impl Config {
         compare!(fit_admission, "fit_admission");
         settings::differences(Group::Engine, self, other, &mut diff);
         settings::differences(Group::Variation, self, other, &mut diff);
-        compare!(dedup, "dedup");
+        settings::differences(Group::Dedup, self, other, &mut diff);
         // #256: `time_budget` is a per-process limit, not search state; a resumed
         // run may set a new one.
         settings::differences(Group::Stop, self, other, &mut diff);
@@ -946,7 +946,7 @@ impl Config {
         compare!(fit_rows, "fit_rows"); // #116
         compare!(fit_fallback_max, "fit_fallback_max"); // #255
         compare!(refit_band, "refit_band"); // #495
-        compare!(front_parents, "front_parents"); // #76
+        settings::differences(Group::FrontParents, self, other, &mut diff);
         settings::differences(Group::Island, self, other, &mut diff);
         compare!(qd_bins, "qd_bins"); // #120
         compare!(qd_cell_cap, "qd_cell_cap"); // #120

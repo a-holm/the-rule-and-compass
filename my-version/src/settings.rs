@@ -38,10 +38,14 @@ pub enum Group {
     Fit,
     /// The variation engine selection, after the checkpoint options.
     Engine,
+    /// Structural de-duplication.
+    Dedup,
+    /// Pareto-front parent feedback.
+    FrontParents,
 }
 
 impl Group {
-    pub const ALL: [Group; 7] = [
+    pub const ALL: [Group; 9] = [
         Group::Stop,
         Group::Schedule,
         Group::Island,
@@ -49,6 +53,8 @@ impl Group {
         Group::Filter,
         Group::Fit,
         Group::Engine,
+        Group::Dedup,
+        Group::FrontParents,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -60,6 +66,8 @@ impl Group {
             Group::Filter => "filter",
             Group::Fit => "fit",
             Group::Engine => "engine",
+            Group::Dedup => "dedup",
+            Group::FrontParents => "front_parents",
         }
     }
 }
@@ -241,6 +249,8 @@ pub trait Setting: Sync {
     /// The checkpoint writer emits the key even at the default.
     fn always(&self) -> bool;
     fn takes_value(&self) -> bool;
+    /// The flag sets the value to `false`: a `--no-<name>` flag, whose schema default is `false`.
+    fn negative(&self) -> bool;
     /// Set the row from the command line; `value` is `None` for a flag.
     fn apply_cli(&self, cfg: &mut Config, value: Option<&str>) -> Result<(), String>;
     /// Copy the row's value from `from` into `to`.
@@ -286,6 +296,9 @@ impl<T: Value> Setting for Row<T> {
     }
     fn takes_value(&self) -> bool {
         matches!(self.cli, Cli::Value(_))
+    }
+    fn negative(&self) -> bool {
+        matches!(&self.cli, Cli::Flag(v) if v.show() == "false")
     }
     fn apply_cli(&self, cfg: &mut Config, value: Option<&str>) -> Result<(), String> {
         let v = match (&self.cli, value) {
@@ -940,5 +953,40 @@ pub static TABLE: &[&dyn Setting] = &[
         write: Write::UnlessDefault,
         active: None,
         conflict: Conflict::SavedKey,
+    },
+    &Row::<bool> {
+        flag: "--no-dedup",
+        key: "dedup",
+        group: Group::Dedup,
+        schema_type: "flag",
+        schema_default: "false",
+        schema: "disable structural de-duplication",
+        help: "  --no-dedup                 disable structural de-duplication",
+        bench: None,
+        gui: true,
+        get: |c| &c.dedup,
+        set: |c| &mut c.dedup,
+        cli: Cli::Flag(false),
+        write: Write::Required,
+        active: None,
+        conflict: Conflict::Saved,
+    },
+    &Row::<bool> {
+        flag: "--no-front-parents",
+        key: "front_parents",
+        group: Group::FrontParents,
+        schema_type: "flag",
+        schema_default: "false",
+        schema: "draw every parent from the island tournament; disables the 15% Pareto-front feedback and restores the pre-#76 trajectory exactly",
+        help: "  --no-front-parents         draw every parent from the island tournament;
+                             turns off the 15% Pareto-front feedback (#76)",
+        bench: None,
+        gui: true,
+        get: |c| &c.front_parents,
+        set: |c| &mut c.front_parents,
+        cli: Cli::Flag(false),
+        write: Write::UnlessDefault,
+        active: None,
+        conflict: Conflict::Saved,
     },
 ];

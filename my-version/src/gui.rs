@@ -950,8 +950,6 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
                     .ok_or_else(|| format!("unknown --fit-strategy '{}'", v))?;
             }
             "--no-fit" => cfg.fit_iters = 0,
-            "--no-dedup" => cfg.dedup = false,
-            "--no-front-parents" => cfg.front_parents = false,
             // #1083: settings from the search setting table that the browser implements.
             flag if crate::settings::find(flag).is_some_and(|r| r.gui()) => {
                 let row = crate::settings::find(flag).expect("matched by the guard");
