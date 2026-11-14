@@ -6233,7 +6233,7 @@ mod tests {
         assert!(slice.check_finite_returns(&[1.0, f64::NAN, f64::NAN, 1.0]).is_ok());
     }
 
-    fn filter_over(t: &Table, src: &str, names: &[String]) -> Filter {
+    fn filter_over(src: &str, names: &[String]) -> Filter {
         Filter {
             tree: expr::parse(src, names).unwrap(),
             vars: names.to_vec(),
@@ -6266,9 +6266,9 @@ mod tests {
         let kept = (0..1000).filter(|&r| t.value(r, 3) <= 0.0).count();
         assert!(kept > 0 && kept < 1000);
         let spec = SplitSpec {
-            exclude: Some(filter_over(&t, "c3 > 0", &names)),
-            train_select: Some(filter_over(&t, "c0 < 5 and c7 > 1", &names)),
-            test_select: Some(filter_over(&t, "c0 >= 5", &names)),
+            exclude: Some(filter_over("c3 > 0", &names)),
+            train_select: Some(filter_over("c0 < 5 and c7 > 1", &names)),
+            test_select: Some(filter_over("c0 >= 5", &names)),
             ..Default::default()
         };
         FILTER_CELL_READS.with(|n| n.set(0));
@@ -6292,18 +6292,18 @@ mod tests {
         let t = table("a,b\n1,2\n3,4\n5,6\n");
         let names = vec!["a".to_string(), "b".to_string()];
         FILTER_CELL_READS.with(|n| n.set(0));
-        let f = filter_over(&t, "1", &names);
+        let f = filter_over("1", &names);
         let mut rf = RowFilter::new(&f, &t).unwrap();
         assert!((0..3).all(|r| rf.holds(r)));
         assert_eq!(FILTER_CELL_READS.with(|n| n.get()), 0);
-        let f = filter_over(&t, "a + a > 2 and a < 5", &names);
+        let f = filter_over("a + a > 2 and a < 5", &names);
         let mut rf = RowFilter::new(&f, &t).unwrap();
         let got: Vec<bool> = (0..3).map(|r| rf.holds(r)).collect();
         assert_eq!(got, vec![false, true, false]);
         assert_eq!(FILTER_CELL_READS.with(|n| n.get()), 3);
         let missing = Filter {
             vars: vec!["a".to_string(), "nope".to_string()],
-            ..filter_over(&t, "a > 0", &names)
+            ..filter_over("a > 0", &names)
         };
         assert!(RowFilter::new(&missing, &t).is_err());
     }
@@ -6382,7 +6382,7 @@ mod tests {
         assert!(rf_reads > 0);
         // Zero-column, one-column and many-column expressions are all present.
         for src in ["1 > 0", "garbage > 0", "a < b and sin > abs or c > 0"] {
-            let f = filter_over(&t, src, &names);
+            let f = filter_over(src, &names);
             let mut rf = RowFilter::new(&f, &t).unwrap();
             for r in 0..t.len() {
                 assert_eq!(rf.holds(r), full_row_holds(&f, &t, r), "{src} row {r}");
