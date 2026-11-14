@@ -125,6 +125,76 @@ pub struct ProtocolOptions {
     /// `stride_seconds` of the target spec: the period width is the larger of the
     /// horizon and this.
     pub stride_seconds: Option<f64>,
+    /// #1094: `--threshold-fit fitness`. Each window's cut is fitted on its
+    /// validation slice (training rows without one); `threshold_fixed` is the
+    /// reference cut and the fallback.
+    pub threshold_fit: Option<CutFit>,
+}
+
+/// #1094: the rule of `--threshold-fit fitness`: the cut with the lowest block
+/// fitness among the cuts with at least `min_entry_times` distinct entry
+/// timestamps on the source rows of a window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CutFit {
+    /// `--cut-min-entries`.
+    pub min_entry_times: u32,
+    /// `--cut-blocks`: time blocks of the fitness.
+    pub blocks: usize,
+    /// `--cut-lambda`: weight of the block regret sd.
+    pub lambda: f64,
+}
+
+impl Default for CutFit {
+    fn default() -> Self {
+        CutFit { min_entry_times: 30, blocks: 4, lambda: 1.0 }
+    }
+}
+
+/// #1094: one cut of a window's sweep, priced on the source rows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CutPoint {
+    /// Source rows at or below the cut.
+    pub index: usize,
+    pub value: f64,
+    pub fitness: f64,
+    pub net: f64,
+    pub flips: u32,
+    pub exits: u32,
+    pub entry_times: u32,
+    /// Long rows over source rows.
+    pub exposure: f64,
+}
+
+/// #1094: the widest run of valid cuts around the fitted one whose fitness
+/// stays within `0.1 * (1 - best)` of the best.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CutPlateau {
+    pub lo: f64,
+    pub hi: f64,
+    pub rows_lo: usize,
+    pub rows_hi: usize,
+}
+
+/// #1094: the cut of one window under `--threshold-fit fitness`.
+#[derive(Clone, Debug)]
+pub struct CutReport {
+    /// `ValidationFitness` or `TrainFitness`; `Fixed` when the window fell back.
+    pub source: ThresholdSource,
+    /// The threshold of the window.
+    pub value: f64,
+    /// Source rows with a finite score and target.
+    pub rows: usize,
+    /// The cut the window uses, when a sweep ran.
+    pub cut: Option<CutPoint>,
+    pub reference_value: f64,
+    pub reference: Option<CutPoint>,
+    pub plateau: Option<CutPlateau>,
+    pub fit: CutFit,
+    /// `no_rows`, `book_error`, `no_valid_cut` or `floor`.
+    pub fallback: Option<&'static str>,
+    pub fallback_detail: Option<String>,
+    /// `(long-row share asked for, the cut)`, 32 rows.
+    pub profile: Vec<(f64, CutPoint)>,
 }
 
 /// #482: where a candidate list came from: a run's Pareto front.
@@ -165,6 +235,7 @@ impl Default for ProtocolOptions {
             fit_label: None,
             horizon_from_spec: false,
             stride_seconds: None,
+            threshold_fit: None,
         }
     }
 }
@@ -471,6 +542,8 @@ pub struct WindowResult {
     /// Latest stamp of any row used for training or validation. Its label ends
     /// at most `required_purge_seconds` later, which stays below `test_start`.
     pub train_last_time: Option<f64>,
+    /// #1094: the fitted cut under `--threshold-fit fitness`.
+    pub cut: Option<CutReport>,
 }
 
 /// #306: the band/cooldown book and its associative carry.
@@ -597,6 +670,8 @@ pub struct Report {
     pub threshold_quantile: f64,
     /// The pre-registered fixed threshold, when one was supplied.
     pub threshold_fixed: Option<f64>,
+    /// #1094: `--threshold-fit fitness` and its rule.
+    pub threshold_fit: Option<CutFit>,
     /// #306: position policy and its band parameters.
     pub policy: Policy,
     /// #930: quorum and votes needed of the members (`candidates`) under `--policy vote`.
@@ -1093,6 +1168,47 @@ pub fn top_tercile_refusal(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<St
     })
 }
 
+/// #1094: the refusal message when `--threshold-fit fitness` meets a policy or
+/// flag whose book is not the plain CPU threshold book. The CLI reports it as a
+/// usage error.
+pub fn threshold_fit_conflict(policy: Policy, band_select: bool, device_pnl: bool, batch_pnl: bool) -> Option<String> {
+    if policy != Policy::Threshold {
+        return Some(format!(
+            "--threshold-fit fitness prices the plain threshold book; --policy {} is refused",
+            policy.as_str()
+        ));
+    }
+    let refused = [(band_select, "--select-band"), (device_pnl, "--device-pnl"), (batch_pnl, "--batch-pnl")];
+    refused.iter().find(|(set, _)| *set).map(|(_, flag)| {
+        format!("--threshold-fit fitness is not supported with {}: the fitted cut prices the CPU threshold book only", flag)
+    })
+}
+
+/// #1094: why `--threshold-fit fitness` cannot run with this spec, or `None`.
+pub fn threshold_fit_refusal(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<String> {
+    let fit = opts.threshold_fit.as_ref()?;
+    if fit.min_entry_times == 0 {
+        return Some("--threshold-fit fitness: --cut-min-entries must be at least 1".to_string());
+    }
+    if fit.blocks == 0 || fit.blocks > crate::trading::FITNESS_MAX_BLOCKS {
+        return Some(format!(
+            "--threshold-fit fitness: --cut-blocks must be 1 to {}, got {}",
+            crate::trading::FITNESS_MAX_BLOCKS,
+            fit.blocks
+        ));
+    }
+    if !fit.lambda.is_finite() || fit.lambda < 0.0 {
+        return Some(format!("--threshold-fit fitness: --cut-lambda must be finite and >= 0, got {}", fit.lambda));
+    }
+    if let Some(msg) = threshold_fit_conflict(spec.policy, spec.band_select, spec.device_pnl, opts.batch_pnl) {
+        return Some(msg);
+    }
+    if spec.threshold_fixed.is_none() {
+        return Some("--threshold-fit fitness needs a reference cut: pass --threshold-fixed or --from-run".to_string());
+    }
+    None
+}
+
 /// Votes needed for a long row: `ceil(quorum x K)`, at least 1.
 pub fn votes_required(quorum: f64, members: usize) -> usize {
     ((quorum * members as f64 - 1e-9).ceil().max(1.0) as usize).min(members.max(1))
@@ -1188,6 +1304,9 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
         if let Some(msg) = vote_refusal(spec, opts) {
             return Err(msg);
         }
+    }
+    if let Some(msg) = threshold_fit_refusal(spec, opts) {
+        return Err(msg);
     }
     let table_validation = !opts.validation_starts.is_empty()
         && spec.windows.iter().all(|w| opts.validation_starts.iter().any(|(l, _)| *l == w.label));
@@ -1359,6 +1478,11 @@ struct WindowData {
     /// Latest stamp of any row that entered training or validation.
     train_max_time: f64,
     dropped: usize,
+    /// #1094: the training rows and every candidate's score on them (NaN kept),
+    /// the source of a fitted cut in a window without a validation slice.
+    keep_train_rows: bool,
+    train_rows: Vec<RowBase>,
+    train_row_scores: Vec<Vec<f64>>,
 }
 
 /// Which rows an [`Accum`] scores. A final read scores in two passes: the
@@ -1388,6 +1512,7 @@ struct Accum {
     test_candidates: Vec<usize>,
     /// `--policy vote`: the final read scores every member on the test rows.
     vote: bool,
+    threshold_fit: Option<CutFit>,
 }
 
 impl Accum {
@@ -1438,6 +1563,9 @@ impl Accum {
                 train_target_n: 0,
                 train_max_time: f64::NEG_INFINITY,
                 dropped: 0,
+                keep_train_rows: opts.threshold_fit.is_some() && validation_start.is_none(),
+                train_rows: Vec::new(),
+                train_row_scores: vec![Vec::new(); candidates],
             });
         }
         Ok(Accum {
@@ -1451,6 +1579,7 @@ impl Accum {
             forced: None,
             test_candidates: Vec::new(),
             vote: spec.policy == Policy::Vote,
+            threshold_fit: opts.threshold_fit,
         })
     }
 
@@ -1513,7 +1642,7 @@ impl Accum {
                     d.window.label
                 ));
             }
-            chosen.push(select_candidate(d, spec, trees, has_validation)?.candidate);
+            chosen.push(select_candidate(d, spec, trees, has_validation, self.threshold_fit.as_ref())?.candidate);
         }
         if self.vote {
             self.test_candidates = (0..trees.len()).collect();
@@ -1607,8 +1736,9 @@ impl Accum {
                     d.window.label, d.window.test_start, d.window.test_end
                 ));
             }
-            let Selected { mut candidate, mut validation_error, mut threshold, band_selection, mut thresholds } =
-                select_candidate(&d, spec, trees, has_validation)?;
+            let Selected { mut candidate, mut validation_error, mut threshold, band_selection, mut thresholds, mut cuts } =
+                select_candidate(&d, spec, trees, has_validation, opts.threshold_fit.as_ref())?;
+            let cut = if vote { None } else { cuts[candidate].take() };
             let member_thresholds = if vote { thresholds.clone() } else { Vec::new() };
             if vote {
                 threshold = apply_vote(&mut d, &thresholds, need, spec.band_width);
@@ -1633,6 +1763,8 @@ impl Accum {
             }
             let source_name = if spec.policy == Policy::TopTercile {
                 ThresholdSource::None
+            } else if let Some(c) = &cut {
+                c.source
             } else if spec.threshold_fixed.is_some() {
                 ThresholdSource::Fixed
             } else if has_validation {
@@ -1817,6 +1949,7 @@ impl Accum {
                 band: ev.band.map(|b| BandCheck { spec: Some(bands[candidate].clone()), ..b }),
                 hindsight_bound: ev.hindsight_bound,
                 band_selection,
+                cut,
             });
         }
 
@@ -2015,6 +2148,7 @@ impl Accum {
             cost_bps: spec.cost_bps,
             threshold_quantile: spec.threshold_quantile,
             threshold_fixed: spec.threshold_fixed,
+            threshold_fit: opts.threshold_fit,
             policy: spec.policy,
             quorum: if vote { opts.quorum } else { None },
             votes_required: need,
@@ -2103,6 +2237,12 @@ fn push_scores(
                     dst.push(if score.is_finite() { score } else { f64::NAN });
                 }
             } else {
+                if d.keep_train_rows {
+                    d.train_rows.push(RowBase { time: t, group, target });
+                    for (dst, &score) in d.train_row_scores.iter_mut().zip(scores) {
+                        dst.push(score);
+                    }
+                }
                 for (c, (dst, &score)) in d.train_scores.iter_mut().zip(scores).enumerate() {
                     if score.is_finite() {
                         dst.push(score);
@@ -3442,6 +3582,64 @@ impl Metrics {
     }
 }
 
+/// #1094: the `cut` object of a window.
+fn cut_json(c: &CutReport) -> String {
+    let num = |v: Option<f64>| v.map_or("null".to_string(), jnum);
+    let int = |v: Option<u64>| v.map_or("null".to_string(), |x| x.to_string());
+    let (p, r) = (c.cut.as_ref(), c.reference.as_ref());
+    let profile: Vec<String> = c
+        .profile
+        .iter()
+        .map(|(share, q)| {
+            format!(
+                "{{\"long_share\":{},\"index\":{},\"value\":{},\"fitness\":{},\"net\":{},\"entry_times\":{}}}",
+                jnum(*share),
+                q.index,
+                jnum(q.value),
+                jnum(q.fitness),
+                jnum(q.net),
+                q.entry_times
+            )
+        })
+        .collect();
+    format!(
+        "{{\"source\":{},\"value\":{},\"index\":{},\"rows\":{},\"fitness\":{},\"net\":{},\"flips\":{},\
+         \"exits\":{},\"entry_times\":{},\"exposure\":{},\"reference\":{{\"value\":{},\"index\":{},\
+         \"fitness\":{},\"net\":{},\"entry_times\":{},\"exposure\":{}}},\"plateau\":{},\
+         \"floor\":{{\"min_entry_times\":{}}},\"blocks\":{},\"lambda\":{},\"fallback\":{},\
+         \"fallback_detail\":{},\"profile\":[{}]}}",
+        jstr(c.source.as_str()),
+        jnum(c.value),
+        int(p.map(|q| q.index as u64)),
+        c.rows,
+        num(p.map(|q| q.fitness)),
+        num(p.map(|q| q.net)),
+        int(p.map(|q| q.flips as u64)),
+        int(p.map(|q| q.exits as u64)),
+        int(p.map(|q| q.entry_times as u64)),
+        num(p.map(|q| q.exposure)),
+        jnum(c.reference_value),
+        int(r.map(|q| q.index as u64)),
+        num(r.map(|q| q.fitness)),
+        num(r.map(|q| q.net)),
+        int(r.map(|q| q.entry_times as u64)),
+        num(r.map(|q| q.exposure)),
+        c.plateau.as_ref().map_or("null".to_string(), |q| format!(
+            "{{\"lo\":{},\"hi\":{},\"rows_lo\":{},\"rows_hi\":{}}}",
+            jnum(q.lo),
+            jnum(q.hi),
+            q.rows_lo,
+            q.rows_hi
+        )),
+        c.fit.min_entry_times,
+        c.fit.blocks,
+        jnum(c.fit.lambda),
+        c.fallback.map_or("null".to_string(), jstr),
+        c.fallback_detail.as_deref().map_or("null".to_string(), jstr),
+        profile.join(",")
+    )
+}
+
 impl WindowResult {
     fn json(&self) -> String {
         let mut s = format!(
@@ -3489,6 +3687,10 @@ impl WindowResult {
         if !self.member_thresholds.is_empty() {
             s.pop();
             s.push_str(&format!(",\"member_thresholds\":[{}]}}", self.member_thresholds.iter().map(|t| jnum(*t)).collect::<Vec<_>>().join(",")));
+        }
+        if let Some(c) = &self.cut {
+            s.pop();
+            s.push_str(&format!(",\"cut\":{}}}", cut_json(c)));
         }
         if self.in_sample {
             s.pop();
@@ -3641,7 +3843,7 @@ impl Report {
              \"threshold\":{{\"quantile\":{},\"fixed\":{},\
              \"method\":\"exact order-preserving radix select + linear interpolation (numpy type 7) in f64\",\
              \"sources\":[\"train_type7\",\"validation_type7\",\"fixed\"],\
-             \"screening_only\":false,\"source\":{}}},\
+             \"screening_only\":false,\"source\":{}{}}},\
              \"annualization\":{{\"periods_per_year\":{},\"method\":{},\"source\":{},\"period_seconds\":{}}},\
              \"risk_model\":{{\"mode\":\"per-period\",\"periods_per_year\":{},\
              \"sharpe\":{{\"scale\":\"sqrt(periods_per_year)\",\"ddof\":1,\
@@ -3696,6 +3898,7 @@ impl Report {
                 .first()
                 .map(|w| w.threshold_source.as_str())
                 .unwrap_or("none")),
+            self.threshold_fit_json(),
             jnum(self.periods_per_year),
             jstr(&self.annualization),
             jstr(self.annualization_source),
@@ -3751,6 +3954,24 @@ impl Report {
             windows.join(","),
             self.pooled_json()
         )
+    }
+
+    /// #1094: the fields `--threshold-fit` adds to the `threshold` object, with
+    /// a leading comma; empty without the flag.
+    fn threshold_fit_json(&self) -> String {
+        match &self.threshold_fit {
+            Some(f) => format!(
+                ",\"fit\":\"fitness\",\"fit_method\":\"per window, the cut of lowest block fitness on the validation rows \
+                 (training rows without a validation slice) among cuts with at least cut_min_entries distinct entry \
+                 timestamps, one sort and one sweep in f64; the fixed threshold when no cut passes\",\
+                 \"fit_sources\":[\"train_fitness\",\"validation_fitness\",\"fixed\"],\
+                 \"cut_min_entries\":{},\"cut_blocks\":{},\"cut_lambda\":{}",
+                f.min_entry_times,
+                f.blocks,
+                jnum(f.lambda)
+            ),
+            None => String::new(),
+        }
     }
 
     fn vote_json(&self) -> String {
@@ -3835,6 +4056,17 @@ impl Report {
         };
         let threshold_rule = if self.policy == Policy::TopTercile {
             "none: the policy ranks the scores of each timestamp (source `none`)".to_string()
+        } else if let (Some(f), Some(theta)) = (self.threshold_fit, self.threshold_fixed) {
+            format!(
+                "fitted per window on its validation rows (training rows without a validation slice): the cut of \
+                 lowest block fitness ({} blocks, lambda {}) among cuts with at least {} distinct entry timestamps, \
+                 frozen on the test block; the reference theta = {} where no cut passes (sources `train_fitness`, \
+                 `validation_fitness`, `fixed`)",
+                f.blocks,
+                f.lambda,
+                f.min_entry_times,
+                theta
+            )
         } else if let Some(theta) = self.threshold_fixed {
             format!(
                 "pre-registered fixed theta = {} (no data fitting; source `fixed`)",
@@ -3920,6 +4152,39 @@ impl Report {
                 md_num(w.metrics.break_even_hit_rate),
                 w.metrics.trades
             ));
+        }
+        if self.threshold_fit.is_some() {
+            s.push_str(
+                "\n## Fitted cut (source rows)\n\n\
+                 Fitness, net, entry timestamps and exposure are measured on the source rows, where the cut was chosen; \
+                 they are not out-of-sample results.\n\n\
+                 | window | source | cut | reference | rows | fitness | net | entry times | exposure | plateau | fallback |\n\
+                 |---|---|---:|---:|---:|---:|---:|---:|---:|---|---|\n",
+            );
+            for w in &self.windows {
+                if let Some(c) = &w.cut {
+                    let p = c.cut.as_ref();
+                    s.push_str(&format!(
+                        "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                        w.window.label,
+                        c.source.as_str(),
+                        md_num(c.value),
+                        md_num(c.reference_value),
+                        c.rows,
+                        md_num(p.map_or(f64::NAN, |q| q.fitness)),
+                        md_num(p.map_or(f64::NAN, |q| q.net)),
+                        p.map_or("n/a".to_string(), |q| q.entry_times.to_string()),
+                        md_num(p.map_or(f64::NAN, |q| q.exposure)),
+                        c.plateau.as_ref().map_or("n/a".to_string(), |q| format!(
+                            "{} to {} ({} rows)",
+                            md_num(q.lo),
+                            md_num(q.hi),
+                            q.rows_hi - q.rows_lo
+                        )),
+                        c.fallback.unwrap_or("none")
+                    ));
+                }
+            }
         }
         s.push_str("\n## Controls (long-only, per window)\n\n");
         s.push_str(
@@ -4113,6 +4378,104 @@ struct Selected {
     threshold: f64,
     band_selection: Option<crate::selection::BandSelection>,
     thresholds: Vec<f64>,
+    /// #1094: the fitted cut of every candidate under `--threshold-fit`.
+    cuts: Vec<Option<CutReport>>,
+}
+
+/// #1094: long-row shares of the cut profile, ascending: `0.5 * 0.7^j` and
+/// `1 - 0.5 * 0.7^j` for `j = 0..15`.
+fn profile_shares() -> Vec<f64> {
+    let mut tail = Vec::with_capacity(16);
+    let mut p = 0.5f64;
+    for _ in 0..16 {
+        tail.push(p);
+        p *= 0.7;
+    }
+    let mut shares: Vec<f64> = tail.iter().rev().copied().collect();
+    shares.extend(tail.iter().map(|p| 1.0 - p));
+    shares
+}
+
+/// #1094: the cut of one candidate in one window from its source rows (the
+/// validation slice, else the training rows), with `reference` as the
+/// fallback. The test rows are not an input.
+fn fit_cut(rows: &[RowBase], scores: &[f64], reference: f64, fit: &CutFit, cost_bps: f64, source: ThresholdSource) -> CutReport {
+    let mut idx: Vec<usize> = (0..rows.len()).filter(|&i| scores[i].is_finite() && rows[i].target.is_finite()).collect();
+    idx.sort_by(|&a, &b| {
+        rows[a].group.cmp(&rows[b].group).then_with(|| rows[a].time.total_cmp(&rows[b].time)).then_with(|| a.cmp(&b))
+    });
+    let mut report = CutReport {
+        source: ThresholdSource::Fixed,
+        value: reference,
+        rows: idx.len(),
+        cut: None,
+        reference_value: reference,
+        reference: None,
+        plateau: None,
+        fit: *fit,
+        fallback: None,
+        fallback_detail: None,
+        profile: Vec::new(),
+    };
+    if idx.len() < 2 {
+        report.fallback = Some("no_rows");
+        return report;
+    }
+    let pred: Vec<f64> = idx.iter().map(|&i| scores[i]).collect();
+    let time: Vec<f64> = idx.iter().map(|&i| rows[i].time).collect();
+    let slice = data::TradingSlice {
+        rows: crate::trading::TradingRows {
+            time: time.clone(),
+            group: idx.iter().map(|&i| rows[i].group).collect(),
+            funding: Vec::new(),
+        },
+        ret: idx.iter().map(|&i| rows[i].target).collect(),
+    };
+    let book_spec = crate::trading::TradingSpec { cost_bps, min_trades: 1, threshold: reference, ..crate::trading::TradingSpec::default() };
+    let sweep = match crate::trading::FitnessBook::with_blocks(&slice, &book_spec, 0.0, fit.blocks, fit.lambda)
+        .and_then(|book| book.cut_sweep(&pred, &time))
+    {
+        Ok(s) => s,
+        Err(e) => {
+            report.fallback = Some("book_error");
+            report.fallback_detail = Some(e);
+            return report;
+        }
+    };
+    let n = sweep.rows();
+    let point = |t: usize| CutPoint {
+        index: t,
+        value: sweep.value(&pred, t),
+        fitness: sweep.fitness(t),
+        net: sweep.net(t),
+        flips: sweep.flips(t),
+        exits: sweep.exits(t),
+        entry_times: sweep.entry_times(t),
+        exposure: (n - t) as f64 / n as f64,
+    };
+    let reference_index = sweep.index_of(&pred, reference);
+    let reference_point = CutPoint { value: reference, ..point(reference_index) };
+    report.profile = profile_shares()
+        .into_iter()
+        .map(|p| (p, point(sweep.snap(n - (p * n as f64).round() as usize))))
+        .collect();
+    match sweep.best(&crate::trading::CutFloor { min_entry_times: fit.min_entry_times }, reference_index) {
+        Some(t) => {
+            let chosen = point(t);
+            let (lo, hi) = sweep.plateau(t);
+            report.plateau = Some(CutPlateau { lo: sweep.value(&pred, lo), hi: sweep.value(&pred, hi), rows_lo: lo, rows_hi: hi });
+            report.source = source;
+            report.value = chosen.value;
+            report.cut = Some(chosen);
+        }
+        None => {
+            let inner = (1..n).any(|t| sweep.is_valid(t) && sweep.fitness(t).is_finite());
+            report.fallback = Some(if inner { "floor" } else { "no_valid_cut" });
+            report.cut = Some(reference_point.clone());
+        }
+    }
+    report.reference = Some(reference_point);
+    report
 }
 
 /// The candidate of one window. Reads the training and validation rows only,
@@ -4123,9 +4486,11 @@ fn select_candidate(
     spec: &EvalSpec,
     trees: &[Node],
     has_validation: bool,
+    fit: Option<&CutFit>,
 ) -> Result<Selected, String> {
             let mut best: Option<(usize, f64, f64)> = None;
             let mut thresholds = vec![f64::NAN; d.train_scores.len()];
+            let mut cuts: Vec<Option<CutReport>> = vec![None; d.train_scores.len()];
             for (c, scores) in d.train_scores.iter().enumerate() {
                 let source_scores = if has_validation {
                     &d.validation_scores[c]
@@ -4147,6 +4512,15 @@ fn select_candidate(
                 };
                 let threshold = if spec.policy == Policy::TopTercile {
                     f64::NAN
+                } else if let (Some(fit), Some(theta)) = (fit, spec.threshold_fixed) {
+                    let report = if has_validation {
+                        fit_cut(&d.validation_rows, &d.validation_scores[c], theta, fit, spec.cost_bps, ThresholdSource::ValidationFitness)
+                    } else {
+                        fit_cut(&d.train_rows, &d.train_row_scores[c], theta, fit, spec.cost_bps, ThresholdSource::TrainFitness)
+                    };
+                    let value = report.value;
+                    cuts[c] = Some(report);
+                    value
                 } else if let Some(theta) = spec.threshold_fixed {
                     Threshold::fixed(theta)?.value()
                 } else if has_validation {
@@ -4209,7 +4583,7 @@ fn select_candidate(
                 let err = if has_validation { Some(err) } else { None };
                 (c, err, theta)
             };
-    Ok(Selected { candidate, validation_error, threshold, band_selection, thresholds })
+    Ok(Selected { candidate, validation_error, threshold, band_selection, thresholds, cuts })
 }
 
 #[cfg(test)]
