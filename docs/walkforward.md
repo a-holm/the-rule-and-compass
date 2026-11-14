@@ -707,6 +707,16 @@ per training row per window. A CSV path is read as a resident `data::Table` and
 accumulated with the same rule. The JSON `memory_bound` field states the bound
 for the run.
 
+The scan reads only the columns the run uses: the variables that a candidate
+expression names, the target, an `f64` time column and a numeric group column. The exact `i64` time and the
+dictionary codes of a text time or group column are read separately. A group in which no row of the current
+pass is wanted is skipped before its value read when its time is an exact `i64` or a dictionary column; an `f64`
+time column is part of the value read, so such a group is always read. A `--locked-test` final read runs the
+group loop twice, training rows first and test rows second. The printed JSON carries a `scan` object next to
+`ledger`: `store_columns`, `named_variables`, `projected_columns`, `groups_read`, `groups_skipped` (both summed
+over the passes of a final read) and `value_bytes`. The table path has no `scan` object. `scan` is outside
+the reproduction hash, like `ledger`.
+
 ## Performance
 
 Measured with the release binary on an Intel i7-3770K (8 threads), 31 GiB,
