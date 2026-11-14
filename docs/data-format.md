@@ -537,6 +537,8 @@ explicit, in which case the numeric column keeps its schema position and its
 stale dictionary (if any) is dropped. The output is written to a temporary file
 next to `--out` and renamed into place.
 
+The append pass reads the temp columns in batches: it stages up to 16 groups of every temp column per read (as many as fit a 1 GiB budget; `RCSR_APPEND_BATCH_GROUPS=<n>` overrides, clamped to `1..=groups`, 1 reads one group at a time), then writes the groups in the usual group-major order from the staged blocks. The writes go through a 4 MiB buffer. The SHA-256 of the output runs on its own thread, fed through a bounded queue of recycled blocks, so the writer never waits for the digest unless the queue is full. The bytes, their order, the header and the digest do not depend on the batch size (`store::tests::append_batched_reads_are_byte_identical`). `rcsr enrich` reports the pass as `timing.write_s` partitioned into `write_read_s`, `write_write_s` and `write_hash_wait_s`.
+
 The raw OHLCV/flow fields (`open high low close volume quote_volume trades
 taker_buy_base taker_buy_quote vwap`) are copied byte for byte with their
 original units; `--features flow` appends the nine derived flow columns
