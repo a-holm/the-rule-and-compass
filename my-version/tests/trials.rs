@@ -67,11 +67,25 @@ struct Spec {
     window: &'static str,
     time: Vec<f64>,
     net_text: Option<String>,
+    quantile: Option<f64>,
+    fixed: Option<f64>,
+    policy: &'static str,
+    fit: Option<(u32, u32, f64)>,
 }
 
 impl Spec {
     fn new(n: usize) -> Spec {
-        Spec { cost_bps: 10.0, ppy: PPY, window: "w1", time: grid(n), net_text: None }
+        Spec {
+            cost_bps: 10.0,
+            ppy: PPY,
+            window: "w1",
+            time: grid(n),
+            net_text: None,
+            quantile: Some(0.5),
+            fixed: None,
+            policy: "threshold",
+            fit: None,
+        }
     }
 }
 
@@ -86,11 +100,17 @@ fn write_report(dir: &Path, name: &str, net: &[f64], s: &Spec) -> String {
 \"purge\":{{\"horizon_seconds\":3600,\"embargo_seconds\":3600}},\
 \"cost_model\":{{\"per_side_bps\":{c},\"round_trip_bps\":{rt}}},\
 \"cost\":{{\"per_side_bps\":{c},\"source\":\"flag\",\"return_units\":\"log\"}},\
-\"policy\":{{\"name\":\"threshold\",\"band_width\":0,\"min_hold\":1}},\
-\"threshold\":{{\"quantile\":0.5,\"fixed\":null}},\
+\"policy\":{{\"name\":\"{policy}\",\"band_width\":0,\"min_hold\":1}},\
+\"threshold\":{{\"quantile\":{quantile},\"fixed\":{fixed}{fit}}},\
 \"annualization\":{{\"periods_per_year\":{ppy},\"method\":\"explicit\"}},\
 \"pooled\":{{\"periods\":{n},\"entries\":10,\"active_rows\":100,\"period_net\":[{net_text}],\"period_time\":[{time}]}}}}",
         w = s.window,
+        policy = s.policy,
+        quantile = s.quantile.map_or("null".to_string(), |q| q.to_string()),
+        fixed = s.fixed.map_or("null".to_string(), |q| q.to_string()),
+        fit = s.fit.map_or(String::new(), |(e, b, l)| format!(
+            ",\"fit\":\"fitness\",\"fit_method\":\"text\",\"fit_sources\":[\"fixed\"],\"cut_min_entries\":{e},\"cut_blocks\":{b},\"cut_lambda\":{l}"
+        )),
         c = s.cost_bps,
         rt = s.cost_bps * 2.0,
         ppy = s.ppy,
@@ -552,4 +572,117 @@ fn big_compare(dir: &Path) -> (Json, f64) {
     let o = compare(dir, &ar, &br, &["--block-len", "21", "--draws", "10000", "--seed", "7"]);
     let secs = t.elapsed().as_secs_f64();
     (stdout_json(&o), secs)
+}
+
+// ---------------------------------------------------------------------------
+// #1163: the fitted-cut rule is part of the threshold rule
+// ---------------------------------------------------------------------------
+
+fn strs(j: &Json) -> Vec<&str> {
+    match j {
+        Json::Arr(v) => v.iter().map(|x| x.as_str().unwrap()).collect(),
+        other => panic!("not an array: {other:?}"),
+    }
+}
+
+fn strs_of<'a>(j: &'a Json, key: &str) -> Vec<&'a str> {
+    match j {
+        Json::Arr(v) => v.iter().map(|x| at(x, &[key]).as_str().unwrap()).collect(),
+        other => panic!("not an array: {other:?}"),
+    }
+}
+
+fn fixed_cut(n: usize) -> Spec {
+    Spec { quantile: None, fixed: Some(0.5), ..Spec::new(n) }
+}
+
+fn fitted_cut(n: usize, e: u32, b: u32, l: f64) -> Spec {
+    Spec { fit: Some((e, b, l)), ..fixed_cut(n) }
+}
+
+fn arm_pair(dir: &Path) -> (String, String) {
+    let fitted = write_report(dir, "fitted", &noise(N, 1, 0.01), &fitted_cut(N, 30, 4, 1.0));
+    let fixed = write_report(dir, "fixed", &noise(N, 2, 0.01), &fixed_cut(N));
+    (fitted, fixed)
+}
+
+fn assert_refused(o: &Output, field: &str, hint: bool) {
+    assert_eq!(code(o), 2, "{}", stderr(o));
+    let e = stderr(o);
+    assert!(e.contains(&format!("'{field}'")), "{e}");
+    assert_eq!(e.contains("--threshold-arms"), hint, "{e}");
+}
+
+#[test]
+fn trials_refuse_a_fitted_cut_mixed_with_a_fixed_cut() {
+    let (_s, dir) = trials_dir();
+    let (fitted, fixed) = arm_pair(&dir);
+    let o = run(&["trials", "--wf", &fitted, &fixed, "--draws", "50"]);
+    assert_refused(&o, "threshold.fit", true);
+    let o = run(&["trials", "--wf", &fixed, &fitted, "--draws", "50"]);
+    assert_refused(&o, "threshold.fit", true);
+}
+
+#[test]
+fn compare_refuses_a_fitted_cut_mixed_with_a_fixed_cut() {
+    let (_s, dir) = trials_dir();
+    let (fitted, fixed) = arm_pair(&dir);
+    let o = run(&["trials", "--compare", &fitted, &fixed, "--draws", "50"]);
+    assert_refused(&o, "threshold.fit", true);
+}
+
+#[test]
+fn trials_refuse_fitted_cuts_with_other_values() {
+    let (_s, dir) = trials_dir();
+    let base = write_report(&dir, "base", &noise(N, 1, 0.01), &fitted_cut(N, 30, 4, 1.0));
+    let cases = [
+        ("entries", fitted_cut(N, 5, 4, 1.0), "threshold.cut_min_entries"),
+        ("blocks", fitted_cut(N, 30, 1, 1.0), "threshold.cut_blocks"),
+        ("lambda", fitted_cut(N, 30, 4, 2.0), "threshold.cut_lambda"),
+    ];
+    for (name, spec, field) in cases {
+        let other = write_report(&dir, name, &noise(N, 2, 0.01), &spec);
+        assert_refused(&run(&["trials", "--wf", &base, &other, "--draws", "50"]), field, true);
+        assert_refused(&run(&["trials", "--compare", &base, &other, "--draws", "50"]), field, true);
+    }
+    let same = write_report(&dir, "same", &noise(N, 3, 0.01), &fitted_cut(N, 30, 4, 1.0));
+    let j = stdout_json(&run(&["trials", "--wf", &base, &same, "--draws", "50", "--block-len", "8"]));
+    assert!(j.get("threshold_arms").is_none());
+}
+
+#[test]
+fn trials_threshold_arms_accepts_the_fit_fields_only() {
+    let (_s, dir) = trials_dir();
+    let (fitted, fixed) = arm_pair(&dir);
+    let j = stdout_json(&run(&["trials", "--wf", &fitted, &fixed, "--threshold-arms", "--draws", "50", "--block-len", "8"]));
+    assert!(matches!(at(&j, &["threshold_arms"]), Json::Bool(true)));
+    assert_eq!(at(&j, &["series"]).as_f64(), Some(2.0));
+    let rules = strs_of(at(&j, &["members"]), "threshold_rule");
+    assert_eq!(rules, ["fitness(min_entries=30,blocks=4,lambda=1)", "fixed"]);
+
+    let j = stdout_json(&run(&["trials", "--compare", &fitted, &fixed, "--threshold-arms", "--draws", "50", "--block-len", "8"]));
+    assert!(matches!(at(&j, &["threshold_arms"]), Json::Bool(true)));
+    assert_eq!(strs(at(&j, &["threshold_rule_a"])), ["fitness(min_entries=30,blocks=4,lambda=1)"]);
+    assert_eq!(strs(at(&j, &["threshold_rule_b"])), ["fixed"]);
+
+    let quantile = write_report(&dir, "quantile", &noise(N, 3, 0.01), &Spec::new(N));
+    let q = stdout_json(&run(&["trials", "--wf", &quantile, "--threshold-arms", "--draws", "50", "--block-len", "8"]));
+    assert_eq!(strs_of(at(&q, &["members"]), "threshold_rule"), ["quantile"]);
+
+    let other_cut = write_report(&dir, "cut", &noise(N, 4, 0.01), &Spec { fixed: Some(0.25), ..fixed_cut(N) });
+    let other_policy = write_report(&dir, "policy", &noise(N, 5, 0.01), &Spec { policy: "band", ..fixed_cut(N) });
+    for (other, field) in [(&other_cut, "threshold.fixed"), (&other_policy, "policy.name")] {
+        assert_refused(&run(&["trials", "--wf", &fitted, other, "--threshold-arms", "--draws", "50"]), field, false);
+        assert_refused(&run(&["trials", "--compare", &fixed, other, "--threshold-arms", "--draws", "50"]), field, false);
+    }
+}
+
+#[test]
+fn trials_without_the_flag_keep_the_old_reports_matching() {
+    let (_s, dir) = trials_dir();
+    let a = write_report(&dir, "old_a", &noise(N, 1, 0.01), &Spec::new(N));
+    let b = write_report(&dir, "old_b", &noise(N, 2, 0.01), &Spec::new(N));
+    let j = stdout_json(&run(&["trials", "--wf", &a, &b, "--draws", "50", "--block-len", "8"]));
+    assert!(j.get("threshold_arms").is_none());
+    assert!(!String::from_utf8_lossy(&run(&["trials", "--wf", &a, &b, "--draws", "50", "--block-len", "8"]).stdout).contains("threshold_rule"));
 }
