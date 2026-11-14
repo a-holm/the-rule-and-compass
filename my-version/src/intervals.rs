@@ -221,7 +221,7 @@ impl IntervalSplit {
         } else {
             return None;
         };
-        if d.test.iter().any(|&(s, e)| reaches(s, e, t, self.purge, self.embargo)) {
+        if d.test.iter().any(|&(s, e)| reaches(s, e, t, 0, 0) && t < s) {
             return None;
         }
         if role == Role::Train && d.validation.iter().any(|&(s, e)| reaches(s, e, t, self.purge, self.purge)) {
