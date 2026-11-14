@@ -8997,6 +8997,9 @@ fn enrich_inner(
         return Ok(report);
     }
 
+    if let Some(rec) = &opts.lock_record {
+        refuse_carried_labels(&opts.data, out, &long_outputs, rec)?;
+    }
     // Append pass: copy existing blocks and write the new columns. The writer
     // hashes the bytes as they stream out, so the report gets the output
     // checksum without a second multi-gigabyte read.
@@ -9076,6 +9079,32 @@ fn label_sidecar_entries(path: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Under a lock record a label sidecar entry this run does not recompute may only carry over when it was
+/// computed under the same record; any other entry holds range information, so the run is refused.
+fn refuse_carried_labels(data: &str, out: &str, outputs: &[LongLabelOutput], rec: &crate::lockrec::LockRecord) -> Result<(), String> {
+    if outputs.is_empty() {
+        return Ok(());
+    }
+    let Some(labels_path) = crate::target::label_sidecar_path(out) else { return Ok(()) };
+    let from = if Path::new(&labels_path).is_file() {
+        Some(labels_path)
+    } else {
+        crate::target::label_sidecar_path(data).filter(|p| Path::new(p).is_file())
+    };
+    let Some(from) = from else { return Ok(()) };
+    for line in label_sidecar_entries(&from) {
+        let recomputed = outputs.iter().any(|o| line.starts_with(&format!("{{\"target\":{},", jstr(&o.target))));
+        if !recomputed && !rec.computed_entry(&line) {
+            let target = crate::manifest::string_field(&line, "target").unwrap_or_default();
+            return Err(format!(
+                "{}: carries the label report of {} computed without this lock record; it would hold locked-range information. Rebuild that label with --lock-record or remove it from the sidecar",
+                from, target
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Write `<out>.labels.json` (the label reports) and add the `y` target specs
@@ -9333,6 +9362,12 @@ pub fn run(args: &[String]) -> ! {
             eprintln!("error: {}", e.message.replacen("--lockbox", "--locked-test", 2));
             std::process::exit(e.exit);
         }
+        if opts.lock_record.is_some() {
+            if let Err(e) = crate::lockbox::check_also_carriers(out, opts.locked_test.as_ref(), opts.locked_also.as_ref()) {
+                eprintln!("error: {}", e.message);
+                std::process::exit(e.exit);
+            }
+        }
     }
     let rates_device = if opts.gpu == GpuMode::Off { None } else { crate::backend::probe().device };
     if let Err(e) = resolve_rates(&opts.calibration, rates_device.as_deref()) {
@@ -9479,7 +9514,10 @@ INPUT / OUTPUT:
                           of every per-feature statistic, like --locked-test. A data
                           declaration that already uses the second slot with another range,
                           or a record that does not parse, exits 2. The output declares the
-                          range as locked_test_also. Check sidecars with `rcsr lock check`
+                          range as locked_test_also. A label sidecar entry that was not
+                          recomputed here and not computed under this record is refused
+                          (exit 3); so is an output whose other carriers lack the range.
+                          Check sidecars with `rcsr lock check`
   --gpu [auto|on|off]     auto (default) dispatches a registered exact kernel
                           only when the cost model estimates it faster; on
                           forces every registered kernel above the 1M-row floor;

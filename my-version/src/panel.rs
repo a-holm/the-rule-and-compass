@@ -140,6 +140,8 @@ pub struct Panel {
     pub gaps: usize,
     pub first_ts: i64,
     pub last_ts: i64,
+    /// Last actual bar of each symbol's whole series (empty when the panel was not built from series).
+    pub last_bar: BTreeMap<String, i64>,
 }
 
 impl Panel {
@@ -163,6 +165,16 @@ impl Panel {
         let mut p = self.clone();
         p.rows.retain(|r| !range.contains(r.bar.time));
         p.summarize();
+        // The series' last bar, clipped to the last development bar, so a bar inside the range never decides.
+        if !self.last_bar.is_empty() {
+            let end = p.last_ts;
+            p.delisted = p
+                .symbols
+                .iter()
+                .filter(|s| self.last_bar.get(*s).map(|t| (*t).min(end) < end - 30 * 86_400).unwrap_or(true))
+                .cloned()
+                .collect();
+        }
         p
     }
 
@@ -446,6 +458,7 @@ pub(crate) fn assemble_panel_with_last(
         gaps,
         first_ts,
         last_ts,
+        last_bar: last.clone(),
     })
 }
 

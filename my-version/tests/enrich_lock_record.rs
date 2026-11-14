@@ -188,15 +188,15 @@ fn a_chained_run_under_the_record_refuses_labels_carried_from_a_run_without_it()
     let (code, err) = enrich_label(&a, &b, "r4", &lh::src(2, ""), Some(&record));
     assert_ne!(code, 0, "{err}");
     assert!(err.contains("lbl_h1_y") && err.contains("without this lock record"), "{err}");
-    assert!(!Path::new(&b).exists() && !Path::new(&format!("{b}.labels.json")).exists());
+    assert!(!Path::new(&b).exists() && !Path::new(&labels_path(&b)).exists());
 
     let (a2, b2) = (s(&dir.join("a2.rcsb")), s(&dir.join("b2.rcsb")));
     assert_eq!(enrich_label(&src, &a2, "r1", &lh::src(1, ""), Some(&record)).0, 0);
     let (code, err) = enrich_label(&a2, &b2, "r4", &lh::src(2, ""), Some(&record));
     assert_eq!(code, 0, "{err}");
-    let text = std::fs::read_to_string(format!("{b2}.labels.json")).unwrap();
+    let text = std::fs::read_to_string(labels_path(&b2)).unwrap();
     assert!(text.contains("lbl_h1_y") && text.contains("lbl_h2_y"), "chained labels under the record are kept");
-    let (code, out, err) = run(&["lock", "check", "--record", &s(&record), &format!("{b2}.labels.json")]);
+    let (code, out, err) = run(&["lock", "check", "--record", &s(&record), &labels_path(&b2)]);
     assert_eq!(code, 0, "{out}{err}");
 }
 
@@ -211,7 +211,7 @@ fn an_in_place_rerun_under_the_record_refuses_labels_it_does_not_recompute() {
     let (code, err) = enrich_label(&src, &out, "r4", &lh::src(2, ""), Some(&record));
     assert_ne!(code, 0, "{err}");
     assert!(err.contains("lbl_h1_y"), "{err}");
-    let (code, out_text, err) = run(&["lock", "check", "--record", &s(&record), &format!("{out}.labels.json")]);
+    let (code, out_text, err) = run(&["lock", "check", "--record", &s(&record), &labels_path(&out)]);
     assert_eq!(code, 4, "the refused run leaves the earlier sidecar untouched: {out_text}{err}");
 }
 
@@ -274,4 +274,8 @@ fn a_stale_carrier_that_lacks_the_record_range_is_refused_before_the_output_is_w
     assert_ne!(code, 0, "{err}");
     assert!(err.contains("stale") && err.contains("manifest.json"), "{err}");
     assert!(!Path::new(&stale).exists() && !Path::new(&format!("{stale}.enrich.json")).exists());
+}
+
+fn labels_path(store: &str) -> String {
+    s(&Path::new(store).with_extension("labels.json"))
 }

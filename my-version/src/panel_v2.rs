@@ -1078,6 +1078,19 @@ fn load_symbol(
         let _ = write!(key, ";{}:{}:{}", p, h, n);
     }
     let key = manifest::sha256_hex(key.as_bytes());
+    let hashes: Vec<(String, String, u64)> = match &opts.lock_record {
+        Some(r) => {
+            let mut kept = Vec::new();
+            for ((s, bytes), h) in srcs.iter().zip(&blobs).zip(hashes) {
+                let d = decode_bytes_excluding(&s.path, &symbol, bytes.clone(), Some(r.range))?;
+                if !(d.rows.is_empty() && d.left_out > 0) {
+                    kept.push(h);
+                }
+            }
+            kept
+        }
+        None => hashes,
+    };
     if let Some(dir) = &opts.resume {
         let path = cache_path(dir, &symbol);
         if let Ok(bytes) = std::fs::read(&path) {
@@ -1291,7 +1304,14 @@ pub fn build_base(opts: &BaseOptions) -> Result<BaseSummary, String> {
     syms.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     inputs.sort();
     let times: Vec<i64> = syms.iter().flat_map(|s| s.rows.iter().map(|r| r.time)).collect();
-    let overlap = guard.check_times("panel base", &times)?;
+    let overlap = match &opts.lock_record {
+        Some(r) => {
+            guard.check_times("panel base", &times)?;
+            let dev: Vec<i64> = times.iter().copied().filter(|t| !r.range.contains(*t)).collect();
+            guard.check_times("panel base", &dev)?
+        }
+        None => guard.check_times("panel base", &times)?,
+    };
     let table = base_table(&syms);
     if table.len() == 0 {
         return Err("panel base: no complete hourly bucket was produced".to_string());
@@ -1396,17 +1416,7 @@ fn base_manifest(
     let rec = opts.lock_record.as_ref();
     let locked = rec.is_some();
     let keep = |t: i64| !rec.is_some_and(|r| r.range.contains(t));
-    let dev_symbols: Vec<&str> = syms.iter().filter(|s| s.rows.iter().any(|r| keep(r.time))).map(|s| s.symbol.as_str()).collect();
-    let inputs: Vec<&(String, String, u64)> = inputs
-        .iter()
-        .filter(|(p, _, _)| {
-            !rec.is_some_and(|r| {
-                let name = Path::new(p).file_name().and_then(|n| n.to_str()).unwrap_or("");
-                month_of_name(Path::new(p)).is_some_and(|(a, b)| a >= r.range.start && b <= r.range.end)
-                    || !dev_symbols.iter().any(|s| name.starts_with(&format!("{s}-")))
-            })
-        })
-        .collect();
+    let inputs: Vec<&(String, String, u64)> = inputs.iter().collect();
     let mut input_rows = 0usize;
     let mut unique_rows = 0usize;
     let mut partial_dropped = 0usize;

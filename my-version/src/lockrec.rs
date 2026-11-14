@@ -78,6 +78,15 @@ impl LockRecord {
         )
     }
 
+    /// Whether a label sidecar entry line (`{"target":..,"report":{..}}`) was computed under this record: its
+    /// report declares the same range as `locked_test_also`.
+    pub fn computed_entry(&self, line: &str) -> bool {
+        let Ok(doc) = parse_json(line) else { return false };
+        let Some(also) = doc.get("report").and_then(|r| r.get("locked_test_also")) else { return false };
+        also.get("start_date").and_then(Json::as_str) == Some(date(self.range.start).as_str())
+            && also.get("end_date").and_then(Json::as_str) == Some(date(self.range.end).as_str())
+    }
+
     /// Put `"lock_record"` first in a JSON object text.
     pub fn insert_declaration(&self, text: &str, rows_left_out: usize) -> String {
         let at = text.find('{').map_or(0, |i| i + 1);
@@ -243,9 +252,15 @@ pub fn refuse_snapshot(text: &str, rec: &LockRecord) -> Result<(), String> {
 /// Entries of a CSV text inside `range`, by header name.
 pub fn check_csv(text: &str, range: &Lockbox) -> BTreeMap<String, usize> {
     let mut out = BTreeMap::new();
-    let mut lines = text.lines();
-    let Some(head) = lines.next() else { return out };
-    let names: Vec<&str> = head.split(',').map(|n| n.trim().trim_matches('"')).collect();
+    let mut lines = text.lines().peekable();
+    let Some(head) = lines.peek().copied() else { return out };
+    let cells: Vec<&str> = head.split(',').map(|n| n.trim().trim_matches('"')).collect();
+    // A first line holding a number or a date is data: the file has no header and no cell is ever printed as a key.
+    let headerless = cells.iter().any(|c| c.parse::<f64>().is_ok() || iso_time(c).is_some());
+    let names: Vec<&str> = if headerless { Vec::new() } else { cells };
+    if !headerless {
+        lines.next();
+    }
     for line in lines {
         for (k, cell) in line.split(',').enumerate() {
             let cell = cell.trim().trim_matches('"');
@@ -338,7 +353,7 @@ data_bytes, output_bytes, input_bytes, size, mtime, utc and built_utc are not
 data times and are skipped.
 
 stdout: one `path:key.path:count` line per finding, never a value. Array indexes
-collapse to []. A CSV key is its header name.
+collapse to []. A CSV key is its header name, or column<k> when the first line holds a number or a date (no header).
 exit: 0 no entry inside the range, 4 at least one, 2 usage or a bad record
 (range.end_exclusive must be true, range.start_epoch < range.end_epoch), 3 an
 unreadable file or a *.json that does not parse.
