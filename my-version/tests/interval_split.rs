@@ -615,3 +615,135 @@ fn embargo_auto_covers_the_mask_columns() {
     assert_eq!(code(&out), 2, "{}", stderr(&out));
     assert!(stderr(&out).contains("below the automatic embargo 2419200"), "{}", stderr(&out));
 }
+
+fn split_of(validation: &[(i64, i64)], test: &[(i64, i64)]) -> IntervalSplit {
+    let d = Declared { split_id: "s".to_string(), train: vec![(hour(0), hour(100))], validation: validation.to_vec(), test: test.to_vec() };
+    IntervalSplit::new(d, 0, 0, EmbargoSource::Purge, None)
+}
+
+/// Long at the last row of the first interval and the first row of the second.
+fn straddling_pred(hours: &[i64], first_end: i64, second_start: i64, seed: u64) -> Vec<f64> {
+    (0..2u64)
+        .flat_map(|g| hours.iter().map(move |&h| if (h as u64 + seed + g) % 3 == 0 || h == first_end || h == second_start { 1.0 } else { -1.0 }))
+        .collect()
+}
+
+/// The two-interval book of `starts` against the two intervals priced alone, checked on every
+/// additive statistic.
+fn assert_separate_books(first: &[i64], second: &[i64], starts: Vec<f64>) {
+    let all: Vec<i64> = first.iter().chain(second).copied().collect();
+    let evaluate = |hours: &[i64], pred: &[f64], starts: Vec<f64>| {
+        let s = two_group_slice(hours);
+        rcsr::trading::evaluate(pred, &s.ret, &s.rows, &TradingSpec { segment_starts: starts, ..book_spec() }).unwrap()
+    };
+    for seed in 0..4u64 {
+        let (last, next) = (*first.last().unwrap(), second[0]);
+        let pred = straddling_pred(&all, last, next, seed);
+        let joint = evaluate(&all, &pred, starts.clone());
+        let carried = evaluate(&all, &pred, Vec::new());
+        let (pa, pb) = (straddling_pred(first, last, next, seed), straddling_pred(second, last, next, seed));
+        let (a, b) = (evaluate(first, &pa, Vec::new()), evaluate(second, &pb, Vec::new()));
+        assert_eq!(joint.trades, a.trades + b.trades);
+        assert_eq!(joint.entries, a.entries + b.entries);
+        assert_eq!(joint.exits, a.exits + b.exits);
+        assert!((joint.total_cost - (a.total_cost + b.total_cost)).abs() <= 1e-12, "cost {} vs {} + {}", joint.total_cost, a.total_cost, b.total_cost);
+        assert!((joint.net_pnl - (a.net_pnl + b.net_pnl)).abs() <= 1e-12, "net {} vs {} + {}", joint.net_pnl, a.net_pnl, b.net_pnl);
+        assert!((joint.gross_pnl - (a.gross_pnl + b.gross_pnl)).abs() <= 1e-12);
+        assert_ne!(carried.exits, joint.exits, "seed {seed}: the carried book skips the exit at the first interval end");
+        assert_ne!(carried.total_cost, joint.total_cost, "seed {seed}");
+    }
+}
+
+#[test]
+fn validation_intervals_are_separate_books() {
+    let first: Vec<i64> = (300..360).collect();
+    let second: Vec<i64> = (900..960).collect();
+    let split = split_of(&[(hour(300), hour(360)), (hour(900), hour(960))], &[]);
+    let starts = split.validation_segment_starts();
+    assert_eq!(starts, vec![hour(300) as f64, hour(900) as f64]);
+    assert_separate_books(&first, &second, starts);
+}
+
+#[test]
+fn test_intervals_are_separate_books() {
+    let first: Vec<i64> = (360..600).collect();
+    let second: Vec<i64> = (1000..1240).collect();
+    let split = split_of(&[], &[(hour(360), hour(600)), (hour(1000), hour(1240))]);
+    let starts = split.test_segment_starts();
+    assert_eq!(starts, vec![hour(360) as f64, hour(1000) as f64]);
+    assert_separate_books(&first, &second, starts);
+    let touching = split_of(&[(hour(300), hour(360)), (hour(360), hour(420))], &[(hour(500), hour(600)), (hour(600), hour(700))]);
+    assert_eq!(touching.validation_segment_starts(), vec![hour(300) as f64]);
+    assert_eq!(touching.test_segment_starts(), vec![hour(500) as f64]);
+}
+
+#[test]
+fn robust_blocks_are_books_at_nonzero_cost() {
+    let hours: Vec<i64> = (300..360).chain(900..960).chain(1260..1320).collect();
+    let slice = two_group_slice(&hours);
+    let rows = &slice.rows;
+    let mut order: Vec<usize> = (0..rows.time.len()).collect();
+    order.sort_by(|&x, &y| rows.time[x].total_cmp(&rows.time[y]).then(x.cmp(&y)));
+    let pick = |idx: &[usize]| TradingRows { time: idx.iter().map(|&i| rows.time[i]).collect(), group: idx.iter().map(|&i| rows.group[i]).collect(), funding: Vec::new() };
+    let sorted = pick(&order);
+    let ret: Vec<f64> = order.iter().map(|&i| slice.ret[i]).collect();
+    // Long over the last rows of each interval and the first rows of the next.
+    let pred: Vec<f64> = (0..ret.len()).map(|k| if (k * 7) % 5 < 3 || sorted.time[k] == hour(359) as f64 || sorted.time[k] == hour(900) as f64 { 1.0 } else { -1.0 }).collect();
+    let cuts = [hour(300) as f64, hour(900) as f64, hour(1260) as f64];
+    let spec = TradingSpec { cost_bps: 5.0, ..TradingSpec::default() };
+    let joint = rcsr::trading::blocked_alpha_cuts(&pred, &ret, &sorted, &spec, &cuts).unwrap();
+    for (k, (a, b)) in [(300, 360), (900, 960), (1260, 1320)].iter().enumerate() {
+        let idx: Vec<usize> = (0..ret.len()).filter(|&i| sorted.time[i] >= hour(*a) as f64 && sorted.time[i] < hour(*b) as f64).collect();
+        let part = pick(&idx.iter().map(|&i| order[i]).collect::<Vec<_>>());
+        let alone = rcsr::trading::blocked_alpha(
+            &idx.iter().map(|&i| pred[i]).collect::<Vec<_>>(),
+            &idx.iter().map(|&i| ret[i]).collect::<Vec<_>>(),
+            &part,
+            &spec,
+            1,
+        )
+        .unwrap();
+        assert!((joint.block_alpha[k] - alone.block_alpha[0]).abs() <= 1e-15, "interval {k}: {} vs {}", joint.block_alpha[k], alone.block_alpha[0]);
+    }
+}
+
+fn period_net(wf: &Json) -> Vec<u64> {
+    match at(wf, &["pooled", "period_net"]) {
+        Json::Arr(a) => a.iter().map(|v| v.as_f64().unwrap().to_bits()).collect(),
+        _ => panic!("pooled.period_net is not an array"),
+    }
+}
+
+#[test]
+fn split_windows_start_flat() {
+    let s = Scratch::new("interval-split-windows-flat");
+    let dir = s.path();
+    let data = write_series(dir, 1400);
+    let table = write_table(
+        dir,
+        "windows.csv",
+        &[
+            ("g2", "train", hour(0), hour(300)),
+            ("g2", "validation", hour(300), hour(360)),
+            ("g2", "test", hour(360), hour(600)),
+            ("g2", "train", hour(600), hour(900)),
+            ("g2", "test", hour(900), hour(1100)),
+            ("a", "train", hour(0), hour(300)),
+            ("a", "test", hour(360), hour(600)),
+            ("b", "train", hour(0), hour(300)),
+            ("b", "test", hour(900), hour(1100)),
+        ],
+    );
+    let (_, run) = pnl_search(dir, &data, &table, &[]);
+    let wf = |id: &str| {
+        let out = walkforward(&data, &run, &["--windows", &table, "--split-id", id]);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        parse(&String::from_utf8_lossy(&out.stdout))
+    };
+    let (ab, a, b) = (wf("g2"), wf("a"), wf("b"));
+    let mut want = period_net(&a);
+    want.extend(period_net(&b));
+    assert_eq!(period_net(&ab), want, "the pooled path is the concatenation of the window books");
+    assert_eq!(num(&ab, &["pooled_seam", "seam_cost"]), 0.0);
+    assert_eq!(at(&ab, &["pooled_seam", "reset_flat"]), &Json::Bool(true));
+}

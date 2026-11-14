@@ -81,6 +81,9 @@ pub struct ProtocolOptions {
     /// #309: score every candidate on every window in one batch (device kernel
     /// when available) and report it beside the exact finalists.
     pub batch_pnl: bool,
+    /// #1189: windows from a splits table: the pooled path starts flat at every window
+    /// that does not touch the end of the previous one, and charges no seam there.
+    pub flat_gaps: bool,
     /// #487: where the cost and the return units came from. `None` is the
     /// historical reading: the flag or default cost and simple returns.
     pub cost: Option<crate::target::CostDecl>,
@@ -225,6 +228,7 @@ impl Default for ProtocolOptions {
             pbo_blocks: 16,
             fdr_q: 0.10,
             batch_pnl: false,
+            flat_gaps: false,
             cost: None,
             front: None,
             expression_source: None,
@@ -1730,6 +1734,7 @@ impl Accum {
         let mut seam_trades = 0usize;
         let mut previous_end: Option<HashMap<u64, f64>> = None;
         let mut pooled_previous: HashMap<u64, f64> = HashMap::new();
+        let mut previous_test_end: Option<f64> = None;
         let expressions = candidate_expressions(spec);
         let want_inference = opts.bootstrap_draws > 0 || opts.null_draws > 0;
         let vote = spec.policy == Policy::Vote;
@@ -1852,6 +1857,8 @@ impl Accum {
             );
             // Pooled path: carry each group's position across the seam unless
             // the caller asked for the historical flat reset.
+            let flat_here = spec.pool_reset_flat || (opts.flat_gaps && previous_test_end != Some(d.window.test_start));
+            previous_test_end = Some(d.window.test_end);
             let pev = if spec.pool_reset_flat {
                 evaluate_window(
                     &d.test_rows,
@@ -1870,6 +1877,9 @@ impl Accum {
                     false,
                 )
             } else {
+                if flat_here {
+                    pooled_previous.clear();
+                }
                 evaluate_window(
                     &d.test_rows,
                     &d.test_scores[candidate],
@@ -1888,7 +1898,7 @@ impl Accum {
                 )
             };
             if !spec.pool_reset_flat && opts.mask.is_none() {
-                if let Some(prev_end) = &previous_end {
+                if let Some(prev_end) = previous_end.as_ref().filter(|_| !flat_here) {
                     for (group, &q_start) in &ev.first_positions {
                         let p_end = prev_end.get(group).copied().unwrap_or(0.0);
                         let delta = (q_start - p_end).abs();
