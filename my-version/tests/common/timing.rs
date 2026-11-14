@@ -21,17 +21,35 @@ pub fn is_timing_key(key: &str) -> bool {
         || key.ends_with("_ms")
 }
 
+/// `seconds` is wall-clock in the `gpu.fit` and `prune` objects and data elsewhere (`lockbox_embargo.seconds`).
+fn drops_seconds(path: &[String]) -> bool {
+    match path {
+        [.., last] if last == "prune" => true,
+        [.., gpu, fit] => gpu == "gpu" && fit == "fit",
+        _ => false,
+    }
+}
+
 /// `value` without its timing members, at any depth.
 pub fn drop_timing(value: Json) -> Json {
+    drop_timing_at(value, &[])
+}
+
+/// `path` is the key chain of the objects above `value`; an array adds no element.
+fn drop_timing_at(value: Json, path: &[String]) -> Json {
     match value {
         Json::Obj(items) => Json::Obj(
             items
                 .into_iter()
-                .filter(|(key, _)| !is_timing_key(key))
-                .map(|(key, v)| (key, drop_timing(v)))
+                .filter(|(key, _)| !is_timing_key(key) && !(key == "seconds" && drops_seconds(path)))
+                .map(|(key, v)| {
+                    let mut below = path.to_vec();
+                    below.push(key.clone());
+                    (key, drop_timing_at(v, &below))
+                })
                 .collect(),
         ),
-        Json::Arr(items) => Json::Arr(items.into_iter().map(drop_timing).collect()),
+        Json::Arr(items) => Json::Arr(items.into_iter().map(|v| drop_timing_at(v, path)).collect()),
         other => other,
     }
 }
