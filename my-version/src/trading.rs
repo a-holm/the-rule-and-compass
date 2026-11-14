@@ -1946,6 +1946,147 @@ impl FitnessBook {
         }
         out
     }
+
+    /// #1094: every root cut of `pred` in one sort and one sweep. `time` is the
+    /// row timestamp, aligned with `pred`; it counts distinct entry timestamps.
+    /// Errors: a non-finite prediction or time, a length mismatch, a book that
+    /// is not plain ([`FitnessBook::is_plain`]).
+    pub fn cut_sweep(&self, pred: &[f64], time: &[f64]) -> Result<CutSweep, String> {
+        let _ = (pred, time);
+        Err("cut sweep: not implemented".to_string())
+    }
+}
+
+/// #1094: the floor of [`CutSweep::best`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CutFloor {
+    /// Fewest distinct timestamps at which at least one row enters.
+    pub min_entry_times: u32,
+}
+
+/// #1094: the books of every root cut of one prediction vector on a plain
+/// [`FitnessBook`]. Cut `t` in `0..=n` is long on the `n - t` rows of highest
+/// prediction. `t` is valid when it does not split equal predictions (`-0.0`
+/// equals `+0.0`); `t = 0` and `t = n` are always valid.
+#[derive(Clone, Debug)]
+pub struct CutSweep {
+    /// Row indices by ascending prediction, ties by row index.
+    order: Vec<u32>,
+    /// `n + 1` values; `+inf` where `t` splits a tie.
+    fitness: Vec<f64>,
+    /// Sum over blocks of `gross - side * (flips + exits)`; NaN where invalid.
+    net: Vec<f64>,
+    flips: Vec<u32>,
+    exits: Vec<u32>,
+    /// Distinct timestamps at which at least one row enters.
+    entry_times: Vec<u32>,
+}
+
+impl CutSweep {
+    /// Rows of the book (`n`); the cuts are `0..=n`.
+    pub fn rows(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_valid(&self, t: usize) -> bool {
+        !self.net[t].is_nan()
+    }
+
+    /// [`FitnessBook::fitness_of`] of cut `t`; `+inf` when `t` is not valid.
+    pub fn fitness(&self, t: usize) -> f64 {
+        self.fitness[t]
+    }
+
+    pub fn net(&self, t: usize) -> f64 {
+        self.net[t]
+    }
+
+    pub fn flips(&self, t: usize) -> u32 {
+        self.flips[t]
+    }
+
+    pub fn exits(&self, t: usize) -> u32 {
+        self.exits[t]
+    }
+
+    pub fn entry_times(&self, t: usize) -> u32 {
+        self.entry_times[t]
+    }
+
+    /// A threshold that realises cut `t` under `pred > threshold`: the midpoint
+    /// of the two neighbouring predictions, or the lower one when the midpoint
+    /// is not strictly below the upper one. `-inf` for `t = 0`, `+inf` for `n`.
+    pub fn value(&self, pred: &[f64], t: usize) -> f64 {
+        let n = self.order.len();
+        if t == 0 {
+            return f64::NEG_INFINITY;
+        }
+        if t >= n {
+            return f64::INFINITY;
+        }
+        let lo = pred[self.order[t - 1] as usize];
+        let hi = pred[self.order[t] as usize];
+        let mid = lo + (hi - lo) * 0.5;
+        if mid < hi {
+            mid
+        } else {
+            lo
+        }
+    }
+
+    /// The cut of threshold `theta`: the number of rows with `pred <= theta`.
+    pub fn index_of(&self, pred: &[f64], theta: f64) -> usize {
+        self.order.partition_point(|&i| pred[i as usize] <= theta)
+    }
+
+    /// The smallest valid cut at or above `t` (`n` at the latest).
+    pub fn snap(&self, t: usize) -> usize {
+        let n = self.order.len();
+        (t.min(n)..n).find(|&k| self.is_valid(k)).unwrap_or(n)
+    }
+
+    /// The fitted cut: among valid `t` with `0 < t < n`, finite fitness and at
+    /// least `floor.min_entry_times` entry timestamps, the lowest fitness; ties
+    /// go to the smallest `|t - reference|`, then to the smaller `t`. `None`
+    /// when no cut passes.
+    pub fn best(&self, floor: &CutFloor, reference: usize) -> Option<usize> {
+        let _ = (floor, reference);
+        None
+    }
+
+    /// The widest run of valid inner cuts around `best` whose fitness stays
+    /// within `0.1 * (1 - f)` of the best fitness `f`; `(best, best)` when `f`
+    /// is 1 or more. Returns the lowest and the highest cut of the run.
+    pub fn plateau(&self, best: usize) -> (usize, usize) {
+        let n = self.order.len();
+        let f = self.fitness[best];
+        if !(f < 1.0) {
+            return (best, best);
+        }
+        let limit = f + 0.1 * (1.0 - f);
+        let inside = |k: usize| self.fitness[k] <= limit;
+        let mut lo = best;
+        for k in (1..best).rev() {
+            if !self.is_valid(k) {
+                continue;
+            }
+            if !inside(k) {
+                break;
+            }
+            lo = k;
+        }
+        let mut hi = best;
+        for k in best + 1..n {
+            if !self.is_valid(k) {
+                continue;
+            }
+            if !inside(k) {
+                break;
+            }
+            hi = k;
+        }
+        (lo, hi)
+    }
 }
 
 /// The finalist chosen by a trading objective, with both books.
@@ -2534,5 +2675,210 @@ mod band_tests {
             assert_eq!(book.net_pnl.to_bits(), explicit.net_pnl.to_bits(), "band {band} hold {hold}");
             assert_eq!(book.trades, explicit.trades);
         }
+    }
+}
+
+#[cfg(test)]
+mod cut_sweep_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    struct Mix(u64);
+
+    impl Mix {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn uni(&mut self) -> f64 {
+            ((self.next() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        }
+
+        fn gauss(&mut self) -> f64 {
+            let (u, v) = (self.uni(), self.uni());
+            (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+        }
+    }
+
+    /// `groups` groups of `steps` hourly rows in canonical order. The market
+    /// feature `z` of each stamp is shared by the groups.
+    fn panel(rng: &mut Mix, groups: usize, steps: usize) -> (crate::data::TradingSlice, Vec<f64>) {
+        let z: Vec<f64> = (0..steps).map(|_| rng.gauss()).collect();
+        let (mut time, mut group, mut ret) = (Vec::new(), Vec::new(), Vec::new());
+        for g in 0..groups {
+            for (k, zk) in z.iter().enumerate() {
+                time.push(k as f64 * 3600.0);
+                group.push(g as u64);
+                ret.push(0.004 * rng.gauss() + 0.002 * zk);
+            }
+        }
+        let rows = TradingRows { time, group, funding: Vec::new() };
+        let zs = (0..groups * steps).map(|i| z[i % steps]).collect();
+        (crate::data::TradingSlice { rows, ret }, zs)
+    }
+
+    fn book(slice: &crate::data::TradingSlice, blocks: usize) -> FitnessBook {
+        let spec = TradingSpec { cost_bps: 5.0, min_trades: 1, ..TradingSpec::default() };
+        FitnessBook::with_blocks(slice, &spec, 0.0, blocks, 1.0).unwrap()
+    }
+
+    fn entry_count(book: &FitnessBook, pred: &[f64], time: &[f64], theta: f64) -> u32 {
+        let mut seen = BTreeSet::new();
+        let mut prev = false;
+        for i in 0..pred.len() {
+            if book.flags()[i] & TradingRows::FIRST != 0 {
+                prev = false;
+            }
+            let long = pred[i] > theta;
+            if long && !prev {
+                seen.insert(trading_gpu::order_key_f64(time[i]).unwrap());
+            }
+            prev = long;
+        }
+        seen.len() as u32
+    }
+
+    /// Every cut of the sweep against a book whose threshold is that cut's value.
+    fn check(book: &FitnessBook, pred: &[f64], time: &[f64]) -> usize {
+        let sw = book.cut_sweep(pred, time).unwrap();
+        let n = pred.len();
+        assert_eq!(sw.rows(), n);
+        let mut sorted = pred.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut checked = 0;
+        for t in 0..=n {
+            let valid = t == 0 || t == n || sorted[t - 1] < sorted[t];
+            assert_eq!(sw.is_valid(t), valid, "validity of cut {t}");
+            if !valid {
+                assert_eq!(sw.fitness(t), f64::INFINITY, "cut {t} inside a tie");
+                continue;
+            }
+            let theta = sw.value(pred, t);
+            assert_eq!(pred.iter().filter(|&&p| p > theta).count(), n - t, "value of cut {t}");
+            assert_eq!(sw.index_of(pred, theta), t);
+            let mut at = book.clone();
+            at.threshold = theta;
+            let want = at.regret(pred);
+            let got = sw.fitness(t);
+            if want.is_finite() || got.is_finite() {
+                assert!((want - got).abs() <= 1e-9 * want.abs().max(1.0), "cut {t}: book {want} sweep {got}");
+            }
+            let totals = at.block_totals(pred);
+            let flips: u64 = totals.iter().map(|x| x.flips).sum();
+            let exits: u64 = totals.iter().map(|x| x.exits).sum();
+            assert_eq!(sw.flips(t) as u64, flips, "flips of cut {t}");
+            assert_eq!(sw.exits(t) as u64, exits, "exits of cut {t}");
+            let net: f64 = totals.iter().map(|x| at.net_of(x)).sum();
+            assert!((net - sw.net(t)).abs() <= 1e-9 * net.abs().max(1.0), "net of cut {t}: {net} vs {}", sw.net(t));
+            assert_eq!(sw.entry_times(t), entry_count(&at, pred, time, theta), "entry timestamps of cut {t}");
+            checked += 1;
+        }
+        checked
+    }
+
+    #[test]
+    fn cut_sweep_equals_the_book_at_every_cut() {
+        let mut rng = Mix(1094);
+        let mut cuts = 0;
+        let mut ties = 0;
+        for blocks in [1usize, 2, 4] {
+            let (slice, z) = panel(&mut rng, 3, 667);
+            let b = book(&slice, blocks);
+            let pred: Vec<f64> = z.iter().map(|zk| zk + 0.5 * rng.gauss()).collect();
+            cuts += check(&b, &pred, &slice.rows.time);
+            let rounded: Vec<f64> = pred.iter().map(|p| (p * 4.0).round() / 4.0).collect();
+            assert!(rounded.iter().any(|p| *p == 0.0 && p.is_sign_negative()), "the rounded panel has -0.0");
+            assert!(rounded.iter().any(|p| *p == 0.0 && p.is_sign_positive()), "the rounded panel has +0.0");
+            let valid = check(&b, &rounded, &slice.rows.time);
+            ties += rounded.len() + 1 - valid;
+            cuts += valid;
+        }
+        assert!(cuts > 6_000, "{cuts} cuts checked");
+        assert!(ties > 4_500, "{ties} cuts inside ties");
+    }
+
+    #[test]
+    fn cut_sweep_refuses_bad_input() {
+        let mut rng = Mix(7);
+        let (slice, z) = panel(&mut rng, 2, 50);
+        let b = book(&slice, 1);
+        let time = &slice.rows.time;
+        let mut bad = z.clone();
+        bad[3] = f64::NAN;
+        assert!(b.cut_sweep(&bad, time).unwrap_err().contains("not finite"));
+        assert!(b.cut_sweep(&z[1..], time).unwrap_err().contains("length"));
+        let spec = TradingSpec { cost_bps: 5.0, min_holding: 2, ..TradingSpec::default() };
+        let held = FitnessBook::with_blocks(&slice, &spec, 0.0, 1, 1.0).unwrap();
+        assert!(held.cut_sweep(&z, time).unwrap_err().contains("plain"));
+    }
+
+    fn hand_sweep(fitness: &[f64], entry_times: &[u32]) -> CutSweep {
+        let n = fitness.len() - 1;
+        CutSweep {
+            order: (0..n as u32).collect(),
+            fitness: fitness.to_vec(),
+            net: vec![0.0; n + 1],
+            flips: vec![0; n + 1],
+            exits: vec![0; n + 1],
+            entry_times: entry_times.to_vec(),
+        }
+    }
+
+    #[test]
+    fn best_cut_applies_the_floor_and_the_tie_rule() {
+        let floor = |e| CutFloor { min_entry_times: e };
+        // t = 0 and t = n are never chosen, however low their fitness.
+        let s = hand_sweep(&[0.1, 0.9, 0.5, 0.7, 0.6, 0.95, 0.2], &[99, 40, 5, 40, 40, 40, 0]);
+        assert_eq!(s.best(&floor(30), 1), Some(4));
+        assert_eq!(s.best(&floor(1), 1), Some(2));
+        assert_eq!(s.best(&floor(41), 1), None);
+        let tie = hand_sweep(&[1.0, 0.5, 0.8, 0.8, 0.5, 1.0], &[40; 6]);
+        assert_eq!(tie.best(&floor(30), 4), Some(4));
+        assert_eq!(tie.best(&floor(30), 2), Some(1));
+        let even = hand_sweep(&[1.0, 0.5, 0.8, 0.5, 0.9, 1.0], &[40; 6]);
+        assert_eq!(even.best(&floor(30), 2), Some(1));
+        let mut invalid = hand_sweep(&[1.0, 0.7, f64::INFINITY, 0.9, 1.0], &[40; 5]);
+        invalid.net[2] = f64::NAN;
+        assert_eq!(invalid.best(&floor(30), 2), Some(1));
+        let none = hand_sweep(&[0.0, f64::INFINITY, f64::INFINITY, 0.0], &[40; 4]);
+        assert_eq!(none.best(&floor(1), 1), None);
+    }
+
+    /// The return pays only when the market feature is below its 3 % quantile.
+    #[test]
+    fn fitted_cut_finds_a_planted_gate() {
+        let (groups, steps) = (4usize, 4000usize);
+        let mut rng = Mix(268);
+        let z: Vec<f64> = (0..steps).map(|_| rng.gauss()).collect();
+        let mut sorted = z.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let q03 = sorted[steps * 3 / 100];
+        let mu = 0.01;
+        let market: Vec<f64> = z.iter().map(|&zk| 0.003 * rng.gauss() + if zk < q03 { mu } else { 0.0 } - mu * 0.03).collect();
+        let (mut time, mut group, mut ret, mut pred) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for g in 0..groups {
+            for k in 0..steps {
+                time.push(k as f64 * 3600.0);
+                group.push(g as u64);
+                ret.push(market[k] + 0.002 * rng.gauss());
+                pred.push(-z[k]);
+            }
+        }
+        let slice = crate::data::TradingSlice { rows: TradingRows { time: time.clone(), group, funding: Vec::new() }, ret };
+        let spec = TradingSpec { cost_bps: 10.0, min_trades: 1, ..TradingSpec::default() };
+        let b = FitnessBook::with_blocks(&slice, &spec, 0.0, 4, 1.0).unwrap();
+        let sw = b.cut_sweep(&pred, &time).unwrap();
+        let n = pred.len();
+        let reference = sw.index_of(&pred, 0.0);
+        let t = sw.best(&CutFloor { min_entry_times: 30 }, reference).expect("a cut passes the floor");
+        let share = (n - t) as f64 / n as f64;
+        let reference_share = (n - reference) as f64 / n as f64;
+        assert!((0.02..=0.05).contains(&share), "fitted long share {share}");
+        assert!(reference_share > 0.4, "reference long share {reference_share}");
+        assert!(sw.fitness(t) < sw.fitness(reference));
     }
 }

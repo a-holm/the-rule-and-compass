@@ -125,6 +125,76 @@ pub struct ProtocolOptions {
     /// `stride_seconds` of the target spec: the period width is the larger of the
     /// horizon and this.
     pub stride_seconds: Option<f64>,
+    /// #1094: `--threshold-fit fitness`. Each window's cut is fitted on its
+    /// validation slice (training rows without one); `threshold_fixed` is the
+    /// reference cut and the fallback.
+    pub threshold_fit: Option<CutFit>,
+}
+
+/// #1094: the rule of `--threshold-fit fitness`: the cut with the lowest block
+/// fitness among the cuts with at least `min_entry_times` distinct entry
+/// timestamps on the source rows of a window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CutFit {
+    /// `--cut-min-entries`.
+    pub min_entry_times: u32,
+    /// `--cut-blocks`: time blocks of the fitness.
+    pub blocks: usize,
+    /// `--cut-lambda`: weight of the block regret sd.
+    pub lambda: f64,
+}
+
+impl Default for CutFit {
+    fn default() -> Self {
+        CutFit { min_entry_times: 30, blocks: 4, lambda: 1.0 }
+    }
+}
+
+/// #1094: one cut of a window's sweep, priced on the source rows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CutPoint {
+    /// Source rows at or below the cut.
+    pub index: usize,
+    pub value: f64,
+    pub fitness: f64,
+    pub net: f64,
+    pub flips: u32,
+    pub exits: u32,
+    pub entry_times: u32,
+    /// Long rows over source rows.
+    pub exposure: f64,
+}
+
+/// #1094: the widest run of valid cuts around the fitted one whose fitness
+/// stays within `0.1 * (1 - best)` of the best.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CutPlateau {
+    pub lo: f64,
+    pub hi: f64,
+    pub rows_lo: usize,
+    pub rows_hi: usize,
+}
+
+/// #1094: the cut of one window under `--threshold-fit fitness`.
+#[derive(Clone, Debug)]
+pub struct CutReport {
+    /// `ValidationFitness` or `TrainFitness`; `Fixed` when the window fell back.
+    pub source: ThresholdSource,
+    /// The threshold of the window.
+    pub value: f64,
+    /// Source rows with a finite score and target.
+    pub rows: usize,
+    /// The cut the window uses, when a sweep ran.
+    pub cut: Option<CutPoint>,
+    pub reference_value: f64,
+    pub reference: Option<CutPoint>,
+    pub plateau: Option<CutPlateau>,
+    pub fit: CutFit,
+    /// `no_rows`, `book_error`, `no_valid_cut` or `floor`.
+    pub fallback: Option<&'static str>,
+    pub fallback_detail: Option<String>,
+    /// `(long-row share asked for, the cut)`, 32 rows.
+    pub profile: Vec<(f64, CutPoint)>,
 }
 
 /// #482: where a candidate list came from: a run's Pareto front.
@@ -165,6 +235,7 @@ impl Default for ProtocolOptions {
             fit_label: None,
             horizon_from_spec: false,
             stride_seconds: None,
+            threshold_fit: None,
         }
     }
 }
@@ -471,6 +542,8 @@ pub struct WindowResult {
     /// Latest stamp of any row used for training or validation. Its label ends
     /// at most `required_purge_seconds` later, which stays below `test_start`.
     pub train_last_time: Option<f64>,
+    /// #1094: the fitted cut under `--threshold-fit fitness`.
+    pub cut: Option<CutReport>,
 }
 
 /// #306: the band/cooldown book and its associative carry.
@@ -1817,6 +1890,7 @@ impl Accum {
                 band: ev.band.map(|b| BandCheck { spec: Some(bands[candidate].clone()), ..b }),
                 hindsight_bound: ev.hindsight_bound,
                 band_selection,
+                cut: None,
             });
         }
 
