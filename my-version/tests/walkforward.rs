@@ -1561,26 +1561,11 @@ fn write_wide(scratch: &Scratch, name: &str, table: &data::Table, group_rows: us
     path
 }
 
-/// The report without the members that name the source of the rows. The table
-/// path hashes a numeric group key differently from the store scan, so the
-/// seeded `controls` draw differently there; `numeric_group` drops them.
-fn without_source(json: &str, numeric_group: bool) -> rcsr::devlog::Json {
+/// The report without the members that name the source of the rows.
+fn without_source(json: &str) -> rcsr::devlog::Json {
     use rcsr::devlog::Json;
-    fn strip(j: Json, numeric_group: bool) -> Json {
-        match j {
-            Json::Obj(items) => Json::Obj(
-                items
-                    .into_iter()
-                    .filter(|(k, _)| !(numeric_group && k == "controls"))
-                    .map(|(k, v)| (k, strip(v, numeric_group)))
-                    .collect(),
-            ),
-            Json::Arr(items) => Json::Arr(items.into_iter().map(|v| strip(v, numeric_group)).collect()),
-            other => other,
-        }
-    }
     match Json::parse(json).unwrap() {
-        Json::Obj(items) => strip(Json::Obj(items.into_iter().filter(|(k, _)| k != "source" && k != "memory_bound").collect()), numeric_group),
+        Json::Obj(items) => Json::Obj(items.into_iter().filter(|(k, _)| k != "source" && k != "memory_bound").collect()),
         other => panic!("not an object: {other:?}"),
     }
 }
@@ -1608,8 +1593,7 @@ fn close(a: &rcsr::devlog::Json, b: &rcsr::devlog::Json, at: &str) {
 fn assert_matches_full_decode(path: &str, table: &data::Table, spec: &EvalSpec, opts: &walkforward::ProtocolOptions) -> walkforward::Report {
     let streamed = walkforward::run_path_with(path, spec, opts).unwrap();
     let resident = walkforward::run_table_with(table, spec, "test", opts).unwrap();
-    let numeric_group = spec.group.as_deref() == Some("gid");
-    close(&without_source(&streamed.json(), numeric_group), &without_source(&resident.json(), numeric_group), "report");
+    close(&without_source(&streamed.json()), &without_source(&resident.json()), "report");
     streamed
 }
 
@@ -1677,4 +1661,109 @@ fn store_scan_matches_the_full_decode_with_a_final_read_and_a_locked_range() {
         assert_eq!((scan.named_variables, scan.projected_columns), (5, 7), "{final_read} {:?}", opts.locked_ranges);
         assert_eq!(scan.groups_read + scan.groups_skipped, if final_read { 18 } else { 9 });
     }
+}
+
+// ---------------------------------------------------------------------------
+// #1149: one group id per numeric key value on the table path and the store path.
+// ---------------------------------------------------------------------------
+
+/// The `controls` member of every window, as printed.
+fn window_controls(json: &str) -> Vec<String> {
+    use rcsr::devlog::Json;
+    let report = Json::parse(json).unwrap();
+    match report.get("windows") {
+        Some(Json::Arr(ws)) => ws.iter().map(|w| format!("{:?}", w.get("controls").expect("controls"))).collect(),
+        other => panic!("no windows: {other:?}"),
+    }
+}
+
+fn assert_csv_and_store_agree(table: &data::Table, scratch: &Scratch, name: &str, group: &str) {
+    let path = scratch.join(name).to_string_lossy().into_owned();
+    store::write_store(&path, table, 36).unwrap();
+    let mut s = spec("x", vec![window("w", 0.0, 6.0, 6.0, 12.0)]);
+    s.target = "y".to_string();
+    s.group = Some(group.to_string());
+    s.control_seed = 7;
+    s.cost_bps = 20.0;
+    s.threshold_quantile = 0.5;
+    let opts = walkforward::ProtocolOptions::default();
+    let resident = walkforward::run_table_with(table, &s, "test", &opts).unwrap();
+    let streamed = walkforward::run_path_with(&path, &s, &opts).unwrap();
+    assert_eq!(window_controls(&resident.json()), window_controls(&streamed.json()), "controls");
+    close(&without_source(&streamed.json()), &without_source(&resident.json()), "report");
+}
+
+/// `keys` distinct numeric keys, 12 steps, one row per key and step. Each key
+/// alternates between two spellings of the same number (`1` and `1.0`, `0` and
+/// `-0`); the last key is NaN.
+fn keyed_table(keys: usize) -> data::Table {
+    let mut vals: Vec<f64> = (0..keys - 2).map(|i| (i as f64 - keys as f64 / 3.0) * 0.25).filter(|v| *v != 0.0).collect();
+    if !vals.contains(&1.0) {
+        vals.push(1.0);
+    }
+    let mut csv = String::from("ts,gid,x,y\n");
+    for step in 0..12usize {
+        let rows = vals.iter().map(|v| if step % 2 == 0 { format!("{v}") } else { format!("{v:?}") });
+        let zero = if step % 2 == 0 { "0".to_string() } else { "-0".to_string() };
+        for (k, key) in rows.chain([zero, "NaN".to_string()]).enumerate() {
+            let x = ((k * 7 + step * 3) % 13) as f64 / 6.0 - 1.0;
+            let y = (((k * 5 + step * 11) % 17) as f64 - 8.0) * 0.001;
+            csv.push_str(&format!("{step},{key},{x},{y}\n"));
+        }
+    }
+    data::parse_table(&csv).unwrap()
+}
+
+#[test]
+fn numeric_group_ids_match_between_csv_and_store() {
+    let scratch = Scratch::new("wf-numeric-group");
+    let table = wide_table(false);
+    let path = write_wide(&scratch, "wide.rcsb", &table, 36);
+    let mut s = wide_spec("f1 + f4 * f1", vec![window("w", 0.0, 24.0, 24.0, 40.0)], Some("gid"));
+    s.control_seed = 7;
+    let opts = walkforward::ProtocolOptions::default();
+    let resident = walkforward::run_table_with(&table, &s, "test", &opts).unwrap();
+    let streamed = walkforward::run_path_with(&path, &s, &opts).unwrap();
+    assert_eq!(window_controls(&resident.json()), window_controls(&streamed.json()));
+    close(&without_source(&streamed.json()), &without_source(&resident.json()), "report");
+}
+
+#[test]
+fn numeric_group_keys_agree_across_spellings_negative_zero_nan_and_cardinality() {
+    let scratch = Scratch::new("wf-numeric-group-keys");
+    // 6 keys keep a dictionary on the table path; 4200 keys drop it.
+    for keys in [6, 4200] {
+        assert_csv_and_store_agree(&keyed_table(keys), &scratch, &format!("keys-{keys}.rcsb"), "gid");
+    }
+}
+
+#[test]
+fn the_cli_prints_the_same_controls_for_a_numeric_group_as_csv_and_store() {
+    let scratch = Scratch::new("wf-numeric-group-cli");
+    let csv_path = scratch.join("d.csv");
+    let store_path = scratch.join("d.rcsb");
+    let mut csv = String::from("ts,gid,x,target\n");
+    for step in 0..12 {
+        for (k, gid) in ["-1", "0.5", "2", "7"].iter().enumerate() {
+            let x = ((k * 7 + step * 3) % 13) as f64 / 6.0 - 1.0;
+            let y = (((k * 5 + step * 11) % 17) as f64 - 8.0) * 0.001;
+            csv.push_str(&format!("{},{gid},{x},{y}\n", 3600 * step));
+        }
+    }
+    std::fs::write(&csv_path, csv).unwrap();
+    let import = rcsr_cmd::rcsr().args(["import", csv_path.to_str().unwrap(), store_path.to_str().unwrap(), "--time", "ts"]).output().unwrap();
+    assert_eq!(import.status.code(), Some(0), "{}", String::from_utf8_lossy(&import.stderr));
+    let run = |data: &std::path::Path| {
+        let out = rcsr_cmd::rcsr()
+            .args([
+                "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x", "--time", "ts",
+                "--group-by", "gid", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365",
+                "--window", "w,0,18000,25200,43200", "--control-seed", "7", "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        window_controls(&String::from_utf8_lossy(&out.stdout))
+    };
+    assert_eq!(run(&csv_path), run(&store_path));
 }
