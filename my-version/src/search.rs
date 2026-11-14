@@ -14455,6 +14455,7 @@ mod tests {
         assert_eq!(gated.seeds[0].error.to_bits(), start.error.to_bits());
         assert_eq!(expr::structural_hash(&gated.seeds[0].tree), expr::structural_hash(&start.tree));
         assert!(plain.seeds[0].error > gated.seeds[0].error, "{} vs {}", plain.seeds[0].error, gated.seeds[0].error);
+    }
 
     /// #1124: under the #848 fallback the finalist refit runs in two passes;
     /// only the pass whose front is reported is counted.
@@ -14479,7 +14480,6 @@ mod tests {
         let (kept, refused) = counts.snapshot().path("finalist").unwrap();
         assert_eq!(kept + refused, 1, "one finalist, one decision");
         assert!(((kept + refused) as usize) <= report.refits);
-    }
     }
 
     /// #1079: an island of scored offspring with edit records.
