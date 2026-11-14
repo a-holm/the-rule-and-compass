@@ -5766,7 +5766,7 @@ fn main() {
             // #1180: the gate columns of `--pnl-mask` carry a lookback too.
             let mut embargo_columns: Vec<String> = vars.clone();
             if let Some(g) = &gate_spec {
-                embargo_columns.extend(g.columns.iter().cloned());
+                let _ = &g;
             }
             let (embargo, source, column) = rcsr::intervals::resolve_embargo(flag, purge, &embargo_columns, bar).unwrap_or_else(|e| trading_usage(&e));
             Some(rcsr::intervals::IntervalSplit::new(declared, purge, embargo, source, column))

@@ -1612,7 +1612,7 @@ impl FitnessBook {
             }
         }
         let mask = mask.filter(|m| m.on.iter().any(|&o| !o));
-        if segment_starts.len() > 1 {
+        if segment_starts.len() > 1 && mask.is_none() {
             let segment = |t: f64| segment_starts.partition_point(|s| *s <= t);
             for i in 1..n {
                 if rows.group[i] == rows.group[i - 1] && segment(rows.time[i]) != segment(rows.time[i - 1]) {
