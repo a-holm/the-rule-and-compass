@@ -1019,6 +1019,10 @@ struct Ind {
     /// `+inf` (a CPU score, a CPU check of a device `+inf`, or a dimension
     /// rejection). `None` means unconfirmed. Any write of `error` clears it.
     inf_rows: Option<u64>,
+    /// #1079: under `--adaptive-mix` with a deferred score, the first parent's
+    /// error and the bit set of edit kinds that made this offspring. Consumed
+    /// by `learn_mix_at_barrier` in the generation that set it; never saved.
+    edit: Option<(f64, u8)>,
 }
 
 impl Ind {
@@ -1084,6 +1088,7 @@ impl Ind {
             descriptor,
             age: 0,
             inf_rows: None,
+            edit: None,
         }
     }
 
@@ -1111,6 +1116,7 @@ impl Ind {
             descriptor: None,
             age: 0,
             inf_rows: None,
+            edit: None,
         }
     }
 
@@ -1217,6 +1223,7 @@ impl Ind {
             descriptor: None,
             age: ind.age,
             inf_rows: None,
+            edit: None,
         }
     }
 }
@@ -6690,6 +6697,11 @@ fn evolve_island(
     *isl = next;
 }
 
+/// #1079: learn the edit success counts of a device-scored generation.
+fn learn_mix_at_barrier(islands: &mut [Vec<Ind>], mixes: &mut [MixWindow]) {
+    let _ = (islands, mixes);
+}
+
 /// A user-provided starting expression, after simplification, constant fitting
 /// and evaluation on the training sample.
 ///
@@ -8080,6 +8092,7 @@ fn run_postfix_search(
                             descriptor: None,
                             age: 0,
                             inf_rows: None,
+                            edit: None,
                         })
                         .collect()
                 })
@@ -8156,6 +8169,7 @@ fn run_postfix_search(
                         descriptor: None,
                         age: 0,
                         inf_rows: None,
+                        edit: None,
                     })
                     .collect()
             })
@@ -10300,6 +10314,7 @@ mod tests {
             descriptor: None,
             age: 0,
             inf_rows: None,
+            edit: None,
         }
     }
 
@@ -10609,6 +10624,7 @@ mod tests {
             descriptor: None,
             age: 0,
             inf_rows: None,
+            edit: None,
         };
         refresh_after_fit(&mut ind, &cfg);
         let want = expr::simplify(&tree);
@@ -11282,6 +11298,7 @@ mod tests {
             descriptor: None,
             age: 0,
             inf_rows: None,
+            edit: None,
         }];
 
         let mut rng = Mt::new(11);
@@ -11553,6 +11570,7 @@ mod tests {
             descriptor: None,
             age: 0,
             inf_rows: None,
+            edit: None,
         };
 
         ind.refit_and_reeval(&first_data, &first, &cfg, None);
@@ -12870,7 +12888,7 @@ mod tests {
     }
 
     fn aged_ind(tree: Node, error: f64, complexity: f64, age: u32) -> Ind {
-        Ind { tree, error, complexity, descriptor: None, age, inf_rows: None }
+        Ind { tree, error, complexity, descriptor: None, age, inf_rows: None, edit: None }
     }
 
     /// #465: the lowest-error individual always survives, whatever its age or
@@ -14419,5 +14437,127 @@ mod tests {
         assert_eq!(gated.seeds[0].error.to_bits(), start.error.to_bits());
         assert_eq!(expr::structural_hash(&gated.seeds[0].tree), expr::structural_hash(&start.tree));
         assert!(plain.seeds[0].error > gated.seeds[0].error, "{} vs {}", plain.seeds[0].error, gated.seeds[0].error);
+    }
+
+    /// #1079: an island of scored offspring with edit records.
+    fn edit_island(rows: &[(Option<(f64, u8)>, f64)], cfg: &Config) -> Vec<Ind> {
+        rows.iter()
+            .map(|&(edit, error)| {
+                let mut ind = Ind::pending(input(0), cfg);
+                ind.set_error(error);
+                ind.edit = edit;
+                ind
+            })
+            .collect()
+    }
+
+    #[test]
+    fn barrier_learning_counts_like_the_inline_rule() {
+        let cfg = Config::default();
+        let inf = f64::INFINITY;
+        let mut islands = vec![edit_island(
+            &[
+                (Some((1.0, 0b0000011)), 0.5),
+                (Some((1.0, 0b0000110)), 2.0),
+                (Some((inf, 0b0001100)), 3.0),
+                (Some((1.0, 0b0011000)), inf),
+                (Some((inf, 0b0110000)), inf),
+                (None, 0.1),
+            ],
+            &cfg,
+        )];
+        let mut mixes = vec![MixWindow::new()];
+        learn_mix_at_barrier(&mut islands, &mut mixes);
+        let mut want: MixCounts = [(0, 0); expr::EDIT_KINDS];
+        want[0] = (1, 1);
+        want[1] = (2, 1);
+        want[2] = (2, 1);
+        want[3] = (2, 1);
+        want[4] = (2, 0);
+        want[5] = (1, 0);
+        let mut expected = MixWindow::new();
+        expected.push(want);
+        assert_eq!(mixes[0], expected);
+        assert!(islands[0].iter().all(|i| i.edit.is_none()));
+    }
+
+    /// #1079: `fit_iters = 0`, no QD policy: the barrier rule and the inline
+    /// rule see the same offspring, so they learn the same window.
+    fn adaptive_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.pop = 40;
+        cfg.fit_iters = 0;
+        cfg.adaptive_mix = true;
+        cfg
+    }
+
+    fn adaptive_island(data: &EvalSample, cfg: &Config) -> Vec<Ind> {
+        (0..cfg.pop)
+            .map(|i| Ind::evaluated(node(Op::Add, vec![input(0), constant(i as f64)]), data, cfg))
+            .collect()
+    }
+
+    #[test]
+    fn barrier_and_inline_learning_agree() {
+        let s = sample();
+        let aggs = AggTable::from_sample(&s);
+        let cfg = adaptive_config();
+        assert!(!cfg.qd_policy);
+        let data = EvalSample::new(&s, &cfg);
+        let mut inline = adaptive_island(&data, &cfg);
+        let mut barrier = adaptive_island(&data, &cfg);
+        let (mut inline_rng, mut barrier_rng) = (Mt::new(23), Mt::new(23));
+        let (mut inline_mix, mut barrier_mix) = (MixWindow::new(), MixWindow::new());
+        for _ in 0..3 {
+            evolve_island(
+                &mut inline, &mut inline_rng, &cfg, &data, &s, 1, &aggs, false, false, no_parents(), None, None, 1,
+                &mut inline_mix, None,
+            );
+            evolve_island(
+                &mut barrier, &mut barrier_rng, &cfg, &data, &s, 1, &aggs, false, true, no_parents(), None, None, 1,
+                &mut barrier_mix, None,
+            );
+            for ind in barrier.iter_mut().filter(|i| i.error.is_nan()) {
+                ind.score_in_place(&data, &cfg);
+            }
+            let mut islands = vec![std::mem::take(&mut barrier)];
+            learn_mix_at_barrier(&mut islands, std::slice::from_mut(&mut barrier_mix));
+            barrier = islands.pop().unwrap();
+            assert_eq!(inline_mix, barrier_mix);
+            let key = |p: &[Ind]| -> Vec<(u64, u64)> {
+                p.iter().map(|i| (expr::structural_hash(&i.tree), i.error.to_bits())).collect()
+            };
+            assert_eq!(key(&inline), key(&barrier));
+        }
+        assert_eq!(inline_mix.len(), 3);
+        assert!(inline_mix.encode().iter().any(|&n| n > 0));
+    }
+
+    #[test]
+    fn no_edit_record_survives_a_generation() {
+        let s = sample();
+        let aggs = AggTable::from_sample(&s);
+        let cfg = adaptive_config();
+        let data = EvalSample::new(&s, &cfg);
+        let mut isl = adaptive_island(&data, &cfg);
+        let mut rng = Mt::new(5);
+        let mut mix = MixWindow::new();
+        for _ in 0..3 {
+            evolve_island(
+                &mut isl, &mut rng, &cfg, &data, &s, 1, &aggs, false, true, no_parents(), None, None, 1,
+                &mut mix, None,
+            );
+            assert!(isl.iter().any(|i| i.edit.is_some()), "offspring carry their edit record");
+            for ind in isl.iter_mut().filter(|i| i.error.is_nan()) {
+                ind.score_in_place(&data, &cfg);
+            }
+            let mut islands = vec![std::mem::take(&mut isl)];
+            learn_mix_at_barrier(&mut islands, std::slice::from_mut(&mut mix));
+            isl = islands.pop().unwrap();
+            assert!(isl.iter().all(|i| i.edit.is_none()));
+        }
+        assert_eq!(mix.len(), 3);
+        let attempts: u64 = mix.encode().chunks(2).map(|c| c[0]).sum();
+        assert!(attempts > 0);
     }
 }
