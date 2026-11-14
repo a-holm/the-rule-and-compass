@@ -122,8 +122,7 @@ pub(super) fn refusal(cfg: &Config, train: &Sample) -> Option<String> {
             "--selection lexicase --fitness pnl --gpu: the device long_pnl fitness returns no sub-book cases yet (#1031); omit --gpu to run on the CPU".to_string()
         });
     }
-    let pop = cfg.pop.max(1);
-    let cases = match cfg.fitness.book() {
+    match cfg.fitness.book() {
         Some(book) => {
             let kept = book.cases().kept.len();
             if kept < 2 {
@@ -132,6 +131,32 @@ pub(super) fn refusal(cfg: &Config, train: &Sample) -> Option<String> {
                     kept
                 ));
             }
+        }
+        None if !cfg.fitness.is_metric() => return Some("the long_pnl fitness book was not rebuilt".to_string()),
+        None => {
+            if let Some(reason) = metric_refusal(cfg.metric, false, train.is_multi(), !train.w.is_empty()) {
+                return Some(reason);
+            }
+            if train.len() < 2 {
+                return Some(format!("--selection lexicase needs at least 2 training rows, found {}", train.len()));
+            }
+        }
+    }
+    limit_refusal(cfg, train)
+}
+
+/// Why the case errors of `cfg` on `train` exceed a cost limit under
+/// `--selection lexicase`, if they do: kept sub-book values (islands times
+/// population times kept sub-books) above 2^28, or one island's matrix
+/// (population times cases) above 2^24. Reads the flags and the data shape only.
+pub fn limit_refusal(cfg: &Config, train: &Sample) -> Option<String> {
+    if cfg.selection != Selection::Lexicase {
+        return None;
+    }
+    let pop = cfg.pop.max(1);
+    let cases = match cfg.fitness.book() {
+        Some(book) => {
+            let kept = book.cases().kept.len();
             let stored = cfg.islands.max(1).saturating_mul(pop).saturating_mul(kept);
             if stored > MAX_STORED_CELLS {
                 return Some(format!(
@@ -145,16 +170,7 @@ pub(super) fn refusal(cfg: &Config, train: &Sample) -> Option<String> {
             }
             kept.min(cfg.lexicase_cases)
         }
-        None if !cfg.fitness.is_metric() => return Some("the long_pnl fitness book was not rebuilt".to_string()),
-        None => {
-            if let Some(reason) = metric_refusal(cfg.metric, false, train.is_multi(), !train.w.is_empty()) {
-                return Some(reason);
-            }
-            if train.len() < 2 {
-                return Some(format!("--selection lexicase needs at least 2 training rows, found {}", train.len()));
-            }
-            train.len().min(cfg.lexicase_cases)
-        }
+        None => train.len().min(cfg.lexicase_cases),
     };
     if pop.saturating_mul(cases) > MAX_MATRIX_CELLS {
         return Some(format!(
@@ -561,6 +577,11 @@ mod tests {
         assert!(refusal(&one, &train).unwrap().contains("--lexicase-cases must be 2 to 4096"));
         let wide = Config { pop: 1 << 16, lexicase_cases: 4096, ..lex.clone() };
         assert_eq!(refusal(&wide, &sample(5000)).map(|r| r.contains("cell limit")), Some(true));
+        // The matrix limit admits exactly 2^24 cells.
+        let at = Config { pop: 1 << 16, ..lex.clone() };
+        assert_eq!(limit_refusal(&at, &sample(400)), None);
+        assert!(limit_refusal(&Config { pop: (1 << 16) + 1, ..at.clone() }, &sample(400)).is_some());
+        assert_eq!(limit_refusal(&Config { selection: Selection::Lexicographic, ..wide.clone() }, &sample(5000)), None);
         let mut weighted = train.clone();
         weighted.w = vec![1.0; weighted.len()];
         assert!(refusal(&lex, &weighted).unwrap().contains("unweighted rows"));

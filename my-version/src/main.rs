@@ -6045,6 +6045,11 @@ fn main() {
     if fitness_pnl && prepared.book.is_some() {
         cfg.fit_view = Some(std::sync::Arc::new(prepared.train.clone()));
     }
+    // #1023: the lexicase cost limits read the flags and the data shape only.
+    if let Some(reason) = search::lexicase_limit_refusal(&cfg, search_train) {
+        eprintln!("error: {}", reason);
+        std::process::exit(EXIT_USAGE);
+    }
 
     // #25: resolve --units names against the prepared input list. A lagged
     // copy (`x_lag1`) inherits the unit declared for its source (`x`); every

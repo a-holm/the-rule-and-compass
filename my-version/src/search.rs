@@ -816,7 +816,7 @@ mod fit_route; // #1091: the fit route of both device fit schedules
 mod fit_accept; // #1117: the fit-accept decision counts
 pub use fit_accept::{FitAcceptCounts, FitAcceptReport, FitPath};
 mod lexicase; // #1023: epsilon-lexicase parent selection
-pub use lexicase::{metric_refusal as lexicase_metric_refusal, DEFAULT_LEXICASE_CASES, MAX_LEXICASE_CASES};
+pub use lexicase::{limit_refusal as lexicase_limit_refusal, metric_refusal as lexicase_metric_refusal, DEFAULT_LEXICASE_CASES, MAX_LEXICASE_CASES};
 use fit_route::{accept_fit, unfitted_wins};
 #[cfg(feature = "cuda")]
 use fit_route::{DeviceArm, ExactFits, FitRoute, FitSettings, Rotation, RouteCounts};
