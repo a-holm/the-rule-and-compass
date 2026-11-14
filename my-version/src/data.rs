@@ -2038,20 +2038,22 @@ pub struct Filter {
     pub expression: String,
 }
 
+/// Distinct `Input` indices of a row expression, in order of first use.
+fn filter_inputs(node: &Node, out: &mut Vec<usize>) {
+    if node.op == crate::expr::Op::Input && !out.contains(&(node.val as usize)) {
+        out.push(node.val as usize);
+    }
+    for k in &node.kids {
+        filter_inputs(k, out);
+    }
+}
+
 /// Store columns a row expression reads, in order of first use. `Err` carries
 /// the parse error when the expression does not parse against `names`.
 pub fn row_expr_columns(src: &str, names: &[String]) -> Result<Vec<String>, String> {
-    fn walk(node: &Node, out: &mut Vec<usize>) {
-        if node.op == crate::expr::Op::Input && !out.contains(&(node.val as usize)) {
-            out.push(node.val as usize);
-        }
-        for k in &node.kids {
-            walk(k, out);
-        }
-    }
     let tree = crate::expr::parse(src, names).map_err(|e| e.to_string())?;
     let mut idx = Vec::new();
-    walk(&tree, &mut idx);
+    filter_inputs(&tree, &mut idx);
     Ok(idx.into_iter().map(|i| names[i].clone()).collect())
 }
 
@@ -2706,6 +2708,54 @@ pub fn prepare_full_targets_weighted_with_indices(
     prepare_full_targets_weighted_inner(t, vars, targets, weight, spec, rng, prep, true)
 }
 
+// #1074: test-only count of cells a row expression reads.
+#[cfg(test)]
+thread_local! {
+    static FILTER_CELL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A row expression bound to the columns it reads.
+struct RowFilter<'a> {
+    tree: &'a Node,
+    /// (position in `Filter::vars`, column values) of every input the tree names.
+    inputs: Vec<(usize, &'a [f64])>,
+    /// One slot per `Filter::vars` entry; only the `inputs` positions are written.
+    vals: Vec<f64>,
+}
+
+impl<'a> RowFilter<'a> {
+    fn new(f: &'a Filter, t: &'a Table) -> Result<Self, String> {
+        let cols: Vec<usize> = f
+            .vars
+            .iter()
+            .map(|v| t.index_of(v))
+            .collect::<Result<_, _>>()?;
+        let mut used = Vec::new();
+        filter_inputs(&f.tree, &mut used);
+        used = (0..cols.len()).collect();
+        let inputs = used
+            .into_iter()
+            .filter(|&p| p < cols.len())
+            .map(|p| (p, t.col(cols[p])))
+            .collect();
+        Ok(RowFilter {
+            tree: &f.tree,
+            inputs,
+            vals: vec![0.0; f.vars.len()],
+        })
+    }
+
+    #[inline]
+    fn holds(&mut self, r: usize) -> bool {
+        for &(p, col) in &self.inputs {
+            self.vals[p] = col.get(r).copied().unwrap_or(f64::NAN);
+        }
+        #[cfg(test)]
+        FILTER_CELL_READS.with(|n| n.set(n.get() + self.inputs.len()));
+        expr::eval(self.tree, &self.vals) > 0.0
+    }
+}
+
 /// The rows that survive `--exclude` and then `--filter`: the population every
 /// split and every cross-validation fold is drawn from.
 pub fn population_mask(t: &Table, spec: &SplitSpec, prep: &PrepSpec) -> Result<Vec<bool>, String> {
@@ -2720,14 +2770,9 @@ fn population_mask_counted(
     let mut excluded_count = 0usize;
     let mut keep_row = vec![true; t.len()];
     if let Some(x) = &spec.exclude {
-        let cols: Vec<usize> = x
-            .vars
-            .iter()
-            .map(|v| t.index_of(v))
-            .collect::<Result<_, _>>()?;
+        let mut rf = RowFilter::new(x, t)?;
         for r in 0..t.len() {
-            let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
-            if expr::eval(&x.tree, &vals) > 0.0 {
+            if rf.holds(r) {
                 excluded_count += 1;
                 keep_row[r] = false;
             }
@@ -2738,17 +2783,12 @@ fn population_mask_counted(
     }
     let mut filtered_count = 0usize;
     if let Some(f) = &prep.filter {
-        let cols: Vec<usize> = f
-            .vars
-            .iter()
-            .map(|v| t.index_of(v))
-            .collect::<Result<_, _>>()?;
+        let mut rf = RowFilter::new(f, t)?;
         for r in 0..t.len() {
             if !keep_row[r] {
                 continue;
             }
-            let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
-            let kept = expr::eval(&f.tree, &vals) > 0.0;
+            let kept = rf.holds(r);
             if !kept {
                 keep_row[r] = false;
                 filtered_count += 1;
@@ -4174,17 +4214,8 @@ fn build_split(
     // positional modes rather than competing with them.
     if spec.train_select.is_some() || spec.test_select.is_some() {
         let evaluate = |f: &Filter, t: &Table| -> Result<Vec<bool>, String> {
-            let cols: Vec<usize> = f
-                .vars
-                .iter()
-                .map(|v| t.index_of(v))
-                .collect::<Result<_, _>>()?;
-            Ok((0..n)
-                .map(|r| {
-                    let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
-                    expr::eval(&f.tree, &vals) > 0.0
-                })
-                .collect())
+            let mut rf = RowFilter::new(f, t)?;
+            Ok((0..n).map(|r| rf.holds(r)).collect())
         };
         let tr_mask = spec
             .train_select
@@ -6201,5 +6232,162 @@ mod tests {
         };
         assert!(slice.check_finite_returns(&[1.0, f64::NAN, 1.0, 1.0]).unwrap_err().starts_with("1 "));
         assert!(slice.check_finite_returns(&[1.0, f64::NAN, f64::NAN, 1.0]).is_ok());
+    }
+
+    fn filter_over(t: &Table, src: &str, names: &[String]) -> Filter {
+        Filter {
+            tree: expr::parse(src, names).unwrap(),
+            vars: names.to_vec(),
+            expression: src.to_string(),
+        }
+    }
+
+    /// The per-row copy of every `Filter::vars` column.
+    fn full_row_holds(f: &Filter, t: &Table, r: usize) -> bool {
+        let vals: Vec<f64> = f
+            .vars
+            .iter()
+            .map(|v| t.value(r, t.index_of(v).unwrap()))
+            .collect();
+        expr::eval(&f.tree, &vals) > 0.0
+    }
+
+    #[test]
+    fn row_filter_reads_only_the_named_columns() {
+        let names: Vec<String> = (0..12).map(|j| format!("c{j}")).collect();
+        let mut csv = names.join(",");
+        csv.push_str(",y\n");
+        for r in 0..1000usize {
+            for j in 0..12usize {
+                csv.push_str(&format!("{},", ((r * (j + 3) + j) % 11) as f64 - 4.0));
+            }
+            csv.push_str(&format!("{}\n", r as f64 * 0.5));
+        }
+        let t = table(&csv);
+        let kept = (0..1000).filter(|&r| t.value(r, 3) <= 0.0).count();
+        assert!(kept > 0 && kept < 1000);
+        let spec = SplitSpec {
+            exclude: Some(filter_over(&t, "c3 > 0", &names)),
+            train_select: Some(filter_over(&t, "c0 < 5 and c7 > 1", &names)),
+            test_select: Some(filter_over(&t, "c0 >= 5", &names)),
+            ..Default::default()
+        };
+        FILTER_CELL_READS.with(|n| n.set(0));
+        prepare_full_targets_weighted_with(
+            &t,
+            &names,
+            &["y"],
+            None,
+            &spec,
+            &mut Mt::new(1),
+            &PrepSpec::default(),
+        )
+        .unwrap();
+        let reads = FILTER_CELL_READS.with(|n| n.get());
+        assert_eq!(reads, 1000 + kept * 2 + kept);
+        assert!(reads < 12 * (1000 + 2 * kept) / 4);
+    }
+
+    #[test]
+    fn row_filter_constant_and_repeated_inputs() {
+        let t = table("a,b\n1,2\n3,4\n5,6\n");
+        let names = vec!["a".to_string(), "b".to_string()];
+        FILTER_CELL_READS.with(|n| n.set(0));
+        let f = filter_over(&t, "1", &names);
+        let mut rf = RowFilter::new(&f, &t).unwrap();
+        assert!((0..3).all(|r| rf.holds(r)));
+        assert_eq!(FILTER_CELL_READS.with(|n| n.get()), 0);
+        let f = filter_over(&t, "a + a > 2 and a < 5", &names);
+        let mut rf = RowFilter::new(&f, &t).unwrap();
+        let got: Vec<bool> = (0..3).map(|r| rf.holds(r)).collect();
+        assert_eq!(got, vec![false, true, false]);
+        assert_eq!(FILTER_CELL_READS.with(|n| n.get()), 3);
+        let missing = Filter {
+            vars: vec!["a".to_string(), "nope".to_string()],
+            ..filter_over(&t, "a > 0", &names)
+        };
+        assert!(RowFilter::new(&missing, &t).is_err());
+    }
+
+    #[test]
+    fn row_filter_matches_the_full_row_evaluation() {
+        // Unused-looking columns carry garbage; `sin` and `abs` collide with
+        // function names; `label` is a text column.
+        let mut csv = String::from("a,b,sin,abs,garbage,label,c\n");
+        let cells = [
+            "NaN", "inf", "-inf", "0", "1", "-2.5", "3", "1e300", "7", "-7", "0.5", "NA",
+        ];
+        for r in 0..200usize {
+            let pick = |k: usize| cells[(r * k + k * k) % cells.len()];
+            csv.push_str(&format!(
+                "{},{},{},{},{},w{},{}\n",
+                pick(3),
+                pick(5),
+                pick(7),
+                pick(11),
+                pick(13),
+                r % 4,
+                r as f64 - 90.0
+            ));
+        }
+        let t = table(&csv);
+        assert!(t.numeric[0] && t.numeric[1] && t.numeric[2] && t.numeric[3] && t.numeric[4]);
+        assert!(!t.numeric[5]);
+        let names: Vec<String> = ["a", "b", "sin", "abs", "garbage", "label", "c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Two names beyond `Filter::vars` exercise the out-of-range input.
+        let mut parse_names = names.clone();
+        parse_names.push("x7".to_string());
+        parse_names.push("x8".to_string());
+        let atoms = [
+            "a", "b", "sin", "abs", "c", "label", "x7", "x8", "0", "1", "2.5", "sin(a)",
+            "abs(c)", "min(a, b)",
+        ];
+        let cmps = ["<", ">", "<=", ">=", "==", "!="];
+        let mut rng = Mt::new(1074);
+        let mut checked = 0usize;
+        let mut rf_reads = 0usize;
+        for _ in 0..300 {
+            let mut parts = Vec::new();
+            for _ in 0..(1 + rng.usize_below(3)) {
+                let l = atoms[rng.usize_below(atoms.len())];
+                let r = atoms[rng.usize_below(atoms.len())];
+                let c = cmps[rng.usize_below(cmps.len())];
+                let arith = ["+", "-", "*"][rng.usize_below(3)];
+                let s = if rng.bool(0.5) {
+                    format!("({l} {arith} {r}) {c} 1")
+                } else {
+                    format!("{l} {c} {r}")
+                };
+                parts.push(if rng.bool(0.3) { format!("not ({s})") } else { s });
+            }
+            let joined = parts.join(if rng.bool(0.5) { " and " } else { " or " });
+            let Ok(tree) = expr::parse(&joined, &parse_names) else {
+                continue;
+            };
+            let f = Filter {
+                tree,
+                vars: names.clone(),
+                expression: joined.clone(),
+            };
+            let mut rf = RowFilter::new(&f, &t).unwrap();
+            for r in 0..t.len() {
+                assert_eq!(rf.holds(r), full_row_holds(&f, &t, r), "{joined} row {r}");
+            }
+            rf_reads += rf.inputs.len();
+            checked += 1;
+        }
+        assert!(checked >= 200, "only {checked} expressions parsed");
+        assert!(rf_reads > 0);
+        // Zero-column, one-column and many-column expressions are all present.
+        for src in ["1 > 0", "garbage > 0", "a < b and sin > abs or c > 0"] {
+            let f = filter_over(&t, src, &names);
+            let mut rf = RowFilter::new(&f, &t).unwrap();
+            for r in 0..t.len() {
+                assert_eq!(rf.holds(r), full_row_holds(&f, &t, r), "{src} row {r}");
+            }
+        }
     }
 }
