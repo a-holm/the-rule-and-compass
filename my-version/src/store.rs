@@ -3110,4 +3110,11 @@ mod tests {
         assert!(!std::path::Path::new(&out).exists());
         assert!(!std::path::Path::new(&format!("{}.tmp-{}", out, std::process::id())).exists());
     }
+
+    #[test]
+    fn append_batch_override_is_clamped_to_the_budget() {
+        assert_eq!(parse_append_batch(Some("16"), 65_536, 292, 427), 4);
+        assert_eq!(parse_append_batch(Some("292"), 65_536, 292, 427), 4);
+        assert_eq!(parse_append_batch(None, 65_536, 292, 427), 4);
+    }
 }
