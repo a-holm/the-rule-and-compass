@@ -1539,3 +1539,104 @@ fn band_sd_robust_selection_uses_member_bands() {
         num(&j, &["objective", "spec", "band_resolved"]).to_bits()
     );
 }
+
+// ---- #1084: book-space QD descriptor ----
+
+const BOOK_QD: [&str; 5] = ["--fitness", "pnl", "--qd-policy", "--qd-descriptor", "book"];
+
+fn front_key(j: &Json) -> Vec<(String, u64)> {
+    pareto(j)
+        .iter()
+        .map(|m| (at(m, &["expression"]).as_str().unwrap().to_string(), num(m, &["fitness", "train_regret"]).to_bits()))
+        .collect()
+}
+
+#[test]
+fn qd_book_descriptor_cpu_run_reports_book_without_fallbacks() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let book = json(&run(&data, &spec, &BOOK_QD));
+    let q = at(&book, &["qd"]);
+    assert_eq!(q.get("descriptor").and_then(Json::as_str), Some("book"));
+    assert_eq!(num(q, &["descriptor_fallbacks"]), 0.0);
+    assert!(num(q, &["occupied"]) > 1.0, "{q:?}");
+    assert_eq!(num(q, &["reachable"]), num(q, &["cells"]));
+    let moments = json(&run(&data, &spec, &["--fitness", "pnl", "--qd-policy"]));
+    assert!(at(&moments, &["qd"]).get("descriptor").is_none(), "the moments report keeps its keys");
+    assert_ne!(at(&moments, &["qd"]), q, "the two kinds key the archive differently");
+}
+
+#[test]
+fn qd_book_descriptor_is_deterministic_and_thread_independent() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let with = |threads: &str| {
+        let mut args = BOOK_QD.to_vec();
+        args.extend(["--threads", threads]);
+        json(&run(&data, &spec, &args))
+    };
+    let (one, again, four) = (with("1"), with("1"), with("4"));
+    for other in [&again, &four] {
+        assert_eq!(at(&one, &["qd"]), at(other, &["qd"]));
+        assert_eq!(front_key(&one), front_key(other));
+        assert_eq!(
+            num(&one, &["search", "candidates_evaluated"]),
+            num(other, &["search", "candidates_evaluated"])
+        );
+    }
+}
+
+#[test]
+fn a_passive_book_descriptor_keeps_the_front() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let plain = json(&run(&data, &spec, &["--fitness", "pnl"]));
+    let passive = json(&run(&data, &spec, &["--fitness", "pnl", "--qd", "--qd-descriptor", "book"]));
+    assert_eq!(front_key(&plain), front_key(&passive));
+    assert_eq!(at(&passive, &["qd", "descriptor"]).as_str(), Some("book"));
+    assert_eq!(num(&passive, &["qd", "descriptor_fallbacks"]), 0.0);
+}
+
+#[test]
+fn qd_book_descriptor_refusals_name_their_reason() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    usage_error(&run(&data, &spec, &["--qd", "--qd-descriptor", "book"]), "--qd-descriptor book needs --fitness pnl");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--qd-descriptor", "book"]), "--qd-descriptor book needs a QD archive");
+    usage_error(
+        &run(&data, &spec, &["--fitness", "pnl", "--qd", "--qd-descriptor", "usage"]),
+        "--qd-descriptor must be moments or book",
+    );
+}
+
+#[test]
+fn qd_book_descriptor_is_saved_and_resumes() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let cp = dir.join("book.rcsr").to_string_lossy().into_owned();
+    let passive = ["--fitness", "pnl", "--qd", "--qd-descriptor", "book"];
+    let mut first = passive.to_vec();
+    first.extend(["--generations", "10", "--save", &cp]);
+    let saved = run(&data, &spec, &first);
+    assert_eq!(code(&saved), 0, "{}", stderr(&saved));
+    assert!(std::fs::read_to_string(&cp).unwrap().contains("\nconfig qd_descriptor book\n"));
+
+    let straight = json(&run(&data, &spec, &passive));
+    let resumed = json(&run(&data, &spec, &["--fitness", "pnl", "--resume", &cp]));
+    assert_eq!(at(&resumed, &["qd", "descriptor"]).as_str(), Some("book"));
+    assert_eq!(front_key(&straight), front_key(&resumed));
+    usage_error(
+        &run(&data, &spec, &["--fitness", "pnl", "--resume", &cp, "--qd-descriptor", "moments"]),
+        "--qd-descriptor moments (saved qd_descriptor is book)",
+    );
+
+    let moments_cp = dir.join("moments.rcsr").to_string_lossy().into_owned();
+    let m = run(&data, &spec, &["--fitness", "pnl", "--qd", "--generations", "2", "--save", &moments_cp]);
+    assert_eq!(code(&m), 0, "{}", stderr(&m));
+    assert!(!std::fs::read_to_string(&moments_cp).unwrap().contains("qd_descriptor"));
+}

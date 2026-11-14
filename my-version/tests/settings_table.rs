@@ -43,6 +43,7 @@ fn sample(row: &dyn Setting) -> Option<&'static str> {
         "--crossover-internal" => "0.25",
         "--variation" => "node",
         "--fit-accept" => "fitness",
+        "--qd-descriptor" => "book",
         other => panic!("no sample value for {other}: add one to tests/settings_table.rs"),
     })
 }
@@ -214,6 +215,7 @@ fn resume_conflict_lines_are_pinned() {
         .args(["--adaptive-mix", "--reject-constant-offspring", "--reject-fixed-position", "--fit-thresholds"])
         .args(["--variation", "node"])
         .args(["--fit-accept", "fitness"])
+        .args(["--qd-descriptor", "book"])
         .output()
         .expect("run the resume");
     assert_eq!(resumed.status.code(), Some(2), "{}", String::from_utf8_lossy(&resumed.stderr));
@@ -235,6 +237,7 @@ fn resume_conflict_lines_are_pinned() {
             "--fit-thresholds (saved fit_thresholds is false)",
             "--fit-accept fitness (saved fit_accept is always)",
             "--variation node (saved variation is auto)",
+            "--qd-descriptor book (saved qd_descriptor is moments)",
         ],
         "{err}"
     );

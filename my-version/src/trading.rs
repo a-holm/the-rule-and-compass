@@ -1376,6 +1376,41 @@ pub struct FitnessTotals {
     pub nonfinite: bool,
 }
 
+/// #1084: the counts of one long/flat book that the book descriptor of the
+/// quality-diversity archive reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BookShape {
+    pub rows: u64,
+    pub long_rows: u64,
+    /// Round trips: every run of the book starts flat, so each entry is closed
+    /// by one flip or by the exit at the run's last row, and
+    /// `flips + exits = 2 * entries`.
+    pub entries: u64,
+}
+
+impl BookShape {
+    /// The shape of a book of `rows` rows from its totals (one per time block).
+    pub fn of(rows: usize, totals: &[FitnessTotals]) -> BookShape {
+        let long_rows = totals.iter().map(|t| t.long_rows).sum();
+        let turns: u64 = totals.iter().map(|t| t.flips + t.exits).sum();
+        BookShape { rows: rows as u64, long_rows, entries: turns / 2 }
+    }
+
+    /// Long rows over rows; 0 for an empty book.
+    pub fn exposure(&self) -> f64 {
+        if self.rows == 0 {
+            0.0
+        } else {
+            self.long_rows as f64 / self.rows as f64
+        }
+    }
+
+    /// Long rows per entry: `long_rows / max(1, entries)`; 0 for a flat book.
+    pub fn mean_holding(&self) -> f64 {
+        self.long_rows as f64 / self.entries.max(1) as f64
+    }
+}
+
 /// Exact CPU `f64` long/flat net regret on the canonical training rows.
 ///
 /// `regret = (B - net) / B`, with `net` the excess net over cash and `B` the
@@ -1695,10 +1730,18 @@ impl FitnessBook {
     }
 
     pub fn regret(&self, pred: &[f64]) -> f64 {
+        self.regret_and_shape(pred).0
+    }
+
+    /// #1084: [`FitnessBook::regret`] and the [`BookShape`] of the same
+    /// reduction, so the shape follows the position rule the regret prices.
+    pub fn regret_and_shape(&self, pred: &[f64]) -> (f64, BookShape) {
         if self.blocks() == 1 {
-            self.regret_of(&self.totals(pred))
+            let t = self.totals(pred);
+            (self.regret_of(&t), BookShape::default()) // WIP stub
         } else {
-            self.fitness_of(&self.block_totals(pred))
+            let t = self.block_totals(pred);
+            (self.fitness_of(&t), BookShape::default()) // WIP stub
         }
     }
 
@@ -2299,6 +2342,47 @@ mod block_tests {
         assert!((fit - (mean + lambda * sd)).abs() <= 1e-12, "{fit} vs {}", mean + lambda * sd);
         let flat = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 0.0).unwrap();
         assert!((flat.regret(&p) - mean).abs() <= 1e-12);
+    }
+
+    /// `F` flat, `L` long; one character per row.
+    fn positions(rows: &str) -> Vec<f64> {
+        rows.chars().map(|c| if c == 'L' { 1.0 } else { -1.0 }).collect()
+    }
+
+    /// #1084: the shape counts long rows and round trips of the book the
+    /// regret prices, from the same reduction, for the plain rule, block seams
+    /// and the minimum-hold automaton.
+    #[test]
+    fn regret_and_shape_reads_the_book_the_regret_prices() {
+        let mut s = panel(&[10, 10]);
+        s.ret.iter_mut().for_each(|r| *r = 0.01);
+        // Group 0: two round trips closed by flips; group 1: one closed by a
+        // flip, one by the exit at the group's last row.
+        let p = positions("FLLLFFLLFFLLFFFFFLLL");
+        let plain = FitnessBook::new(&s, &spec(), 900.0).unwrap();
+        let (r, shape) = plain.regret_and_shape(&p);
+        assert_eq!(r.to_bits(), plain.regret_of(&plain.totals(&p)).to_bits());
+        assert_eq!(shape, BookShape { rows: 20, long_rows: 10, entries: 4 });
+        assert_eq!((shape.exposure(), shape.mean_holding()), (0.5, 2.5));
+        // A position held across the block seam is two round trips, as the
+        // blocked regret charges it.
+        let seam = positions("FFFLLLLFFFFFFFFFFFFF");
+        assert_eq!(plain.regret_and_shape(&seam).1, BookShape { rows: 20, long_rows: 4, entries: 1 });
+        let blocked = FitnessBook::with_blocks(&s, &spec(), 900.0, 2, 1.0).unwrap();
+        let (r, shape) = blocked.regret_and_shape(&seam);
+        assert_eq!(r.to_bits(), blocked.fitness_of(&blocked.block_totals(&seam)).to_bits());
+        assert_eq!(shape, BookShape { rows: 20, long_rows: 4, entries: 2 });
+        // A minimum hold of 3 keeps a one-row signal long for three rows; the
+        // last group ends long after two rows.
+        let short = positions("FLFFFFFFFFFFFFFFFFLF");
+        assert_eq!(plain.regret_and_shape(&short).1, BookShape { rows: 20, long_rows: 2, entries: 2 });
+        let held = FitnessBook::new(&s, &TradingSpec { min_holding: 3, ..spec() }, 900.0).unwrap();
+        let (r, shape) = held.regret_and_shape(&short);
+        assert_eq!(r.to_bits(), held.regret_of(&held.totals(&short)).to_bits());
+        assert_eq!(shape, BookShape { rows: 20, long_rows: 5, entries: 2 });
+        // A flat book has no entry and no holding.
+        let flat = plain.regret_and_shape(&positions(&"F".repeat(20))).1;
+        assert_eq!((flat.long_rows, flat.entries, flat.mean_holding()), (0, 0, 0.0));
     }
 
     #[test]
