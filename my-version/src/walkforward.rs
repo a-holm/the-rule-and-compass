@@ -1302,7 +1302,7 @@ fn group_key(v: f64) -> u64 {
     if v.is_nan() {
         u64::MAX
     } else {
-        v.to_bits()
+        (v + 0.0).to_bits()
     }
 }
 
@@ -1318,6 +1318,10 @@ fn label_group_id(text: &str) -> u64 {
 }
 
 fn table_group_ids(table: &Table, col: usize) -> Vec<u64> {
+    // A numeric key is its value on both readers; the dictionary only keeps its source text.
+    if table.numeric[col] {
+        return table.col(col).iter().map(|&v| group_key(v)).collect();
+    }
     if let Some(dict) = table.dict(col) {
         let ids: Vec<u64> = dict.levels.iter().map(|l| label_group_id(l)).collect();
         let missing = label_group_id("");

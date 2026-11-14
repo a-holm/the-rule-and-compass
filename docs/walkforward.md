@@ -472,6 +472,10 @@ for every group. Its shuffle is a Fisher-Yates driven by a counter-based RNG,
 `draw(seed, group, stream, index)`, so a group's result does not depend on the
 other groups. `--control-seed <n>` (default 0) is recorded as `controls.seed`;
 the same seed gives the same report.
+The `group` of the draw is the group id: the hash of the label for a text
+`--group-by` column, the value for a numeric one (`-0` and `0` are one group, NaN
+is one group). A CSV and a `.rcsb` store of the same rows give the same ids and
+the same controls, whether or not a dictionary is kept for the column.
 
 Beside each control: `exposure`, `turnover` (`sum |position change|`), `beta`
 (on the buy-and-hold period series, from the #307 beta/alpha monoid),
