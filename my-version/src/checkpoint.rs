@@ -2010,6 +2010,7 @@ fn write_config(cfg: &Config, out: &mut String) {
         writeln!(out, "config qd_policy {}", cfg.qd_policy).unwrap();
         writeln!(out, "config qd_control {}", cfg.qd_control).unwrap();
     }
+    crate::settings::write(crate::settings::Group::Qd, cfg, out); // #1084
 }
 
 #[cfg(test)]

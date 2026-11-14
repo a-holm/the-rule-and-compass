@@ -608,6 +608,32 @@ fn synchronous_device_fit_archives_device_long_pnl_scores() {
     assert_archived_values_are_device_scores(&sample, &b, &seen);
 }
 
+/// #1084: a device-scored generation carries no book descriptor; the archive
+/// takes it from one CPU evaluation of the same book and counts it.
+#[test]
+fn device_scored_members_get_the_cpu_book_descriptor() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let (sample, b) = search_fixture();
+    let seen: Archived = Arc::default();
+    let cfg = Config {
+        qd_bins: 64,
+        qd_cvt: true,
+        qd_policy: true,
+        qd_descriptor: rcsr::qd::DescriptorKind::Book,
+        ..config(&b, &seen)
+    };
+    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let out = search::run(&cfg, &sample, &sample);
+    assert_device_scored(&out);
+    let qd = out.qd.as_ref().expect("the QD report");
+    assert_eq!(qd.descriptor, "book");
+    assert!(qd.occupied > 0 && qd.descriptor_fallbacks > 0, "{qd:?}");
+    assert_archived_values_are_device_scores(&sample, &b, &seen);
+}
+
 #[test]
 fn a_refused_book_allocation_falls_back_to_the_cpu_scorer() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());

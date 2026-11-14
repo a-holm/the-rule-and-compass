@@ -199,6 +199,17 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   every member of every island each generation, so the report, patience and
   the restart rules read it unchanged. `--qd-policy` is refused with `island`:
   its QD archive is one parent pool for every island.
+- **QD descriptor** (`--qd-descriptor moments|book`, #1084, default
+  `moments`). The quality-diversity archive (`--qd`, `--qd-policy`, #120) keys
+  its cells by two behaviour axes. `moments` reads variable usage and
+  prediction skewness. Under `--fitness pnl` those axes do not separate the
+  books the fitness separates, so `book` reads the long/flat book of the
+  fitness from the reduction that gives the regret: the log exposure (long rows
+  over rows) and the log mean holding length (long rows per round trip), each
+  mapped from fixed bounds (`1e-4` to 1, 1 to `1e4` rows) onto `[0, 1]`. A cell
+  then means "trades rarely, holds long" against "trades often, holds short".
+  The parent draws, migration victims and restart aims of `--qd-policy` follow
+  those cells. Details in `docs/qd.md`.
 - Termination is by generation count or a time/effort budget.
 
 ## 7. Simplification and presentation

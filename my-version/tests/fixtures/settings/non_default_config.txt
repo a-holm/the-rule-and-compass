@@ -37,4 +37,5 @@ config reject_constant_offspring true
 config reject_fixed_position true
 config fit_thresholds true
 config fit_accept fitness
-config_hash 5e33d009349363d6
+config qd_descriptor book
+config_hash aeb55c338b053b3f

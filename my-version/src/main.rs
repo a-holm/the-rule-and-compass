@@ -216,6 +216,7 @@ fn usage() -> String {
     let help_engine = settings::help(Group::Engine);
     let help_dedup = settings::help(Group::Dedup);
     let help_front_parents = settings::help(Group::FrontParents);
+    let help_qd = settings::help(Group::Qd);
     format!(
         "rcsr {VERSION} — symbolic regression (rule-and-compass)
 
@@ -1088,6 +1089,7 @@ SEARCH:
                              uniformly instead of the UCB1 mix
   --qd-random                control: hash descriptors to random cells, so the
                              partition carries no behaviour information
+{help_qd}
   --threads <N>              worker threads for constant fitting and scoring of
                              offspring, inside each island (default: the CPU
                              cores available to the process; 1 = serial). The
@@ -2094,13 +2096,24 @@ fn eprint_run_summary(
     }
 }
 
+/// #1084: `note` under the book descriptor, nothing under the moments pair, so
+/// a moments run keeps its report bytes.
+fn qd_descriptor_note(q: &qd::QdReport, note: &'static str) -> &'static str {
+    if q.descriptor == rcsr::qd::DescriptorKind::Book.as_str() {
+        note
+    } else {
+        ""
+    }
+}
+
 /// #120: QD coverage in the human-readable log.
 fn qd_text(q: Option<&qd::QdReport>) {
     if let Some(q) = q {
         eprintln!(
-            "# qd ({}): {}/{} reachable cells occupied ({:.1}%), {} entries, best error {}, \
+            "# qd ({}{}): {}/{} reachable cells occupied ({:.1}%), {} entries, best error {}, \
              entropy {:.3}/{:.3} bits, qd-score {:.4}, descriptor fallbacks {}, hypervolume {:.4} (self-normalised diagnostic)",
             q.mode,
+            qd_descriptor_note(q, ", book descriptor"),
             q.occupied_reachable,
             q.reachable,
             100.0 * q.reachable_coverage,
@@ -2120,8 +2133,9 @@ fn qd_json(q: Option<&qd::QdReport>) -> String {
     match q {
         None => "null".to_string(),
         Some(q) => format!(
-            "{{\"mode\":\"{}\",\"bins\":{},\"cells\":{},\"reachable\":{},\"occupied\":{},\"occupied_reachable\":{},\"coverage\":{},\"reachable_coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{},\"occupancy_entropy\":{},\"occupancy_entropy_normalized\":{},\"qd_score\":{},\"descriptor_fallbacks\":{},\"hypervolume\":{},\"evaluations\":{}}}",
+            "{{\"mode\":\"{}\"{},\"bins\":{},\"cells\":{},\"reachable\":{},\"occupied\":{},\"occupied_reachable\":{},\"coverage\":{},\"reachable_coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{},\"occupancy_entropy\":{},\"occupancy_entropy_normalized\":{},\"qd_score\":{},\"descriptor_fallbacks\":{},\"hypervolume\":{},\"evaluations\":{}}}",
             q.mode,
+            qd_descriptor_note(q, ",\"descriptor\":\"book\""),
             q.bins,
             q.cells,
             q.reachable,
@@ -4081,6 +4095,7 @@ fn main() {
         settings::conflicts(Group::Fit, &cfg, &saved, &explicit, &mut conflicts);
         settings::conflicts(Group::Engine, &cfg, &saved, &explicit, &mut conflicts); // #1087
         qd_conflicts(&qd_flags, &saved, &mut conflicts);
+        settings::conflicts(Group::Qd, &cfg, &saved, &explicit, &mut conflicts); // #1084
         if require_dimensions && !saved.require_dimensions {
             conflicts.push(format!(
                 "--require-dimensions (saved require_dimensions is {})",
@@ -5485,6 +5500,15 @@ fn main() {
         }
         if null_runs > 0 {
             trading_usage("--fitness pnl is not supported with --null-runs/--null-block: the null shuffles the target, but the regret reads the book's returns, so every null run is the real run");
+        }
+    }
+    // #1084: the book descriptor reads the long/flat book of the search fitness.
+    if cfg.qd_descriptor == rcsr::qd::DescriptorKind::Book {
+        if !fitness_pnl {
+            trading_usage("--qd-descriptor book needs --fitness pnl: the book descriptor reads the long/flat fitness book");
+        }
+        if cfg.qd_bins == 0 {
+            trading_usage("--qd-descriptor book needs a QD archive: add --qd, --qd-cells or --qd-policy");
         }
     }
 
