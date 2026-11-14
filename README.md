@@ -1312,7 +1312,9 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   across arms. `--qd-policy` is the opt-in search change. Under `--fitness pnl`,
   `--qd-descriptor book` keys the archive by the log exposure and the log mean
   holding length of the long/flat book the fitness prices, from the same
-  reduction as the regret (#1084); `--json` `qd.descriptor` is then `book`. See
+  reduction as the regret (#1084); `--json` `qd.descriptor` is then `book`.
+  Under `--qd-policy` the archive is search state: `--save` writes it and
+  `--resume` restores it, so a resumed run equals the uninterrupted one (#1166). See
   [`docs/qd.md`](docs/qd.md);
 - **configurable complexity** (`--op-complexity`, `--complexity-weights`,
   `--depth-weight`): per-operator costs, variable/constant weights and a

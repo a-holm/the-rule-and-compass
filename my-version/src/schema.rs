@@ -164,7 +164,7 @@ pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--qd-cells", "int", "16", "descriptor cells: grid bins per axis or CVT K (2..=512; enables --qd)"),
         ("--qd-cell-cap", "int", "4", "maximum local Pareto front per descriptor cell"),
         ("--qd-cvt", "flag", "false", "use CVT-MAP-Elites (K centroids, deterministic Halton initialisation and Lloyd updates) instead of the grid"),
-        ("--qd-policy", "flag", "false", "feed the archive back into parent selection (UCB1 60/25/10/5), stratified migration and least-occupied restarts; implies --qd --qd-cvt"),
+        ("--qd-policy", "flag", "false", "feed the archive back into parent selection (UCB1 60/25/10/5), stratified migration and least-occupied restarts; implies --qd --qd-cvt. The archive is then search state: --save writes it and --resume restores it (#1166)"),
         ("--qd-uniform", "flag", "false", "control: select occupied QD cells uniformly instead of the UCB1 mix"),
         ("--qd-random", "flag", "false", "control: hash descriptors to random cells, removing behaviour information"),
         crate::settings::anchor(Group::Qd),
