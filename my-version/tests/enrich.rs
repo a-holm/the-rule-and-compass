@@ -631,6 +631,189 @@ fn shared_pass_cpu_estimate_does_not_grow_with_the_compact_column_count() {
     assert_eq!(cpu_ms(1), cpu_ms(50));
 }
 
+
+const C2_ROWS: usize = 19_097_916;
+const C2_SEGMENTS: usize = 630;
+
+fn count(op: OpClass, cols: usize, supported: usize, exact: usize) -> enrich::ClassCount {
+    enrich::ClassCount { op, cols, supported, exact }
+}
+
+fn plan_mix(
+    mix: &[(&'static str, Vec<enrich::ClassCount>)],
+    threads: usize,
+    n_segments: usize,
+    gpu: GpuMode,
+) -> Vec<enrich::GroupPlan> {
+    let mix: std::collections::BTreeMap<_, _> = mix.iter().cloned().collect();
+    enrich::plan_groups_mixed(
+        &mix,
+        C2_ROWS,
+        n_segments,
+        threads,
+        gpu,
+        true,
+        true,
+        &enrich::EnrichRates::anchors(),
+    )
+}
+
+#[test]
+fn compact_family_with_join_columns_is_priced_at_its_per_column_cost() {
+    let rates = enrich::EnrichRates::anchors();
+    let mrow = C2_ROWS as f64 / 1e6;
+    let join_ms = mrow * rates.class(OpClass::Join).cpu_col_ms;
+    let pass_ms = mrow * rates.class(OpClass::CompactPass).cpu_fixed_ms;
+    let mixed = vec![
+        count(OpClass::CompactPass, 4, 4, 4),
+        count(OpClass::Join, 30, 26, 26),
+    ];
+    let plan = plan_mix(&[("btc", mixed)], 1, C2_SEGMENTS, GpuMode::Off);
+    assert_eq!(plan[0].op, "compact-pass");
+    let want = pass_ms + 30.0 * join_ms;
+    assert!(
+        (plan[0].cpu_ms - want).abs() < 1e-6 * want,
+        "cpu_ms {} want {}",
+        plan[0].cpu_ms,
+        want
+    );
+    let compact_only = plan_mix(
+        &[("btc", vec![count(OpClass::CompactPass, 34, 34, 34)])],
+        1,
+        C2_SEGMENTS,
+        GpuMode::Off,
+    );
+    assert!((compact_only[0].cpu_ms - pass_ms).abs() < 1e-6 * pass_ms);
+}
+
+#[test]
+fn mixed_family_is_priced_by_its_name_classes() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    let seed = (
+        "seed",
+        vec![count(OpClass::Join, 5, 5, 5)],
+    );
+    for threads in [1usize, 4] {
+        let btc = vec![
+            count(OpClass::CompactPass, 4, 4, 4),
+            count(OpClass::Join, 30, 26, 26),
+            count(OpClass::Join, 6, 0, 0),
+        ];
+        let compact_only = vec![count(OpClass::CompactPass, 10, 10, 10)];
+        let plan = plan_mix(
+            &[seed.clone(), ("btc", btc), ("exotic", compact_only)],
+            threads,
+            C2_SEGMENTS,
+            GpuMode::Auto,
+        );
+        let by = |g: &str| plan.iter().find(|p| p.group == g).unwrap();
+        assert_eq!(by("seed").backend, "gpu", "{} workers", threads);
+        assert_eq!(by("btc").backend, "gpu", "{} workers", threads);
+        assert_eq!(by("btc").gpu_cols, 30, "{} workers", threads);
+        assert_eq!(by("exotic").backend, "cpu", "{} workers", threads);
+    }
+}
+
+#[test]
+fn join_columns_that_are_not_bit_identical_keep_their_backend() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    let seed = ("seed", vec![count(OpClass::Join, 5, 5, 5)]);
+    let btc = vec![
+        count(OpClass::CompactPass, 4, 4, 4),
+        count(OpClass::Join, 30, 26, 20),
+    ];
+    let plan = plan_mix(&[seed, ("btc", btc)], 1, C2_SEGMENTS, GpuMode::Auto);
+    let btc = plan.iter().find(|p| p.group == "btc").unwrap();
+    assert_eq!(btc.backend, "cpu");
+    assert_eq!(btc.gpu_cols, 0);
+    let mrow = C2_ROWS as f64 / 1e6;
+    let join_ms = mrow * enrich::EnrichRates::anchors().class(OpClass::Join).cpu_col_ms;
+    assert!(btc.cpu_ms > 30.0 * join_ms, "the estimate still prices the join columns");
+}
+
+#[test]
+fn cpu_estimate_divides_by_the_worker_count() {
+    let family = vec![("lags", vec![count(OpClass::Elementwise, 20, 20, 20)])];
+    let cpu_ms = |threads: usize, segments: usize| {
+        plan_mix(&family, threads, segments, GpuMode::Off)[0].cpu_ms
+    };
+    let one = cpu_ms(1, C2_SEGMENTS);
+    assert!(one > 0.0);
+    assert!((cpu_ms(4, C2_SEGMENTS) - one / 4.0).abs() < 1e-9 * one);
+    assert!((cpu_ms(4, 2) - one / 2.0).abs() < 1e-9 * one);
+    assert_eq!(cpu_ms(0, C2_SEGMENTS), one);
+}
+
+#[test]
+fn c2_names_price_the_btc_family_by_its_join_columns() {
+    let features = "all,py15m,ta:full,exotic:cheap,cross:btc,compact,mtf,cross,flow,price_action,trend";
+    let mut requested: Vec<String> = Vec::new();
+    for f in features.split(',') {
+        for n in enrich::expand(f).unwrap() {
+            if !requested.contains(&n) {
+                requested.push(n);
+            }
+        }
+    }
+    let flow_or_action = |n: &String| {
+        enrich::FLOW_NAMES.contains(&n.as_str()) || enrich::PRICE_ACTION_NAMES.contains(&n.as_str())
+    };
+    let compact: Vec<String> = requested
+        .iter()
+        .filter(|n| enrich::is_compact(n) && !flow_or_action(n))
+        .cloned()
+        .collect();
+    let py15m_all = enrich::py15m_names();
+    let py15m: Vec<String> = requested
+        .iter()
+        .filter(|n| py15m_all.contains(n) && !compact.contains(n) && !flow_or_action(n))
+        .cloned()
+        .collect();
+    let mix = enrich::class_mix(&requested, &compact, &py15m);
+    for (family, classes) in &mix {
+        let line: Vec<String> = classes
+            .iter()
+            .map(|c| format!("{} {}/{}/{}", c.op.name(), c.cols, c.supported, c.exact))
+            .collect();
+        eprintln!("[mix] {family}: {}", line.join(", "));
+    }
+    let btc = &mix["btc"];
+    let join_cols: usize = btc.iter().filter(|c| c.op == OpClass::Join).map(|c| c.cols).sum();
+    assert!(join_cols > 0, "the btc family holds join columns: {btc:?}");
+    assert!(btc.iter().any(|c| c.op == OpClass::CompactPass), "{btc:?}");
+
+    let rates = enrich::EnrichRates::anchors();
+    let mrow = C2_ROWS as f64 / 1e6;
+    let join_ms = mrow * rates.class(OpClass::Join).cpu_col_ms;
+    for threads in [1usize, 4] {
+        let plan = enrich::plan_groups_mixed(
+            &mix,
+            C2_ROWS,
+            C2_SEGMENTS,
+            threads,
+            GpuMode::Auto,
+            true,
+            true,
+            &rates,
+        );
+        let p = plan.iter().find(|p| p.group == "btc").unwrap();
+        assert!(
+            p.cpu_ms >= join_cols as f64 * join_ms / threads as f64,
+            "{threads} workers: cpu_ms {} for {join_cols} join columns",
+            p.cpu_ms
+        );
+        let supported_join: usize = btc.iter().filter(|c| c.op == OpClass::Join).map(|c| c.supported).sum();
+        let exact_join: usize = btc.iter().filter(|c| c.op == OpClass::Join).map(|c| c.exact).sum();
+        eprintln!(
+            "[mix] btc {threads} workers: backend {} cpu_ms {:.0} gpu_ms {:.0} join supported {supported_join} exact {exact_join}",
+            p.backend, p.cpu_ms, p.gpu_ms
+        );
+    }
+}
 #[test]
 fn output_stage_is_bounded_at_64_mib_for_any_column_count() {
     let wide = rcsr::memory::enrich_output_stage_bytes(16_000_000, 358);

@@ -2026,13 +2026,14 @@ impl Report {
             .iter()
             .map(|p| {
                 format!(
-                    "{{\"group\":{},\"rows\":{},\"columns\":{},\"gpu_columns\":{},\"cpu_columns\":{},\"op\":{},\"cpu_ms\":{:.3},\"gpu_ms\":{:.3},\"pass_shared\":{},\"pass_cpu_ms\":{:.3},\"benchmark_present\":{},\"backend\":{},\"reason\":{}}}",
+                    "{{\"group\":{},\"rows\":{},\"columns\":{},\"gpu_columns\":{},\"cpu_columns\":{},\"op\":{},\"classes\":{},\"cpu_ms\":{:.3},\"gpu_ms\":{:.3},\"pass_shared\":{},\"pass_cpu_ms\":{:.3},\"benchmark_present\":{},\"backend\":{},\"reason\":{}}}",
                     jstr(&p.group),
                     p.rows,
                     p.cols,
                     p.gpu_cols,
                     p.cpu_cols,
                     jstr(&p.op),
+                    classes_json(&p.classes),
                     p.cpu_ms,
                     p.gpu_ms,
                     p.pass_shared,
@@ -2393,6 +2394,8 @@ pub struct GroupPlan {
     /// Columns that stay on the CPU (unsupported names or a CPU dispatch).
     pub cpu_cols: usize,
     pub op: String,
+    /// The columns of the family by operation class, so a plan can be recomputed.
+    pub classes: Vec<ClassCount>,
     /// CPU estimate of this family with the whole run on the CPU: a shared pass
     /// is split equally among the families of its class, so the families sum to
     /// the run estimate.
@@ -3185,6 +3188,7 @@ pub fn plan_groups_full(
 /// One family's inputs to the dispatch decision. Seconds.
 struct FamilyCost {
     group: &'static str,
+    classes: Vec<ClassCount>,
     cols: usize,
     supported: usize,
     op: OpClass,
@@ -3222,15 +3226,87 @@ pub fn plan_groups_rated(
     benchmark_present: bool,
     rates: &EnrichRates,
 ) -> Vec<GroupPlan> {
+    let mix: BTreeMap<&'static str, Vec<ClassCount>> = counts
+        .iter()
+        .map(|(group, (cols, op))| {
+            let supported = (*gpu_cols.get(group).unwrap_or(&0)).min(*cols);
+            let one = ClassCount { op: *op, cols: *cols, supported, exact: supported };
+            (*group, vec![one])
+        })
+        .collect();
+    plan_groups_mixed(
+        &mix,
+        n_rows,
+        n_segments,
+        1,
+        gpu_requested,
+        gpu_available,
+        benchmark_present,
+        rates,
+    )
+}
+
+/// Columns of one family that share an operation class.
+///
+/// `supported` counts the columns with a device kernel. `exact` counts the
+/// supported columns whose declared parity tier is `bitwise`: a family moves
+/// by its mixed price only when every supported column is exact, so no
+/// column changes its bytes by changing backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClassCount {
+    pub op: OpClass,
+    pub cols: usize,
+    pub supported: usize,
+    pub exact: usize,
+}
+
+/// The `plan[].classes` sidecar value of one family.
+fn classes_json(classes: &[ClassCount]) -> String {
+    let items: Vec<String> = classes
+        .iter()
+        .map(|c| {
+            format!(
+                "{{\"op\":{},\"columns\":{},\"gpu_supported\":{},\"bit_identical\":{}}}",
+                jstr(c.op.name()),
+                c.cols,
+                c.supported,
+                c.exact
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// [`plan_groups_rated`] with the class of every column of a family and the
+/// number of CPU workers of the feature pass.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_groups_mixed(
+    mix: &BTreeMap<&'static str, Vec<ClassCount>>,
+    n_rows: usize,
+    n_segments: usize,
+    threads: usize,
+    gpu_requested: GpuMode,
+    gpu_available: bool,
+    benchmark_present: bool,
+    rates: &EnrichRates,
+) -> Vec<GroupPlan> {
+    let _ = threads;
     let mrow = n_rows as f64 / 1_000_000.0;
     let write_bps = rates.write_bps;
     let mut fams: Vec<FamilyCost> = Vec::new();
-    for (group, (cols, op)) in counts {
-        let (group, cols, op) = (*group, *cols, *op);
+    for (group, classes) in mix {
+        let group = *group;
+        let cols: usize = classes.iter().map(|c| c.cols).sum();
+        let supported: usize = classes.iter().map(|c| c.supported.min(c.cols)).sum();
+        let mut op = classes.first().map_or(OpClass::Elementwise, |c| c.op);
+        for c in classes {
+            if c.op.pass_rank() > op.pass_rank() {
+                op = c.op;
+            }
+        }
         let rate = rates.class(op);
         let fused = crate::features_gpu::fused_cost(group);
         let in_pass = fused.is_none() && op.is_shared_pass();
-        let supported = (*gpu_cols.get(group).unwrap_or(&0)).min(cols);
         let (cpu_fixed_s, cpu_cols_s, cpu_supported_s) = match fused {
             Some(cost) => (
                 0.0,
@@ -3303,6 +3379,7 @@ pub fn plan_groups_rated(
         };
         fams.push(FamilyCost {
             group,
+            classes: classes.clone(),
             cols,
             supported,
             op,
@@ -3439,6 +3516,7 @@ pub fn plan_groups_rated(
             gpu_cols: if dispatched { f.supported } else { 0 },
             cpu_cols: if dispatched { f.cols - f.supported } else { f.cols },
             op: f.op.name().to_string(),
+            classes: f.classes.clone(),
             cpu_ms: (f.cpu_fixed_s + f.cpu_cols_s) * 1000.0 + pass_share_ms,
             gpu_ms: f.gpu_s * 1000.0,
             pass_shared,
@@ -7437,6 +7515,100 @@ fn temp_dir_for(out: &str) -> PathBuf {
     PathBuf::from(format!("{}.enrich-tmp-{}", out, pid))
 }
 
+/// Operation class a column is costed as. `compact_requested` and
+/// `py15m_requested` are the names the run computes in the shared passes.
+pub fn class_of(name: &str, compact_requested: &[String], py15m_requested: &[String]) -> OpClass {
+    if compact_requested.iter().any(|c| c == name) {
+        OpClass::CompactPass
+    } else if py15m_requested.iter().any(|c| c == name) {
+        OpClass::Py15mPass
+    } else if name.starts_with("xs_") {
+        OpClass::Rank
+    } else if crate::features_gpu::is_device_flow(name) {
+        OpClass::RollingStd
+    } else if crate::features_gpu::is_device_price_action(name) {
+        OpClass::WilderScan
+    } else if FLOW_NAMES.contains(&name) {
+        OpClass::RollingStd
+    } else if name.starts_with("vol")
+        || name.starts_with("bb")
+        || name == "vz96"
+        || name.starts_with("macd")
+        || name.starts_with("skew")
+        || name.starts_with("kurt")
+        || name.starts_with("park")
+        || name.starts_with("gk")
+    {
+        OpClass::RollingStd
+    } else if name.starts_with("dow_")
+        || name.starts_with("hour_")
+        || name.starts_with("month_")
+        || name.starts_with("dom_")
+        || name.starts_with("tod_")
+    {
+        OpClass::Calendar
+    } else if name.starts_with("don") {
+        OpClass::RollingExtrema
+    } else if name.starts_with("ma") || name.starts_with("ema") {
+        OpClass::RollingSum
+    } else if name.starts_with("rsi")
+        || name.starts_with("atr")
+        || name.starts_with("natr")
+        || name.starts_with("adx")
+        || name.starts_with("di_")
+        || name == "stoch_k"
+        || name == "stoch_d"
+    {
+        OpClass::WilderScan
+    } else if name.starts_with("btc")
+        || name.starts_with("rel_btc")
+        || name.starts_with("beta_btc")
+        || name.starts_with("eth_")
+        || name.starts_with("rel_eth")
+        || name.starts_with("beta_eth")
+        || name.starts_with("mkt_")
+        || name.starts_with("cross_")
+    {
+        OpClass::Join
+    } else if is_mtf(name) {
+        OpClass::Mtf
+    } else if crate::trend::is_trend(name) {
+        OpClass::Trend
+    } else {
+        OpClass::Elementwise
+    }
+}
+
+/// A column has an exact device kernel whose declared parity tier is
+/// `bitwise`: it keeps its bytes when its family changes backend.
+fn device_bit_identical(name: &str) -> bool {
+    gpu_supports(name) && declared_parity_tier(name, "") == "bitwise"
+}
+
+/// The columns of every family by operation class, in first-seen order.
+pub fn class_mix(
+    requested: &[String],
+    compact_requested: &[String],
+    py15m_requested: &[String],
+) -> BTreeMap<&'static str, Vec<ClassCount>> {
+    let mut mix: BTreeMap<&'static str, Vec<ClassCount>> = BTreeMap::new();
+    for n in requested {
+        let op = class_of(n, compact_requested, py15m_requested);
+        let classes = mix.entry(family_of(n)).or_default();
+        let i = match classes.iter().position(|c| c.op == op) {
+            Some(i) => i,
+            None => {
+                classes.push(ClassCount { op, cols: 0, supported: 0, exact: 0 });
+                classes.len() - 1
+            }
+        };
+        classes[i].cols += 1;
+        classes[i].supported += gpu_supports(n) as usize;
+        classes[i].exact += device_bit_identical(n) as usize;
+    }
+    mix
+}
+
 fn enrich_inner(
     opts: &Options,
     out: &str,
@@ -7731,98 +7903,26 @@ fn enrich_inner(
         crate::backend::probe()
     };
     let (gpu_available, gpu_device, gpu_probed) = (gpu.available(), gpu.device.clone(), gpu.probed);
-    let mut fam_counts: BTreeMap<&'static str, (usize, OpClass)> = BTreeMap::new();
-    let classify = |name: &str| -> OpClass {
-        if compact_requested.iter().any(|c| c == name) {
-            OpClass::CompactPass
-        } else if py15m_requested.iter().any(|c| c == name) {
-            OpClass::Py15mPass
-        } else if name.starts_with("xs_") {
-            OpClass::Rank
-        } else if crate::features_gpu::is_device_flow(name) {
-            OpClass::RollingStd
-        } else if crate::features_gpu::is_device_price_action(name) {
-            OpClass::WilderScan
-        } else if FLOW_NAMES.contains(&name) {
-            OpClass::RollingStd
-        } else if name.starts_with("vol")
-            || name.starts_with("bb")
-            || name == "vz96"
-            || name.starts_with("macd")
-            || name.starts_with("skew")
-            || name.starts_with("kurt")
-            || name.starts_with("park")
-            || name.starts_with("gk")
-        {
-            OpClass::RollingStd
-        } else if name.starts_with("dow_")
-            || name.starts_with("hour_")
-            || name.starts_with("month_")
-            || name.starts_with("dom_")
-            || name.starts_with("tod_")
-        {
-            OpClass::Calendar
-        } else if name.starts_with("don") {
-            OpClass::RollingExtrema
-        } else if name.starts_with("ma") || name.starts_with("ema") {
-            OpClass::RollingSum
-        } else if name.starts_with("rsi")
-            || name.starts_with("atr")
-            || name.starts_with("natr")
-            || name.starts_with("adx")
-            || name.starts_with("di_")
-            || name == "stoch_k"
-            || name == "stoch_d"
-        {
-            OpClass::WilderScan
-        } else if name.starts_with("btc")
-            || name.starts_with("rel_btc")
-            || name.starts_with("beta_btc")
-            || name.starts_with("eth_")
-            || name.starts_with("rel_eth")
-            || name.starts_with("beta_eth")
-            || name.starts_with("mkt_")
-            || name.starts_with("cross_")
-        {
-            OpClass::Join
-        } else if is_mtf(name) {
-            OpClass::Mtf
-        } else if crate::trend::is_trend(name) {
-            OpClass::Trend
-        } else {
-            OpClass::Elementwise
-        }
-    };
-    let mut gpu_cols: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for n in requested.iter() {
-        let fam = family_of(n);
-        let class = classify(n);
-        let e = fam_counts.entry(fam).or_insert((0, class));
-        if class.pass_rank() > e.1.pass_rank() {
-            e.1 = class;
-        }
-        e.0 += 1;
-        if gpu_supports(n) {
-            *gpu_cols.entry(fam).or_insert(0) += 1;
-        }
-    }
+    let mut mix = class_mix(&requested, &compact_requested, &py15m_requested);
     if !labels.is_empty() {
-        let e = fam_counts.entry("labels").or_insert((0, OpClass::Elementwise));
-        e.0 += labels.len();
-        if gpu_kernels_compiled() {
-            *gpu_cols.entry("labels").or_insert(0) += labels.len();
-        }
+        let supported = if gpu_kernels_compiled() { labels.len() } else { 0 };
+        mix.entry("labels").or_default().push(ClassCount {
+            op: OpClass::Elementwise,
+            cols: labels.len(),
+            supported,
+            exact: supported,
+        });
     }
     let (mut rates, plan_rates) = resolve_rates(&opts.calibration, gpu_device.as_deref())?;
     if let Some(bw) = opts.write_bw {
         rates.write_bps = bw;
     }
     let write_bw = rates.write_bps;
-    let plans = plan_groups_rated(
-        &fam_counts,
-        &gpu_cols,
+    let plans = plan_groups_mixed(
+        &mix,
         store.n_rows(),
         segs.len(),
+        opts.threads.max(1),
         opts.gpu,
         gpu_available,
         !cross.symbol.is_empty(),
