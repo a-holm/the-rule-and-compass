@@ -108,17 +108,16 @@ fn refit(tree: &mut Node, cfg: &Config, fit: &Sample) {
             }
             s => s,
         };
-        crate::fit::with_fit_thresholds(cfg.fit_thresholds, || {
-            crate::fit::fit_weighted_strategy_metric(
-                tree,
-                &fit.x,
-                &fit.y,
-                &fit.w,
-                cfg.fit_iters,
-                strategy,
-                cfg.metric,
-            )
-        });
+        crate::fit::fit_weighted_strategy_metric(
+            tree,
+            &fit.x,
+            &fit.y,
+            &fit.w,
+            cfg.fit_iters,
+            strategy,
+            cfg.metric,
+            cfg.fit_thresholds,
+        );
     }
 }
 

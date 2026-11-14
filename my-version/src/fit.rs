@@ -77,7 +77,7 @@ pub(crate) use rank::{choose_rank_fit, score_constants, RankFitChoice};
 pub use varpro::{cost_eligible as varpro_cost_eligible, VarProPartition};
 pub use reweighted::FitIrls;
 pub use reweighted::with_schedule as with_fit_irls;
-pub use thresholds::{threshold_moves, with_fit_thresholds};
+pub use thresholds::threshold_moves;
 pub(crate) use thresholds::fit_thresholds;
 
 /// `1/sqrt(pi)`, the constant in the error-function derivative.
@@ -1326,12 +1326,14 @@ impl GpuFitReject {
 }
 
 /// #169: build the GPU fit plan for `tree`, or say why it is ineligible.
-pub(crate) fn gpu_fit_plan_reason(tree: &Node) -> Result<GpuFitPlan, GpuFitReject> {
+/// #1024: with `thresholds` set, a tree with a threshold constant stays on the
+/// CPU arm that fits it.
+pub(crate) fn gpu_fit_plan_reason(tree: &Node, thresholds: bool) -> Result<GpuFitPlan, GpuFitReject> {
     let f = flatten(tree);
     if f.nconst == 0 {
         return Err(GpuFitReject::NoConstants);
     }
-    if thresholds::enabled() && !thresholds::threshold_constants(tree).is_empty() {
+    if thresholds && !thresholds::threshold_constants(tree).is_empty() {
         return Err(GpuFitReject::ThresholdConstant);
     }
     if f.nconst > GPU_FIT_MAX_CONSTANTS {
@@ -1409,7 +1411,14 @@ pub(crate) fn gpu_fit_plan_reason(tree: &Node) -> Result<GpuFitPlan, GpuFitRejec
 /// operator without an analytic GPU derivative).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn gpu_fit_plan(tree: &Node) -> Option<GpuFitPlan> {
-    gpu_fit_plan_reason(tree).ok()
+    gpu_fit_plan_reason(tree, false).ok()
+}
+
+/// Whether `tree` has no constant to fit. The check precedes every other plan
+/// reject, so it needs no settings.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn has_no_fit_constants(tree: &Node) -> bool {
+    flatten(tree).nconst == 0
 }
 
 /// Flattened expression: children always precede parents, so index order is a
@@ -3511,6 +3520,7 @@ pub fn fit_weighted_metric_thresholds(
 /// The closed-form linear arm minimises squared error only, so it is used for
 /// the squared/AIC family. Every other metric keeps the IRLS/polish path from
 /// #117, which is the exact objective for that metric.
+#[allow(clippy::too_many_arguments)]
 pub fn fit_weighted_strategy_metric(
     tree: &mut Node,
     x: &[Vec<f64>],
@@ -3519,6 +3529,7 @@ pub fn fit_weighted_strategy_metric(
     iters: usize,
     strategy: FitStrategy,
     metric: Metric,
+    thresholds: bool,
 ) -> f64 {
     let base = |t: &mut Node| {
         if matches!(metric, Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic) {
@@ -3528,7 +3539,7 @@ pub fn fit_weighted_strategy_metric(
         }
     };
     let start = base(tree);
-    if !thresholds::enabled() {
+    if !thresholds {
         return start;
     }
     fit_thresholds(tree, x, y, w, iters, metric, start, base)
@@ -5182,12 +5193,12 @@ mod tests {
         }
         assert_eq!(GPU_FIT_MAX_CONSTANTS, 20);
         for p in 17..=20usize {
-            let plan = gpu_fit_plan_reason(&many_constants(p))
+            let plan = gpu_fit_plan_reason(&many_constants(p), false)
                 .unwrap_or_else(|e| panic!("p={} must be accepted: {:?}", p, e));
             assert_eq!(plan.nconst, p);
         }
         assert_eq!(
-            gpu_fit_plan_reason(&many_constants(21)).err(),
+            gpu_fit_plan_reason(&many_constants(21), false).err(),
             Some(GpuFitReject::TooManyConstants)
         );
     }

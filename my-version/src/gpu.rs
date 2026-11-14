@@ -6212,14 +6212,14 @@ mod fit_tests {
         assert_eq!(crate::fit::GPU_FIT_MAX_CONSTANTS, 20);
         for p in 1..=20usize {
             let m = linear_model(&vec![0.1; p]);
-            let plan = crate::fit::gpu_fit_plan_reason(&m)
+            let plan = crate::fit::gpu_fit_plan_reason(&m, false)
                 .unwrap_or_else(|e| panic!("p={} must be offered to the kernel: {:?}", p, e));
             assert_eq!(plan.nconst, p);
         }
         for p in 21..=24usize {
             let m = linear_model(&vec![0.1; p]);
             assert_eq!(
-                crate::fit::gpu_fit_plan_reason(&m).err(),
+                crate::fit::gpu_fit_plan_reason(&m, false).err(),
                 Some(GpuFitReject::TooManyConstants),
                 "p={} must be labelled too_many_constants",
                 p
@@ -6421,7 +6421,7 @@ mod fit_tests {
         let asinh = node(Op::Asinh, vec![node(Op::Mul, vec![constant(0.5), input(0)])]);
         assert!(crate::fit::gpu_fit_plan(&asinh).is_none());
         assert_eq!(
-            crate::fit::gpu_fit_plan_reason(&asinh).err(),
+            crate::fit::gpu_fit_plan_reason(&asinh, false).err(),
             Some(crate::fit::GpuFitReject::UnsupportedOp)
         );
         // Floor has a device opcode since #548.
@@ -6861,7 +6861,7 @@ mod fit_tests {
         let mut trees = Vec::new();
         while trees.len() < 24 {
             let t = crate::expr::simplify(&random_tree_with(&mut rng, 2, &ops, 4, None));
-            if crate::fit::gpu_fit_plan_reason(&t).is_ok() {
+            if crate::fit::gpu_fit_plan_reason(&t, false).is_ok() {
                 trees.push(t);
             }
         }
@@ -8193,7 +8193,7 @@ mod rank_tests {
     }
 
     fn plan(t: &Node) -> crate::fit::GpuFitPlan {
-        gpu_fit_plan_reason(t).expect("an eligible plan")
+        gpu_fit_plan_reason(t, false).expect("an eligible plan")
     }
 
     fn cpu_pred(f: &Fixture, t: &Node) -> Vec<f64> {
@@ -9019,7 +9019,7 @@ mod score_batch_bench {
                 crate::expr::constant(0.1),
             ],
         );
-        let plan = gpu_fit_plan_reason(&tree).expect("an eligible plan");
+        let plan = gpu_fit_plan_reason(&tree, false).expect("an eligible plan");
         let constants: Vec<Vec<f64>> = (0..p)
             .map(|k| {
                 let mut c = plan.c0.clone();
@@ -9122,7 +9122,7 @@ mod maximum_tests {
     }
 
     fn plan(t: &Node) -> crate::fit::GpuFitPlan {
-        gpu_fit_plan_reason(t).expect("an eligible plan")
+        gpu_fit_plan_reason(t, false).expect("an eligible plan")
     }
 
     /// `a·x + b`: arithmetic only, so the device's f64 forward sweep and
@@ -9503,7 +9503,7 @@ mod order_stat_tests {
     }
 
     fn plan(t: &Node) -> crate::fit::GpuFitPlan {
-        gpu_fit_plan_reason(t).expect("an eligible plan")
+        gpu_fit_plan_reason(t, false).expect("an eligible plan")
     }
 
     /// `a·x + b`: arithmetic-only, so the device's f64 forward sweep and
@@ -10389,7 +10389,7 @@ mod persistent_tests {
     }
 
     fn plans_of(trees: &[Node]) -> Vec<crate::fit::GpuFitPlan> {
-        trees.iter().map(|t| gpu_fit_plan_reason(t).expect("an eligible plan")).collect()
+        trees.iter().map(|t| gpu_fit_plan_reason(t, false).expect("an eligible plan")).collect()
     }
 
     /// Value captured from the pre-change per-call allocating path.
@@ -10776,7 +10776,7 @@ mod alloc_ledger_tests {
             return;
         };
         let t = linear();
-        let p = gpu_fit_plan_reason(&t).expect("an eligible plan");
+        let p = gpu_fit_plan_reason(&t, false).expect("an eligible plan");
         let plans = [&p, &p];
         let trials = trial_lists(2, 6);
         let unsplit = ev
@@ -10800,7 +10800,7 @@ mod alloc_ledger_tests {
             return;
         };
         let t = linear();
-        let p = gpu_fit_plan_reason(&t).expect("an eligible plan");
+        let p = gpu_fit_plan_reason(&t, false).expect("an eligible plan");
         let plans = [&p, &p];
         let trials = trial_lists(2, 6);
         let unsplit = ev
@@ -10833,7 +10833,7 @@ mod alloc_ledger_tests {
             return;
         };
         let t = linear();
-        let p = gpu_fit_plan_reason(&t).expect("an eligible plan");
+        let p = gpu_fit_plan_reason(&t, false).expect("an eligible plan");
         let trials = trial_lists(1, 6);
         let before = ev.alloc_report();
         let sums = ev.rank_score_trials(&[&p], &trials).expect("rank call");
