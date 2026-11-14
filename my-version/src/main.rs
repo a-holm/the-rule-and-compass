@@ -11137,7 +11137,9 @@ OPTIONS:
   --null-draws <B>           draws of the hour-block permutation null and the
                              matched-exposure shifted long/flat null (one
                              circular shift per draw and window, shared by all
-                             symbols; p is null under 20 distinct shifts)
+                             symbols; p is null under 20 distinct shifts; with
+                             D <= B distinct shifts all D are evaluated once and
+                             p = (1+count)/(D+1))
                              (default 0 = off); p = (1+count)/(B+1)
   --trials <N>               total trials behind the candidates, the N of the
                              DSR. Default: the run's candidates_evaluated when a
