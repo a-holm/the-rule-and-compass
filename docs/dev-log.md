@@ -245,6 +245,7 @@ Emitted at the same boundary as `--progress`, once per completed generation
 | `isolated` | full | #1022: islands inside their isolation window after this generation (`--restart-policy island`; 0 under `archive`); an explore island (#1100) is isolated by its tier and is not counted |
 | `migrants` | full | #1029: migrants copied at this generation's migration step (0 on every other generation; the record is reported after the step) |
 | `migrants_skipped` | full | #1029: migrants not copied because the destination already held a member with the migrant's error bits (`--migration-policy ring-tournament`; 0 under `ring`) |
+| `selection.mode`, `selection.cases` | both | #1023: present only under `--selection lexicase`: `"lexicase"` and the number of cases the generation selected on (rows under the metric fitness, sub-books under `--fitness pnl`); every other selection writes no `selection` key, so its lines keep their bytes |
 
 The six `phases` (excluding the two summed CPU times) are disjoint windows on
 the search's main thread and add up to `wall`. `fit_cpu` and `eval_cpu` overlap

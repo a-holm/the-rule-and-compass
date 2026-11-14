@@ -1344,12 +1344,24 @@ fn a_lexicase_long_pnl_run_resumes_exactly() {
         gpu: false,
         ..config(11)
     };
-    let uninterrupted = search::run(&lex(24), &train, &test);
+    // The state at the last generation (populations, generators, the search
+    // archive), taken before the resumed run rebuilds its reported front.
+    let last_generation = |resume: Option<Checkpoint>| {
+        let mut texts = Vec::new();
+        let out = search::run_resumable(&lex(24), &train, &test, resume, 1, |cp| texts.push(cp.to_text())).expect("run");
+        assert!(texts.len() >= 2);
+        (out, texts[texts.len() - 2].clone())
+    };
+    let (uninterrupted, full_state) = last_generation(None);
     let text = checkpoint_text(&lex(12), &train, &test);
-    let saved = Checkpoint::from_text(&text).expect("parse");
-    let resumed = search::run_resumable(&lex(24), &train, &test, Some(saved), 0, |_| {}).expect("resume");
-    assert_eq!(describe(&uninterrupted), describe(&resumed));
-    assert_eq!(uninterrupted.archive.hash(), resumed.archive.hash());
+    let (resumed, resumed_state) = last_generation(Some(Checkpoint::from_text(&text).expect("parse")));
+    assert_eq!(full_state, resumed_state, "populations, generators and the search archive must match");
+    // A resumed run reports the front rebuilt on every row, which takes the
+    // canonical member among trees with the same regret bits; an uninterrupted
+    // CPU run reports the search archive. Compare the reported errors and costs.
+    let bits = |o: &Outcome| o.archive.items.iter().map(|s| (s.error.to_bits(), s.cost.to_bits())).collect::<Vec<_>>();
+    assert_eq!(bits(&uninterrupted), bits(&resumed));
+    assert_eq!(uninterrupted.candidates_evaluated, resumed.candidates_evaluated);
     let lexicographic = search::run(&Config { selection: search::Selection::Lexicographic, ..lex(24) }, &train, &test);
     assert_ne!(uninterrupted.archive.hash(), lexicographic.archive.hash(), "lexicase must change the trajectory");
 }

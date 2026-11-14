@@ -4182,7 +4182,7 @@ fn main() {
         if fitness_arg.as_deref() == Some("pnl") || !cfg.fitness.is_metric() {
             eprintln!("error: --selection lexicase --fitness pnl --gpu: the device long_pnl fitness returns no sub-book cases yet (#1031); omit --gpu to run on the CPU");
         } else {
-            eprintln!("error: --selection lexicase with --gpu: the device scorer returns no per-row case errors yet; omit --gpu to run on the CPU");
+            eprintln!("error: --selection lexicase with --gpu: the device scorer returns no per-row case errors yet (#1169); omit --gpu to run on the CPU");
         }
         std::process::exit(EXIT_USAGE);
     }
@@ -5518,7 +5518,7 @@ fn main() {
     }
     // #1023: a metric-fitness lexicase case is one row's loss.
     if cfg.selection == crate::search::Selection::Lexicase && !fitness_pnl {
-        if let Some(reason) = None::<String>.filter(|_| search::lexicase_metric_refusal(cfg.metric, implicit_mode, multi_output, weight_name.is_some()).is_some()) { // WIP red
+        if let Some(reason) = search::lexicase_metric_refusal(cfg.metric, implicit_mode, multi_output, weight_name.is_some()) {
             eprintln!("error: {}", reason);
             std::process::exit(EXIT_USAGE);
         }

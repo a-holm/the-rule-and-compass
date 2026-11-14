@@ -563,6 +563,19 @@ The prune is off by default; `--prune` enables it. `--prune-rows N` (default 200
 
 `--qd-descriptor book` (with `--fitness pnl` and `--qd` or `--qd-policy`) keys the quality-diversity archive by the log exposure and the log mean holding length of the long/flat book instead of variable usage and prediction skewness. The counts (long rows, flips, exits) come from `FitnessBook::regret_and_shape`, the reduction that already gives the regret, so a CPU-scored candidate gets its descriptor at the cost of a few integer sums and the archive reports `descriptor_fallbacks: 0`. `FitnessBook::regret` is that reduction with the shape dropped, so the regret bits do not move. A device-scored member carries no descriptor; the archive and the migration victim evaluate it once on the CPU with the same reduction (the archive caches it by structural hash), which is the cost the moments descriptor already pays on the device. Reading the kept device totals of #1082 instead would remove that pass; it is not done. Default runs and `--qd-descriptor moments` take the same code as before: the same descriptor calls, the same checkpoint bytes and the same `--json` keys. Whether the book cells improve the search is open: the issue's bench (book descriptor, plain search and `--qd-random` control, seeds 11, 12 and 13) is not run.
 
+### 3.2.4 Epsilon-lexicase parent selection (#1023)
+
+`--selection lexicase` replaces the island tournament, which compares one aggregate error, by semi-dynamic epsilon-lexicase [25, 26] on cases down-sampled per generation [27]. A formula that is best on some rows, symbols or time blocks then has a selection advantage even when it does not win the aggregate. Survivor selection stays generational with the elite, and the 15 % front draw stays in front of the island selection.
+
+* Cases: `K = --lexicase-cases` (default 256, 2 to 4096). Under the metric fitness, `K` rows of the generation's sample, drawn with `generation_subset` and a salt of their own, so the case rows are a function of the seed and the generation and nest inside `--predictor-samples`. Under `--fitness pnl`, every `(group, time block)` run of the long/flat book with a positive hindsight bound; when there are more than `K`, `K` are drawn per generation the same way.
+* Case errors: the metric's row loss on the case rows, or the sub-book regret `(B_c - net_c) / B_c`. The sub-book totals use the book's position rule (threshold, band, minimum hold) and the segment, lane and warp tree of `FitnessBook::totals` from the run's first row, so a run of a plain book totals as a separate book of its rows bit for bit (`case_totals_equal_separate_books`). They are computed in the `with_predictions` pass that scores the candidate and kept on the individual as `f32`; any new error drops them. The row losses are recomputed per generation by one pass over the `K` case rows per member; a row value depends on its own row only, so they are the bits of the fitness pass (`metric_cases_are_the_fitness_pass_row_losses`).
+* Epsilon: per case, the median absolute deviation of the island's finite errors, once per generation. One selection draws the cases lazily in a random order with the island generator and keeps every survivor within epsilon of the best survivor on the case; it stops at one survivor. The final survivors are narrowed to the lowest complexity, then one is drawn uniformly. An island without a finite member falls back to the tournament of four.
+* Cost: building the matrix is one pass over `K` rows per member (metric) or a read of the kept vectors (P&L); epsilon is `O(pop K log pop)` per island and generation; a selection is at most `pool x K` comparisons, usually far fewer because the pool shrinks with every case. `pop x K` above 2^24 and kept sub-book values above 2^28 (`islands x pop x sub-books`) exit 2.
+* Determinism: no new draw happens outside phase A, and the case draw has its own salted stream, so a run is a function of the seed and does not depend on `--threads` (`lexicase_is_deterministic_and_independent_of_threads`). Nothing is added to the checkpoint except `lexicase_cases` off its default; a resumed member's sub-book errors are recomputed from its saved tree, so a resume equals the uninterrupted run (`tests/checkpoint.rs`).
+* Scope: the CPU node path. `--gpu` exits 2 (the device returns no per-case errors; the metric device cases are #1169, the P&L ones #1031), a CUDA build without `--gpu` notes the reason and runs on the CPU, and `--variation postfix` exits 2. A metric without a per-row loss, a weighted sample, several targets and an implicit model exit 2.
+
+Default, `lexicographic` and `afp` runs read no new field and draw nothing new. Whether lexicase improves the search is not measured: the bench and campaign-like comparisons of the issue are open.
+
 ### 3.3 Structure-of-arrays CPU evaluator (stages 1–2, wired)
 
 **[implemented, wired into the search and measured]** — `src/eval_soa.rs`
@@ -1633,6 +1646,14 @@ The status of the GPU path in this repository is in
 22. NVIDIA. *DGX Spark hardware guide.*
 23. Chips and Cheese. *Analyzing NVIDIA GB10's GPU.*
 24. NVIDIA. *RTX Blackwell GPU architecture whitepaper.*
+25. La Cava, Spector & Danai (2016). *Epsilon-lexicase selection for
+    regression.* GECCO. arXiv:1905.13266.
+26. La Cava, Helmuth, Spector & Moore (2019). *A probabilistic and
+    multi-objective analysis of lexicase selection and epsilon-lexicase
+    selection.* Evolutionary Computation 27(3). arXiv:1709.05394.
+27. Hernandez, Lalejini, Dolson & Ofria (2019). *Random subsampling improves
+    performance in lexicase selection.* GECCO Companion.
+    doi:10.1145/3319619.3326900.
 
 ## Structural identification of reported constants (#257)
 

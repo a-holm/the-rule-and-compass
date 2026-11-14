@@ -2076,7 +2076,7 @@ impl FitnessBook {
         let mut seg_start = start;
         let mut seg = 0usize;
         while seg_start < end {
-            let seg_end = ((seg_start / FITNESS_SEGMENT_ROWS + 1) * FITNESS_SEGMENT_ROWS).min(end); // WIP red
+            let seg_end = (seg_start + FITNESS_SEGMENT_ROWS).min(end);
             let mut lanes = [0.0f64; FITNESS_LANES];
             for k in seg_start..seg_end {
                 let p = pred[k];
@@ -2100,7 +2100,7 @@ impl FitnessBook {
                 }
                 if long {
                     t.long_rows += 1;
-                    lanes[k % FITNESS_LANES] += self.excess[k]; // WIP red
+                    lanes[(k - seg_start) % FITNESS_LANES] += self.excess[k];
                     if flag & TradingRows::LAST != 0 {
                         t.exits += 1;
                     }

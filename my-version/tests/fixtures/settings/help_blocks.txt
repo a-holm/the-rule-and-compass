@@ -21,7 +21,7 @@
                              --explore-islands. 0 turns every restart off,
                              explore restarts included. Saved search setting
                              (#1109)
-  --selection lexicographic|afp
+  --selection lexicographic|afp|lexicase
                              survivor and parent selection inside an island.
                              lexicographic (default) replaces the island with
                              its offspring and picks parents by error, then
@@ -29,7 +29,19 @@
                              offspring on (error, complexity, age), adds a few
                              random immigrants per generation and picks
                              parents by Pareto rank and crowding distance.
-                             Node path only; refuses --variation postfix
+                             lexicase replaces the island like lexicographic
+                             and picks parents by epsilon-lexicase on cases
+                             drawn per generation (--lexicase-cases): row
+                             losses under the metric fitness, (group, time
+                             block) sub-book regrets under --fitness pnl.
+                             lexicase runs on the CPU and needs a per-row
+                             loss metric. Node path only; refuses --variation
+                             postfix
+  --lexicase-cases <K>       cases one --selection lexicase generation selects
+                             on, default 256, 2 to 4096: rows under the metric
+                             fitness, sub-books under --fitness pnl, drawn per
+                             generation from the seed. Saved search setting
+                             (#1023)
   --restart-policy archive|island
                              which stall rule restarts an island every
                              restart interval (--restart-interval, default

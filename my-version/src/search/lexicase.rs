@@ -117,7 +117,7 @@ pub(super) fn refusal(cfg: &Config, train: &Sample) -> Option<String> {
     }
     if cfg.gpu_required {
         return Some(if cfg.fitness.is_metric() {
-            "--selection lexicase with --gpu: the device scorer returns no per-row case errors yet; omit --gpu to run on the CPU".to_string()
+            "--selection lexicase with --gpu: the device scorer returns no per-row case errors yet (#1169); omit --gpu to run on the CPU".to_string()
         } else {
             "--selection lexicase --fitness pnl --gpu: the device long_pnl fitness returns no sub-book cases yet (#1031); omit --gpu to run on the CPU".to_string()
         });
@@ -291,7 +291,7 @@ impl Pool {
             CaseSet::Book { ids } => {
                 let book = cfg.fitness.book().expect("a book case set has a book");
                 let missing: Vec<usize> = finite.iter().copied().filter(|&i| isl[i].cases.is_none()).collect();
-                if false && !missing.is_empty() && train.sample.len() == book.len() { // WIP red
+                if !missing.is_empty() && train.sample.len() == book.len() {
                     let trees: Vec<&Node> = missing.iter().map(|&i| &isl[i].tree).collect();
                     let vectors = par_map(batch_workers(workers, trees.len(), train.sample.len()), trees, |tree| {
                         with_predictions(tree, train, |pred| book.case_errors(pred))
@@ -328,7 +328,6 @@ impl Pool {
     /// lowest complexity, then one is drawn uniformly. An empty pool falls back
     /// to the island tournament of four.
     pub(super) fn select(&self, isl: &[Ind], rng: &mut Mt) -> usize {
-        if !self.members.is_empty() { return tournament(isl, rng, 4); } // WIP red
         if self.members.is_empty() {
             return tournament(isl, rng, 4);
         }

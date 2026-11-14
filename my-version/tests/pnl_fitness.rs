@@ -1687,6 +1687,9 @@ fn lexicase_selects_on_two_symbols_times_four_blocks() {
     let saved = lex(&["--generations", "6", "--no-dev-log", "--save", &cp]);
     assert_eq!(code(&saved), 0, "{}", stderr(&saved));
     let resumed = json(&lex(&["--generations", "12", "--no-dev-log", "--resume", &cp]));
-    assert_eq!(members(&full), members(&resumed));
+    // A resumed run reports the front rebuilt on every row, which takes the
+    // canonical tree among equal regrets; compare the regrets.
+    let regrets = |j: &Json| pareto(j).iter().map(|m| num(m, &["fitness", "train_regret"]).to_bits()).collect::<Vec<_>>();
+    assert_eq!(regrets(&full), regrets(&resumed));
     usage_error(&lex(&["--generations", "12", "--no-dev-log", "--resume", &cp, "--lexicase-cases", "4"]), "--lexicase-cases 4 (saved lexicase_cases is 256)");
 }
