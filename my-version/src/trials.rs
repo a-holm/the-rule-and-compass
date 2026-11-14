@@ -43,7 +43,9 @@ Campaign trial accounting from walk-forward reports (pooled.period_net), or a pa
 comparison of two runs. A and B are each one report or a comma-separated list (one per seed).\n\
 \n\
 Campaign (--wf):\n\
-  --wf <files...>        walk-forward --json reports with identical windows, cost, threshold rule and period grid\n\
+  --wf <files...>        walk-forward --json reports with identical windows, cost, threshold rule (threshold.quantile, threshold.fixed,\n\
+                         threshold.fit, threshold.cut_min_entries, threshold.cut_blocks, threshold.cut_lambda), policy\n\
+                         and period grid\n\
   --baseline <file>      rcsr ladder --emit-series report; the best of cash, buy_and_hold, constant_long_flat,\n\
                          best_single_feature and any trend rung by mean is the SPA benchmark\n\
   --baseline-rung <name> use this rung as the SPA benchmark instead\n\
@@ -60,6 +62,9 @@ Both:\n\
                          (default max(horizon, hold, cbrt n) of the reports)\n\
   --draws <n>            bootstrap and SPA draws (default 10000)\n\
   --seed <n>             seed of every draw (default 20260101)\n\
+  --threshold-arms       let the reports differ in the fitted-cut rule (threshold.fit, threshold.cut_min_entries,\n\
+                         threshold.cut_blocks, threshold.cut_lambda) and record the rule of each report; every other\n\
+                         guard stays. The fitted and the fixed arm are separate trials\n\
   --out <file>           write the JSON report to this file instead of stdout\n\
 \n\
 Exit 0 ok, 2 usage error or reports that do not match (the message names the field), 3 unreadable input.\n"
@@ -83,6 +88,15 @@ const GUARDS: &[&[&str]] = &[
     &["policy", "min_hold"],
 ];
 
+/// The fitted-cut rule of `walkforward --threshold-fit` (#1094). Reports written without the flag, and before it
+/// existed, read all four as `null` and match each other. `--threshold-arms` skips these paths only.
+const FIT_GUARDS: &[&[&str]] = &[
+    &["threshold", "fit"],
+    &["threshold", "cut_min_entries"],
+    &["threshold", "cut_blocks"],
+    &["threshold", "cut_lambda"],
+];
+
 struct Wf {
     label: String,
     path: String,
@@ -90,6 +104,8 @@ struct Wf {
     time: Vec<f64>,
     ppy: f64,
     guards: Vec<Json>,
+    fit_guards: Vec<Json>,
+    rule: String,
     default_block: usize,
 }
 
@@ -148,6 +164,8 @@ fn load_wf(path: &str) -> Res<Wf> {
         return usage_err(format!("field 'annualization.periods_per_year' is missing in {}", path));
     };
     let guards = GUARDS.iter().map(|g| at(&j, g).cloned().unwrap_or(Json::Null)).collect();
+    let fit_guards: Vec<Json> = FIT_GUARDS.iter().map(|g| at(&j, g).cloned().unwrap_or(Json::Null)).collect();
+    let rule = threshold_rule(&j);
     let horizon = at(&j, &["purge", "horizon_seconds"]).and_then(Json::as_f64).unwrap_or(0.0);
     let dt = median_step(&time);
     let horizon_periods = if horizon > 0.0 && dt > 0.0 { (horizon / dt).ceil() as usize } else { 0 };
@@ -162,17 +180,44 @@ fn load_wf(path: &str) -> Res<Wf> {
         time,
         ppy,
         guards,
+        fit_guards,
+        rule,
     })
 }
 
-fn require_same(a: &Wf, b: &Wf) -> Res<()> {
-    for (g, (x, y)) in GUARDS.iter().zip(a.guards.iter().zip(&b.guards)) {
+/// The `threshold_rule` member of a report entry, only with `--threshold-arms`.
+fn rule_field(arms: bool, rule: &str) -> String {
+    if arms { format!(",\"threshold_rule\":{}", jstr(rule)) } else { String::new() }
+}
+
+fn threshold_rule(j: &Json) -> String {
+    let t = at(j, &["threshold"]);
+    let num = |k: &str| t.and_then(|t| t.get(k)).and_then(Json::as_f64);
+    if t.and_then(|t| t.get("fit")).is_some_and(|f| *f != Json::Null) {
+        let (e, b, l) = (num("cut_min_entries"), num("cut_blocks"), num("cut_lambda"));
+        let f = |v: Option<f64>| v.map_or("?".to_string(), jnum);
+        return format!("fitness(min_entries={},blocks={},lambda={})", f(e), f(b), f(l));
+    }
+    if num("quantile").is_some() { "quantile" } else { "fixed" }.to_string()
+}
+
+/// `arms`: the fit paths may differ (`--threshold-arms`).
+fn require_same(a: &Wf, b: &Wf, arms: bool) -> Res<()> {
+    let fit = FIT_GUARDS.iter().zip(a.fit_guards.iter().zip(&b.fit_guards)).filter(|_| !arms);
+    let all = GUARDS.iter().zip(a.guards.iter().zip(&b.guards)).chain(fit);
+    for (g, (x, y)) in all {
         if x != y {
+            let hint = if FIT_GUARDS.contains(g) {
+                "; pass --threshold-arms to compare a fitted cut with a fixed cut"
+            } else {
+                ""
+            };
             return usage_err(format!(
-                "reports differ in field '{}': {} vs {}",
+                "reports differ in field '{}': {} vs {}{}",
                 g.join("."),
                 a.path,
-                b.path
+                b.path,
+                hint
             ));
         }
     }
@@ -189,11 +234,15 @@ fn require_same(a: &Wf, b: &Wf) -> Res<()> {
 }
 
 fn load_all(paths: &[String]) -> Res<Vec<Wf>> {
+    load_set(paths, false)
+}
+
+fn load_set(paths: &[String], arms: bool) -> Res<Vec<Wf>> {
     let mut out: Vec<Wf> = Vec::with_capacity(paths.len());
     for p in paths {
         let w = load_wf(p)?;
         if let Some(first) = out.first() {
-            require_same(first, &w)?;
+            require_same(first, &w, arms)?;
         }
         out.push(w);
     }
@@ -222,6 +271,7 @@ struct Options {
     draws: usize,
     seed: u32,
     out: Option<String>,
+    threshold_arms: bool,
 }
 
 fn parse_args(args: &[String]) -> Res<Options> {
@@ -239,6 +289,7 @@ fn parse_args(args: &[String]) -> Res<Options> {
         draws: inference::DEFAULT_DRAWS,
         seed: DEFAULT_SEED,
         out: None,
+        threshold_arms: false,
     };
     let mut given: Vec<&str> = Vec::new();
     let mut i = 0;
@@ -282,6 +333,7 @@ fn parse_args(args: &[String]) -> Res<Options> {
             "--draws" => o.draws = num(a, &val(&mut i)?)?,
             "--seed" => o.seed = num(a, &val(&mut i)?)?,
             "--out" => o.out = Some(val(&mut i)?),
+            "--threshold-arms" => o.threshold_arms = true,
             other => return usage_err(format!("unknown argument '{}'", other)),
         }
         given.push(a);
@@ -417,7 +469,7 @@ fn skipped(reason: &str) -> String {
 }
 
 fn campaign(o: &Options) -> Res<String> {
-    let wfs = load_all(&o.wf)?;
+    let wfs = load_set(&o.wf, o.threshold_arms)?;
     let n = wfs[0].net.len();
     let ppy = wfs[0].ppy;
     let block = o.block_len.unwrap_or_else(|| default_block(&wfs)).clamp(1, n.max(1));
@@ -563,18 +615,19 @@ fn campaign(o: &Options) -> Res<String> {
         .map(|(i, w)| {
             let v = varying.iter().position(|&x| x == distinct[book_of[i]]);
             format!(
-                "{{\"label\":{},\"book\":{},\"cluster\":{},\"sharpe_annual\":{}}}",
+                "{{\"label\":{},\"book\":{},\"cluster\":{},\"sharpe_annual\":{}{}}}",
                 jstr(&w.label),
                 book_of[i],
                 v.map_or("null".to_string(), |p| cluster_of[p].to_string()),
-                jnum(inference::sharpe_per_period(&w.net) * ann)
+                jnum(inference::sharpe_per_period(&w.net) * ann),
+                rule_field(o.threshold_arms, &w.rule)
             )
         })
         .collect();
     Ok(format!(
         "{{\"schema\":{},\"series\":{},\"distinct_books\":{},\"constant_books\":{},\"clusters\":{},\"cluster_rho\":{},\
 \"participation_ratio\":{},\"periods\":{},\"periods_per_year\":{},\"block_len\":{},\"draws\":{},\"seed\":{},\
-\"best\":{},\"spa\":{},\"pbo\":{},\"min_btl_years\":{},\"span_years\":{},\"notes\":[{}],\"members\":[{}]}}\n",
+\"best\":{},\"spa\":{},\"pbo\":{},\"min_btl_years\":{},\"span_years\":{},\"notes\":[{}],\"members\":[{}]{}}}\n",
         jstr(SCHEMA),
         wfs.len(),
         distinct.len(),
@@ -593,7 +646,8 @@ fn campaign(o: &Options) -> Res<String> {
         jnum(min_btl),
         jnum(span_years),
         notes.iter().map(|s| jstr(s)).collect::<Vec<_>>().join(","),
-        members.join(",")
+        members.join(","),
+        if o.threshold_arms { ",\"threshold_arms\":true" } else { "" }
     ))
 }
 
@@ -642,7 +696,7 @@ fn compare(o: &Options) -> Res<String> {
     }
     let a = load_all(&a_paths)?;
     let b = load_all(&b_paths)?;
-    require_same(&a[0], &b[0])?;
+    require_same(&a[0], &b[0], o.threshold_arms)?;
     let n = a[0].net.len();
     let ppy = a[0].ppy;
     if n < 2 {
@@ -691,7 +745,7 @@ fn compare(o: &Options) -> Res<String> {
         "{{\"schema\":{},\"a\":[{}],\"b\":[{}],\"n\":{},\"periods_per_year\":{},\"bootstrap\":{},\"block_len\":{},\
 \"draws\":{},\"seed\":{},\"mean_diff\":{},\"mean_diff_annual\":{},\"ci\":[{},{}],\"level\":{},\"p_period\":{},\
 \"p_two_sided\":{},\"design_effect\":{},\"effective_n\":{},\"short_series\":{},\
-\"seeds\":{{\"n_a\":{},\"n_b\":{},\"delta\":{},\"s_seed\":{},\"df\":{},\"z\":{},\"z_reason\":{}}}}}\n",
+\"seeds\":{{\"n_a\":{},\"n_b\":{},\"delta\":{},\"s_seed\":{},\"df\":{},\"z\":{},\"z_reason\":{}}}{}}}\n",
         jstr(COMPARE_SCHEMA),
         labels(&a),
         labels(&b),
@@ -717,7 +771,13 @@ fn compare(o: &Options) -> Res<String> {
         opt(s_seed),
         opt(df),
         opt(z),
-        z_reason.map_or("null".to_string(), jstr)
+        z_reason.map_or("null".to_string(), jstr),
+        if o.threshold_arms {
+            let rules = |s: &[Wf]| s.iter().map(|w| jstr(&w.rule)).collect::<Vec<_>>().join(",");
+            format!(",\"threshold_arms\":true,\"threshold_rule_a\":[{}],\"threshold_rule_b\":[{}]", rules(&a), rules(&b))
+        } else {
+            String::new()
+        }
     ))
 }
 

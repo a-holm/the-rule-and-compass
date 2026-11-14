@@ -264,7 +264,7 @@ The verdict (`ablation/verdict.json`, `ablation/verdict.md`) says ship or drop p
 
 ### Campaign trial accounting
 
-`rcsr trials --wf <reports...> --baseline ladder.json` counts the finalists of a campaign from the pooled out-of-fold series (`pooled.period_net`) of their walk-forward reports: distinct books, single-linkage clusters at `|rho| >= --cluster-rho` as the effective trial count, the DSR at that count, at 10x and at the nominal count, SPA against the best long-only baseline (`rcsr ladder --emit-series`), PBO by CSCV and MinBTL. `rcsr trials --compare A B` compares two runs, or two sets of seeds, with a paired stationary block bootstrap of the per-period difference and a seed-spread z. See [`docs/overfitting.md`](docs/overfitting.md#314-campaign-trial-accounting-rcsr-trials).
+`rcsr trials --wf <reports...> --baseline ladder.json` counts the finalists of a campaign from the pooled out-of-fold series (`pooled.period_net`) of their walk-forward reports: distinct books, single-linkage clusters at `|rho| >= --cluster-rho` as the effective trial count, the DSR at that count, at 10x and at the nominal count, SPA against the best long-only baseline (`rcsr ladder --emit-series`), PBO by CSCV and MinBTL. `rcsr trials --compare A B` compares two runs, or two sets of seeds, with a paired stationary block bootstrap of the per-period difference and a seed-spread z. Reports must agree on the threshold rule, including the fitted-cut fields (`threshold.fit`, `threshold.cut_min_entries`, `threshold.cut_blocks`, `threshold.cut_lambda`); `--threshold-arms` lets a fitted-cut and a fixed-cut report be compared as separate arms. See [`docs/overfitting.md`](docs/overfitting.md#314-campaign-trial-accounting-rcsr-trials).
 
 ## GUI
 
