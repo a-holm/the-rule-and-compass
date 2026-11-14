@@ -10974,7 +10974,8 @@ OPTIONS:
                              member, labelled front_rank_<k>), instead of --expr.
                              --vars and --target (the run's return column) default
                              to the run; --trials defaults to the front size (the
-                             search trials when a window is in sample). The run's
+                             search trials when a window is in sample and the run has
+                             them). The run's
                              position rule is carried: the
                              objective threshold as a fixed threshold and its
                              per-side cost; --threshold-fixed,
@@ -11139,9 +11140,10 @@ OPTIONS:
                              symbols; p is null under 20 distinct shifts)
                              (default 0 = off); p = (1+count)/(B+1)
   --trials <N>               total trials behind the candidates, the N of the
-                             DSR. Default: --from-run 1 (out-of-sample book), --front
-                             the front size, the run's candidates_evaluated when a
-                             window is in sample, else the candidate count; the report
+                             DSR. Default: the run's candidates_evaluated when a
+                             window is in sample (the front size when the run has no
+                             count); else --from-run 1 (out-of-sample book), --front
+                             the front size, --expr the candidate count; the report
                              names it in multiple_testing.n_trials_source
   --protocol-seed <n>        seed of every bootstrap, null and SPA draw
   --pbo-blocks <S>           even CSCV block count (default 16)

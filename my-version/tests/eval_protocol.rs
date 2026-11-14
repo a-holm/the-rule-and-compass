@@ -644,5 +644,8 @@ fn wf_markdown_psr_row() {
     assert!(psr < dsr);
     o.trials_source = "flag";
     let md = walkforward::run_table_with(&t, &s, "t", &o).unwrap().markdown();
+    assert!(md.contains("Trials N = 3 (source candidate_count)") && !md.contains("rcsr trials."), "{md}");
+    o.trials = Some(3);
+    let md = walkforward::run_table_with(&t, &s, "t", &o).unwrap().markdown();
     assert!(md.contains("(source flag)") && !md.contains("rcsr trials."), "{md}");
 }

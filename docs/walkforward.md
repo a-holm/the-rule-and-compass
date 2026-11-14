@@ -136,6 +136,7 @@ Default trials of the deflated Sharpe (#1027), shared by `--front` and `--from-r
 | case | trials | `n_trials_source` |
 |---|---|---|
 | `--trials N` | `N` | `flag` |
+| `--trials N` with `N` below the candidate count `k` | `k` (the report's `trials` is the number the DSR used) | `candidate_count` |
 | `--from-run`, no in-sample window | 1 | `out_of_sample_book` |
 | `--front`, no in-sample window | front size `k` | `front_size` |
 | a window is in sample (`--allow-in-sample-windows`), run has `search.candidates_evaluated > 0` | `candidates_evaluated` | `run.candidates_evaluated` |
@@ -612,9 +613,9 @@ The benchmark table has the same fields for the strategy, `cash`, `buy_and_hold`
 * **Circular block bootstrap** of the pooled net series with block length `L >= max(h, holding period)` periods (default `max(h, hold, ceil(n^(1/3)))`; a shorter `--block-len` is refused). It reports the mean and annualised Sharpe with percentile 95% CIs.
 * **Design effect**: the variance of the bootstrap mean with blocks over the same with iid rows (`L = 1`). `effective_n = n / design_effect`, in periods (hours on an hourly grid). The `p_mean_positive` field is the one-sided centred p-value `(1 + count) / (B + 1)`.
 * **N_eff**: the participation ratio of the candidate correlation matrix, `N^2 / sum c_ij^2`; identical candidates give 1 and uncorrelated ones give `N`. With `--trials N` the effective trials are `N * PR / candidates`.
-* **DSR** (Bailey and Lopez de Prado) at `N_eff` and `10 N_eff`, with `SR0 = sqrt(V) ((1-g) Z(1-1/N) + g Z(1-1/(N e)))`, `V` the variance of the candidate Sharpes (the Mertens estimator variance with one candidate), `T` the effective n, and skew and raw kurtosis of the series. All inputs are in the report.
+* **DSR** (Bailey and Lopez de Prado) at `N_eff` and `10 N_eff`, with `SR0 = max(0, sqrt(V) ((1-g) Z(1-1/N) + g Z(1-1/(N e))))` (the bracket is negative for `1 < N < 1.2836`; the floor keeps `SR0 >= 0`, so the DSR never exceeds the PSR), `V` the variance of the candidate Sharpes (the Mertens estimator variance with one candidate), `T` the effective n, and skew and raw kurtosis of the series. All inputs are in the report.
 * **PSR** (`multiple_testing.psr`): the same formula at `N = 1` (`SR0 = 0`), the probabilistic Sharpe ratio against a zero benchmark. `--from-run` with no in-sample window has `N = 1`, so `psr` equals `dsr_at_n_eff`. `n_trials_source` names where `trials` comes from (see the default table under `--front`).
-* **MinBTL** (`multiple_testing.min_btl_years`): `inference::min_btl_years(sharpe_annual, n_eff)`; 0 at `n_eff = 1`, NaN (null) when the annual Sharpe is not positive.
+* **MinBTL** (`multiple_testing.min_btl_years`): `inference::min_btl_years(sharpe_annual, n_eff)`; 0 at `n_eff = 1` and wherever the floored `SR0` is 0, NaN (null) when the annual Sharpe is not positive.
 * **PBO** by CSCV with `--pbo-blocks` (default 16) blocks, per-period Sharpe as the measure; needs two candidates.
 * **SPA** (Hansen 2005, joint circular block bootstrap, consistent, lower and upper recentering) of the candidates against the best long/flat baseline.
 * **BH-FDR** at `--fdr-q` over the per-candidate one-sided block-bootstrap p-values.
