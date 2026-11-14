@@ -1793,32 +1793,82 @@ pub struct AppendStats {
 
 /// Size of the buffer in front of the output file.
 const APPEND_WRITE_BUFFER: usize = 4 << 20;
-/// Memory the staged temp-column batch may use.
-const APPEND_BATCH_BUDGET: usize = 1 << 30;
+/// Memory the staged temp-column batch may use by default.
+const APPEND_BUDGET_MIB_DEFAULT: usize = 1024;
+/// Bounds of `RCSR_APPEND_BUDGET_MIB`.
+const APPEND_BUDGET_MIB_RANGE: std::ops::RangeInclusive<usize> = 64..=65536;
 /// Most groups one batch stages.
 const APPEND_BATCH_MAX: usize = 16;
 /// Blocks queued for the hash thread.
 const APPEND_HASH_QUEUE: usize = 8;
 
 /// Groups staged per temp-column read: `RCSR_APPEND_BATCH_GROUPS` when set
-/// (clamped to `1..=n_groups`; 1 reads one group at a time), else as many as
-/// fit the budget, at most 16.
+/// (1 reads one group at a time), else as many as fit the budget. Either way
+/// the result is at most 16, at most the group count, and at most what
+/// `RCSR_APPEND_BUDGET_MIB` (default 1024) holds, with 1 as the floor.
 fn append_batch_groups(source: &FileStore, n_extras: usize) -> usize {
-    parse_append_batch(
+    let (batch, note) = parse_append_batch(
         std::env::var("RCSR_APPEND_BATCH_GROUPS").ok().as_deref(),
+        std::env::var("RCSR_APPEND_BUDGET_MIB").ok().as_deref(),
         source.header.group_rows,
         source.header.n_groups(),
         n_extras,
-    )
+    );
+    if let Some(note) = note {
+        eprintln!("{}", note);
+    }
+    batch
 }
 
-fn parse_append_batch(value: Option<&str>, group_rows: usize, n_groups: usize, n_extras: usize) -> usize {
+/// The batch size and, when the budget or the maximum lowered it, the stderr
+/// note that says so.
+fn parse_append_batch(
+    value: Option<&str>,
+    budget_mib: Option<&str>,
+    group_rows: usize,
+    n_groups: usize,
+    n_extras: usize,
+) -> (usize, Option<String>) {
     let n_groups = n_groups.max(1);
-    if let Some(n) = value.and_then(|v| v.trim().parse::<usize>().ok()) {
-        return n.clamp(1, n_groups);
-    }
+    let mib = budget_mib
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(APPEND_BUDGET_MIB_DEFAULT, |m| {
+            m.clamp(*APPEND_BUDGET_MIB_RANGE.start(), *APPEND_BUDGET_MIB_RANGE.end())
+        });
+    let budget = mib << 20;
     let per_group = n_extras.max(1).saturating_mul(group_rows.max(1)).saturating_mul(8);
-    (APPEND_BATCH_BUDGET / per_group).clamp(1, APPEND_BATCH_MAX).min(n_groups)
+    let by_budget = budget / per_group;
+    let cap = by_budget.clamp(1, APPEND_BATCH_MAX).min(n_groups);
+    let floor_note = (by_budget == 0).then(|| {
+        format!(
+            "one group ({} MiB) exceeds the append budget ({} MiB); staging 1 group",
+            per_group.div_ceil(1 << 20),
+            mib
+        )
+    });
+    match value.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) => {
+            let want = n.clamp(1, n_groups);
+            let got = want.min(cap);
+            let note = if got >= want {
+                None
+            } else if by_budget == 0 {
+                floor_note
+            } else if by_budget < APPEND_BATCH_MAX {
+                Some(format!(
+                    "RCSR_APPEND_BATCH_GROUPS={} clamped to {} by the {} MiB append budget",
+                    n, got, mib
+                ))
+            } else {
+                Some(format!(
+                    "RCSR_APPEND_BATCH_GROUPS={} clamped to {} by the maximum batch",
+                    n, got
+                ))
+            };
+            (got, note)
+        }
+        None => (cap, floor_note),
+    }
 }
 
 pub(crate) fn write_store_appending_hashed_with(
@@ -1827,10 +1877,22 @@ pub(crate) fn write_store_appending_hashed_with(
     extras: &[AppendColumn],
     batch: usize,
 ) -> Result<(String, AppendStats), String> {
+    write_store_appending_hashed_over(path, source, extras, batch, |file| file)
+}
+
+/// [`write_store_appending_hashed_with`] with `wrap` applied to the temporary
+/// file; the bytes go through the wrapper.
+fn write_store_appending_hashed_over<W: Write>(
+    path: &str,
+    source: &FileStore,
+    extras: &[AppendColumn],
+    batch: usize,
+    wrap: impl FnOnce(File) -> W,
+) -> Result<(String, AppendStats), String> {
     let mut stats = AppendStats::default();
     let tmp = format!("{}.tmp-{}", path, std::process::id());
     let guard = TempGuard(tmp.clone());
-    let mut file = File::create(&tmp).map_err(|e| format!("{}: {}", tmp, e))?;
+    let mut file = wrap(File::create(&tmp).map_err(|e| format!("{}: {}", tmp, e))?);
     let (sha, tail) = with_hash_thread(&mut file, path, |out| {
         write_store_appending_to(out, path, source, extras, batch, &mut stats)
     })?;
@@ -1845,6 +1907,21 @@ pub(crate) fn write_store_appending_hashed_with(
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {}", path, e))?;
     std::mem::forget(guard);
     Ok((sha, stats))
+}
+
+/// Test hook: the hash thread of the append to this path panics at this block.
+#[cfg(test)]
+static APPEND_HASH_PANIC: std::sync::Mutex<Option<(String, usize)>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn append_hash_hook(path: &str, block: usize) {
+    let hit = matches!(
+        &*APPEND_HASH_PANIC.lock().unwrap_or_else(|e| e.into_inner()),
+        Some((p, n)) if p == path && *n == block
+    );
+    if hit {
+        panic!("injected hash thread panic at block {}", block);
+    }
 }
 
 /// Removes its file on drop; forgotten once the file has been renamed away.
@@ -1869,14 +1946,14 @@ struct WriterStats {
 
 /// `Write` adapter: writes to the file and hands a copy of every block to the
 /// hash thread. Emptied blocks come back through `free` for reuse.
-struct HashingWriter<'a> {
-    inner: &'a mut File,
+struct HashingWriter<'a, W: Write> {
+    inner: &'a mut W,
     tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     free: std::sync::mpsc::Receiver<Vec<u8>>,
     stats: WriterStats,
 }
 
-impl Write for HashingWriter<'_> {
+impl<W: Write> Write for HashingWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let t = std::time::Instant::now();
         let n = self.inner.write(buf)?;
@@ -1904,17 +1981,19 @@ impl Write for HashingWriter<'_> {
 /// Runs `body` with a buffered writer over `file` whose bytes are also hashed
 /// on a second thread. Returns the digest of everything written and the
 /// writer's own counters (time still waiting for the digest included).
-fn with_hash_thread<R>(
-    file: &mut File,
+fn with_hash_thread<W: Write, R>(
+    file: &mut W,
     path: &str,
-    body: impl FnOnce(&mut std::io::BufWriter<HashingWriter<'_>>) -> Result<R, String>,
+    body: impl FnOnce(&mut std::io::BufWriter<HashingWriter<'_, W>>) -> Result<R, String>,
 ) -> Result<(String, WriterStats), String> {
     std::thread::scope(|scope| {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(APPEND_HASH_QUEUE);
         let (free_tx, free) = std::sync::mpsc::channel::<Vec<u8>>();
         let digest = scope.spawn(move || {
             let mut hasher = crate::manifest::Sha256Hasher::new();
-            for block in rx {
+            for (_i, block) in rx.into_iter().enumerate() {
+                #[cfg(test)]
+                append_hash_hook(path, _i);
                 hasher.update(&block);
                 let _ = free_tx.send(block);
             }
@@ -3026,14 +3105,14 @@ mod tests {
 
     #[test]
     fn append_batch_default_follows_the_budget() {
-        assert_eq!(parse_append_batch(None, 65_536, 292, 427), 4);
-        assert_eq!(parse_append_batch(None, 65_536, 292, 1), 16);
-        assert_eq!(parse_append_batch(None, 65_536, 3, 1), 3);
-        assert_eq!(parse_append_batch(None, 65_536, 292, 100_000), 1);
-        assert_eq!(parse_append_batch(Some("1"), 65_536, 292, 427), 1);
-        assert_eq!(parse_append_batch(Some("1000"), 65_536, 292, 427), 292);
-        assert_eq!(parse_append_batch(Some("0"), 65_536, 292, 427), 1);
-        assert_eq!(parse_append_batch(Some("x"), 65_536, 292, 427), 4);
+        assert_eq!(batch_of(None, None, 65_536, 292, 427), 4);
+        assert_eq!(batch_of(None, None, 65_536, 292, 1), 16);
+        assert_eq!(batch_of(None, None, 65_536, 3, 1), 3);
+        assert_eq!(batch_of(None, None, 65_536, 292, 100_000), 1);
+        assert_eq!(batch_of(Some("1"), None, 65_536, 292, 427), 1);
+        assert_eq!(batch_of(Some("1000"), None, 65_536, 292, 427), 4);
+        assert_eq!(batch_of(Some("0"), None, 65_536, 292, 427), 1);
+        assert_eq!(batch_of(Some("x"), None, 65_536, 292, 427), 4);
     }
 
     /// Deterministic I/O proxy on a store shaped like the C2 append: 17 source
@@ -3109,5 +3188,139 @@ mod tests {
         assert!(err.contains("temporary column"), "{}", err);
         assert!(!std::path::Path::new(&out).exists());
         assert!(!std::path::Path::new(&format!("{}.tmp-{}", out, std::process::id())).exists());
+    }
+
+    fn batch_of(value: Option<&str>, mib: Option<&str>, rows: usize, groups: usize, cols: usize) -> usize {
+        parse_append_batch(value, mib, rows, groups, cols).0
+    }
+
+    #[test]
+    fn append_batch_override_is_clamped_to_the_budget() {
+        for v in [Some("16"), Some("292"), None] {
+            assert_eq!(batch_of(v, None, 65_536, 292, 427), 4, "{:?}", v);
+        }
+        let (n, note) = parse_append_batch(Some("16"), None, 65_536, 292, 427);
+        assert_eq!(n, 4);
+        assert_eq!(
+            note.as_deref(),
+            Some("RCSR_APPEND_BATCH_GROUPS=16 clamped to 4 by the 1024 MiB append budget")
+        );
+        assert_eq!(parse_append_batch(None, None, 65_536, 292, 427).1, None);
+        assert_eq!(batch_of(Some("1"), None, 65_536, 292, 427), 1);
+        assert_eq!(batch_of(Some("0"), None, 65_536, 292, 427), 1);
+        assert_eq!(batch_of(Some("x"), None, 65_536, 292, 427), 4);
+        assert_eq!(batch_of(Some("500"), None, 16, 7, 24), 7);
+        assert_eq!(batch_of(Some("500"), None, 16, 700, 24), APPEND_BATCH_MAX);
+        assert_eq!(batch_of(None, None, 0, 5, 0), 5);
+        assert_eq!(batch_of(None, None, 16, 0, 24), 1);
+    }
+
+    #[test]
+    fn append_batch_floor_is_one_group() {
+        let (n, note) = parse_append_batch(None, None, 65_536, 292, 3_000);
+        assert_eq!(n, 1);
+        assert_eq!(
+            note.as_deref(),
+            Some("one group (1500 MiB) exceeds the append budget (1024 MiB); staging 1 group")
+        );
+        let (n, note) = parse_append_batch(Some("16"), None, 65_536, 292, 3_000);
+        assert_eq!(n, 1);
+        assert!(note.unwrap().contains("exceeds the append budget"));
+    }
+
+    #[test]
+    fn append_budget_env_is_parsed_and_clamped() {
+        assert_eq!(batch_of(None, Some("64"), 65_536, 292, 427), 1);
+        assert_eq!(batch_of(None, Some("1"), 65_536, 292, 427), 1);
+        assert_eq!(batch_of(Some("16"), Some("65536"), 65_536, 292, 427), 16);
+        assert_eq!(batch_of(Some("16"), Some("999999999"), 65_536, 292, 427), 16);
+        for bad in ["", "garbage", "-5", "1.5"] {
+            assert_eq!(batch_of(Some("16"), Some(bad), 65_536, 292, 427), 4, "{:?}", bad);
+        }
+        let (n, note) = parse_append_batch(Some("16"), Some("64"), 65_536, 292, 427);
+        assert_eq!(n, 1);
+        assert!(note.unwrap().contains("exceeds the append budget (64 MiB)"));
+    }
+
+    /// Passes `limit` bytes through, then fails every write.
+    struct FailAfter<W: Write> {
+        inner: W,
+        limit: usize,
+    }
+
+    impl<W: Write> Write for FailAfter<W> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.limit == 0 {
+                return Err(std::io::Error::other("injected write failure"));
+            }
+            let n = buf.len().min(self.limit);
+            let n = self.inner.write(&buf[..n])?;
+            self.limit -= n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    fn assert_no_output(out: &str) {
+        assert!(!std::path::Path::new(out).exists(), "{} exists", out);
+        let tmp = format!("{}.tmp-{}", out, std::process::id());
+        assert!(!std::path::Path::new(&tmp).exists(), "{} remains", tmp);
+    }
+
+    #[test]
+    fn append_mid_stream_write_error_leaves_no_output() {
+        for batch in [1, 3] {
+            let fx = append_fixture(&format!("wfail{}", batch), 4, 16, 4, 2);
+            let out = fx.dir.join("never.rcsb").to_string_lossy().into_owned();
+            let err = write_store_appending_hashed_over(&out, &fx.source, &fx.extras, batch, |file| {
+                FailAfter { inner: file, limit: 700 }
+            })
+            .map(|_| ())
+            .unwrap_err();
+            assert_eq!(err, format!("{}: injected write failure", out));
+            assert_no_output(&out);
+            let _ = std::fs::remove_dir_all(&fx.dir);
+        }
+    }
+
+    #[test]
+    fn append_mid_stream_read_error_leaves_no_output() {
+        for batch in [1, 3] {
+            let fx = append_fixture(&format!("rfail{}", batch), 4, 16, 4, 2);
+            let keep = fx.source.data_start + fx.source.header.columns[0].offsets[3];
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fx.source.path)
+                .unwrap()
+                .set_len(keep)
+                .unwrap();
+            let out = fx.dir.join("never.rcsb").to_string_lossy().into_owned();
+            let err = write_store_appending_hashed_with(&out, &fx.source, &fx.extras, batch)
+                .map(|_| ())
+                .unwrap_err();
+            assert!(
+                err.starts_with(&format!("{}: copying column 'ts': ", out)),
+                "{}",
+                err
+            );
+            assert_no_output(&out);
+            let _ = std::fs::remove_dir_all(&fx.dir);
+        }
+    }
+
+    #[test]
+    fn append_hash_thread_panic_leaves_no_output() {
+        for batch in [1, 3] {
+            let fx = append_fixture(&format!("hpanic{}", batch), 4, 16, 4, 2);
+            let out = fx.dir.join("never.rcsb").to_string_lossy().into_owned();
+            *APPEND_HASH_PANIC.lock().unwrap() = Some((out.clone(), 0));
+            let res = write_store_appending_hashed_with(&out, &fx.source, &fx.extras, batch);
+            *APPEND_HASH_PANIC.lock().unwrap() = None;
+            assert_eq!(res.map(|_| ()).unwrap_err(), "hash thread panicked");
+            assert_no_output(&out);
+            let _ = std::fs::remove_dir_all(&fx.dir);
+        }
     }
 }
