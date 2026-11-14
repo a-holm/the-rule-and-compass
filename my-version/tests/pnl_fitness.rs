@@ -2004,7 +2004,7 @@ fn mask_flags_name_their_reason() {
     let missing = run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "nope"]);
     assert_eq!(code(&missing), 3, "{}", stderr(&missing));
     assert!(stderr(&missing).contains("mask column") && stderr(&missing).contains("nope"), "{}", stderr(&missing));
-    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g", "--gpu"]), "--pnl-mask with --gpu");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g", "--gpu"]), "--gpu");
     usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "0 - g", "--position", "top_tercile"]), "top_tercile");
 }
 

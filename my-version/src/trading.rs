@@ -1556,7 +1556,7 @@ impl FitnessBook {
                 return Err(format!("the regime mask has {} rows, the training slice {}", m.on.len(), n));
             }
         }
-        let mask: Option<BookMask> = None; // WIP red run: the mask is ignored
+        let mask = mask.filter(|m| m.on.iter().any(|&o| !o));
         let mut seg_group: Vec<u64> = rows.group.clone();
         let mut off_rows = 0usize;
         if let Some(m) = &mask {

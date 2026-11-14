@@ -1755,8 +1755,8 @@ impl Accum {
         let mut batch_in: Vec<crate::wf_batch::WindowScores> = Vec::new();
         let forced = self.forced.as_deref();
         for (window_index, mut d) in self.windows.into_iter().enumerate() {
-            if let Some(_gate) = &opts.mask {
-                let _ = window_index; // WIP red run: the walk-forward mask is ignored
+            if let Some(gate) = &opts.mask {
+                apply_mask(&mut d, gate, window_index);
             }
             {
                 let labelled = d.test_rows.iter().filter(|r| r.target.is_finite());
