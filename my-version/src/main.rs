@@ -5676,6 +5676,9 @@ fn main() {
                 Err(e) => trading_usage(&e),
             }
         }
+        if let Err(e) = rcsr::target::check_period_width(horizon, r.spec.stride_seconds, min_group_step) {
+            trading_usage(&e);
+        }
     }
     // #480: the exact long/flat fitness book on the canonical training rows.
     let fitness_book: Option<std::sync::Arc<rcsr::trading::FitnessBook>> = if fitness_pnl {
@@ -11084,8 +11087,9 @@ OPTIONS:
                              spec has a wider stride_seconds (target spec, else
                              --horizon), else the median step of labelled test
                              times. A spec with no stride_seconds whose labelled
-                             rows of one group are 2 horizons or more apart
-                             exits 2. A period is
+                             rows of one group are 2 horizons or more apart,
+                             and a stride_seconds wider than the smallest
+                             per-group step, exit 2. A period is
                              the bucket floor(t / S); without a declared
                              horizon a period is one timestamp. With a target
                              spec a different value exits 2; with --horizon
@@ -12199,7 +12203,7 @@ fn run_walkforward(args: &[String]) -> ! {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") || e.starts_with("--periods-per-year") || e.starts_with("missing stride_seconds") { EXIT_USAGE } else { EXIT_INPUT });
+            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") || e.starts_with("--periods-per-year") || e.starts_with("missing stride_seconds") || e.starts_with("stride_seconds") { EXIT_USAGE } else { EXIT_INPUT });
         }
     };
     if spec.threshold_fixed.is_none() {

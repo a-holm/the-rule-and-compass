@@ -34,7 +34,7 @@ use crate::risk::{risk_stats, BetaAlpha, DEFAULT_SORTINO_MAR};
 use crate::target::TargetSpec;
 use crate::target_structure;
 use crate::trading_gpu::{band_positions, BandParams};
-use crate::walkforward::{quantile, SECONDS_PER_YEAR};
+use crate::walkforward::{quantile, PeriodSource, SECONDS_PER_YEAR};
 use std::time::Instant;
 
 pub const SCHEMA: &str = "rcsr-ladder/1";
@@ -473,12 +473,16 @@ struct Pool {
     by_time: Vec<usize>,
     bounds: Vec<usize>,
     times: Vec<f64>,
+    /// Period buckets over `by_time`: one equal-weight period per `floor(t / S)` when the run declares the width `S`, else one per timestamp.
+    period_bounds: Vec<usize>,
+    period_times: Vec<f64>,
     ppy: f64,
     step: Option<f64>,
+    source: PeriodSource,
 }
 
 impl Pool {
-    fn new(p: &Panel, folds: &[Fold]) -> Pool {
+    fn new(p: &Panel, folds: &[Fold], declared: Option<(f64, PeriodSource)>) -> Pool {
         let mut idx = Vec::new();
         let mut ranges = Vec::new();
         for f in folds {
@@ -502,7 +506,35 @@ impl Pool {
         bounds.push(by_time.len());
         let mut steps: Vec<f64> = times.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 1e-9).collect();
         steps.sort_by(|a, b| a.total_cmp(b));
-        let step = steps.get(steps.len() / 2).copied().filter(|dt| *dt >= 1.0 && *dt <= SECONDS_PER_YEAR);
+        let declared = declared.filter(|(s, _)| *s >= 1.0 && *s <= SECONDS_PER_YEAR);
+        let (period_bounds, period_times) = match declared {
+            Some((s, _)) => {
+                let mut pb = vec![0usize];
+                let mut pt = Vec::new();
+                let mut last = f64::NAN;
+                for k in 0..by_time.len() {
+                    let t = p.time[idx[by_time[k]]];
+                    let key = (t / s).floor();
+                    if k == 0 || key != last {
+                        if k > 0 {
+                            pb.push(k);
+                        }
+                        pt.push(t);
+                        last = key;
+                    }
+                }
+                pb.push(by_time.len());
+                (pb, pt)
+            }
+            None => (bounds.clone(), times.clone()),
+        };
+        let (step, source) = match declared {
+            Some((s, source)) => (Some(s), source),
+            None => (
+                steps.get(steps.len() / 2).copied().filter(|dt| *dt >= 1.0 && *dt <= SECONDS_PER_YEAR),
+                PeriodSource::InferredLabelledRows,
+            ),
+        };
         let ppy = step.map_or(365.0, |dt| SECONDS_PER_YEAR / dt);
         Pool {
             idx,
@@ -510,8 +542,11 @@ impl Pool {
             by_time,
             bounds,
             times,
+            period_bounds,
+            period_times,
             ppy,
             step,
+            source,
         }
     }
 
@@ -519,11 +554,11 @@ impl Pool {
         self.idx.len()
     }
 
-    /// Equal-weight mean of a per-row vector for each timestamp.
+    /// Equal-weight mean of a per-row vector for each period.
     fn periods(&self, v: &[f64]) -> Vec<f64> {
-        (0..self.times.len())
+        (0..self.period_times.len())
             .map(|b| {
-                let (s, e) = (self.bounds[b], self.bounds[b + 1]);
+                let (s, e) = (self.period_bounds[b], self.period_bounds[b + 1]);
                 self.by_time[s..e].iter().map(|&k| v[k]).sum::<f64>() / (e - s) as f64
             })
             .collect()
@@ -1201,6 +1236,8 @@ pub struct Report {
     pub periods: usize,
     pub rows_scored: usize,
     pub periods_per_year: f64,
+    pub period_source: PeriodSource,
+    pub period_seconds: Option<f64>,
     pub block_len: usize,
     pub cost: crate::target::CostDecl,
     pub min_group_step: Option<f64>,
@@ -1493,7 +1530,7 @@ pub fn check_fold_spacing(p: &Panel, folds: &[Fold], horizon_seconds: f64) -> Re
 /// Exit code for an error from the ladder or ablation scoring path: 2 for an
 /// overlap refusal (as in the search objective and walk-forward), else `other`.
 pub fn spacing_exit(message: &str, other: i32) -> i32 {
-    if message.contains("overlapping returns") {
+    if message.contains("overlapping returns") || message.starts_with("missing stride_seconds") || message.starts_with("stride_seconds") {
         2
     } else {
         other
@@ -1514,12 +1551,20 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
     if opts.quantiles.is_empty() {
         return Err("--quantiles needs at least one value".to_string());
     }
-    let pool = Pool::new(p, folds);
+    let min_group_step = check_fold_spacing(p, folds, opts.horizon_seconds)?;
+    if let Some(s) = &opts.spec {
+        crate::target::check_period_width(s.horizon_seconds, s.stride_seconds, min_group_step)?;
+    }
+    let declared = match &opts.spec {
+        Some(s) => Some((s.period_width_seconds(), PeriodSource::TargetSpec)),
+        None if opts.horizon_seconds > 0.0 => Some((opts.horizon_seconds, PeriodSource::HorizonFlag)),
+        None => None,
+    };
+    let pool = Pool::new(p, folds, declared);
     let feats: Vec<usize> = (0..p.names.len()).collect();
     let mut rungs: Vec<Rung> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     let n = pool.len();
-    let min_group_step = check_fold_spacing(p, folds, opts.horizon_seconds)?;
 
     let mut cash = Rung::new("cash", "control");
     cash.pos = vec![0.0; n];
@@ -2031,12 +2076,14 @@ fn finish_report(
     let _ = market;
     Ok(Report {
         rows,
-        period_time: pool.times.clone(),
+        period_time: pool.period_times.clone(),
         emit_series: opts.emit_series,
         folds: folds.iter().map(|f| f.label.clone()).collect(),
-        periods: pool.times.len(),
+        periods: pool.period_times.len(),
         rows_scored: pool.len(),
         periods_per_year: pool.ppy,
+        period_source: pool.source,
+        period_seconds: pool.step,
         block_len: block,
         cost: opts.cost.clone().unwrap_or(crate::target::CostDecl {
             per_side_bps: opts.cost_bps,
@@ -2198,7 +2245,7 @@ impl Report {
         };
         format!(
             "{{\"schema\":{},\"folds\":{},\"periods\":{},\"rows_scored\":{},\"periods_per_year\":{},\"block_len\":{},\
-\"min_group_step_seconds\":{},\"cost_bps\":{},\"cost\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
+\"min_group_step_seconds\":{},\"annualization\":{{\"source\":{},\"period_seconds\":{}}},\"cost_bps\":{},\"cost\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
 \"sr_candidate_evaluations\":{},\"sr_wall_seconds\":{},\"sr_wall_basis\":{},\"gbm_beats_sr\":{}}},\"multiple_testing\":{{\"draws\":{},\"seed\":{},\
 \"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"sr_run\":{},\"rungs\":[{}]{}}}",
             jstr(SCHEMA),
@@ -2208,6 +2255,8 @@ impl Report {
             jnum(self.periods_per_year),
             self.block_len,
             jopt(self.min_group_step),
+            jstr(self.period_source.as_str()),
+            jopt(self.period_seconds),
             jnum(self.cost_bps),
             self.cost.json(),
             self.n_trials,
@@ -2470,7 +2519,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --windows <file>          protocol windows table (rcsr protocol windows)\n\
   --scheme <name>           expanding | rolling | locked (default expanding)\n\
   --purge-seconds <s>       gap between the fit range and the validation slice and between the validation slice and the test block (default 219600; the --target-spec purge when larger, reported as purge_source); with a spec whose column has a report in <data>.labels.json the JSON carries split.fit_label (name, stride, average_uniqueness, effective_n, effective_n_hours)\n\
-  --horizon-seconds <s>     label horizon; floors the bootstrap block; test rows of one group closer than it overlap and are refused (exit 2); the report carries min_group_step_seconds (default 0)\n\
+  --horizon-seconds <s>     label horizon; floors the bootstrap block; test rows of one group closer than it overlap and are refused (exit 2); the report carries min_group_step_seconds (default 0). Period width S: the target spec max(horizon_seconds, stride_seconds), else this flag, else the median step of labelled test times; periods_per_year = 31536000 / S, one period per floor(t / S) bucket, report annualization {source, period_seconds}. A spec with no stride_seconds whose labelled rows of one group are 2 horizons or more apart, and a stride_seconds wider than the smallest per-group step, exit 2\n\
   --cost-bps <x>            per-side cost of the headline book (default 12; with a --target-spec cost, the spec cost, and a different value is refused)\n\
   --cost-override <x>       per-side cost that differs from the --target-spec cost on purpose; reported as source flag with the spec cost beside it\n\
   --cost-grid <a,b,...>     per-side costs reported per rung (default 12,20,40; 1x, 2x and 3.33x the spec cost when a --target-spec declares one)\n\

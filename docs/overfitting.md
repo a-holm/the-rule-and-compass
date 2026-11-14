@@ -557,6 +557,8 @@ Verify: `tests/inference.rs` (hand-computed CVaR, break-even, BH, PSR and PBO fi
 
 A formula is only as good as the best opponent it beat. `rcsr ladder` runs every opponent on the same rows, folds, preprocessing, projection and cost model. Every rung is a `{0, 1}` long/flat book or cash.
 
+Period rule (#1129). The ladder annualises with the walk-forward width `S`: the target spec's `max(horizon_seconds, stride_seconds)`, else `--horizon-seconds`, else the median step of the labelled test times; `periods_per_year = 31536000 / S` and one equal-weight period per `floor(t / S)` bucket when `S` is declared. The JSON carries `annualization {source, period_seconds}`. A spec without `stride_seconds` over labelled test rows of one group at least `2 * horizon_seconds` apart, and a `stride_seconds` wider than the smallest per-group step, exit 2. See `docs/walkforward.md`, "Period rule (#1016)" and "Ladder (#1129)".
+
 | rung | what it is |
 |---|---|
 | `cash` | always flat |
