@@ -644,7 +644,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--seed-expr expr] [--seed-file path]
      [--implicit] [--implicit-derivative] [--function def]
      [--op-complexity spec] [--complexity-weights spec] [--depth-weight w]
-     [--split random|temporal|group|temporal-group|auto] [--time col]
+     [--split random|temporal|group|temporal-group|temporal-intervals|auto] [--time col]
+     [--split-table csv --split-id id] [--embargo seconds|auto]
      [--date-only error|utc-midnight|session-close] [--time-unit s|ms|us|ns] [--tz offset]
      [--group-by col] [--no-project] [--project n|auto] [--view k] [--gap N] [--folds K]
      [--lags K | --lag-set k,..|default] [--history-frac f]
@@ -675,7 +676,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random] [--qd-descriptor moments|book]
      [--time-budget seconds] [--interim-chunk] [--save file] [--save-every N] [--resume file]
      [--allow-backend-change] [--allow-build-change] [--run-manifest file] [--json-out file]
-     [--select-rule validation_objective|robust] [--select-blocks K] [--select-se Z] [--select-block-len L] [--select-require-edge]
+     [--select-rule validation_objective|robust] [--select-blocks K|intervals] [--select-se Z] [--select-block-len L] [--select-require-edge]
      [--reselect checkpoint] [--reselect-run run.json]
      [--format text|json|ndjson] [--json] [--ndjson] [--progress]
      [--dev-log-level summary|full] [--dev-log file.ndjson] [--no-dev-log]
@@ -780,6 +781,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   `--select-by train|validation|aicc` chooses the display order; the test
   block is a scoring-only lockbox and is never used to select. See
   [`docs/overfitting.md`](docs/overfitting.md) for the lockbox argument.
+* `--split-table <csv> --split-id <id>` (#1173) assigns training, validation and test from UTC half-open intervals (`split_id,role,start,end`), so a model can train before and after a test interval (the base of combinatorial purged cross-validation). A training or validation row is left out when its label window reaches a test interval (the purge of the `--target-spec`) or when it lies within `--embargo` after one; `--embargo auto` is the larger of the label purge and the longest lookback of the `--vars` columns. Training rows are also purged on both sides of every validation interval. Under `--fitness pnl` every contiguous training interval is its own book segment; `--select-blocks intervals` gives the robust rule one block per validation interval; `walkforward --from-run` compares intervals, so a test interval before later training rows is out of sample. See [`docs/data-splitting.md`](docs/data-splitting.md#interval-list-splits) and [`docs/time-series.md`](docs/time-series.md).
 * `--objective pnl|sharpe|log_growth` chooses the finalist on the validation
   slice by an exact long/flat book (position 0 or 1, never short, cost per side
   on `|delta p|` including the exit, daily `sqrt(365)` Sharpe) instead of the

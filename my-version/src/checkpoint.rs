@@ -275,6 +275,10 @@ pub struct Checkpoint {
     /// #345: sha256 of the declared target spec the run used, or `None` for a
     /// run without one. A resume must present the same spec.
     pub target_spec: Option<String>,
+    /// #1173: fingerprint of the resolved splits-table intervals, purge and
+    /// embargo, or `None` for a run without `--split-table`. A resume must
+    /// present the same intervals.
+    pub split_intervals: Option<String>,
     /// #482: offspring scored up to this checkpoint, so a resumed run keeps
     /// counting. `0` for a file written before the count existed.
     pub candidates_evaluated: u64,
@@ -600,12 +604,17 @@ pub fn hash_config_text(text: &str) -> u64 {
 impl Checkpoint {
     /// Serialise the checkpoint to the versioned text format.
     pub fn to_text(&self) -> String {
-        self.to_text_for(self.target_spec.as_deref())
+        self.to_text_with(self.target_spec.as_deref(), self.split_intervals.as_deref())
     }
 
     /// [`Checkpoint::to_text`] recording `target_spec` (the sha256 of the
     /// declared target spec of the writing run) instead of the stored one.
     pub fn to_text_for(&self, target_spec: Option<&str>) -> String {
+        self.to_text_with(target_spec, None)
+    }
+
+    /// [`Checkpoint::to_text_for`] that also records the split intervals (#1173).
+    pub fn to_text_with(&self, target_spec: Option<&str>, split_intervals: Option<&str>) -> String {
         let mut out = String::new();
         writeln!(out, "{}", FORMAT_LINE).unwrap();
         write_config(&self.config, &mut out);
@@ -632,6 +641,9 @@ impl Checkpoint {
         }
         if let Some(sha) = target_spec {
             writeln!(out, "target_spec {}", sha).unwrap();
+        }
+        if let Some(fp) = split_intervals {
+            writeln!(out, "split_intervals {}", fp).unwrap();
         }
         writeln!(out, "candidates_evaluated {}", self.candidates_evaluated).unwrap();
         writeln!(out, "archive_hash {:016x}", self.archive.hash()).unwrap();
@@ -773,6 +785,7 @@ impl Checkpoint {
         let mut build_fields: BTreeMap<String, String> = BTreeMap::new();
         let mut target_spec: Option<String> = None;
         let mut candidates_evaluated: Option<u64> = None;
+        let mut split_intervals: Option<String> = None;
         let mut final_header: Option<(usize, usize, u64)> = None;
         let mut final_sols: Vec<Sol> = Vec::new();
         let mut qd = QdReader::default(); // #1166
@@ -930,6 +943,12 @@ impl Checkpoint {
                         .get(1)
                         .ok_or_else(|| format!("line {}: target_spec has no value", lineno))?;
                     set_once(&mut target_spec, v.to_string(), "target_spec", lineno)?;
+                }
+                "split_intervals" => {
+                    let v = parts
+                        .get(1)
+                        .ok_or_else(|| format!("line {}: split_intervals has no value", lineno))?;
+                    set_once(&mut split_intervals, v.to_string(), "split_intervals", lineno)?;
                 }
                 "final" => {
                     let members = parse_num::<usize>(&parts, 1, lineno, "final members")?;
@@ -1308,6 +1327,7 @@ impl Checkpoint {
         };
         Ok(Checkpoint {
             target_spec,
+            split_intervals,
             candidates_evaluated: candidates_evaluated.unwrap_or(0),
             config,
             backend,
@@ -1364,6 +1384,27 @@ impl Checkpoint {
         let text = self.to_text_for(target_spec);
         crate::atomic::write_atomic(path, text.as_bytes(), crate::atomic::Fault::None)
             .map_err(|e| format!("cannot write checkpoint '{}': {}", path.display(), e))
+    }
+
+    /// [`Checkpoint::save_for`] that also records the split intervals (#1173).
+    pub fn save_with_split(&self, path: impl AsRef<Path>, target_spec: Option<&str>, split_intervals: Option<&str>) -> Result<(), String> {
+        let path = path.as_ref();
+        let text = self.to_text_with(target_spec, split_intervals);
+        crate::atomic::write_atomic(path, text.as_bytes(), crate::atomic::Fault::None)
+            .map_err(|e| format!("cannot write checkpoint '{}': {}", path.display(), e))
+    }
+
+    /// #1173: refuse a resume under other split intervals; `None` is a run
+    /// without `--split-table`.
+    pub fn check_split_intervals(&self, current: Option<&str>) -> Result<(), String> {
+        if self.split_intervals.as_deref() == current {
+            return Ok(());
+        }
+        Err(format!(
+            "checkpoint split intervals mismatch: saved {}, this run {}; refusing to resume a search under other --split-table intervals, purge or embargo",
+            self.split_intervals.as_deref().unwrap_or("none"),
+            current.unwrap_or("none")
+        ))
     }
 
     /// [`Checkpoint::save`] with a deliberate fault, for the crash-safety test.

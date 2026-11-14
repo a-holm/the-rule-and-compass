@@ -7260,6 +7260,7 @@ fn snapshot(
             backend == Backend::Gpu,
         )),
         target_spec: None,
+        split_intervals: None,
         candidates_evaluated,
         // #1166: trajectory state only under the policy; a passive archive is
         // rebuilt on resume, so its checkpoint keeps its bytes.

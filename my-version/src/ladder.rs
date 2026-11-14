@@ -213,6 +213,7 @@ fn group_column(t: &Table, name: Option<&str>) -> Result<Vec<u64>, String> {
 pub struct Fold {
     pub label: String,
     pub test_start: f64,
+    pub test_end: f64,
     pub fit: Vec<usize>,
     pub valid: Vec<usize>,
     pub test: Vec<usize>,
@@ -268,6 +269,7 @@ pub fn make_folds(
         let mut f = Fold {
             label: win.label.clone(),
             test_start: win.test_start,
+            test_end: win.test_end,
             fit: Vec::new(),
             valid: Vec::new(),
             test: Vec::new(),
@@ -2533,7 +2535,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --target-spec <file>      target spec file: per-side cost (cost_bps / 2), return units (log is converted with exp_m1), return column and horizon; also the zero-parameter rung (scale column must be in the panel)\n\
   --sr-run <run.json>       one search run (rcsr --objective ... --json-out) scored on every fold with the run's fixed threshold;\n\
                             a run that priced a band or a minimum hold is priced with it: half-width objective.spec.band_resolved as recorded, objective.spec.min_holding, every fold starts flat (sr_run.policy band);\n\
-                            a fold whose test starts before the run's last seen row + purge is refused (exit 3)\n\
+                            a fold whose test starts before the run's last seen row + purge is refused (exit 3; for a --split-table run: a fold that a kept training or validation row reaches with its label window or reads within the run embargo after it)\n\
                             prices objective.finalist.expression_exact, else the rounded expression (sr_run.expression_source);\n\
                             --locked-test refuses a rounded source (exit 3)\n\
   --allow-in-sample         with --sr-run: drop in-sample folds from every rung and label them oof:false\n\
@@ -2857,9 +2859,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let panel = load_panel(&inp, &opts).map_err(input_err)?;
     let mut folds = make_folds(&panel, &rows, opts.purge_seconds, &guard, resolved.embargo.seconds as f64).map_err(input_err)?;
     if let Some(sr) = &mut opts.sr_run {
-        let labelled: Vec<(String, f64)> = folds.iter().map(|f| (f.label.clone(), f.test_start)).collect();
-        let oof = sr.run.oof_flags(&labelled, allow_in_sample).map_err(|e| input_err(format!("--sr-run {}: {}", sr.run.path, e)))?;
-        sr.fold_oof = labelled.iter().map(|(l, _)| l.clone()).zip(oof.iter().copied()).collect();
+        let labelled: Vec<(String, f64, f64)> = folds.iter().map(|f| (f.label.clone(), f.test_start, f.test_end)).collect();
+        let oof = sr.run.oof_flags_windows(&labelled, allow_in_sample).map_err(|e| input_err(format!("--sr-run {}: {}", sr.run.path, e)))?;
+        sr.fold_oof = labelled.iter().map(|(l, _, _)| l.clone()).zip(oof.iter().copied()).collect();
         let mut keep = oof.iter();
         folds.retain(|_| *keep.next().unwrap());
         if folds.is_empty() {

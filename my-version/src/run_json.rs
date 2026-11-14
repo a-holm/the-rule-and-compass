@@ -81,6 +81,9 @@ pub struct RunFile {
     pub validation_time: Option<(f64, f64)>,
     /// `split.required_purge_seconds`, else `split.purge_seconds`.
     pub purge_seconds: Option<f64>,
+    /// #1173: the intervals of an interval-list run (`split.intervals`), resolved
+    /// again with `split.interval_purge_seconds` and `split.embargo_seconds`.
+    pub intervals: Option<crate::intervals::IntervalSplit>,
     /// `search.candidates_evaluated`.
     pub candidates_evaluated: Option<u64>,
     /// `elapsed_seconds`.
@@ -166,6 +169,7 @@ impl RunFile {
             train_time: pair(split.and_then(|s| s.get("train_time"))),
             validation_time: pair(split.and_then(|s| s.get("validation_time"))),
             purge_seconds: purge("required_purge_seconds").or_else(|| purge("purge_seconds")),
+            intervals: run_intervals(split)?,
             candidates_evaluated: j
                 .get("search")
                 .and_then(|s| s.get("candidates_evaluated"))
@@ -258,4 +262,98 @@ pub fn rounded_refusal(path: &str) -> String {
          rerun the search with a build that writes expression_exact",
         path
     )
+}
+
+fn interval_list(j: Option<&Json>, key: &str) -> Result<Vec<(i64, i64)>, String> {
+    let bad = || format!("split.intervals.{} is not a list of [start, end] pairs", key);
+    match j {
+        Some(Json::Arr(a)) => a
+            .iter()
+            .map(|p| match p {
+                Json::Arr(q) if q.len() == 2 => match (q[0].as_f64(), q[1].as_f64()) {
+                    (Some(s), Some(e)) => Ok((s as i64, e as i64)),
+                    _ => Err(bad()),
+                },
+                _ => Err(bad()),
+            })
+            .collect(),
+        _ => Err(bad()),
+    }
+}
+
+/// #1173: `split.intervals` with its purge and embargo; `None` for a run of
+/// another split mode. A malformed block is an error, never the old rule.
+fn run_intervals(split: Option<&Json>) -> Result<Option<crate::intervals::IntervalSplit>, String> {
+    let Some(s) = split else { return Ok(None) };
+    let Some(iv) = s.get("intervals") else { return Ok(None) };
+    let declared = crate::intervals::Declared {
+        split_id: s.get("split_id").and_then(Json::as_str).unwrap_or("").to_string(),
+        train: interval_list(iv.get("train"), "train")?,
+        validation: interval_list(iv.get("validation"), "validation")?,
+        test: interval_list(iv.get("test"), "test")?,
+    };
+    let int = |key: &str| {
+        s.get(key)
+            .and_then(Json::as_f64)
+            .map(|v| v as i64)
+            .ok_or_else(|| format!("split.intervals needs split.{}", key))
+    };
+    let source = s
+        .get("embargo_source")
+        .and_then(Json::as_str)
+        .and_then(crate::intervals::EmbargoSource::parse)
+        .ok_or_else(|| "split.intervals needs split.embargo_source (flag, lookback or purge)".to_string())?;
+    Ok(Some(crate::intervals::IntervalSplit::new(declared, int("interval_purge_seconds")?, int("embargo_seconds")?, source, None)))
+}
+
+impl RunFile {
+    /// #1173: the test window `[test_start, test_end)` is in sample. An
+    /// interval-list run compares intervals: in sample when a kept training or
+    /// validation row has a label window that reaches the window or lies within
+    /// the embargo after it, so a window before later training rows can be out of
+    /// sample. Any other run keeps [`RunFile::in_sample`].
+    pub fn in_sample_window(&self, test_start: f64, test_end: f64) -> bool {
+        match &self.intervals {
+            Some(iv) => {
+                let mut kept = iv.effective(crate::intervals::Role::Train);
+                kept.extend(iv.effective(crate::intervals::Role::Validation));
+                crate::intervals::window_in_sample(&kept, test_start.floor() as i64, test_end.ceil() as i64, iv.purge, iv.embargo)
+            }
+            None => self.in_sample(test_start),
+        }
+    }
+
+    /// Why a window is in sample under the interval rule, for refusals.
+    pub fn interval_reason(&self) -> String {
+        match &self.intervals {
+            Some(iv) => format!(
+                "a kept training or validation row of split '{}' has a label window reaching the window (purge {} s) or reads its bars (embargo {} s after it)",
+                iv.declared.split_id, iv.purge, iv.embargo
+            ),
+            None => "the run has no split.intervals".to_string(),
+        }
+    }
+
+    /// [`RunFile::oof_flags`] over `(label, test_start, test_end)` folds with
+    /// [`RunFile::in_sample_window`].
+    pub fn oof_flags_windows(&self, folds: &[(String, f64, f64)], allow: bool) -> Result<Vec<bool>, String> {
+        if self.intervals.is_none() {
+            let starts: Vec<(String, f64)> = folds.iter().map(|(l, s, _)| (l.clone(), *s)).collect();
+            return self.oof_flags(&starts, allow);
+        }
+        let flags: Vec<bool> = folds.iter().map(|(_, s, e)| !self.in_sample_window(*s, *e)).collect();
+        if !allow {
+            let bad: Vec<&(String, f64, f64)> = folds.iter().zip(&flags).filter(|(_, ok)| !**ok).map(|(f, _)| f).collect();
+            if !bad.is_empty() {
+                let labels: Vec<&str> = bad.iter().map(|f| f.0.as_str()).collect();
+                return Err(format!(
+                    "fold(s) {} test rows the run trained or selected on ({}); \
+                     use a run trained before the fold, or --allow-in-sample to label them oof:false",
+                    labels.join(", "),
+                    self.interval_reason()
+                ));
+            }
+        }
+        Ok(flags)
+    }
 }
