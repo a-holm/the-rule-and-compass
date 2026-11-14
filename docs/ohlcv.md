@@ -993,6 +993,10 @@ partitioned into disjoint intervals on that thread:
 | `gpu.write_s` | host staging writes of GPU output blocks |
 | `timing.feature_cpu_s` | the CPU fallback pass |
 | `timing.feature_other_s` | `feature_s` minus the five above; never negative beyond clock rounding |
+| `timing.write_s` | the append pass that copies the source store and the temp columns into the output |
+| `timing.write_read_s` | block reads inside `write_s` (temp columns in batches, source blocks) |
+| `timing.write_write_s` | file writes inside `write_s` |
+| `timing.write_hash_wait_s` | time inside `write_s` the writer waits for the SHA-256 thread |
 
 `gpu.kernel_s`, `gpu.h2d_s` and `gpu.d2h_s` are device-busy measures. They
 overlap the host timeline and are not summed into the partition. The text

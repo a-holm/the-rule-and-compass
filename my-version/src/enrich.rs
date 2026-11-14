@@ -1827,6 +1827,10 @@ pub struct Report {
     pub feature_other_seconds: f64,
     pub xs_seconds: f64,
     pub write_seconds: f64,
+    /// Partition of `write_seconds` (#1037): temp-column and source reads, file writes, and time blocked on the hash thread.
+    pub write_read_seconds: f64,
+    pub write_write_seconds: f64,
+    pub write_hash_wait_seconds: f64,
     pub total_seconds: f64,
     /// #284: run-scoped phase ledger: stage seconds (`features`, `io`, `host_other`) and device-busy intervals on one clock.
     pub ledger: crate::gpu_stats::RunLedger,
@@ -1889,6 +1893,10 @@ impl Report {
                 self.gpu_write_seconds,
                 self.feature_cpu_seconds,
                 self.feature_other_seconds
+            ),
+            format!(
+                "# enrich: write_parts read={:.3}s write={:.3}s hash_wait={:.3}s",
+                self.write_read_seconds, self.write_write_seconds, self.write_hash_wait_seconds
             ),
         ];
         if let Some(hash) = &self.projection_hash {
@@ -2044,7 +2052,7 @@ impl Report {
              \"backend\":{},\"gpu_requested\":{},\"gpu_probed\":{},\"gpu_available\":{},\"gpu_device\":{},\n  \
              \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"write_s\":{:.6},\"transfer_bytes\":{},\"write_bw\":{:.0},\"fallback_columns\":[{}]}},\n  \
              \"plan_rates\":{},\n  \"projection\":{{\"hash\":{},\"columns\":[{}]}},\n  \
-             \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"feature_read_s\":{:.6},\"feature_context_s\":{:.6},\"feature_gpu_s\":{:.6},\"feature_cpu_s\":{:.6},\"feature_other_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"total_s\":{:.6}}},\n  \"ledger\":{},\n  \
+             \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"feature_read_s\":{:.6},\"feature_context_s\":{:.6},\"feature_gpu_s\":{:.6},\"feature_cpu_s\":{:.6},\"feature_other_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"write_read_s\":{:.6},\"write_write_s\":{:.6},\"write_hash_wait_s\":{:.6},\"total_s\":{:.6}}},\n  \"ledger\":{},\n  \
              \"peak_rss_bytes\":{},\n  \"features\":[{}],\n  \"long_labels\":[{}],\n  \"plan\":[{}]\n}}\n",
             jstr(&self.input),
             jstr(&self.output),
@@ -2104,6 +2112,9 @@ impl Report {
             self.feature_other_seconds,
             self.xs_seconds,
             self.write_seconds,
+            self.write_read_seconds,
+            self.write_write_seconds,
+            self.write_hash_wait_seconds,
             self.total_seconds,
             self.ledger.phase_json("enrich", ENRICH_ZERO_STAGES),
             self.peak_rss_bytes,
@@ -8990,6 +9001,9 @@ fn enrich_inner(
             feature_other_seconds,
             xs_seconds,
             write_seconds: 0.0,
+            write_read_seconds: 0.0,
+            write_write_seconds: 0.0,
+            write_hash_wait_seconds: 0.0,
             ledger: phase_ledger(dev.ledger, started, read_seconds, feature_read_seconds, gpu_write_seconds, 0.0, feature_context_seconds, feature_gpu_seconds, feature_cpu_seconds, feature_other_seconds, xs_seconds),
             total_seconds: started.elapsed().as_secs_f64(),
             peak_rss_bytes: peak_rss_bytes(),
@@ -9005,7 +9019,7 @@ fn enrich_inner(
     // checksum without a second multi-gigabyte read.
     let t_write = Instant::now();
     let tmp_out = work_dir.join("out.rcsb").to_string_lossy().into_owned();
-    let output_sha = store::write_store_appending_hashed(&tmp_out, &store, &extras)?;
+    let (output_sha, append) = store::write_store_appending_hashed_stats(&tmp_out, &store, &extras)?;
     std::fs::rename(&tmp_out, out).map_err(|e| format!("{}: {}", out, e))?;
     let write_seconds = t_write.elapsed().as_secs_f64();
     let bytes = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
@@ -9063,6 +9077,9 @@ fn enrich_inner(
         feature_other_seconds,
         xs_seconds,
         write_seconds,
+        write_read_seconds: append.read_s,
+        write_write_seconds: append.write_s,
+        write_hash_wait_seconds: append.hash_wait_s,
         ledger: phase_ledger(dev.ledger, started, read_seconds, feature_read_seconds, gpu_write_seconds, write_seconds, feature_context_seconds, feature_gpu_seconds, feature_cpu_seconds, feature_other_seconds, xs_seconds),
         total_seconds: started.elapsed().as_secs_f64(),
         peak_rss_bytes: peak_rss_bytes(),
