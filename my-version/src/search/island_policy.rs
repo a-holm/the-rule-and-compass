@@ -25,7 +25,7 @@
 use super::{
     afp_worst, canonical_front, defers_fit_to_gpu, draw_row_dependent, fit_constants, gate_fit, population_best,
     FitAcceptCounts, FitPath,
-    pre_fit_tree, tournament, Config, EvalSample, FrontScope, Ind, MigrationPolicy, RestartPolicy, Selection,
+    pre_fit_tree, qd_descriptor_of, tournament, Config, EvalSample, FrontScope, Ind, MigrationPolicy, RestartPolicy, Selection,
     FRONT_PARENT_P, MIGRANT_TOURNAMENT,
 };
 use crate::checkpoint::IslandStall;
@@ -590,7 +590,7 @@ impl TreeIslands<'_> {
                             return d;
                         }
                     }
-                    qd::descriptor(&ind.tree, self.gen_train)
+                    qd_descriptor_of(&ind.tree, self.gen_data, self.cfg) // #1084
                 })
                 .collect();
             descriptors
@@ -678,7 +678,7 @@ impl IslandPopulation for TreeIslands<'_> {
     }
 
     fn restart(&mut self, island: usize) {
-        let (cfg, nvars, aggs, gen_train) = (self.cfg, self.nvars, self.aggs, self.gen_train);
+        let (cfg, nvars, aggs, gen_train, gen_data) = (self.cfg, self.nvars, self.aggs, self.gen_train, self.gen_data);
         let mut r = self.rngs[island].clone();
         // #120: aim the restart at the least-visited region by rejection
         // sampling a few cheap descriptor probes.
@@ -690,7 +690,7 @@ impl IslandPopulation for TreeIslands<'_> {
                 let mut t = random_tree_with(&mut r, nvars, &cfg.ops, cfg.init_depth, Some(aggs));
                 if let Some(target) = qd_target {
                     let mut best = t.clone();
-                    let best_d = qd::descriptor(&t, gen_train);
+                    let best_d = qd_descriptor_of(&t, gen_data, cfg); // #1084
                     let mut best_score = if hc && !expr::row_dependent(&t) {
                         f64::INFINITY
                     } else {
@@ -698,7 +698,7 @@ impl IslandPopulation for TreeIslands<'_> {
                     };
                     for _ in 0..3 {
                         let cand = random_tree_with(&mut r, nvars, &cfg.ops, cfg.init_depth, Some(aggs));
-                        let d = qd::descriptor(&cand, gen_train);
+                        let d = qd_descriptor_of(&cand, gen_data, cfg); // #1084
                         let score = (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2);
                         if score < best_score && !(hc && !expr::row_dependent(&cand)) {
                             best = cand;

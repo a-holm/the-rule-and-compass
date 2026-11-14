@@ -427,6 +427,9 @@ pub struct Config {
     /// hashes descriptors to random cells. Only the first is the proposed
     /// method; the other two are equal-budget controls.
     pub qd_control: u8,
+    /// #1084: what the QD descriptor axes measure. `Book` reads the long/flat
+    /// fitness book and needs `--fitness pnl`; `Moments` is the original pair.
+    pub qd_descriptor: qd::DescriptorKind,
     /// Optional progress callback, invoked once per generation.
     pub progress: Option<ProgressFn>,
     /// #211: optional development-log callback, invoked once per generation
@@ -854,6 +857,7 @@ impl Default for Config {
             qd_cvt: false,
             qd_policy: false,
             qd_control: 0,
+            qd_descriptor: qd::DescriptorKind::Moments,
             progress: None,
             dev_log: None, // #211: off unless --dev-log is given
             front_observer: None, // #462
@@ -953,6 +957,7 @@ impl Config {
         compare!(qd_cvt, "qd_cvt"); // #120
         compare!(qd_policy, "qd_policy"); // #120
         compare!(qd_control, "qd_control"); // #120
+        settings::differences(Group::Qd, self, other, &mut diff); // #1084
         // #25: units only change the trajectory when they are required; the
         // declaration itself is still part of the saved configuration.
         compare!(units, "units");
@@ -1074,7 +1079,7 @@ impl Ind {
         let (error, descriptor) = if cfg.accepts_dimensions(&tree) {
             match fitted {
                 Some(fit) if can_reuse_sse(cfg, train, &fit, hash) => {
-                    let d = want_descriptor.then(|| qd::descriptor(&tree, train.sample));
+                    let d = want_descriptor.then(|| qd_descriptor_of(&tree, train, cfg)); // #1084
                     (fit.sse / train.sample.len() as f64, d)
                 }
                 _ => fitness_error_and_descriptor(&tree, train, cfg, want_descriptor), // #27 #480
@@ -4468,10 +4473,28 @@ fn fitness_error_and_descriptor(
     }
     let nvars = s.x.first().map(Vec::len).unwrap_or(0);
     with_predictions(tree, data, |pred| {
+        if want_descriptor && cfg.qd_descriptor == qd::DescriptorKind::Book {
+            // #1084: the descriptor reads the reduction that gives the regret.
+            let (error, shape) = book.regret_and_shape(pred);
+            return (error, Some(qd::book_descriptor(&shape)));
+        }
         let error = book.regret(pred);
         let descriptor = want_descriptor.then(|| qd::descriptor_from_prediction(tree, pred, nvars));
         (error, descriptor)
     })
+}
+
+/// #1084: the configured QD descriptor of `tree` on `data` by one evaluation,
+/// for a tree that has none from its scoring pass (device-scored, a random
+/// probe, or unknown to the archive). The moments kind is [`qd::descriptor`];
+/// the book kind is the scoring path's own book reduction.
+fn qd_descriptor_of(tree: &Node, data: &EvalSample, cfg: &Config) -> qd::Descriptor {
+    match cfg.qd_descriptor {
+        qd::DescriptorKind::Moments => qd::descriptor(tree, data.sample),
+        qd::DescriptorKind::Book => fitness_error_and_descriptor(tree, data, cfg, true)
+            .1
+            .unwrap_or_else(|| qd::book_descriptor(&crate::trading::BookShape::default())),
+    }
 }
 
 /// #120: score a candidate and, when asked, accumulate its behaviour
@@ -6649,14 +6672,14 @@ fn evolve_island(
                     let mut best_score = if hc && !expr::row_dependent(&t) {
                         f64::INFINITY
                     } else {
-                        let d = qd::descriptor(&t, train.sample);
+                        let d = qd_descriptor_of(&t, train, cfg); // #1084
                         (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2)
                     };
                     for _ in 0..3 {
                         let cand = random_tree_with(
                             rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs)
                         );
-                        let d = qd::descriptor(&cand, train.sample);
+                        let d = qd_descriptor_of(&cand, train, cfg); // #1084
                         let score = (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2);
                         if score < best_score && !(hc && !expr::row_dependent(&cand)) {
                             t = cand;
@@ -8367,6 +8390,9 @@ fn run_search(
                 .to_string(),
         ); // #1070
     }
+    if cfg.qd_bins > 0 && cfg.qd_descriptor == qd::DescriptorKind::Book && cfg.fitness.book().is_none() {
+        return Err("--qd-descriptor book needs --fitness pnl: the book descriptor reads the long/flat fitness book".to_string()); // #1084
+    }
     #[cfg(feature = "cuda")]
     crate::gpu::note_search_start();
     let nvars = train.x.first().map(|r| r.len()).unwrap_or(0);
@@ -9098,7 +9124,7 @@ fn run_search(
         } else {
             QdArchive::new(cfg.qd_bins, cfg.qd_cell_cap)
         };
-        Some(archive.with_nvars(nvars))
+        Some(archive.with_nvars(nvars).with_kind(cfg.qd_descriptor)) // #1084
     } else {
         None
     };
@@ -9744,7 +9770,7 @@ fn run_search(
                 for s in &archive.items {
                     items.push((s.tree.clone(), s.error, s.cost, None));
                 }
-                qd.record_with_descriptors(items, gen_train);
+                qd.record_with_descriptors_by(items, gen_train, |t| qd_descriptor_of(t, gen_data, cfg)); // #1084
             }
 
             // A checkpoint is taken only at a generation boundary: all of the
@@ -12912,6 +12938,60 @@ mod tests {
             before,
             "QD scoring evaluated a tree a second time for its descriptor"
         );
+    }
+
+    /// #1084: under `--fitness pnl` the book descriptor comes from the same
+    /// reduction as the regret, the regret bits do not move, and the evaluating
+    /// fallback (the path of a device-scored member) gives the same point.
+    #[test]
+    fn qd_book_descriptor_is_folded_into_the_pnl_scoring_pass() {
+        let s = sample();
+        let book = pnl_book(&s);
+        let trees = [
+            node(Op::Add, vec![input(0), constant(0.25)]),
+            node(Op::Sin, vec![node(Op::Mul, vec![constant(9.0), input(0)])]),
+            node(Op::Sub, vec![input(1), constant(1.2)]),
+        ];
+        let off = Config { fitness: Fitness::LongPnl(book.clone()), fit_iters: 0, threads: 1, ..Config::default() };
+        let moments = Config { qd_bins: 16, ..off.clone() };
+        let on = Config { qd_descriptor: crate::qd::DescriptorKind::Book, ..moments.clone() };
+        let data = EvalSample::new(&s, &off);
+        let mut points = Vec::new();
+        for t in &trees {
+            let plain = Ind::evaluated(t.clone(), &data, &off);
+            let ind = Ind::evaluated(t.clone(), &data, &on);
+            assert_eq!(plain.error.to_bits(), ind.error.to_bits(), "the book descriptor changed the regret");
+            let pred: Vec<f64> = s.x.iter().map(|row| expr::eval(t, row)).collect();
+            let (regret, shape) = book.regret_and_shape(&pred);
+            assert_eq!(regret.to_bits(), ind.error.to_bits());
+            let got = ind.descriptor.expect("the pnl scoring pass attaches the book descriptor");
+            assert_eq!(got, crate::qd::book_descriptor(&shape));
+            assert_eq!(qd_descriptor_of(t, &data, &on), got, "the fallback differs from the scoring pass");
+            let m = Ind::evaluated(t.clone(), &data, &moments).descriptor.expect("moments descriptor");
+            assert_eq!(m, crate::qd::descriptor_from_prediction(t, &pred, 2), "the moments kind changed");
+            assert_eq!(qd_descriptor_of(t, &data, &moments), crate::qd::descriptor(t, &s));
+            points.push(got);
+        }
+        assert!(points.iter().all(|d| d.usage > 0.0), "{points:?}");
+        assert!(points[0] != points[1] && points[1] != points[2], "{points:?}");
+    }
+
+    /// #1084: the book descriptor without a fitness book is refused, not run
+    /// with the moments pair.
+    #[test]
+    fn the_book_descriptor_needs_the_fitness_book() {
+        let s = sample();
+        let cfg = Config {
+            qd_bins: 8,
+            qd_descriptor: crate::qd::DescriptorKind::Book,
+            generations: 1,
+            threads: 1,
+            ..Config::default()
+        };
+        let err = run_seeded_checked(&cfg, &s, &s, &[]).err().expect("refused");
+        assert!(err.contains("--qd-descriptor book needs --fitness pnl"), "{err}");
+        let passive_off = Config { qd_bins: 0, ..cfg };
+        assert!(run_seeded_checked(&passive_off, &s, &s, &[]).is_ok(), "no archive, nothing to describe");
     }
 
     fn aged_ind(tree: Node, error: f64, complexity: f64, age: u32) -> Ind {

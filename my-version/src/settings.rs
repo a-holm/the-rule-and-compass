@@ -18,6 +18,7 @@
 //! so older checkpoints still load and default checkpoints keep their bytes.
 //! `tests/settings_table.rs` checks every row in every reader.
 
+use crate::qd::DescriptorKind;
 use crate::search::{Config, FitAccept, FrontScope, MigrationPolicy, MutationMix, RestartPolicy, Selection, VariationMode};
 use std::collections::BTreeMap;
 
@@ -38,10 +39,12 @@ pub enum Group {
     Fit,
     /// The variation engine selection, after the checkpoint options.
     Engine,
+    /// The quality-diversity settings, after the other `--qd` options.
+    Qd,
 }
 
 impl Group {
-    pub const ALL: [Group; 7] = [
+    pub const ALL: [Group; 8] = [
         Group::Stop,
         Group::Schedule,
         Group::Island,
@@ -49,6 +52,7 @@ impl Group {
         Group::Filter,
         Group::Fit,
         Group::Engine,
+        Group::Qd,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -60,6 +64,7 @@ impl Group {
             Group::Filter => "filter",
             Group::Fit => "fit",
             Group::Engine => "engine",
+            Group::Qd => "qd",
         }
     }
 }
@@ -164,7 +169,7 @@ macro_rules! enum_value {
     )*};
 }
 
-enum_value!(Selection, RestartPolicy, MutationMix, FrontScope, MigrationPolicy, VariationMode, FitAccept);
+enum_value!(Selection, RestartPolicy, MutationMix, FrontScope, MigrationPolicy, VariationMode, FitAccept, DescriptorKind);
 
 /// How the command line sets a row.
 pub enum Cli<T> {
@@ -937,6 +942,29 @@ pub static TABLE: &[&dyn Setting] = &[
         get: |c| &c.fit_accept,
         set: |c| &mut c.fit_accept,
         cli: Cli::Value(FitAccept::parse),
+        write: Write::UnlessDefault,
+        active: None,
+        conflict: Conflict::SavedKey,
+    },
+    &Row::<DescriptorKind> {
+        flag: "--qd-descriptor",
+        key: "qd_descriptor",
+        group: Group::Qd,
+        schema_type: "enum",
+        schema_default: "moments",
+        schema: "#1084: moments | book. What the two QD descriptor axes measure. moments: variable usage x prediction skewness. book: the long/flat book of the search fitness, from the reduction that gives the regret: exposure x = long_rows / rows mapped by ln(x / 1e-4) / ln(1e4), and mean holding length h = long_rows / max(1, entries) rows, entries = (flips + exits) / 2 over every (group, block) run, mapped by ln(h) / ln(1e4); both clamped to [0, 1], a flat book at (0, 0). Needs --fitness pnl and a QD archive (--qd, --qd-cells or --qd-policy), else exit 2. Under book every cell counts as reachable. A device-scored member gets its book descriptor from one CPU evaluation, counted in qd.descriptor_fallbacks. --json qd.descriptor is book; the key is absent under moments. Saved search setting: written to the checkpoint only for book, a resume refuses a different value, a checkpoint without it loads as moments",
+        help: "  --qd-descriptor moments|book
+                             what the QD descriptor axes measure. moments
+                             (default): variable usage x prediction skewness.
+                             book: log exposure x log mean holding length of
+                             the long/flat book the fitness prices. book needs
+                             --fitness pnl and --qd, --qd-cells or
+                             --qd-policy. Saved search setting (#1084)",
+        bench: None,
+        gui: false,
+        get: |c| &c.qd_descriptor,
+        set: |c| &mut c.qd_descriptor,
+        cli: Cli::Value(DescriptorKind::parse),
         write: Write::UnlessDefault,
         active: None,
         conflict: Conflict::SavedKey,
