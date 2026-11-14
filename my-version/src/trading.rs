@@ -1186,6 +1186,27 @@ pub fn blocked_alpha(
     spec: &TradingSpec,
     blocks: usize,
 ) -> Result<BlockedAlpha, String> {
+    blocked_alpha_with(pred, r, rows, spec, blocks, None)
+}
+
+/// #1173: [`blocked_alpha`] with one block per cut: a row stamped from `cuts[k]` up
+/// to the next cut is in block `k` (`--select-blocks intervals` passes the
+/// validation interval starts).
+pub fn blocked_alpha_cuts(pred: &[f64], r: &[f64], rows: &TradingRows, spec: &TradingSpec, cuts: &[f64]) -> Result<BlockedAlpha, String> {
+    if cuts.is_empty() || cuts.len() > FITNESS_MAX_BLOCKS {
+        return Err(format!("the block count must be 1 to {}, got {}", FITNESS_MAX_BLOCKS, cuts.len()));
+    }
+    blocked_alpha_with(pred, r, rows, spec, cuts.len(), Some(cuts))
+}
+
+fn blocked_alpha_with(
+    pred: &[f64],
+    r: &[f64],
+    rows: &TradingRows,
+    spec: &TradingSpec,
+    blocks: usize,
+    cuts: Option<&[f64]>,
+) -> Result<BlockedAlpha, String> {
     spec.validate()?;
     check_lengths(pred.len(), r, rows)?;
     let keep: Vec<usize> = (0..pred.len())
@@ -1202,7 +1223,10 @@ pub fn blocked_alpha(
     let flat = run_book(&ctx, &vec![0.0; n], cost_side);
     let held = run_book(&ctx, &vec![1.0; n], cost_side);
     let keys: Vec<f64> = if ctx.bucket > 0.0 { ctx.time.iter().map(|t| (t / ctx.bucket).floor()).collect() } else { ctx.time.clone() };
-    let ids = block_ids(&keys, blocks)?;
+    let ids = match cuts {
+        None => block_ids(&keys, blocks)?,
+        Some(c) => ctx.time.iter().map(|t| c.partition_point(|s| s <= t).saturating_sub(1) as u8).collect(),
+    };
     let mut series_net: Vec<f64> = Vec::new();
     let mut series_pos: Vec<f64> = Vec::new();
     let mut series_bh: Vec<f64> = Vec::new();
@@ -1487,21 +1511,25 @@ impl FitnessBook {
         blocks: usize,
         lambda: f64,
     ) -> Result<Self, String> {
-        Self::with_blocks_masked(slice, spec, horizon_seconds, blocks, lambda, None)
+        Self::with_segments(slice, spec, horizon_seconds, blocks, lambda, &[], None)
     }
 
-    /// #1180: [`FitnessBook::with_blocks`] under a regime mask. Rows with the
-    /// mask off are forced flat and earn and pay nothing; every maximal run of
-    /// on rows of a group starts flat and pays its exit at its last row, so it
-    /// is a book segment like a group or a time block. The hindsight bounds are
-    /// computed on those segments. A mask with every row on is the unmasked
-    /// book, hash included.
-    pub fn with_blocks_masked(
+    /// #1173 and #1180: the one constructor. The rows stamped from
+    /// `segment_starts[k]` up to the next start form interval segment `k`; with
+    /// fewer than two starts there are no segments. Under a regime mask, rows
+    /// with the mask off are forced flat and earn and pay nothing. Every
+    /// maximal run of on rows of a `(group, segment)` starts flat and pays its
+    /// exit at its last row, so it is a book segment like a group or a time
+    /// block; the hindsight bounds are computed on those runs. No segments and
+    /// no mask is `with_blocks` exactly, and a mask with every row on is the
+    /// unmasked book, hash included.
+    pub fn with_segments(
         slice: &crate::data::TradingSlice,
         spec: &TradingSpec,
         horizon_seconds: f64,
         blocks: usize,
         lambda: f64,
+        segment_starts: &[f64],
         mask: Option<BookMask>,
     ) -> Result<Self, String> {
         if blocks == 0 || blocks > FITNESS_MAX_BLOCKS {
@@ -1557,19 +1585,22 @@ impl FitnessBook {
             }
         }
         let mask = mask.filter(|m| m.on.iter().any(|&o| !o));
-        let mut seg_group: Vec<u64> = rows.group.clone();
+        if segment_starts.len() > 1 {
+            let segment = |t: f64| segment_starts.partition_point(|s| *s <= t);
+            for i in 1..n {
+                if rows.group[i] == rows.group[i - 1] && segment(rows.time[i]) != segment(rows.time[i - 1]) {
+                    flags[i] |= TradingRows::FIRST;
+                    flags[i - 1] |= TradingRows::LAST;
+                }
+            }
+        }
         let mut off_rows = 0usize;
         if let Some(m) = &mask {
             let seam = flags.clone();
-            let mut segment = 0u64;
             for i in 0..n {
                 let off = !m.on[i];
                 let first = seam[i] & TradingRows::FIRST != 0 || off || (i > 0 && !m.on[i - 1]);
                 let last = seam[i] & TradingRows::LAST != 0 || off || (i + 1 < n && !m.on[i + 1]);
-                if first {
-                    segment += 1;
-                }
-                seg_group[i] = segment;
                 flags[i] = (if first { TradingRows::FIRST } else { 0 })
                     | (if last { TradingRows::LAST } else { 0 })
                     | (if off { FITNESS_MASK_OFF } else { 0 });
@@ -1579,7 +1610,19 @@ impl FitnessBook {
                 }
             }
         }
-        let bound = trading_gpu::dp_bound(&excess, &seg_group, side)?;
+        let run_key: Option<Vec<u64>> = (segment_starts.len() > 1 || mask.is_some()).then(|| {
+            let mut id = 0u64;
+            (0..n)
+                .map(|i| {
+                    if i > 0 && flags[i] & TradingRows::FIRST != 0 {
+                        id += 1;
+                    }
+                    id
+                })
+                .collect()
+        });
+        let run_of: &[u64] = run_key.as_deref().unwrap_or(&rows.group);
+        let bound = trading_gpu::dp_bound(&excess, run_of, side)?;
         if !(bound > 0.0) {
             return Err(format!(
                 "no profitable long/flat path exists on the {}training rows at {} bp per side (hindsight bound {})",
@@ -1598,7 +1641,7 @@ impl FitnessBook {
                 for i in 0..n {
                     if ids[i] as usize == b {
                         e.push(excess[i]);
-                        g.push(seg_group[i]);
+                        g.push(run_of[i]);
                     }
                 }
                 let bb = trading_gpu::dp_bound(&e, &g, side)?;

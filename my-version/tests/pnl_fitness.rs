@@ -1740,7 +1740,7 @@ fn alternate_mask(s: &TradingSlice, run: usize) -> Vec<bool> {
 }
 
 fn masked(s: &TradingSlice, sp: &TradingSpec, blocks: usize, on: &[bool]) -> Result<FitnessBook, String> {
-    FitnessBook::with_blocks_masked(s, sp, 900.0, blocks, 1.0, Some(BookMask { on, identity: "test-gate" }))
+    FitnessBook::with_segments(s, sp, 900.0, blocks, 1.0, &[], Some(BookMask { on, identity: "test-gate" }))
 }
 
 /// The maximal on-runs as `(group, start, end)` row ranges.
@@ -1875,8 +1875,8 @@ fn a_mask_changes_the_hash_and_refuses_what_it_cannot_price() {
     let sp = spec();
     let on = alternate_mask(&s, 50);
     let plain = FitnessBook::new(&s, &sp, 900.0).unwrap();
-    let a = FitnessBook::with_blocks_masked(&s, &sp, 900.0, 1, 1.0, Some(BookMask { on: &on, identity: "a" })).unwrap();
-    let b = FitnessBook::with_blocks_masked(&s, &sp, 900.0, 1, 1.0, Some(BookMask { on: &on, identity: "b" })).unwrap();
+    let a = FitnessBook::with_segments(&s, &sp, 900.0, 1, 1.0, &[], Some(BookMask { on: &on, identity: "a" })).unwrap();
+    let b = FitnessBook::with_segments(&s, &sp, 900.0, 1, 1.0, &[], Some(BookMask { on: &on, identity: "b" })).unwrap();
     assert_ne!(a.hash(), plain.hash());
     assert_ne!(a.hash(), b.hash());
     assert!(masked(&s, &sp, 1, &on[1..]).unwrap_err().contains("regime mask has"));
@@ -2004,7 +2004,7 @@ fn mask_flags_name_their_reason() {
     let missing = run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "nope"]);
     assert_eq!(code(&missing), 3, "{}", stderr(&missing));
     assert!(stderr(&missing).contains("mask column") && stderr(&missing).contains("nope"), "{}", stderr(&missing));
-    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g", "--gpu"]), "--gpu");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g", "--gpu"]), "--pnl-mask with --gpu");
     usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "0 - g", "--position", "top_tercile"]), "top_tercile");
 }
 

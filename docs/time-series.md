@@ -160,6 +160,14 @@ split.
 
 **Verify.** `tests/selection.rs::selection_overrides_a_temporal_spec_and_says_so`.
 
+### Interval-list splits: purge and embargo at every edge
+
+**Check.** With `--split-table` (#1173) a model trains before and after a test interval, so every edge needs both guards. Before each test interval the label purge drops the training and validation rows whose label window `[t, t + purge)` reaches it. After each test interval the embargo drops the rows in `[end, end + embargo)`; `--embargo auto` takes the longest lookback of the `--vars` columns (rule `rcsr-lookback/1`) or the label purge when that is longer, because a feature of a row after the test interval is computed from test bars. Training rows are purged on both sides of every validation interval. A table interval that reaches a declared locked range exits 3.
+
+**What fails.** Without the embargo, a 28-day return column of a row two weeks after the test interval holds two weeks of test prices: the fit learns from the test path and the test score is optimistic, the leak López de Prado's embargo (AFML 7.4.2) removes. Without the purge, the last training label before the test interval ends inside it. The cost is real: a 200-day column needs a 200-day embargo after every test interval, so long-lookback views lose more training rows under combinatorial splits; that is the price, not a bug.
+
+**Verify.** `tests/interval_split.rs::planted_leaks_are_excluded_from_training` (a feature that reads 500 hours back and a label that crosses the test interval are both left out), `src/intervals.rs::tests::interval_split_purges_and_embargoes_every_edge` (200 random tables at each label horizon 1, 24, 72 and 168 h), `tests/interval_split.rs::embargo_auto_follows_the_lookback`, and `tests/interval_split.rs::interval_guard_allows_cpcv_test_groups` with `interval_guard_refuses_overlap` for the walk-forward guard: a window is in sample when a kept training or validation row of the run reaches it, not when it is earlier than the last training row.
+
 ---
 
 ## 2b. Target structure: the label must not encode a column
