@@ -558,6 +558,9 @@ pub struct GenRecord {
     pub migrants: usize,
     /// #1029: migrants skipped because the destination held their error.
     pub migrants_skipped: usize,
+    /// #1023: cases this generation selected on under `--selection lexicase`;
+    /// `None` under every other selection, and the line carries no `selection`.
+    pub lexicase_cases: Option<usize>,
 }
 
 impl GenRecord {
@@ -584,7 +587,7 @@ impl GenRecord {
     /// archive hash/hypervolume, the variation counters, the per-island best
     /// list and the RNG key — those exist only in a `full` log.
     pub fn json_summary(&self) -> String {
-        format!(
+        self.with_selection(format!(
             "{{\"schema\":\"{}\",\"v\":{},\"event\":\"generation\",\"level\":\"summary\",\
              \"generation\":{},\"total\":{},\"t\":{},\"wall\":{},\
              \"phases\":{{\"prep\":{},\"search\":{},\"eval\":{},\"select\":{},\"archive\":{},\"fit\":{},\
@@ -621,13 +624,13 @@ impl GenRecord {
             num(self.percent_converged),
             self.restarts,
             self.restarts_total
-        )
+        ))
     }
 
     /// The complete NDJSON line (without the trailing newline).
     pub fn json(&self) -> String {
         let islands: Vec<String> = self.island_best.iter().map(|v| num(*v)).collect();
-        format!(
+        self.with_selection(format!(
             "{{\"schema\":\"{}\",\"v\":{},\"event\":\"generation\",\"level\":\"full\",\
              \"generation\":{},\"total\":{},\
              \"t\":{},\"wall\":{},\
@@ -696,7 +699,17 @@ impl GenRecord {
             self.isolated,
             self.migrants,
             self.migrants_skipped
-        )
+        ))
+    }
+
+    /// #1023: `line` with `"selection":{"mode":"lexicase","cases":N}` before its
+    /// closing brace under lexicase; unchanged otherwise.
+    fn with_selection(&self, mut line: String) -> String {
+        if let Some(cases) = self.lexicase_cases {
+            line.pop();
+            line.push_str(&format!(",\"selection\":{{\"mode\":\"lexicase\",\"cases\":{}}}}}", cases));
+        }
+        line
     }
 }
 
@@ -1305,6 +1318,7 @@ mod tests {
             isolated: 2,
             migrants: 4,
             migrants_skipped: 1,
+            lexicase_cases: None,
         }
     }
 
@@ -1408,6 +1422,20 @@ mod tests {
         assert_eq!(full.get("migrants").and_then(|v| v.as_usize()), Some(4));
         assert_eq!(full.get("migrants_skipped").and_then(|v| v.as_usize()), Some(1));
         assert!(line.len() < r.json().len(), "summary must be smaller than full");
+    }
+
+    /// #1023: only a lexicase generation carries `selection`, on both levels.
+    #[test]
+    fn only_a_lexicase_generation_carries_selection() {
+        let r = rec();
+        assert!(!r.json().contains("selection") && !r.json_summary().contains("selection"));
+        let lex = GenRecord { lexicase_cases: Some(8), ..rec() };
+        for line in [lex.json(), lex.json_summary()] {
+            let j = Json::parse(&line).expect("the line parses");
+            let s = j.get("selection").expect("selection");
+            assert_eq!(s.get("mode").and_then(|v| v.as_str()), Some("lexicase"));
+            assert_eq!(s.get("cases").and_then(|v| v.as_usize()), Some(8));
+        }
     }
 
     /// The default cadence keeps a long run to a bounded number of events.

@@ -23,7 +23,8 @@ config dedup false
 config time_budget none
 config patience 7
 config predictor_samples none
-config selection afp
+config selection lexicase
+config lexicase_cases 64
 config restart_policy island
 config restart_isolation 7
 config explore_islands 1
@@ -38,4 +39,4 @@ config reject_fixed_position true
 config fit_thresholds true
 config fit_accept fitness
 config qd_descriptor book
-config_hash 8ffab4ac4ca1cca2
+config_hash c38e92807b3d32c9

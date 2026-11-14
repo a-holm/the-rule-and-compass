@@ -3782,6 +3782,10 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
+    if cfg.selection == crate::search::Selection::Lexicase && cfg.variation == crate::search::VariationMode::Postfix {
+        eprintln!("error: --selection lexicase runs on the node path only; use --variation auto or node");
+        std::process::exit(EXIT_USAGE); // #1023
+    }
     // #1100: a resume is checked against its saved island count by the search.
     if resume_path.is_none() && cfg.explore_islands > 0 && cfg.explore_islands >= cfg.islands.max(1) {
         eprintln!(
@@ -4178,6 +4182,16 @@ fn main() {
         cfg = effective;
         resumed_generation = Some(cp.generations);
         resume_checkpoint = Some(cp);
+    }
+
+    // #1023: lexicase reads per-case errors on the host only.
+    if cfg.selection == crate::search::Selection::Lexicase && gpu_explicit == Some(true) {
+        if fitness_arg.as_deref() == Some("pnl") || !cfg.fitness.is_metric() {
+            eprintln!("error: --selection lexicase --fitness pnl --gpu: the device long_pnl fitness returns no sub-book cases yet (#1031); omit --gpu to run on the CPU");
+        } else {
+            eprintln!("error: --selection lexicase with --gpu: the device scorer returns no per-row case errors yet (#1169); omit --gpu to run on the CPU");
+        }
+        std::process::exit(EXIT_USAGE);
     }
 
     // #141: probe the device once, before the dataset is loaded. The probe
@@ -5509,6 +5523,13 @@ fn main() {
             trading_usage("--fitness pnl is not supported with --null-runs/--null-block: the null shuffles the target, but the regret reads the book's returns, so every null run is the real run");
         }
     }
+    // #1023: a metric-fitness lexicase case is one row's loss.
+    if cfg.selection == crate::search::Selection::Lexicase && !fitness_pnl {
+        if let Some(reason) = search::lexicase_metric_refusal(cfg.metric, implicit_mode, multi_output, weight_name.is_some()) {
+            eprintln!("error: {}", reason);
+            std::process::exit(EXIT_USAGE);
+        }
+    }
     // #1084: the book descriptor reads the long/flat book of the search fitness.
     if cfg.qd_descriptor == rcsr::qd::DescriptorKind::Book {
         if !fitness_pnl {
@@ -6023,6 +6044,11 @@ fn main() {
     let search_train: &data::Sample = if fitness_pnl { book_train } else { &prepared.train };
     if fitness_pnl && prepared.book.is_some() {
         cfg.fit_view = Some(std::sync::Arc::new(prepared.train.clone()));
+    }
+    // #1023: the lexicase cost limits read the flags and the data shape only.
+    if let Some(reason) = search::lexicase_limit_refusal(&cfg, search_train) {
+        eprintln!("error: {}", reason);
+        std::process::exit(EXIT_USAGE);
     }
 
     // #25: resolve --units names against the prepared input list. A lagged
