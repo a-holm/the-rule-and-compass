@@ -86,7 +86,7 @@
                              --variation postfix (#471)
   --adaptive-mix             per-island edit weights learned from the success
                              rate of the last 10 generations (uses all seven edit
-                             kinds; learns from CPU-scored generations only).
+                             kinds; learns on the CPU and the device).
                              Off by default; not with --variation postfix (#471)
 @@ --no-front-parents --prune
   --reject-constant-offspring

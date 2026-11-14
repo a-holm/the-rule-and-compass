@@ -122,8 +122,10 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
     0.20, terminal 0.30, subtree 0.20, insert 0.10, delete 0.10, swap 0.05,
     rotate 0.05. `--adaptive-mix` lets each island reweight the seven kinds
     from the success rate (a child beats its first parent) over the last 10
-    generations, `w = max(0.02, (s + 1) / (a + 2))`, normalised; it learns
-    from CPU-scored generations only;
+    generations, `w = max(0.02, (s + 1) / (a + 2))`, normalised. It learns on both backends: the CPU path counts a child as
+    soon as it is scored; with device scoring the counts are taken at the
+    generation barrier, after every offspring has its score, by the same win
+    rule. Only a screening subset (`--fit-samples`) keeps the base weights;
   - *crossover* — swap subtrees between two parents; `--crossover-internal P`
     picks an internal node as the cut point with probability `P`;
 - **Constant fitting** tunes the numeric constants of a candidate by local

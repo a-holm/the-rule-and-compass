@@ -778,3 +778,38 @@ fn gpu_run_ledger_books_checkpoint_io_and_uses_event_intervals() {
     assert!(l.device_busy_s() <= l.wall_s() + 1e-9);
     assert!((0.0..=1.0).contains(&l.duty_run().value));
 }
+
+/// #1079: `--adaptive-mix` learns from device-scored generations at the
+/// generation barrier: every island saves a full window with attempts in each
+/// generation, and a repeat run gives the same archive.
+#[cfg(feature = "cuda")]
+#[test]
+fn adaptive_mix_learns_on_the_device() {
+    let train = sample(96);
+    let test = sample(96);
+    let run = || {
+        let mut cfg = config(31, true);
+        cfg.generations = 12;
+        cfg.islands = 2;
+        cfg.adaptive_mix = true;
+        let mut last = None;
+        let out = search::run_resumable(&cfg, &train, &test, None, 1, |cp| {
+            last = Some(cp.islands.iter().map(|i| i.mix.encode()).collect::<Vec<_>>());
+        })
+        .expect("a resumable GPU run");
+        (describe(&out), last.expect("the run wrote a checkpoint"))
+    };
+    let (archive, mixes) = run();
+    assert_eq!(mixes.len(), 2);
+    let per = 2 * rcsr::expr::EDIT_KINDS;
+    for (i, window) in mixes.iter().enumerate() {
+        assert_eq!(window.len(), 10 * per, "island {i} keeps 10 generations");
+        for (g, counts) in window.chunks(per).enumerate() {
+            let attempts: u64 = counts.chunks(2).map(|c| c[0]).sum();
+            assert!(attempts > 0, "island {i} generation {g} counted no attempt");
+        }
+    }
+    let (again, again_mixes) = run();
+    assert_eq!(archive, again, "the archive differs between two runs");
+    assert_eq!(mixes, again_mixes, "the learned windows differ between two runs");
+}
