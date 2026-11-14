@@ -747,3 +747,62 @@ fn split_windows_start_flat() {
     assert_eq!(num(&ab, &["pooled_seam", "seam_cost"]), 0.0);
     assert_eq!(at(&ab, &["pooled_seam", "reset_flat"]), &Json::Bool(true));
 }
+
+struct BatchFixture {
+    data: String,
+    run: String,
+    table: String,
+}
+
+fn batch_fixture(s: &Scratch, test_rows: &[(i64, i64)]) -> BatchFixture {
+    let dir = s.path();
+    let data = write_series(dir, 1400);
+    let mut rows = vec![("g2", "train", hour(0), hour(300))];
+    for &(a, b) in test_rows {
+        rows.push(("g2", "test", hour(a), hour(b)));
+    }
+    let table = write_table(dir, "windows.csv", &rows);
+    let (_, run) = pnl_search(dir, &data, &table, &[]);
+    BatchFixture { data, run, table }
+}
+
+fn batch_walkforward(f: &BatchFixture, extra: &[&str]) -> Output {
+    let mut args = vec!["--windows", f.table.as_str(), "--split-id", "g2", "--batch-pnl"];
+    args.extend_from_slice(extra);
+    walkforward(&f.data, &f.run, &args)
+}
+
+#[test]
+fn contiguous_split_windows_keep_batch_carry() {
+    let s = Scratch::new("interval-split-batch-contiguous");
+    let f = batch_fixture(&s, &[(360, 600), (600, 800)]);
+    let out = batch_walkforward(&f, &[]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let wf = parse(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(at(&wf, &["pooled_seam", "reset_flat"]), &Json::Bool(false));
+    assert_ne!(at(&wf, &["batch_pnl", "pooled"]), &Json::Null);
+}
+
+#[test]
+fn mixed_split_windows_refuse_batch() {
+    let s = Scratch::new("interval-split-batch-mixed");
+    let f = batch_fixture(&s, &[(360, 600), (600, 800), (900, 1100)]);
+    let out = batch_walkforward(&f, &[]);
+    assert_eq!(code(&out), 2);
+    assert!(stderr(&out).contains("--pool-reset-flat"), "{}", stderr(&out));
+    let out = batch_walkforward(&f, &["--pool-reset-flat"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let wf = parse(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(at(&wf, &["pooled_seam", "reset_flat"]), &Json::Bool(true));
+}
+
+#[test]
+fn gap_split_windows_batch_resets() {
+    let s = Scratch::new("interval-split-batch-gap");
+    let f = batch_fixture(&s, &[(360, 600), (900, 1100)]);
+    let out = batch_walkforward(&f, &[]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let wf = parse(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(at(&wf, &["pooled_seam", "reset_flat"]), &Json::Bool(true));
+    assert_eq!(at(&wf, &["batch_pnl", "pooled"]), &Json::Null);
+}
