@@ -2100,5 +2100,5 @@ mod fitted_cut {
         assert_eq!(all, PINNED_DEFAULT_REPORTS, "{}", got.join("\n"));
     }
 
-    const PINNED_DEFAULT_REPORTS: &str = "unset";
+    const PINNED_DEFAULT_REPORTS: &str = "3a81f04a52205a0997503d097eebeba7f0bb7b84977931e29656c206f8256589";
 }

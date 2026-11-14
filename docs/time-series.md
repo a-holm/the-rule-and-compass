@@ -431,7 +431,9 @@ type-7 quantile of the train/validation scores, not a sketch. `rcsr walkforward`
 selects the two ranks around `h = (n - 1) q` by order-preserving radix count,
 canonicalises `-0` to `+0`, drops NaN/`±inf`, and interpolates in `f64`. The
 window's `threshold_source` is `train_type7`, `validation_type7` or `fixed`
-(a pre-registered `--threshold-fixed` value).
+(a pre-registered `--threshold-fixed` value), or `train_fitness` or
+`validation_fitness` for a cut fitted on the same rows (`--threshold-fit
+fitness`, see `docs/walkforward.md`).
 
 Positions use the shared valid-row mask: a row is usable only when **both** its
 score and target are finite. That matters at the boundary — in the pinned eval

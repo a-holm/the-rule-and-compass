@@ -1952,8 +1952,128 @@ impl FitnessBook {
     /// Errors: a non-finite prediction or time, a length mismatch, a book that
     /// is not plain ([`FitnessBook::is_plain`]).
     pub fn cut_sweep(&self, pred: &[f64], time: &[f64]) -> Result<CutSweep, String> {
-        let _ = (pred, time);
-        Err("cut sweep: not implemented".to_string())
+        let n = self.excess.len();
+        if pred.len() != n || time.len() != n {
+            return Err(format!(
+                "cut sweep: length mismatch: {} predictions and {} times for {} rows",
+                pred.len(),
+                time.len(),
+                n
+            ));
+        }
+        if !self.is_plain() {
+            return Err("cut sweep: the book is not plain (it has a band or a minimum hold)".to_string());
+        }
+        if n >= u32::MAX as usize {
+            return Err(format!("cut sweep: {} rows do not fit a u32 row index", n));
+        }
+        let mut sorted: Vec<(u64, u32)> = Vec::with_capacity(n);
+        let mut stamps: Vec<u64> = Vec::with_capacity(n);
+        for i in 0..n {
+            let key = trading_gpu::order_key_f64(pred[i]).ok_or_else(|| format!("cut sweep: prediction {} is not finite", i))?;
+            let stamp = trading_gpu::order_key_f64(time[i]).ok_or_else(|| format!("cut sweep: time {} is not finite", i))?;
+            sorted.push((key, i as u32));
+            stamps.push(stamp);
+        }
+        sorted.sort_unstable();
+        let order: Vec<u32> = sorted.iter().map(|&(_, i)| i).collect();
+        let mut rank = vec![0u32; n];
+        for (r, &i) in order.iter().enumerate() {
+            rank[i as usize] = r as u32;
+        }
+        let nb = self.blocks();
+        let block = |i: usize| (self.flags[i] >> FITNESS_BLOCK_SHIFT) as usize & (FITNESS_MAX_BLOCKS - 1);
+        // `diff[b * w + t]`: change of a count of block `b` where the cut reaches `t`.
+        let w = n + 2;
+        let mut flip_diff = vec![0i32; nb * w];
+        let mut exit_diff = vec![0i32; nb * w];
+        let mut entries: Vec<(u64, u32, u32)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let (b, ri, flag) = (block(i), rank[i] as usize, self.flags[i]);
+            if flag & TradingRows::FIRST != 0 {
+                // A run starts flat: an entry while this row is long, `t <= ri`.
+                flip_diff[b * w] += 1;
+                flip_diff[b * w + ri + 1] -= 1;
+                entries.push((stamps[i], 0, ri as u32));
+            } else {
+                let rp = rank[i - 1] as usize;
+                let (lo, hi) = if rp < ri { (rp, ri) } else { (ri, rp) };
+                // Exactly one row of the pair is long: `lo < t <= hi`.
+                flip_diff[b * w + lo + 1] += 1;
+                flip_diff[b * w + hi + 1] -= 1;
+                if rp < ri {
+                    entries.push((stamps[i], rp as u32 + 1, ri as u32));
+                }
+            }
+            if flag & TradingRows::LAST != 0 {
+                exit_diff[b * w] += 1;
+                exit_diff[b * w + ri + 1] -= 1;
+            }
+        }
+        // A timestamp counts once on the union of its rows' entry intervals.
+        entries.sort_unstable();
+        let mut entry_diff = vec![0i32; w];
+        let mut k = 0;
+        while k < entries.len() {
+            let (stamp, mut lo, mut hi) = entries[k];
+            k += 1;
+            while k < entries.len() && entries[k].0 == stamp {
+                let (_, a, c) = entries[k];
+                if a <= hi + 1 {
+                    hi = hi.max(c);
+                } else {
+                    entry_diff[lo as usize] += 1;
+                    entry_diff[hi as usize + 1] -= 1;
+                    lo = a;
+                    hi = c;
+                }
+                k += 1;
+            }
+            entry_diff[lo as usize] += 1;
+            entry_diff[hi as usize + 1] -= 1;
+        }
+        drop(entries);
+        let mut entry_times = vec![0u32; n + 1];
+        let mut running = 0i64;
+        for t in 0..=n {
+            running += entry_diff[t] as i64;
+            entry_times[t] = running as u32;
+        }
+        // Descending `t` adds the row of rank `t` to the long set. Every interval
+        // adds +1 and -1, so the count at `t` is minus the differences above `t`.
+        let mut fitness = vec![f64::INFINITY; n + 1];
+        let mut net = vec![f64::NAN; n + 1];
+        let mut flips = vec![0u32; n + 1];
+        let mut exits = vec![0u32; n + 1];
+        let mut totals = vec![FitnessTotals { gross: 0.0, flips: 0, exits: 0, long_rows: 0, nonfinite: false }; nb];
+        let mut flips_above = vec![0i64; nb];
+        let mut exits_above = vec![0i64; nb];
+        for t in (0..=n).rev() {
+            if t < n {
+                let i = order[t] as usize;
+                let b = block(i);
+                totals[b].gross += self.excess[i];
+                totals[b].long_rows += 1;
+            }
+            let (mut f, mut e) = (0u64, 0u64);
+            for b in 0..nb {
+                totals[b].flips = (-flips_above[b]) as u64;
+                totals[b].exits = (-exits_above[b]) as u64;
+                f += totals[b].flips;
+                e += totals[b].exits;
+            }
+            flips[t] = f as u32;
+            exits[t] = e as u32;
+            if t == 0 || t == n || sorted[t - 1].0 < sorted[t].0 {
+                fitness[t] = self.fitness_of(&totals);
+                net[t] = totals.iter().map(|x| self.net_of(x)).sum();
+            }
+            for b in 0..nb {
+                flips_above[b] += flip_diff[b * w + t] as i64;
+                exits_above[b] += exit_diff[b * w + t] as i64;
+            }
+        }
+        Ok(CutSweep { order, fitness, net, flips, exits, entry_times })
     }
 }
 
@@ -2050,8 +2170,18 @@ impl CutSweep {
     /// go to the smallest `|t - reference|`, then to the smaller `t`. `None`
     /// when no cut passes.
     pub fn best(&self, floor: &CutFloor, reference: usize) -> Option<usize> {
-        let _ = (floor, reference);
-        None
+        let mut best: Option<usize> = None;
+        for t in 1..self.order.len() {
+            let f = self.fitness[t];
+            if !self.is_valid(t) || !f.is_finite() || self.entry_times[t] < floor.min_entry_times {
+                continue;
+            }
+            best = match best {
+                Some(b) if !(f < self.fitness[b] || (f == self.fitness[b] && t.abs_diff(reference) < b.abs_diff(reference))) => Some(b),
+                _ => Some(t),
+            };
+        }
+        best
     }
 
     /// The widest run of valid inner cuts around `best` whose fitness stays
@@ -2880,5 +3010,24 @@ mod cut_sweep_tests {
         assert!((0.02..=0.05).contains(&share), "fitted long share {share}");
         assert!(reference_share > 0.4, "reference long share {reference_share}");
         assert!(sw.fitness(t) < sw.fitness(reference));
+    }
+
+    /// Seconds of one sweep at the campaign training shape: 306 groups x 7,403
+    /// hours, 4 blocks. A measurement, run by hand on an idle core.
+    #[test]
+    #[ignore]
+    fn cut_sweep_cost_at_the_campaign_shape() {
+        let mut rng = Mix(11);
+        let (slice, z) = panel(&mut rng, 306, 7403);
+        let b = book(&slice, 4);
+        let pred: Vec<f64> = z.iter().map(|zk| -zk + 0.5 * rng.gauss()).collect();
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let sw = b.cut_sweep(&pred, &slice.rows.time).unwrap();
+            best = best.min(start.elapsed().as_secs_f64());
+            assert_eq!(sw.rows(), 306 * 7403);
+        }
+        println!("cut_sweep: {} rows, 306 groups, 4 blocks: best of 3 {:.3} s", 306 * 7403, best);
     }
 }
