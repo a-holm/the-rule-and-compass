@@ -1302,7 +1302,7 @@ fn group_key(v: f64) -> u64 {
     if v.is_nan() {
         u64::MAX
     } else {
-        v.to_bits()
+        (v + 0.0).to_bits()
     }
 }
 
@@ -1318,6 +1318,10 @@ fn label_group_id(text: &str) -> u64 {
 }
 
 fn table_group_ids(table: &Table, col: usize) -> Vec<u64> {
+    // A numeric key is its value on both readers; the dictionary only keeps its source text.
+    if table.numeric[col] {
+        return table.col(col).iter().map(|&v| group_key(v)).collect();
+    }
     if let Some(dict) = table.dict(col) {
         let ids: Vec<u64> = dict.levels.iter().map(|l| label_group_id(l)).collect();
         let missing = label_group_id("");
@@ -4440,5 +4444,17 @@ mod close_ledger_tests {
         close_ledger_at(&mut ledger, 1.0);
         assert_eq!(ledger.wall_s(), 1.0);
         assert_eq!(ledger.closure_residual().value, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod group_key_tests {
+    use super::*;
+
+    #[test]
+    fn signed_zeros_and_nans_share_one_id_each() {
+        assert_eq!(group_key(-0.0), group_key(0.0));
+        assert_eq!(group_key(f64::NAN), u64::MAX);
+        assert_ne!(group_key(1.0), group_key(-1.0));
     }
 }
