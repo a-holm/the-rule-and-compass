@@ -38,4 +38,4 @@ config reject_fixed_position true
 config fit_thresholds true
 config fit_accept fitness
 config qd_descriptor book
-config_hash aeb55c338b053b3f
+config_hash 8ffab4ac4ca1cca2
