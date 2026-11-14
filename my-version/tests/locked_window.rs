@@ -402,6 +402,20 @@ fn without_timing_keeps_seconds_spec_and_config_members() {
 }
 
 #[test]
+fn drop_timing_drops_gpu_fit_and_prune_seconds_but_keeps_embargo_seconds() {
+    let fixture = |gpu_s: &str, prune_s: &str, embargo_s: &str, attempts: &str, fits: &str| {
+        format!(
+            r#"{{"gpu":{{"fit":{{"seconds":{gpu_s},"attempts":{attempts}}}}},"prune":{{"seconds":{prune_s},"fits":{fits},"accepted":1}},"lockbox_embargo":{{"seconds":{embargo_s}}}}}"#
+        )
+    };
+    let base = fixture("1", "1", "86400", "4", "2");
+    assert_eq!(without_timing(&base), without_timing(&fixture("7.5", "3", "86400", "4", "2")));
+    assert_ne!(without_timing(&base), without_timing(&fixture("1", "1", "172800", "4", "2")));
+    assert_ne!(without_timing(&base), without_timing(&fixture("1", "1", "86400", "5", "2")));
+    assert_ne!(without_timing(&base), without_timing(&fixture("1", "1", "86400", "4", "3")));
+}
+
+#[test]
 fn search_validation_block_ignores_locked_prices() {
     let (_scratch, dir) = scratch("search_validation");
     let a = diff_store(&dir, "a", false);

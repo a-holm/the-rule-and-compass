@@ -1004,14 +1004,6 @@ impl FileStore {
             .collect();
         if n_groups > 0 {
             let mut work = self.group_destinations(projection, &mut values, &mut ints, &mut codes);
-            if work.len() != n_groups {
-                return Err(format!(
-                    "{}: {} destination groups for {} store groups",
-                    self.path,
-                    work.len(),
-                    n_groups
-                ));
-            }
             if readers == 1 {
                 for dst in &mut work {
                     self.read_group_into(projection, dst)?;
@@ -2226,11 +2218,22 @@ fn read_u32(file: &mut File, path: &str) -> Result<u32, String> {
     Ok(u32::from_le_bytes(b))
 }
 
+/// Types with no invalid bit pattern and no padding; private, so only this module can add one.
+#[cfg(target_endian = "little")]
+trait PlainBytes: Copy {}
+#[cfg(target_endian = "little")]
+impl PlainBytes for f64 {}
+#[cfg(target_endian = "little")]
+impl PlainBytes for i64 {}
+#[cfg(target_endian = "little")]
+impl PlainBytes for u32 {}
+
 /// The bytes of a value slice, for a positional read straight into it.
 #[cfg(target_endian = "little")]
-fn bytes_of_mut<T: Copy>(out: &mut [T]) -> &mut [u8] {
-    // SAFETY: called only with f64, i64 and u32, which have no invalid bit patterns and no
-    // padding; u8 has alignment 1; the view covers exactly the bytes of `out` and borrows it.
+fn bytes_of_mut<T: PlainBytes>(out: &mut [T]) -> &mut [u8] {
+    // SAFETY: `PlainBytes` is implemented only for f64, i64 and u32, which have no invalid bit
+    // patterns and no padding; u8 has alignment 1; the view covers exactly the bytes of `out`
+    // and borrows it.
     unsafe {
         std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, std::mem::size_of_val(out))
     }
