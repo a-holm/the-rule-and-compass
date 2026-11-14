@@ -671,7 +671,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--fit-samples N]
      [--patience N]
      [--gpu] [--gpu-memory size] [--dispatch auto|device] [--calibration anchors|probe|PATH] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
-     [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random]
+     [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random] [--qd-descriptor moments|book]
      [--time-budget seconds] [--interim-chunk] [--save file] [--save-every N] [--resume file]
      [--allow-backend-change] [--allow-build-change] [--run-manifest file] [--json-out file]
      [--select-rule validation_objective|robust] [--select-blocks K] [--select-se Z] [--select-block-len L] [--select-require-edge]
@@ -1308,7 +1308,10 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   passive layer reports reachable-support coverage, occupancy entropy and a
   QD-score in text and `--json` without changing the Pareto front; every run
   also reports a fixed-reference validation hypervolume that is comparable
-  across arms. `--qd-policy` is the opt-in search change. See
+  across arms. `--qd-policy` is the opt-in search change. Under `--fitness pnl`,
+  `--qd-descriptor book` keys the archive by the log exposure and the log mean
+  holding length of the long/flat book the fitness prices, from the same
+  reduction as the regret (#1084); `--json` `qd.descriptor` is then `book`. See
   [`docs/qd.md`](docs/qd.md);
 - **configurable complexity** (`--op-complexity`, `--complexity-weights`,
   `--depth-weight`): per-operator costs, variable/constant weights and a
