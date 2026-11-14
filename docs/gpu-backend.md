@@ -908,6 +908,14 @@ every island before compiling the whole population:
 * selection, migration, restart and the archive still happen at the generation
   barrier, after every result has been received.
 
+`--adaptive-mix` (#1079) learns on the device at that barrier. An offspring
+produced by variation carries its first parent's error and the edit kinds it
+used; `learn_mix_at_barrier` runs once the generation is scored (device or
+CPU rescore), applies the CPU win rule (finite child error below the parent's,
+or finite against a non-finite parent), pushes one count record per island and
+clears every record before selection, migration, restart or a checkpoint. No
+record is ever saved; the per-island `mix` window is.
+
 `--pipeline-depth N` (default 2) sets the queue depth; `0` restores the
 synchronous path. The queue holds at most `N` batches, plus at most one batch in
 the scorer's hands, so live candidate trees are bounded by
