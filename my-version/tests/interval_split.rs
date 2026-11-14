@@ -757,7 +757,7 @@ struct BatchFixture {
 fn batch_fixture(s: &Scratch, test_rows: &[(i64, i64)]) -> BatchFixture {
     let dir = s.path();
     let data = write_series(dir, 1400);
-    let mut rows = vec![("g2", "train", hour(0), hour(300))];
+    let mut rows = vec![("g2", "train", hour(0), hour(300)), ("g2", "validation", hour(300), hour(360))];
     for &(a, b) in test_rows {
         rows.push(("g2", "test", hour(a), hour(b)));
     }
