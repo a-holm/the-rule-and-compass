@@ -2953,7 +2953,11 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
 
 /// Equal-weight period net returns of `pos` on `rows` (one block, in
 /// `(group, time)` order): the block starts flat and pays its final exit.
-pub fn period_net(p: &Panel, rows: &[usize], pos: &[f64], side: f64) -> Vec<f64> {
+/// With a declared `width` (1 s to a year, as in `Pool`) a period is the bucket
+/// `floor(t / width)`; otherwise it is one timestamp.
+pub fn period_net(p: &Panel, rows: &[usize], pos: &[f64], side: f64, width: Option<f64>) -> Vec<f64> {
+    let width = width.filter(|s| *s >= 1.0 && *s <= SECONDS_PER_YEAR);
+    let key_of = |t: f64| width.map_or(t, |s| (t / s).floor());
     let r: Vec<f64> = rows.iter().map(|&i| p.ret[i]).collect();
     let g: Vec<u64> = rows.iter().map(|&i| p.group[i]).collect();
     let net = baselines::net_rows(pos, &r, &g, side);
@@ -2962,7 +2966,7 @@ pub fn period_net(p: &Panel, rows: &[usize], pos: &[f64], side: f64) -> Vec<f64>
     let mut out: Vec<f64> = Vec::new();
     let (mut sum, mut cnt, mut last) = (0.0, 0usize, f64::NAN);
     for &k in &order {
-        let t = p.time[rows[k]];
+        let t = key_of(p.time[rows[k]]);
         if cnt > 0 && t != last {
             out.push(sum / cnt as f64);
             sum = 0.0;
