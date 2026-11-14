@@ -1497,3 +1497,167 @@ fn vote_members_and_thresholds_ignore_test_rows() {
         assert!(!other.test_used_for_selection);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Projected store scan (issue #1034): the scan reads only the columns the run uses.
+// ---------------------------------------------------------------------------
+
+const WIDE_FEATURES: usize = 6;
+const WIDE_GARBAGE: usize = 40;
+const WIDE_STEPS: usize = 60;
+const WIDE_SYMBOLS: usize = 3;
+
+/// Rows in time order, `WIDE_SYMBOLS` per step. Columns: a time (`ts`, whole
+/// numbers, or `ts` with a fraction when `fractional_time`), a text key `sym`,
+/// a numeric key `gid`, features `f0..`, unused numeric columns `g0..` with NaN
+/// and huge values, an unused text column `note`, and the target `y`.
+fn wide_table(fractional_time: bool) -> data::Table {
+    let mut csv = String::from("ts,sym,gid");
+    for j in 0..WIDE_FEATURES {
+        csv.push_str(&format!(",f{j}"));
+    }
+    for j in 0..WIDE_GARBAGE {
+        csv.push_str(&format!(",g{j}"));
+    }
+    csv.push_str(",note,y\n");
+    for k in 0..WIDE_STEPS * WIDE_SYMBOLS {
+        let (step, sym) = (k / WIDE_SYMBOLS, k % WIDE_SYMBOLS);
+        let ts = if fractional_time { format!("{}.25", step) } else { step.to_string() };
+        csv.push_str(&format!("{ts},s{sym},{sym}"));
+        for j in 0..WIDE_FEATURES {
+            let v = ((k * (7 + j) + 3 * j) % 17) as f64 / 8.0 - 1.0;
+            if j == 4 && k % 23 == 5 {
+                csv.push_str(",NaN");
+            } else {
+                csv.push_str(&format!(",{v}"));
+            }
+        }
+        for j in 0..WIDE_GARBAGE {
+            match (k + j) % 9 {
+                0 => csv.push_str(",NaN"),
+                1 => csv.push_str(",1e300"),
+                _ => csv.push_str(&format!(",{}", (k * j) as f64 - 50.0)),
+            }
+        }
+        let y = (((k * 13) % 11) as f64 - 5.0) * 0.001 + (((k * 7) % 17) as f64 / 8.0 - 1.0) * 0.0004;
+        csv.push_str(&format!(",n{},{y}\n", k % 7));
+    }
+    data::parse_table(&csv).unwrap()
+}
+
+fn wide_spec(expr: &str, windows: Vec<Window>, group: Option<&str>) -> EvalSpec {
+    let mut s = spec(expr, windows);
+    s.vars = (0..WIDE_FEATURES).map(|j| format!("f{j}")).collect();
+    s.target = "y".to_string();
+    s.group = group.map(str::to_string);
+    s.cost_bps = 20.0;
+    s.threshold_quantile = 0.5;
+    s
+}
+
+fn write_wide(scratch: &Scratch, name: &str, table: &data::Table, group_rows: usize) -> String {
+    let path = scratch.join(name).to_string_lossy().into_owned();
+    store::write_store(&path, table, group_rows).unwrap();
+    path
+}
+
+/// The report without the members that name the source of the rows.
+fn without_source(json: &str) -> rcsr::devlog::Json {
+    use rcsr::devlog::Json;
+    match Json::parse(json).unwrap() {
+        Json::Obj(items) => Json::Obj(items.into_iter().filter(|(k, _)| k != "source" && k != "memory_bound").collect()),
+        other => panic!("not an object: {other:?}"),
+    }
+}
+
+/// Equal structure and strings; numbers equal to rounding, since the resident
+/// table path adds the same terms in a different order than the store scan.
+fn close(a: &rcsr::devlog::Json, b: &rcsr::devlog::Json, at: &str) {
+    use rcsr::devlog::Json;
+    match (a, b) {
+        (Json::Num(x), Json::Num(y)) => assert!((x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1e-6), "{at}: {x} vs {y}"),
+        (Json::Arr(x), Json::Arr(y)) => {
+            assert_eq!(x.len(), y.len(), "{at}");
+            x.iter().zip(y).enumerate().for_each(|(i, (p, q))| close(p, q, &format!("{at}[{i}]")));
+        }
+        (Json::Obj(x), Json::Obj(y)) => {
+            assert_eq!(x.iter().map(|m| &m.0).collect::<Vec<_>>(), y.iter().map(|m| &m.0).collect::<Vec<_>>(), "{at}");
+            x.iter().zip(y).for_each(|(p, q)| close(&p.1, &q.1, &format!("{at}.{}", p.0)));
+        }
+        _ => assert_eq!(format!("{a:?}"), format!("{b:?}"), "{at}"),
+    }
+}
+
+/// Projected store scan against the full-decode reference: the resident table
+/// of the same store, which holds every column.
+fn assert_matches_full_decode(path: &str, spec: &EvalSpec, opts: &walkforward::ProtocolOptions) -> walkforward::Report {
+    let streamed = walkforward::run_path_with(path, spec, opts).unwrap();
+    let full = store::FileStore::open(path).unwrap().to_table().unwrap();
+    let resident = walkforward::run_table_with(&full, spec, "test", opts).unwrap();
+    close(&without_source(&streamed.json()), &without_source(&resident.json()), "report");
+    streamed
+}
+
+#[test]
+fn store_scan_reads_only_the_named_columns() {
+    let scratch = Scratch::new("wf-scan-columns");
+    let w = vec![window("w", 0.0, 24.0, 24.0, 40.0)];
+    // (fractional time, group column, expected projected columns): 2 named + target
+    // + 1 for an f64 time + 1 for a numeric group.
+    for (fractional, group, extra) in [(false, None, 0), (false, Some("sym"), 0), (false, Some("gid"), 1), (true, Some("gid"), 2), (true, None, 1)] {
+        let table = wide_table(fractional);
+        let path = write_wide(&scratch, &format!("wide-{fractional}-{group:?}.rcsb"), &table, 36);
+        let s = wide_spec("f1 + f4 * f1", w.clone(), group);
+        let r = walkforward::run_path(&path, &s).unwrap();
+        let scan = r.scan.clone().expect("the store scan reports its reads");
+        assert_eq!(scan.store_columns, 3 + WIDE_FEATURES + WIDE_GARBAGE + 2, "{fractional} {group:?}");
+        assert_eq!(scan.named_variables, 2, "{fractional} {group:?}");
+        assert_eq!(scan.projected_columns, 2 + 1 + extra, "{fractional} {group:?}");
+        // An f64 time is part of the value read, so no group is skipped before it.
+        let (read, skipped) = if fractional { (5, 0) } else { (4, 1) };
+        assert_eq!((scan.groups_read, scan.groups_skipped), (read, skipped), "{fractional} {group:?}");
+        assert_eq!(scan.value_bytes, scan.projected_columns as u64 * read as u64 * 36 * 8, "{fractional} {group:?}");
+        assert!(r.json_with_ledger(None).contains(&format!("\"scan\":{{\"source\":\"store\",\"store_columns\":{}", scan.store_columns)));
+        assert!(!r.json().contains("\"scan\""), "the hashed report must stay deterministic");
+        assert_matches_full_decode(&path, &s, &walkforward::ProtocolOptions::default());
+    }
+}
+
+#[test]
+fn a_constant_candidate_projects_only_the_target() {
+    let scratch = Scratch::new("wf-scan-constant");
+    let path = write_wide(&scratch, "wide.rcsb", &wide_table(false), 36);
+    let s = wide_spec("0.5", vec![window("w", 0.0, 24.0, 24.0, 40.0)], None);
+    let scan = assert_matches_full_decode(&path, &s, &walkforward::ProtocolOptions::default()).scan.unwrap();
+    assert_eq!((scan.named_variables, scan.projected_columns), (0, 1));
+}
+
+#[test]
+fn store_scan_skips_groups_outside_the_windows() {
+    let scratch = Scratch::new("wf-scan-skip");
+    let path = write_wide(&scratch, "wide.rcsb", &wide_table(false), 36);
+    // 180 rows in 5 groups of 36 rows (12 time steps); the windows end inside group 2.
+    let s = wide_spec("f1 + f4", vec![window("w", 0.0, 24.0, 24.0, 30.0)], Some("sym"));
+    let r = assert_matches_full_decode(&path, &s, &walkforward::ProtocolOptions::default());
+    let scan = r.scan.unwrap();
+    assert_eq!((scan.groups_read, scan.groups_skipped), (3, 2));
+    assert_eq!(scan.value_bytes, scan.projected_columns as u64 * 3 * 36 * 8);
+}
+
+#[test]
+fn store_scan_matches_the_full_decode_with_a_final_read_and_a_locked_range() {
+    let scratch = Scratch::new("wf-scan-final");
+    let table = wide_table(false);
+    let path = write_wide(&scratch, "wide.rcsb", &table, 20);
+    let mut s = wide_spec("f1 + f4", vec![window("w", 0.0, 24.0, 40.0, 56.0)], Some("gid"));
+    s.candidates = vec!["f1 + f4".to_string(), "f2 - f0 * f5".to_string(), "0.25".to_string()];
+    s.validation_frac = 0.25;
+    for (final_read, locked) in [(false, vec![]), (true, vec![]), (false, vec![(30, 34)]), (true, vec![(30, 34)])] {
+        let opts = walkforward::ProtocolOptions { final_read, locked_ranges: locked, locked_embargo: 2, ..walkforward::ProtocolOptions::default() };
+        let r = assert_matches_full_decode(&path, &s, &opts);
+        let scan = r.scan.unwrap();
+        // union of f0, f1, f2, f4, f5 plus the target and the numeric group key
+        assert_eq!((scan.named_variables, scan.projected_columns), (5, 7), "{final_read} {:?}", opts.locked_ranges);
+        assert_eq!(scan.groups_read + scan.groups_skipped, if final_read { 18 } else { 9 });
+    }
+}

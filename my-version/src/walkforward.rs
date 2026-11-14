@@ -36,7 +36,6 @@
 //! training row per window. A CSV is read as a resident [`Table`]; the same
 //! accumulation rule applies afterwards.
 
-use crate::column::GroupBuf;
 use crate::data::{self, Table};
 use crate::expr::{self, Node};
 use crate::store::{self, FileStore};
@@ -655,6 +654,8 @@ pub struct Report {
     pub batch_pnl: Option<crate::wf_batch::BatchSummary>,
     /// #284: run-scoped phase ledger (`io`, `pnl`, `host_other`, device-busy intervals). Not part of `json()`, which is the reproduction hash.
     pub ledger: crate::gpu_stats::RunLedger,
+    /// Columns and bytes the store scan read; `None` on the table path. Not part of `json()`.
+    pub scan: Option<ScanStats>,
     /// `entry_offset) + horizon + delay`.
     pub required_purge_seconds: f64,
     /// Smallest positive step between consecutive test rows of one group.
@@ -813,6 +814,36 @@ pub fn run_store_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Re
     Ok(report)
 }
 
+/// What the store scan read (issue #1034): value columns of the projection and the bytes decoded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScanStats {
+    pub store_columns: usize,
+    pub named_variables: usize,
+    pub projected_columns: usize,
+    pub groups_read: usize,
+    pub groups_skipped: usize,
+    pub value_bytes: u64,
+}
+
+impl ScanStats {
+    fn json(&self) -> String {
+        format!(
+            "{{\"source\":\"store\",\"store_columns\":{},\"named_variables\":{},\"projected_columns\":{},\"groups_read\":{},\"groups_skipped\":{},\"value_bytes\":{}}}",
+            self.store_columns, self.named_variables, self.projected_columns, self.groups_read, self.groups_skipped, self.value_bytes
+        )
+    }
+}
+
+/// Positions in `layout.vars` that `n` names. Block bodies are not walked: their inputs are argument positions.
+fn named_inputs(n: &Node, out: &mut Vec<usize>) {
+    if n.op == expr::Op::Input && !out.contains(&(n.val as usize)) {
+        out.push(n.val as usize);
+    }
+    for k in &n.kids {
+        named_inputs(k, out);
+    }
+}
+
 fn run_store_clocked(
     path: &str,
     spec: &EvalSpec,
@@ -834,21 +865,54 @@ fn run_store_clocked(
     let header = fs.header();
     let t_pnl = std::time::Instant::now();
     let mut io_s = 0.0f64;
-    let mut buf = GroupBuf::new();
-    let mut scratch = Vec::new();
     let group_ids: Vec<u64> = match layout.group {
         Some(c) if !numeric[c] => header.levels(c).map_or_else(Vec::new, |l| l.iter().map(|s| label_group_id(s)).collect()),
         _ => Vec::new(),
     };
-    let mut features = Vec::with_capacity(layout.vars.len());
+    let mut named: Vec<usize> = Vec::new();
+    for tree in &trees {
+        named_inputs(tree, &mut named);
+    }
+    named.retain(|&p| p < layout.vars.len());
+    let time_f64 = layout.time_numeric && !layout.time_i64;
+    let group_f64 = layout.group.filter(|&g| numeric[g]);
+    let mut needed: Vec<usize> = (0..header.n_cols).filter(|&c| header.dtypes()[c] != store::DType::U32).collect();
+    needed.push(layout.target);
+    if time_f64 {
+        needed.push(layout.time);
+    }
+    needed.extend(group_f64);
+    let projection = store::Projection::from_indices(&fs, &needed)?;
+    let at = |index: usize| -> usize {
+        projection.columns().iter().position(|c| c.index == index).expect("projected column")
+    };
+    let var_at: Vec<(usize, usize)> = named.iter().map(|&p| (p, at(layout.vars[p]))).collect();
+    let target_at = at(layout.target);
+    let time_at = time_f64.then(|| at(layout.time));
+    let group_at = group_f64.map(at);
+    let mut scan = ScanStats {
+        store_columns: header.n_cols,
+        named_variables: named.len(),
+        projected_columns: projection.len(),
+        ..ScanStats::default()
+    };
+    let mut pg = store::ProjectedGroup::new();
+    // Positions no candidate names stay 0.0: `expr::eval` reads a row only at `Input` nodes.
+    let mut features = vec![0.0f64; layout.vars.len()];
+    let time_levels = header.levels(layout.time);
+    let time_of_code = |code: u32| -> f64 {
+        time_levels
+            .and_then(|l| l.get(code as usize))
+            .and_then(|s| data::parse_time(s))
+            .unwrap_or(f64::NAN)
+    };
     for pass in 0..(if opts.final_read { 2 } else { 1 }) {
         if pass == 1 {
             acc.begin_test_pass(spec, &trees)?;
         }
     for group in 0..fs.n_groups() {
         let t_io = std::time::Instant::now();
-        let view = fs.load_group_with(group, &mut buf, &mut scratch)?;
-        let len = view.len();
+        let len = header.group_len(group);
         let time_i64 = if layout.time_i64 {
             Some(fs.read_i64(group, layout.time)?)
         } else {
@@ -859,31 +923,38 @@ fn run_store_clocked(
         } else {
             Some(fs.read_codes(group, layout.time)?)
         };
+        // An exact i64 or dictionary time is known before the value read; an f64 time is part of it.
+        let known_unwanted = false && match (&time_i64, &time_codes) {
+            (Some(ints), _) => !ints.iter().any(|&i| acc.wants(i as f64)),
+            (None, Some(codes)) => !codes.iter().any(|&c| acc.wants(time_of_code(c))),
+            (None, None) => false,
+        };
+        if known_unwanted {
+            io_s += t_io.elapsed().as_secs_f64();
+            scan.groups_skipped += 1;
+            continue;
+        }
+        let stats = fs.read_group_projected(group, &projection, &mut pg)?;
+        scan.groups_read += stats.groups;
+        scan.value_bytes += stats.value_bytes;
         let group_codes = match layout.group {
             Some(c) if !numeric[c] => Some(fs.read_codes(group, c)?),
             _ => None,
         };
         io_s += t_io.elapsed().as_secs_f64();
-        let time_levels = header.levels(layout.time);
+        let var_cols: Vec<(usize, &[f64])> = var_at.iter().map(|&(p, c)| (p, pg.col(c))).collect();
+        let target_col = pg.col(target_at);
         for r in 0..len {
             let t = match (&time_i64, &time_codes) {
                 (Some(ints), _) => ints.get(r).copied().unwrap_or(i64::MIN) as f64,
-                (None, None) => view.col(layout.time)[r],
-                (None, Some(codes)) => {
-                    let code = codes.get(r).copied().unwrap_or(0) as usize;
-                    time_levels
-                        .and_then(|l| l.get(code))
-                        .and_then(|s| data::parse_time(s))
-                        .unwrap_or(f64::NAN)
-                }
-
+                (None, None) => pg.col(time_at.expect("f64 time"))[r],
+                (None, Some(codes)) => time_of_code(codes.get(r).copied().unwrap_or(0)),
             };
             if !acc.wants(t) {
                 continue;
             }
-            features.clear();
-            for &c in &layout.vars {
-                features.push(view.col(c)[r]);
+            for &(p, col) in &var_cols {
+                features[p] = col[r];
             }
             let g = match (layout.group, &group_codes) {
                 (None, _) => 0,
@@ -891,9 +962,9 @@ fn run_store_clocked(
                     let code = codes.get(r).copied().unwrap_or(0) as usize;
                     group_ids.get(code).copied().unwrap_or(label_group_id(""))
                 }
-                (Some(c), None) => group_key(view.col(c)[r]),
+                (Some(_), None) => group_key(pg.col(group_at.expect("numeric group"))[r]),
             };
-            let y = ret_in(opts, view.col(layout.target)[r]);
+            let y = ret_in(opts, target_col[r]);
             acc.add(t, g, &features, y, &trees);
         }
     }
@@ -904,6 +975,7 @@ fn run_store_clocked(
         fs.group_rows()
     );
     let mut report = acc.finish(clock, spec, opts, &layout, "store-stream", &bound, &trees)?;
+    report.scan = Some(scan);
     report.ledger.record_stage(crate::gpu_stats::Stage::Io, io_s);
     report.ledger.record_stage(crate::gpu_stats::Stage::Pnl, t_pnl.elapsed().as_secs_f64() - io_s);
     Ok(report)
@@ -1971,6 +2043,7 @@ impl Accum {
             device_pnl,
             batch_pnl,
             ledger,
+            scan: None,
             required_purge_seconds: required_purge,
             min_group_step,
             min_purge_seconds: min_gap,
@@ -3487,6 +3560,9 @@ impl Report {
         s.pop();
         if let Some(b) = &self.batch_pnl {
             s.push_str(&format!(",\"batch_timings\":{}", b.timings_json()));
+        }
+        if let Some(sc) = &self.scan {
+            s.push_str(&format!(",\"scan\":{}", sc.json()));
         }
         s.push_str(&format!(
             ",\"ledger\":{}}}",
