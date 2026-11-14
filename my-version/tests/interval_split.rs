@@ -633,11 +633,11 @@ fn split_windows_start_flat() {
         dir,
         "windows.csv",
         &[
-            ("ab", "train", hour(0), hour(300)),
-            ("ab", "validation", hour(300), hour(360)),
-            ("ab", "test", hour(360), hour(600)),
-            ("ab", "train", hour(600), hour(900)),
-            ("ab", "test", hour(900), hour(1100)),
+            ("g2", "train", hour(0), hour(300)),
+            ("g2", "validation", hour(300), hour(360)),
+            ("g2", "test", hour(360), hour(600)),
+            ("g2", "train", hour(600), hour(900)),
+            ("g2", "test", hour(900), hour(1100)),
             ("a", "train", hour(0), hour(300)),
             ("a", "test", hour(360), hour(600)),
             ("b", "train", hour(0), hour(300)),
@@ -650,7 +650,7 @@ fn split_windows_start_flat() {
         assert_eq!(code(&out), 0, "{}", stderr(&out));
         parse(&String::from_utf8_lossy(&out.stdout))
     };
-    let (ab, a, b) = (wf("ab"), wf("a"), wf("b"));
+    let (g2, a, b) = (wf("g2"), wf("a"), wf("b"));
     let mut want = period_net(&a);
     want.extend(period_net(&b));
     assert_eq!(period_net(&ab), want, "the pooled path is the concatenation of the window books");
