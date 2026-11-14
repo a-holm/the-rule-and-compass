@@ -382,7 +382,8 @@ pub struct Config {
     pub fit_view: Option<std::sync::Arc<Sample>>,
     /// #255: hard bound on how many admitted candidates one generation may
     /// refit with the exact CPU fallback arm. The first `N` fallbacks in the
-    /// deterministic admission order are refit; any remainder keeps the finite
+    /// rotated prefix order (#1125: group, then island from a start island that
+    /// moves with the seed and the generation) are refit; any remainder keeps the finite
     /// constants the device produced and is reported in `fit_fallback_bounded`.
     /// `0` disables the bound. The default is high enough not to fire on the
     /// recorded cell, so normal runs are bit-identical to the serial loop.
@@ -805,7 +806,7 @@ mod fit_accept; // #1117: the fit-accept decision counts
 pub use fit_accept::{FitAcceptCounts, FitAcceptReport, FitPath};
 use fit_route::{accept_fit, unfitted_wins};
 #[cfg(feature = "cuda")]
-use fit_route::{DeviceArm, ExactFits, FitRoute, FitSettings, RouteCounts};
+use fit_route::{DeviceArm, ExactFits, FitRoute, FitSettings, Rotation, RouteCounts};
 /// #495: default relative band of the finalist refit (`inf`: refit every unique tree).
 pub const DEFAULT_REFIT_BAND: f64 = f64::INFINITY;
 
@@ -1706,7 +1707,7 @@ impl GpuSearch {
         let settings = FitSettings::of(cfg);
         let arm = DeviceArm::for_metric(cfg.metric, fit_train.len(), cfg.fit_iters);
         let single_class = fit_route::single_class(cfg.metric, fit_train);
-        let mut route = FitRoute::new(settings, self.tail_overlap);
+        let mut route = FitRoute::new(settings, self.tail_overlap).with_rotation(Rotation::of(cfg.seed, generation, islands.len()));
         let mut planned: Vec<(usize, usize, crate::fit::GpuFitPlan)> = Vec::new();
         for &(i, j) in admitted {
             route.fold(&mut islands[i][j].tree);
@@ -1760,7 +1761,7 @@ impl GpuSearch {
             }
         }
         route.submit_early(&mut self.pool_fits(&mut pending, fit_train, &settings));
-        // #255: the refit prefix in admission order, written back by slot.
+        // #255: the refit prefix in the route's key order, written back by slot.
         let done = route.finish(&mut self.pool_fits(&mut pending, fit_train, &settings));
         for s in done.settled {
             islands[s.island][s.slot].tree = s.tree;
@@ -2753,7 +2754,7 @@ fn count_improved(map: &mut BTreeMap<String, usize>, cause: FitFallbackCause) {
 /// A cap of `0` means unbounded. The split is a pure function of the admitted
 /// count and the configured cap, so the same seed and configuration always
 /// choose the same prefix; the caller keeps the first `refit` entries in the
-/// deterministic admission order.
+/// route's rotated key order (#1125).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn fallback_batch_split(total: usize, cap: usize) -> (usize, usize) {
     if cap == 0 {
@@ -3799,7 +3800,7 @@ struct PipelineTail<'a> {
 }
 
 /// #578: refit the first `--fit-fallback-max` fallbacks of the generation on
-/// the CPU in the synchronous order, hold the rest, then simplify and score
+/// the CPU in the route's key order, hold the rest, then simplify and score
 /// every fallback tree on the device, as `fit_pending` and its re-score do.
 /// #958: a fallback whose exact fit started early on the pool takes that
 /// result; one past the prefix drops it.
@@ -9297,7 +9298,8 @@ fn run_search_scoped(
             #[cfg(feature = "cuda")]
             let mut pipeline_scored = false;
             #[cfg(feature = "cuda")]
-            let mut pipeline_route = FitRoute::new(FitSettings::of(cfg), gpu.as_ref().is_some_and(|g| g.tail_overlap));
+            let mut pipeline_route = FitRoute::new(FitSettings::of(cfg), gpu.as_ref().is_some_and(|g| g.tail_overlap))
+                .with_rotation(Rotation::of(cfg.seed, gen, islands.len()));
             #[cfg(feature = "cuda")]
             let mut pipeline_tail = PipelineTail { rows: gen_train, pending: PendingTail::default() };
             #[cfg(feature = "cuda")]

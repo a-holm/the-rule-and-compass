@@ -859,6 +859,11 @@ SEARCH:
                              their device constants, also after a routed tail
                              status; only one with no finite device answer keeps
                              its starting constants. All are counted.
+                             A bound that binds takes fallbacks by group (plan
+                             rejects first), then by island from a start
+                             island that moves every generation (a function of
+                             --seed and the generation), so each island gets
+                             refits in proportion over a run.
                              The refits run on the CPU fallback pool beside
                              the device work (same trees as after it);
                              RCSR_FIT_TAIL_SERIAL=1 runs them after the

@@ -452,6 +452,49 @@ pub(super) const ROW_FLOOR: u8 = 1;
 pub(super) const DISPATCH: u8 = 2;
 pub(super) const DEVICE: u8 = 3;
 
+/// #1125: where the `--fit-fallback-max` prefix starts among the islands.
+///
+/// The prefix orders the fallbacks of a group by island, starting at island
+/// `start` and wrapping. The start is a pure function of the run seed and the
+/// generation, so a resumed run, any thread count and both schedules agree,
+/// and over any `islands` consecutive generations every island starts once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Rotation {
+    start: usize,
+    islands: usize,
+}
+
+impl Rotation {
+    /// No rotation: ascending island order (the old order).
+    pub(super) const NONE: Rotation = Rotation { start: 0, islands: 0 };
+
+    /// The rotation of `generation` of the run seeded with `seed`.
+    pub(super) fn of(seed: u32, generation: usize, islands: usize) -> Self {
+        let islands = islands.max(1);
+        let mut z = u64::from(seed).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let start = ((z % islands as u64) as usize + generation % islands) % islands;
+        Rotation { start, islands }
+    }
+
+    /// A rotation that starts at `start`.
+    #[cfg(test)]
+    pub(super) fn at(start: usize, islands: usize) -> Self {
+        let islands = islands.max(1);
+        Rotation { start: start % islands, islands }
+    }
+
+    /// The rank of `island` in the rotated order.
+    pub(super) fn rank(self, island: usize) -> usize {
+        if self.islands == 0 {
+            return island;
+        }
+        (island % self.islands + self.islands - self.start) % self.islands
+    }
+}
+
 /// One candidate that needs the exact CPU fit.
 #[derive(Clone, Debug)]
 struct Fallback {
@@ -594,12 +637,27 @@ pub(super) struct FitRoute {
     offered: usize,
     /// Early jobs submitted so far.
     early_jobs: usize,
+    /// #1125: the island order of the refit prefix.
+    rotation: Rotation,
     counts: RouteCounts,
 }
 
 impl FitRoute {
     pub(super) fn new(settings: FitSettings, overlap: bool) -> Self {
-        FitRoute { settings, overlap, fallbacks: Vec::new(), offered: 0, early_jobs: 0, counts: RouteCounts::default() }
+        FitRoute { settings, overlap, fallbacks: Vec::new(), offered: 0, early_jobs: 0, rotation: Rotation::NONE, counts: RouteCounts::default() }
+    }
+
+    /// #1125: order the refit prefix of each group by island from `rotation`.
+    pub(super) fn with_rotation(mut self, rotation: Rotation) -> Self {
+        self.rotation = rotation;
+        self
+    }
+
+    /// #1125: whether `total` fallbacks exceed `--fit-fallback-max`. Only then
+    /// does the island rotation choose the prefix; otherwise every fallback is
+    /// refit and the key order stands.
+    fn binds(&self, total: usize) -> bool {
+        self.settings.fallback_max != 0 && total > self.settings.fallback_max
     }
 
     pub(super) fn settings(&self) -> &FitSettings {
@@ -788,16 +846,35 @@ impl FitRoute {
 
     /// #1075: whether a release schedule of `waves` calls runs for `jobs`
     /// device jobs: it can start exact fits early (overlap, at least two calls
-    /// of a single-launch LM arm), and every candidate of the stage falling
-    /// back still fits under `--fit-fallback-max`, so each released job lands
-    /// in the refit prefix.
+    /// of a single-launch LM arm). #1125: under `--fit-fallback-max` it runs
+    /// while the prefix has room; a wave releases only the jobs whose rank
+    /// bound in the rotated order is inside the prefix.
     pub(super) fn releases(&self, arm: DeviceArm, jobs: usize, waves: usize) -> bool {
         let cap = self.settings.fallback_max;
         self.overlap
             && waves >= 2
             && jobs >= 2
             && matches!(arm, DeviceArm::Lm(loss) if loss != DeviceLoss::Slope)
-            && (cap == 0 || self.fallbacks.len() + jobs <= cap)
+            && (cap == 0 || self.fallbacks.len() < cap)
+    }
+
+    /// #1125: for each of `jobs`, an upper bound of its rank among the
+    /// fallbacks of the generation: every fallback known now plus the jobs
+    /// that sort before it in the rotated order. A job with a bound below the
+    /// cap is certain to be in the refit prefix. Empty when the cap is 0.
+    fn rank_bounds<K: Copy, S: FitSlots<K> + ?Sized>(&self, jobs: &[(K, GpuFitPlan)], slots: &S) -> Vec<usize> {
+        if self.settings.fallback_max == 0 {
+            return Vec::new();
+        }
+        let rotation = self.rotation;
+        let place: Vec<(usize, usize)> = jobs.iter().map(|(key, _)| slots.place(*key)).collect();
+        let mut order: Vec<usize> = (0..jobs.len()).collect();
+        order.sort_by_key(|&k| (rotation.rank(place[k].0), place[k].1));
+        let mut bounds = vec![0; jobs.len()];
+        for (rank, &k) in order.iter().enumerate() {
+            bounds[k] = self.fallbacks.len() + rank;
+        }
+        bounds
     }
 
     /// #1075: [`Self::fit_on_device`] with the answers released in `waves`
@@ -831,12 +908,14 @@ impl FitRoute {
         let settings = self.settings;
         let plans: Vec<&GpuFitPlan> = jobs.iter().map(|(_, p)| p).collect();
         let mut hints: Vec<Option<Fallback>> = vec![None; jobs.len()];
+        let bounds = self.rank_bounds(jobs, &*slots);
+        let cap = self.settings.fallback_max;
         let early_jobs = &mut self.early_jobs;
         let released = device.fit_released(arm, &plans, &settings, rows, waves, &mut |batch: &[(usize, DeviceAnswer)]| {
             let mut out = Vec::new();
             for (k, answer) in batch {
                 let Some((key, plan)) = jobs.get(*k) else { continue };
-                if hints[*k].is_some() {
+                if hints[*k].is_some() || (cap != 0 && bounds[*k] >= cap) {
                     continue;
                 }
                 let finite = answer.c.iter().all(|v| v.is_finite());
@@ -875,9 +954,31 @@ impl FitRoute {
         step
     }
 
+    /// #1125: which of the fallbacks known now are in the refit prefix, by
+    /// index, or `None` when the cap does not bind. A later fallback can only
+    /// push one out of the prefix, never in.
+    fn prefix_mask(&self) -> Option<Vec<bool>> {
+        if !self.binds(self.fallbacks.len()) {
+            return None;
+        }
+        let rotation = self.rotation;
+        let mut order: Vec<usize> = (0..self.fallbacks.len()).collect();
+        order.sort_by_key(|&n| {
+            let key = self.fallbacks[n].key;
+            (key.0, rotation.rank(key.1), key.2)
+        });
+        let mut mask = vec![false; order.len()];
+        for &n in &order[..self.settings.fallback_max] {
+            mask[n] = true;
+        }
+        Some(mask)
+    }
+
     /// #958: with overlap, hand the fallbacks not yet offered to `exact`, in
     /// insertion order, while fewer than `--fit-fallback-max` jobs are out. A
-    /// fallback that already has a released job (#1075) is skipped.
+    /// fallback that already has a released job (#1075) is skipped. #1125:
+    /// under a binding cap only a fallback inside the rotated prefix is
+    /// offered.
     pub(super) fn submit_early<E: ExactFits + ?Sized>(&mut self, exact: &mut E) {
         if !self.overlap {
             return;
@@ -885,8 +986,10 @@ impl FitRoute {
         let cap = self.settings.fallback_max;
         let room = if cap == 0 { usize::MAX } else { cap.saturating_sub(self.early_jobs) };
         let from = self.offered;
+        let inside = self.prefix_mask();
         let mut jobs = Vec::new();
-        for f in self.fallbacks[from..].iter_mut().filter(|f| f.early.is_none()).take(room) {
+        let candidates = self.fallbacks.iter_mut().enumerate().skip(from);
+        for (_, f) in candidates.filter(|(n, f)| f.early.is_none() && inside.as_ref().is_none_or(|m| m[*n])).take(room) {
             f.early = Some(self.early_jobs + jobs.len());
             jobs.push(refit_job(f, f.device.clone(), &self.settings));
         }
@@ -904,7 +1007,12 @@ impl FitRoute {
         let mut fallbacks = std::mem::take(&mut self.fallbacks);
         self.offered = 0;
         self.early_jobs = 0;
-        fallbacks.sort_by_key(|f| f.key);
+        if self.binds(fallbacks.len()) {
+            let rotation = self.rotation;
+            fallbacks.sort_by_key(|f| (f.key.0, rotation.rank(f.key.1), f.key.2));
+        } else {
+            fallbacks.sort_by_key(|f| f.key);
+        }
         let (refit, bounded) = fallback_batch_split(fallbacks.len(), self.settings.fallback_max);
         self.counts.bounded += bounded;
         let mut early: Vec<Option<FallbackFitJob>> = joined.jobs.into_iter().map(Some).collect();
@@ -1129,6 +1237,7 @@ mod tests {
         call: &dyn Fn(&[&GpuFitPlan]) -> RecCall,
         sample: &Sample,
         settings: &FitSettings,
+        rotation: Rotation,
     ) -> RouteCounts {
         let metric = settings.metric;
         let want = match arm {
@@ -1168,6 +1277,7 @@ mod tests {
             }
         }
         let batch = plan_fit_batch(dispatcher, sample.len(), settings.iters, crate::fit::fit_loss(metric), planned);
+        let (plan_n, floor_n, refused_n) = (fallbacks.len(), batch.floor, batch.refused.len());
         fallbacks.extend(batch.refused);
         let jobs = batch.jobs;
         if !jobs.is_empty() {
@@ -1250,6 +1360,15 @@ mod tests {
                 }
             }
         }
+        let group_of = |n: usize| match n {
+            n if n < plan_n => PLAN,
+            n if n < plan_n + floor_n => ROW_FLOOR,
+            n if n < plan_n + refused_n => DISPATCH,
+            _ => DEVICE,
+        };
+        let mut order: Vec<usize> = (0..fallbacks.len()).collect();
+        order.sort_by_key(|&n| (group_of(n), rotation.rank(fallbacks[n].0), fallbacks[n].1));
+        let fallbacks: Vec<(usize, usize, FitFallbackCause)> = order.into_iter().map(|n| fallbacks[n]).collect();
         for &(_, _, cause) in &fallbacks {
             add(&mut counts.fallback, cause);
         }
@@ -1309,6 +1428,7 @@ mod tests {
         relabel: bool,
         sample: &Sample,
         settings: &FitSettings,
+        rotation: Rotation,
     ) -> (BTreeMap<(usize, usize), (Node, u64)>, RouteCounts) {
         let mut counts = RouteCounts::default();
         let mut out = BTreeMap::new();
@@ -1436,7 +1556,7 @@ mod tests {
         if fallbacks.is_empty() {
             return (out, counts);
         }
-        fallbacks.sort_by_key(|f| (f.group, f.island, f.slot));
+        fallbacks.sort_by_key(|f| (f.group, rotation.rank(f.island), f.slot));
         let (refit, bounded) = fallback_batch_split(fallbacks.len(), cap);
         counts.bounded += bounded;
         fit_fallback_jobs(&mut early_jobs, &sample.x, &sample.y, &sample.w, settings.iters, settings.metric, 2);
@@ -1542,6 +1662,7 @@ mod tests {
         let kind = rng.usize_below(3);
         let thresholds = rng.bool(0.25);
         let settings = FitSettings { accept: accept_of(seed), ..settings(metric, cap_for(&mut rng, admitted.len()), thresholds) };
+        let rotation = Rotation::at(rng.usize_below(islands_n), islands_n);
         let mut grid: Vec<Vec<Node>> = islands.iter().map(|pop| pop.iter().map(|ind| ind.tree.clone()).collect()).collect();
         let call = |plans: &[&GpuFitPlan], keys: &[(usize, usize)]| {
             let s: Vec<Script> = keys.iter().map(|k| scripts[k]).collect();
@@ -1551,7 +1672,7 @@ mod tests {
         // #1024: the threshold flag is a scope on the main thread for the plan
         // and a setting of every refit job.
         crate::fit::with_fit_thresholds(thresholds, || {
-            let mut route = FitRoute::new(settings, overlap);
+            let mut route = FitRoute::new(settings, overlap).with_rotation(rotation);
             let mut exact = ScopedFits::new(&sample, &settings, 2);
             let mut planned: Vec<(usize, usize, GpuFitPlan)> = Vec::new();
             for &(i, j) in &admitted {
@@ -1585,6 +1706,7 @@ mod tests {
                 &|plans: &[&GpuFitPlan]| call(plans, &keys),
                 &sample,
                 &settings,
+                rotation,
             );
             assert_eq!(done.counts, reference, "seed {seed}: counters");
         });
@@ -1624,13 +1746,14 @@ mod tests {
         let overlap = rng.bool(0.5);
         let thresholds = rng.bool(0.25);
         let settings = FitSettings { accept: accept_of(seed), ..settings(metric, cap_for(&mut rng, all.len()), thresholds) };
+        let rotation = Rotation::at(rng.usize_below(islands_n), islands_n);
         let call = |n: usize, plans: &[&GpuFitPlan], keys: &[(usize, usize)]| {
             let s: Vec<Script> = keys.iter().map(|k| scripts[k]).collect();
             recorded(plans, &s, arm, failed[n])
         };
 
         crate::fit::with_fit_thresholds(thresholds, || {
-            let mut route = FitRoute::new(settings, overlap);
+            let mut route = FitRoute::new(settings, overlap).with_rotation(rotation);
             let mut exact = ScopedFits::new(&sample, &settings, 2);
             let mut got: BTreeMap<(usize, usize), (Node, u64)> = BTreeMap::new();
             let mut keys_by_flush: Vec<Vec<(usize, usize)>> = Vec::new();
@@ -1674,6 +1797,7 @@ mod tests {
                 thresholds,
                 &sample,
                 &settings,
+                rotation,
             );
             assert_eq!(counts, reference, "seed {seed}: counters");
             assert_eq!(got.len(), want.len(), "seed {seed}: settled slots");
@@ -1727,6 +1851,7 @@ mod tests {
                 &|_: &[&GpuFitPlan]| unreachable!("a refused batch makes no device call"),
                 &sample,
                 &settings,
+                Rotation::NONE,
             );
             assert_eq!(done.counts, reference);
             for j in 0..2 {
@@ -2042,6 +2167,7 @@ mod tests {
         let kind = rng.usize_below(3);
         let thresholds = rng.bool(0.25);
         let settings = settings(metric, cap_for(&mut rng, admitted.len()), thresholds);
+        let rotation = Rotation::at(rng.usize_below(islands_n), islands_n);
         let schedule = match rng.usize_below(3) {
             0 => Schedule::Waves(*rng.pick(&[0usize, 2, 3, 7])),
             1 => Schedule::Waves(admitted.len() + 2),
@@ -2051,7 +2177,7 @@ mod tests {
         let mut grid: Vec<Vec<Node>> = islands.iter().map(|pop| pop.iter().map(|ind| ind.tree.clone()).collect()).collect();
 
         crate::fit::with_fit_thresholds(thresholds, || {
-            let mut route = FitRoute::new(settings, overlap);
+            let mut route = FitRoute::new(settings, overlap).with_rotation(rotation);
             let mut exact = ScopedFits::new(&sample, &settings, 2);
             let mut planned: Vec<(usize, usize, GpuFitPlan)> = Vec::new();
             for &(i, j) in &admitted {
@@ -2130,6 +2256,7 @@ mod tests {
                 },
                 &sample,
                 &settings,
+                rotation,
             );
             assert_eq!(done.counts, reference, "seed {seed}: counters under {schedule:?}");
         });
@@ -2205,7 +2332,7 @@ mod tests {
     }
 
     /// #1075: a release schedule runs only where it can start exact fits early
-    /// and every released job lands in the refit prefix.
+    /// and a released job lands in the refit prefix (#1125).
     #[test]
     fn release_runs_only_where_every_fallback_is_refit() {
         let lm = DeviceArm::Lm(DeviceLoss::Squared);
@@ -2228,6 +2355,286 @@ mod tests {
         }
         assert!(route(0, true, 50).releases(lm, 10, 3), "no cap");
         assert!(route(12, true, 2).releases(lm, 10, 3), "2 rejects and 10 jobs fit under 12");
-        assert!(!route(11, true, 2).releases(lm, 10, 3), "the cap could bind");
+        assert!(route(11, true, 2).releases(lm, 10, 3), "a binding cap still releases the jobs inside the prefix");
+        assert!(route(3, true, 2).releases(lm, 10, 3), "one job is inside the prefix");
+        assert!(!route(2, true, 2).releases(lm, 10, 3), "the rejects fill the prefix");
+    }
+
+    /// #1125: a fallback of `island`, `slot` whose device answer differs from
+    /// what the exact refit finds, so a refit tree and a held tree differ.
+    fn tail_fallback(island: usize, slot: usize, tree: &Node, device: &Node) -> Fallback {
+        Fallback {
+            key: (DEVICE, island, slot),
+            cause: FitFallbackCause::Unconverged,
+            tree: tree.clone(),
+            device: Some(device.clone()),
+            early: None,
+            tag: (island * 1000 + slot) as u64,
+        }
+    }
+
+    fn rotation_fixture() -> (Sample, Node, Node) {
+        let sample = rows(Metric::Squared, 160);
+        let tree = node(Op::Add, vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.5)]);
+        let plan = crate::fit::gpu_fit_plan_reason(&tree).expect("a plan");
+        let mut device = tree.clone();
+        plan.apply(&mut device, &[2.0, 3.0]);
+        (sample, tree, device)
+    }
+
+    /// The `(island, slot)` pairs a finished route refit: their tree is not the
+    /// held device answer.
+    fn refit_set(done: &RouteDone, device: &Node) -> Vec<(usize, usize)> {
+        let mut set: Vec<(usize, usize)> =
+            done.settled.iter().filter(|s| !crate::expr::same(&s.tree, device)).map(|s| (s.island, s.slot)).collect();
+        set.sort_unstable();
+        set
+    }
+
+    /// One generation of `islands` islands with `per` device fallbacks each.
+    fn capped_generation(cap: usize, islands: usize, per: usize, rotation: Rotation, workers: usize) -> Vec<(usize, usize)> {
+        let (sample, tree, device) = rotation_fixture();
+        let settings = settings(Metric::Squared, cap, false);
+        let mut route = FitRoute::new(settings, false).with_rotation(rotation);
+        let mut exact = ScopedFits::new(&sample, &settings, workers);
+        for island in 0..islands {
+            for slot in 0..per {
+                route.push(tail_fallback(island, slot, &tree, &device));
+            }
+        }
+        let done = route.finish(&mut exact);
+        assert_eq!(done.counts.bounded, (islands * per).saturating_sub(cap));
+        refit_set(&done, &device)
+    }
+
+    /// #1125: the rotation is a pure function of the seed and the generation,
+    /// stays in range, is the identity for one island and starts every island
+    /// once in any run of `islands` generations.
+    #[test]
+    fn rotation_is_a_pure_function_of_seed_and_generation() {
+        for islands in 1..=9usize {
+            for seed in [0u32, 1, 7, 12345, u32::MAX] {
+                for generation in 0..40usize {
+                    let r = Rotation::of(seed, generation, islands);
+                    assert_eq!(r, Rotation::of(seed, generation, islands));
+                    assert!((0..islands).all(|i| r.rank(i) < islands));
+                    let mut ranks: Vec<usize> = (0..islands).map(|i| r.rank(i)).collect();
+                    ranks.sort_unstable();
+                    assert_eq!(ranks, (0..islands).collect::<Vec<_>>(), "rank is a permutation");
+                }
+                for from in 0..12usize {
+                    let mut starts: Vec<usize> =
+                        (from..from + islands).map(|g| (0..islands).find(|&i| Rotation::of(seed, g, islands).rank(i) == 0).unwrap()).collect();
+                    starts.sort_unstable();
+                    assert_eq!(starts, (0..islands).collect::<Vec<_>>(), "seed {seed}, islands {islands}, from {from}");
+                }
+            }
+        }
+        for generation in 0..10 {
+            assert_eq!(Rotation::of(9, generation, 1).rank(0), 0);
+            assert_eq!(Rotation::of(9, generation, 0).rank(3), 0);
+        }
+        assert_ne!(
+            (0..8).map(|s| Rotation::of(s, 0, 8)).collect::<Vec<_>>(),
+            vec![Rotation::of(0, 0, 8); 8],
+            "the seed moves the start"
+        );
+    }
+
+    /// #1125: with a cap below the batch, every island gets refits over a
+    /// window of generations in proportion; the old order refits only the low
+    /// islands.
+    #[test]
+    fn cap_prefix_covers_every_island_over_generations() {
+        let (islands, per, cap) = (8usize, 12usize, 21usize);
+        for (seed, generations) in [(3u32, 64usize), (11, 61)] {
+            let mut counts = vec![0usize; islands];
+            for generation in 0..generations {
+                let set = capped_generation(cap, islands, per, Rotation::of(seed, generation, islands), 2);
+                assert_eq!(set.len(), cap, "generation {generation}");
+                for (island, _) in set {
+                    counts[island] += 1;
+                }
+            }
+            let mean = (cap * generations) as f64 / islands as f64;
+            assert!(counts.iter().all(|&n| n >= 8), "seed {seed}: {counts:?}");
+            assert!(
+                counts.iter().all(|&n| (n as f64 - mean).abs() <= 0.25 * mean),
+                "seed {seed}: refits per island {counts:?} against mean {mean}"
+            );
+        }
+    }
+
+    /// #1125: `--fit-fallback-max 1` refits one candidate per generation and its
+    /// island moves: over `islands` generations every island is refit once.
+    #[test]
+    fn cap_one_refits_one_candidate_on_a_moving_island() {
+        let islands = 6usize;
+        let mut counts = vec![0usize; islands];
+        for generation in 0..islands {
+            let set = capped_generation(1, islands, 3, Rotation::of(5, generation, islands), 2);
+            assert_eq!(set.len(), 1, "generation {generation}");
+            counts[set[0].0] += 1;
+        }
+        assert_eq!(counts, vec![1; islands]);
+    }
+
+    /// #1125: the unrotated order of the issue's example refits islands 0 and 1
+    /// only.
+    #[test]
+    fn the_unrotated_order_starves_the_high_islands() {
+        let mut counts = vec![0usize; 8];
+        for _ in 0..8 {
+            for (island, _) in capped_generation(21, 8, 12, Rotation::NONE, 2) {
+                counts[island] += 1;
+            }
+        }
+        assert_eq!(counts, vec![96, 72, 0, 0, 0, 0, 0, 0]);
+    }
+
+    /// #1125: plan-group priority is kept: a plan reject past the rotated
+    /// island start still refits before any device fallback.
+    #[test]
+    fn the_group_stays_the_first_key_under_rotation() {
+        let (sample, tree, device) = rotation_fixture();
+        let settings = settings(Metric::Squared, 3, false);
+        let mut route = FitRoute::new(settings, false).with_rotation(Rotation::at(2, 4));
+        let mut exact = ScopedFits::new(&sample, &settings, 1);
+        for island in 0..4 {
+            route.push(tail_fallback(island, 0, &tree, &device));
+        }
+        let mut reject = tail_fallback(0, 1, &tree, &device);
+        reject.key = (PLAN, 0, 1);
+        route.push(reject);
+        let done = route.finish(&mut exact);
+        assert_eq!(refit_set(&done, &device), vec![(0, 1), (2, 0), (3, 0)]);
+    }
+
+    /// #1125: the refit set does not depend on the worker count, and a fresh
+    /// route built from the seed and the generation alone (what a resume has)
+    /// refits what the continuous run refit.
+    #[test]
+    fn the_refit_set_is_independent_of_workers_and_of_resume() {
+        let (islands, per, cap, seed) = (5usize, 4usize, 7usize, 21u32);
+        let run: Vec<Vec<(usize, usize)>> =
+            (0..6).map(|g| capped_generation(cap, islands, per, Rotation::of(seed, g, islands), 1)).collect();
+        for generation in 0..6 {
+            let eight = capped_generation(cap, islands, per, Rotation::of(seed, generation, islands), 8);
+            assert_eq!(run[generation], eight, "generation {generation}: 1 against 8 workers");
+            let resumed = capped_generation(cap, islands, per, Rotation::of(seed, generation, islands), 2);
+            assert_eq!(run[generation], resumed, "generation {generation}: resumed");
+        }
+        assert!(run.windows(2).any(|w| w[0] != w[1]), "the refit set moves between generations");
+    }
+
+    /// #1125: a cap that does not bind settles every fallback in the same
+    /// order with the same trees and counters, rotated or not.
+    #[test]
+    fn a_cap_that_does_not_bind_ignores_the_rotation() {
+        for seed in 0..2000u32 {
+            let mut rng = Mt::new(30_000 + seed);
+            let sample = rows(Metric::Squared, 72);
+            let islands = 1 + rng.usize_below(5);
+            let mut entries: Vec<(u8, usize, usize, Node, Option<Node>)> = Vec::new();
+            for group in [PLAN, ROW_FLOOR, DISPATCH, DEVICE] {
+                for island in 0..islands {
+                    for slot in 0..rng.usize_below(3) {
+                        let device = rng.bool(0.5).then(|| random_tree(&mut rng));
+                        entries.push((group, island, slot + 10 * usize::from(group), random_tree(&mut rng), device));
+                    }
+                }
+            }
+            let cap = *rng.pick(&[0, entries.len(), entries.len() + 3]);
+            let rotation = Rotation::at(rng.usize_below(islands), islands);
+            let run = |rotation: Rotation| {
+                let settings = settings(Metric::Squared, cap, false);
+                let mut route = FitRoute::new(settings, false).with_rotation(rotation);
+                let mut exact = ScopedFits::new(&sample, &settings, 2);
+                for (group, island, slot, tree, device) in &entries {
+                    route.push(Fallback {
+                        key: (*group, *island, *slot),
+                        cause: FitFallbackCause::Unconverged,
+                        tree: tree.clone(),
+                        device: device.clone(),
+                        early: None,
+                        tag: (*island * 100 + *slot) as u64,
+                    });
+                }
+                route.finish(&mut exact)
+            };
+            let (a, b) = (run(Rotation::NONE), run(rotation));
+            assert_eq!(a.counts, b.counts, "seed {seed}: counters");
+            assert_eq!(a.counts.bounded, 0, "seed {seed}");
+            assert_eq!(a.settled.len(), b.settled.len());
+            for (x, y) in a.settled.iter().zip(&b.settled) {
+                assert_eq!((x.island, x.slot, x.tag), (y.island, y.slot, y.tag), "seed {seed}: settled order");
+                assert_same_tree(&x.tree, &y.tree, &format!("seed {seed}: slot ({}, {})", x.island, x.slot));
+            }
+        }
+    }
+
+    /// A device that answers every plan with the unconverged tail status at
+    /// its start constants, so every job is a fallback.
+    struct AllTail;
+
+    impl DeviceFit for AllTail {
+        fn fit(&mut self, _: DeviceArm, plans: &[&GpuFitPlan], _: &FitSettings, _: &Sample) -> DeviceRun {
+            let answers = plans.iter().map(|p| DeviceAnswer { status: 9, c: p.c0.clone() }).collect();
+            DeviceRun { answers: Some(answers), ms: 1.0, polish_ms: 0.0, span_start_s: None }
+        }
+    }
+
+    /// #1125: one synchronous stage of `islands` x `slots` candidates whose
+    /// device answers are all fallbacks, with `waves` calls. Returns the
+    /// settled `(island, slot, tree)` list sorted by slot, the early fits and
+    /// the launches.
+    fn tail_stage(cap: usize, rotation: Rotation, islands: usize, slots: usize, waves: usize) -> (Vec<(usize, usize, Node)>, usize, usize) {
+        let (sample, tree, _) = rotation_fixture();
+        let settings = settings(Metric::Squared, cap, false);
+        let mut route = FitRoute::new(settings, true).with_rotation(rotation);
+        let mut exact = ScopedFits::new(&sample, &settings, 2);
+        let cfg = Config::default();
+        let mut grid: Vec<Vec<Ind>> = vec![vec![Ind::pending(tree.clone(), &cfg); slots]; islands];
+        let jobs: Vec<((usize, usize), GpuFitPlan)> = (0..islands)
+            .flat_map(|i| (0..slots).map(move |j| (i, j)))
+            .map(|k| (k, crate::fit::gpu_fit_plan_reason(&tree).expect("a plan")))
+            .collect();
+        let step = route.fit_on_device_released(
+            &mut AllTail,
+            DeviceArm::Lm(DeviceLoss::Squared),
+            &jobs,
+            &mut grid[..],
+            &sample,
+            2,
+            &mut exact,
+            waves,
+        );
+        let (early, launches) = (step.early, step.launches.len());
+        route.submit_early(&mut exact);
+        let done = route.finish(&mut exact);
+        let mut settled: Vec<(usize, usize, Node)> = done.settled.into_iter().map(|s| (s.island, s.slot, s.tree)).collect();
+        settled.sort_by_key(|s| (s.0, s.1));
+        (settled, early, launches)
+    }
+
+    /// #1125: under a binding cap the waves release exactly the jobs whose
+    /// rank bound is inside the prefix, and the settled trees equal one call.
+    #[test]
+    fn a_binding_cap_releases_the_jobs_inside_the_prefix() {
+        let (islands, slots, cap, waves) = (8usize, 3usize, 5usize, 4usize);
+        // Waves cover islands 0-1, 2-3, 4-5 and 6-7; the last is never released.
+        for (start, early) in [(4usize, 5usize), (0, 5), (2, 5), (6, 0), (7, 2)] {
+            let rotation = Rotation::at(start, islands);
+            let (one, none, one_launch) = tail_stage(cap, rotation, islands, slots, 0);
+            let (waved, got, launches) = tail_stage(cap, rotation, islands, slots, waves);
+            assert_eq!((none, one_launch), (0, 1), "one call releases nothing");
+            assert_eq!(launches, waves, "start {start}");
+            assert_eq!(got, early, "start {start}: released jobs inside the prefix");
+            assert_eq!(one.len(), waved.len());
+            for (a, b) in one.iter().zip(&waved) {
+                assert_eq!((a.0, a.1), (b.0, b.1));
+                assert_same_tree(&a.2, &b.2, &format!("start {start}: slot ({}, {})", a.0, a.1));
+            }
+        }
     }
 }
