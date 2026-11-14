@@ -242,3 +242,35 @@ impl Pipeline {
         .to_vec()
     }
 }
+
+/// Every text file a pipeline run wrote under `dir`, except the inputs (`raw/`, the membership table) and the record.
+pub fn written_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if p.is_dir() {
+                if name != "raw" {
+                    stack.push(p);
+                }
+            } else if name != "membership.csv" && !name.starts_with("locked-tail") && !name.ends_with(".rcsb") {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A raw directory with a monthly January archive and daily archives: 2021-02-01 (development) and
+/// 2021-02-05 and 2021-02-06 (inside the range), for two symbols.
+pub fn daily_archives(root: &Path) {
+    for (sym, base) in [("AAAUSDT", 10.0), ("BBBUSDT", 20.0)] {
+        put_zip(root, sym, "2021-01", &hours(base, 0, JAN_END, &[]));
+        put_zip(root, sym, "2021-02-01", &hours(base, JAN_END, 24, &[]));
+        put_zip(root, sym, "2021-02-05", &hours(base, JAN_END + 96, 24, &[]));
+        put_zip(root, sym, "2021-02-06", &hours(base, JAN_END + 120, 24, &[]));
+    }
+}

@@ -143,3 +143,97 @@ fn schema_with_a_record_leaves_the_range_out_and_still_verifies() {
     let (code, _, err) = run(&["panel", "schema", "--data", &s(&p.panel), "--verify"]);
     assert_eq!(code, 0, "{err}");
 }
+
+#[test]
+fn every_file_the_pipeline_wrote_is_free_of_the_planted_symbol_and_passes_lock_check() {
+    let sc = scratch::Scratch::new("panel-lr-allfiles");
+    let dir = sc.path();
+    let record = lr::write_record(dir);
+    let p = Pipeline::new(&dir.join("full"), false);
+    p.build(Some(&record));
+    let files = lr::written_files(&p.dir);
+    assert!(files.len() >= 4, "{files:?}");
+    for f in &files {
+        assert!(!read(f).contains(PLANT), "{} names the planted symbol", f.display());
+    }
+    let (code, out, err) = run(&["lock", "check", "--record", &s(&record), &s(&p.dir.join("snapshot.json")), &format!("{}.manifest.json", s(&p.base)), &format!("{}.manifest.json", s(&p.panel)), &format!("{}.schema.json", s(&p.panel))]);
+    assert_eq!(code, 0, "{out}{err}");
+    let all: Vec<String> = files.iter().filter(|f| f.extension().is_some_and(|e| e == "json" || e == "csv")).map(|f| s(f)).collect();
+    let mut a = vec!["lock".to_string(), "check".into(), "--record".into(), s(&record)];
+    a.extend(all);
+    let a: Vec<&str> = a.iter().map(String::as_str).collect();
+    let (code, out, err) = run(&a);
+    assert_eq!(code, 0, "{out}{err}");
+}
+
+#[test]
+fn daily_archives_inside_the_range_are_not_listed_by_the_base_manifest_or_the_snapshot() {
+    let sc = scratch::Scratch::new("panel-lr-daily");
+    let dir = sc.path();
+    let record = lr::write_record(dir);
+    let raw = dir.join("raw");
+    lr::daily_archives(&raw);
+    let (base, snap) = (dir.join("base_h1.rcsb"), dir.join("snapshot.json"));
+    let (code, _, err) = run(&["panel", "base", "--input", &s(&raw), "--jobs", "2", "--cpu", "--out", &s(&base), "--lock-record", &s(&record)]);
+    assert_eq!(code, 0, "{err}");
+    let (code, _, err) = run(&["panel", "snapshot", "--input", &s(&raw), "--jobs", "2", "--out", &s(&snap), "--lock-record", &s(&record)]);
+    assert_eq!(code, 0, "{err}");
+    let manifest = format!("{}.manifest.json", s(&base));
+    for f in [&manifest, &s(&snap)] {
+        let text = read(Path::new(f));
+        assert!(text.contains("2021-02-01") && text.contains("2021-01"), "development archives stay listed in {f}");
+        assert!(!text.contains("2021-02-05") && !text.contains("2021-02-06"), "an in-range daily archive is listed in {f}");
+        let (code, out, err) = run(&["lock", "check", "--record", &s(&record), f]);
+        assert_eq!(code, 0, "{f}: {out}{err}");
+    }
+}
+
+#[test]
+fn the_base_lockbox_block_uses_development_rows_only() {
+    let sc = scratch::Scratch::new("panel-lr-overlap");
+    let dir = sc.path();
+    let record = lr::write_record(dir);
+    let p = Pipeline::new(&dir.join("full"), false);
+    let guarded = format!("{},{}", lr::lock_start() - 24 * lr::H, lr::lock_end());
+    let (code, _, err) = run(&[
+        "panel", "base", "--input", &s(&p.raw), "--jobs", "2", "--cpu", "--out", &s(&p.base), "--locked-test", &guarded, "--allow-lockbox", "--lock-record", &s(&record),
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let manifest = format!("{}.manifest.json", s(&p.base));
+    let (code, out, err) = run(&["lock", "check", "--record", &s(&record), &manifest]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(!read(Path::new(&manifest)).contains(PLANT));
+}
+
+#[test]
+fn append_with_a_record_leaves_the_range_out_of_the_schema_and_every_written_file() {
+    let sc = scratch::Scratch::new("panel-lr-append");
+    let dir = sc.path();
+    let record = lr::write_record(dir);
+    let p = Pipeline::new(&dir.join("full"), false);
+    p.build(Some(&record));
+    let fam = s(&dir.join("fam.rcsb"));
+    let (code, _, err) = run(&["enrich", "--data", &s(&p.base), "--out", &fam, "--cpu", "--features", "ret1", "--locked-test", "none"]);
+    assert_eq!(code, 0, "{err}");
+    let (rec, plain) = (s(&dir.join("with.rcsb")), s(&dir.join("without.rcsb")));
+    let panel = s(&p.panel);
+    let go = |out: &str, extra: &[&str]| {
+        let mut a = vec!["panel", "append", "--data", &panel, "--family", &fam, "--columns", "ret1", "--out", out];
+        a.extend(extra);
+        run(&a)
+    };
+    let (code, out, err) = go(&rec, &["--lock-record", &s(&record)]);
+    assert_eq!(code, 0, "{out}{err}");
+    let schema = format!("{rec}.schema.json");
+    let text = read(Path::new(&schema));
+    assert!(text.contains("\"lock_record\""), "{text}");
+    let (code, out, err) = run(&["lock", "check", "--record", &s(&record), &schema]);
+    assert_eq!(code, 0, "{out}{err}");
+    let (code, out, err) = go(&plain, &[]);
+    assert_eq!(code, 0, "{out}{err}");
+    let (code, out, _) = run(&["lock", "check", "--record", &s(&record), &format!("{plain}.schema.json")]);
+    assert_eq!(code, 4, "the control without the record is flagged: {out}");
+    for f in lr::written_files(&dir.join("full")) {
+        assert!(!read(&f).contains(PLANT), "{}", f.display());
+    }
+}

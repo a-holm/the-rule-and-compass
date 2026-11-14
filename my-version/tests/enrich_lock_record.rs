@@ -68,7 +68,7 @@ fn features(text: &str) -> Vec<(String, f64, f64)> {
     items
         .iter()
         .map(|f| (f.get("name").and_then(Json::as_str).unwrap().to_string(), num(f, "prevalence"), num(f, "nan_rows")))
-        .filter(|(n, _, _)| n == "ret1")
+        .filter(|(n, _, _)| !n.starts_with("lbl_") && n != "vol96")
         .collect()
 }
 
@@ -164,4 +164,114 @@ fn a_record_that_is_not_usable_is_refused_before_any_work() {
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("range.end_exclusive"), "{err}");
     assert!(!Path::new(&out).exists());
+}
+
+fn enrich_label(src: &str, out: &str, features: &str, label: &str, record: Option<&Path>) -> (i32, String) {
+    let mut a: Vec<String> = ["enrich", "--data", src, "--out", out, "--cpu", "--features", features, "--label", label].iter().map(|x| x.to_string()).collect();
+    if let Some(r) = record {
+        a.push("--lock-record".into());
+        a.push(s(r));
+    }
+    let args: Vec<&str> = a.iter().map(String::as_str).collect();
+    let (code, _, err) = run(&args);
+    (code, err)
+}
+
+#[test]
+fn a_chained_run_under_the_record_refuses_labels_carried_from_a_run_without_it() {
+    let sc = scratch::Scratch::new("enrich-lr-chain");
+    let dir = sc.path();
+    let record = lr::write_record(dir);
+    let src = store(dir, "in.rcsb", N);
+    let (a, b) = (s(&dir.join("a.rcsb")), s(&dir.join("b.rcsb")));
+    assert_eq!(enrich_label(&src, &a, "r1", &lh::src(1, ""), None).0, 0);
+    let (code, err) = enrich_label(&a, &b, "r4", &lh::src(2, ""), Some(&record));
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("lbl_h1_y") && err.contains("without this lock record"), "{err}");
+    assert!(!Path::new(&b).exists() && !Path::new(&format!("{b}.labels.json")).exists());
+
+    let (a2, b2) = (s(&dir.join("a2.rcsb")), s(&dir.join("b2.rcsb")));
+    assert_eq!(enrich_label(&src, &a2, "r1", &lh::src(1, ""), Some(&record)).0, 0);
+    let (code, err) = enrich_label(&a2, &b2, "r4", &lh::src(2, ""), Some(&record));
+    assert_eq!(code, 0, "{err}");
+    let text = std::fs::read_to_string(format!("{b2}.labels.json")).unwrap();
+    assert!(text.contains("lbl_h1_y") && text.contains("lbl_h2_y"), "chained labels under the record are kept");
+    let (code, out, err) = run(&["lock", "check", "--record", &s(&record), &format!("{b2}.labels.json")]);
+    assert_eq!(code, 0, "{out}{err}");
+}
+
+#[test]
+fn an_in_place_rerun_under_the_record_refuses_labels_it_does_not_recompute() {
+    let sc = scratch::Scratch::new("enrich-lr-inplace");
+    let dir = sc.path();
+    let record = lr::write_record(dir);
+    let src = store(dir, "in.rcsb", N);
+    let out = s(&dir.join("x.rcsb"));
+    assert_eq!(enrich_label(&src, &out, "r1", &lh::src(1, ""), None).0, 0);
+    let (code, err) = enrich_label(&src, &out, "r4", &lh::src(2, ""), Some(&record));
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("lbl_h1_y"), "{err}");
+    let (code, out_text, err) = run(&["lock", "check", "--record", &s(&record), &format!("{out}.labels.json")]);
+    assert_eq!(code, 4, "the refused run leaves the earlier sidecar untouched: {out_text}{err}");
+}
+
+fn enrich_features(src: &str, out: &str, features: &str, record: Option<&Path>) -> String {
+    let mut a: Vec<String> = ["enrich", "--data", src, "--out", out, "--cpu", "--features", features].iter().map(|x| x.to_string()).collect();
+    if let Some(r) = record {
+        a.push("--lock-record".into());
+        a.push(s(r));
+    }
+    let args: Vec<&str> = a.iter().map(String::as_str).collect();
+    let (code, _, err) = run(&args);
+    assert_eq!(code, 0, "{err}");
+    std::fs::read_to_string(format!("{out}.enrich.json")).unwrap()
+}
+
+fn all_features(text: &str) -> Vec<(String, f64, f64)> {
+    features(text)
+}
+
+#[test]
+fn every_feature_statistic_equals_a_run_on_the_store_truncated_before_the_range() {
+    let sc = scratch::Scratch::new("enrich-lr-allfeat");
+    let dir = sc.path();
+    let record = lr::write_record(dir);
+    let src = store(dir, "in.rcsb", N);
+    let short = store(dir, "short.rcsb", LOCK_HOUR as usize);
+    let list = "r1,r4,ma5,vol20";
+    let locked = enrich_features(&src, &s(&dir.join("locked.rcsb")), list, Some(&record));
+    let truncated = enrich_features(&short, &s(&dir.join("truncated.rcsb")), list, None);
+    let (a, b) = (all_features(&locked), all_features(&truncated));
+    assert!(a.len() >= 3, "{a:?}");
+    assert_eq!(a, b);
+}
+
+#[test]
+fn a_stale_carrier_that_lacks_the_record_range_is_refused_before_the_output_is_written() {
+    let sc = scratch::Scratch::new("enrich-lr-carrier");
+    let dir = sc.path();
+    let record = lr::write_record(dir);
+    let src = store(dir, "in.rcsb", N);
+    let declaration = format!(
+        "{{\"locked_test\":{{\"start\":{},\"end\":{},\"start_date\":\"2021-01-05\",\"end_date\":\"2021-01-09\",\"source\":\"fixture\"}}}}\n",
+        T0 + 100 * H,
+        T0 + 200 * H
+    );
+    std::fs::write(format!("{src}.manifest.json"), &declaration).unwrap();
+    let run_enrich = |out: &str| {
+        let (code, _, err) = run(&["enrich", "--data", &src, "--out", out, "--cpu", "--features", "r1", "--lock-record", &s(&record)]);
+        (code, err)
+    };
+    let clean = s(&dir.join("clean.rcsb"));
+    let (code, err) = run_enrich(&clean);
+    assert_eq!(code, 0, "{err}");
+    let text = std::fs::read_to_string(format!("{clean}.enrich.json")).unwrap();
+    assert!(text.contains("\"locked_test_also\""), "the record is the second range: {}", &text[..300.min(text.len())]);
+
+    let stale = s(&dir.join("stale.rcsb"));
+    std::fs::write(format!("{stale}.manifest.json"), &declaration).unwrap();
+    let (code, err) = run_enrich(&stale);
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("stale") && err.contains("manifest.json"), "{err}");
+    assert!(!Path::new(&stale).exists() && !Path::new(&format!("{stale}.enrich.json")).exists());
 }

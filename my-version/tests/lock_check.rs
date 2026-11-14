@@ -130,3 +130,23 @@ fn a_record_that_is_not_usable_exits_two_and_names_the_field() {
     let (code, _, err) = run(&["lock", "check", "--record", &s(&dir.join("locked-tail-fixture.json"))]);
     assert_eq!(code, 2, "{err}");
 }
+
+#[test]
+fn a_csv_without_a_header_prints_a_column_index_and_never_a_value() {
+    let sc = scratch::Scratch::new("lock-check-headerless");
+    let dir = sc.path();
+    fixture(dir, false);
+    write(dir, "raw/AAA-15m-2021-02-05.csv", &format!("{},1.0,2.0,0.5,1.5,10\n{},1.0,2.0,0.5,1.5,10\n", IN1 * 1000, IN2 * 1000));
+    write(dir, "raw/AAA-15m-2021-01-05.csv", &format!("{},1.0,2.0,0.5,1.5,10\n", DEV * 1000));
+    write(dir, "raw/dated.csv", "2021-02-12T16:00:00Z,1\n2021-01-05,2\n");
+    let (code, out, err) = check(dir);
+    assert_eq!(code, 4, "{err}");
+    let d = s(dir);
+    assert!(out.lines().any(|l| l == format!("{d}/raw/AAA-15m-2021-02-05.csv:column1:2")), "{out}");
+    assert!(out.lines().any(|l| l == format!("{d}/raw/dated.csv:column1:1")), "{out}");
+    assert!(!out.contains("AAA-15m-2021-01-05.csv"), "a development-only file is clean: {out}");
+    let text = format!("{out}{err}");
+    for needle in [(IN1 * 1000).to_string(), (IN2 * 1000).to_string(), "2021-02-12".to_string(), "16:00".to_string()] {
+        assert!(!text.contains(&needle), "the output names {needle}: {text}");
+    }
+}
