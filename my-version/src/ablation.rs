@@ -1770,7 +1770,7 @@ fn usage() -> &'static str {
             [--lockbox START,END|none]  a fold ending after START minus --purge-seconds (same resolution) is refused (exit 3)\n\
             [--lockbox-embargo S]  widen the lookback embargo after the range end (prepare writes it as its own segment; score refuses a fold reaching it)\n\
             [--retired retired.json]  a record from rcsr protocol retire drops the protocol default from the guard of --lockbox (ledger re-hashed, mismatch exit 3; overlap exit 2)\n\
-            [--allow-in-sample]  a fold whose test starts before the run's last seen row + purge is refused (exit 3); with the flag it is labelled oof:false and left out of every pooled series\n\
+            [--allow-in-sample]  a fold whose test starts before the run's last seen row + purge is refused (exit 3; for a --split-table run: a fold that a kept training or validation row reaches with its label window or reads within the run embargo after it); with the flag it is labelled oof:false and left out of every pooled series\n\
             [--group <col>] [--return-col <col>] [--scheme expanding] [--thresholds 0.6,0.7,0.8]\n\
             [--headline-threshold 0.7] [--cost-bps 12 | --cost-override <bp>] [--purge-seconds 219600] [--target-spec <file>]\n\
             scores the run's finalist (objective.finalist.expression_exact, else the rounded expression; the result carries expression_source) on every fold. Test rows of one group closer than the target spec horizon overlap and are refused (exit 2); a spec without stride_seconds over rows 2 horizons or more apart, or a stride_seconds wider than the smallest per-group step, is refused too (exit 2); a declared width makes one equal-weight period per floor(t / width) bucket; the result carries min_group_step_seconds. --target-spec sets the per-side cost\n\
@@ -2078,9 +2078,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             let rows = protocol::parse_windows_csv(&wtext, Some(fl.opt("--scheme").unwrap_or("expanding"))).map_err(|e| (3, e))?;
             let run_file = crate::run_json::RunFile::parse(&run_text).map_err(|e| (3, format!("{}: {}", run_path, e)))?;
             let run_band = RunBand::of(&run_file.band, run_file.min_holding);
-            let labelled: Vec<(String, f64)> = rows.iter().map(|r| (r.window.label.clone(), r.window.test_start)).collect();
+            let labelled: Vec<(String, f64, f64)> = rows.iter().map(|r| (r.window.label.clone(), r.window.test_start, r.window.test_end)).collect();
             let oof = run_file
-                .oof_flags(&labelled, fl.has("--allow-in-sample"))
+                .oof_flags_windows(&labelled, fl.has("--allow-in-sample"))
                 .map_err(|e| (3, format!("{}: {}", run_path, e)))?;
             let panel = ladder::load_panel(&inp, &opts).map_err(|e| (3, e))?;
             let resolved = crate::lockbox::resolve_retired(fl.opt("--lockbox"), fl.opt("--lockbox-embargo"), fl.need("--data")?, fl.opt("--retired")).map_err(|e| (e.exit, e.message))?;

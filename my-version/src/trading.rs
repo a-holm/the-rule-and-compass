@@ -1186,6 +1186,27 @@ pub fn blocked_alpha(
     spec: &TradingSpec,
     blocks: usize,
 ) -> Result<BlockedAlpha, String> {
+    blocked_alpha_with(pred, r, rows, spec, blocks, None)
+}
+
+/// #1173: [`blocked_alpha`] with one block per cut: a row stamped from `cuts[k]` up
+/// to the next cut is in block `k` (`--select-blocks intervals` passes the
+/// validation interval starts).
+pub fn blocked_alpha_cuts(pred: &[f64], r: &[f64], rows: &TradingRows, spec: &TradingSpec, cuts: &[f64]) -> Result<BlockedAlpha, String> {
+    if cuts.is_empty() || cuts.len() > FITNESS_MAX_BLOCKS {
+        return Err(format!("the block count must be 1 to {}, got {}", FITNESS_MAX_BLOCKS, cuts.len()));
+    }
+    blocked_alpha_with(pred, r, rows, spec, cuts.len(), Some(cuts))
+}
+
+fn blocked_alpha_with(
+    pred: &[f64],
+    r: &[f64],
+    rows: &TradingRows,
+    spec: &TradingSpec,
+    blocks: usize,
+    cuts: Option<&[f64]>,
+) -> Result<BlockedAlpha, String> {
     spec.validate()?;
     check_lengths(pred.len(), r, rows)?;
     let keep: Vec<usize> = (0..pred.len())
@@ -1202,7 +1223,10 @@ pub fn blocked_alpha(
     let flat = run_book(&ctx, &vec![0.0; n], cost_side);
     let held = run_book(&ctx, &vec![1.0; n], cost_side);
     let keys: Vec<f64> = if ctx.bucket > 0.0 { ctx.time.iter().map(|t| (t / ctx.bucket).floor()).collect() } else { ctx.time.clone() };
-    let ids = block_ids(&keys, blocks)?;
+    let ids = match cuts {
+        None => block_ids(&keys, blocks)?,
+        Some(c) => ctx.time.iter().map(|t| c.partition_point(|s| s <= t).saturating_sub(1) as u8).collect(),
+    };
     let mut series_net: Vec<f64> = Vec::new();
     let mut series_pos: Vec<f64> = Vec::new();
     let mut series_bh: Vec<f64> = Vec::new();
@@ -1474,6 +1498,22 @@ impl FitnessBook {
         blocks: usize,
         lambda: f64,
     ) -> Result<Self, String> {
+        Self::with_segments(slice, spec, horizon_seconds, blocks, lambda, &[])
+    }
+
+    /// #1173: [`FitnessBook::with_blocks`] where the rows stamped from
+    /// `segment_starts[k]` up to the next start form segment `k`: every
+    /// `(group, segment)` run is its own book (it starts flat and pays its final
+    /// exit) and the hindsight bound is the sum of the run bounds. With fewer than
+    /// two starts it is `with_blocks` exactly.
+    pub fn with_segments(
+        slice: &crate::data::TradingSlice,
+        spec: &TradingSpec,
+        horizon_seconds: f64,
+        blocks: usize,
+        lambda: f64,
+        segment_starts: &[f64],
+    ) -> Result<Self, String> {
         if blocks == 0 || blocks > FITNESS_MAX_BLOCKS {
             return Err(format!("the block count must be 1 to {}, got {}", FITNESS_MAX_BLOCKS, blocks));
         }
@@ -1521,7 +1561,26 @@ impl FitnessBook {
         let mut flags = rows.seam_flags();
         let groups = flags.iter().filter(|&&f| f & TradingRows::FIRST != 0).count();
         let side = spec.per_side_bps() * BP;
-        let bound = trading_gpu::dp_bound(&excess, &rows.group, side)?;
+        let run_key: Option<Vec<u64>> = (segment_starts.len() > 1).then(|| {
+            let segment = |t: f64| segment_starts.partition_point(|s| *s <= t);
+            for i in 1..n {
+                if rows.group[i] == rows.group[i - 1] && segment(rows.time[i]) != segment(rows.time[i - 1]) {
+                    flags[i] |= TradingRows::FIRST;
+                    flags[i - 1] |= TradingRows::LAST;
+                }
+            }
+            let mut id = 0u64;
+            (0..n)
+                .map(|i| {
+                    if i > 0 && flags[i] & TradingRows::FIRST != 0 {
+                        id += 1;
+                    }
+                    id
+                })
+                .collect()
+        });
+        let run_of: &[u64] = run_key.as_deref().unwrap_or(&rows.group);
+        let bound = trading_gpu::dp_bound(&excess, run_of, side)?;
         if !(bound > 0.0) {
             return Err(format!(
                 "no profitable long/flat path exists on the training rows at {} bp per side (hindsight bound {})",
@@ -1539,7 +1598,7 @@ impl FitnessBook {
                 for i in 0..n {
                     if ids[i] as usize == b {
                         e.push(excess[i]);
-                        g.push(rows.group[i]);
+                        g.push(run_of[i]);
                     }
                 }
                 let bb = trading_gpu::dp_bound(&e, &g, side)?;

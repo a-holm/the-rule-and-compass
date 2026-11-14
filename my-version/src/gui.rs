@@ -818,6 +818,9 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("--resume", "checkpoints depend on a process lifecycle the stream does not have"),
     ("--select-rule", "post-loop selection is a CLI option"),
     ("--select-blocks", "post-loop selection is a CLI option"),
+    ("--split-table", "interval-list splits read a splits table the server does not open"),
+    ("--split-id", "interval-list splits read a splits table the server does not open"),
+    ("--embargo", "interval-list splits read a splits table the server does not open"),
     ("--select-se", "post-loop selection is a CLI option"),
     ("--select-block-len", "post-loop selection is a CLI option"),
     ("--select-require-edge", "post-loop selection is a CLI option"),
@@ -1361,6 +1364,7 @@ impl RunPlan {
             scale_column: None,
             trading: None,
             canonical_train_order: false,
+            intervals: None,
         };
         let cv_dtypes = dtypes.clone();
         let prep = data::PrepSpec {

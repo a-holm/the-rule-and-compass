@@ -1507,6 +1507,8 @@ pub enum SplitMode {
     Temporal,
     Group,
     TemporalGroup,
+    /// #1173: interval roles from a splits table (`--split-table`).
+    TemporalIntervals,
 }
 
 impl SplitMode {
@@ -1516,6 +1518,7 @@ impl SplitMode {
             SplitMode::Temporal => "temporal",
             SplitMode::Group => "group",
             SplitMode::TemporalGroup => "temporal-group",
+            SplitMode::TemporalIntervals => "temporal-intervals",
         }
     }
 
@@ -1525,8 +1528,9 @@ impl SplitMode {
             "temporal" | "time" => Ok(SplitMode::Temporal),
             "group" | "grouped" => Ok(SplitMode::Group),
             "temporal-group" | "temporal_group" | "panel" => Ok(SplitMode::TemporalGroup),
+            "temporal-intervals" | "temporal_intervals" => Ok(SplitMode::TemporalIntervals),
             other => Err(format!(
-                "unknown split mode '{}' (expected random, temporal, group or temporal-group)",
+                "unknown split mode '{}' (expected random, temporal, group, temporal-group or temporal-intervals)",
                 other
             )),
         }
@@ -1585,6 +1589,8 @@ pub struct SplitSpec {
     /// scale statistics are computed, so every train-aligned output is in
     /// canonical order.
     pub canonical_train_order: bool,
+    /// #1173: the resolved splits-table intervals of mode `temporal-intervals`.
+    pub intervals: Option<crate::intervals::IntervalSplit>,
 }
 
 impl SplitSpec {
@@ -1615,6 +1621,7 @@ impl Default for SplitSpec {
             scale_column: None,
             trading: None,
             canonical_train_order: false,
+            intervals: None,
         }
     }
 }
@@ -1687,6 +1694,10 @@ pub struct SplitReport {
     /// the value came from (`store`, `flag` or `protocol_default`).
     pub lockbox_embargo_seconds: i64,
     pub lockbox_embargo_source: &'static str,
+    /// #1173: rows of the table intervals left out by the purge or the embargo,
+    /// and rows outside every interval.
+    pub interval_dropped_rows: usize,
+    pub interval_outside_rows: usize,
 }
 
 pub struct Prepared {
@@ -3032,7 +3043,16 @@ fn prepare_full_targets_weighted_inner(
         }
         None => None,
     };
-    let (mut train_idx, mut fold_idx, mut report) = build_split(filtered, spec, rng)?;
+    let (mut train_idx, mut fold_idx, mut report, interval_validation) = if spec.mode == SplitMode::TemporalIntervals {
+        if spec.validation_frac > 0.0 {
+            return Err("--split-table sets the validation intervals; drop --validation-frac".to_string());
+        }
+        let (train, validation, folds, report) = interval_split(filtered, spec)?;
+        (train, folds, report, validation)
+    } else {
+        let (train, folds, report) = build_split(filtered, spec, rng)?;
+        (train, folds, report, Vec::new())
+    };
     report.excluded_rows = excluded_count;
     if train_idx.is_empty() {
         return Err("training split is empty (reduce --test-frac)".to_string());
@@ -3042,7 +3062,7 @@ fn prepare_full_targets_weighted_inner(
     // training period. Selection may use train/validation; the test block is a
     // lockbox and never influences which candidate wins. A purge of `gap` rows
     // stands between fit-train and validation, mirroring the test embargo.
-    let mut validation_idx: Vec<usize> = Vec::new();
+    let mut validation_idx: Vec<usize> = interval_validation;
     if spec.validation_frac > 0.0 {
         if !(spec.validation_frac < 1.0) {
             return Err("--validation-frac must be in (0, 1)".to_string());
@@ -4191,6 +4211,124 @@ fn describe_selector(n: usize, train: &[usize], test: &[usize]) -> String {
     )
 }
 
+/// #1173: training, validation and test rows from the splits-table intervals
+/// of [`SplitSpec::intervals`], each in time order (ties by row id). The role is
+/// a function of the stamp, so a timestamp never straddles a boundary. An
+/// interval with no row after the purge and the embargo is refused.
+fn interval_split(t: &Table, spec: &SplitSpec) -> Result<(Vec<usize>, Vec<usize>, Vec<Vec<usize>>, SplitReport), String> {
+    use crate::intervals::Role;
+    let iv = spec
+        .intervals
+        .as_ref()
+        .ok_or("--split temporal-intervals needs --split-table <csv> --split-id <id>")?;
+    let tc = spec.time_col.ok_or("--split-table needs a time column (--time <col>)")?;
+    if let Some(dl) = &spec.declared_lockbox {
+        let floored = label_floored(dl, spec);
+        let purge = boundary_purge(spec);
+        for range in std::iter::once(dl.lockbox).chain(dl.also) {
+            let hit = iv.reaching(range.start, range.end, purge, floored.embargo.seconds);
+            if !hit.is_empty() {
+                return Err(format!(
+                    "the split table interval(s) {} of split '{}' reach the declared locked test {}..{} ({}; label end = stamp + {} s, \
+                     lookback embargo {} s after the end); end every interval at or before {} and start none before {}",
+                    hit.join(", "),
+                    iv.declared.split_id,
+                    crate::protocol::iso(range.start as f64),
+                    crate::protocol::iso(range.end as f64),
+                    dl.origin(),
+                    purge,
+                    floored.embargo.seconds,
+                    crate::protocol::iso(range.first_reaching(purge) as f64),
+                    crate::protocol::iso((range.end + floored.embargo.seconds) as f64)
+                ));
+            }
+        }
+    }
+    let n = t.len();
+    let mut report = SplitReport {
+        mode: spec.mode.name(),
+        rows_total: n,
+        folds: spec.folds.max(1),
+        ..Default::default()
+    };
+    let (keys_f64, trep) = time_keys_with(t, tc, &spec.time)?;
+    report.notes.extend(trep.text_lines());
+    let (lo, hi) = keys_f64
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
+    if !crate::lockbox::plausible_epoch_seconds(lo, hi) {
+        return Err("--split-table: the time column is not epoch seconds; the table intervals are UTC seconds".to_string());
+    }
+    let keys = TimeKeys::F64(keys_f64);
+    let order = sorted_by(&keys);
+    let d = &iv.declared;
+    let at = |v: &[(i64, i64)], ts: i64| v.partition_point(|&(a, _)| a <= ts) - 1;
+    let mut hits = [vec![0usize; d.train.len()], vec![0usize; d.validation.len()], vec![0usize; d.test.len()]];
+    let (mut train, mut validation, mut test) = (Vec::new(), Vec::new(), Vec::new());
+    for &i in &order {
+        let k = keys.value(i);
+        if !k.is_finite() {
+            report.interval_outside_rows += 1;
+            continue;
+        }
+        let ts = k.floor() as i64;
+        match iv.role(ts) {
+            Some(Role::Train) => {
+                hits[0][at(&d.train, ts)] += 1;
+                train.push(i);
+            }
+            Some(Role::Validation) => {
+                hits[1][at(&d.validation, ts)] += 1;
+                validation.push(i);
+            }
+            Some(Role::Test) => {
+                hits[2][at(&d.test, ts)] += 1;
+                test.push(i);
+            }
+            None => {
+                let held = |v: &[(i64, i64)]| v.iter().any(|&(a, b)| a <= ts && ts < b);
+                if held(&d.train) || held(&d.validation) {
+                    report.interval_dropped_rows += 1;
+                } else {
+                    report.interval_outside_rows += 1;
+                }
+            }
+        }
+    }
+    for (role, v, h) in [(Role::Train, &d.train, &hits[0]), (Role::Validation, &d.validation, &hits[1]), (Role::Test, &d.test, &hits[2])] {
+        if let Some(k) = h.iter().position(|&c| c == 0) {
+            return Err(format!(
+                "--split-table: the {} interval {}..{} of split '{}' has no rows after the purge ({} s) and the embargo ({} s)",
+                role.as_str(),
+                crate::protocol::iso(v[k].0 as f64),
+                crate::protocol::iso(v[k].1 as f64),
+                d.split_id,
+                iv.purge,
+                iv.embargo
+            ));
+        }
+    }
+    report.notes.push(format!(
+        "split table '{}': {} train / {} validation / {} test row(s); {} row(s) purged or embargoed; {} row(s) outside every interval",
+        d.split_id,
+        train.len(),
+        validation.len(),
+        test.len(),
+        report.interval_dropped_rows,
+        report.interval_outside_rows
+    ));
+    report.train_time_max = train.last().map(|&i| keys.value(i));
+    report.test_time_min = test.first().map(|&i| keys.value(i));
+    let fold_idx = split_blocks(&test, spec.folds.max(1));
+    report.train_rows = train.len();
+    report.test_rows = test.len();
+    report.folds = fold_idx.len();
+    report.selector = describe_selector(n, &train, &test);
+    Ok((train, validation, fold_idx, report))
+}
+
 /// Decide where each row goes. Returns `(train indices, test fold indices, report)`.
 fn build_split(
     t: &Table,
@@ -4295,6 +4433,9 @@ fn build_split(
     }
 
     let (train, fold_idx) = match spec.mode {
+        SplitMode::TemporalIntervals => {
+            return Err("--split temporal-intervals assigns rows through the split table".to_string());
+        }
         SplitMode::Random => {
             let mut idx: Vec<usize> = (0..n).collect();
             for i in (1..n).rev() {

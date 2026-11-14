@@ -513,13 +513,40 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
 
 HOW ROWS ARE SPLIT (important for time series and panel data):
   See docs/time-series.md for the full purge/embargo/look-ahead checklist.
-  --split random|temporal|group|temporal-group|auto   (default random)
+  --split random|temporal|group|temporal-group|temporal-intervals|auto   (default random)
                              random          shuffled i.i.d. holdout
                              temporal        train on the past, test on the future
                              group           hold out whole groups (unseen stocks,
                                              subjects, sensors), never both sides
                              temporal-group  a temporal split inside every group
+                             temporal-intervals  the roles of a --split-table
                              auto            infer from the columns and report
+  --split-table <csv>        interval-list split (mode temporal-intervals): rows
+                             split_id,role,start,end with role train, validation
+                             or test, UTC half-open intervals (ISO 8601 or epoch
+                             seconds). Needs --split-id, --time with epoch seconds
+                             and a --target-spec (the label purge). A training or
+                             validation row whose label window [t, t + purge)
+                             reaches a test interval, or that lies within the
+                             embargo after one, is left out; a training row within
+                             the purge on either side of a validation interval too.
+                             Overlapping intervals, an interval with no row left
+                             and --validation-frac, --test-frac, --train-select,
+                             --test-select or --cv with it exit 2; an interval that
+                             reaches a declared locked range exits 3. A split with
+                             no test interval is a final all-data run. Under
+                             --fitness pnl every maximal contiguous training
+                             interval is its own book segment per group. run.json
+                             split records split_id, split_table_sha256, intervals,
+                             effective_intervals, interval_purge_seconds,
+                             embargo_seconds, embargo_source and embargo_column
+  --split-id <id>            the split of --split-table to use
+  --embargo <seconds|auto>   embargo after every test interval of --split-table
+                             (default auto: the larger of the label purge and the
+                             longest lookback of the --vars columns, rule
+                             rcsr-lookback/1 at the modal bar of the data; a column
+                             without a rule counts as 10972800). A smaller value
+                             exits 2. embargo_source is flag, lookback or purge
   --time <col>               time/ordering column; implies temporal. Accepts
                              epoch numbers or ISO 8601 with a Z / +-HH:MM offset
   --date-only <policy>       date-only time values: error (default, refuses an
@@ -1167,7 +1194,10 @@ CHECKPOINTS:
                              pooled alpha wins. No eligible member: verdict
                              no_signal, validation_objective finalist. Reads
                              training and validation rows only
-  --select-blocks <K>        validation blocks of robust, 1 to 8 (default 4)
+  --select-blocks <K|intervals>
+                             validation blocks of robust, 1 to 8 (default 4);
+                             intervals takes one block per validation interval of
+                             --split-table (2 to 8 intervals, exit 2 otherwise)
   --select-se <Z>            one-standard-error multiple (default 1.0)
   --select-block-len <L>     bootstrap block length in periods, at most half the
                              validation periods (exit 2 above). Default per
@@ -2867,6 +2897,12 @@ fn main() {
     let mut select_rule_arg: Option<String> = None;
     let mut select_require_edge = false;
     let mut select_blocks_arg: Option<usize> = None;
+    // #1173: interval-list split.
+    let mut select_blocks_intervals = false;
+    let mut split_table_path: Option<String> = None;
+    let mut split_id_arg: Option<String> = None;
+    let mut embargo_arg: Option<String> = None;
+    let mut test_frac_given = false;
     let mut select_se_arg: Option<f64> = None;
     let mut select_block_len_arg: Option<usize> = None;
     let mut reselect_path: Option<String> = None;
@@ -3063,7 +3099,10 @@ fn main() {
                 cfg.seed = parse_flag("--seed", &val!(), "an integer from 0 to 4294967295", |_| true);
                 seed_set = true;
             }
-            "--test-frac" => test_frac = parse_nonneg("--test-frac", &val!()),
+            "--test-frac" => {
+                test_frac = parse_nonneg("--test-frac", &val!());
+                test_frac_given = true;
+            }
             "--validation-frac" => validation_frac = parse_nonneg("--validation-frac", &val!()),
             "--select-by" => select_by_arg = Some(val!()),
             "--objective" => objective_arg = Some(val!()),
@@ -3217,6 +3256,9 @@ fn main() {
             "--train-select" => train_select_src = Some(val!()),
             "--test-select" => test_select_src = Some(val!()),
             "--split" => split_arg = Some(val!()),
+            "--split-table" => split_table_path = Some(val!()),
+            "--split-id" => split_id_arg = Some(val!()),
+            "--embargo" => embargo_arg = Some(val!()),
             "--time" => time_name = Some(val!()),
             "--group-by" => group_name = Some(val!()),
             "--gap" => gap_src = Some(val!()),
@@ -3588,7 +3630,14 @@ fn main() {
             "--resume" => resume_path = Some(val!()),
             "--select-rule" => select_rule_arg = Some(val!()),
             "--select-require-edge" => select_require_edge = true,
-            "--select-blocks" => select_blocks_arg = Some(parse_uint("--select-blocks", &val!())),
+            "--select-blocks" => {
+                let v = val!();
+                if v == "intervals" {
+                    select_blocks_intervals = true;
+                } else {
+                    select_blocks_arg = Some(parse_uint("--select-blocks", &v));
+                }
+            }
             "--select-se" => select_se_arg = Some(parse_nonneg("--select-se", &val!())),
             "--select-block-len" => select_block_len_arg = Some(parse_uint("--select-block-len", &val!())),
             "--reselect" => reselect_path = Some(val!()),
@@ -5086,6 +5135,13 @@ fn main() {
             }
         },
     };
+    // #1173: a splits table sets the interval mode.
+    let requested = match (split_table_path.is_some(), requested) {
+        (true, None) | (true, Some(data::SplitMode::TemporalIntervals)) => Some(data::SplitMode::TemporalIntervals),
+        (true, Some(m)) => trading_usage(&format!("--split-table sets --split temporal-intervals; drop --split {}", m.name())),
+        (false, Some(data::SplitMode::TemporalIntervals)) => trading_usage("--split temporal-intervals needs --split-table <csv> --split-id <id>"),
+        (false, m) => m,
+    };
     let mode = if let Some(m) = requested {
         m
     } else if split_arg.as_deref() == Some("auto") {
@@ -5110,7 +5166,7 @@ fn main() {
                 let (guess, tc, gc, nt) = data::suggest_split(&table, target_idx, &known_vars);
                 if guess != data::SplitMode::Random {
                     let hint = match guess {
-                        data::SplitMode::Temporal | data::SplitMode::TemporalGroup => {
+                        data::SplitMode::Temporal | data::SplitMode::TemporalGroup | data::SplitMode::TemporalIntervals => {
                             let mut h = match tc {
                                 Some(j) => format!("--time {}", table.names[j]),
                                 None => "--time <col>".to_string(),
@@ -5142,7 +5198,7 @@ fn main() {
     };
 
     // Fill in a column the mode requires but the user did not name.
-    if matches!(mode, data::SplitMode::Temporal | data::SplitMode::TemporalGroup)
+    if matches!(mode, data::SplitMode::Temporal | data::SplitMode::TemporalGroup | data::SplitMode::TemporalIntervals)
         && time_col.is_none()
     {
         match data::find_time_col(&table, &exclusion(None, group_col)) {
@@ -5369,7 +5425,7 @@ fn main() {
                 trading_usage("--position top_tercile has no threshold: remove --threshold");
             }
         }
-        if !matches!(mode, data::SplitMode::Temporal | data::SplitMode::TemporalGroup)
+        if !matches!(mode, data::SplitMode::Temporal | data::SplitMode::TemporalGroup | data::SplitMode::TemporalIntervals)
             || time_col.is_none()
         {
             trading_usage(&format!(
@@ -5567,6 +5623,70 @@ fn main() {
     } else {
         None
     };
+    // #1173: the splits table, its label purge and the embargo after every test interval.
+    let mut split_table_sha = String::new();
+    let interval_split: Option<rcsr::intervals::IntervalSplit> = match split_table_path.as_deref() {
+        None => {
+            for (flag, given) in [
+                ("--split-id", split_id_arg.is_some()),
+                ("--embargo", embargo_arg.is_some()),
+                ("--select-blocks intervals", select_blocks_intervals),
+            ] {
+                if given {
+                    trading_usage(&format!("{} needs --split-table <csv>", flag));
+                }
+            }
+            None
+        }
+        Some(path) => {
+            for (flag, given) in [
+                ("--validation-frac", validation_frac > 0.0),
+                ("--test-frac", test_frac_given),
+                ("--train-select/--test-select", train_select.is_some() || test_select.is_some()),
+                ("--cv", cv_mode.is_some()),
+            ] {
+                if given {
+                    trading_usage(&format!("--split-table sets the training, validation and test intervals; drop {}", flag));
+                }
+            }
+            let Some(id) = split_id_arg.as_deref() else {
+                trading_usage("--split-table needs --split-id <id>");
+            };
+            let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+                eprintln!("error: --split-table {}: {}", path, e);
+                std::process::exit(EXIT_INPUT);
+            });
+            split_table_sha = rcsr::manifest::sha256_hex(text.as_bytes());
+            let declared = rcsr::intervals::parse_table(&text, id).unwrap_or_else(|e| trading_usage(&e));
+            let purge = match target_resolved.as_ref() {
+                Some(r) => Some(book_resolved.as_ref().map_or(0.0, |b| b.spec.required_purge_seconds()).max(r.spec.required_purge_seconds())),
+                None => multi_boundary_purge,
+            };
+            let Some(purge) = purge else {
+                trading_usage("--split-table needs the label purge of a declared target: add --target-spec");
+            };
+            let purge = purge.ceil() as i64;
+            let tc = time_col.expect("the interval mode resolved a time column");
+            let keys = data::time_keys_with(&table, tc, &data::TimeSpec { date_only, unit: time_unit, tz })
+                .map(|(k, _)| k)
+                .unwrap_or_else(|e| {
+                    eprintln!("error: --split-table: time column: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                });
+            let groups = group_col.map(|gc| data::group_ids(&table, gc).0);
+            let bar = rcsr::intervals::modal_step(&keys, groups.as_deref()).unwrap_or(0);
+            let flag = match embargo_arg.as_deref() {
+                None | Some("auto") => None,
+                Some(s) => match s.trim().parse::<i64>() {
+                    Ok(v) if v >= 0 => Some(v),
+                    _ => trading_usage(&format!("--embargo must be whole seconds >= 0 or auto, got '{}'", s)),
+                },
+            };
+            let (embargo, source, column) = rcsr::intervals::resolve_embargo(flag, purge, &vars, bar).unwrap_or_else(|e| trading_usage(&e));
+            Some(rcsr::intervals::IntervalSplit::new(declared, purge, embargo, source, column))
+        }
+    };
+    let split_fingerprint: Option<String> = interval_split.as_ref().map(|s| s.fingerprint());
     let spec = data::SplitSpec {
         mode,
         time_col,
@@ -5591,6 +5711,7 @@ fn main() {
         boundary_purge_seconds: multi_boundary_purge,
         trading: trading_cols.clone(),
         canonical_train_order: fitness_pnl, // #480
+        intervals: interval_split.clone(),
         scale_column: target_resolved
             .as_ref()
             .and_then(|r| r.spec.scale_column())
@@ -5653,7 +5774,7 @@ fn main() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(if e.starts_with("target spec") {
+            std::process::exit(if e.starts_with("target spec") || e.starts_with("--split-table") {
                 EXIT_USAGE
             } else {
                 EXIT_INPUT
@@ -5728,7 +5849,8 @@ fn main() {
         let (Some(tspec), Some(slice)) = (trading_spec.as_ref(), slice) else {
             trading_usage("--fitness pnl found no training trading rows");
         };
-        match rcsr::trading::FitnessBook::with_blocks(slice, tspec, target_horizon, pnl_blocks, pnl_lambda) {
+        let segments = interval_split.as_ref().map_or_else(Vec::new, |s| s.segment_starts());
+        match rcsr::trading::FitnessBook::with_segments(slice, tspec, target_horizon, pnl_blocks, pnl_lambda, &segments) {
             Ok(book) if book.len() == prepared.book.as_ref().map_or(prepared.train.len(), |b| b.train.len()) => Some(std::sync::Arc::new(book)),
             Ok(book) => trading_usage(&format!(
                 "--fitness pnl: {} training trading rows for {} training rows",
@@ -5967,12 +6089,24 @@ fn main() {
         Some(src) => rcsr::selection::SelectRule::parse(src).unwrap_or_else(|e| trading_usage(&e)),
         None => rcsr::selection::SelectRule::ValidationObjective,
     };
+    // #1173: `--select-blocks intervals` takes one block per validation interval.
+    let interval_cuts: Option<Vec<f64>> = if select_blocks_intervals {
+        let cuts = interval_split.as_ref().map_or_else(Vec::new, |s| s.validation_starts());
+        if cuts.len() < 2 {
+            trading_usage(&format!("--select-blocks intervals needs at least 2 validation intervals in the split, found {}", cuts.len()));
+        }
+        Some(cuts)
+    } else {
+        None
+    };
     let robust_params = rcsr::selection::RobustParams {
-        blocks: select_blocks_arg.unwrap_or(rcsr::selection::RobustParams::default().blocks),
+        blocks: interval_cuts
+            .as_ref()
+            .map_or_else(|| select_blocks_arg.unwrap_or(rcsr::selection::RobustParams::default().blocks), Vec::len),
         se_z: select_se_arg.unwrap_or(rcsr::selection::RobustParams::default().se_z),
         block_len: select_block_len_arg,
     };
-    if select_blocks_arg.is_some() || select_se_arg.is_some() || select_block_len_arg.is_some() {
+    if select_blocks_arg.is_some() || select_blocks_intervals || select_se_arg.is_some() || select_block_len_arg.is_some() {
         if select_rule != rcsr::selection::SelectRule::Robust {
             trading_usage("--select-blocks, --select-se and --select-block-len need --select-rule robust");
         }
@@ -6128,6 +6262,10 @@ fn main() {
     let mut backend_change: Option<(String, String)> = None;
     if let Some(cp) = &resume_checkpoint {
         if let Err(e) = cp.check_target_spec(target_sha.as_deref()) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_USAGE);
+        }
+        if let Err(e) = cp.check_split_intervals(split_fingerprint.as_deref()) {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_USAGE);
         }
@@ -6785,7 +6923,7 @@ fn main() {
             save_every,
             &seeds,
             |cp| {
-                if let Err(e) = cp.save_for(&path, target_sha.as_deref()) {
+                if let Err(e) = cp.save_with_split(&path, target_sha.as_deref(), split_fingerprint.as_deref()) {
                     eprintln!("error: {}", e);
                     std::process::exit(EXIT_INPUT);
                 }
@@ -7408,7 +7546,7 @@ fn main() {
                 let train_pred: Vec<f64> = book_train.x.iter().map(|row| expr::eval(tree, row)).collect();
                 member_spec(tspec, &train_pred, train_slice)
             };
-            let picked = rcsr::selection::select_robust_specs(&metas, robust_params, &mut spec_of, &ret, &book_rows, &mut |i| {
+            let picked = rcsr::selection::select_robust_specs_cuts(&metas, robust_params, interval_cuts.as_deref(), &mut spec_of, &ret, &book_rows, &mut |i| {
                 trading_pred(&sorted[rows[i].archive_rank - 1].tree, &v.x, ctx)
             })
             .unwrap_or_else(|e| trading_usage(&e));
@@ -7417,6 +7555,9 @@ fn main() {
                 order.insert(0, c);
             }
             selection_rule_fields = if select_require_edge { picked.fields_json_edge(no_edge) } else { picked.fields_json() };
+            if interval_cuts.is_some() {
+                selection_rule_fields.push_str(",\"blocks_source\":\"intervals\"");
+            }
         } else if select_require_edge {
             selection_rule_fields.push_str(",\"require_edge\":true");
             if no_edge {
@@ -8149,7 +8290,7 @@ fn main() {
                 String::new()
             };
             let split_json = format!(
-                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"lag_menu\":[{}],\"nvars_before\":{},\"nvars_after\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]{}{}}}",
+                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"lag_menu\":[{}],\"nvars_before\":{},\"nvars_after\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]{}{}{}}}",
                 jstr(prepared.report.mode),
                 prepared.report.rows_total,
                 prepared.train.len(),
@@ -8176,7 +8317,13 @@ fn main() {
                 lag_report.history_rows,
                 notes.iter().map(|n| jstr(n)).collect::<Vec<_>>().join(","),
                 target::split_purge_json(&prepared.report),
-                split_time_json(prepared.keys.as_ref())
+                split_time_json(prepared.keys.as_ref()),
+                interval_split.as_ref().map_or_else(String::new, |s| format!(
+                    "{},\"interval_rows\":{{\"dropped\":{},\"outside\":{}}}",
+                    s.json_fields(&split_table_sha),
+                    prepared.report.interval_dropped_rows,
+                    prepared.report.interval_outside_rows
+                ))
             );
             // #264: lockbox facts of the loaded table (rows, date range, read count).
             let lockbox_json = {
@@ -11028,6 +11175,10 @@ OPTIONS:
                              A window whose test_start is below the last train
                              or validation time of the run plus its required
                              purge exits 2
+                             (a run of --split-table: a window that a kept
+                             training or validation row reaches with its label
+                             window or reads within the run's embargo after the
+                             window exits 2; an earlier window can be out of sample)
                              Members are read from expression_exact (the lossless
                              form) when the run has it; the report says
                              selection.expression_source exact or rounded
@@ -11052,6 +11203,12 @@ OPTIONS:
   --window <spec>            LABEL,TRAIN_START,TRAIN_END,TEST_START,TEST_END
                              (repeatable; the four-bound form is also accepted)
   --windows <file>           CSV file of window rows with the same columns
+                             or a splits table (split_id,role,start,end) with
+                             --split-id: one window per test interval, labelled
+                             <id>-test<k>, with no training range of its own (one
+                             second before the purge gap); use it with --from-run
+                             or --threshold-fixed
+  --split-id <id>            the split of a --windows splits table
   --horizon <seconds>        forward-label horizon; minimum purge/embargo. Test rows of one
                              group closer than the horizon overlap and are refused (exit 2)
                              (default 0)
@@ -11374,6 +11531,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut windows: Vec<walkforward::Window> = Vec::new();
     let mut windows_file: Option<String> = None;
     let mut horizon: Option<f64> = None;
+    let mut windows_split_id: Option<String> = None;
     let mut embargo: Option<f64> = None;
     let mut cost_flag: Option<f64> = None;
     let mut cost_override: Option<f64> = None;
@@ -11477,6 +11635,10 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--windows" => {
                 windows_file = Some(need(args, i + 1, "--windows"));
+                i += 1;
+            }
+            "--split-id" => {
+                windows_split_id = Some(need(args, i + 1, "--split-id"));
                 i += 1;
             }
             "--horizon" => {
@@ -12034,8 +12196,37 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: walkforward needs --time\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
     });
+    let mut split_windows = false;
     if let Some(file) = windows_file {
         match std::fs::read_to_string(&file) {
+            Ok(text) if rcsr::intervals::is_table(&text) => {
+                // #1173: one window per test interval of the split; the window has no
+                // training range of its own (one second before the purge gap).
+                let Some(id) = windows_split_id.as_deref() else {
+                    eprintln!("error: --windows {} is a splits table: add --split-id <id>\n\n{}", file, walkforward_usage());
+                    std::process::exit(EXIT_USAGE);
+                };
+                let d = rcsr::intervals::parse_table(&text, id).unwrap_or_else(|e| {
+                    eprintln!("error: {}: {}", file, e);
+                    std::process::exit(EXIT_USAGE);
+                });
+                if d.test.is_empty() {
+                    eprintln!("error: {}: split '{}' has no test interval", file, id);
+                    std::process::exit(EXIT_USAGE);
+                }
+                split_windows = true;
+                let gap = embargo.unwrap_or(horizon).max(horizon).max(popts.required_purge_seconds(horizon));
+                for (k, &(s, e)) in d.test.iter().enumerate() {
+                    let train_end = s as f64 - gap;
+                    windows.push(walkforward::Window {
+                        label: format!("{}-test{}", id, k + 1),
+                        train_start: train_end - 1.0,
+                        train_end,
+                        test_start: s as f64,
+                        test_end: e as f64,
+                    });
+                }
+            }
             Ok(text) if rcsr::protocol::is_windows_table(&text) => {
                 match rcsr::protocol::parse_windows_csv(&text, windows_scheme.as_deref()) {
                     Ok(rows) => {
@@ -12085,6 +12276,10 @@ fn run_walkforward(args: &[String]) -> ! {
             }
         }
     }
+    if windows_split_id.is_some() && !split_windows {
+        eprintln!("error: --split-id needs --windows <splits table> (header {})\n\n{}", rcsr::intervals::TABLE_HEADER, walkforward_usage());
+        std::process::exit(EXIT_USAGE);
+    }
     if band_select && validation_frac <= 0.0 && popts.validation_starts.is_empty() {
         eprintln!(
             "error: --select-band needs --validation-frac > 0 or a windows table with validation_start; \
@@ -12102,10 +12297,14 @@ fn run_walkforward(args: &[String]) -> ! {
     }
     if let Some(run) = front_run.as_ref() {
         for w in &windows {
-            if run.in_sample(w.test_start) {
+            if run.in_sample_window(w.test_start, w.test_end) {
                 if allow_in_sample {
                     popts.in_sample_windows.push(w.label.clone());
                     continue;
+                }
+                if run.intervals.is_some() {
+                    eprintln!("error: window '{}' tests rows the run trained or selected on ({})", w.label, run.interval_reason());
+                    std::process::exit(EXIT_USAGE);
                 }
                 match run.earliest_test_start() {
                     Some((_, seen, purge)) => eprintln!(

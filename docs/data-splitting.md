@@ -153,6 +153,41 @@ contributes to both the training and the test side — so the test set still ask
 "predict the future", but now over many series at once, which is far more data
 than a single series gives you.
 
+### Interval-list splits
+
+A single train/validation/test cut can only test the end of the data. `--split-table <csv> --split-id <id>` (mode `temporal-intervals`) assigns rows from a table of UTC half-open intervals instead, so a split can train before and after a test interval (the base of combinatorial purged cross-validation, López de Prado 2018, chapter 12) and can hold several validation intervals spread over the training span:
+
+```csv
+split_id,role,start,end
+s02,train,2018-01-01T00:00:00Z,2019-03-01T00:00:00Z
+s02,validation,2019-03-01T00:00:00Z,2019-05-01T00:00:00Z
+s02,test,2019-06-01T00:00:00Z,2020-09-01T00:00:00Z
+s02,train,2022-01-01T00:00:00Z,2023-10-01T00:00:00Z
+s02,validation,2023-10-01T00:00:00Z,2023-12-01T00:00:00Z
+```
+
+```sh
+rcsr --data panel.rcsb --target y --vars r16,r672 --time ts --group-by symbol \
+     --target-spec spec.json --split-table splits.csv --split-id s02 \
+     --objective sharpe --fitness pnl --select-rule robust --select-blocks intervals --json
+```
+
+Rules, with `purge` the label purge of the target spec (`entry_offset + horizon + delay`) and `embargo` the value of `--embargo`:
+
+| row stamped `t` in | left out when |
+|---|---|
+| a training or validation interval | its label window `[t, t + purge)` reaches a test interval `[s, e)` (`t + purge > s`), or `e <= t < e + embargo` |
+| a training interval | its label window reaches a validation interval `[v, w)`, or `w <= t < w + purge` (purged on both sides) |
+| no interval | always |
+
+The predicate is the one of the locked-range guard (`Lockbox::reaches`), and the role is a function of the stamp, so rows that share a timestamp share a role. `--embargo auto` (the default) is the larger of the label purge and the longest lookback of every `--vars` column under rule `rcsr-lookback/1` at the modal bar of the data; a column without a rule counts as 10972800 s, and an explicit value below the automatic one exits 2. The purge protects labels, the embargo protects features: a training row after a test interval whose `r672` column is computed from test bars would carry test prices into the fit. Seed expressions parse against `--vars`, so they read no other column.
+
+Refusals: overlapping intervals (of one role or of two), an interval with no row left after the purge and the embargo, a split without a training interval, and `--validation-frac`, `--test-frac`, `--train-select`, `--test-select` or `--cv` together with the table exit 2. A table interval that reaches a declared locked range `[start - purge, end + embargo)` exits 3. A split without a test interval is a final all-data run. One train and one validation interval that match `--validation-frac` give the same rows in the same order, so the run is bit-identical to the `--validation-frac` run (`tests/interval_split.rs::one_interval_split_equals_validation_frac`).
+
+Under `--fitness pnl` every maximal contiguous training interval (touching training intervals merge) is its own book segment per group: it starts flat, pays its final exit and has its own hindsight bound, so a position is never carried across a removed test interval. `--pnl-blocks K` cuts the distinct training timestamps of the union into `K` runs and the book still resets at every segment. `--select-blocks intervals` gives the robust rule one block per validation interval (2 to 8).
+
+`run.json` `split` records `split_id`, `split_table_sha256`, `intervals {train, validation, test}`, `effective_intervals {train, validation}` (the parts whose rows were kept), `interval_purge_seconds`, `embargo_seconds`, `embargo_source` (`flag`, `lookback` or `purge`), `embargo_column` and `interval_rows {dropped, outside}`. `walkforward --from-run`, `ladder --sr-run` and `ablation score` read these fields and compare intervals: a window is in sample when a kept training or validation row reaches it with its label window or reads it within the embargo after it, and out of sample otherwise, even when it lies before later training rows (see [`walkforward.md`](walkforward.md#candidates-from-a-runs-front---front)).
+
 ## Assigning rows by expression
 
 Sometimes you know exactly which rows are training and which are validation: a
