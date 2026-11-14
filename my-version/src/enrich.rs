@@ -3200,6 +3200,10 @@ struct FamilyCost {
     cpu_cols_s: f64,
     /// CPU time of the columns that have a kernel, without any fixed part.
     cpu_supported_s: f64,
+    /// CPU estimate of the whole family with every column on the CPU.
+    cpu_report_s: f64,
+    /// Every supported column is bit-identical across backends.
+    exact: bool,
     gpu_s: f64,
     /// Part of `gpu_s` that another family on the device already pays: the
     /// context and fixed setup. Zero for the fused families.
@@ -3290,10 +3294,10 @@ pub fn plan_groups_mixed(
     benchmark_present: bool,
     rates: &EnrichRates,
 ) -> Vec<GroupPlan> {
-    let _ = threads;
     let mrow = n_rows as f64 / 1_000_000.0;
     let write_bps = rates.write_bps;
     let mut fams: Vec<FamilyCost> = Vec::new();
+    let workers = if threads > 1 { threads.min(n_segments).max(1) } else { 1 } as f64;
     for (group, classes) in mix {
         let group = *group;
         let cols: usize = classes.iter().map(|c| c.cols).sum();
@@ -3307,21 +3311,62 @@ pub fn plan_groups_mixed(
         let rate = rates.class(op);
         let fused = crate::features_gpu::fused_cost(group);
         let in_pass = fused.is_none() && op.is_shared_pass();
-        let (cpu_fixed_s, cpu_cols_s, cpu_supported_s) = match fused {
-            Some(cost) => (
-                0.0,
-                cost.cpu_ms_per_mrow_column * mrow * (cols as f64) / 1000.0,
-                cost.cpu_ms_per_mrow_column * mrow * (supported as f64) / 1000.0,
-            ),
-            None => (
-                if in_pass { 0.0 } else { mrow * rate.cpu_fixed_ms / 1000.0 },
-                mrow * rate.cpu_col_ms * cols as f64 / 1000.0,
-                mrow * rate.cpu_col_ms * supported as f64 / 1000.0,
-            ),
+        let sup_of = |c: &ClassCount| c.supported.min(c.cols);
+        let exact = classes.iter().all(|c| c.exact >= sup_of(c));
+        // A family whose supported columns are not all bit-identical across
+        // backends keeps the one-class price of its family class and one
+        // worker in the decision, so no such column changes backend.
+        let decide_workers = if exact { workers } else { 1.0 };
+        let (cpu_fixed_s, cpu_cols_s, cpu_supported_s, cpu_report_s) = match fused {
+            Some(cost) => {
+                let cols_s = cost.cpu_ms_per_mrow_column * mrow * (cols as f64) / 1000.0;
+                (
+                    0.0,
+                    cols_s / decide_workers,
+                    cost.cpu_ms_per_mrow_column * mrow * (supported as f64) / 1000.0 / decide_workers,
+                    cols_s / workers,
+                )
+            }
+            None => {
+                let mixed_cols_ms: f64 =
+                    classes.iter().map(|c| rates.class(c.op).cpu_col_ms * c.cols as f64).sum();
+                let mixed_fixed_ms = if in_pass {
+                    0.0
+                } else {
+                    classes.iter().map(|c| rates.class(c.op).cpu_fixed_ms).fold(0.0, f64::max)
+                };
+                let report_s = mrow * (mixed_fixed_ms + mixed_cols_ms) / 1000.0 / workers;
+                if exact {
+                    let mixed_supported_ms: f64 = classes
+                        .iter()
+                        .map(|c| rates.class(c.op).cpu_col_ms * sup_of(c) as f64)
+                        .sum();
+                    (
+                        mrow * mixed_fixed_ms / 1000.0 / workers,
+                        mrow * mixed_cols_ms / 1000.0 / workers,
+                        mrow * mixed_supported_ms / 1000.0 / workers,
+                        report_s,
+                    )
+                } else {
+                    (
+                        if in_pass { 0.0 } else { mrow * rate.cpu_fixed_ms / 1000.0 },
+                        mrow * rate.cpu_col_ms * cols as f64 / 1000.0,
+                        mrow * rate.cpu_col_ms * supported as f64 / 1000.0,
+                        report_s,
+                    )
+                }
+            }
         };
         let gpu_cells_n = n_rows.saturating_mul(supported).max(1);
-        let gpu_cells = gpu_cells_n as f64;
         let transfer_bytes = gpu_cells_n as f64 * 8.0;
+        let kernel_s = if exact {
+            classes
+                .iter()
+                .map(|c| n_rows as f64 * sup_of(c) as f64 / rates.class(c.op).gpu_cells_per_s)
+                .sum::<f64>()
+        } else {
+            gpu_cells_n as f64 / rate.gpu_cells_per_s
+        };
         let context_ms_per_mrow = fused.map_or(rates.context_ms_per_mrow, |c| c.context_ms_per_mrow);
         let context_ms = rates.fixed_overhead_ms + context_ms_per_mrow * mrow;
         let gpu_s = if let Some(fused_ms) =
@@ -3337,7 +3382,7 @@ pub fn plan_groups_mixed(
         } else {
             context_ms / 1000.0
                 + transfer_bytes / GPU_TRANSFER_BYTES_PER_SECOND
-                + gpu_cells / rate.gpu_cells_per_s
+                + kernel_s
                 + transfer_bytes / GPU_D2H_BYTES_PER_SECOND
                 + transfer_bytes / write_bps
         };
@@ -3387,6 +3432,8 @@ pub fn plan_groups_mixed(
             cpu_fixed_s,
             cpu_cols_s,
             cpu_supported_s,
+            cpu_report_s,
+            exact,
             gpu_s,
             ctx_s: if fused.is_some() { 0.0 } else { context_ms / 1000.0 },
             forced,
@@ -3424,7 +3471,8 @@ pub fn plan_groups_mixed(
             if members.is_empty() {
                 continue;
             }
-            let pass_s = mrow * rates.pass_fixed_ms(pass_op, benchmark_present) / 1000.0;
+            let pass_workers = if members.iter().all(|&i| fams[i].exact) { workers } else { 1.0 };
+            let pass_s = mrow * rates.pass_fixed_ms(pass_op, benchmark_present) / 1000.0 / pass_workers;
             let mut free: Vec<usize> = members
                 .iter()
                 .copied()
@@ -3499,7 +3547,7 @@ pub fn plan_groups_mixed(
         };
         let (mut pass_cpu_ms, mut pass_share_ms, mut pass_shared) = (0.0, 0.0, false);
         if f.in_pass {
-            let pass_ms = mrow * rates.pass_fixed_ms(f.op, benchmark_present);
+            let pass_ms = mrow * rates.pass_fixed_ms(f.op, benchmark_present) / workers;
             let cpu_n = cpu_members.get(&f.op.index()).copied().unwrap_or(0);
             let all_n = all_members.get(&f.op.index()).copied().unwrap_or(1);
             pass_shared = all_n > 1;
@@ -3517,7 +3565,7 @@ pub fn plan_groups_mixed(
             cpu_cols: if dispatched { f.cols - f.supported } else { f.cols },
             op: f.op.name().to_string(),
             classes: f.classes.clone(),
-            cpu_ms: (f.cpu_fixed_s + f.cpu_cols_s) * 1000.0 + pass_share_ms,
+            cpu_ms: f.cpu_report_s * 1000.0 + pass_share_ms,
             gpu_ms: f.gpu_s * 1000.0,
             pass_shared,
             pass_cpu_ms,
@@ -9575,7 +9623,8 @@ INPUT / OUTPUT:
                           and output hashes are identical for every size
   --threads <n>           feature-pass workers (default: available CPUs); at most 2 x n
                           segment outputs are held at once; arithmetic and output
-                          hashes are identical for every n
+                          hashes are identical for every n; the planner divides its
+                          CPU estimates by min(n, symbols)
   --group-rows <n>        group size for a CSV input store (store input keeps
                           its own layout)
   --bar-seconds <n>       expected bar spacing; inferred from the modal spacing
