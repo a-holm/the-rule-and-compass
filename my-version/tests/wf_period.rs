@@ -390,3 +390,13 @@ fn wf_stride_unknown_above_horizon() {
     ]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
 }
+
+#[test]
+fn wf_stride_wider_than_step_refused() {
+    let scratch = Scratch::new("wf-period-stride-wider");
+    let dir = scratch.path().to_path_buf();
+    let (out, _) = run_cli_spec(&dir, 3600, 3600, Some(86_400), &[]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    let msg = stderr(&out);
+    assert!(msg.contains("stride_seconds 86400") && msg.contains("3600"), "{msg}");
+}

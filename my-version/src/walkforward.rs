@@ -1749,15 +1749,8 @@ impl Accum {
             None => median(&mut pooled_ppy).unwrap_or(365.0),
         };
         let pooled = summarize(&pooled_returns, &pooled_gross, &pooled_stats, pooled_ppy);
-        if let (true, None, Some(step)) = (opts.horizon_from_spec, opts.stride_seconds, min_group_step) {
-            if step >= 2.0 * spec.horizon {
-                return Err(format!(
-                    "missing stride_seconds: the target spec has horizon_seconds {} and no stride_seconds, but labelled test rows of one group are at least {} s apart: \
-                     one period per horizon would give a wrong periods_per_year; add \"stride_seconds\": {} to the spec \
-                     (rcsr enrich writes it for a label with stride above the horizon)",
-                    spec.horizon, step, step
-                ));
-            }
+        if opts.horizon_from_spec {
+            crate::target::check_period_width(spec.horizon, opts.stride_seconds, min_group_step)?;
         }
         let required_purge = opts.required_purge_seconds(spec.horizon);
         let min_gap = windows

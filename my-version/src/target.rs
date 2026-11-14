@@ -1087,6 +1087,29 @@ pub fn schema_json() -> String {
     )
 }
 
+/// Refuse a declared period width that the labelled rows contradict. `step` is
+/// the smallest per-group step between labelled rows (`None` when no group has
+/// two). The messages start with `missing stride_seconds` or `stride_seconds`
+/// so a command maps them to exit 2 by prefix.
+pub fn check_period_width(horizon_seconds: f64, stride_seconds: Option<f64>, step: Option<f64>) -> Result<(), String> {
+    let Some(step) = step else { return Ok(()) };
+    match stride_seconds {
+        None if step >= 2.0 * horizon_seconds => Err(format!(
+            "missing stride_seconds: the target spec has horizon_seconds {} and no stride_seconds, but labelled test rows of one group are at least {} s apart: \
+             one period per horizon would give a wrong periods_per_year; add \"stride_seconds\": {} to the spec \
+             (rcsr enrich writes it for a label with stride above the horizon)",
+            horizon_seconds, step, step
+        )),
+        Some(s) if step < s * (1.0 - 1e-9) => Err(format!(
+            "stride_seconds {} is wider than the smallest per-group step {} s of the labelled rows: \
+             one period per stride would average rows that are independent returns; fix or remove stride_seconds in the spec \
+             (rcsr enrich writes the stride of the label)",
+            s, step
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1319,5 +1342,21 @@ mod tests {
             .unwrap_err()
             .contains("cost_per_side_bps"));
         assert_eq!(s.sha256(), with_cost(Some(20.0), false).sha256());
+    }
+
+    #[test]
+    fn check_period_width_cases() {
+        let h = 3600.0;
+        assert!(check_period_width(h, None, None).is_ok());
+        assert!(check_period_width(h, Some(86_400.0), None).is_ok());
+        assert!(check_period_width(h, None, Some(h)).is_ok());
+        assert!(check_period_width(h, None, Some(2.0 * h - 1.0)).is_ok());
+        let e = check_period_width(h, None, Some(2.0 * h)).unwrap_err();
+        assert!(e.starts_with("missing stride_seconds"), "{e}");
+        assert!(check_period_width(h, Some(86_400.0), Some(86_400.0)).is_ok());
+        assert!(check_period_width(h, Some(86_400.0), Some(172_800.0)).is_ok());
+        let e = check_period_width(h, Some(86_400.0), Some(3600.0)).unwrap_err();
+        assert!(e.starts_with("stride_seconds") && e.contains("86400") && e.contains("3600"), "{e}");
+        assert!(check_period_width(86_400.0, Some(129_600.0), Some(129_600.0)).is_ok());
     }
 }

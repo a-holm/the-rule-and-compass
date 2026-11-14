@@ -1820,7 +1820,7 @@ fn ladder_verify_read_without_allow_in_sample_scores_nothing() {
     std::fs::write(
         &spec,
         "{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{\"column\":\"y\",\"name\":\"raw_target\",\"kind\":\"forward_return\",\
-\"deprecated\":false,\"return_column\":\"r\",\"return_units\":\"log\",\"horizon_seconds\":900,\"entry_offset_seconds\":0,\
+\"deprecated\":false,\"return_column\":\"r\",\"return_units\":\"log\",\"horizon_seconds\":3600,\"entry_offset_seconds\":0,\
 \"delay_seconds\":0,\"entry_price\":\"next open\",\"exit_price\":\"close\",\"offset\":0.0,\
 \"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"log_return\",\"cost_bps\":null,\
 \"cost_in_label\":false,\"construction_columns\":[],\"note\":null}]}",
