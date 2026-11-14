@@ -237,3 +237,102 @@ fn append_with_a_record_leaves_the_range_out_of_the_schema_and_every_written_fil
         assert!(!read(&f).contains(PLANT), "{}", f.display());
     }
 }
+
+#[test]
+fn the_campaign_rebuild_shape_finishes_under_the_record() {
+    let sc = scratch::Scratch::new("panel-lr-shape");
+    let dir = sc.path();
+    let record = lr::write_record(dir);
+    let (rec, fwd) = (s(&record), format!("{},{}", lr::T0 + 50_000 * lr::H, lr::T0 + 60_000 * lr::H));
+    let p = Pipeline::new(&dir.join("full"), false);
+    p.build_with(Some(&record), Some(&fwd));
+    let fam = s(&dir.join("full/base_enriched.rcsb"));
+    let mut a: Vec<String> = ["enrich", "--data", &s(&p.base), "--out", &fam, "--cpu", "--features", "r1", "--locked-test", &fwd, "--lock-record", &rec]
+        .iter()
+        .map(|x| x.to_string())
+        .collect();
+    for h in 1..=7 {
+        a.push("--label".into());
+        a.push(format!("long:{h},name=h{h},fee=10,stride={h}"));
+    }
+    let args: Vec<&str> = a.iter().map(String::as_str).collect();
+    let (code, out, err) = run(&args);
+    assert_eq!(code, 0, "{out}{err}");
+    let outp = s(&dir.join("full/panel_enriched.rcsb"));
+    let (code, out, err) = run(&["panel", "append", "--data", &s(&p.panel), "--family", &fam, "--columns", "r1", "--out", &outp, "--locked-test", &fwd, "--lock-record", &rec]);
+    assert_eq!(code, 0, "{out}{err}");
+    let (code, out, err) = run(&["panel", "schema", "--data", &outp, "--verify"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let files = lr::written_files(&p.dir);
+    assert!(files.len() >= 8, "{files:?}");
+    for f in &files {
+        assert!(!read(f).contains(PLANT), "{} names the planted symbol", f.display());
+    }
+    let mut a = vec!["lock".to_string(), "check".into(), "--record".into(), rec.clone()];
+    a.extend(files.iter().filter(|f| f.extension().is_some_and(|e| e == "json" || e == "csv")).map(|f| s(f)));
+    let a: Vec<&str> = a.iter().map(String::as_str).collect();
+    let (code, out, err) = run(&a);
+    assert_eq!(code, 0, "{out}{err}");
+}
+
+fn v1_csv(path: &Path, to: i64, with_plant: bool) {
+    let mut text = String::from("ts,symbol,open,high,low,close,volume\n");
+    let mut row = |sym: &str, hr: i64, base: f64| {
+        let p = base * (1.0 + 0.0001 * hr as f64);
+        text.push_str(&format!("{},{},{p},{},{},{p},10\n", lr::T0 + hr * lr::H, sym, p * 1.01, p * 0.99));
+    };
+    for hr in 0..to {
+        row("AAA", hr, 10.0);
+        row("LATE", hr, 20.0);
+        if hr < 50 {
+            row("GONE", hr, 30.0);
+        }
+        if with_plant && hr >= 850 {
+            row("ZZPLANT", hr, 7.0);
+        }
+    }
+    std::fs::write(path, text).unwrap();
+}
+
+#[test]
+fn the_v1_panel_build_under_the_record_equals_the_truncated_build_and_names_nothing_from_the_range() {
+    let sc = scratch::Scratch::new("panel-lr-v1");
+    let dir = sc.path();
+    let record = lr::write_record(dir);
+    let mut m = String::from("as_of,symbol,member,adv_usd,n_bars\n");
+    for sym in ["AAA", "LATE", "GONE"] {
+        m.push_str(&format!("{},{sym},1,1000.0,100\n", lr::T0));
+    }
+    m.push_str(&format!("{},LATE,0,1000.0,100\n{},AAA,1,1000.0,100\n", lr::T0 + 400 * lr::H, lr::T0 + 400 * lr::H));
+    let full_m = format!("{m}{},ZZPLANT,1,1000.0,100\n", lr::T0 + 900 * lr::H);
+    let (mf, mc) = (dir.join("full-m.csv"), dir.join("cut-m.csv"));
+    std::fs::write(&mf, full_m).unwrap();
+    std::fs::write(&mc, &m).unwrap();
+    let go = |name: &str, to: i64, plant: bool, memb: &Path, rec: Option<&Path>| -> String {
+        let csv = dir.join(format!("{name}.csv"));
+        v1_csv(&csv, to, plant);
+        let store = dir.join(format!("{name}.rcsb"));
+        let (code, _, err) = run(&["import", &s(&csv), &s(&store)]);
+        assert_eq!(code, 0, "{err}");
+        let out = s(&dir.join(format!("{name}-panel.rcsb")));
+        let (store_s, memb_s) = (s(&store), s(memb));
+        let mut a = vec!["panel", "build", "--data", &store_s, "--membership", &memb_s, "--bar-seconds", "3600", "--out", &out];
+        let r = rec.map(s);
+        if let Some(r) = &r {
+            a.extend(["--lock-record", r]);
+        }
+        let (code, o, err) = run(&a);
+        assert_eq!(code, 0, "{o}{err}");
+        format!("{out}.manifest.json")
+    };
+    let full = go("full", 1000, true, &mf, Some(&record));
+    let cut = go("cut", LOCK_HOUR, false, &mc, None);
+    let (f, c) = (doc(Path::new(&full)), doc(Path::new(&cut)));
+    for key in ["panel.delisted", "panel.symbols", "panel.rows", "panel.gaps", "panel.last_ts", "membership"] {
+        assert_eq!(member(&f, key), member(&c, key), "{key}");
+    }
+    assert_eq!(member(&f, "panel.delisted"), "Num(1.0)", "GONE only: LATE trades on into the range");
+    assert!(!read(Path::new(&full)).contains("ZZPLANT"));
+    let (code, out, err) = run(&["lock", "check", "--record", &s(&record), &full]);
+    assert_eq!(code, 0, "{out}{err}");
+}

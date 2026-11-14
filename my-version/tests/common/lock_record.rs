@@ -202,7 +202,13 @@ impl Pipeline {
 
     /// snapshot, base and build; `record` adds `--lock-record` to each.
     pub fn build(&self, record: Option<&Path>) {
+        self.build_with(record, None)
+    }
+
+    /// As `build`, with `--locked-test` on base and build.
+    pub fn build_with(&self, record: Option<&Path>, locked: Option<&str>) {
         let rec: Vec<String> = record.map(|r| vec!["--lock-record".to_string(), s(r)]).unwrap_or_default();
+        let lt: Vec<String> = locked.map(|l| vec!["--locked-test".to_string(), l.to_string()]).unwrap_or_default();
         let go = |args: Vec<String>| {
             let a: Vec<&str> = args.iter().map(String::as_str).collect();
             let (code, _, err) = run(&a);
@@ -219,6 +225,7 @@ impl Pipeline {
             .map(str::to_string)
             .collect::<Vec<_>>();
         a.extend(rec.clone());
+        a.extend(lt.clone());
         go(a);
         let mut a = vec![
             "panel", "build", "--data", &s(&self.base), "--membership", &s(&self.membership), "--snapshot", &s(&self.snapshot),
@@ -228,6 +235,7 @@ impl Pipeline {
         .map(str::to_string)
         .collect::<Vec<_>>();
         a.extend(rec);
+        a.extend(lt);
         go(a);
     }
 
