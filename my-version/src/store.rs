@@ -430,6 +430,15 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
     h
 }
 
+/// The destination row ranges of one group in the table columns, one entry per
+/// projection column. A column that has no such block holds `None`.
+struct GroupDst<'a> {
+    group: usize,
+    f64s: Vec<Option<&'a mut [f64]>>,
+    ints: Vec<Option<&'a mut [i64]>>,
+    codes: Vec<Option<&'a mut [u32]>>,
+}
+
 /// Statistics from one projected group read. Incremented at the `pread` site.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProjectedReadStats {
@@ -848,21 +857,6 @@ impl FileStore {
         int_scratch: &mut Vec<i64>,
         byte_scratch: &mut Vec<u8>,
     ) -> Result<ProjectedReadStats, String> {
-        self.read_group_projected_impl(group, projection, out, int_scratch, byte_scratch, None)
-    }
-
-    /// Shared body of the projected group read. With `keep`, the exact `i64`
-    /// block of every `I64` column is appended in projection order, so the
-    /// time column is read once.
-    fn read_group_projected_impl(
-        &self,
-        group: usize,
-        projection: &Projection,
-        out: &mut [f64],
-        int_scratch: &mut Vec<i64>,
-        byte_scratch: &mut Vec<u8>,
-        mut keep: Option<&mut Vec<Vec<i64>>>,
-    ) -> Result<ProjectedReadStats, String> {
         if group >= self.header.n_groups() {
             return Err(format!(
                 "{}: group {} is out of range ({} groups)",
@@ -894,9 +888,6 @@ impl FileStore {
                 }
                 DType::I64 => {
                     read_i64_block(&self.file, &self.path, off, int_scratch, byte_scratch)?;
-                    if let Some(k) = keep.as_deref_mut() {
-                        k.push(int_scratch.clone());
-                    }
                     for (dst, &v) in out[lo..hi].iter_mut().zip(int_scratch.iter()) {
                         *dst = if v == i64::MIN { f64::NAN } else { v as f64 };
                     }
@@ -994,71 +985,40 @@ impl FileStore {
         let n = self.header.n_rows;
         let n_groups = self.header.n_groups();
         let readers = readers.min(n_groups).max(1);
+        // Every element is overwritten by the group reads below, so the zeroed
+        // allocation is never filled a second time.
         let mut values: Vec<Vec<f64>> = projection
             .columns()
             .iter()
-            .map(|c| {
-                if c.width == 0 {
-                    Vec::new()
-                } else {
-                    let mut v = Vec::with_capacity(n);
-                    v.resize(n, f64::NAN);
-                    v
-                }
-            })
+            .map(|c| if c.width == 0 { Vec::new() } else { vec![0.0f64; n] })
             .collect();
         let mut ints: Vec<Option<Vec<i64>>> = projection
             .columns()
             .iter()
-            .map(|c| {
-                if c.dtype == DType::I64 {
-                    let mut v = Vec::with_capacity(n);
-                    v.resize(n, i64::MIN);
-                    Some(v)
-                } else {
-                    None
-                }
-            })
+            .map(|c| (c.dtype == DType::I64).then(|| vec![i64::MIN; n]))
             .collect();
         let mut codes: Vec<Option<Vec<u32>>> = projection
             .columns()
             .iter()
-            .map(|c| {
-                if c.dtype == DType::U32 {
-                    Some(vec![0u32; n])
-                } else {
-                    None
-                }
-            })
+            .map(|c| (c.dtype == DType::U32).then(|| vec![0u32; n]))
             .collect();
-        if readers == 1 {
-            let mut group = ProjectedGroup::new();
-            for g in 0..n_groups {
-                self.read_group_projected(g, projection, &mut group)?;
-                let base = g * self.header.group_rows;
-                let len = group.len();
-                for (c, col) in projection.columns().iter().enumerate() {
-                    if col.width > 0 {
-                        values[c][base..base + len].copy_from_slice(group.col(c));
-                    }
-                    if let Some(dst) = ints[c].as_mut() {
-                        let exact = self.read_i64(g, col.index)?;
-                        dst[base..base + len].copy_from_slice(&exact);
-                    }
-                    if let Some(dst) = codes[c].as_mut() {
-                        let exact = self.read_codes(g, col.index)?;
-                        dst[base..base + len].copy_from_slice(&exact);
-                    }
-                }
+        if n_groups > 0 {
+            let mut work = self.group_destinations(projection, &mut values, &mut ints, &mut codes);
+            if work.len() != n_groups {
+                return Err(format!(
+                    "{}: {} destination groups for {} store groups",
+                    self.path,
+                    work.len(),
+                    n_groups
+                ));
             }
-        } else {
-            self.read_groups_concurrently(
-                projection,
-                readers,
-                &mut values,
-                &mut ints,
-                &mut codes,
-            )?;
+            if readers == 1 {
+                for dst in &mut work {
+                    self.read_group_into(projection, dst)?;
+                }
+            } else {
+                self.read_groups_concurrently(projection, readers, work)?;
+            }
         }
         let names = projection.names();
         let numeric: Vec<bool> = projection
@@ -1085,116 +1045,143 @@ impl FileStore {
         Ok(Table::from_parts(names, numeric, columns, n, 0))
     }
 
+    /// Split every projected column into its per-group row ranges and collect
+    /// the ranges of one group into one work item, in group order.
+    fn group_destinations<'a>(
+        &self,
+        projection: &Projection,
+        values: &'a mut [Vec<f64>],
+        ints: &'a mut [Option<Vec<i64>>],
+        codes: &'a mut [Option<Vec<u32>>],
+    ) -> Vec<GroupDst<'a>> {
+        let rows = self.header.group_rows.max(1);
+        let n_cols = projection.len();
+        let mut work: Vec<GroupDst<'a>> = (0..self.header.n_groups())
+            .map(|group| GroupDst {
+                group,
+                f64s: Vec::with_capacity(n_cols),
+                ints: Vec::with_capacity(n_cols),
+                codes: Vec::with_capacity(n_cols),
+            })
+            .collect();
+        for v in values.iter_mut() {
+            if v.is_empty() {
+                work.iter_mut().for_each(|w| w.f64s.push(None));
+            } else {
+                for (w, chunk) in work.iter_mut().zip(v.chunks_mut(rows)) {
+                    w.f64s.push(Some(chunk));
+                }
+            }
+        }
+        for v in ints.iter_mut() {
+            match v {
+                Some(v) => {
+                    for (w, chunk) in work.iter_mut().zip(v.chunks_mut(rows)) {
+                        w.ints.push(Some(chunk));
+                    }
+                }
+                None => work.iter_mut().for_each(|w| w.ints.push(None)),
+            }
+        }
+        for v in codes.iter_mut() {
+            match v {
+                Some(v) => {
+                    for (w, chunk) in work.iter_mut().zip(v.chunks_mut(rows)) {
+                        w.codes.push(Some(chunk));
+                    }
+                }
+                None => work.iter_mut().for_each(|w| w.codes.push(None)),
+            }
+        }
+        work
+    }
+
+    /// Read the projected blocks of one group straight into its destination
+    /// slices. An `i64` column is read once into `ints` and converted into the
+    /// `f64` view from there.
+    fn read_group_into(
+        &self,
+        projection: &Projection,
+        dst: &mut GroupDst<'_>,
+    ) -> Result<(), String> {
+        let mut scratch = Vec::new();
+        for (c, col) in projection.columns().iter().enumerate() {
+            let meta = &self.header.columns[col.index];
+            let off = self.data_start + meta.offsets[dst.group];
+            match meta.dtype {
+                DType::F64 => read_f64_block(
+                    &self.file,
+                    &self.path,
+                    off,
+                    dst.f64s[c].as_deref_mut().ok_or("missing f64 destination")?,
+                    &mut scratch,
+                )?,
+                DType::I64 => {
+                    let exact = dst.ints[c].as_deref_mut().ok_or("missing i64 destination")?;
+                    read_i64_block(&self.file, &self.path, off, exact, &mut scratch)?;
+                    let vals = dst.f64s[c].as_deref_mut().ok_or("missing f64 destination")?;
+                    for (v, &i) in vals.iter_mut().zip(exact.iter()) {
+                        *v = if i == i64::MIN { f64::NAN } else { i as f64 };
+                    }
+                }
+                DType::U32 => read_u32_block(
+                    &self.file,
+                    &self.path,
+                    self.data_start + meta.code_offsets[dst.group],
+                    dst.codes[c].as_deref_mut().ok_or("missing code destination")?,
+                    &mut scratch,
+                )?,
+            }
+        }
+        Ok(())
+    }
+
     /// Reader pool of [`FileStore::to_table_projected_with_readers`]: workers
-    /// claim group indices, read them through their own handle and send them
-    /// to the calling thread, which copies each into its disjoint row range.
-    /// Emptied group buffers return to the workers.
+    /// take the next group's destination slices, read through their own handle
+    /// and write the blocks into them. The error of the lowest failing group
+    /// is returned: groups are claimed in order and a claimed group is always
+    /// finished, so every group below a failing one has been read.
     fn read_groups_concurrently(
         &self,
         projection: &Projection,
         readers: usize,
-        values: &mut [Vec<f64>],
-        ints: &mut [Option<Vec<i64>>],
-        codes: &mut [Option<Vec<u32>>],
+        work: Vec<GroupDst<'_>>,
     ) -> Result<(), String> {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::{mpsc, Mutex};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
 
-        struct Loaded {
-            group: usize,
-            values: ProjectedGroup,
-            ints: Vec<Vec<i64>>,
-            codes: Vec<Vec<u32>>,
-        }
-
-        let n_groups = self.header.n_groups();
-        let next = AtomicUsize::new(0);
-        let (tx, rx) = mpsc::sync_channel::<Result<Loaded, String>>(readers);
-        let (free_tx, free_rx) = mpsc::channel::<ProjectedGroup>();
-        let free_rx = Mutex::new(free_rx);
-        let handles: Vec<Result<FileStore, String>> =
-            (0..readers).map(|_| self.try_clone()).collect();
+        let handles = (0..readers)
+            .map(|_| self.try_clone())
+            .collect::<Result<Vec<FileStore>, String>>()?;
+        let queue = Mutex::new(work.into_iter());
+        let failed: Mutex<Option<(usize, String)>> = Mutex::new(None);
+        let stop = AtomicBool::new(false);
         std::thread::scope(|s| {
-            for handle in handles {
-                let tx = tx.clone();
-                let next = &next;
-                let free_rx = &free_rx;
+            for fs in &handles {
+                let queue = &queue;
+                let failed = &failed;
+                let stop = &stop;
                 s.spawn(move || {
-                    let fs = match handle {
-                        Ok(f) => f,
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
-                            return;
-                        }
-                    };
-                    loop {
-                        let g = next.fetch_add(1, Ordering::Relaxed);
-                        if g >= n_groups {
-                            break;
-                        }
-                        let mut pg = free_rx
-                            .lock()
-                            .map(|r| r.try_recv().unwrap_or_default())
-                            .unwrap_or_default();
-                        let len = fs.header.group_len(g);
-                        pg.prepare(len, projection.len());
-                        let mut kept_ints = Vec::new();
-                        let item = fs
-                            .read_group_projected_impl(
-                                g,
-                                projection,
-                                &mut pg.values,
-                                &mut pg.int_scratch,
-                                &mut pg.byte_scratch,
-                                Some(&mut kept_ints),
-                            )
-                            .and_then(|_| {
-                                let mut kept_codes = Vec::new();
-                                for col in projection.columns() {
-                                    if col.dtype == DType::U32 {
-                                        kept_codes.push(fs.read_codes(g, col.index)?);
-                                    }
+                    while !stop.load(Ordering::Relaxed) {
+                        let next = queue.lock().map(|mut q| q.next()).unwrap_or(None);
+                        let Some(mut dst) = next else { break };
+                        if let Err(e) = fs.read_group_into(projection, &mut dst) {
+                            if let Ok(mut slot) = failed.lock() {
+                                if slot.as_ref().map_or(true, |(g, _)| dst.group < *g) {
+                                    *slot = Some((dst.group, e));
                                 }
-                                Ok(kept_codes)
-                            })
-                            .map(|kept_codes| Loaded {
-                                group: g,
-                                values: pg,
-                                ints: kept_ints,
-                                codes: kept_codes,
-                            });
-                        if tx.send(item).is_err() {
-                            break;
+                            }
+                            stop.store(true, Ordering::Relaxed);
                         }
                     }
                 });
             }
-            drop(tx);
-            for item in rx {
-                let mut loaded = item?;
-                let base = loaded.group * self.header.group_rows;
-                let len = loaded.values.len();
-                let mut int_blocks = loaded.ints.drain(..);
-                let mut code_blocks = loaded.codes.drain(..);
-                for (c, col) in projection.columns().iter().enumerate() {
-                    if col.width > 0 {
-                        values[c][base..base + len].copy_from_slice(loaded.values.col(c));
-                    }
-                    if let Some(dst) = ints[c].as_mut() {
-                        let block = int_blocks.next().ok_or("missing i64 block")?;
-                        dst[base..base + len].copy_from_slice(&block);
-                    }
-                    if let Some(dst) = codes[c].as_mut() {
-                        let block = code_blocks.next().ok_or("missing code block")?;
-                        dst[base..base + len].copy_from_slice(&block);
-                    }
-                }
-                drop(int_blocks);
-                drop(code_blocks);
-                let _ = free_tx.send(loaded.values);
-            }
-            Ok(())
-        })
+        });
+        match failed.into_inner() {
+            Ok(Some((_, e))) => Err(e),
+            Ok(None) => Ok(()),
+            Err(_) => Err(format!("{}: a reader thread panicked", self.path)),
+        }
     }
 
     /// Load the whole store into the resident column-major image. This is the
@@ -2071,6 +2058,36 @@ fn read_u32(file: &mut File, path: &str) -> Result<u32, String> {
     Ok(u32::from_le_bytes(b))
 }
 
+/// The bytes of a value slice, for a positional read straight into it.
+#[cfg(target_endian = "little")]
+fn bytes_of_mut<T: Copy>(out: &mut [T]) -> &mut [u8] {
+    // SAFETY: called only with f64, i64 and u32, which have no invalid bit patterns and no
+    // padding; u8 has alignment 1; the view covers exactly the bytes of `out` and borrows it.
+    unsafe {
+        std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, std::mem::size_of_val(out))
+    }
+}
+
+fn block_error(path: &str, bytes: usize, offset: u64, e: std::io::Error) -> String {
+    format!(
+        "{}: reading {} bytes at offset {}: {}",
+        path, bytes, offset, e
+    )
+}
+
+#[cfg(target_endian = "little")]
+fn read_f64_block(
+    file: &File,
+    path: &str,
+    offset: u64,
+    out: &mut [f64],
+    _scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    let bytes = out.len() * 8;
+    read_exact_at(file, bytes_of_mut(out), offset).map_err(|e| block_error(path, bytes, offset, e))
+}
+
+#[cfg(not(target_endian = "little"))]
 fn read_f64_block(
     file: &File,
     path: &str,
@@ -2080,12 +2097,8 @@ fn read_f64_block(
 ) -> Result<(), String> {
     let bytes = out.len() * 8;
     scratch.resize(bytes, 0);
-    read_exact_at(file, &mut scratch[..], offset).map_err(|e| {
-        format!(
-            "{}: reading {} bytes at offset {}: {}",
-            path, bytes, offset, e
-        )
-    })?;
+    read_exact_at(file, &mut scratch[..], offset)
+        .map_err(|e| block_error(path, bytes, offset, e))?;
     for (dst, src) in out.iter_mut().zip(scratch.chunks_exact(8)) {
         let mut b = [0u8; 8];
         b.copy_from_slice(src);
@@ -2094,6 +2107,19 @@ fn read_f64_block(
     Ok(())
 }
 
+#[cfg(target_endian = "little")]
+fn read_i64_block(
+    file: &File,
+    path: &str,
+    offset: u64,
+    out: &mut [i64],
+    _scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    let bytes = out.len() * 8;
+    read_exact_at(file, bytes_of_mut(out), offset).map_err(|e| block_error(path, bytes, offset, e))
+}
+
+#[cfg(not(target_endian = "little"))]
 fn read_i64_block(
     file: &File,
     path: &str,
@@ -2103,12 +2129,8 @@ fn read_i64_block(
 ) -> Result<(), String> {
     let bytes = out.len() * 8;
     scratch.resize(bytes, 0);
-    read_exact_at(file, &mut scratch[..], offset).map_err(|e| {
-        format!(
-            "{}: reading {} bytes at offset {}: {}",
-            path, bytes, offset, e
-        )
-    })?;
+    read_exact_at(file, &mut scratch[..], offset)
+        .map_err(|e| block_error(path, bytes, offset, e))?;
     for (dst, src) in out.iter_mut().zip(scratch.chunks_exact(8)) {
         let mut b = [0u8; 8];
         b.copy_from_slice(src);
@@ -2117,6 +2139,19 @@ fn read_i64_block(
     Ok(())
 }
 
+#[cfg(target_endian = "little")]
+fn read_u32_block(
+    file: &File,
+    path: &str,
+    offset: u64,
+    out: &mut [u32],
+    _scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    let bytes = out.len() * 4;
+    read_exact_at(file, bytes_of_mut(out), offset).map_err(|e| block_error(path, bytes, offset, e))
+}
+
+#[cfg(not(target_endian = "little"))]
 fn read_u32_block(
     file: &File,
     path: &str,
@@ -2126,12 +2161,8 @@ fn read_u32_block(
 ) -> Result<(), String> {
     let bytes = out.len() * 4;
     scratch.resize(bytes, 0);
-    read_exact_at(file, &mut scratch[..], offset).map_err(|e| {
-        format!(
-            "{}: reading {} bytes at offset {}: {}",
-            path, bytes, offset, e
-        )
-    })?;
+    read_exact_at(file, &mut scratch[..], offset)
+        .map_err(|e| block_error(path, bytes, offset, e))?;
     for (dst, src) in out.iter_mut().zip(scratch.chunks_exact(4)) {
         let mut b = [0u8; 4];
         b.copy_from_slice(src);
@@ -2581,5 +2612,132 @@ mod tests {
         let text = header_json(&h);
         let back = parse_header(&text, VERSION).unwrap();
         assert_eq!(h, back);
+    }
+
+    fn write_raw(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, File) {
+        let path = std::env::temp_dir().join(format!(
+            "rcsr-1076-{}-{}.bin",
+            tag,
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let file = File::open(&path).unwrap();
+        (path, file)
+    }
+
+    #[test]
+    fn direct_block_reads_match_the_decode_loop() {
+        let f64s = [
+            f64::NAN,
+            f64::from_bits(0x7ff8_0000_dead_beef),
+            f64::from_bits(0xfff4_0000_0000_0001),
+            -0.0,
+            0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN_POSITIVE / 8.0,
+            1.5e300,
+            -3.25,
+        ];
+        let i64s = [i64::MIN, i64::MAX, 0, -1, 1_700_000_000_000_000_000, 42];
+        let u32s = [0u32, 1, u32::MAX, 7, 0x8000_0000];
+        let mut raw: Vec<u8> = vec![0xAA; 3];
+        for v in f64s {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let i_off = raw.len() as u64;
+        for v in i64s {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let u_off = raw.len() as u64;
+        for v in u32s {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let (path, file) = write_raw("blocks", &raw);
+        let p = path.to_string_lossy().into_owned();
+        let mut scratch = Vec::new();
+
+        let mut got = vec![0.0f64; f64s.len()];
+        read_f64_block(&file, &p, 3, &mut got, &mut scratch).unwrap();
+        let want: Vec<u64> = raw[3..]
+            .chunks_exact(8)
+            .take(f64s.len())
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()).to_bits())
+            .collect();
+        assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), want);
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            f64s.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+
+        let mut got = vec![0i64; i64s.len()];
+        read_i64_block(&file, &p, i_off, &mut got, &mut scratch).unwrap();
+        let want: Vec<i64> = raw[i_off as usize..]
+            .chunks_exact(8)
+            .take(i64s.len())
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(got, i64s);
+
+        let mut got = vec![0u32; u32s.len()];
+        read_u32_block(&file, &p, u_off, &mut got, &mut scratch).unwrap();
+        let want: Vec<u32> = raw[u_off as usize..]
+            .chunks_exact(4)
+            .take(u32s.len())
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(got, u32s);
+
+        let mut short = vec![0.0f64; f64s.len() + 40];
+        let e = read_f64_block(&file, &p, 3, &mut short, &mut scratch).unwrap_err();
+        assert!(e.contains("reading 400 bytes at offset 3"), "{}", e);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_failed_group_read_reports_the_lowest_group() {
+        let rows = 5 * 16usize;
+        let mut text = String::from("ts,sym,a,b\n");
+        for r in 0..rows {
+            text.push_str(&format!(
+                "{},{},{},{}\n",
+                1_700_000_000i64 + r as i64,
+                ["P", "Q"][r % 2],
+                r as f64 * 0.5,
+                r as f64 - 3.0
+            ));
+        }
+        let table = crate::data::parse_table_with_time(&text, false, Some("ts")).unwrap();
+        let path = std::env::temp_dir()
+            .join(format!("rcsr-1076-trunc-{}.rcsb", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        write_store_with_time(&path, &table, 16, Some(0)).unwrap();
+        let fs = FileStore::open(&path).unwrap();
+        assert_eq!(fs.n_groups(), 5);
+        let proj = Projection::resolve(&fs, &["ts", "sym", "a", "b"]).unwrap();
+        let cut = fs.data_start + fs.header.columns[2].offsets[3] + 8;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(cut)
+            .unwrap();
+        let expect = format!(
+            "reading 128 bytes at offset {}",
+            fs.data_start + fs.header.columns[2].offsets[3]
+        );
+        for readers in [1usize, 2, 4, 64] {
+            for _ in 0..8 {
+                let e = fs
+                    .to_table_projected_with_readers(&proj, readers)
+                    .err()
+                    .expect("truncated store");
+                assert!(e.contains(&expect), "{} readers: {}", readers, e);
+            }
+        }
+        let _ = std::fs::remove_file(path);
     }
 }

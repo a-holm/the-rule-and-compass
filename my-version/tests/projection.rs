@@ -257,3 +257,142 @@ fn store_readers_parses_the_environment_value() {
     assert_eq!(store::parse_store_readers(Some("1000")), 64);
     assert_eq!(store::parse_store_readers(Some("many")), 4);
 }
+
+/// Reference load: the group-at-a-time public reads copied into the columns,
+/// the way the loader worked before it read blocks straight into the table.
+fn reference_columns(fs: &FileStore, proj: &Projection) -> Vec<data::Column> {
+    let n = fs.n_rows();
+    let rows = fs.group_rows();
+    let mut values: Vec<Vec<f64>> = Vec::new();
+    let mut ints: Vec<Option<Vec<i64>>> = Vec::new();
+    let mut codes: Vec<Option<Vec<u32>>> = Vec::new();
+    for col in proj.columns() {
+        values.push(if col.width == 0 { Vec::new() } else { vec![f64::NAN; n] });
+        ints.push((col.dtype == DType::I64).then(|| vec![i64::MIN; n]));
+        codes.push((col.dtype == DType::U32).then(|| vec![0u32; n]));
+    }
+    let mut group = ProjectedGroup::new();
+    for g in 0..fs.n_groups() {
+        fs.read_group_projected(g, proj, &mut group).unwrap();
+        let base = g * rows;
+        let len = group.len();
+        for (c, col) in proj.columns().iter().enumerate() {
+            if col.width > 0 {
+                values[c][base..base + len].copy_from_slice(group.col(c));
+            }
+            if let Some(dst) = ints[c].as_mut() {
+                dst[base..base + len].copy_from_slice(&fs.read_i64(g, col.index).unwrap());
+            }
+            if let Some(dst) = codes[c].as_mut() {
+                dst[base..base + len].copy_from_slice(&fs.read_codes(g, col.index).unwrap());
+            }
+        }
+    }
+    (0..proj.len())
+        .map(|c| data::Column {
+            values: std::mem::take(&mut values[c]),
+            ints: ints[c].take(),
+            dict: codes[c].take().map(|codes| data::DictColumn {
+                codes,
+                levels: fs
+                    .header()
+                    .levels(proj.columns()[c].index)
+                    .map(|l| l.to_vec())
+                    .unwrap_or_default(),
+            }),
+        })
+        .collect()
+}
+
+/// 3 full groups of 7 rows and a last group of 3. Columns: `ts` (i64 with
+/// missing cells), `x` (f64 with special values), `sym` (text dictionary),
+/// `cat` (numeric f64 with a dictionary), `y` (f64).
+fn all_dtypes_store(dir: &std::path::Path) -> String {
+    use store::{ColumnPlan, GroupColumn};
+    let n = 24usize;
+    let plans = vec![
+        ColumnPlan { name: "ts".into(), numeric: true, dtype: DType::I64, levels: vec![], has_codes: false },
+        ColumnPlan { name: "x".into(), numeric: true, dtype: DType::F64, levels: vec![], has_codes: false },
+        ColumnPlan {
+            name: "sym".into(),
+            numeric: false,
+            dtype: DType::U32,
+            levels: vec!["AAA".into(), "BBB".into(), "CCC".into()],
+            has_codes: true,
+        },
+        ColumnPlan {
+            name: "cat".into(),
+            numeric: true,
+            dtype: DType::F64,
+            levels: vec!["1".into(), "2".into()],
+            has_codes: true,
+        },
+        ColumnPlan { name: "y".into(), numeric: true, dtype: DType::F64, levels: vec![], has_codes: false },
+    ];
+    let special = [
+        f64::NAN,
+        -0.0,
+        0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x7ff8_0000_dead_beef),
+        f64::MIN_POSITIVE / 4.0,
+    ];
+    let path = dir.join("all.rcsb").to_string_lossy().into_owned();
+    store::write_store_grouped(&path, &plans, n, 7, |lo, hi, out: &mut [GroupColumn]| {
+        for r in lo..hi {
+            out[0].i64s.push(if r % 5 == 4 { i64::MIN } else { 1_700_000_000 + r as i64 * 60 });
+            out[1].f64s.push(special[r % special.len()]);
+            out[2].codes.push((r % 3) as u32);
+            out[3].f64s.push((r % 2) as f64 + 1.0);
+            out[3].codes.push((r % 2) as u32);
+            out[4].f64s.push(r as f64 * 0.37 - 4.0);
+        }
+        Ok(())
+    })
+    .unwrap();
+    path
+}
+
+#[test]
+fn direct_load_equals_the_group_read_reference_for_every_dtype_and_projection() {
+    let (_scratch, dir) = tmp_dir("alldtypes");
+    let path = all_dtypes_store(&dir);
+    let fs = FileStore::open(&path).unwrap();
+    assert_eq!(fs.n_groups(), 4);
+    let subsets: [&[&str]; 9] = [
+        &["ts", "x", "sym", "cat", "y"],
+        &["ts"],
+        &["x"],
+        &["sym"],
+        &["cat", "sym"],
+        &["y", "ts", "sym"],
+        &["x", "y"],
+        &["sym", "ts", "cat"],
+        &["y"],
+    ];
+    for names in subsets {
+        let proj = Projection::resolve(&fs, names).unwrap();
+        let want = reference_columns(&fs, &proj);
+        let numeric: Vec<bool> = proj.columns().iter().map(|c| c.dtype != DType::U32).collect();
+        for readers in [1usize, 2, 4, 64] {
+            let got = fs.to_table_projected_with_readers(&proj, readers).unwrap();
+            let label = format!("{:?} at {} readers", names, readers);
+            assert_eq!(proj.names(), got.names, "{}", label);
+            assert_eq!(numeric, got.numeric, "{}", label);
+            assert_eq!(fs.n_rows(), got.len(), "{}", label);
+            for (c, w) in want.iter().enumerate() {
+                let a: Vec<u64> = w.values.iter().map(|v| v.to_bits()).collect();
+                let b: Vec<u64> = got.col(c).iter().map(|v| v.to_bits()).collect();
+                assert_eq!(a, b, "values of column {}: {}", c, label);
+                assert_eq!(w.ints.as_deref(), got.ints(c), "ints of column {}: {}", c, label);
+                assert_eq!(w.dict.as_ref(), got.dict(c), "codes of column {}: {}", c, label);
+            }
+        }
+    }
+    let proj = Projection::resolve(&fs, &["ts", "x"]).unwrap();
+    let t = fs.to_table_projected_with_readers(&proj, 1).unwrap();
+    assert!(t.col(0)[4].is_nan());
+    assert_eq!(t.ints(0).unwrap()[4], i64::MIN);
+    assert_eq!(t.col(1)[5].to_bits(), 0x7ff8_0000_dead_beef);
+}
