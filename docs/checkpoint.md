@@ -156,6 +156,12 @@ Every record:
 | `mix <i> <numbers>` | #471: the adaptive edit counts of island `i` (`--adaptive-mix`), oldest generation first, 14 numbers per generation (attempts and successes for each of the seven edit kinds), at most 10 generations. Written only when the island has counts. |
 | `rng <i\|main> <idx> <624 words>` | exact MT19937 state (state array and next index). `main` is the RNG that built the initial populations. |
 | `ind <i> <error> <complexity> <tree>` | one population member, in population order. |
+| `qd_archive 1 <mode> <cells> <records> <fallbacks> <known_tag> <observed> <entries> <known>` | #1166: header of the QD archive of a `--qd-policy` run, format version 1: the tessellation (`grid`, `cvt` or `random`), the cell count, the candidates offered to the archive so far, the evaluating descriptor fallbacks so far, the fingerprint (hex) of the sample the descriptor cache describes, and the number of `qd_observed`, `qd_entry` and `qd_known` records that follow. The `qd_*` records come after the last island and are written only under `--qd-policy`, so QD-off and passive `--qd` checkpoints keep their bytes. A reader refuses another version, and a checkpoint without `qd_policy` that holds `qd_*` records. A `--qd-policy` checkpoint without them (written before #1166) is refused on resume with exit 2. The records are search state, not configuration: `config_hash` does not cover them. |
+| `qd_visits <n>...` | #1166: how often each cell was offered a candidate, one count per cell in cell order (the UCB1 exploration term and the restart aim). |
+| `qd_centroid <i> <usage> <skew>` | #1166: CVT centroid `i` after the Lloyd steps so far. One per cell under `cvt`, none under `grid` and `random`. |
+| `qd_observed <usage> <skew>` | #1166: one descriptor of the bounded Lloyd sample (at most 4096), in sample order. |
+| `qd_entry <cell> <usage> <skew> <error> <cost> <tree>` | #1166: one member of a cell's local front with its descriptor, in cell order and then in the cell's own order. |
+| `qd_known <hash> <usage> <skew>` | #1166: one entry of the archive's descriptor cache (structural hash in hex), in ascending hash order. The cache decides which trees need an evaluating descriptor fallback, so it is saved for `qd.descriptor_fallbacks` to continue exactly. At most 65 536 entries. |
 
 Floating-point values are written with Rust's shortest round-trip `Debug` form
 (`1.9968344769643271`, `-0.0`), with `inf`, `-inf` and `NaN` for non-finite
@@ -278,7 +284,8 @@ The guarantee holds because the checkpoint carries all of the trajectory state:
 * each island's MT19937 state and the main initialization RNG;
 * the stagnation counters and the patience bookkeeping (`best_prev`,
   `no_improve`);
-* the archive, with its members and capacity.
+* the archive, with its members and capacity;
+* under `--qd-policy`, the QD archive (#1166), which chooses parents, migration victims and restart aims. `tests/checkpoint.rs::a_qd_policy_run_resumed_at_every_generation_matches_exactly` resumes a `--qd-policy` run from every generation's checkpoint (CVT, grid and random archives, and the uniform control on screened rows) and compares the front, the `qd` report and the exit checkpoint bytes.
 
 The CPU count and `--threads` are not part of the trajectory. Every stage that
 reads the thread count hands out independent items and writes each result at its
@@ -328,6 +335,7 @@ Limits:
 | saved `target_spec` differs from this run's spec (or one side has none) | `2` (usage) |
 | saved `build` identity (binary, commit, version, device, driver) differs and `--allow-build-change` was not given | `3` (input) |
 | `--resume` contradicts a saved search setting; `--save-every` without `--save`; invalid flag value | `2` (usage) |
+| `--resume` of a `--qd-policy` checkpoint without the QD archive (#1166) | `2` (usage) |
 | checkpoint cannot be written | `3` (input) |
 
 ## Worked save/resume transcript

@@ -1083,7 +1083,9 @@ SEARCH:
                              instead of the rectangular grid
   --qd-policy                feed the archive back into parent selection (UCB1
                              60/25/10/5), stratified migration and least-
-                             occupied restarts; implies --qd --qd-cvt
+                             occupied restarts; implies --qd --qd-cvt. The
+                             archive is then search state: --save writes it
+                             and --resume restores it (#1166)
   --qd-uniform               control: the policy selects occupied cells
                              uniformly instead of the UCB1 mix
   --qd-random                control: hash descriptors to random cells, so the
@@ -3989,6 +3991,11 @@ fn main() {
             }
         }
         let saved = cp.config.clone();
+        // #1166: a --reselect reads only the final archive, so it needs no QD archive.
+        if saved.qd_policy && cp.qd.is_none() && reselect_path.is_none() {
+            eprintln!("error: --resume '{}': {}", path, rcsr::checkpoint::QD_ARCHIVE_MISSING);
+            std::process::exit(EXIT_USAGE);
+        }
         if cp.refit_band_unknown && !refit_band_set {
             eprintln!(
                 "error: --resume '{}' has no saved --refit-band (written by an older binary), so its band is unknown",

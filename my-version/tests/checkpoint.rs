@@ -2439,12 +2439,21 @@ fn a_qd_policy_run_resumed_at_every_generation_matches_exactly() {
         ("random", Config { qd_cvt: false, qd_control: 2, ..qd_policy_config(12) }),
         ("uniform, screened", Config { qd_control: 1, fit_samples: 120, ..qd_policy_config(12) }),
     ];
+    let mut cvt_texts = Vec::new();
     for (what, cfg) in &arms {
         let (full, texts, migrants, restarts) = every_qd_checkpoint(cfg, &train, &test);
-        assert!(migrants > 0 && restarts > 0, "{what}: the fixture migrates and restarts ({migrants}, {restarts})");
+        assert!(migrants > 0, "{what}: the fixture migrates, so the archive picks migration victims");
+        if *what == "cvt" {
+            assert!(restarts > 0, "{what}: the fixture restarts an island, so the archive aims a restart");
+        }
         assert_eq!(texts.len(), cfg.generations + 1, "{what}: one save per generation and the exit save");
         let exit = texts.last().expect("exit checkpoint");
-        for text in &texts[..cfg.generations - 1] {
+        // Generation 0 saves an empty archive.
+        let mut zero: Option<String> = None;
+        search::run_resumable(&Config { generations: 0, ..cfg.clone() }, &train, &test, None, 0, |cp| zero = Some(cp.to_text()))
+            .expect("generation 0 run");
+        let zero = zero.expect("generation 0 checkpoint");
+        for text in std::iter::once(&zero).chain(&texts[..cfg.generations - 1]) {
             let saved = Checkpoint::from_text(text).expect("parse saved checkpoint");
             let at = saved.generations;
             let mut resumed_exit: Option<String> = None;
@@ -2454,11 +2463,58 @@ fn a_qd_policy_run_resumed_at_every_generation_matches_exactly() {
             assert_eq!(full.qd, resumed.qd, "{what}: QD report after a resume at generation {at}");
             assert_eq!(exit, &resumed_exit.expect("exit checkpoint"), "{what}: exit checkpoint after a resume at generation {at}");
         }
+        if *what == "cvt" {
+            cvt_texts = texts;
+        }
     }
-    // A Lloyd step moves the CVT centroids in generation 6 on this fixture, so
-    // the resume at generation 5 starts right before it.
-    let (_, texts, _, _) = every_qd_checkpoint(&qd_policy_config(12), &train, &test);
-    assert_ne!(qd_centroid_lines(&texts[4]), qd_centroid_lines(&texts[5]), "centroids at generations 5 and 6");
+    // A Lloyd step moves the CVT centroids in generation 4 on this fixture, so
+    // the resume at generation 3 runs it as its first generation.
+    assert_ne!(qd_centroid_lines(&cvt_texts[2]), qd_centroid_lines(&cvt_texts[3]), "centroids at generations 3 and 4");
+}
+
+/// The `qd_*` records save and load every field of the archive state (cells,
+/// descriptors, centroids, visits, Lloyd sample, counters, descriptor cache)
+/// bit for bit, the text is a fixed point, and a malformed block is refused.
+#[test]
+fn the_qd_archive_records_round_trip_exactly() {
+    let train = sample(240);
+    let test = sample(80);
+    let arms = [
+        ("cvt", qd_policy_config(5)),
+        ("grid", Config { qd_cvt: false, qd_bins: 4, ..qd_policy_config(5) }),
+        ("random", Config { qd_cvt: false, qd_control: 2, ..qd_policy_config(5) }),
+        ("uniform, screened", Config { qd_control: 1, fit_samples: 120, ..qd_policy_config(5) }),
+    ];
+    let mut cvt_text = String::new();
+    for (what, cfg) in &arms {
+        let mut live: Option<(rcsr::qd::QdState, String)> = None;
+        search::run_resumable(cfg, &train, &test, None, 0, |cp| live = Some((cp.qd.clone().expect("qd state"), cp.to_text())))
+            .expect("qd policy run");
+        let (state, text) = live.expect("exit checkpoint");
+        assert!(state.cells.iter().any(|c| c.len() == 2), "{what}: a cell at its cap");
+        assert!(!state.known.is_empty() && !state.observed.is_empty(), "{what}");
+        if *what == "uniform, screened" {
+            assert!(state.fallbacks > 0, "{what}: screened members reach the archive without a descriptor");
+        }
+        assert_eq!(state.centroids.len(), if cfg.qd_cvt && cfg.qd_control != 2 { 16 } else { 0 }, "{what}");
+        let loaded = Checkpoint::from_text(&text).expect("parse");
+        assert_eq!(format!("{:?}", loaded.qd.expect("loaded qd")), format!("{state:?}"), "{what}");
+        assert_eq!(Checkpoint::from_text(&text).expect("parse").to_text(), text, "{what}: fixed point");
+        if *what == "cvt" {
+            cvt_text = text;
+        }
+    }
+    let refused = |text: String, needle: &str| {
+        let err = expect_err(Checkpoint::from_text(&text), needle);
+        assert!(err.contains(needle), "{needle}: {err}");
+    };
+    refused(cvt_text.replace("\nqd_archive 1 ", "\nqd_archive 2 "), "qd_archive version 2 is not supported");
+    let last_known = cvt_text.rfind("\nqd_known ").expect("qd_known record");
+    let truncated = format!("{}{}", &cvt_text[..last_known + 1], &cvt_text[last_known + 1..].split_once('\n').expect("line").1);
+    refused(truncated, "qd_known record(s)");
+    let header = cvt_text.lines().find(|l| l.starts_with("qd_archive ")).expect("header");
+    refused(cvt_text.replace(&format!("{header}\n"), ""), "record before the qd_archive header");
+    refused(cvt_text.replace("config qd_policy true\n", "config qd_policy false\n"), "written only under --qd-policy");
 }
 
 /// The archive records do not depend on the thread count, and a resume under
