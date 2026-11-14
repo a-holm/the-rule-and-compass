@@ -1542,7 +1542,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "ops",
         "init_depth",
         "fit_iters",
-        "dedup",
         "time_budget",
         "predictor_samples",
     ];
@@ -1555,7 +1554,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "units.target",
         "require_dimensions",
         "fit_samples",
-        "front_parents", // #76
         "fit_strategy",  // #116: missing means `exact`
         "fit_admission", // #223: missing means `screened`
         "fit_polish",    // #496: missing means `f64`
@@ -1621,13 +1619,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
     };
     let num_f64 = |key: &str| -> Result<f64, String> {
         decode_f64(required(fields, key)?)
-    };
-    let bool_val = |key: &str| -> Result<bool, String> {
-        match required(fields, key)? {
-            "true" => Ok(true),
-            "false" => Ok(false),
-            other => Err(format!("config '{}' must be true or false, got '{}'", key, other)),
-        }
     };
 
     let metric = Metric::parse_opt(required(fields, "metric")?)
@@ -1771,17 +1762,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             ))
         }
     };
-    // #76: missing means on, the default since the feature was introduced.
-    let front_parents = match fields.get("front_parents").map(|s| s.as_str()) {
-        None | Some("true") => true,
-        Some("false") => false,
-        Some(other) => {
-            return Err(format!(
-                "config 'front_parents' must be true or false, got '{}'",
-                other
-            ))
-        }
-    };
     // #116: missing means `exact`, byte-identical to a checkpoint written
     // before the solver portfolio existed.
     let fit_strategy = match fields.get("fit_strategy").map(|s| s.as_str()) {
@@ -1904,7 +1884,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         fit_polish, // #496
         fit_irls, // #611
         fit_report: false,
-        dedup: bool_val("dedup")?,
         time_budget,
         interim_chunk: false,
         predictor_samples,
@@ -1915,7 +1894,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         refit_band, // #495
         // #116: a disk row source is a path choice, not saved search state.
         fit_stream_source: None,
-        front_parents, // #76
         units,
         require_dimensions,
         qd_bins,
@@ -2009,7 +1987,7 @@ fn write_config(cfg: &Config, out: &mut String) {
     }
     // #122: absent means auto (the historical path for every old checkpoint).
     crate::settings::write(crate::settings::Group::Engine, cfg, out);
-    writeln!(out, "config dedup {}", cfg.dedup).unwrap();
+    crate::settings::write(crate::settings::Group::Dedup, cfg, out);
     writeln!(
         out,
         "config time_budget {}",
@@ -2036,11 +2014,7 @@ fn write_config(cfg: &Config, out: &mut String) {
     }
     crate::settings::write(crate::settings::Group::Island, cfg, out); // #1083
     crate::settings::write(crate::settings::Group::Variation, cfg, out);
-    // #76: only write the field when front feedback is off, so an on run's
-    // checkpoint stays byte-identical to one written before the flag existed.
-    if !cfg.front_parents {
-        writeln!(out, "config front_parents false").unwrap();
-    }
+    crate::settings::write(crate::settings::Group::FrontParents, cfg, out);
     crate::settings::write(crate::settings::Group::Filter, cfg, out); // #1083
     crate::settings::write(crate::settings::Group::Fit, cfg, out);
     // #25: only write these when units are active, so a units-free checkpoint

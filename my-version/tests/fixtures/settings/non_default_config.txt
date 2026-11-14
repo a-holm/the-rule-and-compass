@@ -19,7 +19,7 @@ config fit_fallback_max 4096
 config refit_band inf
 config calibration_source anchors
 config variation node
-config dedup true
+config dedup false
 config time_budget none
 config patience 7
 config predictor_samples none
@@ -32,9 +32,10 @@ config migration_policy ring-tournament
 config mutation_mix extended
 config crossover_internal 0.25
 config adaptive_mix true
+config front_parents false
 config reject_constant_offspring true
 config reject_fixed_position true
 config fit_thresholds true
 config fit_accept fitness
 config qd_descriptor book
-config_hash aeb55c338b053b3f
+config_hash 8ffab4ac4ca1cca2

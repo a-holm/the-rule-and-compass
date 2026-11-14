@@ -117,3 +117,8 @@
                              that does not qualify
 
 CHECKPOINTS:
+@@ --no-fit --migration-interval
+  --no-dedup                 disable structural de-duplication
+@@ --adaptive-mix --reject-constant-offspring
+  --no-front-parents         draw every parent from the island tournament;
+                             turns off the 15% Pareto-front feedback (#76)
