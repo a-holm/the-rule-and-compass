@@ -336,3 +336,43 @@ fn the_v1_panel_build_under_the_record_equals_the_truncated_build_and_names_noth
     let (code, out, err) = run(&["lock", "check", "--record", &s(&record), &full]);
     assert_eq!(code, 0, "{out}{err}");
 }
+
+#[test]
+fn clerk_append_refuses_a_family_whose_second_range_is_not_the_record() {
+    let sc = scratch::Scratch::new("panel-lr-append-neg");
+    let dir = sc.path();
+    let record = lr::write_record(dir);
+    let other = dir.join("other-record.json");
+    std::fs::write(&other, lr::record_text(lr::lock_start() + lr::H, lr::lock_end())).unwrap();
+    let (rec, oth) = (s(&record), s(&other));
+    let fwd = format!("{},{}", lr::T0 + 50_000 * lr::H, lr::T0 + 60_000 * lr::H);
+    let p = Pipeline::new(&dir.join("full"), false);
+    p.build_with(Some(&record), Some(&fwd));
+    let (base, panel) = (s(&p.base), s(&p.panel));
+    let enrich = |out: &str, r: &str| {
+        let (code, o, err) = run(&["enrich", "--data", &base, "--out", out, "--cpu", "--features", "r1", "--locked-test", &fwd, "--lock-record", r]);
+        assert_eq!(code, 0, "{o}{err}");
+    };
+    let append = |fam: &str, out: &str, r: Option<&str>| {
+        let mut a = vec!["panel", "append", "--data", &panel, "--family", fam, "--columns", "r1", "--out", out, "--locked-test", &fwd];
+        if let Some(r) = r {
+            a.extend(["--lock-record", r]);
+        }
+        run(&a)
+    };
+    let (fam_other, fam_rec) = (s(&dir.join("full/fam-other.rcsb")), s(&dir.join("full/fam-rec.rcsb")));
+    enrich(&fam_other, &oth);
+    enrich(&fam_rec, &rec);
+    let x1 = s(&dir.join("full/x1.rcsb"));
+    let (code, _, err) = append(&fam_other, &x1, Some(&rec));
+    assert_ne!(code, 0, "a family under another record is refused");
+    assert!(err.contains("family store"), "{err}");
+    assert!(!Path::new(&x1).exists());
+    let x2 = s(&dir.join("full/x2.rcsb"));
+    let (code, _, err) = append(&fam_rec, &x2, None);
+    assert_ne!(code, 0, "a family under the record is refused without the record");
+    assert!(err.contains("family store"), "{err}");
+    assert!(!Path::new(&x2).exists());
+    let (code, o, err) = append(&fam_rec, &s(&dir.join("full/x3.rcsb")), Some(&rec));
+    assert_eq!(code, 0, "{o}{err}");
+}
