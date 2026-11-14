@@ -12730,8 +12730,9 @@ mod tests {
         };
         let view = EvalSample::new(&s, &cfg);
         let bad = node(Op::Add, vec![input(0), input(1)]);
-        let good = node(Op::Sin, vec![input(0)]);
+        let good = node(Op::Mul, vec![constant(2.0), input(0)]);
         assert!(!cfg.accepts_dimensions(&bad));
+        assert!(cfg.accepts_dimensions(&good));
         let mut islands = vec![vec![Ind::pending(bad, &cfg), Ind::pending(good, &cfg)]];
         islands[0][0].set_error(0.5);
         islands[0][1].set_error(0.5);
