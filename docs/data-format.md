@@ -400,7 +400,7 @@ straight into a pinned slot, keeping the time column as `i64` and features as
 `f64`. A missing or dictionary-only name is an error, never a silent omission.
 The projection hash is FNV-1a 64 over `index:name:dtype;` in header order.
 
-`to_table_projected` reads whole groups on `RCSR_STORE_READERS` concurrent readers (default 4, clamped to 1..64; `1` is the serial reference path). Each reader owns a handle from `FileStore::try_clone`, claims group indices from a shared counter and sends the decoded group to the calling thread, which copies it into the group's row range, so the table and its fingerprints are identical for any reader count. Several outstanding preads let the disk reorder the seeks of a cold read. `to_table_projected_with_readers` takes the count explicitly. The variable sits beside `RCSR_CPU_FALLBACK_THREADS` in `rcsr schema`.
+`to_table_projected` reads whole groups on `RCSR_STORE_READERS` concurrent readers (default 4, clamped to 1..64; `1` is the serial reference path). Each reader owns a handle from `FileStore::try_clone`, takes the next group from a shared queue and reads each projected block straight into that group's row range of the table column (a positional read into the column memory on little-endian targets, no group buffer and no copy), so the table and its fingerprints are identical for any reader count. Several outstanding preads let the disk reorder the seeks of a cold read. `to_table_projected_with_readers` takes the count explicitly. The variable sits beside `RCSR_CPU_FALLBACK_THREADS` in `rcsr schema`.
 
 ### Schema sidecar, views and the grouped writer (issue #260)
 

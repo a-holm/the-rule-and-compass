@@ -13,6 +13,8 @@ struct Counting;
 
 static TOTAL: AtomicUsize = AtomicUsize::new(0);
 static MAX_SINGLE: AtomicUsize = AtomicUsize::new(0);
+/// The counters are process-wide: one test measures at a time.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -49,6 +51,7 @@ fn tmp_dir(tag: &str) -> (Scratch, std::path::PathBuf) {
 
 #[test]
 fn the_projected_path_never_allocates_a_full_table() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let rows = 20_000usize;
     let cols = 364usize;
     let mut header = String::from("ts,symbol");
@@ -105,6 +108,7 @@ fn the_projected_path_never_allocates_a_full_table() {
 /// group buffer, byte scratch or per-block vector exists to copy through.
 #[test]
 fn a_projected_load_allocates_only_the_table_columns() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let rows = 4 * 8192 + 500usize;
     let n_numeric = 35usize;
     let mut header = String::from("ts,symbol");
