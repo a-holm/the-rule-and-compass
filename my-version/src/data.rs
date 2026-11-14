@@ -2732,7 +2732,6 @@ impl<'a> RowFilter<'a> {
             .collect::<Result<_, _>>()?;
         let mut used = Vec::new();
         filter_inputs(&f.tree, &mut used);
-        used = (0..cols.len()).collect();
         let inputs = used
             .into_iter()
             .filter(|&p| p < cols.len())
