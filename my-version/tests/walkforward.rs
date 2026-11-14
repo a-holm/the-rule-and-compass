@@ -1561,11 +1561,26 @@ fn write_wide(scratch: &Scratch, name: &str, table: &data::Table, group_rows: us
     path
 }
 
-/// The report without the members that name the source of the rows.
-fn without_source(json: &str) -> rcsr::devlog::Json {
+/// The report without the members that name the source of the rows. The table
+/// path hashes a numeric group key differently from the store scan, so the
+/// seeded `controls` draw differently there; `numeric_group` drops them.
+fn without_source(json: &str, numeric_group: bool) -> rcsr::devlog::Json {
     use rcsr::devlog::Json;
+    fn strip(j: Json, numeric_group: bool) -> Json {
+        match j {
+            Json::Obj(items) => Json::Obj(
+                items
+                    .into_iter()
+                    .filter(|(k, _)| !(numeric_group && k == "controls"))
+                    .map(|(k, v)| (k, strip(v, numeric_group)))
+                    .collect(),
+            ),
+            Json::Arr(items) => Json::Arr(items.into_iter().map(|v| strip(v, numeric_group)).collect()),
+            other => other,
+        }
+    }
     match Json::parse(json).unwrap() {
-        Json::Obj(items) => Json::Obj(items.into_iter().filter(|(k, _)| k != "source" && k != "memory_bound").collect()),
+        Json::Obj(items) => strip(Json::Obj(items.into_iter().filter(|(k, _)| k != "source" && k != "memory_bound").collect()), numeric_group),
         other => panic!("not an object: {other:?}"),
     }
 }
@@ -1589,12 +1604,12 @@ fn close(a: &rcsr::devlog::Json, b: &rcsr::devlog::Json, at: &str) {
 }
 
 /// Projected store scan against the full-decode reference: the resident table
-/// of the same store, which holds every column.
-fn assert_matches_full_decode(path: &str, spec: &EvalSpec, opts: &walkforward::ProtocolOptions) -> walkforward::Report {
+/// the store was written from, which holds every column.
+fn assert_matches_full_decode(path: &str, table: &data::Table, spec: &EvalSpec, opts: &walkforward::ProtocolOptions) -> walkforward::Report {
     let streamed = walkforward::run_path_with(path, spec, opts).unwrap();
-    let full = store::FileStore::open(path).unwrap().to_table().unwrap();
-    let resident = walkforward::run_table_with(&full, spec, "test", opts).unwrap();
-    close(&without_source(&streamed.json()), &without_source(&resident.json()), "report");
+    let resident = walkforward::run_table_with(table, spec, "test", opts).unwrap();
+    let numeric_group = spec.group.as_deref() == Some("gid");
+    close(&without_source(&streamed.json(), numeric_group), &without_source(&resident.json(), numeric_group), "report");
     streamed
 }
 
@@ -1619,26 +1634,28 @@ fn store_scan_reads_only_the_named_columns() {
         assert_eq!(scan.value_bytes, scan.projected_columns as u64 * read as u64 * 36 * 8, "{fractional} {group:?}");
         assert!(r.json_with_ledger(None).contains(&format!("\"scan\":{{\"source\":\"store\",\"store_columns\":{}", scan.store_columns)));
         assert!(!r.json().contains("\"scan\""), "the hashed report must stay deterministic");
-        assert_matches_full_decode(&path, &s, &walkforward::ProtocolOptions::default());
+        assert_matches_full_decode(&path, &table, &s, &walkforward::ProtocolOptions::default());
     }
 }
 
 #[test]
 fn a_constant_candidate_projects_only_the_target() {
     let scratch = Scratch::new("wf-scan-constant");
-    let path = write_wide(&scratch, "wide.rcsb", &wide_table(false), 36);
+    let table = wide_table(false);
+    let path = write_wide(&scratch, "wide.rcsb", &table, 36);
     let s = wide_spec("0.5", vec![window("w", 0.0, 24.0, 24.0, 40.0)], None);
-    let scan = assert_matches_full_decode(&path, &s, &walkforward::ProtocolOptions::default()).scan.unwrap();
+    let scan = assert_matches_full_decode(&path, &table, &s, &walkforward::ProtocolOptions::default()).scan.unwrap();
     assert_eq!((scan.named_variables, scan.projected_columns), (0, 1));
 }
 
 #[test]
 fn store_scan_skips_groups_outside_the_windows() {
     let scratch = Scratch::new("wf-scan-skip");
-    let path = write_wide(&scratch, "wide.rcsb", &wide_table(false), 36);
+    let table = wide_table(false);
+    let path = write_wide(&scratch, "wide.rcsb", &table, 36);
     // 180 rows in 5 groups of 36 rows (12 time steps); the windows end inside group 2.
     let s = wide_spec("f1 + f4", vec![window("w", 0.0, 24.0, 24.0, 30.0)], Some("sym"));
-    let r = assert_matches_full_decode(&path, &s, &walkforward::ProtocolOptions::default());
+    let r = assert_matches_full_decode(&path, &table, &s, &walkforward::ProtocolOptions::default());
     let scan = r.scan.unwrap();
     assert_eq!((scan.groups_read, scan.groups_skipped), (3, 2));
     assert_eq!(scan.value_bytes, scan.projected_columns as u64 * 3 * 36 * 8);
@@ -1654,7 +1671,7 @@ fn store_scan_matches_the_full_decode_with_a_final_read_and_a_locked_range() {
     s.validation_frac = 0.25;
     for (final_read, locked) in [(false, vec![]), (true, vec![]), (false, vec![(30, 34)]), (true, vec![(30, 34)])] {
         let opts = walkforward::ProtocolOptions { final_read, locked_ranges: locked, locked_embargo: 2, ..walkforward::ProtocolOptions::default() };
-        let r = assert_matches_full_decode(&path, &s, &opts);
+        let r = assert_matches_full_decode(&path, &table, &s, &opts);
         let scan = r.scan.unwrap();
         // union of f0, f1, f2, f4, f5 plus the target and the numeric group key
         assert_eq!((scan.named_variables, scan.projected_columns), (5, 7), "{final_read} {:?}", opts.locked_ranges);

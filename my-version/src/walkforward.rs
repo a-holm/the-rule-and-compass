@@ -876,7 +876,7 @@ fn run_store_clocked(
     named.retain(|&p| p < layout.vars.len());
     let time_f64 = layout.time_numeric && !layout.time_i64;
     let group_f64 = layout.group.filter(|&g| numeric[g]);
-    let mut needed: Vec<usize> = (0..header.n_cols).filter(|&c| header.dtypes()[c] != store::DType::U32).collect();
+    let mut needed: Vec<usize> = named.iter().map(|&p| layout.vars[p]).collect();
     needed.push(layout.target);
     if time_f64 {
         needed.push(layout.time);
@@ -924,7 +924,7 @@ fn run_store_clocked(
             Some(fs.read_codes(group, layout.time)?)
         };
         // An exact i64 or dictionary time is known before the value read; an f64 time is part of it.
-        let known_unwanted = false && match (&time_i64, &time_codes) {
+        let known_unwanted = match (&time_i64, &time_codes) {
             (Some(ints), _) => !ints.iter().any(|&i| acc.wants(i as f64)),
             (None, Some(codes)) => !codes.iter().any(|&c| acc.wants(time_of_code(c))),
             (None, None) => false,
