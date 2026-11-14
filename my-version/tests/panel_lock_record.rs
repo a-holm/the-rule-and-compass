@@ -338,7 +338,7 @@ fn the_v1_panel_build_under_the_record_equals_the_truncated_build_and_names_noth
 }
 
 #[test]
-fn clerk_append_refuses_a_family_whose_second_range_is_not_the_record() {
+fn append_refuses_a_family_whose_second_range_is_not_the_record() {
     let sc = scratch::Scratch::new("panel-lr-append-neg");
     let dir = sc.path();
     let record = lr::write_record(dir);

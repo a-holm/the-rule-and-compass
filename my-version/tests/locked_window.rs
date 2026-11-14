@@ -385,6 +385,46 @@ fn without_timing_drops_the_ledger_closure_ratio() {
 }
 
 #[test]
+fn without_timing_keeps_seconds_spec_and_config_members() {
+    for key in [
+        "purge_seconds_effective", "embargo_seconds", "purge_seconds", "horizon_seconds", "bar_seconds", "bar_seconds_modal_share",
+        "lookback_seconds", "required_purge_seconds", "period_seconds", "min_group_step_seconds", "seconds",
+    ] {
+        let a = format!(r#"{{"{key}":1,"rows":5}}"#);
+        let b = format!(r#"{{"{key}":2,"rows":5}}"#);
+        assert_ne!(without_timing(&a), without_timing(&b), "{key} is data and must be compared");
+    }
+    for key in ["wall_seconds", "sr_wall_seconds", "elapsed_seconds", "total_seconds", "search_seconds", "gpu_seconds", "phases_seconds"] {
+        let a = format!(r#"{{"{key}":1,"rows":5}}"#);
+        let b = format!(r#"{{"{key}":2,"rows":5}}"#);
+        assert_eq!(without_timing(&a), without_timing(&b), "{key} is timing and must be dropped");
+    }
+}
+
+#[test]
+fn search_validation_block_ignores_locked_prices() {
+    let (_scratch, dir) = scratch("search_validation");
+    let a = diff_store(&dir, "a", false);
+    let b = diff_store(&dir, "b", true);
+    let exclude = format!("ts >= {}", T0 + 400 * H - DEFAULT_PURGE);
+    let run = |data: &str, out: &str| {
+        let (code, _, err) = rcsr(&[
+            "--data", data, "--target", "y", "--vars", "f1,f2", "--time", "ts", "--group-by", "sym", "--split", "temporal",
+            "--validation-frac", "0.2", "--fill", "drop", "--exclude", &exclude, "--cpu", "--no-dev-log", "--seed", "1",
+            "--generations", "3", "--pop", "20", "--quiet", "--json-out", out,
+        ]);
+        assert_eq!(code, 0, "{err}");
+        let json = std::fs::read_to_string(out).unwrap();
+        let doc = without_timing(&json);
+        let selection = doc.get("selection").cloned().unwrap_or_else(|| panic!("no selection member: {json}"));
+        let validation = selection.get("validation").cloned().unwrap_or_else(|| panic!("no validation member: {json}"));
+        assert!(validation.get("purge_seconds_effective").is_some(), "{json}");
+        validation
+    };
+    assert_eq!(run(&a, &s(&dir.join("ra.json"))), run(&b, &s(&dir.join("rb.json"))));
+}
+
+#[test]
 fn development_outputs_ignore_locked_prices() {
     let (_scratch, dir) = scratch("differential");
     let a = diff_store(&dir, "a", false);
