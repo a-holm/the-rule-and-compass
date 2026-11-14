@@ -314,7 +314,6 @@ impl RunFile {
     /// sample. Any other run keeps [`RunFile::in_sample`].
     pub fn in_sample_window(&self, test_start: f64, test_end: f64) -> bool {
         match &self.intervals {
-            Some(_) if test_start.is_finite() => self.in_sample(test_start),
             Some(iv) => {
                 let mut kept = iv.effective(crate::intervals::Role::Train);
                 kept.extend(iv.effective(crate::intervals::Role::Validation));
