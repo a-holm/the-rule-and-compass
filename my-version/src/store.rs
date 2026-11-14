@@ -1745,7 +1745,7 @@ pub fn write_store_appending(
     extras: &[AppendColumn],
 ) -> Result<(), String> {
     let mut file = File::create(path).map_err(|e| format!("{}: {}", path, e))?;
-    write_store_appending_to(&mut file, path, source, extras)
+    write_store_appending_to(&mut file, path, source, extras, &mut AppendStats::default())
 }
 
 /// Like [`write_store_appending`], but also return the SHA-256 of the bytes it
@@ -1761,6 +1761,27 @@ pub fn write_store_appending_hashed(
     source: &FileStore,
     extras: &[AppendColumn],
 ) -> Result<String, String> {
+    write_store_appending_hashed_with(path, source, extras, None).map(|(sha, _)| sha)
+}
+
+/// Seconds spent in the append pass and, in unit tests, the I/O call counts.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AppendStats {
+    pub read_s: f64,
+    pub write_s: f64,
+    pub hash_wait_s: f64,
+    #[cfg(test)]
+    pub extra_reads: u64,
+}
+
+pub(crate) fn write_store_appending_hashed_with(
+    path: &str,
+    source: &FileStore,
+    extras: &[AppendColumn],
+    batch: Option<usize>,
+) -> Result<(String, AppendStats), String> {
+    let _ = batch;
+    let mut stats = AppendStats::default();
     let tmp = format!("{}.tmp-{}", path, std::process::id());
     let guard = TempGuard(tmp.clone());
     let mut file = File::create(&tmp).map_err(|e| format!("{}: {}", tmp, e))?;
@@ -1770,13 +1791,13 @@ pub fn write_store_appending_hashed(
             inner: &mut file,
             hasher: &mut hasher,
         };
-        write_store_appending_to(&mut out, path, source, extras)?;
+        write_store_appending_to(&mut out, path, source, extras, &mut stats)?;
         out.flush().map_err(|e| format!("{}: {}", path, e))?;
     }
     drop(file);
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {}", path, e))?;
     std::mem::forget(guard);
-    Ok(hasher.finalize())
+    Ok((hasher.finalize(), stats))
 }
 
 /// Removes its file on drop; forgotten once the file has been renamed away.
@@ -1810,6 +1831,7 @@ fn write_store_appending_to<W: Write>(
     path: &str,
     source: &FileStore,
     extras: &[AppendColumn],
+    stats: &mut AppendStats,
 ) -> Result<(), String> {
     if extras.is_empty() {
         return Err("append needs at least one column".to_string());
@@ -1945,6 +1967,10 @@ fn write_store_appending_to<W: Write>(
             if let Some(ei) = extra_of[ci] {
                 let bytes = len * 8;
                 buf.resize(bytes, 0);
+                #[cfg(test)]
+                {
+                    stats.extra_reads += 1;
+                }
                 read_exact_at(&extras_files[ei], &mut buf, (lo as u64) * 8).map_err(|e| {
                     format!("{}: reading appended column '{}': {}", path, col.name, e)
                 })?;
@@ -2739,5 +2765,108 @@ mod tests {
             }
         }
         let _ = std::fs::remove_file(path);
+    }
+
+    const APPEND_GOLDEN_SHA256: &str = "68d592c2c632cf7e9d8ff04485425fd7e648ab0a294cb7dbeaab5ab7ee355ff6";
+    const APPEND_GROUPS: usize = 7;
+    const APPEND_EXTRAS: usize = 40;
+
+    fn splitmix(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    }
+
+    struct AppendFixture {
+        dir: std::path::PathBuf,
+        source: FileStore,
+        extras: Vec<AppendColumn>,
+    }
+
+    impl Drop for AppendFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// 24 numeric columns, a time column and a dictionary column over seven
+    /// groups of 16 rows (the last one short), plus 40 temp columns of
+    /// arbitrary bit patterns, one of which replaces `a3`.
+    fn append_fixture(tag: &str) -> AppendFixture {
+        let rows = APPEND_GROUPS * 16 - 5;
+        let mut text = String::from("ts,sym");
+        for c in 0..24 {
+            text.push_str(&format!(",a{}", c));
+        }
+        text.push('\n');
+        for r in 0..rows {
+            text.push_str(&format!("{},{}", 1_700_000_000i64 + r as i64, ["P", "Q", "R"][r % 3]));
+            for c in 0..24 {
+                text.push_str(&format!(",{}", r as f64 * 0.25 - c as f64));
+            }
+            text.push('\n');
+        }
+        let table = crate::data::parse_table_with_time(&text, false, Some("ts")).unwrap();
+        let dir = std::env::temp_dir().join(format!("rcsr-1037-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.rcsb").to_string_lossy().into_owned();
+        write_store_with_time(&src, &table, 16, Some(0)).unwrap();
+        let source = FileStore::open(&src).unwrap();
+        assert_eq!(source.n_groups(), APPEND_GROUPS);
+        let mut extras = Vec::new();
+        for e in 0..APPEND_EXTRAS {
+            let file = dir.join(format!("extra{}.bin", e));
+            let mut bytes = Vec::with_capacity(rows * 8);
+            for r in 0..rows {
+                bytes.extend_from_slice(&splitmix((e * 1_000_003 + r) as u64).to_le_bytes());
+            }
+            std::fs::write(&file, bytes).unwrap();
+            extras.push(AppendColumn {
+                name: if e == 3 { "a3".to_string() } else { format!("f{}", e) },
+                file,
+                replace: e == 3,
+            });
+        }
+        AppendFixture { dir, source, extras }
+    }
+
+    fn run_append(fx: &AppendFixture, name: &str, batch: Option<usize>) -> (Vec<u8>, String, AppendStats) {
+        let out = fx.dir.join(name).to_string_lossy().into_owned();
+        let (sha, stats) =
+            write_store_appending_hashed_with(&out, &fx.source, &fx.extras, batch).unwrap();
+        (std::fs::read(&out).unwrap(), sha, stats)
+    }
+
+    #[test]
+    fn append_output_matches_the_golden_digest() {
+        let fx = append_fixture("golden");
+        let (bytes, sha, _) = run_append(&fx, "out.rcsb", Some(1));
+        assert_eq!(sha, crate::manifest::sha256_hex(&bytes));
+        assert_eq!(sha, APPEND_GOLDEN_SHA256);
+    }
+
+    #[test]
+    fn append_batched_reads_are_byte_identical() {
+        let fx = append_fixture("batches");
+        let (b1, s1, _) = run_append(&fx, "b1.rcsb", Some(1));
+        for (i, batch) in [Some(2), Some(APPEND_GROUPS), Some(100), None].into_iter().enumerate() {
+            let (b, s, _) = run_append(&fx, &format!("b{}.rcsb", i + 2), batch);
+            assert!(b == b1, "batch {:?} changed the bytes", batch);
+            assert_eq!(s, s1);
+        }
+        assert_eq!(s1, crate::manifest::sha256_hex(&b1));
+    }
+
+    #[test]
+    fn append_batching_cuts_the_temp_column_reads() {
+        let fx = append_fixture("reads");
+        let (_, _, one) = run_append(&fx, "b1.rcsb", Some(1));
+        let (_, _, two) = run_append(&fx, "b2.rcsb", Some(2));
+        let (_, _, dflt) = run_append(&fx, "bd.rcsb", None);
+        assert_eq!(one.extra_reads as usize, APPEND_EXTRAS * APPEND_GROUPS);
+        assert_eq!(two.extra_reads as usize, APPEND_EXTRAS * APPEND_GROUPS.div_ceil(2));
+        assert_eq!(dflt.extra_reads as usize, APPEND_EXTRAS);
+        eprintln!("append reads: batch1={:?} batch2={:?} default={:?}", one, two, dflt);
     }
 }
