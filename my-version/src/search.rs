@@ -7252,10 +7252,10 @@ fn scoring_kind(gpu_used: bool) -> crate::backend::Kind {
 }
 
 /// The `backend` identity field of a checkpoint, the one value every snapshot of a
-/// process writes (#1127). WIP.
+/// process writes. A device that only fits (`fit_only_device`) leaves the host
+/// scoring, so such a run is a `cpu` run unless it scored on the device (`gpu_used`).
 pub fn checkpoint_backend(defer_gpu: bool, fit_only_device: bool, gpu_used: bool) -> Backend {
-    let _ = fit_only_device;
-    if defer_gpu || gpu_used {
+    if (defer_gpu && !fit_only_device) || gpu_used {
         Backend::Gpu
     } else {
         Backend::Cpu
