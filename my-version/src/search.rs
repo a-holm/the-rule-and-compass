@@ -14455,6 +14455,31 @@ mod tests {
         assert_eq!(gated.seeds[0].error.to_bits(), start.error.to_bits());
         assert_eq!(expr::structural_hash(&gated.seeds[0].tree), expr::structural_hash(&start.tree));
         assert!(plain.seeds[0].error > gated.seeds[0].error, "{} vs {}", plain.seeds[0].error, gated.seeds[0].error);
+
+    /// #1124: under the #848 fallback the finalist refit runs in two passes;
+    /// only the pass whose front is reported is counted.
+    #[test]
+    fn fit_accept_finalist_counts_the_reported_pass() {
+        use crate::expr::constant;
+        let s = threshold_panel();
+        let cfg = Config { reject_fixed_position: true, ..accept_config(&s, FitAccept::Fitness) };
+        let view = EvalSample::new(&s, &cfg);
+        let mut archive = Archive::new(10);
+        let tree = constant(5.0);
+        archive.items.push(Sol {
+            complexity: expr::complexity(&tree),
+            cost: cfg.complexity_model.complexity(&tree),
+            error: 0.0,
+            tree,
+        });
+        let counts = FitAcceptCounts::default();
+        let (front, report) = full_data_archive(&archive, &[], &view, &cfg, true, Some(&counts));
+        assert!(report.fixed_position_fallback, "the fixture reaches the fallback");
+        assert!(!front.items.is_empty());
+        let (kept, refused) = counts.snapshot().path("finalist").unwrap();
+        assert_eq!(kept + refused, 1, "one finalist, one decision");
+        assert!(((kept + refused) as usize) <= report.refits);
+    }
     }
 
     /// #1079: an island of scored offspring with edit records.
