@@ -186,7 +186,8 @@ pub fn append_family_locked(opts: &AppendOptions, record: Option<&crate::lockrec
     let retired = crate::retire::writer_retirement(opts.retired.as_deref(), declared.as_ref(), &[&opts.target, &opts.family]).map_err(|e| e.message)?;
     // The target's declaration wins and is kept. A family store with no declaration is accepted.
     if let Some(s) = crate::lockbox::stored_all(&opts.family).map_err(|e| e.message)? {
-        if declared != Some(s.range) || also != s.also {
+        let record_also = record.is_some_and(|r| also.is_none() && s.also == Some(r.range));
+        if declared != Some(s.range) || (also != s.also && !record_also) {
             return Err(format!(
                 "family store {} declares the locked test {} ({}), the target {} declares {}",
                 opts.family,

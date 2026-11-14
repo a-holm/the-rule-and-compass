@@ -9513,7 +9513,7 @@ INPUT / OUTPUT:
                           report (top moves, statistics, locked_test_also.rows_left_out) and
                           of every per-feature statistic, like --locked-test. A data
                           declaration that already uses the second slot with another range,
-                          or a record that does not parse, exits 2. The output declares the
+                          or a record that does not parse, exits 2 (also undeclared data with --locked-test X, where the protocol default fills the slot). The output declares the
                           range as locked_test_also. A label sidecar entry that was not
                           recomputed here and not computed under this record is refused
                           (exit 3); so is an output whose other carriers lack the range.

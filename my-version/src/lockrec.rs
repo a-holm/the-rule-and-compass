@@ -110,7 +110,7 @@ pub fn with_record(
         (Some(_), None) => Ok((primary, Some(*record))),
         (Some(_), Some(a)) if a == *record => Ok((primary, also)),
         (Some(p), Some(a)) => Err(usage(format!(
-            "--lock-record range {} needs the second-range slot, but the data already declares {} + {}",
+            "--lock-record range {} needs the second-range slot, but the resolved locked ranges are {} + {} (declared by the data, or the protocol default and --locked-test)",
             crate::lockbox::span(record),
             crate::lockbox::span(&p),
             crate::lockbox::span(&a)
