@@ -241,3 +241,40 @@ fn reselect_checkpoint_gives_the_in_loop_selection_rule() {
     assert_eq!(without_reselected_from(&a), without_reselected_from(&b));
     assert_eq!(finalist(&a), finalist(&b));
 }
+
+/// `(rank, bits, p_occam)` of every member that has an occam member with a p-value.
+fn priced(j: &Json) -> Vec<(usize, f64, f64)> {
+    pareto(j)
+        .iter()
+        .filter_map(|m| {
+            let o = m.get("occam")?;
+            Some((at(m, &["archive_rank"]).as_usize()?, at(o, &["bits"]).as_f64()?, at(o, &["p_occam"]).as_f64()?))
+        })
+        .collect()
+}
+
+#[test]
+fn reselect_run_prices_the_code_words_of_the_in_loop_rule() {
+    let fx = fixture();
+    // A level between the in-loop p_occam of the finalist (about 1e-36) and the p_occam that
+    // 3x the bits would give (about 1e-21): the verdict depends on the bits.
+    let level: &[&str] = &["--select-rule", "occam", "--select-min-entries", "5", "--select-delta", "1e-30"];
+    ok(&fx.search("a", level));
+    let a = fx.run_json("a");
+    assert_eq!(at(&a, &["objective", "selection_rule", "verdict"]).as_str(), Some("certified"));
+    let run = fx.path("a.run.json");
+    let out = fx.path("c.run.json");
+    let mut args = vec!["--reselect-run", run.as_str(), "--json-out", out.as_str(), "--no-dev-log"];
+    args.extend_from_slice(level);
+    ok(&fx.rcsr(&fx.data, &args));
+    let c = fx.run_json("c");
+    assert_eq!(without_reselected_from(&a), without_reselected_from(&c));
+    let (pa, pc) = (priced(&a), priced(&c));
+    assert!(pa.len() >= 2, "{pa:?}");
+    assert_eq!(pa.len(), pc.len());
+    for ((ra, ba, qa), (rc, bc, qc)) in pa.iter().zip(&pc) {
+        assert_eq!(ra, rc);
+        assert!((ba - bc).abs() < 1e-9, "rank {ra}: bits {ba} vs {bc}");
+        assert!((qa - qc).abs() <= 1e-9 * qa.abs().max(1e-300), "rank {ra}: p_occam {qa} vs {qc}");
+    }
+}

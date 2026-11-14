@@ -7035,7 +7035,11 @@ fn main() {
         for m in &run.members {
             let tree = expr::parse(&m.expression_exact, &vars)
                 .unwrap_or_else(|e| usage(format!("--reselect-run '{}': archive_rank {}: {}", path, m.archive_rank, e)));
-            let tree = normalise_inputs(&tree, &prepared.means, &prepared.stds);
+            let tree = if select_rule_arg.as_deref().is_some_and(|s| rcsr::selection::SelectRule::parse(s) == Ok(rcsr::selection::SelectRule::Occam)) {
+                normalise_inputs_folded(&tree, &prepared.means, &prepared.stds)
+            } else {
+                normalise_inputs(&tree, &prepared.means, &prepared.stds)
+            };
             front.items.push(rcsr::pareto::Sol {
                 complexity: m.complexity as usize,
                 cost: m.complexity,
@@ -7449,6 +7453,7 @@ fn main() {
     };
     let train_slice = prepared.trading.as_ref().and_then(|t| t.train.as_ref());
     let validation_segments = interval_split.as_ref().map_or_else(Vec::new, |s| s.validation_segment_starts());
+    let occam_train_segments = interval_split.as_ref().map_or_else(Vec::new, |s| s.segment_starts());
     let test_segments = interval_split.as_ref().map_or_else(Vec::new, |s| s.test_segment_starts());
     let mut rows: Vec<Row> = sorted
         .iter()
@@ -7729,31 +7734,25 @@ fn main() {
                 })
                 .collect();
             let code = rcsr::occam::CodeSpec::v1(&cfg.ops, vars.len());
+            let dev_books = rcsr::occam::DevBooks { train_ret: &tret, train_rows: &trows, train_segments: &occam_train_segments, val_ret: &vret, val_rows: &vrows, val_segments: &validation_segments };
             let picked = rcsr::occam::select_occam(&metas, occam_params, &code, &mut |i| {
                 let tree = &sorted[rows[i].archive_rank - 1].tree;
                 let mut words = Vec::new();
                 for c in code.candidates(tree) {
                     let train_pred: Vec<f64> = book_train.x.iter().map(|row| expr::eval(&c.tree, row)).collect();
-                    let spec = member_spec(tspec, &train_pred, train_slice);
+                    let base = member_spec(tspec, &train_pred, train_slice);
                     let val_pred = trading_pred(&c.tree, &v.x, vctx);
-                    let (Ok(a), Ok(b)) = (
-                        rcsr::trading::blocked_alpha(&train_pred, &tret, &trows, &spec, 1),
-                        rcsr::trading::blocked_alpha(&val_pred, &vret, &vrows, &spec, 1),
-                    ) else {
+                    let Some((series, entries, hold)) = dev_books.alpha(&train_pred, &val_pred, &base) else {
                         continue;
                     };
-                    let entries = a.entries + b.entries;
-                    let longs = a.long_rows + b.long_rows;
                     let den = expr::simplify_display(&expr::denormalize(&expr::simplify_display(&c.tree), &prepared.means, &prepared.stds));
-                    let mut series = a.series;
-                    series.extend(b.series);
                     words.push(rcsr::occam::Scored {
                         tier: c.tier,
                         expression_exact: expr::to_string_exact(&den, &vars),
                         bits: c.bits,
                         series,
                         entries,
-                        hold: if entries == 0 { 1 } else { longs.div_ceil(entries) },
+                        hold,
                     });
                 }
                 Ok(words)
@@ -9715,6 +9714,92 @@ fn normalise_inputs(n: &expr::Node, means: &[f64], stds: &[f64]) -> expr::Node {
     }
 }
 
+
+/// #1184: [`normalise_inputs`] followed by a fold of the affine maps. Every
+/// `x_i` becomes `s x_i + m`; sums, differences, products and quotients of such
+/// a map with constants collapse back into one map `a x_i + b`, so a formula
+/// printed as `(x - m) / s` returns to the bare input (up to float residue
+/// below 1e-9) and a scaled and shifted input becomes `a * (x + b / a)`. The
+/// Occam code words then price the same tree shape the search held.
+fn normalise_inputs_folded(n: &expr::Node, means: &[f64], stds: &[f64]) -> expr::Node {
+    fold_affine(n, means, stds).into_node()
+}
+
+enum Folded {
+    Const(f64),
+    Lin(usize, f64, f64),
+    Tree(expr::Node),
+}
+
+impl Folded {
+    fn into_node(self) -> expr::Node {
+        const EPS: f64 = 1e-9;
+        match self {
+            Folded::Const(c) => expr::constant(c),
+            Folded::Tree(n) => n,
+            Folded::Lin(i, a, b) => {
+                if (a - 1.0).abs() < EPS && b.abs() < EPS {
+                    expr::input(i)
+                } else if b.abs() < EPS {
+                    expr::node(Op::Mul, vec![expr::constant(a), expr::input(i)])
+                } else if (a - 1.0).abs() < EPS {
+                    expr::node(Op::Add, vec![expr::input(i), expr::constant(b)])
+                } else {
+                    expr::node(Op::Mul, vec![expr::constant(a), expr::node(Op::Add, vec![expr::input(i), expr::constant(b / a)])])
+                }
+            }
+        }
+    }
+}
+
+fn fold_affine(n: &expr::Node, means: &[f64], stds: &[f64]) -> Folded {
+    if n.op.is_meta() || n.op.is_agg() {
+        return Folded::Tree(n.clone());
+    }
+    let generic = |n: &expr::Node| {
+        Folded::Tree(expr::Node {
+            op: n.op,
+            val: n.val,
+            kids: n.kids.iter().map(|k| fold_affine(k, means, stds).into_node()).collect(),
+            block: n.block.clone(),
+        })
+    };
+    match (n.op, n.kids.len()) {
+        (Op::Input, _) => {
+            let i = n.val as usize;
+            let (m, s) = (means.get(i).copied().unwrap_or(0.0), stds.get(i).copied().unwrap_or(1.0));
+            if m == 0.0 && s == 1.0 {
+                Folded::Tree(expr::input(i))
+            } else {
+                Folded::Lin(i, s, m)
+            }
+        }
+        (Op::Const, _) => Folded::Const(n.val),
+        (Op::Neg, 1) => match fold_affine(&n.kids[0], means, stds) {
+            Folded::Const(c) => Folded::Const(-c),
+            Folded::Lin(i, a, b) => Folded::Lin(i, -a, -b),
+            Folded::Tree(t) => Folded::Tree(expr::node(Op::Neg, vec![t])),
+        },
+        (op @ (Op::Add | Op::Sub | Op::Mul | Op::Div), 2) if !op.is_custom() => {
+            let (l, r) = (fold_affine(&n.kids[0], means, stds), fold_affine(&n.kids[1], means, stds));
+            match (op, l, r) {
+                (Op::Add, Folded::Const(x), Folded::Const(y)) => Folded::Const(x + y),
+                (Op::Sub, Folded::Const(x), Folded::Const(y)) => Folded::Const(x - y),
+                (Op::Mul, Folded::Const(x), Folded::Const(y)) => Folded::Const(x * y),
+                (Op::Div, Folded::Const(x), Folded::Const(y)) if y != 0.0 => Folded::Const(x / y),
+                (Op::Add, Folded::Lin(i, a, b), Folded::Const(c)) | (Op::Add, Folded::Const(c), Folded::Lin(i, a, b)) => Folded::Lin(i, a, b + c),
+                (Op::Sub, Folded::Lin(i, a, b), Folded::Const(c)) => Folded::Lin(i, a, b - c),
+                (Op::Sub, Folded::Const(c), Folded::Lin(i, a, b)) => Folded::Lin(i, -a, c - b),
+                (Op::Mul, Folded::Lin(i, a, b), Folded::Const(c)) | (Op::Mul, Folded::Const(c), Folded::Lin(i, a, b)) => Folded::Lin(i, a * c, b * c),
+                (Op::Div, Folded::Lin(i, a, b), Folded::Const(c)) if c != 0.0 => Folded::Lin(i, a / c, b / c),
+                (Op::Add, Folded::Lin(i, a, b), Folded::Lin(j, c, d)) if i == j => Folded::Lin(i, a + c, b + d),
+                (Op::Sub, Folded::Lin(i, a, b), Folded::Lin(j, c, d)) if i == j => Folded::Lin(i, a - c, b - d),
+                (op, l, r) => Folded::Tree(expr::node(op, vec![l.into_node(), r.into_node()])),
+            }
+        }
+        _ => generic(n),
+    }
+}
 /// #1180: the columns of a regime gate are inputs of the decision: a label,
 /// the target, its return column or a construction column would leak the future
 /// into the mask (D13, exit 5).

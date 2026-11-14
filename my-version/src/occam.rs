@@ -565,3 +565,31 @@ fn jstr(s: &str) -> String {
     out.push('"');
     out
 }
+
+/// The development rows of a run: training rows and validation rows with their
+/// returns and the starts of their book segments (`--split-table`: every
+/// contiguous interval starts its book flat).
+pub struct DevBooks<'a> {
+    pub train_ret: &'a [f64],
+    pub train_rows: &'a crate::trading::TradingRows,
+    pub train_segments: &'a [f64],
+    pub val_ret: &'a [f64],
+    pub val_rows: &'a crate::trading::TradingRows,
+    pub val_segments: &'a [f64],
+}
+
+impl DevBooks<'_> {
+    /// Alpha series (training then validation), entries and mean long hold of
+    /// one prediction pair under `base`; `None` when a book cannot be built.
+    pub fn alpha(&self, train_pred: &[f64], val_pred: &[f64], base: &crate::trading::TradingSpec) -> Option<(Vec<f64>, usize, usize)> {
+        let train_spec = crate::trading::TradingSpec { segment_starts: self.train_segments.to_vec(), ..base.clone() };
+        let val_spec = crate::trading::TradingSpec { segment_starts: self.val_segments.to_vec(), ..base.clone() };
+        let a = crate::trading::blocked_alpha(train_pred, self.train_ret, self.train_rows, &train_spec, 1).ok()?;
+        let b = crate::trading::blocked_alpha(val_pred, self.val_ret, self.val_rows, &val_spec, 1).ok()?;
+        let entries = a.entries + b.entries;
+        let longs = a.long_rows + b.long_rows;
+        let mut series = a.series;
+        series.extend(b.series);
+        Some((series, entries, if entries == 0 { 1 } else { longs.div_ceil(entries) }))
+    }
+}
