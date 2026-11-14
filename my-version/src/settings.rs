@@ -788,10 +788,10 @@ pub static TABLE: &[&dyn Setting] = &[
         group: Group::Variation,
         schema_type: "flag",
         schema_default: "false",
-        schema: "#471: each island learns edit weights from the last 10 generations: w_k = max(0.02, (s_k + 1) / (a_k + 2)), normalised, where a child counts as a success when its error is below its first parent's. Uses all seven edit kinds; the --mutation-mix weights stand until a generation has been observed. Learns only from CPU-scored generations (a deferred GPU batch or a screening subset keeps the base weights). The counts are saved in the checkpoint. Saved search setting. Exit 2 with --variation postfix",
+        schema: "#471: each island learns edit weights from the last 10 generations: w_k = max(0.02, (s_k + 1) / (a_k + 2)), normalised, where a child counts as a success when its error is below its first parent's. Uses all seven edit kinds; the --mutation-mix weights stand until a generation has been observed. Learns on both backends: the CPU path counts a child when it is scored, a device-scored generation is counted at the generation barrier by the same win rule (#1079). A screening subset (--fit-samples) keeps the base weights. The counts are saved in the checkpoint. Saved search setting. Exit 2 with --variation postfix",
         help: "  --adaptive-mix             per-island edit weights learned from the success
                              rate of the last 10 generations (uses all seven edit
-                             kinds; learns from CPU-scored generations only).
+                             kinds; learns on the CPU and the device).
                              Off by default; not with --variation postfix (#471)",
         bench: Some(Bench {
             usage: "  --adaptive-mix            per-island edit weights from success rates (#471)",

@@ -3576,6 +3576,7 @@ fn score_generation(
             rescore_pending_cpu(islands, data, cfg, &fallback);
             for (i, j, mut before) in unfitted {
                 before.age = islands[i][j].age;
+                before.edit = islands[i][j].edit; // #1079
                 let fitted = islands[i][j].clone();
                 let moved = expr::structural_hash(&before.tree) != expr::structural_hash(&fitted.tree);
                 let (ind, kept) = accept_fit(before, fitted);
@@ -6498,15 +6499,17 @@ fn evolve_island(
     let mut attempts = 0usize;
     let max_attempts = pop * 50 + 50;
 
-    // #471: edit weights and the adaptive window. Learning needs the child's
-    // error now, which a deferred GPU batch or a screening subset does not give.
+    // #471: edit weights and the adaptive window. Inline learning needs the
+    // child's error now; a deferred GPU batch hands its edit records to
+    // `learn_mix_at_barrier` (#1079); a screening subset never learns.
     let base_opts = cfg.variation_opts();
     let mut opts = base_opts;
     if cfg.adaptive_mix {
         opts.mix = mix.weights(&base_opts.mix);
     }
-    let learn = cfg.adaptive_mix && !screened && !defer_gpu;
-    let parent_errors: std::collections::HashMap<u64, f64> = if learn {
+    let track = cfg.adaptive_mix && !screened;
+    let learn = track && !defer_gpu;
+    let parent_errors: std::collections::HashMap<u64, f64> = if track {
         isl.iter()
             .map(|i| (expr::structural_hash(&i.tree), i.error))
             .chain(parents.front.iter().map(|s| (expr::structural_hash(&s.tree), s.error)))
@@ -6534,7 +6537,7 @@ fn evolve_island(
             // parents; 5% still come from the global Pareto front. With the policy
             // off this is exactly the #76 draw.
             let (p1, mut age) = pick_parent_aged(isl, &parents, rng, afp, &par_rank, &par_crowd);
-            let parent_err = if learn {
+            let parent_err = if track {
                 parent_errors.get(&expr::structural_hash(&p1)).copied()
             } else {
                 None
@@ -6583,7 +6586,9 @@ fn evolve_island(
                 GenCounters::count(counters, |c| &c.post_fit_drops); // #463
                 continue;
             }
-            if let Some((parent, used)) = meta[k] {
+            if defer_gpu {
+                ind.edit = meta[k];
+            } else if let Some((parent, used)) = meta[k] {
                 let won = ind.error.is_finite() && (!parent.is_finite() || ind.error < parent);
                 for kind in expr::EditKind::ALL {
                     if used & (1 << kind.index()) != 0 {
@@ -6699,7 +6704,20 @@ fn evolve_island(
 
 /// #1079: learn the edit success counts of a device-scored generation.
 fn learn_mix_at_barrier(islands: &mut [Vec<Ind>], mixes: &mut [MixWindow]) {
-    let _ = (islands, mixes);
+    for (pop, mix) in islands.iter_mut().zip(mixes.iter_mut()) {
+        let mut counts: MixCounts = [(0, 0); expr::EDIT_KINDS];
+        for ind in pop.iter_mut() {
+            let Some((parent, used)) = ind.edit.take() else { continue };
+            let won = ind.error.is_finite() && (!parent.is_finite() || ind.error < parent);
+            for kind in expr::EditKind::ALL {
+                if used & (1 << kind.index()) != 0 {
+                    counts[kind.index()].0 += 1;
+                    counts[kind.index()].1 += won as u64;
+                }
+            }
+        }
+        mix.push(counts);
+    }
 }
 
 /// A user-provided starting expression, after simplification, constant fitting
@@ -9284,6 +9302,7 @@ fn run_search_scoped(
             let mut pipeline_tail = PipelineTail { rows: gen_train, pending: PendingTail::default() };
             #[cfg(feature = "cuda")]
             let mut fit_queue = PipelineFitQueue::default();
+            let deferred = defer_gpu && !screened; // #1079: `score_generation` may clear `defer_gpu`
             std::thread::scope(|s| {
                 // The queue lives in the scope: producers take a clone of the
                 // sender, and `drain` consumes the original so it can end.
@@ -9460,6 +9479,9 @@ fn run_search_scoped(
                     defer_gpu =
                         score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_data, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version, fit_counts)?;
                 }
+            }
+            if cfg.adaptive_mix && deferred {
+                learn_mix_at_barrier(&mut islands, &mut mixes); // #1079
             }
             let dev_eval = dev_lap(&mut dev_mark); // #211: evaluator batch
             let stage_eval = stage_lap(&mut stage_mark); // #284
