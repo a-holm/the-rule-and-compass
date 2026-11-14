@@ -778,3 +778,105 @@ fn gpu_run_ledger_books_checkpoint_io_and_uses_event_intervals() {
     assert!(l.device_busy_s() <= l.wall_s() + 1e-9);
     assert!((0.0..=1.0).contains(&l.duty_run().value));
 }
+
+/// #1089, #456: a test that arms a fault holds the write side; the fault list is
+/// process-wide.
+#[cfg(feature = "cuda")]
+static FAULTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[cfg(feature = "cuda")]
+struct Faults(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+
+#[cfg(feature = "cuda")]
+impl Faults {
+    fn arm(sites: &str) -> Self {
+        let guard = FAULTS.write().unwrap_or_else(|e| e.into_inner());
+        rcsr::gpu::set_injected_faults_for_tests(sites);
+        Faults(guard)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for Faults {
+    fn drop(&mut self) {
+        rcsr::gpu::set_injected_faults_for_tests("");
+    }
+}
+
+/// #1089: run `cfg` with the fault `site` armed. The fault fires in the
+/// generation that the checkpoints with `generations <= 2` precede. Every
+/// finite error of a checkpoint with `generations >= 3` must be the exact CPU
+/// score of its tree, except a member carried unchanged from an earlier
+/// checkpoint (a device score of its own tree). A screening error of an
+/// unfitted tree, or a merged device score, is not within 1e-9 of it.
+#[cfg(feature = "cuda")]
+fn assert_no_device_score_after(site: &str, cfg: &search::Config) {
+    if !rcsr::backend::probe().available() {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+        return;
+    }
+    let train = sample(96);
+    let test = sample(96);
+    let faults = Faults::arm(site);
+    let mut seen = std::collections::HashSet::new();
+    let mut checked_at_three = 0usize;
+    let mut worst = 0.0f64;
+    let out = search::run_resumable(cfg, &train, &test, None, 1, |cp| {
+        for island in &cp.islands {
+            for ind in &island.population {
+                let key = (expr::structural_hash(&ind.tree), ind.error.to_bits());
+                if cp.generations <= 2 {
+                    seen.insert(key);
+                    continue;
+                }
+                if cp.generations < 3 || !ind.error.is_finite() || seen.contains(&key) {
+                    continue;
+                }
+                let exact = train
+                    .x
+                    .iter()
+                    .zip(&train.y)
+                    .map(|(x, y)| (expr::eval(&ind.tree, x) - y).powi(2))
+                    .sum::<f64>()
+                    / train.y.len() as f64;
+                worst = worst.max((ind.error - exact).abs() / exact.max(1e-300));
+                if cp.generations == 3 {
+                    checked_at_three += 1;
+                }
+            }
+        }
+    })
+    .expect("the run completes on the CPU after the device failure");
+    drop(faults);
+    let reason = out.backend_reason.expect("the run records why the device stopped");
+    assert!(reason.contains(rcsr::gpu::INJECTED_REFUSAL), "{reason}");
+    assert!(
+        checked_at_three + 1 >= cfg.pop * cfg.islands,
+        "only {checked_at_three} members were checked at generation 3"
+    );
+    assert!(worst < 1e-9, "a population error is not the CPU score of its tree: relative gap {worst}");
+}
+
+/// #1089: narrow admission, the re-score after the fit fails.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_failed_rescore_leaves_no_screening_error() {
+    let mut cfg = config(41, true);
+    cfg.generations = 5;
+    cfg.pop = 40;
+    cfg.fit_strategy = rcsr::fit::FitStrategy::Gpu;
+    assert_no_device_score_after("rescore", &cfg);
+}
+
+/// #1089: the overlap pipeline's device fit fails.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_failed_pipeline_fit_scores_the_generation_on_the_cpu() {
+    let mut cfg = config(43, true);
+    cfg.generations = 5;
+    cfg.pop = 40;
+    cfg.fit_strategy = rcsr::fit::FitStrategy::Gpu;
+    cfg.fit_admission = rcsr::fit::FitAdmission::All;
+    cfg.pipeline_depth = 2;
+    assert_no_device_score_after("pipeline_fit", &cfg);
+}
