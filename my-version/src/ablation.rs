@@ -1123,7 +1123,11 @@ fn score_core(
         }
         crate::expr::eval(&tree, &row)
     };
-    ladder::check_fold_spacing(panel, folds, opts.horizon_seconds)?;
+    let min_group_step = ladder::check_fold_spacing(panel, folds, opts.horizon_seconds)?;
+    if let Some(s) = &opts.spec {
+        crate::target::check_period_width(s.horizon_seconds, s.stride_seconds, min_group_step)?;
+    }
+    let width = opts.spec.as_ref().map(|s| s.period_width_seconds());
     let side = opts.cost_bps * 1e-4;
     let mut net_by_fold_threshold = Vec::new();
     let mut net_period: Vec<f64> = Vec::new();
@@ -1143,7 +1147,7 @@ fn score_core(
                     crate::trading_gpu::band_positions(&test_s, &groups, &params)?
                 }
             };
-            let series = ladder::period_net(panel, &f.test, &pos, side);
+            let series = ladder::period_net(panel, &f.test, &pos, side, width);
             per_thr.push(series.iter().sum::<f64>());
             if ti == headline {
                 net_period.extend(series);
@@ -1769,7 +1773,7 @@ fn usage() -> &'static str {
             [--allow-in-sample]  a fold whose test starts before the run's last seen row + purge is refused (exit 3); with the flag it is labelled oof:false and left out of every pooled series\n\
             [--group <col>] [--return-col <col>] [--scheme expanding] [--thresholds 0.6,0.7,0.8]\n\
             [--headline-threshold 0.7] [--cost-bps 12 | --cost-override <bp>] [--purge-seconds 219600] [--target-spec <file>]\n\
-            scores the run's finalist (objective.finalist.expression_exact, else the rounded expression; the result carries expression_source) on every fold. Test rows of one group closer than the target spec horizon overlap and are refused (exit 2); the result carries min_group_step_seconds. --target-spec sets the per-side cost\n\
+            scores the run's finalist (objective.finalist.expression_exact, else the rounded expression; the result carries expression_source) on every fold. Test rows of one group closer than the target spec horizon overlap and are refused (exit 2); a spec without stride_seconds over rows 2 horizons or more apart, or a stride_seconds wider than the smallest per-group step, is refused too (exit 2); a declared width makes one equal-weight period per floor(t / width) bucket; the result carries min_group_step_seconds. --target-spec sets the per-side cost\n\
             (cost_bps / 2), the return units (log is converted with exp_m1) and the return column; a --cost-bps that differs is refused.\n\
             --from-run prices the book the search selected: the run's target spec, per-side cost and fixed threshold\n\
             (objective.spec.threshold); it refuses --thresholds, --headline-threshold and --target-spec, and a run without an objective block\n
