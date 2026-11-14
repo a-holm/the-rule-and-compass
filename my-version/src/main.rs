@@ -345,6 +345,23 @@ INPUT:
                              standard deviation. Needs --fitness pnl
   --pnl-block-lambda L      weight of the block spread (default 1.0, finite,
                              >= 0; 0 is the plain mean). Needs --fitness pnl
+  --pnl-mask <expr>         price only the rows inside a causal regime gate
+                             (a bull or bear specialist). The expression reads
+                             columns of the row; aggregates exit 2 and a
+                             label, target, return or construction column
+                             exits 5 (D13). The gate is on when the value is
+                             > 0. Rows outside are flat; every run of on rows
+                             of a group starts flat and pays its exit; the
+                             hindsight bound is taken on those runs. The
+                             validation and test books apply the same mask.
+                             CPU only: --gpu exits 2. Needs --fitness pnl;
+                             the book hash covers it, so a resume needs the
+                             same mask
+  --pnl-mask-band h         hysteresis of --pnl-mask (default 0, finite, >= 0):
+                             on above +h, off below -h, else the previous
+                             state. Needs --pnl-mask
+  --pnl-mask-dwell D        minimum rows per gate state, per group (default 1,
+                             integer >= 1). Needs --pnl-mask
   --book-target COL         price the long/flat book on another label of the
                              same --target-spec file: its return_column,
                              horizon, entry offset and cost give the fitness,
@@ -1382,6 +1399,15 @@ fn trading_book(
     let pred = trading_pred(tree, x, ctx);
     let (ret, rows) = trading_inputs(slice, ctx);
     rcsr::trading::evaluate(&pred, &ret, &rows, tspec)
+}
+
+/// #1180: the share of rows on and the on-runs of the validation and test
+/// slices under `--pnl-mask`, and the raw slices for the unmasked reference.
+struct MaskContext {
+    validation: Option<(f64, usize)>,
+    test: (f64, usize),
+    raw_validation: Option<data::TradingSlice>,
+    raw_test: data::TradingSlice,
 }
 
 fn trading_usage(msg: &str) -> ! {
@@ -2768,6 +2794,9 @@ fn main() {
     let mut pnl_blocks_arg: Option<String> = None;
     let mut book_target_arg: Option<String> = None;
     let mut pnl_lambda_arg: Option<String> = None;
+    let mut pnl_mask_arg: Option<String> = None;
+    let mut pnl_mask_band_arg: Option<String> = None;
+    let mut pnl_mask_dwell_arg: Option<String> = None;
     let mut trading_flags: Vec<&'static str> = Vec::new();
     let mut position_arg: Option<String> = None;
     let mut allow_short = false;
@@ -3070,6 +3099,9 @@ fn main() {
             "--fitness" => fitness_arg = Some(val!()),
             "--pnl-blocks" => pnl_blocks_arg = Some(val!()),
             "--pnl-block-lambda" => pnl_lambda_arg = Some(val!()),
+            "--pnl-mask" => pnl_mask_arg = Some(val!()),
+            "--pnl-mask-band" => pnl_mask_band_arg = Some(val!()),
+            "--pnl-mask-dwell" => pnl_mask_dwell_arg = Some(val!()),
             "--book-target" => {
                 trading_flags.push("--book-target");
                 book_target_arg = Some(val!());
@@ -4482,6 +4514,46 @@ fn main() {
     if let (Some(r), false) = (&target_resolved, vars.is_empty()) {
         target_check = Some(enforce_target_check(&r.spec, &vars, allow_target_structure, require_clean_inputs));
     }
+    // #1180: the regime gate of --pnl-mask, parsed and checked before any row is read.
+    let gate_spec: Option<rcsr::regime_gate::GateSpec> = match pnl_mask_arg.as_deref() {
+        None => {
+            for (flag, given) in [("--pnl-mask-band", pnl_mask_band_arg.is_some()), ("--pnl-mask-dwell", pnl_mask_dwell_arg.is_some())] {
+                if given {
+                    trading_usage(&format!("{} needs --pnl-mask", flag));
+                }
+            }
+            None
+        }
+        Some(src) => {
+            if fitness_arg.as_deref() != Some("pnl") {
+                trading_usage("--pnl-mask needs --fitness pnl");
+            }
+            let band = match pnl_mask_band_arg.as_deref() {
+                None => 0.0,
+                Some(t) => match t.trim().parse::<f64>() {
+                    Ok(b) if b.is_finite() && b >= 0.0 => b,
+                    _ => trading_usage(&format!("--pnl-mask-band must be a finite number >= 0, got '{}'", t)),
+                },
+            };
+            let dwell = match pnl_mask_dwell_arg.as_deref() {
+                None => 1,
+                Some(t) => match t.trim().parse::<usize>() {
+                    Ok(d) if d >= 1 => d,
+                    _ => trading_usage(&format!("--pnl-mask-dwell must be an integer >= 1, got '{}'", t)),
+                },
+            };
+            let spec = match rcsr::regime_gate::GateSpec::parse(src, band, dwell) {
+                Ok(g) => g,
+                Err(e) => trading_usage(&format!("--pnl-mask: {}", e)),
+            };
+            if gpu_explicit == Some(true) {
+                trading_usage("--pnl-mask with --gpu: the device long_pnl book carries no regime mask; omit --gpu to run on the CPU");
+            }
+            let specs: Vec<&target::TargetSpec> = target_resolved.iter().chain(book_resolved.iter()).map(|r| &r.spec).collect();
+            enforce_gate_columns(&spec.columns, &specs, &target_names, allow_target_structure);
+            Some(spec)
+        }
+    };
 
     // #71/#112: the guard and the backing choice happen before any resident
     // Table or search sample is built. A CSV estimate uses the table's shape
@@ -4744,6 +4816,9 @@ fn main() {
                         }
                         if let Some(f) = trade_funding.as_deref() {
                             pnames.push(f.to_string());
+                        }
+                        if let Some(g) = &gate_spec {
+                            pnames.extend(g.columns.iter().cloned());
                         }
                     }
                     pnames.sort();
@@ -5452,7 +5527,11 @@ fn main() {
             train: fitness_pnl || trade_band_units.as_deref() == Some("sd"), // #480, #925
             cross_section: top_tercile,
             book_rows: book_resolved.is_some(),
+            mask: gate_spec.clone(),
         });
+        if gate_spec.is_some() && top_tercile {
+            trading_usage("--pnl-mask prices the long/flat threshold book: it cannot combine with --position top_tercile");
+        }
         // #925: an sd-unit band is resolved per candidate from its training rows.
         let band_units = match trade_band_units.as_deref().map(rcsr::trading::BandUnits::parse) {
             None => rcsr::trading::BandUnits::Score,
@@ -5728,7 +5807,13 @@ fn main() {
         let (Some(tspec), Some(slice)) = (trading_spec.as_ref(), slice) else {
             trading_usage("--fitness pnl found no training trading rows");
         };
-        match rcsr::trading::FitnessBook::with_blocks(slice, tspec, target_horizon, pnl_blocks, pnl_lambda) {
+        let train_mask = prepared.trading.as_ref().and_then(|t| t.masks.as_ref()).and_then(|m| m.train.as_deref());
+        let mask_identity = gate_spec.as_ref().map(|g| g.identity());
+        let book_mask = match (train_mask, mask_identity.as_deref()) {
+            (Some(on), Some(identity)) => Some(rcsr::trading::BookMask { on, identity }),
+            _ => None,
+        };
+        match rcsr::trading::FitnessBook::with_blocks_masked(slice, tspec, target_horizon, pnl_blocks, pnl_lambda, book_mask) {
             Ok(book) if book.len() == prepared.book.as_ref().map_or(prepared.train.len(), |b| b.train.len()) => Some(std::sync::Arc::new(book)),
             Ok(book) => trading_usage(&format!(
                 "--fitness pnl: {} training trading rows for {} training rows",
@@ -5740,6 +5825,25 @@ fn main() {
     } else {
         None
     };
+    // #1180: the validation and test books price the same regime mask: every
+    // on-run is its own book and the rows outside the mask are dropped. The raw
+    // slices stay for the unmasked reference nets.
+    let mut mask_context: Option<MaskContext> = None;
+    if let (Some(_), Some(split)) = (&gate_spec, prepared.trading.as_mut()) {
+        if let Some(masks) = split.masks.clone() {
+            let share = |slice: &data::TradingSlice, on: &[bool]| {
+                let (rows_on, runs) = rcsr::regime_gate::run_count(&slice.rows.group, on);
+                (rows_on as f64 / on.len().max(1) as f64, runs)
+            };
+            let validation = split.validation.as_ref().zip(masks.validation.as_ref()).map(|(s, on)| share(s, on));
+            let test = share(&split.test, &masks.test);
+            mask_context = Some(MaskContext { validation, test, raw_validation: split.validation.clone(), raw_test: split.test.clone() });
+            if let (Some(v), Some(on)) = (split.validation.as_mut(), masks.validation.as_ref()) {
+                *v = rcsr::regime_gate::masked_slice(v, on);
+            }
+            split.test = rcsr::regime_gate::masked_slice(&split.test, &masks.test);
+        }
+    }
     if let Some(book) = &fitness_book {
         cfg.fitness = search::Fitness::LongPnl(book.clone());
         if weight_name.is_some() && !quiet {
@@ -7482,6 +7586,25 @@ fn main() {
                 reselected_from: reselected_from.clone(),
                 validation: validation_book,
                 test: book(book_test, split.map(|t| &t.test), split.and_then(|t| t.test_context.as_ref())),
+                mask: match (&gate_spec, &mask_context) {
+                    (Some(g), Some(m)) => {
+                        let raw_net = |sample: &data::Sample, slice: Option<&data::TradingSlice>| {
+                            slice.and_then(|s| trading_book(tree, &sample.x, s, None, &fspec).ok()).map(|s| s.net_pnl)
+                        };
+                        Some(rcsr::trading::MaskReport {
+                            expr: g.source.clone(),
+                            band: g.band,
+                            dwell: g.dwell,
+                            validation: m.validation.map(|(on_share, runs)| rcsr::trading::MaskedBlock {
+                                on_share,
+                                runs,
+                                unmasked_net_pnl: book_validation.and_then(|v| raw_net(v, m.raw_validation.as_ref())),
+                            }),
+                            test: rcsr::trading::MaskedBlock { on_share: m.test.0, runs: m.test.1, unmasked_net_pnl: raw_net(book_test, Some(&m.raw_test)) },
+                        })
+                    }
+                    _ => None,
+                },
             })
         }
         _ => None,
@@ -8519,7 +8642,7 @@ fn main() {
                 backend_json,
                 match &fitness_book {
                     Some(b) => format!(
-                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"band\":{},\"band_units\":\"{}\",\"min_holding\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}{}{}}},",
+                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"band\":{},\"band_units\":\"{}\",\"min_holding\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}{}{}{}}},",
                         b.len(),
                         b.groups(),
                         jnum(b.side()),
@@ -8541,6 +8664,17 @@ fn main() {
                             )
                         } else {
                             String::new()
+                        },
+                        // #1180: omitted without a mask, so the default report is unchanged.
+                        match (&gate_spec, b.is_masked()) {
+                            (Some(g), true) => format!(
+                                "\"mask\":{{\"expr\":{},\"band\":{},\"dwell\":{},\"off_rows\":{}}},",
+                                jstr(&g.source),
+                                jnum(g.band),
+                                g.dwell,
+                                b.masked_rows()
+                            ),
+                            _ => String::new(),
                         },
                         // #481: what ranked the generations; `backend` above is
                         // the reported values, always exact CPU f64.
@@ -9331,6 +9465,38 @@ fn normalise_inputs(n: &expr::Node, means: &[f64], stds: &[f64]) -> expr::Node {
 
 /// #254: run the D13 detectors on a declared target; exit 5 on a finding that
 /// is not overridden.
+/// #1180: the columns of a regime gate are inputs of the decision: a label,
+/// the target, its return column or a construction column would leak the future
+/// into the mask (D13, exit 5).
+fn enforce_gate_columns(columns: &[String], specs: &[&target::TargetSpec], target_names: &[String], allow_structure: bool) {
+    let refuse = |why: String| -> ! {
+        eprintln!("error: --pnl-mask: {}", why);
+        std::process::exit(EXIT_LEAKAGE);
+    };
+    for c in columns {
+        if target_names.iter().any(|t| t == c) {
+            refuse(format!("D13a: target '{}' is a mask column", c));
+        }
+        if rcsr::registry::lookup(c).is_some_and(|r| r.family == "label") {
+            refuse(format!("D13a: label-family column '{}' reads bars after the decision time", c));
+        }
+    }
+    for spec in specs {
+        match target::check(spec, columns, allow_structure) {
+            Ok(check) if !check.construction_in_vars.is_empty() => refuse(format!(
+                "D13: construction column(s) of target '{}' are mask columns: {}",
+                spec.column,
+                check.construction_in_vars.join(", ")
+            )),
+            Ok(_) => {}
+            Err(report) => {
+                let why = report.result().err().map_or_else(|| "D13 finding".to_string(), |f| f.to_string());
+                refuse(why)
+            }
+        }
+    }
+}
+
 fn enforce_target_check(
     spec: &target::TargetSpec,
     vars: &[String],
@@ -11107,6 +11273,9 @@ OPTIONS:
   --cut-blocks <K>           time blocks of the fitted-cut fitness (default 4, 1 to 8)
   --cut-lambda <L>           weight of the block regret sd in the fitted-cut fitness
                              (default 1, finite and >= 0)
+  --unmasked                 price the raw formula of a run that searched with
+                             --pnl-mask instead of its masked book (diagnostic;
+                             needs --from-run or --front of a masked run)
   --policy <p>               threshold | band | dp | top-tercile | vote (default threshold). top-tercile
                              holds the top floor(n/3) finite scores of each timestamp long and
                              the rest flat (no threshold; --threshold-quantile, --threshold-fixed,
@@ -11405,6 +11574,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut quiet = false;
     let mut allow_lockbox = false;
     let mut popts = walkforward::ProtocolOptions::default();
+    let mut unmasked = false;
     let mut band_units_arg: Option<String> = None;
     let mut windows_scheme: Option<String> = None;
     let mut ledger_path: Option<String> = None;
@@ -11691,6 +11861,7 @@ fn run_walkforward(args: &[String]) -> ! {
             "--verify-read" => verify_read = true,
             "--allow-unbound-ledger" => allow_unbound = true,
             "--allow-lockbox" => allow_lockbox = true,
+            "--unmasked" => unmasked = true,
             other if other.starts_with("--policy=") => {
                 let src = &other["--policy=".len()..];
                 policy = match walkforward::Policy::parse(src) {
@@ -11818,6 +11989,10 @@ fn run_walkforward(args: &[String]) -> ! {
             input_fail(&e)
         });
         let book = run.band_book().unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
+        if unmasked && book.mask.is_none() {
+            usage_fail("--unmasked: the run priced no regime mask");
+        }
+        popts.mask = if unmasked { None } else { book.mask.clone() };
         expressions.push(book.expression.clone());
         popts.expression_source = Some(book.expression_source);
         if locked_test && book.expression_source == rcsr::run_json::ExpressionSource::Rounded {
@@ -11873,6 +12048,10 @@ fn run_walkforward(args: &[String]) -> ! {
             std::process::exit(EXIT_INPUT);
         }
         expressions = run.front.iter().map(|m| m.expression.clone()).collect();
+        if unmasked && run.mask.is_none() {
+            usage_fail("--unmasked: the run priced no regime mask");
+        }
+        popts.mask = if unmasked { None } else { run.mask.clone() };
         popts.expression_source = Some(run.front_source);
         if locked_test && run.front_source == rcsr::run_json::ExpressionSource::Rounded {
             input_fail(&rcsr::run_json::rounded_refusal(path));
@@ -11939,6 +12118,22 @@ fn run_walkforward(args: &[String]) -> ! {
         match rcsr::target::entry_for(&specs, &want) {
             Some(s) => cost_spec = Some(s.clone()),
             None => input_fail(&format!("{}: no entry for target '{}'", path, want)),
+        }
+    }
+    if unmasked && from_run_path.is_none() && front_path.is_none() {
+        usage_fail("--unmasked needs --from-run or --front of a run that priced a regime mask");
+    }
+    if popts.mask.is_some() {
+        let refused = [
+            (device_pnl, "--device-pnl"),
+            (popts.batch_pnl, "--batch-pnl"),
+            (threshold_fit, "--threshold-fit"),
+            (policy == walkforward::Policy::TopTercile, "--policy top-tercile"),
+            (policy == walkforward::Policy::Vote, "--policy vote"),
+            (policy == walkforward::Policy::Dp, "--policy dp"),
+        ];
+        if let Some((_, flag)) = refused.iter().find(|(on, _)| *on) {
+            usage_fail(&format!("{} conflicts with the run's regime mask (--pnl-mask): the masked book is priced on the CPU test rows; pass --unmasked to price the raw formula", flag));
         }
     }
     let mut cost_bps = walkforward::DEFAULT_COST_BPS;

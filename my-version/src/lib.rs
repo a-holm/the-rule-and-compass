@@ -77,6 +77,7 @@ pub mod pareto;
 pub mod postfix;
 pub mod panel; // #145: point-in-time membership and panel
 pub mod parse;
+pub mod regime_gate; // #1180: causal regime gate and the masks it gives
 pub mod provenance; // #256: build-time commit, binary hash, device identity
 pub mod pipeline; // #119: bounded producer/scorer overlap
 pub mod prep; // #123: raw archives -> column store

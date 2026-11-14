@@ -918,3 +918,57 @@ fn malformed_band_block_is_still_refused() {
         assert!(stderr(&out).contains("band_resolved"), "{mode}: {}", stderr(&out));
     }
 }
+
+/// `g` is +1 in alternate 25-row runs and -1 between them (#1180).
+fn write_gate_csv(dir: &Path) -> String {
+    let mut text = String::from("t,x1,x2,r,y,g\n");
+    for i in 0..N {
+        let (x1, x2, r) = row(i);
+        let g = if (i / 25) % 2 == 0 { 1 } else { -1 };
+        text.push_str(&format!("{},{},{},{},{},{}\n", T0 + STEP * i as i64, x1, x2, r, r, g));
+    }
+    let path = dir.join("gate.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn walkforward_carries_the_mask() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir, "s.json", "log", "20.0");
+    let mask = ["--fitness", "pnl", "--pnl-mask", "g", "--pnl-mask-band", "0.5", "--pnl-mask-dwell", "3"];
+    let run = search_as(&dir, &data, &spec, &mask, "masked.json");
+    let doc = read_json(&run);
+    let recorded = at(&doc, &["objective", "spec", "pnl_mask"]);
+    assert_eq!(at(recorded, &["expr"]).as_str(), Some("g"));
+    assert_eq!((num(recorded, &["band"]), num(recorded, &["dwell"])), (0.5, 3.0));
+    for (slot, window) in [("validation", validation_window()), ("test", window_arg())] {
+        let want = at(&doc, &["objective", slot]);
+        assert!(num(want, &["mask", "runs"]) >= 2.0, "{slot}: the mask must cut several runs");
+        assert!(num(want, &["trades"]) > 0.0, "{slot}: the book must trade");
+        let wf = walk(&dir, &data, &["--from-run", &run, "--window", &window]);
+        let m = at(first_window(&wf), &["metrics"]);
+        for key in ["trades", "exposure", "total_cost", "rows", "entries"] {
+            let (a, b) = (num(m, &[key]), num(want, &[key]));
+            assert!((a - b).abs() <= 1e-12, "{slot} {key}: walkforward {a} objective {b}");
+        }
+        let net = num(m, &["mean_return"]) * num(m, &["periods"]);
+        assert!((net - num(want, &["net_pnl"])).abs() <= 1e-12, "{slot}: net {net} vs {}", num(want, &["net_pnl"]));
+        let raw = walk(&dir, &data, &["--from-run", &run, "--window", &window, "--unmasked"]);
+        let rm = at(first_window(&raw), &["metrics"]);
+        let raw_net = num(rm, &["mean_return"]) * num(rm, &["periods"]);
+        let reference = num(want, &["unmasked_net_pnl"]);
+        assert!((raw_net - reference).abs() <= 1e-12, "{slot}: unmasked net {raw_net} vs {reference}");
+        assert!(num(rm, &["rows"]) > num(m, &["rows"]), "{slot}: the mask drops rows");
+    }
+    let plain = search_as(&dir, &data, &spec, &["--fitness", "pnl"], "plain.json");
+    let w = window_arg();
+    let args = ["walkforward", "--data", &data, "--time", "t", "--from-run", &plain, "--window", &w, "--allow-in-sample-windows", "--unmasked", "--out", "/dev/null"];
+    let o = rcsr(&args);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("priced no regime mask"), "{}", stderr(&o));
+    let o = rcsr(&["walkforward", "--data", &data, "--time", "t", "--from-run", &run, "--window", &w, "--allow-in-sample-windows", "--batch-pnl", "--out", "/dev/null"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("regime mask"), "{}", stderr(&o));
+}

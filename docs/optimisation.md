@@ -1477,6 +1477,34 @@ fitness   = mean_k(regret_k) + L * sd_k(regret_k)       (sample sd, ddof 1)
 * `--json` `search_fitness` gains `blocks`, `lambda` and `block_bounds` (only when `K > 1`), and each Pareto member's `fitness` gains `block_regret` (the regret of each block; `train_regret` is the fitness, `train_net`, `train_flips` and `train_exits` sum the blocks).
 * The blocks are a ranking term inside one training period. They do not refit constants per block; the walk-forward of the front is the out-of-sample test.
 
+#### `--pnl-mask`: regime-masked fitness for specialists
+
+`--pnl-mask <expr>` prices only the rows inside a causal regime gate, so a bull specialist and a bear specialist can be searched on the same panel. It needs `--fitness pnl` (exit 2 otherwise). `--pnl-mask-band h` (default 0, finite, `>= 0`) and `--pnl-mask-dwell D` (default 1, an integer `>= 1`) need `--pnl-mask`.
+
+```sh
+rcsr --data panel.rcsb --target lbl_h24a_y --fitness pnl --pnl-blocks 8 \
+  --pnl-mask "btc_r672" --pnl-mask-band 0.02 --pnl-mask-dwell 7 --save bull.ckpt --json > bull.run.json
+rcsr ... --pnl-mask "0 - btc_r672" --pnl-mask-band 0.02 --pnl-mask-dwell 7 --save bear.ckpt --json > bear.run.json
+```
+
+The gate (`src/regime_gate.rs`, one function for the mask, `rcsr compose` and the gate search):
+
+* The expression reads columns of the row only (any numeric column of the data, `--vars` or not). Aggregate, meta and building-block operators are refused (exit 2): an aggregate reads the whole column, future rows included. A label-family column, the target, the target's return column or a construction column exits 5 (D13a); a column that is not in the data exits 3.
+* The raw state of a row is on when the value is `> 0` (`h = 0`); with `h > 0` it is on above `+h`, off below `-h`, else the previous state. A non-finite value is off. The state starts off at the first row of a group and takes the raw state of that row at once.
+* A state change waits until the current state has held `D` rows (the entry row counts), per group, from the group's first row. The state of row `t` reads only rows `0..=t` of its group; the unit test `the_state_of_a_row_reads_only_earlier_rows` shows that a prefix of the rows gives the prefix of the states. Rows of a group must be in time order.
+
+The book under a mask:
+
+* A row with the gate off is flat: it earns nothing, pays nothing, and its score is ignored (a non-finite score there does not make the fitness `+inf`).
+* Every maximal run of on rows of a group is a book segment like a group or a time block: it starts flat (the band and the minimum hold restart there) and pays its exit at its last row. Entering at the first on row costs one side, leaving at the last on row costs one side. With the slow gate of the composition, the composite `if(gate, A, B)` pays the same costs apart from the seam identity of the plan: `net(composite) = net(A masked on) + net(B masked off) + 2 side J`, with `J` the number of rows at a gate flip that are long on both sides; the masked books pay `side (a + b)` at a flip where the composite pays `side [a != b]`.
+* For a plain threshold book the masked net equals the net of the unmasked book with the scores outside the mask replaced by a flat score (a flip to flat in the unmasked book is the exit of the masked one); `masked_book_is_the_plain_book_with_the_rows_outside_forced_flat` checks it bit for bit. With a band or a minimum hold the segments restart, so the equivalent book is the sum of the separately priced on-runs (`mask_runs_are_book_segments`, to 1e-12).
+* The hindsight bound is computed on the same segments (`masked_bound_matches_brute_force`), so the regret measures the capture of what is reachable inside the regime. A block (`--pnl-blocks`) without a profitable on row exits 2 and names the block. An all-on mask is the plain book: same flags, bounds, hash and regrets (`all_on_mask_book_is_the_plain_book`, `all_on_mask_is_the_plain_run`).
+* Sub-book cases of `--selection lexicase` are the on-runs inside each `(group, time block)`; an off row is never part of a case. `--band-units sd` reads the sd of the scores of the on rows only.
+* The mask expression, band, dwell and the number of off rows enter the book hash when a row is off; a resume with another mask exits 2 like another cost or band.
+* The validation and test books of `--objective` and `--select-rule robust` apply the same mask, computed per slice from each group's first row of the slice: every on-run is its own group and the rows outside are dropped. `objective.spec.pnl_mask` records `{expr, band, dwell}`, `objective.validation.mask` and `objective.test.mask` record `{expr, band, dwell, on_share, runs}` and `unmasked_net_pnl`, the net of the same formula without the mask, for reference. `search_fitness.mask` records `{expr, band, dwell, off_rows}` when a row is off.
+* The device book carries no mask: `--pnl-mask` with `--gpu` exits 2, and a CUDA build without `--gpu` notes that the CPU prices the book. `--position top_tercile` with a mask exits 2.
+* `rcsr walkforward --from-run` and `--front` of a masked run price the masked book on each test window (see `docs/walkforward.md`).
+
 Why the constants keep the metric fit. A fixed linear structure (`[1, tanh z24, tanh z3, vol]`, `h = 4`, stride 4, 5 bp per side) fitted five ways and priced exactly (net train / validation / test):
 
 | fit of the constants | 5 bp | 10 bp |

@@ -1720,3 +1720,337 @@ fn a_qd_book_policy_run_and_its_resume_match_exactly() {
     assert!(read(&half_cp).contains("\nqd_archive 1 cvt "), "the book checkpoint carries the archive");
     assert_eq!(read(&straight_cp), read(&resumed_cp));
 }
+
+// ---- #1180: regime-masked fitness ----
+
+use trading::BookMask;
+
+/// On in alternate `run`-row runs, counted from the first row of each group.
+fn alternate_mask(s: &TradingSlice, run: usize) -> Vec<bool> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for i in 0..s.ret.len() {
+        if i > 0 && s.rows.group[i] != s.rows.group[i - 1] {
+            at = 0;
+        }
+        out.push((at / run) % 2 == 0);
+        at += 1;
+    }
+    out
+}
+
+fn masked(s: &TradingSlice, sp: &TradingSpec, blocks: usize, on: &[bool]) -> Result<FitnessBook, String> {
+    FitnessBook::with_blocks_masked(s, sp, 900.0, blocks, 1.0, Some(BookMask { on, identity: "test-gate" }))
+}
+
+/// The maximal on-runs as `(group, start, end)` row ranges.
+fn on_runs(s: &TradingSlice, on: &[bool]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start: Option<usize> = None;
+    for i in 0..=on.len() {
+        let live = i < on.len() && on[i] && (i == 0 || s.rows.group[i] == s.rows.group[i - 1] || start.is_none());
+        let seam = i > 0 && i < on.len() && s.rows.group[i] != s.rows.group[i - 1];
+        if let Some(a) = start {
+            if !live || seam {
+                runs.push((a, i));
+                start = None;
+            }
+        }
+        if i < on.len() && on[i] && start.is_none() {
+            start = Some(i);
+        }
+    }
+    runs
+}
+
+fn sub_slice(s: &TradingSlice, a: usize, b: usize) -> TradingSlice {
+    TradingSlice {
+        rows: TradingRows { time: s.rows.time[a..b].to_vec(), group: vec![0; b - a], funding: Vec::new() },
+        ret: s.ret[a..b].to_vec(),
+    }
+}
+
+#[test]
+fn all_on_mask_book_is_the_plain_book() {
+    let s = slice(&[300, 280]);
+    let all = vec![true; s.ret.len()];
+    let pred = prediction(&s);
+    let specs = [spec(), TradingSpec { min_holding: 3, band: trading::BandSpec::score(0.1), ..spec() }];
+    for sp in &specs {
+        for blocks in [1usize, 3] {
+            let plain = FitnessBook::with_blocks(&s, sp, 900.0, blocks, 1.0).unwrap();
+            let all_on = masked(&s, sp, blocks, &all).unwrap();
+            assert!(!all_on.is_masked());
+            assert_eq!(plain.hash(), all_on.hash());
+            assert_eq!(plain.flags(), all_on.flags());
+            assert_eq!(plain.bound().to_bits(), all_on.bound().to_bits());
+            assert_eq!(plain.regret(&pred).to_bits(), all_on.regret(&pred).to_bits());
+        }
+    }
+}
+
+#[test]
+fn mask_runs_are_book_segments() {
+    let s = slice(&[400, 400]);
+    let pred = prediction(&s);
+    let on = alternate_mask(&s, 50);
+    let runs = on_runs(&s, &on);
+    assert_eq!(runs.len(), 8);
+    let specs = [spec(), TradingSpec { min_holding: 3, band: trading::BandSpec::score(0.1), ..spec() }];
+    for sp in &specs {
+        let book = masked(&s, sp, 1, &on).unwrap();
+        assert!(book.is_masked());
+        assert_eq!(book.masked_rows(), on.iter().filter(|&&o| !o).count());
+        let (mut net, mut bound, mut flips, mut exits, mut long_rows) = (0.0f64, 0.0f64, 0u64, 0u64, 0u64);
+        for &(a, b) in &runs {
+            let part = FitnessBook::new(&sub_slice(&s, a, b), sp, 900.0).unwrap();
+            let t = part.totals(&pred[a..b]);
+            net += part.net_of(&t);
+            bound += part.bound();
+            flips += t.flips;
+            exits += t.exits;
+            long_rows += t.long_rows;
+        }
+        let t = book.totals(&pred);
+        assert_eq!((t.flips, t.exits, t.long_rows), (flips, exits, long_rows));
+        let masked_net = book.net_of(&t);
+        assert!((masked_net - net).abs() <= 1e-12, "{masked_net} vs {net}");
+        assert!((book.bound() - bound).abs() <= 1e-12, "{} vs {bound}", book.bound());
+        let regret = (bound - net) / bound;
+        assert!((book.regret(&pred) - regret).abs() <= 1e-12, "{} vs {regret}", book.regret(&pred));
+    }
+}
+
+#[test]
+fn masked_book_is_the_plain_book_with_the_rows_outside_forced_flat() {
+    let s = slice(&[400, 400]);
+    let sp = spec();
+    let on = alternate_mask(&s, 50);
+    let book = masked(&s, &sp, 1, &on).unwrap();
+    let plain = FitnessBook::new(&s, &sp, 900.0).unwrap();
+    let pred = prediction(&s);
+    let forced: Vec<f64> = pred.iter().zip(&on).map(|(&p, &o)| if o { p } else { -1.0 }).collect();
+    let (m, p) = (book.totals(&pred), plain.totals(&forced));
+    assert_eq!(m.gross.to_bits(), p.gross.to_bits());
+    assert_eq!(m.flips + m.exits, p.flips + p.exits, "a seam exit replaces the flip to flat");
+    assert_eq!(book.net_of(&m).to_bits(), plain.net_of(&p).to_bits());
+    assert_eq!(m.long_rows, p.long_rows);
+}
+
+#[test]
+fn masked_bound_matches_brute_force() {
+    let s = slice(&[24, 24]);
+    let sp = spec();
+    let side = sp.per_side_bps() * 1e-4;
+    let mut on = vec![false; 48];
+    for i in (5..13).chain(18..24).chain(24..31).chain(36..44) {
+        on[i] = true;
+    }
+    let book = masked(&s, &sp, 1, &on).unwrap();
+    let runs = on_runs(&s, &on);
+    assert_eq!(runs.len(), 4);
+    let mut want = 0.0f64;
+    for &(a, b) in &runs {
+        let m = b - a;
+        let mut best = f64::NEG_INFINITY;
+        for bits in 0u32..(1 << m) {
+            let mut net = 0.0;
+            let mut prev = 0.0;
+            for k in 0..m {
+                let p = ((bits >> k) & 1) as f64;
+                net += p * s.ret[a + k] - side * (p - prev).abs();
+                prev = p;
+            }
+            net -= side * prev;
+            best = best.max(net);
+        }
+        want += best;
+    }
+    assert!((book.bound() - want).abs() <= 1e-12, "{} vs {want}", book.bound());
+}
+
+#[test]
+fn a_mask_changes_the_hash_and_refuses_what_it_cannot_price() {
+    let s = slice(&[300]);
+    let sp = spec();
+    let on = alternate_mask(&s, 50);
+    let plain = FitnessBook::new(&s, &sp, 900.0).unwrap();
+    let a = FitnessBook::with_blocks_masked(&s, &sp, 900.0, 1, 1.0, Some(BookMask { on: &on, identity: "a" })).unwrap();
+    let b = FitnessBook::with_blocks_masked(&s, &sp, 900.0, 1, 1.0, Some(BookMask { on: &on, identity: "b" })).unwrap();
+    assert_ne!(a.hash(), plain.hash());
+    assert_ne!(a.hash(), b.hash());
+    assert!(masked(&s, &sp, 1, &on[1..]).unwrap_err().contains("regime mask has"));
+    let none = vec![false; 300];
+    assert!(masked(&s, &sp, 1, &none).unwrap_err().contains("masked"));
+    let first_third: Vec<bool> = (0..300).map(|i| i < 100).collect();
+    let e = masked(&s, &sp, 3, &first_third).unwrap_err();
+    assert!(e.contains("time block 2 of 3") && e.contains("regime mask"), "{e}");
+}
+
+#[test]
+fn a_non_finite_score_outside_the_mask_is_ignored() {
+    let s = slice(&[400, 400]);
+    let sp = spec();
+    let on = alternate_mask(&s, 50);
+    let book = masked(&s, &sp, 1, &on).unwrap();
+    let pred = prediction(&s);
+    let off = on.iter().position(|&o| !o).unwrap();
+    let on_row = on.iter().position(|&o| o).unwrap();
+    let mut bad_off = pred.clone();
+    bad_off[off] = f64::NAN;
+    assert_eq!(book.regret(&bad_off).to_bits(), book.regret(&pred).to_bits());
+    let mut bad_on = pred.clone();
+    bad_on[on_row] = f64::NAN;
+    assert_eq!(book.regret(&bad_on), f64::INFINITY);
+}
+
+#[test]
+fn masked_cases_hold_on_rows_only_and_the_sd_band_reads_them() {
+    let s = slice(&[400, 400]);
+    let on = alternate_mask(&s, 50);
+    let sp = band_spec(0.5, trading::BandUnits::Sd, 1);
+    let book = masked(&s, &sp, 2, &on).unwrap();
+    let cases = book.cases();
+    assert!(!cases.kept.is_empty());
+    for &c in &cases.kept {
+        let (a, b) = cases.ranges[c];
+        assert!(on[a..b].iter().all(|&o| o), "case {c} holds an off row");
+    }
+    let pred = prediction(&s);
+    assert_eq!(book.case_errors(&pred).len(), cases.kept.len());
+    let on_scores: Vec<f64> = pred.iter().zip(&on).filter(|(_, &o)| o).map(|(&p, _)| p).collect();
+    let want = 0.5 * trading::score_sd(&on_scores).sd.unwrap();
+    assert_eq!(book.resolve_band(&pred).to_bits(), want.to_bits());
+}
+
+#[test]
+fn masked_fitness_is_thread_independent() {
+    let s = slice(&[400, 400]);
+    let on = alternate_mask(&s, 50);
+    let book = masked(&s, &spec(), 4, &on).unwrap();
+    let pred = prediction(&s);
+    let want = book.regret(&pred).to_bits();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..4).map(|_| scope.spawn(|| book.regret(&pred).to_bits())).collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap(), want);
+        }
+    });
+}
+
+/// `g` is +1 in alternate 60-row runs and -1 between them; `lbl_h24a_y` is a
+/// label-family column that no gate may read.
+fn write_gate_csv(dir: &std::path::Path) -> String {
+    let mut text = String::from("t,x1,x2,r,y,g,lbl_h24a_y\n");
+    for i in 0..N {
+        let f = i as f64;
+        let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+        let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+        let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+        let r = 0.01 * x1 + 0.0005 * noise;
+        let g = if (i / 60) % 2 == 0 { 1 } else { -1 };
+        text.push_str(&format!("{},{},{},{},{},{},{}\n", T0 + 900 * i as i64, x1, x2, r, r + 0.05 * x2, g, r));
+    }
+    let path = dir.join("gate.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn all_on_mask_is_the_plain_run() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    let plain = run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "3"]);
+    let all_on = run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "3", "--pnl-mask", "1"]);
+    let (a, b) = (json(&plain), json(&all_on));
+    assert_eq!(members(&a), members(&b));
+    assert_eq!(at(&a, &["search_fitness"]).get("book_hash"), at(&b, &["search_fitness"]).get("book_hash"));
+    assert!(at(&b, &["search_fitness"]).get("mask").is_none());
+    assert_eq!(at(&a, &["objective", "validation"]).get("net_pnl"), at(&b, &["objective", "validation"]).get("net_pnl"));
+    assert_eq!(at(&a, &["objective", "test"]).get("net_pnl"), at(&b, &["objective", "test"]).get("net_pnl"));
+    let (la, lb) = (dir.join("plain.jsonl"), dir.join("mask1.jsonl"));
+    assert_eq!(code(&run_logged(&data, &spec, &la, &["--fitness", "pnl", "--pnl-blocks", "3"])), 0);
+    assert_eq!(code(&run_logged(&data, &spec, &lb, &["--fitness", "pnl", "--pnl-blocks", "3", "--pnl-mask", "1"])), 0);
+    assert_eq!(archive_hash(&la), archive_hash(&lb));
+}
+
+#[test]
+fn mask_refuses_label_columns() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    for col in ["y", "r", "lbl_h24a_y", "x1 + lbl_h24a_y"] {
+        let o = run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", col]);
+        assert_eq!(code(&o), 5, "{col}: {}", stderr(&o));
+        assert!(stderr(&o).contains("D13") && stderr(&o).contains("--pnl-mask"), "{}", stderr(&o));
+    }
+    let ok = run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g"]);
+    assert_eq!(code(&ok), 0, "{}", stderr(&ok));
+}
+
+#[test]
+fn mask_flags_name_their_reason() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    usage_error(&run(&data, &spec, &["--pnl-mask", "g"]), "--pnl-mask needs --fitness pnl");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask-band", "0.1"]), "--pnl-mask-band needs --pnl-mask");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask-dwell", "3"]), "--pnl-mask-dwell needs --pnl-mask");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g", "--pnl-mask-band", "-1"]), "--pnl-mask-band must be");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g", "--pnl-mask-dwell", "0"]), "--pnl-mask-dwell must be");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "mean(g)"]), "aggregate");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g +"]), "--pnl-mask");
+    let missing = run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "nope"]);
+    assert_eq!(code(&missing), 3, "{}", stderr(&missing));
+    assert!(stderr(&missing).contains("mask column") && stderr(&missing).contains("nope"), "{}", stderr(&missing));
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g", "--gpu"]), "--pnl-mask with --gpu");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "0 - g", "--position", "top_tercile"]), "top_tercile");
+}
+
+#[test]
+fn a_masked_search_reports_the_mask_and_is_thread_independent() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    let args = ["--fitness", "pnl", "--pnl-mask", "g", "--pnl-mask-band", "0.5", "--pnl-mask-dwell", "5"];
+    let one = json(&run(&data, &spec, &[&args[..], &["--threads", "1"]].concat()));
+    let four = json(&run(&data, &spec, &[&args[..], &["--threads", "4"]].concat()));
+    assert_eq!(members(&one), members(&four));
+    let sf = at(&one, &["search_fitness"]);
+    assert_eq!(at(sf, &["mask", "expr"]).as_str(), Some("g"));
+    assert_eq!(num(sf, &["mask", "band"]), 0.5);
+    assert_eq!(num(sf, &["mask", "dwell"]), 5.0);
+    assert!(num(sf, &["mask", "off_rows"]) > 0.0);
+    for slot in ["validation", "test"] {
+        let b = at(&one, &["objective", slot]);
+        let share = num(b, &["mask", "on_share"]);
+        assert!(share > 0.0 && share < 1.0, "{slot} on_share {share}");
+        assert!(num(b, &["mask", "runs"]) >= 1.0);
+        assert!(at(b, &["unmasked_net_pnl"]).as_f64().is_some(), "{slot}");
+    }
+    let plain = json(&run(&data, &spec, &["--fitness", "pnl"]));
+    assert_ne!(
+        at(&one, &["search_fitness"]).get("book_hash"),
+        at(&plain, &["search_fitness"]).get("book_hash")
+    );
+}
+
+#[test]
+fn resume_needs_the_same_mask() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    let cp = dir.join("mask.rcsr").to_string_lossy().into_owned();
+    let saved = ["--fitness", "pnl", "--pnl-mask", "g", "--pnl-mask-band", "0.5", "--pnl-mask-dwell", "5"];
+    let first = run(&data, &spec, &[&saved[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let straight = json(&run(&data, &spec, &[&saved[..], &["--generations", "20"]].concat()));
+    let resumed = json(&run(&data, &spec, &[&saved[..], &["--generations", "20", "--resume", &cp]].concat()));
+    assert_eq!(members(&straight), members(&resumed));
+    let resume = |extra: &[&str]| run(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
+    usage_error(&resume(&["--pnl-mask", "0 - g", "--pnl-mask-band", "0.5", "--pnl-mask-dwell", "5"]), "fitness");
+    usage_error(&resume(&["--pnl-mask", "g", "--pnl-mask-band", "0.4", "--pnl-mask-dwell", "5"]), "fitness");
+    usage_error(&resume(&["--pnl-mask", "g", "--pnl-mask-band", "0.5", "--pnl-mask-dwell", "6"]), "fitness");
+    usage_error(&resume(&[]), "fitness");
+}

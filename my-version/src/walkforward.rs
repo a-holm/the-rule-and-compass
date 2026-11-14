@@ -129,6 +129,10 @@ pub struct ProtocolOptions {
     /// validation slice (training rows without one); `threshold_fixed` is the
     /// reference cut and the fallback.
     pub threshold_fit: Option<CutFit>,
+    /// #1180: the regime gate the run priced its book under (`--pnl-mask`),
+    /// carried like the band. Rows with the gate off drop out of the test book
+    /// and every on-run is its own book: it starts flat and pays its exit.
+    pub mask: Option<crate::regime_gate::GateSpec>,
 }
 
 /// #1094: the rule of `--threshold-fit fitness`: the cut with the lowest block
@@ -236,6 +240,7 @@ impl Default for ProtocolOptions {
             horizon_from_spec: false,
             stride_seconds: None,
             threshold_fit: None,
+            mask: None,
         }
     }
 }
@@ -834,7 +839,8 @@ fn run_table_clocked(
     opts: &ProtocolOptions,
     clock: std::time::Instant,
 ) -> Result<Report, String> {
-    let layout = resolve_layout(spec, &table.names, &table.numeric)?;
+    let mut layout = resolve_layout(spec, &table.names, &table.numeric)?;
+    add_mask_columns(&mut layout, &table.names, &table.numeric, opts)?;
     let trees = parse_expressions(spec, &layout)?;
     validate_windows(spec, opts)?;
 
@@ -842,6 +848,7 @@ fn run_table_clocked(
     let group_ids = layout.group.map(|g| table_group_ids(table, g));
     let t_pnl = std::time::Instant::now();
     let mut acc = Accum::new(spec, opts, trees.len())?;
+    acc.gate_base = layout.vars.len();
     if opts.final_read {
         acc.pass = Pass::TrainOnly;
     }
@@ -856,7 +863,7 @@ fn run_table_clocked(
             continue;
         }
         features.clear();
-        for &c in &layout.vars {
+        for &c in layout.vars.iter().chain(&layout.mask_cols) {
             features.push(table.value(r, c));
         }
         let g = group_ids.as_ref().map_or(0, |ids| ids[r]);
@@ -930,10 +937,12 @@ fn run_store_clocked(
     let numeric = fs.header().numeric();
     let mut layout = resolve_layout(spec, &names, &numeric)?;
     layout.time_i64 = fs.header().dtypes()[layout.time] == store::DType::I64;
+    add_mask_columns(&mut layout, &names, &numeric, opts)?;
     let trees = parse_expressions(spec, &layout)?;
     validate_windows(spec, opts)?;
 
     let mut acc = Accum::new(spec, opts, trees.len())?;
+    acc.gate_base = layout.vars.len();
     if opts.final_read {
         acc.pass = Pass::TrainOnly;
     }
@@ -952,6 +961,7 @@ fn run_store_clocked(
     let time_f64 = layout.time_numeric && !layout.time_i64;
     let group_f64 = layout.group.filter(|&g| numeric[g]);
     let mut needed: Vec<usize> = named.iter().map(|&p| layout.vars[p]).collect();
+    needed.extend(layout.mask_cols.iter().copied());
     needed.push(layout.target);
     if time_f64 {
         needed.push(layout.time);
@@ -961,7 +971,10 @@ fn run_store_clocked(
     let at = |index: usize| -> usize {
         projection.columns().iter().position(|c| c.index == index).expect("projected column")
     };
-    let var_at: Vec<(usize, usize)> = named.iter().map(|&p| (p, at(layout.vars[p]))).collect();
+    let mut var_at: Vec<(usize, usize)> = named.iter().map(|&p| (p, at(layout.vars[p]))).collect();
+    for (k, &c) in layout.mask_cols.iter().enumerate() {
+        var_at.push((layout.vars.len() + k, at(c)));
+    }
     let target_at = at(layout.target);
     let time_at = time_f64.then(|| at(layout.time));
     let group_at = group_f64.map(at);
@@ -973,7 +986,7 @@ fn run_store_clocked(
     };
     let mut pg = store::ProjectedGroup::new();
     // Positions no candidate names stay 0.0: `expr::eval` reads a row only at `Input` nodes.
-    let mut features = vec![0.0f64; layout.vars.len()];
+    let mut features = vec![0.0f64; layout.vars.len() + layout.mask_cols.len()];
     let time_levels = header.levels(layout.time);
     let time_of_code = |code: u32| -> f64 {
         time_levels
@@ -1071,6 +1084,25 @@ struct Layout {
     /// The store keeps the time column as `i64`; read it exactly rather than
     /// through the `f64` value block (which is absent).
     time_i64: bool,
+    /// #1180: columns of the regime gate, read after the variables in every
+    /// feature vector.
+    mask_cols: Vec<usize>,
+}
+
+/// #1180: the table columns of the gate of `opts.mask`.
+fn add_mask_columns(layout: &mut Layout, names: &[String], numeric: &[bool], opts: &ProtocolOptions) -> Result<(), String> {
+    let Some(gate) = &opts.mask else { return Ok(()) };
+    for name in &gate.columns {
+        let j = names
+            .iter()
+            .position(|n| n == name)
+            .ok_or_else(|| format!("the run's regime mask reads column '{}', which is not in the data (pass --unmasked to price the raw formula)", name))?;
+        if !numeric.get(j).copied().unwrap_or(false) {
+            return Err(format!("the run's regime mask column '{}' must be numeric", name));
+        }
+        layout.mask_cols.push(j);
+    }
+    Ok(())
 }
 
 fn resolve_layout(spec: &EvalSpec, names: &[String], numeric: &[bool]) -> Result<Layout, String> {
@@ -1125,6 +1157,7 @@ fn resolve_layout(spec: &EvalSpec, names: &[String], numeric: &[bool]) -> Result
         vars,
         var_names,
         time_i64: false,
+        mask_cols: Vec::new(),
     })
 }
 
@@ -1470,6 +1503,8 @@ struct WindowData {
     validation_rows: Vec<RowBase>,
     validation_scores: Vec<Vec<f64>>,
     test_rows: Vec<RowBase>,
+    /// #1180: the gate value of every test row (NaN without a mask).
+    test_gate: Vec<f64>,
     test_scores: Vec<Vec<f64>>,
     /// Sum and count of the finite training-interval targets (#310 constant
     /// control).
@@ -1513,6 +1548,9 @@ struct Accum {
     /// `--policy vote`: the final read scores every member on the test rows.
     vote: bool,
     threshold_fit: Option<CutFit>,
+    /// #1180: the regime gate and the feature index of its first column.
+    gate: Option<crate::regime_gate::GateSpec>,
+    gate_base: usize,
 }
 
 impl Accum {
@@ -1558,6 +1596,7 @@ impl Accum {
                 validation_rows: Vec::new(),
                 validation_scores: vec![Vec::new(); candidates],
                 test_rows: Vec::new(),
+                test_gate: Vec::new(),
                 test_scores: vec![Vec::new(); candidates],
                 train_target_sum: 0.0,
                 train_target_n: 0,
@@ -1580,6 +1619,8 @@ impl Accum {
             test_candidates: Vec::new(),
             vote: spec.policy == Policy::Vote,
             threshold_fit: opts.threshold_fit,
+            gate: opts.mask.clone(),
+            gate_base: 0,
         })
     }
 
@@ -1604,26 +1645,33 @@ impl Accum {
 
     fn add(&mut self, t: f64, group: u64, features: &[f64], target: f64, trees: &[Node]) {
         debug_assert_eq!(trees.len(), self.candidates);
+        let gate = match &self.gate {
+            Some(g) => {
+                let row: Vec<f64> = (0..g.columns.len()).map(|k| features[self.gate_base + k]).collect();
+                expr::eval(&g.tree, &row)
+            }
+            None => f64::NAN,
+        };
         match self.pass {
             Pass::All | Pass::TrainOnly => {
                 for (s, tree) in self.scores.iter_mut().zip(trees) {
                     *s = expr::eval(tree, features);
                 }
-                push_scores(&mut self.windows, t, group, target, &self.scores, self.pass == Pass::All);
+                push_scores(&mut self.windows, t, group, (target, gate), &self.scores, self.pass == Pass::All);
             }
             Pass::TestOnly => {
                 if self.vote {
                     for (s, tree) in self.scores.iter_mut().zip(trees) {
                         *s = expr::eval(tree, features);
                     }
-                    push_all_test(&mut self.windows, t, group, target, &self.scores);
+                    push_all_test(&mut self.windows, t, group, (target, gate), &self.scores);
                     return;
                 }
                 for &c in &self.test_candidates {
                     self.scores[c] = expr::eval(&trees[c], features);
                 }
                 let forced = self.forced.as_deref().expect("the test pass follows the selection");
-                push_selected_test(&mut self.windows, forced, t, group, target, &self.scores);
+                push_selected_test(&mut self.windows, forced, t, group, (target, gate), &self.scores);
             }
         }
     }
@@ -1707,6 +1755,9 @@ impl Accum {
         let mut batch_in: Vec<crate::wf_batch::WindowScores> = Vec::new();
         let forced = self.forced.as_deref();
         for (window_index, mut d) in self.windows.into_iter().enumerate() {
+            if let Some(_gate) = &opts.mask {
+                let _ = window_index; // WIP red run: the walk-forward mask is ignored
+            }
             {
                 let labelled = d.test_rows.iter().filter(|r| r.target.is_finite());
                 let book = crate::trading::TradingRows {
@@ -1836,7 +1887,7 @@ impl Accum {
                     false,
                 )
             };
-            if !spec.pool_reset_flat {
+            if !spec.pool_reset_flat && opts.mask.is_none() {
                 if let Some(prev_end) = &previous_end {
                     for (group, &q_start) in &ev.first_positions {
                         let p_end = prev_end.get(group).copied().unwrap_or(0.0);
@@ -2193,6 +2244,33 @@ impl Accum {
     }
 }
 
+/// #1180: price the test rows of a window under the regime gate. The gate
+/// state is read over the labelled rows in file order, per group from the
+/// group's first row of the window, exactly as the search read its test slice.
+/// Every on-run becomes its own group (a flat start and a paid exit, unique
+/// across windows, so no position carries over a seam) and the target of every
+/// off row becomes NaN, which drops the row from the book.
+fn apply_mask(d: &mut WindowData, gate: &crate::regime_gate::GateSpec, window_index: usize) {
+    let n = d.test_rows.len();
+    let labelled: Vec<usize> = (0..n).filter(|&i| d.test_rows[i].target.is_finite()).collect();
+    let values: Vec<f64> = labelled.iter().map(|&i| d.test_gate[i]).collect();
+    let groups: Vec<u64> = labelled.iter().map(|&i| d.test_rows[i].group).collect();
+    let on_labelled = crate::regime_gate::hysteresis_states(&values, &groups, gate.band, gate.dwell);
+    let mut on = vec![false; n];
+    for (k, &i) in labelled.iter().enumerate() {
+        on[i] = on_labelled[k];
+    }
+    let all_groups: Vec<u64> = d.test_rows.iter().map(|r| r.group).collect();
+    let ids = crate::regime_gate::run_ids(&all_groups, &on);
+    let base = (window_index as u64 + 1) << 40;
+    for i in 0..n {
+        d.test_rows[i].group = base + ids[i];
+        if !on[i] {
+            d.test_rows[i].target = f64::NAN;
+        }
+    }
+}
+
 /// #925: the band of candidate `c` in window `d`: `multiple` in score units, or
 /// `multiple` times the sd of the candidate's finite training scores (rows
 /// before the validation start, never validation or test rows).
@@ -2212,7 +2290,7 @@ fn push_scores(
     windows: &mut [WindowData],
     t: f64,
     group: u64,
-    target: f64,
+    (target, gate): (f64, f64),
     scores: &[f64],
     with_test: bool,
 ) {
@@ -2261,6 +2339,7 @@ fn push_scores(
                 group,
                 target,
             });
+            d.test_gate.push(gate);
             let bad = !target.is_finite() || scores.iter().any(|s| !s.is_finite());
             for (dst, &score) in d.test_scores.iter_mut().zip(scores) {
                 dst.push(score);
@@ -2273,10 +2352,11 @@ fn push_scores(
 }
 
 /// Final read of a vote book: a test row with the score of every member.
-fn push_all_test(windows: &mut [WindowData], t: f64, group: u64, target: f64, scores: &[f64]) {
+fn push_all_test(windows: &mut [WindowData], t: f64, group: u64, (target, gate): (f64, f64), scores: &[f64]) {
     for d in windows {
         if t >= d.window.test_start && t < d.window.test_end {
             d.test_rows.push(RowBase { time: t, group, target });
+            d.test_gate.push(gate);
             for (dst, &score) in d.test_scores.iter_mut().zip(scores) {
                 dst.push(score);
             }
@@ -2295,12 +2375,13 @@ fn push_selected_test(
     chosen: &[usize],
     t: f64,
     group: u64,
-    target: f64,
+    (target, gate): (f64, f64),
     scores: &[f64],
 ) {
     for (d, &c) in windows.iter_mut().zip(chosen) {
         if t >= d.window.test_start && t < d.window.test_end {
             d.test_rows.push(RowBase { time: t, group, target });
+            d.test_gate.push(gate);
             d.test_scores[c].push(scores[c]);
             if !target.is_finite() || !scores[c].is_finite() {
                 d.dropped += 1;
