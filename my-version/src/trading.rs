@@ -384,6 +384,11 @@ pub struct TradingSpec {
     /// Period width: the label horizon, equal to the label stride. Rows with the
     /// same `floor(t / period_seconds)` form one equal-weight period.
     pub period_seconds: Option<f64>,
+    /// #1189: starts of the book segments. A row stamped from `segment_starts[k]`
+    /// up to the next start belongs to segment `k`; every segment starts every
+    /// group flat, resets the band and minimum-hold state and pays its own final
+    /// exit. Empty is one book over all rows.
+    pub segment_starts: Vec<f64>,
 }
 
 impl Default for TradingSpec {
@@ -404,6 +409,7 @@ impl Default for TradingSpec {
             position: PositionMap::Threshold,
             periods_per_year: None,
             period_seconds: None,
+            segment_starts: Vec::new(),
         }
     }
 }
@@ -686,6 +692,8 @@ struct Ctx {
     /// Row indices in `(time, group)` order.
     time_order: Vec<usize>,
     groups: usize,
+    /// Book segment of every row (`0` without segment starts).
+    segment: Vec<usize>,
 }
 
 impl Ctx {
@@ -695,6 +703,7 @@ impl Ctx {
         rows: &TradingRows,
         cash: f64,
         bucket: f64,
+        segment_starts: &[f64],
     ) -> Ctx {
         let time: Vec<f64> = keep.iter().map(|&i| rows.time[i]).collect();
         let group: Vec<u64> = keep.iter().map(|&i| rows.group[i]).collect();
@@ -719,6 +728,7 @@ impl Ctx {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| group[a].cmp(&group[b]))
         });
+        let segment: Vec<usize> = time.iter().map(|&t| segment_of(segment_starts, t)).collect();
         let mut groups = 0usize;
         let mut prev: Option<u64> = None;
         for &i in &order {
@@ -737,6 +747,7 @@ impl Ctx {
             order,
             time_order,
             groups,
+            segment,
         }
     }
 }
@@ -750,6 +761,11 @@ struct Book {
     abs_delta_with_exit: f64,
 }
 
+/// Index of the book segment that holds stamp `t`.
+fn segment_of(starts: &[f64], t: f64) -> usize {
+    starts.partition_point(|s| *s <= t)
+}
+
 fn run_book(ctx: &Ctx, positions: &[f64], cost_side: f64) -> Book {
     let n = ctx.ret.len();
     let mut gross = vec![0.0f64; n];
@@ -758,12 +774,12 @@ fn run_book(ctx: &Ctx, positions: &[f64], cost_side: f64) -> Book {
         rows: n,
         ..Default::default()
     };
-    let mut previous: BTreeMap<u64, f64> = BTreeMap::new();
+    let mut previous: BTreeMap<(u64, usize), f64> = BTreeMap::new();
     let mut funding_paid = 0.0f64;
     let mut abs_delta_with_exit = 0.0f64;
-    let mut last_of_group: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut last_of_group: BTreeMap<(u64, usize), usize> = BTreeMap::new();
     for &i in &ctx.order {
-        let g = ctx.group[i];
+        let g = (ctx.group[i], ctx.segment[i]);
         let pos = positions[i];
         let r = ctx.ret[i];
         let prev = previous.get(&g).copied().unwrap_or(0.0);
@@ -1116,7 +1132,7 @@ pub fn evaluate(
     let keep: Vec<usize> = (0..pred.len())
         .filter(|&i| pred[i].is_finite() && usable(i, r, rows))
         .collect();
-    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0));
+    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0), &spec.segment_starts);
     let positions = positions_of(pred, rows, &keep, &ctx, spec);
     finish(&ctx, &positions, spec)
 }
@@ -1136,11 +1152,12 @@ fn positions_of(pred: &[f64], rows: &TradingRows, keep: &[usize], ctx: &Ctx, spe
             min_hold: spec.min_holding,
         };
         let mut positions = vec![0.0f64; keep.len()];
-        let mut current: Option<u64> = None;
+        let mut current: Option<(u64, usize)> = None;
         let mut state = trading_gpu::BandState::default();
         for &i in &ctx.order {
-            if current != Some(ctx.group[i]) {
-                current = Some(ctx.group[i]);
+            let key = (ctx.group[i], ctx.segment[i]);
+            if current != Some(key) {
+                current = Some(key);
                 state = trading_gpu::BandState::default();
             }
             state = params.next(state, scores[i]);
@@ -1191,7 +1208,8 @@ pub fn blocked_alpha(
 
 /// #1173: [`blocked_alpha`] with one block per cut: a row stamped from `cuts[k]` up
 /// to the next cut is in block `k` (`--select-blocks intervals` passes the
-/// validation interval starts).
+/// validation interval starts). Each block is its own
+/// book: it starts every group flat, resets the band state and pays its final exit.
 pub fn blocked_alpha_cuts(pred: &[f64], r: &[f64], rows: &TradingRows, spec: &TradingSpec, cuts: &[f64]) -> Result<BlockedAlpha, String> {
     if cuts.is_empty() || cuts.len() > FITNESS_MAX_BLOCKS {
         return Err(format!("the block count must be 1 to {}, got {}", FITNESS_MAX_BLOCKS, cuts.len()));
@@ -1208,6 +1226,15 @@ fn blocked_alpha_with(
     cuts: Option<&[f64]>,
 ) -> Result<BlockedAlpha, String> {
     spec.validate()?;
+    // #1189: block k is its own book, started flat and closed at its end.
+    let cut_spec;
+    let spec = match cuts {
+        Some(c) => {
+            cut_spec = TradingSpec { segment_starts: c.to_vec(), ..spec.clone() };
+            &cut_spec
+        }
+        None => spec,
+    };
     check_lengths(pred.len(), r, rows)?;
     let keep: Vec<usize> = (0..pred.len())
         .filter(|&i| pred[i].is_finite() && usable(i, r, rows))
@@ -1215,7 +1242,7 @@ fn blocked_alpha_with(
     if keep.is_empty() {
         return Err("no usable rows (every prediction or return is non-finite)".to_string());
     }
-    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0));
+    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0), &spec.segment_starts);
     let positions = positions_of(pred, rows, &keep, &ctx, spec);
     let n = ctx.ret.len();
     let cost_side = spec.per_side_bps() * BP;
@@ -1294,7 +1321,7 @@ pub fn evaluate_positions(
     spec.validate()?;
     check_lengths(positions.len(), r, rows)?;
     let keep: Vec<usize> = (0..positions.len()).filter(|&i| usable(i, r, rows)).collect();
-    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0));
+    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0), &spec.segment_starts);
     let kept: Vec<f64> = keep.iter().map(|&i| positions[i]).collect();
     finish(&ctx, &kept, spec)
 }
@@ -3139,6 +3166,47 @@ mod band_tests {
             let explicit = evaluate_positions(&pos, &r, &rows, &spec).unwrap();
             assert_eq!(book.net_pnl.to_bits(), explicit.net_pnl.to_bits(), "band {band} hold {hold}");
             assert_eq!(book.trades, explicit.trades);
+        }
+    }
+
+    /// #1189: the band and minimum-hold automaton restarts at every segment start.
+    #[test]
+    fn band_state_resets_at_interval_start() {
+        let first: Vec<usize> = (300..360).collect();
+        let second: Vec<usize> = (900..960).collect();
+        let positions = |hours: &[usize], seed: usize, starts: &[f64]| -> Vec<f64> {
+            let mut rows = TradingRows::default();
+            let mut pred = Vec::new();
+            for g in 0..2usize {
+                for &h in hours {
+                    rows.group.push(g as u64);
+                    rows.time.push(h as f64 * 3600.0);
+                    // Inside the band at the seams: a carried automaton stays long.
+                    pred.push(match h {
+                        358 | 359 => 0.5,
+                        900 | 901 => 0.05,
+                        _ => ((h + seed + g) % 4) as f64 * 0.2 - 0.3,
+                    });
+                }
+            }
+            let r = vec![0.001; pred.len()];
+            let spec = TradingSpec { band: BandSpec::score(0.1), min_holding: 3, segment_starts: starts.to_vec(), ..TradingSpec::default() };
+            let keep: Vec<usize> = (0..pred.len()).collect();
+            let ctx = Ctx::new(&keep, &r, &rows, 0.0, 0.0, &spec.segment_starts);
+            positions_of(&pred, &rows, &keep, &ctx, &spec)
+        };
+        let all: Vec<usize> = first.iter().chain(&second).copied().collect();
+        let starts = [300.0 * 3600.0, 900.0 * 3600.0];
+        for seed in 0..4 {
+            let joint = positions(&all, seed, &starts);
+            let (a, b) = (positions(&first, seed, &[]), positions(&second, seed, &[]));
+            let mut want = Vec::new();
+            for g in 0..2 {
+                want.extend_from_slice(&a[g * first.len()..(g + 1) * first.len()]);
+                want.extend_from_slice(&b[g * second.len()..(g + 1) * second.len()]);
+            }
+            assert_eq!(joint, want, "seed {seed}");
+            assert_ne!(positions(&all, seed, &[]), want, "seed {seed}: a carried automaton differs at the seam");
         }
     }
 }

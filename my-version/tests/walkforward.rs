@@ -2102,3 +2102,30 @@ mod fitted_cut {
 
     const PINNED_DEFAULT_REPORTS: &str = "3a81f04a52205a0997503d097eebeba7f0bb7b84977931e29656c206f8256589";
 }
+
+#[test]
+fn flat_gaps_reset_the_pooled_path_only_at_gaps() {
+    let rows: Vec<(f64, f64, f64)> = (0..11).map(|k| (k as f64, k as f64, if k >= 4 { 0.01 } else { 0.0 })).collect();
+    let t = single(&rows);
+    let mut s = spec(
+        "x",
+        vec![
+            window("a", 0.0, 4.0, 4.0, 6.0),
+            window("b", 0.0, 4.0, 6.0, 8.0),
+            window("c", 0.0, 4.0, 9.0, 11.0),
+        ],
+    );
+    s.threshold_quantile = 0.0;
+    let run = |s: &EvalSpec, flat_gaps: bool| {
+        let opts = walkforward::ProtocolOptions { flat_gaps, ..walkforward::ProtocolOptions::default() };
+        walkforward::run_table_with(&t, s, "test", &opts).unwrap()
+    };
+    let carried = run(&s, false);
+    assert_eq!(carried.pooled.trades, 1, "one entry for the whole pooled path");
+    let gaps = run(&s, true);
+    assert_eq!(gaps.pooled.trades, 2, "windows a and b touch and share the book; c starts flat");
+    assert_eq!(gaps.seam_trades, 0);
+    assert!(!gaps.pool_reset_flat);
+    s.pool_reset_flat = true;
+    assert_eq!(run(&s, true).pooled.trades, 3, "every window is a book");
+}

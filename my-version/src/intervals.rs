@@ -273,15 +273,19 @@ impl IntervalSplit {
     /// Starts of the maximal contiguous training intervals (touching table
     /// intervals merge): every one starts a book segment under `--fitness pnl`.
     pub fn segment_starts(&self) -> Vec<f64> {
-        let mut out: Vec<f64> = Vec::new();
-        let mut last_end: Option<i64> = None;
-        for &(a, b) in &self.declared.train {
-            if last_end != Some(a) {
-                out.push(a as f64);
-            }
-            last_end = Some(b);
-        }
-        out
+        merged_starts(&self.declared.train)
+    }
+
+    /// #1189: starts of the maximal contiguous validation intervals: every one
+    /// starts the validation book flat.
+    pub fn validation_segment_starts(&self) -> Vec<f64> {
+        merged_starts(&self.declared.validation)
+    }
+
+    /// #1189: starts of the maximal contiguous test intervals: every one starts
+    /// the test book flat.
+    pub fn test_segment_starts(&self) -> Vec<f64> {
+        merged_starts(&self.declared.test)
     }
 
     /// Validation interval starts, the cuts of `--select-blocks intervals`.
@@ -314,7 +318,7 @@ impl IntervalSplit {
         format!(
             ",\"split_id\":{},\"split_table_sha256\":{},\"intervals\":{{\"train\":{},\"validation\":{},\"test\":{}}},\
              \"effective_intervals\":{{\"train\":{},\"validation\":{}}},\"interval_purge_seconds\":{},\"embargo_seconds\":{},\
-             \"embargo_source\":{},\"embargo_column\":{}",
+             \"embargo_source\":{},\"embargo_column\":{},\"book_segments\":{{\"validation\":{},\"test\":{}}}",
             jstr(&d.split_id),
             jstr(table_sha256),
             list(&d.train),
@@ -325,7 +329,9 @@ impl IntervalSplit {
             self.purge,
             self.embargo,
             jstr(self.embargo_source.as_str()),
-            self.embargo_column.as_deref().map_or("null".to_string(), jstr)
+            self.embargo_column.as_deref().map_or("null".to_string(), jstr),
+            self.validation_segment_starts().len(),
+            self.test_segment_starts().len()
         )
     }
 
@@ -340,6 +346,18 @@ impl IntervalSplit {
         }
         crate::manifest::sha256_hex(text.as_bytes())
     }
+}
+
+fn merged_starts(intervals: &[(i64, i64)]) -> Vec<f64> {
+    let mut out: Vec<f64> = Vec::new();
+    let mut last_end: Option<i64> = None;
+    for &(a, b) in intervals {
+        if last_end != Some(a) {
+            out.push(a as f64);
+        }
+        last_end = Some(b);
+    }
+    out
 }
 
 /// Out-of-sample test of a scoring window `[start, end)` against the kept
