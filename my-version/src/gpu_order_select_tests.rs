@@ -83,7 +83,7 @@ fn evaluator(f: &Fixture) -> Option<GpuEvaluator> {
 }
 
 fn plan(t: &Node) -> GpuFitPlan {
-    gpu_fit_plan_reason(t).expect("an eligible plan")
+    gpu_fit_plan_reason(t, false).expect("an eligible plan")
 }
 
 /// `c0·x0 + c1`: arithmetic only, so the device's f64 forward sweep and

@@ -1918,12 +1918,7 @@ impl GpuSearch {
                 pending
                     .iter()
                     .copied()
-                    .filter(|&(i, j)| {
-                        matches!(
-                            crate::fit::gpu_fit_plan_reason(&islands[i][j].tree),
-                            Err(crate::fit::GpuFitReject::NoConstants)
-                        )
-                    })
+                    .filter(|&(i, j)| crate::fit::has_no_fit_constants(&islands[i][j].tree))
                     .collect()
             } else {
                 pending.clone()
@@ -2200,7 +2195,7 @@ impl GpuSearch {
                 on_cpu.push((i, j));
                 continue;
             }
-            match crate::fit::gpu_fit_plan_reason(&islands[i][j].tree) {
+            match crate::fit::gpu_fit_plan_reason(&islands[i][j].tree, cfg.fit_thresholds) {
                 Ok(plan) => {
                     plans.push(plan);
                     slots.push((i, j));
@@ -3693,7 +3688,7 @@ fn score_pipeline_batch(
     // call is big enough to fill the GPU (`FIT_BATCH_MIN`).
     for (k, mut job) in jobs.into_iter().enumerate() {
         route.fold(&mut job.2);
-        match crate::fit::gpu_fit_plan_reason(&job.2) {
+        match crate::fit::gpu_fit_plan_reason(&job.2, route.settings().thresholds) {
             Err(crate::fit::GpuFitReject::NoConstants) => {}
             plan => pending.push(job, offered_hash[k], plan),
         }
@@ -4833,17 +4828,16 @@ fn fit_constants_with_iters(
         }
         // #116 + #117: strategy and metric together.
         let sse = crate::fit::with_fit_irls(cfg.fit_irls, || {
-            crate::fit::with_fit_thresholds(cfg.fit_thresholds, || {
-                crate::fit::fit_weighted_strategy_metric(
-                    tree,
-                    &fit.x,
-                    &fit.y,
-                    &fit.w,
-                    iters,
-                    cfg.fit_strategy,
-                    cfg.metric,
-                )
-            })
+            crate::fit::fit_weighted_strategy_metric(
+                tree,
+                &fit.x,
+                &fit.y,
+                &fit.w,
+                iters,
+                cfg.fit_strategy,
+                cfg.metric,
+                cfg.fit_thresholds,
+            )
         });
         Some(FitResult {
             sse,
@@ -5528,12 +5522,7 @@ fn select_promoted(
             // #169: a candidate with no constants has nothing to fit. Keep its
             // screening score and do not spend an admission slot or bill a
             // meaningless CPU fallback for it.
-            .filter(|&(j, _, _)| {
-                !matches!(
-                    crate::fit::gpu_fit_plan_reason(&pop[j].tree),
-                    Err(crate::fit::GpuFitReject::NoConstants)
-                )
-            })
+            .filter(|&(j, _, _)| !crate::fit::has_no_fit_constants(&pop[j].tree))
             .collect();
         ranked.sort_by(|a, b| {
             crate::error_order::cmp_error(a.1, b.1)
@@ -8345,20 +8334,6 @@ fn run_search(
     resume: Option<Checkpoint>,
     save_every: usize,
     seeds: &[Node],
-    on_checkpoint: Option<CheckpointFn<'_>>,
-) -> Result<Outcome, String> {
-    crate::fit::with_fit_thresholds(cfg.fit_thresholds, || {
-        run_search_scoped(cfg, train, test, resume, save_every, seeds, on_checkpoint)
-    })
-}
-
-fn run_search_scoped(
-    cfg: &Config,
-    train: &Sample,
-    test: &Sample,
-    resume: Option<Checkpoint>,
-    save_every: usize,
-    seeds: &[Node],
     mut on_checkpoint: Option<CheckpointFn<'_>>,
 ) -> Result<Outcome, String> {
     if let Some(book) = cfg.fitness.book() {
@@ -10127,7 +10102,7 @@ mod tests {
                     Op::Add,
                     vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.5)],
                 );
-                (0, k, crate::fit::gpu_fit_plan_reason(&tree).expect("an eligible plan"))
+                (0, k, crate::fit::gpu_fit_plan_reason(&tree, false).expect("an eligible plan"))
             })
             .collect()
     }
@@ -11204,13 +11179,13 @@ mod tests {
         assert_eq!(crate::fit::GPU_FIT_MAX_CONSTANTS, 20);
         for p in 17..=20usize {
             assert!(
-                crate::fit::gpu_fit_plan_reason(&many_constants(p)).is_ok(),
+                crate::fit::gpu_fit_plan_reason(&many_constants(p), false).is_ok(),
                 "p={} must be fitted on the device, not silently fallen back",
                 p
             );
         }
         for p in 21..=22usize {
-            let reason = match crate::fit::gpu_fit_plan_reason(&many_constants(p)) {
+            let reason = match crate::fit::gpu_fit_plan_reason(&many_constants(p), false) {
                 Err(reason) => reason,
                 Ok(_) => panic!("p={} has no kernel instantiation", p),
             };

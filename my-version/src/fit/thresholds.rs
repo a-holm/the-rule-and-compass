@@ -10,7 +10,6 @@
 use super::{metric_score_cols, FitCols};
 use crate::expr::{Node, Op};
 use crate::metrics::Metric;
-use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Threshold constants fitted per tree; the rest keep their value.
@@ -24,31 +23,7 @@ const Q: usize = 64;
 /// Rounds of threshold search followed by a refit of the other constants.
 const ROUNDS: usize = 2;
 
-thread_local! {
-    static ENABLED: Cell<bool> = const { Cell::new(false) };
-}
-
 static MOVES: AtomicU64 = AtomicU64::new(0);
-
-/// Restores the previous switch on exit and on unwind.
-struct Restore(bool);
-
-impl Drop for Restore {
-    fn drop(&mut self) {
-        ENABLED.with(|e| e.set(self.0));
-    }
-}
-
-/// Run `f` with the threshold fit switched `on` or off for this thread.
-pub fn with_fit_thresholds<R>(on: bool, f: impl FnOnce() -> R) -> R {
-    let _restore = Restore(ENABLED.with(|e| e.replace(on)));
-    f()
-}
-
-/// Whether this thread fits thresholds.
-pub(crate) fn enabled() -> bool {
-    ENABLED.with(Cell::get)
-}
 
 /// Thresholds moved since process start.
 pub fn threshold_moves() -> u64 {
@@ -387,9 +362,7 @@ mod tests {
     }
 
     fn fit(t: &mut Node, x: &[Vec<f64>], y: &[f64], on: bool) -> f64 {
-        with_fit_thresholds(on, || {
-            fit_weighted_strategy_metric(t, x, y, &[], 8, FitStrategy::Exact, Metric::Squared)
-        })
+        fit_weighted_strategy_metric(t, x, y, &[], 8, FitStrategy::Exact, Metric::Squared, on)
     }
 
     fn sse(t: &Node, x: &[Vec<f64>], y: &[f64]) -> f64 {
@@ -483,12 +456,23 @@ mod tests {
     #[test]
     fn threshold_constants_are_routed_to_the_cpu_arm_under_the_flag() {
         let t = tree("greater(x0, 0.25) * x1 + 0.5");
-        assert!(gpu_fit_plan_reason(&t).is_ok());
-        let reason = with_fit_thresholds(true, || gpu_fit_plan_reason(&t).err());
+        assert!(gpu_fit_plan_reason(&t, false).is_ok());
+        let reason = gpu_fit_plan_reason(&t, true).err();
         assert_eq!(reason, Some(GpuFitReject::ThresholdConstant));
         assert_eq!(GpuFitReject::ThresholdConstant.label(), "threshold_constant");
         let plain = tree("x0 * 0.25 + 0.5");
-        assert!(with_fit_thresholds(true, || gpu_fit_plan_reason(&plain)).is_ok());
+        assert!(gpu_fit_plan_reason(&plain, true).is_ok());
+    }
+
+    #[test]
+    fn threshold_plan_reject_needs_no_scope() {
+        let t = tree("greater(x0, 0.25) * x1 + 0.5");
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                assert_eq!(gpu_fit_plan_reason(&t, true).err(), Some(GpuFitReject::ThresholdConstant));
+                assert!(gpu_fit_plan_reason(&t, false).is_ok());
+            });
+        });
     }
 
     #[test]
@@ -503,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn threshold_fit_is_deterministic_and_scoped() {
+    fn threshold_fit_is_deterministic() {
         let x: Vec<Vec<f64>> = (0..60).map(|i| vec![i as f64 / 60.0, 1.0]).collect();
         let y: Vec<f64> = x.iter().map(|r| if r[0] > 0.7 { 2.0 } else { 0.0 }).collect();
         let run = || {
@@ -512,8 +496,5 @@ mod tests {
             (t, v.to_bits())
         };
         assert_eq!(run(), run());
-        assert!(!enabled());
-        let _ = std::panic::catch_unwind(|| with_fit_thresholds(true, || panic!("inside")));
-        assert!(!enabled());
     }
 }
