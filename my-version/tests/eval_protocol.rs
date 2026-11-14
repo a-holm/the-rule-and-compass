@@ -649,3 +649,93 @@ fn wf_markdown_psr_row() {
     let md = walkforward::run_table_with(&t, &s, "t", &o).unwrap().markdown();
     assert!(md.contains("(source flag)") && !md.contains("rcsr trials."), "{md}");
 }
+
+fn null_input<'a>(
+    book: &'a rcsr::wf_protocol::NullBook,
+    observed: &'a [f64],
+    null_draws: usize,
+    control_seed: u64,
+) -> rcsr::wf_protocol::InferenceInput<'a> {
+    rcsr::wf_protocol::InferenceInput {
+        draws: 0,
+        null_draws,
+        block_len: 5,
+        seed: 11,
+        control_seed,
+        periods_per_year: 365.0,
+        pooled: observed,
+        fresh: observed,
+        candidates: &[],
+        trials: 1,
+        trials_source: "flag",
+        pbo_blocks: 4,
+        fdr_q: 0.1,
+        best_baseline: "cash",
+        baseline_series: &[],
+        buy_and_hold: &[],
+        books: std::slice::from_ref(book),
+    }
+}
+
+fn nulls_of(book: &rcsr::wf_protocol::NullBook, null_draws: usize, control_seed: u64) -> rcsr::wf_protocol::NullTests {
+    let observed = period_means(book, &book.positions);
+    rcsr::wf_protocol::infer(&null_input(book, &observed, null_draws, control_seed)).unwrap().nulls.unwrap()
+}
+
+fn bits4(r: &rcsr::wf_protocol::NullRow) -> [u64; 4] {
+    [r.p_mean.to_bits(), r.p_sharpe.to_bits(), r.null_mean_q95.to_bits(), r.null_sharpe_q95.to_bits()]
+}
+
+/// One window of 39 periods with block 5 has lo = 5 and 30 distinct shifts.
+#[test]
+fn matched_null_enumerates_all_shifts_when_few() {
+    let book = synchronised_book(3, 39, 21);
+    let observed = period_means(&book, &book.positions);
+    let obs_mean = observed.iter().sum::<f64>() / observed.len() as f64;
+    let mut count = 0usize;
+    for shift in 5..=34u64 {
+        let pos = rcsr::baselines::shifted_positions(&book.positions, &book.groups, shift, 39).unwrap();
+        let m = period_means(&book, &pos);
+        if m.iter().sum::<f64>() / m.len() as f64 >= obs_mean {
+            count += 1;
+        }
+    }
+    let expected = (1.0 + count as f64) / 31.0;
+    for draws in [30usize, 31, 200] {
+        let n = nulls_of(&book, draws, 5);
+        assert_eq!(n.matched_distinct_shifts, 30);
+        assert!((n.matched_exposure_random.p_mean - expected).abs() < 1e-12, "B {draws}: {} vs {expected}", n.matched_exposure_random.p_mean);
+        assert!(n.matched_exposure_random.p_sharpe.is_finite());
+    }
+    let a = nulls_of(&book, 30, 5);
+    let b = nulls_of(&book, 30, 6);
+    assert_eq!(bits4(&a.matched_exposure_random), bits4(&b.matched_exposure_random), "no RNG draw in the exact branch");
+    assert_eq!(bits4(&a.block_permutation), BLOCK_PERM_B30);
+}
+
+#[test]
+fn matched_null_p_never_below_exact_floor() {
+    let floor = 1.0 / 31.0;
+    for k in 0..40u64 {
+        let book = synchronised_book(3, 39, 100 + k as u32);
+        let n = nulls_of(&book, 999, 900 + k);
+        assert_eq!(n.matched_distinct_shifts, 30);
+        let r = &n.matched_exposure_random;
+        assert!(r.p_mean >= floor - 1e-12, "seed {k}: p_mean {}", r.p_mean);
+        assert!(r.p_sharpe >= floor - 1e-12, "seed {k}: p_sharpe {}", r.p_sharpe);
+    }
+}
+
+/// D = 30 > B = 20: the sampling branch keeps its pre-change output.
+#[test]
+fn matched_null_sampling_branch_is_pinned() {
+    let book = synchronised_book(3, 39, 21);
+    let n = nulls_of(&book, 20, 5);
+    assert_eq!(n.matched_distinct_shifts, 30);
+    assert_eq!(bits4(&n.matched_exposure_random), SAMPLING_PIN);
+    assert_eq!(bits4(&n.block_permutation), BLOCK_PERM_B20);
+}
+
+const BLOCK_PERM_B30: [u64; 4] = [4602388264357977848, 4602388264357977848, 4548745437637662912, 4585961248428280373];
+const BLOCK_PERM_B20: [u64; 4] = [4602249904922421150, 4602249904922421150, 4530201858545230306, 4568205707870370421];
+const SAMPLING_PIN: [u64; 4] = [4598818590920615058, 4597746305295050654, 4547137172224071350, 4585103290288551041];

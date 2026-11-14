@@ -435,6 +435,31 @@ fn shift_range(periods: usize, block: usize) -> (u64, u64) {
 /// Fewer distinct shifts than this cannot give a p-value below 0.05.
 const MIN_DISTINCT_SHIFTS: u64 = 20;
 
+/// Mean and Sharpe of the shifted long/flat book pooled over windows, with `shift_of` giving the
+/// shift of each window.
+fn shifted_stats(
+    i: &InferenceInput,
+    dense_books: &[Dense],
+    shift_of: &dyn Fn(usize, u64, u64) -> u64,
+) -> Result<(f64, f64), String> {
+    let mut r_stat = Stat::new();
+    for (w, (book, d)) in i.books.iter().zip(dense_books).enumerate() {
+        let periods = d.periods;
+        let (lo, count) = shift_range(periods, i.block_len.max(1));
+        let shift = shift_of(w, lo, count);
+        let pos = baselines::shifted_positions(&book.positions, &book.groups, shift, periods as u64)?;
+        let net = baselines::net_rows(&pos, &book.returns, &book.groups, book.side);
+        let mut bins = vec![0.0f64; periods];
+        for (row, &v) in net.iter().enumerate() {
+            bins[book.period[row] as usize] += v;
+        }
+        for k in 0..periods {
+            r_stat.push(bins[k] / book.period_count[k] as f64);
+        }
+    }
+    Ok((r_stat.mean(), r_stat.sharpe()))
+}
+
 fn run_nulls(i: &InferenceInput) -> Result<NullTests, String> {
     if i.books.is_empty() {
         return Err("nulls need the window books".to_string());
@@ -449,12 +474,15 @@ fn run_nulls(i: &InferenceInput) -> Result<NullTests, String> {
     let mut perm_rng = Mt::new(i.seed.wrapping_add(7919));
     let mut perm_mean = Vec::with_capacity(i.null_draws);
     let mut perm_sharpe = Vec::with_capacity(i.null_draws);
+    let exact = dense_books
+        .iter()
+        .try_fold(1u64, |acc, d| acc.checked_mul(shift_range(d.periods, block).1.max(1)))
+        .filter(|&d| d <= i.null_draws as u64);
     let mut rand_mean = Vec::with_capacity(i.null_draws);
     let mut rand_sharpe = Vec::with_capacity(i.null_draws);
     for b in 0..i.null_draws {
         let mut p_stat = Stat::new();
-        let mut r_stat = Stat::new();
-        for (w, (book, d)) in i.books.iter().zip(&dense_books).enumerate() {
+        for (book, d) in i.books.iter().zip(&dense_books) {
             let periods = d.periods;
             let src = permuted_sources(periods, block, &mut perm_rng);
             let mut sum = vec![0.0f64; periods];
@@ -468,23 +496,34 @@ fn run_nulls(i: &InferenceInput) -> Result<NullTests, String> {
             for k in 0..periods {
                 p_stat.push(sum[k] / book.period_count[k] as f64 - book.period_cost[k]);
             }
-            let seed = splitmix(i.control_seed ^ splitmix((b as u64) << 20 | w as u64));
-            let (lo, count) = shift_range(periods, block);
-            let shift = if count == 0 { 0 } else { lo + ((seed as u128 * count as u128) >> 64) as u64 };
-            let pos = baselines::shifted_positions(&book.positions, &book.groups, shift, periods as u64)?;
-            let net = baselines::net_rows(&pos, &book.returns, &book.groups, book.side);
-            let mut bins = vec![0.0f64; periods];
-            for (row, &v) in net.iter().enumerate() {
-                bins[book.period[row] as usize] += v;
-            }
-            for k in 0..periods {
-                r_stat.push(bins[k] / book.period_count[k] as f64);
-            }
         }
         perm_mean.push(p_stat.mean());
         perm_sharpe.push(p_stat.sharpe());
-        rand_mean.push(r_stat.mean());
-        rand_sharpe.push(r_stat.sharpe());
+        if exact.is_none() {
+            let (m, s) = shifted_stats(i, &dense_books, &|w, lo, count| {
+                if count == 0 {
+                    return 0;
+                }
+                let seed = splitmix(i.control_seed ^ splitmix((b as u64) << 20 | w as u64));
+                lo + ((seed as u128 * count as u128) >> 64) as u64
+            })?;
+            rand_mean.push(m);
+            rand_sharpe.push(s);
+        }
+    }
+    if let Some(d) = exact {
+        for idx in 0..d {
+            let mut rest = idx;
+            let mut digits = Vec::with_capacity(dense_books.len());
+            for book in &dense_books {
+                let count = shift_range(book.periods, block).1.max(1);
+                digits.push(rest % count);
+                rest /= count;
+            }
+            let (m, s) = shifted_stats(i, &dense_books, &|w, lo, count| if count == 0 { 0 } else { lo + digits[w] })?;
+            rand_mean.push(m);
+            rand_sharpe.push(s);
+        }
     }
     let q95 = |v: &[f64]| {
         let mut s: Vec<f64> = v.iter().copied().filter(|x| x.is_finite()).collect();
