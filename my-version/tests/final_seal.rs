@@ -1186,3 +1186,41 @@ fn verify_read_accepts_another_spelling_of_the_front_path() {
     let (code, _, err) = go(&spelled, &["--verify-read", "--expect-report-sha256", &sha]);
     assert_eq!(code, 0, "{}", err);
 }
+
+/// #1094: the cut rule of `--threshold-fit fitness` is part of the sealed
+/// candidate and of the read binding: the fixed arm, another floor or another
+/// lambda is another candidate, and a verify with another rule scores nothing.
+#[test]
+fn threshold_fit_binds_the_sealed_read() {
+    let fit = ["--threshold-fixed", "0", "--threshold-fit", "fitness", "--cut-min-entries", "2", "--cut-blocks", "1"];
+    let (_s, data, l, sealed) = sealed_book("fit-binds", 400, &["x"], &fit);
+    let floor3 = ["--threshold-fixed", "0", "--threshold-fit", "fitness", "--cut-min-entries", "3", "--cut-blocks", "1"];
+    let lambda2 = ["--threshold-fixed", "0", "--threshold-fit", "fitness", "--cut-min-entries", "2", "--cut-blocks", "1", "--cut-lambda", "2"];
+    let fixed = ["--threshold-fixed", "0"];
+    let others: [&[&str]; 3] = [&fixed, &floor3, &lambda2];
+    for other in others {
+        let (code, out, err) = read(&data, &l, &sealed, &["x"], other);
+        assert_eq!(code, 3, "{:?}: {}{}", other, out, err);
+        assert!(err.contains("is not in the sealed list"), "{:?}: {}", other, err);
+        assert!(!Path::new(&marker_of(&data)).exists());
+    }
+    let (code, out, err) = read(&data, &l, &sealed, &["x"], &fit);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("\"fit\":\"fitness\""), "{}", out);
+    let sha = recorded_read_sha(&l);
+    let (ledger_before, marker_before) = (std::fs::read(&l).unwrap(), std::fs::read(marker_of(&data)).unwrap());
+    for other in others {
+        let mut a = other.to_vec();
+        a.extend_from_slice(&["--verify-read", "--expect-report-sha256", sha.as_str()]);
+        let (code, out, err) = read(&data, &l, &sealed, &["x"], &a);
+        assert_eq!(code, 3, "{:?}: {}{}", other, out, err);
+        assert!(!err.contains("report sha256") && !out.contains("report_sha256"), "{:?}: {}{}", other, out, err);
+        assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+        assert_eq!(std::fs::read(marker_of(&data)).unwrap(), marker_before);
+    }
+    let mut verify = fit.to_vec();
+    verify.extend_from_slice(&["--verify-read", "--expect-report-sha256", sha.as_str()]);
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &verify);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(test_reads(&l), 1);
+}

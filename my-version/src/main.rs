@@ -11064,7 +11064,8 @@ OPTIONS:
                              --band-units or --min-hold that differs from the run exits 2.
                              Refuses --expr, --threshold-quantile,
                              --threshold-fixed and --target-spec, and a run without an
-                             objective block
+                             objective block; --threshold-fit fitness keeps the run
+                             threshold as the reference cut
                              The expression is objective.finalist.expression_exact,
                              else the 4-decimal expression (expression_source
                              rounded); --locked-test refuses a rounded source (exit 3)
@@ -11073,6 +11074,26 @@ OPTIONS:
                              radix count, so theta is bit-identical to numpy
   --threshold-fixed <theta>  pre-registered fixed threshold instead of a quantile;
                              reported with threshold_source = fixed
+  --threshold-fit fitness    fit the cut of each window on its validation slice
+                             (training rows without one): the cut with the lowest
+                             block fitness (mean + lambda x sd of the block regrets)
+                             among cuts with at least --cut-min-entries distinct entry
+                             timestamps, from one sort and one sweep, frozen on the
+                             test block. Needs --threshold-fixed or --from-run (the
+                             reference cut and the fallback); --threshold-quantile,
+                             --policy band, vote, dp and top-tercile, --select-band,
+                             --device-pnl and --batch-pnl exit 2. threshold_source is
+                             validation_fitness or train_fitness, or fixed on a
+                             fallback (no_rows, book_error, no_valid_cut, floor);
+                             windows[].cut holds the source-row fitness, the reference
+                             cut, the plateau and a 32-cut profile. The cut rule is part
+                             of the candidate id and the read binding; the DSR trials
+                             are unchanged (the cut never reads the test block)
+  --cut-min-entries <E>      fewest distinct entry timestamps of a fitted cut
+                             (default 30, at least 1)
+  --cut-blocks <K>           time blocks of the fitted-cut fitness (default 4, 1 to 8)
+  --cut-lambda <L>           weight of the block regret sd in the fitted-cut fitness
+                             (default 1, finite and >= 0)
   --policy <p>               threshold | band | dp | top-tercile | vote (default threshold). top-tercile
                              holds the top floor(n/3) finite scores of each timestamp long and
                              the rest flat (no threshold; --threshold-quantile, --threshold-fixed,
@@ -11350,6 +11371,10 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut quantile = walkforward::DEFAULT_QUANTILE;
     let mut quantile_set = false;
     let mut threshold_fixed: Option<f64> = None;
+    let mut threshold_fit = false;
+    let mut cut_min_entries: Option<u32> = None;
+    let mut cut_blocks: Option<usize> = None;
+    let mut cut_lambda: Option<f64> = None;
     let mut policy = walkforward::Policy::Threshold;
     let mut band_width = 0.0f64;
     let mut min_hold = 1usize;
@@ -11483,6 +11508,33 @@ fn run_walkforward(args: &[String]) -> ! {
                     need(args, i + 1, "--threshold-fixed"),
                     "--threshold-fixed",
                 ));
+                i += 1;
+            }
+            "--threshold-fit" => {
+                let src = need(args, i + 1, "--threshold-fit");
+                if src != "fitness" {
+                    eprintln!("error: --threshold-fit takes fitness, got '{}'", src);
+                    std::process::exit(EXIT_USAGE);
+                }
+                threshold_fit = true;
+                i += 1;
+            }
+            "--cut-min-entries" | "--cut-blocks" => {
+                let flag = args[i].clone();
+                let src = need(args, i + 1, &flag);
+                let v = src.parse::<u32>().unwrap_or_else(|_| {
+                    eprintln!("error: {} needs a non-negative integer, got '{}'", flag, src);
+                    std::process::exit(EXIT_USAGE);
+                });
+                if flag == "--cut-min-entries" {
+                    cut_min_entries = Some(v);
+                } else {
+                    cut_blocks = Some(v as usize);
+                }
+                i += 1;
+            }
+            "--cut-lambda" => {
+                cut_lambda = Some(number(need(args, i + 1, "--cut-lambda"), "--cut-lambda"));
                 i += 1;
             }
             "--policy" => {
@@ -11695,6 +11747,26 @@ fn run_walkforward(args: &[String]) -> ! {
         units: band_units_arg.clone(),
         min_hold: given(&["--min-hold"]),
     };
+    if !threshold_fit && (cut_min_entries.is_some() || cut_blocks.is_some() || cut_lambda.is_some()) {
+        usage_fail("--cut-min-entries, --cut-blocks and --cut-lambda need --threshold-fit fitness");
+    }
+    if threshold_fit {
+        if quantile_set {
+            usage_fail(
+                "--threshold-fit fitness and --threshold-quantile are alternatives: the fitted cut replaces the \
+                 quantile; pass the reference cut with --threshold-fixed or --from-run",
+            );
+        }
+        if let Some(msg) = walkforward::threshold_fit_conflict(policy, band_select, device_pnl, popts.batch_pnl) {
+            usage_fail(&msg);
+        }
+        let d = walkforward::CutFit::default();
+        popts.threshold_fit = Some(walkforward::CutFit {
+            min_entry_times: cut_min_entries.unwrap_or(d.min_entry_times),
+            blocks: cut_blocks.unwrap_or(d.blocks),
+            lambda: cut_lambda.unwrap_or(d.lambda),
+        });
+    }
     if from_run_path.is_some() && (target_spec_path.is_some() || front_path.is_some()) {
         usage_fail("--from-run, --front and --target-spec are alternatives: a run carries its own target spec");
     }
@@ -12093,6 +12165,9 @@ fn run_walkforward(args: &[String]) -> ! {
         if let Some(msg) = walkforward::vote_refusal(&spec, &popts) {
             usage_fail(&msg);
         }
+    }
+    if let Some(msg) = walkforward::threshold_fit_refusal(&spec, &popts) {
+        usage_fail(&msg);
     }
     let resolved = rcsr::lockbox::resolve_retired(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path, retired_arg.as_deref()).unwrap_or_else(|e| {
         eprintln!("error: {}", e.message);

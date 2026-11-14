@@ -1091,6 +1091,34 @@ mod front {
         assert_eq!(code, 3, "{err}");
         assert!(err.contains("zz"), "{err}");
     }
+
+    /// #1094: the cut is fitted on rows before the test block, so it is no trial
+    /// on the scored rows: the trials and their source follow the #1027 table.
+    #[test]
+    fn threshold_fit_keeps_the_trial_count() {
+        let (_scratch, dir) = scratch("fittrials");
+        let data = write_data(&dir);
+        let run = write_run(&dir, BOOK_RUN);
+        let fit = ["--threshold-fit", "fitness", "--cut-min-entries", "1", "--cut-blocks", "1"];
+        for (window, extra, trials, want) in [
+            (OK_WINDOW, vec!["--bootstrap", "100"], 1.0, "out_of_sample_book"),
+            (IN_SAMPLE_WINDOW, vec!["--bootstrap", "100", "--allow-in-sample-windows"], 1000.0, "run.candidates_evaluated"),
+        ] {
+            let (code, plain, err) = wf_book(&data, &["--from-run", &run], window, &extra);
+            assert_eq!(code, 0, "{err}");
+            let mut with_fit = extra.clone();
+            with_fit.extend_from_slice(&fit);
+            let (code, fitted, err) = wf_book(&data, &["--from-run", &run], window, &with_fit);
+            assert_eq!(code, 0, "{err}");
+            let j = Json::parse(fitted.trim()).unwrap();
+            assert_eq!(j.get("threshold").and_then(|t| t.get("fit")).and_then(Json::as_str), Some("fitness"), "{fitted}");
+            for out in [&plain, &fitted] {
+                let m = multiple(out);
+                assert_eq!(mt(&m, &["trials"]), trials);
+                assert_eq!(source(&m), want);
+            }
+        }
+    }
 }
 
 #[path = "common/ledger.rs"]
@@ -1766,4 +1794,311 @@ fn the_cli_prints_the_same_controls_for_a_numeric_group_as_csv_and_store() {
         window_controls(&String::from_utf8_lossy(&out.stdout))
     };
     assert_eq!(run(&csv_path), run(&store_path));
+}
+
+/// #1094: `--threshold-fit fitness`, the cut of each window fitted on its
+/// validation slice (training rows without one) and frozen on the test block.
+mod fitted_cut {
+    use super::*;
+    use rcsr::devlog::Json;
+    use walkforward::{CutFit, ProtocolOptions};
+
+    fn unit(k: u64, salt: u64) -> f64 {
+        let mut z = k.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ salt.wrapping_mul(0xD1B5_4A32_D192_ED03);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    }
+
+    const SYMBOLS: [&str; 4] = ["A", "B", "C", "D"];
+
+    /// Four symbols on stamps `k * step`. `x` is one market value per stamp,
+    /// uniform on [-2, 2). Before `split` the target pays 2 % where x > 1.5 and
+    /// loses 1 % where 0.5 < x <= 1.5; from `split` on it pays 2 % where
+    /// x > 0.5, a cut that is best only on those rows. `swap` draws every value
+    /// from `split` on (x and target) again with another seed.
+    fn planted_csv(steps: usize, split: usize, step: f64, swap: Option<u64>) -> String {
+        let mut s = String::from("ts,sym,x,target\n");
+        for k in 0..steps {
+            let late = k >= split;
+            let salt = if late { swap.unwrap_or(0) } else { 0 };
+            let x = 4.0 * unit(k as u64, 1 + salt) - 2.0;
+            for (g, sym) in SYMBOLS.iter().enumerate() {
+                let e = 0.004 * (unit((4 * k + g) as u64, 2 + salt) - 0.5);
+                let y = match (late, swap) {
+                    (false, _) if x > 1.5 => 0.02,
+                    (false, _) if x > 0.5 => -0.01,
+                    (false, _) => -0.001,
+                    (true, Some(_)) => 0.03 * (unit((4 * k + g) as u64, 3 + salt) - 0.5),
+                    (true, None) if x > 0.5 => 0.02,
+                    (true, None) => -0.001,
+                };
+                s.push_str(&format!("{},{},{},{}\n", k as f64 * step, sym, x, y + e));
+            }
+        }
+        s
+    }
+
+    fn planted(swap: Option<u64>) -> data::Table {
+        data::parse_table(&planted_csv(2500, 2000, 1.0, swap)).unwrap()
+    }
+
+    fn fit_spec(validation_frac: f64) -> EvalSpec {
+        let mut s = spec("x", vec![window("w", 0.0, 2000.0, 2000.0, 2500.0)]);
+        s.group = Some("sym".to_string());
+        s.threshold_fixed = Some(0.0);
+        s.validation_frac = validation_frac;
+        s.periods_per_year = Some(8760.0);
+        s
+    }
+
+    fn fit_opts(fit: CutFit) -> ProtocolOptions {
+        ProtocolOptions { threshold_fit: Some(fit), ..ProtocolOptions::default() }
+    }
+
+    /// Replacing every test score and test return leaves the cut bit-identical,
+    /// and a cut planted to be best on the test block only is not found.
+    #[test]
+    fn fitted_cut_ignores_the_test_rows() {
+        let (a, b) = (planted(None), planted(Some(77)));
+        let o = fit_opts(CutFit::default());
+        for (vf, want) in [(0.0, "train_fitness"), (0.25, "validation_fitness")] {
+            let s = fit_spec(vf);
+            let ra = walkforward::run_table_with(&a, &s, "t", &o).unwrap();
+            let rb = walkforward::run_table_with(&b, &s, "t", &o).unwrap();
+            let (wa, wb) = (&ra.windows[0], &rb.windows[0]);
+            let (ca, cb) = (wa.cut.as_ref().expect("a cut"), wb.cut.as_ref().expect("a cut"));
+            assert_eq!(ca.source.as_str(), want);
+            assert_eq!(wa.threshold_source, want);
+            assert!(ca.fallback.is_none(), "{:?}", ca.fallback_detail);
+            assert_eq!(wa.threshold.to_bits(), wb.threshold.to_bits(), "vf {vf}");
+            assert_eq!(ca.value.to_bits(), wa.threshold.to_bits());
+            assert_eq!(format!("{:?}", (&ca.cut, &ca.reference, &ca.plateau, &ca.profile)), format!("{:?}", (&cb.cut, &cb.reference, &cb.plateau, &cb.profile)));
+            assert_ne!(ra.pooled.mean_return.to_bits(), rb.pooled.mean_return.to_bits(), "the test rows differ");
+            assert!((wa.threshold - 1.5).abs() < 0.05, "fitted cut {} is not the source-row gate 1.5", wa.threshold);
+            // The cut of the test block (0.5) earns more there than the fitted cut.
+            let mut at_test_gate = s.clone();
+            at_test_gate.threshold_fixed = Some(0.5);
+            let rt = walkforward::run_table(&a, &at_test_gate, "t").unwrap();
+            assert!(rt.pooled.mean_return > ra.pooled.mean_return, "{} vs {}", rt.pooled.mean_return, ra.pooled.mean_return);
+        }
+    }
+
+    #[test]
+    fn threshold_fit_refusals() {
+        let t = planted(None);
+        let o = fit_opts(CutFit::default());
+        let refused = |s: &EvalSpec, o: &ProtocolOptions, needle: &str| {
+            let e = walkforward::run_table_with(&t, s, "t", o).err().expect("refused");
+            assert!(e.contains("--threshold-fit") && e.contains(needle), "{e}");
+        };
+        let mut s = fit_spec(0.0);
+        s.threshold_fixed = None;
+        refused(&s, &o, "--threshold-fixed");
+        let mut s = fit_spec(0.0);
+        s.policy = walkforward::Policy::Band;
+        refused(&s, &o, "band");
+        let mut s = fit_spec(0.0);
+        s.device_pnl = true;
+        refused(&s, &o, "--device-pnl");
+        let mut batch = fit_opts(CutFit::default());
+        batch.batch_pnl = true;
+        refused(&fit_spec(0.0), &batch, "--batch-pnl");
+
+        let dir = Scratch::new("wf-fit-refusals");
+        let data = dir.path().join("d.csv");
+        std::fs::write(&data, planted_csv(40, 40, 3600.0, None)).unwrap();
+        let run = |extra: &[&str]| {
+            let out = super::rcsr_cmd::rcsr()
+                .args([
+                    "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x",
+                    "--time", "ts", "--group-by", "sym", "--horizon", "3600", "--cost-bps", "5",
+                    "--periods-per-year", "8760", "--window", "w,0,72000,75600,140400", "--json",
+                ])
+                .args(extra)
+                .output()
+                .unwrap();
+            (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+        };
+        let fit = ["--threshold-fit", "fitness"];
+        let with = |more: &[&'static str]| -> Vec<&'static str> { fit.iter().chain(more).copied().collect() };
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (with(&[]), "--threshold-fixed"),
+            (with(&["--threshold-quantile", "0.5"]), "--threshold-quantile"),
+            (with(&["--threshold-fixed", "0", "--policy", "band"]), "--policy"),
+            (with(&["--threshold-fixed", "0", "--policy", "vote", "--quorum", "1"]), "--policy"),
+            (with(&["--threshold-fixed", "0", "--policy", "dp"]), "--policy"),
+            (with(&["--threshold-fixed", "0", "--policy", "top-tercile"]), "--policy"),
+            (with(&["--threshold-fixed", "0", "--expr", "-x", "--validation-frac", "0.3", "--select-band"]), "--select-band"),
+            (with(&["--threshold-fixed", "0", "--device-pnl"]), "--device-pnl"),
+            (with(&["--threshold-fixed", "0", "--batch-pnl"]), "--batch-pnl"),
+            (with(&["--threshold-fixed", "0", "--cut-blocks", "9"]), "--cut-blocks"),
+            (with(&["--threshold-fixed", "0", "--cut-min-entries", "0"]), "--cut-min-entries"),
+            (with(&["--threshold-fixed", "0", "--cut-lambda", "-1"]), "--cut-lambda"),
+            (vec!["--threshold-fit", "quantile", "--threshold-fixed", "0"], "--threshold-fit"),
+            (vec!["--threshold-fixed", "0", "--cut-min-entries", "5"], "--cut-min-entries"),
+        ];
+        for (extra, needle) in cases {
+            let (code, err) = run(&extra);
+            assert_eq!(code, Some(2), "{extra:?}: {err}");
+            assert!(err.contains("--threshold-fit") && err.contains(needle), "{extra:?}: {err}");
+        }
+        let (code, err) = run(&with(&["--threshold-fixed", "0"]));
+        assert_eq!(code, Some(0), "{err}");
+    }
+
+    fn report_csv() -> String {
+        let mut s = planted_csv(2600, 2600, 3600.0, None);
+        // Symbol A pays in every stamp of the short training range of `w2`, so
+        // every block of its book has a profitable path.
+        let lines: Vec<String> = s
+            .lines()
+            .map(|l| {
+                let f: Vec<&str> = l.split(',').collect();
+                match f[0].parse::<f64>() {
+                    Ok(ts) if f[1] == "A" && (2250.0..2270.0).contains(&(ts / 3600.0)) => format!("{},A,{},0.01", f[0], f[2]),
+                    _ => l.to_string(),
+                }
+            })
+            .collect();
+        s = lines.join("\n");
+        s.push('\n');
+        s
+    }
+
+    fn hours(label: &str, a: i64, b: i64, c: i64, d: i64) -> String {
+        format!("{},{},{},{},{}", label, a * 3600, b * 3600, c * 3600, d * 3600)
+    }
+
+    fn get<'a>(j: &'a Json, path: &[&str]) -> &'a Json {
+        path.iter().fold(j, |cur, k| cur.get(k).unwrap_or_else(|| panic!("missing {k} in {path:?}")))
+    }
+
+    fn window_at(j: &Json, i: usize) -> &Json {
+        match j.get("windows") {
+            Some(Json::Arr(w)) => &w[i],
+            _ => panic!("no windows"),
+        }
+    }
+
+    #[test]
+    fn threshold_fit_report_fields() {
+        let dir = Scratch::new("wf-fit-report");
+        let data = dir.path().join("d.csv");
+        std::fs::write(&data, report_csv()).unwrap();
+        let (w1, w2) = (hours("w1", 0, 2000, 2001, 2250), hours("w2", 2250, 2270, 2271, 2600));
+        let run = |extra: &[&str]| {
+            let out = super::rcsr_cmd::rcsr()
+                .args([
+                    "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x",
+                    "--time", "ts", "--group-by", "sym", "--horizon", "3600", "--cost-bps", "5",
+                    "--periods-per-year", "8760", "--window", &w1, "--window", &w2,
+                    "--threshold-fixed", "0", "--threshold-fit", "fitness",
+                ])
+                .args(extra)
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let out = run(&["--json"]);
+        let j = Json::parse(out.trim()).unwrap();
+        assert_eq!(get(&j, &["threshold", "fit"]).as_str(), Some("fitness"));
+        assert_eq!(get(&j, &["threshold", "source"]).as_str(), Some("train_fitness"));
+        assert_eq!(get(&j, &["threshold", "cut_min_entries"]).as_f64(), Some(30.0));
+        assert_eq!(get(&j, &["threshold", "cut_blocks"]).as_f64(), Some(4.0));
+        assert_eq!(get(&j, &["threshold", "cut_lambda"]).as_f64(), Some(1.0));
+        for i in 0..2 {
+            let w = window_at(&j, i);
+            for k in ["source", "value", "index", "rows", "fitness", "net", "flips", "exits", "entry_times", "exposure", "reference", "plateau", "floor", "blocks", "lambda", "fallback", "profile"] {
+                assert!(get(w, &["cut"]).get(k).is_some(), "window {i}: cut.{k}");
+            }
+            match get(w, &["cut", "profile"]) {
+                Json::Arr(p) => {
+                    assert_eq!(p.len(), 32, "window {i}");
+                    for row in p {
+                        for k in ["long_share", "index", "value", "fitness", "net", "entry_times"] {
+                            assert!(row.get(k).is_some(), "window {i}: profile.{k}");
+                        }
+                    }
+                }
+                other => panic!("window {i}: profile {other:?}"),
+            }
+            assert_eq!(get(w, &["cut", "reference", "value"]).as_f64(), Some(0.0));
+            assert_eq!(get(w, &["cut", "floor", "min_entry_times"]).as_f64(), Some(30.0));
+        }
+        let w = window_at(&j, 0);
+        assert_eq!(get(w, &["threshold_source"]).as_str(), Some("train_fitness"));
+        assert_eq!(get(w, &["cut", "source"]).as_str(), Some("train_fitness"));
+        assert!(matches!(get(w, &["cut", "fallback"]), Json::Null));
+        let theta = get(w, &["threshold"]).as_f64().unwrap();
+        assert_eq!(get(w, &["cut", "value"]).as_f64(), Some(theta));
+        assert!((theta - 1.5).abs() < 0.05, "{theta}");
+        assert!(get(w, &["cut", "entry_times"]).as_f64().unwrap() >= 30.0);
+        let (lo, hi) = (get(w, &["cut", "plateau", "lo"]).as_f64().unwrap(), get(w, &["cut", "plateau", "hi"]).as_f64().unwrap());
+        assert!(lo <= theta && theta <= hi, "plateau {lo}..{hi} around {theta}");
+        let index = get(w, &["cut", "index"]).as_f64().unwrap();
+        let (rlo, rhi) = (get(w, &["cut", "plateau", "rows_lo"]).as_f64().unwrap(), get(w, &["cut", "plateau", "rows_hi"]).as_f64().unwrap());
+        assert!(rlo <= index && index <= rhi);
+        let w = window_at(&j, 1);
+        assert_eq!(get(w, &["cut", "fallback"]).as_str(), Some("floor"));
+        assert_eq!(get(w, &["threshold_source"]).as_str(), Some("fixed"));
+        assert_eq!(get(w, &["threshold"]).as_f64(), Some(0.0));
+        assert!(get(w, &["cut", "reference", "entry_times"]).as_f64().unwrap() < 30.0);
+        let sha = |o: &str| o.split("\"report_sha256\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        assert_eq!(sha(&out), sha(&run(&["--json"])), "the same run gives the same report");
+        let md = run(&["--markdown", "-"]);
+        assert!(md.contains("## Fitted cut"), "{md}");
+        assert!(md.contains("| w2 | fixed |") && md.contains("floor"), "{md}");
+        let v = Json::parse(run(&["--json", "--validation-frac", "0.25"]).trim()).unwrap();
+        assert_eq!(get(window_at(&v, 0), &["threshold_source"]).as_str(), Some("validation_fitness"));
+    }
+
+    #[test]
+    fn threshold_fit_enters_the_candidate_id_and_the_read_binding() {
+        let s = fit_spec(0.0);
+        let plain = ProtocolOptions::default();
+        let fit = fit_opts(CutFit::default());
+        let other = fit_opts(CutFit { lambda: 2.0, ..CutFit::default() });
+        let base = rcsr::protocol::procedure_spec(&s, &plain);
+        assert!(!base.contains("threshold_fit"), "{base}");
+        let text = rcsr::protocol::procedure_spec(&s, &fit);
+        assert!(text.starts_with(&base) && text.contains("threshold_fit=fitness"), "{text}");
+        assert_ne!(rcsr::protocol::procedure_spec(&s, &other), text);
+        let bind = |o: &ProtocolOptions| rcsr::protocol::walkforward_binding(&s, o);
+        assert_ne!(bind(&fit), bind(&plain));
+        assert_ne!(bind(&other), bind(&fit));
+    }
+
+    /// Reports without the flag, pinned to the bytes of the base build.
+    #[test]
+    fn default_reports_are_pinned() {
+        let t = planted(None);
+        let mut parts: Vec<(String, String)> = Vec::new();
+        let quantile = {
+            let mut s = fit_spec(0.0);
+            s.threshold_fixed = None;
+            s
+        };
+        let fixed = fit_spec(0.25);
+        let mut pair = fit_spec(0.25);
+        pair.candidates = vec!["x".to_string(), "-x".to_string()];
+        let inference = ProtocolOptions { bootstrap_draws: 200, null_draws: 50, ..ProtocolOptions::default() };
+        for (name, s, o) in [
+            ("quantile", &quantile, ProtocolOptions::default()),
+            ("fixed", &fixed, inference.clone()),
+            ("pair", &pair, inference),
+        ] {
+            let r = walkforward::run_table_with(&t, s, "t", &o).unwrap();
+            parts.push((format!("{name}.json"), r.hashed_json()));
+            parts.push((format!("{name}.md"), r.markdown()));
+            parts.push((format!("{name}.procedure"), rcsr::protocol::procedure_spec(s, &o)));
+        }
+        let got: Vec<String> = parts.iter().map(|(k, v)| format!("{k} {}", rcsr::manifest::sha256_hex(v.as_bytes()))).collect();
+        let all = rcsr::manifest::sha256_hex(got.join("\n").as_bytes());
+        assert_eq!(all, PINNED_DEFAULT_REPORTS, "{}", got.join("\n"));
+    }
+
+    const PINNED_DEFAULT_REPORTS: &str = "3a81f04a52205a0997503d097eebeba7f0bb7b84977931e29656c206f8256589";
 }

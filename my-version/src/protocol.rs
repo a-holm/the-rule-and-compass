@@ -1145,6 +1145,12 @@ pub fn procedure_spec(spec: &crate::walkforward::EvalSpec, o: &crate::walkforwar
             s.push_str(&format!("run_band={:?},{:?}\n", b.multiple, b.resolved));
         }
     }
+    if let Some(f) = &o.threshold_fit {
+        s.push_str(&format!(
+            "threshold_fit=fitness,min_entry_times={},blocks={},lambda={:?}\n",
+            f.min_entry_times, f.blocks, f.lambda
+        ));
+    }
     s
 }
 
