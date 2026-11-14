@@ -650,7 +650,7 @@ fn split_windows_start_flat() {
         assert_eq!(code(&out), 0, "{}", stderr(&out));
         parse(&String::from_utf8_lossy(&out.stdout))
     };
-    let (g2, a, b) = (wf("g2"), wf("a"), wf("b"));
+    let (ab, a, b) = (wf("g2"), wf("a"), wf("b"));
     let mut want = period_net(&a);
     want.extend(period_net(&b));
     assert_eq!(period_net(&ab), want, "the pooled path is the concatenation of the window books");
