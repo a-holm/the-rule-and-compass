@@ -12484,13 +12484,15 @@ fn run_walkforward(args: &[String]) -> ! {
     }
     if split_windows {
         // #1189: test intervals of a split are separate books; adjacent ones keep the carry.
-        let touching = windows.windows(2).any(|p| p[0].test_end == p[1].test_start);
-        if !touching {
+        let seams = windows.len().saturating_sub(1);
+        let touching = windows.windows(2).filter(|p| p[0].test_end == p[1].test_start).count();
+        if touching == 0 {
             pool_reset_flat = true;
-        } else if popts.batch_pnl {
-            eprintln!("error: --batch-pnl needs windows that do not touch, or none that do: a splits table with adjacent test intervals mixes carried and flat seams\n\n{}", walkforward_usage());
-            std::process::exit(EXIT_USAGE);
-        } else {
+        } else if touching < seams && !pool_reset_flat {
+            if popts.batch_pnl {
+                eprintln!("error: --batch-pnl cannot price a splits table whose test intervals both touch and leave gaps (touching seams carry, gaps start flat); add --pool-reset-flat or drop --batch-pnl\n\n{}", walkforward_usage());
+                std::process::exit(EXIT_USAGE);
+            }
             popts.flat_gaps = true;
         }
     }
