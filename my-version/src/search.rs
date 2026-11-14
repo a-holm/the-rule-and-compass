@@ -1953,6 +1953,9 @@ impl GpuSearch {
             if let Some(pending_check) = begun {
                 self.check_end(islands, pending_check, generation);
             }
+            if generation >= 2 && crate::gpu::injected_fault("rescore") {
+                return Err(format!("{}the re-score after the fit", crate::gpu::INJECTED_REFUSAL));
+            }
             // Re-score the survivors so selection sees their fitted constants.
             self.evaluate_the_batch(islands, &admitted, data, cfg, generation, dispatcher)?;
             // #1078: a slot keeps the fit only when it is not worse than its
@@ -3493,6 +3496,74 @@ fn gpu_lost(
     Ok(())
 }
 
+/// #1089: the `(island, slot)` pairs still pending (`error.is_nan()`), in
+/// island then slot order.
+#[cfg(feature = "cuda")]
+fn pending_slots(islands: &[Vec<Ind>]) -> Vec<(usize, usize)> {
+    islands
+        .iter()
+        .enumerate()
+        .flat_map(|(i, pop)| {
+            pop.iter()
+                .enumerate()
+                .filter(|(_, ind)| ind.error.is_nan())
+                .map(move |(j, _)| (i, j))
+        })
+        .collect()
+}
+
+/// #1089: the one loss path. Finish a generation on the CPU after a device
+/// failure: every slot of `entry` is pending again, gets the exact CPU fit when
+/// `refit`, and the exact CPU score on `rows`. A tree the fit made
+/// dimension-inconsistent keeps `+inf`.
+/// #1078: under `--fit-accept fitness` each fitted slot is compared with its
+/// score before the CPU fit.
+#[cfg(feature = "cuda")]
+fn finish_on_cpu(
+    islands: &mut [Vec<Ind>],
+    entry: &[(usize, usize)],
+    rows: &EvalSample,
+    cfg: &Config,
+    pool: &FallbackPool,
+    refit: bool,
+    counts: Option<&FitAcceptCounts>,
+) {
+    let train = rows.sample;
+    let mut unfitted: Vec<(usize, usize, Ind)> = Vec::new();
+    if refit {
+        for &(i, j) in entry {
+            let ind = &mut islands[i][j];
+            if ind.error.is_nan() {
+                if cfg.fit_accept == FitAccept::Fitness {
+                    unfitted.push((i, j, Ind::evaluated(ind.tree.clone(), rows, cfg)));
+                }
+                crate::fit::fit_weighted_metric_thresholds(
+                    &mut ind.tree,
+                    &train.x,
+                    &train.y,
+                    &train.w,
+                    cfg.fit_iters,
+                    cfg.metric,
+                    cfg.fit_thresholds,
+                );
+            }
+        }
+    }
+    // #27: re-scoring the pending batch goes through the SoA view.
+    // #121: the same bounded worker pool as the per-batch fallback.
+    rescore_pending_cpu(islands, rows, cfg, pool);
+    for (i, j, mut before) in unfitted {
+        before.age = islands[i][j].age;
+        let fitted = islands[i][j].clone();
+        let moved = expr::structural_hash(&before.tree) != expr::structural_hash(&fitted.tree);
+        let (ind, kept) = accept_fit(before, fitted);
+        islands[i][j] = ind;
+        if let (Some(counts), true) = (counts, moved) {
+            counts.record(FitPath::LostBatch, kept);
+        }
+    }
+}
+
 /// #26: score the pending individuals, falling back to the CPU on any error.
 ///
 /// Returns whether the GPU remains usable. On failure the whole pending batch
@@ -3515,7 +3586,7 @@ fn score_generation(
         return Ok(false);
     };
     g.rows_version = rows_version;
-    let train = data.sample;
+    let entry = pending_slots(islands);
     match g.score(islands, data, cfg, generation, dispatcher, counts) {
         Ok(()) => {
             // #230: a fit-only evaluator scores on the CPU, so it must not make
@@ -3536,47 +3607,7 @@ fn score_generation(
             // #121: keep the fallback pool alive for the rescore below.
             let fallback = g.take_fallback();
             *gpu = None;
-            // #169 admission: if the CUDA batch failed after the screening pass,
-            // the pending offspring may not have been fitted yet. Fit them with
-            // the exact CPU arm before re-scoring so the fallback never silently
-            // selects on seed constants. A rescore failure after the batch fit
-            // simply warm-starts the same CPU LM again.
-            // #1078: under the gate each such candidate is first scored with its
-            // pre-fit constants.
-            let mut unfitted: Vec<(usize, usize, Ind)> = Vec::new();
-            if defers_fit_to_gpu(cfg, true) {
-                for (i, pop) in islands.iter_mut().enumerate() {
-                    for (j, ind) in pop.iter_mut().enumerate() {
-                        if ind.error.is_nan() {
-                            if cfg.fit_accept == FitAccept::Fitness {
-                                unfitted.push((i, j, Ind::evaluated(ind.tree.clone(), data, cfg)));
-                            }
-                            crate::fit::fit_weighted_metric_thresholds(
-                                &mut ind.tree,
-                                &train.x,
-                                &train.y,
-                                &train.w,
-                                cfg.fit_iters,
-                                cfg.metric,
-                                cfg.fit_thresholds,
-                            );
-                        }
-                    }
-                }
-            }
-            // #27: re-scoring the pending batch goes through the SoA view.
-            // #121: the same bounded worker pool as the per-batch fallback.
-            rescore_pending_cpu(islands, data, cfg, &fallback);
-            for (i, j, mut before) in unfitted {
-                before.age = islands[i][j].age;
-                let fitted = islands[i][j].clone();
-                let moved = expr::structural_hash(&before.tree) != expr::structural_hash(&fitted.tree);
-                let (ind, kept) = accept_fit(before, fitted);
-                islands[i][j] = ind;
-                if let (Some(counts), true) = (counts, moved) {
-                    counts.record(FitPath::LostBatch, kept);
-                }
-            }
+            finish_on_cpu(islands, &entry, data, cfg, &fallback, defers_fit_to_gpu(cfg, true), counts);
             Ok(false)
         }
     }
@@ -3739,6 +3770,9 @@ fn fit_pipeline_queue(
     }
     let mut fitted: Vec<usize> = Vec::new();
     if !plans.is_empty() {
+        if generation >= 2 && crate::gpu::injected_fault("pipeline_fit") {
+            return Err(format!("{}the pipeline fit", crate::gpu::INJECTED_REFUSAL));
+        }
         let fit_device_start = g.ledger_offset_s();
         let mut slots = fit_route::QueueSlots { jobs: &mut jobs, offered: &offered_hash };
         let step = route.fit_on_device(&mut g.ev, arm, &plans, &mut slots, tail.rows, 1);
@@ -3788,6 +3822,25 @@ fn fit_pipeline_queue(
 struct PipelineTail<'a> {
     rows: &'a Sample,
     pending: PendingTail,
+}
+
+/// #1089: the pipeline's loss branch. The results of the failed generation are
+/// dropped and every slot that was pending when the overlap
+/// began is fitted and scored by the exact CPU arm on the generation's rows.
+#[cfg(feature = "cuda")]
+fn finish_pipeline_loss(
+    islands: &mut [Vec<Ind>],
+    results: &mut [Vec<Option<PipelineResult>>],
+    rows: &EvalSample,
+    cfg: &Config,
+    pool: &FallbackPool,
+    counts: Option<&FitAcceptCounts>,
+) {
+    let entry = pending_slots(islands);
+    for slots in results.iter_mut() {
+        slots.iter_mut().for_each(|r| *r = None);
+    }
+    finish_on_cpu(islands, &entry, rows, cfg, pool, defers_fit_to_gpu(cfg, true), counts);
 }
 
 /// #578: refit the first `--fit-fallback-max` fallbacks of the generation on
@@ -9372,41 +9425,41 @@ fn run_search_scoped(
                                     .err();
                         }
                     }
-                    // Results are keyed by (island, slot), so the arrival order
-                    // across concurrent island threads cannot change them.
-                    // #560: a result for a replaced candidate is dropped, which
-                    // leaves the slot pending for `score_generation` below; a
-                    // rejected dimension keeps its infinite error.
-                    let mut nonfinite_slots: Vec<(usize, usize)> = Vec::new();
-                    let mut floor_slots: Vec<(usize, usize)> = Vec::new();
-                    for (i, slots) in pipeline_results.iter_mut().enumerate() {
-                        for (j, value) in slots.iter_mut().enumerate() {
-                            let Some(r) = value.take() else { continue };
-                            let ind = &mut islands[i][j];
-                            if expr::structural_hash(&ind.tree) != r.offered {
-                                continue;
-                            }
-                            if let Some(tree) = r.tree {
-                                ind.complexity = cfg.complexity_model.complexity(&tree);
-                                ind.tree = tree;
-                            }
-                            ind.set_error(if cfg.accepts_dimensions(&ind.tree) {
-                                r.error
-                            } else {
-                                f64::INFINITY
-                            });
-                            match r.nonfinite {
-                                DeviceInf::None => {}
-                                DeviceInf::Range => nonfinite_slots.push((i, j)),
-                                DeviceInf::TradeFloor => floor_slots.push((i, j)),
+                    if pipeline_error.is_none() {
+                        // Results are keyed by (island, slot), so the arrival order
+                        // across concurrent island threads cannot change them.
+                        // #560: a result for a replaced candidate is dropped, which
+                        // leaves the slot pending for `score_generation` below; a
+                        // rejected dimension keeps its infinite error.
+                        let mut nonfinite_slots: Vec<(usize, usize)> = Vec::new();
+                        let mut floor_slots: Vec<(usize, usize)> = Vec::new();
+                        for (i, slots) in pipeline_results.iter_mut().enumerate() {
+                            for (j, value) in slots.iter_mut().enumerate() {
+                                let Some(r) = value.take() else { continue };
+                                let ind = &mut islands[i][j];
+                                if expr::structural_hash(&ind.tree) != r.offered {
+                                    continue;
+                                }
+                                if let Some(tree) = r.tree {
+                                    ind.complexity = cfg.complexity_model.complexity(&tree);
+                                    ind.tree = tree;
+                                }
+                                ind.set_error(if cfg.accepts_dimensions(&ind.tree) {
+                                    r.error
+                                } else {
+                                    f64::INFINITY
+                                });
+                                match r.nonfinite {
+                                    DeviceInf::None => {}
+                                    DeviceInf::Range => nonfinite_slots.push((i, j)),
+                                    DeviceInf::TradeFloor => floor_slots.push((i, j)),
+                                }
                             }
                         }
-                    }
-                    if let Some(g) = gpu.as_mut() {
-                        g.rows_version = rows_version;
-                        g.check_device_nonfinite(&mut islands, &nonfinite_slots, &floor_slots, gen_data, cfg, gen);
-                    }
-                    if pipeline_error.is_none() {
+                        if let Some(g) = gpu.as_mut() {
+                            g.rows_version = rows_version;
+                            g.check_device_nonfinite(&mut islands, &nonfinite_slots, &floor_slots, gen_data, cfg, gen);
+                        }
                         if pipeline_scored {
                             gpu_used = true;
                         }
@@ -9415,9 +9468,10 @@ fn run_search_scoped(
                         defer_gpu =
                             score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_data, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version, fit_counts)?;
                     } else {
-                        // Stop the GPU and re-score every still-pending
-                        // candidate in f64 on the CPU; a failed batch must
-                        // never leave a wrong (or missing) number behind.
+                        // Stop the GPU and finish the generation on the CPU; a
+                        // failed batch must never leave a wrong (or missing)
+                        // number behind. The merge above did not run: the
+                        // pending slots still hold the offered trees.
                         if let Some(e) = pipeline_error.take() {
                             gpu_lost(cfg, e, &mut backend_reason)?;
                         }
@@ -9436,8 +9490,7 @@ fn run_search_scoped(
                                 )
                             });
                         gpu = None;
-                        let train_view = EvalSample::new(train, cfg);
-                        rescore_pending_cpu(&mut islands, &train_view, cfg, &fallback);
+                        finish_pipeline_loss(&mut islands, &mut pipeline_results, gen_data, cfg, &fallback, fit_counts);
                         defer_gpu = false;
                     }
                 } else if !screened {
@@ -12596,6 +12649,143 @@ mod tests {
             assert!(accepted > 0 && accepted < 64, "{:?}: {} accepted", metric, accepted);
             assert!(one.iter().any(|(_, (v, _))| *v == crate::fit::Verdict::NonFinite));
         }
+    }
+
+    /// #1089: three entry slots hold a finite error that is not the score of
+    /// their tree (a screening score of the unfitted tree) and two are pending.
+    #[cfg(feature = "cuda")]
+    fn loss_islands(cfg: &Config) -> (Vec<Vec<Ind>>, Vec<(usize, usize)>) {
+        let trees = [
+            node(Op::Sin, vec![input(0)]),
+            node(Op::Add, vec![node(Op::Mul, vec![constant(0.3), input(0)]), constant(0.1)]),
+            node(Op::Square, vec![input(1)]),
+            node(Op::Mul, vec![constant(3.0), input(0)]),
+            node(Op::Div, vec![constant(1.0), input(1)]),
+            node(Op::Sub, vec![input(0), input(1)]),
+        ];
+        let mut islands: Vec<Vec<Ind>> = vec![
+            trees[..3].iter().cloned().map(|t| Ind::pending(t, cfg)).collect(),
+            trees[3..].iter().cloned().map(|t| Ind::pending(t, cfg)).collect(),
+        ];
+        // Slots 0/1, 0/2 and 1/0 carry a stale screening error, 1/1 and 1/2
+        // are pending, 0/0 was scored before the generation began.
+        islands[0][0].set_error(123.5);
+        islands[0][1].set_error(0.25);
+        islands[0][2].set_error(7.0);
+        islands[1][0].set_error(0.75);
+        let entry = vec![(0, 1), (0, 2), (1, 0), (1, 1), (1, 2)];
+        (islands, entry)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn loss_rescores_fitted_slots_that_hold_a_screening_error() {
+        let s = sample();
+        let cfg = Config::default();
+        let view = EvalSample::new(&s, &cfg);
+        let (mut islands, entry) = loss_islands(&cfg);
+        let untouched = (islands[0][0].tree.clone(), islands[0][0].error);
+        finish_on_cpu(&mut islands, &entry, &view, &cfg, &FallbackPool::new(2, 2), false, None);
+        for &(i, j) in &entry {
+            let want = score_tree(&islands[i][j].tree, &view, &cfg);
+            assert_eq!(islands[i][j].error.to_bits(), want.to_bits(), "slot {i}/{j}");
+        }
+        assert!(expr::same(&islands[0][0].tree, &untouched.0));
+        assert_eq!(islands[0][0].error.to_bits(), untouched.1.to_bits());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn loss_refits_every_entry_slot() {
+        let s = sample();
+        let cfg = Config::default();
+        let view = EvalSample::new(&s, &cfg);
+        let tree = node(Op::Mul, vec![constant(5.0), input(0)]);
+        let mut islands = vec![vec![Ind::pending(tree.clone(), &cfg)]];
+        islands[0][0].set_error(99.0);
+        finish_on_cpu(&mut islands, &[(0, 0)], &view, &cfg, &FallbackPool::new(2, 2), true, None);
+        let mut want = Ind::pending(tree, &cfg).tree;
+        crate::fit::fit_weighted_metric_thresholds(
+            &mut want, &s.x, &s.y, &s.w, cfg.fit_iters, cfg.metric, cfg.fit_thresholds,
+        );
+        let error = score_tree(&want, &view, &cfg);
+        assert!(expr::same(&islands[0][0].tree, &want), "the constants are the exact CPU fit");
+        assert_eq!(islands[0][0].error.to_bits(), error.to_bits());
+        assert!(error < 1e-9, "the fit moved the constant off its poor start");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn loss_keeps_a_dimension_reject_infinite() {
+        let s = sample();
+        let unit = |t: &str| crate::units::Unit::parse(t).unwrap();
+        let cfg = Config {
+            units: Some(Units::new(vec![unit("m"), unit("s")], unit("m"))),
+            require_dimensions: true,
+            ..Config::default()
+        };
+        let view = EvalSample::new(&s, &cfg);
+        let bad = node(Op::Add, vec![input(0), input(1)]);
+        let good = node(Op::Sin, vec![input(0)]);
+        assert!(!cfg.accepts_dimensions(&bad));
+        let mut islands = vec![vec![Ind::pending(bad, &cfg), Ind::pending(good, &cfg)]];
+        islands[0][0].set_error(0.5);
+        islands[0][1].set_error(0.5);
+        finish_on_cpu(&mut islands, &[(0, 0), (0, 1)], &view, &cfg, &FallbackPool::new(2, 2), false, None);
+        assert_eq!(islands[0][0].error, f64::INFINITY);
+        assert_eq!(islands[0][1].error.to_bits(), score_tree(&islands[0][1].tree, &view, &cfg).to_bits());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn loss_is_identical_for_one_and_four_workers() {
+        let s = sample();
+        let cfg = Config::default();
+        let view = EvalSample::new(&s, &cfg);
+        let run = |pool: FallbackPool| {
+            let (mut islands, entry) = loss_islands(&cfg);
+            finish_on_cpu(&mut islands, &entry, &view, &cfg, &pool, true, None);
+            islands
+        };
+        let one = run(FallbackPool::new(1, 1));
+        let four = run(FallbackPool::new(4, 4));
+        for (a, b) in one.iter().flatten().zip(four.iter().flatten()) {
+            assert_eq!(a.error.to_bits(), b.error.to_bits());
+            assert!(expr::same(&a.tree, &b.tree));
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn pipeline_loss_scores_on_the_generation_rows() {
+        let full = sample();
+        let subset = Sample {
+            x: full.x[..7].to_vec(),
+            y: full.y[..7].to_vec(),
+            w: Vec::new(),
+            ys: Vec::new(),
+            pairs: None,
+        };
+        let cfg = Config::default();
+        let rows = EvalSample::new(&subset, &cfg);
+        let all = EvalSample::new(&full, &cfg);
+        let (mut islands, _) = loss_islands(&cfg);
+        for pop in islands.iter_mut() {
+            for ind in pop.iter_mut() {
+                ind.set_error(f64::NAN);
+            }
+        }
+        let mut results: Vec<Vec<Option<PipelineResult>>> = vec![vec![None; 3]; 2];
+        results[0][0] = Some(PipelineResult { error: 42.0, nonfinite: DeviceInf::None, offered: 0, tree: None });
+        finish_pipeline_loss(&mut islands, &mut results, &rows, &cfg, &FallbackPool::new(2, 2), None);
+        assert!(results.iter().flatten().all(|r| r.is_none()), "device results are dropped");
+        let mut differs = false;
+        for ind in islands.iter().flatten() {
+            let want = score_tree(&ind.tree, &rows, &cfg);
+            assert_eq!(ind.error.to_bits(), want.to_bits());
+            differs |= want.to_bits() != score_tree(&ind.tree, &all, &cfg).to_bits();
+        }
+        assert!(differs, "the subset rows are distinguishable from the full rows");
     }
 
     /// #121: the fallback queue is bounded by construction and the merge order
