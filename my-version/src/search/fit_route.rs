@@ -465,8 +465,8 @@ pub(super) struct Rotation {
 }
 
 impl Rotation {
-    /// No rotation: ascending island order.
-    pub(super) const NONE: Rotation = Rotation { start: 0, islands: 1 };
+    /// No rotation: ascending island order (the old order).
+    pub(super) const NONE: Rotation = Rotation { start: 0, islands: 0 };
 
     /// The rotation of `generation` of the run seeded with `seed`.
     pub(super) fn of(seed: u32, generation: usize, islands: usize) -> Self {
@@ -488,6 +488,9 @@ impl Rotation {
 
     /// The rank of `island` in the rotated order.
     pub(super) fn rank(self, island: usize) -> usize {
+        if self.islands == 0 {
+            return island;
+        }
         (island % self.islands + self.islands - self.start) % self.islands
     }
 }
@@ -648,6 +651,13 @@ impl FitRoute {
     pub(super) fn with_rotation(mut self, rotation: Rotation) -> Self {
         self.rotation = rotation;
         self
+    }
+
+    /// #1125: whether `total` fallbacks exceed `--fit-fallback-max`. Only then
+    /// does the island rotation choose the prefix; otherwise every fallback is
+    /// refit and the key order stands.
+    fn binds(&self, total: usize) -> bool {
+        self.settings.fallback_max != 0 && total > self.settings.fallback_max
     }
 
     pub(super) fn settings(&self) -> &FitSettings {
@@ -836,16 +846,35 @@ impl FitRoute {
 
     /// #1075: whether a release schedule of `waves` calls runs for `jobs`
     /// device jobs: it can start exact fits early (overlap, at least two calls
-    /// of a single-launch LM arm), and every candidate of the stage falling
-    /// back still fits under `--fit-fallback-max`, so each released job lands
-    /// in the refit prefix.
+    /// of a single-launch LM arm). #1125: under `--fit-fallback-max` it runs
+    /// while the prefix has room; a wave releases only the jobs whose rank
+    /// bound in the rotated order is inside the prefix.
     pub(super) fn releases(&self, arm: DeviceArm, jobs: usize, waves: usize) -> bool {
         let cap = self.settings.fallback_max;
         self.overlap
             && waves >= 2
             && jobs >= 2
             && matches!(arm, DeviceArm::Lm(loss) if loss != DeviceLoss::Slope)
-            && (cap == 0 || self.fallbacks.len() + jobs <= cap)
+            && (cap == 0 || self.fallbacks.len() < cap)
+    }
+
+    /// #1125: for each of `jobs`, an upper bound of its rank among the
+    /// fallbacks of the generation: every fallback known now plus the jobs
+    /// that sort before it in the rotated order. A job with a bound below the
+    /// cap is certain to be in the refit prefix. Empty when the cap is 0.
+    fn rank_bounds<K: Copy, S: FitSlots<K> + ?Sized>(&self, jobs: &[(K, GpuFitPlan)], slots: &S) -> Vec<usize> {
+        if self.settings.fallback_max == 0 {
+            return Vec::new();
+        }
+        let rotation = self.rotation;
+        let place: Vec<(usize, usize)> = jobs.iter().map(|(key, _)| slots.place(*key)).collect();
+        let mut order: Vec<usize> = (0..jobs.len()).collect();
+        order.sort_by_key(|&k| (rotation.rank(place[k].0), place[k].1));
+        let mut bounds = vec![0; jobs.len()];
+        for (rank, &k) in order.iter().enumerate() {
+            bounds[k] = self.fallbacks.len() + rank;
+        }
+        bounds
     }
 
     /// #1075: [`Self::fit_on_device`] with the answers released in `waves`
@@ -879,12 +908,14 @@ impl FitRoute {
         let settings = self.settings;
         let plans: Vec<&GpuFitPlan> = jobs.iter().map(|(_, p)| p).collect();
         let mut hints: Vec<Option<Fallback>> = vec![None; jobs.len()];
+        let bounds = self.rank_bounds(jobs, &*slots);
+        let cap = self.settings.fallback_max;
         let early_jobs = &mut self.early_jobs;
         let released = device.fit_released(arm, &plans, &settings, rows, waves, &mut |batch: &[(usize, DeviceAnswer)]| {
             let mut out = Vec::new();
             for (k, answer) in batch {
                 let Some((key, plan)) = jobs.get(*k) else { continue };
-                if hints[*k].is_some() {
+                if hints[*k].is_some() || (cap != 0 && bounds[*k] >= cap) {
                     continue;
                 }
                 let finite = answer.c.iter().all(|v| v.is_finite());
@@ -923,9 +954,31 @@ impl FitRoute {
         step
     }
 
+    /// #1125: which of the fallbacks known now are in the refit prefix, by
+    /// index, or `None` when the cap does not bind. A later fallback can only
+    /// push one out of the prefix, never in.
+    fn prefix_mask(&self) -> Option<Vec<bool>> {
+        if !self.binds(self.fallbacks.len()) {
+            return None;
+        }
+        let rotation = self.rotation;
+        let mut order: Vec<usize> = (0..self.fallbacks.len()).collect();
+        order.sort_by_key(|&n| {
+            let key = self.fallbacks[n].key;
+            (key.0, rotation.rank(key.1), key.2)
+        });
+        let mut mask = vec![false; order.len()];
+        for &n in &order[..self.settings.fallback_max] {
+            mask[n] = true;
+        }
+        Some(mask)
+    }
+
     /// #958: with overlap, hand the fallbacks not yet offered to `exact`, in
     /// insertion order, while fewer than `--fit-fallback-max` jobs are out. A
-    /// fallback that already has a released job (#1075) is skipped.
+    /// fallback that already has a released job (#1075) is skipped. #1125:
+    /// under a binding cap only a fallback inside the rotated prefix is
+    /// offered.
     pub(super) fn submit_early<E: ExactFits + ?Sized>(&mut self, exact: &mut E) {
         if !self.overlap {
             return;
@@ -933,8 +986,10 @@ impl FitRoute {
         let cap = self.settings.fallback_max;
         let room = if cap == 0 { usize::MAX } else { cap.saturating_sub(self.early_jobs) };
         let from = self.offered;
+        let inside = self.prefix_mask();
         let mut jobs = Vec::new();
-        for f in self.fallbacks[from..].iter_mut().filter(|f| f.early.is_none()).take(room) {
+        let candidates = self.fallbacks.iter_mut().enumerate().skip(from);
+        for (_, f) in candidates.filter(|(n, f)| f.early.is_none() && inside.as_ref().is_none_or(|m| m[*n])).take(room) {
             f.early = Some(self.early_jobs + jobs.len());
             jobs.push(refit_job(f, f.device.clone(), &self.settings));
         }
@@ -952,7 +1007,12 @@ impl FitRoute {
         let mut fallbacks = std::mem::take(&mut self.fallbacks);
         self.offered = 0;
         self.early_jobs = 0;
-        fallbacks.sort_by_key(|f| f.key);
+        if self.binds(fallbacks.len()) {
+            let rotation = self.rotation;
+            fallbacks.sort_by_key(|f| (f.key.0, rotation.rank(f.key.1), f.key.2));
+        } else {
+            fallbacks.sort_by_key(|f| f.key);
+        }
         let (refit, bounded) = fallback_batch_split(fallbacks.len(), self.settings.fallback_max);
         self.counts.bounded += bounded;
         let mut early: Vec<Option<FallbackFitJob>> = joined.jobs.into_iter().map(Some).collect();
@@ -2405,7 +2465,21 @@ mod tests {
         }
     }
 
-    /// #1125: the unrotated order of the issue's example refits islands 0 to 2
+    /// #1125: `--fit-fallback-max 1` refits one candidate per generation and its
+    /// island moves: over `islands` generations every island is refit once.
+    #[test]
+    fn cap_one_refits_one_candidate_on_a_moving_island() {
+        let islands = 6usize;
+        let mut counts = vec![0usize; islands];
+        for generation in 0..islands {
+            let set = capped_generation(1, islands, 3, Rotation::of(5, generation, islands), 2);
+            assert_eq!(set.len(), 1, "generation {generation}");
+            counts[set[0].0] += 1;
+        }
+        assert_eq!(counts, vec![1; islands]);
+    }
+
+    /// #1125: the unrotated order of the issue's example refits islands 0 and 1
     /// only.
     #[test]
     fn the_unrotated_order_starves_the_high_islands() {
