@@ -5874,11 +5874,20 @@ fn full_data_archive(
         return full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, false, counts);
     }
     // #848: fixed-position trees stay off the front unless nothing else is left.
-    let (front, report) = full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, true, counts);
+    // #1124: each pass counts into its own tally; only the reported pass joins the run counts.
+    let first = FitAcceptCounts::default();
+    let (front, report) = full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, true, counts.map(|_| &first));
     if !front.items.is_empty() {
+        if let Some(c) = counts {
+            c.absorb(&first);
+        }
         return (front, report);
     }
-    let (front, mut report) = full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, false, counts);
+    let second = FitAcceptCounts::default();
+    let (front, mut report) = full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, false, counts.map(|_| &second));
+    if let Some(c) = counts {
+        c.absorb(&second);
+    }
     report.fixed_position_fallback = true;
     (front, report)
 }
