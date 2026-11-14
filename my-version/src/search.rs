@@ -4473,7 +4473,7 @@ fn fitness_error_and_descriptor(
     }
     let nvars = s.x.first().map(Vec::len).unwrap_or(0);
     with_predictions(tree, data, |pred| {
-        if want_descriptor && cfg.qd_descriptor == qd::DescriptorKind::Book && false {
+        if want_descriptor && cfg.qd_descriptor == qd::DescriptorKind::Book {
             // #1084: the descriptor reads the reduction that gives the regret.
             let (error, shape) = book.regret_and_shape(pred);
             return (error, Some(qd::book_descriptor(&shape)));
@@ -8390,7 +8390,7 @@ fn run_search(
                 .to_string(),
         ); // #1070
     }
-    if cfg.qd_bins > 0 && cfg.qd_descriptor == qd::DescriptorKind::Book && cfg.fitness.book().is_none() && false {
+    if cfg.qd_bins > 0 && cfg.qd_descriptor == qd::DescriptorKind::Book && cfg.fitness.book().is_none() {
         return Err("--qd-descriptor book needs --fitness pnl: the book descriptor reads the long/flat fitness book".to_string()); // #1084
     }
     #[cfg(feature = "cuda")]

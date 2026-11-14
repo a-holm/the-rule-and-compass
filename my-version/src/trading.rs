@@ -1738,10 +1738,10 @@ impl FitnessBook {
     pub fn regret_and_shape(&self, pred: &[f64]) -> (f64, BookShape) {
         if self.blocks() == 1 {
             let t = self.totals(pred);
-            (self.regret_of(&t), BookShape::default()) // WIP stub
+            (self.regret_of(&t), BookShape::of(self.len(), std::slice::from_ref(&t)))
         } else {
             let t = self.block_totals(pred);
-            (self.fitness_of(&t), BookShape::default()) // WIP stub
+            (self.fitness_of(&t), BookShape::of(self.len(), &t))
         }
     }
 

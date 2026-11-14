@@ -79,10 +79,6 @@ pub const BOOK_HOLDING_MAX: f64 = 1e4;
 /// each clamped to `[0, 1]`. The bounds are constants, so a book maps to the
 /// same point on every panel. A flat book is `(0, 0)`.
 pub fn book_descriptor(shape: &crate::trading::BookShape) -> Descriptor {
-    if true {
-        let _ = shape;
-        return Descriptor { usage: 0.0, skew: 0.0 }; // WIP stub
-    }
     let x = shape.exposure();
     let h = shape.mean_holding();
     let usage = if x > 0.0 {
@@ -668,7 +664,7 @@ impl QdArchive {
     /// counts as reachable and `reachable_coverage` equals `coverage`.
     fn reachable_mask(&self) -> Vec<bool> {
         let mut reach = vec![false; self.cells.len()];
-        if self.kind == DescriptorKind::Book && false {
+        if self.kind == DescriptorKind::Book {
             reach.fill(true);
             return reach;
         }
@@ -822,7 +818,7 @@ impl QdArchive {
             qd_score,
             evaluations: self.records,
             descriptor_fallbacks: self.fallbacks,
-            descriptor: DescriptorKind::Moments.as_str(), // WIP stub
+            descriptor: self.kind.as_str(),
         }
     }
 

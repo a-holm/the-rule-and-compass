@@ -2098,7 +2098,7 @@ fn eprint_run_summary(
 /// #1084: `note` under the book descriptor, nothing under the moments pair, so
 /// a moments run keeps its report bytes.
 fn qd_descriptor_note(q: &qd::QdReport, note: &'static str) -> &'static str {
-    if q.descriptor == rcsr::qd::DescriptorKind::Book.as_str() && false {
+    if q.descriptor == rcsr::qd::DescriptorKind::Book.as_str() {
         note
     } else {
         ""
@@ -5523,7 +5523,7 @@ fn main() {
         }
     }
     // #1084: the book descriptor reads the long/flat book of the search fitness.
-    if cfg.qd_descriptor == rcsr::qd::DescriptorKind::Book && false {
+    if cfg.qd_descriptor == rcsr::qd::DescriptorKind::Book {
         if !fitness_pnl {
             trading_usage("--qd-descriptor book needs --fitness pnl: the book descriptor reads the long/flat fitness book");
         }
