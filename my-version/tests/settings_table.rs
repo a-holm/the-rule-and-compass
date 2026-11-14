@@ -31,7 +31,8 @@ fn sample(row: &dyn Setting) -> Option<&'static str> {
     }
     Some(match row.flag() {
         "--patience" => "7",
-        "--selection" => "afp",
+        "--selection" => "lexicase",
+        "--lexicase-cases" => "64",
         "--restart-policy" => "island",
         "--restart-isolation" => "7",
         "--migration-interval" => "9",

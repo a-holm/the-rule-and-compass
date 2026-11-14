@@ -1641,6 +1641,59 @@ fn qd_book_descriptor_is_saved_and_resumes() {
     assert!(!std::fs::read_to_string(&moments_cp).unwrap().contains("qd_descriptor"));
 }
 
+/// #1023: a two-symbol panel with four time blocks gives eight sub-book cases;
+/// every generation of `--selection lexicase` selects on all of them, and the
+/// run resumes to the uninterrupted front.
+#[test]
+fn lexicase_selects_on_two_symbols_times_four_blocks() {
+    let (_scratch, dir) = scratch();
+    let mut text = String::from("t,sym,x1,x2,r,y\n");
+    for s in 0..2 {
+        for i in 0..300 {
+            let f = (i + 1000 * s) as f64;
+            let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+            let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+            let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+            let r = 0.01 * x1 + 0.0005 * noise;
+            text.push_str(&format!("{},{},{},{},{},{}\n", T0 + 900 * i as i64, ["a", "b"][s], x1, x2, r, r + 0.05 * x2));
+        }
+    }
+    let data = dir.join("panel.csv");
+    std::fs::write(&data, text).unwrap();
+    let data = data.to_string_lossy().into_owned();
+    let spec = write_spec(&dir);
+    let log = dir.join("dev.ndjson").to_string_lossy().into_owned();
+    let cp = dir.join("lex.rcsr").to_string_lossy().into_owned();
+    let lex = |extra: &[&str]| {
+        let mut args = vec![
+            "--data", &data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--group-by", "sym", "--split",
+            "temporal", "--target-spec", &spec, "--cpu", "--seed", "3", "--pop", "48", "--metric", "squared",
+            "--json", "--quiet", "--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--fitness",
+            "pnl", "--pnl-blocks", "4", "--selection", "lexicase",
+        ];
+        args.extend_from_slice(extra);
+        rcsr_cmd::rcsr().args(&args).output().expect("run rcsr")
+    };
+    let full = json(&lex(&["--generations", "12", "--dev-log", &log]));
+    assert_eq!(num(at(&full, &["search_fitness"]), &["blocks"]), 4.0);
+    let cases: Vec<f64> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains("\"event\":\"generation\""))
+        .map(|l| num(&Json::parse(l).expect("dev-log line"), &["selection", "cases"]))
+        .collect();
+    assert!(!cases.is_empty() && cases.iter().all(|&c| c == 8.0), "{cases:?}");
+
+    let saved = lex(&["--generations", "6", "--no-dev-log", "--save", &cp]);
+    assert_eq!(code(&saved), 0, "{}", stderr(&saved));
+    let resumed = json(&lex(&["--generations", "12", "--no-dev-log", "--resume", &cp]));
+    // A resumed run reports the front rebuilt on every row, which takes the
+    // canonical tree among equal regrets; compare the regrets.
+    let regrets = |j: &Json| pareto(j).iter().map(|m| num(m, &["fitness", "train_regret"]).to_bits()).collect::<Vec<_>>();
+    assert_eq!(regrets(&full), regrets(&resumed));
+    usage_error(&lex(&["--generations", "12", "--no-dev-log", "--resume", &cp, "--lexicase-cases", "4"]), "--lexicase-cases 4 (saved lexicase_cases is 256)");
+}
+
 /// #1166: a `--qd-policy --qd-descriptor book` run resumed at generation 4
 /// equals the 8-generation run: front, QD report and exit checkpoint apart
 /// from the `build` lines.

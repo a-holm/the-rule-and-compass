@@ -668,7 +668,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring] [--reject-fixed-position]
-     [--selection lexicographic|afp] [--migration-interval N] [--restart-interval N] [--restart-policy archive|island] [--restart-isolation N] [--explore-islands K] [--front-scope global|island] [--migration-policy ring|ring-tournament]
+     [--selection lexicographic|afp|lexicase] [--lexicase-cases K] [--migration-interval N] [--restart-interval N] [--restart-policy archive|island] [--restart-isolation N] [--explore-islands K] [--front-scope global|island] [--migration-policy ring|ring-tournament]
      [--mutation-mix classic|extended] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
      [--patience N]
@@ -1271,6 +1271,12 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   crowding distance, a few random immigrants join each generation, and parents
   are drawn by Pareto rank. Small correct shapes and new lineages survive next
   to large approximations. Node path only; the default stays `lexicographic`;
+- **opt-in epsilon-lexicase parent selection** (`--selection lexicase`, `--lexicase-cases K`): the
+  island tournament on the aggregate error is replaced by semi-dynamic epsilon-lexicase (La Cava et al.
+  2016, 2019) on `K` cases drawn per generation (down-sampled lexicase, Hernandez et al. 2019): row
+  losses under the metric fitness, `(group, time block)` sub-book regrets under `--fitness pnl`. A
+  formula that is best on some rows, symbols or periods gets parents even when it does not win the
+  aggregate. CPU node path; needs a metric with a per-row loss; the default stays `lexicographic`;
 - **opt-in island-local restarts** (`--restart-policy island`, `--restart-isolation W`):
   the default rule restarts an island only while its best is worse than the
   archive best, which ring migration makes false for every island within a few
