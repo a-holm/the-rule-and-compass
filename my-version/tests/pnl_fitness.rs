@@ -1693,3 +1693,30 @@ fn lexicase_selects_on_two_symbols_times_four_blocks() {
     assert_eq!(regrets(&full), regrets(&resumed));
     usage_error(&lex(&["--generations", "12", "--no-dev-log", "--resume", &cp, "--lexicase-cases", "4"]), "--lexicase-cases 4 (saved lexicase_cases is 256)");
 }
+
+/// #1166: a `--qd-policy --qd-descriptor book` run resumed at generation 4
+/// equals the 8-generation run: front, QD report and exit checkpoint apart
+/// from the `build` lines.
+#[test]
+fn a_qd_book_policy_run_and_its_resume_match_exactly() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let (straight_cp, half_cp, resumed_cp) = (path("straight.rcsr"), path("half.rcsr"), path("resumed.rcsr"));
+    let mut straight = BOOK_QD.to_vec();
+    straight.extend(["--generations", "8", "--save", &straight_cp]);
+    let a = json(&run(&data, &spec, &straight));
+    let mut half = BOOK_QD.to_vec();
+    half.extend(["--generations", "4", "--save", &half_cp]);
+    json(&run(&data, &spec, &half));
+    let b = json(&run(&data, &spec, &["--fitness", "pnl", "--generations", "8", "--resume", &half_cp, "--save", &resumed_cp]));
+    assert_eq!(at(&a, &["qd", "descriptor"]).as_str(), Some("book"));
+    assert_eq!(at(&a, &["pareto"]), at(&b, &["pareto"]));
+    assert_eq!(at(&a, &["qd"]), at(&b, &["qd"]));
+    let read = |p: &str| -> String {
+        std::fs::read_to_string(p).unwrap().lines().filter(|l| !l.starts_with("build ")).map(|l| format!("{l}\n")).collect()
+    };
+    assert!(read(&half_cp).contains("\nqd_archive 1 cvt "), "the book checkpoint carries the archive");
+    assert_eq!(read(&straight_cp), read(&resumed_cp));
+}

@@ -1243,8 +1243,10 @@ impl Ind {
             tree: ind.tree,
             error: ind.error,
             complexity: ind.complexity,
-            // A checkpoint stores the tree and score, not the descriptor; the
-            // archive recomputes it on the resumed run like any other candidate.
+            // A checkpoint stores the tree and score, not the descriptor. A CPU
+            // resume re-scores the population, which recomputes it through the
+            // scoring pass; otherwise the QD archive (saved under --qd-policy,
+            // #1166) takes it from its descriptor cache or one evaluation.
             descriptor: None,
             age: ind.age,
             inf_rows: None,
@@ -7262,6 +7264,7 @@ fn snapshot(
     test: &Sample,
     final_archive: Option<&Archive>,
     candidates_evaluated: u64,
+    qd: Option<&QdArchive>, // #1166
 ) -> Checkpoint {
     let (words, idx) = main_rng.state();
     Checkpoint {
@@ -7310,6 +7313,9 @@ fn snapshot(
         )),
         target_spec: None,
         candidates_evaluated,
+        // #1166: trajectory state only under the policy; a passive archive is
+        // rebuilt on resume, so its checkpoint keeps its bytes.
+        qd: qd.filter(|_| cfg.qd_policy).map(QdArchive::state),
     }
 }
 
@@ -8223,6 +8229,7 @@ fn run_postfix_search(
                 test,
                 None,
                 candidates,
+                None, // #1166: the flat path refuses a QD archive
             );
             emit(&mut on_checkpoint, &cp);
             io_stage_total += io_mark.elapsed().as_secs_f64();
@@ -8301,6 +8308,7 @@ fn run_postfix_search(
             test,
             None,
             candidates,
+            None, // #1166
         );
         Some(cp)
     } else {
@@ -8852,6 +8860,7 @@ fn run_search(
     let mut best_prev: f64;
     let mut no_improve: usize;
     let mut candidates: u64;
+    let mut saved_qd: Option<qd::QdState> = None; // #1166
     // #85: did any generation fit on a screening subset? Only then may the
     // final archive be refit; a request at least as large as the sample, or
     // `--no-fit`, stays an exact no-op.
@@ -8903,8 +8912,14 @@ fn run_search(
             stagnant: saved_stagnant,
             candidates_evaluated: saved_candidates,
             main_rng,
+            qd: qd_state,
             ..
         } = cp;
+        // #1166: under the policy the archive chose this trajectory's parents;
+        // an empty one would continue a different search.
+        if cfg.qd_policy {
+            saved_qd = Some(qd_state.ok_or_else(|| crate::checkpoint::QD_ARCHIVE_MISSING.to_string())?);
+        }
         gens_done = generations;
         candidates = saved_candidates;
         converged_early = stopped_early;
@@ -9182,9 +9197,11 @@ fn run_search(
     // no population state, so it cannot affect the search trajectory.
     let mut progress_stats = ProgressStats::new(crate::progress_stats::DEFAULT_WINDOW);
     let mut stats_observed = false;
-    // #120: passive descriptor archive. It observes evaluated individuals and
-    // never feeds back into selection, so turning it on cannot change the
-    // trajectory or the Pareto front.
+    // #120: the descriptor archive. Under the passive `--qd` it observes
+    // evaluated individuals and never feeds back into selection, so turning it
+    // on cannot change the trajectory or the Pareto front, and a resume rebuilds
+    // it. Under `--qd-policy` it chooses parents, migration victims and restart
+    // aims, so a resume continues the saved archive (#1166).
     let mut qd_archive = if cfg.qd_bins > 0 {
         let archive = if cfg.qd_control == 2 {
             QdArchive::new_random(cfg.qd_bins, cfg.qd_cell_cap)
@@ -9193,7 +9210,11 @@ fn run_search(
         } else {
             QdArchive::new(cfg.qd_bins, cfg.qd_cell_cap)
         };
-        Some(archive.with_nvars(nvars).with_kind(cfg.qd_descriptor)) // #1084
+        let mut archive = archive.with_nvars(nvars).with_kind(cfg.qd_descriptor); // #1084
+        if let Some(state) = saved_qd.take() {
+            archive.restore(state).map_err(|e| format!("cannot resume: {e}"))?; // #1166
+        }
+        Some(archive)
     } else {
         None
     };
@@ -9869,6 +9890,7 @@ fn run_search(
                     test,
                     None,
                     candidates,
+                    qd_archive.as_ref(), // #1166
                 );
                 emit(&mut on_checkpoint, &cp);
                 io_stage_total += io_mark.elapsed().as_secs_f64();
@@ -9902,24 +9924,13 @@ fn run_search(
         );
     }
 
-    // #120: promoted cell elites are rebuilt exactly on every training row in
-    // f64 before they are reported. Screening and row subsets may guide the
-    // search, but the QD report is never a subset estimate.
     // #855: an interim chunk saves the search state and skips the report.
     let interim = cfg.interim_chunk && stop_reason == "time_budget" && on_checkpoint.is_some();
-    if cfg.qd_policy && !interim {
-        if let Some(qd) = qd_archive.as_mut() {
-            qd.refit_all(|tree| {
-                let sol = refit_survivor(tree, &train_data, cfg, Some(&run_fit));
-                (sol.error, sol.cost)
-            });
-        }
-    }
 
     // Capture the exit state before the final full-data archive rebuild: the
     // saved search archive is the one at the last completed generation. It is
     // emitted after the rebuild (#256) so it also carries the archive the run
-    // reports.
+    // reports. #1166: the QD archive is captured before its refit below too.
     let mut io_final_s = 0.0f64;
     let io_mark = std::time::Instant::now();
     let pending_cp: Option<Checkpoint> = if on_checkpoint.is_some() {
@@ -9942,12 +9953,25 @@ fn run_search(
             test,
             None,
             candidates,
+            qd_archive.as_ref(), // #1166
         );
         Some(cp)
     } else {
         None
     };
     io_final_s += io_mark.elapsed().as_secs_f64();
+
+    // #120: promoted cell elites are rebuilt exactly on every training row in
+    // f64 before they are reported. Screening and row subsets may guide the
+    // search, but the QD report is never a subset estimate.
+    if cfg.qd_policy && !interim {
+        if let Some(qd) = qd_archive.as_mut() {
+            qd.refit_all(|tree| {
+                let sol = refit_survivor(tree, &train_data, cfg, Some(&run_fit));
+                (sol.error, sol.cost)
+            });
+        }
+    }
 
     // #169: with the GPU-fit arm every finalist is also refit by the exact CPU
     // f64 LM before it is scored on all training rows.

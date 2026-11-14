@@ -108,6 +108,15 @@ impl QdMode {
             QdMode::Random => "random",
         }
     }
+
+    pub fn parse(s: &str) -> Option<QdMode> {
+        match s {
+            "grid" => Some(QdMode::Grid),
+            "cvt" => Some(QdMode::Cvt),
+            "random" => Some(QdMode::Random),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +220,27 @@ pub struct QdArchive {
 /// Keep the descriptor cache bounded; a long run must not retain one entry per
 /// candidate it has ever seen.
 const KNOWN_CACHE_CAP: usize = 65_536;
+
+/// #1166: everything in a [`QdArchive`] that a later generation reads, as plain
+/// data for a `--qd-policy` checkpoint. The cell cap, the descriptor kind and
+/// the input count come from the configuration and the data, so a restore
+/// takes them from the archive it fills.
+#[derive(Clone, Debug)]
+pub struct QdState {
+    pub mode: QdMode,
+    /// Every cell's local front, in cell order and in the cell's own order.
+    pub cells: Vec<Vec<QdEntry>>,
+    /// CVT centroids in index order; empty for the grid and random archives.
+    pub centroids: Vec<Descriptor>,
+    pub visits: Vec<u64>,
+    /// The bounded Lloyd sample, in sample order.
+    pub observed: Vec<Descriptor>,
+    pub records: usize,
+    pub fallbacks: usize,
+    pub known_tag: u64,
+    /// The descriptor cache, in ascending structural-hash order.
+    pub known: Vec<(u64, Descriptor)>,
+}
 
 /// The per-run coverage summary reported by the CLI and `--json`.
 #[derive(Clone, Debug, PartialEq)]
@@ -425,6 +455,68 @@ impl QdArchive {
 
     pub fn visits(&self) -> &[u64] {
         &self.visits
+    }
+
+    /// #1166: the state a `--qd-policy` checkpoint saves.
+    pub fn state(&self) -> QdState {
+        let mut known: Vec<(u64, Descriptor)> = self.known.iter().map(|(h, d)| (*h, *d)).collect();
+        known.sort_unstable_by_key(|(h, _)| *h);
+        QdState {
+            mode: self.mode,
+            cells: self.cells.iter().map(|c| c.entries.clone()).collect(),
+            centroids: self.centroids.clone(),
+            visits: self.visits.clone(),
+            observed: self.observed.clone(),
+            records: self.records,
+            fallbacks: self.fallbacks,
+            known_tag: self.known_tag,
+            known,
+        }
+    }
+
+    /// #1166: continue from a saved state. The archive must be built from the
+    /// configuration that saved it; a state of another tessellation, size or
+    /// cell cap is refused.
+    pub fn restore(&mut self, state: QdState) -> Result<(), String> {
+        let cells = self.cells.len();
+        if state.mode != self.mode || state.cells.len() != cells {
+            return Err(format!(
+                "the saved QD archive is {} with {} cells, but this run builds {} with {}",
+                state.mode.name(),
+                state.cells.len(),
+                self.mode.name(),
+                cells
+            ));
+        }
+        if state.visits.len() != cells || state.centroids.len() != self.centroids.len() {
+            return Err(format!(
+                "the saved QD archive has {} visit counts and {} centroids for {} cells",
+                state.visits.len(),
+                state.centroids.len(),
+                cells
+            ));
+        }
+        if let Some(i) = state.cells.iter().position(|c| c.len() > self.cell_cap) {
+            return Err(format!("the saved QD cell {} holds more than the cell cap {}", i, self.cell_cap));
+        }
+        if state.observed.len() > CVT_SAMPLE_CAP || state.known.len() > KNOWN_CACHE_CAP {
+            return Err(format!(
+                "the saved QD archive has {} Lloyd samples and {} cached descriptors, above the bounds {} and {}",
+                state.observed.len(),
+                state.known.len(),
+                CVT_SAMPLE_CAP,
+                KNOWN_CACHE_CAP
+            ));
+        }
+        self.cells = state.cells.into_iter().map(|entries| QdCell { entries }).collect();
+        self.centroids = state.centroids;
+        self.visits = state.visits;
+        self.observed = state.observed;
+        self.records = state.records;
+        self.fallbacks = state.fallbacks;
+        self.known_tag = state.known_tag;
+        self.known = state.known.into_iter().collect();
+        Ok(())
     }
 
     fn grid_index(&self, d: Descriptor) -> usize {
@@ -1537,5 +1629,76 @@ mod tests {
         let occupied = archive.occupied_cells();
         assert_eq!(occupied.len(), 1);
         assert_eq!(occupied[0].0, archive.cell_index(fixed));
+    }
+
+    /// #1166: an archive restored from its state continues exactly like the
+    /// original (cells, centroids, visits, Lloyd sample, counters, descriptor
+    /// cache), and a state of another archive is refused.
+    #[test]
+    fn a_restored_archive_continues_like_the_original() {
+        let s = sample();
+        let tree = |i: usize, salt: f64| {
+            let c = 0.1 * i as f64 + salt;
+            match i % 4 {
+                0 => node(Op::Add, vec![input(0), constant(c)]),
+                1 => node(Op::Mul, vec![input(1), constant(c)]),
+                2 => node(Op::Sin, vec![node(Op::Mul, vec![constant(c), input(0)])]),
+                _ => node(Op::Sub, vec![node(Op::Mul, vec![input(0), input(0)]), constant(c)]),
+            }
+        };
+        let batch = |range: std::ops::Range<usize>, salt: f64, scored: bool| -> Vec<(Node, f64, f64, Option<Descriptor>)> {
+            range
+                .map(|i| {
+                    let t = tree(i, salt);
+                    let d = scored.then(|| descriptor(&t, &s));
+                    (t, 1.0 + (i % 7) as f64 * 0.25, 3.0 + (i % 3) as f64, d)
+                })
+                .collect()
+        };
+        let dump = |q: &QdArchive| format!("{:?}", q.state());
+        let makers: [fn() -> QdArchive; 3] = [
+            || QdArchive::new(4, 2).with_nvars(2),
+            || QdArchive::new_cvt(8, 2).with_nvars(2),
+            || QdArchive::new_random(8, 2).with_nvars(2),
+        ];
+        for make in makers {
+            let mut original = make();
+            original.record_with_descriptors(batch(0..40, 0.0, true), &s);
+            original.record_with_descriptors(batch(30..60, 0.0, false), &s);
+            let state = original.state();
+            assert!(state.fallbacks > 0 && !state.known.is_empty(), "{:?}", original.report());
+            assert!(state.known.windows(2).all(|w| w[0].0 < w[1].0), "the cache is saved in hash order");
+            let mut restored = make();
+            restored.restore(state.clone()).expect("restore");
+            assert_eq!(dump(&original), dump(&restored));
+            for q in [&mut original, &mut restored] {
+                q.record_with_descriptors(batch(0..30, 0.0, false), &s);
+                q.record_with_descriptors(batch(0..50, 0.05, false), &s);
+            }
+            assert_eq!(dump(&original), dump(&restored), "{:?}", original.mode());
+            assert_eq!(original.report(), restored.report());
+            if original.mode() == QdMode::Cvt {
+                assert_ne!(original.centroids(), make().centroids(), "Lloyd steps moved the centroids");
+            }
+
+            // Without the cache the same offers count as evaluating fallbacks.
+            let mut uncached = make();
+            uncached.restore(QdState { known: Vec::new(), known_tag: 0, ..state.clone() }).expect("restore");
+            let mut cached = make();
+            cached.restore(state).expect("restore");
+            for q in [&mut uncached, &mut cached] {
+                q.record_with_descriptors(batch(0..30, 0.0, false), &s);
+            }
+            assert!(uncached.report().descriptor_fallbacks > cached.report().descriptor_fallbacks);
+        }
+        let cvt = QdArchive::new_cvt(16, 2).state();
+        let err = QdArchive::new(4, 2).restore(cvt).unwrap_err();
+        assert!(err.contains("saved QD archive is cvt with 16 cells"), "{err}");
+        let mut full = QdArchive::new(4, 2);
+        let d = Descriptor { usage: 0.5, skew: 0.5 };
+        full.insert_descriptor(&tree(0, 0.0), 1.0, 5.0, d);
+        full.insert_descriptor(&tree(1, 0.0), 2.0, 3.0, d);
+        let err = QdArchive::new(4, 1).restore(full.state()).unwrap_err();
+        assert!(err.contains("more than the cell cap 1"), "{err}");
     }
 }

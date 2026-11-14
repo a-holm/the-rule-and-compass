@@ -244,11 +244,15 @@ trial families and a candidate-to-P&L mapping, which is outside the QD layer.
 
 `--save` writes `qd_bins`, `qd_cell_cap`, `qd_cvt` and `qd_policy` into the
 checkpoint, and `qd_descriptor book` under the book descriptor (absent means
-`moments`; a resume refuses a different `--qd-descriptor`). The archive itself is rebuilt from the resumed search's evaluated
-candidates; it is reporting state, not trajectory state. The passive layer never
-changes the Pareto front. With the layer disabled, the exactness fixtures are
-unchanged — `tests/qd.rs::qd_is_off_by_default_and_does_not_change_the_front`
-and the pinned archive/checkpoint tests cover this.
+`moments`; a resume refuses a different `--qd-descriptor`).
+
+What happens to the archive itself depends on the policy:
+
+* Under `--qd-policy` (and its controls `--qd-uniform` and `--qd-random`) the archive is trajectory state: it chooses parents, migration victims and restart aims. `--save` writes it as `qd_*` records (docs/checkpoint.md): every cell's local front with its descriptors, the CVT centroids, the per-cell offer counts, the Lloyd sample, the offer and fallback counters, and the descriptor cache. `--resume` restores it, so a resumed run gives the same front, `qd` report and exit checkpoint as the uninterrupted run, for both descriptor kinds and every archive (`tests/checkpoint.rs::a_qd_policy_run_resumed_at_every_generation_matches_exactly`, `a_qd_policy_run_and_its_resume_match_exactly`, `tests/pnl_fitness.rs::a_qd_book_policy_run_and_its_resume_match_exactly`). The exit checkpoint saves the archive of the last generation, before the end-of-run refit of the reported cell elites.
+* A `--qd-policy` checkpoint without the archive records (written before #1166) is refused on resume with exit 2, `cannot resume: this --qd-policy checkpoint has no QD archive`: an empty archive would continue a different trajectory. Rerun such a search from generation 0.
+* Under the passive `--qd` the archive is reporting state, not trajectory state: the checkpoint does not carry it, and a resumed run rebuilds it from the candidates it evaluates, so its `qd` report covers the resumed generations only. The passive layer never changes the Pareto front.
+
+With the layer disabled, the exactness fixtures are unchanged: `tests/qd.rs::qd_is_off_by_default_and_does_not_change_the_front` and the pinned archive/checkpoint tests cover this. QD-off and `--qd` checkpoints have no `qd_*` records (`tests/checkpoint.rs::the_qd_archive_is_saved_only_under_qd_policy`).
 
 ## Benchmark and controls
 
